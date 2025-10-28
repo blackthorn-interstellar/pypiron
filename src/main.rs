@@ -1,30 +1,27 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::{
+    config::Region, presigning::PresigningConfig, primitives::ByteStream, Client as S3Client,
+};
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, Response, StatusCode, header},
+    http::{header, HeaderMap, HeaderValue, Response, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Router,
 };
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::{
-    config::Region,
-    presigning::PresigningConfig,
-    primitives::ByteStream,
-    Client as S3Client,
-};
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as b64;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-mod worker;
 mod render;
+mod worker;
 
 const PACKAGES_PREFIX: &str = "packages/";
 const SIMPLE_PREFIX: &str = "simple/";
@@ -57,15 +54,13 @@ struct UploadQuery {
 async fn main() -> Result<()> {
     // logging
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "info,s3_pypi_mvp=info,aws_config=warn,aws_smithy_http_tower=warn".into()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| {
+            "info,s3_pypi_mvp=info,aws_config=warn,aws_smithy_http_tower=warn".into()
+        }))
         .init();
 
     // config from env
-    let bucket = std::env::var("S3_BUCKET")
-        .context("S3_BUCKET env var is required")?;
+    let bucket = std::env::var("S3_BUCKET").context("S3_BUCKET env var is required")?;
 
     let region = std::env::var("AWS_REGION").ok();
     let s3_endpoint = std::env::var("S3_ENDPOINT_URL").ok();
@@ -74,10 +69,10 @@ async fn main() -> Result<()> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let upload_user = std::env::var("BASIC_AUTH_USER")
-        .context("BASIC_AUTH_USER env var is required")?;
-    let upload_pass = std::env::var("BASIC_AUTH_PASS")
-        .context("BASIC_AUTH_PASS env var is required")?;
+    let upload_user =
+        std::env::var("BASIC_AUTH_USER").context("BASIC_AUTH_USER env var is required")?;
+    let upload_pass =
+        std::env::var("BASIC_AUTH_PASS").context("BASIC_AUTH_PASS env var is required")?;
 
     let worker_interval = std::env::var("WORKER_INTERVAL_SECS")
         .ok()
@@ -163,12 +158,16 @@ async fn upload_redirect(
     Query(q): Query<UploadQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
     // auth
-    if let Err(_) = check_basic_auth(&headers, &state.upload_user, &state.upload_pass) {
+    if check_basic_auth(&headers, &state.upload_user, &state.upload_pass).is_err() {
         return Err((StatusCode::UNAUTHORIZED, "Unauthorized"));
     }
 
-    let filename = filename_from_hint(&headers, q.filename.as_deref())
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Missing filename hint (X-Filename header or ?filename= query)"))?;
+    let filename = filename_from_hint(&headers, q.filename.as_deref()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing filename hint (X-Filename header or ?filename= query)",
+        )
+    })?;
 
     let package = infer_package_from_filename(&filename);
     let pkg_norm = normalize_pkg_name(&package);
@@ -227,7 +226,14 @@ async fn presign_put(state: &AppState, key: &str, ttl: Duration) -> Result<Strin
 async fn wait_until_exists(state: &AppState, key: &str, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
-        match state.s3.head_object().bucket(&state.bucket).key(key).send().await {
+        match state
+            .s3
+            .head_object()
+            .bucket(&state.bucket)
+            .key(key)
+            .send()
+            .await
+        {
             Ok(_) => return true,
             Err(_) => {
                 if start.elapsed() >= timeout {
@@ -248,7 +254,9 @@ struct Job {
 }
 
 async fn enqueue_job(state: &AppState, package: &str, filename: &str, s3_key: &str) -> Result<()> {
-    let ts = OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "now".into());
+    let ts = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "now".into());
     let stamp = OffsetDateTime::now_utc().unix_timestamp();
     let job = Job {
         package: package.to_string(),
@@ -271,25 +279,28 @@ async fn enqueue_job(state: &AppState, package: &str, filename: &str, s3_key: &s
 }
 
 /// --- Simple index endpoints ----------------------------------------------
-
 async fn simple_root(State(state): State<Arc<AppState>>) -> Response<Body> {
-    stream_s3(&state, format!("{SIMPLE_PREFIX}index.html"), Some("text/html"))
-        .await
-        .unwrap_or_else(internal_or_404)
+    stream_s3(
+        &state,
+        format!("{SIMPLE_PREFIX}index.html"),
+        Some("text/html"),
+    )
+    .await
+    .unwrap_or_else(internal_or_404)
 }
 
-async fn simple_pkg(
-    State(state): State<Arc<AppState>>,
-    Path(pkg): Path<String>,
-) -> Response<Body> {
+async fn simple_pkg(State(state): State<Arc<AppState>>, Path(pkg): Path<String>) -> Response<Body> {
     let pkg = normalize_pkg_name(&pkg);
-    stream_s3(&state, format!("{SIMPLE_PREFIX}{pkg}/index.html"), Some("text/html"))
-        .await
-        .unwrap_or_else(internal_or_404)
+    stream_s3(
+        &state,
+        format!("{SIMPLE_PREFIX}{pkg}/index.html"),
+        Some("text/html"),
+    )
+    .await
+    .unwrap_or_else(internal_or_404)
 }
 
 /// --- Artifact download endpoint ------------------------------------------
-
 async fn files_get(
     State(state): State<Arc<AppState>>,
     Path((package, filename)): Path<(String, String)>,
@@ -326,8 +337,10 @@ async fn stream_s3(
     let content_length = out.content_length();
     let data = out.body.collect().await?.into_bytes();
     let mut resp = Response::new(Body::from(data));
-    resp.headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_str(&ct).unwrap_or(HeaderValue::from_static("application/octet-stream")));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&ct).unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
     if let Some(sz) = content_length {
         if let Ok(v) = HeaderValue::from_str(&sz.to_string()) {
             resp.headers_mut().insert(header::CONTENT_LENGTH, v);
@@ -346,7 +359,6 @@ fn internal_or_404<E: std::fmt::Debug>(err: E) -> Response<Body> {
 }
 
 /// --- Helpers --------------------------------------------------------------
-
 fn check_basic_auth(headers: &HeaderMap, user: &str, pass: &str) -> Result<()> {
     let auth = headers
         .get(header::AUTHORIZATION)
@@ -379,18 +391,18 @@ fn infer_package_from_filename(filename: &str) -> String {
     // common cases:
     //  - requests-2.28.1-py3-none-any.whl                  → "requests"
     //  - my_pkg_name-1.2.3.tar.gz / .zip / .tar.bz2       → "my_pkg_name"
-    let stem = filename
-        .split('/')
-        .last()
-        .unwrap_or(filename);
+    let stem = filename.split('/').next_back().unwrap_or(filename);
 
     // Wheel: distribution-version-...
     let dist = if let Some(idx) = stem.find('-') {
         &stem[..idx]
     } else if let Some(idx) = stem.rfind(".tar.") {
         // sdist with two extensions (.tar.gz, .tar.bz2, .tar.xz)
-        stem.split_at(idx).0
-            .rsplit_once('-').map(|(d, _)| d).unwrap_or(stem)
+        stem.split_at(idx)
+            .0
+            .rsplit_once('-')
+            .map(|(d, _)| d)
+            .unwrap_or(stem)
     } else if let Some((d, _v)) = stem.rsplit_once('-') {
         d
     } else {

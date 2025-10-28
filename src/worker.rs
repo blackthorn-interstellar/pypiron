@@ -1,14 +1,19 @@
-use std::{collections::{BTreeSet, HashSet}, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::Arc,
+};
 
 use anyhow::Result;
-use aws_sdk_s3::{Client as S3Client, primitives::ByteStream};
+use aws_sdk_s3::{primitives::ByteStream, Client as S3Client};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+use crate::render::{
+    pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json,
+};
 use crate::{
     AppState, PACKAGES_PREFIX, QUEUE_PENDING_PREFIX, QUEUE_PROCESSING_PREFIX, SIMPLE_PREFIX,
 };
-use crate::render::{pep503_package_html, pep503_global_html, pep691_package_json, pep691_global_json};
 
 pub async fn run_worker(state: Arc<AppState>) {
     loop {
@@ -21,7 +26,13 @@ pub async fn run_worker(state: Arc<AppState>) {
 
 async fn tick(state: &AppState) -> Result<()> {
     // 1) list up to batch_size from pending/
-    let jobs = list_jobs(&state.s3, &state.bucket, QUEUE_PENDING_PREFIX, state.job_batch_size).await?;
+    let jobs = list_jobs(
+        &state.s3,
+        &state.bucket,
+        QUEUE_PENDING_PREFIX,
+        state.job_batch_size,
+    )
+    .await?;
     if jobs.is_empty() {
         info!("worker: no jobs");
         return Ok(());
@@ -41,7 +52,9 @@ async fn tick(state: &AppState) -> Result<()> {
     let mut touched: HashSet<String> = HashSet::new();
     for key in &claimed {
         match read_job_package(&state.s3, &state.bucket, key).await {
-            Ok(pkg) => { touched.insert(pkg); }
+            Ok(pkg) => {
+                touched.insert(pkg);
+            }
             Err(e) => {
                 warn!(error=?e, key=%key, "could not read job; attempting to infer from key");
                 if let Some(pkg) = infer_pkg_from_job_key(key) {
@@ -102,11 +115,7 @@ async fn copy_then_delete(s3: &S3Client, bucket: &str, src: &str, dst: &str) -> 
         .send()
         .await?;
     // delete src
-    s3.delete_object()
-        .bucket(bucket)
-        .key(src)
-        .send()
-        .await?;
+    s3.delete_object().bucket(bucket).key(src).send().await?;
     Ok(())
 }
 
@@ -115,14 +124,16 @@ async fn read_job_package(s3: &S3Client, bucket: &str, key: &str) -> Result<Stri
     let data = out.body.collect().await?.into_bytes();
     // Minimal JSON: {"package":"<name>", ...}
     #[derive(serde::Deserialize)]
-    struct JobPkg { package: String }
+    struct JobPkg {
+        package: String,
+    }
     let job: JobPkg = serde_json::from_slice(&data)?;
     Ok(job.package)
 }
 
 fn infer_pkg_from_job_key(key: &str) -> Option<String> {
     // .../processing/<epoch>-<package>-<filename>.json
-    let fname = key.split('/').last()?;
+    let fname = key.split('/').next_back()?;
     let mut parts = fname.splitn(3, '-'); // epoch, package, rest
     let _ = parts.next()?;
     let package = parts.next()?.to_string();
@@ -186,7 +197,11 @@ async fn list_all_packages(s3: &S3Client, bucket: &str) -> Result<Vec<String>> {
     let mut token = None;
     let mut pkgs = BTreeSet::new();
     loop {
-        let mut req = s3.list_objects_v2().bucket(bucket).prefix(&prefix).delimiter("/");
+        let mut req = s3
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(&prefix)
+            .delimiter("/");
         if let Some(t) = token.take() {
             req = req.continuation_token(t);
         }

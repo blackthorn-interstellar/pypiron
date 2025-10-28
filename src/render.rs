@@ -5,10 +5,16 @@ use serde::Serialize;
 pub fn pep503_package_html(package: &str, files: &[String]) -> String {
     // Links are relative to the API under /files/<pkg>/<filename>
     let mut body = String::new();
-    body.push_str(&format!(r#"<html><head><title>Links for {}</title></head><body>"#, encode_text(package)));
+    body.push_str(&format!(
+        r#"<html><head><title>Links for {}</title></head><body>"#,
+        encode_text(package)
+    ));
     for f in files {
         let fname = encode_text(f);
-        body.push_str(&format!(r#"<a href="/files/{}/{fname}">{fname}</a><br/>"#, encode_text(package)));
+        body.push_str(&format!(
+            r#"<a href="/files/{}/{fname}">{fname}</a><br/>"#,
+            encode_text(package)
+        ));
     }
     body.push_str("</body></html>");
     body

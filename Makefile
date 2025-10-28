@@ -17,6 +17,7 @@ test: test-integration
 check:  ## Check the project for compilation errors
 	$(CARGO) check
 
+af: fmt
 fmt:  ## Format the code using rustfmt
 	$(CARGO) fmt --all
 

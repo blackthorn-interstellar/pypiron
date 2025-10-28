@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (fail on warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit tests
+        run: cargo test --workspace --all-features --locked
+
+  build-release:
+    # Only build release binaries on push to master (not on PRs)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    name: build release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [fmt, clippy, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      # Upload the built binary as an artifact per-OS.
+      # Adjust BIN_NAME if your Cargo package name differs.
+      - name: Upload artifact (Linux/macOS)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3_pypi_mvp-${{ runner.os }}-${{ github.sha }}
+          path: target/release/s3_pypi_mvp
+          retention-days: 14
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3_pypi_mvp-${{ runner.os }}-${{ github.sha }}
+          path: target\release\s3_pypi_mvp.exe
+          retention-days: 14

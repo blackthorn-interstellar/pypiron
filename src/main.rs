@@ -125,8 +125,10 @@ async fn main() -> Result<()> {
         .route("/", post(upload_redirect))
         .route("/simple", get(simple_root))
         .route("/simple/", get(simple_root))
+        .route("/simple/index.json", get(simple_root_json))
         .route("/simple/:package", get(simple_pkg))
         .route("/simple/:package/", get(simple_pkg))
+        .route("/simple/:package/index.json", get(simple_pkg_json))
         .route("/files/:package/:filename", get(files_get))
         .with_state(state.clone());
 
@@ -289,12 +291,33 @@ async fn simple_root(State(state): State<Arc<AppState>>) -> Response<Body> {
     .unwrap_or_else(internal_or_404)
 }
 
+async fn simple_root_json(State(state): State<Arc<AppState>>) -> Response<Body> {
+    stream_s3(
+        &state,
+        format!("{SIMPLE_PREFIX}index.json"),
+        Some("application/json"),
+    )
+    .await
+    .unwrap_or_else(internal_or_404)
+}
+
 async fn simple_pkg(State(state): State<Arc<AppState>>, Path(pkg): Path<String>) -> Response<Body> {
     let pkg = normalize_pkg_name(&pkg);
     stream_s3(
         &state,
         format!("{SIMPLE_PREFIX}{pkg}/index.html"),
         Some("text/html"),
+    )
+    .await
+    .unwrap_or_else(internal_or_404)
+}
+
+async fn simple_pkg_json(State(state): State<Arc<AppState>>, Path(pkg): Path<String>) -> Response<Body> {
+    let pkg = normalize_pkg_name(&pkg);
+    stream_s3(
+        &state,
+        format!("{SIMPLE_PREFIX}{pkg}/index.json"),
+        Some("application/json"),
     )
     .await
     .unwrap_or_else(internal_or_404)

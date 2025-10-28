@@ -186,6 +186,17 @@ echo "→ downloading flask from public PyPI via our server ..."
 echo "→ downloaded files:"
 ls -1 "${DL_DIR}"
 
+echo ""
+echo "→ JSON API responses:"
+echo ""
+echo "=== Global index (http://127.0.0.1:8080/simple/index.json) ==="
+curl -s "http://127.0.0.1:8080/simple/index.json" | "${PYTHON}" -m json.tool
+echo ""
+
+echo "=== Package index for 'rich' (http://127.0.0.1:8080/simple/rich/index.json) ==="
+curl -s "http://127.0.0.1:8080/simple/rich/index.json" | "${PYTHON}" -m json.tool
+echo ""
+
 echo "✅ SUCCESS: upload, download, and install from private PyPI server verified!"
 echo "MinIO console: http://127.0.0.1:9001  (user: ${MINIO_ACCESS_KEY} / pass: ${MINIO_SECRET_KEY})"
 sleep 60

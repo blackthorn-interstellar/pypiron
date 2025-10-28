@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Find system Python (not in a venv)
+if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+  # If in a venv, look for system python in common locations
+  for candidate in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+    if [[ -x "${candidate}" ]]; then
+      PYTHON="${candidate}"
+      break
+    fi
+  done
+  # Fallback: temporarily bypass PATH to find system python
+  if [[ -z "${PYTHON:-}" ]]; then
+    PYTHON="$(PATH="/usr/bin:/usr/local/bin:/opt/homebrew/bin" which python3)"
+  fi
+else
+  PYTHON="$(which python3)"
+fi
+
 # --- Config (override if you like) -------------------------------------------
 MINIO_CONTAINER="mvp-minio"
 S3_BUCKET="s3pypi"
@@ -20,9 +37,9 @@ BASIC_AUTH_PASS="secret"
 # Paths
 ROOT_DIR="$(pwd)"
 BIN="${ROOT_DIR}/target/release/pypiron"
-VENV="${ROOT_DIR}/.venv"
 DIST_DIR="${ROOT_DIR}/dist"
 DL_DIR="${ROOT_DIR}/downloaded"
+TEST_VENV="${ROOT_DIR}/.test-venv"
 
 # --- Cleanup -----------------------------------------------------------------
 cleanup() {
@@ -72,82 +89,103 @@ HOST="${API_BIND%:*}"
 PORT="${API_BIND#*:}"
 until (exec 3<>"/dev/tcp/${HOST}/${PORT}") 2>/dev/null; do sleep 0.5; done
 
-# --- Create a tiny Python package & build a wheel ----------------------------
-echo "→ creating demo Python package ..."
-rm -rf "${DIST_DIR}" "${DL_DIR}" demo_pkg "${VENV}"
-python3 -m venv "${VENV}"
-source "${VENV}/bin/activate"
-python -m pip -q install --upgrade pip build >/dev/null
+# --- Download real packages from PyPI ----------------------------------------
+echo "→ downloading real packages from public PyPI ..."
+rm -rf "${DIST_DIR}" "${DL_DIR}" "${TEST_VENV}"
+mkdir -p "${DIST_DIR}"
 
-mkdir -p demo_pkg/src/demo_pkg
-cat > demo_pkg/src/demo_pkg/__init__.py <<'PY'
-__all__ = ["hello"]
-def hello(): return "world"
-PY
+# Download some small, useful packages
+PACKAGES_TO_UPLOAD=(
+  "httpx==0.27.0"
+  "rich==13.7.0"
+  "typer==0.9.0"
+)
 
-cat > demo_pkg/pyproject.toml <<'TOML'
-[build-system]
-requires = ["setuptools>=67", "wheel"]
-build-backend = "setuptools.build_meta"
+for pkg in "${PACKAGES_TO_UPLOAD[@]}"; do
+  echo "   downloading ${pkg} ..."
+  if ! "${PYTHON}" -m pip download --no-deps -d "${DIST_DIR}" "${pkg}" >/dev/null 2>&1; then
+    echo "FAILED: could not download ${pkg} - retrying with verbose output..."
+    "${PYTHON}" -m pip download --no-deps -d "${DIST_DIR}" "${pkg}"
+    exit 1
+  fi
+done
 
-[project]
-name = "demo-pkg"
-version = "0.0.1"
-description = "MVP smoke test package"
-requires-python = ">=3.8"
-TOML
+echo "   downloaded $(ls -1 ${DIST_DIR} | wc -l | tr -d ' ') packages"
 
-echo "→ building wheel ..."
-python -m build --wheel --outdir "${DIST_DIR}" demo_pkg >/dev/null
-FILENAME="$(basename "$(ls -1 ${DIST_DIR}/*.whl)")"
-echo "   built: ${FILENAME}"
+# --- Upload packages via API -------------------------------------------------
+upload_file() {
+  local filename="$1"
+  echo "→ uploading ${filename} ..."
+  
+  HDRS="$(mktemp)"
+  curl -is -u "${BASIC_AUTH_USER}:${BASIC_AUTH_PASS}" \
+    -H "X-Filename: ${filename}" \
+    -X POST "http://${API_BIND}/" \
+    -o /dev/null -D "${HDRS}"
 
-# --- Upload via API (redirect -> pre-signed S3 PUT) --------------------------
-echo "→ requesting pre-signed PUT (server POST, no body read) ..."
-HDRS="$(mktemp)"
-curl -is -u "${BASIC_AUTH_USER}:${BASIC_AUTH_PASS}" \
-  -H "X-Filename: ${FILENAME}" \
-  -X POST "http://${API_BIND}/" \
-  -o /dev/null -D "${HDRS}"
+  UPLOAD_URL="$(awk '/^[Ll]ocation: /{print $2}' "${HDRS}" | tr -d '\r')"
+  if [[ -z "${UPLOAD_URL}" ]]; then
+    echo "FAILED: no Location header for ${filename}"
+    cat "${HDRS}"
+    return 1
+  fi
 
-UPLOAD_URL="$(awk '/^[Ll]ocation: /{print $2}' "${HDRS}" | tr -d '\r')"
-test -n "${UPLOAD_URL}" || { echo "FAILED: no Location header from server"; cat "${HDRS}"; exit 1; }
-echo "   presigned URL acquired."
+  curl -sS -X PUT -H "Content-Type: application/octet-stream" \
+    --upload-file "${DIST_DIR}/${filename}" \
+    "${UPLOAD_URL}" >/dev/null
+  
+  rm -f "${HDRS}"
+}
 
-echo "→ uploading artifact to S3 via presigned URL ..."
-# Content-Type must match what the server used when presigning (application/octet-stream).
-curl -sS -X PUT -H "Content-Type: application/octet-stream" \
-  --upload-file "${DIST_DIR}/${FILENAME}" \
-  "${UPLOAD_URL}" >/dev/null
-echo "   upload done."
+for wheel in "${DIST_DIR}"/*.whl; do
+  filename="$(basename "${wheel}")"
+  upload_file "${filename}"
+done
 
 # --- Wait for worker to regenerate indexes -----------------------------------
-PKG_PATH="http://${API_BIND}/simple/demo-pkg/"
-echo "→ waiting for per-package index at ${PKG_PATH} ..."
+echo "→ waiting for worker to process uploads ..."
+sleep 5  # Give worker time to pick up jobs
+
+# Check that rich package index exists
+PKG_PATH="http://${API_BIND}/simple/rich/"
+echo "→ verifying package index at ${PKG_PATH} ..."
 for _ in {1..60}; do
   if curl -sf "${PKG_PATH}" >/dev/null; then break; fi
   sleep 1
 done
 curl -sf "${PKG_PATH}" >/dev/null || { echo "FAILED: package index not found"; exit 1; }
 
-# --- Download from our server + public PyPI ---------------------------------
+# --- Install from our server -------------------------------------------------
+echo "→ creating test venv with uv ..."
+uv venv "${TEST_VENV}" >/dev/null 2>&1
+
+echo "→ installing rich from our server ..."
+uv pip install --python "${TEST_VENV}" \
+  --index-url "http://127.0.0.1:8080/simple" \
+  --extra-index-url "https://pypi.org/simple" \
+  "rich==13.7.0" >/dev/null 2>&1
+
+echo "→ verifying rich installation ..."
+"${TEST_VENV}/bin/python" -c "import rich; from rich import print as rprint; rprint('[green]✓[/green] rich imported successfully!')"
+
+# --- Download from our server (test direct download) ------------------------
 mkdir -p "${DL_DIR}"
-echo "→ pip download from our server (demo-pkg==0.0.1) ..."
-python -m pip -q download --no-deps -d "${DL_DIR}" \
+echo "→ downloading httpx from our server ..."
+"${PYTHON}" -m pip download --no-deps -d "${DL_DIR}" \
   --index-url "http://127.0.0.1:8080/simple" \
   --trusted-host 127.0.0.1 \
-  "demo-pkg==0.0.1"
+  "httpx==0.27.0" >/dev/null 2>&1
 
-echo "→ pip download from public PyPI via extra-index (flask) ..."
-python -m pip -q download -d "${DL_DIR}" \
+echo "→ downloading flask from public PyPI via our server ..."
+"${PYTHON}" -m pip download --no-deps -d "${DL_DIR}" \
   --index-url "http://127.0.0.1:8080/simple" \
   --trusted-host 127.0.0.1 \
   --extra-index-url "https://pypi.org/simple" \
-  "flask==3.0.0"
+  "flask==3.0.0" >/dev/null 2>&1
 
 echo "→ downloaded files:"
 ls -1 "${DL_DIR}"
 
-echo "✅ SUCCESS: upload via server + S3 and downloads (private + public) verified."
+echo "✅ SUCCESS: upload, download, and install from private PyPI server verified!"
 echo "MinIO console: http://127.0.0.1:9001  (user: ${MINIO_ACCESS_KEY} / pass: ${MINIO_SECRET_KEY})"
 sleep 60

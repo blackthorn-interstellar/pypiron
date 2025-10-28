@@ -11,8 +11,11 @@ build:  ## Build the project in release mode
 dev:  ## Build the project in development mode
 	$(CARGO) build
 
-test: test-integration
+test:  ## Run unit tests
 	$(CARGO) test
+
+test-integration:  ## Run integration tests (requires Docker)
+	./test_simple.sh
 
 check:  ## Check the project for compilation errors
 	$(CARGO) check
@@ -33,7 +36,6 @@ doc:  ## Generate documentation
 init:  ## Setup development tools
 	rustup component add rustfmt
 	rustup component add clippy
-	pip install -r integration_tests/requirements.txt
 	$(CARGO) build
 
 watch-test:  ## Run tests in watch mode

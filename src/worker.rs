@@ -137,7 +137,7 @@ async fn write_pkg_indexes(state: &AppState, pkg: &str, files: &[String]) -> Res
         .put_bytes(
             &format!("{base}index.json"),
             json.into_bytes(),
-            Some("application/json"),
+            Some("application/vnd.pypi.simple.v1+json"),
         )
         .await?;
     Ok(())
@@ -168,7 +168,7 @@ async fn write_global_indexes(state: &AppState, packages: &[String]) -> Result<(
         .put_bytes(
             &format!("{SIMPLE_PREFIX}index.json"),
             json.into_bytes(),
-            Some("application/json"),
+            Some("application/vnd.pypi.simple.v1+json"),
         )
         .await?;
     Ok(())

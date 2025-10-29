@@ -229,7 +229,7 @@ async fn initialize_indexes(state: &AppState) -> Result<()> {
         if !json_exists {
             state
                 .storage
-                .put_bytes(&json_key, json.into_bytes(), Some("application/json"))
+                .put_bytes(&json_key, json.into_bytes(), Some("application/vnd.pypi.simple.v1+json"))
                 .await?;
         }
     }
@@ -371,35 +371,62 @@ async fn enqueue_job(state: &AppState, package: &str, filename: &str, s3_key: &s
 }
 
 /// --- Simple index endpoints ----------------------------------------------
-async fn simple_root(State(state): State<Arc<AppState>>) -> Response<Body> {
-    stream_object(
-        &state,
-        format!("{SIMPLE_PREFIX}index.html"),
-        Some("text/html"),
-    )
-    .await
-    .unwrap_or_else(internal_or_404)
+async fn simple_root(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if accepts_json(&headers) {
+        stream_object(
+            &state,
+            format!("{SIMPLE_PREFIX}index.json"),
+            Some("application/vnd.pypi.simple.v1+json"),
+        )
+        .await
+        .unwrap_or_else(internal_or_404)
+    } else {
+        stream_object(
+            &state,
+            format!("{SIMPLE_PREFIX}index.html"),
+            Some("text/html"),
+        )
+        .await
+        .unwrap_or_else(internal_or_404)
+    }
 }
 
 async fn simple_root_json(State(state): State<Arc<AppState>>) -> Response<Body> {
     stream_object(
         &state,
         format!("{SIMPLE_PREFIX}index.json"),
-        Some("application/json"),
+        Some("application/vnd.pypi.simple.v1+json"),
     )
     .await
     .unwrap_or_else(internal_or_404)
 }
 
-async fn simple_pkg(State(state): State<Arc<AppState>>, Path(pkg): Path<String>) -> Response<Body> {
+async fn simple_pkg(
+    State(state): State<Arc<AppState>>,
+    Path(pkg): Path<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
     let pkg = normalize_pkg_name(&pkg);
-    stream_object(
-        &state,
-        format!("{SIMPLE_PREFIX}{pkg}/index.html"),
-        Some("text/html"),
-    )
-    .await
-    .unwrap_or_else(internal_or_404)
+    if accepts_json(&headers) {
+        stream_object(
+            &state,
+            format!("{SIMPLE_PREFIX}{pkg}/index.json"),
+            Some("application/vnd.pypi.simple.v1+json"),
+        )
+        .await
+        .unwrap_or_else(internal_or_404)
+    } else {
+        stream_object(
+            &state,
+            format!("{SIMPLE_PREFIX}{pkg}/index.html"),
+            Some("text/html"),
+        )
+        .await
+        .unwrap_or_else(internal_or_404)
+    }
 }
 
 async fn simple_pkg_json(
@@ -410,7 +437,7 @@ async fn simple_pkg_json(
     stream_object(
         &state,
         format!("{SIMPLE_PREFIX}{pkg}/index.json"),
-        Some("application/json"),
+        Some("application/vnd.pypi.simple.v1+json"),
     )
     .await
     .unwrap_or_else(internal_or_404)
@@ -467,6 +494,18 @@ fn internal_or_404<E: std::fmt::Debug>(err: E) -> Response<Body> {
 }
 
 /// --- Helpers --------------------------------------------------------------
+/// Check if the client accepts JSON response (PEP 691)
+fn accepts_json(headers: &HeaderMap) -> bool {
+    if let Some(accept) = headers.get(header::ACCEPT) {
+        if let Ok(accept_str) = accept.to_str() {
+            // Check for PEP 691 media type or generic application/json
+            return accept_str.contains("application/vnd.pypi.simple.v1+json")
+                || accept_str.contains("application/json");
+        }
+    }
+    false
+}
+
 fn check_basic_auth(headers: &HeaderMap, user: &str, pass: &str) -> Result<()> {
     let auth = headers
         .get(header::AUTHORIZATION)

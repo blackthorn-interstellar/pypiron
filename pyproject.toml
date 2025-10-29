@@ -14,15 +14,22 @@ authors = [
 ]
 keywords = ["pypi", "package-server", "rust", "s3"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
     "Topic :: Software Development :: Build Tools",
     "Topic :: System :: Software Distribution",
     "Programming Language :: Rust",
+    "Programming Language :: Python",
 ]
 
 [project.urls]
+Homepage = "https://github.com/brycedrennan/pypiron"
 Repository = "https://github.com/brycedrennan/pypiron"
+Documentation = "https://github.com/brycedrennan/pypiron#readme"
+Issues = "https://github.com/brycedrennan/pypiron/issues"
+Changelog = "https://github.com/brycedrennan/pypiron/releases"
 
 [tool.maturin]
 # "bin" bindings means we're packaging a Rust binary, not a Python extension

@@ -75,14 +75,14 @@ jobs:
         if: runner.os != 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: s3_pypi_mvp-${{ runner.os }}-${{ github.sha }}
-          path: target/release/s3_pypi_mvp
+          name: pypiron-${{ runner.os }}-${{ github.sha }}
+          path: target/release/pypiron
           retention-days: 14
 
       - name: Upload artifact (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: s3_pypi_mvp-${{ runner.os }}-${{ github.sha }}
-          path: target\release\s3_pypi_mvp.exe
+          name: pypiron-${{ runner.os }}-${{ github.sha }}
+          path: target\release\pypiron.exe
           retention-days: 14

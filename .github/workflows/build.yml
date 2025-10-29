@@ -21,6 +21,10 @@ jobs:
       
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          # Workaround for ring 0.17 aarch64 assembler detection in manylinux cross builds
+          CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
+          RING_PREGENERATE_ASM: '1'
         with:
           target: ${{ matrix.target }}
           args: --release --strip --out dist --find-interpreter
@@ -56,6 +60,7 @@ jobs:
           sccache: 'true'
       
       - name: Test wheel
+        if: (matrix.target == 'aarch64' && runner.arch == 'ARM64') || (matrix.target == 'x86_64' && runner.arch == 'X64')
         run: |
           pip install dist/*.whl
           pypiron --help

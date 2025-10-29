@@ -222,14 +222,22 @@ async fn initialize_indexes(state: &AppState) -> Result<()> {
         if !html_exists {
             state
                 .storage
-                .put_bytes(&html_key, html.into_bytes(), Some("text/html; charset=utf-8"))
+                .put_bytes(
+                    &html_key,
+                    html.into_bytes(),
+                    Some("text/html; charset=utf-8"),
+                )
                 .await?;
         }
 
         if !json_exists {
             state
                 .storage
-                .put_bytes(&json_key, json.into_bytes(), Some("application/vnd.pypi.simple.v1+json"))
+                .put_bytes(
+                    &json_key,
+                    json.into_bytes(),
+                    Some("application/vnd.pypi.simple.v1+json"),
+                )
                 .await?;
         }
     }
@@ -371,10 +379,7 @@ async fn enqueue_job(state: &AppState, package: &str, filename: &str, s3_key: &s
 }
 
 /// --- Simple index endpoints ----------------------------------------------
-async fn simple_root(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response<Body> {
+async fn simple_root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
     if accepts_json(&headers) {
         stream_object(
             &state,

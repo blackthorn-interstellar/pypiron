@@ -2,11 +2,9 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::{
-    config::Region, presigning::PresigningConfig, primitives::ByteStream, Client as S3Client,
-};
+use aws_sdk_s3::config::Region;
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Response, StatusCode},
     response::IntoResponse,
@@ -15,27 +13,47 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 mod render;
+mod storage;
 mod worker;
+
+use storage::{DiskStorage, ObjectData, S3Storage, Storage};
 
 const PACKAGES_PREFIX: &str = "packages/";
 const SIMPLE_PREFIX: &str = "simple/";
 const QUEUE_PENDING_PREFIX: &str = "_internal/queue/pending/";
 const QUEUE_PROCESSING_PREFIX: &str = "_internal/queue/processing/";
 
+/// Storage backend selection.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum StorageBackend {
+    /// Use the local filesystem (default).
+    Disk,
+    /// Use AWS S3 or an S3-compatible service.
+    S3,
+}
+
 /// `PypIron` - A fast, reliable, and scalable `PyPI` server
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// S3 bucket name for package storage
+    /// Storage backend to use: "disk" or "s3"
+    #[arg(long, env = "PYPIRON_STORAGE", value_enum, default_value_t = StorageBackend::Disk)]
+    storage: StorageBackend,
+
+    /// Root data directory for disk storage
+    #[arg(long, env = "PYPIRON_DATA_DIR", default_value = "./pypiron-data")]
+    data_dir: String,
+
+    /// S3 bucket name for package storage (required if --storage s3)
     #[arg(long, env = "PYPIRON_S3_BUCKET")]
-    s3_bucket: String,
+    s3_bucket: Option<String>,
 
     /// AWS region (e.g., us-east-1)
     #[arg(long, env = "AWS_REGION")]
@@ -49,13 +67,13 @@ struct Cli {
     #[arg(long, env = "PYPIRON_S3_FORCE_PATH_STYLE")]
     s3_force_path_style: bool,
 
-    /// Basic auth username for uploads
+    /// Basic auth username for uploads (optional, allows unauthenticated uploads if not provided)
     #[arg(long, env = "PYPIRON_BASIC_AUTH_USER")]
-    basic_auth_user: String,
+    basic_auth_user: Option<String>,
 
-    /// Basic auth password for uploads
+    /// Basic auth password for uploads (optional, allows unauthenticated uploads if not provided)
     #[arg(long, env = "PYPIRON_BASIC_AUTH_PASS")]
-    basic_auth_pass: String,
+    basic_auth_pass: Option<String>,
 
     /// Worker interval in seconds
     #[arg(long, env = "PYPIRON_WORKER_INTERVAL_SECS", default_value = "300")]
@@ -84,17 +102,15 @@ struct Cli {
 
 #[derive(Clone)]
 struct AppState {
-    s3: S3Client,
-    bucket: String,
+    storage: Arc<dyn Storage>,
     // auth
-    upload_user: String,
-    upload_pass: String,
+    upload_user: Option<String>,
+    upload_pass: Option<String>,
     // worker cfg
     worker_interval: Duration,
     job_batch_size: usize,
     upload_confirm_timeout: Duration,
     // behavior
-    // If set (e.g., behind a proxy), you can emit absolute URLs for files; otherwise relative
     #[allow(dead_code)]
     public_base_url: Option<String>,
 }
@@ -116,25 +132,36 @@ async fn main() -> Result<()> {
     // parse CLI args (with env var fallbacks)
     let cli = Cli::parse();
 
-    // AWS config
-    let mut cfg_loader = aws_config::defaults(BehaviorVersion::latest());
-    if let Some(ref r) = cli.aws_region {
-        cfg_loader = cfg_loader.region(Region::new(r.clone()));
-    }
-    let base_cfg = cfg_loader.load().await;
+    // Build storage backend
+    let storage: Arc<dyn Storage> = match cli.storage {
+        StorageBackend::Disk => Arc::new(DiskStorage::new(&cli.data_dir)),
+        StorageBackend::S3 => {
+            let bucket = cli
+                .s3_bucket
+                .clone()
+                .ok_or_else(|| anyhow!("--s3-bucket is required when using --storage s3"))?;
 
-    let mut s3_cfg_builder = aws_sdk_s3::config::Builder::from(&base_cfg);
-    if let Some(url) = cli.s3_endpoint_url {
-        s3_cfg_builder = s3_cfg_builder.endpoint_url(url);
-    }
-    if cli.s3_force_path_style {
-        s3_cfg_builder = s3_cfg_builder.force_path_style(true);
-    }
-    let s3 = S3Client::from_conf(s3_cfg_builder.build());
+            // AWS config
+            let mut cfg_loader = aws_config::defaults(BehaviorVersion::latest());
+            if let Some(ref r) = cli.aws_region {
+                cfg_loader = cfg_loader.region(Region::new(r.clone()));
+            }
+            let base_cfg = cfg_loader.load().await;
+
+            let mut s3_cfg_builder = aws_sdk_s3::config::Builder::from(&base_cfg);
+            if let Some(url) = cli.s3_endpoint_url {
+                s3_cfg_builder = s3_cfg_builder.endpoint_url(url);
+            }
+            if cli.s3_force_path_style {
+                s3_cfg_builder = s3_cfg_builder.force_path_style(true);
+            }
+            let s3 = aws_sdk_s3::Client::from_conf(s3_cfg_builder.build());
+            Arc::new(S3Storage::new(s3, bucket))
+        }
+    };
 
     let state = Arc::new(AppState {
-        s3,
-        bucket: cli.s3_bucket,
+        storage,
         upload_user: cli.basic_auth_user,
         upload_pass: cli.basic_auth_pass,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
@@ -143,9 +170,14 @@ async fn main() -> Result<()> {
         public_base_url: cli.public_base_url,
     });
 
+    // Initialize empty index files if they don't exist
+    initialize_indexes(&state).await?;
+
     // router
     let app = Router::new()
         .route("/", post(upload_redirect))
+        // Local upload endpoint (used by DiskStorage presign URL)
+        .route("/_upload/:token", post(local_upload).put(local_upload))
         .route("/simple", get(simple_root))
         .route("/simple/", get(simple_root))
         .route("/simple/index.json", get(simple_root_json))
@@ -172,18 +204,53 @@ async fn shutdown_signal() {
     info!("shutdown signal received");
 }
 
+/// Initialize empty index files if they don't exist
+async fn initialize_indexes(state: &AppState) -> Result<()> {
+    let html_key = format!("{SIMPLE_PREFIX}index.html");
+    let json_key = format!("{SIMPLE_PREFIX}index.json");
+
+    // Check if global indexes exist
+    let html_exists = state.storage.head_exists(&html_key).await.unwrap_or(false);
+    let json_exists = state.storage.head_exists(&json_key).await.unwrap_or(false);
+
+    if !html_exists || !json_exists {
+        info!("Initializing empty global indexes");
+        let empty_packages: Vec<String> = Vec::new();
+        let html = render::pep503_global_html(&empty_packages);
+        let json = render::pep691_global_json(&empty_packages);
+
+        if !html_exists {
+            state
+                .storage
+                .put_bytes(&html_key, html.into_bytes(), Some("text/html; charset=utf-8"))
+                .await?;
+        }
+
+        if !json_exists {
+            state
+                .storage
+                .put_bytes(&json_key, json.into_bytes(), Some("application/json"))
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
 /// --- Upload endpoint ------------------------------------------------------
 /// POST `/` → Basic-auth; do not read body; require filename hint in header or query;
-/// generate presigned PUT; respond 307 with Location.
+/// generate upload URL (presigned S3 or local) and respond 307 with Location.
 /// In the background, confirm upload exists and enqueue a job json into pending/.
 async fn upload_redirect(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(q): Query<UploadQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
-    // auth
-    if check_basic_auth(&headers, &state.upload_user, &state.upload_pass).is_err() {
-        return Err((StatusCode::UNAUTHORIZED, "Unauthorized"));
+    // auth - only check if credentials are configured
+    if let (Some(user), Some(pass)) = (&state.upload_user, &state.upload_pass) {
+        if check_basic_auth(&headers, user, pass).is_err() {
+            return Err((StatusCode::UNAUTHORIZED, "Unauthorized"));
+        }
     }
 
     let filename = filename_from_hint(&headers, q.filename.as_deref()).map_err(|_| {
@@ -197,8 +264,10 @@ async fn upload_redirect(
     let pkg_norm = normalize_pkg_name(&package);
     let key = format!("{PACKAGES_PREFIX}{pkg_norm}/{filename}");
 
-    // presign PUT URL
-    let presigned_url = presign_put(&state, &key, Duration::from_secs(15 * 60))
+    // presign/prepare upload URL
+    let upload_url = state
+        .storage
+        .presign_put(&key, Duration::from_secs(15 * 60))
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "presign failed"))?;
 
@@ -220,9 +289,29 @@ async fn upload_redirect(
     *resp.status_mut() = StatusCode::TEMPORARY_REDIRECT;
     resp.headers_mut().insert(
         header::LOCATION,
-        HeaderValue::from_str(&presigned_url).unwrap_or(HeaderValue::from_static("")),
+        HeaderValue::from_str(&upload_url).unwrap_or(HeaderValue::from_static("")),
     );
     Ok(resp)
+}
+
+/// Local/Disk upload sink used by DiskStorage::presign_put.
+/// The :token encodes the final object key (URL-safe base64).
+async fn local_upload(
+    State(state): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    body: Body,
+) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
+    let key = storage::DiskStorage::key_from_token(&token)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad upload token"))?;
+    let data = to_bytes(body, 100 * 1024 * 1024) // 100MB limit
+        .await
+        .map_err(|_| (StatusCode::BAD_REQUEST, "failed to read body"))?;
+    state
+        .storage
+        .put_bytes(&key, data.to_vec(), Some("application/octet-stream"))
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "write failed"))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn filename_from_hint(headers: &HeaderMap, query_filename: Option<&str>) -> Result<String> {
@@ -235,31 +324,15 @@ fn filename_from_hint(headers: &HeaderMap, query_filename: Option<&str>) -> Resu
     Err(anyhow!("no filename hint"))
 }
 
-async fn presign_put(state: &AppState, key: &str, ttl: Duration) -> Result<String> {
-    let presigned = state
-        .s3
-        .put_object()
-        .bucket(&state.bucket)
-        .key(key)
-        .content_type("application/octet-stream")
-        .presigned(PresigningConfig::expires_in(ttl)?)
-        .await?;
-    Ok(presigned.uri().to_string())
-}
-
 async fn wait_until_exists(state: &AppState, key: &str, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
-        if state
-            .s3
-            .head_object()
-            .bucket(&state.bucket)
-            .key(key)
-            .send()
-            .await
-            .is_ok()
-        {
-            return true;
+        match state.storage.head_exists(key).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error=?e, key=%key, "exists check failed");
+            }
         }
         if start.elapsed() >= timeout {
             return false;
@@ -289,21 +362,17 @@ async fn enqueue_job(state: &AppState, package: &str, filename: &str, s3_key: &s
     };
     let name = format!("{stamp}-{package}-{filename}.json");
     let body = serde_json::to_vec(&job)?;
+    let key = format!("{QUEUE_PENDING_PREFIX}{name}");
     state
-        .s3
-        .put_object()
-        .bucket(&state.bucket)
-        .key(format!("{QUEUE_PENDING_PREFIX}{name}"))
-        .body(ByteStream::from(body))
-        .content_type("application/json")
-        .send()
+        .storage
+        .put_bytes(&key, body, Some("application/json"))
         .await?;
     Ok(())
 }
 
 /// --- Simple index endpoints ----------------------------------------------
 async fn simple_root(State(state): State<Arc<AppState>>) -> Response<Body> {
-    stream_s3(
+    stream_object(
         &state,
         format!("{SIMPLE_PREFIX}index.html"),
         Some("text/html"),
@@ -313,7 +382,7 @@ async fn simple_root(State(state): State<Arc<AppState>>) -> Response<Body> {
 }
 
 async fn simple_root_json(State(state): State<Arc<AppState>>) -> Response<Body> {
-    stream_s3(
+    stream_object(
         &state,
         format!("{SIMPLE_PREFIX}index.json"),
         Some("application/json"),
@@ -324,7 +393,7 @@ async fn simple_root_json(State(state): State<Arc<AppState>>) -> Response<Body> 
 
 async fn simple_pkg(State(state): State<Arc<AppState>>, Path(pkg): Path<String>) -> Response<Body> {
     let pkg = normalize_pkg_name(&pkg);
-    stream_s3(
+    stream_object(
         &state,
         format!("{SIMPLE_PREFIX}{pkg}/index.html"),
         Some("text/html"),
@@ -338,7 +407,7 @@ async fn simple_pkg_json(
     Path(pkg): Path<String>,
 ) -> Response<Body> {
     let pkg = normalize_pkg_name(&pkg);
-    stream_s3(
+    stream_object(
         &state,
         format!("{SIMPLE_PREFIX}{pkg}/index.json"),
         Some("application/json"),
@@ -353,37 +422,29 @@ async fn files_get(
     Path((package, filename)): Path<(String, String)>,
 ) -> Response<Body> {
     let pkg = normalize_pkg_name(&package);
-    stream_s3(
-        &state,
-        format!("{PACKAGES_PREFIX}{pkg}/{filename}"),
-        None, // defer to object's content-type if set
-    )
-    .await
-    .unwrap_or_else(internal_or_404)
+    stream_object(&state, format!("{PACKAGES_PREFIX}{pkg}/{filename}"), None)
+        .await
+        .unwrap_or_else(internal_or_404)
 }
 
-async fn stream_s3(
+async fn stream_object(
     state: &AppState,
     key: String,
     override_ct: Option<&'static str>,
 ) -> Result<Response<Body>> {
-    let out = state
-        .s3
-        .get_object()
-        .bucket(&state.bucket)
-        .key(&key)
-        .send()
+    let out: ObjectData = state
+        .storage
+        .get_bytes(&key)
         .await
-        .with_context(|| format!("get_object {key}"))?;
+        .with_context(|| key.clone())?;
 
     let ct = override_ct
         .map(std::string::ToString::to_string)
-        .or_else(|| out.content_type().map(std::string::ToString::to_string))
+        .or(out.content_type.clone())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    let content_length = out.content_length();
-    let data = out.body.collect().await?.into_bytes();
-    let mut resp = Response::new(Body::from(data));
+    let content_length = out.content_length;
+    let mut resp = Response::new(Body::from(out.bytes));
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_str(&ct).unwrap_or(HeaderValue::from_static("application/octet-stream")),
@@ -397,7 +458,7 @@ async fn stream_s3(
 }
 
 fn internal_or_404<E: std::fmt::Debug>(err: E) -> Response<Body> {
-    // If it's a NotFound from S3 we'd prefer a 404; for MVP, return 404 for all errors.
+    // If it's a NotFound we'd prefer a 404; MVP: return 404 for all errors.
     warn!(error=?err, "stream error");
     Response::builder()
         .status(StatusCode::NOT_FOUND)

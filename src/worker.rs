@@ -4,7 +4,6 @@ use std::{
 };
 
 use anyhow::Result;
-use aws_sdk_s3::{primitives::ByteStream, Client as S3Client};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -26,13 +25,13 @@ pub async fn run_worker(state: Arc<AppState>) {
 
 async fn tick(state: &AppState) -> Result<()> {
     // 1) list up to batch_size from pending/
-    let jobs = list_jobs(
-        &state.s3,
-        &state.bucket,
-        QUEUE_PENDING_PREFIX,
-        state.job_batch_size,
-    )
-    .await?;
+    let mut jobs = state
+        .storage
+        .list_prefix_files_limited(QUEUE_PENDING_PREFIX, state.job_batch_size)
+        .await?;
+    // Filter json job files only
+    jobs.retain(|k| k.ends_with(".json"));
+
     if jobs.is_empty() {
         info!("worker: no jobs");
         return Ok(());
@@ -44,14 +43,14 @@ async fn tick(state: &AppState) -> Result<()> {
     let mut claimed = Vec::new();
     for key in &jobs {
         let dst = key.replace(QUEUE_PENDING_PREFIX, QUEUE_PROCESSING_PREFIX);
-        copy_then_delete(&state.s3, &state.bucket, key, &dst).await?;
+        state.storage.copy_then_delete(key, &dst).await?;
         claimed.push(dst);
     }
 
     // 3) aggregate packages from job content or filename
     let mut touched: HashSet<String> = HashSet::new();
     for key in &claimed {
-        match read_job_package(&state.s3, &state.bucket, key).await {
+        match read_job_package(state, key).await {
             Ok(pkg) => {
                 touched.insert(pkg);
             }
@@ -66,68 +65,34 @@ async fn tick(state: &AppState) -> Result<()> {
 
     if touched.is_empty() {
         warn!("worker: no packages inferred; cleaning up claimed jobs");
-        delete_keys(&state.s3, &state.bucket, &claimed).await?;
+        state.storage.delete_keys(&claimed).await?;
         return Ok(());
     }
 
     // 4) per-package index regeneration
     for pkg in &touched {
-        let files = list_artifacts(&state.s3, &state.bucket, pkg).await?;
-        write_pkg_indexes(&state.s3, &state.bucket, pkg, &files).await?;
+        let files = list_artifacts(state, pkg).await?;
+        write_pkg_indexes(state, pkg, &files).await?;
     }
 
     // 5) global index regeneration (once per batch)
-    let packages = list_all_packages(&state.s3, &state.bucket).await?;
-    write_global_indexes(&state.s3, &state.bucket, &packages).await?;
+    let packages = list_all_packages(state).await?;
+    write_global_indexes(state, &packages).await?;
 
     // 6) cleanup processed jobs
-    delete_keys(&state.s3, &state.bucket, &claimed).await?;
+    state.storage.delete_keys(&claimed).await?;
     info!(count=?claimed.len(), "worker: jobs processed");
     Ok(())
 }
 
-async fn list_jobs(s3: &S3Client, bucket: &str, prefix: &str, limit: usize) -> Result<Vec<String>> {
-    let out = s3
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(prefix)
-        .max_keys(limit as i32)
-        .send()
-        .await?;
-    let mut keys = Vec::new();
-    for o in out.contents() {
-        if let Some(k) = o.key() {
-            if k.ends_with(".json") {
-                keys.push(k.to_string());
-            }
-        }
-    }
-    Ok(keys)
-}
-
-async fn copy_then_delete(s3: &S3Client, bucket: &str, src: &str, dst: &str) -> Result<()> {
-    // copy
-    let src_uri = format!("{bucket}/{src}");
-    s3.copy_object()
-        .bucket(bucket)
-        .key(dst)
-        .copy_source(src_uri)
-        .send()
-        .await?;
-    // delete src
-    s3.delete_object().bucket(bucket).key(src).send().await?;
-    Ok(())
-}
-
-async fn read_job_package(s3: &S3Client, bucket: &str, key: &str) -> Result<String> {
-    let out = s3.get_object().bucket(bucket).key(key).send().await?;
-    let data = out.body.collect().await?.into_bytes();
+async fn read_job_package(state: &AppState, key: &str) -> Result<String> {
+    let out = state.storage.get_bytes(key).await?;
     // Minimal JSON: {"package":"<name>", ...}
     #[derive(serde::Deserialize)]
     struct JobPkg {
         package: String,
     }
-    let job: JobPkg = serde_json::from_slice(&data)?;
+    let job: JobPkg = serde_json::from_slice(&out.bytes)?;
     Ok(job.package)
 }
 
@@ -140,113 +105,71 @@ fn infer_pkg_from_job_key(key: &str) -> Option<String> {
     Some(package)
 }
 
-async fn list_artifacts(s3: &S3Client, bucket: &str, pkg: &str) -> Result<Vec<String>> {
+async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<String>> {
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
-    let mut token = None;
-    let mut files = BTreeSet::new(); // stable order
-    loop {
-        let mut req = s3.list_objects_v2().bucket(bucket).prefix(&prefix);
-        if let Some(t) = token.take() {
-            req = req.continuation_token(t);
-        }
-        let out = req.send().await?;
-        for o in out.contents() {
-            if let Some(k) = o.key() {
-                if let Some(fname) = k.strip_prefix(&prefix) {
-                    if !fname.is_empty() {
-                        files.insert(fname.to_string());
-                    }
-                }
+    let mut files = BTreeSet::new();
+    for k in state.storage.list_dir_files(&prefix).await? {
+        if let Some(fname) = k.strip_prefix(&prefix) {
+            if !fname.is_empty() {
+                files.insert(fname.to_string());
             }
-        }
-        if out.is_truncated().unwrap_or(false) {
-            token = out.next_continuation_token.map(|s| s.to_string());
-        } else {
-            break;
         }
     }
     Ok(files.into_iter().collect())
 }
 
-async fn write_pkg_indexes(s3: &S3Client, bucket: &str, pkg: &str, files: &[String]) -> Result<()> {
+async fn write_pkg_indexes(state: &AppState, pkg: &str, files: &[String]) -> Result<()> {
     let html = pep503_package_html(pkg, files);
     let json = pep691_package_json(pkg, files);
 
     // /simple/<pkg>/index.html, index.json
     let base = format!("{SIMPLE_PREFIX}{pkg}/");
-    s3.put_object()
-        .bucket(bucket)
-        .key(format!("{base}index.html"))
-        .content_type("text/html; charset=utf-8")
-        .body(ByteStream::from(html.into_bytes()))
-        .send()
+    state
+        .storage
+        .put_bytes(
+            &format!("{base}index.html"),
+            html.into_bytes(),
+            Some("text/html; charset=utf-8"),
+        )
         .await?;
-    s3.put_object()
-        .bucket(bucket)
-        .key(format!("{base}index.json"))
-        .content_type("application/json")
-        .body(ByteStream::from(json.into_bytes()))
-        .send()
+    state
+        .storage
+        .put_bytes(
+            &format!("{base}index.json"),
+            json.into_bytes(),
+            Some("application/json"),
+        )
         .await?;
     Ok(())
 }
 
-async fn list_all_packages(s3: &S3Client, bucket: &str) -> Result<Vec<String>> {
-    // Enumerate under /packages/ to get canonical package set
-    let prefix = super::PACKAGES_PREFIX.to_string();
-    let mut token = None;
+async fn list_all_packages(state: &AppState) -> Result<Vec<String>> {
     let mut pkgs = BTreeSet::new();
-    loop {
-        let mut req = s3
-            .list_objects_v2()
-            .bucket(bucket)
-            .prefix(&prefix)
-            .delimiter("/");
-        if let Some(t) = token.take() {
-            req = req.continuation_token(t);
-        }
-        let out = req.send().await?;
-        for cp in out.common_prefixes() {
-            if let Some(p) = cp.prefix() {
-                if let Some(name) = p.strip_prefix(&prefix).and_then(|s| s.strip_suffix('/')) {
-                    pkgs.insert(name.to_string());
-                }
-            }
-        }
-        if out.is_truncated().unwrap_or(false) {
-            token = out.next_continuation_token.map(|s| s.to_string());
-        } else {
-            break;
-        }
+    for name in state.storage.list_dirs(PACKAGES_PREFIX).await? {
+        pkgs.insert(name);
     }
     Ok(pkgs.into_iter().collect())
 }
 
-async fn write_global_indexes(s3: &S3Client, bucket: &str, packages: &[String]) -> Result<()> {
+async fn write_global_indexes(state: &AppState, packages: &[String]) -> Result<()> {
     let html = pep503_global_html(packages);
     let json = pep691_global_json(packages);
 
-    s3.put_object()
-        .bucket(bucket)
-        .key(format!("{SIMPLE_PREFIX}index.html"))
-        .content_type("text/html; charset=utf-8")
-        .body(ByteStream::from(html.into_bytes()))
-        .send()
+    state
+        .storage
+        .put_bytes(
+            &format!("{SIMPLE_PREFIX}index.html"),
+            html.into_bytes(),
+            Some("text/html; charset=utf-8"),
+        )
         .await?;
-    s3.put_object()
-        .bucket(bucket)
-        .key(format!("{SIMPLE_PREFIX}index.json"))
-        .content_type("application/json")
-        .body(ByteStream::from(json.into_bytes()))
-        .send()
+    state
+        .storage
+        .put_bytes(
+            &format!("{SIMPLE_PREFIX}index.json"),
+            json.into_bytes(),
+            Some("application/json"),
+        )
         .await?;
-    Ok(())
-}
-
-async fn delete_keys(s3: &S3Client, bucket: &str, keys: &[String]) -> Result<()> {
-    // S3 DeleteObjects could batch; MVP: delete one-by-one for simplicity
-    for k in keys {
-        let _ = s3.delete_object().bucket(bucket).key(k).send().await;
-    }
     Ok(())
 }

@@ -24,3 +24,4 @@ build/
 
 # macOS
 .DS_Store
+pypiron-data/

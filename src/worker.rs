@@ -71,7 +71,7 @@ async fn tick(state: &AppState) -> Result<()> {
     }
 
     // 4) per-package index regeneration
-    for pkg in touched.iter() {
+    for pkg in &touched {
         let files = list_artifacts(&state.s3, &state.bucket, pkg).await?;
         write_pkg_indexes(&state.s3, &state.bucket, pkg, &files).await?;
     }

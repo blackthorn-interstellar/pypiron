@@ -6,7 +6,7 @@ pub fn pep503_package_html(package: &str, files: &[String]) -> String {
     // Links are relative to the API under /files/<pkg>/<filename>
     let mut body = String::new();
     body.push_str(&format!(
-        r#"<html><head><title>Links for {}</title></head><body>"#,
+        r"<html><head><title>Links for {}</title></head><body>",
         encode_text(package)
     ));
     for f in files {
@@ -23,7 +23,7 @@ pub fn pep503_package_html(package: &str, files: &[String]) -> String {
 /// Render minimal PEP 503 global HTML index.
 pub fn pep503_global_html(packages: &[String]) -> String {
     let mut body = String::new();
-    body.push_str(r#"<html><head><title>Simple index</title></head><body>"#);
+    body.push_str(r"<html><head><title>Simple index</title></head><body>");
     for p in packages {
         let p = encode_text(p);
         body.push_str(&format!(r#"<a href="/simple/{p}/">{p}</a><br/>"#));
@@ -60,7 +60,7 @@ pub fn pep691_package_json(package: &str, files: &[String]) -> String {
         .iter()
         .map(|f| Pep691File {
             filename: f.clone(),
-            url: format!("/files/{}/{}", package, f),
+            url: format!("/files/{package}/{f}"),
             yanked: None,
         })
         .collect();
@@ -92,7 +92,7 @@ pub fn pep691_global_json(packages: &[String]) -> String {
         .iter()
         .map(|p| Pep691ProjectRef {
             name: p,
-            url: format!("/simple/{}/", p),
+            url: format!("/simple/{p}/"),
         })
         .collect();
 

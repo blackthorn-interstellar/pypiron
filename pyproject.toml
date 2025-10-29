@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pypiron"
+version = "0.1.0"
+description = "A fast, reliable, and scalable PyPI server"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "pypiron contributors" }
+]
+keywords = ["pypi", "package-server", "rust", "s3"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Software Distribution",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Repository = "https://github.com/brycedrennan/pypiron"
+
+[tool.maturin]
+# "bin" bindings means we're packaging a Rust binary, not a Python extension
+bindings = "bin"
+# Strip debug symbols to reduce binary size
+strip = true
+

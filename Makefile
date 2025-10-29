@@ -17,7 +17,9 @@ test:  ## Run unit tests
 test-integration:  ## Run integration tests (requires Docker)
 	./test_simple.sh
 
-check:  ## Check the project for compilation errors
+check: af cargo-check lint
+
+cargo-check:  ## Check the project for compilation errors
 	$(CARGO) check
 
 af: fmt

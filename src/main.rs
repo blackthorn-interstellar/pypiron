@@ -15,6 +15,7 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::time::sleep;
@@ -27,6 +28,59 @@ const PACKAGES_PREFIX: &str = "packages/";
 const SIMPLE_PREFIX: &str = "simple/";
 const QUEUE_PENDING_PREFIX: &str = "_internal/queue/pending/";
 const QUEUE_PROCESSING_PREFIX: &str = "_internal/queue/processing/";
+
+/// `PypIron` - A fast, reliable, and scalable `PyPI` server
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// S3 bucket name for package storage
+    #[arg(long, env = "PYPIRON_S3_BUCKET")]
+    s3_bucket: String,
+
+    /// AWS region (e.g., us-east-1)
+    #[arg(long, env = "AWS_REGION")]
+    aws_region: Option<String>,
+
+    /// S3 endpoint URL (for S3-compatible services)
+    #[arg(long, env = "PYPIRON_S3_ENDPOINT_URL")]
+    s3_endpoint_url: Option<String>,
+
+    /// Force S3 path-style addressing
+    #[arg(long, env = "PYPIRON_S3_FORCE_PATH_STYLE")]
+    s3_force_path_style: bool,
+
+    /// Basic auth username for uploads
+    #[arg(long, env = "PYPIRON_BASIC_AUTH_USER")]
+    basic_auth_user: String,
+
+    /// Basic auth password for uploads
+    #[arg(long, env = "PYPIRON_BASIC_AUTH_PASS")]
+    basic_auth_pass: String,
+
+    /// Worker interval in seconds
+    #[arg(long, env = "PYPIRON_WORKER_INTERVAL_SECS", default_value = "300")]
+    worker_interval_secs: u64,
+
+    /// Number of jobs to process per worker batch
+    #[arg(long, env = "PYPIRON_JOB_BATCH_SIZE", default_value = "20")]
+    job_batch_size: usize,
+
+    /// Upload confirmation timeout in seconds
+    #[arg(
+        long,
+        env = "PYPIRON_UPLOAD_CONFIRM_TIMEOUT_SECS",
+        default_value = "300"
+    )]
+    upload_confirm_timeout_secs: u64,
+
+    /// Public base URL for generating absolute URLs (optional)
+    #[arg(long, env = "PYPIRON_PUBLIC_BASE_URL")]
+    public_base_url: Option<String>,
+
+    /// Address to bind the server to
+    #[arg(long, env = "PYPIRON_BIND_ADDR", default_value = "0.0.0.0:8080")]
+    bind_addr: String,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -55,69 +109,38 @@ async fn main() -> Result<()> {
     // logging
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| {
-            "info,s3_pypi_mvp=info,aws_config=warn,aws_smithy_http_tower=warn".into()
+            "info,pypiron=info,aws_config=warn,aws_smithy_http_tower=warn".into()
         }))
         .init();
 
-    // config from env
-    let bucket = std::env::var("S3_BUCKET").context("S3_BUCKET env var is required")?;
-
-    let region = std::env::var("AWS_REGION").ok();
-    let s3_endpoint = std::env::var("S3_ENDPOINT_URL").ok();
-    let force_path_style = std::env::var("S3_FORCE_PATH_STYLE")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    let upload_user =
-        std::env::var("BASIC_AUTH_USER").context("BASIC_AUTH_USER env var is required")?;
-    let upload_pass =
-        std::env::var("BASIC_AUTH_PASS").context("BASIC_AUTH_PASS env var is required")?;
-
-    let worker_interval = std::env::var("WORKER_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(300));
-
-    let job_batch_size = std::env::var("JOB_BATCH_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(20);
-
-    let upload_confirm_timeout = std::env::var("UPLOAD_CONFIRM_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(300));
-
-    let public_base_url = std::env::var("PUBLIC_BASE_URL").ok();
+    // parse CLI args (with env var fallbacks)
+    let cli = Cli::parse();
 
     // AWS config
     let mut cfg_loader = aws_config::defaults(BehaviorVersion::latest());
-    if let Some(ref r) = region {
+    if let Some(ref r) = cli.aws_region {
         cfg_loader = cfg_loader.region(Region::new(r.clone()));
     }
     let base_cfg = cfg_loader.load().await;
 
     let mut s3_cfg_builder = aws_sdk_s3::config::Builder::from(&base_cfg);
-    if let Some(url) = s3_endpoint {
+    if let Some(url) = cli.s3_endpoint_url {
         s3_cfg_builder = s3_cfg_builder.endpoint_url(url);
     }
-    if force_path_style {
+    if cli.s3_force_path_style {
         s3_cfg_builder = s3_cfg_builder.force_path_style(true);
     }
     let s3 = S3Client::from_conf(s3_cfg_builder.build());
 
     let state = Arc::new(AppState {
         s3,
-        bucket,
-        upload_user,
-        upload_pass,
-        worker_interval,
-        job_batch_size,
-        upload_confirm_timeout,
-        public_base_url,
+        bucket: cli.s3_bucket,
+        upload_user: cli.basic_auth_user,
+        upload_pass: cli.basic_auth_pass,
+        worker_interval: Duration::from_secs(cli.worker_interval_secs),
+        job_batch_size: cli.job_batch_size,
+        upload_confirm_timeout: Duration::from_secs(cli.upload_confirm_timeout_secs),
+        public_base_url: cli.public_base_url,
     });
 
     // router
@@ -136,9 +159,8 @@ async fn main() -> Result<()> {
     tokio::spawn(worker::run_worker(state.clone()));
 
     // serve
-    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
-    info!("listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    info!("listening on http://{}", cli.bind_addr);
+    let listener = tokio::net::TcpListener::bind(&cli.bind_addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -173,7 +195,7 @@ async fn upload_redirect(
 
     let package = infer_package_from_filename(&filename);
     let pkg_norm = normalize_pkg_name(&package);
-    let key = format!("{PACKAGES_PREFIX}{}/{}", pkg_norm, filename);
+    let key = format!("{PACKAGES_PREFIX}{pkg_norm}/{filename}");
 
     // presign PUT URL
     let presigned_url = presign_put(&state, &key, Duration::from_secs(15 * 60))
@@ -228,22 +250,21 @@ async fn presign_put(state: &AppState, key: &str, ttl: Duration) -> Result<Strin
 async fn wait_until_exists(state: &AppState, key: &str, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
-        match state
+        if state
             .s3
             .head_object()
             .bucket(&state.bucket)
             .key(key)
             .send()
             .await
+            .is_ok()
         {
-            Ok(_) => return true,
-            Err(_) => {
-                if start.elapsed() >= timeout {
-                    return false;
-                }
-                sleep(Duration::from_secs(3)).await;
-            }
+            return true;
         }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        sleep(Duration::from_secs(3)).await;
     }
 }
 
@@ -312,7 +333,10 @@ async fn simple_pkg(State(state): State<Arc<AppState>>, Path(pkg): Path<String>)
     .unwrap_or_else(internal_or_404)
 }
 
-async fn simple_pkg_json(State(state): State<Arc<AppState>>, Path(pkg): Path<String>) -> Response<Body> {
+async fn simple_pkg_json(
+    State(state): State<Arc<AppState>>,
+    Path(pkg): Path<String>,
+) -> Response<Body> {
     let pkg = normalize_pkg_name(&pkg);
     stream_s3(
         &state,
@@ -353,8 +377,8 @@ async fn stream_s3(
         .with_context(|| format!("get_object {key}"))?;
 
     let ct = override_ct
-        .map(|s| s.to_string())
-        .or_else(|| out.content_type().map(|s| s.to_string()))
+        .map(std::string::ToString::to_string)
+        .or_else(|| out.content_type().map(std::string::ToString::to_string))
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
     let content_length = out.content_length();
@@ -424,8 +448,7 @@ fn infer_package_from_filename(filename: &str) -> String {
         stem.split_at(idx)
             .0
             .rsplit_once('-')
-            .map(|(d, _)| d)
-            .unwrap_or(stem)
+            .map_or(stem, |(d, _)| d)
     } else if let Some((d, _v)) = stem.rsplit_once('-') {
         d
     } else {

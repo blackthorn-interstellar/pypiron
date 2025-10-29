@@ -1,9 +1,4 @@
-# PypIron
-<p align="center">
-  <img src="docs/pypiron-logo-256.png" alt="PypIron logo" width="180"/>
-</p>
-
-
+# <img src="docs/pypiron-logo-256.png" alt="PypIron logo" width="40" style="vertical-align: middle;"/> PypIron
 
 A fast and reliable PyPI server built with Rust.
 

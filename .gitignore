@@ -1,4 +1,26 @@
+# Rust
 /target
+.cargo/
+
+# Python
 /downloaded
 /dist
 .test-venv
+*.pyc
+__pycache__/
+*.egg-info/
+.eggs/
+*.whl
+*.tar.gz
+
+# Build artifacts
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store

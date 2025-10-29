@@ -1,18 +1,23 @@
-.PHONY: build test check fmt lint clean help test-integration
+.PHONY: build test check fmt lint clean help test-integration build-wheel build-sdist install-maturin release-build
 
 SHELL := /bin/bash
-CARGO := cargo
 
 .DEFAULT_GOAL := help
 
 build:  ## Build the project in release mode
-	$(CARGO) build --release
+	cargo build --release
+
+build-wheel:  ## Build Python wheel package
+	maturin build --release
+
+release-build:  ## Build wheel with optimizations for release
+	maturin build --release --strip
 
 dev:  ## Build the project in development mode
-	$(CARGO) build
+	cargo build
 
 test:  ## Run unit tests
-	$(CARGO) test
+	cargo test
 
 test-integration:  ## Run integration tests (requires Docker)
 	./test_simple.sh
@@ -20,28 +25,32 @@ test-integration:  ## Run integration tests (requires Docker)
 check: af cargo-check lint
 
 cargo-check:  ## Check the project for compilation errors
-	$(CARGO) check
+	cargo check
 
 af: fmt
 fmt:  ## Format the code using rustfmt
-	$(CARGO) fmt --all
+	cargo fmt --all
 
 lint:  ## Run clippy lints
-	$(CARGO) clippy -- -D warnings
+	cargo clippy -- -D warnings
 
 clean:  ## Clean build artifacts
-	$(CARGO) clean
+	cargo clean
 
 doc:  ## Generate documentation
-	$(CARGO) doc --no-deps
+	cargo doc --no-deps
 
 init:  ## Setup development tools
 	rustup component add rustfmt
 	rustup component add clippy
-	$(CARGO) build
+	cargo build
+	uv sync --all-extras
 
 watch-test:  ## Run tests in watch mode
-	$(CARGO) watch -x test
+	cargo watch -x test
+
+publish:  ## Publish package to pypi.org
+	maturin publish
 
 help:  ## Display this help message
 	@grep -h -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}' 

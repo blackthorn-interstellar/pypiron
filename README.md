@@ -7,6 +7,12 @@
 
 A fast and reliable PyPI server built with Rust.
 
+## Getting Started
+
+```bash
+uvx pypiron  # runs pypiron server locally
+```
+
 ## Features
 - No database required
 - S3-backed storage (works with AWS S3 and S3-compatible services)
@@ -34,12 +40,11 @@ docker run --rm -it -p 8080:8080 \
   pypiron:latest
 ```
 
-### Running Locally
+### Running from PyPI Installation
 
-Build and run:
+After installing via pip:
 ```bash
-cargo build --release
-./target/release/pypiron \
+pypiron \
   --s3-bucket my-bucket \
   --basic-auth-user admin \
   --basic-auth-pass mypassword
@@ -127,8 +132,6 @@ export PYPIRON_BASIC_AUTH_PASS=secret123
 # Override bucket via CLI
 pypiron --s3-bucket production-bucket
 ```
-
-
 
 ## storage file structure
 

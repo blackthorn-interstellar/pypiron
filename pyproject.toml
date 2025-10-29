@@ -30,3 +30,7 @@ bindings = "bin"
 # Strip debug symbols to reduce binary size
 strip = true
 
+[dependency-groups]
+dev = [
+    "maturin",
+]

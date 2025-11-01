@@ -2,13 +2,15 @@
 
 A fast and reliable PyPI server built with Rust.
 
-**New in this release:** PypIron can run against a **local disk** or **S3**.
-The default is **disk** (no cloud required).
+**Scope:** ruthlessly minimal, production‑friendly.
+**Backends:** local **disk** (default) or **S3/S3‑compatible**.
+**APIs:** PEP 503 (HTML) + PEP 691 (JSON).
+**Uploads:** **legacy endpoint only** (`/legacy`), compatible with `uv publish` and `twine`.
 
 ## Getting Started
 
 ```bash
-uvx pypiron  # runs pypiron server locally; stores data in ./pypiron-data
+uvx pypiron   # runs pypiron server locally; stores data under ./pypiron-data
 ````
 
 ### Quick smoke test (disk backend)
@@ -19,23 +21,90 @@ PYPIRON_BASIC_AUTH_USER=admin \
 PYPIRON_BASIC_AUTH_PASS=secret \
 uvx pypiron
 
-# Upload an artifact (simulate client)
-# Note: this endpoint expects a raw body and a filename hint
-curl -u admin:secret -X POST "http://localhost:8080/?filename=demo-0.1.0-py3-none-any.whl" --data-binary @path/to/wheel.whl -i
+# Upload an artifact (legacy multipart) with uv:
+uv publish --publish-url http://localhost:8080/legacy/ \
+  --username admin --password secret \
+  path/to/demo-0.1.0-py3-none-any.whl
 
-# Indexes will appear under ./pypiron-data/simple/
+# Or upload with curl (multipart form):
+curl -u admin:secret -X POST http://localhost:8080/legacy/ \
+  -F "content=@path/to/demo-0.1.0-py3-none-any.whl"
+
+# Browse indexes:
 open http://localhost:8080/simple/
 ```
 
 ## Features
 
-* **Disk-backed storage (default)** — zero external dependencies
-* S3-backed storage (works with AWS S3 and S3-compatible services)
-* No database required
-* Background worker for index generation
-* PEP 503 and PEP 691 compliant
+* **Disk-backed** storage (default) — zero external deps
+* **S3-backed** storage (AWS S3 and S3‑compatible)
+* No database
+* Background worker regenerates indexes
+* PEP 503 (HTML) and PEP 691 (JSON)
 * Basic authentication for uploads
-* Docker support
+* Docker-friendly
+
+## Mirroring packages with `pypiron sync`
+
+Mirror packages from the public PyPI (default) into your PypIron server.
+
+**Create a list file (names only — no versions):**
+
+```text
+# packages.txt
+requests
+numpy
+uvloop
+```
+
+* One name per line.
+* **No versions** (the sync copies **all releases/files** for each package).
+* Blank lines and `#` comments are ignored.
+
+**Run the sync:**
+
+```bash
+# Mirror into a local PypIron running on port 8080 (with basic auth)
+pypiron sync \
+  --packages-list packages.txt \
+  --to http://localhost:8080 \
+  --username admin \
+  --password secret
+```
+
+**Common filters (optional):**
+
+* `--only-wheels` — only copy `.whl` files
+* `--only-sdists` — only copy sdists (e.g. `.tar.gz`, `.zip`)
+* `--python-tag` — include wheels matching python tag(s) (repeatable or comma-separated),
+  e.g. `--python-tag py3`, `--python-tag cp311`
+* `--abi-tag` — include wheels with ABI tag(s),
+  e.g. `--abi-tag none`, `--abi-tag cp311`
+* `--platform-tag` — include wheels with platform tag(s); supports `*` wildcard,
+  e.g. `--platform-tag any`, `--platform-tag manylinux2014_x86_64`,
+  `--platform-tag macosx_*_arm64`, `--platform-tag win_amd64`
+* `--exclude-platform-tag` — exclude platform tags (supports `*`)
+
+**Examples:**
+
+```bash
+# Pure-Python wheels for py3 on any platform
+pypiron sync --packages-list packages.txt --to http://localhost:8080 \
+  --only-wheels --python-tag py3 --platform-tag any
+
+# CPython 3.11 Linux x86_64 wheels (manylinux)
+pypiron sync --packages-list packages.txt --to http://localhost:8080 \
+  --only-wheels --python-tag cp311 --platform-tag manylinux2014_x86_64
+
+# macOS arm64 wheels (any macOS version)
+pypiron sync --packages-list packages.txt --to http://localhost:8080 \
+  --only-wheels --platform-tag macosx_*_arm64
+
+# Only sdists (no wheels)
+pypiron sync --packages-list packages.txt --to http://localhost:8080 --only-sdists
+```
+
+PypIron’s background worker will detect the uploads and regenerate indexes automatically.
 
 ## Running with Docker
 
@@ -60,9 +129,7 @@ docker run --rm -it -p 8080:8080 \
   pypiron:latest
 ```
 
-## Running from PyPI Installation
-
-After installing via pip:
+## Running from PyPI Install
 
 ```bash
 # Disk (default)
@@ -78,129 +145,69 @@ pypiron \
   --basic-auth-pass mypassword
 ```
 
-## Using with pip/twine
-
-Configure pip to use your PyPI server:
+## Using with pip / uv / twine
 
 ```bash
 # Install from your server
 pip install --index-url http://localhost:8080/simple/ mypackage
 
-# Upload with twine (PypIron uses a redirect-based upload flow)
-twine upload --repository-url http://localhost:8080/ \
+# Upload with uv (recommended)
+uv publish --publish-url http://localhost:8080/legacy/ \
   --username admin --password mypassword \
+  dist/*.whl
+
+# Upload with twine
+twine upload --repository-url http://localhost:8080/legacy/ \
+  -u admin -p mypassword \
   dist/*
 ```
 
-> **Note on uploads:** for now, PypIron expects a filename hint via either the `X-Filename` header or `?filename=` query string. If your client does not provide one, you can `curl` as shown above or add the header in your upload tooling.
+> **Uploads are legacy-only.** PypIron expects **multipart/form-data** with the file in `content` (or `file`).
+> The filename is taken from the part’s `filename`; a text field `filename` is also accepted if the part lacks it.
 
 ## Configuration
 
-All configuration options can be set via **command line arguments** or **environment variables**. Command line arguments take precedence over environment variables.
+All options are available via CLI args and/or environment variables (CLI takes precedence).
 
-Run `pypiron --help` to see all available options.
+### Required for uploads
 
-### Required Configuration
+| CLI Arg             | Env Var                   | Description              |
+| ------------------- | ------------------------- | ------------------------ |
+| `--basic-auth-user` | `PYPIRON_BASIC_AUTH_USER` | Username for upload auth |
+| `--basic-auth-pass` | `PYPIRON_BASIC_AUTH_PASS` | Password for upload auth |
 
-| CLI Argument        | Environment Variable      | Description                        |
-| ------------------- | ------------------------- | ---------------------------------- |
-| `--basic-auth-user` | `PYPIRON_BASIC_AUTH_USER` | Username for upload authentication |
-| `--basic-auth-pass` | `PYPIRON_BASIC_AUTH_PASS` | Password for upload authentication |
+### Storage selection
 
-### Storage Selection
+| CLI Arg                 | Env Var                       | Default          | Description                          |
+| ----------------------- | ----------------------------- | ---------------- | ------------------------------------ |
+| `--storage {disk\|s3}`  | `PYPIRON_STORAGE`             | `disk`           | Select storage backend               |
+| `--data-dir PATH`       | `PYPIRON_DATA_DIR`            | `./pypiron-data` | Root when using `disk`               |
+| `--s3-bucket NAME`      | `PYPIRON_S3_BUCKET`           | *(required)*     | Bucket when using `s3`               |
+| `--aws-region`          | `AWS_REGION`                  | *(none)*         | AWS region                           |
+| `--s3-endpoint-url`     | `PYPIRON_S3_ENDPOINT_URL`     | *(none)*         | S3-compatible endpoint (e.g., MinIO) |
+| `--s3-force-path-style` | `PYPIRON_S3_FORCE_PATH_STYLE` | `false`          | Force path-style addressing          |
 
-| CLI Argument           | Environment Variable | Default               | Description                              |
-| ---------------------- | -------------------- | --------------------- | ---------------------------------------- |
-| `--storage {disk\|s3}` | `PYPIRON_STORAGE`    | `disk`                | Select storage backend                   |
-| `--data-dir PATH`      | `PYPIRON_DATA_DIR`   | `./pypiron-data`      | Root directory when using `disk` backend |
-| `--s3-bucket NAME`     | `PYPIRON_S3_BUCKET`  | *(required for `s3`)* | S3 bucket for package storage            |
+### Server & worker
 
-### Optional Configuration
+| CLI Arg                  | Env Var                        | Default        | Description                    |
+| ------------------------ | ------------------------------ | -------------- | ------------------------------ |
+| `--bind-addr`            | `PYPIRON_BIND_ADDR`            | `0.0.0.0:8080` | Listen address                 |
+| `--worker-interval-secs` | `PYPIRON_WORKER_INTERVAL_SECS` | `5`            | Worker tick interval (seconds) |
+| `--job-batch-size`       | `PYPIRON_JOB_BATCH_SIZE`       | `20`           | Jobs processed per tick        |
 
-| CLI Argument                    | Environment Variable                  | Default        | Description                                     |
-| ------------------------------- | ------------------------------------- | -------------- | ----------------------------------------------- |
-| `--aws-region`                  | `AWS_REGION`                          | *(none)*       | AWS region (e.g., us-east-1)                    |
-| `--s3-endpoint-url`             | `PYPIRON_S3_ENDPOINT_URL`             | *(none)*       | Custom S3 endpoint (for S3-compatible services) |
-| `--s3-force-path-style`         | `PYPIRON_S3_FORCE_PATH_STYLE`         | `false`        | Force S3 path-style addressing                  |
-| `--bind-addr`                   | `PYPIRON_BIND_ADDR`                   | `0.0.0.0:8080` | Address to bind the server to                   |
-| `--worker-interval-secs`        | `PYPIRON_WORKER_INTERVAL_SECS`        | `300`          | Worker polling interval in seconds              |
-| `--job-batch-size`              | `PYPIRON_JOB_BATCH_SIZE`              | `20`           | Number of jobs to process per batch             |
-| `--upload-confirm-timeout-secs` | `PYPIRON_UPLOAD_CONFIRM_TIMEOUT_SECS` | `300`          | Upload confirmation timeout in seconds          |
-| `--public-base-url`             | `PYPIRON_PUBLIC_BASE_URL`             | *(none)*       | Public base URL for generating absolute URLs    |
+**AWS credentials** follow standard AWS SDK envs: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`.
 
-**Note:** Standard AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) are not prefixed and follow AWS SDK conventions.
+## Storage layout
 
-### Example Configurations
-
-**Disk (default):**
-
-```bash
-export PYPIRON_BASIC_AUTH_USER=admin
-export PYPIRON_BASIC_AUTH_PASS=secret123
-pypiron  # uses ./pypiron-data
 ```
-
-**Disk with custom data dir:**
-
-```bash
-pypiron --data-dir /srv/pypiron-data \
-  --basic-auth-user admin --basic-auth-pass secret123
+/packages/<project>/<filename.whl|tar.gz>
+/simple/index.html
+/simple/index.json
+/simple/<project>/index.html
+/simple/<project>/index.json
+/_internal/queue/pending/*.json
+/_internal/queue/processing/*.json
 ```
-
-**S3:**
-
-```bash
-export PYPIRON_STORAGE=s3
-export PYPIRON_S3_BUCKET=my-pypi-bucket
-export PYPIRON_BASIC_AUTH_USER=admin
-export PYPIRON_BASIC_AUTH_PASS=secret123
-export AWS_REGION=us-west-2
-pypiron
-```
-
-**Using S3-compatible storage (e.g., MinIO):**
-
-```bash
-pypiron \
-  --storage s3 \
-  --s3-bucket my-bucket \
-  --s3-endpoint-url http://localhost:9000 \
-  --s3-force-path-style \
-  --basic-auth-user admin \
-  --basic-auth-pass secret123
-```
-
-**Mixed configuration (CLI overrides env vars):**
-
-```bash
-export PYPIRON_STORAGE=s3
-export PYPIRON_S3_BUCKET=default-bucket
-export PYPIRON_BASIC_AUTH_USER=admin
-export PYPIRON_BASIC_AUTH_PASS=secret123
-
-# Override bucket via CLI
-pypiron --s3-bucket production-bucket
-```
-
-## storage file structure
-
-Whether on disk or in S3, the logical layout is the same (on disk this is rooted at `--data-dir`):
-
-* /index.json
-* /change-log/
-* /packages/
-
-  * __index.html
-  * __index.json
-  * package-name/
-
-    * __index.html
-    * __index.json
-    * files/
-
-      * distribution(.whl|tar.gz)
-      * distribution(.asc)
-      * distribution.metadata.json
 
 ## Ecosystem
 
@@ -210,12 +217,8 @@ Whether on disk or in S3, the logical layout is the same (on disk this is rooted
 * warehouse
 * gitlab
 
-## useful docs
+## References
 
-* [https://warehouse.pypa.io/api-reference/legacy.html](https://warehouse.pypa.io/api-reference/legacy.html)
-* [https://peps.python.org/pep-0426/](https://peps.python.org/pep-0426/)
-* [https://peps.python.org/pep-0503/](https://peps.python.org/pep-0503/)
-* [https://peps.python.org/pep-0691/](https://peps.python.org/pep-0691/)
-* [https://github.com/nchepanov/peps/blob/warehouse_json_api/pep-9999.rst](https://github.com/nchepanov/peps/blob/warehouse_json_api/pep-9999.rst)
-* [making multi-service docker containers](https://docs.docker.com/config/containers/multi-service_container/)
-* [uwsgi-nginx docker container example](https://github.com/tiangolo/uwsgi-nginx-docker/blob/master/docker-images/python3.9.dockerfile)
+* PEP 503 — Simple Repository API (HTML)
+* PEP 691 — Simple Repository API (JSON)
+* Warehouse legacy upload API

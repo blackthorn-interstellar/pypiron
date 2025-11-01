@@ -1,8 +1,16 @@
 use html_escape::encode_text;
 use serde::Serialize;
+use std::collections::HashMap;
+
+/// File metadata for rendering indexes
+#[derive(Clone, Debug)]
+pub struct FileMetadata {
+    pub filename: String,
+    pub sha256: String,
+}
 
 /// Render minimal PEP 503 per‑package HTML.
-pub fn pep503_package_html(package: &str, files: &[String]) -> String {
+pub fn pep503_package_html(package: &str, files: &[FileMetadata]) -> String {
     // Links are relative to the API under /files/<pkg>/<filename>
     let mut body = String::new();
     body.push_str(&format!(
@@ -10,7 +18,7 @@ pub fn pep503_package_html(package: &str, files: &[String]) -> String {
         encode_text(package)
     ));
     for f in files {
-        let fname = encode_text(f);
+        let fname = encode_text(&f.filename);
         body.push_str(&format!(
             r#"<a href="/files/{}/{fname}">{fname}</a><br/>"#,
             encode_text(package)
@@ -36,6 +44,7 @@ pub fn pep503_global_html(packages: &[String]) -> String {
 struct Pep691File {
     filename: String,
     url: String,
+    hashes: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     yanked: Option<bool>,
 }
@@ -55,13 +64,18 @@ struct Pep691Meta<'a> {
 }
 
 /// Minimal PEP 691 package JSON.
-pub fn pep691_package_json(package: &str, files: &[String]) -> String {
+pub fn pep691_package_json(package: &str, files: &[FileMetadata]) -> String {
     let files: Vec<Pep691File> = files
         .iter()
-        .map(|f| Pep691File {
-            filename: f.clone(),
-            url: format!("/files/{package}/{f}"),
-            yanked: None,
+        .map(|f| {
+            let mut hashes = HashMap::new();
+            hashes.insert("sha256".to_string(), f.sha256.clone());
+            Pep691File {
+                filename: f.filename.clone(),
+                url: format!("/files/{package}/{}", f.filename),
+                hashes,
+                yanked: None,
+            }
         })
         .collect();
 

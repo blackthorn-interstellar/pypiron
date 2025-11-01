@@ -1,17 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use std::{
-    path::{Component, Path, PathBuf},
-    time::Duration,
-};
+use std::path::{Component, Path, PathBuf};
 
 use tokio::fs;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as b64url;
-use base64::Engine;
-
 // S3 deps
-use aws_sdk_s3::{presigning::PresigningConfig, primitives::ByteStream, Client as S3Client};
+use aws_sdk_s3::{primitives::ByteStream, Client as S3Client};
 
 /// Object payload returned by storage backends.
 pub struct ObjectData {
@@ -22,10 +16,6 @@ pub struct ObjectData {
 
 #[async_trait]
 pub trait Storage: Send + Sync {
-    /// Return a presigned/redirect target URL for uploading `key` within `ttl`.
-    /// For the Disk backend this returns a local path like `/_upload/<token>`.
-    async fn presign_put(&self, key: &str, ttl: Duration) -> Result<String>;
-
     /// Check if an object exists.
     async fn head_exists(&self, key: &str) -> Result<bool>;
 
@@ -84,27 +74,10 @@ impl DiskStorage {
         }
         Ok(())
     }
-
-    /// Encode an upload token that carries the key.
-    fn token_for_key(key: &str) -> String {
-        b64url.encode(key.as_bytes())
-    }
-
-    /// Decode an upload token back into a key.
-    pub fn key_from_token(token: &str) -> Result<String> {
-        let bytes = b64url.decode(token).map_err(|_| anyhow!("bad token"))?;
-        let s = String::from_utf8(bytes).map_err(|_| anyhow!("token not utf8"))?;
-        Ok(s)
-    }
 }
 
 #[async_trait]
 impl Storage for DiskStorage {
-    async fn presign_put(&self, key: &str, _ttl: Duration) -> Result<String> {
-        // Map to local upload endpoint carrying the key.
-        Ok(format!("/_upload/{}", Self::token_for_key(key)))
-    }
-
     async fn head_exists(&self, key: &str) -> Result<bool> {
         let p = self.resolve(key)?;
         Ok(fs::metadata(p).await.is_ok())
@@ -251,18 +224,6 @@ impl S3Storage {
 
 #[async_trait]
 impl Storage for S3Storage {
-    async fn presign_put(&self, key: &str, ttl: Duration) -> Result<String> {
-        let presigned = self
-            .s3
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .content_type("application/octet-stream")
-            .presigned(PresigningConfig::expires_in(ttl)?)
-            .await?;
-        Ok(presigned.uri().to_string())
-    }
-
     async fn head_exists(&self, key: &str) -> Result<bool> {
         Ok(self
             .s3

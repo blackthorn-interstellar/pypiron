@@ -4,11 +4,13 @@ use std::{
 };
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::render::{
     pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json,
+    FileMetadata,
 };
 use crate::{
     AppState, PACKAGES_PREFIX, QUEUE_PENDING_PREFIX, QUEUE_PROCESSING_PREFIX, SIMPLE_PREFIX,
@@ -105,7 +107,7 @@ fn infer_pkg_from_job_key(key: &str) -> Option<String> {
     Some(package)
 }
 
-async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<String>> {
+async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<FileMetadata>> {
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
     let mut files = BTreeSet::new();
     for k in state.storage.list_dir_files(&prefix).await? {
@@ -115,10 +117,30 @@ async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<String>> {
             }
         }
     }
-    Ok(files.into_iter().collect())
+    
+    // Compute SHA256 for each file
+    let mut metadata = Vec::new();
+    for filename in files {
+        let key = format!("{prefix}{filename}");
+        match state.storage.get_bytes(&key).await {
+            Ok(obj) => {
+                let mut hasher = Sha256::new();
+                hasher.update(&obj.bytes);
+                let hash = format!("{:x}", hasher.finalize());
+                metadata.push(FileMetadata {
+                    filename,
+                    sha256: hash,
+                });
+            }
+            Err(e) => {
+                warn!(error=?e, key=%key, "could not fetch file for hashing; skipping");
+            }
+        }
+    }
+    Ok(metadata)
 }
 
-async fn write_pkg_indexes(state: &AppState, pkg: &str, files: &[String]) -> Result<()> {
+async fn write_pkg_indexes(state: &AppState, pkg: &str, files: &[FileMetadata]) -> Result<()> {
     let html = pep503_package_html(pkg, files);
     let json = pep691_package_json(pkg, files);
 

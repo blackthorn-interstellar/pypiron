@@ -1,4 +1,4 @@
-.PHONY: build test check fmt lint clean help test-integration build-wheel build-sdist install-maturin release-build
+.PHONY: build test check fmt lint clean help test-integration test-e2e test-stress build-wheel build-sdist install-maturin release-build
 
 SHELL := /bin/bash
 
@@ -19,8 +19,13 @@ dev:  ## Build the project in development mode
 test:  ## Run unit tests
 	cargo test
 
-test-integration:  ## Run integration tests (requires Docker)
-	./test_simple.sh
+test-simple: dev  ## Run simple integration tests (bash + pytest; S3 test may require Docker/MinIO)
+	./tests/test_simple.sh
+
+test-integration: dev  ## Run integration tests (bash + pytest; S3 test may require Docker/MinIO)
+	./tests/test_simple.sh
+	./tests/test_simple_s3.sh
+	pytest -q tests/e2e -m "not stress"
 
 check: af cargo-check lint
 

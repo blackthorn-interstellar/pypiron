@@ -40,4 +40,18 @@ strip = true
 [dependency-groups]
 dev = [
     "maturin",
+    "pytest>=7",
+    "pytest-xdist>=3",
+    "requests>=2.31",
+    "tenacity>=8.2",
+    "twine",
+    "uv"
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "stress: long-running, network-heavy tests (disabled by default)",
+]
+testpaths = [
+    "tests",
 ]

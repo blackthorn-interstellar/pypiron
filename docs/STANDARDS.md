@@ -47,10 +47,10 @@ carry forward PyPI's original timestamps; see
 
 ## Implementation notes
 
-- `versions` (PEP 700) is derived from artifact filenames, best-effort: wheel
-  filenames are structured (PEP 427) and modern sdists are normalized (PEP 625).
-  Once write-time metadata capture lands (see [DESIGN.md](DESIGN.md)), versions
-  come from the upload form's `version` field instead.
+- `versions` (PEP 700) comes from the upload form's `version` field, captured
+  in the sidecar at write time. Filename inference (PEP 427 wheels, PEP 625
+  sdists) remains only as the backfill fallback for files that predate
+  sidecars.
 - Content negotiation: `Accept: application/vnd.pypi.simple.v1+json` (or plain
   `application/json`) gets JSON; everything else gets HTML. Both are pre-rendered
   static files — negotiation just picks which file to serve.

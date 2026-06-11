@@ -2,17 +2,21 @@ use html_escape::encode_text;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 
+use crate::names::infer_version_from_filename;
+
 /// Simple API version: PEP 691 (1.0) + PEP 700 fields (1.1).
 const API_VERSION: &str = "1.1";
 
-/// File metadata for rendering indexes
+/// File metadata for rendering indexes, sourced from sidecars.
 #[derive(Clone, Debug)]
 pub struct FileMetadata {
     pub filename: String,
     pub sha256: String,
     pub size: u64,
-    /// RFC 3339 upload timestamp (PEP 700), from storage last-modified.
+    /// RFC 3339 upload timestamp (PEP 700); sidecar first, storage last-modified fallback.
     pub upload_time: Option<String>,
+    /// Version from the upload form, captured in the sidecar.
+    pub version: Option<String>,
 }
 
 /// Render minimal PEP 503 per‑package HTML (with PEP 629 version meta).
@@ -76,25 +80,15 @@ struct Pep691Meta<'a> {
     api_version: &'a str,
 }
 
-/// Best-effort version extraction from an artifact filename (PEP 700 `versions`).
-fn infer_version_from_filename(filename: &str) -> Option<String> {
-    if let Some(stem) = filename.strip_suffix(".whl") {
-        // PEP 427: distribution-version(-build)?-python-abi-platform.whl
-        return stem.split('-').nth(1).map(str::to_string);
-    }
-    let stem = filename
-        .strip_suffix(".tar.gz")
-        .or_else(|| filename.strip_suffix(".tar.bz2"))
-        .or_else(|| filename.strip_suffix(".tar.xz"))
-        .or_else(|| filename.strip_suffix(".zip"))?;
-    stem.rsplit_once('-').map(|(_, v)| v.to_string())
-}
-
 /// PEP 691 + PEP 700 package JSON.
 pub fn pep691_package_json(package: &str, files: &[FileMetadata]) -> String {
     let versions: Vec<String> = files
         .iter()
-        .filter_map(|f| infer_version_from_filename(&f.filename))
+        .filter_map(|f| {
+            f.version
+                .clone()
+                .or_else(|| infer_version_from_filename(&f.filename))
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -164,31 +158,19 @@ pub fn pep691_global_json(packages: &[String]) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn infers_wheel_version() {
-        assert_eq!(
-            infer_version_from_filename("six-1.16.0-py2.py3-none-any.whl"),
-            Some("1.16.0".to_string())
-        );
-    }
-
-    #[test]
-    fn infers_sdist_version() {
-        assert_eq!(
-            infer_version_from_filename("six-1.16.0.tar.gz"),
-            Some("1.16.0".to_string())
-        );
-    }
-
-    #[test]
-    fn package_json_has_pep700_fields() {
-        let files = vec![FileMetadata {
+    fn meta(version: Option<&str>) -> FileMetadata {
+        FileMetadata {
             filename: "six-1.16.0-py2.py3-none-any.whl".into(),
             sha256: "abc123".into(),
             size: 11236,
             upload_time: Some("2026-06-11T00:00:00Z".into()),
-        }];
-        let json = pep691_package_json("six", &files);
+            version: version.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn package_json_has_pep700_fields() {
+        let json = pep691_package_json("six", &[meta(Some("1.16.0"))]);
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(doc["meta"]["api-version"], "1.1");
         assert_eq!(doc["versions"][0], "1.16.0");
@@ -197,14 +179,15 @@ mod tests {
     }
 
     #[test]
+    fn package_json_versions_fall_back_to_filename_inference() {
+        let json = pep691_package_json("six", &[meta(None)]);
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc["versions"][0], "1.16.0");
+    }
+
+    #[test]
     fn package_html_has_hash_fragment_and_version_meta() {
-        let files = vec![FileMetadata {
-            filename: "six-1.16.0-py2.py3-none-any.whl".into(),
-            sha256: "abc123".into(),
-            size: 11236,
-            upload_time: None,
-        }];
-        let html = pep503_package_html("six", &files);
+        let html = pep503_package_html("six", &[meta(None)]);
         assert!(html.contains("#sha256=abc123"));
         assert!(html.contains(r#"<meta name="pypi:repository-version" content="1.1">"#));
     }

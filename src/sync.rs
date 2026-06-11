@@ -404,28 +404,8 @@ fn parse_spec_line(line: &str) -> Result<PackageSpec> {
         ));
     }
     Ok(PackageSpec {
-        name: normalize_pkg_name(line.trim()),
+        name: crate::names::normalize_pkg_name(line.trim()),
     })
-}
-
-/// PEP 503 normalization (lowercase; replace runs of [-_.] with single '-').
-fn normalize_pkg_name(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    let mut out = String::with_capacity(lower.len());
-    let mut last_dash = false;
-    for ch in lower.chars() {
-        let is_sep = ch == '-' || ch == '_' || ch == '.';
-        if is_sep {
-            if !last_dash {
-                out.push('-');
-                last_dash = true;
-            }
-        } else {
-            out.push(ch);
-            last_dash = false;
-        }
-    }
-    out.trim_matches('-').to_string()
 }
 
 fn normalize_legacy_endpoint(dst_base: &str) -> String {

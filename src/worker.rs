@@ -8,9 +8,12 @@ use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+use crate::names::infer_version_from_filename;
 use crate::render::{
     pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
 };
+use crate::sidecar::{is_artifact, sidecar_key, Sidecar, Yanked, SIDECAR_SUFFIX};
+use crate::storage::FileEntry;
 use crate::{
     AppState, PACKAGES_PREFIX, QUEUE_PENDING_PREFIX, QUEUE_PROCESSING_PREFIX, SIMPLE_PREFIX,
 };
@@ -106,36 +109,91 @@ fn infer_pkg_from_job_key(key: &str) -> Option<String> {
     Some(package)
 }
 
+/// List a package's artifacts with metadata from sidecars — O(files), no hashing.
+/// Artifacts without a sidecar (legacy files) get one backfilled, hashing once.
 async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<FileMetadata>> {
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
-    // Entries arrive sorted by key; carry size + last-modified into the index.
+    let entries = state.storage.list_dir_entries(&prefix).await?;
+    let names: HashSet<&str> = entries
+        .iter()
+        .filter_map(|e| e.key.strip_prefix(&prefix))
+        .collect();
+
     let mut metadata = Vec::new();
-    for entry in state.storage.list_dir_entries(&prefix).await? {
+    for entry in &entries {
         let Some(filename) = entry.key.strip_prefix(&prefix) else {
             continue;
         };
-        if filename.is_empty() {
+        if !is_artifact(filename) {
             continue;
         }
-        let filename = filename.to_string();
-        match state.storage.get_bytes(&entry.key).await {
-            Ok(obj) => {
-                let mut hasher = Sha256::new();
-                hasher.update(&obj.bytes);
-                let hash = format!("{:x}", hasher.finalize());
-                metadata.push(FileMetadata {
-                    filename,
-                    sha256: hash,
-                    size: entry.size,
-                    upload_time: entry.last_modified,
-                });
+
+        let has_sidecar = names.contains(format!("{filename}{SIDECAR_SUFFIX}").as_str());
+        let sc = if has_sidecar {
+            match read_sidecar(state, &entry.key).await {
+                Ok(sc) => sc,
+                Err(e) => {
+                    warn!(error=?e, key=%entry.key, "unreadable sidecar; backfilling");
+                    match backfill_sidecar(state, entry, filename).await {
+                        Ok(sc) => sc,
+                        Err(e) => {
+                            warn!(error=?e, key=%entry.key, "could not backfill sidecar; skipping file");
+                            continue;
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                warn!(error=?e, key=%entry.key, "could not fetch file for hashing; skipping");
+        } else {
+            match backfill_sidecar(state, entry, filename).await {
+                Ok(sc) => sc,
+                Err(e) => {
+                    warn!(error=?e, key=%entry.key, "could not backfill sidecar; skipping file");
+                    continue;
+                }
             }
-        }
+        };
+
+        metadata.push(FileMetadata {
+            filename: filename.to_string(),
+            sha256: sc.sha256,
+            size: sc.size,
+            upload_time: Some(sc.upload_time),
+            version: Some(sc.version).filter(|v| !v.is_empty()),
+        });
     }
     Ok(metadata)
+}
+
+async fn read_sidecar(state: &AppState, artifact_key: &str) -> Result<Sidecar> {
+    let out = state.storage.get_bytes(&sidecar_key(artifact_key)).await?;
+    Ok(serde_json::from_slice(&out.bytes)?)
+}
+
+/// Hash-once-and-backfill for files that predate write-time sidecars.
+/// Storage last-modified is the upload-time fallback (correct by construction
+/// for direct uploads — filenames are immutable, so written exactly once).
+async fn backfill_sidecar(state: &AppState, entry: &FileEntry, filename: &str) -> Result<Sidecar> {
+    let obj = state.storage.get_bytes(&entry.key).await?;
+    let mut hasher = Sha256::new();
+    hasher.update(&obj.bytes);
+    let sc = Sidecar {
+        sha256: format!("{:x}", hasher.finalize()),
+        size: entry.size,
+        version: infer_version_from_filename(filename).unwrap_or_default(),
+        upload_time: entry.last_modified.clone().unwrap_or_default(),
+        requires_python: None,
+        yanked: Yanked::Flag(false),
+    };
+    state
+        .storage
+        .put_bytes(
+            &sidecar_key(&entry.key),
+            serde_json::to_vec(&sc)?,
+            Some("application/json"),
+        )
+        .await?;
+    info!(key=%entry.key, "backfilled sidecar");
+    Ok(sc)
 }
 
 async fn write_pkg_indexes(state: &AppState, pkg: &str, files: &[FileMetadata]) -> Result<()> {

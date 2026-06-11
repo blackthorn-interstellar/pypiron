@@ -16,14 +16,19 @@ use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{info, warn};
 
+mod names;
 mod render;
+mod sidecar;
 mod storage;
 mod sync;
 mod worker;
 
+use names::{infer_package_from_filename, infer_version_from_filename, normalize_pkg_name};
+use sidecar::{sidecar_key, Sidecar, Yanked};
 use storage::{DiskStorage, ObjectData, S3Storage, Storage};
 
 const PACKAGES_PREFIX: &str = "packages/";
@@ -224,6 +229,8 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         // Catch-all for debugging unmatched routes
         .fallback(fallback_handler)
         .with_state(state.clone())
+        // Axum's default 2 MB body limit would reject any real wheel.
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
         .layer(middleware::from_fn(log_requests));
 
     // spawn worker
@@ -307,73 +314,136 @@ async fn initialize_indexes(state: &AppState) -> Result<()> {
 
 /// --- Upload endpoint ------------------------------------------------------
 /// Legacy PyPI upload endpoint compatible with uv/twine.
-/// Accepts multipart/form-data where the file is in field "content" (or "file").
-/// Filename is taken from the file part's filename attribute or a "filename" text field.
+/// Multipart form with metadata text fields (name, version, sha256_digest,
+/// requires_python, ...) and the file in field "content" (or "file").
 async fn legacy_upload(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     mut multipart: Multipart,
-) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     // auth - only check if credentials are configured
     if let (Some(user), Some(pass)) = (&state.upload_user, &state.upload_pass) {
         if check_basic_auth(&headers, user, pass).is_err() {
-            return Err((StatusCode::UNAUTHORIZED, "Unauthorized"));
+            return Err((StatusCode::UNAUTHORIZED, "Unauthorized".into()));
         }
     }
 
     let mut filename_opt: Option<String> = None;
     let mut file_bytes: Option<Vec<u8>> = None;
+    let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid multipart form data"))?
-    {
-        let field_name = field.name().unwrap_or("");
+    while let Some(field) = multipart.next_field().await.map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid multipart form data".into(),
+        )
+    })? {
+        let field_name = field.name().unwrap_or("").to_string();
         let part_filename = field.file_name().map(|s| s.to_string());
 
-        match field_name {
+        match field_name.as_str() {
             "content" | "file" => {
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|_| (StatusCode::BAD_REQUEST, "Could not read uploaded file"))?;
+                let bytes = field.bytes().await.map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "Could not read uploaded file".into(),
+                    )
+                })?;
                 file_bytes = Some(bytes.to_vec());
                 if filename_opt.is_none() {
-                    if let Some(f) = part_filename {
-                        filename_opt = Some(f);
-                    }
-                }
-            }
-            "filename" => {
-                if filename_opt.is_none() {
-                    let s = field
-                        .text()
-                        .await
-                        .map_err(|_| (StatusCode::BAD_REQUEST, "Could not read filename"))?;
-                    if !s.is_empty() {
-                        filename_opt = Some(s);
-                    }
+                    filename_opt = part_filename;
                 }
             }
             _ => {
-                // ignore other form fields (name, version, metadata, sha256, etc.)
+                if let Ok(text) = field.text().await {
+                    if !text.is_empty() {
+                        fields.insert(field_name, text);
+                    }
+                }
             }
         }
     }
 
-    let filename = filename_opt.ok_or((StatusCode::BAD_REQUEST, "Missing filename"))?;
-    let data = file_bytes.ok_or((StatusCode::BAD_REQUEST, "Missing file content"))?;
+    let filename = filename_opt
+        .or_else(|| fields.get("filename").cloned())
+        .ok_or((StatusCode::BAD_REQUEST, "Missing filename".to_string()))?;
+    let data = file_bytes.ok_or((StatusCode::BAD_REQUEST, "Missing file content".to_string()))?;
 
-    let package = infer_package_from_filename(&filename);
-    let pkg_norm = normalize_pkg_name(&package);
+    // No path separators, dotfiles, or names colliding with sidecar suffixes.
+    if filename.contains('/') || filename.contains('\\') || !sidecar::is_artifact(&filename) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid filename".into()));
+    }
+
+    let pkg_norm = match fields.get("name") {
+        Some(name) => normalize_pkg_name(name),
+        None => infer_package_from_filename(&filename),
+    };
+    if pkg_norm.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Could not determine package name".into(),
+        ));
+    }
+
+    // Verify the client-supplied digest, and capture the hash for the sidecar.
+    let sha256 = {
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        format!("{:x}", hasher.finalize())
+    };
+    if let Some(claimed) = fields.get("sha256_digest") {
+        if !claimed.eq_ignore_ascii_case(&sha256) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("sha256_digest mismatch: form says {claimed}, file is {sha256}"),
+            ));
+        }
+    }
+
+    let version = fields
+        .get("version")
+        .cloned()
+        .or_else(|| infer_version_from_filename(&filename))
+        .unwrap_or_default();
+
     let key = format!("{PACKAGES_PREFIX}{pkg_norm}/{filename}");
 
+    // Ordering invariant: artifact, then sidecar, then index job.
     state
         .storage
-        .put_bytes(&key, data, Some("application/octet-stream"))
+        .put_bytes(&key, data.clone(), Some("application/octet-stream"))
         .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to store file"))?;
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to store file".to_string(),
+            )
+        })?;
+
+    let sc = Sidecar {
+        sha256,
+        size: data.len() as u64,
+        version,
+        upload_time: now_rfc3339(),
+        requires_python: fields.get("requires_python").cloned(),
+        yanked: Yanked::Flag(false),
+    };
+    let sc_bytes = serde_json::to_vec(&sc).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to encode sidecar".to_string(),
+        )
+    })?;
+    state
+        .storage
+        .put_bytes(&sidecar_key(&key), sc_bytes, Some("application/json"))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to store sidecar".to_string(),
+            )
+        })?;
 
     // Enqueue a job for background indexing; best-effort
     if let Err(e) = enqueue_job(&state, &pkg_norm, &filename, &key).await {
@@ -382,6 +452,15 @@ async fn legacy_upload(
 
     // Return a simple OK text body compatible with legacy clients.
     Ok((StatusCode::OK, "OK"))
+}
+
+/// Current time as RFC 3339 at whole-second precision.
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .format(&Rfc3339)
+        .unwrap_or_default()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -571,48 +650,4 @@ fn check_basic_auth(headers: &HeaderMap, user: &str, pass: &str) -> Result<()> {
     } else {
         Err(anyhow!("bad credentials"))
     }
-}
-
-/// Extract distribution name (PEP 427 wheel or sdist) → lower & PEP 503 normalize.
-fn infer_package_from_filename(filename: &str) -> String {
-    // common cases:
-    //  - requests-2.28.1-py3-none-any.whl                  → "requests"
-    //  - my_pkg_name-1.2.3.tar.gz / .zip / .tar.bz2       → "my_pkg_name"
-    let stem = filename.split('/').next_back().unwrap_or(filename);
-
-    // Wheel: distribution-version-...
-    let dist = if let Some(idx) = stem.find('-') {
-        &stem[..idx]
-    } else if let Some(idx) = stem.rfind(".tar.") {
-        // sdist with two extensions (.tar.gz, .tar.bz2, .tar.xz)
-        stem.split_at(idx)
-            .0
-            .rsplit_once('-')
-            .map_or(stem, |(d, _)| d)
-    } else if let Some((d, _v)) = stem.rsplit_once('-') {
-        d
-    } else {
-        stem
-    };
-    normalize_pkg_name(dist)
-}
-
-/// PEP 503 normalization: lowercase; replace runs of [-_.] with single '-'.
-fn normalize_pkg_name(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    let mut out = String::with_capacity(lower.len());
-    let mut last_dash = false;
-    for ch in lower.chars() {
-        let is_sep = ch == '-' || ch == '_' || ch == '.';
-        if is_sep {
-            if !last_dash {
-                out.push('-');
-                last_dash = true;
-            }
-        } else {
-            out.push(ch);
-            last_dash = false;
-        }
-    }
-    out.trim_matches('-').to_string()
 }

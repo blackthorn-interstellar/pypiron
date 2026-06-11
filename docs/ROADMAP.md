@@ -7,7 +7,7 @@ without its test is not done. Run `make check` and the test suite after each.
 
 ## Current state (as of 2026-06-11)
 
-Milestones 0–1 are done.
+Milestones 0–2 are done.
 
 - M0: blackbox suite — standards conformance (PEP 503/629/691/700 over HTTP),
   end-to-end `uv pip install --exclude-newer`, real-tools matrix (uv publish +
@@ -17,6 +17,7 @@ Milestones 0–1 are done.
   `<filename>.meta.json` (artifact first, sidecar second, index job last);
   rebuilds read sidecars instead of re-hashing, backfilling legacy files once;
   index `upload-time` and `versions` come from sidecars.
+- M2: filename immutability — re-upload of an existing filename is 409.
 
 Also working: upload via `/legacy/` (twine/uv), PEP 503 HTML + PEP 691 JSON
 indexes, PEP 629 meta tag, sha256 fragments in HTML, disk + S3 (MinIO)

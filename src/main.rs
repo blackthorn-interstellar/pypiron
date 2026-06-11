@@ -408,6 +408,15 @@ async fn legacy_upload(
 
     let key = format!("{PACKAGES_PREFIX}{pkg_norm}/{filename}");
 
+    // Filenames are immutable once written (pypi.org rule): supply-chain
+    // safety and perfect cacheability in one check.
+    if state.storage.head_exists(&key).await.unwrap_or(false) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("File already exists: {filename}"),
+        ));
+    }
+
     // Ordering invariant: artifact, then sidecar, then index job.
     state
         .storage

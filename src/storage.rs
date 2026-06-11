@@ -158,6 +158,10 @@ pub trait Storage: Send + Sync {
     /// validation for S3). Errors mean "not found" to the caller.
     async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>>;
 
+    /// A presigned GET URL, where the backend supports one (S3). `None` means
+    /// "serve it yourself" (disk).
+    async fn presign_get(&self, key: &str, expires: std::time::Duration) -> Result<Option<String>>;
+
     /// Write bytes to `key`. `content_type` is best-effort (ignored on Disk).
     async fn put_bytes(&self, key: &str, bytes: Vec<u8>, content_type: Option<&str>) -> Result<()>;
 
@@ -214,6 +218,14 @@ impl Storage for DiskStorage {
     async fn head_exists(&self, key: &str) -> Result<bool> {
         let p = self.resolve(key)?;
         Ok(fs::metadata(p).await.is_ok())
+    }
+
+    async fn presign_get(
+        &self,
+        _key: &str,
+        _expires: std::time::Duration,
+    ) -> Result<Option<String>> {
+        Ok(None)
     }
 
     async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>> {
@@ -351,6 +363,18 @@ impl Storage for S3Storage {
             .send()
             .await
             .is_ok())
+    }
+
+    async fn presign_get(&self, key: &str, expires: std::time::Duration) -> Result<Option<String>> {
+        let cfg = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires)?;
+        let req = self
+            .s3
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .presigned(cfg)
+            .await?;
+        Ok(Some(req.uri().to_string()))
     }
 
     async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>> {

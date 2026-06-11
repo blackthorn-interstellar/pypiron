@@ -74,6 +74,11 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
     private_prefix: Option<String>,
 
+    /// Redirect artifact downloads to presigned S3 URLs (302) so this node
+    /// never touches wheel bytes (S3 backend only)
+    #[arg(long, env = "PYPIRON_S3_PRESIGNED_REDIRECTS")]
+    s3_presigned_redirects: bool,
+
     /// Worker interval in seconds
     #[arg(long, env = "PYPIRON_WORKER_INTERVAL_SECS", default_value = "5")]
     worker_interval_secs: u64,
@@ -106,6 +111,7 @@ struct AppState {
     upload_user: Option<String>,
     upload_pass: Option<String>,
     private_prefix: Option<String>,
+    presigned_redirects: bool,
     // worker cfg
     worker_interval: Duration,
     reconcile_interval: Duration,
@@ -149,6 +155,7 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         upload_user: cli.basic_auth_user,
         upload_pass: cli.basic_auth_pass,
         private_prefix: cli.private_prefix.as_deref().map(normalize_pkg_name),
+        presigned_redirects: cli.s3_presigned_redirects,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
         upload_confirm_timeout: Duration::from_secs(cli.upload_confirm_timeout_secs),
@@ -614,6 +621,34 @@ async fn files_get(
         return not_found("not an artifact");
     }
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+
+    // S3 serves the megabytes, this node serves kilobytes of index: redirect
+    // artifact downloads to a presigned URL. Metadata companions are tiny and
+    // resolution-critical, so they keep streaming. The redirect itself must
+    // not be cached — the signature expires.
+    if state.presigned_redirects && !filename.ends_with(METADATA_SUFFIX) {
+        if state.storage.head_exists(&key).await.unwrap_or(false) {
+            match state
+                .storage
+                .presign_get(&key, Duration::from_secs(3600))
+                .await
+            {
+                Ok(Some(url)) => {
+                    return Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header(header::LOCATION, url)
+                        .header(header::CACHE_CONTROL, "no-cache")
+                        .body(Body::empty())
+                        .unwrap_or_else(not_found);
+                }
+                Ok(None) => {} // disk backend: fall through to streaming
+                Err(e) => warn!(error=?e, %key, "presign failed; falling back to streaming"),
+            }
+        } else {
+            return not_found("no such artifact");
+        }
+    }
+
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     match state.storage.serve_artifact(&key, range).await {
         Ok(mut resp) => {

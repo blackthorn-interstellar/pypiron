@@ -7,7 +7,7 @@ without its test is not done. Run `make check` and the test suite after each.
 
 ## Current state (as of 2026-06-11)
 
-Milestones 0–9 are done.
+Milestones 0–10 are done.
 
 - M0: blackbox suite — standards conformance (PEP 503/629/691/700 over HTTP),
   end-to-end `uv pip install --exclude-newer`, real-tools matrix (uv publish +
@@ -50,6 +50,10 @@ Milestones 0–9 are done.
   as `mirror`, hard-fails on private-owned names and on the private
   namespace. `--exclude-newer <historical date>` resolves the historically
   correct version against the mirror. HTTP mode remains behind `--to`.
+- M10: S3 presigned redirects — with `--s3-presigned-redirects`, artifact
+  downloads 302 to presigned URLs (1h expiry, `no-cache` on the redirect)
+  so the node never streams wheel bytes; PEP 658 metadata companions keep
+  streaming. Disk keeps streaming with Range.
 
 Also working: upload via `/legacy/` (twine/uv), PEP 503 HTML + PEP 691 JSON
 indexes, PEP 629 meta tag, sha256 fragments in HTML, disk + S3 (MinIO)

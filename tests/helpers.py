@@ -136,6 +136,24 @@ def http_get(
     return _http_request(url, method="GET", headers=headers, timeout=timeout)
 
 
+def http_get_no_redirect(url: str, *, timeout: float = 10.0) -> Tuple[int, bytes, Dict[str, str]]:
+    """GET without following redirects (for asserting 302s)."""
+    import http.client
+    from urllib.parse import urlparse
+
+    p = urlparse(url)
+    conn = http.client.HTTPConnection(p.hostname, p.port, timeout=timeout)
+    try:
+        path = p.path + (f"?{p.query}" if p.query else "")
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        headers = {k.lower(): v for k, v in resp.getheaders()}
+        return resp.status, body, headers
+    finally:
+        conn.close()
+
+
 def http_request_auth(
     method: str,
     url: str,

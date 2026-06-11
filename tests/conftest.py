@@ -253,13 +253,13 @@ def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
     return env
 
 
-@pytest.fixture()
-def s3_server(tmp_path_factory, pypiron_bin: Path, minio: Dict) -> Iterator[Dict]:
-    """pypiron configured against the MinIO S3 backend."""
+def _start_s3_server(tmp_path_factory, pypiron_bin: Path, minio: Dict, extra_env=None) -> Iterator[Dict]:
     port = find_free_port()
     bind = f"127.0.0.1:{port}"
     log_path = tmp_path_factory.mktemp("pypiron-s3") / "server.log"
     env = _s3_env(minio, bind)
+    if extra_env:
+        env.update(extra_env)
 
     with open(log_path, "w") as log_file:
         proc = subprocess.Popen([str(pypiron_bin)], env=env, stdout=log_file, stderr=subprocess.STDOUT)
@@ -278,3 +278,20 @@ def s3_server(tmp_path_factory, pypiron_bin: Path, minio: Dict) -> Iterator[Dict
             }
         finally:
             kill_process_tree(proc)
+
+
+@pytest.fixture()
+def s3_server(tmp_path_factory, pypiron_bin: Path, minio: Dict) -> Iterator[Dict]:
+    """pypiron configured against the MinIO S3 backend."""
+    yield from _start_s3_server(tmp_path_factory, pypiron_bin, minio)
+
+
+@pytest.fixture()
+def s3_server_presigned(tmp_path_factory, pypiron_bin: Path, minio: Dict) -> Iterator[Dict]:
+    """S3-backed server that redirects artifact downloads to presigned URLs."""
+    yield from _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        extra_env={"PYPIRON_S3_PRESIGNED_REDIRECTS": "true"},
+    )

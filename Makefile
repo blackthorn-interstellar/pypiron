@@ -1,8 +1,19 @@
-.PHONY: build test check fmt lint clean help test-integration test-e2e test-stress build-wheel build-sdist install-maturin release-build
+.PHONY: build test check fmt lint clean help test-integration test-e2e test-stress build-wheel build-sdist install-maturin release-build init-rust init-python test-rust test-python
 
 SHELL := /bin/bash
 
 .DEFAULT_GOAL := help
+
+init: init-rust init-python  ## Setup development tools (both Rust and Python)
+
+init-rust:  ## Setup Rust development tools
+	rustup component add rustfmt
+	rustup component add clippy
+	cargo build
+
+init-python:  ## Setup Python development environment
+	uv sync --all-extras
+
 
 build:  ## Build the project in release mode
 	cargo build --release
@@ -16,8 +27,13 @@ release-build:  ## Build wheel with optimizations for release
 dev:  ## Build the project in development mode
 	cargo build
 
-test:  ## Run unit tests
+test: test-rust test-python  ## Run all tests (both Rust and Python)
+
+test-rust:  ## Run Rust unit tests
 	cargo test
+
+test-python:  ## Run Python tests
+	uv run -- pytest tests/
 
 test-simple: dev  ## Run simple integration tests (bash + pytest; S3 test may require Docker/MinIO)
 	./tests/test_simple.sh
@@ -45,11 +61,6 @@ clean:  ## Clean build artifacts
 doc:  ## Generate documentation
 	cargo doc --no-deps
 
-init:  ## Setup development tools
-	rustup component add rustfmt
-	rustup component add clippy
-	cargo build
-	uv sync --all-extras
 
 watch-test:  ## Run tests in watch mode
 	cargo watch -x test

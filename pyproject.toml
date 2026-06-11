@@ -51,6 +51,8 @@ dev = [
 [tool.pytest.ini_options]
 markers = [
     "stress: long-running, network-heavy tests (disabled by default)",
+    "integration: integration tests that may hit the network or spawn services",
+    "s3: tests that require Docker/MinIO S3 emulation",
 ]
 testpaths = [
     "tests",

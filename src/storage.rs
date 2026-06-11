@@ -177,6 +177,34 @@ pub trait Storage: Send + Sync {
 
     /// Delete multiple keys (best-effort).
     async fn delete_keys(&self, keys: &[String]) -> Result<()>;
+
+    /// Whether this backend supports conditional writes for leader leases.
+    /// Disk is explicitly single-node: no lease, always leader.
+    fn supports_leases(&self) -> bool {
+        false
+    }
+
+    /// Read object bytes plus ETag; `None` if the object is missing.
+    async fn get_with_etag(&self, _key: &str) -> Result<Option<(Vec<u8>, String)>> {
+        Err(anyhow!("leases are not supported by this backend"))
+    }
+
+    /// Create-if-absent (`If-None-Match: *`). `Some(etag)` on success,
+    /// `None` if the object already exists or we lost the race.
+    async fn put_if_none_match(&self, _key: &str, _bytes: Vec<u8>) -> Result<Option<String>> {
+        Err(anyhow!("leases are not supported by this backend"))
+    }
+
+    /// Replace-if-unchanged (`If-Match`). `Some(new_etag)` on success,
+    /// `None` if the ETag no longer matches.
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _etag: &str,
+        _bytes: Vec<u8>,
+    ) -> Result<Option<String>> {
+        Err(anyhow!("leases are not supported by this backend"))
+    }
 }
 
 /// ------------------------------ DiskStorage -------------------------------
@@ -518,6 +546,70 @@ impl Storage for S3Storage {
         }
         Ok(())
     }
+
+    fn supports_leases(&self) -> bool {
+        true
+    }
+
+    async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+        let out = match self
+            .s3
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(out) => out,
+            Err(e) if e.code() == Some("NoSuchKey") => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let etag = out.e_tag().unwrap_or_default().to_string();
+        let bytes = out.body.collect().await?.to_vec();
+        Ok(Some((bytes, etag)))
+    }
+
+    async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
+        match self
+            .s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .if_none_match("*")
+            .body(ByteStream::from(bytes))
+            .send()
+            .await
+        {
+            Ok(out) => Ok(Some(out.e_tag().unwrap_or_default().to_string())),
+            Err(e) if lost_conditional_write(&e) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn put_if_match(&self, key: &str, etag: &str, bytes: Vec<u8>) -> Result<Option<String>> {
+        match self
+            .s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .if_match(etag)
+            .body(ByteStream::from(bytes))
+            .send()
+            .await
+        {
+            Ok(out) => Ok(Some(out.e_tag().unwrap_or_default().to_string())),
+            Err(e) if lost_conditional_write(&e) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// A failed precondition or a concurrent conditional write: we lost, cleanly.
+fn lost_conditional_write<E: ProvideErrorMetadata>(e: &E) -> bool {
+    matches!(
+        e.code(),
+        Some("PreconditionFailed") | Some("ConditionalRequestConflict") | Some("NoSuchKey")
+    )
 }
 
 #[cfg(test)]

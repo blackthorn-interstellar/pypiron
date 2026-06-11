@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+use crate::lease::LeaseManager;
 use crate::names::infer_version_from_filename;
 use crate::render::{
     pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
@@ -29,19 +30,34 @@ pub async fn mark_dirty(storage: &dyn Storage, pkg: &str) -> Result<()> {
 }
 
 pub async fn run_worker(state: Arc<AppState>) {
+    // Only the index writer is singular, and only as a cost optimization:
+    // rebuilds are idempotent, so the lease is sloppy. Disk is single-node
+    // and skips leasing entirely.
+    let lease = state
+        .storage
+        .supports_leases()
+        .then(|| LeaseManager::new(state.storage.clone(), state.lease_ttl));
+
     let mut last_reconcile: Option<Instant> = None;
     loop {
-        // The reconciler is the backbone; markers merely accelerate it. The
-        // first sweep runs at startup so a restored backup heals immediately.
-        let due = last_reconcile.is_none_or(|t| t.elapsed() >= state.reconcile_interval);
-        if due {
-            if let Err(e) = reconcile(&state).await {
-                error!(error=?e, "reconcile failed");
+        let is_leader = match &lease {
+            None => true,
+            Some(lm) => lm.is_leader().await,
+        };
+        if is_leader {
+            // The reconciler is the backbone; markers merely accelerate it.
+            // The first leader sweep runs immediately, so a restored backup
+            // (or a fresh leader) heals without waiting an interval.
+            let due = last_reconcile.is_none_or(|t| t.elapsed() >= state.reconcile_interval);
+            if due {
+                if let Err(e) = reconcile(&state).await {
+                    error!(error=?e, "reconcile failed");
+                }
+                last_reconcile = Some(Instant::now());
             }
-            last_reconcile = Some(Instant::now());
-        }
-        if let Err(e) = tick(&state).await {
-            error!(error=?e, "worker tick failed");
+            if let Err(e) = tick(&state).await {
+                error!(error=?e, "worker tick failed");
+            }
         }
         sleep(state.worker_interval).await;
     }

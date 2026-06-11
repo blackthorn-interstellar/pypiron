@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{info, warn};
 
+mod lease;
 mod names;
 mod origin;
 mod render;
@@ -87,6 +88,10 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_RECONCILE_INTERVAL_SECS", default_value = "300")]
     reconcile_interval_secs: u64,
 
+    /// Leader lease TTL in seconds (multi-node S3 only; sloppy by design)
+    #[arg(long, env = "PYPIRON_LEASE_TTL_SECS", default_value = "30")]
+    lease_ttl_secs: u64,
+
     /// Upload confirmation timeout in seconds
     #[arg(
         long,
@@ -115,6 +120,7 @@ struct AppState {
     // worker cfg
     worker_interval: Duration,
     reconcile_interval: Duration,
+    lease_ttl: Duration,
     #[allow(dead_code)]
     upload_confirm_timeout: Duration,
     // behavior
@@ -158,6 +164,7 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         presigned_redirects: cli.s3_presigned_redirects,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
+        lease_ttl: Duration::from_secs(cli.lease_ttl_secs),
         upload_confirm_timeout: Duration::from_secs(cli.upload_confirm_timeout_secs),
         public_base_url: cli.public_base_url,
     });

@@ -7,7 +7,7 @@ without its test is not done. Run `make check` and the test suite after each.
 
 ## Current state (as of 2026-06-11)
 
-Milestones 0–10 are done.
+Milestones 0–11 are done.
 
 - M0: blackbox suite — standards conformance (PEP 503/629/691/700 over HTTP),
   end-to-end `uv pip install --exclude-newer`, real-tools matrix (uv publish +
@@ -54,6 +54,12 @@ Milestones 0–10 are done.
   downloads 302 to presigned URLs (1h expiry, `no-cache` on the redirect)
   so the node never streams wheel bytes; PEP 658 metadata companions keep
   streaming. Disk keeps streaming with Range.
+- M11: leader election — an S3 conditional-write lease at
+  `_leader/lease.json` (acquire with `If-None-Match: *`, renew/steal with
+  `If-Match`, `--lease-ttl-secs` default 30, heartbeat on the worker loop).
+  Worker and reconciler run on the leader only; a fresh leader reconciles
+  immediately. Disk skips leasing — single-node, always leader. Failover
+  verified live against two nodes on one MinIO bucket.
 
 Also working: upload via `/legacy/` (twine/uv), PEP 503 HTML + PEP 691 JSON
 indexes, PEP 629 meta tag, sha256 fragments in HTML, disk + S3 (MinIO)

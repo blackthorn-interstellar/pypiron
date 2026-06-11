@@ -21,8 +21,8 @@ use tracing::{info, warn};
 
 mod render;
 mod storage;
-mod worker;
 mod sync;
+mod worker;
 
 use storage::{DiskStorage, ObjectData, S3Storage, Storage};
 
@@ -34,9 +34,7 @@ const QUEUE_PROCESSING_PREFIX: &str = "_internal/queue/processing/";
 /// Storage backend selection.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum StorageBackend {
-    /// Use the local filesystem (default).
     Disk,
-    /// Use AWS S3 or an S3-compatible service.
     S3,
 }
 
@@ -68,9 +66,9 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_STORAGE", value_enum, default_value_t = StorageBackend::Disk)]
     storage: StorageBackend,
 
-    /// Root data directory for disk storage
-    #[arg(long, env = "PYPIRON_DATA_DIR", default_value = "./pypiron-data")]
-    data_dir: String,
+    /// Root data directory for disk storage (defaults to $HOME/.pypiron/packages)
+    #[arg(long, env = "PYPIRON_DATA_DIR")]
+    data_dir: Option<String>,
 
     /// S3 bucket name for package storage (required if --storage s3)
     #[arg(long, env = "PYPIRON_S3_BUCKET")]
@@ -165,7 +163,14 @@ async fn main() -> Result<()> {
 async fn run_serve(cli: ServeArgs) -> Result<()> {
     // Build storage backend
     let storage: Arc<dyn Storage> = match cli.storage {
-        StorageBackend::Disk => Arc::new(DiskStorage::new(&cli.data_dir)),
+        StorageBackend::Disk => {
+            let data_dir = cli.data_dir.unwrap_or_else(|| {
+                std::env::var("HOME")
+                    .map(|home| format!("{}/.pypiron/packages", home))
+                    .unwrap_or_else(|_| "./.pypiron/packages".to_string())
+            });
+            Arc::new(DiskStorage::new(&data_dir))
+        }
         StorageBackend::S3 => {
             let bucket = cli
                 .s3_bucket

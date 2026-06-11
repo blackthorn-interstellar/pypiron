@@ -18,8 +18,15 @@ use crate::render::{
     pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
 };
 use crate::sidecar::{is_artifact, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, SIDECAR_SUFFIX};
-use crate::storage::FileEntry;
+use crate::storage::{FileEntry, Storage};
 use crate::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
+
+/// Mark a package as needing an index rebuild (empty object at `_dirty/<pkg>`).
+pub async fn mark_dirty(storage: &dyn Storage, pkg: &str) -> Result<()> {
+    storage
+        .put_bytes(&format!("{DIRTY_PREFIX}{pkg}"), Vec::new(), None)
+        .await
+}
 
 pub async fn run_worker(state: Arc<AppState>) {
     let mut last_reconcile: Option<Instant> = None;

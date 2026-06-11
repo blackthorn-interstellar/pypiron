@@ -7,7 +7,7 @@ without its test is not done. Run `make check` and the test suite after each.
 
 ## Current state (as of 2026-06-11)
 
-Milestones 0–8 are done.
+Milestones 0–9 are done.
 
 - M0: blackbox suite — standards conformance (PEP 503/629/691/700 over HTTP),
   end-to-end `uv pip install --exclude-newer`, real-tools matrix (uv publish +
@@ -43,6 +43,13 @@ Milestones 0–8 are done.
   403; `--private-prefix` reserves a namespace (normalized matching) for new
   private packages. The sync-side rejections land with M9's direct-storage
   sync, where sync first gains storage access.
+- M9: direct-storage sync — `pypiron sync` (no `--to`) writes artifacts,
+  sidecars carrying PyPI's true `upload-time`/sha256/`requires-python`/yank
+  state, best-effort PEP 658 metadata companions, and dirty markers straight
+  to storage via the same storage layer as the server. It claims `.origin`
+  as `mirror`, hard-fails on private-owned names and on the private
+  namespace. `--exclude-newer <historical date>` resolves the historically
+  correct version against the mirror. HTTP mode remains behind `--to`.
 
 Also working: upload via `/legacy/` (twine/uv), PEP 503 HTML + PEP 691 JSON
 indexes, PEP 629 meta tag, sha256 fragments in HTML, disk + S3 (MinIO)

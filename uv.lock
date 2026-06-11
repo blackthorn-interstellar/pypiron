@@ -755,6 +755,7 @@ source = { editable = "." }
 [package.dev-dependencies]
 dev = [
     { name = "maturin" },
+    { name = "packaging" },
     { name = "pytest", version = "8.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
     { name = "pytest", version = "8.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.9'" },
     { name = "pytest-xdist", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
@@ -773,6 +774,7 @@ dev = [
 [package.metadata.requires-dev]
 dev = [
     { name = "maturin" },
+    { name = "packaging", specifier = ">=25.0" },
     { name = "pytest", specifier = ">=7" },
     { name = "pytest-xdist", specifier = ">=3" },
     { name = "requests", specifier = ">=2.31" },

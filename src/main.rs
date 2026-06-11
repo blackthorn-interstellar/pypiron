@@ -1,8 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::Region;
 use axum::{
     body::Body,
     extract::{Multipart, Path, Request, State},
@@ -14,7 +12,7 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{info, warn};
@@ -30,18 +28,11 @@ mod worker;
 
 use names::{infer_package_from_filename, infer_version_from_filename, normalize_pkg_name};
 use sidecar::{metadata_key, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX};
-use storage::{DiskStorage, S3Storage, Storage};
+use storage::{Storage, StorageArgs};
 
 const PACKAGES_PREFIX: &str = "packages/";
 const SIMPLE_PREFIX: &str = "simple/";
 const DIRTY_PREFIX: &str = "_dirty/";
-
-/// Storage backend selection.
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum StorageBackend {
-    Disk,
-    S3,
-}
 
 /// Top-level CLI. If no subcommand is supplied, we run the server (serve).
 #[derive(Parser, Debug)]
@@ -67,29 +58,8 @@ enum Commands {
 /// `PypIron` - A fast, reliable, and scalable `PyPI` server
 #[derive(ClapArgs, Debug, Clone)]
 struct ServeArgs {
-    /// Storage backend to use: "disk" or "s3"
-    #[arg(long, env = "PYPIRON_STORAGE", value_enum, default_value_t = StorageBackend::Disk)]
-    storage: StorageBackend,
-
-    /// Root data directory for disk storage (defaults to $HOME/.pypiron/packages)
-    #[arg(long, env = "PYPIRON_DATA_DIR")]
-    data_dir: Option<String>,
-
-    /// S3 bucket name for package storage (required if --storage s3)
-    #[arg(long, env = "PYPIRON_S3_BUCKET")]
-    s3_bucket: Option<String>,
-
-    /// AWS region (e.g., us-east-1)
-    #[arg(long, env = "AWS_REGION")]
-    aws_region: Option<String>,
-
-    /// S3 endpoint URL (for S3-compatible services)
-    #[arg(long, env = "PYPIRON_S3_ENDPOINT_URL")]
-    s3_endpoint_url: Option<String>,
-
-    /// Force S3 path-style addressing
-    #[arg(long, env = "PYPIRON_S3_FORCE_PATH_STYLE")]
-    s3_force_path_style: bool,
+    #[command(flatten)]
+    storage: StorageArgs,
 
     /// Basic auth username for uploads (optional, allows unauthenticated uploads if not provided)
     #[arg(long, env = "PYPIRON_BASIC_AUTH_USER")]
@@ -172,40 +142,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_serve(cli: ServeArgs) -> Result<()> {
-    // Build storage backend
-    let storage: Arc<dyn Storage> = match cli.storage {
-        StorageBackend::Disk => {
-            let data_dir = cli.data_dir.unwrap_or_else(|| {
-                std::env::var("HOME")
-                    .map(|home| format!("{}/.pypiron/packages", home))
-                    .unwrap_or_else(|_| "./.pypiron/packages".to_string())
-            });
-            Arc::new(DiskStorage::new(&data_dir))
-        }
-        StorageBackend::S3 => {
-            let bucket = cli
-                .s3_bucket
-                .clone()
-                .ok_or_else(|| anyhow!("--s3-bucket is required when using --storage s3"))?;
-
-            // AWS config
-            let mut cfg_loader = aws_config::defaults(BehaviorVersion::latest());
-            if let Some(ref r) = cli.aws_region {
-                cfg_loader = cfg_loader.region(Region::new(r.clone()));
-            }
-            let base_cfg = cfg_loader.load().await;
-
-            let mut s3_cfg_builder = aws_sdk_s3::config::Builder::from(&base_cfg);
-            if let Some(url) = cli.s3_endpoint_url {
-                s3_cfg_builder = s3_cfg_builder.endpoint_url(url);
-            }
-            if cli.s3_force_path_style {
-                s3_cfg_builder = s3_cfg_builder.force_path_style(true);
-            }
-            let s3 = aws_sdk_s3::Client::from_conf(s3_cfg_builder.build());
-            Arc::new(S3Storage::new(s3, bucket))
-        }
-    };
+    let storage = cli.storage.build().await?;
 
     let state = Arc::new(AppState {
         storage,
@@ -537,10 +474,7 @@ fn now_rfc3339() -> String {
 
 /// Mark a package as needing an index rebuild (empty object at `_dirty/<pkg>`).
 async fn mark_dirty(state: &AppState, pkg: &str) -> Result<()> {
-    state
-        .storage
-        .put_bytes(&format!("{DIRTY_PREFIX}{pkg}"), Vec::new(), None)
-        .await
+    worker::mark_dirty(state.storage.as_ref(), pkg).await
 }
 
 /// --- Simple index endpoints ----------------------------------------------

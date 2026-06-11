@@ -1,4 +1,14 @@
-use anyhow::{anyhow, Context, Result};
+//! Mirror packages from PyPI into this registry.
+//!
+//! Default mode writes straight to storage with the same code the server
+//! uses: artifact, then a sidecar carrying PyPI's true `upload-time` and
+//! sha256 (no re-hashing), then a dirty marker. Historical timestamps are
+//! gated on storage credentials by construction — the HTTP upload API never
+//! accepts one. `--to <url>` keeps the legacy HTTP mode (POST to a remote
+//! `/legacy/`), with the accepted limitation that timestamps become mirror
+//! time.
+
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use futures::stream::{self, StreamExt};
 use reqwest::{multipart, Client};
@@ -8,6 +18,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs;
 use tracing::{error, info, warn};
+
+use crate::names::{matches_prefix, normalize_pkg_name};
+use crate::origin;
+use crate::sidecar::{metadata_key, sidecar_key, Sidecar, Yanked};
+use crate::storage::{Storage, StorageArgs};
+use crate::worker::mark_dirty;
+use crate::PACKAGES_PREFIX;
 
 #[derive(Debug, Clone, Args)]
 pub struct SyncArgs {
@@ -23,17 +40,22 @@ pub struct SyncArgs {
     )]
     pub src_base: String,
 
-    /// Destination PypIron base URL (we'll POST to <to>/legacy/).
+    /// Destination PypIron base URL for HTTP mode (POSTs to <to>/legacy/).
+    /// Omit to write directly to storage (the default, preserves timestamps).
     #[arg(long = "to", env = "PYPIRON_SYNC_TO")]
-    pub dst_base: String,
+    pub dst_base: Option<String>,
 
-    /// Basic auth username for destination (optional).
+    /// Basic auth username for the HTTP-mode destination (optional).
     #[arg(long, env = "PYPIRON_SYNC_USERNAME")]
     pub username: Option<String>,
 
-    /// Basic auth password for destination (optional).
+    /// Basic auth password for the HTTP-mode destination (optional).
     #[arg(long, env = "PYPIRON_SYNC_PASSWORD")]
     pub password: Option<String>,
+
+    /// Refuse to mirror names inside this private namespace (PEP 503-normalized)
+    #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
+    pub private_prefix: Option<String>,
 
     /// Parallel downloads/uploads.
     #[arg(long, default_value_t = 4)]
@@ -46,6 +68,10 @@ pub struct SyncArgs {
     /// Filtering flags (wheel/python/abi/platform).
     #[command(flatten)]
     pub filter: FilterArgs,
+
+    /// Storage configuration for direct mode (same flags as `serve`).
+    #[command(flatten)]
+    pub storage: StorageArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -75,24 +101,9 @@ pub struct FilterArgs {
     pub exclude_platform_tag: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct PackageSpec {
-    name: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct PyPiJson {
-    #[allow(dead_code)]
-    info: PyPiInfo,
     releases: HashMap<String, Vec<PyPiFile>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PyPiInfo {
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    version: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,13 +111,16 @@ struct PyPiFile {
     filename: String,
     url: String,
     digests: PyPiDigests,
-
-    // Useful hints; presence may vary.
     #[serde(default)]
     packagetype: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
-    python_version: Option<String>,
+    upload_time_iso_8601: Option<String>,
+    #[serde(default)]
+    requires_python: Option<String>,
+    #[serde(default)]
+    yanked: bool,
+    #[serde(default)]
+    yanked_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,11 +128,15 @@ struct PyPiDigests {
     sha256: String,
 }
 
-#[derive(Debug, Clone)]
-struct WheelTags {
-    python: Vec<String>,
-    abi: Vec<String>,
-    platform: Vec<String>,
+/// A file selected for mirroring, with its release version.
+struct Selected {
+    version: String,
+    file: PyPiFile,
+}
+
+enum Sink {
+    Storage(std::sync::Arc<dyn Storage>),
+    Http(String),
 }
 
 pub async fn run_sync(args: SyncArgs) -> Result<()> {
@@ -126,135 +144,261 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
         .user_agent("pypiron-sync/0.1 (+https://github.com/brycedrennan/pypiron)")
         .build()?;
 
-    let specs = read_specs(&args.packages_list).await?;
-    if specs.is_empty() {
+    let packages = read_package_names(&args.packages_list).await?;
+    if packages.is_empty() {
         return Err(anyhow!(
             "No packages found in {}",
             args.packages_list.display()
         ));
     }
 
-    let dst_legacy = normalize_legacy_endpoint(&args.dst_base);
-    info!("Destination legacy upload endpoint: {}", dst_legacy);
+    let sink = match &args.dst_base {
+        Some(dst) => {
+            let endpoint = normalize_legacy_endpoint(dst);
+            info!("HTTP mode: uploading to {endpoint}");
+            Sink::Http(endpoint)
+        }
+        None => {
+            info!("direct-storage mode");
+            Sink::Storage(args.storage.build().await?)
+        }
+    };
 
-    for spec in specs {
-        if let Err(e) = sync_one_package(&client, &args, &dst_legacy, spec).await {
-            error!(error=?e, "Failed to sync a package");
+    let mut failures = 0usize;
+    for pkg in packages {
+        if let Err(e) = sync_one_package(&client, &args, &sink, &pkg).await {
+            error!(package=%pkg, error=?e, "package sync failed");
+            failures += 1;
         }
     }
-
+    if failures > 0 {
+        bail!("{failures} package(s) failed to sync");
+    }
     Ok(())
 }
 
-async fn sync_one_package(
-    client: &Client,
-    args: &SyncArgs,
-    dst_legacy: &str,
-    spec: PackageSpec,
-) -> Result<()> {
-    let files = fetch_all_files_for_package(client, &args.src_base, &spec.name).await?;
-    let selected: Vec<PyPiFile> = files
-        .into_iter()
-        .filter(|f| matches_filters(f, &args.filter))
-        .collect();
+async fn sync_one_package(client: &Client, args: &SyncArgs, sink: &Sink, pkg: &str) -> Result<()> {
+    // Policy gates come before any network traffic.
+    if let Some(prefix) = &args.private_prefix {
+        let prefix = normalize_pkg_name(prefix);
+        if matches_prefix(pkg, &prefix) {
+            bail!("'{pkg}' is inside the private namespace '{prefix}'; refusing to mirror");
+        }
+    }
+    if let Sink::Storage(storage) = sink {
+        match origin::read_origin(storage.as_ref(), pkg).await.as_deref() {
+            Some(origin::MIRROR) | None => {}
+            Some(other) => {
+                bail!("'{pkg}' is {other}-owned; refusing to mirror over it")
+            }
+        }
+    }
 
-    info!(
-        "Syncing {} ({} matching files selected)",
-        spec.name,
-        selected.len()
-    );
+    let selected = fetch_selected_files(client, args, pkg).await?;
+    info!("Syncing {pkg} ({} matching files selected)", selected.len());
 
     if args.dry_run {
-        for f in &selected {
-            println!("[dry-run] would copy {} ({})", f.filename, f.url);
+        for s in &selected {
+            println!("[dry-run] would copy {} ({})", s.file.filename, s.file.url);
         }
         return Ok(());
     }
 
-    stream::iter(selected.into_iter())
-        .map(|f| {
-            let client = client.clone();
-            let args = args.clone();
-            let dst_legacy = dst_legacy.to_string();
-            async move {
-                if let Err(e) = download_verify_and_upload(&client, &dst_legacy, &args, f).await {
-                    error!(error=?e, "file failed");
+    if let Sink::Storage(storage) = sink {
+        // Claim only when actually writing.
+        if origin::read_origin(storage.as_ref(), pkg).await.is_none() {
+            origin::claim_origin(storage.as_ref(), pkg, origin::MIRROR).await?;
+        }
+    }
+
+    let results: Vec<Result<bool>> = stream::iter(selected)
+        .map(|s| async move {
+            match sink {
+                Sink::Storage(storage) => {
+                    mirror_to_storage(client, storage.as_ref(), pkg, &s).await
                 }
+                Sink::Http(endpoint) => upload_via_http(client, args, endpoint, &s).await,
             }
         })
         .buffer_unordered(args.concurrency.max(1))
-        .collect::<Vec<_>>()
+        .collect()
         .await;
 
+    let mut wrote = false;
+    let mut errors = 0usize;
+    for r in &results {
+        match r {
+            Ok(true) => wrote = true,
+            Ok(false) => {}
+            Err(e) => {
+                error!(package=%pkg, error=?e, "file failed");
+                errors += 1;
+            }
+        }
+    }
+
+    if wrote {
+        if let Sink::Storage(storage) = sink {
+            mark_dirty(storage.as_ref(), pkg).await?;
+        }
+    }
+    if errors > 0 {
+        bail!("{errors} file(s) failed for '{pkg}'");
+    }
     Ok(())
 }
 
-async fn fetch_all_files_for_package(
+async fn fetch_selected_files(
     client: &Client,
-    src_base: &str,
+    args: &SyncArgs,
     pkg: &str,
-) -> Result<Vec<PyPiFile>> {
-    let url = format!("{}/pypi/{}/json", src_base.trim_end_matches('/'), pkg);
+) -> Result<Vec<Selected>> {
+    let url = format!("{}/pypi/{}/json", args.src_base.trim_end_matches('/'), pkg);
     let resp = client.get(url).send().await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(anyhow!("Package not found on source: {}", pkg));
+        return Err(anyhow!("Package not found on source: {pkg}"));
     }
     let json: PyPiJson = resp.error_for_status()?.json().await?;
 
-    let mut all = Vec::new();
-    for (_ver, files) in json.releases {
-        for f in files {
-            all.push(f);
+    let mut selected = Vec::new();
+    for (version, files) in json.releases {
+        for file in files {
+            if matches_filters(&file, &args.filter) {
+                selected.push(Selected {
+                    version: version.clone(),
+                    file,
+                });
+            }
         }
     }
-    if all.is_empty() {
-        warn!("No files found for package '{}'", pkg);
+    if selected.is_empty() {
+        warn!("No matching files for package '{pkg}'");
     }
-    Ok(all)
+    Ok(selected)
 }
 
-async fn download_verify_and_upload(
+/// Mirror one file into storage. Returns false if it was already present.
+/// Writes follow the ordering invariant: artifact, metadata, sidecar; the
+/// caller drops the package's dirty marker after the batch.
+async fn mirror_to_storage(
     client: &Client,
-    dst_legacy: &str,
-    args: &SyncArgs,
-    file: PyPiFile,
-) -> Result<()> {
-    info!("  - downloading {}", file.filename);
+    storage: &dyn Storage,
+    pkg: &str,
+    s: &Selected,
+) -> Result<bool> {
+    let key = format!("{PACKAGES_PREFIX}{pkg}/{}", s.file.filename);
+    if storage.head_exists(&key).await.unwrap_or(false) {
+        return Ok(false);
+    }
+
+    info!("  - mirroring {}", s.file.filename);
+    let bytes = download_verified(client, &s.file).await?;
+
+    storage
+        .put_bytes(&key, bytes.clone(), Some("application/octet-stream"))
+        .await?;
+
+    // Best-effort PEP 658: PyPI serves metadata at <file-url>.metadata.
+    if s.file.filename.ends_with(".whl") {
+        if let Ok(resp) = client.get(format!("{}.metadata", s.file.url)).send().await {
+            if resp.status().is_success() {
+                if let Ok(md) = resp.bytes().await {
+                    let _ = storage
+                        .put_bytes(
+                            &metadata_key(&key),
+                            md.to_vec(),
+                            Some("text/plain; charset=utf-8"),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
+    let yanked = match (&s.file.yanked_reason, s.file.yanked) {
+        (Some(reason), _) if !reason.trim().is_empty() => Yanked::Reason(reason.trim().into()),
+        (_, flag) => Yanked::Flag(flag),
+    };
+    let sc = Sidecar {
+        // PyPI's digest, verified against the downloaded bytes — not re-derived.
+        sha256: s.file.digests.sha256.clone(),
+        size: bytes.len() as u64,
+        version: s.version.clone(),
+        // PyPI's true upload time: the whole point of direct-storage sync.
+        upload_time: s.file.upload_time_iso_8601.clone().unwrap_or_default(),
+        requires_python: s.file.requires_python.clone(),
+        yanked,
+    };
+    storage
+        .put_bytes(
+            &sidecar_key(&key),
+            serde_json::to_vec(&sc)?,
+            Some("application/json"),
+        )
+        .await?;
+    Ok(true)
+}
+
+async fn download_verified(client: &Client, file: &PyPiFile) -> Result<Vec<u8>> {
     let resp = client.get(&file.url).send().await?.error_for_status()?;
     let bytes = resp.bytes().await?.to_vec();
-
-    // Verify SHA256
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let got = format!("{:x}", hasher.finalize());
-    if got != file.digests.sha256 {
-        warn!(
-            "SHA256 mismatch for {} (expected {}, got {}) — skipping upload",
-            file.filename, file.digests.sha256, got
+    if !got.eq_ignore_ascii_case(&file.digests.sha256) {
+        bail!(
+            "sha256 mismatch for {} (expected {}, got {got})",
+            file.filename,
+            file.digests.sha256
         );
-        return Err(anyhow!("sha256 mismatch for {}", file.filename));
     }
+    Ok(bytes)
+}
 
-    info!("  - uploading {}", file.filename);
+/// HTTP mode: push through a remote `/legacy/` with full metadata fields.
+/// Returns true on success (the remote may 409 on existing files — treated
+/// as already-present, false).
+async fn upload_via_http(
+    client: &Client,
+    args: &SyncArgs,
+    endpoint: &str,
+    s: &Selected,
+) -> Result<bool> {
+    let bytes = download_verified(client, &s.file).await?;
+
+    info!("  - uploading {}", s.file.filename);
     let part = multipart::Part::bytes(bytes)
-        .file_name(file.filename.clone())
+        .file_name(s.file.filename.clone())
         .mime_str("application/octet-stream")?;
 
-    let form = multipart::Form::new()
-        .text("filename", file.filename.clone())
+    let mut form = multipart::Form::new()
+        .text(":action", "file_upload")
+        .text("protocol_version", "1")
+        .text(
+            "name",
+            s.file.filename.split('-').next().unwrap_or("").to_string(),
+        )
+        .text("version", s.version.clone())
+        .text("sha256_digest", s.file.digests.sha256.clone())
         .part("content", part);
+    if let Some(rp) = &s.file.requires_python {
+        form = form.text("requires_python", rp.clone());
+    }
 
-    let mut req = client.post(dst_legacy).multipart(form);
+    let mut req = client.post(endpoint).multipart(form);
     if let (Some(u), Some(p)) = (args.username.as_ref(), args.password.as_ref()) {
         req = req.basic_auth(u, Some(p));
     }
     let resp = req.send().await?;
+    if resp.status() == reqwest::StatusCode::CONFLICT {
+        return Ok(false);
+    }
     if !resp.status().is_success() {
         let code = resp.status();
         let body = resp.text().await.unwrap_or_else(|_| "<no body>".into());
-        return Err(anyhow!("upload failed [{}]: {}", code, body));
+        bail!("upload failed [{code}]: {body}");
     }
-    Ok(())
+    Ok(true)
 }
 
 fn matches_filters(file: &PyPiFile, f: &FilterArgs) -> bool {
@@ -305,6 +449,13 @@ fn matches_filters(file: &PyPiFile, f: &FilterArgs) -> bool {
     }
 
     true
+}
+
+#[derive(Debug, Clone)]
+struct WheelTags {
+    python: Vec<String>,
+    abi: Vec<String>,
+    platform: Vec<String>,
 }
 
 fn tokens_match_any(tokens: &[String], filters: &[String]) -> bool {
@@ -378,7 +529,7 @@ fn parse_wheel_tags(filename: &str) -> Option<WheelTags> {
     })
 }
 
-async fn read_specs(path: &PathBuf) -> Result<Vec<PackageSpec>> {
+async fn read_package_names(path: &PathBuf) -> Result<Vec<String>> {
     let text = fs::read_to_string(path)
         .await
         .with_context(|| format!("reading {}", path.display()))?;
@@ -388,24 +539,16 @@ async fn read_specs(path: &PathBuf) -> Result<Vec<PackageSpec>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let spec =
-            parse_spec_line(line).with_context(|| format!("line {}: {}", lineno + 1, raw))?;
-        out.push(spec);
+        if line.contains("==") {
+            bail!(
+                "line {}: versions are not allowed in the packages list (found '{line}'). \
+                 Put only the package name (one per line) to mirror ALL releases.",
+                lineno + 1
+            );
+        }
+        out.push(normalize_pkg_name(line));
     }
     Ok(out)
-}
-
-fn parse_spec_line(line: &str) -> Result<PackageSpec> {
-    if line.contains("==") {
-        return Err(anyhow!(
-            "Versions are not allowed in the packages list (found '{}'). \
-             Put only the package name (one per line) to mirror ALL releases.",
-            line
-        ));
-    }
-    Ok(PackageSpec {
-        name: crate::names::normalize_pkg_name(line.trim()),
-    })
 }
 
 fn normalize_legacy_endpoint(dst_base: &str) -> String {

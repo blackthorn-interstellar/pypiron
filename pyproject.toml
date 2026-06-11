@@ -40,12 +40,13 @@ strip = true
 [dependency-groups]
 dev = [
     "maturin",
+    "packaging>=25.0",
     "pytest>=7",
     "pytest-xdist>=3",
     "requests>=2.31",
     "tenacity>=8.2",
     "twine",
-    "uv"
+    "uv",
 ]
 
 [tool.pytest.ini_options]

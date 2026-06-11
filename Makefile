@@ -1,4 +1,4 @@
-.PHONY: init init-rust init-python build dev test test-rust test-python perf check cargo-check af fmt lint clean doc publish build-wheel release-build help
+.PHONY: init init-rust init-python build dev run test test-rust test-python perf check cargo-check af fmt lint clean doc publish build-wheel release-build help
 
 SHELL := /bin/bash
 
@@ -19,6 +19,14 @@ build:  ## Build the project in release mode
 
 dev:  ## Build the project in development mode
 	cargo build
+
+run:  ## Run a local dev server (./data, admin/secret, http://127.0.0.1:8080)
+	cargo run --release -- \
+		--bind-addr 127.0.0.1:8080 \
+		--data-dir ./data \
+		--basic-auth-user admin \
+		--basic-auth-pass secret \
+		--worker-interval-secs 1
 
 test: test-rust test-python  ## Run all tests (perf/stress excluded)
 
@@ -50,13 +58,13 @@ doc:  ## Generate documentation
 	cargo doc --no-deps
 
 build-wheel:  ## Build Python wheel package
-	maturin build --release
+	uv run -- maturin build --release
 
 release-build:  ## Build wheel with optimizations for release
-	maturin build --release --strip
+	uv run -- maturin build --release --strip
 
 publish:  ## Publish package to pypi.org
-	maturin publish
+	uv run -- maturin publish
 
 help:  ## Display this help message
 	@grep -h -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'

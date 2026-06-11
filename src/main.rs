@@ -101,6 +101,10 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_WORKER_INTERVAL_SECS", default_value = "5")]
     worker_interval_secs: u64,
 
+    /// Full-reconcile sweep interval in seconds (the self-heal backbone)
+    #[arg(long, env = "PYPIRON_RECONCILE_INTERVAL_SECS", default_value = "300")]
+    reconcile_interval_secs: u64,
+
     /// Upload confirmation timeout in seconds
     #[arg(
         long,
@@ -126,6 +130,7 @@ struct AppState {
     upload_pass: Option<String>,
     // worker cfg
     worker_interval: Duration,
+    reconcile_interval: Duration,
     #[allow(dead_code)]
     upload_confirm_timeout: Duration,
     // behavior
@@ -199,6 +204,7 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         upload_user: cli.basic_auth_user,
         upload_pass: cli.basic_auth_pass,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
+        reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
         upload_confirm_timeout: Duration::from_secs(cli.upload_confirm_timeout_secs),
         public_base_url: cli.public_base_url,
     });

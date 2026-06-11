@@ -6,7 +6,7 @@
 //! processing, no claims, no races worth having. Duplicate markers collapse
 //! into one rebuild for free.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -22,12 +22,53 @@ use crate::storage::FileEntry;
 use crate::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 
 pub async fn run_worker(state: Arc<AppState>) {
+    let mut last_reconcile: Option<Instant> = None;
     loop {
+        // The reconciler is the backbone; markers merely accelerate it. The
+        // first sweep runs at startup so a restored backup heals immediately.
+        let due = last_reconcile.is_none_or(|t| t.elapsed() >= state.reconcile_interval);
+        if due {
+            if let Err(e) = reconcile(&state).await {
+                error!(error=?e, "reconcile failed");
+            }
+            last_reconcile = Some(Instant::now());
+        }
         if let Err(e) = tick(&state).await {
             error!(error=?e, "worker tick failed");
         }
         sleep(state.worker_interval).await;
     }
+}
+
+/// Full sweep: regenerate every package index from truth (backfilling missing
+/// sidecars), prune views whose package is gone, and refresh the global index.
+/// Writes only happen where the materialized view disagrees with truth.
+pub async fn reconcile(state: &AppState) -> Result<()> {
+    let mut live: Vec<String> = Vec::new();
+    for pkg in state.storage.list_dirs(PACKAGES_PREFIX).await? {
+        if rebuild_package(state, &pkg).await? {
+            live.push(pkg);
+        }
+    }
+
+    // Views whose truth directory disappeared entirely.
+    let live_set: HashSet<&str> = live.iter().map(String::as_str).collect();
+    for view in state.storage.list_dirs(SIMPLE_PREFIX).await? {
+        if !live_set.contains(view.as_str()) {
+            state
+                .storage
+                .delete_keys(&[
+                    format!("{SIMPLE_PREFIX}{view}/index.html"),
+                    format!("{SIMPLE_PREFIX}{view}/index.json"),
+                ])
+                .await?;
+        }
+    }
+
+    live.sort();
+    write_global_indexes(state, &live).await?;
+    info!(packages = live.len(), "reconcile: sweep complete");
+    Ok(())
 }
 
 async fn tick(state: &AppState) -> Result<()> {
@@ -213,27 +254,36 @@ async fn backfill_sidecar(state: &AppState, entry: &FileEntry, filename: &str) -
     Ok(sc)
 }
 
+/// Write only if the stored object differs — idempotent rebuilds shouldn't
+/// touch storage (or bump mtimes/ETags) when nothing changed.
+async fn put_if_changed(state: &AppState, key: &str, bytes: Vec<u8>, ct: &str) -> Result<()> {
+    if let Ok(current) = state.storage.get_bytes(key).await {
+        if current == bytes {
+            return Ok(());
+        }
+    }
+    state.storage.put_bytes(key, bytes, Some(ct)).await
+}
+
 async fn write_pkg_indexes(state: &AppState, pkg: &str, files: &[FileMetadata]) -> Result<()> {
     let html = pep503_package_html(pkg, files);
     let json = pep691_package_json(pkg, files);
 
     let base = format!("{SIMPLE_PREFIX}{pkg}/");
-    state
-        .storage
-        .put_bytes(
-            &format!("{base}index.html"),
-            html.into_bytes(),
-            Some("text/html; charset=utf-8"),
-        )
-        .await?;
-    state
-        .storage
-        .put_bytes(
-            &format!("{base}index.json"),
-            json.into_bytes(),
-            Some("application/vnd.pypi.simple.v1+json"),
-        )
-        .await?;
+    put_if_changed(
+        state,
+        &format!("{base}index.html"),
+        html.into_bytes(),
+        "text/html; charset=utf-8",
+    )
+    .await?;
+    put_if_changed(
+        state,
+        &format!("{base}index.json"),
+        json.into_bytes(),
+        "application/vnd.pypi.simple.v1+json",
+    )
+    .await?;
     Ok(())
 }
 
@@ -241,21 +291,19 @@ async fn write_global_indexes(state: &AppState, packages: &[String]) -> Result<(
     let html = pep503_global_html(packages);
     let json = pep691_global_json(packages);
 
-    state
-        .storage
-        .put_bytes(
-            &format!("{SIMPLE_PREFIX}index.html"),
-            html.into_bytes(),
-            Some("text/html; charset=utf-8"),
-        )
-        .await?;
-    state
-        .storage
-        .put_bytes(
-            &format!("{SIMPLE_PREFIX}index.json"),
-            json.into_bytes(),
-            Some("application/vnd.pypi.simple.v1+json"),
-        )
-        .await?;
+    put_if_changed(
+        state,
+        &format!("{SIMPLE_PREFIX}index.html"),
+        html.into_bytes(),
+        "text/html; charset=utf-8",
+    )
+    .await?;
+    put_if_changed(
+        state,
+        &format!("{SIMPLE_PREFIX}index.json"),
+        json.into_bytes(),
+        "application/vnd.pypi.simple.v1+json",
+    )
+    .await?;
     Ok(())
 }

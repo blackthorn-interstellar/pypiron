@@ -81,7 +81,7 @@ def pip_venv(tmp_path_factory, uv_path: str) -> Path:
 # ---------------------------- Disk server fixture -----------------------------
 
 
-def _start_disk_server(tmp_path_factory, bin_path: Path) -> Iterator[Dict]:
+def _start_disk_server(tmp_path_factory, bin_path: Path, extra_args=()) -> Iterator[Dict]:
     data_dir = tmp_path_factory.mktemp("pypiron-data")
     log_path = data_dir.parent / f"{data_dir.name}-server.log"
     port = find_free_port()
@@ -101,6 +101,7 @@ def _start_disk_server(tmp_path_factory, bin_path: Path) -> Iterator[Dict]:
         pw,
         "--worker-interval-secs",
         "1",
+        *extra_args,
     ]
 
     env = os.environ.copy()
@@ -136,6 +137,14 @@ def disk_server(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
 def disk_server_release(tmp_path_factory, pypiron_release_bin: Path) -> Iterator[Dict]:
     """Disk-mode server running the release binary (perf tests)."""
     yield from _start_disk_server(tmp_path_factory, pypiron_release_bin)
+
+
+@pytest.fixture()
+def disk_server_fast_reconcile(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server with an aggressive reconcile sweep (reconciler tests)."""
+    yield from _start_disk_server(
+        tmp_path_factory, pypiron_bin, extra_args=["--reconcile-interval-secs", "2"]
+    )
 
 
 # ------------------------------ MinIO (S3) fixtures ---------------------------

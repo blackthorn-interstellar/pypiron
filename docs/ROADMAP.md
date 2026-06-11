@@ -7,7 +7,7 @@ without its test is not done. Run `make check` and the test suite after each.
 
 ## Current state (as of 2026-06-11)
 
-Milestones 0–4 are done.
+Milestones 0–5 are done.
 
 - M0: blackbox suite — standards conformance (PEP 503/629/691/700 over HTTP),
   end-to-end `uv pip install --exclude-newer`, real-tools matrix (uv publish +
@@ -25,6 +25,11 @@ Milestones 0–4 are done.
 - M4: dirty markers — uploads drop `_dirty/<pkg>`; the worker rebuilds marked
   packages from listing and deletes markers last; the global index is rebuilt
   only when the package-name set changes. The copy-then-delete queue is gone.
+- M5: reconciler — a periodic full sweep (`--reconcile-interval-secs`,
+  default 300, first sweep at startup) regenerates disagreeing indexes,
+  backfills missing sidecars, and prunes views whose packages vanished.
+  Index writes are compare-before-write, so idempotent sweeps touch nothing.
+  Lost markers are provably harmless.
 
 Also working: upload via `/legacy/` (twine/uv), PEP 503 HTML + PEP 691 JSON
 indexes, PEP 629 meta tag, sha256 fragments in HTML, disk + S3 (MinIO)

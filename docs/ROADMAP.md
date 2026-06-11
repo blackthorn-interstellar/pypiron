@@ -7,7 +7,7 @@ without its test is not done. Run `make check` and the test suite after each.
 
 ## Current state (as of 2026-06-11)
 
-Milestones 0–3 are done.
+Milestones 0–4 are done.
 
 - M0: blackbox suite — standards conformance (PEP 503/629/691/700 over HTTP),
   end-to-end `uv pip install --exclude-newer`, real-tools matrix (uv publish +
@@ -22,13 +22,13 @@ Milestones 0–3 are done.
   revalidation), `public, max-age=31536000, immutable` on artifacts, single
   byte-range support on downloads (disk streams with seek, S3 passes Range
   through).
+- M4: dirty markers — uploads drop `_dirty/<pkg>`; the worker rebuilds marked
+  packages from listing and deletes markers last; the global index is rebuilt
+  only when the package-name set changes. The copy-then-delete queue is gone.
 
 Also working: upload via `/legacy/` (twine/uv), PEP 503 HTML + PEP 691 JSON
 indexes, PEP 629 meta tag, sha256 fragments in HTML, disk + S3 (MinIO)
-backends, queue-based worker, HTTP-mode `sync`.
-
-Known warts the roadmap removes: the queue has copy-then-delete claim
-semantics (replaced by dirty markers in M4).
+backends, HTTP-mode `sync`.
 
 ## Milestones
 

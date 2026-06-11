@@ -87,18 +87,12 @@ pub trait Storage: Send + Sync {
     /// Read full object bytes (indexes, sidecars — small files only).
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>>;
 
-    /// List up to `limit` file keys under `prefix` (non-recursive where possible).
-    async fn list_prefix_files_limited(&self, prefix: &str, limit: usize) -> Result<Vec<String>>;
-
     /// List immediate file entries under the directory `dir_prefix` (non-recursive),
     /// returning full keys (dir_prefix + filename) with size and last-modified.
     async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>>;
 
     /// List immediate child directory names under `dir_prefix` (without trailing slash).
     async fn list_dirs(&self, dir_prefix: &str) -> Result<Vec<String>>;
-
-    /// Copy object from `src` to `dst` then delete `src`.
-    async fn copy_then_delete(&self, src: &str, dst: &str) -> Result<()>;
 
     /// Delete multiple keys (best-effort).
     async fn delete_keys(&self, keys: &[String]) -> Result<()>;
@@ -204,29 +198,6 @@ impl Storage for DiskStorage {
             .with_context(|| format!("read {}", key))?)
     }
 
-    async fn list_prefix_files_limited(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
-        let dir = self.resolve(prefix)?;
-        let mut out = Vec::new();
-        if let Ok(mut rd) = fs::read_dir(dir).await {
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                if out.len() >= limit {
-                    break;
-                }
-                let md = entry.metadata().await?;
-                if md.is_file() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        out.push(format!("{}{}", prefix, name));
-                    }
-                }
-            }
-        }
-        out.sort();
-        if out.len() > limit {
-            out.truncate(limit);
-        }
-        Ok(out)
-    }
-
     async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
         let dir = self.resolve(dir_prefix)?;
         let mut files = Vec::new();
@@ -268,15 +239,6 @@ impl Storage for DiskStorage {
         }
         dirs.sort();
         Ok(dirs)
-    }
-
-    async fn copy_then_delete(&self, src: &str, dst: &str) -> Result<()> {
-        let s = self.resolve(src)?;
-        let d = self.resolve(dst)?;
-        self.ensure_parent(&d).await?;
-        fs::copy(&s, &d).await?;
-        let _ = fs::remove_file(&s).await;
-        Ok(())
     }
 
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
@@ -381,27 +343,6 @@ impl Storage for S3Storage {
         Ok(out.body.collect().await?.to_vec())
     }
 
-    async fn list_prefix_files_limited(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
-        let out = self
-            .s3
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(prefix)
-            .max_keys(limit as i32)
-            .send()
-            .await?;
-        let mut keys = Vec::new();
-        for o in out.contents() {
-            if let Some(k) = o.key() {
-                // S3 objects with keys ending in "/" are not expected here; include files only.
-                if !k.ends_with('/') {
-                    keys.push(k.to_string());
-                }
-            }
-        }
-        Ok(keys)
-    }
-
     async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
         let mut token: Option<String> = None;
         let mut entries = Vec::new();
@@ -462,25 +403,6 @@ impl Storage for S3Storage {
         }
         dirs.sort();
         Ok(dirs)
-    }
-
-    async fn copy_then_delete(&self, src: &str, dst: &str) -> Result<()> {
-        let src_uri = format!("{}/{}", self.bucket, src);
-        self.s3
-            .copy_object()
-            .bucket(&self.bucket)
-            .key(dst)
-            .copy_source(src_uri)
-            .send()
-            .await?;
-        let _ = self
-            .s3
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(src)
-            .send()
-            .await;
-        Ok(())
     }
 
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {

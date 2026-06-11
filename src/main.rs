@@ -15,7 +15,6 @@ use axum::{
 use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{info, warn};
@@ -33,8 +32,7 @@ use storage::{DiskStorage, S3Storage, Storage};
 
 const PACKAGES_PREFIX: &str = "packages/";
 const SIMPLE_PREFIX: &str = "simple/";
-const QUEUE_PENDING_PREFIX: &str = "_internal/queue/pending/";
-const QUEUE_PROCESSING_PREFIX: &str = "_internal/queue/processing/";
+const DIRTY_PREFIX: &str = "_dirty/";
 
 /// Storage backend selection.
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -103,10 +101,6 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_WORKER_INTERVAL_SECS", default_value = "5")]
     worker_interval_secs: u64,
 
-    /// Number of jobs to process per worker batch
-    #[arg(long, env = "PYPIRON_JOB_BATCH_SIZE", default_value = "20")]
-    job_batch_size: usize,
-
     /// Upload confirmation timeout in seconds
     #[arg(
         long,
@@ -132,7 +126,6 @@ struct AppState {
     upload_pass: Option<String>,
     // worker cfg
     worker_interval: Duration,
-    job_batch_size: usize,
     #[allow(dead_code)]
     upload_confirm_timeout: Duration,
     // behavior
@@ -206,7 +199,6 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         upload_user: cli.basic_auth_user,
         upload_pass: cli.basic_auth_pass,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
-        job_batch_size: cli.job_batch_size,
         upload_confirm_timeout: Duration::from_secs(cli.upload_confirm_timeout_secs),
         public_base_url: cli.public_base_url,
     });
@@ -454,9 +446,10 @@ async fn legacy_upload(
             )
         })?;
 
-    // Enqueue a job for background indexing; best-effort
-    if let Err(e) = enqueue_job(&state, &pkg_norm, &filename, &key).await {
-        warn!(error=?e, "legacy: failed to enqueue indexing job");
+    // Drop a dirty marker for the worker; best-effort — the artifact is
+    // durable either way and the periodic reconcile heals lost markers.
+    if let Err(e) = mark_dirty(&state, &pkg_norm).await {
+        warn!(error=?e, "legacy: failed to write dirty marker");
     }
 
     // Return a simple OK text body compatible with legacy clients.
@@ -472,33 +465,12 @@ fn now_rfc3339() -> String {
         .unwrap_or_default()
 }
 
-#[derive(Serialize, Deserialize)]
-struct Job {
-    package: String,
-    filename: String,
-    s3_key: String,
-    uploaded_at: String,
-}
-
-async fn enqueue_job(state: &AppState, package: &str, filename: &str, s3_key: &str) -> Result<()> {
-    let ts = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "now".into());
-    let stamp = OffsetDateTime::now_utc().unix_timestamp();
-    let job = Job {
-        package: package.to_string(),
-        filename: filename.to_string(),
-        s3_key: s3_key.to_string(),
-        uploaded_at: ts,
-    };
-    let name = format!("{stamp}-{package}-{filename}.json");
-    let body = serde_json::to_vec(&job)?;
-    let key = format!("{QUEUE_PENDING_PREFIX}{name}");
+/// Mark a package as needing an index rebuild (empty object at `_dirty/<pkg>`).
+async fn mark_dirty(state: &AppState, pkg: &str) -> Result<()> {
     state
         .storage
-        .put_bytes(&key, body, Some("application/json"))
-        .await?;
-    Ok(())
+        .put_bytes(&format!("{DIRTY_PREFIX}{pkg}"), Vec::new(), None)
+        .await
 }
 
 /// --- Simple index endpoints ----------------------------------------------

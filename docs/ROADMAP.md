@@ -7,6 +7,12 @@ without its test is not done. Run `make check` and the test suite after each.
 
 ## Current state (as of 2026-06-11)
 
+Milestone 0 is done: the blackbox suite covers standards conformance (PEP
+503/629/691/700 over HTTP), end-to-end `uv pip install --exclude-newer`, the
+real-tools matrix (uv publish + twine upload, uv + pip install), round trips on
+both disk and MinIO-S3 backends, and a perf harness (`make perf`) against the
+release binary.
+
 Already working: upload via `/legacy/` (twine/uv), PEP 503 HTML + PEP 691 JSON
 indexes, PEP 700 fields (`upload-time`/`size`/`versions`, sourced from storage
 last-modified), PEP 629 meta tag, sha256 fragments in HTML, disk + S3 (MinIO)

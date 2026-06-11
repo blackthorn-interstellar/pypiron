@@ -53,7 +53,9 @@ markers = [
     "stress: long-running, network-heavy tests (disabled by default)",
     "integration: integration tests that may hit the network or spawn services",
     "s3: tests that require Docker/MinIO S3 emulation",
+    "perf: performance benchmarks against the release binary (disabled by default)",
 ]
+addopts = "-m 'not perf and not stress'"
 testpaths = [
     "tests",
 ]

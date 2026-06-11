@@ -1,4 +1,4 @@
-.PHONY: build test check fmt lint clean help test-integration test-e2e test-stress build-wheel build-sdist install-maturin release-build init-rust init-python test-rust test-python
+.PHONY: init init-rust init-python build dev test test-rust test-python perf check cargo-check af fmt lint clean doc publish build-wheel release-build help
 
 SHELL := /bin/bash
 
@@ -14,36 +14,24 @@ init-rust:  ## Setup Rust development tools
 init-python:  ## Setup Python development environment
 	uv sync --all-extras
 
-
 build:  ## Build the project in release mode
 	cargo build --release
-
-build-wheel:  ## Build Python wheel package
-	maturin build --release
-
-release-build:  ## Build wheel with optimizations for release
-	maturin build --release --strip
 
 dev:  ## Build the project in development mode
 	cargo build
 
-test: test-rust test-python  ## Run all tests (both Rust and Python)
+test: test-rust test-python  ## Run all tests (perf/stress excluded)
 
 test-rust:  ## Run Rust unit tests
 	cargo test
 
-test-python:  ## Run Python tests
-	uv run -- pytest tests/
+test-python:  ## Run blackbox integration tests
+	uv run -- pytest tests
 
-test-simple: dev  ## Run simple integration tests (bash + pytest; S3 test may require Docker/MinIO)
-	./tests/test_simple.sh
+perf:  ## Run performance benchmarks (builds release binary)
+	uv run -- pytest tests -m perf -s
 
-test-integration: dev  ## Run integration tests (bash + pytest; S3 test may require Docker/MinIO)
-	./tests/test_simple.sh
-	./tests/test_simple_s3.sh
-	pytest -q tests/e2e -m "not stress"
-
-check: af cargo-check lint
+check: af cargo-check lint test-rust  ## Format, lint, and unit-test
 
 cargo-check:  ## Check the project for compilation errors
 	cargo check
@@ -53,7 +41,7 @@ fmt:  ## Format the code using rustfmt
 	cargo fmt --all
 
 lint:  ## Run clippy lints
-	cargo clippy -- -D warnings
+	cargo clippy --all-targets -- -D warnings
 
 clean:  ## Clean build artifacts
 	cargo clean
@@ -61,12 +49,14 @@ clean:  ## Clean build artifacts
 doc:  ## Generate documentation
 	cargo doc --no-deps
 
+build-wheel:  ## Build Python wheel package
+	maturin build --release
 
-watch-test:  ## Run tests in watch mode
-	cargo watch -x test
+release-build:  ## Build wheel with optimizations for release
+	maturin build --release --strip
 
 publish:  ## Publish package to pypi.org
 	maturin publish
 
 help:  ## Display this help message
-	@grep -h -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}' 
+	@grep -h -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'

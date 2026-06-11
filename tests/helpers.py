@@ -121,10 +121,10 @@ def _http_request(
         with urlopen(req, data=data, timeout=timeout) as resp:
             code = resp.getcode()
             body = resp.read()
-            hdrs = {k: v for k, v in resp.headers.items()}
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
             return code, body, hdrs
     except HTTPError as e:
-        return e.code, e.read() if e.fp else b"", dict(e.headers or {})
+        return e.code, e.read() if e.fp else b"", {k.lower(): v for k, v in (e.headers or {}).items()}
     except URLError as e:
         raise ConnectionError(f"HTTP request failed to {url}: {e}") from e
 
@@ -178,6 +178,11 @@ def pypi_release_file(package: str, version: str, suffix: str = ".whl") -> Tuple
         if f["filename"].endswith(suffix):
             return f["filename"], f["url"]
     raise RuntimeError(f"No {suffix} file found for {package}=={version} on PyPI")
+
+
+def pypi_project_json(package: str) -> dict:
+    """Full project JSON from pypi.org (all releases, with upload times)."""
+    return http_get_json(f"https://pypi.org/pypi/{package}/json", timeout=30.0)
 
 
 def download_pypi_wheel(package: str, version: str, dest_dir: Path) -> Path:
@@ -247,46 +252,71 @@ def _encode_basic_auth(user: str, password: str) -> str:
     return "Basic " + base64.b64encode(token).decode("ascii")
 
 
+def parse_dist_filename(filename: str) -> Tuple[str, str]:
+    """Best-effort (name, version) from a wheel/sdist filename."""
+    if filename.endswith(".whl"):
+        parts = filename[: -len(".whl")].split("-")
+        return parts[0], parts[1]
+    for suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".zip"):
+        if filename.endswith(suffix):
+            stem = filename[: -len(suffix)]
+            name, _, version = stem.rpartition("-")
+            return name, version
+    raise ValueError(f"Unrecognized distribution filename: {filename}")
+
+
 def upload_legacy(
     legacy_url: str,
     wheel_path: Path,
     *,
     username: Optional[str] = None,
     password: Optional[str] = None,
+    fields: Optional[Dict[str, str]] = None,
     timeout: float = 30.0,
-) -> None:
-    """POST multipart/form-data to /legacy with fields:
-       - filename (text)
-       - content (file) with filename attribute
+    expect_status: int = 200,
+) -> Tuple[int, bytes]:
+    """POST multipart/form-data to /legacy the way twine does.
+
+    Sends the standard metadata fields (:action, name, version, sha256_digest)
+    plus the file in field "content". `fields` overrides/extends the defaults.
+    Returns (status, body); raises if status != expect_status.
     """
     filename = wheel_path.name
     file_bytes = wheel_path.read_bytes()
+    name, version = parse_dist_filename(filename)
+
+    form: Dict[str, str] = {
+        ":action": "file_upload",
+        "protocol_version": "1",
+        "name": name,
+        "version": version,
+        "sha256_digest": hashlib.sha256(file_bytes).hexdigest(),
+    }
+    if fields:
+        form.update(fields)
+
     boundary = f"------------------------{uuid.uuid4().hex}"
     crlf = "\r\n"
-
-    # Build multipart payload manually to avoid external deps.
     parts: list[bytes] = []
 
-    # filename text field
+    for key, value in form.items():
+        parts.append(
+            (
+                f"--{boundary}{crlf}"
+                f'Content-Disposition: form-data; name="{key}"{crlf}{crlf}'
+                f"{value}{crlf}"
+            ).encode("utf-8")
+        )
+
     parts.append(
         (
             f"--{boundary}{crlf}"
-            f'Content-Disposition: form-data; name="filename"{crlf}{crlf}'
-            f"{filename}{crlf}"
+            f'Content-Disposition: form-data; name="content"; filename="{filename}"{crlf}'
+            f"Content-Type: application/octet-stream{crlf}{crlf}"
         ).encode("utf-8")
     )
-
-    # content file field
-    headers = (
-        f"--{boundary}{crlf}"
-        f'Content-Disposition: form-data; name="content"; filename="{filename}"{crlf}'
-        f"Content-Type: application/octet-stream{crlf}{crlf}"
-    ).encode("utf-8")
-    parts.append(headers)
     parts.append(file_bytes)
     parts.append(crlf.encode("utf-8"))
-
-    # closing boundary
     parts.append((f"--{boundary}--{crlf}").encode("utf-8"))
 
     body = b"".join(parts)
@@ -295,8 +325,11 @@ def upload_legacy(
         hdrs["Authorization"] = _encode_basic_auth(username, password)
 
     code, resp_body, _ = _http_request(legacy_url, method="POST", headers=hdrs, data=body, timeout=timeout)
-    if not (200 <= code < 300):
-        raise RuntimeError(f"Upload failed ({code}): {resp_body.decode('utf-8', 'replace')}")
+    if code != expect_status:
+        raise RuntimeError(
+            f"Upload returned {code}, expected {expect_status}: {resp_body.decode('utf-8', 'replace')}"
+        )
+    return code, resp_body
 
 
 # ----------------------------- Binary path helper ----------------------------

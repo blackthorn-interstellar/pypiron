@@ -58,39 +58,61 @@ open http://localhost:8080/simple/
 
 ## Mirroring packages with `pypiron sync`
 
-`sync` writes artifacts, metadata sidecars, and index markers **directly to
-storage**, carrying PyPI's true upload timestamps — so `--exclude-newer`
-resolves historically correct versions against your mirror.
+The recommended mode mirrors **over HTTP**: sync needs only the server URL and
+the upload credential — no storage credentials, no knowledge of the server's
+backend. It carries PyPI's true upload timestamps, so `--exclude-newer`
+resolves historically correct versions against your mirror. The server must
+opt in with `--mirror-uploads`.
 
 ```text
-# packages.txt — one name per line, no versions (all releases are mirrored)
-requests
+# packages.txt — one entry per line; PEP 440 specifiers are optional
+requests>=2.20,<3
 numpy
+six==1.16.0
 ```
 
 ```bash
-# Mirror into local disk storage (the default mode)
-pypiron sync --packages-list packages.txt --data-dir ~/.pypiron/packages
+# Server side: enable mirror uploads
+pypiron --mirror-uploads --basic-auth-user admin --basic-auth-pass secret
 
-# Mirror into S3
-pypiron sync --packages-list packages.txt \
-  --storage s3 --s3-bucket my-bucket
-
-# Push over HTTP to a remote PypIron instead (timestamps become mirror time)
+# Mirror over HTTP (recommended)
 pypiron sync --packages-list packages.txt \
   --to http://localhost:8080 --username admin --password secret
+
+# Or write directly to storage (needs bucket/disk access; no server involved)
+pypiron sync --packages-list packages.txt --data-dir ~/.pypiron/packages
+pypiron sync --packages-list packages.txt --storage s3 --s3-bucket my-bucket
 ```
 
-**Common filters (optional):**
+**Filters** (gate only what a run *adds* — already-mirrored files are never
+removed):
 
 * `--only-wheels` / `--only-sdists`
 * `--python-tag py3,cp311` — python tag(s)
 * `--abi-tag none,cp311` — ABI tag(s)
 * `--platform-tag any,manylinux2014_x86_64,macosx_*_arm64` — platform tag(s), `*` wildcard
 * `--exclude-platform-tag` — exclusions (supports `*`)
+* `--exclude-newer 2024-01-01T00:00:00Z` — only files PyPI received before then
+* `--exclude-older 2020-01-01T00:00:00Z` — only files received since then
+
+**Configuration file**: every sync option also lives in `pypiron.toml`
+(auto-discovered in the working directory, or `--config <path>`), layered as
+CLI/env > file > defaults:
+
+```toml
+[sync]
+packages = ["requests>=2.20,<3", "six"]   # or packages-list = "packages.txt"
+to = "http://localhost:8080"
+username = "admin"                        # password via PYPIRON_SYNC_PASSWORD
+only-wheels = true
+python-tag = ["py3"]
+exclude-newer = "2026-01-01T00:00:00Z"
+concurrency = 8
+```
 
 Mirrored names are claimed `mirror`-origin; names already claimed by private
-uploads (or inside `--private-prefix`) are refused outright.
+uploads (or inside `--private-prefix`) are refused outright — backdating never
+rides along on ordinary uploads, even on a mirror-enabled server.
 
 ## Running with Docker
 
@@ -169,6 +191,7 @@ All options are available via CLI args and/or environment variables.
 | `--basic-auth-user`          | `PYPIRON_BASIC_AUTH_USER`          | *(none)*       | Username for upload/management auth              |
 | `--basic-auth-pass`          | `PYPIRON_BASIC_AUTH_PASS`          | *(none)*       | Password for upload/management auth              |
 | `--private-prefix`           | `PYPIRON_PRIVATE_PREFIX`           | *(none)*       | Reserve a namespace for private uploads          |
+| `--mirror-uploads`           | `PYPIRON_MIRROR_UPLOADS`           | `false`        | Accept mirror uploads (what `sync --to` sends)   |
 | `--worker-interval-secs`     | `PYPIRON_WORKER_INTERVAL_SECS`     | `5`            | Worker tick interval                             |
 | `--reconcile-interval-secs`  | `PYPIRON_RECONCILE_INTERVAL_SECS`  | `300`          | Full self-heal sweep interval                    |
 | `--lease-ttl-secs`           | `PYPIRON_LEASE_TTL_SECS`           | `30`           | Leader lease TTL (multi-node S3)                 |

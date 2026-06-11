@@ -1,24 +1,32 @@
 //! Mirror packages from PyPI into this registry.
 //!
-//! Default mode writes straight to storage with the same code the server
-//! uses: artifact, then a sidecar carrying PyPI's true `upload-time` and
-//! sha256 (no re-hashing), then a dirty marker. Historical timestamps are
-//! gated on storage credentials by construction — the HTTP upload API never
-//! accepts one. `--to <url>` keeps the legacy HTTP mode (POST to a remote
-//! `/legacy/`), with the accepted limitation that timestamps become mirror
-//! time.
+//! The recommended mode is mirror-over-HTTP (`--to <server>`): each file is
+//! POSTed to the server's `/legacy/` with `mirror=true` plus PyPI's true
+//! `upload-time` and yank state, and the server (running `--mirror-uploads`)
+//! owns every storage write. Sync needs a URL and the upload credential —
+//! nothing about the server's storage. Without `--to`, sync writes directly
+//! to storage with the same code the server uses.
+//!
+//! Filters (`--only-wheels`, tag filters, `--exclude-newer`/`--exclude-older`,
+//! PEP 440 specifiers in the package list) gate only what a run *adds*;
+//! nothing already mirrored is ever removed. Options layer as
+//! CLI/env > pypiron.toml > defaults.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use futures::stream::{self, StreamExt};
+use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::{multipart, Client};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::fs;
 use tracing::{error, info, warn};
 
+use crate::config::{self, SyncConfig};
 use crate::names::{is_normalized, matches_prefix, normalize_pkg_name};
 use crate::origin;
 use crate::sidecar::{metadata_key, sidecar_key, Sidecar, Yanked};
@@ -28,20 +36,23 @@ use crate::PACKAGES_PREFIX;
 
 #[derive(Debug, Clone, Args)]
 pub struct SyncArgs {
-    /// Path to a text file containing packages to mirror (one per line). Only names are allowed (no versions).
+    /// Path to a pypiron.toml (defaults to ./pypiron.toml when present).
+    /// CLI and env values take precedence over the file.
+    #[arg(long, env = "PYPIRON_CONFIG")]
+    pub config: Option<PathBuf>,
+
+    /// Text file of packages to mirror, one per line: a name with optional
+    /// PEP 440 specifiers (e.g. "requests>=2.20,<3").
     #[arg(long, env = "PYPIRON_PACKAGES_LIST")]
-    pub packages_list: PathBuf,
+    pub packages_list: Option<PathBuf>,
 
     /// Source PyPI base (default: https://pypi.org). We call /pypi/<name>/json here.
-    #[arg(
-        long = "from",
-        env = "PYPIRON_SYNC_FROM",
-        default_value = "https://pypi.org"
-    )]
-    pub src_base: String,
+    #[arg(long = "from", env = "PYPIRON_SYNC_FROM")]
+    pub src_base: Option<String>,
 
-    /// Destination PypIron base URL for HTTP mode (POSTs to <to>/legacy/).
-    /// Omit to write directly to storage (the default, preserves timestamps).
+    /// Destination PypIron base URL: mirror over HTTP via its /legacy/
+    /// (recommended; the server must run --mirror-uploads). Omit to write
+    /// directly to storage.
     #[arg(long = "to", env = "PYPIRON_SYNC_TO")]
     pub dst_base: Option<String>,
 
@@ -57,15 +68,15 @@ pub struct SyncArgs {
     #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
     pub private_prefix: Option<String>,
 
-    /// Parallel downloads/uploads.
-    #[arg(long, default_value_t = 4)]
-    pub concurrency: usize,
+    /// Parallel downloads/uploads (default 4).
+    #[arg(long, env = "PYPIRON_SYNC_CONCURRENCY")]
+    pub concurrency: Option<usize>,
 
     /// Print actions without downloading/uploading.
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Filtering flags (wheel/python/abi/platform).
+    /// Filtering flags (wheel/python/abi/platform/upload-time).
     #[command(flatten)]
     pub filter: FilterArgs,
 
@@ -77,11 +88,11 @@ pub struct SyncArgs {
 #[derive(Debug, Clone, Args)]
 pub struct FilterArgs {
     /// Only mirror wheel files (.whl)
-    #[arg(long)]
+    #[arg(long, env = "PYPIRON_SYNC_ONLY_WHEELS")]
     pub only_wheels: bool,
 
     /// Only mirror source distributions (sdist)
-    #[arg(long)]
+    #[arg(long, env = "PYPIRON_SYNC_ONLY_SDISTS")]
     pub only_sdists: bool,
 
     /// Include wheels whose python tag matches any of these (e.g. py3, cp311). Comma-separated or repeatable.
@@ -99,6 +110,155 @@ pub struct FilterArgs {
     /// Exclude wheels whose platform tag matches any of these (supports '*' wildcard).
     #[arg(long, value_delimiter = ',', value_name = "TAG")]
     pub exclude_platform_tag: Vec<String>,
+
+    /// Only mirror files PyPI received before this RFC 3339 timestamp
+    /// (the mirroring twin of uv's --exclude-newer).
+    #[arg(long, env = "PYPIRON_SYNC_EXCLUDE_NEWER", value_name = "TIMESTAMP")]
+    pub exclude_newer: Option<String>,
+
+    /// Only mirror files PyPI received at or after this RFC 3339 timestamp.
+    #[arg(long, env = "PYPIRON_SYNC_EXCLUDE_OLDER", value_name = "TIMESTAMP")]
+    pub exclude_older: Option<String>,
+}
+
+/// One package to mirror, with optional PEP 440 version constraints.
+#[derive(Debug, Clone)]
+struct PackageSpec {
+    name: String,
+    specifiers: Option<VersionSpecifiers>,
+}
+
+/// Everything resolved: CLI/env over pypiron.toml over defaults, all inputs
+/// parsed and validated up front.
+struct Resolved {
+    specs: Vec<PackageSpec>,
+    src_base: String,
+    dst_base: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    private_prefix: Option<String>,
+    concurrency: usize,
+    dry_run: bool,
+    filter: ResolvedFilter,
+}
+
+struct ResolvedFilter {
+    only_wheels: bool,
+    only_sdists: bool,
+    python_tag: Vec<String>,
+    abi_tag: Vec<String>,
+    platform_tag: Vec<String>,
+    exclude_platform_tag: Vec<String>,
+    exclude_newer: Option<OffsetDateTime>,
+    exclude_older: Option<OffsetDateTime>,
+}
+
+impl Resolved {
+    async fn merge(args: &SyncArgs, cfg: SyncConfig) -> Result<Self> {
+        // Package list: CLI path wins over the file's path; the file's inline
+        // `packages` array is appended either way.
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(path) = args.packages_list.as_ref().or(cfg.packages_list.as_ref()) {
+            let text = fs::read_to_string(path)
+                .await
+                .with_context(|| format!("reading {}", path.display()))?;
+            lines.extend(text.lines().map(str::to_string));
+        }
+        lines.extend(cfg.packages.unwrap_or_default());
+
+        let mut specs = Vec::new();
+        for (lineno, raw) in lines.iter().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            specs.push(
+                parse_spec_line(line)
+                    .with_context(|| format!("package entry {} ('{line}')", lineno + 1))?,
+            );
+        }
+        if specs.is_empty() {
+            bail!(
+                "no packages to sync: provide --packages-list or [sync].packages in pypiron.toml"
+            );
+        }
+
+        let filter = &args.filter;
+        Ok(Self {
+            specs,
+            src_base: args
+                .src_base
+                .clone()
+                .or(cfg.from)
+                .unwrap_or_else(|| "https://pypi.org".to_string()),
+            dst_base: args.dst_base.clone().or(cfg.to),
+            username: args.username.clone().or(cfg.username),
+            password: args.password.clone().or(cfg.password),
+            private_prefix: args.private_prefix.clone().or(cfg.private_prefix),
+            concurrency: args.concurrency.or(cfg.concurrency).unwrap_or(4).max(1),
+            dry_run: args.dry_run,
+            filter: ResolvedFilter {
+                only_wheels: filter.only_wheels || cfg.only_wheels.unwrap_or(false),
+                only_sdists: filter.only_sdists || cfg.only_sdists.unwrap_or(false),
+                python_tag: pick_vec(&filter.python_tag, cfg.python_tag),
+                abi_tag: pick_vec(&filter.abi_tag, cfg.abi_tag),
+                platform_tag: pick_vec(&filter.platform_tag, cfg.platform_tag),
+                exclude_platform_tag: pick_vec(
+                    &filter.exclude_platform_tag,
+                    cfg.exclude_platform_tag,
+                ),
+                exclude_newer: parse_cutoff(
+                    "exclude-newer",
+                    filter.exclude_newer.as_ref().or(cfg.exclude_newer.as_ref()),
+                )?,
+                exclude_older: parse_cutoff(
+                    "exclude-older",
+                    filter.exclude_older.as_ref().or(cfg.exclude_older.as_ref()),
+                )?,
+            },
+        })
+    }
+}
+
+/// CLI tags win when any were passed; otherwise the config file's.
+fn pick_vec(cli: &[String], cfg: Option<Vec<String>>) -> Vec<String> {
+    if cli.is_empty() {
+        cfg.unwrap_or_default()
+    } else {
+        cli.to_vec()
+    }
+}
+
+fn parse_cutoff(what: &str, value: Option<&String>) -> Result<Option<OffsetDateTime>> {
+    let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
+        return Ok(None);
+    };
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map(Some)
+        .map_err(|e| anyhow!("{what} is not RFC 3339 ('{value}'): {e}"))
+}
+
+/// `name` with optional PEP 440 specifiers: `requests`, `six==1.16.0`,
+/// `requests>=2.20,<3`.
+fn parse_spec_line(line: &str) -> Result<PackageSpec> {
+    let split = line
+        .find(['<', '>', '=', '!', '~', ' '])
+        .unwrap_or(line.len());
+    let (raw_name, raw_spec) = line.split_at(split);
+    let name = normalize_pkg_name(raw_name.trim());
+    if !is_normalized(&name) {
+        bail!("invalid package name '{raw_name}'");
+    }
+    let raw_spec = raw_spec.trim();
+    let specifiers = if raw_spec.is_empty() {
+        None
+    } else {
+        Some(
+            VersionSpecifiers::from_str(raw_spec)
+                .map_err(|e| anyhow!("invalid version specifiers '{raw_spec}': {e}"))?,
+        )
+    };
+    Ok(PackageSpec { name, specifiers })
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,22 +302,17 @@ enum Sink {
 }
 
 pub async fn run_sync(args: SyncArgs) -> Result<()> {
+    let cfg = config::load(args.config.as_deref())?.sync;
+    let resolved = Resolved::merge(&args, cfg).await?;
+
     let client = Client::builder()
         .user_agent("pypiron-sync/0.1 (+https://github.com/brycedrennan/pypiron)")
         .build()?;
 
-    let packages = read_package_names(&args.packages_list).await?;
-    if packages.is_empty() {
-        return Err(anyhow!(
-            "No packages found in {}",
-            args.packages_list.display()
-        ));
-    }
-
-    let sink = match &args.dst_base {
+    let sink = match &resolved.dst_base {
         Some(dst) => {
             let endpoint = normalize_legacy_endpoint(dst);
-            info!("HTTP mode: uploading to {endpoint}");
+            info!("mirror-over-HTTP mode: uploading to {endpoint}");
             Sink::Http(endpoint)
         }
         None => {
@@ -167,9 +322,9 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
     };
 
     let mut failures = 0usize;
-    for pkg in packages {
-        if let Err(e) = sync_one_package(&client, &args, &sink, &pkg).await {
-            error!(package=%pkg, error=?e, "package sync failed");
+    for spec in &resolved.specs {
+        if let Err(e) = sync_one_package(&client, &resolved, &sink, spec).await {
+            error!(package=%spec.name, error=?e, "package sync failed");
             failures += 1;
         }
     }
@@ -179,9 +334,17 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
     Ok(())
 }
 
-async fn sync_one_package(client: &Client, args: &SyncArgs, sink: &Sink, pkg: &str) -> Result<()> {
-    // Policy gates come before any network traffic.
-    if let Some(prefix) = &args.private_prefix {
+async fn sync_one_package(
+    client: &Client,
+    resolved: &Resolved,
+    sink: &Sink,
+    spec: &PackageSpec,
+) -> Result<()> {
+    let pkg = spec.name.as_str();
+
+    // Policy gates come before any network traffic. Over HTTP the server
+    // enforces all of this again — defense in both places.
+    if let Some(prefix) = &resolved.private_prefix {
         let prefix = normalize_pkg_name(prefix);
         if matches_prefix(pkg, &prefix) {
             bail!("'{pkg}' is inside the private namespace '{prefix}'; refusing to mirror");
@@ -196,10 +359,10 @@ async fn sync_one_package(client: &Client, args: &SyncArgs, sink: &Sink, pkg: &s
         }
     }
 
-    let selected = fetch_selected_files(client, args, pkg).await?;
+    let selected = fetch_selected_files(client, resolved, spec).await?;
     info!("Syncing {pkg} ({} matching files selected)", selected.len());
 
-    if args.dry_run {
+    if resolved.dry_run {
         for s in &selected {
             println!("[dry-run] would copy {} ({})", s.file.filename, s.file.url);
         }
@@ -225,10 +388,10 @@ async fn sync_one_package(client: &Client, args: &SyncArgs, sink: &Sink, pkg: &s
                 Sink::Storage(storage) => {
                     mirror_to_storage(client, storage.as_ref(), pkg, &s).await
                 }
-                Sink::Http(endpoint) => upload_via_http(client, args, endpoint, pkg, &s).await,
+                Sink::Http(endpoint) => upload_via_http(client, resolved, endpoint, pkg, &s).await,
             }
         })
-        .buffer_unordered(args.concurrency.max(1))
+        .buffer_unordered(resolved.concurrency)
         .collect()
         .await;
 
@@ -283,20 +446,31 @@ async fn release_empty_claim(storage: &dyn Storage, pkg: &str) {
 
 async fn fetch_selected_files(
     client: &Client,
-    args: &SyncArgs,
-    pkg: &str,
+    resolved: &Resolved,
+    spec: &PackageSpec,
 ) -> Result<Vec<Selected>> {
-    let url = format!("{}/pypi/{}/json", args.src_base.trim_end_matches('/'), pkg);
+    let url = format!(
+        "{}/pypi/{}/json",
+        resolved.src_base.trim_end_matches('/'),
+        spec.name
+    );
     let resp = client.get(url).send().await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(anyhow!("Package not found on source: {pkg}"));
+        return Err(anyhow!("Package not found on source: {}", spec.name));
     }
     let json: PyPiJson = resp.error_for_status()?.json().await?;
 
     let mut selected = Vec::new();
     for (version, files) in json.releases {
+        if let Some(specifiers) = &spec.specifiers {
+            // Unparseable (pre-PEP-440 junk) versions never match a constraint.
+            match Version::from_str(&version) {
+                Ok(v) if specifiers.contains(&v) => {}
+                _ => continue,
+            }
+        }
         for file in files {
-            if matches_filters(&file, &args.filter) {
+            if matches_filters(&file, &resolved.filter) {
                 selected.push(Selected {
                     version: version.clone(),
                     file,
@@ -305,7 +479,7 @@ async fn fetch_selected_files(
         }
     }
     if selected.is_empty() {
-        warn!("No matching files for package '{pkg}'");
+        warn!("No matching files for package '{}'", spec.name);
     }
     Ok(selected)
 }
@@ -380,7 +554,7 @@ async fn write_mirror_sidecar(
         sha256: s.file.digests.sha256.clone(),
         size,
         version: s.version.clone(),
-        // PyPI's true upload time: the whole point of direct-storage sync.
+        // PyPI's true upload time: the whole point of mirroring.
         upload_time: s.file.upload_time_iso_8601.clone().unwrap_or_default(),
         requires_python: s.file.requires_python.clone(),
         yanked,
@@ -417,7 +591,7 @@ async fn download_verified(client: &Client, file: &PyPiFile) -> Result<Vec<u8>> 
 /// remote's 409 on an existing file means already-present (false).
 async fn upload_via_http(
     client: &Client,
-    args: &SyncArgs,
+    resolved: &Resolved,
     endpoint: &str,
     pkg: &str,
     s: &Selected,
@@ -451,7 +625,7 @@ async fn upload_via_http(
     }
 
     let mut req = client.post(endpoint).multipart(form);
-    if let (Some(u), Some(p)) = (args.username.as_ref(), args.password.as_ref()) {
+    if let (Some(u), Some(p)) = (resolved.username.as_ref(), resolved.password.as_ref()) {
         req = req.basic_auth(u, Some(p));
     }
     let resp = req.send().await?;
@@ -466,7 +640,7 @@ async fn upload_via_http(
     Ok(true)
 }
 
-fn matches_filters(file: &PyPiFile, f: &FilterArgs) -> bool {
+fn matches_filters(file: &PyPiFile, f: &ResolvedFilter) -> bool {
     let fname = file.filename.to_ascii_lowercase();
     let is_wheel =
         fname.ends_with(".whl") || matches!(file.packagetype.as_deref(), Some("bdist_wheel"));
@@ -476,6 +650,24 @@ fn matches_filters(file: &PyPiFile, f: &FilterArgs) -> bool {
     }
     if f.only_sdists && is_wheel {
         return false;
+    }
+
+    // Upload-time bounds. With a bound set, a file without a parseable
+    // timestamp is excluded — same rule uv applies to --exclude-newer.
+    if f.exclude_newer.is_some() || f.exclude_older.is_some() {
+        let uploaded = file
+            .upload_time_iso_8601
+            .as_deref()
+            .and_then(|ts| OffsetDateTime::parse(ts, &Rfc3339).ok());
+        let Some(uploaded) = uploaded else {
+            return false;
+        };
+        if f.exclude_newer.is_some_and(|cutoff| uploaded >= cutoff) {
+            return false;
+        }
+        if f.exclude_older.is_some_and(|cutoff| uploaded < cutoff) {
+            return false;
+        }
     }
 
     let has_tag_filters = !(f.python_tag.is_empty()
@@ -594,37 +786,85 @@ fn parse_wheel_tags(filename: &str) -> Option<WheelTags> {
     })
 }
 
-async fn read_package_names(path: &PathBuf) -> Result<Vec<String>> {
-    let text = fs::read_to_string(path)
-        .await
-        .with_context(|| format!("reading {}", path.display()))?;
-    let mut out = Vec::new();
-    for (lineno, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.contains("==") {
-            bail!(
-                "line {}: versions are not allowed in the packages list (found '{line}'). \
-                 Put only the package name (one per line) to mirror ALL releases.",
-                lineno + 1
-            );
-        }
-        let name = normalize_pkg_name(line);
-        if !is_normalized(&name) {
-            bail!("line {}: invalid package name '{line}'", lineno + 1);
-        }
-        out.push(name);
-    }
-    Ok(out)
-}
-
 fn normalize_legacy_endpoint(dst_base: &str) -> String {
     let trimmed = dst_base.trim_end_matches('/');
     if trimmed.ends_with("/legacy") {
         format!("{trimmed}/")
     } else {
         format!("{trimmed}/legacy/")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_spec_lines() {
+        let plain = parse_spec_line("requests").unwrap();
+        assert_eq!(plain.name, "requests");
+        assert!(plain.specifiers.is_none());
+
+        let pinned = parse_spec_line("Six==1.16.0").unwrap();
+        assert_eq!(pinned.name, "six");
+        let v = Version::from_str("1.16.0").unwrap();
+        assert!(pinned.specifiers.unwrap().contains(&v));
+
+        let ranged = parse_spec_line("requests>=2.20,<3").unwrap();
+        let specs = ranged.specifiers.unwrap();
+        assert!(specs.contains(&Version::from_str("2.28.1").unwrap()));
+        assert!(!specs.contains(&Version::from_str("3.0.0").unwrap()));
+
+        assert!(parse_spec_line("foo/bar").is_err());
+        assert!(parse_spec_line("requests >= 2.20").is_ok());
+    }
+
+    fn pypi_file(upload_time: Option<&str>) -> PyPiFile {
+        PyPiFile {
+            filename: "six-1.16.0-py2.py3-none-any.whl".into(),
+            url: String::new(),
+            digests: PyPiDigests {
+                sha256: String::new(),
+            },
+            size: None,
+            packagetype: None,
+            upload_time_iso_8601: upload_time.map(str::to_string),
+            requires_python: None,
+            yanked: false,
+            yanked_reason: None,
+        }
+    }
+
+    fn time_filter(newer: Option<&str>, older: Option<&str>) -> ResolvedFilter {
+        let parse = |v: Option<&str>| v.map(|s| OffsetDateTime::parse(s, &Rfc3339).unwrap());
+        ResolvedFilter {
+            only_wheels: false,
+            only_sdists: false,
+            python_tag: vec![],
+            abi_tag: vec![],
+            platform_tag: vec![],
+            exclude_platform_tag: vec![],
+            exclude_newer: parse(newer),
+            exclude_older: parse(older),
+        }
+    }
+
+    #[test]
+    fn upload_time_bounds_filter() {
+        let old = pypi_file(Some("2015-10-07T13:41:23Z"));
+        let new = pypi_file(Some("2024-12-04T17:35:26Z"));
+        let unknown = pypi_file(None);
+
+        let before_2016 = time_filter(Some("2016-01-01T00:00:00Z"), None);
+        assert!(matches_filters(&old, &before_2016));
+        assert!(!matches_filters(&new, &before_2016));
+        assert!(!matches_filters(&unknown, &before_2016));
+
+        let since_2016 = time_filter(None, Some("2016-01-01T00:00:00Z"));
+        assert!(!matches_filters(&old, &since_2016));
+        assert!(matches_filters(&new, &since_2016));
+
+        let unbounded = time_filter(None, None);
+        assert!(matches_filters(&unknown, &unbounded));
     }
 }

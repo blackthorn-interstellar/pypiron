@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{info, warn};
 
+mod config;
 mod lease;
 mod names;
 mod origin;
@@ -53,9 +54,9 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Run the PypIron server (same args as top-level default)
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Mirror packages from PyPI (or another source) into this PypIron instance
-    Sync(sync::SyncArgs),
+    Sync(Box<sync::SyncArgs>),
 }
 
 /// `PypIron` - A fast, reliable, and scalable `PyPI` server
@@ -145,10 +146,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Sync(args)) => {
-            return sync::run_sync(args).await;
+            return sync::run_sync(*args).await;
         }
         Some(Commands::Serve(args)) => {
-            return run_serve(args).await;
+            return run_serve(*args).await;
         }
         None => {
             // Back-compat: `pypiron` with no subcommand runs the server

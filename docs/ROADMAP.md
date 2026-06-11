@@ -64,6 +64,16 @@ All milestones (0–12) are done.
   index (bounded by `--sync-upload-timeout-secs`, default 10) before
   returning 200, so publish-then-install CI never sees a missing version.
 
+Post-roadmap:
+
+- Mirror-over-HTTP: `sync --to` pushes PyPI's history (true `upload-time`,
+  yank state) through `/legacy/` with `mirror=true`; the server (opt-in via
+  `--mirror-uploads`) owns all storage writes. Backdating stays impossible
+  for ordinary uploads.
+- Sync filtering and config: `--exclude-newer`/`--exclude-older` upload-time
+  bounds, PEP 440 version specifiers in the package list, and `pypiron.toml`
+  layered under CLI/env. Filters gate only what a run adds.
+
 Also working: upload via `/legacy/` (twine/uv), PEP 503 HTML + PEP 691 JSON
 indexes, PEP 629 meta tag, sha256 fragments in HTML, disk + S3 (MinIO)
 backends, HTTP-mode `sync`.

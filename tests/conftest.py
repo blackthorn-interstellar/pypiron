@@ -147,6 +147,14 @@ def disk_server_fast_reconcile(tmp_path_factory, pypiron_bin: Path) -> Iterator[
     )
 
 
+@pytest.fixture()
+def disk_server_prefixed(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server reserving the `acme` namespace for private uploads."""
+    yield from _start_disk_server(
+        tmp_path_factory, pypiron_bin, extra_args=["--private-prefix", "acme"]
+    )
+
+
 # ------------------------------ MinIO (S3) fixtures ---------------------------
 
 

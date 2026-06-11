@@ -7,7 +7,7 @@ without its test is not done. Run `make check` and the test suite after each.
 
 ## Current state (as of 2026-06-11)
 
-Milestones 0–7 are done.
+Milestones 0–8 are done.
 
 - M0: blackbox suite — standards conformance (PEP 503/629/691/700 over HTTP),
   end-to-end `uv pip install --exclude-newer`, real-tools matrix (uv publish +
@@ -38,6 +38,11 @@ Milestones 0–7 are done.
   `<filename>.metadata`, served at `<artifact-url>.metadata` (immutable),
   advertised via `core-metadata`/`dist-info-metadata` and `requires-python`
   in both index formats. uv resolves without downloading wheels.
+- M8: origin exclusivity — `.origin` claimed `private` at first upload and
+  released when the last file is deleted; uploads to mirror-owned names are
+  403; `--private-prefix` reserves a namespace (normalized matching) for new
+  private packages. The sync-side rejections land with M9's direct-storage
+  sync, where sync first gains storage access.
 
 Also working: upload via `/legacy/` (twine/uv), PEP 503 HTML + PEP 691 JSON
 indexes, PEP 629 meta tag, sha256 fragments in HTML, disk + S3 (MinIO)

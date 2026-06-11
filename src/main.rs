@@ -20,6 +20,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{info, warn};
 
 mod names;
+mod origin;
 mod render;
 mod sidecar;
 mod storage;
@@ -98,6 +99,11 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_BASIC_AUTH_PASS")]
     basic_auth_pass: Option<String>,
 
+    /// Reserve this namespace for private uploads: new private packages must
+    /// match `<prefix>` or `<prefix>-*` (PEP 503-normalized)
+    #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
+    private_prefix: Option<String>,
+
     /// Worker interval in seconds
     #[arg(long, env = "PYPIRON_WORKER_INTERVAL_SECS", default_value = "5")]
     worker_interval_secs: u64,
@@ -129,6 +135,7 @@ struct AppState {
     // auth
     upload_user: Option<String>,
     upload_pass: Option<String>,
+    private_prefix: Option<String>,
     // worker cfg
     worker_interval: Duration,
     reconcile_interval: Duration,
@@ -204,6 +211,7 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         storage,
         upload_user: cli.basic_auth_user,
         upload_pass: cli.basic_auth_pass,
+        private_prefix: cli.private_prefix.as_deref().map(normalize_pkg_name),
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
         upload_confirm_timeout: Duration::from_secs(cli.upload_confirm_timeout_secs),
@@ -409,6 +417,31 @@ async fn legacy_upload(
 
     let key = format!("{PACKAGES_PREFIX}{pkg_norm}/{filename}");
 
+    // Origin exclusivity: a mirror-owned name never accepts private uploads,
+    // and new names must clear the optional private-namespace policy.
+    let claimed_origin = origin::read_origin(state.storage.as_ref(), &pkg_norm).await;
+    match claimed_origin.as_deref() {
+        Some(origin::MIRROR) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("Package '{pkg_norm}' is mirror-owned; private uploads are rejected"),
+            ));
+        }
+        Some(_) => {}
+        None => {
+            if let Some(prefix) = &state.private_prefix {
+                if !names::matches_prefix(&pkg_norm, prefix) {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        format!(
+                            "Package '{pkg_norm}' does not match the private prefix '{prefix}'"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     // Filenames are immutable once written (pypi.org rule): supply-chain
     // safety and perfect cacheability in one check.
     if state.storage.head_exists(&key).await.unwrap_or(false) {
@@ -416,6 +449,18 @@ async fn legacy_upload(
             StatusCode::CONFLICT,
             format!("File already exists: {filename}"),
         ));
+    }
+
+    // First write claims the package as private.
+    if claimed_origin.is_none() {
+        if let Err(e) =
+            origin::claim_origin(state.storage.as_ref(), &pkg_norm, origin::PRIVATE).await
+        {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to claim origin: {e}"),
+            ));
+        }
     }
 
     // Ordering invariant: artifact, then sidecars, then index job.
@@ -672,7 +717,7 @@ async fn files_delete(
         return Err((StatusCode::NOT_FOUND, "No such file".into()));
     }
 
-    worker::rebuild_package_excluding(&state, &pkg, Some(&filename))
+    let still_has_artifacts = worker::rebuild_package_excluding(&state, &pkg, Some(&filename))
         .await
         .map_err(|e| {
             (
@@ -691,10 +736,12 @@ async fn files_delete(
                 format!("artifact delete failed: {e}"),
             )
         })?;
-    let _ = state
-        .storage
-        .delete_keys(&[sidecar_key(&key), sidecar::metadata_key(&key)])
-        .await;
+    let mut leftovers = vec![sidecar_key(&key), sidecar::metadata_key(&key)];
+    if !still_has_artifacts {
+        // The package is gone; its origin claim dies with it.
+        leftovers.push(origin::origin_key(&pkg));
+    }
+    let _ = state.storage.delete_keys(&leftovers).await;
 
     // Worker confirms from truth and prunes global membership if needed.
     if let Err(e) = mark_dirty(&state, &pkg).await {

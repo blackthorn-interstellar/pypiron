@@ -32,6 +32,16 @@ pub fn infer_package_from_filename(filename: &str) -> String {
     normalize_pkg_name(dist)
 }
 
+/// True if normalized `pkg` falls under normalized `prefix`: the prefix
+/// itself or anything below it (`acme` matches `acme` and `acme-foo`,
+/// never `acmefoo`). Cf. PEP 752 reserved namespaces.
+pub fn matches_prefix(pkg: &str, prefix: &str) -> bool {
+    pkg == prefix
+        || pkg
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('-'))
+}
+
 /// Best-effort version extraction from an artifact filename.
 /// Fallback only — sidecars carry the authoritative version.
 pub fn infer_version_from_filename(filename: &str) -> Option<String> {
@@ -64,6 +74,15 @@ mod tests {
             infer_package_from_filename("six-1.16.0-py2.py3-none-any.whl"),
             "six"
         );
+    }
+
+    #[test]
+    fn prefix_matching_is_namespace_shaped() {
+        assert!(matches_prefix("acme", "acme"));
+        assert!(matches_prefix("acme-foo", "acme"));
+        assert!(matches_prefix("acme-foo-bar", "acme"));
+        assert!(!matches_prefix("acmefoo", "acme"));
+        assert!(!matches_prefix("other", "acme"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ from .helpers import (
     sha256_file,
     upload_legacy,
     wait_for_file_in_index,
+    wait_for_project_in_global,
 )
 
 PACKAGE = "six"
@@ -36,6 +37,7 @@ def indexed_server(disk_server, tmp_path):
         password=disk_server["password"],
     )
     index = wait_for_file_in_index(disk_server["simple"], PACKAGE, wheel_path.name)
+    wait_for_project_in_global(disk_server["simple"], PACKAGE)
     return {**disk_server, "wheel_path": wheel_path, "package_index": index}
 
 

@@ -15,6 +15,7 @@ from .helpers import (
     run_checked,
     sha256_file,
     wait_for_file_in_index,
+    wait_for_project_in_global,
 )
 
 PACKAGE = "six"
@@ -53,10 +54,9 @@ def test_upload_index_download_install(server, tmp_path, uv_path, uv_venv):
         timeout=120,
     )
 
-    # Appears in the package index ...
+    # Appears in the package index, then the global index (in that order).
     wait_for_file_in_index(server["simple"], PACKAGE, wheel_path.name)
-
-    # ... and in the global index.
+    wait_for_project_in_global(server["simple"], PACKAGE)
     global_idx = http_get_json(f"{server['simple']}index.json", headers={"Accept": ACCEPT_PEP691})
     assert PACKAGE in [p.get("name") for p in global_idx.get("projects", [])]
 

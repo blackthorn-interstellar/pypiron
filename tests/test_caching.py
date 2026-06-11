@@ -10,6 +10,7 @@ from .helpers import (
     http_get,
     upload_legacy,
     wait_for_file_in_index,
+    wait_for_project_in_global,
 )
 
 PACKAGE = "six"
@@ -31,6 +32,9 @@ def server(request, tmp_path):
         server["legacy"], wheel_path, username=server["user"], password=server["password"]
     )
     wait_for_file_in_index(server["simple"], PACKAGE, wheel_path.name)
+    # The global index is written after the package index; wait for it too,
+    # or the ETag assertions race the worker.
+    wait_for_project_in_global(server["simple"], PACKAGE)
     return {**server, "wheel_path": wheel_path}
 
 

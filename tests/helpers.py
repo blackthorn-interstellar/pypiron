@@ -243,6 +243,24 @@ def wait_for_file_in_index(
     raise TimeoutError(f"{filename} did not appear in index for {package} within {timeout}s")
 
 
+def wait_for_project_in_global(simple_url: str, package: str, *, timeout: float = 30.0) -> None:
+    """Poll the global index until `package` is listed.
+
+    The package index is written before the global one; tests that read the
+    global index right after an upload must wait for this or race the worker.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            data = http_get_json(f"{simple_url}index.json", headers={"Accept": ACCEPT_PEP691})
+            if package in [p.get("name") for p in data.get("projects", [])]:
+                return
+        except (RuntimeError, ConnectionError):
+            pass
+        time.sleep(0.2)
+    raise TimeoutError(f"{package} did not appear in the global index within {timeout}s")
+
+
 # ------------------------------ File / Hashing --------------------------------
 
 

@@ -13,12 +13,12 @@ The bar for "supported" is blackbox-verified behavior against real clients
 | [PEP 691](https://peps.python.org/pep-0691/) | JSON simple API with content negotiation | Supported |
 | [PEP 700](https://peps.python.org/pep-0700/) | `versions`, `size`, `upload-time` in JSON (api-version 1.1) | Supported |
 | Legacy upload API | `POST /legacy/` multipart, as spoken by twine / `uv publish` | Supported (minimal) |
-| [PEP 592](https://peps.python.org/pep-0592/) | Yanked releases (`yanked` key / `data-yanked` attr) | Planned |
+| [PEP 592](https://peps.python.org/pep-0592/) | Yanked releases (`yanked` key / `data-yanked` attr) | Supported |
 | [PEP 658](https://peps.python.org/pep-0658/) / [714](https://peps.python.org/pep-0714/) | Serve wheel `METADATA` as `<filename>.metadata` + `core-metadata` attrs | Planned |
 | `requires-python` | `data-requires-python` attr / `requires-python` key | Planned (needs write-time metadata capture) |
 | Filename immutability | Reject re-upload of an existing filename (pypi.org rule) | Supported |
 | HTTP caching | ETag on indexes, `immutable` on artifacts, Range requests | Supported |
-| Package deletion | Delete event → index rebuild | Planned |
+| Package deletion | Delete event → index rebuild | Supported |
 | Origin exclusivity | Each package is `private` or `mirror`, claimed at first write; collisions rejected (dependency-confusion defense) | Planned |
 | Namespace prefix policy | Reserve a configured prefix for private uploads; mirror refuses it (cf. PEP 752) | Planned |
 | Mirrored upload times | `sync` writes PyPI's true `upload-time` into sidecars so `--exclude-newer` works on mirrored packages | Planned |

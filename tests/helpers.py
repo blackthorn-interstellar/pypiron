@@ -136,6 +136,20 @@ def http_get(
     return _http_request(url, method="GET", headers=headers, timeout=timeout)
 
 
+def http_request_auth(
+    method: str,
+    url: str,
+    *,
+    username: str,
+    password: str,
+    data: Optional[bytes] = None,
+    timeout: float = 10.0,
+) -> Tuple[int, bytes, Dict[str, str]]:
+    """Authenticated request (DELETE/POST management API); does not raise."""
+    headers = {"Authorization": _encode_basic_auth(username, password)}
+    return _http_request(url, method=method, headers=headers, data=data, timeout=timeout)
+
+
 def http_get_bytes(url: str, *, headers: Optional[Dict[str, str]] = None, timeout: float = 10.0) -> bytes:
     code, body, _ = _http_request(url, method="GET", headers=headers, timeout=timeout)
     if code < 200 or code >= 300:

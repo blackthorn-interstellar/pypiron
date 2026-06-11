@@ -44,6 +44,11 @@ pub fn sidecar_key(artifact_key: &str) -> String {
     format!("{artifact_key}{SIDECAR_SUFFIX}")
 }
 
+/// Storage key of the PEP 658 metadata file for an artifact key.
+pub fn metadata_key(artifact_key: &str) -> String {
+    format!("{artifact_key}{METADATA_SUFFIX}")
+}
+
 /// True if `filename` (no directory part) is an artifact, not a sidecar or dotfile.
 pub fn is_artifact(filename: &str) -> bool {
     !filename.is_empty()

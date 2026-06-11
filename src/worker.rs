@@ -98,7 +98,21 @@ async fn tick(state: &AppState) -> Result<()> {
 /// Returns whether the package still has artifacts; with none, its indexes
 /// are removed (index first, per the ordering invariant).
 pub async fn rebuild_package(state: &AppState, pkg: &str) -> Result<bool> {
-    let files = list_artifacts(state, pkg).await?;
+    rebuild_package_excluding(state, pkg, None).await
+}
+
+/// Like `rebuild_package`, but omitting one filename from the views. Deletion
+/// uses this to drop the file from the index *before* removing the artifact —
+/// views may lag truth but never lead it.
+pub async fn rebuild_package_excluding(
+    state: &AppState,
+    pkg: &str,
+    omit: Option<&str>,
+) -> Result<bool> {
+    let mut files = list_artifacts(state, pkg).await?;
+    if let Some(omit) = omit {
+        files.retain(|f| f.filename != omit);
+    }
     if files.is_empty() {
         state
             .storage
@@ -217,6 +231,7 @@ pub async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<FileMetad
             size: sc.size,
             upload_time: Some(sc.upload_time),
             version: Some(sc.version).filter(|v| !v.is_empty()),
+            yanked: sc.yanked,
         });
     }
     Ok(metadata)

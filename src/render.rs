@@ -1,8 +1,9 @@
-use html_escape::encode_text;
+use html_escape::{encode_double_quoted_attribute, encode_text};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 
 use crate::names::infer_version_from_filename;
+use crate::sidecar::Yanked;
 
 /// Simple API version: PEP 691 (1.0) + PEP 700 fields (1.1).
 const API_VERSION: &str = "1.1";
@@ -17,6 +18,8 @@ pub struct FileMetadata {
     pub upload_time: Option<String>,
     /// Version from the upload form, captured in the sidecar.
     pub version: Option<String>,
+    /// PEP 592 yank state from the sidecar.
+    pub yanked: Yanked,
 }
 
 /// Render minimal PEP 503 per‑package HTML (with PEP 629 version meta).
@@ -29,8 +32,18 @@ pub fn pep503_package_html(package: &str, files: &[FileMetadata]) -> String {
     ));
     for f in files {
         let fname = encode_text(&f.filename);
+        let yanked_attr = match &f.yanked {
+            Yanked::Flag(false) => String::new(),
+            Yanked::Flag(true) => r#" data-yanked="""#.to_string(),
+            Yanked::Reason(reason) => {
+                format!(
+                    r#" data-yanked="{}""#,
+                    encode_double_quoted_attribute(reason)
+                )
+            }
+        };
         body.push_str(&format!(
-            r##"<a href="/files/{}/{fname}#sha256={}">{fname}</a><br/>"##,
+            r##"<a href="/files/{}/{fname}#sha256={}"{yanked_attr}>{fname}</a><br/>"##,
             encode_text(package),
             f.sha256
         ));
@@ -61,8 +74,7 @@ struct Pep691File {
     size: u64,
     #[serde(rename = "upload-time", skip_serializing_if = "Option::is_none")]
     upload_time: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    yanked: Option<bool>,
+    yanked: Yanked,
 }
 
 #[derive(Serialize)]
@@ -104,7 +116,7 @@ pub fn pep691_package_json(package: &str, files: &[FileMetadata]) -> String {
                 hashes,
                 size: f.size,
                 upload_time: f.upload_time.clone(),
-                yanked: None,
+                yanked: f.yanked.clone(),
             }
         })
         .collect();
@@ -165,6 +177,7 @@ mod tests {
             size: 11236,
             upload_time: Some("2026-06-11T00:00:00Z".into()),
             version: version.map(str::to_string),
+            yanked: Yanked::Flag(false),
         }
     }
 
@@ -189,6 +202,28 @@ mod tests {
     fn package_html_has_hash_fragment_and_version_meta() {
         let html = pep503_package_html("six", &[meta(None)]);
         assert!(html.contains("#sha256=abc123"));
+        assert!(!html.contains("data-yanked"));
         assert!(html.contains(r#"<meta name="pypi:repository-version" content="1.1">"#));
+    }
+
+    #[test]
+    fn yanked_renders_in_html_and_json() {
+        let mut yanked = meta(Some("1.16.0"));
+        yanked.yanked = Yanked::Reason("broken \"wheel\"".into());
+
+        let html = pep503_package_html("six", &[yanked.clone()]);
+        assert!(html.contains(r#"data-yanked="broken &quot;wheel&quot;""#));
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&pep691_package_json("six", &[yanked])).unwrap();
+        assert_eq!(doc["files"][0]["yanked"], "broken \"wheel\"");
+
+        let mut flagged = meta(Some("1.16.0"));
+        flagged.yanked = Yanked::Flag(true);
+        let html = pep503_package_html("six", &[flagged.clone()]);
+        assert!(html.contains(r#"data-yanked="""#));
+        let doc: serde_json::Value =
+            serde_json::from_str(&pep691_package_json("six", &[flagged])).unwrap();
+        assert_eq!(doc["files"][0]["yanked"], true);
     }
 }

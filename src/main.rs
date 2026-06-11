@@ -223,7 +223,14 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         .route("/simple/:package", get(simple_pkg))
         .route("/simple/:package/", get(simple_pkg))
         .route("/simple/:package/index.json", get(simple_pkg_json))
-        .route("/files/:package/:filename", get(files_get))
+        .route(
+            "/files/:package/:filename",
+            get(files_get).delete(files_delete),
+        )
+        .route(
+            "/files/:package/:filename/yank",
+            post(yank_set).delete(yank_clear),
+        )
         // Catch-all for debugging unmatched routes
         .fallback(fallback_handler)
         .with_state(state.clone())
@@ -319,12 +326,7 @@ async fn legacy_upload(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // auth - only check if credentials are configured
-    if let (Some(user), Some(pass)) = (&state.upload_user, &state.upload_pass) {
-        if check_basic_auth(&headers, user, pass).is_err() {
-            return Err((StatusCode::UNAUTHORIZED, "Unauthorized".into()));
-        }
-    }
+    require_auth(&state, &headers)?;
 
     let mut filename_opt: Option<String> = None;
     let mut file_bytes: Option<Vec<u8>> = None;
@@ -630,6 +632,119 @@ fn not_found<E: std::fmt::Debug>(err: E) -> Response<Body> {
     resp
 }
 
+// --- Deletion + yank (PEP 592) ----------------------------------------------
+
+/// Delete an artifact. Ordering invariant: the file leaves the index first,
+/// then the artifact goes, then its sidecars — a listed-but-missing file is
+/// the only harmful state, and this order never produces one.
+async fn files_delete(
+    State(state): State<Arc<AppState>>,
+    Path((package, filename)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_auth(&state, &headers)?;
+    let pkg = normalize_pkg_name(&package);
+    let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+    if !state.storage.head_exists(&key).await.unwrap_or(false) {
+        return Err((StatusCode::NOT_FOUND, "No such file".into()));
+    }
+
+    worker::rebuild_package_excluding(&state, &pkg, Some(&filename))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("index rewrite failed: {e}"),
+            )
+        })?;
+
+    state
+        .storage
+        .delete_keys(std::slice::from_ref(&key))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("artifact delete failed: {e}"),
+            )
+        })?;
+    let _ = state
+        .storage
+        .delete_keys(&[sidecar_key(&key), sidecar::metadata_key(&key)])
+        .await;
+
+    // Worker confirms from truth and prunes global membership if needed.
+    if let Err(e) = mark_dirty(&state, &pkg).await {
+        warn!(error=?e, "delete: failed to write dirty marker");
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Yank a file (PEP 592). The request body, if any, is the reason.
+async fn yank_set(
+    State(state): State<Arc<AppState>>,
+    Path((package, filename)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let reason = body.trim().to_string();
+    let yanked = if reason.is_empty() {
+        Yanked::Flag(true)
+    } else {
+        Yanked::Reason(reason)
+    };
+    set_yanked(&state, &headers, &package, &filename, yanked).await
+}
+
+/// Un-yank a file.
+async fn yank_clear(
+    State(state): State<Arc<AppState>>,
+    Path((package, filename)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    set_yanked(&state, &headers, &package, &filename, Yanked::Flag(false)).await
+}
+
+/// Yank state lives in the sidecar — it is truth, so the system can heal.
+async fn set_yanked(
+    state: &AppState,
+    headers: &HeaderMap,
+    package: &str,
+    filename: &str,
+    yanked: Yanked,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_auth(state, headers)?;
+    let pkg = normalize_pkg_name(package);
+    let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+    let sc_key = sidecar_key(&key);
+
+    let bytes = state
+        .storage
+        .get_bytes(&sc_key)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "No such file".to_string()))?;
+    let mut sc: Sidecar = serde_json::from_slice(&bytes).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("bad sidecar: {e}"),
+        )
+    })?;
+    sc.yanked = yanked;
+
+    let out = serde_json::to_vec(&sc)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
+    state
+        .storage
+        .put_bytes(&sc_key, out, Some("application/json"))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
+
+    if let Err(e) = mark_dirty(state, &pkg).await {
+        warn!(error=?e, "yank: failed to write dirty marker");
+    }
+    Ok(StatusCode::OK)
+}
+
 /// --- Helpers --------------------------------------------------------------
 /// Check if the client accepts JSON response (PEP 691)
 fn accepts_json(headers: &HeaderMap) -> bool {
@@ -641,6 +756,16 @@ fn accepts_json(headers: &HeaderMap) -> bool {
         }
     }
     false
+}
+
+/// Gate writes behind basic auth when credentials are configured.
+fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    if let (Some(user), Some(pass)) = (&state.upload_user, &state.upload_pass) {
+        if check_basic_auth(headers, user, pass).is_err() {
+            return Err((StatusCode::UNAUTHORIZED, "Unauthorized".into()));
+        }
+    }
+    Ok(())
 }
 
 fn check_basic_auth(headers: &HeaderMap, user: &str, pass: &str) -> Result<()> {

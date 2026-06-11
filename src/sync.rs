@@ -16,7 +16,11 @@ pub struct SyncArgs {
     pub packages_list: PathBuf,
 
     /// Source PyPI base (default: https://pypi.org). We call /pypi/<name>/json here.
-    #[arg(long = "from", env = "PYPIRON_SYNC_FROM", default_value = "https://pypi.org")]
+    #[arg(
+        long = "from",
+        env = "PYPIRON_SYNC_FROM",
+        default_value = "https://pypi.org"
+    )]
     pub src_base: String,
 
     /// Destination PypIron base URL (we'll POST to <to>/legacy/).
@@ -101,6 +105,7 @@ struct PyPiFile {
     #[serde(default)]
     packagetype: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     python_version: Option<String>,
 }
 
@@ -184,7 +189,11 @@ async fn sync_one_package(
     Ok(())
 }
 
-async fn fetch_all_files_for_package(client: &Client, src_base: &str, pkg: &str) -> Result<Vec<PyPiFile>> {
+async fn fetch_all_files_for_package(
+    client: &Client,
+    src_base: &str,
+    pkg: &str,
+) -> Result<Vec<PyPiFile>> {
     let url = format!("{}/pypi/{}/json", src_base.trim_end_matches('/'), pkg);
     let resp = client.get(url).send().await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -250,8 +259,8 @@ async fn download_verify_and_upload(
 
 fn matches_filters(file: &PyPiFile, f: &FilterArgs) -> bool {
     let fname = file.filename.to_ascii_lowercase();
-    let is_wheel = fname.ends_with(".whl")
-        || matches!(file.packagetype.as_deref(), Some("bdist_wheel"));
+    let is_wheel =
+        fname.ends_with(".whl") || matches!(file.packagetype.as_deref(), Some("bdist_wheel"));
 
     if f.only_wheels && !is_wheel {
         return false;
@@ -279,7 +288,9 @@ fn matches_filters(file: &PyPiFile, f: &FilterArgs) -> bool {
     };
 
     // Exclusions first
-    if !f.exclude_platform_tag.is_empty() && tokens_match_any(&tags.platform, &f.exclude_platform_tag) {
+    if !f.exclude_platform_tag.is_empty()
+        && tokens_match_any(&tags.platform, &f.exclude_platform_tag)
+    {
         return false;
     }
 
@@ -323,10 +334,8 @@ fn tag_matches(tag: &str, filter: &str) -> bool {
 /// Simple glob-like matching: '*' matches any substring, parts must appear in order.
 fn glob_like_contains(haystack: &str, pattern: &str) -> bool {
     let mut rest = haystack;
-    let mut first_part = true;
     for part in pattern.split('*') {
         if part.is_empty() {
-            first_part = false;
             continue;
         }
         if let Some(idx) = rest.find(part) {
@@ -334,7 +343,6 @@ fn glob_like_contains(haystack: &str, pattern: &str) -> bool {
         } else {
             return false;
         }
-        first_part = false;
     }
     true
 }
@@ -351,12 +359,21 @@ fn parse_wheel_tags(filename: &str) -> Option<WheelTags> {
         // name, version, [build?], py, abi, platform  -> min 5 fields (without build)
         return None;
     }
-    let py = parts[parts.len() - 3].split('.').map(|s| s.to_string()).collect::<Vec<_>>();
-    let abi = parts[parts.len() - 2].split('.').map(|s| s.to_string()).collect::<Vec<_>>();
-    let plat = parts[parts.len() - 1].split('.').map(|s| s.to_string()).collect::<Vec<_>>();
+    let py = parts[parts.len() - 3]
+        .split('.')
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    let abi = parts[parts.len() - 2]
+        .split('.')
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    let plat = parts[parts.len() - 1]
+        .split('.')
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
     Some(WheelTags {
         python: py,
-        abi: abi,
+        abi,
         platform: plat,
     })
 }
@@ -371,8 +388,8 @@ async fn read_specs(path: &PathBuf) -> Result<Vec<PackageSpec>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let spec = parse_spec_line(line)
-            .with_context(|| format!("line {}: {}", lineno + 1, raw))?;
+        let spec =
+            parse_spec_line(line).with_context(|| format!("line {}: {}", lineno + 1, raw))?;
         out.push(spec);
     }
     Ok(out)

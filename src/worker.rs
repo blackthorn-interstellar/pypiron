@@ -9,8 +9,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::render::{
-    pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json,
-    FileMetadata,
+    pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
 };
 use crate::{
     AppState, PACKAGES_PREFIX, QUEUE_PENDING_PREFIX, QUEUE_PROCESSING_PREFIX, SIMPLE_PREFIX,
@@ -109,20 +108,17 @@ fn infer_pkg_from_job_key(key: &str) -> Option<String> {
 
 async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<FileMetadata>> {
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
-    let mut files = BTreeSet::new();
-    for k in state.storage.list_dir_files(&prefix).await? {
-        if let Some(fname) = k.strip_prefix(&prefix) {
-            if !fname.is_empty() {
-                files.insert(fname.to_string());
-            }
-        }
-    }
-    
-    // Compute SHA256 for each file
+    // Entries arrive sorted by key; carry size + last-modified into the index.
     let mut metadata = Vec::new();
-    for filename in files {
-        let key = format!("{prefix}{filename}");
-        match state.storage.get_bytes(&key).await {
+    for entry in state.storage.list_dir_entries(&prefix).await? {
+        let Some(filename) = entry.key.strip_prefix(&prefix) else {
+            continue;
+        };
+        if filename.is_empty() {
+            continue;
+        }
+        let filename = filename.to_string();
+        match state.storage.get_bytes(&entry.key).await {
             Ok(obj) => {
                 let mut hasher = Sha256::new();
                 hasher.update(&obj.bytes);
@@ -130,10 +126,12 @@ async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<FileMetadata>
                 metadata.push(FileMetadata {
                     filename,
                     sha256: hash,
+                    size: entry.size,
+                    upload_time: entry.last_modified,
                 });
             }
             Err(e) => {
-                warn!(error=?e, key=%key, "could not fetch file for hashing; skipping");
+                warn!(error=?e, key=%entry.key, "could not fetch file for hashing; skipping");
             }
         }
     }

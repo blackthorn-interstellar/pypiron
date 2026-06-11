@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use std::path::{Component, Path, PathBuf};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use tokio::fs;
 
@@ -12,6 +13,14 @@ pub struct ObjectData {
     pub bytes: Vec<u8>,
     pub content_type: Option<String>,
     pub content_length: Option<u64>,
+}
+
+/// A file from a directory listing, with the metadata index rendering needs.
+pub struct FileEntry {
+    pub key: String,
+    pub size: u64,
+    /// RFC 3339 last-modified timestamp (serves as PEP 700 upload-time).
+    pub last_modified: Option<String>,
 }
 
 #[async_trait]
@@ -28,9 +37,9 @@ pub trait Storage: Send + Sync {
     /// List up to `limit` file keys under `prefix` (non-recursive where possible).
     async fn list_prefix_files_limited(&self, prefix: &str, limit: usize) -> Result<Vec<String>>;
 
-    /// List immediate file names under the directory `dir_prefix` (non-recursive),
-    /// returning full keys (dir_prefix + filename).
-    async fn list_dir_files(&self, dir_prefix: &str) -> Result<Vec<String>>;
+    /// List immediate file entries under the directory `dir_prefix` (non-recursive),
+    /// returning full keys (dir_prefix + filename) with size and last-modified.
+    async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>>;
 
     /// List immediate child directory names under `dir_prefix` (without trailing slash).
     async fn list_dirs(&self, dir_prefix: &str) -> Result<Vec<String>>;
@@ -130,7 +139,7 @@ impl Storage for DiskStorage {
         Ok(out)
     }
 
-    async fn list_dir_files(&self, dir_prefix: &str) -> Result<Vec<String>> {
+    async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
         let dir = self.resolve(dir_prefix)?;
         let mut files = Vec::new();
         if let Ok(mut rd) = fs::read_dir(dir).await {
@@ -138,12 +147,21 @@ impl Storage for DiskStorage {
                 let md = entry.metadata().await?;
                 if md.is_file() {
                     if let Some(name) = entry.file_name().to_str() {
-                        files.push(format!("{}{}", dir_prefix, name));
+                        let last_modified = md
+                            .modified()
+                            .ok()
+                            .map(OffsetDateTime::from)
+                            .and_then(|t| t.format(&Rfc3339).ok());
+                        files.push(FileEntry {
+                            key: format!("{}{}", dir_prefix, name),
+                            size: md.len(),
+                            last_modified,
+                        });
                     }
                 }
             }
         }
-        files.sort();
+        files.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(files)
     }
 
@@ -192,33 +210,6 @@ pub struct S3Storage {
 impl S3Storage {
     pub fn new(s3: S3Client, bucket: String) -> Self {
         Self { s3, bucket }
-    }
-
-    async fn list_all_objects(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut token: Option<String> = None;
-        let mut keys = Vec::new();
-        loop {
-            let mut req = self
-                .s3
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(prefix);
-            if let Some(t) = token.take() {
-                req = req.continuation_token(t);
-            }
-            let out = req.send().await?;
-            for o in out.contents() {
-                if let Some(k) = o.key() {
-                    keys.push(k.to_string());
-                }
-            }
-            if out.is_truncated().unwrap_or(false) {
-                token = out.next_continuation_token.map(|s| s.to_string());
-            } else {
-                break;
-            }
-        }
-        Ok(keys)
     }
 }
 
@@ -288,18 +279,45 @@ impl Storage for S3Storage {
         Ok(keys)
     }
 
-    async fn list_dir_files(&self, dir_prefix: &str) -> Result<Vec<String>> {
-        let keys = self.list_all_objects(dir_prefix).await?;
-        let mut out = Vec::new();
-        for k in keys {
-            if let Some(rest) = k.strip_prefix(dir_prefix) {
-                if !rest.is_empty() && !rest.contains('/') {
-                    out.push(k);
+    async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
+        let mut token: Option<String> = None;
+        let mut entries = Vec::new();
+        loop {
+            let mut req = self
+                .s3
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(dir_prefix);
+            if let Some(t) = token.take() {
+                req = req.continuation_token(t);
+            }
+            let out = req.send().await?;
+            for o in out.contents() {
+                let Some(k) = o.key() else { continue };
+                let Some(rest) = k.strip_prefix(dir_prefix) else {
+                    continue;
+                };
+                if rest.is_empty() || rest.contains('/') {
+                    continue;
                 }
+                let last_modified = o
+                    .last_modified()
+                    .and_then(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).ok())
+                    .and_then(|t| t.format(&Rfc3339).ok());
+                entries.push(FileEntry {
+                    key: k.to_string(),
+                    size: o.size().unwrap_or(0).max(0) as u64,
+                    last_modified,
+                });
+            }
+            if out.is_truncated().unwrap_or(false) {
+                token = out.next_continuation_token.map(|s| s.to_string());
+            } else {
+                break;
             }
         }
-        out.sort();
-        Ok(out)
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(entries)
     }
 
     async fn list_dirs(&self, dir_prefix: &str) -> Result<Vec<String>> {

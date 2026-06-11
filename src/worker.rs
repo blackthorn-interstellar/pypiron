@@ -17,7 +17,7 @@ use crate::names::infer_version_from_filename;
 use crate::render::{
     pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
 };
-use crate::sidecar::{is_artifact, sidecar_key, Sidecar, Yanked, SIDECAR_SUFFIX};
+use crate::sidecar::{is_artifact, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, SIDECAR_SUFFIX};
 use crate::storage::FileEntry;
 use crate::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 
@@ -232,6 +232,8 @@ pub async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<FileMetad
             upload_time: Some(sc.upload_time),
             version: Some(sc.version).filter(|v| !v.is_empty()),
             yanked: sc.yanked,
+            requires_python: sc.requires_python,
+            core_metadata: names.contains(format!("{filename}{METADATA_SUFFIX}").as_str()),
         });
     }
     Ok(metadata)

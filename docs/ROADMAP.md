@@ -7,7 +7,7 @@ without its test is not done. Run `make check` and the test suite after each.
 
 ## Current state (as of 2026-06-11)
 
-Milestones 0–6 are done.
+Milestones 0–7 are done.
 
 - M0: blackbox suite — standards conformance (PEP 503/629/691/700 over HTTP),
   end-to-end `uv pip install --exclude-newer`, real-tools matrix (uv publish +
@@ -34,6 +34,10 @@ Milestones 0–6 are done.
   the index first, then artifact, then sidecars; `POST`/`DELETE`
   `/files/<pkg>/<filename>/yank` flips the sidecar's PEP 592 `yanked` state
   (optional body = reason). pip skips yanked unless pinned, verified live.
+- M7: PEP 658/714 — wheel `METADATA` extracted at upload into
+  `<filename>.metadata`, served at `<artifact-url>.metadata` (immutable),
+  advertised via `core-metadata`/`dist-info-metadata` and `requires-python`
+  in both index formats. uv resolves without downloading wheels.
 
 Also working: upload via `/legacy/` (twine/uv), PEP 503 HTML + PEP 691 JSON
 indexes, PEP 629 meta tag, sha256 fragments in HTML, disk + S3 (MinIO)

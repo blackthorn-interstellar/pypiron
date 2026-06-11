@@ -20,6 +20,10 @@ pub struct FileMetadata {
     pub version: Option<String>,
     /// PEP 592 yank state from the sidecar.
     pub yanked: Yanked,
+    /// `Requires-Python` from the upload form, captured in the sidecar.
+    pub requires_python: Option<String>,
+    /// Whether a PEP 658 `<filename>.metadata` companion exists.
+    pub core_metadata: bool,
 }
 
 /// Render minimal PEP 503 per‑package HTML (with PEP 629 version meta).
@@ -32,18 +36,27 @@ pub fn pep503_package_html(package: &str, files: &[FileMetadata]) -> String {
     ));
     for f in files {
         let fname = encode_text(&f.filename);
-        let yanked_attr = match &f.yanked {
-            Yanked::Flag(false) => String::new(),
-            Yanked::Flag(true) => r#" data-yanked="""#.to_string(),
-            Yanked::Reason(reason) => {
-                format!(
-                    r#" data-yanked="{}""#,
-                    encode_double_quoted_attribute(reason)
-                )
-            }
-        };
+        let mut attrs = String::new();
+        if let Some(rp) = &f.requires_python {
+            attrs.push_str(&format!(
+                r#" data-requires-python="{}""#,
+                encode_double_quoted_attribute(rp)
+            ));
+        }
+        if f.core_metadata {
+            // PEP 714 name plus the original PEP 658 name for older clients.
+            attrs.push_str(r#" data-core-metadata="true" data-dist-info-metadata="true""#);
+        }
+        match &f.yanked {
+            Yanked::Flag(false) => {}
+            Yanked::Flag(true) => attrs.push_str(r#" data-yanked="""#),
+            Yanked::Reason(reason) => attrs.push_str(&format!(
+                r#" data-yanked="{}""#,
+                encode_double_quoted_attribute(reason)
+            )),
+        }
         body.push_str(&format!(
-            r##"<a href="/files/{}/{fname}#sha256={}"{yanked_attr}>{fname}</a><br/>"##,
+            r##"<a href="/files/{}/{fname}#sha256={}"{attrs}>{fname}</a><br/>"##,
             encode_text(package),
             f.sha256
         ));
@@ -75,6 +88,12 @@ struct Pep691File {
     #[serde(rename = "upload-time", skip_serializing_if = "Option::is_none")]
     upload_time: Option<String>,
     yanked: Yanked,
+    #[serde(rename = "requires-python", skip_serializing_if = "Option::is_none")]
+    requires_python: Option<String>,
+    #[serde(rename = "core-metadata", skip_serializing_if = "Option::is_none")]
+    core_metadata: Option<bool>,
+    #[serde(rename = "dist-info-metadata", skip_serializing_if = "Option::is_none")]
+    dist_info_metadata: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -117,6 +136,9 @@ pub fn pep691_package_json(package: &str, files: &[FileMetadata]) -> String {
                 size: f.size,
                 upload_time: f.upload_time.clone(),
                 yanked: f.yanked.clone(),
+                requires_python: f.requires_python.clone(),
+                core_metadata: f.core_metadata.then_some(true),
+                dist_info_metadata: f.core_metadata.then_some(true),
             }
         })
         .collect();
@@ -178,6 +200,8 @@ mod tests {
             upload_time: Some("2026-06-11T00:00:00Z".into()),
             version: version.map(str::to_string),
             yanked: Yanked::Flag(false),
+            requires_python: None,
+            core_metadata: false,
         }
     }
 
@@ -204,6 +228,30 @@ mod tests {
         assert!(html.contains("#sha256=abc123"));
         assert!(!html.contains("data-yanked"));
         assert!(html.contains(r#"<meta name="pypi:repository-version" content="1.1">"#));
+    }
+
+    #[test]
+    fn requires_python_and_core_metadata_render() {
+        let mut m = meta(Some("1.16.0"));
+        m.requires_python = Some(">=3.9".into());
+        m.core_metadata = true;
+
+        let html = pep503_package_html("six", &[m.clone()]);
+        assert!(html.contains(r#"data-requires-python="&gt;=3.9""#));
+        assert!(html.contains(r#"data-core-metadata="true""#));
+        assert!(html.contains(r#"data-dist-info-metadata="true""#));
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&pep691_package_json("six", &[m])).unwrap();
+        assert_eq!(doc["files"][0]["requires-python"], ">=3.9");
+        assert_eq!(doc["files"][0]["core-metadata"], true);
+        assert_eq!(doc["files"][0]["dist-info-metadata"], true);
+
+        let plain = meta(None);
+        let doc: serde_json::Value =
+            serde_json::from_str(&pep691_package_json("six", &[plain])).unwrap();
+        assert!(doc["files"][0].get("requires-python").is_none());
+        assert!(doc["files"][0].get("core-metadata").is_none());
     }
 
     #[test]

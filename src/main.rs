@@ -24,10 +24,11 @@ mod render;
 mod sidecar;
 mod storage;
 mod sync;
+mod wheel;
 mod worker;
 
 use names::{infer_package_from_filename, infer_version_from_filename, normalize_pkg_name};
-use sidecar::{sidecar_key, Sidecar, Yanked};
+use sidecar::{metadata_key, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX};
 use storage::{DiskStorage, S3Storage, Storage};
 
 const PACKAGES_PREFIX: &str = "packages/";
@@ -417,7 +418,7 @@ async fn legacy_upload(
         ));
     }
 
-    // Ordering invariant: artifact, then sidecar, then index job.
+    // Ordering invariant: artifact, then sidecars, then index job.
     state
         .storage
         .put_bytes(&key, data.clone(), Some("application/octet-stream"))
@@ -428,6 +429,22 @@ async fn legacy_upload(
                 "Failed to store file".to_string(),
             )
         })?;
+
+    // PEP 658: capture the wheel's METADATA as a static file next to it.
+    if filename.ends_with(".whl") {
+        match wheel::extract_metadata(&data) {
+            Some(md) => {
+                if let Err(e) = state
+                    .storage
+                    .put_bytes(&metadata_key(&key), md, Some("text/plain; charset=utf-8"))
+                    .await
+                {
+                    warn!(error=?e, %filename, "failed to store PEP 658 metadata");
+                }
+            }
+            None => warn!(%filename, "wheel has no extractable METADATA"),
+        }
+    }
 
     let sc = Sidecar {
         sha256,
@@ -602,13 +619,19 @@ async fn serve_index(
 }
 
 /// --- Artifact download endpoint ------------------------------------------
+/// Serves artifacts and their PEP 658 `<filename>.metadata` companions; both
+/// are immutable. Sidecar JSON and dotfiles are not served.
 async fn files_get(
     State(state): State<Arc<AppState>>,
     Path((package, filename)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response<Body> {
     let pkg = normalize_pkg_name(&package);
-    if !sidecar::is_artifact(&filename) {
+    let servable = match filename.strip_suffix(METADATA_SUFFIX) {
+        Some(base) => sidecar::is_artifact(base),
+        None => sidecar::is_artifact(&filename),
+    };
+    if !servable {
         return not_found("not an artifact");
     }
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");

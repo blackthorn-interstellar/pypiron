@@ -14,8 +14,8 @@ The bar for "supported" is blackbox-verified behavior against real clients
 | [PEP 700](https://peps.python.org/pep-0700/) | `versions`, `size`, `upload-time` in JSON (api-version 1.1) | Supported |
 | Legacy upload API | `POST /legacy/` multipart, as spoken by twine / `uv publish` | Supported (minimal) |
 | [PEP 592](https://peps.python.org/pep-0592/) | Yanked releases (`yanked` key / `data-yanked` attr) | Supported |
-| [PEP 658](https://peps.python.org/pep-0658/) / [714](https://peps.python.org/pep-0714/) | Serve wheel `METADATA` as `<filename>.metadata` + `core-metadata` attrs | Planned |
-| `requires-python` | `data-requires-python` attr / `requires-python` key | Planned (needs write-time metadata capture) |
+| [PEP 658](https://peps.python.org/pep-0658/) / [714](https://peps.python.org/pep-0714/) | Serve wheel `METADATA` as `<filename>.metadata` + `core-metadata` attrs | Supported |
+| `requires-python` | `data-requires-python` attr / `requires-python` key | Supported |
 | Filename immutability | Reject re-upload of an existing filename (pypi.org rule) | Supported |
 | HTTP caching | ETag on indexes, `immutable` on artifacts, Range requests | Supported |
 | Package deletion | Delete event → index rebuild | Supported |

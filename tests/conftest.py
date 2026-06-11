@@ -161,6 +161,12 @@ def disk_server_sync_uploads(tmp_path_factory, pypiron_bin: Path) -> Iterator[Di
     yield from _start_disk_server(tmp_path_factory, pypiron_bin, extra_args=["--sync-uploads"])
 
 
+@pytest.fixture()
+def disk_server_mirror(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server accepting mirror uploads (what sync --to targets)."""
+    yield from _start_disk_server(tmp_path_factory, pypiron_bin, extra_args=["--mirror-uploads"])
+
+
 # ------------------------------ MinIO (S3) fixtures ---------------------------
 
 

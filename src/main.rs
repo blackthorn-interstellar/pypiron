@@ -77,6 +77,13 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
     private_prefix: Option<String>,
 
+    /// Accept mirror uploads: authenticated `/legacy/` requests carrying
+    /// `mirror=true` may claim mirror origin and provide historical
+    /// `upload_time`/yank state (what `sync --to` sends). Off by default —
+    /// a stock server never accepts a client timestamp.
+    #[arg(long, env = "PYPIRON_MIRROR_UPLOADS")]
+    mirror_uploads: bool,
+
     /// Redirect artifact downloads to presigned S3 URLs (302) so this node
     /// never touches wheel bytes (S3 backend only)
     #[arg(long, env = "PYPIRON_S3_PRESIGNED_REDIRECTS")]
@@ -115,6 +122,7 @@ struct AppState {
     upload_user: Option<String>,
     upload_pass: Option<String>,
     private_prefix: Option<String>,
+    mirror_uploads: bool,
     presigned_redirects: bool,
     // worker cfg
     worker_interval: Duration,
@@ -157,6 +165,7 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         upload_user: cli.basic_auth_user,
         upload_pass: cli.basic_auth_pass,
         private_prefix: cli.private_prefix.as_deref().map(normalize_pkg_name),
+        mirror_uploads: cli.mirror_uploads,
         presigned_redirects: cli.s3_presigned_redirects,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
@@ -384,9 +393,59 @@ async fn legacy_upload(
 
     let key = format!("{PACKAGES_PREFIX}{pkg_norm}/{filename}");
 
-    // Origin exclusivity: a mirror-owned name never accepts private uploads,
-    // and new names must clear the optional private-namespace policy.
-    // Storage errors are outages (503), never "unclaimed".
+    // Mirror mode: `sync --to` sends mirror=true plus PyPI's historical
+    // metadata. Backdating is operator-gated — a request carrying mirror
+    // fields against a stock server is rejected outright, never reinterpreted
+    // as a normal upload.
+    let is_mirror = fields.get("mirror").map(String::as_str) == Some("true");
+    if is_mirror && !state.mirror_uploads {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Mirror uploads are not enabled on this server (--mirror-uploads)".into(),
+        ));
+    }
+    if !is_mirror
+        && (fields.contains_key("upload_time")
+            || fields.contains_key("yanked")
+            || fields.contains_key("yanked_reason"))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "upload_time/yanked fields require mirror=true on a mirror-enabled server".into(),
+        ));
+    }
+    let upload_time = match fields.get("upload_time") {
+        Some(ts) => {
+            if OffsetDateTime::parse(ts, &Rfc3339).is_err() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("upload_time is not RFC 3339: {ts}"),
+                ));
+            }
+            ts.clone()
+        }
+        None => now_rfc3339(),
+    };
+    let yanked = if is_mirror {
+        match (fields.get("yanked_reason"), fields.get("yanked")) {
+            (Some(reason), _) if !reason.trim().is_empty() => {
+                Yanked::Reason(reason.trim().to_string())
+            }
+            (_, Some(flag)) => Yanked::Flag(flag == "true"),
+            _ => Yanked::Flag(false),
+        }
+    } else {
+        Yanked::Flag(false)
+    };
+
+    // Origin exclusivity: each package belongs to exactly one world. A
+    // mismatch is a hard error, never a merge — the dependency-confusion
+    // defense. Storage errors are outages (503), never "unclaimed".
+    let desired_origin = if is_mirror {
+        origin::MIRROR
+    } else {
+        origin::PRIVATE
+    };
     let claimed_origin = origin::read_origin(state.storage.as_ref(), &pkg_norm)
         .await
         .map_err(|e| {
@@ -396,16 +455,25 @@ async fn legacy_upload(
             )
         })?;
     match claimed_origin.as_deref() {
-        Some(origin::MIRROR) => {
+        Some(owner) if owner == desired_origin => {}
+        Some(owner) => {
             return Err((
                 StatusCode::FORBIDDEN,
-                format!("Package '{pkg_norm}' is mirror-owned; private uploads are rejected"),
+                format!(
+                    "Package '{pkg_norm}' is {owner}-owned; {desired_origin} uploads are rejected"
+                ),
             ));
         }
-        Some(_) => {}
         None => {
             if let Some(prefix) = &state.private_prefix {
-                if !names::matches_prefix(&pkg_norm, prefix) {
+                let inside = names::matches_prefix(&pkg_norm, prefix);
+                if is_mirror && inside {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        format!("'{pkg_norm}' is inside the private namespace '{prefix}'; mirrors may not touch it"),
+                    ));
+                }
+                if !is_mirror && !inside {
                     return Err((
                         StatusCode::FORBIDDEN,
                         format!(
@@ -414,9 +482,9 @@ async fn legacy_upload(
                     ));
                 }
             }
-            // First write claims the package as private — atomically, so a
-            // racing first sync can't merge origins.
-            let winner = origin::claim_origin(state.storage.as_ref(), &pkg_norm, origin::PRIVATE)
+            // First write claims the package — atomically, so racing private
+            // and mirror first-writes can't merge origins.
+            let winner = origin::claim_origin(state.storage.as_ref(), &pkg_norm, desired_origin)
                 .await
                 .map_err(|e| {
                     (
@@ -424,10 +492,10 @@ async fn legacy_upload(
                         format!("Failed to claim origin: {e}"),
                     )
                 })?;
-            if winner != origin::PRIVATE {
+            if winner != desired_origin {
                 return Err((
                     StatusCode::FORBIDDEN,
-                    format!("Package '{pkg_norm}' is {winner}-owned; private uploads are rejected"),
+                    format!("Package '{pkg_norm}' is {winner}-owned; {desired_origin} uploads are rejected"),
                 ));
             }
         }
@@ -477,9 +545,9 @@ async fn legacy_upload(
         sha256,
         size,
         version,
-        upload_time: now_rfc3339(),
+        upload_time,
         requires_python: fields.get("requires_python").cloned(),
-        yanked: Yanked::Flag(false),
+        yanked,
     };
     let sc_bytes = serde_json::to_vec(&sc).map_err(|_| {
         (

@@ -99,10 +99,13 @@ migration, or a backup restore silently rewrites history for every package.
 Sidecars make the timestamp part of the truth tree — durable and copyable. It also
 makes mirrored timestamps possible (below).
 
-The HTTP upload API never accepts a timestamp from the client, only receipt time.
+Ordinary uploads never get to claim a timestamp — only receipt time.
 `--exclude-newer` is a supply-chain control; letting any uploader backdate a
-package would let them sneak under a cutoff. Backdating requires storage
-credentials, full stop.
+package would let them sneak under a cutoff. Backdating requires one of exactly
+two things: storage credentials, or upload credentials to a server whose
+operator has explicitly enabled mirror uploads (`--mirror-uploads`, below).
+Both are operator-controlled boundaries; neither is reachable from a default
+deployment.
 
 ## Mirroring: carry forward true timestamps
 
@@ -111,17 +114,26 @@ otherwise every mirrored file looks brand-new and `--exclude-newer` is useless.
 PyPI publishes the true timestamp per file (`upload-time` in its PEP 700 JSON), so
 the data is free; the design question is where it enters the system.
 
-Answer: `sync` writes directly to storage, not through `/legacy/`. It is a
-subcommand of the same binary, so it uses the same storage code — no layout
-coupling, no second implementation. For each mirrored file it writes the artifact,
-a sidecar carrying PyPI's `upload-time` and PyPI's sha256 digest (no re-hashing),
-and a dirty marker. The trust story falls out naturally: the upload API stays
-receipt-time-only for everyone, and the ability to write historical timestamps is
-gated on storage credentials — the right boundary.
+The recommended path is **mirror-over-HTTP**: `sync --to <server>` POSTs each
+file to `/legacy/` with `mirror=true` plus PyPI's `upload_time` and yank state
+as form fields. The server — and only the server — writes storage: it claims
+the package `mirror`-origin, persists the provided timestamp in the sidecar,
+and extracts PEP 658 metadata from the wheel like any other upload. This keeps
+deployment simple (sync needs a URL and the upload credential, nothing else),
+keeps the storage layout a server-internal concern (no version coupling
+between a fleet of sync clients and the server), and keeps one writer.
 
-The HTTP mode of `sync` (POST to a remote PypIron's `/legacy/`) remains for
-pushing to a server whose storage you can't reach, with the accepted limitation
-that timestamps become mirror time.
+Mirror uploads are an explicit server opt-in: `--mirror-uploads` off (the
+default) means any request carrying mirror fields is rejected outright, so a
+stock server still never accepts a client timestamp. With it on, the same
+basic-auth credential that can upload can also mirror — on a private registry
+the uploader set is the trusted set, and the flag is the operator saying "my
+uploaders may import history".
+
+`sync` can also write **directly to storage** (no `--to`): same binary, same
+storage code — artifact, sidecar carrying PyPI's digest and timestamp, dirty
+marker. This needs no server cooperation at all and suits bucket-credential
+environments (a cron job next to the bucket, an airgapped import).
 
 ## Private + mirrored packages: dependency confusion
 

@@ -32,3 +32,5 @@ async-trait = "0.1"
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "gzip", "brotli", "zstd", "stream"] }
+pep440_rs = "0.7.3"
+toml = "1.1.2"

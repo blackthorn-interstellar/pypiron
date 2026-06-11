@@ -225,7 +225,7 @@ async fn sync_one_package(client: &Client, args: &SyncArgs, sink: &Sink, pkg: &s
                 Sink::Storage(storage) => {
                     mirror_to_storage(client, storage.as_ref(), pkg, &s).await
                 }
-                Sink::Http(endpoint) => upload_via_http(client, args, endpoint, &s).await,
+                Sink::Http(endpoint) => upload_via_http(client, args, endpoint, pkg, &s).await,
             }
         })
         .buffer_unordered(args.concurrency.max(1))
@@ -411,13 +411,15 @@ async fn download_verified(client: &Client, file: &PyPiFile) -> Result<Vec<u8>> 
     Ok(bytes)
 }
 
-/// HTTP mode: push through a remote `/legacy/` with full metadata fields.
-/// Returns true on success (the remote may 409 on existing files — treated
-/// as already-present, false).
+/// HTTP mode: push through the remote `/legacy/` as a mirror upload, carrying
+/// PyPI's metadata verbatim — the server (which must run with
+/// `--mirror-uploads`) owns the storage writes. Returns true on success; the
+/// remote's 409 on an existing file means already-present (false).
 async fn upload_via_http(
     client: &Client,
     args: &SyncArgs,
     endpoint: &str,
+    pkg: &str,
     s: &Selected,
 ) -> Result<bool> {
     let bytes = download_verified(client, &s.file).await?;
@@ -430,13 +432,20 @@ async fn upload_via_http(
     let mut form = multipart::Form::new()
         .text(":action", "file_upload")
         .text("protocol_version", "1")
-        .text(
-            "name",
-            s.file.filename.split('-').next().unwrap_or("").to_string(),
-        )
+        .text("mirror", "true")
+        .text("name", pkg.to_string())
         .text("version", s.version.clone())
         .text("sha256_digest", s.file.digests.sha256.clone())
+        .text("yanked", if s.file.yanked { "true" } else { "false" })
         .part("content", part);
+    if let Some(ts) = &s.file.upload_time_iso_8601 {
+        form = form.text("upload_time", ts.clone());
+    }
+    if let Some(reason) = &s.file.yanked_reason {
+        if !reason.trim().is_empty() {
+            form = form.text("yanked_reason", reason.trim().to_string());
+        }
+    }
     if let Some(rp) = &s.file.requires_python {
         form = form.text("requires_python", rp.clone());
     }

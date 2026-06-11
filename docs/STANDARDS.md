@@ -12,7 +12,7 @@ The bar for "supported" is blackbox-verified behavior against real clients
 | [PEP 629](https://peps.python.org/pep-0629/) | `pypi:repository-version` meta tag in HTML | Supported |
 | [PEP 691](https://peps.python.org/pep-0691/) | JSON simple API with content negotiation | Supported |
 | [PEP 700](https://peps.python.org/pep-0700/) | `versions`, `size`, `upload-time` in JSON (api-version 1.1) | Supported |
-| Legacy upload API | `POST /legacy/` multipart, as spoken by twine / `uv publish` | Supported (minimal) |
+| Legacy upload API | `POST /legacy/` multipart, as spoken by twine / `uv publish` | Supported |
 | [PEP 592](https://peps.python.org/pep-0592/) | Yanked releases (`yanked` key / `data-yanked` attr) | Supported |
 | [PEP 658](https://peps.python.org/pep-0658/) / [714](https://peps.python.org/pep-0714/) | Serve wheel `METADATA` as `<filename>.metadata` + `core-metadata` attrs | Supported |
 | `requires-python` | `data-requires-python` attr / `requires-python` key | Supported |

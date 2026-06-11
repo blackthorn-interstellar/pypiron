@@ -155,6 +155,12 @@ def disk_server_prefixed(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     )
 
 
+@pytest.fixture()
+def disk_server_sync_uploads(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server where uploads wait for index visibility before returning."""
+    yield from _start_disk_server(tmp_path_factory, pypiron_bin, extra_args=["--sync-uploads"])
+
+
 # ------------------------------ MinIO (S3) fixtures ---------------------------
 
 

@@ -7,7 +7,7 @@ without its test is not done. Run `make check` and the test suite after each.
 
 ## Current state (as of 2026-06-11)
 
-Milestones 0–11 are done.
+All milestones (0–12) are done.
 
 - M0: blackbox suite — standards conformance (PEP 503/629/691/700 over HTTP),
   end-to-end `uv pip install --exclude-newer`, real-tools matrix (uv publish +
@@ -60,6 +60,9 @@ Milestones 0–11 are done.
   Worker and reconciler run on the leader only; a fresh leader reconciles
   immediately. Disk skips leasing — single-node, always leader. Failover
   verified live against two nodes on one MinIO bucket.
+- M12: synchronous uploads — with `--sync-uploads`, the handler polls its own
+  index (bounded by `--sync-upload-timeout-secs`, default 10) before
+  returning 200, so publish-then-install CI never sees a missing version.
 
 Also working: upload via `/legacy/` (twine/uv), PEP 503 HTML + PEP 691 JSON
 indexes, PEP 629 meta tag, sha256 fragments in HTML, disk + S3 (MinIO)

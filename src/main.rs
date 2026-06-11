@@ -92,17 +92,14 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_LEASE_TTL_SECS", default_value = "30")]
     lease_ttl_secs: u64,
 
-    /// Upload confirmation timeout in seconds
-    #[arg(
-        long,
-        env = "PYPIRON_UPLOAD_CONFIRM_TIMEOUT_SECS",
-        default_value = "300"
-    )]
-    upload_confirm_timeout_secs: u64,
+    /// Wait for the uploaded file to appear in the index before returning
+    /// 200 (publish-then-install CI pipelines)
+    #[arg(long, env = "PYPIRON_SYNC_UPLOADS")]
+    sync_uploads: bool,
 
-    /// Public base URL for generating absolute URLs (optional)
-    #[arg(long, env = "PYPIRON_PUBLIC_BASE_URL")]
-    public_base_url: Option<String>,
+    /// Bound on the synchronous-upload wait, in seconds
+    #[arg(long, env = "PYPIRON_SYNC_UPLOAD_TIMEOUT_SECS", default_value = "10")]
+    sync_upload_timeout_secs: u64,
 
     /// Address to bind the server to
     #[arg(long, env = "PYPIRON_BIND_ADDR", default_value = "0.0.0.0:8080")]
@@ -121,11 +118,8 @@ struct AppState {
     worker_interval: Duration,
     reconcile_interval: Duration,
     lease_ttl: Duration,
-    #[allow(dead_code)]
-    upload_confirm_timeout: Duration,
-    // behavior
-    #[allow(dead_code)]
-    public_base_url: Option<String>,
+    sync_uploads: bool,
+    sync_upload_timeout: Duration,
 }
 
 #[tokio::main]
@@ -165,8 +159,8 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
         lease_ttl: Duration::from_secs(cli.lease_ttl_secs),
-        upload_confirm_timeout: Duration::from_secs(cli.upload_confirm_timeout_secs),
-        public_base_url: cli.public_base_url,
+        sync_uploads: cli.sync_uploads,
+        sync_upload_timeout: Duration::from_secs(cli.sync_upload_timeout_secs),
     });
 
     // Initialize empty index files if they don't exist
@@ -473,8 +467,42 @@ async fn legacy_upload(
         warn!(error=?e, "legacy: failed to write dirty marker");
     }
 
+    // Read-your-writes by waiting: poll our own index until the file shows
+    // up, so publish-then-install pipelines never see a missing version.
+    if state.sync_uploads {
+        wait_for_index_visibility(&state, &pkg_norm, &filename).await;
+    }
+
     // Return a simple OK text body compatible with legacy clients.
     Ok((StatusCode::OK, "OK"))
+}
+
+/// Bounded wait for a freshly uploaded file to appear in the package index.
+/// A timeout still returns success upstream — the artifact is durable and the
+/// index will catch up; failing the upload would only provoke a client retry
+/// into the 409 from immutability.
+async fn wait_for_index_visibility(state: &AppState, pkg: &str, filename: &str) {
+    let key = format!("{SIMPLE_PREFIX}{pkg}/index.json");
+    let deadline = std::time::Instant::now() + state.sync_upload_timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(bytes) = state.storage.get_bytes(&key).await {
+            #[derive(serde::Deserialize)]
+            struct Index {
+                files: Vec<File>,
+            }
+            #[derive(serde::Deserialize)]
+            struct File {
+                filename: String,
+            }
+            if let Ok(idx) = serde_json::from_slice::<Index>(&bytes) {
+                if idx.files.iter().any(|f| f.filename == filename) {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    warn!(%pkg, %filename, "sync upload: index visibility wait timed out");
 }
 
 /// Current time as RFC 3339 at whole-second precision.

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use axum::body::Body;
 use clap::{Args as ClapArgs, ValueEnum};
@@ -91,6 +91,17 @@ impl StorageArgs {
     }
 }
 
+/// Sentinel error for "object does not exist" — callers translate this to
+/// 404; every other storage error is an outage and must surface as one.
+#[derive(Debug, thiserror::Error)]
+#[error("not found: {0}")]
+pub struct NotFound(pub String);
+
+/// True if `err` is (or wraps) a missing-object error.
+pub fn is_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NotFound>().is_some()
+}
+
 /// A file from a directory listing, with the metadata index rendering needs.
 pub struct FileEntry {
     pub key: String,
@@ -164,6 +175,17 @@ pub trait Storage: Send + Sync {
 
     /// Write bytes to `key`. `content_type` is best-effort (ignored on Disk).
     async fn put_bytes(&self, key: &str, bytes: Vec<u8>, content_type: Option<&str>) -> Result<()>;
+
+    /// Atomically create `key` only if it does not exist. Returns false when
+    /// the object was already there (or we lost the race). This is what
+    /// enforces filename immutability and origin exclusivity — a HEAD check
+    /// alone is a TOCTOU hole.
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<bool>;
 
     /// Read full object bytes (indexes, sidecars — small files only).
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>>;
@@ -239,6 +261,16 @@ impl DiskStorage {
         }
         Ok(())
     }
+
+    /// A unique temp path next to `path` (same filesystem, so rename/link is atomic).
+    fn tmp_sibling(&self, path: &Path) -> Result<PathBuf> {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow!("bad path"))?;
+        let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        Ok(path.with_file_name(format!(".tmp-{nanos}-{}-{name}", std::process::id())))
+    }
 }
 
 #[async_trait]
@@ -258,11 +290,15 @@ impl Storage for DiskStorage {
 
     async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>> {
         let path = self.resolve(key)?;
-        let md = fs::metadata(&path)
-            .await
-            .with_context(|| format!("stat {key}"))?;
+        let md = match fs::metadata(&path).await {
+            Ok(md) => md,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(NotFound(key.to_string()).into());
+            }
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("stat {key}"))),
+        };
         if !md.is_file() {
-            return Err(anyhow!("not a file: {key}"));
+            return Err(NotFound(key.to_string()).into());
         }
         let size = md.len();
 
@@ -302,38 +338,76 @@ impl Storage for DiskStorage {
         bytes: Vec<u8>,
         _content_type: Option<&str>,
     ) -> Result<()> {
+        // Write-to-tmp + rename: a crash or full disk never leaves a torn
+        // file at the final key. S3 PUTs are already atomic.
         let p = self.resolve(key)?;
         self.ensure_parent(&p).await?;
-        fs::write(p, bytes).await?;
+        let tmp = self.tmp_sibling(&p)?;
+        fs::write(&tmp, bytes).await?;
+        if let Err(e) = fs::rename(&tmp, &p).await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
         Ok(())
+    }
+
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        _content_type: Option<&str>,
+    ) -> Result<bool> {
+        // hard_link fails with EEXIST if the destination exists — an atomic
+        // create-if-absent with full content, unlike create_new + write.
+        let p = self.resolve(key)?;
+        self.ensure_parent(&p).await?;
+        let tmp = self.tmp_sibling(&p)?;
+        fs::write(&tmp, bytes).await?;
+        let created = match fs::hard_link(&tmp, &p).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(anyhow::Error::from(e)),
+        };
+        let _ = fs::remove_file(&tmp).await;
+        created
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
         let p = self.resolve(key)?;
-        Ok(fs::read(&p)
-            .await
-            .with_context(|| format!("read {}", key))?)
+        match fs::read(&p).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(NotFound(key.to_string()).into())
+            }
+            Err(e) => Err(anyhow::Error::from(e).context(format!("read {key}"))),
+        }
     }
 
     async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
+        // A missing directory is an empty listing; any other error must
+        // propagate — a silent empty here would make the reconciler delete
+        // live indexes off a phantom "no packages" observation.
         let dir = self.resolve(dir_prefix)?;
+        let mut rd = match fs::read_dir(dir).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("list {dir_prefix}"))),
+        };
         let mut files = Vec::new();
-        if let Ok(mut rd) = fs::read_dir(dir).await {
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let md = entry.metadata().await?;
-                if md.is_file() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        let last_modified = md
-                            .modified()
-                            .ok()
-                            .map(OffsetDateTime::from)
-                            .and_then(|t| t.format(&Rfc3339).ok());
-                        files.push(FileEntry {
-                            key: format!("{}{}", dir_prefix, name),
-                            size: md.len(),
-                            last_modified,
-                        });
-                    }
+        while let Some(entry) = rd.next_entry().await? {
+            let md = entry.metadata().await?;
+            if md.is_file() {
+                if let Some(name) = entry.file_name().to_str() {
+                    let last_modified = md
+                        .modified()
+                        .ok()
+                        .map(OffsetDateTime::from)
+                        .and_then(|t| t.format(&Rfc3339).ok());
+                    files.push(FileEntry {
+                        key: format!("{}{}", dir_prefix, name),
+                        size: md.len(),
+                        last_modified,
+                    });
                 }
             }
         }
@@ -343,14 +417,17 @@ impl Storage for DiskStorage {
 
     async fn list_dirs(&self, dir_prefix: &str) -> Result<Vec<String>> {
         let dir = self.resolve(dir_prefix)?;
+        let mut rd = match fs::read_dir(dir).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("list {dir_prefix}"))),
+        };
         let mut dirs = Vec::new();
-        if let Ok(mut rd) = fs::read_dir(dir).await {
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let md = entry.metadata().await?;
-                if md.is_dir() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        dirs.push(name.to_string());
-                    }
+        while let Some(entry) = rd.next_entry().await? {
+            let md = entry.metadata().await?;
+            if md.is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    dirs.push(name.to_string());
                 }
             }
         }
@@ -383,14 +460,19 @@ impl S3Storage {
 #[async_trait]
 impl Storage for S3Storage {
     async fn head_exists(&self, key: &str) -> Result<bool> {
-        Ok(self
+        match self
             .s3
             .head_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
             .await
-            .is_ok())
+        {
+            Ok(_) => Ok(true),
+            // HEAD has no body, so missing objects surface as generic 404s.
+            Err(e) if is_s3_not_found(&e) => Ok(false),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("head {key}"))),
+        }
     }
 
     async fn presign_get(&self, key: &str, expires: std::time::Duration) -> Result<Option<String>> {
@@ -418,6 +500,9 @@ impl Storage for S3Storage {
                     return Ok(Response::builder()
                         .status(StatusCode::RANGE_NOT_SATISFIABLE)
                         .body(Body::empty())?);
+                }
+                if is_s3_not_found(&e) {
+                    return Err(NotFound(key.to_string()).into());
                 }
                 return Err(e.into());
             }
@@ -462,14 +547,42 @@ impl Storage for S3Storage {
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
-        let out = self
+        let out = match self
             .s3
             .get_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
-            .await?;
+            .await
+        {
+            Ok(out) => out,
+            Err(e) if is_s3_not_found(&e) => return Err(NotFound(key.to_string()).into()),
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("get {key}"))),
+        };
         Ok(out.body.collect().await?.to_vec())
+    }
+
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<bool> {
+        let mut req = self
+            .s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .if_none_match("*")
+            .body(ByteStream::from(bytes));
+        if let Some(ct) = content_type {
+            req = req.content_type(ct);
+        }
+        match req.send().await {
+            Ok(_) => Ok(true),
+            Err(e) if lost_conditional_write(&e) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
@@ -602,6 +715,12 @@ impl Storage for S3Storage {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Missing object: the SDK models GET misses as `NoSuchKey` and HEAD misses
+/// as `NotFound`.
+fn is_s3_not_found<E: ProvideErrorMetadata>(e: &E) -> bool {
+    matches!(e.code(), Some("NoSuchKey") | Some("NotFound"))
 }
 
 /// A failed precondition or a concurrent conditional write: we lost, cleanly.

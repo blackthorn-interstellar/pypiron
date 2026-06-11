@@ -27,7 +27,9 @@ mod sync;
 mod wheel;
 mod worker;
 
-use names::{infer_package_from_filename, infer_version_from_filename, normalize_pkg_name};
+use names::{
+    infer_package_from_filename, infer_version_from_filename, is_normalized, normalize_pkg_name,
+};
 use sidecar::{metadata_key, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX};
 use storage::{Storage, StorageArgs};
 
@@ -162,6 +164,12 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         sync_uploads: cli.sync_uploads,
         sync_upload_timeout: Duration::from_secs(cli.sync_upload_timeout_secs),
     });
+
+    if state.upload_user.is_none() || state.upload_pass.is_none() {
+        warn!(
+            "no --basic-auth-user/--basic-auth-pass configured: uploads, deletes, and yanks are UNAUTHENTICATED"
+        );
+    }
 
     // Initialize empty index files if they don't exist
     initialize_indexes(&state).await?;
@@ -332,19 +340,33 @@ async fn legacy_upload(
         Some(name) => normalize_pkg_name(name),
         None => infer_package_from_filename(&filename),
     };
-    if pkg_norm.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Could not determine package name".into(),
-        ));
+    // Normalized names are storage path segments; anything else is hostile.
+    if !is_normalized(&pkg_norm) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid package name".into()));
     }
 
-    // Verify the client-supplied digest, and capture the hash for the sidecar.
-    let sha256 = {
+    // Hashing and zip extraction are CPU-bound: off the async runtime.
+    let is_wheel = filename.ends_with(".whl");
+    let (data, sha256, wheel_metadata) = tokio::task::spawn_blocking(move || {
         let mut hasher = Sha256::new();
         hasher.update(&data);
-        format!("{:x}", hasher.finalize())
-    };
+        let sha = format!("{:x}", hasher.finalize());
+        let md = if is_wheel {
+            wheel::extract_metadata(&data)
+        } else {
+            None
+        };
+        (data, sha, md)
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Hashing task failed".to_string(),
+        )
+    })?;
+
+    // Verify the client-supplied digest, and capture the hash for the sidecar.
     if let Some(claimed) = fields.get("sha256_digest") {
         if !claimed.eq_ignore_ascii_case(&sha256) {
             return Err((
@@ -364,7 +386,15 @@ async fn legacy_upload(
 
     // Origin exclusivity: a mirror-owned name never accepts private uploads,
     // and new names must clear the optional private-namespace policy.
-    let claimed_origin = origin::read_origin(state.storage.as_ref(), &pkg_norm).await;
+    // Storage errors are outages (503), never "unclaimed".
+    let claimed_origin = origin::read_origin(state.storage.as_ref(), &pkg_norm)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("storage error reading origin: {e}"),
+            )
+        })?;
     match claimed_origin.as_deref() {
         Some(origin::MIRROR) => {
             return Err((
@@ -384,45 +414,52 @@ async fn legacy_upload(
                     ));
                 }
             }
-        }
-    }
-
-    // Filenames are immutable once written (pypi.org rule): supply-chain
-    // safety and perfect cacheability in one check.
-    if state.storage.head_exists(&key).await.unwrap_or(false) {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("File already exists: {filename}"),
-        ));
-    }
-
-    // First write claims the package as private.
-    if claimed_origin.is_none() {
-        if let Err(e) =
-            origin::claim_origin(state.storage.as_ref(), &pkg_norm, origin::PRIVATE).await
-        {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to claim origin: {e}"),
-            ));
+            // First write claims the package as private — atomically, so a
+            // racing first sync can't merge origins.
+            let winner = origin::claim_origin(state.storage.as_ref(), &pkg_norm, origin::PRIVATE)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to claim origin: {e}"),
+                    )
+                })?;
+            if winner != origin::PRIVATE {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("Package '{pkg_norm}' is {winner}-owned; private uploads are rejected"),
+                ));
+            }
         }
     }
 
     // Ordering invariant: artifact, then sidecars, then index job.
-    state
+    // The conditional create IS the immutability rule (pypi.org's): a plain
+    // HEAD-then-PUT is a TOCTOU hole that lets concurrent uploads swap bytes.
+    let size = data.len() as u64;
+    match state
         .storage
-        .put_bytes(&key, data.clone(), Some("application/octet-stream"))
+        .put_if_absent(&key, data, Some("application/octet-stream"))
         .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to store file".to_string(),
-            )
-        })?;
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("File already exists: {filename}"),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Failed to store file: {e}"),
+            ));
+        }
+    }
 
     // PEP 658: capture the wheel's METADATA as a static file next to it.
-    if filename.ends_with(".whl") {
-        match wheel::extract_metadata(&data) {
+    if is_wheel {
+        match wheel_metadata {
             Some(md) => {
                 if let Err(e) = state
                     .storage
@@ -438,7 +475,7 @@ async fn legacy_upload(
 
     let sc = Sidecar {
         sha256,
-        size: data.len() as u64,
+        size,
         version,
         upload_time: now_rfc3339(),
         requires_python: fields.get("requires_python").cloned(),
@@ -566,6 +603,9 @@ async fn simple_pkg(
     headers: HeaderMap,
 ) -> Response<Body> {
     let pkg = normalize_pkg_name(&pkg);
+    if !is_normalized(&pkg) {
+        return not_found("invalid package name");
+    }
     if accepts_json(&headers) {
         serve_index(
             &state,
@@ -591,6 +631,9 @@ async fn simple_pkg_json(
     headers: HeaderMap,
 ) -> Response<Body> {
     let pkg = normalize_pkg_name(&pkg);
+    if !is_normalized(&pkg) {
+        return not_found("invalid package name");
+    }
     serve_index(
         &state,
         format!("{SIMPLE_PREFIX}{pkg}/index.json"),
@@ -610,7 +653,7 @@ async fn serve_index(
 ) -> Response<Body> {
     let bytes = match state.storage.get_bytes(&key).await {
         Ok(o) => o,
-        Err(e) => return not_found(e),
+        Err(e) => return read_error(e),
     };
 
     let mut hasher = Sha256::new();
@@ -652,7 +695,7 @@ async fn files_get(
         Some(base) => sidecar::is_artifact(base),
         None => sidecar::is_artifact(&filename),
     };
-    if !servable {
+    if !is_normalized(&pkg) || !servable || filename.contains('/') || filename.contains('\\') {
         return not_found("not an artifact");
     }
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
@@ -662,25 +705,26 @@ async fn files_get(
     // resolution-critical, so they keep streaming. The redirect itself must
     // not be cached — the signature expires.
     if state.presigned_redirects && !filename.ends_with(METADATA_SUFFIX) {
-        if state.storage.head_exists(&key).await.unwrap_or(false) {
-            match state
-                .storage
-                .presign_get(&key, Duration::from_secs(3600))
-                .await
-            {
-                Ok(Some(url)) => {
-                    return Response::builder()
-                        .status(StatusCode::FOUND)
-                        .header(header::LOCATION, url)
-                        .header(header::CACHE_CONTROL, "no-cache")
-                        .body(Body::empty())
-                        .unwrap_or_else(not_found);
-                }
-                Ok(None) => {} // disk backend: fall through to streaming
-                Err(e) => warn!(error=?e, %key, "presign failed; falling back to streaming"),
+        match state.storage.head_exists(&key).await {
+            Ok(true) => {}
+            Ok(false) => return not_found("no such artifact"),
+            Err(e) => return read_error(e),
+        }
+        match state
+            .storage
+            .presign_get(&key, Duration::from_secs(3600))
+            .await
+        {
+            Ok(Some(url)) => {
+                return Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header(header::LOCATION, url)
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .body(Body::empty())
+                    .unwrap_or_else(not_found);
             }
-        } else {
-            return not_found("no such artifact");
+            Ok(None) => {} // disk backend: fall through to streaming
+            Err(e) => warn!(error=?e, %key, "presign failed; falling back to streaming"),
         }
     }
 
@@ -693,7 +737,7 @@ async fn files_get(
             );
             resp
         }
-        Err(e) => not_found(e),
+        Err(e) => read_error(e),
     }
 }
 
@@ -701,6 +745,19 @@ fn not_found<E: std::fmt::Debug>(err: E) -> Response<Body> {
     warn!(error=?err, "read miss");
     let mut resp = Response::new(Body::empty());
     *resp.status_mut() = StatusCode::NOT_FOUND;
+    resp
+}
+
+/// 404 only when storage says the object does not exist; everything else is
+/// an outage and must surface as 503 — telling pip "no such package" during
+/// an S3 blip is the dependency-confusion direction.
+fn read_error(err: anyhow::Error) -> Response<Body> {
+    if storage::is_not_found(&err) {
+        return not_found(err);
+    }
+    tracing::error!(error=?err, "storage error on read path");
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
     resp
 }
 
@@ -716,9 +773,21 @@ async fn files_delete(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_auth(&state, &headers)?;
     let pkg = normalize_pkg_name(&package);
-    let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
-    if !state.storage.head_exists(&key).await.unwrap_or(false) {
+    // Artifacts only: .origin, sidecars, and metadata companions are managed
+    // by the server, not deletable handles.
+    if !is_normalized(&pkg) || !sidecar::is_artifact(&filename) || filename.contains('/') {
         return Err((StatusCode::NOT_FOUND, "No such file".into()));
+    }
+    let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+    match state.storage.head_exists(&key).await {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::NOT_FOUND, "No such file".into())),
+        Err(e) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("storage error: {e}"),
+            ));
+        }
     }
 
     let still_has_artifacts = worker::rebuild_package_excluding(&state, &pkg, Some(&filename))
@@ -789,6 +858,9 @@ async fn set_yanked(
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_auth(state, headers)?;
     let pkg = normalize_pkg_name(package);
+    if !is_normalized(&pkg) || !sidecar::is_artifact(filename) || filename.contains('/') {
+        return Err((StatusCode::NOT_FOUND, "No such file".to_string()));
+    }
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
     let sc_key = sidecar_key(&key);
 

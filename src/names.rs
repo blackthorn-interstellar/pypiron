@@ -32,6 +32,18 @@ pub fn infer_package_from_filename(filename: &str) -> String {
     normalize_pkg_name(dist)
 }
 
+/// A well-formed PEP 503 normalized name: nonempty, only `[a-z0-9-]`.
+/// Anything else (slashes, dots that survived, unicode) is hostile input —
+/// normalized names are storage path segments.
+pub fn is_normalized(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// True if normalized `pkg` falls under normalized `prefix`: the prefix
 /// itself or anything below it (`acme` matches `acme` and `acme-foo`,
 /// never `acmefoo`). Cf. PEP 752 reserved namespaces.
@@ -74,6 +86,17 @@ mod tests {
             infer_package_from_filename("six-1.16.0-py2.py3-none-any.whl"),
             "six"
         );
+    }
+
+    #[test]
+    fn validates_normalized_names() {
+        assert!(is_normalized("six"));
+        assert!(is_normalized("acme-foo2"));
+        assert!(!is_normalized(""));
+        assert!(!is_normalized("foo/bar"));
+        assert!(!is_normalized("Foo"));
+        assert!(!is_normalized("foo..bar"));
+        assert!(!is_normalized("-foo"));
     }
 
     #[test]

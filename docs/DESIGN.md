@@ -50,10 +50,19 @@ harmless direction.
 Queue semantics (pending/, processing/, claim-by-copy) buy nothing here, because the
 job payload is redundant — the truth is the storage listing. Instead:
 
-1. An upload or delete drops an empty marker object at `_dirty/<pkg>`.
-2. The worker lists `_dirty/`, rebuilds each marked package from listing, and
-   deletes markers **after** writing indexes (at-least-once processing — a crash
-   mid-rebuild leaves the marker, and the next tick redoes the work).
+1. An upload or delete drops an empty marker object at `_dirty/<pkg>` — always
+   *after* the truth change it announces (artifact/sidecar written, or index
+   entry removed).
+2. The worker lists `_dirty/`, deletes each marker **first**, then rebuilds that
+   package from a fresh listing. Deleting first matters: the marker key is
+   shared, so deleting after the rebuild would destroy any mark written
+   concurrently *during* the rebuild — and since a delete's mark signals an
+   index entry that must go away, swallowing it leaves a listed-but-missing
+   file (the one harmful state) until the next reconcile. With delete-first,
+   truth-before-marker guarantees the rebuild's listing always sees the state
+   that prompted any swallowed mark. The cost is honest: a crash between
+   delete and rebuild loses the event — which the reconciler heals, exactly
+   the failure class it exists for.
 3. Duplicate markers for the same package collapse into one rebuild for free.
 
 No claim races are possible because there is nothing to claim. This deletes a whole

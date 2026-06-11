@@ -6,6 +6,9 @@ use std::io::{Cursor, Read};
 
 use zip::ZipArchive;
 
+/// Core metadata is text; anything past this is a zip bomb, not a METADATA.
+const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Extract the core `METADATA` file from wheel bytes, if present.
 pub fn extract_metadata(wheel_bytes: &[u8]) -> Option<Vec<u8>> {
     let mut zip = ZipArchive::new(Cursor::new(wheel_bytes)).ok()?;
@@ -13,8 +16,19 @@ pub fn extract_metadata(wheel_bytes: &[u8]) -> Option<Vec<u8>> {
         .file_names()
         .find(|n| n.ends_with(".dist-info/METADATA") && n.matches('/').count() == 1)
         .map(str::to_string)?;
+    let entry = zip.by_name(&name).ok()?;
+    if entry.size() > MAX_METADATA_BYTES {
+        return None;
+    }
     let mut out = Vec::new();
-    zip.by_name(&name).ok()?.read_to_end(&mut out).ok()?;
+    // take() guards against central directories that lie about the size.
+    entry
+        .take(MAX_METADATA_BYTES + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    if out.len() as u64 > MAX_METADATA_BYTES {
+        return None;
+    }
     Some(out)
 }
 

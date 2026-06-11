@@ -80,3 +80,21 @@ def test_deleting_last_file_releases_claim(disk_server, tmp_path):
     assert not (disk_server["data_dir"] / "packages" / PACKAGE / ".origin").exists(), (
         "the origin claim dies with the package"
     )
+
+
+def test_origin_marker_not_deletable_via_api(disk_server, tmp_path):
+    """DELETE /files/<pkg>/.origin must not work — the claim is server-managed."""
+    from .helpers import http_request_auth
+
+    wheel_path = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
+    creds = {"username": disk_server["user"], "password": disk_server["password"]}
+    upload_legacy(disk_server["legacy"], wheel_path, **creds)
+    wait_for_file_in_index(disk_server["simple"], PACKAGE, wheel_path.name)
+
+    for target in (".origin", f"{wheel_path.name}.meta.json", f"{wheel_path.name}.metadata"):
+        code, _, _ = http_request_auth(
+            "DELETE", f"{disk_server['base_url']}/files/{PACKAGE}/{target}", **creds
+        )
+        assert code == 404, f"{target} must not be deletable via the API"
+
+    assert (disk_server["data_dir"] / "packages" / PACKAGE / ".origin").exists()

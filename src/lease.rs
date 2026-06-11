@@ -92,13 +92,16 @@ impl LeaseManager {
             return Ok(renewed);
         }
 
-        if now > current.expires_at {
+        // Expired — or impossibly far in the future: a clock-skewed holder
+        // that died would otherwise leave an unstealabe lease and a silent
+        // leadership vacuum. Anything past now + 3×ttl is bogus.
+        if now > current.expires_at || current.expires_at > now + 3 * self.ttl_secs {
             let stolen = storage
                 .put_if_match(LEASE_KEY, &etag, self.lease_json(current.term + 1, now))
                 .await?
                 .is_some();
             if stolen {
-                info!(holder=%self.holder, previous=%current.holder, term = current.term + 1, "lease stolen (expired)");
+                info!(holder=%self.holder, previous=%current.holder, term = current.term + 1, "lease stolen (expired or bogus expiry)");
             }
             return Ok(stolen);
         }

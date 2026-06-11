@@ -101,3 +101,54 @@ def test_index_upload_time_comes_from_sidecar(disk_server, tmp_path):
     assert entry["upload-time"] == "2020-01-01T00:00:00Z", (
         "index upload-time must come from the sidecar, not storage mtime"
     )
+
+
+def test_corrupt_sidecar_omits_file_never_fabricates(disk_server, tmp_path):
+    """A present-but-unreadable sidecar must not be silently rebuilt — that
+    would reset a security yank to false. The file drops out of the index."""
+    old_wheel = download_pypi_wheel(PACKAGE, OLD_VERSION, tmp_path)
+    new_wheel = download_pypi_wheel(PACKAGE, NEW_VERSION, tmp_path)
+    _upload(disk_server, old_wheel)
+    _upload(disk_server, new_wheel)
+    wait_for_file_in_index(disk_server["simple"], PACKAGE, old_wheel.name)
+    wait_for_file_in_index(disk_server["simple"], PACKAGE, new_wheel.name)
+
+    sidecar_path = disk_server["data_dir"] / "packages" / PACKAGE / f"{old_wheel.name}.meta.json"
+    sidecar_path.write_text("{corrupt json!!")
+
+    # Trigger a rebuild via the other file's yank flip.
+    import time as _time
+    from .helpers import http_request_auth
+
+    creds = {"username": disk_server["user"], "password": disk_server["password"]}
+    yank_url = f"{disk_server['base_url']}/files/{PACKAGE}/{new_wheel.name}/yank"
+    code, _, _ = http_request_auth("POST", yank_url, **creds)
+    assert code == 200
+
+    from .helpers import http_get_json, ACCEPT_PEP691
+
+    deadline = _time.time() + 15.0
+    while _time.time() < deadline:
+        doc = http_get_json(
+            f"{disk_server['simple']}{PACKAGE}/index.json", headers={"Accept": ACCEPT_PEP691}
+        )
+        names = [f["filename"] for f in doc["files"]]
+        if old_wheel.name not in names and new_wheel.name in names:
+            break
+        _time.sleep(0.2)
+    else:
+        raise AssertionError("corrupt-sidecar file should be omitted from the index")
+
+    # The corrupt sidecar was not overwritten with fabricated metadata.
+    assert sidecar_path.read_text() == "{corrupt json!!"
+
+
+def test_invalid_package_name_rejected(disk_server, tmp_path):
+    wheel_path = download_pypi_wheel(PACKAGE, NEW_VERSION, tmp_path)
+    _upload(
+        disk_server,
+        wheel_path,
+        fields={"name": "../escape"},
+        expect_status=400,
+    )
+    assert not (disk_server["data_dir"] / "escape").exists()

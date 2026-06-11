@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use tokio::fs;
 use tracing::{error, info, warn};
 
-use crate::names::{matches_prefix, normalize_pkg_name};
+use crate::names::{is_normalized, matches_prefix, normalize_pkg_name};
 use crate::origin;
 use crate::sidecar::{metadata_key, sidecar_key, Sidecar, Yanked};
 use crate::storage::{Storage, StorageArgs};
@@ -112,6 +112,8 @@ struct PyPiFile {
     url: String,
     digests: PyPiDigests,
     #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
     packagetype: Option<String>,
     #[serde(default)]
     upload_time_iso_8601: Option<String>,
@@ -186,7 +188,7 @@ async fn sync_one_package(client: &Client, args: &SyncArgs, sink: &Sink, pkg: &s
         }
     }
     if let Sink::Storage(storage) = sink {
-        match origin::read_origin(storage.as_ref(), pkg).await.as_deref() {
+        match origin::read_origin(storage.as_ref(), pkg).await?.as_deref() {
             Some(origin::MIRROR) | None => {}
             Some(other) => {
                 bail!("'{pkg}' is {other}-owned; refusing to mirror over it")
@@ -204,10 +206,16 @@ async fn sync_one_package(client: &Client, args: &SyncArgs, sink: &Sink, pkg: &s
         return Ok(());
     }
 
+    let mut claimed_now = false;
     if let Sink::Storage(storage) = sink {
-        // Claim only when actually writing.
-        if origin::read_origin(storage.as_ref(), pkg).await.is_none() {
-            origin::claim_origin(storage.as_ref(), pkg, origin::MIRROR).await?;
+        // Claim only when actually writing — atomically, so a racing first
+        // private upload can't merge origins.
+        if origin::read_origin(storage.as_ref(), pkg).await?.is_none() {
+            let winner = origin::claim_origin(storage.as_ref(), pkg, origin::MIRROR).await?;
+            if winner != origin::MIRROR {
+                bail!("'{pkg}' is {winner}-owned; refusing to mirror over it");
+            }
+            claimed_now = true;
         }
     }
 
@@ -243,9 +251,34 @@ async fn sync_one_package(client: &Client, args: &SyncArgs, sink: &Sink, pkg: &s
         }
     }
     if errors > 0 {
+        // A claim with nothing behind it would block the name forever.
+        if claimed_now && !wrote {
+            if let Sink::Storage(storage) = sink {
+                release_empty_claim(storage.as_ref(), pkg).await;
+            }
+        }
         bail!("{errors} file(s) failed for '{pkg}'");
     }
     Ok(())
+}
+
+/// Remove our orphan `.origin` claim if the package holds no artifacts.
+async fn release_empty_claim(storage: &dyn Storage, pkg: &str) {
+    let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
+    match storage.list_dir_entries(&prefix).await {
+        Ok(entries) => {
+            let has_artifact = entries.iter().any(|e| {
+                e.key
+                    .strip_prefix(&prefix)
+                    .map(crate::sidecar::is_artifact)
+                    .unwrap_or(false)
+            });
+            if !has_artifact {
+                let _ = storage.delete_keys(&[origin::origin_key(pkg)]).await;
+            }
+        }
+        Err(e) => warn!(package=%pkg, error=?e, "could not check for orphan claim"),
+    }
 }
 
 async fn fetch_selected_files(
@@ -287,15 +320,26 @@ async fn mirror_to_storage(
     s: &Selected,
 ) -> Result<bool> {
     let key = format!("{PACKAGES_PREFIX}{pkg}/{}", s.file.filename);
-    if storage.head_exists(&key).await.unwrap_or(false) {
+    let artifact_exists = storage.head_exists(&key).await?;
+    let sidecar_exists = storage.head_exists(&sidecar_key(&key)).await?;
+    if artifact_exists && sidecar_exists {
         return Ok(false);
+    }
+    if artifact_exists {
+        // A crash between artifact and sidecar writes left a half-mirrored
+        // file; heal the sidecar from PyPI metadata without re-downloading.
+        write_mirror_sidecar(storage, &key, s, s.file.size.unwrap_or(0)).await?;
+        return Ok(true);
     }
 
     info!("  - mirroring {}", s.file.filename);
     let bytes = download_verified(client, &s.file).await?;
+    let size = bytes.len() as u64;
 
+    // Conditional create: a racing syncer losing here is harmless, the
+    // sidecar write below is deterministic for both.
     storage
-        .put_bytes(&key, bytes.clone(), Some("application/octet-stream"))
+        .put_if_absent(&key, bytes, Some("application/octet-stream"))
         .await?;
 
     // Best-effort PEP 658: PyPI serves metadata at <file-url>.metadata.
@@ -315,6 +359,18 @@ async fn mirror_to_storage(
         }
     }
 
+    write_mirror_sidecar(storage, &key, s, size).await?;
+    Ok(true)
+}
+
+/// Sidecar carrying PyPI's metadata verbatim — digest, true upload time,
+/// requires-python, yank state.
+async fn write_mirror_sidecar(
+    storage: &dyn Storage,
+    key: &str,
+    s: &Selected,
+    size: u64,
+) -> Result<()> {
     let yanked = match (&s.file.yanked_reason, s.file.yanked) {
         (Some(reason), _) if !reason.trim().is_empty() => Yanked::Reason(reason.trim().into()),
         (_, flag) => Yanked::Flag(flag),
@@ -322,7 +378,7 @@ async fn mirror_to_storage(
     let sc = Sidecar {
         // PyPI's digest, verified against the downloaded bytes — not re-derived.
         sha256: s.file.digests.sha256.clone(),
-        size: bytes.len() as u64,
+        size,
         version: s.version.clone(),
         // PyPI's true upload time: the whole point of direct-storage sync.
         upload_time: s.file.upload_time_iso_8601.clone().unwrap_or_default(),
@@ -331,12 +387,12 @@ async fn mirror_to_storage(
     };
     storage
         .put_bytes(
-            &sidecar_key(&key),
+            &sidecar_key(key),
             serde_json::to_vec(&sc)?,
             Some("application/json"),
         )
         .await?;
-    Ok(true)
+    Ok(())
 }
 
 async fn download_verified(client: &Client, file: &PyPiFile) -> Result<Vec<u8>> {
@@ -546,7 +602,11 @@ async fn read_package_names(path: &PathBuf) -> Result<Vec<String>> {
                 lineno + 1
             );
         }
-        out.push(normalize_pkg_name(line));
+        let name = normalize_pkg_name(line);
+        if !is_normalized(&name) {
+            bail!("line {}: invalid package name '{line}'", lineno + 1);
+        }
+        out.push(name);
     }
     Ok(out)
 }

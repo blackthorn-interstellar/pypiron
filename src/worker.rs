@@ -1,10 +1,14 @@
 //! Index rebuild worker: dirty markers, not a queue.
 //!
-//! Uploads and deletes drop an empty marker at `_dirty/<pkg>`. Each tick lists
-//! the markers, rebuilds every marked package from a storage listing, and
-//! deletes markers only after the indexes are written — at-least-once
-//! processing, no claims, no races worth having. Duplicate markers collapse
-//! into one rebuild for free.
+//! Uploads and deletes drop an empty marker at `_dirty/<pkg>` — always after
+//! the truth change it announces. Each tick lists the markers, deletes each
+//! marker FIRST, then rebuilds that package from a fresh listing. Deleting
+//! first matters: the key is shared, so deleting after the rebuild would
+//! destroy marks written concurrently during it — and a swallowed delete-mark
+//! leaves a listed-but-missing file, the one harmful state. With delete-first,
+//! truth-before-marker guarantees the rebuild sees whatever prompted any
+//! swallowed mark. A crash between delete and rebuild merely defers to the
+//! reconciler. Duplicate markers still collapse into one rebuild for free.
 
 use std::{collections::HashSet, sync::Arc, time::Instant};
 
@@ -68,28 +72,65 @@ pub async fn run_worker(state: Arc<AppState>) {
 /// Writes only happen where the materialized view disagrees with truth.
 pub async fn reconcile(state: &AppState) -> Result<()> {
     let mut live: Vec<String> = Vec::new();
+    let mut failures = 0usize;
     for pkg in state.storage.list_dirs(PACKAGES_PREFIX).await? {
-        if rebuild_package(state, &pkg).await? {
-            live.push(pkg);
+        match rebuild_package(state, &pkg).await {
+            Ok(true) => live.push(pkg),
+            Ok(false) => {}
+            Err(e) => {
+                // Conservative on failure: keep the package's existing views
+                // and global listing rather than pruning on a bad observation.
+                error!(package=%pkg, error=?e, "reconcile: package rebuild failed");
+                failures += 1;
+                live.push(pkg);
+            }
         }
     }
 
-    // Views whose truth directory disappeared entirely.
+    // Views whose truth directory disappeared entirely. Destructive, so
+    // re-check truth at delete time: a package born after our first listing
+    // (or built by a split-brain peer) must not have its fresh view pruned.
     let live_set: HashSet<&str> = live.iter().map(String::as_str).collect();
     for view in state.storage.list_dirs(SIMPLE_PREFIX).await? {
-        if !live_set.contains(view.as_str()) {
-            state
-                .storage
-                .delete_keys(&[
-                    format!("{SIMPLE_PREFIX}{view}/index.html"),
-                    format!("{SIMPLE_PREFIX}{view}/index.json"),
-                ])
-                .await?;
+        if live_set.contains(view.as_str()) {
+            continue;
         }
+        let prefix = format!("{PACKAGES_PREFIX}{view}/");
+        match state.storage.list_dir_entries(&prefix).await {
+            Ok(entries) => {
+                let has_artifact = entries.iter().any(|e| {
+                    e.key
+                        .strip_prefix(&prefix)
+                        .map(is_artifact)
+                        .unwrap_or(false)
+                });
+                if has_artifact {
+                    continue;
+                }
+            }
+            Err(e) => {
+                error!(view=%view, error=?e, "reconcile: cannot verify orphan view; keeping it");
+                failures += 1;
+                continue;
+            }
+        }
+        state
+            .storage
+            .delete_keys(&[
+                format!("{SIMPLE_PREFIX}{view}/index.html"),
+                format!("{SIMPLE_PREFIX}{view}/index.json"),
+            ])
+            .await?;
     }
 
     live.sort();
+    live.dedup();
     write_global_indexes(state, &live).await?;
+    if failures > 0 {
+        return Err(anyhow::anyhow!(
+            "sweep finished with {failures} package failure(s)"
+        ));
+    }
     info!(packages = live.len(), "reconcile: sweep complete");
     Ok(())
 }
@@ -101,20 +142,40 @@ async fn tick(state: &AppState) -> Result<()> {
     }
     info!(count = markers.len(), "worker: processing dirty markers");
 
+    // One failing package must not starve the rest of the namespace.
+    let mut failures = 0usize;
     for marker in &markers {
         let Some(pkg) = marker.key.strip_prefix(DIRTY_PREFIX) else {
             continue;
         };
-        let has_artifacts = rebuild_package(state, pkg).await?;
-        maybe_rebuild_global(state, pkg, has_artifacts).await?;
-        // Marker goes last: a crash above leaves it, and the next tick redoes
-        // the (idempotent) work.
-        state
+        // Marker first (see module docs): marks landing during the rebuild
+        // survive for the next tick instead of being deleted unprocessed.
+        if let Err(e) = state
             .storage
             .delete_keys(std::slice::from_ref(&marker.key))
-            .await?;
+            .await
+        {
+            error!(package=%pkg, error=?e, "could not delete dirty marker; will retry");
+            failures += 1;
+            continue;
+        }
+        if let Err(e) = process_dirty(state, pkg).await {
+            error!(package=%pkg, error=?e, "rebuild failed; re-marking");
+            // Restore the event so the next tick retries promptly instead of
+            // waiting for the reconcile sweep.
+            let _ = mark_dirty(state.storage.as_ref(), pkg).await;
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        return Err(anyhow::anyhow!("{failures} package(s) failed this tick"));
     }
     Ok(())
+}
+
+async fn process_dirty(state: &AppState, pkg: &str) -> Result<()> {
+    let has_artifacts = rebuild_package(state, pkg).await?;
+    maybe_rebuild_global(state, pkg, has_artifacts).await
 }
 
 /// Regenerate one package's indexes from a storage listing.
@@ -228,14 +289,12 @@ pub async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<FileMetad
             match read_sidecar(state, &entry.key).await {
                 Ok(sc) => sc,
                 Err(e) => {
-                    warn!(error=?e, key=%entry.key, "unreadable sidecar; backfilling");
-                    match backfill_sidecar(state, entry, filename).await {
-                        Ok(sc) => sc,
-                        Err(e) => {
-                            warn!(error=?e, key=%entry.key, "could not backfill sidecar; skipping file");
-                            continue;
-                        }
-                    }
+                    // A present-but-unreadable sidecar is corruption, not a
+                    // legacy file. Backfilling would fabricate fresh metadata
+                    // over it — silently resetting a security yank to false.
+                    // Leave the file out of the index until an operator looks.
+                    error!(error=?e, key=%entry.key, "corrupt sidecar; omitting file from index (will not fabricate metadata)");
+                    continue;
                 }
             }
         } else {

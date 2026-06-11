@@ -17,7 +17,7 @@ The bar for "supported" is blackbox-verified behavior against real clients
 | [PEP 658](https://peps.python.org/pep-0658/) / [714](https://peps.python.org/pep-0714/) | Serve wheel `METADATA` as `<filename>.metadata` + `core-metadata` attrs | Planned |
 | `requires-python` | `data-requires-python` attr / `requires-python` key | Planned (needs write-time metadata capture) |
 | Filename immutability | Reject re-upload of an existing filename (pypi.org rule) | Supported |
-| HTTP caching | ETag on indexes, `immutable` on artifacts, Range requests | Planned |
+| HTTP caching | ETag on indexes, `immutable` on artifacts, Range requests | Supported |
 | Package deletion | Delete event → index rebuild | Planned |
 | Origin exclusivity | Each package is `private` or `mirror`, claimed at first write; collisions rejected (dependency-confusion defense) | Planned |
 | Namespace prefix policy | Reserve a configured prefix for private uploads; mirror refuses it (cf. PEP 752) | Planned |

@@ -1,19 +1,18 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use axum::body::Body;
+use http::{header, Response, StatusCode};
+use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 
 // S3 deps
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::{primitives::ByteStream, Client as S3Client};
-
-/// Object payload returned by storage backends.
-pub struct ObjectData {
-    pub bytes: Vec<u8>,
-    pub content_type: Option<String>,
-    pub content_length: Option<u64>,
-}
 
 /// A file from a directory listing, with the metadata index rendering needs.
 pub struct FileEntry {
@@ -23,16 +22,70 @@ pub struct FileEntry {
     pub last_modified: Option<String>,
 }
 
+/// A single HTTP byte range resolved against a known size.
+#[derive(Debug, PartialEq)]
+pub enum RangeSpec {
+    Full,
+    Partial(u64, u64),
+    Unsatisfiable,
+}
+
+/// Parse a single-range `Range` header. Multi-range and malformed headers
+/// fall back to the full body (RFC 9110 lets a server ignore Range).
+pub fn parse_range(header: Option<&str>, size: u64) -> RangeSpec {
+    let Some(spec) = header.and_then(|h| h.strip_prefix("bytes=")) else {
+        return RangeSpec::Full;
+    };
+    let spec = spec.trim();
+    if spec.contains(',') {
+        return RangeSpec::Full;
+    }
+    if let Some(suffix) = spec.strip_prefix('-') {
+        // suffix range: the last N bytes
+        let Ok(n) = suffix.parse::<u64>() else {
+            return RangeSpec::Full;
+        };
+        if n == 0 || size == 0 {
+            return RangeSpec::Unsatisfiable;
+        }
+        let n = n.min(size);
+        return RangeSpec::Partial(size - n, size - 1);
+    }
+    let Some((start_s, end_s)) = spec.split_once('-') else {
+        return RangeSpec::Full;
+    };
+    let Ok(start) = start_s.parse::<u64>() else {
+        return RangeSpec::Full;
+    };
+    if start >= size {
+        return RangeSpec::Unsatisfiable;
+    }
+    let end = if end_s.is_empty() {
+        size - 1
+    } else {
+        match end_s.parse::<u64>() {
+            Ok(e) if e >= start => e.min(size - 1),
+            _ => return RangeSpec::Full,
+        }
+    };
+    RangeSpec::Partial(start, end)
+}
+
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// Check if an object exists.
     async fn head_exists(&self, key: &str) -> Result<bool>;
 
+    /// Serve an artifact as an HTTP response, honoring a `Range` header.
+    /// Each backend uses its native range machinery (seek for disk, S3's own
+    /// validation for S3). Errors mean "not found" to the caller.
+    async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>>;
+
     /// Write bytes to `key`. `content_type` is best-effort (ignored on Disk).
     async fn put_bytes(&self, key: &str, bytes: Vec<u8>, content_type: Option<&str>) -> Result<()>;
 
-    /// Read object bytes + metadata.
-    async fn get_bytes(&self, key: &str) -> Result<ObjectData>;
+    /// Read full object bytes (indexes, sidecars — small files only).
+    async fn get_bytes(&self, key: &str) -> Result<Vec<u8>>;
 
     /// List up to `limit` file keys under `prefix` (non-recursive where possible).
     async fn list_prefix_files_limited(&self, prefix: &str, limit: usize) -> Result<Vec<String>>;
@@ -92,6 +145,46 @@ impl Storage for DiskStorage {
         Ok(fs::metadata(p).await.is_ok())
     }
 
+    async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>> {
+        let path = self.resolve(key)?;
+        let md = fs::metadata(&path)
+            .await
+            .with_context(|| format!("stat {key}"))?;
+        if !md.is_file() {
+            return Err(anyhow!("not a file: {key}"));
+        }
+        let size = md.len();
+
+        let resp = match parse_range(range, size) {
+            RangeSpec::Full => {
+                let file = fs::File::open(&path).await?;
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, size)
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .body(Body::from_stream(ReaderStream::new(file)))?
+            }
+            RangeSpec::Partial(start, end) => {
+                let mut file = fs::File::open(&path).await?;
+                file.seek(SeekFrom::Start(start)).await?;
+                let len = end - start + 1;
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_LENGTH, len)
+                    .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"))
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .body(Body::from_stream(ReaderStream::new(file.take(len))))?
+            }
+            RangeSpec::Unsatisfiable => Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{size}"))
+                .body(Body::empty())?,
+        };
+        Ok(resp)
+    }
+
     async fn put_bytes(
         &self,
         key: &str,
@@ -104,16 +197,11 @@ impl Storage for DiskStorage {
         Ok(())
     }
 
-    async fn get_bytes(&self, key: &str) -> Result<ObjectData> {
+    async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
         let p = self.resolve(key)?;
-        let bytes = fs::read(&p)
+        Ok(fs::read(&p)
             .await
-            .with_context(|| format!("read {}", key))?;
-        Ok(ObjectData {
-            content_length: Some(bytes.len() as u64),
-            content_type: None, // no filesystem metadata — callers often override CT anyway
-            bytes,
-        })
+            .with_context(|| format!("read {}", key))?)
     }
 
     async fn list_prefix_files_limited(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
@@ -226,6 +314,48 @@ impl Storage for S3Storage {
             .is_ok())
     }
 
+    async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>> {
+        let mut req = self.s3.get_object().bucket(&self.bucket).key(key);
+        if let Some(r) = range {
+            req = req.range(r);
+        }
+        let out = match req.send().await {
+            Ok(out) => out,
+            Err(e) => {
+                // S3 validates ranges itself; surface its verdict.
+                if e.code() == Some("InvalidRange") {
+                    return Ok(Response::builder()
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .body(Body::empty())?);
+                }
+                return Err(e.into());
+            }
+        };
+
+        let status = if out.content_range().is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        };
+        let mut builder = Response::builder()
+            .status(status)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(
+                header::CONTENT_TYPE,
+                out.content_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_string(),
+            );
+        if let Some(len) = out.content_length() {
+            builder = builder.header(header::CONTENT_LENGTH, len);
+        }
+        if let Some(cr) = out.content_range() {
+            builder = builder.header(header::CONTENT_RANGE, cr.to_string());
+        }
+        let body = Body::from_stream(ReaderStream::new(out.body.into_async_read()));
+        Ok(builder.body(body)?)
+    }
+
     async fn put_bytes(&self, key: &str, bytes: Vec<u8>, content_type: Option<&str>) -> Result<()> {
         let mut req = self
             .s3
@@ -240,7 +370,7 @@ impl Storage for S3Storage {
         Ok(())
     }
 
-    async fn get_bytes(&self, key: &str) -> Result<ObjectData> {
+    async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
         let out = self
             .s3
             .get_object()
@@ -248,14 +378,7 @@ impl Storage for S3Storage {
             .key(key)
             .send()
             .await?;
-        let ct = out.content_type().map(|s| s.to_string());
-        let len = out.content_length().map(|v| v as u64);
-        let bytes = out.body.collect().await?.to_vec();
-        Ok(ObjectData {
-            bytes,
-            content_type: ct,
-            content_length: len,
-        })
+        Ok(out.body.collect().await?.to_vec())
     }
 
     async fn list_prefix_files_limited(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
@@ -371,5 +494,31 @@ impl Storage for S3Storage {
                 .await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_parsing() {
+        use RangeSpec::*;
+        assert_eq!(parse_range(None, 100), Full);
+        assert_eq!(parse_range(Some("bytes=0-49"), 100), Partial(0, 49));
+        assert_eq!(parse_range(Some("bytes=50-"), 100), Partial(50, 99));
+        assert_eq!(parse_range(Some("bytes=-10"), 100), Partial(90, 99));
+        // end clamps to size
+        assert_eq!(parse_range(Some("bytes=0-1000"), 100), Partial(0, 99));
+        // suffix larger than the file means the whole file
+        assert_eq!(parse_range(Some("bytes=-1000"), 100), Partial(0, 99));
+        // out of bounds start
+        assert_eq!(parse_range(Some("bytes=100-"), 100), Unsatisfiable);
+        assert_eq!(parse_range(Some("bytes=-0"), 100), Unsatisfiable);
+        // ignorable: multi-range, malformed, non-byte units
+        assert_eq!(parse_range(Some("bytes=0-1,5-9"), 100), Full);
+        assert_eq!(parse_range(Some("bytes=junk"), 100), Full);
+        assert_eq!(parse_range(Some("items=0-5"), 100), Full);
+        assert_eq!(parse_range(Some("bytes=9-5"), 100), Full);
     }
 }

@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use axum::{
@@ -29,7 +29,7 @@ mod worker;
 
 use names::{infer_package_from_filename, infer_version_from_filename, normalize_pkg_name};
 use sidecar::{sidecar_key, Sidecar, Yanked};
-use storage::{DiskStorage, ObjectData, S3Storage, Storage};
+use storage::{DiskStorage, S3Storage, Storage};
 
 const PACKAGES_PREFIX: &str = "packages/";
 const SIMPLE_PREFIX: &str = "simple/";
@@ -502,34 +502,44 @@ async fn enqueue_job(state: &AppState, package: &str, filename: &str, s3_key: &s
 }
 
 /// --- Simple index endpoints ----------------------------------------------
+const CT_JSON: &str = "application/vnd.pypi.simple.v1+json";
+const CT_HTML: &str = "text/html; charset=utf-8";
+/// Indexes change on every rebuild: always revalidate, never stale.
+const INDEX_CACHE_CONTROL: &str = "no-cache";
+/// Filenames are immutable, so artifact bytes can be cached forever.
+const ARTIFACT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+
 async fn simple_root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
     if accepts_json(&headers) {
-        stream_object(
+        serve_index(
             &state,
             format!("{SIMPLE_PREFIX}index.json"),
-            Some("application/vnd.pypi.simple.v1+json"),
+            CT_JSON,
+            &headers,
         )
         .await
-        .unwrap_or_else(internal_or_404)
     } else {
-        stream_object(
+        serve_index(
             &state,
             format!("{SIMPLE_PREFIX}index.html"),
-            Some("text/html"),
+            CT_HTML,
+            &headers,
         )
         .await
-        .unwrap_or_else(internal_or_404)
     }
 }
 
-async fn simple_root_json(State(state): State<Arc<AppState>>) -> Response<Body> {
-    stream_object(
+async fn simple_root_json(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    serve_index(
         &state,
         format!("{SIMPLE_PREFIX}index.json"),
-        Some("application/vnd.pypi.simple.v1+json"),
+        CT_JSON,
+        &headers,
     )
     .await
-    .unwrap_or_else(internal_or_404)
 }
 
 async fn simple_pkg(
@@ -539,86 +549,107 @@ async fn simple_pkg(
 ) -> Response<Body> {
     let pkg = normalize_pkg_name(&pkg);
     if accepts_json(&headers) {
-        stream_object(
+        serve_index(
             &state,
             format!("{SIMPLE_PREFIX}{pkg}/index.json"),
-            Some("application/vnd.pypi.simple.v1+json"),
+            CT_JSON,
+            &headers,
         )
         .await
-        .unwrap_or_else(internal_or_404)
     } else {
-        stream_object(
+        serve_index(
             &state,
             format!("{SIMPLE_PREFIX}{pkg}/index.html"),
-            Some("text/html"),
+            CT_HTML,
+            &headers,
         )
         .await
-        .unwrap_or_else(internal_or_404)
     }
 }
 
 async fn simple_pkg_json(
     State(state): State<Arc<AppState>>,
     Path(pkg): Path<String>,
+    headers: HeaderMap,
 ) -> Response<Body> {
     let pkg = normalize_pkg_name(&pkg);
-    stream_object(
+    serve_index(
         &state,
         format!("{SIMPLE_PREFIX}{pkg}/index.json"),
-        Some("application/vnd.pypi.simple.v1+json"),
+        CT_JSON,
+        &headers,
     )
     .await
-    .unwrap_or_else(internal_or_404)
+}
+
+/// Serve a materialized index file with a content-hash ETag; conditional GETs
+/// revalidate to 304.
+async fn serve_index(
+    state: &AppState,
+    key: String,
+    content_type: &'static str,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let bytes = match state.storage.get_bytes(&key).await {
+        Ok(o) => o,
+        Err(e) => return not_found(e),
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let etag = format!("\"{:x}\"", hasher.finalize());
+
+    let revalidated = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "*" || v.contains(etag.as_str()))
+        .unwrap_or(false);
+
+    let builder = Response::builder()
+        .header(header::ETAG, etag.clone())
+        .header(header::CACHE_CONTROL, INDEX_CACHE_CONTROL);
+
+    let result = if revalidated {
+        builder.status(StatusCode::NOT_MODIFIED).body(Body::empty())
+    } else {
+        builder
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, bytes.len())
+            .body(Body::from(bytes))
+    };
+    result.unwrap_or_else(not_found)
 }
 
 /// --- Artifact download endpoint ------------------------------------------
 async fn files_get(
     State(state): State<Arc<AppState>>,
     Path((package, filename)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response<Body> {
     let pkg = normalize_pkg_name(&package);
-    stream_object(&state, format!("{PACKAGES_PREFIX}{pkg}/{filename}"), None)
-        .await
-        .unwrap_or_else(internal_or_404)
-}
-
-async fn stream_object(
-    state: &AppState,
-    key: String,
-    override_ct: Option<&'static str>,
-) -> Result<Response<Body>> {
-    let out: ObjectData = state
-        .storage
-        .get_bytes(&key)
-        .await
-        .with_context(|| key.clone())?;
-
-    let ct = override_ct
-        .map(std::string::ToString::to_string)
-        .or(out.content_type.clone())
-        .unwrap_or_else(|| "application/octet-stream".to_string());
-
-    let content_length = out.content_length;
-    let mut resp = Response::new(Body::from(out.bytes));
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_str(&ct).unwrap_or(HeaderValue::from_static("application/octet-stream")),
-    );
-    if let Some(sz) = content_length {
-        if let Ok(v) = HeaderValue::from_str(&sz.to_string()) {
-            resp.headers_mut().insert(header::CONTENT_LENGTH, v);
-        }
+    if !sidecar::is_artifact(&filename) {
+        return not_found("not an artifact");
     }
-    Ok(resp)
+    let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    match state.storage.serve_artifact(&key, range).await {
+        Ok(mut resp) => {
+            resp.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(ARTIFACT_CACHE_CONTROL),
+            );
+            resp
+        }
+        Err(e) => not_found(e),
+    }
 }
 
-fn internal_or_404<E: std::fmt::Debug>(err: E) -> Response<Body> {
-    // If it's a NotFound we'd prefer a 404; MVP: return 404 for all errors.
-    warn!(error=?err, "stream error");
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .body(Body::empty())
-        .unwrap()
+fn not_found<E: std::fmt::Debug>(err: E) -> Response<Body> {
+    warn!(error=?err, "read miss");
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = StatusCode::NOT_FOUND;
+    resp
 }
 
 /// --- Helpers --------------------------------------------------------------

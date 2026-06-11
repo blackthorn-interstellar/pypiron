@@ -96,7 +96,7 @@ async fn read_job_package(state: &AppState, key: &str) -> Result<String> {
     struct JobPkg {
         package: String,
     }
-    let job: JobPkg = serde_json::from_slice(&out.bytes)?;
+    let job: JobPkg = serde_json::from_slice(&out)?;
     Ok(job.package)
 }
 
@@ -166,7 +166,7 @@ async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<FileMetadata>
 
 async fn read_sidecar(state: &AppState, artifact_key: &str) -> Result<Sidecar> {
     let out = state.storage.get_bytes(&sidecar_key(artifact_key)).await?;
-    Ok(serde_json::from_slice(&out.bytes)?)
+    Ok(serde_json::from_slice(&out)?)
 }
 
 /// Hash-once-and-backfill for files that predate write-time sidecars.
@@ -175,7 +175,7 @@ async fn read_sidecar(state: &AppState, artifact_key: &str) -> Result<Sidecar> {
 async fn backfill_sidecar(state: &AppState, entry: &FileEntry, filename: &str) -> Result<Sidecar> {
     let obj = state.storage.get_bytes(&entry.key).await?;
     let mut hasher = Sha256::new();
-    hasher.update(&obj.bytes);
+    hasher.update(&obj);
     let sc = Sidecar {
         sha256: format!("{:x}", hasher.finalize()),
         size: entry.size,

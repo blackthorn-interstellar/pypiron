@@ -51,6 +51,7 @@ def _sync_to(server, pypiron_bin, pkg_list, *extra, user=None, password=None):
     )
 
 
+@pytest.mark.compat("uv", "exclude-newer")
 def test_http_mirror_preserves_historical_timestamps(
     disk_server, pypiron_bin, tmp_path, uv_path, uv_venv
 ):

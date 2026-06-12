@@ -50,7 +50,9 @@ All milestones (0–12) are done.
   as `mirror`, hard-fails on private-owned names and on the private
   namespace. `--exclude-newer <historical date>` resolves the historically
   correct version against the mirror. HTTP mode remains behind `--to`.
-- M10: S3 presigned redirects — with `--s3-presigned-redirects`, artifact
+- M10: S3 presigned redirects — with `--artifact-delivery` (`auto` default:
+  redirect only clients whose caches survive presigned-URL churn, i.e. uv;
+  stream pip and unknowns; `redirect`/`stream` force either), artifact
   downloads 302 to presigned URLs (1h expiry, `no-cache` on the redirect)
   so the node never streams wheel bytes; PEP 658 metadata companions keep
   streaming. Disk keeps streaming with Range.

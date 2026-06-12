@@ -1,4 +1,4 @@
-.PHONY: init init-rust init-python build dev run test test-rust test-python perf check cargo-check af fmt lint clean doc publish build-wheel release-build help
+.PHONY: init init-rust init-python build dev run test test-rust test-python perf compat check cargo-check af fmt lint clean doc publish build-wheel release-build help
 
 SHELL := /bin/bash
 
@@ -38,6 +38,9 @@ test-python:  ## Run blackbox integration tests
 
 perf:  ## Run performance benchmarks (builds release binary)
 	uv run -- pytest tests -m perf -s
+
+compat:  ## Generate the client compatibility matrix
+	uv run -- pytest tests -m "compat and not perf and not stress" --write-compat-doc
 
 check: af cargo-check lint test-rust  ## Format, lint, and unit-test
 

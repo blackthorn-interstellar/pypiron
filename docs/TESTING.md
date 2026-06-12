@@ -39,6 +39,13 @@ assumptions about clients instead of the clients.
 Markers (`pyproject.toml`): `integration`, `s3` (needs Docker/MinIO), `perf`,
 `stress`. Default runs exclude `perf` and `stress`.
 
+## Client compatibility matrix
+
+Tests that prove behavior through a real client binary carry
+`@pytest.mark.compat(client, feature)`. Run `make compat` to execute those tests
+and regenerate [COMPATIBILITY.md](COMPATIBILITY.md), including the client
+versions used for the matrix.
+
 ## Key scenarios
 
 - **Round trip**: upload a real wheel → appears in package + global index →

@@ -34,6 +34,8 @@ def server(request):
     return request.getfixturevalue(request.param)
 
 
+@pytest.mark.compat("uv", "upload")
+@pytest.mark.compat("uv", "install")
 def test_upload_index_download_install(server, tmp_path, uv_path, uv_venv):
     wheel_path = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
     orig_sha = sha256_file(wheel_path)

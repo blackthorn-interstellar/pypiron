@@ -39,8 +39,9 @@ open http://localhost:8080/simple/
 ## Features
 
 * **Disk-backed** storage (default) — zero external deps
-* **S3-backed** storage (AWS S3 and S3-compatible), optional presigned
-  redirects so the server never streams wheel bytes
+* **S3-backed** storage (AWS S3 and S3-compatible), with client-aware
+  artifact delivery: presigned redirects for clients that tolerate them (uv),
+  streamed bytes for clients whose caches don't (pip)
 * No database — truth is files, views are regenerable, backups are rsync
 * PEP 503 (HTML) and PEP 691 (JSON) with PEP 700 fields — `uv
   --exclude-newer` works, including on mirrored packages
@@ -206,11 +207,40 @@ All options are available via CLI args and/or environment variables.
 | `--worker-interval-secs`     | `PYPIRON_WORKER_INTERVAL_SECS`     | `5`            | Worker tick interval                             |
 | `--reconcile-interval-secs`  | `PYPIRON_RECONCILE_INTERVAL_SECS`  | `300`          | Full self-heal sweep interval                    |
 | `--lease-ttl-secs`           | `PYPIRON_LEASE_TTL_SECS`           | `30`           | Leader lease TTL (multi-node S3)                 |
-| `--s3-presigned-redirects`   | `PYPIRON_S3_PRESIGNED_REDIRECTS`   | `false`        | 302 artifact downloads to presigned S3 URLs      |
+| `--artifact-delivery`        | `PYPIRON_ARTIFACT_DELIVERY`        | `auto`         | How artifact bytes reach clients (see below)     |
 | `--sync-uploads`             | `PYPIRON_SYNC_UPLOADS`             | `false`        | Wait for index visibility before returning 200   |
 | `--sync-upload-timeout-secs` | `PYPIRON_SYNC_UPLOAD_TIMEOUT_SECS` | `10`           | Bound on the synchronous-upload wait             |
 
 **AWS credentials** follow standard AWS SDK envs: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`.
+
+### Artifact delivery
+
+Index pages always carry stable `/files/<pkg>/<filename>#sha256=...` URLs —
+that's what ends up in lockfiles and client caches, and it never expires.
+`--artifact-delivery` governs what happens when a client GETs one:
+
+| Mode       | Behavior                                                                  |
+| ---------- | ------------------------------------------------------------------------- |
+| `auto`     | *(default)* Redirect clients that tolerate it (uv); stream everyone else |
+| `redirect` | Always 302 to a presigned S3 URL — the node never touches wheel bytes    |
+| `stream`   | Always proxy bytes through the node with immutable cache headers         |
+
+The tradeoff: a presigned redirect moves the megabytes to S3, but each
+response carries a freshly signed URL. Clients whose download caches are
+keyed by the URL that served the bytes — pip's HTTP cache — can never get a
+hit on such a URL, so `redirect` silently turns every pip install in a fresh
+environment into a full re-download. uv is immune: it caches wheels by index
+and filename, so it doesn't care what URL the bytes came from.
+
+`auto` resolves this per request: clients verified to cache by filename get
+the 302, everyone else (pip, browsers, unknown tools) gets streamed bytes
+under the stable URL with `Cache-Control: immutable` — a warm pip cache means
+zero artifact bytes over the network. Use `redirect` when the node's
+bandwidth is the binding constraint and you accept weaker pip caching; use
+`stream` when clients can't reach the bucket endpoint (private subnet,
+firewalled S3). The disk backend always streams, whatever the mode.
+PEP 658 `.metadata` companions always stream — they're tiny and
+resolution-critical.
 
 ## Storage layout
 
@@ -234,6 +264,7 @@ _leader/lease.json                       # multi-node lease (holder, term, expir
 * [VISION.md](docs/VISION.md) — the one-page version
 * [DESIGN.md](docs/DESIGN.md) — architecture and reasoning
 * [STANDARDS.md](docs/STANDARDS.md) — PEP support matrix
+* [COMPATIBILITY.md](docs/COMPATIBILITY.md) — generated client compatibility matrix
 * [TESTING.md](docs/TESTING.md) — blackbox-first test philosophy
 * [ROADMAP.md](docs/ROADMAP.md) — implementation history
 

@@ -55,6 +55,7 @@ markers = [
     "integration: integration tests that may hit the network or spawn services",
     "s3: tests that require Docker/MinIO S3 emulation",
     "perf: performance benchmarks against the release binary (disabled by default)",
+    "compat(client, feature): client compatibility coverage point for docs/COMPATIBILITY.md",
 ]
 addopts = "-m 'not perf and not stress'"
 testpaths = [

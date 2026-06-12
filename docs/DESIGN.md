@@ -208,6 +208,29 @@ Reads are stateless file serving and scale horizontally trivially. Per backend:
   ever serves kilobytes of index while S3 serves the megabytes — with Range support
   for free. The node never holds wheel bytes in memory.
 
+Redirects collide with client caching, though. Each 302 carries a freshly
+signed URL (`X-Amz-Date`/`X-Amz-Signature` differ per request), and the
+redirect itself is `no-cache` because the signature expires. pip's HTTP cache
+(CacheControl) keys on the per-hop URL — the final 200 gets cached under a
+presigned URL that will never be requested again, so blanket redirects defeat
+pip's wheel cache entirely: every fresh-venv install re-downloads everything.
+uv keys its artifact cache by index + filename and is indifferent to URL
+churn. Hence `--artifact-delivery` (default `auto`): redirect only clients on
+a verified redirect-safe User-Agent list (uv), stream everyone else under the
+stable `/files/` URL with `immutable` headers. The polarity is deliberate —
+misclassifying a client as *stream* costs this node bandwidth; misclassifying
+it as *redirect* silently breaks its cache. Grow the list by verified cache
+behavior, not popularity. Index pages always embed the stable `/files/` URLs;
+anything else would bake expiring signatures into lockfiles and cached index
+pages.
+
+The redirect path does no existence check — presigning is local HMAC math, so
+answering a redirect costs zero network round trips. A request for a missing
+artifact (a stale index race, or a hand-typed URL) gets a signed URL that S3
+answers with its own 404. That 404-not-403 depends on the server's
+credentials carrying `s3:ListBucket`, which they must anyway: index rebuilds,
+dirty-marker processing, and the reconcile sweep are all built on listing.
+
 ## Multi-node: sloppy leader election
 
 Only the index writer needs to be singular, and only as an optimization. A lease

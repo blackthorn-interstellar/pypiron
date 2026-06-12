@@ -14,6 +14,8 @@ VERSION = "1.17.0"
 pytestmark = pytest.mark.integration
 
 
+@pytest.mark.compat("twine", "upload")
+@pytest.mark.compat("pip", "install")
 def test_twine_upload_pip_install(disk_server, tmp_path, pip_venv):
     wheel_path = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
 

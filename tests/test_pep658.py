@@ -67,6 +67,8 @@ def test_index_advertises_core_metadata_and_requires_python(metadata_server):
     assert 'data-requires-python="&gt;=2.7"' in html
 
 
+@pytest.mark.compat("uv", "pep658-metadata")
+@pytest.mark.compat("uv", "resolve")
 def test_uv_resolves_without_downloading_the_wheel(metadata_server, tmp_path, uv_path):
     wheel_name = metadata_server["wheel_path"].name
     reqs = tmp_path / "requirements.in"

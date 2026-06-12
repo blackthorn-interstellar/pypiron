@@ -30,3 +30,4 @@ bench/.keys/
 bench/.server-env
 bench/.rig.env
 bench/results/
+/data/

@@ -21,6 +21,7 @@ def _installed_version(py: str) -> str:
     return cp.stdout.strip()
 
 
+@pytest.mark.compat("uv", "exclude-newer")
 def test_exclude_newer_resolves_old_version(disk_server, tmp_path, uv_path, uv_venv):
     old_wheel = download_pypi_wheel(PACKAGE, OLD_VERSION, tmp_path)
     new_wheel = download_pypi_wheel(PACKAGE, NEW_VERSION, tmp_path)

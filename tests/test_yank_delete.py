@@ -61,6 +61,7 @@ def _pip_version(py: str) -> str:
     return run_checked([py, "-c", "import six; print(six.__version__)"]).stdout.strip()
 
 
+@pytest.mark.compat("pip", "yank")
 def test_pip_skips_yanked_unless_pinned(stocked_server, pip_venv):
     server = stocked_server
     new_wheel = server["wheels"][NEW_VERSION]

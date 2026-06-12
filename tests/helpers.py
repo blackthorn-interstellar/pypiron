@@ -5,12 +5,14 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import time
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 from urllib.request import Request, urlopen
@@ -18,6 +20,22 @@ from urllib.error import URLError, HTTPError
 
 
 ACCEPT_PEP691 = "application/vnd.pypi.simple.v1+json"
+CLIENT_PINS = {
+    "pip": "venv-seeded",
+    "uv": "system",
+    "poetry": "2.4.1",
+    "pdm": "2.27.0",
+    "twine": "dev-dependency",
+    "flit": "3.12.0",
+    "hatch": "1.17.0",
+}
+
+
+def uvx_client(client: str) -> list[str]:
+    pin = CLIENT_PINS[client]
+    if pin in {"venv-seeded", "system", "dev-dependency"}:
+        raise ValueError(f"{client} is not run through uv tool")
+    return ["uv", "tool", "run", "--from", f"{client}=={pin}", client]
 
 
 # -------------------------- Command / Process helpers -------------------------
@@ -136,7 +154,9 @@ def http_get(
     return _http_request(url, method="GET", headers=headers, timeout=timeout)
 
 
-def http_get_no_redirect(url: str, *, timeout: float = 10.0) -> Tuple[int, bytes, Dict[str, str]]:
+def http_get_no_redirect(
+    url: str, *, headers: Optional[Dict[str, str]] = None, timeout: float = 10.0
+) -> Tuple[int, bytes, Dict[str, str]]:
     """GET without following redirects (for asserting 302s)."""
     import http.client
     from urllib.parse import urlparse
@@ -145,7 +165,7 @@ def http_get_no_redirect(url: str, *, timeout: float = 10.0) -> Tuple[int, bytes
     conn = http.client.HTTPConnection(p.hostname, p.port, timeout=timeout)
     try:
         path = p.path + (f"?{p.query}" if p.query else "")
-        conn.request("GET", path)
+        conn.request("GET", path, headers=headers or {})
         resp = conn.getresponse()
         body = resp.read()
         headers = {k.lower(): v for k, v in resp.getheaders()}
@@ -270,6 +290,46 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             m.update(chunk)
     return m.hexdigest()
+
+
+def make_wheel(name: str, version: str, dest_dir: Path) -> Path:
+    safe_name = re.sub(r"[^A-Za-z0-9.]+", "_", name).strip("_")
+    module_name = re.sub(r"\W+", "_", name).strip("_").lower()
+    dist_info = f"{safe_name}-{version}.dist-info"
+    wheel_path = dest_dir / f"{safe_name}-{version}-py3-none-any.whl"
+    files = {
+        f"{module_name}.py": f'__version__ = "{version}"\n'.encode(),
+        f"{dist_info}/METADATA": (
+            "Metadata-Version: 2.1\n"
+            f"Name: {name}\n"
+            f"Version: {version}\n"
+            "Summary: pypiron test package\n"
+        ).encode(),
+        f"{dist_info}/WHEEL": (
+            "Wheel-Version: 1.0\n"
+            "Generator: pypiron-tests\n"
+            "Root-Is-Purelib: true\n"
+            "Tag: py3-none-any\n"
+        ).encode(),
+    }
+
+    record_lines = []
+    for path, data in files.items():
+        digest = (
+            base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+            .rstrip(b"=")
+            .decode()
+        )
+        record_lines.append(f"{path},sha256={digest},{len(data)}")
+    record_path = f"{dist_info}/RECORD"
+    record_lines.append(f"{record_path},,")
+    files[record_path] = ("\n".join(record_lines) + "\n").encode()
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(wheel_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path, data in files.items():
+            zf.writestr(path, data)
+    return wheel_path
 
 
 # ------------------------------ uv utilities ---------------------------------

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterator
 
@@ -18,6 +19,182 @@ from .helpers import (
     uv_python_path,
     wait_http_ok,
 )
+
+COMPAT_CLIENTS = ("pip", "uv", "poetry", "pdm", "twine", "flit", "hatch")
+COMPAT_FEATURES = (
+    "upload",
+    "install",
+    "resolve",
+    "pep658-metadata",
+    "yank",
+    "hash-check",
+    "exclude-newer",
+)
+COMPAT_OUTCOME_SYMBOLS = {
+    "failed": "\u274c",
+    "xfailed": "\u274c",
+    "passed": "\u2705",
+    "skipped": "?",
+}
+COMPAT_OUTCOME_PRECEDENCE = ("failed", "xfailed", "passed", "skipped")
+COMPAT_VERSION_LABELS = {
+    "venv-seeded": "venv-seeded",
+    "system": "system",
+    "dev-dependency": "dev-dependency",
+}
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--write-compat-doc",
+        action="store_true",
+        help="Write docs/COMPATIBILITY.md from tests marked compat(client, feature).",
+    )
+
+
+def pytest_configure(config):
+    config._compat_results = []
+
+
+def pytest_collection_modifyitems(config, items):
+    clients = set(COMPAT_CLIENTS)
+    features = set(COMPAT_FEATURES)
+    errors = []
+    for item in items:
+        for marker in item.iter_markers("compat"):
+            if marker.kwargs or len(marker.args) != 2:
+                errors.append(f"{item.nodeid}: compat marker must be compat(client, feature)")
+                continue
+            client, feature = marker.args
+            if client not in clients:
+                errors.append(
+                    f"{item.nodeid}: unknown compat client {client!r}; "
+                    f"expected one of {', '.join(COMPAT_CLIENTS)}"
+                )
+            if feature not in features:
+                errors.append(
+                    f"{item.nodeid}: unknown compat feature {feature!r}; "
+                    f"expected one of {', '.join(COMPAT_FEATURES)}"
+                )
+    if errors:
+        raise pytest.UsageError("\n".join(errors))
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    markers = list(item.iter_markers("compat"))
+    if not markers:
+        return
+
+    compat_outcome = None
+    if report.failed:
+        compat_outcome = "failed"
+    elif report.when == "setup" and report.skipped:
+        compat_outcome = "skipped"
+    elif report.when == "call":
+        if report.skipped and hasattr(report, "wasxfail"):
+            compat_outcome = "xfailed"
+        elif report.skipped:
+            compat_outcome = "skipped"
+        elif report.passed:
+            compat_outcome = "passed"
+
+    if compat_outcome is None:
+        return
+
+    for marker in markers:
+        client, feature = marker.args
+        item.config._compat_results.append((client, feature, compat_outcome))
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if not session.config.getoption("--write-compat-doc"):
+        return
+    _write_compat_doc(Path(session.config.rootpath), session.config._compat_results)
+
+
+def _write_compat_doc(repo_root: Path, results: list[tuple[str, str, str]]) -> None:
+    from .helpers import CLIENT_PINS
+
+    doc_path = repo_root / "docs" / "COMPATIBILITY.md"
+    doc_path.parent.mkdir(parents=True, exist_ok=True)
+
+    by_cell = {
+        (client, feature): []
+        for client in COMPAT_CLIENTS
+        for feature in COMPAT_FEATURES
+    }
+    for client, feature, outcome in results:
+        by_cell[(client, feature)].append(outcome)
+
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    revision = _git_short_head(repo_root)
+
+    lines = [
+        "<!-- GENERATED \u2014 do not edit. Regenerate with `make compat`. -->",
+        "",
+        "# Client Compatibility",
+        "",
+        "Every populated cell is backed by an integration test that runs the real "
+        "client binary against a real pypiron server.",
+        "",
+        f"Generated: {generated_at}",
+        f"Revision: `{revision}`",
+        "",
+        "| Client | " + " | ".join(COMPAT_FEATURES) + " |",
+        "| --- | " + " | ".join("---" for _ in COMPAT_FEATURES) + " |",
+    ]
+
+    for client in COMPAT_CLIENTS:
+        cells = [_compat_cell(by_cell[(client, feature)]) for feature in COMPAT_FEATURES]
+        lines.append("| " + client + " | " + " | ".join(cells) + " |")
+
+    lines.extend(
+        [
+            "",
+            "Legend: \u274c known incompatibility / failing, \u2705 verified, "
+            "? not verified in this run, \u2014 not tested / not applicable.",
+            "",
+            "## Client Versions",
+            "",
+            "| Client | Version source |",
+            "| --- | --- |",
+        ]
+    )
+    for client in COMPAT_CLIENTS:
+        lines.append(f"| {client} | {_client_version_label(CLIENT_PINS[client])} |")
+
+    doc_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _compat_cell(outcomes: list[str]) -> str:
+    if not outcomes:
+        return "\u2014"
+    seen = set(outcomes)
+    for outcome in COMPAT_OUTCOME_PRECEDENCE:
+        if outcome in seen:
+            return COMPAT_OUTCOME_SYMBOLS[outcome]
+    return "\u2014"
+
+
+def _client_version_label(pin: str) -> str:
+    return COMPAT_VERSION_LABELS.get(pin, pin)
+
+
+def _git_short_head(repo_root: Path) -> str:
+    try:
+        cp = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return cp.stdout.strip() or "unknown"
 
 # ----------------------------- Basic path fixtures ----------------------------
 
@@ -110,7 +287,7 @@ def _start_disk_server(tmp_path_factory, bin_path: Path, extra_args=()) -> Itera
     ]
 
     env = os.environ.copy()
-    env.setdefault("RUST_LOG", "info")
+    env.setdefault("RUST_LOG", "info,pypiron=debug")
 
     # Logs go to a file: an undrained PIPE fills up and deadlocks the server.
     with open(log_path, "w") as log_file:
@@ -192,7 +369,7 @@ def disk_server_uploader_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[D
         "1",
     ]
     env = os.environ.copy()
-    env.setdefault("RUST_LOG", "info")
+    env.setdefault("RUST_LOG", "info,pypiron=debug")
     with open(log_path, "w") as log_file:
         proc = subprocess.Popen(args, env=env, stdout=log_file, stderr=subprocess.STDOUT)
         try:
@@ -306,7 +483,7 @@ def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
             "PYPIRON_ADMIN_PASS": "secret",
             "PYPIRON_UPLOADER_USER": "uploader",
             "PYPIRON_UPLOADER_PASS": "uploadersecret",
-            "RUST_LOG": "info",
+            "RUST_LOG": "info,pypiron=debug",
         }
     )
     return env
@@ -347,10 +524,10 @@ def s3_server(tmp_path_factory, pypiron_bin: Path, minio: Dict) -> Iterator[Dict
 
 @pytest.fixture()
 def s3_server_presigned(tmp_path_factory, pypiron_bin: Path, minio: Dict) -> Iterator[Dict]:
-    """S3-backed server that redirects artifact downloads to presigned URLs."""
+    """S3-backed server that redirects ALL artifact downloads to presigned URLs."""
     yield from _start_s3_server(
         tmp_path_factory,
         pypiron_bin,
         minio,
-        extra_env={"PYPIRON_S3_PRESIGNED_REDIRECTS": "true"},
+        extra_env={"PYPIRON_ARTIFACT_DELIVERY": "redirect"},
     )

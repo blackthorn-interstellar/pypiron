@@ -42,7 +42,10 @@ def _expected_version_at(cutoff: str) -> str:
     return str(max(candidates))
 
 
-def test_mirror_preserves_historical_timestamps(disk_server, pypiron_bin, tmp_path, uv_path, uv_venv):
+@pytest.mark.compat("uv", "exclude-newer")
+def test_mirror_preserves_historical_timestamps(
+    disk_server, pypiron_bin, tmp_path, uv_path, uv_venv
+):
     pkg_list = tmp_path / "packages.txt"
     pkg_list.write_text(f"{PACKAGE}\n")
 

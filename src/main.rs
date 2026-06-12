@@ -183,7 +183,9 @@ struct ServeArgs {
 
     /// Read credential username — when set, the simple indexes and artifact
     /// downloads require basic auth (this credential, the uploader, or the
-    /// admin all work). When unset, reads are public.
+    /// admin all work). When unset, reads are public. Usernames support
+    /// `+tag` subaddressing (e.g. `reader+billing-api`) for per-project
+    /// traffic attribution in /metrics and the request logs.
     #[arg(long, env = "PYPIRON_READ_USER")]
     read_user: Option<String>,
 
@@ -416,9 +418,21 @@ async fn shutdown_signal() {
 async fn log_requests(req: Request, next: Next) -> impl IntoResponse {
     let method = req.method().clone();
     let uri = req.uri().clone();
-    tracing::debug!("Incoming request: {} {}", method, uri);
+    let project = project_tag(req.headers());
+    tracing::debug!(
+        project = project.as_deref(),
+        "Incoming request: {} {}",
+        method,
+        uri
+    );
     let response = next.run(req).await;
-    tracing::debug!("Response status: {} {} {}", response.status(), method, uri);
+    tracing::debug!(
+        project = project.as_deref(),
+        "Response status: {} {} {}",
+        response.status(),
+        method,
+        uri
+    );
     response
 }
 
@@ -445,8 +459,17 @@ async fn track_metrics(
     next: Next,
 ) -> Response<Body> {
     let group = metrics::route_group(req.uri().path());
+    let project = project_tag(req.headers());
     let resp = next.run(req).await;
-    state.metrics.record_request(group, resp.status().as_u16());
+    let status = resp.status().as_u16();
+    state.metrics.record_request(group, status);
+    // Attribute traffic to the client's project tag — except on auth
+    // failures, where the tag never validated against anything.
+    if let Some(tag) = project {
+        if status != 401 && status != 403 {
+            state.metrics.record_project(&tag, group);
+        }
+    }
     resp
 }
 
@@ -1543,28 +1566,93 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCod
 }
 
 fn check_basic_auth(headers: &HeaderMap, user: &str, pass: &str) -> Result<()> {
-    let auth = headers
-        .get(header::AUTHORIZATION)
-        .ok_or_else(|| anyhow!("missing authorization"))?
-        .to_str()
-        .map_err(|_| anyhow!("bad header"))?;
-
-    let prefix = "Basic ";
-    if !auth.starts_with(prefix) {
-        return Err(anyhow!("not basic auth"));
-    }
-
-    let decoded = b64
-        .decode(auth.trim_start_matches(prefix))
-        .map_err(|_| anyhow!("bad base64"))?;
-    let s = String::from_utf8(decoded).map_err(|_| anyhow!("utf8"))?;
-    let mut parts = s.splitn(2, ':');
-    let u = parts.next().unwrap_or("");
-    let p = parts.next().unwrap_or("");
-
-    if u == user && p == pass {
+    let (u, p) = basic_credentials(headers).ok_or_else(|| anyhow!("missing basic auth"))?;
+    // Gmail-style subaddressing: `ci+billing-api` authenticates as `ci`; the
+    // suffix is a project attribution tag, not part of the identity.
+    let base = u.split_once('+').map_or(u.as_str(), |(b, _)| b);
+    if (u == user || base == user) && p == pass {
         Ok(())
     } else {
         Err(anyhow!("bad credentials"))
+    }
+}
+
+/// Decode the `Authorization: Basic` header into (username, password).
+/// None when absent or malformed — callers decide whether that matters.
+fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    let auth = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let encoded = auth.strip_prefix("Basic ")?;
+    let decoded = b64.decode(encoded).ok()?;
+    let s = String::from_utf8(decoded).ok()?;
+    let (u, p) = s.split_once(':').unwrap_or((s.as_str(), ""));
+    Some((u.to_string(), p.to_string()))
+}
+
+/// Project attribution tag from the Basic-auth username: the part after `+`
+/// (`ci+billing-api` → `billing-api`), or the whole username when untagged.
+/// Deliberately works without any credential check — open servers still get
+/// attribution from whatever username the client volunteers. The value is
+/// client-supplied, so it is held to a label-safe charset and length; anything
+/// else is dropped rather than escaped.
+fn project_tag(headers: &HeaderMap) -> Option<String> {
+    let (user, _) = basic_credentials(headers)?;
+    let tag = user.split_once('+').map_or(user.as_str(), |(_, t)| t);
+    let ok = !tag.is_empty()
+        && tag.len() <= 64
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    ok.then(|| tag.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn basic_headers(user: &str, pass: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        let v = format!("Basic {}", b64.encode(format!("{user}:{pass}")));
+        h.insert(header::AUTHORIZATION, HeaderValue::from_str(&v).unwrap());
+        h
+    }
+
+    #[test]
+    fn basic_auth_exact_match() {
+        assert!(check_basic_auth(&basic_headers("ci", "tok"), "ci", "tok").is_ok());
+        assert!(check_basic_auth(&basic_headers("ci", "nope"), "ci", "tok").is_err());
+        assert!(check_basic_auth(&basic_headers("other", "tok"), "ci", "tok").is_err());
+        assert!(check_basic_auth(&HeaderMap::new(), "ci", "tok").is_err());
+    }
+
+    #[test]
+    fn basic_auth_accepts_subaddressed_username() {
+        assert!(check_basic_auth(&basic_headers("ci+billing-api", "tok"), "ci", "tok").is_ok());
+        // The password still has to be right.
+        assert!(check_basic_auth(&basic_headers("ci+billing-api", "nope"), "ci", "tok").is_err());
+        // The base has to match exactly — no prefix matching.
+        assert!(check_basic_auth(&basic_headers("cif+billing-api", "tok"), "ci", "tok").is_err());
+        // A configured username containing '+' still matches itself exactly.
+        assert!(check_basic_auth(&basic_headers("ci+team", "tok"), "ci+team", "tok").is_ok());
+    }
+
+    #[test]
+    fn project_tag_extraction() {
+        assert_eq!(
+            project_tag(&basic_headers("ci+billing-api", "tok")).as_deref(),
+            Some("billing-api")
+        );
+        // Untagged username: the username itself is the attribution.
+        assert_eq!(
+            project_tag(&basic_headers("etl", "tok")).as_deref(),
+            Some("etl")
+        );
+        // No credentials, empty tags, oversized or label-unsafe tags: dropped.
+        assert_eq!(project_tag(&HeaderMap::new()), None);
+        assert_eq!(project_tag(&basic_headers("ci+", "tok")), None);
+        assert_eq!(project_tag(&basic_headers("ci+bad\"label", "tok")), None);
+        assert_eq!(
+            project_tag(&basic_headers(&format!("ci+{}", "x".repeat(65)), "tok")),
+            None
+        );
     }
 }

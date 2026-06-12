@@ -210,6 +210,24 @@ probes and scrapers), and clients embed it the usual way:
 pip install --index-url http://reader:secret@localhost:8080/simple/ mypackage
 ```
 
+### Per-project traffic attribution
+
+Usernames support Gmail-style subaddressing: `reader+billing-api`
+authenticates as `reader` (the password is still required), and
+`billing-api` is recorded as a project tag — per-tag request counts show up
+in `/metrics` as `pypiron_project_requests_total{project=...,route=...}`
+and in the debug request logs. With uv:
+
+```bash
+export UV_INDEX_COMPANY_USERNAME="reader+billing-api"
+export UV_INDEX_COMPANY_PASSWORD="secret"
+```
+
+This works on open servers too: with no read credential configured, any
+volunteered username is parsed for attribution and the password is ignored.
+Tag cardinality in `/metrics` is capped (overflow lands in `_overflow`),
+and tags are restricted to `[A-Za-z0-9._-]`, max 64 chars.
+
 ## Running with Docker
 
 ```bash

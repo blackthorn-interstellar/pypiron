@@ -5,12 +5,21 @@
 //! by route group and status class — low cardinality on purpose (per-package
 //! labels would make the scrape payload scale with the registry).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Route groups, by path prefix. Order matches the counter matrix.
 const ROUTES: [&str; 6] = ["simple", "files", "legacy", "health", "metrics", "other"];
 /// Status classes. Order matches the counter matrix.
 const STATUS_CLASSES: [&str; 4] = ["2xx", "3xx", "4xx", "5xx"];
+
+/// Cap on distinct project attribution tags. Tags are client-supplied
+/// (basic-auth username subaddresses), so without a cap a hostile or
+/// misconfigured client could grow the scrape payload without bound.
+/// Past the cap, new tags land in [`OVERFLOW_TAG`].
+const MAX_PROJECT_TAGS: usize = 256;
+const OVERFLOW_TAG: &str = "_overflow";
 
 /// Index into [`ROUTES`] for a request path.
 pub fn route_group(path: &str) -> usize {
@@ -42,6 +51,10 @@ pub struct Metrics {
     /// Upstream artifacts downloaded and committed to storage (proxy mode).
     pub proxy_artifacts_cached: AtomicU64,
     pub proxy_artifact_errors: AtomicU64,
+    /// requests by project attribution tag and route group. A mutex, not
+    /// atomics: only requests that carry credentials touch it, and the
+    /// critical section is one map bump.
+    project_requests: Mutex<HashMap<String, [u64; ROUTES.len()]>>,
 }
 
 impl Metrics {
@@ -54,7 +67,27 @@ impl Metrics {
             proxy_listing_errors: AtomicU64::new(0),
             proxy_artifacts_cached: AtomicU64::new(0),
             proxy_artifact_errors: AtomicU64::new(0),
+            project_requests: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Count a request against a project attribution tag. The tag must
+    /// already be sanitized (label-safe charset) by the caller.
+    pub fn record_project(&self, tag: &str, route: usize) {
+        let mut map = self
+            .project_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(counts) = map.get_mut(tag) {
+            counts[route] += 1;
+            return;
+        }
+        let key = if map.len() < MAX_PROJECT_TAGS {
+            tag
+        } else {
+            OVERFLOW_TAG
+        };
+        map.entry(key.to_string()).or_insert([0; ROUTES.len()])[route] += 1;
     }
 
     pub fn record_request(&self, route: usize, status: u16) {
@@ -117,6 +150,26 @@ impl Metrics {
             out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
             out.push_str(&format!("{name} {}\n", value.load(Ordering::Relaxed)));
         }
+        let map = self
+            .project_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !map.is_empty() {
+            out.push_str("# HELP pypiron_project_requests_total Requests by client project tag (basic-auth username subaddress) and route group.\n");
+            out.push_str("# TYPE pypiron_project_requests_total counter\n");
+            let mut tags: Vec<&String> = map.keys().collect();
+            tags.sort();
+            for tag in tags {
+                for (r, route) in ROUTES.iter().enumerate() {
+                    let v = map[tag][r];
+                    if v > 0 {
+                        out.push_str(&format!(
+                            "pypiron_project_requests_total{{project=\"{tag}\",route=\"{route}\"}} {v}\n"
+                        ));
+                    }
+                }
+            }
+        }
         out
     }
 }
@@ -153,5 +206,45 @@ mod tests {
         assert!(text.contains("pypiron_http_requests_total{route=\"simple\",status=\"4xx\"} 1"));
         assert!(text.contains("pypiron_proxy_artifacts_cached_total 3"));
         assert!(text.contains("# TYPE pypiron_http_requests_total counter"));
+        // No project traffic recorded: the family is omitted entirely.
+        assert!(!text.contains("pypiron_project_requests_total"));
+    }
+
+    #[test]
+    fn records_project_attribution() {
+        let m = Metrics::new();
+        m.record_project("billing-api", route_group("/simple/"));
+        m.record_project("billing-api", route_group("/simple/"));
+        m.record_project("billing-api", route_group("/files/six/six.whl"));
+        m.record_project("etl", route_group("/simple/"));
+        let text = m.render();
+        assert!(text.contains(
+            "pypiron_project_requests_total{project=\"billing-api\",route=\"simple\"} 2"
+        ));
+        assert!(text
+            .contains("pypiron_project_requests_total{project=\"billing-api\",route=\"files\"} 1"));
+        assert!(text.contains("pypiron_project_requests_total{project=\"etl\",route=\"simple\"} 1"));
+        // Zero cells are omitted.
+        assert!(!text.contains("project=\"etl\",route=\"files\""));
+    }
+
+    #[test]
+    fn project_tags_cap_into_overflow() {
+        let m = Metrics::new();
+        for i in 0..MAX_PROJECT_TAGS {
+            m.record_project(&format!("tag{i}"), 0);
+        }
+        m.record_project("one-too-many", 0);
+        m.record_project("and-another", 0);
+        // Known tags still count past the cap.
+        m.record_project("tag0", 0);
+        let text = m.render();
+        assert!(!text.contains("one-too-many"));
+        assert!(!text.contains("and-another"));
+        assert!(text
+            .contains("pypiron_project_requests_total{project=\"_overflow\",route=\"simple\"} 2"));
+        assert!(
+            text.contains("pypiron_project_requests_total{project=\"tag0\",route=\"simple\"} 2")
+        );
     }
 }

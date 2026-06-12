@@ -73,16 +73,6 @@ track the same scenarios comparatively.
 | R6 | Artifact download, S3 presigned 302 | 10k rps | **≥50k rps redirects, server CPU < 25%** |
 | R7 | PEP 658 `.metadata` fetch storm (uv resolving = index + N metadata files) | 10k rps | **≥60k rps** |
 
-Predicted finding: R1–R4 on the S3 backend currently do one S3 GET + full
-SHA-256 *per request* (`serve_index`), which caps S3-backed index reads at
-S3's per-prefix rate (~5.5k GET/s) and ~15 ms floor latency, and caps R2 at
-hash throughput (~2 GB/s/core). The fix ladder, cheapest first:
-store the ETag at rebuild time instead of hashing per request → short-circuit
-`If-None-Match` before fetching the body → in-memory index cache (bytes +
-ETag, invalidated by rebuild) → precompressed gzip variants. After the cache,
-index reads are RAM-bound and the S3 backend serves reads at disk-backend
-speed. That single change is most of the brag sheet.
-
 ### Tier 2 — the write path (the hard ones)
 
 | ID | Scenario | Floor | Brag target |
@@ -92,12 +82,6 @@ speed. That single change is most of the brag sheet.
 | W3 | Upload→visible latency (200 → file in index), 1 s worker tick | p99 < 10 s | **p99 < 2.5 s** |
 | W4 | Sync-upload mode (`--sync-uploads`) round trip | < timeout | **S3 p99 < 3 s, zero publish-then-install failures across 1k cycles** |
 | W5 | Sustained small uploads, 1k distinct pkgs, 10 uploads/s for 10 min | worker keeps up | **dirty-queue depth bounded; visibility p99 flat over the run** |
-
-Predicted finding: W1/W2 currently buffer the whole multipart field in memory
-behind a 1 GiB `DefaultBodyLimit` — W1's RSS target will fail until uploads
-stream to a temp object with incremental hashing. (Also: PyPI's own per-file
-cap is 1 GiB; private registries hold *bigger* artifacts, so the cap becomes
-config and W1 gets a 5 GB variant once streaming lands.)
 
 ### Tier 3 — scale (very large S3 index)
 
@@ -134,27 +118,6 @@ fifteen years of packaging sins find our edge cases for us.
 | M3 | HTTP-push mode (`--to`) vs direct-to-storage | works | **within 25% of direct** once server uploads stream (W1) |
 | M4 | Incremental re-sync of a full mirror (the freshness cost) | < 4 h | **daily delta < 30 min** |
 | M5 | **The full clone**: every package on PyPI (~620k projects, ~14M files, ~35 TB) | completes with a bounded, categorized failure list | **< 24 h wall clock; zero crashes; every refusal becomes a test fixture** |
-
-Predicted findings, from reading `sync.rs` (sync.rs:325):
-
-- **Packages are synced sequentially** — `--concurrency` only parallelizes
-  files *within* one package (`buffer_unordered`). The long tail of PyPI is
-  hundreds of thousands of 2-file packages, so M1/M5 are gated on per-package
-  round-trip latency until package-level parallelism lands. That's the first
-  fix this tier forces.
-- **No size filter.** ~90% of PyPI's bytes live in <1% of files (CUDA wheels,
-  nightlies). A `--max-file-size` filter makes a *full-namespace* clone
-  possible at ~1/5 the bytes — same filename/metadata edge-case coverage,
-  fraction of the cost — so the capped clone runs first, the uncapped clone is
-  the final flex.
-- **Resume = re-walk.** A clone that dies at package 400k re-checks everything
-  from zero (existence checks make the re-run incremental, but the walk itself
-  is M4's number). If re-walk is too slow, that motivates PyPI
-  changelog-serial support (what bandersnatch uses) — a feature decision the
-  benchmark gets to force, not us guessing.
-- **HTTP mode buffers each file in RAM** (`Part::bytes`, sync.rs:428) and hits
-  the server's 1 GiB body cap; direct-to-storage mode bypasses both. M3 will
-  quantify the gap.
 
 The edge-case harvest is the real payoff of M5. Expected catch, all of which
 becomes regression fixtures: pre-PEP-625 sdists whose versions can't be
@@ -221,63 +184,6 @@ scoped IAM user (EC2 + one bucket), never account root.
   while it lives. Reconcile sweeps over 3M objects cost ~$0.02 in LISTs —
   measure and print actual request counts per run (S6 and M5 double as the
   S3-bill benchmark).
-
-## The ramp
-
-Each phase gates the next; optimize at the cheapest phase that exposes the
-problem. Never rent a 100 Gbps NIC to discover a per-request `format!`.
-
-**Phase 0 — laptop + MinIO, $0 (build the harness).**
-`bench/` directory: corpus generator, `oha` wrappers emitting one JSON line per
-run (scenario, commit, hardware, rps, p50/95/99, server peak RSS + CPU),
-results appended to `docs/BENCHMARK_RESULTS.md`. Run R1–R7 and W1–W3 against
-MinIO, plus S1/S2 at `medium` scale. MinIO latency ≠ S3 latency — local
-numbers are comparative only, but **storage op counts per scenario are
-hardware-independent truth**, so the harness logs them from day one. Expected
-immediate findings: an S3 GET + full SHA-256 per index read, upload
-buffering. No `src/` changes in this phase.
-
-**Phase 0.5 — reference-rig baseline #0, ~$1 (before touching anything).**
-The moment the harness runs, stand up the reference rig and record the meter
-suite against the *current, unoptimized* code. This is non-negotiable
-sequencing: every optimization from here on gets its before/after on the
-customer box, and the full series tells the story from day one.
-
-**Phase 1 — the optimization loop, $0 plus ~$1 per meter run.**
-Now the fixes, cheapest first: ETag stored at rebuild time, `If-None-Match`
-short-circuit, in-memory index cache, streaming uploads. Iterate against
-MinIO (op counts prove each fix structurally), one reference-rig meter run
-per landed change. Most of the brag sheet gets earned here, on the smallest
-hardware in the plan.
-
-**Phase 2 — AWS + S3, ~$10 (the brag box).**
-`c7gn.2xlarge` + same-region S3, oversized loadgen. Full Tier 1 + Tier 2 —
-the first publishable absolute numbers.
-
-**Phase 3 — AWS + real S3 at scale, ~$25 (the hard scenarios).**
-Seed `medium`, then `large`. Tier 3, plus sync throughput
-(M1–M3, against a few thousand real PyPI packages — this is where the
-sequential-package-loop fix gets its before/after). The two marquee questions
-land here: torch-class uploads (W1/W2) and index updates against a very large
-S3 corpus (S2/S3/S4). Re-run after each optimization; the before/after pairs
-are the changelog.
-
-**Phase 4 — AWS, the absurd, ~$50 (the demo).**
-The R5 proxy-throughput ceiling on a `c7gn.8xlarge`, the Black Friday hour (C1), CI stampede
-(C3), beat-pypi.org (C2), leader-kill (C4), and the synthetic `pypi-mirror`
-suite (S6). Output: a results table at the top of the README with commit,
-instance type, and date on every number.
-
-**Phase 5 — the full clone, ~$300–500 (the fuzzer finale).**
-M5 in two passes: first the full-namespace clone capped at 100 MB/file (every
-project, every weird filename, ~1/5 the bytes), harvest and fix the edge
-cases; then the uncapped ~35 TB clone with M4's re-sync keeping it fresh.
-Re-run the read and scale suites (R, S2–S5) against `pypi-real` — absolute
-numbers on the genuine article, not a synthetic shape. Cost is dominated by
-S3: ~50M PUTs ≈ $250 one-time, ~35 TB ≈ $27/day stored — run the suite within
-the week, keep the results, delete the bucket. The brag at the end: *we are a
-working PyPI mirror, cloned in under a day, serving reads faster than the
-original.*
 
 ## Deliverables
 

@@ -1,117 +1,106 @@
 # <img src="docs/pypiron-logo-256.png" alt="PypIron logo" width="40" style="vertical-align: middle;"/> PypIron
 
-An ultra-fast, reliable, standards-compliant PyPI server for private registries
-that only serves static files. No database.
+[![CI](https://github.com/brycedrennan/pypiron/actions/workflows/ci.yml/badge.svg)](https://github.com/brycedrennan/pypiron/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/pypiron.svg)](https://pypi.org/project/pypiron/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Scope:** ruthlessly minimal, production-friendly.
-**Backends:** local **disk** (default) or **S3/S3-compatible**.
-**APIs:** PEP 503 (HTML) + PEP 691/700 (JSON), PEP 592 yank, PEP 658/714 metadata.
-**Uploads:** legacy endpoint (`/legacy/`), compatible with `uv publish` and `twine`.
+An ultra-fast PyPI server written in Rust. 
 
 The design is a static site generator wearing a PyPI costume: truth lives in
 the packages tree (immutable artifacts plus write-time metadata sidecars), and
-the simple index is a materialized view, idempotently regenerable from a
-storage listing. See [docs/DESIGN.md](docs/DESIGN.md) for the full reasoning.
+the simple index is a materialized view, idempotently regenerable from a storage
+listing. That one decision is where the speed, the self-healing, and the
+rsync-it-and-you're-done backups all come from. See
+[docs/DESIGN.md](docs/DESIGN.md) for the full reasoning.
 
 ## Performance
 
-Real measurements on real AWS hardware with the S3 backend — the setup
-people actually deploy. The small server costs about **$12/month**; the
-large one is a standard 8-CPU machine.
+Real measurements on real AWS hardware with the S3 backend — the setup people
+actually deploy. The small server costs about **$12/month**; the large one is a
+standard 8-CPU machine.
 
 | | $12/month server (2 CPUs) | 8-CPU server |
 |---|---|---|
-| Requests answered per second (package lookups, update checks, download links) | **~75,000** | **~440,000** |
-| How fast each request finishes | almost all in under 2 ms | almost all in under 5 ms |
-| Browsing a giant package (PyTorch-sized: 2,000 versions) | 4,300 pages/second | 27,000 pages/second |
-| Publishing a package → installable by everyone | about **0.7 seconds** | about 1 second, even with 10,000 packages hosted |
-| Uploading a 900 MB wheel (PyTorch-sized) | 15–20 seconds, using only ~50 MB of memory | eight simultaneous uploads, all succeed — and installs stay fast the whole time |
-| Serving wheel downloads through the server | 3.9 gigabits/second | 48 gigabits/second |
+| Requests answered per second | **~75,000** | **~440,000** |
+| Request latency | almost all under 2 ms | almost all under 5 ms |
+| Publish → installable by everyone | about **0.7 s** | about 1 s, even with 10,000 packages hosted |
+| 900 MB wheel upload (PyTorch-sized) | 15–20 s, ~50 MB of memory | 8 simultaneous, all succeed, reads stay fast |
+| Wheel download throughput | 3.9 Gbit/s | 48 Gbit/s |
 
-In both cases the server code isn't the limit — the small machine runs out
-of network and CPU, and the large one was still answering 440,000 requests
-per second when our 64-CPU load generator was loafing at 8%. Background
-maintenance (the self-healing sweep) runs without readers noticing, and
-mirroring packages down from PyPI runs at over 100 files per second.
+The server code isn't the limit in either case — the small machine runs out of
+network and CPU, and the large one was still answering 440,000 requests per
+second while our 64-CPU load generator loafed at 8%. Every number is a logged,
+repeatable run — commit, hardware, and method included — in
+[docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md).
 
-Every number above comes from a logged, repeatable benchmark run — commit,
-hardware, and method included — in
-[docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md). For contrast: when
-benchmarking began, the $12 server managed 2,000 requests per second, took
-58 seconds to make a new upload installable, and crashed outright on a
-single PyTorch-sized upload. The full fix-by-fix path from there to here is
-the [improvements log](docs/BENCHMARK_RESULTS.md#improvements-log).
+## Highlights
 
-## Getting Started
+- 🚀 **Ultra-fast static-file core** — no database, no dynamic island; one binary.
+- 💾 **Disk or S3 backend** — disk by default (zero deps), S3/S3-compatible for scale and multi-node.
+- 📦 **Standards-complete** — PEP 503 (HTML) + PEP 691/700 (JSON), PEP 658/714 metadata, PEP 592 yank, `requires-python`, `--exclude-newer`.
+- ⬆️ **Works with your tools** — `uv publish`, `twine`, `pip`, `poetry`, `pdm` upload and install against it unmodified.
+- 🔁 **Mirror PyPI** — `pypiron sync` (explicit allowlist) or `--proxy-upstream` (cache-on-use), carrying PyPI's true upload times so `--exclude-newer` stays historically correct.
+- 🛡️ **Dependency-confusion defense** — every package is exclusively `private` or `mirror`, claimed at first write; optional reserved namespace prefix.
+- 🩹 **Self-healing** — crash-safe event markers keep indexes fresh; a cheap fingerprint audit catches out-of-band storage changes; `pypiron verify`/`resync` recompute the world on demand.
+- 🔒 **Optional auth** — admin / uploader / reader basic-auth credentials; read-only by default when none are set.
+- 📈 **Boring observability** — `/health`, Prometheus `/metrics`, `--log-format json`.
+
+## Installation
 
 ```bash
-uvx pypiron   # runs pypiron locally; stores data under ~/.pypiron/packages
+uvx pypiron            # run without installing; data under ~/.pypiron/packages
 ```
 
-### Quick smoke test (disk backend)
+```bash
+pip install pypiron    # or install it
+```
+
+```bash
+docker run --rm -it -p 8080:8080 \
+  -e PYPIRON_ADMIN_USER=admin -e PYPIRON_ADMIN_PASS=secret \
+  pypiron:latest
+```
+
+## Documentation
+
+- [VISION.md](docs/VISION.md) — the one-page version
+- [DESIGN.md](docs/DESIGN.md) — architecture and reasoning
+- [STANDARDS.md](docs/STANDARDS.md) — PEP support matrix
+- [COMPATIBILITY.md](docs/COMPATIBILITY.md) — generated client compatibility matrix
+- [TESTING.md](docs/TESTING.md) — blackbox-first test philosophy
+- [ROADMAP.md](docs/ROADMAP.md) — features shipped, planned, and rejected
+- [BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) — measured numbers, scale, and the improvements log
+
+## Quickstart
 
 ```bash
 # Start PypIron (basic auth required for uploads)
-PYPIRON_ADMIN_USER=admin \
-PYPIRON_ADMIN_PASS=secret \
-uvx pypiron
+PYPIRON_ADMIN_USER=admin PYPIRON_ADMIN_PASS=secret uvx pypiron
 
-# Upload an artifact with uv:
+# Publish an artifact
 uv publish --publish-url http://localhost:8080/legacy/ \
-  --username admin --password secret \
-  path/to/demo-0.1.0-py3-none-any.whl
+  --username admin --password secret dist/*.whl
 
-# Browse indexes:
+# Install it (point clients at this registry only — see the FAQ)
+pip install --index-url http://localhost:8080/simple/ mypackage
+
+# Browse the indexes
 open http://localhost:8080/simple/
 ```
 
-## Features
+`twine upload --repository-url http://localhost:8080/legacy/ -u admin -p secret dist/*`
+works identically.
 
-* **Disk-backed** storage (default) — zero external deps
-* **S3-backed** storage (AWS S3 and S3-compatible), with client-aware
-  artifact delivery: presigned redirects for clients that tolerate them (uv),
-  streamed bytes for clients whose caches don't (pip)
-* No database — truth is files, views are regenerable, backups are rsync
-* PEP 503 (HTML) and PEP 691 (JSON) with PEP 700 fields — `uv
-  --exclude-newer` works, including on mirrored packages
-* PEP 658/714: wheel `METADATA` served as a static companion, so resolvers
-  never download wheels just to read dependencies
-* PEP 592 yank, plus deletion, with cache-correct index rebuilds
-* Filename immutability (the pypi.org rule): artifacts are served
-  `Cache-Control: immutable`, indexes revalidate with ETags
-* Dependency-confusion defense: every package is exclusively `private` or
-  `mirror`, claimed at first write; optional reserved namespace prefix
-* Self-healing: crash-safe event markers keep indexes fresh (proven by a
-  crash-point fault-injection suite), a cheap fingerprint audit catches
-  out-of-band storage changes, and `pypiron verify`/`resync` recompute the
-  world on demand
-* Multi-node on S3 via a sloppy leader lease (conditional writes, TTL)
-* Optional synchronous uploads for publish-then-install CI pipelines
-* **On-demand PyPI proxying** (opt-in): one URL for private packages plus
-  transparently cached public dependencies, origin-checked end to end
-* Optional **read authentication** (`--read-user`/`--read-pass`) — make the
-  registry actually private, not just unguessable
-* Boring observability: `/health`, Prometheus `/metrics`, `--log-format json`
-
-## Mirroring packages with `pypiron sync`
+## Mirroring with `pypiron sync`
 
 The recommended mode mirrors **over HTTP**: sync needs only the server URL and
-the admin credential — no storage credentials, no knowledge of the server's
-backend. It carries PyPI's true upload timestamps, so `--exclude-newer`
-resolves historically correct versions against your mirror. Mirroring is an
-**admin** operation: PypIron has two roles — uploader (publish) and admin
-(everything, including mirror, delete, and yank) — so ordinary uploaders
-cannot backdate packages.
-
-```text
-# packages.txt — one entry per line; PEP 440 specifiers are optional
-requests>=2.20,<3
-numpy
-six==1.16.0
-```
+the admin credential — no storage credentials, no knowledge of the backend. It
+carries PyPI's true upload timestamps, so `--exclude-newer` resolves
+historically correct versions against your mirror. Mirroring is an **admin**
+operation, so ordinary uploaders cannot backdate packages.
 
 ```bash
-# Server side: two roles — uploader publishes, admin can also mirror
+# Server: two roles — uploader publishes, admin can also mirror/delete/yank
 pypiron --uploader-user dev --uploader-pass devsecret \
   --admin-user admin --admin-pass adminsecret
 
@@ -124,18 +113,19 @@ pypiron sync --packages-list packages.txt --data-dir ~/.pypiron/packages
 pypiron sync --packages-list packages.txt --storage s3 --s3-bucket my-bucket
 ```
 
-**Filters** (gate only what a run *adds* — already-mirrored files are never
-removed):
+```text
+# packages.txt — one entry per line; PEP 440 specifiers optional
+requests>=2.20,<3
+numpy
+six==1.16.0
+```
 
-* `--only-wheels` / `--only-sdists`
-* `--python-tag py3,cp311` — python tag(s)
-* `--abi-tag none,cp311` — ABI tag(s)
-* `--platform-tag any,manylinux2014_x86_64,macosx_*_arm64` — platform tag(s), `*` wildcard
-* `--exclude-platform-tag` — exclusions (supports `*`)
-* `--exclude-newer 2024-01-01T00:00:00Z` — only files PyPI received before then
-* `--exclude-older 2020-01-01T00:00:00Z` — only files received since then
+**Filters** gate only what a run *adds* (already-mirrored files are never
+removed): `--only-wheels` / `--only-sdists`, `--python-tag`, `--abi-tag`,
+`--platform-tag` (with `*` wildcard) and `--exclude-platform-tag`,
+`--exclude-newer` / `--exclude-older` upload-time bounds.
 
-**Configuration file**: every sync option also lives in `pypiron.toml`
+**Config file:** every sync option also lives in `pypiron.toml`
 (auto-discovered in the working directory, or `--config <path>`), layered as
 CLI/env > file > defaults:
 
@@ -150,13 +140,10 @@ exclude-newer = "2026-01-01T00:00:00Z"
 concurrency = 8
 ```
 
-A `packages-list` path in the file resolves relative to the config file, not
-the working directory. An explicit `--packages-list` on the CLI replaces the
-file's list entirely; other options layer per-key.
-
-Mirrored names are claimed `mirror`-origin; names already claimed by private
-uploads (or inside `--private-prefix`) are refused outright. Only the admin
-credential can mirror — backdating never rides along on the uploader credential.
+A `packages-list` path in the file resolves relative to the config file. An
+explicit `--packages-list` on the CLI replaces the file's list entirely; other
+options layer per-key. Mirrored names are claimed `mirror`-origin; names already
+claimed `private` (or inside `--private-prefix`) are refused outright.
 
 ## On-demand proxying (cached public PyPI)
 
@@ -171,25 +158,39 @@ pypiron --admin-user admin --admin-pass secret \
   --proxy-upstream https://pypi.org
 ```
 
-* Package pages are answered from the upstream PEP 691 listing (cached for
-  60 s), carrying PyPI's true upload times — `--exclude-newer` stays
-  historically correct. Artifacts are downloaded on first GET, verified
-  against the upstream sha256, and committed as ordinary `mirror`-origin
-  files; from then on they serve locally, upstream up or down.
-* The origin rules are the same as `sync`: names claimed `private` (or inside
+- Package pages come from the upstream PEP 691 listing (cached 60 s), carrying
+  PyPI's true upload times. Artifacts download on first GET, are verified
+  against the upstream sha256, and commit as ordinary `mirror`-origin files;
+  from then on they serve locally, upstream up or down.
+- The origin rules match `sync`: names claimed `private` (or inside
   `--private-prefix`) **never** fall through to upstream. Run the proxy with
-  `--private-prefix` — without it, a new private name and the public name
-  race for first claim.
-* The same filters as `sync` gate what the proxy serves and caches, under a
-  `--proxy-` prefix: `--proxy-only-wheels`, `--proxy-only-sdists`,
-  `--proxy-python-tag`, `--proxy-abi-tag`, `--proxy-platform-tag`,
-  `--proxy-exclude-platform-tag`, `--proxy-exclude-newer`,
-  `--proxy-exclude-older`.
-* The global `/simple/` index lists local packages only (nobody pages through
-  all of PyPI); package URLs resolve regardless.
-* If upstream is unreachable, proxied pages fall back to the local
-  materialized index: everything already cached keeps resolving and
-  installing.
+  `--private-prefix` — without it, a new private name and the public name race
+  for first claim.
+- The same filters as `sync` apply under a `--proxy-` prefix
+  (`--proxy-only-wheels`, `--proxy-exclude-newer`, …).
+- The global `/simple/` index lists local packages only; package URLs resolve
+  regardless. If upstream is unreachable, proxied pages fall back to the local
+  materialized index, so everything already cached keeps installing.
+
+## S3 backend
+
+```bash
+docker run --rm -it -p 8080:8080 \
+  -e PYPIRON_STORAGE=s3 \
+  -e PYPIRON_S3_BUCKET=my-bucket \
+  -e PYPIRON_ADMIN_USER=admin -e PYPIRON_ADMIN_PASS=secret \
+  -e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... -e AWS_REGION=us-east-1 \
+  pypiron:latest
+```
+
+On S3, artifact delivery is client-aware: presigned redirects for clients whose
+caches tolerate them (uv), streamed bytes for clients whose caches don't (pip).
+Multi-node runs on a sloppy leader lease (conditional writes, TTL). See
+[Artifact delivery](#artifact-delivery) below.
+
+**Large uploads:** the upload spool defaults to the system temp dir. In
+containers where `/tmp` is RAM-backed tmpfs, point it at real disk or multi-GB
+wheels spool into memory: `-v /data/spool:/spool -e PYPIRON_SPOOL_DIR=/spool`.
 
 ## Authentication
 
@@ -202,87 +203,31 @@ reader:
 | uploader | `--uploader-user`/`--uploader-pass` | publish ordinary uploads |
 | read | `--read-user`/`--read-pass` | read indexes and artifacts |
 
-With **no write credential** configured the server is **read-only** — open
-unauthenticated writes don't exist. With no read credential, reads are
-public. When `--read-user` is set, `/simple/` and `/files/` require auth
-(any of the three credentials works; `/health` and `/metrics` stay open for
-probes and scrapers), and clients embed it the usual way:
+With **no write credential** the server is **read-only** — open unauthenticated
+writes don't exist. With no read credential, reads are public. When
+`--read-user` is set, `/simple/` and `/files/` require auth (any of the three
+credentials works; `/health` and `/metrics` stay open for probes):
 
 ```bash
 pip install --index-url http://reader:secret@localhost:8080/simple/ mypackage
 ```
 
-### Per-project traffic attribution
-
-Usernames support Gmail-style subaddressing: `reader+billing-api`
-authenticates as `reader` (the password is still required), and
-`billing-api` is recorded as a project tag — per-tag request counts show up
-in `/metrics` as `pypiron_project_requests_total{project=...,route=...}`
-and in the debug request logs. With uv:
+**Per-project traffic attribution:** usernames support Gmail-style
+subaddressing. `reader+billing-api` authenticates as `reader` (password still
+required) and records `billing-api` as a project tag — per-tag counts show up in
+`/metrics` as `pypiron_project_requests_total{project=...,route=...}`. Works on
+open servers too (any volunteered username is parsed; the password is ignored).
+Tag cardinality is capped (overflow → `_overflow`); tags are `[A-Za-z0-9._-]`,
+max 64 chars.
 
 ```bash
 export UV_INDEX_COMPANY_USERNAME="reader+billing-api"
 export UV_INDEX_COMPANY_PASSWORD="secret"
 ```
 
-This works on open servers too: with no read credential configured, any
-volunteered username is parsed for attribution and the password is ignored.
-Tag cardinality in `/metrics` is capped (overflow lands in `_overflow`),
-and tags are restricted to `[A-Za-z0-9._-]`, max 64 chars.
-
-## Running with Docker
-
-```bash
-docker run --rm -it -p 8080:8080 \
-  -e PYPIRON_ADMIN_USER=admin \
-  -e PYPIRON_ADMIN_PASS=<mypassword> \
-  pypiron:latest
-```
-
-### Switch to S3 backend (Docker)
-
-```bash
-docker run --rm -it -p 8080:8080 \
-  -e PYPIRON_STORAGE=s3 \
-  -e PYPIRON_S3_BUCKET=<my_bucket_name> \
-  -e PYPIRON_ADMIN_USER=admin \
-  -e PYPIRON_ADMIN_PASS=<mypassword> \
-  -e AWS_ACCESS_KEY_ID=<my_access_key> \
-  -e AWS_SECRET_ACCESS_KEY=<my_secret_key> \
-  -e AWS_REGION=us-east-1 \
-  pypiron:latest
-```
-
-**Large uploads:** the upload spool defaults to the system temp dir. In
-containers (and distros) where `/tmp` is a RAM-backed tmpfs, point it at real
-disk or multi-GB wheels spool into memory:
-`-v /data/spool:/spool -e PYPIRON_SPOOL_DIR=/spool`.
-
-## Using with pip / uv / twine
-
-```bash
-# Install from your server
-pip install --index-url http://localhost:8080/simple/ mypackage
-
-# Upload with uv
-uv publish --publish-url http://localhost:8080/legacy/ \
-  --username admin --password mypassword dist/*.whl
-
-# Upload with twine
-twine upload --repository-url http://localhost:8080/legacy/ \
-  -u admin -p mypassword dist/*
-```
-
-Point clients at this registry **only** (`--index-url`, never
-`--extra-index-url https://pypi.org/simple` — that reopens the
-dependency-confusion hole the origin system closes). Need public packages
-too? That's what `--proxy-upstream` and `pypiron sync` are for — the same
-single URL, origin-checked.
-
 ## Management API
 
-Deletion and yank are **admin** operations — authenticate with the admin
-credential.
+Deletion and yank are **admin** operations.
 
 ```bash
 # Delete a file (index first, then artifact — clients never see a broken link)
@@ -337,21 +282,17 @@ All options are available via CLI args and/or environment variables.
 
 ### Operations
 
-* `GET /health` — `200 {"status":"ok"}` when storage answers a probe, `503`
+- `GET /health` — `200 {"status":"ok"}` when storage answers a probe, `503`
   otherwise. Unauthenticated; point your load balancer at it.
-* `GET /metrics` — Prometheus text: requests by route group and status class,
-  index rebuilds, reconcile sweeps, proxy fetch/cache counters.
-  Unauthenticated. Audit + leader-election machinery is observable too:
-  `pypiron_audit_packages_rebuilt_total` / `pypiron_audit_packages_skipped_total`
-  (fingerprint hits — a high skip ratio means the daily audit is cheap),
-  `pypiron_audit_last_duration_seconds` (gauge, last completed pass),
-  `pypiron_global_cas_conflicts_total` (two nodes raced the name set and the
-  loser reloaded — dual leadership converging, not corrupting), and
-  `pypiron_stale_intents_healed_total` (unpaired intents consumed past the
-  grace period — a rising rate means writers are crashing mid-upload).
-* Logs go to stdout via `tracing`; `--log-format json` emits one JSON object
-  per line for log pipelines. Per-request logging is at `debug`
-  (`RUST_LOG=pypiron=debug`) so the access log never becomes the workload.
+- `GET /metrics` — Prometheus text: requests by route group and status class,
+  index rebuilds, reconcile sweeps, proxy fetch/cache counters, plus audit and
+  leader-election machinery (`pypiron_audit_packages_rebuilt_total` /
+  `_skipped_total`, `pypiron_audit_last_duration_seconds`,
+  `pypiron_global_cas_conflicts_total`, `pypiron_stale_intents_healed_total`).
+  Unauthenticated.
+- Logs go to stdout via `tracing`; `--log-format json` emits one JSON object per
+  line. Per-request logging is at `debug` (`RUST_LOG=pypiron=debug`) so the
+  access log never becomes the workload.
 
 ### Artifact delivery
 
@@ -365,26 +306,20 @@ that's what ends up in lockfiles and client caches, and it never expires.
 | `redirect` | Always 302 to a presigned S3 URL — the node never touches wheel bytes    |
 | `stream`   | Always proxy bytes through the node with immutable cache headers         |
 
-The tradeoff: a presigned redirect moves the megabytes to S3, but each
-response carries a freshly signed URL. Clients whose download caches are
-keyed by the URL that served the bytes — pip's HTTP cache — can never get a
-hit on such a URL, so `redirect` silently turns every pip install in a fresh
-environment into a full re-download. uv is immune: it caches wheels by index
-and filename, so it doesn't care what URL the bytes came from.
-
-`auto` resolves this per request: clients verified to cache by filename get
-the 302, everyone else (pip, browsers, unknown tools) gets streamed bytes
-under the stable URL with `Cache-Control: immutable` — a warm pip cache means
-zero artifact bytes over the network. Use `redirect` when the node's
-bandwidth is the binding constraint and you accept weaker pip caching; use
-`stream` when clients can't reach the bucket endpoint (private subnet,
-firewalled S3). The disk backend always streams, whatever the mode.
-PEP 658 `.metadata` companions always stream — they're tiny and
-resolution-critical.
+A presigned redirect moves the megabytes to S3, but each response carries a
+freshly signed URL. Clients whose download caches are keyed by the serving URL
+(pip's HTTP cache) can never get a hit, so `redirect` silently turns every
+fresh-environment pip install into a full re-download. uv is immune — it caches
+wheels by index and filename. `auto` resolves this per request; use `redirect`
+when node bandwidth is the binding constraint, `stream` when clients can't reach
+the bucket endpoint (private subnet, firewalled S3). The disk backend always
+streams. PEP 658 `.metadata` companions always stream — tiny and
+resolution-critical. Full reasoning in
+[docs/DESIGN.md](docs/DESIGN.md#read-path-zero-coordination).
 
 ## Storage layout
 
-The layout is the schema — see [docs/DESIGN.md](docs/DESIGN.md):
+The layout *is* the schema — see [docs/DESIGN.md](docs/DESIGN.md):
 
 ```
 packages/<pkg>/<filename>                # artifact, immutable once written
@@ -395,22 +330,47 @@ simple/index.html                        # materialized views (regenerable)
 simple/index.json
 simple/<pkg>/index.html
 simple/<pkg>/index.json
-_dirty/<pkg>                             # empty marker: package needs index rebuild
+_dirty/<pkg>                             # event markers: package needs index rebuild
 _leader/lease.json                       # multi-node lease (holder, term, expires-at)
 ```
 
-## Docs
+## FAQ
 
-* [VISION.md](docs/VISION.md) — the one-page version
-* [DESIGN.md](docs/DESIGN.md) — architecture and reasoning
-* [STANDARDS.md](docs/STANDARDS.md) — PEP support matrix
-* [COMPATIBILITY.md](docs/COMPATIBILITY.md) — generated client compatibility matrix
-* [TESTING.md](docs/TESTING.md) — blackbox-first test philosophy
-* [ROADMAP.md](docs/ROADMAP.md) — implementation history
+**Does it really not need a database?** No. Truth is files; the index is a
+materialized view regenerable from a storage listing; backups are rsync. The one
+feature a DB genuinely wants — user accounts / API tokens — is covered for
+private registries by static basic-auth credentials. See
+[DESIGN.md](docs/DESIGN.md#what-no-db-honestly-costs).
+
+**Can I serve public PyPI packages too?** Yes — `pypiron sync` for an explicit
+allowlist, or `--proxy-upstream` to cache packages on first use. Both serve from
+the same single URL and are origin-checked end to end.
+
+**Why must clients use `--index-url`, never `--extra-index-url`?** pip merges
+extra indexes by version with no priority — that *is* the dependency-confusion
+vulnerability (an attacker publishes your private name publicly at a higher
+version and wins). Point clients at this registry only; it decides what exists.
+
+**Is one node enough?** Yes. The server is cache-correct, not cache-dependent:
+artifacts are `immutable`, indexes ETag-revalidate, and client/proxy/CDN caches
+compound a single node's already-sufficient capacity. Multi-node on S3 exists
+for write availability, not read throughput.
+
+**Is it production-ready?** It's a single binary with measured, repeatable
+numbers ([BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md)) and a blackbox suite
+that drives real clients ([TESTING.md](docs/TESTING.md)). For the explicitly
+stated target — private registries serving static files — yes. For a
+multi-tenant pypi.org clone, no, and we don't try.
 
 ## Ecosystem
 
-* devpi-server
-* pypiserver
-* pypicloud
-* warehouse
+Other private-PyPI servers, for comparison:
+
+- [devpi-server](https://github.com/devpi/devpi)
+- [pypiserver](https://github.com/pypiserver/pypiserver)
+- [pypicloud](https://github.com/stevearc/pypicloud)
+- [warehouse](https://github.com/pypi/warehouse) (the software behind pypi.org)
+
+## License
+
+PypIron is licensed under the [MIT License](LICENSE).

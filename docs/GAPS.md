@@ -1,155 +1,143 @@
 # Gaps
 
-Known missing features, tracked here so they don't get lost. Organized by
-source: spec/conformance gaps in the current implementation, and market gaps
-(features teams expect that PypIron doesn't have).
+Known missing features, tracked here so they don't get lost. Bucketed by
+intent — **Maybe**, **Enterprise** (gated behind the paid version), and
+**Not planned**.
+
+Previously tracked and since shipped: PEP 503 301-redirects for
+non-normalized names, `WWW-Authenticate` on 401s, gzip index responses
+(precompressed variants in the index cache), read authentication
+(`--read-user`/`--read-pass`), on-demand PyPI proxying (`--proxy-upstream`
+with `sync`-equivalent filters), `/health`, Prometheus `/metrics`,
+`--log-format json`, read-only-by-default when no credentials are configured
+(open-mode writes are gone), and `--spool-dir` documentation.
 
 ---
 
-## Technical / conformance gaps
+## Maybe
 
-### 1. `WWW-Authenticate` header missing from 401 responses
+### Scoped API tokens
 
-All 401 return sites (`legacy_upload`, `require_admin`) emit bare
-`UNAUTHORIZED` with no `WWW-Authenticate: Basic realm="PypIron"` header.
-
-**Why it matters:** RFC 7235 requires this header on 401. pip's keyring
-integration and browsers use it to trigger credential prompts. Without it,
-unauthenticated pip clients get a silent 401 with no indication that credentials
-are required. Twine and uv send credentials proactively so they're unaffected,
-but pip's `--extra-index-url` fallback and interactive installs break silently.
-
-**Fix:** Add `WWW-Authenticate: Basic realm="PypIron"` to every 401 response.
-
----
-
-### 2. No gzip content-encoding on index responses
-
-Index bytes are served raw. The in-memory `IndexCache` stores uncompressed bytes
-and no compression middleware is applied.
-
-**Why it matters:** DESIGN.md says "a multi-MB HTML file served statically with
-gzip is a non-event" — implying this works. For large registries the global
-`index.html` can reach several MB. Every pip/uv resolve fetches it. Uncompressed
-at scale is a real bandwidth and latency cost.
-
-**Fix:** Add `tower-http` `CompressionLayer` (or equivalent) to compress
-responses for clients that send `Accept-Encoding: gzip`. Alternatively, store
-pre-compressed bytes in `IndexCache` and serve with `Content-Encoding: gzip`.
-
----
-
-### 3. No 301 redirect for non-normalized package names
-
-`simple_pkg` normalizes the name and serves correct data but returns 200 at the
-un-normalized path. E.g., `/simple/Requests/` returns content without redirecting
-to `/simple/requests/`.
-
-**Why it matters:** PEP 503 conformance. Standard PyPI behavior is a 301 to the
-normalized URL. Tools that cache index responses by URL get duplicate cache
-entries; edge proxies or CDNs fronting PypIron may split cache. pip/uv normalize
-before requesting so this rarely causes broken installs, but it's a conformance
-gap and can surprise integrators.
-
-**Fix:** If `pkg != normalize_pkg_name(original_path_segment)`, return 301 to
-the normalized URL before serving.
-
----
-
-### 4. `--spool-dir` not mentioned in Docker examples
-
-The config table lists `--spool-dir` / `PYPIRON_SPOOL_DIR` but the Docker
-examples don't bind a real-disk volume for it. On containers where `/tmp` is a
-RAM-backed `tmpfs`, large uploads spool into RAM — the exact problem the option
-exists to solve.
-
-**Fix:** Add a note in the Docker section recommending `-v /data/spool:/spool -e
-PYPIRON_SPOOL_DIR=/spool` (or equivalent) when uploading large wheels.
-
----
-
-## Market gaps
-
-*Features that would drive adoption or remove friction for real teams.*
-
-### Blocker-level
-
-**Multiple upload credentials / API tokens**
 One uploader credential and one admin credential means a single shared secret
-across every CI job, developer, and service account. Teams that want per-service
-tokens or need to rotate one without touching others can't. This is the most
-commonly cited reason teams reach for devpi or Artifactory instead. The DESIGN
-explicitly defers user accounts/tokens as needing a database — a legitimate
-call, but it caps the addressable market at small teams or teams willing to
-share a single secret.
+across every CI job, developer, and service account. Teams that want
+per-service tokens, or need to rotate one without touching others, can't —
+the most commonly cited reason teams reach for devpi or Artifactory instead.
 
-**SSO / LDAP / SAML integration**
-Large enterprises won't evaluate a tool that requires managing credentials
-separately from their corporate identity provider. Without SSO, PypIron is
-eliminated from any organization with an IT security policy. This is a full
-blocker for enterprise adoption (though it may not be the target audience).
+If we do it, it stays no-DB:
 
----
+- Token = random secret; server stores only a hash + scope in a file
+  (`_tokens/<token-id>.json`), listable/regenerable like everything else.
+- Scope: package name(s) or prefix, role (publish), optional expiry.
+- Works as basic auth (`__token__` / `pypi-...` style) so every client just
+  works.
+- CLI follows: `pypiron token create --package foo`. Per-package "ownership"
+  is this feature too — a token scoped to `foo` *is* the ownership record.
+  No separate user system.
 
-### Friction-level
+### Explicit `--read-only` flag
 
-**No audit log**
-No record of who uploaded or deleted what and when. Enterprise security teams
-(SOC 2, internal compliance) and regulated industries require this. Without it,
-PypIron is excluded from regulated environments regardless of the rest of the
-story.
+No credentials already means read-only, and that covers the footgun. The
+remaining case is a credentialed deployment that wants serve-only replicas:
+a flag that 403s every write and skips the worker/reconciler/lease, so the
+node can run with read-only storage credentials (a compromised public-facing
+replica physically cannot tamper with the truth tree). Note such a node
+serves what's materialized and cannot self-heal — a writer node must exist
+somewhere.
 
-**Fine-grained RBAC**
-Two roles (uploader + admin) is too coarse for mid-size teams. Common need:
-read-only roles, per-package or per-namespace permissions, separate CI service
-accounts with minimal scope. devpi and Artifactory both have this; its absence
-pushes teams toward those tools as they grow.
+### Management UI / package browser
 
-**No management UI / package browser**
-Browsing `/simple/` shows raw PEP 503 HTML. Teams expect a web UI to see
-versions, upload times, yanked status. devpi and pypicloud both have one. Not
-a blocker — the PEP 503 index works — but it's friction for non-developer users
-(release managers, QA, security teams).
+Browsing `/simple/` already shows projects, versions, and files as HTML, but
+it's raw PEP 503 — no upload times, yanked status, or token management. Teams
+expect one (devpi and pypicloud have one); friction for non-developer users
+(release managers, QA, security). Earns its keep only after tokens exist —
+and even then: server-rendered pages, no build step, no React death star.
 
-**No Prometheus metrics / observability**
-No `/metrics` endpoint. Production teams need request counts, upload volume,
-cache hit rates, S3 latency, and error rates to justify running PypIron in
-production and to page on problems.
+### Webhook / event notification
 
-**No webhook / event notification**
-No way to trigger downstream actions (notify Slack, trigger CI) on publish or
-yank. Competitors have this; teams work around it by polling the index.
+Trigger downstream actions (notify Slack, trigger CI) on publish or yank.
+Competitors have this; teams work around it by polling the index.
 
-**No PyPI-passthrough / fallback (intentional, but felt as friction)**
-devpi's most popular feature is transparent PyPI fallback. PypIron deliberately
-rejects this (DESIGN documents the dependency-confusion risk). The correct answer
-is explicit mirroring via `pypiron sync`. But teams evaluating PypIron vs devpi
-feel it as missing — migration requires ops work (sync setup, packages list) that
-devpi hides behind a proxy.
+### Management CLI (beyond sync)
 
----
+`pypiron packages list`, `pypiron packages delete <pkg> <ver>`, `pypiron
+yank` etc. The management API exists but requires hand-crafting `curl`
+commands. A first-class CLI surface lowers the ops bar.
 
-### Nice-to-have
+### HTTPS / TLS built-in
 
-**`pypiron` management CLI (beyond sync)**
-`pypiron packages list`, `pypiron packages delete <pkg> <ver>`, `pypiron yank`
-etc. The management API exists but requires hand-crafting `curl` commands. A
-first-class CLI surface lowers the ops bar significantly.
+Currently expects a reverse proxy for TLS. Small teams running PypIron
+standalone have to set up nginx/caddy separately — a real barrier for the
+"just run it" audience.
 
-**HTTPS / TLS built-in**
-Currently expects a reverse proxy for TLS. Small teams running PypIron standalone
-have to set up nginx/caddy separately — a real barrier for the "just run it"
-audience.
+### Package retention / cleanup policies
 
-**Package retention / cleanup policies**
 Auto-delete versions older than N days or keep only the N most recent per
 package. Large registries accumulate stale pre-release wheels.
 
-**Rate limiting**
+### Rate limiting
+
 Prevent resource exhaustion on shared instances. Less critical for
 single-tenant/private use but matters for shared team deployments.
 
-**CI/CD example configs**
-GitHub Actions, GitLab CI snippets showing the full publish-then-install pattern
-(`--sync-uploads`, credential setup, uv publish). Reduces time-to-working for
-new adopters.
+### CI/CD example configs
+
+GitHub Actions, GitLab CI snippets showing the full publish-then-install
+pattern (`--sync-uploads`, credential setup, uv publish). Reduces
+time-to-working for new adopters.
+
+---
+
+## Enterprise (paid version)
+
+Features gated behind the paid tier. Table stakes for large-org procurement,
+irrelevant to the free tier's audience.
+
+### SSO / LDAP / SAML integration
+
+Large enterprises won't evaluate a tool that requires managing credentials
+separately from their corporate identity provider. Without SSO, PypIron is
+eliminated from any organization with an IT security policy.
+
+### Audit log
+
+A record of who uploaded or deleted what and when. Enterprise security teams
+(SOC 2, internal compliance) and regulated industries require this. Without
+it, PypIron is excluded from regulated environments regardless of the rest of
+the story.
+
+### Fine-grained RBAC
+
+Two write roles (uploader + admin) plus an optional read credential is too
+coarse for large orgs. Per-package or per-namespace permissions, separate CI
+service accounts with minimal scope. devpi and Artifactory both have this.
+(Scoped tokens, above, cover the simple cases; full RBAC is the enterprise
+version.)
+
+---
+
+## Not planned
+
+### Snapshot export/import
+
+For disk, "it's just files — rsync it" is genuinely correct and better than a
+bespoke tool. For S3, `aws s3 sync` exists. Cross-backend airgap movement is
+the only real case, and `pypiron sync` between servers already covers most of
+it. Not worth a command.
+
+### SQLite / Postgres mode
+
+The no-DB design *is* the answer to both. Single-node is already stupidly
+easy (one binary, one directory); serious deployments get S3 + multi-node
+lease. Adding a database would delete the product's reason to exist.
+
+### Static/simple mode
+
+The whole server is this. Truth is files; the index is a materialized view;
+backups are rsync.
+
+### Hosted/proxy/group repo taxonomy
+
+Nexus needs three repo types and a group URL because its repos are silos. We
+have one namespace with per-package origin: private packages, explicit
+mirrors (`sync`), and on-demand proxying (`--proxy-upstream`) all serve from
+one URL.

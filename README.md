@@ -13,6 +13,44 @@ the packages tree (immutable artifacts plus write-time metadata sidecars), and
 the simple index is a materialized view, idempotently regenerable from a
 storage listing. See [docs/DESIGN.md](docs/DESIGN.md) for the full reasoning.
 
+## Performance
+
+Measured, not promised: every number below is a row in
+[docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) with the commit,
+hardware, and method that produced it. Both rigs run the S3 backend — the
+configuration that actually gets deployed, not a tmpfs demo.
+
+**On a $12/month box** (`t4g.small`, 2 vCPU / 2 GiB, same-region S3):
+
+| | |
+|---|---|
+| Package-index reads | **76,000 req/s**, p99 1.7 ms |
+| 304 revalidations (pip/uv steady state) | **76,000 req/s** |
+| Presigned artifact redirects | **69,000 req/s** |
+| PEP 658 metadata reads | **72,000 req/s** |
+| torch-sized index (2,000 files, served gzipped) | **4,300 req/s** |
+| Upload → visible in the index | **p50 0.7 s, p99 1.1 s** |
+| Synchronous publish-then-install round trip | **p99 0.8 s**, zero read-your-write misses |
+| 900 MB wheel upload | 15–20 s at **~50 MB RSS** |
+| Proxied artifact downloads | 3.9 Gbps (the NIC gives out first) |
+
+**On an 8-vCPU box** (`c7gn.2xlarge`, same-region S3):
+
+| | |
+|---|---|
+| Index reads / 304s / redirects / metadata | **~440,000 req/s each**, p99 < 5 ms — server CPU-bound at 94% while a 64-vCPU load generator idled at 8% |
+| torch-sized index | **27,000 req/s gzipped**; 48 Gbps of NIC when a client insists on identity |
+| 8 × 900 MB concurrent uploads | 8/8 succeed at **287 MB peak RSS**, reads stay at p99 7 ms throughout |
+| 10,000-package corpus | upload→visible p99 **1.8 s**; a brand-new name reaches the global index in **1.7 s** |
+| Reads during a full reconcile sweep | **112,000 req/s, p99 0.76 ms** — the self-heal pass is invisible |
+| Mirroring from PyPI (`pypiron sync`) | 117 files/s on the long tail; torch-class wheels at ~1 Gbps |
+
+When this benchmarking effort started, the same suite on the same $12 box
+managed 2,000 index reads/s, took 58 seconds to make an upload visible, and
+was OOM-killed by a single torch upload. The complete path from there to
+here — every fix paired with its before/after — is the
+[improvements log](docs/BENCHMARK_RESULTS.md#improvements-log).
+
 ## Getting Started
 
 ```bash
@@ -204,7 +242,7 @@ All options are available via CLI args and/or environment variables.
 | `--admin-user`               | `PYPIRON_ADMIN_USER`               | *(none)*       | Admin credential — publish + mirror/delete/yank  |
 | `--admin-pass`               | `PYPIRON_ADMIN_PASS`               | *(none)*       | Admin credential password                        |
 | `--private-prefix`           | `PYPIRON_PRIVATE_PREFIX`           | *(none)*       | Reserve a namespace for private uploads          |
-| `--worker-interval-secs`     | `PYPIRON_WORKER_INTERVAL_SECS`     | `5`            | Worker tick interval                             |
+| `--worker-interval-secs`     | `PYPIRON_WORKER_INTERVAL_SECS`     | `1`            | Worker tick interval (writes also nudge the worker directly) |
 | `--reconcile-interval-secs`  | `PYPIRON_RECONCILE_INTERVAL_SECS`  | `300`          | Full self-heal sweep interval                    |
 | `--lease-ttl-secs`           | `PYPIRON_LEASE_TTL_SECS`           | `30`           | Leader lease TTL (multi-node S3)                 |
 | `--artifact-delivery`        | `PYPIRON_ARTIFACT_DELIVERY`        | `auto`         | How artifact bytes reach clients (see below)     |

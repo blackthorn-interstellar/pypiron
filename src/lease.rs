@@ -109,6 +109,27 @@ impl LeaseManager {
         Ok(false)
     }
 
+    /// Best-effort release on graceful shutdown: delete the lease if we still
+    /// hold it, so a restarted (or replacement) node becomes leader on its
+    /// next tick instead of waiting out the TTL — without this, every restart
+    /// was a TTL-long window where uploads went unprocessed. The read-then-
+    /// delete race (a peer steals between the two) merely deletes the peer's
+    /// fresh lease; it re-creates it next tick. Sloppy by design.
+    pub async fn release(&self) {
+        let held = match self.storage.get_with_etag(LEASE_KEY).await {
+            Ok(Some((bytes, _))) => serde_json::from_slice::<Lease>(&bytes)
+                .map(|l| l.holder == self.holder)
+                .unwrap_or(false),
+            _ => false,
+        };
+        if held {
+            match self.storage.delete_keys(&[LEASE_KEY.to_string()]).await {
+                Ok(()) => info!(holder=%self.holder, "lease released on shutdown"),
+                Err(e) => warn!(error=?e, "failed to release lease on shutdown"),
+            }
+        }
+    }
+
     fn lease_json(&self, term: u64, now: i64) -> Vec<u8> {
         serde_json::to_vec(&Lease {
             holder: self.holder.clone(),
@@ -116,5 +137,49 @@ impl LeaseManager {
             expires_at: now + self.ttl_secs,
         })
         .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::test_support::InMemStorage;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn release_deletes_own_lease_only() {
+        let storage = Arc::new(InMemStorage::default());
+        let lm = LeaseManager::new(storage.clone(), Duration::from_secs(30));
+        assert!(lm.is_leader().await, "first node acquires the lease");
+        lm.release().await;
+        assert!(
+            storage.get_bytes(LEASE_KEY).await.is_err(),
+            "own lease must be deleted on release"
+        );
+
+        // A foreign lease survives someone else's release.
+        let other = LeaseManager::new(storage.clone(), Duration::from_secs(30));
+        assert!(other.is_leader().await);
+        let late = LeaseManager::new(storage.clone(), Duration::from_secs(30));
+        assert!(!late.is_leader().await, "lease is held by `other`");
+        late.release().await;
+        assert!(
+            storage.get_bytes(LEASE_KEY).await.is_ok(),
+            "a non-holder's release must not delete the lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn released_lease_is_acquired_immediately_not_after_ttl() {
+        let storage = Arc::new(InMemStorage::default());
+        let a = LeaseManager::new(storage.clone(), Duration::from_secs(3600));
+        assert!(a.is_leader().await);
+        a.release().await;
+        // TTL is an hour; without release the successor would wait it out.
+        let b = LeaseManager::new(storage.clone(), Duration::from_secs(3600));
+        assert!(
+            b.is_leader().await,
+            "successor must acquire instantly after a graceful release"
+        );
     }
 }

@@ -32,6 +32,7 @@ pub struct SyncConfig {
     pub password: Option<String>,
     pub private_prefix: Option<String>,
     pub concurrency: Option<usize>,
+    pub package_concurrency: Option<usize>,
     pub only_wheels: Option<bool>,
     pub only_sdists: Option<bool>,
     pub python_tag: Option<Vec<String>>,
@@ -88,12 +89,14 @@ mod tests {
             python-tag = ["py3"]
             exclude-newer = "2026-01-01T00:00:00Z"
             concurrency = 8
+            package-concurrency = 16
             "#,
         )
         .unwrap();
         assert_eq!(cfg.sync.packages.unwrap().len(), 2);
         assert_eq!(cfg.sync.only_wheels, Some(true));
         assert_eq!(cfg.sync.concurrency, Some(8));
+        assert_eq!(cfg.sync.package_concurrency, Some(16));
         assert_eq!(
             cfg.sync.exclude_newer.as_deref(),
             Some("2026-01-01T00:00:00Z")

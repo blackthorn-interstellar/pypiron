@@ -2,16 +2,22 @@
 //! (PEP 658). Wheels are zip files with metadata at
 //! `<dist>-<version>.dist-info/METADATA`.
 
-use std::io::{Cursor, Read};
+use std::io::{Read, Seek};
+use std::path::Path;
 
 use zip::ZipArchive;
 
 /// Core metadata is text; anything past this is a zip bomb, not a METADATA.
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Extract the core `METADATA` file from wheel bytes, if present.
-pub fn extract_metadata(wheel_bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut zip = ZipArchive::new(Cursor::new(wheel_bytes)).ok()?;
+/// Extract `METADATA` from a wheel on disk without loading the wheel into
+/// memory — zip needs only the central directory plus the one entry.
+pub fn extract_metadata_from_file(path: &Path) -> Option<Vec<u8>> {
+    extract_metadata_from_reader(std::fs::File::open(path).ok()?)
+}
+
+fn extract_metadata_from_reader<R: Read + Seek>(reader: R) -> Option<Vec<u8>> {
+    let mut zip = ZipArchive::new(reader).ok()?;
     let name = zip
         .file_names()
         .find(|n| n.ends_with(".dist-info/METADATA") && n.matches('/').count() == 1)
@@ -35,7 +41,7 @@ pub fn extract_metadata(wheel_bytes: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
 
     fn fake_wheel(metadata: Option<&[u8]>) -> Vec<u8> {
@@ -54,12 +60,41 @@ mod tests {
     fn extracts_metadata_from_wheel() {
         let md = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
         let wheel = fake_wheel(Some(md));
-        assert_eq!(extract_metadata(&wheel).as_deref(), Some(md.as_slice()));
+        assert_eq!(
+            extract_metadata_from_reader(Cursor::new(&wheel)).as_deref(),
+            Some(md.as_slice())
+        );
     }
 
     #[test]
     fn missing_metadata_and_garbage_are_none() {
-        assert_eq!(extract_metadata(&fake_wheel(None)), None);
-        assert_eq!(extract_metadata(b"not a zip"), None);
+        assert_eq!(
+            extract_metadata_from_reader(Cursor::new(&fake_wheel(None))),
+            None
+        );
+        assert_eq!(
+            extract_metadata_from_reader(Cursor::new(b"not a zip" as &[u8])),
+            None
+        );
+    }
+
+    #[test]
+    fn file_and_bytes_extraction_agree() {
+        let md = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+        let wheel = fake_wheel(Some(md));
+        let dir = std::env::temp_dir().join(format!("pypiron-wheel-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("demo-1.0-py3-none-any.whl");
+        std::fs::write(&path, &wheel).unwrap();
+        assert_eq!(
+            extract_metadata_from_file(&path),
+            extract_metadata_from_reader(Cursor::new(&wheel)),
+            "spooled-file extraction must match in-memory extraction"
+        );
+        assert_eq!(
+            extract_metadata_from_file(Path::new("/nonexistent.whl")),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

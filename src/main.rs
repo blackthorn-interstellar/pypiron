@@ -13,10 +13,10 @@ use axum::{
 use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{info, warn};
 
+mod cache;
 mod config;
 mod lease;
 mod names;
@@ -25,6 +25,7 @@ mod render;
 mod sidecar;
 mod storage;
 mod sync;
+mod upload;
 mod wheel;
 mod worker;
 
@@ -59,6 +60,39 @@ enum Commands {
     Sync(Box<sync::SyncArgs>),
 }
 
+/// How artifact bytes reach clients. The tension: redirects move the
+/// megabytes to S3, but a fresh presigned URL per request defeats any client
+/// cache keyed by the final URL (pip's HTTP cache re-downloads every wheel),
+/// while streaming keeps every cache effective at the cost of this node
+/// serving the bytes. Index pages always carry stable `/files/` URLs; this
+/// only governs what happens when a client GETs one.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactDelivery {
+    /// Per-client: redirect clients verified immune to presigned-URL churn
+    /// (uv keys its cache by index + filename), stream everyone else.
+    Auto,
+    /// Always 302 to presigned S3 URLs; this node never touches wheel bytes.
+    Redirect,
+    /// Always proxy bytes through this node with immutable cache headers.
+    Stream,
+}
+
+/// User-Agent prefixes of clients whose artifact caches are keyed by package
+/// filename rather than the URL that served the bytes, verified to follow
+/// cross-host 302s. Only such clients may be redirected in `auto` mode —
+/// anyone else (pip's CacheControl keys on the per-hop URL; unknown tools are
+/// assumed to as well) gets streamed bytes under the stable `/files/` URL.
+/// Grow this list by verified cache behavior, not by client popularity.
+const REDIRECT_SAFE_UA_PREFIXES: &[&str] = &["uv/"];
+
+fn redirect_safe_client(headers: &HeaderMap) -> bool {
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    REDIRECT_SAFE_UA_PREFIXES.iter().any(|p| ua.starts_with(p))
+}
+
 /// `PypIron` - A fast, reliable, and scalable `PyPI` server
 #[derive(ClapArgs, Debug, Clone)]
 struct ServeArgs {
@@ -89,10 +123,19 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
     private_prefix: Option<String>,
 
-    /// Redirect artifact downloads to presigned S3 URLs (302) so this node
-    /// never touches wheel bytes (S3 backend only)
-    #[arg(long, env = "PYPIRON_S3_PRESIGNED_REDIRECTS")]
-    s3_presigned_redirects: bool,
+    /// How artifact bytes reach clients. `stream`: proxy through this node
+    /// (URL-keyed HTTP caches like pip's stay effective). `redirect`: 302 to
+    /// presigned S3 URLs so this node never touches wheel bytes. `auto`
+    /// (default): per-client — redirect clients whose caches are immune to
+    /// presigned-URL churn (uv), stream everyone else. Disk backend always
+    /// streams. See docs/DESIGN.md for the tradeoffs.
+    #[arg(
+        long,
+        env = "PYPIRON_ARTIFACT_DELIVERY",
+        value_enum,
+        default_value_t = ArtifactDelivery::Auto
+    )]
+    artifact_delivery: ArtifactDelivery,
 
     /// Worker interval in seconds
     #[arg(long, env = "PYPIRON_WORKER_INTERVAL_SECS", default_value = "5")]
@@ -118,6 +161,12 @@ struct ServeArgs {
     /// Address to bind the server to
     #[arg(long, env = "PYPIRON_BIND_ADDR", default_value = "0.0.0.0:8080")]
     bind_addr: String,
+
+    /// Directory for upload spool files (defaults to the system temp dir).
+    /// Point this at real disk on distros where /tmp is a RAM-backed tmpfs —
+    /// otherwise large uploads spool into memory and defeat streaming.
+    #[arg(long, env = "PYPIRON_SPOOL_DIR")]
+    spool_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -130,13 +179,21 @@ struct AppState {
     admin_user: Option<String>,
     admin_pass: Option<String>,
     private_prefix: Option<String>,
-    presigned_redirects: bool,
+    artifact_delivery: ArtifactDelivery,
     // worker cfg
     worker_interval: Duration,
     reconcile_interval: Duration,
     lease_ttl: Duration,
     sync_uploads: bool,
     sync_upload_timeout: Duration,
+    /// RAM-served indexes with precomputed ETags; see cache.rs.
+    index_cache: Arc<cache::IndexCache>,
+    /// Reused presigned GET URLs for immutable artifacts; see cache.rs.
+    presign_cache: Arc<cache::PresignCache>,
+    /// Where upload spools live (must be real disk, not tmpfs).
+    spool_dir: std::path::PathBuf,
+    /// Serializes incremental global-index read-modify-writes in-process.
+    global_index_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[tokio::main]
@@ -174,12 +231,16 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         admin_user: cli.admin_user,
         admin_pass: cli.admin_pass,
         private_prefix: cli.private_prefix.as_deref().map(normalize_pkg_name),
-        presigned_redirects: cli.s3_presigned_redirects,
+        artifact_delivery: cli.artifact_delivery,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
         lease_ttl: Duration::from_secs(cli.lease_ttl_secs),
         sync_uploads: cli.sync_uploads,
         sync_upload_timeout: Duration::from_secs(cli.sync_upload_timeout_secs),
+        index_cache: Arc::new(cache::IndexCache::new(cache::INDEX_CACHE_TTL)),
+        presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
+        spool_dir: cli.spool_dir.unwrap_or_else(std::env::temp_dir),
+        global_index_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
     if state.auth_open() {
@@ -224,8 +285,10 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
         .layer(middleware::from_fn(log_requests));
 
-    // spawn worker
-    tokio::spawn(worker::run_worker(state.clone()));
+    // spawn worker (with a shutdown handle so it can release the leader
+    // lease on graceful exit)
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker_handle = tokio::spawn(worker::run_worker_until(state.clone(), shutdown_rx));
 
     // serve
     info!("listening on http://{}", cli.bind_addr);
@@ -233,21 +296,48 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // Tell the worker to stop and give it a moment to release the leader
+    // lease — that hand-off is what keeps a restart from being a lease-TTL
+    // write outage on the successor.
+    let _ = shutdown_tx.send(true);
+    if tokio::time::timeout(Duration::from_secs(5), worker_handle)
+        .await
+        .is_err()
+    {
+        warn!("worker did not stop within 5s; exiting without lease release");
+    }
     Ok(())
 }
 
 async fn shutdown_signal() {
+    // SIGTERM is what process managers (and our own bench scripts) send;
+    // Ctrl-C covers interactive use.
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
     info!("shutdown signal received");
 }
 
 /// Middleware to log all incoming requests
+/// Per-request logging is `debug`, not `info`: at tens of thousands of rps
+/// the access log otherwise becomes the workload (a 30 s benchmark filled a
+/// 924 MB tmpfs with INFO lines and wedged the box). `RUST_LOG=debug` turns
+/// it back on for troubleshooting.
 async fn log_requests(req: Request, next: Next) -> impl IntoResponse {
     let method = req.method().clone();
     let uri = req.uri().clone();
-    info!("Incoming request: {} {}", method, uri);
+    tracing::debug!("Incoming request: {} {}", method, uri);
     let response = next.run(req).await;
-    info!("Response status: {}", response.status());
+    tracing::debug!("Response status: {} {} {}", response.status(), method, uri);
     response
 }
 
@@ -322,10 +412,10 @@ async fn legacy_upload(
     }
 
     let mut filename_opt: Option<String> = None;
-    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut spooled: Option<upload::FinishedSpool> = None;
     let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
-    while let Some(field) = multipart.next_field().await.map_err(|_| {
+    while let Some(mut field) = multipart.next_field().await.map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
             "Invalid multipart form data".into(),
@@ -336,13 +426,39 @@ async fn legacy_upload(
 
         match field_name.as_str() {
             "content" | "file" => {
-                let bytes = field.bytes().await.map_err(|_| {
+                // Stream to a temp file, hashing as we go — memory stays
+                // chunk-sized no matter how big the wheel is (see upload.rs).
+                let mut spool = upload::UploadSpool::new(&state.spool_dir)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Could not open upload spool: {e}"),
+                        )
+                    })?;
+                loop {
+                    match field.chunk().await {
+                        Ok(Some(chunk)) => spool.write_chunk(&chunk).await.map_err(|e| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Could not spool uploaded file: {e}"),
+                            )
+                        })?,
+                        Ok(None) => break,
+                        Err(_) => {
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                "Could not read uploaded file".into(),
+                            ))
+                        }
+                    }
+                }
+                spooled = Some(spool.finish().await.map_err(|e| {
                     (
-                        StatusCode::BAD_REQUEST,
-                        "Could not read uploaded file".into(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not finish upload spool: {e}"),
                     )
-                })?;
-                file_bytes = Some(bytes.to_vec());
+                })?);
                 if filename_opt.is_none() {
                     filename_opt = part_filename;
                 }
@@ -360,7 +476,7 @@ async fn legacy_upload(
     let filename = filename_opt
         .or_else(|| fields.get("filename").cloned())
         .ok_or((StatusCode::BAD_REQUEST, "Missing filename".to_string()))?;
-    let data = file_bytes.ok_or((StatusCode::BAD_REQUEST, "Missing file content".to_string()))?;
+    let spooled = spooled.ok_or((StatusCode::BAD_REQUEST, "Missing file content".to_string()))?;
 
     // No path separators, dotfiles, or names colliding with sidecar suffixes.
     if filename.contains('/') || filename.contains('\\') || !sidecar::is_artifact(&filename) {
@@ -376,26 +492,24 @@ async fn legacy_upload(
         return Err((StatusCode::BAD_REQUEST, "Invalid package name".into()));
     }
 
-    // Hashing and zip extraction are CPU-bound: off the async runtime.
+    // The hash was computed incrementally during spooling. Zip extraction
+    // reads the central directory + one entry from the spool file — it is
+    // I/O + CPU bound, so off the async runtime.
     let is_wheel = filename.ends_with(".whl");
-    let (data, sha256, wheel_metadata) = tokio::task::spawn_blocking(move || {
-        let mut hasher = Sha256::new();
-        hasher.update(&data);
-        let sha = format!("{:x}", hasher.finalize());
-        let md = if is_wheel {
-            wheel::extract_metadata(&data)
-        } else {
-            None
-        };
-        (data, sha, md)
-    })
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Hashing task failed".to_string(),
-        )
-    })?;
+    let sha256 = spooled.sha256.clone();
+    let wheel_metadata = if is_wheel {
+        let path = spooled.path.path().to_path_buf();
+        tokio::task::spawn_blocking(move || wheel::extract_metadata_from_file(&path))
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Metadata extraction task failed".to_string(),
+                )
+            })?
+    } else {
+        None
+    };
 
     // Verify the client-supplied digest, and capture the hash for the sidecar.
     if let Some(claimed) = fields.get("sha256_digest") {
@@ -545,10 +659,10 @@ async fn legacy_upload(
     // Ordering invariant: artifact, then sidecars, then index job.
     // The conditional create IS the immutability rule (pypi.org's): a plain
     // HEAD-then-PUT is a TOCTOU hole that lets concurrent uploads swap bytes.
-    let size = data.len() as u64;
+    let size = spooled.size;
     match state
         .storage
-        .put_if_absent(&key, data, Some("application/octet-stream"))
+        .put_file_if_absent(&key, spooled.path.path(), Some("application/octet-stream"))
         .await
     {
         Ok(true) => {}
@@ -679,6 +793,7 @@ async fn simple_root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
             &state,
             format!("{SIMPLE_PREFIX}index.json"),
             CT_JSON,
+            INDEX_CACHE_CONTROL,
             &headers,
         )
         .await
@@ -687,6 +802,7 @@ async fn simple_root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
             &state,
             format!("{SIMPLE_PREFIX}index.html"),
             CT_HTML,
+            INDEX_CACHE_CONTROL,
             &headers,
         )
         .await
@@ -701,6 +817,7 @@ async fn simple_root_json(
         &state,
         format!("{SIMPLE_PREFIX}index.json"),
         CT_JSON,
+        INDEX_CACHE_CONTROL,
         &headers,
     )
     .await
@@ -720,6 +837,7 @@ async fn simple_pkg(
             &state,
             format!("{SIMPLE_PREFIX}{pkg}/index.json"),
             CT_JSON,
+            INDEX_CACHE_CONTROL,
             &headers,
         )
         .await
@@ -728,6 +846,7 @@ async fn simple_pkg(
             &state,
             format!("{SIMPLE_PREFIX}{pkg}/index.html"),
             CT_HTML,
+            INDEX_CACHE_CONTROL,
             &headers,
         )
         .await
@@ -747,37 +866,37 @@ async fn simple_pkg_json(
         &state,
         format!("{SIMPLE_PREFIX}{pkg}/index.json"),
         CT_JSON,
+        INDEX_CACHE_CONTROL,
         &headers,
     )
     .await
 }
 
 /// Serve a materialized index file with a content-hash ETag; conditional GETs
-/// revalidate to 304.
+/// revalidate to 304. Bytes and ETag come from the in-memory cache — the hot
+/// path costs zero storage calls and zero hashing (see cache.rs).
 async fn serve_index(
     state: &AppState,
     key: String,
     content_type: &'static str,
+    cache_control: &'static str,
     headers: &HeaderMap,
 ) -> Response<Body> {
-    let bytes = match state.storage.get_bytes(&key).await {
-        Ok(o) => o,
+    let (body, etag) = match state.index_cache.get(state.storage.as_ref(), &key).await {
+        Ok(Some(hit)) => hit,
+        Ok(None) => return not_found("no such index"),
         Err(e) => return read_error(e),
     };
-
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let etag = format!("\"{:x}\"", hasher.finalize());
 
     let revalidated = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim() == "*" || v.contains(etag.as_str()))
+        .map(|v| v.trim() == "*" || v.contains(&*etag))
         .unwrap_or(false);
 
     let builder = Response::builder()
-        .header(header::ETAG, etag.clone())
-        .header(header::CACHE_CONTROL, INDEX_CACHE_CONTROL);
+        .header(header::ETAG, &*etag)
+        .header(header::CACHE_CONTROL, cache_control);
 
     let result = if revalidated {
         builder.status(StatusCode::NOT_MODIFIED).body(Body::empty())
@@ -785,8 +904,10 @@ async fn serve_index(
         builder
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, content_type)
-            .header(header::CONTENT_LENGTH, bytes.len())
-            .body(Body::from(bytes))
+            .header(header::CONTENT_LENGTH, body.len())
+            // Arc<Vec<u8>> → owned copy for the response body: one memcpy of
+            // an index per 200, which is nothing at index sizes.
+            .body(Body::from(body.as_ref().clone()))
     };
     result.unwrap_or_else(not_found)
 }
@@ -809,28 +930,47 @@ async fn files_get(
     }
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
 
+    // PEP 658 metadata is immutable, tiny, and hammered by resolvers (uv
+    // fetches one per candidate wheel) — serve it from the same RAM cache as
+    // the indexes instead of one storage GET per request. Range requests
+    // fall through to storage; nobody range-reads a METADATA file.
+    if filename.ends_with(METADATA_SUFFIX) && headers.get(header::RANGE).is_none() {
+        return serve_index(
+            &state,
+            key,
+            "text/plain; charset=utf-8",
+            ARTIFACT_CACHE_CONTROL,
+            &headers,
+        )
+        .await;
+    }
+
     // S3 serves the megabytes, this node serves kilobytes of index: redirect
-    // artifact downloads to a presigned URL. Metadata companions are tiny and
-    // resolution-critical, so they keep streaming. The redirect itself must
-    // not be cached — the signature expires.
-    if state.presigned_redirects && !filename.ends_with(METADATA_SUFFIX) {
-        match state.storage.head_exists(&key).await {
-            Ok(true) => {}
-            Ok(false) => return not_found("no such artifact"),
-            Err(e) => return read_error(e),
+    // artifact downloads to a presigned URL — but only for clients whose
+    // caches survive URL churn (see ArtifactDelivery). Metadata companions
+    // are tiny and resolution-critical, so they always stream. The redirect
+    // itself must not be cached — the signature expires.
+    let redirect = match state.artifact_delivery {
+        ArtifactDelivery::Stream => false,
+        ArtifactDelivery::Redirect => true,
+        ArtifactDelivery::Auto => redirect_safe_client(&headers),
+    };
+    if redirect && !filename.ends_with(METADATA_SUFFIX) {
+        // No existence check: presigning is local HMAC math, so the redirect
+        // path costs zero network round trips. A signed URL to a missing key
+        // gets S3's own 404 (the server's credentials carry s3:ListBucket —
+        // required for index rebuilds — which is what makes S3 say 404
+        // rather than 403). Existence is the index's job, not this path's.
+        // Immutability also makes signed URLs reusable across clients: serve
+        // a cached one while it has plenty of validity left (see cache.rs).
+        if let Some(url) = state.presign_cache.fresh(&key) {
+            return found_redirect(&url);
         }
-        match state
-            .storage
-            .presign_get(&key, Duration::from_secs(3600))
-            .await
-        {
+        match state.storage.presign_get(&key, cache::PRESIGN_EXPIRY).await {
             Ok(Some(url)) => {
-                return Response::builder()
-                    .status(StatusCode::FOUND)
-                    .header(header::LOCATION, url)
-                    .header(header::CACHE_CONTROL, "no-cache")
-                    .body(Body::empty())
-                    .unwrap_or_else(not_found);
+                let url: Arc<str> = url.into();
+                state.presign_cache.put(&key, url.clone());
+                return found_redirect(&url);
             }
             Ok(None) => {} // disk backend: fall through to streaming
             Err(e) => warn!(error=?e, %key, "presign failed; falling back to streaming"),
@@ -848,6 +988,15 @@ async fn files_get(
         }
         Err(e) => read_error(e),
     }
+}
+
+fn found_redirect(url: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, url)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::empty())
+        .unwrap_or_else(not_found)
 }
 
 fn not_found<E: std::fmt::Debug>(err: E) -> Response<Body> {
@@ -918,6 +1067,8 @@ async fn files_delete(
                 format!("artifact delete failed: {e}"),
             )
         })?;
+    // Stop handing out the dead URL immediately (same node; peers age out).
+    state.presign_cache.invalidate(&key);
     // The `.origin` claim is durable on purpose: deleting every artifact must
     // not release the name for the *opposite* world to re-claim. Otherwise a
     // credentialed client could empty a mirror-owned public name and re-upload

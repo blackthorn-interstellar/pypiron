@@ -68,9 +68,16 @@ pub struct SyncArgs {
     #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
     pub private_prefix: Option<String>,
 
-    /// Parallel downloads/uploads (default 4).
+    /// Parallel downloads/uploads within one package (default 4).
     #[arg(long, env = "PYPIRON_SYNC_CONCURRENCY")]
     pub concurrency: Option<usize>,
+
+    /// Packages synced in parallel (default 8). The long tail of any real
+    /// mirror is hundreds of thousands of 2-file packages; per-file
+    /// concurrency alone leaves throughput gated on serial per-package
+    /// round-trips.
+    #[arg(long, env = "PYPIRON_SYNC_PACKAGE_CONCURRENCY")]
+    pub package_concurrency: Option<usize>,
 
     /// Print actions without downloading/uploading.
     #[arg(long)]
@@ -138,6 +145,7 @@ struct Resolved {
     password: Option<String>,
     private_prefix: Option<String>,
     concurrency: usize,
+    package_concurrency: usize,
     dry_run: bool,
     filter: ResolvedFilter,
 }
@@ -221,6 +229,11 @@ impl Resolved {
             password: args.password.clone().or(cfg.password),
             private_prefix: args.private_prefix.clone().or(cfg.private_prefix),
             concurrency: args.concurrency.or(cfg.concurrency).unwrap_or(4).max(1),
+            package_concurrency: args
+                .package_concurrency
+                .or(cfg.package_concurrency)
+                .unwrap_or(8)
+                .max(1),
             dry_run: args.dry_run,
             filter: ResolvedFilter {
                 only_wheels,
@@ -346,11 +359,22 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
         }
     };
 
+    // Packages in parallel (chunked join_all — same pattern as the worker
+    // sweep), files within each package in parallel below. The long tail of a
+    // mirror is small packages, so serial-per-package was the throughput cap.
     let mut failures = 0usize;
-    for spec in &resolved.specs {
-        if let Err(e) = sync_one_package(&client, &resolved, &sink, spec).await {
-            error!(package=%spec.name, error=?e, "package sync failed");
-            failures += 1;
+    for chunk in resolved.specs.chunks(resolved.package_concurrency) {
+        let results = futures::future::join_all(
+            chunk
+                .iter()
+                .map(|spec| sync_one_package(&client, &resolved, &sink, spec)),
+        )
+        .await;
+        for (spec, result) in chunk.iter().zip(results) {
+            if let Err(e) = result {
+                error!(package=%spec.name, error=?e, "package sync failed");
+                failures += 1;
+            }
         }
     }
     if failures > 0 {
@@ -594,7 +618,30 @@ async fn write_mirror_sidecar(
     Ok(())
 }
 
+/// How many times a single file download is attempted before the package is
+/// marked failed. At mirror scale, transient CDN errors are a statistical
+/// certainty — one 503 in 7,714 files failed an entire sync run before this
+/// existed. Hash mismatches retry too: a truncated body looks identical.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+
 async fn download_verified(client: &Client, file: &PyPiFile) -> Result<Vec<u8>> {
+    let mut last_err = None;
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        match download_once(client, file).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                if attempt < DOWNLOAD_ATTEMPTS {
+                    warn!(file=%file.filename, error=?e, attempt, "download failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("at least one attempt"))
+}
+
+async fn download_once(client: &Client, file: &PyPiFile) -> Result<Vec<u8>> {
     let resp = client.get(&file.url).send().await?.error_for_status()?;
     let bytes = resp.bytes().await?.to_vec();
     let mut hasher = Sha256::new();

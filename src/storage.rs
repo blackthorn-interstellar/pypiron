@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 use async_trait::async_trait;
 use axum::body::Body;
 use clap::{Args as ClapArgs, ValueEnum};
@@ -187,6 +187,15 @@ pub trait Storage: Send + Sync {
         content_type: Option<&str>,
     ) -> Result<bool>;
 
+    /// `put_if_absent`, but the body comes from a local file — artifacts of
+    /// any size are stored without ever being held in memory.
+    async fn put_file_if_absent(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        content_type: Option<&str>,
+    ) -> Result<bool>;
+
     /// Read full object bytes (indexes, sidecars — small files only).
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>>;
 
@@ -227,6 +236,11 @@ pub trait Storage: Send + Sync {
     ) -> Result<Option<String>> {
         Err(anyhow!("leases are not supported by this backend"))
     }
+}
+
+/// EXDEV ("invalid cross-device link") without pulling in the libc crate.
+fn libc_exdev() -> i32 {
+    18
 }
 
 /// ------------------------------ DiskStorage -------------------------------
@@ -372,6 +386,34 @@ impl Storage for DiskStorage {
         created
     }
 
+    async fn put_file_if_absent(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        _content_type: Option<&str>,
+    ) -> Result<bool> {
+        let p = self.resolve(key)?;
+        self.ensure_parent(&p).await?;
+        // Same atomic create-if-absent as put_if_absent. Try linking the
+        // source directly (free when the spool shares a filesystem with the
+        // data dir); EXDEV falls back to a copy into a tmp sibling first.
+        match fs::hard_link(path, &p).await {
+            Ok(()) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(e) if e.raw_os_error() == Some(libc_exdev()) => {}
+            Err(e) => return Err(anyhow::Error::from(e)),
+        }
+        let tmp = self.tmp_sibling(&p)?;
+        fs::copy(path, &tmp).await?;
+        let created = match fs::hard_link(&tmp, &p).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(anyhow::Error::from(e)),
+        };
+        let _ = fs::remove_file(&tmp).await;
+        created
+    }
+
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
         let p = self.resolve(key)?;
         match fs::read(&p).await {
@@ -451,9 +493,127 @@ pub struct S3Storage {
     bucket: String,
 }
 
+/// Above this, uploads go as parallel multipart parts instead of one
+/// sequential PUT — a 900 MB wheel went from ~12 s of single-stream S3 to
+/// ~2-3 s with parts in flight.
+const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
+const MULTIPART_PART_SIZE: u64 = 16 * 1024 * 1024;
+const MULTIPART_CONCURRENCY: usize = 6;
+
 impl S3Storage {
     pub fn new(s3: S3Client, bucket: String) -> Self {
         Self { s3, bucket }
+    }
+
+    /// Parallel multipart upload from a local file with a conditional
+    /// complete (`If-None-Match: *`) — immutability holds exactly as it does
+    /// for the single-PUT path, just decided at complete time. Any failure
+    /// aborts the multipart upload so no invisible parts linger billable.
+    async fn multipart_from_file(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        size: u64,
+        content_type: Option<&str>,
+    ) -> Result<bool> {
+        let mut create = self
+            .s3
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key);
+        if let Some(ct) = content_type {
+            create = create.content_type(ct);
+        }
+        let upload_id = create
+            .send()
+            .await
+            .context("create multipart upload")?
+            .upload_id
+            .ok_or_else(|| anyhow!("S3 returned no upload id"))?;
+
+        let result = self.upload_parts(key, path, size, &upload_id).await;
+        let completed = match result {
+            Ok(parts) => {
+                let mpu = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build();
+                match self
+                    .s3
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(mpu)
+                    .if_none_match("*")
+                    .send()
+                    .await
+                {
+                    Ok(_) => return Ok(true),
+                    Err(e) if lost_conditional_write(&e) => Ok(false),
+                    Err(e) => Err(anyhow::Error::from(e).context("complete multipart upload")),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        // Lost the immutability race or failed mid-flight: clean up the
+        // invisible parts either way.
+        let _ = self
+            .s3
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        completed
+    }
+
+    async fn upload_parts(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        size: u64,
+        upload_id: &str,
+    ) -> Result<Vec<aws_sdk_s3::types::CompletedPart>> {
+        let n_parts = size.div_ceil(MULTIPART_PART_SIZE);
+        let mut parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::with_capacity(n_parts as usize);
+        let part_numbers: Vec<i32> = (1..=n_parts as i32).collect();
+        for chunk in part_numbers.chunks(MULTIPART_CONCURRENCY) {
+            let uploads = chunk.iter().map(|&part_number| {
+                let offset = (part_number as u64 - 1) * MULTIPART_PART_SIZE;
+                let length = MULTIPART_PART_SIZE.min(size - offset);
+                async move {
+                    let body = ByteStream::read_from()
+                        .path(path)
+                        .offset(offset)
+                        .length(aws_sdk_s3::primitives::Length::Exact(length))
+                        .build()
+                        .await
+                        .context("open spool range")?;
+                    let out = self
+                        .s3
+                        .upload_part()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .part_number(part_number)
+                        .body(body)
+                        .send()
+                        .await
+                        .with_context(|| format!("upload part {part_number}"))?;
+                    Ok::<_, anyhow::Error>(
+                        aws_sdk_s3::types::CompletedPart::builder()
+                            .part_number(part_number)
+                            .set_e_tag(out.e_tag)
+                            .build(),
+                    )
+                }
+            });
+            for part in futures::future::join_all(uploads).await {
+                parts.push(part?);
+            }
+        }
+        Ok(parts)
     }
 }
 
@@ -585,6 +745,43 @@ impl Storage for S3Storage {
         }
     }
 
+    async fn put_file_if_absent(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        content_type: Option<&str>,
+    ) -> Result<bool> {
+        let size = tokio::fs::metadata(path)
+            .await
+            .with_context(|| format!("stat upload spool {}", path.display()))?
+            .len();
+        if size > MULTIPART_THRESHOLD {
+            return self
+                .multipart_from_file(key, path, size, content_type)
+                .await;
+        }
+        // The SDK streams the file body; nothing is buffered beyond its
+        // internal chunks. Same conditional create as put_if_absent.
+        let body = ByteStream::from_path(path)
+            .await
+            .with_context(|| format!("open upload spool {}", path.display()))?;
+        let mut req = self
+            .s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .if_none_match("*")
+            .body(body);
+        if let Some(ct) = content_type {
+            req = req.content_type(ct);
+        }
+        match req.send().await {
+            Ok(_) => Ok(true),
+            Err(e) if lost_conditional_write(&e) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
         let mut token: Option<String> = None;
         let mut entries = Vec::new();
@@ -627,20 +824,34 @@ impl Storage for S3Storage {
     }
 
     async fn list_dirs(&self, dir_prefix: &str) -> Result<Vec<String>> {
-        let out = self
-            .s3
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(dir_prefix)
-            .delimiter("/")
-            .send()
-            .await?;
+        // Paginate: ListObjectsV2 returns at most 1000 common prefixes per
+        // page. Without the token loop this silently capped the registry at
+        // 1000 packages — truncated global index, reconciler sweeping only
+        // the first thousand. Found at 10k-package scale.
+        let mut token: Option<String> = None;
         let mut dirs = Vec::new();
-        for cp in out.common_prefixes() {
-            if let Some(p) = cp.prefix() {
-                if let Some(name) = p.strip_prefix(dir_prefix).and_then(|s| s.strip_suffix('/')) {
-                    dirs.push(name.to_string());
+        loop {
+            let mut req = self
+                .s3
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(dir_prefix)
+                .delimiter("/");
+            if let Some(t) = token.take() {
+                req = req.continuation_token(t);
+            }
+            let out = req.send().await?;
+            for cp in out.common_prefixes() {
+                if let Some(p) = cp.prefix() {
+                    if let Some(name) = p.strip_prefix(dir_prefix).and_then(|s| s.strip_suffix('/'))
+                    {
+                        dirs.push(name.to_string());
+                    }
                 }
+            }
+            match out.next_continuation_token() {
+                Some(t) => token = Some(t.to_string()),
+                None => break,
             }
         }
         dirs.sort();
@@ -754,5 +965,172 @@ mod tests {
         assert_eq!(parse_range(Some("bytes=junk"), 100), Full);
         assert_eq!(parse_range(Some("items=0-5"), 100), Full);
         assert_eq!(parse_range(Some("bytes=9-5"), 100), Full);
+    }
+}
+
+/// Minimal in-memory Storage for unit tests across modules.
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    pub struct InMemStorage {
+        objects: Mutex<HashMap<String, Vec<u8>>>,
+        gets: AtomicUsize,
+        fail_next_get: AtomicBool,
+    }
+
+    impl InMemStorage {
+        pub fn insert(&self, key: &str, bytes: Vec<u8>) {
+            self.objects.lock().unwrap().insert(key.to_string(), bytes);
+        }
+        pub fn get_count(&self) -> usize {
+            self.gets.load(Ordering::SeqCst)
+        }
+        pub fn fail_next_get(&self) {
+            self.fail_next_get.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for InMemStorage {
+        async fn head_exists(&self, key: &str) -> Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+        async fn serve_artifact(
+            &self,
+            _key: &str,
+            _range: Option<&str>,
+        ) -> Result<axum::response::Response<axum::body::Body>> {
+            anyhow::bail!("serve_artifact not supported by InMemStorage")
+        }
+        async fn presign_get(
+            &self,
+            _key: &str,
+            _expires: std::time::Duration,
+        ) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn put_bytes(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<()> {
+            self.insert(key, bytes);
+            Ok(())
+        }
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bool> {
+            let mut map = self.objects.lock().unwrap();
+            if map.contains_key(key) {
+                return Ok(false);
+            }
+            map.insert(key.to_string(), bytes);
+            Ok(true)
+        }
+        async fn put_file_if_absent(
+            &self,
+            key: &str,
+            path: &std::path::Path,
+            content_type: Option<&str>,
+        ) -> Result<bool> {
+            let bytes = std::fs::read(path)?;
+            self.put_if_absent(key, bytes, content_type).await
+        }
+        async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            if self.fail_next_get.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("injected storage failure");
+            }
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| NotFound(key.to_string()).into())
+        }
+        async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
+            let map = self.objects.lock().unwrap();
+            let mut out: Vec<FileEntry> = map
+                .iter()
+                .filter(|(k, _)| k.starts_with(dir_prefix) && !k[dir_prefix.len()..].contains('/'))
+                .map(|(k, v)| FileEntry {
+                    key: k.clone(),
+                    size: v.len() as u64,
+                    last_modified: Some("2026-01-01T00:00:00Z".to_string()),
+                })
+                .collect();
+            out.sort_by(|a, b| a.key.cmp(&b.key));
+            Ok(out)
+        }
+        async fn list_dirs(&self, dir_prefix: &str) -> Result<Vec<String>> {
+            let map = self.objects.lock().unwrap();
+            let mut dirs: Vec<String> = map
+                .keys()
+                .filter_map(|k| k.strip_prefix(dir_prefix))
+                .filter_map(|rest| rest.split_once('/').map(|(d, _)| d.to_string()))
+                .collect();
+            dirs.sort();
+            dirs.dedup();
+            Ok(dirs)
+        }
+        async fn delete_keys(&self, keys: &[String]) -> Result<()> {
+            let mut map = self.objects.lock().unwrap();
+            for k in keys {
+                map.remove(k);
+            }
+            Ok(())
+        }
+        fn supports_leases(&self) -> bool {
+            true
+        }
+        async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|b| (b.clone(), test_etag(b))))
+        }
+        async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
+            let mut map = self.objects.lock().unwrap();
+            if map.contains_key(key) {
+                return Ok(None);
+            }
+            let etag = test_etag(&bytes);
+            map.insert(key.to_string(), bytes);
+            Ok(Some(etag))
+        }
+        async fn put_if_match(
+            &self,
+            key: &str,
+            etag: &str,
+            bytes: Vec<u8>,
+        ) -> Result<Option<String>> {
+            let mut map = self.objects.lock().unwrap();
+            match map.get(key) {
+                Some(current) if test_etag(current) == etag => {
+                    let new_etag = test_etag(&bytes);
+                    map.insert(key.to_string(), bytes);
+                    Ok(Some(new_etag))
+                }
+                _ => Ok(None),
+            }
+        }
+    }
+
+    fn test_etag(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
     }
 }

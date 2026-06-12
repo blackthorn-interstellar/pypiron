@@ -1,0 +1,117 @@
+"""Regression: one transient CDN error must not fail a sync run.
+
+A single 503 ("first byte timeout") on one of 7,714 files marked the whole
+package — and therefore the whole run — as failed, with no retry. At mirror
+scale transient errors are a statistical certainty; sync retries each file
+download with backoff before giving up.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import threading
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+from .helpers import find_free_port, run_checked
+
+pytestmark = pytest.mark.integration
+
+WHEEL_NAME = "flaky_pkg-1.0.0-py3-none-any.whl"
+
+
+def make_wheel() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr(
+            "flaky_pkg-1.0.0.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: flaky-pkg\nVersion: 1.0.0\n",
+        )
+        zf.writestr("flaky_pkg-1.0.0.dist-info/WHEEL", "Wheel-Version: 1.0\n")
+        zf.writestr("flaky_pkg-1.0.0.dist-info/RECORD", "")
+    return buf.getvalue()
+
+
+class FlakyPyPI(BaseHTTPRequestHandler):
+    """Serves the JSON API normally; 503s the FIRST artifact request only."""
+
+    wheel = make_wheel()
+    failures_remaining = 1
+    lock = threading.Lock()
+
+    def do_GET(self):  # noqa: N802 - stdlib naming
+        if self.path == "/pypi/flaky-pkg/json":
+            body = json.dumps(
+                {
+                    "releases": {
+                        "1.0.0": [
+                            {
+                                "filename": WHEEL_NAME,
+                                "url": f"http://127.0.0.1:{self.server.server_port}/files/{WHEEL_NAME}",
+                                "digests": {"sha256": hashlib.sha256(self.wheel).hexdigest()},
+                                "size": len(self.wheel),
+                                "packagetype": "bdist_wheel",
+                                "upload_time_iso_8601": "2026-01-01T00:00:00.000000Z",
+                            }
+                        ]
+                    }
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == f"/files/{WHEEL_NAME}":
+            with FlakyPyPI.lock:
+                if FlakyPyPI.failures_remaining > 0:
+                    FlakyPyPI.failures_remaining -= 1
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(self.wheel)))
+            self.end_headers()
+            self.wfile.write(self.wheel)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):  # quiet
+        pass
+
+
+def test_sync_retries_transient_download_failures(tmp_path, pypiron_bin):
+    port = find_free_port()
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), FlakyPyPI)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        packages = tmp_path / "packages.txt"
+        packages.write_text("flaky-pkg\n")
+        data_dir = tmp_path / "data"
+        # Direct-to-storage (disk) sync against the flaky stub: the 503 on
+        # attempt one must be retried, and the run must succeed.
+        run_checked(
+            [
+                str(pypiron_bin),
+                "sync",
+                "--packages-list",
+                str(packages),
+                "--from",
+                f"http://127.0.0.1:{port}",
+                "--data-dir",
+                str(data_dir),
+            ],
+            timeout=120,
+        )
+        stored = data_dir / "packages" / "flaky-pkg" / WHEEL_NAME
+        assert stored.exists(), "artifact missing after sync with one transient 503"
+        assert stored.read_bytes() == FlakyPyPI.wheel
+    finally:
+        httpd.shutdown()

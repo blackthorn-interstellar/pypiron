@@ -15,41 +15,32 @@ storage listing. See [docs/DESIGN.md](docs/DESIGN.md) for the full reasoning.
 
 ## Performance
 
-Measured, not promised: every number below is a row in
-[docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) with the commit,
-hardware, and method that produced it. Both rigs run the S3 backend — the
-configuration that actually gets deployed, not a tmpfs demo.
+Real measurements on real AWS hardware with the S3 backend — the setup
+people actually deploy. The small server costs about **$12/month**; the
+large one is a standard 8-CPU machine.
 
-**On a $12/month box** (`t4g.small`, 2 vCPU / 2 GiB, same-region S3):
+| | $12/month server (2 CPUs) | 8-CPU server |
+|---|---|---|
+| Requests answered per second (package lookups, update checks, download links) | **~75,000** | **~440,000** |
+| How fast each request finishes | almost all in under 2 ms | almost all in under 5 ms |
+| Browsing a giant package (PyTorch-sized: 2,000 versions) | 4,300 pages/second | 27,000 pages/second |
+| Publishing a package → installable by everyone | about **0.7 seconds** | about 1 second, even with 10,000 packages hosted |
+| Uploading a 900 MB wheel (PyTorch-sized) | 15–20 seconds, using only ~50 MB of memory | eight simultaneous uploads, all succeed — and installs stay fast the whole time |
+| Serving wheel downloads through the server | 3.9 gigabits/second | 48 gigabits/second |
 
-| | |
-|---|---|
-| Package-index reads | **76,000 req/s**, p99 1.7 ms |
-| 304 revalidations (pip/uv steady state) | **76,000 req/s** |
-| Presigned artifact redirects | **69,000 req/s** |
-| PEP 658 metadata reads | **72,000 req/s** |
-| torch-sized index (2,000 files, served gzipped) | **4,300 req/s** |
-| Upload → visible in the index | **p50 0.7 s, p99 1.1 s** |
-| Synchronous publish-then-install round trip | **p99 0.8 s**, zero read-your-write misses |
-| 900 MB wheel upload | 15–20 s at **~50 MB RSS** |
-| Proxied artifact downloads | 3.9 Gbps (the NIC gives out first) |
+In both cases the server code isn't the limit — the small machine runs out
+of network and CPU, and the large one was still answering 440,000 requests
+per second when our 64-CPU load generator was loafing at 8%. Background
+maintenance (the self-healing sweep) runs without readers noticing, and
+mirroring packages down from PyPI runs at over 100 files per second.
 
-**On an 8-vCPU box** (`c7gn.2xlarge`, same-region S3):
-
-| | |
-|---|---|
-| Index reads / 304s / redirects / metadata | **~440,000 req/s each**, p99 < 5 ms — server CPU-bound at 94% while a 64-vCPU load generator idled at 8% |
-| torch-sized index | **27,000 req/s gzipped**; 48 Gbps of NIC when a client insists on identity |
-| 8 × 900 MB concurrent uploads | 8/8 succeed at **287 MB peak RSS**, reads stay at p99 7 ms throughout |
-| 10,000-package corpus | upload→visible p99 **1.8 s**; a brand-new name reaches the global index in **1.7 s** |
-| Reads during a full reconcile sweep | **112,000 req/s, p99 0.76 ms** — the self-heal pass is invisible |
-| Mirroring from PyPI (`pypiron sync`) | 117 files/s on the long tail; torch-class wheels at ~1 Gbps |
-
-When this benchmarking effort started, the same suite on the same $12 box
-managed 2,000 index reads/s, took 58 seconds to make an upload visible, and
-was OOM-killed by a single torch upload. The complete path from there to
-here — every fix paired with its before/after — is the
-[improvements log](docs/BENCHMARK_RESULTS.md#improvements-log).
+Every number above comes from a logged, repeatable benchmark run — commit,
+hardware, and method included — in
+[docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md). For contrast: when
+benchmarking began, the $12 server managed 2,000 requests per second, took
+58 seconds to make a new upload installable, and crashed outright on a
+single PyTorch-sized upload. The full fix-by-fix path from there to here is
+the [improvements log](docs/BENCHMARK_RESULTS.md#improvements-log).
 
 ## Getting Started
 
@@ -94,6 +85,11 @@ open http://localhost:8080/simple/
   events are harmless
 * Multi-node on S3 via a sloppy leader lease (conditional writes, TTL)
 * Optional synchronous uploads for publish-then-install CI pipelines
+* **On-demand PyPI proxying** (opt-in): one URL for private packages plus
+  transparently cached public dependencies, origin-checked end to end
+* Optional **read authentication** (`--read-user`/`--read-pass`) — make the
+  registry actually private, not just unguessable
+* Boring observability: `/health`, Prometheus `/metrics`, `--log-format json`
 
 ## Mirroring packages with `pypiron sync`
 
@@ -160,6 +156,60 @@ Mirrored names are claimed `mirror`-origin; names already claimed by private
 uploads (or inside `--private-prefix`) are refused outright. Only the admin
 credential can mirror — backdating never rides along on the uploader credential.
 
+## On-demand proxying (cached public PyPI)
+
+`sync` mirrors what you list; the proxy mirrors what you *use*. With
+`--proxy-upstream`, one URL serves your private packages **and** public
+dependencies, fetched from upstream on first request and cached in storage
+forever after:
+
+```bash
+pypiron --admin-user admin --admin-pass secret \
+  --private-prefix acme \
+  --proxy-upstream https://pypi.org
+```
+
+* Package pages are answered from the upstream PEP 691 listing (cached for
+  60 s), carrying PyPI's true upload times — `--exclude-newer` stays
+  historically correct. Artifacts are downloaded on first GET, verified
+  against the upstream sha256, and committed as ordinary `mirror`-origin
+  files; from then on they serve locally, upstream up or down.
+* The origin rules are the same as `sync`: names claimed `private` (or inside
+  `--private-prefix`) **never** fall through to upstream. Run the proxy with
+  `--private-prefix` — without it, a new private name and the public name
+  race for first claim.
+* The same filters as `sync` gate what the proxy serves and caches, under a
+  `--proxy-` prefix: `--proxy-only-wheels`, `--proxy-only-sdists`,
+  `--proxy-python-tag`, `--proxy-abi-tag`, `--proxy-platform-tag`,
+  `--proxy-exclude-platform-tag`, `--proxy-exclude-newer`,
+  `--proxy-exclude-older`.
+* The global `/simple/` index lists local packages only (nobody pages through
+  all of PyPI); package URLs resolve regardless.
+* If upstream is unreachable, proxied pages fall back to the local
+  materialized index: everything already cached keeps resolving and
+  installing.
+
+## Authentication
+
+Three optional basic-auth credentials, strictly ordered — admin ⊇ uploader ⊇
+reader:
+
+| Credential | Flags | Grants |
+| --- | --- | --- |
+| admin | `--admin-user`/`--admin-pass` | everything: publish, mirror (backdating), delete, yank |
+| uploader | `--uploader-user`/`--uploader-pass` | publish ordinary uploads |
+| read | `--read-user`/`--read-pass` | read indexes and artifacts |
+
+With **no write credential** configured the server is **read-only** — open
+unauthenticated writes don't exist. With no read credential, reads are
+public. When `--read-user` is set, `/simple/` and `/files/` require auth
+(any of the three credentials works; `/health` and `/metrics` stay open for
+probes and scrapers), and clients embed it the usual way:
+
+```bash
+pip install --index-url http://reader:secret@localhost:8080/simple/ mypackage
+```
+
 ## Running with Docker
 
 ```bash
@@ -183,6 +233,11 @@ docker run --rm -it -p 8080:8080 \
   pypiron:latest
 ```
 
+**Large uploads:** the upload spool defaults to the system temp dir. In
+containers (and distros) where `/tmp` is a RAM-backed tmpfs, point it at real
+disk or multi-GB wheels spool into memory:
+`-v /data/spool:/spool -e PYPIRON_SPOOL_DIR=/spool`.
+
 ## Using with pip / uv / twine
 
 ```bash
@@ -200,7 +255,9 @@ twine upload --repository-url http://localhost:8080/legacy/ \
 
 Point clients at this registry **only** (`--index-url`, never
 `--extra-index-url https://pypi.org/simple` — that reopens the
-dependency-confusion hole the origin system closes).
+dependency-confusion hole the origin system closes). Need public packages
+too? That's what `--proxy-upstream` and `pypiron sync` are for — the same
+single URL, origin-checked.
 
 ## Management API
 
@@ -241,7 +298,12 @@ All options are available via CLI args and/or environment variables.
 | `--uploader-pass`            | `PYPIRON_UPLOADER_PASS`            | *(none)*       | Uploader credential password                     |
 | `--admin-user`               | `PYPIRON_ADMIN_USER`               | *(none)*       | Admin credential — publish + mirror/delete/yank  |
 | `--admin-pass`               | `PYPIRON_ADMIN_PASS`               | *(none)*       | Admin credential password                        |
+| `--read-user`                | `PYPIRON_READ_USER`                | *(none)*       | Read credential — when set, reads require auth   |
+| `--read-pass`                | `PYPIRON_READ_PASS`                | *(none)*       | Read credential password                         |
 | `--private-prefix`           | `PYPIRON_PRIVATE_PREFIX`           | *(none)*       | Reserve a namespace for private uploads          |
+| `--proxy-upstream`           | `PYPIRON_PROXY_UPSTREAM`           | *(none)*       | On-demand mirror of this upstream simple index (plus `--proxy-*` filters, see above) |
+| `--spool-dir`                | `PYPIRON_SPOOL_DIR`                | system temp    | Upload/proxy spool directory — real disk, not tmpfs |
+| `--log-format`               | `PYPIRON_LOG_FORMAT`               | `text`         | `text` or `json` (one object per line)           |
 | `--worker-interval-secs`     | `PYPIRON_WORKER_INTERVAL_SECS`     | `1`            | Worker tick interval (writes also nudge the worker directly) |
 | `--reconcile-interval-secs`  | `PYPIRON_RECONCILE_INTERVAL_SECS`  | `300`          | Full self-heal sweep interval                    |
 | `--lease-ttl-secs`           | `PYPIRON_LEASE_TTL_SECS`           | `30`           | Leader lease TTL (multi-node S3)                 |
@@ -250,6 +312,17 @@ All options are available via CLI args and/or environment variables.
 | `--sync-upload-timeout-secs` | `PYPIRON_SYNC_UPLOAD_TIMEOUT_SECS` | `10`           | Bound on the synchronous-upload wait             |
 
 **AWS credentials** follow standard AWS SDK envs: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`.
+
+### Operations
+
+* `GET /health` — `200 {"status":"ok"}` when storage answers a probe, `503`
+  otherwise. Unauthenticated; point your load balancer at it.
+* `GET /metrics` — Prometheus text: requests by route group and status class,
+  index rebuilds, reconcile sweeps, proxy fetch/cache counters.
+  Unauthenticated.
+* Logs go to stdout via `tracing`; `--log-format json` emits one JSON object
+  per line for log pipelines. Per-request logging is at `debug`
+  (`RUST_LOG=pypiron=debug`) so the access log never becomes the workload.
 
 ### Artifact delivery
 

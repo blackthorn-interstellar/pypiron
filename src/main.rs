@@ -882,21 +882,38 @@ async fn serve_index(
     cache_control: &'static str,
     headers: &HeaderMap,
 ) -> Response<Body> {
-    let (body, etag) = match state.index_cache.get(state.storage.as_ref(), &key).await {
+    let (identity, gzip) = match state.index_cache.get(state.storage.as_ref(), &key).await {
         Ok(Some(hit)) => hit,
         Ok(None) => return not_found("no such index"),
         Err(e) => return read_error(e),
     };
 
+    // Content negotiation against the precompressed variant: zero per-request
+    // CPU — big indexes were NIC-bound, and gzip is a ~5-7x cut in bytes.
+    // Each representation carries its own strong ETag (hence Vary).
+    let accepts_gzip = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("gzip"))
+        .unwrap_or(false);
+    let (variant, encoding) = match (&gzip, accepts_gzip) {
+        (Some(gz), true) => (gz, Some("gzip")),
+        _ => (&identity, None),
+    };
+
     let revalidated = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim() == "*" || v.contains(&*etag))
+        .map(|v| v.trim() == "*" || v.contains(&*variant.etag) || v.contains(&*identity.etag))
         .unwrap_or(false);
 
-    let builder = Response::builder()
-        .header(header::ETAG, &*etag)
+    let mut builder = Response::builder()
+        .header(header::ETAG, &*variant.etag)
+        .header(header::VARY, "Accept-Encoding")
         .header(header::CACHE_CONTROL, cache_control);
+    if let Some(enc) = encoding {
+        builder = builder.header(header::CONTENT_ENCODING, enc);
+    }
 
     let result = if revalidated {
         builder.status(StatusCode::NOT_MODIFIED).body(Body::empty())
@@ -904,10 +921,10 @@ async fn serve_index(
         builder
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, content_type)
-            .header(header::CONTENT_LENGTH, body.len())
+            .header(header::CONTENT_LENGTH, variant.body.len())
             // Arc<Vec<u8>> → owned copy for the response body: one memcpy of
             // an index per 200, which is nothing at index sizes.
-            .body(Body::from(body.as_ref().clone()))
+            .body(Body::from(variant.body.as_ref().clone()))
     };
     result.unwrap_or_else(not_found)
 }

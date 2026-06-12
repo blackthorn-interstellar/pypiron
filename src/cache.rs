@@ -36,19 +36,64 @@ pub const INDEX_CACHE_TTL: Duration = Duration::from_secs(1);
 /// times over, and "bounded and dumb" beats an LRU nobody will ever tune.
 pub const INDEX_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 
+/// One cacheable representation: body bytes plus the ETag identifying them.
+#[derive(Clone)]
+pub struct Variant {
+    pub body: Arc<Vec<u8>>,
+    pub etag: Arc<str>,
+}
+
 #[derive(Clone)]
 enum Cached {
-    Present { body: Arc<Vec<u8>>, etag: Arc<str> },
+    Present {
+        identity: Variant,
+        /// Precompressed at fill time when it actually shrinks the body —
+        /// the hot path serves gzip with zero per-request CPU. None for
+        /// bodies too small or too incompressible to bother.
+        gzip: Option<Variant>,
+    },
     Missing,
 }
 
 impl Cached {
     fn body_len(&self) -> usize {
         match self {
-            Cached::Present { body, .. } => body.len(),
+            Cached::Present { identity, gzip } => {
+                identity.body.len() + gzip.as_ref().map_or(0, |g| g.body.len())
+            }
             Cached::Missing => 0,
         }
     }
+}
+
+/// Below this, gzip headers cost more than they save.
+const GZIP_MIN_BYTES: usize = 1024;
+/// Keep the variant only if it actually pays: ≤90% of the original.
+const GZIP_KEEP_RATIO_PCT: usize = 90;
+
+fn quoted_sha256(bytes: &[u8]) -> Arc<str> {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("\"{:x}\"", hasher.finalize()).into()
+}
+
+fn maybe_gzip(identity: &[u8]) -> Option<Variant> {
+    if identity.len() < GZIP_MIN_BYTES {
+        return None;
+    }
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::with_capacity(identity.len() / 4), Compression::new(6));
+    enc.write_all(identity).ok()?;
+    let compressed = enc.finish().ok()?;
+    if compressed.len() * 100 > identity.len() * GZIP_KEEP_RATIO_PCT {
+        return None;
+    }
+    let etag = quoted_sha256(&compressed);
+    Some(Variant {
+        body: Arc::new(compressed),
+        etag,
+    })
 }
 
 struct Entry {
@@ -119,28 +164,31 @@ impl IndexCache {
     }
 
     /// Fetch an index through the cache. `Ok(None)` means "no such index"
-    /// (negatively cached). The ETag is the quoted SHA-256 of the body,
-    /// computed once per fill.
+    /// (negatively cached). Returns the identity representation plus the
+    /// precompressed gzip variant when one exists; ETags are the quoted
+    /// SHA-256 of each representation's bytes, computed once per fill.
     pub async fn get(
         &self,
         storage: &dyn Storage,
         key: &str,
-    ) -> Result<Option<(Arc<Vec<u8>>, Arc<str>)>> {
+    ) -> Result<Option<(Variant, Option<Variant>)>> {
         if let Some(hit) = self.fresh(key) {
             return Ok(match hit {
-                Cached::Present { body, etag } => Some((body, etag)),
+                Cached::Present { identity, gzip } => Some((identity, gzip)),
                 Cached::Missing => None,
             });
         }
 
         let cached = match storage.get_bytes(key).await {
             Ok(bytes) => {
-                let mut hasher = Sha256::new();
-                hasher.update(&bytes);
-                let etag: Arc<str> = format!("\"{:x}\"", hasher.finalize()).into();
+                let gzip = maybe_gzip(&bytes);
+                let etag = quoted_sha256(&bytes);
                 Cached::Present {
-                    body: Arc::new(bytes),
-                    etag,
+                    identity: Variant {
+                        body: Arc::new(bytes),
+                        etag,
+                    },
+                    gzip,
                 }
             }
             Err(e) if e.is::<NotFound>() => Cached::Missing,
@@ -159,7 +207,7 @@ impl IndexCache {
             entries.enforce_cap(self.max_bytes, self.ttl);
         }
         Ok(match cached {
-            Cached::Present { body, etag } => Some((body, etag)),
+            Cached::Present { identity, gzip } => Some((identity, gzip)),
             Cached::Missing => None,
         })
     }
@@ -242,23 +290,23 @@ mod tests {
         storage.insert("simple/foo/index.json", b"body-1".to_vec());
         let cache = IndexCache::new(Duration::from_secs(60));
 
-        let (body, etag) = cache
+        let (identity, _) = cache
             .get(&storage, "simple/foo/index.json")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(body.as_slice(), b"body-1");
-        assert_eq!(&*etag, etag_of(b"body-1"));
+        assert_eq!(identity.body.as_slice(), b"body-1");
+        assert_eq!(&*identity.etag, etag_of(b"body-1"));
         assert_eq!(storage.get_count(), 1);
 
         // Second read: served from RAM, same etag, no storage traffic.
-        let (body2, etag2) = cache
+        let (identity2, _) = cache
             .get(&storage, "simple/foo/index.json")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(body2.as_slice(), b"body-1");
-        assert_eq!(etag2, etag);
+        assert_eq!(identity2.body.as_slice(), b"body-1");
+        assert_eq!(identity2.etag, identity.etag);
         assert_eq!(storage.get_count(), 1);
     }
 
@@ -272,13 +320,17 @@ mod tests {
         storage.insert("simple/foo/index.json", b"new".to_vec());
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let (body, etag) = cache
+        let (identity, _) = cache
             .get(&storage, "simple/foo/index.json")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(body.as_slice(), b"new");
-        assert_eq!(&*etag, etag_of(b"new"), "etag must track the new body");
+        assert_eq!(identity.body.as_slice(), b"new");
+        assert_eq!(
+            &*identity.etag,
+            etag_of(b"new"),
+            "etag must track the new body"
+        );
         assert_eq!(storage.get_count(), 2);
     }
 
@@ -292,13 +344,13 @@ mod tests {
         storage.insert("simple/foo/index.json", b"new".to_vec());
         cache.invalidate("simple/foo/index.json");
 
-        let (body, _) = cache
+        let (identity, _) = cache
             .get(&storage, "simple/foo/index.json")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            body.as_slice(),
+            identity.body.as_slice(),
             b"new",
             "same-process write must be visible immediately"
         );
@@ -382,6 +434,73 @@ mod tests {
         assert!(
             cache.fresh("packages/p/a.whl").is_none(),
             "expired URLs must not be served"
+        );
+    }
+
+    #[tokio::test]
+    async fn gzip_variant_round_trips_with_distinct_etag() {
+        let storage = InMemStorage::default();
+        // Highly compressible and above the size floor.
+        let body = b"{\"files\": []}".repeat(500);
+        storage.insert("simple/foo/index.json", body.clone());
+        let cache = IndexCache::new(Duration::from_secs(60));
+
+        let (identity, gzip) = cache
+            .get(&storage, "simple/foo/index.json")
+            .await
+            .unwrap()
+            .unwrap();
+        let gz = gzip.expect("compressible body must get a gzip variant");
+        assert!(gz.body.len() < body.len() / 2, "gzip should pay for itself");
+        assert_ne!(
+            gz.etag, identity.etag,
+            "each representation has its own ETag"
+        );
+
+        use std::io::Read;
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(gz.body.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(
+            decoded, body,
+            "gzip variant must decode to the identity body"
+        );
+    }
+
+    #[tokio::test]
+    async fn tiny_and_incompressible_bodies_skip_gzip() {
+        let storage = InMemStorage::default();
+        storage.insert("simple/tiny/index.json", b"{}".to_vec());
+        // Random-ish bytes: hex of hashes, no structure to compress.
+        let incompressible: Vec<u8> = (0..200_000u32)
+            .flat_map(|i| {
+                let mut h = Sha256::new();
+                h.update(i.to_le_bytes());
+                h.finalize().to_vec()
+            })
+            .take(100_000)
+            .collect();
+        storage.insert("simple/rand/index.json", incompressible);
+        let cache = IndexCache::new(Duration::from_secs(60));
+
+        let (_, gz_tiny) = cache
+            .get(&storage, "simple/tiny/index.json")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            gz_tiny.is_none(),
+            "sub-1KB bodies must not carry a gzip variant"
+        );
+        let (_, gz_rand) = cache
+            .get(&storage, "simple/rand/index.json")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            gz_rand.is_none(),
+            "a variant that saves <10% must be dropped, not cached"
         );
     }
 

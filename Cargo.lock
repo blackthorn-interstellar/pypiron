@@ -1929,6 +1929,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
+ "flate2",
  "futures",
  "html-escape",
  "http 1.3.1",

@@ -11,7 +11,7 @@ from contextlib import ExitStack, contextmanager
 import pytest
 
 from .conftest import _start_s3_server
-from .helpers import download_pypi_wheel, kill_process_tree, upload_legacy, wait_for_file_in_index
+from .helpers import download_pypi_wheel, upload_legacy, wait_for_file_in_index
 
 PACKAGE = "six"
 OLD_VERSION = "1.16.0"
@@ -47,9 +47,11 @@ def test_leader_failover(minio, pypiron_bin, tmp_path_factory, tmp_path):
             "second node must be a follower while the leader lives"
         )
 
-        # Kill the leader; the survivor steals the expired lease and the
-        # pipeline keeps moving.
-        kill_process_tree(server_a["proc"])
+        # Crash the leader (SIGKILL — no graceful lease release; a SIGTERM
+        # hands the lease over and the survivor merely *acquires* it). The
+        # survivor must steal the expired lease and keep the pipeline moving.
+        server_a["proc"].kill()
+        server_a["proc"].wait(timeout=5.0)
 
         new_wheel = download_pypi_wheel(PACKAGE, NEW_VERSION, tmp_path)
         upload_legacy(

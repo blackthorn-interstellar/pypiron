@@ -94,6 +94,7 @@ pub async fn run_worker_until(
         }
         tokio::select! {
             _ = sleep(state.worker_interval) => {}
+            _ = state.worker_nudge.notified() => {}
             _ = shutdown.changed() => break,
         }
     }
@@ -595,6 +596,89 @@ mod tests {
         }
     }
 
+    /// Regression for write-visibility latency: a dirty marker dropped while
+    /// the worker is parked in its sleep must be processed via the nudge in
+    /// far less than the tick interval (10s here; the nudge makes it ~ms).
+    #[tokio::test]
+    async fn nudge_wakes_worker_before_tick() {
+        let pkg = "fastpkg";
+        let wheel = "fastpkg-1.0-py3-none-any.whl";
+        let mut objects = HashMap::new();
+        objects.insert(
+            format!("{PACKAGES_PREFIX}{pkg}/{wheel}"),
+            b"not-a-real-wheel".to_vec(),
+        );
+        objects.insert(
+            format!("{PACKAGES_PREFIX}{pkg}/{wheel}{SIDECAR_SUFFIX}"),
+            serde_json::to_vec(&Sidecar {
+                sha256: "ab".repeat(32),
+                size: 16,
+                version: "1.0".into(),
+                upload_time: "2026-01-01T00:00:00Z".into(),
+                requires_python: None,
+                yanked: Yanked::Flag(false),
+            })
+            .unwrap(),
+        );
+        objects.insert(
+            format!("{SIMPLE_PREFIX}index.json"),
+            br#"{"projects":[{"name":"fastpkg"}]}"#.to_vec(),
+        );
+        let storage = Arc::new(SweepStallsStorage {
+            objects: Mutex::new(objects),
+            sweep_entered: StdAtomicBool::new(false),
+        });
+        let state = Arc::new(AppState {
+            storage: storage.clone(),
+            uploader_user: None,
+            uploader_pass: None,
+            admin_user: None,
+            admin_pass: None,
+            private_prefix: None,
+            artifact_delivery: ArtifactDelivery::Auto,
+            worker_interval: Duration::from_secs(10),
+            reconcile_interval: Duration::from_secs(3600),
+            sync_uploads: false,
+            sync_upload_timeout: Duration::from_secs(1),
+            lease_ttl: Duration::from_secs(30),
+            index_cache: Arc::new(crate::cache::IndexCache::new(crate::cache::INDEX_CACHE_TTL)),
+            presign_cache: Arc::new(crate::cache::PresignCache::new(
+                crate::cache::PRESIGN_CACHE_TTL,
+            )),
+            spool_dir: std::env::temp_dir(),
+            global_index_lock: Arc::new(tokio::sync::Mutex::new(())),
+            worker_nudge: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(run_worker_until(state.clone(), shutdown_rx));
+        // Let the first (empty) tick pass; the worker parks in a 10s sleep.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        storage
+            .objects
+            .lock()
+            .unwrap()
+            .insert(format!("{DIRTY_PREFIX}{pkg}"), Vec::new());
+        state.worker_nudge.notify_one();
+
+        let index_key = format!("{SIMPLE_PREFIX}{pkg}/index.json");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut rebuilt = false;
+        while Instant::now() < deadline {
+            if storage.objects.lock().unwrap().contains_key(&index_key) {
+                rebuilt = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        worker.abort();
+        assert!(
+            rebuilt,
+            "nudged marker not processed within 2s — visibility is stuck on the 10s tick"
+        );
+    }
+
     /// Regression: a long reconcile sweep must not starve dirty-marker
     /// processing. Before the fix, the sweep ran inline ahead of tick() —
     /// uploads stayed invisible (and sync uploads timed out) for the whole
@@ -652,6 +736,7 @@ mod tests {
             )),
             spool_dir: std::env::temp_dir(),
             global_index_lock: Arc::new(tokio::sync::Mutex::new(())),
+            worker_nudge: Arc::new(tokio::sync::Notify::new()),
         });
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

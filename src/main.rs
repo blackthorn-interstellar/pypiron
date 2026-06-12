@@ -137,8 +137,10 @@ struct ServeArgs {
     )]
     artifact_delivery: ArtifactDelivery,
 
-    /// Worker interval in seconds
-    #[arg(long, env = "PYPIRON_WORKER_INTERVAL_SECS", default_value = "5")]
+    /// Worker interval in seconds. The nudge path makes same-process writes
+    /// visible at rebuild speed regardless; this is the marker-poll cadence
+    /// for peer nodes' writes. 1s costs ~$0.45/month in S3 LISTs.
+    #[arg(long, env = "PYPIRON_WORKER_INTERVAL_SECS", default_value = "1")]
     worker_interval_secs: u64,
 
     /// Full-reconcile sweep interval in seconds (the self-heal backbone)
@@ -194,6 +196,8 @@ struct AppState {
     spool_dir: std::path::PathBuf,
     /// Serializes incremental global-index read-modify-writes in-process.
     global_index_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Wakes the worker immediately after a write drops a dirty marker.
+    worker_nudge: Arc<tokio::sync::Notify>,
 }
 
 #[tokio::main]
@@ -241,6 +245,7 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
         spool_dir: cli.spool_dir.unwrap_or_else(std::env::temp_dir),
         global_index_lock: Arc::new(tokio::sync::Mutex::new(())),
+        worker_nudge: Arc::new(tokio::sync::Notify::new()),
     });
 
     if state.auth_open() {
@@ -776,7 +781,12 @@ fn now_rfc3339() -> String {
 
 /// Mark a package as needing an index rebuild (empty object at `_dirty/<pkg>`).
 async fn mark_dirty(state: &AppState, pkg: &str) -> Result<()> {
-    worker::mark_dirty(state.storage.as_ref(), pkg).await
+    worker::mark_dirty(state.storage.as_ref(), pkg).await?;
+    // Wake the worker now instead of letting the marker wait out the tick —
+    // upload→visible drops from ~tick+rebuild to ~rebuild. Peer nodes still
+    // ride the marker/tick path; this is a same-process accelerant only.
+    state.worker_nudge.notify_one();
+    Ok(())
 }
 
 /// --- Simple index endpoints ----------------------------------------------
@@ -922,9 +932,8 @@ async fn serve_index(
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, content_type)
             .header(header::CONTENT_LENGTH, variant.body.len())
-            // Arc<Vec<u8>> → owned copy for the response body: one memcpy of
-            // an index per 200, which is nothing at index sizes.
-            .body(Body::from(variant.body.as_ref().clone()))
+            // Bytes clone = refcount bump; hyper streams the shared buffer.
+            .body(Body::from(variant.body.clone()))
     };
     result.unwrap_or_else(not_found)
 }

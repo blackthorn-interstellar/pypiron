@@ -37,9 +37,11 @@ pub const INDEX_CACHE_TTL: Duration = Duration::from_secs(1);
 pub const INDEX_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 
 /// One cacheable representation: body bytes plus the ETag identifying them.
+/// `Bytes` so responses share the buffer refcounted instead of memcpying it —
+/// at 4k rps of 100 KB gzip bodies the clone was ~430 MB/s of pure copy.
 #[derive(Clone)]
 pub struct Variant {
-    pub body: Arc<Vec<u8>>,
+    pub body: bytes::Bytes,
     pub etag: Arc<str>,
 }
 
@@ -91,7 +93,7 @@ fn maybe_gzip(identity: &[u8]) -> Option<Variant> {
     }
     let etag = quoted_sha256(&compressed);
     Some(Variant {
-        body: Arc::new(compressed),
+        body: bytes::Bytes::from(compressed),
         etag,
     })
 }
@@ -185,7 +187,7 @@ impl IndexCache {
                 let etag = quoted_sha256(&bytes);
                 Cached::Present {
                     identity: Variant {
-                        body: Arc::new(bytes),
+                        body: bytes::Bytes::from(bytes),
                         etag,
                     },
                     gzip,
@@ -295,7 +297,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(identity.body.as_slice(), b"body-1");
+        assert_eq!(identity.body.as_ref(), b"body-1");
         assert_eq!(&*identity.etag, etag_of(b"body-1"));
         assert_eq!(storage.get_count(), 1);
 
@@ -305,7 +307,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(identity2.body.as_slice(), b"body-1");
+        assert_eq!(identity2.body.as_ref(), b"body-1");
         assert_eq!(identity2.etag, identity.etag);
         assert_eq!(storage.get_count(), 1);
     }
@@ -325,7 +327,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(identity.body.as_slice(), b"new");
+        assert_eq!(identity.body.as_ref(), b"new");
         assert_eq!(
             &*identity.etag,
             etag_of(b"new"),
@@ -350,7 +352,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            identity.body.as_slice(),
+            identity.body.as_ref(),
             b"new",
             "same-process write must be visible immediately"
         );
@@ -459,7 +461,7 @@ mod tests {
 
         use std::io::Read;
         let mut decoded = Vec::new();
-        flate2::read::GzDecoder::new(gz.body.as_slice())
+        flate2::read::GzDecoder::new(gz.body.as_ref())
             .read_to_end(&mut decoded)
             .unwrap();
         assert_eq!(

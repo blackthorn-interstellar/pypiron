@@ -249,6 +249,50 @@ Accept-Encoding by default, which silently invalidated the first attempt):
 (6.5× compression, done once at cache fill). pip and uv both send
 `Accept-Encoding: gzip`, so real clients get this path by default.
 
+### Run 009 — 2026-06-12 — event-driven audit + conditional writes on **real** AWS S3
+
+- Commit: `be4db39` + this change (global-index CAS HTML-ordering fix; audit/election
+  metrics) · Rig: `c7g.4xlarge` in **us-east-1**, same-region real S3 bucket (not MinIO)
+- Corpus: fabricated 5k tier via `bench/scale.py seed --packages 5000` (realistic
+  files-per-project distribution, RNG seed 42) → **5,000 packages / 104,645 files /
+  219,298 objects** (209,290 truth + 10,004 views), synced with `aws s3 sync`
+- Scripts: `bench/s3_cas_validate.py`, `bench/s3_scale_measure.py`,
+  `bench/s3_upload_during_steady.py`
+
+**Conditional writes — validated against the real thing.** MinIO only approximates
+S3's `If-None-Match`/`If-Match`; this confirms S3 returns the precondition errors
+that `lost_conditional_write` (storage.rs) catches, so a lost race is a clean retry,
+not a 500:
+
+| Path | S3 op | Result |
+|---|---|---|
+| Lease acquire | `put_if_none_match` create | one node wins, logs `lease acquired` |
+| Lease acquire conflict | `put_if_none_match` on existing | other node stays follower, no error |
+| Lease steal | `put_if_match` over expired lease | follower steals after TTL, logs `lease stolen` |
+| Global-index CAS conflict | `put_if_match` with stale ETag | zombie loses CAS, `pypiron_global_cas_conflicts_total` += 1, self-heals |
+
+**Audit — cost scales with churn, not corpus (measured).** Boot-audit duration and
+the new `/metrics` counters, read straight off the server:
+
+| Audit | duration | rebuilt | skipped | what it proves |
+|---|---|---|---|---|
+| cold (no fingerprints, rebuild-everything = restore-from-backup) | **140.1 s** | 5,001 | 0 | the explicit `resync`/restore cost |
+| steady (fingerprints match) | **8.0 s** | **0** | 5,001 | the daily default reads **nothing**; pure listing |
+
+- **`rebuilt=0` on real S3** is the headline: a steady audit over 104,645 files
+  re-derives no view and reads no sidecar — it only flat-lists.
+- **LIST cost**: the steady audit is ~293 LIST requests (219,298 objects ÷ 1,000 keys
+  per page + per-shard rounding across 36 shards) ≈ **$0.0015**. Linear in object
+  count, this extrapolates to ~46k LISTs ≈ **$0.23** at full PyPI — confirming the
+  SCALE.md projection's basis with a real measurement.
+- **upload → visible *during* an audit**: **0.55 s** during a steady audit, **0.59 s**
+  even during the 140 s cold rebuild-everything audit. The audit runs on its own task,
+  so the event path is never starved — a publish lands in ~one rebuild regardless of a
+  concurrent sweep. (Earlier "starvation" readings were a probe-naming artifact in the
+  harness, since fixed; the worker was always processing the marker promptly.)
+- Seeding note: `aws s3 sync` of 209,290 tiny objects took 818 s — CLI-concurrency
+  bound (10 parallel PUTs), not a server path; irrelevant to steady-state cost.
+
 <!--
 Template:
 

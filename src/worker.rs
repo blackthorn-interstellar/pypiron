@@ -233,6 +233,7 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
     let mut dead: Vec<String> = Vec::new();
     let mut failures = 0usize;
     let mut rebuilt = 0usize;
+    let mut skipped = 0usize;
 
     // Shards enumerate in parallel — that is what the sharding is for. The
     // bound keeps peak memory at a few shards' worth of listings (a shard is
@@ -248,6 +249,7 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
                     live.extend(result.live);
                     dead.extend(result.dead);
                     rebuilt += result.rebuilt;
+                    skipped += result.skipped;
                     failures += result.failures;
                 }
                 Err(e) => {
@@ -266,15 +268,18 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
     if failures > 0 {
         return Err(anyhow::anyhow!("audit finished with {failures} failure(s)"));
     }
-    state
-        .metrics
-        .reconcile_sweeps
+    let duration_secs = started.elapsed().as_secs_f64();
+    let m = &state.metrics;
+    m.reconcile_sweeps
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    m.audit_packages_rebuilt
+        .fetch_add(rebuilt as u64, std::sync::atomic::Ordering::Relaxed);
+    m.audit_packages_skipped
+        .fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
+    m.set_audit_duration(duration_secs);
     info!(
         packages = live.len(),
-        rebuilt,
-        duration_secs = started.elapsed().as_secs_f64(),
-        "reconcile: sweep complete"
+        rebuilt, skipped, duration_secs, "reconcile: sweep complete"
     );
     Ok(())
 }
@@ -284,6 +289,8 @@ struct ShardAudit {
     /// Observed with no artifacts: must not be listed globally.
     dead: Vec<String>,
     rebuilt: usize,
+    /// Provably unchanged (fingerprint hit): zero reads spent.
+    skipped: usize,
     failures: usize,
 }
 
@@ -324,6 +331,7 @@ async fn audit_shard(state: &AppState, shard: char, force_deep: bool) -> Result<
         live: Vec::new(),
         dead: Vec::new(),
         rebuilt: 0,
+        skipped: 0,
         failures: 0,
     };
     let mut fresh: std::collections::HashMap<String, String> = Default::default();
@@ -375,6 +383,7 @@ async fn audit_shard(state: &AppState, shard: char, force_deep: bool) -> Result<
                 out.dead.push(pkg);
             }
             out.rebuilt += was_rebuilt as usize;
+            out.skipped += (!was_rebuilt && !failed) as usize;
             out.failures += failed as usize;
         }
     }
@@ -436,12 +445,16 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
     }
 
     let mut work: Vec<(String, Vec<String>)> = Vec::new();
+    // Per package, how many unpaired-but-stale intents we are about to heal —
+    // counted into the metric only once the rebuild actually consumes them.
+    let mut stale_by_pkg: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for (pkg, markers) in per_pkg {
         let commit_nonces: HashSet<&str> = markers
             .iter()
             .filter(|m| m.is_commit)
             .filter_map(|m| m.nonce.as_deref())
             .collect();
+        let mut stale_healed = 0u64;
         let consumable: Vec<String> = markers
             .iter()
             .filter(|m| {
@@ -455,6 +468,10 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
                     .as_deref()
                     .is_some_and(|n| commit_nonces.contains(n));
                 let stale = m.written_at.is_none_or(|t| now - t >= state.intent_grace);
+                // A stale, never-committed intent is a crashed writer healing.
+                if !paired && stale {
+                    stale_healed += 1;
+                }
                 paired || stale
             })
             .map(|m| m.key.clone())
@@ -462,6 +479,9 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
         // Only fresh unpaired intents: a writer is mid-flight; its commit (or
         // staleness) will bring the package back.
         if !consumable.is_empty() {
+            if stale_healed > 0 {
+                stale_by_pkg.insert(pkg.clone(), stale_healed);
+            }
             work.push((pkg, consumable));
         }
     }
@@ -497,20 +517,30 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
         }));
     }
     let mut failures = 0usize;
+    let mut healed = 0u64;
     let (mut adds, mut removes) = (Vec::new(), Vec::new());
     let mut consumed: Vec<String> = Vec::new();
     for handle in handles {
         match handle.await {
-            Ok((pkg, keys, Some(true))) => {
-                adds.push(pkg);
-                consumed.extend(keys);
-            }
-            Ok((pkg, keys, Some(false))) => {
-                removes.push(pkg);
+            Ok((pkg, keys, Some(live_now))) => {
+                // Markers for this package are now consumed; the stale intents
+                // among them are healed crashed writers.
+                healed += stale_by_pkg.get(&pkg).copied().unwrap_or(0);
+                if live_now {
+                    adds.push(pkg);
+                } else {
+                    removes.push(pkg);
+                }
                 consumed.extend(keys);
             }
             _ => failures += 1,
         }
+    }
+    if healed > 0 {
+        state
+            .metrics
+            .stale_intents_healed
+            .fetch_add(healed, std::sync::atomic::Ordering::Relaxed);
     }
     // One batched global-index pass per tick: mass ingest of N new packages
     // rewrites the (corpus-sized) global views once, not N times.
@@ -593,6 +623,13 @@ async fn update_global_index(state: &AppState, adds: &[String], removes: &[Strin
         return Ok(());
     }
     let mut guard = state.global_names.lock().await;
+    // Once we lose a CAS we have already written an optimistic HTML for a name
+    // set that lost. If the reload then makes our delta a no-op (the winner
+    // already added our name), `changed` is false and we would return leaving
+    // that stale HTML as the final write — a drift nothing else heals (the
+    // audit reaches the same `changed` gate). So on that path, reconcile HTML
+    // to the now-canonical set before returning.
+    let mut wrote_optimistic_html = false;
     for _attempt in 0..4 {
         if guard.is_none() {
             *guard = Some(load_global_names(state).await?);
@@ -606,6 +643,17 @@ async fn update_global_index(state: &AppState, adds: &[String], removes: &[Strin
             changed |= cached.names.remove(pkg);
         }
         if !changed {
+            if wrote_optimistic_html {
+                let mut packages: Vec<String> = cached.names.iter().cloned().collect();
+                packages.sort();
+                put_if_changed(
+                    state,
+                    &format!("{SIMPLE_PREFIX}index.html"),
+                    pep503_global_html(&packages).into_bytes(),
+                    "text/html; charset=utf-8",
+                )
+                .await?;
+            }
             return Ok(());
         }
         let mut packages: Vec<String> = cached.names.iter().cloned().collect();
@@ -617,7 +665,21 @@ async fn update_global_index(state: &AppState, adds: &[String], removes: &[Strin
             }
             return Ok(());
         }
-        // Lost the CAS to a peer: drop the cache, reload, reapply the delta.
+        // Lost the CAS to a peer: another node updated the name set under us.
+        // We already wrote an optimistic HTML this iteration; remember that so
+        // a subsequent no-op reload still reconciles it. Count the conflict
+        // (operators watch this to confirm dual leadership converges rather
+        // than corrupts), then drop the cache, reload, reapply the delta.
+        wrote_optimistic_html = true;
+        state
+            .metrics
+            .global_cas_conflicts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        warn!(
+            adds = adds.len(),
+            removes = removes.len(),
+            "global index CAS lost to a peer; reloading and retrying"
+        );
         *guard = None;
     }
     anyhow::bail!("global index CAS retries exhausted")
@@ -665,8 +727,14 @@ async fn current_global_etag(state: &AppState) -> Option<String> {
         .map(|(_, etag)| etag)
 }
 
-/// Write both global views; the JSON is the canonical copy and goes first,
-/// conditionally where supported. Returns false when the CAS was lost.
+/// Write both global views. The canonical JSON — the one `changed` detection
+/// reloads from — is written LAST, under CAS where supported, so that a crash
+/// between the two writes is healed by replay: stale JSON re-detects the change
+/// and rewrites both. (JSON-first stranded a stale HTML that the name-set-change
+/// gate never revisited without an audit; the disk path already orders it this
+/// way.) HTML is last-writer-wins; a racing loser rewrites it on its retry, so
+/// the iteration whose JSON CAS finally wins always left a matching HTML.
+/// Returns false when the CAS was lost.
 async fn write_global_indexes_cas(
     state: &AppState,
     packages: &[String],
@@ -675,15 +743,7 @@ async fn write_global_indexes_cas(
     let json_key = format!("{SIMPLE_PREFIX}index.json");
     let json = pep691_global_json(packages).into_bytes();
     if state.storage.supports_leases() {
-        let outcome = match expected_etag {
-            Some(etag) => state.storage.put_if_match(&json_key, etag, json).await?,
-            None => state.storage.put_if_none_match(&json_key, json).await?,
-        };
-        if outcome.is_none() {
-            return Ok(false);
-        }
-        state.index_cache.invalidate(&json_key);
-        // HTML is derived from the same list; last-writer-wins is fine.
+        // HTML first: derived from the same list, unconditional, idempotent.
         let html_key = format!("{SIMPLE_PREFIX}index.html");
         state
             .storage
@@ -694,6 +754,15 @@ async fn write_global_indexes_cas(
             )
             .await?;
         state.index_cache.invalidate(&html_key);
+        // Canonical JSON last, under CAS: its success is what consumes markers.
+        let outcome = match expected_etag {
+            Some(etag) => state.storage.put_if_match(&json_key, etag, json).await?,
+            None => state.storage.put_if_none_match(&json_key, json).await?,
+        };
+        if outcome.is_none() {
+            return Ok(false);
+        }
+        state.index_cache.invalidate(&json_key);
         return Ok(true);
     }
     write_global_indexes(state, packages).await?;

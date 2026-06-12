@@ -45,6 +45,20 @@ pub struct Metrics {
     pub index_rebuilds: AtomicU64,
     /// Full reconcile sweeps completed.
     pub reconcile_sweeps: AtomicU64,
+    /// Audit outcomes, summed across passes: packages the audit rebuilt
+    /// (fingerprint differed or force-deep) vs skipped (fingerprint hit, zero
+    /// reads). A high skip ratio is the daily-audit default earning its keep.
+    pub audit_packages_rebuilt: AtomicU64,
+    pub audit_packages_skipped: AtomicU64,
+    /// Last completed audit's wall duration, seconds, as f64 bits (gauge).
+    audit_last_duration_bits: AtomicU64,
+    /// Global-index CAS write-backs lost to a peer (reload-and-retry fired).
+    /// A nonzero value is two nodes legitimately racing the name set — the
+    /// proof that dual leadership is converging, not corrupting.
+    pub global_cas_conflicts: AtomicU64,
+    /// Unpaired intents consumed after the grace period: a writer dropped an
+    /// intent and died before committing. A rising rate means writers crash.
+    pub stale_intents_healed: AtomicU64,
     /// Upstream package-listing fetches (proxy mode), by outcome.
     pub proxy_listing_fetches: AtomicU64,
     pub proxy_listing_errors: AtomicU64,
@@ -63,6 +77,11 @@ impl Metrics {
             requests: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             index_rebuilds: AtomicU64::new(0),
             reconcile_sweeps: AtomicU64::new(0),
+            audit_packages_rebuilt: AtomicU64::new(0),
+            audit_packages_skipped: AtomicU64::new(0),
+            audit_last_duration_bits: AtomicU64::new(0),
+            global_cas_conflicts: AtomicU64::new(0),
+            stale_intents_healed: AtomicU64::new(0),
             proxy_listing_fetches: AtomicU64::new(0),
             proxy_listing_errors: AtomicU64::new(0),
             proxy_artifacts_cached: AtomicU64::new(0),
@@ -88,6 +107,12 @@ impl Metrics {
             OVERFLOW_TAG
         };
         map.entry(key.to_string()).or_insert([0; ROUTES.len()])[route] += 1;
+    }
+
+    /// Record the wall duration of the audit pass that just completed.
+    pub fn set_audit_duration(&self, secs: f64) {
+        self.audit_last_duration_bits
+            .store(secs.to_bits(), Ordering::Relaxed);
     }
 
     pub fn record_request(&self, route: usize, status: u16) {
@@ -127,6 +152,26 @@ impl Metrics {
                 &self.reconcile_sweeps,
             ),
             (
+                "pypiron_audit_packages_rebuilt_total",
+                "Packages the audit rebuilt (fingerprint differed or force-deep).",
+                &self.audit_packages_rebuilt,
+            ),
+            (
+                "pypiron_audit_packages_skipped_total",
+                "Packages the audit skipped on a fingerprint hit (zero reads).",
+                &self.audit_packages_skipped,
+            ),
+            (
+                "pypiron_global_cas_conflicts_total",
+                "Global-index CAS write-backs lost to a peer (reload-and-retry).",
+                &self.global_cas_conflicts,
+            ),
+            (
+                "pypiron_stale_intents_healed_total",
+                "Unpaired intents consumed after the grace period (crashed writer).",
+                &self.stale_intents_healed,
+            ),
+            (
                 "pypiron_proxy_listing_fetches_total",
                 "Upstream package-listing fetches.",
                 &self.proxy_listing_fetches,
@@ -150,6 +195,14 @@ impl Metrics {
             out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
             out.push_str(&format!("{name} {}\n", value.load(Ordering::Relaxed)));
         }
+        let audit_secs = f64::from_bits(self.audit_last_duration_bits.load(Ordering::Relaxed));
+        out.push_str(
+            "# HELP pypiron_audit_last_duration_seconds Wall duration of the last completed audit pass.\n",
+        );
+        out.push_str("# TYPE pypiron_audit_last_duration_seconds gauge\n");
+        out.push_str(&format!(
+            "pypiron_audit_last_duration_seconds {audit_secs}\n"
+        ));
         let map = self
             .project_requests
             .lock()
@@ -206,8 +259,30 @@ mod tests {
         assert!(text.contains("pypiron_http_requests_total{route=\"simple\",status=\"4xx\"} 1"));
         assert!(text.contains("pypiron_proxy_artifacts_cached_total 3"));
         assert!(text.contains("# TYPE pypiron_http_requests_total counter"));
+        // New worker/audit counters and the duration gauge are always present.
+        assert!(text.contains("pypiron_audit_packages_rebuilt_total 0"));
+        assert!(text.contains("pypiron_audit_packages_skipped_total 0"));
+        assert!(text.contains("pypiron_global_cas_conflicts_total 0"));
+        assert!(text.contains("pypiron_stale_intents_healed_total 0"));
+        assert!(text.contains("# TYPE pypiron_audit_last_duration_seconds gauge"));
+        assert!(text.contains("pypiron_audit_last_duration_seconds 0"));
         // No project traffic recorded: the family is omitted entirely.
         assert!(!text.contains("pypiron_project_requests_total"));
+    }
+
+    #[test]
+    fn audit_duration_gauge_reflects_last_pass() {
+        let m = Metrics::new();
+        m.set_audit_duration(12.5);
+        m.audit_packages_rebuilt.fetch_add(2, Ordering::Relaxed);
+        m.audit_packages_skipped.fetch_add(40, Ordering::Relaxed);
+        let text = m.render();
+        assert!(
+            text.contains("pypiron_audit_last_duration_seconds 12.5"),
+            "{text}"
+        );
+        assert!(text.contains("pypiron_audit_packages_rebuilt_total 2"));
+        assert!(text.contains("pypiron_audit_packages_skipped_total 40"));
     }
 
     #[test]

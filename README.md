@@ -341,7 +341,14 @@ All options are available via CLI args and/or environment variables.
   otherwise. Unauthenticated; point your load balancer at it.
 * `GET /metrics` — Prometheus text: requests by route group and status class,
   index rebuilds, reconcile sweeps, proxy fetch/cache counters.
-  Unauthenticated.
+  Unauthenticated. Audit + leader-election machinery is observable too:
+  `pypiron_audit_packages_rebuilt_total` / `pypiron_audit_packages_skipped_total`
+  (fingerprint hits — a high skip ratio means the daily audit is cheap),
+  `pypiron_audit_last_duration_seconds` (gauge, last completed pass),
+  `pypiron_global_cas_conflicts_total` (two nodes raced the name set and the
+  loser reloaded — dual leadership converging, not corrupting), and
+  `pypiron_stale_intents_healed_total` (unpaired intents consumed past the
+  grace period — a rising rate means writers are crashing mid-upload).
 * Logs go to stdout via `tracing`; `--log-format json` emits one JSON object
   per line for log pipelines. Per-request logging is at `debug`
   (`RUST_LOG=pypiron=debug`) so the access log never becomes the workload.

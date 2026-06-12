@@ -40,6 +40,54 @@ def test_metrics_count_requests(disk_server):
     assert "pypiron_index_rebuilds_total" in text
     assert "pypiron_reconcile_sweeps_total" in text
     assert "pypiron_proxy_artifacts_cached_total" in text
+    # Audit + election observability (event-driven indexer machinery).
+    assert "pypiron_audit_packages_rebuilt_total" in text
+    assert "pypiron_audit_packages_skipped_total" in text
+    assert "pypiron_global_cas_conflicts_total" in text
+    assert "pypiron_stale_intents_healed_total" in text
+    assert "# TYPE pypiron_audit_last_duration_seconds gauge" in text
+
+
+def _metric_value(text: str, name: str) -> float | None:
+    m = re.search(rf"^{re.escape(name)} ([\d.eE+-]+)$", text, re.MULTILINE)
+    return float(m.group(1)) if m else None
+
+
+def test_audit_counters_populate_across_passes(disk_server_fast_reconcile):
+    """An audit rebuilds a freshly-uploaded package once (no stored
+    fingerprint), then skips it on every steady pass thereafter — the
+    daily-audit default's "cost scales with churn" claim, made observable."""
+    import time
+
+    from .helpers import make_wheel, upload_legacy
+
+    server = disk_server_fast_reconcile
+    wheel = make_wheel("obs-audit", "1.0", server["data_dir"].parent / "wheels")
+    upload_legacy(
+        f"{server['base_url']}/legacy/",
+        wheel,
+        username=server["user"],
+        password=server["password"],
+    )
+
+    # reconcile-interval is 2s; poll until a steady audit has skipped the
+    # package (proves at least one rebuild pass and one fingerprint-hit pass).
+    deadline = time.time() + 30
+    skipped = rebuilt = 0.0
+    while time.time() < deadline:
+        _, body, _ = http_get(f"{server['base_url']}/metrics")
+        text = body.decode()
+        skipped = _metric_value(text, "pypiron_audit_packages_skipped_total") or 0.0
+        rebuilt = _metric_value(text, "pypiron_audit_packages_rebuilt_total") or 0.0
+        if skipped >= 1:
+            break
+        time.sleep(0.5)
+
+    assert rebuilt >= 1, f"audit never rebuilt the new package: {rebuilt=}"
+    assert skipped >= 1, f"steady audit never skipped on a fingerprint hit: {skipped=}"
+    # The duration gauge reflects a completed pass (>= 0, present and numeric).
+    _, body, _ = http_get(f"{server['base_url']}/metrics")
+    assert _metric_value(body.decode(), "pypiron_audit_last_duration_seconds") is not None
 
 
 def test_metrics_attribute_project_without_read_auth(disk_server):

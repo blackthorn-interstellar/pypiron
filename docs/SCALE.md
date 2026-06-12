@@ -32,6 +32,30 @@ Extrapolations for the new audit at full PyPI (17.1M files, ~46M keys):
 parallel); disk: a ~15-minute background stat-walk, daily. When nothing
 changed, nothing else happens at any scale.
 
+## Measured on real AWS S3 (not MinIO)
+
+The S3 row above was extrapolation; this validates its basis on a real
+same-region bucket (us-east-1, `c7g.4xlarge`, 2026-06-12, commit `be4db39` +
+event-driven-indexer work). Corpus: the fabricated **5k tier** (5,000 packages
+/ 104,645 files / **219,298 objects**), seeded with `bench/scale.py seed` and
+synced to S3. Full procedure and conditional-write validation in
+[BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#run-009).
+
+| 5k pkgs / 104,645 files (real S3) | measured |
+|---|---|
+| steady audit (fingerprints match) | **8.0 s, `rebuilt=0`, `skipped=5001`** — reads no sidecar, only flat-lists |
+| cold rebuild-everything (restore-from-backup) | 140 s, `rebuilt=5001` |
+| steady audit LIST requests / cost | ~293 LISTs ≈ **$0.0015** (219,298 objects ÷ 1,000/page + 36-shard rounding) |
+| upload → visible *during* a running audit | **0.55 s** (steady) / **0.59 s** (cold) — event path never starved |
+
+The `rebuilt=0` steady audit and the per-object LIST cost both hold on the real
+thing. Scaling the measured LIST count linearly by object count lands at ~46k
+LISTs ≈ **$0.23** for full PyPI — the projection above, now anchored to a
+measurement rather than arithmetic. Conditional writes (`If-None-Match` lease
+acquire, `If-Match` lease steal + global-index CAS conflict) were exercised on
+the same bucket and behave exactly as the disk/MinIO tests assume: a lost race
+returns cleanly via `lost_conditional_write`, never an error.
+
 ---
 
 Everything below is the original investigation that motivated the rewrite,

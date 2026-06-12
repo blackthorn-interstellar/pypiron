@@ -13,6 +13,18 @@ unoptimized baseline.
 
 | # | Date | Commit | R1 idx rps | R3 304 rps | R2-lite rps | R6 302 rps | R7 meta rps | W3 visible p99 | W4 sync p99 | W1 100MB wall / RSS | W1-torch 900MB |
 |---|------|--------|-----------|-----------|------------|-----------|------------|---------------|------------|--------------------|----------------|
+| 0 | 2026-06-12 | `b79dd16` | 2,059 | 2,078 | 227 | 3,426 | 1,433 | 58.3s | 10.6s | 2.59s / 258MB | **FAIL (server OOM-killed)** |
+| 1 | 2026-06-12 | `b79dd16`+P1 | **82,231** | **88,399** | 881¹ | 10,092 | 1,406 | **1.57s** | 10.5s² | 4.91s³ / **36.7MB** | **PASS 18.9s / 15.5MB RSS** |
+
+| 2 | 2026-06-12 | `b79dd16`+P1b | 77,673 | 86,774 | 853¹ | **74,781** | **81,312** | 1.64s | **2.29s, 0/10 fail** | 2.1s / 52.2MB | **PASS 19.5s / 22MB** |
+
+¹ R2 is now NIC-bound, not server-bound: 17.8 GB of index bytes in 30 s ≈ 4.7 Gbps, the t4g.small burst ceiling.
+² W4 p50 fell 10.2s → 1.49s and failures 9/10 → 2/10; the tail is the leader-lease gap after restart (next fix).
+³ W1 wall rose 2.6s → 4.9s: the spool round-trips gp3 disk (~125 MB/s). RSS is the win; spool/upload overlap is known remaining juice.
+
+After run #2 the reference rig is hardware-bound on every scenario: R1/R3/R6/R7
+saturate ~75–87k rps of CPU+NIC, R2/R5 sit at the burst-NIC ceiling (~4.6 Gbps),
+W3 is worker-tick cadence, W1-torch is gp3 disk throughput. Phase 1 is dry.
 
 <!-- Append rows only. W1-torch records pass/FAIL(reason) until it passes. -->
 
@@ -22,6 +34,23 @@ Every landed optimization, paired with the meter runs that bracket it.
 
 | Date | Change (commit) | Benchmark moved | Before → After |
 |------|-----------------|-----------------|----------------|
+| 2026-06-12 | Reconcile sweep moved off the tick path + 16-way sidecar reads (worker.rs) | W3 visible p99 | 58.3s → 1.57s |
+| 2026-06-12 | Same | W4 sync p50 / RYW failures | 10.2s → 1.49s / 9/10 → 2/10 |
+| 2026-06-12 | In-memory index cache, ETag hashed once at fill (cache.rs) | R1 / R3 | 2,059 → 82,231 rps / 2,078 → 88,399 rps |
+| 2026-06-12 | Same | R2 torch index | 227 → 881 rps (now NIC-bound) |
+| 2026-06-12 | Streaming upload spool (upload.rs, put_file_if_absent) | W1-torch 900MB | OOM-killed → PASS, RSS 638MB+ → 15.5MB |
+| 2026-06-12 | Per-request logging INFO → debug; spool + log moved off tmpfs | server survival | 30s benchmark filled a 924MB tmpfs and wedged the box → stable |
+| 2026-06-12 | PEP 658 metadata served from RAM cache (immutable) | R7 | 1,406 → 81,312 rps |
+| 2026-06-12 | Presigned URLs reused across clients (immutable artifacts) | R6 | 10,092 → 74,781 rps |
+| 2026-06-12 | Leader lease released on graceful shutdown (lease.rs) | W4 read-your-write failures / p99 | 2/10 → **0/10** / 10.5s → 2.29s |
+| 2026-06-12 | Parallel multipart upload for >64MB artifacts (storage.rs) | W1 100MB / W1-torch 900MB wall | 3.8s → 1.32s / 32.7s → 18.0s |
+| 2026-06-12 | **S3 list_dirs pagination** (correctness: global index + reconciler silently capped at 1,000 packages) | corpus integrity @10k pkgs | 1,000 listed → 10,007 listed; regression test `tests/test_scale.py` |
+| 2026-06-12 | Concurrent dirty-marker drain (8-way, worker.rs) | mass-ingest of ~9k pending packages | unfinished after 40+ min → 528s (~17 pkg/s) |
+| 2026-06-12 | Semaphore drain (no chunk head-of-line blocking) | S2 visibility p99 during 5k-file burst | 72.9s → 1.80s |
+| 2026-06-12 | Incremental global-index update (worker.rs); sweep stays the healer | S4 new name → global index | 56.8s → 1.68s |
+| 2026-06-12 | Sidecar read fan-out 16 → 64 | S1 5,000-file package rebuild | 17.2s → 7.42s |
+| 2026-06-12 | Per-file download retry with backoff (sync.rs); test `tests/test_sync_retry.py` | M-suite robustness | one transient 503 in 7,714 files failed the whole run → retried and survives |
+| 2026-06-12 | Package-level sync concurrency (`--package-concurrency`, default 8) | M1 small-file mirror throughput | 13.7 → 30.6 files/s (wall now bound by largest single package) |
 
 ## Full run details
 
@@ -29,6 +58,138 @@ One subsection per benchmark session (meter runs, big-box runs, scale runs).
 Newest last. Include: date, commit, rig (instance types, region), corpus
 preset, exact command, and the full metric output (rps, p50/p95/p99, server
 peak RSS, CPU, storage op counts where logged).
+
+### Run 000 — 2026-06-11 — harness validation (NOT a meter row)
+
+- Commit: `b79dd16` · Rig: local MacBook + Docker MinIO (loopback; comparative only)
+- Suite: meter, `--duration 5s --connections 32 --skip-torch-upload`, torch preset reduced to 200 files
+- Purpose: prove the harness end-to-end before the rig. Numbers are NOT
+  comparable to reference-rig rows and never will be.
+
+| Scenario | rps | p50 ms | p95 ms | p99 ms | ok% | Notes |
+|---|---|---|---|---|---|---|
+| R1_json | 9,920 | 2.94 | 5.15 | 9.32 | 100 | per-request storage GET visible |
+| R1_html | 10,227 | 2.91 | 4.79 | 8.12 | 100 | |
+| R3_304 | 9,911 | 2.96 | 5.13 | 9.21 | 100 | 304 no faster than 200 — full GET + hash per request, as predicted |
+| R2_torch_idx | 2,446 | 11.57 | 29.49 | 35.3 | 100 | index size already dominates |
+| R6_302 | 10,931 | 2.75 | 4.33 | 6.55 | 100 | uv UA, presign per request |
+| R7_metadata | 10,462 | 2.87 | 4.79 | 7.69 | 100 | |
+| W3_visibility | — | p50 1.05s | — | p99 1.11s | — | 1s worker tick + rebuild |
+| W1_100mb | — | — | — | — | — | wall 1.86s, **peak RSS 245 MB** — multipart buffering confirmed |
+| W4_sync_upload | — | p50 1.08s | — | p99 10.08s | — | **hit the 10s sync timeout; 2/10 read-your-write failures** |
+| R5_proxy_download | 3.2 | 4038 | — | 4274 | 100 | 1.34 Gbps loopback, RSS flat 26 MB (downloads do stream) |
+
+Harness findings worth keeping: oha follows redirects by default (`-r 0`
+required or R6 measures S3, not the 302 — and exhausts loopback ports);
+oha emits null percentiles when nothing completes; the W4 sync-upload
+timeout is real behavior under S3-ish latency, not harness noise.
+
+### Run 001 — 2026-06-12 — reference-rig baseline #0 (meter row 0)
+
+- Commit: `b79dd16` (src/ unmodified; bench/ harness uncommitted) · Binary built on loadgen from the same tree
+- Rig: server `t4g.small` unlimited (i-06e8aef562f76f197) + loadgen `c7gn.4xlarge`, us-east-1, bucket `pypiron-bench-844098004410-us-east-1`
+- Config: S3 backend, `--artifact-delivery auto`, worker tick 1s, reconcile 300s — customer defaults otherwise
+- Corpus: meter preset (bench-small ×10, torchsim ×2000); seeding 2,010 files through `/legacy/` took **88s ≈ 23 files/s** (pre-M1 data point)
+- Suite: `bench/run-baseline.sh baseline-0` (oha `-z 30s -c 64`); raw JSON in `bench/results/baseline-0.json`
+
+| Scenario | rps | p50 ms | p95 ms | p99 ms | ok% | Notes |
+|---|---|---|---|---|---|---|
+| R1_json | 2,059 | 27.2 | 54.6 | 91.0 | 100 | p50 ≈ one S3 GET — per-request fetch confirmed at AWS latency |
+| R1_html | 2,118 | 26.7 | 51.8 | 82.8 | 100 | |
+| R3_304 | 2,078 | 27.2 | 53.3 | 84.1 | 100 | 304 exactly as expensive as 200: full S3 GET + SHA-256 per revalidation |
+| R2_torch_idx | 227 | 284.5 | 404.8 | 457.3 | 100 | 674 KB index; ~1.2 Gbps sustained but p50 0.28s — hash + fetch per request |
+| R6_302 | 3,426 | 15.7 | 36.0 | 66.2 | 100 | presign (local HMAC) + S3 HEAD per request |
+| R7_metadata | 1,433 | 28.5 | 82.8 | 107.9 | 100 | |
+| W3_visibility | — | p50 1.59s | — | **p99 58.3s** | — | long tail: worker/reconcile contention while corpus rebuilds queue up |
+| W1_100mb | — | — | — | — | — | wall 2.59s, peak RSS 258 MB (2.6× artifact size, buffered) |
+| W4_sync_upload | — | p50 **10.2s** | — | 10.6s | — | **all 10 hit the sync timeout; 9/10 read-your-write failures** — sync mode effectively broken on S3 at baseline |
+| R5_proxy_download | 4.7 | 1726 | 2339 | 2660 | 100 | **3.72 Gbps** S3→client pass-through, RSS flat at 18 MB — downloads genuinely stream |
+| W1_torch_900mb | — | — | — | — | — | **FAIL: server OOM-killed at ≥638 MB RSS** buffering the multipart body; client saw RemoteDisconnected at 2.9s |
+
+The baseline story in one line: reads are S3-GET-bound (~27 ms floor,
+~2k rps/endpoint), 304s buy nothing, big-index reads collapse to 227 rps,
+sync uploads time out, and a torch-class upload kills the box. Downloads
+stream; everything else is the optimization backlog, in priority order.
+
+### Run 004 — 2026-06-12 — Phase 2 brag box, meter shape (pre-multipart)
+
+- Commit: `b79dd16`+P1b · Rig: server `c7gn.2xlarge` (8 vCPU, 50 Gbps) + loadgen `c7gn.4xlarge`, us-east-1, same bucket/corpus
+- Suite: meter shape (oha `-z 30s -c 64`); raw JSON `bench/results/bragbox-meter.json`. NOT a meter-series row (different hardware).
+
+| Scenario | rps | p50 ms | p99 ms | Notes |
+|---|---|---|---|---|
+| R1_json / R1_html | 114,752 / 115,349 | 0.53 | 0.76 | likely loadgen-bound at 64 conns |
+| R3_304 | 117,716 | 0.51 | 0.76 | |
+| R2_torch_idx | 8,904 | 6.43 | 18.03 | **180 GB served in 30 s = 48 Gbps — NIC saturated by index bytes** |
+| R6_302 | 112,100 | 0.56 | 0.77 | presign cache |
+| R7_metadata | 115,507 | 0.52 | 0.78 | RAM cache |
+| W3 / W4 | p99 2.24s / p99 2.42s (0 RYW fail) | | | tick-cadence bound |
+| R5_proxy | 4.73 Gbps @ 8 conns | | | per-connection S3 GET bound; scales with conns |
+| W1_torch_900mb | PASS 32.7s, RSS 24.8MB | | | spool (gp3 125 MB/s) + single sequential PUT → multipart fix next |
+
+### Run 005 — 2026-06-12 — Phase 2 brag box, post-multipart + Tier 2
+
+- Commit: `b79dd16`+P1b+multipart · Same rig as Run 004
+- Raw JSON: `bench/results/bragbox-meter2.json`, `bench/results/tier2-bragbox.json`
+
+Multipart upload effect (parallel 16 MB parts, conditional complete):
+W1 100MB wall 3.8s → **1.32s**; W1-torch 900MB wall 32.7s → **18.0s** (the
+residual is the gp3 spool at 125 MB/s — provisioned-throughput EBS money, not
+code).
+
+Tier 2 at 1,024 connections (`oha -z 30s -c 1024`):
+
+| Scenario | rps | p50 ms | p99 ms |
+|---|---|---|---|
+| R1_json_1k | **442,005** | 2.14 | 4.52 |
+| R3_304_1k | **477,555** | 2.00 | 4.14 |
+| R6_302_1k | **441,551** | 2.24 | 4.55 |
+| R7_meta_1k | **443,901** | 2.15 | 4.47 |
+| R2_torch_1k | 9,110 (≈48 Gbps, NIC-pinned) | 82 | 548 |
+
+These may still be loadgen-bound — the server never blinked. W2: **8
+concurrent 900 MB uploads, 8/8 succeeded**, peak RSS 287 MB, reads at 8.8k
+rps / p99 7 ms throughout (read load shares the NIC with 7.2 GB of upload).
+Per-upload wall ~72 s is eight spools through one 125 MB/s gp3 volume —
+disk-bound by design, no longer memory-bound by defect.
+
+Phase 2 verdict: every read metric is NIC- or loadgen-bound, every write
+metric is EBS-bound. No code-level juice left at this tier.
+
+### Run 006 — 2026-06-12 — Phase 3: `medium` corpus (10k packages, 320k objects)
+
+- Rig: server `c7gn.2xlarge` + loadgen `c7gn.4xlarge`, us-east-1, real S3
+- Corpus: 10,000 synthetic packages × 10 files seeded direct-to-S3
+  (`bench/seed_s3.py`, 320k PUTs in 657s), on top of the meter corpus
+- Raw JSON: `bench/results/phase3-medium.json` (before), `phase3-medium-fixed.json` (after)
+
+Two scale defects found, fixed, and regression-tested:
+
+1. **Unpaginated S3 `list_dirs` capped the registry at 1,000 packages** —
+   global index truncated, reconciler silently sweeping a tenth of the
+   corpus. Pinned by `tests/test_scale.py` (1,100 packages via MinIO).
+2. **Marker drain was serial** (mass ingest of 10k packages: unfinished
+   after 40 min), then chunk-HOL-blocked (one 5,000-file rebuild stalled
+   unrelated packages' visibility to a 72.9 s p99). Fixed with
+   semaphore-bounded concurrent drain.
+
+Plus one architectural fast-path: the global index now updates
+**incrementally** when one name appears/disappears (the sweep's full rebuild
+remains the self-healing backbone, exactly per DESIGN.md).
+
+| Scenario | Before | After |
+|---|---|---|
+| S1 rebuild ladder 10/100/1000/5000 files | 0.56 / 66.0 / 67.2 / 58.9 s (backlog-polluted) | **0.42 / 0.98 / 3.24 / 7.42 s** (clean, linear, no cliff)¹ |
+| S2 upload→visible @10k pkgs | p50 1.24s / p99 **72.9s** | p50 1.24s / **p99 1.80s** |
+| S4 new name → global index | 56.8s | **1.68s** |
+| S5 reads during full sweep | — | **112k rps, p99 0.76 ms** (sweep invisible to readers) |
+| Mass ingest, ~9–10k pending packages | unfinished at 40+ min | **528s (~17 pkg/s)** |
+
+¹ first pass at SIDECAR_READ_CONCURRENCY=16 gave 17.2s for the 5,000-file
+rung; 64-way sidecar fan-out brought it to 7.42s.
+
+Steady-state visibility is flat from 100 packages to 10,000 — prefix-scoped
+rebuilds proven: corpus size does not tax single-package updates.
 
 <!--
 Template:

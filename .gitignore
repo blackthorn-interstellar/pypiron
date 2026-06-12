@@ -25,3 +25,8 @@ build/
 # macOS
 .DS_Store
 pypiron-data/
+# Bench harness local state
+bench/.keys/
+bench/.server-env
+bench/.rig.env
+bench/results/

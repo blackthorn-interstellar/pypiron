@@ -18,6 +18,7 @@ unoptimized baseline.
 
 | 2 | 2026-06-12 | `b79dd16`+P1b | 77,673 | 86,774 | 853¹ | **74,781** | **81,312** | 1.64s | **2.29s, 0/10 fail** | 2.1s / 52.2MB | **PASS 19.5s / 22MB** |
 | 3 | 2026-06-12 | `9c60027` | 76,346 | 78,162 | **4,283**⁴ | 71,120 | 75,068 | 1.69s | **1.83s, 0/10 fail** | 1.68s / 51.7MB | **PASS 14.6s / 53MB** |
+| 4 | 2026-06-12 | nudge+Bytes | 76,458 | 76,049 | 4,268 | 69,479 | 72,345 | **1.09s (p50 0.68s)** | **0.82s, 0/10 fail** | 2.1s / 75.6MB | PASS 19.4s⁵ / 50MB |
 
 ¹ R2 is now NIC-bound, not server-bound: 17.8 GB of index bytes in 30 s ≈ 4.7 Gbps, the t4g.small burst ceiling.
 ² W4 p50 fell 10.2s → 1.49s and failures 9/10 → 2/10; the tail is the leader-lease gap after restart (next fix).
@@ -26,6 +27,11 @@ unoptimized baseline.
 After run #2 the reference rig is hardware-bound on every scenario: R1/R3/R6/R7
 saturate ~75–87k rps of CPU+NIC, R2/R5 sit at the burst-NIC ceiling (~4.6 Gbps),
 W3 is worker-tick cadence, W1-torch is gp3 disk throughput. Phase 1 is dry.
+
+⁵ W1-torch wall varies 14–20s run-to-run with fresh gp3 volumes' burst
+credits; RSS is the stable signal. Row 4's headline: the worker nudge makes
+upload→visible cost one rebuild (~0.5s) instead of tick+rebuild — sync
+publish-then-install is now sub-second on the $12 box.
 
 ⁴ Row 3 R2 measures the gzip path (100 KB on the wire instead of 674 KB) —
 which is what uv and pip request by default. Same-row gains vs row 2: torch
@@ -61,6 +67,8 @@ Every landed optimization, paired with the meter runs that bracket it.
 | 2026-06-12 | …plus file-concurrency 16 within packages (flag tuning, no code) | M1 | 30.6 → **117 files/s** (8.5× total) |
 | 2026-06-12 | In-memory multipart for >64MB `put_if_absent` bodies (sync mirror path) | M2 torch-class mirroring | 0.95 → 1.04 Gbps (bound moved to per-file phase serialization; documented, deferred) |
 | 2026-06-12 | Precompressed gzip index/metadata variants (cache.rs) | R2 torch-index reads | 8,296 → 27,287 rps at half the wire bytes (NIC-bound → CPU-bound) |
+| 2026-06-12 | Worker nudge on writes (Notify) + 1s default tick | W3 visible p50 / W4 sync p99 | 1.35s → 0.68s / 1.83s → 0.82s |
+| 2026-06-12 | Cache bodies as `Bytes` (refcount, not memcpy) | per-response copy removed | ~430 MB/s of memcpy off the 2-vCPU hot path |
 
 ## Full run details
 

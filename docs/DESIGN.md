@@ -102,9 +102,12 @@ makes mirrored timestamps possible (below).
 Ordinary uploads never get to claim a timestamp — only receipt time.
 `--exclude-newer` is a supply-chain control; letting any uploader backdate a
 package would let them sneak under a cutoff. Backdating requires one of exactly
-two things: storage credentials, or upload credentials to a server whose
-operator has explicitly enabled mirror uploads (`--mirror-uploads`, below).
-Both are operator-controlled boundaries; neither is reachable from a default
+two things: storage credentials, or a *dedicated mirror credential* on a server
+whose operator configured one (`--mirror-auth-user`/`--mirror-auth-pass`,
+below). The mirror credential is deliberately separate from the ordinary upload
+credential — backdating is a distinct privilege, so the people who can publish
+private packages are not, by default, the people who can rewrite history. Both
+are operator-controlled boundaries; neither is reachable from a default
 deployment.
 
 ## Mirroring: carry forward true timestamps
@@ -116,19 +119,23 @@ the data is free; the design question is where it enters the system.
 
 The recommended path is **mirror-over-HTTP**: `sync --to <server>` POSTs each
 file to `/legacy/` with `mirror=true` plus PyPI's `upload_time` and yank state
-as form fields. The server — and only the server — writes storage: it claims
-the package `mirror`-origin, persists the provided timestamp in the sidecar,
-and extracts PEP 658 metadata from the wheel like any other upload. This keeps
-deployment simple (sync needs a URL and the upload credential, nothing else),
-keeps the storage layout a server-internal concern (no version coupling
-between a fleet of sync clients and the server), and keeps one writer.
+as form fields, authenticated against the mirror credential. The server — and
+only the server — writes storage: it claims the package `mirror`-origin,
+persists the provided timestamp in the sidecar, and extracts PEP 658 metadata
+from the wheel like any other upload. This keeps deployment simple (sync needs
+a URL and the mirror credential, nothing else), keeps the storage layout a
+server-internal concern (no version coupling between a fleet of sync clients
+and the server), and keeps one writer.
 
-Mirror uploads are an explicit server opt-in: `--mirror-uploads` off (the
-default) means any request carrying mirror fields is rejected outright, so a
-stock server still never accepts a client timestamp. With it on, the same
-basic-auth credential that can upload can also mirror — on a private registry
-the uploader set is the trusted set, and the flag is the operator saying "my
-uploaders may import history".
+Mirror uploads are gated on a dedicated credential: configuring
+`--mirror-auth-user`/`--mirror-auth-pass` is what enables them, and a mirror
+request authenticates against *that* credential alone — the ordinary upload
+credential cannot mirror, and the mirror credential cannot do ordinary uploads.
+With no mirror credential configured (the default) any request carrying mirror
+fields is rejected outright, so a stock server never accepts a client
+timestamp. The separation is the point: backdating is a distinct privilege from
+publishing, granted to a separate credential the operator hands only to the
+mirror job.
 
 `sync` can also write **directly to storage** (no `--to`): same binary, same
 storage code — artifact, sidecar carrying PyPI's digest and timestamp, dirty

@@ -1,7 +1,7 @@
 """Mirror-over-HTTP: sync --to pushes PyPI's history through /legacy/.
 
 The server owns all storage writes; sync needs only a URL and the upload
-credential. Backdating is an explicit server opt-in (--mirror-uploads).
+credential. Backdating is gated on a dedicated mirror credential.
 """
 
 from __future__ import annotations
@@ -25,7 +25,11 @@ CUTOFF = "2016-01-01T00:00:00Z"
 pytestmark = pytest.mark.integration
 
 
-def _sync_to(server, pypiron_bin, pkg_list, *extra):
+def _sync_to(server, pypiron_bin, pkg_list, *extra, user=None, password=None):
+    # Mirroring authenticates against the dedicated mirror credential, not the
+    # ordinary upload credential.
+    user = user if user is not None else server.get("mirror_user", server["user"])
+    password = password if password is not None else server.get("mirror_password", server["password"])
     return run_returncode(
         [
             str(pypiron_bin),
@@ -35,9 +39,9 @@ def _sync_to(server, pypiron_bin, pkg_list, *extra):
             "--to",
             server["base_url"],
             "--username",
-            server["user"],
+            user,
             "--password",
-            server["password"],
+            password,
             "--only-wheels",
             *extra,
         ],
@@ -96,8 +100,8 @@ def test_http_mirror_preserves_historical_timestamps(
     )
 
 
-def test_mirror_uploads_require_server_opt_in(disk_server, pypiron_bin, tmp_path):
-    """A stock server (no --mirror-uploads) refuses mirror pushes outright."""
+def test_mirror_uploads_require_mirror_credential(disk_server, pypiron_bin, tmp_path):
+    """A stock server (no mirror credential) refuses mirror pushes outright."""
     pkg_list = tmp_path / "packages.txt"
     pkg_list.write_text(f"{PACKAGE}\n")
     rc, out, err = _sync_to(disk_server, pypiron_bin, pkg_list)
@@ -158,8 +162,42 @@ def test_mirror_prefix_block_holds_even_when_already_mirror_claimed(
     upload_legacy(
         server["legacy"],
         acme,
-        username=server["user"],
-        password=server["password"],
+        username=server["mirror_user"],
+        password=server["mirror_password"],
         fields={"mirror": "true", "name": "acme-tool", "upload_time": "2020-01-01T00:00:00Z"},
         expect_status=403,
     )
+
+
+def test_mirror_requires_the_mirror_credential(disk_server_mirror, tmp_path):
+    """Ordinary upload credentials cannot perform a mirror upload; only the
+    dedicated mirror credential can. This is the whole point of the separate
+    credential — normal uploaders must not be able to backdate."""
+    wheel = download_pypi_wheel(PACKAGE, "1.17.0", tmp_path)
+    server = disk_server_mirror
+    mirror_fields = {"mirror": "true", "upload_time": "2014-01-01T00:00:00Z"}
+
+    # The upload credential (admin/secret) is rejected for a mirror upload.
+    upload_legacy(
+        server["legacy"],
+        wheel,
+        username=server["user"],
+        password=server["password"],
+        fields=mirror_fields,
+        expect_status=401,
+    )
+    # No artifact, no claim leaked through.
+    assert not (server["data_dir"] / "packages" / PACKAGE).exists()
+
+    # The mirror credential succeeds and the backdated time is honored.
+    upload_legacy(
+        server["legacy"],
+        wheel,
+        username=server["mirror_user"],
+        password=server["mirror_password"],
+        fields=mirror_fields,
+    )
+    index = wait_for_file_in_index(server["simple"], PACKAGE, wheel.name)
+    (entry,) = [f for f in index["files"] if f["filename"] == wheel.name]
+    assert entry["upload-time"] == "2014-01-01T00:00:00Z"
+    assert (server["data_dir"] / "packages" / PACKAGE / ".origin").read_text() == "mirror"

@@ -21,7 +21,7 @@ The bar for "supported" is blackbox-verified behavior against real clients
 | Package deletion | Delete event → index rebuild | Supported |
 | Origin exclusivity | Each package is `private` or `mirror`, claimed at first write; collisions rejected (dependency-confusion defense) | Supported |
 | Namespace prefix policy | Reserve a configured prefix for private uploads; mirror refuses it (cf. PEP 752) | Supported |
-| Mirrored upload times | `sync` carries PyPI's true `upload-time` into sidecars (over HTTP to a `--mirror-uploads` server, or straight to storage) so `--exclude-newer` works on mirrored packages | Supported |
+| Mirrored upload times | `sync` carries PyPI's true `upload-time` into sidecars (over HTTP to a server with a mirror credential, or straight to storage) so `--exclude-newer` works on mirrored packages | Supported |
 | [PEP 694](https://peps.python.org/pep-0694/) | Upload API 2.0 (draft) | Out of scope until stable |
 | [PEP 708](https://peps.python.org/pep-0708/) | Index merging / alternate locations metadata | Out of scope |
 | [PEP 740](https://peps.python.org/pep-0740/) | Attestations | Out of scope |

@@ -59,10 +59,12 @@ open http://localhost:8080/simple/
 ## Mirroring packages with `pypiron sync`
 
 The recommended mode mirrors **over HTTP**: sync needs only the server URL and
-the upload credential — no storage credentials, no knowledge of the server's
+the mirror credential — no storage credentials, no knowledge of the server's
 backend. It carries PyPI's true upload timestamps, so `--exclude-newer`
-resolves historically correct versions against your mirror. The server must
-opt in with `--mirror-uploads`.
+resolves historically correct versions against your mirror. The server enables
+it by configuring a dedicated mirror credential
+(`--mirror-auth-user`/`--mirror-auth-pass`), kept separate from the ordinary
+upload credential so normal uploaders cannot backdate packages.
 
 ```text
 # packages.txt — one entry per line; PEP 440 specifiers are optional
@@ -72,12 +74,13 @@ six==1.16.0
 ```
 
 ```bash
-# Server side: enable mirror uploads
-pypiron --mirror-uploads --basic-auth-user admin --basic-auth-pass secret
+# Server side: enable mirror uploads with a dedicated credential
+pypiron --basic-auth-user admin --basic-auth-pass secret \
+  --mirror-auth-user mirror --mirror-auth-pass mirrorsecret
 
-# Mirror over HTTP (recommended)
+# Mirror over HTTP (recommended) — authenticate with the mirror credential
 pypiron sync --packages-list packages.txt \
-  --to http://localhost:8080 --username admin --password secret
+  --to http://localhost:8080 --username mirror --password mirrorsecret
 
 # Or write directly to storage (needs bucket/disk access; no server involved)
 pypiron sync --packages-list packages.txt --data-dir ~/.pypiron/packages
@@ -115,8 +118,9 @@ the working directory. An explicit `--packages-list` on the CLI replaces the
 file's list entirely; other options layer per-key.
 
 Mirrored names are claimed `mirror`-origin; names already claimed by private
-uploads (or inside `--private-prefix`) are refused outright — backdating never
-rides along on ordinary uploads, even on a mirror-enabled server.
+uploads (or inside `--private-prefix`) are refused outright. The mirror
+credential is the only thing that can mirror — backdating never rides along on
+the ordinary upload credential.
 
 ## Running with Docker
 
@@ -195,7 +199,8 @@ All options are available via CLI args and/or environment variables.
 | `--basic-auth-user`          | `PYPIRON_BASIC_AUTH_USER`          | *(none)*       | Username for upload/management auth              |
 | `--basic-auth-pass`          | `PYPIRON_BASIC_AUTH_PASS`          | *(none)*       | Password for upload/management auth              |
 | `--private-prefix`           | `PYPIRON_PRIVATE_PREFIX`           | *(none)*       | Reserve a namespace for private uploads          |
-| `--mirror-uploads`           | `PYPIRON_MIRROR_UPLOADS`           | `false`        | Accept mirror uploads (what `sync --to` sends)   |
+| `--mirror-auth-user`         | `PYPIRON_MIRROR_AUTH_USER`         | *(none)*       | Mirror-upload credential user (enables mirroring) |
+| `--mirror-auth-pass`         | `PYPIRON_MIRROR_AUTH_PASS`         | *(none)*       | Mirror-upload credential password                |
 | `--worker-interval-secs`     | `PYPIRON_WORKER_INTERVAL_SECS`     | `5`            | Worker tick interval                             |
 | `--reconcile-interval-secs`  | `PYPIRON_RECONCILE_INTERVAL_SECS`  | `300`          | Full self-heal sweep interval                    |
 | `--lease-ttl-secs`           | `PYPIRON_LEASE_TTL_SECS`           | `30`           | Leader lease TTL (multi-node S3)                 |

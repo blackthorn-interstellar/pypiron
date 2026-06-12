@@ -161,18 +161,28 @@ def disk_server_sync_uploads(tmp_path_factory, pypiron_bin: Path) -> Iterator[Di
     yield from _start_disk_server(tmp_path_factory, pypiron_bin, extra_args=["--sync-uploads"])
 
 
+_MIRROR_ARGS = ["--mirror-auth-user", "mirror", "--mirror-auth-pass", "mirrorsecret"]
+_MIRROR_CREDS = {"mirror_user": "mirror", "mirror_password": "mirrorsecret"}
+
+
 @pytest.fixture()
 def disk_server_mirror(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
-    """Disk server accepting mirror uploads (what sync --to targets)."""
-    yield from _start_disk_server(tmp_path_factory, pypiron_bin, extra_args=["--mirror-uploads"])
+    """Disk server with a dedicated mirror credential (what sync --to targets).
+
+    The mirror credential is distinct from the upload credential (admin/secret),
+    so ordinary uploaders cannot backdate.
+    """
+    for server in _start_disk_server(tmp_path_factory, pypiron_bin, extra_args=_MIRROR_ARGS):
+        yield {**server, **_MIRROR_CREDS}
 
 
 @pytest.fixture()
 def disk_server_mirror_prefixed(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Mirror-enabled server reserving the `acme` namespace for private uploads."""
-    yield from _start_disk_server(
-        tmp_path_factory, pypiron_bin, extra_args=["--mirror-uploads", "--private-prefix", "acme"]
-    )
+    for server in _start_disk_server(
+        tmp_path_factory, pypiron_bin, extra_args=[*_MIRROR_ARGS, "--private-prefix", "acme"]
+    ):
+        yield {**server, **_MIRROR_CREDS}
 
 
 # ------------------------------ MinIO (S3) fixtures ---------------------------

@@ -78,12 +78,18 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
     private_prefix: Option<String>,
 
-    /// Accept mirror uploads: authenticated `/legacy/` requests carrying
+    /// Mirror-upload credential username. Configuring this (with a password)
+    /// is what enables mirror uploads: `/legacy/` requests carrying
     /// `mirror=true` may claim mirror origin and provide historical
-    /// `upload_time`/yank state (what `sync --to` sends). Off by default —
-    /// a stock server never accepts a client timestamp.
-    #[arg(long, env = "PYPIRON_MIRROR_UPLOADS")]
-    mirror_uploads: bool,
+    /// `upload_time`/yank state (what `sync --to` sends), but only when
+    /// authenticated against THIS credential — the ordinary upload credential
+    /// cannot backdate. Unset → mirror uploads are rejected.
+    #[arg(long, env = "PYPIRON_MIRROR_AUTH_USER")]
+    mirror_auth_user: Option<String>,
+
+    /// Mirror-upload credential password (see --mirror-auth-user).
+    #[arg(long, env = "PYPIRON_MIRROR_AUTH_PASS")]
+    mirror_auth_pass: Option<String>,
 
     /// Redirect artifact downloads to presigned S3 URLs (302) so this node
     /// never touches wheel bytes (S3 backend only)
@@ -122,8 +128,9 @@ struct AppState {
     // auth
     upload_user: Option<String>,
     upload_pass: Option<String>,
+    mirror_user: Option<String>,
+    mirror_pass: Option<String>,
     private_prefix: Option<String>,
-    mirror_uploads: bool,
     presigned_redirects: bool,
     // worker cfg
     worker_interval: Duration,
@@ -165,8 +172,9 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         storage,
         upload_user: cli.basic_auth_user,
         upload_pass: cli.basic_auth_pass,
+        mirror_user: cli.mirror_auth_user,
+        mirror_pass: cli.mirror_auth_pass,
         private_prefix: cli.private_prefix.as_deref().map(normalize_pkg_name),
-        mirror_uploads: cli.mirror_uploads,
         presigned_redirects: cli.s3_presigned_redirects,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
@@ -178,6 +186,14 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
     if state.upload_user.is_none() || state.upload_pass.is_none() {
         warn!(
             "no --basic-auth-user/--basic-auth-pass configured: uploads, deletes, and yanks are UNAUTHENTICATED"
+        );
+    }
+    if state.mirror_credential().is_none() {
+        info!("mirror uploads disabled (set --mirror-auth-user/--mirror-auth-pass to enable)");
+    } else if state.mirror_credential() == state.upload_credential() {
+        warn!(
+            "mirror credential equals the upload credential: ordinary uploaders can backdate \
+             (set a distinct --mirror-auth-user/--mirror-auth-pass to separate the powers)"
         );
     }
 
@@ -298,7 +314,15 @@ async fn legacy_upload(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers)?;
+    // Mirror-ness lives in a form field, so the auth decision can't be final
+    // until the body is parsed. From the header alone we learn which
+    // credential(s) this request satisfies, and reject up front only when no
+    // valid interpretation exists — preserving "never read the body of an
+    // unauthorized request".
+    let auth = UploadAuth::from_headers(&state, &headers);
+    if !auth.upload_ok && !auth.mirror_ok {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".into()));
+    }
 
     let mut filename_opt: Option<String> = None;
     let mut file_bytes: Option<Vec<u8>> = None;
@@ -395,25 +419,38 @@ async fn legacy_upload(
     let key = format!("{PACKAGES_PREFIX}{pkg_norm}/{filename}");
 
     // Mirror mode: `sync --to` sends mirror=true plus PyPI's historical
-    // metadata. Backdating is operator-gated — a request carrying mirror
-    // fields against a stock server is rejected outright, never reinterpreted
-    // as a normal upload.
+    // metadata. Backdating is its own privilege — gated on the dedicated
+    // mirror credential, never reachable with ordinary upload rights, and
+    // never reinterpreted as a normal upload.
     let is_mirror = fields.get("mirror").map(String::as_str) == Some("true");
-    if is_mirror && !state.mirror_uploads {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Mirror uploads are not enabled on this server (--mirror-uploads)".into(),
-        ));
-    }
-    if !is_mirror
-        && (fields.contains_key("upload_time")
+    if is_mirror {
+        if state.mirror_credential().is_none() {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Mirror uploads are not enabled on this server (--mirror-auth-user/--mirror-auth-pass)".into(),
+            ));
+        }
+        if !auth.mirror_ok {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Mirror uploads require the mirror credential".into(),
+            ));
+        }
+    } else {
+        // An ordinary upload needs ordinary upload rights — the mirror-only
+        // credential cannot stand in for it.
+        if !auth.upload_ok {
+            return Err((StatusCode::UNAUTHORIZED, "Unauthorized".into()));
+        }
+        if fields.contains_key("upload_time")
             || fields.contains_key("yanked")
-            || fields.contains_key("yanked_reason"))
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "upload_time/yanked fields require mirror=true on a mirror-enabled server".into(),
-        ));
+            || fields.contains_key("yanked_reason")
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "upload_time/yanked fields require a mirror upload (mirror=true with the mirror credential)".into(),
+            ));
+        }
     }
     let upload_time = match fields.get("upload_time") {
         Some(ts) => {
@@ -986,9 +1023,55 @@ fn accepts_json(headers: &HeaderMap) -> bool {
     false
 }
 
-/// Gate writes behind basic auth when credentials are configured.
+impl AppState {
+    /// The configured upload credential, if any (both halves required).
+    fn upload_credential(&self) -> Option<(&str, &str)> {
+        match (&self.upload_user, &self.upload_pass) {
+            (Some(u), Some(p)) => Some((u, p)),
+            _ => None,
+        }
+    }
+
+    /// The configured mirror credential, if any. Its presence is what enables
+    /// mirror uploads.
+    fn mirror_credential(&self) -> Option<(&str, &str)> {
+        match (&self.mirror_user, &self.mirror_pass) {
+            (Some(u), Some(p)) => Some((u, p)),
+            _ => None,
+        }
+    }
+}
+
+/// Which upload powers a request's `Authorization` header grants. Computed
+/// from the header alone so the decision is available before the body is read.
+struct UploadAuth {
+    /// May perform ordinary uploads (open when no upload credential is set).
+    upload_ok: bool,
+    /// May perform mirror uploads (only ever true when a mirror credential is
+    /// set and matched — backdating is never open).
+    mirror_ok: bool,
+}
+
+impl UploadAuth {
+    fn from_headers(state: &AppState, headers: &HeaderMap) -> Self {
+        let upload_ok = match state.upload_credential() {
+            None => true, // open uploads
+            Some((u, p)) => check_basic_auth(headers, u, p).is_ok(),
+        };
+        let mirror_ok = match state.mirror_credential() {
+            None => false, // mirror uploads disabled
+            Some((u, p)) => check_basic_auth(headers, u, p).is_ok(),
+        };
+        Self {
+            upload_ok,
+            mirror_ok,
+        }
+    }
+}
+
+/// Gate management routes (delete, yank) behind the upload credential.
 fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
-    if let (Some(user), Some(pass)) = (&state.upload_user, &state.upload_pass) {
+    if let Some((user, pass)) = state.upload_credential() {
         if check_basic_auth(headers, user, pass).is_err() {
             return Err((StatusCode::UNAUTHORIZED, "Unauthorized".into()));
         }

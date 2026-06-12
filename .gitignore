@@ -31,3 +31,5 @@ bench/.server-env
 bench/.rig.env
 bench/results/
 /data/
+# Bulk PyPI corpus downloads (95MB+, see src/corpus_check.rs)
+bench/corpus/

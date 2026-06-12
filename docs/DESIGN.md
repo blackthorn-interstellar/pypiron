@@ -321,7 +321,8 @@ to the adjacent stored file.
 
 ## Honest scaling limits
 
-Measured against a fabricated full-PyPI-shaped corpus (see SCALE.md):
+Measured against a fabricated full-PyPI-shaped corpus (see
+[BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#scale-full-pypi-measured)):
 
 - Per-package write throughput is serialized through the leader — fine, uploads are
   rare by definition.

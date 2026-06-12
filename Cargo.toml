@@ -1,6 +1,8 @@
 [package]
 name = "pypiron"
-version = "0.1.0"
+# Permanent placeholder: real versions come from git tags (vX.Y.Z).
+# CI stamps the tag version in before building wheels. See RELEASE.md.
+version = "0.0.0"
 edition = "2021"
 
 [dependencies]

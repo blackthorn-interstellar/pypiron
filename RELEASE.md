@@ -1,33 +1,46 @@
 # Release Process
 
-## Prerequisites
+Versions are determined solely by git tags. `Cargo.toml` permanently says
+`0.0.0`; when a `vX.Y.Z` tag is pushed, CI stamps the tag version into
+`Cargo.toml`/`Cargo.lock` (`.github/stamp-version.sh`) before building, so the
+wheels, sdist, and the binary's `--version` all pick it up. There is no
+version-bump commit.
 
-Set up PyPI API token as a GitHub secret:
-1. Get token from https://pypi.org/manage/account/token/
-2. Add to GitHub: Settings → Secrets and variables → Actions
-3. Create secret named `PYPI_API_TOKEN`
-
-## Build Locally
+## Make a release
 
 ```bash
-# Install maturin (first time only)
-make install-maturin
+git tag v0.2.0
+git push origin v0.2.0
+```
 
-# Build wheel
-make build-wheel
+That's it. CI runs fmt/clippy/tests, builds wheels for all platforms plus the
+sdist, generates build-provenance attestations, and publishes to PyPI via
+trusted publishing. Nothing is published if the tests fail.
 
-# Test it
+Local and dev builds report version `0.0.0` — only tagged CI builds carry a
+real version. `git describe --tags` tells you where a checkout sits relative
+to releases.
+
+## One-time setup: PyPI trusted publishing
+
+The release job authenticates with OIDC; no API token is stored anywhere.
+Configure once at https://pypi.org/manage/project/pypiron/settings/publishing/:
+
+- Owner: `brycedrennan`
+- Repository: `pypiron`
+- Workflow: `ci.yml`
+- Environment: (leave blank)
+
+## Local build
+
+```bash
+make build-wheel        # wheel lands in target/wheels/
 pip install target/wheels/pypiron-*.whl
 pypiron --help
 ```
 
-## Make a Release
+## Dry-running the pipeline
 
-1. Update version in `Cargo.toml` and `pyproject.toml`
-2. Commit and push
-3. Create and push tag:
-   ```bash
-   git tag -a v0.1.0 -m "Release 0.1.0"
-   git push origin v0.1.0
-   ```
-4. GitHub Actions will automatically build and publish to PyPI
+Trigger the workflow manually (`workflow_dispatch`) to build the full wheel
+matrix without publishing — untagged builds carry version `0.0.0` and the
+release job only runs for tags.

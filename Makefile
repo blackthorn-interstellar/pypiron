@@ -1,4 +1,4 @@
-.PHONY: init init-rust init-python build dev run test test-rust test-python perf compat check cargo-check af fmt lint clean doc publish build-wheel release-build help
+.PHONY: init init-rust init-python build dev run test test-rust test-python perf compat check cargo-check af fmt lint clean doc build-wheel help
 
 SHELL := /bin/bash
 
@@ -60,14 +60,8 @@ clean:  ## Clean build artifacts
 doc:  ## Generate documentation
 	cargo doc --no-deps
 
-build-wheel:  ## Build Python wheel package
+build-wheel:  ## Build Python wheel (local smoke-testing; releases happen in CI via git tag)
 	uv run -- maturin build --release
-
-release-build:  ## Build wheel with optimizations for release
-	uv run -- maturin build --release --strip
-
-publish:  ## Publish package to pypi.org
-	uv run -- maturin publish
 
 help:  ## Display this help message
 	@grep -h -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'

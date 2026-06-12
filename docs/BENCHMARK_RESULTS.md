@@ -53,6 +53,7 @@ Every landed optimization, paired with the meter runs that bracket it.
 | 2026-06-12 | Package-level sync concurrency (`--package-concurrency`, default 8) | M1 small-file mirror throughput | 13.7 → 30.6 files/s (wall bound by largest single package) |
 | 2026-06-12 | …plus file-concurrency 16 within packages (flag tuning, no code) | M1 | 30.6 → **117 files/s** (8.5× total) |
 | 2026-06-12 | In-memory multipart for >64MB `put_if_absent` bodies (sync mirror path) | M2 torch-class mirroring | 0.95 → 1.04 Gbps (bound moved to per-file phase serialization; documented, deferred) |
+| 2026-06-12 | Precompressed gzip index/metadata variants (cache.rs) | R2 torch-index reads | 8,296 → 27,287 rps at half the wire bytes (NIC-bound → CPU-bound) |
 
 ## Full run details
 
@@ -206,6 +207,33 @@ rebuilds proven: corpus size does not tax single-package updates.
 | M1 tuned (pc=8, file-conc 16) | 7,715 files / 66s = **117 files/s (8.5×)** |
 | M2 torch-class (17.66 GB, 37 wheels) | 149s ≈ **0.95 Gbps**; with multipart artifact writes 136s ≈ 1.04 Gbps. Remaining bound: per-file download→hash→upload phases serialize. The tee-streaming fix matters at clone scale (Phase 5) and is deliberately deferred |
 | M3 HTTP push (same list, via /legacy/) | 86s = 90 files/s — **within 23% of direct mode** (target ≤25%) |
+
+### Run 008 — 2026-06-12 — read ceiling (proper CPU sampling) + gzip A/B
+
+- Rig: server `c7gn.2xlarge` + loadgen `c7gn.16xlarge` (64 vCPU, 200 Gbps) — sized to make the loadgen impossible to blame
+- CPU sampled on both boxes mid-run; raw log in the session records
+
+**Ceiling**: the suspicion that tier-2 numbers were loadgen-bound is resolved: **no** — server CPU was 94–95% with the loadgen at 8%. The `c7gn.2xlarge` ceiling is real:
+
+| conns | rps | p50 | p99 | server CPU | loadgen CPU |
+|---|---|---|---|---|---|
+| 1,024 | **438,764** | 2.1ms | 4.8ms | 94% | 8% |
+| 2,048 | 410,583 | 3.1ms | 18.0ms | 95% | 8% |
+| 4,096 | 393,328 | 3.3ms | 52.4ms | 95% | 8% |
+
+**≈55k rps per vCPU**; past saturation, more connections only buy queueing.
+
+**Gzip A/B** (torch-shaped 674 KB index, `-c 1024`, forced headers — oha sends
+Accept-Encoding by default, which silently invalidated the first attempt):
+
+| | rps | p50 | wire |
+|---|---|---|---|
+| identity (forced) | 8,296 | 79.7ms | 44.5 Gbps (NIC-pinned) |
+| gzip | **27,287** | 15.3ms | 21.8 Gbps (now CPU-bound) |
+
+**3.3× the requests at half the bandwidth**; ~100 KB on the wire per response
+(6.5× compression, done once at cache fill). pip and uv both send
+`Accept-Encoding: gzip`, so real clients get this path by default.
 
 <!--
 Template:

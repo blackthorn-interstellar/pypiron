@@ -17,6 +17,7 @@ unoptimized baseline.
 | 1 | 2026-06-12 | `b79dd16`+P1 | **82,231** | **88,399** | 881¹ | 10,092 | 1,406 | **1.57s** | 10.5s² | 4.91s³ / **36.7MB** | **PASS 18.9s / 15.5MB RSS** |
 
 | 2 | 2026-06-12 | `b79dd16`+P1b | 77,673 | 86,774 | 853¹ | **74,781** | **81,312** | 1.64s | **2.29s, 0/10 fail** | 2.1s / 52.2MB | **PASS 19.5s / 22MB** |
+| 3 | 2026-06-12 | `9c60027` | 76,346 | 78,162 | **4,283**⁴ | 71,120 | 75,068 | 1.69s | **1.83s, 0/10 fail** | 1.68s / 51.7MB | **PASS 14.6s / 53MB** |
 
 ¹ R2 is now NIC-bound, not server-bound: 17.8 GB of index bytes in 30 s ≈ 4.7 Gbps, the t4g.small burst ceiling.
 ² W4 p50 fell 10.2s → 1.49s and failures 9/10 → 2/10; the tail is the leader-lease gap after restart (next fix).
@@ -25,6 +26,12 @@ unoptimized baseline.
 After run #2 the reference rig is hardware-bound on every scenario: R1/R3/R6/R7
 saturate ~75–87k rps of CPU+NIC, R2/R5 sit at the burst-NIC ceiling (~4.6 Gbps),
 W3 is worker-tick cadence, W1-torch is gp3 disk throughput. Phase 1 is dry.
+
+⁴ Row 3 R2 measures the gzip path (100 KB on the wire instead of 674 KB) —
+which is what uv and pip request by default. Same-row gains vs row 2: torch
+index reads 853 → 4,283 rps (5×), 900 MB upload 19.5s → 14.6s (multipart),
+sync-upload p99 2.29s → 1.83s. The $12/month box now serves 4.3k torch-sized
+index reads per second.
 
 <!-- Append rows only. W1-torch records pass/FAIL(reason) until it passes. -->
 

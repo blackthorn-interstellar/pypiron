@@ -24,8 +24,8 @@ run:  ## Run a local dev server (./data, admin/secret, http://127.0.0.1:8080)
 	cargo run --release -- \
 		--bind-addr 127.0.0.1:8080 \
 		--data-dir ./data \
-		--basic-auth-user admin \
-		--basic-auth-pass secret \
+		--admin-user admin \
+		--admin-pass secret \
 		--worker-interval-secs 1
 
 test: test-rust test-python  ## Run all tests (perf/stress excluded)

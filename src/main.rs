@@ -65,31 +65,29 @@ struct ServeArgs {
     #[command(flatten)]
     storage: StorageArgs,
 
-    /// Basic auth username for uploads (optional, allows unauthenticated uploads if not provided)
-    #[arg(long, env = "PYPIRON_BASIC_AUTH_USER")]
-    basic_auth_user: Option<String>,
+    /// Uploader credential username — may publish (ordinary uploads). When no
+    /// credential of any kind is set, all writes are unauthenticated.
+    #[arg(long, env = "PYPIRON_UPLOADER_USER")]
+    uploader_user: Option<String>,
 
-    /// Basic auth password for uploads (optional, allows unauthenticated uploads if not provided)
-    #[arg(long, env = "PYPIRON_BASIC_AUTH_PASS")]
-    basic_auth_pass: Option<String>,
+    /// Uploader credential password (see --uploader-user).
+    #[arg(long, env = "PYPIRON_UPLOADER_PASS")]
+    uploader_pass: Option<String>,
+
+    /// Admin credential username — may do everything an uploader can, plus the
+    /// privileged operations: mirror uploads (backdating + `mirror` origin),
+    /// deletion, and yank. Configuring it is what enables those operations.
+    #[arg(long, env = "PYPIRON_ADMIN_USER")]
+    admin_user: Option<String>,
+
+    /// Admin credential password (see --admin-user).
+    #[arg(long, env = "PYPIRON_ADMIN_PASS")]
+    admin_pass: Option<String>,
 
     /// Reserve this namespace for private uploads: new private packages must
     /// match `<prefix>` or `<prefix>-*` (PEP 503-normalized)
     #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
     private_prefix: Option<String>,
-
-    /// Mirror-upload credential username. Configuring this (with a password)
-    /// is what enables mirror uploads: `/legacy/` requests carrying
-    /// `mirror=true` may claim mirror origin and provide historical
-    /// `upload_time`/yank state (what `sync --to` sends), but only when
-    /// authenticated against THIS credential — the ordinary upload credential
-    /// cannot backdate. Unset → mirror uploads are rejected.
-    #[arg(long, env = "PYPIRON_MIRROR_AUTH_USER")]
-    mirror_auth_user: Option<String>,
-
-    /// Mirror-upload credential password (see --mirror-auth-user).
-    #[arg(long, env = "PYPIRON_MIRROR_AUTH_PASS")]
-    mirror_auth_pass: Option<String>,
 
     /// Redirect artifact downloads to presigned S3 URLs (302) so this node
     /// never touches wheel bytes (S3 backend only)
@@ -125,11 +123,12 @@ struct ServeArgs {
 #[derive(Clone)]
 struct AppState {
     storage: Arc<dyn Storage>,
-    // auth
-    upload_user: Option<String>,
-    upload_pass: Option<String>,
-    mirror_user: Option<String>,
-    mirror_pass: Option<String>,
+    // auth — two roles: uploader (publish) and admin (everything, incl. mirror,
+    // delete, yank). Admin is a strict superset of uploader.
+    uploader_user: Option<String>,
+    uploader_pass: Option<String>,
+    admin_user: Option<String>,
+    admin_pass: Option<String>,
     private_prefix: Option<String>,
     presigned_redirects: bool,
     // worker cfg
@@ -170,10 +169,10 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
 
     let state = Arc::new(AppState {
         storage,
-        upload_user: cli.basic_auth_user,
-        upload_pass: cli.basic_auth_pass,
-        mirror_user: cli.mirror_auth_user,
-        mirror_pass: cli.mirror_auth_pass,
+        uploader_user: cli.uploader_user,
+        uploader_pass: cli.uploader_pass,
+        admin_user: cli.admin_user,
+        admin_pass: cli.admin_pass,
         private_prefix: cli.private_prefix.as_deref().map(normalize_pkg_name),
         presigned_redirects: cli.s3_presigned_redirects,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
@@ -183,18 +182,17 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         sync_upload_timeout: Duration::from_secs(cli.sync_upload_timeout_secs),
     });
 
-    if state.upload_user.is_none() || state.upload_pass.is_none() {
-        warn!(
-            "no --basic-auth-user/--basic-auth-pass configured: uploads, deletes, and yanks are UNAUTHENTICATED"
-        );
-    }
-    if state.mirror_credential().is_none() {
-        info!("mirror uploads disabled (set --mirror-auth-user/--mirror-auth-pass to enable)");
-    } else if state.mirror_credential() == state.upload_credential() {
-        warn!(
-            "mirror credential equals the upload credential: ordinary uploaders can backdate \
-             (set a distinct --mirror-auth-user/--mirror-auth-pass to separate the powers)"
-        );
+    if state.auth_open() {
+        warn!("no credentials configured: uploads, mirror, deletes, and yanks are UNAUTHENTICATED");
+    } else {
+        if state.admin_credential().is_none() {
+            info!("no admin credential: mirror uploads, deletion, and yank are disabled");
+        }
+        if state.admin_credential().is_some()
+            && state.admin_credential() == state.uploader_credential()
+        {
+            warn!("uploader and admin credentials are identical: every uploader has admin powers");
+        }
     }
 
     // Initialize empty index files if they don't exist
@@ -314,13 +312,12 @@ async fn legacy_upload(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // Mirror-ness lives in a form field, so the auth decision can't be final
-    // until the body is parsed. From the header alone we learn which
-    // credential(s) this request satisfies, and reject up front only when no
-    // valid interpretation exists — preserving "never read the body of an
-    // unauthorized request".
-    let auth = UploadAuth::from_headers(&state, &headers);
-    if !auth.upload_ok && !auth.mirror_ok {
+    // Mirror-ness lives in a form field, so whether *admin* is required can't
+    // be decided until the body is parsed. But every upload needs at least
+    // uploader rights, so reject that up front — preserving "never read the
+    // body of an unauthorized request".
+    let is_admin = state.is_admin(&headers);
+    if !is_admin && !state.is_uploader(&headers) {
         return Err((StatusCode::UNAUTHORIZED, "Unauthorized".into()));
     }
 
@@ -419,38 +416,35 @@ async fn legacy_upload(
     let key = format!("{PACKAGES_PREFIX}{pkg_norm}/{filename}");
 
     // Mirror mode: `sync --to` sends mirror=true plus PyPI's historical
-    // metadata. Backdating is its own privilege — gated on the dedicated
-    // mirror credential, never reachable with ordinary upload rights, and
-    // never reinterpreted as a normal upload.
+    // metadata. Backdating is an admin privilege — never reachable with plain
+    // uploader rights, and never reinterpreted as a normal upload.
     let is_mirror = fields.get("mirror").map(String::as_str) == Some("true");
     if is_mirror {
-        if state.mirror_credential().is_none() {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Mirror uploads are not enabled on this server (--mirror-auth-user/--mirror-auth-pass)".into(),
-            ));
+        if !is_admin {
+            // Distinguish "admin disabled here" from "you're not admin".
+            return Err(
+                if state.admin_credential().is_none() && !state.auth_open() {
+                    (
+                        StatusCode::FORBIDDEN,
+                        "Mirror uploads are disabled (no admin credential configured)".into(),
+                    )
+                } else {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        "Mirror uploads require the admin credential".into(),
+                    )
+                },
+            );
         }
-        if !auth.mirror_ok {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "Mirror uploads require the mirror credential".into(),
-            ));
-        }
-    } else {
-        // An ordinary upload needs ordinary upload rights — the mirror-only
-        // credential cannot stand in for it.
-        if !auth.upload_ok {
-            return Err((StatusCode::UNAUTHORIZED, "Unauthorized".into()));
-        }
-        if fields.contains_key("upload_time")
-            || fields.contains_key("yanked")
-            || fields.contains_key("yanked_reason")
-        {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "upload_time/yanked fields require a mirror upload (mirror=true with the mirror credential)".into(),
-            ));
-        }
+    } else if fields.contains_key("upload_time")
+        || fields.contains_key("yanked")
+        || fields.contains_key("yanked_reason")
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "upload_time/yanked fields require a mirror upload (mirror=true, admin credential)"
+                .into(),
+        ));
     }
     let upload_time = match fields.get("upload_time") {
         Some(ts) => {
@@ -886,7 +880,7 @@ async fn files_delete(
     Path((package, filename)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_auth(&state, &headers)?;
+    require_admin(&state, &headers)?;
     let pkg = normalize_pkg_name(&package);
     // Artifacts only: .origin, sidecars, and metadata companions are managed
     // by the server, not deletable handles.
@@ -975,7 +969,7 @@ async fn set_yanked(
     filename: &str,
     yanked: Yanked,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    require_auth(state, headers)?;
+    require_admin(state, headers)?;
     let pkg = normalize_pkg_name(package);
     if !is_normalized(&pkg) || !sidecar::is_artifact(filename) || filename.contains('/') {
         return Err((StatusCode::NOT_FOUND, "No such file".to_string()));
@@ -1024,59 +1018,64 @@ fn accepts_json(headers: &HeaderMap) -> bool {
 }
 
 impl AppState {
-    /// The configured upload credential, if any (both halves required).
-    fn upload_credential(&self) -> Option<(&str, &str)> {
-        match (&self.upload_user, &self.upload_pass) {
+    /// The configured uploader credential, if any (both halves required).
+    fn uploader_credential(&self) -> Option<(&str, &str)> {
+        match (&self.uploader_user, &self.uploader_pass) {
             (Some(u), Some(p)) => Some((u, p)),
             _ => None,
         }
     }
 
-    /// The configured mirror credential, if any. Its presence is what enables
-    /// mirror uploads.
-    fn mirror_credential(&self) -> Option<(&str, &str)> {
-        match (&self.mirror_user, &self.mirror_pass) {
+    /// The configured admin credential, if any. Its presence is what enables
+    /// the privileged operations (mirror, delete, yank).
+    fn admin_credential(&self) -> Option<(&str, &str)> {
+        match (&self.admin_user, &self.admin_pass) {
             (Some(u), Some(p)) => Some((u, p)),
             _ => None,
         }
     }
-}
 
-/// Which upload powers a request's `Authorization` header grants. Computed
-/// from the header alone so the decision is available before the body is read.
-struct UploadAuth {
-    /// May perform ordinary uploads (open when no upload credential is set).
-    upload_ok: bool,
-    /// May perform mirror uploads (only ever true when a mirror credential is
-    /// set and matched — backdating is never open).
-    mirror_ok: bool,
-}
+    /// No credentials of any kind configured: writes are fully open (dev mode).
+    fn auth_open(&self) -> bool {
+        self.uploader_credential().is_none() && self.admin_credential().is_none()
+    }
 
-impl UploadAuth {
-    fn from_headers(state: &AppState, headers: &HeaderMap) -> Self {
-        let upload_ok = match state.upload_credential() {
-            None => true, // open uploads
+    /// Does the request authenticate as admin? (Open mode is admin.)
+    fn is_admin(&self, headers: &HeaderMap) -> bool {
+        if self.auth_open() {
+            return true;
+        }
+        match self.admin_credential() {
             Some((u, p)) => check_basic_auth(headers, u, p).is_ok(),
-        };
-        let mirror_ok = match state.mirror_credential() {
-            None => false, // mirror uploads disabled
+            None => false,
+        }
+    }
+
+    /// May the request publish? Admin ⊇ uploader; open mode allows all.
+    fn is_uploader(&self, headers: &HeaderMap) -> bool {
+        if self.is_admin(headers) {
+            return true;
+        }
+        match self.uploader_credential() {
             Some((u, p)) => check_basic_auth(headers, u, p).is_ok(),
-        };
-        Self {
-            upload_ok,
-            mirror_ok,
+            None => false,
         }
     }
 }
 
-/// Gate management routes (delete, yank) behind the upload credential.
-fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
-    if let Some((user, pass)) = state.upload_credential() {
-        if check_basic_auth(headers, user, pass).is_err() {
-            return Err((StatusCode::UNAUTHORIZED, "Unauthorized".into()));
-        }
+/// Gate the privileged routes (delete, yank) behind the admin credential.
+fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    if state.is_admin(headers) {
+        return Ok(());
     }
-    Ok(())
+    Err(if state.admin_credential().is_none() {
+        (
+            StatusCode::FORBIDDEN,
+            "This operation is disabled (no admin credential configured)".into(),
+        )
+    } else {
+        (StatusCode::UNAUTHORIZED, "Admin credential required".into())
+    })
 }
 
 fn check_basic_auth(headers: &HeaderMap, user: &str, pass: &str) -> Result<()> {

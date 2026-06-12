@@ -23,8 +23,8 @@ uvx pypiron   # runs pypiron locally; stores data under ~/.pypiron/packages
 
 ```bash
 # Start PypIron (basic auth required for uploads)
-PYPIRON_BASIC_AUTH_USER=admin \
-PYPIRON_BASIC_AUTH_PASS=secret \
+PYPIRON_ADMIN_USER=admin \
+PYPIRON_ADMIN_PASS=secret \
 uvx pypiron
 
 # Upload an artifact with uv:
@@ -59,12 +59,12 @@ open http://localhost:8080/simple/
 ## Mirroring packages with `pypiron sync`
 
 The recommended mode mirrors **over HTTP**: sync needs only the server URL and
-the mirror credential — no storage credentials, no knowledge of the server's
+the admin credential — no storage credentials, no knowledge of the server's
 backend. It carries PyPI's true upload timestamps, so `--exclude-newer`
-resolves historically correct versions against your mirror. The server enables
-it by configuring a dedicated mirror credential
-(`--mirror-auth-user`/`--mirror-auth-pass`), kept separate from the ordinary
-upload credential so normal uploaders cannot backdate packages.
+resolves historically correct versions against your mirror. Mirroring is an
+**admin** operation: PypIron has two roles — uploader (publish) and admin
+(everything, including mirror, delete, and yank) — so ordinary uploaders
+cannot backdate packages.
 
 ```text
 # packages.txt — one entry per line; PEP 440 specifiers are optional
@@ -74,13 +74,13 @@ six==1.16.0
 ```
 
 ```bash
-# Server side: enable mirror uploads with a dedicated credential
-pypiron --basic-auth-user admin --basic-auth-pass secret \
-  --mirror-auth-user mirror --mirror-auth-pass mirrorsecret
+# Server side: two roles — uploader publishes, admin can also mirror
+pypiron --uploader-user dev --uploader-pass devsecret \
+  --admin-user admin --admin-pass adminsecret
 
-# Mirror over HTTP (recommended) — authenticate with the mirror credential
+# Mirror over HTTP (recommended) — authenticate with the admin credential
 pypiron sync --packages-list packages.txt \
-  --to http://localhost:8080 --username mirror --password mirrorsecret
+  --to http://localhost:8080 --username admin --password adminsecret
 
 # Or write directly to storage (needs bucket/disk access; no server involved)
 pypiron sync --packages-list packages.txt --data-dir ~/.pypiron/packages
@@ -118,16 +118,15 @@ the working directory. An explicit `--packages-list` on the CLI replaces the
 file's list entirely; other options layer per-key.
 
 Mirrored names are claimed `mirror`-origin; names already claimed by private
-uploads (or inside `--private-prefix`) are refused outright. The mirror
-credential is the only thing that can mirror — backdating never rides along on
-the ordinary upload credential.
+uploads (or inside `--private-prefix`) are refused outright. Only the admin
+credential can mirror — backdating never rides along on the uploader credential.
 
 ## Running with Docker
 
 ```bash
 docker run --rm -it -p 8080:8080 \
-  -e PYPIRON_BASIC_AUTH_USER=admin \
-  -e PYPIRON_BASIC_AUTH_PASS=<mypassword> \
+  -e PYPIRON_ADMIN_USER=admin \
+  -e PYPIRON_ADMIN_PASS=<mypassword> \
   pypiron:latest
 ```
 
@@ -137,8 +136,8 @@ docker run --rm -it -p 8080:8080 \
 docker run --rm -it -p 8080:8080 \
   -e PYPIRON_STORAGE=s3 \
   -e PYPIRON_S3_BUCKET=<my_bucket_name> \
-  -e PYPIRON_BASIC_AUTH_USER=admin \
-  -e PYPIRON_BASIC_AUTH_PASS=<mypassword> \
+  -e PYPIRON_ADMIN_USER=admin \
+  -e PYPIRON_ADMIN_PASS=<mypassword> \
   -e AWS_ACCESS_KEY_ID=<my_access_key> \
   -e AWS_SECRET_ACCESS_KEY=<my_secret_key> \
   -e AWS_REGION=us-east-1 \
@@ -165,6 +164,9 @@ Point clients at this registry **only** (`--index-url`, never
 dependency-confusion hole the origin system closes).
 
 ## Management API
+
+Deletion and yank are **admin** operations — authenticate with the admin
+credential.
 
 ```bash
 # Delete a file (index first, then artifact — clients never see a broken link)
@@ -196,11 +198,11 @@ All options are available via CLI args and/or environment variables.
 | CLI Arg                      | Env Var                            | Default        | Description                                      |
 | ---------------------------- | ---------------------------------- | -------------- | ------------------------------------------------ |
 | `--bind-addr`                | `PYPIRON_BIND_ADDR`                | `0.0.0.0:8080` | Listen address                                   |
-| `--basic-auth-user`          | `PYPIRON_BASIC_AUTH_USER`          | *(none)*       | Username for upload/management auth              |
-| `--basic-auth-pass`          | `PYPIRON_BASIC_AUTH_PASS`          | *(none)*       | Password for upload/management auth              |
+| `--uploader-user`            | `PYPIRON_UPLOADER_USER`            | *(none)*       | Uploader credential — may publish                |
+| `--uploader-pass`            | `PYPIRON_UPLOADER_PASS`            | *(none)*       | Uploader credential password                     |
+| `--admin-user`               | `PYPIRON_ADMIN_USER`               | *(none)*       | Admin credential — publish + mirror/delete/yank  |
+| `--admin-pass`               | `PYPIRON_ADMIN_PASS`               | *(none)*       | Admin credential password                        |
 | `--private-prefix`           | `PYPIRON_PRIVATE_PREFIX`           | *(none)*       | Reserve a namespace for private uploads          |
-| `--mirror-auth-user`         | `PYPIRON_MIRROR_AUTH_USER`         | *(none)*       | Mirror-upload credential user (enables mirroring) |
-| `--mirror-auth-pass`         | `PYPIRON_MIRROR_AUTH_PASS`         | *(none)*       | Mirror-upload credential password                |
 | `--worker-interval-secs`     | `PYPIRON_WORKER_INTERVAL_SECS`     | `5`            | Worker tick interval                             |
 | `--reconcile-interval-secs`  | `PYPIRON_RECONCILE_INTERVAL_SECS`  | `300`          | Full self-heal sweep interval                    |
 | `--lease-ttl-secs`           | `PYPIRON_LEASE_TTL_SECS`           | `30`           | Leader lease TTL (multi-node S3)                 |

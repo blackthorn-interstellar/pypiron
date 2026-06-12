@@ -68,7 +68,7 @@ Post-roadmap:
 
 - Mirror-over-HTTP: `sync --to` pushes PyPI's history (true `upload-time`,
   yank state) through `/legacy/` with `mirror=true`; the server (opt-in via
-  a dedicated mirror credential) owns all storage writes. Backdating stays impossible
+  the admin credential) owns all storage writes. Backdating stays admin-only
   for ordinary uploads.
 - Sync filtering and config: `--exclude-newer`/`--exclude-older` upload-time
   bounds, PEP 440 version specifiers in the package list, and `pypiron.toml`

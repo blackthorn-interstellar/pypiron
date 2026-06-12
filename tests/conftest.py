@@ -86,19 +86,24 @@ def _start_disk_server(tmp_path_factory, bin_path: Path, extra_args=()) -> Itera
     log_path = data_dir.parent / f"{data_dir.name}-server.log"
     port = find_free_port()
     bind = f"127.0.0.1:{port}"
-    user = "admin"
-    pw = "secret"
 
+    # Two roles: admin (everything, incl. mirror/delete/yank) and uploader
+    # (publish only). The dict's `user`/`password` are the admin credential —
+    # a superset — so tests that do any operation through them keep working.
     args = [
         str(bin_path),
         "--bind-addr",
         bind,
         "--data-dir",
         str(data_dir),
-        "--basic-auth-user",
-        user,
-        "--basic-auth-pass",
-        pw,
+        "--admin-user",
+        "admin",
+        "--admin-pass",
+        "secret",
+        "--uploader-user",
+        "uploader",
+        "--uploader-pass",
+        "uploadersecret",
         "--worker-interval-secs",
         "1",
         *extra_args,
@@ -117,8 +122,12 @@ def _start_disk_server(tmp_path_factory, bin_path: Path, extra_args=()) -> Itera
                 "base_url": f"http://{bind}",
                 "legacy": f"http://{bind}/legacy/",
                 "simple": f"http://{bind}/simple/",
-                "user": user,
-                "password": pw,
+                "user": "admin",
+                "password": "secret",
+                "admin_user": "admin",
+                "admin_password": "secret",
+                "uploader_user": "uploader",
+                "uploader_password": "uploadersecret",
                 "data_dir": data_dir,
                 "log_path": log_path,
                 "proc": proc,
@@ -161,28 +170,46 @@ def disk_server_sync_uploads(tmp_path_factory, pypiron_bin: Path) -> Iterator[Di
     yield from _start_disk_server(tmp_path_factory, pypiron_bin, extra_args=["--sync-uploads"])
 
 
-_MIRROR_ARGS = ["--mirror-auth-user", "mirror", "--mirror-auth-pass", "mirrorsecret"]
-_MIRROR_CREDS = {"mirror_user": "mirror", "mirror_password": "mirrorsecret"}
-
-
 @pytest.fixture()
-def disk_server_mirror(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
-    """Disk server with a dedicated mirror credential (what sync --to targets).
-
-    The mirror credential is distinct from the upload credential (admin/secret),
-    so ordinary uploaders cannot backdate.
-    """
-    for server in _start_disk_server(tmp_path_factory, pypiron_bin, extra_args=_MIRROR_ARGS):
-        yield {**server, **_MIRROR_CREDS}
-
-
-@pytest.fixture()
-def disk_server_mirror_prefixed(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
-    """Mirror-enabled server reserving the `acme` namespace for private uploads."""
-    for server in _start_disk_server(
-        tmp_path_factory, pypiron_bin, extra_args=[*_MIRROR_ARGS, "--private-prefix", "acme"]
-    ):
-        yield {**server, **_MIRROR_CREDS}
+def disk_server_uploader_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server with only an uploader credential (no admin) — mirror,
+    delete, and yank are disabled."""
+    data_dir = tmp_path_factory.mktemp("pypiron-uploader-only")
+    port = find_free_port()
+    bind = f"127.0.0.1:{port}"
+    log_path = data_dir.parent / f"{data_dir.name}-server.log"
+    args = [
+        str(pypiron_bin),
+        "--bind-addr",
+        bind,
+        "--data-dir",
+        str(data_dir),
+        "--uploader-user",
+        "uploader",
+        "--uploader-pass",
+        "uploadersecret",
+        "--worker-interval-secs",
+        "1",
+    ]
+    env = os.environ.copy()
+    env.setdefault("RUST_LOG", "info")
+    with open(log_path, "w") as log_file:
+        proc = subprocess.Popen(args, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+        try:
+            wait_http_ok(f"http://{bind}/simple/index.json", timeout=20.0)
+            yield {
+                "bind": bind,
+                "base_url": f"http://{bind}",
+                "legacy": f"http://{bind}/legacy/",
+                "simple": f"http://{bind}/simple/",
+                "user": "uploader",
+                "password": "uploadersecret",
+                "data_dir": data_dir,
+                "log_path": log_path,
+                "proc": proc,
+            }
+        finally:
+            kill_process_tree(proc)
 
 
 # ------------------------------ MinIO (S3) fixtures ---------------------------
@@ -275,8 +302,10 @@ def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
             "AWS_SECRET_ACCESS_KEY": minio["secret_key"],
             "PYPIRON_BIND_ADDR": bind,
             "PYPIRON_WORKER_INTERVAL_SECS": "1",
-            "PYPIRON_BASIC_AUTH_USER": "admin",
-            "PYPIRON_BASIC_AUTH_PASS": "secret",
+            "PYPIRON_ADMIN_USER": "admin",
+            "PYPIRON_ADMIN_PASS": "secret",
+            "PYPIRON_UPLOADER_USER": "uploader",
+            "PYPIRON_UPLOADER_PASS": "uploadersecret",
             "RUST_LOG": "info",
         }
     )

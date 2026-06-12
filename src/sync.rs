@@ -2,9 +2,9 @@
 //!
 //! The recommended mode is mirror-over-HTTP (`--to <server>`): each file is
 //! POSTed to the server's `/legacy/` with `mirror=true` plus PyPI's true
-//! `upload-time` and yank state, authenticated against the server's mirror
+//! `upload-time` and yank state, authenticated against the server's admin
 //! credential, and the server owns every storage write. Sync needs a URL and
-//! the mirror credential — nothing about the server's storage. Without
+//! the admin credential — nothing about the server's storage. Without
 //! `--to`, sync writes directly to storage with the same code the server uses.
 //!
 //! Filters (`--only-wheels`, tag filters, `--exclude-newer`/`--exclude-older`,
@@ -51,7 +51,7 @@ pub struct SyncArgs {
     pub src_base: Option<String>,
 
     /// Destination PypIron base URL: mirror over HTTP via its /legacy/
-    /// (recommended; authenticate with the server's mirror credential). Omit
+    /// (recommended; authenticate with the server's admin credential). Omit
     /// to write directly to storage.
     #[arg(long = "to", env = "PYPIRON_SYNC_TO")]
     pub dst_base: Option<String>,
@@ -611,9 +611,9 @@ async fn download_verified(client: &Client, file: &PyPiFile) -> Result<Vec<u8>> 
 }
 
 /// HTTP mode: push through the remote `/legacy/` as a mirror upload, carrying
-/// PyPI's metadata verbatim — the server (which must run with
-/// mirror credential) owns the storage writes. Returns true on success; the
-/// remote's 409 on an existing file means already-present (false).
+/// PyPI's metadata verbatim — the server (authenticated as admin) owns the
+/// storage writes. Returns true on success; the remote's 409 on an existing
+/// file means already-present (false).
 async fn upload_via_http(
     client: &Client,
     resolved: &Resolved,

@@ -1,0 +1,82 @@
+"""Two-role auth: uploader publishes; admin does everything (mirror, delete, yank)."""
+
+from __future__ import annotations
+
+import pytest
+
+from .helpers import (
+    download_pypi_wheel,
+    http_request_auth,
+    upload_legacy,
+    wait_for_file_in_index,
+)
+
+PACKAGE = "six"
+VERSION = "1.17.0"
+
+pytestmark = pytest.mark.integration
+
+
+def test_uploader_can_publish(disk_server, tmp_path):
+    wheel = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
+    upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["uploader_user"],
+        password=disk_server["uploader_password"],
+    )
+    wait_for_file_in_index(disk_server["simple"], PACKAGE, wheel.name)
+
+
+def test_bad_credential_rejected(disk_server, tmp_path):
+    wheel = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
+    upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username="nope",
+        password="wrong",
+        expect_status=401,
+    )
+
+
+def test_uploader_cannot_delete_or_yank(disk_server, tmp_path):
+    wheel = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
+    up = {"username": disk_server["uploader_user"], "password": disk_server["uploader_password"]}
+    upload_legacy(disk_server["legacy"], wheel, **up)
+    wait_for_file_in_index(disk_server["simple"], PACKAGE, wheel.name)
+
+    base = disk_server["base_url"]
+    # Delete and yank are admin-only — the uploader credential gets 401.
+    code, _, _ = http_request_auth("DELETE", f"{base}/files/{PACKAGE}/{wheel.name}", **up)
+    assert code == 401
+    code, _, _ = http_request_auth(
+        "POST", f"{base}/files/{PACKAGE}/{wheel.name}/yank", data=b"oops", **up
+    )
+    assert code == 401
+
+    # The artifact and index are untouched.
+    assert (disk_server["data_dir"] / "packages" / PACKAGE / wheel.name).exists()
+
+    # The admin credential can do both.
+    admin = {"username": disk_server["admin_user"], "password": disk_server["admin_password"]}
+    code, _, _ = http_request_auth(
+        "POST", f"{base}/files/{PACKAGE}/{wheel.name}/yank", data=b"bad", **admin
+    )
+    assert code == 200
+    code, _, _ = http_request_auth("DELETE", f"{base}/files/{PACKAGE}/{wheel.name}", **admin)
+    assert code == 204
+
+
+def test_admin_disabled_when_unconfigured(disk_server_uploader_only, tmp_path):
+    """With no admin credential, delete/yank are disabled for everyone."""
+    server = disk_server_uploader_only
+    wheel = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
+    up = {"username": server["user"], "password": server["password"]}
+    upload_legacy(server["legacy"], wheel, **up)
+    wait_for_file_in_index(server["simple"], PACKAGE, wheel.name)
+
+    # No admin credential exists → the operation is disabled (403), not a 401.
+    code, _, _ = http_request_auth(
+        "DELETE", f"{server['base_url']}/files/{PACKAGE}/{wheel.name}", **up
+    )
+    assert code == 403

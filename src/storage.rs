@@ -56,6 +56,20 @@ pub struct StorageArgs {
 
 impl StorageArgs {
     pub async fn build(&self) -> Result<Arc<dyn Storage>> {
+        let storage = self.build_backend().await?;
+        // Crash-consistency hook for the chaos tests: abort the process just
+        // before the Nth mutating storage operation. Inert without the env
+        // var; see tests/test_crash_consistency.py.
+        if let Some(n) = std::env::var("PYPIRON_FAULT_ABORT_AFTER_WRITES")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+        {
+            return Ok(Arc::new(FaultInjectStorage::new(storage, n)));
+        }
+        Ok(storage)
+    }
+
+    async fn build_backend(&self) -> Result<Arc<dyn Storage>> {
         match self.storage {
             StorageBackend::Disk => {
                 let data_dir = self.data_dir.clone().unwrap_or_else(|| {
@@ -109,6 +123,27 @@ pub struct FileEntry {
     /// RFC 3339 last-modified timestamp (serves as PEP 700 upload-time).
     pub last_modified: Option<String>,
 }
+
+/// One object from a flat (recursive) listing — see [`Storage::list_all`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectMeta {
+    pub key: String,
+    pub size: u64,
+    /// Opaque change detector, compared for equality only: the S3 ETag, or
+    /// mtime+size on disk. Two listings agree on (key, size, etag) iff the
+    /// object hasn't been rewritten between them.
+    pub etag: String,
+}
+
+/// First characters a key can have under the prefixes the audit enumerates:
+/// normalized package names start with [a-z0-9] (names.rs), and the global
+/// index files are `index.html`/`index.json`. Fanning a flat listing out over
+/// these sub-prefixes makes enumeration parallel — S3 pagination within one
+/// prefix is inherently serial.
+pub const SHARD_CHARS: &[char] = &[
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
+    'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+];
 
 /// A single HTTP byte range resolved against a known size.
 #[derive(Debug, PartialEq)]
@@ -203,8 +238,13 @@ pub trait Storage: Send + Sync {
     /// returning full keys (dir_prefix + filename) with size and last-modified.
     async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>>;
 
-    /// List immediate child directory names under `dir_prefix` (without trailing slash).
-    async fn list_dirs(&self, dir_prefix: &str) -> Result<Vec<String>>;
+    /// Flat, recursive listing of every object whose key starts with
+    /// `prefix`, sorted by key. This is the cheap way to see an entire
+    /// corpus: one paged LIST per 1,000 keys on S3 (vs. one LIST per
+    /// directory), one filesystem walk on disk. `prefix` is a *key* prefix,
+    /// not a directory — `packages/a` matches every package starting with
+    /// 'a', which is how callers parallelize (see [`SHARD_CHARS`]).
+    async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
 
     /// Delete multiple keys (best-effort).
     async fn delete_keys(&self, keys: &[String]) -> Result<()>;
@@ -457,26 +497,6 @@ impl Storage for DiskStorage {
         Ok(files)
     }
 
-    async fn list_dirs(&self, dir_prefix: &str) -> Result<Vec<String>> {
-        let dir = self.resolve(dir_prefix)?;
-        let mut rd = match fs::read_dir(dir).await {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(anyhow::Error::from(e).context(format!("list {dir_prefix}"))),
-        };
-        let mut dirs = Vec::new();
-        while let Some(entry) = rd.next_entry().await? {
-            let md = entry.metadata().await?;
-            if md.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    dirs.push(name.to_string());
-                }
-            }
-        }
-        dirs.sort();
-        Ok(dirs)
-    }
-
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
         for k in keys {
             if let Ok(p) = self.resolve(k) {
@@ -485,6 +505,80 @@ impl Storage for DiskStorage {
         }
         Ok(())
     }
+
+    async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        // Key prefix, not directory: walk the deepest enclosing directory and
+        // filter first-level names against the remainder, so a sharded call
+        // ("packages/a") never walks the other shards' trees. The walk is
+        // std::fs on a blocking thread — a million-file tree is syscall
+        // bound, and tokio::fs would add a channel hop per dirent.
+        let (dir_part, name_filter) = match prefix.rfind('/') {
+            Some(i) => (&prefix[..=i], &prefix[i + 1..]),
+            None => ("", prefix),
+        };
+        let root = self.resolve(if dir_part.is_empty() { "." } else { dir_part })?;
+        let dir_prefix = dir_part.to_string();
+        let name_filter = name_filter.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            let top = match std::fs::read_dir(&root) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+                Err(e) => return Err(anyhow::Error::from(e).context("list_all root")),
+            };
+            for entry in top {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if !name.starts_with(&name_filter) {
+                    continue;
+                }
+                walk_disk(&entry.path(), &format!("{dir_prefix}{name}"), &mut out)?;
+            }
+            out.sort_by(|a, b| a.key.cmp(&b.key));
+            Ok(out)
+        })
+        .await?
+    }
+}
+
+/// Recurse one filesystem subtree, appending every regular file as an
+/// ObjectMeta keyed by `key_base` plus its relative path.
+fn walk_disk(path: &Path, key_base: &str, out: &mut Vec<ObjectMeta>) -> Result<()> {
+    let md = std::fs::symlink_metadata(path)?;
+    if md.is_file() {
+        out.push(ObjectMeta {
+            key: key_base.to_string(),
+            size: md.len(),
+            etag: disk_etag(&md),
+        });
+        return Ok(());
+    }
+    if !md.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        walk_disk(&entry.path(), &format!("{key_base}/{name}"), out)?;
+    }
+    Ok(())
+}
+
+/// mtime (nanos) + size: changes whenever the file is rewritten. Disk writes
+/// go through tmp+rename, so a content change always produces a new inode
+/// with a new mtime.
+fn disk_etag(md: &std::fs::Metadata) -> String {
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{mtime}-{}", md.len())
 }
 
 /// ------------------------------ S3Storage --------------------------------
@@ -933,41 +1027,6 @@ impl Storage for S3Storage {
         Ok(entries)
     }
 
-    async fn list_dirs(&self, dir_prefix: &str) -> Result<Vec<String>> {
-        // Paginate: ListObjectsV2 returns at most 1000 common prefixes per
-        // page. Without the token loop this silently capped the registry at
-        // 1000 packages — truncated global index, reconciler sweeping only
-        // the first thousand. Found at 10k-package scale.
-        let mut token: Option<String> = None;
-        let mut dirs = Vec::new();
-        loop {
-            let mut req = self
-                .s3
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(dir_prefix)
-                .delimiter("/");
-            if let Some(t) = token.take() {
-                req = req.continuation_token(t);
-            }
-            let out = req.send().await?;
-            for cp in out.common_prefixes() {
-                if let Some(p) = cp.prefix() {
-                    if let Some(name) = p.strip_prefix(dir_prefix).and_then(|s| s.strip_suffix('/'))
-                    {
-                        dirs.push(name.to_string());
-                    }
-                }
-            }
-            match out.next_continuation_token() {
-                Some(t) => token = Some(t.to_string()),
-                None => break,
-            }
-        }
-        dirs.sort();
-        Ok(dirs)
-    }
-
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
         for k in keys {
             let _ = self
@@ -979,6 +1038,38 @@ impl Storage for S3Storage {
                 .await;
         }
         Ok(())
+    }
+
+    async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        // No delimiter: every page carries 1,000 real keys, so a whole
+        // corpus is keys/1000 requests instead of one request per directory.
+        let mut token: Option<String> = None;
+        let mut out = Vec::new();
+        loop {
+            let mut req = self
+                .s3
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+            if let Some(t) = token.take() {
+                req = req.continuation_token(t);
+            }
+            let page = req.send().await.context("list_all page")?;
+            for o in page.contents() {
+                let Some(k) = o.key() else { continue };
+                out.push(ObjectMeta {
+                    key: k.to_string(),
+                    size: o.size().unwrap_or(0).max(0) as u64,
+                    etag: o.e_tag().unwrap_or_default().to_string(),
+                });
+            }
+            match page.next_continuation_token() {
+                Some(t) => token = Some(t.to_string()),
+                None => break,
+            }
+        }
+        // ListObjectsV2 returns keys in UTF-8 binary order already.
+        Ok(out)
     }
 
     fn supports_leases(&self) -> bool {
@@ -1038,6 +1129,98 @@ impl Storage for S3Storage {
     }
 }
 
+/// ---------------------------- FaultInjectStorage ---------------------------
+/// Crash-point injection for the chaos tests: delegates everything, but
+/// aborts the whole process immediately *before* the Nth mutating operation.
+/// Sweeping N over a scenario's write count exercises a crash in every gap of
+/// the write protocol; recovery + `pypiron verify` then prove convergence.
+pub struct FaultInjectStorage {
+    inner: Arc<dyn Storage>,
+    remaining: std::sync::atomic::AtomicI64,
+}
+
+impl FaultInjectStorage {
+    pub fn new(inner: Arc<dyn Storage>, abort_after: i64) -> Self {
+        Self {
+            inner,
+            remaining: std::sync::atomic::AtomicI64::new(abort_after),
+        }
+    }
+
+    fn count_mutation(&self, op: &str, key: &str) {
+        let left = self
+            .remaining
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if left <= 0 {
+            eprintln!("fault injection: aborting before {op} {key}");
+            std::process::abort();
+        }
+    }
+}
+
+#[async_trait]
+impl Storage for FaultInjectStorage {
+    async fn head_exists(&self, key: &str) -> Result<bool> {
+        self.inner.head_exists(key).await
+    }
+    async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>> {
+        self.inner.serve_artifact(key, range).await
+    }
+    async fn presign_get(&self, key: &str, expires: std::time::Duration) -> Result<Option<String>> {
+        self.inner.presign_get(key, expires).await
+    }
+    async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
+        self.inner.get_bytes(key).await
+    }
+    async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
+        self.inner.list_dir_entries(dir_prefix).await
+    }
+    async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        self.inner.list_all(prefix).await
+    }
+    fn supports_leases(&self) -> bool {
+        self.inner.supports_leases()
+    }
+    async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+        self.inner.get_with_etag(key).await
+    }
+
+    async fn put_bytes(&self, key: &str, bytes: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+        self.count_mutation("put_bytes", key);
+        self.inner.put_bytes(key, bytes, content_type).await
+    }
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<bool> {
+        self.count_mutation("put_if_absent", key);
+        self.inner.put_if_absent(key, bytes, content_type).await
+    }
+    async fn put_file_if_absent(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        content_type: Option<&str>,
+    ) -> Result<bool> {
+        self.count_mutation("put_file_if_absent", key);
+        self.inner.put_file_if_absent(key, path, content_type).await
+    }
+    async fn delete_keys(&self, keys: &[String]) -> Result<()> {
+        self.count_mutation("delete_keys", keys.first().map_or("", String::as_str));
+        self.inner.delete_keys(keys).await
+    }
+    async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
+        self.count_mutation("put_if_none_match", key);
+        self.inner.put_if_none_match(key, bytes).await
+    }
+    async fn put_if_match(&self, key: &str, etag: &str, bytes: Vec<u8>) -> Result<Option<String>> {
+        self.count_mutation("put_if_match", key);
+        self.inner.put_if_match(key, etag, bytes).await
+    }
+}
+
 /// Missing object: the SDK models GET misses as `NoSuchKey` and HEAD misses
 /// as `NotFound`.
 fn is_s3_not_found<E: ProvideErrorMetadata>(e: &E) -> bool {
@@ -1055,6 +1238,53 @@ fn lost_conditional_write<E: ProvideErrorMetadata>(e: &E) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn disk_list_all_walks_filters_and_detects_change() {
+        let dir = std::env::temp_dir().join(format!("pypiron-listall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = DiskStorage::new(&dir);
+        s.put_bytes("packages/alpha/a-1.0.tar.gz", b"x".to_vec(), None)
+            .await
+            .unwrap();
+        s.put_bytes(
+            "packages/alpha/a-1.0.tar.gz.meta.json",
+            b"{}".to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+        s.put_bytes("packages/beta/b-1.0.tar.gz", b"y".to_vec(), None)
+            .await
+            .unwrap();
+
+        let all = s.list_all("packages/").await.unwrap();
+        assert_eq!(
+            all.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(),
+            [
+                "packages/alpha/a-1.0.tar.gz",
+                "packages/alpha/a-1.0.tar.gz.meta.json",
+                "packages/beta/b-1.0.tar.gz",
+            ]
+        );
+
+        // Sharded key prefix: only the matching first-level subtree.
+        let shard = s.list_all("packages/a").await.unwrap();
+        assert_eq!(shard.len(), 2);
+        assert!(shard.iter().all(|o| o.key.starts_with("packages/alpha/")));
+        assert!(s.list_all("packages/z").await.unwrap().is_empty());
+        assert!(s.list_all("nope/").await.unwrap().is_empty());
+
+        // Rewriting an object must change its etag.
+        let before = all[0].etag.clone();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        s.put_bytes("packages/alpha/a-1.0.tar.gz", b"xx".to_vec(), None)
+            .await
+            .unwrap();
+        let after = &s.list_all("packages/alpha/a-1.0.tar.gz").await.unwrap()[0];
+        assert_ne!(before, after.etag);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn range_parsing() {
@@ -1181,23 +1411,26 @@ pub mod test_support {
             out.sort_by(|a, b| a.key.cmp(&b.key));
             Ok(out)
         }
-        async fn list_dirs(&self, dir_prefix: &str) -> Result<Vec<String>> {
-            let map = self.objects.lock().unwrap();
-            let mut dirs: Vec<String> = map
-                .keys()
-                .filter_map(|k| k.strip_prefix(dir_prefix))
-                .filter_map(|rest| rest.split_once('/').map(|(d, _)| d.to_string()))
-                .collect();
-            dirs.sort();
-            dirs.dedup();
-            Ok(dirs)
-        }
         async fn delete_keys(&self, keys: &[String]) -> Result<()> {
             let mut map = self.objects.lock().unwrap();
             for k in keys {
                 map.remove(k);
             }
             Ok(())
+        }
+        async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+            let map = self.objects.lock().unwrap();
+            let mut out: Vec<ObjectMeta> = map
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, v)| ObjectMeta {
+                    key: k.clone(),
+                    size: v.len() as u64,
+                    etag: test_etag(v),
+                })
+                .collect();
+            out.sort_by(|a, b| a.key.cmp(&b.key));
+            Ok(out)
         }
         fn supports_leases(&self) -> bool {
             true

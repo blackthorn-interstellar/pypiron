@@ -350,8 +350,14 @@ impl Proxy {
             }
         };
 
+        // Intent before truth, commit after (see worker.rs): a crash between
+        // the artifact landing and the commit marker heals via stale intent.
+        let intent_nonce = crate::worker::mark_intent(state.storage.as_ref(), pkg)
+            .await
+            .ok();
+
         // Ordering invariant: artifact, then companion, then sidecar, then
-        // dirty marker — a listed-but-missing file is the only harmful state.
+        // commit marker — a listed-but-missing file is the only harmful state.
         state
             .storage
             .put_file_if_absent(&key, spool.path.path(), Some("application/octet-stream"))
@@ -388,7 +394,7 @@ impl Proxy {
                 Some("application/json"),
             )
             .await?;
-        crate::mark_dirty(state, pkg).await?;
+        crate::commit_marker(state, pkg, intent_nonce).await?;
         state
             .metrics
             .proxy_artifacts_cached

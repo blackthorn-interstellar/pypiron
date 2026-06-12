@@ -431,6 +431,13 @@ async fn sync_one_package(
         }
     }
 
+    // Intent before the batch of truth writes; commit (paired) after. A sync
+    // process killed mid-package heals via the stale intent.
+    let intent_nonce = match sink {
+        Sink::Storage(storage) => crate::worker::mark_intent(storage.as_ref(), pkg).await.ok(),
+        Sink::Http(_) => None,
+    };
+
     let results: Vec<Result<bool>> = stream::iter(selected)
         .map(|s| async move {
             match sink {
@@ -459,7 +466,10 @@ async fn sync_one_package(
 
     if wrote {
         if let Sink::Storage(storage) = sink {
-            mark_dirty(storage.as_ref(), pkg).await?;
+            match &intent_nonce {
+                Some(nonce) => crate::worker::mark_commit(storage.as_ref(), pkg, nonce).await?,
+                None => mark_dirty(storage.as_ref(), pkg).await?,
+            }
         }
     }
     if errors > 0 {
@@ -781,10 +791,10 @@ pub(crate) fn matches_filters(file: &PyPiFile, f: &ResolvedFilter) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct WheelTags {
-    python: Vec<String>,
-    abi: Vec<String>,
-    platform: Vec<String>,
+pub(crate) struct WheelTags {
+    pub(crate) python: Vec<String>,
+    pub(crate) abi: Vec<String>,
+    pub(crate) platform: Vec<String>,
 }
 
 fn tokens_match_any(tokens: &[String], filters: &[String]) -> bool {
@@ -829,7 +839,7 @@ fn glob_like_contains(haystack: &str, pattern: &str) -> bool {
 
 /// Parse wheel filename into (python, abi, platform) tags.
 /// Uses the last 3 dash-separated fields before ".whl" per PEP 427.
-fn parse_wheel_tags(filename: &str) -> Option<WheelTags> {
+pub(crate) fn parse_wheel_tags(filename: &str) -> Option<WheelTags> {
     if !filename.ends_with(".whl") {
         return None;
     }
@@ -919,6 +929,24 @@ mod tests {
             exclude_newer: parse(newer),
             exclude_older: parse(older),
         }
+    }
+
+    #[test]
+    fn wheel_tags_parse_and_reject_real_shapes() {
+        // Standard, compound python tag, and build-tag wheels parse.
+        let t = parse_wheel_tags("six-1.16.0-py2.py3-none-any.whl").unwrap();
+        assert_eq!(t.python, ["py2", "py3"]);
+        assert_eq!(t.abi, ["none"]);
+        assert_eq!(t.platform, ["any"]);
+        let t = parse_wheel_tags("demo-1.0-1-cp311-cp311-manylinux_2_17_x86_64.whl").unwrap();
+        assert_eq!(t.python, ["cp311"]);
+
+        // Real malformed uploads (126 of 9.94M wheels): missing version or
+        // tag fields. Must be None, not a panic or a bogus parse.
+        assert!(parse_wheel_tags("JHVIT-0.0.1-py3-any.whl").is_none());
+        assert!(parse_wheel_tags("CLUEstering-1.0.2-none-any.whl").is_none());
+        assert!(parse_wheel_tags("GoldenFace1.1-py3-none-any.whl").is_none());
+        assert!(parse_wheel_tags("not-a-wheel-1.0.tar.gz").is_none());
     }
 
     #[test]

@@ -1,14 +1,23 @@
 //! Index rebuild worker: dirty markers, not a queue.
 //!
-//! Uploads and deletes drop an empty marker at `_dirty/<pkg>` — always after
-//! the truth change it announces. Each tick lists the markers, deletes each
-//! marker FIRST, then rebuilds that package from a fresh listing. Deleting
-//! first matters: the key is shared, so deleting after the rebuild would
-//! destroy marks written concurrently during it — and a swallowed delete-mark
-//! leaves a listed-but-missing file, the one harmful state. With delete-first,
-//! truth-before-marker guarantees the rebuild sees whatever prompted any
-//! swallowed mark. A crash between delete and rebuild merely defers to the
-//! reconciler. Duplicate markers still collapse into one rebuild for free.
+//! Markers are unique, create-only event keys:
+//! `_dirty/<pkg>!<nonce>.intent` written *before* a writer touches truth, and
+//! `_dirty/<pkg>!<nonce>.commit` written *after*. Because every event is its
+//! own key, the worker can rebuild FIRST and then delete exactly the keys it
+//! observed — a concurrent writer's new marker is a new key and survives
+//! untouched, and a crash mid-rebuild leaves the keys in place for the next
+//! tick. At-least-once processing is free: rebuilds derive views from current
+//! truth, so duplicates converge.
+//!
+//! The intent/commit pair is what makes a crashed writer heal without any
+//! sweep: a commit (or an intent whose pair arrived) rebuilds immediately; an
+//! unpaired intent younger than the grace period means a writer is still in
+//! flight, so the package is skipped this tick; an unpaired intent older than
+//! the grace period is a crashed writer — rebuild and consume it. Markers are
+//! never deleted unprocessed, so no event is ever lost.
+//!
+//! Legacy flat markers (`_dirty/<pkg>`, no `!`) are treated as commits so an
+//! upgraded node drains what an old node wrote.
 
 use std::{
     collections::HashSet,
@@ -30,7 +39,7 @@ use crate::render::{
     pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
 };
 use crate::sidecar::{is_artifact, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, SIDECAR_SUFFIX};
-use crate::storage::{FileEntry, Storage};
+use crate::storage::{FileEntry, ObjectMeta, Storage};
 use crate::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 
 /// Bounded fan-out for storage round-trips during rebuilds and sweeps.
@@ -41,11 +50,97 @@ use crate::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 const SIDECAR_READ_CONCURRENCY: usize = 64;
 const PACKAGE_SWEEP_CONCURRENCY: usize = 8;
 
-/// Mark a package as needing an index rebuild (empty object at `_dirty/<pkg>`).
-pub async fn mark_dirty(storage: &dyn Storage, pkg: &str) -> Result<()> {
+const INTENT_SUFFIX: &str = ".intent";
+const COMMIT_SUFFIX: &str = ".commit";
+
+/// Unique per-event marker id: wall nanos + pid + process-local counter.
+/// Uniqueness is what makes delete-after-rebuild race-free.
+fn marker_nonce() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{nanos}-{}-{seq}", std::process::id())
+}
+
+/// Declare "I am about to change truth for `pkg`". Returns the nonce the
+/// writer must commit with. If the writer dies, the intent goes stale and the
+/// worker rebuilds anyway after the grace period.
+pub async fn mark_intent(storage: &dyn Storage, pkg: &str) -> Result<String> {
+    let nonce = marker_nonce();
     storage
-        .put_bytes(&format!("{DIRTY_PREFIX}{pkg}"), Vec::new(), None)
+        .put_bytes(
+            &format!("{DIRTY_PREFIX}{pkg}!{nonce}{INTENT_SUFFIX}"),
+            Vec::new(),
+            None,
+        )
+        .await?;
+    Ok(nonce)
+}
+
+/// Declare "truth changed for `pkg`": rebuild as soon as possible.
+pub async fn mark_commit(storage: &dyn Storage, pkg: &str, nonce: &str) -> Result<()> {
+    storage
+        .put_bytes(
+            &format!("{DIRTY_PREFIX}{pkg}!{nonce}{COMMIT_SUFFIX}"),
+            Vec::new(),
+            None,
+        )
         .await
+}
+
+/// Mark a package as needing an index rebuild (an unpaired commit event, for
+/// callers whose truth change already happened).
+pub async fn mark_dirty(storage: &dyn Storage, pkg: &str) -> Result<()> {
+    mark_commit(storage, pkg, &marker_nonce()).await
+}
+
+/// One parsed `_dirty/` entry.
+struct Marker {
+    key: String,
+    nonce: Option<String>,
+    is_commit: bool,
+    /// Storage last-modified — staleness comes from the storage clock.
+    written_at: Option<time::OffsetDateTime>,
+}
+
+/// Split a marker key into (package, marker). Legacy `_dirty/<pkg>` keys
+/// parse as nonce-less commits.
+fn parse_marker(entry: &FileEntry) -> Option<(String, Marker)> {
+    let rest = entry.key.strip_prefix(DIRTY_PREFIX)?;
+    let written_at = entry.last_modified.as_deref().and_then(|ts| {
+        time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339).ok()
+    });
+    let Some((pkg, event)) = rest.split_once('!') else {
+        return Some((
+            rest.to_string(),
+            Marker {
+                key: entry.key.clone(),
+                nonce: None,
+                is_commit: true,
+                written_at,
+            },
+        ));
+    };
+    let (nonce, is_commit) = if let Some(n) = event.strip_suffix(COMMIT_SUFFIX) {
+        (n, true)
+    } else if let Some(n) = event.strip_suffix(INTENT_SUFFIX) {
+        (n, false)
+    } else {
+        // Unknown suffix: treat as a commit so nothing rots in the prefix.
+        (event, true)
+    };
+    Some((
+        pkg.to_string(),
+        Marker {
+            key: entry.key.clone(),
+            nonce: Some(nonce.to_string()),
+            is_commit,
+            written_at,
+        },
+    ))
 }
 
 pub async fn run_worker_until(
@@ -60,12 +155,23 @@ pub async fn run_worker_until(
         .supports_leases()
         .then(|| LeaseManager::new(state.storage.clone(), state.lease_ttl));
 
-    let mut last_reconcile: Option<Instant> = None;
-    // The sweep runs on its own task: a full reconcile over a large corpus
-    // takes minutes of storage round-trips, and running it inline starved
-    // dirty-marker processing for its whole duration (sync uploads timed
-    // out, upload→visible p99 went to tens of seconds). Concurrent sweep +
-    // tick rebuilds of the same package are safe — rebuilds are idempotent.
+    // Markers are the primary freshness mechanism; the audit is the safety
+    // net for what events cannot see (restores, out-of-band storage changes,
+    // a peer that died without committing). The first leader audit runs
+    // immediately (unless --audit-on-boot=false), so a restored backup heals
+    // without waiting an interval. The audit runs on its own task: a deep
+    // pass over a large corpus takes minutes of storage round-trips, and
+    // running it inline starved dirty-marker processing for its whole
+    // duration. Concurrent audit + tick rebuilds of the same package are
+    // safe — rebuilds are idempotent.
+    let mut last_audit: Option<Instant> = if state.audit_on_boot {
+        None
+    } else {
+        Some(Instant::now())
+    };
+    // Adaptive spacing: never spend more than ~1/10th of wall time auditing,
+    // no matter how the interval is configured relative to corpus size.
+    let last_audit_secs = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sweep_running = Arc::new(AtomicBool::new(false));
     loop {
         let is_leader = match &lease {
@@ -73,18 +179,21 @@ pub async fn run_worker_until(
             Some(lm) => lm.is_leader().await,
         };
         if is_leader {
-            // The reconciler is the backbone; markers merely accelerate it.
-            // The first leader sweep runs immediately, so a restored backup
-            // (or a fresh leader) heals without waiting an interval.
-            let due = last_reconcile.is_none_or(|t| t.elapsed() >= state.reconcile_interval);
+            let spacing = state.reconcile_interval.max(std::time::Duration::from_secs(
+                last_audit_secs.load(Ordering::Relaxed) * 10,
+            ));
+            let due = last_audit.is_none_or(|t| t.elapsed() >= spacing);
             if due && !sweep_running.swap(true, Ordering::SeqCst) {
-                last_reconcile = Some(Instant::now());
+                last_audit = Some(Instant::now());
                 let state = state.clone();
                 let running = sweep_running.clone();
+                let duration_out = last_audit_secs.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = reconcile(&state).await {
-                        error!(error=?e, "reconcile failed");
+                    let started = Instant::now();
+                    if let Err(e) = audit(&state, false).await {
+                        error!(error=?e, "audit failed");
                     }
+                    duration_out.store(started.elapsed().as_secs(), Ordering::Relaxed);
                     running.store(false, Ordering::SeqCst);
                 });
             }
@@ -105,114 +214,315 @@ pub async fn run_worker_until(
     }
 }
 
-/// Full sweep: regenerate every package index from truth (backfilling missing
-/// sidecars), prune views whose package is gone, and refresh the global index.
-/// Writes only happen where the materialized view disagrees with truth.
-pub async fn reconcile(state: &AppState) -> Result<()> {
-    let mut live: Vec<String> = Vec::new();
-    let mut failures = 0usize;
-    let packages = state.storage.list_dirs(PACKAGES_PREFIX).await?;
-    for chunk in packages.chunks(PACKAGE_SWEEP_CONCURRENCY) {
-        let results =
-            futures::future::join_all(chunk.iter().map(|pkg| rebuild_package(state, pkg))).await;
-        for (pkg, result) in chunk.iter().zip(results) {
-            match result {
-                Ok(true) => live.push(pkg.clone()),
-                Ok(false) => {}
-                Err(e) => {
-                    // Conservative on failure: keep the package's existing views
-                    // and global listing rather than pruning on a bad observation.
-                    error!(package=%pkg, error=?e, "reconcile: package rebuild failed");
-                    failures += 1;
-                    live.push(pkg.clone());
-                }
-            }
-        }
-    }
+/// Fingerprint shards live here, one JSON map per [`SHARD_CHARS`] character:
+/// package → hash of the (key, size, etag) listing its views were built
+/// from. They are views of views — regenerable, never trusted over truth. A
+/// lost shard merely means its packages rebuild once.
+const STATE_PREFIX: &str = "_state/";
 
-    // Views whose truth directory disappeared entirely. Destructive, so
-    // re-check truth at delete time: a package born after our first listing
-    // (or built by a split-brain peer) must not have its fresh view pruned.
-    let live_set: HashSet<&str> = live.iter().map(String::as_str).collect();
-    for view in state.storage.list_dirs(SIMPLE_PREFIX).await? {
-        if live_set.contains(view.as_str()) {
-            continue;
-        }
-        let prefix = format!("{PACKAGES_PREFIX}{view}/");
-        match state.storage.list_dir_entries(&prefix).await {
-            Ok(entries) => {
-                let has_artifact = entries.iter().any(|e| {
-                    e.key
-                        .strip_prefix(&prefix)
-                        .map(is_artifact)
-                        .unwrap_or(false)
-                });
-                if has_artifact {
-                    continue;
+/// Audit sweep: detect-and-repair with cost proportional to *churn*, not
+/// corpus size. One flat listing per shard (1,000 keys per S3 request)
+/// covers truth and views; a package whose listing fingerprint matches the
+/// one stored at its last rebuild is provably unchanged — zero reads. Only
+/// the diff gets the deep treatment (sidecar reads, view rewrite, sidecar
+/// backfill, orphan pruning). `force_deep` ignores stored fingerprints and
+/// rebuilds everything — that is `pypiron resync`.
+pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
+    let started = Instant::now();
+    let mut live: Vec<String> = Vec::new();
+    let mut dead: Vec<String> = Vec::new();
+    let mut failures = 0usize;
+    let mut rebuilt = 0usize;
+
+    // Shards enumerate in parallel — that is what the sharding is for. The
+    // bound keeps peak memory at a few shards' worth of listings (a shard is
+    // ~1/36th of the corpus).
+    const SHARD_CONCURRENCY: usize = 6;
+    for chunk in crate::storage::SHARD_CHARS.chunks(SHARD_CONCURRENCY) {
+        let audits = chunk
+            .iter()
+            .map(|shard| audit_shard(state, *shard, force_deep));
+        for (shard, result) in chunk.iter().zip(futures::future::join_all(audits).await) {
+            match result {
+                Ok(result) => {
+                    live.extend(result.live);
+                    dead.extend(result.dead);
+                    rebuilt += result.rebuilt;
+                    failures += result.failures;
+                }
+                Err(e) => {
+                    error!(shard=%shard, error=?e, "audit: shard failed");
+                    failures += 1;
                 }
             }
-            Err(e) => {
-                error!(view=%view, error=?e, "reconcile: cannot verify orphan view; keeping it");
-                failures += 1;
-                continue;
-            }
-        }
-        let keys = [
-            format!("{SIMPLE_PREFIX}{view}/index.html"),
-            format!("{SIMPLE_PREFIX}{view}/index.json"),
-        ];
-        state.storage.delete_keys(&keys).await?;
-        for key in &keys {
-            state.index_cache.invalidate(key);
         }
     }
 
     live.sort();
     live.dedup();
-    write_global_indexes(state, &live).await?;
+    // Delta + CAS, not a blind overwrite: a package born mid-audit (its name
+    // added by the tick) must not be clobbered by our older observation.
+    update_global_index(state, &live, &dead).await?;
     if failures > 0 {
-        return Err(anyhow::anyhow!(
-            "sweep finished with {failures} package failure(s)"
-        ));
+        return Err(anyhow::anyhow!("audit finished with {failures} failure(s)"));
     }
     state
         .metrics
         .reconcile_sweeps
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    info!(packages = live.len(), "reconcile: sweep complete");
+    info!(
+        packages = live.len(),
+        rebuilt,
+        duration_secs = started.elapsed().as_secs_f64(),
+        "reconcile: sweep complete"
+    );
     Ok(())
 }
 
+struct ShardAudit {
+    live: Vec<String>,
+    /// Observed with no artifacts: must not be listed globally.
+    dead: Vec<String>,
+    rebuilt: usize,
+    failures: usize,
+}
+
+/// Audit every package whose name starts with `shard`.
+async fn audit_shard(state: &AppState, shard: char, force_deep: bool) -> Result<ShardAudit> {
+    let (truth, views) = futures::future::try_join(
+        state.storage.list_all(&format!("{PACKAGES_PREFIX}{shard}")),
+        state.storage.list_all(&format!("{SIMPLE_PREFIX}{shard}")),
+    )
+    .await?;
+
+    // Group listings by package; the global index files ("index.json" under
+    // simple/i...) have no '/' and are skipped — they are handled globally.
+    let mut by_pkg: std::collections::BTreeMap<String, (Vec<&ObjectMeta>, Vec<&ObjectMeta>)> =
+        std::collections::BTreeMap::new();
+    for obj in &truth {
+        if let Some(pkg) = key_package(&obj.key, PACKAGES_PREFIX) {
+            by_pkg.entry(pkg.to_string()).or_default().0.push(obj);
+        }
+    }
+    for obj in &views {
+        if let Some(pkg) = key_package(&obj.key, SIMPLE_PREFIX) {
+            by_pkg.entry(pkg.to_string()).or_default().1.push(obj);
+        }
+    }
+
+    let fp_key = format!("{STATE_PREFIX}fp-{shard}.json");
+    let stored: std::collections::HashMap<String, String> = if force_deep {
+        Default::default()
+    } else {
+        match state.storage.get_bytes(&fp_key).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(_) => Default::default(),
+        }
+    };
+
+    let mut out = ShardAudit {
+        live: Vec::new(),
+        dead: Vec::new(),
+        rebuilt: 0,
+        failures: 0,
+    };
+    let mut fresh: std::collections::HashMap<String, String> = Default::default();
+    let packages: Vec<(String, String, bool)> = by_pkg
+        .into_iter()
+        .map(|(pkg, (t, v))| {
+            let fp = fingerprint(&t, &v);
+            let has_artifacts = t.iter().any(|o| {
+                o.key
+                    .strip_prefix(&format!("{PACKAGES_PREFIX}{pkg}/"))
+                    .is_some_and(is_artifact)
+            });
+            (pkg, fp, has_artifacts)
+        })
+        .collect();
+
+    for chunk in packages.chunks(PACKAGE_SWEEP_CONCURRENCY) {
+        let jobs = chunk.iter().map(|(pkg, fp, has_artifacts)| {
+            let unchanged = stored.get(pkg.as_str()) == Some(fp);
+            let (pkg, fp, has_artifacts) = (pkg.clone(), fp.clone(), *has_artifacts);
+            async move {
+                if unchanged {
+                    // Provably unchanged since the fingerprint was written.
+                    return (pkg, Some(fp), has_artifacts, false, false);
+                }
+                match rebuild_package(state, &pkg).await {
+                    Ok(live_now) => {
+                        // Fingerprint what the rebuild actually saw/wrote, not
+                        // the pre-rebuild listing — two cheap per-package lists.
+                        let new_fp = package_fingerprint(state, &pkg).await.ok();
+                        (pkg, new_fp, live_now, true, false)
+                    }
+                    Err(e) => {
+                        // Conservative on failure: keep the package listed and
+                        // its views rather than pruning on a bad observation.
+                        error!(package=%pkg, error=?e, "audit: package rebuild failed");
+                        (pkg, None, has_artifacts, false, true)
+                    }
+                }
+            }
+        });
+        for (pkg, fp, live_now, was_rebuilt, failed) in futures::future::join_all(jobs).await {
+            if let Some(fp) = fp {
+                fresh.insert(pkg.clone(), fp);
+            }
+            if live_now || failed {
+                out.live.push(pkg);
+            } else {
+                out.dead.push(pkg);
+            }
+            out.rebuilt += was_rebuilt as usize;
+            out.failures += failed as usize;
+        }
+    }
+
+    // `fresh` now holds exactly the packages that exist; anything left in
+    // `stored` is gone and simply drops out of the rewritten shard.
+    let bytes = serde_json::to_vec(&std::collections::BTreeMap::from_iter(fresh.iter()))?;
+    put_if_changed(state, &fp_key, bytes, "application/json").await?;
+    Ok(out)
+}
+
+/// The package a key belongs to: first path segment after `prefix`.
+fn key_package<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    key.strip_prefix(prefix)?.split_once('/').map(|(p, _)| p)
+}
+
+/// Hash of everything a package's views are derived from, as observed in a
+/// flat listing: truth objects (artifacts decide membership, sidecar etags
+/// carry yank/metadata changes) plus the view objects themselves (so
+/// out-of-band view deletion or tampering is also caught).
+fn fingerprint(truth: &[&ObjectMeta], views: &[&ObjectMeta]) -> String {
+    let mut hasher = Sha256::new();
+    for obj in truth.iter().chain(views.iter()) {
+        hasher.update(&obj.key);
+        hasher.update(obj.size.to_le_bytes());
+        hasher.update(&obj.etag);
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Re-derive one package's fingerprint from fresh listings (post-rebuild).
+async fn package_fingerprint(state: &AppState, pkg: &str) -> Result<String> {
+    let (truth, views) = futures::future::try_join(
+        state.storage.list_all(&format!("{PACKAGES_PREFIX}{pkg}/")),
+        state.storage.list_all(&format!("{SIMPLE_PREFIX}{pkg}/")),
+    )
+    .await?;
+    Ok(fingerprint(
+        &truth.iter().collect::<Vec<_>>(),
+        &views.iter().collect::<Vec<_>>(),
+    ))
+}
+
 async fn tick(state: &Arc<AppState>) -> Result<()> {
-    let markers = state.storage.list_dir_entries(DIRTY_PREFIX).await?;
-    if markers.is_empty() {
+    let entries = state.storage.list_dir_entries(DIRTY_PREFIX).await?;
+    if entries.is_empty() {
         return Ok(());
     }
-    info!(count = markers.len(), "worker: processing dirty markers");
 
-    // Markers drain with bounded concurrency: they are per-package and
-    // rebuilds are idempotent, so parallelism across packages is free. The
-    // serial loop capped mass ingest (10k freshly seeded packages) at a few
-    // packages per second of S3 round-trips. A semaphore (not chunked
-    // join_all) so one slow 5,000-file rebuild never head-of-line blocks the
-    // tiny rebuilds behind it — that stall showed up as a 73s visibility p99
-    // for unrelated packages. One failing package still must not starve the
-    // rest of the namespace.
+    // Group events per package and decide what is consumable now.
+    let now = time::OffsetDateTime::now_utc();
+    let mut per_pkg: std::collections::HashMap<String, Vec<Marker>> =
+        std::collections::HashMap::new();
+    for entry in &entries {
+        if let Some((pkg, marker)) = parse_marker(entry) {
+            per_pkg.entry(pkg).or_default().push(marker);
+        }
+    }
+
+    let mut work: Vec<(String, Vec<String>)> = Vec::new();
+    for (pkg, markers) in per_pkg {
+        let commit_nonces: HashSet<&str> = markers
+            .iter()
+            .filter(|m| m.is_commit)
+            .filter_map(|m| m.nonce.as_deref())
+            .collect();
+        let consumable: Vec<String> = markers
+            .iter()
+            .filter(|m| {
+                if m.is_commit {
+                    return true;
+                }
+                // Intent: consumable once its commit arrived (the pair is
+                // done) or once it is stale (the writer crashed mid-flight).
+                let paired = m
+                    .nonce
+                    .as_deref()
+                    .is_some_and(|n| commit_nonces.contains(n));
+                let stale = m.written_at.is_none_or(|t| now - t >= state.intent_grace);
+                paired || stale
+            })
+            .map(|m| m.key.clone())
+            .collect();
+        // Only fresh unpaired intents: a writer is mid-flight; its commit (or
+        // staleness) will bring the package back.
+        if !consumable.is_empty() {
+            work.push((pkg, consumable));
+        }
+    }
+    if work.is_empty() {
+        return Ok(());
+    }
+    info!(
+        packages = work.len(),
+        markers = entries.len(),
+        "worker: processing dirty markers"
+    );
+
+    // Packages drain with bounded concurrency: rebuilds are idempotent, so
+    // parallelism across packages is free. A semaphore (not chunked join_all)
+    // so one slow 5,000-file rebuild never head-of-line blocks the tiny
+    // rebuilds behind it — that stall showed up as a 73s visibility p99 for
+    // unrelated packages. One failing package must not starve the namespace.
     let semaphore = Arc::new(tokio::sync::Semaphore::new(PACKAGE_SWEEP_CONCURRENCY));
-    let mut handles = Vec::with_capacity(markers.len());
-    for marker in markers {
+    let mut handles = Vec::with_capacity(work.len());
+    for (pkg, keys) in work {
         let state = state.clone();
         let semaphore = semaphore.clone();
         handles.push(tokio::spawn(async move {
             let _permit = semaphore.acquire().await;
-            drain_one_marker(&state, &marker).await
+            let rebuilt = match process_dirty(&state, &pkg).await {
+                Ok(has_artifacts) => Some(has_artifacts),
+                Err(e) => {
+                    error!(package=%pkg, error=?e, "rebuild failed; markers retained for retry");
+                    None
+                }
+            };
+            (pkg, keys, rebuilt)
         }));
     }
     let mut failures = 0usize;
+    let (mut adds, mut removes) = (Vec::new(), Vec::new());
+    let mut consumed: Vec<String> = Vec::new();
     for handle in handles {
-        if !handle.await.unwrap_or(false) {
-            failures += 1;
+        match handle.await {
+            Ok((pkg, keys, Some(true))) => {
+                adds.push(pkg);
+                consumed.extend(keys);
+            }
+            Ok((pkg, keys, Some(false))) => {
+                removes.push(pkg);
+                consumed.extend(keys);
+            }
+            _ => failures += 1,
         }
+    }
+    // One batched global-index pass per tick: mass ingest of N new packages
+    // rewrites the (corpus-sized) global views once, not N times.
+    update_global_index(state, &adds, &removes).await?;
+    // Markers are consumed LAST — they are the transaction log, and must
+    // outlive every write they announce (package views above, global index
+    // here). Rebuild-then-delete is race-free because keys are unique: an
+    // event arriving during the rebuild is a new key and survives. A crash
+    // anywhere before this line replays the whole tick — idempotent, so the
+    // only cost is repeated work, never a lost update.
+    if let Err(e) = state.storage.delete_keys(&consumed).await {
+        warn!(error=?e, "could not consume markers; rebuilds will repeat");
     }
     if failures > 0 {
         return Err(anyhow::anyhow!("{failures} package(s) failed this tick"));
@@ -220,34 +530,8 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
-/// Delete one marker then rebuild its package; returns success.
-async fn drain_one_marker(state: &AppState, marker: &FileEntry) -> bool {
-    let Some(pkg) = marker.key.strip_prefix(DIRTY_PREFIX) else {
-        return true;
-    };
-    // Marker first (see module docs): marks landing during the rebuild
-    // survive for the next tick instead of being deleted unprocessed.
-    if let Err(e) = state
-        .storage
-        .delete_keys(std::slice::from_ref(&marker.key))
-        .await
-    {
-        error!(package=%pkg, error=?e, "could not delete dirty marker; will retry");
-        return false;
-    }
-    if let Err(e) = process_dirty(state, pkg).await {
-        error!(package=%pkg, error=?e, "rebuild failed; re-marking");
-        // Restore the event so the next tick retries promptly instead of
-        // waiting for the reconcile sweep.
-        let _ = mark_dirty(state.storage.as_ref(), pkg).await;
-        return false;
-    }
-    true
-}
-
-async fn process_dirty(state: &AppState, pkg: &str) -> Result<()> {
-    let has_artifacts = rebuild_package(state, pkg).await?;
-    maybe_rebuild_global(state, pkg, has_artifacts).await
+async fn process_dirty(state: &AppState, pkg: &str) -> Result<bool> {
+    rebuild_package(state, pkg).await
 }
 
 /// Regenerate one package's indexes from a storage listing.
@@ -288,38 +572,70 @@ pub async fn rebuild_package_excluding(
     Ok(true)
 }
 
-/// The global index only changes when the *set of package names* changes.
-/// Check membership in the current index first; most uploads skip any write.
-/// When it does change, update incrementally — the one changed name is known,
-/// and re-listing every package directory put a new name 57 s away from the
-/// global index at 10k packages. Lost updates (peer nodes racing) are healed
-/// by the reconcile sweep's full rebuild; in-process racers serialize on a
-/// lock. Views may lag truth; the backbone repairs.
-async fn maybe_rebuild_global(state: &AppState, pkg: &str, has_artifacts: bool) -> Result<()> {
-    let _guard = state.global_index_lock.lock().await;
-    let mut projects = global_index_projects(state).await;
-    let listed = projects.contains(pkg);
-    if listed == has_artifacts {
-        return Ok(());
-    }
-    if has_artifacts {
-        projects.insert(pkg.to_string());
-    } else {
-        projects.remove(pkg);
-    }
-    let mut packages: Vec<String> = projects.into_iter().collect();
-    packages.sort();
-    write_global_indexes(state, &packages).await
+/// The in-memory copy of the global index's name set, pinned to the ETag of
+/// the materialized JSON it was loaded from (None on backends without ETags).
+/// At 780k names a membership check against storage costs a 45 MB GET +
+/// parse; against this it costs a hash lookup.
+pub(crate) struct GlobalNames {
+    etag: Option<String>,
+    names: HashSet<String>,
 }
 
-/// Package names in the current materialized global JSON index (empty if unreadable).
-async fn global_index_projects(state: &AppState) -> HashSet<String> {
-    let Ok(bytes) = state
-        .storage
-        .get_bytes(&format!("{SIMPLE_PREFIX}index.json"))
-        .await
-    else {
-        return HashSet::new();
+/// The global index only changes when the *set of package names* changes —
+/// check membership in memory first; the common case (an upload to a known
+/// package) costs nothing. Real changes are applied as a delta and written
+/// back under CAS (`If-Match`) where the backend supports it, so two nodes
+/// adding different names can never clobber each other: the loser reloads
+/// and reapplies. Deltas batch per worker tick, so mass ingest rewrites the
+/// (large) global index once per tick, not once per package.
+async fn update_global_index(state: &AppState, adds: &[String], removes: &[String]) -> Result<()> {
+    if adds.is_empty() && removes.is_empty() {
+        return Ok(());
+    }
+    let mut guard = state.global_names.lock().await;
+    for _attempt in 0..4 {
+        if guard.is_none() {
+            *guard = Some(load_global_names(state).await?);
+        }
+        let cached = guard.as_mut().expect("just loaded");
+        let mut changed = false;
+        for pkg in adds {
+            changed |= cached.names.insert(pkg.clone());
+        }
+        for pkg in removes {
+            changed |= cached.names.remove(pkg);
+        }
+        if !changed {
+            return Ok(());
+        }
+        let mut packages: Vec<String> = cached.names.iter().cloned().collect();
+        packages.sort();
+        if write_global_indexes_cas(state, &packages, &cached.etag.clone()).await? {
+            if let Some(cached) = guard.as_mut() {
+                // Re-pin to the fresh etag (None on non-CAS backends).
+                cached.etag = current_global_etag(state).await;
+            }
+            return Ok(());
+        }
+        // Lost the CAS to a peer: drop the cache, reload, reapply the delta.
+        *guard = None;
+    }
+    anyhow::bail!("global index CAS retries exhausted")
+}
+
+/// Load the global name set (and its ETag) from the materialized JSON.
+async fn load_global_names(state: &AppState) -> Result<GlobalNames> {
+    let key = format!("{SIMPLE_PREFIX}index.json");
+    let (bytes, etag) = if state.storage.supports_leases() {
+        match state.storage.get_with_etag(&key).await? {
+            Some((bytes, etag)) => (bytes, Some(etag)),
+            None => (Vec::new(), None),
+        }
+    } else {
+        (
+            state.storage.get_bytes(&key).await.unwrap_or_default(),
+            None,
+        )
     };
     #[derive(serde::Deserialize)]
     struct Global {
@@ -329,10 +645,59 @@ async fn global_index_projects(state: &AppState) -> HashSet<String> {
     struct Project {
         name: String,
     }
-    match serde_json::from_slice::<Global>(&bytes) {
+    let names = match serde_json::from_slice::<Global>(&bytes) {
         Ok(g) => g.projects.into_iter().map(|p| p.name).collect(),
         Err(_) => HashSet::new(),
+    };
+    Ok(GlobalNames { etag, names })
+}
+
+async fn current_global_etag(state: &AppState) -> Option<String> {
+    if !state.storage.supports_leases() {
+        return None;
     }
+    state
+        .storage
+        .get_with_etag(&format!("{SIMPLE_PREFIX}index.json"))
+        .await
+        .ok()
+        .flatten()
+        .map(|(_, etag)| etag)
+}
+
+/// Write both global views; the JSON is the canonical copy and goes first,
+/// conditionally where supported. Returns false when the CAS was lost.
+async fn write_global_indexes_cas(
+    state: &AppState,
+    packages: &[String],
+    expected_etag: &Option<String>,
+) -> Result<bool> {
+    let json_key = format!("{SIMPLE_PREFIX}index.json");
+    let json = pep691_global_json(packages).into_bytes();
+    if state.storage.supports_leases() {
+        let outcome = match expected_etag {
+            Some(etag) => state.storage.put_if_match(&json_key, etag, json).await?,
+            None => state.storage.put_if_none_match(&json_key, json).await?,
+        };
+        if outcome.is_none() {
+            return Ok(false);
+        }
+        state.index_cache.invalidate(&json_key);
+        // HTML is derived from the same list; last-writer-wins is fine.
+        let html_key = format!("{SIMPLE_PREFIX}index.html");
+        state
+            .storage
+            .put_bytes(
+                &html_key,
+                pep503_global_html(packages).into_bytes(),
+                Some("text/html; charset=utf-8"),
+            )
+            .await?;
+        state.index_cache.invalidate(&html_key);
+        return Ok(true);
+    }
+    write_global_indexes(state, packages).await?;
+    Ok(true)
 }
 
 /// List a package's artifacts with metadata from sidecars — O(files), no hashing.
@@ -419,6 +784,11 @@ async fn read_sidecar(state: &AppState, artifact_key: &str) -> Result<Sidecar> {
 /// Hash-once-and-backfill for files that predate write-time sidecars.
 /// Storage last-modified is the upload-time fallback (correct by construction
 /// for direct uploads — filenames are immutable, so written exactly once).
+///
+/// Create-only, never overwrite: "missing" was observed in a listing that may
+/// already be stale, and a concurrent upload's real sidecar (true timestamp,
+/// yank state) must always beat this fabricated one. Losing the race means
+/// the real sidecar exists — read and use it.
 async fn backfill_sidecar(state: &AppState, entry: &FileEntry, filename: &str) -> Result<Sidecar> {
     let bytes = state.storage.get_bytes(&entry.key).await?;
     let mut hasher = Sha256::new();
@@ -431,14 +801,17 @@ async fn backfill_sidecar(state: &AppState, entry: &FileEntry, filename: &str) -
         requires_python: None,
         yanked: Yanked::Flag(false),
     };
-    state
+    let created = state
         .storage
-        .put_bytes(
+        .put_if_absent(
             &sidecar_key(&entry.key),
             serde_json::to_vec(&sc)?,
             Some("application/json"),
         )
         .await?;
+    if !created {
+        return read_sidecar(state, &entry.key).await;
+    }
     info!(key=%entry.key, "backfilled sidecar");
     Ok(sc)
 }
@@ -512,7 +885,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    /// Storage stub whose `list_dirs("packages/")` never returns — a reconcile
+    /// Storage stub whose `list_all("packages/...")` never returns — an audit
     /// sweep that takes forever. Everything else is a tiny in-memory object map.
     struct SweepStallsStorage {
         objects: Mutex<HashMap<String, Vec<u8>>>,
@@ -587,9 +960,9 @@ mod tests {
             out.sort_by(|a, b| a.key.cmp(&b.key));
             Ok(out)
         }
-        async fn list_dirs(&self, dir_prefix: &str) -> Result<Vec<String>> {
-            if dir_prefix == PACKAGES_PREFIX {
-                // The sweep is now "running" and will never finish.
+        async fn list_all(&self, prefix: &str) -> Result<Vec<crate::storage::ObjectMeta>> {
+            if prefix.starts_with(PACKAGES_PREFIX) {
+                // Same stall for the flat-enumeration path the audit uses.
                 self.sweep_entered.store(true, Ordering::SeqCst);
                 futures::future::pending::<()>().await;
             }
@@ -648,6 +1021,8 @@ mod tests {
             artifact_delivery: ArtifactDelivery::Auto,
             worker_interval: Duration::from_secs(10),
             reconcile_interval: Duration::from_secs(3600),
+            intent_grace: time::Duration::seconds(900),
+            audit_on_boot: true,
             sync_uploads: false,
             sync_upload_timeout: Duration::from_secs(1),
             lease_ttl: Duration::from_secs(30),
@@ -656,7 +1031,7 @@ mod tests {
                 crate::cache::PRESIGN_CACHE_TTL,
             )),
             spool_dir: std::env::temp_dir(),
-            global_index_lock: Arc::new(tokio::sync::Mutex::new(())),
+            global_names: Arc::new(tokio::sync::Mutex::new(None)),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             proxy: None,
@@ -719,7 +1094,7 @@ mod tests {
             .unwrap(),
         );
         // Global index already lists the package, so the tick path skips the
-        // global rebuild (which would also hit the stalled list_dirs).
+        // global rebuild (which would also hit the stalled list_all).
         objects.insert(
             format!("{SIMPLE_PREFIX}index.json"),
             br#"{"projects":[{"name":"fastpkg"}]}"#.to_vec(),
@@ -741,6 +1116,8 @@ mod tests {
             artifact_delivery: ArtifactDelivery::Auto,
             worker_interval: Duration::from_millis(10),
             reconcile_interval: Duration::from_secs(3600),
+            intent_grace: time::Duration::seconds(900),
+            audit_on_boot: true,
             sync_uploads: false,
             sync_upload_timeout: Duration::from_secs(1),
             lease_ttl: Duration::from_secs(30),
@@ -749,7 +1126,7 @@ mod tests {
                 crate::cache::PRESIGN_CACHE_TTL,
             )),
             spool_dir: std::env::temp_dir(),
-            global_index_lock: Arc::new(tokio::sync::Mutex::new(())),
+            global_names: Arc::new(tokio::sync::Mutex::new(None)),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             proxy: None,

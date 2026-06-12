@@ -18,6 +18,8 @@ use tracing::{info, warn};
 
 mod cache;
 mod config;
+#[cfg(test)]
+mod corpus_check;
 mod lease;
 mod metrics;
 mod names;
@@ -28,6 +30,7 @@ mod sidecar;
 mod storage;
 mod sync;
 mod upload;
+mod verify;
 mod wheel;
 mod worker;
 
@@ -60,6 +63,25 @@ enum Commands {
     Serve(Box<ServeArgs>),
     /// Mirror packages from PyPI (or another source) into this PypIron instance
     Sync(Box<sync::SyncArgs>),
+    /// Recompute every index from truth and diff against what storage serves
+    /// (read-only); exits nonzero on any divergence
+    Verify(Box<verify::VerifyArgs>),
+    /// Rebuild every materialized view from truth, unconditionally. Run after
+    /// restoring a backup or editing storage out-of-band.
+    Resync(Box<ResyncArgs>),
+}
+
+#[derive(ClapArgs, Debug)]
+struct ResyncArgs {
+    #[command(flatten)]
+    storage: StorageArgs,
+}
+
+/// One-shot deep audit against a storage backend, no server attached.
+async fn run_resync(args: ResyncArgs) -> Result<()> {
+    let storage = args.storage.build().await?;
+    let state = AppState::headless(storage);
+    worker::audit(&state, true).await
 }
 
 /// How artifact bytes reach clients. The tension: redirects move the
@@ -155,7 +177,22 @@ struct ServeArgs {
     worker_interval_secs: u64,
 
     /// Full-reconcile sweep interval in seconds (the self-heal backbone)
-    #[arg(long, env = "PYPIRON_RECONCILE_INTERVAL_SECS", default_value = "300")]
+    /// Seconds an in-flight write may hold off its package's rebuild before
+    /// the worker assumes the writer crashed and rebuilds anyway. Must exceed
+    /// the slowest expected upload.
+    #[arg(long, env = "PYPIRON_INTENT_GRACE_SECS", default_value = "900")]
+    intent_grace_secs: u64,
+
+    /// Run an audit sweep as soon as this node becomes leader (heals a
+    /// restored backup or a crashed predecessor without waiting an interval).
+    #[arg(long, env = "PYPIRON_AUDIT_ON_BOOT", default_value_t = true, action = clap::ArgAction::Set)]
+    audit_on_boot: bool,
+
+    /// Seconds between audit sweeps. Day-to-day freshness rides the event
+    /// markers; the audit only catches out-of-band storage changes, so daily
+    /// is plenty. Fingerprint shards make an unchanged corpus cost a flat
+    /// listing and nothing else.
+    #[arg(long, env = "PYPIRON_RECONCILE_INTERVAL_SECS", default_value = "86400")]
     reconcile_interval_secs: u64,
 
     /// Leader lease TTL in seconds (multi-node S3 only; sloppy by design)
@@ -231,6 +268,11 @@ struct AppState {
     // worker cfg
     worker_interval: Duration,
     reconcile_interval: Duration,
+    /// How long an unpaired intent marker may sit before the worker treats
+    /// its writer as crashed and rebuilds anyway. time::Duration because it
+    /// is compared against storage timestamps.
+    intent_grace: time::Duration,
+    audit_on_boot: bool,
     lease_ttl: Duration,
     sync_uploads: bool,
     sync_upload_timeout: Duration,
@@ -240,8 +282,8 @@ struct AppState {
     presign_cache: Arc<cache::PresignCache>,
     /// Where upload spools live (must be real disk, not tmpfs).
     spool_dir: std::path::PathBuf,
-    /// Serializes incremental global-index read-modify-writes in-process.
-    global_index_lock: Arc<tokio::sync::Mutex<()>>,
+    /// In-memory global-index name set + the lock serializing its writes.
+    global_names: Arc<tokio::sync::Mutex<Option<worker::GlobalNames>>>,
     /// Wakes the worker immediately after a write drops a dirty marker.
     worker_nudge: Arc<tokio::sync::Notify>,
     /// Hand-rolled Prometheus counters served at /metrics.
@@ -269,6 +311,12 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Sync(args)) => {
             return sync::run_sync(*args).await;
+        }
+        Some(Commands::Verify(args)) => {
+            return verify::run_verify(*args).await;
+        }
+        Some(Commands::Resync(args)) => {
+            return run_resync(*args).await;
         }
         Some(Commands::Serve(args)) => {
             return run_serve(*args).await;
@@ -299,13 +347,15 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         artifact_delivery: cli.artifact_delivery,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
+        intent_grace: time::Duration::seconds(cli.intent_grace_secs as i64),
+        audit_on_boot: cli.audit_on_boot,
         lease_ttl: Duration::from_secs(cli.lease_ttl_secs),
         sync_uploads: cli.sync_uploads,
         sync_upload_timeout: Duration::from_secs(cli.sync_upload_timeout_secs),
         index_cache: Arc::new(cache::IndexCache::new(cache::INDEX_CACHE_TTL)),
         presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
         spool_dir: cli.spool_dir.unwrap_or_else(std::env::temp_dir),
-        global_index_lock: Arc::new(tokio::sync::Mutex::new(())),
+        global_names: Arc::new(tokio::sync::Mutex::new(None)),
         worker_nudge: Arc::new(tokio::sync::Notify::new()),
         metrics: Arc::new(metrics::Metrics::new()),
         proxy,
@@ -822,6 +872,17 @@ async fn legacy_upload(
         }
     }
 
+    // Intent marker before any truth write: if this request dies anywhere
+    // below, the stale intent guarantees a rebuild without any sweep.
+    // Best-effort — the commit marker after the writes is the primary signal.
+    let intent_nonce = match worker::mark_intent(state.storage.as_ref(), &pkg_norm).await {
+        Ok(nonce) => Some(nonce),
+        Err(e) => {
+            warn!(error=?e, "legacy: failed to write intent marker");
+            None
+        }
+    };
+
     // Ordering invariant: artifact, then sidecars, then index job.
     // The conditional create IS the immutability rule (pypi.org's): a plain
     // HEAD-then-PUT is a TOCTOU hole that lets concurrent uploads swap bytes.
@@ -887,10 +948,11 @@ async fn legacy_upload(
             )
         })?;
 
-    // Drop a dirty marker for the worker; best-effort — the artifact is
-    // durable either way and the periodic reconcile heals lost markers.
-    if let Err(e) = mark_dirty(&state, &pkg_norm).await {
-        warn!(error=?e, "legacy: failed to write dirty marker");
+    // Commit marker: truth changed, rebuild now. Pairs with the intent above
+    // so the worker consumes both; if this write fails the intent still goes
+    // stale and heals the package.
+    if let Err(e) = commit_marker(&state, &pkg_norm, intent_nonce).await {
+        warn!(error=?e, "legacy: failed to write commit marker");
     }
 
     // Read-your-writes by waiting: poll our own index until the file shows
@@ -940,12 +1002,20 @@ fn now_rfc3339() -> String {
         .unwrap_or_default()
 }
 
-/// Mark a package as needing an index rebuild (empty object at `_dirty/<pkg>`).
-pub(crate) async fn mark_dirty(state: &AppState, pkg: &str) -> Result<()> {
-    worker::mark_dirty(state.storage.as_ref(), pkg).await?;
-    // Wake the worker now instead of letting the marker wait out the tick —
-    // upload→visible drops from ~tick+rebuild to ~rebuild. Peer nodes still
-    // ride the marker/tick path; this is a same-process accelerant only.
+/// Commit a truth change, pairing with `intent_nonce` when the intent marker
+/// landed (so the worker consumes both), and wake the worker now instead of
+/// letting the marker wait out the tick — upload→visible drops from
+/// ~tick+rebuild to ~rebuild. Peer nodes still ride the marker/tick path;
+/// the nudge is a same-process accelerant only.
+pub(crate) async fn commit_marker(
+    state: &AppState,
+    pkg: &str,
+    intent_nonce: Option<String>,
+) -> Result<()> {
+    match intent_nonce {
+        Some(nonce) => worker::mark_commit(state.storage.as_ref(), pkg, &nonce).await?,
+        None => worker::mark_dirty(state.storage.as_ref(), pkg).await?,
+    }
     state.worker_nudge.notify_one();
     Ok(())
 }
@@ -1367,6 +1437,10 @@ async fn files_delete(
         }
     }
 
+    // Intent before any mutation: a crash mid-delete heals via the stale
+    // intent instead of leaving the view permanently ahead of truth.
+    let intent_nonce = worker::mark_intent(state.storage.as_ref(), &pkg).await.ok();
+
     worker::rebuild_package_excluding(&state, &pkg, Some(&filename))
         .await
         .map_err(|e| {
@@ -1400,8 +1474,8 @@ async fn files_delete(
         .await;
 
     // Worker confirms from truth and prunes global membership if needed.
-    if let Err(e) = mark_dirty(&state, &pkg).await {
-        warn!(error=?e, "delete: failed to write dirty marker");
+    if let Err(e) = commit_marker(&state, &pkg, intent_nonce).await {
+        warn!(error=?e, "delete: failed to write commit marker");
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1460,6 +1534,7 @@ async fn set_yanked(
     })?;
     sc.yanked = yanked;
 
+    let intent_nonce = worker::mark_intent(state.storage.as_ref(), &pkg).await.ok();
     let out = serde_json::to_vec(&sc)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
     state
@@ -1468,8 +1543,8 @@ async fn set_yanked(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
 
-    if let Err(e) = mark_dirty(state, &pkg).await {
-        warn!(error=?e, "yank: failed to write dirty marker");
+    if let Err(e) = commit_marker(state, &pkg, intent_nonce).await {
+        warn!(error=?e, "yank: failed to write commit marker");
     }
     Ok(StatusCode::OK)
 }
@@ -1488,6 +1563,36 @@ fn accepts_json(headers: &HeaderMap) -> bool {
 }
 
 impl AppState {
+    /// State for one-shot storage operations (resync) — no credentials, no
+    /// server, default knobs. Only the storage-facing fields matter.
+    fn headless(storage: Arc<dyn Storage>) -> Self {
+        AppState {
+            storage,
+            uploader_user: None,
+            uploader_pass: None,
+            admin_user: None,
+            admin_pass: None,
+            read_user: None,
+            read_pass: None,
+            private_prefix: None,
+            artifact_delivery: ArtifactDelivery::Auto,
+            worker_interval: Duration::from_secs(1),
+            reconcile_interval: Duration::from_secs(86400),
+            intent_grace: time::Duration::seconds(900),
+            audit_on_boot: true,
+            lease_ttl: Duration::from_secs(30),
+            sync_uploads: false,
+            sync_upload_timeout: Duration::from_secs(10),
+            index_cache: Arc::new(cache::IndexCache::new(cache::INDEX_CACHE_TTL)),
+            presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
+            spool_dir: std::env::temp_dir(),
+            global_names: Arc::new(tokio::sync::Mutex::new(None)),
+            worker_nudge: Arc::new(tokio::sync::Notify::new()),
+            metrics: Arc::new(metrics::Metrics::new()),
+            proxy: None,
+        }
+    }
+
     /// The configured uploader credential, if any (both halves required).
     fn uploader_credential(&self) -> Option<(&str, &str)> {
         match (&self.uploader_user, &self.uploader_pass) {

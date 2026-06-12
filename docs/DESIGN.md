@@ -32,9 +32,13 @@ architectural work:
 - **Split-brain is harmless.** Two workers rebuilding the same package index do
   redundant work and converge. So leader election can be *sloppy* — it is a cost
   optimization (avoid duplicate LISTs/PUTs), not a correctness requirement.
-- **Lost events are harmless.** A periodic full reconcile regenerates anything
-  stale, so the event path only has to be fast, never reliable.
-- **Recovery is trivial.** Worst case, delete every view and regenerate from truth.
+- **Events cannot be lost.** Markers are unique create-only keys written around
+  every truth change (intent before, commit after) and only consumed after the
+  work they announce is done. At-least-once processing is free because rebuilds
+  derive from truth; crash anywhere and the replay converges. Proven by the
+  crash-point sweep in tests/test_crash_consistency.py.
+- **Recovery is trivial.** Worst case, `pypiron resync` regenerates every view
+  from truth.
 
 ## Ordering invariant: views may lag truth, but must never lead it
 
@@ -50,35 +54,45 @@ harmless direction.
 Queue semantics (pending/, processing/, claim-by-copy) buy nothing here, because the
 job payload is redundant — the truth is the storage listing. Instead:
 
-1. An upload or delete drops an empty marker object at `_dirty/<pkg>` — always
-   *after* the truth change it announces (artifact/sidecar written, or index
-   entry removed).
-2. The worker lists `_dirty/`, deletes each marker **first**, then rebuilds that
-   package from a fresh listing. Deleting first matters: the marker key is
-   shared, so deleting after the rebuild would destroy any mark written
-   concurrently *during* the rebuild — and since a delete's mark signals an
-   index entry that must go away, swallowing it leaves a listed-but-missing
-   file (the one harmful state) until the next reconcile. With delete-first,
-   truth-before-marker guarantees the rebuild's listing always sees the state
-   that prompted any swallowed mark. The cost is honest: a crash between
-   delete and rebuild loses the event — which the reconciler heals, exactly
-   the failure class it exists for.
-3. Duplicate markers for the same package collapse into one rebuild for free.
+1. A writer drops a unique, create-only **intent** marker
+   (`_dirty/<pkg>!<nonce>.intent`) *before* touching truth, and a paired
+   **commit** marker (`...<nonce>.commit`) *after*. Every event is its own
+   key — nothing is ever overwritten.
+2. The worker lists `_dirty/`, rebuilds each marked package from a fresh
+   listing, updates the global index, and only **then** deletes exactly the
+   marker keys it observed. Rebuild-before-delete is race-free because keys
+   are unique: an event arriving during the rebuild is a new key and
+   survives. A crash anywhere before the delete replays the tick — rebuilds
+   are idempotent, so the only cost is repeated work, never a lost update.
+3. A commit (or an intent whose pair arrived) rebuilds immediately. An
+   unpaired intent younger than the grace period (`--intent-grace-secs`)
+   means a writer is in flight — skip. Older means the writer crashed —
+   rebuild anyway. Either way the package heals without any sweep.
+4. Duplicate markers for the same package collapse into one rebuild for free.
 
 No claim races are possible because there is nothing to claim. This deletes a whole
 class of distributed-systems problems.
 
 The **global index** (`/simple/`) only changes when the *set of package names*
-changes — a new name appears or the last file of a package is deleted. Check
-membership first; most uploads skip the global rebuild entirely.
+changes — a new name appears or the last file of a package is deleted. The
+leader keeps the name set in memory (a membership check must not cost a
+corpus-sized GET), batches changes per tick, and writes back under S3
+conditional writes (`If-Match`) so racing nodes reload-and-retry instead of
+clobbering each other.
 
-## The reconciler is the backbone; events are an accelerant
+## Events are the backbone; the audit is the safety net
 
-A periodic full reconcile (leader only, every N minutes) lists everything and
-regenerates anything stale. Once that exists, dirty markers are merely a latency
-optimization. Systems where the repair mechanism is the foundation and events are an
-optimization are dramatically more robust than systems where events must never be
-lost.
+Markers carry all day-to-day freshness. What they cannot see is change pypiron
+didn't make: a restored backup, manual bucket surgery, another tool writing.
+For that, a periodic **audit** (leader only, default daily, plus one on boot)
+flat-lists the corpus — 1,000 keys per S3 request, no per-directory listing —
+and compares each package's (key, size, etag) fingerprint against the one
+stored at its last rebuild in `_state/fp-*.json`. Unchanged packages cost
+zero reads; only the diff gets rebuilt. Audit cost scales with churn, not
+corpus size: a full-PyPI-sized tree (17M files) audits for ~$0.25 of LIST
+requests instead of ~$11 of GETs per old-style sweep. `pypiron resync` is the
+same pass with fingerprints ignored — the rebuild-the-world button. `pypiron
+verify` is its read-only twin: recompute everything, diff, exit nonzero.
 
 ## Write-time metadata capture: never compute at read or rebuild time
 
@@ -276,7 +290,9 @@ simple/index.html                        # materialized views (regenerable)
 simple/index.json
 simple/<pkg>/index.html
 simple/<pkg>/index.json
-_dirty/<pkg>                             # empty marker: package needs index rebuild
+_dirty/<pkg>!<nonce>.intent              # empty marker: a writer is touching this package
+_dirty/<pkg>!<nonce>.commit              # empty marker: truth changed, rebuild now
+_state/fp-<shard>.json                   # audit fingerprints: pkg -> listing hash at last rebuild
 _leader/lease.json                       # multi-node lease (holder, term, expires-at)
 ```
 
@@ -298,19 +314,22 @@ Sidecar schema (`<filename>.meta.json`), all captured at write time:
 ```
 
 `yanked` may be `false` or a reason string (PEP 592). Rebuilds read sidecars only;
-if a sidecar is missing (legacy file), the reconciler backfills it by hashing the
-artifact once. PEP 658 serving falls out of the layout: `<artifact-url>.metadata`
-maps directly to the adjacent stored file.
+if a sidecar is missing (legacy file), the rebuild backfills it by hashing the
+artifact once — create-only, so a real write-time sidecar always wins the race.
+PEP 658 serving falls out of the layout: `<artifact-url>.metadata` maps directly
+to the adjacent stored file.
 
 ## Honest scaling limits
 
-All comfortably beyond any real private registry:
+Measured against a fabricated full-PyPI-shaped corpus (see SCALE.md):
 
 - Per-package write throughput is serialized through the leader — fine, uploads are
   rare by definition.
-- Global index regeneration is rare (only on package-set changes) and a multi-MB
-  HTML file served statically with gzip is a non-event.
+- Global index regeneration is rare (only on package-set changes), batched per
+  tick, and a multi-MB HTML file served statically with gzip is a non-event.
 - Polling `_dirty/` at a ~1s tick costs pennies a day in S3 LIST requests.
+- Every steady-state cost scales with what *changed*; only the audit (cheap
+  LISTs) and `resync`/`verify` (explicit) scale with what *exists*.
 
 Backups and disaster recovery are a selling point, not a feature: it's just files.
 rsync it, version the bucket, done.

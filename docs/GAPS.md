@@ -10,7 +10,10 @@ non-normalized names, `WWW-Authenticate` on 401s, gzip index responses
 (`--read-user`/`--read-pass`), on-demand PyPI proxying (`--proxy-upstream`
 with `sync`-equivalent filters), `/health`, Prometheus `/metrics`,
 `--log-format json`, read-only-by-default when no credentials are configured
-(open-mode writes are gone), and `--spool-dir` documentation.
+(open-mode writes are gone), `--spool-dir` documentation, and the scale-tier
+reconcile (event markers as the backbone, fingerprint audits with cost
+proportional to churn, `pypiron verify`/`resync` — see SCALE.md and
+DESIGN.md).
 
 ---
 

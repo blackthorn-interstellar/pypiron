@@ -81,8 +81,10 @@ open http://localhost:8080/simple/
   `Cache-Control: immutable`, indexes revalidate with ETags
 * Dependency-confusion defense: every package is exclusively `private` or
   `mirror`, claimed at first write; optional reserved namespace prefix
-* Self-healing: a periodic reconciler regenerates anything stale, so lost
-  events are harmless
+* Self-healing: crash-safe event markers keep indexes fresh (proven by a
+  crash-point fault-injection suite), a cheap fingerprint audit catches
+  out-of-band storage changes, and `pypiron verify`/`resync` recompute the
+  world on demand
 * Multi-node on S3 via a sloppy leader lease (conditional writes, TTL)
 * Optional synchronous uploads for publish-then-install CI pipelines
 * **On-demand PyPI proxying** (opt-in): one URL for private packages plus
@@ -323,7 +325,9 @@ All options are available via CLI args and/or environment variables.
 | `--spool-dir`                | `PYPIRON_SPOOL_DIR`                | system temp    | Upload/proxy spool directory — real disk, not tmpfs |
 | `--log-format`               | `PYPIRON_LOG_FORMAT`               | `text`         | `text` or `json` (one object per line)           |
 | `--worker-interval-secs`     | `PYPIRON_WORKER_INTERVAL_SECS`     | `1`            | Worker tick interval (writes also nudge the worker directly) |
-| `--reconcile-interval-secs`  | `PYPIRON_RECONCILE_INTERVAL_SECS`  | `300`          | Full self-heal sweep interval                    |
+| `--reconcile-interval-secs`  | `PYPIRON_RECONCILE_INTERVAL_SECS`  | `86400`        | Audit sweep interval (fingerprint-skipped; cost scales with churn) |
+| `--audit-on-boot`            | `PYPIRON_AUDIT_ON_BOOT`            | `true`         | Audit as soon as this node becomes leader        |
+| `--intent-grace-secs`        | `PYPIRON_INTENT_GRACE_SECS`        | `900`          | How long an in-flight write may defer its package's rebuild |
 | `--lease-ttl-secs`           | `PYPIRON_LEASE_TTL_SECS`           | `30`           | Leader lease TTL (multi-node S3)                 |
 | `--artifact-delivery`        | `PYPIRON_ARTIFACT_DELIVERY`        | `auto`         | How artifact bytes reach clients (see below)     |
 | `--sync-uploads`             | `PYPIRON_SYNC_UPLOADS`             | `false`        | Wait for index visibility before returning 200   |

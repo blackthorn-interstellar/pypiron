@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use tracing::info;
 
 pub const DEFAULT_CONFIG_PATH: &str = "pypiron.toml";
 
@@ -43,6 +44,8 @@ pub struct SyncConfig {
 
 /// Load configuration. An explicit `--config` path must exist; without one,
 /// `./pypiron.toml` is used when present and silently skipped when not.
+/// Relative `packages-list` paths inside the file resolve against the config
+/// file's own directory, not the process cwd.
 pub fn load(explicit: Option<&Path>) -> Result<ConfigFile> {
     let path = match explicit {
         Some(p) => p.to_path_buf(),
@@ -54,9 +57,20 @@ pub fn load(explicit: Option<&Path>) -> Result<ConfigFile> {
             default.to_path_buf()
         }
     };
+    // Always announce a loaded config — silent auto-discovery of ./pypiron.toml
+    // is how an unrelated CLI invocation gets quietly rewired.
+    info!("loaded configuration from {}", path.display());
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+    let mut cfg: ConfigFile =
+        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+
+    if let Some(rel) = cfg.sync.packages_list.as_ref().filter(|p| p.is_relative()) {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            cfg.sync.packages_list = Some(dir.join(rel));
+        }
+    }
+    Ok(cfg)
 }
 
 #[cfg(test)]

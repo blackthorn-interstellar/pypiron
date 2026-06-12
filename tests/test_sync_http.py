@@ -134,3 +134,32 @@ def test_normal_uploads_cannot_backdate(disk_server_mirror, tmp_path):
         fields={"upload_time": "2015-01-01T00:00:00Z"},
         expect_status=400,
     )
+
+
+def test_mirror_prefix_block_holds_even_when_already_mirror_claimed(
+    disk_server_mirror_prefixed, tmp_path
+):
+    """The private namespace is off-limits to mirrors on every write, not just
+    the first claim — adopting a prefix after a name was mirror-claimed still
+    shuts the door (the guardrail can't silently no-op)."""
+    server = disk_server_mirror_prefixed
+
+    wheel = download_pypi_wheel(PACKAGE, "1.17.0", tmp_path)
+    acme = tmp_path / "acme_tool-1.0-py3-none-any.whl"
+    acme.write_bytes(wheel.read_bytes())
+
+    # Pre-claim 'acme-tool' as mirror directly in the tree (as if it were
+    # mirror-claimed before the prefix was configured).
+    pkg_dir = server["data_dir"] / "packages" / "acme-tool"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / ".origin").write_text("mirror")
+
+    # A mirror upload to this already-mirror-claimed, in-prefix name is still 403.
+    upload_legacy(
+        server["legacy"],
+        acme,
+        username=server["user"],
+        password=server["password"],
+        fields={"mirror": "true", "name": "acme-tool", "upload_time": "2020-01-01T00:00:00Z"},
+        expect_status=403,
+    )

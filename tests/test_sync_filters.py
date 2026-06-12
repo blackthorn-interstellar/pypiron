@@ -168,3 +168,96 @@ exclude-newer = "2030-01-01T00:00:00Z"
     )
     assert rc != 0
     assert "only-weels" in (out + err)
+
+
+def test_exclude_only_platform_tag_keeps_sdists(pypiron_bin, tmp_path):
+    """--exclude-platform-tag must not silently drop sdists (they have no tag)."""
+    pkg_list = tmp_path / "packages.txt"
+    pkg_list.write_text(f"{PACKAGE}==1.16.0\n")
+    data_dir = tmp_path / "data"
+    run_checked(
+        [
+            str(pypiron_bin),
+            "sync",
+            "--packages-list",
+            str(pkg_list),
+            "--data-dir",
+            str(data_dir),
+            "--exclude-platform-tag",
+            "win*",
+        ],
+        timeout=600,
+    )
+    pkg_dir = data_dir / "packages" / PACKAGE
+    files = sorted(p.name for p in pkg_dir.iterdir() if not p.name.startswith("."))
+    assert any(f.endswith(".tar.gz") for f in files), "the sdist must survive an exclusion-only filter"
+
+
+def test_only_wheels_and_only_sdists_conflict(pypiron_bin, tmp_path):
+    pkg_list = tmp_path / "packages.txt"
+    pkg_list.write_text(f"{PACKAGE}\n")
+    rc, out, err = run_returncode(
+        [
+            str(pypiron_bin),
+            "sync",
+            "--packages-list",
+            str(pkg_list),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--only-wheels",
+            "--only-sdists",
+        ],
+        timeout=60,
+    )
+    assert rc != 0, "contradictory filters must fail, not silently mirror nothing"
+
+
+def test_cli_packages_list_overrides_config_packages(pypiron_bin, tmp_path):
+    config = tmp_path / "pypiron.toml"
+    config.write_text('[sync]\npackages = ["this-name-does-not-exist-xyz"]\n')
+    pkg_list = tmp_path / "mine.txt"
+    pkg_list.write_text(f"{PACKAGE}==1.16.0\n")
+    data_dir = tmp_path / "data"
+
+    # An explicit --packages-list fully replaces the file's inline list; the
+    # bogus config entry must not be attempted (it would fail the run).
+    run_checked(
+        [
+            str(pypiron_bin),
+            "sync",
+            "--config",
+            str(config),
+            "--packages-list",
+            str(pkg_list),
+            "--data-dir",
+            str(data_dir),
+            "--only-wheels",
+        ],
+        timeout=600,
+    )
+    assert _wheels(data_dir) == ["six-1.16.0-py2.py3-none-any.whl"]
+    assert not (data_dir / "packages" / "this-name-does-not-exist-xyz").exists()
+
+
+def test_config_packages_list_resolves_relative_to_config(pypiron_bin, tmp_path):
+    cfgdir = tmp_path / "cfgdir"
+    cfgdir.mkdir()
+    (cfgdir / "pypiron.toml").write_text('[sync]\npackages-list = "pkgs.txt"\nonly-wheels = true\n')
+    (cfgdir / "pkgs.txt").write_text(f"{PACKAGE}==1.16.0\n")
+    data_dir = tmp_path / "data"
+
+    # Run from a different cwd (tmp_path) — the relative path must resolve
+    # against the config file's directory, not the process cwd.
+    run_checked(
+        [
+            str(pypiron_bin),
+            "sync",
+            "--config",
+            str(cfgdir / "pypiron.toml"),
+            "--data-dir",
+            str(data_dir),
+        ],
+        cwd=tmp_path,
+        timeout=600,
+    )
+    assert _wheels(data_dir) == ["six-1.16.0-py2.py3-none-any.whl"]

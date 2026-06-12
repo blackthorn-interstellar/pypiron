@@ -155,7 +155,12 @@ it — publicly and wins. Defense in four layers, ordered by importance:
    without it, adding a private package's name to the mirror list would merge
    public files into the private package's index — pulling an attacker's
    PyPI-published version in through our own mirror. Exclusivity means each
-   package belongs to exactly one world, so indexes never merge origins.
+   package belongs to exactly one world, so indexes never merge origins. The
+   claim is **durable**: deleting every artifact of a package does *not* release
+   `.origin`, because that would let a credentialed client empty a mirror-owned
+   public name and re-upload it as private (the dependency-confusion direction).
+   Re-purposing a name across worlds requires deleting the `.origin` file
+   directly — an operator action gated on storage access, the right boundary.
 3. **Namespace prefix policy (the guardrail).** Optionally require private uploads
    to match a configured prefix (e.g. `acme-*`) and forbid sync from touching it.
    Makes intent auditable and prevents accidentally publishing an internal package

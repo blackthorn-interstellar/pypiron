@@ -110,6 +110,10 @@ exclude-newer = "2026-01-01T00:00:00Z"
 concurrency = 8
 ```
 
+A `packages-list` path in the file resolves relative to the config file, not
+the working directory. An explicit `--packages-list` on the CLI replaces the
+file's list entirely; other options layer per-key.
+
 Mirrored names are claimed `mirror`-origin; names already claimed by private
 uploads (or inside `--private-prefix`) are refused outright — backdating never
 rides along on ordinary uploads, even on a mirror-enabled server.

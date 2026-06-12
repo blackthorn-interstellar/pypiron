@@ -88,7 +88,7 @@ pub struct SyncArgs {
 #[derive(Debug, Clone, Args)]
 pub struct FilterArgs {
     /// Only mirror wheel files (.whl)
-    #[arg(long, env = "PYPIRON_SYNC_ONLY_WHEELS")]
+    #[arg(long, env = "PYPIRON_SYNC_ONLY_WHEELS", conflicts_with = "only_sdists")]
     pub only_wheels: bool,
 
     /// Only mirror source distributions (sdist)
@@ -155,16 +155,25 @@ struct ResolvedFilter {
 
 impl Resolved {
     async fn merge(args: &SyncArgs, cfg: SyncConfig) -> Result<Self> {
-        // Package list: CLI path wins over the file's path; the file's inline
-        // `packages` array is appended either way.
+        // Package set follows CLI > file: an explicit --packages-list replaces
+        // the file's list entirely (both its `packages-list` and inline
+        // `packages`). With no CLI list, the file's path and inline array
+        // combine.
         let mut lines: Vec<String> = Vec::new();
-        if let Some(path) = args.packages_list.as_ref().or(cfg.packages_list.as_ref()) {
+        if let Some(path) = &args.packages_list {
             let text = fs::read_to_string(path)
                 .await
                 .with_context(|| format!("reading {}", path.display()))?;
             lines.extend(text.lines().map(str::to_string));
+        } else {
+            if let Some(path) = &cfg.packages_list {
+                let text = fs::read_to_string(path)
+                    .await
+                    .with_context(|| format!("reading {}", path.display()))?;
+                lines.extend(text.lines().map(str::to_string));
+            }
+            lines.extend(cfg.packages.unwrap_or_default());
         }
-        lines.extend(cfg.packages.unwrap_or_default());
 
         let mut specs = Vec::new();
         for (lineno, raw) in lines.iter().enumerate() {
@@ -184,6 +193,22 @@ impl Resolved {
         }
 
         let filter = &args.filter;
+        let only_wheels = filter.only_wheels || cfg.only_wheels.unwrap_or(false);
+        let only_sdists = filter.only_sdists || cfg.only_sdists.unwrap_or(false);
+        if only_wheels && only_sdists {
+            // Would select nothing and "succeed" — a silent empty mirror.
+            bail!("only-wheels and only-sdists are mutually exclusive");
+        }
+
+        let dst_base = args.dst_base.clone().or(cfg.to);
+        // CLI/env > file says storage flags win, but in HTTP mode they have no
+        // sink to apply to — flag it rather than silently ignore --data-dir.
+        if dst_base.is_some()
+            && (args.storage.data_dir.is_some() || args.storage.s3_bucket.is_some())
+        {
+            warn!("mirror-over-HTTP mode (--to/[sync].to): --data-dir/--s3-bucket are ignored");
+        }
+
         Ok(Self {
             specs,
             src_base: args
@@ -191,15 +216,15 @@ impl Resolved {
                 .clone()
                 .or(cfg.from)
                 .unwrap_or_else(|| "https://pypi.org".to_string()),
-            dst_base: args.dst_base.clone().or(cfg.to),
+            dst_base,
             username: args.username.clone().or(cfg.username),
             password: args.password.clone().or(cfg.password),
             private_prefix: args.private_prefix.clone().or(cfg.private_prefix),
             concurrency: args.concurrency.or(cfg.concurrency).unwrap_or(4).max(1),
             dry_run: args.dry_run,
             filter: ResolvedFilter {
-                only_wheels: filter.only_wheels || cfg.only_wheels.unwrap_or(false),
-                only_sdists: filter.only_sdists || cfg.only_sdists.unwrap_or(false),
+                only_wheels,
+                only_sdists,
                 python_tag: pick_vec(&filter.python_tag, cfg.python_tag),
                 abi_tag: pick_vec(&filter.abi_tag, cfg.abi_tag),
                 platform_tag: pick_vec(&filter.platform_tag, cfg.platform_tag),
@@ -670,21 +695,21 @@ fn matches_filters(file: &PyPiFile, f: &ResolvedFilter) -> bool {
         }
     }
 
-    let has_tag_filters = !(f.python_tag.is_empty()
-        && f.abi_tag.is_empty()
-        && f.platform_tag.is_empty()
-        && f.exclude_platform_tag.is_empty());
+    // Only *inclusion* filters gate non-wheels (sdists have no tags). An
+    // exclusion-only filter (e.g. --exclude-platform-tag win*) must not silently
+    // drop every sdist — an sdist can't match a platform exclusion.
+    let has_inclusion_filters =
+        !(f.python_tag.is_empty() && f.abi_tag.is_empty() && f.platform_tag.is_empty());
 
     if !is_wheel {
-        // Non-wheel (e.g., sdist). If tag filters provided, sdists won't match.
-        return !has_tag_filters;
+        return !has_inclusion_filters;
     }
 
     let tags = match parse_wheel_tags(&file.filename) {
         Some(t) => t,
         None => {
-            warn!(filename=%file.filename, "Could not parse wheel tags; skipping if filters present");
-            return !has_tag_filters;
+            warn!(filename=%file.filename, "Could not parse wheel tags; skipping if inclusion filters present");
+            return !has_inclusion_filters;
         }
     };
 

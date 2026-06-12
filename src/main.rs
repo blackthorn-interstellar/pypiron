@@ -455,6 +455,19 @@ async fn legacy_upload(
                 format!("storage error reading origin: {e}"),
             )
         })?;
+    // The private namespace is off-limits to mirrors regardless of claim
+    // state — checked here, not only at first write, so adopting a prefix
+    // after a name was mirror-claimed still shuts the door.
+    if is_mirror {
+        if let Some(prefix) = &state.private_prefix {
+            if names::matches_prefix(&pkg_norm, prefix) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("'{pkg_norm}' is inside the private namespace '{prefix}'; mirrors may not touch it"),
+                ));
+            }
+        }
+    }
     match claimed_origin.as_deref() {
         Some(owner) if owner == desired_origin => {}
         Some(owner) => {
@@ -466,15 +479,11 @@ async fn legacy_upload(
             ));
         }
         None => {
+            // A new private name must be inside the prefix; existing private
+            // packages outside a newly-adopted prefix are grandfathered (only
+            // first claims are gated, so adopting a prefix never bricks them).
             if let Some(prefix) = &state.private_prefix {
-                let inside = names::matches_prefix(&pkg_norm, prefix);
-                if is_mirror && inside {
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        format!("'{pkg_norm}' is inside the private namespace '{prefix}'; mirrors may not touch it"),
-                    ));
-                }
-                if !is_mirror && !inside {
+                if !is_mirror && !names::matches_prefix(&pkg_norm, prefix) {
                     return Err((
                         StatusCode::FORBIDDEN,
                         format!(
@@ -859,7 +868,7 @@ async fn files_delete(
         }
     }
 
-    let still_has_artifacts = worker::rebuild_package_excluding(&state, &pkg, Some(&filename))
+    worker::rebuild_package_excluding(&state, &pkg, Some(&filename))
         .await
         .map_err(|e| {
             (
@@ -878,12 +887,16 @@ async fn files_delete(
                 format!("artifact delete failed: {e}"),
             )
         })?;
-    let mut leftovers = vec![sidecar_key(&key), sidecar::metadata_key(&key)];
-    if !still_has_artifacts {
-        // The package is gone; its origin claim dies with it.
-        leftovers.push(origin::origin_key(&pkg));
-    }
-    let _ = state.storage.delete_keys(&leftovers).await;
+    // The `.origin` claim is durable on purpose: deleting every artifact must
+    // not release the name for the *opposite* world to re-claim. Otherwise a
+    // credentialed client could empty a mirror-owned public name and re-upload
+    // it as a private package (the dependency-confusion direction). Re-purposing
+    // a name from private to mirror is an operator action gated on storage
+    // access — delete the `.origin` file directly.
+    let _ = state
+        .storage
+        .delete_keys(&[sidecar_key(&key), sidecar::metadata_key(&key)])
+        .await;
 
     // Worker confirms from truth and prunes global membership if needed.
     if let Err(e) = mark_dirty(&state, &pkg).await {

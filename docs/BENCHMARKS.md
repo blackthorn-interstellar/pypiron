@@ -35,7 +35,8 @@ Corpus presets:
 | `medium` | 10,000 | 10 | ~300k | big private registry |
 | `large` | 100,000 | 10 | ~3M | bigger than any real private registry |
 | `torch` | 1 | 2,000 | ~6k | one package shaped like `simple/torch` (~1.5 MB JSON index), incl. several real ~900 MB artifacts |
-| `pypi-mirror` | 600,000 | 1–500 zipf | ~12M | full-PyPI-shaped, stretch goal |
+| `pypi-mirror` | 600,000 | 1–500 zipf | ~12M | full-PyPI-shaped, synthetic |
+| `pypi-real` | all of PyPI | actual | ~14M files | not synthetic at all — see Tier 5; supersedes `pypi-mirror` once it exists |
 
 ¹ artifact + `.meta.json` + `.metadata` per file.
 
@@ -106,6 +107,57 @@ config and W1 gets a 5 GB variant once streaming lands.)
 | C3 | 500 parallel `uv pip install` of distinct packages (CI-fleet stampede) | all succeed; server p99 < 25 ms |
 | C4 | Multi-node: kill the S3 leader mid-upload-storm | uploads visible within lease TTL + tick; zero client-visible errors |
 
+### Tier 5 — `sync` throughput & the full PyPI clone
+
+`sync` is the bulk-ingest path, so it gets its own throughput numbers — and the
+ultimate benchmark doubles as a fuzzer: clone *every package on PyPI* and let
+fifteen years of packaging sins find our edge cases for us.
+
+| ID | Scenario | Floor | Brag target |
+|---|---|---|---|
+| M1 | Sync throughput, small-file packages, direct-to-S3 (request-bound) | 100 files/s | **≥1,000 files/s sustained** (~4 storage ops/file ≈ 4k S3 ops/s) |
+| M2 | Sync throughput, torch-class artifacts (bandwidth-bound) | 1 Gbps | **≥5 Gbps sustained PyPI→S3 pass-through, RSS flat** |
+| M3 | HTTP-push mode (`--to`) vs direct-to-storage | works | **within 25% of direct** once server uploads stream (W1) |
+| M4 | Incremental re-sync of a full mirror (the freshness cost) | < 4 h | **daily delta < 30 min** |
+| M5 | **The full clone**: every package on PyPI (~620k projects, ~14M files, ~35 TB) | completes with a bounded, categorized failure list | **< 24 h wall clock; zero crashes; every refusal becomes a test fixture** |
+
+Predicted findings, from reading `sync.rs` (sync.rs:325):
+
+- **Packages are synced sequentially** — `--concurrency` only parallelizes
+  files *within* one package (`buffer_unordered`). The long tail of PyPI is
+  hundreds of thousands of 2-file packages, so M1/M5 are gated on per-package
+  round-trip latency until package-level parallelism lands. That's the first
+  fix this tier forces.
+- **No size filter.** ~90% of PyPI's bytes live in <1% of files (CUDA wheels,
+  nightlies). A `--max-file-size` filter makes a *full-namespace* clone
+  possible at ~1/5 the bytes — same filename/metadata edge-case coverage,
+  fraction of the cost — so the capped clone runs first, the uncapped clone is
+  the final flex.
+- **Resume = re-walk.** A clone that dies at package 400k re-checks everything
+  from zero (existence checks make the re-run incremental, but the walk itself
+  is M4's number). If re-walk is too slow, that motivates PyPI
+  changelog-serial support (what bandersnatch uses) — a feature decision the
+  benchmark gets to force, not us guessing.
+- **HTTP mode buffers each file in RAM** (`Part::bytes`, sync.rs:428) and hits
+  the server's 1 GiB body cap; direct-to-storage mode bypasses both. M3 will
+  quantify the gap.
+
+The edge-case harvest is the real payoff of M5. Expected catch, all of which
+becomes regression fixtures: pre-PEP-625 sdists whose versions can't be
+inferred from filenames, `.egg`/`.exe`-era artifacts (skip cleanly or mirror —
+either way, deliberately), wheels with missing or unparseable `METADATA`,
+filenames with `+` local-version builds and other URL/S3-key-hostile
+characters, distinct names that normalize identically, 10k-file packages
+(`tf-nightly` and friends), zero-file projects, yanked-everything projects,
+and unicode in every field that allows it. The acceptance bar: after the
+clone, `uv pip install` resolves correctly against our mirror for a sampled
+set of the weirdest survivors, and every file PyPI serves that we refused is
+logged with a reason we can defend.
+
+Politeness is part of the spec: identifiable User-Agent with contact info,
+bounded request rate against pypi.org's JSON API, conditional requests and
+backoff on the re-walk. Fastly absorbs the bytes; the API gets treated gently.
+
 ## AWS topology
 
 Boring on purpose: two or three EC2 boxes and a bucket, stood up by a script,
@@ -120,9 +172,11 @@ torn down the same hour. No Terraform, no fleet.
   <suite>` rsyncs the pinned binary, runs, pulls JSON results; `aws-down.sh`.
 - **Cost honesty:** spot c7gn.2xlarge ≈ $0.25/hr; a full Tier-1+2 session
   < $5. Seeding `large` (~3M PUTs) ≈ $15 one-time into a keep-around bucket;
-  `pypi-mirror` ≈ $60, do it once, version the bucket. Reconcile sweeps over
-  3M objects cost ~$0.02 in LISTs — measure and print actual request counts
-  per run (S6 doubles as the S3-bill benchmark).
+  synthetic `pypi-mirror` ≈ $60, do it once, version the bucket. The real
+  clone (Phase 5) is its own line item: ~$250 in PUTs + ~$27/day of storage
+  while it lives. Reconcile sweeps over 3M objects cost ~$0.02 in LISTs —
+  measure and print actual request counts per run (S6 and M5 double as the
+  S3-bill benchmark).
 
 ## The ramp
 
@@ -148,16 +202,29 @@ Single server + one loadgen. Full Tier 1 + Tier 2. These are the first
 publishable numbers; record them as the baseline brag sheet.
 
 **Phase 3 — AWS + real S3, ~$25 (the hard scenarios).**
-Seed `medium`, then `large`. Full Tier 2 + Tier 3, including the two marquee
-questions: torch-class uploads (W1/W2) and index updates against a very large
+Seed `medium`, then `large`. Full Tier 2 + Tier 3, plus sync throughput
+(M1–M3, against a few thousand real PyPI packages — this is where the
+sequential-package-loop fix gets its before/after). The two marquee questions
+land here: torch-class uploads (W1/W2) and index updates against a very large
 S3 corpus (S2/S3/S4). Re-run after each optimization; the before/after pairs
 are the changelog.
 
 **Phase 4 — AWS, the absurd, ~$50 (the demo).**
 `c7gn.8xlarge` NIC saturation (R5), the Black Friday hour (C1), CI stampede
-(C3), beat-pypi.org (C2), leader-kill (C4), and — bucket permitting — the
-`pypi-mirror` stretch (S6). Output: a results table at the top of the README
-with commit, instance type, and date on every number.
+(C3), beat-pypi.org (C2), leader-kill (C4), and the synthetic `pypi-mirror`
+suite (S6). Output: a results table at the top of the README with commit,
+instance type, and date on every number.
+
+**Phase 5 — the full clone, ~$300–500 (the fuzzer finale).**
+M5 in two passes: first the full-namespace clone capped at 100 MB/file (every
+project, every weird filename, ~1/5 the bytes), harvest and fix the edge
+cases; then the uncapped ~35 TB clone with M4's re-sync keeping it fresh.
+Re-run the read and scale suites (R, S2–S5) against `pypi-real` — absolute
+numbers on the genuine article, not a synthetic shape. Cost is dominated by
+S3: ~50M PUTs ≈ $250 one-time, ~35 TB ≈ $27/day stored — run the suite within
+the week, keep the results, delete the bucket. The brag at the end: *we are a
+working PyPI mirror, cloned in under a day, serving reads faster than the
+original.*
 
 ## Deliverables
 

@@ -167,6 +167,14 @@ def disk_server_mirror(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     yield from _start_disk_server(tmp_path_factory, pypiron_bin, extra_args=["--mirror-uploads"])
 
 
+@pytest.fixture()
+def disk_server_mirror_prefixed(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Mirror-enabled server reserving the `acme` namespace for private uploads."""
+    yield from _start_disk_server(
+        tmp_path_factory, pypiron_bin, extra_args=["--mirror-uploads", "--private-prefix", "acme"]
+    )
+
+
 # ------------------------------ MinIO (S3) fixtures ---------------------------
 
 

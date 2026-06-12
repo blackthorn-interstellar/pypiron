@@ -65,21 +65,48 @@ def test_private_prefix_policy(disk_server_prefixed, tmp_path):
     assert (server["data_dir"] / "packages" / "acme-foo" / ".origin").read_text() == "private"
 
 
-def test_deleting_last_file_releases_claim(disk_server, tmp_path):
+def test_origin_claim_survives_deletion(disk_server, tmp_path):
+    """A mirror-owned name emptied by deletion must not become re-claimable as
+    private — that would be the dependency-confusion direction. The .origin
+    claim is durable; re-purposing a name needs storage access."""
     from .helpers import http_request_auth
 
-    wheel_path = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
-    creds = {"username": disk_server["user"], "password": disk_server["password"]}
-    upload_legacy(disk_server["legacy"], wheel_path, **creds)
-    wait_for_file_in_index(disk_server["simple"], PACKAGE, wheel_path.name)
+    # Claim the name as mirror via storage (what sync does).
+    pkg_dir = disk_server["data_dir"] / "packages" / PACKAGE
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / ".origin").write_text("mirror")
 
+    creds = {"username": disk_server["user"], "password": disk_server["password"]}
+    # Mirror an artifact in via the file tree, then index it.
+    wheel_path = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
+    (pkg_dir / wheel_path.name).write_bytes(wheel_path.read_bytes())
+    import json as _json
+    import hashlib
+
+    (pkg_dir / f"{wheel_path.name}.meta.json").write_text(
+        _json.dumps(
+            {
+                "sha256": hashlib.sha256(wheel_path.read_bytes()).hexdigest(),
+                "size": wheel_path.stat().st_size,
+                "version": VERSION,
+                "upload-time": "2020-01-01T00:00:00Z",
+                "yanked": False,
+            }
+        )
+    )
+    # A private upload to this mirror-owned name is forbidden (origin check
+    # precedes immutability).
+    upload_legacy(disk_server["legacy"], wheel_path, expect_status=403, **creds)
+
+    # Delete the only artifact.
     code, _, _ = http_request_auth(
         "DELETE", f"{disk_server['base_url']}/files/{PACKAGE}/{wheel_path.name}", **creds
     )
     assert code == 204
-    assert not (disk_server["data_dir"] / "packages" / PACKAGE / ".origin").exists(), (
-        "the origin claim dies with the package"
-    )
+
+    # The claim is still mirror — a private re-upload remains forbidden.
+    assert (pkg_dir / ".origin").read_text() == "mirror"
+    upload_legacy(disk_server["legacy"], wheel_path, expect_status=403, **creds)
 
 
 def test_origin_marker_not_deletable_via_api(disk_server, tmp_path):

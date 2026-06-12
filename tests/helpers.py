@@ -220,6 +220,20 @@ def wait_http_ok(url: str, *, timeout: float = 15.0, interval: float = 0.1) -> N
     raise TimeoutError(f"Timed out waiting for {url}")
 
 
+def wait_http_responding(url: str, *, timeout: float = 15.0, interval: float = 0.1) -> None:
+    """Poll until GET returns any HTTP status (readiness for auth-gated servers)."""
+    deadline = time.time() + timeout
+    last_err = None
+    while time.time() < deadline:
+        try:
+            _http_request(url)
+            return
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+        time.sleep(interval)
+    raise TimeoutError(f"Timed out waiting for {url}: last error: {last_err}")
+
+
 # ------------------------------ PyPI helpers ----------------------------------
 
 
@@ -330,6 +344,24 @@ def make_wheel(name: str, version: str, dest_dir: Path) -> Path:
         for path, data in files.items():
             zf.writestr(path, data)
     return wheel_path
+
+
+def make_sdist(name: str, version: str, dest_dir: Path) -> Path:
+    """A minimal but valid sdist tarball (PKG-INFO only)."""
+    import io
+    import tarfile
+
+    base = f"{name}-{version}"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    path = dest_dir / f"{base}.tar.gz"
+    pkg_info = (
+        f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+    ).encode()
+    with tarfile.open(path, "w:gz") as tf:
+        info = tarfile.TarInfo(f"{base}/PKG-INFO")
+        info.size = len(pkg_info)
+        tf.addfile(info, io.BytesIO(pkg_info))
+    return path
 
 
 # ------------------------------ uv utilities ---------------------------------

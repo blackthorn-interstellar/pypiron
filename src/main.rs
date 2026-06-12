@@ -19,8 +19,10 @@ use tracing::{info, warn};
 mod cache;
 mod config;
 mod lease;
+mod metrics;
 mod names;
 mod origin;
+mod proxy;
 mod render;
 mod sidecar;
 mod storage;
@@ -85,6 +87,15 @@ enum ArtifactDelivery {
 /// Grow this list by verified cache behavior, not by client popularity.
 const REDIRECT_SAFE_UA_PREFIXES: &[&str] = &["uv/"];
 
+/// Log output format.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFormat {
+    /// Human-readable lines (default).
+    Text,
+    /// One JSON object per line, for log pipelines.
+    Json,
+}
+
 fn redirect_safe_client(headers: &HeaderMap) -> bool {
     let ua = headers
         .get(header::USER_AGENT)
@@ -99,8 +110,8 @@ struct ServeArgs {
     #[command(flatten)]
     storage: StorageArgs,
 
-    /// Uploader credential username — may publish (ordinary uploads). When no
-    /// credential of any kind is set, all writes are unauthenticated.
+    /// Uploader credential username — may publish (ordinary uploads). With no
+    /// credential of any kind configured, the server is read-only.
     #[arg(long, env = "PYPIRON_UPLOADER_USER")]
     uploader_user: Option<String>,
 
@@ -169,6 +180,35 @@ struct ServeArgs {
     /// otherwise large uploads spool into memory and defeat streaming.
     #[arg(long, env = "PYPIRON_SPOOL_DIR")]
     spool_dir: Option<std::path::PathBuf>,
+
+    /// Read credential username — when set, the simple indexes and artifact
+    /// downloads require basic auth (this credential, the uploader, or the
+    /// admin all work). When unset, reads are public.
+    #[arg(long, env = "PYPIRON_READ_USER")]
+    read_user: Option<String>,
+
+    /// Read credential password (see --read-user).
+    #[arg(long, env = "PYPIRON_READ_PASS")]
+    read_pass: Option<String>,
+
+    /// Log output format: `text` (human-readable) or `json` (one object per
+    /// line, for log pipelines).
+    #[arg(long, env = "PYPIRON_LOG_FORMAT", value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
+
+    /// Serve unknown (non-private) packages on demand from this upstream
+    /// simple index (e.g. https://pypi.org): package pages are answered from
+    /// upstream metadata and artifacts are downloaded, verified, and cached
+    /// in storage as `mirror`-origin packages on first request. Names claimed
+    /// `private` (or inside --private-prefix) never fall through. Off by
+    /// default.
+    #[arg(long, env = "PYPIRON_PROXY_UPSTREAM")]
+    proxy_upstream: Option<String>,
+
+    /// Filters gating what the proxy serves and caches (same semantics as
+    /// the `sync` filters, under a `--proxy-` prefix).
+    #[command(flatten)]
+    proxy_filter: proxy::ProxyFilterArgs,
 }
 
 #[derive(Clone)]
@@ -180,6 +220,10 @@ struct AppState {
     uploader_pass: Option<String>,
     admin_user: Option<String>,
     admin_pass: Option<String>,
+    // read credential — when configured, index and artifact reads require it
+    // (or any stronger credential).
+    read_user: Option<String>,
+    read_pass: Option<String>,
     private_prefix: Option<String>,
     artifact_delivery: ArtifactDelivery,
     // worker cfg
@@ -198,18 +242,27 @@ struct AppState {
     global_index_lock: Arc<tokio::sync::Mutex<()>>,
     /// Wakes the worker immediately after a write drops a dirty marker.
     worker_nudge: Arc<tokio::sync::Notify>,
+    /// Hand-rolled Prometheus counters served at /metrics.
+    metrics: Arc<metrics::Metrics>,
+    /// On-demand upstream mirroring (None unless --proxy-upstream is set).
+    proxy: Option<Arc<proxy::Proxy>>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // logging
-    tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| {
-            "info,pypiron=info,aws_config=warn,aws_smithy_http_tower=warn".into()
-        }))
-        .init();
-
     let cli = Cli::parse();
+
+    // logging — format comes from --log-format/PYPIRON_LOG_FORMAT (the env
+    // var also reaches `sync` runs through the flattened serve args).
+    let env_filter = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| "info,pypiron=info,aws_config=warn,aws_smithy_http_tower=warn".into());
+    match cli.serve.log_format {
+        LogFormat::Text => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .init(),
+    }
 
     match cli.command {
         Some(Commands::Sync(args)) => {
@@ -227,6 +280,10 @@ async fn main() -> Result<()> {
 
 async fn run_serve(cli: ServeArgs) -> Result<()> {
     let storage = cli.storage.build().await?;
+    let proxy = match cli.proxy_upstream.as_deref() {
+        Some(upstream) => Some(Arc::new(proxy::Proxy::new(upstream, &cli.proxy_filter)?)),
+        None => None,
+    };
 
     let state = Arc::new(AppState {
         storage,
@@ -234,6 +291,8 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         uploader_pass: cli.uploader_pass,
         admin_user: cli.admin_user,
         admin_pass: cli.admin_pass,
+        read_user: cli.read_user,
+        read_pass: cli.read_pass,
         private_prefix: cli.private_prefix.as_deref().map(normalize_pkg_name),
         artifact_delivery: cli.artifact_delivery,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
@@ -246,10 +305,12 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         spool_dir: cli.spool_dir.unwrap_or_else(std::env::temp_dir),
         global_index_lock: Arc::new(tokio::sync::Mutex::new(())),
         worker_nudge: Arc::new(tokio::sync::Notify::new()),
+        metrics: Arc::new(metrics::Metrics::new()),
+        proxy,
     });
 
-    if state.auth_open() {
-        warn!("no credentials configured: uploads, mirror, deletes, and yanks are UNAUTHENTICATED");
+    if state.uploads_disabled() {
+        warn!("no credentials configured: the server is read-only (set --uploader-user/--admin-user to enable uploads)");
     } else {
         if state.admin_credential().is_none() {
             info!("no admin credential: mirror uploads, deletion, and yank are disabled");
@@ -258,6 +319,15 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
             && state.admin_credential() == state.uploader_credential()
         {
             warn!("uploader and admin credentials are identical: every uploader has admin powers");
+        }
+    }
+    if state.read_credential().is_none() {
+        info!("no read credential: indexes and artifacts are served without authentication");
+    }
+    if let Some(p) = &state.proxy {
+        info!(upstream = %p.upstream(), "on-demand proxy enabled");
+        if state.private_prefix.is_none() {
+            warn!("proxy enabled without --private-prefix: new private uploads race public names for first claim; a reserved prefix closes that hole");
         }
     }
 
@@ -283,12 +353,18 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
             "/files/:package/:filename/yank",
             post(yank_set).delete(yank_clear),
         )
+        // Operational endpoints: deliberately outside read auth — load
+        // balancers and Prometheus scrapers don't carry package credentials.
+        .route("/health", get(health))
+        .route("/metrics", get(serve_metrics))
         // Catch-all for debugging unmatched routes
         .fallback(fallback_handler)
         .with_state(state.clone())
         // Axum's default 2 MB body limit would reject any real wheel.
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
-        .layer(middleware::from_fn(log_requests));
+        .layer(middleware::from_fn(log_requests))
+        .layer(middleware::from_fn(add_www_authenticate))
+        .layer(middleware::from_fn_with_state(state.clone(), track_metrics));
 
     // spawn worker (with a shutdown handle so it can release the leader
     // lease on graceful exit)
@@ -344,6 +420,63 @@ async fn log_requests(req: Request, next: Next) -> impl IntoResponse {
     let response = next.run(req).await;
     tracing::debug!("Response status: {} {} {}", response.status(), method, uri);
     response
+}
+
+/// RFC 7235: a 401 without `WWW-Authenticate` is malformed, and pip's keyring
+/// integration and browsers rely on the header to prompt for credentials.
+/// One layer covers every 401 return site, present and future.
+async fn add_www_authenticate(req: Request, next: Next) -> Response<Body> {
+    let mut resp = next.run(req).await;
+    if resp.status() == StatusCode::UNAUTHORIZED
+        && !resp.headers().contains_key(header::WWW_AUTHENTICATE)
+    {
+        resp.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static(r#"Basic realm="PypIron""#),
+        );
+    }
+    resp
+}
+
+/// Count every request by route group and status class (see metrics.rs).
+async fn track_metrics(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response<Body> {
+    let group = metrics::route_group(req.uri().path());
+    let resp = next.run(req).await;
+    state.metrics.record_request(group, resp.status().as_u16());
+    resp
+}
+
+/// Liveness + storage reachability. A storage error is the only failure mode:
+/// `Ok(false)` (probe object missing) still proves storage answers.
+async fn health(State(state): State<Arc<AppState>>) -> Response<Body> {
+    let probe = format!("{SIMPLE_PREFIX}index.json");
+    let (status, body) = match state.storage.head_exists(&probe).await {
+        Ok(_) => (StatusCode::OK, r#"{"status":"ok"}"#),
+        Err(e) => {
+            warn!(error=?e, "health: storage probe failed");
+            (StatusCode::SERVICE_UNAVAILABLE, r#"{"status":"degraded"}"#)
+        }
+    };
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(body))
+        .unwrap_or_else(not_found)
+}
+
+/// Prometheus text exposition of the process counters.
+async fn serve_metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(state.metrics.render()))
+        .unwrap_or_else(not_found)
 }
 
 /// Fallback handler for unmatched routes
@@ -413,7 +546,14 @@ async fn legacy_upload(
     // body of an unauthorized request".
     let is_admin = state.is_admin(&headers);
     if !is_admin && !state.is_uploader(&headers) {
-        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".into()));
+        return Err(if state.uploads_disabled() {
+            (
+                StatusCode::FORBIDDEN,
+                "Uploads are disabled (no upload credential configured)".into(),
+            )
+        } else {
+            (StatusCode::UNAUTHORIZED, "Unauthorized".into())
+        });
     }
 
     let mut filename_opt: Option<String> = None;
@@ -541,19 +681,17 @@ async fn legacy_upload(
     if is_mirror {
         if !is_admin {
             // Distinguish "admin disabled here" from "you're not admin".
-            return Err(
-                if state.admin_credential().is_none() && !state.auth_open() {
-                    (
-                        StatusCode::FORBIDDEN,
-                        "Mirror uploads are disabled (no admin credential configured)".into(),
-                    )
-                } else {
-                    (
-                        StatusCode::UNAUTHORIZED,
-                        "Mirror uploads require the admin credential".into(),
-                    )
-                },
-            );
+            return Err(if state.admin_credential().is_none() {
+                (
+                    StatusCode::FORBIDDEN,
+                    "Mirror uploads are disabled (no admin credential configured)".into(),
+                )
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "Mirror uploads require the admin credential".into(),
+                )
+            });
         }
     } else if fields.contains_key("upload_time")
         || fields.contains_key("yanked")
@@ -780,7 +918,7 @@ fn now_rfc3339() -> String {
 }
 
 /// Mark a package as needing an index rebuild (empty object at `_dirty/<pkg>`).
-async fn mark_dirty(state: &AppState, pkg: &str) -> Result<()> {
+pub(crate) async fn mark_dirty(state: &AppState, pkg: &str) -> Result<()> {
     worker::mark_dirty(state.storage.as_ref(), pkg).await?;
     // Wake the worker now instead of letting the marker wait out the tick —
     // upload→visible drops from ~tick+rebuild to ~rebuild. Peer nodes still
@@ -798,6 +936,9 @@ const INDEX_CACHE_CONTROL: &str = "no-cache";
 const ARTIFACT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 async fn simple_root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
+    if !state.is_reader(&headers) {
+        return unauthorized();
+    }
     if accepts_json(&headers) {
         serve_index(
             &state,
@@ -823,6 +964,9 @@ async fn simple_root_json(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response<Body> {
+    if !state.is_reader(&headers) {
+        return unauthorized();
+    }
     serve_index(
         &state,
         format!("{SIMPLE_PREFIX}index.json"),
@@ -835,42 +979,50 @@ async fn simple_root_json(
 
 async fn simple_pkg(
     State(state): State<Arc<AppState>>,
-    Path(pkg): Path<String>,
+    Path(raw): Path<String>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let pkg = normalize_pkg_name(&pkg);
+    if !state.is_reader(&headers) {
+        return unauthorized();
+    }
+    let pkg = normalize_pkg_name(&raw);
     if !is_normalized(&pkg) {
         return not_found("invalid package name");
     }
-    if accepts_json(&headers) {
-        serve_index(
-            &state,
-            format!("{SIMPLE_PREFIX}{pkg}/index.json"),
-            CT_JSON,
-            INDEX_CACHE_CONTROL,
-            &headers,
-        )
-        .await
-    } else {
-        serve_index(
-            &state,
-            format!("{SIMPLE_PREFIX}{pkg}/index.html"),
-            CT_HTML,
-            INDEX_CACHE_CONTROL,
-            &headers,
-        )
-        .await
+    // PEP 503: the canonical URL is the normalized one; everything else 301s
+    // there, so URL-keyed caches (CDNs, edge proxies) never split entries.
+    if raw != pkg {
+        return moved_permanently(&format!("/simple/{pkg}/"));
     }
+    let json = accepts_json(&headers);
+    if let Some(resp) = proxy_package_index(&state, &pkg, json, &headers).await {
+        return resp;
+    }
+    let (key, ct) = if json {
+        (format!("{SIMPLE_PREFIX}{pkg}/index.json"), CT_JSON)
+    } else {
+        (format!("{SIMPLE_PREFIX}{pkg}/index.html"), CT_HTML)
+    };
+    serve_index(&state, key, ct, INDEX_CACHE_CONTROL, &headers).await
 }
 
 async fn simple_pkg_json(
     State(state): State<Arc<AppState>>,
-    Path(pkg): Path<String>,
+    Path(raw): Path<String>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    let pkg = normalize_pkg_name(&pkg);
+    if !state.is_reader(&headers) {
+        return unauthorized();
+    }
+    let pkg = normalize_pkg_name(&raw);
     if !is_normalized(&pkg) {
         return not_found("invalid package name");
+    }
+    if raw != pkg {
+        return moved_permanently(&format!("/simple/{pkg}/index.json"));
+    }
+    if let Some(resp) = proxy_package_index(&state, &pkg, true, &headers).await {
+        return resp;
     }
     serve_index(
         &state,
@@ -880,6 +1032,44 @@ async fn simple_pkg_json(
         &headers,
     )
     .await
+}
+
+/// Proxy hook for package pages: `Some(response)` when the page is served
+/// from upstream metadata, `None` to fall through to the local materialized
+/// index (proxy off, package ineligible, or upstream unavailable).
+async fn proxy_package_index(
+    state: &AppState,
+    pkg: &str,
+    json: bool,
+    headers: &HeaderMap,
+) -> Option<Response<Body>> {
+    let proxy = state.proxy.as_ref()?;
+    match proxy::eligible(state, pkg).await {
+        Ok(true) => {}
+        Ok(false) => return None,
+        // Origin unreadable is an outage: never answer "what owns this name"
+        // questions optimistically (the dependency-confusion direction).
+        Err(e) => return Some(read_error(e)),
+    }
+    let rendered = proxy.package_index(state, pkg, json).await?;
+    let revalidated = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "*" || v.contains(&*rendered.etag))
+        .unwrap_or(false);
+    let builder = Response::builder()
+        .header(header::ETAG, &*rendered.etag)
+        .header(header::CACHE_CONTROL, INDEX_CACHE_CONTROL);
+    let resp = if revalidated {
+        builder.status(StatusCode::NOT_MODIFIED).body(Body::empty())
+    } else {
+        builder
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, if json { CT_JSON } else { CT_HTML })
+            .header(header::CONTENT_LENGTH, rendered.body.len())
+            .body(Body::from(rendered.body.clone()))
+    };
+    Some(resp.unwrap_or_else(not_found))
 }
 
 /// Serve a materialized index file with a content-hash ETag; conditional GETs
@@ -946,6 +1136,9 @@ async fn files_get(
     Path((package, filename)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response<Body> {
+    if !state.is_reader(&headers) {
+        return unauthorized();
+    }
     let pkg = normalize_pkg_name(&package);
     let servable = match filename.strip_suffix(METADATA_SUFFIX) {
         Some(base) => sidecar::is_artifact(base),
@@ -961,7 +1154,7 @@ async fn files_get(
     // the indexes instead of one storage GET per request. Range requests
     // fall through to storage; nobody range-reads a METADATA file.
     if filename.ends_with(METADATA_SUFFIX) && headers.get(header::RANGE).is_none() {
-        return serve_index(
+        let resp = serve_index(
             &state,
             key,
             "text/plain; charset=utf-8",
@@ -969,6 +1162,23 @@ async fn files_get(
             &headers,
         )
         .await;
+        // Not stored yet (wheel not cached): pass upstream metadata through
+        // without writing anything — a resolver probing dozens of candidate
+        // wheels must not stampede gigabytes into storage. The companion is
+        // stored when the wheel itself is downloaded.
+        if resp.status() == StatusCode::NOT_FOUND {
+            if let Some(upstream) = proxy_metadata_passthrough(&state, &pkg, &filename).await {
+                return upstream;
+            }
+        }
+        return resp;
+    }
+
+    // On-demand mirroring: make sure the artifact is in storage before the
+    // presign/stream logic runs (a presigned redirect never observes a 404,
+    // so the fetch can't be triggered by one).
+    if let Some(resp) = proxy_ensure_artifact(&state, &pkg, &filename).await {
+        return resp;
     }
 
     // S3 serves the megabytes, this node serves kilobytes of index: redirect
@@ -1016,6 +1226,51 @@ async fn files_get(
     }
 }
 
+/// Proxy hook for artifact downloads: fetch-and-commit on a local miss.
+/// `None` means fall through to normal serving (the file is now in storage,
+/// was already there, or doesn't exist upstream either); `Some` is a hard
+/// failure response (storage outage, upstream verification failure).
+async fn proxy_ensure_artifact(
+    state: &Arc<AppState>,
+    pkg: &str,
+    filename: &str,
+) -> Option<Response<Body>> {
+    let proxy = state.proxy.as_ref()?;
+    match proxy::eligible(state, pkg).await {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => return Some(read_error(e)),
+    }
+    match proxy.ensure_artifact_cached(state, pkg, filename).await {
+        Ok(()) => None,
+        Err(e) => Some(read_error(e)),
+    }
+}
+
+/// Serve a PEP 658 companion straight from upstream, no storage writes.
+async fn proxy_metadata_passthrough(
+    state: &Arc<AppState>,
+    pkg: &str,
+    filename: &str,
+) -> Option<Response<Body>> {
+    let proxy = state.proxy.as_ref()?;
+    match proxy::eligible(state, pkg).await {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => return Some(read_error(e)),
+    }
+    let bytes = proxy.fetch_metadata(state, pkg, filename).await?;
+    Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(header::CACHE_CONTROL, ARTIFACT_CACHE_CONTROL)
+            .header(header::CONTENT_LENGTH, bytes.len())
+            .body(Body::from(bytes))
+            .unwrap_or_else(not_found),
+    )
+}
+
 fn found_redirect(url: &str) -> Response<Body> {
     Response::builder()
         .status(StatusCode::FOUND)
@@ -1023,6 +1278,21 @@ fn found_redirect(url: &str) -> Response<Body> {
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::empty())
         .unwrap_or_else(not_found)
+}
+
+fn moved_permanently(location: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::MOVED_PERMANENTLY)
+        .header(header::LOCATION, location)
+        .body(Body::empty())
+        .unwrap_or_else(not_found)
+}
+
+fn unauthorized() -> Response<Body> {
+    // The WWW-Authenticate header rides in via middleware.
+    let mut resp = Response::new(Body::from("Unauthorized"));
+    *resp.status_mut() = StatusCode::UNAUTHORIZED;
+    resp
 }
 
 fn not_found<E: std::fmt::Debug>(err: E) -> Response<Body> {
@@ -1212,23 +1482,30 @@ impl AppState {
         }
     }
 
-    /// No credentials of any kind configured: writes are fully open (dev mode).
-    fn auth_open(&self) -> bool {
+    /// The configured read credential, if any (both halves required).
+    fn read_credential(&self) -> Option<(&str, &str)> {
+        match (&self.read_user, &self.read_pass) {
+            (Some(u), Some(p)) => Some((u, p)),
+            _ => None,
+        }
+    }
+
+    /// No write credential configured: every write path is disabled and the
+    /// server is read-only. Unauthenticated open writes were a footgun on the
+    /// default 0.0.0.0 bind, not a dev convenience.
+    fn uploads_disabled(&self) -> bool {
         self.uploader_credential().is_none() && self.admin_credential().is_none()
     }
 
-    /// Does the request authenticate as admin? (Open mode is admin.)
+    /// Does the request authenticate as admin?
     fn is_admin(&self, headers: &HeaderMap) -> bool {
-        if self.auth_open() {
-            return true;
-        }
         match self.admin_credential() {
             Some((u, p)) => check_basic_auth(headers, u, p).is_ok(),
             None => false,
         }
     }
 
-    /// May the request publish? Admin ⊇ uploader; open mode allows all.
+    /// May the request publish? Admin ⊇ uploader.
     fn is_uploader(&self, headers: &HeaderMap) -> bool {
         if self.is_admin(headers) {
             return true;
@@ -1236,6 +1513,16 @@ impl AppState {
         match self.uploader_credential() {
             Some((u, p)) => check_basic_auth(headers, u, p).is_ok(),
             None => false,
+        }
+    }
+
+    /// May the request read indexes and artifacts? Public unless a read
+    /// credential is configured; any stronger credential also reads
+    /// (admin ⊇ uploader ⊇ reader).
+    fn is_reader(&self, headers: &HeaderMap) -> bool {
+        match self.read_credential() {
+            None => true,
+            Some((u, p)) => check_basic_auth(headers, u, p).is_ok() || self.is_uploader(headers),
         }
     }
 }

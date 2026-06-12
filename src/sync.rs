@@ -150,15 +150,15 @@ struct Resolved {
     filter: ResolvedFilter,
 }
 
-struct ResolvedFilter {
-    only_wheels: bool,
-    only_sdists: bool,
-    python_tag: Vec<String>,
-    abi_tag: Vec<String>,
-    platform_tag: Vec<String>,
-    exclude_platform_tag: Vec<String>,
-    exclude_newer: Option<OffsetDateTime>,
-    exclude_older: Option<OffsetDateTime>,
+pub(crate) struct ResolvedFilter {
+    pub(crate) only_wheels: bool,
+    pub(crate) only_sdists: bool,
+    pub(crate) python_tag: Vec<String>,
+    pub(crate) abi_tag: Vec<String>,
+    pub(crate) platform_tag: Vec<String>,
+    pub(crate) exclude_platform_tag: Vec<String>,
+    pub(crate) exclude_newer: Option<OffsetDateTime>,
+    pub(crate) exclude_older: Option<OffsetDateTime>,
 }
 
 impl Resolved {
@@ -267,7 +267,7 @@ fn pick_vec(cli: &[String], cfg: Option<Vec<String>>) -> Vec<String> {
     }
 }
 
-fn parse_cutoff(what: &str, value: Option<&String>) -> Result<Option<OffsetDateTime>> {
+pub(crate) fn parse_cutoff(what: &str, value: Option<&String>) -> Result<Option<OffsetDateTime>> {
     let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
         return Ok(None);
     };
@@ -305,27 +305,27 @@ struct PyPiJson {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct PyPiFile {
-    filename: String,
-    url: String,
-    digests: PyPiDigests,
+pub(crate) struct PyPiFile {
+    pub(crate) filename: String,
+    pub(crate) url: String,
+    pub(crate) digests: PyPiDigests,
     #[serde(default)]
-    size: Option<u64>,
+    pub(crate) size: Option<u64>,
     #[serde(default)]
-    packagetype: Option<String>,
+    pub(crate) packagetype: Option<String>,
     #[serde(default)]
-    upload_time_iso_8601: Option<String>,
+    pub(crate) upload_time_iso_8601: Option<String>,
     #[serde(default)]
-    requires_python: Option<String>,
+    pub(crate) requires_python: Option<String>,
     #[serde(default)]
-    yanked: bool,
+    pub(crate) yanked: bool,
     #[serde(default)]
-    yanked_reason: Option<String>,
+    pub(crate) yanked_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct PyPiDigests {
-    sha256: String,
+pub(crate) struct PyPiDigests {
+    pub(crate) sha256: String,
 }
 
 /// A file selected for mirroring, with its release version.
@@ -712,7 +712,7 @@ async fn upload_via_http(
     Ok(true)
 }
 
-fn matches_filters(file: &PyPiFile, f: &ResolvedFilter) -> bool {
+pub(crate) fn matches_filters(file: &PyPiFile, f: &ResolvedFilter) -> bool {
     let fname = file.filename.to_ascii_lowercase();
     let is_wheel =
         fname.ends_with(".whl") || matches!(file.packagetype.as_deref(), Some("bdist_wheel"));

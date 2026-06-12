@@ -18,6 +18,7 @@ from .helpers import (
     run_returncode,
     uv_python_path,
     wait_http_ok,
+    wait_http_responding,
 )
 
 COMPAT_CLIENTS = ("pip", "uv", "poetry", "pdm", "twine", "flit", "hatch")
@@ -293,7 +294,8 @@ def _start_disk_server(tmp_path_factory, bin_path: Path, extra_args=()) -> Itera
     with open(log_path, "w") as log_file:
         proc = subprocess.Popen(args, env=env, stdout=log_file, stderr=subprocess.STDOUT)
         try:
-            wait_http_ok(f"http://{bind}/simple/index.json", timeout=20.0)
+            # Any HTTP status counts as up: read-auth servers answer 401 here.
+            wait_http_responding(f"http://{bind}/simple/index.json", timeout=20.0)
             yield {
                 "bind": bind,
                 "base_url": f"http://{bind}",
@@ -345,6 +347,102 @@ def disk_server_prefixed(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
 def disk_server_sync_uploads(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Disk server where uploads wait for index visibility before returning."""
     yield from _start_disk_server(tmp_path_factory, pypiron_bin, extra_args=["--sync-uploads"])
+
+
+@pytest.fixture()
+def disk_server_read_auth(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server requiring basic auth on index and artifact reads."""
+    for server in _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=["--read-user", "reader", "--read-pass", "readersecret"],
+    ):
+        server["read_user"] = "reader"
+        server["read_password"] = "readersecret"
+        yield server
+
+
+@pytest.fixture()
+def disk_server_no_creds(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server with no credentials at all: read-only, every write disabled."""
+    data_dir = tmp_path_factory.mktemp("pypiron-no-creds")
+    port = find_free_port()
+    bind = f"127.0.0.1:{port}"
+    log_path = data_dir.parent / f"{data_dir.name}-server.log"
+    args = [
+        str(pypiron_bin),
+        "--bind-addr",
+        bind,
+        "--data-dir",
+        str(data_dir),
+        "--worker-interval-secs",
+        "1",
+    ]
+    env = os.environ.copy()
+    env.setdefault("RUST_LOG", "info,pypiron=debug")
+    with open(log_path, "w") as log_file:
+        proc = subprocess.Popen(args, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+        try:
+            wait_http_ok(f"http://{bind}/simple/index.json", timeout=20.0)
+            yield {
+                "bind": bind,
+                "base_url": f"http://{bind}",
+                "legacy": f"http://{bind}/legacy/",
+                "simple": f"http://{bind}/simple/",
+                "data_dir": data_dir,
+                "log_path": log_path,
+                "proc": proc,
+            }
+        finally:
+            kill_process_tree(proc)
+
+
+@pytest.fixture()
+def disk_server_json_logs(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server logging one JSON object per line."""
+    yield from _start_disk_server(
+        tmp_path_factory, pypiron_bin, extra_args=["--log-format", "json"]
+    )
+
+
+# ------------------------------ Proxy fixtures --------------------------------
+
+
+def _start_proxy_pair(tmp_path_factory, pypiron_bin: Path, proxy_extra_args=()) -> Iterator[Dict]:
+    """An upstream disk server plus a second server proxying it on demand."""
+    upstream_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    upstream = next(upstream_gen)
+    proxy_gen = _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=["--proxy-upstream", upstream["base_url"], *proxy_extra_args],
+    )
+    proxy = next(proxy_gen)
+    try:
+        yield {"upstream": upstream, "proxy": proxy}
+    finally:
+        proxy_gen.close()
+        upstream_gen.close()
+
+
+@pytest.fixture()
+def proxy_pair(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    yield from _start_proxy_pair(tmp_path_factory, pypiron_bin)
+
+
+@pytest.fixture()
+def proxy_pair_wheels_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    yield from _start_proxy_pair(
+        tmp_path_factory, pypiron_bin, proxy_extra_args=["--proxy-only-wheels"]
+    )
+
+
+@pytest.fixture()
+def proxy_pair_prefixed(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Proxying server that reserves the `acme` namespace for private uploads."""
+    yield from _start_proxy_pair(
+        tmp_path_factory, pypiron_bin, proxy_extra_args=["--private-prefix", "acme"]
+    )
 
 
 @pytest.fixture()

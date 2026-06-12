@@ -6,6 +6,7 @@ import pytest
 
 from .helpers import (
     download_pypi_wheel,
+    http_get,
     http_request_auth,
     upload_legacy,
     wait_for_file_in_index,
@@ -65,6 +66,42 @@ def test_uploader_cannot_delete_or_yank(disk_server, tmp_path):
     assert code == 200
     code, _, _ = http_request_auth("DELETE", f"{base}/files/{PACKAGE}/{wheel.name}", **admin)
     assert code == 204
+
+
+def test_401_carries_www_authenticate(disk_server):
+    """RFC 7235: pip's keyring prompt and browsers need the challenge header."""
+    from .helpers import _encode_basic_auth, _http_request
+
+    code, _, headers = _http_request(
+        disk_server["legacy"],
+        method="POST",
+        headers={
+            "Authorization": _encode_basic_auth("nope", "wrong"),
+            "Content-Type": "multipart/form-data; boundary=x",
+        },
+        data=b"",
+    )
+    assert code == 401
+    assert headers.get("www-authenticate") == 'Basic realm="PypIron"'
+
+
+def test_no_credentials_means_read_only(disk_server_no_creds, tmp_path):
+    """With no credentials configured every write is disabled — not open."""
+    server = disk_server_no_creds
+    wheel = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
+    upload_legacy(server["legacy"], wheel, expect_status=403)
+
+    code, _, _ = http_request_auth(
+        "DELETE",
+        f"{server['base_url']}/files/{PACKAGE}/{wheel.name}",
+        username="any",
+        password="thing",
+    )
+    assert code == 403
+
+    # Reads stay public.
+    code, _, _ = http_get(f"{server['simple']}index.json")
+    assert code == 200
 
 
 def test_admin_disabled_when_unconfigured(disk_server_uploader_only, tmp_path):

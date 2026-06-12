@@ -175,6 +175,10 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
             "sweep finished with {failures} package failure(s)"
         ));
     }
+    state
+        .metrics
+        .reconcile_sweeps
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     info!(packages = live.len(), "reconcile: sweep complete");
     Ok(())
 }
@@ -261,6 +265,10 @@ pub async fn rebuild_package_excluding(
     pkg: &str,
     omit: Option<&str>,
 ) -> Result<bool> {
+    state
+        .metrics
+        .index_rebuilds
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut files = list_artifacts(state, pkg).await?;
     if let Some(omit) = omit {
         files.retain(|f| f.filename != omit);
@@ -634,6 +642,8 @@ mod tests {
             uploader_pass: None,
             admin_user: None,
             admin_pass: None,
+            read_user: None,
+            read_pass: None,
             private_prefix: None,
             artifact_delivery: ArtifactDelivery::Auto,
             worker_interval: Duration::from_secs(10),
@@ -648,6 +658,8 @@ mod tests {
             spool_dir: std::env::temp_dir(),
             global_index_lock: Arc::new(tokio::sync::Mutex::new(())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            proxy: None,
         });
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -723,6 +735,8 @@ mod tests {
             uploader_pass: None,
             admin_user: None,
             admin_pass: None,
+            read_user: None,
+            read_pass: None,
             private_prefix: None,
             artifact_delivery: ArtifactDelivery::Auto,
             worker_interval: Duration::from_millis(10),
@@ -737,6 +751,8 @@ mod tests {
             spool_dir: std::env::temp_dir(),
             global_index_lock: Arc::new(tokio::sync::Mutex::new(())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            proxy: None,
         });
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

@@ -50,7 +50,9 @@ Every landed optimization, paired with the meter runs that bracket it.
 | 2026-06-12 | Incremental global-index update (worker.rs); sweep stays the healer | S4 new name → global index | 56.8s → 1.68s |
 | 2026-06-12 | Sidecar read fan-out 16 → 64 | S1 5,000-file package rebuild | 17.2s → 7.42s |
 | 2026-06-12 | Per-file download retry with backoff (sync.rs); test `tests/test_sync_retry.py` | M-suite robustness | one transient 503 in 7,714 files failed the whole run → retried and survives |
-| 2026-06-12 | Package-level sync concurrency (`--package-concurrency`, default 8) | M1 small-file mirror throughput | 13.7 → 30.6 files/s (wall now bound by largest single package) |
+| 2026-06-12 | Package-level sync concurrency (`--package-concurrency`, default 8) | M1 small-file mirror throughput | 13.7 → 30.6 files/s (wall bound by largest single package) |
+| 2026-06-12 | …plus file-concurrency 16 within packages (flag tuning, no code) | M1 | 30.6 → **117 files/s** (8.5× total) |
+| 2026-06-12 | In-memory multipart for >64MB `put_if_absent` bodies (sync mirror path) | M2 torch-class mirroring | 0.95 → 1.04 Gbps (bound moved to per-file phase serialization; documented, deferred) |
 
 ## Full run details
 
@@ -190,6 +192,20 @@ rung; 64-way sidecar fan-out brought it to 7.42s.
 
 Steady-state visibility is flat from 100 packages to 10,000 — prefix-scoped
 rebuilds proven: corpus size does not tax single-package updates.
+
+### Run 007 — 2026-06-12 — Phase 3: sync throughput (M1/M2/M3)
+
+- Same rig; sync runs on the loadgen (c7gn.4xlarge) against PyPI + the bench bucket
+- Corpus: 30 real PyPI packages, wheels only (7,715 files); torch cp312 manylinux for M2
+- A/B on one binary: `--package-concurrency 1` reproduces the old serial behavior
+
+| Scenario | Result |
+|---|---|
+| M1 serial (old behavior) | 7,714 files / 563s = **13.7 files/s**; 1 transient PyPI 503 failed the whole run (now retried) |
+| M1 parallel (pc=8, file-conc 4) | 7,715 files / 252s = 30.6 files/s — wall bound by the single biggest package |
+| M1 tuned (pc=8, file-conc 16) | 7,715 files / 66s = **117 files/s (8.5×)** |
+| M2 torch-class (17.66 GB, 37 wheels) | 149s ≈ **0.95 Gbps**; with multipart artifact writes 136s ≈ 1.04 Gbps. Remaining bound: per-file download→hash→upload phases serialize. The tee-streaming fix matters at clone scale (Phase 5) and is deliberately deferred |
+| M3 HTTP push (same list, via /legacy/) | 86s = 90 files/s — **within 23% of direct mode** (target ≤25%) |
 
 <!--
 Template:

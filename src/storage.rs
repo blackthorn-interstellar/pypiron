@@ -568,6 +568,111 @@ impl S3Storage {
         completed
     }
 
+    /// Multipart from an in-memory body (sync's mirror path verifies the
+    /// digest before writing, so the bytes are already resident). Parts are
+    /// Bytes slices — zero-copy views into the one buffer.
+    async fn multipart_from_bytes(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<bool> {
+        let mut create = self
+            .s3
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key);
+        if let Some(ct) = content_type {
+            create = create.content_type(ct);
+        }
+        let upload_id = create
+            .send()
+            .await
+            .context("create multipart upload")?
+            .upload_id
+            .ok_or_else(|| anyhow!("S3 returned no upload id"))?;
+
+        let body = bytes::Bytes::from(bytes);
+        let part_ranges: Vec<(i32, std::ops::Range<usize>)> = (0..)
+            .map(|i| {
+                let start = i * MULTIPART_PART_SIZE as usize;
+                let end = (start + MULTIPART_PART_SIZE as usize).min(body.len());
+                (i as i32 + 1, start..end)
+            })
+            .take_while(|(_, r)| !r.is_empty())
+            .collect();
+
+        let mut parts = Vec::with_capacity(part_ranges.len());
+        let mut failed: Option<anyhow::Error> = None;
+        for chunk in part_ranges.chunks(MULTIPART_CONCURRENCY) {
+            let uploads = chunk.iter().map(|(part_number, range)| {
+                let part = body.slice(range.clone());
+                let upload_id = upload_id.as_str();
+                async move {
+                    let out = self
+                        .s3
+                        .upload_part()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .part_number(*part_number)
+                        .body(ByteStream::from(part))
+                        .send()
+                        .await
+                        .with_context(|| format!("upload part {part_number}"))?;
+                    Ok::<_, anyhow::Error>(
+                        aws_sdk_s3::types::CompletedPart::builder()
+                            .part_number(*part_number)
+                            .set_e_tag(out.e_tag)
+                            .build(),
+                    )
+                }
+            });
+            for part in futures::future::join_all(uploads).await {
+                match part {
+                    Ok(p) => parts.push(p),
+                    Err(e) => failed = Some(e),
+                }
+            }
+            if failed.is_some() {
+                break;
+            }
+        }
+
+        let completed = match failed {
+            None => {
+                let mpu = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build();
+                match self
+                    .s3
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(mpu)
+                    .if_none_match("*")
+                    .send()
+                    .await
+                {
+                    Ok(_) => return Ok(true),
+                    Err(e) if lost_conditional_write(&e) => Ok(false),
+                    Err(e) => Err(anyhow::Error::from(e).context("complete multipart upload")),
+                }
+            }
+            Some(e) => Err(e),
+        };
+        let _ = self
+            .s3
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        completed
+    }
+
     async fn upload_parts(
         &self,
         key: &str,
@@ -728,6 +833,11 @@ impl Storage for S3Storage {
         bytes: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<bool> {
+        if bytes.len() as u64 > MULTIPART_THRESHOLD {
+            // Same parallel-multipart path as spooled uploads: a single
+            // sequential PUT capped sync's torch-class mirroring at ~1 Gbps.
+            return self.multipart_from_bytes(key, bytes, content_type).await;
+        }
         let mut req = self
             .s3
             .put_object()

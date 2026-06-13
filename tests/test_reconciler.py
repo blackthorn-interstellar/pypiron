@@ -16,8 +16,8 @@ import pytest
 from .helpers import (
     ACCEPT_PEP691,
     download_pypi_wheel,
+    get_index_json,
     http_get,
-    http_get_json,
     sha256_file,
     upload_legacy,
     wait_for_file_in_index,
@@ -46,9 +46,7 @@ def test_lost_marker_is_harmless(disk_server_fast_reconcile, tmp_path):
     assert entry["hashes"]["sha256"] == sha256_file(wheel_path)
     assert (pkg_dir / f"{wheel_path.name}.meta.json").exists()
 
-    global_idx = http_get_json(
-        f"{server['simple']}index.json", headers={"Accept": ACCEPT_PEP691}
-    )
+    global_idx = get_index_json(server["simple"])
     assert PACKAGE in [p["name"] for p in global_idx["projects"]]
 
 
@@ -72,9 +70,7 @@ def test_reconcile_prunes_stale_views(disk_server_fast_reconcile, tmp_path):
     else:
         pytest.fail("reconcile did not prune the stale package index")
 
-    global_idx = http_get_json(
-        f"{server['simple']}index.json", headers={"Accept": ACCEPT_PEP691}
-    )
+    global_idx = get_index_json(server["simple"])
     assert PACKAGE not in [p["name"] for p in global_idx["projects"]], (
         "reconcile must remove vanished packages from the global index"
     )

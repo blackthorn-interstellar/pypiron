@@ -5,9 +5,8 @@ from __future__ import annotations
 import pytest
 
 from .helpers import (
-    ACCEPT_PEP691,
     download_pypi_wheel,
-    http_get_json,
+    get_index_json,
     run_checked,
     upload_legacy,
 )
@@ -27,9 +26,7 @@ def test_upload_returns_only_after_index_visibility(disk_server_sync_uploads, tm
     for version in (OLD_VERSION, NEW_VERSION):
         wheel = download_pypi_wheel(PACKAGE, version, tmp_path)
         upload_legacy(server["legacy"], wheel, **creds)
-        index = http_get_json(
-            f"{server['simple']}{PACKAGE}/index.json", headers={"Accept": ACCEPT_PEP691}
-        )
+        index = get_index_json(server["simple"], PACKAGE)
         assert wheel.name in [f["filename"] for f in index["files"]], (
             "a synchronous upload must be index-visible the instant it returns"
         )

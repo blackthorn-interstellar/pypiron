@@ -423,11 +423,13 @@ async fn sync_one_package(
         // Claim only when actually writing — atomically, so a racing first
         // private upload can't merge origins.
         if origin::read_origin(storage.as_ref(), pkg).await?.is_none() {
-            let winner = origin::claim_origin(storage.as_ref(), pkg, origin::MIRROR).await?;
+            let (created, winner) =
+                origin::claim_origin(storage.as_ref(), pkg, origin::MIRROR).await?;
             if winner != origin::MIRROR {
                 bail!("'{pkg}' is {winner}-owned; refusing to mirror over it");
             }
-            claimed_now = true;
+            // Only release a claim we actually created — never a racing peer's.
+            claimed_now = created;
         }
     }
 
@@ -476,31 +478,12 @@ async fn sync_one_package(
         // A claim with nothing behind it would block the name forever.
         if claimed_now && !wrote {
             if let Sink::Storage(storage) = sink {
-                release_empty_claim(storage.as_ref(), pkg).await;
+                origin::release_empty_claim(storage.as_ref(), pkg).await;
             }
         }
         bail!("{errors} file(s) failed for '{pkg}'");
     }
     Ok(())
-}
-
-/// Remove our orphan `.origin` claim if the package holds no artifacts.
-async fn release_empty_claim(storage: &dyn Storage, pkg: &str) {
-    let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
-    match storage.list_dir_entries(&prefix).await {
-        Ok(entries) => {
-            let has_artifact = entries.iter().any(|e| {
-                e.key
-                    .strip_prefix(&prefix)
-                    .map(crate::sidecar::is_artifact)
-                    .unwrap_or(false)
-            });
-            if !has_artifact {
-                let _ = storage.delete_keys(&[origin::origin_key(pkg)]).await;
-            }
-        }
-        Err(e) => warn!(package=%pkg, error=?e, "could not check for orphan claim"),
-    }
 }
 
 async fn fetch_selected_files(
@@ -849,22 +832,11 @@ pub(crate) fn parse_wheel_tags(filename: &str) -> Option<WheelTags> {
         // name, version, [build?], py, abi, platform  -> min 5 fields (without build)
         return None;
     }
-    let py = parts[parts.len() - 3]
-        .split('.')
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    let abi = parts[parts.len() - 2]
-        .split('.')
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    let plat = parts[parts.len() - 1]
-        .split('.')
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
+    let dotted = |field: &str| field.split('.').map(str::to_string).collect::<Vec<_>>();
     Some(WheelTags {
-        python: py,
-        abi,
-        platform: plat,
+        python: dotted(parts[parts.len() - 3]),
+        abi: dotted(parts[parts.len() - 2]),
+        platform: dotted(parts[parts.len() - 1]),
     })
 }
 

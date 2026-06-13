@@ -28,7 +28,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -37,6 +37,7 @@ use crate::lease::LeaseManager;
 use crate::names::infer_version_from_filename;
 use crate::render::{
     pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
+    SIMPLE_HTML_CONTENT_TYPE, SIMPLE_JSON_CONTENT_TYPE,
 };
 use crate::sidecar::{is_artifact, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, SIDECAR_SUFFIX};
 use crate::storage::{FileEntry, ObjectMeta, Storage};
@@ -70,21 +71,20 @@ fn marker_nonce() -> String {
 /// worker rebuilds anyway after the grace period.
 pub async fn mark_intent(storage: &dyn Storage, pkg: &str) -> Result<String> {
     let nonce = marker_nonce();
-    storage
-        .put_bytes(
-            &format!("{DIRTY_PREFIX}{pkg}!{nonce}{INTENT_SUFFIX}"),
-            Vec::new(),
-            None,
-        )
-        .await?;
+    put_marker(storage, pkg, &nonce, INTENT_SUFFIX).await?;
     Ok(nonce)
 }
 
 /// Declare "truth changed for `pkg`": rebuild as soon as possible.
 pub async fn mark_commit(storage: &dyn Storage, pkg: &str, nonce: &str) -> Result<()> {
+    put_marker(storage, pkg, nonce, COMMIT_SUFFIX).await
+}
+
+/// Write an empty event marker `_dirty/<pkg>!<nonce><suffix>`.
+async fn put_marker(storage: &dyn Storage, pkg: &str, nonce: &str, suffix: &str) -> Result<()> {
     storage
         .put_bytes(
-            &format!("{DIRTY_PREFIX}{pkg}!{nonce}{COMMIT_SUFFIX}"),
+            &format!("{DIRTY_PREFIX}{pkg}!{nonce}{suffix}"),
             Vec::new(),
             None,
         )
@@ -266,7 +266,7 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
     // added by the tick) must not be clobbered by our older observation.
     update_global_index(state, &live, &dead).await?;
     if failures > 0 {
-        return Err(anyhow::anyhow!("audit finished with {failures} failure(s)"));
+        return Err(anyhow!("audit finished with {failures} failure(s)"));
     }
     let duration_secs = started.elapsed().as_secs_f64();
     let m = &state.metrics;
@@ -506,7 +506,7 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
         let semaphore = semaphore.clone();
         handles.push(tokio::spawn(async move {
             let _permit = semaphore.acquire().await;
-            let rebuilt = match process_dirty(&state, &pkg).await {
+            let rebuilt = match rebuild_package(&state, &pkg).await {
                 Ok(has_artifacts) => Some(has_artifacts),
                 Err(e) => {
                     error!(package=%pkg, error=?e, "rebuild failed; markers retained for retry");
@@ -555,13 +555,9 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
         warn!(error=?e, "could not consume markers; rebuilds will repeat");
     }
     if failures > 0 {
-        return Err(anyhow::anyhow!("{failures} package(s) failed this tick"));
+        return Err(anyhow!("{failures} package(s) failed this tick"));
     }
     Ok(())
-}
-
-async fn process_dirty(state: &AppState, pkg: &str) -> Result<bool> {
-    rebuild_package(state, pkg).await
 }
 
 /// Regenerate one package's indexes from a storage listing.
@@ -650,7 +646,7 @@ async fn update_global_index(state: &AppState, adds: &[String], removes: &[Strin
                     state,
                     &format!("{SIMPLE_PREFIX}index.html"),
                     pep503_global_html(&packages).into_bytes(),
-                    "text/html; charset=utf-8",
+                    SIMPLE_HTML_CONTENT_TYPE,
                 )
                 .await?;
             }
@@ -658,12 +654,17 @@ async fn update_global_index(state: &AppState, adds: &[String], removes: &[Strin
         }
         let mut packages: Vec<String> = cached.names.iter().cloned().collect();
         packages.sort();
-        if write_global_indexes_cas(state, &packages, &cached.etag.clone()).await? {
-            if let Some(cached) = guard.as_mut() {
-                // Re-pin to the fresh etag (None on non-CAS backends).
-                cached.etag = current_global_etag(state).await;
+        match write_global_indexes_cas(state, &packages, &cached.etag.clone()).await? {
+            CasOutcome::Won(new_etag) => {
+                if let Some(cached) = guard.as_mut() {
+                    // Pin the ETag the conditional write itself returned, not one
+                    // from a follow-up GET — a peer could land a write between the
+                    // two and we'd pin its ETag against our stale name set.
+                    cached.etag = new_etag;
+                }
+                return Ok(());
             }
-            return Ok(());
+            CasOutcome::Lost => {}
         }
         // Lost the CAS to a peer: another node updated the name set under us.
         // We already wrote an optimistic HTML this iteration; remember that so
@@ -682,7 +683,7 @@ async fn update_global_index(state: &AppState, adds: &[String], removes: &[Strin
         );
         *guard = None;
     }
-    anyhow::bail!("global index CAS retries exhausted")
+    bail!("global index CAS retries exhausted")
 }
 
 /// Load the global name set (and its ETag) from the materialized JSON.
@@ -714,17 +715,12 @@ async fn load_global_names(state: &AppState) -> Result<GlobalNames> {
     Ok(GlobalNames { etag, names })
 }
 
-async fn current_global_etag(state: &AppState) -> Option<String> {
-    if !state.storage.supports_leases() {
-        return None;
-    }
-    state
-        .storage
-        .get_with_etag(&format!("{SIMPLE_PREFIX}index.json"))
-        .await
-        .ok()
-        .flatten()
-        .map(|(_, etag)| etag)
+/// Outcome of a global-index conditional write.
+enum CasOutcome {
+    /// Won; carries the authoritative new ETag (`None` on non-CAS disk backends).
+    Won(Option<String>),
+    /// Lost the conditional write to a concurrent leader; caller should reload.
+    Lost,
 }
 
 /// Write both global views. The canonical JSON — the one `changed` detection
@@ -734,12 +730,13 @@ async fn current_global_etag(state: &AppState) -> Option<String> {
 /// gate never revisited without an audit; the disk path already orders it this
 /// way.) HTML is last-writer-wins; a racing loser rewrites it on its retry, so
 /// the iteration whose JSON CAS finally wins always left a matching HTML.
-/// Returns false when the CAS was lost.
+/// Returns `CasOutcome::Lost` when the conditional write lost the race, else
+/// `CasOutcome::Won` with the ETag the put itself returned.
 async fn write_global_indexes_cas(
     state: &AppState,
     packages: &[String],
     expected_etag: &Option<String>,
-) -> Result<bool> {
+) -> Result<CasOutcome> {
     let json_key = format!("{SIMPLE_PREFIX}index.json");
     let json = pep691_global_json(packages).into_bytes();
     if state.storage.supports_leases() {
@@ -750,7 +747,7 @@ async fn write_global_indexes_cas(
             .put_bytes(
                 &html_key,
                 pep503_global_html(packages).into_bytes(),
-                Some("text/html; charset=utf-8"),
+                Some(SIMPLE_HTML_CONTENT_TYPE),
             )
             .await?;
         state.index_cache.invalidate(&html_key);
@@ -759,14 +756,14 @@ async fn write_global_indexes_cas(
             Some(etag) => state.storage.put_if_match(&json_key, etag, json).await?,
             None => state.storage.put_if_none_match(&json_key, json).await?,
         };
-        if outcome.is_none() {
-            return Ok(false);
-        }
+        let Some(new_etag) = outcome else {
+            return Ok(CasOutcome::Lost);
+        };
         state.index_cache.invalidate(&json_key);
-        return Ok(true);
+        return Ok(CasOutcome::Won(Some(new_etag)));
     }
     write_global_indexes(state, packages).await?;
-    Ok(true)
+    Ok(CasOutcome::Won(None))
 }
 
 /// List a package's artifacts with metadata from sidecars — O(files), no hashing.
@@ -833,16 +830,8 @@ async fn load_file_metadata(
             }
         }
     };
-    Some(FileMetadata {
-        filename: filename.to_string(),
-        sha256: sc.sha256,
-        size: sc.size,
-        upload_time: Some(sc.upload_time),
-        version: Some(sc.version).filter(|v| !v.is_empty()),
-        yanked: sc.yanked,
-        requires_python: sc.requires_python,
-        core_metadata: names.contains(format!("{filename}{METADATA_SUFFIX}").as_str()),
-    })
+    let core_metadata = names.contains(format!("{filename}{METADATA_SUFFIX}").as_str());
+    Some(FileMetadata::from_sidecar(filename, sc, core_metadata))
 }
 
 async fn read_sidecar(state: &AppState, artifact_key: &str) -> Result<Sidecar> {
@@ -909,14 +898,14 @@ async fn write_pkg_indexes(state: &AppState, pkg: &str, files: &[FileMetadata]) 
         state,
         &format!("{base}index.html"),
         html.into_bytes(),
-        "text/html; charset=utf-8",
+        SIMPLE_HTML_CONTENT_TYPE,
     )
     .await?;
     put_if_changed(
         state,
         &format!("{base}index.json"),
         json.into_bytes(),
-        "application/vnd.pypi.simple.v1+json",
+        SIMPLE_JSON_CONTENT_TYPE,
     )
     .await?;
     Ok(())
@@ -930,14 +919,14 @@ async fn write_global_indexes(state: &AppState, packages: &[String]) -> Result<(
         state,
         &format!("{SIMPLE_PREFIX}index.html"),
         html.into_bytes(),
-        "text/html; charset=utf-8",
+        SIMPLE_HTML_CONTENT_TYPE,
     )
     .await?;
     put_if_changed(
         state,
         &format!("{SIMPLE_PREFIX}index.json"),
         json.into_bytes(),
-        "application/vnd.pypi.simple.v1+json",
+        SIMPLE_JSON_CONTENT_TYPE,
     )
     .await?;
     Ok(())
@@ -967,7 +956,7 @@ mod tests {
             Ok(self.objects.lock().unwrap().contains_key(key))
         }
         async fn serve_artifact(&self, _key: &str, _range: Option<&str>) -> Result<Response<Body>> {
-            anyhow::bail!("not used in this test")
+            bail!("not used in this test")
         }
         async fn presign_get(
             &self,

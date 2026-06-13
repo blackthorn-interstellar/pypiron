@@ -278,10 +278,8 @@ pub trait Storage: Send + Sync {
     }
 }
 
-/// EXDEV ("invalid cross-device link") without pulling in the libc crate.
-fn libc_exdev() -> i32 {
-    18
-}
+/// EXDEV ("invalid cross-device link"), hardcoded so we don't pull in libc.
+const EXDEV: i32 = 18;
 
 /// ------------------------------ DiskStorage -------------------------------
 pub struct DiskStorage {
@@ -324,6 +322,19 @@ impl DiskStorage {
             .ok_or_else(|| anyhow!("bad path"))?;
         let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
         Ok(path.with_file_name(format!(".tmp-{nanos}-{}-{name}", std::process::id())))
+    }
+
+    /// hard_link `tmp`→`dest` as an atomic create-if-absent (EEXIST → already
+    /// there), then remove `tmp` regardless. `Ok(false)` means the destination
+    /// already existed.
+    async fn link_atomic(&self, tmp: &Path, dest: &Path) -> Result<bool> {
+        let created = match fs::hard_link(tmp, dest).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(anyhow::Error::from(e)),
+        };
+        let _ = fs::remove_file(tmp).await;
+        created
     }
 }
 
@@ -417,13 +428,7 @@ impl Storage for DiskStorage {
         self.ensure_parent(&p).await?;
         let tmp = self.tmp_sibling(&p)?;
         fs::write(&tmp, bytes).await?;
-        let created = match fs::hard_link(&tmp, &p).await {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(e) => Err(anyhow::Error::from(e)),
-        };
-        let _ = fs::remove_file(&tmp).await;
-        created
+        self.link_atomic(&tmp, &p).await
     }
 
     async fn put_file_if_absent(
@@ -440,18 +445,12 @@ impl Storage for DiskStorage {
         match fs::hard_link(path, &p).await {
             Ok(()) => return Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-            Err(e) if e.raw_os_error() == Some(libc_exdev()) => {}
+            Err(e) if e.raw_os_error() == Some(EXDEV) => {}
             Err(e) => return Err(anyhow::Error::from(e)),
         }
         let tmp = self.tmp_sibling(&p)?;
         fs::copy(path, &tmp).await?;
-        let created = match fs::hard_link(&tmp, &p).await {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(e) => Err(anyhow::Error::from(e)),
-        };
-        let _ = fs::remove_file(&tmp).await;
-        created
+        self.link_atomic(&tmp, &p).await
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
@@ -599,17 +598,8 @@ impl S3Storage {
         Self { s3, bucket }
     }
 
-    /// Parallel multipart upload from a local file with a conditional
-    /// complete (`If-None-Match: *`) — immutability holds exactly as it does
-    /// for the single-PUT path, just decided at complete time. Any failure
-    /// aborts the multipart upload so no invisible parts linger billable.
-    async fn multipart_from_file(
-        &self,
-        key: &str,
-        path: &std::path::Path,
-        size: u64,
-        content_type: Option<&str>,
-    ) -> Result<bool> {
+    /// Open a multipart upload, returning its upload id.
+    async fn begin_multipart(&self, key: &str, content_type: Option<&str>) -> Result<String> {
         let mut create = self
             .s3
             .create_multipart_upload()
@@ -618,15 +608,51 @@ impl S3Storage {
         if let Some(ct) = content_type {
             create = create.content_type(ct);
         }
-        let upload_id = create
+        create
             .send()
             .await
             .context("create multipart upload")?
             .upload_id
-            .ok_or_else(|| anyhow!("S3 returned no upload id"))?;
+            .ok_or_else(|| anyhow!("S3 returned no upload id"))
+    }
 
-        let result = self.upload_parts(key, path, size, &upload_id).await;
-        let completed = match result {
+    /// Upload one part and return its `CompletedPart` (number + ETag).
+    async fn put_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        body: ByteStream,
+    ) -> Result<aws_sdk_s3::types::CompletedPart> {
+        let out = self
+            .s3
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("upload part {part_number}"))?;
+        Ok(aws_sdk_s3::types::CompletedPart::builder()
+            .part_number(part_number)
+            .set_e_tag(out.e_tag)
+            .build())
+    }
+
+    /// Complete a multipart upload conditionally (`If-None-Match: *`) from the
+    /// part results — immutability decided at complete time, exactly as the
+    /// single-PUT path. Any failure (lost race or a mid-flight error) aborts
+    /// the upload so no invisible parts linger billable. `Ok(false)` means we
+    /// lost the immutability race.
+    async fn finish_multipart(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: Result<Vec<aws_sdk_s3::types::CompletedPart>>,
+    ) -> Result<bool> {
+        let completed = match parts {
             Ok(parts) => {
                 let mpu = aws_sdk_s3::types::CompletedMultipartUpload::builder()
                     .set_parts(Some(parts))
@@ -636,7 +662,7 @@ impl S3Storage {
                     .complete_multipart_upload()
                     .bucket(&self.bucket)
                     .key(key)
-                    .upload_id(&upload_id)
+                    .upload_id(upload_id)
                     .multipart_upload(mpu)
                     .if_none_match("*")
                     .send()
@@ -649,17 +675,29 @@ impl S3Storage {
             }
             Err(e) => Err(e),
         };
-        // Lost the immutability race or failed mid-flight: clean up the
-        // invisible parts either way.
         let _ = self
             .s3
             .abort_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
-            .upload_id(&upload_id)
+            .upload_id(upload_id)
             .send()
             .await;
         completed
+    }
+
+    /// Parallel multipart upload from a local file (artifacts of any size are
+    /// streamed off disk, never held in memory).
+    async fn multipart_from_file(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        size: u64,
+        content_type: Option<&str>,
+    ) -> Result<bool> {
+        let upload_id = self.begin_multipart(key, content_type).await?;
+        let parts = self.upload_parts(key, path, size, &upload_id).await;
+        self.finish_multipart(key, &upload_id, parts).await
     }
 
     /// Multipart from an in-memory body (sync's mirror path verifies the
@@ -671,20 +709,7 @@ impl S3Storage {
         bytes: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<bool> {
-        let mut create = self
-            .s3
-            .create_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key);
-        if let Some(ct) = content_type {
-            create = create.content_type(ct);
-        }
-        let upload_id = create
-            .send()
-            .await
-            .context("create multipart upload")?
-            .upload_id
-            .ok_or_else(|| anyhow!("S3 returned no upload id"))?;
+        let upload_id = self.begin_multipart(key, content_type).await?;
 
         let body = bytes::Bytes::from(bytes);
         let part_ranges: Vec<(i32, std::ops::Range<usize>)> = (0..)
@@ -701,26 +726,7 @@ impl S3Storage {
         for chunk in part_ranges.chunks(MULTIPART_CONCURRENCY) {
             let uploads = chunk.iter().map(|(part_number, range)| {
                 let part = body.slice(range.clone());
-                let upload_id = upload_id.as_str();
-                async move {
-                    let out = self
-                        .s3
-                        .upload_part()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .upload_id(upload_id)
-                        .part_number(*part_number)
-                        .body(ByteStream::from(part))
-                        .send()
-                        .await
-                        .with_context(|| format!("upload part {part_number}"))?;
-                    Ok::<_, anyhow::Error>(
-                        aws_sdk_s3::types::CompletedPart::builder()
-                            .part_number(*part_number)
-                            .set_e_tag(out.e_tag)
-                            .build(),
-                    )
-                }
+                self.put_part(key, &upload_id, *part_number, ByteStream::from(part))
             });
             for part in futures::future::join_all(uploads).await {
                 match part {
@@ -733,38 +739,11 @@ impl S3Storage {
             }
         }
 
-        let completed = match failed {
-            None => {
-                let mpu = aws_sdk_s3::types::CompletedMultipartUpload::builder()
-                    .set_parts(Some(parts))
-                    .build();
-                match self
-                    .s3
-                    .complete_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .multipart_upload(mpu)
-                    .if_none_match("*")
-                    .send()
-                    .await
-                {
-                    Ok(_) => return Ok(true),
-                    Err(e) if lost_conditional_write(&e) => Ok(false),
-                    Err(e) => Err(anyhow::Error::from(e).context("complete multipart upload")),
-                }
-            }
+        let parts = match failed {
             Some(e) => Err(e),
+            None => Ok(parts),
         };
-        let _ = self
-            .s3
-            .abort_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .send()
-            .await;
-        completed
+        self.finish_multipart(key, &upload_id, parts).await
     }
 
     async fn upload_parts(
@@ -789,23 +768,7 @@ impl S3Storage {
                         .build()
                         .await
                         .context("open spool range")?;
-                    let out = self
-                        .s3
-                        .upload_part()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .upload_id(upload_id)
-                        .part_number(part_number)
-                        .body(body)
-                        .send()
-                        .await
-                        .with_context(|| format!("upload part {part_number}"))?;
-                    Ok::<_, anyhow::Error>(
-                        aws_sdk_s3::types::CompletedPart::builder()
-                            .part_number(part_number)
-                            .set_e_tag(out.e_tag)
-                            .build(),
-                    )
+                    self.put_part(key, upload_id, part_number, body).await
                 }
             });
             for part in futures::future::join_all(uploads).await {
@@ -1017,10 +980,13 @@ impl Storage for S3Storage {
                     last_modified,
                 });
             }
-            if out.is_truncated().unwrap_or(false) {
-                token = out.next_continuation_token.map(|s| s.to_string());
-            } else {
-                break;
+            // Terminate on the continuation token alone (like `list_all`):
+            // an S3-compatible backend that sets is_truncated but returns no
+            // token would otherwise refetch page 1 forever and grow `entries`
+            // without bound.
+            match out.next_continuation_token {
+                Some(t) if !t.is_empty() => token = Some(t),
+                _ => break,
             }
         }
         entries.sort_by(|a, b| a.key.cmp(&b.key));

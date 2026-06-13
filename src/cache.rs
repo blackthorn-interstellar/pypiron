@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
-use crate::storage::{NotFound, Storage};
+use crate::storage::{is_not_found, Storage};
 
 /// How stale a cached index may be when another node rebuilt it.
 pub const INDEX_CACHE_TTL: Duration = Duration::from_secs(1);
@@ -66,6 +66,14 @@ impl Cached {
             Cached::Missing => 0,
         }
     }
+
+    /// The `(identity, gzip)` pair `get` hands back, or `None` when missing.
+    fn into_pair(self) -> Option<(Variant, Option<Variant>)> {
+        match self {
+            Cached::Present { identity, gzip } => Some((identity, gzip)),
+            Cached::Missing => None,
+        }
+    }
 }
 
 /// Below this, gzip headers cost more than they save.
@@ -73,7 +81,7 @@ const GZIP_MIN_BYTES: usize = 1024;
 /// Keep the variant only if it actually pays: ≤90% of the original.
 const GZIP_KEEP_RATIO_PCT: usize = 90;
 
-fn quoted_sha256(bytes: &[u8]) -> Arc<str> {
+pub(crate) fn quoted_sha256(bytes: &[u8]) -> Arc<str> {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("\"{:x}\"", hasher.finalize()).into()
@@ -175,10 +183,7 @@ impl IndexCache {
         key: &str,
     ) -> Result<Option<(Variant, Option<Variant>)>> {
         if let Some(hit) = self.fresh(key) {
-            return Ok(match hit {
-                Cached::Present { identity, gzip } => Some((identity, gzip)),
-                Cached::Missing => None,
-            });
+            return Ok(hit.into_pair());
         }
 
         let cached = match storage.get_bytes(key).await {
@@ -193,7 +198,7 @@ impl IndexCache {
                     gzip,
                 }
             }
-            Err(e) if e.is::<NotFound>() => Cached::Missing,
+            Err(e) if is_not_found(&e) => Cached::Missing,
             Err(e) => return Err(e),
         };
 
@@ -208,10 +213,7 @@ impl IndexCache {
             );
             entries.enforce_cap(self.max_bytes, self.ttl);
         }
-        Ok(match cached {
-            Cached::Present { identity, gzip } => Some((identity, gzip)),
-            Cached::Missing => None,
-        })
+        Ok(cached.into_pair())
     }
 
     /// Drop a key after writing or deleting its index — same-process reads

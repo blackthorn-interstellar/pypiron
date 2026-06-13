@@ -190,16 +190,8 @@ async fn check_package(
                     continue;
                 }
             };
-            files.push(FileMetadata {
-                filename: filename.to_string(),
-                sha256: sc.sha256,
-                size: sc.size,
-                upload_time: Some(sc.upload_time),
-                version: Some(sc.version).filter(|v| !v.is_empty()),
-                yanked: sc.yanked,
-                requires_python: sc.requires_python,
-                core_metadata: names.contains(format!("{filename}{METADATA_SUFFIX}").as_str()),
-            });
+            let core_metadata = names.contains(format!("{filename}{METADATA_SUFFIX}").as_str());
+            files.push(FileMetadata::from_sidecar(filename, sc, core_metadata));
         }
     }
 

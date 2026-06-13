@@ -125,13 +125,11 @@ def test_corrupt_sidecar_omits_file_never_fabricates(disk_server, tmp_path):
     code, _, _ = http_request_auth("POST", yank_url, **creds)
     assert code == 200
 
-    from .helpers import http_get_json, ACCEPT_PEP691
+    from .helpers import get_index_json
 
     deadline = _time.time() + 15.0
     while _time.time() < deadline:
-        doc = http_get_json(
-            f"{disk_server['simple']}{PACKAGE}/index.json", headers={"Accept": ACCEPT_PEP691}
-        )
+        doc = get_index_json(disk_server["simple"], PACKAGE)
         names = [f["filename"] for f in doc["files"]]
         if old_wheel.name not in names and new_wheel.name in names:
             break

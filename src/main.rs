@@ -682,7 +682,32 @@ async fn legacy_upload(
                 }
             }
             _ => {
-                if let Ok(text) = field.text().await {
+                // Metadata fields are tiny (version, sha256_digest, ...). The
+                // artifact is streamed to a disk spool; a non-content part must
+                // not be the hole that buffers ~1 GiB in RAM and OOMs the box.
+                const MAX_FIELD_BYTES: usize = 64 * 1024;
+                let mut buf = Vec::new();
+                loop {
+                    match field.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if buf.len() + chunk.len() > MAX_FIELD_BYTES {
+                                return Err((
+                                    StatusCode::BAD_REQUEST,
+                                    format!("Form field '{field_name}' is too large"),
+                                ));
+                            }
+                            buf.extend_from_slice(&chunk);
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                "Invalid multipart form data".into(),
+                            ))
+                        }
+                    }
+                }
+                if let Ok(text) = String::from_utf8(buf) {
                     if !text.is_empty() {
                         fields.insert(field_name, text);
                     }
@@ -697,7 +722,7 @@ async fn legacy_upload(
     let spooled = spooled.ok_or((StatusCode::BAD_REQUEST, "Missing file content".to_string()))?;
 
     // No path separators, dotfiles, or names colliding with sidecar suffixes.
-    if filename.contains('/') || filename.contains('\\') || !sidecar::is_artifact(&filename) {
+    if !valid_artifact_filename(&filename) {
         return Err((StatusCode::BAD_REQUEST, "Invalid filename".into()));
     }
 
@@ -855,14 +880,15 @@ async fn legacy_upload(
             }
             // First write claims the package — atomically, so racing private
             // and mirror first-writes can't merge origins.
-            let winner = origin::claim_origin(state.storage.as_ref(), &pkg_norm, desired_origin)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to claim origin: {e}"),
-                    )
-                })?;
+            let (_created, winner) =
+                origin::claim_origin(state.storage.as_ref(), &pkg_norm, desired_origin)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to claim origin: {e}"),
+                        )
+                    })?;
             if winner != desired_origin {
                 return Err((
                     StatusCode::FORBIDDEN,
@@ -1021,53 +1047,35 @@ pub(crate) async fn commit_marker(
 }
 
 /// --- Simple index endpoints ----------------------------------------------
-const CT_JSON: &str = "application/vnd.pypi.simple.v1+json";
-const CT_HTML: &str = "text/html; charset=utf-8";
+const CT_JSON: &str = render::SIMPLE_JSON_CONTENT_TYPE;
+const CT_HTML: &str = render::SIMPLE_HTML_CONTENT_TYPE;
 /// Indexes change on every rebuild: always revalidate, never stale.
 const INDEX_CACHE_CONTROL: &str = "no-cache";
 /// Filenames are immutable, so artifact bytes can be cached forever.
 const ARTIFACT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 async fn simple_root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
-    if !state.is_reader(&headers) {
-        return unauthorized();
-    }
-    if accepts_json(&headers) {
-        serve_index(
-            &state,
-            format!("{SIMPLE_PREFIX}index.json"),
-            CT_JSON,
-            INDEX_CACHE_CONTROL,
-            &headers,
-        )
-        .await
-    } else {
-        serve_index(
-            &state,
-            format!("{SIMPLE_PREFIX}index.html"),
-            CT_HTML,
-            INDEX_CACHE_CONTROL,
-            &headers,
-        )
-        .await
-    }
+    serve_root_index(&state, accepts_json(&headers), &headers).await
 }
 
 async fn simple_root_json(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    if !state.is_reader(&headers) {
+    serve_root_index(&state, true, &headers).await
+}
+
+/// The global `/simple/` index, in JSON or HTML.
+async fn serve_root_index(state: &AppState, json: bool, headers: &HeaderMap) -> Response<Body> {
+    if !state.is_reader(headers) {
         return unauthorized();
     }
-    serve_index(
-        &state,
-        format!("{SIMPLE_PREFIX}index.json"),
-        CT_JSON,
-        INDEX_CACHE_CONTROL,
-        &headers,
-    )
-    .await
+    let (key, ct) = if json {
+        (format!("{SIMPLE_PREFIX}index.json"), CT_JSON)
+    } else {
+        (format!("{SIMPLE_PREFIX}index.html"), CT_HTML)
+    };
+    serve_index(state, key, ct, INDEX_CACHE_CONTROL, headers).await
 }
 
 async fn simple_pkg(
@@ -1075,28 +1083,7 @@ async fn simple_pkg(
     Path(raw): Path<String>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    if !state.is_reader(&headers) {
-        return unauthorized();
-    }
-    let pkg = normalize_pkg_name(&raw);
-    if !is_normalized(&pkg) {
-        return not_found("invalid package name");
-    }
-    // PEP 503: the canonical URL is the normalized one; everything else 301s
-    // there, so URL-keyed caches (CDNs, edge proxies) never split entries.
-    if raw != pkg {
-        return moved_permanently(&format!("/simple/{pkg}/"));
-    }
-    let json = accepts_json(&headers);
-    if let Some(resp) = proxy_package_index(&state, &pkg, json, &headers).await {
-        return resp;
-    }
-    let (key, ct) = if json {
-        (format!("{SIMPLE_PREFIX}{pkg}/index.json"), CT_JSON)
-    } else {
-        (format!("{SIMPLE_PREFIX}{pkg}/index.html"), CT_HTML)
-    };
-    serve_index(&state, key, ct, INDEX_CACHE_CONTROL, &headers).await
+    serve_pkg_index(&state, &raw, false, &headers).await
 }
 
 async fn simple_pkg_json(
@@ -1104,27 +1091,62 @@ async fn simple_pkg_json(
     Path(raw): Path<String>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    if !state.is_reader(&headers) {
+    serve_pkg_index(&state, &raw, true, &headers).await
+}
+
+/// A package's `/simple/<pkg>/` page. `force_json` is the explicit-`index.json`
+/// route (otherwise the representation is content-negotiated); it also pins the
+/// canonical-redirect target so URL-keyed caches never split entries.
+async fn serve_pkg_index(
+    state: &AppState,
+    raw: &str,
+    force_json: bool,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    if !state.is_reader(headers) {
         return unauthorized();
     }
-    let pkg = normalize_pkg_name(&raw);
+    let pkg = normalize_pkg_name(raw);
     if !is_normalized(&pkg) {
         return not_found("invalid package name");
     }
+    // PEP 503: the canonical URL is the normalized one; everything else 301s
+    // there, so URL-keyed caches (CDNs, edge proxies) never split entries.
     if raw != pkg {
-        return moved_permanently(&format!("/simple/{pkg}/index.json"));
+        let target = if force_json {
+            format!("/simple/{pkg}/index.json")
+        } else {
+            format!("/simple/{pkg}/")
+        };
+        return moved_permanently(&target);
     }
-    if let Some(resp) = proxy_package_index(&state, &pkg, true, &headers).await {
+    let json = force_json || accepts_json(headers);
+    if let Some(resp) = proxy_package_index(state, &pkg, json, headers).await {
         return resp;
     }
-    serve_index(
-        &state,
-        format!("{SIMPLE_PREFIX}{pkg}/index.json"),
-        CT_JSON,
-        INDEX_CACHE_CONTROL,
-        &headers,
-    )
-    .await
+    let (key, ct) = if json {
+        (format!("{SIMPLE_PREFIX}{pkg}/index.json"), CT_JSON)
+    } else {
+        (format!("{SIMPLE_PREFIX}{pkg}/index.html"), CT_HTML)
+    };
+    serve_index(state, key, ct, INDEX_CACHE_CONTROL, headers).await
+}
+
+/// Resolve the proxy for `pkg`, enforcing the eligibility gate (the
+/// dependency-confusion defense) in one place. `None` = no proxy configured or
+/// the name is ineligible (private / reserved prefix), so fall through to local
+/// serving; `Some(Err)` = origin unreadable, an outage to surface rather than
+/// answer "who owns this name" optimistically; `Some(Ok)` = serve upstream.
+async fn eligible_proxy<'a>(
+    state: &'a AppState,
+    pkg: &str,
+) -> Option<Result<&'a Arc<proxy::Proxy>, Response<Body>>> {
+    let proxy = state.proxy.as_ref()?;
+    match proxy::eligible(state, pkg).await {
+        Ok(true) => Some(Ok(proxy)),
+        Ok(false) => None,
+        Err(e) => Some(Err(read_error(e))),
+    }
 }
 
 /// Proxy hook for package pages: `Some(response)` when the page is served
@@ -1328,12 +1350,11 @@ async fn proxy_ensure_artifact(
     pkg: &str,
     filename: &str,
 ) -> Option<Response<Body>> {
-    let proxy = state.proxy.as_ref()?;
-    match proxy::eligible(state, pkg).await {
-        Ok(true) => {}
-        Ok(false) => return None,
-        Err(e) => return Some(read_error(e)),
-    }
+    let proxy = match eligible_proxy(state, pkg).await {
+        Some(Ok(proxy)) => proxy,
+        Some(Err(resp)) => return Some(resp),
+        None => return None,
+    };
     match proxy.ensure_artifact_cached(state, pkg, filename).await {
         Ok(()) => None,
         Err(e) => Some(read_error(e)),
@@ -1346,12 +1367,11 @@ async fn proxy_metadata_passthrough(
     pkg: &str,
     filename: &str,
 ) -> Option<Response<Body>> {
-    let proxy = state.proxy.as_ref()?;
-    match proxy::eligible(state, pkg).await {
-        Ok(true) => {}
-        Ok(false) => return None,
-        Err(e) => return Some(read_error(e)),
-    }
+    let proxy = match eligible_proxy(state, pkg).await {
+        Some(Ok(proxy)) => proxy,
+        Some(Err(resp)) => return Some(resp),
+        None => return None,
+    };
     let bytes = proxy.fetch_metadata(state, pkg, filename).await?;
     Some(
         Response::builder()
@@ -1422,7 +1442,7 @@ async fn files_delete(
     let pkg = normalize_pkg_name(&package);
     // Artifacts only: .origin, sidecars, and metadata companions are managed
     // by the server, not deletable handles.
-    if !is_normalized(&pkg) || !sidecar::is_artifact(&filename) || filename.contains('/') {
+    if !is_normalized(&pkg) || !valid_artifact_filename(&filename) {
         return Err((StatusCode::NOT_FOUND, "No such file".into()));
     }
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
@@ -1515,7 +1535,7 @@ async fn set_yanked(
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_admin(state, headers)?;
     let pkg = normalize_pkg_name(package);
-    if !is_normalized(&pkg) || !sidecar::is_artifact(filename) || filename.contains('/') {
+    if !is_normalized(&pkg) || !valid_artifact_filename(filename) {
         return Err((StatusCode::NOT_FOUND, "No such file".to_string()));
     }
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
@@ -1595,27 +1615,20 @@ impl AppState {
 
     /// The configured uploader credential, if any (both halves required).
     fn uploader_credential(&self) -> Option<(&str, &str)> {
-        match (&self.uploader_user, &self.uploader_pass) {
-            (Some(u), Some(p)) => Some((u, p)),
-            _ => None,
-        }
+        self.uploader_user
+            .as_deref()
+            .zip(self.uploader_pass.as_deref())
     }
 
     /// The configured admin credential, if any. Its presence is what enables
     /// the privileged operations (mirror, delete, yank).
     fn admin_credential(&self) -> Option<(&str, &str)> {
-        match (&self.admin_user, &self.admin_pass) {
-            (Some(u), Some(p)) => Some((u, p)),
-            _ => None,
-        }
+        self.admin_user.as_deref().zip(self.admin_pass.as_deref())
     }
 
     /// The configured read credential, if any (both halves required).
     fn read_credential(&self) -> Option<(&str, &str)> {
-        match (&self.read_user, &self.read_pass) {
-            (Some(u), Some(p)) => Some((u, p)),
-            _ => None,
-        }
+        self.read_user.as_deref().zip(self.read_pass.as_deref())
     }
 
     /// No write credential configured: every write path is disabled and the
@@ -1627,21 +1640,16 @@ impl AppState {
 
     /// Does the request authenticate as admin?
     fn is_admin(&self, headers: &HeaderMap) -> bool {
-        match self.admin_credential() {
-            Some((u, p)) => check_basic_auth(headers, u, p).is_ok(),
-            None => false,
-        }
+        self.admin_credential()
+            .is_some_and(|(u, p)| check_basic_auth(headers, u, p).is_ok())
     }
 
     /// May the request publish? Admin ⊇ uploader.
     fn is_uploader(&self, headers: &HeaderMap) -> bool {
-        if self.is_admin(headers) {
-            return true;
-        }
-        match self.uploader_credential() {
-            Some((u, p)) => check_basic_auth(headers, u, p).is_ok(),
-            None => false,
-        }
+        self.is_admin(headers)
+            || self
+                .uploader_credential()
+                .is_some_and(|(u, p)| check_basic_auth(headers, u, p).is_ok())
     }
 
     /// May the request read indexes and artifacts? Public unless a read
@@ -1653,6 +1661,13 @@ impl AppState {
             Some((u, p)) => check_basic_auth(headers, u, p).is_ok() || self.is_uploader(headers),
         }
     }
+}
+
+/// A filename usable as an artifact key: no path separators, not a dotfile,
+/// and not a sidecar/metadata companion. The backslash guard matters on the
+/// upload, delete, and yank paths alike — keep them consistent.
+fn valid_artifact_filename(filename: &str) -> bool {
+    !filename.contains('/') && !filename.contains('\\') && sidecar::is_artifact(filename)
 }
 
 /// Gate the privileged routes (delete, yank) behind the admin credential.
@@ -1670,12 +1685,28 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCod
     })
 }
 
+/// Length-independent constant-time byte equality, so credential checks don't
+/// leak the secret one prefix-byte at a time (CWE-208). The length may leak;
+/// the bytes do not.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn check_basic_auth(headers: &HeaderMap, user: &str, pass: &str) -> Result<()> {
     let (u, p) = basic_credentials(headers).ok_or_else(|| anyhow!("missing basic auth"))?;
     // Gmail-style subaddressing: `ci+billing-api` authenticates as `ci`; the
     // suffix is a project attribution tag, not part of the identity.
     let base = u.split_once('+').map_or(u.as_str(), |(b, _)| b);
-    if (u == user || base == user) && p == pass {
+    // Username is not a secret; the password is — compare it in constant time.
+    if (u == user || base == user) && ct_eq(&p, pass) {
         Ok(())
     } else {
         Err(anyhow!("bad credentials"))

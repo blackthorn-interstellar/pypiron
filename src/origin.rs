@@ -3,7 +3,9 @@
 //! the dependency-confusion defense (DESIGN.md).
 
 use anyhow::{anyhow, Result};
+use tracing::warn;
 
+use crate::sidecar::is_artifact;
 use crate::storage::{is_not_found, Storage};
 use crate::PACKAGES_PREFIX;
 
@@ -27,9 +29,18 @@ pub async fn read_origin(storage: &dyn Storage, pkg: &str) -> Result<Option<Stri
     }
 }
 
-/// Atomically claim the package for `origin`; first write wins. Returns the
-/// origin that actually holds the claim — ours, or a racer's.
-pub async fn claim_origin(storage: &dyn Storage, pkg: &str, origin: &str) -> Result<String> {
+/// Atomically claim the package for `origin`; first write wins. Returns
+/// `(created, owner)`: `created` is true only when THIS call wrote the marker,
+/// and `owner` is the origin that actually holds the claim — ours, or a racer's.
+///
+/// The `created` flag matters: a caller that merely read back a peer's fresh
+/// claim must not believe it owns it, or it could later "release" the peer's
+/// live claim out from under an in-flight download.
+pub async fn claim_origin(
+    storage: &dyn Storage,
+    pkg: &str,
+    origin: &str,
+) -> Result<(bool, String)> {
     let won = storage
         .put_if_absent(
             &origin_key(pkg),
@@ -38,9 +49,27 @@ pub async fn claim_origin(storage: &dyn Storage, pkg: &str, origin: &str) -> Res
         )
         .await?;
     if won {
-        return Ok(origin.to_string());
+        return Ok((true, origin.to_string()));
     }
-    read_origin(storage, pkg)
+    let owner = read_origin(storage, pkg)
         .await?
-        .ok_or_else(|| anyhow!("lost the origin claim race for '{pkg}' but no claim exists"))
+        .ok_or_else(|| anyhow!("lost the origin claim race for '{pkg}' but no claim exists"))?;
+    Ok((false, owner))
+}
+
+/// Remove our orphan `.origin` claim if the package holds no artifacts — a
+/// failed first write (sync or proxy) must not block the name forever.
+pub async fn release_empty_claim(storage: &dyn Storage, pkg: &str) {
+    let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
+    match storage.list_dir_entries(&prefix).await {
+        Ok(entries) => {
+            let has_artifact = entries
+                .iter()
+                .any(|e| e.key.strip_prefix(&prefix).is_some_and(is_artifact));
+            if !has_artifact {
+                let _ = storage.delete_keys(&[origin_key(pkg)]).await;
+            }
+        }
+        Err(e) => warn!(package=%pkg, error=?e, "could not check for orphan claim"),
+    }
 }

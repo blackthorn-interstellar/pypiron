@@ -203,6 +203,14 @@ def http_get_json(url: str, *, headers: Optional[Dict[str, str]] = None, timeout
     return json.loads(data.decode("utf-8"))
 
 
+def get_index_json(simple_url: str, package: Optional[str] = None, *, timeout: float = 10.0):
+    """Fetch a PEP 691 JSON index — the global index, or `package`'s — as parsed JSON."""
+    suffix = f"{package}/index.json" if package else "index.json"
+    return http_get_json(
+        f"{simple_url}{suffix}", headers={"Accept": ACCEPT_PEP691}, timeout=timeout
+    )
+
+
 def wait_http_ok(url: str, *, timeout: float = 15.0, interval: float = 0.1) -> None:
     """Poll until GET returns 2xx or timeout."""
     deadline = time.time() + timeout
@@ -371,19 +379,6 @@ def uv_python_path(venv_dir: Path) -> Path:
     if platform.system().lower().startswith("win"):
         return venv_dir / "Scripts" / "python.exe"
     return venv_dir / "bin" / "python"
-
-
-def make_uv_venv(uv: str, venv_dir: Path, *, seed: bool = False) -> Path:
-    """Create a venv with uv and return its python. seed=True installs pip into it."""
-    args = [uv, "venv"]
-    if seed:
-        args.append("--seed")
-    args.append(str(venv_dir))
-    run_checked(args)
-    py = uv_python_path(venv_dir)
-    if not py.exists():
-        raise FileNotFoundError(f"uv venv python not found at {py}")
-    return py
 
 
 # -------------------------- Legacy upload (multipart) -------------------------

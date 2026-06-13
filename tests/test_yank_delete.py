@@ -9,6 +9,7 @@ import pytest
 from .helpers import (
     ACCEPT_PEP691,
     download_pypi_wheel,
+    get_index_json,
     http_get,
     http_get_json,
     http_request_auth,
@@ -145,9 +146,7 @@ def test_delete_removes_file_then_package(stocked_server):
     deadline = time.time() + 15.0
     while time.time() < deadline:
         code, _, _ = http_get(f"{server['simple']}{PACKAGE}/", headers={"Accept": ACCEPT_PEP691})
-        global_idx = http_get_json(
-            f"{server['simple']}index.json", headers={"Accept": ACCEPT_PEP691}
-        )
+        global_idx = get_index_json(server["simple"])
         if code == 404 and PACKAGE not in [p["name"] for p in global_idx["projects"]]:
             break
         time.sleep(0.2)

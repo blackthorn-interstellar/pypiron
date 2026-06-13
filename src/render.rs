@@ -3,10 +3,15 @@ use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 
 use crate::names::infer_version_from_filename;
-use crate::sidecar::Yanked;
+use crate::sidecar::{Sidecar, Yanked};
 
 /// Simple API version: PEP 691 (1.0) + PEP 700 fields (1.1).
 const API_VERSION: &str = "1.1";
+
+/// PEP 691 JSON simple-API content type (response, outgoing/incoming Accept).
+pub const SIMPLE_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
+/// PEP 503 HTML simple-API content type.
+pub const SIMPLE_HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 
 /// File metadata for rendering indexes, sourced from sidecars.
 #[derive(Clone, Debug)]
@@ -26,6 +31,25 @@ pub struct FileMetadata {
     pub core_metadata: bool,
 }
 
+impl FileMetadata {
+    /// Build an index entry from an artifact's sidecar. `core_metadata` is
+    /// whether the `<filename>.metadata` companion exists. The worker and
+    /// `verify` both derive index entries this exact way — keep them in
+    /// lockstep by routing through here.
+    pub fn from_sidecar(filename: &str, sc: Sidecar, core_metadata: bool) -> Self {
+        Self {
+            filename: filename.to_string(),
+            sha256: sc.sha256,
+            size: sc.size,
+            upload_time: Some(sc.upload_time),
+            version: Some(sc.version).filter(|v| !v.is_empty()),
+            yanked: sc.yanked,
+            requires_python: sc.requires_python,
+            core_metadata,
+        }
+    }
+}
+
 /// Render minimal PEP 503 per‑package HTML (with PEP 629 version meta).
 pub fn pep503_package_html(package: &str, files: &[FileMetadata]) -> String {
     // Links are relative to the API under /files/<pkg>/<filename>
@@ -34,8 +58,15 @@ pub fn pep503_package_html(package: &str, files: &[FileMetadata]) -> String {
         r#"<html><head><meta name="pypi:repository-version" content="{API_VERSION}"><title>Links for {}</title></head><body>"#,
         encode_text(package)
     ));
+    // The package name is the same in every link's href; encode it once.
+    let pkg_attr = encode_double_quoted_attribute(package);
     for f in files {
-        let fname = encode_text(&f.filename);
+        // Two contexts, two escapers: link text wants text escaping, but the
+        // href attribute (and #sha256 fragment) must escape `"` too, or an
+        // uploaded filename like `a" onmouseover=…` breaks out of the attribute.
+        let fname_text = encode_text(&f.filename);
+        let fname_attr = encode_double_quoted_attribute(&f.filename);
+        let sha_attr = encode_double_quoted_attribute(&f.sha256);
         let mut attrs = String::new();
         if let Some(rp) = &f.requires_python {
             attrs.push_str(&format!(
@@ -56,9 +87,7 @@ pub fn pep503_package_html(package: &str, files: &[FileMetadata]) -> String {
             )),
         }
         body.push_str(&format!(
-            r##"<a href="/files/{}/{fname}#sha256={}"{attrs}>{fname}</a><br/>"##,
-            encode_text(package),
-            f.sha256
+            r##"<a href="/files/{pkg_attr}/{fname_attr}#sha256={sha_attr}"{attrs}>{fname_text}</a><br/>"##
         ));
     }
     body.push_str("</body></html>");
@@ -72,8 +101,9 @@ pub fn pep503_global_html(packages: &[String]) -> String {
         r#"<html><head><meta name="pypi:repository-version" content="{API_VERSION}"><title>Simple index</title></head><body>"#
     ));
     for p in packages {
-        let p = encode_text(p);
-        body.push_str(&format!(r#"<a href="/simple/{p}/">{p}</a><br/>"#));
+        let p_attr = encode_double_quoted_attribute(p);
+        let p_text = encode_text(p);
+        body.push_str(&format!(r#"<a href="/simple/{p_attr}/">{p_text}</a><br/>"#));
     }
     body.push_str("</body></html>");
     body
@@ -252,6 +282,25 @@ mod tests {
             serde_json::from_str(&pep691_package_json("six", &[plain])).unwrap();
         assert!(doc["files"][0].get("requires-python").is_none());
         assert!(doc["files"][0].get("core-metadata").is_none());
+    }
+
+    #[test]
+    fn filename_and_sha_cannot_break_out_of_href_attribute() {
+        // A filename passes upload validation as long as it has no '/'/'\\' and
+        // isn't a dotfile/sidecar — a double-quote is allowed, so it must not be
+        // able to terminate the href attribute and inject markup.
+        let mut m = meta(Some("1.0"));
+        m.filename = r#"a" onmouseover=alert(1) x.whl"#.into();
+        m.sha256 = r#"b"><script>"#.into();
+        let html = pep503_package_html("six", &[m]);
+        // In the href the quote is escaped, so the attribute never terminates
+        // early (the raw `href="/files/six/a"` breakout must not appear).
+        assert!(
+            html.contains(r#"href="/files/six/a&quot; onmouseover=alert(1) x.whl#sha256=b&quot;"#)
+        );
+        assert!(!html.contains(r#"href="/files/six/a""#));
+        // The link text keeps the literal filename — harmless in text context.
+        assert!(html.contains(r#">a" onmouseover=alert(1) x.whl</a>"#));
     }
 
     #[test]

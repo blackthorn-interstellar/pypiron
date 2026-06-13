@@ -21,6 +21,7 @@
 //! materialized index: already-cached packages keep installing.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,7 +30,6 @@ use clap::Args;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::names::{infer_version_from_filename, matches_prefix};
@@ -44,11 +44,16 @@ use crate::{AppState, PACKAGES_PREFIX};
 /// refetching. Bounds the lag for "a new release appeared upstream"; the
 /// artifacts themselves are immutable and cached forever.
 const LISTING_TTL: Duration = Duration::from_secs(60);
+/// Hard ceiling on cached listings. Each `/simple/:pkg` miss against a proxy
+/// upstream inserts one entry (including negative `Missing` ones for 404s), and
+/// there are unbounded distinct normalized names, so without a cap a stream of
+/// nonexistent-package requests grows the map until OOM.
+const MAX_LISTINGS: usize = 8192;
 /// Listing and metadata fetches are small; bound them hard.
 const SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Same retry budget as `sync`: at CDN scale, transient errors are routine.
 const DOWNLOAD_ATTEMPTS: u32 = 3;
-const PEP691_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
+const PEP691_CONTENT_TYPE: &str = render::SIMPLE_JSON_CONTENT_TYPE;
 
 /// Filters gating what the proxy serves and caches — the `sync` filters under
 /// a `--proxy-` prefix, with identical semantics (they gate what this server
@@ -210,10 +215,8 @@ pub struct RenderedIndex {
 }
 
 fn rendered(body: String) -> RenderedIndex {
-    let mut hasher = Sha256::new();
-    hasher.update(body.as_bytes());
     RenderedIndex {
-        etag: format!("\"{:x}\"", hasher.finalize()).into(),
+        etag: crate::cache::quoted_sha256(body.as_bytes()),
         body: bytes::Bytes::from(body),
     }
 }
@@ -325,12 +328,14 @@ impl Proxy {
             Some(owner) if owner == origin::MIRROR => {}
             Some(_) => return Ok(()),
             None => {
-                let winner =
+                let (created, winner) =
                     origin::claim_origin(state.storage.as_ref(), pkg, origin::MIRROR).await?;
                 if winner != origin::MIRROR {
                     return Ok(());
                 }
-                claimed_now = true;
+                // Only the creator may later release this claim; a racer that
+                // merely read back our peer's fresh MIRROR claim must not.
+                claimed_now = created;
             }
         }
 
@@ -341,10 +346,10 @@ impl Proxy {
                 state
                     .metrics
                     .proxy_artifact_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed);
                 // A claim with nothing behind it would block the name forever.
                 if claimed_now {
-                    release_empty_claim(state, pkg).await;
+                    origin::release_empty_claim(state.storage.as_ref(), pkg).await;
                 }
                 return Err(e);
             }
@@ -398,7 +403,7 @@ impl Proxy {
         state
             .metrics
             .proxy_artifacts_cached
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -456,14 +461,14 @@ impl Proxy {
         state
             .metrics
             .proxy_listing_fetches
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, Ordering::Relaxed);
         let listing = match self.fetch_listing(pkg).await {
             Ok(listing) => listing,
             Err(e) => {
                 state
                     .metrics
                     .proxy_listing_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed);
                 warn!(%pkg, upstream = %self.upstream, error=?e, "proxy: upstream listing fetch failed");
                 if let Some(stale) = self.cached_listing(pkg, true) {
                     return stale;
@@ -476,6 +481,9 @@ impl Proxy {
             Listing::Missing => None,
         };
         let mut map = self.listings.lock().expect("listing lock poisoned");
+        if map.len() >= MAX_LISTINGS && !map.contains_key(pkg) {
+            evict_listings(&mut map);
+        }
         map.insert(
             pkg.to_string(),
             CacheEntry {
@@ -587,23 +595,19 @@ impl Proxy {
     }
 }
 
-/// Remove our orphan `.origin` claim if the package holds no artifacts —
-/// a failed first download must not block the name forever.
-async fn release_empty_claim(state: &AppState, pkg: &str) {
-    let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
-    match state.storage.list_dir_entries(&prefix).await {
-        Ok(entries) => {
-            let has_artifact = entries.iter().any(|e| {
-                e.key
-                    .strip_prefix(&prefix)
-                    .map(crate::sidecar::is_artifact)
-                    .unwrap_or(false)
-            });
-            if !has_artifact {
-                let _ = state.storage.delete_keys(&[origin::origin_key(pkg)]).await;
-            }
-        }
-        Err(e) => warn!(package=%pkg, error=?e, "proxy: could not check for orphan claim"),
+/// Keep the listings cache bounded: first drop everything past its TTL (those
+/// would be re-fetched anyway), and if that didn't free a slot, evict the
+/// oldest entries down to half the cap so this stays amortized O(1) per insert.
+fn evict_listings(map: &mut HashMap<String, CacheEntry>) {
+    map.retain(|_, e| e.fetched.elapsed() < LISTING_TTL);
+    if map.len() < MAX_LISTINGS {
+        return;
+    }
+    let mut by_age: Vec<(String, Instant)> =
+        map.iter().map(|(k, e)| (k.clone(), e.fetched)).collect();
+    by_age.sort_by_key(|(_, fetched)| *fetched);
+    for (k, _) in by_age.into_iter().take(MAX_LISTINGS / 2) {
+        map.remove(&k);
     }
 }
 

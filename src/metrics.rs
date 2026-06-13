@@ -38,6 +38,7 @@ pub fn route_group(path: &str) -> usize {
     }
 }
 
+#[derive(Default)]
 pub struct Metrics {
     /// requests[route][status_class]
     requests: [[AtomicU64; STATUS_CLASSES.len()]; ROUTES.len()],
@@ -73,21 +74,7 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new() -> Self {
-        Self {
-            requests: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
-            index_rebuilds: AtomicU64::new(0),
-            reconcile_sweeps: AtomicU64::new(0),
-            audit_packages_rebuilt: AtomicU64::new(0),
-            audit_packages_skipped: AtomicU64::new(0),
-            audit_last_duration_bits: AtomicU64::new(0),
-            global_cas_conflicts: AtomicU64::new(0),
-            stale_intents_healed: AtomicU64::new(0),
-            proxy_listing_fetches: AtomicU64::new(0),
-            proxy_listing_errors: AtomicU64::new(0),
-            proxy_artifacts_cached: AtomicU64::new(0),
-            proxy_artifact_errors: AtomicU64::new(0),
-            project_requests: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     /// Count a request against a project attribution tag. The tag must
@@ -224,12 +211,6 @@ impl Metrics {
             }
         }
         out
-    }
-}
-
-impl Default for Metrics {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

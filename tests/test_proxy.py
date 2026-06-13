@@ -11,8 +11,8 @@ import pytest
 
 from .helpers import (
     ACCEPT_PEP691,
+    get_index_json,
     http_get,
-    http_get_json,
     kill_process_tree,
     make_sdist,
     make_wheel,
@@ -37,9 +37,7 @@ def test_proxy_serves_and_caches_upstream_package(proxy_pair, tmp_path):
     _upload(upstream, wheel, "proxydemo")
 
     # The package was never uploaded to the proxy, yet its page resolves.
-    data = http_get_json(
-        f"{proxy['simple']}proxydemo/index.json", headers={"Accept": ACCEPT_PEP691}
-    )
+    data = get_index_json(proxy["simple"], "proxydemo")
     entry = next(f for f in data["files"] if f["filename"] == wheel.name)
     assert entry["hashes"]["sha256"] == sha256_file(wheel)
     # PEP 700 upload-time rides through — --exclude-newer keeps working.
@@ -68,9 +66,7 @@ def test_metadata_passthrough_does_not_cache_the_wheel(proxy_pair, tmp_path):
     _upload(upstream, wheel, "mdpass")
 
     # The proxied page advertises the PEP 658 companion...
-    data = http_get_json(
-        f"{proxy['simple']}mdpass/index.json", headers={"Accept": ACCEPT_PEP691}
-    )
+    data = get_index_json(proxy["simple"], "mdpass")
     entry = next(f for f in data["files"] if f["filename"] == wheel.name)
     assert entry.get("core-metadata")
 
@@ -96,9 +92,7 @@ def test_private_package_never_falls_through(proxy_pair, tmp_path):
     upstream_wheel = make_wheel("mixedpkg", "2.0", tmp_path / "up")
     _upload(upstream, upstream_wheel, "mixedpkg")
 
-    data = http_get_json(
-        f"{proxy['simple']}mixedpkg/index.json", headers={"Accept": ACCEPT_PEP691}
-    )
+    data = get_index_json(proxy["simple"], "mixedpkg")
     filenames = [f["filename"] for f in data["files"]]
     assert local.name in filenames
     assert upstream_wheel.name not in filenames, (
@@ -138,9 +132,7 @@ def test_proxy_filters_gate_what_is_served(proxy_pair_wheels_only, tmp_path):
     _upload(upstream, wheel, "filterpkg")
     _upload(upstream, sdist, "filterpkg")
 
-    data = http_get_json(
-        f"{proxy['simple']}filterpkg/index.json", headers={"Accept": ACCEPT_PEP691}
-    )
+    data = get_index_json(proxy["simple"], "filterpkg")
     filenames = [f["filename"] for f in data["files"]]
     assert wheel.name in filenames
     assert sdist.name not in filenames

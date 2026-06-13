@@ -16,7 +16,7 @@ pub fn extract_metadata_from_file(path: &Path) -> Option<Vec<u8>> {
     extract_metadata_from_reader(std::fs::File::open(path).ok()?)
 }
 
-fn extract_metadata_from_reader<R: Read + Seek>(reader: R) -> Option<Vec<u8>> {
+pub(crate) fn extract_metadata_from_reader<R: Read + Seek>(reader: R) -> Option<Vec<u8>> {
     let mut zip = ZipArchive::new(reader).ok()?;
     let name = zip
         .file_names()

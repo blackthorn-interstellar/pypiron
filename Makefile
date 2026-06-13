@@ -1,4 +1,4 @@
-.PHONY: init init-rust init-python build dev run test test-rust test-python perf compat check cargo-check af fmt lint clean doc build-wheel help
+.PHONY: init init-rust init-python build dev run test test-rust test-python perf compat check cargo-check af fmt lint clean doc build-wheel fuzz fuzz-build help
 
 SHELL := /bin/bash
 
@@ -62,6 +62,16 @@ doc:  ## Generate documentation
 
 build-wheel:  ## Build Python wheel (local smoke-testing; releases happen in CI via git tag)
 	uv run -- maturin build --release
+
+# Coverage-guided fuzzing of the input-parsing modules (needs nightly +
+# `cargo install cargo-fuzz`). TARGET=fuzz_names|fuzz_wheel|fuzz_render, SECS overrides time.
+FUZZ_TARGET ?= fuzz_render
+FUZZ_SECS ?= 60
+fuzz:  ## Run a fuzz target (FUZZ_TARGET=fuzz_render FUZZ_SECS=60)
+	cargo +nightly fuzz run $(FUZZ_TARGET) -- -max_total_time=$(FUZZ_SECS)
+
+fuzz-build:  ## Compile all fuzz targets (CI smoke test)
+	cargo +nightly fuzz build
 
 help:  ## Display this help message
 	@grep -h -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'

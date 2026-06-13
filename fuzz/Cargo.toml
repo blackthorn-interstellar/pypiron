@@ -1,0 +1,51 @@
+[package]
+name = "pypiron-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace: the fuzz crate must not be pulled into the parent
+# package's build (pypiron is a binary crate with no lib to depend on).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1"
+
+# Mirror the parent crate's versions so the fuzzer exercises the same parsers.
+# The targets `include!` the relevant src/*.rs modules directly (see each
+# fuzz_targets/*.rs), so these are the only third-party crates those modules
+# reach for.
+pep440_rs = "0.7.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+html-escape = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+debug = 1
+
+# Each target is its own [[bin]]; cargo-fuzz discovers them by name.
+[[bin]]
+name = "fuzz_names"
+path = "fuzz_targets/fuzz_names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wheel"
+path = "fuzz_targets/fuzz_wheel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_render"
+path = "fuzz_targets/fuzz_render.rs"
+test = false
+doc = false
+bench = false

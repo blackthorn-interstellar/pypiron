@@ -1615,20 +1615,18 @@ impl AppState {
 
     /// The configured uploader credential, if any (both halves required).
     fn uploader_credential(&self) -> Option<(&str, &str)> {
-        self.uploader_user
-            .as_deref()
-            .zip(self.uploader_pass.as_deref())
+        cred_pair(self.uploader_user.as_deref(), self.uploader_pass.as_deref())
     }
 
     /// The configured admin credential, if any. Its presence is what enables
     /// the privileged operations (mirror, delete, yank).
     fn admin_credential(&self) -> Option<(&str, &str)> {
-        self.admin_user.as_deref().zip(self.admin_pass.as_deref())
+        cred_pair(self.admin_user.as_deref(), self.admin_pass.as_deref())
     }
 
     /// The configured read credential, if any (both halves required).
     fn read_credential(&self) -> Option<(&str, &str)> {
-        self.read_user.as_deref().zip(self.read_pass.as_deref())
+        cred_pair(self.read_user.as_deref(), self.read_pass.as_deref())
     }
 
     /// No write credential configured: every write path is disabled and the
@@ -1661,6 +1659,21 @@ impl AppState {
             Some((u, p)) => check_basic_auth(headers, u, p).is_ok() || self.is_uploader(headers),
         }
     }
+}
+
+/// Treat an empty string as an unset value. An empty environment variable
+/// (e.g. `PYPIRON_ADMIN_PASS=`) parses as `Some("")`, not `None` — a common
+/// container/helm footgun (an unset secret, `value: ""`, `$UNSET`).
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.filter(|s| !s.is_empty())
+}
+
+/// Pair a credential's two halves, treating an empty half as unconfigured so
+/// the role disables (fail closed) instead of enabling a bypassable credential.
+/// Because `ct_eq("", "")` is true, an empty password half would otherwise
+/// authenticate any client that sends an empty password.
+fn cred_pair<'a>(user: Option<&'a str>, pass: Option<&'a str>) -> Option<(&'a str, &'a str)> {
+    nonempty(user).zip(nonempty(pass))
 }
 
 /// A filename usable as an artifact key: no path separators, not a dotfile,
@@ -1750,6 +1763,21 @@ mod tests {
         let v = format!("Basic {}", b64.encode(format!("{user}:{pass}")));
         h.insert(header::AUTHORIZATION, HeaderValue::from_str(&v).unwrap());
         h
+    }
+
+    #[test]
+    fn empty_credential_half_is_unconfigured() {
+        // An empty password env var (`PYPIRON_ADMIN_PASS=`) must not enable a
+        // credential: ct_eq("", "") is true, so it would accept any client.
+        assert_eq!(
+            cred_pair(Some("admin"), Some("secret")),
+            Some(("admin", "secret"))
+        );
+        assert_eq!(cred_pair(Some("admin"), Some("")), None);
+        assert_eq!(cred_pair(Some("admin"), None), None);
+        assert_eq!(cred_pair(Some(""), Some("secret")), None);
+        assert_eq!(cred_pair(None, Some("secret")), None);
+        assert_eq!(cred_pair(None, None), None);
     }
 
     #[test]

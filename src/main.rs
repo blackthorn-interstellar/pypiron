@@ -329,6 +329,35 @@ async fn main() -> Result<()> {
 }
 
 async fn run_serve(cli: ServeArgs) -> Result<()> {
+    // Reject a half-configured credential before doing anything else: it can
+    // never authenticate, and a half-set read credential would fail open and
+    // serve every package publicly. Fail loudly at startup rather than silently.
+    for (label, user, pass) in [
+        (
+            "admin (--admin-user/--admin-pass)",
+            &cli.admin_user,
+            &cli.admin_pass,
+        ),
+        (
+            "uploader (--uploader-user/--uploader-pass)",
+            &cli.uploader_user,
+            &cli.uploader_pass,
+        ),
+        (
+            "read (--read-user/--read-pass)",
+            &cli.read_user,
+            &cli.read_pass,
+        ),
+    ] {
+        if let Some(msg) = credential_pair_error(label, user.as_deref(), pass.as_deref()) {
+            anyhow::bail!(
+                "{msg}. Configure both halves or neither: a half-configured credential cannot \
+                 authenticate, and a half-configured read credential would serve every package \
+                 without authentication."
+            );
+        }
+    }
+
     let storage = cli.storage.build().await?;
     let proxy = match cli.proxy_upstream.as_deref() {
         Some(upstream) => Some(Arc::new(proxy::Proxy::new(upstream, &cli.proxy_filter)?)),
@@ -1676,6 +1705,23 @@ fn cred_pair<'a>(user: Option<&'a str>, pass: Option<&'a str>) -> Option<(&'a st
     nonempty(user).zip(nonempty(pass))
 }
 
+/// A half-configured credential pair — exactly one of username/password set
+/// (an empty value counts as unset) — can never authenticate anyone, and a
+/// half-configured *read* credential silently serves every index and artifact
+/// publicly. Returns the error message to fail startup with, or None if the
+/// pair is whole (both set) or absent (neither set).
+fn credential_pair_error(label: &str, user: Option<&str>, pass: Option<&str>) -> Option<String> {
+    match (nonempty(user).is_some(), nonempty(pass).is_some()) {
+        (true, false) => Some(format!(
+            "{label} username is set but its password is empty/unset"
+        )),
+        (false, true) => Some(format!(
+            "{label} password is set but its username is empty/unset"
+        )),
+        _ => None,
+    }
+}
+
 /// A filename usable as an artifact key: no path separators, not a dotfile,
 /// and not a sidecar/metadata companion. The backslash guard matters on the
 /// upload, delete, and yank paths alike — keep them consistent.
@@ -1778,6 +1824,19 @@ mod tests {
         assert_eq!(cred_pair(Some(""), Some("secret")), None);
         assert_eq!(cred_pair(None, Some("secret")), None);
         assert_eq!(cred_pair(None, None), None);
+    }
+
+    #[test]
+    fn half_configured_credential_is_rejected() {
+        // Exactly one half set (empty counts as unset) is a fatal misconfig.
+        assert!(credential_pair_error("read", Some("reader"), None).is_some());
+        assert!(credential_pair_error("read", None, Some("secret")).is_some());
+        assert!(credential_pair_error("read", Some("reader"), Some("")).is_some());
+        assert!(credential_pair_error("read", Some(""), Some("secret")).is_some());
+        // Both halves set, or neither: accepted.
+        assert!(credential_pair_error("read", Some("reader"), Some("secret")).is_none());
+        assert!(credential_pair_error("read", None, None).is_none());
+        assert!(credential_pair_error("read", Some(""), Some("")).is_none());
     }
 
     #[test]

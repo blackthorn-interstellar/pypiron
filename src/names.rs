@@ -78,6 +78,16 @@ pub fn is_normalized(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Normalize `raw` and return it only if the result is a usable PEP 503 name.
+/// Pairs the two halves of the gate — normalize then [`is_normalized`] — so a
+/// caller can't accidentally use a normalized-but-unvalidated name (which could
+/// be empty or otherwise hostile) as a storage path segment. `None` means the
+/// input is not servable.
+pub fn checked_pkg_name(raw: &str) -> Option<String> {
+    let name = normalize_pkg_name(raw);
+    is_normalized(&name).then_some(name)
+}
+
 /// True if normalized `pkg` falls under normalized `prefix`: the prefix
 /// itself or anything below it (`acme` matches `acme` and `acme-foo`,
 /// never `acmefoo`). Cf. PEP 752 reserved namespaces.
@@ -248,6 +258,17 @@ mod tests {
         assert!(!is_normalized("Foo"));
         assert!(!is_normalized("foo..bar"));
         assert!(!is_normalized("-foo"));
+    }
+
+    #[test]
+    fn checked_pkg_name_normalizes_then_validates() {
+        assert_eq!(
+            checked_pkg_name("Foo.Bar_baz").as_deref(),
+            Some("foo-bar-baz")
+        );
+        assert_eq!(checked_pkg_name("  six "), None); // spaces aren't separators; caller must trim
+        assert_eq!(checked_pkg_name("..."), None); // normalizes to empty
+        assert_eq!(checked_pkg_name("foo/bar"), None); // slash survives normalization
     }
 
     #[test]

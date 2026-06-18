@@ -52,9 +52,7 @@ def test_index_etag_roundtrips_304(server):
         etag = headers["etag"]
         assert etag.startswith('"') and etag.endswith('"')
 
-        code, body, headers = http_get(
-            url, headers={**req_headers, "If-None-Match": etag}
-        )
+        code, body, headers = http_get(url, headers={**req_headers, "If-None-Match": etag})
         assert code == 304, f"conditional GET must revalidate to 304 for {url}"
         assert body == b""
         assert headers["etag"] == etag

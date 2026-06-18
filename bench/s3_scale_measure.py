@@ -75,7 +75,10 @@ def make_wheel(name: str, version: str) -> Path:
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{name}.py", f'__version__ = "{version}"\n')
         zf.writestr(f"{di}/METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
-        zf.writestr(f"{di}/WHEEL", "Wheel-Version: 1.0\nGenerator: m\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+        zf.writestr(
+            f"{di}/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: m\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
         zf.writestr(f"{di}/RECORD", "")
     return path
 
@@ -93,9 +96,11 @@ def upload(base: str, wheel: Path) -> None:
     boundary = f"----{uuid.uuid4().hex}"
     parts = []
     for k, v in form.items():
-        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode())
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+        )
     parts.append(
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"content\"; filename=\"{wheel.name}\"\r\n"
+        f'--{boundary}\r\nContent-Disposition: form-data; name="content"; filename="{wheel.name}"\r\n'
         "Content-Type: application/octet-stream\r\n\r\n".encode()
     )
     parts.append(data)
@@ -104,7 +109,10 @@ def upload(base: str, wheel: Path) -> None:
         f"{base}/legacy/",
         data=b"".join(parts),
         method="POST",
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Authorization": basic_auth()},
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Authorization": basic_auth(),
+        },
     )
     urlopen(req, timeout=30).read()
 
@@ -130,7 +138,12 @@ def boot(label: str, audit_on_boot: bool, reconcile: int) -> tuple:
     port = free_port()
     logp = TREE.parent / f"{label}.log"
     log = open(logp, "w")
-    proc = subprocess.Popen([BIN, "serve"], env=server_env(port, audit_on_boot, reconcile), stdout=log, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(
+        [BIN, "serve"],
+        env=server_env(port, audit_on_boot, reconcile),
+        stdout=log,
+        stderr=subprocess.STDOUT,
+    )
     base = f"http://127.0.0.1:{port}"
     deadline = time.time() + 30
     while time.time() < deadline:
@@ -202,7 +215,9 @@ def main() -> int:
 
     pkg_objs = count_objects("packages/")
     results["packages_objects_seeded"] = pkg_objs
-    print(f"== seeded {pkg_objs} objects under packages/ in {results['seed_sync_secs']}s", flush=True)
+    print(
+        f"== seeded {pkg_objs} objects under packages/ in {results['seed_sync_secs']}s", flush=True
+    )
 
     # 3. Cold audit (rebuild everything) + upload->visible while it runs.
     print("== cold audit (rebuild-everything) + concurrent upload", flush=True)
@@ -231,9 +246,15 @@ def main() -> int:
     try:
         assert wait_sweep(base, 600), "cold audit never completed"
         results["cold_audit"] = sweep_line(logp)
-        results["cold_audit"]["metric_rebuilt"] = metric(base, "pypiron_audit_packages_rebuilt_total")
-        results["cold_audit"]["metric_skipped"] = metric(base, "pypiron_audit_packages_skipped_total")
-        results["cold_audit"]["metric_last_duration_s"] = metric(base, "pypiron_audit_last_duration_seconds")
+        results["cold_audit"]["metric_rebuilt"] = metric(
+            base, "pypiron_audit_packages_rebuilt_total"
+        )
+        results["cold_audit"]["metric_skipped"] = metric(
+            base, "pypiron_audit_packages_skipped_total"
+        )
+        results["cold_audit"]["metric_last_duration_s"] = metric(
+            base, "pypiron_audit_last_duration_seconds"
+        )
         th.join(timeout=70)
         results["upload_visible_during_audit_secs"] = probe_visible["secs"]
         sim_objs = count_objects("simple/")
@@ -247,9 +268,15 @@ def main() -> int:
     try:
         assert wait_sweep(base, 600), "steady audit never completed"
         results["steady_audit"] = sweep_line(logp)
-        results["steady_audit"]["metric_rebuilt"] = metric(base, "pypiron_audit_packages_rebuilt_total")
-        results["steady_audit"]["metric_skipped"] = metric(base, "pypiron_audit_packages_skipped_total")
-        results["steady_audit"]["metric_last_duration_s"] = metric(base, "pypiron_audit_last_duration_seconds")
+        results["steady_audit"]["metric_rebuilt"] = metric(
+            base, "pypiron_audit_packages_rebuilt_total"
+        )
+        results["steady_audit"]["metric_skipped"] = metric(
+            base, "pypiron_audit_packages_skipped_total"
+        )
+        results["steady_audit"]["metric_last_duration_s"] = metric(
+            base, "pypiron_audit_last_duration_seconds"
+        )
     finally:
         stop(proc)
 
@@ -258,10 +285,16 @@ def main() -> int:
     #    keys per page; the per-shard ceiling adds up to ~36 partial pages each.
     pkg_objs = count_objects("packages/")
     sim_objs = count_objects("simple/")
-    list_pages = (pkg_objs + 999) // 1000 + (sim_objs + 999) // 1000 + 2 * len(
-        "0123456789abcdefghijklmnopqrstuvwxyz"
+    list_pages = (
+        (pkg_objs + 999) // 1000
+        + (sim_objs + 999) // 1000
+        + 2 * len("0123456789abcdefghijklmnopqrstuvwxyz")
     )
-    results["live_objects"] = {"packages": pkg_objs, "simple": sim_objs, "total": pkg_objs + sim_objs}
+    results["live_objects"] = {
+        "packages": pkg_objs,
+        "simple": sim_objs,
+        "total": pkg_objs + sim_objs,
+    }
     results["audit_list_requests_est"] = list_pages
     results["audit_list_cost_usd"] = round(list_pages / 1000 * 0.005, 4)
 

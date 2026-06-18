@@ -135,7 +135,9 @@ def test_delete_removes_file_then_package(stocked_server):
     assert code == 404
     pkg_dir = server["data_dir"] / "packages" / PACKAGE
     assert not (pkg_dir / new_wheel.name).exists()
-    assert not (pkg_dir / f"{new_wheel.name}.meta.json").exists(), "sidecar must go with the artifact"
+    assert not (pkg_dir / f"{new_wheel.name}.meta.json").exists(), (
+        "sidecar must go with the artifact"
+    )
 
     # Deleting the last file removes the package from both indexes.
     code, _, _ = http_request_auth(

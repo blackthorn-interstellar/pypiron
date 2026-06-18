@@ -18,7 +18,9 @@ NEW_VERSION = "1.17.0"
 pytestmark = pytest.mark.integration
 
 
-def test_upload_returns_only_after_index_visibility(disk_server_sync_uploads, tmp_path, uv_path, uv_venv):
+def test_upload_returns_only_after_index_visibility(
+    disk_server_sync_uploads, tmp_path, uv_path, uv_venv
+):
     server = disk_server_sync_uploads
     creds = {"username": server["user"], "password": server["password"]}
 

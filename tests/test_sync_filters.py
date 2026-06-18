@@ -8,7 +8,7 @@ is the contract, so tree assertions are blackbox assertions.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pytest
 
@@ -190,7 +190,9 @@ def test_exclude_only_platform_tag_keeps_sdists(pypiron_bin, tmp_path):
     )
     pkg_dir = data_dir / "packages" / PACKAGE
     files = sorted(p.name for p in pkg_dir.iterdir() if not p.name.startswith("."))
-    assert any(f.endswith(".tar.gz") for f in files), "the sdist must survive an exclusion-only filter"
+    assert any(f.endswith(".tar.gz") for f in files), (
+        "the sdist must survive an exclusion-only filter"
+    )
 
 
 def test_only_wheels_and_only_sdists_conflict(pypiron_bin, tmp_path):

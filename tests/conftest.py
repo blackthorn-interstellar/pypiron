@@ -122,11 +122,7 @@ def _write_compat_doc(repo_root: Path, results: list[tuple[str, str, str]]) -> N
     doc_path = repo_root / "docs" / "COMPATIBILITY.md"
     doc_path.parent.mkdir(parents=True, exist_ok=True)
 
-    by_cell = {
-        (client, feature): []
-        for client in COMPAT_CLIENTS
-        for feature in COMPAT_FEATURES
-    }
+    by_cell = {(client, feature): [] for client in COMPAT_CLIENTS for feature in COMPAT_FEATURES}
     for client, feature, outcome in results:
         by_cell[(client, feature)].append(outcome)
 
@@ -196,6 +192,7 @@ def _git_short_head(repo_root: Path) -> str:
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
     return cp.stdout.strip() or "unknown"
+
 
 # ----------------------------- Basic path fixtures ----------------------------
 
@@ -587,7 +584,9 @@ def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
     return env
 
 
-def _start_s3_server(tmp_path_factory, pypiron_bin: Path, minio: Dict, extra_env=None) -> Iterator[Dict]:
+def _start_s3_server(
+    tmp_path_factory, pypiron_bin: Path, minio: Dict, extra_env=None
+) -> Iterator[Dict]:
     port = find_free_port()
     bind = f"127.0.0.1:{port}"
     log_path = tmp_path_factory.mktemp("pypiron-s3") / "server.log"
@@ -596,7 +595,9 @@ def _start_s3_server(tmp_path_factory, pypiron_bin: Path, minio: Dict, extra_env
         env.update(extra_env)
 
     with open(log_path, "w") as log_file:
-        proc = subprocess.Popen([str(pypiron_bin)], env=env, stdout=log_file, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(
+            [str(pypiron_bin)], env=env, stdout=log_file, stderr=subprocess.STDOUT
+        )
         try:
             wait_http_ok(f"http://{bind}/simple/index.json", timeout=30.0)
             yield {

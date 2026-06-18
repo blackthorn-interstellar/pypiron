@@ -118,6 +118,7 @@ def test_corrupt_sidecar_omits_file_never_fabricates(disk_server, tmp_path):
 
     # Trigger a rebuild via the other file's yank flip.
     import time as _time
+
     from .helpers import http_request_auth
 
     creds = {"username": disk_server["user"], "password": disk_server["password"]}

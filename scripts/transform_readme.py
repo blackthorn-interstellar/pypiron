@@ -31,9 +31,7 @@ def _ref() -> str:
     tomllib so the script runs on the older Pythons some CI runners default to.
     """
     text = Path("Cargo.toml").read_text(encoding="utf8")
-    match = re.search(
-        r'(?ms)^\[package\][^\[]*?^version\s*=\s*"([^"]+)"', text
-    )
+    match = re.search(r'(?ms)^\[package\][^\[]*?^version\s*=\s*"([^"]+)"', text)
     if not match:
         raise ValueError("could not find [package] version in Cargo.toml")
     version = match.group(1)

@@ -25,7 +25,6 @@ import json
 import os
 import shlex
 import subprocess
-import sys
 import threading
 import time
 import urllib.error
@@ -58,7 +57,9 @@ def _auth_header(user: str, password: str) -> str:
     return "Basic " + base64.b64encode(token).decode("ascii")
 
 
-def http_get(url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 30.0) -> Tuple[int, bytes, Dict[str, str]]:
+def http_get(
+    url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 30.0
+) -> Tuple[int, bytes, Dict[str, str]]:
     req = urllib.request.Request(url, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -95,7 +96,9 @@ def make_wheel_bytes(name: str, version: str, payload_size: int) -> bytes:
         f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
         f"Requires-Python: >=3.8\nSummary: pypiron bench corpus\n"
     )
-    wheel_meta = "Wheel-Version: 1.0\nGenerator: pypiron-bench\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+    wheel_meta = (
+        "Wheel-Version: 1.0\nGenerator: pypiron-bench\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+    )
     di = f"{name}-{version}.dist-info"
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
@@ -178,7 +181,9 @@ def upload_wheel(
         return e.code, e.read()
 
 
-def wait_visible(base_url: str, pkg: str, filename: str, timeout: float = 120.0, poll: float = 0.05) -> float:
+def wait_visible(
+    base_url: str, pkg: str, filename: str, timeout: float = 120.0, poll: float = 0.05
+) -> float:
     """Seconds until filename appears in the package JSON index."""
     t0 = time.perf_counter()
     deadline = time.time() + timeout
@@ -245,7 +250,18 @@ def run_oha(
 ) -> Dict:
     # -r 0: never follow redirects — a 302 scenario measures the 302, and
     # following presigned URLs at full blast exhausts loopback ephemeral ports.
-    cmd = [oha, "--no-tui", "--output-format", "json", "-r", "0", "-z", duration, "-c", str(connections)]
+    cmd = [
+        oha,
+        "--no-tui",
+        "--output-format",
+        "json",
+        "-r",
+        "0",
+        "-z",
+        duration,
+        "-c",
+        str(connections),
+    ]
     for h in headers or []:
         cmd += ["-H", h]
     cmd.append(url)
@@ -294,7 +310,13 @@ def seed(args: argparse.Namespace) -> None:
     def upload_one(pkg: str, version: str, tag: str = "py3-none-any", size: int = 1024) -> str:
         fname = wheel_filename(pkg, version, tag)
         status, body = upload_wheel(
-            legacy, fname, make_wheel_bytes(pkg, version, size), pkg, version, args.user, args.password
+            legacy,
+            fname,
+            make_wheel_bytes(pkg, version, size),
+            pkg,
+            version,
+            args.user,
+            args.password,
         )
         # 409 = already seeded (filename immutability); re-seeding is a no-op.
         if status not in (200, 409):
@@ -327,9 +349,7 @@ def seed(args: argparse.Namespace) -> None:
         jobs.append((version, f"{py.split('-')[0]}-{py.split('-')[1]}-{plat}"))
     last_torch = ""
     with ThreadPoolExecutor(max_workers=args.seed_concurrency) as pool:
-        names = list(
-            pool.map(lambda j: upload_one(TORCH_PKG, j[0], j[1]), jobs)
-        )
+        names = list(pool.map(lambda j: upload_one(TORCH_PKG, j[0], j[1]), jobs))
         last_torch = names[-1]
 
     print("waiting for index visibility (worker catches up)...")
@@ -354,7 +374,9 @@ def run(args: argparse.Namespace) -> None:
     # Pick a torchsim artifact + capture the small-index ETag up front.
     status, body, _ = http_get(f"{base}/simple/{TORCH_PKG}/index.json")
     if status != 200:
-        raise RuntimeError(f"corpus missing: /simple/{TORCH_PKG}/ -> {status}; run `meter.py seed` first")
+        raise RuntimeError(
+            f"corpus missing: /simple/{TORCH_PKG}/ -> {status}; run `meter.py seed` first"
+        )
     torch_file = json.loads(body)["files"][0]["filename"]
     status, _, hdrs = http_get(f"{base}/simple/{SMALL_PKG}/index.json")
     etag = next((v for k, v in hdrs.items() if k.lower() == "etag"), "")
@@ -367,8 +389,12 @@ def run(args: argparse.Namespace) -> None:
 
     print("R3: 304 revalidation")
     results["R3_304"] = run_oha(
-        oha, f"{base}/simple/{SMALL_PKG}/index.json", dur, conns,
-        headers=[f"If-None-Match: {etag}"], expect_status=304,
+        oha,
+        f"{base}/simple/{SMALL_PKG}/index.json",
+        dur,
+        conns,
+        headers=[f"If-None-Match: {etag}"],
+        expect_status=304,
     )
 
     print("R2-lite: torch-shaped index read")
@@ -378,14 +404,22 @@ def run(args: argparse.Namespace) -> None:
     # (uv) get 302s — so R6 presents a uv User-Agent. Metadata always streams.
     print("R6: artifact 302 redirects (uv client)")
     results["R6_302"] = run_oha(
-        oha, f"{base}/files/{TORCH_PKG}/{torch_file}", dur, conns,
-        headers=["User-Agent: uv/0.7.0"], expect_status=302,
+        oha,
+        f"{base}/files/{TORCH_PKG}/{torch_file}",
+        dur,
+        conns,
+        headers=["User-Agent: uv/0.7.0"],
+        expect_status=302,
     )
 
     print("R7: PEP 658 metadata fetches")
     results["R7_metadata"] = run_oha(
-        oha, f"{base}/files/{TORCH_PKG}/{torch_file}.metadata", dur, conns,
-        headers=["User-Agent: uv/0.7.0"], expect_status=200,
+        oha,
+        f"{base}/files/{TORCH_PKG}/{torch_file}.metadata",
+        dur,
+        conns,
+        headers=["User-Agent: uv/0.7.0"],
+        expect_status=200,
     )
 
     print(f"W3: upload->visible latency x{W3_ITERATIONS}")
@@ -394,7 +428,9 @@ def run(args: argparse.Namespace) -> None:
     for i in range(W3_ITERATIONS):
         v = f"0.{int(time.time())}.{i}"
         fname = wheel_filename(W3_PKG, v)
-        s, b = upload_wheel(legacy, fname, make_wheel_bytes(W3_PKG, v, 1024), W3_PKG, v, args.user, args.password)
+        s, b = upload_wheel(
+            legacy, fname, make_wheel_bytes(W3_PKG, v, 1024), W3_PKG, v, args.user, args.password
+        )
         if s != 200:
             raise RuntimeError(f"W3 upload failed: {s} {b[:200]!r}")
         lat.append(wait_visible(base, W3_PKG, fname))
@@ -426,7 +462,15 @@ def run(args: argparse.Namespace) -> None:
             v = f"0.{int(time.time())}.{i}"
             fname = wheel_filename(W4_PKG, v)
             t0 = time.perf_counter()
-            s, b = upload_wheel(legacy, fname, make_wheel_bytes(W4_PKG, v, 1024), W4_PKG, v, args.user, args.password)
+            s, b = upload_wheel(
+                legacy,
+                fname,
+                make_wheel_bytes(W4_PKG, v, 1024),
+                W4_PKG,
+                v,
+                args.user,
+                args.password,
+            )
             lat.append(time.perf_counter() - t0)
             if s != 200:
                 raise RuntimeError(f"W4 upload failed: {s} {b[:200]!r}")
@@ -461,20 +505,30 @@ def run(args: argparse.Namespace) -> None:
     if args.skip_torch_upload:
         results["W1_torch_900mb"] = {"skipped": "--skip-torch-upload"}
     else:
-        print(f"W1-torch: {TORCH_UPLOAD_MB} MB upload (expected to fail on 2 GiB boxes until streaming)")
+        print(
+            f"W1-torch: {TORCH_UPLOAD_MB} MB upload (expected to fail on 2 GiB boxes until streaming)"
+        )
         v = f"0.{int(time.time())}.0"
         fname = wheel_filename(TORCH_UPLOAD_PKG, v)
         blob = make_wheel_bytes(TORCH_UPLOAD_PKG, v, TORCH_UPLOAD_MB << 20)
         with RssSampler(args.rss_cmd) as rss:
             t0 = time.perf_counter()
             try:
-                s, b = upload_wheel(legacy, fname, blob, TORCH_UPLOAD_PKG, v, args.user, args.password, timeout=900)
+                s, b = upload_wheel(
+                    legacy, fname, blob, TORCH_UPLOAD_PKG, v, args.user, args.password, timeout=900
+                )
                 wall = time.perf_counter() - t0
-                outcome = {"result": "PASS" if s == 200 else f"FAIL(status {s})", "wall_s": round(wall, 2)}
+                outcome = {
+                    "result": "PASS" if s == 200 else f"FAIL(status {s})",
+                    "wall_s": round(wall, 2),
+                }
                 if s != 200:
                     outcome["body"] = b[:200].decode("utf-8", "replace")
             except (urllib.error.URLError, ConnectionError, OSError, TimeoutError) as e:
-                outcome = {"result": f"FAIL({type(e).__name__})", "wall_s": round(time.perf_counter() - t0, 2)}
+                outcome = {
+                    "result": f"FAIL({type(e).__name__})",
+                    "wall_s": round(time.perf_counter() - t0, 2),
+                }
         outcome["peak_rss_mb"] = rss.peak_mb
         outcome["size_mb"] = TORCH_UPLOAD_MB
         results["W1_torch_900mb"] = outcome
@@ -498,9 +552,12 @@ def run(args: argparse.Namespace) -> None:
 
 def git_commit() -> str:
     try:
-        return subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=10
-        ).stdout.strip() or "unknown"
+        return (
+            subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=10
+            ).stdout.strip()
+            or "unknown"
+        )
     except (subprocess.SubprocessError, OSError):
         return "unknown"
 
@@ -573,9 +630,13 @@ def main() -> None:
     rn.add_argument("--connections", type=int, default=64)
     rn.add_argument("--rig", default="local")
     rn.add_argument("--rss-cmd", default=None, help="command printing server RSS in KB")
-    rn.add_argument("--restart-cmd", default=None, help="`<cmd> <default|sync|proxy>` restarts server in mode")
+    rn.add_argument(
+        "--restart-cmd", default=None, help="`<cmd> <default|sync|proxy>` restarts server in mode"
+    )
     rn.add_argument("--skip-torch-upload", action="store_true")
-    rn.add_argument("--commit", default=None, help="commit hash override (loadgen copies have no .git)")
+    rn.add_argument(
+        "--commit", default=None, help="commit hash override (loadgen copies have no .git)"
+    )
     rn.add_argument("--output", default=None, help="write results JSON here")
     rn.set_defaults(fn=run)
 

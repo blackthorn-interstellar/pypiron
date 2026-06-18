@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from .helpers import (
-    http_get,
     http_get_no_redirect,
     make_wheel,
     upload_legacy,
@@ -18,9 +17,7 @@ pytestmark = pytest.mark.integration
 def test_non_normalized_name_redirects(disk_server, tmp_path):
     server = disk_server
     wheel = make_wheel("RedirDemo", "1.0", tmp_path)
-    upload_legacy(
-        server["legacy"], wheel, username=server["user"], password=server["password"]
-    )
+    upload_legacy(server["legacy"], wheel, username=server["user"], password=server["password"])
     wait_for_file_in_index(server["simple"], "redirdemo", wheel.name)
 
     code, _, headers = http_get_no_redirect(f"{server['simple']}RedirDemo/")

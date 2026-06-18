@@ -21,7 +21,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import boto3
-
 from meter import make_wheel_bytes, wheel_filename
 
 
@@ -67,9 +66,7 @@ def main() -> None:
     session = boto3.session.Session()
     # One client shared across threads: boto3 clients are thread-safe and the
     # connection pool does the rest.
-    s3 = session.client(
-        "s3", config=boto3.session.Config(max_pool_connections=args.threads * 2)
-    )
+    s3 = session.client("s3", config=boto3.session.Config(max_pool_connections=args.threads * 2))
 
     names = [f"{args.prefix}-{i:06d}" for i in range(args.start, args.packages)]
     t0 = time.time()

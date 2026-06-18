@@ -56,12 +56,10 @@ def test_pip_resolves_with_pep658_metadata(pip_six_server, pip_venv):
     assert f"Would install {PACKAGE}-{VERSION}" in output
 
     log = pip_six_server["log_path"].read_text()
-    assert (
-        f"GET /files/{PACKAGE}/{wheel_name}.metadata" in log
-    ), "pip should fetch the PEP 658 metadata companion"
-    wheel_fetches = re.findall(
-        rf"GET /files/{PACKAGE}/{re.escape(wheel_name)}$", log, re.MULTILINE
+    assert f"GET /files/{PACKAGE}/{wheel_name}.metadata" in log, (
+        "pip should fetch the PEP 658 metadata companion"
     )
+    wheel_fetches = re.findall(rf"GET /files/{PACKAGE}/{re.escape(wheel_name)}$", log, re.MULTILINE)
     assert not wheel_fetches, "resolution must not download the wheel itself"
 
 

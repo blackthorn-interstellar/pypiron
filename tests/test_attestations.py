@@ -17,7 +17,6 @@ import json
 import pytest
 
 from .helpers import (
-    ACCEPT_PEP691,
     get_index_json,
     http_get,
     http_request_auth,
@@ -148,7 +147,9 @@ def test_proxy_relays_and_caches_provenance(proxy_pair, tmp_path):
     _mirror_upload(upstream, wheel, pkg)
 
     # The proxied page re-advertises provenance under the proxy's own URL.
-    entry = next(f for f in get_index_json(proxy["simple"], pkg)["files"] if f["filename"] == wheel.name)
+    entry = next(
+        f for f in get_index_json(proxy["simple"], pkg)["files"] if f["filename"] == wheel.name
+    )
     assert entry["provenance"] == f"/files/{pkg}/{wheel.name}.provenance"
 
     # Before the wheel is cached, provenance streams through from upstream.

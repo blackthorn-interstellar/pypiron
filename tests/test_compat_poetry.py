@@ -26,9 +26,7 @@ def _module_name(package_name: str) -> str:
     return re.sub(r"\W+", "_", package_name).strip("_").lower()
 
 
-def _poetry_env(
-    tmp_path: Path, disk_server, *, in_project_venv: bool = False
-) -> dict[str, str]:
+def _poetry_env(tmp_path: Path, disk_server, *, in_project_venv: bool = False) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
         {

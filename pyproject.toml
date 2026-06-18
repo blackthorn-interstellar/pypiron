@@ -44,6 +44,7 @@ dev = [
     "pytest>=7",
     "pytest-xdist>=3",
     "requests>=2.31",
+    "ruff>=0.15",
     "tenacity>=8.2",
     "twine",
     "uv",
@@ -62,3 +63,12 @@ addopts = "-m 'not perf and not stress'"
 testpaths = [
     "tests",
 ]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# Deliberately minimal: pyflakes (real bugs — unused imports, undefined names)
+# plus import sorting. Line length and other style are left to the formatter,
+# not enforced as lint noise.
+select = ["F", "I"]

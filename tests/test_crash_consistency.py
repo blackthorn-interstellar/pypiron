@@ -181,9 +181,7 @@ def _basic_auth() -> str:
 
 @pytest.mark.chaos
 @pytest.mark.parametrize("kill_point", range(1, 16))
-def test_crash_during_upload_converges(
-    pypiron_bin: Path, tmp_path: Path, kill_point: int
-) -> None:
+def test_crash_during_upload_converges(pypiron_bin: Path, tmp_path: Path, kill_point: int) -> None:
     """Kill the process before the Nth write during a fresh-package upload
     (covers boot init, origin claim, intent, artifact, companion, sidecar,
     commit, and the worker's view/global writes)."""
@@ -202,9 +200,7 @@ def test_crash_during_upload_converges(
 
 @pytest.mark.chaos
 @pytest.mark.parametrize("kill_point", range(1, 9))
-def test_crash_during_yank_converges(
-    pypiron_bin: Path, tmp_path: Path, kill_point: int
-) -> None:
+def test_crash_during_yank_converges(pypiron_bin: Path, tmp_path: Path, kill_point: int) -> None:
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     wheel = make_wheel("chaos-yank", "1.0", tmp_path)
@@ -236,9 +232,7 @@ def test_crash_during_yank_converges(
 
 @pytest.mark.chaos
 @pytest.mark.parametrize("kill_point", range(1, 13))
-def test_crash_during_delete_converges(
-    pypiron_bin: Path, tmp_path: Path, kill_point: int
-) -> None:
+def test_crash_during_delete_converges(pypiron_bin: Path, tmp_path: Path, kill_point: int) -> None:
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     wheel = make_wheel("chaos-delete", "1.0", tmp_path)
@@ -285,9 +279,7 @@ def test_multi_node_s3_uploads_converge(pypiron_bin: Path, minio, tmp_path: Path
         env = _s3_env(minio, f"127.0.0.1:{port}")
         env.update(event_only_env)
         log = open(tmp_path / f"node-{port}.log", "w")
-        proc = subprocess.Popen(
-            [str(pypiron_bin)], env=env, stdout=log, stderr=subprocess.STDOUT
-        )
+        proc = subprocess.Popen([str(pypiron_bin)], env=env, stdout=log, stderr=subprocess.STDOUT)
         wait_http_responding(f"http://127.0.0.1:{port}/health", timeout=30)
         return proc, f"http://127.0.0.1:{port}"
 
@@ -301,12 +293,8 @@ def test_multi_node_s3_uploads_converge(pypiron_bin: Path, minio, tmp_path: Path
                 wheel = make_wheel(name, "1.0", tmp_path)
                 attempt(upload_legacy, f"{base}/legacy/", wheel, **AUTH)
 
-        t_a = threading.Thread(
-            target=uploads, args=(base_a, [f"dual-{i}" for i in range(6)])
-        )
-        t_b = threading.Thread(
-            target=uploads, args=(base_b, [f"dual-{i}" for i in range(3, 9)])
-        )
+        t_a = threading.Thread(target=uploads, args=(base_a, [f"dual-{i}" for i in range(6)]))
+        t_b = threading.Thread(target=uploads, args=(base_b, [f"dual-{i}" for i in range(3, 9)]))
         t_a.start()
         t_b.start()
         t_a.join()
@@ -473,7 +461,9 @@ def _assert_s3_converges(
 ) -> None:
     """Bring up a clean node to drain any pending markers, then poll the oracle
     until storage converges (views == recomputed-from-truth)."""
-    node = _start_s3_node(pypiron_bin, minio, tmp_path, f"recover-{int(time.time()*1000)%100000}")
+    node = _start_s3_node(
+        pypiron_bin, minio, tmp_path, f"recover-{int(time.time() * 1000) % 100000}"
+    )
     try:
         deadline = time.time() + timeout
         result = None
@@ -536,10 +526,15 @@ def test_ungraceful_failover_under_churn(pypiron_bin: Path, minio, tmp_path: Pat
         t0 = time.time()
         upload_legacy(f"{follower['base']}/legacy/", probe, **AUTH)
         wait_for_file_in_index(
-            f"{follower['base']}/simple/", "failover-probe", probe.name, timeout=FAILOVER_BUDGET_SECS
+            f"{follower['base']}/simple/",
+            "failover-probe",
+            probe.name,
+            timeout=FAILOVER_BUDGET_SECS,
         )
         latency = time.time() - t0
-        assert latency < FAILOVER_BUDGET_SECS, f"post-kill upload took {latency:.1f}s (unbounded outage)"
+        assert latency < FAILOVER_BUDGET_SECS, (
+            f"post-kill upload took {latency:.1f}s (unbounded outage)"
+        )
     finally:
         stop.set()
         for t in threads:
@@ -578,8 +573,7 @@ def test_dual_leadership_overlap_triggers_cas_conflict(
 
         # 3. The follower waits out the (now un-renewed) lease and steals it.
         assert _wait_for_steal(follower, FAILOVER_BUDGET_SECS), (
-            "follower never stole the lease from the frozen leader:\n"
-            f"{_log_text(follower)[-1500:]}"
+            f"follower never stole the lease from the frozen leader:\n{_log_text(follower)[-1500:]}"
         )
 
         # 4. New leader changes the global name set → global index ETag advances

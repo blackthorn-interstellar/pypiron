@@ -36,7 +36,6 @@ import os
 import random
 import re
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -97,8 +96,7 @@ def cmd_seed(args: argparse.Namespace) -> None:
     done_files = 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [
-            pool.submit(seed_package, packages_root / name, name, count)
-            for name, count in sample
+            pool.submit(seed_package, packages_root / name, name, count) for name, count in sample
         ]
         for i, fut in enumerate(futures, 1):
             done_files += fut.result()
@@ -216,7 +214,9 @@ def upload_visibility_secs(base: str, user: str, password: str) -> float:
         )
     parts.append(
         f'--{boundary}\r\nContent-Disposition: form-data; name="content"; filename="{filename}"\r\n'
-        f"Content-Type: application/octet-stream\r\n\r\n".encode() + wheel + b"\r\n"
+        f"Content-Type: application/octet-stream\r\n\r\n".encode()
+        + wheel
+        + b"\r\n"
     )
     parts.append(f"--{boundary}--\r\n".encode())
     body = b"".join(parts)
@@ -225,8 +225,7 @@ def upload_visibility_secs(base: str, user: str, password: str) -> float:
         data=body,
         headers={
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Authorization": "Basic "
-            + base64.b64encode(f"{user}:{password}".encode()).decode(),
+            "Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode(),
         },
     )
     t0 = time.monotonic()
@@ -309,9 +308,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         results["package_index_json"] = time_get(f"{base}/simple/{pkg}/index.json")
 
         # Write visibility while the corpus is at full size.
-        results["upload_visible_secs"] = round(
-            upload_visibility_secs(base, "admin", "secret"), 2
-        )
+        results["upload_visible_secs"] = round(upload_visibility_secs(base, "admin", "secret"), 2)
         results["rss_final_mb"] = round(rss_mb(proc.pid), 1)
     finally:
         stop(proc)

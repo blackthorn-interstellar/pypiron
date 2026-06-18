@@ -37,3 +37,12 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "gzip", "brotli", "zstd", "stream"] }
 pep440_rs = "0.7.3"
 toml = "1.1.2"
+
+# Policy as data: these apply to local `cargo clippy` and rust-analyzer, not just
+# the CI `-D warnings` gate. Kept deliberately small — no clippy::pedantic.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "warn"
+exit = "warn"

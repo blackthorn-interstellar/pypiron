@@ -171,6 +171,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: ./.github/stamp-version.sh "$GITHUB_REF_NAME"
+      # Make the README baked into the wheel/sdist metadata render on PyPI:
+      # rewrite its repo-relative links/logo to absolute URLs (pinned to the
+      # stamped tag). The committed file stays GitHub-relative.
+      - name: Rewrite README links to absolute URLs for PyPI
+        shell: bash
+        run: command -v python3 >/dev/null 2>&1 && python3 scripts/transform_readme.py --target pypi || python scripts/transform_readme.py --target pypi
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -208,6 +214,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: ./.github/stamp-version.sh "$GITHUB_REF_NAME"
+      # Make the README baked into the wheel/sdist metadata render on PyPI:
+      # rewrite its repo-relative links/logo to absolute URLs (pinned to the
+      # stamped tag). The committed file stays GitHub-relative.
+      - name: Rewrite README links to absolute URLs for PyPI
+        shell: bash
+        run: command -v python3 >/dev/null 2>&1 && python3 scripts/transform_readme.py --target pypi || python scripts/transform_readme.py --target pypi
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -243,6 +255,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: ./.github/stamp-version.sh "$GITHUB_REF_NAME"
+      # Make the README baked into the wheel/sdist metadata render on PyPI:
+      # rewrite its repo-relative links/logo to absolute URLs (pinned to the
+      # stamped tag). The committed file stays GitHub-relative.
+      - name: Rewrite README links to absolute URLs for PyPI
+        shell: bash
+        run: command -v python3 >/dev/null 2>&1 && python3 scripts/transform_readme.py --target pypi || python scripts/transform_readme.py --target pypi
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -273,6 +291,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: ./.github/stamp-version.sh "$GITHUB_REF_NAME"
+      # Make the README baked into the wheel/sdist metadata render on PyPI:
+      # rewrite its repo-relative links/logo to absolute URLs (pinned to the
+      # stamped tag). The committed file stays GitHub-relative.
+      - name: Rewrite README links to absolute URLs for PyPI
+        shell: bash
+        run: command -v python3 >/dev/null 2>&1 && python3 scripts/transform_readme.py --target pypi || python scripts/transform_readme.py --target pypi
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -296,6 +320,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: ./.github/stamp-version.sh "$GITHUB_REF_NAME"
+      # Make the README baked into the wheel/sdist metadata render on PyPI:
+      # rewrite its repo-relative links/logo to absolute URLs (pinned to the
+      # stamped tag). The committed file stays GitHub-relative.
+      - name: Rewrite README links to absolute URLs for PyPI
+        shell: bash
+        run: command -v python3 >/dev/null 2>&1 && python3 scripts/transform_readme.py --target pypi || python scripts/transform_readme.py --target pypi
       - name: Build sdist
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:

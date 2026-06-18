@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use crate::render::{FileMetadata, SIMPLE_JSON_CONTENT_TYPE};
 use crate::sidecar::Yanked;
+use crate::status::ProjectStatusDoc;
 
 /// One file from a PEP 691 listing (PEP 700 + PEP 658/714 + PEP 740 fields).
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +77,26 @@ impl SimpleFile {
 pub struct SimpleIndex {
     #[serde(default)]
     pub files: Vec<SimpleFile>,
+    /// PEP 792 project status, relayed verbatim. We are CONSUMING someone
+    /// else's index here, so an unknown/foreign marker degrades to `None`
+    /// (== active) rather than failing the whole listing — the opposite of our
+    /// own fail-closed [`crate::status::read_status`].
+    #[serde(
+        rename = "project-status",
+        default,
+        deserialize_with = "lenient_status"
+    )]
+    pub project_status: Option<ProjectStatusDoc>,
+}
+
+/// Parse the upstream `project-status` object, swallowing anything we don't
+/// recognize (a future fifth marker must not break mirroring the whole index).
+fn lenient_status<'de, D>(de: D) -> Result<Option<ProjectStatusDoc>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(de)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// Fetch a package's PEP 691 JSON listing from `base`. `Ok(None)` on a 404 —
@@ -139,6 +160,33 @@ mod tests {
         assert_eq!(bare.sha256(), None);
         assert!(!bare.has_core_metadata());
         assert!(!bare.as_file_metadata().provenance);
+    }
+
+    #[test]
+    fn project_status_relays_from_upstream_and_degrades_safely() {
+        use crate::status::ProjectStatus;
+
+        let archived: SimpleIndex = serde_json::from_value(serde_json::json!({
+            "files": [],
+            "project-status": {"status": "archived", "reason": "moved"}
+        }))
+        .unwrap();
+        let doc = archived.project_status.unwrap();
+        assert_eq!(doc.status, ProjectStatus::Archived);
+        assert_eq!(doc.reason.as_deref(), Some("moved"));
+
+        // Absent → None (== active).
+        let plain: SimpleIndex =
+            serde_json::from_value(serde_json::json!({ "files": [] })).unwrap();
+        assert!(plain.project_status.is_none());
+
+        // An unknown/foreign marker must NOT fail the whole listing.
+        let future: SimpleIndex = serde_json::from_value(serde_json::json!({
+            "files": [],
+            "project-status": {"status": "hexed"}
+        }))
+        .unwrap();
+        assert!(future.project_status.is_none());
     }
 
     #[test]

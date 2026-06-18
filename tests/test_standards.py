@@ -83,7 +83,7 @@ def test_pep691_global_json(indexed_server):
     import json
 
     doc = json.loads(body)
-    assert doc["meta"]["api-version"] == "1.3"
+    assert doc["meta"]["api-version"] == "1.4"
     assert PACKAGE in [p["name"] for p in doc["projects"]]
 
 
@@ -91,9 +91,12 @@ def test_pep700_package_json_fields(indexed_server):
     doc = indexed_server["package_index"]
     wheel_path = indexed_server["wheel_path"]
 
-    assert doc["meta"]["api-version"] == "1.3"
+    assert doc["meta"]["api-version"] == "1.4"
     assert doc["name"] == PACKAGE
     assert VERSION in doc["versions"]
+    # An ordinary active project carries no project-status marker (PEP 792
+    # lets us omit it, and we do).
+    assert "project-status" not in doc
 
     (entry,) = [f for f in doc["files"] if f["filename"] == wheel_path.name]
     assert entry["hashes"]["sha256"] == sha256_file(wheel_path)

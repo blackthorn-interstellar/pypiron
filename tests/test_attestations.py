@@ -71,8 +71,8 @@ def test_mirror_upload_stores_serves_and_advertises_provenance(disk_server, tmp_
     # Tied to an immutable artifact, cached like one.
     assert headers["cache-control"] == "public, max-age=31536000, immutable"
 
-    # The index advertises it (JSON `provenance` + api-version 1.3).
-    assert index["meta"]["api-version"] == "1.3"
+    # The index advertises it (JSON `provenance` + api-version 1.4).
+    assert index["meta"]["api-version"] == "1.4"
     (entry,) = index["files"]
     assert entry["provenance"] == f"/files/{pkg}/{wheel.name}.provenance"
 

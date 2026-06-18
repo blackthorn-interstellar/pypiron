@@ -77,6 +77,7 @@ mod tests {
         assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.metadata"));
         assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.provenance"));
         assert!(!is_artifact(".origin"));
+        assert!(!is_artifact(".project-status.json"));
         assert!(!is_artifact(""));
     }
 

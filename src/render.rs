@@ -4,10 +4,13 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::names::infer_version_from_filename;
 use crate::sidecar::{Sidecar, Yanked};
+use crate::status::ProjectStatusDoc;
 
-/// Simple API version: PEP 691 (1.0) + PEP 700 fields (1.1) + PEP 714
-/// `core-metadata` (1.2) + PEP 740 `provenance` (1.3).
-const API_VERSION: &str = "1.3";
+/// Simple API version lineage: 1.0 PEP 629 (initial) · 1.1 PEP 700 (`versions`,
+/// file `size`/`upload-time`) · 1.2 PEP 708 "tracks"/alternate-locations (out of
+/// scope, see STANDARDS.md) · 1.3 PEP 740 `provenance` · 1.4 PEP 792 project
+/// status markers.
+const API_VERSION: &str = "1.4";
 
 /// PEP 691 JSON simple-API content type (response, outgoing/incoming Accept).
 pub const SIMPLE_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
@@ -59,12 +62,35 @@ impl FileMetadata {
     }
 }
 
-/// Render minimal PEP 503 per‑package HTML (with PEP 629 version meta).
-pub fn pep503_package_html(package: &str, files: &[FileMetadata]) -> String {
+/// Render minimal PEP 503 per‑package HTML (with PEP 629 version meta and, for
+/// a non-active project, the PEP 792 `pypi:project-status` meta). Quarantine
+/// link-omission is the caller's job — it passes an empty `files` slice.
+pub fn pep503_package_html(
+    package: &str,
+    files: &[FileMetadata],
+    status: &ProjectStatusDoc,
+) -> String {
     // Links are relative to the API under /files/<pkg>/<filename>
     let mut body = String::new();
     body.push_str(&format!(
-        r#"<html><head><meta name="pypi:repository-version" content="{API_VERSION}"><title>Links for {}</title></head><body>"#,
+        r#"<html><head><meta name="pypi:repository-version" content="{API_VERSION}">"#
+    ));
+    // PEP 792: emit the status marker only when non-active (active MAY be, and
+    // here is, omitted). `reason` is arbitrary text, so it must be escaped.
+    if !status.status.is_active() {
+        body.push_str(&format!(
+            r#"<meta name="pypi:project-status" content="{}">"#,
+            status.status.as_str()
+        ));
+        if let Some(reason) = &status.reason {
+            body.push_str(&format!(
+                r#"<meta name="pypi:project-status-reason" content="{}">"#,
+                encode_double_quoted_attribute(reason)
+            ));
+        }
+    }
+    body.push_str(&format!(
+        r#"<title>Links for {}</title></head><body>"#,
         encode_text(package)
     ));
     // The package name is the same in every link's href; encode it once.
@@ -150,6 +176,10 @@ struct Pep691PkgIndex<'a> {
     #[serde(rename = "meta")]
     meta: Pep691Meta<'a>,
     name: &'a str,
+    /// PEP 792 (top-level, NOT nested in `meta` — the spec's nested example is
+    /// a known doc bug). Omitted for an active project.
+    #[serde(rename = "project-status", skip_serializing_if = "Option::is_none")]
+    project_status: Option<&'a ProjectStatusDoc>,
     versions: Vec<String>,
     files: Vec<Pep691File>,
 }
@@ -160,8 +190,14 @@ struct Pep691Meta<'a> {
     api_version: &'a str,
 }
 
-/// PEP 691 + PEP 700 package JSON.
-pub fn pep691_package_json(package: &str, files: &[FileMetadata]) -> String {
+/// PEP 691 + PEP 700 package JSON (with the PEP 792 `project-status` object for
+/// a non-active project). Quarantine link-omission is the caller's job — it
+/// passes an empty `files` slice, which empties `versions` too.
+pub fn pep691_package_json(
+    package: &str,
+    files: &[FileMetadata],
+    status: &ProjectStatusDoc,
+) -> String {
     let versions: Vec<String> = files
         .iter()
         .filter_map(|f| {
@@ -200,6 +236,7 @@ pub fn pep691_package_json(package: &str, files: &[FileMetadata]) -> String {
             api_version: API_VERSION,
         },
         name: package,
+        project_status: (!status.status.is_active()).then_some(status),
         versions,
         files,
     };
@@ -243,6 +280,7 @@ pub fn pep691_global_json(packages: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::ProjectStatus;
 
     fn meta(version: Option<&str>) -> FileMetadata {
         FileMetadata {
@@ -258,11 +296,15 @@ mod tests {
         }
     }
 
+    fn active() -> ProjectStatusDoc {
+        ProjectStatusDoc::default()
+    }
+
     #[test]
     fn package_json_has_pep700_fields() {
-        let json = pep691_package_json("six", &[meta(Some("1.16.0"))]);
+        let json = pep691_package_json("six", &[meta(Some("1.16.0"))], &active());
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(doc["meta"]["api-version"], "1.3");
+        assert_eq!(doc["meta"]["api-version"], "1.4");
         assert_eq!(doc["versions"][0], "1.16.0");
         assert_eq!(doc["files"][0]["size"], 11236);
         assert_eq!(doc["files"][0]["upload-time"], "2026-06-11T00:00:00Z");
@@ -270,17 +312,77 @@ mod tests {
 
     #[test]
     fn package_json_versions_fall_back_to_filename_inference() {
-        let json = pep691_package_json("six", &[meta(None)]);
+        let json = pep691_package_json("six", &[meta(None)], &active());
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(doc["versions"][0], "1.16.0");
     }
 
     #[test]
     fn package_html_has_hash_fragment_and_version_meta() {
-        let html = pep503_package_html("six", &[meta(None)]);
+        let html = pep503_package_html("six", &[meta(None)], &active());
         assert!(html.contains("#sha256=abc123"));
         assert!(!html.contains("data-yanked"));
-        assert!(html.contains(r#"<meta name="pypi:repository-version" content="1.3">"#));
+        assert!(html.contains(r#"<meta name="pypi:repository-version" content="1.4">"#));
+    }
+
+    #[test]
+    fn active_status_is_omitted_entirely() {
+        // PEP 792 lets us omit the active marker; we do, in both formats.
+        let html = pep503_package_html("six", &[meta(Some("1.16.0"))], &active());
+        assert!(!html.contains("pypi:project-status"));
+
+        let doc: serde_json::Value = serde_json::from_str(&pep691_package_json(
+            "six",
+            &[meta(Some("1.16.0"))],
+            &active(),
+        ))
+        .unwrap();
+        assert!(doc.get("project-status").is_none());
+        // It is top-level when present, never nested in meta.
+        assert!(doc["meta"].get("project-status").is_none());
+    }
+
+    #[test]
+    fn non_active_status_renders_top_level_with_escaped_reason() {
+        let status = ProjectStatusDoc {
+            status: ProjectStatus::Archived,
+            reason: Some(r#"moved to "foo""#.into()),
+        };
+        let html = pep503_package_html("six", &[meta(Some("1.16.0"))], &status);
+        assert!(html.contains(r#"<meta name="pypi:project-status" content="archived">"#));
+        assert!(html.contains(
+            r#"<meta name="pypi:project-status-reason" content="moved to &quot;foo&quot;">"#
+        ));
+
+        let doc: serde_json::Value = serde_json::from_str(&pep691_package_json(
+            "six",
+            &[meta(Some("1.16.0"))],
+            &status,
+        ))
+        .unwrap();
+        assert_eq!(doc["project-status"]["status"], "archived");
+        assert_eq!(doc["project-status"]["reason"], r#"moved to "foo""#);
+    }
+
+    #[test]
+    fn quarantine_omits_links_but_keeps_marker() {
+        // The caller drops the files for a quarantined project; render still
+        // emits the marker and now has nothing to link.
+        let status = ProjectStatusDoc {
+            status: ProjectStatus::Quarantined,
+            reason: None,
+        };
+        assert!(status.status.blocks_downloads());
+
+        let html = pep503_package_html("six", &[], &status);
+        assert!(html.contains(r#"<meta name="pypi:project-status" content="quarantined">"#));
+        assert!(!html.contains("<a href"));
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&pep691_package_json("six", &[], &status)).unwrap();
+        assert_eq!(doc["project-status"]["status"], "quarantined");
+        assert_eq!(doc["files"].as_array().unwrap().len(), 0);
+        assert_eq!(doc["versions"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -289,20 +391,20 @@ mod tests {
         m.requires_python = Some(">=3.9".into());
         m.core_metadata = true;
 
-        let html = pep503_package_html("six", &[m.clone()]);
+        let html = pep503_package_html("six", &[m.clone()], &active());
         assert!(html.contains(r#"data-requires-python="&gt;=3.9""#));
         assert!(html.contains(r#"data-core-metadata="true""#));
         assert!(html.contains(r#"data-dist-info-metadata="true""#));
 
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[m])).unwrap();
+            serde_json::from_str(&pep691_package_json("six", &[m], &active())).unwrap();
         assert_eq!(doc["files"][0]["requires-python"], ">=3.9");
         assert_eq!(doc["files"][0]["core-metadata"], true);
         assert_eq!(doc["files"][0]["dist-info-metadata"], true);
 
         let plain = meta(None);
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[plain])).unwrap();
+            serde_json::from_str(&pep691_package_json("six", &[plain], &active())).unwrap();
         assert!(doc["files"][0].get("requires-python").is_none());
         assert!(doc["files"][0].get("core-metadata").is_none());
     }
@@ -312,13 +414,13 @@ mod tests {
         let mut m = meta(Some("1.16.0"));
         m.provenance = true;
 
-        let html = pep503_package_html("six", &[m.clone()]);
+        let html = pep503_package_html("six", &[m.clone()], &active());
         assert!(html.contains(
             r#"data-provenance="/files/six/six-1.16.0-py2.py3-none-any.whl.provenance""#
         ));
 
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[m])).unwrap();
+            serde_json::from_str(&pep691_package_json("six", &[m], &active())).unwrap();
         assert_eq!(
             doc["files"][0]["provenance"],
             "/files/six/six-1.16.0-py2.py3-none-any.whl.provenance"
@@ -326,10 +428,10 @@ mod tests {
 
         // Absent companion → no field / attribute at all.
         let plain = meta(None);
-        let html = pep503_package_html("six", std::slice::from_ref(&plain));
+        let html = pep503_package_html("six", std::slice::from_ref(&plain), &active());
         assert!(!html.contains("data-provenance"));
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[plain])).unwrap();
+            serde_json::from_str(&pep691_package_json("six", &[plain], &active())).unwrap();
         assert!(doc["files"][0].get("provenance").is_none());
     }
 
@@ -341,7 +443,7 @@ mod tests {
         let mut m = meta(Some("1.0"));
         m.filename = r#"a" onmouseover=alert(1) x.whl"#.into();
         m.sha256 = r#"b"><script>"#.into();
-        let html = pep503_package_html("six", &[m]);
+        let html = pep503_package_html("six", &[m], &active());
         // In the href the quote is escaped, so the attribute never terminates
         // early (the raw `href="/files/six/a"` breakout must not appear).
         assert!(
@@ -357,19 +459,19 @@ mod tests {
         let mut yanked = meta(Some("1.16.0"));
         yanked.yanked = Yanked::Reason("broken \"wheel\"".into());
 
-        let html = pep503_package_html("six", &[yanked.clone()]);
+        let html = pep503_package_html("six", &[yanked.clone()], &active());
         assert!(html.contains(r#"data-yanked="broken &quot;wheel&quot;""#));
 
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[yanked])).unwrap();
+            serde_json::from_str(&pep691_package_json("six", &[yanked], &active())).unwrap();
         assert_eq!(doc["files"][0]["yanked"], "broken \"wheel\"");
 
         let mut flagged = meta(Some("1.16.0"));
         flagged.yanked = Yanked::Flag(true);
-        let html = pep503_package_html("six", &[flagged.clone()]);
+        let html = pep503_package_html("six", &[flagged.clone()], &active());
         assert!(html.contains(r#"data-yanked="""#));
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[flagged])).unwrap();
+            serde_json::from_str(&pep691_package_json("six", &[flagged], &active())).unwrap();
         assert_eq!(doc["files"][0]["yanked"], true);
     }
 }

@@ -37,7 +37,8 @@ mod wheel;
 mod worker;
 
 use names::{
-    infer_package_from_filename, infer_version_from_filename, is_normalized, normalize_pkg_name,
+    checked_pkg_name, infer_package_from_filename, infer_version_from_filename, is_normalized,
+    normalize_pkg_name,
 };
 use sidecar::{
     metadata_key, provenance_key, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, PROVENANCE_SUFFIX,
@@ -1187,10 +1188,9 @@ async fn serve_pkg_index(
     if !state.is_reader(headers) {
         return unauthorized();
     }
-    let pkg = normalize_pkg_name(raw);
-    if !is_normalized(&pkg) {
+    let Some(pkg) = checked_pkg_name(raw) else {
         return not_found("invalid package name");
-    }
+    };
     // PEP 503: the canonical URL is the normalized one; everything else 301s
     // there, so URL-keyed caches (CDNs, edge proxies) never split entries.
     if raw != pkg {
@@ -1335,7 +1335,6 @@ async fn files_get(
     if !state.is_reader(&headers) {
         return unauthorized();
     }
-    let pkg = normalize_pkg_name(&package);
     // A request is for an artifact or one of its served companions
     // (`.metadata`, `.provenance`); the sidecar JSON and dotfiles never serve.
     let servable = match filename
@@ -1345,9 +1344,11 @@ async fn files_get(
         Some(base) => sidecar::is_artifact(base),
         None => sidecar::is_artifact(&filename),
     };
-    if !is_normalized(&pkg) || !servable || filename.contains('/') || filename.contains('\\') {
+    let Some(pkg) = checked_pkg_name(&package)
+        .filter(|_| servable && !filename.contains('/') && !filename.contains('\\'))
+    else {
         return not_found("not an artifact");
-    }
+    };
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
 
     // PEP 658 metadata is immutable, tiny, and hammered by resolvers (uv
@@ -1569,12 +1570,12 @@ async fn files_delete(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers)?;
-    let pkg = normalize_pkg_name(&package);
     // Artifacts only: .origin, sidecars, and metadata companions are managed
     // by the server, not deletable handles.
-    if !is_normalized(&pkg) || !valid_artifact_filename(&filename) {
+    let Some(pkg) = checked_pkg_name(&package).filter(|_| valid_artifact_filename(&filename))
+    else {
         return Err((StatusCode::NOT_FOUND, "No such file".into()));
-    }
+    };
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
     match state.storage.head_exists(&key).await {
         Ok(true) => {}
@@ -1668,10 +1669,9 @@ async fn set_yanked(
     yanked: Yanked,
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_admin(state, headers)?;
-    let pkg = normalize_pkg_name(package);
-    if !is_normalized(&pkg) || !valid_artifact_filename(filename) {
+    let Some(pkg) = checked_pkg_name(package).filter(|_| valid_artifact_filename(filename)) else {
         return Err((StatusCode::NOT_FOUND, "No such file".to_string()));
-    }
+    };
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
     let sc_key = sidecar_key(&key);
 

@@ -26,7 +26,7 @@ use tracing::{error, info, warn};
 
 use crate::config::{self, SyncConfig};
 use crate::names::{
-    infer_version_from_filename, is_normalized, matches_prefix, normalize_pkg_name,
+    checked_pkg_name, infer_version_from_filename, matches_prefix, normalize_pkg_name,
 };
 use crate::origin;
 use crate::sidecar::{metadata_key, provenance_key, sidecar_key, Sidecar, Yanked};
@@ -287,10 +287,9 @@ fn parse_spec_line(line: &str) -> Result<PackageSpec> {
         .find(['<', '>', '=', '!', '~', ' '])
         .unwrap_or(line.len());
     let (raw_name, raw_spec) = line.split_at(split);
-    let name = normalize_pkg_name(raw_name.trim());
-    if !is_normalized(&name) {
+    let Some(name) = checked_pkg_name(raw_name.trim()) else {
         bail!("invalid package name '{raw_name}'");
-    }
+    };
     let raw_spec = raw_spec.trim();
     let specifiers = if raw_spec.is_empty() {
         None

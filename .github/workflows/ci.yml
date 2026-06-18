@@ -60,6 +60,40 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace --all-features --locked
 
+  integration:
+    name: blackbox integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - name: Sync dev dependencies
+        run: uv sync
+      # The product's center of gravity is the blackbox suite (docs/TESTING.md):
+      # the real binary driven over HTTP by real uv/pip clients. S3/MinIO tests
+      # skip without Docker; the multi-client compat matrix (poetry/pdm/flit/
+      # hatch via uvx) stays a local `make compat` concern, not a merge gate.
+      - name: Blackbox suite (disk mode)
+        run: uv run -- pytest tests -m "not perf and not stress and not compat"
+
+  fuzz-build:
+    name: fuzz build (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # Keep the fuzz targets compiling. Coverage-guided runs stay manual
+      # (`make fuzz`); this only guards against bitrot in the harness.
+      - name: Compile all fuzz targets
+        run: cargo fuzz build
+
   build-release:
     # Build release binaries on pushes to master/main (not on PRs)
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')

@@ -274,6 +274,12 @@ impl Proxy {
             client: Client::builder()
                 .user_agent("pypiron-proxy/0.1 (+https://github.com/brycedrennan/pypiron)")
                 .connect_timeout(Duration::from_secs(10))
+                // Inactivity timeout between reads, reset on each chunk: an
+                // upstream that connects then stalls mid-stream can't hang a
+                // client-facing request forever. Does NOT bound large downloads
+                // that keep streaming. download_verified's retry loop turns the
+                // resulting error into a clean retry.
+                .read_timeout(Duration::from_secs(30))
                 .build()?,
             listings: Mutex::new(HashMap::new()),
         })

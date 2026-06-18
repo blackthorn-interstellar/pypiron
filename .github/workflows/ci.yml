@@ -360,7 +360,10 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
           path: dist
+      # Build-provenance attestation is a public-repo-only feature; skip it while
+      # the repo is private (it reactivates automatically once the repo is public).
       - name: Generate artifact attestation
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: 'dist/*'

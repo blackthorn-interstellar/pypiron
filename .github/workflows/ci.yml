@@ -146,148 +146,36 @@ jobs:
 
   # Wheel builds run only for release tags (and manual dispatch for testing the
   # pipeline). The version is stamped from the tag; the repo itself stays at 0.0.0.
-  linux:
+  # One job, one matrix over every (kind, runner, target). maturin-action treats an
+  # unset manylinux as auto and ignores it off Linux, and the aarch64-gnu CFLAGS is a
+  # no-op elsewhere, so the steps are identical for every platform. fail-fast is off
+  # so one platform's failure doesn't cancel the rest (these were independent jobs).
+  wheels:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    runs-on: ${{ matrix.platform.runner }}
+    name: wheels (${{ matrix.kind }}, ${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
-        platform:
-          - runner: ubuntu-22.04
-            target: x86_64
-          - runner: ubuntu-22.04
-            target: x86
-          - runner: ubuntu-22.04
-            target: aarch64
-          - runner: ubuntu-22.04
-            target: armv7
-          - runner: ubuntu-22.04
-            target: s390x
-          - runner: ubuntu-22.04
-            target: ppc64le
-          - runner: ubuntu-22.04
-            target: riscv64
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-      - name: Stamp version from tag
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: ./.github/stamp-version.sh "$GITHUB_REF_NAME"
-      # Make the README baked into the wheel/sdist metadata render on PyPI:
-      # rewrite its repo-relative links/logo to absolute URLs (pinned to the
-      # stamped tag). The committed file stays GitHub-relative.
-      - name: Rewrite README links to absolute URLs for PyPI
-        shell: bash
-        run: command -v python3 >/dev/null 2>&1 && python3 scripts/transform_readme.py --target pypi || python scripts/transform_readme.py --target pypi
-      - name: Build wheels
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --locked --out dist
-          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          manylinux: auto
-        env:
-          CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
-      - name: Upload wheels
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: wheels-linux-${{ matrix.platform.target }}
-          path: dist
-
-  musllinux:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      matrix:
-        platform:
-          - runner: ubuntu-22.04
-            target: x86_64
-          - runner: ubuntu-22.04
-            target: x86
-          - runner: ubuntu-22.04
-            target: aarch64
-          - runner: ubuntu-22.04
-            target: armv7
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-      - name: Stamp version from tag
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: ./.github/stamp-version.sh "$GITHUB_REF_NAME"
-      # Make the README baked into the wheel/sdist metadata render on PyPI:
-      # rewrite its repo-relative links/logo to absolute URLs (pinned to the
-      # stamped tag). The committed file stays GitHub-relative.
-      - name: Rewrite README links to absolute URLs for PyPI
-        shell: bash
-        run: command -v python3 >/dev/null 2>&1 && python3 scripts/transform_readme.py --target pypi || python scripts/transform_readme.py --target pypi
-      - name: Build wheels
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --locked --out dist
-          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          manylinux: musllinux_1_2
-        env:
-          CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
-      - name: Upload wheels
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: wheels-musllinux-${{ matrix.platform.target }}
-          path: dist
-
-  windows:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      matrix:
-        platform:
-          - runner: windows-latest
-            target: x64
-          - runner: windows-latest
-            target: x86
-          - runner: windows-latest
-            target: aarch64
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-      - name: Stamp version from tag
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: ./.github/stamp-version.sh "$GITHUB_REF_NAME"
-      # Make the README baked into the wheel/sdist metadata render on PyPI:
-      # rewrite its repo-relative links/logo to absolute URLs (pinned to the
-      # stamped tag). The committed file stays GitHub-relative.
-      - name: Rewrite README links to absolute URLs for PyPI
-        shell: bash
-        run: command -v python3 >/dev/null 2>&1 && python3 scripts/transform_readme.py --target pypi || python scripts/transform_readme.py --target pypi
-      - name: Build wheels
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --locked --out dist
-          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-      - name: Upload wheels
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: wheels-windows-${{ matrix.platform.target }}
-          path: dist
-
-  macos:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      matrix:
-        platform:
+        include:
+          - { kind: linux,     runner: ubuntu-22.04,   target: x86_64 }
+          - { kind: linux,     runner: ubuntu-22.04,   target: x86 }
+          - { kind: linux,     runner: ubuntu-22.04,   target: aarch64 }
+          - { kind: linux,     runner: ubuntu-22.04,   target: armv7 }
+          - { kind: linux,     runner: ubuntu-22.04,   target: s390x }
+          - { kind: linux,     runner: ubuntu-22.04,   target: ppc64le }
+          - { kind: linux,     runner: ubuntu-22.04,   target: riscv64 }
+          - { kind: musllinux, runner: ubuntu-22.04,   target: x86_64,  manylinux: musllinux_1_2 }
+          - { kind: musllinux, runner: ubuntu-22.04,   target: x86,     manylinux: musllinux_1_2 }
+          - { kind: musllinux, runner: ubuntu-22.04,   target: aarch64, manylinux: musllinux_1_2 }
+          - { kind: musllinux, runner: ubuntu-22.04,   target: armv7,   manylinux: musllinux_1_2 }
+          - { kind: windows,   runner: windows-latest, target: x64 }
+          - { kind: windows,   runner: windows-latest, target: x86 }
+          - { kind: windows,   runner: windows-latest, target: aarch64 }
           # GitHub retired the macos-13 (Intel) image on 2025-12-04; macos-15-intel
           # is its standard x86_64 replacement (last Intel image, supported to ~2027-08).
-          - runner: macos-15-intel
-            target: x86_64
-          - runner: macos-14
-            target: aarch64
+          - { kind: macos,     runner: macos-15-intel, target: x86_64 }
+          - { kind: macos,     runner: macos-14,       target: aarch64 }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -305,13 +193,16 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
-          target: ${{ matrix.platform.target }}
+          target: ${{ matrix.target }}
           args: --release --locked --out dist
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+        env:
+          CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
       - name: Upload wheels
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: wheels-macos-${{ matrix.platform.target }}
+          name: wheels-${{ matrix.kind }}-${{ matrix.target }}
           path: dist
 
   sdist:
@@ -346,7 +237,7 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [fmt, clippy, test, linux, musllinux, windows, macos, sdist]
+    needs: [fmt, clippy, test, wheels, sdist]
     permissions:
       # Used for PyPI trusted publishing and to sign the release artifacts
       id-token: write

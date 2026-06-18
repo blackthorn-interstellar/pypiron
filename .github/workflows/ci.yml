@@ -102,7 +102,10 @@ jobs:
       # Keep the fuzz targets compiling. Coverage-guided runs stay manual
       # (`make fuzz`); this only guards against bitrot in the harness.
       - name: Compile all fuzz targets
-        run: cargo fuzz build
+        # Pin the gnu host target: recent cargo-fuzz defaults to musl even on a
+        # gnu host, and musl's static libc is incompatible with ASan.
+        # https://github.com/rust-fuzz/cargo-fuzz/issues/398
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu
 
   build-release:
     # Build release binaries on pushes to master/main (not on PRs)

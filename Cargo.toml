@@ -46,3 +46,12 @@ unsafe_code = "forbid"
 [lints.clippy]
 dbg_macro = "warn"
 exit = "warn"
+
+# Applied uniformly to every release build — wheel, Docker, and `cargo install`.
+# thin LTO + a single codegen unit buy most of fat-LTO's runtime/size win at a
+# fraction of the compile cost; strip here makes the [tool.maturin] strip flag
+# redundant and also shrinks the (previously unstripped) Docker/CI binaries.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

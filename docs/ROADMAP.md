@@ -8,8 +8,9 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 
 **Standards** ([STANDARDS.md](STANDARDS.md) is the authoritative matrix)
 - PEP 503 simple HTML index — name normalization, sha256 URL fragments, PEP 629 `repository-version` meta tag, 301-redirects for non-normalized names.
-- PEP 691 JSON simple API with content negotiation; PEP 700 `versions` / `size` / `upload-time` (api-version 1.1).
+- PEP 691 JSON simple API with content negotiation; PEP 700 `versions` / `size` / `upload-time` (api-version 1.3).
 - PEP 592 yank; PEP 658/714 wheel `METADATA` served as a static `<filename>.metadata` companion with `core-metadata` attrs.
+- PEP 740 provenance relayed verbatim through `sync` and the proxy (`<filename>.provenance` companion, `provenance` key / `data-provenance` attr) — carried, not verified; first-party `attestations` uploads refused.
 - `requires-python`; filename immutability (re-upload rejected); HTTP caching (content-hash ETags + 304, `immutable` artifacts, Range requests, gzip index variants).
 
 **Upload & write path**

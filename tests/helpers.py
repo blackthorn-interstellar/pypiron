@@ -267,6 +267,12 @@ def download_pypi_wheel(package: str, version: str, dest_dir: Path) -> Path:
     return path
 
 
+def pypi_provenance(package: str, version: str, filename: str, *, timeout: float = 30.0) -> dict:
+    """Fetch a file's PEP 740 provenance object from PyPI's integrity API."""
+    url = f"https://pypi.org/integrity/{package}/{version}/{filename}/provenance"
+    return json.loads(http_get_bytes(url, timeout=timeout).decode("utf-8"))
+
+
 def wait_for_file_in_index(
     simple_url: str, package: str, filename: str, *, timeout: float = 30.0
 ) -> dict:

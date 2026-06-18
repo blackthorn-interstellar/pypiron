@@ -29,14 +29,16 @@ use anyhow::{anyhow, bail, Result};
 use clap::Args;
 use futures::StreamExt;
 use reqwest::Client;
-use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::names::{infer_version_from_filename, matches_prefix};
 use crate::origin;
 use crate::render::{self, FileMetadata};
-use crate::sidecar::{metadata_key, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX};
-use crate::sync::{matches_filters, parse_cutoff, PyPiDigests, PyPiFile, ResolvedFilter};
+use crate::sidecar::{
+    metadata_key, provenance_key, sidecar_key, Sidecar, METADATA_SUFFIX, PROVENANCE_SUFFIX,
+};
+use crate::simple::{self, SimpleFile};
+use crate::sync::{matches_filters, parse_cutoff, ResolvedFilter};
 use crate::upload::{FinishedSpool, UploadSpool};
 use crate::{AppState, PACKAGES_PREFIX};
 
@@ -53,7 +55,6 @@ const MAX_LISTINGS: usize = 8192;
 const SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Same retry budget as `sync`: at CDN scale, transient errors are routine.
 const DOWNLOAD_ATTEMPTS: u32 = 3;
-const PEP691_CONTENT_TYPE: &str = render::SIMPLE_JSON_CONTENT_TYPE;
 
 /// Filters gating what the proxy serves and caches — the `sync` filters under
 /// a `--proxy-` prefix, with identical semantics (they gate what this server
@@ -128,85 +129,6 @@ impl ProxyFilterArgs {
     }
 }
 
-/// One file from the upstream PEP 691 listing (PEP 700 fields included).
-#[derive(Debug, Clone, Deserialize)]
-struct UpstreamFile {
-    filename: String,
-    url: String,
-    #[serde(default)]
-    hashes: HashMap<String, String>,
-    #[serde(default)]
-    size: Option<u64>,
-    #[serde(rename = "upload-time", default)]
-    upload_time: Option<String>,
-    #[serde(rename = "requires-python", default)]
-    requires_python: Option<String>,
-    #[serde(default)]
-    yanked: Yanked,
-    /// PEP 714 / PEP 658: bool or a hash object; anything but false/null
-    /// means the companion exists upstream.
-    #[serde(rename = "core-metadata", default)]
-    core_metadata: Option<serde_json::Value>,
-    #[serde(rename = "dist-info-metadata", default)]
-    dist_info_metadata: Option<serde_json::Value>,
-}
-
-impl UpstreamFile {
-    fn sha256(&self) -> Option<&str> {
-        self.hashes.get("sha256").map(String::as_str)
-    }
-
-    fn has_core_metadata(&self) -> bool {
-        let truthy = |v: &serde_json::Value| !matches!(v, serde_json::Value::Bool(false));
-        self.core_metadata.as_ref().map(truthy).unwrap_or(false)
-            || self
-                .dist_info_metadata
-                .as_ref()
-                .map(truthy)
-                .unwrap_or(false)
-    }
-
-    /// Adapter for `sync::matches_filters` (it reads filename, packagetype,
-    /// and upload time).
-    fn as_pypi_file(&self) -> PyPiFile {
-        let (yanked, yanked_reason) = match &self.yanked {
-            Yanked::Flag(f) => (*f, None),
-            Yanked::Reason(r) => (true, Some(r.clone())),
-        };
-        PyPiFile {
-            filename: self.filename.clone(),
-            url: self.url.clone(),
-            digests: PyPiDigests {
-                sha256: self.sha256().unwrap_or_default().to_string(),
-            },
-            size: self.size,
-            packagetype: None,
-            upload_time_iso_8601: self.upload_time.clone(),
-            requires_python: self.requires_python.clone(),
-            yanked,
-            yanked_reason,
-        }
-    }
-
-    fn as_file_metadata(&self) -> FileMetadata {
-        FileMetadata {
-            filename: self.filename.clone(),
-            sha256: self.sha256().unwrap_or_default().to_string(),
-            size: self.size.unwrap_or(0),
-            upload_time: self.upload_time.clone(),
-            version: None, // render infers from the filename
-            yanked: self.yanked.clone(),
-            requires_python: self.requires_python.clone(),
-            core_metadata: self.has_core_metadata(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct UpstreamIndex {
-    files: Vec<UpstreamFile>,
-}
-
 /// A package page rendered from the upstream listing, ETag precomputed.
 #[derive(Clone)]
 pub struct RenderedIndex {
@@ -224,7 +146,7 @@ fn rendered(body: String) -> RenderedIndex {
 /// Upstream listing, filtered and pre-rendered. Rendering happens once per
 /// fill, so the per-request cost of a proxied page is a map lookup.
 struct Found {
-    files: Vec<UpstreamFile>,
+    files: Vec<SimpleFile>,
     html: RenderedIndex,
     json: RenderedIndex,
 }
@@ -387,6 +309,21 @@ impl Proxy {
                     .await;
             }
         }
+        if let Some(prov_url) = &file.provenance {
+            // PEP 740 provenance, relayed verbatim alongside the artifact.
+            // Best-effort like metadata: a missing companion only drops the
+            // supply-chain signal, never the artifact.
+            if let Some(prov) = self.fetch_provenance_url(pkg, prov_url).await {
+                let _ = state
+                    .storage
+                    .put_bytes(
+                        &provenance_key(&key),
+                        prov.to_vec(),
+                        Some("application/json"),
+                    )
+                    .await;
+            }
+        }
         let sidecar = Sidecar {
             // Upstream's digest, verified against the downloaded bytes.
             sha256: spool.sha256.clone(),
@@ -449,6 +386,47 @@ impl Proxy {
             Ok(resp) => resp.bytes().await.ok(),
             Err(e) => {
                 warn!(%url, error=?e, "proxy: upstream metadata fetch failed");
+                None
+            }
+        }
+    }
+
+    /// PEP 740 provenance for a not-yet-cached file, fetched from upstream and
+    /// served without storage writes. `None` falls back to a local 404.
+    pub async fn fetch_provenance(
+        &self,
+        state: &AppState,
+        pkg: &str,
+        provenance_filename: &str,
+    ) -> Option<bytes::Bytes> {
+        let base = provenance_filename.strip_suffix(PROVENANCE_SUFFIX)?;
+        let found = self.listing(state, pkg).await?;
+        let file = found.files.iter().find(|f| f.filename == base)?;
+        let prov_url = file.provenance.as_ref()?;
+        self.fetch_provenance_url(pkg, prov_url).await
+    }
+
+    async fn fetch_provenance_url(&self, pkg: &str, prov_url: &str) -> Option<bytes::Bytes> {
+        // The upstream provenance URL is authoritative (absolute on PyPI), but
+        // resolve relative ones against the index page just like file URLs.
+        let url = match self.resolve_url(pkg, prov_url) {
+            Ok(url) => url,
+            Err(e) => {
+                warn!(%pkg, error=?e, "proxy: unresolvable upstream provenance URL");
+                return None;
+            }
+        };
+        let resp = self
+            .client
+            .get(url.clone())
+            .timeout(SMALL_FETCH_TIMEOUT)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status());
+        match resp {
+            Ok(resp) => resp.bytes().await.ok(),
+            Err(e) => {
+                warn!(%url, error=?e, "proxy: upstream provenance fetch failed");
                 None
             }
         }
@@ -517,26 +495,20 @@ impl Proxy {
     }
 
     async fn fetch_listing(&self, pkg: &str) -> Result<Listing> {
-        let url = format!("{}/simple/{pkg}/", self.upstream);
-        let resp = self
-            .client
-            .get(&url)
-            .header(reqwest::header::ACCEPT, PEP691_CONTENT_TYPE)
-            .timeout(SMALL_FETCH_TIMEOUT)
-            .send()
-            .await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let Some(index) =
+            simple::fetch_index(&self.client, &self.upstream, pkg, Some(SMALL_FETCH_TIMEOUT))
+                .await?
+        else {
             return Ok(Listing::Missing);
-        }
-        let index: UpstreamIndex = resp.error_for_status()?.json().await?;
-        let files: Vec<UpstreamFile> = index
+        };
+        let files: Vec<SimpleFile> = index
             .files
             .into_iter()
             // No digest, no service: every artifact we hand out is verifiable.
             .filter(|f| f.sha256().is_some())
-            .filter(|f| matches_filters(&f.as_pypi_file(), &self.filter))
+            .filter(|f| matches_filters(f, &self.filter))
             .collect();
-        let metas: Vec<FileMetadata> = files.iter().map(UpstreamFile::as_file_metadata).collect();
+        let metas: Vec<FileMetadata> = files.iter().map(SimpleFile::as_file_metadata).collect();
         Ok(Listing::Found(Arc::new(Found {
             html: rendered(render::pep503_package_html(pkg, &metas)),
             json: rendered(render::pep691_package_json(pkg, &metas)),
@@ -551,7 +523,7 @@ impl Proxy {
         &self,
         state: &AppState,
         pkg: &str,
-        file: &UpstreamFile,
+        file: &SimpleFile,
     ) -> Result<FinishedSpool> {
         let expected = file
             .sha256()
@@ -620,50 +592,6 @@ fn evict_listings(map: &mut HashMap<String, CacheEntry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn upstream_file(json: serde_json::Value) -> UpstreamFile {
-        serde_json::from_value(json).unwrap()
-    }
-
-    #[test]
-    fn pep691_file_parses_pep700_and_metadata_fields() {
-        let f = upstream_file(serde_json::json!({
-            "filename": "six-1.16.0-py2.py3-none-any.whl",
-            "url": "/files/six/six-1.16.0-py2.py3-none-any.whl",
-            "hashes": {"sha256": "abc"},
-            "size": 11236,
-            "upload-time": "2021-05-05T14:18:17Z",
-            "requires-python": ">=2.7",
-            "yanked": false,
-            "core-metadata": {"sha256": "def"}
-        }));
-        assert_eq!(f.sha256(), Some("abc"));
-        assert!(f.has_core_metadata());
-        let meta = f.as_file_metadata();
-        assert_eq!(meta.size, 11236);
-        assert_eq!(meta.upload_time.as_deref(), Some("2021-05-05T14:18:17Z"));
-        assert!(meta.core_metadata);
-
-        let bare = upstream_file(serde_json::json!({
-            "filename": "six-1.16.0.tar.gz",
-            "url": "https://files.example.com/six-1.16.0.tar.gz"
-        }));
-        assert_eq!(bare.sha256(), None);
-        assert!(!bare.has_core_metadata());
-    }
-
-    #[test]
-    fn yanked_reason_round_trips_into_filter_adapter() {
-        let f = upstream_file(serde_json::json!({
-            "filename": "six-1.16.0-py2.py3-none-any.whl",
-            "url": "x",
-            "hashes": {"sha256": "abc"},
-            "yanked": "broken release"
-        }));
-        let p = f.as_pypi_file();
-        assert!(p.yanked);
-        assert_eq!(p.yanked_reason.as_deref(), Some("broken release"));
-    }
 
     #[test]
     fn relative_and_absolute_upstream_urls_resolve() {

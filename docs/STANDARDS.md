@@ -10,8 +10,8 @@ The bar for "supported" is blackbox-verified behavior against real clients
 |---|---|---|
 | [PEP 503](https://peps.python.org/pep-0503/) | Simple HTML index, name normalization, sha256 URL fragments | Supported |
 | [PEP 629](https://peps.python.org/pep-0629/) | `pypi:repository-version` meta tag in HTML | Supported |
-| [PEP 691](https://peps.python.org/pep-0691/) | JSON simple API with content negotiation | Supported |
-| [PEP 700](https://peps.python.org/pep-0700/) | `versions`, `size`, `upload-time` in JSON (api-version 1.1) | Supported |
+| [PEP 691](https://peps.python.org/pep-0691/) | JSON simple API with content negotiation (api-version 1.3) | Supported |
+| [PEP 700](https://peps.python.org/pep-0700/) | `versions`, `size`, `upload-time` in JSON | Supported |
 | Legacy upload API | `POST /legacy/` multipart, as spoken by twine / `uv publish` | Supported |
 | [PEP 592](https://peps.python.org/pep-0592/) | Yanked releases (`yanked` key / `data-yanked` attr) | Supported |
 | [PEP 658](https://peps.python.org/pep-0658/) / [714](https://peps.python.org/pep-0714/) | Serve wheel `METADATA` as `<filename>.metadata` + `core-metadata` attrs | Supported |
@@ -24,7 +24,7 @@ The bar for "supported" is blackbox-verified behavior against real clients
 | Mirrored upload times | `sync` carries PyPI's true `upload-time` into sidecars (over HTTP to a server with an admin credential, or straight to storage) so `--exclude-newer` works on mirrored packages | Supported |
 | [PEP 694](https://peps.python.org/pep-0694/) | Upload API 2.0 (draft) | Out of scope until stable |
 | [PEP 708](https://peps.python.org/pep-0708/) | Index merging / alternate locations metadata | Out of scope |
-| [PEP 740](https://peps.python.org/pep-0740/) | Attestations | Out of scope |
+| [PEP 740](https://peps.python.org/pep-0740/) | Provenance/attestations — relayed verbatim through `sync` + proxy (`provenance` key / `data-provenance` attr), not verified | Supported |
 | XML-RPC / search API | Deprecated upstream | Out of scope |
 | `/pypi/<pkg>/json` API | Non-standard pypi.org JSON API | Out of scope (the simple API is the standard) |
 
@@ -56,3 +56,15 @@ carry forward PyPI's original timestamps; see
   static files — negotiation just picks which file to serve.
 - The `yanked` and PEP 658 features are pure static-file plays: a sidecar flag and
   a sidecar metadata file, each followed by an index rebuild. No new machinery.
+- PEP 740 is the same play one more time: a `<filename>.provenance` companion
+  served next to the artifact, advertised by a `provenance` URL (JSON) and
+  `data-provenance` attribute (HTML). pypiron is a **relay, not a verifier** — it
+  carries PyPI's already-verified provenance through `sync` (direct and over HTTP)
+  and the on-demand proxy so an offline consumer can verify the original publisher
+  end-to-end (Sigstore bundles verify against a cached trust root, no egress
+  needed). It never runs Sigstore itself and never mints provenance, so a direct
+  upload carrying first-party `attestations` is refused — pypiron has no Trusted
+  Publisher identity to bind, so it cannot produce a provenance object any verifier
+  would trust. Like every URL we emit, `provenance`/`data-provenance` are
+  root-relative (we don't know our public base); clients resolve them against the
+  index URL.

@@ -83,7 +83,7 @@ def test_pep691_global_json(indexed_server):
     import json
 
     doc = json.loads(body)
-    assert doc["meta"]["api-version"] == "1.1"
+    assert doc["meta"]["api-version"] == "1.3"
     assert PACKAGE in [p["name"] for p in doc["projects"]]
 
 
@@ -91,7 +91,7 @@ def test_pep700_package_json_fields(indexed_server):
     doc = indexed_server["package_index"]
     wheel_path = indexed_server["wheel_path"]
 
-    assert doc["meta"]["api-version"] == "1.1"
+    assert doc["meta"]["api-version"] == "1.3"
     assert doc["name"] == PACKAGE
     assert VERSION in doc["versions"]
 

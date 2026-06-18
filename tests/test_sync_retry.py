@@ -37,32 +37,31 @@ def make_wheel() -> bytes:
 
 
 class FlakyPyPI(BaseHTTPRequestHandler):
-    """Serves the JSON API normally; 503s the FIRST artifact request only."""
+    """Serves the PEP 691 Simple API normally; 503s the FIRST artifact only."""
 
     wheel = make_wheel()
     failures_remaining = 1
     lock = threading.Lock()
 
     def do_GET(self):  # noqa: N802 - stdlib naming
-        if self.path == "/pypi/flaky-pkg/json":
+        if self.path == "/simple/flaky-pkg/":
             body = json.dumps(
                 {
-                    "releases": {
-                        "1.0.0": [
-                            {
-                                "filename": WHEEL_NAME,
-                                "url": f"http://127.0.0.1:{self.server.server_port}/files/{WHEEL_NAME}",
-                                "digests": {"sha256": hashlib.sha256(self.wheel).hexdigest()},
-                                "size": len(self.wheel),
-                                "packagetype": "bdist_wheel",
-                                "upload_time_iso_8601": "2026-01-01T00:00:00.000000Z",
-                            }
-                        ]
-                    }
+                    "meta": {"api-version": "1.1"},
+                    "name": "flaky-pkg",
+                    "files": [
+                        {
+                            "filename": WHEEL_NAME,
+                            "url": f"http://127.0.0.1:{self.server.server_port}/files/{WHEEL_NAME}",
+                            "hashes": {"sha256": hashlib.sha256(self.wheel).hexdigest()},
+                            "size": len(self.wheel),
+                            "upload-time": "2026-01-01T00:00:00.000000Z",
+                        }
+                    ],
                 }
             ).encode()
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/vnd.pypi.simple.v1+json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

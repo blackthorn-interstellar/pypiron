@@ -17,9 +17,7 @@ use clap::Args;
 use futures::stream::{self, StreamExt};
 use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::{multipart, Client};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -27,9 +25,12 @@ use tokio::fs;
 use tracing::{error, info, warn};
 
 use crate::config::{self, SyncConfig};
-use crate::names::{is_normalized, matches_prefix, normalize_pkg_name};
+use crate::names::{
+    infer_version_from_filename, is_normalized, matches_prefix, normalize_pkg_name,
+};
 use crate::origin;
-use crate::sidecar::{metadata_key, sidecar_key, Sidecar, Yanked};
+use crate::sidecar::{metadata_key, provenance_key, sidecar_key, Sidecar, Yanked};
+use crate::simple::{self, SimpleFile};
 use crate::storage::{Storage, StorageArgs};
 use crate::worker::mark_dirty;
 use crate::PACKAGES_PREFIX;
@@ -46,7 +47,9 @@ pub struct SyncArgs {
     #[arg(long, env = "PYPIRON_PACKAGES_LIST")]
     pub packages_list: Option<PathBuf>,
 
-    /// Source PyPI base (default: https://pypi.org). We call /pypi/<name>/json here.
+    /// Source index base (default: https://pypi.org). Read over the PEP 691
+    /// Simple API (`/simple/<name>/`), so any PEP 691 index works — PyPI,
+    /// another pypiron, etc.
     #[arg(long = "from", env = "PYPIRON_SYNC_FROM")]
     pub src_base: Option<String>,
 
@@ -299,39 +302,11 @@ fn parse_spec_line(line: &str) -> Result<PackageSpec> {
     Ok(PackageSpec { name, specifiers })
 }
 
-#[derive(Debug, Deserialize)]
-struct PyPiJson {
-    releases: HashMap<String, Vec<PyPiFile>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct PyPiFile {
-    pub(crate) filename: String,
-    pub(crate) url: String,
-    pub(crate) digests: PyPiDigests,
-    #[serde(default)]
-    pub(crate) size: Option<u64>,
-    #[serde(default)]
-    pub(crate) packagetype: Option<String>,
-    #[serde(default)]
-    pub(crate) upload_time_iso_8601: Option<String>,
-    #[serde(default)]
-    pub(crate) requires_python: Option<String>,
-    #[serde(default)]
-    pub(crate) yanked: bool,
-    #[serde(default)]
-    pub(crate) yanked_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct PyPiDigests {
-    pub(crate) sha256: String,
-}
-
-/// A file selected for mirroring, with its release version.
+/// A file selected for mirroring. `version` is inferred from the filename (the
+/// Simple API doesn't bind files to versions); `None` means it wasn't parseable.
 struct Selected {
-    version: String,
-    file: PyPiFile,
+    version: Option<String>,
+    file: SimpleFile,
 }
 
 enum Sink {
@@ -497,39 +472,79 @@ async fn fetch_selected_files(
     resolved: &Resolved,
     spec: &PackageSpec,
 ) -> Result<Vec<Selected>> {
-    let url = format!(
-        "{}/pypi/{}/json",
+    let base_url = format!(
+        "{}/simple/{}/",
         resolved.src_base.trim_end_matches('/'),
         spec.name
     );
-    let resp = client.get(url).send().await?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(anyhow!("Package not found on source: {}", spec.name));
-    }
-    let json: PyPiJson = resp.error_for_status()?.json().await?;
+    let index = simple::fetch_index(client, &resolved.src_base, &spec.name, None)
+        .await?
+        .ok_or_else(|| anyhow!("Package not found on source: {}", spec.name))?;
+
+    // PEP 691 file URLs may be relative; resolve them (and provenance URLs)
+    // against the index page so a non-PyPI source — another pypiron, whose
+    // listings are root-relative — works, not just PyPI's absolute CDN links.
+    let base = reqwest::Url::parse(&base_url).ok();
+    let resolve = |raw: &str| -> String {
+        base.as_ref()
+            .and_then(|b| b.join(raw).ok())
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| raw.to_string())
+    };
 
     let mut selected = Vec::new();
-    for (version, files) in json.releases {
+    for mut file in index.files {
+        // No digest, no service: every artifact we hand out must be verifiable.
+        if file.sha256().is_none() {
+            continue;
+        }
+        if !matches_filters(&file, &resolved.filter) {
+            continue;
+        }
+        let version = infer_version_from_filename(&file.filename);
         if let Some(specifiers) = &spec.specifiers {
-            // Unparseable (pre-PEP-440 junk) versions never match a constraint.
-            match Version::from_str(&version) {
-                Ok(v) if specifiers.contains(&v) => {}
-                _ => continue,
+            // A specifier gates by version, which the Simple API doesn't carry —
+            // we infer it from the filename. A file whose version can't be
+            // parsed can't be proven to match, so it's skipped (the same
+            // conservative rule the release-keyed API applied to junk versions).
+            let matched = version
+                .as_deref()
+                .and_then(|v| Version::from_str(v).ok())
+                .is_some_and(|v| specifiers.contains(&v));
+            if !matched {
+                continue;
             }
         }
-        for file in files {
-            if matches_filters(&file, &resolved.filter) {
-                selected.push(Selected {
-                    version: version.clone(),
-                    file,
-                });
-            }
-        }
+        file.url = resolve(&file.url);
+        file.provenance = file.provenance.as_deref().map(&resolve);
+        selected.push(Selected { version, file });
     }
     if selected.is_empty() {
         warn!("No matching files for package '{}'", spec.name);
     }
     Ok(selected)
+}
+
+/// Best-effort provenance fetch — supplemental, never fails the file.
+async fn download_provenance(client: &Client, url: &str) -> Option<Vec<u8>> {
+    match client
+        .get(url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        Ok(resp) => match resp.bytes().await {
+            Ok(bytes) => Some(bytes.to_vec()),
+            Err(e) => {
+                warn!(%url, error=?e, "sync: provenance body read failed");
+                None
+            }
+        },
+        Err(e) => {
+            warn!(%url, error=?e, "sync: provenance fetch failed");
+            None
+        }
+    }
 }
 
 /// Mirror one file into storage. Returns false if it was already present.
@@ -564,8 +579,10 @@ async fn mirror_to_storage(
         .put_if_absent(&key, bytes, Some("application/octet-stream"))
         .await?;
 
-    // Best-effort PEP 658: PyPI serves metadata at <file-url>.metadata.
-    if s.file.filename.ends_with(".whl") {
+    // Best-effort PEP 658: the source serves metadata at <file-url>.metadata.
+    // The Simple API tells us which wheels actually have a companion, so we only
+    // fetch when one exists instead of probing (and 404ing) on every wheel.
+    if s.file.filename.ends_with(".whl") && s.file.has_core_metadata() {
         if let Ok(resp) = client.get(format!("{}.metadata", s.file.url)).send().await {
             if resp.status().is_success() {
                 if let Ok(md) = resp.bytes().await {
@@ -581,6 +598,16 @@ async fn mirror_to_storage(
         }
     }
 
+    // Best-effort PEP 740: relay the provenance object verbatim next to the
+    // artifact so an offline consumer can still verify the original publisher.
+    if let Some(prov_url) = &s.file.provenance {
+        if let Some(prov) = download_provenance(client, prov_url).await {
+            let _ = storage
+                .put_bytes(&provenance_key(&key), prov, Some("application/json"))
+                .await;
+        }
+    }
+
     write_mirror_sidecar(storage, &key, s, size).await?;
     Ok(true)
 }
@@ -593,19 +620,15 @@ async fn write_mirror_sidecar(
     s: &Selected,
     size: u64,
 ) -> Result<()> {
-    let yanked = match (&s.file.yanked_reason, s.file.yanked) {
-        (Some(reason), _) if !reason.trim().is_empty() => Yanked::Reason(reason.trim().into()),
-        (_, flag) => Yanked::Flag(flag),
-    };
     let sc = Sidecar {
-        // PyPI's digest, verified against the downloaded bytes — not re-derived.
-        sha256: s.file.digests.sha256.clone(),
+        // The source's digest, verified against the downloaded bytes — not re-derived.
+        sha256: s.file.sha256().unwrap_or_default().to_string(),
         size,
-        version: s.version.clone(),
-        // PyPI's true upload time: the whole point of mirroring.
-        upload_time: s.file.upload_time_iso_8601.clone().unwrap_or_default(),
+        version: s.version.clone().unwrap_or_default(),
+        // The source's true upload time (PEP 700): the whole point of mirroring.
+        upload_time: s.file.upload_time.clone().unwrap_or_default(),
         requires_python: s.file.requires_python.clone(),
-        yanked,
+        yanked: s.file.yanked.clone(),
     };
     storage
         .put_bytes(
@@ -623,7 +646,7 @@ async fn write_mirror_sidecar(
 /// existed. Hash mismatches retry too: a truncated body looks identical.
 const DOWNLOAD_ATTEMPTS: u32 = 3;
 
-async fn download_verified(client: &Client, file: &PyPiFile) -> Result<Vec<u8>> {
+async fn download_verified(client: &Client, file: &SimpleFile) -> Result<Vec<u8>> {
     let mut last_err = None;
     for attempt in 1..=DOWNLOAD_ATTEMPTS {
         match download_once(client, file).await {
@@ -640,17 +663,19 @@ async fn download_verified(client: &Client, file: &PyPiFile) -> Result<Vec<u8>> 
     Err(last_err.expect("at least one attempt"))
 }
 
-async fn download_once(client: &Client, file: &PyPiFile) -> Result<Vec<u8>> {
+async fn download_once(client: &Client, file: &SimpleFile) -> Result<Vec<u8>> {
+    let expected = file
+        .sha256()
+        .ok_or_else(|| anyhow!("no sha256 for {}", file.filename))?;
     let resp = client.get(&file.url).send().await?.error_for_status()?;
     let bytes = resp.bytes().await?.to_vec();
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let got = format!("{:x}", hasher.finalize());
-    if !got.eq_ignore_ascii_case(&file.digests.sha256) {
+    if !got.eq_ignore_ascii_case(expected) {
         bail!(
-            "sha256 mismatch for {} (expected {}, got {got})",
+            "sha256 mismatch for {} (expected {expected}, got {got})",
             file.filename,
-            file.digests.sha256
         );
     }
     Ok(bytes)
@@ -674,25 +699,46 @@ async fn upload_via_http(
         .file_name(s.file.filename.clone())
         .mime_str("application/octet-stream")?;
 
+    let (yanked, yanked_reason) = match &s.file.yanked {
+        Yanked::Flag(f) => (*f, None),
+        Yanked::Reason(r) => (true, Some(r.clone())),
+    };
     let mut form = multipart::Form::new()
         .text(":action", "file_upload")
         .text("protocol_version", "1")
         .text("mirror", "true")
         .text("name", pkg.to_string())
-        .text("version", s.version.clone())
-        .text("sha256_digest", s.file.digests.sha256.clone())
-        .text("yanked", if s.file.yanked { "true" } else { "false" })
+        .text(
+            "sha256_digest",
+            s.file.sha256().unwrap_or_default().to_string(),
+        )
+        .text("yanked", if yanked { "true" } else { "false" })
         .part("content", part);
-    if let Some(ts) = &s.file.upload_time_iso_8601 {
+    // The Simple API doesn't bind files to versions; send the filename-inferred
+    // one when we have it, else let the server infer it the same way.
+    if let Some(v) = &s.version {
+        form = form.text("version", v.clone());
+    }
+    if let Some(ts) = &s.file.upload_time {
         form = form.text("upload_time", ts.clone());
     }
-    if let Some(reason) = &s.file.yanked_reason {
+    if let Some(reason) = &yanked_reason {
         if !reason.trim().is_empty() {
             form = form.text("yanked_reason", reason.trim().to_string());
         }
     }
     if let Some(rp) = &s.file.requires_python {
         form = form.text("requires_python", rp.clone());
+    }
+    // PEP 740: forward the provenance object verbatim; the receiving server
+    // stores it as the `.provenance` companion. Best-effort and UTF-8 (the
+    // object is JSON), so a fetch failure just omits the supply-chain signal.
+    if let Some(prov_url) = &s.file.provenance {
+        if let Some(prov) = download_provenance(client, prov_url).await {
+            if let Ok(text) = String::from_utf8(prov) {
+                form = form.text("provenance", text);
+            }
+        }
     }
 
     let mut req = client.post(endpoint).multipart(form);
@@ -711,10 +757,9 @@ async fn upload_via_http(
     Ok(true)
 }
 
-pub(crate) fn matches_filters(file: &PyPiFile, f: &ResolvedFilter) -> bool {
+pub(crate) fn matches_filters(file: &SimpleFile, f: &ResolvedFilter) -> bool {
     let fname = file.filename.to_ascii_lowercase();
-    let is_wheel =
-        fname.ends_with(".whl") || matches!(file.packagetype.as_deref(), Some("bdist_wheel"));
+    let is_wheel = fname.ends_with(".whl");
 
     if f.only_wheels && !is_wheel {
         return false;
@@ -727,7 +772,7 @@ pub(crate) fn matches_filters(file: &PyPiFile, f: &ResolvedFilter) -> bool {
     // timestamp is excluded — same rule uv applies to --exclude-newer.
     if f.exclude_newer.is_some() || f.exclude_older.is_some() {
         let uploaded = file
-            .upload_time_iso_8601
+            .upload_time
             .as_deref()
             .and_then(|ts| OffsetDateTime::parse(ts, &Rfc3339).ok());
         let Some(uploaded) = uploaded else {
@@ -879,19 +924,18 @@ mod tests {
         assert!(parse_spec_line("requests >= 2.20").is_ok());
     }
 
-    fn pypi_file(upload_time: Option<&str>) -> PyPiFile {
-        PyPiFile {
+    fn simple_file(upload_time: Option<&str>) -> SimpleFile {
+        SimpleFile {
             filename: "six-1.16.0-py2.py3-none-any.whl".into(),
             url: String::new(),
-            digests: PyPiDigests {
-                sha256: String::new(),
-            },
+            hashes: Default::default(),
             size: None,
-            packagetype: None,
-            upload_time_iso_8601: upload_time.map(str::to_string),
+            upload_time: upload_time.map(str::to_string),
             requires_python: None,
-            yanked: false,
-            yanked_reason: None,
+            yanked: Yanked::Flag(false),
+            core_metadata: None,
+            dist_info_metadata: None,
+            provenance: None,
         }
     }
 
@@ -929,9 +973,9 @@ mod tests {
 
     #[test]
     fn upload_time_bounds_filter() {
-        let old = pypi_file(Some("2015-10-07T13:41:23Z"));
-        let new = pypi_file(Some("2024-12-04T17:35:26Z"));
-        let unknown = pypi_file(None);
+        let old = simple_file(Some("2015-10-07T13:41:23Z"));
+        let new = simple_file(Some("2024-12-04T17:35:26Z"));
+        let unknown = simple_file(None);
 
         let before_2016 = time_filter(Some("2016-01-01T00:00:00Z"), None);
         assert!(matches_filters(&old, &before_2016));

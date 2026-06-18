@@ -285,6 +285,7 @@ to it like database migrations.
 packages/<pkg>/<filename>                # artifact, immutable once written
 packages/<pkg>/<filename>.meta.json      # sidecar (see below)
 packages/<pkg>/<filename>.metadata       # PEP 658 core metadata, extracted from wheel
+packages/<pkg>/<filename>.provenance     # PEP 740 provenance object, relayed verbatim from upstream
 packages/<pkg>/.origin                   # "private" | "mirror" — claimed at first write
 simple/index.html                        # materialized views (regenerable)
 simple/index.json
@@ -297,8 +298,8 @@ _leader/lease.json                       # multi-node lease (holder, term, expir
 ```
 
 `<pkg>` is always the PEP 503 normalized name. Index rebuilds include only
-artifact files — sidecars (`.meta.json`, `.metadata`) and dotfiles are excluded
-from listings by suffix/prefix.
+artifact files — sidecars (`.meta.json`, `.metadata`, `.provenance`) and dotfiles
+are excluded from listings by suffix/prefix.
 
 Sidecar schema (`<filename>.meta.json`), all captured at write time:
 
@@ -317,7 +318,13 @@ Sidecar schema (`<filename>.meta.json`), all captured at write time:
 if a sidecar is missing (legacy file), the rebuild backfills it by hashing the
 artifact once — create-only, so a real write-time sidecar always wins the race.
 PEP 658 serving falls out of the layout: `<artifact-url>.metadata` maps directly
-to the adjacent stored file.
+to the adjacent stored file. PEP 740 provenance works the same way —
+`<artifact-url>.provenance` maps to the stored object. pypiron **relays**
+provenance through `sync` and the proxy; it never verifies (verification is the
+consumer's end-to-end job and works offline against a cached Sigstore trust root)
+and never synthesizes it, so a direct upload carrying first-party `attestations`
+is refused. A mirror serves a point-in-time snapshot, so the companion is treated
+as immutable like the artifact it describes.
 
 ## Honest scaling limits
 

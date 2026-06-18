@@ -17,6 +17,12 @@ That's it. CI runs fmt/clippy/tests, builds wheels for all platforms plus the
 sdist, generates build-provenance attestations, and publishes to PyPI via
 trusted publishing. Nothing is published if the tests fail.
 
+In parallel, `docker.yml` builds the multi-arch (amd64/arm64) container image
+and pushes it to GHCR — `ghcr.io/brycedrennan/pypiron:X.Y.Z`, `:X.Y`, and
+`:latest` — with its own provenance attestation. Pushes to `master` publish a
+rolling `:master` tag; every push also gets a `:sha-<short>` tag. No secrets or
+one-time setup are needed: it authenticates with the built-in `GITHUB_TOKEN`.
+
 Local and dev builds report version `0.0.0` — only tagged CI builds carry a
 real version. `git describe --tags` tells you where a checkout sits relative
 to releases.

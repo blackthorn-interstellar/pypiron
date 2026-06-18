@@ -1,0 +1,28 @@
+# Keep the build context tiny: only Rust sources feed `cargo build`.
+# Everything here is either rebuilt, irrelevant to the binary, or bulky.
+target/
+.git/
+.github/
+docs/
+tests/
+bench/
+fuzz/
+data/
+dist/
+downloaded/
+pypiron-data/
+.venv/
+.test-venv/
+.pytest_cache/
+.ruff_cache/
+.claude/
+.cargo/
+*.whl
+*.tar.gz
+**/__pycache__/
+*.pyc
+.DS_Store
+pyproject.toml
+uv.lock
+README.md
+RELEASE.md

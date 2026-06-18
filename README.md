@@ -39,10 +39,13 @@ uvx pypiron        # or: pip install pypiron
 ```
 
 ```bash
-docker run --rm -it -p 8080:8080 \
+docker run --rm -it -p 8080:8080 -v pypiron-data:/data \
   -e PYPIRON_ADMIN_USER=admin -e PYPIRON_ADMIN_PASS=secret \
-  pypiron:latest
+  ghcr.io/brycedrennan/pypiron:latest
 ```
+
+Multi-arch (amd64/arm64) images are published to GHCR on every release tag
+(`:X.Y.Z`, `:X.Y`, `:latest`) and on each push to `master` (`:master`).
 
 ## Documentation
 

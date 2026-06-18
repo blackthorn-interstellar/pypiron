@@ -39,7 +39,9 @@ use crate::render::{
     pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
     SIMPLE_HTML_CONTENT_TYPE, SIMPLE_JSON_CONTENT_TYPE,
 };
-use crate::sidecar::{is_artifact, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, SIDECAR_SUFFIX};
+use crate::sidecar::{
+    is_artifact, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, PROVENANCE_SUFFIX, SIDECAR_SUFFIX,
+};
 use crate::storage::{FileEntry, ObjectMeta, Storage};
 use crate::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 
@@ -173,6 +175,15 @@ pub async fn run_worker_until(
     // no matter how the interval is configured relative to corpus size.
     let last_audit_secs = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sweep_running = Arc::new(AtomicBool::new(false));
+    // Clears the in-flight flag on drop — including a panic unwind inside the
+    // spawned audit. Without it, a panicking sweep leaves the flag stuck `true`
+    // and no further sweep is ever scheduled, silently disabling self-healing.
+    struct SweepGuard(Arc<AtomicBool>);
+    impl Drop for SweepGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
     loop {
         let is_leader = match &lease {
             None => true,
@@ -186,15 +197,18 @@ pub async fn run_worker_until(
             if due && !sweep_running.swap(true, Ordering::SeqCst) {
                 last_audit = Some(Instant::now());
                 let state = state.clone();
-                let running = sweep_running.clone();
                 let duration_out = last_audit_secs.clone();
+                let guard = SweepGuard(sweep_running.clone());
                 tokio::spawn(async move {
+                    // Held for the task's lifetime; its Drop clears the flag on
+                    // normal return or panic. Bound to a name (not `_`) so it
+                    // isn't dropped immediately.
+                    let _guard = guard;
                     let started = Instant::now();
                     if let Err(e) = audit(&state, false).await {
                         error!(error=?e, "audit failed");
                     }
                     duration_out.store(started.elapsed().as_secs(), Ordering::Relaxed);
-                    running.store(false, Ordering::SeqCst);
                 });
             }
             if let Err(e) = tick(&state).await {
@@ -831,7 +845,13 @@ async fn load_file_metadata(
         }
     };
     let core_metadata = names.contains(format!("{filename}{METADATA_SUFFIX}").as_str());
-    Some(FileMetadata::from_sidecar(filename, sc, core_metadata))
+    let provenance = names.contains(format!("{filename}{PROVENANCE_SUFFIX}").as_str());
+    Some(FileMetadata::from_sidecar(
+        filename,
+        sc,
+        core_metadata,
+        provenance,
+    ))
 }
 
 async fn read_sidecar(state: &AppState, artifact_key: &str) -> Result<Sidecar> {

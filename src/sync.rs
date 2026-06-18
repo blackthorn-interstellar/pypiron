@@ -345,6 +345,12 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
 
     let client = Client::builder()
         .user_agent("pypiron-sync/0.1 (+https://github.com/brycedrennan/pypiron)")
+        // Bound the handshake and any mid-stream stall so a dead/dribbling
+        // upstream fails a sync task cleanly (the retry loop absorbs it) instead
+        // of hanging forever. read_timeout is per-read and resets on each chunk,
+        // so it never bounds a large artifact that keeps streaming.
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
     let sink = match &resolved.dst_base {

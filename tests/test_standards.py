@@ -76,9 +76,7 @@ def test_pep691_content_negotiation(indexed_server):
 
 
 def test_pep691_global_json(indexed_server):
-    code, body, headers = http_get(
-        f"{indexed_server['simple']}", headers={"Accept": ACCEPT_PEP691}
-    )
+    code, body, headers = http_get(f"{indexed_server['simple']}", headers={"Accept": ACCEPT_PEP691})
     assert code == 200
     import json
 

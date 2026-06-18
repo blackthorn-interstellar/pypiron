@@ -106,8 +106,6 @@ def test_publish_then_install_flow_with_read_auth(disk_server_read_auth, tmp_pat
     else:
         raise TimeoutError("uploaded file never appeared in the authed index")
 
-    code, body, _ = http_get(
-        f"{server['base_url']}/files/authpkg/{wheel.name}", headers=auth
-    )
+    code, body, _ = http_get(f"{server['base_url']}/files/authpkg/{wheel.name}", headers=auth)
     assert code == 200
     assert body == wheel.read_bytes()

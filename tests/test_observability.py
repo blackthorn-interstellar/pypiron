@@ -30,9 +30,7 @@ def test_metrics_count_requests(disk_server):
     text = body.decode()
     assert "# TYPE pypiron_http_requests_total counter" in text
 
-    m = re.search(
-        r'pypiron_http_requests_total\{route="simple",status="2xx"\} (\d+)', text
-    )
+    m = re.search(r'pypiron_http_requests_total\{route="simple",status="2xx"\} (\d+)', text)
     assert m, text
     assert int(m.group(1)) >= 1
 
@@ -116,13 +114,7 @@ def test_json_log_format_emits_json_lines(disk_server_json_logs):
     code, _, _ = http_get(f"{server['base_url']}/health")
     assert code == 200
 
-    lines = [
-        line
-        for line in server["log_path"].read_text().splitlines()
-        if line.strip()
-    ]
+    lines = [line for line in server["log_path"].read_text().splitlines() if line.strip()]
     assert lines, "server wrote no log lines"
     parsed = [json.loads(line) for line in lines]
-    assert any(
-        "listening on" in p.get("fields", {}).get("message", "") for p in parsed
-    ), parsed
+    assert any("listening on" in p.get("fields", {}).get("message", "") for p in parsed), parsed

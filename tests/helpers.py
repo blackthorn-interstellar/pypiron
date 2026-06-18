@@ -3,21 +3,18 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
 import platform
 import re
 import shutil
 import socket
 import subprocess
-import sys
 import time
 import uuid
 import zipfile
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
-
 
 ACCEPT_PEP691 = "application/vnd.pypi.simple.v1+json"
 CLIENT_PINS = {
@@ -142,7 +139,11 @@ def _http_request(
             hdrs = {k.lower(): v for k, v in resp.headers.items()}
             return code, body, hdrs
     except HTTPError as e:
-        return e.code, e.read() if e.fp else b"", {k.lower(): v for k, v in (e.headers or {}).items()}
+        return (
+            e.code,
+            e.read() if e.fp else b"",
+            {k.lower(): v for k, v in (e.headers or {}).items()},
+        )
     except URLError as e:
         raise ConnectionError(f"HTTP request failed to {url}: {e}") from e
 
@@ -188,7 +189,9 @@ def http_request_auth(
     return _http_request(url, method=method, headers=headers, data=data, timeout=timeout)
 
 
-def http_get_bytes(url: str, *, headers: Optional[Dict[str, str]] = None, timeout: float = 10.0) -> bytes:
+def http_get_bytes(
+    url: str, *, headers: Optional[Dict[str, str]] = None, timeout: float = 10.0
+) -> bytes:
     code, body, _ = _http_request(url, method="GET", headers=headers, timeout=timeout)
     if code < 200 or code >= 300:
         raise RuntimeError(f"GET {url} failed with status {code}")
@@ -343,11 +346,7 @@ def make_wheel(name: str, version: str, dest_dir: Path) -> Path:
 
     record_lines = []
     for path, data in files.items():
-        digest = (
-            base64.urlsafe_b64encode(hashlib.sha256(data).digest())
-            .rstrip(b"=")
-            .decode()
-        )
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
         record_lines.append(f"{path},sha256={digest},{len(data)}")
     record_path = f"{dist_info}/RECORD"
     record_lines.append(f"{record_path},,")
@@ -368,9 +367,7 @@ def make_sdist(name: str, version: str, dest_dir: Path) -> Path:
     base = f"{name}-{version}"
     dest_dir.mkdir(parents=True, exist_ok=True)
     path = dest_dir / f"{base}.tar.gz"
-    pkg_info = (
-        f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
-    ).encode()
+    pkg_info = (f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n").encode()
     with tarfile.open(path, "w:gz") as tf:
         info = tarfile.TarInfo(f"{base}/PKG-INFO")
         info.size = len(pkg_info)
@@ -467,7 +464,9 @@ def upload_legacy(
     if username and password:
         hdrs["Authorization"] = _encode_basic_auth(username, password)
 
-    code, resp_body, _ = _http_request(legacy_url, method="POST", headers=hdrs, data=body, timeout=timeout)
+    code, resp_body, _ = _http_request(
+        legacy_url, method="POST", headers=hdrs, data=body, timeout=timeout
+    )
     if code != expect_status:
         raise RuntimeError(
             f"Upload returned {code}, expected {expect_status}: {resp_body.decode('utf-8', 'replace')}"

@@ -52,9 +52,7 @@ def _wait_for_status(simple_url, pkg, *, timeout=30.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            doc = http_get_json(
-                f"{simple_url}{pkg}/index.json", headers={"Accept": ACCEPT_PEP691}
-            )
+            doc = http_get_json(f"{simple_url}{pkg}/index.json", headers={"Accept": ACCEPT_PEP691})
             if "project-status" in doc:
                 return doc
         except (RuntimeError, ConnectionError):
@@ -80,10 +78,7 @@ def test_archived_status_served_in_html_and_json(disk_server, tmp_path):
     html = html.decode()
     assert '<meta name="pypi:project-status" content="archived">' in html
     # The arbitrary reason is attribute-escaped.
-    assert (
-        '<meta name="pypi:project-status-reason" content="moved to &quot;foo&quot;">'
-        in html
-    )
+    assert '<meta name="pypi:project-status-reason" content="moved to &quot;foo&quot;">' in html
 
 
 def test_active_project_has_no_status_marker(disk_server, tmp_path):

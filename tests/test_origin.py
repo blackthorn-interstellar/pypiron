@@ -80,8 +80,8 @@ def test_origin_claim_survives_deletion(disk_server, tmp_path):
     # Mirror an artifact in via the file tree, then index it.
     wheel_path = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
     (pkg_dir / wheel_path.name).write_bytes(wheel_path.read_bytes())
-    import json as _json
     import hashlib
+    import json as _json
 
     (pkg_dir / f"{wheel_path.name}.meta.json").write_text(
         _json.dumps(

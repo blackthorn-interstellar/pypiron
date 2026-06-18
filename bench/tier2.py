@@ -9,13 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import threading
 import time
 
 from meter import (
-    RssSampler,
     TORCH_PKG,
+    RssSampler,
     http_get,
     make_wheel_bytes,
     run_oha,
@@ -47,10 +46,15 @@ def w2_concurrent_uploads(args) -> dict:
         fname, v, blob = blobs[i]
         t0 = time.perf_counter()
         try:
-            s, b = upload_wheel(legacy, fname, blob, UPLOAD_PKG, v, args.user, args.password, timeout=1800)
+            s, b = upload_wheel(
+                legacy, fname, blob, UPLOAD_PKG, v, args.user, args.password, timeout=1800
+            )
             results[i] = {"status": s, "wall_s": round(time.perf_counter() - t0, 1)}
         except Exception as e:  # noqa: BLE001 — record, don't crash the run
-            results[i] = {"status": f"EXC({type(e).__name__})", "wall_s": round(time.perf_counter() - t0, 1)}
+            results[i] = {
+                "status": f"EXC({type(e).__name__})",
+                "wall_s": round(time.perf_counter() - t0, 1),
+            }
 
     # Read load runs throughout: did uploads degrade reads?
     read_during: dict = {}
@@ -109,25 +113,41 @@ def main() -> None:
     torch_file = json.loads(body)["files"][0]["filename"]
 
     print(f"R1 @ {args.big_conns} conns")
-    out["R1_json_1k"] = run_oha(args.oha, f"{base}/simple/bench-small/index.json", args.duration, args.big_conns)
+    out["R1_json_1k"] = run_oha(
+        args.oha, f"{base}/simple/bench-small/index.json", args.duration, args.big_conns
+    )
     print(f"R3 @ {args.big_conns} conns")
     _, _, hdrs = http_get(f"{base}/simple/bench-small/index.json")
     etag = next((v for k, v in hdrs.items() if k.lower() == "etag"), "")
     out["R3_304_1k"] = run_oha(
-        args.oha, f"{base}/simple/bench-small/index.json", args.duration, args.big_conns,
-        headers=[f"If-None-Match: {etag}"], expect_status=304,
+        args.oha,
+        f"{base}/simple/bench-small/index.json",
+        args.duration,
+        args.big_conns,
+        headers=[f"If-None-Match: {etag}"],
+        expect_status=304,
     )
     print(f"R2 torch idx @ {args.big_conns} conns")
-    out["R2_torch_1k"] = run_oha(args.oha, f"{base}/simple/{TORCH_PKG}/index.json", args.duration, args.big_conns)
+    out["R2_torch_1k"] = run_oha(
+        args.oha, f"{base}/simple/{TORCH_PKG}/index.json", args.duration, args.big_conns
+    )
     print(f"R6 302 @ {args.big_conns} conns")
     out["R6_302_1k"] = run_oha(
-        args.oha, f"{base}/files/{TORCH_PKG}/{torch_file}", args.duration, args.big_conns,
-        headers=["User-Agent: uv/0.7.0"], expect_status=302,
+        args.oha,
+        f"{base}/files/{TORCH_PKG}/{torch_file}",
+        args.duration,
+        args.big_conns,
+        headers=["User-Agent: uv/0.7.0"],
+        expect_status=302,
     )
     print(f"R7 metadata @ {args.big_conns} conns")
     out["R7_meta_1k"] = run_oha(
-        args.oha, f"{base}/files/{TORCH_PKG}/{torch_file}.metadata", args.duration, args.big_conns,
-        headers=["User-Agent: uv/0.7.0"], expect_status=200,
+        args.oha,
+        f"{base}/files/{TORCH_PKG}/{torch_file}.metadata",
+        args.duration,
+        args.big_conns,
+        headers=["User-Agent: uv/0.7.0"],
+        expect_status=200,
     )
 
     out["W2_concurrent_uploads"] = w2_concurrent_uploads(args)
@@ -138,7 +158,9 @@ def main() -> None:
     print("\n--- tier2 results ---")
     for k, v in out.items():
         if "rps" in v:
-            print(f"{k}: {v['rps']} rps p50={v['p50_ms']}ms p99={v['p99_ms']}ms ok%={v['status_ok_pct']}")
+            print(
+                f"{k}: {v['rps']} rps p50={v['p50_ms']}ms p99={v['p99_ms']}ms ok%={v['status_ok_pct']}"
+            )
         else:
             print(f"{k}: {json.dumps({kk: vv for kk, vv in v.items() if kk != 'uploads'})}")
 

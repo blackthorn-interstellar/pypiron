@@ -7,7 +7,6 @@ periodic sweep, and stale index entries pointing at deleted files get pruned.
 
 from __future__ import annotations
 
-import json
 import shutil
 import time
 

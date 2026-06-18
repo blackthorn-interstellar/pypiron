@@ -79,7 +79,9 @@ def test_artifact_download_redirects_to_presigned_url(presigned_server):
     assert code == 404
 
     # Metadata companions keep streaming from the node (resolution-critical).
-    code, body, _ = http_get_no_redirect(f"{server['base_url']}/files/{PACKAGE}/{wheel_name}.metadata")
+    code, body, _ = http_get_no_redirect(
+        f"{server['base_url']}/files/{PACKAGE}/{wheel_name}.metadata"
+    )
     assert code == 200
     assert body.startswith(b"Metadata-Version:")
 
@@ -145,8 +147,6 @@ def test_auto_mode_dispatches_on_client(auto_server):
     assert headers["cache-control"] == IMMUTABLE
 
     # Metadata companions stream even for redirect-safe clients.
-    code, body, _ = http_get_no_redirect(
-        f"{url}.metadata", headers={"User-Agent": "uv/0.7.0"}
-    )
+    code, body, _ = http_get_no_redirect(f"{url}.metadata", headers={"User-Agent": "uv/0.7.0"})
     assert code == 200
     assert body.startswith(b"Metadata-Version:")

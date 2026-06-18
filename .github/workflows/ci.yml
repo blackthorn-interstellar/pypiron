@@ -86,6 +86,21 @@ jobs:
       - name: Blackbox suite (disk mode)
         run: uv run -- pytest tests -m "not perf and not stress and not compat"
 
+  python-lint:
+    name: python lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - name: Sync dev dependencies
+        run: uv sync
+      - name: Ruff lint and format check
+        run: |
+          uv run -- ruff check tests bench scripts
+          uv run -- ruff format --check tests bench scripts
+
   fuzz-build:
     name: fuzz build (smoke)
     runs-on: ubuntu-latest

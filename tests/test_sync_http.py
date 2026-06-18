@@ -103,9 +103,7 @@ def test_http_mirror_preserves_historical_timestamps(
     )
 
 
-def test_mirror_disabled_without_admin_credential(
-    disk_server_uploader_only, pypiron_bin, tmp_path
-):
+def test_mirror_disabled_without_admin_credential(disk_server_uploader_only, pypiron_bin, tmp_path):
     """A server with no admin credential refuses mirror pushes outright."""
     server = disk_server_uploader_only
     pkg_list = tmp_path / "packages.txt"
@@ -146,9 +144,7 @@ def test_normal_uploads_cannot_backdate(disk_server, tmp_path):
     )
 
 
-def test_mirror_prefix_block_holds_even_when_already_mirror_claimed(
-    disk_server_prefixed, tmp_path
-):
+def test_mirror_prefix_block_holds_even_when_already_mirror_claimed(disk_server_prefixed, tmp_path):
     """The private namespace is off-limits to mirrors on every write, not just
     the first claim — adopting a prefix after a name was mirror-claimed still
     shuts the door (the guardrail can't silently no-op)."""

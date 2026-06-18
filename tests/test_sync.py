@@ -8,7 +8,7 @@ version that existed on PyPI at that date.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pytest
 from packaging.version import Version
@@ -65,9 +65,7 @@ def test_mirror_preserves_historical_timestamps(
     # The server's worker picks up the dirty marker and indexes the mirror.
     data = pypi_project_json(PACKAGE)
     latest = data["info"]["version"]
-    pypi_entry = next(
-        f for f in data["releases"][latest] if f["filename"].endswith(".whl")
-    )
+    pypi_entry = next(f for f in data["releases"][latest] if f["filename"].endswith(".whl"))
     latest_wheel = pypi_entry["filename"]
     wait_for_file_in_index(disk_server["simple"], PACKAGE, latest_wheel)
 

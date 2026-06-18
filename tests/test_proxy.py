@@ -25,9 +25,7 @@ pytestmark = pytest.mark.integration
 
 
 def _upload(server, dist, package):
-    upload_legacy(
-        server["legacy"], dist, username=server["user"], password=server["password"]
-    )
+    upload_legacy(server["legacy"], dist, username=server["user"], password=server["password"])
     wait_for_file_in_index(server["simple"], package, dist.name)
 
 
@@ -72,9 +70,7 @@ def test_metadata_passthrough_does_not_cache_the_wheel(proxy_pair, tmp_path):
 
     # ...and serving it streams from upstream without committing anything:
     # a resolver probing candidate wheels must not stampede them into storage.
-    code, body, _ = http_get(
-        f"{proxy['base_url']}/files/mdpass/{wheel.name}.metadata"
-    )
+    code, body, _ = http_get(f"{proxy['base_url']}/files/mdpass/{wheel.name}.metadata")
     assert code == 200
     assert b"Metadata-Version" in body
     pkg_dir = proxy["data_dir"] / "packages" / "mdpass"
@@ -99,9 +95,7 @@ def test_private_package_never_falls_through(proxy_pair, tmp_path):
         "private name resolved from upstream — dependency confusion"
     )
 
-    code, _, _ = http_get(
-        f"{proxy['base_url']}/files/mixedpkg/{upstream_wheel.name}"
-    )
+    code, _, _ = http_get(f"{proxy['base_url']}/files/mixedpkg/{upstream_wheel.name}")
     assert code == 404
     assert (
         proxy["data_dir"] / "packages" / "mixedpkg" / ".origin"

@@ -56,7 +56,10 @@ def make_wheel(name: str, version: str) -> Path:
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{safe.lower()}.py", f'__version__ = "{version}"\n')
         zf.writestr(f"{di}/METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
-        zf.writestr(f"{di}/WHEEL", "Wheel-Version: 1.0\nGenerator: cas\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+        zf.writestr(
+            f"{di}/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: cas\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
         zf.writestr(f"{di}/RECORD", "")
     return path
 
@@ -80,9 +83,11 @@ def upload(base: str, wheel: Path) -> None:
     boundary = f"----{uuid.uuid4().hex}"
     parts = []
     for k, v in form.items():
-        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode())
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+        )
     parts.append(
-        f"--{boundary}\r\nContent-Disposition: form-data; name=\"content\"; filename=\"{fname}\"\r\n"
+        f'--{boundary}\r\nContent-Disposition: form-data; name="content"; filename="{fname}"\r\n'
         "Content-Type: application/octet-stream\r\n\r\n".encode()
     )
     parts.append(data)
@@ -92,7 +97,10 @@ def upload(base: str, wheel: Path) -> None:
         f"{base}/legacy/",
         data=body,
         method="POST",
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Authorization": basic_auth()},
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Authorization": basic_auth(),
+        },
     )
     urlopen(req, timeout=30).read()
 
@@ -178,15 +186,19 @@ def main() -> int:
     leader = None
     try:
         # put_if_none_match acquire: exactly one node creates the lease.
-        assert wait_for(
-            lambda: sum("lease acquired" in logtext(n) for n in (a, b)) == 1, BUDGET
-        ), "no node acquired the lease (put_if_none_match acquire failed on real S3)"
+        assert wait_for(lambda: sum("lease acquired" in logtext(n) for n in (a, b)) == 1, BUDGET), (
+            "no node acquired the lease (put_if_none_match acquire failed on real S3)"
+        )
         leader = a if "lease acquired" in logtext(a) else b
         follower = b if leader is a else a
         results["put_if_none_match_acquire"] = f"{leader['label']} acquired"
         # put_if_none_match conflict: the other node did NOT also acquire.
-        assert "lease acquired" not in logtext(follower), "both nodes acquired — conflict not detected"
-        results["put_if_none_match_conflict"] = f"{follower['label']} stayed follower (create lost cleanly)"
+        assert "lease acquired" not in logtext(follower), (
+            "both nodes acquired — conflict not detected"
+        )
+        results["put_if_none_match_conflict"] = (
+            f"{follower['label']} stayed follower (create lost cleanly)"
+        )
 
         # Seed the leader's in-memory global name set + ETag pin.
         upload(leader["base"], make_wheel("casseed", "1.0"))

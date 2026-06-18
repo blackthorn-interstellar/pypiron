@@ -63,7 +63,9 @@ def test_upload_index_download_install(server, tmp_path, uv_path, uv_venv):
 
     # Downloaded bytes match the original sha256.
     downloaded = tmp_path / "downloaded.whl"
-    downloaded.write_bytes(http_get_bytes(f"{server['base_url']}/files/{PACKAGE}/{wheel_path.name}"))
+    downloaded.write_bytes(
+        http_get_bytes(f"{server['base_url']}/files/{PACKAGE}/{wheel_path.name}")
+    )
     assert sha256_file(downloaded) == orig_sha
 
     # Installs into a fresh venv and imports.

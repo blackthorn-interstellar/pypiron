@@ -48,11 +48,14 @@ cargo-check:  ## Check the project for compilation errors
 	cargo check
 
 af: fmt
-fmt:  ## Format the code using rustfmt
+fmt:  ## Format Rust (rustfmt) and Python (ruff: sort imports, then format)
 	cargo fmt --all
+	uv run -- ruff check --fix tests bench scripts
+	uv run -- ruff format tests bench scripts
 
-lint:  ## Run clippy lints
+lint:  ## Run clippy and ruff lints
 	cargo clippy --all-targets -- -D warnings
+	uv run -- ruff check tests bench scripts
 
 clean:  ## Clean build artifacts
 	cargo clean

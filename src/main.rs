@@ -453,7 +453,10 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
     let worker_handle = tokio::spawn(worker::run_worker_until(state.clone(), shutdown_rx));
 
     // serve
-    info!("listening on http://{}", cli.bind_addr);
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "listening on http://{}", cli.bind_addr
+    );
     let listener = tokio::net::TcpListener::bind(&cli.bind_addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

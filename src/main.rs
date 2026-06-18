@@ -27,6 +27,7 @@ mod origin;
 mod proxy;
 mod render;
 mod sidecar;
+mod simple;
 mod storage;
 mod sync;
 mod upload;
@@ -37,7 +38,9 @@ mod worker;
 use names::{
     infer_package_from_filename, infer_version_from_filename, is_normalized, normalize_pkg_name,
 };
-use sidecar::{metadata_key, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX};
+use sidecar::{
+    metadata_key, provenance_key, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, PROVENANCE_SUFFIX,
+};
 use storage::{Storage, StorageArgs};
 
 const PACKAGES_PREFIX: &str = "packages/";
@@ -640,6 +643,11 @@ async fn initialize_indexes(state: &AppState) -> Result<()> {
 /// Legacy PyPI upload endpoint compatible with uv/twine.
 /// Multipart form with metadata text fields (name, version, sha256_digest,
 /// requires_python, ...) and the file in field "content" (or "file").
+/// Upper bound for the PEP 740 `provenance`/`attestations` form fields. These
+/// JSON objects are KBs in practice; the cap only guards against a pathological
+/// part buffering unbounded bytes in RAM.
+const PROVENANCE_MAX_FIELD_BYTES: usize = 4 * 1024 * 1024;
+
 async fn legacy_upload(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -717,12 +725,17 @@ async fn legacy_upload(
                 // Metadata fields are tiny (version, sha256_digest, ...). The
                 // artifact is streamed to a disk spool; a non-content part must
                 // not be the hole that buffers ~1 GiB in RAM and OOMs the box.
-                const MAX_FIELD_BYTES: usize = 64 * 1024;
+                // The PEP 740 provenance/attestations objects are larger JSON —
+                // bounded higher, but still bounded.
+                let max_field_bytes = match field_name.as_str() {
+                    "provenance" | "attestations" => PROVENANCE_MAX_FIELD_BYTES,
+                    _ => 64 * 1024,
+                };
                 let mut buf = Vec::new();
                 loop {
                     match field.chunk().await {
                         Ok(Some(chunk)) => {
-                            if buf.len() + chunk.len() > MAX_FIELD_BYTES {
+                            if buf.len() + chunk.len() > max_field_bytes {
                                 return Err((
                                     StatusCode::BAD_REQUEST,
                                     format!("Form field '{field_name}' is too large"),
@@ -833,6 +846,21 @@ async fn legacy_upload(
                 .into(),
         ));
     }
+
+    // PEP 740: pypiron relays PyPI's already-verified provenance through the
+    // proxy/sync mirror paths, but is not itself a verifying authority and
+    // cannot synthesize a valid provenance object from a bare `attestations`
+    // array (it has no Trusted Publisher identity). Refuse first-party
+    // attestations fail-closed rather than store something no verifier trusts.
+    if !is_mirror && fields.contains_key("attestations") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "pypiron relays mirrored provenance (via the proxy and sync) but does not verify \
+             first-party attestations; re-run the upload without --attestations"
+                .into(),
+        ));
+    }
+
     let upload_time = match fields.get("upload_time") {
         Some(ts) => {
             if OffsetDateTime::parse(ts, &Rfc3339).is_err() {
@@ -978,6 +1006,26 @@ async fn legacy_upload(
                 }
             }
             None => warn!(%filename, "wheel has no extractable METADATA"),
+        }
+    }
+
+    // PEP 740: store the relayed provenance object next to the artifact. Only
+    // mirror uploads carry it (`sync --to` forwards PyPI's provenance verbatim);
+    // first-party attestations were refused above. Best-effort, like metadata:
+    // a missing companion only drops the supply-chain signal.
+    if is_mirror {
+        if let Some(prov) = fields.get("provenance") {
+            if let Err(e) = state
+                .storage
+                .put_bytes(
+                    &provenance_key(&key),
+                    prov.clone().into_bytes(),
+                    Some("application/json"),
+                )
+                .await
+            {
+                warn!(error=?e, %filename, "failed to store PEP 740 provenance");
+            }
         }
     }
 
@@ -1287,7 +1335,12 @@ async fn files_get(
         return unauthorized();
     }
     let pkg = normalize_pkg_name(&package);
-    let servable = match filename.strip_suffix(METADATA_SUFFIX) {
+    // A request is for an artifact or one of its served companions
+    // (`.metadata`, `.provenance`); the sidecar JSON and dotfiles never serve.
+    let servable = match filename
+        .strip_suffix(METADATA_SUFFIX)
+        .or_else(|| filename.strip_suffix(PROVENANCE_SUFFIX))
+    {
         Some(base) => sidecar::is_artifact(base),
         None => sidecar::is_artifact(&filename),
     };
@@ -1321,6 +1374,26 @@ async fn files_get(
         return resp;
     }
 
+    // PEP 740 provenance companion: same RAM-cache + passthrough story as
+    // metadata, served as JSON. A mirror snapshot is point-in-time, so it is
+    // cached as immutably as the artifact it describes.
+    if filename.ends_with(PROVENANCE_SUFFIX) && headers.get(header::RANGE).is_none() {
+        let resp = serve_index(
+            &state,
+            key,
+            "application/json",
+            ARTIFACT_CACHE_CONTROL,
+            &headers,
+        )
+        .await;
+        if resp.status() == StatusCode::NOT_FOUND {
+            if let Some(upstream) = proxy_provenance_passthrough(&state, &pkg, &filename).await {
+                return upstream;
+            }
+        }
+        return resp;
+    }
+
     // On-demand mirroring: make sure the artifact is in storage before the
     // presign/stream logic runs (a presigned redirect never observes a 404,
     // so the fetch can't be triggered by one).
@@ -1338,7 +1411,7 @@ async fn files_get(
         ArtifactDelivery::Redirect => true,
         ArtifactDelivery::Auto => redirect_safe_client(&headers),
     };
-    if redirect && !filename.ends_with(METADATA_SUFFIX) {
+    if redirect && !filename.ends_with(METADATA_SUFFIX) && !filename.ends_with(PROVENANCE_SUFFIX) {
         // No existence check: presigning is local HMAC math, so the redirect
         // path costs zero network round trips. A signed URL to a missing key
         // gets S3's own 404 (the server's credentials carry s3:ListBucket —
@@ -1409,6 +1482,30 @@ async fn proxy_metadata_passthrough(
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(header::CACHE_CONTROL, ARTIFACT_CACHE_CONTROL)
+            .header(header::CONTENT_LENGTH, bytes.len())
+            .body(Body::from(bytes))
+            .unwrap_or_else(not_found),
+    )
+}
+
+/// Serve a PEP 740 provenance companion straight from upstream, no storage
+/// writes — the mirror equivalent of metadata passthrough.
+async fn proxy_provenance_passthrough(
+    state: &Arc<AppState>,
+    pkg: &str,
+    filename: &str,
+) -> Option<Response<Body>> {
+    let proxy = match eligible_proxy(state, pkg).await {
+        Some(Ok(proxy)) => proxy,
+        Some(Err(resp)) => return Some(resp),
+        None => return None,
+    };
+    let bytes = proxy.fetch_provenance(state, pkg, filename).await?;
+    Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
             .header(header::CACHE_CONTROL, ARTIFACT_CACHE_CONTROL)
             .header(header::CONTENT_LENGTH, bytes.len())
             .body(Body::from(bytes))
@@ -1522,7 +1619,11 @@ async fn files_delete(
     // access — delete the `.origin` file directly.
     let _ = state
         .storage
-        .delete_keys(&[sidecar_key(&key), sidecar::metadata_key(&key)])
+        .delete_keys(&[
+            sidecar_key(&key),
+            sidecar::metadata_key(&key),
+            sidecar::provenance_key(&key),
+        ])
         .await;
 
     // Worker confirms from truth and prunes global membership if needed.

@@ -5,8 +5,9 @@ use std::collections::{BTreeSet, HashMap};
 use crate::names::infer_version_from_filename;
 use crate::sidecar::{Sidecar, Yanked};
 
-/// Simple API version: PEP 691 (1.0) + PEP 700 fields (1.1).
-const API_VERSION: &str = "1.1";
+/// Simple API version: PEP 691 (1.0) + PEP 700 fields (1.1) + PEP 714
+/// `core-metadata` (1.2) + PEP 740 `provenance` (1.3).
+const API_VERSION: &str = "1.3";
 
 /// PEP 691 JSON simple-API content type (response, outgoing/incoming Accept).
 pub const SIMPLE_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
@@ -29,14 +30,21 @@ pub struct FileMetadata {
     pub requires_python: Option<String>,
     /// Whether a PEP 658 `<filename>.metadata` companion exists.
     pub core_metadata: bool,
+    /// Whether a PEP 740 `<filename>.provenance` companion exists.
+    pub provenance: bool,
 }
 
 impl FileMetadata {
-    /// Build an index entry from an artifact's sidecar. `core_metadata` is
-    /// whether the `<filename>.metadata` companion exists. The worker and
-    /// `verify` both derive index entries this exact way — keep them in
-    /// lockstep by routing through here.
-    pub fn from_sidecar(filename: &str, sc: Sidecar, core_metadata: bool) -> Self {
+    /// Build an index entry from an artifact's sidecar. `core_metadata` and
+    /// `provenance` are whether the `<filename>.metadata` / `.provenance`
+    /// companions exist. The worker and `verify` both derive index entries this
+    /// exact way — keep them in lockstep by routing through here.
+    pub fn from_sidecar(
+        filename: &str,
+        sc: Sidecar,
+        core_metadata: bool,
+        provenance: bool,
+    ) -> Self {
         Self {
             filename: filename.to_string(),
             sha256: sc.sha256,
@@ -46,6 +54,7 @@ impl FileMetadata {
             yanked: sc.yanked,
             requires_python: sc.requires_python,
             core_metadata,
+            provenance,
         }
     }
 }
@@ -77,6 +86,14 @@ pub fn pep503_package_html(package: &str, files: &[FileMetadata]) -> String {
         if f.core_metadata {
             // PEP 714 name plus the original PEP 658 name for older clients.
             attrs.push_str(r#" data-core-metadata="true" data-dist-info-metadata="true""#);
+        }
+        if f.provenance {
+            // PEP 740: point at the provenance companion served next to the
+            // artifact. Root-relative like every URL we emit — we don't know
+            // our public base, and clients resolve it against the index URL.
+            attrs.push_str(&format!(
+                r#" data-provenance="/files/{pkg_attr}/{fname_attr}.provenance""#
+            ));
         }
         match &f.yanked {
             Yanked::Flag(false) => {}
@@ -124,6 +141,8 @@ struct Pep691File {
     core_metadata: Option<bool>,
     #[serde(rename = "dist-info-metadata", skip_serializing_if = "Option::is_none")]
     dist_info_metadata: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -169,6 +188,9 @@ pub fn pep691_package_json(package: &str, files: &[FileMetadata]) -> String {
                 requires_python: f.requires_python.clone(),
                 core_metadata: f.core_metadata.then_some(true),
                 dist_info_metadata: f.core_metadata.then_some(true),
+                provenance: f
+                    .provenance
+                    .then(|| format!("/files/{package}/{}.provenance", f.filename)),
             }
         })
         .collect();
@@ -232,6 +254,7 @@ mod tests {
             yanked: Yanked::Flag(false),
             requires_python: None,
             core_metadata: false,
+            provenance: false,
         }
     }
 
@@ -239,7 +262,7 @@ mod tests {
     fn package_json_has_pep700_fields() {
         let json = pep691_package_json("six", &[meta(Some("1.16.0"))]);
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(doc["meta"]["api-version"], "1.1");
+        assert_eq!(doc["meta"]["api-version"], "1.3");
         assert_eq!(doc["versions"][0], "1.16.0");
         assert_eq!(doc["files"][0]["size"], 11236);
         assert_eq!(doc["files"][0]["upload-time"], "2026-06-11T00:00:00Z");
@@ -257,7 +280,7 @@ mod tests {
         let html = pep503_package_html("six", &[meta(None)]);
         assert!(html.contains("#sha256=abc123"));
         assert!(!html.contains("data-yanked"));
-        assert!(html.contains(r#"<meta name="pypi:repository-version" content="1.1">"#));
+        assert!(html.contains(r#"<meta name="pypi:repository-version" content="1.3">"#));
     }
 
     #[test]
@@ -282,6 +305,32 @@ mod tests {
             serde_json::from_str(&pep691_package_json("six", &[plain])).unwrap();
         assert!(doc["files"][0].get("requires-python").is_none());
         assert!(doc["files"][0].get("core-metadata").is_none());
+    }
+
+    #[test]
+    fn provenance_renders_in_html_and_json() {
+        let mut m = meta(Some("1.16.0"));
+        m.provenance = true;
+
+        let html = pep503_package_html("six", &[m.clone()]);
+        assert!(html.contains(
+            r#"data-provenance="/files/six/six-1.16.0-py2.py3-none-any.whl.provenance""#
+        ));
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&pep691_package_json("six", &[m])).unwrap();
+        assert_eq!(
+            doc["files"][0]["provenance"],
+            "/files/six/six-1.16.0-py2.py3-none-any.whl.provenance"
+        );
+
+        // Absent companion → no field / attribute at all.
+        let plain = meta(None);
+        let html = pep503_package_html("six", std::slice::from_ref(&plain));
+        assert!(!html.contains("data-provenance"));
+        let doc: serde_json::Value =
+            serde_json::from_str(&pep691_package_json("six", &[plain])).unwrap();
+        assert!(doc["files"][0].get("provenance").is_none());
     }
 
     #[test]

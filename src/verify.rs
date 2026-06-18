@@ -16,7 +16,7 @@ use crate::names::normalize_pkg_name;
 use crate::render::{
     pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
 };
-use crate::sidecar::{is_artifact, Sidecar, METADATA_SUFFIX, SIDECAR_SUFFIX};
+use crate::sidecar::{is_artifact, Sidecar, METADATA_SUFFIX, PROVENANCE_SUFFIX, SIDECAR_SUFFIX};
 use crate::storage::{is_not_found, ObjectMeta, Storage, StorageArgs, SHARD_CHARS};
 use crate::{DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 
@@ -191,7 +191,13 @@ async fn check_package(
                 }
             };
             let core_metadata = names.contains(format!("{filename}{METADATA_SUFFIX}").as_str());
-            files.push(FileMetadata::from_sidecar(filename, sc, core_metadata));
+            let provenance = names.contains(format!("{filename}{PROVENANCE_SUFFIX}").as_str());
+            files.push(FileMetadata::from_sidecar(
+                filename,
+                sc,
+                core_metadata,
+                provenance,
+            ));
         }
     }
 

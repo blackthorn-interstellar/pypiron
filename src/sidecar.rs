@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 pub const SIDECAR_SUFFIX: &str = ".meta.json";
 pub const METADATA_SUFFIX: &str = ".metadata";
+/// PEP 740 provenance object, relayed verbatim from upstream next to the
+/// artifact. Like `.metadata`, it is a served companion, not truth we author.
+pub const PROVENANCE_SUFFIX: &str = ".provenance";
 
 /// PEP 592 yank state: `false`, `true`, or a reason string.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -49,12 +52,18 @@ pub fn metadata_key(artifact_key: &str) -> String {
     format!("{artifact_key}{METADATA_SUFFIX}")
 }
 
+/// Storage key of the PEP 740 provenance companion for an artifact key.
+pub fn provenance_key(artifact_key: &str) -> String {
+    format!("{artifact_key}{PROVENANCE_SUFFIX}")
+}
+
 /// True if `filename` (no directory part) is an artifact, not a sidecar or dotfile.
 pub fn is_artifact(filename: &str) -> bool {
     !filename.is_empty()
         && !filename.starts_with('.')
         && !filename.ends_with(SIDECAR_SUFFIX)
         && !filename.ends_with(METADATA_SUFFIX)
+        && !filename.ends_with(PROVENANCE_SUFFIX)
 }
 
 #[cfg(test)]
@@ -66,6 +75,7 @@ mod tests {
         assert!(is_artifact("six-1.16.0-py2.py3-none-any.whl"));
         assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.meta.json"));
         assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.metadata"));
+        assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.provenance"));
         assert!(!is_artifact(".origin"));
         assert!(!is_artifact(""));
     }

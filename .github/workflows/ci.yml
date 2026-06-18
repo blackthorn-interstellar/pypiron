@@ -282,7 +282,9 @@ jobs:
     strategy:
       matrix:
         platform:
-          - runner: macos-13
+          # GitHub retired the macos-13 (Intel) image on 2025-12-04; macos-15-intel
+          # is its standard x86_64 replacement (last Intel image, supported to ~2027-08).
+          - runner: macos-15-intel
             target: x86_64
           - runner: macos-14
             target: aarch64

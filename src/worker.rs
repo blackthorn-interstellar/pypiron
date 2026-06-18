@@ -910,8 +910,20 @@ async fn put_if_changed(state: &AppState, key: &str, bytes: Vec<u8>, ct: &str) -
 }
 
 async fn write_pkg_indexes(state: &AppState, pkg: &str, files: &[FileMetadata]) -> Result<()> {
-    let html = pep503_package_html(pkg, files);
-    let json = pep691_package_json(pkg, files);
+    // Status is per-project truth (PEP 792). A read error propagates — we
+    // re-render against the prior index rather than assume `active` and, say,
+    // re-expose links for a project that should be quarantined.
+    let status = crate::status::read_status(state.storage.as_ref(), pkg).await?;
+    // Quarantine omits file links; the delete-vs-render decision upstream still
+    // keys on the real artifact count, so a quarantined project keeps a
+    // status-bearing (link-free) page instead of 404ing.
+    let render_files: &[FileMetadata] = if status.status.blocks_downloads() {
+        &[]
+    } else {
+        files
+    };
+    let html = pep503_package_html(pkg, render_files, &status);
+    let json = pep691_package_json(pkg, render_files, &status);
 
     let base = format!("{SIMPLE_PREFIX}{pkg}/");
     put_if_changed(

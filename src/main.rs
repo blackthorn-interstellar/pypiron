@@ -28,6 +28,7 @@ mod proxy;
 mod render;
 mod sidecar;
 mod simple;
+mod status;
 mod storage;
 mod sync;
 mod upload;

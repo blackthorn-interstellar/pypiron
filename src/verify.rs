@@ -204,9 +204,24 @@ async fn check_package(
     let has_artifacts = !artifacts.is_empty();
     let base = format!("{SIMPLE_PREFIX}{pkg}/");
     if has_artifacts && comparable {
+        // Render exactly as the worker does (worker::write_pkg_indexes): same
+        // per-project status, same quarantine link-omission — otherwise every
+        // status-bearing package would read as a spurious stale-view.
+        let status = crate::status::read_status(storage, pkg).await?;
+        let render_files: &[FileMetadata] = if status.status.blocks_downloads() {
+            &[]
+        } else {
+            &files
+        };
         for (suffix, expected) in [
-            ("index.html", pep503_package_html(pkg, &files)),
-            ("index.json", pep691_package_json(pkg, &files)),
+            (
+                "index.html",
+                pep503_package_html(pkg, render_files, &status),
+            ),
+            (
+                "index.json",
+                pep691_package_json(pkg, render_files, &status),
+            ),
         ] {
             match storage.get_bytes(&format!("{base}{suffix}")).await {
                 Ok(actual) if actual == expected.as_bytes() => {}

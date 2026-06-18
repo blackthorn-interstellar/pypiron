@@ -31,6 +31,7 @@ use crate::names::{
 use crate::origin;
 use crate::sidecar::{metadata_key, provenance_key, sidecar_key, Sidecar, Yanked};
 use crate::simple::{self, SimpleFile};
+use crate::status::{self, ProjectStatusDoc};
 use crate::storage::{Storage, StorageArgs};
 use crate::worker::mark_dirty;
 use crate::PACKAGES_PREFIX;
@@ -389,7 +390,7 @@ async fn sync_one_package(
         }
     }
 
-    let selected = fetch_selected_files(client, resolved, spec).await?;
+    let (selected, upstream_status) = fetch_selected_files(client, resolved, spec).await?;
     info!("Syncing {pkg} ({} matching files selected)", selected.len());
 
     if resolved.dry_run {
@@ -449,6 +450,21 @@ async fn sync_one_package(
 
     if wrote {
         if let Sink::Storage(storage) = sink {
+            // Relay PEP 792 status verbatim, inside the intent/commit window so
+            // the rebuild this triggers renders it. Best-effort — the advisory
+            // marker must never fail an otherwise-good mirror. Re-sync clears a
+            // stale marker once upstream returns to active. (A status change
+            // with no file change lags until the next file write — and a
+            // quarantined upstream serves no files, so that case relies on the
+            // existing empty-package handling; documented in STANDARDS.md.)
+            match &upstream_status {
+                Some(doc) if !doc.status.is_active() => {
+                    let _ = status::write_status(storage.as_ref(), pkg, doc).await;
+                }
+                _ => {
+                    let _ = status::clear_status(storage.as_ref(), pkg).await;
+                }
+            }
             match &intent_nonce {
                 Some(nonce) => crate::worker::mark_commit(storage.as_ref(), pkg, nonce).await?,
                 None => mark_dirty(storage.as_ref(), pkg).await?,
@@ -471,7 +487,7 @@ async fn fetch_selected_files(
     client: &Client,
     resolved: &Resolved,
     spec: &PackageSpec,
-) -> Result<Vec<Selected>> {
+) -> Result<(Vec<Selected>, Option<ProjectStatusDoc>)> {
     let base_url = format!(
         "{}/simple/{}/",
         resolved.src_base.trim_end_matches('/'),
@@ -492,6 +508,7 @@ async fn fetch_selected_files(
             .unwrap_or_else(|| raw.to_string())
     };
 
+    let upstream_status = index.project_status.clone();
     let mut selected = Vec::new();
     for mut file in index.files {
         // No digest, no service: every artifact we hand out must be verifiable.
@@ -522,7 +539,7 @@ async fn fetch_selected_files(
     if selected.is_empty() {
         warn!("No matching files for package '{}'", spec.name);
     }
-    Ok(selected)
+    Ok((selected, upstream_status))
 }
 
 /// Best-effort provenance fetch — supplemental, never fails the file.

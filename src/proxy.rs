@@ -501,6 +501,10 @@ impl Proxy {
         else {
             return Ok(Listing::Missing);
         };
+        // Relay the upstream PEP 792 status verbatim (default active). An
+        // upstream-quarantined project returns no files anyway, so the marker
+        // rides along with a naturally empty listing.
+        let status = index.project_status.clone().unwrap_or_default();
         let files: Vec<SimpleFile> = index
             .files
             .into_iter()
@@ -509,9 +513,14 @@ impl Proxy {
             .filter(|f| matches_filters(f, &self.filter))
             .collect();
         let metas: Vec<FileMetadata> = files.iter().map(SimpleFile::as_file_metadata).collect();
+        let render_metas: &[FileMetadata] = if status.status.blocks_downloads() {
+            &[]
+        } else {
+            &metas
+        };
         Ok(Listing::Found(Arc::new(Found {
-            html: rendered(render::pep503_package_html(pkg, &metas)),
-            json: rendered(render::pep691_package_json(pkg, &metas)),
+            html: rendered(render::pep503_package_html(pkg, render_metas, &status)),
+            json: rendered(render::pep691_package_json(pkg, render_metas, &status)),
             files,
         })))
     }

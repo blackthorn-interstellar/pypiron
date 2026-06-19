@@ -167,12 +167,13 @@ cmd_run() {
 cmd_capacity() {
   load_env
   local track="${RIG_TRACK:-1}"
+  local capflag="--capacity"; [[ "${RIG_INSTALL_MIX:-0}" == "1" ]] && capflag="--install-mix"
   local servers=("$@"); [[ ${#servers[@]} -eq 0 ]] && servers=(pypiron pypiserver devpi pypicloud bandersnatch proxpi)
   local rigenv="PYPIRON_S3_BUCKET=${RIG_BUCKET} AWS_REGION=${RIG_REGION}"
   local failed=()
   for s in "${servers[@]}"; do
-    echo "== capacity ${s} (track ${track})"
-    rig_ssh "cd pypiron/bench/install && sudo ${rigenv} python3 bench.py --server ${s} --track ${track} --tier ${RIG_TIER} --arch ${RIG_ARCH} --capacity --no-drive" \
+    echo "== capacity ${s} (${capflag}, track ${track})"
+    rig_ssh "cd pypiron/bench/install && sudo ${rigenv} python3 bench.py --server ${s} --track ${track} --tier ${RIG_TIER} --arch ${RIG_ARCH} ${capflag} --no-drive" \
       || { echo "!! ${s} FAILED (continuing)"; failed+=("$s"); }
   done
   [[ ${#failed[@]} -gt 0 ]] && echo "== failed servers: ${failed[*]}"

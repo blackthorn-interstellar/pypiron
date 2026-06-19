@@ -166,7 +166,12 @@ def main() -> None:
     ap.add_argument("--samples", type=int, default=24)
     ap.add_argument("--sampling", default="uniform", choices=["uniform", "zipf"])
     ap.add_argument("--python", default="3.11")
-    ap.add_argument("--capacity", action="store_true", help="run the oha breaking-point ramp")
+    ap.add_argument(
+        "--capacity", action="store_true", help="run the oha index-read breaking-point ramp"
+    )
+    ap.add_argument(
+        "--install-mix", action="store_true", help="run the oha install-mix ramp (installs/sec)"
+    )
     ap.add_argument("--no-drive", action="store_true", help="skip the uv install sweep")
     ap.add_argument(
         "--rep-pkg", default="flask", help="representative package for the capacity ramp"
@@ -311,28 +316,32 @@ def main() -> None:
             }
             result_path.write_text(json.dumps(result, indent=2) + "\n")
 
-        if args.capacity:
+        if args.capacity or args.install_mix:
             ensure_oha(args.arch)
-            cap_name = f"cap-{out_name}"
-            print("-- capacity (oha breaking-point ramp)")
-            exec_loadgen(
+            common = [
                 "python3",
                 "capacity.py",
                 "--index-url",
                 index_url,
                 "--host",
                 spec["host"],
-                "--rep-pkg",
-                args.rep_pkg,
+                "--arch",
+                args.arch,
                 "--oha",
                 "/repo/bench/install/.bin/oha",
                 "--control-url",
                 "http://control/control-index.json",
                 "--label",
                 args.server,
-                "--output",
-                f"results/{cap_name}",
-            )
+            ]
+            if args.install_mix:
+                print("-- capacity (install-mix ramp -> installs/sec)")
+                exec_loadgen(*common, "--install-mix", "--output", f"results/capmix-{out_name}")
+            if args.capacity:
+                print("-- capacity (index-read MST ramp)")
+                exec_loadgen(
+                    *common, "--rep-pkg", args.rep_pkg, "--output", f"results/cap-{out_name}"
+                )
 
         print(f"\n== {args.server} done in {round(time.time() - t0, 1)}s")
     finally:

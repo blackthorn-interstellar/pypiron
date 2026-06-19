@@ -346,21 +346,37 @@ pypicloud are mid-pack with worse p99 tails under load; **devpi is the clear
 laggard** — it serves indexes through Python, so it plateaus at ~560/min and its
 p50 blows out to 6.5 s at C=128 where the nginx-fronted servers hold.
 
-**Track 2 — best cloud.** pypiron `--storage s3 --artifact-delivery redirect`
-(node serves only the 302 + index; S3 serves the bytes): C=8–128 all 0 errors,
-1143 / 1496 / 1219 / 1247 installs/min — on par with its Track 1 disk throughput
-while offloading every wheel byte to S3, an option no competitor has. (C=1 shows
-40 errors² — a seed-race, not a serving fault.) pypicloud `s3 + DynamoDB` did not
-stand up (archived tool; container failed to boot against DynamoDB) — left as a
-known gap.
+**Track 2 — every server in its best-production config** (all six, re-run on a
+fresh box). pypiron = S3 + presigned redirect; pypicloud = S3 + DynamoDB; the
+other four have no cloud-offload path, so their Track 1 config *is* their optimal
+and they run identically. installs/min:
+
+| Server | config | C=8 | C=32 | C=128 | C=32 p50 | resolve p50 | err |
+|---|---|---|---|---|---|---|---|
+| bandersnatch | nginx static | 1663 | **1817** | 1626 | 265 ms | 42 ms | 0 |
+| pypiserver | gunicorn+cached-dir | 1582 | 1770 | 1637 | 343 ms | 44 ms | 0 |
+| proxpi | 1-worker cache | 1207 | 1408 | 1173 | 917 ms | 55 ms | 0 |
+| pypicloud | **S3 + DynamoDB** | 1088 | 1362 | 1056 | 455 ms | 50 ms | 20¹ |
+| **pypiron** | **S3 + redirect** | 1155 | 1217 | 1307 | 347 ms | 79 ms | 0 |
+| devpi | nginx + devpi | 647 | 532 | 538 | 2830 ms | 65 ms | 0 |
+
+**The honest read:** on `corpus-lite` (small wheels), local-disk serving
+(bandersnatch nginx, pypiserver gunicorn) tops throughput, and pypiron's
+S3+redirect is *slightly slower* than its own Track 1 disk+stream (1217 vs 1414
+at C=32) — the 302→S3 extra round-trip costs more per install than it saves when
+wheels are small. Redirect's win is **byte-offload, not lite-throughput**: the
+pypiron node never touches a wheel byte, which only pays off under big wheels
+(the heavy tier / S2, not yet run) or NIC saturation. pypicloud's S3+DynamoDB
+(its real cloud-native combo) now stands up and serves at ~1360/min. Net: Track 2
+is a fair "best foot forward" for each tool; it does not crown pypiron on small
+wheels, and we say so.
 
 ¹ pypicloud cache-mode can't serve a dependency version different from the one
 first cached (e.g. `redis 8.0.0` after `celery[redis]` cached an earlier redis);
-4 of 800 sampled installs hit it. A real, documented limitation of the archived
-tool, tolerated via `--warm-min-ok 0.95`.
-² S3 index materialization lags the upload more than disk does, so the C=1 burst
-fired before `nvidia-nccl-cu12` was indexed; resolved by C=8. A post-seed
-full-visibility wait would remove it.
+~4 sampled installs/level hit it. A real, documented limitation of the archived
+tool, tolerated via `--warm-min-ok 0.95`. Its S3+DynamoDB boot needed the rig
+IAM to grant `dynamodb:ListTables` on `*` (flywheel checks table existence at
+startup).
 
 **Honest framing.** Single-box rig (loadgen + server co-located): correct for an
 install-latency-under-concurrency benchmark, not a NIC-saturation test. Numbers

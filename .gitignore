@@ -36,6 +36,8 @@ bench/corpus/
 # Install-bench: downloaded wheels + results are regenerable from lock/ (committed)
 bench/install/wheelhouse/
 bench/install/results/
+# downloaded oha load-tester binary
+bench/install/.bin/
 # aarch64 corpus is generated on demand for local validation; x86_64 is committed
 bench/install/lock/aarch64/
 # generated at run time from the manifest / rig env

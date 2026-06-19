@@ -81,11 +81,18 @@ cmd_up() {
   aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$sg" --protocol tcp --port 22 --cidr "${myip}/32" >/dev/null 2>&1 || true
 
   ami=$(aws ssm get-parameter --region "$REGION" --name "$(ami_param)" --query Parameter.Value --output text)
-  local userdata; userdata=$(base64 <<'UD'
+  # Raw script — `aws ec2 run-instances --user-data` base64-encodes it itself;
+  # pre-encoding double-encodes and cloud-init silently skips it.
+  local userdata; userdata=$(cat <<'UD'
 #!/bin/bash
-dnf install -y docker git rsync
+dnf install -y docker git rsync python3
 systemctl enable --now docker
 usermod -aG docker ec2-user
+# docker compose v2 plugin (base `dnf install docker` omits it)
+mkdir -p /usr/libexec/docker/cli-plugins
+curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-$(uname -m)" \
+  -o /usr/libexec/docker/cli-plugins/docker-compose
+chmod +x /usr/libexec/docker/cli-plugins/docker-compose
 UD
 )
   echo "== launching ${INSTANCE_TYPE} (${ARCH}, ${DISK_GB}GB gp3)"
@@ -124,13 +131,16 @@ cmd_deploy() {
   load_env
   echo "== waiting for ssh + docker"
   for _ in $(seq 1 60); do rig_ssh 'command -v docker' >/dev/null 2>&1 && break; sleep 5; done
-  echo "== rsync repo"
-  rsync -az -e "ssh ${SSH_OPTS[*]} -i ${RIG_KEY}" --delete \
-    --exclude target --exclude .git --exclude data --exclude bench/install/wheelhouse \
-    --exclude bench/install/results --exclude bench/.keys --exclude '*.rig.env' \
-    "${REPO}/" "$(ssh_host):pypiron/"
+  echo "== ship a clean checkout of HEAD (git archive — excludes any uncommitted"
+  echo "   work-in-progress, so the box builds exactly the committed tree)"
+  git -C "$REPO" archive --format=tar HEAD \
+    | rig_ssh "rm -rf pypiron && mkdir -p pypiron && tar -x -C pypiron"
   echo "== build pypiron image + fetch wheelhouse (${RIG_ARCH}/${RIG_TIER})"
-  rig_ssh "cd pypiron && sudo docker build --platform linux/${RIG_ARCH/x86_64/amd64} -t pypiron:bench-${RIG_ARCH} . && \
+  # Rig workaround: HEAD's object_store dep needs a newer toolchain than the
+  # committed Dockerfile's rust:1.85 pin (E0658). Bump only the box copy; the
+  # committed Dockerfile is left for the repo owners to fix.
+  rig_ssh "cd pypiron && sed -i 's#rust:1.85-bookworm#rust:1-bookworm#' Dockerfile && \
+    sudo docker build --platform linux/${RIG_ARCH/x86_64/amd64} -t pypiron:bench-${RIG_ARCH} . && \
     sudo docker run --rm -v \$PWD:/repo -w /repo/bench/install ghcr.io/astral-sh/uv:0.9.30-python3.11-bookworm-slim \
       python3 wheelhouse.py --tier ${RIG_TIER} --arch ${RIG_ARCH}"
   echo "== deploy complete"
@@ -141,10 +151,14 @@ cmd_run() {
   local track="${RIG_TRACK:-1}"
   local servers=("$@"); [[ ${#servers[@]} -eq 0 ]] && servers=(pypiron pypiserver devpi pypicloud bandersnatch proxpi)
   local rigenv="PYPIRON_S3_BUCKET=${RIG_BUCKET} AWS_REGION=${RIG_REGION}"
+  local failed=()
   for s in "${servers[@]}"; do
     echo "== run ${s} (track ${track})"
-    rig_ssh "cd pypiron/bench/install && sudo ${rigenv} python3 bench.py --server ${s} --track ${track} --tier ${RIG_TIER} --arch ${RIG_ARCH} --concurrency 1,8,32,64,128 --samples 60"
+    # One flaky server must not abort the batch; record and continue.
+    rig_ssh "cd pypiron/bench/install && sudo ${rigenv} python3 bench.py --server ${s} --track ${track} --tier ${RIG_TIER} --arch ${RIG_ARCH} --concurrency 1,8,32,64,128 --samples ${RIG_SAMPLES:-160}" \
+      || { echo "!! ${s} FAILED (continuing)"; failed+=("$s"); }
   done
+  [[ ${#failed[@]} -gt 0 ]] && echo "== failed servers: ${failed[*]}"
   rig_ssh "cd pypiron/bench/install && sudo python3 report.py"
 }
 

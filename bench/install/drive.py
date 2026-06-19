@@ -169,23 +169,38 @@ def warm(
     host: str,
     python: str,
     concurrency: int,
+    retries: int = 3,
 ) -> Dict:
     """Install every closure once (each project at least once) to fill a proxy's
-    cache (egress on) or prove it is fully cached (egress off, sanity)."""
+    cache (egress on) or prove it is fully cached (egress off, sanity).
+
+    Lazy proxies (devpi/pypicloud) can 502 a few projects under the concurrent
+    cold-fetch load of the first pass. Retry only the stragglers at lower
+    concurrency — by then the rest are cache hits, so the retry runs under almost
+    no load and clears the transient failures."""
     t0 = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        results = list(
-            pool.map(lambda n: run_one(closures[n], index_url, host, python, dry=False), names)
-        )
-    errs = [r for r in results if not r["ok"]]
+    pending = list(names)
+    last_errs: List[Dict] = []
+    for attempt in range(retries):
+        conc = concurrency if attempt == 0 else max(1, concurrency // 2)
+        with ThreadPoolExecutor(max_workers=conc) as pool:
+            results = list(
+                pool.map(
+                    lambda n: run_one(closures[n], index_url, host, python, dry=False), pending
+                )
+            )
+        last_errs = [r for r in results if not r["ok"]]
+        if not last_errs:
+            break
+        pending = [r["project"] for r in last_errs]
     out = {
         "projects": len(names),
-        "ok": len(names) - len(errs),
-        "errors": len(errs),
+        "ok": len(names) - len(last_errs),
+        "errors": len(last_errs),
         "wall_s": round(time.perf_counter() - t0, 1),
     }
-    if errs:
-        out["error_sample"] = errs[0]
+    if last_errs:
+        out["error_sample"] = last_errs[0]
     return out
 
 
@@ -203,6 +218,12 @@ def main() -> None:
     ap.add_argument("--python", default="3.11")
     ap.add_argument("--concurrency", default="1,8,32", help="comma-separated sweep")
     ap.add_argument("--warm-concurrency", type=int, default=4)
+    ap.add_argument(
+        "--warm-min-ok",
+        type=float,
+        default=1.0,
+        help="fraction of projects that must warm/serve; <1.0 tolerates a documented gap",
+    )
     ap.add_argument("--samples", type=int, default=24, help="installs per concurrency level")
     ap.add_argument("--sampling", default="uniform", choices=["uniform", "zipf"])
     ap.add_argument("--seed", type=int, default=1729)
@@ -223,7 +244,9 @@ def main() -> None:
         print(f"warm {args.label}: {w['ok']}/{w['projects']} ok, {w['errors']} err, {w['wall_s']}s")
         if w["errors"]:
             print(f"  first error: {w['error_sample']['project']}: {w['error_sample']['err']}")
-            raise SystemExit(1)
+            if w["ok"] / w["projects"] < args.warm_min_ok:
+                raise SystemExit(1)
+            print(f"  tolerated ({w['errors']} unservable; min-ok={args.warm_min_ok})")
         return
 
     weights = weighted_order(names, args.sampling)

@@ -1,0 +1,42 @@
+# pypicloud (private host + on-demand cache). ARCHIVED/unmaintained since 2023
+# (Python 3.8 image) but boots and serves uv/pip — included with the staleness
+# disclosed. Track 1: file blob storage + Postgres metadata cache (config in
+# pypicloud-config.ini). uWSGI processes=4, max-requests=0 (no mid-run worker
+# recycling). pypi.fallback=cache + default_read=everyone, warmed once, so the
+# measured run is all local reads. docs/BENCHMARK_INSTALL.md §3.
+#
+# amd64-only image (emulated locally, native on the x86_64 AWS rig). seed class
+# "warm". Reachable at pypicloud:8080; index /simple/.
+
+services:
+  pypicloud:
+    image: stevearc/pypicloud:1.3.12
+    platform: linux/amd64
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - pypicloud-data:/var/lib/pypicloud
+      - ./pypicloud-config.ini:/etc/pypicloud/config.ini:ro
+    networks: [bench, egress]
+
+  postgres:
+    image: postgres:16
+    platform: ${BENCH_PLATFORM:-linux/arm64}
+    environment:
+      POSTGRES_USER: pypicloud
+      POSTGRES_PASSWORD: pypicloud
+      POSTGRES_DB: pypicloud
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pypicloud"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [bench]
+
+networks:
+  egress:
+    internal: false
+
+volumes:
+  pypicloud-data:

@@ -1,0 +1,38 @@
+# devpi (hybrid: pull-through PyPI cache + private index), fronted by the nginx
+# sidecar from devpi-gen-config so wheels are served off disk directly — the
+# documented prod path and the fairness requirement (bare :3141 streams every
+# byte through Python). Filesystem/SQLite KeyFS (NOT Postgres, which would put
+# files in the DB and defeat nginx direct serving). docs/BENCHMARK_INSTALL.md §3.
+#
+# Warm class: the orchestrator installs the corpus once via root/pypi WITH egress
+# (devpi caches upstream files), then disconnects the `egress` network so the
+# measured run serves only from cache and any miss fails loudly.
+#
+# Reachable at nginx:8080; index path /root/pypi/+simple/.
+
+services:
+  devpi:
+    image: jonasal/devpi-server:6.20.1
+    platform: ${BENCH_PLATFORM:-linux/arm64}
+    environment:
+      DEVPI_PASSWORD: benchmark
+    command: ["--threads", "50", "--keyfs-cache-size", "100000"]
+    volumes:
+      - devpi-data:/devpi/server
+    networks: [bench, egress]
+
+  nginx:
+    image: nginx:1.27
+    platform: ${BENCH_PLATFORM:-linux/arm64}
+    depends_on: [devpi]
+    volumes:
+      - devpi-data:/devpi/server:ro
+      - ./nginx-devpi.conf:/etc/nginx/conf.d/default.conf:ro
+    networks: [bench]
+
+networks:
+  egress:
+    internal: false
+
+volumes:
+  devpi-data:

@@ -1,0 +1,38 @@
+# pypiserver (private host; no proxy/cache). Production config: gunicorn workers
+# + the cached-dir backend (watchdog in-memory index; simple-dir rescans the dir
+# every request and tanks at scale). --disable-fallback is non-negotiable — the
+# default fallback is a 301 to pypi.org, which would measure the WAN, not
+# pypiserver. -a . -P . disable auth (anonymous read, like the others).
+#
+# Seeded by copying the wheelhouse into the packages volume (seed class "copy"),
+# then a restart so cached-dir rescans. No PEP 691 JSON / PEP 658 metadata: uv
+# range-requests wheel METADATA — a real architectural difference, reported not
+# "fixed". docs/BENCHMARK_INSTALL.md §3. Reachable at pypiserver:8080.
+
+services:
+  pypiserver:
+    image: pypiserver/pypiserver:v2.4.1
+    platform: ${BENCH_PLATFORM:-linux/arm64}
+    # pypiserver `run` has no -w; gunicorn worker count comes from GUNICORN_CMD_ARGS.
+    command:
+      - run
+      - -p
+      - "8080"
+      - --server
+      - gunicorn
+      - --backend
+      - cached-dir
+      - --disable-fallback
+      - -a
+      - "."
+      - -P
+      - "."
+      - /data/packages
+    environment:
+      GUNICORN_CMD_ARGS: "--workers=4"
+    volumes:
+      - pypiserver-data:/data/packages
+    networks: [bench]
+
+volumes:
+  pypiserver-data:

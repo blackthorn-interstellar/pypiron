@@ -1,0 +1,3 @@
+loguru==0.7.3 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:19480589e77d47b8d85b2c827ad95d49bf31b0dcde16593892eb51dd18706eb6 \
+    --hash=sha256:31a33c10c8e1e10422bfd431aeb5d351c7cf7fa671e3c4df004162264b28220c

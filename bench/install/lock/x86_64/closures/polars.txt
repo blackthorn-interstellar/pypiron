@@ -1,0 +1,7 @@
+polars==1.41.2 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:23ce9a2910b6e3e8d4258770bf44aa17170958df7af6e85feedf4458a04d8d29 \
+    --hash=sha256:256d6731162371b77f3f29a55eacb8c0fc740ddb1a293a01d2ef5b5393c5c708
+polars-runtime-32==1.41.2 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:2630540dfdfb0f36f9b04a07c7c2e3f50bf2ad384113263c1c812007ee9141e0 \
+    --hash=sha256:7af09ec1ab053da2c9669e8d15f809a4083a29be05db57111688b8051062af56 \
+    --hash=sha256:e7016a3deb641b64a31447abbbee0f34bd020a6a9ae34ee6b743837def15e2a4

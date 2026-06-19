@@ -1,0 +1,321 @@
+# Realistic install benchmark: pypiron vs the field
+
+A `uv`-driven, realistic-traffic benchmark that compares pypiron against four
+open-source PyPI servers — **pypiserver, devpi, pypicloud, bandersnatch,
+proxpi** — on the same workload, each set up the way you would actually run it.
+
+This is the C2/C3 `uv pip install` tier named in
+[BENCHMARKS.md](BENCHMARKS.md#tier-4--absurd-load--chaos-the-demo). It lives in
+`bench/install/` as a **new** family; it does not touch the frozen
+[`bench/meter.py`](../bench/meter.py) (whose shape is comparability-load-bearing).
+House style is inherited: stdlib-only Python, real `uv`/`pip`/`twine` clients,
+real wheels, results as `{"meta","results"}` JSON + a markdown table.
+
+## 0. The fairness problem (why this is the hard part)
+
+The five competitors are not the same kind of thing:
+
+| System | Category | Hosts private | Serves public installs |
+|---|---|---|---|
+| **pypiron** | hybrid (host + proxy + mirror) | yes | yes |
+| pypiserver | private host | yes | only if pre-seeded (its "fallback" is a 301 to pypi.org, not a cache) |
+| devpi | hybrid (pull-through cache + private index) | yes | yes |
+| pypicloud | hybrid (host + on-demand cache) | yes | yes |
+| bandersnatch | full mirror → static tree (nginx serves) | **no** (no upload API) | yes |
+| proxpi | pure caching proxy | **no** (no upload API) | yes |
+
+A naive "point `uv` at each and install" would compare apples to oranges and,
+worse, would mostly measure **upstream pypi.org/Fastly luck**, not the server.
+
+**The fix — measure *serving*, not sourcing.** Resolve the dependency closures
+of ~100 real projects **once** into a frozen, hash-pinned union of wheels; then
+pre-populate *and warm* every server with that **identical byte universe** and
+fire **byte-identical `uv` requests** at each. How each server acquires the
+bytes (twine upload / selective mirror / warm-by-proxy) is *setup*, not
+measurement. The frozen lock is the equalizer: no server can win by being
+thinner or lose to a mid-run upstream fetch.
+
+**Two anti-cheating rules, enforced both directions:**
+
+1. **Production-realistic, not toy.** Each competitor runs in its own documented
+   production topology (right app server + worker count, and the nginx/DB
+   sidecars it *architecturally* needs — see §3). The hard rule: **no tool gets
+   a response/edge cache another lacks.** We do not handicap devpi or
+   bandersnatch by running them bare, and we do not bolt a shared front-cache on
+   everyone (that benchmarks nginx, not the tools).
+2. **No self-cheating for pypiron.** In the head-to-head ranking, pypiron runs
+   `--storage disk --artifact-delivery stream` — disk always streams every byte
+   through the node, the level playing field. Its S3 + presigned-redirect
+   byte-offload (a real architectural edge no competitor has) appears **only**
+   in the separately-labeled best-cloud track (§1), never folded into the
+   apples-to-apples number.
+
+**Egress is blocked on every ranking run** (measured servers sit on an
+`internal: true` Docker network with no route upstream). Any residual cache
+miss, fallback redirect, or proxy 302 then **fails loudly** instead of being
+silently served by Fastly. This single control neutralizes the biggest
+cross-tool footgun: pypiserver's 301, pypicloud's default 302-redirect,
+proxpi's 0.9 s-timeout 302-bounce, devpi's revalidation.
+
+## 1. Two tracks (decided: run both)
+
+Every scenario is run in two clearly-labeled configurations, because they answer
+different questions and conflating them is exactly the dishonesty this benchmark
+exists to avoid:
+
+- **Track 1 — apples-to-apples serving (the ranking).** Identical substrate for
+  all: local-disk artifact backend (EBS gp3 on AWS), plaintext HTTP, anonymous
+  read, identical instance. pypiron = disk + stream; pypicloud = file storage +
+  Postgres. Measures *pure serving code over the same bytes on the same disk*.
+  This is the defensible ranking.
+- **Track 2 — best cloud production (the companion).** Each tool in its real
+  AWS-native config: pypiron = S3 + presigned redirect; **pypicloud = S3 +
+  DynamoDB**; devpi/pypiserver/bandersnatch/proxpi = EBS (they have no
+  byte-offload path). Measures "what you would actually deploy," including
+  pypiron's redirect advantage — reported honestly as an architectural trait,
+  not slipped into the ranking.
+
+## 2. The rig: AWS (decided)
+
+Measurement happens on AWS for consistency and proper resourcing. Local
+docker-compose is the **development/validation** surface only — the *same*
+compose stacks run in both places; only the AWS run yields citable absolutes
+(per [BENCHMARKS.md](BENCHMARKS.md): disk numbers are host-dependent, a loose
+floor).
+
+- **Topology** (extends [`bench/aws-up.sh`](../bench/aws-up.sh)): one
+  **server-under-test** instance + one oversized **loadgen** instance (runs
+  `uv`, never the suspect), same VPC/AZ, us-east-1. **Exactly one server runs at
+  a time** on the identically-sized instance; servers are torn down and the next
+  brought up, so every system sees the same CPU/disk/NIC.
+- **Containers, not native.** The server box runs Docker; each system (pypiron
+  included, via its [Dockerfile](../Dockerfile)) is brought up by its
+  `compose/docker-compose.<system>.yml`. Running pypiron the same way as the
+  competitors is itself a fairness requirement.
+- **Proper resourcing.** gp3 with provisioned throughput where disk-bound (the
+  meter already found gp3's 125 MB/s the wall); in-region S3; DynamoDB
+  on-demand (Track 2 pypicloud + pypiron S3 axis); instance class sized so the
+  server, not the box, is what we measure.
+
+## 3. Per-server fair setup
+
+All services share one Docker network for warm/seed (egress allowed) and switch
+to an `internal: true` network for measured runs. Substrate equalized: same host
+class, local-disk backend (Track 1), plaintext HTTP (`uv --allow-insecure-host`),
+anonymous read, pinned `uv` + Python for all. Images **pinned by digest**.
+
+### pypiron
+`pypiron:bench` built from source at the pinned commit (the ghcr tag job is
+disabled; only digest pushes happen). Track 1: `serve --storage disk --data-dir
+/data --artifact-delivery stream`. Single binary, no sidecar. **Warm:** `twine
+upload` the shared wheelhouse to `/legacy/` as mirror-origin (admin creds);
+worker (1 s) + audit-on-boot materialize the `/simple/` indexes. Track 2 (S2
+sidebar): `--storage s3 --artifact-delivery redirect`. Index path `/simple/`.
+**Fairness:** never `--artifact-delivery auto` in the head-to-head (could hide an
+S3 redirect).
+
+### pypiserver
+`pypiserver/pypiserver:v2.4.1` (pinned). `run --server gunicorn -w <vCPU>
+--backend cached-dir --disable-fallback -a . -P . /data/packages`.
+**`--disable-fallback` is non-negotiable** (default fallback = 301 to pypi.org).
+`cached-dir` is mandatory (watchdog in-memory index; `simple-dir` rescans every
+request and tanks at scale). **Warm:** copy the wheelhouse straight into the
+`packages/` volume. No PEP 691 JSON / PEP 658 metadata → uv range-requests wheel
+METADATA: a real architectural difference, reported not "fixed." Index `/simple/`.
+
+### devpi (+ nginx sidecar)
+`jonasal/devpi-server:6.20.1` + `nginx:1.27` sharing the serverdir volume
+(read-only). nginx config from `devpi-gen-config`: direct `/+f/` static file
+serving, gzip on (incl. `application/vnd.pypi.simple.v1+json`), `proxy_pass`
+only for the index/API. devpi `--threads 50 --keyfs-cache-size 100000`.
+Filesystem/SQLite KeyFS — **not Postgres** (files would go into the DB, defeating
+nginx direct serving). **Warm:** install the locked corpus once online against
+`root/pypi/+simple/`, then restart `--offline-mode`. The nginx sidecar is the
+documented prod path and **required** for fairness (bare devpi streams every
+byte through Python). Index `/root/pypi/+simple/`.
+
+### pypicloud (+ postgres / dynamodb)
+`stevearc/pypicloud:1.3.12` (== latest; **archived/unmaintained, Python 3.9 —
+disclosed**) + `postgres:16` (Track 1) or DynamoDB (Track 2). uWSGI
+`processes=<vCPU>, enable-threads=true, max-requests=0` (no mid-run recycling),
+log level WARN (shipped sample is DEBUG, skews timings). Track 1:
+`pypi.storage=file` + `pypi.db=sql` (Postgres). Track 2: `pypi.storage=s3` +
+`pypi.db=dynamo`. **`pypi.fallback=cache` + `pypi.default_read=everyone`**;
+default `redirect` measures the CDN, not pypicloud. **Warm:** install the corpus
+once with a `cache_update` account; verify zero 302s. Index `/simple/`.
+
+### bandersnatch (batch sync, not measured) + nginx (measured)
+Sync: `pypa/bandersnatch:7.1.0` (filesystem tag). Serve (measured):
+`nginx:1.27-alpine` over the static tree (`root /data/pypi/web`), banderx config
+**plus a gzip block** for the index (banderx ships gzip off). `allowlist_project`
+plugin seeded with the **FULL transitive closure** (the allowlist does *not*
+resolve deps — union all names from the closures or installs hard-fail);
+`simple-format = ALL` so PEP 691 JSON is generated. **Warm:** `mirror` once;
+measure only the warm tree. No PEP 658 → uv pays one extra range-request per
+dist (structural, disclosed). Pure nginx sendfile = "the static-file ceiling,"
+framed as such, not as bandersnatch app speed. Public scenarios only (no upload
+API). Index `/simple/`.
+
+### proxpi
+`epicwink/proxpi:latest` (pin by digest). `--workers 1` (**mandatory** — the
+in-memory index cache is per-process; extra workers serve cold-index requests
+upstream) `--threads 16`. `PROXPI_CACHE_DIR` on a **persistent** volume (default
+is an ephemeral temp dir), `PROXPI_CACHE_SIZE` a large number > corpus bytes
+(**not 0**, which *disables* caching), `PROXPI_INDEX_TTL=86400` (default 1800 s
+re-fetches mid-run), `PROXPI_DOWNLOAD_TIMEOUT=60` during warm (so slow first
+downloads cache instead of 302-bouncing). Single-process GIL ceiling is
+architectural — stated plainly, not "leveled" by adding workers. Index `/index/`.
+
+### Sidecar policy
+A DB/nginx that is part of a tool's own architecture is fair (devpi nginx,
+pypicloud Postgres/DynamoDB, bandersnatch nginx). Decide gzip parity once and
+apply uniformly.
+
+## 4. Corpus (frozen, reproducible)
+
+### 4.1 Selection (~100 projects)
+`bench/install/lock/projects.toml` — a curated list balancing popularity and
+dependency realism: web frameworks, data/sci, DL, data-eng, DB drivers, cloud
+SDKs, http/validation, CLI, testing, plus a **heavy-native quota** (numpy, scipy,
+pandas, pyarrow, torch, scikit-learn, pydantic-core, cryptography, grpcio,
+opencv, shapely) so wheel-byte realism is guaranteed. Each entry pins an exact
+distribution + realistic extras. Optionally regenerable from `top-pypi-packages`
+(hugovk, pinned monthly tag) via `corpus.py`.
+
+### 4.2 Freeze (resolve once with uv)
+`freeze.py` builds one aggregator and runs
+`uv pip compile --universal --generate-hashes --only-binary :all:` bounded to
+`{linux x86_64} × {cp311, cp312}`, exporting the **union** to a PEP 751
+`corpus-<tier>.pylock.toml` (per-file `url`, `size`, `sha256`) plus a per-project
+frozen closure `closures/<project>.txt` (resolver-free at replay). Re-freeze
+only on an explicit committed bump.
+
+### 4.3 Two tiers
+- `corpus-lite` — no GPU stacks, CPU-only torch, ~2–3 GB. Headline (S1, S5).
+- `corpus-heavy` — CUDA torch/tf closure, ~8–15 GB incl. the 688 MB
+  `nvidia-cudnn-cu12` wheel. Byte-transfer stress (S2). Opt-in (disk footprint).
+
+### 4.4 Committed vs seeded
+Commit (small text): `projects.toml`, `corpus-*.pylock.toml`, `closures/*.txt`
+under `bench/install/lock/` (a non-ignored path — `bench/corpus/` is gitignored).
+**Never commit wheels.** `wheelhouse.py` downloads the union into
+`bench/install/wheelhouse/` (gitignored) and sha256-verifies against the lock —
+the single shared byte source every private host is seeded from; proxies/mirrors
+warm-by-install pinned to the same lock so their caches converge on the same
+files.
+
+## 5. Client (uv) recipe
+
+- **Pin the instrument:** `UV_VERSION`, `UV_PYTHON_DOWNLOADS=never`, fixed
+  `--python`, `UV_CONCURRENT_DOWNLOADS` (e.g. 16), `UV_CONCURRENT_INSTALLS`,
+  `UV_CONCURRENT_BUILDS=1` — constant for every server.
+- **Authoritative single index:** `--default-index http://host:PORT/<path>`
+  ONLY (it *replaces* pypi.org). Never `--index`/`--extra-index-url` (those
+  leave pypi.org as fallback). `--allow-insecure-host` for plaintext HTTP.
+- **Cold vs warm client:** fresh `UV_CACHE_DIR=$(mktemp -d)` **and** fresh
+  `uv venv` per trial (a satisfied venv no-ops the install). Cold = empty cache.
+- **Build isolation:** `--only-binary :all:` (refuse sdists → measure serving,
+  not compiling). Drop any project lacking a compatible wheel at compile time.
+- **Deterministic replay:** `--require-hashes --no-deps` against the frozen
+  files so every server is asked for byte-identical wheels regardless of what it
+  hosts.
+- **Two workloads (shared frozen closures):**
+  - **A — deterministic instrument:** one `uv pip install --no-deps
+    --require-hashes -r <pinned>.txt` per trial; identical request set.
+  - **B — CI-fleet (headline):** each runner = fresh process + fresh venv + cold
+    cache, installs one sampled project's `closures/<project>.txt`. Sweep
+    concurrency C ∈ {1, 8, 32, 64, 128}. Two sampling modes, both reported: Zipf
+    (download-count weighted, the headline) and uniform (long-tail stress).
+    Seeded RNG (`random.Random(seed)`, like `scale.py`) for reproducibility.
+- **pip cross-check (secondary):** same frozen files, low concurrency, separate
+  column. Consistency of *ranking* across uv and pip is the signal; inconsistency
+  is itself a finding.
+
+## 6. Scenarios
+
+| ID | What | Systems | Network |
+|---|---|---|---|
+| **S1** | Warm serve, corpus-lite, Workload B sweep (**HEADLINE**) | all 6 | egress-blocked |
+| S2 | Heavy-byte throughput, corpus-heavy | all 6 | egress-blocked |
+| S3 | Private publish + install | pypiron, pypiserver, devpi, pypicloud | egress-blocked |
+| S4 | Cold cache-fill / first-touch (**upstream-inclusive, labeled**) | pypiron(proxy), devpi(online), pypicloud(cache), proxpi | egress **allowed** |
+| S5 | oha HTTP microbench cross-check (per-capability endpoints) | all 6 | egress-blocked |
+
+S4 measures upstream latency by design → reported separately, **never** folded
+into the S1/S2 ranking.
+
+## 7. Metrics & methodology
+
+Per (server × scenario × concurrency), ≥5 trials, **interleave servers
+round-robin** to average noise:
+
+- Median install wall (`/usr/bin/time`); p50/p95/p99 per-install wall (Workload B).
+- Resolve-only wall (`uv pip install --dry-run`) → isolates metadata serving;
+  download+install = total − resolve (unzip/link is a client constant since
+  bytes are identical, so the cross-server delta is wheel transfer).
+- Throughput: installs/min; MB/s served (S2).
+- Error rate; **offline sanity**: a post-warm `uv … --offline` pass per server
+  must succeed (proves 100 % cache) **before** any timing.
+- Server-side request count + bytes (access-log parse by default; optional
+  uniform counting proxy, cache off, all-or-none) → surfaces PEP 658-vs-range
+  cost.
+- Server CPU + peak RSS via `docker stats` (reuse `meter.py`'s `RssSampler`).
+
+Honest disclosures (never penalized via flags): PEP 658 absence (bandersnatch,
+pypiserver); PEP 700 absence (devpi, proxpi) → never use `--exclude-newer`;
+bandersnatch's nginx sendfile is the static-file ceiling; proxpi's single-process
+GIL is an architectural ceiling. `uv` has no `pip download` (astral-sh/uv#3163) →
+emulate pure-fetch via `install --no-deps --target $(mktemp -d)` or count
+server-side bytes.
+
+## 8. Layout
+
+```
+bench/install/
+  lock/                  # COMMITTED: projects.toml, corpus-*.pylock.toml, closures/*.txt
+  compose/               # docker-compose.<system>.yml + configs (nginx-devpi.conf, config.ini, bandersnatch.conf, nginx-bander.conf)
+  benchlib.py            # shared helpers (reuses bench/meter.py)
+  corpus.py              # selection -> projects.toml
+  freeze.py              # uv compile/export -> lock/
+  wheelhouse.py          # download union -> wheelhouse/, sha256-verify
+  seed.py                # per-server-class load (twine/copy/allowlist/proxy-warm)
+  drive.py               # uv subprocess driver (A & B), Zipf/uniform sampler, metrics
+  bench.py               # orchestrator: up -> seed -> warm -> offline-sanity -> measure -> emit -> teardown
+  rig.sh                 # AWS provisioning (Docker host; extends aws-up.sh/deploy.sh)
+  wheelhouse/            # gitignored
+  results/               # gitignored: JSON + md
+```
+
+Reuse from `meter.py` (do not edit it): `http_get`, `wait_healthy`,
+`upload_wheel`, `wait_visible`, `RssSampler`, `percentile`, `print_markdown`,
+the `{meta,results}` shape. Reuse from `scale.py`: the launch/health-wait/
+teardown pattern and the seeded sampler.
+
+## 9. Results
+
+`{"meta": {...}, "results": {...}}` to `bench/install/results/` + a markdown
+table to stdout. `meta` adds: `track` (1|2), `corpus_tier`, `uv_version`,
+`python`, `matrix`, `sampler_seed`, `sampling_mode`, `concurrency`, per-server
+image digest, pypiron commit. Headline table appended to a **new** section of
+[BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) (append-only, with commit + rig
+provenance) — separate from the frozen meter series.
+
+## 10. Build sequencing (decided: vertical slice first)
+
+- **Phase 1 — validate the methodology.** `corpus.py` + `freeze.py` +
+  `wheelhouse.py` + `drive.py` + `bench.py`; **pypiron + devpi** on S1.
+  Validated locally via docker-compose, then on the AWS rig. Confirm numbers are
+  sane and reproducible before fanning out.
+- **Phase 2 — fan out.** pypiserver, pypicloud, bandersnatch, proxpi; S2–S5;
+  both corpus tiers; Track 2.
+
+## 11. Limitations & honest disclosures
+
+Disk numbers are host-dependent (comparative on the local rig; absolutes only
+from AWS, and gp3 burst adds variance — already seen in the meter's W1-torch).
+S4 includes upstream latency (network-position-dependent; quarantined).
+bandersnatch/pypiserver lack PEP 658; devpi/proxpi lack PEP 700 — category
+traits, not penalized. pypicloud is archived (Python 3.9); images pinned by
+digest. Each tool runs its own documented prod topology; no tool gets a cache
+another lacks. The heavy tier is opt-in (8–15 GB × 6 servers — share one
+wheelhouse and/or run servers serially on a small box).

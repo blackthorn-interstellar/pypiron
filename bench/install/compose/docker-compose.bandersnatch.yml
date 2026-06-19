@@ -1,0 +1,36 @@
+# bandersnatch: a batch mirror that writes a static PEP 503/691 tree, served by
+# nginx (the measured tier — pure sendfile, "the static-file ceiling"). It has no
+# upload API (public scenarios only) and no PEP 658 metadata (uv pays one extra
+# range-request per dist — structural, disclosed). docs/BENCHMARK_INSTALL.md §3.
+#
+# The mirror runs once with a release-level allowlist of exactly the corpus pins
+# (bench.py generates bandersnatch.gen.conf from the manifest — the allowlist does
+# NOT resolve deps, so we feed the full closure). It is `profiles: [seed]` so
+# `up` starts only nginx; the orchestrator runs it explicitly via the mirror
+# seed. Reachable at web:8080; index /simple/.
+
+services:
+  bandersnatch:
+    image: pypa/bandersnatch:7.1.0
+    platform: ${BENCH_PLATFORM:-linux/arm64}
+    profiles: ["seed"]
+    command: ["bandersnatch", "-c", "/conf/bandersnatch.gen.conf", "mirror"]
+    volumes:
+      - mirror:/data/pypi
+      - ./bandersnatch.gen.conf:/conf/bandersnatch.gen.conf:ro
+    networks: [bench, egress]
+
+  web:
+    image: nginx:1.27-alpine
+    platform: ${BENCH_PLATFORM:-linux/arm64}
+    volumes:
+      - mirror:/data/pypi:ro
+      - ./nginx-bander.conf:/etc/nginx/conf.d/default.conf:ro
+    networks: [bench]
+
+networks:
+  egress:
+    internal: false
+
+volumes:
+  mirror:

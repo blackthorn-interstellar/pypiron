@@ -58,33 +58,67 @@ def regex_escape(s: str) -> str:
     return "".join(out)
 
 
-def parse_wheel_url(page_url: str, body: bytes, arch: str, allowed: set) -> Optional[str]:
-    """Extract one wheel URL the server actually serves for a package, from its
-    index page (PEP 691 JSON or legacy HTML), resolving relative hrefs. Picks a
-    wheel whose filename is in `allowed` (the seeded manifest set) — a proxy's
-    index lists ALL upstream versions but only the seeded ones are served, so an
-    unrestricted pick would request an uncached wheel and 404."""
+def pick_canonical(filenames: List[str], arch: str) -> str:
+    """One wheel per package, chosen identically for every server (a py3.11 /
+    linux <arch> install's wheel) so the mix is the same workload everywhere."""
+    glibc = [f for f in sorted(filenames) if is_glibc_wheel(f, arch)]
+    pool = glibc or sorted(filenames)
+    for f in pool:
+        if "cp311" in f and "manylinux" in f:
+            return f
+    for f in pool:
+        if f.endswith("-none-any.whl"):
+            return f
+    return pool[0]
+
+
+def find_wheel_href(page_url: str, body: bytes, target: str) -> Optional[str]:
+    """Find the server's URL for the wheel named exactly `target`, from its index
+    page (PEP 691 JSON or legacy HTML), resolving relative hrefs."""
     text = body.decode("utf-8", "replace")
     try:
         urls = [f.get("url", "") for f in json.loads(text).get("files", [])]
     except json.JSONDecodeError:
         urls = re.findall(r'href="([^"]+\.whl[^"]*)"', text)
     for u in (x.split("#", 1)[0] for x in urls if ".whl" in x):
-        fn = u.rsplit("/", 1)[-1]
-        if fn in allowed and is_glibc_wheel(fn, arch):
+        if u.rsplit("/", 1)[-1] == target:
             return urljoin(page_url, u)
     return None
 
 
-def build_install_mix(index_url: str, arch: str, tier: str) -> Tuple[str, float, int, int]:
-    """Build the realistic install-traffic URL mix: every seeded package's index
-    page + one wheel it serves. Returns (rand_regex, reqs_per_install, n_index,
-    n_wheel). reqs_per_install ~= 2 x avg packages/closure (each package = one
-    index GET + one wheel GET during a cold install). Packages + the served-wheel
-    set come from the manifest (the bytes every server was seeded with)."""
+def served_ok(url: str) -> bool:
+    """True if the server returns 200/206 for `url` without downloading the body
+    (HEAD, or a 1-byte Range GET) — so verifying a 688 MB wheel costs ~nothing."""
+    import urllib.error
+    import urllib.request
+
+    for method, hdrs in (("HEAD", {}), ("GET", {"Range": "bytes=0-0"})):
+        try:
+            req = urllib.request.Request(url, method=method, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.status in (200, 206)
+        except urllib.error.HTTPError as e:
+            if e.code == 405 and method == "HEAD":
+                continue  # server rejects HEAD — fall back to Range GET
+            return False
+        except (urllib.error.URLError, OSError):
+            return False
+    return False
+
+
+def build_install_mix(index_url: str, arch: str, tier: str) -> Tuple[str, float, int, int, int]:
+    """Build the realistic install-traffic URL mix: every package's index page +
+    its ONE canonical wheel. The canonical (name->wheel) set is chosen from the
+    manifest identically for every server, so the mix is the SAME workload (same
+    wheel sizes) everywhere — fixing the per-server divergence. Each wheel is
+    GET/HEAD-preverified 200 on this server and DROPPED (counted) if unservable,
+    so the ramp never 404s mid-flight. Returns (rand_regex, reqs_per_install,
+    n_index, n_wheel, n_dropped)."""
     manifest = json.loads(manifest_path(tier, arch).read_text())
-    allowed = {w["filename"] for w in manifest["wheels"]}
-    names = {pep503(w["name"]) for w in manifest["wheels"]}
+    by_name: Dict[str, List[str]] = {}
+    for w in manifest["wheels"]:
+        by_name.setdefault(pep503(w["name"]), []).append(w["filename"])
+    canonical = {nm: pick_canonical(fns, arch) for nm, fns in by_name.items()}
 
     pkgs_per: List[int] = []
     for c in sorted(closures_dir(arch).glob("*.txt")):
@@ -98,16 +132,17 @@ def build_install_mix(index_url: str, arch: str, tier: str) -> Tuple[str, float,
     reqs_per_install = (sum(pkgs_per) / len(pkgs_per)) * 2 if pkgs_per else 1.0
 
     base = index_url.rstrip("/") + "/"
-    index_urls, wheel_urls = [], []
+    index_urls, wheel_urls, dropped = [], [], 0
     hdr = {"Accept": "application/vnd.pypi.simple.v1+json"}
-    for nm in sorted(names):
+    for nm in sorted(canonical):
         iu = base + nm + "/"
         index_urls.append(iu)
         status, body, _ = http_get(iu, headers=hdr)
-        if status == 200:
-            w = parse_wheel_url(iu, body, arch, allowed)
-            if w:
-                wheel_urls.append(w)
+        href = find_wheel_href(iu, body, canonical[nm]) if status == 200 else None
+        if href and served_ok(href):
+            wheel_urls.append(href)
+        else:
+            dropped += 1
     mix = index_urls + wheel_urls
     # oha --rand-regex-url mishandles a varying scheme/host/port, so keep the
     # common scheme://host:port a literal prefix and vary only the PATH in the
@@ -115,12 +150,9 @@ def build_install_mix(index_url: str, arch: str, tier: str) -> Tuple[str, float,
     # dot-free service names, so the prefix needs no escaping.
     parts = urlsplit(mix[0])
     prefix = f"{parts.scheme}://{parts.netloc}"
-    paths = []
-    for u in mix:
-        p = urlsplit(u)
-        paths.append(p.path + (f"?{p.query}" if p.query else ""))
+    paths = [urlsplit(u).path + (f"?{urlsplit(u).query}" if urlsplit(u).query else "") for u in mix]
     regex = prefix + "(" + "|".join(regex_escape(pp) for pp in paths) + ")"
-    return regex, round(reqs_per_install, 1), len(index_urls), len(wheel_urls)
+    return regex, round(reqs_per_install, 1), len(index_urls), len(wheel_urls), dropped
 
 
 def oha_run(
@@ -340,12 +372,12 @@ def main() -> None:
     wait_ready(args.index_url)
 
     if args.install_mix:
-        regex, reqs_per_install, n_index, n_wheel = build_install_mix(
+        regex, reqs_per_install, n_index, n_wheel, n_dropped = build_install_mix(
             args.index_url, args.arch, args.tier
         )
         print(
             f"capacity {args.label}: install-mix ramp ({n_index} index + {n_wheel} wheel URLs, "
-            f"~{reqs_per_install} reqs/install)"
+            f"{n_dropped} dropped/unservable, ~{reqs_per_install} reqs/install)"
         )
         primary = measure(
             args.oha,
@@ -359,6 +391,7 @@ def main() -> None:
             regex=True,
         )
         primary["mix_index_urls"], primary["mix_wheel_urls"] = n_index, n_wheel
+        primary["mix_dropped"] = n_dropped
         primary["reqs_per_install"] = reqs_per_install
         primary["installs_per_sec"] = (
             round(primary["mst_rps"] / reqs_per_install, 1) if reqs_per_install else 0.0

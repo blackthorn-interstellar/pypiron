@@ -84,18 +84,15 @@ def main() -> None:
 
     if mixes:
         print("\n### Breaking point — install throughput (oha install-mix ramp)\n")
-        print(
-            "| Server | installs/s | MB/s | req MST | c_knee | breach | reqs/install | R_ceiling | headroom | bound |"
-        )
-        print("|---|---|---|---|---|---|---|---|---|---|")
+        print("| Server | installs/s | MB/s | req MST | c_knee | breach | wheels/dropped | bound |")
+        print("|---|---|---|---|---|---|---|---|")
         for d in sorted(mixes, key=lambda d: -d["install_mix"].get("installs_per_sec", 0)):
             m = d["install_mix"]
-            ctl = d.get("control", {})
+            wd = f"{m.get('mix_wheel_urls', '—')}/{m.get('mix_dropped', '—')}"
             print(
                 f"| {d.get('label', '?')} | {m.get('installs_per_sec', '—')} | {m.get('mb_per_sec', '—')} "
                 f"| {m.get('mst_rps', '—')} | {m.get('c_knee', '—')} | {m.get('breach_mode', '—')} "
-                f"| {m.get('reqs_per_install', '—')} | {ctl.get('r_ceiling_rps', '—')} "
-                f"| {ctl.get('headroom', '—')} | {d.get('bound_class', '—')} |"
+                f"| {wd} | {d.get('bound_class', '—')} |"
             )
 
     if not runs and not caps and not mixes:

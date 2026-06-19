@@ -55,45 +55,49 @@ def test_no_break_within_ladder():
     assert out["breach_mode"] == "none(ladder-cap)"
 
 
-def test_parse_wheel_url_json_picks_glibc_and_resolves_relative():
-    page = "http://pypiron:8080/simple/numpy/"
-    body = json.dumps(
-        {
-            "files": [
-                {"url": "../../packages/numpy-2.3.5-cp311-cp311-musllinux_1_2_x86_64.whl"},
-                {"url": "../../packages/numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl"},
-            ]
-        }
-    ).encode()
-    allowed = {"numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl"}  # only the seeded one
-    got = capacity.parse_wheel_url(page, body, "x86_64", allowed)
-    assert got == "http://pypiron:8080/packages/numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl"
+def test_pick_canonical_prefers_cp311_manylinux():
+    fns = [
+        "numpy-2.3.5-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "numpy-2.3.5-cp311-cp311-musllinux_1_2_x86_64.whl",  # not glibc -> excluded
+        "numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl",
+    ]
+    assert (
+        capacity.pick_canonical(fns, "x86_64")
+        == "numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl"
+    )
 
 
-def test_parse_wheel_url_skips_unseeded():
+def test_pick_canonical_pure_wheel():
+    assert (
+        capacity.pick_canonical(["flask-3.0.0-py3-none-any.whl"], "x86_64")
+        == "flask-3.0.0-py3-none-any.whl"
+    )
+
+
+def test_find_wheel_href_exact_match_resolves_relative():
     page = "http://nginx:8080/root/pypi/+simple/numpy/"
     body = json.dumps(
         {
             "files": [
-                {"url": "../+f/aa/numpy-9.9.9-cp311-cp311-manylinux_2_28_x86_64.whl"},  # not seeded
+                {"url": "../../+f/aa/numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl"},
+                {"url": "../../+f/bb/numpy-9.9.9-cp311-cp311-manylinux_2_28_x86_64.whl"},
             ]
         }
     ).encode()
+    got = capacity.find_wheel_href(page, body, "numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl")
     assert (
-        capacity.parse_wheel_url(
-            page, body, "x86_64", {"numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl"}
-        )
-        is None
+        got == "http://nginx:8080/root/pypi/+f/aa/numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl"
     )
 
 
-def test_parse_wheel_url_html_strips_fragment():
+def test_find_wheel_href_html_strips_fragment_and_misses_absent():
     page = "http://web:8080/simple/flask/"
-    body = (
-        b'<a href="../../packages/fl/flask/flask-3.0.0-py3-none-any.whl#sha256=abc">flask-3.0.0</a>'
+    body = b'<a href="../../packages/fl/flask/flask-3.0.0-py3-none-any.whl#sha256=abc">x</a>'
+    assert (
+        capacity.find_wheel_href(page, body, "flask-3.0.0-py3-none-any.whl")
+        == "http://web:8080/packages/fl/flask/flask-3.0.0-py3-none-any.whl"
     )
-    got = capacity.parse_wheel_url(page, body, "x86_64", {"flask-3.0.0-py3-none-any.whl"})
-    assert got == "http://web:8080/packages/fl/flask/flask-3.0.0-py3-none-any.whl"
+    assert capacity.find_wheel_href(page, body, "flask-9.9.9-py3-none-any.whl") is None
 
 
 def test_regex_escape_char_classes_specials():

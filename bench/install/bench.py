@@ -72,6 +72,10 @@ SERVERS = {
         "seed": "warm",
         "egress_service": "pypicloud",
         "service": "pypicloud",
+        # pypicloud (archived) cache-mode can't serve a version different from the
+        # one a dependency first cached (e.g. redis 8.0.0 after celery[redis] cached
+        # an earlier redis). Tolerate that documented gap rather than abort.
+        "warm_min_ok": 0.95,
     },
     "bandersnatch": {
         "overlay": "docker-compose.bandersnatch.yml",
@@ -191,6 +195,8 @@ def main() -> None:
             args.python,
             "--label",
             args.server,
+            "--warm-min-ok",
+            str(spec.get("warm_min_ok", 1.0)),
             *extra,
         )
 
@@ -235,7 +241,12 @@ def main() -> None:
             dc("cp", f"{src}/.", f"{spec['service']}:{spec['copy_target']}/", check=True)
             dc("restart", spec["service"], check=True)  # rescan the now-populated dir
         elif spec["seed"] == "warm":
-            print("-- warm (install corpus once, egress on)")
+            print("-- warm (install corpus, egress on)")
+            drive(mode="warm")
+            # Lazy proxies persist cached files asynchronously; a second egress-on
+            # pass (all cache hits) forces any straggler to be stored before we
+            # sever upstream, so the offline sanity is clean.
+            print("-- warm confirm (persist stragglers, egress on)")
             drive(mode="warm")
             cut_egress()
             print("-- offline sanity (must serve fully from cache, egress off)")

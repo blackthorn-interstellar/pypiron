@@ -319,3 +319,52 @@ traits, not penalized. pypicloud is archived (Python 3.9); images pinned by
 digest. Each tool runs its own documented prod topology; no tool gets a cache
 another lacks. The heavy tier is opt-in (8–15 GB × 6 servers — share one
 wheelhouse and/or run servers serially on a small box).
+
+## 12. First AWS run — 2026-06-19
+
+Rig: one `c7i.4xlarge` (16 vCPU, x86_64) Docker host, us-east-1, gp3 (provisioned
+250 MB/s / 4000 IOPS), via `rig.sh`. Corpus: `corpus-lite` x86_64 (100 projects,
+391 wheels, 1.47 GB). Client: `uv 0.9.30`, `--python 3.11`, Workload B,
+uniform sampling, 160 samples/level, sweep C ∈ {1,8,32,64,128}.
+
+**Track 1 — apples-to-apples (all servers local-disk/EBS on the box, identical
+bytes).** installs/min (higher better) and per-install p50:
+
+| Server | C=1 p50 | C=8 /min | C=32 /min | C=128 /min | C=128 p50 | resolve p50 | err |
+|---|---|---|---|---|---|---|---|
+| bandersnatch (nginx static) | 129 ms | 1500 | **1688** | 1503 | 966 ms | 47 ms | 0 |
+| pypiserver (gunicorn) | 137 ms | 1403 | 1671 | 1466 | 1074 ms | 48 ms | 0 |
+| **pypiron** (disk+stream) | 134 ms | 1365 | 1414 | 1390 | 1078 ms | 47 ms | 0 |
+| proxpi (1 worker) | 159 ms | 1105 | 1265 | 1077 | 3652 ms | 61 ms | 0 |
+| pypicloud (uWSGI+PG) | 138 ms | 1190 | 1259 | 1219 | 2602 ms | 50 ms | 4¹ |
+| devpi (nginx+devpi) | 197 ms | 557 | 560 | 545 | 6457 ms | 78 ms | 0 |
+
+Reading it: the nginx-static (bandersnatch) and gunicorn (pypiserver) servers top
+raw throughput; **pypiron sits with them in the front group** (~1,400/min,
+fastest-tier 47 ms metadata resolve, 0 errors, tightest tails). proxpi and
+pypicloud are mid-pack with worse p99 tails under load; **devpi is the clear
+laggard** — it serves indexes through Python, so it plateaus at ~560/min and its
+p50 blows out to 6.5 s at C=128 where the nginx-fronted servers hold.
+
+**Track 2 — best cloud.** pypiron `--storage s3 --artifact-delivery redirect`
+(node serves only the 302 + index; S3 serves the bytes): C=8–128 all 0 errors,
+1143 / 1496 / 1219 / 1247 installs/min — on par with its Track 1 disk throughput
+while offloading every wheel byte to S3, an option no competitor has. (C=1 shows
+40 errors² — a seed-race, not a serving fault.) pypicloud `s3 + DynamoDB` did not
+stand up (archived tool; container failed to boot against DynamoDB) — left as a
+known gap.
+
+¹ pypicloud cache-mode can't serve a dependency version different from the one
+first cached (e.g. `redis 8.0.0` after `celery[redis]` cached an earlier redis);
+4 of 800 sampled installs hit it. A real, documented limitation of the archived
+tool, tolerated via `--warm-min-ok 0.95`.
+² S3 index materialization lags the upload more than disk does, so the C=1 burst
+fired before `nvidia-nccl-cu12` was indexed; resolved by C=8. A post-seed
+full-visibility wait would remove it.
+
+**Honest framing.** Single-box rig (loadgen + server co-located): correct for an
+install-latency-under-concurrency benchmark, not a NIC-saturation test. Numbers
+are real on real hardware but the absolute throughput is box-bound at 16 vCPU.
+The committed Dockerfile pins `rust:1.85`, too old for HEAD's `object_store`
+dep (E0658); `rig.sh` bumps the toolchain on the box copy only (a separate repo
+fix is warranted). Re-run any time with `rig.sh up && deploy && run`.

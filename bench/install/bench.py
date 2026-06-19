@@ -33,6 +33,7 @@ SERVERS = {
     "pypiron": {
         "overlay": "docker-compose.pypiron.yml",
         "overlay_t2": "docker-compose.pypiron-s3.yml",  # Track 2: S3 + presigned redirect
+        "t2_needs_egress": True,  # client follows 302 to S3
         "index_path": "/simple/",
         "host": "pypiron:8080",
         "seed": "upload",
@@ -67,6 +68,7 @@ SERVERS = {
     "pypicloud": {
         "overlay": "docker-compose.pypicloud.yml",
         "overlay_t2": "docker-compose.pypicloud-dynamo.yml",  # Track 2: S3 + DynamoDB
+        "t2_needs_egress": True,  # serves blobs from S3 + talks to DynamoDB live
         "index_path": "/simple/",
         "host": "pypicloud:8080",
         "seed": "warm",
@@ -154,18 +156,20 @@ def main() -> None:
     RESULTS.mkdir(parents=True, exist_ok=True)
     out_name = f"{args.scenario}-{args.server}-track{args.track}-{args.tier}-{args.arch}.json"
 
-    # Track 2 (best cloud) swaps in S3/DynamoDB overlays for pypiron/pypicloud and
-    # needs egress (the client follows pypiron's 302 to real S3; pypicloud talks
-    # to DynamoDB) — so it is NOT egress-blocked. Other servers are EBS in both
-    # tracks (overlay_t2 absent -> same overlay). Track 2 is AWS-only (real S3 +
-    # DynamoDB via the rig instance profile).
+    # Track 2 = each server in its best-production config. pypiron (S3+redirect)
+    # and pypicloud (S3+DynamoDB) get distinct overlays and need LIVE egress (the
+    # client follows pypiron's 302 to S3; pypicloud serves blobs from S3 + talks
+    # to DynamoDB), so they are not egress-blocked and we don't cut/​sanity them.
+    # The other four have no cloud-offload path — their Track 1 config IS their
+    # optimal, so Track 2 runs them identically (egress-blocked, cut after warm).
     overlay = spec.get("overlay_t2", spec["overlay"]) if args.track == 2 else spec["overlay"]
+    needs_egress = args.track == 2 and spec.get("t2_needs_egress", False)
     env = {
         **os.environ,
         "BENCH_PLATFORM": PLATFORM[args.arch],
         "BENCH_ARCH": args.arch,
         "BENCH_TIER": args.tier,
-        "BENCH_INTERNAL": "false" if args.track == 2 else "true",
+        "BENCH_INTERNAL": "false" if needs_egress else "true",
     }
     base = ["docker", "compose", "-p", project, "-f", "docker-compose.base.yml", "-f", overlay]
 
@@ -248,9 +252,14 @@ def main() -> None:
             # sever upstream, so the offline sanity is clean.
             print("-- warm confirm (persist stragglers, egress on)")
             drive(mode="warm")
-            cut_egress()
-            print("-- offline sanity (must serve fully from cache, egress off)")
-            drive(mode="warm")
+            if needs_egress:
+                # S3-backed Track 2 (pypicloud-dynamo) serves blobs from S3 live —
+                # egress must stay, so there is no cut/offline-sanity phase.
+                print("-- (S3-backed: egress stays; no offline sanity)")
+            else:
+                cut_egress()
+                print("-- offline sanity (must serve fully from cache, egress off)")
+                drive(mode="warm")
         elif spec["seed"] == "mirror":
             print("-- mirror (batch download of pinned releases, egress on)")
             dc("run", "--rm", spec["mirror_service"], check=True)  # mirrors then exits

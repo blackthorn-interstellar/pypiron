@@ -19,7 +19,9 @@ Runs inside the loadgen container, reaching the server on the bench network.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from benchlib import http_get, upload_wheel, wait_healthy, wheelhouse_dir
@@ -28,6 +30,39 @@ from benchlib import http_get, upload_wheel, wait_healthy, wheelhouse_dir
 def parse_name_version(filename: str) -> tuple[str, str]:
     parts = filename[: -len(".whl")].split("-")
     return parts[0], parts[1]
+
+
+def pep503(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def wait_all_visible(base_url: str, names: set[str], timeout: float = 300.0) -> None:
+    """Block until every package name appears in the global /simple/ index.
+
+    The worker materializes indexes from storage after upload; on S3 this lags
+    enough that a measured run firing immediately can miss a not-yet-indexed
+    package (the pypiron Track-2 C=1 seed-race). Wait for full visibility first.
+    """
+    url = base_url.rstrip("/") + "/simple/"
+    want = {pep503(n) for n in names}
+    deadline = time.time() + timeout
+    last_missing: set[str] = set(want)
+
+    def seen(n: str, text: str) -> bool:
+        # match absolute href /simple/n/, relative href "n/", or link text >n<
+        return f"/{n}/" in text or f'"{n}/"' in text or f">{n}<" in text
+
+    while time.time() < deadline:
+        status, body, _ = http_get(url, timeout=15.0)
+        if status == 200:
+            text = body.decode("utf-8", "replace")
+            last_missing = {n for n in want if not seen(n, text)}
+            if not last_missing:
+                return
+        time.sleep(1.0)
+    raise SystemExit(
+        f"{len(last_missing)} packages never became visible: {sorted(last_missing)[:5]}"
+    )
 
 
 def seed_upload(base_url: str, tier: str, arch: str, user: str, password: str, jobs: int) -> None:
@@ -47,14 +82,19 @@ def seed_upload(base_url: str, tier: str, arch: str, user: str, password: str, j
         return path.name, status
 
     done = 0
+    names = set()
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         futs = [pool.submit(one, p) for p in wheels]
+        for p in wheels:
+            names.add(parse_name_version(p.name)[0])
         for fut in as_completed(futs):
             fut.result()
             done += 1
             if done % 25 == 0 or done == len(wheels):
                 print(f"  {done}/{len(wheels)}")
-    print(f"uploaded {done} wheels")
+    print(f"uploaded {done} wheels; waiting for index visibility ({len(names)} packages)")
+    wait_all_visible(base_url, names)
+    print("all packages visible")
 
 
 def main() -> None:

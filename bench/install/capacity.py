@@ -30,7 +30,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from benchlib import closures_dir, http_get, is_glibc_wheel
 
@@ -41,9 +41,21 @@ def pep503(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+_REGEX_SPECIAL = set(".+*?()|[]{}^$\\")
+
+
 def regex_escape(s: str) -> str:
-    """Escape rand_regex (Rust regex) metachars so a URL matches literally."""
-    return re.sub(r"([.+*?()|\[\]{}^$\\-])", r"\\\1", s)
+    """Make a literal string for oha's rand_regex by wrapping each metachar in a
+    char class — `[.]`, `[+]`, etc. Backslash-escaping (`\\.`) is unreliable in
+    rand_regex (its "dot disabled" mode mangles it); char classes are the
+    documented-reliable literal construct."""
+    out = []
+    for ch in s:
+        if ch in _REGEX_SPECIAL:
+            out.append(f"[\\{ch}]" if ch in "]^\\" else f"[{ch}]")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def parse_wheel_url(page_url: str, body: bytes, arch: str) -> Optional[str]:
@@ -92,7 +104,17 @@ def build_install_mix(index_url: str, arch: str) -> Tuple[str, float, int, int]:
             if w:
                 wheel_urls.append(w)
     mix = index_urls + wheel_urls
-    regex = "(" + "|".join(regex_escape(u) for u in mix) + ")"
+    # oha --rand-regex-url mishandles a varying scheme/host/port, so keep the
+    # common scheme://host:port a literal prefix and vary only the PATH in the
+    # alternation (matches oha's documented working form). Bench hosts are
+    # dot-free service names, so the prefix needs no escaping.
+    parts = urlsplit(mix[0])
+    prefix = f"{parts.scheme}://{parts.netloc}"
+    paths = []
+    for u in mix:
+        p = urlsplit(u)
+        paths.append(p.path + (f"?{p.query}" if p.query else ""))
+    regex = prefix + "(" + "|".join(regex_escape(pp) for pp in paths) + ")"
     return regex, round(reqs_per_install, 1), len(index_urls), len(wheel_urls)
 
 

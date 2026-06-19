@@ -21,7 +21,7 @@ from .helpers import (
     wait_http_responding,
 )
 
-COMPAT_CLIENTS = ("pip", "uv", "poetry", "pdm", "twine", "flit", "hatch")
+COMPAT_CLIENTS = ("pip", "uv", "poetry", "pdm", "twine", "flit", "hatch", "pipenv")
 COMPAT_FEATURES = (
     "upload",
     "install",

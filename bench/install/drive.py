@@ -101,12 +101,13 @@ def install_cmd(
 def run_one(closure: Path, index_url: str, host: str, python: str, dry: bool) -> Dict:
     cache = Path(tempfile.mkdtemp(prefix="uvc-"))
     target = Path(tempfile.mkdtemp(prefix="uvt-"))
+    work = Path(tempfile.mkdtemp(prefix="uvw-"))
     cmd = install_cmd(closure, index_url, host, python, cache, target, dry)
     t0 = time.perf_counter()
     try:
-        # cwd under /tmp so uv never discovers a stray ancestor .venv (e.g. the
-        # mounted host repo's macOS .venv) when resolving --dry-run.
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=cache)
+        # cwd is a neutral empty dir (NOT the cache — newer uv rejects a cwd inside
+        # --cache-dir) so uv never discovers a stray ancestor .venv when resolving.
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=work)
         wall = time.perf_counter() - t0
         ok = proc.returncode == 0
         err = "" if ok else (proc.stderr.strip()[-300:] or f"exit {proc.returncode}")
@@ -116,6 +117,7 @@ def run_one(closure: Path, index_url: str, host: str, python: str, dry: bool) ->
     finally:
         shutil.rmtree(cache, ignore_errors=True)
         shutil.rmtree(target, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
     return {"project": closure.stem, "wall_ms": round(wall * 1000, 1), "ok": ok, "err": err}
 
 

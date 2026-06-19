@@ -174,7 +174,10 @@ cmd_serve() {  # serve <server>  (pypiron only for now)
   local server="${1:-pypiron}"
   [[ "$server" == pypiron ]] || { echo "rig2 serve currently supports only pypiron (Track 2)" >&2; exit 2; }
   echo "== start pypiron Track 2 (S3 + presigned redirect) on the server"
-  ssh_to "$RIG2_SERVER_IP" "sudo docker rm -f pypiron 2>/dev/null; sudo docker run -d --name pypiron -p 8080:8080 \
+  # --network host, not -p 8080:8080: a flamegraph showed Docker's bridge/NAT +
+  # conntrack cost ~24% of throughput on a small box (and a single-box deployment
+  # wouldn't bridge-NAT anyway). Host networking measures the server, not docker.
+  ssh_to "$RIG2_SERVER_IP" "sudo docker rm -f pypiron 2>/dev/null; sudo docker run -d --name pypiron --network host \
     -e PYPIRON_BIND_ADDR=0.0.0.0:8080 -e PYPIRON_S3_BUCKET=${RIG_BUCKET} -e AWS_REGION=${RIG_REGION} \
     pypiron:bench-${RIG2_SERVER_ARCH} pypiron serve --storage=s3 --artifact-delivery=redirect \
     --uploader-user=admin --uploader-pass=secret --admin-user=admin --admin-pass=secret"

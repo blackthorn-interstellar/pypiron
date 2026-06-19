@@ -163,6 +163,21 @@ cmd_run() {
   rig_ssh "cd pypiron/bench/install && sudo python3 report.py"
 }
 
+cmd_capacity() {
+  load_env
+  local track="${RIG_TRACK:-1}"
+  local servers=("$@"); [[ ${#servers[@]} -eq 0 ]] && servers=(pypiron pypiserver devpi pypicloud bandersnatch proxpi)
+  local rigenv="PYPIRON_S3_BUCKET=${RIG_BUCKET} AWS_REGION=${RIG_REGION}"
+  local failed=()
+  for s in "${servers[@]}"; do
+    echo "== capacity ${s} (track ${track})"
+    rig_ssh "cd pypiron/bench/install && sudo ${rigenv} python3 bench.py --server ${s} --track ${track} --tier ${RIG_TIER} --arch ${RIG_ARCH} --capacity --no-drive" \
+      || { echo "!! ${s} FAILED (continuing)"; failed+=("$s"); }
+  done
+  [[ ${#failed[@]} -gt 0 ]] && echo "== failed servers: ${failed[*]}"
+  rig_ssh "cd pypiron/bench/install && sudo python3 report.py"
+}
+
 cmd_results() {
   load_env
   mkdir -p "${HERE}/results"
@@ -180,7 +195,8 @@ case "${1:-}" in
   up) cmd_up ;;
   deploy) cmd_deploy ;;
   run) shift; cmd_run "$@" ;;
+  capacity) shift; cmd_capacity "$@" ;;
   results) cmd_results ;;
   down) cmd_down ;;
-  *) echo "usage: $0 {up|deploy|run [servers...]|results|down}" >&2; exit 2 ;;
+  *) echo "usage: $0 {up|deploy|run [servers...]|capacity [servers...]|results|down}" >&2; exit 2 ;;
 esac

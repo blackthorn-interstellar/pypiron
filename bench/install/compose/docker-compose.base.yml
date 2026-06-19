@@ -26,6 +26,17 @@ services:
     command: ["sleep", "infinity"]
     networks: [bench]
 
+  # Static control target for the capacity metric: nginx serving a fixed
+  # index-shaped body. The same oha ramp against it yields R_ceiling (the most
+  # rps this rig+oha can push), so a server's MST can be classified server-bound
+  # vs rig-bound instead of silently reporting the rig's ceiling. See capacity.py.
+  control:
+    image: nginx:1.27-alpine
+    platform: ${BENCH_PLATFORM:-linux/arm64}
+    volumes:
+      - ./control-index.json:/usr/share/nginx/html/control-index.json:ro
+    networks: [bench]
+
 networks:
   bench:
     internal: ${BENCH_INTERNAL:-true}

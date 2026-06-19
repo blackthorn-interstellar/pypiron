@@ -16,8 +16,26 @@ import json
 import os
 import subprocess
 import time
+import urllib.request
 
-from benchlib import COMPOSE, RESULTS, manifest_path, wheelhouse_dir
+from benchlib import COMPOSE, HERE, RESULTS, manifest_path, wheelhouse_dir
+
+OHA_VERSION = "v1.4.7"
+
+
+def ensure_oha(arch: str) -> None:
+    """Download a static oha binary (matching the loadgen container arch) into
+    bench/install/.bin/oha (bind-mounted into the loadgen at /repo). Idempotent."""
+    binary = HERE / ".bin" / "oha"
+    if binary.exists():
+        return
+    binary.parent.mkdir(exist_ok=True)
+    suffix = {"x86_64": "amd64", "aarch64": "arm64"}[arch]
+    url = f"https://github.com/hatoo/oha/releases/download/{OHA_VERSION}/oha-linux-{suffix}"
+    print(f"-- fetching oha {OHA_VERSION} ({suffix})")
+    urllib.request.urlretrieve(url, binary)
+    binary.chmod(0o755)
+
 
 # Per-server config (data-driven — a competitor is a compose overlay + an entry):
 #   overlay         compose file under compose/
@@ -148,6 +166,11 @@ def main() -> None:
     ap.add_argument("--samples", type=int, default=24)
     ap.add_argument("--sampling", default="uniform", choices=["uniform", "zipf"])
     ap.add_argument("--python", default="3.11")
+    ap.add_argument("--capacity", action="store_true", help="run the oha breaking-point ramp")
+    ap.add_argument("--no-drive", action="store_true", help="skip the uv install sweep")
+    ap.add_argument(
+        "--rep-pkg", default="flask", help="representative package for the capacity ramp"
+    )
     ap.add_argument("--keep", action="store_true", help="don't tear down after the run")
     args = ap.parse_args()
 
@@ -264,32 +287,54 @@ def main() -> None:
             print("-- mirror (batch download of pinned releases, egress on)")
             dc("run", "--rm", spec["mirror_service"], check=True)  # mirrors then exits
 
-        print("-- drive")
-        drive(
-            "--concurrency",
-            args.concurrency,
-            "--samples",
-            str(args.samples),
-            "--sampling",
-            args.sampling,
-            "--output",
-            f"results/{out_name}",
-        )
+        if not args.no_drive:
+            print("-- drive")
+            drive(
+                "--concurrency",
+                args.concurrency,
+                "--samples",
+                str(args.samples),
+                "--sampling",
+                args.sampling,
+                "--output",
+                f"results/{out_name}",
+            )
+            result_path = RESULTS / out_name
+            result = json.loads(result_path.read_text())
+            result["meta"] = {
+                "server": args.server,
+                "scenario": args.scenario,
+                "track": args.track,
+                "tier": args.tier,
+                "arch": args.arch,
+                "wall_s": round(time.time() - t0, 1),
+            }
+            result_path.write_text(json.dumps(result, indent=2) + "\n")
 
-        result_path = RESULTS / out_name
-        result = json.loads(result_path.read_text())
-        result["meta"] = {
-            "server": args.server,
-            "scenario": args.scenario,
-            "track": args.track,
-            "tier": args.tier,
-            "arch": args.arch,
-            "wall_s": round(time.time() - t0, 1),
-        }
-        result_path.write_text(json.dumps(result, indent=2) + "\n")
-        print(
-            f"\n== done in {result['meta']['wall_s']}s -> {result_path.relative_to(RESULTS.parent.parent)}"
-        )
+        if args.capacity:
+            ensure_oha(args.arch)
+            cap_name = f"cap-{out_name}"
+            print("-- capacity (oha breaking-point ramp)")
+            exec_loadgen(
+                "python3",
+                "capacity.py",
+                "--index-url",
+                index_url,
+                "--host",
+                spec["host"],
+                "--rep-pkg",
+                args.rep_pkg,
+                "--oha",
+                "/repo/bench/install/.bin/oha",
+                "--control-url",
+                "http://control/control-index.json",
+                "--label",
+                args.server,
+                "--output",
+                f"results/{cap_name}",
+            )
+
+        print(f"\n== {args.server} done in {round(time.time() - t0, 1)}s")
     finally:
         if not args.keep:
             print("-- teardown")

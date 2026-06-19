@@ -25,12 +25,75 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urljoin
+
+from benchlib import closures_dir, http_get, is_glibc_wheel
 
 LADDER = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+
+
+def pep503(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def regex_escape(s: str) -> str:
+    """Escape rand_regex (Rust regex) metachars so a URL matches literally."""
+    return re.sub(r"([.+*?()|\[\]{}^$\\-])", r"\\\1", s)
+
+
+def parse_wheel_url(page_url: str, body: bytes, arch: str) -> Optional[str]:
+    """Extract one wheel URL the server serves for a package, from its index page
+    (PEP 691 JSON or legacy HTML). Resolves relative hrefs against the page URL."""
+    text = body.decode("utf-8", "replace")
+    try:
+        urls = [f.get("url", "") for f in json.loads(text).get("files", [])]
+    except json.JSONDecodeError:
+        urls = re.findall(r'href="([^"]+\.whl[^"]*)"', text)
+    cleaned = [u.split("#", 1)[0] for u in urls if ".whl" in u]
+    for u in cleaned:
+        if is_glibc_wheel(u.rsplit("/", 1)[-1], arch):
+            return urljoin(page_url, u)
+    return urljoin(page_url, cleaned[0]) if cleaned else None
+
+
+def build_install_mix(index_url: str, arch: str) -> Tuple[str, float, int, int]:
+    """Build the realistic install-traffic URL mix: every corpus package's index
+    page + one wheel it serves. Returns (rand_regex, reqs_per_install, n_index,
+    n_wheel). reqs_per_install ~= 2 x avg packages/closure (each package = one
+    index GET + one wheel GET during a cold install)."""
+    closures = sorted(closures_dir(arch).glob("*.txt"))
+    pkgs_per: List[int] = []
+    names: set = set()
+    for c in closures:
+        n = 0
+        for line in c.read_text().splitlines():
+            line = line.strip()
+            if "==" in line and not line.startswith(("--", "#")):
+                names.add(pep503(line.split("==")[0].strip()))
+                n += 1
+        if n:
+            pkgs_per.append(n)
+    reqs_per_install = (sum(pkgs_per) / len(pkgs_per)) * 2 if pkgs_per else 1.0
+
+    base = index_url.rstrip("/") + "/"
+    index_urls, wheel_urls = [], []
+    hdr = {"Accept": "application/vnd.pypi.simple.v1+json"}
+    for nm in sorted(names):
+        iu = base + nm + "/"
+        index_urls.append(iu)
+        status, body, _ = http_get(iu, headers=hdr)
+        if status == 200:
+            w = parse_wheel_url(iu, body, arch)
+            if w:
+                wheel_urls.append(w)
+    mix = index_urls + wheel_urls
+    regex = "(" + "|".join(regex_escape(u) for u in mix) + ")"
+    return regex, round(reqs_per_install, 1), len(index_urls), len(wheel_urls)
 
 
 def oha_run(
@@ -40,12 +103,15 @@ def oha_run(
     connections: int,
     headers: Optional[List[str]] = None,
     expect_status: int = 200,
+    regex: bool = False,
 ) -> Dict:
     """Run oha and return rps + latency percentiles + success%. Uses oha's current
     `--json` CLI (the frozen meter.run_oha passes the old `--output-format json`),
     but the JSON shape is identical. `-r 0`: never follow redirects (a 302 measures
-    the 302)."""
+    the 302). regex=True: `url` is a rand_regex the install mix is drawn from."""
     cmd = [oha, "--no-tui", "--json", "-r", "0", "-z", duration, "-c", str(connections)]
+    if regex:
+        cmd.append("--rand-regex-url")
     for h in headers or []:
         cmd += ["-H", h]
     cmd.append(url)
@@ -127,13 +193,14 @@ def ramp(
     duration: str,
     ceiling_ms: float,
     ladder: List[int],
+    regex: bool = False,
 ) -> List[Dict]:
     """Run the connection ladder, stopping once the server breaks (or collapses)."""
     steps: List[Dict] = []
     peak = 0.0
     collapse_streak = 0
     for c in ladder:
-        r = oha_run(oha, url, duration, c, headers=headers, expect_status=expect)
+        r = oha_run(oha, url, duration, c, headers=headers, expect_status=expect, regex=regex)
         step = {
             "connections": c,
             "rps": r["rps"],
@@ -167,10 +234,11 @@ def measure(
     slo_floor_ms: float,
     slo_mult: float,
     ladder: List[int],
+    regex: bool = False,
 ) -> Dict:
-    base = oha_run(oha, url, "5s", 1, headers=headers, expect_status=expect)
+    base = oha_run(oha, url, "5s", 1, headers=headers, expect_status=expect, regex=regex)
     ceiling = max(slo_floor_ms, slo_mult * base["p99_ms"])
-    steps = ramp(oha, url, headers, expect, duration, ceiling, ladder)
+    steps = ramp(oha, url, headers, expect, duration, ceiling, ladder, regex=regex)
     out = analyze_ramp(steps, ceiling)
     out.update(
         {
@@ -185,14 +253,33 @@ def measure(
     return out
 
 
+def classify_bound(primary: Dict, r_ceiling: float) -> Tuple[float, str]:
+    """server-bound (real break, MST << rig ceiling) | caution | rig-bound."""
+    mst = primary["mst_rps"]
+    headroom = round(r_ceiling / mst, 2) if mst else 0.0
+    if not primary["broke"]:
+        return headroom, "rig-bound"
+    if headroom >= 2.0:
+        return headroom, "server-bound"
+    if headroom >= 1.3:
+        return headroom, "caution"
+    return headroom, "rig-bound"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--index-url", required=True, help="PEP 503 index root")
     ap.add_argument("--host", required=True)
+    ap.add_argument("--arch", default="x86_64")
     ap.add_argument(
         "--rep-pkg", default="flask", help="a package present on every server (small clean index)"
+    )
+    ap.add_argument(
+        "--install-mix",
+        action="store_true",
+        help="ramp the realistic install URL mix (index+wheel) -> installs/sec",
     )
     ap.add_argument("--oha", default="oha")
     ap.add_argument("--duration", default="10s")
@@ -204,15 +291,51 @@ def main() -> None:
     args = ap.parse_args()
 
     ladder = LADDER
-    index_url = args.index_url.rstrip("/") + "/" + args.rep_pkg + "/"
     headers = ["Accept: application/vnd.pypi.simple.v1+json"]
+    result = {"label": args.label, "host": args.host}
 
-    print(f"capacity {args.label}: index ramp {index_url}")
-    index = measure(
-        args.oha, index_url, headers, 200, args.duration, args.slo_floor_ms, args.slo_mult, ladder
-    )
-
-    result = {"label": args.label, "host": args.host, "rep_pkg": args.rep_pkg, "index": index}
+    if args.install_mix:
+        regex, reqs_per_install, n_index, n_wheel = build_install_mix(args.index_url, args.arch)
+        print(
+            f"capacity {args.label}: install-mix ramp ({n_index} index + {n_wheel} wheel URLs, "
+            f"~{reqs_per_install} reqs/install)"
+        )
+        primary = measure(
+            args.oha,
+            regex,
+            headers,
+            200,
+            args.duration,
+            args.slo_floor_ms,
+            args.slo_mult,
+            ladder,
+            regex=True,
+        )
+        primary["mix_index_urls"], primary["mix_wheel_urls"] = n_index, n_wheel
+        primary["reqs_per_install"] = reqs_per_install
+        primary["installs_per_sec"] = (
+            round(primary["mst_rps"] / reqs_per_install, 1) if reqs_per_install else 0.0
+        )
+        bpr = primary.get("bytes_per_request") or 0
+        primary["mb_per_sec"] = round(primary["mst_rps"] * bpr / 1e6, 1)
+        key = "install_mix"
+        result[key] = primary
+    else:
+        index_url = args.index_url.rstrip("/") + "/" + args.rep_pkg + "/"
+        print(f"capacity {args.label}: index ramp {index_url}")
+        primary = measure(
+            args.oha,
+            index_url,
+            headers,
+            200,
+            args.duration,
+            args.slo_floor_ms,
+            args.slo_mult,
+            ladder,
+        )
+        key = "index"
+        result["rep_pkg"] = args.rep_pkg
+        result[key] = primary
 
     if args.control_url:
         print(f"capacity {args.label}: control ramp {args.control_url}")
@@ -226,27 +349,23 @@ def main() -> None:
             args.slo_mult,
             ladder,
         )
-        r_ceiling = ctl["peak_rps"]
-        mst = index["mst_rps"]
-        headroom = round(r_ceiling / mst, 2) if mst else 0.0
-        if not index["broke"]:
-            bound = "rig-bound"  # never broke within the ladder
-        elif headroom >= 2.0:
-            bound = "server-bound"
-        elif headroom >= 1.3:
-            bound = "caution"
-        else:
-            bound = "rig-bound"
-        result["control"] = {"r_ceiling_rps": r_ceiling, "headroom": headroom}
+        headroom, bound = classify_bound(primary, ctl["peak_rps"])
+        result["control"] = {"r_ceiling_rps": ctl["peak_rps"], "headroom": headroom}
         result["bound_class"] = bound
-        index["headroom"] = headroom
-        index["bound_class"] = bound
+        primary["headroom"], primary["bound_class"] = headroom, bound
 
-    idx = result["index"]
-    print(
-        f"  MST={idx['mst_rps']} rps @ c={idx['c_knee']}  p99@knee={idx['p99_at_knee_ms']}ms  "
-        f"breach={idx['breach_mode']}  bound={result.get('bound_class', 'n/a')}"
-    )
+    p = result[key]
+    if key == "install_mix":
+        print(
+            f"  install MST: {p.get('installs_per_sec')} installs/s  ({p.get('mb_per_sec')} MB/s, "
+            f"req MST {p['mst_rps']} @ c={p['c_knee']}, breach {p['breach_mode']}, "
+            f"bound {result.get('bound_class', 'n/a')})"
+        )
+    else:
+        print(
+            f"  MST={p['mst_rps']} rps @ c={p['c_knee']}  p99@knee={p['p99_at_knee_ms']}ms  "
+            f"breach={p['breach_mode']}  bound={result.get('bound_class', 'n/a')}"
+        )
 
     blob = json.dumps(result, indent=2)
     if args.output:

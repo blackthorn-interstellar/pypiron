@@ -1,0 +1,192 @@
+accelerate==1.14.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:41b9c4377a54e0b460a959b0defa1b736e4ca0a2373252d9a539964c2afe3c8d \
+    --hash=sha256:e94390c2863b873be18f623f9df48a0d8fe5eff13ea7f1a00092b0a7904888c6
+annotated-doc==0.0.4 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:571ac1dc6991c450b25a9c2d84a3705e2ae7a53467b5d111c24fa8baabbed320 \
+    --hash=sha256:fbcda96e87e9c92ad167c2e53839e57503ecfda18804ea28102353485033faa4
+anyio==4.14.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:b47c1f9ccf73e67021df785332508f99379c68fa7d0684e8e3492cb1d4b23f89 \
+    --hash=sha256:dd9b7a2a9799ed6552fde617b2c5df02b7fdd7d88392fc48101e51bae46164d9
+certifi==2026.6.17 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:024c88eeec92ca068db80f02b8b07c9cef7b9fe261d1d535abfd5abd6f6af432 \
+    --hash=sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db
+click==8.4.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:482be17c6991b8c19c5429a1e995d9b0efdbb63172824c41f99965dc0ade8ec2 \
+    --hash=sha256:918b5633eddf6b41c32d4f454bf0de810065c74e3f7dbf8ee5452f8be88d3e96
+cuda-bindings==13.3.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:04436a9364059c84b8f9636f359eccda1cf814341f5b670c71d80d2f79dbc708 \
+    --hash=sha256:e32d08f71ebcdf00f0f41eab2eb37e8da94c8ed411cc9f7f7a019ce6b34abe3a
+cuda-pathfinder==1.5.5 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:0228c023f95d1480f143ef5c8922d27a2ab052087a942e81dc289c9eb8f91689
+cuda-toolkit==13.0.2 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:b198824cf2f54003f50d64ada3a0f184b42ca0846c1c94192fa269ecd97a66eb
+filelock==3.29.4 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:10cdb3656fc44541cdf30652a93fb10ec6b05325620eb316bd26893e4201538a \
+    --hash=sha256:dac1648087d5115554850d113e7dd8c83ab2d38e3435dde2d4f163847e57b767
+fsspec==2026.6.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:02e0b71817df9b2169dc30a16832045764def1191b43dcff5bb85bdee212d2a1 \
+    --hash=sha256:f5bac145310fe30e16e1471bd6840b2d990d609e872251d7e674241822abf01a
+h11==0.16.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:4e35b956cf45792e4caa5885e69fba00bdbc6ffafbfa020300e549b208ee5ff1 \
+    --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
+hf-xet==1.5.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:51ef4500dab3764b41135ee1381a4b62ce56fc54d4c92b719b59e597d6df5bf6 \
+    --hash=sha256:6208adb15d192b90e4c2ad2a27ed864359b2cb0f2494eb6d7c7f3699ac02e2bf \
+    --hash=sha256:892e3a3a3aecc12aded8b93cf4f9cd059282c7de0732f7d55026f3abdf474350
+httpcore==1.0.9 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55 \
+    --hash=sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8
+httpx==0.28.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc \
+    --hash=sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad
+huggingface-hub==1.20.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:274448a45c1ba6f112fe2fb168ead05574c654faa156904157a84085cfae14bd \
+    --hash=sha256:9f6d63bfbeab2d2a8357200a9bc4f18cd2c8bfac9579f792f5922e77bf6471d0
+idna==3.18 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2 \
+    --hash=sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848
+jinja2==3.1.6 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d \
+    --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
+markdown-it-py==4.2.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49 \
+    --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
+markupsafe==3.0.3 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:0bf2a864d67e76e5c9a34dc26ec616a66b9888e25e7b9460e1c76d3293bd9dbf \
+    --hash=sha256:722695808f4b6457b320fdc131280796bdceb04ab50fe1795cd540799ebe1698 \
+    --hash=sha256:77f0643abe7495da77fb436f50f8dab76dbc6e5fd25d39589a0f1fe6548bfa2b \
+    --hash=sha256:7be7b61bb172e1ed687f1754f8e7484f1c8019780f6f6b0786e76bb01c2ae115 \
+    --hash=sha256:83891d0e9fb81a825d9a6d61e3f07550ca70a076484292a70fde82c4b807286f \
+    --hash=sha256:94c6f0bb423f739146aec64595853541634bde58b2135f27f61c1ffd1cd4d16a \
+    --hash=sha256:bc51efed119bc9cfdf792cdeaa4d67e8f6fcccab66ed4bfdd6bde3e59bfcbb2f \
+    --hash=sha256:d6dd0be5b5b189d31db7cda48b91d7e0a9795f31430b7f271219ab30f1d3ac9d \
+    --hash=sha256:f9e130248f4462aaa8e2552d547f36ddadbeaa573879158d721bbd33dfe4743a
+mdurl==0.1.2 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \
+    --hash=sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba
+mpmath==1.3.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:7a28eb2a9774d00c7bc92411c19a89209d5da7c4c9a9e227be8330a23a25b91f \
+    --hash=sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c
+networkx==3.6.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:26b7c357accc0c8cde558ad486283728b65b6a95d85ee1cd66bafab4c8168509 \
+    --hash=sha256:d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762
+numpy==2.4.6 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:89cd468399cfd2504718f0ba50e410dca55a170b61a02ad92bb18c8a65186e93 \
+    --hash=sha256:8ad03c0965fb3c692200e74d458ca28c1dbb4ce96f9a479a8aa041ad5fabca02 \
+    --hash=sha256:90f9849678c75fe7afa2d348ac842c168b0a4d3d61919687216dfc547976d853 \
+    --hash=sha256:e5805d5a22fd19c8ccff10a9561f9df94436b0545619ea579db2d3c35294bce2 \
+    --hash=sha256:f3a3570c4a2a16746ac2c31a7c7c7b0c186b95ce902e33db6f28094ed7387dda \
+    --hash=sha256:f407cb6b8e9d6d8c626bc73c945db1706035af8fd632295547bf1c9e46d092d6
+nvidia-cublas==13.1.1.3 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:37936a16db8fe4ac1f065c2139360608a543a09275cb1a1af612e08cfa065436
+nvidia-cuda-cupti==13.0.85 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:4eb01c08e859bf924d222250d2e8f8b8ff6d3db4721288cf35d14252a4d933c8
+nvidia-cuda-nvrtc==13.0.88 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575
+nvidia-cuda-runtime==13.0.96 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:7f82250d7782aa23b6cfe765ecc7db554bd3c2870c43f3d1821f1d18aebf0548
+nvidia-cudnn-cu13==9.20.0.48 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:0c45dd8eeb50b603f07995b1b300c62ffe6a1980482b82b3bcf94a4ca9d49304
+nvidia-cufft==12.0.0.61 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:6c44f692dce8fd5ffd3e3df134b6cdb9c2f72d99cf40b62c32dde45eea9ddad3
+nvidia-cufile==1.15.1.6 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:08a3ecefae5a01c7f5117351c64f17c7c62efa5fffdbe24fc7d298da19cd0b44
+nvidia-curand==10.4.0.35 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:1aee33a5da6e1db083fe2b90082def8915f30f3248d5896bcec36a579d941bfc
+nvidia-cusolver==12.0.4.66 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:0a759da5dea5c0ea10fd307de75cdeb59e7ea4fcb8add0924859b944babf1112
+nvidia-cusparse==12.6.3.3 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:2b3c89c88d01ee0e477cb7f82ef60a11a4bcd57b6b87c33f789350b59759360b
+nvidia-cusparselt-cu13==0.8.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:786ce87568c303fadb5afcc7102d454cd3040d75f6f8626f5db460d1871f4dd0
+nvidia-nccl-cu13==2.29.7 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:edd81538446786ec3b73972543e53bb43bcaf0bfc8ef76cb679fcc390ffe136d
+nvidia-nvjitlink==13.0.88 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:13a74f429e23b921c1109976abefacc69835f2f433ebd323d3946e11d804e47b
+nvidia-nvshmem-cu13==3.4.5 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:290f0a2ee94c9f3687a02502f3b9299a9f9fe826e6d0287ee18482e78d495b80
+nvidia-nvtx==13.0.85 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:4936d1d6780fbe68db454f5e72a42ff64d1fd6397df9f363ae786930fd5c1cd4
+packaging==26.2 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e \
+    --hash=sha256:ff452ff5a3e828ce110190feff1178bb1f2ea2281fa2075aadb987c2fb221661
+psutil==7.2.2 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:0746f5f8d406af344fd547f1c8daa5f5c33dbc293bb8d6a16d80b4bb88f59372 \
+    --hash=sha256:076a2d2f923fd4821644f5ba89f059523da90dc9014e85f8e45a5774ca5bc6f9 \
+    --hash=sha256:b58fabe35e80b264a4e3bb23e6b96f9e45a3df7fb7eed419ac0e5947c61e47cc
+pygments==2.20.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f \
+    --hash=sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176
+pyyaml==6.0.3 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:37503bfbfc9d2c40b344d06b2199cf0e96e97957ab1c1b546fd4f87e53e5d3e4 \
+    --hash=sha256:41715c910c881bc081f1e8872880d3c650acf13dfa8214bad49ed4cede7c34ea \
+    --hash=sha256:5fdec68f91a0c6739b380c83b951e2c72ac0197ace422360e6d5a959d8d97b2c \
+    --hash=sha256:850774a7879607d3a6f50d36d04f00ee69e7fc816450e5f7e58d7f17f1ae5c00 \
+    --hash=sha256:b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d \
+    --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc \
+    --hash=sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f
+regex==2026.5.9 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:01f0f5f55f4b64dacec85dc116d3c05fd23ad3ff037bbc73a2085775953c2611 \
+    --hash=sha256:0f9eede6a5cbdc02d4978090186390936e1776a7d1359b21e41014c609880bcf \
+    --hash=sha256:1268eddd8486dc561d08eee1156e40aa3a8fe10f4bdec8fa653b455fcbffd12c \
+    --hash=sha256:2a661a7d270a61f7cf460caee8b9fa2d5ef9e5c681234bcb9e0fe14f488e7dfc \
+    --hash=sha256:39617fb0cde9c0e6306dc70e3bfc096f3da793219879f7ae7aa341a69fbdcf6d \
+    --hash=sha256:3dd4a3ff360dfb836fecdb93a4598f9d6e2ac81e3e397125145c6221bf58cf4c \
+    --hash=sha256:91328f1c23d47595ca3ef0a7557fa129c5a23404b775c770697d2f35b33e0107 \
+    --hash=sha256:93a7860539414dddaefba2b40f8771765ae17949d4c7182b876ce429e11a8309 \
+    --hash=sha256:97cf3bc1b7d7d2306772ec07366c80d9df00ff79e79cea32898883a646d2fae2 \
+    --hash=sha256:a8234aa23ec39894bfe4a3f1b85616a7032481964a13ac6fc9f10de4f6fca270 \
+    --hash=sha256:c9411dd64ca95477225734a93dfc8583b51916b8d5942f99d6cac21e09965451 \
+    --hash=sha256:cd2846168eb9ee3c513902bc8225409cb1caab31d04728b145171fa1625d9621 \
+    --hash=sha256:daff2bdbaf1d23e52fdff7c0b7bc2048b68f978df6a4d107ac981f94caef2e66 \
+    --hash=sha256:dd2810d22146b6d838acc5ec15602cb6b47920aa4e33015df3868eedfd20bab8 \
+    --hash=sha256:ea9c8ecfa1b73c73b626534d6626e5340d429630943672b8480724f44e84b962 \
+    --hash=sha256:f079e50a0d3cc3cd5091fa9ff45869a2e6b2cd35895731edafb0327901a8d86d \
+    --hash=sha256:fd03c4f0e33280d15cae17159b899245d6b7c53d21def19b263b39655061f5ce
+rich==15.0.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb \
+    --hash=sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36
+safetensors==0.8.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:040070828e36dc8e122178bbbd5830ff9e97920affb84cbe0f46442497bed358 \
+    --hash=sha256:4124502b78f03534117c848f87a39b8f31e577b15eff423bf8bfb95f2a8c30d0 \
+    --hash=sha256:4a95ae2b05d7726d751da4ebf626a2ca782b706e101bd894c95bc2450b1cffcc \
+    --hash=sha256:7bc0a787ba8a35be368ee3574edfa2b1ad389eebd0a72e482ae275490e3f6c98 \
+    --hash=sha256:8e080062fcde23be189565e1c3305d16751a218ecf9412c8601e64204eb6f846 \
+    --hash=sha256:fabaf3e0f18a6618d9b36560682562157f77c2b71fcffc7b432be2baed9d753d \
+    --hash=sha256:fcdd41ec4628fee5799f807c73c353629130fbd942aa23d83c623dd6c9d52d78 \
+    --hash=sha256:fd6f3f93c9a0a7cc2788ee63fb763353d4bd2e89b0751bc78fcf7dda00bea774
+setuptools==81.0.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:487b53915f52501f0a79ccfd0c02c165ffe06631443a886740b91af4b7a5845a \
+    --hash=sha256:fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6
+shellingham==1.5.4 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686 \
+    --hash=sha256:8dbca0739d487e5bd35ab3ca4b36e11c4078f3a234bfce294b0a0291363404de
+sympy==1.14.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:d3d3fe8df1e5a0b42f0e7bdf50541697dbe7d23746e894990c030e2b05e72517 \
+    --hash=sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5
+tokenizers==0.22.2 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:1c774b1276f71e1ef716e5486f21e76333464f47bece56bbd554485982a9e03e \
+    --hash=sha256:25b85325d0815e86e0bac263506dd114578953b7b53d7de09a6485e4a160a7dd \
+    --hash=sha256:369cc9fc8cc10cb24143873a0d95438bb8ee257bb80c71989e3ee290e8d72c67 \
+    --hash=sha256:37ae80a28c1d3265bb1f22464c856bd23c02a05bb211e56d0c5301a435be6c1a \
+    --hash=sha256:38337540fbbddff8e999d59970f3c6f35a82de10053206a7562f1ea02d046fa5 \
+    --hash=sha256:473b83b915e547aa366d1eee11806deaf419e17be16310ac0a14077f1e28f917 \
+    --hash=sha256:df6c4265b289083bf710dff49bc51ef252f9d5be33a45ee2bed151114a56207b
+torch==2.12.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:649e4ced014ba646f76f8cb9c9726735a6323eb321b7919f942790a923f90921 \
+    --hash=sha256:6e29e7e74d05bda7d955c75e99459f878ebd970ef851b4057edbd3b34a5eb4a3
+tqdm==4.68.3 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:00dfa48452b6b6cfae3dd9885636c23d3422d1ec97c66d96818cbd5e0821d482 \
+    --hash=sha256:39832cc2def2789a6f29df83f172db7416cea70052c0907a57801c5f2fdccb03
+transformers==5.12.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:2a5e109d2021265df7098ffbb738295acaf5ad256f12cbc586db2ea4dcbb1a8a \
+    --hash=sha256:679ee731c8225347889ad4fb3b2c926a62e9da3b7d284e9d12c791da7272466b
+triton==3.7.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:6744957e9fd610a29680ec2346057d0c86948ed3812468670719f391e94b44a5 \
+    --hash=sha256:7e40869937a68206ec70d7f25bb7ec6433cb083f9135e1f36dbd318dc449a728
+typer==0.25.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:75caa44ed46a03fb2dab8808753ffacdbfea88495e74c85a28c5eefcf5f39c89 \
+    --hash=sha256:9616eb8853a09ffeabab1698952f33c6f29ffdbceb4eaeecf571880e8d7664cc
+typing-extensions==4.15.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466 \
+    --hash=sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548

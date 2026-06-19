@@ -6,6 +6,8 @@ Run: uv run -- pytest bench/install/test_capacity.py
 
 from __future__ import annotations
 
+import json
+
 import capacity
 
 
@@ -51,3 +53,31 @@ def test_no_break_within_ladder():
     assert out["broke"] is False
     assert out["mst_rps"] == 3000
     assert out["breach_mode"] == "none(ladder-cap)"
+
+
+def test_parse_wheel_url_json_picks_glibc_and_resolves_relative():
+    page = "http://pypiron:8080/simple/numpy/"
+    body = json.dumps(
+        {
+            "files": [
+                {"url": "../../packages/numpy-2.3.5-cp311-cp311-musllinux_1_2_x86_64.whl"},
+                {"url": "../../packages/numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl"},
+            ]
+        }
+    ).encode()
+    got = capacity.parse_wheel_url(page, body, "x86_64")
+    assert got == "http://pypiron:8080/packages/numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl"
+
+
+def test_parse_wheel_url_html_strips_fragment():
+    page = "http://web:8080/simple/flask/"
+    body = (
+        b'<a href="../../packages/fl/flask/flask-3.0.0-py3-none-any.whl#sha256=abc">flask-3.0.0</a>'
+    )
+    got = capacity.parse_wheel_url(page, body, "x86_64")
+    assert got == "http://web:8080/packages/fl/flask/flask-3.0.0-py3-none-any.whl"
+
+
+def test_regex_escape_makes_url_literal():
+    esc = capacity.regex_escape("http://h/files/numpy-2.3.5+cu12-cp311.whl")
+    assert r"\-" in esc and r"\." in esc and r"\+" in esc

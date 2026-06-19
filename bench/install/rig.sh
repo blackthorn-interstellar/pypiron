@@ -137,6 +137,14 @@ cmd_deploy() {
   echo "   work-in-progress, so the box builds exactly the committed tree)"
   git -C "$REPO" archive --format=tar HEAD \
     | rig_ssh "rm -rf pypiron && mkdir -p pypiron && tar -x -C pypiron"
+  # The pypiron binary only needs to SERVE; if HEAD's src doesn't compile (a
+  # concurrent agent committed incomplete Rust to master), build the image from a
+  # known-good src ref while the bench harness still runs from HEAD.
+  if [[ -n "${RIG_BUILD_REF:-}" ]]; then
+    echo "== overlay pypiron src from ${RIG_BUILD_REF} (HEAD src doesn't build)"
+    git -C "$REPO" archive --format=tar "$RIG_BUILD_REF" src Cargo.toml Cargo.lock \
+      | rig_ssh "cd pypiron && tar -x"
+  fi
   echo "== build pypiron image + fetch wheelhouse (${RIG_ARCH}/${RIG_TIER})"
   # Rig workaround: HEAD's object_store dep needs a newer toolchain than the
   # committed Dockerfile's rust:1.85 pin (E0658). Bump only the box copy; the

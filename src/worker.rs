@@ -248,6 +248,8 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
     let mut failures = 0usize;
     let mut rebuilt = 0usize;
     let mut skipped = 0usize;
+    let mut files = 0u64;
+    let mut releases = 0u64;
 
     // Shards enumerate in parallel — that is what the sharding is for. The
     // bound keeps peak memory at a few shards' worth of listings (a shard is
@@ -265,6 +267,8 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
                     rebuilt += result.rebuilt;
                     skipped += result.skipped;
                     failures += result.failures;
+                    files += result.files;
+                    releases += result.releases;
                 }
                 Err(e) => {
                     error!(shard=%shard, error=?e, "audit: shard failed");
@@ -291,6 +295,9 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
     m.audit_packages_skipped
         .fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
     m.set_audit_duration(duration_secs);
+    // `live` is sorted+deduped above, so its length is the distinct project
+    // count; releases/files were summed straight off the shard listings.
+    m.set_inventory(live.len() as u64, releases, files);
     info!(
         packages = live.len(),
         rebuilt, skipped, duration_secs, "reconcile: sweep complete"
@@ -306,6 +313,10 @@ struct ShardAudit {
     /// Provably unchanged (fingerprint hit): zero reads spent.
     skipped: usize,
     failures: usize,
+    /// Inventory derived from the shard listing (no extra reads): artifact
+    /// files (sidecars excluded) and distinct `(project, version)` releases.
+    files: u64,
+    releases: u64,
 }
 
 /// Audit every package whose name starts with `shard`.
@@ -347,20 +358,32 @@ async fn audit_shard(state: &AppState, shard: char, force_deep: bool) -> Result<
         rebuilt: 0,
         skipped: 0,
         failures: 0,
+        files: 0,
+        releases: 0,
     };
     let mut fresh: std::collections::HashMap<String, String> = Default::default();
-    let packages: Vec<(String, String, bool)> = by_pkg
-        .into_iter()
-        .map(|(pkg, (t, v))| {
-            let fp = fingerprint(&t, &v);
-            let has_artifacts = t.iter().any(|o| {
-                o.key
-                    .strip_prefix(&format!("{PACKAGES_PREFIX}{pkg}/"))
-                    .is_some_and(is_artifact)
-            });
-            (pkg, fp, has_artifacts)
-        })
-        .collect();
+    let mut packages: Vec<(String, String, bool)> = Vec::with_capacity(by_pkg.len());
+    for (pkg, (t, v)) in by_pkg {
+        let fp = fingerprint(&t, &v);
+        // Count artifacts and distinct versions straight off the listing — the
+        // same bytes the fingerprint already walked, so the inventory is free.
+        let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
+        let mut versions: HashSet<String> = HashSet::new();
+        let mut file_count = 0u64;
+        for obj in &t {
+            if let Some(filename) = obj.key.strip_prefix(&prefix) {
+                if is_artifact(filename) {
+                    file_count += 1;
+                    if let Some(version) = infer_version_from_filename(filename) {
+                        versions.insert(version);
+                    }
+                }
+            }
+        }
+        out.files += file_count;
+        out.releases += versions.len() as u64;
+        packages.push((pkg, fp, file_count > 0));
+    }
 
     for chunk in packages.chunks(PACKAGE_SWEEP_CONCURRENCY) {
         let jobs = chunk.iter().map(|(pkg, fp, has_artifacts)| {
@@ -619,6 +642,33 @@ pub async fn rebuild_package_excluding(
 pub(crate) struct GlobalNames {
     etag: Option<String>,
     names: HashSet<String>,
+}
+
+impl GlobalNames {
+    /// Number of package names in the materialized global index — the
+    /// dashboard's "packages hosted" figure, a free in-memory count.
+    pub(crate) fn len(&self) -> usize {
+        self.names.len()
+    }
+}
+
+/// All hosted package names, sorted — the human package browser's listing.
+/// Loads the global name set into memory on first use (same source and cache as
+/// the dashboard's count), so a freshly booted node still answers.
+pub async fn global_package_names(state: &AppState) -> Result<Vec<String>> {
+    let mut guard = state.global_names.lock().await;
+    if guard.is_none() {
+        *guard = Some(load_global_names(state).await?);
+    }
+    let mut names: Vec<String> = guard
+        .as_ref()
+        .expect("just loaded")
+        .names
+        .iter()
+        .cloned()
+        .collect();
+    names.sort();
+    Ok(names)
 }
 
 /// The global index only changes when the *set of package names* changes —

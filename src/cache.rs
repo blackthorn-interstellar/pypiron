@@ -19,6 +19,7 @@
 //! existed, once per TTL. Single-flight machinery would buy nothing but code.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -158,6 +159,11 @@ pub struct IndexCache {
     ttl: Duration,
     max_bytes: usize,
     entries: Mutex<Entries>,
+    /// Hit/miss tally for the dashboard's cache-hit rate. A "hit" is any index
+    /// served from memory without touching storage — including negatively
+    /// cached misses (a known-absent package answered from RAM).
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl IndexCache {
@@ -170,7 +176,17 @@ impl IndexCache {
             ttl,
             max_bytes,
             entries: Mutex::new(Entries::default()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
+    }
+
+    /// `(hits, misses)` since boot, for the dashboard's cache-hit rate.
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
     }
 
     /// Fetch an index through the cache. `Ok(None)` means "no such index"
@@ -183,8 +199,10 @@ impl IndexCache {
         key: &str,
     ) -> Result<Option<(Variant, Option<Variant>)>> {
         if let Some(hit) = self.fresh(key) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(hit.into_pair());
         }
+        self.misses.fetch_add(1, Ordering::Relaxed);
 
         let cached = match storage.get_bytes(key).await {
             Ok(bytes) => {

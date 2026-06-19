@@ -130,8 +130,9 @@ rig_ssh() { ssh "${SSH_OPTS[@]}" -i "$RIG_KEY" "$(ssh_host)" "$@"; }
 
 cmd_deploy() {
   load_env
-  echo "== waiting for ssh + docker"
-  for _ in $(seq 1 60); do rig_ssh 'command -v docker' >/dev/null 2>&1 && break; sleep 5; done
+  echo "== waiting for ssh + docker DAEMON (not just the binary — first-boot userdata)"
+  for _ in $(seq 1 90); do rig_ssh 'sudo docker info' >/dev/null 2>&1 && break; sleep 5; done
+  rig_ssh 'sudo docker info >/dev/null 2>&1' || { echo "docker daemon never came up" >&2; exit 1; }
   echo "== ship a clean checkout of HEAD (git archive — excludes any uncommitted"
   echo "   work-in-progress, so the box builds exactly the committed tree)"
   git -C "$REPO" archive --format=tar HEAD \

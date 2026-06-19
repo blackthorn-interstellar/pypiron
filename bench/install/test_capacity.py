@@ -65,8 +65,26 @@ def test_parse_wheel_url_json_picks_glibc_and_resolves_relative():
             ]
         }
     ).encode()
-    got = capacity.parse_wheel_url(page, body, "x86_64")
+    allowed = {"numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl"}  # only the seeded one
+    got = capacity.parse_wheel_url(page, body, "x86_64", allowed)
     assert got == "http://pypiron:8080/packages/numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl"
+
+
+def test_parse_wheel_url_skips_unseeded():
+    page = "http://nginx:8080/root/pypi/+simple/numpy/"
+    body = json.dumps(
+        {
+            "files": [
+                {"url": "../+f/aa/numpy-9.9.9-cp311-cp311-manylinux_2_28_x86_64.whl"},  # not seeded
+            ]
+        }
+    ).encode()
+    assert (
+        capacity.parse_wheel_url(
+            page, body, "x86_64", {"numpy-2.3.5-cp311-cp311-manylinux_2_28_x86_64.whl"}
+        )
+        is None
+    )
 
 
 def test_parse_wheel_url_html_strips_fragment():
@@ -74,7 +92,7 @@ def test_parse_wheel_url_html_strips_fragment():
     body = (
         b'<a href="../../packages/fl/flask/flask-3.0.0-py3-none-any.whl#sha256=abc">flask-3.0.0</a>'
     )
-    got = capacity.parse_wheel_url(page, body, "x86_64")
+    got = capacity.parse_wheel_url(page, body, "x86_64", {"flask-3.0.0-py3-none-any.whl"})
     assert got == "http://web:8080/packages/fl/flask/flask-3.0.0-py3-none-any.whl"
 
 

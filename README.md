@@ -147,6 +147,14 @@ export UV_INDEX_COMPANY_PASSWORD="secret"
 regenerable view, backups are rsync. See
 [DESIGN.md](docs/DESIGN.md#what-no-db-honestly-costs).
 
+**How do private and public packages share one URL?** They live in one index —
+there's no virtual-repo group (Artifactory/Nexus) or index inheritance (devpi)
+to compose. Those tools merge several repos per request, which is where
+resolution-order bugs and dependency-confusion fall-through live. Here every
+name belongs to exactly one world — `private` or `mirror`, claimed at first
+write — so there's nothing to merge and no order to get wrong. See
+[DESIGN.md](docs/DESIGN.md#private--mirrored-packages-dependency-confusion).
+
 **Why `--index-url` only, never `--extra-index-url`?** pip merges extra indexes
 with no priority — that *is* the dependency-confusion vulnerability. Point
 clients at this registry only; it decides what exists.

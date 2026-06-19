@@ -295,16 +295,23 @@ def wait_for_file_in_index(
     raise TimeoutError(f"{filename} did not appear in index for {package} within {timeout}s")
 
 
-def wait_for_project_in_global(simple_url: str, package: str, *, timeout: float = 30.0) -> None:
+def wait_for_project_in_global(
+    simple_url: str,
+    package: str,
+    *,
+    timeout: float = 30.0,
+    headers: Optional[Dict[str, str]] = None,
+) -> None:
     """Poll the global index until `package` is listed.
 
     The package index is written before the global one; tests that read the
     global index right after an upload must wait for this or race the worker.
     """
+    accept = {"Accept": ACCEPT_PEP691, **(headers or {})}
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            data = http_get_json(f"{simple_url}index.json", headers={"Accept": ACCEPT_PEP691})
+            data = http_get_json(f"{simple_url}index.json", headers=accept)
             if package in [p.get("name") for p in data.get("projects", [])]:
                 return
         except (RuntimeError, ConnectionError):
@@ -324,19 +331,30 @@ def sha256_file(path: Path) -> str:
     return m.hexdigest()
 
 
-def make_wheel(name: str, version: str, dest_dir: Path) -> Path:
+def make_wheel(
+    name: str,
+    version: str,
+    dest_dir: Path,
+    *,
+    metadata_extra: str = "",
+    description: str = "",
+) -> Path:
     safe_name = re.sub(r"[^A-Za-z0-9.]+", "_", name).strip("_")
     module_name = re.sub(r"\W+", "_", name).strip("_").lower()
     dist_info = f"{safe_name}-{version}.dist-info"
     wheel_path = dest_dir / f"{safe_name}-{version}-py3-none-any.whl"
+    metadata = (
+        "Metadata-Version: 2.1\n"
+        f"Name: {name}\n"
+        f"Version: {version}\n"
+        "Summary: pypiron test package\n"
+        f"{metadata_extra}"
+    )
+    if description:
+        metadata += "\n" + description
     files = {
         f"{module_name}.py": f'__version__ = "{version}"\n'.encode(),
-        f"{dist_info}/METADATA": (
-            "Metadata-Version: 2.1\n"
-            f"Name: {name}\n"
-            f"Version: {version}\n"
-            "Summary: pypiron test package\n"
-        ).encode(),
+        f"{dist_info}/METADATA": metadata.encode(),
         f"{dist_info}/WHEEL": (
             "Wheel-Version: 1.0\n"
             "Generator: pypiron-tests\n"

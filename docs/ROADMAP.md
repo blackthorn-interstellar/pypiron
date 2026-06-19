@@ -36,6 +36,7 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 **Operations & management**
 - `/health`, Prometheus `/metrics`, `--log-format json`, per-project traffic attribution via username subaddressing.
 - Delete and yank management API.
+- Human-facing pages: landing (`/`), live `/dashboard`, and a read-only project page (`/project/<pkg>/`) — metadata sidebar, release files, README shown verbatim (not rendered). Server-rendered on demand, no build step, gated by read auth.
 
 Implementation history (the original milestone-by-milestone build) lives in git;
 the [improvements log](BENCHMARK_RESULTS.md#improvements-log) tracks every landed
@@ -62,10 +63,13 @@ can run with read-only storage credentials (a compromised public replica
 physically cannot tamper with truth). Such a node serves what's materialized and
 cannot self-heal — a writer node must exist somewhere.
 
-**Management UI / package browser.** Browsing `/simple/` shows projects and
-files, but it's raw PEP 503 — no upload times, yank status, or token management.
-Earns its keep only after tokens exist — and even then: server-rendered pages,
-no build step, no React death star.
+**Management UI.** The read-only project page ships (`/project/<pkg>/`:
+metadata sidebar, release files, README shown verbatim — see Shipped). What's
+left is the *management* half — token management, yank/delete from the browser —
+which earns its keep only after tokens exist. Server-rendered, no build step, no
+React death star. A possible follow-up to the read page: opt-in,
+sanitized Markdown rendering of the README (`pulldown-cmark` + `ammonia`, fuzzed,
+`<pre>` fallback for rst/plain), off by default to keep the zero-dep posture.
 
 **Webhook / event notification.** Trigger downstream actions (notify Slack, kick
 CI) on publish or yank. Competitors have it; teams work around it by polling.
@@ -73,9 +77,6 @@ CI) on publish or yank. Competitors have it; teams work around it by polling.
 **Management CLI (beyond sync).** `pypiron packages list`, `pypiron packages
 delete <pkg> <ver>`, `pypiron yank`. The management API exists but requires
 hand-crafted `curl`.
-
-**HTTPS / TLS built-in.** Currently expects a reverse proxy for TLS. A real
-barrier for the "just run it" standalone audience.
 
 **Package retention / cleanup policies.** Auto-delete versions older than N days
 or keep only the N most recent per package. Large registries accumulate stale
@@ -112,3 +113,17 @@ materialized view; backups are rsync.
 URL because its repos are silos. PypIron has one namespace with per-package
 origin: private packages, explicit mirrors (`sync`), and on-demand proxying
 (`--proxy-upstream`) all serve from one URL.
+
+**Built-in HTTPS / TLS.** TLS terminates in front of the service — a reverse
+proxy, load balancer, or CDN (nginx, Caddy's auto-HTTPS, Cloudflare, an ALB). A
+static-file server gains nothing by owning cert lifecycle (ACME, renewal, SNI)
+that those do better, and it fits the design: be cache-correct and let the layer
+in front compound a single node. The standalone "just run it" case is a three-line
+Caddyfile, not a feature we build.
+
+**Deprecated & niche standards — TUF, XML-RPC, eggs, the legacy `/pypi/<pkg>/json`
+API.** Explicitly out of scope; the authoritative statements are in
+[STANDARDS.md](STANDARDS.md). They are either dead (PyPI never shipped PEP 458 TUF;
+XML-RPC search is disabled upstream), a legacy format (eggs — pip dropped egg
+installs), or a non-standard metadata endpoint superseded by the PEP 691/700 JSON
+simple API. No installer needs any of them from a private index.

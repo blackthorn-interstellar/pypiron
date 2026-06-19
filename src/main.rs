@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 mod cache;
 mod config;
+mod coremeta;
 #[cfg(test)]
 mod corpus_check;
 mod lease;
@@ -415,10 +416,14 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
 
     // router
     let app = Router::new()
-        // Human-facing pages. Root is the public front door (no secrets); the
-        // dashboard is gated by read auth inside its handler.
+        // Human-facing pages. Root is the public front door (no secrets); its
+        // inline activity panel and the package browser are gated by read auth
+        // inside their handlers.
         .route("/", get(root))
-        .route("/dashboard", get(dashboard))
+        .route("/projects", get(projects_page))
+        .route("/projects/", get(projects_page))
+        .route("/project/:package", get(project_page))
+        .route("/project/:package/", get(project_page))
         // Legacy PyPI upload API (used by uv/twine)
         .route("/legacy", post(legacy_upload))
         .route("/legacy/", post(legacy_upload))
@@ -609,33 +614,97 @@ async fn track_metrics(
 
 /// The root landing page: a self-contained HTML front door with copy-paste
 /// client config. Public (no secrets) — like `/health`, it carries no auth.
+/// The live activity panel (traffic counters, project-tag names) is folded in
+/// only for an authorized reader, so a public deployment never leaks stats: it
+/// surfaces the same data as `/metrics`, but legibly, and only to operators who
+/// can already read. When reads are public (no read credential), everyone sees
+/// it — consistent with that deployment's open posture.
 async fn root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
-    html_ok(web::landing_html(&page_context(&state, &headers)))
-}
-
-/// The live dashboard. Gated by read auth (open when no read credential is
-/// configured): it surfaces the same data as `/metrics`, but legibly, including
-/// client project tags — operators reading it have read creds; scrapers keep
-/// using `/metrics`.
-async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
+    let ctx = page_context(&state, &headers);
+    // Registry inventory (counts only) is public — shown under the header.
+    let inventory = state.metrics.inventory();
     if !state.is_reader(&headers) {
-        return unauthorized();
+        return html_ok(web::landing_html(&ctx, inventory.as_ref(), None));
     }
     let snap = state.metrics.snapshot();
-    let (hits, misses) = state.index_cache.stats();
-    let packages = state
+    let (cache_hits, cache_misses) = state.index_cache.stats();
+    let packages_hosted = state
         .global_names
         .lock()
         .await
         .as_ref()
         .map_or(0, |g| g.len());
-    html_ok(web::dashboard_html(
+    let dash = web::DashboardData {
+        snapshot: &snap,
+        cache_hits,
+        cache_misses,
+        packages_hosted,
+    };
+    html_ok(web::landing_html(&ctx, inventory.as_ref(), Some(&dash)))
+}
+
+/// The human package browser (`/projects/`): every hosted package, linked to
+/// its project page. Read-only and gated by read auth like the activity panel.
+async fn projects_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
+    if !state.is_reader(&headers) {
+        return unauthorized();
+    }
+    let names = match worker::global_package_names(&state).await {
+        Ok(names) => names,
+        Err(e) => return read_error(e),
+    };
+    html_ok(web::projects_html(&page_context(&state, &headers), &names))
+}
+
+/// The human project page (`/project/<pkg>/`): metadata sidebar, release files,
+/// and the README shown verbatim. Read-only and gated by read auth like the
+/// dashboard. Rendered on demand — no materialized view, truth stays files.
+async fn project_page(
+    State(state): State<Arc<AppState>>,
+    Path(raw): Path<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !state.is_reader(&headers) {
+        return unauthorized();
+    }
+    let Some(pkg) = checked_pkg_name(&raw) else {
+        return not_found("invalid package name");
+    };
+    // Canonical URL is the normalized one; everything else 301s there.
+    if raw != pkg {
+        return moved_permanently(&format!("/project/{pkg}/"));
+    }
+    let files = match worker::list_artifacts(&state, &pkg).await {
+        Ok(files) => files,
+        Err(e) => return read_error(e),
+    };
+    if files.is_empty() {
+        return not_found("no such project");
+    }
+    let meta = load_core_metadata(&state, &pkg, &files).await;
+    html_ok(web::project_html(
         &page_context(&state, &headers),
-        &snap,
-        hits,
-        misses,
-        packages,
+        &pkg,
+        &files,
+        meta.as_ref(),
     ))
+}
+
+/// Parse the core metadata of the representative file — the newest-uploaded one
+/// that has a `.metadata` companion. Best-effort: any miss returns `None` and
+/// the page renders without a sidebar.
+async fn load_core_metadata(
+    state: &AppState,
+    pkg: &str,
+    files: &[render::FileMetadata],
+) -> Option<coremeta::CoreMetadata> {
+    let rep = files
+        .iter()
+        .filter(|f| f.core_metadata)
+        .max_by(|a, b| a.upload_time.cmp(&b.upload_time))?;
+    let key = sidecar::metadata_key(&format!("{PACKAGES_PREFIX}{pkg}/{}", rep.filename));
+    let bytes = state.storage.get_bytes(&key).await.ok()?;
+    Some(coremeta::parse(&bytes))
 }
 
 /// Build the request-derived context both pages share. The base URL honors a

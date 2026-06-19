@@ -10,9 +10,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Route groups, by path prefix. Order matches the counter matrix.
-const ROUTES: [&str; 6] = ["simple", "files", "legacy", "health", "metrics", "other"];
+pub const ROUTES: [&str; 6] = ["simple", "files", "legacy", "health", "metrics", "other"];
 /// Status classes. Order matches the counter matrix.
 const STATUS_CLASSES: [&str; 4] = ["2xx", "3xx", "4xx", "5xx"];
+
+/// Index of the `files` route and the `2xx` status class in the matrix above.
+/// The dashboard's "files served" tile is files-route successes; naming the
+/// indices (and asserting them in a test) keeps that out of magic numbers.
+const ROUTE_FILES: usize = 1;
+const CLASS_2XX: usize = 0;
 
 /// Cap on distinct project attribution tags. Tags are client-supplied
 /// (basic-auth username subaddresses), so without a cap a hostile or
@@ -53,6 +59,15 @@ pub struct Metrics {
     pub audit_packages_skipped: AtomicU64,
     /// Last completed audit's wall duration, seconds, as f64 bits (gauge).
     audit_last_duration_bits: AtomicU64,
+    /// Registry inventory, recomputed each full sweep from the shard listings
+    /// (zero extra reads): distinct projects with artifacts, distinct
+    /// (project, version) releases, and artifact files (sidecars excluded).
+    /// `inventory_ready` flips true after the first clean sweep — until then
+    /// the homepage shows nothing rather than a misleading zero.
+    inventory_ready: std::sync::atomic::AtomicBool,
+    inventory_projects: AtomicU64,
+    inventory_releases: AtomicU64,
+    inventory_files: AtomicU64,
     /// Global-index CAS write-backs lost to a peer (reload-and-retry fired).
     /// A nonzero value is two nodes legitimately racing the name set — the
     /// proof that dual leadership is converging, not corrupting.
@@ -102,6 +117,25 @@ impl Metrics {
             .store(secs.to_bits(), Ordering::Relaxed);
     }
 
+    /// Publish the registry inventory measured by a clean sweep.
+    pub fn set_inventory(&self, projects: u64, releases: u64, files: u64) {
+        self.inventory_projects.store(projects, Ordering::Relaxed);
+        self.inventory_releases.store(releases, Ordering::Relaxed);
+        self.inventory_files.store(files, Ordering::Relaxed);
+        self.inventory_ready.store(true, Ordering::Relaxed);
+    }
+
+    /// The last measured inventory, or `None` before the first sweep completes.
+    pub fn inventory(&self) -> Option<Inventory> {
+        self.inventory_ready
+            .load(Ordering::Relaxed)
+            .then(|| Inventory {
+                projects: self.inventory_projects.load(Ordering::Relaxed),
+                releases: self.inventory_releases.load(Ordering::Relaxed),
+                files: self.inventory_files.load(Ordering::Relaxed),
+            })
+    }
+
     pub fn record_request(&self, route: usize, status: u16) {
         let class = match status {
             200..=299 => 0,
@@ -110,6 +144,28 @@ impl Metrics {
             _ => 3,
         };
         self.requests[route][class].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A consistent-enough point-in-time copy of the request counters for the
+    /// human dashboard (`/dashboard`). Atomics are read individually, not under
+    /// a global lock, so totals can be off by a handful under concurrent
+    /// traffic — fine for a glanceable page, never used for correctness.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        let mut requests = [[0u64; STATUS_CLASSES.len()]; ROUTES.len()];
+        for (r, row) in requests.iter_mut().enumerate() {
+            for (c, cell) in row.iter_mut().enumerate() {
+                *cell = self.requests[r][c].load(Ordering::Relaxed);
+            }
+        }
+        let map = self
+            .project_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let project_requests = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        MetricsSnapshot {
+            requests,
+            project_requests,
+        }
     }
 
     /// Prometheus text exposition (format version 0.0.4).
@@ -190,6 +246,26 @@ impl Metrics {
         out.push_str(&format!(
             "pypiron_audit_last_duration_seconds {audit_secs}\n"
         ));
+        for (name, help, value) in [
+            (
+                "pypiron_registry_projects",
+                "Distinct projects with at least one artifact (last sweep).",
+                self.inventory_projects.load(Ordering::Relaxed),
+            ),
+            (
+                "pypiron_registry_releases",
+                "Distinct (project, version) releases (last sweep).",
+                self.inventory_releases.load(Ordering::Relaxed),
+            ),
+            (
+                "pypiron_registry_files",
+                "Artifact files, excluding sidecars (last sweep).",
+                self.inventory_files.load(Ordering::Relaxed),
+            ),
+        ] {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+            out.push_str(&format!("{name} {value}\n"));
+        }
         let map = self
             .project_requests
             .lock()
@@ -214,9 +290,90 @@ impl Metrics {
     }
 }
 
+/// Registry size at the last clean sweep: distinct projects with at least one
+/// artifact, distinct `(project, version)` releases, and artifact files
+/// (sidecar/metadata/provenance excluded). Shown under the homepage header.
+#[derive(Clone, Copy, Debug)]
+pub struct Inventory {
+    pub projects: u64,
+    pub releases: u64,
+    pub files: u64,
+}
+
+/// A copy of the request counters at one instant, with the derived numbers the
+/// dashboard shows. Plain data so [`crate::web::dashboard_html`] stays a pure
+/// function that can be unit-tested without spinning up [`Metrics`].
+pub struct MetricsSnapshot {
+    /// `requests[route][status_class]`, indexed by [`ROUTES`]/`STATUS_CLASSES`.
+    requests: [[u64; STATUS_CLASSES.len()]; ROUTES.len()],
+    /// `(project_tag, per-route counts)` for every attribution tag seen.
+    project_requests: Vec<(String, [u64; ROUTES.len()])>,
+}
+
+impl MetricsSnapshot {
+    /// Every request the process has served since boot.
+    pub fn total_requests(&self) -> u64 {
+        self.requests.iter().flatten().sum()
+    }
+
+    /// Successful (2xx) responses on the `/files/` route — wheels streamed by
+    /// this node plus their `.metadata`/`.provenance` companion fetches. NOT a
+    /// faithful "downloads" count: under `redirect`/`auto` delivery a wheel GET
+    /// is a 302 (lands in files-route 3xx, excluded here), so on an S3 node this
+    /// reads ~0 because the bytes come from S3, not us. Labeled "Files served".
+    pub fn files_served(&self) -> u64 {
+        self.requests[ROUTE_FILES][CLASS_2XX]
+    }
+
+    /// `(route_group, total requests)` across all status classes, in matrix
+    /// order; callers sort/filter for the "top route groups" chart.
+    pub fn route_totals(&self) -> Vec<(&'static str, u64)> {
+        ROUTES
+            .iter()
+            .enumerate()
+            .map(|(r, name)| (*name, self.requests[r].iter().sum()))
+            .collect()
+    }
+
+    /// `(project_tag, total requests)` across all routes; callers sort/filter
+    /// for the "top projects" chart.
+    pub fn project_totals(&self) -> Vec<(String, u64)> {
+        self.project_requests
+            .iter()
+            .map(|(tag, counts)| (tag.clone(), counts.iter().sum()))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matrix_indices_match_route_names() {
+        assert_eq!(ROUTES[ROUTE_FILES], "files");
+        assert_eq!(STATUS_CLASSES[CLASS_2XX], "2xx");
+    }
+
+    #[test]
+    fn snapshot_reports_totals_files_served_and_breakdowns() {
+        let m = Metrics::new();
+        m.record_request(route_group("/simple/"), 200);
+        m.record_request(route_group("/simple/"), 404);
+        m.record_request(route_group("/files/six/six.whl"), 200);
+        m.record_request(route_group("/files/six/six.whl"), 200);
+        m.record_project("billing-api", route_group("/files/six/six.whl"));
+        m.record_project("etl", route_group("/simple/"));
+        let snap = m.snapshot();
+        assert_eq!(snap.total_requests(), 4);
+        assert_eq!(snap.files_served(), 2);
+        let routes: std::collections::HashMap<_, _> = snap.route_totals().into_iter().collect();
+        assert_eq!(routes["simple"], 2);
+        assert_eq!(routes["files"], 2);
+        let projects: std::collections::HashMap<_, _> = snap.project_totals().into_iter().collect();
+        assert_eq!(projects["billing-api"], 1);
+        assert_eq!(projects["etl"], 1);
+    }
 
     #[test]
     fn route_groups_classify_paths() {
@@ -264,6 +421,23 @@ mod tests {
         );
         assert!(text.contains("pypiron_audit_packages_rebuilt_total 2"));
         assert!(text.contains("pypiron_audit_packages_skipped_total 40"));
+    }
+
+    #[test]
+    fn inventory_is_none_until_set_then_reports_and_exposes_gauges() {
+        let m = Metrics::new();
+        assert!(m.inventory().is_none());
+        // Gauges are present (at zero) before the first sweep.
+        assert!(m.render().contains("pypiron_registry_projects 0"));
+
+        m.set_inventory(12, 345, 6789);
+        let inv = m.inventory().expect("inventory set");
+        assert_eq!((inv.projects, inv.releases, inv.files), (12, 345, 6789));
+        let text = m.render();
+        assert!(text.contains("# TYPE pypiron_registry_releases gauge"));
+        assert!(text.contains("pypiron_registry_projects 12"));
+        assert!(text.contains("pypiron_registry_releases 345"));
+        assert!(text.contains("pypiron_registry_files 6789"));
     }
 
     #[test]

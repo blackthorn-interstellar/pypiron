@@ -55,6 +55,7 @@ markers = [
     "stress: long-running, network-heavy tests (disabled by default)",
     "integration: integration tests that may hit the network or spawn services",
     "s3: tests that require Docker/MinIO S3 emulation",
+    "azure: tests that require Docker/Azurite Azure Blob emulation",
     "perf: performance benchmarks against the release binary (disabled by default)",
     "chaos: crash-point fault injection sweeps (slow-ish, deterministic)",
     "compat(client, feature): client compatibility coverage point for docs/COMPATIBILITY.md",

@@ -6,9 +6,9 @@ Truth lives in the packages tree: immutable artifacts plus write-time metadata s
 
 Upload and delete events drop dirty markers; a single worker rebuilds marked packages from listing and deletes markers last. A periodic full reconcile is the backbone — events merely accelerate it, so lost events self-heal. The global index regenerates only when the set of package names changes.
 
-Reads need zero coordination and the server is fully cache-correct — filenames can never be re-uploaded, so artifacts are served `immutable`; indexes are ETag-revalidated; S3 downloads redirect to presigned URLs so nodes never touch wheel bytes. Client caches, proxies, or an optional CDN compound a single node's already-sufficient capacity. Disk or S3 backed.
+Reads need zero coordination and the server is fully cache-correct — filenames can never be re-uploaded, so artifacts are served `immutable`; indexes are ETag-revalidated; cloud-backend downloads redirect to presigned URLs so nodes never touch wheel bytes. Client caches, proxies, or an optional CDN compound a single node's already-sufficient capacity. Disk-backed or cloud-backed (S3, Google Cloud Storage, Azure Blob).
 
-For multi-node, only the index writer is singular: an S3 conditional-write lease, sloppy by design — rebuilds are idempotent, so split-brain merely duplicates work.
+For multi-node, only the index writer is singular: a conditional-write lease on the bucket, sloppy by design — rebuilds are idempotent, so split-brain merely duplicates work.
 
 An optional synchronous upload mode waits for index visibility before returning 200, for publish-then-install CI pipelines.
 

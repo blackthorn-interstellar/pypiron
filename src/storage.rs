@@ -12,24 +12,33 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-// S3 deps
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::Region;
-use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::{primitives::ByteStream, Client as S3Client};
+// Cloud object-store deps: S3, GCS, and Azure Blob behind one API. Disk is a
+// separate, dependency-free backend; everything remote shares one impl.
+use futures::StreamExt as _;
+use object_store::aws::{AmazonS3Builder, S3CopyIfNotExists};
+use object_store::azure::MicrosoftAzureBuilder;
+use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
+use object_store::path::Path as OsPath;
+use object_store::signer::Signer;
+use object_store::{
+    Attribute, Attributes, Error as OsError, GetOptions, GetRange, ObjectStore, ObjectStoreExt,
+    PutMode, PutMultipartOptions, PutOptions, PutPayload, UpdateVersion, WriteMultipart,
+};
 
 /// Storage backend selection.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum StorageBackend {
     Disk,
     S3,
+    Gcs,
+    Azure,
 }
 
 /// Storage configuration shared by `serve` and `sync` — one binary, one
 /// storage layer, no second implementation.
 #[derive(ClapArgs, Debug, Clone)]
 pub struct StorageArgs {
-    /// Storage backend to use: "disk" or "s3"
+    /// Storage backend to use: "disk", "s3", "gcs", or "azure"
     #[arg(long, env = "PYPIRON_STORAGE", value_enum, default_value_t = StorageBackend::Disk)]
     pub storage: StorageBackend,
 
@@ -52,6 +61,41 @@ pub struct StorageArgs {
     /// Force S3 path-style addressing
     #[arg(long, env = "PYPIRON_S3_FORCE_PATH_STYLE")]
     pub s3_force_path_style: bool,
+
+    // --- Google Cloud Storage (--storage gcs) ---
+    /// GCS bucket name for package storage (required if --storage gcs)
+    #[arg(long, env = "PYPIRON_GCS_BUCKET")]
+    pub gcs_bucket: Option<String>,
+
+    /// Path to a GCS service-account JSON key. Without it, Application Default
+    /// Credentials are used — but presigned URLs are then unavailable.
+    #[arg(long, env = "PYPIRON_GCS_SERVICE_ACCOUNT_PATH")]
+    pub gcs_service_account_path: Option<String>,
+
+    /// GCS endpoint URL (for a local emulator such as fake-gcs-server)
+    #[arg(long, env = "PYPIRON_GCS_ENDPOINT_URL")]
+    pub gcs_endpoint_url: Option<String>,
+
+    // --- Azure Blob Storage (--storage azure) ---
+    /// Azure storage account name (required if --storage azure)
+    #[arg(long, env = "PYPIRON_AZURE_ACCOUNT")]
+    pub azure_account: Option<String>,
+
+    /// Azure blob container for package storage (required if --storage azure)
+    #[arg(long, env = "PYPIRON_AZURE_CONTAINER")]
+    pub azure_container: Option<String>,
+
+    /// Azure storage account access key. Enables presigned (SAS) URLs.
+    #[arg(long, env = "PYPIRON_AZURE_ACCESS_KEY")]
+    pub azure_access_key: Option<String>,
+
+    /// Azure endpoint URL (for a local emulator such as Azurite)
+    #[arg(long, env = "PYPIRON_AZURE_ENDPOINT_URL")]
+    pub azure_endpoint_url: Option<String>,
+
+    /// Use the Azurite storage emulator (well-known dev account and key)
+    #[arg(long, env = "PYPIRON_AZURE_USE_EMULATOR")]
+    pub azure_use_emulator: bool,
 }
 
 impl StorageArgs {
@@ -84,22 +128,88 @@ impl StorageArgs {
                     .s3_bucket
                     .clone()
                     .ok_or_else(|| anyhow!("--s3-bucket is required when using --storage s3"))?;
-
-                let mut cfg_loader = aws_config::defaults(BehaviorVersion::latest());
+                // Credentials come from the standard AWS chain (env vars, web
+                // identity, instance metadata). The default S3ConditionalPut is
+                // ETag-match, so the single-PUT create-if-absent path works on
+                // S3 and S3-compatible stores out of the box; large artifacts
+                // are published with a multipart copy-if-not-exists.
+                let mut b = AmazonS3Builder::from_env()
+                    .with_bucket_name(bucket)
+                    .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
                 if let Some(ref r) = self.aws_region {
-                    cfg_loader = cfg_loader.region(Region::new(r.clone()));
+                    b = b.with_region(r.clone());
                 }
-                let base_cfg = cfg_loader.load().await;
-
-                let mut s3_cfg_builder = aws_sdk_s3::config::Builder::from(&base_cfg);
                 if let Some(ref url) = self.s3_endpoint_url {
-                    s3_cfg_builder = s3_cfg_builder.endpoint_url(url);
+                    b = b.with_endpoint(url.clone());
+                    if url.starts_with("http://") {
+                        b = b.with_allow_http(true);
+                    }
                 }
                 if self.s3_force_path_style {
-                    s3_cfg_builder = s3_cfg_builder.force_path_style(true);
+                    b = b.with_virtual_hosted_style_request(false);
+                } else if self.s3_endpoint_url.is_none() {
+                    // Real AWS prefers virtual-hosted-style addressing; custom
+                    // endpoints (MinIO et al.) keep the path-style default.
+                    b = b.with_virtual_hosted_style_request(true);
                 }
-                let s3 = aws_sdk_s3::Client::from_conf(s3_cfg_builder.build());
-                Ok(Arc::new(S3Storage::new(s3, bucket)))
+                let s3 = Arc::new(b.build().context("configure S3 backend")?);
+                let store: Arc<dyn ObjectStore> = s3.clone();
+                let signer: Arc<dyn Signer> = s3;
+                Ok(Arc::new(ObjectStorage::new(store, Some(signer), "s3")))
+            }
+            StorageBackend::Gcs => {
+                let bucket = self
+                    .gcs_bucket
+                    .clone()
+                    .ok_or_else(|| anyhow!("--gcs-bucket is required when using --storage gcs"))?;
+                let mut b = GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
+                // Presigning needs a service-account private key; ADC tokens
+                // cannot sign URLs, so presign is disabled under ADC.
+                let mut can_sign = false;
+                if let Some(ref p) = self.gcs_service_account_path {
+                    b = b.with_service_account_path(p.clone());
+                    can_sign = true;
+                }
+                if let Some(ref url) = self.gcs_endpoint_url {
+                    // Emulator (fake-gcs-server): point at it and skip signing.
+                    b = b
+                        .with_config(GoogleConfigKey::BaseUrl, url.clone())
+                        .with_config(GoogleConfigKey::SkipSignature, "true");
+                    can_sign = false;
+                }
+                let gcs = Arc::new(b.build().context("configure GCS backend")?);
+                let store: Arc<dyn ObjectStore> = gcs.clone();
+                let signer = can_sign.then_some(gcs as Arc<dyn Signer>);
+                Ok(Arc::new(ObjectStorage::new(store, signer, "gcs")))
+            }
+            StorageBackend::Azure => {
+                let container = self.azure_container.clone().ok_or_else(|| {
+                    anyhow!("--azure-container is required when using --storage azure")
+                })?;
+                let mut b = MicrosoftAzureBuilder::from_env().with_container_name(container);
+                // SAS presigning needs the account access key.
+                let mut can_sign = false;
+                if let Some(ref a) = self.azure_account {
+                    b = b.with_account(a.clone());
+                }
+                if let Some(ref k) = self.azure_access_key {
+                    b = b.with_access_key(k.clone());
+                    can_sign = true;
+                }
+                if self.azure_use_emulator {
+                    b = b.with_use_emulator(true);
+                    can_sign = true;
+                }
+                if let Some(ref url) = self.azure_endpoint_url {
+                    b = b.with_endpoint(url.clone());
+                    if url.starts_with("http://") {
+                        b = b.with_allow_http(true);
+                    }
+                }
+                let az = Arc::new(b.build().context("configure Azure backend")?);
+                let store: Arc<dyn ObjectStore> = az.clone();
+                let signer = can_sign.then_some(az as Arc<dyn Signer>);
+                Ok(Arc::new(ObjectStorage::new(store, signer, "azure")))
             }
         }
     }
@@ -580,308 +690,193 @@ fn disk_etag(md: &std::fs::Metadata) -> String {
     format!("{mtime}-{}", md.len())
 }
 
-/// ------------------------------ S3Storage --------------------------------
-pub struct S3Storage {
-    s3: S3Client,
-    bucket: String,
+/// ------------------------------ ObjectStorage -----------------------------
+/// One backend for every cloud object store — S3, GCS, and Azure Blob — over
+/// the `object_store` crate. Disk stays a separate, dependency-free backend;
+/// everything remote shares this single implementation, so there is no
+/// per-cloud code to drift.
+pub struct ObjectStorage {
+    store: Arc<dyn ObjectStore>,
+    /// Present only when the backend can mint presigned GET URLs (S3 always;
+    /// GCS with a service-account key; Azure with an account key or emulator).
+    /// `None` means "serve it yourself" — never a hard failure.
+    signer: Option<Arc<dyn Signer>>,
+    /// Backend name, for error context.
+    backend: &'static str,
 }
 
-/// Above this, uploads go as parallel multipart parts instead of one
-/// sequential PUT — a 900 MB wheel went from ~12 s of single-stream S3 to
-/// ~2-3 s with parts in flight.
+/// At or below this size an upload is a single conditional PUT; above it the
+/// body streams to a unique staging key as parallel multipart parts (bounded
+/// RSS) and is then published atomically with `copy_if_not_exists`. The 16 MB
+/// part size keeps a ~900 MB wheel to a handful of in-flight parts.
 const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
-const MULTIPART_PART_SIZE: u64 = 16 * 1024 * 1024;
+const MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
 const MULTIPART_CONCURRENCY: usize = 6;
+const READ_CHUNK: usize = 8 * 1024 * 1024;
 
-impl S3Storage {
-    pub fn new(s3: S3Client, bucket: String) -> Self {
-        Self { s3, bucket }
-    }
+/// Staging keys live here; large uploads land under this prefix and are then
+/// published (copy-if-not-exists) to their final key. Always cleaned up.
+const STAGING_PREFIX: &str = "_staging/";
 
-    /// Open a multipart upload, returning its upload id.
-    async fn begin_multipart(&self, key: &str, content_type: Option<&str>) -> Result<String> {
-        let mut create = self
-            .s3
-            .create_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key);
-        if let Some(ct) = content_type {
-            create = create.content_type(ct);
+/// Packs object_store's (e_tag, version) pair into one opaque token. Stores use
+/// differing combinations to express a conditional update (S3/Azure: ETag; GCS:
+/// generation), so we round-trip both. Compared only for equality.
+const VERSION_SEP: char = '\u{1f}';
+
+impl ObjectStorage {
+    pub fn new(
+        store: Arc<dyn ObjectStore>,
+        signer: Option<Arc<dyn Signer>>,
+        backend: &'static str,
+    ) -> Self {
+        Self {
+            store,
+            signer,
+            backend,
         }
-        create
-            .send()
-            .await
-            .context("create multipart upload")?
-            .upload_id
-            .ok_or_else(|| anyhow!("S3 returned no upload id"))
     }
 
-    /// Upload one part and return its `CompletedPart` (number + ETag).
-    async fn put_part(
-        &self,
-        key: &str,
-        upload_id: &str,
-        part_number: i32,
-        body: ByteStream,
-    ) -> Result<aws_sdk_s3::types::CompletedPart> {
-        let out = self
-            .s3
-            .upload_part()
-            .bucket(&self.bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(body)
-            .send()
-            .await
-            .with_context(|| format!("upload part {part_number}"))?;
-        Ok(aws_sdk_s3::types::CompletedPart::builder()
-            .part_number(part_number)
-            .set_e_tag(out.e_tag)
-            .build())
-    }
-
-    /// Complete a multipart upload conditionally (`If-None-Match: *`) from the
-    /// part results — immutability decided at complete time, exactly as the
-    /// single-PUT path. Any failure (lost race or a mid-flight error) aborts
-    /// the upload so no invisible parts linger billable. `Ok(false)` means we
-    /// lost the immutability race.
-    async fn finish_multipart(
-        &self,
-        key: &str,
-        upload_id: &str,
-        parts: Result<Vec<aws_sdk_s3::types::CompletedPart>>,
-    ) -> Result<bool> {
-        let completed = match parts {
-            Ok(parts) => {
-                let mpu = aws_sdk_s3::types::CompletedMultipartUpload::builder()
-                    .set_parts(Some(parts))
-                    .build();
-                match self
-                    .s3
-                    .complete_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(upload_id)
-                    .multipart_upload(mpu)
-                    .if_none_match("*")
-                    .send()
-                    .await
-                {
-                    Ok(_) => return Ok(true),
-                    Err(e) if lost_conditional_write(&e) => Ok(false),
-                    Err(e) => Err(anyhow::Error::from(e).context("complete multipart upload")),
-                }
+    /// GET the whole object as a 200 response.
+    async fn full_response(&self, path: &OsPath, key: &str) -> Result<Response<Body>> {
+        let res = match self.store.get(path).await {
+            Ok(r) => r,
+            Err(OsError::NotFound { .. }) => return Err(NotFound(key.to_string()).into()),
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!("{}: get {key}", self.backend)))
             }
-            Err(e) => Err(e),
         };
-        let _ = self
-            .s3
-            .abort_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .send()
-            .await;
-        completed
+        let size = res.meta.size;
+        let ct = content_type_of(&res.attributes);
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, size)
+            .header(header::CONTENT_TYPE, ct)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .body(Body::from_stream(res.into_stream()))?)
     }
 
-    /// Parallel multipart upload from a local file (artifacts of any size are
-    /// streamed off disk, never held in memory).
-    async fn multipart_from_file(
+    /// Stream a spooled file into a multipart upload at `staging`, bounding
+    /// resident memory to a few parts in flight. Aborts on any error so no
+    /// orphaned parts linger billable.
+    async fn stream_multipart(
         &self,
-        key: &str,
+        staging: &OsPath,
         path: &std::path::Path,
-        size: u64,
         content_type: Option<&str>,
-    ) -> Result<bool> {
-        let upload_id = self.begin_multipart(key, content_type).await?;
-        let parts = self.upload_parts(key, path, size, &upload_id).await;
-        self.finish_multipart(key, &upload_id, parts).await
-    }
-
-    /// Multipart from an in-memory body (sync's mirror path verifies the
-    /// digest before writing, so the bytes are already resident). Parts are
-    /// Bytes slices — zero-copy views into the one buffer.
-    async fn multipart_from_bytes(
-        &self,
-        key: &str,
-        bytes: Vec<u8>,
-        content_type: Option<&str>,
-    ) -> Result<bool> {
-        let upload_id = self.begin_multipart(key, content_type).await?;
-
-        let body = bytes::Bytes::from(bytes);
-        let part_ranges: Vec<(i32, std::ops::Range<usize>)> = (0..)
-            .map(|i| {
-                let start = i * MULTIPART_PART_SIZE as usize;
-                let end = (start + MULTIPART_PART_SIZE as usize).min(body.len());
-                (i as i32 + 1, start..end)
-            })
-            .take_while(|(_, r)| !r.is_empty())
-            .collect();
-
-        let mut parts = Vec::with_capacity(part_ranges.len());
-        let mut failed: Option<anyhow::Error> = None;
-        for chunk in part_ranges.chunks(MULTIPART_CONCURRENCY) {
-            let uploads = chunk.iter().map(|(part_number, range)| {
-                let part = body.slice(range.clone());
-                self.put_part(key, &upload_id, *part_number, ByteStream::from(part))
-            });
-            for part in futures::future::join_all(uploads).await {
-                match part {
-                    Ok(p) => parts.push(p),
-                    Err(e) => failed = Some(e),
+    ) -> Result<()> {
+        let opts = PutMultipartOptions::from(ct_attrs(content_type));
+        let upload = self
+            .store
+            .put_multipart_opts(staging, opts)
+            .await
+            .with_context(|| format!("{}: begin multipart {staging}", self.backend))?;
+        let mut writer = WriteMultipart::new_with_chunk_size(upload, MULTIPART_PART_SIZE);
+        let mut file = fs::File::open(path)
+            .await
+            .with_context(|| format!("open upload spool {}", path.display()))?;
+        let mut buf = vec![0u8; READ_CHUNK];
+        loop {
+            let n = match file.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = writer.abort().await;
+                    return Err(anyhow::Error::from(e).context("read upload spool"));
                 }
+            };
+            if let Err(e) = writer.wait_for_capacity(MULTIPART_CONCURRENCY).await {
+                let _ = writer.abort().await;
+                return Err(anyhow::Error::from(e).context("multipart part upload"));
             }
-            if failed.is_some() {
-                break;
-            }
+            writer.write(&buf[..n]);
         }
-
-        let parts = match failed {
-            Some(e) => Err(e),
-            None => Ok(parts),
-        };
-        self.finish_multipart(key, &upload_id, parts).await
-    }
-
-    async fn upload_parts(
-        &self,
-        key: &str,
-        path: &std::path::Path,
-        size: u64,
-        upload_id: &str,
-    ) -> Result<Vec<aws_sdk_s3::types::CompletedPart>> {
-        let n_parts = size.div_ceil(MULTIPART_PART_SIZE);
-        let mut parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::with_capacity(n_parts as usize);
-        let part_numbers: Vec<i32> = (1..=n_parts as i32).collect();
-        for chunk in part_numbers.chunks(MULTIPART_CONCURRENCY) {
-            let uploads = chunk.iter().map(|&part_number| {
-                let offset = (part_number as u64 - 1) * MULTIPART_PART_SIZE;
-                let length = MULTIPART_PART_SIZE.min(size - offset);
-                async move {
-                    let body = ByteStream::read_from()
-                        .path(path)
-                        .offset(offset)
-                        .length(aws_sdk_s3::primitives::Length::Exact(length))
-                        .build()
-                        .await
-                        .context("open spool range")?;
-                    self.put_part(key, upload_id, part_number, body).await
-                }
-            });
-            for part in futures::future::join_all(uploads).await {
-                parts.push(part?);
-            }
-        }
-        Ok(parts)
+        writer
+            .finish()
+            .await
+            .with_context(|| format!("{}: finish multipart {staging}", self.backend))?;
+        Ok(())
     }
 }
 
 #[async_trait]
-impl Storage for S3Storage {
+impl Storage for ObjectStorage {
     async fn head_exists(&self, key: &str) -> Result<bool> {
-        match self
-            .s3
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
+        match self.store.head(&oskey(key)).await {
             Ok(_) => Ok(true),
-            // HEAD has no body, so missing objects surface as generic 404s.
-            Err(e) if is_s3_not_found(&e) => Ok(false),
-            Err(e) => Err(anyhow::Error::from(e).context(format!("head {key}"))),
+            Err(OsError::NotFound { .. }) => Ok(false),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("{}: head {key}", self.backend))),
         }
     }
 
     async fn presign_get(&self, key: &str, expires: std::time::Duration) -> Result<Option<String>> {
-        let cfg = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires)?;
-        let req = self
-            .s3
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .presigned(cfg)
-            .await?;
-        Ok(Some(req.uri().to_string()))
+        let Some(signer) = &self.signer else {
+            return Ok(None);
+        };
+        let url = signer
+            .signed_url(reqwest::Method::GET, &oskey(key), expires)
+            .await
+            .with_context(|| format!("{}: presign {key}", self.backend))?;
+        Ok(Some(url.to_string()))
     }
 
     async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>> {
-        let mut req = self.s3.get_object().bucket(&self.bucket).key(key);
-        if let Some(r) = range {
-            req = req.range(r);
-        }
-        let out = match req.send().await {
-            Ok(out) => out,
+        let path = oskey(key);
+        let Some(raw_range) = range else {
+            return self.full_response(&path, key).await;
+        };
+        // A range needs the size to build Content-Range and to reject an
+        // unsatisfiable range with 416 — one HEAD, only on ranged requests.
+        let size = match self.store.head(&path).await {
+            Ok(m) => m.size,
+            Err(OsError::NotFound { .. }) => return Err(NotFound(key.to_string()).into()),
             Err(e) => {
-                // S3 validates ranges itself; surface its verdict.
-                if e.code() == Some("InvalidRange") {
-                    return Ok(Response::builder()
-                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                        .body(Body::empty())?);
-                }
-                if is_s3_not_found(&e) {
-                    return Err(NotFound(key.to_string()).into());
-                }
-                return Err(e.into());
+                return Err(anyhow::Error::from(e).context(format!("{}: head {key}", self.backend)))
             }
         };
-
-        let status = if out.content_range().is_some() {
-            StatusCode::PARTIAL_CONTENT
-        } else {
-            StatusCode::OK
-        };
-        let mut builder = Response::builder()
-            .status(status)
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(
-                header::CONTENT_TYPE,
-                out.content_type()
-                    .unwrap_or("application/octet-stream")
-                    .to_string(),
-            );
-        if let Some(len) = out.content_length() {
-            builder = builder.header(header::CONTENT_LENGTH, len);
+        match parse_range(Some(raw_range), size) {
+            RangeSpec::Full => self.full_response(&path, key).await,
+            RangeSpec::Unsatisfiable => Ok(Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{size}"))
+                .body(Body::empty())?),
+            RangeSpec::Partial(start, end) => {
+                let opts = GetOptions {
+                    range: Some(GetRange::Bounded(start..end + 1)),
+                    ..Default::default()
+                };
+                let res = match self.store.get_opts(&path, opts).await {
+                    Ok(r) => r,
+                    Err(OsError::NotFound { .. }) => return Err(NotFound(key.to_string()).into()),
+                    Err(e) => {
+                        return Err(
+                            anyhow::Error::from(e).context(format!("{}: get {key}", self.backend))
+                        )
+                    }
+                };
+                let ct = content_type_of(&res.attributes);
+                let len = end - start + 1;
+                Ok(Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_LENGTH, len)
+                    .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"))
+                    .header(header::CONTENT_TYPE, ct)
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .body(Body::from_stream(res.into_stream()))?)
+            }
         }
-        if let Some(cr) = out.content_range() {
-            builder = builder.header(header::CONTENT_RANGE, cr.to_string());
-        }
-        let body = Body::from_stream(ReaderStream::new(out.body.into_async_read()));
-        Ok(builder.body(body)?)
     }
 
     async fn put_bytes(&self, key: &str, bytes: Vec<u8>, content_type: Option<&str>) -> Result<()> {
-        let mut req = self
-            .s3
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(bytes));
-        if let Some(ct) = content_type {
-            req = req.content_type(ct);
-        }
-        req.send().await?;
-        Ok(())
-    }
-
-    async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
-        let out = match self
-            .s3
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(out) => out,
-            Err(e) if is_s3_not_found(&e) => return Err(NotFound(key.to_string()).into()),
-            Err(e) => return Err(anyhow::Error::from(e).context(format!("get {key}"))),
+        let opts = PutOptions {
+            mode: PutMode::Overwrite,
+            attributes: ct_attrs(content_type),
+            ..Default::default()
         };
-        Ok(out.body.collect().await?.to_vec())
+        self.store
+            .put_opts(&oskey(key), PutPayload::from(bytes), opts)
+            .await
+            .with_context(|| format!("{}: put {key}", self.backend))?;
+        Ok(())
     }
 
     async fn put_if_absent(
@@ -890,25 +885,22 @@ impl Storage for S3Storage {
         bytes: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<bool> {
-        if bytes.len() as u64 > MULTIPART_THRESHOLD {
-            // Same parallel-multipart path as spooled uploads: a single
-            // sequential PUT capped sync's torch-class mirroring at ~1 Gbps.
-            return self.multipart_from_bytes(key, bytes, content_type).await;
-        }
-        let mut req = self
-            .s3
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .if_none_match("*")
-            .body(ByteStream::from(bytes));
-        if let Some(ct) = content_type {
-            req = req.content_type(ct);
-        }
-        match req.send().await {
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            attributes: ct_attrs(content_type),
+            ..Default::default()
+        };
+        match self
+            .store
+            .put_opts(&oskey(key), PutPayload::from(bytes), opts)
+            .await
+        {
             Ok(_) => Ok(true),
-            Err(e) if lost_conditional_write(&e) => Ok(false),
-            Err(e) => Err(e.into()),
+            Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => Ok(false),
+            Err(e) => {
+                Err(anyhow::Error::from(e)
+                    .context(format!("{}: put_if_absent {key}", self.backend)))
+            }
         }
     }
 
@@ -918,124 +910,105 @@ impl Storage for S3Storage {
         path: &std::path::Path,
         content_type: Option<&str>,
     ) -> Result<bool> {
-        let size = tokio::fs::metadata(path)
+        let size = fs::metadata(path)
             .await
             .with_context(|| format!("stat upload spool {}", path.display()))?
             .len();
-        if size > MULTIPART_THRESHOLD {
-            return self
-                .multipart_from_file(key, path, size, content_type)
-                .await;
+        if size <= MULTIPART_THRESHOLD {
+            // Small enough to create with one conditional PUT.
+            let bytes = fs::read(path)
+                .await
+                .with_context(|| format!("read upload spool {}", path.display()))?;
+            return self.put_if_absent(key, bytes, content_type).await;
         }
-        // The SDK streams the file body; nothing is buffered beyond its
-        // internal chunks. Same conditional create as put_if_absent.
-        let body = ByteStream::from_path(path)
-            .await
-            .with_context(|| format!("open upload spool {}", path.display()))?;
-        let mut req = self
-            .s3
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .if_none_match("*")
-            .body(body);
-        if let Some(ct) = content_type {
-            req = req.content_type(ct);
-        }
-        match req.send().await {
-            Ok(_) => Ok(true),
-            Err(e) if lost_conditional_write(&e) => Ok(false),
-            Err(e) => Err(e.into()),
+        // Too big for a single PUT: stream to a unique staging key (bounded
+        // RSS), then publish atomically. copy_if_not_exists is the race-free
+        // create-if-absent for large objects — native on GCS/Azure, a
+        // multipart copy on S3.
+        let staging = oskey(&staging_key(key));
+        self.stream_multipart(&staging, path, content_type).await?;
+        let outcome = match self.store.copy_if_not_exists(&staging, &oskey(key)).await {
+            Ok(()) => Ok(true),
+            Err(OsError::AlreadyExists { .. }) => Ok(false),
+            Err(e) => {
+                Err(anyhow::Error::from(e).context(format!("{}: publish {key}", self.backend)))
+            }
+        };
+        let _ = self.store.delete(&staging).await;
+        outcome
+    }
+
+    async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
+        match self.store.get(&oskey(key)).await {
+            Ok(res) => Ok(res
+                .bytes()
+                .await
+                .with_context(|| format!("{}: read {key}", self.backend))?
+                .to_vec()),
+            Err(OsError::NotFound { .. }) => Err(NotFound(key.to_string()).into()),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("{}: get {key}", self.backend))),
         }
     }
 
     async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
-        let mut token: Option<String> = None;
-        let mut entries = Vec::new();
-        loop {
-            let mut req = self
-                .s3
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(dir_prefix);
-            if let Some(t) = token.take() {
-                req = req.continuation_token(t);
-            }
-            let out = req.send().await?;
-            for o in out.contents() {
-                let Some(k) = o.key() else { continue };
-                let Some(rest) = k.strip_prefix(dir_prefix) else {
-                    continue;
-                };
-                if rest.is_empty() || rest.contains('/') {
-                    continue;
-                }
-                let last_modified = o
-                    .last_modified()
-                    .and_then(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).ok())
-                    .and_then(|t| t.format(&Rfc3339).ok());
-                entries.push(FileEntry {
-                    key: k.to_string(),
-                    size: o.size().unwrap_or(0).max(0) as u64,
-                    last_modified,
-                });
-            }
-            // Terminate on the continuation token alone (like `list_all`):
-            // an S3-compatible backend that sets is_truncated but returns no
-            // token would otherwise refetch page 1 forever and grow `entries`
-            // without bound.
-            match out.next_continuation_token {
-                Some(t) if !t.is_empty() => token = Some(t),
-                _ => break,
-            }
-        }
+        // list_with_delimiter is the directory listing: immediate files in
+        // `objects`, sub-directories in `common_prefixes` (which we drop). A
+        // missing prefix is an empty listing, not an error.
+        let res = self
+            .store
+            .list_with_delimiter(Some(&oskey(dir_prefix)))
+            .await
+            .with_context(|| format!("{}: list {dir_prefix}", self.backend))?;
+        let mut entries: Vec<FileEntry> = res
+            .objects
+            .into_iter()
+            .map(|m| FileEntry {
+                key: m.location.as_ref().to_string(),
+                size: m.size,
+                last_modified: OffsetDateTime::from_unix_timestamp(m.last_modified.timestamp())
+                    .ok()
+                    .and_then(|t| t.format(&Rfc3339).ok()),
+            })
+            .collect();
         entries.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(entries)
     }
 
-    async fn delete_keys(&self, keys: &[String]) -> Result<()> {
-        for k in keys {
-            let _ = self
-                .s3
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(k)
-                .send()
-                .await;
-        }
-        Ok(())
-    }
-
     async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
-        // No delimiter: every page carries 1,000 real keys, so a whole
-        // corpus is keys/1000 requests instead of one request per directory.
-        let mut token: Option<String> = None;
+        // object_store's list() treats the prefix as a directory (it appends a
+        // '/'), but our contract is a raw byte prefix: SHARD_CHARS passes
+        // "packages/a" to match "packages/alpha". So list the enclosing
+        // directory and filter by the exact byte prefix. A trailing-slash
+        // prefix ("packages/foo/") lists only that directory; a sharded prefix
+        // ("packages/a") lists "packages/" — the audit fans those out across
+        // shards in parallel.
+        let dir = match prefix.rfind('/') {
+            Some(i) => &prefix[..=i],
+            None => "",
+        };
+        let list_prefix = (!dir.is_empty()).then(|| oskey(dir));
+        let mut stream = self.store.list(list_prefix.as_ref());
         let mut out = Vec::new();
-        loop {
-            let mut req = self
-                .s3
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(prefix);
-            if let Some(t) = token.take() {
-                req = req.continuation_token(t);
-            }
-            let page = req.send().await.context("list_all page")?;
-            for o in page.contents() {
-                let Some(k) = o.key() else { continue };
+        while let Some(item) = stream.next().await {
+            let m = item.with_context(|| format!("{}: list_all {prefix}", self.backend))?;
+            let key = m.location.as_ref();
+            if key.starts_with(prefix) {
                 out.push(ObjectMeta {
-                    key: k.to_string(),
-                    size: o.size().unwrap_or(0).max(0) as u64,
-                    etag: o.e_tag().unwrap_or_default().to_string(),
+                    key: key.to_string(),
+                    size: m.size,
+                    etag: pack_version(&m.e_tag, &m.version),
                 });
             }
-            match page.next_continuation_token() {
-                Some(t) => token = Some(t.to_string()),
-                None => break,
-            }
         }
-        // ListObjectsV2 returns keys in UTF-8 binary order already.
+        out.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
+    }
+
+    async fn delete_keys(&self, keys: &[String]) -> Result<()> {
+        for k in keys {
+            let _ = self.store.delete(&oskey(k)).await;
+        }
+        Ok(())
     }
 
     fn supports_leases(&self) -> bool {
@@ -1043,55 +1016,103 @@ impl Storage for S3Storage {
     }
 
     async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
-        let out = match self
-            .s3
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(out) => out,
-            Err(e) if e.code() == Some("NoSuchKey") => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let etag = out.e_tag().unwrap_or_default().to_string();
-        let bytes = out.body.collect().await?.to_vec();
-        Ok(Some((bytes, etag)))
+        match self.store.get(&oskey(key)).await {
+            Ok(res) => {
+                let etag = pack_version(&res.meta.e_tag, &res.meta.version);
+                let bytes = res
+                    .bytes()
+                    .await
+                    .with_context(|| format!("{}: read {key}", self.backend))?
+                    .to_vec();
+                Ok(Some((bytes, etag)))
+            }
+            Err(OsError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("{}: get {key}", self.backend))),
+        }
     }
 
     async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
         match self
-            .s3
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .if_none_match("*")
-            .body(ByteStream::from(bytes))
-            .send()
+            .store
+            .put_opts(
+                &oskey(key),
+                PutPayload::from(bytes),
+                PutOptions::from(PutMode::Create),
+            )
             .await
         {
-            Ok(out) => Ok(Some(out.e_tag().unwrap_or_default().to_string())),
-            Err(e) if lost_conditional_write(&e) => Ok(None),
-            Err(e) => Err(e.into()),
+            Ok(res) => Ok(Some(pack_version(&res.e_tag, &res.version))),
+            Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => Ok(None),
+            Err(e) => Err(anyhow::Error::from(e)
+                .context(format!("{}: put_if_none_match {key}", self.backend))),
         }
     }
 
     async fn put_if_match(&self, key: &str, etag: &str, bytes: Vec<u8>) -> Result<Option<String>> {
+        let opts = PutOptions::from(PutMode::Update(unpack_version(etag)));
         match self
-            .s3
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .if_match(etag)
-            .body(ByteStream::from(bytes))
-            .send()
+            .store
+            .put_opts(&oskey(key), PutPayload::from(bytes), opts)
             .await
         {
-            Ok(out) => Ok(Some(out.e_tag().unwrap_or_default().to_string())),
-            Err(e) if lost_conditional_write(&e) => Ok(None),
-            Err(e) => Err(e.into()),
+            Ok(res) => Ok(Some(pack_version(&res.e_tag, &res.version))),
+            // A failed precondition, a concurrent conditional write, or a
+            // since-deleted object: we lost, cleanly.
+            Err(
+                OsError::Precondition { .. }
+                | OsError::AlreadyExists { .. }
+                | OsError::NotFound { .. },
+            ) => Ok(None),
+            Err(e) => {
+                Err(anyhow::Error::from(e).context(format!("{}: put_if_match {key}", self.backend)))
+            }
         }
+    }
+}
+
+/// A key as an object_store path. Our keys carry no leading/trailing or doubled
+/// slashes, so this round-trips exactly.
+fn oskey(key: &str) -> OsPath {
+    OsPath::from(key)
+}
+
+/// Best-effort content type as object_store attributes (ignored by stores that
+/// don't support it).
+fn ct_attrs(content_type: Option<&str>) -> Attributes {
+    let mut a = Attributes::new();
+    if let Some(ct) = content_type {
+        a.insert(Attribute::ContentType, ct.to_string().into());
+    }
+    a
+}
+
+fn content_type_of(attrs: &Attributes) -> String {
+    attrs
+        .get(&Attribute::ContentType)
+        .map(|v| v.as_ref().to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+/// A unique staging key for a large upload, namespaced by its final filename.
+fn staging_key(key: &str) -> String {
+    let fname = key.rsplit('/').next().unwrap_or(key);
+    let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    format!("{STAGING_PREFIX}{nanos}-{}-{fname}", std::process::id())
+}
+
+fn pack_version(e_tag: &Option<String>, version: &Option<String>) -> String {
+    format!(
+        "{}{VERSION_SEP}{}",
+        e_tag.as_deref().unwrap_or(""),
+        version.as_deref().unwrap_or("")
+    )
+}
+
+fn unpack_version(packed: &str) -> UpdateVersion {
+    let (e, v) = packed.split_once(VERSION_SEP).unwrap_or((packed, ""));
+    UpdateVersion {
+        e_tag: (!e.is_empty()).then(|| e.to_string()),
+        version: (!v.is_empty()).then(|| v.to_string()),
     }
 }
 
@@ -1187,20 +1208,6 @@ impl Storage for FaultInjectStorage {
     }
 }
 
-/// Missing object: the SDK models GET misses as `NoSuchKey` and HEAD misses
-/// as `NotFound`.
-fn is_s3_not_found<E: ProvideErrorMetadata>(e: &E) -> bool {
-    matches!(e.code(), Some("NoSuchKey") | Some("NotFound"))
-}
-
-/// A failed precondition or a concurrent conditional write: we lost, cleanly.
-fn lost_conditional_write<E: ProvideErrorMetadata>(e: &E) -> bool {
-    matches!(
-        e.code(),
-        Some("PreconditionFailed") | Some("ConditionalRequestConflict") | Some("NoSuchKey")
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1271,6 +1278,29 @@ mod tests {
         assert_eq!(parse_range(Some("bytes=junk"), 100), Full);
         assert_eq!(parse_range(Some("items=0-5"), 100), Full);
         assert_eq!(parse_range(Some("bytes=9-5"), 100), Full);
+    }
+
+    #[test]
+    fn version_token_round_trips_etag_and_generation() {
+        // Stores express a conditional update with different fields: S3/Azure
+        // use the ETag, GCS the generation. The opaque token must carry both
+        // back into an UpdateVersion unchanged.
+        for (etag, version) in [
+            (Some("\"abc123\"".to_string()), None), // S3 / Azure: ETag only
+            (Some("\"xyz\"".to_string()), Some("17".to_string())), // GCS: ETag + generation
+            (None, Some("42".to_string())),         // generation only
+            (None, None),                           // neither
+        ] {
+            let token = pack_version(&etag, &version);
+            let back = unpack_version(&token);
+            assert_eq!(back.e_tag, etag);
+            assert_eq!(back.version, version);
+        }
+        // Distinct inputs produce distinct tokens (fingerprint equality).
+        assert_ne!(
+            pack_version(&Some("a".into()), &None),
+            pack_version(&None, &Some("a".into())),
+        );
     }
 }
 

@@ -5,17 +5,59 @@ variables.
 
 ## Storage (shared by `serve` and `sync`)
 
-| CLI Arg                 | Env Var                       | Default               | Description                          |
-| ----------------------- | ----------------------------- | --------------------- | ------------------------------------ |
-| `--storage {disk\|s3}`  | `PYPIRON_STORAGE`             | `disk`                | Select storage backend               |
-| `--data-dir PATH`       | `PYPIRON_DATA_DIR`            | `~/.pypiron/packages` | Root when using `disk`               |
-| `--s3-bucket NAME`      | `PYPIRON_S3_BUCKET`           | *(required for s3)*   | Bucket when using `s3`               |
-| `--aws-region`          | `AWS_REGION`                  | *(none)*              | AWS region                           |
-| `--s3-endpoint-url`     | `PYPIRON_S3_ENDPOINT_URL`     | *(none)*              | S3-compatible endpoint (e.g., MinIO) |
-| `--s3-force-path-style` | `PYPIRON_S3_FORCE_PATH_STYLE` | `false`               | Force path-style addressing          |
+One binary, one storage layer. `disk` is the zero-dependency default; the three
+cloud backends (`s3`, `gcs`, `azure`) share a single implementation over the
+[`object_store`](https://docs.rs/object_store) crate. Pick one with `--storage`.
 
-**AWS credentials** follow standard AWS SDK envs: `AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`.
+| CLI Arg                            | Env Var               | Default               | Description                       |
+| ---------------------------------- | --------------------- | --------------------- | --------------------------------- |
+| `--storage {disk\|s3\|gcs\|azure}` | `PYPIRON_STORAGE`     | `disk`                | Select storage backend            |
+| `--data-dir PATH`                  | `PYPIRON_DATA_DIR`    | `~/.pypiron/packages` | Root when using `disk`            |
+
+### S3 / S3-compatible (`--storage s3`)
+
+| CLI Arg                 | Env Var                       | Default             | Description                          |
+| ----------------------- | ----------------------------- | ------------------- | ------------------------------------ |
+| `--s3-bucket NAME`      | `PYPIRON_S3_BUCKET`           | *(required for s3)* | Bucket name                          |
+| `--aws-region`          | `AWS_REGION`                  | *(none)*            | AWS region                           |
+| `--s3-endpoint-url`     | `PYPIRON_S3_ENDPOINT_URL`     | *(none)*            | S3-compatible endpoint (e.g., MinIO) |
+| `--s3-force-path-style` | `PYPIRON_S3_FORCE_PATH_STYLE` | `false`             | Force path-style addressing          |
+
+**AWS credentials** follow the standard AWS chain: `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, web identity, or instance metadata.
+An `http://` endpoint (a local MinIO) is allowed automatically.
+
+### Google Cloud Storage (`--storage gcs`)
+
+| CLI Arg                        | Env Var                            | Default              | Description                                  |
+| ------------------------------ | ---------------------------------- | -------------------- | -------------------------------------------- |
+| `--gcs-bucket NAME`            | `PYPIRON_GCS_BUCKET`               | *(required for gcs)* | Bucket name                                  |
+| `--gcs-service-account-path`   | `PYPIRON_GCS_SERVICE_ACCOUNT_PATH` | *(none)*             | Service-account JSON key file                |
+| `--gcs-endpoint-url`           | `PYPIRON_GCS_ENDPOINT_URL`         | *(none)*             | Custom endpoint (local emulator)             |
+
+**GCS credentials**: a service-account key (via the flag or the standard
+`GOOGLE_*`/`GOOGLE_APPLICATION_CREDENTIALS` envs), otherwise Application Default
+Credentials. **Presigned redirects (`--artifact-delivery redirect`/`auto`)
+require a service-account key** — URL signing needs the private key, which ADC
+tokens do not provide. Under ADC, artifact downloads fall back to streaming.
+
+### Azure Blob Storage (`--storage azure`)
+
+| CLI Arg                  | Env Var                       | Default                | Description                          |
+| ------------------------ | ----------------------------- | ---------------------- | ------------------------------------ |
+| `--azure-account NAME`   | `PYPIRON_AZURE_ACCOUNT`       | *(required for azure)* | Storage account name                 |
+| `--azure-container NAME` | `PYPIRON_AZURE_CONTAINER`     | *(required for azure)* | Blob container                       |
+| `--azure-access-key KEY` | `PYPIRON_AZURE_ACCESS_KEY`    | *(none)*               | Account access key                   |
+| `--azure-endpoint-url`   | `PYPIRON_AZURE_ENDPOINT_URL`  | *(none)*               | Custom endpoint (local emulator)     |
+| `--azure-use-emulator`   | `PYPIRON_AZURE_USE_EMULATOR`  | `false`               | Target Azurite (well-known dev creds) |
+
+**Azure credentials**: an account access key (via the flag or the standard
+`AZURE_*` envs), or a managed identity / bearer token. **Presigned redirects
+require the account key** — signed SAS URLs are derived from it; without it,
+artifact downloads stream.
+
+> **Buckets/containers must already exist.** pypiron writes objects but does not
+> create the bucket or container — provision it first.
 
 ## Server
 
@@ -127,18 +169,19 @@ that's what ends up in lockfiles and client caches, and it never expires.
 | Mode       | Behavior                                                                  |
 | ---------- | ------------------------------------------------------------------------- |
 | `auto`     | *(default)* Redirect clients that tolerate it (uv); stream everyone else |
-| `redirect` | Always 302 to a presigned S3 URL — the node never touches wheel bytes    |
+| `redirect` | Always 302 to a presigned object-store URL — the node never touches wheel bytes |
 | `stream`   | Always proxy bytes through the node with immutable cache headers         |
 
-A presigned redirect moves the megabytes to S3, but each response carries a
-freshly signed URL. Clients whose download caches are keyed by the serving URL
-(pip's HTTP cache) can never get a hit, so `redirect` silently turns every
-fresh-environment pip install into a full re-download. uv is immune — it caches
-wheels by index and filename. `auto` resolves this per request; use `redirect`
-when node bandwidth is the binding constraint, `stream` when clients can't reach
-the bucket endpoint (private subnet, firewalled S3). The disk backend always
-streams. PEP 658 `.metadata` companions always stream — tiny and
-resolution-critical. Full reasoning in
+A presigned redirect moves the megabytes to object storage, but each response
+carries a freshly signed URL. Clients whose download caches are keyed by the
+serving URL (pip's HTTP cache) can never get a hit, so `redirect` silently turns
+every fresh-environment pip install into a full re-download. uv is immune — it
+caches wheels by index and filename. `auto` resolves this per request; use
+`redirect` when node bandwidth is the binding constraint, `stream` when clients
+can't reach the bucket endpoint (private subnet, firewalled storage). The disk
+backend always streams — as does any cloud backend that can't sign URLs (GCS
+under ADC, Azure without an account key). PEP 658 `.metadata` companions always
+stream — tiny and resolution-critical. Full reasoning in
 [DESIGN.md](DESIGN.md#read-path-zero-coordination).
 
 ## Management API

@@ -303,8 +303,8 @@ async fn main() -> Result<()> {
 
     // logging — format comes from --log-format/PYPIRON_LOG_FORMAT (the env
     // var also reaches `sync` runs through the flattened serve args).
-    let env_filter = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| "info,pypiron=info,aws_config=warn,aws_smithy_http_tower=warn".into());
+    let env_filter =
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "info,pypiron=info,object_store=warn".into());
     match cli.serve.log_format {
         LogFormat::Text => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
         LogFormat::Json => tracing_subscriber::fmt()

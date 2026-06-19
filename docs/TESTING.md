@@ -16,8 +16,14 @@ actually succeeding against the server. Rules of thumb:
   the behavior end to end, not our half of the contract.
 - **Real packages.** Tests download actual wheels from public PyPI, looked up via
   the pypi.org JSON API at test time (no hardcoded blob URLs that rot).
-- **Real backends.** Disk mode runs against a tmpdir; S3 mode runs against MinIO in
-  Docker. The S3 tests skip cleanly when Docker is unavailable.
+- **Real backends.** Disk mode runs against a tmpdir; S3 against MinIO and Azure
+  Blob against Azurite, both in Docker. These tests skip cleanly when Docker is
+  unavailable. GCS has no blackbox test: no local emulator faithfully implements
+  object_store's GCS XML data-plane (fake-gcs-server rejects the conditional XML
+  PUT; Google's storage-testbench omits the required `ETag` header). The GCS
+  backend shares the single `object_store`-backed code path that the S3 and Azure
+  suites exercise end to end — only its builder config differs — so it is covered
+  by construction plus object_store's own GCS test suite against real GCS.
 - **Always fresh binaries.** The test fixture runs `cargo build` unconditionally —
   incremental builds make it a cheap no-op, and skipping it would silently test a
   stale binary.
@@ -32,12 +38,13 @@ assumptions about clients instead of the clients.
 | Layer | What | How it runs |
 |---|---|---|
 | Rust unit | Pure functions: rendering, parsing, normalization | `cargo test`, fast, no I/O |
-| Blackbox integration | Real binary + real clients + real packages, disk & S3 | pytest, `integration` marker |
+| Blackbox integration | Real binary + real clients + real packages, disk / S3 / Azure | pytest, `integration` marker |
 | Standards conformance | PEP 503/629/691/700 behavior asserted over HTTP | pytest, part of integration |
 | Performance | Hot read endpoints under load, release binary | pytest, `perf` marker, opt-in |
 
-Markers (`pyproject.toml`): `integration`, `s3` (needs Docker/MinIO), `perf`,
-`stress`. Default runs exclude `perf` and `stress`.
+Markers (`pyproject.toml`): `integration`, `s3` (needs Docker/MinIO), `azure`
+(needs Docker/Azurite), `perf`, `stress`. Default runs exclude `perf` and
+`stress`.
 
 ## Client compatibility matrix
 

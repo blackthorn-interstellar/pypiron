@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import os
 import subprocess
 import time
 from datetime import datetime, timezone
+from email.utils import formatdate
 from pathlib import Path
 from typing import Dict, Iterator
 
 import pytest
 
 from .helpers import (
+    _http_request,
     cmd_exists,
     ensure_built,
     find_free_port,
@@ -630,3 +635,153 @@ def s3_server_presigned(tmp_path_factory, pypiron_bin: Path, minio: Dict) -> Ite
         minio,
         extra_env={"PYPIRON_ARTIFACT_DELIVERY": "redirect"},
     )
+
+
+# ------------------- Shared cloud-backed server launcher ----------------------
+
+
+def _cloud_creds_env(bind: str) -> Dict[str, str]:
+    """Common pypiron env (auth, bind, fast worker) for a cloud-backed server."""
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYPIRON_BIND_ADDR": bind,
+            "PYPIRON_WORKER_INTERVAL_SECS": "1",
+            "PYPIRON_ADMIN_USER": "admin",
+            "PYPIRON_ADMIN_PASS": "secret",
+            "PYPIRON_UPLOADER_USER": "uploader",
+            "PYPIRON_UPLOADER_PASS": "uploadersecret",
+            "RUST_LOG": "info,pypiron=debug",
+        }
+    )
+    return env
+
+
+def _start_cloud_server(tmp_path_factory, pypiron_bin: Path, env: Dict, bind: str, label: str):
+    log_path = tmp_path_factory.mktemp(f"pypiron-{label}") / "server.log"
+    with open(log_path, "w") as log_file:
+        proc = subprocess.Popen(
+            [str(pypiron_bin)], env=env, stdout=log_file, stderr=subprocess.STDOUT
+        )
+        try:
+            wait_http_ok(f"http://{bind}/simple/index.json", timeout=30.0)
+            yield {
+                "bind": bind,
+                "base_url": f"http://{bind}",
+                "legacy": f"http://{bind}/legacy/",
+                "simple": f"http://{bind}/simple/",
+                "user": "admin",
+                "password": "secret",
+                "log_path": log_path,
+                "proc": proc,
+            }
+        finally:
+            kill_process_tree(proc)
+
+
+# GCS note: no local emulator faithfully implements object_store's GCS XML
+# data-plane (fake-gcs-server rejects the XML PUT; Google's storage-testbench
+# omits the required ETag), so GCS has no blackbox fixture. The GCS backend
+# shares the ObjectStorage code path exercised by the S3 and Azure suites; only
+# its builder config differs. See docs/TESTING.md.
+
+
+# ------------------------------ Azurite fixtures ------------------------------
+
+# Azurite's well-known development account and key (public, fixed by Microsoft).
+AZURITE_ACCOUNT = "devstoreaccount1"
+AZURITE_KEY = (
+    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+)
+
+
+def _azurite_create_container(port: int, container: str) -> int:
+    """Create a blob container in Azurite with a SharedKey-signed PUT (stdlib only)."""
+    date = formatdate(timeval=time.time(), usegmt=True)
+    version = "2021-08-06"
+    canon_headers = f"x-ms-date:{date}\nx-ms-version:{version}\n"
+    # Azurite uses path-style URLs (/account/container), so its canonicalized
+    # resource is "/{account}" + the path — the account name appears twice.
+    canon_resource = f"/{AZURITE_ACCOUNT}/{AZURITE_ACCOUNT}/{container}\nrestype:container"
+    string_to_sign = "\n".join(
+        ["PUT", "", "", "", "", "", "", "", "", "", "", "", canon_headers + canon_resource]
+    )
+    signature = base64.b64encode(
+        hmac.new(
+            base64.b64decode(AZURITE_KEY), string_to_sign.encode("utf-8"), hashlib.sha256
+        ).digest()
+    ).decode()
+    url = f"http://127.0.0.1:{port}/{AZURITE_ACCOUNT}/{container}?restype=container"
+    code, _, _ = _http_request(
+        url,
+        method="PUT",
+        headers={
+            "x-ms-date": date,
+            "x-ms-version": version,
+            "Content-Length": "0",
+            "Authorization": f"SharedKey {AZURITE_ACCOUNT}:{signature}",
+        },
+    )
+    return code
+
+
+@pytest.fixture()
+def azure(tmp_path_factory) -> Iterator[Dict]:
+    """Start Azurite via Docker with a fresh container; skip without Docker."""
+    if not cmd_exists("docker"):
+        pytest.skip("docker is required for Azure integration tests; not found on PATH")
+
+    port = find_free_port()
+    name = f"pypiron-azurite-{port}-{int(time.time())}"
+    container = "pypiron-test"
+    endpoint = f"http://127.0.0.1:{port}/{AZURITE_ACCOUNT}"
+    run_checked(
+        [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            name,
+            "-p",
+            f"{port}:10000",
+            "mcr.microsoft.com/azure-storage/azurite",
+            "azurite-blob",
+            "--blobHost",
+            "0.0.0.0",
+            "--blobPort",
+            "10000",
+            "--skipApiVersionCheck",
+        ]
+    )
+    try:
+        # Azurite answers (a 400 for the bare account URL is "up and responding").
+        wait_http_responding(f"http://127.0.0.1:{port}/{AZURITE_ACCOUNT}", timeout=60.0)
+        code = _azurite_create_container(port, container)
+        if code not in (201, 409):
+            pytest.skip(f"unable to create Azurite container (status {code})")
+        yield {
+            "endpoint": endpoint,
+            "account": AZURITE_ACCOUNT,
+            "key": AZURITE_KEY,
+            "container": container,
+        }
+    finally:
+        run_returncode(["docker", "rm", "-f", name])
+
+
+@pytest.fixture()
+def azure_server(tmp_path_factory, pypiron_bin: Path, azure: Dict) -> Iterator[Dict]:
+    """pypiron configured against the Azurite Azure Blob backend."""
+    port = find_free_port()
+    bind = f"127.0.0.1:{port}"
+    env = _cloud_creds_env(bind)
+    env.update(
+        {
+            "PYPIRON_STORAGE": "azure",
+            "PYPIRON_AZURE_ACCOUNT": azure["account"],
+            "PYPIRON_AZURE_CONTAINER": azure["container"],
+            "PYPIRON_AZURE_ACCESS_KEY": azure["key"],
+            "PYPIRON_AZURE_ENDPOINT_URL": azure["endpoint"],
+        }
+    )
+    yield from _start_cloud_server(tmp_path_factory, pypiron_bin, env, bind, "azure")

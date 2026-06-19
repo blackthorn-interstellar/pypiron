@@ -1,6 +1,8 @@
 """Round trip: upload a real wheel -> indexed -> bytes intact -> installable.
 
-Runs against both backends: disk (tmpdir) and S3 (MinIO in Docker).
+Runs against the emulator-backed backends: disk (tmpdir), S3 (MinIO), and Azure
+Blob (Azurite) — the cloud ones in Docker. GCS shares the same object_store code
+path but has no faithful local emulator (see docs/TESTING.md).
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ pytestmark = pytest.mark.integration
     params=[
         pytest.param("disk_server", id="disk"),
         pytest.param("s3_server", id="s3", marks=pytest.mark.s3),
+        pytest.param("azure_server", id="azure", marks=pytest.mark.azure),
     ]
 )
 def server(request):

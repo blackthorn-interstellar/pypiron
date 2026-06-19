@@ -19,10 +19,10 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 - Optional synchronous uploads (`--sync-uploads`) for publish-then-install CI.
 
 **Storage & indexing**
-- Disk (default, zero deps) and S3 / S3-compatible backends.
-- Client-aware artifact delivery on S3 (`auto` / `redirect` / `stream`); streaming uploads (incremental hash, bounded RSS).
+- Disk (default, zero deps) and three cloud backends — S3 / S3-compatible, Google Cloud Storage, and Azure Blob — over one `object_store`-backed implementation.
+- Client-aware artifact delivery on cloud backends (`auto` / `redirect` / `stream`) via presigned URLs; streaming uploads (incremental hash, bounded RSS, multipart for large artifacts).
 - Crash-safe event-marker indexing (intent/commit pairs); fingerprint audit with cost proportional to churn; `pypiron verify` / `pypiron resync`.
-- Multi-node on S3 via a sloppy leader lease (conditional writes, TTL, heartbeat).
+- Multi-node on any cloud backend via a sloppy leader lease (conditional writes, TTL, heartbeat).
 
 **Mirroring & proxying**
 - `pypiron sync` over HTTP (`--to`) and direct-to-storage, carrying PyPI's true `upload-time` so `--exclude-newer` stays historically correct; tag/time filters; `pypiron.toml` config layering.

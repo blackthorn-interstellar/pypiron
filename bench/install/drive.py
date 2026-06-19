@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import shutil
 import subprocess
 import tempfile
@@ -28,7 +29,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from benchlib import closures_dir, percentile
+from benchlib import closures_dir, load_projects, percentile, select_projects
+
+
+def proj_key(name: str) -> str:
+    """Normalize a project/closure name for matching (drop extras, pep503)."""
+    return re.sub(r"[-_.]+", "-", re.sub(r"\[.*?\]", "", name)).strip().lower()
 
 
 def uv_version() -> str:
@@ -342,10 +348,16 @@ def main() -> None:
     args = ap.parse_args()
 
     # Closures live in lock/<arch>/closures (all frozen projects for that arch).
+    # Sample only the tier actually seeded on the server (the dir holds lite+heavy
+    # closures; installing a heavy closure against a lite-seeded server 404s).
     cdir = closures_dir(args.arch)
     names = list_closures(cdir)
     if not names:
         raise SystemExit(f"no closures in {cdir}; run freeze.py first")
+    tier_keys = {proj_key(p["name"]) for p in select_projects(load_projects(), args.tier)}
+    names = [n for n in names if proj_key(n) in tier_keys]
+    if not names:
+        raise SystemExit(f"no closures match tier '{args.tier}'")
     closures = {n: cdir / f"{n}.txt" for n in names}
     wait_index(args.index_url)
 

@@ -64,6 +64,12 @@ doc:  ## Generate documentation
 	cargo doc --no-deps
 
 build-wheel:  ## Build Python wheel (local smoke-testing; releases happen in CI via git tag)
+	# Same as CI: rewrite the README's relative links/logo to absolute URLs so the
+	# packaged metadata renders on PyPI, then restore the GitHub-relative file
+	# (the trap runs even if the build fails).
+	@cp README.md README.md.orig; \
+	trap 'mv -f README.md.orig README.md' EXIT; \
+	uv run -- python scripts/transform_readme.py --target pypi && \
 	uv run -- maturin build --release
 
 # Coverage-guided fuzzing of the input-parsing modules (needs nightly +

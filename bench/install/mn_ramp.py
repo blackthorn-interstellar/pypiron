@@ -69,7 +69,7 @@ def build_mix(tier: str) -> tuple[str, float]:
     """Build the install-mix regex + reqs/install on a loadgen (it reaches the server)."""
     code = (
         "import capacity,json;"
-        f"r=capacity.build_install_mix('http://{PRIV}:8080/simple/','x86_64','{tier}');"
+        f"r=capacity.build_install_mix('{INDEX_URL}','x86_64','{tier}');"
         "print(json.dumps({'regex':r[0],'rpi':r[1],'nidx':r[2],'nwhl':r[3],'drop':r[4]}))"
     )
     out = ssh_run(LGS[0], f'cd pypiron/bench/install && python3.11 -c "{code}"', timeout=240)
@@ -133,9 +133,14 @@ def main() -> None:
     ap.add_argument("--ladder", default="256,512,1024,2048,4096", help="per-node concurrency")
     ap.add_argument("--duration", default="15s")
     ap.add_argument("--cpu-break", type=float, default=92.0, help="server CPU%% = saturated")
+    ap.add_argument("--index-url", default=f"http://{PRIV}:8080/simple/", help="PEP503 root")
+    ap.add_argument("--container", default="pypiron", help="server container name for CPU sampling")
     ap.add_argument("--output", default="results/mnramp-pypiron-t2.json")
     args = ap.parse_args()
 
+    global INDEX_URL, CONTAINER
+    INDEX_URL = args.index_url
+    CONTAINER = args.container
     regex, rpi = build_mix(args.tier)
     push_runner(regex)
     print(f"driving {N} loadgens in lockstep vs {PRIV}:8080 (Track 2, bytes from S3)\n")

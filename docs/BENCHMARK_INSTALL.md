@@ -384,3 +384,46 @@ are real on real hardware but the absolute throughput is box-bound at 16 vCPU.
 The committed Dockerfile pins `rust:1.85`, too old for HEAD's `object_store`
 dep (E0658); `rig.sh` bumps the toolchain on the box copy only (a separate repo
 fix is warranted). Re-run any time with `rig.sh up && deploy && run`.
+
+## 13. Breaking point — index-read MST (capacity.py, oha ramp)
+
+The fixed install sweep (§12) degrades servers but never breaks them, and can't:
+it spawns one `uv` process per concurrent install, so the loadgen saturates
+before a fast server does. `capacity.py` instead ramps `oha` connections against
+each server's hot index path (`/simple/flask/`) until it breaks, where **MST
+(Max Sustained Throughput)** = the highest rps holding success ≥ 99.5 % AND
+p99 ≤ max(50 ms, 10× unloaded p99). A static-nginx **control target** gives
+`R_ceiling` (the most this rig+oha can push); `headroom = R_ceiling/MST` classes
+each result **server-bound** (real break found) vs **rig-bound** (too fast for
+this box to break — needs a 2-box rig for the true ceiling).
+
+First AWS run (2026-06-19, c7i.4xlarge, ladder c=1…4096, 10 s/step):
+
+| Server | MST rps | c_knee | p99@knee | breach | headroom | bound |
+|---|---|---|---|---|---|---|
+| **pypiron** | **396,471** | 2048 | 15 ms | never broke¹ | 0.7 | rig-bound |
+| bandersnatch | 278,196 | 1024 | 12 ms | never broke¹ | 0.99 | rig-bound |
+| pypiserver | 6,544 | 4 | 0.7 ms | latency | 43× | server-bound |
+| pypicloud | 5,187 | 16 | 7 ms | latency | 54× | server-bound |
+| proxpi | 735 | 16 | 36 ms | latency | 383× | server-bound |
+| devpi | 283 | 8 | 45 ms | latency | 930× | server-bound |
+
+The metric separates the field across **three orders of magnitude** and reports
+its own validity per server:
+
+- **pypiron and bandersnatch are rig-bound** — the 16-vCPU box + oha couldn't
+  break either. pypiron's RAM-served index (precomputed ETags) sustained
+  396k rps at p99 15 ms and actually **beat the static-nginx control** (278k,
+  headroom 0.7); bandersnatch's nginx-sendfile sat right at the rig ceiling
+  (278k, headroom 0.99). Their true breaking points are above what this rig can
+  apply — a dedicated two-box loadgen is the named fix for citable high-end
+  numbers.
+- **The Python-tier servers have real, found breaking points** (headroom ≫ 1×,
+  unambiguously server-bound): pypiserver 6.5k rps, pypicloud 5.2k, proxpi 735
+  (its single-worker GIL ceiling, exactly as predicted), and devpi 283 (indexes
+  served through Python — the weakest, ~1,400× below pypiron's floor). All break
+  on **latency runaway** (p99 past the ceiling), not errors or collapse.
+
+¹ "never broke" = held the SLO to the c=4096 ladder cap; reported as rig-bound,
+not as a server limit. The headroom < 1 for pypiron means its index path
+out-serves the control — the rig, not pypiron, is the bottleneck.

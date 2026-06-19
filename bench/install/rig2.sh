@@ -23,24 +23,27 @@ set -euo pipefail
 
 REGION="${RIG_REGION:-us-east-1}"
 NAME="${RIG_NAME:-pypiron-ibench}"            # shares rig.sh's bucket/IAM/key
-ARCH="${RIG_ARCH:-x86_64}"
-SERVER_TYPE="${RIG2_SERVER_TYPE:-c7i.2xlarge}"
-LOADGEN_TYPE="${RIG2_LOADGEN_TYPE:-c7i.8xlarge}"  # big: out-drive a fast server
-LOADGENS="${RIG2_LOADGENS:-1}"
-DISK_GB="${RIG_DISK_GB:-120}"
+ARCH="${RIG_ARCH:-x86_64}"                          # loadgen + corpus arch (x86)
+SERVER_ARCH="${RIG2_SERVER_ARCH:-aarch64}"          # the box customers run pypiron on
+SERVER_TYPE="${RIG2_SERVER_TYPE:-t4g.small}"        # realistic small Graviton box
+LOADGEN_TYPE="${RIG2_LOADGEN_TYPE:-c7i.2xlarge}"    # x86 oha drivers
+LOADGENS="${RIG2_LOADGENS:-2}"
+DISK_GB="${RIG_DISK_GB:-40}"
 TIER="${RIG_TIER:-lite}"
+SERVER_IMG="${RIG2_SERVER_IMG:-/tmp/pypiron-${SERVER_ARCH}.tgz}"  # prebuilt image to load
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "${HERE}/../.." && pwd)"
 ENVF="${HERE}/.rig2.env"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
 
-ami_param() {
-  case "$ARCH" in
+ami_param() {  # arch -> SSM AMI param
+  case "$1" in
     aarch64) echo /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 ;;
     x86_64)  echo /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 ;;
-    *) echo "bad RIG_ARCH=$ARCH" >&2; exit 2 ;;
+    *) echo "bad arch=$1" >&2; exit 2 ;;
   esac
 }
+resolve_ami() { aws ssm get-parameter --region "$REGION" --name "$(ami_param "$1")" --query Parameter.Value --output text; }
 
 # Server runs docker (pypiron image). Loadgens run drive.py natively (uv + py311).
 userdata() {
@@ -53,15 +56,18 @@ curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin s
 UD
 }
 
-launch() {  # role instance_type -> instance id (reused if already running)
-  local role="$1" itype="$2" ami="$3" sg="$4" id
+launch() {  # role instance_type ami -> instance id (reused if already running)
+  local role="$1" itype="$2" ami="$3" sg="$4" id credit=()
   id=$(aws ec2 describe-instances --region "$REGION" \
     --filters "Name=tag:Name,Values=${NAME}2-${role}" "Name=instance-state-name,Values=pending,running" \
     --query 'Reservations[].Instances[].InstanceId' --output text)
   if [[ -z "$id" ]]; then
+    # T-series (t4g/t3) burst: unlimited so a sustained ramp sees full vCPU
+    # instead of throttling to baseline once credits drain.
+    [[ "$itype" == t* ]] && credit=(--credit-specification "CpuCredits=unlimited")
     id=$(aws ec2 run-instances --region "$REGION" --image-id "$ami" --instance-type "$itype" \
       --key-name "$NAME" --security-group-ids "$sg" --iam-instance-profile "Name=${NAME}" \
-      --user-data "$(userdata)" \
+      --user-data "$(userdata)" "${credit[@]}" \
       --metadata-options "HttpTokens=optional,HttpPutResponseHopLimit=2" \
       --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=${DISK_GB},VolumeType=gp3,Throughput=250,Iops=4000}" \
       --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME}2-${role}}]" \
@@ -101,10 +107,11 @@ cmd_up() {
   aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$sg" --protocol tcp --port 22 --cidr "${myip}/32" >/dev/null 2>&1 || true
   aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$sg" --protocol all --source-group "$sg" >/dev/null 2>&1 || true
 
-  ami=$(aws ssm get-parameter --region "$REGION" --name "$(ami_param)" --query Parameter.Value --output text)
-  echo "== launching server (${SERVER_TYPE}) + ${LOADGENS} loadgen(s) (${LOADGEN_TYPE})"
-  sid=$(launch server "$SERVER_TYPE" "$ami" "$sg")
-  for ((i=1;i<=LOADGENS;i++)); do lids+=("$(launch "loadgen${i}" "$LOADGEN_TYPE" "$ami" "$sg")"); done
+  local sami lami
+  sami=$(resolve_ami "$SERVER_ARCH"); lami=$(resolve_ami "$ARCH")
+  echo "== launching server (${SERVER_TYPE}/${SERVER_ARCH}) + ${LOADGENS} loadgen(s) (${LOADGEN_TYPE}/${ARCH})"
+  sid=$(launch server "$SERVER_TYPE" "$sami" "$sg")
+  for ((i=1;i<=LOADGENS;i++)); do lids+=("$(launch "loadgen${i}" "$LOADGEN_TYPE" "$lami" "$sg")"); done
 
   aws ec2 wait instance-running --region "$REGION" --instance-ids "$sid" "${lids[@]}"
   local spriv spub
@@ -115,6 +122,7 @@ cmd_up() {
     echo "export RIG_BUCKET=${bucket}"
     echo "export RIG_KEY=${HERE}/.keys/${NAME}.pem"
     echo "export RIG_ARCH=${ARCH}"
+    echo "export RIG2_SERVER_ARCH=${SERVER_ARCH}"
     echo "export RIG_TIER=${TIER}"
     echo "export RIG2_SERVER_ID=${sid}"
     echo "export RIG2_SERVER_IP=${spub}"
@@ -144,15 +152,20 @@ ship() {  # host -- ship HEAD repo (+ good src ref for the image)
 
 cmd_deploy() {
   load_env
-  echo "== server: wait docker, ship, build pypiron image, fetch wheelhouse (${TIER})"
-  wait_docker "$RIG2_SERVER_PRIV" 2>/dev/null || wait_docker "$RIG2_SERVER_IP"
+  echo "== server: wait docker, LOAD prebuilt ${SERVER_ARCH} image (tiny box can't compile w/ LTO), ship, wheelhouse"
+  wait_docker "$RIG2_SERVER_IP"
+  [[ -f "$SERVER_IMG" ]] || { echo "prebuilt image ${SERVER_IMG} missing — build off-box: docker build --platform linux/${SERVER_ARCH/aarch64/arm64} -t pypiron:bench-${SERVER_ARCH} . && docker save pypiron:bench-${SERVER_ARCH} | gzip > ${SERVER_IMG}" >&2; exit 1; }
   ship "$RIG2_SERVER_IP"
-  ssh_to "$RIG2_SERVER_IP" "cd pypiron && sed -i 's#rust:1.85-bookworm#rust:1-bookworm#' Dockerfile && \
-    sudo docker build --platform linux/${ARCH/x86_64/amd64} -t pypiron:bench-${ARCH} . && \
-    sudo docker run --rm -v \$PWD:/repo -w /repo/bench/install ghcr.io/astral-sh/uv:0.9.30-python3.11-bookworm-slim \
-      python3 wheelhouse.py --tier ${TIER} --arch ${ARCH}"
-  echo "== loadgens: wait uv, ship harness"
-  for ip in $(loadgen_ips); do wait_uv "$ip"; ship "$ip"; done
+  echo "== loading ${SERVER_IMG} onto server"
+  gzip -dc "$SERVER_IMG" | ssh_to "$RIG2_SERVER_IP" "sudo docker load"
+  ssh_to "$RIG2_SERVER_IP" "cd pypiron/bench/install && sudo docker run --rm -v \$(pwd)/../..:/repo \
+    -w /repo/bench/install ghcr.io/astral-sh/uv:0.9.30-python3.11-bookworm-slim \
+    python3 wheelhouse.py --tier ${TIER} --arch ${ARCH}"
+  echo "== loadgens: wait uv, ship harness, fetch oha"
+  for ip in $(loadgen_ips); do
+    wait_uv "$ip"; ship "$ip"
+    ssh_to "$ip" "test -x /home/ec2-user/oha || { curl -fsSL https://github.com/hatoo/oha/releases/download/v1.4.7/oha-linux-amd64 -o /home/ec2-user/oha && chmod +x /home/ec2-user/oha; }"
+  done
   echo "== deploy complete"
 }
 
@@ -163,7 +176,7 @@ cmd_serve() {  # serve <server>  (pypiron only for now)
   echo "== start pypiron Track 2 (S3 + presigned redirect) on the server"
   ssh_to "$RIG2_SERVER_IP" "sudo docker rm -f pypiron 2>/dev/null; sudo docker run -d --name pypiron -p 8080:8080 \
     -e PYPIRON_BIND_ADDR=0.0.0.0:8080 -e PYPIRON_S3_BUCKET=${RIG_BUCKET} -e AWS_REGION=${RIG_REGION} \
-    pypiron:bench-${ARCH} pypiron serve --storage=s3 --artifact-delivery=redirect \
+    pypiron:bench-${RIG2_SERVER_ARCH} pypiron serve --storage=s3 --artifact-delivery=redirect \
     --uploader-user=admin --uploader-pass=secret --admin-user=admin --admin-pass=secret"
   echo "== seed corpus -> pypiron -> S3 (upload from the server)"
   ssh_to "$RIG2_SERVER_IP" "cd pypiron/bench/install && sudo docker run --rm --network host -v \$(pwd)/../..:/repo \

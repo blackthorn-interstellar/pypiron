@@ -8,8 +8,6 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.7", features = ["macros", "json", "multipart"] }
-aws-config = "1"
-aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -37,6 +35,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "gzip", "brotli", "zstd", "stream"] }
 pep440_rs = "0.7.3"
 toml = "1.1.2"
+object_store = { version = "0.13.2", features = ["aws", "gcp", "azure"] }
 
 # Policy as data: these apply to local `cargo clippy` and rust-analyzer, not just
 # the CI `-D warnings` gate. Kept deliberately small — no clippy::pedantic.

@@ -218,9 +218,12 @@ changes — but the architecture claim is that one node is enough.
 Reads are stateless file serving and scale horizontally trivially. Per backend:
 
 - **Disk**: stream with sendfile semantics, support Range requests.
-- **S3**: redirect artifact downloads (302 to a presigned URL) so the node only
-  ever serves kilobytes of index while S3 serves the megabytes — with Range support
-  for free. The node never holds wheel bytes in memory.
+- **Cloud (S3 / GCS / Azure)**: redirect artifact downloads (302 to a presigned
+  URL) so the node only ever serves kilobytes of index while the object store
+  serves the megabytes — with Range support for free. The node never holds wheel
+  bytes in memory. Signing needs a credential that can mint URLs (S3 always; GCS
+  with a service-account key; Azure with an account key); without one the backend
+  streams instead.
 
 Redirects collide with client caching, though. Each 302 carries a freshly
 signed URL (`X-Amz-Date`/`X-Amz-Signature` differ per request), and the
@@ -248,12 +251,13 @@ dirty-marker processing, and the reconcile sweep are all built on listing.
 ## Multi-node: sloppy leader election
 
 Only the index writer needs to be singular, and only as an optimization. A lease
-object in S3 with a TTL, heartbeat, and conditional writes (`If-None-Match` /
-`If-Match` on PUT, supported by S3 since late 2024) is ~100 lines. No Raft, no
-fencing tokens, no correctness proofs — because rebuilds are idempotent, dual
-leadership for a few seconds merely duplicates work.
+object in the bucket with a TTL, heartbeat, and conditional writes
+(`If-None-Match` / `If-Match` on PUT — native to GCS and Azure, supported by S3
+since late 2024) is ~100 lines. No Raft, no fencing tokens, no correctness
+proofs — because rebuilds are idempotent, dual leadership for a few seconds
+merely duplicates work.
 
-Disk backend is explicitly single-node; multi-node implies S3.
+Disk backend is explicitly single-node; multi-node implies a cloud backend.
 
 ## Publish-then-install
 
@@ -278,8 +282,8 @@ target. For a multi-tenant pypi.org clone it wouldn't, and we shouldn't try.
 
 ## Storage layout (the contract)
 
-Everything in one tree, on disk or S3. This layout *is* the schema — treat changes
-to it like database migrations.
+Everything in one tree, on disk or any cloud backend (S3, GCS, Azure). This
+layout *is* the schema — treat changes to it like database migrations.
 
 ```
 packages/<pkg>/<filename>                # artifact, immutable once written
@@ -295,6 +299,12 @@ _dirty/<pkg>!<nonce>.intent              # empty marker: a writer is touching th
 _dirty/<pkg>!<nonce>.commit              # empty marker: truth changed, rebuild now
 _state/fp-<shard>.json                   # audit fingerprints: pkg -> listing hash at last rebuild
 _leader/lease.json                       # multi-node lease (holder, term, expires-at)
+_staging/<ts>-<pid>-<filename>           # cloud only: a >64 MB upload streams here, then
+                                         #   copy-if-not-exists publishes it to its final key.
+                                         #   Transient (the object-store analog of disk's .tmp +
+                                         #   rename); never referenced by an index. A hard crash
+                                         #   mid-publish may orphan one — harmless, like a leftover
+                                         #   .tmp on disk; expire with a bucket lifecycle rule.
 ```
 
 `<pkg>` is always the PEP 503 normalized name. Index rebuilds include only

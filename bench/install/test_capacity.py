@@ -78,6 +78,7 @@ def test_parse_wheel_url_html_strips_fragment():
     assert got == "http://web:8080/packages/fl/flask/flask-3.0.0-py3-none-any.whl"
 
 
-def test_regex_escape_makes_url_literal():
-    esc = capacity.regex_escape("http://h/files/numpy-2.3.5+cu12-cp311.whl")
-    assert r"\-" in esc and r"\." in esc and r"\+" in esc
+def test_regex_escape_char_classes_specials():
+    esc = capacity.regex_escape("numpy-2.3.5+cu12.whl")
+    # dots/plus wrapped in char classes (rand_regex literal); dash left bare
+    assert esc == "numpy-2[.]3[.]5[+]cu12[.]whl"

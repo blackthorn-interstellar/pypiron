@@ -1,0 +1,28 @@
+# pypiron, Track 2 (best cloud): S3 backend + presigned-redirect delivery — the
+# node never touches wheel bytes (its headline production story, a real
+# architectural edge no competitor has). The client follows pypiron's 302 to a
+# presigned S3 URL and fetches bytes from S3 directly. Reported separately from
+# the Track 1 ranking (docs/BENCHMARK_INSTALL.md §1).
+#
+# AWS-only: needs a real bucket + credentials (the rig instance profile, reached
+# via IMDS — rig.sh sets the metadata hop limit to 2 so the container can read
+# it). Set PYPIRON_S3_BUCKET + AWS_REGION. Seeded by upload (stored to S3).
+
+services:
+  pypiron:
+    image: pypiron:bench-${BENCH_ARCH:-x86_64}
+    platform: ${BENCH_PLATFORM:-linux/amd64}
+    command:
+      - pypiron
+      - serve
+      - --storage=s3
+      - --artifact-delivery=redirect
+      - --uploader-user=admin
+      - --uploader-pass=secret
+      - --admin-user=admin
+      - --admin-pass=secret
+    environment:
+      PYPIRON_BIND_ADDR: "0.0.0.0:8080"
+      PYPIRON_S3_BUCKET: ${PYPIRON_S3_BUCKET:?set PYPIRON_S3_BUCKET to the rig bucket}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    networks: [bench]

@@ -1,0 +1,9 @@
+narwhals==2.22.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:60567d774edf77db53906f89d9fbd164e66e56d66d388e1e6990f17ac33cfb53 \
+    --hash=sha256:d62920805a0a43b7ff8b54b0c0d3142d796f8a9301836ada37e573d6a33cbcd9
+packaging==26.2 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e \
+    --hash=sha256:ff452ff5a3e828ce110190feff1178bb1f2ea2281fa2075aadb987c2fb221661
+plotly==6.8.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:13c5c4a0f70b74cab1913eda0de49b826df5931708eb6f9c3010040614700ec8 \
+    --hash=sha256:e088e7ddc68d4f70e3d66659224727a45296d71d2b8284181862d3d8f1f0d88f

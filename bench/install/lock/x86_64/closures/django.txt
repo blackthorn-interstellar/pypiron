@@ -1,0 +1,12 @@
+asgiref==3.11.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:5f184dc43b7e763efe848065441eac62229c9f7b0475f41f80e207a114eda4ce \
+    --hash=sha256:e8667a091e69529631969fd45dc268fa79b99c92c5fcdda727757e52146ec133
+django==5.2.15 ; python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:0eb4a9bb1853a35b0286dbc6d916bd352c8c2687195a7f2d6f80cefd840e4970 \
+    --hash=sha256:5154a9bf84ac01dde011e367f355c07dbb329532e06810dcf3ef2af269e236e7
+django==6.0.6 ; python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:25148b1194c47c2e685e5f5e9c5d59c78b075dfd282cb9618861ba6c1708f4d2 \
+    --hash=sha256:ad03916ba59523d781ae5c3f631960c23d69a9d9c43cecda52fc23b47e953713
+sqlparse==0.5.5 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:12a08b3bf3eec877c519589833aed092e2444e68240a3577e8e26148acc7b1ba \
+    --hash=sha256:e20d4a9b0b8585fdf63b10d30066c7c94c5d7a7ec47c889a2d83a3caa93ff28e

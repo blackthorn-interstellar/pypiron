@@ -1,0 +1,35 @@
+attrs==26.1.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309 \
+    --hash=sha256:d03ceb89cb322a8fd706d4fb91940737b6642aa36998fe130a9bc96c985eff32
+jsonschema==4.26.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:0c26707e2efad8aa1bfc5b7ce170f3fccc2e4918ff85989ba9ffa9facb2be326 \
+    --hash=sha256:d489f15263b8d200f8387e64b4c3a75f06629559fb73deb8fdfb525f2dab50ce
+jsonschema-specifications==2025.9.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe \
+    --hash=sha256:b540987f239e745613c7a9176f3edb72b832a4ac465cf02712288397832b5e8d
+referencing==0.37.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231 \
+    --hash=sha256:44aefc3142c5b842538163acb373e24cce6632bd54bdb01b21ad5863489f50d8
+rpds-py==2026.5.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:01d17b29c0c23d82b1f4751147ec49cf451f1fc2554eb9ef5f957e55d2656ead \
+    --hash=sha256:07b24fea40541e28570e5b795a4a38fbdcd12550c06bd0748005ecc8116ca256 \
+    --hash=sha256:0b35217adefe87f2fe4db7e9766cabe84744bfe9616d9667be18988928c7f2dc \
+    --hash=sha256:141c9498daf2ace9eda35d2b0e376f9ea8b058d84f2aef4f96fccfd449a2f251 \
+    --hash=sha256:40ff257542e04796880e011e15cd4dc21c2599975df2aaa8f2c8495ca574e1a5 \
+    --hash=sha256:4be8b1d2a705cc37d08256004e1d07de143fa0075c8e85a3df020b776f62b732 \
+    --hash=sha256:613fc4ee9eaef26dc5840666214dd6fbcebcf32f46e76f4abc473059f4e13dda \
+    --hash=sha256:6142dbd80c4df62a5d899f0d616d417f84e0bc8d32526c8e5589019d75d028a7 \
+    --hash=sha256:66c93681c4729e4e3ecba31b8179fae083ff3118841672835140338b4b9867c1 \
+    --hash=sha256:6f249f8b860a200ad35193af961183ebe9132710484e6f6ce0cf89fd83c63a9a \
+    --hash=sha256:7559f72b94ae52659086c595dfa017cde03155f7832071d30959049052cb3ece \
+    --hash=sha256:85264a90ff4c05c1568dd65f5921c837614b67c60358fb4c17df3b7f2e90690a \
+    --hash=sha256:8895840ac4809e5f60c88fd07617cd71326e73d6e5a8aa783c5c0f7c24985de2 \
+    --hash=sha256:8c43a8a973270fd173bf48cdf80bbe66312421cba68d40845034f174f2389049 \
+    --hash=sha256:9e25b7088f9ccbfc0dfcaa52bf969300ca229e10ecf758974ebcbb080a4b37bb \
+    --hash=sha256:b6825cc329b290e93c5f6a9be2393118a763f6ccf6abd83704e0c102ca583644 \
+    --hash=sha256:b95d5e11fc712b752081183a55a244c03cd00570489edd7014d8899f8ceb8162 \
+    --hash=sha256:ca653c6546386227cd9800d1bef6a348099acf8db4250341da6d90f663d6dfcb \
+    --hash=sha256:de42116e69cb53b911cc34aee5ab98f36c597b822545045d49e938818b99e5e4
+typing-extensions==4.15.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466 \
+    --hash=sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548

@@ -1,0 +1,37 @@
+# pypiron, Track 1 (apples-to-apples): local disk + stream. Disk always streams
+# every byte through the node — the level playing field vs the streaming
+# competitors. NEVER --artifact-delivery auto here (could hide an S3 redirect);
+# the S3 + presigned-redirect config is Track 2 only (docs/BENCHMARK_INSTALL.md §1).
+#
+# Built from source at the pinned commit:
+#   docker build --platform $BENCH_PLATFORM -t pypiron:bench-$BENCH_ARCH .
+#
+# Seeded by uploading the shared wheelhouse to /legacy/ (seed.py); the worker +
+# audit-on-boot materialize the /simple/ indexes. Reachable at pypiron:8080.
+
+services:
+  pypiron:
+    image: pypiron:bench-${BENCH_ARCH:-aarch64}
+    platform: ${BENCH_PLATFORM:-linux/arm64}
+    command:
+      - pypiron
+      - serve
+      - --storage=disk
+      - --data-dir=/data
+      - --artifact-delivery=stream
+      - --uploader-user=admin
+      - --uploader-pass=secret
+      - --admin-user=admin
+      - --admin-pass=secret
+    environment:
+      PYPIRON_BIND_ADDR: "0.0.0.0:8080"
+      # Spool defaults to the container's /tmp (real overlay disk here, not the
+      # AL2023 tmpfs the AWS rig must avoid via --spool-dir on the data volume).
+      PYPIRON_WORKER_INTERVAL_SECS: "1"
+    volumes:
+      - pypiron-data:/data
+    networks: [bench]
+
+volumes:
+  pypiron-data:
+

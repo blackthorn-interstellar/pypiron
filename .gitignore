@@ -33,3 +33,13 @@ bench/results/
 /data/
 # Bulk PyPI corpus downloads (95MB+, see src/corpus_check.rs)
 bench/corpus/
+# Install-bench: downloaded wheels + results are regenerable from lock/ (committed)
+bench/install/wheelhouse/
+bench/install/results/
+# aarch64 corpus is generated on demand for local validation; x86_64 is committed
+bench/install/lock/aarch64/
+# generated at run time from the manifest / rig env
+bench/install/compose/bandersnatch.gen.conf
+bench/install/compose/pypicloud-config-dynamo.gen.ini
+# Transient README backup from `make build-wheel`'s transform/restore
+/README.md.orig

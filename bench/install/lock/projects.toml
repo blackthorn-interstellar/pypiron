@@ -1,0 +1,575 @@
+# Corpus of well-known open-source Python projects whose dependency closures
+# drive the realistic install benchmark (see docs/BENCHMARK_INSTALL.md).
+#
+# This file is the curated INPUT (loose names + realistic extras). The frozen
+# OUTPUT — exact versions, wheel URLs, sizes, hashes — lives in the generated
+# `closures/*.txt` and `wheelhouse.*.json` next to it, produced by `freeze.py`.
+# Each project is resolved INDEPENDENTLY (its own transitive closure), so the
+# wheelhouse is naturally multi-version, like a real index. Re-freeze only on an
+# explicit, committed bump.
+
+[meta]
+# uv resolves each closure constrained to this environment so the wheelhouse is
+# a finite, glibc-linux/x86_64 set (the loadgen runtime).
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+target_pythons = ["3.11", "3.12"]
+# Wheel tags the benchmark client will actually request (wheelhouse filter).
+platform_tags = ["manylinux", "any"]
+
+# --- lite tier: everyday-CI headline (S1, S5); native but reasonable bytes ---
+
+# http clients / networking
+[[project]]
+name = "requests"
+requirement = "requests"
+tier = "lite"
+category = "http"
+[[project]]
+name = "httpx"
+requirement = "httpx"
+tier = "lite"
+category = "http"
+[[project]]
+name = "aiohttp"
+requirement = "aiohttp"
+tier = "lite"
+category = "http"
+[[project]]
+name = "urllib3"
+requirement = "urllib3"
+tier = "lite"
+category = "http"
+
+# web frameworks / servers
+[[project]]
+name = "flask"
+requirement = "flask"
+tier = "lite"
+category = "web"
+[[project]]
+name = "django"
+requirement = "django"
+tier = "lite"
+category = "web"
+[[project]]
+name = "fastapi"
+requirement = "fastapi[standard]"
+tier = "lite"
+category = "web"
+[[project]]
+name = "starlette"
+requirement = "starlette"
+tier = "lite"
+category = "web"
+[[project]]
+name = "uvicorn"
+requirement = "uvicorn[standard]"
+tier = "lite"
+category = "web"
+[[project]]
+name = "gunicorn"
+requirement = "gunicorn"
+tier = "lite"
+category = "web"
+[[project]]
+name = "tornado"
+requirement = "tornado"
+tier = "lite"
+category = "web"
+[[project]]
+name = "werkzeug"
+requirement = "werkzeug"
+tier = "lite"
+category = "web"
+
+# async / tasks / messaging
+[[project]]
+name = "celery"
+requirement = "celery[redis]"
+tier = "lite"
+category = "tasks"
+[[project]]
+name = "redis"
+requirement = "redis"
+tier = "lite"
+category = "tasks"
+[[project]]
+name = "kombu"
+requirement = "kombu"
+tier = "lite"
+category = "tasks"
+
+# data / scientific (native, lite)
+[[project]]
+name = "numpy"
+requirement = "numpy"
+tier = "lite"
+category = "data"
+[[project]]
+name = "pandas"
+requirement = "pandas"
+tier = "lite"
+category = "data"
+[[project]]
+name = "scipy"
+requirement = "scipy"
+tier = "lite"
+category = "data"
+[[project]]
+name = "pyarrow"
+requirement = "pyarrow"
+tier = "lite"
+category = "data"
+[[project]]
+name = "polars"
+requirement = "polars"
+tier = "lite"
+category = "data"
+[[project]]
+name = "dask"
+requirement = "dask"
+tier = "lite"
+category = "data"
+[[project]]
+name = "sympy"
+requirement = "sympy"
+tier = "lite"
+category = "data"
+[[project]]
+name = "scikit-learn"
+requirement = "scikit-learn"
+tier = "lite"
+category = "ml"
+[[project]]
+name = "xgboost"
+requirement = "xgboost"
+tier = "lite"
+category = "ml"
+[[project]]
+name = "statsmodels"
+requirement = "statsmodels"
+tier = "lite"
+category = "data"
+
+# visualization / imaging
+[[project]]
+name = "matplotlib"
+requirement = "matplotlib"
+tier = "lite"
+category = "viz"
+[[project]]
+name = "plotly"
+requirement = "plotly"
+tier = "lite"
+category = "viz"
+[[project]]
+name = "seaborn"
+requirement = "seaborn"
+tier = "lite"
+category = "viz"
+[[project]]
+name = "bokeh"
+requirement = "bokeh"
+tier = "lite"
+category = "viz"
+[[project]]
+name = "pillow"
+requirement = "pillow"
+tier = "lite"
+category = "imaging"
+[[project]]
+name = "opencv-python"
+requirement = "opencv-python"
+tier = "lite"
+category = "imaging"
+
+# validation / serialization
+[[project]]
+name = "pydantic"
+requirement = "pydantic[email]"
+tier = "lite"
+category = "validation"
+[[project]]
+name = "marshmallow"
+requirement = "marshmallow"
+tier = "lite"
+category = "validation"
+[[project]]
+name = "attrs"
+requirement = "attrs"
+tier = "lite"
+category = "validation"
+[[project]]
+name = "cattrs"
+requirement = "cattrs"
+tier = "lite"
+category = "validation"
+[[project]]
+name = "orjson"
+requirement = "orjson"
+tier = "lite"
+category = "validation"
+[[project]]
+name = "msgpack"
+requirement = "msgpack"
+tier = "lite"
+category = "validation"
+[[project]]
+name = "jsonschema"
+requirement = "jsonschema"
+tier = "lite"
+category = "validation"
+
+# databases / ORMs
+[[project]]
+name = "sqlalchemy"
+requirement = "sqlalchemy"
+tier = "lite"
+category = "db"
+[[project]]
+name = "alembic"
+requirement = "alembic"
+tier = "lite"
+category = "db"
+[[project]]
+name = "psycopg2-binary"
+requirement = "psycopg2-binary"
+tier = "lite"
+category = "db"
+[[project]]
+name = "asyncpg"
+requirement = "asyncpg"
+tier = "lite"
+category = "db"
+[[project]]
+name = "pymysql"
+requirement = "pymysql"
+tier = "lite"
+category = "db"
+[[project]]
+name = "pymongo"
+requirement = "pymongo"
+tier = "lite"
+category = "db"
+
+# cloud SDKs
+[[project]]
+name = "boto3"
+requirement = "boto3"
+tier = "lite"
+category = "cloud"
+[[project]]
+name = "google-cloud-storage"
+requirement = "google-cloud-storage"
+tier = "lite"
+category = "cloud"
+[[project]]
+name = "azure-storage-blob"
+requirement = "azure-storage-blob"
+tier = "lite"
+category = "cloud"
+[[project]]
+name = "s3fs"
+requirement = "s3fs"
+tier = "lite"
+category = "cloud"
+
+# CLI / TUI
+[[project]]
+name = "click"
+requirement = "click"
+tier = "lite"
+category = "cli"
+[[project]]
+name = "typer"
+requirement = "typer"
+tier = "lite"
+category = "cli"
+[[project]]
+name = "rich"
+requirement = "rich"
+tier = "lite"
+category = "cli"
+[[project]]
+name = "textual"
+requirement = "textual"
+tier = "lite"
+category = "cli"
+[[project]]
+name = "tqdm"
+requirement = "tqdm"
+tier = "lite"
+category = "cli"
+
+# testing / QA
+[[project]]
+name = "pytest"
+requirement = "pytest"
+tier = "lite"
+category = "testing"
+[[project]]
+name = "pytest-cov"
+requirement = "pytest-cov"
+tier = "lite"
+category = "testing"
+[[project]]
+name = "pytest-asyncio"
+requirement = "pytest-asyncio"
+tier = "lite"
+category = "testing"
+[[project]]
+name = "hypothesis"
+requirement = "hypothesis"
+tier = "lite"
+category = "testing"
+[[project]]
+name = "coverage"
+requirement = "coverage"
+tier = "lite"
+category = "testing"
+[[project]]
+name = "tox"
+requirement = "tox"
+tier = "lite"
+category = "testing"
+[[project]]
+name = "faker"
+requirement = "faker"
+tier = "lite"
+category = "testing"
+
+# lint / format / typing
+[[project]]
+name = "black"
+requirement = "black"
+tier = "lite"
+category = "lint"
+[[project]]
+name = "ruff"
+requirement = "ruff"
+tier = "lite"
+category = "lint"
+[[project]]
+name = "mypy"
+requirement = "mypy"
+tier = "lite"
+category = "lint"
+[[project]]
+name = "flake8"
+requirement = "flake8"
+tier = "lite"
+category = "lint"
+[[project]]
+name = "pylint"
+requirement = "pylint"
+tier = "lite"
+category = "lint"
+[[project]]
+name = "isort"
+requirement = "isort"
+tier = "lite"
+category = "lint"
+[[project]]
+name = "pre-commit"
+requirement = "pre-commit"
+tier = "lite"
+category = "lint"
+
+# parsing / config / dates
+[[project]]
+name = "beautifulsoup4"
+requirement = "beautifulsoup4"
+tier = "lite"
+category = "parse"
+[[project]]
+name = "lxml"
+requirement = "lxml"
+tier = "lite"
+category = "parse"
+[[project]]
+name = "pyyaml"
+requirement = "pyyaml"
+tier = "lite"
+category = "parse"
+[[project]]
+name = "python-dateutil"
+requirement = "python-dateutil"
+tier = "lite"
+category = "parse"
+[[project]]
+name = "jinja2"
+requirement = "jinja2"
+tier = "lite"
+category = "parse"
+[[project]]
+name = "markupsafe"
+requirement = "markupsafe"
+tier = "lite"
+category = "parse"
+
+# crypto / security
+[[project]]
+name = "cryptography"
+requirement = "cryptography"
+tier = "lite"
+category = "crypto"
+[[project]]
+name = "pyjwt"
+requirement = "pyjwt"
+tier = "lite"
+category = "crypto"
+[[project]]
+name = "passlib"
+requirement = "passlib"
+tier = "lite"
+category = "crypto"
+[[project]]
+name = "bcrypt"
+requirement = "bcrypt"
+tier = "lite"
+category = "crypto"
+[[project]]
+name = "certifi"
+requirement = "certifi"
+tier = "lite"
+category = "crypto"
+
+# scraping / NLP
+[[project]]
+name = "scrapy"
+requirement = "scrapy"
+tier = "lite"
+category = "scraping"
+[[project]]
+name = "nltk"
+requirement = "nltk"
+tier = "lite"
+category = "nlp"
+
+# geo
+[[project]]
+name = "shapely"
+requirement = "shapely"
+tier = "lite"
+category = "geo"
+
+# notebooks / interactive
+[[project]]
+name = "ipython"
+requirement = "ipython"
+tier = "lite"
+category = "notebook"
+[[project]]
+name = "jupyterlab"
+requirement = "jupyterlab"
+tier = "lite"
+category = "notebook"
+
+# general-purpose utilities (the long tail every project pulls)
+[[project]]
+name = "packaging"
+requirement = "packaging"
+tier = "lite"
+category = "util"
+[[project]]
+name = "setuptools"
+requirement = "setuptools"
+tier = "lite"
+category = "util"
+[[project]]
+name = "python-dotenv"
+requirement = "python-dotenv"
+tier = "lite"
+category = "util"
+[[project]]
+name = "loguru"
+requirement = "loguru"
+tier = "lite"
+category = "util"
+[[project]]
+name = "structlog"
+requirement = "structlog"
+tier = "lite"
+category = "util"
+[[project]]
+name = "tenacity"
+requirement = "tenacity"
+tier = "lite"
+category = "util"
+[[project]]
+name = "cachetools"
+requirement = "cachetools"
+tier = "lite"
+category = "util"
+[[project]]
+name = "networkx"
+requirement = "networkx"
+tier = "lite"
+category = "util"
+[[project]]
+name = "more-itertools"
+requirement = "more-itertools"
+tier = "lite"
+category = "util"
+[[project]]
+name = "arrow"
+requirement = "arrow"
+tier = "lite"
+category = "util"
+[[project]]
+name = "pendulum"
+requirement = "pendulum"
+tier = "lite"
+category = "util"
+[[project]]
+name = "httptools"
+requirement = "httptools"
+tier = "lite"
+category = "util"
+[[project]]
+name = "pygments"
+requirement = "pygments"
+tier = "lite"
+category = "util"
+[[project]]
+name = "websockets"
+requirement = "websockets"
+tier = "lite"
+category = "util"
+[[project]]
+name = "grpcio"
+requirement = "grpcio"
+tier = "lite"
+category = "util"
+[[project]]
+name = "protobuf"
+requirement = "protobuf"
+tier = "lite"
+category = "util"
+[[project]]
+name = "pyzmq"
+requirement = "pyzmq"
+tier = "lite"
+category = "util"
+[[project]]
+name = "watchdog"
+requirement = "watchdog"
+tier = "lite"
+category = "util"
+
+# --- heavy tier: byte-transfer stress (S2); CUDA/GPU closures, opt-in ---
+[[project]]
+name = "torch"
+requirement = "torch"
+tier = "heavy"
+category = "dl"
+[[project]]
+name = "tensorflow"
+requirement = "tensorflow"
+tier = "heavy"
+category = "dl"
+[[project]]
+name = "transformers"
+requirement = "transformers[torch]"
+tier = "heavy"
+category = "dl"

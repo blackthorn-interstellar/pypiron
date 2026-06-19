@@ -1,0 +1,21 @@
+# pypicloud, Track 2 (best cloud): S3 blob storage + DynamoDB metadata cache —
+# its real cloud-native combo (no Postgres sidecar). docs/BENCHMARK_INSTALL.md §1.
+#
+# AWS-only: needs a real bucket + DynamoDB + credentials (rig instance profile via
+# IMDS). pypicloud auto-creates its DynamoDB tables on startup. Set
+# PYPIRON_S3_BUCKET + AWS_REGION. seed class "warm" (fallback=cache, warmed once).
+
+services:
+  pypicloud:
+    image: stevearc/pypicloud:1.3.12
+    platform: linux/amd64
+    volumes:
+      - ./pypicloud-config-dynamo.gen.ini:/etc/pypicloud/config.ini:ro
+    environment:
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      PYPICLOUD_S3_BUCKET: ${PYPIRON_S3_BUCKET:?set PYPIRON_S3_BUCKET to the rig bucket}
+    networks: [bench, egress]
+
+networks:
+  egress:
+    internal: false

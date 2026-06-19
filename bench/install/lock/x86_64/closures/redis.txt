@@ -1,0 +1,6 @@
+async-timeout==5.0.1 ; python_full_version < '3.11.3' and platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:39e3809566ff85354557ec2398b55e096c8364bacac9405a7a1fa429e77fe76c \
+    --hash=sha256:d9321a7a3d5a6a5e187e824d2fa0793ce379a202935782d555d6e9d2735677d3
+redis==8.0.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:a00c5355432051ac14e593b8b197fc76c887ee12d55a0984f69328a1115fdc49 \
+    --hash=sha256:c938c18338585009f0bc310f4c7e4e4b4d37639356c4ac072cedf3af570c8dc7

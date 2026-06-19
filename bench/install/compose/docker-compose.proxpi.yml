@@ -1,0 +1,31 @@
+# proxpi (pure pull-through cache). Single Gunicorn worker is MANDATORY — the
+# in-memory index cache is per-process, so extra workers serve cold-index
+# requests upstream (architectural, not a tuning failure; stated in results).
+# Footguns neutralized: CACHE_DIR on a persistent volume (default is an ephemeral
+# temp dir), CACHE_SIZE a large number > corpus bytes (NOT 0, which DISABLES
+# caching), INDEX_TTL long (default 1800s re-fetches mid-run), DOWNLOAD_TIMEOUT
+# 60s during warm (default 0.9s 302-bounces the client to pypi.org).
+#
+# No `platform:` pin — the image is amd64-only (emulated locally, native on the
+# x86_64 AWS rig); a proxy serves wheel bytes arch-agnostically. seed class
+# "warm". docs/BENCHMARK_INSTALL.md §3. Reachable at proxpi:5000; index /index/.
+
+services:
+  proxpi:
+    image: epicwink/proxpi:latest
+    command: ["--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "16", "--no-control-socket"]
+    environment:
+      PROXPI_CACHE_DIR: /var/cache/proxpi
+      PROXPI_CACHE_SIZE: "53687091200"   # 50 GB > corpus; NOT 0 (0 disables caching)
+      PROXPI_INDEX_TTL: "86400"
+      PROXPI_DOWNLOAD_TIMEOUT: "60"
+    volumes:
+      - proxpi-cache:/var/cache/proxpi
+    networks: [bench, egress]
+
+networks:
+  egress:
+    internal: false
+
+volumes:
+  proxpi-cache:

@@ -1,0 +1,35 @@
+certifi==2026.6.17 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:024c88eeec92ca068db80f02b8b07c9cef7b9fe261d1d535abfd5abd6f6af432 \
+    --hash=sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db
+charset-normalizer==3.4.7 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:08e721811161356f97b4059a9ba7bafb23ea5ee2255402c42881c214e173c6b4 \
+    --hash=sha256:0f7eb884681e3938906ed0434f20c63046eacd0111c4ba96f27b76084cd679f5 \
+    --hash=sha256:1a87ca9d5df6fe460483d9a5bbf2b18f620cbed41b432e2bddb686228282d10b \
+    --hash=sha256:1c2a768fdd44ee4a9339a9b0b130049139b8ce3c01d2ce09f67f5a68048d477c \
+    --hash=sha256:203104ed3e428044fd943bc4bf45fa73c0730391f9621e37fe39ecf477b128cb \
+    --hash=sha256:298930cec56029e05497a76988377cbd7457ba864beeea92ad7e844fe74cd1f1 \
+    --hash=sha256:2fe249cb4651fd12605b7288b24751d8bfd46d35f12a20b1ba33dea122e690df \
+    --hash=sha256:30b8d1d8c52a48c2c5690e152c169b673487a2a58de1ec7393196753063fcd5e \
+    --hash=sha256:38c0109396c4cfc574d502df99742a45c72c08eff0a36158b6f04000043dbf38 \
+    --hash=sha256:3dce51d0f5e7951f8bb4900c257dad282f49190fdbebecd4ba99bcc41fef404d \
+    --hash=sha256:4dc1e73c36828f982bfe79fadf5919923f8a6f4df2860804db9a98c48824ce8d \
+    --hash=sha256:532bc9bf33a68613fd7d65e4b1c71a6a38d7d42604ecf239c77392e9b4e8998c \
+    --hash=sha256:5649fd1c7bade02f320a462fdefd0b4bd3ce036065836d4f42e0de958038e116 \
+    --hash=sha256:65bcd23054beab4d166035cabbc868a09c1a49d1efe458fe8e4361215df40265 \
+    --hash=sha256:ae196f021b5e7c78e918242d217db021ed2a6ace2bc6ae94c0fc596221c7f58d \
+    --hash=sha256:ae89db9e5f98a11a4bf50407d4363e7b09b31e55bc117b4f7d80aab97ba009e5 \
+    --hash=sha256:aed52fea0513bac0ccde438c188c8a471c4e0f457c2dd20cdbf6ea7a450046c7 \
+    --hash=sha256:bb6d88045545b26da47aa879dd4a89a71d1dce0f0e549b1abcb31dfe4a8eac49 \
+    --hash=sha256:d635aab80466bc95771bb78d5370e74d36d1fe31467b6b29b8b57b2a3cd7d22c \
+    --hash=sha256:e1421b502d83040e6d7fb2fb18dff63957f720da3d77b2fbd3187ceb63755d7b \
+    --hash=sha256:edac0f1ab77644605be2cbba52e6b7f630731fc42b34cb0f634be1a6eface56a \
+    --hash=sha256:fea24543955a6a729c45a73fe90e08c743f0b3334bbf3201e6c4bc1b0c7fa464
+idna==3.18 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2 \
+    --hash=sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848
+requests==2.34.2 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0 \
+    --hash=sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed
+urllib3==2.7.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c \
+    --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897

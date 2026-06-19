@@ -1,0 +1,30 @@
+click==8.4.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:482be17c6991b8c19c5429a1e995d9b0efdbb63172824c41f99965dc0ade8ec2 \
+    --hash=sha256:918b5633eddf6b41c32d4f454bf0de810065c74e3f7dbf8ee5452f8be88d3e96
+joblib==1.5.3 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:5fc3c5039fc5ca8c0276333a188bbd59d6b7ab37fe6632daa76bc7f9ec18e713 \
+    --hash=sha256:8561a3269e6801106863fd0d6d84bb737be9e7631e33aaed3fb9ce5953688da3
+nltk==3.9.4 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:ed03bc098a40481310320808b2db712d95d13ca65b27372f8a403949c8b523d0 \
+    --hash=sha256:f2fa301c3a12718ce4a0e9305c5675299da5ad9e26068218b69d692fda84828f
+regex==2026.5.9 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:01f0f5f55f4b64dacec85dc116d3c05fd23ad3ff037bbc73a2085775953c2611 \
+    --hash=sha256:0f9eede6a5cbdc02d4978090186390936e1776a7d1359b21e41014c609880bcf \
+    --hash=sha256:1268eddd8486dc561d08eee1156e40aa3a8fe10f4bdec8fa653b455fcbffd12c \
+    --hash=sha256:2a661a7d270a61f7cf460caee8b9fa2d5ef9e5c681234bcb9e0fe14f488e7dfc \
+    --hash=sha256:39617fb0cde9c0e6306dc70e3bfc096f3da793219879f7ae7aa341a69fbdcf6d \
+    --hash=sha256:3dd4a3ff360dfb836fecdb93a4598f9d6e2ac81e3e397125145c6221bf58cf4c \
+    --hash=sha256:91328f1c23d47595ca3ef0a7557fa129c5a23404b775c770697d2f35b33e0107 \
+    --hash=sha256:93a7860539414dddaefba2b40f8771765ae17949d4c7182b876ce429e11a8309 \
+    --hash=sha256:97cf3bc1b7d7d2306772ec07366c80d9df00ff79e79cea32898883a646d2fae2 \
+    --hash=sha256:a8234aa23ec39894bfe4a3f1b85616a7032481964a13ac6fc9f10de4f6fca270 \
+    --hash=sha256:c9411dd64ca95477225734a93dfc8583b51916b8d5942f99d6cac21e09965451 \
+    --hash=sha256:cd2846168eb9ee3c513902bc8225409cb1caab31d04728b145171fa1625d9621 \
+    --hash=sha256:daff2bdbaf1d23e52fdff7c0b7bc2048b68f978df6a4d107ac981f94caef2e66 \
+    --hash=sha256:dd2810d22146b6d838acc5ec15602cb6b47920aa4e33015df3868eedfd20bab8 \
+    --hash=sha256:ea9c8ecfa1b73c73b626534d6626e5340d429630943672b8480724f44e84b962 \
+    --hash=sha256:f079e50a0d3cc3cd5091fa9ff45869a2e6b2cd35895731edafb0327901a8d86d \
+    --hash=sha256:fd03c4f0e33280d15cae17159b899245d6b7c53d21def19b263b39655061f5ce
+tqdm==4.68.3 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:00dfa48452b6b6cfae3dd9885636c23d3422d1ec97c66d96818cbd5e0821d482 \
+    --hash=sha256:39832cc2def2789a6f29df83f172db7416cea70052c0907a57801c5f2fdccb03

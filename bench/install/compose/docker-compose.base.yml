@@ -1,0 +1,31 @@
+# Base stack: the loadgen (uv client) + the bench network. Combined with a
+# per-server overlay (docker-compose.<server>.yml) via:
+#   docker compose -p ibench -f docker-compose.base.yml -f docker-compose.<server>.yml ...
+#
+# The loadgen runs uv against the server-under-test on the `bench` network. That
+# network is `internal: true` by default (no egress) so any cache miss / fallback
+# redirect fails loudly during measured runs (see docs/BENCHMARK_INSTALL.md §0).
+# Proxy/mirror servers that need to warm from pypi.org are temporarily attached
+# to a separate egress network by the orchestrator (bench.py).
+#
+# Knobs (env): BENCH_PLATFORM (linux/arm64 local | linux/amd64 AWS),
+#              BENCH_INTERNAL (true measured | false while warming).
+
+services:
+  loadgen:
+    image: ghcr.io/astral-sh/uv:0.9.30-python3.11-bookworm-slim  # pinned for reproducibility
+    platform: ${BENCH_PLATFORM:-linux/arm64}
+    working_dir: /repo/bench/install
+    volumes:
+      - ../../../:/repo
+    environment:
+      UV_PYTHON_DOWNLOADS: "never"
+      UV_CONCURRENT_DOWNLOADS: "16"
+      UV_CONCURRENT_INSTALLS: "8"
+      UV_CONCURRENT_BUILDS: "1"
+    command: ["sleep", "infinity"]
+    networks: [bench]
+
+networks:
+  bench:
+    internal: ${BENCH_INTERNAL:-true}

@@ -163,12 +163,17 @@ def oha_run(
     headers: Optional[List[str]] = None,
     expect_status: int = 200,
     regex: bool = False,
+    follow: bool = False,
 ) -> Dict:
     """Run oha and return rps + latency percentiles + success%. Uses oha's current
     `--json` CLI (the frozen meter.run_oha passes the old `--output-format json`),
-    but the JSON shape is identical. `-r 0`: never follow redirects (a 302 measures
-    the 302). regex=True: `url` is a rand_regex the install mix is drawn from."""
-    cmd = [oha, "--no-tui", "--json", "-r", "0", "-z", duration, "-c", str(connections)]
+    but the JSON shape is identical. follow=False (`-r 0`): never follow redirects
+    (a 302 measures the 302 — index-read ramp). follow=True (`--redirect 5`): follow
+    the 302 and download the wheel bytes from wherever they live (incl S3 in Track
+    2) so the install-mix exercises the FULL path and surfaces any S3-side limit.
+    regex=True: `url` is a rand_regex the install mix is drawn from."""
+    redirect = ["--redirect", "5"] if follow else ["-r", "0"]
+    cmd = [oha, "--no-tui", "--json", *redirect, "-z", duration, "-c", str(connections)]
     if regex:
         cmd.append("--rand-regex-url")
     for h in headers or []:
@@ -253,13 +258,16 @@ def ramp(
     ceiling_ms: float,
     ladder: List[int],
     regex: bool = False,
+    follow: bool = False,
 ) -> List[Dict]:
     """Run the connection ladder, stopping once the server breaks (or collapses)."""
     steps: List[Dict] = []
     peak = 0.0
     collapse_streak = 0
     for c in ladder:
-        r = oha_run(oha, url, duration, c, headers=headers, expect_status=expect, regex=regex)
+        r = oha_run(
+            oha, url, duration, c, headers=headers, expect_status=expect, regex=regex, follow=follow
+        )
         step = {
             "connections": c,
             "rps": r["rps"],
@@ -294,10 +302,13 @@ def measure(
     slo_mult: float,
     ladder: List[int],
     regex: bool = False,
+    follow: bool = False,
 ) -> Dict:
-    base = oha_run(oha, url, "5s", 1, headers=headers, expect_status=expect, regex=regex)
+    base = oha_run(
+        oha, url, "5s", 1, headers=headers, expect_status=expect, regex=regex, follow=follow
+    )
     ceiling = max(slo_floor_ms, slo_mult * base["p99_ms"])
-    steps = ramp(oha, url, headers, expect, duration, ceiling, ladder, regex=regex)
+    steps = ramp(oha, url, headers, expect, duration, ceiling, ladder, regex=regex, follow=follow)
     out = analyze_ramp(steps, ceiling)
     out.update(
         {
@@ -389,6 +400,7 @@ def main() -> None:
             args.slo_mult,
             ladder,
             regex=True,
+            follow=True,  # follow the 302 and pull wheel bytes (incl S3 in Track 2)
         )
         primary["mix_index_urls"], primary["mix_wheel_urls"] = n_index, n_wheel
         primary["mix_dropped"] = n_dropped

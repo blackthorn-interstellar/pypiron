@@ -25,6 +25,7 @@ CLIENT_PINS = {
     "twine": "dev-dependency",
     "flit": "3.12.0",
     "hatch": "1.17.0",
+    "pipenv": "2026.5.2",
 }
 
 

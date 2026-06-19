@@ -113,14 +113,31 @@ impl StorageArgs {
         Ok(storage)
     }
 
+    /// The disk data directory actually used, applying the default.
+    fn resolved_data_dir(&self) -> String {
+        self.data_dir.clone().unwrap_or_else(|| {
+            std::env::var("HOME")
+                .map(|home| format!("{home}/.pypiron/packages"))
+                .unwrap_or_else(|_| "./.pypiron/packages".to_string())
+        })
+    }
+
+    /// Short, human-friendly description for the startup banner.
+    pub fn describe(&self) -> String {
+        match self.storage {
+            StorageBackend::Disk => format!("disk · {}", self.resolved_data_dir()),
+            StorageBackend::S3 => format!("s3 · {}", self.s3_bucket.as_deref().unwrap_or("?")),
+            StorageBackend::Gcs => format!("gcs · {}", self.gcs_bucket.as_deref().unwrap_or("?")),
+            StorageBackend::Azure => {
+                format!("azure · {}", self.azure_container.as_deref().unwrap_or("?"))
+            }
+        }
+    }
+
     async fn build_backend(&self) -> Result<Arc<dyn Storage>> {
         match self.storage {
             StorageBackend::Disk => {
-                let data_dir = self.data_dir.clone().unwrap_or_else(|| {
-                    std::env::var("HOME")
-                        .map(|home| format!("{home}/.pypiron/packages"))
-                        .unwrap_or_else(|_| "./.pypiron/packages".to_string())
-                });
+                let data_dir = self.resolved_data_dir();
                 Ok(Arc::new(DiskStorage::new(&data_dir)))
             }
             StorageBackend::S3 => {

@@ -33,6 +33,7 @@ mod storage;
 mod sync;
 mod upload;
 mod verify;
+mod web;
 mod wheel;
 mod worker;
 
@@ -363,6 +364,7 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         }
     }
 
+    let storage_desc = cli.storage.describe();
     let storage = cli.storage.build().await?;
     let proxy = match cli.proxy_upstream.as_deref() {
         Some(upstream) => Some(Arc::new(proxy::Proxy::new(upstream, &cli.proxy_filter)?)),
@@ -395,26 +397,17 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         proxy,
     });
 
-    if state.uploads_disabled() {
-        warn!("no credentials configured: the server is read-only (set --uploader-user/--admin-user to enable uploads)");
-    } else {
-        if state.admin_credential().is_none() {
-            info!("no admin credential: mirror uploads, deletion, and yank are disabled");
-        }
-        if state.admin_credential().is_some()
-            && state.admin_credential() == state.uploader_credential()
-        {
-            warn!("uploader and admin credentials are identical: every uploader has admin powers");
-        }
+    // Genuine misconfiguration hazards warn in any log format. The benign
+    // facts (read-only, no-admin, public reads, proxy upstream) are surfaced in
+    // the startup banner (text) or the structured `listening` event (JSON).
+    if !state.uploads_disabled()
+        && state.admin_credential().is_some()
+        && state.admin_credential() == state.uploader_credential()
+    {
+        warn!("uploader and admin credentials are identical: every uploader has admin powers");
     }
-    if state.read_credential().is_none() {
-        info!("no read credential: indexes and artifacts are served without authentication");
-    }
-    if let Some(p) = &state.proxy {
-        info!(upstream = %p.upstream(), "on-demand proxy enabled");
-        if state.private_prefix.is_none() {
-            warn!("proxy enabled without --private-prefix: new private uploads race public names for first claim; a reserved prefix closes that hole");
-        }
+    if state.proxy.is_some() && state.private_prefix.is_none() {
+        warn!("proxy enabled without --private-prefix: new private uploads race public names for first claim; a reserved prefix closes that hole");
     }
 
     // Initialize empty index files if they don't exist
@@ -422,6 +415,10 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
 
     // router
     let app = Router::new()
+        // Human-facing pages. Root is the public front door (no secrets); the
+        // dashboard is gated by read auth inside its handler.
+        .route("/", get(root))
+        .route("/dashboard", get(dashboard))
         // Legacy PyPI upload API (used by uv/twine)
         .route("/legacy", post(legacy_upload))
         .route("/legacy/", post(legacy_upload))
@@ -458,11 +455,18 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
     let worker_handle = tokio::spawn(worker::run_worker_until(state.clone(), shutdown_rx));
 
     // serve
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        "listening on http://{}", cli.bind_addr
-    );
     let listener = tokio::net::TcpListener::bind(&cli.bind_addr).await?;
+    match cli.log_format {
+        LogFormat::Text => print_banner(&state, &cli.bind_addr, &storage_desc),
+        // JSON consumers keep a single machine-readable readiness event.
+        LogFormat::Json => info!(
+            version = env!("CARGO_PKG_VERSION"),
+            storage = %storage_desc,
+            read_only = state.uploads_disabled(),
+            authed_reads = state.read_credential().is_some(),
+            "listening on http://{}", cli.bind_addr
+        ),
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -478,6 +482,49 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         warn!("worker did not stop within 5s; exiting without lease release");
     }
     Ok(())
+}
+
+/// A friendly, human-readable startup summary for the default text log format.
+/// Not a log line on purpose — it's the first thing a developer sees, so it
+/// reads as a greeting, not a trace event. (JSON mode keeps a structured
+/// `listening` event instead.)
+fn print_banner(state: &AppState, bind_addr: &str, storage: &str) {
+    let uploads = if state.uploads_disabled() {
+        "disabled — read-only (set --admin-user / --uploader-user to enable)".to_string()
+    } else {
+        let mut roles = Vec::new();
+        if state.admin_credential().is_some() {
+            roles.push("admin");
+        }
+        if state.uploader_credential().is_some() {
+            roles.push("uploader");
+        }
+        let mut s = roles.join(", ");
+        if state.admin_credential().is_none() {
+            s.push_str("  (no admin: mirror, delete, yank disabled)");
+        }
+        s
+    };
+    let reads = if state.read_credential().is_some() {
+        "require auth"
+    } else {
+        "public, no auth"
+    };
+    let proxy = state
+        .proxy
+        .as_ref()
+        .map(|p| format!("\n     proxy     {}", p.upstream()))
+        .unwrap_or_default();
+
+    println!(
+        "\n  🐍 pypiron {version} — ready\n\n     \
+         url       http://{bind_addr}\n     \
+         storage   {storage}\n     \
+         uploads   {uploads}\n     \
+         reads     {reads}{proxy}\n\n     \
+         ctrl-c to stop\n",
+        version = env!("CARGO_PKG_VERSION"),
+    );
 }
 
 async fn shutdown_signal() {
@@ -558,6 +605,95 @@ async fn track_metrics(
         }
     }
     resp
+}
+
+/// The root landing page: a self-contained HTML front door with copy-paste
+/// client config. Public (no secrets) — like `/health`, it carries no auth.
+async fn root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
+    html_ok(web::landing_html(&page_context(&state, &headers)))
+}
+
+/// The live dashboard. Gated by read auth (open when no read credential is
+/// configured): it surfaces the same data as `/metrics`, but legibly, including
+/// client project tags — operators reading it have read creds; scrapers keep
+/// using `/metrics`.
+async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
+    if !state.is_reader(&headers) {
+        return unauthorized();
+    }
+    let snap = state.metrics.snapshot();
+    let (hits, misses) = state.index_cache.stats();
+    let packages = state
+        .global_names
+        .lock()
+        .await
+        .as_ref()
+        .map_or(0, |g| g.len());
+    html_ok(web::dashboard_html(
+        &page_context(&state, &headers),
+        &snap,
+        hits,
+        misses,
+        packages,
+    ))
+}
+
+/// Build the request-derived context both pages share. The base URL honors a
+/// reverse proxy's `X-Forwarded-Proto`/`-Host`, falling back to the `Host`
+/// header; the host is restricted to a plausible charset (it lands in the page
+/// as escaped text, but we keep it tidy too).
+fn page_context(state: &AppState, headers: &HeaderMap) -> web::PageContext {
+    web::PageContext {
+        base_url: base_url_from_headers(headers),
+        version: env!("CARGO_PKG_VERSION"),
+        proxy_enabled: state.proxy.is_some(),
+        delivery: match state.artifact_delivery {
+            ArtifactDelivery::Auto => "auto",
+            ArtifactDelivery::Redirect => "redirect",
+            ArtifactDelivery::Stream => "stream",
+        },
+        reads_authenticated: state.read_credential().is_some(),
+    }
+}
+
+fn base_url_from_headers(headers: &HeaderMap) -> String {
+    let first = |v: &HeaderValue| -> Option<String> {
+        v.to_str()
+            .ok()
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_string())
+    };
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(first)
+        .filter(|s| s == "http" || s == "https")
+        .unwrap_or_else(|| "http".to_string());
+    let host = headers
+        .get("x-forwarded-host")
+        .and_then(first)
+        .or_else(|| headers.get(header::HOST).and_then(first))
+        .filter(|h| is_plausible_host(h))
+        .unwrap_or_else(|| "localhost:8080".to_string());
+    format!("{proto}://{host}")
+}
+
+/// A host:port we're willing to echo into the page verbatim — letters, digits,
+/// and the few punctuation marks a real authority uses. Anything else (spaces,
+/// control bytes, quotes) falls back to the default.
+fn is_plausible_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 255
+        && h.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+}
+
+fn html_ok(body: String) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(body))
+        .unwrap_or_else(not_found)
 }
 
 /// Liveness + storage reachability. A storage error is the only failure mode:

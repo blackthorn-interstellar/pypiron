@@ -16,8 +16,9 @@
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 
-// render.rs reaches for `crate::names` and `crate::sidecar`; provide both at the
-// binary root so those absolute paths resolve, then pull render in beside them.
+// render.rs reaches for `crate::names`, `crate::sidecar`, and
+// `crate::status::ProjectStatusDoc`; provide them at the binary root so those
+// absolute paths resolve, then pull render in beside them.
 #[path = "../../src/names.rs"]
 mod names;
 #[path = "../../src/sidecar.rs"]
@@ -25,8 +26,62 @@ mod sidecar;
 #[path = "../../src/render.rs"]
 mod render;
 
+// The real `status.rs` drags in the storage/anyhow stack (S3, axum, tokio) for
+// its sidecar read/write helpers, which would pull the whole crate into this
+// otherwise-minimal harness. render only touches the pure PEP 792 status types,
+// so mirror just those here. Any drift in their shape or serde shows up as a
+// compile error in this exact fuzz-build job.
+mod status {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum ProjectStatus {
+        Active,
+        Archived,
+        Quarantined,
+        Deprecated,
+    }
+
+    impl ProjectStatus {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                ProjectStatus::Active => "active",
+                ProjectStatus::Archived => "archived",
+                ProjectStatus::Quarantined => "quarantined",
+                ProjectStatus::Deprecated => "deprecated",
+            }
+        }
+
+        pub fn is_active(self) -> bool {
+            matches!(self, ProjectStatus::Active)
+        }
+
+        pub fn blocks_downloads(self) -> bool {
+            matches!(self, ProjectStatus::Quarantined)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ProjectStatusDoc {
+        pub status: ProjectStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reason: Option<String>,
+    }
+
+    impl Default for ProjectStatusDoc {
+        fn default() -> Self {
+            Self {
+                status: ProjectStatus::Active,
+                reason: None,
+            }
+        }
+    }
+}
+
 use render::FileMetadata;
 use sidecar::Yanked;
+use status::{ProjectStatus, ProjectStatusDoc};
 
 fn carve(u: &mut Unstructured) -> (String, FileMetadata) {
     let pkg = String::arbitrary(u).unwrap_or_default();
@@ -44,21 +99,36 @@ fn carve(u: &mut Unstructured) -> (String, FileMetadata) {
         yanked,
         requires_python: Option::<String>::arbitrary(u).unwrap_or(None),
         core_metadata: bool::arbitrary(u).unwrap_or(false),
+        provenance: bool::arbitrary(u).unwrap_or(false),
     };
     (pkg, fm)
+}
+
+// PEP 792 status doc — its `reason` is arbitrary text that lands inside a
+// double-quoted HTML attribute, so it's an injection surface worth fuzzing.
+fn carve_status(u: &mut Unstructured) -> ProjectStatusDoc {
+    let status = match u8::arbitrary(u).unwrap_or(0) % 4 {
+        0 => ProjectStatus::Active,
+        1 => ProjectStatus::Archived,
+        2 => ProjectStatus::Quarantined,
+        _ => ProjectStatus::Deprecated,
+    };
+    let reason = Option::<String>::arbitrary(u).unwrap_or(None);
+    ProjectStatusDoc { status, reason }
 }
 
 fuzz_target!(|data: &[u8]| {
     let mut u = Unstructured::new(data);
     let (pkg, fm) = carve(&mut u);
+    let status = carve_status(&mut u);
     let files = std::slice::from_ref(&fm);
 
     // 1. PEP 691 JSON must always parse.
-    let json = render::pep691_package_json(&pkg, files);
+    let json = render::pep691_package_json(&pkg, files, &status);
     serde_json::from_str::<serde_json::Value>(&json).expect("PEP 691 JSON is not valid JSON");
 
     // 2. The HTML `href` must be quote-safe and lossless.
-    let html = render::pep503_package_html(&pkg, files);
+    let html = render::pep503_package_html(&pkg, files, &status);
     if let Some(start) = html.find("href=\"/files/") {
         let after = &html[start + "href=\"".len()..];
         if let Some(end) = after.find('"') {

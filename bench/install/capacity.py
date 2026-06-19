@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlsplit
 
-from benchlib import closures_dir, http_get, is_glibc_wheel
+from benchlib import closures_dir, http_get, is_glibc_wheel, manifest_path
 
 LADDER = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
@@ -58,36 +58,41 @@ def regex_escape(s: str) -> str:
     return "".join(out)
 
 
-def parse_wheel_url(page_url: str, body: bytes, arch: str) -> Optional[str]:
-    """Extract one wheel URL the server serves for a package, from its index page
-    (PEP 691 JSON or legacy HTML). Resolves relative hrefs against the page URL."""
+def parse_wheel_url(page_url: str, body: bytes, arch: str, allowed: set) -> Optional[str]:
+    """Extract one wheel URL the server actually serves for a package, from its
+    index page (PEP 691 JSON or legacy HTML), resolving relative hrefs. Picks a
+    wheel whose filename is in `allowed` (the seeded manifest set) — a proxy's
+    index lists ALL upstream versions but only the seeded ones are served, so an
+    unrestricted pick would request an uncached wheel and 404."""
     text = body.decode("utf-8", "replace")
     try:
         urls = [f.get("url", "") for f in json.loads(text).get("files", [])]
     except json.JSONDecodeError:
         urls = re.findall(r'href="([^"]+\.whl[^"]*)"', text)
-    cleaned = [u.split("#", 1)[0] for u in urls if ".whl" in u]
-    for u in cleaned:
-        if is_glibc_wheel(u.rsplit("/", 1)[-1], arch):
+    for u in (x.split("#", 1)[0] for x in urls if ".whl" in x):
+        fn = u.rsplit("/", 1)[-1]
+        if fn in allowed and is_glibc_wheel(fn, arch):
             return urljoin(page_url, u)
-    return urljoin(page_url, cleaned[0]) if cleaned else None
+    return None
 
 
-def build_install_mix(index_url: str, arch: str) -> Tuple[str, float, int, int]:
-    """Build the realistic install-traffic URL mix: every corpus package's index
+def build_install_mix(index_url: str, arch: str, tier: str) -> Tuple[str, float, int, int]:
+    """Build the realistic install-traffic URL mix: every seeded package's index
     page + one wheel it serves. Returns (rand_regex, reqs_per_install, n_index,
     n_wheel). reqs_per_install ~= 2 x avg packages/closure (each package = one
-    index GET + one wheel GET during a cold install)."""
-    closures = sorted(closures_dir(arch).glob("*.txt"))
+    index GET + one wheel GET during a cold install). Packages + the served-wheel
+    set come from the manifest (the bytes every server was seeded with)."""
+    manifest = json.loads(manifest_path(tier, arch).read_text())
+    allowed = {w["filename"] for w in manifest["wheels"]}
+    names = {pep503(w["name"]) for w in manifest["wheels"]}
+
     pkgs_per: List[int] = []
-    names: set = set()
-    for c in closures:
-        n = 0
-        for line in c.read_text().splitlines():
-            line = line.strip()
-            if "==" in line and not line.startswith(("--", "#")):
-                names.add(pep503(line.split("==")[0].strip()))
-                n += 1
+    for c in sorted(closures_dir(arch).glob("*.txt")):
+        n = sum(
+            1
+            for line in c.read_text().splitlines()
+            if "==" in line.strip() and not line.strip().startswith(("--", "#"))
+        )
         if n:
             pkgs_per.append(n)
     reqs_per_install = (sum(pkgs_per) / len(pkgs_per)) * 2 if pkgs_per else 1.0
@@ -100,7 +105,7 @@ def build_install_mix(index_url: str, arch: str) -> Tuple[str, float, int, int]:
         index_urls.append(iu)
         status, body, _ = http_get(iu, headers=hdr)
         if status == 200:
-            w = parse_wheel_url(iu, body, arch)
+            w = parse_wheel_url(iu, body, arch, allowed)
             if w:
                 wheel_urls.append(w)
     mix = index_urls + wheel_urls
@@ -275,6 +280,22 @@ def measure(
     return out
 
 
+def wait_ready(url: str, timeout: float = 180.0) -> None:
+    """Poll the index root until the server answers (any HTTP status) — capacity
+    runs right after seed, and e.g. pypiserver rescans the copied wheelhouse on
+    restart before it serves."""
+    import urllib.error
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            http_get(url, timeout=5.0)
+            return
+        except (urllib.error.URLError, OSError):
+            time.sleep(2.0)
+    raise SystemExit(f"server index {url} not ready after {timeout}s")
+
+
 def classify_bound(primary: Dict, r_ceiling: float) -> Tuple[float, str]:
     """server-bound (real break, MST << rig ceiling) | caution | rig-bound."""
     mst = primary["mst_rps"]
@@ -295,6 +316,7 @@ def main() -> None:
     ap.add_argument("--index-url", required=True, help="PEP 503 index root")
     ap.add_argument("--host", required=True)
     ap.add_argument("--arch", default="x86_64")
+    ap.add_argument("--tier", default="all", help="manifest tier for the seeded-wheel set")
     ap.add_argument(
         "--rep-pkg", default="flask", help="a package present on every server (small clean index)"
     )
@@ -315,9 +337,12 @@ def main() -> None:
     ladder = LADDER
     headers = ["Accept: application/vnd.pypi.simple.v1+json"]
     result = {"label": args.label, "host": args.host}
+    wait_ready(args.index_url)
 
     if args.install_mix:
-        regex, reqs_per_install, n_index, n_wheel = build_install_mix(args.index_url, args.arch)
+        regex, reqs_per_install, n_index, n_wheel = build_install_mix(
+            args.index_url, args.arch, args.tier
+        )
         print(
             f"capacity {args.label}: install-mix ramp ({n_index} index + {n_wheel} wheel URLs, "
             f"~{reqs_per_install} reqs/install)"

@@ -327,6 +327,8 @@ def main() -> None:
                 spec["host"],
                 "--arch",
                 args.arch,
+                "--tier",
+                args.tier,
                 "--oha",
                 "/repo/bench/install/.bin/oha",
                 "--control-url",

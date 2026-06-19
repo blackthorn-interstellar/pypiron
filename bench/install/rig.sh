@@ -57,7 +57,8 @@ cmd_up() {
     \"Version\":\"2012-10-17\",\"Statement\":[
       {\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\"],\"Resource\":\"arn:aws:s3:::${bucket}/*\"},
       {\"Effect\":\"Allow\",\"Action\":[\"s3:ListBucket\"],\"Resource\":\"arn:aws:s3:::${bucket}\"},
-      {\"Effect\":\"Allow\",\"Action\":[\"dynamodb:*\"],\"Resource\":\"arn:aws:dynamodb:${REGION}:${account}:table/${NAME}*\"}
+      {\"Effect\":\"Allow\",\"Action\":[\"dynamodb:*\"],\"Resource\":\"arn:aws:dynamodb:${REGION}:${account}:table/${NAME}*\"},
+      {\"Effect\":\"Allow\",\"Action\":[\"dynamodb:ListTables\",\"dynamodb:DescribeLimits\"],\"Resource\":\"*\"}
     ]}"
   if ! aws iam get-instance-profile --instance-profile-name "${NAME}" >/dev/null 2>&1; then
     aws iam create-instance-profile --instance-profile-name "${NAME}" >/dev/null

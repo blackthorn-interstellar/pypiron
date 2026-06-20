@@ -208,6 +208,76 @@ def test_unchanged_resync_skips_via_conditional_304(source_dest, pypiron_bin, tm
     assert f"Syncing {pkg}" in (out + err)
 
 
+def test_resync_skips_files_already_mirrored(source_dest, pypiron_bin, tmp_path):
+    """A re-run uploads only genuinely new files: one the dest already holds is
+    skipped before its bytes are even downloaded (no wasted download + 409),
+    while a newly published file still lands."""
+    source, dest = source_dest["source"], source_dest["dest"]
+    pkg = "reconskip"
+    w1 = _seed(source, pkg, "1.0", tmp_path)
+    wait_for_file_in_index(source["simple"], pkg, w1.name)
+
+    pkg_list = tmp_path / "packages.txt"
+    pkg_list.write_text(f"{pkg}\n")
+
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list)
+    assert rc == 0, f"initial sync failed:\n{out}\n{err}"
+    wait_for_file_in_index(dest["simple"], pkg, w1.name)
+
+    # Publish a second version upstream; its appearance changes the source index
+    # ETag, so the re-sync re-selects (no 304) and sees both files.
+    w2 = _seed(source, pkg, "2.0", tmp_path)
+    wait_for_file_in_index(source["simple"], pkg, w2.name)
+
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list)
+    assert rc == 0, f"resync failed:\n{out}\n{err}"
+    combined = out + err
+    # Only the new file is uploaded; the already-mirrored one is skipped.
+    assert f"Syncing {pkg} (1 new, 1 already mirrored)" in combined, combined
+    assert f"uploading {w2.name}" in combined, combined
+    assert f"uploading {w1.name}" not in combined, combined
+    wait_for_file_in_index(dest["simple"], pkg, w2.name)
+
+    # A forced --full re-run bypasses the 304 and re-selects every file, yet
+    # uploads nothing — all are already present.
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--full")
+    assert rc == 0, f"--full resync failed:\n{out}\n{err}"
+    combined = out + err
+    assert f"Syncing {pkg} (0 new, 2 already mirrored)" in combined, combined
+    assert "- uploading" not in combined, combined
+
+
+def test_relative_duration_exclude_older_still_304s_on_resync(source_dest, pypiron_bin, tmp_path):
+    """A relative `--exclude-older` ("1 day") resolves to a fresh instant every
+    run, but the sync cursor must still match its own prior config so an
+    unchanged upstream 304s. Regression: the resolved instant used to be hashed
+    into the cursor's config key, so every relative-duration run re-fetched and
+    re-tried every file (each a wasted download + a 409)."""
+    source, dest = source_dest["source"], source_dest["dest"]
+    pkg = "reconcutoff"
+    w1 = _seed(source, pkg, "1.0", tmp_path)
+    wait_for_file_in_index(source["simple"], pkg, w1.name)
+
+    pkg_list = tmp_path / "packages.txt"
+    pkg_list.write_text(f"{pkg}\n")
+
+    # Fresh wheels upload "now", so a 1-day older-bound still includes them.
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--exclude-older", "1 day")
+    assert rc == 0, f"initial sync failed:\n{out}\n{err}"
+    assert f"Syncing {pkg}" in (out + err)
+    wait_for_file_in_index(dest["simple"], pkg, w1.name)
+
+    # Second run, same relative bound, nothing changed upstream: the cursor's
+    # config key is hashed from the raw "1 day", not its (now-shifted) instant,
+    # so the conditional fetch 304s and the whole project is skipped.
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--exclude-older", "1 day")
+    assert rc == 0, f"second sync failed:\n{out}\n{err}"
+    combined = out + err
+    assert "upstream unchanged since last sync (304)" in combined, combined
+    assert f"Syncing {pkg}" not in combined, combined
+    assert "- uploading" not in combined, combined
+
+
 def test_quarantine_status_propagates_without_mass_removal(source_dest, pypiron_bin, tmp_path):
     source, dest = source_dest["source"], source_dest["dest"]
     pkg = "reconcilestatus"

@@ -488,3 +488,29 @@ Peak p99 is high (5–14 s, deep queueing) — these are saturation ceilings, no
 low-latency operating points. bandersnatch is a different use case (full mirror,
 no private/upload). Numbers are 2-vCPU; the ranking, not the absolute, is the
 point. pypicloud has 2 documented unservable wheels (redis cache-mode pin).
+
+## 15. pypiron's true (server-bound) ceiling — 2026-06-20
+
+§14 reported pypiron at 1,022 installs/s but **rig-limited** (node 43% CPU; the 2
+loadgens, busy pulling wheels from S3, were the bottleneck). Scaling the loadgen
+fleet to **4× c7i.8xlarge** (~50 Gbps aggregate, enough S3-download capacity to
+keep the request rate up) drove pypiron's own CPU to the wall:
+
+| agg concurrency | req/s | installs/s | node CPU (of 200%) | note |
+|---|---|---|---|---|
+| 8,192 | 12,475 | 960 | 178% | climbing |
+| 16,384 | 17,671 | 1,359 | 173% | |
+| 32,768 | 24,082 / 21,014 | 1,852 / 1,617 | 166% / **185%** | at the knee |
+| 49,152 | 26,438 | **2,034** | 168% | peak sustained |
+| 65,536 | 10,450 | 804 | 174% | collapse (over-concurrency) |
+
+**pypiron's true ceiling on 2 vCPU ≈ 2,000 installs/s (~26,000 req/s of index +
+302), CPU-saturated (~185-190% = ~93-95%)** — about **1,000 installs/s per vCPU**,
+so it scales ~linearly with cores (an 8-vCPU box ≈ 8,000 installs/s). It collapses
+only when pushed past ~50k concurrent connections (deep queueing), as expected.
+
+So §14's 1,022 was conservative (rig-bound); pypiron's real ceiling is ~2× that,
+and the gap over the field widens accordingly — vs pypicloud's 47 and pypiserver's
+85, pypiron at its true ceiling is **~24× and ~42×** respectively. The competitors
+were already server-bound in §14 (their numbers are real ceilings); only pypiron
+and bandersnatch had headroom left, and this pins pypiron's.

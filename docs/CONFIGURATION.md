@@ -125,6 +125,29 @@ username is parsed for attribution and the password is ignored. Tag cardinality
 in `/metrics` is capped (overflow lands in `_overflow`); tags are restricted to
 `[A-Za-z0-9._-]`, max 64 chars.
 
+## Re-sync, reconcile, and conditional fetch
+
+A re-`sync` doesn't just add new files — it *reconciles* what it already holds:
+yank state is brought in line with upstream (set, cleared, or its reason
+updated), a file gone from upstream is flagged yanked `removed upstream` (kept
+downloadable, just skipped by installers), and PEP 792 project status is
+relayed. Artifacts are never deleted.
+
+To keep "reconcile every run" cheap, each project is fetched conditionally: the
+last upstream ETag is remembered server-side (`_sync/cursors.json`, served by
+the admin-only `GET`/`PUT /sync/cursors`) and replayed as `If-None-Match`, so an
+unchanged upstream answers `304` and the project is skipped entirely. The cursor
+is a pure cache — delete it and the next run re-fetches.
+
+- `--full` (`PYPIRON_SYNC_FULL`) — ignore the cursor memo: re-fetch every
+  project unconditionally and fully reconcile. Run periodically (e.g. nightly)
+  as the self-heal, since a normal run only reconciles projects whose upstream
+  listing actually changed.
+
+The cursor key folds in the source URL, the resolved filters, and each project's
+specifiers, so changing any of them invalidates the shortcut and forces a full
+fetch.
+
 ## Sync filters and config file
 
 Filters gate only what a run *adds* — already-mirrored files are never removed:

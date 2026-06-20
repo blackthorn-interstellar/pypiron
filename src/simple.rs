@@ -99,16 +99,37 @@ where
     Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
 }
 
-/// Fetch a package's PEP 691 JSON listing from `base`. `Ok(None)` on a 404 —
-/// the package isn't on this index. `timeout` bounds the whole request for
-/// latency-sensitive callers (the proxy); `None` relies on the client's own
-/// timeouts (sync).
-pub async fn fetch_index(
+/// Outcome of a conditional listing fetch (see [`fetch_index_conditional`]).
+pub enum IndexFetch {
+    /// `304`: the source confirms the listing is byte-identical to the ETag we
+    /// sent. Nothing to re-parse — and nothing to reconcile.
+    NotModified,
+    /// `404`: the package isn't on this index.
+    NotFound,
+    /// `200`: a fresh listing, plus the change tokens to remember for next time.
+    Found {
+        index: SimpleIndex,
+        /// The response ETag, opaque — stored and compared for equality only,
+        /// never parsed (PyPI's is a Fastly token).
+        etag: Option<String>,
+        /// PyPI's `X-PyPI-Last-Serial` (human-readable "moved N→M"); for logs.
+        last_serial: Option<u64>,
+    },
+}
+
+/// Fetch a package's PEP 691 JSON listing from `base`, optionally conditional
+/// on a previously-seen ETag. `if_none_match` rides as `If-None-Match`; a `304`
+/// short-circuits with [`IndexFetch::NotModified`] (no body, no parse). The
+/// ETag is opaque — only ever compared for equality. `timeout` bounds the whole
+/// request for latency-sensitive callers; `None` relies on the client's own
+/// timeouts.
+pub async fn fetch_index_conditional(
     client: &Client,
     base: &str,
     pkg: &str,
     timeout: Option<Duration>,
-) -> Result<Option<SimpleIndex>> {
+    if_none_match: Option<&str>,
+) -> Result<IndexFetch> {
     let url = format!("{}/simple/{pkg}/", base.trim_end_matches('/'));
     let mut req = client
         .get(&url)
@@ -116,11 +137,54 @@ pub async fn fetch_index(
     if let Some(t) = timeout {
         req = req.timeout(t);
     }
-    let resp = req.send().await?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
+    if let Some(tag) = if_none_match {
+        req = req.header(reqwest::header::IF_NONE_MATCH, tag);
     }
-    Ok(Some(resp.error_for_status()?.json().await?))
+    let resp = req.send().await?;
+    match resp.status() {
+        reqwest::StatusCode::NOT_MODIFIED => Ok(IndexFetch::NotModified),
+        reqwest::StatusCode::NOT_FOUND => Ok(IndexFetch::NotFound),
+        _ => {
+            let resp = resp.error_for_status()?;
+            // Read headers before `.json()` consumes the response.
+            let etag = resp
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let last_serial = resp
+                .headers()
+                .get("x-pypi-last-serial")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let index = resp.json().await?;
+            Ok(IndexFetch::Found {
+                index,
+                etag,
+                last_serial,
+            })
+        }
+    }
+}
+
+/// Fetch a package's PEP 691 JSON listing from `base`. `Ok(None)` on a 404 —
+/// the package isn't on this index. `timeout` bounds the whole request for
+/// latency-sensitive callers (the proxy); `None` relies on the client's own
+/// timeouts (sync). Unconditional: this never sends `If-None-Match`.
+pub async fn fetch_index(
+    client: &Client,
+    base: &str,
+    pkg: &str,
+    timeout: Option<Duration>,
+) -> Result<Option<SimpleIndex>> {
+    match fetch_index_conditional(client, base, pkg, timeout, None).await? {
+        IndexFetch::Found { index, .. } => Ok(Some(index)),
+        IndexFetch::NotFound => Ok(None),
+        // We sent no `If-None-Match`, so a 304 is the source misbehaving.
+        IndexFetch::NotModified => Err(anyhow::anyhow!(
+            "source returned 304 without a conditional request"
+        )),
+    }
 }
 
 #[cfg(test)]

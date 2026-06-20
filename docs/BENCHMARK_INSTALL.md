@@ -427,3 +427,64 @@ its own validity per server:
 ¹ "never broke" = held the SLO to the c=4096 ladder cap; reported as rig-bound,
 not as a server limit. The headroom < 1 for pypiron means its index path
 out-serves the control — the rig, not pypiron, is the bottleneck.
+
+## 14. Six-way install-throughput comparison — 2026-06-20
+
+The headline number: **max sustained real-install throughput** on one realistic
+small server, every server in its best cloud-backed config, driven by `oha`
+replaying the install-mix (index + wheel URLs in install proportions) and
+**following the 302 to download wheel bytes from S3** so the *entire* path is
+exercised. Driver: `mn_ramp.py` (N loadgens in lockstep, summed) + `rig2.sh`.
+
+- **Server:** one `r7i.large` (2 vCPU, 16 GB, x86), **host networking** — a
+  flamegraph (§ below) showed Docker's bridge/NAT cost ~24% on a small box, and a
+  single-box deploy wouldn't bridge-NAT; host-net measures the server, not docker.
+- **Loadgens:** 2× `c7i.2xlarge` running `oha` (HTTP is arch-agnostic).
+- **Corpus:** lite (100 projects / 391 wheels). Same frozen set for everyone.
+- installs/s = sustained req/s ÷ ~13 reqs/install (≈2 × avg pkgs/closure).
+
+| Rank | Server | Cloud config | **installs/s** | req/s | breaking mode |
+|---|---|---|---|---|---|
+| 1 | **pypiron** | S3 + presigned redirect (Rust) | **1,022** | 13,287 | none — node 43% CPU at peak (rig/connection-limited; true ceiling higher) |
+| 2 | bandersnatch | full static mirror via nginx | 512 | 6,664 | none — node ~60% CPU (nginx zero-copy; conn-limited) |
+| 3 | pypiserver | gunicorn + cached-dir | 85 | 1,102 | server CPU (99%) |
+| 4 | pypicloud | **S3 + DynamoDB** (uwsgi) | 47 | 614 | collapse at 2× load |
+| 5 | devpi | devpi + nginx (+f direct) | 35 | 449 | errors |
+| 6 | proxpi | flask caching proxy | 32 | 414 | server CPU (87%) |
+
+Findings:
+- **pypiron wins by 2× (bandersnatch) to ~30× (the Python app servers)** and is
+  the only server still **rig-limited, not server-limited** — its node sat at 43%
+  CPU at 1,022 installs/s; the real ceiling is higher than this rig can drive.
+- **pypicloud — the architectural peer (also S3 blob offload) — lands near the
+  bottom (47/s, collapses).** Offloading bytes to S3 doesn't help when the index/
+  redirect path is Python + uwsgi + DynamoDB: that layer caps throughput and
+  falls over under concurrency. The win is the lean Rust serving path, not just S3.
+- **bandersnatch is the only credible challenger (512/s)** — but only because it
+  is *pure nginx zero-copy static serving* with no application layer, and it is a
+  full public mirror (no private packages, no upload, no auth). It serves every
+  wheel byte through the node, so on a small-NIC box (see below) it throttles
+  where pypiron (S3 redirect) does not.
+- **The Python app servers cluster at 32–85 installs/s** — the app layer is the
+  ceiling regardless of storage.
+
+Smaller box (`t3.small`, 2 vCPU / **2 GB**), pypiron only: **450 installs/s**
+(host-net), server-CPU-bound, S3 streaming 1.2 GB/s with zero errors — pypiron
+seeds and serves comfortably on a $12/mo box. **pypicloud could not even seed the
+corpus there: its uwsgi ingest path spiked to ~1.5 GB and OOM-wedged the box**
+(hence the bigger box for the field). A real operational gap: pypiron runs where
+pypicloud cannot.
+
+Hot-path flamegraph (pypiron under load, t3.small): pypiron's own code is 37% of
+CPU with **no dominant function** (top app symbol ~1.5%) — the serving path is
+already lean. The actionable finding was the Docker bridge/NAT tax (~24% on a
+small box → switched all servers to host networking). Micro-opts attempted on
+branch `perf-hotpath` (log fast-path, cache RwLock) are correct but didn't move
+this anonymous/2-core workload.
+
+Honest caveats: pypiron and bandersnatch never hit a server-CPU wall on this rig
+(2 loadgens) — their ranks are lower bounds, the Python servers are true ceilings.
+Peak p99 is high (5–14 s, deep queueing) — these are saturation ceilings, not
+low-latency operating points. bandersnatch is a different use case (full mirror,
+no private/upload). Numbers are 2-vCPU; the ranking, not the absolute, is the
+point. pypicloud has 2 documented unservable wheels (redis cache-mode pin).

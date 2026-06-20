@@ -74,8 +74,12 @@ pub struct DashboardData<'a> {
 }
 
 const PAGE_CSS: &str = "\
-:root{color-scheme:light dark;--bg:#fafafa;--fg:#15171a;--muted:#6b7280;--card:#fff;--border:#e6e7eb;--accent:#3b6cff;--code:#f3f4f6;--bar:#3b6cff;--track:#e9ecf3}\
-@media(prefers-color-scheme:dark){:root{--bg:#0e1014;--fg:#e7e9ee;--muted:#9aa1ac;--card:#161922;--border:#252a35;--accent:#7aa0ff;--code:#1a1e27;--bar:#7aa0ff;--track:#222733}}\
+/* pypiron color scheme — iron & rust, after the logo: warm rust-orange accent\
+   on warm steel/charcoal neutrals. Shared by every page and our docs. Tokens:\
+   --bg content surface, --header the banner band (distinct from content),\
+   --accent rust (links/buttons), --accent-ink a darker rust for hover. */\
+:root{color-scheme:light dark;--bg:#faf7f4;--header:#efe7df;--fg:#211b17;--muted:#7c7269;--card:#fff;--border:#e7ddd3;--accent:#bf5a2e;--accent-ink:#a04a24;--code:#f3ece4;--bar:#bf5a2e;--track:#ece2d8}\
+@media(prefers-color-scheme:dark){:root{--bg:#15110e;--header:#1f1813;--fg:#ece5dd;--muted:#a59a8f;--card:#1c1713;--border:#352c24;--accent:#e07b45;--accent-ink:#ef9460;--code:#1f1813;--bar:#e07b45;--track:#2c241d}}\
 *{box-sizing:border-box}\
 body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);font:15px/1.55 ui-sans-serif,system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif;display:flex;justify-content:center}\
 main{width:100%;max-width:720px;padding:52px 24px 72px}\
@@ -118,18 +122,23 @@ code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
 .activity{margin-top:44px;border-top:1px solid var(--border);padding-top:24px}\
 .activity .cap{margin:0 0 16px;color:var(--muted);font-size:13px;text-align:center}\
 main.wide{max-width:1000px}\
-.summary{margin:6px 0 0;color:var(--muted);font-size:16px}\
 .top .home{font:inherit;font-size:20px;font-weight:650;letter-spacing:-.02em;color:var(--fg)}\
 .top .home:hover{text-decoration:none}\
-.phead{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:14px 36px;border-bottom:1px solid var(--border);padding-bottom:22px;margin-bottom:26px}\
+/* Header band: a distinct background from the content, full-bleed to the edges\
+   of the centered column (pypi.org-style). It wraps the brand strip + banner. */\
+.phead-band{background:var(--header);border-bottom:1px solid var(--border);margin:-52px -24px 0;padding:20px 24px 24px}\
+.phead-band .top{margin-bottom:18px}\
+.phead{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:10px 36px;margin:0}\
 .phead-main{flex:1;min-width:240px}\
 .phead-name{margin:0;font-size:30px;letter-spacing:-.02em;word-break:break-word}\
 .phead-name .pver{color:var(--muted);font-weight:500}\
-.phead-date{margin:7px 0 0;color:var(--muted);font-size:13px}\
-.phead .summary{margin:9px 0 0}\
-.phead-install{width:min(100%,400px);flex:none}\
-.phead-install .snip{margin:0 0 10px}\
-.pcols{display:grid;gap:34px;margin-top:8px}\
+.phead-install{width:min(100%,440px);margin:16px 0 0}\
+.phead-install .snip{margin:0}\
+.phead-right{flex:none;text-align:right}\
+.phead-date{margin:0;color:var(--muted);font-size:13px}\
+.psummary{margin:0 -24px;padding:15px 24px;background:var(--card);border-bottom:1px solid var(--border)}\
+.psummary p{margin:0;color:var(--fg);font-size:16px}\
+.pcols{display:grid;gap:34px;margin-top:30px}\
 .pcontent{order:1}.pmeta{order:2}\
 @media(min-width:760px){.pcols{grid-template-columns:230px minmax(0,1fr)}.pcontent,.pmeta{order:0}}\
 .pmeta h2,.tabpanel>h2,.snip-label{font-size:12px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--muted)}\
@@ -492,23 +501,30 @@ pub fn project_html(
     } else {
         format!(" <span class=\"pver\">{}</span>", encode_text(selected))
     };
+    // The short description gets its own bar below the header (pypi.org leaves
+    // the banner to name + install + date).
     let summary = meta
         .and_then(|m| m.summary.as_deref())
-        .map(|s| format!("<p class=\"summary\">{}</p>", encode_text(s)))
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| format!("<div class=\"psummary\"><p>{}</p></div>", encode_text(s)))
         .unwrap_or_default();
     let released = newest_upload_date(&sel_files)
         .map(|d| format!("<p class=\"phead-date\">Released {}</p>", encode_text(&d)))
         .unwrap_or_default();
 
-    // Layout mirrors pypi.org: a slim brand strip, then a package banner (name
-    // + `uv add`), then a metadata sidebar on the LEFT (Navigation tabs +
-    // Verified/Unverified details) with the tab panels on the right.
+    // Layout mirrors pypi.org: a header band (distinct background) holding the
+    // brand strip and the package banner — name with `uv add` below it, the
+    // release date on the right — then the description bar, then a metadata
+    // sidebar on the LEFT (Navigation tabs + Verified/Unverified details) with
+    // the tab panels on the right.
     let body = format!(
-        "<header class=\"top\"><div class=\"brand\">{logo}\
+        "<div class=\"phead-band\">\
+<header class=\"top\"><div class=\"brand\">{logo}\
 <a class=\"home\" href=\"/\">pypiron</a></div>{index_copy}</header>\
-<header class=\"phead\"><div class=\"phead-main\">\
-<h1 class=\"phead-name\">{name}{ver}</h1>{released}{summary}</div>\
-<div class=\"phead-install\">{install}</div></header>\
+<header class=\"phead\">\
+<div class=\"phead-main\"><h1 class=\"phead-name\">{name}{ver}</h1>\
+<div class=\"phead-install\">{install}</div></div>\
+<div class=\"phead-right\">{released}</div></header></div>{summary}\
 <div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{verified}{unverified}</aside>\
 <div class=\"pcontent\">{desc}{history}{dl}</div></div>\
 <nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/projects/\">All packages</a> · \

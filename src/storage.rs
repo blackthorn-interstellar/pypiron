@@ -563,7 +563,17 @@ impl Storage for DiskStorage {
         };
         let mut files = Vec::new();
         while let Some(entry) = rd.next_entry().await? {
-            let md = entry.metadata().await?;
+            // The entry can vanish between readdir and this stat: a concurrent
+            // upload's temp sibling (tmp_sibling) is renamed/removed out from
+            // under us. It's gone for good and was never an artifact, so skip
+            // it — propagating ENOENT here spuriously fails the whole rebuild.
+            let md = match entry.metadata().await {
+                Ok(md) => md,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(anyhow::Error::from(e).context(format!("stat {dir_prefix}")));
+                }
+            };
             if md.is_file() {
                 if let Some(name) = entry.file_name().to_str() {
                     let last_modified = md

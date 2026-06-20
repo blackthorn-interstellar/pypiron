@@ -184,7 +184,16 @@ pub async fn run_worker_until(
             self.0.store(false, Ordering::SeqCst);
         }
     }
+    let mut last_inventory_refresh: Option<Instant> = None;
     loop {
+        // Every node (leader or follower) refreshes its in-memory inventory from
+        // the persisted view on a throttle — this is how the leader's published
+        // counts reach followers, who never run a tick or audit. Outside the
+        // leader gate on purpose.
+        if last_inventory_refresh.is_none_or(|t| t.elapsed() >= INVENTORY_REFRESH_INTERVAL) {
+            last_inventory_refresh = Some(Instant::now());
+            refresh_inventory(&state).await;
+        }
         let is_leader = match &lease {
             None => true,
             Some(lm) => lm.is_leader().await,
@@ -234,6 +243,54 @@ pub async fn run_worker_until(
 /// lost shard merely means its packages rebuild once.
 const STATE_PREFIX: &str = "_state/";
 
+/// How often each node refreshes its in-memory inventory from the persisted
+/// view. Followers never rebuild, so this is how the leader's value reaches
+/// them; a few seconds of homepage lag is fine for a glanceable stat.
+const INVENTORY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Storage key for the registry-inventory view (option 4): a tiny regenerable
+/// aggregate every node reads, so followers stay current without a sweep.
+fn inventory_key() -> String {
+    format!("{STATE_PREFIX}inventory.json")
+}
+
+/// Publish the aggregate to `_state/inventory.json` (so other nodes see it) and
+/// into the local metrics atomics (so this node's homepage and `/metrics` show
+/// it now). Best-effort: a failed persist only means followers lag until the
+/// next publish — it must never strand markers or fail a rebuild.
+async fn publish_inventory(state: &AppState, inv: crate::metrics::Inventory) {
+    state
+        .metrics
+        .set_inventory(inv.projects, inv.releases, inv.files, inv.bytes);
+    match serde_json::to_vec(&inv) {
+        Ok(bytes) => {
+            if let Err(e) = state
+                .storage
+                .put_bytes(&inventory_key(), bytes, Some("application/json"))
+                .await
+            {
+                warn!(error=?e, "inventory: persist failed (followers will lag)");
+            }
+        }
+        Err(e) => warn!(error=?e, "inventory: serialize failed"),
+    }
+}
+
+/// Refresh this node's in-memory inventory atomics from the persisted view.
+/// Runs on every node (leader and follower) so the published value propagates.
+/// A missing or unparseable object is left alone — the homepage shows nothing
+/// until the first sweep writes it (never panics; no `unwrap` on the worker
+/// path).
+async fn refresh_inventory(state: &AppState) {
+    if let Ok(bytes) = state.storage.get_bytes(&inventory_key()).await {
+        if let Ok(inv) = serde_json::from_slice::<crate::metrics::Inventory>(&bytes) {
+            state
+                .metrics
+                .set_inventory(inv.projects, inv.releases, inv.files, inv.bytes);
+        }
+    }
+}
+
 /// Audit sweep: detect-and-repair with cost proportional to *churn*, not
 /// corpus size. One flat listing per shard (1,000 keys per S3 request)
 /// covers truth and views; a package whose listing fingerprint matches the
@@ -249,7 +306,9 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
     let mut rebuilt = 0usize;
     let mut skipped = 0usize;
     let mut files = 0u64;
+    let mut bytes = 0u64;
     let mut releases = 0u64;
+    let mut pkg_stats: Vec<(String, PkgStat)> = Vec::new();
 
     // Shards enumerate in parallel — that is what the sharding is for. The
     // bound keeps peak memory at a few shards' worth of listings (a shard is
@@ -268,7 +327,9 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
                     skipped += result.skipped;
                     failures += result.failures;
                     files += result.files;
+                    bytes += result.bytes;
                     releases += result.releases;
+                    pkg_stats.extend(result.pkg_stats);
                 }
                 Err(e) => {
                     error!(shard=%shard, error=?e, "audit: shard failed");
@@ -296,8 +357,23 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
         .fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
     m.set_audit_duration(duration_secs);
     // `live` is sorted+deduped above, so its length is the distinct project
-    // count; releases/files were summed straight off the shard listings.
-    m.set_inventory(live.len() as u64, releases, files);
+    // count; releases/files/bytes were summed straight off the shard listings.
+    let totals = crate::metrics::Inventory {
+        projects: live.len() as u64,
+        releases,
+        files,
+        bytes,
+    };
+    // Authoritatively re-baseline the in-memory map from truth (heals any
+    // between-sweep delta drift, restores it after a restart), then publish the
+    // aggregate so every node — leader or follower — serves the current value.
+    {
+        let mut inv = state.inventory.lock().await;
+        inv.pkgs = pkg_stats.into_iter().collect();
+        inv.ready = true;
+        inv.dirty = false;
+    }
+    publish_inventory(state, totals).await;
     info!(
         packages = live.len(),
         rebuilt, skipped, duration_secs, "reconcile: sweep complete"
@@ -314,9 +390,14 @@ struct ShardAudit {
     skipped: usize,
     failures: usize,
     /// Inventory derived from the shard listing (no extra reads): artifact
-    /// files (sidecars excluded) and distinct `(project, version)` releases.
+    /// files (sidecars excluded), their total size in bytes, and distinct
+    /// `(project, version)` releases.
     files: u64,
+    bytes: u64,
     releases: u64,
+    /// Per-package stats for the live packages, used to re-baseline the
+    /// in-memory inventory map authoritatively each sweep.
+    pkg_stats: Vec<(String, PkgStat)>,
 }
 
 /// Audit every package whose name starts with `shard`.
@@ -359,7 +440,9 @@ async fn audit_shard(state: &AppState, shard: char, force_deep: bool) -> Result<
         skipped: 0,
         failures: 0,
         files: 0,
+        bytes: 0,
         releases: 0,
+        pkg_stats: Vec::new(),
     };
     let mut fresh: std::collections::HashMap<String, String> = Default::default();
     let mut packages: Vec<(String, String, bool)> = Vec::with_capacity(by_pkg.len());
@@ -369,19 +452,32 @@ async fn audit_shard(state: &AppState, shard: char, force_deep: bool) -> Result<
         // same bytes the fingerprint already walked, so the inventory is free.
         let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
         let mut versions: HashSet<String> = HashSet::new();
-        let mut file_count = 0u64;
+        let mut file_count = 0u32;
+        let mut pkg_bytes = 0u64;
         for obj in &t {
             if let Some(filename) = obj.key.strip_prefix(&prefix) {
                 if is_artifact(filename) {
                     file_count += 1;
+                    pkg_bytes += obj.size;
                     if let Some(version) = infer_version_from_filename(filename) {
                         versions.insert(version);
                     }
                 }
             }
         }
-        out.files += file_count;
+        out.files += file_count as u64;
+        out.bytes += pkg_bytes;
         out.releases += versions.len() as u64;
+        if file_count > 0 {
+            out.pkg_stats.push((
+                pkg.clone(),
+                PkgStat {
+                    files: file_count,
+                    releases: versions.len() as u32,
+                    bytes: pkg_bytes,
+                },
+            ));
+        }
         packages.push((pkg, fp, file_count > 0));
     }
 
@@ -582,6 +678,22 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
     // One batched global-index pass per tick: mass ingest of N new packages
     // rewrites the (corpus-sized) global views once, not N times.
     update_global_index(state, &adds, &removes).await?;
+    // Flush the inventory once per tick if this tick's rebuilds changed it
+    // (and a sweep has set the full baseline — before that the map is partial,
+    // so we let the audit publish). Batched like the global index: one write
+    // per tick, never one per package.
+    let pending = {
+        let mut inv = state.inventory.lock().await;
+        if inv.ready && inv.dirty {
+            inv.dirty = false;
+            Some(inv.totals())
+        } else {
+            None
+        }
+    };
+    if let Some(totals) = pending {
+        publish_inventory(state, totals).await;
+    }
     // Markers are consumed LAST — they are the transaction log, and must
     // outlive every write they announce (package views above, global index
     // here). Rebuild-then-delete is race-free because keys are unique: an
@@ -620,7 +732,7 @@ pub async fn rebuild_package_excluding(
     if let Some(omit) = omit {
         files.retain(|f| f.filename != omit);
     }
-    if files.is_empty() {
+    let stat = if files.is_empty() {
         let keys = [
             format!("{SIMPLE_PREFIX}{pkg}/index.html"),
             format!("{SIMPLE_PREFIX}{pkg}/index.json"),
@@ -629,10 +741,93 @@ pub async fn rebuild_package_excluding(
         for key in &keys {
             state.index_cache.invalidate(key);
         }
-        return Ok(false);
+        PkgStat::default()
+    } else {
+        write_pkg_indexes(state, pkg, &files).await?;
+        PkgStat::from_files(&files)
+    };
+    // Maintain the in-memory inventory from the unfiltered artifact list (truth,
+    // not the quarantine-filtered view). This is the one choke point every
+    // rebuild — tick, audit, delete — flows through, and `upsert` is an
+    // idempotent absolute set, so concurrent or repeated rebuilds never
+    // double-count. The audit re-baselines the whole map periodically.
+    state.inventory.lock().await.upsert(pkg, stat);
+    Ok(stat.files > 0)
+}
+
+/// One package's truth-faithful contribution to the registry inventory.
+/// Computed from the artifact list the rebuild already holds (the audit's exact
+/// method: distinct `infer_version_from_filename`, artifact `size` sum), so the
+/// two writers never disagree. `u32` counts are ample (thousands of files per
+/// package at most); bytes need `u64`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct PkgStat {
+    files: u32,
+    releases: u32,
+    bytes: u64,
+}
+
+impl PkgStat {
+    /// Stats for a package's artifacts. `files` are already artifact-only
+    /// (`list_artifacts` filters sidecars), so no further filtering here.
+    /// Releases are distinct inferred versions — the audit's exact method
+    /// (worker.rs audit_shard) — so the two writers can't disagree.
+    fn from_files(files: &[FileMetadata]) -> Self {
+        let mut versions: HashSet<String> = HashSet::new();
+        let mut bytes = 0u64;
+        for f in files {
+            bytes += f.size;
+            if let Some(v) = infer_version_from_filename(&f.filename) {
+                versions.insert(v);
+            }
+        }
+        PkgStat {
+            files: files.len() as u32,
+            releases: versions.len() as u32,
+            bytes,
+        }
     }
-    write_pkg_indexes(state, pkg, &files).await?;
-    Ok(true)
+}
+
+/// In-memory per-package inventory, the truth-faithful source of "old" for the
+/// between-sweep delta. Maintained on the leader by every rebuild (idempotent
+/// absolute set), re-baselined wholesale by each audit, and summed to publish
+/// `_state/inventory.json`. `ready` gates publishing until the first audit has
+/// established the full baseline; `dirty` marks an unpublished change.
+#[derive(Default)]
+pub(crate) struct InventoryMap {
+    pkgs: std::collections::HashMap<String, PkgStat>,
+    ready: bool,
+    dirty: bool,
+}
+
+impl InventoryMap {
+    /// Idempotent: set this package's absolute stats and flag a change. An
+    /// empty package (no artifacts) is removed. Safe from any caller — two
+    /// rebuilds of the same package converge to the same map.
+    fn upsert(&mut self, pkg: &str, stat: PkgStat) {
+        let changed = if stat.files == 0 {
+            self.pkgs.remove(pkg).is_some()
+        } else {
+            self.pkgs.insert(pkg.to_string(), stat) != Some(stat)
+        };
+        self.dirty |= changed;
+    }
+
+    /// Current aggregate, summed off the map. O(projects); only paid when we
+    /// publish (a changed tick or an audit), not per request.
+    fn totals(&self) -> crate::metrics::Inventory {
+        let mut inv = crate::metrics::Inventory {
+            projects: self.pkgs.len() as u64,
+            ..Default::default()
+        };
+        for s in self.pkgs.values() {
+            inv.releases += s.releases as u64;
+            inv.files += s.files as u64;
+            inv.bytes += s.bytes;
+        }
+        inv
+    }
 }
 
 /// The in-memory copy of the global index's name set, pinned to the ETag of
@@ -644,17 +839,9 @@ pub(crate) struct GlobalNames {
     names: HashSet<String>,
 }
 
-impl GlobalNames {
-    /// Number of package names in the materialized global index — the
-    /// dashboard's "packages hosted" figure, a free in-memory count.
-    pub(crate) fn len(&self) -> usize {
-        self.names.len()
-    }
-}
-
 /// All hosted package names, sorted — the human package browser's listing.
-/// Loads the global name set into memory on first use (same source and cache as
-/// the dashboard's count), so a freshly booted node still answers.
+/// Loads the global name set into memory on first use, so a freshly booted node
+/// still answers.
 pub async fn global_package_names(state: &AppState) -> Result<Vec<String>> {
     let mut guard = state.global_names.lock().await;
     if guard.is_none() {
@@ -1025,6 +1212,63 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    fn fm(filename: &str, size: u64) -> FileMetadata {
+        FileMetadata {
+            filename: filename.into(),
+            sha256: "x".into(),
+            size,
+            upload_time: None,
+            version: None,
+            yanked: Yanked::Flag(false),
+            requires_python: None,
+            core_metadata: false,
+            provenance: false,
+        }
+    }
+
+    #[test]
+    fn pkgstat_counts_files_distinct_versions_and_bytes() {
+        // Two versions of one project: 3 files, 2 releases, summed bytes.
+        let files = [
+            fm("six-1.16.0-py2.py3-none-any.whl", 100),
+            fm("six-1.16.0.tar.gz", 50),
+            fm("six-1.15.0-py2.py3-none-any.whl", 80),
+        ];
+        let stat = PkgStat::from_files(&files);
+        assert_eq!(stat.files, 3);
+        assert_eq!(stat.releases, 2);
+        assert_eq!(stat.bytes, 230);
+        assert_eq!(PkgStat::from_files(&[]), PkgStat::default());
+    }
+
+    #[test]
+    fn inventory_map_upsert_is_idempotent_and_totals_sum() {
+        let mut inv = InventoryMap::default();
+        let a = PkgStat::from_files(&[fm("a-1.0-py3-none-any.whl", 10)]);
+        inv.upsert("a", a);
+        assert!(inv.dirty);
+        inv.dirty = false;
+        // Re-applying the same absolute stat is a no-op (the audit re-running, or
+        // a duplicate marker, must not double-count).
+        inv.upsert("a", a);
+        assert!(!inv.dirty, "identical upsert must not mark dirty");
+
+        inv.upsert(
+            "b",
+            PkgStat::from_files(&[
+                fm("b-1.0-py3-none-any.whl", 20),
+                fm("b-2.0-py3-none-any.whl", 5),
+            ]),
+        );
+        let t = inv.totals();
+        assert_eq!((t.projects, t.releases, t.files, t.bytes), (2, 3, 3, 35));
+
+        // Going to zero artifacts removes the project (a delete that empties it).
+        inv.upsert("a", PkgStat::default());
+        let t = inv.totals();
+        assert_eq!((t.projects, t.releases, t.files, t.bytes), (1, 2, 2, 25));
+    }
+
     /// Storage stub whose `list_all("packages/...")` never returns — an audit
     /// sweep that takes forever. Everything else is a tiny in-memory object map.
     struct SweepStallsStorage {
@@ -1172,9 +1416,11 @@ mod tests {
             )),
             spool_dir: std::env::temp_dir(),
             global_names: Arc::new(tokio::sync::Mutex::new(None)),
+            inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             proxy: None,
+            started: std::time::Instant::now(),
         });
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1267,9 +1513,11 @@ mod tests {
             )),
             spool_dir: std::env::temp_dir(),
             global_names: Arc::new(tokio::sync::Mutex::new(None)),
+            inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             proxy: None,
+            started: std::time::Instant::now(),
         });
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

@@ -68,6 +68,9 @@ pub struct Metrics {
     inventory_projects: AtomicU64,
     inventory_releases: AtomicU64,
     inventory_files: AtomicU64,
+    /// Total bytes of artifact files (sidecars excluded), summed off the same
+    /// shard listings as the file count — the `size` already in each listing.
+    inventory_bytes: AtomicU64,
     /// Global-index CAS write-backs lost to a peer (reload-and-retry fired).
     /// A nonzero value is two nodes legitimately racing the name set — the
     /// proof that dual leadership is converging, not corrupting.
@@ -118,10 +121,11 @@ impl Metrics {
     }
 
     /// Publish the registry inventory measured by a clean sweep.
-    pub fn set_inventory(&self, projects: u64, releases: u64, files: u64) {
+    pub fn set_inventory(&self, projects: u64, releases: u64, files: u64, bytes: u64) {
         self.inventory_projects.store(projects, Ordering::Relaxed);
         self.inventory_releases.store(releases, Ordering::Relaxed);
         self.inventory_files.store(files, Ordering::Relaxed);
+        self.inventory_bytes.store(bytes, Ordering::Relaxed);
         self.inventory_ready.store(true, Ordering::Relaxed);
     }
 
@@ -133,6 +137,7 @@ impl Metrics {
                 projects: self.inventory_projects.load(Ordering::Relaxed),
                 releases: self.inventory_releases.load(Ordering::Relaxed),
                 files: self.inventory_files.load(Ordering::Relaxed),
+                bytes: self.inventory_bytes.load(Ordering::Relaxed),
             })
     }
 
@@ -262,6 +267,11 @@ impl Metrics {
                 "Artifact files, excluding sidecars (last sweep).",
                 self.inventory_files.load(Ordering::Relaxed),
             ),
+            (
+                "pypiron_registry_bytes",
+                "Total bytes of artifact files, excluding sidecars (last sweep).",
+                self.inventory_bytes.load(Ordering::Relaxed),
+            ),
         ] {
             out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
             out.push_str(&format!("{name} {value}\n"));
@@ -290,14 +300,23 @@ impl Metrics {
     }
 }
 
-/// Registry size at the last clean sweep: distinct projects with at least one
-/// artifact, distinct `(project, version)` releases, and artifact files
-/// (sidecar/metadata/provenance excluded). Shown under the homepage header.
-#[derive(Clone, Copy, Debug)]
+/// Registry size: distinct projects with at least one artifact, distinct
+/// `(project, version)` releases, and artifact files (sidecar/metadata/
+/// provenance excluded) with their total bytes. Shown under the homepage
+/// header, and the serialized form of the storage-backed view
+/// `_state/inventory.json` (see worker.rs). `#[serde(default)]` keeps an older
+/// or truncated object readable as zeros rather than a parse error.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Inventory {
+    #[serde(default)]
     pub projects: u64,
+    #[serde(default)]
     pub releases: u64,
+    #[serde(default)]
     pub files: u64,
+    /// Total bytes of those artifact files (sidecars excluded).
+    #[serde(default)]
+    pub bytes: u64,
 }
 
 /// A copy of the request counters at one instant, with the derived numbers the
@@ -430,14 +449,18 @@ mod tests {
         // Gauges are present (at zero) before the first sweep.
         assert!(m.render().contains("pypiron_registry_projects 0"));
 
-        m.set_inventory(12, 345, 6789);
+        m.set_inventory(12, 345, 6789, 1_048_576);
         let inv = m.inventory().expect("inventory set");
-        assert_eq!((inv.projects, inv.releases, inv.files), (12, 345, 6789));
+        assert_eq!(
+            (inv.projects, inv.releases, inv.files, inv.bytes),
+            (12, 345, 6789, 1_048_576)
+        );
         let text = m.render();
         assert!(text.contains("# TYPE pypiron_registry_releases gauge"));
         assert!(text.contains("pypiron_registry_projects 12"));
         assert!(text.contains("pypiron_registry_releases 345"));
         assert!(text.contains("pypiron_registry_files 6789"));
+        assert!(text.contains("pypiron_registry_bytes 1048576"));
     }
 
     #[test]

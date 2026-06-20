@@ -1,8 +1,8 @@
-//! Human-facing HTML: the root landing page (`/`) — config card with a live
-//! activity panel folded in for authorized readers — plus the package browser
-//! (`/projects/`) and per-project pages. Self-contained — inline CSS, an
-//! embedded base64 logo, and a few lines of copy-button JS. No external
-//! requests, no framework, no new
+//! Human-facing HTML: the root landing page (`/`) — search box, registry
+//! inventory, and server status, with a live activity panel folded in for
+//! authorized readers — plus the package browser / search results (`/projects/`)
+//! and per-project pages. Self-contained — inline CSS, an embedded base64 logo,
+//! and a few lines of copy-button JS. No external requests, no framework, no new
 //! dependency. The PEP simple-API rendering lives in [`crate::render`]; this is
 //! the front door a human sees in a browser.
 //!
@@ -34,6 +34,18 @@ fn logo_data_uri() -> &'static str {
     })
 }
 
+/// The logo `<img>` wrapped in a link to pypiron's PyPI project page. Static
+/// markup (no request data); opens in a new tab so it doesn't navigate the
+/// operator away from the running server's UI.
+fn logo_link() -> String {
+    format!(
+        "<a class=\"logo-link\" href=\"https://pypi.org/project/pypiron/\" \
+target=\"_blank\" rel=\"noopener noreferrer\">\
+<img class=\"logo\" src=\"{logo}\" width=\"110\" height=\"128\" alt=\"pypiron logo\"></a>",
+        logo = logo_data_uri(),
+    )
+}
+
 /// Request-derived context shared by both pages.
 pub struct PageContext {
     /// `scheme://host`, no trailing slash, built from the request headers.
@@ -44,6 +56,8 @@ pub struct PageContext {
     pub delivery: &'static str,
     /// Whether a read credential is configured (reads are gated).
     pub reads_authenticated: bool,
+    /// Seconds since process start, for the homepage uptime readout.
+    pub uptime_secs: u64,
 }
 
 /// Live counters for the homepage's activity panel. Only built (and only
@@ -53,7 +67,6 @@ pub struct DashboardData<'a> {
     pub snapshot: &'a MetricsSnapshot,
     pub cache_hits: u64,
     pub cache_misses: u64,
-    pub packages_hosted: usize,
 }
 
 const PAGE_CSS: &str = "\
@@ -65,6 +78,7 @@ main{width:100%;max-width:720px;padding:52px 24px 72px}\
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
 .hero{text-align:center;margin-bottom:36px}\
 .logo{height:104px;width:auto}\
+.logo-link{display:inline-flex;line-height:0}\
 .hero.compact .logo{height:56px}\
 h1{margin:14px 0 4px;font-size:30px;letter-spacing:-.02em}\
 .tag{margin:0;color:var(--muted)}\
@@ -85,7 +99,7 @@ code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
 .links{margin-top:30px;text-align:center;color:var(--muted)}\
 .ver{margin-top:8px;text-align:center;color:var(--muted);font-size:13px}\
 .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin:8px 0 30px}\
-@media(min-width:560px){.stats{grid-template-columns:repeat(4,1fr)}}\
+@media(min-width:560px){.stats{grid-template-columns:repeat(3,1fr)}}\
 .stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px}\
 .stat .num{font-size:26px;font-weight:650;letter-spacing:-.01em}\
 .stat .lbl{margin-top:2px;color:var(--muted);font-size:12px}\
@@ -119,13 +133,37 @@ table.files-t td{border-bottom:1px solid var(--border);padding:6px 8px;vertical-
 .muted-s{color:var(--muted);font-size:13px}\
 .filter{width:100%;font:inherit;padding:9px 12px;margin:0 0 18px;background:var(--card);color:var(--fg);border:1px solid var(--border);border-radius:8px}\
 .pkglist{list-style:none;margin:0;padding:0;columns:3 200px;column-gap:24px}\
-.pkglist li{break-inside:avoid;padding:3px 0}";
+.pkglist li{break-inside:avoid;padding:3px 0}\
+.top{display:flex;align-items:center;justify-content:space-between;gap:16px 24px;flex-wrap:wrap;margin-bottom:34px}\
+.brand{display:flex;align-items:center;gap:14px;min-width:0}\
+.brand .logo{height:52px;width:auto}\
+.brand h1{margin:0;font-size:23px;letter-spacing:-.02em}\
+.brand .tag{margin:2px 0 0;font-size:13px}\
+.idx{display:flex;flex-direction:column;align-items:flex-end;gap:6px;margin-left:auto;color:var(--muted);min-width:0}\
+.idx-row{display:flex;align-items:center;gap:8px}\
+.idx-label{font-size:10px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;white-space:nowrap}\
+.idx-url{font:10.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code);border:1px solid var(--border);border-radius:6px;padding:2px 7px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
+.idx .copy{font-size:11px;padding:1px 9px}\
+.search{display:flex;gap:10px;margin:8px 0 12px}\
+.search-input{flex:1;min-width:0;font:inherit;font-size:17px;padding:14px 18px;background:var(--card);color:var(--fg);border:1px solid var(--border);border-radius:10px}\
+.search-input:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:var(--accent)}\
+.search-btn{font:inherit;font-weight:600;cursor:pointer;color:#fff;background:var(--accent);border:1px solid var(--accent);border-radius:10px;padding:0 22px}\
+.search-btn:hover{filter:brightness(1.06)}\
+.browse{margin:0 0 30px;text-align:center;font-size:14px}\
+.cfg{margin-top:40px;border-top:1px solid var(--border);padding-top:22px}\
+.section-label{margin:0 0 10px;font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);text-align:center}\
+.status{display:flex;flex-wrap:wrap;justify-content:center;gap:8px 22px;margin:0;color:var(--muted);font-size:13px}\
+.status b{color:var(--fg);font-weight:600}\
+.tip{position:relative;cursor:help}\
+.tip:hover::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 9px);transform:translateX(-50%);width:max-content;max-width:230px;padding:8px 11px;border-radius:7px;background:var(--card);color:var(--fg);border:1px solid var(--border);box-shadow:0 8px 24px rgba(0,0,0,.18);font-size:12px;font-weight:400;line-height:1.45;letter-spacing:normal;text-transform:none;text-align:left;white-space:normal;z-index:20;pointer-events:none}\
+.tip:hover::before{content:'';position:absolute;left:50%;bottom:calc(100% + 4px);transform:translateX(-50%);border:5px solid transparent;border-top-color:var(--border);z-index:20}";
 
 /// Copy-to-clipboard wiring for the landing page's snippet blocks. Tiny and
 /// dependency-free; the page is fully readable without it.
 const COPY_JS: &str = "<script>\
 document.querySelectorAll('.copy').forEach(function(b){b.addEventListener('click',function(){\
-var c=b.closest('.snip').querySelector('code').innerText;\
+var box=b.closest('.snip')||b.closest('.idx');if(!box)return;\
+var c=box.querySelector('code').innerText;\
 navigator.clipboard.writeText(c).then(function(){var o=b.textContent;b.textContent='Copied';b.classList.add('ok');\
 setTimeout(function(){b.textContent=o;b.classList.remove('ok')},1200)})})});\
 </script>";
@@ -163,45 +201,46 @@ fn snippet(label: &str, code: &str) -> String {
     )
 }
 
-/// The registry-size row shown under the header: projects · releases · files.
-/// Public (counts only, no names), measured by the last sweep.
+/// The registry-size row: projects · releases · files · bytes stored. Public
+/// (counts and total size only, no names), measured by the last sweep.
 fn inventory_row(inv: &Inventory) -> String {
     format!(
         "<section class=\"inv\">\
 <span><b>{projects}</b> projects</span>\
 <span><b>{releases}</b> releases</span>\
-<span><b>{files}</b> files</span></section>",
+<span><b>{files}</b> files</span>\
+<span><b>{size}</b> stored</span></section>",
         projects = group_thousands(inv.projects),
         releases = group_thousands(inv.releases),
         files = group_thousands(inv.files),
+        size = human_size(inv.bytes),
     )
 }
 
-/// The root landing page: what this server is, plus the one index URL a client
-/// needs. `inventory` (registry size, public) renders under the header when a
-/// sweep has measured it. When `dash` is present (the viewer is an authorized
-/// reader) the live activity panel is rendered inline below; otherwise the
-/// front door stays a public config card with no traffic stats.
+/// The root landing page: a search box front and center (the package browser
+/// at `/projects/` is the results page), then the registry inventory and server
+/// status. The one index URL a client needs sits top-right, de-emphasized but
+/// copyable. `inventory` (registry size, public) renders when a sweep has
+/// measured it. When `dash` is present (the viewer is an authorized reader) the
+/// live activity panel folds in below; otherwise the front door leaks no stats.
 pub fn landing_html(
     ctx: &PageContext,
     inventory: Option<&Inventory>,
     dash: Option<&DashboardData>,
 ) -> String {
     let index_url = format!("{}/simple/", ctx.base_url);
-    let snippet = snippet("Index URL", &index_url);
+    // Top-right, de-emphasized: the one index URL, copyable. It is request-
+    // derived, so it's escaped as text (never an attribute) and the copy button
+    // reads it straight from the DOM — no client-controlled value in an attr.
+    let index_copy = format!(
+        "<div class=\"idx\"><code class=\"idx-url\">{url}</code>\
+<div class=\"idx-row\"><span class=\"idx-label\">Index URL</span>\
+<button class=\"copy\" type=\"button\">Copy</button></div></div>",
+        url = encode_text(&index_url),
+    );
 
     let inv = inventory.map(inventory_row).unwrap_or_default();
-
-    let caps = format!(
-        "<p class=\"caps\">proxy <b>{proxy}</b> · delivery <b>{delivery}</b> · reads <b>{reads}</b></p>",
-        proxy = if ctx.proxy_enabled { "on" } else { "off" },
-        delivery = encode_text(ctx.delivery),
-        reads = if ctx.reads_authenticated {
-            "authenticated"
-        } else {
-            "public"
-        },
-    );
+    let status = server_status(ctx);
     let note = if ctx.reads_authenticated {
         "<p class=\"note\">🔒 Reads require a credential — embed it in the index URL \
 (<code>https://user:pass@host/simple/</code>) or your client's keyring.</p>"
@@ -212,26 +251,97 @@ pub fn landing_html(
     let activity = dash.map(metrics_section).unwrap_or_default();
 
     let body = format!(
-        "<header class=\"hero\"><img class=\"logo\" src=\"{logo}\" width=\"110\" height=\"128\" \
-alt=\"pypiron logo\"><h1>pypiron</h1><p class=\"tag\">An ultra-fast PyPI server written in \
-Rust.</p></header>{inv}{snippet}{caps}{note}{activity}\
-<nav class=\"links\"><a href=\"/projects/\">Browse packages</a> · <a href=\"/health\">Health</a> \
-· <a href=\"/metrics\">Metrics</a></nav>\
+        "<header class=\"top\"><div class=\"brand\">\
+{logo}\
+<div class=\"brand-txt\"><h1>pypiron</h1>\
+<p class=\"tag\">An ultra-fast PyPI server written in Rust.</p></div></div>{index_copy}</header>\
+<form class=\"search\" method=\"get\" action=\"/projects/\" role=\"search\">\
+<input class=\"search-input\" type=\"search\" name=\"q\" placeholder=\"Search packages…\" \
+aria-label=\"Search packages\" autocomplete=\"off\" autofocus>\
+<button class=\"search-btn\" type=\"submit\">Search</button></form>\
+<p class=\"browse\"><a href=\"/projects/\">Browse all packages →</a></p>\
+{inv}{status}{note}{activity}\
+<nav class=\"links\"><a href=\"/health\">Health</a> · <a href=\"/metrics\">Metrics</a></nav>\
 <p class=\"ver\">pypiron v{version}</p>",
-        logo = logo_data_uri(),
+        logo = logo_link(),
         version = encode_text(ctx.version),
     );
     shell("pypiron", &body, true, false)
 }
 
-/// The human package browser (`/projects/`): every hosted package, linked to
-/// its project page, with a client-side filter box. `packages` must be sorted.
-pub fn projects_html(ctx: &PageContext, packages: &[String]) -> String {
-    let count = packages.len();
-    let list = if packages.is_empty() {
-        "<p class=\"empty\">No packages hosted yet.</p>".to_string()
+/// The labelled configuration section: posture settings (proxy, delivery,
+/// reads) plus uptime, each carrying a hover tooltip that explains it. Public —
+/// these are deployment facts, not traffic stats. The `data-tip` strings are
+/// static (no request data), so they go straight into the attribute.
+fn server_status(ctx: &PageContext) -> String {
+    format!(
+        "<section class=\"cfg\"><h2 class=\"section-label\">Configuration</h2>\
+<div class=\"status\">\
+<span class=\"tip\" data-tip=\"On-demand mirroring of an upstream index. When on, packages not hosted here are fetched and cached from upstream on first request.\">proxy <b>{proxy}</b></span>\
+<span class=\"tip\" data-tip=\"How package files reach clients: stream the bytes through this node, redirect to object storage, or auto (per client).\">delivery <b>{delivery}</b></span>\
+<span class=\"tip\" data-tip=\"Whether downloading packages requires a credential. public: open to anyone. authenticated: a read credential is required.\">reads <b>{reads}</b></span>\
+<span class=\"tip\" data-tip=\"Time since this server process started.\">uptime <b>{uptime}</b></span>\
+</div></section>",
+        proxy = if ctx.proxy_enabled { "on" } else { "off" },
+        delivery = encode_text(ctx.delivery),
+        reads = if ctx.reads_authenticated {
+            "authenticated"
+        } else {
+            "public"
+        },
+        uptime = human_duration(ctx.uptime_secs),
+    )
+}
+
+/// Seconds as a compact uptime (`5d 3h`, `12m 4s`). The two coarsest nonzero
+/// units, coarsest first — boring, no dependency.
+fn human_duration(secs: u64) -> String {
+    let (d, h, m, s) = (
+        secs / 86400,
+        (secs % 86400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
     } else {
-        let items: String = packages
+        format!("{s}s")
+    }
+}
+
+/// The human package browser (`/projects/`) — and the search results page. Lists
+/// hosted packages, each linked to its project page, behind a search box that
+/// doubles as a live client-side filter. `packages` must be sorted; a non-empty
+/// `query` narrows the list to case-insensitive substring matches server-side
+/// (so a result page stays small even on a large mirror) and pre-fills the box.
+pub fn projects_html(ctx: &PageContext, packages: &[String], query: &str) -> String {
+    let q = query.trim();
+    let matches: Vec<&String> = if q.is_empty() {
+        packages.iter().collect()
+    } else {
+        let needle = q.to_lowercase();
+        packages
+            .iter()
+            .filter(|p| p.to_lowercase().contains(&needle))
+            .collect()
+    };
+    let count = matches.len();
+
+    // The search box submits to this same page (no-JS fallback) while the live
+    // filter narrows the rendered list client-side. Pre-filled with the query.
+    let search = format!(
+        "<form class=\"searchform\" method=\"get\" action=\"/projects/\" role=\"search\">\
+<input class=\"filter\" type=\"search\" name=\"q\" value=\"{q}\" placeholder=\"Search packages…\" \
+aria-label=\"Search packages\" autocomplete=\"off\" autofocus></form>",
+        q = encode_double_quoted_attribute(q),
+    );
+
+    let list = if !matches.is_empty() {
+        let items: String = matches
             .iter()
             .map(|p| {
                 format!(
@@ -241,18 +351,27 @@ pub fn projects_html(ctx: &PageContext, packages: &[String]) -> String {
                 )
             })
             .collect();
+        format!("{search}<ul class=\"pkglist\">{items}</ul>")
+    } else if q.is_empty() {
+        "<p class=\"empty\">No packages hosted yet.</p>".to_string()
+    } else {
         format!(
-            "<input class=\"filter\" type=\"search\" placeholder=\"Filter packages…\" \
-aria-label=\"Filter packages\" autocomplete=\"off\"><ul class=\"pkglist\">{items}</ul>"
+            "{search}<p class=\"empty\">No packages match “{q}”.</p>",
+            q = encode_text(q),
         )
     };
 
+    let tag = if q.is_empty() {
+        format!("{count} hosted")
+    } else {
+        format!("{count} matching “{}”", encode_text(q))
+    };
+
     let body = format!(
-        "<header class=\"hero compact\"><img class=\"logo\" src=\"{logo}\" width=\"110\" height=\"128\" \
-alt=\"pypiron logo\"><h1>Packages</h1><p class=\"tag\">{count} hosted</p></header>{list}\
+        "<header class=\"hero compact\">{logo}<h1>Packages</h1><p class=\"tag\">{tag}</p></header>{list}\
 <nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/simple/\">Simple index</a></nav>\
 <p class=\"ver\">pypiron v{version}</p>{FILTER_JS}",
-        logo = logo_data_uri(),
+        logo = logo_link(),
         version = encode_text(ctx.version),
     );
     shell("pypiron · packages", &body, false, false)
@@ -299,14 +418,13 @@ pub fn project_html(
     };
 
     let body = format!(
-        "<header class=\"hero compact\"><img class=\"logo\" src=\"{logo}\" width=\"110\" height=\"128\" \
-alt=\"pypiron logo\"><h1>{name}{ver}</h1>{summary}</header>\
+        "<header class=\"hero compact\">{logo}<h1>{name}{ver}</h1>{summary}</header>\
 <div class=\"pcols\"><div class=\"pcontent\">{install}{readme}{files_table}</div>\
 <aside class=\"pmeta\">{sidebar}</aside></div>\
 <nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/projects/\">All packages</a> · \
 <a href=\"/simple/{name}/\">Simple index</a></nav>\
 <p class=\"ver\">pypiron v{appver}</p>",
-        logo = logo_data_uri(),
+        logo = logo_link(),
         name = encode_text(pkg),
         ver = if version.is_empty() {
             String::new()
@@ -484,11 +602,9 @@ fn metrics_section(d: &DashboardData) -> String {
 <div class=\"stat\"><div class=\"num\">{total}</div><div class=\"lbl\">Total requests</div></div>\
 <div class=\"stat\"><div class=\"num\">{files_served}</div><div class=\"lbl\">Files served</div></div>\
 <div class=\"stat\"><div class=\"num\">{hit_rate}</div><div class=\"lbl\">Index cache hit rate</div></div>\
-<div class=\"stat\"><div class=\"num\">{packages}</div><div class=\"lbl\">Packages hosted</div></div>\
 </section>",
         total = group_thousands(total),
         files_served = group_thousands(files_served),
-        packages = group_thousands(d.packages_hosted as u64),
     );
 
     let mut projects = snap.project_totals();
@@ -511,7 +627,8 @@ they carry a basic-auth username tag.",
     let routes_chart = svg_bar_chart(&routes, "No requests recorded yet.");
 
     format!(
-        "<section class=\"activity\"><p class=\"cap\">live activity · this node · since process start</p>\
+        "<section class=\"activity\"><h2 class=\"section-label\">Metrics</h2>\
+<p class=\"cap\">live activity · this node · since process start</p>\
 {stats}\
 <section class=\"chart\"><h2>Top projects</h2>{projects_chart}</section>\
 <section class=\"chart\"><h2>Top route groups</h2>{routes_chart}</section></section>",
@@ -597,27 +714,87 @@ mod tests {
             proxy_enabled: true,
             delivery: "stream",
             reads_authenticated: false,
+            uptime_secs: 3661, // 1h 1m 1s
         }
     }
 
     #[test]
-    fn landing_shows_index_url_logo_and_tagline_only() {
+    fn landing_leads_with_search_and_keeps_index_url_and_status() {
         let html = landing_html(&ctx(), None, None);
         assert!(html.contains("data:image/png;base64,"));
         assert!(html.contains("An ultra-fast PyPI server written in Rust."));
-        // The one index URL is offered (with a copy button)...
+        // The logo links to pypiron's PyPI project page.
+        assert!(html.contains("href=\"https://pypi.org/project/pypiron/\""));
+        // Search is the focus: a GET form to the browser/results page.
+        assert!(html.contains("class=\"search\""));
+        assert!(html.contains("action=\"/projects/\""));
+        assert!(html.contains("name=\"q\""));
+        // The one index URL is still offered (de-emphasized, top-right) with a
+        // working copy button...
+        assert!(html.contains("class=\"idx\""));
         assert!(html.contains("https://pkgs.example.com/simple/"));
         assert!(html.contains("navigator.clipboard.writeText"));
         // ...and the per-client command boxes are gone.
         assert!(!html.contains("uv pip install"));
         assert!(!html.contains("poetry source add"));
         assert!(!html.contains("twine upload"));
+        // A browse-all link sits right under the search box.
+        assert!(html.contains("class=\"browse\""));
+        assert!(html.contains("Browse all packages"));
+        // Config section is labelled, and each setting carries a hover tooltip.
+        assert!(html.contains("<h2 class=\"section-label\">Configuration</h2>"));
+        assert!(html.contains("class=\"tip\" data-tip="));
+        // Server status shows settings and uptime.
         assert!(html.contains("proxy <b>on</b>"));
         assert!(html.contains("reads <b>public</b>"));
+        assert!(html.contains("uptime <b>1h 1m</b>"));
         // No inventory and no dashboard data -> neither panel.
         assert!(!html.contains("class=\"inv\""));
         assert!(!html.contains("class=\"activity\""));
         assert!(!html.contains("Top projects"));
+    }
+
+    #[test]
+    fn projects_lists_all_without_a_query() {
+        let pkgs = vec!["alpha".to_string(), "beta".to_string()];
+        let html = projects_html(&ctx(), &pkgs, "");
+        assert!(html.contains("href=\"/project/alpha/\""));
+        assert!(html.contains("href=\"/project/beta/\""));
+        assert!(html.contains("2 hosted"));
+        assert!(html.contains("class=\"filter\"")); // the search/filter box
+    }
+
+    #[test]
+    fn projects_filters_to_substring_matches_and_prefills_the_box() {
+        let pkgs = vec![
+            "alpha".to_string(),
+            "alpha-utils".to_string(),
+            "beta".to_string(),
+        ];
+        let html = projects_html(&ctx(), &pkgs, "ALPHA"); // case-insensitive
+        assert!(html.contains("href=\"/project/alpha/\""));
+        assert!(html.contains("href=\"/project/alpha-utils/\""));
+        assert!(!html.contains("href=\"/project/beta/\""));
+        assert!(html.contains("2 matching"));
+        assert!(html.contains("value=\"ALPHA\"")); // box pre-filled with query
+    }
+
+    #[test]
+    fn projects_reports_no_match_but_keeps_the_box() {
+        let pkgs = vec!["alpha".to_string()];
+        let html = projects_html(&ctx(), &pkgs, "zzz");
+        assert!(html.contains("No packages match"));
+        assert!(html.contains("value=\"zzz\""));
+        assert!(!html.contains("class=\"pkglist\""));
+    }
+
+    #[test]
+    fn human_duration_picks_the_two_coarsest_units() {
+        assert_eq!(human_duration(0), "0s");
+        assert_eq!(human_duration(45), "45s");
+        assert_eq!(human_duration(125), "2m 5s");
+        assert_eq!(human_duration(3 * 3600 + 12 * 60), "3h 12m");
+        assert_eq!(human_duration(5 * 86400 + 3 * 3600 + 59 * 60), "5d 3h");
     }
 
     #[test]
@@ -635,12 +812,14 @@ mod tests {
             projects: 1234,
             releases: 56789,
             files: 90123,
+            bytes: 1_572_864, // 1.5 MB
         };
         let html = landing_html(&ctx(), Some(&inv), None);
         assert!(html.contains("class=\"inv\""));
         assert!(html.contains("<b>1,234</b> projects"));
         assert!(html.contains("<b>56,789</b> releases"));
         assert!(html.contains("<b>90,123</b> files"));
+        assert!(html.contains("<b>1.5 MB</b> stored"));
     }
 
     #[test]
@@ -664,17 +843,19 @@ mod tests {
             snapshot: &snap,
             cache_hits: 9,
             cache_misses: 1,
-            packages_hosted: 1234,
         };
         let html = landing_html(&ctx(), None, Some(&dash));
         // Index URL still present...
         assert!(html.contains("https://pkgs.example.com/simple/"));
-        // ...with the activity panel folded in.
+        // ...with the activity panel folded in, under a "Metrics" label.
         assert!(html.contains("class=\"activity\""));
+        assert!(html.contains("<h2 class=\"section-label\">Metrics</h2>"));
         assert!(html.contains("Total requests"));
-        assert!(html.contains("Packages hosted"));
-        assert!(html.contains("1,234")); // grouped package count
+        assert!(html.contains("Files served"));
         assert!(html.contains("90%")); // cache hit rate 9/(9+1)
+                                       // The redundant "Packages hosted" tile is gone — registry size lives in
+                                       // the inventory row instead.
+        assert!(!html.contains("Packages hosted"));
         assert!(html.contains("billing-api"));
         assert!(html.contains("<svg")); // inline SVG charts
     }
@@ -686,7 +867,6 @@ mod tests {
             snapshot: &snap,
             cache_hits: 0,
             cache_misses: 0,
-            packages_hosted: 0,
         };
         let html = landing_html(&ctx(), None, Some(&dash));
         assert!(html.contains("—"));

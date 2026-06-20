@@ -2,7 +2,8 @@
 
 # --- build stage -------------------------------------------------------------
 # Full (non-slim) rust image: it ships gcc, which the linker needs.
-FROM rust:1.85-bookworm AS builder
+# Needs >=1.88: object_store 0.13.2 uses let-chains despite declaring MSRV 1.85.
+FROM rust:1.90-bookworm AS builder
 
 WORKDIR /usr/src/pypiron
 COPY . .

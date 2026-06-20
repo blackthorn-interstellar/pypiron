@@ -38,15 +38,40 @@ fn logo_data_uri() -> &'static str {
     })
 }
 
-/// The logo `<img>` wrapped in a link to pypiron's PyPI project page. Static
-/// markup (no request data); opens in a new tab so it doesn't navigate the
-/// operator away from the running server's UI.
+/// The logo `<img>` wrapped in a link to this server's root. Static markup (no
+/// request data).
 fn logo_link() -> String {
     format!(
-        "<a class=\"logo-link\" href=\"https://pypi.org/project/pypiron/\" \
-target=\"_blank\" rel=\"noopener noreferrer\">\
+        "<a class=\"logo-link\" href=\"/\">\
 <img class=\"logo\" src=\"{logo}\" width=\"110\" height=\"128\" alt=\"pypiron logo\"></a>",
         logo = logo_data_uri(),
+    )
+}
+
+/// The page footer: the pypiron wordmark linking to its PyPI project page, plus
+/// the running version. Opens in a new tab so it doesn't leave the server's UI.
+fn version_footer(version: &str) -> String {
+    format!(
+        "<p class=\"ver\"><a href=\"https://pypi.org/project/pypiron/\" \
+target=\"_blank\" rel=\"noopener noreferrer\">pypiron</a> v{}</p>",
+        encode_text(version),
+    )
+}
+
+/// A copyable command/URL field, pypi.org-style: the text in a bordered field
+/// with the copy button attached on its right edge, no label. Sizes to its
+/// content and scrolls horizontally rather than overflowing. `text` is escaped.
+fn copy_field(text: &str, extra_class: &str, aria: &str) -> String {
+    format!(
+        "<div class=\"install{extra_class}\"><code>{text}</code>\
+<button class=\"copy\" type=\"button\" aria-label=\"{aria}\">Copy</button></div>",
+        extra_class = if extra_class.is_empty() {
+            String::new()
+        } else {
+            format!(" {extra_class}")
+        },
+        text = encode_text(text),
+        aria = encode_text(aria),
     )
 }
 
@@ -149,8 +174,6 @@ main.wide{max-width:1000px;padding-top:0}\
 .pmeta h2,.tabpanel>h2,.snip-label{font-size:12px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--muted)}\
 .pmeta>div,.pmeta>section{margin-bottom:22px}\
 .pmeta h2{margin:0 0 6px}\
-.pmeta h3{font-size:11px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);margin:0 0 5px}\
-.pmeta .sb-block{margin:0 0 14px}\
 .pmeta .vals{list-style:none;margin:0;padding:0}\
 .pmeta .vals li{margin:2px 0;word-break:break-word}\
 .pmeta .pill{font-size:13px}\
@@ -198,11 +221,7 @@ table.files-t td{border-bottom:1px solid var(--border);padding:6px 8px;vertical-
 .brand .logo{height:52px;width:auto}\
 .brand h1{margin:0;font-size:23px;letter-spacing:-.02em}\
 .brand .tag{margin:2px 0 0;font-size:13px}\
-.idx{display:flex;flex-direction:column;align-items:flex-end;gap:6px;margin-left:auto;color:var(--muted);min-width:0}\
-.idx-row{display:flex;align-items:center;gap:8px}\
-.idx-label{font-size:10px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;white-space:nowrap}\
-.idx-url{font:10.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code);border:1px solid var(--border);border-radius:6px;padding:2px 7px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
-.idx .copy{font-size:11px;padding:1px 9px}\
+.idxbox{margin-left:auto;max-width:min(100%,360px);font-size:12px}\
 .search{display:flex;gap:10px;margin:8px 0 12px}\
 .search-input{flex:1;min-width:0;font:inherit;font-size:17px;padding:14px 18px;background:var(--card);color:var(--fg);border:1px solid var(--border);border-radius:10px}\
 .search-input:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:var(--accent)}\
@@ -221,7 +240,7 @@ table.files-t td{border-bottom:1px solid var(--border);padding:6px 8px;vertical-
 /// dependency-free; the page is fully readable without it.
 const COPY_JS: &str = "<script>\
 document.querySelectorAll('.copy').forEach(function(b){b.addEventListener('click',function(){\
-var box=b.closest('.install')||b.closest('.snip')||b.closest('.idx');if(!box)return;\
+var box=b.closest('.install')||b.closest('.snip');if(!box)return;\
 var c=box.querySelector('code').innerText;\
 navigator.clipboard.writeText(c).then(function(){var o=b.textContent;b.textContent='Copied';b.classList.add('ok');\
 setTimeout(function(){b.textContent=o;b.classList.remove('ok')},1200)})})});\
@@ -258,21 +277,11 @@ fn shell(title: &str, banner: &str, body: &str, copy_js: bool, wide: bool) -> St
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<meta name=\"referrer\" content=\"no-referrer\">\
 <title>{title}</title><style>{PAGE_CSS}</style></head><body>{banner}<main{cls}>{body}</main>{js}</body></html>",
         title = encode_text(title),
         cls = if wide { " class=\"wide\"" } else { "" },
         js = if copy_js { COPY_JS } else { "" },
-    )
-}
-
-/// The package banner's copyable install command, pypi.org-style: the command in
-/// a bordered field with the copy button attached on its right edge, no label.
-/// The box sizes to its content and scrolls horizontally rather than overflowing.
-fn install_box(cmd: &str) -> String {
-    format!(
-        "<div class=\"install\"><code>{}</code>\
-<button class=\"copy\" type=\"button\" aria-label=\"Copy install command\">Copy</button></div>",
-        encode_text(cmd),
     )
 }
 
@@ -304,15 +313,10 @@ pub fn landing_html(
     dash: Option<&DashboardData>,
 ) -> String {
     let index_url = format!("{}/simple/", ctx.base_url);
-    // Top-right, de-emphasized: the one index URL, copyable. It is request-
-    // derived, so it's escaped as text (never an attribute) and the copy button
-    // reads it straight from the DOM — no client-controlled value in an attr.
-    let index_copy = format!(
-        "<div class=\"idx\"><code class=\"idx-url\">{url}</code>\
-<div class=\"idx-row\"><span class=\"idx-label\">Index URL</span>\
-<button class=\"copy\" type=\"button\">Copy</button></div></div>",
-        url = encode_text(&index_url),
-    );
+    // Top-right: the one index URL in a copy field (same style as `uv add`). The
+    // command-box copy button reads the text from the DOM, so the request-derived
+    // URL never rides in an attribute.
+    let index_copy = copy_field(&index_url, "idxbox", "Copy index URL");
 
     let inv = inventory.map(inventory_row).unwrap_or_default();
     let status = server_status(ctx);
@@ -337,9 +341,9 @@ aria-label=\"Search packages\" autocomplete=\"off\" autofocus>\
 <p class=\"browse\"><a href=\"/projects/\">Browse all packages →</a></p>\
 {inv}{status}{note}{activity}\
 <nav class=\"links\"><a href=\"/health\">Health</a> · <a href=\"/metrics\">Metrics</a></nav>\
-<p class=\"ver\">pypiron v{version}</p>",
+{footer}",
         logo = logo_link(),
-        version = encode_text(ctx.version),
+        footer = version_footer(ctx.version),
     );
     shell("pypiron", "", &body, true, false)
 }
@@ -445,9 +449,9 @@ aria-label=\"Search packages\" autocomplete=\"off\" autofocus></form>",
     let body = format!(
         "<header class=\"hero compact\">{logo}<h1>Packages</h1><p class=\"tag\">{tag}</p></header>{list}\
 <nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/simple/\">Simple index</a></nav>\
-<p class=\"ver\">pypiron v{version}</p>{FILTER_JS}",
+{footer}{FILTER_JS}",
         logo = logo_link(),
-        version = encode_text(ctx.version),
+        footer = version_footer(ctx.version),
     );
     shell("pypiron · packages", "", &body, false, false)
 }
@@ -473,15 +477,9 @@ pub fn project_html(
     verified: Option<(&Publisher, &str)>,
 ) -> String {
     let index_url = format!("{}/simple/", ctx.base_url);
-    // The one index URL, top-right and copyable — the same de-emphasized
-    // component the landing page carries. Request-derived, so escaped as text
-    // (never an attribute); the copy button reads it straight from the DOM.
-    let index_copy = format!(
-        "<div class=\"idx\"><code class=\"idx-url\">{url}</code>\
-<div class=\"idx-row\"><span class=\"idx-label\">Index URL</span>\
-<button class=\"copy\" type=\"button\">Copy</button></div></div>",
-        url = encode_text(&index_url),
-    );
+    // The one index URL, top-right, in a copy field (same style as the landing
+    // page and `uv add`); the copy button reads it from the DOM.
+    let index_copy = copy_field(&index_url, "idxbox", "Copy index URL");
 
     // Install command: `uv add` only, pinned to the version on a version page.
     let target = if pinned && !selected.is_empty() {
@@ -489,7 +487,11 @@ pub fn project_html(
     } else {
         pkg.to_string()
     };
-    let install = install_box(&format!("uv add --index {index_url} {target}"));
+    let install = copy_field(
+        &format!("uv add --index {index_url} {target}"),
+        "",
+        "Copy install command",
+    );
 
     // The banner's version and "Released" date come from the selected version.
     // An empty `selected` means no derivable version (legacy artifacts) — show
@@ -542,21 +544,22 @@ pub fn project_html(
     );
 
     // The centered column: a metadata sidebar on the LEFT (Navigation tabs +
-    // Verified/Unverified details) with the tab panels on the right.
+    // attestation + the package's self-declared details) with the tab panels on
+    // the right.
     let body = format!(
-        "<div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{verified}{unverified}</aside>\
+        "<div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{verified}{details}</aside>\
 <div class=\"pcontent\">{desc}{history}{dl}</div></div>\
 <nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/projects/\">All packages</a> · \
 <a href=\"/simple/{name}/\">Simple index</a></nav>\
-<p class=\"ver\">pypiron v{appver}</p>{TABS_JS}",
+{footer}{TABS_JS}",
         name = encode_text(pkg),
         nav = nav_section(),
         verified = verified_section(pkg, verified),
-        unverified = unverified_section(meta),
+        details = meta_sections(meta),
         desc = description_panel(meta),
         history = release_history_panel(pkg, files, selected),
         dl = files_panel(pkg, &sel_files),
-        appver = encode_text(ctx.version),
+        footer = version_footer(ctx.version),
     );
     shell(&format!("{pkg} · pypiron"), &banner, &body, true, true)
 }
@@ -739,16 +742,16 @@ server. <a href=\"/files/{pkg_attr}/{file_attr}.provenance\">Re-verify ↓</a></
     )
 }
 
-/// The "Unverified details" sidebar section: the package's self-declared
-/// metadata (project links, license, author, deps, classifiers), framed plainly
-/// as author-reported and unverified.
-fn unverified_section(meta: Option<&CoreMetadata>) -> String {
+/// The package's self-declared metadata, as plain sidebar sections — project
+/// links, meta (license/python/author/keywords), dependencies, classifiers. Each
+/// is shown only when present.
+fn meta_sections(meta: Option<&CoreMetadata>) -> String {
     let Some(m) = meta else {
         return "<section class=\"sb\"><h2>Details</h2>\
 <p class=\"muted-s\">No metadata available for this package.</p></section>"
             .to_string();
     };
-    let mut blocks = String::new();
+    let mut out = String::new();
 
     let links: String = m
         .project_urls
@@ -764,8 +767,8 @@ fn unverified_section(meta: Option<&CoreMetadata>) -> String {
         })
         .collect();
     if !links.is_empty() {
-        blocks.push_str(&format!(
-            "<div class=\"sb-block\"><h3>Project links</h3><ul class=\"vals\">{links}</ul></div>"
+        out.push_str(&format!(
+            "<section class=\"sb\"><h2>Project links</h2><ul class=\"vals\">{links}</ul></section>"
         ));
     }
 
@@ -781,25 +784,24 @@ fn unverified_section(meta: Option<&CoreMetadata>) -> String {
     push_kv(&mut dl, "Author", author.as_deref());
     push_kv(&mut dl, "Keywords", m.keywords.as_deref());
     if !dl.is_empty() {
-        blocks.push_str(&format!("<dl class=\"sb-dl\">{dl}</dl>"));
+        out.push_str(&format!(
+            "<section class=\"sb\"><h2>Meta</h2><dl class=\"sb-dl\">{dl}</dl></section>"
+        ));
     }
 
     if !m.requires_dist.is_empty() {
-        blocks.push_str(&sub_list("Dependencies", &m.requires_dist));
+        out.push_str(&section_list("Dependencies", &m.requires_dist));
     }
     if !m.classifiers.is_empty() {
-        blocks.push_str(&sub_list("Classifiers", &m.classifiers));
+        out.push_str(&section_list("Classifiers", &m.classifiers));
     }
 
-    if blocks.is_empty() {
+    if out.is_empty() {
         return "<section class=\"sb\"><h2>Details</h2>\
 <p class=\"muted-s\">No details provided.</p></section>"
             .to_string();
     }
-    format!(
-        "<section class=\"sb\"><h2>Unverified details</h2>\
-<p class=\"sb-cap\">Self-reported by the package author; not verified.</p>{blocks}</section>"
-    )
+    out
 }
 
 /// A `<dt>/<dd>` row, omitting nothing — caller filters absent values.
@@ -814,14 +816,14 @@ fn push_kv(out: &mut String, k: &str, value: Option<&str>) {
     }
 }
 
-/// A labelled sub-list of values (dependencies, classifiers).
-fn sub_list(label: &str, values: &[String]) -> String {
+/// A labelled sidebar section listing values (dependencies, classifiers).
+fn section_list(label: &str, values: &[String]) -> String {
     let items: String = values
         .iter()
         .map(|v| format!("<li>{}</li>", encode_text(v)))
         .collect();
     format!(
-        "<div class=\"sb-block\"><h3>{}</h3><ul class=\"vals pill\">{items}</ul></div>",
+        "<section class=\"sb\"><h2>{}</h2><ul class=\"vals pill\">{items}</ul></section>",
         encode_text(label),
     )
 }
@@ -1015,16 +1017,17 @@ mod tests {
         let html = landing_html(&ctx(), None, None);
         assert!(html.contains("data:image/png;base64,"));
         assert!(html.contains("An ultra-fast PyPI server written in Rust."));
-        // The logo links to pypiron's PyPI project page.
+        // The logo links to the server root; the footer wordmark links to PyPI.
+        assert!(html.contains("class=\"logo-link\" href=\"/\""));
         assert!(html.contains("href=\"https://pypi.org/project/pypiron/\""));
         // Search is the focus: a GET form to the browser/results page.
         assert!(html.contains("class=\"search\""));
         assert!(html.contains("action=\"/projects/\""));
         assert!(html.contains("name=\"q\""));
-        // The one index URL is still offered (de-emphasized, top-right) with a
-        // working copy button...
-        assert!(html.contains("class=\"idx\""));
-        assert!(html.contains("https://pkgs.example.com/simple/"));
+        // The one index URL is offered top-right in a copy field (no label).
+        assert!(html.contains("class=\"install idxbox\""));
+        assert!(html.contains("<code>https://pkgs.example.com/simple/</code>"));
+        assert!(!html.contains("Index URL")); // the label is gone
         assert!(html.contains("navigator.clipboard.writeText"));
         // ...and the per-client command boxes are gone.
         assert!(!html.contains("uv pip install"));
@@ -1103,9 +1106,11 @@ mod tests {
             None,
         );
 
-        // Slim brand strip (home link + index URL), then a package banner.
+        // Slim brand strip (home link + index URL field), then a package banner.
         assert!(html.contains("class=\"home\" href=\"/\""));
-        assert!(html.contains("class=\"idx\""));
+        // The logo links to the server root, not an external page.
+        assert!(html.contains("class=\"logo-link\" href=\"/\""));
+        assert!(html.contains("class=\"install idxbox\""));
         assert!(html.contains("https://pkgs.example.com/simple/"));
         assert!(html.contains(
             "<h1 class=\"phead-name\">imaginairy <span class=\"pver\">15.0.0</span></h1>"
@@ -1143,10 +1148,14 @@ mod tests {
         // Release history links every version to its per-version page.
         assert!(html.contains("href=\"/project/imaginairy/14.3.0/\""));
         assert!(html.contains("href=\"/project/imaginairy/15.0.0/\""));
-        // Self-reported metadata under "Unverified details"; no attestation.
-        assert!(html.contains("<h2>Unverified details</h2>"));
-        assert!(html.contains("<h3>Project links</h3>"));
+        // Self-reported metadata as plain sections — no "Unverified details"
+        // framing, no attestation section.
+        assert!(html.contains("<h2>Project links</h2>"));
+        assert!(!html.contains("Unverified details"));
+        assert!(!html.contains("Self-reported"));
         assert!(!html.contains("Verified details"));
+        // Footer wordmark links to pypiron's PyPI project page.
+        assert!(html.contains("href=\"https://pypi.org/project/pypiron/\""));
     }
 
     #[test]

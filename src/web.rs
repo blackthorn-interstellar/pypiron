@@ -140,8 +140,9 @@ main.wide{max-width:1000px;padding-top:0}\
 .install{display:inline-flex;max-width:100%;align-items:stretch;border:1px solid var(--border);border-radius:8px;background:var(--card);vertical-align:top}\
 .install code{padding:9px 13px;overflow-x:auto;white-space:nowrap;border-radius:8px 0 0 8px}\
 .install .copy{flex:none;border:0;border-left:1px solid var(--border);border-radius:0 8px 8px 0;padding:0 14px;font-size:12px}\
-.psummary{margin:0 -24px;padding:15px 24px;background:var(--card);border-bottom:1px solid var(--border)}\
-.psummary p{margin:0;color:var(--fg);font-size:16px}\
+.psummary{width:100%;background:var(--card);border-bottom:1px solid var(--border)}\
+.psummary-in{max-width:1000px;margin:0 auto;padding:15px 24px}\
+.psummary-in p{margin:0;color:var(--fg);font-size:16px}\
 .pcols{display:grid;gap:34px;margin-top:30px}\
 .pcontent{order:1}.pmeta{order:2}\
 @media(min-width:760px){.pcols{grid-template-columns:230px minmax(0,1fr)}.pcontent,.pmeta{order:0}}\
@@ -506,21 +507,28 @@ pub fn project_html(
     } else {
         format!(" <span class=\"pver\">{}</span>", encode_text(selected))
     };
-    // The short description gets its own bar below the header (pypi.org leaves
-    // the banner to name + install + date).
+    // The short description is its own full-window bar below the header (its
+    // inner text aligned to the centered column). Like the header, it renders
+    // outside `<main>`.
     let summary = meta
         .and_then(|m| m.summary.as_deref())
         .filter(|s| !s.trim().is_empty())
-        .map(|s| format!("<div class=\"psummary\"><p>{}</p></div>", encode_text(s)))
+        .map(|s| {
+            format!(
+                "<div class=\"psummary\"><div class=\"psummary-in\"><p>{}</p></div></div>",
+                encode_text(s)
+            )
+        })
         .unwrap_or_default();
     let released = newest_upload_date(&sel_files)
         .map(|d| format!("<p class=\"phead-date\">Released {}</p>", encode_text(&d)))
         .unwrap_or_default();
 
-    // Header band: a full-window-width strip (distinct background) holding the
-    // brand row and the package banner — name with `uv add` below it, the
-    // release date on the right — with its inner content aligned to the same
-    // centered column as the page body. It renders outside `<main>`.
+    // Header band + description bar: full-window-width strips (each with a
+    // distinct background) whose inner content aligns to the same centered
+    // column as the page body. They render outside `<main>`. The header holds
+    // the brand row and the package banner — name with `uv add` below it, the
+    // release date on the right.
     let banner = format!(
         "<header class=\"phead-band\"><div class=\"phead-in\">\
 <div class=\"top\"><div class=\"brand\">{logo}\
@@ -528,17 +536,15 @@ pub fn project_html(
 <div class=\"phead\">\
 <div class=\"phead-main\"><h1 class=\"phead-name\">{name}{ver}</h1>\
 <div class=\"phead-install\">{install}</div></div>\
-<div class=\"phead-right\">{released}</div></div></div></header>",
+<div class=\"phead-right\">{released}</div></div></div></header>{summary}",
         logo = logo_link(),
         name = encode_text(pkg),
     );
 
-    // Below the centered column: the description bar, then a metadata sidebar on
-    // the LEFT (Navigation tabs + Verified/Unverified details) with the tab
-    // panels on the right.
+    // The centered column: a metadata sidebar on the LEFT (Navigation tabs +
+    // Verified/Unverified details) with the tab panels on the right.
     let body = format!(
-        "{summary}\
-<div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{verified}{unverified}</aside>\
+        "<div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{verified}{unverified}</aside>\
 <div class=\"pcontent\">{desc}{history}{dl}</div></div>\
 <nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/projects/\">All packages</a> · \
 <a href=\"/simple/{name}/\">Simple index</a></nav>\
@@ -1106,9 +1112,12 @@ mod tests {
         ));
         // Banner date is the selected version's newest upload.
         assert!(html.contains("Released 2026-06-10"));
-        // Full-window header band renders before <main>, its inner column aligned.
+        // Full-window header band AND description bar render before <main>, each
+        // with a centered inner column.
         assert!(html.find("class=\"phead-band\"").unwrap() < html.find("<main").unwrap());
         assert!(html.contains("class=\"phead-in\""));
+        assert!(html.find("class=\"psummary\"").unwrap() < html.find("<main").unwrap());
+        assert!(html.contains("class=\"psummary-in\""));
         // Install is `uv add` only — no pip / uv pip forms anywhere.
         assert!(html.contains("class=\"phead-install\""));
         assert!(html.contains("uv add --index https://pkgs.example.com/simple/ imaginairy"));

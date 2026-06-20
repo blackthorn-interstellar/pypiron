@@ -555,10 +555,13 @@ fn list_block(label: &str, values: &[String]) -> String {
 /// Allow only `http`/`https` URLs into an `href` — author-controlled metadata
 /// must never smuggle in `javascript:` or `data:` schemes.
 fn safe_href(url: &str) -> Option<&str> {
-    let lower = url.trim_start();
-    let scheme_ok = lower.len() >= 7
-        && (lower[..7].eq_ignore_ascii_case("http://")
-            || (lower.len() >= 8 && lower[..8].eq_ignore_ascii_case("https://")));
+    // Compare on bytes: a metadata URL is arbitrary UTF-8, and slicing a `&str`
+    // at a fixed index panics when it splits a multi-byte char (a request-path
+    // panic, since the value rides in from package METADATA). `[u8]` slices are
+    // bounded only by length, so a length guard makes them panic-free.
+    let b = url.trim_start().as_bytes();
+    let scheme_ok = (b.len() >= 7 && b[..7].eq_ignore_ascii_case(b"http://"))
+        || (b.len() >= 8 && b[..8].eq_ignore_ascii_case(b"https://"));
     scheme_ok.then_some(url.trim())
 }
 
@@ -804,6 +807,21 @@ mod tests {
         let html = landing_html(&c, None, None);
         assert!(!html.contains("<script>alert(1)"));
         assert!(html.contains("&lt;script&gt;alert(1)"));
+    }
+
+    #[test]
+    fn safe_href_handles_non_ascii_without_panicking() {
+        // A project URL is arbitrary UTF-8 from package METADATA; a multi-byte
+        // char straddling byte 7/8 used to panic the str slice (request-path
+        // panic = persistent DoS of /project/<pkg>/).
+        assert_eq!(safe_href("€€€"), None);
+        assert_eq!(safe_href("abcdef€://x"), None);
+        assert_eq!(
+            safe_href("https://exämple.com/€"),
+            Some("https://exämple.com/€")
+        );
+        assert_eq!(safe_href("http://ok"), Some("http://ok"));
+        assert_eq!(safe_href("javascript:alert(1)"), None);
     }
 
     #[test]

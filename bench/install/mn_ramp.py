@@ -38,6 +38,8 @@ SERVER_IP = ENV["RIG2_SERVER_IP"]
 N = int(ENV["RIG2_LOADGEN_N"])
 LGS = [ENV[f"RIG2_LOADGEN_IP_{i}"] for i in range(1, N + 1)]
 SSH = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-i", KEY]
+INDEX_URL = f"http://{PRIV}:8080/simple/"  # overridden by --index-url in main
+CONTAINER = "pypiron"  # overridden by --container in main
 
 
 def ssh_run(ip: str, cmd: str, timeout: int = 120) -> subprocess.CompletedProcess:
@@ -100,7 +102,9 @@ def push_runner(regex: str) -> None:
 
 def server_cpu() -> float:
     out = ssh_run(
-        SERVER_IP, "sudo docker stats --no-stream --format '{{.CPUPerc}}' pypiron", timeout=30
+        SERVER_IP,
+        f"sudo docker stats --no-stream --format '{{{{.CPUPerc}}}}' {CONTAINER}",
+        timeout=30,
     )
     try:
         return float(out.stdout.strip().rstrip("%"))

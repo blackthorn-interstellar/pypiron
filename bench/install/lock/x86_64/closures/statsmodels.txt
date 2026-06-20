@@ -20,12 +20,16 @@ patsy==1.0.2 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
 python-dateutil==2.9.0.post0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
     --hash=sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3 \
     --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427
-scipy==1.17.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+scipy==1.17.1 ; python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' \
     --hash=sha256:02ae3b274fde71c5e92ac4d54bc06c42d80e399fec704383dcd99b301df37458 \
     --hash=sha256:43af8d1f3bea642559019edfe64e9b11192a8978efbd1539d7bc2aaa23d92de4 \
     --hash=sha256:4eb6c25dd62ee8d5edf68a8e1c171dd71c292fdae95d8aeb3dd7d7de4c364082 \
     --hash=sha256:95d8e012d8cb8816c226aef832200b1d45109ed4464303e997c5b13122b297c0 \
     --hash=sha256:f590cd684941912d10becc07325a3eeb77886fe981415660d9265c4c418d0bea
+scipy==1.18.0 ; python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:1f55797419e16e7f30cf88ffb3113ce0467f00cfe3f70d5c281730b21769bfc2 \
+    --hash=sha256:4a55985d54c769c872e64b7f4c8a81cc30ef700cc04296abbbf3705439c126de \
+    --hash=sha256:67b2ad2ad54c72ca6d04975a9b2df8c3638c34ddd5b28738e94fc2b57929d378
 six==1.17.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
     --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274 \
     --hash=sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81

@@ -5,9 +5,13 @@ numpy==2.4.6 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
     --hash=sha256:e5805d5a22fd19c8ccff10a9561f9df94436b0545619ea579db2d3c35294bce2 \
     --hash=sha256:f3a3570c4a2a16746ac2c31a7c7c7b0c186b95ce902e33db6f28094ed7387dda \
     --hash=sha256:f407cb6b8e9d6d8c626bc73c945db1706035af8fd632295547bf1c9e46d092d6
-scipy==1.17.1 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+scipy==1.17.1 ; python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' \
     --hash=sha256:02ae3b274fde71c5e92ac4d54bc06c42d80e399fec704383dcd99b301df37458 \
     --hash=sha256:43af8d1f3bea642559019edfe64e9b11192a8978efbd1539d7bc2aaa23d92de4 \
     --hash=sha256:4eb6c25dd62ee8d5edf68a8e1c171dd71c292fdae95d8aeb3dd7d7de4c364082 \
     --hash=sha256:95d8e012d8cb8816c226aef832200b1d45109ed4464303e997c5b13122b297c0 \
     --hash=sha256:f590cd684941912d10becc07325a3eeb77886fe981415660d9265c4c418d0bea
+scipy==1.18.0 ; python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:1f55797419e16e7f30cf88ffb3113ce0467f00cfe3f70d5c281730b21769bfc2 \
+    --hash=sha256:4a55985d54c769c872e64b7f4c8a81cc30ef700cc04296abbbf3705439c126de \
+    --hash=sha256:67b2ad2ad54c72ca6d04975a9b2df8c3638c34ddd5b28738e94fc2b57929d378

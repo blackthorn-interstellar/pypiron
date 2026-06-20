@@ -1,6 +1,6 @@
-hypothesis==6.155.5 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
-    --hash=sha256:b0eb5645f4c962dffdafef36d05329aa704a5322ee1273495fa98d5a986daf70 \
-    --hash=sha256:f7f8f803e05a69cd70399b07ed89a89b673c9ff3530977c4a768ed3acb702169
+hypothesis==6.155.6 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
+    --hash=sha256:7569e1897690336c85d49d8391b49ec6ab83d951009515bfc29faebbac286cf5 \
+    --hash=sha256:a96d9a29f6bbc8ccac39dd84e140892da76765464929f401a4181b90c20c9ad1
 sortedcontainers==2.4.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' \
     --hash=sha256:25caa5a06cc30b6b83d11423433f65d1f9d76c4c6a0c90e3379eaa43b9bfdb88 \
     --hash=sha256:a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0

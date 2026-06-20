@@ -13,6 +13,7 @@ import pytest
 from .helpers import (
     _encode_basic_auth,
     http_get,
+    http_get_no_redirect,
     make_wheel,
     upload_legacy,
     wait_for_project_in_global,
@@ -224,6 +225,119 @@ def test_project_page_shows_metadata_files_and_unrendered_readme(disk_server, tm
     assert "<strong>markdown</strong>" not in html
     # The release file links to the artifact.
     assert 'href="/files/projpkg/projpkg-2.1.0-py3-none-any.whl"' in html
+
+
+def test_project_page_renders_markdown_readme_through_whitelist(disk_server, tmp_path):
+    """A wheel declaring text/markdown gets its README rendered through the
+    locked-down whitelist: real markdown becomes HTML, raw script is dropped."""
+    wheel = make_wheel(
+        "mdpkg",
+        "3.2.1",
+        tmp_path,
+        metadata_extra="Description-Content-Type: text/markdown\n",
+        description=(
+            "# Title\n\n"
+            "Some **bold** text and a [link](https://example.com).\n\n"
+            "<script>alert('xss')</script>\n"
+        ),
+    )
+    upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+    )
+    wait_for_project_in_global(disk_server["simple"], "mdpkg")
+
+    code, body, _ = http_get(f"{disk_server['base_url']}/project/mdpkg/")
+    assert code == 200
+    html = body.decode()
+    # Markdown rendered to HTML...
+    assert '<div class="readme-md">' in html
+    assert "<strong>bold</strong>" in html
+    assert '<a href="https://example.com" rel="nofollow noopener noreferrer">link</a>' in html
+    # ...but the raw <script> is dropped, never echoed back.
+    assert "<script>alert" not in html
+    assert "shown unrendered" not in html
+
+
+def test_per_version_page_pins_install_and_validates_version(disk_server, tmp_path):
+    for v in ("1.0.0", "1.2.0"):
+        wheel = make_wheel("verpkg", v, tmp_path)
+        upload_legacy(
+            disk_server["legacy"],
+            wheel,
+            username=disk_server["user"],
+            password=disk_server["password"],
+        )
+        wait_for_project_in_global(disk_server["simple"], "verpkg")
+
+    # Latest page: unpinned `uv add`, release history links to per-version pages.
+    code, body, _ = http_get(f"{disk_server['base_url']}/project/verpkg/")
+    assert code == 200
+    latest = body.decode()
+    assert "1.2.0" in latest
+    assert 'href="/project/verpkg/1.0.0/"' in latest
+    assert "uv add --index" in latest
+
+    # Per-version page: pinned install, current release flagged.
+    code, body, _ = http_get(f"{disk_server['base_url']}/project/verpkg/1.0.0/")
+    assert code == 200
+    page = body.decode()
+    assert "verpkg==1.0.0" in page
+    assert "This version" in page
+
+    # An unknown version 404s rather than reflecting the path segment.
+    code, _, _ = http_get(f"{disk_server['base_url']}/project/verpkg/9.9.9/")
+    assert code == 404
+
+
+def test_version_page_redirect_does_not_reflect_traversal(disk_server, tmp_path):
+    """A non-normalized name 301s to the canonical URL, but the (not-yet-
+    validated) version segment is percent-encoded so a `..%2f..%2f` payload can't
+    cross a path boundary in Location — it lands back here and 404s."""
+    wheel = make_wheel("RedirPkg", "1.0.0", tmp_path)
+    upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+    )
+    wait_for_project_in_global(disk_server["simple"], "redirpkg")
+
+    base = disk_server["base_url"]
+    # Non-normalized name + traversal version: the encoded slash stays in-segment.
+    code, _, headers = http_get_no_redirect(f"{base}/project/RedirPkg/..%2f..%2fsimple/")
+    assert code == 301
+    loc = headers.get("location", "")
+    assert "/simple/" not in loc  # did not collapse to another route
+    assert "%2F" in loc.upper()  # slash stayed percent-encoded
+    # Following it dead-ends at a 404, never at /simple/.
+    code, _, _ = http_get(f"{base}/project/RedirPkg/..%2f..%2fsimple/")
+    assert code == 404
+
+
+def test_default_page_skips_prerelease(disk_server, tmp_path):
+    for v in ("2.0.0", "2.1.0rc1"):
+        wheel = make_wheel("prerelpkg", v, tmp_path)
+        upload_legacy(
+            disk_server["legacy"],
+            wheel,
+            username=disk_server["user"],
+            password=disk_server["password"],
+        )
+        wait_for_project_in_global(disk_server["simple"], "prerelpkg")
+
+    code, body, _ = http_get(f"{disk_server['base_url']}/project/prerelpkg/")
+    assert code == 200
+    html = body.decode()
+    # The bare page headlines the newest stable release, not the pre-release...
+    assert '<span class="pver">2.0.0</span>' in html
+    assert '<span class="pver">2.1.0rc1</span>' not in html
+    # ...but the pre-release is still listed and directly reachable.
+    assert 'href="/project/prerelpkg/2.1.0rc1/"' in html
+    code, _, _ = http_get(f"{disk_server['base_url']}/project/prerelpkg/2.1.0rc1/")
+    assert code == 200
 
 
 def test_projects_index_lists_packages_linking_to_project_pages(disk_server, tmp_path):

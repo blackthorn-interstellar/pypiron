@@ -111,6 +111,23 @@ pub fn infer_version_from_filename(filename: &str) -> Option<String> {
     split_sdist_stem(stem).map(|(_, v)| v.to_string())
 }
 
+/// Order two version strings newest-first by PEP 440 semantics (so `1.10` sorts
+/// above `1.9`). When either side isn't valid PEP 440 — legacy or malformed —
+/// fall back to a reversed lexical compare so the list still sorts
+/// deterministically. Used by the project page's release history.
+pub fn version_cmp_desc(a: &str, b: &str) -> std::cmp::Ordering {
+    match (
+        a.parse::<pep440_rs::Version>(),
+        b.parse::<pep440_rs::Version>(),
+    ) {
+        (Ok(va), Ok(vb)) => vb.cmp(&va),
+        // A parseable version outranks an unparseable one; otherwise lexical.
+        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Err(_)) => b.cmp(a),
+    }
+}
+
 /// The PEP 427 compatibility tags of a wheel: the dot-separated alternatives in
 /// each of the python / abi / platform fields.
 #[derive(Debug, Clone)]
@@ -149,6 +166,21 @@ mod tests {
         assert_eq!(normalize_pkg_name("Foo.Bar_baz"), "foo-bar-baz");
         assert_eq!(normalize_pkg_name("six"), "six");
         assert_eq!(normalize_pkg_name("A--B"), "a-b");
+    }
+
+    #[test]
+    fn version_cmp_desc_orders_newest_first() {
+        use std::cmp::Ordering;
+        // PEP 440, not lexical: 1.10 is newer than 1.9.
+        assert_eq!(version_cmp_desc("1.10.0", "1.9.0"), Ordering::Less);
+        assert_eq!(version_cmp_desc("2.0.0", "2.0.0"), Ordering::Equal);
+        assert_eq!(version_cmp_desc("15.0.0", "14.3.0"), Ordering::Less);
+        // 2.0.0a1 is a pre-release of 2.0.0, so it outranks every 1.x.
+        let mut v = vec!["1.9.0", "1.10.0", "1.2.0", "2.0.0a1"];
+        v.sort_by(|a, b| version_cmp_desc(a, b));
+        assert_eq!(v, vec!["2.0.0a1", "1.10.0", "1.9.0", "1.2.0"]);
+        // Parseable outranks unparseable; junk still sorts deterministically.
+        assert_eq!(version_cmp_desc("1.0.0", "not-a-version"), Ordering::Less);
     }
 
     // Edge-case filenames below are real PyPI uploads, found by running the

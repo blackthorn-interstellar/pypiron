@@ -2,9 +2,10 @@
 //! by a free-text description body — into the handful of fields the human
 //! project page shows. Pure parsing, no I/O, unit-tested.
 //!
-//! This deliberately does NOT render the description: the page shows it
-//! verbatim in a `<pre>` (see [`crate::web::project_html`]). Rendering Markdown
-//! or reStructuredText safely is a separate, opt-in concern.
+//! The page renders the description as Markdown only when it declares
+//! `Description-Content-Type: text/markdown` (via the locked-down whitelist in
+//! [`crate::markdown`]); reStructuredText and plain text are shown verbatim in a
+//! `<pre>`. See [`CoreMetadata::is_markdown`] and [`crate::web::project_html`].
 
 /// Display fields lifted from a wheel's `METADATA` (or an sdist's `PKG-INFO`).
 /// Every field is optional — legacy and minimal artifacts omit most of them.
@@ -24,6 +25,25 @@ pub struct CoreMetadata {
     pub requires_dist: Vec<String>,
     /// The long description / README body, exactly as stored.
     pub description: Option<String>,
+    /// `Description-Content-Type` (PEP 566), e.g. `text/markdown`. Gates whether
+    /// the page renders the description as Markdown or shows it verbatim.
+    pub description_content_type: Option<String>,
+}
+
+impl CoreMetadata {
+    /// Whether the description is Markdown and should be rendered (vs shown
+    /// verbatim). A bare or absent content type means plain text / reST, which
+    /// we never render.
+    pub fn is_markdown(&self) -> bool {
+        self.description_content_type
+            .as_deref()
+            .map(|ct| {
+                ct.trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("text/markdown")
+            })
+            .unwrap_or(false)
+    }
 }
 
 /// Parse core-metadata bytes. Invalid UTF-8 is lossily decoded rather than
@@ -50,6 +70,7 @@ pub fn parse(bytes: &[u8]) -> CoreMetadata {
             "license-expression" => license_expression = Some(v.to_string()),
             "requires-python" => m.requires_python = Some(v.to_string()),
             "keywords" => m.keywords = Some(v.to_string()),
+            "description-content-type" => m.description_content_type = Some(v.to_string()),
             "home-page" => m.project_urls.push(("Homepage".to_string(), v.to_string())),
             "project-url" => {
                 if let Some((label, url)) = v.split_once(',') {
@@ -162,6 +183,20 @@ Requires-Dist: click; extra == \"cli\"\n\
             m.description.as_deref(),
             Some("# Demo\n\nThis is the README body.")
         );
+    }
+
+    #[test]
+    fn description_content_type_drives_is_markdown() {
+        let md =
+            parse(b"Name: d\nDescription-Content-Type: text/markdown; charset=UTF-8\n\n# hi\n");
+        assert_eq!(
+            md.description_content_type.as_deref(),
+            Some("text/markdown; charset=UTF-8")
+        );
+        assert!(md.is_markdown());
+        // reST and plain text are never rendered.
+        assert!(!parse(b"Name: d\nDescription-Content-Type: text/x-rst\n\nx\n").is_markdown());
+        assert!(!parse(b"Name: d\n\nplain body\n").is_markdown());
     }
 
     #[test]

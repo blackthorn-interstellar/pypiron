@@ -22,9 +22,11 @@ mod coremeta;
 #[cfg(test)]
 mod corpus_check;
 mod lease;
+mod markdown;
 mod metrics;
 mod names;
 mod origin;
+mod provenance;
 mod proxy;
 mod range;
 mod render;
@@ -447,6 +449,8 @@ async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
         .route("/projects/", get(projects_page))
         .route("/project/:package", get(project_page))
         .route("/project/:package/", get(project_page))
+        .route("/project/:package/:version", get(project_version_page))
+        .route("/project/:package/:version/", get(project_version_page))
         // Legacy PyPI upload API (used by uv/twine)
         .route("/legacy", post(legacy_upload))
         .route("/legacy/", post(legacy_upload))
@@ -724,55 +728,197 @@ async fn projects_page(
     ))
 }
 
-/// The human project page (`/project/<pkg>/`): metadata sidebar, release files,
-/// and the README shown verbatim. Read-only and gated by read auth like the
-/// dashboard. Rendered on demand — no materialized view, truth stays files.
+/// The human project page (`/project/<pkg>/`): the latest version, tabbed into
+/// description / release history / download files. Read-only and gated by read
+/// auth like the dashboard. Rendered on demand — no materialized view.
 async fn project_page(
     State(state): State<Arc<AppState>>,
     Path(raw): Path<String>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    if !state.is_reader(&headers) {
+    render_project(&state, &headers, &raw, None).await
+}
+
+/// The per-version page (`/project/<pkg>/<version>/`): the same page focused on
+/// one release, with a version-pinned install snippet.
+async fn project_version_page(
+    State(state): State<Arc<AppState>>,
+    Path((raw, version)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    render_project(&state, &headers, &raw, Some(&version)).await
+}
+
+/// Shared project-page renderer. `requested_version` is `None` for the latest
+/// view; when present it's validated against the hosted versions (so an
+/// arbitrary path segment is never reflected) and pins the install snippet.
+async fn render_project(
+    state: &AppState,
+    headers: &HeaderMap,
+    raw: &str,
+    requested_version: Option<&str>,
+) -> Response<Body> {
+    if !state.is_reader(headers) {
         return unauthorized();
     }
-    let Some(pkg) = checked_pkg_name(&raw) else {
+    let Some(pkg) = checked_pkg_name(raw) else {
         return not_found("invalid package name");
     };
-    // Canonical URL is the normalized one; everything else 301s there.
+    // Canonical URL is the normalized package name; everything else 301s there.
+    // The version segment is percent-encoded so a hostile, not-yet-validated
+    // value (e.g. `..%2f..%2fsimple`, which axum has already decoded) can't cross
+    // a path boundary in the `Location` header — it lands back here and 404s.
     if raw != pkg {
-        return moved_permanently(&format!("/project/{pkg}/"));
+        let dest = match requested_version {
+            Some(v) => format!(
+                "/project/{pkg}/{}/",
+                percent_encoding::utf8_percent_encode(v, PATH_SEGMENT)
+            ),
+            None => format!("/project/{pkg}/"),
+        };
+        return moved_permanently(&dest);
     }
-    let files = match worker::list_artifacts(&state, &pkg).await {
+    let files = match worker::list_artifacts(state, &pkg).await {
         Ok((files, _raw)) => files,
         Err(e) => return read_error(e),
     };
     if files.is_empty() {
         return not_found("no such project");
     }
-    let meta = load_core_metadata(&state, &pkg, &files).await;
+
+    // Pick the version to display: the requested one (must be hosted), else the
+    // latest by PEP 440 order.
+    let mut versions: Vec<String> = files
+        .iter()
+        .filter_map(web::file_version)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    versions.sort_by(|a, b| names::version_cmp_desc(a, b));
+    let (selected, pinned) = match requested_version {
+        Some(v) => {
+            if !versions.iter().any(|known| known == v) {
+                return not_found("no such version");
+            }
+            (v.to_string(), true)
+        }
+        // The bare page headlines the newest *stable*, not-fully-yanked release
+        // (pypi.org behavior), falling back to the newest overall, then to empty
+        // for legacy artifacts with no derivable version (still rendered).
+        None => (default_display_version(&files, &versions), false),
+    };
+
+    // Representative files of the selected version — the newest carrying each
+    // companion. Metadata and provenance may ride on different artifacts.
+    let meta_rep = representative(&files, &selected, |f| f.core_metadata);
+    let meta = match meta_rep {
+        Some(f) => load_core_metadata(state, &pkg, f).await,
+        None => None,
+    };
+    let prov_rep = representative(&files, &selected, |f| f.provenance);
+    let publisher = match prov_rep {
+        Some(f) => load_provenance(state, &pkg, f).await,
+        None => None,
+    };
+    let verified = match (&publisher, prov_rep) {
+        (Some(p), Some(f)) => Some((p, f.filename.as_str())),
+        _ => None,
+    };
+
     html_ok(web::project_html(
-        &page_context(&state, &headers),
+        &page_context(state, headers),
         &pkg,
         &files,
+        &selected,
+        pinned,
         meta.as_ref(),
+        verified,
     ))
 }
 
-/// Parse the core metadata of the representative file — the newest-uploaded one
-/// that has a `.metadata` companion. Best-effort: any miss returns `None` and
-/// the page renders without a sidebar.
+/// Characters refused raw in a redirect path segment — anything that could
+/// cross a path boundary or restructure the URL. `versions` come in
+/// already-percent-decoded by axum, so a `/` or control byte here is hostile.
+const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b'/')
+    .add(b'%')
+    .add(b'?')
+    .add(b'#')
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'|');
+
+/// The version to headline on the bare project page: the newest stable release
+/// (not a pre-release/dev) that isn't fully yanked, like pypi.org — falling back
+/// to the newest overall, then to empty (legacy artifacts with no version).
+fn default_display_version(files: &[render::FileMetadata], versions: &[String]) -> String {
+    versions
+        .iter()
+        .find(|v| !is_prerelease(v) && !fully_yanked(files, v))
+        .or_else(|| versions.first())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Whether a version string parses as a PEP 440 pre-release or dev release.
+fn is_prerelease(v: &str) -> bool {
+    v.parse::<pep440_rs::Version>()
+        .map(|ver| ver.any_prerelease())
+        .unwrap_or(false)
+}
+
+/// Whether every file of `version` is yanked (so the release shouldn't headline).
+fn fully_yanked(files: &[render::FileMetadata], version: &str) -> bool {
+    let mut vers = files
+        .iter()
+        .filter(|f| web::file_version(f).as_deref() == Some(version))
+        .peekable();
+    vers.peek().is_some() && vers.all(|f| !matches!(f.yanked, Yanked::Flag(false)))
+}
+
+/// The newest-uploaded file of `version` for which `want` holds — used to pick
+/// the artifact whose `.metadata` / `.provenance` companion represents a release.
+fn representative<'a>(
+    files: &'a [render::FileMetadata],
+    version: &str,
+    want: impl Fn(&render::FileMetadata) -> bool,
+) -> Option<&'a render::FileMetadata> {
+    files
+        .iter()
+        .filter(|f| want(f) && web::file_version(f).as_deref() == Some(version))
+        .max_by(|a, b| a.upload_time.cmp(&b.upload_time))
+}
+
+/// Parse a representative file's `.metadata` companion. Best-effort: any miss
+/// returns `None` and the page renders without a sidebar.
 async fn load_core_metadata(
     state: &AppState,
     pkg: &str,
-    files: &[render::FileMetadata],
+    rep: &render::FileMetadata,
 ) -> Option<coremeta::CoreMetadata> {
-    let rep = files
-        .iter()
-        .filter(|f| f.core_metadata)
-        .max_by(|a, b| a.upload_time.cmp(&b.upload_time))?;
     let key = sidecar::metadata_key(&format!("{PACKAGES_PREFIX}{pkg}/{}", rep.filename));
     let bytes = state.storage.get_bytes(&key).await.ok()?;
     Some(coremeta::parse(&bytes))
+}
+
+/// Parse a representative file's relayed `.provenance` companion into its
+/// publisher. Best-effort: a miss or malformed bundle returns `None` and the
+/// page renders without a "Verified details" section.
+async fn load_provenance(
+    state: &AppState,
+    pkg: &str,
+    rep: &render::FileMetadata,
+) -> Option<provenance::Publisher> {
+    let key = sidecar::provenance_key(&format!("{PACKAGES_PREFIX}{pkg}/{}", rep.filename));
+    let bytes = state.storage.get_bytes(&key).await.ok()?;
+    provenance::parse_publisher(&bytes)
 }
 
 /// Build the request-derived context both pages share. The base URL honors a

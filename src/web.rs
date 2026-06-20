@@ -11,13 +11,17 @@
 //! from the `Host`/`X-Forwarded-*` headers) is HTML-escaped: the page reflects
 //! a client-controlled header, so it must never let it break out of its text.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use base64::Engine;
 use html_escape::{encode_double_quoted_attribute, encode_text};
 
 use crate::coremeta::CoreMetadata;
+use crate::markdown;
 use crate::metrics::{Inventory, MetricsSnapshot};
+use crate::names::{infer_version_from_filename, version_cmp_desc};
+use crate::provenance::Publisher;
 use crate::render::FileMetadata;
 use crate::sidecar::Yanked;
 
@@ -113,18 +117,59 @@ code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
 .empty{color:var(--muted);font-size:14px;font-style:italic}\
 .activity{margin-top:44px;border-top:1px solid var(--border);padding-top:24px}\
 .activity .cap{margin:0 0 16px;color:var(--muted);font-size:13px;text-align:center}\
-main.wide{max-width:980px}\
+main.wide{max-width:1000px}\
 .summary{margin:6px 0 0;color:var(--muted);font-size:16px}\
-.pcols{display:grid;gap:32px;margin-top:8px}\
-@media(min-width:760px){.pcols{grid-template-columns:minmax(0,1fr) 260px}}\
-.pmeta h2,.files h2,.readme-sec .snip-label{font-size:12px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--muted)}\
-.pmeta>div{margin-bottom:18px}\
-.pmeta h2{margin:0 0 5px}\
+.top .home{font:inherit;font-size:20px;font-weight:650;letter-spacing:-.02em;color:var(--fg)}\
+.top .home:hover{text-decoration:none}\
+.phead{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:14px 36px;border-bottom:1px solid var(--border);padding-bottom:22px;margin-bottom:26px}\
+.phead-main{flex:1;min-width:240px}\
+.phead-name{margin:0;font-size:30px;letter-spacing:-.02em;word-break:break-word}\
+.phead-name .pver{color:var(--muted);font-weight:500}\
+.phead-date{margin:7px 0 0;color:var(--muted);font-size:13px}\
+.phead .summary{margin:9px 0 0}\
+.phead-install{width:min(100%,400px);flex:none}\
+.phead-install .snip{margin:0 0 10px}\
+.pcols{display:grid;gap:34px;margin-top:8px}\
+.pcontent{order:1}.pmeta{order:2}\
+@media(min-width:760px){.pcols{grid-template-columns:230px minmax(0,1fr)}.pcontent,.pmeta{order:0}}\
+.pmeta h2,.tabpanel>h2,.snip-label{font-size:12px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--muted)}\
+.pmeta>div,.pmeta>section{margin-bottom:22px}\
+.pmeta h2{margin:0 0 6px}\
+.pmeta h3{font-size:11px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);margin:0 0 5px}\
+.pmeta .sb-block{margin:0 0 14px}\
 .pmeta .vals{list-style:none;margin:0;padding:0}\
 .pmeta .vals li{margin:2px 0;word-break:break-word}\
 .pmeta .pill{font-size:13px}\
+.pmeta .tablink.active{color:var(--fg);font-weight:600}\
+.sb-cap{margin:0 0 9px;font-size:12px;color:var(--muted);line-height:1.45}\
+.sb-dl{margin:0}\
+.sb-dl dt{font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);margin-top:9px}\
+.sb-dl dd{margin:1px 0 0;font-size:13px;word-break:break-word}\
+.sb-verified h2::before{content:'✓ ';color:#16a34a}\
+.tabpanel{margin:0 0 26px}\
+.tabpanel>h2{margin:0 0 12px}\
+.js-tabs .tabpanel{display:none}\
+.js-tabs .tabpanel.active{display:block}\
+.releases{list-style:none;margin:0;padding:0}\
+.releases li{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 10px;padding:9px 0;border-bottom:1px solid var(--border)}\
+.releases a{font-weight:500}\
+.release.current a{font-weight:700}\
+.rel-badge{font-size:11px;color:var(--accent);border:1px solid var(--accent);border-radius:5px;padding:0 6px}\
+.rel-meta{margin-left:auto;color:var(--muted);font-size:12px}\
 .readme{white-space:pre-wrap;word-wrap:break-word;max-height:560px;overflow:auto}\
-.readme-sec{margin:0 0 26px}\
+.readme-md{font-size:15px;line-height:1.65;overflow-wrap:anywhere}\
+.readme-md>:first-child{margin-top:0}\
+.readme-md h1{font-size:25px}\
+.readme-md h2{font-size:20px;text-transform:none;letter-spacing:-.01em;color:var(--fg);border-bottom:1px solid var(--border);padding-bottom:5px;margin:26px 0 12px}\
+.readme-md h3{font-size:16px;text-transform:none;letter-spacing:normal;color:var(--fg);margin:20px 0 8px}\
+.readme-md code{background:var(--code);padding:1px 5px;border-radius:4px;font-size:.92em}\
+.readme-md pre{margin:14px 0}\
+.readme-md pre code{background:none;padding:0}\
+.readme-md img{max-width:100%;height:auto}\
+.readme-md a{color:var(--accent)}\
+.readme-md blockquote{margin:14px 0;padding:2px 14px;border-left:3px solid var(--border);color:var(--muted)}\
+.readme-md table{border-collapse:collapse;margin:14px 0;font-size:14px}\
+.readme-md th,.readme-md td{border:1px solid var(--border);padding:5px 10px;text-align:left}\
 .files h2{margin:0 0 8px}\
 table.files-t{width:100%;border-collapse:collapse;font-size:13px}\
 table.files-t th{text-align:left;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);padding:6px 8px}\
@@ -166,6 +211,21 @@ var box=b.closest('.snip')||b.closest('.idx');if(!box)return;\
 var c=box.querySelector('code').innerText;\
 navigator.clipboard.writeText(c).then(function(){var o=b.textContent;b.textContent='Copied';b.classList.add('ok');\
 setTimeout(function(){b.textContent=o;b.classList.remove('ok')},1200)})})});\
+</script>";
+
+/// Tab switcher for the project page's Navigation. Progressive enhancement: with
+/// JS off, every panel is plain markup and stays visible (the links act as
+/// in-page anchors); with JS on, the panels become tabs. Targets `.ptabs` so it
+/// never touches another page.
+const TABS_JS: &str = "<script>\
+(function(){var root=document.querySelector('.ptabs');if(!root)return;\
+var links=root.querySelectorAll('.tablink');var panels=root.querySelectorAll('.tabpanel');\
+if(!panels.length)return;root.classList.add('js-tabs');\
+function show(id){var ok=false;panels.forEach(function(p){var on=p.id===id;p.classList.toggle('active',on);ok=ok||on;});\
+links.forEach(function(l){l.classList.toggle('active',l.getAttribute('data-tab')===id);});return ok;}\
+if(!show((location.hash||'').slice(1)))show(panels[0].id);\
+links.forEach(function(l){l.addEventListener('click',function(e){e.preventDefault();var id=l.getAttribute('data-tab');\
+show(id);history.replaceState(null,'',l.getAttribute('href'));});});})();\
 </script>";
 
 /// Live filter for the package browser. Progressive enhancement — the full list
@@ -377,114 +437,284 @@ aria-label=\"Search packages\" autocomplete=\"off\" autofocus></form>",
     shell("pypiron · packages", &body, false, false)
 }
 
-/// A human-readable project page modelled on pypi.org: install snippets, the
-/// README shown **verbatim** (never rendered — that's a separate opt-in), a
-/// metadata sidebar, and the list of release files. `files` is the package's
-/// artifacts (any order — sorted here, newest first); `meta` is the parsed
-/// core metadata of the representative file, absent for legacy/minimal packages.
+/// A human-readable project page modelled on pypi.org. `files` is *every*
+/// artifact for the package (any order); `selected` is the version this view
+/// focuses on — the latest, or the one in the URL on a per-version page — and
+/// `pinned` marks that it came from a `/project/<pkg>/<version>/` request (it
+/// pins the `uv add` snippet). `meta` is the selected version's representative
+/// core metadata (the README is rendered when it declares Markdown, else shown
+/// verbatim). `verified` is the PEP 740 publisher of the selected version and
+/// the artifact filename whose `.provenance` backs it, present only for files
+/// that carry relayed attestations. The content area has three tab panels —
+/// description, release history, download files — switched by the sidebar.
+#[allow(clippy::too_many_arguments)]
 pub fn project_html(
     ctx: &PageContext,
     pkg: &str,
     files: &[FileMetadata],
+    selected: &str,
+    pinned: bool,
     meta: Option<&CoreMetadata>,
+    verified: Option<(&Publisher, &str)>,
 ) -> String {
     let index_url = format!("{}/simple/", ctx.base_url);
-    let install = [
-        snippet(
-            "uv",
-            &format!("uv pip install --index-url {index_url} {pkg}"),
-        ),
-        snippet("pip", &format!("pip install --index-url {index_url} {pkg}")),
-    ]
-    .concat();
+    // The one index URL, top-right and copyable — the same de-emphasized
+    // component the landing page carries. Request-derived, so escaped as text
+    // (never an attribute); the copy button reads it straight from the DOM.
+    let index_copy = format!(
+        "<div class=\"idx\"><code class=\"idx-url\">{url}</code>\
+<div class=\"idx-row\"><span class=\"idx-label\">Index URL</span>\
+<button class=\"copy\" type=\"button\">Copy</button></div></div>",
+        url = encode_text(&index_url),
+    );
 
-    let version = meta
-        .and_then(|m| m.version.as_deref())
-        .or_else(|| files.iter().find_map(|f| f.version.as_deref()))
-        .unwrap_or("");
+    // Install snippet: `uv add` only, pinned to the version on a version page.
+    let target = if pinned && !selected.is_empty() {
+        format!("{pkg}=={selected}")
+    } else {
+        pkg.to_string()
+    };
+    let install = snippet("uv", &format!("uv add --index {index_url} {target}"));
+
+    // The banner's version and "Released" date come from the selected version.
+    // An empty `selected` means no derivable version (legacy artifacts) — show
+    // every file rather than nothing.
+    let sel_files: Vec<&FileMetadata> = if selected.is_empty() {
+        files.iter().collect()
+    } else {
+        files
+            .iter()
+            .filter(|f| file_version(f).as_deref() == Some(selected))
+            .collect()
+    };
+    let ver = if selected.is_empty() {
+        String::new()
+    } else {
+        format!(" <span class=\"pver\">{}</span>", encode_text(selected))
+    };
     let summary = meta
         .and_then(|m| m.summary.as_deref())
         .map(|s| format!("<p class=\"summary\">{}</p>", encode_text(s)))
         .unwrap_or_default();
+    let released = newest_upload_date(&sel_files)
+        .map(|d| format!("<p class=\"phead-date\">Released {}</p>", encode_text(&d)))
+        .unwrap_or_default();
 
-    let readme = match meta.and_then(|m| m.description.as_deref()) {
-        Some(desc) if !desc.trim().is_empty() => format!(
-            "<section class=\"readme-sec\"><div class=\"snip-h\">\
-<span class=\"snip-label\">Readme</span><span class=\"muted-s\">shown unrendered</span></div>\
-<pre class=\"readme\"><code>{}</code></pre></section>",
-            encode_text(desc),
-        ),
-        _ => String::new(),
-    };
-
+    // Layout mirrors pypi.org: a slim brand strip, then a package banner (name
+    // + `uv add`), then a metadata sidebar on the LEFT (Navigation tabs +
+    // Verified/Unverified details) with the tab panels on the right.
     let body = format!(
-        "<header class=\"hero compact\">{logo}<h1>{name}{ver}</h1>{summary}</header>\
-<div class=\"pcols\"><div class=\"pcontent\">{install}{readme}{files_table}</div>\
-<aside class=\"pmeta\">{sidebar}</aside></div>\
+        "<header class=\"top\"><div class=\"brand\">{logo}\
+<a class=\"home\" href=\"/\">pypiron</a></div>{index_copy}</header>\
+<header class=\"phead\"><div class=\"phead-main\">\
+<h1 class=\"phead-name\">{name}{ver}</h1>{released}{summary}</div>\
+<div class=\"phead-install\">{install}</div></header>\
+<div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{verified}{unverified}</aside>\
+<div class=\"pcontent\">{desc}{history}{dl}</div></div>\
 <nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/projects/\">All packages</a> · \
 <a href=\"/simple/{name}/\">Simple index</a></nav>\
-<p class=\"ver\">pypiron v{appver}</p>",
+<p class=\"ver\">pypiron v{appver}</p>{TABS_JS}",
         logo = logo_link(),
         name = encode_text(pkg),
-        ver = if version.is_empty() {
-            String::new()
-        } else {
-            format!(" <span class=\"summary\">{}</span>", encode_text(version))
-        },
-        files_table = files_table(pkg, files),
-        sidebar = sidebar(meta),
+        nav = nav_section(),
+        verified = verified_section(pkg, verified),
+        unverified = unverified_section(meta),
+        desc = description_panel(meta),
+        history = release_history_panel(pkg, files, selected),
+        dl = files_panel(pkg, &sel_files),
         appver = encode_text(ctx.version),
     );
     shell(&format!("{pkg} · pypiron"), &body, true, true)
 }
 
-/// The release-files table: filename (download link), version, size, upload
-/// date, and a yank badge. Newest upload first.
-fn files_table(pkg: &str, files: &[FileMetadata]) -> String {
+/// A file's version: the sidecar value, else inferred from the filename. Shared
+/// with the request handler, which uses it to enumerate and select versions.
+pub(crate) fn file_version(f: &FileMetadata) -> Option<String> {
+    f.version
+        .clone()
+        .filter(|v| !v.is_empty())
+        .or_else(|| infer_version_from_filename(&f.filename))
+}
+
+/// The sidebar's "Navigation" block — the three tab links. With JS off they act
+/// as plain in-page anchors; [`TABS_JS`] upgrades them to tabs.
+fn nav_section() -> String {
+    "<div class=\"sb\"><h2>Navigation</h2><ul class=\"vals\">\
+<li><a class=\"tablink\" data-tab=\"description\" href=\"#description\">Project description</a></li>\
+<li><a class=\"tablink\" data-tab=\"history\" href=\"#history\">Release history</a></li>\
+<li><a class=\"tablink\" data-tab=\"files\" href=\"#files\">Download files</a></li>\
+</ul></div>"
+        .to_string()
+}
+
+/// The newest upload date (`YYYY-MM-DD`) among `files` for the banner's
+/// "Released" line. RFC 3339 timestamps share a format, so lexical max is newest.
+fn newest_upload_date(files: &[&FileMetadata]) -> Option<String> {
+    files
+        .iter()
+        .filter_map(|f| f.upload_time.as_deref())
+        .max()
+        .map(|ts| date_only(ts).to_string())
+}
+
+/// The "Project description" tab: the README rendered when it's Markdown, shown
+/// verbatim otherwise, or a placeholder when the release carries none.
+fn description_panel(meta: Option<&CoreMetadata>) -> String {
+    let inner = match meta.and_then(|m| m.description.as_deref().map(|d| (m, d))) {
+        Some((m, desc)) if !desc.trim().is_empty() => {
+            if m.is_markdown() {
+                // The whitelist renderer only ever emits a fixed safe tag set,
+                // so a hostile README cannot inject active content.
+                format!(
+                    "<div class=\"readme-md\">{}</div>",
+                    markdown::render_limited(desc)
+                )
+            } else {
+                format!(
+                    "<div class=\"snip-h\"><span class=\"snip-label\">Readme</span>\
+<span class=\"muted-s\">shown unrendered</span></div>\
+<pre class=\"readme\"><code>{}</code></pre>",
+                    encode_text(desc),
+                )
+            }
+        }
+        _ => "<p class=\"empty\">This release has no project description.</p>".to_string(),
+    };
+    format!("<section class=\"tabpanel\" id=\"description\">{inner}</section>")
+}
+
+/// The "Release history" tab: every version newest-first (PEP 440 order), each
+/// linking to its per-version page, the selected one flagged. Date is the
+/// newest upload in that version; count is its file total.
+fn release_history_panel(pkg: &str, files: &[FileMetadata], selected: &str) -> String {
+    let mut by_ver: HashMap<String, (Option<String>, u32)> = HashMap::new();
+    for f in files {
+        let Some(v) = file_version(f) else { continue };
+        let e = by_ver.entry(v).or_insert((None, 0));
+        e.1 += 1;
+        if f.upload_time.as_deref() > e.0.as_deref() {
+            e.0 = f.upload_time.clone();
+        }
+    }
+    let mut rows: Vec<(String, Option<String>, u32)> =
+        by_ver.into_iter().map(|(v, (d, c))| (v, d, c)).collect();
+    rows.sort_by(|a, b| version_cmp_desc(&a.0, &b.0));
+
+    let pkg_attr = encode_double_quoted_attribute(pkg);
+    let items: String = rows
+        .iter()
+        .map(|(v, date, count)| {
+            let current = if v == selected { " current" } else { "" };
+            let badge = if v == selected {
+                " <span class=\"rel-badge\">This version</span>"
+            } else {
+                ""
+            };
+            format!(
+                "<li class=\"release{current}\">\
+<a href=\"/project/{pkg_attr}/{vattr}/\">{vtext}</a>{badge}\
+<span class=\"rel-meta\">{date} · {count} file{plural}</span></li>",
+                vattr = encode_double_quoted_attribute(v),
+                vtext = encode_text(v),
+                date = encode_text(date.as_deref().map(date_only).unwrap_or("")),
+                plural = if *count == 1 { "" } else { "s" },
+            )
+        })
+        .collect();
+    let body = if items.is_empty() {
+        "<p class=\"empty\">No releases.</p>".to_string()
+    } else {
+        format!("<ul class=\"releases\">{items}</ul>")
+    };
+    format!("<section class=\"tabpanel\" id=\"history\"><h2>Release history</h2>{body}</section>")
+}
+
+/// The "Download files" tab: the selected version's artifacts (download link,
+/// size, upload date, yank badge), newest upload first.
+fn files_panel(pkg: &str, files: &[&FileMetadata]) -> String {
     if files.is_empty() {
-        return "<section class=\"files\"><h2>Files</h2><p class=\"empty\">No files.</p></section>"
+        return "<section class=\"tabpanel\" id=\"files\"><h2>Files</h2>\
+<p class=\"empty\">No files for this release.</p></section>"
             .to_string();
     }
-    let mut sorted: Vec<&FileMetadata> = files.iter().collect();
+    let mut sorted: Vec<&FileMetadata> = files.to_vec();
     // Newest upload first; ties broken by filename for deterministic output.
     sorted.sort_by(|a, b| {
         b.upload_time
             .cmp(&a.upload_time)
             .then_with(|| a.filename.cmp(&b.filename))
     });
+    let pkg_attr = encode_double_quoted_attribute(pkg);
     let mut rows = String::new();
-    for f in sorted {
+    for f in &sorted {
         let yank = match &f.yanked {
             Yanked::Flag(false) => String::new(),
             Yanked::Flag(true) => " <span class=\"yank\">yanked</span>".to_string(),
-            Yanked::Reason(r) => {
-                format!(" <span class=\"yank\">yanked: {}</span>", encode_text(r))
-            }
+            Yanked::Reason(r) => format!(" <span class=\"yank\">yanked: {}</span>", encode_text(r)),
         };
         rows.push_str(&format!(
-            "<tr><td><a href=\"/files/{pkg}/{href}\">{name}</a>{yank}</td>\
-<td>{ver}</td><td>{size}</td><td>{when}</td></tr>",
-            pkg = encode_double_quoted_attribute(pkg),
+            "<tr><td><a href=\"/files/{pkg_attr}/{href}\">{name}</a>{yank}</td>\
+<td>{size}</td><td>{when}</td></tr>",
             href = encode_double_quoted_attribute(&f.filename),
             name = encode_text(&f.filename),
-            ver = encode_text(f.version.as_deref().unwrap_or("")),
             size = human_size(f.size),
             when = encode_text(f.upload_time.as_deref().map(date_only).unwrap_or("")),
         ));
     }
     format!(
-        "<section class=\"files\"><h2>Files</h2><table class=\"files-t\">\
-<thead><tr><th>File</th><th>Version</th><th>Size</th><th>Uploaded</th></tr></thead>\
+        "<section class=\"tabpanel\" id=\"files\"><h2>Files</h2><table class=\"files-t\">\
+<thead><tr><th>File</th><th>Size</th><th>Uploaded</th></tr></thead>\
 <tbody>{rows}</tbody></table></section>",
     )
 }
 
-/// The metadata sidebar. Returns a note when there's no metadata to show.
-fn sidebar(meta: Option<&CoreMetadata>) -> String {
-    let Some(m) = meta else {
-        return "<p class=\"muted-s\">No metadata available for this package.</p>".to_string();
+/// The "Verified details" sidebar section. Shown only when the selected version
+/// carries a relayed PEP 740 attestation: pypiron does NOT re-verify it, so this
+/// names the publisher the upstream index recorded and links the raw
+/// `.provenance` so anyone can re-verify — it never claims this server did the
+/// cryptography.
+fn verified_section(pkg: &str, verified: Option<(&Publisher, &str)>) -> String {
+    let Some((p, file)) = verified else {
+        return String::new();
     };
-    let mut out = String::new();
+    let mut rows = String::new();
+    rows.push_str(&kv_row("Publisher", &p.kind));
+    if let Some(repo) = &p.repository {
+        match repo_url(&p.kind, repo) {
+            Some(url) => rows.push_str(&format!(
+                "<dt>Repository</dt><dd><a href=\"{href}\" rel=\"nofollow noopener noreferrer\">{txt}</a></dd>",
+                href = encode_double_quoted_attribute(&url),
+                txt = encode_text(repo),
+            )),
+            None => rows.push_str(&kv_row("Repository", repo)),
+        }
+    }
+    if let Some(w) = &p.workflow {
+        rows.push_str(&kv_row("Workflow", w));
+    }
+    if let Some(e) = &p.environment {
+        rows.push_str(&kv_row("Environment", e));
+    }
+    format!(
+        "<section class=\"sb sb-verified\"><h2>Verified details</h2>\
+<p class=\"sb-cap\">Recorded by the publishing index and relayed here, not re-verified by this \
+server. <a href=\"/files/{pkg_attr}/{file_attr}.provenance\">Re-verify ↓</a></p>\
+<dl class=\"sb-dl\">{rows}</dl></section>",
+        pkg_attr = encode_double_quoted_attribute(pkg),
+        file_attr = encode_double_quoted_attribute(file),
+    )
+}
+
+/// The "Unverified details" sidebar section: the package's self-declared
+/// metadata (project links, license, author, deps, classifiers), framed plainly
+/// as author-reported and unverified.
+fn unverified_section(meta: Option<&CoreMetadata>) -> String {
+    let Some(m) = meta else {
+        return "<section class=\"sb\"><h2>Details</h2>\
+<p class=\"muted-s\">No metadata available for this package.</p></section>"
+            .to_string();
+    };
+    let mut blocks = String::new();
 
     let links: String = m
         .project_urls
@@ -500,61 +730,86 @@ fn sidebar(meta: Option<&CoreMetadata>) -> String {
         })
         .collect();
     if !links.is_empty() {
-        out.push_str(&format!(
-            "<div><h2>Links</h2><ul class=\"vals\">{links}</ul></div>"
+        blocks.push_str(&format!(
+            "<div class=\"sb-block\"><h3>Project links</h3><ul class=\"vals\">{links}</ul></div>"
         ));
     }
 
-    meta_block(&mut out, "License", m.license.as_deref());
-    meta_block(&mut out, "Requires Python", m.requires_python.as_deref());
     let author = match (m.author.as_deref(), m.author_email.as_deref()) {
         (Some(a), Some(e)) => Some(format!("{a} <{e}>")),
         (Some(a), None) => Some(a.to_string()),
         (None, Some(e)) => Some(e.to_string()),
         (None, None) => None,
     };
-    meta_block(&mut out, "Author", author.as_deref());
-    meta_block(&mut out, "Keywords", m.keywords.as_deref());
+    let mut dl = String::new();
+    push_kv(&mut dl, "License", m.license.as_deref());
+    push_kv(&mut dl, "Requires Python", m.requires_python.as_deref());
+    push_kv(&mut dl, "Author", author.as_deref());
+    push_kv(&mut dl, "Keywords", m.keywords.as_deref());
+    if !dl.is_empty() {
+        blocks.push_str(&format!("<dl class=\"sb-dl\">{dl}</dl>"));
+    }
 
     if !m.requires_dist.is_empty() {
-        out.push_str(&list_block("Dependencies", &m.requires_dist));
+        blocks.push_str(&sub_list("Dependencies", &m.requires_dist));
     }
     if !m.classifiers.is_empty() {
-        out.push_str(&list_block("Classifiers", &m.classifiers));
+        blocks.push_str(&sub_list("Classifiers", &m.classifiers));
     }
 
-    if out.is_empty() {
-        return "<p class=\"muted-s\">No metadata available for this package.</p>".to_string();
+    if blocks.is_empty() {
+        return "<section class=\"sb\"><h2>Details</h2>\
+<p class=\"muted-s\">No details provided.</p></section>"
+            .to_string();
     }
-    out
+    format!(
+        "<section class=\"sb\"><h2>Unverified details</h2>\
+<p class=\"sb-cap\">Self-reported by the package author; not verified.</p>{blocks}</section>"
+    )
 }
 
-/// A single labelled sidebar value, omitted when absent.
-fn meta_block(out: &mut String, label: &str, value: Option<&str>) {
+/// A `<dt>/<dd>` row, omitting nothing — caller filters absent values.
+fn kv_row(k: &str, v: &str) -> String {
+    format!("<dt>{}</dt><dd>{}</dd>", encode_text(k), encode_text(v))
+}
+
+/// Append a `<dt>/<dd>` row when `value` is present and non-blank.
+fn push_kv(out: &mut String, k: &str, value: Option<&str>) {
     if let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) {
-        out.push_str(&format!(
-            "<div><h2>{label}</h2><div class=\"pill\">{value}</div></div>",
-            label = encode_text(label),
-            value = encode_text(v),
-        ));
+        out.push_str(&kv_row(k, v));
     }
 }
 
-/// A labelled list of values (dependencies, classifiers).
-fn list_block(label: &str, values: &[String]) -> String {
+/// A labelled sub-list of values (dependencies, classifiers).
+fn sub_list(label: &str, values: &[String]) -> String {
     let items: String = values
         .iter()
         .map(|v| format!("<li>{}</li>", encode_text(v)))
         .collect();
     format!(
-        "<div><h2>{label}</h2><ul class=\"vals pill\">{items}</ul></div>",
-        label = encode_text(label),
+        "<div class=\"sb-block\"><h3>{}</h3><ul class=\"vals pill\">{items}</ul></div>",
+        encode_text(label),
     )
 }
 
+/// Build a repository URL for the publisher hosts we recognize (`owner/name`
+/// path only); anything unusual falls back to plain text.
+fn repo_url(kind: &str, repo: &str) -> Option<String> {
+    let host = match kind.to_ascii_lowercase() {
+        k if k.contains("github") => "github.com",
+        k if k.contains("gitlab") => "gitlab.com",
+        _ => return None,
+    };
+    if repo.is_empty() || repo.starts_with('/') || repo.contains("..") || !repo.contains('/') {
+        return None;
+    }
+    Some(format!("https://{host}/{repo}"))
+}
+
 /// Allow only `http`/`https` URLs into an `href` — author-controlled metadata
-/// must never smuggle in `javascript:` or `data:` schemes.
-fn safe_href(url: &str) -> Option<&str> {
+/// must never smuggle in `javascript:` or `data:` schemes. Shared with
+/// [`crate::markdown`], which applies the same policy to README links/images.
+pub(crate) fn safe_href(url: &str) -> Option<&str> {
     // Compare on bytes: a metadata URL is arbitrary UTF-8, and slicing a `&str`
     // at a fixed index panics when it splits a multi-byte char (a request-path
     // panic, since the value rides in from package METADATA). `[u8]` slices are
@@ -755,6 +1010,179 @@ mod tests {
         assert!(!html.contains("class=\"inv\""));
         assert!(!html.contains("class=\"activity\""));
         assert!(!html.contains("Top projects"));
+    }
+
+    fn file(name: &str, version: &str, when: &str) -> FileMetadata {
+        FileMetadata {
+            filename: name.into(),
+            sha256: "abc".into(),
+            size: 2048,
+            upload_time: Some(when.into()),
+            version: Some(version.into()),
+            yanked: Yanked::Flag(false),
+            requires_python: None,
+            core_metadata: false,
+            provenance: false,
+        }
+    }
+
+    fn imaginairy_meta() -> CoreMetadata {
+        let mut m = CoreMetadata {
+            version: Some("15.0.0".into()),
+            summary: Some("AI imagined images.".into()),
+            description: Some("# imaginAIry\n\nlong **readme** body".into()),
+            description_content_type: Some("text/markdown".into()),
+            requires_python: Some(">=3.10".into()),
+            ..Default::default()
+        };
+        m.project_urls
+            .push(("Homepage".into(), "https://example.com".into()));
+        m
+    }
+
+    fn imaginairy_files() -> Vec<FileMetadata> {
+        vec![
+            file(
+                "imaginAIry-14.3.0-py3-none-any.whl",
+                "14.3.0",
+                "2026-05-01T00:00:00Z",
+            ),
+            file(
+                "imaginAIry-15.0.0-py3-none-any.whl",
+                "15.0.0",
+                "2026-06-10T00:00:00Z",
+            ),
+        ]
+    }
+
+    #[test]
+    fn project_page_mirrors_pypi_layout() {
+        let m = imaginairy_meta();
+        let files = imaginairy_files();
+        let html = project_html(
+            &ctx(),
+            "imaginairy",
+            &files,
+            "15.0.0",
+            false,
+            Some(&m),
+            None,
+        );
+
+        // Slim brand strip (home link + index URL), then a package banner.
+        assert!(html.contains("class=\"home\" href=\"/\""));
+        assert!(html.contains("class=\"idx\""));
+        assert!(html.contains("https://pkgs.example.com/simple/"));
+        assert!(html.contains(
+            "<h1 class=\"phead-name\">imaginairy <span class=\"pver\">15.0.0</span></h1>"
+        ));
+        // Banner date is the selected version's newest upload.
+        assert!(html.contains("Released 2026-06-10"));
+        // Install is `uv add` only — no pip / uv pip forms anywhere.
+        assert!(html.contains("class=\"phead-install\""));
+        assert!(html.contains("uv add --index https://pkgs.example.com/simple/ imaginairy"));
+        assert!(!html.contains("uv pip install"));
+        assert!(!html.contains("pip install"));
+        // Metadata sidebar sits to the LEFT of the content (pypi.org order).
+        assert!(html.find("class=\"pmeta\"").unwrap() < html.find("class=\"pcontent\"").unwrap());
+        // Tabbed Navigation: three links → three panels.
+        assert!(html.contains("class=\"pcols ptabs\""));
+        for tab in ["description", "history", "files"] {
+            assert!(html.contains(&format!("data-tab=\"{tab}\"")));
+            assert!(html.contains(&format!("id=\"{tab}\"")));
+        }
+        // Markdown README is rendered (not shown verbatim in a <pre>).
+        assert!(html.contains("<div class=\"readme-md\"><h1>imaginAIry</h1>"));
+        assert!(html.contains("<strong>readme</strong>"));
+        assert!(!html.contains("<pre class=\"readme\">"));
+        // Release history links every version to its per-version page.
+        assert!(html.contains("href=\"/project/imaginairy/14.3.0/\""));
+        assert!(html.contains("href=\"/project/imaginairy/15.0.0/\""));
+        // Self-reported metadata under "Unverified details"; no attestation.
+        assert!(html.contains("<h2>Unverified details</h2>"));
+        assert!(html.contains("<h3>Project links</h3>"));
+        assert!(!html.contains("Verified details"));
+    }
+
+    #[test]
+    fn version_page_pins_install_and_flags_current_release() {
+        let m = imaginairy_meta();
+        let files = imaginairy_files();
+        // A per-version view of 14.3.0.
+        let html = project_html(&ctx(), "imaginairy", &files, "14.3.0", true, Some(&m), None);
+        // The banner and install snippet pin the selected version.
+        assert!(html.contains("<span class=\"pver\">14.3.0</span>"));
+        assert!(html.contains("uv add --index https://pkgs.example.com/simple/ imaginairy==14.3.0"));
+        // Release history marks 14.3.0 as the current one.
+        assert!(html.contains("class=\"release current\""));
+        assert!(html.contains("This version"));
+        // Download files shows only the selected version's artifacts.
+        let dl = &html[html.find("id=\"files\"").unwrap()..];
+        assert!(dl.contains("imaginAIry-14.3.0-py3-none-any.whl"));
+        assert!(!dl.contains("imaginAIry-15.0.0-py3-none-any.whl"));
+    }
+
+    #[test]
+    fn verified_details_render_from_relayed_attestation() {
+        let m = imaginairy_meta();
+        let files = imaginairy_files();
+        let pubr = Publisher {
+            kind: "GitHub".into(),
+            repository: Some("brycedrennan/imaginAIry".into()),
+            workflow: Some("release.yml".into()),
+            environment: Some("pypi".into()),
+        };
+        let html = project_html(
+            &ctx(),
+            "imaginairy",
+            &files,
+            "15.0.0",
+            false,
+            Some(&m),
+            Some((&pubr, "imaginAIry-15.0.0-py3-none-any.whl")),
+        );
+        assert!(html.contains("<h2>Verified details</h2>"));
+        // Honest framing: relayed, not re-verified here.
+        assert!(html.contains("not re-verified by this server"));
+        // GitHub repo becomes a link; provenance is re-verifiable.
+        assert!(html.contains("href=\"https://github.com/brycedrennan/imaginAIry\""));
+        assert!(html.contains("/files/imaginairy/imaginAIry-15.0.0-py3-none-any.whl.provenance"));
+        assert!(html.contains("<dt>Workflow</dt><dd>release.yml</dd>"));
+    }
+
+    #[test]
+    fn non_markdown_readme_is_shown_verbatim() {
+        let m = CoreMetadata {
+            description: Some("Plain * text & <not> markdown".into()),
+            description_content_type: Some("text/plain".into()),
+            ..Default::default()
+        };
+        let files = [file(
+            "x-1.0-py3-none-any.whl",
+            "1.0",
+            "2026-01-01T00:00:00Z",
+        )];
+        let html = project_html(&ctx(), "x", &files, "1.0", false, Some(&m), None);
+        assert!(html.contains("<pre class=\"readme\">"));
+        assert!(html.contains("shown unrendered"));
+        assert!(html.contains("Plain * text &amp; &lt;not&gt; markdown"));
+        assert!(!html.contains("<div class=\"readme-md\">"));
+    }
+
+    #[test]
+    fn project_page_without_metadata_still_has_tabs_and_files() {
+        let files = [file(
+            "x-1.0-py3-none-any.whl",
+            "1.0",
+            "2026-01-01T00:00:00Z",
+        )];
+        let html = project_html(&ctx(), "x", &files, "1.0", false, None, None);
+        // Tabs always present; description falls back to a placeholder.
+        assert!(html.contains("data-tab=\"description\""));
+        assert!(html.contains("This release has no project description."));
+        assert!(html.contains("No metadata available"));
+        assert!(html.contains("uv add --index https://pkgs.example.com/simple/ x"));
+        assert!(html.contains("x-1.0-py3-none-any.whl"));
     }
 
     #[test]

@@ -103,6 +103,24 @@ def test_exclude_newer_bounds_mirroring(disk_server, pypiron_bin, tmp_path):
         assert uploaded < cutoff_dt, f"{name} uploaded {uploaded}, after the cutoff"
 
 
+def test_duration_cutoff_is_accepted(disk_server, pypiron_bin, tmp_path):
+    """A cutoff may be a relative duration (uv-style), not just an RFC 3339
+    timestamp: `--exclude-older "1 day"` resolves to ~yesterday, so six's
+    long-old wheels are all filtered out and nothing is mirrored."""
+    pkg_list = _packages_list(tmp_path, PACKAGE)
+    rc, out, err = sync_to(
+        pypiron_bin,
+        disk_server,
+        "--packages-list",
+        str(pkg_list),
+        "--only-wheels",
+        "--exclude-older",
+        "1 day",
+    )
+    assert rc == 0, f"a duration cutoff must be accepted:\n{out}\n{err}"
+    assert _wheels(disk_server) == [], "every six wheel predates a 1-day cutoff"
+
+
 def test_filters_never_remove_mirrored_files(disk_server, pypiron_bin, tmp_path):
     def sync(spec, *extra):
         pkg_list = _packages_list(tmp_path, spec)

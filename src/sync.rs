@@ -29,7 +29,7 @@ use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
@@ -177,6 +177,11 @@ struct Resolved {
     dry_run: bool,
     full: bool,
     filter: ResolvedFilter,
+    /// The raw `--exclude-older` input (e.g. `"800 days"`), kept verbatim for
+    /// [`config_key`]: a relative duration must hash to a value that is *stable*
+    /// across runs, or the sync cursor never matches its own prior config and
+    /// every run re-fetches. Only the older bound needs this — see [`config_key`].
+    exclude_older_raw: Option<String>,
 }
 
 pub(crate) struct ResolvedFilter {
@@ -247,6 +252,17 @@ impl Resolved {
             )
         })?);
 
+        // The exact `--exclude-older` value that feeds `parse_cutoff` (CLI over
+        // file), normalized the same way it trims: kept so `config_key` can hash
+        // the *input* rather than the now-relative instant it resolves to.
+        let exclude_older_raw = filter
+            .exclude_older
+            .as_deref()
+            .or(cfg.exclude_older.as_deref())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned);
+
         Ok(Self {
             specs,
             src_base: args
@@ -280,11 +296,9 @@ impl Resolved {
                     "exclude-newer",
                     filter.exclude_newer.as_ref().or(cfg.exclude_newer.as_ref()),
                 )?,
-                exclude_older: parse_cutoff(
-                    "exclude-older",
-                    filter.exclude_older.as_ref().or(cfg.exclude_older.as_ref()),
-                )?,
+                exclude_older: parse_cutoff("exclude-older", exclude_older_raw.as_ref())?,
             },
+            exclude_older_raw,
         })
     }
 }
@@ -540,16 +554,32 @@ fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
         }
         h.update([0x1f]);
     }
+    // The two cutoffs are hashed asymmetrically — on purpose, don't "tidy" it.
+    //
+    // `--exclude-newer` keeps its *resolved* instant: an absolute timestamp is
+    // stable across runs anyway, and a relative one ("30 days") is meant to
+    // slide — as releases age past the upper bound they become eligible, which a
+    // 304 would silently miss, so its config must change each run to force a
+    // re-fetch and re-evaluation.
     h.update(
         f.exclude_newer
             .map_or(0i64, |d| d.unix_timestamp())
             .to_le_bytes(),
     );
+    // `--exclude-older` hashes its raw *input* instead, so a relative duration
+    // stays stable run to run. Its bound only ever slides files *out* of the
+    // set and a mirror never deletes, so there is nothing to re-evaluate —
+    // letting the cursor 304 a quiet package. Hashing the resolved instant here
+    // (as the newer bound does) would change every run and defeat the cursor for
+    // every relative-duration mirror.
     h.update(
-        f.exclude_older
-            .map_or(0i64, |d| d.unix_timestamp())
-            .to_le_bytes(),
+        resolved
+            .exclude_older_raw
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes(),
     );
+    h.update([0x1e]);
     if let Some(s) = &spec.specifiers {
         h.update(s.to_string().as_bytes());
     }
@@ -735,7 +765,50 @@ async fn sync_one_package(
         };
 
     let (selected, upstream_status, upstream_files) = select_from_index(index, resolved, spec);
-    info!("Syncing {pkg} ({} matching files selected)", selected.len());
+
+    let mut errors = 0usize;
+
+    // The dest's own materialized PEP 691 index — read via `/sync/local-index`
+    // so the on-demand proxy never shadows it — serves double duty: it tells us
+    // which files are already mirrored (skipped below, so a re-run does no work)
+    // and it is the truth reconcile and status relay diff against further down.
+    // A fetch error fails the package so the cursor doesn't advance over an
+    // un-reconciled state, and forgoes the skip — we fall back to uploading
+    // everything, which the server 409s for the duplicates.
+    let local = match fetch_local_index(client, resolved, pkg).await {
+        Ok(local) => local,
+        Err(e) => {
+            error!(package=%pkg, error=?e, "local-index fetch failed");
+            errors += 1;
+            None
+        }
+    };
+
+    // Skip files the destination already holds: re-uploading one only earns a
+    // 409 after a wasted download. The server keys that 409 on the filename (the
+    // storage key), so a filename match is exactly "already present".
+    let (selected, already_present) = {
+        let present: HashSet<&str> = local
+            .as_ref()
+            .map(|l| l.files.iter().map(|f| f.filename.as_str()).collect())
+            .unwrap_or_default();
+        let total = selected.len();
+        let to_upload: Vec<Selected> = selected
+            .into_iter()
+            .filter(|s| !present.contains(s.file.filename.as_str()))
+            .collect();
+        let already_present = total - to_upload.len();
+        (to_upload, already_present)
+    };
+
+    if already_present > 0 {
+        info!(
+            "Syncing {pkg} ({} new, {already_present} already mirrored)",
+            selected.len()
+        );
+    } else {
+        info!("Syncing {pkg} ({} matching files selected)", selected.len());
+    }
 
     if resolved.dry_run {
         for s in &selected {
@@ -750,7 +823,6 @@ async fn sync_one_package(
         .collect()
         .await;
 
-    let mut errors = 0usize;
     for r in &results {
         if let Err(e) = r {
             error!(package=%pkg, error=?e, "file failed");
@@ -761,19 +833,6 @@ async fn sync_one_package(
     // Upstream's authoritative PEP 792 verdict for this run.
     let upstream_blocks = matches!(&upstream_status, Some(doc) if doc.status.blocks_downloads());
     let upstream_frozen = matches!(&upstream_status, Some(doc) if !doc.status.is_active());
-
-    // The dest's own materialized PEP 691 index — read via `/sync/local-index`
-    // so the on-demand proxy never shadows it — is the truth that reconcile and
-    // status relay diff against. A fetch error fails the package so the cursor
-    // doesn't advance over an un-reconciled state.
-    let local = match fetch_local_index(client, resolved, pkg).await {
-        Ok(local) => local,
-        Err(e) => {
-            error!(package=%pkg, error=?e, "local-index fetch failed");
-            errors += 1;
-            None
-        }
-    };
 
     // Hold the cursor (force a re-fetch next run) when this run couldn't fully
     // reconcile despite a clean upload — otherwise a 304 next run masks the gap
@@ -1474,6 +1533,7 @@ mod tests {
             dry_run: false,
             full: false,
             filter,
+            exclude_older_raw: None,
         }
     }
 
@@ -1536,5 +1596,43 @@ mod tests {
             config_key(&resolved_with(wheels, "https://pypi.org"), &s)
         );
         assert_ne!(k, config_key(&r, &spec("requests", Some(">=2"))));
+    }
+
+    #[test]
+    fn config_key_older_bound_is_stable_across_relative_runs() {
+        let s = spec("requests", None);
+
+        // Two runs of the same `--exclude-older "800 days"` resolve to two
+        // different instants (now slides), but the raw input is identical. The
+        // key must stay stable, or the sync cursor never matches its own prior
+        // config and every relative-duration run needlessly re-fetches.
+        let mut run1 = resolved_with(
+            time_filter(None, Some("2024-01-01T00:00:00Z")),
+            "https://pypi.org",
+        );
+        let mut run2 = resolved_with(
+            time_filter(None, Some("2020-06-15T00:00:00Z")),
+            "https://pypi.org",
+        );
+        run1.exclude_older_raw = Some("800 days".into());
+        run2.exclude_older_raw = Some("800 days".into());
+        assert_eq!(config_key(&run1, &s), config_key(&run2, &s));
+
+        // A genuinely different older bound still invalidates the key.
+        run2.exclude_older_raw = Some("400 days".into());
+        assert_ne!(config_key(&run1, &s), config_key(&run2, &s));
+
+        // The newer bound is hashed by its resolved instant, so a sliding
+        // relative `--exclude-newer` keeps invalidating the key every run — by
+        // design: releases aging past it become eligible and a 304 would miss them.
+        let newer_a = resolved_with(
+            time_filter(Some("2024-01-01T00:00:00Z"), None),
+            "https://pypi.org",
+        );
+        let newer_b = resolved_with(
+            time_filter(Some("2020-06-15T00:00:00Z"), None),
+            "https://pypi.org",
+        );
+        assert_ne!(config_key(&newer_a, &s), config_key(&newer_b, &s));
     }
 }

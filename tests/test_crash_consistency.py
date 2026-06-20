@@ -67,6 +67,7 @@ def start_server(
     env.setdefault("RUST_LOG", "info,pypiron=debug")
     args = [
         str(bin_path),
+        "serve",
         "--bind-addr",
         f"127.0.0.1:{port}",
         "--data-dir",
@@ -279,7 +280,9 @@ def test_multi_node_s3_uploads_converge(pypiron_bin: Path, minio, tmp_path: Path
         env = _s3_env(minio, f"127.0.0.1:{port}")
         env.update(event_only_env)
         log = open(tmp_path / f"node-{port}.log", "w")
-        proc = subprocess.Popen([str(pypiron_bin)], env=env, stdout=log, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(
+            [str(pypiron_bin), "serve"], env=env, stdout=log, stderr=subprocess.STDOUT
+        )
         wait_http_responding(f"http://127.0.0.1:{port}/health", timeout=30)
         return proc, f"http://127.0.0.1:{port}"
 
@@ -370,7 +373,9 @@ def _start_s3_node(
         env["PYPIRON_FAULT_ABORT_AFTER_WRITES"] = str(fault_after)
     log_path = tmp_path / f"{label}.log"
     log = open(log_path, "w")
-    proc = subprocess.Popen([str(pypiron_bin)], env=env, stdout=log, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(
+        [str(pypiron_bin), "serve"], env=env, stdout=log, stderr=subprocess.STDOUT
+    )
     node = {"proc": proc, "base": f"http://127.0.0.1:{port}", "log": log_path, "label": label}
     try:
         # A faulted node may abort during boot writes; recovery proceeds either way.

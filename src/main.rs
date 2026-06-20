@@ -12,7 +12,7 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{Args as ClapArgs, CommandFactory, Parser, Subcommand};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{info, warn};
 
@@ -51,9 +51,11 @@ const PACKAGES_PREFIX: &str = "packages/";
 const SIMPLE_PREFIX: &str = "simple/";
 const DIRTY_PREFIX: &str = "_dirty/";
 
-// Bare `pypiron` (no args at all) prints help — listing the subcommands and the
-// global serve flags — via `arg_required_else_help`. A subcommand, or serve
-// flags without a subcommand (back-compat), runs the server.
+// Bare `pypiron` (no args) prints help (arg_required_else_help). Every verb is a
+// subcommand — serving is `pypiron serve`. Only genuinely cross-cutting flags
+// (`--log-format`) live at the top level; everything serve-specific is under
+// `serve`, so the top-level help stays a short front door instead of dumping
+// every server flag.
 /// PypIron — a fast single-binary PyPI server: index, upload, mirror, on-demand proxy.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, arg_required_else_help = true)]
@@ -62,15 +64,22 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Flattened server args so `pypiron <serve flags>` (no subcommand) still
-    /// serves; truly-bare `pypiron` shows help instead.
-    #[command(flatten)]
-    serve: ServeArgs,
+    /// Log output format: `text` (human-readable) or `json` (one object per
+    /// line, for log pipelines). Applies to every subcommand; `global` so it
+    /// may sit before or after the subcommand.
+    #[arg(
+        long,
+        env = "PYPIRON_LOG_FORMAT",
+        value_enum,
+        default_value_t = LogFormat::Text,
+        global = true
+    )]
+    log_format: LogFormat,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run the PypIron server (same args usable without the subcommand)
+    /// Run the PypIron server (the default day-to-day command)
     Serve(Box<ServeArgs>),
     /// Mirror packages from PyPI (or another source) into this PypIron instance
     Sync(Box<sync::SyncArgs>),
@@ -241,11 +250,6 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_READ_PASS")]
     read_pass: Option<String>,
 
-    /// Log output format: `text` (human-readable) or `json` (one object per
-    /// line, for log pipelines).
-    #[arg(long, env = "PYPIRON_LOG_FORMAT", value_enum, default_value_t = LogFormat::Text)]
-    log_format: LogFormat,
-
     /// Serve unknown (non-private) packages on demand from this upstream
     /// simple index (e.g. https://pypi.org): package pages are answered from
     /// upstream metadata and artifacts are downloaded, verified, and cached
@@ -313,11 +317,11 @@ struct AppState {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // logging — format comes from --log-format/PYPIRON_LOG_FORMAT (the env
-    // var also reaches `sync` runs through the flattened serve args).
+    // logging — format comes from the global --log-format/PYPIRON_LOG_FORMAT,
+    // so every subcommand (serve, sync, verify, resync) logs consistently.
     let env_filter =
         std::env::var("RUST_LOG").unwrap_or_else(|_| "info,pypiron=info,object_store=warn".into());
-    match cli.serve.log_format {
+    match cli.log_format {
         LogFormat::Text => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
@@ -326,28 +330,22 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Some(Commands::Sync(args)) => {
-            return sync::run_sync(*args).await;
-        }
-        Some(Commands::Verify(args)) => {
-            return verify::run_verify(*args).await;
-        }
-        Some(Commands::Resync(args)) => {
-            return run_resync(*args).await;
-        }
-        Some(Commands::Serve(args)) => {
-            return run_serve(*args).await;
-        }
+        Some(Commands::Sync(args)) => sync::run_sync(*args).await,
+        Some(Commands::Verify(args)) => verify::run_verify(*args).await,
+        Some(Commands::Resync(args)) => run_resync(*args).await,
+        Some(Commands::Serve(args)) => run_serve(*args, cli.log_format).await,
         None => {
-            // Back-compat: serve flags without a subcommand run the server.
-            // (Truly-bare `pypiron` prints help via arg_required_else_help and
-            // never reaches here.)
-            return run_serve(cli.serve).await;
+            // A global flag (e.g. --log-format) but no subcommand: nothing to
+            // run, so show help. Truly-bare `pypiron` never reaches here —
+            // arg_required_else_help prints help before dispatch.
+            Cli::command().print_help()?;
+            println!();
+            Ok(())
         }
     }
 }
 
-async fn run_serve(cli: ServeArgs) -> Result<()> {
+async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
     // Reject a half-configured credential before doing anything else: it can
     // never authenticate, and a half-set read credential would fail open and
     // serve every package publicly. Fail loudly at startup rather than silently.
@@ -484,7 +482,7 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
 
     // serve
     let listener = tokio::net::TcpListener::bind(&cli.bind_addr).await?;
-    match cli.log_format {
+    match log_format {
         LogFormat::Text => print_banner(&state, &cli.bind_addr, &storage_desc),
         // JSON consumers keep a single machine-readable readiness event.
         LogFormat::Json => info!(

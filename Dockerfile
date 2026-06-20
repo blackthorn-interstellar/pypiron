@@ -34,6 +34,7 @@ VOLUME /data
 EXPOSE 8080
 
 # Defaults (bind 0.0.0.0:8080, /data, health at /health) make this runnable
-# with no args; reads stay public until you set credentials. `pypiron` with no
-# subcommand serves. See `pypiron serve --help`.
-CMD ["pypiron"]
+# with no extra args; reads stay public until you set credentials. Bare
+# `pypiron` now prints help, so the image serves explicitly. See
+# `pypiron serve --help`.
+CMD ["pypiron", "serve"]

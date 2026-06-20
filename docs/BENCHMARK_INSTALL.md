@@ -514,3 +514,37 @@ and the gap over the field widens accordingly — vs pypicloud's 47 and pypiserv
 85, pypiron at its true ceiling is **~24× and ~42×** respectively. The competitors
 were already server-bound in §14 (their numbers are real ceilings); only pypiron
 and bandersnatch had headroom left, and this pins pypiron's.
+
+## 16. bandersnatch's true ceiling — NIC-bound, not CPU-bound (2026-06-20)
+
+§14 had bandersnatch at ≥512 (node ~60% CPU — not saturated). Re-run with the same
+4× c7i.8xlarge fleet that pinned pypiron:
+
+| agg concurrency | req/s | installs/s | server egress | node CPU | note |
+|---|---|---|---|---|---|
+| 4,096 | 5,441 | 419 | 831 MB/s | 115% | |
+| 8,192 | 7,465 | **574** | 804 MB/s | 119% | peak |
+| 16,384 | 5,346 | 411 | 834 MB/s | 112% | collapse |
+
+**bandersnatch's true ceiling ≈ 574 installs/s — and it's the server's NIC, not its
+CPU.** The egress NIC sampler peaked at **1,819 MB/s (~14.5 Gbps = the r7i.large's
+NIC wall)** while nginx CPU sat at only ~60%. Completed-install throughput plateaued
+~574/s (with lots of partial transfers in flight — that's why measured tx (1.8 GB/s)
+exceeds completed-request bytes (~0.8 GB/s)), then collapsed past the knee.
+
+This is the whole architecture argument in one number:
+
+| | bytes path | ceiling | bottleneck |
+|---|---|---|---|
+| **pypiron** | 302 → client pulls from **S3** | **~2,000 installs/s** | node **CPU** (NIC ~idle) |
+| bandersnatch | every byte **through nginx** | 574 installs/s | node **NIC** (~14.5 Gbps, CPU ~60%) |
+
+bandersnatch is the fastest *byte-serving* design there is (pure nginx zero-copy,
+no app layer), yet it tops out **~3.5× below pypiron** on the same box — because it
+must push every wheel byte through its own NIC, and that pipe saturates with CPU to
+spare. pypiron's presigned-redirect offload removes that ceiling entirely: its NIC
+carries only index + 302s, so it scales to its CPU. A bigger-NIC box lifts
+bandersnatch's number, but the byte-egress tax is structural; pypiron never pays it.
+
+Final true-ceiling ranking (r7i.large, 2 vCPU, host-net, real S3-download install-mix):
+pypiron ~2,000 ≫ bandersnatch 574 ≫ pypiserver 85 > pypicloud 47 > devpi 35 > proxpi 32.

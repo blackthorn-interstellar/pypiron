@@ -73,8 +73,8 @@ build-wheel:  ## Build Python wheel (local smoke-testing; releases happen in CI 
 	uv run -- maturin build --release
 
 # Coverage-guided fuzzing of the input-parsing modules (needs nightly +
-# `cargo install cargo-fuzz`). TARGET=fuzz_names|fuzz_wheel|fuzz_render|fuzz_coremeta|fuzz_range,
-# SECS overrides time.
+# `cargo install cargo-fuzz`). TARGET=fuzz_names|fuzz_wheel|fuzz_wheelzip|fuzz_render|
+# fuzz_coremeta|fuzz_range, SECS overrides time.
 FUZZ_TARGET ?= fuzz_render
 FUZZ_SECS ?= 60
 fuzz:  ## Run a fuzz target (FUZZ_TARGET=fuzz_render FUZZ_SECS=60)

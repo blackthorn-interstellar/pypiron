@@ -111,6 +111,35 @@ pub fn infer_version_from_filename(filename: &str) -> Option<String> {
     split_sdist_stem(stem).map(|(_, v)| v.to_string())
 }
 
+/// The PEP 427 compatibility tags of a wheel: the dot-separated alternatives in
+/// each of the python / abi / platform fields.
+#[derive(Debug, Clone)]
+pub struct WheelTags {
+    pub python: Vec<String>,
+    pub abi: Vec<String>,
+    pub platform: Vec<String>,
+}
+
+/// Parse a wheel filename into its (python, abi, platform) tags — the last three
+/// dash-separated fields before `.whl` per PEP 427. `None` for anything that
+/// isn't a wheel or is missing fields. The filename is attacker/upstream
+/// controlled (an upload form field or a mirrored artifact name), so this never
+/// panics: the `< 5` guard makes the `len() - 3/2/1` indexing total.
+pub fn parse_wheel_tags(filename: &str) -> Option<WheelTags> {
+    let stem = filename.strip_suffix(".whl")?;
+    let parts: Vec<&str> = stem.split('-').collect();
+    if parts.len() < 5 {
+        // name, version, [build?], py, abi, platform  -> min 5 fields (without build)
+        return None;
+    }
+    let dotted = |field: &str| field.split('.').map(str::to_string).collect::<Vec<_>>();
+    Some(WheelTags {
+        python: dotted(parts[parts.len() - 3]),
+        abi: dotted(parts[parts.len() - 2]),
+        platform: dotted(parts[parts.len() - 1]),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +323,23 @@ mod tests {
             infer_version_from_filename("six-1.16.0.tar.gz"),
             Some("1.16.0".to_string())
         );
+    }
+
+    #[test]
+    fn wheel_tags_parse_and_reject_real_shapes() {
+        // Standard, compound python tag, and build-tag wheels parse.
+        let t = parse_wheel_tags("six-1.16.0-py2.py3-none-any.whl").unwrap();
+        assert_eq!(t.python, ["py2", "py3"]);
+        assert_eq!(t.abi, ["none"]);
+        assert_eq!(t.platform, ["any"]);
+        let t = parse_wheel_tags("demo-1.0-1-cp311-cp311-manylinux_2_17_x86_64.whl").unwrap();
+        assert_eq!(t.python, ["cp311"]);
+
+        // Real malformed uploads (126 of 9.94M wheels): missing version or
+        // tag fields. Must be None, not a panic or a bogus parse.
+        assert!(parse_wheel_tags("JHVIT-0.0.1-py3-any.whl").is_none());
+        assert!(parse_wheel_tags("CLUEstering-1.0.2-none-any.whl").is_none());
+        assert!(parse_wheel_tags("GoldenFace1.1-py3-none-any.whl").is_none());
+        assert!(parse_wheel_tags("not-a-wheel-1.0.tar.gz").is_none());
     }
 }

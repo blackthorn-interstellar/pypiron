@@ -3,8 +3,9 @@
 The full reference. All options are available via CLI args and/or environment
 variables.
 
-## Storage (shared by `serve` and `sync`)
+## Storage (`serve`)
 
+The server owns storage; `sync` is a pure HTTP client (see [Sync](#sync-mirror-over-http)).
 One binary, one storage layer. `disk` is the zero-dependency default; the three
 cloud backends (`s3`, `gcs`, `azure`) share a single implementation over the
 [`object_store`](https://docs.rs/object_store) crate. Pick one with `--storage`.
@@ -125,6 +126,31 @@ username is parsed for attribution and the password is ignored. Tag cardinality
 in `/metrics` is capped (overflow lands in `_overflow`); tags are restricted to
 `[A-Za-z0-9._-]`, max 64 chars.
 
+## Sync (mirror over HTTP)
+
+`pypiron sync` mirrors packages from a PEP 691 source into a pypiron server. It
+is a pure HTTP client: each file is POSTed to the destination's `/legacy/` as a
+mirror upload (carrying PyPI's true `upload-time` and yank state), and the
+server owns every storage write. Sync needs a destination URL and the admin
+credential — nothing about the server's storage backend.
+
+| CLI Arg                       | Env Var                          | Default            | Description                                              |
+| ----------------------------- | -------------------------------- | ------------------ | ------------------------------------------------------- |
+| `--to URL`                    | `PYPIRON_SYNC_TO`                | *(required)*       | Destination pypiron base URL (or `[sync].to`)           |
+| `--from URL`                  | `PYPIRON_SYNC_FROM`              | `https://pypi.org` | Source PEP 691 index                                    |
+| `--username` / `--password`   | `PYPIRON_SYNC_USERNAME` / `_PASSWORD` | *(none)*      | Destination admin credential (mirroring is admin-only)  |
+| `--pkg SPEC`                  | —                                | *(none)*           | A package to mirror (repeatable; same syntax as a list line) |
+| `--packages-list PATH`        | `PYPIRON_PACKAGES_LIST`          | *(none)*           | File of packages, one per line                          |
+| `--private-prefix`            | `PYPIRON_PRIVATE_PREFIX`         | *(none)*           | Refuse to mirror names inside this namespace            |
+| `--concurrency N`             | `PYPIRON_SYNC_CONCURRENCY`       | `4`                | Parallel downloads/uploads within one package           |
+| `--package-concurrency N`     | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8`              | Packages synced in parallel                             |
+| `--dry-run`                   | —                                | `false`            | Print what would be mirrored, write nothing             |
+
+`--to` is mandatory (there is no direct-to-storage mode); without it (and no
+`[sync].to`) the run refuses to start. The package set comes from `--pkg`
+and/or `--packages-list`; when either is given on the CLI it fully replaces the
+config file's `[sync].packages`/`packages-list`.
+
 ## Re-sync, reconcile, and conditional fetch
 
 A re-`sync` doesn't just add new files — it *reconciles* what it already holds:
@@ -175,8 +201,8 @@ concurrency = 8
 ```
 
 A `packages-list` path in the file resolves relative to the config file, not
-the working directory. An explicit `--packages-list` on the CLI replaces the
-file's list entirely; other options layer per-key.
+the working directory. A CLI package source (`--pkg` and/or `--packages-list`)
+replaces the file's list entirely; other options layer per-key.
 
 The same filters gate what the proxy serves and caches, under a `--proxy-`
 prefix: `--proxy-only-wheels`, `--proxy-only-sdists`, `--proxy-python-tag`,
@@ -219,6 +245,12 @@ curl -u admin:secret -X DELETE http://localhost:8080/files/<pkg>/<filename>
 curl -u admin:secret -X POST -d "broken release" \
   http://localhost:8080/files/<pkg>/<filename>/yank
 curl -u admin:secret -X DELETE http://localhost:8080/files/<pkg>/<filename>/yank
+
+# Set / clear PEP 792 project status (body is the status doc); `sync` relays
+# upstream status through this endpoint.
+curl -u admin:secret -X POST -d '{"status":"quarantined","reason":"security hold"}' \
+  http://localhost:8080/project/<pkg>/status
+curl -u admin:secret -X DELETE http://localhost:8080/project/<pkg>/status
 ```
 
 ## Operations

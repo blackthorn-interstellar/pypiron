@@ -93,6 +93,34 @@ def run_returncode(
     return cp.returncode, cp.stdout, cp.stderr
 
 
+def sync_to(
+    pypiron_bin,
+    server: Dict,
+    *extra: str,
+    source: Optional[str] = None,
+    cwd: Optional[Path] = None,
+    timeout: float = 600,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[int, str, str]:
+    """Run `pypiron sync` in mirror-over-HTTP mode against `server` (the only
+    mode). Mirroring is an admin operation, so it authenticates with the admin
+    credential. Pass the package selection (`--pkg`/`--packages-list`) and any
+    filters in `*extra`; `source` sets `--from`. Returns (rc, out, err)."""
+    args = [
+        str(pypiron_bin),
+        "sync",
+        "--to",
+        server["base_url"],
+        "--username",
+        server.get("admin_user", server["user"]),
+        "--password",
+        server.get("admin_password", server["password"]),
+    ]
+    if source is not None:
+        args += ["--from", source]
+    return run_returncode([*args, *extra], cwd=cwd, timeout=timeout, env=env)
+
+
 def kill_process_tree(proc: subprocess.Popen) -> None:
     """Terminate a process, then kill if needed (cross-platform)."""
     if proc.poll() is not None:

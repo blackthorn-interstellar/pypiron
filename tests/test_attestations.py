@@ -22,7 +22,7 @@ from .helpers import (
     http_request_auth,
     make_wheel,
     pypi_provenance,
-    run_checked,
+    sync_to,
     upload_legacy,
     wait_for_file_in_index,
 )
@@ -175,7 +175,7 @@ PYPI_ATTESTED_VERSION = "4.0.0"
 PYPI_ATTESTED_WHEEL = "sampleproject-4.0.0-py3-none-any.whl"
 
 
-def test_sync_relays_provenance_from_pypi(disk_server, pypiron_bin, tmp_path):
+def test_sync_relays_provenance_from_pypi(disk_server, pypiron_bin):
     # Confirm upstream still serves this file's provenance; skip if PyPI changed.
     try:
         upstream_provenance = pypi_provenance(
@@ -184,20 +184,14 @@ def test_sync_relays_provenance_from_pypi(disk_server, pypiron_bin, tmp_path):
     except RuntimeError as e:
         pytest.skip(f"{PYPI_ATTESTED_WHEEL} provenance unavailable on PyPI: {e}")
 
-    pkg_list = tmp_path / "packages.txt"
-    pkg_list.write_text(f"{PYPI_ATTESTED_PKG}=={PYPI_ATTESTED_VERSION}\n")
-    run_checked(
-        [
-            str(pypiron_bin),
-            "sync",
-            "--packages-list",
-            str(pkg_list),
-            "--data-dir",
-            str(disk_server["data_dir"]),
-            "--only-wheels",
-        ],
-        timeout=600,
+    rc, out, err = sync_to(
+        pypiron_bin,
+        disk_server,
+        "--pkg",
+        f"{PYPI_ATTESTED_PKG}=={PYPI_ATTESTED_VERSION}",
+        "--only-wheels",
     )
+    assert rc == 0, f"sync failed:\n{out}\n{err}"
     index = wait_for_file_in_index(disk_server["simple"], PYPI_ATTESTED_PKG, PYPI_ATTESTED_WHEEL)
 
     entry = next(f for f in index["files"] if f["filename"] == PYPI_ATTESTED_WHEEL)

@@ -131,15 +131,16 @@ otherwise every mirrored file looks brand-new and `--exclude-newer` is useless.
 PyPI publishes the true timestamp per file (`upload-time` in its PEP 700 JSON), so
 the data is free; the design question is where it enters the system.
 
-The recommended path is **mirror-over-HTTP**: `sync --to <server>` POSTs each
-file to `/legacy/` with `mirror=true` plus PyPI's `upload_time` and yank state
-as form fields, authenticated against the admin credential. The server — and
-only the server — writes storage: it claims the package `mirror`-origin,
-persists the provided timestamp in the sidecar, and extracts PEP 658 metadata
-from the wheel like any other upload. This keeps deployment simple (sync needs
-a URL and the admin credential, nothing else), keeps the storage layout a
+Mirroring is **over HTTP**: `sync --to <server>` POSTs each file to `/legacy/`
+with `mirror=true` plus PyPI's `upload_time` and yank state as form fields,
+authenticated against the admin credential. The server — and only the server —
+writes storage: it claims the package `mirror`-origin, persists the provided
+timestamp in the sidecar, and extracts PEP 658 metadata from the wheel like any
+other upload. Sync is a pure HTTP client, which keeps deployment simple (it
+needs a URL and the admin credential, nothing else), keeps the storage layout a
 server-internal concern (no version coupling between a fleet of sync clients
-and the server), and keeps one writer.
+and the server), and keeps one writer. There is no direct-to-storage mode: the
+server is the single writer, always.
 
 Mirror uploads are an admin operation: a `mirror=true` request must
 authenticate as admin (`--admin-user`/`--admin-pass`), so an ordinary uploader
@@ -147,10 +148,12 @@ cannot backdate. With no admin credential configured, mirror uploads — like
 deletion and yank — are disabled, so a stock server never accepts a client
 timestamp.
 
-`sync` can also write **directly to storage** (no `--to`): same binary, same
-storage code — artifact, sidecar carrying PyPI's digest and timestamp, dirty
-marker. This needs no server cooperation at all and suits bucket-credential
-environments (a cron job next to the bucket, an airgapped import).
+A re-sync also *reconciles* what the destination already holds: it drives the
+server's yank endpoint to bring yank state in line with upstream (and to flag
+files gone upstream `removed upstream`), and its status endpoint
+(`POST`/`DELETE /project/<pkg>/status`) to relay PEP 792 project status. Both
+are admin operations the server enforces, so the same single-writer guarantee
+covers reconcile as well as the initial mirror.
 
 ## Private + mirrored packages: dependency confusion
 

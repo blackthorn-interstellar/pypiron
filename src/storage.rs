@@ -5,6 +5,7 @@ use clap::{Args as ClapArgs, ValueEnum};
 use http::{header, Response, StatusCode};
 use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -24,6 +25,8 @@ use object_store::{
     Attribute, Attributes, Error as OsError, GetOptions, GetRange, ObjectStore, ObjectStoreExt,
     PutMode, PutMultipartOptions, PutOptions, PutPayload, UpdateVersion, WriteMultipart,
 };
+
+use crate::range::{parse_range, RangeSpec};
 
 /// Storage backend selection.
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -272,55 +275,6 @@ pub const SHARD_CHARS: &[char] = &[
     'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-/// A single HTTP byte range resolved against a known size.
-#[derive(Debug, PartialEq)]
-pub enum RangeSpec {
-    Full,
-    Partial(u64, u64),
-    Unsatisfiable,
-}
-
-/// Parse a single-range `Range` header. Multi-range and malformed headers
-/// fall back to the full body (RFC 9110 lets a server ignore Range).
-pub fn parse_range(header: Option<&str>, size: u64) -> RangeSpec {
-    let Some(spec) = header.and_then(|h| h.strip_prefix("bytes=")) else {
-        return RangeSpec::Full;
-    };
-    let spec = spec.trim();
-    if spec.contains(',') {
-        return RangeSpec::Full;
-    }
-    if let Some(suffix) = spec.strip_prefix('-') {
-        // suffix range: the last N bytes
-        let Ok(n) = suffix.parse::<u64>() else {
-            return RangeSpec::Full;
-        };
-        if n == 0 || size == 0 {
-            return RangeSpec::Unsatisfiable;
-        }
-        let n = n.min(size);
-        return RangeSpec::Partial(size - n, size - 1);
-    }
-    let Some((start_s, end_s)) = spec.split_once('-') else {
-        return RangeSpec::Full;
-    };
-    let Ok(start) = start_s.parse::<u64>() else {
-        return RangeSpec::Full;
-    };
-    if start >= size {
-        return RangeSpec::Unsatisfiable;
-    }
-    let end = if end_s.is_empty() {
-        size - 1
-    } else {
-        match end_s.parse::<u64>() {
-            Ok(e) if e >= start => e.min(size - 1),
-            _ => return RangeSpec::Full,
-        }
-    };
-    RangeSpec::Partial(start, end)
-}
-
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// Check if an object exists.
@@ -443,12 +397,18 @@ impl DiskStorage {
 
     /// A unique temp path next to `path` (same filesystem, so rename/link is atomic).
     fn tmp_sibling(&self, path: &Path) -> Result<PathBuf> {
+        // A per-process atomic counter — not the clock alone — guarantees a
+        // distinct staging path per call. On a coarse-clock host two concurrent
+        // writes to the same key can read identical nanos, share one tmp inode,
+        // and clobber each other's bytes (corrupting e.g. the .origin marker).
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow!("bad path"))?;
         let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
-        Ok(path.with_file_name(format!(".tmp-{nanos}-{}-{name}", std::process::id())))
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        Ok(path.with_file_name(format!(".tmp-{nanos}-{}-{seq}-{name}", std::process::id())))
     }
 
     /// hard_link `tmp`→`dest` as an atomic create-if-absent (EEXIST → already
@@ -1274,27 +1234,6 @@ mod tests {
         let after = &s.list_all("packages/alpha/a-1.0.tar.gz").await.unwrap()[0];
         assert_ne!(before, after.etag);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn range_parsing() {
-        use RangeSpec::*;
-        assert_eq!(parse_range(None, 100), Full);
-        assert_eq!(parse_range(Some("bytes=0-49"), 100), Partial(0, 49));
-        assert_eq!(parse_range(Some("bytes=50-"), 100), Partial(50, 99));
-        assert_eq!(parse_range(Some("bytes=-10"), 100), Partial(90, 99));
-        // end clamps to size
-        assert_eq!(parse_range(Some("bytes=0-1000"), 100), Partial(0, 99));
-        // suffix larger than the file means the whole file
-        assert_eq!(parse_range(Some("bytes=-1000"), 100), Partial(0, 99));
-        // out of bounds start
-        assert_eq!(parse_range(Some("bytes=100-"), 100), Unsatisfiable);
-        assert_eq!(parse_range(Some("bytes=-0"), 100), Unsatisfiable);
-        // ignorable: multi-range, malformed, non-byte units
-        assert_eq!(parse_range(Some("bytes=0-1,5-9"), 100), Full);
-        assert_eq!(parse_range(Some("bytes=junk"), 100), Full);
-        assert_eq!(parse_range(Some("items=0-5"), 100), Full);
-        assert_eq!(parse_range(Some("bytes=9-5"), 100), Full);
     }
 
     #[test]

@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from .helpers import find_free_port, run_checked
+from .helpers import find_free_port, sync_to
 
 pytestmark = pytest.mark.integration
 
@@ -85,31 +85,24 @@ class FlakyPyPI(BaseHTTPRequestHandler):
         pass
 
 
-def test_sync_retries_transient_download_failures(tmp_path, pypiron_bin):
+def test_sync_retries_transient_download_failures(disk_server, pypiron_bin):
     port = find_free_port()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), FlakyPyPI)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
-        packages = tmp_path / "packages.txt"
-        packages.write_text("flaky-pkg\n")
-        data_dir = tmp_path / "data"
-        # Direct-to-storage (disk) sync against the flaky stub: the 503 on
-        # attempt one must be retried, and the run must succeed.
-        run_checked(
-            [
-                str(pypiron_bin),
-                "sync",
-                "--packages-list",
-                str(packages),
-                "--from",
-                f"http://127.0.0.1:{port}",
-                "--data-dir",
-                str(data_dir),
-            ],
+        # Mirror-over-HTTP against the flaky source: the 503 on the first
+        # download attempt must be retried, and the run must still succeed.
+        rc, out, err = sync_to(
+            pypiron_bin,
+            disk_server,
+            "--pkg",
+            "flaky-pkg",
+            source=f"http://127.0.0.1:{port}",
             timeout=120,
         )
-        stored = data_dir / "packages" / "flaky-pkg" / WHEEL_NAME
+        assert rc == 0, f"sync failed:\n{out}\n{err}"
+        stored = disk_server["data_dir"] / "packages" / "flaky-pkg" / WHEEL_NAME
         assert stored.exists(), "artifact missing after sync with one transient 503"
         assert stored.read_bytes() == FlakyPyPI.wheel
     finally:

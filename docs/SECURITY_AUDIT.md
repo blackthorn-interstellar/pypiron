@@ -32,12 +32,13 @@ qualifier: most of these require the operator to enable a feature (`sync`,
 
 ### Medium
 
-#### M1 — Sync fetches arbitrary upstream-controlled URLs (SSRF); direct mode stores the response as served `.metadata`
-- **Location:** `src/sync.rs:638` (artifact GET), `src/sync.rs:562-576` (`.metadata` readback).
-- **Risk:** The per-file download `url` comes verbatim from the upstream index JSON with no scheme/host check and no requirement that it relate to `--from`; the request fires (following up to 10 redirects) before any hash check. Points the sync host at `http://169.254.169.254/…` or internal services. In direct-storage mode the server also GETs `{url}.metadata` and persists the body **unverified** as the served PEP 658 metadata, turning blind SSRF into readback for anyone with the read credential.
+#### M1 — Sync fetches arbitrary upstream-controlled URLs (SSRF)
+- **Update (HTTP-only sync):** Direct-storage mode has been removed — `sync` is an HTTP client only. That eliminates the `.metadata` *readback* variant (the destination server now extracts PEP 658 metadata from the received wheel rather than the sync host GETting `{url}.metadata` from the source). The blind-SSRF core below still stands: sync still GETs each artifact (and best-effort provenance) from upstream-controlled URLs.
+- **Location:** `src/sync.rs` `download_once` (artifact GET), `download_provenance` (provenance GET).
+- **Risk:** The per-file download `url` comes verbatim from the upstream index JSON with no scheme/host check and no requirement that it relate to `--from`; the request fires (following up to 10 redirects) before any hash check. Points the sync host at `http://169.254.169.254/…` or internal services.
 - **Reachability:** Only when the operator runs `pypiron sync --from <index>` against an index they do not fully control. The default (`pypi.org`) is trusted and returns `files.pythonhosted.org` URLs.
-- **Fix:** Parse `url` before fetching; require http(s), block link-local/loopback/metadata IPs, and constrain redirects to an allowlist. Never persist `.metadata` from a host that did not also serve the (hash-verified) artifact.
-- **Tradeoff:** A strict same-host-as-`--from` rule **breaks normal mirroring**, because PyPI's index host (`pypi.org`) legitimately differs from its file host (`files.pythonhosted.org`). The correct fix is an allowlist/SSRF-deny filter (block private ranges, optionally an operator allowlist), which is more code than a one-liner and needs a DNS-rebinding-aware resolver to be airtight. Deferred as a deliberate, scoped piece of work rather than a quick patch. Interim mitigation: only `sync --from` indexes you trust, and prefer mirror-over-HTTP (`--to`) mode, which does not do the unverified `.metadata` readback.
+- **Fix:** Parse `url` before fetching; require http(s), block link-local/loopback/metadata IPs, and constrain redirects to an allowlist.
+- **Tradeoff:** A strict same-host-as-`--from` rule **breaks normal mirroring**, because PyPI's index host (`pypi.org`) legitimately differs from its file host (`files.pythonhosted.org`). The correct fix is an allowlist/SSRF-deny filter (block private ranges, optionally an operator allowlist), which is more code than a one-liner and needs a DNS-rebinding-aware resolver to be airtight. Deferred as a deliberate, scoped piece of work rather than a quick patch. Interim mitigation: only `sync --from` indexes you trust.
 
 #### M2 — Multipart metadata fields are buffered in RAM with no count/aggregate cap (OOM)
 - **Location:** `src/main.rs:684-714` (`legacy_upload`).
@@ -62,8 +63,9 @@ qualifier: most of these require the operator to enable a feature (`sync`,
 
 ### Low
 
-#### L1 — Direct-storage mirror writes the upstream filename into the storage key without the server's filename validation
-- **Location:** `src/sync.rs:538`.
+#### L1 — Direct-storage mirror writes the upstream filename into the storage key without the server's filename validation — **RESOLVED**
+- **Update:** Direct-storage mode has been removed. `sync` now POSTs every file through the server's `/legacy/`, which enforces `valid_artifact_filename` like any other upload, so the unvalidated-key path no longer exists.
+- **Location:** *(was `src/sync.rs` `mirror_to_storage`, now deleted)*.
 - **Risk:** The object key is `packages/<pkg>/<filename>` straight from the upstream `filename`, skipping `valid_artifact_filename` (which the upload path enforces). `DiskStorage::resolve` still blocks `..`, so this is **not** a namespace escape; impact is in-package-subtree pollution: a filename with `/` creates index-invisible orphan objects, and a `<sibling>.metadata`-shaped name can collide with a legitimate artifact's sidecar/metadata key.
 - **Reachability:** Direct-storage `sync` against a malicious/compromised `--from` (which already controls all mirrored bytes).
 - **Fix:** Validate `s.file.filename` with the same `valid_artifact_filename`/`sidecar::is_artifact` rules before building the key; skip-with-warning on failure. Ideally share one helper between `main.rs`/`upload.rs` and `sync.rs`.

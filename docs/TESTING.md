@@ -96,3 +96,22 @@ make test-rust       # unit tests only
 make test-python     # blackbox integration tests
 make perf            # performance benchmarks (builds release binary)
 ```
+
+## Fuzzing
+
+Coverage-guided fuzzing (`fuzz/`, needs nightly + `cargo install cargo-fuzz`)
+covers the pure parsers that eat attacker- or upstream-controlled bytes. Each
+target asserts "never panic" plus a domain invariant:
+
+| Target | Module | Invariant beyond no-panic |
+|---|---|---|
+| `fuzz_names` | `names.rs` | PEP 503 normalization is idempotent; wheel-tag fields never empty |
+| `fuzz_wheel` | `wheel.rs` | extracted METADATA stays under the 16 MiB cap |
+| `fuzz_render` | `render.rs` | PEP 691 JSON always valid; HTML `href` can't break out of its attribute |
+| `fuzz_coremeta` | `coremeta.rs` | RFC 822 METADATA parse is total over any bytes |
+| `fuzz_range` | `range.rs` | a resolved `Partial(start, end)` is always `start <= end < size` |
+
+```sh
+make fuzz FUZZ_TARGET=fuzz_range FUZZ_SECS=60   # run one target
+make fuzz-build                                 # compile all (CI smoke test)
+```

@@ -21,13 +21,26 @@ The bar for "supported" is blackbox-verified behavior against real clients
 | Package deletion | Delete event → index rebuild | Supported |
 | Origin exclusivity | Each package is `private` or `mirror`, claimed at first write; collisions rejected (dependency-confusion defense) | Supported |
 | Namespace prefix policy | Reserve a configured prefix for private uploads; mirror refuses it (cf. PEP 752) | Supported |
-| Mirrored upload times | `sync` carries PyPI's true `upload-time` into sidecars (over HTTP to a server with an admin credential, or straight to storage) so `--exclude-newer` works on mirrored packages | Supported |
+| Mirrored upload times | `sync` carries PyPI's true `upload-time` into sidecars (over HTTP to a server with an admin credential) so `--exclude-newer` works on mirrored packages | Supported |
 | [PEP 694](https://peps.python.org/pep-0694/) | Upload API 2.0 (draft) | Out of scope until stable |
 | [PEP 708](https://peps.python.org/pep-0708/) | Index merging / alternate locations metadata | Out of scope |
 | [PEP 740](https://peps.python.org/pep-0740/) | Provenance/attestations — relayed verbatim through `sync` + proxy (`provenance` key / `data-provenance` attr), not verified | Supported |
 | [PEP 792](https://peps.python.org/pep-0792/) | Project status markers (`active`/`archived`/`quarantined`/`deprecated`) — relayed verbatim through `sync` + proxy (top-level `project-status` JSON / `pypi:project-status` meta); first-party authoring not provided | Supported (relay) |
-| XML-RPC / search API | Deprecated upstream | Out of scope |
-| `/pypi/<pkg>/json` API | Non-standard pypi.org JSON API | Out of scope (the simple API is the standard) |
+| [PEP 458](https://peps.python.org/pep-0458/) / [480](https://peps.python.org/pep-0480/) | TUF-signed repository metadata | **Not supported** — out of scope; no installer requires it and pypi.org itself has never shipped it |
+| XML-RPC API | Legacy `search` / `list_packages` API | **Not supported** — deprecated upstream (PyPI disabled XML-RPC search); the JSON simple API is the path forward |
+| `/pypi/<pkg>/json` API | Non-standard pypi.org metadata API, predates the JSON simple API | **Not supported** — the PEP 691/700 JSON simple API is the standard; installers never request this from a custom index (see note) |
+| Eggs (`.egg` / bdist_egg) | Legacy binary distribution format | **Not supported** — wheels + sdists only; pip has removed egg installation |
+
+## Why the legacy `/pypi/<pkg>/json` API is safe to omit
+
+Installers — pip, uv, Poetry, PDM — resolve and install against the **simple API**
+(PEP 503 HTML / PEP 691 JSON) at the configured `--index-url`; none of them request
+`/pypi/<name>/json` from a custom index. That endpoint is a pypi.org-specific
+metadata convenience consumed by *analytics and recipe tooling pointed at pypi.org*
+(dashboards, `grayskull`, badge/version services), not by the install path. The
+structured data it carried — versions, file sizes, upload times, yank state — is
+exactly what PEP 700 puts in the standard JSON simple API, which pypiron does serve.
+So omitting it costs no client compatibility.
 
 ## Why PEP 700 is the minimum bar: `--exclude-newer`
 
@@ -65,7 +78,7 @@ carry forward PyPI's original timestamps; see
 - PEP 740 is the same play one more time: a `<filename>.provenance` companion
   served next to the artifact, advertised by a `provenance` URL (JSON) and
   `data-provenance` attribute (HTML). pypiron is a **relay, not a verifier** — it
-  carries PyPI's already-verified provenance through `sync` (direct and over HTTP)
+  carries PyPI's already-verified provenance through `sync` (over HTTP)
   and the on-demand proxy so an offline consumer can verify the original publisher
   end-to-end (Sigstore bundles verify against a cached trust root, no egress
   needed). It never runs Sigstore itself and never mints provenance, so a direct
@@ -79,16 +92,16 @@ carry forward PyPI's original timestamps; see
   (`{status, reason?}`; absent == `active`, which we omit from output entirely),
   carried into the rendered index — top-level `project-status` JSON object and
   `pypi:project-status[-reason]` HTML meta — and propagated from upstream by `sync`
-  (direct mode) and the proxy. A `quarantined` project is rendered with no file
-  links. pypiron does **not** author status: there is no admin endpoint to
-  archive/quarantine a first-party package, and quarantine relay does **not**
-  fail-close downloads of already-stored bytes — both are deferred (the upload and
-  `/files/` gates are only worth building once a real client consumes the marker;
-  pip/uv today only *MAY* warn). `sync` (direct mode) now reconciles status on
-  every run an upstream listing actually changes — not only runs that write
-  files — so a quarantine that lands with no new release propagates on the next
-  sync; an upstream-quarantined project serves no files, so its (empty) listing
-  is left to the status relay rather than misread as a mass removal. Remaining
-  gap: HTTP-mode `sync` (`/legacy/`) still has no channel for the marker. We do
-  not implement PEP 708 `alternate-locations`
-  (out of scope), even though pypi.org emits an empty one alongside `project-status`.
+  and the proxy. A `quarantined` project is rendered with no file links. The admin
+  endpoint `POST`/`DELETE /project/<pkg>/status` sets and clears the marker; it
+  exists so `sync` can relay upstream status over HTTP (an operator can call it
+  too). pypiron still does **not** *author* status as policy: quarantine does
+  **not** fail-close downloads of already-stored bytes (the `/files/` and upload
+  gates are deferred — only worth building once a real client consumes the marker;
+  pip/uv today only *MAY* warn). `sync` reconciles status on every run an upstream
+  listing actually changes — not only runs that write files — so a quarantine that
+  lands with no new release propagates on the next sync; an upstream-quarantined
+  project serves no files, so its (empty) listing is left to the status relay
+  rather than misread as a mass removal. We do not implement PEP 708
+  `alternate-locations` (out of scope), even though pypi.org emits an empty one
+  alongside `project-status`.

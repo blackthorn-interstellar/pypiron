@@ -4,6 +4,12 @@
 [![PyPI](https://img.shields.io/pypi/v/pypiron.svg)](https://pypi.org/project/pypiron/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+<p align="center">
+  <img src="docs/install-throughput.png" alt="Max sustained install throughput: pypiron vs pypiserver, devpi, pypicloud, bandersnatch, proxpi" width="760">
+  <br>
+  <sub>installs per second · r7i.large</sub>
+</p>
+
 An ultra-fast PyPI server written in Rust.
 
 
@@ -35,7 +41,7 @@ Measured on real AWS hardware with the S3 backend ([method and logs](docs/BENCHM
 ## Installation
 
 ```bash
-uvx pypiron        # or: pip install pypiron
+uvx pypiron serve  # or: pip install pypiron && pypiron serve
 ```
 
 ```bash

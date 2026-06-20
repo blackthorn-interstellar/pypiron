@@ -4,44 +4,30 @@
 [![PyPI](https://img.shields.io/pypi/v/pypiron.svg)](https://pypi.org/project/pypiron/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+An ultra-fast Python package server, written in Rust.
+
 <p align="center">
   <img src="docs/install-throughput.png" alt="Max sustained install throughput: pypiron vs pypiserver, devpi, pypicloud, bandersnatch, proxpi" width="760">
   <br>
   <sub>installs per second · r7i.large</sub>
 </p>
 
-An ultra-fast PyPI server written in Rust.
-
 
 ## Highlights
-
-- 🚀 **Ultra-fast** — a $12/month server answers ~75,000 requests per second.
-- ♾️ **Infinite horizontal scaling that "just works"** — point any number of nodes at the same bucket; reads need zero coordination.
+- 4x-60x faster than other PyPi servers
+- Mitigates supply-chain attacks by supporting --exclude-newer and protecting private package names
+- Works with all major cli tools (uv, pip, poetry, twine, pipenv)
+- **Infinite horizontal scaling that "just works"** — point any number of nodes at the same bucket; reads need zero coordination.
 - 📊 **Per-project download tracking** — tag requests by consuming project, straight into Prometheus.
-- 🔁 **Mirror or proxy PyPI** — one URL serves private packages and cached public dependencies, with PyPI's true upload times.
-- 🗄️ **No database** — truth is files, views are regenerable, backups are rsync.
+- 🔁 **Mirror or proxy PyPI** — one URL serves private packages and cached public dependencies.
 - 📦 **Standards-complete** — PEP 503, 691, 700, 658, 592; `uv`, `pip`, `twine`, `poetry`, and `pdm` work unmodified.
 - 🛡️ **Dependency-confusion defense** — every package is exclusively private or mirrored, claimed at first write.
-- 🩹 **Self-healing** — crash-safe event markers plus a daily storage audit; `pypiron resync` rebuilds the world.
 
-## Performance
 
-Measured on real AWS hardware with the S3 backend ([method and logs](docs/BENCHMARK_RESULTS.md)):
-
-| | 2 CPUs EC2 | 8 CPU EC2 |
-|---|---|---|
-| Requests per second | **~75,000** | **~440,000** |
-| Request latency | p99 2 ms | p99 5 ms |
-| Publish → installable | **0.7 s** | 1 s with 10,000 packages hosted |
-| 900 MB wheel upload | 15–20 s, ~50 MB memory | 8 simultaneous, reads stay fast |
-| Download throughput | 3.9 Gbit/s* | 48 Gbit/s* |
-
-\* Saturated
-
-## Installation
+## Quickstart
 
 ```bash
-uvx pypiron serve  # or: pip install pypiron && pypiron serve
+uvx pypiron serve 
 ```
 
 ```bash
@@ -68,7 +54,7 @@ Multi-arch (amd64/arm64) images are published to GHCR on every release tag
 ### Publish and install
 
 ```bash
-PYPIRON_ADMIN_USER=admin PYPIRON_ADMIN_PASS=secret uvx pypiron
+PYPIRON_ADMIN_USER=admin PYPIRON_ADMIN_PASS=secret uvx pypiron serve
 
 uv publish --publish-url http://localhost:8080/legacy/ \
   --username admin --password secret dist/*.whl
@@ -106,7 +92,7 @@ upstream on first request, cached in storage forever after, served locally
 whether upstream is up or down:
 
 ```bash
-pypiron --admin-user admin --admin-pass secret \
+pypiron serve --admin-user admin --admin-pass secret \
   --private-prefix acme \
   --proxy-upstream https://pypi.org
 ```
@@ -119,8 +105,8 @@ hole stays closed.
 Start more nodes on the same bucket. That's the whole procedure:
 
 ```bash
-pypiron --storage s3 --s3-bucket my-bucket ...   # node 1
-pypiron --storage s3 --s3-bucket my-bucket ...   # node 2, same bucket, done
+pypiron serve --storage s3 --s3-bucket my-bucket ...   # node 1
+pypiron serve --storage s3 --s3-bucket my-bucket ...   # node 2, same bucket, done
 ```
 
 Reads are stateless file serving — no coordination, no shared state, no

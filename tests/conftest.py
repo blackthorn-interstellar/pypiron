@@ -272,6 +272,7 @@ def _start_disk_server(tmp_path_factory, bin_path: Path, extra_args=()) -> Itera
     # a superset — so tests that do any operation through them keep working.
     args = [
         str(bin_path),
+        "serve",
         "--bind-addr",
         bind,
         "--data-dir",
@@ -373,6 +374,7 @@ def disk_server_no_creds(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     log_path = data_dir.parent / f"{data_dir.name}-server.log"
     args = [
         str(pypiron_bin),
+        "serve",
         "--bind-addr",
         bind,
         "--data-dir",
@@ -457,6 +459,7 @@ def disk_server_uploader_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[D
     log_path = data_dir.parent / f"{data_dir.name}-server.log"
     args = [
         str(pypiron_bin),
+        "serve",
         "--bind-addr",
         bind,
         "--data-dir",
@@ -601,7 +604,7 @@ def _start_s3_server(
 
     with open(log_path, "w") as log_file:
         proc = subprocess.Popen(
-            [str(pypiron_bin)], env=env, stdout=log_file, stderr=subprocess.STDOUT
+            [str(pypiron_bin), "serve"], env=env, stdout=log_file, stderr=subprocess.STDOUT
         )
         try:
             wait_http_ok(f"http://{bind}/simple/index.json", timeout=30.0)
@@ -661,7 +664,7 @@ def _start_cloud_server(tmp_path_factory, pypiron_bin: Path, env: Dict, bind: st
     log_path = tmp_path_factory.mktemp(f"pypiron-{label}") / "server.log"
     with open(log_path, "w") as log_file:
         proc = subprocess.Popen(
-            [str(pypiron_bin)], env=env, stdout=log_file, stderr=subprocess.STDOUT
+            [str(pypiron_bin), "serve"], env=env, stdout=log_file, stderr=subprocess.STDOUT
         )
         try:
             wait_http_ok(f"http://{bind}/simple/index.json", timeout=30.0)

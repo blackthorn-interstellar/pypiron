@@ -81,7 +81,7 @@ const PAGE_CSS: &str = "\
 :root{color-scheme:light dark;--bg:#faf7f4;--header:#efe7df;--fg:#211b17;--muted:#7c7269;--card:#fff;--border:#e7ddd3;--accent:#bf5a2e;--accent-ink:#a04a24;--code:#f3ece4;--bar:#bf5a2e;--track:#ece2d8}\
 @media(prefers-color-scheme:dark){:root{--bg:#15110e;--header:#1f1813;--fg:#ece5dd;--muted:#a59a8f;--card:#1c1713;--border:#352c24;--accent:#e07b45;--accent-ink:#ef9460;--code:#1f1813;--bar:#e07b45;--track:#2c241d}}\
 *{box-sizing:border-box}\
-body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);font:15px/1.55 ui-sans-serif,system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif;display:flex;justify-content:center}\
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);font:15px/1.55 ui-sans-serif,system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif;display:flex;flex-direction:column;align-items:center}\
 main{width:100%;max-width:720px;padding:52px 24px 72px}\
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
 .hero{text-align:center;margin-bottom:36px}\
@@ -92,7 +92,6 @@ h1{margin:14px 0 4px;font-size:30px;letter-spacing:-.02em}\
 .tag{margin:0;color:var(--muted)}\
 .inv{display:flex;flex-wrap:wrap;justify-content:center;gap:14px 30px;margin:0 0 30px;color:var(--muted);font-size:14px}\
 .inv b{color:var(--fg);font-size:21px;font-weight:650;margin-right:7px;letter-spacing:-.01em}\
-.snip{margin:14px 0}\
 .snip-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}\
 .snip-label{font-size:12px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--muted)}\
 .copy{font:inherit;font-size:12px;cursor:pointer;border:1px solid var(--border);background:var(--card);color:var(--muted);border-radius:6px;padding:2px 10px}\
@@ -121,21 +120,26 @@ code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
 .empty{color:var(--muted);font-size:14px;font-style:italic}\
 .activity{margin-top:44px;border-top:1px solid var(--border);padding-top:24px}\
 .activity .cap{margin:0 0 16px;color:var(--muted);font-size:13px;text-align:center}\
-main.wide{max-width:1000px}\
+main.wide{max-width:1000px;padding-top:0}\
 .top .home{font:inherit;font-size:20px;font-weight:650;letter-spacing:-.02em;color:var(--fg)}\
 .top .home:hover{text-decoration:none}\
-/* Header band: a distinct background from the content, full-bleed to the edges\
-   of the centered column (pypi.org-style). It wraps the brand strip + banner. */\
-.phead-band{background:var(--header);border-bottom:1px solid var(--border);margin:-52px -24px 0;padding:20px 24px 24px}\
+/* Header band: spans the full window width (a distinct background from the\
+   content), while its inner column stays aligned with the centered page body. */\
+.phead-band{width:100%;background:var(--header);border-bottom:1px solid var(--border)}\
+.phead-in{max-width:1000px;margin:0 auto;padding:22px 24px 24px}\
 .phead-band .top{margin-bottom:18px}\
 .phead{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:10px 36px;margin:0}\
 .phead-main{flex:1;min-width:240px}\
 .phead-name{margin:0;font-size:30px;letter-spacing:-.02em;word-break:break-word}\
 .phead-name .pver{color:var(--muted);font-weight:500}\
-.phead-install{width:min(100%,440px);margin:16px 0 0}\
-.phead-install .snip{margin:0}\
+.phead-install{margin:16px 0 0;max-width:100%}\
 .phead-right{flex:none;text-align:right}\
 .phead-date{margin:0;color:var(--muted);font-size:13px}\
+/* Install field: command + attached copy button as one bordered pill, sized to\
+   its content; the command scrolls horizontally rather than overflowing. */\
+.install{display:inline-flex;max-width:100%;align-items:stretch;border:1px solid var(--border);border-radius:8px;background:var(--card);vertical-align:top}\
+.install code{padding:9px 13px;overflow-x:auto;white-space:nowrap;border-radius:8px 0 0 8px}\
+.install .copy{flex:none;border:0;border-left:1px solid var(--border);border-radius:0 8px 8px 0;padding:0 14px;font-size:12px}\
 .psummary{margin:0 -24px;padding:15px 24px;background:var(--card);border-bottom:1px solid var(--border)}\
 .psummary p{margin:0;color:var(--fg);font-size:16px}\
 .pcols{display:grid;gap:34px;margin-top:30px}\
@@ -216,7 +220,7 @@ table.files-t td{border-bottom:1px solid var(--border);padding:6px 8px;vertical-
 /// dependency-free; the page is fully readable without it.
 const COPY_JS: &str = "<script>\
 document.querySelectorAll('.copy').forEach(function(b){b.addEventListener('click',function(){\
-var box=b.closest('.snip')||b.closest('.idx');if(!box)return;\
+var box=b.closest('.install')||b.closest('.snip')||b.closest('.idx');if(!box)return;\
 var c=box.querySelector('code').innerText;\
 navigator.clipboard.writeText(c).then(function(){var o=b.textContent;b.textContent='Copied';b.classList.add('ok');\
 setTimeout(function(){b.textContent=o;b.classList.remove('ok')},1200)})})});\
@@ -246,27 +250,28 @@ f.addEventListener('input',function(){var q=f.value.toLowerCase();\
 items.forEach(function(li){li.style.display=li.textContent.toLowerCase().indexOf(q)>=0?'':'none'})})})();\
 </script>";
 
-/// Wrap a page body in the shared document shell. `wide` widens the content
-/// column for the two-pane project page.
-fn shell(title: &str, body: &str, copy_js: bool, wide: bool) -> String {
+/// Wrap a page body in the shared document shell. `banner`, if non-empty, is a
+/// full-window-width section rendered *before* the centered `<main>` (the
+/// project page's header band); `wide` widens the content column.
+fn shell(title: &str, banner: &str, body: &str, copy_js: bool, wide: bool) -> String {
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>{title}</title><style>{PAGE_CSS}</style></head><body><main{cls}>{body}</main>{js}</body></html>",
+<title>{title}</title><style>{PAGE_CSS}</style></head><body>{banner}<main{cls}>{body}</main>{js}</body></html>",
         title = encode_text(title),
         cls = if wide { " class=\"wide\"" } else { "" },
         js = if copy_js { COPY_JS } else { "" },
     )
 }
 
-/// A labelled, copyable command block. `code` is escaped as text — it carries
-/// the request-derived base URL.
-fn snippet(label: &str, code: &str) -> String {
+/// The package banner's copyable install command, pypi.org-style: the command in
+/// a bordered field with the copy button attached on its right edge, no label.
+/// The box sizes to its content and scrolls horizontally rather than overflowing.
+fn install_box(cmd: &str) -> String {
     format!(
-        "<div class=\"snip\"><div class=\"snip-h\"><span class=\"snip-label\">{label}</span>\
-<button class=\"copy\" type=\"button\">Copy</button></div><pre><code>{code}</code></pre></div>",
-        label = encode_text(label),
-        code = encode_text(code),
+        "<div class=\"install\"><code>{}</code>\
+<button class=\"copy\" type=\"button\" aria-label=\"Copy install command\">Copy</button></div>",
+        encode_text(cmd),
     )
 }
 
@@ -335,7 +340,7 @@ aria-label=\"Search packages\" autocomplete=\"off\" autofocus>\
         logo = logo_link(),
         version = encode_text(ctx.version),
     );
-    shell("pypiron", &body, true, false)
+    shell("pypiron", "", &body, true, false)
 }
 
 /// The labelled configuration section: posture settings (proxy, delivery,
@@ -443,7 +448,7 @@ aria-label=\"Search packages\" autocomplete=\"off\" autofocus></form>",
         logo = logo_link(),
         version = encode_text(ctx.version),
     );
-    shell("pypiron · packages", &body, false, false)
+    shell("pypiron · packages", "", &body, false, false)
 }
 
 /// A human-readable project page modelled on pypi.org. `files` is *every*
@@ -477,13 +482,13 @@ pub fn project_html(
         url = encode_text(&index_url),
     );
 
-    // Install snippet: `uv add` only, pinned to the version on a version page.
+    // Install command: `uv add` only, pinned to the version on a version page.
     let target = if pinned && !selected.is_empty() {
         format!("{pkg}=={selected}")
     } else {
         pkg.to_string()
     };
-    let install = snippet("uv", &format!("uv add --index {index_url} {target}"));
+    let install = install_box(&format!("uv add --index {index_url} {target}"));
 
     // The banner's version and "Released" date come from the selected version.
     // An empty `selected` means no derivable version (legacy artifacts) — show
@@ -512,25 +517,32 @@ pub fn project_html(
         .map(|d| format!("<p class=\"phead-date\">Released {}</p>", encode_text(&d)))
         .unwrap_or_default();
 
-    // Layout mirrors pypi.org: a header band (distinct background) holding the
-    // brand strip and the package banner — name with `uv add` below it, the
-    // release date on the right — then the description bar, then a metadata
-    // sidebar on the LEFT (Navigation tabs + Verified/Unverified details) with
-    // the tab panels on the right.
-    let body = format!(
-        "<div class=\"phead-band\">\
-<header class=\"top\"><div class=\"brand\">{logo}\
-<a class=\"home\" href=\"/\">pypiron</a></div>{index_copy}</header>\
-<header class=\"phead\">\
+    // Header band: a full-window-width strip (distinct background) holding the
+    // brand row and the package banner — name with `uv add` below it, the
+    // release date on the right — with its inner content aligned to the same
+    // centered column as the page body. It renders outside `<main>`.
+    let banner = format!(
+        "<header class=\"phead-band\"><div class=\"phead-in\">\
+<div class=\"top\"><div class=\"brand\">{logo}\
+<a class=\"home\" href=\"/\">pypiron</a></div>{index_copy}</div>\
+<div class=\"phead\">\
 <div class=\"phead-main\"><h1 class=\"phead-name\">{name}{ver}</h1>\
 <div class=\"phead-install\">{install}</div></div>\
-<div class=\"phead-right\">{released}</div></header></div>{summary}\
+<div class=\"phead-right\">{released}</div></div></div></header>",
+        logo = logo_link(),
+        name = encode_text(pkg),
+    );
+
+    // Below the centered column: the description bar, then a metadata sidebar on
+    // the LEFT (Navigation tabs + Verified/Unverified details) with the tab
+    // panels on the right.
+    let body = format!(
+        "{summary}\
 <div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{verified}{unverified}</aside>\
 <div class=\"pcontent\">{desc}{history}{dl}</div></div>\
 <nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/projects/\">All packages</a> · \
 <a href=\"/simple/{name}/\">Simple index</a></nav>\
 <p class=\"ver\">pypiron v{appver}</p>{TABS_JS}",
-        logo = logo_link(),
         name = encode_text(pkg),
         nav = nav_section(),
         verified = verified_section(pkg, verified),
@@ -540,7 +552,7 @@ pub fn project_html(
         dl = files_panel(pkg, &sel_files),
         appver = encode_text(ctx.version),
     );
-    shell(&format!("{pkg} · pypiron"), &body, true, true)
+    shell(&format!("{pkg} · pypiron"), &banner, &body, true, true)
 }
 
 /// A file's version: the sidecar value, else inferred from the filename. Shared
@@ -1094,12 +1106,20 @@ mod tests {
         ));
         // Banner date is the selected version's newest upload.
         assert!(html.contains("Released 2026-06-10"));
+        // Full-window header band renders before <main>, its inner column aligned.
+        assert!(html.find("class=\"phead-band\"").unwrap() < html.find("<main").unwrap());
+        assert!(html.contains("class=\"phead-in\""));
         // Install is `uv add` only — no pip / uv pip forms anywhere.
         assert!(html.contains("class=\"phead-install\""));
         assert!(html.contains("uv add --index https://pkgs.example.com/simple/ imaginairy"));
         assert!(!html.contains("uv pip install"));
         assert!(!html.contains("pip install"));
-        // Metadata sidebar sits to the LEFT of the content (pypi.org order).
+        // Install box: command + attached copy button, no "uv" label.
+        assert!(html.contains(
+            "<div class=\"install\"><code>uv add --index https://pkgs.example.com/simple/ imaginairy</code><button class=\"copy\""
+        ));
+        assert!(!html.contains(">uv</span>")); // the old snippet label is gone
+                                               // Metadata sidebar sits to the LEFT of the content (pypi.org order).
         assert!(html.find("class=\"pmeta\"").unwrap() < html.find("class=\"pcontent\"").unwrap());
         // Tabbed Navigation: three links → three panels.
         assert!(html.contains("class=\"pcols ptabs\""));

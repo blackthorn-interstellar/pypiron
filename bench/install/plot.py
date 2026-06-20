@@ -113,11 +113,10 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--out", default=str(RESULTS / "install-throughput.svg"))
-    ap.add_argument("--title", default="Max sustained install throughput")
-    ap.add_argument(
-        "--subtitle",
-        default="cold uv installs · Track 2 (S3 redirect) · 1 small server (r7i.large, 2 vCPU)",
-    )
+    # Default titleless: the chart is captioned where it's embedded. Pass --title
+    # (and optionally --subtitle) for a standalone version.
+    ap.add_argument("--title", default="")
+    ap.add_argument("--subtitle", default="")
     args = ap.parse_args()
     data = collect()
     if not data:

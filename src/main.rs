@@ -441,6 +441,15 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
             "/files/:package/:filename/yank",
             post(yank_set).delete(yank_clear),
         )
+        // Mirror-over-HTTP sync cursors: the server-side memo of the last
+        // upstream ETag each sync job saw, so a fresh/ephemeral sync host stays
+        // conditional. Admin-gated; opaque JSON the server never interprets.
+        .route("/sync/cursors", get(sync_cursors_get).put(sync_cursors_put))
+        // The locally-materialized PEP 691 index, bypassing the on-demand
+        // proxy: a mirror-over-HTTP `sync` reconciles against the dest's own
+        // truth (which files it holds, their yank state), not a proxied
+        // upstream view that would hide a removed file from the reconcile.
+        .route("/sync/local-index/:package", get(sync_local_index))
         // Operational endpoints: deliberately outside read auth — load
         // balancers and Prometheus scrapers don't carry package credentials.
         .route("/health", get(health))
@@ -1906,6 +1915,71 @@ async fn set_yanked(
         warn!(error=?e, "yank: failed to write commit marker");
     }
     Ok(StatusCode::OK)
+}
+
+/// Read the sync-cursor blob (the server-side memo a mirror-over-HTTP sync
+/// reads to stay conditional). Admin-gated; an absent blob is an empty object,
+/// not a 404 — a first-ever sync run is the normal case.
+async fn sync_cursors_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
+    let bytes = match state.storage.get_bytes(sync::CURSORS_KEY).await {
+        Ok(b) => b,
+        Err(e) if storage::is_not_found(&e) => b"{}".to_vec(),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("read: {e}"))),
+    };
+    Ok(([(header::CONTENT_TYPE, "application/json")], bytes))
+}
+
+/// Replace the sync-cursor blob. Admin-gated. The body must be a JSON object
+/// (sync's own format); we validate that much so a malformed PUT can't poison
+/// the next sync's reads, but the contents are otherwise opaque to the server.
+async fn sync_cursors_put(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
+    if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&body).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "cursors body must be a JSON object".into(),
+        ));
+    }
+    state
+        .storage
+        .put_bytes(
+            sync::CURSORS_KEY,
+            body.into_bytes(),
+            Some("application/json"),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The locally-materialized PEP 691 index for a package, read straight from
+/// storage so the on-demand proxy never shadows it. Admin-gated; a package with
+/// no local index yet is an empty listing, not a 404 (so the caller treats it
+/// as "nothing mirrored", not "endpoint missing").
+async fn sync_local_index(
+    State(state): State<Arc<AppState>>,
+    Path(package): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
+    let Some(pkg) = checked_pkg_name(&package) else {
+        return Err((StatusCode::NOT_FOUND, "no such package".to_string()));
+    };
+    let key = format!("{SIMPLE_PREFIX}{pkg}/index.json");
+    let bytes = match state.storage.get_bytes(&key).await {
+        Ok(b) => b,
+        Err(e) if storage::is_not_found(&e) => br#"{"files":[]}"#.to_vec(),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("read: {e}"))),
+    };
+    Ok(([(header::CONTENT_TYPE, "application/json")], bytes))
 }
 
 /// --- Helpers --------------------------------------------------------------

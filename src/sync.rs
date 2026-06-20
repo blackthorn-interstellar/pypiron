@@ -8,8 +8,19 @@
 //! `--to`, sync writes directly to storage with the same code the server uses.
 //!
 //! Filters (`--only-wheels`, tag filters, `--exclude-newer`/`--exclude-older`,
-//! PEP 440 specifiers in the package list) gate only what a run *adds*;
-//! nothing already mirrored is ever removed. Options layer as
+//! PEP 440 specifiers in the package list) gate only what a run *adds* — an
+//! artifact, once mirrored, is never deleted. A re-sync does, however,
+//! *reconcile* the mutable metadata of files it already has: yank state is
+//! brought in line with upstream (set, cleared, or its reason updated), and a
+//! file gone from upstream is flagged yanked `removed upstream` (kept
+//! downloadable, but installers skip it). PEP 792 project status is relayed the
+//! same way.
+//!
+//! To make "reconcile every run" cheap, each project is fetched conditionally:
+//! the last upstream ETag is remembered (server-side, in `_sync/cursors.json`)
+//! and replayed as `If-None-Match`, so an unchanged upstream answers `304` and
+//! the whole project is skipped. `--full` ignores the memo and reconciles
+//! everything — run it periodically as the self-heal. Options layer as
 //! CLI/env > pypiron.toml > defaults.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -17,7 +28,9 @@ use clap::Args;
 use futures::stream::{self, StreamExt};
 use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::{multipart, Client};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -29,8 +42,9 @@ use crate::names::{
     checked_pkg_name, infer_version_from_filename, matches_prefix, normalize_pkg_name,
 };
 use crate::origin;
-use crate::sidecar::{metadata_key, provenance_key, sidecar_key, Sidecar, Yanked};
-use crate::simple::{self, SimpleFile};
+use crate::render::SIMPLE_JSON_CONTENT_TYPE;
+use crate::sidecar::{metadata_key, provenance_key, sidecar_key, Sidecar, Yanked, SIDECAR_SUFFIX};
+use crate::simple::{self, IndexFetch, SimpleFile, SimpleIndex};
 use crate::status::{self, ProjectStatusDoc};
 use crate::storage::{Storage, StorageArgs};
 use crate::worker::mark_dirty;
@@ -86,6 +100,13 @@ pub struct SyncArgs {
     /// Print actions without downloading/uploading.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Ignore the conditional-fetch memo: re-fetch every project unconditionally
+    /// and fully reconcile (yank/status/removed) what is already mirrored. Run
+    /// periodically as the self-heal — a normal run only reconciles projects
+    /// whose upstream listing actually changed.
+    #[arg(long, env = "PYPIRON_SYNC_FULL")]
+    pub full: bool,
 
     /// Filtering flags (wheel/python/abi/platform/upload-time).
     #[command(flatten)]
@@ -151,6 +172,7 @@ struct Resolved {
     concurrency: usize,
     package_concurrency: usize,
     dry_run: bool,
+    full: bool,
     filter: ResolvedFilter,
 }
 
@@ -239,6 +261,7 @@ impl Resolved {
                 .unwrap_or(8)
                 .max(1),
             dry_run: args.dry_run,
+            full: args.full,
             filter: ResolvedFilter {
                 only_wheels,
                 only_sdists,
@@ -314,6 +337,160 @@ enum Sink {
     Http(String),
 }
 
+/// Yank reason stamped on a file that has disappeared from upstream. The bytes
+/// stay downloadable (we never delete a mirrored artifact); installers skip it.
+const REMOVED_UPSTREAM: &str = "removed upstream";
+
+/// Storage key of the sync-cursor blob — the server-side memo of the last
+/// upstream ETag each project synced at, replayed as `If-None-Match`. Lives
+/// outside `packages/`/`simple/`, so the worker's membership and index builds
+/// never see it; disposable — a lost blob just means the next run full-fetches.
+pub(crate) const CURSORS_KEY: &str = "_sync/cursors.json";
+
+/// One project's conditional-fetch memo.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CursorEntry {
+    /// The upstream listing ETag last synced (opaque, equality-only).
+    etag: String,
+    /// Hash of the run config that produced it ([`config_key`]); a mismatch
+    /// invalidates the ETag, since a changed filter/specifier/source may select
+    /// files the cached listing already contained but we skipped.
+    config: String,
+    /// PyPI's `X-PyPI-Last-Serial`, when present — diagnostics only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    serial: Option<u64>,
+}
+
+/// project name -> its cursor.
+type Cursors = HashMap<String, CursorEntry>;
+
+/// A stable hash of everything that changes which files a run *selects*: the
+/// source, the resolved filters, and this project's version specifiers. Stored
+/// beside the ETag so a config change forces a full fetch instead of trusting a
+/// 304 against a listing that was filtered differently. Tag vectors are sorted
+/// so argument order doesn't perturb the key.
+fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
+    let f = &resolved.filter;
+    let mut h = Sha256::new();
+    h.update(resolved.src_base.as_bytes());
+    h.update([0]);
+    h.update([u8::from(f.only_wheels), u8::from(f.only_sdists)]);
+    for tags in [
+        &f.python_tag,
+        &f.abi_tag,
+        &f.platform_tag,
+        &f.exclude_platform_tag,
+    ] {
+        let mut sorted = tags.clone();
+        sorted.sort();
+        for t in &sorted {
+            h.update(t.as_bytes());
+            h.update([0]);
+        }
+        h.update([0x1f]);
+    }
+    h.update(
+        f.exclude_newer
+            .map_or(0i64, |d| d.unix_timestamp())
+            .to_le_bytes(),
+    );
+    h.update(
+        f.exclude_older
+            .map_or(0i64, |d| d.unix_timestamp())
+            .to_le_bytes(),
+    );
+    if let Some(s) = &spec.specifiers {
+        h.update(s.to_string().as_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
+
+/// Every filename in the upstream listing mapped to its yank state, captured
+/// *before* filtering — reconcile must tell "filtered out, still upstream" from
+/// "gone upstream".
+struct UpstreamFiles {
+    by_name: HashMap<String, Yanked>,
+}
+
+impl UpstreamFiles {
+    /// What a local file's yank state *should* be: upstream's verdict if the
+    /// file is still listed, else flagged [`REMOVED_UPSTREAM`].
+    fn desired(&self, filename: &str) -> Yanked {
+        match self.by_name.get(filename) {
+            Some(y) => y.clone(),
+            None => Yanked::Reason(REMOVED_UPSTREAM.to_string()),
+        }
+    }
+}
+
+/// Load the cursor memo for this run. `--full` (or any read failure) yields an
+/// empty map, which forces unconditional fetches — the memo only ever speeds a
+/// run up, never changes its result.
+async fn load_cursors(client: &Client, resolved: &Resolved, sink: &Sink) -> Cursors {
+    if resolved.full {
+        return Cursors::new();
+    }
+    match sink {
+        Sink::Storage(storage) => match storage.get_bytes(CURSORS_KEY).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(_) => Cursors::new(),
+        },
+        Sink::Http(_) => {
+            let Some(base) = &resolved.dst_base else {
+                return Cursors::new();
+            };
+            let url = format!("{}/sync/cursors", base.trim_end_matches('/'));
+            let mut req = client.get(&url);
+            if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+                req = req.basic_auth(u, Some(p));
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+                _ => Cursors::new(),
+            }
+        }
+    }
+}
+
+/// Persist the merged cursor memo. Best-effort: a failure just means the next
+/// run re-fetches, so it must never fail an otherwise-good sync.
+async fn save_cursors(client: &Client, resolved: &Resolved, sink: &Sink, cursors: &Cursors) {
+    let body = match serde_json::to_vec(cursors) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error=?e, "could not encode sync cursors");
+            return;
+        }
+    };
+    let result = match sink {
+        Sink::Storage(storage) => {
+            storage
+                .put_bytes(CURSORS_KEY, body, Some("application/json"))
+                .await
+        }
+        Sink::Http(_) => save_cursors_http(client, resolved, body).await,
+    };
+    if let Err(e) = result {
+        warn!(error=?e, "failed to persist sync cursors (next run re-fetches)");
+    }
+}
+
+async fn save_cursors_http(client: &Client, resolved: &Resolved, body: Vec<u8>) -> Result<()> {
+    let Some(base) = &resolved.dst_base else {
+        return Ok(());
+    };
+    let url = format!("{}/sync/cursors", base.trim_end_matches('/'));
+    let mut req = client.put(&url).body(body);
+    if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+        req = req.basic_auth(u, Some(p));
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        bail!("saving sync cursors failed [{}]", resp.status());
+    }
+    Ok(())
+}
+
 pub async fn run_sync(args: SyncArgs) -> Result<()> {
     let cfg = config::load(args.config.as_deref())?.sync;
     let resolved = Resolved::merge(&args, cfg).await?;
@@ -340,28 +517,54 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
         }
     };
 
+    // The conditional-fetch memo from the last run; an empty map (first run,
+    // --full, or any read error) simply means every project full-fetches.
+    let cursors = load_cursors(&client, &resolved, &sink).await;
+
     // Packages in parallel (chunked join_all — same pattern as the worker
     // sweep), files within each package in parallel below. The long tail of a
     // mirror is small packages, so serial-per-package was the throughput cap.
     let mut failures = 0usize;
+    let mut refreshed: Cursors = Cursors::new();
     for chunk in resolved.specs.chunks(resolved.package_concurrency) {
-        let results = futures::future::join_all(
-            chunk
-                .iter()
-                .map(|spec| sync_one_package(&client, &resolved, &sink, spec)),
-        )
+        let results = futures::future::join_all(chunk.iter().map(|spec| {
+            sync_one_package(&client, &resolved, &sink, spec, cursors.get(&spec.name))
+        }))
         .await;
         for (spec, result) in chunk.iter().zip(results) {
-            if let Err(e) = result {
-                error!(package=%spec.name, error=?e, "package sync failed");
-                failures += 1;
+            match result {
+                Ok(outcome) => {
+                    if let Some(entry) = outcome.new_cursor {
+                        refreshed.insert(spec.name.clone(), entry);
+                    }
+                }
+                Err(e) => {
+                    error!(package=%spec.name, error=?e, "package sync failed");
+                    failures += 1;
+                }
             }
         }
     }
+
+    // Keep cursors for projects this run didn't touch (or 304'd), overwrite the
+    // ones we re-fetched. A failed project advances nothing — it re-fetches next
+    // run. Persisting is best-effort; the memo only ever speeds things up.
+    let mut merged = cursors;
+    merged.extend(refreshed);
+    save_cursors(&client, &resolved, &sink, &merged).await;
+
     if failures > 0 {
         bail!("{failures} package(s) failed to sync");
     }
     Ok(())
+}
+
+/// What a single project's sync produced for the run-level cursor memo.
+struct PackageOutcome {
+    /// `Some` only on a successful 200 fetch with an ETag — the entry to store.
+    /// `None` means "leave the existing cursor as-is" (a 304 skip, a dry run, or
+    /// a source with no ETag).
+    new_cursor: Option<CursorEntry>,
 }
 
 async fn sync_one_package(
@@ -369,7 +572,8 @@ async fn sync_one_package(
     resolved: &Resolved,
     sink: &Sink,
     spec: &PackageSpec,
-) -> Result<()> {
+    prev_cursor: Option<&CursorEntry>,
+) -> Result<PackageOutcome> {
     let pkg = spec.name.as_str();
 
     // Policy gates come before any network traffic. Over HTTP the server
@@ -389,14 +593,41 @@ async fn sync_one_package(
         }
     }
 
-    let (selected, upstream_status) = fetch_selected_files(client, resolved, spec).await?;
+    // Conditional fetch: replay last run's ETag (unless its config differs, or
+    // this is a dry run that wants the full picture). A 304 means nothing
+    // changed upstream — no files to add, nothing to reconcile — so skip.
+    let cfg_key = config_key(resolved, spec);
+    let if_none_match = if resolved.dry_run {
+        None
+    } else {
+        prev_cursor
+            .filter(|c| c.config == cfg_key)
+            .map(|c| c.etag.as_str())
+    };
+    let (index, etag, last_serial) =
+        match simple::fetch_index_conditional(client, &resolved.src_base, pkg, None, if_none_match)
+            .await?
+        {
+            IndexFetch::NotModified => {
+                info!("{pkg}: upstream unchanged since last sync (304)");
+                return Ok(PackageOutcome { new_cursor: None });
+            }
+            IndexFetch::NotFound => bail!("Package not found on source: {pkg}"),
+            IndexFetch::Found {
+                index,
+                etag,
+                last_serial,
+            } => (index, etag, last_serial),
+        };
+
+    let (selected, upstream_status, upstream_files) = select_from_index(index, resolved, spec);
     info!("Syncing {pkg} ({} matching files selected)", selected.len());
 
     if resolved.dry_run {
         for s in &selected {
             println!("[dry-run] would copy {} ({})", s.file.filename, s.file.url);
         }
-        return Ok(());
+        return Ok(PackageOutcome { new_cursor: None });
     }
 
     let mut claimed_now = false;
@@ -414,8 +645,9 @@ async fn sync_one_package(
         }
     }
 
-    // Intent before the batch of truth writes; commit (paired) after. A sync
-    // process killed mid-package heals via the stale intent.
+    // Intent before the batch of truth writes (adds AND reconcile's sidecar
+    // rewrites); commit (paired) after. A sync killed mid-package heals via the
+    // stale intent.
     let intent_nonce = match sink {
         Sink::Storage(storage) => crate::worker::mark_intent(storage.as_ref(), pkg).await.ok(),
         Sink::Http(_) => None,
@@ -447,29 +679,59 @@ async fn sync_one_package(
         }
     }
 
-    if wrote {
-        if let Sink::Storage(storage) = sink {
-            // Relay PEP 792 status verbatim, inside the intent/commit window so
-            // the rebuild this triggers renders it. Best-effort — the advisory
-            // marker must never fail an otherwise-good mirror. Re-sync clears a
-            // stale marker once upstream returns to active. (A status change
-            // with no file change lags until the next file write — and a
-            // quarantined upstream serves no files, so that case relies on the
-            // existing empty-package handling; documented in STANDARDS.md.)
-            match &upstream_status {
-                Some(doc) if !doc.status.is_active() => {
-                    let _ = status::write_status(storage.as_ref(), pkg, doc).await;
-                }
-                _ => {
-                    let _ = status::clear_status(storage.as_ref(), pkg).await;
-                }
+    // Reconcile mutable metadata of files already mirrored: yank set/cleared to
+    // match upstream, and files gone upstream flagged removed. Upstream is
+    // authoritative for a mirror, so this both raises and clears yanks. A
+    // failure here is a real failure — a missed security yank — so it counts.
+    //
+    // A quarantined upstream (PEP 792) MUST offer no files, so its listing is
+    // empty by design — not because every file was removed. Skip reconcile then;
+    // the status relay below blocks downloads, and flagging every file as
+    // "removed upstream" would be both wrong and a storm of sidecar churn that
+    // reverts the moment the quarantine lifts.
+    let upstream_blocks = matches!(&upstream_status, Some(doc) if doc.status.blocks_downloads());
+    let reconciled = if upstream_blocks {
+        false
+    } else {
+        match reconcile(client, resolved, sink, pkg, &upstream_files).await {
+            Ok(changed) => changed,
+            Err(e) => {
+                error!(package=%pkg, error=?e, "reconcile failed");
+                errors += 1;
+                false
             }
+        }
+    };
+
+    // Relay PEP 792 status (storage mode only — the server owns its own status,
+    // and has no HTTP endpoint to set it). A failed write counts as an error
+    // like a missed yank: it must not advance the cursor over an un-enforced
+    // freeze (a later 304 would mask it forever).
+    let status_changed = match sink {
+        Sink::Storage(storage) => match relay_status(storage.as_ref(), pkg, &upstream_status).await
+        {
+            Ok(changed) => changed,
+            Err(e) => {
+                error!(package=%pkg, error=?e, "status relay failed");
+                errors += 1;
+                false
+            }
+        },
+        Sink::Http(_) => false,
+    };
+
+    // Any truth change (added file, reconciled yank, or status flip) triggers
+    // exactly one index rebuild, inside the intent window. HTTP mode does no
+    // marker work — its uploads and yank calls drive the server's own rebuilds.
+    if wrote || reconciled || status_changed {
+        if let Sink::Storage(storage) = sink {
             match &intent_nonce {
                 Some(nonce) => crate::worker::mark_commit(storage.as_ref(), pkg, nonce).await?,
                 None => mark_dirty(storage.as_ref(), pkg).await?,
             }
         }
     }
+
     if errors > 0 {
         // A claim with nothing behind it would block the name forever.
         if claimed_now && !wrote {
@@ -479,22 +741,200 @@ async fn sync_one_package(
         }
         bail!("{errors} file(s) failed for '{pkg}'");
     }
+
+    // Advance the cursor only after a clean run, so any failure re-fetches next
+    // time. A source without an ETag simply never gets the 304 shortcut.
+    let new_cursor = etag.map(|etag| CursorEntry {
+        etag,
+        config: cfg_key,
+        serial: last_serial,
+    });
+    Ok(PackageOutcome { new_cursor })
+}
+
+/// Dispatch reconcile to the active sink. Returns whether anything changed.
+async fn reconcile(
+    client: &Client,
+    resolved: &Resolved,
+    sink: &Sink,
+    pkg: &str,
+    upstream: &UpstreamFiles,
+) -> Result<bool> {
+    match sink {
+        Sink::Storage(storage) => reconcile_storage(storage.as_ref(), pkg, upstream).await,
+        Sink::Http(_) => reconcile_http(client, resolved, pkg, upstream).await,
+    }
+}
+
+/// Storage mode: rewrite each already-mirrored sidecar whose yank state differs
+/// from upstream's verdict. Corrupt sidecars are left untouched — the worker
+/// already omits them from the index, and fabricating a fresh one would clear a
+/// real yank (see worker's backfill guard). Returns true if anything changed.
+async fn reconcile_storage(
+    storage: &dyn Storage,
+    pkg: &str,
+    upstream: &UpstreamFiles,
+) -> Result<bool> {
+    let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
+    let objects = storage.list_all(&prefix).await?;
+    let mut changed = false;
+    for obj in &objects {
+        let Some(name) = obj.key.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(artifact) = name.strip_suffix(SIDECAR_SUFFIX) else {
+            continue;
+        };
+        let bytes = storage.get_bytes(&obj.key).await?;
+        let mut sc: Sidecar = match serde_json::from_slice(&bytes) {
+            Ok(sc) => sc,
+            Err(e) => {
+                warn!(key=%obj.key, error=?e, "reconcile: skipping corrupt sidecar");
+                continue;
+            }
+        };
+        let desired = upstream.desired(artifact);
+        if sc.yanked != desired {
+            info!(
+                "  - reconcile {artifact}: yank {:?} -> {:?}",
+                sc.yanked, desired
+            );
+            sc.yanked = desired;
+            storage
+                .put_bytes(&obj.key, serde_json::to_vec(&sc)?, Some("application/json"))
+                .await?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// HTTP mode: enumerate the files the destination actually holds locally and,
+/// for each whose yank state has drifted from upstream, drive the server's
+/// `/files/.../yank` endpoint. (Newly-uploaded files already carry the right
+/// yank from the upload; this catches drift on files already there and flags
+/// removals.) Returns true if anything changed.
+///
+/// It reads `/sync/local-index/<pkg>` — the dest's own materialized index, not
+/// `/simple/`, which an on-demand proxy would shadow with the upstream view and
+/// thereby hide a removed file from the reconcile.
+async fn reconcile_http(
+    client: &Client,
+    resolved: &Resolved,
+    pkg: &str,
+    upstream: &UpstreamFiles,
+) -> Result<bool> {
+    let base = resolved
+        .dst_base
+        .as_deref()
+        .ok_or_else(|| anyhow!("HTTP reconcile without a destination base"))?;
+    let url = format!("{}/sync/local-index/{pkg}", base.trim_end_matches('/'));
+    let mut req = client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, SIMPLE_JSON_CONTENT_TYPE);
+    if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+        req = req.basic_auth(u, Some(p));
+    }
+    let resp = req.send().await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        // An older destination without this endpoint: skip the local-truth
+        // reconcile rather than reconcile against a proxied view. (Matched
+        // deployments always have it; the yank set at upload time still holds.)
+        return Ok(false);
+    }
+    let index: SimpleIndex = resp.error_for_status()?.json().await?;
+    let mut changed = false;
+    for file in &index.files {
+        let desired = upstream.desired(&file.filename);
+        if file.yanked != desired {
+            apply_yank_http(client, resolved, base, pkg, &file.filename, &desired).await?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Set/clear a file's yank on the destination via the admin yank endpoint.
+async fn apply_yank_http(
+    client: &Client,
+    resolved: &Resolved,
+    base: &str,
+    pkg: &str,
+    filename: &str,
+    yanked: &Yanked,
+) -> Result<()> {
+    let url = format!("{}/files/{pkg}/{filename}/yank", base.trim_end_matches('/'));
+    let mut req = match yanked {
+        Yanked::Flag(false) => client.delete(&url),
+        Yanked::Flag(true) => client.post(&url).body(String::new()),
+        Yanked::Reason(reason) => client.post(&url).body(reason.clone()),
+    };
+    if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+        req = req.basic_auth(u, Some(p));
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_else(|_| "<no body>".into());
+        bail!("yank update failed for {filename} [{code}]: {body}");
+    }
     Ok(())
 }
 
-async fn fetch_selected_files(
-    client: &Client,
+/// Relay PEP 792 project status to match upstream, returning whether it
+/// changed. `Err` means a status *write* we attempted failed — the caller
+/// treats that like a missed yank: it counts as a failure so the run exits
+/// non-zero and the cursor doesn't advance, forcing a retry next run (otherwise
+/// a 304 would mask an un-enforced quarantine forever). Fail-closed: an
+/// unreadable local marker is never *cleared* (a transient read error must not
+/// un-freeze a quarantine) — only escalated.
+async fn relay_status(
+    storage: &dyn Storage,
+    pkg: &str,
+    upstream_status: &Option<ProjectStatusDoc>,
+) -> Result<bool> {
+    let desired = match upstream_status {
+        Some(doc) if !doc.status.is_active() => doc.clone(),
+        _ => ProjectStatusDoc::default(),
+    };
+    match status::read_status(storage, pkg).await {
+        Ok(current) if current == desired => Ok(false),
+        Ok(_) => apply_status(storage, pkg, &desired).await.map(|()| true),
+        Err(e) => {
+            warn!(package=%pkg, error=?e, "status relay: current status unreadable");
+            if desired.status.is_active() {
+                // Don't clear on an unreadable marker — a transient read error
+                // must not un-freeze a quarantine. Leave whatever's there.
+                Ok(false)
+            } else {
+                apply_status(storage, pkg, &desired).await.map(|()| true)
+            }
+        }
+    }
+}
+
+async fn apply_status(storage: &dyn Storage, pkg: &str, desired: &ProjectStatusDoc) -> Result<()> {
+    if desired.status.is_active() {
+        status::clear_status(storage, pkg).await
+    } else {
+        status::write_status(storage, pkg, desired).await
+    }
+}
+
+/// From an already-fetched listing, derive the files to add (filtered), the
+/// upstream project status, and the full unfiltered filename→yank map that
+/// reconcile needs. Pure — the network fetch happens in the caller so it can be
+/// conditional.
+fn select_from_index(
+    index: SimpleIndex,
     resolved: &Resolved,
     spec: &PackageSpec,
-) -> Result<(Vec<Selected>, Option<ProjectStatusDoc>)> {
+) -> (Vec<Selected>, Option<ProjectStatusDoc>, UpstreamFiles) {
     let base_url = format!(
         "{}/simple/{}/",
         resolved.src_base.trim_end_matches('/'),
         spec.name
     );
-    let index = simple::fetch_index(client, &resolved.src_base, &spec.name, None)
-        .await?
-        .ok_or_else(|| anyhow!("Package not found on source: {}", spec.name))?;
 
     // PEP 691 file URLs may be relative; resolve them (and provenance URLs)
     // against the index page so a non-PyPI source — another pypiron, whose
@@ -508,12 +948,25 @@ async fn fetch_selected_files(
     };
 
     let upstream_status = index.project_status.clone();
+    // Every upstream filename → its yank, captured before filtering: reconcile
+    // must distinguish "filtered out, still upstream" from "gone upstream".
+    // Normalize to the form the server persists, so reconcile is idempotent
+    // even against a sloppy upstream reason (whitespace / empty string).
+    let upstream_files = UpstreamFiles {
+        by_name: index
+            .files
+            .iter()
+            .map(|f| (f.filename.clone(), f.yanked.normalized()))
+            .collect(),
+    };
+
     let mut selected = Vec::new();
     for mut file in index.files {
         // No digest, no service: every artifact we hand out must be verifiable.
         if file.sha256().is_none() {
             continue;
         }
+        file.yanked = file.yanked.normalized();
         if !matches_filters(&file, &resolved.filter) {
             continue;
         }
@@ -538,7 +991,7 @@ async fn fetch_selected_files(
     if selected.is_empty() {
         warn!("No matching files for package '{}'", spec.name);
     }
-    Ok((selected, upstream_status))
+    (selected, upstream_status, upstream_files)
 }
 
 /// Best-effort provenance fetch — supplemental, never fails the file.
@@ -1004,5 +1457,82 @@ mod tests {
 
         let unbounded = time_filter(None, None);
         assert!(matches_filters(&unknown, &unbounded));
+    }
+
+    fn resolved_with(filter: ResolvedFilter, src_base: &str) -> Resolved {
+        Resolved {
+            specs: vec![],
+            src_base: src_base.to_string(),
+            dst_base: None,
+            username: None,
+            password: None,
+            private_prefix: None,
+            concurrency: 1,
+            package_concurrency: 1,
+            dry_run: false,
+            full: false,
+            filter,
+        }
+    }
+
+    fn spec(name: &str, specifiers: Option<&str>) -> PackageSpec {
+        PackageSpec {
+            name: name.to_string(),
+            specifiers: specifiers.map(|s| VersionSpecifiers::from_str(s).unwrap()),
+        }
+    }
+
+    #[test]
+    fn desired_yank_reflects_upstream_or_flags_removal() {
+        let mut by_name = HashMap::new();
+        by_name.insert("a.whl".to_string(), Yanked::Flag(false));
+        by_name.insert("b.whl".to_string(), Yanked::Reason("broken".into()));
+        let up = UpstreamFiles { by_name };
+
+        // Present + not yanked upstream → not yanked (clears a stale local yank).
+        assert_eq!(up.desired("a.whl"), Yanked::Flag(false));
+        // Present + yanked upstream with a reason → that reason.
+        assert_eq!(up.desired("b.whl"), Yanked::Reason("broken".into()));
+        // Gone from upstream → flagged removed (bytes stay downloadable).
+        assert_eq!(
+            up.desired("gone.whl"),
+            Yanked::Reason("removed upstream".into())
+        );
+    }
+
+    #[test]
+    fn config_key_is_stable_and_change_sensitive() {
+        let r = resolved_with(time_filter(None, None), "https://pypi.org");
+        let s = spec("requests", None);
+        let k = config_key(&r, &s);
+
+        // Deterministic across calls.
+        assert_eq!(k, config_key(&r, &s));
+
+        // Tag argument order must not matter (vecs are sorted before hashing).
+        let mut f1 = time_filter(None, None);
+        f1.python_tag = vec!["cp311".into(), "cp310".into()];
+        let mut f2 = time_filter(None, None);
+        f2.python_tag = vec!["cp310".into(), "cp311".into()];
+        assert_eq!(
+            config_key(&resolved_with(f1, "https://pypi.org"), &s),
+            config_key(&resolved_with(f2, "https://pypi.org"), &s),
+        );
+
+        // Source, filter, and specifier changes each invalidate the key.
+        assert_ne!(
+            k,
+            config_key(
+                &resolved_with(time_filter(None, None), "https://other.example"),
+                &s
+            )
+        );
+        let mut wheels = time_filter(None, None);
+        wheels.only_wheels = true;
+        assert_ne!(
+            k,
+            config_key(&resolved_with(wheels, "https://pypi.org"), &s)
+        );
+        assert_ne!(k, config_key(&r, &spec("requests", Some(">=2"))));
     }
 }

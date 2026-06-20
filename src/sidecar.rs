@@ -25,6 +25,30 @@ impl Default for Yanked {
     }
 }
 
+impl Yanked {
+    /// The canonical form the upload/yank endpoints store: a reason is trimmed,
+    /// and an empty (or whitespace-only) reason collapses to a bare `true`.
+    /// Normalizing inbound upstream yank to this form keeps `sync` reconcile
+    /// idempotent — otherwise a `Reason("")` upstream value would never match
+    /// the `Flag(true)` the server actually persists, and reconcile would
+    /// re-yank every run.
+    pub fn normalized(&self) -> Yanked {
+        match self {
+            Yanked::Reason(r) => {
+                let t = r.trim();
+                if t.is_empty() {
+                    Yanked::Flag(true)
+                } else if t.len() == r.len() {
+                    Yanked::Reason(r.clone())
+                } else {
+                    Yanked::Reason(t.to_string())
+                }
+            }
+            Yanked::Flag(b) => Yanked::Flag(*b),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sidecar {
     pub sha256: String,
@@ -79,6 +103,28 @@ mod tests {
         assert!(!is_artifact(".origin"));
         assert!(!is_artifact(".project-status.json"));
         assert!(!is_artifact(""));
+    }
+
+    #[test]
+    fn yanked_normalized_matches_server_storage() {
+        // Trim, and collapse an empty/whitespace reason to a bare flag — the
+        // same rule the upload/yank endpoints apply, so sync reconcile is
+        // idempotent against a sloppy upstream reason.
+        assert_eq!(Yanked::Reason("".into()).normalized(), Yanked::Flag(true));
+        assert_eq!(
+            Yanked::Reason("   ".into()).normalized(),
+            Yanked::Flag(true)
+        );
+        assert_eq!(
+            Yanked::Reason("broken ".into()).normalized(),
+            Yanked::Reason("broken".into())
+        );
+        assert_eq!(
+            Yanked::Reason("broken".into()).normalized(),
+            Yanked::Reason("broken".into())
+        );
+        assert_eq!(Yanked::Flag(false).normalized(), Yanked::Flag(false));
+        assert_eq!(Yanked::Flag(true).normalized(), Yanked::Flag(true));
     }
 
     #[test]

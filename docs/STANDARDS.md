@@ -57,6 +57,11 @@ carry forward PyPI's original timestamps; see
   static files — negotiation just picks which file to serve.
 - The `yanked` and PEP 658 features are pure static-file plays: a sidecar flag and
   a sidecar metadata file, each followed by an index rebuild. No new machinery.
+  A re-`sync` keeps the flag honest: upstream is authoritative for a mirror, so
+  yank state set, cleared, or re-worded upstream is reconciled onto the local
+  sidecar, and a file that has disappeared from upstream is flagged yanked
+  `removed upstream` — the bytes stay downloadable (pypiron never deletes a
+  mirrored artifact), but installers skip it unless pinned.
 - PEP 740 is the same play one more time: a `<filename>.provenance` companion
   served next to the artifact, advertised by a `provenance` URL (JSON) and
   `data-provenance` attribute (HTML). pypiron is a **relay, not a verifier** — it
@@ -79,8 +84,11 @@ carry forward PyPI's original timestamps; see
   archive/quarantine a first-party package, and quarantine relay does **not**
   fail-close downloads of already-stored bytes — both are deferred (the upload and
   `/files/` gates are only worth building once a real client consumes the marker;
-  pip/uv today only *MAY* warn). Known relay gaps: `sync` reconciles status only on
-  a run that writes files, and an upstream-quarantined project serves no files (so
-  it relies on the existing empty-package handling); HTTP-mode `sync` (`/legacy/`)
-  has no channel for the marker. We do not implement PEP 708 `alternate-locations`
+  pip/uv today only *MAY* warn). `sync` (direct mode) now reconciles status on
+  every run an upstream listing actually changes — not only runs that write
+  files — so a quarantine that lands with no new release propagates on the next
+  sync; an upstream-quarantined project serves no files, so its (empty) listing
+  is left to the status relay rather than misread as a mass removal. Remaining
+  gap: HTTP-mode `sync` (`/legacy/`) still has no channel for the marker. We do
+  not implement PEP 708 `alternate-locations`
   (out of scope), even though pypi.org emits an empty one alongside `project-status`.

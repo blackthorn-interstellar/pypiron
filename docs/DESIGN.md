@@ -298,6 +298,10 @@ simple/<pkg>/index.json
 _dirty/<pkg>!<nonce>.intent              # empty marker: a writer is touching this package
 _dirty/<pkg>!<nonce>.commit              # empty marker: truth changed, rebuild now
 _state/fp-<shard>.json                   # audit fingerprints: pkg -> listing hash at last rebuild
+_sync/cursors.json                       # mirror-over-HTTP sync memo: pkg -> last upstream ETag
+                                         #   (config-keyed). Pure cache for conditional fetch;
+                                         #   never truth, never a view — delete it and the next
+                                         #   sync re-fetches. Served by admin GET/PUT /sync/cursors.
 _leader/lease.json                       # multi-node lease (holder, term, expires-at)
 _staging/<ts>-<pid>-<filename>           # cloud only: a >64 MB upload streams here, then
                                          #   copy-if-not-exists publishes it to its final key.

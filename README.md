@@ -14,9 +14,9 @@ An ultra-fast Python package server, written in Rust.
 
 
 ## Highlights
-- 4x-60x faster than other PyPi servers
-- Mitigates supply-chain attacks by supporting --exclude-newer and protecting private package names
-- Works with all major cli tools (uv, pip, poetry, twine, pipenv)
+- **4x-60x faster** than other PyPi servers
+- **Mitigates supply-chain attacks** by supporting `--exclude-newer` and protecting private package names
+- **Compatible with entire ecosystem** uv, pip, poetry, twine, pipenv, hatch
 - **Infinite horizontal scaling that "just works"** — point any number of nodes at the same bucket; reads need zero coordination.
 - 📊 **Per-project download tracking** — tag requests by consuming project, straight into Prometheus.
 - 🔁 **Mirror or proxy PyPI** — one URL serves private packages and cached public dependencies.
@@ -29,15 +29,6 @@ An ultra-fast Python package server, written in Rust.
 ```bash
 uvx pypiron serve 
 ```
-
-```bash
-docker run --rm -it -p 8080:8080 -v pypiron-data:/data \
-  -e PYPIRON_ADMIN_USER=admin -e PYPIRON_ADMIN_PASS=secret \
-  ghcr.io/brycedrennan/pypiron:latest
-```
-
-Multi-arch (amd64/arm64) images are published to GHCR on every release tag
-(`:X.Y.Z`, `:X.Y`, `:latest`) and on each push to `master` (`:master`).
 
 ## Documentation
 
@@ -72,7 +63,12 @@ upload timestamps so `uv --exclude-newer` resolves historically correct
 versions against your mirror:
 
 ```bash
+# Mirror a list into a running server (sync is an HTTP client; --to is required)
 pypiron sync --packages-list packages.txt \
+  --to http://localhost:8080 --username admin --password adminsecret
+
+# ...or a one-off package without a list file (--pkg is repeatable)
+pypiron sync --pkg requests --pkg numpy \
   --to http://localhost:8080 --username admin --password adminsecret
 ```
 
@@ -135,15 +131,15 @@ export UV_INDEX_COMPANY_PASSWORD="secret"
 
 ## FAQ
 
-**Does it really not need a database?** No. Truth is files, the index is a
+**Does it need a database?** No. Truth is files, the index is a
 regenerable view, backups are rsync. See
 [DESIGN.md](docs/DESIGN.md#what-no-db-honestly-costs).
 
 **How do private and public packages share one URL?** They live in one index —
 there's no virtual-repo group (Artifactory/Nexus) or index inheritance (devpi)
 to compose. Those tools merge several repos per request, which is where
-resolution-order bugs and dependency-confusion fall-through live. Here every
-name belongs to exactly one world — `private` or `mirror`, claimed at first
+resolution-order bugs and dependency-confusion fall-through happens. In pypiron, every
+package name belongs to exactly one world — `private` or `mirror`, claimed at first
 write — so there's nothing to merge and no order to get wrong. See
 [DESIGN.md](docs/DESIGN.md#private--mirrored-packages-dependency-confusion).
 
@@ -165,7 +161,7 @@ Alternatives, for comparison:
 [devpi-server](https://github.com/devpi/devpi),
 [pypiserver](https://github.com/pypiserver/pypiserver),
 [pypicloud](https://github.com/stevearc/pypicloud),
-[warehouse](https://github.com/pypi/warehouse).
+[devpi](https://www.devpi.net/).
 
 ## License
 

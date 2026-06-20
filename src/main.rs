@@ -510,14 +510,35 @@ async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
             "listening on http://{}", cli.bind_addr
         ),
     }
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // We observe the shutdown signal ourselves (rather than handing it
+    // straight to `with_graceful_shutdown`) so we can bound how long we wait
+    // afterwards. Axum's graceful shutdown otherwise blocks until *every*
+    // connection closes, including idle HTTP keep-alive ones — a single open
+    // browser tab or lingering client is enough to make Ctrl-C hang forever.
+    let (graceful_tx, graceful_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = graceful_rx.await;
+            })
+            .await
+    });
 
-    // Tell the worker to stop and give it a moment to release the leader
-    // lease — that hand-off is what keeps a restart from being a lease-TTL
-    // write outage on the successor.
-    let _ = shutdown_tx.send(true);
+    shutdown_signal().await;
+    let _ = graceful_tx.send(()); // begin draining in-flight requests
+    let _ = shutdown_tx.send(true); // stop the worker
+
+    // Give in-flight requests a moment to finish, then exit regardless of any
+    // idle keep-alive connections axum would otherwise wait on.
+    match tokio::time::timeout(Duration::from_secs(10), server).await {
+        Err(_) => warn!("graceful shutdown timed out after 10s; forcing exit"),
+        Ok(Err(e)) => warn!(error = %e, "server task failed to join"),
+        Ok(Ok(Err(e))) => return Err(anyhow!("server error: {e}")),
+        Ok(Ok(Ok(()))) => {}
+    }
+
+    // Give the worker a moment to release the leader lease — that hand-off is
+    // what keeps a restart from being a lease-TTL write outage on the successor.
     if tokio::time::timeout(Duration::from_secs(5), worker_handle)
         .await
         .is_err()

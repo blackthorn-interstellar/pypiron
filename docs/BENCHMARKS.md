@@ -113,9 +113,9 @@ fifteen years of packaging sins find our edge cases for us.
 
 | ID | Scenario | Floor | Brag target |
 |---|---|---|---|
-| M1 | Sync throughput, small-file packages, direct-to-S3 (request-bound) | 100 files/s | **≥1,000 files/s sustained** (~4 storage ops/file ≈ 4k S3 ops/s) |
+| M1 | Sync throughput, small-file packages, HTTP-push to an S3-backed server (request-bound) | 100 files/s | **≥1,000 files/s sustained** (~4 storage ops/file ≈ 4k S3 ops/s) |
 | M2 | Sync throughput, torch-class artifacts (bandwidth-bound) | 1 Gbps | **≥5 Gbps sustained PyPI→S3 pass-through, RSS flat** |
-| M3 | HTTP-push mode (`--to`) vs direct-to-storage | works | **within 25% of direct** once server uploads stream (W1) |
+| M3 | HTTP-push (`--to`) is the only sync mode — server-side streaming uploads keep it competitive with the bytes' floor | works | **server upload streaming (W1) holds throughput within 25% of raw PyPI→S3** |
 | M4 | Incremental re-sync of a full mirror (the freshness cost) | < 4 h | **daily delta < 30 min** |
 | M5 | **The full clone**: every package on PyPI (~620k projects, ~14M files, ~35 TB) | completes with a bounded, categorized failure list | **< 24 h wall clock; zero crashes; every refusal becomes a test fixture** |
 

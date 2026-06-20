@@ -28,9 +28,10 @@ use std::path::Path;
 
 use flate2::read::GzDecoder;
 
-use crate::names::{infer_package_from_filename, infer_version_from_filename, normalize_pkg_name};
+use crate::names::{
+    infer_package_from_filename, infer_version_from_filename, normalize_pkg_name, parse_wheel_tags,
+};
 use crate::sidecar::is_artifact;
-use crate::sync::parse_wheel_tags;
 
 const SAMPLES_PER_BUCKET: usize = 8;
 

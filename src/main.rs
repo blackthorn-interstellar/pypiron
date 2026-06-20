@@ -26,6 +26,7 @@ mod metrics;
 mod names;
 mod origin;
 mod proxy;
+mod range;
 mod render;
 mod sidecar;
 mod simple;
@@ -382,6 +383,16 @@ async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
         None => None,
     };
 
+    // The private prefix is the dependency-confusion control; a value that PEP
+    // 503 normalization reduces to empty (e.g. `.`, `_`, `..`) would match no
+    // package and silently protect nothing. Fail closed at startup instead.
+    let private_prefix = match cli.private_prefix.as_deref() {
+        Some(raw) => Some(checked_pkg_name(raw).ok_or_else(|| {
+            anyhow::anyhow!("--private-prefix '{raw}' is not a valid package name")
+        })?),
+        None => None,
+    };
+
     let state = Arc::new(AppState {
         storage,
         uploader_user: cli.uploader_user,
@@ -390,7 +401,7 @@ async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
         admin_pass: cli.admin_pass,
         read_user: cli.read_user,
         read_pass: cli.read_pass,
-        private_prefix: cli.private_prefix.as_deref().map(normalize_pkg_name),
+        private_prefix,
         artifact_delivery: cli.artifact_delivery,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
@@ -452,6 +463,12 @@ async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
         .route(
             "/files/:package/:filename/yank",
             post(yank_set).delete(yank_clear),
+        )
+        // PEP 792 project status (admin): the project-level twin of file yank.
+        // Mirror-over-HTTP `sync` relays upstream status through it.
+        .route(
+            "/project/:package/status",
+            post(project_status_set).delete(project_status_clear),
         )
         // Mirror-over-HTTP sync cursors: the server-side memo of the last
         // upstream ETag each sync job saw, so a fresh/ephemeral sync host stays
@@ -1935,6 +1952,61 @@ async fn set_yanked(
 
     if let Err(e) = commit_marker(state, &pkg, intent_nonce).await {
         warn!(error=?e, "yank: failed to write commit marker");
+    }
+    Ok(StatusCode::OK)
+}
+
+/// Set a project's PEP 792 status (admin). The body is the status doc, e.g.
+/// `{"status":"quarantined","reason":"..."}`. An `active` target carries no
+/// marker, so it is treated as a clear. This is how mirror-over-HTTP `sync`
+/// relays an upstream freeze; the marker is truth, so the index heals from it.
+async fn project_status_set(
+    State(state): State<Arc<AppState>>,
+    Path(package): Path<String>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Authenticate before parsing the body — an unauthenticated caller must not
+    // be able to probe well-formed vs malformed JSON (400 vs 401/403).
+    require_admin(&state, &headers)?;
+    let doc: status::ProjectStatusDoc = serde_json::from_str(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid status doc: {e}")))?;
+    write_project_status(&state, &package, doc).await
+}
+
+/// Clear a project's status, reverting it to the default `active` (admin).
+async fn project_status_clear(
+    State(state): State<Arc<AppState>>,
+    Path(package): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
+    write_project_status(&state, &package, status::ProjectStatusDoc::default()).await
+}
+
+/// Write (or, for `active`, remove) the project-status marker, then rebuild the
+/// index — status changes what the listing renders (a quarantine serves no
+/// files). Marker is truth, so this is crash-safe via the intent/commit pair.
+/// Callers MUST enforce admin auth first.
+async fn write_project_status(
+    state: &AppState,
+    package: &str,
+    doc: status::ProjectStatusDoc,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let Some(pkg) = checked_pkg_name(package) else {
+        return Err((StatusCode::NOT_FOUND, "no such package".to_string()));
+    };
+
+    let intent_nonce = worker::mark_intent(state.storage.as_ref(), &pkg).await.ok();
+    let result = if doc.status.is_active() {
+        status::clear_status(state.storage.as_ref(), &pkg).await
+    } else {
+        status::write_status(state.storage.as_ref(), &pkg, &doc).await
+    };
+    result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
+
+    if let Err(e) = commit_marker(state, &pkg, intent_nonce).await {
+        warn!(error=?e, "status: failed to write commit marker");
     }
     Ok(StatusCode::OK)
 }

@@ -5,9 +5,11 @@ per-project marker is truth on disk at `packages/<pkg>/.project-status.json`,
 carried into the rendered index and propagated through the proxy. These drive
 the real binary over HTTP.
 
-Status is set the on-brand way for Phase 1 — by writing the marker file before
-the upload that materializes the index (truth is files on disk; there is no
-authoring endpoint yet).
+Most tests set status the on-brand way — by writing the marker file before the
+upload that materializes the index (truth is files on disk). The admin endpoint
+`POST`/`DELETE /project/<pkg>/status` also sets/clears the marker; it exists so
+mirror-over-HTTP `sync` can relay upstream status, and an operator may call it
+directly.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from .helpers import (
     get_index_json,
     http_get,
     http_get_json,
+    http_request_auth,
     make_wheel,
     upload_legacy,
     wait_for_file_in_index,
@@ -115,6 +118,55 @@ def test_quarantined_project_omits_file_links_but_keeps_marker(disk_server, tmp_
     # The artifact bytes still exist on disk — Phase 1 relays the marker but
     # does not gate downloads (that fail-closed gate is deferred to Phase 2).
     assert (disk_server["data_dir"] / "packages" / pkg / wheel.name).exists()
+
+
+def test_admin_status_endpoint_sets_and_clears(disk_server, tmp_path):
+    """POST/DELETE /project/<pkg>/status round-trips a quarantine: set hides the
+    files, clear restores them. Admin-gated; a malformed body is a 400."""
+    server = disk_server
+    pkg = "endpointdemo"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    _mirror_upload(server, wheel)
+    wait_for_file_in_index(server["simple"], pkg, wheel.name)
+
+    status_url = f"{server['base_url']}/project/{pkg}/status"
+    admin = {"username": server["admin_user"], "password": server["admin_password"]}
+
+    # Non-admin (uploader) cannot author status.
+    code, _, _ = http_request_auth(
+        "POST",
+        status_url,
+        data=b'{"status":"quarantined"}',
+        username=server["uploader_user"],
+        password=server["uploader_password"],
+    )
+    assert code == 401, "status authoring is admin-only"
+
+    # A malformed/unknown status body is a 400, not a silent no-op.
+    code, _, _ = http_request_auth("POST", status_url, data=b'{"status":"frozen"}', **admin)
+    assert code == 400
+
+    # Admin sets quarantine → the index hides the files but keeps the marker.
+    code, _, _ = http_request_auth("POST", status_url, data=b'{"status":"quarantined"}', **admin)
+    assert code == 200
+    index = _wait_for_status(server["simple"], pkg)
+    assert index["project-status"]["status"] == "quarantined"
+    assert index["files"] == []
+    # The bytes are untouched on disk — quarantine omits links, never deletes.
+    assert (server["data_dir"] / "packages" / pkg / wheel.name).exists()
+
+    # Admin clears → back to active (marker gone, file restored).
+    code, _, _ = http_request_auth("DELETE", status_url, **admin)
+    assert code == 200
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        doc = get_index_json(server["simple"], pkg)
+        if "project-status" not in doc and any(f["filename"] == wheel.name for f in doc["files"]):
+            break
+        time.sleep(0.2)
+    doc = get_index_json(server["simple"], pkg)
+    assert "project-status" not in doc, "clear must remove the marker"
+    assert any(f["filename"] == wheel.name for f in doc["files"]), "files return after un-freeze"
 
 
 def test_proxy_relays_upstream_project_status(proxy_pair, tmp_path):

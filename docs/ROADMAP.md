@@ -25,7 +25,7 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 - Multi-node on any cloud backend via a sloppy leader lease (conditional writes, TTL, heartbeat).
 
 **Mirroring & proxying**
-- `pypiron sync` over HTTP (`--to`) and direct-to-storage, carrying PyPI's true `upload-time` so `--exclude-newer` stays historically correct; tag/time filters; `pypiron.toml` config layering.
+- `pypiron sync` over HTTP (`--to`, the single writer is always the server), carrying PyPI's true `upload-time` so `--exclude-newer` stays historically correct; tag/time filters; `--pkg`/packages-list selection; `pypiron.toml` config layering.
 - On-demand PyPI proxying (`--proxy-upstream`) — cache public dependencies on first use, origin-checked.
 
 **Security & access**

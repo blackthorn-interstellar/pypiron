@@ -1,10 +1,8 @@
 """A re-sync truly converges to upstream: yank state propagates, files gone
-upstream are flagged, and an unchanged upstream is skipped via a conditional
-304. Driven against two real pypiron processes — a mutable SOURCE and a DEST —
-so the source can be yanked/deleted/quarantined and the dest re-synced.
-
-Both sync modes are exercised: direct-storage (`--data-dir`) and
-mirror-over-HTTP (`--to`).
+upstream are flagged, project status (PEP 792) is relayed, and an unchanged
+upstream is skipped via a conditional 304. Driven against two real pypiron
+processes — a mutable SOURCE and a DEST — so the source can be
+yanked/deleted/quarantined and the dest re-synced over HTTP (`--to`).
 """
 
 from __future__ import annotations
@@ -22,7 +20,7 @@ from .helpers import (
     http_get,
     http_request_auth,
     make_wheel,
-    run_returncode,
+    sync_to,
     upload_legacy,
     wait_for_file_in_index,
 )
@@ -57,30 +55,19 @@ def _seed(server, name: str, version: str, tmp_path):
     return wheel
 
 
-def _run_sync(pypiron_bin, source, dest, pkg_list, mode: str, *extra):
-    args = [
-        str(pypiron_bin),
-        "sync",
-        "--packages-list",
-        str(pkg_list),
-        "--from",
-        source["base_url"],
-    ]
-    if mode == "http":
-        args += [
-            "--to",
-            dest["base_url"],
-            "--username",
-            dest["admin_user"],
-            "--password",
-            dest["admin_password"],
-        ]
-    else:
-        args += ["--data-dir", str(dest["data_dir"])]
+def _run_sync(pypiron_bin, source, dest, pkg_list, *extra):
     # Pin the log filter so the 304/"Syncing" assertions don't depend on an
     # ambient RUST_LOG; the messages are emitted at info!.
     env = {**os.environ, "RUST_LOG": "info,pypiron=info"}
-    return run_returncode([*args, *extra], timeout=600, env=env)
+    return sync_to(
+        pypiron_bin,
+        dest,
+        "--packages-list",
+        str(pkg_list),
+        *extra,
+        source=source["base_url"],
+        env=env,
+    )
 
 
 def _yank_value(idx: dict, filename: str):
@@ -103,8 +90,7 @@ def _wait_yank(simple_url: str, pkg: str, filename: str, expected, *, timeout: f
     raise AssertionError(f"{filename}: yanked={last!r}, expected {expected!r} within {timeout}s")
 
 
-@pytest.mark.parametrize("mode", ["direct", "http"])
-def test_yank_set_and_clear_propagate_on_resync(source_dest, pypiron_bin, tmp_path, mode):
+def test_yank_set_and_clear_propagate_on_resync(source_dest, pypiron_bin, tmp_path):
     source, dest = source_dest["source"], source_dest["dest"]
     pkg = "reconcileyank"
     _seed(source, pkg, "1.0", tmp_path)
@@ -115,7 +101,7 @@ def test_yank_set_and_clear_propagate_on_resync(source_dest, pypiron_bin, tmp_pa
     pkg_list.write_text(f"{pkg}\n")
 
     # Initial sync: both files land, unyanked.
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, mode)
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list)
     assert rc == 0, f"initial sync failed:\n{out}\n{err}"
     wait_for_file_in_index(dest["simple"], pkg, w2.name)
     assert _yank_value(get_index_json(dest["simple"], pkg), w2.name) is False
@@ -128,7 +114,7 @@ def test_yank_set_and_clear_propagate_on_resync(source_dest, pypiron_bin, tmp_pa
     _wait_yank(source["simple"], pkg, w2.name, "broken release")
 
     # Re-sync: the yank reaches the dest, reason and all.
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, mode)
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list)
     assert rc == 0, f"yank re-sync failed:\n{out}\n{err}"
     _wait_yank(dest["simple"], pkg, w2.name, "broken release")
 
@@ -137,13 +123,12 @@ def test_yank_set_and_clear_propagate_on_resync(source_dest, pypiron_bin, tmp_pa
     code, _, _ = http_request_auth("DELETE", yank_url, **_admin(source))
     assert code == 200
     _wait_yank(source["simple"], pkg, w2.name, False)
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, mode)
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list)
     assert rc == 0, f"un-yank re-sync failed:\n{out}\n{err}"
     _wait_yank(dest["simple"], pkg, w2.name, False)
 
 
-@pytest.mark.parametrize("mode", ["direct", "http"])
-def test_removed_upstream_is_flagged_yet_downloadable(source_dest, pypiron_bin, tmp_path, mode):
+def test_removed_upstream_is_flagged_yet_downloadable(source_dest, pypiron_bin, tmp_path):
     source, dest = source_dest["source"], source_dest["dest"]
     pkg = "reconcileremoved"
     w1 = _seed(source, pkg, "1.0", tmp_path)
@@ -153,7 +138,7 @@ def test_removed_upstream_is_flagged_yet_downloadable(source_dest, pypiron_bin, 
     pkg_list = tmp_path / "packages.txt"
     pkg_list.write_text(f"{pkg}\n")
 
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, mode)
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list)
     assert rc == 0, f"initial sync failed:\n{out}\n{err}"
     wait_for_file_in_index(dest["simple"], pkg, w1.name)
     wait_for_file_in_index(dest["simple"], pkg, w2.name)
@@ -172,7 +157,7 @@ def test_removed_upstream_is_flagged_yet_downloadable(source_dest, pypiron_bin, 
     assert _yank_value(get_index_json(source["simple"], pkg), w1.name) is None
 
     # Re-sync: v1 stays mirrored but is flagged removed; v2 is untouched.
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, mode)
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list)
     assert rc == 0, f"removal re-sync failed:\n{out}\n{err}"
     _wait_yank(dest["simple"], pkg, w1.name, "removed upstream")
     assert _yank_value(get_index_json(dest["simple"], pkg), w2.name) is False
@@ -182,8 +167,7 @@ def test_removed_upstream_is_flagged_yet_downloadable(source_dest, pypiron_bin, 
     assert code == 200
 
 
-@pytest.mark.parametrize("mode", ["direct", "http"])
-def test_unchanged_resync_skips_via_conditional_304(source_dest, pypiron_bin, tmp_path, mode):
+def test_unchanged_resync_skips_via_conditional_304(source_dest, pypiron_bin, tmp_path):
     source, dest = source_dest["source"], source_dest["dest"]
     pkg = "reconcile304"
     w1 = _seed(source, pkg, "1.0", tmp_path)
@@ -192,7 +176,7 @@ def test_unchanged_resync_skips_via_conditional_304(source_dest, pypiron_bin, tm
     pkg_list = tmp_path / "packages.txt"
     pkg_list.write_text(f"{pkg}\n")
 
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, mode)
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list)
     assert rc == 0, f"initial sync failed:\n{out}\n{err}"
     assert f"Syncing {pkg}" in (out + err)
     wait_for_file_in_index(dest["simple"], pkg, w1.name)
@@ -206,7 +190,7 @@ def test_unchanged_resync_skips_via_conditional_304(source_dest, pypiron_bin, tm
     # Second run, nothing changed upstream: the conditional fetch 304s (in HTTP
     # mode the cursor round-trips through GET /sync/cursors) and the whole
     # project is skipped — no re-selection, no reconcile.
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, mode)
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list)
     assert rc == 0, f"second sync failed:\n{out}\n{err}"
     combined = out + err
     assert "upstream unchanged since last sync (304)" in combined, combined
@@ -214,12 +198,12 @@ def test_unchanged_resync_skips_via_conditional_304(source_dest, pypiron_bin, tm
 
     # A changed run config (here --only-wheels) must invalidate the cursor's
     # config key and force a re-fetch, even though upstream is unchanged.
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, mode, "--only-wheels")
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--only-wheels")
     assert rc == 0, f"config-change sync failed:\n{out}\n{err}"
     assert f"Syncing {pkg}" in (out + err), "config change did not invalidate the 304 shortcut"
 
     # --full ignores the memo and re-fetches even though nothing changed.
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, mode, "--full")
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--full")
     assert rc == 0, f"--full sync failed:\n{out}\n{err}"
     assert f"Syncing {pkg}" in (out + err)
 
@@ -233,7 +217,7 @@ def test_quarantine_status_propagates_without_mass_removal(source_dest, pypiron_
     pkg_list = tmp_path / "packages.txt"
     pkg_list.write_text(f"{pkg}\n")
 
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "direct")
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list)
     assert rc == 0, f"initial sync failed:\n{out}\n{err}"
     wait_for_file_in_index(dest["simple"], pkg, w1.name)
 
@@ -259,9 +243,9 @@ def test_quarantine_status_propagates_without_mass_removal(source_dest, pypiron_
         == "quarantined"
     )
 
-    # Re-sync. No files changed, so the old code (status only on a file write)
-    # would never propagate this. The new code relays it regardless.
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "direct")
+    # Re-sync. No files change (a quarantine offers none), yet the status must
+    # still reach the dest — relayed over HTTP through its status endpoint.
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list)
     assert rc == 0, f"status re-sync failed:\n{out}\n{err}"
 
     deadline = time.time() + 30.0

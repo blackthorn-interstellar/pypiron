@@ -29,6 +29,17 @@ fuzz_target!(|data: &[u8]| {
     let _ = infer_package_from_filename(s);
     let _ = infer_version_from_filename(s);
 
+    // PEP 427 wheel-tag extraction off the same hostile filename. The `< 5`
+    // field guard makes the `len() - 3/2/1` indexing total; a wheel that parses
+    // always yields three non-empty tag fields (each `.`-split keeps the field
+    // itself when it has no dot, so the vecs are never empty).
+    if let Some(tags) = parse_wheel_tags(s) {
+        assert!(
+            !tags.python.is_empty() && !tags.abi.is_empty() && !tags.platform.is_empty(),
+            "parse_wheel_tags returned an empty tag field for {s:?}"
+        );
+    }
+
     // PEP 503 normalization must be idempotent — the canonical-URL 301 in
     // `simple_pkg` would otherwise redirect in a loop.
     assert_eq!(normalize_pkg_name(&norm), norm, "normalize_pkg_name not idempotent");

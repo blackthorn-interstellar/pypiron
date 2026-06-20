@@ -8,14 +8,17 @@ credentials cannot do it.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pytest
+from packaging.version import Version
 
 from .helpers import (
     download_pypi_wheel,
     pypi_project_json,
     run_checked,
     run_returncode,
+    sync_to,
     upload_legacy,
     wait_for_file_in_index,
 )
@@ -24,6 +27,21 @@ PACKAGE = "six"
 CUTOFF = "2016-01-01T00:00:00Z"
 
 pytestmark = pytest.mark.integration
+
+
+def _expected_version_at(cutoff: str) -> str:
+    """Highest non-yanked six version with a wheel uploaded before the cutoff,
+    computed independently from pypi.org — the ground truth uv must resolve to."""
+    cutoff_dt = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+    data = pypi_project_json(PACKAGE)
+    candidates = []
+    for version, files in data["releases"].items():
+        for f in files:
+            uploaded = datetime.fromisoformat(f["upload_time_iso_8601"].replace("Z", "+00:00"))
+            if f["filename"].endswith(".whl") and not f.get("yanked") and uploaded < cutoff_dt:
+                candidates.append(Version(version))
+    assert candidates, "PyPI should have pre-cutoff six wheels"
+    return str(max(candidates))
 
 
 def _sync_to(server, pypiron_bin, pkg_list, *extra, user=None, password=None):
@@ -95,12 +113,35 @@ def test_http_mirror_preserves_historical_timestamps(
         timeout=180,
     )
     installed = run_checked([py, "-c", "import six; print(six.__version__)"]).stdout.strip()
+    # Cross-check against PyPI ground truth: the backdated mirror must resolve the
+    # EXACT maximal version that existed pre-cutoff, not merely *some* older one.
+    expected = _expected_version_at(CUTOFF)
+    assert installed == expected, (
+        f"--exclude-newer {CUTOFF} must resolve {expected} (PyPI history), got {installed}"
+    )
     sidecar_installed = json.loads(
         next(pkg_dir.glob(f"six-{installed}-*.whl.meta.json")).read_text()
     )
     assert sidecar_installed["upload-time"] < CUTOFF, (
         f"resolved {installed} must predate the cutoff"
     )
+
+
+def test_sync_refuses_private_namespace(disk_server, pypiron_bin):
+    """The client-side private-namespace gate refuses before any upload — no
+    network traffic, nothing written."""
+    rc, out, err = sync_to(
+        pypiron_bin,
+        disk_server,
+        "--pkg",
+        PACKAGE,
+        "--private-prefix",
+        PACKAGE,
+        timeout=120,
+    )
+    assert rc != 0
+    assert "namespace" in (out + err)
+    assert not (disk_server["data_dir"] / "packages" / PACKAGE).exists()
 
 
 def test_mirror_disabled_without_admin_credential(disk_server_uploader_only, pypiron_bin, tmp_path):
@@ -125,9 +166,15 @@ def test_http_mirror_refuses_private_owned_names(disk_server, pypiron_bin, tmp_p
 
     pkg_list = tmp_path / "packages.txt"
     pkg_list.write_text(f"{PACKAGE}\n")
-    rc, _, _ = _sync_to(server, pypiron_bin, pkg_list)
+    rc, out, err = _sync_to(server, pypiron_bin, pkg_list)
     assert rc != 0, "mirroring over a private-owned name must hard-fail"
-    assert (server["data_dir"] / "packages" / PACKAGE / ".origin").read_text() == "private"
+    # The failure is the private-name guard, not some unrelated error.
+    assert "private" in (out + err), f"expected a private-name diagnostic:\n{out}\n{err}"
+    pkg_dir = server["data_dir"] / "packages" / PACKAGE
+    assert (pkg_dir / ".origin").read_text() == "private", "the claim must be untouched"
+    # No mirrored wheel may leak in alongside the private claim.
+    wheels = sorted(p.name for p in pkg_dir.iterdir() if p.name.endswith(".whl"))
+    assert wheels == [wheel_path.name], f"no mirrored files may appear, found {wheels}"
 
 
 def test_normal_uploads_cannot_backdate(disk_server, tmp_path):

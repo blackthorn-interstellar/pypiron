@@ -1,20 +1,19 @@
-//! Mirror packages from PyPI into this registry.
+//! Mirror packages from PyPI into a pypiron server, over HTTP.
 //!
-//! The recommended mode is mirror-over-HTTP (`--to <server>`): each file is
-//! POSTed to the server's `/legacy/` with `mirror=true` plus PyPI's true
-//! `upload-time` and yank state, authenticated against the server's admin
-//! credential, and the server owns every storage write. Sync needs a URL and
-//! the admin credential — nothing about the server's storage. Without
-//! `--to`, sync writes directly to storage with the same code the server uses.
+//! Sync is a client: each selected file is POSTed to the destination server's
+//! `/legacy/` with `mirror=true` plus PyPI's true `upload-time` and yank state,
+//! authenticated against the server's admin credential. The server owns every
+//! storage write — sync needs a URL (`--to`) and the admin credential, nothing
+//! about the server's storage backend.
 //!
 //! Filters (`--only-wheels`, tag filters, `--exclude-newer`/`--exclude-older`,
 //! PEP 440 specifiers in the package list) gate only what a run *adds* — an
 //! artifact, once mirrored, is never deleted. A re-sync does, however,
 //! *reconcile* the mutable metadata of files it already has: yank state is
-//! brought in line with upstream (set, cleared, or its reason updated), and a
-//! file gone from upstream is flagged yanked `removed upstream` (kept
-//! downloadable, but installers skip it). PEP 792 project status is relayed the
-//! same way.
+//! brought in line with upstream (set, cleared, or its reason updated, via the
+//! server's yank endpoint), and a file gone from upstream is flagged yanked
+//! `removed upstream` (kept downloadable, but installers skip it). PEP 792
+//! project status is relayed the same way, through the server's status endpoint.
 //!
 //! To make "reconcile every run" cheap, each project is fetched conditionally:
 //! the last upstream ETag is remembered (server-side, in `_sync/cursors.json`)
@@ -40,15 +39,12 @@ use tracing::{error, info, warn};
 use crate::config::{self, SyncConfig};
 use crate::names::{
     checked_pkg_name, infer_version_from_filename, matches_prefix, normalize_pkg_name,
+    parse_wheel_tags,
 };
-use crate::origin;
 use crate::render::SIMPLE_JSON_CONTENT_TYPE;
-use crate::sidecar::{metadata_key, provenance_key, sidecar_key, Sidecar, Yanked, SIDECAR_SUFFIX};
+use crate::sidecar::Yanked;
 use crate::simple::{self, IndexFetch, SimpleFile, SimpleIndex};
-use crate::status::{self, ProjectStatusDoc};
-use crate::storage::{Storage, StorageArgs};
-use crate::worker::mark_dirty;
-use crate::PACKAGES_PREFIX;
+use crate::status::ProjectStatusDoc;
 
 #[derive(Debug, Clone, Args)]
 pub struct SyncArgs {
@@ -62,23 +58,30 @@ pub struct SyncArgs {
     #[arg(long, env = "PYPIRON_PACKAGES_LIST")]
     pub packages_list: Option<PathBuf>,
 
+    /// A single package to mirror, same line syntax as a packages-list entry
+    /// (name with optional PEP 440 specifiers); repeatable. When any CLI
+    /// package is given (`--pkg` and/or `--packages-list`), the CLI set fully
+    /// replaces the config file's `[sync].packages`/`packages-list`.
+    #[arg(long = "pkg", value_name = "SPEC")]
+    pub pkg: Vec<String>,
+
     /// Source index base (default: https://pypi.org). Read over the PEP 691
     /// Simple API (`/simple/<name>/`), so any PEP 691 index works — PyPI,
     /// another pypiron, etc.
     #[arg(long = "from", env = "PYPIRON_SYNC_FROM")]
     pub src_base: Option<String>,
 
-    /// Destination PypIron base URL: mirror over HTTP via its /legacy/
-    /// (recommended; authenticate with the server's admin credential). Omit
-    /// to write directly to storage.
+    /// Destination pypiron base URL. Sync mirrors over HTTP: each file is POSTed
+    /// to the server's `/legacy/`, authenticated with the server's admin
+    /// credential. Required (here or as `[sync].to`).
     #[arg(long = "to", env = "PYPIRON_SYNC_TO")]
     pub dst_base: Option<String>,
 
-    /// Basic auth username for the HTTP-mode destination (optional).
+    /// Basic auth username for the destination (the admin credential).
     #[arg(long, env = "PYPIRON_SYNC_USERNAME")]
     pub username: Option<String>,
 
-    /// Basic auth password for the HTTP-mode destination (optional).
+    /// Basic auth password for the destination (the admin credential).
     #[arg(long, env = "PYPIRON_SYNC_PASSWORD")]
     pub password: Option<String>,
 
@@ -111,10 +114,6 @@ pub struct SyncArgs {
     /// Filtering flags (wheel/python/abi/platform/upload-time).
     #[command(flatten)]
     pub filter: FilterArgs,
-
-    /// Storage configuration for direct mode (same flags as `serve`).
-    #[command(flatten)]
-    pub storage: StorageArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -165,7 +164,7 @@ struct PackageSpec {
 struct Resolved {
     specs: Vec<PackageSpec>,
     src_base: String,
-    dst_base: Option<String>,
+    dst_base: String,
     username: Option<String>,
     password: Option<String>,
     private_prefix: Option<String>,
@@ -189,16 +188,19 @@ pub(crate) struct ResolvedFilter {
 
 impl Resolved {
     async fn merge(args: &SyncArgs, cfg: SyncConfig) -> Result<Self> {
-        // Package set follows CLI > file: an explicit --packages-list replaces
-        // the file's list entirely (both its `packages-list` and inline
-        // `packages`). With no CLI list, the file's path and inline array
-        // combine.
+        // Package set follows CLI > file: any CLI package source (`--pkg` or
+        // `--packages-list`) replaces the file's set entirely (both its
+        // `packages-list` and inline `packages`). With no CLI packages, the
+        // file's path and inline array combine.
         let mut lines: Vec<String> = Vec::new();
-        if let Some(path) = &args.packages_list {
-            let text = fs::read_to_string(path)
-                .await
-                .with_context(|| format!("reading {}", path.display()))?;
-            lines.extend(text.lines().map(str::to_string));
+        if args.packages_list.is_some() || !args.pkg.is_empty() {
+            if let Some(path) = &args.packages_list {
+                let text = fs::read_to_string(path)
+                    .await
+                    .with_context(|| format!("reading {}", path.display()))?;
+                lines.extend(text.lines().map(str::to_string));
+            }
+            lines.extend(args.pkg.iter().cloned());
         } else {
             if let Some(path) = &cfg.packages_list {
                 let text = fs::read_to_string(path)
@@ -222,7 +224,7 @@ impl Resolved {
         }
         if specs.is_empty() {
             bail!(
-                "no packages to sync: provide --packages-list or [sync].packages in pypiron.toml"
+                "no packages to sync: provide --pkg/--packages-list or [sync].packages in pypiron.toml"
             );
         }
 
@@ -234,14 +236,12 @@ impl Resolved {
             bail!("only-wheels and only-sdists are mutually exclusive");
         }
 
-        let dst_base = args.dst_base.clone().or(cfg.to);
-        // CLI/env > file says storage flags win, but in HTTP mode they have no
-        // sink to apply to — flag it rather than silently ignore --data-dir.
-        if dst_base.is_some()
-            && (args.storage.data_dir.is_some() || args.storage.s3_bucket.is_some())
-        {
-            warn!("mirror-over-HTTP mode (--to/[sync].to): --data-dir/--s3-bucket are ignored");
-        }
+        // Sync mirrors over HTTP; a destination is mandatory.
+        let dst_base = args.dst_base.clone().or(cfg.to).ok_or_else(|| {
+            anyhow!(
+                "no destination: pass --to <server> (or set [sync].to) — sync mirrors over HTTP"
+            )
+        })?;
 
         Ok(Self {
             specs,
@@ -332,11 +332,6 @@ struct Selected {
     file: SimpleFile,
 }
 
-enum Sink {
-    Storage(std::sync::Arc<dyn Storage>),
-    Http(String),
-}
-
 /// Yank reason stamped on a file that has disappeared from upstream. The bytes
 /// stay downloadable (we never delete a mirrored artifact); installers skip it.
 const REMOVED_UPSTREAM: &str = "removed upstream";
@@ -423,38 +418,29 @@ impl UpstreamFiles {
     }
 }
 
-/// Load the cursor memo for this run. `--full` (or any read failure) yields an
-/// empty map, which forces unconditional fetches — the memo only ever speeds a
-/// run up, never changes its result.
-async fn load_cursors(client: &Client, resolved: &Resolved, sink: &Sink) -> Cursors {
+/// Load the cursor memo for this run from the destination's `/sync/cursors`.
+/// `--full` (or any read failure) yields an empty map, which forces
+/// unconditional fetches — the memo only ever speeds a run up, never changes
+/// its result.
+async fn load_cursors(client: &Client, resolved: &Resolved) -> Cursors {
     if resolved.full {
         return Cursors::new();
     }
-    match sink {
-        Sink::Storage(storage) => match storage.get_bytes(CURSORS_KEY).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Cursors::new(),
-        },
-        Sink::Http(_) => {
-            let Some(base) = &resolved.dst_base else {
-                return Cursors::new();
-            };
-            let url = format!("{}/sync/cursors", base.trim_end_matches('/'));
-            let mut req = client.get(&url);
-            if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
-                req = req.basic_auth(u, Some(p));
-            }
-            match req.send().await {
-                Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
-                _ => Cursors::new(),
-            }
-        }
+    let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
+    let mut req = client.get(&url);
+    if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+        req = req.basic_auth(u, Some(p));
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+        _ => Cursors::new(),
     }
 }
 
-/// Persist the merged cursor memo. Best-effort: a failure just means the next
-/// run re-fetches, so it must never fail an otherwise-good sync.
-async fn save_cursors(client: &Client, resolved: &Resolved, sink: &Sink, cursors: &Cursors) {
+/// Persist the merged cursor memo to the destination. Best-effort: a failure
+/// just means the next run re-fetches, so it must never fail an otherwise-good
+/// sync.
+async fn save_cursors(client: &Client, resolved: &Resolved, cursors: &Cursors) {
     let body = match serde_json::to_vec(cursors) {
         Ok(b) => b,
         Err(e) => {
@@ -462,33 +448,22 @@ async fn save_cursors(client: &Client, resolved: &Resolved, sink: &Sink, cursors
             return;
         }
     };
-    let result = match sink {
-        Sink::Storage(storage) => {
-            storage
-                .put_bytes(CURSORS_KEY, body, Some("application/json"))
-                .await
-        }
-        Sink::Http(_) => save_cursors_http(client, resolved, body).await,
-    };
-    if let Err(e) = result {
-        warn!(error=?e, "failed to persist sync cursors (next run re-fetches)");
-    }
-}
-
-async fn save_cursors_http(client: &Client, resolved: &Resolved, body: Vec<u8>) -> Result<()> {
-    let Some(base) = &resolved.dst_base else {
-        return Ok(());
-    };
-    let url = format!("{}/sync/cursors", base.trim_end_matches('/'));
+    let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
     let mut req = client.put(&url).body(body);
     if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
         req = req.basic_auth(u, Some(p));
     }
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        bail!("saving sync cursors failed [{}]", resp.status());
+    let result = async {
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            bail!("saving sync cursors failed [{}]", resp.status());
+        }
+        Ok::<(), anyhow::Error>(())
     }
-    Ok(())
+    .await;
+    if let Err(e) = result {
+        warn!(error=?e, "failed to persist sync cursors (next run re-fetches)");
+    }
 }
 
 pub async fn run_sync(args: SyncArgs) -> Result<()> {
@@ -505,21 +480,12 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
         .read_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let sink = match &resolved.dst_base {
-        Some(dst) => {
-            let endpoint = normalize_legacy_endpoint(dst);
-            info!("mirror-over-HTTP mode: uploading to {endpoint}");
-            Sink::Http(endpoint)
-        }
-        None => {
-            info!("direct-storage mode");
-            Sink::Storage(args.storage.build().await?)
-        }
-    };
+    let endpoint = normalize_legacy_endpoint(&resolved.dst_base);
+    info!("mirror-over-HTTP mode: uploading to {endpoint}");
 
     // The conditional-fetch memo from the last run; an empty map (first run,
     // --full, or any read error) simply means every project full-fetches.
-    let cursors = load_cursors(&client, &resolved, &sink).await;
+    let cursors = load_cursors(&client, &resolved).await;
 
     // Packages in parallel (chunked join_all — same pattern as the worker
     // sweep), files within each package in parallel below. The long tail of a
@@ -528,7 +494,7 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
     let mut refreshed: Cursors = Cursors::new();
     for chunk in resolved.specs.chunks(resolved.package_concurrency) {
         let results = futures::future::join_all(chunk.iter().map(|spec| {
-            sync_one_package(&client, &resolved, &sink, spec, cursors.get(&spec.name))
+            sync_one_package(&client, &resolved, &endpoint, spec, cursors.get(&spec.name))
         }))
         .await;
         for (spec, result) in chunk.iter().zip(results) {
@@ -551,7 +517,7 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
     // run. Persisting is best-effort; the memo only ever speeds things up.
     let mut merged = cursors;
     merged.extend(refreshed);
-    save_cursors(&client, &resolved, &sink, &merged).await;
+    save_cursors(&client, &resolved, &merged).await;
 
     if failures > 0 {
         bail!("{failures} package(s) failed to sync");
@@ -570,26 +536,18 @@ struct PackageOutcome {
 async fn sync_one_package(
     client: &Client,
     resolved: &Resolved,
-    sink: &Sink,
+    endpoint: &str,
     spec: &PackageSpec,
     prev_cursor: Option<&CursorEntry>,
 ) -> Result<PackageOutcome> {
     let pkg = spec.name.as_str();
 
-    // Policy gates come before any network traffic. Over HTTP the server
-    // enforces all of this again — defense in both places.
+    // Policy gate before any network traffic. The server enforces it again —
+    // defense in both places.
     if let Some(prefix) = &resolved.private_prefix {
         let prefix = normalize_pkg_name(prefix);
         if matches_prefix(pkg, &prefix) {
             bail!("'{pkg}' is inside the private namespace '{prefix}'; refusing to mirror");
-        }
-    }
-    if let Sink::Storage(storage) = sink {
-        match origin::read_origin(storage.as_ref(), pkg).await?.as_deref() {
-            Some(origin::MIRROR) | None => {}
-            Some(other) => {
-                bail!("'{pkg}' is {other}-owned; refusing to mirror over it")
-            }
         }
     }
 
@@ -630,205 +588,129 @@ async fn sync_one_package(
         return Ok(PackageOutcome { new_cursor: None });
     }
 
-    let mut claimed_now = false;
-    if let Sink::Storage(storage) = sink {
-        // Claim only when actually writing — atomically, so a racing first
-        // private upload can't merge origins.
-        if origin::read_origin(storage.as_ref(), pkg).await?.is_none() {
-            let (created, winner) =
-                origin::claim_origin(storage.as_ref(), pkg, origin::MIRROR).await?;
-            if winner != origin::MIRROR {
-                bail!("'{pkg}' is {winner}-owned; refusing to mirror over it");
-            }
-            // Only release a claim we actually created — never a racing peer's.
-            claimed_now = created;
-        }
-    }
-
-    // Intent before the batch of truth writes (adds AND reconcile's sidecar
-    // rewrites); commit (paired) after. A sync killed mid-package heals via the
-    // stale intent.
-    let intent_nonce = match sink {
-        Sink::Storage(storage) => crate::worker::mark_intent(storage.as_ref(), pkg).await.ok(),
-        Sink::Http(_) => None,
-    };
-
     let results: Vec<Result<bool>> = stream::iter(selected)
-        .map(|s| async move {
-            match sink {
-                Sink::Storage(storage) => {
-                    mirror_to_storage(client, storage.as_ref(), pkg, &s).await
-                }
-                Sink::Http(endpoint) => upload_via_http(client, resolved, endpoint, pkg, &s).await,
-            }
-        })
+        .map(|s| async move { upload_via_http(client, resolved, endpoint, pkg, &s).await })
         .buffer_unordered(resolved.concurrency)
         .collect()
         .await;
 
-    let mut wrote = false;
     let mut errors = 0usize;
     for r in &results {
-        match r {
-            Ok(true) => wrote = true,
-            Ok(false) => {}
-            Err(e) => {
-                error!(package=%pkg, error=?e, "file failed");
-                errors += 1;
-            }
+        if let Err(e) = r {
+            error!(package=%pkg, error=?e, "file failed");
+            errors += 1;
         }
     }
 
-    // Reconcile mutable metadata of files already mirrored: yank set/cleared to
-    // match upstream, and files gone upstream flagged removed. Upstream is
-    // authoritative for a mirror, so this both raises and clears yanks. A
-    // failure here is a real failure — a missed security yank — so it counts.
-    //
-    // A quarantined upstream (PEP 792) MUST offer no files, so its listing is
-    // empty by design — not because every file was removed. Skip reconcile then;
-    // the status relay below blocks downloads, and flagging every file as
-    // "removed upstream" would be both wrong and a storm of sidecar churn that
-    // reverts the moment the quarantine lifts.
+    // Upstream's authoritative PEP 792 verdict for this run.
     let upstream_blocks = matches!(&upstream_status, Some(doc) if doc.status.blocks_downloads());
-    let reconciled = if upstream_blocks {
-        false
-    } else {
-        match reconcile(client, resolved, sink, pkg, &upstream_files).await {
-            Ok(changed) => changed,
-            Err(e) => {
-                error!(package=%pkg, error=?e, "reconcile failed");
-                errors += 1;
-                false
-            }
+    let upstream_frozen = matches!(&upstream_status, Some(doc) if !doc.status.is_active());
+
+    // The dest's own materialized PEP 691 index — read via `/sync/local-index`
+    // so the on-demand proxy never shadows it — is the truth that reconcile and
+    // status relay diff against. A fetch error fails the package so the cursor
+    // doesn't advance over an un-reconciled state.
+    let local = match fetch_local_index(client, resolved, pkg).await {
+        Ok(local) => local,
+        Err(e) => {
+            error!(package=%pkg, error=?e, "local-index fetch failed");
+            errors += 1;
+            None
         }
     };
 
-    // Relay PEP 792 status (storage mode only — the server owns its own status,
-    // and has no HTTP endpoint to set it). A failed write counts as an error
-    // like a missed yank: it must not advance the cursor over an un-enforced
-    // freeze (a later 304 would mask it forever).
-    let status_changed = match sink {
-        Sink::Storage(storage) => match relay_status(storage.as_ref(), pkg, &upstream_status).await
-        {
-            Ok(changed) => changed,
-            Err(e) => {
+    // Hold the cursor (force a re-fetch next run) when this run couldn't fully
+    // reconcile despite a clean upload — otherwise a 304 next run masks the gap
+    // until `--full`.
+    let mut hold_cursor = false;
+
+    match &local {
+        Some(local) => {
+            // Reconcile mutable metadata of files already mirrored: yank
+            // set/cleared to match upstream, and files gone upstream flagged
+            // removed.
+            //
+            // A quarantined upstream (PEP 792) MUST offer no files, so its
+            // listing is empty by design — not because every file was removed.
+            // Skip reconcile then (the status relay below blocks downloads
+            // instead); flagging every file "removed upstream" would be both
+            // wrong and a storm of churn that reverts when the quarantine lifts.
+            let dest_blocks = local
+                .project_status
+                .as_ref()
+                .is_some_and(|d| d.status.blocks_downloads());
+            if !upstream_blocks {
+                if dest_blocks {
+                    // The quarantine is lifting: the dest's index is still the
+                    // frozen (empty) render, so there are no files to diff yet.
+                    // The relay below clears the freeze; hold the cursor so the
+                    // next run reconciles for real once the dest rebuilds.
+                    hold_cursor = true;
+                } else if let Err(e) =
+                    reconcile_yanks(client, resolved, pkg, local, &upstream_files).await
+                {
+                    error!(package=%pkg, error=?e, "reconcile failed");
+                    errors += 1;
+                }
+            }
+
+            // Relay PEP 792 project status regardless of the block — that relay
+            // is how the freeze reaches the dest in the first place.
+            // Authoritative for a mirror, so it both sets and clears.
+            if let Err(e) = relay_status(client, resolved, pkg, local, &upstream_status).await {
                 error!(package=%pkg, error=?e, "status relay failed");
                 errors += 1;
-                false
             }
-        },
-        Sink::Http(_) => false,
-    };
-
-    // Any truth change (added file, reconciled yank, or status flip) triggers
-    // exactly one index rebuild, inside the intent window. HTTP mode does no
-    // marker work — its uploads and yank calls drive the server's own rebuilds.
-    if wrote || reconciled || status_changed {
-        if let Sink::Storage(storage) = sink {
-            match &intent_nonce {
-                Some(nonce) => crate::worker::mark_commit(storage.as_ref(), pkg, nonce).await?,
-                None => mark_dirty(storage.as_ref(), pkg).await?,
+        }
+        None => {
+            // An older dest without `/sync/local-index`: the per-file yank set at
+            // upload time still holds, so a plain mirror is fine. But a
+            // project-level freeze (quarantine/archive/deprecate) can't be
+            // relayed — fail loud rather than silently advance the cursor over an
+            // un-enforced freeze (a later 304 would mask it forever).
+            if upstream_frozen {
+                error!(
+                    package=%pkg,
+                    "destination has no /sync/local-index endpoint; cannot relay project status — refusing to advance the cursor over an un-enforced freeze"
+                );
+                errors += 1;
             }
         }
     }
 
     if errors > 0 {
-        // A claim with nothing behind it would block the name forever.
-        if claimed_now && !wrote {
-            if let Sink::Storage(storage) = sink {
-                origin::release_empty_claim(storage.as_ref(), pkg).await;
-            }
-        }
-        bail!("{errors} file(s) failed for '{pkg}'");
+        bail!("{errors} error(s) syncing '{pkg}'");
     }
 
-    // Advance the cursor only after a clean run, so any failure re-fetches next
-    // time. A source without an ETag simply never gets the 304 shortcut.
-    let new_cursor = etag.map(|etag| CursorEntry {
-        etag,
-        config: cfg_key,
-        serial: last_serial,
-    });
+    // Advance the cursor only after a clean, fully-reconciled run, so any failure
+    // (or a deferred lift-transition reconcile) re-fetches next time. A source
+    // without an ETag simply never gets the 304 shortcut.
+    let new_cursor = if hold_cursor {
+        None
+    } else {
+        etag.map(|etag| CursorEntry {
+            etag,
+            config: cfg_key,
+            serial: last_serial,
+        })
+    };
     Ok(PackageOutcome { new_cursor })
 }
 
-/// Dispatch reconcile to the active sink. Returns whether anything changed.
-async fn reconcile(
-    client: &Client,
-    resolved: &Resolved,
-    sink: &Sink,
-    pkg: &str,
-    upstream: &UpstreamFiles,
-) -> Result<bool> {
-    match sink {
-        Sink::Storage(storage) => reconcile_storage(storage.as_ref(), pkg, upstream).await,
-        Sink::Http(_) => reconcile_http(client, resolved, pkg, upstream).await,
-    }
-}
-
-/// Storage mode: rewrite each already-mirrored sidecar whose yank state differs
-/// from upstream's verdict. Corrupt sidecars are left untouched — the worker
-/// already omits them from the index, and fabricating a fresh one would clear a
-/// real yank (see worker's backfill guard). Returns true if anything changed.
-async fn reconcile_storage(
-    storage: &dyn Storage,
-    pkg: &str,
-    upstream: &UpstreamFiles,
-) -> Result<bool> {
-    let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
-    let objects = storage.list_all(&prefix).await?;
-    let mut changed = false;
-    for obj in &objects {
-        let Some(name) = obj.key.strip_prefix(&prefix) else {
-            continue;
-        };
-        let Some(artifact) = name.strip_suffix(SIDECAR_SUFFIX) else {
-            continue;
-        };
-        let bytes = storage.get_bytes(&obj.key).await?;
-        let mut sc: Sidecar = match serde_json::from_slice(&bytes) {
-            Ok(sc) => sc,
-            Err(e) => {
-                warn!(key=%obj.key, error=?e, "reconcile: skipping corrupt sidecar");
-                continue;
-            }
-        };
-        let desired = upstream.desired(artifact);
-        if sc.yanked != desired {
-            info!(
-                "  - reconcile {artifact}: yank {:?} -> {:?}",
-                sc.yanked, desired
-            );
-            sc.yanked = desired;
-            storage
-                .put_bytes(&obj.key, serde_json::to_vec(&sc)?, Some("application/json"))
-                .await?;
-            changed = true;
-        }
-    }
-    Ok(changed)
-}
-
-/// HTTP mode: enumerate the files the destination actually holds locally and,
-/// for each whose yank state has drifted from upstream, drive the server's
-/// `/files/.../yank` endpoint. (Newly-uploaded files already carry the right
-/// yank from the upload; this catches drift on files already there and flags
-/// removals.) Returns true if anything changed.
-///
-/// It reads `/sync/local-index/<pkg>` — the dest's own materialized index, not
-/// `/simple/`, which an on-demand proxy would shadow with the upstream view and
-/// thereby hide a removed file from the reconcile.
-async fn reconcile_http(
+/// Fetch the destination's locally-materialized PEP 691 index (its own truth:
+/// which files it holds, their yank state, and project status). `Ok(None)` means
+/// an older dest without the `/sync/local-index` endpoint; reconcile and status
+/// relay are then skipped rather than run against a proxied upstream view that
+/// would hide a removed file.
+async fn fetch_local_index(
     client: &Client,
     resolved: &Resolved,
     pkg: &str,
-    upstream: &UpstreamFiles,
-) -> Result<bool> {
-    let base = resolved
-        .dst_base
-        .as_deref()
-        .ok_or_else(|| anyhow!("HTTP reconcile without a destination base"))?;
-    let url = format!("{}/sync/local-index/{pkg}", base.trim_end_matches('/'));
+) -> Result<Option<SimpleIndex>> {
+    let url = format!(
+        "{}/sync/local-index/{pkg}",
+        resolved.dst_base.trim_end_matches('/')
+    );
     let mut req = client
         .get(&url)
         .header(reqwest::header::ACCEPT, SIMPLE_JSON_CONTENT_TYPE);
@@ -837,21 +719,30 @@ async fn reconcile_http(
     }
     let resp = req.send().await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        // An older destination without this endpoint: skip the local-truth
-        // reconcile rather than reconcile against a proxied view. (Matched
-        // deployments always have it; the yank set at upload time still holds.)
-        return Ok(false);
+        return Ok(None);
     }
-    let index: SimpleIndex = resp.error_for_status()?.json().await?;
-    let mut changed = false;
-    for file in &index.files {
+    Ok(Some(resp.error_for_status()?.json().await?))
+}
+
+/// For each already-mirrored file whose yank state has drifted from upstream,
+/// drive the server's `/files/.../yank` endpoint. (Newly-uploaded files already
+/// carry the right yank from the upload; this catches drift on files already
+/// there and flags removals.)
+async fn reconcile_yanks(
+    client: &Client,
+    resolved: &Resolved,
+    pkg: &str,
+    local: &SimpleIndex,
+    upstream: &UpstreamFiles,
+) -> Result<()> {
+    let base = resolved.dst_base.trim_end_matches('/');
+    for file in &local.files {
         let desired = upstream.desired(&file.filename);
         if file.yanked != desired {
             apply_yank_http(client, resolved, base, pkg, &file.filename, &desired).await?;
-            changed = true;
         }
     }
-    Ok(changed)
+    Ok(())
 }
 
 /// Set/clear a file's yank on the destination via the admin yank endpoint.
@@ -863,7 +754,7 @@ async fn apply_yank_http(
     filename: &str,
     yanked: &Yanked,
 ) -> Result<()> {
-    let url = format!("{}/files/{pkg}/{filename}/yank", base.trim_end_matches('/'));
+    let url = format!("{base}/files/{pkg}/{filename}/yank");
     let mut req = match yanked {
         Yanked::Flag(false) => client.delete(&url),
         Yanked::Flag(true) => client.post(&url).body(String::new()),
@@ -881,44 +772,44 @@ async fn apply_yank_http(
     Ok(())
 }
 
-/// Relay PEP 792 project status to match upstream, returning whether it
-/// changed. `Err` means a status *write* we attempted failed — the caller
-/// treats that like a missed yank: it counts as a failure so the run exits
-/// non-zero and the cursor doesn't advance, forcing a retry next run (otherwise
-/// a 304 would mask an un-enforced quarantine forever). Fail-closed: an
-/// unreadable local marker is never *cleared* (a transient read error must not
-/// un-freeze a quarantine) — only escalated.
+/// Relay PEP 792 project status to match upstream, via the server's status
+/// endpoint, when it has drifted. Upstream is authoritative for a mirror, so
+/// this both sets a freeze and clears it. `current` comes from the dest's own
+/// materialized index, so a no-op run issues no write (and triggers no rebuild).
 async fn relay_status(
-    storage: &dyn Storage,
+    client: &Client,
+    resolved: &Resolved,
     pkg: &str,
+    local: &SimpleIndex,
     upstream_status: &Option<ProjectStatusDoc>,
-) -> Result<bool> {
+) -> Result<()> {
     let desired = match upstream_status {
         Some(doc) if !doc.status.is_active() => doc.clone(),
         _ => ProjectStatusDoc::default(),
     };
-    match status::read_status(storage, pkg).await {
-        Ok(current) if current == desired => Ok(false),
-        Ok(_) => apply_status(storage, pkg, &desired).await.map(|()| true),
-        Err(e) => {
-            warn!(package=%pkg, error=?e, "status relay: current status unreadable");
-            if desired.status.is_active() {
-                // Don't clear on an unreadable marker — a transient read error
-                // must not un-freeze a quarantine. Leave whatever's there.
-                Ok(false)
-            } else {
-                apply_status(storage, pkg, &desired).await.map(|()| true)
-            }
-        }
+    let current = local.project_status.clone().unwrap_or_default();
+    if current == desired {
+        return Ok(());
     }
-}
-
-async fn apply_status(storage: &dyn Storage, pkg: &str, desired: &ProjectStatusDoc) -> Result<()> {
-    if desired.status.is_active() {
-        status::clear_status(storage, pkg).await
+    let base = resolved.dst_base.trim_end_matches('/');
+    let url = format!("{base}/project/{pkg}/status");
+    // Active carries no marker, so an active target is a clear (DELETE); any
+    // freeze is a POST of the status doc — same set/clear shape as yank.
+    let mut req = if desired.status.is_active() {
+        client.delete(&url)
     } else {
-        status::write_status(storage, pkg, desired).await
+        client.post(&url).json(&desired)
+    };
+    if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+        req = req.basic_auth(u, Some(p));
     }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_else(|_| "<no body>".into());
+        bail!("status update failed for {pkg} [{code}]: {body}");
+    }
+    Ok(())
 }
 
 /// From an already-fetched listing, derive the files to add (filtered), the
@@ -1016,99 +907,6 @@ async fn download_provenance(client: &Client, url: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Mirror one file into storage. Returns false if it was already present.
-/// Writes follow the ordering invariant: artifact, metadata, sidecar; the
-/// caller drops the package's dirty marker after the batch.
-async fn mirror_to_storage(
-    client: &Client,
-    storage: &dyn Storage,
-    pkg: &str,
-    s: &Selected,
-) -> Result<bool> {
-    let key = format!("{PACKAGES_PREFIX}{pkg}/{}", s.file.filename);
-    let artifact_exists = storage.head_exists(&key).await?;
-    let sidecar_exists = storage.head_exists(&sidecar_key(&key)).await?;
-    if artifact_exists && sidecar_exists {
-        return Ok(false);
-    }
-    if artifact_exists {
-        // A crash between artifact and sidecar writes left a half-mirrored
-        // file; heal the sidecar from PyPI metadata without re-downloading.
-        write_mirror_sidecar(storage, &key, s, s.file.size.unwrap_or(0)).await?;
-        return Ok(true);
-    }
-
-    info!("  - mirroring {}", s.file.filename);
-    let bytes = download_verified(client, &s.file).await?;
-    let size = bytes.len() as u64;
-
-    // Conditional create: a racing syncer losing here is harmless, the
-    // sidecar write below is deterministic for both.
-    storage
-        .put_if_absent(&key, bytes, Some("application/octet-stream"))
-        .await?;
-
-    // Best-effort PEP 658: the source serves metadata at <file-url>.metadata.
-    // The Simple API tells us which wheels actually have a companion, so we only
-    // fetch when one exists instead of probing (and 404ing) on every wheel.
-    if s.file.filename.ends_with(".whl") && s.file.has_core_metadata() {
-        if let Ok(resp) = client.get(format!("{}.metadata", s.file.url)).send().await {
-            if resp.status().is_success() {
-                if let Ok(md) = resp.bytes().await {
-                    let _ = storage
-                        .put_bytes(
-                            &metadata_key(&key),
-                            md.to_vec(),
-                            Some("text/plain; charset=utf-8"),
-                        )
-                        .await;
-                }
-            }
-        }
-    }
-
-    // Best-effort PEP 740: relay the provenance object verbatim next to the
-    // artifact so an offline consumer can still verify the original publisher.
-    if let Some(prov_url) = &s.file.provenance {
-        if let Some(prov) = download_provenance(client, prov_url).await {
-            let _ = storage
-                .put_bytes(&provenance_key(&key), prov, Some("application/json"))
-                .await;
-        }
-    }
-
-    write_mirror_sidecar(storage, &key, s, size).await?;
-    Ok(true)
-}
-
-/// Sidecar carrying PyPI's metadata verbatim — digest, true upload time,
-/// requires-python, yank state.
-async fn write_mirror_sidecar(
-    storage: &dyn Storage,
-    key: &str,
-    s: &Selected,
-    size: u64,
-) -> Result<()> {
-    let sc = Sidecar {
-        // The source's digest, verified against the downloaded bytes — not re-derived.
-        sha256: s.file.sha256().unwrap_or_default().to_string(),
-        size,
-        version: s.version.clone().unwrap_or_default(),
-        // The source's true upload time (PEP 700): the whole point of mirroring.
-        upload_time: s.file.upload_time.clone().unwrap_or_default(),
-        requires_python: s.file.requires_python.clone(),
-        yanked: s.file.yanked.clone(),
-    };
-    storage
-        .put_bytes(
-            &sidecar_key(key),
-            serde_json::to_vec(&sc)?,
-            Some("application/json"),
-        )
-        .await?;
-    Ok(())
-}
-
 /// How many times a single file download is attempted before the package is
 /// marked failed. At mirror scale, transient CDN errors are a statistical
 /// certainty — one 503 in 7,714 files failed an entire sync run before this
@@ -1129,7 +927,7 @@ async fn download_verified(client: &Client, file: &SimpleFile) -> Result<Vec<u8>
             }
         }
     }
-    Err(last_err.expect("at least one attempt"))
+    Err(last_err.unwrap_or_else(|| anyhow!("download failed for {}", file.filename)))
 }
 
 async fn download_once(client: &Client, file: &SimpleFile) -> Result<Vec<u8>> {
@@ -1150,7 +948,7 @@ async fn download_once(client: &Client, file: &SimpleFile) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// HTTP mode: push through the remote `/legacy/` as a mirror upload, carrying
+/// Push one file through the remote `/legacy/` as a mirror upload, carrying
 /// PyPI's metadata verbatim — the server (authenticated as admin) owns the
 /// storage writes. Returns true on success; the remote's 409 on an existing
 /// file means already-present (false).
@@ -1293,13 +1091,6 @@ pub(crate) fn matches_filters(file: &SimpleFile, f: &ResolvedFilter) -> bool {
     true
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct WheelTags {
-    pub(crate) python: Vec<String>,
-    pub(crate) abi: Vec<String>,
-    pub(crate) platform: Vec<String>,
-}
-
 fn tokens_match_any(tokens: &[String], filters: &[String]) -> bool {
     let tokens_lc: Vec<String> = tokens.iter().map(|t| t.to_ascii_lowercase()).collect();
     for f in filters {
@@ -1338,26 +1129,6 @@ fn glob_like_contains(haystack: &str, pattern: &str) -> bool {
         }
     }
     true
-}
-
-/// Parse wheel filename into (python, abi, platform) tags.
-/// Uses the last 3 dash-separated fields before ".whl" per PEP 427.
-pub(crate) fn parse_wheel_tags(filename: &str) -> Option<WheelTags> {
-    if !filename.ends_with(".whl") {
-        return None;
-    }
-    let stem = filename.strip_suffix(".whl")?;
-    let parts: Vec<&str> = stem.split('-').collect();
-    if parts.len() < 5 {
-        // name, version, [build?], py, abi, platform  -> min 5 fields (without build)
-        return None;
-    }
-    let dotted = |field: &str| field.split('.').map(str::to_string).collect::<Vec<_>>();
-    Some(WheelTags {
-        python: dotted(parts[parts.len() - 3]),
-        abi: dotted(parts[parts.len() - 2]),
-        platform: dotted(parts[parts.len() - 1]),
-    })
 }
 
 fn normalize_legacy_endpoint(dst_base: &str) -> String {
@@ -1423,24 +1194,6 @@ mod tests {
     }
 
     #[test]
-    fn wheel_tags_parse_and_reject_real_shapes() {
-        // Standard, compound python tag, and build-tag wheels parse.
-        let t = parse_wheel_tags("six-1.16.0-py2.py3-none-any.whl").unwrap();
-        assert_eq!(t.python, ["py2", "py3"]);
-        assert_eq!(t.abi, ["none"]);
-        assert_eq!(t.platform, ["any"]);
-        let t = parse_wheel_tags("demo-1.0-1-cp311-cp311-manylinux_2_17_x86_64.whl").unwrap();
-        assert_eq!(t.python, ["cp311"]);
-
-        // Real malformed uploads (126 of 9.94M wheels): missing version or
-        // tag fields. Must be None, not a panic or a bogus parse.
-        assert!(parse_wheel_tags("JHVIT-0.0.1-py3-any.whl").is_none());
-        assert!(parse_wheel_tags("CLUEstering-1.0.2-none-any.whl").is_none());
-        assert!(parse_wheel_tags("GoldenFace1.1-py3-none-any.whl").is_none());
-        assert!(parse_wheel_tags("not-a-wheel-1.0.tar.gz").is_none());
-    }
-
-    #[test]
     fn upload_time_bounds_filter() {
         let old = simple_file(Some("2015-10-07T13:41:23Z"));
         let new = simple_file(Some("2024-12-04T17:35:26Z"));
@@ -1463,7 +1216,7 @@ mod tests {
         Resolved {
             specs: vec![],
             src_base: src_base.to_string(),
-            dst_base: None,
+            dst_base: "https://dest.example".to_string(),
             username: None,
             password: None,
             private_prefix: None,

@@ -49,3 +49,17 @@ path = "fuzz_targets/fuzz_render.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_coremeta"
+path = "fuzz_targets/fuzz_coremeta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_range"
+path = "fuzz_targets/fuzz_range.rs"
+test = false
+doc = false
+bench = false

@@ -4,6 +4,7 @@ when a read credential is configured."""
 
 from __future__ import annotations
 
+import json
 import re
 import time
 
@@ -54,6 +55,26 @@ def test_root_url_follows_forwarded_headers(disk_server):
     assert "https://pkgs.example.com/simple/" in body.decode()
 
 
+def test_homepage_leads_with_a_search_form(disk_server):
+    code, body, _ = http_get(f"{disk_server['base_url']}/")
+    assert code == 200
+    html = body.decode()
+    # Search is the front-and-center focus: a GET form to the results page.
+    assert 'class="search"' in html
+    assert 'action="/projects/"' in html
+    assert 'name="q"' in html
+    assert 'type="search"' in html
+    # A browse-all link sits right under the search box.
+    assert 'class="browse"' in html
+    assert 'href="/projects/"' in html
+    # Config section is labelled and its settings carry hover tooltips.
+    assert ">Configuration</h2>" in html
+    assert "data-tip=" in html
+    # The index URL is still present (de-emphasized, top-right).
+    assert 'class="idx"' in html
+    assert f"{disk_server['base_url']}/simple/" in html
+
+
 def test_homepage_shows_live_activity_when_reads_public(disk_server):
     # disk_server has public reads, so the activity panel renders inline on /.
     # Generate a little traffic so the numbers aren't all zero.
@@ -69,35 +90,15 @@ def test_homepage_shows_live_activity_when_reads_public(disk_server):
         "Total requests",
         "Files served",
         "Index cache hit rate",
-        "Packages hosted",
         "Top projects",
         "Top route groups",
     ):
         assert label in html, label
+    # The redundant "Packages hosted" tile was dropped — registry size lives in
+    # the inventory row instead.
+    assert "Packages hosted" not in html
     # Bars are inline SVG.
     assert "<svg" in html
-
-
-def test_homepage_counts_hosted_packages(disk_server, tmp_path):
-    wheel = make_wheel("dashpkg", "1.0.0", tmp_path)
-    upload_legacy(
-        disk_server["legacy"],
-        wheel,
-        username=disk_server["user"],
-        password=disk_server["password"],
-    )
-    # The panel reads the worker's in-memory name set; wait until the upload is
-    # materialized in the global index before asserting the count.
-    wait_for_project_in_global(disk_server["simple"], "dashpkg")
-
-    code, body, _ = http_get(f"{disk_server['base_url']}/")
-    assert code == 200
-    m = re.search(
-        r'<div class="num">([\d,]+)</div><div class="lbl">Packages hosted</div>',
-        body.decode(),
-    )
-    assert m, "Packages hosted tile not found"
-    assert int(m.group(1).replace(",", "")) >= 1
 
 
 def _inv_count(html: str, label: str) -> int | None:
@@ -105,8 +106,32 @@ def _inv_count(html: str, label: str) -> int | None:
     return int(m.group(1).replace(",", "")) if m else None
 
 
-def test_homepage_inventory_counts_projects_releases_files(disk_server_fast_reconcile, tmp_path):
-    server = disk_server_fast_reconcile
+def _wait_homepage(server, timeout=25.0, **needs):
+    """Poll `/` until every `label=min_count` is met; return the last HTML."""
+    deadline = time.time() + timeout
+    html = ""
+    while time.time() < deadline:
+        _, body, _ = http_get(f"{server['base_url']}/")
+        html = body.decode()
+        if all((_inv_count(html, label) or -1) >= n for label, n in needs.items()):
+            return html
+        time.sleep(0.5)
+    return html
+
+
+def test_homepage_inventory_updates_incrementally_without_a_sweep(disk_server, tmp_path):
+    # disk_server uses the DEFAULT reconcile interval (daily), so no further
+    # audit fires during the test. After the boot audit establishes the baseline
+    # (ready, shown by the inventory row), every count change here can only come
+    # from the per-tick incremental update — exactly option 4's between-sweep
+    # path.
+    server = disk_server
+    # Wait for the boot audit to publish the (empty) baseline so `ready` is set
+    # before we upload — this both proves readiness and avoids an upload racing
+    # the boot sweep's re-baseline.
+    baseline = _wait_homepage(server, projects=0)
+    assert 'class="inv"' in baseline, baseline
+
     for name in ("invone", "invtwo"):
         wheel = make_wheel(name, "1.0.0", tmp_path)
         upload_legacy(
@@ -117,21 +142,42 @@ def test_homepage_inventory_counts_projects_releases_files(disk_server_fast_reco
         )
         wait_for_project_in_global(server["simple"], name)
 
-    # Inventory is recomputed by the audit sweep (fast-reconcile = 2s here);
-    # poll the homepage until the sweep has counted both uploads.
-    deadline = time.time() + 25
-    html = ""
-    while time.time() < deadline:
-        _, body, _ = http_get(f"{server['base_url']}/")
-        html = body.decode()
-        if (_inv_count(html, "projects") or 0) >= 2:
-            break
-        time.sleep(0.5)
-
+    html = _wait_homepage(server, projects=2, files=2, releases=2)
     assert (_inv_count(html, "projects") or 0) >= 2, html
     # Two single-wheel projects → two files (sidecars excluded) and two releases.
     assert (_inv_count(html, "files") or 0) >= 2
     assert (_inv_count(html, "releases") or 0) >= 2
+    # Space used (sum of artifact sizes) renders right after the file count, as
+    # a human size — e.g. "1.2 KB stored" or "523 B stored".
+    assert re.search(r"<b>[\d.]+ [KMGT]?B</b> stored", html), html
+
+
+def test_inventory_view_is_persisted_to_storage(disk_server, tmp_path):
+    # The storage-backed view is what makes inventory multi-node + restart-safe.
+    # It lives at _state/inventory.json on disk (the data dir), not on any route.
+    server = disk_server
+    wheel = make_wheel("persistpkg", "1.0.0", tmp_path)
+    upload_legacy(
+        server["legacy"],
+        wheel,
+        username=server["user"],
+        password=server["password"],
+    )
+    wait_for_project_in_global(server["simple"], "persistpkg")
+    _wait_homepage(server, projects=1)
+
+    inv_path = server["data_dir"] / "_state" / "inventory.json"
+    deadline = time.time() + 10
+    while time.time() < deadline and not inv_path.exists():
+        time.sleep(0.25)
+    assert inv_path.exists(), f"{inv_path} not written"
+    data = json.loads(inv_path.read_text())
+    assert data["projects"] >= 1
+    assert data["files"] >= 1
+    assert data["bytes"] >= 1
+    # _state/ is internal — it must not be reachable over HTTP.
+    code, _, _ = http_get(f"{server['base_url']}/files/_state/inventory.json")
+    assert code in (403, 404), code
 
 
 def test_project_page_shows_metadata_files_and_unrendered_readme(disk_server, tmp_path):
@@ -202,6 +248,35 @@ def test_projects_index_lists_packages_linking_to_project_pages(disk_server, tmp
     # The landing page points humans here.
     _, root_body, _ = http_get(f"{disk_server['base_url']}/")
     assert 'href="/projects/"' in root_body.decode()
+
+
+def test_projects_search_filters_to_matching_names(disk_server, tmp_path):
+    for name in ("searchapple", "searchberry"):
+        wheel = make_wheel(name, "1.0.0", tmp_path)
+        upload_legacy(
+            disk_server["legacy"],
+            wheel,
+            username=disk_server["user"],
+            password=disk_server["password"],
+        )
+        wait_for_project_in_global(disk_server["simple"], name)
+
+    # The search box on / submits here as ?q=; results are filtered server-side.
+    code, body, _ = http_get(f"{disk_server['base_url']}/projects/?q=apple")
+    assert code == 200
+    html = body.decode()
+    assert 'href="/project/searchapple/"' in html
+    assert 'href="/project/searchberry/"' not in html
+    # The box is pre-filled with the query so it reads as a search result page.
+    assert 'value="apple"' in html
+    assert "matching" in html
+
+    # An empty query falls back to listing everything (plain browse).
+    code, body, _ = http_get(f"{disk_server['base_url']}/projects/?q=")
+    assert code == 200
+    html = body.decode()
+    assert 'href="/project/searchapple/"' in html
+    assert 'href="/project/searchberry/"' in html
 
 
 def test_projects_index_gated_under_read_auth(disk_server_read_auth):

@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{anyhow, Result};
 use axum::{
     body::Body,
-    extract::{Multipart, Path, Request, State},
+    extract::{Multipart, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Response, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -51,22 +51,26 @@ const PACKAGES_PREFIX: &str = "packages/";
 const SIMPLE_PREFIX: &str = "simple/";
 const DIRTY_PREFIX: &str = "_dirty/";
 
-/// Top-level CLI. If no subcommand is supplied, we run the server (serve).
+// Bare `pypiron` (no args at all) prints help — listing the subcommands and the
+// global serve flags — via `arg_required_else_help`. A subcommand, or serve
+// flags without a subcommand (back-compat), runs the server.
+/// PypIron — a fast single-binary PyPI server: index, upload, mirror, on-demand proxy.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None, arg_required_else_help = true)]
 struct Cli {
-    /// Subcommands: `serve` (default) or `sync`
+    /// Subcommands: `serve`, `sync`, `verify`, `resync`.
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Flattened server args so `pypiron` with no subcommand still works.
+    /// Flattened server args so `pypiron <serve flags>` (no subcommand) still
+    /// serves; truly-bare `pypiron` shows help instead.
     #[command(flatten)]
     serve: ServeArgs,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run the PypIron server (same args as top-level default)
+    /// Run the PypIron server (same args usable without the subcommand)
     Serve(Box<ServeArgs>),
     /// Mirror packages from PyPI (or another source) into this PypIron instance
     Sync(Box<sync::SyncArgs>),
@@ -291,12 +295,18 @@ struct AppState {
     spool_dir: std::path::PathBuf,
     /// In-memory global-index name set + the lock serializing its writes.
     global_names: Arc<tokio::sync::Mutex<Option<worker::GlobalNames>>>,
+    /// In-memory per-package inventory: the working set behind the storage view
+    /// `_state/inventory.json`. The leader maintains it on every rebuild and
+    /// re-baselines it each sweep; followers read the persisted view.
+    inventory: Arc<tokio::sync::Mutex<worker::InventoryMap>>,
     /// Wakes the worker immediately after a write drops a dirty marker.
     worker_nudge: Arc<tokio::sync::Notify>,
     /// Hand-rolled Prometheus counters served at /metrics.
     metrics: Arc<metrics::Metrics>,
     /// On-demand upstream mirroring (None unless --proxy-upstream is set).
     proxy: Option<Arc<proxy::Proxy>>,
+    /// Process start, for the homepage uptime readout.
+    started: std::time::Instant,
 }
 
 #[tokio::main]
@@ -329,7 +339,9 @@ async fn main() -> Result<()> {
             return run_serve(*args).await;
         }
         None => {
-            // Back-compat: `pypiron` with no subcommand runs the server
+            // Back-compat: serve flags without a subcommand run the server.
+            // (Truly-bare `pypiron` prints help via arg_required_else_help and
+            // never reaches here.)
             return run_serve(cli.serve).await;
         }
     }
@@ -393,9 +405,11 @@ async fn run_serve(cli: ServeArgs) -> Result<()> {
         presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
         spool_dir: cli.spool_dir.unwrap_or_else(std::env::temp_dir),
         global_names: Arc::new(tokio::sync::Mutex::new(None)),
+        inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
         worker_nudge: Arc::new(tokio::sync::Notify::new()),
         metrics: Arc::new(metrics::Metrics::new()),
         proxy,
+        started: std::time::Instant::now(),
     });
 
     // Genuine misconfiguration hazards warn in any log format. The benign
@@ -637,24 +651,29 @@ async fn root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respons
     }
     let snap = state.metrics.snapshot();
     let (cache_hits, cache_misses) = state.index_cache.stats();
-    let packages_hosted = state
-        .global_names
-        .lock()
-        .await
-        .as_ref()
-        .map_or(0, |g| g.len());
     let dash = web::DashboardData {
         snapshot: &snap,
         cache_hits,
         cache_misses,
-        packages_hosted,
     };
     html_ok(web::landing_html(&ctx, inventory.as_ref(), Some(&dash)))
 }
 
-/// The human package browser (`/projects/`): every hosted package, linked to
-/// its project page. Read-only and gated by read auth like the activity panel.
-async fn projects_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
+/// Optional `?q=` search term for the package browser.
+#[derive(serde::Deserialize)]
+struct BrowseQuery {
+    q: Option<String>,
+}
+
+/// The human package browser (`/projects/`), which doubles as the search results
+/// page: every hosted package (or those matching `?q=`), linked to its project
+/// page. Read-only and gated by read auth like the activity panel, so a `?q=`
+/// search can never enumerate private names on a credentialed deployment.
+async fn projects_page(
+    State(state): State<Arc<AppState>>,
+    Query(browse): Query<BrowseQuery>,
+    headers: HeaderMap,
+) -> Response<Body> {
     if !state.is_reader(&headers) {
         return unauthorized();
     }
@@ -662,7 +681,11 @@ async fn projects_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         Ok(names) => names,
         Err(e) => return read_error(e),
     };
-    html_ok(web::projects_html(&page_context(&state, &headers), &names))
+    html_ok(web::projects_html(
+        &page_context(&state, &headers),
+        &names,
+        browse.q.as_deref().unwrap_or(""),
+    ))
 }
 
 /// The human project page (`/project/<pkg>/`): metadata sidebar, release files,
@@ -731,6 +754,7 @@ fn page_context(state: &AppState, headers: &HeaderMap) -> web::PageContext {
             ArtifactDelivery::Stream => "stream",
         },
         reads_authenticated: state.read_credential().is_some(),
+        uptime_secs: state.started.elapsed().as_secs(),
     }
 }
 
@@ -2020,9 +2044,11 @@ impl AppState {
             presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
             spool_dir: std::env::temp_dir(),
             global_names: Arc::new(tokio::sync::Mutex::new(None)),
+            inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             metrics: Arc::new(metrics::Metrics::new()),
             proxy: None,
+            started: std::time::Instant::now(),
         }
     }
 

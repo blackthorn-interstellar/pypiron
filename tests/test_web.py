@@ -71,8 +71,8 @@ def test_homepage_leads_with_a_search_form(disk_server):
     # Config section is labelled and its settings carry hover tooltips.
     assert ">Configuration</h2>" in html
     assert "data-tip=" in html
-    # The index URL is still present (de-emphasized, top-right).
-    assert 'class="idx"' in html
+    # The index URL is present top-right as a copy field (no label).
+    assert 'class="install idxbox"' in html
     assert f"{disk_server['base_url']}/simple/" in html
 
 

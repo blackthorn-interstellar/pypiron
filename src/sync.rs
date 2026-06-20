@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tokio::fs;
 use tracing::{error, info, warn};
 
@@ -142,13 +142,17 @@ pub struct FilterArgs {
     #[arg(long, value_delimiter = ',', value_name = "TAG")]
     pub exclude_platform_tag: Vec<String>,
 
-    /// Only mirror files PyPI received before this RFC 3339 timestamp
-    /// (the mirroring twin of uv's --exclude-newer).
-    #[arg(long, env = "PYPIRON_SYNC_EXCLUDE_NEWER", value_name = "TIMESTAMP")]
+    /// Only mirror files PyPI received before this cutoff (the mirroring twin of
+    /// uv's --exclude-newer). Accepts an RFC 3339 timestamp, a friendly duration
+    /// ("30 days", "24 hours", "1 week"), or an ISO 8601 duration (P30D, PT24H);
+    /// a duration is relative to now. Calendar months/years are not allowed.
+    #[arg(long, env = "PYPIRON_SYNC_EXCLUDE_NEWER", value_name = "WHEN")]
     pub exclude_newer: Option<String>,
 
-    /// Only mirror files PyPI received at or after this RFC 3339 timestamp.
-    #[arg(long, env = "PYPIRON_SYNC_EXCLUDE_OLDER", value_name = "TIMESTAMP")]
+    /// Only mirror files PyPI received at or after this cutoff. Same formats as
+    /// --exclude-newer (RFC 3339 timestamp, or a duration ago like "30 days" /
+    /// P30D).
+    #[arg(long, env = "PYPIRON_SYNC_EXCLUDE_OLDER", value_name = "WHEN")]
     pub exclude_older: Option<String>,
 }
 
@@ -237,11 +241,11 @@ impl Resolved {
         }
 
         // Sync mirrors over HTTP; a destination is mandatory.
-        let dst_base = args.dst_base.clone().or(cfg.to).ok_or_else(|| {
+        let dst_base = ensure_http_scheme(args.dst_base.clone().or(cfg.to).ok_or_else(|| {
             anyhow!(
                 "no destination: pass --to <server> (or set [sync].to) — sync mirrors over HTTP"
             )
-        })?;
+        })?);
 
         Ok(Self {
             specs,
@@ -294,13 +298,165 @@ fn pick_vec(cli: &[String], cfg: Option<Vec<String>>) -> Vec<String> {
     }
 }
 
+/// Parse a "cutoff" value (CLI/env/config) into an absolute instant, matching
+/// uv's `--exclude-newer` grammar: an RFC 3339 timestamp, a "friendly" duration
+/// (`30 days`, `24 hours`, `1 week`), or an ISO 8601 duration (`P30D`, `PT24H`).
+/// A duration is taken relative to now and resolved as a fixed number of seconds
+/// — a day is 24 hours, DST is ignored. Calendar months and years are rejected:
+/// with no fixed length they can't be reduced to a number of seconds.
 pub(crate) fn parse_cutoff(what: &str, value: Option<&String>) -> Result<Option<OffsetDateTime>> {
-    let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
+    let Some(value) = value.map(|v| v.trim()).filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
-    OffsetDateTime::parse(value, &Rfc3339)
-        .map(Some)
-        .map_err(|e| anyhow!("{what} is not RFC 3339 ('{value}'): {e}"))
+    // An absolute RFC 3339 timestamp wins.
+    if let Ok(ts) = OffsetDateTime::parse(value, &Rfc3339) {
+        return Ok(Some(ts));
+    }
+    // Otherwise a relative duration, resolved against now.
+    if let Some(secs) = parse_duration_secs(value) {
+        return Ok(Some(OffsetDateTime::now_utc() - Duration::seconds(secs)));
+    }
+    bail!(
+        "{what} '{value}' is not a valid cutoff: use an RFC 3339 timestamp \
+         (e.g. 2026-01-01T00:00:00Z), a friendly duration (e.g. \"30 days\", \"24 hours\", \
+         \"1 week\"), or an ISO 8601 duration (e.g. P30D, PT24H). Calendar months and years \
+         are not allowed."
+    );
+}
+
+/// Total seconds in a duration string — friendly (`30 days`) or ISO 8601
+/// (`P30D`) — or `None` if it isn't a supported duration. Only fixed-length
+/// units (second, minute, hour, day = 24 h, week = 7 d) are accepted; months and
+/// years are rejected.
+fn parse_duration_secs(s: &str) -> Option<i64> {
+    if s.is_empty() {
+        return None;
+    }
+    if s.starts_with(['P', 'p']) {
+        parse_iso8601_duration_secs(s)
+    } else {
+        parse_friendly_duration_secs(s)
+    }
+}
+
+/// Seconds per fixed-length unit; `None` for months/years and anything unknown.
+fn unit_seconds(unit: &str) -> Option<i64> {
+    Some(match unit {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+        "d" | "day" | "days" => 86_400,
+        "w" | "wk" | "wks" | "week" | "weeks" => 604_800,
+        _ => return None,
+    })
+}
+
+/// `30 days`, `24 hours`, `1 week`, `1h30m`, `2 days 5 hours`. Each term is an
+/// integer count followed by a unit; whitespace and commas separate terms. Empty
+/// input, a bare number, a fraction, or any unknown/calendar unit → `None`.
+fn parse_friendly_duration_secs(s: &str) -> Option<i64> {
+    let mut total: i64 = 0;
+    let mut saw_term = false;
+    let mut chars = s.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() || c == ',' {
+            chars.next();
+            continue;
+        }
+        let mut num: i64 = 0;
+        let mut saw_digit = false;
+        while let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+            num = num.checked_mul(10)?.checked_add(i64::from(d))?;
+            saw_digit = true;
+            chars.next();
+        }
+        if !saw_digit {
+            return None;
+        }
+        // An optional space between the count and its unit ("30 days").
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let mut unit = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_alphabetic() {
+                unit.push(c.to_ascii_lowercase());
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let secs = unit_seconds(&unit)?;
+        total = total.checked_add(num.checked_mul(secs)?)?;
+        saw_term = true;
+    }
+    saw_term.then_some(total)
+}
+
+/// `P30D`, `PT24H`, `P1W`, `P1DT2H30M`. Date part: weeks and days; time part
+/// (after `T`): hours, minutes, seconds. Years (`Y`) and months (`M` before
+/// `T`) are rejected; integers only. `None` on anything malformed.
+fn parse_iso8601_duration_secs(s: &str) -> Option<i64> {
+    let rest = s.strip_prefix(['P', 'p'])?;
+    if rest.is_empty() {
+        return None;
+    }
+    let (date_part, time_part) = match rest.split_once(['T', 't']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (rest, None),
+    };
+    let mut total: i64 = 0;
+    let mut saw_any = false;
+    for (num, unit) in iso_terms(date_part)? {
+        let secs = match unit.to_ascii_uppercase() {
+            'D' => 86_400,
+            'W' => 604_800,
+            _ => return None, // Y/M (calendar) and anything else
+        };
+        total = total.checked_add(num.checked_mul(secs)?)?;
+        saw_any = true;
+    }
+    if let Some(time_part) = time_part {
+        if time_part.is_empty() {
+            return None; // a dangling `T` with no time terms
+        }
+        for (num, unit) in iso_terms(time_part)? {
+            let secs = match unit.to_ascii_uppercase() {
+                'H' => 3_600,
+                'M' => 60,
+                'S' => 1,
+                _ => return None,
+            };
+            total = total.checked_add(num.checked_mul(secs)?)?;
+            saw_any = true;
+        }
+    }
+    saw_any.then_some(total)
+}
+
+/// Split an ISO 8601 component run into (integer, unit-letter) pairs; `None`
+/// unless it's a clean sequence of digits-then-letter.
+fn iso_terms(part: &str) -> Option<Vec<(i64, char)>> {
+    let mut terms = Vec::new();
+    let mut chars = part.chars().peekable();
+    while chars.peek().is_some() {
+        let mut num: i64 = 0;
+        let mut saw_digit = false;
+        while let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+            num = num.checked_mul(10)?.checked_add(i64::from(d))?;
+            saw_digit = true;
+            chars.next();
+        }
+        if !saw_digit {
+            return None;
+        }
+        let unit = chars.next()?;
+        if !unit.is_ascii_alphabetic() {
+            return None;
+        }
+        terms.push((num, unit));
+    }
+    Some(terms)
 }
 
 /// `name` with optional PEP 440 specifiers: `requests`, `six==1.16.0`,
@@ -1131,6 +1287,18 @@ fn glob_like_contains(haystack: &str, pattern: &str) -> bool {
     true
 }
 
+/// A schemeless `--to` (e.g. `127.0.0.1:8000/simple/`) is a relative URL, which
+/// makes every request `reqwest` builds fail with "relative URL without a base".
+/// Default a missing scheme to `http://` — sync destinations are typically a
+/// local/internal pypiron, not a public TLS host.
+fn ensure_http_scheme(dst_base: String) -> String {
+    if dst_base.contains("://") {
+        dst_base
+    } else {
+        format!("http://{dst_base}")
+    }
+}
+
 fn normalize_legacy_endpoint(dst_base: &str) -> String {
     let trimmed = dst_base.trim_end_matches('/');
     if trimmed.ends_with("/legacy") {
@@ -1143,6 +1311,22 @@ fn normalize_legacy_endpoint(dst_base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_http_scheme_defaults_and_preserves() {
+        assert_eq!(
+            ensure_http_scheme("127.0.0.1:8000/simple/".into()),
+            "http://127.0.0.1:8000/simple/"
+        );
+        assert_eq!(
+            ensure_http_scheme("https://dest.example".into()),
+            "https://dest.example"
+        );
+        assert_eq!(
+            ensure_http_scheme("http://dest.example".into()),
+            "http://dest.example"
+        );
+    }
 
     #[test]
     fn parses_spec_lines() {
@@ -1210,6 +1394,71 @@ mod tests {
 
         let unbounded = time_filter(None, None);
         assert!(matches_filters(&unknown, &unbounded));
+    }
+
+    fn cutoff(value: &str) -> Result<Option<OffsetDateTime>> {
+        parse_cutoff("test", Some(&value.to_string()))
+    }
+
+    #[test]
+    fn parse_cutoff_accepts_rfc3339_and_durations() {
+        // Empty/whitespace is "no cutoff", not an error.
+        assert!(cutoff("").unwrap().is_none());
+        assert!(cutoff("   ").unwrap().is_none());
+
+        // An absolute RFC 3339 timestamp is taken verbatim.
+        assert_eq!(
+            cutoff("2020-01-01T00:00:00Z").unwrap().unwrap(),
+            OffsetDateTime::parse("2020-01-01T00:00:00Z", &Rfc3339).unwrap()
+        );
+
+        // Friendly and ISO 8601 durations resolve to (now - duration), within a
+        // small window for the clock advancing across the call.
+        for (input, secs) in [
+            ("30 days", 30 * 86_400),
+            ("24 hours", 24 * 3_600),
+            ("1 week", 604_800),
+            ("1h30m", 5_400),
+            ("2 days 5 hours", 2 * 86_400 + 5 * 3_600),
+            ("P30D", 30 * 86_400),
+            ("PT24H", 24 * 3_600),
+            ("P1W", 604_800),
+            ("P1DT2H30M", 86_400 + 2 * 3_600 + 30 * 60),
+            ("PT90M", 90 * 60),
+        ] {
+            let before = OffsetDateTime::now_utc();
+            let got = cutoff(input).unwrap().unwrap();
+            let after = OffsetDateTime::now_utc();
+            let slack = Duration::seconds(5);
+            assert!(
+                got >= before - Duration::seconds(secs) - slack
+                    && got <= after - Duration::seconds(secs) + slack,
+                "{input} resolved to {got}, expected ~{secs}s ago"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_cutoff_rejects_calendar_units_and_garbage() {
+        // Calendar months/years have no fixed length — rejected in both forms.
+        for bad in [
+            "1 month", "2 months", "1 year", "3 years", "1mo", "P1M", "P1Y", "P3Y6M",
+        ] {
+            assert!(cutoff(bad).is_err(), "{bad} must be rejected");
+        }
+        // Not durations or timestamps at all.
+        for bad in [
+            "tomorrow",
+            "2020-01-01",
+            "5",
+            "30",
+            "PT",
+            "P",
+            "1.5 hours",
+            "garbage",
+        ] {
+            assert!(cutoff(bad).is_err(), "{bad} must be rejected");
+        }
     }
 
     fn resolved_with(filter: ResolvedFilter, src_base: &str) -> Resolved {

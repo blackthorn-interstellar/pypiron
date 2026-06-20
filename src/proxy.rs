@@ -93,19 +93,22 @@ pub struct ProxyFilterArgs {
     )]
     pub exclude_platform_tag: Vec<String>,
 
-    /// Only proxy files the upstream received before this RFC 3339 timestamp.
+    /// Only proxy files the upstream received before this cutoff. Accepts an
+    /// RFC 3339 timestamp, a friendly duration ("30 days", "24 hours", "1 week"),
+    /// or an ISO 8601 duration (P30D, PT24H), relative to now; no months/years.
     #[arg(
         long = "proxy-exclude-newer",
         env = "PYPIRON_PROXY_EXCLUDE_NEWER",
-        value_name = "TIMESTAMP"
+        value_name = "WHEN"
     )]
     pub exclude_newer: Option<String>,
 
-    /// Only proxy files the upstream received at or after this RFC 3339 timestamp.
+    /// Only proxy files the upstream received at or after this cutoff. Same
+    /// formats as --proxy-exclude-newer.
     #[arg(
         long = "proxy-exclude-older",
         env = "PYPIRON_PROXY_EXCLUDE_OLDER",
-        value_name = "TIMESTAMP"
+        value_name = "WHEN"
     )]
     pub exclude_older: Option<String>,
 }

@@ -183,8 +183,15 @@ Filters gate only what a run *adds* — already-mirrored files are never removed
 - `--abi-tag none,cp311` — ABI tag(s)
 - `--platform-tag any,manylinux2014_x86_64,macosx_*_arm64` — platform tag(s), `*` wildcard
 - `--exclude-platform-tag` — exclusions (supports `*`)
-- `--exclude-newer 2024-01-01T00:00:00Z` — only files PyPI received before then
-- `--exclude-older 2020-01-01T00:00:00Z` — only files received since then
+- `--exclude-newer <when>` — only files PyPI received before the cutoff
+- `--exclude-older <when>` — only files received since the cutoff
+
+`<when>` (matching uv's `--exclude-newer`) is an **RFC 3339 timestamp**
+(`2024-01-01T00:00:00Z`), a **friendly duration** ago (`"30 days"`, `"24 hours"`,
+`"1 week"`), or an **ISO 8601 duration** ago (`P30D`, `PT24H`). A duration is
+resolved against the current time as a fixed number of seconds (a day is 24 h);
+calendar months and years are rejected. The same forms apply to the `--proxy-`
+variants and to the `pypiron.toml` `exclude-newer`/`exclude-older` keys.
 
 Every sync option also lives in `pypiron.toml` (auto-discovered in the working
 directory, or `--config <path>`), layered as CLI/env > file > defaults:

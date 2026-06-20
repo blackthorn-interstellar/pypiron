@@ -106,7 +106,8 @@ target asserts "never panic" plus a domain invariant:
 | Target | Module | Invariant beyond no-panic |
 |---|---|---|
 | `fuzz_names` | `names.rs` | PEP 503 normalization is idempotent; wheel-tag fields never empty |
-| `fuzz_wheel` | `wheel.rs` | extracted METADATA stays under the 16 MiB cap |
+| `fuzz_wheel` | `wheel.rs` | raw bytes: extracted METADATA stays under the 16 MiB cap |
+| `fuzz_wheelzip` | `wheel.rs` | valid zips: METADATA is the first one-slash `*.dist-info/METADATA`, decoys never win |
 | `fuzz_render` | `render.rs` | PEP 691 JSON always valid; HTML `href` can't break out of its attribute |
 | `fuzz_coremeta` | `coremeta.rs` | RFC 822 METADATA parse is total over any bytes |
 | `fuzz_range` | `range.rs` | a resolved `Partial(start, end)` is always `start <= end < size` |

@@ -63,3 +63,10 @@ path = "fuzz_targets/fuzz_range.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_wheelzip"
+path = "fuzz_targets/fuzz_wheelzip.rs"
+test = false
+doc = false
+bench = false

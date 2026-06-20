@@ -186,18 +186,22 @@ pub async fn run_worker_until(
     }
     let mut last_inventory_refresh: Option<Instant> = None;
     loop {
-        // Every node (leader or follower) refreshes its in-memory inventory from
-        // the persisted view on a throttle — this is how the leader's published
-        // counts reach followers, who never run a tick or audit. Outside the
-        // leader gate on purpose.
-        if last_inventory_refresh.is_none_or(|t| t.elapsed() >= INVENTORY_REFRESH_INTERVAL) {
-            last_inventory_refresh = Some(Instant::now());
-            refresh_inventory(&state).await;
-        }
         let is_leader = match &lease {
             None => true,
             Some(lm) => lm.is_leader().await,
         };
+        // Refresh the in-memory inventory from the persisted view ONCE on boot
+        // (a starting display, including a restart's last-known value), then
+        // continuously only on followers — that's how the leader's published
+        // counts reach them. The leader does NOT keep refreshing: it is the
+        // authority, and reading back its own (possibly stale-on-failed-persist)
+        // file would revert its fresh atomics.
+        let due_refresh = last_inventory_refresh
+            .is_none_or(|t| !is_leader && t.elapsed() >= INVENTORY_REFRESH_INTERVAL);
+        if due_refresh {
+            last_inventory_refresh = Some(Instant::now());
+            refresh_inventory(&state).await;
+        }
         if is_leader {
             let spacing = state.reconcile_interval.max(std::time::Duration::from_secs(
                 last_audit_secs.load(Ordering::Relaxed) * 10,
@@ -256,23 +260,31 @@ fn inventory_key() -> String {
 
 /// Publish the aggregate to `_state/inventory.json` (so other nodes see it) and
 /// into the local metrics atomics (so this node's homepage and `/metrics` show
-/// it now). Best-effort: a failed persist only means followers lag until the
-/// next publish — it must never strand markers or fail a rebuild.
-async fn publish_inventory(state: &AppState, inv: crate::metrics::Inventory) {
+/// it now). Returns whether the persist landed: the local atomics always update,
+/// but a storage-write failure returns `false` so the caller can retry rather
+/// than drop the change. Best-effort — it must never strand markers or fail a
+/// rebuild.
+async fn publish_inventory(state: &AppState, inv: crate::metrics::Inventory) -> bool {
     state
         .metrics
         .set_inventory(inv.projects, inv.releases, inv.files, inv.bytes);
-    match serde_json::to_vec(&inv) {
-        Ok(bytes) => {
-            if let Err(e) = state
-                .storage
-                .put_bytes(&inventory_key(), bytes, Some("application/json"))
-                .await
-            {
-                warn!(error=?e, "inventory: persist failed (followers will lag)");
-            }
+    let bytes = match serde_json::to_vec(&inv) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(error=?e, "inventory: serialize failed");
+            return false;
         }
-        Err(e) => warn!(error=?e, "inventory: serialize failed"),
+    };
+    match state
+        .storage
+        .put_bytes(&inventory_key(), bytes, Some("application/json"))
+        .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(error=?e, "inventory: persist failed (followers will lag)");
+            false
+        }
     }
 }
 
@@ -305,9 +317,6 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
     let mut failures = 0usize;
     let mut rebuilt = 0usize;
     let mut skipped = 0usize;
-    let mut files = 0u64;
-    let mut bytes = 0u64;
-    let mut releases = 0u64;
     let mut pkg_stats: Vec<(String, PkgStat)> = Vec::new();
 
     // Shards enumerate in parallel — that is what the sharding is for. The
@@ -326,9 +335,6 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
                     rebuilt += result.rebuilt;
                     skipped += result.skipped;
                     failures += result.failures;
-                    files += result.files;
-                    bytes += result.bytes;
-                    releases += result.releases;
                     pkg_stats.extend(result.pkg_stats);
                 }
                 Err(e) => {
@@ -356,23 +362,19 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
     m.audit_packages_skipped
         .fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
     m.set_audit_duration(duration_secs);
-    // `live` is sorted+deduped above, so its length is the distinct project
-    // count; releases/files/bytes were summed straight off the shard listings.
-    let totals = crate::metrics::Inventory {
-        projects: live.len() as u64,
-        releases,
-        files,
-        bytes,
-    };
     // Authoritatively re-baseline the in-memory map from truth (heals any
     // between-sweep delta drift, restores it after a restart), then publish the
-    // aggregate so every node — leader or follower — serves the current value.
-    {
+    // map's own totals — the exact value a subsequent tick flush would publish,
+    // so the displayed counts never flicker between the audit and tick paths.
+    // (`projects` = packages with stored artifacts, not the global name set's
+    // `live`, which conservatively keeps failed-rebuild names listed.)
+    let totals = {
         let mut inv = state.inventory.lock().await;
         inv.pkgs = pkg_stats.into_iter().collect();
         inv.ready = true;
         inv.dirty = false;
-    }
+        inv.totals()
+    };
     publish_inventory(state, totals).await;
     info!(
         packages = live.len(),
@@ -389,13 +391,9 @@ struct ShardAudit {
     /// Provably unchanged (fingerprint hit): zero reads spent.
     skipped: usize,
     failures: usize,
-    /// Inventory derived from the shard listing (no extra reads): artifact
-    /// files (sidecars excluded), their total size in bytes, and distinct
-    /// `(project, version)` releases.
-    files: u64,
-    bytes: u64,
-    releases: u64,
-    /// Per-package stats for the live packages, used to re-baseline the
+    /// Per-package inventory derived from the shard listing (no extra reads):
+    /// artifact files (sidecars excluded), bytes, and distinct releases, for
+    /// every package with at least one artifact. Summed to re-baseline the
     /// in-memory inventory map authoritatively each sweep.
     pkg_stats: Vec<(String, PkgStat)>,
 }
@@ -439,9 +437,6 @@ async fn audit_shard(state: &AppState, shard: char, force_deep: bool) -> Result<
         rebuilt: 0,
         skipped: 0,
         failures: 0,
-        files: 0,
-        bytes: 0,
-        releases: 0,
         pkg_stats: Vec::new(),
     };
     let mut fresh: std::collections::HashMap<String, String> = Default::default();
@@ -465,9 +460,6 @@ async fn audit_shard(state: &AppState, shard: char, force_deep: bool) -> Result<
                 }
             }
         }
-        out.files += file_count as u64;
-        out.bytes += pkg_bytes;
-        out.releases += versions.len() as u64;
         if file_count > 0 {
             out.pkg_stats.push((
                 pkg.clone(),
@@ -692,7 +684,12 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
         }
     };
     if let Some(totals) = pending {
-        publish_inventory(state, totals).await;
+        if !publish_inventory(state, totals).await {
+            // Persist failed; re-arm dirty so the next tick retries instead of
+            // waiting for the next change or sweep. (A concurrent rebuild may
+            // have re-set it already — harmless, the flush is idempotent.)
+            state.inventory.lock().await.dirty = true;
+        }
     }
     // Markers are consumed LAST — they are the transaction log, and must
     // outlive every write they announce (package views above, global index
@@ -728,11 +725,19 @@ pub async fn rebuild_package_excluding(
         .metrics
         .index_rebuilds
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut files = list_artifacts(state, pkg).await?;
+    let (mut files, mut raw) = list_artifacts(state, pkg).await?;
     if let Some(omit) = omit {
         files.retain(|f| f.filename != omit);
+        raw.retain(|(filename, _)| filename != omit);
     }
-    let stat = if files.is_empty() {
+    // Index membership keys on the *renderable* files; inventory keys on the
+    // *stored* files (raw). They differ only for a corrupt-sidecar file, which
+    // is dropped from the index but still counted as stored — matching the
+    // audit, so the two inventory writers can't disagree.
+    let live = !files.is_empty();
+    if live {
+        write_pkg_indexes(state, pkg, &files).await?;
+    } else {
         let keys = [
             format!("{SIMPLE_PREFIX}{pkg}/index.html"),
             format!("{SIMPLE_PREFIX}{pkg}/index.json"),
@@ -741,25 +746,22 @@ pub async fn rebuild_package_excluding(
         for key in &keys {
             state.index_cache.invalidate(key);
         }
-        PkgStat::default()
-    } else {
-        write_pkg_indexes(state, pkg, &files).await?;
-        PkgStat::from_files(&files)
-    };
-    // Maintain the in-memory inventory from the unfiltered artifact list (truth,
-    // not the quarantine-filtered view). This is the one choke point every
+    }
+    // Maintain the in-memory inventory. This is the one choke point every
     // rebuild — tick, audit, delete — flows through, and `upsert` is an
     // idempotent absolute set, so concurrent or repeated rebuilds never
     // double-count. The audit re-baselines the whole map periodically.
-    state.inventory.lock().await.upsert(pkg, stat);
-    Ok(stat.files > 0)
+    state
+        .inventory
+        .lock()
+        .await
+        .upsert(pkg, PkgStat::from_raw(&raw));
+    Ok(live)
 }
 
-/// One package's truth-faithful contribution to the registry inventory.
-/// Computed from the artifact list the rebuild already holds (the audit's exact
-/// method: distinct `infer_version_from_filename`, artifact `size` sum), so the
-/// two writers never disagree. `u32` counts are ample (thousands of files per
-/// package at most); bytes need `u64`.
+/// One package's contribution to the registry inventory: artifact files in
+/// storage and their bytes, with distinct inferred-version releases. `u32`
+/// counts are ample (thousands of files per package at most); bytes need `u64`.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) struct PkgStat {
     files: u32,
@@ -768,21 +770,24 @@ pub(crate) struct PkgStat {
 }
 
 impl PkgStat {
-    /// Stats for a package's artifacts. `files` are already artifact-only
-    /// (`list_artifacts` filters sidecars), so no further filtering here.
-    /// Releases are distinct inferred versions — the audit's exact method
-    /// (worker.rs audit_shard) — so the two writers can't disagree.
-    fn from_files(files: &[FileMetadata]) -> Self {
+    /// Stats for a package's `(filename, size)` artifacts as they exist in
+    /// storage — counted straight off the raw listing, the audit's exact method
+    /// ([`audit_shard`]). Counting the *stored* files (not the index-renderable
+    /// subset) is what keeps the tick and audit writers in agreement even for a
+    /// file whose sidecar is corrupt: the audit counts it off the listing, so
+    /// this must too. `omit` (a being-deleted filename) is already applied by
+    /// the caller.
+    fn from_raw(artifacts: &[(String, u64)]) -> Self {
         let mut versions: HashSet<String> = HashSet::new();
         let mut bytes = 0u64;
-        for f in files {
-            bytes += f.size;
-            if let Some(v) = infer_version_from_filename(&f.filename) {
+        for (filename, size) in artifacts {
+            bytes += size;
+            if let Some(v) = infer_version_from_filename(filename) {
                 versions.insert(v);
             }
         }
         PkgStat {
-            files: files.len() as u32,
+            files: artifacts.len() as u32,
             releases: versions.len() as u32,
             bytes,
         }
@@ -1019,7 +1024,14 @@ async fn write_global_indexes_cas(
 
 /// List a package's artifacts with metadata from sidecars — O(files), no hashing.
 /// Artifacts without a sidecar (legacy files) get one backfilled, hashing once.
-pub async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<FileMetadata>> {
+/// Also returns the *raw* `(filename, size)` of every artifact in storage — the
+/// inventory counts off this, not the metadata `Vec`, because a corrupt-sidecar
+/// file is dropped from the index (`load_file_metadata` returns `None`) yet
+/// still occupies storage, and the audit counts it off the listing.
+pub async fn list_artifacts(
+    state: &AppState,
+    pkg: &str,
+) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
     let entries = state.storage.list_dir_entries(&prefix).await?;
     let names: HashSet<&str> = entries
@@ -1038,6 +1050,10 @@ pub async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<FileMetad
             is_artifact(filename).then_some((entry, filename))
         })
         .collect();
+    let raw: Vec<(String, u64)> = artifacts
+        .iter()
+        .map(|(entry, filename)| (filename.to_string(), entry.size))
+        .collect();
     let mut metadata = Vec::with_capacity(artifacts.len());
     for chunk in artifacts.chunks(SIDECAR_READ_CONCURRENCY) {
         let loaded = futures::future::join_all(
@@ -1048,7 +1064,7 @@ pub async fn list_artifacts(state: &AppState, pkg: &str) -> Result<Vec<FileMetad
         .await;
         metadata.extend(loaded.into_iter().flatten());
     }
-    Ok(metadata)
+    Ok((metadata, raw))
 }
 
 /// Load one artifact's index entry from its sidecar (backfilling if absent).
@@ -1212,39 +1228,28 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    fn fm(filename: &str, size: u64) -> FileMetadata {
-        FileMetadata {
-            filename: filename.into(),
-            sha256: "x".into(),
-            size,
-            upload_time: None,
-            version: None,
-            yanked: Yanked::Flag(false),
-            requires_python: None,
-            core_metadata: false,
-            provenance: false,
-        }
+    fn raw(items: &[(&str, u64)]) -> Vec<(String, u64)> {
+        items.iter().map(|(n, s)| (n.to_string(), *s)).collect()
     }
 
     #[test]
     fn pkgstat_counts_files_distinct_versions_and_bytes() {
         // Two versions of one project: 3 files, 2 releases, summed bytes.
-        let files = [
-            fm("six-1.16.0-py2.py3-none-any.whl", 100),
-            fm("six-1.16.0.tar.gz", 50),
-            fm("six-1.15.0-py2.py3-none-any.whl", 80),
-        ];
-        let stat = PkgStat::from_files(&files);
+        let stat = PkgStat::from_raw(&raw(&[
+            ("six-1.16.0-py2.py3-none-any.whl", 100),
+            ("six-1.16.0.tar.gz", 50),
+            ("six-1.15.0-py2.py3-none-any.whl", 80),
+        ]));
         assert_eq!(stat.files, 3);
         assert_eq!(stat.releases, 2);
         assert_eq!(stat.bytes, 230);
-        assert_eq!(PkgStat::from_files(&[]), PkgStat::default());
+        assert_eq!(PkgStat::from_raw(&[]), PkgStat::default());
     }
 
     #[test]
     fn inventory_map_upsert_is_idempotent_and_totals_sum() {
         let mut inv = InventoryMap::default();
-        let a = PkgStat::from_files(&[fm("a-1.0-py3-none-any.whl", 10)]);
+        let a = PkgStat::from_raw(&raw(&[("a-1.0-py3-none-any.whl", 10)]));
         inv.upsert("a", a);
         assert!(inv.dirty);
         inv.dirty = false;
@@ -1255,10 +1260,10 @@ mod tests {
 
         inv.upsert(
             "b",
-            PkgStat::from_files(&[
-                fm("b-1.0-py3-none-any.whl", 20),
-                fm("b-2.0-py3-none-any.whl", 5),
-            ]),
+            PkgStat::from_raw(&raw(&[
+                ("b-1.0-py3-none-any.whl", 20),
+                ("b-2.0-py3-none-any.whl", 5),
+            ])),
         );
         let t = inv.totals();
         assert_eq!((t.projects, t.releases, t.files, t.bytes), (2, 3, 3, 35));

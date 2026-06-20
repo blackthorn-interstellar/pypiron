@@ -707,7 +707,7 @@ async fn project_page(
         return moved_permanently(&format!("/project/{pkg}/"));
     }
     let files = match worker::list_artifacts(&state, &pkg).await {
-        Ok(files) => files,
+        Ok((files, _raw)) => files,
         Err(e) => return read_error(e),
     };
     if files.is_empty() {

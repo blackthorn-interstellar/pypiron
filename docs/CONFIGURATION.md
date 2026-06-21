@@ -67,8 +67,8 @@ artifact downloads stream.
 | `--bind-addr`                | `PYPIRON_BIND_ADDR`                | `0.0.0.0:8080` | Listen address                                   |
 | `--uploader-user`            | `PYPIRON_UPLOADER_USER`            | *(none)*       | Uploader credential — may publish                |
 | `--uploader-pass`            | `PYPIRON_UPLOADER_PASS`            | *(none)*       | Uploader credential password                     |
-| `--admin-user`               | `PYPIRON_ADMIN_USER`               | *(none)*       | Admin credential — publish + mirror/delete/yank  |
-| `--admin-pass`               | `PYPIRON_ADMIN_PASS`               | *(none)*       | Admin credential password                        |
+| `--admin-user`               | `PYPIRON_ADMIN_USER`               | `admin`        | Admin credential — publish + mirror/delete/yank  |
+| `--admin-pass`               | `PYPIRON_ADMIN_PASS`               | *(none)*       | Admin credential password (enables admin)        |
 | `--read-user`                | `PYPIRON_READ_USER`                | *(none)*       | Read credential — when set, reads require auth   |
 | `--read-pass`                | `PYPIRON_READ_PASS`                | *(none)*       | Read credential password                         |
 | `--private-prefix`           | `PYPIRON_PRIVATE_PREFIX`           | *(none)*       | Reserve a namespace for private uploads          |
@@ -120,7 +120,9 @@ reader:
 | uploader | `--uploader-user`/`--uploader-pass` | publish ordinary uploads |
 | read | `--read-user`/`--read-pass` | read indexes and artifacts |
 
-With **no write credential** the server is **read-only** — open unauthenticated
+Setting a password is what enables a role; the admin username defaults to
+`admin`, so `--admin-pass secret` alone is a complete admin credential. With
+**no write credential** the server is **read-only** — open unauthenticated
 writes don't exist. With no read credential, reads are public. When
 `--read-user` is set, `/simple/` and `/files/` require auth (any of the three
 credentials works; `/health` and `/metrics` stay open for probes):

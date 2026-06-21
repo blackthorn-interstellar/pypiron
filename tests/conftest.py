@@ -374,6 +374,46 @@ def disk_server_read_auth(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]
 
 
 @pytest.fixture()
+def disk_server_admin_pass_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server given only `--admin-pass`: the username defaults to `admin`."""
+    data_dir = tmp_path_factory.mktemp("pypiron-admin-pass-only")
+    port = find_free_port()
+    bind = f"127.0.0.1:{port}"
+    log_path = data_dir.parent / f"{data_dir.name}-server.log"
+    args = [
+        str(pypiron_bin),
+        "serve",
+        "--bind-addr",
+        bind,
+        "--data-dir",
+        str(data_dir),
+        "--admin-pass",
+        "secret",
+        "--worker-interval-secs",
+        "1",
+    ]
+    env = os.environ.copy()
+    env.setdefault("RUST_LOG", "info,pypiron=debug")
+    with open(log_path, "w") as log_file:
+        proc = subprocess.Popen(args, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+        try:
+            wait_http_ok(f"http://{bind}/simple/index.json", timeout=20.0)
+            yield {
+                "bind": bind,
+                "base_url": f"http://{bind}",
+                "legacy": f"http://{bind}/legacy/",
+                "simple": f"http://{bind}/simple/",
+                "admin_user": "admin",
+                "admin_password": "secret",
+                "data_dir": data_dir,
+                "log_path": log_path,
+                "proc": proc,
+            }
+        finally:
+            kill_process_tree(proc)
+
+
+@pytest.fixture()
 def disk_server_no_creds(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Disk server with no credentials at all: read-only, every write disabled."""
     data_dir = tmp_path_factory.mktemp("pypiron-no-creds")

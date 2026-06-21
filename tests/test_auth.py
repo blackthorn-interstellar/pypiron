@@ -104,6 +104,33 @@ def test_no_credentials_means_read_only(disk_server_no_creds, tmp_path):
     assert code == 200
 
 
+def test_admin_pass_only_defaults_username_to_admin(disk_server_admin_pass_only, tmp_path):
+    """`serve --admin-pass secret` alone is a complete admin credential under the
+    default `admin` username — publish plus the admin-only delete/yank."""
+    server = disk_server_admin_pass_only
+    admin = {"username": "admin", "password": "secret"}
+    wheel = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
+
+    # Publishing authenticates as the defaulted admin username.
+    upload_legacy(server["legacy"], wheel, **admin)
+    wait_for_file_in_index(server["simple"], PACKAGE, wheel.name)
+
+    # A wrong username is still rejected — the default isn't a bypass.
+    code, _, _ = http_request_auth(
+        "DELETE",
+        f"{server['base_url']}/files/{PACKAGE}/{wheel.name}",
+        username="root",
+        password="secret",
+    )
+    assert code == 401
+
+    # The admin-only operations work under the default username.
+    code, _, _ = http_request_auth(
+        "DELETE", f"{server['base_url']}/files/{PACKAGE}/{wheel.name}", **admin
+    )
+    assert code == 204
+
+
 def test_admin_disabled_when_unconfigured(disk_server_uploader_only, tmp_path):
     """With no admin credential, delete/yank are disabled for everyone."""
     server = disk_server_uploader_only

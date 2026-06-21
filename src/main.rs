@@ -167,7 +167,9 @@ struct ServeArgs {
 
     /// Admin credential username — may do everything an uploader can, plus the
     /// privileged operations: mirror uploads (backdating + `mirror` origin),
-    /// deletion, and yank. Configuring it is what enables those operations.
+    /// deletion, and yank. Configuring a password is what enables those
+    /// operations; the username defaults to `admin` when only the password is
+    /// set.
     #[arg(long, env = "PYPIRON_ADMIN_USER")]
     admin_user: Option<String>,
 
@@ -465,7 +467,13 @@ fn parse_resolution_secs(s: &str) -> Result<u32> {
         .ok_or_else(|| anyhow::anyhow!("'{s}': duration too large"))
 }
 
-async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
+async fn run_serve(mut cli: ServeArgs, log_format: LogFormat) -> Result<()> {
+    // Supplying only `--admin-pass` is enough to enable admin: the password is
+    // the secret, the username is conventional. Fill in the default username
+    // only alongside a password, so the no-admin (read-only) configuration keeps
+    // both halves unset rather than tripping the half-configured check below.
+    cli.admin_user = resolve_admin_user(cli.admin_user.as_deref(), cli.admin_pass.as_deref());
+
     // Reject a half-configured credential before doing anything else: it can
     // never authenticate, and a half-set read credential would fail open and
     // serve every package publicly. Fail loudly at startup rather than silently.
@@ -2652,6 +2660,23 @@ fn cred_pair<'a>(user: Option<&'a str>, pass: Option<&'a str>) -> Option<(&'a st
     nonempty(user).zip(nonempty(pass))
 }
 
+/// The conventional admin username supplied when only `--admin-pass` is given.
+const DEFAULT_ADMIN_USER: &str = "admin";
+
+/// Default the admin username to `admin` when a password was given without one —
+/// the password is the secret; the username need not be repeated. The default
+/// applies *only* alongside a password, so the no-admin (read-only)
+/// configuration keeps both halves unset and never trips the half-configured
+/// startup error. A password-less username is returned unchanged, so a stray
+/// `--admin-user` still fails closed.
+fn resolve_admin_user(user: Option<&str>, pass: Option<&str>) -> Option<String> {
+    if nonempty(pass).is_some() && nonempty(user).is_none() {
+        Some(DEFAULT_ADMIN_USER.to_string())
+    } else {
+        user.map(str::to_string)
+    }
+}
+
 /// A half-configured credential pair — exactly one of username/password set
 /// (an empty value counts as unset) — can never authenticate anyone, and a
 /// half-configured *read* credential silently serves every index and artifact
@@ -2784,6 +2809,35 @@ mod tests {
         assert!(credential_pair_error("read", Some("reader"), Some("secret")).is_none());
         assert!(credential_pair_error("read", None, None).is_none());
         assert!(credential_pair_error("read", Some(""), Some("")).is_none());
+    }
+
+    #[test]
+    fn admin_username_defaults_only_with_a_password() {
+        // Password given, username omitted (or empty) -> conventional default.
+        assert_eq!(
+            resolve_admin_user(None, Some("secret")).as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            resolve_admin_user(Some(""), Some("secret")).as_deref(),
+            Some("admin")
+        );
+        // An explicit username is preserved.
+        assert_eq!(
+            resolve_admin_user(Some("root"), Some("secret")).as_deref(),
+            Some("root")
+        );
+        // No password -> no admin: the username is NOT defaulted, so the
+        // read-only configuration keeps both halves unset and the half-configured
+        // check stays quiet.
+        assert_eq!(resolve_admin_user(None, None), None);
+        assert_eq!(resolve_admin_user(None, Some("")), None);
+        // A password-less username is left untouched so it still fails closed via
+        // the half-configured check.
+        assert_eq!(
+            resolve_admin_user(Some("root"), None).as_deref(),
+            Some("root")
+        );
     }
 
     #[test]

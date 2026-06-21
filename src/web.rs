@@ -178,7 +178,6 @@ main.wide{max-width:1000px;padding-top:0}\
 .pmeta .vals li{margin:2px 0;word-break:break-word}\
 .pmeta .pill{font-size:13px}\
 .pmeta .tablink.active{color:var(--fg);font-weight:600}\
-.sb-cap{margin:0 0 9px;font-size:12px;color:var(--muted);line-height:1.45}\
 .sb-dl{margin:0}\
 .sb-dl dt{font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);margin-top:9px}\
 .sb-dl dd{margin:1px 0 0;font-size:13px;word-break:break-word}\
@@ -462,10 +461,10 @@ aria-label=\"Search packages\" autocomplete=\"off\" autofocus></form>",
 /// `pinned` marks that it came from a `/project/<pkg>/<version>/` request (it
 /// pins the `uv add` snippet). `meta` is the selected version's representative
 /// core metadata (the README is rendered when it declares Markdown, else shown
-/// verbatim). `verified` is the PEP 740 publisher of the selected version and
-/// the artifact filename whose `.provenance` backs it, present only for files
-/// that carry relayed attestations. The content area has three tab panels —
-/// description, release history, download files — switched by the sidebar.
+/// verbatim). `publisher` is the PEP 740 publisher of the selected version,
+/// present only for files that carry relayed attestations. The content area has
+/// three tab panels — description, release history, download files — switched by
+/// the sidebar.
 #[allow(clippy::too_many_arguments)]
 pub fn project_html(
     ctx: &PageContext,
@@ -474,7 +473,7 @@ pub fn project_html(
     selected: &str,
     pinned: bool,
     meta: Option<&CoreMetadata>,
-    verified: Option<(&Publisher, &str)>,
+    publisher: Option<&Publisher>,
 ) -> String {
     let index_url = format!("{}/simple/", ctx.base_url);
     // The one index URL, top-right, in a copy field (same style as the landing
@@ -554,7 +553,7 @@ pub fn project_html(
 {footer}{TABS_JS}",
         name = encode_text(pkg),
         nav = nav_section(),
-        verified = verified_section(pkg, verified),
+        verified = verified_section(publisher),
         details = meta_sections(meta),
         desc = description_panel(meta),
         history = release_history_panel(pkg, files, selected),
@@ -705,13 +704,11 @@ fn files_panel(pkg: &str, files: &[&FileMetadata]) -> String {
     )
 }
 
-/// The "Verified details" sidebar section. Shown only when the selected version
-/// carries a relayed PEP 740 attestation: pypiron does NOT re-verify it, so this
-/// names the publisher the upstream index recorded and links the raw
-/// `.provenance` so anyone can re-verify — it never claims this server did the
-/// cryptography.
-fn verified_section(pkg: &str, verified: Option<(&Publisher, &str)>) -> String {
-    let Some((p, file)) = verified else {
+/// The "Verified details" sidebar section: the publishing identity recorded in
+/// the selected version's relayed PEP 740 attestation. Shown only when one is
+/// present (mirror-origin files only).
+fn verified_section(publisher: Option<&Publisher>) -> String {
+    let Some(p) = publisher else {
         return String::new();
     };
     let mut rows = String::new();
@@ -732,14 +729,7 @@ fn verified_section(pkg: &str, verified: Option<(&Publisher, &str)>) -> String {
     if let Some(e) = &p.environment {
         rows.push_str(&kv_row("Environment", e));
     }
-    format!(
-        "<section class=\"sb sb-verified\"><h2>Verified details</h2>\
-<p class=\"sb-cap\">Recorded by the publishing index and relayed here, not re-verified by this \
-server. <a href=\"/files/{pkg_attr}/{file_attr}.provenance\">Re-verify ↓</a></p>\
-<dl class=\"sb-dl\">{rows}</dl></section>",
-        pkg_attr = encode_double_quoted_attribute(pkg),
-        file_attr = encode_double_quoted_attribute(file),
-    )
+    format!("<section class=\"sb sb-verified\"><h2>Verified details</h2><dl class=\"sb-dl\">{rows}</dl></section>")
 }
 
 /// The package's self-declared metadata, as plain sidebar sections — project
@@ -1193,15 +1183,17 @@ mod tests {
             "15.0.0",
             false,
             Some(&m),
-            Some((&pubr, "imaginAIry-15.0.0-py3-none-any.whl")),
+            Some(&pubr),
         );
         assert!(html.contains("<h2>Verified details</h2>"));
-        // Honest framing: relayed, not re-verified here.
-        assert!(html.contains("not re-verified by this server"));
-        // GitHub repo becomes a link; provenance is re-verifiable.
+        // The publisher rows render; the GitHub repo becomes a link.
+        assert!(html.contains("<dt>Publisher</dt><dd>GitHub</dd>"));
         assert!(html.contains("href=\"https://github.com/brycedrennan/imaginAIry\""));
-        assert!(html.contains("/files/imaginairy/imaginAIry-15.0.0-py3-none-any.whl.provenance"));
         assert!(html.contains("<dt>Workflow</dt><dd>release.yml</dd>"));
+        // The relayed/re-verify caption is gone.
+        assert!(!html.contains("not re-verified by this server"));
+        assert!(!html.contains("Re-verify"));
+        assert!(!html.contains(".provenance"));
     }
 
     #[test]

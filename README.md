@@ -24,40 +24,18 @@ An ultra-fast Python package server, written in Rust.
 ## Quickstart
 
 ```bash
-uvx pypiron serve 
-```
+uvx pypiron serve --admin-pass my-pw
 
-## Examples
-
-Four recipes cover almost everyone. There is one URL and one namespace — it
-serves your private uploads, packages you `sync` in, and anything proxied on
-demand, all at once — so mix these freely. Every `--flag` is also a `PYPIRON_*`
-env var; the full reference is [CONFIGURATION.md](docs/CONFIGURATION.md).
-
-### 1. Host private packages
-
-Internal libraries that must never touch public PyPI. Disk storage, one box:
-
-```bash
-uvx pypiron serve --admin-pass "$ADMIN" --read-user team --read-pass "$READ"
-```
-
-`--admin-pass` alone is a complete credential (the admin user defaults to
-`admin`). Setting `--read-user` makes reads require auth — drop it to leave
-installs public.
-
-```bash
 # publish
-uv publish --publish-url http://HOST:8080/legacy/ \
-  --username admin --password "$ADMIN" dist/*
+uv publish --publish-url http://HOST:8080/legacy/ --username admin --password "my-pw" dist/*
 
 # install — add pypiron alongside PyPI (pip: --extra-index-url)
-uv add --index http://team:$READ@HOST:8080/simple/ acme-widgets
+uv add --index http://@HOST:8080/simple/ acme-widgets
 ```
 
 Want a single index that serves public packages too, instead of two? → setup 2.
 
-### 2. One index for private + public
+### One index for private + public
 
 The most common setup: a single URL that serves your private packages and
 caches everything else from PyPI on first use, so developers configure one index
@@ -89,9 +67,6 @@ No egress: the serving node can't reach PyPI, so you pre-load an allowlist with
 `pypiron sync` from a host that can. `sync` is a pure HTTP client — it only needs
 the server's URL and the admin credential, nothing about its storage.
 
-```bash
-uvx pypiron serve --admin-pass "$ADMIN"        # inside the network, no internet
-```
 
 From a host that can reach both PyPI and the server, put the allowlist and
 filters in `pypiron.toml` (auto-discovered in the working directory):

@@ -8,7 +8,7 @@ use crate::status::ProjectStatusDoc;
 
 /// Simple API version lineage: 1.0 PEP 629 (initial) · 1.1 PEP 700 (`versions`,
 /// file `size`/`upload-time`) · 1.2 PEP 708 "tracks"/alternate-locations (out of
-/// scope, see STANDARDS.md) · 1.3 PEP 740 `provenance` · 1.4 PEP 792 project
+/// scope, see docs/reference/standards.md) · 1.3 PEP 740 `provenance` · 1.4 PEP 792 project
 /// status markers.
 const API_VERSION: &str = "1.4";
 

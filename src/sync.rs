@@ -30,16 +30,20 @@ use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tokio::fs;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{self, SyncConfig};
 use crate::names::{
     checked_pkg_name, infer_version_from_filename, matches_prefix, normalize_pkg_name,
-    parse_wheel_tags,
+    parse_wheel_tags, WheelTags,
 };
 use crate::render::SIMPLE_JSON_CONTENT_TYPE;
 use crate::sidecar::Yanked;
@@ -119,6 +123,11 @@ pub struct SyncArgs {
     #[arg(long, env = "PYPIRON_SYNC_FULL")]
     pub full: bool,
 
+    /// Disable the live progress meter (files/bytes, rate, and ETA on stderr).
+    /// The meter is on by default; the end-of-run summary always prints.
+    #[arg(long = "no-progress", env = "PYPIRON_SYNC_NO_PROGRESS")]
+    pub no_progress: bool,
+
     /// Filtering flags (wheel/python/abi/platform/upload-time).
     #[command(flatten)]
     pub filter: FilterArgs,
@@ -151,9 +160,10 @@ pub struct FilterArgs {
     pub exclude_platform_tag: Vec<String>,
 
     /// Only mirror files PyPI received before this cutoff (the mirroring twin of
-    /// uv's --exclude-newer). Accepts an RFC 3339 timestamp, a friendly duration
+    /// uv's --exclude-newer). Accepts an RFC 3339 timestamp, a bare date
+    /// (2008-12-03), a bare integer of days ago (7), a friendly duration
     /// ("30 days", "24 hours", "1 week"), or an ISO 8601 duration (P30D, PT24H);
-    /// a duration is relative to now. Calendar months/years are not allowed.
+    /// durations are relative to now. Calendar months/years are not allowed.
     #[arg(long, env = "PYPIRON_SYNC_EXCLUDE_NEWER", value_name = "WHEN")]
     pub exclude_newer: Option<String>,
 
@@ -162,6 +172,25 @@ pub struct FilterArgs {
     /// P30D).
     #[arg(long, env = "PYPIRON_SYNC_EXCLUDE_OLDER", value_name = "WHEN")]
     pub exclude_older: Option<String>,
+
+    /// Skip wheels built only for Python older than this floor (e.g. "3.10"
+    /// drops cp36–cp39 and python-2 wheels). Version-agnostic wheels (py3,
+    /// py2.py3), forward-compatible abi3 wheels, and all sdists are kept.
+    #[arg(
+        long = "min-python",
+        env = "PYPIRON_SYNC_MIN_PYTHON",
+        value_name = "X.Y"
+    )]
+    pub min_python: Option<String>,
+
+    /// Skip PEP 440 dev releases (any version with a `.devN` segment).
+    #[arg(long = "exclude-dev", env = "PYPIRON_SYNC_EXCLUDE_DEV")]
+    pub exclude_dev: bool,
+
+    /// Skip Windows artifacts: wheels with a win32/win_amd64/win_arm64 platform
+    /// tag, plus legacy Windows installers (.exe/.msi and .winXX filenames).
+    #[arg(long = "exclude-windows", env = "PYPIRON_SYNC_EXCLUDE_WINDOWS")]
+    pub exclude_windows: bool,
 }
 
 /// One package to mirror, with optional PEP 440 version constraints.
@@ -202,6 +231,14 @@ pub(crate) struct ResolvedFilter {
     pub(crate) exclude_platform_tag: Vec<String>,
     pub(crate) exclude_newer: Option<OffsetDateTime>,
     pub(crate) exclude_older: Option<OffsetDateTime>,
+    /// Minimum Python `(major, minor)`; wheels that target only older Pythons
+    /// are dropped. `None` disables the floor.
+    pub(crate) min_python: Option<(u32, u32)>,
+    /// Drop PEP 440 dev releases.
+    pub(crate) exclude_dev: bool,
+    /// Drop Windows artifacts: wheels with a `win*` platform tag and legacy
+    /// Windows installers (`.exe`/`.msi`/`.winXX` filenames).
+    pub(crate) exclude_windows: bool,
 }
 
 impl Resolved {
@@ -307,6 +344,11 @@ impl Resolved {
                     filter.exclude_newer.as_ref().or(cfg.exclude_newer.as_ref()),
                 )?,
                 exclude_older: parse_cutoff("exclude-older", exclude_older_raw.as_ref())?,
+                min_python: parse_min_python(
+                    filter.min_python.as_deref().or(cfg.min_python.as_deref()),
+                )?,
+                exclude_dev: filter.exclude_dev || cfg.exclude_dev.unwrap_or(false),
+                exclude_windows: filter.exclude_windows || cfg.exclude_windows.unwrap_or(false),
             },
             exclude_older_raw,
         })
@@ -336,16 +378,55 @@ pub(crate) fn parse_cutoff(what: &str, value: Option<&String>) -> Result<Option<
     if let Ok(ts) = OffsetDateTime::parse(value, &Rfc3339) {
         return Ok(Some(ts));
     }
+    // A bare calendar date (no time) — the common "since 2008-12-03" cutoff,
+    // taken as that day at 00:00:00 UTC.
+    if let Some(ts) = parse_bare_date(value) {
+        return Ok(Some(ts));
+    }
+    // A bare integer is that many days ago, so `--exclude-newer 7` means "before
+    // 7 days ago" — the obvious reading of a unit-less count of days.
+    if let Ok(days) = value.parse::<i64>() {
+        if days >= 0 {
+            return Ok(Some(OffsetDateTime::now_utc() - Duration::days(days)));
+        }
+    }
     // Otherwise a relative duration, resolved against now.
     if let Some(secs) = parse_duration_secs(value) {
         return Ok(Some(OffsetDateTime::now_utc() - Duration::seconds(secs)));
     }
     bail!(
         "{what} '{value}' is not a valid cutoff: use an RFC 3339 timestamp \
-         (e.g. 2026-01-01T00:00:00Z), a friendly duration (e.g. \"30 days\", \"24 hours\", \
-         \"1 week\"), or an ISO 8601 duration (e.g. P30D, PT24H). Calendar months and years \
-         are not allowed."
+         (e.g. 2026-01-01T00:00:00Z), a bare date (e.g. 2008-12-03), a number of days ago \
+         (e.g. 7), a friendly duration (e.g. \"30 days\", \"24 hours\", \"1 week\"), or an \
+         ISO 8601 duration (e.g. P30D, PT24H). Calendar months and years are not allowed."
     );
+}
+
+/// A bare calendar date `YYYY-MM-DD` → that day at 00:00:00 UTC.
+fn parse_bare_date(value: &str) -> Option<OffsetDateTime> {
+    let fmt = time::macros::format_description!("[year]-[month]-[day]");
+    time::Date::parse(value, fmt)
+        .ok()
+        .map(|d| d.midnight().assume_utc())
+}
+
+/// Parse a Python floor like `3.10` (or bare `3`) into `(major, minor)`.
+/// Components past the first two are ignored (`3.10.2` → `(3, 10)`).
+pub(crate) fn parse_min_python(value: Option<&str>) -> Result<Option<(u32, u32)>> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let invalid = || anyhow!("min-python '{value}' is not a version like 3.10");
+    let mut parts = value.split('.');
+    let major = parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .ok_or_else(invalid)?;
+    let minor = match parts.next() {
+        Some(p) => p.parse::<u32>().map_err(|_| invalid())?,
+        None => 0,
+    };
+    Ok(Some((major, minor)))
 }
 
 /// Total seconds in a duration string — friendly (`30 days`) or ISO 8601
@@ -590,6 +671,12 @@ fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
             .as_bytes(),
     );
     h.update([0x1e]);
+    h.update([u8::from(f.exclude_dev), u8::from(f.exclude_windows)]);
+    if let Some((maj, min)) = f.min_python {
+        h.update(maj.to_le_bytes());
+        h.update(min.to_le_bytes());
+    }
+    h.update([0x1d]);
     if let Some(s) = &spec.specifiers {
         h.update(s.to_string().as_bytes());
     }
@@ -706,6 +793,180 @@ async fn save_cursors(client: &Client, resolved: &Resolved, cursors: &Cursors) {
     }
 }
 
+/// Live throughput meter for a sync run — a tqdm-style one-liner on stderr with
+/// rate and ETA. Counters are atomic so the background ticker can read them while
+/// the package/file fan-out updates them.
+struct Progress {
+    start: Instant,
+    pkgs_total: usize,
+    pkgs_done: AtomicUsize,
+    files_done: AtomicU64,
+    bytes_done: AtomicU64,
+    bytes_seen: AtomicU64,
+    skipped: AtomicU64,
+    errors: AtomicU64,
+    /// Signalled when the run is over so the ticker stops immediately instead of
+    /// sleeping out its interval.
+    done: tokio::sync::Notify,
+}
+
+impl Progress {
+    fn new(pkgs_total: usize) -> Self {
+        Self {
+            start: Instant::now(),
+            pkgs_total,
+            pkgs_done: AtomicUsize::new(0),
+            files_done: AtomicU64::new(0),
+            bytes_done: AtomicU64::new(0),
+            bytes_seen: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            done: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Files newly selected to upload for a package (and the bytes they'll move),
+    /// fed into the ETA's total-size extrapolation.
+    fn discover(&self, bytes: u64) {
+        self.bytes_seen.fetch_add(bytes, Ordering::Relaxed);
+    }
+    fn skip(&self, n: u64) {
+        self.skipped.fetch_add(n, Ordering::Relaxed);
+    }
+    fn file_done(&self, bytes: u64) {
+        self.files_done.fetch_add(1, Ordering::Relaxed);
+        self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
+    }
+    fn file_err(&self) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+    }
+    fn package_done(&self) {
+        self.pkgs_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The live status line; `final_` swaps the running prefix for a summary.
+    fn render(&self, final_: bool) -> String {
+        let el = self.start.elapsed().as_secs_f64();
+        let pkgs_done = self.pkgs_done.load(Ordering::Relaxed);
+        let files_done = self.files_done.load(Ordering::Relaxed);
+        let bytes_done = self.bytes_done.load(Ordering::Relaxed);
+        let bytes_seen = self.bytes_seen.load(Ordering::Relaxed);
+        let skipped = self.skipped.load(Ordering::Relaxed);
+        let errors = self.errors.load(Ordering::Relaxed);
+        let rate = if el > 0.0 {
+            bytes_done as f64 / el
+        } else {
+            0.0
+        };
+
+        if final_ {
+            return format!(
+                "sync done: {pkgs_done}/{} pkgs · {} files · {} in {} (avg {}/s) · {skipped} already present · {errors} errors",
+                self.pkgs_total,
+                fmt_count(files_done),
+                human_bytes(bytes_done),
+                human_dur(el),
+                human_bytes(rate as u64),
+            );
+        }
+
+        let pct = if self.pkgs_total > 0 {
+            100.0 * pkgs_done as f64 / self.pkgs_total as f64
+        } else {
+            0.0
+        };
+        // Extrapolate the run's total bytes from the fraction of packages done,
+        // then divide the remaining bytes by the current rate. Unknown until at
+        // least one package has finished and some bytes have moved.
+        let eta = if pkgs_done > 0 && bytes_done > 0 {
+            let est_total = bytes_seen as f64 * self.pkgs_total as f64 / pkgs_done as f64;
+            let remaining = (est_total - bytes_done as f64).max(0.0);
+            format!(", ~{} left", human_dur(remaining / rate))
+        } else {
+            String::new()
+        };
+        format!(
+            "sync {pkgs_done}/{} pkgs {pct:.0}% · {} files {} · {}/s {:.1} f/s · {} elapsed{eta} · {errors} err",
+            self.pkgs_total,
+            fmt_count(files_done),
+            human_bytes(bytes_done),
+            human_bytes(rate as u64),
+            if el > 0.0 { files_done as f64 / el } else { 0.0 },
+            human_dur(el),
+        )
+    }
+}
+
+/// Spawn the background ticker. On a TTY it overwrites one line each second; when
+/// stderr is redirected (a log file) it prints a fresh line every 30s instead.
+fn spawn_progress(progress: Arc<Progress>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let tty = std::io::stderr().is_terminal();
+        let interval = std::time::Duration::from_secs(if tty { 1 } else { 30 });
+        loop {
+            // Wake on the interval or the instant the run finishes — whichever
+            // comes first — so a fast run isn't padded out to a full interval.
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = progress.done.notified() => break,
+            }
+            if tty {
+                eprint!("\r\x1b[2K{}", progress.render(false));
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            } else {
+                eprintln!("{}", progress.render(false));
+            }
+        }
+        if tty {
+            // Leave the carriage at column 0 so the summary prints on its own line.
+            eprintln!();
+        }
+    })
+}
+
+/// SI byte sizes (kB = 1000), matching how PyPI/uv report mirror sizes.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "kB", "MB", "GB", "TB", "PB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1000.0 && i < UNITS.len() - 1 {
+        v /= 1000.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+/// Compact elapsed/ETA: `6h12m`, `12m04s`, `9s`.
+fn human_dur(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{sec:02}s")
+    } else {
+        format!("{sec}s")
+    }
+}
+
+/// Integer with thousands separators: `353417` → `353,417`.
+fn fmt_count(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
 pub async fn run_sync(args: SyncArgs) -> Result<()> {
     let cfg = config::load(args.config.as_deref())?.sync;
     let resolved = Resolved::merge(&args, cfg).await?;
@@ -715,9 +976,13 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
         // Bound the handshake and any mid-stream stall so a dead/dribbling
         // upstream fails a sync task cleanly (the retry loop absorbs it) instead
         // of hanging forever. read_timeout is per-read and resets on each chunk,
-        // so it never bounds a large artifact that keeps streaming.
+        // so it never bounds a large artifact that keeps streaming. The 300 s (vs
+        // a tighter handshake) covers the *quiet* wait after a multi-GB upload is
+        // sent, while the destination hashes it and PUTs it to object storage
+        // before answering — at 30 s a 2–3 GB wheel (torch, the nvidia-cu* CUDA
+        // libs, tensorflow) timed the client out mid-write and never persisted.
         .connect_timeout(std::time::Duration::from_secs(10))
-        .read_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(300))
         .build()?;
 
     let endpoint = normalize_legacy_endpoint(&resolved.dst_base);
@@ -735,14 +1000,24 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
     // Packages in parallel (chunked join_all — same pattern as the worker
     // sweep), files within each package in parallel below. The long tail of a
     // mirror is small packages, so serial-per-package was the throughput cap.
+    let progress = Arc::new(Progress::new(resolved.specs.len()));
+    let ticker = (!args.no_progress).then(|| spawn_progress(progress.clone()));
     let mut failures = 0usize;
     let mut refreshed: Cursors = Cursors::new();
     for chunk in resolved.specs.chunks(resolved.package_concurrency) {
         let results = futures::future::join_all(chunk.iter().map(|spec| {
-            sync_one_package(&client, &resolved, &endpoint, spec, cursors.get(&spec.name))
+            sync_one_package(
+                &client,
+                &resolved,
+                &endpoint,
+                spec,
+                cursors.get(&spec.name),
+                &progress,
+            )
         }))
         .await;
         for (spec, result) in chunk.iter().zip(results) {
+            progress.package_done();
             match result {
                 Ok(outcome) => {
                     if let Some(entry) = outcome.new_cursor {
@@ -764,6 +1039,13 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
     merged.extend(refreshed);
     save_cursors(&client, &resolved, &merged).await;
 
+    // Stop the ticker, then print the always-on summary on its own line.
+    progress.done.notify_one();
+    if let Some(ticker) = ticker {
+        let _ = ticker.await;
+    }
+    eprintln!("{}", progress.render(true));
+
     if failures > 0 {
         bail!("{failures} package(s) failed to sync");
     }
@@ -784,6 +1066,7 @@ async fn sync_one_package(
     endpoint: &str,
     spec: &PackageSpec,
     prev_cursor: Option<&CursorEntry>,
+    progress: &Progress,
 ) -> Result<PackageOutcome> {
     let pkg = spec.name.as_str();
 
@@ -812,7 +1095,7 @@ async fn sync_one_package(
             .await?
         {
             IndexFetch::NotModified => {
-                info!("{pkg}: upstream unchanged since last sync (304)");
+                debug!("{pkg}: upstream unchanged since last sync (304)");
                 return Ok(PackageOutcome { new_cursor: None });
             }
             IndexFetch::NotFound => bail!("Package not found on source: {pkg}"),
@@ -860,13 +1143,16 @@ async fn sync_one_package(
         (to_upload, already_present)
     };
 
+    let sel_bytes: u64 = selected.iter().map(|s| s.file.size.unwrap_or(0)).sum();
+    progress.discover(sel_bytes);
+    progress.skip(already_present as u64);
     if already_present > 0 {
-        info!(
+        debug!(
             "Syncing {pkg} ({} new, {already_present} already mirrored)",
             selected.len()
         );
     } else {
-        info!("Syncing {pkg} ({} matching files selected)", selected.len());
+        debug!("Syncing {pkg} ({} matching files selected)", selected.len());
     }
 
     if resolved.dry_run {
@@ -877,7 +1163,14 @@ async fn sync_one_package(
     }
 
     let results: Vec<Result<bool>> = stream::iter(selected)
-        .map(|s| async move { upload_via_http(client, resolved, endpoint, pkg, &s).await })
+        .map(|s| async move {
+            let r = upload_via_http(client, resolved, endpoint, pkg, &s).await;
+            match &r {
+                Ok(_) => progress.file_done(s.file.size.unwrap_or(0)),
+                Err(_) => progress.file_err(),
+            }
+            r
+        })
         .buffer_unordered(resolved.concurrency)
         .collect()
         .await;
@@ -1154,7 +1447,7 @@ fn select_from_index(
         selected.push(Selected { version, file });
     }
     if selected.is_empty() {
-        warn!("No matching files for package '{}'", spec.name);
+        debug!("No matching files for package '{}'", spec.name);
     }
     (selected, upstream_status, upstream_files)
 }
@@ -1282,7 +1575,7 @@ async fn upload_via_http(
     // Held until after the POST below: dropping the spool deletes its temp file.
     let spool = download_verified(client, &s.file, &resolved.spool_dir).await?;
 
-    info!("  - uploading {}", s.file.filename);
+    debug!("  - uploading {}", s.file.filename);
     // Stream the spool file into the multipart body instead of re-buffering it
     // in RAM (the artifact already lives on disk from the download).
     let file = fs::File::open(spool.path.path())
@@ -1362,6 +1655,17 @@ pub(crate) fn matches_filters(file: &SimpleFile, f: &ResolvedFilter) -> bool {
         return false;
     }
 
+    // Dev releases (`.devN`) gate every file — sdists too. The version isn't in
+    // the Simple API, so it's inferred from the filename; a file whose version
+    // can't be parsed is kept (we can't prove it's a dev release).
+    if f.exclude_dev {
+        if let Some(v) = infer_version_from_filename(&file.filename) {
+            if is_dev_version(&v) {
+                return false;
+            }
+        }
+    }
+
     // Upload-time bounds. With a bound set, a file without a parseable
     // timestamp is excluded — same rule uv applies to --exclude-newer.
     if f.exclude_newer.is_some() || f.exclude_older.is_some() {
@@ -1387,6 +1691,11 @@ pub(crate) fn matches_filters(file: &SimpleFile, f: &ResolvedFilter) -> bool {
         !(f.python_tag.is_empty() && f.abi_tag.is_empty() && f.platform_tag.is_empty());
 
     if !is_wheel {
+        // A non-wheel can still be a Windows installer (.exe/.msi/.winXX) — those
+        // carry no wheel tags, so platform exclusion can't reach them.
+        if f.exclude_windows && is_windows_installer_filename(&fname) {
+            return false;
+        }
         return !has_inclusion_filters;
     }
 
@@ -1399,10 +1708,18 @@ pub(crate) fn matches_filters(file: &SimpleFile, f: &ResolvedFilter) -> bool {
     };
 
     // Exclusions first
+    if f.exclude_windows && is_windows_wheel_platform(&tags) {
+        return false;
+    }
     if !f.exclude_platform_tag.is_empty()
         && tokens_match_any(&tags.platform, &f.exclude_platform_tag)
     {
         return false;
+    }
+    if let Some(floor) = f.min_python {
+        if !wheel_reaches_min_python(&tags, floor) {
+            return false;
+        }
     }
 
     if !f.python_tag.is_empty() && !tokens_match_any(&tags.python, &f.python_tag) {
@@ -1456,6 +1773,80 @@ fn glob_like_contains(haystack: &str, pattern: &str) -> bool {
         }
     }
     true
+}
+
+/// True if a wheel's platform tags are Windows. Wheel platform tags are a fixed
+/// vocabulary (any / manylinux* / musllinux* / macosx* / win*), so a `win`
+/// prefix is unambiguous here — unlike a raw filename, where a package name can
+/// start with "win" (windrose, winnow).
+fn is_windows_wheel_platform(tags: &WheelTags) -> bool {
+    tags.platform
+        .iter()
+        .any(|p| p.to_ascii_lowercase().starts_with("win"))
+}
+
+/// True if a non-wheel filename is a Windows installer: `.exe`/`.msi` (always
+/// Windows) or a legacy `.winXX` platform segment (`.win32`, `.win-amd64`,
+/// `.win_amd64`, …). The leading dot anchors the marker to a platform component,
+/// so an sdist whose name merely starts with "win" is never matched. `fname`
+/// must already be lowercased.
+fn is_windows_installer_filename(fname: &str) -> bool {
+    const MARKERS: [&str; 8] = [
+        ".win32",
+        ".win64",
+        ".win-amd64",
+        ".win_amd64",
+        ".win-arm64",
+        ".win_arm64",
+        ".win-ia64",
+        ".win_ia64",
+    ];
+    fname.ends_with(".exe") || fname.ends_with(".msi") || MARKERS.iter().any(|m| fname.contains(m))
+}
+
+/// True if `version` (a PEP 440 string) is a dev release — i.e. its canonical
+/// form carries a `.devN` segment. Canonicalizing first normalizes the handful
+/// of legacy spellings (`1.0dev1`, `1.0-dev1`); an unparseable version falls
+/// back to a substring check.
+fn is_dev_version(version: &str) -> bool {
+    let canon = Version::from_str(version)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| version.to_string());
+    canon.to_ascii_lowercase().contains(".dev")
+}
+
+/// The interpreter version a PEP 427 python tag pins to: strip the leading
+/// interpreter letters (cp/py/pp/…), then read the leading digit run as a
+/// major plus optional minor. `cp39` → `(3, Some(9))`, `cp310` → `(3, Some(10))`,
+/// `py3` → `(3, None)`, `cp313t` → `(3, Some(13))`. `None` when there's no
+/// version (e.g. an unrecognized tag).
+fn interp_tag_version(tag: &str) -> Option<(u32, Option<u32>)> {
+    let after = tag.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    let mut chars = digits.chars();
+    let major = chars.next()?.to_digit(10)?;
+    let rest: String = chars.collect();
+    let minor = if rest.is_empty() {
+        None
+    } else {
+        rest.parse::<u32>().ok()
+    };
+    Some((major, minor))
+}
+
+/// Whether a wheel's tags reach a minimum Python `(major, minor)`. A wheel
+/// passes if any of its python tags targets a Python at or above the floor: a
+/// version-agnostic tag (`py3`/`cp3`) covers its whole major line, an `abi3`
+/// wheel is forward-compatible from its tagged minor onward, and an exact tag
+/// (`cp39`) must itself be ≥ the floor. Unrecognized tags are kept.
+fn wheel_reaches_min_python(tags: &WheelTags, floor: (u32, u32)) -> bool {
+    let (fmaj, fmin) = floor;
+    let abi3 = tags.abi.iter().any(|a| a.eq_ignore_ascii_case("abi3"));
+    tags.python.iter().any(|t| match interp_tag_version(t) {
+        None => true,
+        Some((major, None)) => major >= fmaj,
+        Some((major, Some(minor))) => (abi3 && major >= fmaj) || (major, minor) >= (fmaj, fmin),
+    })
 }
 
 /// A schemeless `--to` (e.g. `127.0.0.1:8000/simple/`) is a relative URL, which
@@ -1534,8 +1925,7 @@ mod tests {
         }
     }
 
-    fn time_filter(newer: Option<&str>, older: Option<&str>) -> ResolvedFilter {
-        let parse = |v: Option<&str>| v.map(|s| OffsetDateTime::parse(s, &Rfc3339).unwrap());
+    fn base_filter() -> ResolvedFilter {
         ResolvedFilter {
             only_wheels: false,
             only_sdists: false,
@@ -1543,8 +1933,27 @@ mod tests {
             abi_tag: vec![],
             platform_tag: vec![],
             exclude_platform_tag: vec![],
+            exclude_newer: None,
+            exclude_older: None,
+            min_python: None,
+            exclude_dev: false,
+            exclude_windows: false,
+        }
+    }
+
+    fn named_file(filename: &str) -> SimpleFile {
+        SimpleFile {
+            filename: filename.into(),
+            ..simple_file(None)
+        }
+    }
+
+    fn time_filter(newer: Option<&str>, older: Option<&str>) -> ResolvedFilter {
+        let parse = |v: Option<&str>| v.map(|s| OffsetDateTime::parse(s, &Rfc3339).unwrap());
+        ResolvedFilter {
             exclude_newer: parse(newer),
             exclude_older: parse(older),
+            ..base_filter()
         }
     }
 
@@ -1565,6 +1974,154 @@ mod tests {
 
         let unbounded = time_filter(None, None);
         assert!(matches_filters(&unknown, &unbounded));
+    }
+
+    #[test]
+    fn min_python_drops_old_wheels_keeps_modern_and_sdists() {
+        let f = ResolvedFilter {
+            min_python: Some((3, 10)),
+            ..base_filter()
+        };
+
+        // Version-pinned wheels for Python ≤ 3.9 (and Python 2) are dropped.
+        assert!(!matches_filters(
+            &named_file("foo-1.0-cp39-cp39-manylinux2014_x86_64.whl"),
+            &f
+        ));
+        assert!(!matches_filters(
+            &named_file("foo-1.0-cp36-cp36m-win_amd64.whl"),
+            &f
+        ));
+        assert!(!matches_filters(
+            &named_file("foo-1.0-py27-none-any.whl"),
+            &f
+        ));
+        assert!(!matches_filters(
+            &named_file("foo-1.0-pp39-pypy39_pp73-linux_x86_64.whl"),
+            &f
+        ));
+
+        // Modern pinned wheels pass — cp310 must not read as "cp3" + 1.
+        assert!(matches_filters(
+            &named_file("foo-1.0-cp310-cp310-manylinux_2_17_x86_64.whl"),
+            &f
+        ));
+        assert!(matches_filters(
+            &named_file("foo-1.0-cp313-cp313t-manylinux_2_17_x86_64.whl"),
+            &f
+        ));
+
+        // Version-agnostic and abi3 (forward-compatible) wheels are kept.
+        assert!(matches_filters(&named_file("foo-1.0-py3-none-any.whl"), &f));
+        assert!(matches_filters(
+            &named_file("six-1.16.0-py2.py3-none-any.whl"),
+            &f
+        ));
+        assert!(matches_filters(
+            &named_file("foo-1.0-cp37-abi3-manylinux2014_x86_64.whl"),
+            &f
+        ));
+
+        // sdists carry no python tag — the floor never touches them.
+        assert!(matches_filters(&named_file("foo-1.0.tar.gz"), &f));
+    }
+
+    #[test]
+    fn exclude_dev_drops_dev_releases_only() {
+        let f = ResolvedFilter {
+            exclude_dev: true,
+            ..base_filter()
+        };
+        assert!(!matches_filters(
+            &named_file("foo-1.0.dev1-py3-none-any.whl"),
+            &f
+        ));
+        assert!(!matches_filters(&named_file("foo-1.0.dev1.tar.gz"), &f));
+        assert!(!matches_filters(
+            &named_file("foo-1.0.dev0-cp311-cp311-manylinux_2_17_x86_64.whl"),
+            &f
+        ));
+        // Final, pre-release, and post-release versions are kept.
+        assert!(matches_filters(&named_file("foo-1.0-py3-none-any.whl"), &f));
+        assert!(matches_filters(
+            &named_file("foo-1.0rc1-py3-none-any.whl"),
+            &f
+        ));
+        assert!(matches_filters(&named_file("foo-1.0.post1.tar.gz"), &f));
+    }
+
+    #[test]
+    fn exclude_windows_drops_win_wheels_and_installers_only() {
+        let f = ResolvedFilter {
+            exclude_windows: true,
+            ..base_filter()
+        };
+        // Windows wheels (any win* platform tag).
+        assert!(!matches_filters(
+            &named_file("foo-1.0-cp311-cp311-win_amd64.whl"),
+            &f
+        ));
+        assert!(!matches_filters(
+            &named_file("foo-1.0-cp311-cp311-win32.whl"),
+            &f
+        ));
+        assert!(!matches_filters(
+            &named_file("foo-1.0-cp311-cp311-win_arm64.whl"),
+            &f
+        ));
+        // Legacy Windows installers carry no wheel tag.
+        assert!(!matches_filters(&named_file("Foo-1.0.win32-py2.7.exe"), &f));
+        assert!(!matches_filters(&named_file("Foo-1.0.win-amd64.msi"), &f));
+        assert!(!matches_filters(
+            &named_file("Foo-1.0-cp27-none-win_amd64.msi"),
+            &f
+        ));
+
+        // Non-Windows wheels and sdists are kept — including packages whose name
+        // merely starts with "win" (the raw-filename foot-gun).
+        assert!(matches_filters(
+            &named_file("foo-1.0-cp311-cp311-manylinux_2_17_x86_64.whl"),
+            &f
+        ));
+        assert!(matches_filters(
+            &named_file("foo-1.0-cp311-cp311-macosx_11_0_arm64.whl"),
+            &f
+        ));
+        assert!(matches_filters(&named_file("foo-1.0-py3-none-any.whl"), &f));
+        assert!(matches_filters(&named_file("windrose-1.9.2.tar.gz"), &f));
+        assert!(matches_filters(&named_file("winnow-0.1.0.tar.gz"), &f));
+    }
+
+    #[test]
+    fn interp_tag_version_parses_real_tags() {
+        assert_eq!(interp_tag_version("cp39"), Some((3, Some(9))));
+        assert_eq!(interp_tag_version("cp310"), Some((3, Some(10))));
+        assert_eq!(interp_tag_version("cp313t"), Some((3, Some(13))));
+        assert_eq!(interp_tag_version("py3"), Some((3, None)));
+        assert_eq!(interp_tag_version("py27"), Some((2, Some(7))));
+        assert_eq!(interp_tag_version("pp39"), Some((3, Some(9))));
+        assert_eq!(interp_tag_version("none"), None);
+        assert_eq!(interp_tag_version("any"), None);
+    }
+
+    #[test]
+    fn is_dev_version_detects_dev_spellings() {
+        assert!(is_dev_version("1.0.dev1"));
+        assert!(is_dev_version("1.0dev0")); // canonicalizes to 1.0.dev0
+        assert!(is_dev_version("2.0a1.dev3"));
+        assert!(!is_dev_version("1.0"));
+        assert!(!is_dev_version("1.0rc1"));
+        assert!(!is_dev_version("1.0.post1"));
+    }
+
+    #[test]
+    fn parse_min_python_parses_versions() {
+        assert_eq!(parse_min_python(None).unwrap(), None);
+        assert_eq!(parse_min_python(Some("  ")).unwrap(), None);
+        assert_eq!(parse_min_python(Some("3.10")).unwrap(), Some((3, 10)));
+        assert_eq!(parse_min_python(Some("3")).unwrap(), Some((3, 0)));
+        assert_eq!(parse_min_python(Some("3.10.2")).unwrap(), Some((3, 10)));
+        assert!(parse_min_python(Some("three.ten")).is_err());
     }
 
     fn cutoff(value: &str) -> Result<Option<OffsetDateTime>> {
@@ -1610,6 +2167,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_cutoff_accepts_bare_date_and_day_count() {
+        // A bare calendar date is that day at 00:00:00 UTC.
+        assert_eq!(
+            cutoff("2008-12-03").unwrap().unwrap(),
+            OffsetDateTime::parse("2008-12-03T00:00:00Z", &Rfc3339).unwrap()
+        );
+        // A bare integer is that many days ago (so `--exclude-newer 7` works).
+        for (input, days) in [("7", 7), ("30", 30), ("0", 0)] {
+            let before = OffsetDateTime::now_utc();
+            let got = cutoff(input).unwrap().unwrap();
+            let after = OffsetDateTime::now_utc();
+            let slack = Duration::seconds(5);
+            assert!(
+                got >= before - Duration::days(days) - slack
+                    && got <= after - Duration::days(days) + slack,
+                "{input} resolved to {got}, expected ~{days}d ago"
+            );
+        }
+    }
+
+    #[test]
     fn parse_cutoff_rejects_calendar_units_and_garbage() {
         // Calendar months/years have no fixed length — rejected in both forms.
         for bad in [
@@ -1617,12 +2195,11 @@ mod tests {
         ] {
             assert!(cutoff(bad).is_err(), "{bad} must be rejected");
         }
-        // Not durations or timestamps at all.
+        // Not durations, dates, day-counts, or timestamps at all.
         for bad in [
             "tomorrow",
-            "2020-01-01",
-            "5",
-            "30",
+            "2020-13-01", // month 13 isn't a date
+            "-5",         // a negative day count is nonsense
             "PT",
             "P",
             "1.5 hours",

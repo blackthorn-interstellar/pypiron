@@ -1,0 +1,91 @@
+site_name: pypiron
+site_description: An ultra-fast Python package server, written in Rust.
+site_author: pypiron contributors
+site_url: https://brycedrennan.github.io/pypiron/
+copyright: Copyright &copy; pypiron contributors
+
+repo_url: https://github.com/brycedrennan/pypiron
+repo_name: brycedrennan/pypiron
+edit_uri: edit/master/docs/
+
+theme:
+  name: material
+  logo: assets/pypiron-logo-256.png
+  favicon: assets/pypiron-logo-256.png
+  features:
+    - navigation.sections
+    - navigation.tracking
+    - navigation.top
+    - navigation.footer
+    - navigation.indexes
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - toc.follow
+    - search.suggest
+    - search.highlight
+  palette:
+    # Iron & rust, matching the server's own scheme (src/web.rs PAGE_CSS).
+    - media: "(prefers-color-scheme: light)"
+      scheme: pypiron-light
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: pypiron-dark
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+extra_css:
+  - stylesheets/pypiron.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.magiclink
+  - pymdownx.keys
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/installation.md
+      - First steps: getting-started/first-steps.md
+  - Guides:
+      - Host private packages: guides/private-packages.md
+      - Private + public in one index: guides/private-and-public.md
+      - Air-gapped mirror: guides/air-gapped-mirror.md
+      - Production deployment: guides/production.md
+  - Concepts:
+      - How it works: concepts/how-it-works.md
+      - Storage backends: concepts/storage.md
+      - Authentication: concepts/authentication.md
+      - Mirroring & proxying: concepts/mirroring.md
+      - Supply-chain defense: concepts/supply-chain.md
+      - Artifact delivery: concepts/artifact-delivery.md
+      - Download statistics: concepts/download-stats.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Configuration: reference/configuration.md
+      - Management API: reference/api.md
+      - Client compatibility: reference/compatibility.md
+      - Standards support: reference/standards.md
+      - Benchmarks: reference/benchmarks.md

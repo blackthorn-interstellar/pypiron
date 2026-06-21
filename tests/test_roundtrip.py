@@ -2,7 +2,7 @@
 
 Runs against the emulator-backed backends: disk (tmpdir), S3 (MinIO), and Azure
 Blob (Azurite) — the cloud ones in Docker. GCS shares the same object_store code
-path but has no faithful local emulator (see docs/TESTING.md).
+path but has no faithful local emulator (see dev/TESTING.md).
 """
 
 from __future__ import annotations

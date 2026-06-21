@@ -1,0 +1,75 @@
+/* pypiron docs palette — iron & rust, lifted from the server's own scheme
+   (the :root / dark tokens at the top of PAGE_CSS in src/web.rs). Warm
+   rust-orange accent on warm steel/charcoal neutrals. */
+
+[data-md-color-scheme="pypiron-light"] {
+  --md-primary-fg-color: #bf5a2e;
+  --md-primary-fg-color--light: #d07347;
+  --md-primary-fg-color--dark: #a04a24;
+  --md-primary-bg-color: #ffffff;
+  --md-primary-bg-color--light: #fff7f2;
+
+  --md-accent-fg-color: #a04a24;
+  --md-accent-fg-color--transparent: rgba(191, 90, 46, 0.1);
+
+  --md-default-bg-color: #faf7f4;
+  --md-default-fg-color: #211b17;
+  --md-default-fg-color--light: #7c7269;
+  --md-default-fg-color--lighter: #a99e93;
+  --md-default-fg-color--lightest: #ece2d8;
+
+  --md-typeset-a-color: #bf5a2e;
+  --md-code-bg-color: #f3ece4;
+  --md-code-fg-color: #211b17;
+
+  --md-footer-bg-color: #efe7df;
+  --md-footer-bg-color--dark: #e7ddd3;
+  --md-footer-fg-color: #211b17;
+  --md-footer-fg-color--light: #7c7269;
+  --md-footer-fg-color--lighter: #a99e93;
+}
+
+[data-md-color-scheme="pypiron-dark"] {
+  color-scheme: dark;
+
+  --md-primary-fg-color: #1f1813;
+  --md-primary-fg-color--light: #2c241d;
+  --md-primary-fg-color--dark: #15110e;
+  --md-primary-bg-color: #ece5dd;
+  --md-primary-bg-color--light: #a59a8f;
+
+  --md-accent-fg-color: #ef9460;
+  --md-accent-fg-color--transparent: rgba(224, 123, 69, 0.1);
+
+  --md-default-bg-color: #15110e;
+  --md-default-fg-color: #ece5dd;
+  --md-default-fg-color--light: #a59a8f;
+  --md-default-fg-color--lighter: #7c7269;
+  --md-default-fg-color--lightest: #352c24;
+
+  --md-typeset-a-color: #e07b45;
+  --md-code-bg-color: #1f1813;
+  --md-code-fg-color: #ece5dd;
+
+  --md-footer-bg-color: #1f1813;
+  --md-footer-bg-color--dark: #15110e;
+  --md-footer-fg-color: #ece5dd;
+  --md-footer-fg-color--light: #a59a8f;
+  --md-footer-fg-color--lighter: #7c7269;
+}
+
+/* The logo is a rusted-iron block on transparency; give it a hair of room. */
+.md-header__button.md-logo img {
+  height: 1.6rem;
+  width: auto;
+}
+
+/* Tighter, warmer code blocks to echo the server's cards. */
+[data-md-color-scheme="pypiron-light"] .md-typeset pre > code {
+  border: 1px solid #e7ddd3;
+  border-radius: 8px;
+}
+[data-md-color-scheme="pypiron-dark"] .md-typeset pre > code {
+  border: 1px solid #352c24;
+  border-radius: 8px;
+}

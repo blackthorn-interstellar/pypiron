@@ -1,6 +1,6 @@
 """Milestone 1: write-time metadata sidecars (<filename>.meta.json).
 
-The storage layout is the contract (DESIGN.md), so asserting sidecar files on
+The storage layout is the contract (dev/DESIGN.md), so asserting sidecar files on
 the disk backend is blackbox testing of that contract.
 """
 

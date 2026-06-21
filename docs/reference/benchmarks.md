@@ -1,0 +1,48 @@
+# Benchmarks
+
+pypiron is 4–60× faster than other PyPI servers at sustained install throughput.
+
+![Max sustained install throughput](../assets/install-throughput.svg)
+
+## Headline
+
+A six-way comparison of max sustained real-install throughput, every server in
+its best cloud-backed config, on one small AWS box. `oha` replays the install
+mix (index + wheel URLs in install proportions) and follows the 302 to download
+wheel bytes from S3, so the entire path is exercised.
+
+| Rank | Server | Config | Installs/s |
+|---|---|---|---|
+| 1 | **pypiron** | S3 + presigned redirect (Rust) | **1,022** |
+| 2 | bandersnatch | full static mirror via nginx | 512 |
+| 3 | pypiserver | gunicorn + cached-dir | 85 |
+| 4 | pypicloud | S3 + DynamoDB (uwsgi) | 47 |
+| 5 | devpi | devpi + nginx | 35 |
+| 6 | proxpi | flask caching proxy | 32 |
+
+pypiron is the only server still rig-limited, not server-limited, at this rate
+(its node sat at 43% CPU). With a larger load fleet its own ceiling is ~2,000
+installs/s on 2 vCPU, scaling roughly linearly with cores.
+
+!!! note
+    bandersnatch serves every wheel byte through its own NIC and saturates the
+    network with CPU to spare. pypiron's presigned redirect offloads bytes to
+    object storage, so its node carries only index responses and 302s and scales
+    to its CPU instead. See [Artifact delivery](../concepts/artifact-delivery.md).
+
+## Methodology
+
+The comparison is honest by construction. Each competitor runs in its own
+documented production topology (right app server, worker count, and the
+nginx/DB sidecars it architecturally needs) — no tool gets a response or edge
+cache another lacks. Egress is blocked on every ranking run, so any cache miss
+or upstream fallback fails loudly instead of being served by a CDN. Every server
+is seeded with the same frozen, hash-pinned set of ~100 real projects' wheels,
+and the clients fire byte-identical `uv` requests at each.
+
+## Full results
+
+Methodology, raw numbers, and the AWS rig provenance live in the repo:
+
+- [Benchmark plan](https://github.com/brycedrennan/pypiron/blob/master/dev/BENCHMARK_INSTALL.md)
+- [Benchmark results](https://github.com/brycedrennan/pypiron/blob/master/dev/BENCHMARK_RESULTS.md)

@@ -4,7 +4,7 @@
 #
 # The loadgen runs uv against the server-under-test on the `bench` network. That
 # network is `internal: true` by default (no egress) so any cache miss / fallback
-# redirect fails loudly during measured runs (see docs/BENCHMARK_INSTALL.md §0).
+# redirect fails loudly during measured runs (see dev/BENCHMARK_INSTALL.md §0).
 # Proxy/mirror servers that need to warm from pypi.org are temporarily attached
 # to a separate egress network by the orchestrator (bench.py).
 #

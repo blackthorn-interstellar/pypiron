@@ -49,3 +49,6 @@ bench/install/compose/bandersnatch.gen.conf
 bench/install/compose/pypicloud-config-dynamo.gen.ini
 # Transient README backup from `make build-wheel`'s transform/restore
 /README.md.orig
+
+# mkdocs build output (regenerable; published via CI)
+/site/

@@ -79,7 +79,7 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - name: Sync dev dependencies
         run: uv sync
-      # The product's center of gravity is the blackbox suite (docs/TESTING.md):
+      # The product's center of gravity is the blackbox suite (dev/TESTING.md):
       # the real binary driven over HTTP by real uv/pip clients. S3/MinIO tests
       # skip without Docker; the multi-client compat matrix (poetry/pdm/flit/
       # hatch via uvx) stays a local `make compat` concern, not a merge gate.

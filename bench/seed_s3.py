@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 3 corpus seeder: write the storage layout directly to S3.
 
-The layout is the schema (docs/DESIGN.md), so seeding bypasses the server:
+The layout is the schema (dev/DESIGN.md), so seeding bypasses the server:
 artifact + .meta.json sidecar + .metadata + .origin per package, then a
 _dirty/<pkg> marker so the server's worker materializes the indexes.
 

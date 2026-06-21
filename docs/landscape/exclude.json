@@ -1,4 +1,0 @@
-{
-  "$comment": "Product ids listed here are hidden by default in LANDSCAPE.html (non-serious contenders). The HTML 'Show non-contenders' toggle reveals them. Hone by adding ids here (use the HTML 'Copy hidden IDs' button), then recompile.",
-  "hidden_by_default": []
-}

@@ -1,4 +1,4 @@
-.PHONY: init init-rust init-python build dev run test test-rust test-python perf compat check cargo-check af fmt lint clean doc build-wheel fuzz fuzz-build help
+.PHONY: init init-rust init-python build dev run test test-rust test-python perf compat check cargo-check af fmt lint clean doc docs docs-serve build-wheel fuzz fuzz-build help
 
 SHELL := /bin/bash
 
@@ -60,8 +60,14 @@ lint:  ## Run clippy and ruff lints
 clean:  ## Clean build artifacts
 	cargo clean
 
-doc:  ## Generate documentation
+doc:  ## Generate Rust API documentation
 	cargo doc --no-deps
+
+docs:  ## Build the user-facing docs site (mkdocs, strict)
+	uv run --group docs -- mkdocs build --strict
+
+docs-serve:  ## Live-preview the docs site at http://127.0.0.1:8000
+	uv run --group docs -- mkdocs serve
 
 build-wheel:  ## Build Python wheel (local smoke-testing; releases happen in CI via git tag)
 	# Same as CI: rewrite the README's relative links/logo to absolute URLs so the

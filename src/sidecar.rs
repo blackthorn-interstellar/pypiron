@@ -1,6 +1,6 @@
 //! Metadata sidecars: `<filename>.meta.json` next to each artifact.
 //!
-//! The sidecar schema is part of the storage contract (DESIGN.md). Everything
+//! The sidecar schema is part of the storage contract (dev/DESIGN.md). Everything
 //! is captured at write time so rebuilds never hash artifacts or infer names.
 
 use serde::{Deserialize, Serialize};

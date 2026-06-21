@@ -29,6 +29,13 @@ use crate::sidecar::Yanked;
 /// requests. The full-resolution asset stays in `docs/`.
 const LOGO_PNG: &[u8] = include_bytes!("../assets/pypiron-logo-128.png");
 
+/// Multi-size favicon (16/32/48) carved from the logo, embedded so the browser's
+/// automatic `/favicon.ico` request is answered from memory (and never 404s into
+/// the fallback log). Regenerate from the square original with:
+/// `magick dev/pypiron-logo-orig.png -background none \
+///   -define icon:auto-resize=48,32,16 assets/favicon.ico`
+pub const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
+
 /// The logo as a `data:` URI, base64-encoded once on first use.
 fn logo_data_uri() -> &'static str {
     static URI: OnceLock<String> = OnceLock::new();
@@ -277,6 +284,7 @@ fn shell(title: &str, banner: &str, body: &str, copy_js: bool, wide: bool) -> St
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
 <meta name=\"referrer\" content=\"no-referrer\">\
+<link rel=\"icon\" href=\"/favicon.ico\" sizes=\"any\">\
 <title>{title}</title><style>{PAGE_CSS}</style></head><body>{banner}<main{cls}>{body}</main>{js}</body></html>",
         title = encode_text(title),
         cls = if wide { " class=\"wide\"" } else { "" },

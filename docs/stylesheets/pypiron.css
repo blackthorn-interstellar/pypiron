@@ -143,11 +143,28 @@
   border-radius: 8px;
 }
 
-/* Admonitions / details read as warm cards in dark mode (their default tinted
-   background is keyed to the light base). */
+/* Admonitions / details as callout cards. Material's default is a thin
+   all-around border with no shadow, which reads as "unstyled" on our warm
+   palette — turn it into a bold type-colored left bar (the border-color is
+   already per-type: blue note, green tip, …) over a warm surface. */
+.md-typeset .admonition,
+.md-typeset details {
+  border-width: 0 0 0 0.2rem;
+  border-radius: 0.1rem;
+  box-shadow: none;
+}
+[data-md-color-scheme="pypiron-light"] .md-typeset .admonition,
+[data-md-color-scheme="pypiron-light"] .md-typeset details {
+  background-color: #f4ede6;
+}
 [data-md-color-scheme="pypiron-dark"] .md-typeset .admonition,
 [data-md-color-scheme="pypiron-dark"] .md-typeset details {
   background-color: var(--pi-surface);
+}
+/* Give the title bar a touch more presence than the default 10% tint. */
+.md-typeset .admonition-title,
+.md-typeset summary {
+  font-weight: 700;
 }
 
 /* Content images (e.g. the benchmark chart, which carries its own white card):

@@ -604,6 +604,50 @@ impl UpstreamFiles {
     }
 }
 
+/// Verify the destination is reachable and the admin credentials are accepted
+/// before doing any work. One authenticated GET to `/sync/cursors` (admin-gated,
+/// cheap) distinguishes the three ways a run is doomed from the start —
+/// unreachable server, wrong/missing credentials, or a `--to` that isn't a
+/// pypiron — and turns each into a single actionable error instead of letting it
+/// recur once per file.
+async fn preflight(client: &Client, resolved: &Resolved) -> Result<()> {
+    let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
+    let mut req = client.get(&url);
+    if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+        req = req.basic_auth(u, Some(p));
+    }
+    let resp = req.send().await.with_context(|| {
+        format!(
+            "cannot reach sync destination {} — is the server running and the URL correct?",
+            resolved.dst_base
+        )
+    })?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let detail = resp.text().await.unwrap_or_default();
+    let detail = detail.trim();
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => bail!(
+            "sync destination {} rejected the admin credentials [{status}]{}{} \
+             — check --username/--password (or [sync] in the config)",
+            resolved.dst_base,
+            if detail.is_empty() { "" } else { ": " },
+            detail
+        ),
+        reqwest::StatusCode::NOT_FOUND => bail!(
+            "sync destination {} has no /sync/cursors endpoint [404] \
+             — does --to point at a pypiron server?",
+            resolved.dst_base
+        ),
+        _ => bail!(
+            "sync destination {} preflight failed [{status}]",
+            resolved.dst_base
+        ),
+    }
+}
+
 /// Load the cursor memo for this run from the destination's `/sync/cursors`.
 /// `--full` (or any read failure) yields an empty map, which forces
 /// unconditional fetches — the memo only ever speeds a run up, never changes
@@ -668,6 +712,11 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
 
     let endpoint = normalize_legacy_endpoint(&resolved.dst_base);
     info!("mirror-over-HTTP mode: uploading to {endpoint}");
+
+    // Probe the destination once before any per-file work: a dead server or bad
+    // credentials becomes a single clear error here, not the same failure echoed
+    // once per file.
+    preflight(&client, &resolved).await?;
 
     // The conditional-fetch memo from the last run; an empty map (first run,
     // --full, or any read error) simply means every project full-fetches.

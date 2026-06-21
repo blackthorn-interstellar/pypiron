@@ -278,7 +278,10 @@ Transactions, uniqueness constraints, and queries. Mapped to PyPI features:
   database. For private registries, two static basic-auth credentials (an
   uploader and an admin) cover the real roles without one.
 - **Search beyond `/simple/`** — deprecated upstream anyway; skip.
-- **Per-package stats** — don't care.
+- **Per-package download stats** — a best-effort, *lossy* analytic, not a DB
+  feature: counted in memory on the GET path and rolled up to sharded daily
+  files under `_counters/` (see below). A crash can lose recent history; it can
+  never lose correctness, because the counters are never truth.
 
 So the no-DB claim holds for **private registries**, which is the explicitly stated
 target. For a multi-tenant pypi.org clone it wouldn't, and we shouldn't try.
@@ -294,6 +297,7 @@ packages/<pkg>/<filename>.meta.json      # sidecar (see below)
 packages/<pkg>/<filename>.metadata       # PEP 658 core metadata, extracted from wheel
 packages/<pkg>/<filename>.provenance     # PEP 740 provenance object, relayed verbatim from upstream
 packages/<pkg>/.origin                   # "private" | "mirror" — claimed at first write
+packages/<pkg>/.project-status.json      # PEP 792 status ({status, reason?}); absent == active
 simple/index.html                        # materialized views (regenerable)
 simple/index.json
 simple/<pkg>/index.html
@@ -301,11 +305,21 @@ simple/<pkg>/index.json
 _dirty/<pkg>!<nonce>.intent              # empty marker: a writer is touching this package
 _dirty/<pkg>!<nonce>.commit              # empty marker: truth changed, rebuild now
 _state/fp-<shard>.json                   # audit fingerprints: pkg -> listing hash at last rebuild
+_state/inventory.json                    # regenerable aggregate (pkg/file counts); nodes read it for `/`
 _sync/cursors.json                       # mirror-over-HTTP sync memo: pkg -> last upstream ETag
                                          #   (config-keyed). Pure cache for conditional fetch;
                                          #   never truth, never a view — delete it and the next
                                          #   sync re-fetches. Served by admin GET/PUT /sync/cursors.
 _leader/lease.json                       # multi-node lease (holder, term, expires-at)
+_counters/<metric>/seg/<day>/<shard>/<id>.json   # download counters: node-flushed delta segments
+                                         #   (write path; <id> is a unique per-incarnation id).
+_counters/<metric>/day/<day>/<shard>.json        # frozen per-shard day total (leader compaction);
+                                         #   a frozen file wins over the seg dir, so a crash mid-
+                                         #   compaction can't double-count or shrink a total.
+_counters/<metric>/day/<day>/_summary.json       # per-day total + busiest keys (dashboard reads).
+                                         #   All of _counters/ is a DERIVED, LOSSY analytic — never
+                                         #   truth, never a view of truth; delete it freely (like
+                                         #   _sync/). Sharded by package first char (0-9a-z, _).
 _staging/<ts>-<pid>-<filename>           # cloud only: a >64 MB upload streams here, then
                                          #   copy-if-not-exists publishes it to its final key.
                                          #   Transient (the object-store analog of disk's .tmp +

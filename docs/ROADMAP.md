@@ -8,7 +8,7 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 
 **Standards** ([STANDARDS.md](STANDARDS.md) is the authoritative matrix)
 - PEP 503 simple HTML index — name normalization, sha256 URL fragments, PEP 629 `repository-version` meta tag, 301-redirects for non-normalized names.
-- PEP 691 JSON simple API with content negotiation; PEP 700 `versions` / `size` / `upload-time` (api-version 1.3).
+- PEP 691 JSON simple API with content negotiation (api-version 1.4); PEP 700 `versions` / `size` / `upload-time`.
 - PEP 592 yank; PEP 658/714 wheel `METADATA` served as a static `<filename>.metadata` companion with `core-metadata` attrs.
 - PEP 740 provenance relayed verbatim through `sync` and the proxy (`<filename>.provenance` companion, `provenance` key / `data-provenance` attr) — carried, not verified; first-party `attestations` uploads refused.
 - `requires-python`; filename immutability (re-upload rejected); HTTP caching (content-hash ETags + 304, `immutable` artifacts, Range requests, gzip index variants).
@@ -35,8 +35,9 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 
 **Operations & management**
 - `/health`, Prometheus `/metrics`, `--log-format json`, per-project traffic attribution via username subaddressing.
+- Distributed per-package/version download counters (`_counters/`): counted on the GET path, flushed as immutable sharded segments, compacted into frozen daily files by the leader; served at `GET /stats/downloads/<pkg>`. A best-effort, lossy analytic (never truth), kept off the low-cardinality `/metrics`.
 - Delete and yank management API.
-- Human-facing pages: landing (`/`), live `/dashboard`, and a read-only project page (`/project/<pkg>/`) — metadata sidebar, release files, README shown verbatim (not rendered). Server-rendered on demand, no build step, gated by read auth.
+- Human-facing pages: landing + live dashboard (`/`), a package browser (`/projects/`), and a read-only project page (`/project/<pkg>/`) — metadata sidebar, release files, README shown verbatim (not rendered). Server-rendered on demand, no build step, gated by read auth.
 
 Implementation history (the original milestone-by-milestone build) lives in git;
 the [improvements log](BENCHMARK_RESULTS.md#improvements-log) tracks every landed

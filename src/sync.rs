@@ -30,7 +30,7 @@ use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tokio::fs;
@@ -45,6 +45,7 @@ use crate::render::SIMPLE_JSON_CONTENT_TYPE;
 use crate::sidecar::Yanked;
 use crate::simple::{self, IndexFetch, SimpleFile, SimpleIndex};
 use crate::status::ProjectStatusDoc;
+use crate::upload::{FinishedSpool, UploadSpool};
 
 #[derive(Debug, Clone, Args)]
 pub struct SyncArgs {
@@ -99,6 +100,13 @@ pub struct SyncArgs {
     /// round-trips.
     #[arg(long, env = "PYPIRON_SYNC_PACKAGE_CONCURRENCY")]
     pub package_concurrency: Option<usize>,
+
+    /// Directory for download spool files (default: the system temp dir). Sync
+    /// streams each artifact to a spool file before re-uploading, so RAM stays
+    /// bounded regardless of wheel size — point this at real disk, not a tmpfs,
+    /// when mirroring large (multi-GB) wheels.
+    #[arg(long, env = "PYPIRON_SYNC_SPOOL_DIR")]
+    pub spool_dir: Option<PathBuf>,
 
     /// Print actions without downloading/uploading.
     #[arg(long)]
@@ -174,6 +182,7 @@ struct Resolved {
     private_prefix: Option<String>,
     concurrency: usize,
     package_concurrency: usize,
+    spool_dir: PathBuf,
     dry_run: bool,
     full: bool,
     filter: ResolvedFilter,
@@ -280,6 +289,7 @@ impl Resolved {
                 .or(cfg.package_concurrency)
                 .unwrap_or(8)
                 .max(1),
+            spool_dir: args.spool_dir.clone().unwrap_or_else(std::env::temp_dir),
             dry_run: args.dry_run,
             full: args.full,
             filter: ResolvedFilter {
@@ -1149,26 +1159,49 @@ fn select_from_index(
     (selected, upstream_status, upstream_files)
 }
 
+/// Provenance objects are small JSON, and the destination's upload path rejects
+/// a `provenance` field past 4 MiB — so cap the fetch at the same bound rather
+/// than buffer an unbounded hostile-upstream body into RAM.
+const MAX_PROVENANCE_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Best-effort provenance fetch — supplemental, never fails the file.
 async fn download_provenance(client: &Client, url: &str) -> Option<Vec<u8>> {
-    match client
+    let resp = match client
         .get(url)
         .send()
         .await
         .and_then(|r| r.error_for_status())
     {
-        Ok(resp) => match resp.bytes().await {
-            Ok(bytes) => Some(bytes.to_vec()),
-            Err(e) => {
-                warn!(%url, error=?e, "sync: provenance body read failed");
-                None
-            }
-        },
+        Ok(resp) => resp,
         Err(e) => {
             warn!(%url, error=?e, "sync: provenance fetch failed");
-            None
+            return None;
         }
+    };
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_PROVENANCE_BYTES)
+    {
+        warn!(%url, "sync: provenance exceeds cap (Content-Length)");
+        return None;
     }
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(%url, error=?e, "sync: provenance body read failed");
+                return None;
+            }
+        };
+        if buf.len() as u64 + chunk.len() as u64 > MAX_PROVENANCE_BYTES {
+            warn!(%url, "sync: provenance exceeds cap");
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Some(buf)
 }
 
 /// How many times a single file download is attempted before the package is
@@ -1177,39 +1210,62 @@ async fn download_provenance(client: &Client, url: &str) -> Option<Vec<u8>> {
 /// existed. Hash mismatches retry too: a truncated body looks identical.
 const DOWNLOAD_ATTEMPTS: u32 = 3;
 
-async fn download_verified(client: &Client, file: &SimpleFile) -> Result<Vec<u8>> {
+async fn download_verified(
+    client: &Client,
+    file: &SimpleFile,
+    spool_dir: &Path,
+) -> Result<FinishedSpool> {
+    let expected = file
+        .sha256()
+        .ok_or_else(|| anyhow!("no sha256 for {}", file.filename))?;
     let mut last_err = None;
     for attempt in 1..=DOWNLOAD_ATTEMPTS {
-        match download_once(client, file).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) => {
-                if attempt < DOWNLOAD_ATTEMPTS {
-                    warn!(file=%file.filename, error=?e, attempt, "download failed; retrying");
-                    tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
-                }
-                last_err = Some(e);
+        match download_once(client, file, spool_dir).await {
+            Ok(spool) if spool.sha256.eq_ignore_ascii_case(expected) => return Ok(spool),
+            Ok(spool) => {
+                last_err = Some(anyhow!(
+                    "sha256 mismatch for {} (expected {expected}, got {})",
+                    file.filename,
+                    spool.sha256
+                ));
             }
+            Err(e) => last_err = Some(e),
+        }
+        if attempt < DOWNLOAD_ATTEMPTS {
+            warn!(file=%file.filename, attempt, error=?last_err, "download failed; retrying");
+            tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("download failed for {}", file.filename)))
 }
 
-async fn download_once(client: &Client, file: &SimpleFile) -> Result<Vec<u8>> {
-    let expected = file
-        .sha256()
-        .ok_or_else(|| anyhow!("no sha256 for {}", file.filename))?;
+/// Stream the artifact to a spool file on disk, hashing as it lands, so RAM
+/// stays chunk-sized regardless of wheel size. The old path read the whole body
+/// into a `Vec` — and at default concurrency ~32 artifacts were resident at
+/// once, OOMing a small box. The upstream-declared `size` bounds the read: a
+/// body that overruns it is wrong (it would fail the sha check anyway) and is
+/// aborted before it can fill the disk.
+async fn download_once(
+    client: &Client,
+    file: &SimpleFile,
+    spool_dir: &Path,
+) -> Result<FinishedSpool> {
     let resp = client.get(&file.url).send().await?.error_for_status()?;
-    let bytes = resp.bytes().await?.to_vec();
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let got = format!("{:x}", hasher.finalize());
-    if !got.eq_ignore_ascii_case(expected) {
-        bail!(
-            "sha256 mismatch for {} (expected {expected}, got {got})",
-            file.filename,
-        );
+    let mut spool = UploadSpool::new(spool_dir).await?;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        spool.write_chunk(&chunk?).await?;
+        if let Some(max) = file.size {
+            if spool.size() > max {
+                bail!(
+                    "{} overran its declared size ({} > {max} bytes)",
+                    file.filename,
+                    spool.size()
+                );
+            }
+        }
     }
-    Ok(bytes)
+    spool.finish().await
 }
 
 /// Push one file through the remote `/legacy/` as a mirror upload, carrying
@@ -1223,10 +1279,17 @@ async fn upload_via_http(
     pkg: &str,
     s: &Selected,
 ) -> Result<bool> {
-    let bytes = download_verified(client, &s.file).await?;
+    // Held until after the POST below: dropping the spool deletes its temp file.
+    let spool = download_verified(client, &s.file, &resolved.spool_dir).await?;
 
     info!("  - uploading {}", s.file.filename);
-    let part = multipart::Part::bytes(bytes)
+    // Stream the spool file into the multipart body instead of re-buffering it
+    // in RAM (the artifact already lives on disk from the download).
+    let file = fs::File::open(spool.path.path())
+        .await
+        .with_context(|| format!("reopening spool for {}", s.file.filename))?;
+    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+    let part = multipart::Part::stream_with_length(body, spool.size)
         .file_name(s.file.filename.clone())
         .mime_str("application/octet-stream")?;
 
@@ -1579,6 +1642,7 @@ mod tests {
             private_prefix: None,
             concurrency: 1,
             package_concurrency: 1,
+            spool_dir: std::env::temp_dir(),
             dry_run: false,
             full: false,
             filter,

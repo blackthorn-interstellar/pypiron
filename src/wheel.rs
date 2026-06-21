@@ -8,7 +8,8 @@ use std::path::Path;
 use zip::ZipArchive;
 
 /// Core metadata is text; anything past this is a zip bomb, not a METADATA.
-const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+/// The proxy reuses this to bound upstream `.metadata`/`.provenance` fetches.
+pub(crate) const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Extract `METADATA` from a wheel on disk without loading the wheel into
 /// memory — zip needs only the central directory plus the one entry.

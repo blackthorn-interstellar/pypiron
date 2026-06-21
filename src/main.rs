@@ -514,11 +514,11 @@ async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
             "listening on http://{}", cli.bind_addr
         ),
     }
-    // We observe the shutdown signal ourselves (rather than handing it
-    // straight to `with_graceful_shutdown`) so we can bound how long we wait
-    // afterwards. Axum's graceful shutdown otherwise blocks until *every*
-    // connection closes, including idle HTTP keep-alive ones — a single open
-    // browser tab or lingering client is enough to make Ctrl-C hang forever.
+    // We observe the shutdown signal ourselves (rather than handing it straight
+    // to `with_graceful_shutdown`) so we can bound the wait. Axum's graceful
+    // shutdown blocks until every *in-flight* request finishes; one slow or
+    // stuck request (a hung `uv` resolve, a half-sent request, an interrupted
+    // download) would otherwise pin Ctrl-C for as long as the client holds on.
     let (graceful_tx, graceful_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -529,11 +529,26 @@ async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
     });
 
     shutdown_signal().await;
+    info!("shutting down — press Ctrl-C again to force-quit");
+
+    // Escape hatch. Installing our own SIGINT/SIGTERM handler replaces the OS
+    // default (terminate the process), so while the bounded drain below runs,
+    // every further Ctrl-C is a silent no-op — the "Ctrl-C does nothing" trap.
+    // A second signal hard-exits now, whatever the drain is stuck on. 130 is
+    // the conventional 128 + SIGINT exit code for a Ctrl-C'd process.
+    tokio::spawn(async {
+        shutdown_signal().await;
+        warn!("second signal received — forcing immediate exit");
+        // Hard-exit deliberately: returning to unwind the runtime could itself
+        // block on whatever the drain is stuck on, defeating the escape hatch.
+        #[allow(clippy::exit)]
+        std::process::exit(130);
+    });
+
     let _ = graceful_tx.send(()); // begin draining in-flight requests
     let _ = shutdown_tx.send(true); // stop the worker
 
-    // Give in-flight requests a moment to finish, then exit regardless of any
-    // idle keep-alive connections axum would otherwise wait on.
+    // Give in-flight requests up to 10s to finish, then exit regardless.
     match tokio::time::timeout(Duration::from_secs(10), server).await {
         Err(_) => warn!("graceful shutdown timed out after 10s; forcing exit"),
         Ok(Err(e)) => warn!(error = %e, "server task failed to join"),
@@ -609,7 +624,6 @@ async fn shutdown_signal() {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
-    info!("shutdown signal received");
 }
 
 /// Middleware to log all incoming requests

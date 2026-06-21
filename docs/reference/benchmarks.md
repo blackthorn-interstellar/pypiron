@@ -2,7 +2,8 @@
 
 pypiron is 4–60× faster than other PyPI servers at sustained install throughput.
 
-![Max sustained install throughput](../assets/install-throughput.svg)
+![Max sustained install throughput](../assets/install-throughput.svg#only-light)
+![Max sustained install throughput](../assets/install-throughput-dark.svg#only-dark)
 
 ## Headline
 

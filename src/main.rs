@@ -21,6 +21,7 @@ mod config;
 mod coremeta;
 #[cfg(test)]
 mod corpus_check;
+mod counters;
 mod lease;
 mod markdown;
 mod metrics;
@@ -222,6 +223,39 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_LEASE_TTL_SECS", default_value = "30")]
     lease_ttl_secs: u64,
 
+    /// Count per-package/version downloads per day into the S3-backed counter
+    /// store (`_counters/`). A best-effort derived analytic — lossy by design,
+    /// never truth. Adds a periodic small PUT per node (see docs/CONFIGURATION).
+    #[arg(long, env = "PYPIRON_DOWNLOAD_STATS", default_value_t = true, action = clap::ArgAction::Set)]
+    download_stats: bool,
+
+    /// Counter resolution (intra-day bucket width): a whole number of minutes
+    /// dividing a day, e.g. `1d`, `1h`, `30m`, `2h`. Coarser is cheaper; changing
+    /// it is non-destructive (old days keep their granularity).
+    #[arg(long, env = "PYPIRON_COUNTERS_RESOLUTION", default_value = "1d")]
+    counters_resolution: String,
+
+    /// Seconds between counter flushes (every node). Lower = fresher and less
+    /// loss on crash, at more S3 PUTs. The dominant cost knob.
+    #[arg(
+        long,
+        env = "PYPIRON_COUNTERS_FLUSH_INTERVAL_SECS",
+        default_value = "300"
+    )]
+    counters_flush_interval_secs: u64,
+
+    /// Seconds between leader compaction passes (freeze finished days, prune).
+    #[arg(
+        long,
+        env = "PYPIRON_COUNTERS_ROLLUP_INTERVAL_SECS",
+        default_value = "3600"
+    )]
+    counters_rollup_interval_secs: u64,
+
+    /// Days of per-day counter history to keep before deletion.
+    #[arg(long, env = "PYPIRON_COUNTERS_RETENTION_DAYS", default_value = "90")]
+    counters_retention_days: i64,
+
     /// Wait for the uploaded file to appear in the index before returning
     /// 200 (publish-then-install CI pipelines)
     #[arg(long, env = "PYPIRON_SYNC_UPLOADS")]
@@ -310,10 +344,49 @@ struct AppState {
     worker_nudge: Arc<tokio::sync::Notify>,
     /// Hand-rolled Prometheus counters served at /metrics.
     metrics: Arc<metrics::Metrics>,
+    /// Distributed S3-backed event counters (per-package/version downloads per
+    /// day). Self-contained engine; see counters.rs. Disabled => a no-op.
+    counters: Arc<counters::Counters>,
     /// On-demand upstream mirroring (None unless --proxy-upstream is set).
     proxy: Option<Arc<proxy::Proxy>>,
     /// Process start, for the homepage uptime readout.
     started: std::time::Instant,
+}
+
+/// Adapts the pypiron [`Storage`] trait to the counter engine's minimal
+/// [`counters::ObjectStore`]. This is the *only* coupling between the otherwise
+/// self-contained `counters` module and the rest of pypiron — lifting the engine
+/// into its own crate means reproducing just these four methods.
+struct CounterStore(Arc<dyn Storage>);
+
+#[async_trait::async_trait]
+impl counters::ObjectStore for CounterStore {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if self.0.supports_leases() {
+            // Cloud: distinguishes a genuine miss (Ok(None)) from a transient
+            // error (Err) — the engine must never freeze a day from a failed read.
+            Ok(self.0.get_with_etag(key).await?.map(|(b, _)| b))
+        } else {
+            // Disk: get_bytes errors on a miss; a single-node disk store has no
+            // compaction-safety stakes, so treat any error as absent.
+            Ok(self.0.get_bytes(key).await.ok())
+        }
+    }
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+        self.0.put_bytes(key, bytes, Some("application/json")).await
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self
+            .0
+            .list_all(prefix)
+            .await?
+            .into_iter()
+            .map(|o| o.key)
+            .collect())
+    }
+    async fn delete(&self, keys: &[String]) -> Result<()> {
+        self.0.delete_keys(keys).await
+    }
 }
 
 #[tokio::main]
@@ -346,6 +419,50 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Build the download-counter engine from CLI config, failing closed on a bad
+/// resolution. Disabled (`--download-stats=false`) yields a no-op store.
+fn build_counters(cli: &ServeArgs, storage: Arc<dyn Storage>) -> Result<counters::Counters> {
+    if !cli.download_stats {
+        return Ok(counters::Counters::disabled());
+    }
+    let resolution_secs = parse_resolution_secs(&cli.counters_resolution)?;
+    let cfg = counters::Config {
+        resolution_secs,
+        flush_interval: Duration::from_secs(cli.counters_flush_interval_secs.max(1)),
+        rollup_interval: Duration::from_secs(cli.counters_rollup_interval_secs.max(1)),
+        retention_days: cli.counters_retention_days.max(1),
+        ..counters::Config::default()
+    }
+    .checked()
+    .map_err(|e| anyhow::anyhow!("--counters-resolution: {e}"))?;
+    Ok(counters::Counters::new(
+        Box::new(CounterStore(storage)),
+        cfg,
+    ))
+}
+
+/// Parse `1d` / `1h` / `30m` / `2h` into seconds. Minutes/hours/days only — the
+/// counter buckets are minute-aligned, so smaller or calendar units are refused.
+fn parse_resolution_secs(s: &str) -> Result<u32> {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| !c.is_ascii_digit())
+        .filter(|&i| i > 0)
+        .ok_or_else(|| anyhow::anyhow!("'{s}' is not a <number><unit> duration (e.g. 1d, 30m)"))?;
+    let (num, unit) = s.split_at(split);
+    let n: u32 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("'{s}': bad number"))?;
+    let unit_secs = match unit.trim() {
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+        "d" | "day" | "days" => 86_400,
+        other => anyhow::bail!("'{s}': unit '{other}' must be m, h, or d"),
+    };
+    n.checked_mul(unit_secs)
+        .ok_or_else(|| anyhow::anyhow!("'{s}': duration too large"))
 }
 
 async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
@@ -395,6 +512,16 @@ async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
         None => None,
     };
 
+    let counters = Arc::new(build_counters(&cli, storage.clone())?);
+    if counters.enabled() {
+        info!(
+            resolution = %cli.counters_resolution,
+            flush_secs = cli.counters_flush_interval_secs,
+            retention_days = cli.counters_retention_days,
+            "download counters enabled (_counters/)"
+        );
+    }
+
     let state = Arc::new(AppState {
         storage,
         uploader_user: cli.uploader_user,
@@ -419,6 +546,7 @@ async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
         inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
         worker_nudge: Arc::new(tokio::sync::Notify::new()),
         metrics: Arc::new(metrics::Metrics::new()),
+        counters,
         proxy,
         started: std::time::Instant::now(),
     });
@@ -483,6 +611,9 @@ async fn run_serve(cli: ServeArgs, log_format: LogFormat) -> Result<()> {
         // truth (which files it holds, their yank state), not a proxied
         // upstream view that would hide a removed file from the reconcile.
         .route("/sync/local-index/:package", get(sync_local_index))
+        // Per-package and global download counters (read-auth gated in-handler).
+        .route("/stats/:metric", get(stats_summary_get))
+        .route("/stats/:metric/:package", get(stats_get))
         // Operational endpoints: deliberately outside read auth — load
         // balancers and Prometheus scrapers don't carry package credentials.
         .route("/health", get(health))
@@ -834,6 +965,8 @@ async fn render_project(
         None => None,
     };
 
+    let downloads = download_summary(state, &pkg).await;
+
     html_ok(web::project_html(
         &page_context(state, headers),
         &pkg,
@@ -842,7 +975,30 @@ async fn render_project(
         pinned,
         meta.as_ref(),
         publisher.as_ref(),
+        &downloads,
     ))
+}
+
+/// Last-30-day download counts for a package, filenames rolled up to versions
+/// and sorted busiest first — the data behind the project page's Downloads card.
+/// Empty (no traffic, or counters disabled) renders nothing.
+async fn download_summary(state: &AppState, pkg: &str) -> Vec<(String, u64)> {
+    let to = OffsetDateTime::now_utc().date();
+    let from = to.saturating_sub(time::Duration::days(29));
+    let series = state
+        .counters
+        .query_package("downloads", pkg, from, to)
+        .await;
+    let mut by_ver: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for files in series.values() {
+        for (filename, count) in files {
+            let ver = infer_version_from_filename(filename).unwrap_or_else(|| "unknown".into());
+            *by_ver.entry(ver).or_insert(0) += count;
+        }
+    }
+    let mut out: Vec<(String, u64)> = by_ver.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 /// Characters refused raw in a redirect path segment — anything that could
@@ -1780,6 +1936,12 @@ async fn files_get(
     };
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
 
+    // Download attribution key, computed once: a real artifact only (companions
+    // and the ranged-companion fall-through below parse to None), keyed
+    // `<pkg>/<filename>` so the counter store rolls files up to versions. Counted
+    // at the two delivery exits (302 redirect, 200 stream) — see counters.rs.
+    let dl_key = sidecar::is_artifact(&filename).then(|| format!("{pkg}/{filename}"));
+
     // PEP 658 metadata is immutable, tiny, and hammered by resolvers (uv
     // fetches one per candidate wheel) — serve it from the same RAM cache as
     // the indexes instead of one storage GET per request. Range requests
@@ -1851,12 +2013,20 @@ async fn files_get(
         // Immutability also makes signed URLs reusable across clients: serve
         // a cached one while it has plenty of validity left (see cache.rs).
         if let Some(url) = state.presign_cache.fresh(&key) {
+            if let Some(k) = &dl_key {
+                state.counters.record("downloads", k);
+                state.metrics.record_download();
+            }
             return found_redirect(&url);
         }
         match state.storage.presign_get(&key, cache::PRESIGN_EXPIRY).await {
             Ok(Some(url)) => {
                 let url: Arc<str> = url.into();
                 state.presign_cache.put(&key, url.clone());
+                if let Some(k) = &dl_key {
+                    state.counters.record("downloads", k);
+                    state.metrics.record_download();
+                }
                 return found_redirect(&url);
             }
             Ok(None) => {} // disk backend: fall through to streaming
@@ -1867,6 +2037,14 @@ async fn files_get(
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     match state.storage.serve_artifact(&key, range).await {
         Ok(mut resp) => {
+            // Count only a full delivered body (200): a 206 range read is a
+            // partial of one logical download, a 416 is none.
+            if resp.status() == StatusCode::OK {
+                if let Some(k) = &dl_key {
+                    state.counters.record("downloads", k);
+                    state.metrics.record_download();
+                }
+            }
             resp.headers_mut().insert(
                 header::CACHE_CONTROL,
                 HeaderValue::from_static(ARTIFACT_CACHE_CONTROL),
@@ -1875,6 +2053,94 @@ async fn files_get(
         }
         Err(e) => read_error(e),
     }
+}
+
+/// Per-package counter series: `GET /stats/:metric/:package` (read-auth gated).
+/// Up to the last 30 days of daily counts, filenames rolled up to versions, plus
+/// a grand total. Frozen days are exact; today is best-effort. Deliberately a
+/// separate surface from `/metrics`, which stays low-cardinality.
+async fn stats_get(
+    State(state): State<Arc<AppState>>,
+    Path((metric, package)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !state.is_reader(&headers) {
+        return unauthorized();
+    }
+    let Some(pkg) = checked_pkg_name(&package) else {
+        return not_found("not a package");
+    };
+    let to = OffsetDateTime::now_utc().date();
+    let from = to.saturating_sub(time::Duration::days(29));
+    let series = state.counters.query_package(&metric, &pkg, from, to).await;
+
+    let mut days: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> =
+        std::collections::BTreeMap::new();
+    let mut total: u64 = 0;
+    for (day, files) in series {
+        let by_ver = days.entry(day).or_default();
+        for (filename, count) in files {
+            total += count;
+            let ver = infer_version_from_filename(&filename).unwrap_or_else(|| "unknown".into());
+            *by_ver.entry(ver).or_insert(0) += count;
+        }
+    }
+    json_response(serde_json::json!({
+        "metric": metric,
+        "package": pkg,
+        "total": total,
+        "days": days,
+    }))
+}
+
+/// Global counter summary: `GET /stats/:metric` (read-auth gated). The last 30
+/// days of per-day totals and the busiest packages, from the leader-written
+/// per-day summaries (top keys are rolled up to packages — approximate at the
+/// tail, fine for a dashboard glance).
+async fn stats_summary_get(
+    State(state): State<Arc<AppState>>,
+    Path(metric): Path<String>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !state.is_reader(&headers) {
+        return unauthorized();
+    }
+    let to = OffsetDateTime::now_utc().date();
+    let from = to.saturating_sub(time::Duration::days(29));
+    let summaries = state.counters.query_summaries(&metric, from, to).await;
+
+    let mut total: u64 = 0;
+    let mut by_pkg: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut days: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for (day, s) in &summaries {
+        total += s.total;
+        days.insert(day.clone(), s.total);
+        for (k, v) in &s.top {
+            let pkg = k.split('/').next().unwrap_or(k).to_string();
+            *by_pkg.entry(pkg).or_insert(0) += v;
+        }
+    }
+    let mut ranked: Vec<(String, u64)> = by_pkg.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(20);
+    json_response(serde_json::json!({
+        "metric": metric,
+        "total": total,
+        "days": days,
+        "top": ranked.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+    }))
+}
+
+/// A `200 application/json` response with no-store caching, or a 404 if the body
+/// can't be built. Shared by the `/stats` endpoints.
+fn json_response(value: serde_json::Value) -> Response<Body> {
+    let bytes = serde_json::to_vec(&value).unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(bytes))
+        .unwrap_or_else(not_found)
 }
 
 /// Proxy hook for artifact downloads: fetch-and-commit on a local miss.
@@ -2293,6 +2559,7 @@ impl AppState {
             inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             metrics: Arc::new(metrics::Metrics::new()),
+            counters: Arc::new(counters::Counters::disabled()),
             proxy: None,
             started: std::time::Instant::now(),
         }

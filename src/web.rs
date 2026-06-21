@@ -474,6 +474,7 @@ pub fn project_html(
     pinned: bool,
     meta: Option<&CoreMetadata>,
     publisher: Option<&Publisher>,
+    downloads: &[(String, u64)],
 ) -> String {
     let index_url = format!("{}/simple/", ctx.base_url);
     // The one index URL, top-right, in a copy field (same style as the landing
@@ -546,13 +547,14 @@ pub fn project_html(
     // attestation + the package's self-declared details) with the tab panels on
     // the right.
     let body = format!(
-        "<div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{verified}{details}</aside>\
+        "<div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{downloads}{verified}{details}</aside>\
 <div class=\"pcontent\">{desc}{history}{dl}</div></div>\
 <nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/projects/\">All packages</a> · \
 <a href=\"/simple/{name}/\">Simple index</a></nav>\
 {footer}{TABS_JS}",
         name = encode_text(pkg),
         nav = nav_section(),
+        downloads = downloads_section(downloads),
         verified = verified_section(publisher),
         details = meta_sections(meta),
         desc = description_panel(meta),
@@ -701,6 +703,35 @@ fn files_panel(pkg: &str, files: &[&FileMetadata]) -> String {
         "<section class=\"tabpanel\" id=\"files\"><h2>Files</h2><table class=\"files-t\">\
 <thead><tr><th>File</th><th>Size</th><th>Uploaded</th></tr></thead>\
 <tbody>{rows}</tbody></table></section>",
+    )
+}
+
+/// The "Downloads" sidebar card: the package's last-30-day total and its
+/// busiest versions, from the S3-backed counter store. Shown only when there is
+/// recorded traffic (a fresh registry, or `--download-stats=false`, shows
+/// nothing rather than a misleading zero). Counts are a best-effort analytic;
+/// today is included but lags one flush interval (see counters.rs).
+fn downloads_section(downloads: &[(String, u64)]) -> String {
+    let total: u64 = downloads.iter().map(|(_, c)| c).sum();
+    if total == 0 {
+        return String::new();
+    }
+    let rows: String = downloads
+        .iter()
+        .take(6)
+        .map(|(ver, count)| {
+            format!(
+                "<dt>{}</dt><dd>{}</dd>",
+                encode_text(ver),
+                group_thousands(*count)
+            )
+        })
+        .collect();
+    format!(
+        "<section class=\"sb sb-downloads\"><h2>Downloads</h2>\
+<p class=\"dl-total\"><b>{total}</b> in the last 30 days</p>\
+<dl class=\"sb-dl\">{rows}</dl></section>",
+        total = group_thousands(total),
     )
 }
 
@@ -873,6 +904,7 @@ fn human_size(bytes: u64) -> String {
 fn metrics_section(d: &DashboardData) -> String {
     let snap = d.snapshot;
     let total = snap.total_requests();
+    let downloads = snap.downloads_total();
     let files_served = snap.files_served();
     let cache_total = d.cache_hits + d.cache_misses;
     let hit_rate = if cache_total == 0 {
@@ -884,10 +916,12 @@ fn metrics_section(d: &DashboardData) -> String {
     let stats = format!(
         "<section class=\"stats\">\
 <div class=\"stat\"><div class=\"num\">{total}</div><div class=\"lbl\">Total requests</div></div>\
+<div class=\"stat\"><div class=\"num\">{downloads}</div><div class=\"lbl\">Downloads</div></div>\
 <div class=\"stat\"><div class=\"num\">{files_served}</div><div class=\"lbl\">Files served</div></div>\
 <div class=\"stat\"><div class=\"num\">{hit_rate}</div><div class=\"lbl\">Index cache hit rate</div></div>\
 </section>",
         total = group_thousands(total),
+        downloads = group_thousands(downloads),
         files_served = group_thousands(files_served),
     );
 
@@ -1094,6 +1128,7 @@ mod tests {
             false,
             Some(&m),
             None,
+            &[],
         );
 
         // Slim brand strip (home link + index URL field), then a package banner.
@@ -1153,7 +1188,16 @@ mod tests {
         let m = imaginairy_meta();
         let files = imaginairy_files();
         // A per-version view of 14.3.0.
-        let html = project_html(&ctx(), "imaginairy", &files, "14.3.0", true, Some(&m), None);
+        let html = project_html(
+            &ctx(),
+            "imaginairy",
+            &files,
+            "14.3.0",
+            true,
+            Some(&m),
+            None,
+            &[],
+        );
         // The banner and install snippet pin the selected version.
         assert!(html.contains("<span class=\"pver\">14.3.0</span>"));
         assert!(html.contains("uv add --index https://pkgs.example.com/simple/ imaginairy==14.3.0"));
@@ -1184,6 +1228,7 @@ mod tests {
             false,
             Some(&m),
             Some(&pubr),
+            &[],
         );
         assert!(html.contains("<h2>Verified details</h2>"));
         // The publisher rows render; the GitHub repo becomes a link.
@@ -1208,7 +1253,7 @@ mod tests {
             "1.0",
             "2026-01-01T00:00:00Z",
         )];
-        let html = project_html(&ctx(), "x", &files, "1.0", false, Some(&m), None);
+        let html = project_html(&ctx(), "x", &files, "1.0", false, Some(&m), None, &[]);
         assert!(html.contains("<pre class=\"readme\">"));
         assert!(html.contains("shown unrendered"));
         assert!(html.contains("Plain * text &amp; &lt;not&gt; markdown"));
@@ -1222,7 +1267,7 @@ mod tests {
             "1.0",
             "2026-01-01T00:00:00Z",
         )];
-        let html = project_html(&ctx(), "x", &files, "1.0", false, None, None);
+        let html = project_html(&ctx(), "x", &files, "1.0", false, None, None, &[]);
         // Tabs always present; description falls back to a placeholder.
         assert!(html.contains("data-tab=\"description\""));
         assert!(html.contains("This release has no project description."));
@@ -1330,6 +1375,7 @@ mod tests {
         m.record_request(crate::metrics::route_group("/files/six/six.whl"), 200);
         m.record_request(crate::metrics::route_group("/files/six/six.whl"), 200);
         m.record_project("billing-api", crate::metrics::route_group("/files/x"));
+        m.record_download();
         let snap = m.snapshot();
         let dash = DashboardData {
             snapshot: &snap,
@@ -1343,6 +1389,7 @@ mod tests {
         assert!(html.contains("class=\"activity\""));
         assert!(html.contains("<h2 class=\"section-label\">Metrics</h2>"));
         assert!(html.contains("Total requests"));
+        assert!(html.contains(">Downloads</div>"));
         assert!(html.contains("Files served"));
         assert!(html.contains("90%")); // cache hit rate 9/(9+1)
                                        // The redundant "Packages hosted" tile is gone — registry size lives in

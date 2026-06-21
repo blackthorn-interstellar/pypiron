@@ -48,6 +48,13 @@ pub fn route_group(path: &str) -> usize {
 pub struct Metrics {
     /// requests[route][status_class]
     requests: [[AtomicU64; STATUS_CLASSES.len()]; ROUTES.len()],
+    /// Artifact downloads served, this node, since boot. Counts real artifacts
+    /// only (sidecar companions and range partials excluded) on BOTH delivery
+    /// paths — streamed 200s and presigned 302s — so unlike `files_served` it
+    /// stays accurate on an S3/redirect node. A single aggregate on purpose: the
+    /// per-package/version breakdown lives in the counter store (`_counters/`),
+    /// never here, to keep the scrape payload off registry-sized cardinality.
+    downloads: AtomicU64,
     /// Package index rebuilds (worker + reconcile + deletes).
     pub index_rebuilds: AtomicU64,
     /// Full reconcile sweeps completed.
@@ -141,6 +148,12 @@ impl Metrics {
             })
     }
 
+    /// Count one delivered artifact download (this node). Called from the file
+    /// handler alongside the durable per-package counter.
+    pub fn record_download(&self) {
+        self.downloads.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_request(&self, route: usize, status: u16) {
         let class = match status {
             200..=299 => 0,
@@ -170,6 +183,7 @@ impl Metrics {
         MetricsSnapshot {
             requests,
             project_requests,
+            downloads: self.downloads.load(Ordering::Relaxed),
         }
     }
 
@@ -189,6 +203,11 @@ impl Metrics {
             }
         }
         for (name, help, value) in [
+            (
+                "pypiron_downloads_total",
+                "Artifact downloads served (real artifacts; streamed 200s and presigned 302s).",
+                &self.downloads,
+            ),
             (
                 "pypiron_index_rebuilds_total",
                 "Package index rebuilds.",
@@ -327,6 +346,8 @@ pub struct MetricsSnapshot {
     requests: [[u64; STATUS_CLASSES.len()]; ROUTES.len()],
     /// `(project_tag, per-route counts)` for every attribution tag seen.
     project_requests: Vec<(String, [u64; ROUTES.len()])>,
+    /// Artifact downloads served this node since boot (both delivery paths).
+    downloads: u64,
 }
 
 impl MetricsSnapshot {
@@ -342,6 +363,13 @@ impl MetricsSnapshot {
     /// reads ~0 because the bytes come from S3, not us. Labeled "Files served".
     pub fn files_served(&self) -> u64 {
         self.requests[ROUTE_FILES][CLASS_2XX]
+    }
+
+    /// Artifact downloads served by this node since boot — real artifacts on
+    /// both delivery paths (streamed 200s and presigned 302s), so it stays
+    /// accurate on an S3/redirect node where [`Self::files_served`] reads ~0.
+    pub fn downloads_total(&self) -> u64 {
+        self.downloads
     }
 
     /// `(route_group, total requests)` across all status classes, in matrix
@@ -383,9 +411,12 @@ mod tests {
         m.record_request(route_group("/files/six/six.whl"), 200);
         m.record_project("billing-api", route_group("/files/six/six.whl"));
         m.record_project("etl", route_group("/simple/"));
+        m.record_download();
+        m.record_download();
         let snap = m.snapshot();
         assert_eq!(snap.total_requests(), 4);
         assert_eq!(snap.files_served(), 2);
+        assert_eq!(snap.downloads_total(), 2);
         let routes: std::collections::HashMap<_, _> = snap.route_totals().into_iter().collect();
         assert_eq!(routes["simple"], 2);
         assert_eq!(routes["files"], 2);
@@ -411,8 +442,11 @@ mod tests {
         m.record_request(route_group("/simple/"), 200);
         m.record_request(route_group("/simple/"), 404);
         m.proxy_artifacts_cached.fetch_add(3, Ordering::Relaxed);
+        m.record_download();
         let text = m.render();
         assert!(text.contains("pypiron_http_requests_total{route=\"simple\",status=\"2xx\"} 1"));
+        assert!(text.contains("# TYPE pypiron_downloads_total counter"));
+        assert!(text.contains("pypiron_downloads_total 1"));
         assert!(text.contains("pypiron_http_requests_total{route=\"simple\",status=\"4xx\"} 1"));
         assert!(text.contains("pypiron_proxy_artifacts_cached_total 3"));
         assert!(text.contains("# TYPE pypiron_http_requests_total counter"));

@@ -153,7 +153,7 @@ main.wide{max-width:1000px;padding-top:0}\
 .phead-band{width:100%;background:var(--header);border-bottom:1px solid var(--border)}\
 .phead-in{max-width:1000px;margin:0 auto;padding:22px 24px 24px}\
 .phead-band .top{margin-bottom:18px}\
-.phead{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:10px 36px;margin:0}\
+.phead{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:10px 36px;margin:0}\
 .phead-main{flex:1;min-width:240px}\
 .phead-name{margin:0;font-size:30px;letter-spacing:-.02em;word-break:break-word}\
 .phead-name .pver{color:var(--muted);font-weight:500}\

@@ -8,6 +8,11 @@ FROM rust:1.90-bookworm AS builder
 WORKDIR /usr/src/pypiron
 COPY . .
 
+# `.git` is excluded from the build context, so build.rs can't ask git for the
+# commit. CI passes it in via this arg; it lands in the binary's version string.
+ARG PYPIRON_GIT_HASH=unknown
+ENV PYPIRON_GIT_HASH=$PYPIRON_GIT_HASH
+
 # Cache the cargo registry and target dir across builds (BuildKit cache mounts,
 # persisted in CI via the gha cache backend). The binary is copied out of the
 # cached target dir in the same layer so it survives into the runtime stage.

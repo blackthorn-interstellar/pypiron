@@ -185,6 +185,8 @@ pub async fn run_worker_until(
         }
     }
     let mut last_inventory_refresh: Option<Instant> = None;
+    let mut last_counter_flush: Option<Instant> = None;
+    let mut last_counter_compact: Option<Instant> = None;
     loop {
         let is_leader = match &lease {
             None => true,
@@ -201,6 +203,15 @@ pub async fn run_worker_until(
         if due_refresh {
             last_inventory_refresh = Some(Instant::now());
             refresh_inventory(&state).await;
+        }
+        // Counter flush (EVERY node, not leader-gated): drain the in-memory
+        // download buffer to this node's own immutable segment. Best-effort;
+        // fires on the interval or early when the buffer hits its high-water mark.
+        if last_counter_flush.is_none_or(|t| t.elapsed() >= state.counters.flush_interval())
+            || state.counters.flush_due()
+        {
+            last_counter_flush = Some(Instant::now());
+            state.counters.flush().await;
         }
         if is_leader {
             let spacing = state.reconcile_interval.max(std::time::Duration::from_secs(
@@ -227,13 +238,27 @@ pub async fn run_worker_until(
             if let Err(e) = tick(&state).await {
                 error!(error=?e, "worker tick failed");
             }
+            // Counter compaction (LEADER only): freeze finished days into one
+            // file per shard, write summaries, prune past retention. Cheap most
+            // ticks (a list with nothing closeable); gated to the rollup cadence.
+            // Inline is fine at the hourly default; spawn it like the audit if a
+            // very large corpus ever makes it head-of-line-block the tick.
+            if last_counter_compact.is_none_or(|t| t.elapsed() >= state.counters.rollup_interval())
+            {
+                last_counter_compact = Some(Instant::now());
+                state.counters.compact().await;
+            }
         }
         tokio::select! {
             _ = sleep(state.worker_interval) => {}
             _ = state.worker_nudge.notified() => {}
+            _ = state.counters.flush_signal() => {}
             _ = shutdown.changed() => break,
         }
     }
+    // Flush any buffered counts before exit so a graceful restart loses at most
+    // the events of the final partial interval.
+    state.counters.flush().await;
     // Graceful exit: hand leadership over instead of leaving successors to
     // wait out the lease TTL (a restart used to be a TTL-long write outage).
     if let Some(lm) = &lease {
@@ -1424,6 +1449,7 @@ mod tests {
             inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            counters: Arc::new(crate::counters::Counters::disabled()),
             proxy: None,
             started: std::time::Instant::now(),
         });
@@ -1521,6 +1547,7 @@ mod tests {
             inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            counters: Arc::new(crate::counters::Counters::disabled()),
             proxy: None,
             started: std::time::Instant::now(),
         });

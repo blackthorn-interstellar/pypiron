@@ -353,6 +353,14 @@ def disk_server_sync_uploads(tmp_path_factory, pypiron_bin: Path) -> Iterator[Di
 
 
 @pytest.fixture()
+def disk_server_fast_counters(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server flushing download counters every second (counter tests)."""
+    yield from _start_disk_server(
+        tmp_path_factory, pypiron_bin, extra_args=["--counters-flush-interval-secs", "1"]
+    )
+
+
+@pytest.fixture()
 def disk_server_read_auth(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Disk server requiring basic auth on index and artifact reads."""
     for server in _start_disk_server(

@@ -25,7 +25,7 @@ The bar for "supported" is blackbox-verified behavior against real clients
 | [PEP 694](https://peps.python.org/pep-0694/) | Upload API 2.0 (draft) | Out of scope until stable |
 | [PEP 708](https://peps.python.org/pep-0708/) | Index merging / alternate locations metadata | Out of scope |
 | [PEP 740](https://peps.python.org/pep-0740/) | Provenance/attestations — relayed verbatim through `sync` + proxy (`provenance` key / `data-provenance` attr), not verified | Supported |
-| [PEP 792](https://peps.python.org/pep-0792/) | Project status markers (`active`/`archived`/`quarantined`/`deprecated`) — relayed verbatim through `sync` + proxy (top-level `project-status` JSON / `pypi:project-status` meta); first-party authoring not provided | Supported (relay) |
+| [PEP 792](https://peps.python.org/pep-0792/) | Project status markers (`active`/`archived`/`quarantined`/`deprecated`) — relayed verbatim through `sync` + proxy (top-level `project-status` JSON / `pypi:project-status` meta); admin endpoint sets/clears the marker, fail-close enforcement deferred | Supported (relay) |
 | [PEP 458](https://peps.python.org/pep-0458/) / [480](https://peps.python.org/pep-0480/) | TUF-signed repository metadata | **Not supported** — out of scope; no installer requires it and pypi.org itself has never shipped it |
 | XML-RPC API | Legacy `search` / `list_packages` API | **Not supported** — deprecated upstream (PyPI disabled XML-RPC search); the JSON simple API is the path forward |
 | `/pypi/<pkg>/json` API | Non-standard pypi.org metadata API, predates the JSON simple API | **Not supported** — the PEP 691/700 JSON simple API is the standard; installers never request this from a custom index (see note) |

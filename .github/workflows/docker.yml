@@ -54,6 +54,11 @@ jobs:
         shell: bash
         run: ./.github/stamp-version.sh "$GITHUB_REF_NAME"
 
+      # `.git` is excluded from the docker context, so hand build.rs the commit.
+      - name: Short commit hash
+        shell: bash
+        run: echo "PYPIRON_GIT_HASH=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
       - name: Docker metadata (labels)
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
@@ -75,6 +80,8 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
+          build-args: |
+            PYPIRON_GIT_HASH=${{ env.PYPIRON_GIT_HASH }}
           platforms: linux/${{ matrix.platform.arch }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=docker-${{ matrix.platform.arch }}

@@ -60,9 +60,21 @@ const DIRTY_PREFIX: &str = "_dirty/";
 // (`--log-format`) live at the top level; everything serve-specific is under
 // `serve`, so the top-level help stays a short front door instead of dumping
 // every server flag.
+/// The git commit baked in at build time (see `build.rs`); `unknown` when built
+/// without git (e.g. from an sdist).
+const GIT_HASH: &str = env!("PYPIRON_GIT_HASH");
+/// Crate version plus the commit it was built from, e.g. `0.0.0 (abc1234)`.
+/// One string for `--version`, the startup banner, and the web footer.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("PYPIRON_GIT_HASH"),
+    ")"
+);
+
 /// PypIron — a fast single-binary PyPI server: index, upload, mirror, on-demand proxy.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None, arg_required_else_help = true)]
+#[command(author, version = VERSION, about, long_about = None, arg_required_else_help = true)]
 struct Cli {
     /// Subcommands: `serve`, `sync`, `verify`, `resync`.
     #[command(subcommand)]
@@ -648,6 +660,7 @@ async fn run_serve(mut cli: ServeArgs, log_format: LogFormat) -> Result<()> {
         // JSON consumers keep a single machine-readable readiness event.
         LogFormat::Json => info!(
             version = env!("CARGO_PKG_VERSION"),
+            commit = GIT_HASH,
             storage = %storage_desc,
             read_only = state.uploads_disabled(),
             authed_reads = state.read_credential().is_some(),
@@ -746,7 +759,7 @@ fn print_banner(state: &AppState, bind_addr: &str, storage: &str) {
          uploads   {uploads}\n     \
          reads     {reads}{proxy}\n\n     \
          ctrl-c to stop\n",
-        version = env!("CARGO_PKG_VERSION"),
+        version = VERSION,
     );
 }
 
@@ -1102,7 +1115,7 @@ async fn load_provenance(
 fn page_context(state: &AppState, headers: &HeaderMap) -> web::PageContext {
     web::PageContext {
         base_url: base_url_from_headers(headers),
-        version: env!("CARGO_PKG_VERSION"),
+        version: VERSION,
         proxy_enabled: state.proxy.is_some(),
         delivery: match state.artifact_delivery {
             ArtifactDelivery::Auto => "auto",

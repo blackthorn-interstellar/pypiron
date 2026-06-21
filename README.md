@@ -15,7 +15,7 @@ An ultra-fast Python package server, written in Rust.
 
 
 ## Highlights
-- **4x-60x faster** than other PyPi servers
+- **Handles 4–60× more load** than other PyPI servers
 - **Mitigates supply-chain attacks.** Avoid supply chain issues by excluding recent updates via `--exclude-newer`
 - **Compatible with entire ecosystem/** uv, pip, poetry, twine, pipenv, hatch
 - **Infinite horizontal scaling that "just works".** Point any number of nodes at the same bucket; reads need zero coordination.

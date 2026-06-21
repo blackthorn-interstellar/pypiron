@@ -50,7 +50,7 @@ Markers (`pyproject.toml`): `integration`, `s3` (needs Docker/MinIO), `azure`
 
 Tests that prove behavior through a real client binary carry
 `@pytest.mark.compat(client, feature)`. Run `make compat` to execute those tests
-and regenerate [COMPATIBILITY.md](COMPATIBILITY.md), including the client
+and regenerate [COMPATIBILITY.md](../docs/reference/compatibility.md), including the client
 versions used for the matrix.
 
 ## Key scenarios
@@ -65,7 +65,7 @@ versions used for the matrix.
   fragments and the PEP 629 meta tag in HTML.
 - **Tool matrix**: uv and twine for upload; uv and pip for install.
 
-As features land per [STANDARDS.md](STANDARDS.md), each gets its blackbox test in
+As features land per [STANDARDS.md](../docs/reference/standards.md), each gets its blackbox test in
 the same style: yank → pip refuses to pick it unless pinned; immutability →
 re-upload of the same filename is rejected; caching → ETag round-trips as a 304.
 

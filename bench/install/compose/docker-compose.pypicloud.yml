@@ -3,7 +3,7 @@
 # disclosed. Track 1: file blob storage + Postgres metadata cache (config in
 # pypicloud-config.ini). uWSGI processes=4, max-requests=0 (no mid-run worker
 # recycling). pypi.fallback=cache + default_read=everyone, warmed once, so the
-# measured run is all local reads. docs/BENCHMARK_INSTALL.md §3.
+# measured run is all local reads. dev/BENCHMARK_INSTALL.md §3.
 #
 # amd64-only image (emulated locally, native on the x86_64 AWS rig). seed class
 # "warm". Reachable at pypicloud:8080; index /simple/.

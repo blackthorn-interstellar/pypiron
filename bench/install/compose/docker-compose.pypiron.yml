@@ -1,7 +1,7 @@
 # pypiron, Track 1 (apples-to-apples): local disk + stream. Disk always streams
 # every byte through the node — the level playing field vs the streaming
 # competitors. NEVER --artifact-delivery auto here (could hide an S3 redirect);
-# the S3 + presigned-redirect config is Track 2 only (docs/BENCHMARK_INSTALL.md §1).
+# the S3 + presigned-redirect config is Track 2 only (dev/BENCHMARK_INSTALL.md §1).
 #
 # Built from source at the pinned commit:
 #   docker build --platform $BENCH_PLATFORM -t pypiron:bench-$BENCH_ARCH .

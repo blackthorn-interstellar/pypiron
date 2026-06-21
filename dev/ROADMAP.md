@@ -6,7 +6,7 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 
 ## Shipped
 
-**Standards** ([STANDARDS.md](STANDARDS.md) is the authoritative matrix)
+**Standards** ([STANDARDS.md](../docs/reference/standards.md) is the authoritative matrix)
 - PEP 503 simple HTML index — name normalization, sha256 URL fragments, PEP 629 `repository-version` meta tag, 301-redirects for non-normalized names.
 - PEP 691 JSON simple API with content negotiation (api-version 1.4); PEP 700 `versions` / `size` / `upload-time`.
 - PEP 592 yank; PEP 658/714 wheel `METADATA` served as a static `<filename>.metadata` companion with `core-metadata` attrs.
@@ -124,7 +124,7 @@ Caddyfile, not a feature we build.
 
 **Deprecated & niche standards — TUF, XML-RPC, eggs, the legacy `/pypi/<pkg>/json`
 API.** Explicitly out of scope; the authoritative statements are in
-[STANDARDS.md](STANDARDS.md). They are either dead (PyPI never shipped PEP 458 TUF;
+[STANDARDS.md](../docs/reference/standards.md). They are either dead (PyPI never shipped PEP 458 TUF;
 XML-RPC search is disabled upstream), a legacy format (eggs — pip dropped egg
 installs), or a non-standard metadata endpoint superseded by the PEP 691/700 JSON
 simple API. No installer needs any of them from a private index.

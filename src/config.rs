@@ -41,6 +41,9 @@ pub struct SyncConfig {
     pub exclude_platform_tag: Option<Vec<String>>,
     pub exclude_newer: Option<String>,
     pub exclude_older: Option<String>,
+    pub min_python: Option<String>,
+    pub exclude_dev: Option<bool>,
+    pub exclude_windows: Option<bool>,
 }
 
 /// Load configuration. An explicit `--config` path must exist; without one,

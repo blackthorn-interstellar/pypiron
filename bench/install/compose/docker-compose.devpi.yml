@@ -2,7 +2,7 @@
 # sidecar from devpi-gen-config so wheels are served off disk directly — the
 # documented prod path and the fairness requirement (bare :3141 streams every
 # byte through Python). Filesystem/SQLite KeyFS (NOT Postgres, which would put
-# files in the DB and defeat nginx direct serving). docs/BENCHMARK_INSTALL.md §3.
+# files in the DB and defeat nginx direct serving). dev/BENCHMARK_INSTALL.md §3.
 #
 # Warm class: the orchestrator installs the corpus once via root/pypi WITH egress
 # (devpi caches upstream files), then disconnects the `egress` network so the

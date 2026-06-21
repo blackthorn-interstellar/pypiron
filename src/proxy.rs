@@ -38,7 +38,7 @@ use crate::sidecar::{
     metadata_key, provenance_key, sidecar_key, Sidecar, METADATA_SUFFIX, PROVENANCE_SUFFIX,
 };
 use crate::simple::{self, SimpleFile};
-use crate::sync::{matches_filters, parse_cutoff, ResolvedFilter};
+use crate::sync::{matches_filters, parse_cutoff, parse_min_python, ResolvedFilter};
 use crate::upload::{FinishedSpool, UploadSpool};
 use crate::{AppState, PACKAGES_PREFIX};
 
@@ -111,6 +111,23 @@ pub struct ProxyFilterArgs {
         value_name = "WHEN"
     )]
     pub exclude_older: Option<String>,
+
+    /// Skip wheels built only for Python older than this floor (e.g. "3.10").
+    /// Version-agnostic and abi3 wheels and all sdists are kept.
+    #[arg(
+        long = "proxy-min-python",
+        env = "PYPIRON_PROXY_MIN_PYTHON",
+        value_name = "X.Y"
+    )]
+    pub min_python: Option<String>,
+
+    /// Skip PEP 440 dev releases (any version with a `.devN` segment).
+    #[arg(long = "proxy-exclude-dev", env = "PYPIRON_PROXY_EXCLUDE_DEV")]
+    pub exclude_dev: bool,
+
+    /// Skip Windows artifacts: win* wheels and legacy .exe/.msi/.winXX installers.
+    #[arg(long = "proxy-exclude-windows", env = "PYPIRON_PROXY_EXCLUDE_WINDOWS")]
+    pub exclude_windows: bool,
 }
 
 impl ProxyFilterArgs {
@@ -128,6 +145,9 @@ impl ProxyFilterArgs {
             exclude_platform_tag: self.exclude_platform_tag.clone(),
             exclude_newer: parse_cutoff("proxy-exclude-newer", self.exclude_newer.as_ref())?,
             exclude_older: parse_cutoff("proxy-exclude-older", self.exclude_older.as_ref())?,
+            min_python: parse_min_python(self.min_python.as_deref())?,
+            exclude_dev: self.exclude_dev,
+            exclude_windows: self.exclude_windows,
         })
     }
 }

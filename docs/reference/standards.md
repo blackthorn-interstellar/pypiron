@@ -1,8 +1,8 @@
 # Standards support
 
-What PypIron implements, what's planned, and what's deliberately out of scope.
-The bar for "supported" is blackbox-verified behavior against real clients
-(uv, pip, twine), not just spec-shaped output.
+What pypiron implements, what's planned, and what's out of scope. "Supported"
+means blackbox-verified behavior against real clients (uv, pip, twine), not
+spec-shaped output.
 
 ## Support matrix
 
@@ -57,7 +57,7 @@ fallback is correct by construction for direct uploads — filenames are immutab
 so a file is written exactly once and last-modified *is* upload time. Sidecars make
 the timestamp durable (it survives rsync and bucket migrations) and let mirroring
 carry forward PyPI's original timestamps; see
-[DESIGN.md](DESIGN.md#mirroring-carry-forward-true-timestamps).
+[DESIGN.md](https://github.com/brycedrennan/pypiron/blob/master/dev/DESIGN.md#mirroring-carry-forward-true-timestamps).
 
 ## Implementation notes
 

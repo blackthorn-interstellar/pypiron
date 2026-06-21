@@ -1,13 +1,16 @@
-# <img src="docs/pypiron-logo-256.png" alt="PypIron logo" width="40" style="vertical-align: middle;"/> PypIron
+# <img src="docs/assets/pypiron-logo-256.png" alt="PypIron logo" width="40" style="vertical-align: middle;"/> PypIron
 
 [![CI](https://github.com/brycedrennan/pypiron/actions/workflows/ci.yml/badge.svg)](https://github.com/brycedrennan/pypiron/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/pypiron.svg)](https://pypi.org/project/pypiron/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-pypiron-bf5a2e.svg)](https://brycedrennan.github.io/pypiron/)
 
 An ultra-fast Python package server, written in Rust.
 
+**Documentation:** <https://brycedrennan.github.io/pypiron/>
+
 <p align="center">
-  <img src="docs/install-throughput.png" alt="Max sustained install throughput: pypiron vs pypiserver, devpi, pypicloud, bandersnatch, proxpi" width="760">
+  <img src="docs/assets/install-throughput.png" alt="Max sustained install throughput: pypiron vs pypiserver, devpi, pypicloud, bandersnatch, proxpi" width="760">
 </p>
 
 
@@ -87,7 +90,7 @@ pypiron sync                 # re-run anytime; unchanged upstream is a 304 and s
 
 Run `pypiron sync --full` on a schedule (e.g. nightly) to reconcile yanks and
 upstream removals. Wheel/platform/date filters:
-[CONFIGURATION.md](docs/CONFIGURATION.md#sync-filters-and-config-file).
+[CONFIGURATION.md](docs/reference/configuration.md#sync-filters-and-config-file).
 
 ### 4. Production (S3, multi-node, HTTPS)
 
@@ -123,7 +126,7 @@ pypi.acme.com {
 ```
 
 GCS and Azure backends, the full three-tier auth model, and presigned-redirect
-delivery are all in [CONFIGURATION.md](docs/CONFIGURATION.md).
+delivery are all in [CONFIGURATION.md](docs/reference/configuration.md).
 
 ### Track installs per project
 

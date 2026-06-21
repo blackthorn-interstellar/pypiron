@@ -1,6 +1,6 @@
 //! Origin exclusivity: every package is `private` or `mirror`, claimed at
 //! first write via `packages/<pkg>/.origin`. Indexes never merge origins —
-//! the dependency-confusion defense (DESIGN.md).
+//! the dependency-confusion defense (dev/DESIGN.md).
 
 use anyhow::{anyhow, Result};
 use tracing::warn;

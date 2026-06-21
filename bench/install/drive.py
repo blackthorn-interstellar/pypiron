@@ -3,7 +3,7 @@
 
 Runs inside the loadgen (native uv). The corpus is frozen and hash-pinned, so
 every server is asked for byte-identical wheels; the only variable is how fast it
-answers (docs/BENCHMARK_INSTALL.md §5).
+answers (dev/BENCHMARK_INSTALL.md §5).
 
 Workload B (the CI-fleet headline): each "runner" is a fresh process with a fresh
 uv cache and a fresh install target, installing one sampled project's frozen

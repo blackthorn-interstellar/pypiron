@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Seed a server-under-test with the shared wheelhouse.
 
-Population is SETUP, not measurement (docs/BENCHMARK_INSTALL.md §0): every server
+Population is SETUP, not measurement (dev/BENCHMARK_INSTALL.md §0): every server
 ends up serving the identical frozen byte universe. How it gets there depends on
 the server class:
 

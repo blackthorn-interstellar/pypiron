@@ -187,7 +187,7 @@ struct ServeArgs {
     /// presigned S3 URLs so this node never touches wheel bytes. `auto`
     /// (default): per-client — redirect clients whose caches are immune to
     /// presigned-URL churn (uv), stream everyone else. Disk backend always
-    /// streams. See docs/DESIGN.md for the tradeoffs.
+    /// streams. See dev/DESIGN.md for the tradeoffs.
     #[arg(
         long,
         env = "PYPIRON_ARTIFACT_DELIVERY",

@@ -1,7 +1,7 @@
 # bandersnatch: a batch mirror that writes a static PEP 503/691 tree, served by
 # nginx (the measured tier — pure sendfile, "the static-file ceiling"). It has no
 # upload API (public scenarios only) and no PEP 658 metadata (uv pays one extra
-# range-request per dist — structural, disclosed). docs/BENCHMARK_INSTALL.md §3.
+# range-request per dist — structural, disclosed). dev/BENCHMARK_INSTALL.md §3.
 #
 # The mirror runs once with a release-level allowlist of exactly the corpus pins
 # (bench.py generates bandersnatch.gen.conf from the manifest — the allowlist does

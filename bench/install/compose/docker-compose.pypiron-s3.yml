@@ -2,7 +2,7 @@
 # node never touches wheel bytes (its headline production story, a real
 # architectural edge no competitor has). The client follows pypiron's 302 to a
 # presigned S3 URL and fetches bytes from S3 directly. Reported separately from
-# the Track 1 ranking (docs/BENCHMARK_INSTALL.md §1).
+# the Track 1 ranking (dev/BENCHMARK_INSTALL.md §1).
 #
 # AWS-only: needs a real bucket + credentials (the rig instance profile, reached
 # via IMDS — rig.sh sets the metadata hop limit to 2 so the container can read

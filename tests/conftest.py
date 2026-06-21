@@ -54,7 +54,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--write-compat-doc",
         action="store_true",
-        help="Write docs/COMPATIBILITY.md from tests marked compat(client, feature).",
+        help="Write docs/reference/compatibility.md from tests marked compat(client, feature).",
     )
 
 
@@ -124,7 +124,7 @@ def pytest_sessionfinish(session, exitstatus):
 def _write_compat_doc(repo_root: Path, results: list[tuple[str, str, str]]) -> None:
     from .helpers import CLIENT_PINS
 
-    doc_path = repo_root / "docs" / "COMPATIBILITY.md"
+    doc_path = repo_root / "docs" / "reference" / "compatibility.md"
     doc_path.parent.mkdir(parents=True, exist_ok=True)
 
     by_cell = {(client, feature): [] for client in COMPAT_CLIENTS for feature in COMPAT_FEATURES}
@@ -734,7 +734,7 @@ def _start_cloud_server(tmp_path_factory, pypiron_bin: Path, env: Dict, bind: st
 # data-plane (fake-gcs-server rejects the XML PUT; Google's storage-testbench
 # omits the required ETag), so GCS has no blackbox fixture. The GCS backend
 # shares the ObjectStorage code path exercised by the S3 and Azure suites; only
-# its builder config differs. See docs/TESTING.md.
+# its builder config differs. See dev/TESTING.md.
 
 
 # ------------------------------ Azurite fixtures ------------------------------

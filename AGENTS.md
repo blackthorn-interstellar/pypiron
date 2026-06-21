@@ -10,7 +10,7 @@ database. The guiding bias is against complexity: the best code is no code.
 - Run `make test` for the full suite (Rust unit + Python blackbox) when you touch
   HTTP, storage, the worker, sync, or the proxy. `make help` lists every target.
 
-## Testing (see [docs/TESTING.md](docs/TESTING.md))
+## Testing (see [dev/TESTING.md](dev/TESTING.md))
 - Blackbox-first: the real binary, driven over HTTP by real `uv`/`pip`/`twine`.
   Add a blackbox test (`tests/*.py`) for any changed user-visible behavior.
 - Rust unit tests (`#[cfg(test)]`) are for pure functions only — parsing,
@@ -20,14 +20,18 @@ database. The guiding bias is against complexity: the best code is no code.
   hatch compat matrix runs via `make compat`, not on every change.
 
 ## Conventions
-- Architecture and the storage-layout contract: [docs/DESIGN.md](docs/DESIGN.md)
-  ([docs/VISION.md](docs/VISION.md) is the one-pager). Don't invent storage-tree
+- Two doc trees: the user manual is the mkdocs-material site under `docs/`
+  (published to GitHub Pages; build with `make docs`, preview with
+  `make docs-serve`); contributor/architecture/benchmark docs live in `dev/`.
+  Update the manual when you change user-visible behavior.
+- Architecture and the storage-layout contract: [dev/DESIGN.md](dev/DESIGN.md)
+  ([dev/VISION.md](dev/VISION.md) is the one-pager). Don't invent storage-tree
   or sidecar variants.
 - Standards support is behavior verified against real clients, not spec-shaped
-  output: [docs/STANDARDS.md](docs/STANDARDS.md).
+  output: [docs/reference/standards.md](docs/reference/standards.md).
 - Every `--flag` is also a `PYPIRON_FLAG` env var; document new knobs in
-  [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
-- Check [docs/ROADMAP.md](docs/ROADMAP.md) before adding features — respect the
+  [docs/reference/configuration.md](docs/reference/configuration.md).
+- Check [dev/ROADMAP.md](dev/ROADMAP.md) before adding features — respect the
   "rejected" list; don't re-litigate it.
 - No `unwrap`/`expect`/`panic!` on a request or worker path; return errors with
   `anyhow` context. Catch specific errors, never a blanket match.

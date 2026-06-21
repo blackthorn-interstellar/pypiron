@@ -57,8 +57,10 @@ tokens do not provide. Under ADC, artifact downloads fall back to streaming.
 require the account key** — signed SAS URLs are derived from it; without it,
 artifact downloads stream.
 
-> **Buckets/containers must already exist.** pypiron writes objects but does not
-> create the bucket or container — provision it first.
+!!! warning
+
+    **Buckets/containers must already exist.** pypiron writes objects but does
+    not create the bucket or container — provision it first.
 
 ## Server
 
@@ -105,9 +107,11 @@ flush PUTs (`flush_interval × nodes`): ~$0.04/node/month at the 300 s default,
 effectively free for a private registry. Frozen days are exact; today lags one
 flush interval. Changing the resolution is non-destructive (old days keep theirs).
 
-**Large uploads:** the upload spool defaults to the system temp dir. In
-containers where `/tmp` is RAM-backed tmpfs, point it at real disk or multi-GB
-wheels spool into memory: `-v /data/spool:/spool -e PYPIRON_SPOOL_DIR=/spool`.
+!!! note "Large uploads"
+
+    The upload spool defaults to the system temp dir. In containers where
+    `/tmp` is RAM-backed tmpfs, point it at real disk or multi-GB wheels spool
+    into memory: `-v /data/spool:/spool -e PYPIRON_SPOOL_DIR=/spool`.
 
 ## Authentication
 
@@ -208,15 +212,28 @@ Filters gate only what a run *adds* — already-mirrored files are never removed
 - `--abi-tag none,cp311` — ABI tag(s)
 - `--platform-tag any,manylinux2014_x86_64,macosx_*_arm64` — platform tag(s), `*` wildcard
 - `--exclude-platform-tag` — exclusions (supports `*`)
+- `--min-python X.Y` — drop wheels built only for Python older than the floor
+  (e.g. `3.10` drops cp36–cp39 and python-2 wheels). Version-agnostic wheels
+  (`py3`, `py2.py3`), forward-compatible `abi3` wheels, and all sdists are kept.
+- `--exclude-dev` — drop PEP 440 dev releases (any version with a `.devN` segment)
+- `--exclude-windows` — drop Windows artifacts: `win*` wheels and legacy
+  `.exe`/`.msi`/`.winXX` installers (a package whose name merely starts with
+  "win", like `windrose`, is never matched)
 - `--exclude-newer <when>` — only files PyPI received before the cutoff
 - `--exclude-older <when>` — only files received since the cutoff
 
 `<when>` (matching uv's `--exclude-newer`) is an **RFC 3339 timestamp**
-(`2024-01-01T00:00:00Z`), a **friendly duration** ago (`"30 days"`, `"24 hours"`,
-`"1 week"`), or an **ISO 8601 duration** ago (`P30D`, `PT24H`). A duration is
-resolved against the current time as a fixed number of seconds (a day is 24 h);
-calendar months and years are rejected. The same forms apply to the `--proxy-`
-variants and to the `pypiron.toml` `exclude-newer`/`exclude-older` keys.
+(`2024-01-01T00:00:00Z`), a **bare date** (`2008-12-03`, taken as 00:00:00 UTC),
+a **bare integer of days** ago (`7`), a **friendly duration** ago (`"30 days"`,
+`"24 hours"`, `"1 week"`), or an **ISO 8601 duration** ago (`P30D`, `PT24H`). A
+duration is resolved against the current time as a fixed number of seconds (a day
+is 24 h); calendar months and years are rejected. The same forms apply to the
+`--proxy-` variants and to the `pypiron.toml` `exclude-newer`/`exclude-older` keys.
+
+A sync run prints a live progress meter on stderr (packages done, files/bytes
+mirrored, throughput, ETA) plus an always-on end-of-run summary; `--no-progress`
+(`PYPIRON_SYNC_NO_PROGRESS`) silences the live line. When stderr is redirected to
+a file, the meter prints one fresh line every 30 s instead of repainting.
 
 Every sync option also lives in `pypiron.toml` (auto-discovered in the working
 directory, or `--config <path>`), layered as CLI/env > file > defaults:
@@ -239,6 +256,7 @@ replaces the file's list entirely; other options layer per-key.
 The same filters gate what the proxy serves and caches, under a `--proxy-`
 prefix: `--proxy-only-wheels`, `--proxy-only-sdists`, `--proxy-python-tag`,
 `--proxy-abi-tag`, `--proxy-platform-tag`, `--proxy-exclude-platform-tag`,
+`--proxy-min-python`, `--proxy-exclude-dev`, `--proxy-exclude-windows`,
 `--proxy-exclude-newer`, `--proxy-exclude-older`.
 
 ## Artifact delivery
@@ -263,46 +281,18 @@ can't reach the bucket endpoint (private subnet, firewalled storage). The disk
 backend always streams — as does any cloud backend that can't sign URLs (GCS
 under ADC, Azure without an account key). PEP 658 `.metadata` companions always
 stream — tiny and resolution-critical. Full reasoning in
-[DESIGN.md](DESIGN.md#read-path-zero-coordination).
+[DESIGN.md](https://github.com/brycedrennan/pypiron/blob/master/dev/DESIGN.md#read-path-zero-coordination).
 
-## Management API
+## Management and operations endpoints
 
-Deletion and yank are **admin** operations.
-
-```bash
-# Delete a file (index first, then artifact — clients never see a broken link)
-curl -u admin:secret -X DELETE http://localhost:8080/files/<pkg>/<filename>
-
-# Yank / un-yank (PEP 592); request body becomes the reason
-curl -u admin:secret -X POST -d "broken release" \
-  http://localhost:8080/files/<pkg>/<filename>/yank
-curl -u admin:secret -X DELETE http://localhost:8080/files/<pkg>/<filename>/yank
-
-# Set / clear PEP 792 project status (body is the status doc); `sync` relays
-# upstream status through this endpoint.
-curl -u admin:secret -X POST -d '{"status":"quarantined","reason":"security hold"}' \
-  http://localhost:8080/project/<pkg>/status
-curl -u admin:secret -X DELETE http://localhost:8080/project/<pkg>/status
-```
-
-## Operations
-
-- `GET /health` — `200 {"status":"ok"}` when storage answers a probe, `503`
-  otherwise. Unauthenticated; point your load balancer at it.
-- `GET /metrics` — Prometheus text: requests by route group and status class,
-  index rebuilds, reconcile sweeps, proxy fetch/cache counters, plus audit and
-  leader-election machinery (`pypiron_audit_packages_rebuilt_total` /
-  `_skipped_total`, `pypiron_audit_last_duration_seconds`,
-  `pypiron_global_cas_conflicts_total`, `pypiron_stale_intents_healed_total`).
-  Unauthenticated.
-- Logs go to stdout via `tracing`; `--log-format json` emits one JSON object per
-  line. Per-request logging is at `debug` (`RUST_LOG=pypiron=debug`) so the
-  access log never becomes the workload.
+Admin operations (delete, yank, PEP 792 project status, sync cursors) and the
+operational endpoints (`/health`, `/metrics`, logging) live on the
+[Management API](api.md) page.
 
 ## Storage layout
 
 The layout *is* the schema — full contract in
-[DESIGN.md](DESIGN.md#storage-layout-the-contract):
+[DESIGN.md](https://github.com/brycedrennan/pypiron/blob/master/dev/DESIGN.md#storage-layout-the-contract):
 
 ```
 packages/<pkg>/<filename>                # artifact, immutable once written

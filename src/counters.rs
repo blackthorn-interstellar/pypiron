@@ -35,7 +35,7 @@ use time::{Date, OffsetDateTime};
 use tracing::warn;
 
 /// Everything this store writes lives under one top-level prefix, excluded from
-/// index rebuilds like every other `_`-prefixed key. See docs/DESIGN.md.
+/// index rebuilds like every other `_`-prefixed key. See dev/DESIGN.md.
 pub const PREFIX: &str = "_counters/";
 
 /// In-memory keys past the cap fold into this catch-all so a flood of distinct

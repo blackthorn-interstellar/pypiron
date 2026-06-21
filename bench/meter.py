@@ -2,7 +2,7 @@
 """The meter: the fixed benchmark suite for the reference rig.
 
 Stdlib only (runs on a bare AL2023 box with python3 + an `oha` binary).
-Scenarios and targets are defined in docs/BENCHMARKS.md; this file must keep
+Scenarios and targets are defined in dev/BENCHMARKS.md; this file must keep
 its shape forever so any two runs are comparable.
 
 Subcommands:
@@ -583,7 +583,7 @@ def print_markdown(out: Dict) -> None:
     w4 = r.get("W4_sync_upload", {})
     w4_cell = f"{w4['p99_s']}s" if "p99_s" in w4 else "skipped"
 
-    print("\n--- meter series row (append to docs/BENCHMARK_RESULTS.md) ---")
+    print("\n--- meter series row (append to dev/BENCHMARK_RESULTS.md) ---")
     print(
         f"| # | {m['date']} | `{m['commit']}` | {rps('R1_json')} | {rps('R3_304')} "
         f"| {rps('R2_torch_idx')} | {rps('R6_302')} | {rps('R7_metadata')} "

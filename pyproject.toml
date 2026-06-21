@@ -27,7 +27,7 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/brycedrennan/pypiron"
 Repository = "https://github.com/brycedrennan/pypiron"
-Documentation = "https://github.com/brycedrennan/pypiron#readme"
+Documentation = "https://brycedrennan.github.io/pypiron/"
 Issues = "https://github.com/brycedrennan/pypiron/issues"
 Changelog = "https://github.com/brycedrennan/pypiron/releases"
 
@@ -49,6 +49,10 @@ dev = [
     "twine",
     "uv",
 ]
+# User-facing docs site (mkdocs-material). Build: `make docs`; serve: `make docs-serve`.
+docs = [
+    "mkdocs-material>=9.5",
+]
 
 [tool.pytest.ini_options]
 markers = [
@@ -58,7 +62,7 @@ markers = [
     "azure: tests that require Docker/Azurite Azure Blob emulation",
     "perf: performance benchmarks against the release binary (disabled by default)",
     "chaos: crash-point fault injection sweeps (slow-ish, deterministic)",
-    "compat(client, feature): client compatibility coverage point for docs/COMPATIBILITY.md",
+    "compat(client, feature): client compatibility coverage point for docs/reference/compatibility.md",
 ]
 addopts = "-m 'not perf and not stress'"
 testpaths = [

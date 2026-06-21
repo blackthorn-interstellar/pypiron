@@ -1,5 +1,5 @@
 # pypicloud, Track 2 (best cloud): S3 blob storage + DynamoDB metadata cache —
-# its real cloud-native combo (no Postgres sidecar). docs/BENCHMARK_INSTALL.md §1.
+# its real cloud-native combo (no Postgres sidecar). dev/BENCHMARK_INSTALL.md §1.
 #
 # AWS-only: needs a real bucket + DynamoDB + credentials (rig instance profile via
 # IMDS). pypicloud auto-creates its DynamoDB tables on startup. Set

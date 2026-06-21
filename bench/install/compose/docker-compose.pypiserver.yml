@@ -7,7 +7,7 @@
 # Seeded by copying the wheelhouse into the packages volume (seed class "copy"),
 # then a restart so cached-dir rescans. No PEP 691 JSON / PEP 658 metadata: uv
 # range-requests wheel METADATA — a real architectural difference, reported not
-# "fixed". docs/BENCHMARK_INSTALL.md §3. Reachable at pypiserver:8080.
+# "fixed". dev/BENCHMARK_INSTALL.md §3. Reachable at pypiserver:8080.
 
 services:
   pypiserver:

@@ -1,5 +1,5 @@
 # Corpus of well-known open-source Python projects whose dependency closures
-# drive the realistic install benchmark (see docs/BENCHMARK_INSTALL.md).
+# drive the realistic install benchmark (see dev/BENCHMARK_INSTALL.md).
 #
 # This file is the curated INPUT (loose names + realistic extras). The frozen
 # OUTPUT — exact versions, wheel URLs, sizes, hashes — lives in the generated

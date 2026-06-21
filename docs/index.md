@@ -6,7 +6,8 @@ One binary, no database. pypiron serves your private uploads, mirrors public PyP
 on demand, and bulk-syncs allowlists — all behind one URL and one namespace.
 Truth is files on disk or object storage; indexes are regenerable views.
 
-![Max sustained install throughput](assets/install-throughput.svg)
+![Max sustained install throughput](assets/install-throughput.svg#only-light)
+![Max sustained install throughput](assets/install-throughput-dark.svg#only-dark)
 
 ## Highlights
 

@@ -167,10 +167,16 @@
   font-weight: 700;
 }
 
-/* Content images (e.g. the benchmark chart, which carries its own white card):
-   round the corners so a light figure reads as intentional on dark. */
+/* Content images: round the corners (the benchmark chart carries its own card). */
 .md-typeset img {
   border-radius: 8px;
+}
+
+/* Theme-aware figures: embed both `name.svg#only-light` and `name-dark.svg#only-dark`
+   and the active scheme shows the matching one (same trick as the uv docs). */
+[data-md-color-scheme="pypiron-light"] img[src$="#only-dark"],
+[data-md-color-scheme="pypiron-dark"] img[src$="#only-light"] {
+  display: none;
 }
 
 /* The logo is a rusted-iron block on transparency; give it a hair of room. */

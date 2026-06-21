@@ -152,7 +152,10 @@ code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
 .empty{color:var(--muted);font-size:14px;font-style:italic}\
 .activity{margin-top:44px;border-top:1px solid var(--border);padding-top:24px}\
 .activity .cap{margin:0 0 16px;color:var(--muted);font-size:13px;text-align:center}\
-main.wide{max-width:1000px;padding-top:0}\
+main.wide{max-width:1000px}\
+/* The project page drops main's top padding because its full-width header band\
+   already supplies it; the (bandless) landing page keeps its padding. */\
+.phead-band+main,.psummary+main{padding-top:0}\
 .top .home{font:inherit;font-size:20px;font-weight:650;letter-spacing:-.02em;color:var(--fg)}\
 .top .home:hover{text-decoration:none}\
 /* Header band: spans the full window width (a distinct background from the\
@@ -227,7 +230,9 @@ table.files-t td{border-bottom:1px solid var(--border);padding:6px 8px;vertical-
 .brand .logo{height:52px;width:auto}\
 .brand h1{margin:0;font-size:23px;letter-spacing:-.02em}\
 .brand .tag{margin:2px 0 0;font-size:13px}\
-.idxbox{margin-left:auto;max-width:min(100%,360px);font-size:12px}\
+.idxbox{margin-left:auto;max-width:min(100%,300px)}\
+.idxbox code{padding:5px 9px;font-size:11px}\
+.idxbox .copy{padding:0 9px;font-size:11px}\
 .search{display:flex;gap:10px;margin:8px 0 12px}\
 .search-input{flex:1;min-width:0;font:inherit;font-size:17px;padding:14px 18px;background:var(--card);color:var(--fg);border:1px solid var(--border);border-radius:10px}\
 .search-input:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:var(--accent)}\
@@ -352,7 +357,7 @@ aria-label=\"Search packages\" autocomplete=\"off\" autofocus>\
         logo = logo_link(),
         footer = version_footer(ctx.version),
     );
-    shell("pypiron", "", &body, true, false)
+    shell("pypiron", "", &body, true, true)
 }
 
 /// The labelled configuration section: posture settings (proxy, delivery,

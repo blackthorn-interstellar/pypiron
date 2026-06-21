@@ -44,6 +44,30 @@ def test_root_serves_landing_with_embedded_logo_and_index_url(disk_server):
     assert "twine upload" not in html
 
 
+def test_favicon_served_as_multisize_ico(disk_server):
+    code, body, headers = http_get(f"{disk_server['base_url']}/favicon.ico")
+    assert code == 200
+    assert headers.get("content-type") == "image/x-icon"
+    # Immutable per build, so it's cacheable (unlike the no-cache HTML pages).
+    assert "max-age" in headers.get("cache-control", "")
+    # A real ICO: 2 reserved bytes (00 00) then image type 1 (01 00).
+    assert body[:4] == b"\x00\x00\x01\x00"
+    assert len(body) > 1000  # carved from the logo, not an empty placeholder
+
+
+def test_pages_declare_the_favicon(disk_server):
+    _, body, _ = http_get(f"{disk_server['base_url']}/")
+    assert '<link rel="icon" href="/favicon.ico"' in body.decode()
+
+
+def test_favicon_is_public_under_read_auth(disk_server_read_auth):
+    # Browsers fetch /favicon.ico before any credential is in play, so it must
+    # stay outside read auth — same posture as /health and /metrics.
+    code, _, headers = http_get(f"{disk_server_read_auth['base_url']}/favicon.ico")
+    assert code == 200
+    assert headers.get("content-type") == "image/x-icon"
+
+
 def test_root_url_follows_forwarded_headers(disk_server):
     code, body, _ = http_get(
         f"{disk_server['base_url']}/",

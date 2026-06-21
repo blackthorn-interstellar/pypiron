@@ -581,6 +581,7 @@ async fn run_serve(mut cli: ServeArgs, log_format: LogFormat) -> Result<()> {
         // inline activity panel and the package browser are gated by read auth
         // inside their handlers.
         .route("/", get(root))
+        .route("/favicon.ico", get(favicon))
         .route("/projects", get(projects_page))
         .route("/projects/", get(projects_page))
         .route("/project/:package", get(project_page))
@@ -1179,6 +1180,18 @@ async fn serve_metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
         .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(state.metrics.render()))
+        .unwrap_or_else(not_found)
+}
+
+/// The site icon, carved from the logo. Static and immutable per build, so it's
+/// served straight from the embedded bytes with a day-long cache and no auth —
+/// browsers fetch it unprompted, before any credential is in play.
+async fn favicon() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/x-icon")
+        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .body(Body::from(web::FAVICON_ICO))
         .unwrap_or_else(not_found)
 }
 

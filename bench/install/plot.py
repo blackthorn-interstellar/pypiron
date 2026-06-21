@@ -20,10 +20,11 @@ from pathlib import Path
 
 from benchlib import RESULTS
 
-PURPLE = "#6e40c9"
+BAR = "#e07b45"  # iron/rust brand orange
 TEXT = "#1f2328"
 AXIS = "#8b949e"
 GRID = "#eaecef"
+XMAX = 2300.0  # axis ceiling (longest bar ~2,034/s; leaves room for its label)
 ALIAS = {"bander": "bandersnatch"}  # cmp-bander-ceiling.json -> bandersnatch
 
 
@@ -45,22 +46,22 @@ def collect() -> list[tuple[str, float]]:
     return sorted(best.items(), key=lambda kv: -kv[1])
 
 
-def nice_ticks(maxv: float, n: int = 4) -> list[float]:
-    step = maxv / n
+def nice_ticks(top: float, n: int = 5) -> list[float]:
+    """Round gridline values from 0 up to (not exceeding) the axis ceiling `top`."""
+    step = top / n
     mag = 10 ** math.floor(math.log10(step))
     step = next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= step)
-    top = math.ceil(maxv / step) * step
-    return [i * step for i in range(round(top / step) + 1)]
+    return [i * step for i in range(int(top // step) + 1)]
 
 
 def svg(data: list[tuple[str, float]], title: str, subtitle: str) -> str:
-    W, LABEL, PAD_R, ROW = 780, 130, 80, 36
+    W, LABEL, PAD_R, ROW = 780, 130, 80, 26
     head = 56 if title else 14
     plot_w = W - LABEL - PAD_R
     base = head + len(data) * ROW
     H = base + 40
-    ticks = nice_ticks(max(v for _, v in data))
-    top = ticks[-1]
+    top = XMAX
+    ticks = nice_ticks(top)
 
     def x(v: float) -> float:
         return LABEL + plot_w * v / top
@@ -88,7 +89,7 @@ def svg(data: list[tuple[str, float]], title: str, subtitle: str) -> str:
         f'<text x="{LABEL + plot_w / 2:.1f}" y="{base + 34}" font-size="11" fill="{AXIS}" '
         f'text-anchor="middle">installs / second (higher is better)</text>'
     )
-    bh = 20
+    bh = 16
     for i, (name, v) in enumerate(data):
         by = head + i * ROW + (ROW - bh) / 2
         ty = by + bh * 0.72
@@ -98,7 +99,7 @@ def svg(data: list[tuple[str, float]], title: str, subtitle: str) -> str:
             f'fill="{TEXT}" text-anchor="end">{name}</text>'
         )
         s.append(
-            f'<rect x="{LABEL}" y="{by:.1f}" width="{x(v) - LABEL:.1f}" height="{bh}" rx="2" fill="{PURPLE}"/>'
+            f'<rect x="{LABEL}" y="{by:.1f}" width="{x(v) - LABEL:.1f}" height="{bh}" rx="2" fill="{BAR}"/>'
         )
         s.append(
             f'<text x="{x(v) + 8:.1f}" y="{ty:.1f}" font-size="12" font-weight="{weight}" '

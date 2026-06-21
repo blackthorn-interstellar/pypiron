@@ -8,19 +8,17 @@ An ultra-fast Python package server, written in Rust.
 
 <p align="center">
   <img src="docs/install-throughput.png" alt="Max sustained install throughput: pypiron vs pypiserver, devpi, pypicloud, bandersnatch, proxpi" width="760">
-  <br>
-  <sub>installs per second · r7i.large</sub>
 </p>
 
 
 ## Highlights
 - **4x-60x faster** than other PyPi servers
-- **Mitigates supply-chain attacks** avoid supply chain issues by excluding recent updates via `--exclude-newer`
-- **Compatible with entire ecosystem** uv, pip, poetry, twine, pipenv, hatch
-- **Infinite horizontal scaling that "just works"** — point any number of nodes at the same bucket; reads need zero coordination.
-- **Per-project download tracking** — see per-package, per-version download statistics .
-- **Mirror or proxy PyPI** — one URL serves private packages and cached public dependencies.
-- **Dependency-confusion defense** — every package is exclusively private or mirrored, claimed at first write.
+- **Mitigates supply-chain attacks.** Avoid supply chain issues by excluding recent updates via `--exclude-newer`
+- **Compatible with entire ecosystem/** uv, pip, poetry, twine, pipenv, hatch
+- **Infinite horizontal scaling that "just works".** Point any number of nodes at the same bucket; reads need zero coordination.
+- **Per-project download tracking.** Per-package, per-version download statistics.
+- **Host private and public packages together.** One URL serves private packages and cached public dependencies.
+- **Dependency-confusion defense.** Every package is exclusively private or mirrored, claimed at first write.
 
 
 ## Quickstart
@@ -29,90 +27,137 @@ An ultra-fast Python package server, written in Rust.
 uvx pypiron serve 
 ```
 
-## Features
+## Examples
 
-### Publish and install
+Four recipes cover almost everyone. There is one URL and one namespace — it
+serves your private uploads, packages you `sync` in, and anything proxied on
+demand, all at once — so mix these freely. Every `--flag` is also a `PYPIRON_*`
+env var; the full reference is [CONFIGURATION.md](docs/CONFIGURATION.md).
 
-```bash
-PYPIRON_ADMIN_USER=admin PYPIRON_ADMIN_PASS=secret uvx pypiron serve
+### 1. Host private packages
 
-uv publish --publish-url http://localhost:8080/legacy/ \
-  --username admin --password secret dist/*.whl
-
-uv add --index-url http://localhost:8080/simple/ mypackage
-```
-
-### Mirror PyPI
-
-`pypiron sync` mirrors an allowlist of public packages, carrying PyPI's true
-upload timestamps so `uv --exclude-newer` resolves historically correct
-versions against your mirror:
+Internal libraries that must never touch public PyPI. Disk storage, one box:
 
 ```bash
-# Mirror a list into a running server (sync is an HTTP client; --to is required)
-pypiron sync --packages-list packages.txt \
-  --to http://localhost:8080 --username admin --password adminsecret
-
-# ...or a one-off package without a list file (--pkg is repeatable)
-pypiron sync --pkg requests --pkg numpy \
-  --to http://localhost:8080 --username admin --password adminsecret
+uvx pypiron serve --admin-pass "$ADMIN" --read-user team --read-pass "$READ"
 ```
 
-```text
-# packages.txt
-requests>=2.20,<3
-numpy
+`--admin-pass` alone is a complete credential (the admin user defaults to
+`admin`). Setting `--read-user` makes reads require auth — drop it to leave
+installs public.
+
+```bash
+# publish
+uv publish --publish-url http://HOST:8080/legacy/ \
+  --username admin --password "$ADMIN" dist/*
+
+# install — add pypiron alongside PyPI (pip: --extra-index-url)
+uv add --index http://team:$READ@HOST:8080/simple/ acme-widgets
 ```
 
-Wheel/platform/date filters and a `pypiron.toml` config file are in
+Want a single index that serves public packages too, instead of two? → setup 2.
+
+### 2. One index for private + public
+
+The most common setup: a single URL that serves your private packages and
+caches everything else from PyPI on first use, so developers configure one index
+instead of two. That's also what closes the dependency-confusion hole.
+
+```bash
+uvx pypiron serve --admin-pass "$ADMIN" \
+  --private-prefix acme \
+  --proxy-upstream https://pypi.org \
+  --proxy-exclude-newer "7 days"
+```
+
+- `--proxy-upstream` mirrors public packages on demand, cached in storage
+  forever after — served locally whether PyPI is up or down.
+- `--private-prefix acme` reserves the `acme-*` namespace for your uploads;
+  those names never fall through to upstream.
+- `--proxy-exclude-newer` *(optional)* hides releases younger than the window —
+  a cheap supply-chain quarantine; `uv --exclude-newer` resolves against it.
+
+Point installs and CI at the one index — public and private resolve together:
+
+```bash
+uv add --default-index http://HOST:8080/simple/ requests acme-widgets
+```
+
+### 3. Air-gapped mirror
+
+No egress: the serving node can't reach PyPI, so you pre-load an allowlist with
+`pypiron sync` from a host that can. `sync` is a pure HTTP client — it only needs
+the server's URL and the admin credential, nothing about its storage.
+
+```bash
+uvx pypiron serve --admin-pass "$ADMIN"        # inside the network, no internet
+```
+
+From a host that can reach both PyPI and the server, put the allowlist and
+filters in `pypiron.toml` (auto-discovered in the working directory):
+
+```toml
+[sync]
+to = "http://HOST:8080"
+username = "admin"                       # password via PYPIRON_SYNC_PASSWORD
+packages = ["requests>=2.20,<3", "numpy", "pandas"]
+only-wheels = true
+exclude-newer = "2026-01-01T00:00:00Z"   # reproducible, historically-correct cutoff
+```
+
+```bash
+export PYPIRON_SYNC_PASSWORD="$ADMIN"
+pypiron sync                 # re-run anytime; unchanged upstream is a 304 and skipped
+```
+
+Run `pypiron sync --full` on a schedule (e.g. nightly) to reconcile yanks and
+upstream removals. Wheel/platform/date filters:
 [CONFIGURATION.md](docs/CONFIGURATION.md#sync-filters-and-config-file).
 
-### Proxy PyPI on demand
+### 4. Production (S3, multi-node, HTTPS)
 
-`sync` mirrors what you list; the proxy mirrors what you *use* — fetched from
-upstream on first request, cached in storage forever after, served locally
-whether upstream is up or down:
+Object storage instead of disk, any number of identical nodes on the same
+bucket. `docker-compose.yml`:
 
-```bash
-pypiron serve --admin-user admin --admin-pass secret \
-  --private-prefix acme \
-  --proxy-upstream https://pypi.org
+```yaml
+services:
+  pypiron:
+    image: ghcr.io/brycedrennan/pypiron:latest
+    command: pypiron serve --storage s3 --s3-bucket my-pypiron
+    ports: ["8080:8080"]
+    environment:
+      PYPIRON_ADMIN_PASS: ${ADMIN}
+      PYPIRON_READ_USER: team
+      PYPIRON_READ_PASS: ${READ}
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}      # on AWS, drop these two and
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}  # use the instance/task role
 ```
 
-Names claimed private never fall through to upstream — the dependency-confusion
-hole stays closed.
+Scale out by running the same container on more hosts pointed at the same bucket
+— reads are stateless file serving, no coordination; one node is elected index
+writer via an S3 lease and failover is automatic. The bucket must already exist.
 
-### Scale out
+pypiron speaks plain HTTP; terminate TLS in a reverse proxy out front. A
+three-line Caddyfile is the whole story:
 
-Start more nodes on the same bucket. That's the whole procedure:
-
-```bash
-pypiron serve --storage s3 --s3-bucket my-bucket ...   # node 1
-pypiron serve --storage s3 --s3-bucket my-bucket ...   # node 2, same bucket, done
+```caddy
+pypi.acme.com {
+    reverse_proxy localhost:8080
+}
 ```
 
-Reads are stateless file serving — no coordination, no shared state, no
-session affinity. Nodes elect an index writer through an S3 lease; failover is
-automatic.
+GCS and Azure backends, the full three-tier auth model, and presigned-redirect
+delivery are all in [CONFIGURATION.md](docs/CONFIGURATION.md).
 
-### Authentication
+### Track installs per project
 
-Three optional basic-auth credentials: **admin** (everything), **uploader**
-(publish), **reader** (read). No write credential configured means the server
-is read-only; no read credential means reads are public.
-
-```bash
-pip install --index-url http://reader:secret@localhost:8080/simple/ mypackage
-```
-
-### Track downloads per project
-
-Username subaddressing tags every request with the consuming project — counts
-land in Prometheus `/metrics` as `pypiron_project_requests_total{project=...}`:
+Username subaddressing tags each request with the consuming project; counts land
+in Prometheus `/metrics` as `pypiron_project_requests_total{project=...}` and at
+`GET /stats/downloads`:
 
 ```bash
-export UV_INDEX_COMPANY_USERNAME="reader+billing-api"
-export UV_INDEX_COMPANY_PASSWORD="secret"
+export UV_INDEX_COMPANY_USERNAME="team+billing-api"   # password unchanged
 ```
 
 ## Ecosystem
@@ -122,4 +167,3 @@ Alternatives, for comparison:
 [pypiserver](https://github.com/pypiserver/pypiserver),
 [pypicloud](https://github.com/stevearc/pypicloud),
 [devpi](https://www.devpi.net/).
-

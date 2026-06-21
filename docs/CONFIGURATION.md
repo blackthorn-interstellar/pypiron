@@ -83,6 +83,27 @@ artifact downloads stream.
 | `--artifact-delivery`        | `PYPIRON_ARTIFACT_DELIVERY`        | `auto`         | How artifact bytes reach clients (see below)     |
 | `--sync-uploads`             | `PYPIRON_SYNC_UPLOADS`             | `false`        | Wait for index visibility before returning 200   |
 | `--sync-upload-timeout-secs` | `PYPIRON_SYNC_UPLOAD_TIMEOUT_SECS` | `10`           | Bound on the synchronous-upload wait             |
+| `--download-stats`           | `PYPIRON_DOWNLOAD_STATS`           | `true`         | Count per-package/version downloads per day (see below) |
+| `--counters-resolution`      | `PYPIRON_COUNTERS_RESOLUTION`      | `1d`           | Counter bucket width: `1d`/`1h`/`30m`/`2h` (whole minutes dividing a day) |
+| `--counters-flush-interval-secs`  | `PYPIRON_COUNTERS_FLUSH_INTERVAL_SECS`  | `300` | How often each node flushes counts (the dominant cost knob) |
+| `--counters-rollup-interval-secs` | `PYPIRON_COUNTERS_ROLLUP_INTERVAL_SECS` | `3600` | Leader compaction cadence (freeze finished days, prune) |
+| `--counters-retention-days`  | `PYPIRON_COUNTERS_RETENTION_DAYS`  | `90`           | Days of per-day counter history to keep           |
+
+**Download counters.** With `--download-stats` (on by default), each node counts
+artifact downloads per `(package, filename)` in memory and flushes immutable
+delta segments under `_counters/` every `--counters-flush-interval-secs`; the
+leader compacts a finished day into one frozen file per shard and writes a small
+per-day summary. Read them at `GET /stats/downloads/<pkg>` (per-package, last 30
+days, rolled up to versions; includes today) and `GET /stats/downloads`
+(global top packages + daily totals, closed days only) — both read-auth gated.
+Counts are a best-effort, *lossy* analytic (never truth). The **per-package**
+breakdown is deliberately kept off `/metrics` (registry-sized cardinality);
+`/metrics` carries only a single low-cardinality `pypiron_downloads_total`
+aggregate, and the root dashboard's Metrics section gains a per-node "Downloads"
+tile (accurate on S3, unlike "Files served"). Cost is dominated by
+flush PUTs (`flush_interval × nodes`): ~$0.04/node/month at the 300 s default,
+effectively free for a private registry. Frozen days are exact; today lags one
+flush interval. Changing the resolution is non-destructive (old days keep theirs).
 
 **Large uploads:** the upload spool defaults to the system temp dir. In
 containers where `/tmp` is RAM-backed tmpfs, point it at real disk or multi-GB
@@ -144,6 +165,8 @@ credential — nothing about the server's storage backend.
 | `--private-prefix`            | `PYPIRON_PRIVATE_PREFIX`         | *(none)*           | Refuse to mirror names inside this namespace            |
 | `--concurrency N`             | `PYPIRON_SYNC_CONCURRENCY`       | `4`                | Parallel downloads/uploads within one package           |
 | `--package-concurrency N`     | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8`              | Packages synced in parallel                             |
+| `--config PATH`               | `PYPIRON_CONFIG`                 | *(auto)*           | Path to a `pypiron.toml` (default `./pypiron.toml` if present) |
+| `--spool-dir PATH`            | `PYPIRON_SYNC_SPOOL_DIR`         | system temp        | Download spool dir — real disk, not tmpfs, for large wheels |
 | `--dry-run`                   | —                                | `false`            | Print what would be mirrored, write nothing             |
 
 `--to` is mandatory (there is no direct-to-storage mode); without it (and no

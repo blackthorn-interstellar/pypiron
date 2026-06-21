@@ -386,7 +386,7 @@ impl Proxy {
             .await
             .and_then(|r| r.error_for_status());
         match resp {
-            Ok(resp) => resp.bytes().await.ok(),
+            Ok(resp) => read_capped(resp, crate::wheel::MAX_METADATA_BYTES, &url).await,
             Err(e) => {
                 warn!(%url, error=?e, "proxy: upstream metadata fetch failed");
                 None
@@ -427,7 +427,7 @@ impl Proxy {
             .await
             .and_then(|r| r.error_for_status());
         match resp {
-            Ok(resp) => resp.bytes().await.ok(),
+            Ok(resp) => read_capped(resp, crate::wheel::MAX_METADATA_BYTES, url.as_str()).await,
             Err(e) => {
                 warn!(%url, error=?e, "proxy: upstream provenance fetch failed");
                 None
@@ -583,6 +583,36 @@ impl Proxy {
         let base = reqwest::Url::parse(&format!("{}/simple/{pkg}/", self.upstream))?;
         Ok(base.join(raw)?)
     }
+}
+
+/// Read an upstream companion body into memory with a hard ceiling. The local
+/// wheel extractor already bounds `.metadata` at 16 MiB; the passthrough/cache
+/// paths must too, or a hostile/huge upstream `.metadata`/`.provenance` body
+/// (the timeout bounds time, not size) OOMs the node. `None` on overflow or a
+/// read error — both fall back to a local 404, which is the existing contract.
+async fn read_capped(resp: reqwest::Response, max: u64, url: &str) -> Option<bytes::Bytes> {
+    let declared = resp.content_length();
+    if declared.is_some_and(|len| len > max) {
+        warn!(%url, max, "proxy: upstream body exceeds cap (Content-Length)");
+        return None;
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(declared.map_or(0, |l| l.min(max)) as usize);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(%url, error=?e, "proxy: upstream body read failed");
+                return None;
+            }
+        };
+        if buf.len() as u64 + chunk.len() as u64 > max {
+            warn!(%url, max, "proxy: upstream body exceeds cap");
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Some(bytes::Bytes::from(buf))
 }
 
 /// Keep the listings cache bounded: first drop everything past its TTL (those

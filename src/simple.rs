@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -157,7 +158,7 @@ pub async fn fetch_index_conditional(
                 .get("x-pypi-last-serial")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse().ok());
-            let index = resp.json().await?;
+            let index = read_index_capped(resp).await?;
             Ok(IndexFetch::Found {
                 index,
                 etag,
@@ -165,6 +166,33 @@ pub async fn fetch_index_conditional(
             })
         }
     }
+}
+
+/// A single package's PEP 691 JSON is KBs to a few MB even for the largest
+/// projects; cap the body well above that so a hostile or runaway upstream index
+/// can't be buffered unbounded into RAM during a sync.
+const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read a PEP 691 JSON listing with a hard size ceiling. `resp.json()` would
+/// buffer the whole body with no bound (the timeout caps time, not size).
+async fn read_index_capped(resp: reqwest::Response) -> Result<SimpleIndex> {
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_INDEX_BYTES)
+    {
+        bail!("upstream index exceeds {MAX_INDEX_BYTES} bytes (Content-Length)");
+    }
+    let mut buf: Vec<u8> =
+        Vec::with_capacity(resp.content_length().map_or(0, |l| l.min(MAX_INDEX_BYTES)) as usize);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if buf.len() as u64 + chunk.len() as u64 > MAX_INDEX_BYTES {
+            bail!("upstream index exceeds {MAX_INDEX_BYTES} bytes");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&buf)?)
 }
 
 /// Fetch a package's PEP 691 JSON listing from `base`. `Ok(None)` on a 404 —

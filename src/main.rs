@@ -1235,6 +1235,14 @@ async fn initialize_indexes(state: &AppState) -> Result<()> {
 /// part buffering unbounded bytes in RAM.
 const PROVENANCE_MAX_FIELD_BYTES: usize = 4 * 1024 * 1024;
 
+/// Bound the non-file metadata parts as a whole. The per-field cap above doesn't
+/// stop a flood of uniquely-named 64 KiB fields — ~16k of them fit under the
+/// 1 GiB body limit and sit resident in the `fields` map at once, OOMing a small
+/// box. Real uploads send a few dozen small fields (plus the two large JSON
+/// ones), so these limits are generous headroom, not a functional constraint.
+const MAX_METADATA_FIELDS: usize = 256;
+const MAX_METADATA_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+
 async fn legacy_upload(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1259,6 +1267,8 @@ async fn legacy_upload(
     let mut filename_opt: Option<String> = None;
     let mut spooled: Option<upload::FinishedSpool> = None;
     let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Cumulative bytes across non-file parts — bounds the metadata map's RAM.
+    let mut metadata_total_bytes: usize = 0;
 
     while let Some(mut field) = multipart.next_field().await.map_err(|_| {
         (
@@ -1341,6 +1351,20 @@ async fn legacy_upload(
                 }
                 if let Ok(text) = String::from_utf8(buf) {
                     if !text.is_empty() {
+                        metadata_total_bytes += text.len();
+                        if metadata_total_bytes > MAX_METADATA_TOTAL_BYTES {
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                "Metadata fields too large".into(),
+                            ));
+                        }
+                        if !fields.contains_key(&field_name) && fields.len() >= MAX_METADATA_FIELDS
+                        {
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                "Too many metadata fields".into(),
+                            ));
+                        }
                         fields.insert(field_name, text);
                     }
                 }

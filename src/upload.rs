@@ -68,6 +68,12 @@ impl UploadSpool {
         Ok(())
     }
 
+    /// Bytes written so far — lets a streaming caller enforce a size cap
+    /// mid-download instead of after the whole body has landed.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
     pub async fn finish(mut self) -> Result<FinishedSpool> {
         self.file.flush().await?;
         self.file.sync_data().await?;

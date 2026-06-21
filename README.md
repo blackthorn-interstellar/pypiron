@@ -15,13 +15,12 @@ An ultra-fast Python package server, written in Rust.
 
 ## Highlights
 - **4x-60x faster** than other PyPi servers
-- **Mitigates supply-chain attacks** by supporting `--exclude-newer` and protecting private package names
+- **Mitigates supply-chain attacks** avoid supply chain issues by excluding recent updates via `--exclude-newer`
 - **Compatible with entire ecosystem** uv, pip, poetry, twine, pipenv, hatch
 - **Infinite horizontal scaling that "just works"** — point any number of nodes at the same bucket; reads need zero coordination.
-- 📊 **Per-project download tracking** — tag requests by consuming project, straight into Prometheus.
-- 🔁 **Mirror or proxy PyPI** — one URL serves private packages and cached public dependencies.
-- 📦 **Standards-complete** — PEP 503, 691, 700, 658, 592; `uv`, `pip`, `twine`, `poetry`, and `pdm` work unmodified.
-- 🛡️ **Dependency-confusion defense** — every package is exclusively private or mirrored, claimed at first write.
+- **Per-project download tracking** — see per-package, per-version download statistics .
+- **Mirror or proxy PyPI** — one URL serves private packages and cached public dependencies.
+- **Dependency-confusion defense** — every package is exclusively private or mirrored, claimed at first write.
 
 
 ## Quickstart
@@ -29,16 +28,6 @@ An ultra-fast Python package server, written in Rust.
 ```bash
 uvx pypiron serve 
 ```
-
-## Documentation
-
-- [CONFIGURATION.md](docs/CONFIGURATION.md) — every flag, env var, and endpoint
-- [DESIGN.md](docs/DESIGN.md) — architecture and reasoning ([VISION.md](docs/VISION.md) is the one-pager)
-- [STANDARDS.md](docs/STANDARDS.md) — PEP support matrix
-- [COMPATIBILITY.md](docs/COMPATIBILITY.md) — generated client compatibility matrix
-- [TESTING.md](docs/TESTING.md) — blackbox-first test philosophy
-- [ROADMAP.md](docs/ROADMAP.md) — features shipped, planned, and rejected
-- [BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) — measured numbers and the improvements log
 
 ## Features
 
@@ -50,11 +39,8 @@ PYPIRON_ADMIN_USER=admin PYPIRON_ADMIN_PASS=secret uvx pypiron serve
 uv publish --publish-url http://localhost:8080/legacy/ \
   --username admin --password secret dist/*.whl
 
-pip install --index-url http://localhost:8080/simple/ mypackage
+uv add --index-url http://localhost:8080/simple/ mypackage
 ```
-
-`twine`, `poetry`, and `pdm` work the same way. Point clients at this registry
-*only* — never `--extra-index-url` (see the FAQ).
 
 ### Mirror PyPI
 
@@ -129,32 +115,6 @@ export UV_INDEX_COMPANY_USERNAME="reader+billing-api"
 export UV_INDEX_COMPANY_PASSWORD="secret"
 ```
 
-## FAQ
-
-**Does it need a database?** No. Truth is files, the index is a
-regenerable view, backups are rsync. See
-[DESIGN.md](docs/DESIGN.md#what-no-db-honestly-costs).
-
-**How do private and public packages share one URL?** They live in one index —
-there's no virtual-repo group (Artifactory/Nexus) or index inheritance (devpi)
-to compose. Those tools merge several repos per request, which is where
-resolution-order bugs and dependency-confusion fall-through happens. In pypiron, every
-package name belongs to exactly one world — `private` or `mirror`, claimed at first
-write — so there's nothing to merge and no order to get wrong. See
-[DESIGN.md](docs/DESIGN.md#private--mirrored-packages-dependency-confusion).
-
-**Why `--index-url` only, never `--extra-index-url`?** pip merges extra indexes
-with no priority — that *is* the dependency-confusion vulnerability. Point
-clients at this registry only; it decides what exists.
-
-**Is one node enough?** Almost always. Artifacts are served immutable and
-indexes ETag-revalidate, so client and proxy caches compound a single node's
-already-large capacity. Add nodes for availability, not throughput.
-
-**Is it production-ready?** For private registries — the stated target — yes:
-one binary, measured numbers, and a blackbox suite that drives real clients.
-For a multi-tenant pypi.org clone, no, and we don't try.
-
 ## Ecosystem
 
 Alternatives, for comparison:
@@ -163,6 +123,3 @@ Alternatives, for comparison:
 [pypicloud](https://github.com/stevearc/pypicloud),
 [devpi](https://www.devpi.net/).
 
-## License
-
-PypIron is licensed under the [MIT License](LICENSE).

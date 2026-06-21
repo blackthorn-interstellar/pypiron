@@ -829,14 +829,9 @@ async fn render_project(
         Some(f) => load_core_metadata(state, &pkg, f).await,
         None => None,
     };
-    let prov_rep = representative(&files, &selected, |f| f.provenance);
-    let publisher = match prov_rep {
+    let publisher = match representative(&files, &selected, |f| f.provenance) {
         Some(f) => load_provenance(state, &pkg, f).await,
         None => None,
-    };
-    let verified = match (&publisher, prov_rep) {
-        (Some(p), Some(f)) => Some((p, f.filename.as_str())),
-        _ => None,
     };
 
     html_ok(web::project_html(
@@ -846,7 +841,7 @@ async fn render_project(
         &selected,
         pinned,
         meta.as_ref(),
-        verified,
+        publisher.as_ref(),
     ))
 }
 

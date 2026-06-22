@@ -46,7 +46,6 @@
   --md-primary-fg-color: var(--pi-surface-d);
   --md-primary-bg-color: #ece5dd;
   --md-accent-fg-color: var(--pi-accent-ink-d);
-  --md-typeset-a-color: var(--pi-accent-ink-d);
   --md-typeset-mark-color: rgba(224, 123, 69, 0.3);
 
   /* warm a few syntax tokens toward the brand (slate's defaults skew cool) */
@@ -55,6 +54,14 @@
   --md-code-hl-string-color: #9cc592;
   --md-code-hl-number-color: #e0a35a;
   --md-code-hl-function-color: #e9c46a;
+}
+
+/* Material forces a blue link color on slate keyed to its default primary
+   (`[data-md-color-scheme=slate][data-md-color-primary=indigo]`, specificity
+   0,2,0 — indigo is the default). Beat it (equal specificity, later source) so
+   links stay rust rather than reverting to blue. */
+[data-md-color-scheme="slate"][data-md-color-scheme] {
+  --md-typeset-a-color: var(--pi-accent-ink-d);
 }
 
 /* ---------- component tweaks (scheme-agnostic) ---------- */

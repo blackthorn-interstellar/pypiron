@@ -115,10 +115,12 @@ def test_homepage_shows_live_activity_when_reads_public(disk_server):
         "Total requests",
         "Files served",
         "Index cache hit rate",
-        "Top projects",
         "Top route groups",
     ):
         assert label in html, label
+    # The old "Top projects" chart was replaced by the "Most Downloaded Packages"
+    # marquee, which renders only when there is download traffic (none here).
+    assert "Top projects" not in html
     # The redundant "Packages hosted" tile was dropped — registry size lives in
     # the inventory row instead.
     assert "Packages hosted" not in html
@@ -519,4 +521,5 @@ def test_root_public_but_activity_panel_gated_under_read_auth(disk_server_read_a
     assert code == 200
     authed = body.decode()
     assert 'class="activity"' in authed
-    assert "Top projects" in authed
+    assert "Top route groups" in authed
+    assert "Top projects" not in authed

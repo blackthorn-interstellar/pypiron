@@ -316,6 +316,10 @@ struct ServeArgs {
     proxy_filter: proxy::ProxyFilterArgs,
 }
 
+/// Shared TTL cache of the ranked download leaderboard: `(computed_at, board)`,
+/// or `None` until first populated.
+type DownloadBoard = Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<(String, u64)>)>>>;
+
 #[derive(Clone)]
 struct AppState {
     storage: Arc<dyn Storage>,
@@ -361,6 +365,10 @@ struct AppState {
     /// Distributed S3-backed event counters (per-package/version downloads per
     /// day). Self-contained engine; see counters.rs. Disabled => a no-op.
     counters: Arc<counters::Counters>,
+    /// TTL cache of the global download leaderboard (ranked, top 500). Shared by
+    /// the homepage marquee and `/downloads/` so a public homepage doesn't rescan
+    /// the counter store on every hit; the numbers lag a flush interval anyway.
+    download_board: DownloadBoard,
     /// On-demand upstream mirroring (None unless --proxy-upstream is set).
     proxy: Option<Arc<proxy::Proxy>>,
     /// Process start, for the homepage uptime readout.
@@ -567,6 +575,7 @@ async fn run_serve(mut cli: ServeArgs, log_format: LogFormat) -> Result<()> {
         worker_nudge: Arc::new(tokio::sync::Notify::new()),
         metrics: Arc::new(metrics::Metrics::new()),
         counters,
+        download_board: Arc::new(std::sync::Mutex::new(None)),
         proxy,
         started: std::time::Instant::now(),
     });
@@ -635,6 +644,9 @@ async fn run_serve(mut cli: ServeArgs, log_format: LogFormat) -> Result<()> {
         // Per-package and global download counters (read-auth gated in-handler).
         .route("/stats/:metric", get(stats_summary_get))
         .route("/stats/:metric/:package", get(stats_get))
+        // The human download leaderboard (read-auth gated in-handler).
+        .route("/downloads", get(downloads_page))
+        .route("/downloads/", get(downloads_page))
         // Operational endpoints: deliberately outside read auth — load
         // balancers and Prometheus scrapers don't carry package credentials.
         .route("/health", get(health))
@@ -858,10 +870,12 @@ async fn root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respons
     }
     let snap = state.metrics.snapshot();
     let (cache_hits, cache_misses) = state.index_cache.stats();
+    let board = download_leaderboard(&state).await;
     let dash = web::DashboardData {
         snapshot: &snap,
         cache_hits,
         cache_misses,
+        top_downloads: &board,
     };
     html_ok(web::landing_html(&ctx, inventory.as_ref(), Some(&dash)))
 }
@@ -893,6 +907,18 @@ async fn projects_page(
         &names,
         browse.q.as_deref().unwrap_or(""),
     ))
+}
+
+/// The download leaderboard (`/downloads/`): the most-downloaded packages over
+/// the last 30 days, busiest first (top 500). Read-only and gated by read auth
+/// like the dashboard, so it never enumerates private names on a credentialed
+/// deployment. Served from the same TTL-cached board as the homepage marquee.
+async fn downloads_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
+    if !state.is_reader(&headers) {
+        return unauthorized();
+    }
+    let board = download_leaderboard(&state).await;
+    html_ok(web::downloads_html(&page_context(&state, &headers), &board))
 }
 
 /// The human project page (`/project/<pkg>/`): the latest version, tabbed into
@@ -1021,6 +1047,66 @@ async fn download_summary(state: &AppState, pkg: &str) -> Vec<(String, u64)> {
     let mut out: Vec<(String, u64)> = by_ver.into_iter().collect();
     out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     out
+}
+
+/// How long the cached download leaderboard stays warm. Downloads already lag a
+/// flush interval (300 s default), so a minute of staleness is invisible — but
+/// it spares a public, S3-backed homepage a counter-store rescan on every hit.
+const DOWNLOAD_BOARD_TTL: Duration = Duration::from_secs(60);
+
+/// Rank packages by total downloads from the per-day counter summaries, busiest
+/// first. Each summary's top keys are `<pkg>/<filename>`; we roll them up to the
+/// package. Approximate at the tail (a day keeps only its top keys), which is
+/// fine for a leaderboard glance. Shared by the global `/stats` JSON and the
+/// human leaderboard so both rank identically.
+fn rank_packages(
+    summaries: &std::collections::BTreeMap<String, counters::DaySummary>,
+) -> Vec<(String, u64)> {
+    let mut by_pkg: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for s in summaries.values() {
+        for (k, v) in &s.top {
+            let pkg = k.split('/').next().unwrap_or(k);
+            *by_pkg.entry(pkg.to_string()).or_insert(0) += v;
+        }
+    }
+    let mut ranked: Vec<(String, u64)> = by_pkg.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+}
+
+/// The most-downloaded packages over the last 30 days, ranked busiest first and
+/// capped at 500. The uncached compute behind [`download_leaderboard`].
+async fn compute_download_board(state: &AppState) -> Vec<(String, u64)> {
+    let to = OffsetDateTime::now_utc().date();
+    let from = to.saturating_sub(time::Duration::days(29));
+    let summaries = state.counters.query_summaries("downloads", from, to).await;
+    let mut ranked = rank_packages(&summaries);
+    ranked.truncate(500);
+    ranked
+}
+
+/// The download leaderboard, served from a short TTL cache so a public homepage
+/// (where every viewer sees the activity panel) doesn't rescan the counter store
+/// on every request. Returns up to the top 500 packages; callers slice as needed.
+async fn download_leaderboard(state: &AppState) -> Vec<(String, u64)> {
+    {
+        let guard = state
+            .download_board
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((at, board)) = guard.as_ref() {
+            if at.elapsed() < DOWNLOAD_BOARD_TTL {
+                return board.clone();
+            }
+        }
+    }
+    let board = compute_download_board(state).await;
+    let mut guard = state
+        .download_board
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = Some((std::time::Instant::now(), board.clone()));
+    board
 }
 
 /// Characters refused raw in a redirect path segment — anything that could
@@ -2174,18 +2260,12 @@ async fn stats_summary_get(
     let summaries = state.counters.query_summaries(&metric, from, to).await;
 
     let mut total: u64 = 0;
-    let mut by_pkg: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut days: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     for (day, s) in &summaries {
         total += s.total;
         days.insert(day.clone(), s.total);
-        for (k, v) in &s.top {
-            let pkg = k.split('/').next().unwrap_or(k).to_string();
-            *by_pkg.entry(pkg).or_insert(0) += v;
-        }
     }
-    let mut ranked: Vec<(String, u64)> = by_pkg.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut ranked = rank_packages(&summaries);
     ranked.truncate(20);
     json_response(serde_json::json!({
         "metric": metric,
@@ -2624,6 +2704,7 @@ impl AppState {
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             metrics: Arc::new(metrics::Metrics::new()),
             counters: Arc::new(counters::Counters::disabled()),
+            download_board: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),
         }
@@ -2813,6 +2894,41 @@ mod tests {
         let v = format!("Basic {}", b64.encode(format!("{user}:{pass}")));
         h.insert(header::AUTHORIZATION, HeaderValue::from_str(&v).unwrap());
         h
+    }
+
+    #[test]
+    fn rank_packages_rolls_up_files_and_ranks_busiest_first() {
+        use std::collections::BTreeMap;
+        let day = |entries: &[(&str, u64)]| counters::DaySummary {
+            total: entries.iter().map(|(_, c)| c).sum(),
+            top: entries.iter().map(|(k, c)| (k.to_string(), *c)).collect(),
+        };
+        let mut summaries: BTreeMap<String, counters::DaySummary> = BTreeMap::new();
+        summaries.insert(
+            "2026-06-20".into(),
+            day(&[
+                ("requests/requests-2.31.0-py3-none-any.whl", 6),
+                ("requests/requests-2.30.0-py3-none-any.whl", 4),
+                ("flask/flask-3.0.0-py3-none-any.whl", 7),
+            ]),
+        );
+        summaries.insert(
+            "2026-06-21".into(),
+            day(&[
+                ("requests/requests-2.31.0-py3-none-any.whl", 5),
+                ("zeta/zeta-1.0.0-py3-none-any.whl", 7),
+            ]),
+        );
+        // requests rolls up across files AND days (6+4+5=15) and ranks first;
+        // flask & zeta tie at 7, broken by name ascending (flask before zeta).
+        assert_eq!(
+            rank_packages(&summaries),
+            vec![
+                ("requests".to_string(), 15),
+                ("flask".to_string(), 7),
+                ("zeta".to_string(), 7),
+            ]
+        );
     }
 
     #[test]

@@ -49,6 +49,21 @@ curl -u $READ http://localhost:8080/stats/downloads
 }
 ```
 
+### In the browser
+
+Two human pages render the same numbers for an authorized reader (gated like the
+JSON endpoints above):
+
+- The homepage (`/`) leads its activity panel with a **Most Downloaded Packages**
+  chart — the top five over the last 30 days — linking to the full leaderboard.
+- `GET /downloads/` is that leaderboard: the busiest packages (up to 500), each
+  linked to its project page.
+
+Both read a short-lived cached ranking, so a public homepage never rescans the
+counter store on every hit. A public deployment (no read credential) shows these
+to everyone; a credentialed one shows them only to readers, so private names
+never leak.
+
 ## How counting works
 
 Each node counts downloads in memory and flushes immutable delta segments under

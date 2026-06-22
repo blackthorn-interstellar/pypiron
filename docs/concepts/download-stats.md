@@ -32,8 +32,9 @@ curl -u $READ http://localhost:8080/stats/downloads/acme
 
 ### Global
 
-`GET /stats/downloads` — per-day totals and the busiest packages, closed days
-only (today is excluded).
+`GET /stats/downloads` — last 30 days of per-day totals and the busiest
+packages, including today (recent, not-yet-frozen days are aggregated live on
+read, the same as the per-package endpoint).
 
 ```bash
 curl -u $READ http://localhost:8080/stats/downloads
@@ -42,8 +43,8 @@ curl -u $READ http://localhost:8080/stats/downloads
 ```json
 {
   "metric": "downloads",
-  "total": 9821,
-  "days": { "2026-06-19": 4903, "2026-06-20": 4918 },
+  "total": 14739,
+  "days": { "2026-06-19": 4903, "2026-06-20": 4918, "2026-06-21": 4918 },
   "top": { "acme": 3120, "requests": 2204 }
 }
 ```
@@ -61,7 +62,10 @@ database — the counter store is files like everything else.
 - Counts are **lossy by design**: an in-memory tail can be lost on a hard crash,
   and they are never used as the source of truth for anything.
 - **Frozen (closed) days are exact.** The leader has merged every node's deltas.
-- **Today lags one flush interval** — a download shows up after the next flush.
+- **Today lags one flush interval** — a download shows up after the next flush,
+  on both the per-package and global endpoints (recent days that haven't been
+  frozen yet are summed live from segments on read, so the global view is never
+  days behind).
 - Changing `--counters-resolution` is non-destructive; existing days keep the
   resolution they were written with.
 

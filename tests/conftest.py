@@ -483,6 +483,14 @@ def proxy_pair(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
 
 
 @pytest.fixture()
+def proxy_pair_fast_counters(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Proxy pair whose proxy flushes download counters every second."""
+    yield from _start_proxy_pair(
+        tmp_path_factory, pypiron_bin, proxy_extra_args=["--counters-flush-interval-secs", "1"]
+    )
+
+
+@pytest.fixture()
 def proxy_pair_wheels_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     yield from _start_proxy_pair(
         tmp_path_factory, pypiron_bin, proxy_extra_args=["--proxy-only-wheels"]

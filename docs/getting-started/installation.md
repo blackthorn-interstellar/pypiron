@@ -38,7 +38,7 @@ The `pypiron` package on PyPI is a [maturin](https://www.maturin.rs/)-built bina
 ## Container image
 
 ```bash
-docker run -p 8080:8080 ghcr.io/brycedrennan/pypiron:latest pypiron serve
+docker run -p 8080:8080 ghcr.io/blackthorn-interstellar/pypiron:latest pypiron serve
 ```
 
 The image runs unprivileged, defaults its storage to `/data`, and exposes port 8080. Mount a volume at `/data` to persist packages between runs, or point it at object storage instead. See [Production](../guides/production.md) for S3, multi-node, and TLS.
@@ -65,7 +65,7 @@ Bare `pypiron` prints help. The other subcommands are `sync`, `verify`, and `res
 You need a recent Rust toolchain (1.88+).
 
 ```bash
-git clone https://github.com/brycedrennan/pypiron
+git clone https://github.com/blackthorn-interstellar/pypiron
 cd pypiron
 cargo build --release
 ./target/release/pypiron --version

@@ -57,7 +57,7 @@ fallback is correct by construction for direct uploads — filenames are immutab
 so a file is written exactly once and last-modified *is* upload time. Sidecars make
 the timestamp durable (it survives rsync and bucket migrations) and let mirroring
 carry forward PyPI's original timestamps; see
-[DESIGN.md](https://github.com/brycedrennan/pypiron/blob/master/dev/DESIGN.md#mirroring-carry-forward-true-timestamps).
+[DESIGN.md](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/DESIGN.md#mirroring-carry-forward-true-timestamps).
 
 ## Implementation notes
 

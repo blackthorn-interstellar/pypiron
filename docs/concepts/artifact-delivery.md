@@ -71,4 +71,4 @@ flag:
 See [Storage backends](storage.md) for which backends can sign URLs, and
 [Configuration](../reference/configuration.md#artifact-delivery) for the flag and
 its env var. The full read-path reasoning is in
-[DESIGN.md](https://github.com/brycedrennan/pypiron/blob/master/dev/DESIGN.md#read-path-zero-coordination).
+[DESIGN.md](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/DESIGN.md#read-path-zero-coordination).

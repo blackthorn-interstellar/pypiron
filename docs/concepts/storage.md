@@ -79,4 +79,4 @@ standard `AZURE_*` envs), or a managed identity / bearer token.
 Exact flags, env vars, and per-backend options live in
 [Configuration → Storage](../reference/configuration.md#storage-serve). The
 storage layout contract is in
-[DESIGN.md](https://github.com/brycedrennan/pypiron/blob/master/dev/DESIGN.md).
+[DESIGN.md](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/DESIGN.md).

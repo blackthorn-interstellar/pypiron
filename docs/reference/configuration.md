@@ -281,7 +281,7 @@ can't reach the bucket endpoint (private subnet, firewalled storage). The disk
 backend always streams — as does any cloud backend that can't sign URLs (GCS
 under ADC, Azure without an account key). PEP 658 `.metadata` companions always
 stream — tiny and resolution-critical. Full reasoning in
-[DESIGN.md](https://github.com/brycedrennan/pypiron/blob/master/dev/DESIGN.md#read-path-zero-coordination).
+[DESIGN.md](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/DESIGN.md#read-path-zero-coordination).
 
 ## Management and operations endpoints
 
@@ -292,7 +292,7 @@ operational endpoints (`/health`, `/metrics`, logging) live on the
 ## Storage layout
 
 The layout *is* the schema — full contract in
-[DESIGN.md](https://github.com/brycedrennan/pypiron/blob/master/dev/DESIGN.md#storage-layout-the-contract):
+[DESIGN.md](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/DESIGN.md#storage-layout-the-contract):
 
 ```
 packages/<pkg>/<filename>                # artifact, immutable once written

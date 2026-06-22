@@ -217,7 +217,9 @@ impl Proxy {
             upstream,
             filter: filter.resolve()?,
             client: Client::builder()
-                .user_agent("pypiron-proxy/0.1 (+https://github.com/brycedrennan/pypiron)")
+                .user_agent(
+                    "pypiron-proxy/0.1 (+https://github.com/blackthorn-interstellar/pypiron)",
+                )
                 .connect_timeout(Duration::from_secs(10))
                 // Inactivity timeout between reads, reset on each chunk: an
                 // upstream that connects then stalls mid-stream can't hang a

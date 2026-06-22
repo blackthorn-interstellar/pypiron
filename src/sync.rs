@@ -972,7 +972,7 @@ pub async fn run_sync(args: SyncArgs) -> Result<()> {
     let resolved = Resolved::merge(&args, cfg).await?;
 
     let client = Client::builder()
-        .user_agent("pypiron-sync/0.1 (+https://github.com/brycedrennan/pypiron)")
+        .user_agent("pypiron-sync/0.1 (+https://github.com/blackthorn-interstellar/pypiron)")
         // Bound the handshake and any mid-stream stall so a dead/dribbling
         // upstream fails a sync task cleanly (the retry loop absorbs it) instead
         // of hanging forever. read_timeout is per-read and resets on each chunk,

@@ -18,7 +18,7 @@ sdist, generates build-provenance attestations, and publishes to PyPI via
 trusted publishing. Nothing is published if the tests fail.
 
 In parallel, `docker.yml` builds the multi-arch (amd64/arm64) container image
-and pushes it to GHCR — `ghcr.io/brycedrennan/pypiron:X.Y.Z`, `:X.Y`, and
+and pushes it to GHCR — `ghcr.io/blackthorn-interstellar/pypiron:X.Y.Z`, `:X.Y`, and
 `:latest` — with its own provenance attestation. Pushes to `master` publish a
 rolling `:master` tag; every push also gets a `:sha-<short>` tag. No secrets or
 one-time setup are needed: it authenticates with the built-in `GITHUB_TOKEN`.
@@ -32,7 +32,7 @@ to releases.
 The release job authenticates with OIDC; no API token is stored anywhere.
 Configure once at https://pypi.org/manage/project/pypiron/settings/publishing/:
 
-- Owner: `brycedrennan`
+- Owner: `blackthorn-interstellar`
 - Repository: `pypiron`
 - Workflow: `ci.yml`
 - Environment: (leave blank)

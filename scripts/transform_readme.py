@@ -17,7 +17,7 @@ import re
 import urllib.parse
 from pathlib import Path
 
-REPO = "brycedrennan/pypiron"
+REPO = "blackthorn-interstellar/pypiron"
 # Links render as pages (github blob); images need the raw byte host.
 BLOB = f"https://github.com/{REPO}/blob/{{ref}}/"
 RAW = f"https://raw.githubusercontent.com/{REPO}/{{ref}}/"

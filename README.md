@@ -1,16 +1,16 @@
 # <img src="docs/assets/pypiron-logo-256.png" alt="pypiron logo" width="40" style="vertical-align: middle;"/> pypiron
 
-[![CI](https://github.com/brycedrennan/pypiron/actions/workflows/ci.yml/badge.svg)](https://github.com/brycedrennan/pypiron/actions/workflows/ci.yml)
+[![CI](https://github.com/blackthorn-interstellar/pypiron/actions/workflows/ci.yml/badge.svg)](https://github.com/blackthorn-interstellar/pypiron/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/pypiron.svg)](https://pypi.org/project/pypiron/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-pypiron-bf5a2e.svg)](https://brycedrennan.github.io/pypiron/)
+[![Docs](https://img.shields.io/badge/docs-pypiron-bf5a2e.svg)](https://pypiron.com/)
 
 An ultra-fast Python package server, written in Rust.
 
 One binary, no database. pypiron serves your private uploads, mirrors public PyPI
 on demand, and bulk-syncs allowlists — all behind one URL and one namespace.
 
-**Documentation:** <https://brycedrennan.github.io/pypiron/>
+**Documentation:** <https://pypiron.com/>
 
 <p align="center">
   <img src="docs/assets/install-throughput.png" alt="Max sustained install throughput: pypiron vs bandersnatch, pypiserver, pypicloud, devpi, proxpi" width="760">

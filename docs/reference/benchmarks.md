@@ -45,5 +45,5 @@ and the clients fire byte-identical `uv` requests at each.
 
 Methodology, raw numbers, and the AWS rig provenance live in the repo:
 
-- [Benchmark plan](https://github.com/brycedrennan/pypiron/blob/master/dev/BENCHMARK_INSTALL.md)
-- [Benchmark results](https://github.com/brycedrennan/pypiron/blob/master/dev/BENCHMARK_RESULTS.md)
+- [Benchmark plan](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/BENCHMARK_INSTALL.md)
+- [Benchmark results](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/BENCHMARK_RESULTS.md)

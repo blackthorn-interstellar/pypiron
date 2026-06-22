@@ -77,4 +77,4 @@ backend is single-node; multi-node implies a cloud backend.
 
 The full storage-layout contract — every path, the sidecar schema, the marker
 format — is documented in
-[DESIGN.md](https://github.com/brycedrennan/pypiron/blob/master/dev/DESIGN.md).
+[DESIGN.md](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/DESIGN.md).

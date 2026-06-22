@@ -11,7 +11,7 @@ Point the server at an S3 bucket instead of local disk. Below is a complete
 ```yaml
 services:
   pypiron:
-    image: ghcr.io/brycedrennan/pypiron:latest
+    image: ghcr.io/blackthorn-interstellar/pypiron:latest
     command: pypiron serve --storage s3 --s3-bucket my-pypiron
     ports: ["8080:8080"]
     environment:

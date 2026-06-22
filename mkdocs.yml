@@ -1,11 +1,11 @@
 site_name: pypiron
 site_description: An ultra-fast Python package server, written in Rust.
 site_author: Blackthorn Interstellar
-site_url: https://brycedrennan.github.io/pypiron/
+site_url: https://pypiron.com/
 copyright: Copyright &copy; 2025 Blackthorn Interstellar
 
-repo_url: https://github.com/brycedrennan/pypiron
-repo_name: brycedrennan/pypiron
+repo_url: https://github.com/blackthorn-interstellar/pypiron
+repo_name: blackthorn-interstellar/pypiron
 edit_uri: edit/master/docs/
 
 theme:

@@ -1,170 +1,84 @@
 /* pypiron docs theme — iron & rust, lifted from the server's own scheme (the
    :root / dark tokens at the top of PAGE_CSS in src/web.rs).
 
-   IMPORTANT: pypiron-light / pypiron-dark are *custom* Material color schemes.
-   Material only ships full variable sets for its built-in `default` (light) and
-   `slate` (dark) schemes; a custom scheme inherits the light base, so a dark
-   scheme must redefine everything that depends on background — typeset color,
-   the code syntax-highlight palette, table/diff/mark colors — or those fall back
-   to light values and go unreadable on dark. (Same lesson as astral's uv docs.) */
+   We recolor Material's BUILT-IN `default` (light) and `slate` (dark) schemes
+   rather than inventing custom scheme names. That matters: a custom scheme
+   inherits only the light base, so a dark variant must hand-redefine everything
+   Material derives for `slate` (shadows, the full code-highlight palette,
+   admonition/table/kbd colors, …) — easy to miss one at a time. Building on
+   `slate` we inherit all of it; `slate` derives its grays from `--md-hue`, so a
+   warm hue tints the whole dark theme, and we override only the brand anchors. */
 
 :root {
-  /* iron & rust palette (dark / light suffixed) */
-  --pi-bg: #15110e;
-  --pi-surface: #1f1813;
-  --pi-fg: #ece5dd;
-  --pi-muted: #a59a8f;
-  --pi-border: #352c24;
-  --pi-accent: #e07b45;
-  --pi-accent-ink: #ef9460;
-
-  --pi-bg-l: #faf7f4;
-  --pi-surface-l: #efe7df;
-  --pi-fg-l: #211b17;
-  --pi-muted-l: #7c7269;
-  --pi-border-l: #e7ddd3;
-  --pi-code-l: #f3ece4;
-  --pi-accent-l: #bf5a2e;
+  --pi-accent-l: #bf5a2e;       /* rust — light */
   --pi-accent-ink-l: #a04a24;
-
-  /* syntax accents that read on the warm dark code surface */
-  --pi-string: #9cc592;
-  --pi-amber: #e0a35a;
-  --pi-yellow: #e9c46a;
+  --pi-accent-d: #e07b45;       /* rust — dark */
+  --pi-accent-ink-d: #ef9460;
+  --pi-surface-d: #1f1813;      /* warm near-black card (server --header/--code dark) */
+  --pi-border-l: #e7ddd3;
+  --pi-border-d: #352c24;
 }
 
-/* ---------- light ---------- */
-[data-md-color-scheme="pypiron-light"] {
+/* ---------- light (default) ---------- */
+[data-md-color-scheme="default"] {
   --md-primary-fg-color: var(--pi-accent-l);
   --md-primary-fg-color--light: #d07347;
   --md-primary-fg-color--dark: var(--pi-accent-ink-l);
-  --md-primary-bg-color: #ffffff;
-  --md-primary-bg-color--light: #fff7f2;
-
   --md-accent-fg-color: var(--pi-accent-ink-l);
-  --md-accent-fg-color--transparent: rgba(191, 90, 46, 0.1);
 
-  --md-default-bg-color: var(--pi-bg-l);
-  --md-default-fg-color: var(--pi-fg-l);
-  --md-default-fg-color--light: #5f554c;
-  --md-default-fg-color--lighter: #8a7f74;
-  --md-default-fg-color--lightest: rgba(33, 27, 23, 0.12);
+  --md-default-bg-color: #faf7f4;
+  --md-code-bg-color: #f3ece4;
 
-  --md-typeset-color: var(--pi-fg-l);
   --md-typeset-a-color: var(--pi-accent-l);
-  --md-typeset-mark-color: rgba(191, 90, 46, 0.2);
-
-  --md-code-fg-color: var(--pi-fg-l);
-  --md-code-bg-color: var(--pi-code-l);
-
-  --md-footer-bg-color: var(--pi-surface-l);
-  --md-footer-bg-color--dark: var(--pi-border-l);
-  --md-footer-fg-color: var(--pi-fg-l);
-  --md-footer-fg-color--light: var(--pi-muted-l);
-  --md-footer-fg-color--lighter: #a99e93;
 }
 
-/* ---------- dark ---------- */
-[data-md-color-scheme="pypiron-dark"] {
-  color-scheme: dark;
+/* ---------- dark (slate) ---------- */
+[data-md-color-scheme="slate"] {
+  --md-hue: 28; /* warm the grays slate derives (bg/fg tints, tables, kbd, …) */
 
-  --md-default-bg-color: var(--pi-bg);
-  --md-default-fg-color: var(--pi-fg);
-  --md-default-fg-color--light: var(--pi-fg);
-  --md-default-fg-color--lighter: #c4b9ad;
-  --md-default-fg-color--lightest: rgba(236, 229, 221, 0.4);
+  /* exact brand surfaces (deeper than slate's hue-derived defaults) */
+  --md-default-bg-color: #15110e;
+  --md-default-fg-color: #ece5dd;
+  --md-code-bg-color: var(--pi-surface-d);
+  --md-admonition-bg-color: var(--pi-surface-d); /* subtle card lift off the page */
 
-  --md-primary-fg-color: var(--pi-surface);
-  --md-primary-fg-color--light: #2c241d;
-  --md-primary-fg-color--dark: var(--pi-bg);
-  --md-primary-bg-color: var(--pi-fg);
-  --md-primary-bg-color--light: var(--pi-muted);
-
-  --md-accent-fg-color: var(--pi-accent-ink);
-  --md-accent-fg-color--transparent: rgba(224, 123, 69, 0.1);
-
-  --md-typeset-color: var(--pi-fg);
-  --md-typeset-a-color: var(--pi-accent-ink);
+  /* dark header band + rust links/accents */
+  --md-primary-fg-color: var(--pi-surface-d);
+  --md-primary-bg-color: #ece5dd;
+  --md-accent-fg-color: var(--pi-accent-ink-d);
+  --md-typeset-a-color: var(--pi-accent-ink-d);
   --md-typeset-mark-color: rgba(224, 123, 69, 0.3);
 
-  --md-code-fg-color: var(--pi-fg);
-  --md-code-bg-color: var(--pi-surface);
-
-  /* syntax highlighting — must be set explicitly for a custom dark scheme */
-  --md-code-hl-color: rgba(224, 123, 69, 0.15);
-  --md-code-hl-comment-color: var(--pi-muted);
-  --md-code-hl-punctuation-color: #c9beb2;
-  --md-code-hl-generic-color: #c9beb2;
-  --md-code-hl-variable-color: var(--pi-fg);
-  --md-code-hl-string-color: var(--pi-string);
-  --md-code-hl-keyword-color: var(--pi-accent-ink);
-  --md-code-hl-operator-color: var(--pi-accent-ink);
-  --md-code-hl-number-color: var(--pi-amber);
-  --md-code-hl-special-color: var(--pi-amber);
-  --md-code-hl-function-color: var(--pi-yellow);
-  --md-code-hl-constant-color: var(--pi-amber);
-  --md-code-hl-name-color: var(--pi-fg);
-
-  --md-typeset-del-color: hsla(6, 90%, 60%, 0.15);
-  --md-typeset-ins-color: hsla(150, 70%, 44%, 0.15);
-
-  --md-typeset-table-color: hsla(35, 25%, 90%, 0.12);
-  --md-typeset-table-color--light: hsla(35, 25%, 90%, 0.035);
-
-  --md-footer-bg-color: var(--pi-surface);
-  --md-footer-bg-color--dark: var(--pi-bg);
-  --md-footer-fg-color: var(--pi-fg);
-  --md-footer-fg-color--light: var(--pi-muted);
-  --md-footer-fg-color--lighter: #7c7269;
+  /* warm a few syntax tokens toward the brand (slate's defaults skew cool) */
+  --md-code-hl-keyword-color: var(--pi-accent-ink-d);
+  --md-code-hl-operator-color: var(--pi-accent-ink-d);
+  --md-code-hl-string-color: #9cc592;
+  --md-code-hl-number-color: #e0a35a;
+  --md-code-hl-function-color: #e9c46a;
 }
 
-/* ---------- component tweaks ---------- */
+/* ---------- component tweaks (scheme-agnostic) ---------- */
 
-/* Headings: Material softens h1/h2 to a muted token, too faint on warm
-   neutrals — keep them at full foreground strength. */
+/* Material softens h1/h2 to a muted token; keep headings at full strength. */
 .md-typeset h1,
 .md-typeset h2,
 .md-typeset h3 {
   color: var(--md-default-fg-color);
 }
 
-/* Bold the active nav link (accessibility, beyond just the accent color). */
+/* Bold the active nav link (accessibility, beyond the accent color). */
 .md-nav__link--active {
   font-weight: 700;
 }
 
-/* Code blocks: a warm border + rounding, echoing the server's cards. */
-[data-md-color-scheme="pypiron-light"] .md-typeset pre > code {
+/* Warm border + rounding on code blocks, echoing the server's cards. */
+[data-md-color-scheme="default"] .md-typeset pre > code {
   border: 1px solid var(--pi-border-l);
   border-radius: 8px;
 }
-[data-md-color-scheme="pypiron-dark"] .md-typeset pre > code {
-  border: 1px solid var(--pi-border);
+[data-md-color-scheme="slate"] .md-typeset pre > code {
+  border: 1px solid var(--pi-border-d);
   border-radius: 8px;
-}
-
-/* Admonitions / details as callout cards. Material's default is a thin
-   all-around border with no shadow, which reads as "unstyled" on our warm
-   palette — turn it into a bold type-colored left bar (the border-color is
-   already per-type: blue note, green tip, …) over a warm surface. */
-.md-typeset .admonition,
-.md-typeset details {
-  border-width: 0 0 0 0.2rem;
-  border-radius: 0.1rem;
-  box-shadow: none;
-}
-[data-md-color-scheme="pypiron-light"] .md-typeset .admonition,
-[data-md-color-scheme="pypiron-light"] .md-typeset details {
-  background-color: #f4ede6;
-}
-[data-md-color-scheme="pypiron-dark"] .md-typeset .admonition,
-[data-md-color-scheme="pypiron-dark"] .md-typeset details {
-  background-color: var(--pi-surface);
-}
-/* Give the title bar a touch more presence than the default 10% tint. */
-.md-typeset .admonition-title,
-.md-typeset summary {
-  font-weight: 700;
 }
 
 /* Content images: round the corners (the benchmark chart carries its own card). */
@@ -174,8 +88,8 @@
 
 /* Theme-aware figures: embed both `name.svg#only-light` and `name-dark.svg#only-dark`
    and the active scheme shows the matching one (same trick as the uv docs). */
-[data-md-color-scheme="pypiron-light"] img[src$="#only-dark"],
-[data-md-color-scheme="pypiron-dark"] img[src$="#only-light"] {
+[data-md-color-scheme="default"] img[src$="#only-dark"],
+[data-md-color-scheme="slate"] img[src$="#only-light"] {
   display: none;
 }
 

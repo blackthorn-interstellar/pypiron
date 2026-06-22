@@ -25,14 +25,17 @@ theme:
     - search.suggest
     - search.highlight
   palette:
-    # Iron & rust, matching the server's own scheme (src/web.rs PAGE_CSS).
+    # Built-in default (light) / slate (dark) schemes, recolored to the iron &
+    # rust palette in stylesheets/pypiron.css. Building on slate means we inherit
+    # its complete, dark-correct variable set (shadows, code highlighting,
+    # admonition/table colors) instead of re-deriving it by hand.
     - media: "(prefers-color-scheme: light)"
-      scheme: pypiron-light
+      scheme: default
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
     - media: "(prefers-color-scheme: dark)"
-      scheme: pypiron-dark
+      scheme: slate
       toggle:
         icon: material/brightness-4
         name: Switch to light mode

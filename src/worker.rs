@@ -1450,6 +1450,7 @@ mod tests {
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             counters: Arc::new(crate::counters::Counters::disabled()),
+            download_board: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),
         });
@@ -1548,6 +1549,7 @@ mod tests {
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             counters: Arc::new(crate::counters::Counters::disabled()),
+            download_board: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),
         });

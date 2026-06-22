@@ -254,6 +254,43 @@ def test_real_uv_install_counts(disk_server_fast_counters, uv_venv, uv_path, tmp
     assert stats["total"] == 1, stats
 
 
+def test_downloads_leaderboard_and_homepage_marquee(disk_server_fast_counters, tmp_path):
+    """The most-downloaded packages surface on the dedicated `/downloads/`
+    leaderboard and on the homepage marquee (which links to it). Both read the
+    same ranked board; counted on the real GET path and flushed to the store."""
+    server = disk_server_fast_counters
+    base = server["base_url"]
+    pkg, version = "topdl", "1.0.0"
+    wheel = make_wheel(pkg, version, tmp_path)
+    upload_legacy(
+        server["legacy"],
+        wheel,
+        username=server["uploader_user"],
+        password=server["uploader_password"],
+    )
+    for _ in range(3):
+        assert http_get_bytes(f"{base}/files/{pkg}/{wheel.name}")
+    # Confirm the downloads have flushed to the counter store before reading the
+    # board (the board itself never hits /stats, so this can't warm its cache).
+    _wait_for_total(base, pkg, 3)
+
+    # The dedicated leaderboard ranks the package and links to its project page.
+    code, body, _ = http_get(f"{base}/downloads/")
+    assert code == 200
+    html = body.decode()
+    assert "Most Downloaded Packages" in html
+    assert f'href="/project/{pkg}/"' in html
+    assert "1 package · last 30 days" in html
+
+    # The homepage marquee shows it too, with a link to the full leaderboard.
+    code, body, _ = http_get(f"{base}/")
+    assert code == 200
+    home = body.decode()
+    assert "Most Downloaded Packages" in home
+    assert 'href="/downloads/"' in home
+    assert pkg in home
+
+
 def test_mirrored_package_download_counts(proxy_pair_fast_counters, tmp_path):
     """The user's `requests` scenario: a download of a MIRRORED (on-demand
     proxied) artifact is counted on the proxy. The first GET fetches it from

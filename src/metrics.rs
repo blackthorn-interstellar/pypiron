@@ -175,14 +175,8 @@ impl Metrics {
                 *cell = self.requests[r][c].load(Ordering::Relaxed);
             }
         }
-        let map = self
-            .project_requests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let project_requests = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         MetricsSnapshot {
             requests,
-            project_requests,
             downloads: self.downloads.load(Ordering::Relaxed),
         }
     }
@@ -344,8 +338,6 @@ pub struct Inventory {
 pub struct MetricsSnapshot {
     /// `requests[route][status_class]`, indexed by [`ROUTES`]/`STATUS_CLASSES`.
     requests: [[u64; STATUS_CLASSES.len()]; ROUTES.len()],
-    /// `(project_tag, per-route counts)` for every attribution tag seen.
-    project_requests: Vec<(String, [u64; ROUTES.len()])>,
     /// Artifact downloads served this node since boot (both delivery paths).
     downloads: u64,
 }
@@ -381,15 +373,6 @@ impl MetricsSnapshot {
             .map(|(r, name)| (*name, self.requests[r].iter().sum()))
             .collect()
     }
-
-    /// `(project_tag, total requests)` across all routes; callers sort/filter
-    /// for the "top projects" chart.
-    pub fn project_totals(&self) -> Vec<(String, u64)> {
-        self.project_requests
-            .iter()
-            .map(|(tag, counts)| (tag.clone(), counts.iter().sum()))
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -409,8 +392,6 @@ mod tests {
         m.record_request(route_group("/simple/"), 404);
         m.record_request(route_group("/files/six/six.whl"), 200);
         m.record_request(route_group("/files/six/six.whl"), 200);
-        m.record_project("billing-api", route_group("/files/six/six.whl"));
-        m.record_project("etl", route_group("/simple/"));
         m.record_download();
         m.record_download();
         let snap = m.snapshot();
@@ -420,9 +401,6 @@ mod tests {
         let routes: std::collections::HashMap<_, _> = snap.route_totals().into_iter().collect();
         assert_eq!(routes["simple"], 2);
         assert_eq!(routes["files"], 2);
-        let projects: std::collections::HashMap<_, _> = snap.project_totals().into_iter().collect();
-        assert_eq!(projects["billing-api"], 1);
-        assert_eq!(projects["etl"], 1);
     }
 
     #[test]

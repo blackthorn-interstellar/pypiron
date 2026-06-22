@@ -103,6 +103,10 @@ pub struct DashboardData<'a> {
     pub snapshot: &'a MetricsSnapshot,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    /// Most-downloaded packages over the last 30 days (all nodes), busiest first,
+    /// from the S3-backed counter store. Drives the "Most Downloaded Packages"
+    /// panel; empty (no traffic, or `--download-stats=false`) renders nothing.
+    pub top_downloads: &'a [(String, u64)],
 }
 
 const PAGE_CSS: &str = "\
@@ -152,6 +156,12 @@ code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
 .empty{color:var(--muted);font-size:14px;font-style:italic}\
 .activity{margin-top:44px;border-top:1px solid var(--border);padding-top:24px}\
 .activity .cap{margin:0 0 16px;color:var(--muted);font-size:13px;text-align:center}\
+.chart-more{margin:8px 0 0;text-align:center;font-size:14px}\
+table.dlboard{width:100%;border-collapse:collapse;font-size:14px;margin:8px 0 0}\
+table.dlboard th{text-align:left;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);padding:7px 10px}\
+table.dlboard td{border-bottom:1px solid var(--border);padding:7px 10px;word-break:break-word}\
+table.dlboard td.rank{color:var(--muted);width:3em;text-align:right;font-variant-numeric:tabular-nums}\
+table.dlboard td.count{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}\
 main.wide{max-width:1000px}\
 /* The project page drops main's top padding because its full-width header band\
    already supplies it; the (bandless) landing page keeps its padding. */\
@@ -339,7 +349,17 @@ pub fn landing_html(
         ""
     };
 
-    let activity = dash.map(metrics_section).unwrap_or_default();
+    // For an authorized reader: the download leaderboard (the marquee) leads,
+    // then this node's live request metrics. Public viewers see neither.
+    let activity = dash
+        .map(|d| {
+            format!(
+                "{}{}",
+                most_downloaded_section(d.top_downloads),
+                metrics_section(d)
+            )
+        })
+        .unwrap_or_default();
 
     let body = format!(
         "<header class=\"top\"><div class=\"brand\">\
@@ -466,6 +486,52 @@ aria-label=\"Search packages\" autocomplete=\"off\" autofocus></form>",
         footer = version_footer(ctx.version),
     );
     shell("pypiron · packages", "", &body, false, false)
+}
+
+/// The download leaderboard (`/downloads/`): the most-downloaded packages over
+/// the last 30 days (all nodes), each linked to its project page. `top` is
+/// pre-ranked busiest first and pre-capped (top 500). Read-only and gated by read
+/// auth like the dashboard, so it never enumerates private names publicly.
+pub fn downloads_html(ctx: &PageContext, top: &[(String, u64)]) -> String {
+    let body_inner = if top.is_empty() {
+        "<p class=\"empty\">No downloads recorded yet.</p>".to_string()
+    } else {
+        let rows: String = top
+            .iter()
+            .enumerate()
+            .map(|(i, (pkg, count))| {
+                format!(
+                    "<tr><td class=\"rank\">{rank}</td>\
+<td><a href=\"/project/{href}/\">{name}</a></td>\
+<td class=\"count\">{count}</td></tr>",
+                    rank = i + 1,
+                    href = encode_double_quoted_attribute(pkg),
+                    name = encode_text(pkg),
+                    count = group_thousands(*count),
+                )
+            })
+            .collect();
+        format!(
+            "<table class=\"dlboard\">\
+<thead><tr><th class=\"rank\">#</th><th>Package</th><th class=\"count\">Downloads</th></tr></thead>\
+<tbody>{rows}</tbody></table>",
+        )
+    };
+
+    let tag = format!(
+        "{} package{} · last 30 days",
+        group_thousands(top.len() as u64),
+        if top.len() == 1 { "" } else { "s" },
+    );
+    let body = format!(
+        "<header class=\"hero compact\">{logo}<h1>Most Downloaded Packages</h1>\
+<p class=\"tag\">{tag}</p></header>{body_inner}\
+<nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/projects/\">Browse all packages</a></nav>\
+{footer}",
+        logo = logo_link(),
+        footer = version_footer(ctx.version),
+    );
+    shell("pypiron · downloads", "", &body, false, false)
 }
 
 /// A human-readable project page modelled on pypi.org. `files` is *every*
@@ -938,16 +1004,6 @@ fn metrics_section(d: &DashboardData) -> String {
         files_served = group_thousands(files_served),
     );
 
-    let mut projects = snap.project_totals();
-    projects.retain(|(_, v)| *v > 0);
-    projects.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    projects.truncate(10);
-    let projects_chart = svg_bar_chart(
-        &projects,
-        "No per-project traffic yet — requests attribute to a project only when \
-they carry a basic-auth username tag.",
-    );
-
     let mut routes = snap.route_totals();
     routes.retain(|(_, v)| *v > 0);
     routes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
@@ -961,8 +1017,26 @@ they carry a basic-auth username tag.",
         "<section class=\"activity\"><h2 class=\"section-label\">Metrics</h2>\
 <p class=\"cap\">live activity · this node · since process start</p>\
 {stats}\
-<section class=\"chart\"><h2>Top projects</h2>{projects_chart}</section>\
 <section class=\"chart\"><h2>Top route groups</h2>{routes_chart}</section></section>",
+    )
+}
+
+/// The "Most Downloaded Packages" homepage panel: the top five packages by real
+/// download count over the last 30 days (all nodes, from the counter store) as a
+/// bar chart, with a link to the full leaderboard. Empty (no recorded traffic,
+/// or `--download-stats=false`) renders nothing rather than a misleading zero —
+/// matching the per-project Downloads card.
+fn most_downloaded_section(top: &[(String, u64)]) -> String {
+    if top.is_empty() {
+        return String::new();
+    }
+    let five: Vec<(String, u64)> = top.iter().take(5).cloned().collect();
+    let chart = svg_bar_chart(&five, "");
+    format!(
+        "<section class=\"activity\"><h2 class=\"section-label\">Most Downloaded Packages</h2>\
+<p class=\"cap\">last 30 days · all nodes</p>\
+<div class=\"chart\">{chart}</div>\
+<p class=\"chart-more\"><a href=\"/downloads/\">View all →</a></p></section>",
     )
 }
 
@@ -1387,13 +1461,14 @@ mod tests {
         m.record_request(crate::metrics::route_group("/simple/"), 200);
         m.record_request(crate::metrics::route_group("/files/six/six.whl"), 200);
         m.record_request(crate::metrics::route_group("/files/six/six.whl"), 200);
-        m.record_project("billing-api", crate::metrics::route_group("/files/x"));
         m.record_download();
         let snap = m.snapshot();
+        let top = [("requests".to_string(), 1200u64), ("flask".to_string(), 42)];
         let dash = DashboardData {
             snapshot: &snap,
             cache_hits: 9,
             cache_misses: 1,
+            top_downloads: &top,
         };
         let html = landing_html(&ctx(), None, Some(&dash));
         // Index URL still present...
@@ -1408,7 +1483,12 @@ mod tests {
                                        // The redundant "Packages hosted" tile is gone — registry size lives in
                                        // the inventory row instead.
         assert!(!html.contains("Packages hosted"));
-        assert!(html.contains("billing-api"));
+        // The "Most Downloaded Packages" marquee leads, with a link to the full
+        // leaderboard; "Top projects" is gone.
+        assert!(html.contains("Most Downloaded Packages"));
+        assert!(html.contains("href=\"/downloads/\""));
+        assert!(html.contains("requests"));
+        assert!(!html.contains("Top projects"));
         assert!(html.contains("<svg")); // inline SVG charts
     }
 
@@ -1419,11 +1499,34 @@ mod tests {
             snapshot: &snap,
             cache_hits: 0,
             cache_misses: 0,
+            top_downloads: &[],
         };
         let html = landing_html(&ctx(), None, Some(&dash));
         assert!(html.contains("—"));
-        // empty project chart falls back to the explanatory message
-        assert!(html.contains("No per-project traffic yet"));
+        // No download data => the Most Downloaded panel renders nothing.
+        assert!(!html.contains("Most Downloaded Packages"));
+    }
+
+    #[test]
+    fn downloads_page_ranks_packages_and_links_projects() {
+        let top = [("requests".to_string(), 1200u64), ("flask".to_string(), 42)];
+        let html = downloads_html(&ctx(), &top);
+        assert!(html.contains("Most Downloaded Packages"));
+        assert!(html.contains("2 packages · last 30 days"));
+        assert!(html.contains("class=\"dlboard\""));
+        // Ranked busiest first, each linked to its project page, count grouped.
+        assert!(html.contains("<a href=\"/project/requests/\">requests</a>"));
+        assert!(html.contains("1,200"));
+        let req = html.find("requests").expect("requests present");
+        let flask = html.find("flask").expect("flask present");
+        assert!(req < flask, "busiest package ranks first");
+    }
+
+    #[test]
+    fn downloads_page_empty_state() {
+        let html = downloads_html(&ctx(), &[]);
+        assert!(html.contains("No downloads recorded yet."));
+        assert!(!html.contains("class=\"dlboard\""));
     }
 
     #[test]

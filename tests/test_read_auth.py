@@ -30,6 +30,7 @@ def test_reads_require_credential(disk_server_read_auth):
         f"{server['simple']}index.json",
         f"{server['simple']}somepkg/",
         f"{server['base_url']}/files/somepkg/some-1.0-py3-none-any.whl",
+        f"{server['base_url']}/downloads/",
     ):
         code, _, headers = http_get(url)
         assert code == 401, url

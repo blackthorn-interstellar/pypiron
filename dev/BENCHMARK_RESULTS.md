@@ -291,7 +291,7 @@ timeout is real behavior under S3-ish latency, not harness noise.
 ### Run 001 — 2026-06-12 — reference-rig baseline #0 (meter row 0)
 
 - Commit: `b79dd16` (src/ unmodified; bench/ harness uncommitted) · Binary built on loadgen from the same tree
-- Rig: server `t4g.small` unlimited (i-06e8aef562f76f197) + loadgen `c7gn.4xlarge`, us-east-1, bucket `pypiron-bench-844098004410-us-east-1`
+- Rig: server `t4g.small` unlimited (single instance) + loadgen `c7gn.4xlarge`, us-east-1, bucket `pypiron-bench-<account-id>-us-east-1`
 - Config: S3 backend, `--artifact-delivery auto`, worker tick 1s, reconcile 300s — customer defaults otherwise
 - Corpus: meter preset (bench-small ×10, torchsim ×2000); seeding 2,010 files through `/legacy/` took **88s ≈ 23 files/s** (pre-M1 data point)
 - Suite: `bench/run-baseline.sh baseline-0` (oha `-z 30s -c 64`); raw JSON in `bench/results/baseline-0.json`

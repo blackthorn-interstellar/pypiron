@@ -137,9 +137,9 @@ cmd_deploy() {
   echo "   work-in-progress, so the box builds exactly the committed tree)"
   git -C "$REPO" archive --format=tar HEAD \
     | rig_ssh "rm -rf pypiron && mkdir -p pypiron && tar -x -C pypiron"
-  # The pypiron binary only needs to SERVE; if HEAD's src doesn't compile (a
-  # concurrent agent committed incomplete Rust to master), build the image from a
-  # known-good src ref while the bench harness still runs from HEAD.
+  # The pypiron binary only needs to SERVE; if HEAD's src doesn't compile, set
+  # RIG_BUILD_REF to a known-good src ref to build the image from, while the
+  # bench harness still runs from HEAD.
   if [[ -n "${RIG_BUILD_REF:-}" ]]; then
     echo "== overlay pypiron src from ${RIG_BUILD_REF} (HEAD src doesn't build)"
     git -C "$REPO" archive --format=tar "$RIG_BUILD_REF" src Cargo.toml Cargo.lock \

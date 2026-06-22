@@ -52,3 +52,8 @@ bench/install/compose/pypicloud-config-dynamo.gen.ini
 
 # mkdocs build output (regenerable; published via CI)
 /site/
+
+# Internal security audit — kept locally, not published (see SECURITY.md for disclosure)
+dev/SECURITY_AUDIT.md
+# Landscape report: generated output + source kept locally, regenerated via dev/landscape/compile.py
+dev/landscape/

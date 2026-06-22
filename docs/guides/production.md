@@ -25,8 +25,8 @@ services:
 
 This sets an admin credential (publish, mirror, delete, yank) and a read
 credential (`/simple/` and `/files/` now require auth; `/health` and `/metrics`
-stay open). `--admin-pass` alone is a complete admin credential — the username
-defaults to `admin`. See [Authentication](../concepts/authentication.md).
+stay open). The admin username defaults to `admin`, so the compose sets no
+`PYPIRON_ADMIN_USER`. See [Authentication](../concepts/authentication.md).
 
 !!! note "Use the instance role on AWS"
     On EC2, ECS, or EKS, omit `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.

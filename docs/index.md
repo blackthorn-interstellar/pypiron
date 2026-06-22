@@ -50,12 +50,6 @@ Publish, then install — both against the one URL:
     pip install --extra-index-url http://localhost:8080/simple/ acme-widgets
     ```
 
-!!! tip
-
-    Setting a password is what enables a role. With only `--admin-pass`, writes
-    need the admin credential and reads stay public. See
-    [Authentication](reference/configuration.md#authentication).
-
 ## Next steps
 
 <div class="grid cards" markdown>

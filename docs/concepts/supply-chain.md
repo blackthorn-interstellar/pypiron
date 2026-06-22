@@ -2,7 +2,7 @@
 
 pypiron serves private uploads, synced mirrors, and on-demand-proxied packages
 from one URL and one namespace. That mix is exactly where supply-chain attacks
-live. This page lists each protection and the threat it answers.
+live. Each protection below answers one threat.
 
 | Threat | Mechanism | Control |
 | --- | --- | --- |

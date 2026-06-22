@@ -17,9 +17,7 @@ That command sets up two credentials:
 | `--admin-pass "$ADMIN"` | admin | publish, delete, yank |
 | `--read-user team` / `--read-pass "$READ"` | read | install (`/simple/`, `/files/`) |
 
-Setting a password is what enables a role. `--admin-pass` alone is a complete
-admin credential — the admin username defaults to `admin`, so you don't pass
-`--admin-user`.
+`--admin-user` defaults to `admin`.
 
 `--read-user`/`--read-pass` lock down reads: with them set, `/simple/` and
 `/files/` require basic auth (any of the three credentials works). Drop both

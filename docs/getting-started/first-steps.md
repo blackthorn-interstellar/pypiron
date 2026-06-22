@@ -9,17 +9,13 @@ commands, one terminal.
 uvx pypiron serve --admin-pass secret
 ```
 
-This serves on `http://localhost:8080`. Setting a password is what enables a
-role, so `--admin-pass secret` is a complete admin credential — the admin
-username defaults to `admin`. With no read credential, reads are public.
+This serves on `http://localhost:8080`. Your admin credential is `admin` /
+`secret` — (username defaults to `admin`).
 
 - The root URL (`http://localhost:8080`) is a web dashboard with copy-paste
   client config.
 - `GET /health` is an unauthenticated probe for load balancers.
 
-!!! note
-    With no write credential at all, the server is read-only. The admin
-    credential above is what lets you publish in the next step.
 
 ## 2. Publish a package
 

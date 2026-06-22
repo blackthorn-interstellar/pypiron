@@ -124,8 +124,8 @@ reader:
 | uploader | `--uploader-user`/`--uploader-pass` | publish ordinary uploads |
 | read | `--read-user`/`--read-pass` | read indexes and artifacts |
 
-Setting a password is what enables a role; the admin username defaults to
-`admin`, so `--admin-pass secret` alone is a complete admin credential. With
+The admin username defaults to `admin`, so `--admin-pass secret` alone is a
+complete admin credential. With
 **no write credential** the server is **read-only** — open unauthenticated
 writes don't exist. With no read credential, reads are public. When
 `--read-user` is set, `/simple/` and `/files/` require auth (any of the three

@@ -16,7 +16,9 @@ from .helpers import (
     http_get,
     http_get_bytes,
     http_get_json,
+    http_head,
     make_wheel,
+    run_checked,
     upload_legacy,
 )
 
@@ -25,6 +27,10 @@ pytestmark = pytest.mark.integration
 
 def _stats(base_url: str, pkg: str) -> dict:
     return http_get_json(f"{base_url}/stats/downloads/{pkg}")
+
+
+def _global_stats(base_url: str) -> dict:
+    return http_get_json(f"{base_url}/stats/downloads")
 
 
 def _wait_for_total(base_url: str, pkg: str, want: int, *, timeout: float = 8.0) -> dict:
@@ -154,3 +160,115 @@ def test_stats_requires_read_auth_when_configured(disk_server_prefixed, tmp_path
         "total": 0,
         "days": {},
     }
+
+
+def test_global_stats_reflects_today_without_compaction(disk_server_fast_counters, tmp_path):
+    """Regression for the ~2-day delay: the global /stats/<metric> summary must
+    reflect today's downloads as soon as they flush, without waiting for the
+    leader to freeze/compact the day (which only happens >= grace_days later)."""
+    server = disk_server_fast_counters
+    base = server["base_url"]
+    pkg, version = "freshstats", "3.1.4"
+    wheel = make_wheel(pkg, version, tmp_path)
+    upload_legacy(
+        server["legacy"],
+        wheel,
+        username=server["uploader_user"],
+        password=server["uploader_password"],
+    )
+
+    for _ in range(4):
+        assert http_get_bytes(f"{base}/files/{pkg}/{wheel.name}")
+    # Confirm the per-package surface has flushed today's segment...
+    _wait_for_total(base, pkg, 4)
+
+    # ...and the GLOBAL summary reflects today too (no compaction in this window).
+    summary = _global_stats(base)
+    assert summary["total"] == 4, summary
+    assert summary["days"], f"global summary has no days (2-day delay?): {summary}"
+    assert max(summary["days"].values()) == 4, summary
+    assert summary["top"].get(pkg) == 4, summary
+
+
+def test_head_and_partial_range_are_not_counted(disk_server_fast_counters, tmp_path):
+    """A bodiless HEAD and a partial-range (206) read are not full downloads, so
+    neither increments the counter; only a full GET (200) does."""
+    server = disk_server_fast_counters
+    base = server["base_url"]
+    pkg, version = "edgecount", "0.0.1"
+    wheel = make_wheel(pkg, version, tmp_path)
+    upload_legacy(
+        server["legacy"],
+        wheel,
+        username=server["uploader_user"],
+        password=server["uploader_password"],
+    )
+    url = f"{base}/files/{pkg}/{wheel.name}"
+
+    # HEAD transfers no body; a partial range returns 206.
+    code, _, _ = http_head(url)
+    assert code == 200
+    code, body, _ = http_get(url, headers={"Range": "bytes=0-9"})
+    assert code == 206, (code, body[:64])
+
+    # Wait past the 1s flush interval so anything wrongly recorded would surface.
+    time.sleep(2.5)
+    assert _stats(base, pkg)["total"] == 0, "HEAD/206 must not count as downloads"
+
+    # A real full download counts.
+    assert http_get_bytes(url)
+    assert _wait_for_total(base, pkg, 1)["total"] == 1
+
+
+def test_real_uv_install_counts(disk_server_fast_counters, uv_venv, uv_path, tmp_path):
+    """A real `uv pip install` records exactly one download (the wheel) — the PEP
+    658 .metadata probe and any range/HEAD requests uv makes must not inflate it."""
+    server = disk_server_fast_counters
+    base = server["base_url"]
+    pkg, version = "uvcounted", "1.0.0"
+    wheel = make_wheel(pkg, version, tmp_path)
+    upload_legacy(
+        server["legacy"],
+        wheel,
+        username=server["uploader_user"],
+        password=server["uploader_password"],
+    )
+
+    run_checked(
+        [
+            uv_path,
+            "pip",
+            "install",
+            "--python",
+            str(uv_venv),
+            "--index-url",
+            server["simple"],
+            "--no-cache",
+            f"{pkg}=={version}",
+        ],
+        timeout=180,
+    )
+    run_checked([str(uv_venv), "-c", f"import {pkg}"])
+
+    stats = _wait_for_total(base, pkg, 1)
+    assert stats["total"] == 1, stats
+
+
+def test_mirrored_package_download_counts(proxy_pair_fast_counters, tmp_path):
+    """The user's `requests` scenario: a download of a MIRRORED (on-demand
+    proxied) artifact is counted on the proxy. The first GET fetches it from
+    upstream, caches it, serves it, and counts it like any hosted artifact."""
+    pair = proxy_pair_fast_counters
+    upstream, proxy = pair["upstream"], pair["proxy"]
+    pkg, version = "mirrorme", "2.5.0"
+    wheel = make_wheel(pkg, version, tmp_path)
+    upload_legacy(
+        upstream["legacy"],
+        wheel,
+        username=upstream["uploader_user"],
+        password=upstream["uploader_password"],
+    )
+
+    assert http_get_bytes(f"{proxy['base_url']}/files/{pkg}/{wheel.name}")
+    stats = _wait_for_total(proxy["base_url"], pkg, 1)
+    assert stats["total"] == 1, stats

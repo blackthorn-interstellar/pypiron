@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use axum::{
     body::Body,
     extract::{Multipart, Path, Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, Response, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
@@ -1972,6 +1972,7 @@ async fn serve_index(
 /// are immutable. Sidecar JSON and dotfiles are not served.
 async fn files_get(
     State(state): State<Arc<AppState>>,
+    method: Method,
     Path((package, filename)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -1997,8 +1998,11 @@ async fn files_get(
     // Download attribution key, computed once: a real artifact only (companions
     // and the ranged-companion fall-through below parse to None), keyed
     // `<pkg>/<filename>` so the counter store rolls files up to versions. Counted
-    // at the two delivery exits (302 redirect, 200 stream) — see counters.rs.
-    let dl_key = sidecar::is_artifact(&filename).then(|| format!("{pkg}/{filename}"));
+    // at the two delivery exits (302 redirect, 200 stream) — see counters.rs. A
+    // HEAD transfers no body (axum routes it to this GET handler), so it is not a
+    // download: gate on GET so a bodiless probe never inflates the count.
+    let dl_key = (method == Method::GET && sidecar::is_artifact(&filename))
+        .then(|| format!("{pkg}/{filename}"));
 
     // PEP 658 metadata is immutable, tiny, and hammered by resolvers (uv
     // fetches one per candidate wheel) — serve it from the same RAM cache as
@@ -2096,7 +2100,9 @@ async fn files_get(
     match state.storage.serve_artifact(&key, range).await {
         Ok(mut resp) => {
             // Count only a full delivered body (200): a 206 range read is a
-            // partial of one logical download, a 416 is none.
+            // partial of one logical download, a 416 is none. (A whole-file range
+            // served as 206 — rare, e.g. `curl -C-`/`wget -c` — is undercounted;
+            // download stats are best-effort, so we don't parse Content-Range.)
             if resp.status() == StatusCode::OK {
                 if let Some(k) = &dl_key {
                     state.counters.record("downloads", k);

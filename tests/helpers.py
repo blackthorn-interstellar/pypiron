@@ -184,6 +184,13 @@ def http_get(
     return _http_request(url, method="GET", headers=headers, timeout=timeout)
 
 
+def http_head(
+    url: str, *, headers: Optional[Dict[str, str]] = None, timeout: float = 10.0
+) -> Tuple[int, bytes, Dict[str, str]]:
+    """HEAD returning (status, body, headers); does not raise on non-2xx."""
+    return _http_request(url, method="HEAD", headers=headers, timeout=timeout)
+
+
 def http_get_no_redirect(
     url: str, *, headers: Optional[Dict[str, str]] = None, timeout: float = 10.0
 ) -> Tuple[int, bytes, Dict[str, str]]:

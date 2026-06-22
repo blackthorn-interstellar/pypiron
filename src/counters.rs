@@ -379,13 +379,7 @@ impl Counters {
                 }
             }
         }
-        let mut ranked: Vec<(String, u64)> = totals.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        ranked.truncate(50);
-        let summary = DaySummary {
-            total,
-            top: ranked.into_iter().collect(),
-        };
+        let summary = rank_summary(totals, total);
         let key = format!("{prefix}{SUMMARY_FILE}");
         let _ = store
             .put(&key, serde_json::to_vec(&summary).unwrap_or_default())
@@ -435,8 +429,13 @@ impl Counters {
         out
     }
 
-    /// Sum of recent per-day summaries: `day -> DaySummary`. Cheap (one tiny
-    /// object per day), for a dashboard's totals/top-N.
+    /// Recent per-day summaries: `day -> DaySummary`, for a dashboard's
+    /// totals/top-N. A frozen `_summary.json` is one tiny GET per day; a day that
+    /// isn't frozen yet (today and anything within `grace_days`) has no summary,
+    /// so it is aggregated live across shards on read — that way the global view
+    /// is never days behind the per-package one (which already reads open-day
+    /// segments). Older days with no summary are genuinely empty (or
+    /// retention-pruned), so they cost nothing beyond the missing-summary GET.
     pub async fn query_summaries(
         &self,
         metric: &str,
@@ -447,14 +446,31 @@ impl Counters {
         let Some(store) = self.store.as_deref() else {
             return out;
         };
+        // Mirror of `compact`'s freeze gate: a day at or after this cutoff cannot
+        // be frozen yet, so its absent summary means "still open", not "empty" —
+        // those are the only days worth a live cross-shard scan.
+        let close_cutoff = day_str(
+            OffsetDateTime::now_utc()
+                .date()
+                .saturating_sub(time::Duration::days(self.cfg.grace_days)),
+        );
         let mut day = from;
         loop {
             let ds = day_str(day);
             let key = format!("{PREFIX}{metric}/day/{ds}/{SUMMARY_FILE}");
-            if let Ok(Some(bytes)) = store.get(&key).await {
-                if let Ok(s) = serde_json::from_slice::<DaySummary>(&bytes) {
-                    out.insert(ds, s);
+            match store.get(&key).await {
+                Ok(Some(bytes)) => {
+                    if let Ok(s) = serde_json::from_slice::<DaySummary>(&bytes) {
+                        out.insert(ds, s); // frozen summary wins, always
+                    }
                 }
+                Ok(None) if ds >= close_cutoff => {
+                    if let Some(s) = self.summarize_day_live(store, metric, &ds).await {
+                        out.insert(ds, s);
+                    }
+                }
+                Ok(None) => {} // closed day, no summary => no data: skip the scan
+                Err(_) => {}   // transient: skip; the next refresh retries
             }
             if day >= to {
                 break;
@@ -465,6 +481,34 @@ impl Counters {
             };
         }
         out
+    }
+
+    /// Build a [`DaySummary`] for `day` from live state — the same shape
+    /// [`Counters::write_summary`] freezes, but computed on read by summing every
+    /// shard via [`Counters::read_day_shard`] (so a shard's frozen file still wins
+    /// over its open segments). `None` when no shard has data for the day.
+    async fn summarize_day_live(
+        &self,
+        store: &dyn ObjectStore,
+        metric: &str,
+        day: &str,
+    ) -> Option<DaySummary> {
+        let mut totals: BTreeMap<String, u64> = BTreeMap::new();
+        let mut total: u64 = 0;
+        let mut any = false;
+        for shard in all_shards() {
+            let Some(buckets) = self.read_day_shard(store, metric, day, shard).await else {
+                continue;
+            };
+            any = true;
+            for keys_at in buckets.values() {
+                for (key, c) in keys_at {
+                    *totals.entry(key.clone()).or_insert(0) += c;
+                    total += c;
+                }
+            }
+        }
+        any.then(|| rank_summary(totals, total))
     }
 
     /// Frozen file wins; otherwise sum the open day's live segments. `None` means
@@ -572,6 +616,25 @@ fn shard_of(key: &str) -> char {
     match key.chars().next() {
         Some(c) if c.is_ascii_alphanumeric() => c.to_ascii_lowercase(),
         _ => '_',
+    }
+}
+
+/// Every shard label in deterministic order — the inverse of [`shard_of`]: the
+/// package tree's first-character fan-out (`0-9`, `a-z`) plus the `_` catch-all.
+fn all_shards() -> impl Iterator<Item = char> {
+    ('0'..='9').chain('a'..='z').chain(std::iter::once('_'))
+}
+
+/// Total + top-50 (count desc, then key asc) — the on-disk [`DaySummary`] shape,
+/// shared by the freeze path ([`Counters::write_summary`]) and the live read
+/// fallback ([`Counters::summarize_day_live`]) so both produce identical bytes.
+fn rank_summary(totals: BTreeMap<String, u64>, total: u64) -> DaySummary {
+    let mut ranked: Vec<(String, u64)> = totals.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(50);
+    DaySummary {
+        total,
+        top: ranked.into_iter().collect(),
     }
 }
 
@@ -858,5 +921,109 @@ mod tests {
             .query_package("downloads", "requests", d, d)
             .await
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_summaries_includes_open_day_live() {
+        // The 2-day-delay fix: today's downloads must surface in the GLOBAL
+        // summary after a flush, without waiting for a day to freeze/compact.
+        let store = MemStore::default();
+        let c = engine(store, Config::default());
+        c.record("downloads", "requests/requests-2.31.0-py3-none-any.whl");
+        c.record("downloads", "requests/requests-2.31.0-py3-none-any.whl");
+        c.record("downloads", "flask/flask-3.0.0-py3-none-any.whl");
+        c.flush().await; // note: NO compact() — today is never frozen.
+
+        let today = OffsetDateTime::now_utc().date();
+        let day = day_str(today);
+        let sums = c.query_summaries("downloads", today, today).await;
+        assert_eq!(
+            sums[&day].total, 3,
+            "open day aggregated live across shards"
+        );
+        assert_eq!(
+            sums[&day].top["requests/requests-2.31.0-py3-none-any.whl"],
+            2
+        );
+        assert_eq!(sums[&day].top["flask/flask-3.0.0-py3-none-any.whl"], 1);
+    }
+
+    #[tokio::test]
+    async fn query_summaries_frozen_summary_wins_over_live() {
+        // A frozen _summary.json short-circuits the live fallback, so straggler
+        // segments left behind after a freeze can never inflate the total.
+        let store = MemStore::default();
+        let c = engine(store.clone(), Config::default());
+        let today = day_str(OffsetDateTime::now_utc().date());
+        store
+            .put(
+                &format!("{PREFIX}downloads/day/{today}/{SUMMARY_FILE}"),
+                serde_json::to_vec(&DaySummary {
+                    total: 10,
+                    top: BTreeMap::from([("requests/r-1.0.whl".to_string(), 10u64)]),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // A straggler segment for the same day that must be IGNORED.
+        store
+            .put(
+                &format!("{PREFIX}downloads/seg/{today}/r/late-0.json"),
+                serde_json::to_vec(&Segment {
+                    resolution_secs: 86_400,
+                    buckets: BTreeMap::from([(
+                        "00:00".to_string(),
+                        BTreeMap::from([("requests/r-1.0.whl".to_string(), 99u64)]),
+                    )]),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let d = OffsetDateTime::now_utc().date();
+        let sums = c.query_summaries("downloads", d, d).await;
+        assert_eq!(
+            sums[&today].total, 10,
+            "frozen summary wins; straggler ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_summaries_mixes_frozen_and_live_and_skips_empty() {
+        let store = MemStore::default();
+        let c = engine(store.clone(), Config::default());
+        let today = OffsetDateTime::now_utc().date();
+        let today_s = day_str(today);
+
+        // An old, frozen day represented only by its summary file.
+        let old = day_str(today.saturating_sub(time::Duration::days(5)));
+        store
+            .put(
+                &format!("{PREFIX}downloads/day/{old}/{SUMMARY_FILE}"),
+                serde_json::to_vec(&DaySummary {
+                    total: 7,
+                    top: BTreeMap::from([("flask/f-1.0.whl".to_string(), 7u64)]),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Today: live segments only (flushed, not compacted).
+        c.record("downloads", "requests/r-2.0.whl");
+        c.flush().await;
+
+        let from = today.saturating_sub(time::Duration::days(10));
+        let sums = c.query_summaries("downloads", from, today).await;
+        assert_eq!(sums[&old].total, 7, "frozen day served from its summary");
+        assert_eq!(
+            sums[&today_s].total, 1,
+            "open day served from live segments"
+        );
+        // An in-range day that is closed but has no summary is genuinely empty:
+        // absent from the result, and paid no cross-shard scan.
+        let empty = day_str(today.saturating_sub(time::Duration::days(3)));
+        assert!(!sums.contains_key(&empty));
     }
 }

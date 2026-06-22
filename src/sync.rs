@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tokio::fs;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::{self, SyncConfig};
 use crate::names::{
@@ -1095,7 +1095,7 @@ async fn sync_one_package(
             .await?
         {
             IndexFetch::NotModified => {
-                debug!("{pkg}: upstream unchanged since last sync (304)");
+                info!("{pkg}: upstream unchanged since last sync (304)");
                 return Ok(PackageOutcome { new_cursor: None });
             }
             IndexFetch::NotFound => bail!("Package not found on source: {pkg}"),
@@ -1147,12 +1147,12 @@ async fn sync_one_package(
     progress.discover(sel_bytes);
     progress.skip(already_present as u64);
     if already_present > 0 {
-        debug!(
+        info!(
             "Syncing {pkg} ({} new, {already_present} already mirrored)",
             selected.len()
         );
     } else {
-        debug!("Syncing {pkg} ({} matching files selected)", selected.len());
+        info!("Syncing {pkg} ({} matching files selected)", selected.len());
     }
 
     if resolved.dry_run {
@@ -1447,7 +1447,7 @@ fn select_from_index(
         selected.push(Selected { version, file });
     }
     if selected.is_empty() {
-        debug!("No matching files for package '{}'", spec.name);
+        warn!("No matching files for package '{}'", spec.name);
     }
     (selected, upstream_status, upstream_files)
 }
@@ -1575,7 +1575,7 @@ async fn upload_via_http(
     // Held until after the POST below: dropping the spool deletes its temp file.
     let spool = download_verified(client, &s.file, &resolved.spool_dir).await?;
 
-    debug!("  - uploading {}", s.file.filename);
+    info!("  - uploading {}", s.file.filename);
     // Stream the spool file into the multipart body instead of re-buffering it
     // in RAM (the artifact already lives on disk from the download).
     let file = fs::File::open(spool.path.path())

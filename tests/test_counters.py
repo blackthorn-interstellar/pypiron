@@ -20,6 +20,7 @@ from .helpers import (
     make_wheel,
     run_checked,
     upload_legacy,
+    wait_for_file_in_index,
 )
 
 pytestmark = pytest.mark.integration
@@ -305,6 +306,10 @@ def test_mirrored_package_download_counts(proxy_pair_fast_counters, tmp_path):
         username=upstream["uploader_user"],
         password=upstream["uploader_password"],
     )
+    # The proxy resolves /files/ on-demand against the upstream simple index, so
+    # wait for upstream to publish the file before the first proxied GET —
+    # otherwise the listing is still empty and the fetch 404s (CI race).
+    wait_for_file_in_index(upstream["simple"], pkg, wheel.name)
 
     assert http_get_bytes(f"{proxy['base_url']}/files/{pkg}/{wheel.name}")
     stats = _wait_for_total(proxy["base_url"], pkg, 1)

@@ -18,7 +18,7 @@ on demand, and bulk-syncs allowlists — all behind one URL and one namespace.
 
 ## Highlights
 
-- **4–60× faster** than other PyPI servers at sustained install throughput.
+- **Handles 4–60× more load** than other PyPI servers.
 - **Dead simple.** `uvx pypiron serve` and you're live — no database, no config.
 - **Works with the whole ecosystem.** uv, pip, poetry, twine, pipenv, hatch.
 - **Private and public together.** One URL serves your private packages and

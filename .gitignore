@@ -57,3 +57,5 @@ bench/install/compose/pypicloud-config-dynamo.gen.ini
 dev/SECURITY_AUDIT.md
 # Landscape report: generated output + source kept locally, regenerated via dev/landscape/compile.py
 dev/landscape/
+# Launch/marketing strategy — kept local, not published
+/marketing/

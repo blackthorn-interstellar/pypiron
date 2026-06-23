@@ -60,7 +60,6 @@ Lowest priority; a single `code-simplifier` pass. Helpers already in-tree
   calling `eligible_proxy` (`main.rs`).
 - **C2** — `proxy_metadata_passthrough` / `proxy_provenance_passthrough` near-
   identical (`main.rs`); extract `companion_response`.
-- **C5** — stray help line on `--intent-grace-secs` (clap shows the wrong knob).
 - **C6** — redundant `!uploads_disabled()` guard in the identical-credential warning.
 - **C7** — config logs "loaded configuration from X" before it reads/parses.
 - **C8** — identical 416 Range-Not-Satisfiable response in both storage backends.

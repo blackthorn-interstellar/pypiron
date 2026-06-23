@@ -214,7 +214,6 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_WORKER_INTERVAL_SECS", default_value = "1")]
     worker_interval_secs: u64,
 
-    /// Full-reconcile sweep interval in seconds (the self-heal backbone)
     /// Seconds an in-flight write may hold off its package's rebuild before
     /// the worker assumes the writer crashed and rebuilds anyway. Must exceed
     /// the slowest expected upload.
@@ -239,7 +238,8 @@ struct ServeArgs {
 
     /// Count per-package/version downloads per day into the S3-backed counter
     /// store (`_counters/`). A best-effort derived analytic — lossy by design,
-    /// never truth. Adds a periodic small PUT per node (see docs/CONFIGURATION).
+    /// never truth. Adds a periodic small PUT per node (see
+    /// docs/reference/configuration.md).
     #[arg(long, env = "PYPIRON_DOWNLOAD_STATS", default_value_t = true, action = clap::ArgAction::Set)]
     download_stats: bool,
 

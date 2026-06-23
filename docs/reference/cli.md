@@ -92,6 +92,11 @@ pypiron verify-index --storage disk --data-dir ./data
 Each divergence prints as `kind<TAB>package<TAB>detail`, followed by a summary
 line. Use it in CI or after out-of-band storage changes to assert convergence.
 
+It scans the whole corpus, so cost scales with corpus size, not churn. **S3 rule
+of thumb: ~$0.5 and ~20 min per million files** (single node, default
+concurrency; mostly sidecar GETs, no writes). The day-to-day `serve` audit stays
+seconds and pennies at any scale because fingerprints skip unchanged packages.
+
 ## rebuild-index
 
 Rebuild every materialized view from truth, unconditionally. Run it after
@@ -101,6 +106,12 @@ schedule, but `rebuild-index` forces the full sweep now.
 ```bash
 pypiron rebuild-index --storage disk --data-dir ./data
 ```
+
+Like `verify-index` it scans the whole corpus (cost scales with corpus, not
+churn), and additionally rewrites views and re-fingerprints. **S3 rule of thumb:
+~$1–1.5 and ~20–30 min per million files** (single node, default concurrency;
+sidecar GETs + per-package LISTs, plus PUTs on a real restore). To only check for
+drift without writing, use the cheaper read-only `verify-index`.
 
 ## Global flags
 

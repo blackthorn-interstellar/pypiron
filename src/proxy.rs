@@ -74,20 +74,36 @@ pub struct ProxyFilterArgs {
     pub only_sdists: bool,
 
     /// Include wheels whose python tag matches any of these (e.g. py3, cp311). Comma-separated or repeatable.
-    #[arg(long = "proxy-python-tag", value_delimiter = ',', value_name = "TAG")]
+    #[arg(
+        long = "proxy-python-tag",
+        env = "PYPIRON_PROXY_PYTHON_TAG",
+        value_delimiter = ',',
+        value_name = "TAG"
+    )]
     pub python_tag: Vec<String>,
 
     /// Include wheels whose ABI tag matches any of these (e.g. none, cp311). Comma-separated or repeatable.
-    #[arg(long = "proxy-abi-tag", value_delimiter = ',', value_name = "TAG")]
+    #[arg(
+        long = "proxy-abi-tag",
+        env = "PYPIRON_PROXY_ABI_TAG",
+        value_delimiter = ',',
+        value_name = "TAG"
+    )]
     pub abi_tag: Vec<String>,
 
     /// Include wheels whose platform tag matches any of these (supports '*' wildcard).
-    #[arg(long = "proxy-platform-tag", value_delimiter = ',', value_name = "TAG")]
+    #[arg(
+        long = "proxy-platform-tag",
+        env = "PYPIRON_PROXY_PLATFORM_TAG",
+        value_delimiter = ',',
+        value_name = "TAG"
+    )]
     pub platform_tag: Vec<String>,
 
     /// Exclude wheels whose platform tag matches any of these (supports '*' wildcard).
     #[arg(
         long = "proxy-exclude-platform-tag",
+        env = "PYPIRON_PROXY_EXCLUDE_PLATFORM_TAG",
         value_delimiter = ',',
         value_name = "TAG"
     )]

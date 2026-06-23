@@ -144,19 +144,39 @@ pub struct FilterArgs {
     pub only_sdists: bool,
 
     /// Include wheels whose python tag matches any of these (e.g. py3, cp311). Comma-separated or repeatable.
-    #[arg(long, value_delimiter = ',', value_name = "TAG")]
+    #[arg(
+        long,
+        env = "PYPIRON_SYNC_PYTHON_TAG",
+        value_delimiter = ',',
+        value_name = "TAG"
+    )]
     pub python_tag: Vec<String>,
 
     /// Include wheels whose ABI tag matches any of these (e.g. none, cp311). Comma-separated or repeatable.
-    #[arg(long, value_delimiter = ',', value_name = "TAG")]
+    #[arg(
+        long,
+        env = "PYPIRON_SYNC_ABI_TAG",
+        value_delimiter = ',',
+        value_name = "TAG"
+    )]
     pub abi_tag: Vec<String>,
 
     /// Include wheels whose platform tag matches any of these (e.g. any, manylinux2014_x86_64, macosx_*_arm64, win_amd64). Supports '*' wildcard.
-    #[arg(long, value_delimiter = ',', value_name = "TAG")]
+    #[arg(
+        long,
+        env = "PYPIRON_SYNC_PLATFORM_TAG",
+        value_delimiter = ',',
+        value_name = "TAG"
+    )]
     pub platform_tag: Vec<String>,
 
     /// Exclude wheels whose platform tag matches any of these (supports '*' wildcard).
-    #[arg(long, value_delimiter = ',', value_name = "TAG")]
+    #[arg(
+        long,
+        env = "PYPIRON_SYNC_EXCLUDE_PLATFORM_TAG",
+        value_delimiter = ',',
+        value_name = "TAG"
+    )]
     pub exclude_platform_tag: Vec<String>,
 
     /// Only mirror files PyPI received before this cutoff (the mirroring twin of

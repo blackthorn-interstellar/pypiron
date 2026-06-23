@@ -1107,7 +1107,7 @@ fn unpack_version(packed: &str) -> UpdateVersion {
 /// Crash-point injection for the chaos tests: delegates everything, but
 /// aborts the whole process immediately *before* the Nth mutating operation.
 /// Sweeping N over a scenario's write count exercises a crash in every gap of
-/// the write protocol; recovery + `pypiron verify` then prove convergence.
+/// the write protocol; recovery + `pypiron verify-index` then prove convergence.
 pub struct FaultInjectStorage {
     inner: Arc<dyn Storage>,
     remaining: std::sync::atomic::AtomicI64,

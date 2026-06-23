@@ -334,7 +334,7 @@ async fn refresh_inventory(state: &AppState) {
 /// one stored at its last rebuild is provably unchanged — zero reads. Only
 /// the diff gets the deep treatment (sidecar reads, view rewrite, sidecar
 /// backfill, orphan pruning). `force_deep` ignores stored fingerprints and
-/// rebuilds everything — that is `pypiron resync`.
+/// rebuilds everything — that is `pypiron rebuild-index`.
 pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
     let started = Instant::now();
     let mut live: Vec<String> = Vec::new();

@@ -96,8 +96,8 @@ the kill-point sweep in tests/test_crash_consistency.py); the audit only
 exists for out-of-band storage changes, runs daily by default, and skips any
 package whose flat-listing fingerprint (key, size, etag) matches the one
 recorded at its last rebuild. Cost scales with churn, not corpus.
-`pypiron verify` recomputes everything read-only and exits nonzero on
-divergence; `pypiron resync` is the rebuild-the-world button.
+`pypiron verify-index` recomputes everything read-only and exits nonzero on
+divergence; `pypiron rebuild-index` is the rebuild-the-world button.
 
 Extrapolations for the new audit at full PyPI (17.1M files, ~46M keys):
 **S3: under a minute and $0.23** (36 prefix shards × ~1,300 pages in
@@ -463,7 +463,7 @@ the new `/metrics` counters, read straight off the server:
 
 | Audit | duration | rebuilt | skipped | what it proves |
 |---|---|---|---|---|
-| cold (no fingerprints, rebuild-everything = restore-from-backup) | **140.1 s** | 5,001 | 0 | the explicit `resync`/restore cost |
+| cold (no fingerprints, rebuild-everything = restore-from-backup) | **140.1 s** | 5,001 | 0 | the explicit `rebuild-index`/restore cost |
 | steady (fingerprints match) | **8.0 s** | **0** | 5,001 | the daily default reads **nothing**; pure listing |
 
 - **`rebuilt=0` on real S3** is the headline: a steady audit over 104,645 files

@@ -76,7 +76,7 @@ const VERSION: &str = concat!(
 #[derive(Parser, Debug)]
 #[command(author, version = VERSION, about, long_about = None, arg_required_else_help = true)]
 struct Cli {
-    /// Subcommands: `serve`, `sync`, `verify`, `resync`.
+    /// Subcommands: `serve`, `sync`, `verify-index`, `rebuild-index`.
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -107,20 +107,20 @@ enum Commands {
     Sync(Box<sync::SyncArgs>),
     /// Recompute every index from truth and diff against what storage serves
     /// (read-only); exits nonzero on any divergence
-    Verify(Box<verify::VerifyArgs>),
+    VerifyIndex(Box<verify::VerifyArgs>),
     /// Rebuild every materialized view from truth, unconditionally. Run after
     /// restoring a backup or editing storage out-of-band.
-    Resync(Box<ResyncArgs>),
+    RebuildIndex(Box<RebuildIndexArgs>),
 }
 
 #[derive(ClapArgs, Debug)]
-struct ResyncArgs {
+struct RebuildIndexArgs {
     #[command(flatten)]
     storage: StorageArgs,
 }
 
 /// One-shot deep audit against a storage backend, no server attached.
-async fn run_resync(args: ResyncArgs) -> Result<()> {
+async fn run_rebuild_index(args: RebuildIndexArgs) -> Result<()> {
     let storage = args.storage.build().await?;
     let state = AppState::headless(storage);
     worker::audit(&state, true).await
@@ -431,7 +431,7 @@ async fn main() -> Result<()> {
     };
 
     // logging — format comes from the global --log-format/PYPIRON_LOG_FORMAT,
-    // so every subcommand (serve, sync, verify, resync) logs consistently.
+    // so every subcommand (serve, sync, verify-index, rebuild-index) logs consistently.
     let env_filter =
         std::env::var("RUST_LOG").unwrap_or_else(|_| "info,pypiron=info,object_store=warn".into());
     match cli.log_format {
@@ -445,8 +445,8 @@ async fn main() -> Result<()> {
     let config_path = cli.config.clone();
     match cli.command {
         Some(Commands::Sync(args)) => sync::run_sync(*args, config_path).await,
-        Some(Commands::Verify(args)) => verify::run_verify(*args).await,
-        Some(Commands::Resync(args)) => run_resync(*args).await,
+        Some(Commands::VerifyIndex(args)) => verify::run_verify(*args).await,
+        Some(Commands::RebuildIndex(args)) => run_rebuild_index(*args).await,
         Some(Commands::Serve(args)) => {
             let serve_matches = matches
                 .subcommand_matches("serve")
@@ -2857,7 +2857,7 @@ fn accepts_json(headers: &HeaderMap) -> bool {
 }
 
 impl AppState {
-    /// State for one-shot storage operations (resync) — no credentials, no
+    /// State for one-shot storage operations (rebuild-index) — no credentials, no
     /// server, default knobs. Only the storage-facing fields matter.
     fn headless(storage: Arc<dyn Storage>) -> Self {
         AppState {

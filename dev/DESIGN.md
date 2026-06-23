@@ -37,7 +37,7 @@ architectural work:
   work they announce is done. At-least-once processing is free because rebuilds
   derive from truth; crash anywhere and the replay converges. Proven by the
   crash-point sweep in tests/test_crash_consistency.py.
-- **Recovery is trivial.** Worst case, `pypiron resync` regenerates every view
+- **Recovery is trivial.** Worst case, `pypiron rebuild-index` regenerates every view
   from truth.
 
 ## Ordering invariant: views may lag truth, but must never lead it
@@ -90,7 +90,7 @@ and compares each package's (key, size, etag) fingerprint against the one
 stored at its last rebuild in `_state/fp-*.json`. Unchanged packages cost
 zero reads; only the diff gets rebuilt. Audit cost scales with churn, not
 corpus size: a full-PyPI-sized tree (17M files) audits for ~$0.25 of LIST
-requests instead of ~$11 of GETs per old-style sweep. `pypiron resync` is the
+requests instead of ~$11 of GETs per old-style sweep. `pypiron rebuild-index` is the
 same pass with fingerprints ignored — the rebuild-the-world button. `pypiron
 verify` is its read-only twin: recompute everything, diff, exit nonzero.
 
@@ -368,7 +368,7 @@ Measured against a fabricated full-PyPI-shaped corpus (see
   tick, and a multi-MB HTML file served statically with gzip is a non-event.
 - Polling `_dirty/` at a ~1s tick costs pennies a day in S3 LIST requests.
 - Every steady-state cost scales with what *changed*; only the audit (cheap
-  LISTs) and `resync`/`verify` (explicit) scale with what *exists*.
+  LISTs) and `rebuild-index`/`verify-index` (explicit) scale with what *exists*.
 
 Backups and disaster recovery are a selling point, not a feature: it's just files.
 rsync it, version the bucket, done.

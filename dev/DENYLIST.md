@@ -184,8 +184,8 @@ pypiron deny export [--mode ...]        # emit the current denylist document
 ```
 
 `add`/`remove`/`import` CAS-update `_deny/denylist.json` and mark affected
-packages dirty. These are new `Commands` variants alongside `Sync`/`Verify`/
-`Resync` (`main.rs:61`), each taking `StorageArgs` — they need storage, never
+packages dirty. These are new `Commands` variants alongside `Sync`/`VerifyIndex`/
+`RebuildIndex` (`main.rs:61`), each taking `StorageArgs` — they need storage, never
 the network.
 
 ### Config & server flags
@@ -295,7 +295,7 @@ No shared store — the gap is crossed by copying files (the same way wheels get
 in). Split the work into **plan (egress) → apply (airgap)**:
 
 **On a connected host** (has internet, *read* access to a manifest of what the
-airgapped node holds — e.g. an exported `simple/index.json` or a `pypiron verify`
+airgapped node holds — e.g. an exported `simple/index.json` or a `pypiron verify-index`
 listing carried out):
 
 ```

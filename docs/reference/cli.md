@@ -3,10 +3,10 @@
 One binary, four subcommands:
 
 ```bash
-pypiron serve     # run the server
-pypiron sync      # mirror packages into a server over HTTP
-pypiron verify    # check that served indexes match truth (read-only)
-pypiron resync    # rebuild every index from truth, unconditionally
+pypiron serve          # run the server
+pypiron sync           # mirror packages into a server over HTTP
+pypiron verify-index   # check that served indexes match truth (read-only)
+pypiron rebuild-index  # rebuild every index from truth, unconditionally
 ```
 
 Every `--flag` has a matching `PYPIRON_*` environment variable. Values layer
@@ -78,28 +78,28 @@ the periodic self-heal. Once mirrored, an artifact is never deleted — re-runs
 reconcile yank state and project status. See
 [Mirroring](../concepts/mirroring.md) for filters and the full flag set.
 
-## verify
+## verify-index
 
 Recompute every index from truth (artifacts plus sidecars) and diff against what
 storage actually serves. Strictly read-only: where the server would heal a
-missing or stale view, `verify` reports it instead. Exits nonzero on any
+missing or stale view, `verify-index` reports it instead. Exits nonzero on any
 divergence.
 
 ```bash
-pypiron verify --storage disk --data-dir ./data
+pypiron verify-index --storage disk --data-dir ./data
 ```
 
 Each divergence prints as `kind<TAB>package<TAB>detail`, followed by a summary
 line. Use it in CI or after out-of-band storage changes to assert convergence.
 
-## resync
+## rebuild-index
 
 Rebuild every materialized view from truth, unconditionally. Run it after
 restoring a backup or editing storage out of band — `serve` heals on its own
-schedule, but `resync` forces the full sweep now.
+schedule, but `rebuild-index` forces the full sweep now.
 
 ```bash
-pypiron resync --storage disk --data-dir ./data
+pypiron rebuild-index --storage disk --data-dir ./data
 ```
 
 ## Global flags

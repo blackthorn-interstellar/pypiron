@@ -107,7 +107,7 @@ def drain_markers(data_dir: Path, *, timeout: float = 25.0) -> None:
 
 def run_verify(bin_path: Path, data_dir: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [str(bin_path), "verify", "--data-dir", str(data_dir)],
+        [str(bin_path), "verify-index", "--data-dir", str(data_dir)],
         capture_output=True,
         text=True,
         timeout=60,
@@ -310,7 +310,7 @@ def test_multi_node_s3_uploads_converge(pypiron_bin: Path, minio, tmp_path: Path
         result = None
         while time.time() < deadline:
             result = subprocess.run(
-                [str(pypiron_bin), "verify"],
+                [str(pypiron_bin), "verify-index"],
                 env=verify_env,
                 capture_output=True,
                 text=True,
@@ -334,7 +334,7 @@ def test_multi_node_s3_uploads_converge(pypiron_bin: Path, minio, tmp_path: Path
 # and overlap leaders against MinIO with a short lease TTL and the audit
 # disabled, so the event path + election do all the healing. A 2s TTL means
 # failover lands within a few worker ticks; convergence is asserted by polling
-# the read-only oracle (`pypiron verify`) to a bounded deadline.
+# the read-only oracle (`pypiron verify-index`) to a bounded deadline.
 
 LEASE_TTL_SECS = 2
 # Boot writes (lease acquire) + an upload's marker/artifact protocol all happen
@@ -453,7 +453,7 @@ def _wait_for_metric(node: Dict, name: str, threshold: float, timeout: float) ->
 
 def _s3_verify(pypiron_bin: Path, minio: Dict) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [str(pypiron_bin), "verify"],
+        [str(pypiron_bin), "verify-index"],
         env=_chaos_s3_env(minio, "unused"),
         capture_output=True,
         text=True,

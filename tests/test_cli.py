@@ -11,7 +11,7 @@ import pytest
 pytestmark = pytest.mark.integration
 
 # The four verbs the top-level help must advertise.
-SUBCOMMANDS = ("serve", "sync", "verify", "resync")
+SUBCOMMANDS = ("serve", "sync", "verify-index", "rebuild-index")
 
 
 def _run(bin_path: Path, *args: str) -> subprocess.CompletedProcess:

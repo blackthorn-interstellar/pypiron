@@ -58,7 +58,7 @@ List every flag for the server:
 pypiron serve --help
 ```
 
-Bare `pypiron` prints help. The other subcommands are `sync`, `verify`, and `resync` ([CLI reference](../reference/cli.md)). Every `--flag` also has a `PYPIRON_*` environment variable ([Configuration](../reference/configuration.md)).
+Bare `pypiron` prints help. The other subcommands are `sync`, `verify-index`, and `rebuild-index` ([CLI reference](../reference/cli.md)). Every `--flag` also has a `PYPIRON_*` environment variable ([Configuration](../reference/configuration.md)).
 
 ## Build from source
 

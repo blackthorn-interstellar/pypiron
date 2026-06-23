@@ -1,4 +1,4 @@
-//! `pypiron verify`: the read-only oracle. Recompute every materialized view
+//! `pypiron verify-index`: the read-only oracle. Recompute every materialized view
 //! from truth (artifacts + sidecars) and diff against what storage actually
 //! serves. Divergence means a healing bug, an interrupted write, or
 //! out-of-band storage surgery — exit nonzero so CI and chaos tests can

@@ -45,8 +45,8 @@ Because rebuilds are pure regenerations from a listing, they are idempotent: any
 node can rebuild any package at any time and get the same answer. That one property
 does most of the work. Lost a marker? A periodic full reconcile flat-lists the
 corpus and repairs the diff, so events only accelerate healing rather than being
-required for it. Worst case, `pypiron resync` regenerates every view from truth and
-`pypiron verify` checks them read-only.
+required for it. Worst case, `pypiron rebuild-index` regenerates every view from truth and
+`pypiron verify-index` checks them read-only.
 
 ## Reads need zero coordination
 

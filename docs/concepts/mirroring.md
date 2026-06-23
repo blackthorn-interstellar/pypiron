@@ -98,10 +98,14 @@ an unchanged upstream answers `304` and the whole project is skipped:
 pypiron sync          # re-run anytime; unchanged projects 304 and are skipped
 ```
 
-A normal run therefore only reconciles projects whose upstream listing actually
-changed. Run `--full` periodically (e.g. nightly) as the self-heal — it ignores
-the cursor and re-fetches every project unconditionally, catching yanks and
-removals on projects that were otherwise quiet:
+A normal run therefore reconciles every project whose upstream listing actually
+changed — and a yank or removal *does* change the listing, so it gets a `200` and
+is reconciled on an ordinary `sync`. `--full` is not required to pick up a fresh
+yank. Run it periodically (e.g. nightly) as the self-heal: it ignores the cursor
+and re-fetches every project unconditionally, closing the gaps a `304` can't
+see — a stale upstream-CDN response that 304s right after a yank, or dest-side
+drift (a manual admin yank toggle, a restore from backup) that no upstream change
+reflects:
 
 ```bash
 pypiron sync --full   # ignore the cursor; re-fetch and fully reconcile everything

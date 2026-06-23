@@ -68,18 +68,23 @@ a re-run only moves what's new.
 
 ## 4. Keep it current
 
-A normal run only reconciles projects whose upstream listing changed. To pull in
-yanks and upstream removals across your whole allowlist, run a full pass on a
-schedule (e.g. nightly):
+A normal run already reconciles yanks and removals: yanking or removing a file
+upstream changes the project's listing, so the conditional fetch gets a `200`
+(not a `304`) and reconciles it. You don't need `--full` to pick up a fresh yank.
+
+Run a full pass on a schedule (e.g. nightly) as the *self-heal* — it ignores the
+conditional-fetch memo and re-reconciles every project unconditionally, which
+closes the gaps a `304` can't see: a stale upstream-CDN response that answers
+`304` right after a yank, or dest-side drift (a manual admin yank toggle, a
+restore from backup) that no upstream change reflects.
 
 ```bash
 pypiron sync --full
 ```
 
-`--full` ignores the conditional-fetch memo and reconciles every project: yank
-state is brought in line with upstream, and a file gone from upstream is flagged
-yanked `removed upstream` (kept downloadable, skipped by installers). Mirrored
-artifacts are never deleted.
+Either way: yank state is brought in line with upstream, and a file gone from
+upstream is flagged yanked `removed upstream` (kept downloadable, skipped by
+installers). Mirrored artifacts are never deleted.
 
 ## Install from the mirror
 

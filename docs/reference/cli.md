@@ -67,11 +67,11 @@ pypiron sync \
 | `--from` | Source index base. Default `https://pypi.org`. |
 | `--pkg` | One package, with optional PEP 440 specifiers. Repeatable. |
 | `--packages-list` | Text file of packages, one per line. |
-| `--config` | Path to a `pypiron.toml`. Defaults to `./pypiron.toml` when present. |
+| `--config` | Path to a `pypiron.toml` (global; `serve` reads it too). Defaults to `./pypiron.toml` when present. |
 | `--username` / `--password` | Admin credential for the destination. |
 | `--full` | Ignore the conditional-fetch memo; re-fetch and reconcile everything. |
 | `--dry-run` | Print what would be copied, transfer nothing. |
-| `--exclude-newer` | Only mirror files PyPI received before a cutoff (timestamp, date, `7`, `30 days`, `P30D`). |
+| `--filter-exclude-newer` | Only mirror files received upstream before a cutoff (timestamp, date, `7`, `30 days`, `P30D`). One of the shared `--filter-*` flags (see [Configuration](configuration.md#filters)). |
 
 A normal run only touches projects whose upstream listing changed; `--full` is
 the periodic self-heal. Once mirrored, an artifact is never deleted — re-runs

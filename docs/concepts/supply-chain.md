@@ -7,7 +7,7 @@ live. Each protection below answers one threat.
 | Threat | Mechanism | Control |
 | --- | --- | --- |
 | Dependency confusion | Origin exclusivity + namespace reservation | `.origin` marker, `--private-prefix` |
-| Malicious recent releases | Quarantine window | `--proxy-exclude-newer`, `sync --exclude-newer` |
+| Malicious recent releases | Quarantine window | `--filter-exclude-newer` (sync or serve) |
 | Tampered or unattributed bytes | Filename immutability, PEP 740 provenance relay | `<filename>.provenance` |
 
 ## Dependency confusion
@@ -85,11 +85,11 @@ The proxy applies it on the read path; `sync` applies it to what a run mirrors:
 ```bash
 pypiron serve --admin-pass "$ADMIN" \
   --proxy-upstream https://pypi.org \
-  --proxy-exclude-newer "7 days"
+  --filter-exclude-newer "7 days"
 ```
 
 ```bash
-pypiron sync --exclude-newer "2026-01-01T00:00:00Z"
+pypiron sync --filter-exclude-newer "2026-01-01T00:00:00Z"
 ```
 
 `<when>` is an RFC 3339 timestamp (`2026-01-01T00:00:00Z`), a friendly duration
@@ -140,9 +140,9 @@ the original publisher.
 The proxy still talks to live PyPI on a cache miss. An [air-gapped
 mirror](../guides/air-gapped-mirror.md) removes that surface entirely: the
 serving node has no egress, and `sync` pre-loads a vetted allowlist from a host
-that does. Combine the allowlist with `--exclude-newer` and a private prefix and
-the serving node resolves a fixed, reviewed corpus with no live upstream to
-attack.
+that does. Combine the allowlist with `--filter-exclude-newer` and a private
+prefix and the serving node resolves a fixed, reviewed corpus with no live
+upstream to attack.
 
 ## See also
 
@@ -152,5 +152,5 @@ attack.
   gate backdating and mirror uploads.
 - [Standards support](../reference/standards.md) — what is verified against real
   clients.
-- [Configuration](../reference/configuration.md#sync-filters-and-config-file) —
-  every `--proxy-*` and `sync` filter, with env-var equivalents.
+- [Configuration](../reference/configuration.md#filters) — the shared `--filter-*`
+  surface, with env-var and `[filter]`-table equivalents.

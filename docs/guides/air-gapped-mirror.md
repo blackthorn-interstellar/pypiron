@@ -38,13 +38,16 @@ On the sync host, put the destination, credential, package set, and filters in
 to = "http://HOST:8080"
 username = "admin"                       # password via PYPIRON_SYNC_PASSWORD
 packages = ["requests>=2.20,<3", "numpy", "pandas"]
+
+[filter]
 only-wheels = true
 exclude-newer = "2026-01-01T00:00:00Z"   # reproducible, historically-correct cutoff
 ```
 
 Each `packages` entry is a name with optional PEP 440 specifiers, so you pin
-exactly the versions you want mirrored. `only-wheels` skips sdists;
-`exclude-newer` mirrors only files PyPI received before the cutoff.
+exactly the versions you want mirrored. The `[filter]` slice is shared with the
+proxy: `only-wheels` skips sdists; `exclude-newer` mirrors only files PyPI
+received before the cutoff.
 
 ## 3. Run the sync
 
@@ -109,6 +112,6 @@ config. See [Authentication](../concepts/authentication.md).
 
 `exclude-newer` and `only-wheels` are two of the filters that gate what a run
 adds. The full set — wheel/sdist, python/abi/platform tags, date cutoffs — is in
-[Configuration](../reference/configuration.md#sync-filters-and-config-file). For
-how mirroring reconciles yanks, removals, and project status, see
-[Mirroring](../concepts/mirroring.md).
+[Configuration](../reference/configuration.md#filters), and the same `[filter]`
+slice governs the on-demand proxy. For how mirroring reconciles yanks, removals,
+and project status, see [Mirroring](../concepts/mirroring.md).

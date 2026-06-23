@@ -168,10 +168,10 @@ credential — nothing about the server's storage backend.
 | `--username` / `--password`   | `PYPIRON_SYNC_USERNAME` / `_PASSWORD` | *(none)*      | Destination admin credential (mirroring is admin-only)  |
 | `--pkg SPEC`                  | —                                | *(none)*           | A package to mirror (repeatable; same syntax as a list line) |
 | `--packages-list PATH`        | `PYPIRON_PACKAGES_LIST`          | *(none)*           | File of packages, one per line                          |
-| `--private-prefix`            | `PYPIRON_PRIVATE_PREFIX`         | *(none)*           | Refuse to mirror names inside this namespace            |
+| `--private-prefix`            | `PYPIRON_PRIVATE_PREFIX`         | *(none)*           | Refuse to mirror names inside this namespace (or top-level `private-prefix`) |
 | `--concurrency N`             | `PYPIRON_SYNC_CONCURRENCY`       | `4`                | Parallel downloads/uploads within one package           |
 | `--package-concurrency N`     | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8`              | Packages synced in parallel                             |
-| `--config PATH`               | `PYPIRON_CONFIG`                 | *(auto)*           | Path to a `pypiron.toml` (default `./pypiron.toml` if present) |
+| `--config PATH`               | `PYPIRON_CONFIG`                 | *(auto)*           | Path to a `pypiron.toml` (global; read by `serve` too; default `./pypiron.toml` if present) |
 | `--spool-dir PATH`            | `PYPIRON_SYNC_SPOOL_DIR`         | system temp        | Download spool dir — real disk, not tmpfs, for large wheels |
 | `--dry-run`                   | —                                | `false`            | Print what would be mirrored, write nothing             |
 
@@ -203,24 +203,32 @@ The cursor key folds in the source URL, the resolved filters, and each project's
 specifiers, so changing any of them invalidates the shortcut and forces a full
 fetch.
 
-## Sync filters and config file
+## Filters
 
-Filters gate only what a run *adds* — already-mirrored files are never removed:
+Filters select the slice of PyPI you want. They are **shared**: the same
+`--filter-*` flags, `PYPIRON_FILTER_*` env vars, and `[filter]` table govern both
+`pypiron sync` (push mirror) and `serve --proxy-upstream` (on-demand proxy) — set
+the slice once and it applies to whichever you run. Filters gate only what is
+*added*; already-mirrored or already-cached files are never removed.
 
-- `--only-wheels` / `--only-sdists`
-- `--python-tag py3,cp311` — python tag(s)
-- `--abi-tag none,cp311` — ABI tag(s)
-- `--platform-tag any,manylinux2014_x86_64,macosx_*_arm64` — platform tag(s), `*` wildcard
-- `--exclude-platform-tag` — exclusions (supports `*`)
-- `--min-python X.Y` — drop wheels built only for Python older than the floor
+- `--filter-only-wheels` / `--filter-only-sdists`
+- `--filter-python-tag py3,cp311` — python tag(s)
+- `--filter-abi-tag none,cp311` — ABI tag(s)
+- `--filter-platform-tag any,manylinux2014_x86_64,macosx_*_arm64` — platform tag(s), `*` wildcard
+- `--filter-exclude-platform-tag` — exclusions (supports `*`)
+- `--filter-min-python X.Y` — drop wheels built only for Python older than the floor
   (e.g. `3.10` drops cp36–cp39 and python-2 wheels). Version-agnostic wheels
   (`py3`, `py2.py3`), forward-compatible `abi3` wheels, and all sdists are kept.
-- `--exclude-dev` — drop PEP 440 dev releases (any version with a `.devN` segment)
-- `--exclude-windows` — drop Windows artifacts: `win*` wheels and legacy
+- `--filter-exclude-dev` — drop PEP 440 dev releases (any version with a `.devN` segment)
+- `--filter-exclude-windows` — drop Windows artifacts: `win*` wheels and legacy
   `.exe`/`.msi`/`.winXX` installers (a package whose name merely starts with
   "win", like `windrose`, is never matched)
-- `--exclude-newer <when>` — only files PyPI received before the cutoff
-- `--exclude-older <when>` — only files received since the cutoff
+- `--filter-exclude-newer <when>` — only files received upstream before the cutoff
+- `--filter-exclude-older <when>` — only files received upstream since the cutoff
+
+Every flag has a matching `PYPIRON_FILTER_*` env var (e.g.
+`PYPIRON_FILTER_ONLY_WHEELS`, `PYPIRON_FILTER_PYTHON_TAG`) and an unprefixed
+`[filter]` key (`only-wheels`, `python-tag`, …).
 
 `<when>` (matching uv's `--exclude-newer`) is an **RFC 3339 timestamp**
 (`2024-01-01T00:00:00Z`), a **bare date** (`2008-12-03`, taken as 00:00:00 UTC),
@@ -228,36 +236,57 @@ a **bare integer of days** ago (`7`), a **friendly duration** ago (`"30 days"`,
 `"24 hours"`, `"1 week"`), or an **ISO 8601 duration** ago (`P30D`, `PT24H`). A
 duration is resolved against the current time as a fixed number of seconds (a day
 is 24 h); calendar months and years are rejected. The same forms apply to the
-`--proxy-` variants and to the `pypiron.toml` `exclude-newer`/`exclude-older` keys.
+`[filter]` `exclude-newer`/`exclude-older` keys.
 
 A sync run prints a live progress meter on stderr (packages done, files/bytes
 mirrored, throughput, ETA) plus an always-on end-of-run summary; `--no-progress`
 (`PYPIRON_SYNC_NO_PROGRESS`) silences the live line. When stderr is redirected to
 a file, the meter prints one fresh line every 30 s instead of repainting.
 
-Every sync option also lives in `pypiron.toml` (auto-discovered in the working
-directory, or `--config <path>`), layered as CLI/env > file > defaults:
+## The config file (`pypiron.toml`)
+
+Both `serve` and `sync` read `pypiron.toml` — pass `--config <path>` (global,
+`PYPIRON_CONFIG`) or let it be auto-discovered as `./pypiron.toml` in the working
+directory. Precedence is **CLI/env > file > defaults**. Four parts:
+
+- top-level `private-prefix` — the reserved private namespace, shared by both
+  commands.
+- `[filter]` — the slice of PyPI (shared by sync and the proxy; see above).
+- `[serve]` — the server process. Every `serve` flag *except secrets*:
+  admin/uploader/read passwords and the Azure access key stay in CLI/env. Storage
+  selection (`storage`, `s3-bucket`, …) lives here too.
+- `[sync]` — the push-mirror job: source/dest, the destination username,
+  packages, concurrency.
 
 ```toml
-[sync]
-packages = ["requests>=2.20,<3", "six"]   # or packages-list = "packages.txt"
-to = "http://localhost:8080"
-username = "admin"                        # password via PYPIRON_SYNC_PASSWORD
+private-prefix = "acme"
+
+[filter]                                    # shared by sync and the serve proxy
 only-wheels = true
-python-tag = ["py3"]
+python-tag = ["cp311", "cp312"]
 exclude-newer = "2026-01-01T00:00:00Z"
+
+[serve]
+bind-addr = "0.0.0.0:8080"
+storage = "s3"
+s3-bucket = "acme-mirror"
+proxy-upstream = "https://pypi.org"
+artifact-delivery = "auto"
+
+[sync]
+packages = ["requests>=2.20,<3", "six"]     # or packages-list = "packages.txt"
+to = "http://localhost:8080"
+username = "admin"                          # password via PYPIRON_SYNC_PASSWORD
 concurrency = 8
 ```
 
-A `packages-list` path in the file resolves relative to the config file, not
-the working directory. A CLI package source (`--pkg` and/or `--packages-list`)
-replaces the file's list entirely; other options layer per-key.
-
-The same filters gate what the proxy serves and caches, under a `--proxy-`
-prefix: `--proxy-only-wheels`, `--proxy-only-sdists`, `--proxy-python-tag`,
-`--proxy-abi-tag`, `--proxy-platform-tag`, `--proxy-exclude-platform-tag`,
-`--proxy-min-python`, `--proxy-exclude-dev`, `--proxy-exclude-windows`,
-`--proxy-exclude-newer`, `--proxy-exclude-older`.
+A `packages-list` path in the file resolves relative to the config file, not the
+working directory. A CLI package source (`--pkg` and/or `--packages-list`)
+replaces the file's list entirely; other options layer per-key. A boolean set
+`true` in the file can be turned on but not off by the absence of a flag (clap
+cannot express an explicit `false`). Filter keys (and `private-prefix`) that used
+to live under `[sync]` now belong in `[filter]` (and at the top level); a stale
+config fails to start with a pointer to the new home.
 
 ## Artifact delivery
 

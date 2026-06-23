@@ -189,7 +189,7 @@ def test_sync_relays_provenance_from_pypi(disk_server, pypiron_bin):
         disk_server,
         "--pkg",
         f"{PYPI_ATTESTED_PKG}=={PYPI_ATTESTED_VERSION}",
-        "--only-wheels",
+        "--filter-only-wheels",
     )
     assert rc == 0, f"sync failed:\n{out}\n{err}"
     index = wait_for_file_in_index(disk_server["simple"], PYPI_ATTESTED_PKG, PYPI_ATTESTED_WHEEL)

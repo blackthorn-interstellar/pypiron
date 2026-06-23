@@ -12,7 +12,7 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
-use clap::{Args as ClapArgs, CommandFactory, Parser, Subcommand};
+use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{info, warn};
 
@@ -80,6 +80,12 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
+    /// Path to a pypiron.toml (defaults to ./pypiron.toml when present). Read by
+    /// both `serve` and `sync`; CLI/env values take precedence over the file.
+    /// `global` so it may sit before or after the subcommand.
+    #[arg(long, env = "PYPIRON_CONFIG", global = true)]
+    config: Option<std::path::PathBuf>,
+
     /// Log output format: `text` (human-readable) or `json` (one object per
     /// line, for log pipelines). Applies to every subcommand; `global` so it
     /// may sit before or after the subcommand.
@@ -97,7 +103,7 @@ struct Cli {
 enum Commands {
     /// Run the PypIron server (the default day-to-day command)
     Serve(Box<ServeArgs>),
-    /// Mirror packages from PyPI (or another source) into this PypIron instance
+    /// Mirror packages from PyPI (or another source) into a PypIron instance
     Sync(Box<sync::SyncArgs>),
     /// Recompute every index from truth and diff against what storage serves
     /// (read-only); exits nonzero on any divergence
@@ -310,10 +316,11 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_PROXY_UPSTREAM")]
     proxy_upstream: Option<String>,
 
-    /// Filters gating what the proxy serves and caches (same semantics as
-    /// the `sync` filters, under a `--proxy-` prefix).
+    /// The slice of PyPI the proxy serves and caches. The same `--filter-*`
+    /// surface as `sync`, set once and shared: a `[filter]` table in
+    /// pypiron.toml governs both.
     #[command(flatten)]
-    proxy_filter: proxy::ProxyFilterArgs,
+    filter: sync::FilterArgs,
 }
 
 /// Shared TTL cache of the ranked download leaderboard: `(computed_at, board)`,
@@ -413,7 +420,15 @@ impl counters::ObjectStore for CounterStore {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Parse via ArgMatches (not just `Cli::parse()`) so `run_serve` can ask
+    // clap whether each serve knob came from the CLI/env or is sitting at its
+    // default — that's how the `[serve]` table layers under CLI/env without
+    // losing the `[default: …]` hints clap prints in `--help`.
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
 
     // logging — format comes from the global --log-format/PYPIRON_LOG_FORMAT,
     // so every subcommand (serve, sync, verify, resync) logs consistently.
@@ -427,11 +442,17 @@ async fn main() -> Result<()> {
             .init(),
     }
 
+    let config_path = cli.config.clone();
     match cli.command {
-        Some(Commands::Sync(args)) => sync::run_sync(*args).await,
+        Some(Commands::Sync(args)) => sync::run_sync(*args, config_path).await,
         Some(Commands::Verify(args)) => verify::run_verify(*args).await,
         Some(Commands::Resync(args)) => run_resync(*args).await,
-        Some(Commands::Serve(args)) => run_serve(*args, cli.log_format).await,
+        Some(Commands::Serve(args)) => {
+            let serve_matches = matches
+                .subcommand_matches("serve")
+                .expect("serve subcommand matched");
+            run_serve(*args, config_path, serve_matches, cli.log_format).await
+        }
         None => {
             // A global flag (e.g. --log-format) but no subcommand: nothing to
             // run, so show help. Truly-bare `pypiron` never reaches here —
@@ -487,7 +508,164 @@ fn parse_resolution_secs(s: &str) -> Result<u32> {
         .ok_or_else(|| anyhow::anyhow!("'{s}': duration too large"))
 }
 
-async fn run_serve(mut cli: ServeArgs, log_format: LogFormat) -> Result<()> {
+/// Did this arg come from the command line or an env var (as opposed to sitting
+/// at its clap default)? This is how `[serve]` layers *under* CLI/env without
+/// dropping clap's `[default: …]` hints: the file fills a knob only when the
+/// user left it untouched. Panics only on a typo'd id — every id below is a real
+/// `ServeArgs`/`StorageArgs` field.
+fn arg_from_cli_or_env(m: &clap::ArgMatches, id: &str) -> bool {
+    matches!(
+        m.value_source(id),
+        Some(clap::parser::ValueSource::CommandLine) | Some(clap::parser::ValueSource::EnvVariable)
+    )
+}
+
+/// Parse a `[serve]` string into a clap value-enum, naming the table key on
+/// error so a bad `storage = "s4"` reads clearly.
+fn serve_value_enum<T: clap::ValueEnum>(key: &str, v: &str) -> Result<T> {
+    <T as clap::ValueEnum>::from_str(v, true).map_err(|e| anyhow::anyhow!("[serve].{key}: {e}"))
+}
+
+/// Fold the `[serve]` table into the parsed CLI args. Defaulted/bool/enum knobs
+/// take the file value only when the CLI/env didn't set them; `Option` knobs use
+/// CLI/env-or-file. Secrets (credentials, the Azure access key) are never here —
+/// they stay CLI/env only.
+fn merge_serve_file(
+    cli: &mut ServeArgs,
+    f: &config::ServeConfig,
+    m: &clap::ArgMatches,
+) -> Result<()> {
+    macro_rules! fill {
+        ($field:expr, $id:literal, $val:expr) => {
+            if !arg_from_cli_or_env(m, $id) {
+                if let Some(v) = $val {
+                    $field = v;
+                }
+            }
+        };
+    }
+
+    // Server knobs (defaulted scalars / bools / enums).
+    fill!(cli.bind_addr, "bind_addr", f.bind_addr.clone());
+    if !arg_from_cli_or_env(m, "artifact_delivery") {
+        if let Some(v) = &f.artifact_delivery {
+            cli.artifact_delivery = serve_value_enum("artifact-delivery", v)?;
+        }
+    }
+    fill!(cli.sync_uploads, "sync_uploads", f.sync_uploads);
+    fill!(
+        cli.sync_upload_timeout_secs,
+        "sync_upload_timeout_secs",
+        f.sync_upload_timeout_secs
+    );
+    fill!(
+        cli.worker_interval_secs,
+        "worker_interval_secs",
+        f.worker_interval_secs
+    );
+    fill!(
+        cli.intent_grace_secs,
+        "intent_grace_secs",
+        f.intent_grace_secs
+    );
+    fill!(cli.audit_on_boot, "audit_on_boot", f.audit_on_boot);
+    fill!(
+        cli.reconcile_interval_secs,
+        "reconcile_interval_secs",
+        f.reconcile_interval_secs
+    );
+    fill!(cli.lease_ttl_secs, "lease_ttl_secs", f.lease_ttl_secs);
+    fill!(cli.download_stats, "download_stats", f.download_stats);
+    fill!(
+        cli.counters_resolution,
+        "counters_resolution",
+        f.counters_resolution.clone()
+    );
+    fill!(
+        cli.counters_flush_interval_secs,
+        "counters_flush_interval_secs",
+        f.counters_flush_interval_secs
+    );
+    fill!(
+        cli.counters_rollup_interval_secs,
+        "counters_rollup_interval_secs",
+        f.counters_rollup_interval_secs
+    );
+    fill!(
+        cli.counters_retention_days,
+        "counters_retention_days",
+        f.counters_retention_days
+    );
+
+    // Storage backend selection (defaulted/bool knobs).
+    if !arg_from_cli_or_env(m, "storage") {
+        if let Some(v) = &f.storage {
+            cli.storage.storage = serve_value_enum("storage", v)?;
+        }
+    }
+    fill!(
+        cli.storage.s3_force_path_style,
+        "s3_force_path_style",
+        f.s3_force_path_style
+    );
+    fill!(
+        cli.storage.azure_use_emulator,
+        "azure_use_emulator",
+        f.azure_use_emulator
+    );
+
+    // Option knobs: CLI/env wins when present, else the file.
+    cli.proxy_upstream = cli.proxy_upstream.take().or(f.proxy_upstream.clone());
+    cli.spool_dir = cli.spool_dir.take().or(f.spool_dir.clone());
+    cli.storage.data_dir = cli.storage.data_dir.take().or(f.data_dir.clone());
+    cli.storage.s3_bucket = cli.storage.s3_bucket.take().or(f.s3_bucket.clone());
+    cli.storage.aws_region = cli.storage.aws_region.take().or(f.aws_region.clone());
+    cli.storage.s3_endpoint_url = cli
+        .storage
+        .s3_endpoint_url
+        .take()
+        .or(f.s3_endpoint_url.clone());
+    cli.storage.gcs_bucket = cli.storage.gcs_bucket.take().or(f.gcs_bucket.clone());
+    cli.storage.gcs_service_account_path = cli
+        .storage
+        .gcs_service_account_path
+        .take()
+        .or(f.gcs_service_account_path.clone());
+    cli.storage.gcs_endpoint_url = cli
+        .storage
+        .gcs_endpoint_url
+        .take()
+        .or(f.gcs_endpoint_url.clone());
+    cli.storage.azure_account = cli.storage.azure_account.take().or(f.azure_account.clone());
+    cli.storage.azure_container = cli
+        .storage
+        .azure_container
+        .take()
+        .or(f.azure_container.clone());
+    cli.storage.azure_endpoint_url = cli
+        .storage
+        .azure_endpoint_url
+        .take()
+        .or(f.azure_endpoint_url.clone());
+
+    Ok(())
+}
+
+async fn run_serve(
+    mut cli: ServeArgs,
+    config_path: Option<std::path::PathBuf>,
+    serve_matches: &clap::ArgMatches,
+    log_format: LogFormat,
+) -> Result<()> {
+    // Layer pypiron.toml under CLI/env before anything reads the config: the
+    // `[serve]` table fills in any knob the CLI/env left at its default, and the
+    // top-level `private-prefix` + shared `[filter]` reach the server here. The
+    // filter itself is resolved through sync's one shared path, so the proxy and
+    // a sync run can never drift.
+    let file = config::load(config_path.as_deref())?;
+    merge_serve_file(&mut cli, &file.serve, serve_matches)?;
+    cli.private_prefix = cli.private_prefix.take().or(file.private_prefix.clone());
+
     // Supplying only `--admin-pass` is enough to enable admin: the password is
     // the secret, the username is conventional. Fill in the default username
     // only alongside a password, so the no-admin (read-only) configuration keeps
@@ -526,7 +704,10 @@ async fn run_serve(mut cli: ServeArgs, log_format: LogFormat) -> Result<()> {
     let storage_desc = cli.storage.describe();
     let storage = cli.storage.build().await?;
     let proxy = match cli.proxy_upstream.as_deref() {
-        Some(upstream) => Some(Arc::new(proxy::Proxy::new(upstream, &cli.proxy_filter)?)),
+        Some(upstream) => {
+            let filter = cli.filter.resolve(Some(&file.filter))?;
+            Some(Arc::new(proxy::Proxy::new(upstream, filter)?))
+        }
         None => None,
     };
 

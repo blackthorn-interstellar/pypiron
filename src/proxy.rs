@@ -26,7 +26,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
-use clap::Args;
 use futures::StreamExt;
 use reqwest::Client;
 use tracing::{info, warn};
@@ -38,7 +37,7 @@ use crate::sidecar::{
     metadata_key, provenance_key, sidecar_key, Sidecar, METADATA_SUFFIX, PROVENANCE_SUFFIX,
 };
 use crate::simple::{self, SimpleFile};
-use crate::sync::{matches_filters, parse_cutoff, parse_min_python, ResolvedFilter};
+use crate::sync::{matches_filters, ResolvedFilter};
 use crate::upload::{FinishedSpool, UploadSpool};
 use crate::{AppState, PACKAGES_PREFIX};
 
@@ -55,118 +54,6 @@ const MAX_LISTINGS: usize = 8192;
 const SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Same retry budget as `sync`: at CDN scale, transient errors are routine.
 const DOWNLOAD_ATTEMPTS: u32 = 3;
-
-/// Filters gating what the proxy serves and caches — the `sync` filters under
-/// a `--proxy-` prefix, with identical semantics (they gate what this server
-/// *adds*; nothing cached is ever removed by a filter change).
-#[derive(Debug, Clone, Default, Args)]
-pub struct ProxyFilterArgs {
-    /// Only proxy wheel files (.whl)
-    #[arg(
-        long = "proxy-only-wheels",
-        env = "PYPIRON_PROXY_ONLY_WHEELS",
-        conflicts_with = "only_sdists"
-    )]
-    pub only_wheels: bool,
-
-    /// Only proxy source distributions (sdist)
-    #[arg(long = "proxy-only-sdists", env = "PYPIRON_PROXY_ONLY_SDISTS")]
-    pub only_sdists: bool,
-
-    /// Include wheels whose python tag matches any of these (e.g. py3, cp311). Comma-separated or repeatable.
-    #[arg(
-        long = "proxy-python-tag",
-        env = "PYPIRON_PROXY_PYTHON_TAG",
-        value_delimiter = ',',
-        value_name = "TAG"
-    )]
-    pub python_tag: Vec<String>,
-
-    /// Include wheels whose ABI tag matches any of these (e.g. none, cp311). Comma-separated or repeatable.
-    #[arg(
-        long = "proxy-abi-tag",
-        env = "PYPIRON_PROXY_ABI_TAG",
-        value_delimiter = ',',
-        value_name = "TAG"
-    )]
-    pub abi_tag: Vec<String>,
-
-    /// Include wheels whose platform tag matches any of these (supports '*' wildcard).
-    #[arg(
-        long = "proxy-platform-tag",
-        env = "PYPIRON_PROXY_PLATFORM_TAG",
-        value_delimiter = ',',
-        value_name = "TAG"
-    )]
-    pub platform_tag: Vec<String>,
-
-    /// Exclude wheels whose platform tag matches any of these (supports '*' wildcard).
-    #[arg(
-        long = "proxy-exclude-platform-tag",
-        env = "PYPIRON_PROXY_EXCLUDE_PLATFORM_TAG",
-        value_delimiter = ',',
-        value_name = "TAG"
-    )]
-    pub exclude_platform_tag: Vec<String>,
-
-    /// Only proxy files the upstream received before this cutoff. Accepts an
-    /// RFC 3339 timestamp, a friendly duration ("30 days", "24 hours", "1 week"),
-    /// or an ISO 8601 duration (P30D, PT24H), relative to now; no months/years.
-    #[arg(
-        long = "proxy-exclude-newer",
-        env = "PYPIRON_PROXY_EXCLUDE_NEWER",
-        value_name = "WHEN"
-    )]
-    pub exclude_newer: Option<String>,
-
-    /// Only proxy files the upstream received at or after this cutoff. Same
-    /// formats as --proxy-exclude-newer.
-    #[arg(
-        long = "proxy-exclude-older",
-        env = "PYPIRON_PROXY_EXCLUDE_OLDER",
-        value_name = "WHEN"
-    )]
-    pub exclude_older: Option<String>,
-
-    /// Skip wheels built only for Python older than this floor (e.g. "3.10").
-    /// Version-agnostic and abi3 wheels and all sdists are kept.
-    #[arg(
-        long = "proxy-min-python",
-        env = "PYPIRON_PROXY_MIN_PYTHON",
-        value_name = "X.Y"
-    )]
-    pub min_python: Option<String>,
-
-    /// Skip PEP 440 dev releases (any version with a `.devN` segment).
-    #[arg(long = "proxy-exclude-dev", env = "PYPIRON_PROXY_EXCLUDE_DEV")]
-    pub exclude_dev: bool,
-
-    /// Skip Windows artifacts: win* wheels and legacy .exe/.msi/.winXX installers.
-    #[arg(long = "proxy-exclude-windows", env = "PYPIRON_PROXY_EXCLUDE_WINDOWS")]
-    pub exclude_windows: bool,
-}
-
-impl ProxyFilterArgs {
-    fn resolve(&self) -> Result<ResolvedFilter> {
-        if self.only_wheels && self.only_sdists {
-            // Would select nothing and "succeed" — a registry of 404s.
-            bail!("proxy-only-wheels and proxy-only-sdists are mutually exclusive");
-        }
-        Ok(ResolvedFilter {
-            only_wheels: self.only_wheels,
-            only_sdists: self.only_sdists,
-            python_tag: self.python_tag.clone(),
-            abi_tag: self.abi_tag.clone(),
-            platform_tag: self.platform_tag.clone(),
-            exclude_platform_tag: self.exclude_platform_tag.clone(),
-            exclude_newer: parse_cutoff("proxy-exclude-newer", self.exclude_newer.as_ref())?,
-            exclude_older: parse_cutoff("proxy-exclude-older", self.exclude_older.as_ref())?,
-            min_python: parse_min_python(self.min_python.as_deref())?,
-            exclude_dev: self.exclude_dev,
-            exclude_windows: self.exclude_windows,
-        })
-    }
-}
 
 /// A package page rendered from the upstream listing, ETag precomputed.
 #[derive(Clone)]
@@ -224,14 +111,14 @@ pub async fn eligible(state: &AppState, pkg: &str) -> Result<bool> {
 }
 
 impl Proxy {
-    pub fn new(upstream: &str, filter: &ProxyFilterArgs) -> Result<Self> {
+    pub fn new(upstream: &str, filter: ResolvedFilter) -> Result<Self> {
         let upstream = upstream.trim_end_matches('/').to_string();
         if !upstream.starts_with("http://") && !upstream.starts_with("https://") {
             bail!("--proxy-upstream must be an http(s) URL, got '{upstream}'");
         }
         Ok(Self {
             upstream,
-            filter: filter.resolve()?,
+            filter,
             client: Client::builder()
                 .user_agent(
                     "pypiron-proxy/0.1 (+https://github.com/blackthorn-interstellar/pypiron)",
@@ -675,7 +562,7 @@ mod tests {
 
     #[test]
     fn relative_and_absolute_upstream_urls_resolve() {
-        let proxy = Proxy::new("https://pypi.org/", &ProxyFilterArgs::default()).unwrap();
+        let proxy = Proxy::new("https://pypi.org/", ResolvedFilter::default()).unwrap();
         assert_eq!(proxy.upstream(), "https://pypi.org");
         let abs = proxy
             .resolve_url("six", "https://files.pythonhosted.org/p/six.whl")
@@ -689,7 +576,7 @@ mod tests {
 
     #[test]
     fn non_http_upstream_is_rejected() {
-        let err = Proxy::new("ftp://mirror", &ProxyFilterArgs::default())
+        let err = Proxy::new("ftp://mirror", ResolvedFilter::default())
             .map(|_| ())
             .unwrap_err();
         assert!(err.to_string().contains("http(s)"));

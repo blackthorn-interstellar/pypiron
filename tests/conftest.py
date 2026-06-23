@@ -493,7 +493,7 @@ def proxy_pair_fast_counters(tmp_path_factory, pypiron_bin: Path) -> Iterator[Di
 @pytest.fixture()
 def proxy_pair_wheels_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     yield from _start_proxy_pair(
-        tmp_path_factory, pypiron_bin, proxy_extra_args=["--proxy-only-wheels"]
+        tmp_path_factory, pypiron_bin, proxy_extra_args=["--filter-only-wheels"]
     )
 
 

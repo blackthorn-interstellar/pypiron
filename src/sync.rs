@@ -40,7 +40,7 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tokio::fs;
 use tracing::{error, info, warn};
 
-use crate::config::{self, SyncConfig};
+use crate::config::{self, ConfigFile, FilterFile};
 use crate::names::{
     checked_pkg_name, infer_version_from_filename, matches_prefix, normalize_pkg_name,
     parse_wheel_tags, WheelTags,
@@ -53,11 +53,6 @@ use crate::upload::{FinishedSpool, UploadSpool};
 
 #[derive(Debug, Clone, Args)]
 pub struct SyncArgs {
-    /// Path to a pypiron.toml (defaults to ./pypiron.toml when present).
-    /// CLI and env values take precedence over the file.
-    #[arg(long, env = "PYPIRON_CONFIG")]
-    pub config: Option<PathBuf>,
-
     /// Text file of packages to mirror, one per line: a name with optional
     /// PEP 440 specifiers (e.g. "requests>=2.20,<3").
     #[arg(long, env = "PYPIRON_PACKAGES_LIST")]
@@ -133,20 +128,28 @@ pub struct SyncArgs {
     pub filter: FilterArgs,
 }
 
-#[derive(Debug, Clone, Args)]
+/// The slice of PyPI to mirror/proxy. One surface, flattened into both `sync`
+/// and `serve`: the same `--filter-*` flags and `PYPIRON_FILTER_*` env vars
+/// govern the push mirror and the on-demand proxy alike. The file form is the
+/// `[filter]` table in pypiron.toml (see [`FilterFile`]).
+#[derive(Debug, Clone, Default, Args)]
 pub struct FilterArgs {
-    /// Only mirror wheel files (.whl)
-    #[arg(long, env = "PYPIRON_SYNC_ONLY_WHEELS", conflicts_with = "only_sdists")]
+    /// Only mirror/proxy wheel files (.whl)
+    #[arg(
+        long = "filter-only-wheels",
+        env = "PYPIRON_FILTER_ONLY_WHEELS",
+        conflicts_with = "only_sdists"
+    )]
     pub only_wheels: bool,
 
-    /// Only mirror source distributions (sdist)
-    #[arg(long, env = "PYPIRON_SYNC_ONLY_SDISTS")]
+    /// Only mirror/proxy source distributions (sdist)
+    #[arg(long = "filter-only-sdists", env = "PYPIRON_FILTER_ONLY_SDISTS")]
     pub only_sdists: bool,
 
     /// Include wheels whose python tag matches any of these (e.g. py3, cp311). Comma-separated or repeatable.
     #[arg(
-        long,
-        env = "PYPIRON_SYNC_PYTHON_TAG",
+        long = "filter-python-tag",
+        env = "PYPIRON_FILTER_PYTHON_TAG",
         value_delimiter = ',',
         value_name = "TAG"
     )]
@@ -154,8 +157,8 @@ pub struct FilterArgs {
 
     /// Include wheels whose ABI tag matches any of these (e.g. none, cp311). Comma-separated or repeatable.
     #[arg(
-        long,
-        env = "PYPIRON_SYNC_ABI_TAG",
+        long = "filter-abi-tag",
+        env = "PYPIRON_FILTER_ABI_TAG",
         value_delimiter = ',',
         value_name = "TAG"
     )]
@@ -163,8 +166,8 @@ pub struct FilterArgs {
 
     /// Include wheels whose platform tag matches any of these (e.g. any, manylinux2014_x86_64, macosx_*_arm64, win_amd64). Supports '*' wildcard.
     #[arg(
-        long,
-        env = "PYPIRON_SYNC_PLATFORM_TAG",
+        long = "filter-platform-tag",
+        env = "PYPIRON_FILTER_PLATFORM_TAG",
         value_delimiter = ',',
         value_name = "TAG"
     )]
@@ -172,45 +175,116 @@ pub struct FilterArgs {
 
     /// Exclude wheels whose platform tag matches any of these (supports '*' wildcard).
     #[arg(
-        long,
-        env = "PYPIRON_SYNC_EXCLUDE_PLATFORM_TAG",
+        long = "filter-exclude-platform-tag",
+        env = "PYPIRON_FILTER_EXCLUDE_PLATFORM_TAG",
         value_delimiter = ',',
         value_name = "TAG"
     )]
     pub exclude_platform_tag: Vec<String>,
 
-    /// Only mirror files PyPI received before this cutoff (the mirroring twin of
-    /// uv's --exclude-newer). Accepts an RFC 3339 timestamp, a bare date
-    /// (2008-12-03), a bare integer of days ago (7), a friendly duration
-    /// ("30 days", "24 hours", "1 week"), or an ISO 8601 duration (P30D, PT24H);
-    /// durations are relative to now. Calendar months/years are not allowed.
-    #[arg(long, env = "PYPIRON_SYNC_EXCLUDE_NEWER", value_name = "WHEN")]
+    /// Only mirror/proxy files received upstream before this cutoff (the
+    /// mirroring twin of uv's --exclude-newer). Accepts an RFC 3339 timestamp, a
+    /// bare date (2008-12-03), a bare integer of days ago (7), a friendly
+    /// duration ("30 days", "24 hours", "1 week"), or an ISO 8601 duration
+    /// (P30D, PT24H); durations are relative to now. Calendar months/years are
+    /// not allowed.
+    #[arg(
+        long = "filter-exclude-newer",
+        env = "PYPIRON_FILTER_EXCLUDE_NEWER",
+        value_name = "WHEN"
+    )]
     pub exclude_newer: Option<String>,
 
-    /// Only mirror files PyPI received at or after this cutoff. Same formats as
-    /// --exclude-newer (RFC 3339 timestamp, or a duration ago like "30 days" /
-    /// P30D).
-    #[arg(long, env = "PYPIRON_SYNC_EXCLUDE_OLDER", value_name = "WHEN")]
+    /// Only mirror/proxy files received upstream at or after this cutoff. Same
+    /// formats as --filter-exclude-newer.
+    #[arg(
+        long = "filter-exclude-older",
+        env = "PYPIRON_FILTER_EXCLUDE_OLDER",
+        value_name = "WHEN"
+    )]
     pub exclude_older: Option<String>,
 
     /// Skip wheels built only for Python older than this floor (e.g. "3.10"
     /// drops cp36–cp39 and python-2 wheels). Version-agnostic wheels (py3,
     /// py2.py3), forward-compatible abi3 wheels, and all sdists are kept.
     #[arg(
-        long = "min-python",
-        env = "PYPIRON_SYNC_MIN_PYTHON",
+        long = "filter-min-python",
+        env = "PYPIRON_FILTER_MIN_PYTHON",
         value_name = "X.Y"
     )]
     pub min_python: Option<String>,
 
     /// Skip PEP 440 dev releases (any version with a `.devN` segment).
-    #[arg(long = "exclude-dev", env = "PYPIRON_SYNC_EXCLUDE_DEV")]
+    #[arg(long = "filter-exclude-dev", env = "PYPIRON_FILTER_EXCLUDE_DEV")]
     pub exclude_dev: bool,
 
     /// Skip Windows artifacts: wheels with a win32/win_amd64/win_arm64 platform
     /// tag, plus legacy Windows installers (.exe/.msi and .winXX filenames).
-    #[arg(long = "exclude-windows", env = "PYPIRON_SYNC_EXCLUDE_WINDOWS")]
+    #[arg(
+        long = "filter-exclude-windows",
+        env = "PYPIRON_FILTER_EXCLUDE_WINDOWS"
+    )]
     pub exclude_windows: bool,
+}
+
+impl FilterArgs {
+    /// The raw `--filter-exclude-older` input (CLI/env over file), trimmed —
+    /// kept verbatim so sync's [`config_key`] hashes a value that is stable
+    /// across runs rather than the now-relative instant a duration resolves to.
+    pub(crate) fn exclude_older_raw(&self, file: Option<&FilterFile>) -> Option<String> {
+        self.exclude_older
+            .as_deref()
+            .or(file.and_then(|f| f.exclude_older.as_deref()))
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Resolve CLI/env over the optional `[filter]` table into the runtime
+    /// predicate. The single path used by both `sync` and the `serve` proxy, so
+    /// the two can never drift. Precedence is CLI/env > file > default; a bool
+    /// set in the file can be turned *on* but not off by the absence of a flag
+    /// (clap cannot express an explicit `false`).
+    pub(crate) fn resolve(&self, file: Option<&FilterFile>) -> Result<ResolvedFilter> {
+        let only_wheels = self.only_wheels || file.and_then(|f| f.only_wheels).unwrap_or(false);
+        let only_sdists = self.only_sdists || file.and_then(|f| f.only_sdists).unwrap_or(false);
+        if only_wheels && only_sdists {
+            // Would select nothing and "succeed" — a silent empty mirror.
+            bail!("filter-only-wheels and filter-only-sdists are mutually exclusive");
+        }
+        Ok(ResolvedFilter {
+            only_wheels,
+            only_sdists,
+            python_tag: pick_vec(&self.python_tag, file.and_then(|f| f.python_tag.clone())),
+            abi_tag: pick_vec(&self.abi_tag, file.and_then(|f| f.abi_tag.clone())),
+            platform_tag: pick_vec(
+                &self.platform_tag,
+                file.and_then(|f| f.platform_tag.clone()),
+            ),
+            exclude_platform_tag: pick_vec(
+                &self.exclude_platform_tag,
+                file.and_then(|f| f.exclude_platform_tag.clone()),
+            ),
+            exclude_newer: parse_cutoff(
+                "filter-exclude-newer",
+                self.exclude_newer
+                    .as_ref()
+                    .or(file.and_then(|f| f.exclude_newer.as_ref())),
+            )?,
+            exclude_older: parse_cutoff(
+                "filter-exclude-older",
+                self.exclude_older_raw(file).as_ref(),
+            )?,
+            min_python: parse_min_python(
+                self.min_python
+                    .as_deref()
+                    .or(file.and_then(|f| f.min_python.as_deref())),
+            )?,
+            exclude_dev: self.exclude_dev || file.and_then(|f| f.exclude_dev).unwrap_or(false),
+            exclude_windows: self.exclude_windows
+                || file.and_then(|f| f.exclude_windows).unwrap_or(false),
+        })
+    }
 }
 
 /// One package to mirror, with optional PEP 440 version constraints.
@@ -242,6 +316,7 @@ struct Resolved {
     exclude_older_raw: Option<String>,
 }
 
+#[derive(Debug, Default)]
 pub(crate) struct ResolvedFilter {
     pub(crate) only_wheels: bool,
     pub(crate) only_sdists: bool,
@@ -262,7 +337,8 @@ pub(crate) struct ResolvedFilter {
 }
 
 impl Resolved {
-    async fn merge(args: &SyncArgs, cfg: SyncConfig) -> Result<Self> {
+    async fn merge(args: &SyncArgs, cfg: ConfigFile) -> Result<Self> {
+        let sync = cfg.sync;
         // Package set follows CLI > file: any CLI package source (`--pkg` or
         // `--packages-list`) replaces the file's set entirely (both its
         // `packages-list` and inline `packages`). With no CLI packages, the
@@ -277,13 +353,13 @@ impl Resolved {
             }
             lines.extend(args.pkg.iter().cloned());
         } else {
-            if let Some(path) = &cfg.packages_list {
+            if let Some(path) = &sync.packages_list {
                 let text = fs::read_to_string(path)
                     .await
                     .with_context(|| format!("reading {}", path.display()))?;
                 lines.extend(text.lines().map(str::to_string));
             }
-            lines.extend(cfg.packages.unwrap_or_default());
+            lines.extend(sync.packages.unwrap_or_default());
         }
 
         let mut specs = Vec::new();
@@ -303,73 +379,39 @@ impl Resolved {
             );
         }
 
-        let filter = &args.filter;
-        let only_wheels = filter.only_wheels || cfg.only_wheels.unwrap_or(false);
-        let only_sdists = filter.only_sdists || cfg.only_sdists.unwrap_or(false);
-        if only_wheels && only_sdists {
-            // Would select nothing and "succeed" — a silent empty mirror.
-            bail!("only-wheels and only-sdists are mutually exclusive");
-        }
-
         // Sync mirrors over HTTP; a destination is mandatory.
-        let dst_base = ensure_http_scheme(args.dst_base.clone().or(cfg.to).ok_or_else(|| {
+        let dst_base = ensure_http_scheme(args.dst_base.clone().or(sync.to).ok_or_else(|| {
             anyhow!(
                 "no destination: pass --to <server> (or set [sync].to) — sync mirrors over HTTP"
             )
         })?);
 
-        // The exact `--exclude-older` value that feeds `parse_cutoff` (CLI over
-        // file), normalized the same way it trims: kept so `config_key` can hash
-        // the *input* rather than the now-relative instant it resolves to.
-        let exclude_older_raw = filter
-            .exclude_older
-            .as_deref()
-            .or(cfg.exclude_older.as_deref())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned);
+        // The filter is resolved through the one shared path (CLI/env over the
+        // `[filter]` table), so a sync run and the serve proxy can never drift.
+        let filter = args.filter.resolve(Some(&cfg.filter))?;
+        let exclude_older_raw = args.filter.exclude_older_raw(Some(&cfg.filter));
 
         Ok(Self {
             specs,
             src_base: args
                 .src_base
                 .clone()
-                .or(cfg.from)
+                .or(sync.from)
                 .unwrap_or_else(|| "https://pypi.org".to_string()),
             dst_base,
-            username: args.username.clone().or(cfg.username),
-            password: args.password.clone().or(cfg.password),
+            username: args.username.clone().or(sync.username),
+            password: args.password.clone().or(sync.password),
             private_prefix: args.private_prefix.clone().or(cfg.private_prefix),
-            concurrency: args.concurrency.or(cfg.concurrency).unwrap_or(4).max(1),
+            concurrency: args.concurrency.or(sync.concurrency).unwrap_or(4).max(1),
             package_concurrency: args
                 .package_concurrency
-                .or(cfg.package_concurrency)
+                .or(sync.package_concurrency)
                 .unwrap_or(8)
                 .max(1),
             spool_dir: args.spool_dir.clone().unwrap_or_else(std::env::temp_dir),
             dry_run: args.dry_run,
             full: args.full,
-            filter: ResolvedFilter {
-                only_wheels,
-                only_sdists,
-                python_tag: pick_vec(&filter.python_tag, cfg.python_tag),
-                abi_tag: pick_vec(&filter.abi_tag, cfg.abi_tag),
-                platform_tag: pick_vec(&filter.platform_tag, cfg.platform_tag),
-                exclude_platform_tag: pick_vec(
-                    &filter.exclude_platform_tag,
-                    cfg.exclude_platform_tag,
-                ),
-                exclude_newer: parse_cutoff(
-                    "exclude-newer",
-                    filter.exclude_newer.as_ref().or(cfg.exclude_newer.as_ref()),
-                )?,
-                exclude_older: parse_cutoff("exclude-older", exclude_older_raw.as_ref())?,
-                min_python: parse_min_python(
-                    filter.min_python.as_deref().or(cfg.min_python.as_deref()),
-                )?,
-                exclude_dev: filter.exclude_dev || cfg.exclude_dev.unwrap_or(false),
-                exclude_windows: filter.exclude_windows || cfg.exclude_windows.unwrap_or(false),
-            },
+            filter,
             exclude_older_raw,
         })
     }
@@ -987,8 +1029,8 @@ fn fmt_count(n: u64) -> String {
     out
 }
 
-pub async fn run_sync(args: SyncArgs) -> Result<()> {
-    let cfg = config::load(args.config.as_deref())?.sync;
+pub async fn run_sync(args: SyncArgs, config_path: Option<PathBuf>) -> Result<()> {
+    let cfg = config::load(config_path.as_deref())?;
     let resolved = Resolved::merge(&args, cfg).await?;
 
     let client = Client::builder()

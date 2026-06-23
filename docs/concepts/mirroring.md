@@ -31,9 +31,10 @@ served from local storage — **whether upstream is up or down**.
   about a minute; cached artifacts are immutable and kept forever.
 - If upstream is unreachable, a still-valid cached listing is reused and
   already-cached packages keep installing.
-- `--proxy-*` filters gate what the proxy serves and caches — same flags as
-  `sync` under a `--proxy-` prefix (`--proxy-only-wheels`, `--proxy-exclude-newer`,
-  the tag filters). See [Configuration](../reference/configuration.md#sync-filters-and-config-file).
+- `--filter-*` filters gate what the proxy serves and caches — the *same* flags,
+  env vars, and `[filter]` table that `sync` uses (`--filter-only-wheels`,
+  `--filter-exclude-newer`, the tag filters). Set the slice once; it applies to
+  whichever you run. See [Configuration](../reference/configuration.md#filters).
 
 !!! note
     A name reserved by `--private-prefix`, or already claimed `private` by an
@@ -57,13 +58,16 @@ pypiron sync \
 ```
 
 Put the allowlist and filters in `pypiron.toml` instead (auto-discovered in the
-working directory):
+working directory). The package set and destination are sync-specific (`[sync]`);
+the filter is shared with the proxy (`[filter]`):
 
 ```toml
 [sync]
 to = "http://HOST:8080"
 username = "admin"                       # password via PYPIRON_SYNC_PASSWORD
 packages = ["requests>=2.20,<3", "numpy", "pandas"]
+
+[filter]
 only-wheels = true
 exclude-newer = "2026-01-01T00:00:00Z"
 ```
@@ -123,7 +127,7 @@ pypiron sync --full   # ignore the cursor; re-fetch and fully reconcile everythi
 | ------------------- | ------------------------------------ | ------------------------------------- |
 | When files arrive   | Lazily, on first request             | Ahead of time, when you run `sync`    |
 | Who initiates       | The serving node, per cache miss     | A separate client (any host with egress) |
-| Package set         | Anything not blocked by `--proxy-*` filters | An explicit allowlist             |
+| Package set         | Anything not blocked by the `[filter]` slice | An explicit allowlist            |
 | Egress from server  | Required (until cached)              | None — the syncing host needs it      |
 | Offline serving     | Cached files only                    | Everything you synced                 |
 | Reconcile yanks/removals | Listings refresh every 60s      | On re-sync (`--full` for a sweep)     |
@@ -137,7 +141,7 @@ the proxy for convenience and `sync` to guarantee a known set is present.
   node has no egress.
 - [Private + public](../guides/private-and-public.md) — one index for uploads,
   synced, and proxied packages.
-- [Supply-chain defense](supply-chain.md) — `--exclude-newer` for a reproducible,
-  historically-correct cutoff on both paths.
-- [Configuration](../reference/configuration.md#sync-filters-and-config-file) —
-  every sync and `--proxy-*` filter, plus the `pypiron.toml` reference.
+- [Supply-chain defense](supply-chain.md) — `--filter-exclude-newer` for a
+  reproducible, historically-correct cutoff on both paths.
+- [Configuration](../reference/configuration.md#filters) — the shared `--filter-*`
+  surface, plus the `pypiron.toml` reference.

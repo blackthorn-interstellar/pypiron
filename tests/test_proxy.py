@@ -38,7 +38,7 @@ def test_proxy_serves_and_caches_upstream_package(proxy_pair, tmp_path):
     data = get_index_json(proxy["simple"], "proxydemo")
     entry = next(f for f in data["files"] if f["filename"] == wheel.name)
     assert entry["hashes"]["sha256"] == sha256_file(wheel)
-    # PEP 700 upload-time rides through — --exclude-newer keeps working.
+    # PEP 700 upload-time rides through — --filter-exclude-newer keeps working.
     assert entry.get("upload-time")
 
     # First artifact GET downloads, verifies, commits, serves.

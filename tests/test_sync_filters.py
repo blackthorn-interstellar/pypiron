@@ -49,7 +49,7 @@ def _packages_list(tmp_path, spec: str):
 def test_version_specifiers_limit_releases(disk_server, pypiron_bin, tmp_path):
     pkg_list = _packages_list(tmp_path, f"{PACKAGE}>=1.15,<1.17")
     rc, out, err = sync_to(
-        pypiron_bin, disk_server, "--packages-list", str(pkg_list), "--only-wheels"
+        pypiron_bin, disk_server, "--packages-list", str(pkg_list), "--filter-only-wheels"
     )
     assert rc == 0, f"sync failed:\n{out}\n{err}"
 
@@ -70,7 +70,7 @@ def test_pkg_flag_is_repeatable_with_no_list_file(disk_server, pypiron_bin):
         f"{PACKAGE}==1.16.0",
         "--pkg",
         "iniconfig==2.0.0",
-        "--only-wheels",
+        "--filter-only-wheels",
     )
     assert rc == 0, f"sync failed:\n{out}\n{err}"
     assert _wheels(disk_server) == ["six-1.16.0-py2.py3-none-any.whl"]
@@ -87,8 +87,8 @@ def test_exclude_newer_bounds_mirroring(disk_server, pypiron_bin, tmp_path):
         disk_server,
         "--packages-list",
         str(pkg_list),
-        "--only-wheels",
-        "--exclude-newer",
+        "--filter-only-wheels",
+        "--filter-exclude-newer",
         cutoff,
     )
     assert rc == 0, f"sync failed:\n{out}\n{err}"
@@ -105,7 +105,7 @@ def test_exclude_newer_bounds_mirroring(disk_server, pypiron_bin, tmp_path):
 
 def test_duration_cutoff_is_accepted(disk_server, pypiron_bin, tmp_path):
     """A cutoff may be a relative duration (uv-style), not just an RFC 3339
-    timestamp: `--exclude-older "1 day"` resolves to ~yesterday, so six's
+    timestamp: `--filter-exclude-older "1 day"` resolves to ~yesterday, so six's
     long-old wheels are all filtered out and nothing is mirrored."""
     pkg_list = _packages_list(tmp_path, PACKAGE)
     rc, out, err = sync_to(
@@ -113,8 +113,8 @@ def test_duration_cutoff_is_accepted(disk_server, pypiron_bin, tmp_path):
         disk_server,
         "--packages-list",
         str(pkg_list),
-        "--only-wheels",
-        "--exclude-older",
+        "--filter-only-wheels",
+        "--filter-exclude-older",
         "1 day",
     )
     assert rc == 0, f"a duration cutoff must be accepted:\n{out}\n{err}"
@@ -125,7 +125,12 @@ def test_filters_never_remove_mirrored_files(disk_server, pypiron_bin, tmp_path)
     def sync(spec, *extra):
         pkg_list = _packages_list(tmp_path, spec)
         rc, out, err = sync_to(
-            pypiron_bin, disk_server, "--packages-list", str(pkg_list), "--only-wheels", *extra
+            pypiron_bin,
+            disk_server,
+            "--packages-list",
+            str(pkg_list),
+            "--filter-only-wheels",
+            *extra,
         )
         assert rc == 0, f"sync failed:\n{out}\n{err}"
 
@@ -139,7 +144,7 @@ def test_filters_never_remove_mirrored_files(disk_server, pypiron_bin, tmp_path)
     ], "a narrower later run must only add, never remove"
 
     # A filter matching nothing changes nothing.
-    sync(PACKAGE, "--exclude-newer", "2001-01-01T00:00:00Z")
+    sync(PACKAGE, "--filter-exclude-newer", "2001-01-01T00:00:00Z")
     assert len(_wheels(disk_server)) == 2
 
 
@@ -149,6 +154,8 @@ def test_toml_config_with_cli_precedence(disk_server, pypiron_bin, tmp_path, tmp
         f"""
 [sync]
 packages = ["{PACKAGE}==1.16.0"]
+
+[filter]
 only-wheels = true
 exclude-newer = "2030-01-01T00:00:00Z"
 """
@@ -167,7 +174,7 @@ exclude-newer = "2030-01-01T00:00:00Z"
             dest2,
             "--config",
             str(config),
-            "--exclude-newer",
+            "--filter-exclude-newer",
             "2001-01-01T00:00:00Z",
         )
         assert rc == 0, f"sync failed:\n{out}\n{err}"
@@ -182,14 +189,14 @@ exclude-newer = "2030-01-01T00:00:00Z"
 
 
 def test_exclude_only_platform_tag_keeps_sdists(disk_server, pypiron_bin, tmp_path):
-    """--exclude-platform-tag must not silently drop sdists (they have no tag)."""
+    """--filter-exclude-platform-tag must not silently drop sdists (they have no tag)."""
     pkg_list = _packages_list(tmp_path, f"{PACKAGE}==1.16.0")
     rc, out, err = sync_to(
         pypiron_bin,
         disk_server,
         "--packages-list",
         str(pkg_list),
-        "--exclude-platform-tag",
+        "--filter-exclude-platform-tag",
         "win*",
     )
     assert rc == 0, f"sync failed:\n{out}\n{err}"
@@ -207,8 +214,8 @@ def test_only_wheels_and_only_sdists_conflict(disk_server, pypiron_bin, tmp_path
         disk_server,
         "--packages-list",
         str(pkg_list),
-        "--only-wheels",
-        "--only-sdists",
+        "--filter-only-wheels",
+        "--filter-only-sdists",
         timeout=60,
     )
     assert rc != 0, "contradictory filters must fail, not silently mirror nothing"
@@ -243,7 +250,7 @@ def test_cli_packages_list_overrides_config_packages(disk_server, pypiron_bin, t
         str(config),
         "--packages-list",
         str(pkg_list),
-        "--only-wheels",
+        "--filter-only-wheels",
     )
     assert rc == 0, f"sync failed:\n{out}\n{err}"
     assert _wheels(disk_server) == ["six-1.16.0-py2.py3-none-any.whl"]
@@ -253,7 +260,9 @@ def test_cli_packages_list_overrides_config_packages(disk_server, pypiron_bin, t
 def test_config_packages_list_resolves_relative_to_config(disk_server, pypiron_bin, tmp_path):
     cfgdir = tmp_path / "cfgdir"
     cfgdir.mkdir()
-    (cfgdir / "pypiron.toml").write_text('[sync]\npackages-list = "pkgs.txt"\nonly-wheels = true\n')
+    (cfgdir / "pypiron.toml").write_text(
+        '[sync]\npackages-list = "pkgs.txt"\n\n[filter]\nonly-wheels = true\n'
+    )
     (cfgdir / "pkgs.txt").write_text(f"{PACKAGE}==1.16.0\n")
 
     # Run from a different cwd (tmp_path) — the relative path must resolve

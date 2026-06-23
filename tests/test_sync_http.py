@@ -62,7 +62,7 @@ def _sync_to(server, pypiron_bin, pkg_list, *extra, user=None, password=None):
             user,
             "--password",
             password,
-            "--only-wheels",
+            "--filter-only-wheels",
             *extra,
         ],
         timeout=600,
@@ -117,7 +117,7 @@ def test_http_mirror_preserves_historical_timestamps(
     # EXACT maximal version that existed pre-cutoff, not merely *some* older one.
     expected = _expected_version_at(CUTOFF)
     assert installed == expected, (
-        f"--exclude-newer {CUTOFF} must resolve {expected} (PyPI history), got {installed}"
+        f"uv --exclude-newer {CUTOFF} must resolve {expected} (PyPI history), got {installed}"
     )
     sidecar_installed = json.loads(
         next(pkg_dir.glob(f"six-{installed}-*.whl.meta.json")).read_text()

@@ -24,6 +24,9 @@ cloud backends (`s3`, `gcs`, `azure`) share a single implementation over the
 | `--s3-endpoint-url`     | `PYPIRON_S3_ENDPOINT_URL`     | *(none)*            | S3-compatible endpoint (e.g., MinIO) |
 | `--s3-force-path-style` | `PYPIRON_S3_FORCE_PATH_STYLE` | `false`             | Force path-style addressing          |
 
+Region uses the standard `AWS_REGION` (the AWS SDK reads it too); there is
+intentionally no `PYPIRON_S3_REGION`/`PYPIRON_AWS_REGION`.
+
 **AWS credentials** follow the standard AWS chain: `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, web identity, or instance metadata.
 An `http://` endpoint (a local MinIO) is allowed automatically.
@@ -90,6 +93,11 @@ artifact downloads stream.
 | `--counters-flush-interval-secs`  | `PYPIRON_COUNTERS_FLUSH_INTERVAL_SECS`  | `300` | How often each node flushes counts (the dominant cost knob) |
 | `--counters-rollup-interval-secs` | `PYPIRON_COUNTERS_ROLLUP_INTERVAL_SECS` | `3600` | Leader compaction cadence (freeze finished days, prune) |
 | `--counters-retention-days`  | `PYPIRON_COUNTERS_RETENTION_DAYS`  | `90`           | Days of per-day counter history to keep           |
+
+The two default-on toggles — `--audit-on-boot` and `--download-stats` — are
+disabled with an explicit value, `--audit-on-boot false` /
+`--download-stats false` (or `PYPIRON_AUDIT_ON_BOOT=false` /
+`PYPIRON_DOWNLOAD_STATS=false`), not a `--no-` form.
 
 **Download counters.** With `--download-stats` (on by default), each node counts
 artifact downloads per `(package, filename)` in memory and flushes immutable

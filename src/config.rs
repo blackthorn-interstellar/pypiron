@@ -140,9 +140,6 @@ pub fn load(explicit: Option<&Path>) -> Result<ConfigFile> {
             default.to_path_buf()
         }
     };
-    // Always announce a loaded config — silent auto-discovery of ./pypiron.toml
-    // is how an unrelated CLI invocation gets quietly rewired.
-    info!("loaded configuration from {}", path.display());
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
 
@@ -161,6 +158,11 @@ pub fn load(explicit: Option<&Path>) -> Result<ConfigFile> {
             cfg.sync.packages_list = Some(dir.join(rel));
         }
     }
+    // Announce only after a clean parse — silent auto-discovery of
+    // ./pypiron.toml is how an unrelated CLI invocation gets quietly rewired,
+    // but a malformed file shouldn't claim it "loaded". The read/parse errors
+    // above carry the path via `with_context`, so failures still name the file.
+    info!("loaded configuration from {}", path.display());
     Ok(cfg)
 }
 

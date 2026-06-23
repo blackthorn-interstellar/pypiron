@@ -101,15 +101,23 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run the PypIron server (the default day-to-day command)
+    /// Run the PypIron server (the primary, day-to-day command)
     Serve(Box<ServeArgs>),
     /// Mirror packages from PyPI (or another source) into a PypIron instance
     Sync(Box<sync::SyncArgs>),
     /// Recompute every index from truth and diff against what storage serves
     /// (read-only); exits nonzero on any divergence
+    ///
+    /// Whole-corpus scan: cost scales with corpus, not churn. S3 rule of thumb:
+    /// ~$0.5 and ~20 min per million files (single node, default concurrency;
+    /// read-only). The daily `serve` audit stays seconds/pennies via fingerprints.
     VerifyIndex(Box<verify::VerifyArgs>),
     /// Rebuild every materialized view from truth, unconditionally. Run after
     /// restoring a backup or editing storage out-of-band.
+    ///
+    /// Whole-corpus scan and rewrite: cost scales with corpus, not churn. S3
+    /// rule of thumb: ~$1-1.5 and ~20-30 min per million files (single node,
+    /// default concurrency). To only check for drift, use read-only `verify-index`.
     RebuildIndex(Box<RebuildIndexArgs>),
 }
 
@@ -228,6 +236,8 @@ struct ServeArgs {
 
     /// Run an audit sweep as soon as this node becomes leader (heals a
     /// restored backup or a crashed predecessor without waiting an interval).
+    /// On by default; disable with `--audit-on-boot false` (or
+    /// `PYPIRON_AUDIT_ON_BOOT=false`).
     #[arg(long, env = "PYPIRON_AUDIT_ON_BOOT", default_value_t = true, action = clap::ArgAction::Set)]
     audit_on_boot: bool,
 
@@ -245,7 +255,8 @@ struct ServeArgs {
     /// Count per-package/version downloads per day into the S3-backed counter
     /// store (`_counters/`). A best-effort derived analytic — lossy by design,
     /// never truth. Adds a periodic small PUT per node (see
-    /// docs/reference/configuration.md).
+    /// docs/reference/configuration.md). On by default; disable with
+    /// `--download-stats false` (or `PYPIRON_DOWNLOAD_STATS=false`).
     #[arg(long, env = "PYPIRON_DOWNLOAD_STATS", default_value_t = true, action = clap::ArgAction::Set)]
     download_stats: bool,
 

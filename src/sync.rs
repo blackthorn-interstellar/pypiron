@@ -59,9 +59,12 @@ pub struct SyncArgs {
     pub packages_list: Option<PathBuf>,
 
     /// A single package to mirror, same line syntax as a packages-list entry
-    /// (name with optional PEP 440 specifiers); repeatable. When any CLI
-    /// package is given (`--pkg` and/or `--packages-list`), the CLI set fully
-    /// replaces the config file's `[sync].packages`/`packages-list`.
+    /// (name with optional PEP 440 specifiers, e.g. `requests>=2.20,<3`);
+    /// repeatable. Commas belong to the specifier — pass multiple packages as
+    /// repeated `--pkg`, not a comma-joined list (unlike the comma-splitting
+    /// `--filter-*-tag` flags). When any CLI package is given (`--pkg` and/or
+    /// `--packages-list`), the CLI set fully replaces the config file's
+    /// `[sync].packages`/`packages-list`.
     #[arg(long = "pkg", value_name = "SPEC")]
     pub pkg: Vec<String>,
 
@@ -352,6 +355,23 @@ impl Resolved {
                 lines.extend(text.lines().map(str::to_string));
             }
             lines.extend(args.pkg.iter().cloned());
+            // The CLI set replaces the file's entirely (documented on `--pkg`).
+            // Announce the override so a quick `--pkg foo` doesn't silently drop
+            // a populated `[sync]` package source. Built from data already in
+            // hand — count the inline array, name the list path without reading it.
+            let mut ignored = Vec::new();
+            if let Some(n) = sync.packages.as_ref().map(Vec::len).filter(|n| *n > 0) {
+                ignored.push(format!("{n} inline package(s)"));
+            }
+            if let Some(path) = &sync.packages_list {
+                ignored.push(format!("packages-list {}", path.display()));
+            }
+            if !ignored.is_empty() {
+                info!(
+                    "CLI --pkg/--packages-list overrides the pypiron.toml [sync] package set (ignoring {})",
+                    ignored.join(" + ")
+                );
+            }
         } else {
             if let Some(path) = &sync.packages_list {
                 let text = fs::read_to_string(path)

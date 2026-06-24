@@ -1,15 +1,21 @@
 //! `pypiron verify-index`: the read-only oracle. Recompute every materialized view
 //! from truth (artifacts + sidecars) and diff against what storage actually
 //! serves. Divergence means a healing bug, an interrupted write, or
-//! out-of-band storage surgery — exit nonzero so CI and chaos tests can
-//! assert convergence.
+//! out-of-band storage surgery.
+//!
+//! Exit codes follow the grep/diff idiom so CI and chaos tests can branch on
+//! the three outcomes: **0** converged, **1** diverged (the summary lists what,
+//! on stdout — an expected result, not a tool error), **2** the check could not
+//! run (storage unreachable, bad config, I/O failure). The diverged path is
+//! deliberately kept off the error channel so a found-difference never looks
+//! like the tool itself crashed.
 //!
 //! Strictly read-only: where the worker would backfill a missing sidecar,
 //! verify reports it instead.
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::Args as ClapArgs;
 
 use crate::names::normalize_pkg_name;
@@ -37,7 +43,10 @@ struct Divergence {
     detail: String,
 }
 
-pub async fn run_verify(args: VerifyArgs) -> Result<()> {
+/// Run the read-only diff. `Ok(true)` = converged, `Ok(false)` = diverged
+/// (rows + summary already printed to stdout), `Err` = the check could not run.
+/// The caller maps these to exit codes 0 / 1 / 2.
+pub async fn run_verify(args: VerifyArgs) -> Result<bool> {
     let storage = args.storage.build().await?;
 
     let pending = storage.list_dir_entries(DIRTY_PREFIX).await?;
@@ -91,10 +100,10 @@ pub async fn run_verify(args: VerifyArgs) -> Result<()> {
         truth.values().map(Vec::len).sum::<usize>(),
         divergences.len()
     );
-    if !divergences.is_empty() {
-        bail!("{} divergence(s) found", divergences.len());
-    }
-    Ok(())
+    // Diverged is an expected, scriptable outcome — return it as data (the rows
+    // and summary are already on stdout) rather than routing it through the
+    // error channel, which is reserved for "could not run".
+    Ok(divergences.is_empty())
 }
 
 /// Flat-list `prefix` across shards and group objects by first path segment

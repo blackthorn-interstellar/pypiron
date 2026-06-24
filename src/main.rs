@@ -456,7 +456,16 @@ async fn main() -> Result<()> {
     let config_path = cli.config.clone();
     match cli.command {
         Some(Commands::Sync(args)) => sync::run_sync(*args, config_path).await,
-        Some(Commands::VerifyIndex(args)) => verify::run_verify(*args).await,
+        Some(Commands::VerifyIndex(args)) => match verify::run_verify(*args).await {
+            // grep/diff exit-code idiom: 0 converged, 1 diverged, 2 could-not-run.
+            // Keep diverged off the error channel so CI can branch the three.
+            Ok(true) => Ok(()),
+            Ok(false) => std::process::exit(1),
+            Err(e) => {
+                eprintln!("Error: {e:?}");
+                std::process::exit(2);
+            }
+        },
         Some(Commands::RebuildIndex(args)) => run_rebuild_index(*args).await,
         Some(Commands::Serve(args)) => {
             let serve_matches = matches

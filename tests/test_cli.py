@@ -55,3 +55,38 @@ def test_serve_help_lists_serve_flags(pypiron_bin: Path):
     out = cp.stdout + cp.stderr
     for flag in ("--bind-addr", "--storage", "--admin-user", "--proxy-upstream"):
         assert flag in out, f"`serve --help` missing {flag!r}:\n{out}"
+
+
+# `verify-index` exit codes follow the grep/diff idiom: 0 converged, 1 diverged,
+# 2 could-not-run. CI scripts branch on these, so they are a CLI contract.
+
+
+def test_verify_index_converged_exits_0(pypiron_bin: Path, tmp_path: Path):
+    """An empty (or already-consistent) store has nothing to diverge."""
+    cp = _run(pypiron_bin, "verify-index", "--storage", "disk", "--data-dir", str(tmp_path))
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+
+
+def test_verify_index_diverged_exits_1(pypiron_bin: Path, tmp_path: Path):
+    """A materialized view with no backing package is an orphan-view divergence.
+
+    Exit 1 (not the generic error exit 2), and the divergence is reported on
+    stdout — a found difference is data, not a tool crash.
+    """
+    orphan = tmp_path / "simple" / "orphanpkg" / "index.html"
+    orphan.parent.mkdir(parents=True)
+    orphan.write_text("<!DOCTYPE html><html><body></body></html>")
+
+    cp = _run(pypiron_bin, "verify-index", "--storage", "disk", "--data-dir", str(tmp_path))
+    assert cp.returncode == 1, f"expected diverged exit 1:\n{cp.stdout}{cp.stderr}"
+    assert "orphan-view" in cp.stdout, cp.stdout
+    # The expected outcome must not masquerade as a tool error on stderr.
+    assert "Error:" not in cp.stderr, cp.stderr
+
+
+def test_verify_index_could_not_run_exits_2(pypiron_bin: Path):
+    """An unworkable config (s3 with no bucket) is an operational failure, not a
+    divergence — exit 2 keeps it distinct from a real diff."""
+    cp = _run(pypiron_bin, "verify-index", "--storage", "s3")
+    assert cp.returncode == 2, f"expected could-not-run exit 2:\n{cp.stdout}{cp.stderr}"
+    assert "Error:" in cp.stderr, cp.stderr

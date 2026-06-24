@@ -82,8 +82,7 @@ reconcile yank state and project status. See
 
 Recompute every index from truth (artifacts plus sidecars) and diff against what
 storage actually serves. Strictly read-only: where the server would heal a
-missing or stale view, `verify-index` reports it instead. Exits nonzero on any
-divergence.
+missing or stale view, `verify-index` reports it instead.
 
 ```bash
 pypiron verify-index --storage disk --data-dir ./data
@@ -91,6 +90,14 @@ pypiron verify-index --storage disk --data-dir ./data
 
 Each divergence prints as `kind<TAB>package<TAB>detail`, followed by a summary
 line. Use it in CI or after out-of-band storage changes to assert convergence.
+Exit codes follow the grep/diff idiom so a pipeline can branch the three
+outcomes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Converged — views match truth. |
+| `1` | Diverged — at least one difference (listed on stdout). |
+| `2` | Could not run — storage unreachable, bad config, or I/O failure. |
 
 It scans the whole corpus, so cost scales with corpus size, not churn. **S3 rule
 of thumb: ~$0.5 and ~20 min per million files** (single node, default

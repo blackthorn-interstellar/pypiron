@@ -67,7 +67,7 @@ pypiron sync \
 | `--from` | Source index base. Default `https://pypi.org`. |
 | `--filter-package` | One package, with optional PEP 440 specifiers. Repeatable. Shared with `serve` (see [Configuration](configuration.md#filters)). |
 | `--filter-packages-list` | Text file of packages, one per line. |
-| `--config` | Path to a `pypiron.toml` (global; `serve` reads it too). Defaults to `./pypiron.toml` when present. |
+| `--config` | Path to a `pypiron.toml` (global; read by every subcommand — `verify-index`/`rebuild-index` use its `[serve]` storage selection). Defaults to `./pypiron.toml` when present. |
 | `--admin-user` / `--admin-pass` | Admin credential for the destination. |
 | `--full` | Ignore the conditional-fetch memo; re-fetch and reconcile everything. |
 | `--dry-run` | Print what would be copied, transfer nothing. |
@@ -80,11 +80,19 @@ reconcile yank state and project status. See
 
 ## verify-index
 
-Recompute every index from truth (artifacts plus sidecars) and diff against what
-storage actually serves. Strictly read-only: where the server would heal a
-missing or stale view, `verify-index` reports it instead.
+A **server maintenance command**: recompute every index from truth (artifacts
+plus sidecars) and diff against what storage actually serves. Strictly
+read-only: where the server would heal a missing or stale view, `verify-index`
+reports it instead.
+
+Run it on a server node against the **same storage backend `serve` uses**. Pass
+the same `--config pypiron.toml` (or the same `--storage`/`PYPIRON_*` flags) so
+it points at your real backend — it reads the `[serve]` storage selection from
+the file. Run with no storage flags in a directory without a `pypiron.toml` and
+it checks the default `./data` disk store.
 
 ```bash
+pypiron verify-index --config pypiron.toml      # same backend as serve
 pypiron verify-index --storage disk --data-dir ./data
 ```
 
@@ -106,11 +114,17 @@ seconds and pennies at any scale because fingerprints skip unchanged packages.
 
 ## rebuild-index
 
-Rebuild every materialized view from truth, unconditionally. Run it after
-restoring a backup or editing storage out of band — `serve` heals on its own
-schedule, but `rebuild-index` forces the full sweep now.
+A **server maintenance command**: rebuild every materialized view from truth,
+unconditionally. Run it after restoring a backup or editing storage out of
+band — `serve` heals on its own schedule, but `rebuild-index` forces the full
+sweep now.
+
+Like `verify-index`, run it on a server node against the **same storage backend
+`serve` uses** — pass the same `--config pypiron.toml` (it reads the `[serve]`
+storage selection) or the same `--storage`/`PYPIRON_*` flags.
 
 ```bash
+pypiron rebuild-index --config pypiron.toml      # same backend as serve
 pypiron rebuild-index --storage disk --data-dir ./data
 ```
 

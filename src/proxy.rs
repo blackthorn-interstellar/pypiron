@@ -104,6 +104,37 @@ pub struct Proxy {
     scope: Option<HashMap<String, Vec<Option<VersionSpecifiers>>>>,
     client: Client,
     listings: Mutex<HashMap<String, CacheEntry>>,
+    /// Single-flight guard: at most one in-flight download per artifact key.
+    /// Without it, N concurrent GETs for the same uncached wheel each stream a
+    /// full copy into N separate spool files — an anonymous client could
+    /// amplify one request for a large wheel into N full-size downloads
+    /// (disk-fill + upstream bandwidth). The map self-prunes (see
+    /// [`DownloadSlot`]), so it stays bounded by live concurrency, not by the
+    /// number of distinct artifacts ever proxied.
+    inflight: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+/// Held for the whole download-verify-commit of one artifact key. Dropping it
+/// removes the map entry once no other task is waiting on that key, keeping
+/// [`Proxy::inflight`] bounded.
+struct DownloadSlot {
+    inflight: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    key: String,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl Drop for DownloadSlot {
+    fn drop(&mut self) {
+        let mut map = self.inflight.lock().expect("inflight mutex poisoned");
+        if let Some(lock) = map.get(&self.key) {
+            // We still hold `_guard` (one strong ref) and the map holds one.
+            // Any count beyond that is a task already waiting on this key, so
+            // only collapse the entry when we are its last user.
+            if Arc::strong_count(lock) <= 2 {
+                map.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// May this package be served from upstream at all? Private names, the reserved
@@ -182,7 +213,26 @@ impl Proxy {
                 .read_timeout(Duration::from_secs(30))
                 .build()?,
             listings: Mutex::new(HashMap::new()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Acquire the single-flight slot for an artifact key, waiting if another
+    /// task is already downloading it. Held until the returned guard drops.
+    async fn acquire_download_slot(&self, key: &str) -> DownloadSlot {
+        let lock = self
+            .inflight
+            .lock()
+            .expect("inflight mutex poisoned")
+            .entry(key.to_string())
+            .or_default()
+            .clone();
+        let guard = lock.lock_owned().await;
+        DownloadSlot {
+            inflight: self.inflight.clone(),
+            key: key.to_string(),
+            _guard: guard,
+        }
     }
 
     /// Is this (PEP 503-normalized) name allowed to fall through to upstream?
@@ -237,6 +287,14 @@ impl Proxy {
         filename: &str,
     ) -> Result<()> {
         let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+        if state.storage.head_exists(&key).await? {
+            return Ok(());
+        }
+        // Serialize concurrent fetches of the *same* artifact (distinct files
+        // still download in parallel). The slot is held until this function
+        // returns; a racer that loses the race re-checks below and finds the
+        // file already cached instead of downloading its own copy.
+        let _slot = self.acquire_download_slot(&key).await;
         if state.storage.head_exists(&key).await? {
             return Ok(());
         }
@@ -543,7 +601,7 @@ impl Proxy {
         let url = self.resolve_url(pkg, &file.url)?;
         let mut last_err = None;
         for attempt in 1..=DOWNLOAD_ATTEMPTS {
-            match self.download_once(state, &url).await {
+            match self.download_once(state, &url, file).await {
                 Ok(spool) if spool.sha256.eq_ignore_ascii_case(expected) => return Ok(spool),
                 Ok(spool) => {
                     last_err = Some(anyhow!(
@@ -562,7 +620,12 @@ impl Proxy {
         Err(last_err.expect("at least one attempt"))
     }
 
-    async fn download_once(&self, state: &AppState, url: &reqwest::Url) -> Result<FinishedSpool> {
+    async fn download_once(
+        &self,
+        state: &AppState,
+        url: &reqwest::Url,
+        file: &SimpleFile,
+    ) -> Result<FinishedSpool> {
         let resp = self
             .client
             .get(url.clone())
@@ -573,6 +636,19 @@ impl Proxy {
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             spool.write_chunk(&chunk?).await?;
+            // Mirror sync::download_once: abort a body that overruns its
+            // upstream-declared size before it can fill the disk (the read
+            // timeout bounds time, not size, and an overrun fails the sha
+            // check anyway). No declared size → no cap, same as sync.
+            if let Some(max) = file.size {
+                if spool.size() > max {
+                    bail!(
+                        "{} overran its declared size ({} > {max} bytes)",
+                        file.filename,
+                        spool.size()
+                    );
+                }
+            }
         }
         spool.finish().await
     }

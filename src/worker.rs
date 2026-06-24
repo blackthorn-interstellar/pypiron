@@ -235,18 +235,32 @@ pub async fn run_worker_until(
                     duration_out.store(started.elapsed().as_secs(), Ordering::Relaxed);
                 });
             }
-            if let Err(e) = tick(&state).await {
-                error!(error=?e, "worker tick failed");
-            }
-            // Counter compaction (LEADER only): freeze finished days into one
-            // file per shard, write summaries, prune past retention. Cheap most
-            // ticks (a list with nothing closeable); gated to the rollup cadence.
-            // Inline is fine at the hourly default; spawn it like the audit if a
-            // very large corpus ever makes it head-of-line-block the tick.
-            if last_counter_compact.is_none_or(|t| t.elapsed() >= state.counters.rollup_interval())
-            {
-                last_counter_compact = Some(Instant::now());
-                state.counters.compact().await;
+            // tick + compact can run many seconds on S3 with a backlog. Race
+            // them against the shutdown signal: a graceful SIGTERM must never be
+            // stuck behind a slow batch, or the worker is aborted before it
+            // releases the lease — and a skipped release is a lease-TTL write
+            // outage on the successor (the very thing release() exists to avoid).
+            // Abandoning a rebuild mid-flight is safe: rebuilds are idempotent
+            // and the next leader redoes the work.
+            let leader_work = async {
+                if let Err(e) = tick(&state).await {
+                    error!(error=?e, "worker tick failed");
+                }
+                // Counter compaction (LEADER only): freeze finished days into one
+                // file per shard, write summaries, prune past retention. Cheap most
+                // ticks (a list with nothing closeable); gated to the rollup cadence.
+                // Inline is fine at the hourly default; spawn it like the audit if a
+                // very large corpus ever makes it head-of-line-block the tick.
+                if last_counter_compact
+                    .is_none_or(|t| t.elapsed() >= state.counters.rollup_interval())
+                {
+                    last_counter_compact = Some(Instant::now());
+                    state.counters.compact().await;
+                }
+            };
+            tokio::select! {
+                _ = leader_work => {}
+                _ = shutdown.changed() => break,
             }
         }
         tokio::select! {
@@ -1453,6 +1467,7 @@ mod tests {
             download_board: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1552,6 +1567,7 @@ mod tests {
             download_board: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

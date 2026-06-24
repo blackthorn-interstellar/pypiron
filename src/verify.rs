@@ -33,7 +33,7 @@ const SIDECAR_READ_CONCURRENCY: usize = 64;
 #[derive(ClapArgs, Debug)]
 pub struct VerifyArgs {
     #[command(flatten)]
-    storage: StorageArgs,
+    pub storage: StorageArgs,
 }
 
 /// One observed divergence, printed as `kind\tpackage\tdetail`.

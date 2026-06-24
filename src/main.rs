@@ -81,8 +81,11 @@ struct Cli {
     command: Option<Commands>,
 
     /// Path to a pypiron.toml (defaults to ./pypiron.toml when present). Read by
-    /// both `serve` and `sync`; CLI/env values take precedence over the file.
-    /// `global` so it may sit before or after the subcommand.
+    /// every subcommand: `serve`/`sync` use the full file, and the maintenance
+    /// commands (`verify-index`/`rebuild-index`) read the `[serve]` storage
+    /// selection so they target the same backend the server does. CLI/env
+    /// values take precedence over the file. `global` so it may sit before or
+    /// after the subcommand.
     #[arg(long, env = "PYPIRON_CONFIG", global = true)]
     config: Option<std::path::PathBuf>,
 
@@ -105,16 +108,21 @@ enum Commands {
     Serve(Box<ServeArgs>),
     /// Mirror packages from PyPI (or another source) into a PypIron instance
     Sync(Box<sync::SyncArgs>),
-    /// Recompute every index from truth and diff against what storage serves
-    /// (read-only); exits nonzero on any divergence
+    /// Server maintenance: recompute every index from truth and diff against
+    /// what storage serves (read-only); exits nonzero on any divergence
     ///
+    /// Run on a server node against the same storage backend `serve` uses (it
+    /// reads the `[serve]` storage config from --config / pypiron.toml).
     /// Whole-corpus scan: cost scales with corpus, not churn. S3 rule of thumb:
     /// ~$0.5 and ~20 min per million files (single node, default concurrency;
     /// read-only). The daily `serve` audit stays seconds/pennies via fingerprints.
     VerifyIndex(Box<verify::VerifyArgs>),
-    /// Rebuild every materialized view from truth, unconditionally. Run after
-    /// restoring a backup or editing storage out-of-band.
+    /// Server maintenance: rebuild every materialized view from truth,
+    /// unconditionally. Run after restoring a backup or editing storage
+    /// out-of-band.
     ///
+    /// Run on a server node against the same storage backend `serve` uses (it
+    /// reads the `[serve]` storage config from --config / pypiron.toml).
     /// Whole-corpus scan and rewrite: cost scales with corpus, not churn. S3
     /// rule of thumb: ~$1-1.5 and ~20-30 min per million files (single node,
     /// default concurrency). To only check for drift, use read-only `verify-index`.
@@ -132,6 +140,28 @@ async fn run_rebuild_index(args: RebuildIndexArgs) -> Result<()> {
     let storage = args.storage.build().await?;
     let state = AppState::headless(storage);
     worker::audit(&state, true).await
+}
+
+/// Point a maintenance command (verify-index, rebuild-index) at the same
+/// storage the server uses, by folding the `[serve]` storage config from
+/// pypiron.toml under its CLI/env args. Without this, `--config` would be a
+/// silent no-op on these commands and a file-only operator would audit the
+/// default `./data` disk store instead of their real (e.g. S3) backend — a
+/// false "converged" for the exact backup-recovery case they exist for. Echoes
+/// the resolved backend so an operator can see what they're pointed at.
+fn apply_maintenance_config(
+    storage: &mut StorageArgs,
+    config_path: Option<&std::path::Path>,
+    matches: &clap::ArgMatches,
+    subcommand: &str,
+) -> Result<()> {
+    let file = config::load(config_path)?;
+    let m = matches
+        .subcommand_matches(subcommand)
+        .expect("dispatched subcommand always matches");
+    merge_storage_file(storage, &file.serve, m)?;
+    eprintln!("{subcommand}: storage backend {}", storage.describe());
+    Ok(())
 }
 
 /// How artifact bytes reach clients. The tension: redirects move the
@@ -158,6 +188,24 @@ enum ArtifactDelivery {
 /// assumed to as well) gets streamed bytes under the stable `/files/` URL.
 /// Grow this list by verified cache behavior, not by client popularity.
 const REDIRECT_SAFE_UA_PREFIXES: &[&str] = &["uv/"];
+
+/// Whole-request deadline for ordinary (small, fast) requests. Hyper 1.x has no
+/// default body-read timeout, so without this a trickled or stalled request
+/// (slowloris) pins a connection forever; this bounds it. Generous enough that
+/// a slow `uv` resolve or a large index render never trips it.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Deadline for the streaming routes — uploads and artifact downloads move
+/// bodies up to the 1 GiB limit, so a real large wheel over a slow link needs
+/// far longer than a read. Still finite: a trickled transfer can't hold a
+/// connection (and an upload's spool fd) indefinitely.
+const STREAMING_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// On a graceful shutdown of a cloud-backed (multi-node) deployment, fail
+/// `/health` for this long *before* the listener stops accepting, so a load
+/// balancer pulls the node from rotation instead of routing new requests into
+/// connection-refused. Skipped on disk (single-node) — see the shutdown path.
+const PRE_DRAIN_PAUSE: Duration = Duration::from_secs(3);
 
 /// Log output format.
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,6 +441,9 @@ struct AppState {
     proxy: Option<Arc<proxy::Proxy>>,
     /// Process start, for the homepage uptime readout.
     started: std::time::Instant,
+    /// Set on graceful shutdown so `/health` reports 503 *before* the listener
+    /// stops accepting, letting a load balancer drain the node cleanly.
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Adapts the pypiron [`Storage`] trait to the counter engine's minimal
@@ -458,17 +509,33 @@ async fn main() -> Result<()> {
     let config_path = cli.config.clone();
     match cli.command {
         Some(Commands::Sync(args)) => sync::run_sync(*args, config_path).await,
-        Some(Commands::VerifyIndex(args)) => match verify::run_verify(*args).await {
-            // grep/diff exit-code idiom: 0 converged, 1 diverged, 2 could-not-run.
-            // Keep diverged off the error channel so CI can branch the three.
-            Ok(true) => Ok(()),
-            Ok(false) => std::process::exit(1),
-            Err(e) => {
-                eprintln!("Error: {e:?}");
-                std::process::exit(2);
+        Some(Commands::VerifyIndex(mut args)) => {
+            apply_maintenance_config(
+                &mut args.storage,
+                config_path.as_deref(),
+                &matches,
+                "verify-index",
+            )?;
+            match verify::run_verify(*args).await {
+                // grep/diff exit-code idiom: 0 converged, 1 diverged, 2 could-not-run.
+                // Keep diverged off the error channel so CI can branch the three.
+                Ok(true) => Ok(()),
+                Ok(false) => std::process::exit(1),
+                Err(e) => {
+                    eprintln!("Error: {e:?}");
+                    std::process::exit(2);
+                }
             }
-        },
-        Some(Commands::RebuildIndex(args)) => run_rebuild_index(*args).await,
+        }
+        Some(Commands::RebuildIndex(mut args)) => {
+            apply_maintenance_config(
+                &mut args.storage,
+                config_path.as_deref(),
+                &matches,
+                "rebuild-index",
+            )?;
+            run_rebuild_index(*args).await
+        }
         Some(Commands::Serve(args)) => {
             let serve_matches = matches
                 .subcommand_matches("serve")
@@ -619,57 +686,59 @@ fn merge_serve_file(
         f.counters_retention_days
     );
 
-    // Storage backend selection (defaulted/bool knobs).
-    if !arg_from_cli_or_env(m, "storage") {
-        if let Some(v) = &f.storage {
-            cli.storage.storage = serve_value_enum("storage", v)?;
-        }
-    }
-    fill!(
-        cli.storage.s3_force_path_style,
-        "s3_force_path_style",
-        f.s3_force_path_style
-    );
-    fill!(
-        cli.storage.azure_use_emulator,
-        "azure_use_emulator",
-        f.azure_use_emulator
-    );
-
-    // Option knobs: CLI/env wins when present, else the file.
+    // Server-only Option knobs: CLI/env wins when present, else the file.
     cli.proxy_upstream = cli.proxy_upstream.take().or(f.proxy_upstream.clone());
     cli.spool_dir = cli.spool_dir.take().or(f.spool_dir.clone());
-    cli.storage.data_dir = cli.storage.data_dir.take().or(f.data_dir.clone());
-    cli.storage.s3_bucket = cli.storage.s3_bucket.take().or(f.s3_bucket.clone());
-    cli.storage.aws_region = cli.storage.aws_region.take().or(f.aws_region.clone());
-    cli.storage.s3_endpoint_url = cli
-        .storage
-        .s3_endpoint_url
-        .take()
-        .or(f.s3_endpoint_url.clone());
-    cli.storage.gcs_bucket = cli.storage.gcs_bucket.take().or(f.gcs_bucket.clone());
-    cli.storage.gcs_service_account_path = cli
-        .storage
+
+    // Storage selection is shared with the maintenance commands, so it lives in
+    // its own helper.
+    merge_storage_file(&mut cli.storage, f, m)
+}
+
+/// Fold the storage-selection knobs from `[serve]` into a [`StorageArgs`]. The
+/// `[serve]` table is the one place storage is configured; the server *and* the
+/// maintenance commands (verify-index, rebuild-index) read it from here, so a
+/// `pypiron.toml`-only operator points all of them at the same backend. CLI/env
+/// still wins over the file. Credentials/cloud keys never live in the file.
+fn merge_storage_file(
+    storage: &mut StorageArgs,
+    f: &config::ServeConfig,
+    m: &clap::ArgMatches,
+) -> Result<()> {
+    if !arg_from_cli_or_env(m, "storage") {
+        if let Some(v) = &f.storage {
+            storage.storage = serve_value_enum("storage", v)?;
+        }
+    }
+    if !arg_from_cli_or_env(m, "s3_force_path_style") {
+        if let Some(v) = f.s3_force_path_style {
+            storage.s3_force_path_style = v;
+        }
+    }
+    if !arg_from_cli_or_env(m, "azure_use_emulator") {
+        if let Some(v) = f.azure_use_emulator {
+            storage.azure_use_emulator = v;
+        }
+    }
+    storage.data_dir = storage.data_dir.take().or(f.data_dir.clone());
+    storage.s3_bucket = storage.s3_bucket.take().or(f.s3_bucket.clone());
+    storage.aws_region = storage.aws_region.take().or(f.aws_region.clone());
+    storage.s3_endpoint_url = storage.s3_endpoint_url.take().or(f.s3_endpoint_url.clone());
+    storage.gcs_bucket = storage.gcs_bucket.take().or(f.gcs_bucket.clone());
+    storage.gcs_service_account_path = storage
         .gcs_service_account_path
         .take()
         .or(f.gcs_service_account_path.clone());
-    cli.storage.gcs_endpoint_url = cli
-        .storage
+    storage.gcs_endpoint_url = storage
         .gcs_endpoint_url
         .take()
         .or(f.gcs_endpoint_url.clone());
-    cli.storage.azure_account = cli.storage.azure_account.take().or(f.azure_account.clone());
-    cli.storage.azure_container = cli
-        .storage
-        .azure_container
-        .take()
-        .or(f.azure_container.clone());
-    cli.storage.azure_endpoint_url = cli
-        .storage
+    storage.azure_account = storage.azure_account.take().or(f.azure_account.clone());
+    storage.azure_container = storage.azure_container.take().or(f.azure_container.clone());
+    storage.azure_endpoint_url = storage
         .azure_endpoint_url
         .take()
         .or(f.azure_endpoint_url.clone());
-
     Ok(())
 }
 
@@ -781,6 +850,7 @@ async fn run_serve(
         download_board: Arc::new(std::sync::Mutex::new(None)),
         proxy,
         started: std::time::Instant::now(),
+        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     // Genuine misconfiguration hazards warn in any log format. The benign
@@ -799,6 +869,23 @@ async fn run_serve(
     // Initialize empty index files if they don't exist
     initialize_indexes(&state).await?;
 
+    // The streaming routes — uploads and artifact downloads — move large
+    // bodies, so they get the longer deadline. Kept in their own router and
+    // merged in *after* the short timeout is applied below, so they never
+    // inherit it (axum's `.layer()` only wraps routes added before the call).
+    let streaming = Router::new()
+        // Legacy PyPI upload API (used by uv/twine).
+        .route("/legacy", post(legacy_upload))
+        .route("/legacy/", post(legacy_upload))
+        // Artifact bytes (streamed through this node in `stream` mode).
+        .route(
+            "/files/:package/:filename",
+            get(files_get).delete(files_delete),
+        )
+        .layer(tower_http::timeout::TimeoutLayer::new(
+            STREAMING_REQUEST_TIMEOUT,
+        ));
+
     // router
     let app = Router::new()
         // Human-facing pages. Root is the public front door (no secrets); its
@@ -812,19 +899,12 @@ async fn run_serve(
         .route("/project/:package/", get(project_page))
         .route("/project/:package/:version", get(project_version_page))
         .route("/project/:package/:version/", get(project_version_page))
-        // Legacy PyPI upload API (used by uv/twine)
-        .route("/legacy", post(legacy_upload))
-        .route("/legacy/", post(legacy_upload))
         .route("/simple", get(simple_root))
         .route("/simple/", get(simple_root))
         .route("/simple/index.json", get(simple_root_json))
         .route("/simple/:package", get(simple_pkg))
         .route("/simple/:package/", get(simple_pkg))
         .route("/simple/:package/index.json", get(simple_pkg_json))
-        .route(
-            "/files/:package/:filename",
-            get(files_get).delete(files_delete),
-        )
         .route(
             "/files/:package/:filename/yank",
             post(yank_set).delete(yank_clear),
@@ -856,6 +936,10 @@ async fn run_serve(
         .route("/metrics", get(serve_metrics))
         // Catch-all for debugging unmatched routes
         .fallback(fallback_handler)
+        // Short whole-request deadline on every route above (slowloris guard);
+        // the streaming routes are merged in next, so they keep their own.
+        .layer(tower_http::timeout::TimeoutLayer::new(REQUEST_TIMEOUT))
+        .merge(streaming)
         .with_state(state.clone())
         // Axum's default 2 MB body limit would reject any real wheel.
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
@@ -912,6 +996,17 @@ async fn run_serve(
         #[allow(clippy::exit)]
         std::process::exit(130);
     });
+
+    // Fail /health first, so a load balancer pulls this node out of rotation
+    // before we stop accepting — otherwise new requests race straight into
+    // connection-refused during the drain. Only cloud (multi-node, LB-fronted)
+    // deployments need the pause; disk is single-node, so Ctrl-C stays instant.
+    state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    if state.storage.supports_leases() {
+        tokio::time::sleep(PRE_DRAIN_PAUSE).await;
+    }
 
     let _ = graceful_tx.send(()); // begin draining in-flight requests
     let _ = shutdown_tx.send(true); // stop the worker
@@ -1457,8 +1552,21 @@ fn html_ok(body: String) -> Response<Body> {
 }
 
 /// Liveness + storage reachability. A storage error is the only failure mode:
-/// `Ok(false)` (probe object missing) still proves storage answers.
+/// `Ok(false)` (probe object missing) still proves storage answers. During a
+/// graceful shutdown this reports 503 first, so a load balancer drains the node
+/// before the listener stops accepting (see the shutdown path in `run_serve`).
 async fn health(State(state): State<Arc<AppState>>) -> Response<Body> {
+    if state
+        .shutting_down
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from(r#"{"status":"draining"}"#))
+            .unwrap_or_else(not_found);
+    }
     let probe = format!("{SIMPLE_PREFIX}index.json");
     let (status, body) = match state.storage.head_exists(&probe).await {
         Ok(_) => (StatusCode::OK, r#"{"status":"ok"}"#),
@@ -2910,6 +3018,7 @@ impl AppState {
             download_board: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

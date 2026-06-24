@@ -177,7 +177,7 @@ credential — nothing about the server's storage backend.
 | `--private-prefix`            | `PYPIRON_PRIVATE_PREFIX`         | *(none)*           | Refuse to mirror names inside this namespace (or top-level `private-prefix`) |
 | `--concurrency N`             | `PYPIRON_SYNC_CONCURRENCY`       | `4`                | Parallel downloads/uploads within one package           |
 | `--package-concurrency N`     | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8`              | Packages synced in parallel                             |
-| `--config PATH`               | `PYPIRON_CONFIG`                 | *(auto)*           | Path to a `pypiron.toml` (global; read by `serve` too; default `./pypiron.toml` if present) |
+| `--config PATH`               | `PYPIRON_CONFIG`                 | *(auto)*           | Path to a `pypiron.toml` (global; read by every subcommand — `verify-index`/`rebuild-index` use its `[serve]` storage selection; default `./pypiron.toml` if present) |
 | `--spool-dir PATH`            | `PYPIRON_SYNC_SPOOL_DIR`         | system temp        | Download spool dir — real disk, not tmpfs, for large wheels |
 | `--dry-run`                   | —                                | `false`            | Print what would be mirrored, write nothing             |
 
@@ -284,9 +284,12 @@ a file, the meter prints one fresh line every 30 s instead of repainting.
 
 ## The config file (`pypiron.toml`)
 
-Both `serve` and `sync` read `pypiron.toml` — pass `--config <path>` (global,
+Every subcommand reads `pypiron.toml` — pass `--config <path>` (global,
 `PYPIRON_CONFIG`) or let it be auto-discovered as `./pypiron.toml` in the working
-directory. Precedence is **CLI/env > file > defaults**. Four parts:
+directory. `serve` and `sync` use the whole file; the maintenance commands
+`verify-index`/`rebuild-index` read the `[serve]` storage selection so they
+target the same backend `serve` does. Precedence is **CLI/env > file >
+defaults**. Four parts:
 
 - top-level `private-prefix` — the reserved private namespace, shared by both
   commands.

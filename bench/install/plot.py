@@ -27,7 +27,7 @@ THEMES = {
     "light": {"bg": "white", "text": "#1f2328", "axis": "#8b949e", "grid": "#eaecef"},
     "dark": {"bg": "#1f1813", "text": "#ece5dd", "axis": "#a59a8f", "grid": "#352c24"},
 }
-XMAX = 2300.0  # axis ceiling (longest bar ~2,034/s; leaves room for its label)
+XMAX = 3200.0  # axis ceiling (longest bar ~2,845/s; leaves room for its label)
 ALIAS = {"bander": "bandersnatch"}  # cmp-bander-ceiling.json -> bandersnatch
 
 
@@ -107,7 +107,7 @@ def svg(data: list[tuple[str, float]], title: str, subtitle: str, theme: dict[st
         )
         s.append(
             f'<text x="{x(v) + 8:.1f}" y="{ty:.1f}" font-size="12" font-weight="{weight}" '
-            f'fill="{TEXT}">{v:,.0f}/s</text>'
+            f'fill="{TEXT}">{int(v + 0.5):,}/s</text>'
         )
     s.append("</svg>")
     return "\n".join(s)
@@ -132,7 +132,7 @@ def main() -> None:
     out.write_text(svg(data, args.title, args.subtitle, THEMES[args.theme]))
     print(f"wrote {out}")
     for name, v in data:
-        print(f"  {name:<14} {v:,.0f}/s")
+        print(f"  {name:<14} {int(v + 0.5):,}/s")
 
 
 if __name__ == "__main__":

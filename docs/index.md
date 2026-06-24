@@ -11,7 +11,7 @@ Truth is files on disk or object storage; indexes are regenerable views.
 
 ## Highlights
 
-- **Handles 4–60× more load** than other PyPI servers.
+- **Handles 5–85× more load** than other PyPI servers.
 - **Supply-chain quarantine.** Hide releases younger than a window with
   `--filter-exclude-newer`; `uv --exclude-newer` resolves against it.
 - **Works with the whole ecosystem.** uv, pip, poetry, twine, pipenv, hatch.

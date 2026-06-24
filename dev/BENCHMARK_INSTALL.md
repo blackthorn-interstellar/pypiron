@@ -577,5 +577,50 @@ spare. pypiron's presigned-redirect offload removes that ceiling entirely: its N
 carries only index + 302s, so it scales to its CPU. A bigger-NIC box lifts
 bandersnatch's number, but the byte-egress tax is structural; pypiron never pays it.
 
+## 17. Post-mimalloc ceiling — mimalloc + an 8-loadgen fleet (2026-06-24)
+
+Two things changed since §15: (1) **mimalloc** as the global allocator (commit
+`98db902`) cut per-request CPU on this allocation-heavy index+302 path; (2) §15's
+4× c7i.8xlarge fleet only drove pypiron to 168% CPU — a lower bound, not a true
+wall — so the fleet was **doubled to 8× c7i.8xlarge**. Re-running the working-tree
+build on the same `r7i.large` (Track 2, S3 + presigned redirect, host-net):
+
+| agg concurrency | req/s | installs/s | node CPU (of 200%) | note |
+|---|---|---|---|---|
+| 16,384 | 24,671 | 1,883 | 170% | climbing |
+| 32,768 | 32,305 | 2,466 | 164% | |
+| 65,536 | 37,271 | **2,845** | 163% | peak sustained |
+| 98,304 | 25,766 | 1,967 | 179% | collapse (over-concurrency) |
+
+**pypiron's sustained ceiling on 2 vCPU is 2,845 installs/s (~37,300 req/s of index +
+302), server-bound** — the 8-loadgen fleet still had headroom, so the box (not the
+rig) is the limit; pushing past ~65k concurrent connections collapses into deep
+queueing, exactly as in §15. docker-stats CPU reads **163% at the 2,845 peak** and
+climbs to **179% only at the collapse step** — but that gauge doesn't charge host-net
+softirq (the kernel moving 37k rps of redirects) to the container, so true
+utilization runs higher than the cgroup figure. That's **~1,420 installs/s per
+vCPU**; extrapolating ~linearly (a projection, not a measurement), an 8-vCPU box ≈
+**11,000 installs/s**.
+
+**How much of this is mimalloc?** Isolate the allocator: same 4-loadgen fleet and
+ladder as §15, the §15 build vs the working tree. Throughput is loadgen-bound and
+matches within noise, so the signal is the CPU drop:
+
+| agg concurrency | installs/s | CPU §15 build | CPU mimalloc |
+|---|---|---|---|
+| 8,192 | ~960 | 178% | **150%** |
+| 16,384 | ~1,340 | 173% | **140%** |
+| 32,768 | ~1,810 | 166% | **160%** |
+
+Same work, **~15–18% less server CPU per request**. That freed headroom is why the
+4-loadgen fleet can no longer saturate the server (it now tops out ~160% CPU,
+rig-limited) and why doubling the fleet was needed to find the wall.
+
+So the §15 2,034 → 2,845 jump is **two compounding effects, not all mimalloc**: the
+allocator's ~15–18% CPU cut, *plus* the fact that §15's 2,034 was itself a 4-loadgen
+**lower bound** (168% CPU, never saturated). 2,845 is the first properly saturated
+2-vCPU ceiling. The gap over the field widens accordingly — vs pypiserver's 85 and
+pypicloud's 47, pypiron at its true ceiling is now **~33× and ~60×**.
+
 Final true-ceiling ranking (r7i.large, 2 vCPU, host-net, real S3-download install-mix):
-pypiron ~2,000 ≫ bandersnatch 574 ≫ pypiserver 85 > pypicloud 47 > devpi 35 > proxpi 32.
+pypiron 2,845 ≫ bandersnatch 574 ≫ pypiserver 85 > pypicloud 47 > devpi 35 > proxpi 32.

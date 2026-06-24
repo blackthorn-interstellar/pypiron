@@ -140,13 +140,14 @@ jobs:
           # binary archive pulled from that same wheel (see "Archive ..." below).
           - { kind: linux,     runner: ubuntu-22.04,   target: x86_64,  triple: x86_64-unknown-linux-gnu }
           - { kind: linux,     runner: ubuntu-22.04,   target: x86,     triple: i686-unknown-linux-gnu }
-          # --zig: these cross arches default to the manylinux2014 image, whose old
-          # GCC can't compile mimalloc v3's C. Build them with zig (the same toolchain
-          # the Docker image already cross-compiles all 8 arches with) instead.
+          # aarch64/armv7's manylinux2014 cross-GCC can't compile mimalloc's C, so build
+          # them with zig (the toolchain the Docker image cross-compiles all 8 with).
+          # s390x/ppc64le use an even older cross-GCC that --zig doesn't redirect, so
+          # mimalloc is gated off them (Cargo.toml) and they build as before.
           - { kind: linux,     runner: ubuntu-22.04,   target: aarch64, triple: aarch64-unknown-linux-gnu, zig: "--zig" }
           - { kind: linux,     runner: ubuntu-22.04,   target: armv7,   triple: armv7-unknown-linux-gnueabihf, zig: "--zig" }
-          - { kind: linux,     runner: ubuntu-22.04,   target: s390x,   triple: s390x-unknown-linux-gnu, zig: "--zig" }
-          - { kind: linux,     runner: ubuntu-22.04,   target: ppc64le, triple: powerpc64le-unknown-linux-gnu, zig: "--zig" }
+          - { kind: linux,     runner: ubuntu-22.04,   target: s390x,   triple: s390x-unknown-linux-gnu }
+          - { kind: linux,     runner: ubuntu-22.04,   target: ppc64le, triple: powerpc64le-unknown-linux-gnu }
           - { kind: linux,     runner: ubuntu-22.04,   target: riscv64, triple: riscv64gc-unknown-linux-gnu }
           - { kind: musllinux, runner: ubuntu-22.04,   target: x86_64,  triple: x86_64-unknown-linux-musl,  manylinux: musllinux_1_2 }
           - { kind: musllinux, runner: ubuntu-22.04,   target: x86,     triple: i686-unknown-linux-musl,    manylinux: musllinux_1_2 }

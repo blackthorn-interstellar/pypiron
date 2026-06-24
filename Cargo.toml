@@ -35,6 +35,12 @@ pep440_rs = "0.7.3"
 toml = "1.1.2"
 object_store = { version = "0.13.2", features = ["aws", "gcp", "azure"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
+
+# mimalloc on every arch except s390x/ppc64le: their manylinux2014 cross-GCC is too
+# old to accept the `-Wno-error=date-time` flag libmimalloc-sys passes, so the C
+# build fails there. Those two are niche (the system allocator is fine); the common
+# cloud arches (x86_64/aarch64) keep the win. main.rs gates the allocator to match.
+[target.'cfg(not(any(target_arch = "s390x", target_arch = "powerpc64")))'.dependencies]
 mimalloc = "0.1.52"
 
 # Policy as data: these apply to local `cargo clippy` and rust-analyzer, not just

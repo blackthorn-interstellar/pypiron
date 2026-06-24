@@ -1,9 +1,14 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    io::{IsTerminal, Write},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
-    extract::{Multipart, Path, Query, Request, State},
+    extract::{ConnectInfo, Multipart, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -14,7 +19,7 @@ use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
 use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 mod cache;
 mod config;
@@ -50,6 +55,13 @@ use sidecar::{
     metadata_key, provenance_key, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, PROVENANCE_SUFFIX,
 };
 use storage::{Storage, StorageArgs};
+
+/// The request path allocates many small, short-lived objects per request
+/// (header values, the index-cache key, axum/tower's per-request service
+/// clones). The platform allocator was ~17% of on-CPU time under index-read
+/// load; mimalloc's thread-local free lists cut that contention.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const PACKAGES_PREFIX: &str = "packages/";
 const SIMPLE_PREFIX: &str = "simple/";
@@ -267,6 +279,24 @@ enum LogFormat {
     Json,
 }
 
+/// How the per-request access log is rendered (only when `--access-log` is set).
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessLogFormat {
+    /// One structured `tracing` event per request on the `pypiron::access`
+    /// target — key=value in text mode, a JSON object under `--log-format json`.
+    Structured,
+    /// Combined Log Format, written straight to stdout for log tooling
+    /// (GoAccess/lnav/awstats). Bypasses the diagnostic log's timestamp+level
+    /// prefix, which those parsers can't read.
+    Clf,
+}
+
+/// CLF timestamp, e.g. `10/Oct/2000:13:55:36 +0000`. We always log in UTC, so
+/// the offset is fixed.
+const CLF_TIME: &[time::format_description::FormatItem<'_>] = time::macros::format_description!(
+    "[day]/[month repr:short]/[year]:[hour]:[minute]:[second] +0000"
+);
+
 fn redirect_safe_client(headers: &HeaderMap) -> bool {
     let ua = headers
         .get(header::USER_AGENT)
@@ -320,6 +350,26 @@ struct ServeArgs {
         default_value_t = ArtifactDelivery::Auto
     )]
     artifact_delivery: ArtifactDelivery,
+
+    /// Also log reads (index listings, downloads) — the full access log. By
+    /// default only mutations (uploads, deletes, yanks, status changes) are
+    /// logged, since reads can become the workload at high rps. Either way
+    /// `/health` and `/metrics` log only at debug. Each line carries method,
+    /// path, status, latency, size, client IP, project tag, and User-Agent on
+    /// the `pypiron::access` target (tunable via `RUST_LOG`).
+    #[arg(long, env = "PYPIRON_ACCESS_LOG")]
+    access_log: bool,
+
+    /// Access-log rendering when `--access-log` is on: `structured` (default;
+    /// key=value in text mode, JSON under `--log-format json`) or `clf` (Combined
+    /// Log Format on stdout, for GoAccess/lnav/awstats).
+    #[arg(
+        long,
+        env = "PYPIRON_ACCESS_LOG_FORMAT",
+        value_enum,
+        default_value_t = AccessLogFormat::Structured
+    )]
+    access_log_format: AccessLogFormat,
 
     /// Worker interval in seconds. The nudge path makes same-process writes
     /// visible at rebuild speed regardless; this is the marker-poll cadence
@@ -454,6 +504,10 @@ struct AppState {
     read_pass: Option<String>,
     private_prefix: Option<String>,
     artifact_delivery: ArtifactDelivery,
+    /// Widen the access log from mutations-only (the default) to every request.
+    /// See `log_requests`.
+    access_log: bool,
+    access_log_format: AccessLogFormat,
     // worker cfg
     worker_interval: Duration,
     reconcile_interval: Duration,
@@ -550,7 +604,12 @@ async fn main() -> Result<()> {
     let env_filter =
         std::env::var("RUST_LOG").unwrap_or_else(|_| "info,pypiron=info,object_store=warn".into());
     match cli.log_format {
-        LogFormat::Text => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
+        // ANSI only when stdout is a TTY, so color codes don't leak into files
+        // or `docker logs`.
+        LogFormat::Text => tracing_subscriber::fmt()
+            .with_ansi(std::io::stdout().is_terminal())
+            .with_env_filter(env_filter)
+            .init(),
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
             .with_env_filter(env_filter)
@@ -691,6 +750,12 @@ fn merge_serve_file(
     if !arg_from_cli_or_env(m, "artifact_delivery") {
         if let Some(v) = &f.artifact_delivery {
             cli.artifact_delivery = serve_value_enum("artifact-delivery", v)?;
+        }
+    }
+    fill!(cli.access_log, "access_log", f.access_log);
+    if !arg_from_cli_or_env(m, "access_log_format") {
+        if let Some(v) = &f.access_log_format {
+            cli.access_log_format = serve_value_enum("access-log-format", v)?;
         }
     }
     fill!(cli.wait_on_upload, "wait_on_upload", f.wait_on_upload);
@@ -874,6 +939,10 @@ async fn run_serve(
         );
     }
 
+    if cli.access_log {
+        info!("access log enabled — logging every request decreases throughput ~7-10%");
+    }
+
     let state = Arc::new(AppState {
         storage,
         uploader_user: cli.uploader_user,
@@ -884,6 +953,8 @@ async fn run_serve(
         read_pass: cli.read_pass,
         private_prefix,
         artifact_delivery: cli.artifact_delivery,
+        access_log: cli.access_log,
+        access_log_format: cli.access_log_format,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
         intent_grace: time::Duration::seconds(cli.intent_grace_secs as i64),
@@ -995,7 +1066,7 @@ async fn run_serve(
         .with_state(state.clone())
         // Axum's default 2 MB body limit would reject any real wheel.
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
-        .layer(middleware::from_fn(log_requests))
+        .layer(middleware::from_fn_with_state(state.clone(), log_requests))
         .layer(middleware::from_fn(add_www_authenticate))
         .layer(middleware::from_fn_with_state(state.clone(), track_metrics));
 
@@ -1025,11 +1096,14 @@ async fn run_serve(
     // download) would otherwise pin Ctrl-C for as long as the client holds on.
     let (graceful_tx, graceful_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = graceful_rx.await;
-            })
-            .await
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = graceful_rx.await;
+        })
+        .await
     });
 
     shutdown_signal().await;
@@ -1141,30 +1215,185 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// Middleware to log all incoming requests
-/// Per-request logging is `debug`, not `info`: at tens of thousands of rps
-/// the access log otherwise becomes the workload (a 30 s benchmark filled a
-/// 924 MB tmpfs with INFO lines and wedged the box). `RUST_LOG=debug` turns
-/// it back on for troubleshooting.
-async fn log_requests(req: Request, next: Next) -> impl IntoResponse {
+/// Request logging. The default (no `--access-log`) is an *audit* log: it records
+/// mutations — uploads, deletes, yanks, status changes (any non-GET/HEAD) — at
+/// `info`, and stays silent on the high-volume reads (index listings, downloads)
+/// so the log doesn't become the workload. `--access-log` widens it to every
+/// request (the full access log). Either way, `/health` and `/metrics` are logged
+/// only at `debug`: load balancers and Prometheus poll them constantly, so an
+/// info-level access log would drown in them.
+///
+/// Records are `tracing` events on the `pypiron::access` target, so `RUST_LOG`
+/// tunes them (`pypiron::access=warn` keeps only failures, `=off` silences them)
+/// and they render as key=value or, under `--log-format json`, a JSON object.
+/// With `--access-log --access-log-format clf` the line is Combined Log Format
+/// written straight to stdout, bypassing the diagnostic log's timestamp+level
+/// prefix that CLF parsers can't read.
+async fn log_requests(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response<Body> {
     let method = req.method().clone();
-    let uri = req.uri().clone();
+    let is_read = method == Method::GET || method == Method::HEAD;
+    let health_or_metrics = matches!(req.uri().path(), "/health" | "/metrics");
+
+    // Decide up front whether this request could be logged, so the hot read path
+    // does no timing or field work.
+    let consider = if health_or_metrics {
+        // Only ever at debug — checked here so frequent probes cost nothing
+        // at the default info level.
+        tracing::enabled!(target: "pypiron::access", tracing::Level::DEBUG)
+    } else if state.access_log {
+        true // firehose: every request
+    } else {
+        !is_read // default audit: mutations only
+    };
+    if !consider {
+        return next.run(req).await;
+    }
+
+    let clf = state.access_log && matches!(state.access_log_format, AccessLogFormat::Clf);
+
+    // Captured before `next.run` consumes the request.
+    let target = req.uri().to_string();
     let project = project_tag(req.headers());
-    tracing::debug!(
-        project = project.as_deref(),
-        "Incoming request: {} {}",
-        method,
-        uri
-    );
+    let ua = header_str(req.headers(), header::USER_AGENT);
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let host = client_ip(req.headers(), peer);
+    // CLF-only fields: skip the work for the structured path.
+    let version = req.version();
+    let authuser = clf
+        .then(|| basic_credentials(req.headers()).map(|(u, _)| u))
+        .flatten();
+    let referer = if clf {
+        header_str(req.headers(), header::REFERER)
+    } else {
+        None
+    };
+
+    let start = std::time::Instant::now();
     let response = next.run(req).await;
-    tracing::debug!(
-        project = project.as_deref(),
-        "Response status: {} {} {}",
-        response.status(),
-        method,
-        uri
-    );
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let status = response.status();
+    let bytes = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    if clf {
+        let time = OffsetDateTime::now_utc()
+            .format(CLF_TIME)
+            .unwrap_or_default();
+        let line = format_clf(
+            &host,
+            authuser.as_deref(),
+            &time,
+            &method,
+            &target,
+            &format!("{version:?}"),
+            status.as_u16(),
+            bytes,
+            referer.as_deref(),
+            ua.as_deref(),
+        );
+        // CLF bypasses tracing; a locked, whole-line write keeps it from
+        // interleaving with the diagnostic log on the shared stdout.
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{line}");
+        return response;
+    }
+
+    let bytes = bytes.map(|b| b.to_string());
+    let bytes = bytes.as_deref().unwrap_or("-");
+    macro_rules! access_event {
+        ($level:ident) => {
+            $level!(
+                target: "pypiron::access",
+                %method,
+                path = %target,
+                status = status.as_u16(),
+                latency_ms,
+                bytes = %bytes,
+                project = project.as_deref(),
+                client = %host,
+                ua = ua.as_deref(),
+                "request"
+            )
+        };
+    }
+    // /health & /metrics only reach here when debug is enabled, so keep them at
+    // debug; otherwise 5xx at warn so failures surface under a warn filter.
+    if health_or_metrics {
+        access_event!(debug);
+    } else if status.is_server_error() {
+        access_event!(warn);
+    } else {
+        access_event!(info);
+    }
     response
+}
+
+/// A header's value as an owned `String`, if present and valid UTF-8.
+fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// The client's address for logging: `X-Forwarded-For` (leftmost) or
+/// `X-Real-IP` when set by a trusted proxy, else the direct peer, else `-`.
+fn client_ip(headers: &HeaderMap, peer: Option<std::net::IpAddr>) -> String {
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        let first = xff.split(',').next().unwrap_or("").trim();
+        if !first.is_empty() {
+            return first.to_string();
+        }
+    }
+    if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let real = real.trim();
+        if !real.is_empty() {
+            return real.to_string();
+        }
+    }
+    peer.map(|ip| ip.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// Render one Combined Log Format line. Pure (no clock) so it unit-tests; the
+/// caller supplies the formatted timestamp. Missing fields render as `-`.
+#[allow(clippy::too_many_arguments)]
+fn format_clf(
+    host: &str,
+    authuser: Option<&str>,
+    time: &str,
+    method: &Method,
+    target: &str,
+    proto: &str,
+    status: u16,
+    bytes: Option<u64>,
+    referer: Option<&str>,
+    ua: Option<&str>,
+) -> String {
+    let dash = |s: Option<&str>| match s {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => "-".to_string(),
+    };
+    let host = if host.is_empty() { "-" } else { host };
+    let bytes = bytes
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "{host} - {authuser} [{time}] \"{method} {target} {proto}\" {status} {bytes} \"{referer}\" \"{ua}\"",
+        authuser = dash(authuser),
+        referer = dash(referer),
+        ua = dash(ua),
+    )
 }
 
 /// RFC 7235: a 401 without `WWW-Authenticate` is malformed, and pip's keyring
@@ -3052,6 +3281,8 @@ impl AppState {
             read_pass: None,
             private_prefix: None,
             artifact_delivery: ArtifactDelivery::Auto,
+            access_log: false,
+            access_log_format: AccessLogFormat::Structured,
             worker_interval: Duration::from_secs(1),
             reconcile_interval: Duration::from_secs(86400),
             intent_grace: time::Duration::seconds(900),
@@ -3409,6 +3640,42 @@ mod tests {
         assert_eq!(
             project_tag(&basic_headers(&format!("ci+{}", "x".repeat(65)), "tok")),
             None
+        );
+    }
+
+    #[test]
+    fn clf_line_full_and_missing() {
+        // All fields present.
+        assert_eq!(
+            format_clf(
+                "10.0.0.5",
+                Some("ci"),
+                "10/Oct/2000:13:55:36 +0000",
+                &Method::GET,
+                "/simple/flask/",
+                "HTTP/1.1",
+                200,
+                Some(1532),
+                Some("http://ref"),
+                Some("uv/0.4.0"),
+            ),
+            "10.0.0.5 - ci [10/Oct/2000:13:55:36 +0000] \"GET /simple/flask/ HTTP/1.1\" 200 1532 \"http://ref\" \"uv/0.4.0\""
+        );
+        // Missing host/user/bytes/referer/ua all collapse to `-`.
+        assert_eq!(
+            format_clf(
+                "",
+                None,
+                "10/Oct/2000:13:55:36 +0000",
+                &Method::POST,
+                "/legacy/",
+                "HTTP/1.1",
+                503,
+                None,
+                None,
+                None,
+            ),
+            "- - - [10/Oct/2000:13:55:36 +0000] \"POST /legacy/ HTTP/1.1\" 503 - \"-\" \"-\""
         );
     }
 }

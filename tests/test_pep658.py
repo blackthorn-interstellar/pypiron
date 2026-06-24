@@ -25,7 +25,8 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture()
-def metadata_server(disk_server, tmp_path):
+def metadata_server(disk_server_access_log, tmp_path):
+    disk_server = disk_server_access_log  # access log on: lets us see client fetches
     wheel_path = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
     upload_legacy(
         disk_server["legacy"],
@@ -92,8 +93,11 @@ def test_uv_resolves_without_downloading_the_wheel(metadata_server, tmp_path, uv
     assert f"{PACKAGE}=={VERSION}" in out.read_text()
 
     log = metadata_server["log_path"].read_text()
-    assert f"GET /files/{PACKAGE}/{wheel_name}.metadata" in log, (
+    assert f"path=/files/{PACKAGE}/{wheel_name}.metadata" in log, (
         "uv should fetch the PEP 658 metadata companion"
     )
-    wheel_fetches = re.findall(rf"GET /files/{PACKAGE}/{re.escape(wheel_name)}$", log, re.MULTILINE)
+    # The access-log path is `path=/files/<pkg>/<wheel> ` (space before the next
+    # field); the metadata companion is `<wheel>.metadata`, so a trailing space
+    # selects bare-wheel fetches only.
+    wheel_fetches = re.findall(rf"path=/files/{re.escape(PACKAGE)}/{re.escape(wheel_name)} ", log)
     assert not wheel_fetches, "resolution must not download the wheel itself"

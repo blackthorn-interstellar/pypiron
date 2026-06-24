@@ -80,6 +80,8 @@ artifact downloads stream.
 | `--proxy-upstream`           | `PYPIRON_PROXY_UPSTREAM`           | *(none)*       | On-demand mirror of this upstream simple index (plus `--proxy-*` filters, see below) |
 | `--spool-dir`                | `PYPIRON_SPOOL_DIR`                | system temp    | Upload/proxy spool directory — real disk, not tmpfs |
 | `--log-format`               | `PYPIRON_LOG_FORMAT`               | `text`         | `text` or `json` (one object per line)           |
+| `--access-log`               | `PYPIRON_ACCESS_LOG`               | `false`        | Also log reads (downloads/listings), not just mutations (see below) |
+| `--access-log-format`        | `PYPIRON_ACCESS_LOG_FORMAT`        | `structured`   | `structured` (key=value/JSON) or `clf` (Combined Log Format) |
 | `--worker-interval-secs`     | `PYPIRON_WORKER_INTERVAL_SECS`     | `1`            | Worker tick interval (writes also nudge the worker directly) |
 | `--reconcile-interval-secs`  | `PYPIRON_RECONCILE_INTERVAL_SECS`  | `86400`        | Audit sweep interval (fingerprint-skipped; cost scales with churn) |
 | `--audit-on-boot`            | `PYPIRON_AUDIT_ON_BOOT`            | `true`         | Audit as soon as this node becomes leader        |
@@ -98,6 +100,30 @@ The two default-on toggles — `--audit-on-boot` and `--download-stats` — are
 disabled with an explicit value, `--audit-on-boot false` /
 `--download-stats false` (or `PYPIRON_AUDIT_ON_BOOT=false` /
 `PYPIRON_DOWNLOAD_STATS=false`), not a `--no-` form.
+
+**Access log.** Each logged request is one line — method, path, status, latency,
+response size, client IP (honoring `X-Forwarded-For` / `X-Real-IP` behind a
+proxy), the project tag, and User-Agent. What gets logged depends on the request:
+
+- **By default** (no `--access-log`) only **mutations** are logged — uploads,
+  deletes, yanks, status changes (any non-GET/HEAD) — at `info`. This is a small,
+  high-value audit trail. Reads (index listings, downloads) are **not** logged:
+  an always-on read log becomes the workload at high request rates.
+- **`--access-log`** widens it to **every request**, the full access log.
+- `/health` and `/metrics` are logged **only at debug** in either mode — load
+  balancers and Prometheus poll them constantly, so they'd drown an info log.
+  Enable with `RUST_LOG=pypiron::access=debug` (or any debug filter).
+
+Two renderings, via `--access-log-format`:
+
+- `structured` (default) — a `tracing` event on the `pypiron::access` target, so
+  it follows `--log-format` (key=value text, or a JSON object under `json`) and
+  stays tunable with `RUST_LOG` (`pypiron::access=warn` keeps only 5xx, `=off`
+  silences it). 5xx log at `warn`, everything else at `info`.
+- `clf` — Combined Log Format written straight to stdout, for GoAccess/lnav/
+  awstats. It bypasses the diagnostic log's timestamp+level prefix (which those
+  parsers can't read), so it shares stdout with the diagnostic log; run
+  `RUST_LOG=warn` for a near-pure access stream (CLF parsers skip the rest).
 
 **Download counters.** With `--download-stats` (on by default), each node counts
 artifact downloads per `(package, filename)` in memory and flushes immutable

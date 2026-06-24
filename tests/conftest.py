@@ -261,7 +261,9 @@ def pip_venv(tmp_path_factory, uv_path: str) -> Path:
 # ---------------------------- Disk server fixture -----------------------------
 
 
-def _start_disk_server(tmp_path_factory, bin_path: Path, extra_args=()) -> Iterator[Dict]:
+def _start_disk_server(
+    tmp_path_factory, bin_path: Path, extra_args=(), extra_env=None
+) -> Iterator[Dict]:
     data_dir = tmp_path_factory.mktemp("pypiron-data")
     log_path = data_dir.parent / f"{data_dir.name}-server.log"
     port = find_free_port()
@@ -292,6 +294,8 @@ def _start_disk_server(tmp_path_factory, bin_path: Path, extra_args=()) -> Itera
 
     env = os.environ.copy()
     env.setdefault("RUST_LOG", "info,pypiron=debug")
+    if extra_env:
+        env.update(extra_env)
 
     # Logs go to a file: an undrained PIPE fills up and deadlocks the server.
     with open(log_path, "w") as log_file:
@@ -454,6 +458,45 @@ def disk_server_json_logs(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]
     """Disk server logging one JSON object per line."""
     yield from _start_disk_server(
         tmp_path_factory, pypiron_bin, extra_args=["--log-format", "json"]
+    )
+
+
+@pytest.fixture()
+def disk_server_access_log(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server with the structured (text) access log on — lets tests observe
+    per-request client behavior in the server log."""
+    yield from _start_disk_server(tmp_path_factory, pypiron_bin, extra_args=["--access-log"])
+
+
+@pytest.fixture()
+def disk_server_access_log_info(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Access log on at info level (debug OFF) — so /health and /metrics, which
+    log only at debug, are excluded."""
+    yield from _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=["--access-log"],
+        extra_env={"RUST_LOG": "info,pypiron=info"},
+    )
+
+
+@pytest.fixture()
+def disk_server_access_log_json(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server with the structured access log on, emitting JSON lines."""
+    yield from _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=["--access-log", "--log-format", "json"],
+    )
+
+
+@pytest.fixture()
+def disk_server_access_log_clf(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server with the access log on in Combined Log Format."""
+    yield from _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=["--access-log", "--access-log-format", "clf"],
     )
 
 
@@ -703,7 +746,9 @@ def s3_server_presigned(tmp_path_factory, pypiron_bin: Path, minio: Dict) -> Ite
         tmp_path_factory,
         pypiron_bin,
         minio,
-        extra_env={"PYPIRON_ARTIFACT_DELIVERY": "redirect"},
+        # access log on so the redirect test can confirm the wheel GET hit this
+        # node (and was answered 302, never streamed).
+        extra_env={"PYPIRON_ARTIFACT_DELIVERY": "redirect", "PYPIRON_ACCESS_LOG": "true"},
     )
 
 

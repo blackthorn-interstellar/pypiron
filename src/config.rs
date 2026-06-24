@@ -91,6 +91,8 @@ pub struct FilterFile {
 pub struct ServeConfig {
     pub bind_addr: Option<String>,
     pub artifact_delivery: Option<String>,
+    pub access_log: Option<bool>,
+    pub access_log_format: Option<String>,
     pub proxy_upstream: Option<String>,
     pub spool_dir: Option<PathBuf>,
     pub wait_on_upload: Option<bool>,

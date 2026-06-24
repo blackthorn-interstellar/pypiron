@@ -21,7 +21,8 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture()
-def pip_six_server(disk_server, tmp_path):
+def pip_six_server(disk_server_access_log, tmp_path):
+    disk_server = disk_server_access_log  # access log on: lets us see client fetches
     wheel_path = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
     upload_legacy(
         disk_server["legacy"],
@@ -56,10 +57,11 @@ def test_pip_resolves_with_pep658_metadata(pip_six_server, pip_venv):
     assert f"Would install {PACKAGE}-{VERSION}" in output
 
     log = pip_six_server["log_path"].read_text()
-    assert f"GET /files/{PACKAGE}/{wheel_name}.metadata" in log, (
+    assert f"path=/files/{PACKAGE}/{wheel_name}.metadata" in log, (
         "pip should fetch the PEP 658 metadata companion"
     )
-    wheel_fetches = re.findall(rf"GET /files/{PACKAGE}/{re.escape(wheel_name)}$", log, re.MULTILINE)
+    # Trailing space selects bare-wheel fetches, excluding the `.metadata` companion.
+    wheel_fetches = re.findall(rf"path=/files/{re.escape(PACKAGE)}/{re.escape(wheel_name)} ", log)
     assert not wheel_fetches, "resolution must not download the wheel itself"
 
 

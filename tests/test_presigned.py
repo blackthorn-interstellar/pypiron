@@ -110,7 +110,7 @@ def test_install_works_through_redirects(presigned_server, uv_path, uv_venv):
     wheel_lines = [
         line
         for line in log.splitlines()
-        if f"GET /files/{PACKAGE}/" in line and ".metadata" not in line
+        if f"path=/files/{PACKAGE}/" in line and ".metadata" not in line
     ]
     assert wheel_lines, "uv must have requested the wheel from the node"
 

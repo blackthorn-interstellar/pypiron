@@ -1264,7 +1264,7 @@ async fn write_global_indexes(state: &AppState, packages: &[String]) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ArtifactDelivery;
+    use crate::{AccessLogFormat, ArtifactDelivery};
     use axum::body::Body;
     use http::Response;
     use std::collections::HashMap;
@@ -1452,6 +1452,8 @@ mod tests {
             read_pass: None,
             private_prefix: None,
             artifact_delivery: ArtifactDelivery::Auto,
+            access_log: false,
+            access_log_format: AccessLogFormat::Structured,
             worker_interval: Duration::from_secs(10),
             reconcile_interval: Duration::from_secs(3600),
             intent_grace: time::Duration::seconds(900),
@@ -1552,6 +1554,8 @@ mod tests {
             read_pass: None,
             private_prefix: None,
             artifact_delivery: ArtifactDelivery::Auto,
+            access_log: false,
+            access_log_format: AccessLogFormat::Structured,
             worker_interval: Duration::from_millis(10),
             reconcile_interval: Duration::from_secs(3600),
             intent_grace: time::Duration::seconds(900),

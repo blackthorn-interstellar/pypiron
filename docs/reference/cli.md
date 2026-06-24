@@ -162,3 +162,27 @@ verbosity.
 ```bash
 PYPIRON_LOG_FORMAT=json pypiron serve --storage s3 --s3-bucket my-bucket
 ```
+
+### Access log
+
+By default pypiron logs **mutations** (uploads, deletes, yanks, status changes) on
+the `pypiron::access` target and stays silent on reads. `--access-log` widens that
+to **every request** (the full access log). `/health` and `/metrics` log only at
+debug in either mode. See [configuration](configuration.md#access-log) for the
+field list and rationale.
+
+The default `structured` rendering follows `--log-format` and is tunable with
+`RUST_LOG` (`RUST_LOG=pypiron::access=warn` for failures only).
+`--access-log-format clf` instead writes Combined Log Format to stdout for log
+tooling:
+
+```bash
+# full structured JSON access log for a pipeline
+pypiron serve --access-log --log-format json
+
+# full access log in Combined Log Format for GoAccess/lnav (quiet diagnostics)
+RUST_LOG=warn pypiron serve --access-log --access-log-format clf
+
+# see /health and /metrics too (debug)
+RUST_LOG=pypiron::access=debug pypiron serve --access-log
+```

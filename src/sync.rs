@@ -53,21 +53,6 @@ use crate::upload::{FinishedSpool, UploadSpool};
 
 #[derive(Debug, Clone, Args)]
 pub struct SyncArgs {
-    /// Text file of packages to mirror, one per line: a name with optional
-    /// PEP 440 specifiers (e.g. "requests>=2.20,<3").
-    #[arg(long, env = "PYPIRON_PACKAGES_LIST")]
-    pub packages_list: Option<PathBuf>,
-
-    /// A single package to mirror, same line syntax as a packages-list entry
-    /// (name with optional PEP 440 specifiers, e.g. `requests>=2.20,<3`);
-    /// repeatable. Commas belong to the specifier — pass multiple packages as
-    /// repeated `--pkg`, not a comma-joined list (unlike the comma-splitting
-    /// `--filter-*-tag` flags). When any CLI package is given (`--pkg` and/or
-    /// `--packages-list`), the CLI set fully replaces the config file's
-    /// `[sync].packages`/`packages-list`.
-    #[arg(long = "pkg", value_name = "SPEC")]
-    pub pkg: Vec<String>,
-
     /// Source index base (default: https://pypi.org). Read over the PEP 691
     /// Simple API (`/simple/<name>/`), so any PEP 691 index works — PyPI,
     /// another pypiron, etc.
@@ -137,6 +122,30 @@ pub struct SyncArgs {
 /// `[filter]` table in pypiron.toml (see [`FilterFile`]).
 #[derive(Debug, Clone, Default, Args)]
 pub struct FilterArgs {
+    /// Restrict to these packages: a name with optional PEP 440 specifiers
+    /// (e.g. `requests>=2.20,<3`); repeatable. `sync` mirrors exactly these;
+    /// the `serve` proxy serves only these from upstream and 404s the rest
+    /// (fail-closed). Commas belong to the specifier — pass multiple packages
+    /// as repeated `--filter-package`, not a comma-joined list (unlike the
+    /// comma-splitting `--filter-*-tag` flags). A CLI package source
+    /// (`--filter-package` and/or `--filter-packages-list`) replaces the config
+    /// file's `[filter].packages`/`packages-list` entirely.
+    #[arg(
+        long = "filter-package",
+        env = "PYPIRON_FILTER_PACKAGE",
+        value_name = "SPEC"
+    )]
+    pub package: Vec<String>,
+
+    /// File of package specs to restrict to, one per line; same syntax as
+    /// `--filter-package`. Blank lines and lines beginning with `#` are ignored.
+    #[arg(
+        long = "filter-packages-list",
+        env = "PYPIRON_FILTER_PACKAGES_LIST",
+        value_name = "FILE"
+    )]
+    pub packages_list: Option<PathBuf>,
+
     /// Only mirror/proxy wheel files (.whl)
     #[arg(
         long = "filter-only-wheels",
@@ -228,6 +237,28 @@ pub struct FilterArgs {
         env = "PYPIRON_FILTER_EXCLUDE_WINDOWS"
     )]
     pub exclude_windows: bool,
+
+    /// Skip PEP 440 pre-releases: alpha/beta/rc *and* dev releases. The strict
+    /// superset of --filter-exclude-dev (keep stable releases only).
+    #[arg(
+        long = "filter-exclude-prereleases",
+        env = "PYPIRON_FILTER_EXCLUDE_PRERELEASES"
+    )]
+    pub exclude_prereleases: bool,
+
+    /// Skip artifacts larger than this size (e.g. 250MB, 1.5GiB, 1048576). Units
+    /// are powers of 1024 (KB == KiB); a bare number is bytes. A file whose size
+    /// is absent from the upstream listing is kept.
+    #[arg(
+        long = "filter-max-size",
+        env = "PYPIRON_FILTER_MAX_SIZE",
+        value_name = "SIZE"
+    )]
+    pub max_size: Option<String>,
+
+    /// Skip files yanked upstream (PEP 592).
+    #[arg(long = "filter-exclude-yanked", env = "PYPIRON_FILTER_EXCLUDE_YANKED")]
+    pub exclude_yanked: bool,
 }
 
 impl FilterArgs {
@@ -256,6 +287,7 @@ impl FilterArgs {
             bail!("filter-only-wheels and filter-only-sdists are mutually exclusive");
         }
         Ok(ResolvedFilter {
+            packages: self.resolve_packages(file)?,
             only_wheels,
             only_sdists,
             python_tag: pick_vec(&self.python_tag, file.and_then(|f| f.python_tag.clone())),
@@ -286,21 +318,90 @@ impl FilterArgs {
             exclude_dev: self.exclude_dev || file.and_then(|f| f.exclude_dev).unwrap_or(false),
             exclude_windows: self.exclude_windows
                 || file.and_then(|f| f.exclude_windows).unwrap_or(false),
+            exclude_prereleases: self.exclude_prereleases
+                || file.and_then(|f| f.exclude_prereleases).unwrap_or(false),
+            max_size: parse_size(
+                "filter-max-size",
+                self.max_size
+                    .as_deref()
+                    .or(file.and_then(|f| f.max_size.as_deref())),
+            )?,
+            exclude_yanked: self.exclude_yanked
+                || file.and_then(|f| f.exclude_yanked).unwrap_or(false),
         })
+    }
+
+    /// Resolve the package scope (the filter's name axis): CLI over file,
+    /// parsed into specs. A CLI source (`--filter-package` and/or
+    /// `--filter-packages-list`) replaces the file's `packages`/`packages-list`
+    /// entirely; with no CLI source the file's list file and inline array
+    /// combine. Empty is allowed here — `serve` reads it as "any name" and
+    /// `sync` enforces non-empty itself. The list file is read with `std::fs`
+    /// so this stays synchronous and serves both the async `sync` startup and
+    /// the `serve` startup through one path.
+    fn resolve_packages(&self, file: Option<&FilterFile>) -> Result<Vec<PackageSpec>> {
+        let mut lines: Vec<String> = Vec::new();
+        if self.packages_list.is_some() || !self.package.is_empty() {
+            if let Some(path) = &self.packages_list {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                lines.extend(text.lines().map(str::to_string));
+            }
+            lines.extend(self.package.iter().cloned());
+            // Announce the override so a stray `--filter-package foo` doesn't
+            // silently drop a populated `[filter]` package source.
+            let mut ignored = Vec::new();
+            if let Some(n) = file
+                .and_then(|f| f.packages.as_ref())
+                .map(Vec::len)
+                .filter(|n| *n > 0)
+            {
+                ignored.push(format!("{n} inline package(s)"));
+            }
+            if let Some(path) = file.and_then(|f| f.packages_list.as_ref()) {
+                ignored.push(format!("packages-list {}", path.display()));
+            }
+            if !ignored.is_empty() {
+                info!(
+                    "CLI --filter-package/--filter-packages-list overrides the pypiron.toml [filter] package set (ignoring {})",
+                    ignored.join(" + ")
+                );
+            }
+        } else if let Some(file) = file {
+            if let Some(path) = &file.packages_list {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                lines.extend(text.lines().map(str::to_string));
+            }
+            lines.extend(file.packages.clone().unwrap_or_default());
+        }
+
+        let mut specs = Vec::new();
+        for (lineno, raw) in lines.iter().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            specs.push(
+                parse_spec_line(line)
+                    .with_context(|| format!("package entry {} ('{line}')", lineno + 1))?,
+            );
+        }
+        Ok(specs)
     }
 }
 
-/// One package to mirror, with optional PEP 440 version constraints.
+/// One package in the scope, with optional PEP 440 version constraints. The
+/// name is PEP 503-normalized.
 #[derive(Debug, Clone)]
-struct PackageSpec {
-    name: String,
-    specifiers: Option<VersionSpecifiers>,
+pub(crate) struct PackageSpec {
+    pub(crate) name: String,
+    pub(crate) specifiers: Option<VersionSpecifiers>,
 }
 
 /// Everything resolved: CLI/env over pypiron.toml over defaults, all inputs
 /// parsed and validated up front.
 struct Resolved {
-    specs: Vec<PackageSpec>,
     src_base: String,
     dst_base: String,
     admin_user: Option<String>,
@@ -321,6 +422,11 @@ struct Resolved {
 
 #[derive(Debug, Default)]
 pub(crate) struct ResolvedFilter {
+    /// The package scope (the filter's name axis). Empty means "no name
+    /// restriction": `sync` rejects that (it needs an explicit work list), but
+    /// the `serve` proxy treats it as "serve any non-private name", preserving
+    /// the open-proxy default. Non-empty is a fail-closed allowlist.
+    pub(crate) packages: Vec<PackageSpec>,
     pub(crate) only_wheels: bool,
     pub(crate) only_sdists: bool,
     pub(crate) python_tag: Vec<String>,
@@ -337,67 +443,19 @@ pub(crate) struct ResolvedFilter {
     /// Drop Windows artifacts: wheels with a `win*` platform tag and legacy
     /// Windows installers (`.exe`/`.msi`/`.winXX` filenames).
     pub(crate) exclude_windows: bool,
+    /// Drop PEP 440 pre-releases (alpha/beta/rc and dev) — superset of
+    /// `exclude_dev`.
+    pub(crate) exclude_prereleases: bool,
+    /// Drop artifacts whose listed size exceeds this many bytes. `None` disables
+    /// the ceiling; a file with no size in the listing is kept.
+    pub(crate) max_size: Option<u64>,
+    /// Drop files yanked upstream (PEP 592).
+    pub(crate) exclude_yanked: bool,
 }
 
 impl Resolved {
     async fn merge(args: &SyncArgs, cfg: ConfigFile) -> Result<Self> {
         let sync = cfg.sync;
-        // Package set follows CLI > file: any CLI package source (`--pkg` or
-        // `--packages-list`) replaces the file's set entirely (both its
-        // `packages-list` and inline `packages`). With no CLI packages, the
-        // file's path and inline array combine.
-        let mut lines: Vec<String> = Vec::new();
-        if args.packages_list.is_some() || !args.pkg.is_empty() {
-            if let Some(path) = &args.packages_list {
-                let text = fs::read_to_string(path)
-                    .await
-                    .with_context(|| format!("reading {}", path.display()))?;
-                lines.extend(text.lines().map(str::to_string));
-            }
-            lines.extend(args.pkg.iter().cloned());
-            // The CLI set replaces the file's entirely (documented on `--pkg`).
-            // Announce the override so a quick `--pkg foo` doesn't silently drop
-            // a populated `[sync]` package source. Built from data already in
-            // hand — count the inline array, name the list path without reading it.
-            let mut ignored = Vec::new();
-            if let Some(n) = sync.packages.as_ref().map(Vec::len).filter(|n| *n > 0) {
-                ignored.push(format!("{n} inline package(s)"));
-            }
-            if let Some(path) = &sync.packages_list {
-                ignored.push(format!("packages-list {}", path.display()));
-            }
-            if !ignored.is_empty() {
-                info!(
-                    "CLI --pkg/--packages-list overrides the pypiron.toml [sync] package set (ignoring {})",
-                    ignored.join(" + ")
-                );
-            }
-        } else {
-            if let Some(path) = &sync.packages_list {
-                let text = fs::read_to_string(path)
-                    .await
-                    .with_context(|| format!("reading {}", path.display()))?;
-                lines.extend(text.lines().map(str::to_string));
-            }
-            lines.extend(sync.packages.unwrap_or_default());
-        }
-
-        let mut specs = Vec::new();
-        for (lineno, raw) in lines.iter().enumerate() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            specs.push(
-                parse_spec_line(line)
-                    .with_context(|| format!("package entry {} ('{line}')", lineno + 1))?,
-            );
-        }
-        if specs.is_empty() {
-            bail!(
-                "no packages to sync: provide --pkg/--packages-list or [sync].packages in pypiron.toml"
-            );
-        }
 
         // Sync mirrors over HTTP; a destination is mandatory.
         let dst_base = ensure_http_scheme(args.dst_base.clone().or(sync.to).ok_or_else(|| {
@@ -406,13 +464,19 @@ impl Resolved {
             )
         })?);
 
-        // The filter is resolved through the one shared path (CLI/env over the
-        // `[filter]` table), so a sync run and the serve proxy can never drift.
+        // The filter — package scope included — is resolved through the one
+        // shared path (CLI/env over the `[filter]` table), so a sync run and
+        // the serve proxy can never drift. The proxy treats an empty scope as
+        // "any name"; sync needs an explicit work list, so it bails here.
         let filter = args.filter.resolve(Some(&cfg.filter))?;
+        if filter.packages.is_empty() {
+            bail!(
+                "no packages to sync: provide --filter-package/--filter-packages-list or [filter].packages in pypiron.toml"
+            );
+        }
         let exclude_older_raw = args.filter.exclude_older_raw(Some(&cfg.filter));
 
         Ok(Self {
-            specs,
             src_base: args
                 .src_base
                 .clone()
@@ -509,6 +573,35 @@ pub(crate) fn parse_min_python(value: Option<&str>) -> Result<Option<(u32, u32)>
         None => 0,
     };
     Ok(Some((major, minor)))
+}
+
+/// Parse a human size — `250MB`, `1.5GiB`, `1048576`, `500k` — into bytes. Units
+/// are powers of 1024 (so `KB` == `KiB`); a bare number is bytes. Empty/absent is
+/// `None` (no ceiling), not an error. `what` names the flag for error context.
+pub(crate) fn parse_size(what: &str, value: Option<&str>) -> Result<Option<u64>> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let split = value
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(value.len());
+    let (num, unit) = value.split_at(split);
+    let num: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("{what} '{value}' is not a size like 250MB or 1048576"))?;
+    if !num.is_finite() || num < 0.0 {
+        bail!("{what} '{value}' must be a non-negative size");
+    }
+    let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1 << 10,
+        "m" | "mb" | "mib" => 1 << 20,
+        "g" | "gb" | "gib" => 1 << 30,
+        "t" | "tb" | "tib" => 1 << 40,
+        other => bail!("{what} '{value}' has unknown unit '{other}' (use B, KB, MB, GB, TB)"),
+    };
+    Ok(Some((num * mult as f64) as u64))
 }
 
 /// Total seconds in a duration string — friendly (`30 days`) or ISO 8601
@@ -753,11 +846,17 @@ fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
             .as_bytes(),
     );
     h.update([0x1e]);
-    h.update([u8::from(f.exclude_dev), u8::from(f.exclude_windows)]);
+    h.update([
+        u8::from(f.exclude_dev),
+        u8::from(f.exclude_windows),
+        u8::from(f.exclude_prereleases),
+        u8::from(f.exclude_yanked),
+    ]);
     if let Some((maj, min)) = f.min_python {
         h.update(maj.to_le_bytes());
         h.update(min.to_le_bytes());
     }
+    h.update(f.max_size.unwrap_or(0).to_le_bytes());
     h.update([0x1d]);
     if let Some(s) = &spec.specifiers {
         h.update(s.to_string().as_bytes());
@@ -1082,11 +1181,15 @@ pub async fn run_sync(args: SyncArgs, config_path: Option<PathBuf>) -> Result<()
     // Packages in parallel (chunked join_all — same pattern as the worker
     // sweep), files within each package in parallel below. The long tail of a
     // mirror is small packages, so serial-per-package was the throughput cap.
-    let progress = Arc::new(Progress::new(resolved.specs.len()));
+    let progress = Arc::new(Progress::new(resolved.filter.packages.len()));
     let ticker = (!args.no_progress).then(|| spawn_progress(progress.clone()));
     let mut failures = 0usize;
     let mut refreshed: Cursors = Cursors::new();
-    for chunk in resolved.specs.chunks(resolved.package_concurrency) {
+    for chunk in resolved
+        .filter
+        .packages
+        .chunks(resolved.package_concurrency)
+    {
         let results = futures::future::join_all(chunk.iter().map(|spec| {
             sync_one_package(
                 &client,
@@ -1737,12 +1840,28 @@ pub(crate) fn matches_filters(file: &SimpleFile, f: &ResolvedFilter) -> bool {
         return false;
     }
 
-    // Dev releases (`.devN`) gate every file — sdists too. The version isn't in
-    // the Simple API, so it's inferred from the filename; a file whose version
-    // can't be parsed is kept (we can't prove it's a dev release).
-    if f.exclude_dev {
+    // Yank and size gate every file. A file yanked upstream (PEP 592) is dropped;
+    // a file larger than the ceiling is dropped, but one whose size is missing
+    // from the listing is kept (we can't prove it exceeds).
+    if f.exclude_yanked && is_yanked(&file.yanked) {
+        return false;
+    }
+    if let Some(max) = f.max_size {
+        if file.size.is_some_and(|s| s > max) {
+            return false;
+        }
+    }
+
+    // Pre-release / dev gates every file — sdists too. The version isn't in the
+    // Simple API, so it's inferred from the filename; a file whose version can't
+    // be parsed is kept (we can't prove it's a pre-release). `exclude_prereleases`
+    // (alpha/beta/rc + dev) is the superset of `exclude_dev` (dev only).
+    if f.exclude_dev || f.exclude_prereleases {
         if let Some(v) = infer_version_from_filename(&file.filename) {
-            if is_dev_version(&v) {
+            if f.exclude_prereleases && is_prerelease_version(&v) {
+                return false;
+            }
+            if f.exclude_dev && is_dev_version(&v) {
                 return false;
             }
         }
@@ -1897,6 +2016,19 @@ fn is_dev_version(version: &str) -> bool {
     canon.to_ascii_lowercase().contains(".dev")
 }
 
+/// True if `version` (a PEP 440 string) is a pre-release — an alpha/beta/rc *or*
+/// dev release. An unparseable version is treated as not-a-pre-release (kept):
+/// we can't prove it is one. The superset of [`is_dev_version`].
+fn is_prerelease_version(version: &str) -> bool {
+    Version::from_str(version).is_ok_and(|v| v.any_prerelease())
+}
+
+/// True if a file is yanked upstream (PEP 592): anything but an explicit
+/// `false`. A bare `true` or any reason string counts as yanked.
+fn is_yanked(yanked: &Yanked) -> bool {
+    !matches!(yanked, Yanked::Flag(false))
+}
+
 /// The interpreter version a PEP 427 python tag pins to: strip the leading
 /// interpreter letters (cp/py/pp/…), then read the leading digit run as a
 /// major plus optional minor. `cp39` → `(3, Some(9))`, `cp310` → `(3, Some(10))`,
@@ -2009,6 +2141,7 @@ mod tests {
 
     fn base_filter() -> ResolvedFilter {
         ResolvedFilter {
+            packages: vec![],
             only_wheels: false,
             only_sdists: false,
             python_tag: vec![],
@@ -2020,6 +2153,9 @@ mod tests {
             min_python: None,
             exclude_dev: false,
             exclude_windows: false,
+            exclude_prereleases: false,
+            max_size: None,
+            exclude_yanked: false,
         }
     }
 
@@ -2175,6 +2311,97 @@ mod tests {
     }
 
     #[test]
+    fn exclude_prereleases_drops_alpha_beta_rc_and_dev() {
+        let f = ResolvedFilter {
+            exclude_prereleases: true,
+            ..base_filter()
+        };
+        // Every PEP 440 pre-release spelling is dropped — wheels and sdists.
+        for name in [
+            "foo-1.0a1-py3-none-any.whl",
+            "foo-1.0b2-py3-none-any.whl",
+            "foo-1.0rc1-py3-none-any.whl",
+            "foo-2.0.dev1.tar.gz",
+            "foo-2.0rc1.dev3-cp311-cp311-manylinux_2_17_x86_64.whl",
+        ] {
+            assert!(
+                !matches_filters(&named_file(name), &f),
+                "{name} should drop"
+            );
+        }
+        // Final and post releases stay — unlike exclude_dev, rc is also dropped.
+        assert!(matches_filters(&named_file("foo-1.0-py3-none-any.whl"), &f));
+        assert!(matches_filters(&named_file("foo-1.0.post1.tar.gz"), &f));
+        // An unparseable version can't be proven a pre-release, so it's kept.
+        assert!(matches_filters(&named_file("foo-notaversion.tar.gz"), &f));
+    }
+
+    #[test]
+    fn max_size_drops_oversize_keeps_unsized() {
+        let f = ResolvedFilter {
+            max_size: Some(1000),
+            ..base_filter()
+        };
+        let sized = |n: u64| SimpleFile {
+            size: Some(n),
+            ..named_file("foo-1.0-py3-none-any.whl")
+        };
+        assert!(!matches_filters(&sized(1001), &f)); // over
+        assert!(matches_filters(&sized(1000), &f)); // exactly at the ceiling
+        assert!(matches_filters(&sized(10), &f)); // under
+                                                  // No size in the listing → can't prove it's oversize → kept.
+        assert!(matches_filters(&named_file("foo-1.0-py3-none-any.whl"), &f));
+    }
+
+    #[test]
+    fn exclude_yanked_drops_yanked_files() {
+        let f = ResolvedFilter {
+            exclude_yanked: true,
+            ..base_filter()
+        };
+        let with_yank = |y: Yanked| SimpleFile {
+            yanked: y,
+            ..named_file("foo-1.0-py3-none-any.whl")
+        };
+        assert!(!matches_filters(&with_yank(Yanked::Flag(true)), &f));
+        assert!(!matches_filters(
+            &with_yank(Yanked::Reason("CVE-2024-1".into())),
+            &f
+        ));
+        assert!(matches_filters(&with_yank(Yanked::Flag(false)), &f));
+    }
+
+    #[test]
+    fn is_prerelease_version_spans_pre_and_dev() {
+        assert!(is_prerelease_version("1.0a1"));
+        assert!(is_prerelease_version("1.0b2"));
+        assert!(is_prerelease_version("1.0rc1"));
+        assert!(is_prerelease_version("1.0.dev1"));
+        assert!(is_prerelease_version("2.0rc1.dev3"));
+        assert!(!is_prerelease_version("1.0"));
+        assert!(!is_prerelease_version("1.0.post1"));
+        // Unparseable → not a pre-release (kept).
+        assert!(!is_prerelease_version("notaversion"));
+    }
+
+    #[test]
+    fn parse_size_parses_units_and_rejects_garbage() {
+        let ok = |s: &str| parse_size("max-size", Some(s)).unwrap();
+        assert_eq!(ok(""), None);
+        assert_eq!(ok("   "), None);
+        assert_eq!(ok("1048576"), Some(1_048_576));
+        assert_eq!(ok("500"), Some(500));
+        assert_eq!(ok("1KB"), Some(1024));
+        assert_eq!(ok("1kib"), Some(1024));
+        assert_eq!(ok("250MB"), Some(250 << 20));
+        assert_eq!(ok("1.5GiB"), Some(1_610_612_736));
+        assert_eq!(ok(" 2 gb "), Some(2 << 30));
+        assert!(parse_size("max-size", Some("big")).is_err());
+        assert!(parse_size("max-size", Some("10XB")).is_err());
+        assert!(parse_size("max-size", Some("-5MB")).is_err());
+    }
+
+    #[test]
     fn interp_tag_version_parses_real_tags() {
         assert_eq!(interp_tag_version("cp39"), Some((3, Some(9))));
         assert_eq!(interp_tag_version("cp310"), Some((3, Some(10))));
@@ -2293,7 +2520,6 @@ mod tests {
 
     fn resolved_with(filter: ResolvedFilter, src_base: &str) -> Resolved {
         Resolved {
-            specs: vec![],
             src_base: src_base.to_string(),
             dst_base: "https://dest.example".to_string(),
             admin_user: None,
@@ -2368,6 +2594,16 @@ mod tests {
             config_key(&resolved_with(wheels, "https://pypi.org"), &s)
         );
         assert_ne!(k, config_key(&r, &spec("requests", Some(">=2"))));
+
+        // Each new filter axis invalidates the cursor key too.
+        let with = |mutate: fn(&mut ResolvedFilter)| {
+            let mut f = time_filter(None, None);
+            mutate(&mut f);
+            config_key(&resolved_with(f, "https://pypi.org"), &s)
+        };
+        assert_ne!(k, with(|f| f.exclude_prereleases = true));
+        assert_ne!(k, with(|f| f.exclude_yanked = true));
+        assert_ne!(k, with(|f| f.max_size = Some(1 << 20)));
     }
 
     #[test]

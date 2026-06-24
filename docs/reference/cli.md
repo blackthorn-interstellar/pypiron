@@ -58,15 +58,15 @@ backend.
 ```bash
 pypiron sync \
   --to http://localhost:8080 --admin-pass "$ADMIN" \
-  --pkg "requests>=2.20,<3" --pkg numpy
+  --filter-package "requests>=2.20,<3" --filter-package numpy
 ```
 
 | Flag | Purpose |
 | --- | --- |
 | `--to` | Destination pypiron base URL. Required. |
 | `--from` | Source index base. Default `https://pypi.org`. |
-| `--pkg` | One package, with optional PEP 440 specifiers. Repeatable. |
-| `--packages-list` | Text file of packages, one per line. |
+| `--filter-package` | One package, with optional PEP 440 specifiers. Repeatable. Shared with `serve` (see [Configuration](configuration.md#filters)). |
+| `--filter-packages-list` | Text file of packages, one per line. |
 | `--config` | Path to a `pypiron.toml` (global; `serve` reads it too). Defaults to `./pypiron.toml` when present. |
 | `--admin-user` / `--admin-pass` | Admin credential for the destination. |
 | `--full` | Ignore the conditional-fetch memo; re-fetch and reconcile everything. |

@@ -3,12 +3,12 @@
 //! Four pieces, one per concern:
 //!   - top-level `private-prefix` — the reserved private namespace, shared by
 //!     `sync` and the `serve` proxy (one knob, one place).
-//!   - `[filter]` — the slice of PyPI you want. Shared by `sync` (push mirror)
-//!     and `serve --proxy-upstream` (on-demand pull mirror): set it once, it
-//!     governs whichever you run.
+//!   - `[filter]` — the slice of PyPI you want, names included. Shared by
+//!     `sync` (push mirror) and `serve --proxy-upstream` (on-demand pull
+//!     mirror): set it once, it governs whichever you run.
 //!   - `[serve]` — the server process (non-secret knobs only; credentials and
 //!     cloud keys stay in CLI/env — see docs/concepts/authentication.md).
-//!   - `[sync]` — the push-mirror job (source/dest + which packages).
+//!   - `[sync]` — the push-mirror job (source/dest + concurrency).
 //!
 //! Precedence is CLI/env (clap merges those) > file > built-in default.
 //! Unknown keys are hard errors — a typo'd filter that silently no-ops is
@@ -25,6 +25,8 @@ pub const DEFAULT_CONFIG_PATH: &str = "pypiron.toml";
 /// Filter keys that used to live under `[sync]` and now belong under `[filter]`.
 /// Kept only to turn the `deny_unknown_fields` rejection into a migration hint.
 const MOVED_FILTER_KEYS: &[&str] = &[
+    "packages",
+    "packages-list",
     "only-wheels",
     "only-sdists",
     "python-tag",
@@ -57,6 +59,13 @@ pub struct ConfigFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct FilterFile {
+    /// Inline package scope; each entry is a name with optional PEP 440
+    /// specifiers (e.g. "requests>=2.20,<3"), same syntax as a packages.txt
+    /// line. The slice's name axis: `sync` mirrors exactly these, and the
+    /// `serve` proxy serves only these from upstream (fail-closed when set).
+    pub packages: Option<Vec<String>>,
+    /// File of package specs, one per line; same syntax as `packages`.
+    pub packages_list: Option<PathBuf>,
     pub only_wheels: Option<bool>,
     pub only_sdists: Option<bool>,
     pub python_tag: Option<Vec<String>>,
@@ -68,6 +77,9 @@ pub struct FilterFile {
     pub min_python: Option<String>,
     pub exclude_dev: Option<bool>,
     pub exclude_windows: Option<bool>,
+    pub exclude_prereleases: Option<bool>,
+    pub max_size: Option<String>,
+    pub exclude_yanked: Option<bool>,
 }
 
 /// `[serve]`: the server process. Non-secret knobs only — admin/uploader/read
@@ -108,15 +120,11 @@ pub struct ServeConfig {
     pub azure_use_emulator: Option<bool>,
 }
 
-/// `[sync]`: the push-mirror job. Filters moved to `[filter]`; `private-prefix`
-/// moved to the top level.
+/// `[sync]`: the push-mirror job. The package scope and filters moved to
+/// `[filter]`; `private-prefix` moved to the top level.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SyncConfig {
-    /// Inline package list; same line syntax as packages.txt
-    /// (name plus optional PEP 440 specifiers, e.g. "requests>=2.20,<3").
-    pub packages: Option<Vec<String>>,
-    pub packages_list: Option<PathBuf>,
     pub from: Option<String>,
     pub to: Option<String>,
     pub admin_user: Option<String>,
@@ -153,9 +161,14 @@ pub fn load(explicit: Option<&Path>) -> Result<ConfigFile> {
         }
     };
 
-    if let Some(rel) = cfg.sync.packages_list.as_ref().filter(|p| p.is_relative()) {
+    if let Some(rel) = cfg
+        .filter
+        .packages_list
+        .as_ref()
+        .filter(|p| p.is_relative())
+    {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            cfg.sync.packages_list = Some(dir.join(rel));
+            cfg.filter.packages_list = Some(dir.join(rel));
         }
     }
     // Announce only after a clean parse — silent auto-discovery of
@@ -204,20 +217,23 @@ mod tests {
             private-prefix = "acme"
 
             [sync]
-            packages = ["requests>=2.20,<3", "six"]
             to = "http://localhost:8080"
             concurrency = 8
             package-concurrency = 16
 
             [filter]
+            packages = ["requests>=2.20,<3", "six"]
             only-wheels = true
             python-tag = ["py3"]
             exclude-newer = "2026-01-01T00:00:00Z"
+            exclude-prereleases = true
+            max-size = "250MB"
+            exclude-yanked = true
             "#,
         )
         .unwrap();
         assert_eq!(cfg.private_prefix.as_deref(), Some("acme"));
-        assert_eq!(cfg.sync.packages.unwrap().len(), 2);
+        assert_eq!(cfg.filter.packages.unwrap().len(), 2);
         assert_eq!(cfg.sync.concurrency, Some(8));
         assert_eq!(cfg.sync.package_concurrency, Some(16));
         assert_eq!(cfg.filter.only_wheels, Some(true));
@@ -225,6 +241,9 @@ mod tests {
             cfg.filter.exclude_newer.as_deref(),
             Some("2026-01-01T00:00:00Z")
         );
+        assert_eq!(cfg.filter.exclude_prereleases, Some(true));
+        assert_eq!(cfg.filter.max_size.as_deref(), Some("250MB"));
+        assert_eq!(cfg.filter.exclude_yanked, Some(true));
     }
 
     #[test]
@@ -266,6 +285,15 @@ mod tests {
     }
 
     #[test]
+    fn moved_packages_under_sync_gives_migration_hint() {
+        let err = migration_hint("[sync]\npackages = [\"requests\"]\n").unwrap_err();
+        assert!(
+            err.to_string().contains("moved to [filter].packages"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn moved_private_prefix_gives_migration_hint() {
         let err = migration_hint("[sync]\nprivate-prefix = \"acme\"\n").unwrap_err();
         assert!(
@@ -277,7 +305,7 @@ mod tests {
     #[test]
     fn empty_config_is_fine() {
         let cfg: ConfigFile = toml::from_str("").unwrap();
-        assert!(cfg.sync.packages.is_none());
+        assert!(cfg.filter.packages.is_none());
         assert!(cfg.filter.only_wheels.is_none());
         assert!(cfg.serve.bind_addr.is_none());
         assert!(cfg.private_prefix.is_none());

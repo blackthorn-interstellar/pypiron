@@ -34,20 +34,20 @@ On the sync host, put the destination, credential, package set, and filters in
 `pypiron.toml` — auto-discovered in the working directory.
 
 ```toml
+[filter]
+packages = ["requests>=2.20,<3", "numpy", "pandas"]
+only-wheels = true
+exclude-newer = "2026-01-01T00:00:00Z"   # reproducible, historically-correct cutoff
+
 [sync]
 to = "http://HOST:8080"
 admin-user = "admin"                     # password via PYPIRON_SYNC_ADMIN_PASS
-packages = ["requests>=2.20,<3", "numpy", "pandas"]
-
-[filter]
-only-wheels = true
-exclude-newer = "2026-01-01T00:00:00Z"   # reproducible, historically-correct cutoff
 ```
 
-Each `packages` entry is a name with optional PEP 440 specifiers, so you pin
-exactly the versions you want mirrored. The `[filter]` slice is shared with the
-proxy: `only-wheels` skips sdists; `exclude-newer` mirrors only files PyPI
-received before the cutoff.
+Each `[filter].packages` entry is a name with optional PEP 440 specifiers, so you
+pin exactly the versions you want mirrored. The whole `[filter]` slice — the
+allowlist included — is shared with the proxy: `only-wheels` skips sdists;
+`exclude-newer` mirrors only files PyPI received before the cutoff.
 
 ## 3. Run the sync
 

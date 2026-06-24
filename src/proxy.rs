@@ -21,12 +21,14 @@
 //! materialized index: already-cached packages keep installing.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use futures::StreamExt;
+use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::Client;
 use tracing::{info, warn};
 
@@ -92,15 +94,31 @@ struct CacheEntry {
 pub struct Proxy {
     upstream: String,
     filter: ResolvedFilter,
+    /// The package scope as a fast name → version-constraints lookup, derived
+    /// once from `filter.packages`. `None` means no scope is configured (serve
+    /// any non-private name — the open-proxy default). A present map is a
+    /// fail-closed allowlist: a name absent from it never falls through, and a
+    /// name's constraints gate which versions are served. A name may carry
+    /// several constraints (duplicate list entries); a version passes if any
+    /// allows it, matching `sync`'s union semantics.
+    scope: Option<HashMap<String, Vec<Option<VersionSpecifiers>>>>,
     client: Client,
     listings: Mutex<HashMap<String, CacheEntry>>,
 }
 
-/// May this package be served from upstream at all? Private names and the
-/// reserved prefix never fall through — that is the entire defense.
+/// May this package be served from upstream at all? Private names, the reserved
+/// prefix, and (when a scope is configured) names outside the allowlist never
+/// fall through — that is the entire defense.
 pub async fn eligible(state: &AppState, pkg: &str) -> Result<bool> {
     if let Some(prefix) = &state.private_prefix {
         if matches_prefix(pkg, prefix) {
+            return Ok(false);
+        }
+    }
+    // The package allowlist is fail-closed and pure (no I/O), so it gates before
+    // the origin read — an unapproved name never even touches storage.
+    if let Some(proxy) = &state.proxy {
+        if !proxy.name_in_scope(pkg) {
             return Ok(false);
         }
     }
@@ -110,15 +128,47 @@ pub async fn eligible(state: &AppState, pkg: &str) -> Result<bool> {
     }
 }
 
+/// Whether a file's inferred version satisfies a name's scope constraints. A
+/// bare entry (no specifiers) allows every version; otherwise the version must
+/// parse and match at least one specifier — a file whose version can't be
+/// parsed can't be proven to match, so it's dropped (the same conservative rule
+/// `sync` applies).
+fn version_allowed(constraints: &[Option<VersionSpecifiers>], filename: &str) -> bool {
+    if constraints.iter().any(Option::is_none) {
+        return true;
+    }
+    let Some(version) =
+        infer_version_from_filename(filename).and_then(|v| Version::from_str(&v).ok())
+    else {
+        return false;
+    };
+    constraints
+        .iter()
+        .flatten()
+        .any(|specifiers| specifiers.contains(&version))
+}
+
 impl Proxy {
     pub fn new(upstream: &str, filter: ResolvedFilter) -> Result<Self> {
         let upstream = upstream.trim_end_matches('/').to_string();
         if !upstream.starts_with("http://") && !upstream.starts_with("https://") {
             bail!("--proxy-upstream must be an http(s) URL, got '{upstream}'");
         }
+        // Derive the request-time allowlist index once. Empty scope → None, so
+        // name_in_scope() short-circuits to "allow all" (the open-proxy default).
+        let scope = (!filter.packages.is_empty()).then(|| {
+            let mut map: HashMap<String, Vec<Option<VersionSpecifiers>>> = HashMap::new();
+            for spec in &filter.packages {
+                map.entry(spec.name.clone())
+                    .or_default()
+                    .push(spec.specifiers.clone());
+            }
+            map
+        });
         Ok(Self {
             upstream,
             filter,
+            scope,
             client: Client::builder()
                 .user_agent(
                     "pypiron-proxy/0.1 (+https://github.com/blackthorn-interstellar/pypiron)",
@@ -133,6 +183,27 @@ impl Proxy {
                 .build()?,
             listings: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Is this (PEP 503-normalized) name allowed to fall through to upstream?
+    /// True when no scope is configured; otherwise true only if the name is on
+    /// the allowlist. The version axis is enforced separately, per file, in the
+    /// listing.
+    pub fn name_in_scope(&self, pkg: &str) -> bool {
+        self.scope.as_ref().is_none_or(|m| m.contains_key(pkg))
+    }
+
+    /// Does this file satisfy the name's version constraints? Allowed when no
+    /// scope is configured; otherwise the name's constraints gate the version.
+    /// A name in scope is reached here only after [`name_in_scope`], so a miss
+    /// in the map can't normally happen — treated fail-closed if it does.
+    fn version_in_scope(&self, pkg: &str, filename: &str) -> bool {
+        match self.scope.as_ref() {
+            None => true,
+            Some(map) => map
+                .get(pkg)
+                .is_some_and(|constraints| version_allowed(constraints, filename)),
+        }
     }
 
     pub fn upstream(&self) -> &str {
@@ -439,6 +510,10 @@ impl Proxy {
             // No digest, no service: every artifact we hand out is verifiable.
             .filter(|f| f.sha256().is_some())
             .filter(|f| matches_filters(f, &self.filter))
+            // The scope's version axis: a pinned/ranged allowlist entry serves
+            // only matching versions, exactly as `sync` mirrors only matching
+            // versions. No scope → kept.
+            .filter(|f| self.version_in_scope(pkg, &f.filename))
             .collect();
         let metas: Vec<FileMetadata> = files.iter().map(SimpleFile::as_file_metadata).collect();
         let render_metas: &[FileMetadata] = if status.status.blocks_downloads() {
@@ -580,5 +655,65 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
         assert!(err.to_string().contains("http(s)"));
+    }
+
+    fn spec(name: &str, specifiers: Option<&str>) -> crate::sync::PackageSpec {
+        crate::sync::PackageSpec {
+            name: name.to_string(),
+            specifiers: specifiers.map(|s| VersionSpecifiers::from_str(s).unwrap()),
+        }
+    }
+
+    #[test]
+    fn empty_scope_allows_every_name_and_version() {
+        let proxy = Proxy::new("https://pypi.org", ResolvedFilter::default()).unwrap();
+        assert!(proxy.name_in_scope("anything"));
+        assert!(proxy.version_in_scope("anything", "anything-1.0.0.tar.gz"));
+    }
+
+    #[test]
+    fn scope_gates_names_fail_closed() {
+        let filter = ResolvedFilter {
+            packages: vec![spec("requests", Some(">=2.20,<3")), spec("numpy", None)],
+            ..Default::default()
+        };
+        let proxy = Proxy::new("https://pypi.org", filter).unwrap();
+        assert!(proxy.name_in_scope("requests"));
+        assert!(proxy.name_in_scope("numpy"));
+        assert!(
+            !proxy.name_in_scope("flask"),
+            "unapproved name must be denied"
+        );
+    }
+
+    #[test]
+    fn scope_gates_versions_like_sync() {
+        let filter = ResolvedFilter {
+            packages: vec![spec("requests", Some(">=2.20,<3")), spec("numpy", None)],
+            ..Default::default()
+        };
+        let proxy = Proxy::new("https://pypi.org", filter).unwrap();
+        // Pinned name: only versions inside the range pass.
+        assert!(proxy.version_in_scope("requests", "requests-2.31.0-py3-none-any.whl"));
+        assert!(!proxy.version_in_scope("requests", "requests-2.10.0-py3-none-any.whl"));
+        assert!(!proxy.version_in_scope("requests", "requests-3.0.0-py3-none-any.whl"));
+        // Unparseable version under a constraint can't be proven to match → dropped.
+        assert!(!proxy.version_in_scope("requests", "requests-garbage.whl"));
+        // Bare (unpinned) name: every version passes, even an unparseable one.
+        assert!(proxy.version_in_scope("numpy", "numpy-1.26.0-cp311-cp311-linux_x86_64.whl"));
+        assert!(proxy.version_in_scope("numpy", "numpy-whatever.tar.gz"));
+    }
+
+    #[test]
+    fn duplicate_entries_union_their_ranges() {
+        // Two constrained entries for one name: a version matching either passes.
+        let filter = ResolvedFilter {
+            packages: vec![spec("foo", Some("==1.0")), spec("foo", Some("==3.0"))],
+            ..Default::default()
+        };
+        let proxy = Proxy::new("https://pypi.org", filter).unwrap();
+        assert!(proxy.version_in_scope("foo", "foo-1.0-py3-none-any.whl"));
+        assert!(proxy.version_in_scope("foo", "foo-3.0-py3-none-any.whl"));
+        assert!(!proxy.version_in_scope("foo", "foo-2.0-py3-none-any.whl"));
     }
 }

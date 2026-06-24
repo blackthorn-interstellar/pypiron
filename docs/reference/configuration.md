@@ -174,8 +174,6 @@ credential — nothing about the server's storage backend.
 | `--to URL`                    | `PYPIRON_SYNC_TO`                | *(required)*       | Destination pypiron base URL (or `[sync].to`)           |
 | `--from URL`                  | `PYPIRON_SYNC_FROM`              | `https://pypi.org` | Source PEP 691 index                                    |
 | `--admin-user` / `--admin-pass` | `PYPIRON_SYNC_ADMIN_USER` / `_PASS` | *(none)*    | Destination admin credential (mirroring is admin-only)  |
-| `--pkg SPEC`                  | —                                | *(none)*           | A package to mirror (repeatable; same syntax as a list line) |
-| `--packages-list PATH`        | `PYPIRON_PACKAGES_LIST`          | *(none)*           | File of packages, one per line                          |
 | `--private-prefix`            | `PYPIRON_PRIVATE_PREFIX`         | *(none)*           | Refuse to mirror names inside this namespace (or top-level `private-prefix`) |
 | `--concurrency N`             | `PYPIRON_SYNC_CONCURRENCY`       | `4`                | Parallel downloads/uploads within one package           |
 | `--package-concurrency N`     | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8`              | Packages synced in parallel                             |
@@ -184,9 +182,10 @@ credential — nothing about the server's storage backend.
 | `--dry-run`                   | —                                | `false`            | Print what would be mirrored, write nothing             |
 
 `--to` is mandatory (there is no direct-to-storage mode); without it (and no
-`[sync].to`) the run refuses to start. The package set comes from `--pkg`
-and/or `--packages-list`; when either is given on the CLI it fully replaces the
-config file's `[sync].packages`/`packages-list`.
+`[sync].to`) the run refuses to start. Which packages get mirrored is the
+filter's name axis — `--filter-package` / `--filter-packages-list` /
+`[filter].packages` (see [Filters](#filters)) — and `sync` requires a non-empty
+set (it needs an explicit work list). The same scope governs the proxy.
 
 ## Re-sync, reconcile, and conditional fetch
 
@@ -213,11 +212,32 @@ fetch.
 
 ## Filters
 
-Filters select the slice of PyPI you want. They are **shared**: the same
-`--filter-*` flags, `PYPIRON_FILTER_*` env vars, and `[filter]` table govern both
-`pypiron sync` (push mirror) and `serve --proxy-upstream` (on-demand proxy) — set
-the slice once and it applies to whichever you run. Filters gate only what is
-*added*; already-mirrored or already-cached files are never removed.
+Filters select the slice of PyPI you want — names *and* files. They are
+**shared**: the same `--filter-*` flags, `PYPIRON_FILTER_*` env vars, and
+`[filter]` table govern both `pypiron sync` (push mirror) and
+`serve --proxy-upstream` (on-demand proxy) — set the slice once and it applies to
+whichever you run. Filters gate only what is *added*; already-mirrored or
+already-cached files are never removed.
+
+The **name axis** (the approved-package list):
+
+- `--filter-package SPEC` (`PYPIRON_FILTER_PACKAGE`) — one package: a name with
+  optional PEP 440 specifiers (`requests`, `six==1.16.0`, `requests>=2.20,<3`).
+  Repeatable. Commas belong to the specifier, so pass multiple packages as
+  repeated flags, not a comma-joined list.
+- `--filter-packages-list FILE` (`PYPIRON_FILTER_PACKAGES_LIST`) — a file of
+  specs, one per line; blank lines and `#` comment lines are ignored.
+- `[filter].packages` (inline array) and `[filter].packages-list` (file path) are
+  the config-file forms.
+
+`sync` mirrors exactly the listed names (and, where a spec is version-pinned,
+only matching versions); it requires a non-empty list. The **proxy is
+fail-closed**: with a list set, only listed names fall through to upstream and
+everything else is `404`'d (a version-pinned name serves only matching versions,
+just as `sync` mirrors only those). With **no** list, the proxy keeps its default
+of serving any non-private name on demand.
+
+The **file axis** (which artifacts of a selected package to keep):
 
 - `--filter-only-wheels` / `--filter-only-sdists`
 - `--filter-python-tag py3,cp311` — python tag(s)
@@ -228,9 +248,16 @@ the slice once and it applies to whichever you run. Filters gate only what is
   (e.g. `3.10` drops cp36–cp39 and python-2 wheels). Version-agnostic wheels
   (`py3`, `py2.py3`), forward-compatible `abi3` wheels, and all sdists are kept.
 - `--filter-exclude-dev` — drop PEP 440 dev releases (any version with a `.devN` segment)
+- `--filter-exclude-prereleases` — drop PEP 440 pre-releases: alpha/beta/rc **and**
+  dev (keep stable releases only). The superset of `--filter-exclude-dev`
 - `--filter-exclude-windows` — drop Windows artifacts: `win*` wheels and legacy
   `.exe`/`.msi`/`.winXX` installers (a package whose name merely starts with
   "win", like `windrose`, is never matched)
+- `--filter-max-size <size>` — drop artifacts larger than `size` (e.g. `250MB`,
+  `1.5GiB`, `1048576`). Units are powers of 1024 (`KB` == `KiB`); a bare number is
+  bytes. A file with no size in the upstream listing is kept. Useful for trimming
+  multi-gigabyte CUDA/ML wheels off a disk- or S3-cost-bound mirror
+- `--filter-exclude-yanked` — drop files yanked upstream (PEP 592)
 - `--filter-exclude-newer <when>` — only files received upstream before the cutoff
 - `--filter-exclude-older <when>` — only files received upstream since the cutoff
 
@@ -259,17 +286,19 @@ directory. Precedence is **CLI/env > file > defaults**. Four parts:
 
 - top-level `private-prefix` — the reserved private namespace, shared by both
   commands.
-- `[filter]` — the slice of PyPI (shared by sync and the proxy; see above).
+- `[filter]` — the slice of PyPI, names and files (shared by sync and the proxy;
+  see above).
 - `[serve]` — the server process. Every `serve` flag *except secrets*:
   admin/uploader/read passwords and the Azure access key stay in CLI/env. Storage
   selection (`storage`, `s3-bucket`, …) lives here too.
 - `[sync]` — the push-mirror job: source/dest, the destination admin credential,
-  packages, concurrency.
+  concurrency.
 
 ```toml
 private-prefix = "acme"
 
 [filter]                                    # shared by sync and the serve proxy
+packages = ["requests>=2.20,<3", "six"]     # or packages-list = "packages.txt"
 only-wheels = true
 python-tag = ["cp311", "cp312"]
 exclude-newer = "2026-01-01T00:00:00Z"
@@ -282,19 +311,20 @@ proxy-upstream = "https://pypi.org"
 artifact-delivery = "auto"
 
 [sync]
-packages = ["requests>=2.20,<3", "six"]     # or packages-list = "packages.txt"
 to = "http://localhost:8080"
 admin-user = "admin"                        # password via PYPIRON_SYNC_ADMIN_PASS
 concurrency = 8
 ```
 
 A `packages-list` path in the file resolves relative to the config file, not the
-working directory. A CLI package source (`--pkg` and/or `--packages-list`)
-replaces the file's list entirely; other options layer per-key. A boolean set
+working directory. A CLI package source (`--filter-package` and/or
+`--filter-packages-list`) replaces the file's `[filter].packages`/`packages-list`
+entirely; other options layer per-key. A boolean set
 `true` in the file can be turned on but not off by the absence of a flag (clap
-cannot express an explicit `false`). Filter keys (and `private-prefix`) that used
-to live under `[sync]` now belong in `[filter]` (and at the top level); a stale
-config fails to start with a pointer to the new home.
+cannot express an explicit `false`). The package list (`packages`,
+`packages-list`), the artifact-filter keys, and `private-prefix` all used to live
+under `[sync]` and now belong in `[filter]` (and at the top level); a stale config
+fails to start with a pointer to the new home.
 
 ## Artifact delivery
 

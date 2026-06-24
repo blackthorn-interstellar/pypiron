@@ -62,7 +62,7 @@ def _run_sync(pypiron_bin, source, dest, pkg_list, *extra):
     return sync_to(
         pypiron_bin,
         dest,
-        "--packages-list",
+        "--filter-packages-list",
         str(pkg_list),
         *extra,
         source=source["base_url"],

@@ -322,14 +322,16 @@ struct ServeArgs {
     /// simple index (e.g. https://pypi.org): package pages are answered from
     /// upstream metadata and artifacts are downloaded, verified, and cached
     /// in storage as `mirror`-origin packages on first request. Names claimed
-    /// `private` (or inside --private-prefix) never fall through. Off by
-    /// default.
+    /// `private` (or inside --private-prefix) never fall through. When a package
+    /// scope is set (`--filter-package`/`[filter].packages`), only those names
+    /// fall through and the rest are 404'd (fail-closed). Off by default.
     #[arg(long, env = "PYPIRON_PROXY_UPSTREAM")]
     proxy_upstream: Option<String>,
 
-    /// The slice of PyPI the proxy serves and caches. The same `--filter-*`
-    /// surface as `sync`, set once and shared: a `[filter]` table in
-    /// pypiron.toml governs both.
+    /// The slice of PyPI the proxy serves and caches — names included. The same
+    /// `--filter-*` surface as `sync`, set once and shared: a `[filter]` table
+    /// in pypiron.toml governs both. With a package scope, the proxy serves only
+    /// those names (and matching versions) from upstream.
     #[command(flatten)]
     filter: sync::FilterArgs,
 }

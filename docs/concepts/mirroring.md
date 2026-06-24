@@ -35,11 +35,18 @@ served from local storage — **whether upstream is up or down**.
   env vars, and `[filter]` table that `sync` uses (`--filter-only-wheels`,
   `--filter-exclude-newer`, the tag filters). Set the slice once; it applies to
   whichever you run. See [Configuration](../reference/configuration.md#filters).
+- An **approved-package list** (`--filter-package` / `[filter].packages`) makes
+  the proxy **fail-closed**: with a list set, only those names fall through to
+  upstream and every other name is `404`'d, and a version-pinned entry serves
+  only matching versions. With no list, the proxy serves any non-private name on
+  demand (the default). This is the same list `sync` mirrors — set it once, in
+  `[filter]`, and the push and pull paths agree.
 
 !!! note
-    A name reserved by `--private-prefix`, or already claimed `private` by an
-    upload, never falls through to upstream. That is the dependency-confusion
-    defense — see [Authentication](authentication.md) and the
+    A name reserved by `--private-prefix`, already claimed `private` by an
+    upload, or outside a configured approved list never falls through to
+    upstream. That is the dependency-confusion defense — see
+    [Authentication](authentication.md) and the
     [Private + public guide](../guides/private-and-public.md).
 
 ## Bulk sync
@@ -54,22 +61,22 @@ needs nothing but the destination URL and an admin credential:
 pypiron sync \
   --to http://HOST:8080 \
   --admin-user admin --admin-pass "$ADMIN" \
-  --pkg "requests>=2.20,<3" --pkg numpy
+  --filter-package "requests>=2.20,<3" --filter-package numpy
 ```
 
 Put the allowlist and filters in `pypiron.toml` instead (auto-discovered in the
-working directory). The package set and destination are sync-specific (`[sync]`);
-the filter is shared with the proxy (`[filter]`):
+working directory). The allowlist and filters live in `[filter]` — shared with
+the proxy; only the destination is sync-specific (`[sync]`):
 
 ```toml
+[filter]
+packages = ["requests>=2.20,<3", "numpy", "pandas"]
+only-wheels = true
+exclude-newer = "2026-01-01T00:00:00Z"
+
 [sync]
 to = "http://HOST:8080"
 admin-user = "admin"                     # password via PYPIRON_SYNC_ADMIN_PASS
-packages = ["requests>=2.20,<3", "numpy", "pandas"]
-
-[filter]
-only-wheels = true
-exclude-newer = "2026-01-01T00:00:00Z"
 ```
 
 ```bash
@@ -127,7 +134,7 @@ pypiron sync --full   # ignore the cursor; re-fetch and fully reconcile everythi
 | ------------------- | ------------------------------------ | ------------------------------------- |
 | When files arrive   | Lazily, on first request             | Ahead of time, when you run `sync`    |
 | Who initiates       | The serving node, per cache miss     | A separate client (any host with egress) |
-| Package set         | Anything not blocked by the `[filter]` slice | An explicit allowlist            |
+| Package set         | The `[filter]` slice — any non-private name, or only an approved list if you set one | An explicit allowlist (required) |
 | Egress from server  | Required (until cached)              | None — the syncing host needs it      |
 | Offline serving     | Cached files only                    | Everything you synced                 |
 | Reconcile yanks/removals | Listings refresh every 60s      | On re-sync (`--full` for a sweep)     |

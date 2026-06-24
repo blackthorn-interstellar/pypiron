@@ -138,6 +138,39 @@ def test_proxy_filters_gate_what_is_served(proxy_pair_wheels_only, tmp_path):
     assert code == 200
 
 
+def test_proxy_allowlist_gates_names_and_versions(proxy_pair_scoped, tmp_path):
+    """The package scope (`--filter-package`/`[filter].packages`) is fail-closed
+    on the proxy: only approved names fall through, and a version-pinned entry
+    serves only matching versions — the pull twin of what `sync` mirrors."""
+    upstream, proxy = proxy_pair_scoped["upstream"], proxy_pair_scoped["proxy"]
+    allowed = make_wheel("allowed", "1.0", tmp_path)
+    pinned_old = make_wheel("pinned", "1.0", tmp_path)
+    pinned_new = make_wheel("pinned", "2.0", tmp_path)
+    blocked = make_wheel("blocked", "1.0", tmp_path)
+    _upload(upstream, allowed, "allowed")
+    _upload(upstream, pinned_old, "pinned")
+    _upload(upstream, pinned_new, "pinned")
+    _upload(upstream, blocked, "blocked")
+
+    # An approved name (no version pin) falls through and serves.
+    data = get_index_json(proxy["simple"], "allowed")
+    assert [f["filename"] for f in data["files"]] == [allowed.name]
+    assert http_get(f"{proxy['base_url']}/files/allowed/{allowed.name}")[0] == 200
+
+    # A version-scoped name serves only matching versions; the rest never cache.
+    data = get_index_json(proxy["simple"], "pinned")
+    filenames = [f["filename"] for f in data["files"]]
+    assert pinned_new.name in filenames
+    assert pinned_old.name not in filenames, "out-of-range version must not fall through"
+    assert http_get(f"{proxy['base_url']}/files/pinned/{pinned_new.name}")[0] == 200
+    assert http_get(f"{proxy['base_url']}/files/pinned/{pinned_old.name}")[0] == 404
+
+    # An unapproved name is 404'd — fail-closed, even though upstream has it.
+    code, _, _ = http_get(f"{proxy['simple']}blocked/index.json", headers={"Accept": ACCEPT_PEP691})
+    assert code == 404
+    assert http_get(f"{proxy['base_url']}/files/blocked/{blocked.name}")[0] == 404
+
+
 def test_unknown_package_404s_through_proxy(proxy_pair):
     proxy = proxy_pair["proxy"]
     code, _, _ = http_get(

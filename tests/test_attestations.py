@@ -187,7 +187,7 @@ def test_sync_relays_provenance_from_pypi(disk_server, pypiron_bin):
     rc, out, err = sync_to(
         pypiron_bin,
         disk_server,
-        "--pkg",
+        "--filter-package",
         f"{PYPI_ATTESTED_PKG}=={PYPI_ATTESTED_VERSION}",
         "--filter-only-wheels",
     )

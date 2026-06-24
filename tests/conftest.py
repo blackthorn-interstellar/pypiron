@@ -506,6 +506,17 @@ def proxy_pair_prefixed(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
 
 
 @pytest.fixture()
+def proxy_pair_scoped(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Proxy restricted to an approved-package allowlist: `allowed` (any
+    version) and `pinned>=2.0` (version-scoped). Every other name is 404'd."""
+    yield from _start_proxy_pair(
+        tmp_path_factory,
+        pypiron_bin,
+        proxy_extra_args=["--filter-package", "allowed", "--filter-package", "pinned>=2.0"],
+    )
+
+
+@pytest.fixture()
 def disk_server_uploader_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Disk server with only an uploader credential (no admin) — mirror,
     delete, and yank are disabled."""

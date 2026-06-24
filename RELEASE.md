@@ -17,6 +17,14 @@ That's it. CI runs fmt/clippy/tests, builds wheels for all platforms plus the
 sdist, generates build-provenance attestations, and publishes to PyPI via
 trusted publishing. Nothing is published if the tests fail.
 
+The same per-target builds double as standalone binaries: CI pulls the compiled
+executable out of each wheel (no second compile), and the `release-binaries` job
+attaches them — `pypiron-<triple>.tar.gz`/`.zip` plus a `SHA256SUMS` manifest and
+a provenance attestation — to the tag's **GitHub Release**. So one tag yields
+three channels: PyPI wheels, GitHub Release binaries, and the GHCR image below.
+A `workflow_dispatch` run builds the wheels and binary archives (as artifacts)
+without creating a Release, for dry-running the matrix.
+
 In parallel, `docker.yml` builds the multi-arch (amd64/arm64) container image
 and pushes it to GHCR — `ghcr.io/blackthorn-interstellar/pypiron:X.Y.Z`, `:X.Y`, and
 `:latest` — with its own provenance attestation. Pushes to `master` publish a

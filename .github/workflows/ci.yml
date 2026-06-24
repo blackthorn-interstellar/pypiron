@@ -122,43 +122,6 @@ jobs:
         # https://github.com/rust-fuzz/cargo-fuzz/issues/398
         run: cargo fuzz build --target x86_64-unknown-linux-gnu
 
-  build-release:
-    # Build release binaries on pushes to master/main (not on PRs)
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
-    name: build release (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    needs: [fmt, clippy, test]
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ ubuntu-latest, macos-latest, windows-latest ]
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Build (release)
-        run: cargo build --release --locked
-
-      # Upload the built binary as an artifact per-OS.
-      - name: Upload artifact (Linux/macOS)
-        if: runner.os != 'Windows'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: pypiron-${{ runner.os }}-${{ github.sha }}
-          path: target/release/pypiron
-          retention-days: 14
-
-      - name: Upload artifact (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: pypiron-${{ runner.os }}-${{ github.sha }}
-          path: target\release\pypiron.exe
-          retention-days: 14
-
   # Wheel builds run only for release tags (and manual dispatch for testing the
   # pipeline). The version is stamped from the tag; the repo itself stays at 0.0.0.
   # One job, one matrix over every (kind, runner, target). maturin-action treats an
@@ -173,24 +136,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { kind: linux,     runner: ubuntu-22.04,   target: x86_64 }
-          - { kind: linux,     runner: ubuntu-22.04,   target: x86 }
-          - { kind: linux,     runner: ubuntu-22.04,   target: aarch64 }
-          - { kind: linux,     runner: ubuntu-22.04,   target: armv7 }
-          - { kind: linux,     runner: ubuntu-22.04,   target: s390x }
-          - { kind: linux,     runner: ubuntu-22.04,   target: ppc64le }
-          - { kind: linux,     runner: ubuntu-22.04,   target: riscv64 }
-          - { kind: musllinux, runner: ubuntu-22.04,   target: x86_64,  manylinux: musllinux_1_2 }
-          - { kind: musllinux, runner: ubuntu-22.04,   target: x86,     manylinux: musllinux_1_2 }
-          - { kind: musllinux, runner: ubuntu-22.04,   target: aarch64, manylinux: musllinux_1_2 }
-          - { kind: musllinux, runner: ubuntu-22.04,   target: armv7,   manylinux: musllinux_1_2 }
-          - { kind: windows,   runner: windows-latest, target: x64 }
-          - { kind: windows,   runner: windows-latest, target: x86 }
-          - { kind: windows,   runner: windows-latest, target: aarch64 }
+          # `triple` is the Rust target the wheel embeds; it names the standalone
+          # binary archive pulled from that same wheel (see "Archive ..." below).
+          - { kind: linux,     runner: ubuntu-22.04,   target: x86_64,  triple: x86_64-unknown-linux-gnu }
+          - { kind: linux,     runner: ubuntu-22.04,   target: x86,     triple: i686-unknown-linux-gnu }
+          - { kind: linux,     runner: ubuntu-22.04,   target: aarch64, triple: aarch64-unknown-linux-gnu }
+          - { kind: linux,     runner: ubuntu-22.04,   target: armv7,   triple: armv7-unknown-linux-gnueabihf }
+          - { kind: linux,     runner: ubuntu-22.04,   target: s390x,   triple: s390x-unknown-linux-gnu }
+          - { kind: linux,     runner: ubuntu-22.04,   target: ppc64le, triple: powerpc64le-unknown-linux-gnu }
+          - { kind: linux,     runner: ubuntu-22.04,   target: riscv64, triple: riscv64gc-unknown-linux-gnu }
+          - { kind: musllinux, runner: ubuntu-22.04,   target: x86_64,  triple: x86_64-unknown-linux-musl,  manylinux: musllinux_1_2 }
+          - { kind: musllinux, runner: ubuntu-22.04,   target: x86,     triple: i686-unknown-linux-musl,    manylinux: musllinux_1_2 }
+          - { kind: musllinux, runner: ubuntu-22.04,   target: aarch64, triple: aarch64-unknown-linux-musl, manylinux: musllinux_1_2 }
+          - { kind: musllinux, runner: ubuntu-22.04,   target: armv7,   triple: armv7-unknown-linux-musleabihf, manylinux: musllinux_1_2 }
+          - { kind: windows,   runner: windows-latest, target: x64,     triple: x86_64-pc-windows-msvc }
+          - { kind: windows,   runner: windows-latest, target: x86,     triple: i686-pc-windows-msvc }
+          - { kind: windows,   runner: windows-latest, target: aarch64, triple: aarch64-pc-windows-msvc }
           # GitHub retired the macos-13 (Intel) image on 2025-12-04; macos-15-intel
           # is its standard x86_64 replacement (last Intel image, supported to ~2027-08).
-          - { kind: macos,     runner: macos-15-intel, target: x86_64 }
-          - { kind: macos,     runner: macos-14,       target: aarch64 }
+          - { kind: macos,     runner: macos-15-intel, target: x86_64,  triple: x86_64-apple-darwin }
+          - { kind: macos,     runner: macos-14,       target: aarch64, triple: aarch64-apple-darwin }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -219,6 +184,19 @@ jobs:
         with:
           name: wheels-${{ matrix.kind }}-${{ matrix.target }}
           path: dist
+      # Re-wrap the compiled binary already inside the wheel as a standalone
+      # archive — the GitHub-Release download for this target. No second compile.
+      - name: Archive standalone binary
+        shell: bash
+        run: |
+          command -v python3 >/dev/null 2>&1 && PY=python3 || PY=python
+          "$PY" scripts/archive_binary.py --dist dist --triple "${{ matrix.triple }}" --out binaries
+      - name: Upload standalone binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binaries-${{ matrix.kind }}-${{ matrix.target }}
+          path: binaries
+          if-no-files-found: error
 
   sdist:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
@@ -277,3 +255,41 @@ jobs:
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           skip-existing: true
+
+  # Standalone binaries → GitHub Release. The per-target binaries were already
+  # pulled from the wheels (the `wheels` job), so this just collects them, writes
+  # a checksum manifest, attests them, and attaches them to the tag's Release.
+  # PyPI wheels stay separate (the `release` job above); the GHCR image is its
+  # own workflow (docker.yml).
+  release-binaries:
+    name: Release binaries (GitHub)
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [fmt, clippy, test, wheels]
+    permissions:
+      contents: write       # create the Release and upload assets
+      id-token: write       # provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: binaries
+      - name: Generate checksums
+        working-directory: binaries
+        run: sha256sum pypiron-* > SHA256SUMS
+      # Build-provenance attestation is a public-repo-only feature; skip it while
+      # the repo is private (it reactivates automatically once the repo is public).
+      - name: Generate artifact attestation
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: 'binaries/pypiron-*'
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes binaries/* \
+          || gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber binaries/*

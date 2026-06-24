@@ -262,6 +262,17 @@ def find_ceiling(
             best_installs = max(best_installs, s["installs_per_sec"])
             c_lo = mid
 
+    # Walk DOWN if the best sample is the lowest concurrency tried: a server that
+    # saturates below c_start (e.g. a single GIL-bound worker) peaks at tiny
+    # concurrency, so the upward bracket started past its knee. Halve while
+    # lowering load still raises throughput, until it doesn't or we hit c=1.
+    while len(samples) < max_samples:
+        lo = min(samples)
+        if lo <= 1 or max(samples, key=lambda k: samples[k]["installs_per_sec"]) != lo:
+            break
+        if at(lo // 2)["installs_per_sec"] <= samples[lo]["installs_per_sec"]:
+            break
+
     return [samples[c] for c in sorted(samples)], breach
 
 

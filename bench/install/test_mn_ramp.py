@@ -60,6 +60,17 @@ def rising(slope: float, cpu_per_c: float):
     return measure
 
 
+def saturate_low(peak_c: int, peak_val: float, cpu_sat: float):
+    """Single-worker-like (proxpi): peaks at a TINY concurrency, then over-
+    concurrency thrashes throughput down (~1/c); CPU pegged from the first step."""
+
+    def measure(c: int) -> dict:
+        inst = peak_val * (c / peak_c if c <= peak_c else peak_c / c)
+        return mk(c, inst, cpu_sat, mbs=inst)
+
+    return measure
+
+
 def test_cliff_pins_knee_above_the_coarse_step_and_reports_server_bound():
     # Knee at c=10000: coarse doubling lands 8192 (healthy) then 16384 (collapse).
     # The 65k->98k gap that motivated this: the refine MUST sample between them and
@@ -118,3 +129,15 @@ def test_is_collapse_signals():
         mn_ramp.is_collapse(mk(1, 50, 50, mbs=100), 100, 100) == "collapse"
     )  # installs retrograde
     assert mn_ramp.is_collapse(mk(1, 100, 50, mbs=100), 100, 100) is None  # healthy
+
+
+def test_walks_down_when_c_start_overshoots_the_knee():
+    # Knee at c=2, but c_start=16 starts well past it (the proxpi case). The
+    # downward walk must recover the real peak, not the saturated declining tail.
+    measure = saturate_low(peak_c=2, peak_val=30, cpu_sat=180)
+    ramp, _ = mn_ramp.find_ceiling(measure, c_start=16, c_max=4096, cpu_break=100)
+    peak, bound, _ = mn_ramp.summarize(ramp, cpu_break=100)
+
+    assert peak["per_node_c"] <= 4  # found the low knee, not the c>=16 tail
+    assert peak["installs_per_sec"] > 25  # ~30 at the knee, not ~4 at c=16
+    assert bound == "server-bound"

@@ -175,25 +175,62 @@ cmd_deploy() {
   echo "== deploy complete"
 }
 
-cmd_serve() {  # serve <server>  (pypiron only for now)
+UV_IMG="ghcr.io/astral-sh/uv:0.9.30-python3.11-bookworm-slim"
+
+cmd_serve() {  # serve <server>  -- pypiron | pypiserver | proxpi
   load_env
   local server="${1:-pypiron}"
-  [[ "$server" == pypiron ]] || { echo "rig2 serve currently supports only pypiron (Track 2)" >&2; exit 2; }
-  echo "== start pypiron Track 2 (S3 + presigned redirect) on the server"
-  # --network host, not -p 8080:8080: a flamegraph showed Docker's bridge/NAT +
-  # conntrack cost ~24% of throughput on a small box (and a single-box deployment
-  # wouldn't bridge-NAT anyway). Host networking measures the server, not docker.
-  # The runtime image's ENTRYPOINT is already `pypiron`, so the args start at the
-  # subcommand (a leading `pypiron` here would exec `pypiron pypiron serve`).
-  ssh_to "$RIG2_SERVER_IP" "sudo docker rm -f pypiron 2>/dev/null; sudo docker run -d --name pypiron --network host \
-    -e PYPIRON_BIND_ADDR=0.0.0.0:8080 -e PYPIRON_S3_BUCKET=${RIG_BUCKET} -e AWS_REGION=${RIG_REGION} \
-    pypiron:bench-${RIG2_SERVER_ARCH} serve --storage=s3 --artifact-delivery=redirect \
-    --uploader-user=admin --uploader-pass=secret --admin-user=admin --admin-pass=secret"
-  echo "== seed corpus -> pypiron -> S3 (upload from the server)"
-  ssh_to "$RIG2_SERVER_IP" "cd pypiron/bench/install && sudo docker run --rm --network host -v \$(pwd)/../..:/repo \
-    -w /repo/bench/install ghcr.io/astral-sh/uv:0.9.30-python3.11-bookworm-slim \
-    python3 seed.py --server pypiron --base-url http://localhost:8080 --tier ${TIER} --arch ${ARCH}"
-  echo "== served + seeded"
+  # All servers run --network host, not -p 8080:8080: a flamegraph showed Docker's
+  # bridge/NAT + conntrack cost ~24% of throughput on a small box (and a single-box
+  # deployment wouldn't bridge-NAT). Host networking measures the server, not docker
+  # — and every server gets the same treatment, which is the fairness requirement.
+  local wheels="/home/ec2-user/pypiron/bench/install/wheelhouse/${ARCH}/${TIER}"
+  case "$server" in
+    pypiron)
+      echo "== start pypiron Track 2 (S3 + presigned redirect) on the server"
+      # The runtime image's ENTRYPOINT is already `pypiron`, so args start at the
+      # subcommand (a leading `pypiron` here would exec `pypiron pypiron serve`).
+      ssh_to "$RIG2_SERVER_IP" "sudo docker rm -f pypiron 2>/dev/null; sudo docker run -d --name pypiron --network host \
+        -e PYPIRON_BIND_ADDR=0.0.0.0:8080 -e PYPIRON_S3_BUCKET=${RIG_BUCKET} -e AWS_REGION=${RIG_REGION} \
+        pypiron:bench-${RIG2_SERVER_ARCH} serve --storage=s3 --artifact-delivery=redirect \
+        --uploader-user=admin --uploader-pass=secret --admin-user=admin --admin-pass=secret"
+      echo "== seed corpus -> pypiron -> S3 (upload from the server)"
+      ssh_to "$RIG2_SERVER_IP" "cd pypiron/bench/install && sudo docker run --rm --network host -v \$(pwd)/../..:/repo \
+        -w /repo/bench/install ${UV_IMG} \
+        python3 seed.py --server pypiron --base-url http://localhost:8080 --tier ${TIER} --arch ${ARCH}" ;;
+    pypiserver)
+      # Private host: gunicorn x4 + cached-dir (in-memory index). pypiserver's
+      # entrypoint chowns /data/packages to its own uid 9898, so a read-only mount
+      # of the shared wheelhouse crashes it ("Read-only file system"). Copy-seed
+      # into a fresh writable dir instead — that IS the "copy" seed class — and
+      # mount it read-write. --disable-fallback so a miss fails loudly, not a 301.
+      echo "== start pypiserver (gunicorn x4, cached-dir) + copy-seed wheelhouse"
+      ssh_to "$RIG2_SERVER_IP" "rm -rf /home/ec2-user/pypiserver-data && cp -r ${wheels} /home/ec2-user/pypiserver-data && chmod -R a+rwX /home/ec2-user/pypiserver-data && \
+        sudo docker rm -f pypiserver 2>/dev/null; sudo docker run -d --name pypiserver --network host \
+        -e GUNICORN_CMD_ARGS=--workers=4 -v /home/ec2-user/pypiserver-data:/data/packages \
+        pypiserver/pypiserver:v2.4.1 run -p 8080 --server gunicorn --backend cached-dir \
+        --disable-fallback -a . -P . /data/packages"
+      echo "-- wait pypiserver ready (cached-dir indexes 391 wheels)"
+      ssh_to "$RIG2_SERVER_IP" 'for _ in $(seq 1 60); do curl -fsS http://localhost:8080/simple/ >/dev/null 2>&1 && break; sleep 2; done' ;;
+    proxpi)
+      # Pure pull-through cache, single worker (its in-memory index is per-process).
+      # Warm-seed: install the whole corpus once through proxpi WITH egress (the rig
+      # has internet) so its cache fills; the measured run then serves from cache.
+      echo "== start proxpi (1 worker, 50 GB cache) + warm-seed through it (egress on)"
+      ssh_to "$RIG2_SERVER_IP" "sudo docker rm -f proxpi 2>/dev/null; sudo docker run -d --name proxpi --network host \
+        -e PROXPI_CACHE_DIR=/var/cache/proxpi -e PROXPI_CACHE_SIZE=53687091200 \
+        -e PROXPI_INDEX_TTL=86400 -e PROXPI_DOWNLOAD_TIMEOUT=60 -v proxpi-cache:/var/cache/proxpi \
+        epicwink/proxpi:latest --bind 0.0.0.0:5000 --workers 1 --threads 16 --no-control-socket"
+      echo "-- wait proxpi ready, then warm"
+      ssh_to "$RIG2_SERVER_IP" 'for _ in $(seq 1 30); do curl -fsS http://localhost:5000/index/ >/dev/null 2>&1 && break; sleep 2; done'
+      ssh_to "$RIG2_SERVER_IP" "cd pypiron/bench/install && sudo docker run --rm --network host -v \$(pwd)/../..:/repo \
+        -w /repo/bench/install ${UV_IMG} \
+        python3 drive.py --mode warm --index-url http://localhost:5000/index/ --host localhost:5000 \
+        --tier ${TIER} --arch ${ARCH}" ;;
+    *)
+      echo "rig2 serve supports: pypiron | pypiserver | proxpi (got '$server')" >&2; exit 2 ;;
+  esac
+  echo "== served + seeded ($server)"
 }
 
 cmd_ramp() {  # ramp <server>

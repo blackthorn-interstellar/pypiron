@@ -27,7 +27,7 @@
 # (rig2.sh's, via env):
 #   RIG2_SERVER_TYPE  (def r7i.large)   the box customers run pypiron on
 #   RIG2_LOADGEN_TYPE (def c7i.8xlarge), RIG2_LOADGENS (def 4)  the ceiling fleet
-#   RIG2_LADDER       per-node oha concurrency ladder (def below)
+#   RIG2_LADDER       optional fixed per-node ladder; unset => auto-search the ceiling
 # A bigger/faster server needs a bigger fleet to saturate — watch for the
 # rig-limited warning and raise RIG2_LOADGENS / RIG2_LOADGEN_TYPE if it fires.
 #
@@ -45,7 +45,7 @@ BASE_IMG="gcr.io/distroless/cc-debian13:nonroot"
 IMG_TAG="pypiron:bench-${ARCH}"
 IMG_TGZ="/tmp/pypiron-${ARCH}.tgz"               # rig2.sh deploy loads this
 TIER="${RIG_TIER:-lite}"
-LADDER="${RIG2_LADDER:-2048,4096,8192,12288,16384}"   # §15 ceiling ladder (agg up to 64k)
+LADDER="${RIG2_LADDER:-}"   # empty => mn_ramp AUTO-SEARCHES the ceiling; set RIG2_LADDER for a fixed ladder
 
 # ---- args: [REF] [--up|--down] ------------------------------------------------
 REF=""; FORCE_UP=0; TEARDOWN=0
@@ -130,9 +130,15 @@ CORES="$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$RI
   "ec2-user@${RIG2_SERVER_IP}" nproc 2>/dev/null | tr -d '[:space:]')"
 CORES="${CORES:-1}"
 CPU_BREAK="$(( CORES * 95 ))"
-echo "== install-mix ramp (ladder ${LADDER}, cpu-break ${CPU_BREAK}% of ${CORES} cores)"
-python3 "${HERE}/mn_ramp.py" --tier "$TIER" --ladder "$LADDER" --cpu-break "$CPU_BREAK" \
-  --container pypiron --output "results/cmp-pypiron.json"
+RAMP_ARGS=(--tier "$TIER" --cpu-break "$CPU_BREAK" --container pypiron \
+  --output "results/cmp-pypiron.json")
+if [[ -n "$LADDER" ]]; then
+  RAMP_ARGS+=(--ladder "$LADDER")
+  echo "== install-mix ramp (fixed ladder ${LADDER}, cpu-break ${CPU_BREAK}% of ${CORES} cores)"
+else
+  echo "== install-mix ramp (auto-search the ceiling, cpu-break ${CPU_BREAK}% of ${CORES} cores)"
+fi
+python3 "${HERE}/mn_ramp.py" "${RAMP_ARGS[@]}"
 
 # Stamp the result, and VERIFY it is a real ceiling: if the server never neared
 # saturation (peak CPU < 85% of its cores) the loadgen fleet was the bottleneck,

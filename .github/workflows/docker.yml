@@ -1,16 +1,19 @@
 name: Docker
 
-# Publishes multi-arch images to GHCR:
+# Publishes a multi-arch image to GHCR:
 #   ghcr.io/<owner>/pypiron:<branch>   on pushes to master/main
 #   ghcr.io/<owner>/pypiron:X.Y.Z + :X.Y + :latest   on vX.Y.Z tags
 #   plus a :sha-<short> tag on every push.
-# Pull requests build (both arches) but never push, so the Dockerfile stays
-# green without leaking images.
+# Pull requests build (no push), so the pipeline stays green without leaking images.
 #
-# Multi-arch is built one arch per native runner (amd64 + arm64), then stitched
-# into a single manifest list with `imagetools create` — no QEMU, which would
-# crawl for a from-scratch Rust release build. This is Docker's documented
-# split-runner pattern: https://docs.docker.com/build/ci/github-actions/multi-platform/
+# How the arches are built: we CROSS-COMPILE each target on an ordinary amd64
+# runner with cargo-zigbuild (no QEMU, no per-arch gcc), then assemble a
+# RUN-free image (just `COPY` the binary into a minimal base — see Dockerfile).
+# Because the final image stage runs no target-arch code, `buildx --platform
+# linux/<arch>` builds it without emulation. Releases (tags) and manual dry-runs
+# cover the full arch set; ordinary pushes/PRs build only amd64+arm64 to stay fast.
+# Per-arch images are pushed by digest, then `imagetools create` stitches them
+# into one manifest list (the merge job).
 
 on:
   push:
@@ -29,20 +32,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The arch set is data: the full 8 for releases (tags) and manual dry-runs;
+  # just amd64+arm64 for ordinary pushes/PRs so routine CI stays fast. Each entry
+  # carries the Docker platform, the Rust target to cross-compile, and the base
+  # image for that arch (distroless/cc has glibc + certs + a nonroot user and
+  # covers six arches; scratch carries the two arches distroless has no image for,
+  # which therefore ship a fully static musl binary).
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          cc='gcr.io/distroless/cc-debian13:nonroot'
+          full='[{"id":"amd64","platform":"linux/amd64","triple":"x86_64-unknown-linux-gnu","base":"'$cc'"},{"id":"arm64","platform":"linux/arm64","triple":"aarch64-unknown-linux-gnu","base":"'$cc'"},{"id":"armv7","platform":"linux/arm/v7","triple":"armv7-unknown-linux-gnueabihf","base":"'$cc'"},{"id":"ppc64le","platform":"linux/ppc64le","triple":"powerpc64le-unknown-linux-gnu","base":"'$cc'"},{"id":"s390x","platform":"linux/s390x","triple":"s390x-unknown-linux-gnu","base":"'$cc'"},{"id":"riscv64","platform":"linux/riscv64","triple":"riscv64gc-unknown-linux-gnu","base":"'$cc'"},{"id":"386","platform":"linux/386","triple":"i686-unknown-linux-musl","base":"scratch"},{"id":"armv6","platform":"linux/arm/v6","triple":"arm-unknown-linux-musleabihf","base":"scratch"}]'
+          subset='[{"id":"amd64","platform":"linux/amd64","triple":"x86_64-unknown-linux-gnu","base":"'$cc'"},{"id":"arm64","platform":"linux/arm64","triple":"aarch64-unknown-linux-gnu","base":"'$cc'"}]'
+          if [[ "$GITHUB_REF" == refs/tags/* || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            echo "matrix=$full" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix=$subset" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
-    name: build (${{ matrix.platform.arch }})
-    runs-on: ${{ matrix.platform.runner }}
+    name: build (${{ matrix.id }})
+    needs: setup
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
+        include: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -54,10 +77,37 @@ jobs:
         shell: bash
         run: ./.github/stamp-version.sh "$GITHUB_REF_NAME"
 
-      # `.git` is excluded from the docker context, so hand build.rs the commit.
+      # `.git` isn't in the docker context, but build.rs reads this env directly.
       - name: Short commit hash
         shell: bash
         run: echo "PYPIRON_GIT_HASH=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: docker-${{ matrix.id }}
+      - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+        with:
+          tool: cargo-zigbuild
+
+      # zig is the C cross-compiler cargo-zigbuild drives (ring builds a little C);
+      # the ziglang pip package ships it prebuilt for every host.
+      - name: Install zig
+        run: pipx install ziglang || python3 -m pip install --user ziglang
+
+      - name: Cross-compile ${{ matrix.triple }}
+        run: cargo zigbuild --release --locked --target ${{ matrix.triple }}
+
+      # The COPY-only Dockerfile expects the binary, a CA bundle, and an empty
+      # data dir at the build-context root. /etc/ssl/... is the runner's bundle.
+      - name: Assemble build context
+        run: |
+          mkdir -p ctx/data
+          cp "target/${{ matrix.triple }}/release/pypiron" ctx/pypiron
+          cp /etc/ssl/certs/ca-certificates.crt ctx/ca-certificates.crt
+          cp Dockerfile ctx/Dockerfile
 
       - name: Docker metadata (labels)
         id: meta
@@ -68,7 +118,7 @@ jobs:
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to ${{ env.REGISTRY }}
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -79,38 +129,35 @@ jobs:
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
-          context: .
+          context: ctx
           build-args: |
-            PYPIRON_GIT_HASH=${{ env.PYPIRON_GIT_HASH }}
-          platforms: linux/${{ matrix.platform.arch }}
+            BASE=${{ matrix.base }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=docker-${{ matrix.platform.arch }}
-          cache-to: type=gha,scope=docker-${{ matrix.platform.arch }},mode=max
-          # On PRs build only (push=false); the merge job is skipped there.
-          # Provenance off so each arch is a clean single manifest — the merge
-          # job re-attests the final manifest list.
+          # Provenance off per-arch; the merge job re-attests the final manifest.
           provenance: false
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          # Push by digest on real pushes/tags; PRs and manual dry-runs build only.
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch' }}
 
       - name: Export digest
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch'
         run: |
           mkdir -p "${{ runner.temp }}/digests"
           digest="${{ steps.build.outputs.digest }}"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload digest
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: digest-${{ matrix.platform.arch }}
+          name: digest-${{ matrix.id }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
     name: merge manifest & push tags
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
     permissions:

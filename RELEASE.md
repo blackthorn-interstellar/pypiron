@@ -25,11 +25,15 @@ three channels: PyPI wheels, GitHub Release binaries, and the GHCR image below.
 A `workflow_dispatch` run builds the wheels and binary archives (as artifacts)
 without creating a Release, for dry-running the matrix.
 
-In parallel, `docker.yml` builds the multi-arch (amd64/arm64) container image
-and pushes it to GHCR — `ghcr.io/blackthorn-interstellar/pypiron:X.Y.Z`, `:X.Y`, and
-`:latest` — with its own provenance attestation. Pushes to `master` publish a
-rolling `:master` tag; every push also gets a `:sha-<short>` tag. No secrets or
-one-time setup are needed: it authenticates with the built-in `GITHUB_TOKEN`.
+In parallel, `docker.yml` builds the multi-arch container image and pushes it to
+GHCR — `ghcr.io/blackthorn-interstellar/pypiron:X.Y.Z`, `:X.Y`, and `:latest` —
+with its own provenance attestation. Releases cover the full arch set (amd64,
+arm64, arm/v7, ppc64le, s390x, riscv64, 386, arm/v6): each binary is
+cross-compiled on an ordinary runner and `COPY`-ed into a minimal base (no QEMU —
+the image stage runs no target-arch code), then the per-arch images are stitched
+into one manifest. Ordinary pushes build just amd64+arm64 for a rolling `:master`
+tag; every push also gets a `:sha-<short>` tag. No secrets or one-time setup are
+needed: it authenticates with the built-in `GITHUB_TOKEN`.
 
 Local and dev builds report version `0.0.0` — only tagged CI builds carry a
 real version. `git describe --tags` tells you where a checkout sits relative

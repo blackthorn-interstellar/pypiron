@@ -281,9 +281,40 @@ bench/install/
   seed.py                # per-server-class load (twine/copy/allowlist/proxy-warm)
   drive.py               # uv subprocess driver (A & B), Zipf/uniform sampler, metrics
   bench.py               # orchestrator: up -> seed -> warm -> offline-sanity -> measure -> emit -> teardown
-  rig.sh                 # AWS provisioning (Docker host; extends aws-up.sh/deploy.sh)
+  capacity.py            # oha index-read MST + install-mix builder (build_install_mix)
+  rig.sh                 # single-box AWS provisioning (Docker host; extends aws-up.sh/deploy.sh)
+  rig2.sh                # multi-node AWS rig (1 server + N loadgens) for the install-mix ceiling
+  mn_ramp.py             # N-loadgen oha install-mix ramp -> results/cmp-*.json (chart input)
+  benchmark.sh           # ONE-COMMAND repeatable per-release run (release image -> rig2 -> mn_ramp)
+  plot.py                # cmp-*.json -> install-throughput.svg (README/docs chart)
   wheelhouse/            # gitignored
   results/               # gitignored: JSON + md
+```
+
+### Repeatable single-release run
+
+`benchmark.sh` is the scripted §14/§15 run for one pypiron build. It resolves a
+server image for a released tag (downloads + sha-verifies the GitHub Release
+binary, assembles the COPY-only distroless image) or a local source build,
+reuses a running rig2 (or brings one up), serves Track 2, and ramps **to the
+server's CPU ceiling** — writing `results/cmp-pypiron.json` (stamped with the
+version and the `server-bound`/`rig-limited` verdict), the input `plot.py`
+renders into the chart.
+
+Finding the ceiling is the whole point, so the default loadgen fleet is sized to
+saturate the default server (4× c7i.8xlarge → a 2-vCPU r7i.large, per §15) — not
+the 2-loadgen rig that only finds pypiron's *rig-limited* number (§14). After the
+ramp the script checks the server actually saturated (peak CPU ≥ 85 % of its
+cores); if it didn't, it flags the result as a rig-limited **lower bound** and
+tells you to scale the fleet, so it never reports a rig-limited number as a
+ceiling.
+
+```
+./benchmark.sh 0.0.7          # benchmark a release to its ceiling (default: latest tag)
+./benchmark.sh local          # benchmark the working tree (cargo-zigbuild)
+./benchmark.sh 0.0.7 --down    # tear the rig down when finished
+# cheap rig-limited spot-check (smaller fleet — will warn it's a lower bound):
+RIG2_LOADGENS=2 RIG2_LOADGEN_TYPE=c7i.2xlarge ./benchmark.sh 0.0.7
 ```
 
 Reuse from `meter.py` (do not edit it): `http_get`, `wait_healthy`,

@@ -149,7 +149,7 @@ def main() -> None:
     push_runner(regex)
     print(f"driving {N} loadgens in lockstep vs {PRIV}:8080 (Track 2, bytes from S3)\n")
 
-    steps, peak = [], 0.0
+    steps, peak, peak_mbs = [], 0.0, 0.0
     for c in [int(x) for x in args.ladder.split(",")]:
         cpu_box: list[float] = []
         with ThreadPoolExecutor(max_workers=N + 1) as pool:
@@ -177,6 +177,7 @@ def main() -> None:
         }
         steps.append(step)
         peak = max(peak, agg_rps)
+        peak_mbs = max(peak_mbs, agg_mbs)
         print(
             f"  c={c}x{N}={c * N:<6} {agg_rps:>8} rps  {installs_s:>6} inst/s  {agg_mbs:>6} MB/s  "
             f"p99={p99:>7}ms  ok={ok_pct}%  serverCPU={scpu}%"
@@ -187,13 +188,24 @@ def main() -> None:
         if scpu >= args.cpu_break:
             step["breach"] = "server-cpu"
             break
+        # Over-concurrency collapse. On the install-mix this surfaces as wheel
+        # bytes stalling — MB/s craters even while cheap index-only requests keep
+        # rps high and rising (so a max-rps peak would pick this degenerate point)
+        # and p99 explodes. Check MB/s, not just rps.
+        if peak_mbs and agg_mbs < 0.5 * peak_mbs:
+            step["breach"] = "collapse"
+            break
         if peak and agg_rps < 0.85 * peak:
             step["breach"] = "collapse"
             break
     else:
         steps[-1]["breach"] = "none(ladder-cap)"
 
-    best = max((s for s in steps), key=lambda s: s["agg_rps"])
+    # Peak = best SUSTAINED step. Exclude collapsed/errored steps: their rps is
+    # inflated by index-only completions while real installs (wheel bytes) time
+    # out, so it is not throughput the server actually sustains.
+    healthy = [s for s in steps if s.get("breach") not in ("collapse", "errors")]
+    best = max(healthy or steps, key=lambda s: s["installs_per_sec"])
     out = {
         "label": "pypiron-t2-mn",
         "loadgens": N,

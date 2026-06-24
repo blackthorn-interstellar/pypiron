@@ -143,8 +143,14 @@ wait_docker() { for _ in $(seq 1 90); do ssh_to "$1" 'sudo docker info' >/dev/nu
 wait_uv() { for _ in $(seq 1 90); do ssh_to "$1" 'test -x /usr/local/bin/uv && command -v python3.11' >/dev/null 2>&1 && return; sleep 5; done; echo "uv/py311 never up on $1" >&2; exit 1; }
 loadgen_ips() { local v; for ((i=1;i<=RIG2_LOADGEN_N;i++)); do v="RIG2_LOADGEN_IP_$i"; echo "${!v}"; done; }
 
-ship() {  # host -- ship HEAD repo (+ good src ref for the image)
-  git -C "$REPO" archive --format=tar HEAD | ssh_to "$1" "rm -rf pypiron && mkdir -p pypiron && tar -x -C pypiron"
+ship() {  # host -- ship HEAD repo, preserving any fetched wheelhouse across deploys.
+  # The deploy's container steps (wheelhouse.py/seed.py via `docker run -v`) write
+  # ROOT-owned files into the bind-mounted repo, so a plain `rm -rf pypiron` as
+  # ec2-user fails on a re-deploy — use sudo. And the wheelhouse is large and
+  # version-independent, so carry it over instead of re-downloading it each run.
+  ssh_to "$1" 'sudo rm -rf pypiron.prev; if [ -e pypiron ]; then sudo mv pypiron pypiron.prev; fi; mkdir -p pypiron'
+  git -C "$REPO" archive --format=tar HEAD | ssh_to "$1" "tar -x -C pypiron"
+  ssh_to "$1" 'if [ -d pypiron.prev/bench/install/wheelhouse ]; then sudo mv pypiron.prev/bench/install/wheelhouse pypiron/bench/install/; fi; sudo rm -rf pypiron.prev'
   if [[ -n "${RIG_BUILD_REF:-}" ]]; then
     git -C "$REPO" archive --format=tar "$RIG_BUILD_REF" src Cargo.toml Cargo.lock | ssh_to "$1" "cd pypiron && tar -x"
   fi
@@ -177,9 +183,11 @@ cmd_serve() {  # serve <server>  (pypiron only for now)
   # --network host, not -p 8080:8080: a flamegraph showed Docker's bridge/NAT +
   # conntrack cost ~24% of throughput on a small box (and a single-box deployment
   # wouldn't bridge-NAT anyway). Host networking measures the server, not docker.
+  # The runtime image's ENTRYPOINT is already `pypiron`, so the args start at the
+  # subcommand (a leading `pypiron` here would exec `pypiron pypiron serve`).
   ssh_to "$RIG2_SERVER_IP" "sudo docker rm -f pypiron 2>/dev/null; sudo docker run -d --name pypiron --network host \
     -e PYPIRON_BIND_ADDR=0.0.0.0:8080 -e PYPIRON_S3_BUCKET=${RIG_BUCKET} -e AWS_REGION=${RIG_REGION} \
-    pypiron:bench-${RIG2_SERVER_ARCH} pypiron serve --storage=s3 --artifact-delivery=redirect \
+    pypiron:bench-${RIG2_SERVER_ARCH} serve --storage=s3 --artifact-delivery=redirect \
     --uploader-user=admin --uploader-pass=secret --admin-user=admin --admin-pass=secret"
   echo "== seed corpus -> pypiron -> S3 (upload from the server)"
   ssh_to "$RIG2_SERVER_IP" "cd pypiron/bench/install && sudo docker run --rm --network host -v \$(pwd)/../..:/repo \

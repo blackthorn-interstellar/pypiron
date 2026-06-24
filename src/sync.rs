@@ -80,13 +80,13 @@ pub struct SyncArgs {
     #[arg(long = "to", env = "PYPIRON_SYNC_TO")]
     pub dst_base: Option<String>,
 
-    /// Basic auth username for the destination (the admin credential).
-    #[arg(long, env = "PYPIRON_SYNC_USERNAME")]
-    pub username: Option<String>,
+    /// Admin username for the destination (mirroring is admin-only).
+    #[arg(long, env = "PYPIRON_SYNC_ADMIN_USER")]
+    pub admin_user: Option<String>,
 
-    /// Basic auth password for the destination (the admin credential).
-    #[arg(long, env = "PYPIRON_SYNC_PASSWORD")]
-    pub password: Option<String>,
+    /// Admin password for the destination (mirroring is admin-only).
+    #[arg(long, env = "PYPIRON_SYNC_ADMIN_PASS")]
+    pub admin_pass: Option<String>,
 
     /// Refuse to mirror names inside this private namespace (PEP 503-normalized)
     #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
@@ -303,8 +303,8 @@ struct Resolved {
     specs: Vec<PackageSpec>,
     src_base: String,
     dst_base: String,
-    username: Option<String>,
-    password: Option<String>,
+    admin_user: Option<String>,
+    admin_pass: Option<String>,
     private_prefix: Option<String>,
     concurrency: usize,
     package_concurrency: usize,
@@ -419,8 +419,8 @@ impl Resolved {
                 .or(sync.from)
                 .unwrap_or_else(|| "https://pypi.org".to_string()),
             dst_base,
-            username: args.username.clone().or(sync.username),
-            password: args.password.clone().or(sync.password),
+            admin_user: args.admin_user.clone().or(sync.admin_user),
+            admin_pass: args.admin_pass.clone().or(sync.admin_pass),
             private_prefix: args.private_prefix.clone().or(cfg.private_prefix),
             concurrency: args.concurrency.or(sync.concurrency).unwrap_or(4).max(1),
             package_concurrency: args
@@ -792,7 +792,7 @@ impl UpstreamFiles {
 async fn preflight(client: &Client, resolved: &Resolved) -> Result<()> {
     let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
     let mut req = client.get(&url);
-    if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
         req = req.basic_auth(u, Some(p));
     }
     let resp = req.send().await.with_context(|| {
@@ -810,7 +810,7 @@ async fn preflight(client: &Client, resolved: &Resolved) -> Result<()> {
     match status {
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => bail!(
             "sync destination {} rejected the admin credentials [{status}]{}{} \
-             — check --username/--password (or [sync] in the config)",
+             — check --admin-user/--admin-pass (or [sync] in the config)",
             resolved.dst_base,
             if detail.is_empty() { "" } else { ": " },
             detail
@@ -837,7 +837,7 @@ async fn load_cursors(client: &Client, resolved: &Resolved) -> Cursors {
     }
     let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
     let mut req = client.get(&url);
-    if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
         req = req.basic_auth(u, Some(p));
     }
     match req.send().await {
@@ -859,7 +859,7 @@ async fn save_cursors(client: &Client, resolved: &Resolved, cursors: &Cursors) {
     };
     let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
     let mut req = client.put(&url).body(body);
-    if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
         req = req.basic_auth(u, Some(p));
     }
     let result = async {
@@ -1363,7 +1363,7 @@ async fn fetch_local_index(
     let mut req = client
         .get(&url)
         .header(reqwest::header::ACCEPT, SIMPLE_JSON_CONTENT_TYPE);
-    if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
         req = req.basic_auth(u, Some(p));
     }
     let resp = req.send().await?;
@@ -1409,7 +1409,7 @@ async fn apply_yank_http(
         Yanked::Flag(true) => client.post(&url).body(String::new()),
         Yanked::Reason(reason) => client.post(&url).body(reason.clone()),
     };
-    if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
         req = req.basic_auth(u, Some(p));
     }
     let resp = req.send().await?;
@@ -1449,7 +1449,7 @@ async fn relay_status(
     } else {
         client.post(&url).json(&desired)
     };
-    if let (Some(u), Some(p)) = (&resolved.username, &resolved.password) {
+    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
         req = req.basic_auth(u, Some(p));
     }
     let resp = req.send().await?;
@@ -1711,7 +1711,7 @@ async fn upload_via_http(
     }
 
     let mut req = client.post(endpoint).multipart(form);
-    if let (Some(u), Some(p)) = (resolved.username.as_ref(), resolved.password.as_ref()) {
+    if let (Some(u), Some(p)) = (resolved.admin_user.as_ref(), resolved.admin_pass.as_ref()) {
         req = req.basic_auth(u, Some(p));
     }
     let resp = req.send().await?;
@@ -2296,8 +2296,8 @@ mod tests {
             specs: vec![],
             src_base: src_base.to_string(),
             dst_base: "https://dest.example".to_string(),
-            username: None,
-            password: None,
+            admin_user: None,
+            admin_pass: None,
             private_prefix: None,
             concurrency: 1,
             package_concurrency: 1,

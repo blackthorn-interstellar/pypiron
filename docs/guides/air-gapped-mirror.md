@@ -36,7 +36,7 @@ On the sync host, put the destination, credential, package set, and filters in
 ```toml
 [sync]
 to = "http://HOST:8080"
-username = "admin"                       # password via PYPIRON_SYNC_PASSWORD
+admin-user = "admin"                     # password via PYPIRON_SYNC_ADMIN_PASS
 packages = ["requests>=2.20,<3", "numpy", "pandas"]
 
 [filter]
@@ -54,7 +54,7 @@ received before the cutoff.
 The password comes from the environment, never the config file.
 
 ```bash
-export PYPIRON_SYNC_PASSWORD="$ADMIN"
+export PYPIRON_SYNC_ADMIN_PASS="$ADMIN"
 pypiron sync
 ```
 

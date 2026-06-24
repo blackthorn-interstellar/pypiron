@@ -57,7 +57,7 @@ backend.
 
 ```bash
 pypiron sync \
-  --to http://localhost:8080 --password "$ADMIN" \
+  --to http://localhost:8080 --admin-pass "$ADMIN" \
   --pkg "requests>=2.20,<3" --pkg numpy
 ```
 
@@ -68,7 +68,7 @@ pypiron sync \
 | `--pkg` | One package, with optional PEP 440 specifiers. Repeatable. |
 | `--packages-list` | Text file of packages, one per line. |
 | `--config` | Path to a `pypiron.toml` (global; `serve` reads it too). Defaults to `./pypiron.toml` when present. |
-| `--username` / `--password` | Admin credential for the destination. |
+| `--admin-user` / `--admin-pass` | Admin credential for the destination. |
 | `--full` | Ignore the conditional-fetch memo; re-fetch and reconcile everything. |
 | `--dry-run` | Print what would be copied, transfer nothing. |
 | `--filter-exclude-newer` | Only mirror files received upstream before a cutoff (timestamp, date, `7`, `30 days`, `P30D`). One of the shared `--filter-*` flags (see [Configuration](configuration.md#filters)). |

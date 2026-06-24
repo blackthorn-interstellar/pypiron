@@ -1437,8 +1437,8 @@ mod tests {
             reconcile_interval: Duration::from_secs(3600),
             intent_grace: time::Duration::seconds(900),
             audit_on_boot: true,
-            sync_uploads: false,
-            sync_upload_timeout: Duration::from_secs(1),
+            wait_on_upload: false,
+            wait_on_upload_timeout: Duration::from_secs(1),
             lease_ttl: Duration::from_secs(30),
             index_cache: Arc::new(crate::cache::IndexCache::new(crate::cache::INDEX_CACHE_TTL)),
             presign_cache: Arc::new(crate::cache::PresignCache::new(
@@ -1536,8 +1536,8 @@ mod tests {
             reconcile_interval: Duration::from_secs(3600),
             intent_grace: time::Duration::seconds(900),
             audit_on_boot: true,
-            sync_uploads: false,
-            sync_upload_timeout: Duration::from_secs(1),
+            wait_on_upload: false,
+            wait_on_upload_timeout: Duration::from_secs(1),
             lease_ttl: Duration::from_secs(30),
             index_cache: Arc::new(crate::cache::IndexCache::new(crate::cache::INDEX_CACHE_TTL)),
             presign_cache: Arc::new(crate::cache::PresignCache::new(

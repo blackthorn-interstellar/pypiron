@@ -86,8 +86,8 @@ artifact downloads stream.
 | `--intent-grace-secs`        | `PYPIRON_INTENT_GRACE_SECS`        | `900`          | How long an in-flight write may defer its package's rebuild |
 | `--lease-ttl-secs`           | `PYPIRON_LEASE_TTL_SECS`           | `30`           | Leader lease TTL (multi-node S3)                 |
 | `--artifact-delivery`        | `PYPIRON_ARTIFACT_DELIVERY`        | `auto`         | How artifact bytes reach clients (see below)     |
-| `--sync-uploads`             | `PYPIRON_SYNC_UPLOADS`             | `false`        | Wait for index visibility before returning 200   |
-| `--sync-upload-timeout-secs` | `PYPIRON_SYNC_UPLOAD_TIMEOUT_SECS` | `10`           | Bound on the synchronous-upload wait             |
+| `--wait-on-upload`           | `PYPIRON_WAIT_ON_UPLOAD`           | `false`        | Wait for index visibility before returning 200   |
+| `--wait-on-upload-secs`      | `PYPIRON_WAIT_ON_UPLOAD_SECS`      | `10`           | Bound on the wait-on-upload poll                 |
 | `--download-stats`           | `PYPIRON_DOWNLOAD_STATS`           | `true`         | Count per-package/version downloads per day (see below) |
 | `--counters-resolution`      | `PYPIRON_COUNTERS_RESOLUTION`      | `1d`           | Counter bucket width: `1d`/`1h`/`30m`/`2h` (whole minutes dividing a day) |
 | `--counters-flush-interval-secs`  | `PYPIRON_COUNTERS_FLUSH_INTERVAL_SECS`  | `300` | How often each node flushes counts (the dominant cost knob) |
@@ -173,7 +173,7 @@ credential — nothing about the server's storage backend.
 | ----------------------------- | -------------------------------- | ------------------ | ------------------------------------------------------- |
 | `--to URL`                    | `PYPIRON_SYNC_TO`                | *(required)*       | Destination pypiron base URL (or `[sync].to`)           |
 | `--from URL`                  | `PYPIRON_SYNC_FROM`              | `https://pypi.org` | Source PEP 691 index                                    |
-| `--username` / `--password`   | `PYPIRON_SYNC_USERNAME` / `_PASSWORD` | *(none)*      | Destination admin credential (mirroring is admin-only)  |
+| `--admin-user` / `--admin-pass` | `PYPIRON_SYNC_ADMIN_USER` / `_PASS` | *(none)*    | Destination admin credential (mirroring is admin-only)  |
 | `--pkg SPEC`                  | —                                | *(none)*           | A package to mirror (repeatable; same syntax as a list line) |
 | `--packages-list PATH`        | `PYPIRON_PACKAGES_LIST`          | *(none)*           | File of packages, one per line                          |
 | `--private-prefix`            | `PYPIRON_PRIVATE_PREFIX`         | *(none)*           | Refuse to mirror names inside this namespace (or top-level `private-prefix`) |
@@ -263,7 +263,7 @@ directory. Precedence is **CLI/env > file > defaults**. Four parts:
 - `[serve]` — the server process. Every `serve` flag *except secrets*:
   admin/uploader/read passwords and the Azure access key stay in CLI/env. Storage
   selection (`storage`, `s3-bucket`, …) lives here too.
-- `[sync]` — the push-mirror job: source/dest, the destination username,
+- `[sync]` — the push-mirror job: source/dest, the destination admin credential,
   packages, concurrency.
 
 ```toml
@@ -284,7 +284,7 @@ artifact-delivery = "auto"
 [sync]
 packages = ["requests>=2.20,<3", "six"]     # or packages-list = "packages.txt"
 to = "http://localhost:8080"
-username = "admin"                          # password via PYPIRON_SYNC_PASSWORD
+admin-user = "admin"                        # password via PYPIRON_SYNC_ADMIN_PASS
 concurrency = 8
 ```
 

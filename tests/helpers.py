@@ -111,9 +111,9 @@ def sync_to(
         "sync",
         "--to",
         server["base_url"],
-        "--username",
+        "--admin-user",
         server.get("admin_user", server["user"]),
-        "--password",
+        "--admin-pass",
         server.get("admin_password", server["password"]),
     ]
     if source is not None:

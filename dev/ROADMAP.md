@@ -16,7 +16,7 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 **Upload & write path**
 - Legacy `POST /legacy/` multipart upload, as spoken by `twine` and `uv publish`; `sha256_digest` verified on ingest.
 - Write-time metadata sidecars (`<filename>.meta.json`) — rebuilds read sidecars, never re-hash.
-- Optional synchronous uploads (`--sync-uploads`) for publish-then-install CI.
+- Optional synchronous uploads (`--wait-on-upload`) for publish-then-install CI.
 
 **Storage & indexing**
 - Disk (default, zero deps) and three cloud backends — S3 / S3-compatible, Google Cloud Storage, and Azure Blob — over one `object_store`-backed implementation.

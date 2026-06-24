@@ -22,7 +22,7 @@ PORT="${PYPIRON_PORT:-8080}"
 EXTRA_ARGS=()
 case "$MODE" in
   default) EXTRA_ARGS+=(--artifact-delivery auto) ;;
-  sync)    EXTRA_ARGS+=(--artifact-delivery auto --sync-uploads) ;;
+  sync)    EXTRA_ARGS+=(--artifact-delivery auto --wait-on-upload) ;;
   proxy)   EXTRA_ARGS+=(--artifact-delivery stream) ;;
   stop) ;;
   *) echo "usage: $0 {default|sync|proxy|stop}" >&2; exit 2 ;;

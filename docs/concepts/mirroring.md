@@ -53,7 +53,7 @@ needs nothing but the destination URL and an admin credential:
 ```bash
 pypiron sync \
   --to http://HOST:8080 \
-  --username admin --password "$ADMIN" \
+  --admin-user admin --admin-pass "$ADMIN" \
   --pkg "requests>=2.20,<3" --pkg numpy
 ```
 
@@ -64,7 +64,7 @@ the filter is shared with the proxy (`[filter]`):
 ```toml
 [sync]
 to = "http://HOST:8080"
-username = "admin"                       # password via PYPIRON_SYNC_PASSWORD
+admin-user = "admin"                     # password via PYPIRON_SYNC_ADMIN_PASS
 packages = ["requests>=2.20,<3", "numpy", "pandas"]
 
 [filter]
@@ -73,7 +73,7 @@ exclude-newer = "2026-01-01T00:00:00Z"
 ```
 
 ```bash
-export PYPIRON_SYNC_PASSWORD="$ADMIN"
+export PYPIRON_SYNC_ADMIN_PASS="$ADMIN"
 pypiron sync
 ```
 

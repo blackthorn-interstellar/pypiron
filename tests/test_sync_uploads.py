@@ -19,9 +19,9 @@ pytestmark = pytest.mark.integration
 
 
 def test_upload_returns_only_after_index_visibility(
-    disk_server_sync_uploads, tmp_path, uv_path, uv_venv
+    disk_server_wait_on_upload, tmp_path, uv_path, uv_venv
 ):
-    server = disk_server_sync_uploads
+    server = disk_server_wait_on_upload
     creds = {"username": server["user"], "password": server["password"]}
 
     # No polling anywhere: the moment the upload returns, the index has it.

@@ -289,12 +289,12 @@ struct ServeArgs {
 
     /// Wait for the uploaded file to appear in the index before returning
     /// 200 (publish-then-install CI pipelines)
-    #[arg(long, env = "PYPIRON_SYNC_UPLOADS")]
-    sync_uploads: bool,
+    #[arg(long, env = "PYPIRON_WAIT_ON_UPLOAD")]
+    wait_on_upload: bool,
 
-    /// Bound on the synchronous-upload wait, in seconds
-    #[arg(long, env = "PYPIRON_SYNC_UPLOAD_TIMEOUT_SECS", default_value = "10")]
-    sync_upload_timeout_secs: u64,
+    /// Bound on the wait-on-upload poll, in seconds
+    #[arg(long, env = "PYPIRON_WAIT_ON_UPLOAD_SECS", default_value = "10")]
+    wait_on_upload_secs: u64,
 
     /// Address to bind the server to
     #[arg(long, env = "PYPIRON_BIND_ADDR", default_value = "0.0.0.0:8080")]
@@ -362,8 +362,8 @@ struct AppState {
     intent_grace: time::Duration,
     audit_on_boot: bool,
     lease_ttl: Duration,
-    sync_uploads: bool,
-    sync_upload_timeout: Duration,
+    wait_on_upload: bool,
+    wait_on_upload_timeout: Duration,
     /// RAM-served indexes with precomputed ETags; see cache.rs.
     index_cache: Arc<cache::IndexCache>,
     /// Reused presigned GET URLs for immutable artifacts; see cache.rs.
@@ -572,11 +572,11 @@ fn merge_serve_file(
             cli.artifact_delivery = serve_value_enum("artifact-delivery", v)?;
         }
     }
-    fill!(cli.sync_uploads, "sync_uploads", f.sync_uploads);
+    fill!(cli.wait_on_upload, "wait_on_upload", f.wait_on_upload);
     fill!(
-        cli.sync_upload_timeout_secs,
-        "sync_upload_timeout_secs",
-        f.sync_upload_timeout_secs
+        cli.wait_on_upload_secs,
+        "wait_on_upload_secs",
+        f.wait_on_upload_secs
     );
     fill!(
         cli.worker_interval_secs,
@@ -766,8 +766,8 @@ async fn run_serve(
         intent_grace: time::Duration::seconds(cli.intent_grace_secs as i64),
         audit_on_boot: cli.audit_on_boot,
         lease_ttl: Duration::from_secs(cli.lease_ttl_secs),
-        sync_uploads: cli.sync_uploads,
-        sync_upload_timeout: Duration::from_secs(cli.sync_upload_timeout_secs),
+        wait_on_upload: cli.wait_on_upload,
+        wait_on_upload_timeout: Duration::from_secs(cli.wait_on_upload_secs),
         index_cache: Arc::new(cache::IndexCache::new(cache::INDEX_CACHE_TTL)),
         presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
         spool_dir: cli.spool_dir.unwrap_or_else(std::env::temp_dir),
@@ -1995,7 +1995,7 @@ async fn legacy_upload(
 
     // Read-your-writes by waiting: poll our own index until the file shows
     // up, so publish-then-install pipelines never see a missing version.
-    if state.sync_uploads {
+    if state.wait_on_upload {
         wait_for_index_visibility(&state, &pkg_norm, &filename).await;
     }
 
@@ -2009,7 +2009,7 @@ async fn legacy_upload(
 /// into the 409 from immutability.
 async fn wait_for_index_visibility(state: &AppState, pkg: &str, filename: &str) {
     let key = format!("{SIMPLE_PREFIX}{pkg}/index.json");
-    let deadline = std::time::Instant::now() + state.sync_upload_timeout;
+    let deadline = std::time::Instant::now() + state.wait_on_upload_timeout;
     while std::time::Instant::now() < deadline {
         if let Ok(bytes) = state.storage.get_bytes(&key).await {
             #[derive(serde::Deserialize)]
@@ -2028,7 +2028,7 @@ async fn wait_for_index_visibility(state: &AppState, pkg: &str, filename: &str) 
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    warn!(%pkg, %filename, "sync upload: index visibility wait timed out");
+    warn!(%pkg, %filename, "wait-on-upload: index visibility wait timed out");
 }
 
 /// Current time as RFC 3339 at whole-second precision.
@@ -2895,8 +2895,8 @@ impl AppState {
             intent_grace: time::Duration::seconds(900),
             audit_on_boot: true,
             lease_ttl: Duration::from_secs(30),
-            sync_uploads: false,
-            sync_upload_timeout: Duration::from_secs(10),
+            wait_on_upload: false,
+            wait_on_upload_timeout: Duration::from_secs(10),
             index_cache: Arc::new(cache::IndexCache::new(cache::INDEX_CACHE_TTL)),
             presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
             spool_dir: std::env::temp_dir(),

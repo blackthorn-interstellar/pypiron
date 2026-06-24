@@ -80,7 +80,7 @@ track the same scenarios comparatively.
 | W1 | Single 900 MB upload (torch-class), S3 | completes, no 5xx | **wall ≤ transfer time + 3 s; peak RSS < 300 MB** (streaming, incremental hash) |
 | W2 | 8 concurrent 900 MB uploads on an 8 GB box | no OOM | **all succeed; reads stay < 2× baseline p99 during** |
 | W3 | Upload→visible latency (200 → file in index), 1 s worker tick | p99 < 10 s | **p99 < 2.5 s** |
-| W4 | Sync-upload mode (`--sync-uploads`) round trip | < timeout | **S3 p99 < 3 s, zero publish-then-install failures across 1k cycles** |
+| W4 | Wait-on-upload mode (`--wait-on-upload`) round trip | < timeout | **S3 p99 < 3 s, zero publish-then-install failures across 1k cycles** |
 | W5 | Sustained small uploads, 1k distinct pkgs, 10 uploads/s for 10 min | worker keeps up | **dirty-queue depth bounded; visibility p99 flat over the run** |
 
 ### Tier 3 — scale (very large S3 index)

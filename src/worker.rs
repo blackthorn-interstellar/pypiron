@@ -42,7 +42,7 @@ use crate::render::{
 use crate::sidecar::{
     is_artifact, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, PROVENANCE_SUFFIX, SIDECAR_SUFFIX,
 };
-use crate::storage::{FileEntry, ObjectMeta, Storage};
+use crate::storage::{is_not_found, FileEntry, ObjectMeta, Storage};
 use crate::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 
 /// Bounded fan-out for storage round-trips during rebuilds and sweeps.
@@ -990,10 +990,15 @@ async fn load_global_names(state: &AppState) -> Result<GlobalNames> {
             None => (Vec::new(), None),
         }
     } else {
-        (
-            state.storage.get_bytes(&key).await.unwrap_or_default(),
-            None,
-        )
+        // A missing index is an empty set (no packages yet); any other read
+        // error must propagate. Swallowing a transient I/O error to empty here
+        // would let the caller write back a near-empty global index, truncating
+        // the package list off a phantom "zero packages" observation.
+        match state.storage.get_bytes(&key).await {
+            Ok(bytes) => (bytes, None),
+            Err(e) if is_not_found(&e) => (Vec::new(), None),
+            Err(e) => return Err(e),
+        }
     };
     #[derive(serde::Deserialize)]
     struct Global {

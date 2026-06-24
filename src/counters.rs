@@ -337,7 +337,30 @@ impl Counters {
             }
         }
 
-        // Recompute each newly-frozen day's summary from its frozen shard files.
+        // Backfill any already-frozen day still missing its _summary.json: a
+        // prior cycle's best-effort write_summary failed transiently. Without
+        // this it never retries — a frozen day with swept segments never
+        // re-enters the loop above — and the global dashboard undercounts it
+        // forever. Recomputing from the surviving frozen shard files is
+        // idempotent, so skip days that already have a summary (no churn).
+        let have_summary: std::collections::HashSet<(&str, &str)> = keys
+            .iter()
+            .filter_map(
+                |k| match k.strip_prefix(PREFIX)?.split('/').collect::<Vec<_>>()[..] {
+                    [metric, "day", day, file] if file == SUMMARY_FILE => Some((metric, day)),
+                    _ => None,
+                },
+            )
+            .collect();
+        for (metric, day, _shard) in &layout.frozen {
+            if day.as_str() >= retain_cutoff.as_str()
+                && !have_summary.contains(&(metric.as_str(), day.as_str()))
+            {
+                to_summarize.insert((metric.clone(), day.clone()), ());
+            }
+        }
+
+        // Recompute each pending day's summary from its frozen shard files.
         for (metric, day) in to_summarize.into_keys() {
             self.write_summary(store, &metric, &day).await;
         }
@@ -864,6 +887,55 @@ mod tests {
         // Summary reflects the total.
         let sums = c.query_summaries("downloads", from, to).await;
         assert_eq!(sums[&yest].total, 5);
+    }
+
+    #[tokio::test]
+    async fn compaction_backfills_a_frozen_day_missing_its_summary() {
+        let store = MemStore::default();
+        let c = engine(store.clone(), Config::default());
+
+        // A prior cycle froze this past day's shard but its best-effort
+        // write_summary failed: the frozen file exists, its segments are gone,
+        // and there is no _summary.json. The day never re-enters the freeze
+        // loop (no segments), so without backfill it stays summary-less forever
+        // and the global dashboard undercounts it.
+        let day = day_str(
+            OffsetDateTime::now_utc()
+                .date()
+                .saturating_sub(time::Duration::days(3)),
+        );
+        let frozen = Segment {
+            resolution_secs: 86_400,
+            buckets: BTreeMap::from([(
+                "00:00".to_string(),
+                BTreeMap::from([("requests/r-1.0.whl".to_string(), 7u64)]),
+            )]),
+        };
+        store
+            .put(
+                &format!("{PREFIX}downloads/day/{day}/r.json"),
+                serde_json::to_vec(&frozen).unwrap(),
+            )
+            .await
+            .unwrap();
+        let summary_key = format!("{PREFIX}downloads/day/{day}/{SUMMARY_FILE}");
+        assert!(!store.objects.lock().unwrap().contains_key(&summary_key));
+
+        c.compact().await;
+
+        // Recomputed from the surviving frozen shard file.
+        assert!(store.objects.lock().unwrap().contains_key(&summary_key));
+        let from = OffsetDateTime::now_utc()
+            .date()
+            .saturating_sub(time::Duration::days(4));
+        let to = OffsetDateTime::now_utc().date();
+        let sums = c.query_summaries("downloads", from, to).await;
+        assert_eq!(sums[&day].total, 7);
+
+        // A day that already has a summary is not rewritten on the next pass.
+        let before = store.objects.lock().unwrap().clone();
+        c.compact().await;
+        assert_eq!(*store.objects.lock().unwrap(), before);
     }
 
     #[tokio::test]

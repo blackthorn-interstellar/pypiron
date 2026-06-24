@@ -490,8 +490,12 @@ impl Storage for DiskStorage {
         bytes: Vec<u8>,
         _content_type: Option<&str>,
     ) -> Result<()> {
-        // Write-to-tmp + rename: a crash or full disk never leaves a torn
-        // file at the final key. S3 PUTs are already atomic.
+        // Write-to-tmp + rename: a process crash or full disk never leaves a
+        // torn file at the final key. This is atomicity, not power-loss
+        // durability — we deliberately skip fsync (it would serialize every
+        // small index write); the single-node disk backend leans on backups or
+        // a journaling FS for that, while cloud backends are durable. S3 PUTs
+        // are already atomic.
         let p = self.resolve(key)?;
         self.ensure_parent(&p).await?;
         let tmp = self.tmp_sibling(&p)?;
@@ -642,7 +646,16 @@ impl Storage for DiskStorage {
 /// Recurse one filesystem subtree, appending every regular file as an
 /// ObjectMeta keyed by `key_base` plus its relative path.
 fn walk_disk(path: &Path, key_base: &str, out: &mut Vec<ObjectMeta>) -> Result<()> {
-    let md = std::fs::symlink_metadata(path)?;
+    // The entry can vanish between the parent's readdir and this stat — a
+    // concurrent upload's temp sibling (tmp_sibling) is renamed/removed out
+    // from under us. It was never an artifact, so skip it; propagating ENOENT
+    // here would spuriously fail the whole audit/rebuild walk (mirrors the
+    // guard in list_dir_entries).
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
     if md.is_file() {
         out.push(ObjectMeta {
             key: key_base.to_string(),
@@ -654,7 +667,13 @@ fn walk_disk(path: &Path, key_base: &str, out: &mut Vec<ObjectMeta>) -> Result<(
     if !md.is_dir() {
         return Ok(());
     }
-    for entry in std::fs::read_dir(path)? {
+    // Same race for a directory removed between the stat above and this read.
+    let rd = match std::fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in rd {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
@@ -751,6 +770,12 @@ impl ObjectStorage {
         path: &std::path::Path,
         content_type: Option<&str>,
     ) -> Result<()> {
+        // Open the local spool BEFORE initiating the multipart upload: a failure
+        // here (spool vanished, EMFILE) must not leave an initiated multipart with
+        // orphan parts billing forever, since we'd drop the writer without abort().
+        let mut file = fs::File::open(path)
+            .await
+            .with_context(|| format!("open upload spool {}", path.display()))?;
         let opts = PutMultipartOptions::from(ct_attrs(content_type));
         let upload = self
             .store
@@ -758,9 +783,6 @@ impl ObjectStorage {
             .await
             .with_context(|| format!("{}: begin multipart {staging}", self.backend))?;
         let mut writer = WriteMultipart::new_with_chunk_size(upload, MULTIPART_PART_SIZE);
-        let mut file = fs::File::open(path)
-            .await
-            .with_context(|| format!("open upload spool {}", path.display()))?;
         let mut buf = vec![0u8; READ_CHUNK];
         loop {
             let n = match file.read(&mut buf).await {

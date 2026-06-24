@@ -622,5 +622,31 @@ allocator's ~15–18% CPU cut, *plus* the fact that §15's 2,034 was itself a 4-
 2-vCPU ceiling. The gap over the field widens accordingly — vs pypiserver's 85 and
 pypicloud's 47, pypiron at its true ceiling is now **~33× and ~60×**.
 
-Final true-ceiling ranking (r7i.large, 2 vCPU, host-net, real S3-download install-mix):
-pypiron 2,845 ≫ bandersnatch 574 ≫ pypiserver 85 > pypicloud 47 > devpi 35 > proxpi 32.
+## 18. Auto-searched ceiling — the knee the fixed ladder missed (2026-06-24)
+
+§17's fixed ladder sampled 65,536 then jumped to 98,304 conns and reported 2,845
+(the 65,536 step) — but never looked between, where the curve was still rising with
+CPU headroom. The adaptive search (`mn_ramp` with no `--ladder`: exponential bracket
+→ geometric bisection) re-ran the same 8× c7i.8xlarge fleet and pinned the real knee:
+
+| agg concurrency | req/s | installs/s | node CPU | note |
+|---|---|---|---|---|
+| 32,768 | 34,094 | 2,603 | 168% | |
+| 65,536 | 38,287 | 2,923 | 158% | ≈ §17's ladder stop |
+| 77,936 | 39,645 | **3,026** | 154% | bisect: peak sustained |
+| 92,680 | 18,475 | 1,410 | 169% | bisect: collapse |
+| 131,072 | 29,996 | 2,290 | 123% | collapse |
+
+**pypiron's sustained ceiling is 3,026 installs/s (~39,600 req/s) — +6.4% over the
+ladder's 2,845**, found by the bisection at ~78k conns, in the band §17 skipped.
+Past the knee throughput collapses (a server breaking point, not a loadgen plateau).
+The harness stamped this run **rig-limited** because peak docker-stats CPU read
+169.5% (just under the 170% = 85%-of-2-cores bar) — but that gauge is a single
+instantaneous sample per step (it bounces 154–169% near the peak) and excludes
+host-net softirq, so it's an unreliable saturation signal here; the throughput
+knee + collapse is the real one. So 3,026 is adopted as the sustained ceiling — at
+minimum a lower bound, up from 2,845. **Known limitation:** average CPU over each
+step (not one snapshot) for a trustworthy server-bound/rig-limited verdict.
+
+Final ceiling ranking (r7i.large, 2 vCPU, host-net; pypiron a rig-limited lower bound):
+pypiron 3,026 ≫ bandersnatch 574 ≫ pypiserver 85 > pypicloud 47 > devpi 35 > proxpi 32.

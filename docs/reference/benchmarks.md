@@ -1,6 +1,6 @@
 # Benchmarks
 
-pypiron is 5–85× faster than other PyPI servers at sustained install throughput.
+pypiron is 5–90× faster than other PyPI servers at sustained install throughput.
 
 ![Max sustained install throughput](../assets/install-throughput.svg#only-light)
 ![Max sustained install throughput](../assets/install-throughput-dark.svg#only-dark)
@@ -14,18 +14,20 @@ wheel bytes from S3, so the entire path is exercised.
 
 | Rank | Server | Config | Installs/s |
 |---|---|---|---|
-| 1 | **pypiron** | S3 + presigned redirect (Rust) | **2,845** |
+| 1 | **pypiron** | S3 + presigned redirect (Rust) | **3,026** |
 | 2 | bandersnatch | full static mirror via nginx | 574 |
 | 3 | pypiserver | gunicorn + cached-dir | 85 |
 | 4 | pypicloud | S3 + DynamoDB (uwsgi) | 47 |
 | 5 | devpi | devpi + nginx | 35 |
 | 6 | proxpi | flask caching proxy | 32 |
 
-Each row is that server's own saturation ceiling on the same small box (an
-`r7i.large`, 2 vCPU). The Python app servers hit their wall under a modest load;
-pypiron and bandersnatch serve so leanly that reaching their ceiling took a larger
-load fleet (8× and 4× `c7i.8xlarge`). pypiron tops out at 2,845 installs/s on 2 vCPU
-— server-bound, scaling roughly linearly with cores.
+Each row is that server's own ceiling on the same small box (an `r7i.large`, 2
+vCPU). The Python app servers hit their CPU wall under a modest load; pypiron and
+bandersnatch serve so leanly that reaching their limit took a larger load fleet (8×
+and 4× `c7i.8xlarge`). pypiron peaks at 3,026 installs/s — the sustained throughput
+just before it collapses, and a conservative lower bound (its per-step CPU read just
+under the saturation bar, so the box — not the load fleet — is the limit; see §18 of
+the benchmark plan). It scales roughly linearly with cores (a projection).
 
 !!! note
     bandersnatch serves every wheel byte through its own NIC and saturates the

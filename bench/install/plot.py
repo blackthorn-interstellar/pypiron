@@ -27,7 +27,7 @@ THEMES = {
     "light": {"bg": "white", "text": "#1f2328", "axis": "#8b949e", "grid": "#eaecef"},
     "dark": {"bg": "#1f1813", "text": "#ece5dd", "axis": "#a59a8f", "grid": "#352c24"},
 }
-XMAX = 3200.0  # axis ceiling (longest bar ~2,845/s; leaves room for its label)
+XMAX = 3400.0  # axis ceiling (longest bar ~3,026/s; leaves room for its label)
 ALIAS = {"bander": "bandersnatch"}  # cmp-bander-ceiling.json -> bandersnatch
 
 

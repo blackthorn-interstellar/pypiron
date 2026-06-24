@@ -256,9 +256,12 @@ pub struct FilterArgs {
     )]
     pub max_size: Option<String>,
 
-    /// Skip files yanked upstream (PEP 592).
-    #[arg(long = "filter-exclude-yanked", env = "PYPIRON_FILTER_EXCLUDE_YANKED")]
-    pub exclude_yanked: bool,
+    /// Mirror files yanked upstream (PEP 592). Yanked files are *excluded by
+    /// default*; pass this to pull them anyway (still flagged yanked, so a pinned
+    /// install resolves). Either way, files already mirrored are never removed —
+    /// the filter only gates what a run pulls in.
+    #[arg(long = "filter-include-yanked", env = "PYPIRON_FILTER_INCLUDE_YANKED")]
+    pub include_yanked: bool,
 }
 
 impl FilterArgs {
@@ -326,8 +329,12 @@ impl FilterArgs {
                     .as_deref()
                     .or(file.and_then(|f| f.max_size.as_deref())),
             )?,
-            exclude_yanked: self.exclude_yanked
-                || file.and_then(|f| f.exclude_yanked).unwrap_or(false),
+            // Yanked is excluded by default; --filter-include-yanked (CLI/env) or
+            // `[filter].include-yanked = true` opts back in. Same precedence shape
+            // as the other bool filters: CLI can only turn the opt-in *on*, never
+            // force-exclude over a file that opted in.
+            exclude_yanked: !(self.include_yanked
+                || file.and_then(|f| f.include_yanked).unwrap_or(false)),
         })
     }
 
@@ -2369,6 +2376,34 @@ mod tests {
             &f
         ));
         assert!(matches_filters(&with_yank(Yanked::Flag(false)), &f));
+    }
+
+    #[test]
+    fn yanked_is_excluded_by_default_unless_opted_in() {
+        let exclude =
+            |f: FilterArgs, file: Option<&FilterFile>| f.resolve(file).unwrap().exclude_yanked;
+        // Nothing set: yanked is dropped by default.
+        assert!(exclude(FilterArgs::default(), None));
+        // CLI/env opt-out (--filter-include-yanked) mirrors them again.
+        assert!(!exclude(
+            FilterArgs {
+                include_yanked: true,
+                ..Default::default()
+            },
+            None
+        ));
+        // File opt-out (`[filter].include-yanked = true`).
+        let on = FilterFile {
+            include_yanked: Some(true),
+            ..Default::default()
+        };
+        assert!(!exclude(FilterArgs::default(), Some(&on)));
+        // An explicit `include-yanked = false` keeps the default exclusion.
+        let off = FilterFile {
+            include_yanked: Some(false),
+            ..Default::default()
+        };
+        assert!(exclude(FilterArgs::default(), Some(&off)));
     }
 
     #[test]

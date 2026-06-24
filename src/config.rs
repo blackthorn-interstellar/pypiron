@@ -79,7 +79,8 @@ pub struct FilterFile {
     pub exclude_windows: Option<bool>,
     pub exclude_prereleases: Option<bool>,
     pub max_size: Option<String>,
-    pub exclude_yanked: Option<bool>,
+    /// Yanked files (PEP 592) are excluded by default; set `true` to mirror them.
+    pub include_yanked: Option<bool>,
 }
 
 /// `[serve]`: the server process. Non-secret knobs only — admin/uploader/read
@@ -228,7 +229,7 @@ mod tests {
             exclude-newer = "2026-01-01T00:00:00Z"
             exclude-prereleases = true
             max-size = "250MB"
-            exclude-yanked = true
+            include-yanked = true
             "#,
         )
         .unwrap();
@@ -243,7 +244,7 @@ mod tests {
         );
         assert_eq!(cfg.filter.exclude_prereleases, Some(true));
         assert_eq!(cfg.filter.max_size.as_deref(), Some("250MB"));
-        assert_eq!(cfg.filter.exclude_yanked, Some(true));
+        assert_eq!(cfg.filter.include_yanked, Some(true));
     }
 
     #[test]

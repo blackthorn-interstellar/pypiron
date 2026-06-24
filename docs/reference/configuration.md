@@ -257,7 +257,11 @@ The **file axis** (which artifacts of a selected package to keep):
   `1.5GiB`, `1048576`). Units are powers of 1024 (`KB` == `KiB`); a bare number is
   bytes. A file with no size in the upstream listing is kept. Useful for trimming
   multi-gigabyte CUDA/ML wheels off a disk- or S3-cost-bound mirror
-- `--filter-exclude-yanked` — drop files yanked upstream (PEP 592)
+- yanked files (PEP 592) are **dropped by default**. Pass `--filter-include-yanked`
+  (or `[filter].include-yanked = true`) to mirror them anyway — they stay flagged
+  yanked, so a pinned install still resolves. Either way the filter only gates what
+  a run *pulls in*: a file already mirrored is never removed, and one that is yanked
+  upstream after you mirrored it stays on disk and is re-flagged yanked by reconcile
 - `--filter-exclude-newer <when>` — only files received upstream before the cutoff
 - `--filter-exclude-older <when>` — only files received upstream since the cutoff
 

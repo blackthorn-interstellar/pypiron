@@ -141,3 +141,16 @@ def test_walks_down_when_c_start_overshoots_the_knee():
     assert peak["per_node_c"] <= 4  # found the low knee, not the c>=16 tail
     assert peak["installs_per_sec"] > 25  # ~30 at the knee, not ~4 at c=16
     assert bound == "server-bound"
+
+
+def test_collapse_below_cpu_bar_is_server_bound_not_rig_limited():
+    # The pypiron case: throughput knees then COLLAPSES (a server breaking point),
+    # yet peak CPU (~121% of 200%) never reaches the naive 0.85*cpu_break bar. A
+    # rig-limited run can't collapse the server, so the collapse settles it.
+    measure = cliff(knee=8000, ceil=3000, cpu_at_knee=115)  # max cpu ~121
+    ramp, breach = mn_ramp.find_ceiling(measure, c_start=64, c_max=65536, cpu_break=190)
+    peak, bound, _ = mn_ramp.summarize(ramp, cpu_break=190)
+
+    assert breach == "collapse"
+    assert max(s["server_cpu_pct"] for s in ramp) < 0.85 * 190  # under the naive bar
+    assert bound == "server-bound"  # but the collapse is dispositive

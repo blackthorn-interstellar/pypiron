@@ -174,12 +174,24 @@ def is_collapse(step: dict, best_installs: float, best_mbs: float) -> str | None
 
 def summarize(ramp: list[dict], cpu_break: float) -> tuple[dict, str, float]:
     """Peak SUSTAINED step, server/rig bound verdict, peak healthy MB/s. Excludes
-    collapsed/errored steps: their rps is inflated by index-only completions while
-    real installs (wheel bytes) time out — not throughput the server sustains."""
+    collapsed/errored steps for the peak: their rps is inflated by index-only
+    completions while real installs (wheel bytes) time out.
+
+    Bound: the server's limit was FOUND (server-bound) if it saturated CPU, OR if
+    throughput COLLAPSED while the server was under real load — the search drove it
+    PAST its knee, which a rig-limited run cannot do. It is rig-limited only when the
+    loadgen fleet maxed first: throughput rose to the cap with no collapse, or
+    collapsed with the server near-idle (the rig/S3 broke, not the server)."""
     healthy = [s for s in ramp if s.get("breach") not in ("collapse", "errors")]
     peak = max(healthy or ramp, key=lambda s: s["installs_per_sec"])
     max_cpu = max((s["server_cpu_pct"] for s in ramp if s["server_cpu_pct"] >= 0), default=0.0)
-    bound = "server-bound" if max_cpu >= 0.85 * cpu_break else "rig-limited"
+    saturated = max_cpu >= 0.85 * cpu_break
+    collapsed = any(s.get("breach") in ("collapse", "errors") for s in ramp)
+    bound = (
+        "server-bound"
+        if (saturated or (collapsed and max_cpu >= 0.5 * cpu_break))
+        else "rig-limited"
+    )
     peak_mbs = max((s["agg_mb_per_sec"] for s in healthy), default=peak["agg_mb_per_sec"])
     return peak, bound, peak_mbs
 

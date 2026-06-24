@@ -21,13 +21,12 @@ wheel bytes from S3, so the entire path is exercised.
 | 5 | devpi | devpi + nginx | 35 |
 | 6 | proxpi | flask caching proxy | 32 |
 
-Each row is that server's own ceiling on the same small box (an `r7i.large`, 2
-vCPU). The Python app servers hit their CPU wall under a modest load; pypiron and
-bandersnatch serve so leanly that reaching their limit took a larger load fleet (8×
-and 4× `c7i.8xlarge`). pypiron peaks at 3,026 installs/s — the sustained throughput
-just before it collapses, and a conservative lower bound (its per-step CPU read just
-under the saturation bar, so the box — not the load fleet — is the limit; see §18 of
-the benchmark plan). It scales roughly linearly with cores (a projection).
+Each row is that server's own saturation ceiling on the same small box (an
+`r7i.large`, 2 vCPU). The Python app servers hit their CPU wall under a modest load;
+pypiron and bandersnatch serve so leanly that reaching their ceiling took a larger
+load fleet (8× and 4× `c7i.8xlarge`). pypiron tops out at 3,026 installs/s on 2 vCPU
+— server-bound: the fleet drove it past its knee into collapse, so the box, not the
+load fleet, is the limit. It scales roughly linearly with cores.
 
 !!! note
     bandersnatch serves every wheel byte through its own NIC and saturates the

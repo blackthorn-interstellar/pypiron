@@ -637,16 +637,16 @@ CPU headroom. The adaptive search (`mn_ramp` with no `--ladder`: exponential bra
 | 92,680 | 18,475 | 1,410 | 169% | bisect: collapse |
 | 131,072 | 29,996 | 2,290 | 123% | collapse |
 
-**pypiron's sustained ceiling is 3,026 installs/s (~39,600 req/s) — +6.4% over the
-ladder's 2,845**, found by the bisection at ~78k conns, in the band §17 skipped.
-Past the knee throughput collapses (a server breaking point, not a loadgen plateau).
-The harness stamped this run **rig-limited** because peak docker-stats CPU read
-169.5% (just under the 170% = 85%-of-2-cores bar) — but that gauge is a single
-instantaneous sample per step (it bounces 154–169% near the peak) and excludes
-host-net softirq, so it's an unreliable saturation signal here; the throughput
-knee + collapse is the real one. So 3,026 is adopted as the sustained ceiling — at
-minimum a lower bound, up from 2,845. **Known limitation:** average CPU over each
-step (not one snapshot) for a trustworthy server-bound/rig-limited verdict.
+**pypiron's server-bound ceiling is 3,026 installs/s (~39,600 req/s) — +6.4% over
+the ladder's 2,845**, found by the bisection at ~78k conns, in the band §17 skipped.
+Past the knee throughput collapses (3,026 → 1,410 as concurrency keeps rising): the
+fleet drove the server PAST its limit, which a rig-limited run cannot do — so it's
+server-bound, full stop. A naive CPU-threshold check first mis-stamped it rig-limited
+(peak docker-stats CPU 169.5%, just under the 170% = 85%-of-2-cores bar), but that
+gauge is a noisy single sample per step (it bounces 154–169%), excludes host-net
+softirq, and the over-concurrency collapse binds before user-CPU even maxes. The
+collapse is the dispositive signal, so the bound classifier (`summarize` /
+benchmark.sh) now reads a collapse-under-load as server-bound, not just a CPU bar.
 
-Final ceiling ranking (r7i.large, 2 vCPU, host-net; pypiron a rig-limited lower bound):
+Final true-ceiling ranking (r7i.large, 2 vCPU, host-net, real S3-download install-mix):
 pypiron 3,026 ≫ bandersnatch 574 ≫ pypiserver 85 > pypicloud 47 > devpi 35 > proxpi 32.

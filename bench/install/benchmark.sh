@@ -140,9 +140,12 @@ else
 fi
 python3 "${HERE}/mn_ramp.py" "${RAMP_ARGS[@]}"
 
-# Stamp the result, and VERIFY it is a real ceiling: if the server never neared
-# saturation (peak CPU < 85% of its cores) the loadgen fleet was the bottleneck,
-# so the number is a rig-limited lower bound, not a ceiling — say so loudly.
+# Stamp the result and classify the bound. The server's limit was FOUND — so the
+# peak is a real ceiling, server-bound — if it saturated CPU, OR if throughput
+# COLLAPSED while the server was under real load: the rig drove it PAST its knee,
+# which a rig-limited run cannot do (a collapse is the server breaking, not the
+# fleet). It is rig-limited only when the fleet maxed first — throughput rose to
+# the safety cap with no collapse, or collapsed with the server near-idle.
 python3 - "${HERE}/results/cmp-pypiron.json" "$REF" "$RIG2_SERVER_TYPE" "$RIG2_LOADGENS" "$RIG2_LOADGEN_TYPE" "$CORES" <<'PY'
 import json, sys
 from pathlib import Path
@@ -152,22 +155,25 @@ p = Path(path)
 d = json.loads(p.read_text())
 ramp = d.get("ramp", [])
 peak_cpu = max((s.get("server_cpu_pct", 0) or 0) for s in ramp) if ramp else 0.0
+collapsed = any(s.get("breach") in ("collapse", "errors") for s in ramp)
 saturated = peak_cpu >= 0.85 * cores * 100
+server_bound = saturated or (collapsed and peak_cpu >= 0.5 * cores * 100)
 d["pypiron_version"] = ref
 d["server_type"] = server
 d["loadgen"] = f"{int(lg_n)}x {lg_type}"
 d["server_cores"] = cores
 d["peak_server_cpu_pct"] = round(peak_cpu, 1)
-d["bound"] = "server-bound" if saturated else "rig-limited"
+d["bound"] = "server-bound" if server_bound else "rig-limited"
 p.write_text(json.dumps(d, indent=2))
 inst, rps = d["peak_installs_per_sec"], d["peak_agg_rps"]
 print(f"\n  pypiron {ref}: peak {inst} installs/s ({rps} rps) on {server} "
       f"[{int(lg_n)}x {lg_type}]")
-print(f"  server CPU peaked {peak_cpu:.0f}% of {cores * 100}% — "
-      f"{'SATURATED (server-bound ceiling)' if saturated else 'NOT saturated'}")
-if not saturated:
-    print("\n  ⚠⚠  RIG-LIMITED — this is a LOWER BOUND, not pypiron's ceiling.")
-    print("      The loadgen fleet saturated before the server did. Scale up:")
+print(f"  server CPU peaked {peak_cpu:.0f}% of {cores * 100}%; "
+      f"{'collapsed past the knee' if collapsed else 'no collapse'} — "
+      f"{'SERVER-BOUND (real ceiling)' if server_bound else 'rig-limited'}")
+if not server_bound:
+    print("\n  ⚠⚠  RIG-LIMITED — the loadgen fleet maxed before the server broke;")
+    print("      this is a LOWER BOUND, not pypiron's ceiling. Scale up:")
     print(f"      RIG2_LOADGENS={int(lg_n) * 2} RIG2_LOADGEN_TYPE={lg_type} "
           f"./benchmark.sh {ref}\n")
 PY

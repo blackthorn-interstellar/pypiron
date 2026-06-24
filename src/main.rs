@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
     extract::{Multipart, Path, Query, Request, State},
@@ -76,7 +76,7 @@ const VERSION: &str = concat!(
 #[derive(Parser, Debug)]
 #[command(author, version = VERSION, about, long_about = None, arg_required_else_help = true)]
 struct Cli {
-    /// Subcommands: `serve`, `sync`, `verify-index`, `rebuild-index`.
+    /// Subcommands: `serve`, `sync`, `verify-index`, `rebuild-index`, `healthcheck`.
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -127,6 +127,21 @@ enum Commands {
     /// rule of thumb: ~$1-1.5 and ~20-30 min per million files (single node,
     /// default concurrency). To only check for drift, use read-only `verify-index`.
     RebuildIndex(Box<RebuildIndexArgs>),
+    /// Probe a running server's `/health` and exit 0 (healthy) or 1
+    /// (unreachable / unhealthy).
+    ///
+    /// Self-contained — no `curl`/`wget` — so the slim container image can use it
+    /// as its `HEALTHCHECK` and orchestrators can reuse it as a liveness probe.
+    Healthcheck(HealthcheckArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct HealthcheckArgs {
+    /// URL to probe. Defaults to `http://127.0.0.1:<port>/health`, where the port
+    /// is taken from `PYPIRON_BIND_ADDR` (so a port override is honored without
+    /// repeating it here), falling back to 8080.
+    #[arg(long, env = "PYPIRON_HEALTHCHECK_URL")]
+    url: Option<String>,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -140,6 +155,42 @@ async fn run_rebuild_index(args: RebuildIndexArgs) -> Result<()> {
     let storage = args.storage.build().await?;
     let state = AppState::headless(storage);
     worker::audit(&state, true).await
+}
+
+/// Loopback `/health` URL for the port `serve` would bind. `bind` is the raw
+/// `PYPIRON_BIND_ADDR` value (e.g. `0.0.0.0:8080`); an unset or unparseable
+/// value falls back to the default 8080. Always loopback — the probe runs inside
+/// the container, regardless of which interface the server binds to.
+fn loopback_health_url(bind: Option<&str>) -> String {
+    let port = bind
+        .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+        .map_or(8080, |a| a.port());
+    format!("http://127.0.0.1:{port}/health")
+}
+
+/// One-shot probe for container/orchestrator health checks: GET `/health` and
+/// map the result onto the process exit code (2xx → 0, anything else → nonzero;
+/// the returned `Err` becomes exit 1). Self-contained over the binary's existing
+/// HTTP client, so the slim runtime image needs no `curl`/`wget`.
+async fn run_healthcheck(args: HealthcheckArgs) -> Result<()> {
+    let url = args
+        .url
+        .unwrap_or_else(|| loopback_health_url(std::env::var("PYPIRON_BIND_ADDR").ok().as_deref()));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("building healthcheck client")?;
+    let status = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("health probe could not reach {url}"))?
+        .status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("health probe {url} returned HTTP {}", status.as_u16());
+    }
 }
 
 /// Point a maintenance command (verify-index, rebuild-index) at the same
@@ -542,6 +593,7 @@ async fn main() -> Result<()> {
                 .expect("serve subcommand matched");
             run_serve(*args, config_path, serve_matches, cli.log_format).await
         }
+        Some(Commands::Healthcheck(args)) => run_healthcheck(args).await,
         None => {
             // A global flag (e.g. --log-format) but no subcommand: nothing to
             // run, so show help. Truly-bare `pypiron` never reaches here —
@@ -3206,6 +3258,26 @@ mod tests {
         let v = format!("Basic {}", b64.encode(format!("{user}:{pass}")));
         h.insert(header::AUTHORIZATION, HeaderValue::from_str(&v).unwrap());
         h
+    }
+
+    #[test]
+    fn loopback_health_url_defaults_and_follows_bind_port() {
+        // Unset → default port.
+        assert_eq!(loopback_health_url(None), "http://127.0.0.1:8080/health");
+        // The bind port is honored; the bind host is ignored (always loopback).
+        assert_eq!(
+            loopback_health_url(Some("0.0.0.0:9000")),
+            "http://127.0.0.1:9000/health"
+        );
+        assert_eq!(
+            loopback_health_url(Some("[::]:7000")),
+            "http://127.0.0.1:7000/health"
+        );
+        // Garbage never panics — it falls back to the default port.
+        assert_eq!(
+            loopback_health_url(Some("not-an-addr")),
+            "http://127.0.0.1:8080/health"
+        );
     }
 
     #[test]

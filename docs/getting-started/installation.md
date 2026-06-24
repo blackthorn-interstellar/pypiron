@@ -41,7 +41,7 @@ The `pypiron` package on PyPI is a [maturin](https://www.maturin.rs/)-built bina
 docker run -p 8080:8080 ghcr.io/blackthorn-interstellar/pypiron:latest pypiron serve
 ```
 
-The image runs unprivileged, defaults its storage to `/data`, and exposes port 8080. Mount a volume at `/data` to persist packages between runs, or point it at object storage instead. See [Production](../guides/production.md) for S3, multi-node, and TLS.
+The image runs unprivileged, defaults its storage to `/data`, and exposes port 8080. It ships a built-in Docker `HEALTHCHECK` (the self-contained `pypiron healthcheck` probe — no `curl`/`wget` needed). Mount a volume at `/data` to persist packages between runs, or point it at object storage instead. See [Production](../guides/production.md) for S3, multi-node, and TLS.
 
 !!! note
     Started with no credentials, the server is read-only and reads are public. Set a password to enable uploads. See [Authentication](../concepts/authentication.md).

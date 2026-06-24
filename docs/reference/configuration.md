@@ -357,6 +357,18 @@ under ADC, Azure without an account key). PEP 658 `.metadata` companions always
 stream — tiny and resolution-critical. Full reasoning in
 [DESIGN.md](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/DESIGN.md#read-path-zero-coordination).
 
+## Healthcheck (`healthcheck`)
+
+The `pypiron healthcheck` probe (the container's built-in `HEALTHCHECK`) takes
+one knob:
+
+| CLI Arg  | Env Var                    | Default                            | Description                                   |
+| -------- | -------------------------- | ---------------------------------- | --------------------------------------------- |
+| `--url`  | `PYPIRON_HEALTHCHECK_URL`  | `http://127.0.0.1:<bind port>/health` | Endpoint to probe; exit `0` on 2xx, else nonzero |
+
+The default port follows `PYPIRON_BIND_ADDR` and the probe always targets
+loopback. See [CLI → healthcheck](cli.md#healthcheck).
+
 ## Management and operations endpoints
 
 Admin operations (delete, yank, PEP 792 project status, sync cursors) and the

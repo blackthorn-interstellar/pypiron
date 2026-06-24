@@ -1,12 +1,13 @@
 # CLI
 
-One binary, four subcommands:
+One binary, five subcommands:
 
 ```bash
 pypiron serve          # run the server
 pypiron sync           # mirror packages into a server over HTTP
 pypiron verify-index   # check that served indexes match truth (read-only)
 pypiron rebuild-index  # rebuild every index from truth, unconditionally
+pypiron healthcheck    # probe a running server's /health (exit 0/1)
 ```
 
 Every `--flag` has a matching `PYPIRON_*` environment variable. Values layer
@@ -133,6 +134,24 @@ churn), and additionally rewrites views and re-fingerprints. **S3 rule of thumb:
 ~$1–1.5 and ~20–30 min per million files** (single node, default concurrency;
 sidecar GETs + per-package LISTs, plus PUTs on a real restore). To only check for
 drift without writing, use the cheaper read-only `verify-index`.
+
+## healthcheck
+
+A **liveness probe**: GET a running server's `/health` and exit `0` when healthy,
+nonzero otherwise. It is self-contained — no `curl`/`wget` — so the container
+image uses it as its built-in
+[`HEALTHCHECK`](../getting-started/installation.md#container-image) and any
+orchestrator can reuse the same line.
+
+```bash
+pypiron healthcheck                                  # probes 127.0.0.1:<bind port>/health
+pypiron healthcheck --url http://other-host:8080/health
+```
+
+With no `--url` it derives the port from `PYPIRON_BIND_ADDR` (the same knob
+`serve` reads, defaulting to 8080) and always probes loopback, so the baked-in
+container check follows a port override without being edited. Override the whole
+URL with `--url` / `PYPIRON_HEALTHCHECK_URL`.
 
 ## Global flags
 

@@ -39,6 +39,12 @@ ENV PYPIRON_DATA_DIR=/data
 VOLUME /data
 EXPOSE 8080
 
+# Self-contained probe (no curl/wget in this slim image): the binary GETs its own
+# /health and exits nonzero when unhealthy. It reads PYPIRON_BIND_ADDR, so a port
+# override is followed without editing this line. start-period covers cold start.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["pypiron", "healthcheck"]
+
 # Defaults (bind 0.0.0.0:8080, /data, health at /health) make this runnable
 # with no extra args; reads stay public until you set credentials. Bare
 # `pypiron` now prints help, so the image serves explicitly. See

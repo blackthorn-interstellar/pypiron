@@ -3,10 +3,13 @@ global flags only. Serve-specific flags live under `pypiron serve --help`."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from .helpers import find_free_port
 
 pytestmark = pytest.mark.integration
 
@@ -90,3 +93,35 @@ def test_verify_index_could_not_run_exits_2(pypiron_bin: Path):
     cp = _run(pypiron_bin, "verify-index", "--storage", "s3")
     assert cp.returncode == 2, f"expected could-not-run exit 2:\n{cp.stdout}{cp.stderr}"
     assert "Error:" in cp.stderr, cp.stderr
+
+
+# `healthcheck` is the container HEALTHCHECK / orchestrator liveness probe: exit 0
+# means healthy, nonzero means pull this node. It carries no curl/wget dependency.
+
+
+def test_healthcheck_ok_via_url(pypiron_bin: Path, disk_server):
+    """A healthy server's /health makes `healthcheck` exit 0."""
+    cp = _run(pypiron_bin, "healthcheck", "--url", f"{disk_server['base_url']}/health")
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+
+
+def test_healthcheck_follows_bind_addr_env(pypiron_bin: Path, disk_server):
+    """With no --url, the probe derives the port from PYPIRON_BIND_ADDR — the same
+    knob `serve` reads — so the baked-in container HEALTHCHECK follows a port
+    override for free."""
+    env = os.environ.copy()
+    env["PYPIRON_BIND_ADDR"] = disk_server["bind"]
+    env.pop("PYPIRON_HEALTHCHECK_URL", None)
+    cp = subprocess.run(
+        [str(pypiron_bin), "healthcheck"], capture_output=True, text=True, timeout=15, env=env
+    )
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+
+
+def test_healthcheck_unreachable_exits_nonzero(pypiron_bin: Path):
+    """Nothing listening → connection refused → nonzero exit (orchestrator pulls
+    the node), reported on stderr rather than crashing."""
+    dead_port = find_free_port()
+    cp = _run(pypiron_bin, "healthcheck", "--url", f"http://127.0.0.1:{dead_port}/health")
+    assert cp.returncode != 0, "expected nonzero exit for an unreachable server"
+    assert "health probe" in cp.stderr.lower(), cp.stderr

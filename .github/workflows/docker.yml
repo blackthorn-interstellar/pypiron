@@ -92,10 +92,11 @@ jobs:
         with:
           tool: cargo-zigbuild
 
-      # zig is the C cross-compiler cargo-zigbuild drives (ring builds a little C);
-      # the ziglang pip package ships it prebuilt for every host.
+      # zig is the C cross-compiler cargo-zigbuild drives (ring builds a little C).
+      # Install the version-matched ziglang into the same python3 cargo-zigbuild
+      # probes (`python3 -m ziglang`) — NOT pipx, which isolates it out of reach.
       - name: Install zig
-        run: pipx install ziglang || python3 -m pip install --user ziglang
+        run: python3 -m pip install --user --break-system-packages ziglang
 
       - name: Cross-compile ${{ matrix.triple }}
         run: cargo zigbuild --release --locked --target ${{ matrix.triple }}

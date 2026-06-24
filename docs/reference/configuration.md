@@ -179,7 +179,7 @@ credential — nothing about the server's storage backend.
 | `--package-concurrency N`     | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8`              | Packages synced in parallel                             |
 | `--config PATH`               | `PYPIRON_CONFIG`                 | *(auto)*           | Path to a `pypiron.toml` (global; read by every subcommand — `verify-index`/`rebuild-index` use its `[serve]` storage selection; default `./pypiron.toml` if present) |
 | `--spool-dir PATH`            | `PYPIRON_SYNC_SPOOL_DIR`         | system temp        | Download spool dir — real disk, not tmpfs, for large wheels |
-| `--dry-run`                   | —                                | `false`            | Print what would be mirrored, write nothing             |
+| `--dry-run`                   | `PYPIRON_SYNC_DRY_RUN`           | `false`            | Print what would be mirrored, write nothing             |
 
 `--to` is mandatory (there is no direct-to-storage mode); without it (and no
 `[sync].to`) the run refuses to start. Which packages get mirrored is the

@@ -96,7 +96,7 @@ pub struct SyncArgs {
     pub spool_dir: Option<PathBuf>,
 
     /// Print actions without downloading/uploading.
-    #[arg(long)]
+    #[arg(long, env = "PYPIRON_SYNC_DRY_RUN")]
     pub dry_run: bool,
 
     /// Ignore the conditional-fetch memo: re-fetch every project unconditionally
@@ -483,6 +483,20 @@ impl Resolved {
         }
         let exclude_older_raw = args.filter.exclude_older_raw(Some(&cfg.filter));
 
+        // A `0` here would mean "no work in flight" — `chunks(0)`/`buffer_unordered(0)`
+        // panic or stall — so refuse it rather than silently coercing a typo to 1.
+        let concurrency = args.concurrency.or(sync.concurrency).unwrap_or(4);
+        let package_concurrency = args
+            .package_concurrency
+            .or(sync.package_concurrency)
+            .unwrap_or(8);
+        if concurrency == 0 {
+            bail!("--concurrency must be at least 1");
+        }
+        if package_concurrency == 0 {
+            bail!("--package-concurrency must be at least 1");
+        }
+
         Ok(Self {
             src_base: args
                 .src_base
@@ -493,12 +507,8 @@ impl Resolved {
             admin_user: args.admin_user.clone().or(sync.admin_user),
             admin_pass: args.admin_pass.clone().or(sync.admin_pass),
             private_prefix: args.private_prefix.clone().or(cfg.private_prefix),
-            concurrency: args.concurrency.or(sync.concurrency).unwrap_or(4).max(1),
-            package_concurrency: args
-                .package_concurrency
-                .or(sync.package_concurrency)
-                .unwrap_or(8)
-                .max(1),
+            concurrency,
+            package_concurrency,
             spool_dir: args.spool_dir.clone().unwrap_or_else(std::env::temp_dir),
             dry_run: args.dry_run,
             full: args.full,

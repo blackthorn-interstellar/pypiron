@@ -235,6 +235,29 @@ def test_missing_destination_is_an_error(pypiron_bin, tmp_path):
     assert "--to" in (out + err) or "destination" in (out + err)
 
 
+def test_zero_concurrency_is_an_error(pypiron_bin, tmp_path):
+    """A 0 concurrency means no work in flight (chunks(0) panics); refuse it at
+    startup rather than silently coercing the typo to 1."""
+    from .helpers import run_returncode
+
+    pkg_list = _packages_list(tmp_path, PACKAGE)
+    rc, out, err = run_returncode(
+        [
+            str(pypiron_bin),
+            "sync",
+            "--to",
+            "http://127.0.0.1:1",
+            "--filter-packages-list",
+            str(pkg_list),
+            "--concurrency",
+            "0",
+        ],
+        timeout=60,
+    )
+    assert rc != 0
+    assert "--concurrency must be at least 1" in (out + err)
+
+
 def test_cli_packages_list_overrides_config_packages(disk_server, pypiron_bin, tmp_path):
     config = tmp_path / "pypiron.toml"
     config.write_text('[filter]\npackages = ["this-name-does-not-exist-xyz"]\n')

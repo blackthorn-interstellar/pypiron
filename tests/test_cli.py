@@ -87,6 +87,23 @@ def test_verify_index_diverged_exits_1(pypiron_bin: Path, tmp_path: Path):
     assert "Error:" not in cp.stderr, cp.stderr
 
 
+def test_serve_rejects_out_of_range_counter_knob(pypiron_bin: Path, tmp_path: Path):
+    """An out-of-range counter knob fails closed at startup instead of silently
+    clamping to 1 — a 0 retention would prune every finished day on the next
+    compaction. The config is validated before the listener binds, so the short
+    `_run` timeout doubles as the "it never started serving" assertion."""
+    cp = _run(
+        pypiron_bin,
+        "serve",
+        "--data-dir",
+        str(tmp_path),
+        "--counters-retention-days",
+        "0",
+    )
+    assert cp.returncode != 0, cp.stdout + cp.stderr
+    assert "retention-days must be at least 1" in (cp.stdout + cp.stderr)
+
+
 def test_verify_index_could_not_run_exits_2(pypiron_bin: Path):
     """An unworkable config (s3 with no bucket) is an operational failure, not a
     divergence — exit 2 keeps it distinct from a real diff."""

@@ -614,13 +614,13 @@ fn build_counters(cli: &ServeArgs, storage: Arc<dyn Storage>) -> Result<counters
     let resolution_secs = parse_resolution_secs(&cli.counters_resolution)?;
     let cfg = counters::Config {
         resolution_secs,
-        flush_interval: Duration::from_secs(cli.counters_flush_interval_secs.max(1)),
-        rollup_interval: Duration::from_secs(cli.counters_rollup_interval_secs.max(1)),
-        retention_days: cli.counters_retention_days.max(1),
+        flush_interval: Duration::from_secs(cli.counters_flush_interval_secs),
+        rollup_interval: Duration::from_secs(cli.counters_rollup_interval_secs),
+        retention_days: cli.counters_retention_days,
         ..counters::Config::default()
     }
     .checked()
-    .map_err(|e| anyhow::anyhow!("--counters-resolution: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("counter config: {e}"))?;
     Ok(counters::Counters::new(
         Box::new(CounterStore(storage)),
         cfg,

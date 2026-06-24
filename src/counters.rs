@@ -90,14 +90,27 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Validate the resolution (a whole-minute divisor of a day) and clamp the
-    /// cap to something sane. Returns an error string for a bad resolution so a
-    /// caller can fail closed at startup.
+    /// Validate the operator-facing knobs and clamp the internal cap to
+    /// something sane. Returns an error string so the caller can fail closed at
+    /// startup rather than silently coercing a typo'd `0` (e.g. a `0` retention
+    /// would prune all history on the next compaction).
     pub fn checked(self) -> Result<Self, String> {
         let r = self.resolution_secs;
         if !(60..=86_400).contains(&r) || !r.is_multiple_of(60) || !86_400u32.is_multiple_of(r) {
             return Err(format!(
                 "resolution must be a whole number of minutes dividing a day (60..=86400 s), got {r}s"
+            ));
+        }
+        if self.flush_interval.is_zero() {
+            return Err("flush-interval must be at least 1 second".into());
+        }
+        if self.rollup_interval.is_zero() {
+            return Err("rollup-interval must be at least 1 second".into());
+        }
+        if self.retention_days < 1 {
+            return Err(format!(
+                "retention-days must be at least 1, got {}",
+                self.retention_days
             ));
         }
         Ok(Self {
@@ -756,6 +769,33 @@ mod tests {
         }
         .checked()
         .is_err());
+    }
+
+    #[test]
+    fn config_rejects_zero_intervals_and_retention() {
+        // A typo'd 0 must fail closed, not silently coerce to 1 (a 0 retention
+        // would prune every finished day on the next compaction).
+        assert!(Config {
+            flush_interval: Duration::ZERO,
+            ..Default::default()
+        }
+        .checked()
+        .is_err());
+        assert!(Config {
+            rollup_interval: Duration::ZERO,
+            ..Default::default()
+        }
+        .checked()
+        .is_err());
+        for days in [0, -1] {
+            assert!(Config {
+                retention_days: days,
+                ..Default::default()
+            }
+            .checked()
+            .is_err());
+        }
+        assert!(Config::default().checked().is_ok());
     }
 
     #[test]

@@ -1,9 +1,8 @@
 # Authentication
 
 pypiron has three optional basic-auth credentials, strictly ordered:
-admin ⊇ uploader ⊇ reader. Each is a superset of the one below it. A request
-authenticated as admin passes any uploader or reader check; an uploader passes
-any reader check.
+admin ⊇ uploader ⊇ reader. A request authenticated as admin passes any uploader
+or reader check; an uploader passes any reader check.
 
 A role exists only once you set its **password**. No password, no role. There is
 no config file of users and no database — the credentials are flags or env vars
@@ -33,8 +32,8 @@ public" switch.
 ## When reads require auth
 
 Set `--read-user` (with `--read-pass`) and reads close: `/simple/` and `/files/`
-require basic auth. Any of the three credentials works — a reader, an uploader,
-or the admin can all install. The human package pages (`/projects/` and
+require basic auth. Any of the three credentials — reader, uploader, or admin —
+can install. The human package pages (`/projects/` and
 `/project/<pkg>/`) gate the same way; the root `/` stays public but folds in its
 live activity panel only for an authorized reader.
 
@@ -71,9 +70,7 @@ Install against a read-gated server by putting the credential in the index URL:
   server exits with an error. A half-set credential can never authenticate, and
   a half-set *read* credential would otherwise fail open and serve every package
   publicly.
-- **Secrets compare in constant time.** Password checks are length-independent
-  byte comparisons, so a wrong guess never leaks the secret one prefix-byte at a
-  time. The username is not a secret.
+- **Secrets compare in constant time.** The username is not a secret.
 - **Private names never fall through to upstream.** A name claimed private (or
   inside `--private-prefix`) is never proxied from a public upstream, so a
   request can't be answered by an impostor package.

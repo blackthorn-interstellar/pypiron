@@ -40,13 +40,11 @@ The `pypiron` package on PyPI is a [maturin](https://www.maturin.rs/)-built bina
 Every release attaches prebuilt binaries to its [GitHub Release](https://github.com/blackthorn-interstellar/pypiron/releases/latest) for Linux (glibc and static musl), macOS, and Windows — across x86_64, ARM, and more. Download the archive for your platform, verify it against `SHA256SUMS`, and drop the binary on your `PATH`:
 
 ```bash
-# Linux x86_64 (musl build runs on any distro); pick your platform's archive.
+# Linux x86_64 (musl = fully static, runs on any distro); pick your platform's archive.
 curl -LO https://github.com/blackthorn-interstellar/pypiron/releases/latest/download/pypiron-x86_64-unknown-linux-musl.tar.gz
 tar xzf pypiron-x86_64-unknown-linux-musl.tar.gz
 ./pypiron --version
 ```
-
-The Linux **musl** archives are fully static — one file, no system libraries, runs anywhere.
 
 ## Container image
 

@@ -20,8 +20,7 @@ Anything that can't be derived from an artifact (a yank flag, a true mirror
 timestamp) lives in the tree as a sidecar, so the system can always heal.
 
 The simple index is a materialized view. It is derivable from a storage listing at
-any time, so it can be thrown away and rebuilt. It may lag truth, but it never
-leads it.
+any time, so it can be thrown away and rebuilt.
 
 ## Views may lag truth, never lead it
 

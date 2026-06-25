@@ -353,8 +353,9 @@ A `packages-list` path in the file resolves relative to the config file, not the
 working directory. A CLI package source (`--filter-package` and/or
 `--filter-packages-list`) replaces the file's `[filter].packages`/`packages-list`
 entirely; other options layer per-key. A boolean set
-`true` in the file can be turned on but not off by the absence of a flag (clap
-cannot express an explicit `false`). The package list (`packages`,
+`true` in the file can be turned on but not off by the absence of a flag — there
+is no flag for `false`, so clear it by setting it `false` (or deleting the line)
+in the file. The package list (`packages`,
 `packages-list`), the artifact-filter keys, and `private-prefix` all used to live
 under `[sync]` and now belong in `[filter]` (and at the top level); a stale config
 fails to start with a pointer to the new home.

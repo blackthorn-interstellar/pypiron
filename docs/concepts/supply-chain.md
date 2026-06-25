@@ -108,8 +108,8 @@ uv pip install --index-url http://HOST:8080/simple/ \
 ```
 
 !!! note
-    `--exclude-newer` only works because every file carries `upload-time`. uv
-    treats files without it as unavailable. See [Why PEP 700 is the minimum
+    uv treats files without `upload-time` as unavailable and drops them from
+    resolution. See [Why PEP 700 is the minimum
     bar](../reference/standards.md#why-pep-700-is-the-minimum-bar-exclude-newer).
 
 Backdating a timestamp is an **admin** privilege, not an uploader one. An

@@ -30,7 +30,7 @@ load balancers and Prometheus.
 
 ## Publish
 
-The admin username is `admin`; the upload endpoint is `/legacy/`.
+Publish with the admin credential to `/legacy/` (PyPI's legacy upload API).
 
 === "uv"
     ```bash

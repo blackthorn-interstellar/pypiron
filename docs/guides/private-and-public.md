@@ -48,7 +48,7 @@ Public and private packages resolve from the same index.
     ```
 
 `requests` is fetched from PyPI on first use and cached; `acme-widgets` comes
-from your private uploads. Both arrive over one index URL.
+from your private uploads.
 
 !!! note "Private reads"
     Reads are public unless you set a read credential. Add `--read-user $READ`
@@ -89,9 +89,9 @@ The value accepts an RFC 3339 timestamp, a friendly duration (`"7 days"`,
 `"24 hours"`, `"1 week"`), or an ISO 8601 duration (`P7D`). Calendar months and
 years are rejected.
 
-The proxy honors the full set of `--filter-*` filters (wheels-only, python/abi/
-platform tags, date cutoffs) — the *same* filters `sync` uses, set once in the
-shared `[filter]` table. See [Configuration](../reference/configuration.md#filters).
+The proxy honors the full `--filter-*` set (wheels-only, python/abi/platform
+tags, date cutoffs) from the shared `[filter]` table. See
+[Configuration](../reference/configuration.md#filters).
 
 ## Next steps
 

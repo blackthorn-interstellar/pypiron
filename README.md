@@ -61,7 +61,6 @@ guided version are in [First steps](docs/getting-started/first-steps.md).
 
 ## Alternatives
 
-For comparison:
 [bandersnatch](https://github.com/pypa/bandersnatch),
 [pypiserver](https://github.com/pypiserver/pypiserver),
 [pypicloud](https://github.com/stevearc/pypicloud),

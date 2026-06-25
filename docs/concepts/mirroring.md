@@ -139,9 +139,6 @@ pypiron sync --full   # ignore the cursor; re-fetch and fully reconcile everythi
 | Offline serving     | Cached files only                    | Everything you synced                 |
 | Reconcile yanks/removals | Listings refresh every 60s      | On re-sync (`--full` for a sweep)     |
 
-Both cache verified, immutable artifacts in the same storage tree, so you can run
-the proxy for convenience and `sync` to guarantee a known set is present.
-
 ## See also
 
 - [Air-gapped mirror](../guides/air-gapped-mirror.md) — `sync` when the serving

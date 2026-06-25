@@ -13,8 +13,7 @@ PyPI  ──▶  sync host  ──▶  pypiron server  ──▶  developers / C
           (has egress)     (air-gapped)
 ```
 
-The sync host reaches both PyPI and the server. The server itself never needs
-outbound internet — and neither does anyone installing from it afterward.
+Developers and CI installing from the air-gapped server need no internet either.
 
 ## 1. Start the server
 

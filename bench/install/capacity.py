@@ -136,9 +136,12 @@ def build_install_mix(index_url: str, arch: str, tier: str) -> Tuple[str, float,
     hdr = {"Accept": "application/vnd.pypi.simple.v1+json"}
     for nm in sorted(canonical):
         iu = base + nm + "/"
-        index_urls.append(iu)
         status, body, _ = http_get(iu, headers=hdr)
-        href = find_wheel_href(iu, body, canonical[nm]) if status == 200 else None
+        if status != 200:
+            dropped += 1  # package absent here — skip it, don't leave a 404 index URL in the mix
+            continue
+        index_urls.append(iu)
+        href = find_wheel_href(iu, body, canonical[nm])
         if href and served_ok(href):
             wheel_urls.append(href)
         else:

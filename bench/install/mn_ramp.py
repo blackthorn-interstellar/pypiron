@@ -96,6 +96,10 @@ def push_runner(regex: str) -> None:
         "#!/bin/bash\n"
         '/home/ec2-user/oha --no-tui --json --redirect 5 -z "$1" -c "$2" '
         "-H 'Accept: application/vnd.pypi.simple.v1+json' "
+        # Real installs are uv: send a uv/X.Y.Z UA so an `--artifact-delivery auto`
+        # server 302s us to object storage (its uv path) instead of the stream
+        # fallback it gives non-uv clients. Forced redirect/stream servers ignore it.
+        "-H 'User-Agent: uv/0.9.30' "
         f"--rand-regex-url '{regex}'\n"
     )
     p = HERE / "_oha_runner.sh"

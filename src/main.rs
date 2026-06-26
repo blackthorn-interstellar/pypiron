@@ -1391,9 +1391,15 @@ fn format_clf(
     let bytes = bytes
         .map(|b| b.to_string())
         .unwrap_or_else(|| "-".to_string());
+    // `authuser` is the one field decoded from base64 (`basic_credentials`), so —
+    // unlike the header/URI-sourced fields, which hyper has already stripped of
+    // control bytes — it can carry raw CR/LF/ESC. Drop control chars (Unicode Cc:
+    // C0, DEL, C1) so a crafted username can't forge log lines, poison fail2ban,
+    // or inject ANSI into an operator's terminal.
+    let authuser = authuser.map(|u| u.chars().filter(|c| !c.is_control()).collect::<String>());
     format!(
         "{host} - {authuser} [{time}] \"{method} {target} {proto}\" {status} {bytes} \"{referer}\" \"{ua}\"",
-        authuser = dash(authuser),
+        authuser = dash(authuser.as_deref()),
         referer = dash(referer),
         ua = dash(ua),
     )
@@ -3679,6 +3685,32 @@ mod tests {
                 None,
             ),
             "- - - [10/Oct/2000:13:55:36 +0000] \"POST /legacy/ HTTP/1.1\" 503 - \"-\" \"-\""
+        );
+    }
+
+    #[test]
+    fn clf_authuser_drops_control_chars() {
+        // A base64 username can decode to arbitrary UTF-8, including CR/LF/ESC.
+        // Those must not survive into the line: no forged second record, no ANSI.
+        let line = format_clf(
+            "10.0.0.5",
+            Some("evil\r\n10.0.0.6 - - [x] \"GET /forged\" 200 0 \"\" \"\"\x1b[31m"),
+            "10/Oct/2000:13:55:36 +0000",
+            &Method::GET,
+            "/simple/flask/",
+            "HTTP/1.1",
+            200,
+            Some(1532),
+            None,
+            None,
+        );
+        assert!(!line.contains('\n'), "no embedded newline: {line:?}");
+        assert!(!line.contains('\r'), "no embedded CR: {line:?}");
+        assert!(!line.contains('\x1b'), "no ANSI escape: {line:?}");
+        // The non-control text is preserved on the single rendered line.
+        assert_eq!(
+            line,
+            "10.0.0.5 - evil10.0.0.6 - - [x] \"GET /forged\" 200 0 \"\" \"\"[31m [10/Oct/2000:13:55:36 +0000] \"GET /simple/flask/ HTTP/1.1\" 200 1532 \"-\" \"-\""
         );
     }
 }

@@ -58,14 +58,25 @@ enum Cached {
     Missing,
 }
 
+/// Fixed per-entry overhead charged to the byte ceiling. Without it a negative
+/// (`Missing`, zero-body) entry weighs nothing, so a flood of probes for
+/// distinct unknown names — anonymous on a public read path — never trips the
+/// cap and grows the map until OOM. Charging the key+struct+slot footprint
+/// makes entry count bound itself through the same ceiling; the proxy listing
+/// cache guards the identical hazard with a hard count cap.
+const ENTRY_OVERHEAD_BYTES: usize = 256;
+
 impl Cached {
-    fn body_len(&self) -> usize {
-        match self {
+    /// Bytes this entry charges against the cap: its body plus a fixed
+    /// per-entry overhead so zero-body `Missing` entries still count.
+    fn weight(&self) -> usize {
+        let body = match self {
             Cached::Present { identity, gzip } => {
                 identity.body.len() + gzip.as_ref().map_or(0, |g| g.body.len())
             }
             Cached::Missing => 0,
-        }
+        };
+        ENTRY_OVERHEAD_BYTES + body
     }
 
     /// The `(identity, gzip)` pair `get` hands back, or `None` when missing.
@@ -120,15 +131,15 @@ struct Entries {
 
 impl Entries {
     fn insert(&mut self, key: String, entry: Entry) {
-        self.body_bytes += entry.cached.body_len();
+        self.body_bytes += entry.cached.weight();
         if let Some(old) = self.map.insert(key, entry) {
-            self.body_bytes -= old.cached.body_len();
+            self.body_bytes -= old.cached.weight();
         }
     }
 
     fn remove(&mut self, key: &str) {
         if let Some(old) = self.map.remove(key) {
-            self.body_bytes -= old.cached.body_len();
+            self.body_bytes -= old.cached.weight();
         }
     }
 
@@ -143,7 +154,7 @@ impl Entries {
         self.map.retain(|_, e| {
             let keep = e.fetched.elapsed() < ttl;
             if !keep {
-                freed += e.cached.body_len();
+                freed += e.cached.weight();
             }
             keep
         });
@@ -435,6 +446,29 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn negative_entries_are_bounded() {
+        // A flood of probes for distinct unknown names (anonymous on a public
+        // read path) must not grow the map forever. Missing entries are
+        // zero-body, so they only stay bounded if they charge the per-entry
+        // overhead against the ceiling.
+        let storage = InMemStorage::default();
+        let max_bytes = 4 * 1024;
+        let cache = IndexCache::with_capacity(Duration::from_secs(60), max_bytes);
+        for i in 0..10_000 {
+            assert!(cache
+                .get(&storage, &format!("simple/missing{i}/index.json"))
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let len = cache.entries.lock().unwrap().map.len();
+        assert!(
+            len <= max_bytes / ENTRY_OVERHEAD_BYTES,
+            "negative cache grew to {len} entries — unbounded by the ceiling"
+        );
     }
 
     #[tokio::test]

@@ -475,17 +475,17 @@ struct ServeArgs {
     /// upstream metadata and artifacts are downloaded, verified, and cached
     /// in storage as `mirror`-origin packages on first request. Names claimed
     /// `private` (or inside --private-prefix) never fall through. When a package
-    /// scope is set (`--filter-package`/`[filter].packages`), only those names
+    /// scope is set (`--include-package`/`[mirror].include-packages`), only those names
     /// fall through and the rest are 404'd (fail-closed). Off by default.
     #[arg(long, env = "PYPIRON_PROXY_UPSTREAM")]
     proxy_upstream: Option<String>,
 
     /// The slice of PyPI the proxy serves and caches — names included. The same
-    /// `--filter-*` surface as `sync`, set once and shared: a `[filter]` table
+    /// mirror-selection surface as `sync`, set once and shared: a `[mirror]` table
     /// in pypiron.toml governs both. With a package scope, the proxy serves only
     /// those names (and matching versions) from upstream.
     #[command(flatten)]
-    filter: sync::FilterArgs,
+    mirror: sync::MirrorArgs,
 }
 
 /// Shared TTL cache of the ranked download leaderboard: `(computed_at, board)`,
@@ -870,8 +870,8 @@ async fn run_serve(
 ) -> Result<()> {
     // Layer pypiron.toml under CLI/env before anything reads the config: the
     // `[serve]` table fills in any knob the CLI/env left at its default, and the
-    // top-level `private-prefix` + shared `[filter]` reach the server here. The
-    // filter itself is resolved through sync's one shared path, so the proxy and
+    // top-level `private-prefix` + shared `[mirror]` reach the server here. The
+    // mirror selection itself is resolved through sync's one shared path, so the proxy and
     // a sync run can never drift.
     let file = config::load(config_path.as_deref())?;
     merge_serve_file(&mut cli, &file.serve, serve_matches)?;
@@ -916,8 +916,8 @@ async fn run_serve(
     let storage = cli.storage.build().await?;
     let proxy = match cli.proxy_upstream.as_deref() {
         Some(upstream) => {
-            let filter = cli.filter.resolve(Some(&file.filter))?;
-            Some(Arc::new(proxy::Proxy::new(upstream, filter)?))
+            let mirror = cli.mirror.resolve(Some(&file.mirror))?;
+            Some(Arc::new(proxy::Proxy::new(upstream, mirror)?))
         }
         None => None,
     };

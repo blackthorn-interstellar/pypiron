@@ -29,13 +29,13 @@ Everything it serves is what you push into it.
 
 ## 2. Define the allowlist
 
-On the sync host, put the destination, credential, package set, and filters in
+On the sync host, put the destination, credential, package set, and mirror rules in
 `pypiron.toml` — auto-discovered in the working directory.
 
 ```toml
-[filter]
-packages = ["requests>=2.20,<3", "numpy", "pandas"]
-only-wheels = true
+[mirror]
+include-packages = ["requests>=2.20,<3", "numpy", "pandas"]
+include-format = ["wheel"]
 exclude-newer = "2026-01-01T00:00:00Z"   # reproducible, historically-correct cutoff
 
 [sync]
@@ -43,10 +43,10 @@ to = "http://HOST:8080"
 admin-user = "admin"                     # password via PYPIRON_SYNC_ADMIN_PASS
 ```
 
-Each `[filter].packages` entry is a name with optional PEP 440 specifiers, so you
-pin exactly the versions you want mirrored. The whole `[filter]` slice — the
-allowlist included — is shared with the proxy: `only-wheels` skips sdists;
-`exclude-newer` mirrors only files PyPI received before the cutoff.
+Each `[mirror].include-packages` entry is a name with optional PEP 440 specifiers, so you
+pin exactly the versions you want mirrored. The whole `[mirror]` slice — the
+allowlist included — is shared with the proxy: `include-format = ["wheel"]`
+skips sdists; `exclude-newer` mirrors only files PyPI received before the cutoff.
 
 ## 3. Run the sync
 
@@ -107,10 +107,11 @@ If you set a read credential (`--read-user`/`--read-pass`), `/simple/` and
 `/files/` require auth — put the credentials in the index URL or your client's
 config. See [Authentication](../concepts/authentication.md).
 
-## Filters
+## Mirror selection
 
-`exclude-newer` and `only-wheels` are two of the filters that gate what a run
-adds. The full set — wheel/sdist, python/abi/platform tags, date cutoffs — is in
-[Configuration](../reference/configuration.md#filters), and the same `[filter]`
-slice governs the on-demand proxy. For how mirroring reconciles yanks, removals,
-and project status, see [Mirroring](../concepts/mirroring.md).
+`exclude-newer` and `include-format` are two of the mirror rules that gate what a
+run adds. The full set — package include/exclude, format, python/abi/platform
+tags, date cutoffs — is in
+[Configuration](../reference/configuration.md#mirror-selection), and the same
+`[mirror]` slice governs the on-demand proxy. For how mirroring reconciles yanks,
+removals, and project status, see [Mirroring](../concepts/mirroring.md).

@@ -39,7 +39,7 @@ use crate::sidecar::{
     metadata_key, provenance_key, sidecar_key, Sidecar, METADATA_SUFFIX, PROVENANCE_SUFFIX,
 };
 use crate::simple::{self, SimpleFile};
-use crate::sync::{matches_filters, ResolvedFilter};
+use crate::sync::{matches_mirror, ResolvedMirror};
 use crate::upload::{FinishedSpool, UploadSpool};
 use crate::{AppState, PACKAGES_PREFIX};
 
@@ -93,15 +93,19 @@ struct CacheEntry {
 
 pub struct Proxy {
     upstream: String,
-    filter: ResolvedFilter,
+    mirror: ResolvedMirror,
     /// The package scope as a fast name → version-constraints lookup, derived
-    /// once from `filter.packages`. `None` means no scope is configured (serve
+    /// once from `mirror.include_packages`. `None` means no scope is configured (serve
     /// any non-private name — the open-proxy default). A present map is a
     /// fail-closed allowlist: a name absent from it never falls through, and a
     /// name's constraints gate which versions are served. A name may carry
     /// several constraints (duplicate list entries); a version passes if any
     /// allows it, matching `sync`'s union semantics.
     scope: Option<HashMap<String, Vec<Option<VersionSpecifiers>>>>,
+    /// Package denylist as a fast name -> version-constraints lookup. `None`
+    /// means no denylist. A bare entry (`None`) denies the whole project; a
+    /// constrained entry denies only matching versions.
+    deny: Option<HashMap<String, Vec<Option<VersionSpecifiers>>>>,
     client: Client,
     listings: Mutex<HashMap<String, CacheEntry>>,
     /// Single-flight guard: at most one in-flight download per artifact key.
@@ -149,6 +153,9 @@ pub async fn eligible(state: &AppState, pkg: &str) -> Result<bool> {
     // The package allowlist is fail-closed and pure (no I/O), so it gates before
     // the origin read — an unapproved name never even touches storage.
     if let Some(proxy) = &state.proxy {
+        if proxy.name_fully_denied(pkg) {
+            return Ok(false);
+        }
         if !proxy.name_in_scope(pkg) {
             return Ok(false);
         }
@@ -180,16 +187,25 @@ fn version_allowed(constraints: &[Option<VersionSpecifiers>], filename: &str) ->
 }
 
 impl Proxy {
-    pub fn new(upstream: &str, filter: ResolvedFilter) -> Result<Self> {
+    pub fn new(upstream: &str, mirror: ResolvedMirror) -> Result<Self> {
         let upstream = upstream.trim_end_matches('/').to_string();
         if !upstream.starts_with("http://") && !upstream.starts_with("https://") {
             bail!("--proxy-upstream must be an http(s) URL, got '{upstream}'");
         }
         // Derive the request-time allowlist index once. Empty scope → None, so
         // name_in_scope() short-circuits to "allow all" (the open-proxy default).
-        let scope = (!filter.packages.is_empty()).then(|| {
+        let scope = (!mirror.include_packages.is_empty()).then(|| {
             let mut map: HashMap<String, Vec<Option<VersionSpecifiers>>> = HashMap::new();
-            for spec in &filter.packages {
+            for spec in &mirror.include_packages {
+                map.entry(spec.name.clone())
+                    .or_default()
+                    .push(spec.specifiers.clone());
+            }
+            map
+        });
+        let deny = (!mirror.exclude_packages.is_empty()).then(|| {
+            let mut map: HashMap<String, Vec<Option<VersionSpecifiers>>> = HashMap::new();
+            for spec in &mirror.exclude_packages {
                 map.entry(spec.name.clone())
                     .or_default()
                     .push(spec.specifiers.clone());
@@ -198,8 +214,9 @@ impl Proxy {
         });
         Ok(Self {
             upstream,
-            filter,
+            mirror,
             scope,
+            deny,
             client: Client::builder()
                 .user_agent(
                     "pypiron-proxy/0.1 (+https://github.com/blackthorn-interstellar/pypiron)",
@@ -243,17 +260,33 @@ impl Proxy {
         self.scope.as_ref().is_none_or(|m| m.contains_key(pkg))
     }
 
+    pub fn name_fully_denied(&self, pkg: &str) -> bool {
+        self.deny
+            .as_ref()
+            .and_then(|m| m.get(pkg))
+            .is_some_and(|constraints| constraints.iter().any(Option::is_none))
+    }
+
     /// Does this file satisfy the name's version constraints? Allowed when no
     /// scope is configured; otherwise the name's constraints gate the version.
     /// A name in scope is reached here only after [`name_in_scope`], so a miss
     /// in the map can't normally happen — treated fail-closed if it does.
     fn version_in_scope(&self, pkg: &str, filename: &str) -> bool {
-        match self.scope.as_ref() {
+        let allowed = match self.scope.as_ref() {
             None => true,
             Some(map) => map
                 .get(pkg)
                 .is_some_and(|constraints| version_allowed(constraints, filename)),
+        };
+        if !allowed {
+            return false;
         }
+        if let Some(constraints) = self.deny.as_ref().and_then(|m| m.get(pkg)) {
+            if version_allowed(constraints, filename) {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn upstream(&self) -> &str {
@@ -567,7 +600,7 @@ impl Proxy {
             .into_iter()
             // No digest, no service: every artifact we hand out is verifiable.
             .filter(|f| f.sha256().is_some())
-            .filter(|f| matches_filters(f, &self.filter))
+            .filter(|f| matches_mirror(f, &self.mirror))
             // The scope's version axis: a pinned/ranged allowlist entry serves
             // only matching versions, exactly as `sync` mirrors only matching
             // versions. No scope → kept.
@@ -713,7 +746,7 @@ mod tests {
 
     #[test]
     fn relative_and_absolute_upstream_urls_resolve() {
-        let proxy = Proxy::new("https://pypi.org/", ResolvedFilter::default()).unwrap();
+        let proxy = Proxy::new("https://pypi.org/", ResolvedMirror::default()).unwrap();
         assert_eq!(proxy.upstream(), "https://pypi.org");
         let abs = proxy
             .resolve_url("six", "https://files.pythonhosted.org/p/six.whl")
@@ -727,7 +760,7 @@ mod tests {
 
     #[test]
     fn non_http_upstream_is_rejected() {
-        let err = Proxy::new("ftp://mirror", ResolvedFilter::default())
+        let err = Proxy::new("ftp://mirror", ResolvedMirror::default())
             .map(|_| ())
             .unwrap_err();
         assert!(err.to_string().contains("http(s)"));
@@ -742,15 +775,15 @@ mod tests {
 
     #[test]
     fn empty_scope_allows_every_name_and_version() {
-        let proxy = Proxy::new("https://pypi.org", ResolvedFilter::default()).unwrap();
+        let proxy = Proxy::new("https://pypi.org", ResolvedMirror::default()).unwrap();
         assert!(proxy.name_in_scope("anything"));
         assert!(proxy.version_in_scope("anything", "anything-1.0.0.tar.gz"));
     }
 
     #[test]
     fn scope_gates_names_fail_closed() {
-        let filter = ResolvedFilter {
-            packages: vec![spec("requests", Some(">=2.20,<3")), spec("numpy", None)],
+        let filter = ResolvedMirror {
+            include_packages: vec![spec("requests", Some(">=2.20,<3")), spec("numpy", None)],
             ..Default::default()
         };
         let proxy = Proxy::new("https://pypi.org", filter).unwrap();
@@ -764,8 +797,8 @@ mod tests {
 
     #[test]
     fn scope_gates_versions_like_sync() {
-        let filter = ResolvedFilter {
-            packages: vec![spec("requests", Some(">=2.20,<3")), spec("numpy", None)],
+        let filter = ResolvedMirror {
+            include_packages: vec![spec("requests", Some(">=2.20,<3")), spec("numpy", None)],
             ..Default::default()
         };
         let proxy = Proxy::new("https://pypi.org", filter).unwrap();
@@ -783,13 +816,55 @@ mod tests {
     #[test]
     fn duplicate_entries_union_their_ranges() {
         // Two constrained entries for one name: a version matching either passes.
-        let filter = ResolvedFilter {
-            packages: vec![spec("foo", Some("==1.0")), spec("foo", Some("==3.0"))],
+        let mirror = ResolvedMirror {
+            include_packages: vec![spec("foo", Some("==1.0")), spec("foo", Some("==3.0"))],
             ..Default::default()
         };
-        let proxy = Proxy::new("https://pypi.org", filter).unwrap();
+        let proxy = Proxy::new("https://pypi.org", mirror).unwrap();
         assert!(proxy.version_in_scope("foo", "foo-1.0-py3-none-any.whl"));
         assert!(proxy.version_in_scope("foo", "foo-3.0-py3-none-any.whl"));
         assert!(!proxy.version_in_scope("foo", "foo-2.0-py3-none-any.whl"));
+    }
+
+    #[test]
+    fn empty_scope_with_bare_deny_excludes_that_name_only() {
+        let mirror = ResolvedMirror {
+            exclude_packages: vec![spec("blocked", None)],
+            ..Default::default()
+        };
+        let proxy = Proxy::new("https://pypi.org", mirror).unwrap();
+        assert!(proxy.name_in_scope("blocked"));
+        assert!(proxy.name_fully_denied("blocked"));
+        assert!(!proxy.version_in_scope("blocked", "blocked-1.0-py3-none-any.whl"));
+        assert!(!proxy.name_fully_denied("allowed"));
+        assert!(proxy.version_in_scope("allowed", "allowed-1.0-py3-none-any.whl"));
+    }
+
+    #[test]
+    fn version_pinned_deny_drops_old_versions_only() {
+        let mirror = ResolvedMirror {
+            exclude_packages: vec![spec("demo", Some("<2"))],
+            ..Default::default()
+        };
+        let proxy = Proxy::new("https://pypi.org", mirror).unwrap();
+        assert!(!proxy.name_fully_denied("demo"));
+        assert!(!proxy.version_in_scope("demo", "demo-1.9-py3-none-any.whl"));
+        assert!(proxy.version_in_scope("demo", "demo-2.0-py3-none-any.whl"));
+        assert!(proxy.version_in_scope("demo", "demo-garbage.whl"));
+    }
+
+    #[test]
+    fn deny_wins_over_allow() {
+        let mirror = ResolvedMirror {
+            include_packages: vec![spec("demo", None), spec("pinned", Some(">=1"))],
+            exclude_packages: vec![spec("demo", None), spec("pinned", Some("<2"))],
+            ..Default::default()
+        };
+        let proxy = Proxy::new("https://pypi.org", mirror).unwrap();
+        assert!(proxy.name_in_scope("demo"));
+        assert!(proxy.name_fully_denied("demo"));
+        assert!(!proxy.version_in_scope("demo", "demo-3.0-py3-none-any.whl"));
+        assert!(!proxy.version_in_scope("pinned", "pinned-1.5-py3-none-any.whl"));
+        assert!(proxy.version_in_scope("pinned", "pinned-2.0-py3-none-any.whl"));
     }
 }

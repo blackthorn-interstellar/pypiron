@@ -104,8 +104,8 @@ def sync_to(
 ) -> Tuple[int, str, str]:
     """Run `pypiron sync` in mirror-over-HTTP mode against `server` (the only
     mode). Mirroring is an admin operation, so it authenticates with the admin
-    credential. Pass the package selection (`--filter-package`/
-    `--filter-packages-list`) and any filters in `*extra`; `source` sets
+    credential. Pass the package selection (`--include-package`/
+    `--include-packages-from`) and any mirror rules in `*extra`; `source` sets
     `--from`. Returns (rc, out, err)."""
     args = [
         str(pypiron_bin),

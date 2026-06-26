@@ -31,16 +31,17 @@ served from local storage — **whether upstream is up or down**.
   about a minute; cached artifacts are immutable and kept forever.
 - If upstream is unreachable, a still-valid cached listing is reused and
   already-cached packages keep installing.
-- `--filter-*` filters gate what the proxy serves and caches — the *same* flags,
-  env vars, and `[filter]` table that `sync` uses (`--filter-only-wheels`,
-  `--filter-exclude-newer`, the tag filters). Set the slice once; it applies to
-  whichever you run. See [Configuration](../reference/configuration.md#filters).
-- An **approved-package list** (`--filter-package` / `[filter].packages`) makes
+- Mirror-selection flags gate what the proxy serves and caches — the *same*
+  flags, env vars, and `[mirror]` table that `sync` uses (`--include-format
+  wheel`, `--exclude-newer`, the tag selectors). Set the slice once; it applies
+  to whichever you run. See
+  [Configuration](../reference/configuration.md#mirror-selection).
+- An **approved-package list** (`--include-package` / `[mirror].include-packages`) makes
   the proxy **fail-closed**: with a list set, only those names fall through to
   upstream and every other name is `404`'d, and a version-pinned entry serves
   only matching versions. With no list, the proxy serves any non-private name on
   demand (the default). This is the same list `sync` mirrors — set it once, in
-  `[filter]`, and the push and pull paths agree.
+  `[mirror]`, and the push and pull paths agree.
 
 !!! note
     A name reserved by `--private-prefix`, already claimed `private` by an
@@ -61,17 +62,17 @@ needs nothing but the destination URL and an admin credential:
 pypiron sync \
   --to http://HOST:8080 \
   --admin-user admin --admin-pass "$ADMIN" \
-  --filter-package "requests>=2.20,<3" --filter-package numpy
+  --include-package "requests>=2.20,<3" --include-package numpy
 ```
 
-Put the allowlist and filters in `pypiron.toml` instead (auto-discovered in the
-working directory). The allowlist and filters live in `[filter]` — shared with
+Put the allowlist and mirror rules in `pypiron.toml` instead (auto-discovered in
+the working directory). The allowlist and mirror rules live in `[mirror]` — shared with
 the proxy; only the destination is sync-specific (`[sync]`):
 
 ```toml
-[filter]
-packages = ["requests>=2.20,<3", "numpy", "pandas"]
-only-wheels = true
+[mirror]
+include-packages = ["requests>=2.20,<3", "numpy", "pandas"]
+include-format = ["wheel"]
 exclude-newer = "2026-01-01T00:00:00Z"
 
 [sync]
@@ -134,7 +135,7 @@ pypiron sync --full   # ignore the cursor; re-fetch and fully reconcile everythi
 | ------------------- | ------------------------------------ | ------------------------------------- |
 | When files arrive   | Lazily, on first request             | Ahead of time, when you run `sync`    |
 | Who initiates       | The serving node, per cache miss     | A separate client (any host with egress) |
-| Package set         | The `[filter]` slice — any non-private name, or only an approved list if you set one | An explicit allowlist (required) |
+| Package set         | The `[mirror]` slice — any non-private name, or only an approved list if you set one | An explicit allowlist (required) |
 | Egress from server  | Required (until cached)              | None — the syncing host needs it      |
 | Offline serving     | Cached files only                    | Everything you synced                 |
 | Reconcile yanks/removals | Listings refresh every 60s      | On re-sync (`--full` for a sweep)     |
@@ -145,7 +146,7 @@ pypiron sync --full   # ignore the cursor; re-fetch and fully reconcile everythi
   node has no egress.
 - [Private + public](../guides/private-and-public.md) — one index for uploads,
   synced, and proxied packages.
-- [Supply-chain defense](supply-chain.md) — `--filter-exclude-newer` for a
+- [Supply-chain defense](supply-chain.md) — `--exclude-newer` for a
   reproducible, historically-correct cutoff on both paths.
-- [Configuration](../reference/configuration.md#filters) — the shared `--filter-*`
-  surface, plus the `pypiron.toml` reference.
+- [Configuration](../reference/configuration.md#mirror-selection) — the shared
+  mirror-selection surface, plus the `pypiron.toml` reference.

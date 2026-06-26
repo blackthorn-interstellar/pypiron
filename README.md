@@ -30,7 +30,7 @@ on demand, and bulk-syncs allowlists — all behind one URL and one namespace.
 - **Download tracking.** Per-package, per-version counts at
   `GET /stats/downloads/<pkg>`; per-project labels in Prometheus `/metrics`.
 - **Supply-chain quarantine.** Hide releases younger than a window with
-  `--filter-exclude-newer`; `uv --exclude-newer` resolves against it.
+  `--exclude-newer`; `uv --exclude-newer` resolves against it.
 
 ## Quickstart
 

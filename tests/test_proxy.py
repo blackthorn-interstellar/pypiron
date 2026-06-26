@@ -38,7 +38,7 @@ def test_proxy_serves_and_caches_upstream_package(proxy_pair, tmp_path):
     data = get_index_json(proxy["simple"], "proxydemo")
     entry = next(f for f in data["files"] if f["filename"] == wheel.name)
     assert entry["hashes"]["sha256"] == sha256_file(wheel)
-    # PEP 700 upload-time rides through — --filter-exclude-newer keeps working.
+    # PEP 700 upload-time rides through — --exclude-newer keeps working.
     assert entry.get("upload-time")
 
     # First artifact GET downloads, verifies, commits, serves.
@@ -116,7 +116,7 @@ def test_private_prefix_blocks_proxy(proxy_pair_prefixed, tmp_path):
     assert code == 404
 
 
-def test_proxy_filters_gate_what_is_served(proxy_pair_wheels_only, tmp_path):
+def test_proxy_mirror_rules_gate_what_is_served(proxy_pair_wheels_only, tmp_path):
     upstream, proxy = (
         proxy_pair_wheels_only["upstream"],
         proxy_pair_wheels_only["proxy"],
@@ -131,7 +131,7 @@ def test_proxy_filters_gate_what_is_served(proxy_pair_wheels_only, tmp_path):
     assert wheel.name in filenames
     assert sdist.name not in filenames
 
-    # Filtered files aren't downloadable either — the filter gates the cache.
+    # Excluded files aren't downloadable either — the mirror rules gate the cache.
     code, _, _ = http_get(f"{proxy['base_url']}/files/filterpkg/{sdist.name}")
     assert code == 404
     code, _, _ = http_get(f"{proxy['base_url']}/files/filterpkg/{wheel.name}")
@@ -139,7 +139,7 @@ def test_proxy_filters_gate_what_is_served(proxy_pair_wheels_only, tmp_path):
 
 
 def test_proxy_allowlist_gates_names_and_versions(proxy_pair_scoped, tmp_path):
-    """The package scope (`--filter-package`/`[filter].packages`) is fail-closed
+    """The package scope (`--include-package`/`[mirror].include-packages`) is fail-closed
     on the proxy: only approved names fall through, and a version-pinned entry
     serves only matching versions — the pull twin of what `sync` mirrors."""
     upstream, proxy = proxy_pair_scoped["upstream"], proxy_pair_scoped["proxy"]
@@ -169,6 +169,43 @@ def test_proxy_allowlist_gates_names_and_versions(proxy_pair_scoped, tmp_path):
     code, _, _ = http_get(f"{proxy['simple']}blocked/index.json", headers={"Accept": ACCEPT_PEP691})
     assert code == 404
     assert http_get(f"{proxy['base_url']}/files/blocked/{blocked.name}")[0] == 404
+
+
+def test_proxy_denylist_subtracts_from_open_proxy(proxy_pair_denylist, tmp_path):
+    upstream, proxy = proxy_pair_denylist["upstream"], proxy_pair_denylist["proxy"]
+    allowed = make_wheel("allowedopen", "1.0", tmp_path)
+    blocked = make_wheel("blocked", "1.0", tmp_path)
+    pinned_old = make_wheel("pinned", "1.0", tmp_path)
+    pinned_new = make_wheel("pinned", "2.0", tmp_path)
+    _upload(upstream, allowed, "allowedopen")
+    _upload(upstream, blocked, "blocked")
+    _upload(upstream, pinned_old, "pinned")
+    _upload(upstream, pinned_new, "pinned")
+
+    data = get_index_json(proxy["simple"], "allowedopen")
+    assert [f["filename"] for f in data["files"]] == [allowed.name]
+    assert http_get(f"{proxy['base_url']}/files/allowedopen/{allowed.name}")[0] == 200
+
+    code, _, _ = http_get(f"{proxy['simple']}blocked/index.json", headers={"Accept": ACCEPT_PEP691})
+    assert code == 404
+    assert http_get(f"{proxy['base_url']}/files/blocked/{blocked.name}")[0] == 404
+
+    data = get_index_json(proxy["simple"], "pinned")
+    filenames = [f["filename"] for f in data["files"]]
+    assert pinned_new.name in filenames
+    assert pinned_old.name not in filenames
+    assert http_get(f"{proxy['base_url']}/files/pinned/{pinned_new.name}")[0] == 200
+    assert http_get(f"{proxy['base_url']}/files/pinned/{pinned_old.name}")[0] == 404
+
+
+def test_proxy_deny_wins_over_allow(proxy_pair_deny_wins, tmp_path):
+    upstream, proxy = proxy_pair_deny_wins["upstream"], proxy_pair_deny_wins["proxy"]
+    wheel = make_wheel("both", "1.0", tmp_path)
+    _upload(upstream, wheel, "both")
+
+    code, _, _ = http_get(f"{proxy['simple']}both/index.json", headers={"Accept": ACCEPT_PEP691})
+    assert code == 404
+    assert http_get(f"{proxy['base_url']}/files/both/{wheel.name}")[0] == 404
 
 
 def test_unknown_package_404s_through_proxy(proxy_pair):

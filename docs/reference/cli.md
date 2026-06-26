@@ -59,25 +59,25 @@ backend.
 ```bash
 pypiron sync \
   --to http://localhost:8080 --admin-pass "$ADMIN" \
-  --filter-package "requests>=2.20,<3" --filter-package numpy
+  --include-package "requests>=2.20,<3" --include-package numpy
 ```
 
 | Flag | Purpose |
 | --- | --- |
 | `--to` | Destination pypiron base URL. Required. |
 | `--from` | Source index base. Default `https://pypi.org`. |
-| `--filter-package` | One package, with optional PEP 440 specifiers. Repeatable. Shared with `serve` (see [Configuration](configuration.md#filters)). |
-| `--filter-packages-list` | Text file of packages, one per line. |
+| `--include-package` | One package, with optional PEP 440 specifiers. Repeatable. Shared with `serve` (see [Configuration](configuration.md#mirror-selection)). |
+| `--include-packages-from` | Text file of packages, one per line. |
 | `--config` | Path to a `pypiron.toml` (global; read by every subcommand — `verify-index`/`rebuild-index` use its `[serve]` storage selection). Defaults to `./pypiron.toml` when present. |
 | `--admin-user` / `--admin-pass` | Admin credential for the destination. |
 | `--full` | Ignore the conditional-fetch memo; re-fetch and reconcile everything. |
 | `--dry-run` | Print what would be copied, transfer nothing. |
-| `--filter-exclude-newer` | Only mirror files received upstream before a cutoff (timestamp, date, `7`, `30 days`, `P30D`). One of the shared `--filter-*` flags (see [Configuration](configuration.md#filters)). |
+| `--exclude-newer` | Only mirror files received upstream before a cutoff (timestamp, date, `7`, `30 days`, `P30D`). One of the shared mirror-selection flags (see [Configuration](configuration.md#mirror-selection)). |
 
 A normal run only touches projects whose upstream listing changed; `--full` is
 the periodic self-heal. Once mirrored, an artifact is never deleted — re-runs
 reconcile yank state and project status. See
-[Mirroring](../concepts/mirroring.md) for filters and the full flag set.
+[Mirroring](../concepts/mirroring.md) for mirror selection and the full flag set.
 
 ## verify-index
 

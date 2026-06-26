@@ -6,8 +6,8 @@
 //! storage write — sync needs a URL (`--to`) and the admin credential, nothing
 //! about the server's storage backend.
 //!
-//! Filters (`--only-wheels`, tag filters, `--exclude-newer`/`--exclude-older`,
-//! PEP 440 specifiers in the package list) gate only what a run *adds* — an
+//! Mirror rules (`--include-format`, tag filters, `--exclude-newer`/
+//! `--exclude-older`, PEP 440 specifiers in the package list) gate only what a run *adds* — an
 //! artifact, once mirrored, is never deleted. A re-sync does, however,
 //! *reconcile* the mutable metadata of files it already has: yank state is
 //! brought in line with upstream (set, cleared, or its reason updated, via the
@@ -40,7 +40,7 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tokio::fs;
 use tracing::{error, info, warn};
 
-use crate::config::{self, ConfigFile, FilterFile};
+use crate::config::{self, ConfigFile, MirrorConfig};
 use crate::names::{
     checked_pkg_name, infer_version_from_filename, matches_prefix, normalize_pkg_name,
     parse_wheel_tags, WheelTags,
@@ -111,84 +111,100 @@ pub struct SyncArgs {
     #[arg(long = "no-progress", env = "PYPIRON_SYNC_NO_PROGRESS")]
     pub no_progress: bool,
 
-    /// Filtering flags (wheel/python/abi/platform/upload-time).
+    /// Mirror selection flags (names, formats, tags, upload-time).
     #[command(flatten)]
-    pub filter: FilterArgs,
+    pub mirror: MirrorArgs,
 }
 
 /// The slice of PyPI to mirror/proxy. One surface, flattened into both `sync`
-/// and `serve`: the same `--filter-*` flags and `PYPIRON_FILTER_*` env vars
-/// govern the push mirror and the on-demand proxy alike. The file form is the
-/// `[filter]` table in pypiron.toml (see [`FilterFile`]).
+/// and `serve`: the same mirror flags and `PYPIRON_INCLUDE_*`/`PYPIRON_EXCLUDE_*`
+/// env vars govern the push mirror and the on-demand proxy alike. The file form
+/// is the `[mirror]` table in pypiron.toml (see [`MirrorConfig`]).
 #[derive(Debug, Clone, Default, Args)]
-pub struct FilterArgs {
-    /// Restrict to these packages: a name with optional PEP 440 specifiers
+pub struct MirrorArgs {
+    /// Include these packages: a name with optional PEP 440 specifiers
     /// (e.g. `requests>=2.20,<3`); repeatable. `sync` mirrors exactly these;
     /// the `serve` proxy serves only these from upstream and 404s the rest
     /// (fail-closed). Commas belong to the specifier — pass multiple packages
-    /// as repeated `--filter-package`, not a comma-joined list (unlike the
-    /// comma-splitting `--filter-*-tag` flags). A CLI package source
-    /// (`--filter-package` and/or `--filter-packages-list`) replaces the config
-    /// file's `[filter].packages`/`packages-list` entirely.
+    /// as repeated `--include-package`, not a comma-joined list (unlike the
+    /// comma-splitting tag/format flags). A CLI include package source
+    /// (`--include-package` and/or `--include-packages-from`) replaces the config
+    /// file's `[mirror].include-packages`/`include-packages-from` entirely.
     #[arg(
-        long = "filter-package",
-        env = "PYPIRON_FILTER_PACKAGE",
+        long = "include-package",
+        env = "PYPIRON_INCLUDE_PACKAGE",
         value_name = "SPEC"
     )]
-    pub package: Vec<String>,
+    pub include_package: Vec<String>,
 
-    /// File of package specs to restrict to, one per line; same syntax as
-    /// `--filter-package`. Blank lines and lines beginning with `#` are ignored.
+    /// File of package specs to include, one per line; same syntax as
+    /// `--include-package`. Blank lines and lines beginning with `#` are ignored.
     #[arg(
-        long = "filter-packages-list",
-        env = "PYPIRON_FILTER_PACKAGES_LIST",
+        long = "include-packages-from",
+        env = "PYPIRON_INCLUDE_PACKAGES_FROM",
         value_name = "FILE"
     )]
-    pub packages_list: Option<PathBuf>,
+    pub include_packages_from: Option<PathBuf>,
 
-    /// Only mirror/proxy wheel files (.whl)
+    /// Exclude these packages from the include set; same syntax as
+    /// `--include-package`. Bare names deny the whole project; specifiers deny
+    /// only matching versions.
     #[arg(
-        long = "filter-only-wheels",
-        env = "PYPIRON_FILTER_ONLY_WHEELS",
-        conflicts_with = "only_sdists"
+        long = "exclude-package",
+        env = "PYPIRON_EXCLUDE_PACKAGE",
+        value_name = "SPEC"
     )]
-    pub only_wheels: bool,
+    pub exclude_package: Vec<String>,
 
-    /// Only mirror/proxy source distributions (sdist)
-    #[arg(long = "filter-only-sdists", env = "PYPIRON_FILTER_ONLY_SDISTS")]
-    pub only_sdists: bool,
+    /// File of package specs to exclude, one per line; same syntax as
+    /// `--exclude-package`.
+    #[arg(
+        long = "exclude-packages-from",
+        env = "PYPIRON_EXCLUDE_PACKAGES_FROM",
+        value_name = "FILE"
+    )]
+    pub exclude_packages_from: Option<PathBuf>,
+
+    /// Artifact formats to include: wheel, sdist, other. Comma-separated or repeatable.
+    #[arg(
+        long = "include-format",
+        env = "PYPIRON_INCLUDE_FORMAT",
+        value_delimiter = ',',
+        value_name = "VALUE"
+    )]
+    pub include_format: Vec<String>,
 
     /// Include wheels whose python tag matches any of these (e.g. py3, cp311). Comma-separated or repeatable.
     #[arg(
-        long = "filter-python-tag",
-        env = "PYPIRON_FILTER_PYTHON_TAG",
+        long = "include-python-tag",
+        env = "PYPIRON_INCLUDE_PYTHON_TAG",
         value_delimiter = ',',
         value_name = "TAG"
     )]
-    pub python_tag: Vec<String>,
+    pub include_python_tag: Vec<String>,
 
     /// Include wheels whose ABI tag matches any of these (e.g. none, cp311). Comma-separated or repeatable.
     #[arg(
-        long = "filter-abi-tag",
-        env = "PYPIRON_FILTER_ABI_TAG",
+        long = "include-abi-tag",
+        env = "PYPIRON_INCLUDE_ABI_TAG",
         value_delimiter = ',',
         value_name = "TAG"
     )]
-    pub abi_tag: Vec<String>,
+    pub include_abi_tag: Vec<String>,
 
     /// Include wheels whose platform tag matches any of these (e.g. any, manylinux2014_x86_64, macosx_*_arm64, win_amd64). Supports '*' wildcard.
     #[arg(
-        long = "filter-platform-tag",
-        env = "PYPIRON_FILTER_PLATFORM_TAG",
+        long = "include-platform-tag",
+        env = "PYPIRON_INCLUDE_PLATFORM_TAG",
         value_delimiter = ',',
         value_name = "TAG"
     )]
-    pub platform_tag: Vec<String>,
+    pub include_platform_tag: Vec<String>,
 
     /// Exclude wheels whose platform tag matches any of these (supports '*' wildcard).
     #[arg(
-        long = "filter-exclude-platform-tag",
-        env = "PYPIRON_FILTER_EXCLUDE_PLATFORM_TAG",
+        long = "exclude-platform-tag",
+        env = "PYPIRON_EXCLUDE_PLATFORM_TAG",
         value_delimiter = ',',
         value_name = "TAG"
     )]
@@ -201,17 +217,17 @@ pub struct FilterArgs {
     /// (P30D, PT24H); durations are relative to now. Calendar months/years are
     /// not allowed.
     #[arg(
-        long = "filter-exclude-newer",
-        env = "PYPIRON_FILTER_EXCLUDE_NEWER",
+        long = "exclude-newer",
+        env = "PYPIRON_EXCLUDE_NEWER",
         value_name = "WHEN"
     )]
     pub exclude_newer: Option<String>,
 
     /// Only mirror/proxy files received upstream at or after this cutoff. Same
-    /// formats as --filter-exclude-newer.
+    /// formats as --exclude-newer.
     #[arg(
-        long = "filter-exclude-older",
-        env = "PYPIRON_FILTER_EXCLUDE_OLDER",
+        long = "exclude-older",
+        env = "PYPIRON_EXCLUDE_OLDER",
         value_name = "WHEN"
     )]
     pub exclude_older: Option<String>,
@@ -220,55 +236,49 @@ pub struct FilterArgs {
     /// drops cp36–cp39 and python-2 wheels). Version-agnostic wheels (py3,
     /// py2.py3), forward-compatible abi3 wheels, and all sdists are kept.
     #[arg(
-        long = "filter-min-python",
-        env = "PYPIRON_FILTER_MIN_PYTHON",
+        long = "exclude-python-below",
+        env = "PYPIRON_EXCLUDE_PYTHON_BELOW",
         value_name = "X.Y"
     )]
-    pub min_python: Option<String>,
+    pub exclude_python_below: Option<String>,
 
     /// Skip PEP 440 dev releases (any version with a `.devN` segment).
-    #[arg(long = "filter-exclude-dev", env = "PYPIRON_FILTER_EXCLUDE_DEV")]
+    #[arg(long = "exclude-dev", env = "PYPIRON_EXCLUDE_DEV")]
     pub exclude_dev: bool,
 
     /// Skip Windows artifacts: wheels with a win32/win_amd64/win_arm64 platform
     /// tag, plus legacy Windows installers (.exe/.msi and .winXX filenames).
-    #[arg(
-        long = "filter-exclude-windows",
-        env = "PYPIRON_FILTER_EXCLUDE_WINDOWS"
-    )]
+    #[arg(long = "exclude-windows", env = "PYPIRON_EXCLUDE_WINDOWS")]
     pub exclude_windows: bool,
 
     /// Skip PEP 440 pre-releases: alpha/beta/rc *and* dev releases. The strict
-    /// superset of --filter-exclude-dev (keep stable releases only).
-    #[arg(
-        long = "filter-exclude-prereleases",
-        env = "PYPIRON_FILTER_EXCLUDE_PRERELEASES"
-    )]
+    /// superset of --exclude-dev (keep stable releases only).
+    #[arg(long = "exclude-prereleases", env = "PYPIRON_EXCLUDE_PRERELEASES")]
     pub exclude_prereleases: bool,
 
     /// Skip artifacts larger than this size (e.g. 250MB, 1.5GiB, 1048576). Units
     /// are powers of 1024 (KB == KiB); a bare number is bytes. A file whose size
     /// is absent from the upstream listing is kept.
     #[arg(
-        long = "filter-max-size",
-        env = "PYPIRON_FILTER_MAX_SIZE",
+        long = "exclude-larger",
+        env = "PYPIRON_EXCLUDE_LARGER",
         value_name = "SIZE"
     )]
-    pub max_size: Option<String>,
+    pub exclude_larger: Option<String>,
 
     /// Mirror files yanked upstream (PEP 592). Yanked files are *excluded by
     /// default*; pass this to pull them anyway (still flagged yanked, so a pinned
     /// install resolves). Either way, files already mirrored are never removed —
     /// the filter only gates what a run pulls in.
-    #[arg(long = "filter-include-yanked", env = "PYPIRON_FILTER_INCLUDE_YANKED")]
+    #[arg(long = "include-yanked", env = "PYPIRON_INCLUDE_YANKED")]
     pub include_yanked: bool,
 }
 
-impl FilterArgs {
-    /// The raw `--filter-exclude-older` input (CLI/env over file), trimmed —
+impl MirrorArgs {
+    /// The raw `--exclude-older` input (CLI/env over file), trimmed —
     /// kept verbatim so sync's [`config_key`] hashes a value that is stable
     /// across runs rather than the now-relative instant a duration resolves to.
-    pub(crate) fn exclude_older_raw(&self, file: Option<&FilterFile>) -> Option<String> {
+    pub(crate) fn exclude_older_raw(&self, file: Option<&MirrorConfig>) -> Option<String> {
         self.exclude_older
             .as_deref()
             .or(file.and_then(|f| f.exclude_older.as_deref()))
@@ -277,60 +287,60 @@ impl FilterArgs {
             .map(str::to_owned)
     }
 
-    /// Resolve CLI/env over the optional `[filter]` table into the runtime
+    /// Resolve CLI/env over the optional `[mirror]` table into the runtime
     /// predicate. The single path used by both `sync` and the `serve` proxy, so
     /// the two can never drift. Precedence is CLI/env > file > default; a bool
     /// set in the file can be turned *on* but not off by the absence of a flag
     /// (clap cannot express an explicit `false`).
-    pub(crate) fn resolve(&self, file: Option<&FilterFile>) -> Result<ResolvedFilter> {
-        let only_wheels = self.only_wheels || file.and_then(|f| f.only_wheels).unwrap_or(false);
-        let only_sdists = self.only_sdists || file.and_then(|f| f.only_sdists).unwrap_or(false);
-        if only_wheels && only_sdists {
-            // Would select nothing and "succeed" — a silent empty mirror.
-            bail!("filter-only-wheels and filter-only-sdists are mutually exclusive");
-        }
-        Ok(ResolvedFilter {
-            packages: self.resolve_packages(file)?,
-            only_wheels,
-            only_sdists,
-            python_tag: pick_vec(&self.python_tag, file.and_then(|f| f.python_tag.clone())),
-            abi_tag: pick_vec(&self.abi_tag, file.and_then(|f| f.abi_tag.clone())),
-            platform_tag: pick_vec(
-                &self.platform_tag,
-                file.and_then(|f| f.platform_tag.clone()),
+    pub(crate) fn resolve(&self, file: Option<&MirrorConfig>) -> Result<ResolvedMirror> {
+        Ok(ResolvedMirror {
+            include_packages: self.resolve_include_packages(file)?,
+            exclude_packages: self.resolve_exclude_packages(file)?,
+            include_format: parse_formats(&pick_vec(
+                &self.include_format,
+                file.and_then(|f| f.include_format.clone()),
+            ))?,
+            include_python_tag: pick_vec(
+                &self.include_python_tag,
+                file.and_then(|f| f.include_python_tag.clone()),
+            ),
+            include_abi_tag: pick_vec(
+                &self.include_abi_tag,
+                file.and_then(|f| f.include_abi_tag.clone()),
+            ),
+            include_platform_tag: pick_vec(
+                &self.include_platform_tag,
+                file.and_then(|f| f.include_platform_tag.clone()),
             ),
             exclude_platform_tag: pick_vec(
                 &self.exclude_platform_tag,
                 file.and_then(|f| f.exclude_platform_tag.clone()),
             ),
             exclude_newer: parse_cutoff(
-                "filter-exclude-newer",
+                "exclude-newer",
                 self.exclude_newer
                     .as_ref()
                     .or(file.and_then(|f| f.exclude_newer.as_ref())),
             )?,
-            exclude_older: parse_cutoff(
-                "filter-exclude-older",
-                self.exclude_older_raw(file).as_ref(),
-            )?,
-            min_python: parse_min_python(
-                self.min_python
+            exclude_older: parse_cutoff("exclude-older", self.exclude_older_raw(file).as_ref())?,
+            exclude_python_below: parse_exclude_python_below(
+                self.exclude_python_below
                     .as_deref()
-                    .or(file.and_then(|f| f.min_python.as_deref())),
+                    .or(file.and_then(|f| f.exclude_python_below.as_deref())),
             )?,
             exclude_dev: self.exclude_dev || file.and_then(|f| f.exclude_dev).unwrap_or(false),
             exclude_windows: self.exclude_windows
                 || file.and_then(|f| f.exclude_windows).unwrap_or(false),
             exclude_prereleases: self.exclude_prereleases
                 || file.and_then(|f| f.exclude_prereleases).unwrap_or(false),
-            max_size: parse_size(
-                "filter-max-size",
-                self.max_size
+            exclude_larger: parse_size(
+                "exclude-larger",
+                self.exclude_larger
                     .as_deref()
-                    .or(file.and_then(|f| f.max_size.as_deref())),
+                    .or(file.and_then(|f| f.exclude_larger.as_deref())),
             )?,
-            // Yanked is excluded by default; --filter-include-yanked (CLI/env) or
-            // `[filter].include-yanked = true` opts back in. Same precedence shape
+            // Yanked is excluded by default; --include-yanked (CLI/env) or
+            // `[mirror].include-yanked = true` opts back in. Same precedence shape
             // as the other bool filters: CLI can only turn the opt-in *on*, never
             // force-exclude over a file that opted in.
             exclude_yanked: !(self.include_yanked
@@ -338,64 +348,112 @@ impl FilterArgs {
         })
     }
 
-    /// Resolve the package scope (the filter's name axis): CLI over file,
-    /// parsed into specs. A CLI source (`--filter-package` and/or
-    /// `--filter-packages-list`) replaces the file's `packages`/`packages-list`
-    /// entirely; with no CLI source the file's list file and inline array
-    /// combine. Empty is allowed here — `serve` reads it as "any name" and
-    /// `sync` enforces non-empty itself. The list file is read with `std::fs`
-    /// so this stays synchronous and serves both the async `sync` startup and
-    /// the `serve` startup through one path.
-    fn resolve_packages(&self, file: Option<&FilterFile>) -> Result<Vec<PackageSpec>> {
-        let mut lines: Vec<String> = Vec::new();
-        if self.packages_list.is_some() || !self.package.is_empty() {
-            if let Some(path) = &self.packages_list {
-                let text = std::fs::read_to_string(path)
-                    .with_context(|| format!("reading {}", path.display()))?;
-                lines.extend(text.lines().map(str::to_string));
-            }
-            lines.extend(self.package.iter().cloned());
-            // Announce the override so a stray `--filter-package foo` doesn't
-            // silently drop a populated `[filter]` package source.
-            let mut ignored = Vec::new();
-            if let Some(n) = file
-                .and_then(|f| f.packages.as_ref())
-                .map(Vec::len)
-                .filter(|n| *n > 0)
-            {
-                ignored.push(format!("{n} inline package(s)"));
-            }
-            if let Some(path) = file.and_then(|f| f.packages_list.as_ref()) {
-                ignored.push(format!("packages-list {}", path.display()));
-            }
-            if !ignored.is_empty() {
-                info!(
-                    "CLI --filter-package/--filter-packages-list overrides the pypiron.toml [filter] package set (ignoring {})",
-                    ignored.join(" + ")
-                );
-            }
-        } else if let Some(file) = file {
-            if let Some(path) = &file.packages_list {
-                let text = std::fs::read_to_string(path)
-                    .with_context(|| format!("reading {}", path.display()))?;
-                lines.extend(text.lines().map(str::to_string));
-            }
-            lines.extend(file.packages.clone().unwrap_or_default());
-        }
+    fn resolve_include_packages(&self, file: Option<&MirrorConfig>) -> Result<Vec<PackageSpec>> {
+        resolve_packages(
+            &self.include_package,
+            self.include_packages_from.as_deref(),
+            file.and_then(|f| f.include_packages.as_ref()),
+            file.and_then(|f| f.include_packages_from.as_deref()),
+            PackageSourceNames {
+                cli_inline: "--include-package",
+                cli_from_file: "--include-packages-from",
+                table: "[mirror]",
+                file_inline: "include-packages",
+                file_from_file: "include-packages-from",
+                label: "include package",
+            },
+        )
+    }
 
-        let mut specs = Vec::new();
-        for (lineno, raw) in lines.iter().enumerate() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            specs.push(
-                parse_spec_line(line)
-                    .with_context(|| format!("package entry {} ('{line}')", lineno + 1))?,
+    fn resolve_exclude_packages(&self, file: Option<&MirrorConfig>) -> Result<Vec<PackageSpec>> {
+        resolve_packages(
+            &self.exclude_package,
+            self.exclude_packages_from.as_deref(),
+            file.and_then(|f| f.exclude_packages.as_ref()),
+            file.and_then(|f| f.exclude_packages_from.as_deref()),
+            PackageSourceNames {
+                cli_inline: "--exclude-package",
+                cli_from_file: "--exclude-packages-from",
+                table: "[mirror]",
+                file_inline: "exclude-packages",
+                file_from_file: "exclude-packages-from",
+                label: "exclude package",
+            },
+        )
+    }
+}
+
+struct PackageSourceNames {
+    cli_inline: &'static str,
+    cli_from_file: &'static str,
+    table: &'static str,
+    file_inline: &'static str,
+    file_from_file: &'static str,
+    label: &'static str,
+}
+
+/// Resolve one package-spec axis: CLI over file, parsed into specs. A CLI
+/// source replaces the matching file source entirely; with no CLI source the
+/// file's list file and inline array combine. Empty is allowed here — `serve`
+/// reads an empty include set as "any name" and `sync` enforces non-empty
+/// includes itself. The list files are read with `std::fs` so this stays
+/// synchronous and serves both the async `sync` startup and the `serve` startup
+/// through one path.
+fn resolve_packages(
+    cli_inline: &[String],
+    cli_from_file: Option<&Path>,
+    file_inline: Option<&Vec<String>>,
+    file_from_file: Option<&Path>,
+    names: PackageSourceNames,
+) -> Result<Vec<PackageSpec>> {
+    let mut lines: Vec<String> = Vec::new();
+    if cli_from_file.is_some() || !cli_inline.is_empty() {
+        if let Some(path) = cli_from_file {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            lines.extend(text.lines().map(str::to_string));
+        }
+        lines.extend(cli_inline.iter().cloned());
+        // Announce the override so a stray CLI package source doesn't
+        // silently drop a populated `[mirror]` package source.
+        let mut ignored = Vec::new();
+        if let Some(n) = file_inline.map(Vec::len).filter(|n| *n > 0) {
+            ignored.push(format!("{} ({n} spec(s))", names.file_inline));
+        }
+        if let Some(path) = file_from_file {
+            ignored.push(format!("{} {}", names.file_from_file, path.display()));
+        }
+        if !ignored.is_empty() {
+            info!(
+                "CLI {}/{} overrides the pypiron.toml {} {} set (ignoring {})",
+                names.cli_inline,
+                names.cli_from_file,
+                names.table,
+                names.label,
+                ignored.join(" + "),
             );
         }
-        Ok(specs)
+    } else {
+        if let Some(path) = file_from_file {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            lines.extend(text.lines().map(str::to_string));
+        }
+        lines.extend(file_inline.cloned().unwrap_or_default());
     }
+
+    let mut specs = Vec::new();
+    for (lineno, raw) in lines.iter().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        specs.push(
+            parse_spec_line(line)
+                .with_context(|| format!("package entry {} ('{line}')", lineno + 1))?,
+        );
+    }
+    Ok(specs)
 }
 
 /// One package in the scope, with optional PEP 440 version constraints. The
@@ -404,6 +462,57 @@ impl FilterArgs {
 pub(crate) struct PackageSpec {
     pub(crate) name: String,
     pub(crate) specifiers: Option<VersionSpecifiers>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Format {
+    Wheel,
+    Sdist,
+    Other,
+}
+
+impl Format {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Wheel => "wheel",
+            Self::Sdist => "sdist",
+            Self::Other => "other",
+        }
+    }
+}
+
+fn parse_formats(values: &[String]) -> Result<Vec<Format>> {
+    let mut formats = Vec::new();
+    for raw in values {
+        for value in raw.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+            let format = match value.to_ascii_lowercase().as_str() {
+                "wheel" => Format::Wheel,
+                "sdist" => Format::Sdist,
+                "other" => Format::Other,
+                _ => bail!("include-format '{value}' is not valid; use wheel, sdist, or other"),
+            };
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+        }
+    }
+    formats.sort();
+    Ok(formats)
+}
+
+fn file_format(filename: &str) -> Format {
+    let fname = filename.to_ascii_lowercase();
+    if fname.ends_with(".whl") {
+        Format::Wheel
+    } else if fname.ends_with(".tar.gz")
+        || fname.ends_with(".tgz")
+        || fname.ends_with(".tar.bz2")
+        || fname.ends_with(".zip")
+    {
+        Format::Sdist
+    } else {
+        Format::Other
+    }
 }
 
 /// Everything resolved: CLI/env over pypiron.toml over defaults, all inputs
@@ -419,7 +528,7 @@ struct Resolved {
     spool_dir: PathBuf,
     dry_run: bool,
     full: bool,
-    filter: ResolvedFilter,
+    mirror: ResolvedMirror,
     /// The raw `--exclude-older` input (e.g. `"800 days"`), kept verbatim for
     /// [`config_key`]: a relative duration must hash to a value that is *stable*
     /// across runs, or the sync cursor never matches its own prior config and
@@ -428,23 +537,24 @@ struct Resolved {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct ResolvedFilter {
-    /// The package scope (the filter's name axis). Empty means "no name
+pub(crate) struct ResolvedMirror {
+    /// The package include scope (the mirror's name axis). Empty means "no name
     /// restriction": `sync` rejects that (it needs an explicit work list), but
     /// the `serve` proxy treats it as "serve any non-private name", preserving
     /// the open-proxy default. Non-empty is a fail-closed allowlist.
-    pub(crate) packages: Vec<PackageSpec>,
-    pub(crate) only_wheels: bool,
-    pub(crate) only_sdists: bool,
-    pub(crate) python_tag: Vec<String>,
-    pub(crate) abi_tag: Vec<String>,
-    pub(crate) platform_tag: Vec<String>,
+    pub(crate) include_packages: Vec<PackageSpec>,
+    /// Package deny specs. Empty means no package subtraction.
+    pub(crate) exclude_packages: Vec<PackageSpec>,
+    pub(crate) include_format: Vec<Format>,
+    pub(crate) include_python_tag: Vec<String>,
+    pub(crate) include_abi_tag: Vec<String>,
+    pub(crate) include_platform_tag: Vec<String>,
     pub(crate) exclude_platform_tag: Vec<String>,
     pub(crate) exclude_newer: Option<OffsetDateTime>,
     pub(crate) exclude_older: Option<OffsetDateTime>,
     /// Minimum Python `(major, minor)`; wheels that target only older Pythons
     /// are dropped. `None` disables the floor.
-    pub(crate) min_python: Option<(u32, u32)>,
+    pub(crate) exclude_python_below: Option<(u32, u32)>,
     /// Drop PEP 440 dev releases.
     pub(crate) exclude_dev: bool,
     /// Drop Windows artifacts: wheels with a `win*` platform tag and legacy
@@ -455,7 +565,7 @@ pub(crate) struct ResolvedFilter {
     pub(crate) exclude_prereleases: bool,
     /// Drop artifacts whose listed size exceeds this many bytes. `None` disables
     /// the ceiling; a file with no size in the listing is kept.
-    pub(crate) max_size: Option<u64>,
+    pub(crate) exclude_larger: Option<u64>,
     /// Drop files yanked upstream (PEP 592).
     pub(crate) exclude_yanked: bool,
 }
@@ -471,17 +581,17 @@ impl Resolved {
             )
         })?);
 
-        // The filter — package scope included — is resolved through the one
-        // shared path (CLI/env over the `[filter]` table), so a sync run and
+        // The mirror selection — package scope included — is resolved through the one
+        // shared path (CLI/env over the `[mirror]` table), so a sync run and
         // the serve proxy can never drift. The proxy treats an empty scope as
         // "any name"; sync needs an explicit work list, so it bails here.
-        let filter = args.filter.resolve(Some(&cfg.filter))?;
-        if filter.packages.is_empty() {
+        let mirror = args.mirror.resolve(Some(&cfg.mirror))?;
+        if mirror.include_packages.is_empty() {
             bail!(
-                "no packages to sync: provide --filter-package/--filter-packages-list or [filter].packages in pypiron.toml"
+                "no packages to sync: provide --include-package/--include-packages-from or [mirror].include-packages in pypiron.toml; exclude-packages alone is not a work list"
             );
         }
-        let exclude_older_raw = args.filter.exclude_older_raw(Some(&cfg.filter));
+        let exclude_older_raw = args.mirror.exclude_older_raw(Some(&cfg.mirror));
 
         // A `0` here would mean "no work in flight" — `chunks(0)`/`buffer_unordered(0)`
         // panic or stall — so refuse it rather than silently coercing a typo to 1.
@@ -512,7 +622,7 @@ impl Resolved {
             spool_dir: args.spool_dir.clone().unwrap_or_else(std::env::temp_dir),
             dry_run: args.dry_run,
             full: args.full,
-            filter,
+            mirror,
             exclude_older_raw,
         })
     }
@@ -575,11 +685,11 @@ fn parse_bare_date(value: &str) -> Option<OffsetDateTime> {
 
 /// Parse a Python floor like `3.10` (or bare `3`) into `(major, minor)`.
 /// Components past the first two are ignored (`3.10.2` → `(3, 10)`).
-pub(crate) fn parse_min_python(value: Option<&str>) -> Result<Option<(u32, u32)>> {
+pub(crate) fn parse_exclude_python_below(value: Option<&str>) -> Result<Option<(u32, u32)>> {
     let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
-    let invalid = || anyhow!("min-python '{value}' is not a version like 3.10");
+    let invalid = || anyhow!("exclude-python-below '{value}' is not a version like 3.10");
     let mut parts = value.split('.');
     let major = parts
         .next()
@@ -778,6 +888,28 @@ fn parse_spec_line(line: &str) -> Result<PackageSpec> {
     Ok(PackageSpec { name, specifiers })
 }
 
+pub(crate) fn spec_matches_filename(specifiers: &VersionSpecifiers, filename: &str) -> bool {
+    infer_version_from_filename(filename)
+        .and_then(|v| Version::from_str(&v).ok())
+        .is_some_and(|v| specifiers.contains(&v))
+}
+
+fn package_fully_denied(exclude_packages: &[PackageSpec], pkg: &str) -> bool {
+    exclude_packages
+        .iter()
+        .any(|spec| spec.name == pkg && spec.specifiers.is_none())
+}
+
+fn package_file_denied(exclude_packages: &[PackageSpec], pkg: &str, filename: &str) -> bool {
+    exclude_packages
+        .iter()
+        .filter(|spec| spec.name == pkg)
+        .any(|spec| match &spec.specifiers {
+            None => true,
+            Some(specifiers) => spec_matches_filename(specifiers, filename),
+        })
+}
+
 /// A file selected for mirroring. `version` is inferred from the filename (the
 /// Simple API doesn't bind files to versions); `None` means it wasn't parseable.
 struct Selected {
@@ -818,16 +950,20 @@ type Cursors = HashMap<String, CursorEntry>;
 /// 304 against a listing that was filtered differently. Tag vectors are sorted
 /// so argument order doesn't perturb the key.
 fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
-    let f = &resolved.filter;
+    let m = &resolved.mirror;
     let mut h = Sha256::new();
     h.update(resolved.src_base.as_bytes());
     h.update([0]);
-    h.update([u8::from(f.only_wheels), u8::from(f.only_sdists)]);
+    for format in &m.include_format {
+        h.update(format.as_str().as_bytes());
+        h.update([0]);
+    }
+    h.update([0x20]);
     for tags in [
-        &f.python_tag,
-        &f.abi_tag,
-        &f.platform_tag,
-        &f.exclude_platform_tag,
+        &m.include_python_tag,
+        &m.include_abi_tag,
+        &m.include_platform_tag,
+        &m.exclude_platform_tag,
     ] {
         let mut sorted = tags.clone();
         sorted.sort();
@@ -845,7 +981,7 @@ fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
     // 304 would silently miss, so its config must change each run to force a
     // re-fetch and re-evaluation.
     h.update(
-        f.exclude_newer
+        m.exclude_newer
             .map_or(0i64, |d| d.unix_timestamp())
             .to_le_bytes(),
     );
@@ -864,16 +1000,37 @@ fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
     );
     h.update([0x1e]);
     h.update([
-        u8::from(f.exclude_dev),
-        u8::from(f.exclude_windows),
-        u8::from(f.exclude_prereleases),
-        u8::from(f.exclude_yanked),
+        u8::from(m.exclude_dev),
+        u8::from(m.exclude_windows),
+        u8::from(m.exclude_prereleases),
+        u8::from(m.exclude_yanked),
     ]);
-    if let Some((maj, min)) = f.min_python {
+    if let Some((maj, min)) = m.exclude_python_below {
         h.update(maj.to_le_bytes());
         h.update(min.to_le_bytes());
     }
-    h.update(f.max_size.unwrap_or(0).to_le_bytes());
+    h.update(m.exclude_larger.unwrap_or(0).to_le_bytes());
+    h.update([0x1c]);
+    let mut excludes: Vec<(String, String)> = m
+        .exclude_packages
+        .iter()
+        .map(|spec| {
+            (
+                spec.name.clone(),
+                spec.specifiers
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    excludes.sort();
+    for (name, specifiers) in excludes {
+        h.update(name.as_bytes());
+        h.update([0]);
+        h.update(specifiers.as_bytes());
+        h.update([0]);
+    }
     h.update([0x1d]);
     if let Some(s) = &spec.specifiers {
         h.update(s.to_string().as_bytes());
@@ -1198,13 +1355,13 @@ pub async fn run_sync(args: SyncArgs, config_path: Option<PathBuf>) -> Result<()
     // Packages in parallel (chunked join_all — same pattern as the worker
     // sweep), files within each package in parallel below. The long tail of a
     // mirror is small packages, so serial-per-package was the throughput cap.
-    let progress = Arc::new(Progress::new(resolved.filter.packages.len()));
+    let progress = Arc::new(Progress::new(resolved.mirror.include_packages.len()));
     let ticker = (!args.no_progress).then(|| spawn_progress(progress.clone()));
     let mut failures = 0usize;
     let mut refreshed: Cursors = Cursors::new();
     for chunk in resolved
-        .filter
-        .packages
+        .mirror
+        .include_packages
         .chunks(resolved.package_concurrency)
     {
         let results = futures::future::join_all(chunk.iter().map(|spec| {
@@ -1279,6 +1436,10 @@ async fn sync_one_package(
         if matches_prefix(pkg, &prefix) {
             bail!("'{pkg}' is inside the private namespace '{prefix}'; refusing to mirror");
         }
+    }
+    if package_fully_denied(&resolved.mirror.exclude_packages, pkg) {
+        info!("{pkg}: excluded by mirror package denylist");
+        return Ok(PackageOutcome { new_cursor: None });
     }
 
     // Conditional fetch: replay last run's ETag (unless its config differs, or
@@ -1627,7 +1788,7 @@ fn select_from_index(
             continue;
         }
         file.yanked = file.yanked.normalized();
-        if !matches_filters(&file, &resolved.filter) {
+        if !matches_mirror(&file, &resolved.mirror) {
             continue;
         }
         let version = infer_version_from_filename(&file.filename);
@@ -1636,13 +1797,16 @@ fn select_from_index(
             // we infer it from the filename. A file whose version can't be
             // parsed can't be proven to match, so it's skipped (the same
             // conservative rule the release-keyed API applied to junk versions).
-            let matched = version
-                .as_deref()
-                .and_then(|v| Version::from_str(v).ok())
-                .is_some_and(|v| specifiers.contains(&v));
-            if !matched {
+            if !spec_matches_filename(specifiers, &file.filename) {
                 continue;
             }
+        }
+        if package_file_denied(
+            &resolved.mirror.exclude_packages,
+            &spec.name,
+            &file.filename,
+        ) {
+            continue;
         }
         file.url = resolve(&file.url);
         file.provenance = file.provenance.as_deref().map(&resolve);
@@ -1846,24 +2010,22 @@ async fn upload_via_http(
     Ok(true)
 }
 
-pub(crate) fn matches_filters(file: &SimpleFile, f: &ResolvedFilter) -> bool {
+pub(crate) fn matches_mirror(file: &SimpleFile, m: &ResolvedMirror) -> bool {
     let fname = file.filename.to_ascii_lowercase();
-    let is_wheel = fname.ends_with(".whl");
+    let format = file_format(&fname);
+    let is_wheel = format == Format::Wheel;
 
-    if f.only_wheels && !is_wheel {
-        return false;
-    }
-    if f.only_sdists && is_wheel {
+    if !m.include_format.is_empty() && !m.include_format.contains(&format) {
         return false;
     }
 
     // Yank and size gate every file. A file yanked upstream (PEP 592) is dropped;
     // a file larger than the ceiling is dropped, but one whose size is missing
     // from the listing is kept (we can't prove it exceeds).
-    if f.exclude_yanked && is_yanked(&file.yanked) {
+    if m.exclude_yanked && is_yanked(&file.yanked) {
         return false;
     }
-    if let Some(max) = f.max_size {
+    if let Some(max) = m.exclude_larger {
         if file.size.is_some_and(|s| s > max) {
             return false;
         }
@@ -1873,12 +2035,12 @@ pub(crate) fn matches_filters(file: &SimpleFile, f: &ResolvedFilter) -> bool {
     // Simple API, so it's inferred from the filename; a file whose version can't
     // be parsed is kept (we can't prove it's a pre-release). `exclude_prereleases`
     // (alpha/beta/rc + dev) is the superset of `exclude_dev` (dev only).
-    if f.exclude_dev || f.exclude_prereleases {
+    if m.exclude_dev || m.exclude_prereleases {
         if let Some(v) = infer_version_from_filename(&file.filename) {
-            if f.exclude_prereleases && is_prerelease_version(&v) {
+            if m.exclude_prereleases && is_prerelease_version(&v) {
                 return false;
             }
-            if f.exclude_dev && is_dev_version(&v) {
+            if m.exclude_dev && is_dev_version(&v) {
                 return false;
             }
         }
@@ -1886,7 +2048,7 @@ pub(crate) fn matches_filters(file: &SimpleFile, f: &ResolvedFilter) -> bool {
 
     // Upload-time bounds. With a bound set, a file without a parseable
     // timestamp is excluded — same rule uv applies to --exclude-newer.
-    if f.exclude_newer.is_some() || f.exclude_older.is_some() {
+    if m.exclude_newer.is_some() || m.exclude_older.is_some() {
         let uploaded = file
             .upload_time
             .as_deref()
@@ -1894,10 +2056,10 @@ pub(crate) fn matches_filters(file: &SimpleFile, f: &ResolvedFilter) -> bool {
         let Some(uploaded) = uploaded else {
             return false;
         };
-        if f.exclude_newer.is_some_and(|cutoff| uploaded >= cutoff) {
+        if m.exclude_newer.is_some_and(|cutoff| uploaded >= cutoff) {
             return false;
         }
-        if f.exclude_older.is_some_and(|cutoff| uploaded < cutoff) {
+        if m.exclude_older.is_some_and(|cutoff| uploaded < cutoff) {
             return false;
         }
     }
@@ -1905,13 +2067,14 @@ pub(crate) fn matches_filters(file: &SimpleFile, f: &ResolvedFilter) -> bool {
     // Only *inclusion* filters gate non-wheels (sdists have no tags). An
     // exclusion-only filter (e.g. --exclude-platform-tag win*) must not silently
     // drop every sdist — an sdist can't match a platform exclusion.
-    let has_inclusion_filters =
-        !(f.python_tag.is_empty() && f.abi_tag.is_empty() && f.platform_tag.is_empty());
+    let has_inclusion_filters = !(m.include_python_tag.is_empty()
+        && m.include_abi_tag.is_empty()
+        && m.include_platform_tag.is_empty());
 
     if !is_wheel {
         // A non-wheel can still be a Windows installer (.exe/.msi/.winXX) — those
         // carry no wheel tags, so platform exclusion can't reach them.
-        if f.exclude_windows && is_windows_installer_filename(&fname) {
+        if m.exclude_windows && is_windows_installer_filename(&fname) {
             return false;
         }
         return !has_inclusion_filters;
@@ -1926,27 +2089,29 @@ pub(crate) fn matches_filters(file: &SimpleFile, f: &ResolvedFilter) -> bool {
     };
 
     // Exclusions first
-    if f.exclude_windows && is_windows_wheel_platform(&tags) {
+    if m.exclude_windows && is_windows_wheel_platform(&tags) {
         return false;
     }
-    if !f.exclude_platform_tag.is_empty()
-        && tokens_match_any(&tags.platform, &f.exclude_platform_tag)
+    if !m.exclude_platform_tag.is_empty()
+        && tokens_match_any(&tags.platform, &m.exclude_platform_tag)
     {
         return false;
     }
-    if let Some(floor) = f.min_python {
-        if !wheel_reaches_min_python(&tags, floor) {
+    if let Some(floor) = m.exclude_python_below {
+        if !wheel_reaches_python_floor(&tags, floor) {
             return false;
         }
     }
 
-    if !f.python_tag.is_empty() && !tokens_match_any(&tags.python, &f.python_tag) {
+    if !m.include_python_tag.is_empty() && !tokens_match_any(&tags.python, &m.include_python_tag) {
         return false;
     }
-    if !f.abi_tag.is_empty() && !tokens_match_any(&tags.abi, &f.abi_tag) {
+    if !m.include_abi_tag.is_empty() && !tokens_match_any(&tags.abi, &m.include_abi_tag) {
         return false;
     }
-    if !f.platform_tag.is_empty() && !tokens_match_any(&tags.platform, &f.platform_tag) {
+    if !m.include_platform_tag.is_empty()
+        && !tokens_match_any(&tags.platform, &m.include_platform_tag)
+    {
         return false;
     }
 
@@ -2070,7 +2235,7 @@ fn interp_tag_version(tag: &str) -> Option<(u32, Option<u32>)> {
 /// version-agnostic tag (`py3`/`cp3`) covers its whole major line, an `abi3`
 /// wheel is forward-compatible from its tagged minor onward, and an exact tag
 /// (`cp39`) must itself be ≥ the floor. Unrecognized tags are kept.
-fn wheel_reaches_min_python(tags: &WheelTags, floor: (u32, u32)) -> bool {
+fn wheel_reaches_python_floor(tags: &WheelTags, floor: (u32, u32)) -> bool {
     let (fmaj, fmin) = floor;
     let abi3 = tags.abi.iter().any(|a| a.eq_ignore_ascii_case("abi3"));
     tags.python.iter().any(|t| match interp_tag_version(t) {
@@ -2156,22 +2321,22 @@ mod tests {
         }
     }
 
-    fn base_filter() -> ResolvedFilter {
-        ResolvedFilter {
-            packages: vec![],
-            only_wheels: false,
-            only_sdists: false,
-            python_tag: vec![],
-            abi_tag: vec![],
-            platform_tag: vec![],
+    fn base_filter() -> ResolvedMirror {
+        ResolvedMirror {
+            include_packages: vec![],
+            exclude_packages: vec![],
+            include_format: vec![],
+            include_python_tag: vec![],
+            include_abi_tag: vec![],
+            include_platform_tag: vec![],
             exclude_platform_tag: vec![],
             exclude_newer: None,
             exclude_older: None,
-            min_python: None,
+            exclude_python_below: None,
             exclude_dev: false,
             exclude_windows: false,
             exclude_prereleases: false,
-            max_size: None,
+            exclude_larger: None,
             exclude_yanked: false,
         }
     }
@@ -2183,9 +2348,9 @@ mod tests {
         }
     }
 
-    fn time_filter(newer: Option<&str>, older: Option<&str>) -> ResolvedFilter {
+    fn time_filter(newer: Option<&str>, older: Option<&str>) -> ResolvedMirror {
         let parse = |v: Option<&str>| v.map(|s| OffsetDateTime::parse(s, &Rfc3339).unwrap());
-        ResolvedFilter {
+        ResolvedMirror {
             exclude_newer: parse(newer),
             exclude_older: parse(older),
             ..base_filter()
@@ -2199,137 +2364,137 @@ mod tests {
         let unknown = simple_file(None);
 
         let before_2016 = time_filter(Some("2016-01-01T00:00:00Z"), None);
-        assert!(matches_filters(&old, &before_2016));
-        assert!(!matches_filters(&new, &before_2016));
-        assert!(!matches_filters(&unknown, &before_2016));
+        assert!(matches_mirror(&old, &before_2016));
+        assert!(!matches_mirror(&new, &before_2016));
+        assert!(!matches_mirror(&unknown, &before_2016));
 
         let since_2016 = time_filter(None, Some("2016-01-01T00:00:00Z"));
-        assert!(!matches_filters(&old, &since_2016));
-        assert!(matches_filters(&new, &since_2016));
+        assert!(!matches_mirror(&old, &since_2016));
+        assert!(matches_mirror(&new, &since_2016));
 
         let unbounded = time_filter(None, None);
-        assert!(matches_filters(&unknown, &unbounded));
+        assert!(matches_mirror(&unknown, &unbounded));
     }
 
     #[test]
-    fn min_python_drops_old_wheels_keeps_modern_and_sdists() {
-        let f = ResolvedFilter {
-            min_python: Some((3, 10)),
+    fn exclude_python_below_drops_old_wheels_keeps_modern_and_sdists() {
+        let f = ResolvedMirror {
+            exclude_python_below: Some((3, 10)),
             ..base_filter()
         };
 
         // Version-pinned wheels for Python ≤ 3.9 (and Python 2) are dropped.
-        assert!(!matches_filters(
+        assert!(!matches_mirror(
             &named_file("foo-1.0-cp39-cp39-manylinux2014_x86_64.whl"),
             &f
         ));
-        assert!(!matches_filters(
+        assert!(!matches_mirror(
             &named_file("foo-1.0-cp36-cp36m-win_amd64.whl"),
             &f
         ));
-        assert!(!matches_filters(
+        assert!(!matches_mirror(
             &named_file("foo-1.0-py27-none-any.whl"),
             &f
         ));
-        assert!(!matches_filters(
+        assert!(!matches_mirror(
             &named_file("foo-1.0-pp39-pypy39_pp73-linux_x86_64.whl"),
             &f
         ));
 
         // Modern pinned wheels pass — cp310 must not read as "cp3" + 1.
-        assert!(matches_filters(
+        assert!(matches_mirror(
             &named_file("foo-1.0-cp310-cp310-manylinux_2_17_x86_64.whl"),
             &f
         ));
-        assert!(matches_filters(
+        assert!(matches_mirror(
             &named_file("foo-1.0-cp313-cp313t-manylinux_2_17_x86_64.whl"),
             &f
         ));
 
         // Version-agnostic and abi3 (forward-compatible) wheels are kept.
-        assert!(matches_filters(&named_file("foo-1.0-py3-none-any.whl"), &f));
-        assert!(matches_filters(
+        assert!(matches_mirror(&named_file("foo-1.0-py3-none-any.whl"), &f));
+        assert!(matches_mirror(
             &named_file("six-1.16.0-py2.py3-none-any.whl"),
             &f
         ));
-        assert!(matches_filters(
+        assert!(matches_mirror(
             &named_file("foo-1.0-cp37-abi3-manylinux2014_x86_64.whl"),
             &f
         ));
 
         // sdists carry no python tag — the floor never touches them.
-        assert!(matches_filters(&named_file("foo-1.0.tar.gz"), &f));
+        assert!(matches_mirror(&named_file("foo-1.0.tar.gz"), &f));
     }
 
     #[test]
     fn exclude_dev_drops_dev_releases_only() {
-        let f = ResolvedFilter {
+        let f = ResolvedMirror {
             exclude_dev: true,
             ..base_filter()
         };
-        assert!(!matches_filters(
+        assert!(!matches_mirror(
             &named_file("foo-1.0.dev1-py3-none-any.whl"),
             &f
         ));
-        assert!(!matches_filters(&named_file("foo-1.0.dev1.tar.gz"), &f));
-        assert!(!matches_filters(
+        assert!(!matches_mirror(&named_file("foo-1.0.dev1.tar.gz"), &f));
+        assert!(!matches_mirror(
             &named_file("foo-1.0.dev0-cp311-cp311-manylinux_2_17_x86_64.whl"),
             &f
         ));
         // Final, pre-release, and post-release versions are kept.
-        assert!(matches_filters(&named_file("foo-1.0-py3-none-any.whl"), &f));
-        assert!(matches_filters(
+        assert!(matches_mirror(&named_file("foo-1.0-py3-none-any.whl"), &f));
+        assert!(matches_mirror(
             &named_file("foo-1.0rc1-py3-none-any.whl"),
             &f
         ));
-        assert!(matches_filters(&named_file("foo-1.0.post1.tar.gz"), &f));
+        assert!(matches_mirror(&named_file("foo-1.0.post1.tar.gz"), &f));
     }
 
     #[test]
     fn exclude_windows_drops_win_wheels_and_installers_only() {
-        let f = ResolvedFilter {
+        let f = ResolvedMirror {
             exclude_windows: true,
             ..base_filter()
         };
         // Windows wheels (any win* platform tag).
-        assert!(!matches_filters(
+        assert!(!matches_mirror(
             &named_file("foo-1.0-cp311-cp311-win_amd64.whl"),
             &f
         ));
-        assert!(!matches_filters(
+        assert!(!matches_mirror(
             &named_file("foo-1.0-cp311-cp311-win32.whl"),
             &f
         ));
-        assert!(!matches_filters(
+        assert!(!matches_mirror(
             &named_file("foo-1.0-cp311-cp311-win_arm64.whl"),
             &f
         ));
         // Legacy Windows installers carry no wheel tag.
-        assert!(!matches_filters(&named_file("Foo-1.0.win32-py2.7.exe"), &f));
-        assert!(!matches_filters(&named_file("Foo-1.0.win-amd64.msi"), &f));
-        assert!(!matches_filters(
+        assert!(!matches_mirror(&named_file("Foo-1.0.win32-py2.7.exe"), &f));
+        assert!(!matches_mirror(&named_file("Foo-1.0.win-amd64.msi"), &f));
+        assert!(!matches_mirror(
             &named_file("Foo-1.0-cp27-none-win_amd64.msi"),
             &f
         ));
 
         // Non-Windows wheels and sdists are kept — including packages whose name
         // merely starts with "win" (the raw-filename foot-gun).
-        assert!(matches_filters(
+        assert!(matches_mirror(
             &named_file("foo-1.0-cp311-cp311-manylinux_2_17_x86_64.whl"),
             &f
         ));
-        assert!(matches_filters(
+        assert!(matches_mirror(
             &named_file("foo-1.0-cp311-cp311-macosx_11_0_arm64.whl"),
             &f
         ));
-        assert!(matches_filters(&named_file("foo-1.0-py3-none-any.whl"), &f));
-        assert!(matches_filters(&named_file("windrose-1.9.2.tar.gz"), &f));
-        assert!(matches_filters(&named_file("winnow-0.1.0.tar.gz"), &f));
+        assert!(matches_mirror(&named_file("foo-1.0-py3-none-any.whl"), &f));
+        assert!(matches_mirror(&named_file("windrose-1.9.2.tar.gz"), &f));
+        assert!(matches_mirror(&named_file("winnow-0.1.0.tar.gz"), &f));
     }
 
     #[test]
     fn exclude_prereleases_drops_alpha_beta_rc_and_dev() {
-        let f = ResolvedFilter {
+        let f = ResolvedMirror {
             exclude_prereleases: true,
             ..base_filter()
         };
@@ -2341,38 +2506,35 @@ mod tests {
             "foo-2.0.dev1.tar.gz",
             "foo-2.0rc1.dev3-cp311-cp311-manylinux_2_17_x86_64.whl",
         ] {
-            assert!(
-                !matches_filters(&named_file(name), &f),
-                "{name} should drop"
-            );
+            assert!(!matches_mirror(&named_file(name), &f), "{name} should drop");
         }
         // Final and post releases stay — unlike exclude_dev, rc is also dropped.
-        assert!(matches_filters(&named_file("foo-1.0-py3-none-any.whl"), &f));
-        assert!(matches_filters(&named_file("foo-1.0.post1.tar.gz"), &f));
+        assert!(matches_mirror(&named_file("foo-1.0-py3-none-any.whl"), &f));
+        assert!(matches_mirror(&named_file("foo-1.0.post1.tar.gz"), &f));
         // An unparseable version can't be proven a pre-release, so it's kept.
-        assert!(matches_filters(&named_file("foo-notaversion.tar.gz"), &f));
+        assert!(matches_mirror(&named_file("foo-notaversion.tar.gz"), &f));
     }
 
     #[test]
-    fn max_size_drops_oversize_keeps_unsized() {
-        let f = ResolvedFilter {
-            max_size: Some(1000),
+    fn exclude_larger_drops_oversize_keeps_unsized() {
+        let f = ResolvedMirror {
+            exclude_larger: Some(1000),
             ..base_filter()
         };
         let sized = |n: u64| SimpleFile {
             size: Some(n),
             ..named_file("foo-1.0-py3-none-any.whl")
         };
-        assert!(!matches_filters(&sized(1001), &f)); // over
-        assert!(matches_filters(&sized(1000), &f)); // exactly at the ceiling
-        assert!(matches_filters(&sized(10), &f)); // under
-                                                  // No size in the listing → can't prove it's oversize → kept.
-        assert!(matches_filters(&named_file("foo-1.0-py3-none-any.whl"), &f));
+        assert!(!matches_mirror(&sized(1001), &f)); // over
+        assert!(matches_mirror(&sized(1000), &f)); // exactly at the ceiling
+        assert!(matches_mirror(&sized(10), &f)); // under
+                                                 // No size in the listing → can't prove it's oversize → kept.
+        assert!(matches_mirror(&named_file("foo-1.0-py3-none-any.whl"), &f));
     }
 
     #[test]
     fn exclude_yanked_drops_yanked_files() {
-        let f = ResolvedFilter {
+        let f = ResolvedMirror {
             exclude_yanked: true,
             ..base_filter()
         };
@@ -2380,40 +2542,40 @@ mod tests {
             yanked: y,
             ..named_file("foo-1.0-py3-none-any.whl")
         };
-        assert!(!matches_filters(&with_yank(Yanked::Flag(true)), &f));
-        assert!(!matches_filters(
+        assert!(!matches_mirror(&with_yank(Yanked::Flag(true)), &f));
+        assert!(!matches_mirror(
             &with_yank(Yanked::Reason("CVE-2024-1".into())),
             &f
         ));
-        assert!(matches_filters(&with_yank(Yanked::Flag(false)), &f));
+        assert!(matches_mirror(&with_yank(Yanked::Flag(false)), &f));
     }
 
     #[test]
     fn yanked_is_excluded_by_default_unless_opted_in() {
         let exclude =
-            |f: FilterArgs, file: Option<&FilterFile>| f.resolve(file).unwrap().exclude_yanked;
+            |f: MirrorArgs, file: Option<&MirrorConfig>| f.resolve(file).unwrap().exclude_yanked;
         // Nothing set: yanked is dropped by default.
-        assert!(exclude(FilterArgs::default(), None));
-        // CLI/env opt-out (--filter-include-yanked) mirrors them again.
+        assert!(exclude(MirrorArgs::default(), None));
+        // CLI/env opt-out (--include-yanked) mirrors them again.
         assert!(!exclude(
-            FilterArgs {
+            MirrorArgs {
                 include_yanked: true,
                 ..Default::default()
             },
             None
         ));
-        // File opt-out (`[filter].include-yanked = true`).
-        let on = FilterFile {
+        // File opt-out (`[mirror].include-yanked = true`).
+        let on = MirrorConfig {
             include_yanked: Some(true),
             ..Default::default()
         };
-        assert!(!exclude(FilterArgs::default(), Some(&on)));
+        assert!(!exclude(MirrorArgs::default(), Some(&on)));
         // An explicit `include-yanked = false` keeps the default exclusion.
-        let off = FilterFile {
+        let off = MirrorConfig {
             include_yanked: Some(false),
             ..Default::default()
         };
-        assert!(exclude(FilterArgs::default(), Some(&off)));
+        assert!(exclude(MirrorArgs::default(), Some(&off)));
     }
 
     #[test]
@@ -2431,7 +2593,7 @@ mod tests {
 
     #[test]
     fn parse_size_parses_units_and_rejects_garbage() {
-        let ok = |s: &str| parse_size("max-size", Some(s)).unwrap();
+        let ok = |s: &str| parse_size("exclude-larger", Some(s)).unwrap();
         assert_eq!(ok(""), None);
         assert_eq!(ok("   "), None);
         assert_eq!(ok("1048576"), Some(1_048_576));
@@ -2441,9 +2603,9 @@ mod tests {
         assert_eq!(ok("250MB"), Some(250 << 20));
         assert_eq!(ok("1.5GiB"), Some(1_610_612_736));
         assert_eq!(ok(" 2 gb "), Some(2 << 30));
-        assert!(parse_size("max-size", Some("big")).is_err());
-        assert!(parse_size("max-size", Some("10XB")).is_err());
-        assert!(parse_size("max-size", Some("-5MB")).is_err());
+        assert!(parse_size("exclude-larger", Some("big")).is_err());
+        assert!(parse_size("exclude-larger", Some("10XB")).is_err());
+        assert!(parse_size("exclude-larger", Some("-5MB")).is_err());
     }
 
     #[test]
@@ -2469,13 +2631,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_min_python_parses_versions() {
-        assert_eq!(parse_min_python(None).unwrap(), None);
-        assert_eq!(parse_min_python(Some("  ")).unwrap(), None);
-        assert_eq!(parse_min_python(Some("3.10")).unwrap(), Some((3, 10)));
-        assert_eq!(parse_min_python(Some("3")).unwrap(), Some((3, 0)));
-        assert_eq!(parse_min_python(Some("3.10.2")).unwrap(), Some((3, 10)));
-        assert!(parse_min_python(Some("three.ten")).is_err());
+    fn parse_exclude_python_below_parses_versions() {
+        assert_eq!(parse_exclude_python_below(None).unwrap(), None);
+        assert_eq!(parse_exclude_python_below(Some("  ")).unwrap(), None);
+        assert_eq!(
+            parse_exclude_python_below(Some("3.10")).unwrap(),
+            Some((3, 10))
+        );
+        assert_eq!(parse_exclude_python_below(Some("3")).unwrap(), Some((3, 0)));
+        assert_eq!(
+            parse_exclude_python_below(Some("3.10.2")).unwrap(),
+            Some((3, 10))
+        );
+        assert!(parse_exclude_python_below(Some("three.ten")).is_err());
     }
 
     fn cutoff(value: &str) -> Result<Option<OffsetDateTime>> {
@@ -2563,7 +2731,7 @@ mod tests {
         }
     }
 
-    fn resolved_with(filter: ResolvedFilter, src_base: &str) -> Resolved {
+    fn resolved_with(filter: ResolvedMirror, src_base: &str) -> Resolved {
         Resolved {
             src_base: src_base.to_string(),
             dst_base: "https://dest.example".to_string(),
@@ -2575,7 +2743,7 @@ mod tests {
             spool_dir: std::env::temp_dir(),
             dry_run: false,
             full: false,
-            filter,
+            mirror: filter,
             exclude_older_raw: None,
         }
     }
@@ -2616,9 +2784,9 @@ mod tests {
 
         // Tag argument order must not matter (vecs are sorted before hashing).
         let mut f1 = time_filter(None, None);
-        f1.python_tag = vec!["cp311".into(), "cp310".into()];
+        f1.include_python_tag = vec!["cp311".into(), "cp310".into()];
         let mut f2 = time_filter(None, None);
-        f2.python_tag = vec!["cp310".into(), "cp311".into()];
+        f2.include_python_tag = vec!["cp310".into(), "cp311".into()];
         assert_eq!(
             config_key(&resolved_with(f1, "https://pypi.org"), &s),
             config_key(&resolved_with(f2, "https://pypi.org"), &s),
@@ -2633,7 +2801,7 @@ mod tests {
             )
         );
         let mut wheels = time_filter(None, None);
-        wheels.only_wheels = true;
+        wheels.include_format = vec![Format::Wheel];
         assert_ne!(
             k,
             config_key(&resolved_with(wheels, "https://pypi.org"), &s)
@@ -2641,14 +2809,19 @@ mod tests {
         assert_ne!(k, config_key(&r, &spec("requests", Some(">=2"))));
 
         // Each new filter axis invalidates the cursor key too.
-        let with = |mutate: fn(&mut ResolvedFilter)| {
+        let with = |mutate: fn(&mut ResolvedMirror)| {
             let mut f = time_filter(None, None);
             mutate(&mut f);
             config_key(&resolved_with(f, "https://pypi.org"), &s)
         };
         assert_ne!(k, with(|f| f.exclude_prereleases = true));
         assert_ne!(k, with(|f| f.exclude_yanked = true));
-        assert_ne!(k, with(|f| f.max_size = Some(1 << 20)));
+        assert_ne!(k, with(|f| f.exclude_larger = Some(1 << 20)));
+        assert_ne!(k, with(|f| f.include_format = vec![Format::Sdist]));
+        assert_ne!(
+            k,
+            with(|f| f.exclude_packages = vec![spec("requests", Some("<2"))])
+        );
     }
 
     #[test]

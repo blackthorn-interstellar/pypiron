@@ -54,7 +54,7 @@ def _sync_to(server, pypiron_bin, pkg_list, *extra, user=None, password=None):
         [
             str(pypiron_bin),
             "sync",
-            "--filter-packages-list",
+            "--include-packages-from",
             str(pkg_list),
             "--to",
             server["base_url"],
@@ -62,7 +62,8 @@ def _sync_to(server, pypiron_bin, pkg_list, *extra, user=None, password=None):
             user,
             "--admin-pass",
             password,
-            "--filter-only-wheels",
+            "--include-format",
+            "wheel",
             *extra,
         ],
         timeout=600,
@@ -133,7 +134,7 @@ def test_sync_refuses_private_namespace(disk_server, pypiron_bin):
     rc, out, err = sync_to(
         pypiron_bin,
         disk_server,
-        "--filter-package",
+        "--include-package",
         PACKAGE,
         "--private-prefix",
         PACKAGE,

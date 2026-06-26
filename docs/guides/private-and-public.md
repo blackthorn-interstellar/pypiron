@@ -13,7 +13,7 @@ This is the most common pypiron setup.
 uvx pypiron serve --admin-pass "$ADMIN" \
   --private-prefix acme \
   --proxy-upstream https://pypi.org \
-  --filter-exclude-newer "7 days"
+  --exclude-newer "7 days"
 ```
 
 | Flag | What it does |
@@ -21,11 +21,11 @@ uvx pypiron serve --admin-pass "$ADMIN" \
 | `--admin-pass "$ADMIN"` | Enables the admin credential (username defaults to `admin`), so you can publish. Without any write credential the server is read-only. |
 | `--private-prefix acme` | Reserves the `acme-*` namespace for your uploads. Names under it never fall through to upstream. |
 | `--proxy-upstream https://pypi.org` | Mirrors public packages on demand. The first request downloads, verifies, and caches the artifact in storage; it is served locally from then on, whether PyPI is up or down. |
-| `--filter-exclude-newer "7 days"` | Optional. Hides releases the upstream received less than 7 days ago — a supply-chain quarantine window. The `--filter-*` flags are shared with `sync`. |
+| `--exclude-newer "7 days"` | Optional. Hides releases the upstream received less than 7 days ago — a supply-chain quarantine window. Mirror-selection flags are shared with `sync`. |
 
 Every flag has a `PYPIRON_*` env var (`PYPIRON_ADMIN_PASS`,
 `PYPIRON_PRIVATE_PREFIX`, `PYPIRON_PROXY_UPSTREAM`,
-`PYPIRON_PROXY_EXCLUDE_NEWER`). See [Configuration](../reference/configuration.md).
+`PYPIRON_EXCLUDE_NEWER`). See [Configuration](../reference/configuration.md).
 
 !!! warning "Set `--private-prefix` with the proxy"
     With the proxy on and no reserved prefix, a new private upload races public
@@ -76,7 +76,7 @@ yours; the proxy will never serve a public package of the same name.
 
 ## The supply-chain window
 
-pypiron's `--filter-exclude-newer` and uv's own `--exclude-newer` resolve against
+pypiron's `--exclude-newer` and uv's own `--exclude-newer` resolve against
 the same true upstream upload time, so a developer can pin even tighter than the
 server:
 
@@ -89,9 +89,9 @@ The value accepts an RFC 3339 timestamp, a friendly duration (`"7 days"`,
 `"24 hours"`, `"1 week"`), or an ISO 8601 duration (`P7D`). Calendar months and
 years are rejected.
 
-The proxy honors the full `--filter-*` set (wheels-only, python/abi/platform
-tags, date cutoffs) from the shared `[filter]` table. See
-[Configuration](../reference/configuration.md#filters).
+The proxy honors the full mirror-selection set (formats, python/abi/platform
+tags, package denies, date cutoffs) from the shared `[mirror]` table. See
+[Configuration](../reference/configuration.md#mirror-selection).
 
 ## Next steps
 

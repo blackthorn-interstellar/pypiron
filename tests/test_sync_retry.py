@@ -96,7 +96,7 @@ def test_sync_retries_transient_download_failures(disk_server, pypiron_bin):
         rc, out, err = sync_to(
             pypiron_bin,
             disk_server,
-            "--filter-package",
+            "--include-package",
             "flaky-pkg",
             source=f"http://127.0.0.1:{port}",
             timeout=120,

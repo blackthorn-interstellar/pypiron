@@ -25,8 +25,8 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 - Multi-node on any cloud backend via a sloppy leader lease (conditional writes, TTL, heartbeat).
 
 **Mirroring & proxying**
-- `pypiron sync` over HTTP (`--to`, the single writer is always the server), carrying PyPI's true `upload-time` so `--exclude-newer` stays historically correct; tag/time filters; `--filter-package`/packages-list selection; `pypiron.toml` config layering.
-- On-demand PyPI proxying (`--proxy-upstream`) — cache public dependencies on first use, origin-checked; an optional approved-package list (the shared `[filter]` scope) makes it fail-closed.
+- `pypiron sync` over HTTP (`--to`, the single writer is always the server), carrying PyPI's true `upload-time` so `--exclude-newer` stays historically correct; tag/time/format gates; `--include-package`/`--include-packages-from` work-list selection; `--exclude-package`/`--exclude-packages-from` subtraction; `pypiron.toml` config layering.
+- On-demand PyPI proxying (`--proxy-upstream`) — cache public dependencies on first use, origin-checked; an optional approved-package list (the shared `[mirror]` scope) makes it fail-closed, and package denies subtract in both scoped and open-proxy modes.
 
 **Security & access**
 - Origin exclusivity — every package `private` or `mirror`, claimed at first write; collisions rejected (dependency-confusion defense).

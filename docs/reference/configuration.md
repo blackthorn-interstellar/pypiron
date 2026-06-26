@@ -77,7 +77,7 @@ artifact downloads stream.
 | `--read-user`                | `PYPIRON_READ_USER`                | *(none)*       | Read credential — when set, reads require auth   |
 | `--read-pass`                | `PYPIRON_READ_PASS`                | *(none)*       | Read credential password                         |
 | `--private-prefix`           | `PYPIRON_PRIVATE_PREFIX`           | *(none)*       | Reserve a namespace for private uploads          |
-| `--proxy-upstream`           | `PYPIRON_PROXY_UPSTREAM`           | *(none)*       | On-demand mirror of this upstream simple index (plus `--proxy-*` filters, see below) |
+| `--proxy-upstream`           | `PYPIRON_PROXY_UPSTREAM`           | *(none)*       | On-demand mirror of this upstream simple index (plus mirror-selection flags, see below) |
 | `--spool-dir`                | `PYPIRON_SPOOL_DIR`                | system temp    | Upload/proxy spool directory — real disk, not tmpfs |
 | `--log-format`               | `PYPIRON_LOG_FORMAT`               | `text`         | `text` or `json` (one object per line)           |
 | `--access-log`               | `PYPIRON_ACCESS_LOG`               | `false`        | Also log reads (downloads/listings), not just mutations (see below) |
@@ -209,9 +209,10 @@ credential — nothing about the server's storage backend.
 
 `--to` is mandatory (there is no direct-to-storage mode); without it (and no
 `[sync].to`) the run refuses to start. Which packages get mirrored is the
-filter's name axis — `--filter-package` / `--filter-packages-list` /
-`[filter].packages` (see [Filters](#filters)) — and `sync` requires a non-empty
-set (it needs an explicit work list). The same scope governs the proxy.
+mirror name axis — `--include-package` / `--include-packages-from` /
+`[mirror].include-packages` (see [Mirror selection](#mirror-selection)) — and
+`sync` requires a non-empty set (it needs an explicit work list). The same scope
+governs the proxy.
 
 ## Re-sync, reconcile, and conditional fetch
 
@@ -232,68 +233,91 @@ is a pure cache — delete it and the next run re-fetches.
   as the self-heal, since a normal run only reconciles projects whose upstream
   listing actually changed.
 
-The cursor key folds in the source URL, the resolved filters, and each project's
-specifiers, so changing any of them invalidates the shortcut and forces a full
-fetch.
+The cursor key folds in the source URL, the resolved mirror selection, and each
+project's specifiers, so changing any of them invalidates the shortcut and
+forces a full fetch.
 
-## Filters
+## Mirror Selection
 
-Filters select the slice of PyPI you want — names *and* files. They are
-**shared**: the same `--filter-*` flags, `PYPIRON_FILTER_*` env vars, and
-`[filter]` table govern both `pypiron sync` (push mirror) and
-`serve --proxy-upstream` (on-demand proxy) — set the slice once and it applies to
-whichever you run. Filters gate only what is *added*; already-mirrored or
-already-cached files are never removed.
+`[mirror]` is the slice of PyPI you want — names *and* files. It is shared
+verbatim by `pypiron sync` (push mirror) and `serve --proxy-upstream` (on-demand
+pull mirror): set it once and both paths agree. Mirror selection gates only what
+is *added*; already-mirrored or already-cached files are never removed by later
+selection changes.
 
-The **name axis** (the approved-package list):
+| `[mirror]` key | CLI flag | Env var |
+| --- | --- | --- |
+| `include-packages` | `--include-package SPEC` | `PYPIRON_INCLUDE_PACKAGE` |
+| `include-packages-from` | `--include-packages-from FILE` | `PYPIRON_INCLUDE_PACKAGES_FROM` |
+| `exclude-packages` | `--exclude-package SPEC` | `PYPIRON_EXCLUDE_PACKAGE` |
+| `exclude-packages-from` | `--exclude-packages-from FILE` | `PYPIRON_EXCLUDE_PACKAGES_FROM` |
+| `include-format` | `--include-format VALUE` | `PYPIRON_INCLUDE_FORMAT` |
+| `include-python-tag` | `--include-python-tag TAG` | `PYPIRON_INCLUDE_PYTHON_TAG` |
+| `include-abi-tag` | `--include-abi-tag TAG` | `PYPIRON_INCLUDE_ABI_TAG` |
+| `include-platform-tag` | `--include-platform-tag TAG` | `PYPIRON_INCLUDE_PLATFORM_TAG` |
+| `exclude-platform-tag` | `--exclude-platform-tag TAG` | `PYPIRON_EXCLUDE_PLATFORM_TAG` |
+| `exclude-python-below` | `--exclude-python-below X.Y` | `PYPIRON_EXCLUDE_PYTHON_BELOW` |
+| `exclude-larger` | `--exclude-larger SIZE` | `PYPIRON_EXCLUDE_LARGER` |
+| `exclude-newer` | `--exclude-newer WHEN` | `PYPIRON_EXCLUDE_NEWER` |
+| `exclude-older` | `--exclude-older WHEN` | `PYPIRON_EXCLUDE_OLDER` |
+| `exclude-dev` | `--exclude-dev` | `PYPIRON_EXCLUDE_DEV` |
+| `exclude-windows` | `--exclude-windows` | `PYPIRON_EXCLUDE_WINDOWS` |
+| `exclude-prereleases` | `--exclude-prereleases` | `PYPIRON_EXCLUDE_PRERELEASES` |
+| `include-yanked` | `--include-yanked` | `PYPIRON_INCLUDE_YANKED` |
 
-- `--filter-package SPEC` (`PYPIRON_FILTER_PACKAGE`) — one package: a name with
-  optional PEP 440 specifiers (`requests`, `six==1.16.0`, `requests>=2.20,<3`).
-  Repeatable. Commas belong to the specifier, so pass multiple packages as
-  repeated flags, not a comma-joined list.
-- `--filter-packages-list FILE` (`PYPIRON_FILTER_PACKAGES_LIST`) — a file of
-  specs, one per line; blank lines and `#` comment lines are ignored.
-- `[filter].packages` (inline array) and `[filter].packages-list` (file path) are
-  the config-file forms.
+Package specs use one syntax everywhere: a PEP 503-normalized name with optional
+PEP 440 specifiers (`requests`, `six==1.16.0`, `requests>=2.20,<3`). Inline TOML
+keys are arrays; CLI flags are singular and repeatable by design. Commas belong
+to PEP 440 specifiers, so `PYPIRON_INCLUDE_PACKAGE` and
+`PYPIRON_EXCLUDE_PACKAGE` each carry one spec. For automation with many names,
+prefer `PYPIRON_INCLUDE_PACKAGES_FROM` / `PYPIRON_EXCLUDE_PACKAGES_FROM`.
 
-`sync` mirrors exactly the listed names (and, where a spec is version-pinned,
-only matching versions); it requires a non-empty list. The **proxy is
-fail-closed**: with a list set, only listed names fall through to upstream and
-everything else is `404`'d (a version-pinned name serves only matching versions,
-just as `sync` mirrors only those). With **no** list, the proxy keeps its default
-of serving any non-private name on demand.
+Selection has two stages, and exclude wins in both:
 
-The **file axis** (which artifacts of a selected package to keep):
+1. Name stage: a project/version is allowed when `include-packages` is empty or
+   the name matches an include spec, and no exclude spec matches. A bare
+   `exclude-packages` name drops the whole project. A version-pinned exclude
+   drops only files whose inferred version parses and satisfies the specifier.
+   If the version cannot be parsed, pypiron keeps the file because it cannot
+   prove the artifact is denied.
+2. File stage: surviving projects then pass through the format, tag, upload
+   time, yanked, size, prerelease, and Windows gates.
 
-- `--filter-only-wheels` / `--filter-only-sdists`
-- `--filter-python-tag py3,cp311` — python tag(s)
-- `--filter-abi-tag none,cp311` — ABI tag(s)
-- `--filter-platform-tag any,manylinux2014_x86_64,macosx_*_arm64` — platform tag(s), `*` wildcard
-- `--filter-exclude-platform-tag` — exclusions (supports `*`)
-- `--filter-min-python X.Y` — drop wheels built only for Python older than the floor
-  (e.g. `3.10` drops cp36–cp39 and python-2 wheels). Version-agnostic wheels
-  (`py3`, `py2.py3`), forward-compatible `abi3` wheels, and all sdists are kept.
-- `--filter-exclude-dev` — drop PEP 440 dev releases (any version with a `.devN` segment)
-- `--filter-exclude-prereleases` — drop PEP 440 pre-releases: alpha/beta/rc **and**
-  dev (keep stable releases only). The superset of `--filter-exclude-dev`
-- `--filter-exclude-windows` — drop Windows artifacts: `win*` wheels and legacy
-  `.exe`/`.msi`/`.winXX` installers (a package whose name merely starts with
-  "win", like `windrose`, is never matched)
-- `--filter-max-size <size>` — drop artifacts larger than `size` (e.g. `250MB`,
-  `1.5GiB`, `1048576`). Units are powers of 1024 (`KB` == `KiB`); a bare number is
-  bytes. A file with no size in the upstream listing is kept. Useful for trimming
-  multi-gigabyte CUDA/ML wheels off a disk- or S3-cost-bound mirror
-- yanked files (PEP 592) are **dropped by default**. Pass `--filter-include-yanked`
-  (or `[filter].include-yanked = true`) to mirror them anyway — they stay flagged
-  yanked, so a pinned install still resolves. Either way the filter only gates what
-  a run *pulls in*: a file already mirrored is never removed, and one that is yanked
-  upstream after you mirrored it stays on disk and is re-flagged yanked by reconcile
-- `--filter-exclude-newer <when>` — only files received upstream before the cutoff
-- `--filter-exclude-older <when>` — only files received upstream since the cutoff
+`sync` requires a non-empty work list from `include-packages` or
+`include-packages-from`; an exclude list alone is not work. The proxy has split
+semantics: empty include means an open proxy for any non-private name, while a
+non-empty include is a fail-closed allowlist. `exclude-packages` subtracts in
+both modes, so this is an open proxy minus a denylist:
 
-Every flag has a matching `PYPIRON_FILTER_*` env var (e.g.
-`PYPIRON_FILTER_ONLY_WHEELS`, `PYPIRON_FILTER_PYTHON_TAG`) and an unprefixed
-`[filter]` key (`only-wheels`, `python-tag`, …).
+```bash
+pypiron serve \
+  --proxy-upstream https://pypi.org \
+  --exclude-package legacy-insecure \
+  --exclude-package "demo<2"
+```
+
+`include-format` accepts `wheel`, `sdist`, and `other`; it is repeatable and
+comma-separated (`--include-format wheel,sdist`). Unset means all formats.
+`wheel` is `.whl`; `sdist` is `.tar.gz`, `.tgz`, `.tar.bz2`, or `.zip`; `other`
+is everything else. `exclude-windows` still independently drops `.exe`, `.msi`,
+`.winXX`, and Windows wheel platforms.
+
+Other file-axis rules:
+
+- `--include-python-tag`, `--include-abi-tag`, and `--include-platform-tag`
+  match wheel tags; `--exclude-platform-tag` supports `*` wildcards.
+- `--exclude-python-below X.Y` drops wheels built only for Python older than the
+  floor. Version-agnostic wheels (`py3`, `py2.py3`), forward-compatible `abi3`
+  wheels, and all sdists are kept.
+- `--exclude-dev` drops PEP 440 dev releases. `--exclude-prereleases` drops
+  alpha, beta, rc, and dev releases.
+- `--exclude-larger SIZE` drops artifacts larger than `SIZE` (`250MB`,
+  `1.5GiB`, `1048576`). Units are powers of 1024; a missing upstream size is
+  kept.
+- Yanked files (PEP 592) are dropped by default. Pass `--include-yanked` or set
+  `[mirror].include-yanked = true` to pull them anyway; they stay flagged yanked.
+- `--exclude-newer WHEN` keeps files received upstream before the cutoff.
+- `--exclude-older WHEN` keeps files received upstream at or after the cutoff.
 
 `<when>` (matching uv's `--exclude-newer`) is an **RFC 3339 timestamp**
 (`2024-01-01T00:00:00Z`), a **bare date** (`2008-12-03`, taken as 00:00:00 UTC),
@@ -301,7 +325,7 @@ a **bare integer of days** ago (`7`), a **friendly duration** ago (`"30 days"`,
 `"24 hours"`, `"1 week"`), or an **ISO 8601 duration** ago (`P30D`, `PT24H`). A
 duration is resolved against the current time as a fixed number of seconds (a day
 is 24 h); calendar months and years are rejected. The same forms apply to the
-`[filter]` `exclude-newer`/`exclude-older` keys.
+`[mirror]` `exclude-newer`/`exclude-older` keys.
 
 A sync run prints a live progress meter on stderr (packages done, files/bytes
 mirrored, throughput, ETA) plus an always-on end-of-run summary; `--no-progress`
@@ -319,7 +343,7 @@ defaults**. Four parts:
 
 - top-level `private-prefix` — the reserved private namespace, shared by both
   commands.
-- `[filter]` — the slice of PyPI, names and files (shared by sync and the proxy;
+- `[mirror]` — the slice of PyPI, names and files (shared by sync and the proxy;
   see above).
 - `[serve]` — the server process. Every `serve` flag *except secrets*:
   admin/uploader/read passwords and the Azure access key stay in CLI/env. Storage
@@ -330,10 +354,11 @@ defaults**. Four parts:
 ```toml
 private-prefix = "acme"
 
-[filter]                                    # shared by sync and the serve proxy
-packages = ["requests>=2.20,<3", "six"]     # or packages-list = "packages.txt"
-only-wheels = true
-python-tag = ["cp311", "cp312"]
+[mirror]                                    # shared by sync and the serve proxy
+include-packages = ["requests>=2.20,<3", "six"]     # or include-packages-from = "packages.txt"
+exclude-packages = ["legacy-insecure", "demo<2"]
+include-format = ["wheel"]
+include-python-tag = ["cp311", "cp312"]
 exclude-newer = "2026-01-01T00:00:00Z"
 
 [serve]
@@ -349,16 +374,13 @@ admin-user = "admin"                        # password via PYPIRON_SYNC_ADMIN_PA
 concurrency = 8
 ```
 
-A `packages-list` path in the file resolves relative to the config file, not the
-working directory. A CLI package source (`--filter-package` and/or
-`--filter-packages-list`) replaces the file's `[filter].packages`/`packages-list`
-entirely; other options layer per-key. A boolean set
-`true` in the file can be turned on but not off by the absence of a flag — there
-is no flag for `false`, so clear it by setting it `false` (or deleting the line)
-in the file. The package list (`packages`,
-`packages-list`), the artifact-filter keys, and `private-prefix` all used to live
-under `[sync]` and now belong in `[filter]` (and at the top level); a stale config
-fails to start with a pointer to the new home.
+`include-packages-from` and `exclude-packages-from` paths in the file resolve
+relative to the config file, not the working directory. A CLI package source
+(`--include-package` and/or `--include-packages-from`, or the exclude twins)
+replaces the matching file source entirely; other options layer per-key. A
+boolean set `true` in the file can be turned on but not off by the absence of a
+flag — there is no flag for `false`, so clear it by setting it `false` (or
+deleting the line) in the file.
 
 ## Artifact delivery
 

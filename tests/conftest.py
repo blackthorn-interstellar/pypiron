@@ -536,7 +536,7 @@ def proxy_pair_fast_counters(tmp_path_factory, pypiron_bin: Path) -> Iterator[Di
 @pytest.fixture()
 def proxy_pair_wheels_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     yield from _start_proxy_pair(
-        tmp_path_factory, pypiron_bin, proxy_extra_args=["--filter-only-wheels"]
+        tmp_path_factory, pypiron_bin, proxy_extra_args=["--include-format", "wheel"]
     )
 
 
@@ -555,7 +555,27 @@ def proxy_pair_scoped(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     yield from _start_proxy_pair(
         tmp_path_factory,
         pypiron_bin,
-        proxy_extra_args=["--filter-package", "allowed", "--filter-package", "pinned>=2.0"],
+        proxy_extra_args=["--include-package", "allowed", "--include-package", "pinned>=2.0"],
+    )
+
+
+@pytest.fixture()
+def proxy_pair_denylist(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Open proxy with a whole-name deny and a version-pinned deny."""
+    yield from _start_proxy_pair(
+        tmp_path_factory,
+        pypiron_bin,
+        proxy_extra_args=["--exclude-package", "blocked", "--exclude-package", "pinned<2.0"],
+    )
+
+
+@pytest.fixture()
+def proxy_pair_deny_wins(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Scoped proxy where the same name is both included and denied."""
+    yield from _start_proxy_pair(
+        tmp_path_factory,
+        pypiron_bin,
+        proxy_extra_args=["--include-package", "both", "--exclude-package", "both"],
     )
 
 

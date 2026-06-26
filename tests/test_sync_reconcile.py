@@ -62,7 +62,7 @@ def _run_sync(pypiron_bin, source, dest, pkg_list, *extra):
     return sync_to(
         pypiron_bin,
         dest,
-        "--filter-packages-list",
+        "--include-packages-from",
         str(pkg_list),
         *extra,
         source=source["base_url"],
@@ -196,9 +196,9 @@ def test_unchanged_resync_skips_via_conditional_304(source_dest, pypiron_bin, tm
     assert "upstream unchanged since last sync (304)" in combined, combined
     assert f"Syncing {pkg}" not in combined
 
-    # A changed run config (here --filter-only-wheels) must invalidate the cursor's
+    # A changed run config (here --include-format wheel) must invalidate the cursor's
     # config key and force a re-fetch, even though upstream is unchanged.
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--filter-only-wheels")
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--include-format", "wheel")
     assert rc == 0, f"config-change sync failed:\n{out}\n{err}"
     assert f"Syncing {pkg}" in (out + err), "config change did not invalidate the 304 shortcut"
 
@@ -248,7 +248,7 @@ def test_resync_skips_files_already_mirrored(source_dest, pypiron_bin, tmp_path)
 
 
 def test_relative_duration_exclude_older_still_304s_on_resync(source_dest, pypiron_bin, tmp_path):
-    """A relative `--filter-exclude-older` ("1 day") resolves to a fresh instant every
+    """A relative `--exclude-older` ("1 day") resolves to a fresh instant every
     run, but the sync cursor must still match its own prior config so an
     unchanged upstream 304s. Regression: the resolved instant used to be hashed
     into the cursor's config key, so every relative-duration run re-fetched and
@@ -262,7 +262,7 @@ def test_relative_duration_exclude_older_still_304s_on_resync(source_dest, pypir
     pkg_list.write_text(f"{pkg}\n")
 
     # Fresh wheels upload "now", so a 1-day older-bound still includes them.
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--filter-exclude-older", "1 day")
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--exclude-older", "1 day")
     assert rc == 0, f"initial sync failed:\n{out}\n{err}"
     assert f"Syncing {pkg}" in (out + err)
     wait_for_file_in_index(dest["simple"], pkg, w1.name)
@@ -270,7 +270,7 @@ def test_relative_duration_exclude_older_still_304s_on_resync(source_dest, pypir
     # Second run, same relative bound, nothing changed upstream: the cursor's
     # config key is hashed from the raw "1 day", not its (now-shifted) instant,
     # so the conditional fetch 304s and the whole project is skipped.
-    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--filter-exclude-older", "1 day")
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--exclude-older", "1 day")
     assert rc == 0, f"second sync failed:\n{out}\n{err}"
     combined = out + err
     assert "upstream unchanged since last sync (304)" in combined, combined

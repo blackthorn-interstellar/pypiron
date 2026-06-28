@@ -288,6 +288,25 @@ impl MirrorArgs {
             .map(str::to_owned)
     }
 
+    /// The raw `--exclude-newer` input after precedence, defaulting to `"7"` (the
+    /// 7-day quarantine). The single source of that default: both the parsed
+    /// `Cutoff` and [`config_key`]'s hash derive from this, so they can't drift.
+    fn exclude_newer_input<'a>(&'a self, file: Option<&'a MirrorConfig>) -> &'a str {
+        self.exclude_newer
+            .as_deref()
+            .or(file.and_then(|f| f.exclude_newer.as_deref()))
+            .unwrap_or("7")
+    }
+
+    /// The newer bound kept verbatim for [`config_key`] — like
+    /// [`Self::exclude_older_raw`], a relative duration must hash to a *stable*
+    /// value across runs. `""` (the opt-out) trims to `None`, matching
+    /// [`parse_cutoff`]'s "no cutoff".
+    pub(crate) fn exclude_newer_raw(&self, file: Option<&MirrorConfig>) -> Option<String> {
+        let raw = self.exclude_newer_input(file).trim();
+        (!raw.is_empty()).then(|| raw.to_owned())
+    }
+
     /// Resolve CLI/env over the optional `[mirror]` table into the runtime
     /// predicate. The single path used by both `sync` and the `serve` proxy, so
     /// the two can never drift. Precedence is CLI/env > file > default; a bool
@@ -321,15 +340,7 @@ impl MirrorArgs {
             // a week old (a sliding 7-day quarantine that blunts install-then-yank
             // supply-chain attacks). An explicit empty value opts out — `""` parses
             // to "no cutoff" and, unlike `0`, keeps the sync cursor stable.
-            exclude_newer: parse_cutoff(
-                "exclude-newer",
-                Some(
-                    self.exclude_newer
-                        .as_deref()
-                        .or(file.and_then(|f| f.exclude_newer.as_deref()))
-                        .unwrap_or("7"),
-                ),
-            )?,
+            exclude_newer: parse_cutoff("exclude-newer", Some(self.exclude_newer_input(file)))?,
             exclude_older: parse_cutoff("exclude-older", self.exclude_older_raw(file).as_deref())?,
             exclude_python_below: parse_exclude_python_below(
                 self.exclude_python_below
@@ -540,8 +551,13 @@ struct Resolved {
     /// The raw `--exclude-older` input (e.g. `"800 days"`), kept verbatim for
     /// [`config_key`]: a relative duration must hash to a value that is *stable*
     /// across runs, or the sync cursor never matches its own prior config and
-    /// every run re-fetches. Only the older bound needs this — see [`config_key`].
+    /// every run re-fetches.
     exclude_older_raw: Option<String>,
+    /// The raw `--exclude-newer` input, kept verbatim for [`config_key`] for the
+    /// same reason as [`Self::exclude_older_raw`]. Its run-to-run "a file aged
+    /// past the cutoff" re-evaluation is driven by the per-package
+    /// `next_eligible_at` watermark, not by perturbing this hash every run.
+    exclude_newer_raw: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -600,6 +616,7 @@ impl Resolved {
             );
         }
         let exclude_older_raw = args.mirror.exclude_older_raw(Some(&cfg.mirror));
+        let exclude_newer_raw = args.mirror.exclude_newer_raw(Some(&cfg.mirror));
 
         // A `0` here would mean "no work in flight" — `chunks(0)`/`buffer_unordered(0)`
         // panic or stall — so refuse it rather than silently coercing a typo to 1.
@@ -632,6 +649,7 @@ impl Resolved {
             full: args.full,
             mirror,
             exclude_older_raw,
+            exclude_newer_raw,
         })
     }
 }
@@ -971,6 +989,16 @@ struct CursorEntry {
     /// PyPI's `X-PyPI-Last-Serial`, when present — diagnostics only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     serial: Option<u64>,
+    /// Unix-seconds upload time of the earliest file the last 200 held back
+    /// *only* by `--exclude-newer` — the instant the (sliding) newer cutoff must
+    /// reach before a 304 could hide a now-eligible file. While the cutoff stays
+    /// below it, an unchanged listing is safe to 304; once it crosses, the cursor
+    /// forces a full re-fetch so the aged-in file is picked up. `None` = nothing
+    /// was in the cooldown, so only an ETag/config change re-fetches. Absent in
+    /// pre-watermark cursors (revived as `None`; harmless — the `config` hash
+    /// changed too, forcing one full sweep that recomputes it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_eligible_at: Option<i64>,
 }
 
 /// project name -> its cursor.
@@ -1005,32 +1033,18 @@ fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
         }
         h.update([0x1f]);
     }
-    // The two cutoffs are hashed asymmetrically — on purpose, don't "tidy" it.
-    //
-    // `--exclude-newer` keeps its *resolved* instant: an absolute timestamp is
-    // stable across runs anyway, and a relative one ("30 days") is meant to
-    // slide — as releases age past the upper bound they become eligible, which a
-    // 304 would silently miss, so its config must change each run to force a
-    // re-fetch and re-evaluation.
-    h.update(
-        m.exclude_newer
-            .map_or(0i64, |c| c.instant().unix_timestamp())
-            .to_le_bytes(),
-    );
-    // `--exclude-older` hashes its raw *input* instead, so a relative duration
-    // stays stable run to run. Its bound only ever slides files *out* of the
-    // set and a mirror never deletes, so there is nothing to re-evaluate —
-    // letting the cursor 304 a quiet package. Hashing the resolved instant here
-    // (as the newer bound does) would change every run and defeat the cursor for
-    // every relative-duration mirror.
-    h.update(
-        resolved
-            .exclude_older_raw
-            .as_deref()
-            .unwrap_or("")
-            .as_bytes(),
-    );
-    h.update([0x1e]);
+    // Both cutoffs hash their *raw input*, not the resolved instant — so a
+    // relative duration ("7 days") stays stable run to run instead of perturbing
+    // the key every run and defeating the cursor for every relative-duration
+    // mirror. A spec *change* (7 -> 14 days) still flips the key. The newer
+    // bound's "a release aged past the cutoff, re-fetch to catch it" is handled
+    // out-of-band by the per-package `next_eligible_at` watermark, not here; the
+    // older bound needs no such thing — it only slides files *out* and a mirror
+    // never deletes, so there is nothing to re-evaluate.
+    for raw in [&resolved.exclude_newer_raw, &resolved.exclude_older_raw] {
+        h.update(raw.as_deref().unwrap_or("").as_bytes());
+        h.update([0x1e]);
+    }
     h.update([
         u8::from(m.exclude_dev),
         u8::from(m.exclude_windows),
@@ -1482,7 +1496,23 @@ async fn sync_one_package(
         None
     } else {
         prev_cursor
+            // The config gate MUST come first: only when the run config is
+            // unchanged is the prior ETag (and its watermark) meaningful.
             .filter(|c| c.config == cfg_key)
+            // Watermark gate: a relative `--exclude-newer` hashes stably (so the
+            // config matches run to run), so the cursor itself must notice when a
+            // held-back file ages in. Replay the ETag only while the *current*
+            // cutoff is still below the earliest in-cooldown upload-time; once it
+            // reaches it, fall through to a full fetch that re-selects. Fail
+            // closed: any shape we can't prove safe (a recorded watermark with no
+            // live bound below it) forces the 200.
+            .filter(|c| match c.next_eligible_at {
+                None => true,
+                Some(w) => resolved
+                    .mirror
+                    .exclude_newer
+                    .is_some_and(|cut| cut.instant().unix_timestamp() < w),
+            })
             .map(|c| c.etag.as_str())
     };
     let (index, etag, last_serial) =
@@ -1501,7 +1531,8 @@ async fn sync_one_package(
             } => (index, etag, last_serial),
         };
 
-    let (selected, upstream_status, upstream_files) = select_from_index(index, resolved, spec);
+    let (selected, upstream_status, upstream_files, next_eligible_at) =
+        select_from_index(index, resolved, spec);
 
     let mut errors = 0usize;
 
@@ -1654,6 +1685,7 @@ async fn sync_one_package(
             etag,
             config: cfg_key,
             serial: last_serial,
+            next_eligible_at,
         })
     };
     Ok(PackageOutcome { new_cursor })
@@ -1782,7 +1814,14 @@ fn select_from_index(
     index: SimpleIndex,
     resolved: &Resolved,
     spec: &PackageSpec,
-) -> (Vec<Selected>, Option<ProjectStatusDoc>, UpstreamFiles) {
+) -> (
+    Vec<Selected>,
+    Option<ProjectStatusDoc>,
+    UpstreamFiles,
+    // The newer-bound watermark: earliest upload-time among files held back only
+    // by `--exclude-newer`. `None` if nothing is in the cooldown.
+    Option<i64>,
+) {
     let base_url = format!(
         "{}/simple/{}/",
         resolved.src_base.trim_end_matches('/'),
@@ -1814,15 +1853,17 @@ fn select_from_index(
     };
 
     let mut selected = Vec::new();
+    // Earliest upload-time of a file held back *only* by the cooldown — the
+    // instant a 304 could begin hiding a now-eligible file. The name-axis gates
+    // (specifier, deny) run *before* this so the watermark reflects exactly the
+    // set the mirror would select once the cooldown lifts.
+    let mut next_eligible_at: Option<i64> = None;
     for mut file in index.files {
         // No digest, no service: every artifact we hand out must be verifiable.
         if file.sha256().is_none() {
             continue;
         }
         file.yanked = file.yanked.normalized();
-        if !matches_mirror(&file, &resolved.mirror) {
-            continue;
-        }
         let version = infer_version_from_filename(&file.filename);
         if let Some(specifiers) = &spec.specifiers {
             // A specifier gates by version, which the Simple API doesn't carry —
@@ -1840,14 +1881,19 @@ fn select_from_index(
         ) {
             continue;
         }
-        file.url = resolve(&file.url);
-        file.provenance = file.provenance.as_deref().map(&resolve);
-        selected.push(Selected { version, file });
+        if matches_mirror(&file, &resolved.mirror) {
+            file.url = resolve(&file.url);
+            file.provenance = file.provenance.as_deref().map(&resolve);
+            selected.push(Selected { version, file });
+        } else if let Some(t) = held_back_by_newer(&file, &resolved.mirror) {
+            let secs = t.unix_timestamp();
+            next_eligible_at = Some(next_eligible_at.map_or(secs, |cur| cur.min(secs)));
+        }
     }
     if selected.is_empty() {
         warn!("No matching files for package '{}'", spec.name);
     }
-    (selected, upstream_status, upstream_files)
+    (selected, upstream_status, upstream_files, next_eligible_at)
 }
 
 /// Provenance objects are small JSON, and the destination's upload path rejects
@@ -2043,6 +2089,15 @@ async fn upload_via_http(
 }
 
 pub(crate) fn matches_mirror(file: &SimpleFile, m: &ResolvedMirror) -> bool {
+    matches_mirror_inner(file, m, false)
+}
+
+/// The real mirror predicate. `ignore_newer` lifts the `--exclude-newer` bound
+/// only — the sync watermark uses it to ask "would this file be selected once it
+/// ages past the cooldown?" without re-deriving (and risking drift from) every
+/// other gate. Public callers go through [`matches_mirror`] (`ignore_newer =
+/// false`), which is byte-identical to the old behaviour.
+fn matches_mirror_inner(file: &SimpleFile, m: &ResolvedMirror, ignore_newer: bool) -> bool {
     let fname = file.filename.to_ascii_lowercase();
     let format = file_format(&fname);
     let is_wheel = format == Format::Wheel;
@@ -2078,25 +2133,27 @@ pub(crate) fn matches_mirror(file: &SimpleFile, m: &ResolvedMirror) -> bool {
         }
     }
 
-    // Upload-time bounds. With a bound set, a file without a parseable
-    // timestamp is excluded — same rule uv applies to --exclude-newer.
-    if m.exclude_newer.is_some() || m.exclude_older.is_some() {
-        let uploaded = file
+    // Upload-time bounds. A file with no parseable upload-time is *kept*: we
+    // don't drop a release just because upstream omitted the timestamp (a mirror
+    // favours completeness, and it sidesteps a sticky empty-mirror trap against
+    // upstreams that don't carry PEP 700 `upload-time`). The gates only ever act
+    // on files we can place in time. `ignore_newer` lifts the upper bound for the
+    // watermark probe.
+    let newer = if ignore_newer { None } else { m.exclude_newer };
+    if newer.is_some() || m.exclude_older.is_some() {
+        if let Some(uploaded) = file
             .upload_time
             .as_deref()
-            .and_then(|ts| OffsetDateTime::parse(ts, &Rfc3339).ok());
-        let Some(uploaded) = uploaded else {
-            return false;
-        };
-        if m.exclude_newer
-            .is_some_and(|cutoff| uploaded >= cutoff.instant())
+            .and_then(|ts| OffsetDateTime::parse(ts, &Rfc3339).ok())
         {
-            return false;
-        }
-        if m.exclude_older
-            .is_some_and(|cutoff| uploaded < cutoff.instant())
-        {
-            return false;
+            if newer.is_some_and(|cutoff| uploaded >= cutoff.instant()) {
+                return false;
+            }
+            if m.exclude_older
+                .is_some_and(|cutoff| uploaded < cutoff.instant())
+            {
+                return false;
+            }
         }
     }
 
@@ -2152,6 +2209,25 @@ pub(crate) fn matches_mirror(file: &SimpleFile, m: &ResolvedMirror) -> bool {
     }
 
     true
+}
+
+/// If `file` is withheld *only* by `--exclude-newer` — it clears every other
+/// gate and would be mirrored once it ages past the cooldown — return its upload
+/// time; otherwise `None`. Feeds the per-package `next_eligible_at` watermark
+/// (the min of these), so the sync cursor knows the earliest instant a 304 could
+/// start hiding a now-eligible file. A file with no parseable upload-time can
+/// never age in (and is kept anyway, per [`matches_mirror_inner`]), so it never
+/// contributes.
+fn held_back_by_newer(file: &SimpleFile, m: &ResolvedMirror) -> Option<OffsetDateTime> {
+    let cutoff = m.exclude_newer?;
+    let uploaded = file
+        .upload_time
+        .as_deref()
+        .and_then(|ts| OffsetDateTime::parse(ts, &Rfc3339).ok())?;
+    if uploaded < cutoff.instant() {
+        return None; // already past the cooldown w.r.t. the newer bound
+    }
+    matches_mirror_inner(file, m, true).then_some(uploaded)
 }
 
 fn tokens_match_any(tokens: &[String], filters: &[String]) -> bool {
@@ -2403,14 +2479,47 @@ mod tests {
         let before_2016 = time_filter(Some("2016-01-01T00:00:00Z"), None);
         assert!(matches_mirror(&old, &before_2016));
         assert!(!matches_mirror(&new, &before_2016));
-        assert!(!matches_mirror(&unknown, &before_2016));
+        // A file with no parseable upload-time is *kept* under either bound: we
+        // don't drop a release just because upstream omitted the timestamp.
+        assert!(matches_mirror(&unknown, &before_2016));
 
         let since_2016 = time_filter(None, Some("2016-01-01T00:00:00Z"));
         assert!(!matches_mirror(&old, &since_2016));
         assert!(matches_mirror(&new, &since_2016));
+        assert!(matches_mirror(&unknown, &since_2016));
 
         let unbounded = time_filter(None, None);
         assert!(matches_mirror(&unknown, &unbounded));
+    }
+
+    #[test]
+    fn held_back_by_newer_is_the_watermark_input() {
+        // `time_filter` builds Cutoff::At, so a cutoff *before* the upload holds
+        // the file back; the upload time is what the watermark records.
+        let recent = simple_file(Some("2024-12-04T17:35:26Z"));
+        let uploaded = OffsetDateTime::parse("2024-12-04T17:35:26Z", &Rfc3339).unwrap();
+        let cutoff_2016 = time_filter(Some("2016-01-01T00:00:00Z"), None);
+
+        // Held back only by the newer bound → its upload time feeds the watermark.
+        assert_eq!(held_back_by_newer(&recent, &cutoff_2016), Some(uploaded));
+
+        // Already past the cooldown → not held.
+        let old = simple_file(Some("2015-10-07T13:41:23Z"));
+        assert_eq!(held_back_by_newer(&old, &cutoff_2016), None);
+
+        // No newer bound at all → nothing is "held by newer".
+        assert_eq!(held_back_by_newer(&recent, &time_filter(None, None)), None);
+
+        // Recent but excluded by *another* filter (sdists only) → not selectable
+        // even once it ages in, so it must not schedule a wakeup.
+        let sdist_only = ResolvedMirror {
+            include_format: vec![Format::Sdist],
+            ..time_filter(Some("2016-01-01T00:00:00Z"), None)
+        };
+        assert_eq!(held_back_by_newer(&recent, &sdist_only), None);
+
+        // No parseable upload-time → kept by the filter, never ages in.
+        assert_eq!(held_back_by_newer(&simple_file(None), &cutoff_2016), None);
     }
 
     #[test]
@@ -2824,6 +2933,7 @@ mod tests {
             full: false,
             mirror: filter,
             exclude_older_raw: None,
+            exclude_newer_raw: None,
         }
     }
 
@@ -2904,40 +3014,37 @@ mod tests {
     }
 
     #[test]
-    fn config_key_older_bound_is_stable_across_relative_runs() {
+    fn config_key_cutoffs_are_stable_across_relative_runs() {
         let s = spec("requests", None);
 
-        // Two runs of the same `--exclude-older "800 days"` resolve to two
-        // different instants (now slides), but the raw input is identical. The
-        // key must stay stable, or the sync cursor never matches its own prior
-        // config and every relative-duration run needlessly re-fetches.
-        let mut run1 = resolved_with(
-            time_filter(None, Some("2024-01-01T00:00:00Z")),
-            "https://pypi.org",
-        );
-        let mut run2 = resolved_with(
-            time_filter(None, Some("2020-06-15T00:00:00Z")),
-            "https://pypi.org",
-        );
-        run1.exclude_older_raw = Some("800 days".into());
-        run2.exclude_older_raw = Some("800 days".into());
-        assert_eq!(config_key(&run1, &s), config_key(&run2, &s));
+        // Two runs of the same relative cutoff resolve to two different instants
+        // (now slides), but the raw input is identical. The key must stay stable
+        // for BOTH bounds, or the sync cursor never matches its own prior config
+        // and every relative-duration run needlessly re-fetches. (The newer
+        // bound's "a release aged past the cutoff" case is handled by the
+        // per-package next_eligible_at watermark, not by perturbing this key.)
+        for set_raw in [
+            (|r: &mut Resolved, v: &str| r.exclude_older_raw = Some(v.into()))
+                as fn(&mut Resolved, &str),
+            |r: &mut Resolved, v: &str| r.exclude_newer_raw = Some(v.into()),
+        ] {
+            // Different resolved instants, identical raw input → identical key.
+            let mut run1 = resolved_with(
+                time_filter(Some("2024-01-01T00:00:00Z"), Some("2024-01-01T00:00:00Z")),
+                "https://pypi.org",
+            );
+            let mut run2 = resolved_with(
+                time_filter(Some("2020-06-15T00:00:00Z"), Some("2020-06-15T00:00:00Z")),
+                "https://pypi.org",
+            );
+            set_raw(&mut run1, "800 days");
+            set_raw(&mut run2, "800 days");
+            assert_eq!(config_key(&run1, &s), config_key(&run2, &s));
 
-        // A genuinely different older bound still invalidates the key.
-        run2.exclude_older_raw = Some("400 days".into());
-        assert_ne!(config_key(&run1, &s), config_key(&run2, &s));
-
-        // The newer bound is hashed by its resolved instant, so a sliding
-        // relative `--exclude-newer` keeps invalidating the key every run — by
-        // design: releases aging past it become eligible and a 304 would miss them.
-        let newer_a = resolved_with(
-            time_filter(Some("2024-01-01T00:00:00Z"), None),
-            "https://pypi.org",
-        );
-        let newer_b = resolved_with(
-            time_filter(Some("2020-06-15T00:00:00Z"), None),
-            "https://pypi.org",
-        );
-        assert_ne!(config_key(&newer_a, &s), config_key(&newer_b, &s));
+            // A genuinely different bound (a spec change, e.g. 7 -> 14 days) still
+            // invalidates the key.
+            set_raw(&mut run2, "400 days");
+            assert_ne!(config_key(&run1, &s), config_key(&run2, &s));
+        }
     }
 }

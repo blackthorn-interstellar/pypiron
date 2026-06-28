@@ -333,6 +333,12 @@ is 24 h); calendar months and years are rejected. The same forms apply to the
 `[mirror]` `exclude-newer`/`exclude-older` keys. An empty value (`""`) means "no
 cutoff" — the explicit way to opt out of the default 7-day cooldown.
 
+Unlike uv's client-side `--exclude-newer` (which treats a file with no
+`upload-time` as unavailable), the mirror **keeps** a file whose upstream listing
+carries no parseable upload time — the time bounds only ever act on files that
+can be placed in time, so an upstream without PEP 700 timestamps still mirrors
+fully instead of going silently empty.
+
 A sync run prints a live progress meter on stderr (packages done, files/bytes
 mirrored, throughput, ETA) plus an always-on end-of-run summary; `--no-progress`
 (`PYPIRON_SYNC_NO_PROGRESS`) silences the live line. When stderr is redirected to

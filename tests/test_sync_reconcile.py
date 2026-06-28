@@ -16,6 +16,7 @@ import pytest
 
 from .conftest import _start_disk_server
 from .helpers import (
+    ACCEPT_PEP691,
     get_index_json,
     http_get,
     http_request_auth,
@@ -46,6 +47,14 @@ def source_dest(tmp_path_factory, pypiron_bin) -> Iterator[Dict]:
 
 def _admin(server) -> Dict[str, str]:
     return {"username": server["admin_user"], "password": server["admin_password"]}
+
+
+def _dest_filenames(dest, pkg):
+    """Filenames the dest serves for `pkg` ([] if it never mirrored it / 404)."""
+    code, body, _ = http_get(f"{dest['simple']}{pkg}/", headers={"Accept": ACCEPT_PEP691})
+    if code != 200:
+        return []
+    return [f["filename"] for f in json.loads(body).get("files", [])]
 
 
 def _seed(server, name: str, version: str, tmp_path):
@@ -211,6 +220,59 @@ def test_unchanged_resync_skips_via_conditional_304(source_dest, pypiron_bin, tm
     rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--full")
     assert rc == 0, f"--full sync failed:\n{out}\n{err}"
     assert f"Syncing {pkg}" in (out + err)
+
+
+def test_cooldown_quarantines_and_cursor_records_watermark(source_dest, pypiron_bin, tmp_path):
+    """A held-back release isn't mirrored, the cursor records when it ages in, and
+    an unchanged re-run still 304s (the watermark is below the cutoff)."""
+    source, dest = source_dest["source"], source_dest["dest"]
+    pkg = "cooldownpkg"
+    wheel = _seed(source, pkg, "1.0", tmp_path)
+    wait_for_file_in_index(source["simple"], pkg, wheel.name)
+
+    # An absolute cutoff fixed forever *below* the wheel's just-now upload time:
+    # the release is unconditionally quarantined, with no dependence on timing.
+    cutoff = "2000-01-01T00:00:00Z"
+    args = ("--include-package", pkg, "--exclude-newer", cutoff)
+    rc, out, err = sync_to(pypiron_bin, dest, *args, source=source["base_url"])
+    assert rc == 0, f"sync failed:\n{out}\n{err}"
+    assert _dest_filenames(dest, pkg) == [], "a quarantined release must not be mirrored"
+
+    cursors = json.loads((dest["data_dir"] / "_sync" / "cursors.json").read_text())
+    assert pkg in cursors, "sync did not persist a cursor"
+    assert cursors[pkg].get("next_eligible_at"), "cursor is missing the cooldown watermark"
+
+    # Same absolute cutoff: config matches AND cutoff(2000) < watermark, so the
+    # ETag replays -> 304, and the release stays quarantined.
+    rc, out, err = sync_to(pypiron_bin, dest, *args, source=source["base_url"])
+    assert rc == 0, f"second sync failed:\n{out}\n{err}"
+    assert "upstream unchanged since last sync (304)" in (out + err)
+    assert _dest_filenames(dest, pkg) == []
+
+
+def test_cooldown_watermark_lets_a_release_age_in(source_dest, pypiron_bin, tmp_path):
+    """With the config (the --exclude-newer flag) held constant, only the
+    next_eligible_at watermark can force the re-fetch that mirrors an aged-in
+    release — proving the 304 fast path stays correct under a sliding window."""
+    source, dest = source_dest["source"], source_dest["dest"]
+    pkg = "agingpkg"
+    wheel = _seed(source, pkg, "1.0", tmp_path)
+    wait_for_file_in_index(source["simple"], pkg, wheel.name)
+
+    # A short relative window: the just-uploaded wheel is held back now...
+    window = "10 seconds"
+    args = ("--include-package", pkg, "--exclude-newer", window)
+    rc, out, err = sync_to(pypiron_bin, dest, *args, source=source["base_url"])
+    assert rc == 0, f"sync failed:\n{out}\n{err}"
+    assert _dest_filenames(dest, pkg) == [], "a fresh release must start quarantined"
+
+    # ...wait past the window, then re-run with the IDENTICAL flag (config_key
+    # unchanged), so the watermark — not a config or ETag change — drives the 200.
+    time.sleep(12)
+    rc, out, err = sync_to(pypiron_bin, dest, *args, source=source["base_url"])
+    assert rc == 0, f"age-in sync failed:\n{out}\n{err}"
+    assert f"Syncing {pkg}" in (out + err), "watermark did not re-fetch as the file aged in"
+    wait_for_file_in_index(dest["simple"], pkg, wheel.name)
 
 
 def test_resync_skips_files_already_mirrored(source_dest, pypiron_bin, tmp_path):

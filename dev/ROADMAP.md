@@ -37,7 +37,7 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 - `/health`, Prometheus `/metrics`, `--log-format json`, per-project traffic attribution via username subaddressing.
 - Distributed per-package/version download counters (`_counters/`): counted on the GET path, flushed as immutable sharded segments, compacted into frozen daily files by the leader; served at `GET /stats/downloads/<pkg>`. A best-effort, lossy analytic (never truth), kept off the low-cardinality `/metrics`.
 - Delete and yank management API.
-- Human-facing pages: landing + live dashboard (`/`), a package browser (`/projects/`), and a read-only project page (`/project/<pkg>/`) — metadata sidebar, release files, README shown verbatim (not rendered). Server-rendered on demand, no build step, gated by read auth.
+- Human-facing pages: landing + live dashboard (`/`), a package browser (`/projects/`, name search via `?q=`), and a read-only project page (`/project/<pkg>/`) — metadata sidebar, release files, README rendered from Markdown through a locked-down whitelist renderer (no separate sanitizer; `<script>`/handlers/`javascript:` URLs are unrepresentable), with rst/plain shown verbatim in a `<pre>`. Server-rendered on demand, no build step, gated by read auth.
 
 Implementation history (the original milestone-by-milestone build) lives in git;
 the [improvements log](BENCHMARK_RESULTS.md#improvements-log) tracks every landed
@@ -65,12 +65,10 @@ physically cannot tamper with truth). Such a node serves what's materialized and
 cannot self-heal — a writer node must exist somewhere.
 
 **Management UI.** The read-only project page ships (`/project/<pkg>/`:
-metadata sidebar, release files, README shown verbatim — see Shipped). What's
+metadata sidebar, release files, rendered README — see Shipped). What's
 left is the *management* half — token management, yank/delete from the browser —
 which earns its keep only after tokens exist. Server-rendered, no build step, no
-React death star. A possible follow-up to the read page: opt-in,
-sanitized Markdown rendering of the README (`pulldown-cmark` + `ammonia`, fuzzed,
-`<pre>` fallback for rst/plain), off by default to keep the zero-dep posture.
+React death star.
 
 **Webhook / event notification.** Trigger downstream actions (notify Slack, kick
 CI) on publish or yank. Competitors have it; teams work around it by polling.

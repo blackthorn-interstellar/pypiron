@@ -72,7 +72,7 @@ pypiron sync \
 | `--admin-user` / `--admin-pass` | Admin credential for the destination. |
 | `--full` | Ignore the conditional-fetch memo; re-fetch and reconcile everything. |
 | `--dry-run` | Print what would be copied, transfer nothing. |
-| `--exclude-newer` | Only mirror files received upstream before a cutoff (timestamp, date, `7`, `30 days`, `P30D`). One of the shared mirror-selection flags (see [Configuration](configuration.md#mirror-selection)). |
+| `--exclude-newer` | Only mirror files received upstream before a cutoff (timestamp, date, `7`, `30 days`, `P30D`). **Defaults to `7`** — a sliding 7-day quarantine; `""` disables it. One of the shared mirror-selection flags (see [Configuration](configuration.md#mirror-selection)). |
 
 A normal run only touches projects whose upstream listing changed; `--full` is
 the periodic self-heal. Once mirrored, an artifact is never deleted — re-runs

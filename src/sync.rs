@@ -211,11 +211,12 @@ pub struct MirrorArgs {
     pub exclude_platform_tag: Vec<String>,
 
     /// Only mirror/proxy files received upstream before this cutoff (the
-    /// mirroring twin of uv's --exclude-newer). Accepts an RFC 3339 timestamp, a
-    /// bare date (2008-12-03), a bare integer of days ago (7), a friendly
-    /// duration ("30 days", "24 hours", "1 week"), or an ISO 8601 duration
-    /// (P30D, PT24H); durations are relative to now. Calendar months/years are
-    /// not allowed.
+    /// mirroring twin of uv's --exclude-newer). Defaults to "7" — a sliding
+    /// 7-day quarantine so freshly published (and quickly-yanked) releases are
+    /// held back; pass "" to disable. Accepts an RFC 3339 timestamp, a bare date
+    /// (2008-12-03), a bare integer of days ago (7), a friendly duration
+    /// ("30 days", "24 hours", "1 week"), or an ISO 8601 duration (P30D, PT24H);
+    /// durations are relative to now. Calendar months/years are not allowed.
     #[arg(
         long = "exclude-newer",
         env = "PYPIRON_EXCLUDE_NEWER",
@@ -316,13 +317,20 @@ impl MirrorArgs {
                 &self.exclude_platform_tag,
                 file.and_then(|f| f.exclude_platform_tag.clone()),
             ),
+            // Default cooldown: with nothing set, hold files back until they are
+            // a week old (a sliding 7-day quarantine that blunts install-then-yank
+            // supply-chain attacks). An explicit empty value opts out — `""` parses
+            // to "no cutoff" and, unlike `0`, keeps the sync cursor stable.
             exclude_newer: parse_cutoff(
                 "exclude-newer",
-                self.exclude_newer
-                    .as_ref()
-                    .or(file.and_then(|f| f.exclude_newer.as_ref())),
+                Some(
+                    self.exclude_newer
+                        .as_deref()
+                        .or(file.and_then(|f| f.exclude_newer.as_deref()))
+                        .unwrap_or("7"),
+                ),
             )?,
-            exclude_older: parse_cutoff("exclude-older", self.exclude_older_raw(file).as_ref())?,
+            exclude_older: parse_cutoff("exclude-older", self.exclude_older_raw(file).as_deref())?,
             exclude_python_below: parse_exclude_python_below(
                 self.exclude_python_below
                     .as_deref()
@@ -550,8 +558,8 @@ pub(crate) struct ResolvedMirror {
     pub(crate) include_abi_tag: Vec<String>,
     pub(crate) include_platform_tag: Vec<String>,
     pub(crate) exclude_platform_tag: Vec<String>,
-    pub(crate) exclude_newer: Option<OffsetDateTime>,
-    pub(crate) exclude_older: Option<OffsetDateTime>,
+    pub(crate) exclude_newer: Option<Cutoff>,
+    pub(crate) exclude_older: Option<Cutoff>,
     /// Minimum Python `(major, minor)`; wheels that target only older Pythons
     /// are dropped. `None` disables the floor.
     pub(crate) exclude_python_below: Option<(u32, u32)>,
@@ -637,35 +645,59 @@ fn pick_vec(cli: &[String], cfg: Option<Vec<String>>) -> Vec<String> {
     }
 }
 
-/// Parse a "cutoff" value (CLI/env/config) into an absolute instant, matching
-/// uv's `--exclude-newer` grammar: an RFC 3339 timestamp, a "friendly" duration
+/// An upload-time bound. A value the user pinned to a specific instant (an
+/// RFC 3339 timestamp or a bare date) is [`Cutoff::At`] and never moves. A value
+/// expressed as a duration (`7`, `30 days`, `P30D`) is [`Cutoff::Ago`] and is
+/// re-evaluated against the wall clock every time the filter runs — so the
+/// window keeps sliding inside a long-lived `serve` proxy instead of freezing at
+/// the instant the process resolved its config. `sync` re-resolves per run, so
+/// it slides there regardless; the distinction matters for the always-on proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cutoff {
+    At(OffsetDateTime),
+    Ago(Duration),
+}
+
+impl Cutoff {
+    /// The effective instant right now: a pinned `At` is returned verbatim, an
+    /// `Ago` is measured back from the current time so the window slides.
+    pub(crate) fn instant(self) -> OffsetDateTime {
+        match self {
+            Cutoff::At(t) => t,
+            Cutoff::Ago(d) => OffsetDateTime::now_utc() - d,
+        }
+    }
+}
+
+/// Parse a "cutoff" value (CLI/env/config) into a [`Cutoff`], matching uv's
+/// `--exclude-newer` grammar: an RFC 3339 timestamp, a "friendly" duration
 /// (`30 days`, `24 hours`, `1 week`), or an ISO 8601 duration (`P30D`, `PT24H`).
-/// A duration is taken relative to now and resolved as a fixed number of seconds
-/// — a day is 24 hours, DST is ignored. Calendar months and years are rejected:
-/// with no fixed length they can't be reduced to a number of seconds.
-pub(crate) fn parse_cutoff(what: &str, value: Option<&String>) -> Result<Option<OffsetDateTime>> {
+/// A duration is a fixed number of seconds back from "now" — a day is 24 hours,
+/// DST is ignored — and stays relative so the window slides. Calendar months and
+/// years are rejected: with no fixed length they can't be reduced to seconds.
+pub(crate) fn parse_cutoff(what: &str, value: Option<&str>) -> Result<Option<Cutoff>> {
     let Some(value) = value.map(|v| v.trim()).filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
-    // An absolute RFC 3339 timestamp wins.
+    // An absolute RFC 3339 timestamp wins — a pinned instant.
     if let Ok(ts) = OffsetDateTime::parse(value, &Rfc3339) {
-        return Ok(Some(ts));
+        return Ok(Some(Cutoff::At(ts)));
     }
     // A bare calendar date (no time) — the common "since 2008-12-03" cutoff,
-    // taken as that day at 00:00:00 UTC.
+    // taken as that day at 00:00:00 UTC. Also a pinned instant.
     if let Some(ts) = parse_bare_date(value) {
-        return Ok(Some(ts));
+        return Ok(Some(Cutoff::At(ts)));
     }
     // A bare integer is that many days ago, so `--exclude-newer 7` means "before
-    // 7 days ago" — the obvious reading of a unit-less count of days.
+    // 7 days ago" — the obvious reading of a unit-less count of days. Relative.
     if let Ok(days) = value.parse::<i64>() {
         if days >= 0 {
-            return Ok(Some(OffsetDateTime::now_utc() - Duration::days(days)));
+            return Ok(Some(Cutoff::Ago(Duration::days(days))));
         }
     }
-    // Otherwise a relative duration, resolved against now.
+    // Otherwise a relative duration, kept relative and measured from now at use.
     if let Some(secs) = parse_duration_secs(value) {
-        return Ok(Some(OffsetDateTime::now_utc() - Duration::seconds(secs)));
+        return Ok(Some(Cutoff::Ago(Duration::seconds(secs))));
     }
     bail!(
         "{what} '{value}' is not a valid cutoff: use an RFC 3339 timestamp \
@@ -982,7 +1014,7 @@ fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
     // re-fetch and re-evaluation.
     h.update(
         m.exclude_newer
-            .map_or(0i64, |d| d.unix_timestamp())
+            .map_or(0i64, |c| c.instant().unix_timestamp())
             .to_le_bytes(),
     );
     // `--exclude-older` hashes its raw *input* instead, so a relative duration
@@ -2056,10 +2088,14 @@ pub(crate) fn matches_mirror(file: &SimpleFile, m: &ResolvedMirror) -> bool {
         let Some(uploaded) = uploaded else {
             return false;
         };
-        if m.exclude_newer.is_some_and(|cutoff| uploaded >= cutoff) {
+        if m.exclude_newer
+            .is_some_and(|cutoff| uploaded >= cutoff.instant())
+        {
             return false;
         }
-        if m.exclude_older.is_some_and(|cutoff| uploaded < cutoff) {
+        if m.exclude_older
+            .is_some_and(|cutoff| uploaded < cutoff.instant())
+        {
             return false;
         }
     }
@@ -2349,7 +2385,8 @@ mod tests {
     }
 
     fn time_filter(newer: Option<&str>, older: Option<&str>) -> ResolvedMirror {
-        let parse = |v: Option<&str>| v.map(|s| OffsetDateTime::parse(s, &Rfc3339).unwrap());
+        let parse =
+            |v: Option<&str>| v.map(|s| Cutoff::At(OffsetDateTime::parse(s, &Rfc3339).unwrap()));
         ResolvedMirror {
             exclude_newer: parse(newer),
             exclude_older: parse(older),
@@ -2579,6 +2616,48 @@ mod tests {
     }
 
     #[test]
+    fn exclude_newer_defaults_to_a_seven_day_quarantine() {
+        let newer = |a: MirrorArgs, f: Option<&MirrorConfig>| a.resolve(f).unwrap().exclude_newer;
+
+        // Nothing set: a sliding 7-day window, stored as a *relative* duration so
+        // it keeps advancing in a long-lived proxy instead of freezing at startup.
+        assert_eq!(
+            newer(MirrorArgs::default(), None),
+            Some(Cutoff::Ago(Duration::days(7)))
+        );
+
+        // An explicit empty value opts out entirely (no cutoff), via CLI/env...
+        assert!(newer(
+            MirrorArgs {
+                exclude_newer: Some(String::new()),
+                ..Default::default()
+            },
+            None,
+        )
+        .is_none());
+        // ...or via the `[mirror]` table.
+        let off = MirrorConfig {
+            exclude_newer: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(newer(MirrorArgs::default(), Some(&off)).is_none());
+
+        // An explicit timestamp still wins over the default and stays pinned.
+        assert_eq!(
+            newer(
+                MirrorArgs {
+                    exclude_newer: Some("2024-01-01T00:00:00Z".into()),
+                    ..Default::default()
+                },
+                None,
+            ),
+            Some(Cutoff::At(
+                OffsetDateTime::parse("2024-01-01T00:00:00Z", &Rfc3339).unwrap()
+            ))
+        );
+    }
+
+    #[test]
     fn is_prerelease_version_spans_pre_and_dev() {
         assert!(is_prerelease_version("1.0a1"));
         assert!(is_prerelease_version("1.0b2"));
@@ -2647,7 +2726,7 @@ mod tests {
     }
 
     fn cutoff(value: &str) -> Result<Option<OffsetDateTime>> {
-        parse_cutoff("test", Some(&value.to_string()))
+        Ok(parse_cutoff("test", Some(value))?.map(Cutoff::instant))
     }
 
     #[test]

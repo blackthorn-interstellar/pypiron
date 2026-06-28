@@ -317,6 +317,11 @@ Other file-axis rules:
 - Yanked files (PEP 592) are dropped by default. Pass `--include-yanked` or set
   `[mirror].include-yanked = true` to pull them anyway; they stay flagged yanked.
 - `--exclude-newer WHEN` keeps files received upstream before the cutoff.
+  **Defaults to `7`** — a sliding 7-day quarantine that holds freshly published
+  releases back from both the mirror and the proxy, so an install-then-yank
+  supply-chain attack has a week to be caught before any client can pull it. Set
+  `exclude-newer = ""` (an empty value) to turn the cooldown off and mirror
+  everything up to the present.
 - `--exclude-older WHEN` keeps files received upstream at or after the cutoff.
 
 `<when>` (matching uv's `--exclude-newer`) is an **RFC 3339 timestamp**
@@ -325,7 +330,8 @@ a **bare integer of days** ago (`7`), a **friendly duration** ago (`"30 days"`,
 `"24 hours"`, `"1 week"`), or an **ISO 8601 duration** ago (`P30D`, `PT24H`). A
 duration is resolved against the current time as a fixed number of seconds (a day
 is 24 h); calendar months and years are rejected. The same forms apply to the
-`[mirror]` `exclude-newer`/`exclude-older` keys.
+`[mirror]` `exclude-newer`/`exclude-older` keys. An empty value (`""`) means "no
+cutoff" — the explicit way to opt out of the default 7-day cooldown.
 
 A sync run prints a live progress meter on stderr (packages done, files/bytes
 mirrored, throughput, ETA) plus an always-on end-of-run summary; `--no-progress`

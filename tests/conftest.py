@@ -503,14 +503,22 @@ def disk_server_access_log_clf(tmp_path_factory, pypiron_bin: Path) -> Iterator[
 # ------------------------------ Proxy fixtures --------------------------------
 
 
-def _start_proxy_pair(tmp_path_factory, pypiron_bin: Path, proxy_extra_args=()) -> Iterator[Dict]:
-    """An upstream disk server plus a second server proxying it on demand."""
+def _start_proxy_pair(
+    tmp_path_factory, pypiron_bin: Path, proxy_extra_args=(), exclude_newer: str | None = ""
+) -> Iterator[Dict]:
+    """An upstream disk server plus a second server proxying it on demand.
+
+    The proxy disables the default 7-day quarantine (`exclude_newer=""`) so these
+    tests can publish a wheel upstream and proxy it immediately; pass
+    `exclude_newer=None` to leave the production default in place and exercise the
+    cooldown itself."""
     upstream_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
     upstream = next(upstream_gen)
+    cooldown = [] if exclude_newer is None else ["--exclude-newer", exclude_newer]
     proxy_gen = _start_disk_server(
         tmp_path_factory,
         pypiron_bin,
-        extra_args=["--proxy-upstream", upstream["base_url"], *proxy_extra_args],
+        extra_args=["--proxy-upstream", upstream["base_url"], *cooldown, *proxy_extra_args],
     )
     proxy = next(proxy_gen)
     try:

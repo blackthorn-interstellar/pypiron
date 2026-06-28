@@ -64,6 +64,11 @@ def _run_sync(pypiron_bin, source, dest, pkg_list, *extra):
         dest,
         "--include-packages-from",
         str(pkg_list),
+        # These wheels are built and uploaded moments before the sync, so disable
+        # the default 7-day quarantine — otherwise every freshly-seeded release
+        # sits inside the cooldown and nothing mirrors.
+        "--exclude-newer",
+        "",
         *extra,
         source=source["base_url"],
         env=env,

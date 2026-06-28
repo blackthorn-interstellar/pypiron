@@ -80,22 +80,28 @@ A compromised maintainer account or a typosquat is most dangerous in its first
 hours, before anyone notices. A quarantine window hides releases younger than a
 cutoff so resolution lands on versions that have had time to be caught.
 
-The proxy applies it on the read path; `sync` applies it to what a run mirrors:
+**This is on by default: `--exclude-newer` defaults to `7` — a sliding 7-day
+window.** The proxy applies it on the read path (re-evaluated against the wall
+clock per request, so the window keeps sliding in a long-running server); `sync`
+applies it to what a run mirrors. Override the window, pin an absolute "as of"
+date, or disable it with an empty value:
 
 ```bash
 pypiron serve --admin-pass "$ADMIN" \
   --proxy-upstream https://pypi.org \
-  --exclude-newer "7 days"
+  --exclude-newer "30 days"          # widen the default 7-day window
 ```
 
 ```bash
-pypiron sync --exclude-newer "2026-01-01T00:00:00Z"
+pypiron sync --exclude-newer "2026-01-01T00:00:00Z"   # pin an absolute cutoff
+pypiron sync --exclude-newer ""                        # disable: mirror everything
 ```
 
-`<when>` is an RFC 3339 timestamp (`2026-01-01T00:00:00Z`), a friendly duration
-ago (`"30 days"`, `"24 hours"`), or an ISO 8601 duration ago (`P30D`, `PT24H`).
-Durations resolve to a fixed number of seconds; calendar months and years are
-rejected.
+`<when>` is an RFC 3339 timestamp (`2026-01-01T00:00:00Z`), a bare integer of
+days ago (`7`), a friendly duration ago (`"30 days"`, `"24 hours"`), or an ISO
+8601 duration ago (`P30D`, `PT24H`). Durations stay relative and slide; an
+absolute timestamp stays pinned. Calendar months and years are rejected, and an
+empty value means "no cutoff". A duration resolves to a fixed number of seconds.
 
 This composes with uv's client-side `--exclude-newer`. pypiron serves PEP 700
 `upload-time` for every file (private uploads get receipt time; mirrored files

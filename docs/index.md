@@ -12,8 +12,9 @@ Truth is files on disk or object storage; indexes are regenerable views.
 ## Highlights
 
 - **Handles 5–90× more load** than other PyPI servers.
-- **Supply-chain quarantine.** Hide releases younger than a window with
-  `--exclude-newer`; `uv --exclude-newer` resolves against it.
+- **Supply-chain quarantine, on by default.** Releases younger than a sliding
+  7-day window are held back (`--exclude-newer`, tunable or `""` to disable);
+  `uv --exclude-newer` resolves against it.
 - **Works with the whole ecosystem.** uv, pip, poetry, twine, pipenv, hatch.
 - **Horizontal scaling that just works.** Point any number of nodes at one
   bucket; reads need zero coordination.

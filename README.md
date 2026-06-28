@@ -29,8 +29,9 @@ on demand, and bulk-syncs allowlists — all behind one URL and one namespace.
   bucket; reads need zero coordination and failover is automatic.
 - **Download tracking.** Per-package, per-version counts at
   `GET /stats/downloads/<pkg>`; per-project labels in Prometheus `/metrics`.
-- **Supply-chain quarantine.** Hide releases younger than a window with
-  `--exclude-newer`; `uv --exclude-newer` resolves against it.
+- **Supply-chain quarantine, on by default.** Releases younger than a sliding
+  7-day window are held back (`--exclude-newer`, tunable or `""` to disable);
+  `uv --exclude-newer` resolves against it.
 
 ## Quickstart
 

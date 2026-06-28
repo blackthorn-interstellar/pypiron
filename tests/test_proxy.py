@@ -6,9 +6,11 @@ pypiron instance — it speaks the same PEP 691 + PEP 700 the proxy consumes."""
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 
+from .conftest import _start_proxy_pair
 from .helpers import (
     ACCEPT_PEP691,
     get_index_json,
@@ -27,6 +29,26 @@ pytestmark = pytest.mark.integration
 def _upload(server, dist, package):
     upload_legacy(server["legacy"], dist, username=server["user"], password=server["password"])
     wait_for_file_in_index(server["simple"], package, dist.name)
+
+
+def test_default_cooldown_withholds_a_fresh_release(tmp_path_factory, pypiron_bin, tmp_path):
+    """With no --exclude-newer configured, the proxy applies a default 7-day
+    quarantine: a release uploaded moments ago is withheld until it ages past the
+    window, so an install-then-yank attack has a week to be caught first."""
+    gen = _start_proxy_pair(tmp_path_factory, pypiron_bin, exclude_newer=None)
+    pair = next(gen)
+    try:
+        upstream, proxy = pair["upstream"], pair["proxy"]
+        wheel = make_wheel("freshpkg", "1.0", tmp_path)
+        _upload(upstream, wheel, "freshpkg")  # upstream lists it immediately
+
+        # The proxy withholds the just-uploaded release: every file is inside the
+        # cooldown, so the project page carries no files (or 404s outright).
+        code, body, _ = http_get(f"{proxy['simple']}freshpkg/", headers={"Accept": ACCEPT_PEP691})
+        files = json.loads(body).get("files", []) if code == 200 else []
+        assert not files, f"default cooldown must withhold a fresh release (status {code})"
+    finally:
+        gen.close()
 
 
 def test_proxy_serves_and_caches_upstream_package(proxy_pair, tmp_path):

@@ -72,7 +72,7 @@ backend is single-node; multi-node implies a cloud backend.
     One URL and one namespace serve private uploads, synced mirror packages, and
     on-demand proxied packages together. Each package belongs to exactly one
     world, claimed at first write. See [Mirroring](mirroring.md) and
-    [Private + public](../guides/private-and-public.md).
+    [Add public PyPI](../guides/deploy.md#add-public-pypi).
 
 The full storage-layout contract — every path, the sidecar schema, the marker
 format — is documented in

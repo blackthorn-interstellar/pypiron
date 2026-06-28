@@ -61,7 +61,7 @@ Install against a read-gated server by putting the credential in the index URL:
 !!! tip
     uv reads credentials from `UV_INDEX_<NAME>_USERNAME` /
     `UV_INDEX_<NAME>_PASSWORD` so the secret stays out of the URL and out of
-    lockfiles. See [Private packages](../guides/private-packages.md).
+    lockfiles. See [Deploy](../guides/deploy.md#private-packages).
 
 ## Fail-closed by design
 

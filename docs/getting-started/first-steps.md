@@ -5,9 +5,18 @@ commands, one terminal.
 
 ## 1. Start a server
 
-```bash
-uvx pypiron serve --admin-pass secret
-```
+=== "uvx"
+
+    ```bash
+    uvx pypiron serve --admin-pass secret
+    ```
+
+=== "docker"
+
+    ```bash
+    docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS=secret \
+      ghcr.io/blackthorn-interstellar/pypiron:latest
+    ```
 
 This serves on `http://localhost:8080`. Your admin credential is `admin` /
 `secret` — (username defaults to `admin`).
@@ -44,12 +53,12 @@ Install from the simple index at `/simple/`.
 
 === "pip"
     ```bash
-    pip install --index-url http://localhost:8080/simple/ acme-widgets
+    pip install --extra-index-url http://localhost:8080/simple/ acme-widgets
     ```
 
 ## Next
 
-- Real setups — auth, a single public + private index, S3: see the
-  [guides](../guides/private-packages.md).
+- Real setups — auth, a single public + private index, S3, Docker, Kubernetes:
+  see [Deploy](../guides/deploy.md).
 - Every flag and its `PYPIRON_*` env var: see
   [Configuration](../reference/configuration.md).

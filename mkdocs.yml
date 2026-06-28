@@ -73,10 +73,8 @@ nav:
       - Installation: getting-started/installation.md
       - First steps: getting-started/first-steps.md
   - Guides:
-      - Host private packages: guides/private-packages.md
-      - Private + public in one index: guides/private-and-public.md
+      - Deploy: guides/deploy.md
       - Air-gapped mirror: guides/air-gapped-mirror.md
-      - Production deployment: guides/production.md
   - Concepts:
       - How it works: concepts/how-it-works.md
       - Storage backends: concepts/storage.md

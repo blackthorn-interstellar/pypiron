@@ -48,7 +48,7 @@ served from local storage — **whether upstream is up or down**.
     upload, or outside a configured approved list never falls through to
     upstream. That is the dependency-confusion defense — see
     [Authentication](authentication.md) and the
-    [Private + public guide](../guides/private-and-public.md).
+    [Add public PyPI](../guides/deploy.md#add-public-pypi).
 
 ## Bulk sync
 
@@ -144,8 +144,8 @@ pypiron sync --full   # ignore the cursor; re-fetch and fully reconcile everythi
 
 - [Air-gapped mirror](../guides/air-gapped-mirror.md) — `sync` when the serving
   node has no egress.
-- [Private + public](../guides/private-and-public.md) — one index for uploads,
-  synced, and proxied packages.
+- [Deploy → Add public PyPI](../guides/deploy.md#add-public-pypi) — one index
+  for uploads, synced, and proxied packages.
 - [Supply-chain defense](supply-chain.md) — `--exclude-newer` for a
   reproducible, historically-correct cutoff on both paths.
 - [Configuration](../reference/configuration.md#mirror-selection) — the shared

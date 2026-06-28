@@ -36,8 +36,12 @@ on demand, and bulk-syncs allowlists — all behind one URL and one namespace.
 ## Quickstart
 
 ```bash
-# 1. Start a server (serves http://localhost:8080)
+# 1. Start a server (serves http://localhost:8080) — native binary…
 uvx pypiron serve --admin-pass "$ADMIN"
+
+# …or in a container (storage at /data, built-in healthcheck):
+docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" \
+  ghcr.io/blackthorn-interstellar/pypiron:latest
 
 # 2. Publish
 uv publish --publish-url http://localhost:8080/legacy/ \
@@ -53,10 +57,8 @@ guided version are in [First steps](docs/getting-started/first-steps.md).
 
 ## Going further
 
-- [Host private packages](docs/guides/private-packages.md)
-- [Private + public from one index](docs/guides/private-and-public.md)
+- [Deploy](docs/guides/deploy.md) — private, public proxy, S3, multi-node, Docker, Kubernetes
 - [Air-gapped mirror](docs/guides/air-gapped-mirror.md)
-- [Production — S3, multi-node, HTTPS](docs/guides/production.md)
 - [Configuration](docs/reference/configuration.md) — every flag and its `PYPIRON_*` env var
 - [Benchmarks](docs/reference/benchmarks.md) — how the numbers above were measured
 

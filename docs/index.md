@@ -27,9 +27,20 @@ Truth is files on disk or object storage; indexes are regenerable views.
 
 ## Quickstart
 
-```bash
-uvx pypiron serve --admin-pass "$ADMIN"
-```
+Start a server — serves `http://localhost:8080`:
+
+=== "uvx"
+
+    ```bash
+    uvx pypiron serve --admin-pass "$ADMIN"
+    ```
+
+=== "docker"
+
+    ```bash
+    docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" \
+      ghcr.io/blackthorn-interstellar/pypiron:latest
+    ```
 
 Publish, then install — both against the one URL:
 
@@ -57,7 +68,7 @@ Publish, then install — both against the one URL:
 
 - :material-download: __Installation__ — get the binary ([Installation](getting-started/installation.md))
 - :material-rocket-launch: __First steps__ — publish & install ([First steps](getting-started/first-steps.md))
-- :material-book-open: __Guides__ — four real setups ([Host private packages](guides/private-packages.md))
+- :material-server-network: __Deploy__ — every setup, every platform ([Deploy](guides/deploy.md))
 - :material-cog: __Configuration__ — every flag ([Configuration](reference/configuration.md))
 
 </div>

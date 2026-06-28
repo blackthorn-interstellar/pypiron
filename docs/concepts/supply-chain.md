@@ -71,8 +71,8 @@ through to upstream:
     pypi.org itself. Some laptop somewhere will always run `pip install` against
     the defaults.
 
-See [Private packages](../guides/private-packages.md) and [Private and
-public, one index](../guides/private-and-public.md).
+See [Deploy → Private packages](../guides/deploy.md#private-packages) and
+[Deploy → Add public PyPI](../guides/deploy.md#add-public-pypi).
 
 ## Malicious recent releases
 

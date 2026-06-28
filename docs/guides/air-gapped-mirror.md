@@ -1,7 +1,10 @@
 # Air-gapped mirror
 
 The serving node has no egress: it can't reach PyPI. Pre-load an allowlist of
-packages with `pypiron sync`, run from a host that *can* reach PyPI.
+packages with `pypiron sync`, run from a host that *can* reach PyPI. This is the
+no-egress option from [Deploy](deploy.md) — the serve node is the same `serve`
+process, just without `--proxy-upstream`. Run it on any platform with the same
+[launchers](deploy.md#run-it-on-your-platform).
 
 `sync` is a pure HTTP client. It needs the server's URL and the admin
 credential — nothing about where the server keeps its bytes (disk, S3, GCS,

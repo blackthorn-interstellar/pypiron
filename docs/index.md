@@ -33,6 +33,13 @@ Serves `http://localhost:8080`:
     pypiron serve --admin-pass secret
     ```
 
+=== "poetry"
+
+    ```bash
+    poetry add pypiron
+    poetry run pypiron serve --admin-pass secret
+    ```
+
 === "binary"
 
     ```bash

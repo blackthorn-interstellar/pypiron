@@ -1,44 +1,55 @@
 # Authentication
 
-pypiron has three optional basic-auth credentials, strictly ordered:
-admin ⊇ uploader ⊇ reader. A request authenticated as admin passes any uploader
-or reader check; an uploader passes any reader check.
+Reads are open by default — anyone who can reach the server can install. To
+accept uploads, set an admin password; that one credential publishes, mirrors,
+and manages releases. Credentials are flags or environment variables — no user
+database to run.
 
-A role exists only once you set its **password**. No password, no role. There is
-no config file of users and no database — the credentials are flags or env vars
-on `serve`.
+```bash
+pypiron serve --admin-pass secret
+```
 
-| Role | Flags | Grants |
+That's the whole setup for a private team: open installs, password-gated
+publishing. Need more separation — CI that only publishes, or login-gated
+installs? Reach for the three roles below.
+
+## Roles
+
+admin can do everything an uploader can, and an uploader everything a reader can.
+A role exists only once you set its **password** — no password, no role.
+
+| Role | Use it for | Grants |
 | --- | --- | --- |
-| admin | `--admin-user` / `--admin-pass` | publish, mirror (backdating), delete, yank, project status |
-| uploader | `--uploader-user` / `--uploader-pass` | publish ordinary uploads |
-| reader | `--read-user` / `--read-pass` | read indexes and artifacts |
+| **admin** | operators, and CI that mirrors or manages releases | publish, mirror, delete, yank, project status |
+| **uploader** | CI that should only publish, never manage | publish ordinary uploads |
+| **reader** | optional — only when you want installs to require a login | read indexes and artifacts |
 
-The admin username defaults to `admin`, so `--admin-pass secret` alone is a
-complete admin credential. Every flag has a `PYPIRON_*` env var — see
-[Configuration](../reference/configuration.md#authentication).
+The admin username defaults to `admin`, so `--admin-pass secret` is a complete
+admin credential. Every role has a username/password pair — a flag with a
+matching `PYPIRON_*` env var; see
+[Configuration](../reference/configuration.md#authentication) for the full list.
 
 ## What "no credential" means
 
-Posture follows from which passwords you set. There is no separate "make it
-public" switch.
+Your posture follows from which passwords you set — no separate "make it public"
+switch.
 
 - **No write credential** (no admin, no uploader): the server is read-only.
-  Open unauthenticated writes do not exist — uploads return an error instead of
-  silently accepting bytes on the default `0.0.0.0` bind.
-- **No read credential**: reads are public. `/simple/` and `/files/` answer
+  Uploads return an error rather than silently accepting bytes, so an open
+  `0.0.0.0` bind never becomes an open write target.
+- **No read credential**: installs are public. `/simple/` and `/files/` answer
   without auth.
 
 ## When reads require auth
 
-Set `--read-user` (with `--read-pass`) and reads close: `/simple/` and `/files/`
-require basic auth. Any of the three credentials — reader, uploader, or admin —
-can install. The human package pages (`/projects/` and
-`/project/<pkg>/`) gate the same way; the root `/` stays public but folds in its
-live activity panel only for an authorized reader.
+Set a reader password (`--read-user` with `--read-pass`) and installs close:
+`/simple/` and `/files/` require basic auth, and any of the three credentials —
+reader, uploader, or admin — can install. The package pages (`/projects/` and
+`/project/<pkg>/`) gate the same way. The root `/` stays public but shows its
+live activity panel only to an authorized reader.
 
 `/health` and `/metrics` stay open regardless, so load balancers and Prometheus
-scrapers never carry package credentials.
+scrapers never need package credentials.
 
 Install against a read-gated server by putting the credential in the index URL:
 
@@ -67,28 +78,28 @@ Install against a read-gated server by putting the credential in the index URL:
 
 - **Half-configured credentials refuse startup.** Set a username without a
   password (or the reverse, including an empty `PYPIRON_*=` env var) and the
-  server exits with an error. A half-set credential can never authenticate, and
-  a half-set *read* credential would otherwise fail open and serve every package
+  server exits with an error — a half-set credential can never authenticate, and
+  a half-set *read* credential would otherwise fall open and serve every package
   publicly.
-- **Secrets compare in constant time.** The username is not a secret.
-- **Private names never fall through to upstream.** A name claimed private (or
+- **Secrets compare in constant time**, so a password can't be guessed by timing
+  the response. The username is not a secret.
+- **Private names never fall through to upstream.** A name that's yours (or
   inside `--private-prefix`) is never proxied from a public upstream, so a
   request can't be answered by an impostor package.
 
 ## Per-project attribution
 
-Usernames support Gmail-style subaddressing. `reader+billing-api` authenticates
-as `reader` (the password is still required and still checked) and records
-`billing-api` as a project tag. The `+tag` suffix is attribution, not identity.
+Usernames support tags. `reader+billing-api` authenticates as `reader` (the
+password is still required and checked) and records `billing-api` as a project
+tag — the `+tag` suffix is attribution, not identity.
 
-This drives per-project download and traffic accounting without minting a
-credential per team. See [Download statistics](download-stats.md).
+Per-project download and traffic accounting without minting a credential per
+team. See [Download statistics](download-stats.md).
 
 ## Privileged operations
 
-Delete, yank, and PEP 792 project status are admin-only and live on the same
-endpoints as the artifacts. The full request shapes are in the
-[Management API](../reference/api.md).
+Delete, yank, and project status are admin-only, on the same endpoints as the
+artifacts. Full request shapes in the [Management API](../reference/api.md).
 
 ```bash
 # Yank a release (admin); the request body becomes the reason

@@ -2,73 +2,102 @@
 
 An ultra-fast Python package server, written in Rust.
 
-One binary, no database. pypiron serves your private uploads, mirrors public PyPI
-on demand, and bulk-syncs allowlists — all behind one URL and one namespace.
-Truth is files on disk or object storage; indexes are regenerable views.
+pypiron aims to be the fastest, most reliable PyPI server (and mirror) available.
 
 ![Max sustained install throughput](assets/install-throughput.svg#only-light)
 ![Max sustained install throughput](assets/install-throughput-dark.svg#only-dark)
 
-## Highlights
-
-- **Handles 5–90× more load** than other PyPI servers.
-- **Supply-chain quarantine, on by default.** Releases younger than a sliding
-  7-day window are held back (`--exclude-newer`, tunable or `""` to disable);
-  `uv --exclude-newer` resolves against it.
-- **Works with the whole ecosystem.** uv, pip, poetry, twine, pipenv, hatch.
-- **Horizontal scaling that just works.** Point any number of nodes at one
-  bucket; reads need zero coordination.
-- **Per-package download stats.** Per-package, per-version counts at
-  `GET /stats/downloads/<pkg>` and `GET /stats/downloads`.
-- **Private and public together.** One URL serves private packages and cached
-  public dependencies.
-- **Dependency-confusion defense.** Every name is exclusively private or
-  mirrored, claimed at first write.
+- **5–90× faster than any PyPI server.** 3,026 installs/s on 2 vCPU. ([benchmarks](reference/benchmarks.md))
+- **Supply-chain quarantine, on by default.** New releases wait 7 days. Most attacks surface first. ([how](concepts/supply-chain.md))
+- **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
+- **Scales to a fleet.** Point any number of nodes at one bucket. No coordination.
+- **Works with everything.** uv, pip, poetry, pdm, twine, pipenv, hatch, flit.
+- **Download stats built in.** ([details](concepts/download-stats.md))
 
 ## Quickstart
 
-Start a server — serves `http://localhost:8080`:
+### Start a server
 
-=== "uvx"
+Serves `http://localhost:8080`:
+
+=== "uv"
 
     ```bash
-    uvx pypiron serve --admin-pass "$ADMIN"
+    uvx pypiron serve --admin-pass secret
+    ```
+
+=== "pip"
+
+    ```bash
+    pip install pypiron
+    pypiron serve --admin-pass secret
+    ```
+
+=== "binary"
+
+    ```bash
+    # Linux x86_64 — see the releases page for other platforms
+    curl -LO https://github.com/blackthorn-interstellar/pypiron/releases/latest/download/pypiron-x86_64-unknown-linux-musl.tar.gz
+    tar xzf pypiron-x86_64-unknown-linux-musl.tar.gz
+    ./pypiron serve --admin-pass secret
     ```
 
 === "docker"
 
     ```bash
-    docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" \
+    docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS=secret \
       ghcr.io/blackthorn-interstellar/pypiron:latest
     ```
 
-Publish, then install — both against the one URL:
+### Publish a package
 
 === "uv"
 
     ```bash
     uv publish --publish-url http://localhost:8080/legacy/ \
-      --username admin --password "$ADMIN" dist/*
+      --username admin --password secret dist/*
+    ```
 
+=== "twine"
+
+    ```bash
+    twine upload --repository-url http://localhost:8080/legacy/ \
+      -u admin -p secret dist/*
+    ```
+
+=== "poetry"
+
+    ```bash
+    poetry config repositories.pypiron http://localhost:8080/legacy/
+    poetry publish --repository pypiron -u admin -p secret
+    ```
+
+### Install a package
+=== "uv"
+
+    ```bash
     uv add --index http://localhost:8080/simple/ acme-widgets
     ```
 
 === "pip"
 
     ```bash
-    twine upload --repository-url http://localhost:8080/legacy/ \
-      --username admin --password "$ADMIN" dist/*
-
     pip install --extra-index-url http://localhost:8080/simple/ acme-widgets
+    ```
+
+=== "poetry"
+
+    ```bash
+    poetry source add pypiron http://localhost:8080/simple/
+    poetry add acme-widgets
     ```
 
 ## Next steps
 
 <div class="grid cards" markdown>
 
-- :material-download: __Installation__ — get the binary ([Installation](getting-started/installation.md))
-- :material-rocket-launch: __First steps__ — publish & install ([First steps](getting-started/first-steps.md))
-- :material-server-network: __Deploy__ — every setup, every platform ([Deploy](guides/deploy.md))
+- :material-lightbulb: __How it works__ — why it's fast ([How it works](concepts/how-it-works.md))
+- :material-server-network: __Deploy__ — production setups ([Deploy](guides/deploy.md))
 - :material-cog: __Configuration__ — every flag ([Configuration](reference/configuration.md))
 
 </div>

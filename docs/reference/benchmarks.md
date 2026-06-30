@@ -7,10 +7,9 @@ pypiron is 5–90× faster than other PyPI servers at sustained install throughp
 
 ## Headline
 
-A six-way comparison of max sustained real-install throughput, every server in
-its best cloud-backed config, on one small AWS box. `oha` replays the install
-mix (index + wheel URLs in install proportions) and follows the 302 to download
-wheel bytes from S3, so the entire path is exercised.
+pypiron sustains **3,026 real installs/s on 2 vCPU** — 5–90× the other servers,
+scaling near-linearly with cores. The full six-way field, every server in its
+best cloud-backed config on the same small AWS box:
 
 | Rank | Server | Config | Installs/s |
 |---|---|---|---|
@@ -21,28 +20,29 @@ wheel bytes from S3, so the entire path is exercised.
 | 5 | devpi | devpi + nginx | 35 |
 | 6 | proxpi | flask caching proxy | 32 |
 
-Each row is that server's own saturation ceiling on the same small box (an
-`r7i.large`, 2 vCPU). The Python app servers hit their CPU wall under a modest load;
-pypiron and bandersnatch serve so leanly that reaching their ceiling took a larger
-load fleet (8× and 4× `c7i.8xlarge`). pypiron tops out at 3,026 installs/s on 2 vCPU
-— server-bound: the fleet drove it past its knee into collapse, so the box, not the
-load fleet, is the limit. It scales roughly linearly with cores.
-
 !!! note
-    bandersnatch serves every wheel byte through its own NIC and saturates the
-    network with CPU to spare. pypiron's presigned redirect offloads bytes to
-    object storage, so its node carries only index responses and 302s and scales
-    to its CPU instead. See [Artifact delivery](../concepts/artifact-delivery.md).
+    bandersnatch pushes every wheel byte through its own NIC and saturates the
+    network with CPU to spare. pypiron offloads wheel bytes to object storage, so
+    the node serves only index responses and scales to its CPU. See
+    [Artifact delivery](../concepts/artifact-delivery.md).
 
 ## Methodology
 
 The comparison is honest by construction. Each competitor runs in its own
-documented production topology (right app server, worker count, and the
-nginx/DB sidecars it architecturally needs) — no tool gets a response or edge
-cache another lacks. Egress is blocked on every ranking run, so any cache miss
-or upstream fallback fails loudly instead of being served by a CDN. Every server
-is seeded with the same frozen, hash-pinned set of ~100 real projects' wheels,
-and the clients fire byte-identical `uv` requests at each.
+documented production topology — right app server, worker count, and the
+nginx/DB sidecars it needs. No tool gets a response or edge cache another lacks.
+Egress is blocked on every ranking run: a cache miss or upstream fallback fails
+loudly instead of being served by a CDN. Every server gets the same frozen,
+hash-pinned set of ~100 real projects' wheels, and clients fire byte-identical
+`uv` requests at each. The load generator (`oha`) replays the real install mix —
+index pages and wheel URLs in install proportions — and follows each redirect to
+object storage to pull the wheel bytes. The whole install path is measured.
+
+Each row is that server's own saturation ceiling on the same small box (an
+`r7i.large`, 2 vCPU). The Python app servers hit their CPU wall under modest
+load. pypiron and bandersnatch serve so leanly that reaching their ceiling
+needed a much larger load generator (a fleet of `c7i.8xlarge` boxes, 8× and 4×):
+the limit was the 2-vCPU server under test, not the test itself.
 
 ## Full results
 

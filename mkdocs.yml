@@ -69,9 +69,6 @@ plugins:
 
 nav:
   - Home: index.md
-  - Getting started:
-      - Installation: getting-started/installation.md
-      - First steps: getting-started/first-steps.md
   - Guides:
       - Deploy: guides/deploy.md
       - Air-gapped mirror: guides/air-gapped-mirror.md

@@ -1,31 +1,31 @@
 # Deploy
 
-One binary, no database. Pick a topology, set a few flags, and run it on
-whatever you already use. Almost everyone lands on one of the setups below.
+Pick a topology, set a couple of flags, run it on what you already use.
+Almost everyone lands on one of the setups below.
 
 ## Pick your setup
 
 - **Private packages only** — an internal index for libraries that never touch
-  public PyPI. Developers publish to it and install from it. → [Private
+  public PyPI. Developers publish and install. → [Private
   packages](#private-packages)
 - **Private + public from one URL** — the same index also caches public PyPI on
-  demand, so developers configure one index instead of two. *Most common.* →
+  demand. One index, not two. *Most common.* →
   [Add public PyPI](#add-public-pypi)
-- **No outbound internet** — the serving node can't reach PyPI, so you pre-load
-  an allowlist with `pypiron sync` from a host that can. →
+- **No outbound internet** — the serving node can't reach PyPI. Pre-load
+  an approved package list with `pypiron sync` from a host that can. →
   [Air-gapped mirror](air-gapped-mirror.md)
 
-All three are the same `serve` process; they differ only by a couple of flags.
-Set them however you like — **most `--flag`s are also a `PYPIRON_*` env var and a
-`pypiron.toml` key** (precedence: CLI/env > file > defaults). The exceptions stay
-on CLI or env, never the file: **credentials** (the read/admin/uploader
-user + password pairs) and the Azure access key.
+All three are the same `serve` process, differing by a couple of flags.
+**Most `--flag`s are also a `PYPIRON_*` env var and a `pypiron.toml` key**
+(precedence: CLI/env > file > defaults). Two exceptions stay on CLI or env,
+never the file: **credentials** (the read/admin/uploader user + password pairs)
+and the Azure access key.
 
 ## Private packages
 
-An internal index on local disk. The admin password is the only thing you must
-set — it enables uploads. Without a write credential the server is read-only;
-there are no open, unauthenticated writes.
+An internal index on local disk. Set the admin password — it enables uploads.
+Without a write credential the server is read-only; no open, unauthenticated
+writes.
 
 === "pypiron.toml"
 
@@ -62,18 +62,16 @@ there are no open, unauthenticated writes.
 Drop the read credential and reads are public; `/health` and `/metrics` stay
 open either way for probes. Full model: [Authentication](../concepts/authentication.md).
 
-Artifacts and the regenerable `simple/` indexes live under `--data-dir`
-(default `~/.pypiron/packages`). Truth is the files on disk — back up that
-directory and you've backed up the registry.
+All data lives under `--data-dir` (default `~/.pypiron/packages`); back up that
+folder and you've backed up the registry.
 
 ## Add public PyPI
 
 Mirror public packages on demand from the same URL. The first request for a
 public name downloads, verifies, and caches the artifact; it's served locally
-from then on, whether PyPI is up or down. That single namespace is also what
-closes the dependency-confusion hole — every name is either yours or mirrored,
-never both. **This is the most common pypiron setup.** Add two flags to the
-private-index config above:
+from then on, whether PyPI is up or down. Each name is private or public, never
+both — blocking dependency-confusion attacks. **The most common pypiron setup.**
+Add two flags to the private-index config above:
 
 === "pypiron.toml"
 
@@ -113,7 +111,7 @@ private-index config above:
 | --- | --- |
 | `--private-prefix acme` | Reserves `acme-*` for your uploads; those names never fall through to upstream. |
 | `--proxy-upstream https://pypi.org` | Mirrors public packages on demand, cached after first use. |
-| `--exclude-newer "7 days"` | On by default (a sliding 7-day window). Hides releases upstream received less than 7 days ago — a quarantine `uv --exclude-newer` resolves against too. Set `--exclude-newer ""` to disable. |
+| `--exclude-newer "7 days"` | Catches malicious recent releases before they reach you: a compromised or typosquatted package is usually pulled from PyPI before your builds ever see it. On by default (a sliding 7-day window); set `--exclude-newer ""` to disable. |
 
 !!! warning "Set `--private-prefix` with the proxy"
 
@@ -128,9 +126,9 @@ once and both paths agree. See [Mirror selection](../reference/configuration.md#
 ## Run it on your platform
 
 The settings above are the *what*; this is the *how*. Same config, every
-launcher — pick yours. Examples use the disk backend and the admin password from
-the environment; add your scenario's flags and, for more than one replica, swap
-in object storage ([below](#object-storage)).
+launcher. Examples use the disk backend and the admin password from the
+environment; add your scenario's flags, and swap in object storage for more than
+one replica ([below](#object-storage)).
 
 === "Binary / systemd"
 
@@ -177,12 +175,10 @@ in object storage ([below](#object-storage)).
       ghcr.io/blackthorn-interstellar/pypiron:latest
     ```
 
-    The image is minimal (distroless, or `scratch` on the two smallest arches,
-    386 and arm/v6), unprivileged (uid 65532), and multi-arch (amd64, arm64,
-    arm/v7, ppc64le, s390x, riscv64, 386, arm/v6) — Docker picks the right one. If
-    `/tmp` is RAM-backed tmpfs, point the upload spool at the data volume (real
-    disk, already writable by the nonroot uid) so large wheels don't spool into
-    memory: `-e PYPIRON_SPOOL_DIR=/data`.
+    The image is minimal, unprivileged, and multi-arch — Docker pulls the right
+    one for your host. If `/tmp` is RAM-backed tmpfs, point the upload spool at
+    the data volume so large wheels don't spool into memory:
+    `-e PYPIRON_SPOOL_DIR=/data`.
 
 === "Docker Compose"
 
@@ -263,17 +259,17 @@ in object storage ([below](#object-storage)).
 
 === "Helm"
 
-    There's no official chart — pypiron is one stateless container, so a generic
-    app chart covers it cleanly. With
+    No official chart — pypiron is one stateless container, so a generic
+    app chart covers it. With
     [bjw-s `app-template`](https://bjw-s-labs.github.io/helm-charts/) or similar:
     point the image at `ghcr.io/blackthorn-interstellar/pypiron`, expose `8080`,
     set the `PYPIRON_*` env, and add `/health` probes — the **Kubernetes** tab is
-    the shape to template. A bucket-backed setup ([below](#object-storage)) is the
-    natural fit, since it lets replicas scale freely.
+    the shape to template. A bucket-backed setup ([below](#object-storage)) fits,
+    letting replicas scale freely.
 
 ## Publish and install
 
-The same loop regardless of scenario. Build your distributions to `dist/`,
+The same loop regardless of scenario. Build distributions to `dist/`,
 publish to `/legacy/` as admin, install from `/simple/`. Replace `HOST:8080`
 with your server's URL.
 
@@ -368,24 +364,22 @@ objects but never creates the bucket.
           AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}  # the instance/task role
     ```
 
-On EC2, ECS, or EKS, omit the access keys — pypiron follows the standard AWS
-credential chain and picks up the instance/task role automatically. GCS and
-Azure use the same model with their own flags and credential chains. See
-[Storage backends](../concepts/storage.md) and
-[Configuration](../reference/configuration.md#storage-serve).
+On EC2, ECS, or EKS, omit the access keys — pypiron picks up the instance/task
+role. GCS and Azure work the same way with their own flags. Full
+backend and credential detail lives in [Storage backends](../concepts/storage.md);
+the flags are in [Configuration](../reference/configuration.md#storage-serve).
 
 ### Scale out
 
-Run the same container on more hosts, all pointed at the one bucket. There is no
-extra wiring.
+Run the same container on more hosts, all pointed at the one bucket. No extra
+wiring.
 
-- **Reads are stateless.** Serving an index or artifact is file serving with
-  zero coordination between nodes. Add capacity by adding containers.
-- **One writer at a time.** Index rebuilds need a single author, so one node is
-  elected leader through an S3 lease. Failover is automatic when the leader dies,
-  bounded by the lease TTL.
-- **Truth is the bucket.** Indexes are regenerable views over the files; a node
-  holds no durable local state, so any node can be replaced at any time.
+- **Add capacity by adding containers.** Each node serves indexes and artifacts
+  straight from the bucket, no coordination between nodes.
+- **Failover is automatic.** Index rebuilds are coordinated for you; if a
+  node dies another takes over — nothing to configure.
+- **Nodes keep no permanent local state**, so any node can be replaced at any
+  time.
 
 Put the nodes behind a load balancer and point its health check at `/health`
 (`200` when storage answers, `503` otherwise).
@@ -406,8 +400,8 @@ the install snippets with your real `https://` URL.
 
 ### Track installs per project
 
-Username subaddressing tags each request with the consuming project — append
-`+tag` to the username; the password is unchanged.
+Username tags label each request with the consuming project — append `+tag` to
+the username; the password is unchanged.
 
 === "uv"
 

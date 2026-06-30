@@ -1,62 +1,63 @@
 # Mirroring & proxying
 
-pypiron has two ways to serve public packages alongside your private ones, on the
-same index URL. Pick by who pulls and when:
+Serve packages from public PyPI on the same URL as your private ones. Two ways
+to fill the cache — pick by whether your serving node can reach the internet:
 
-- **On-demand proxy** (`--proxy-upstream`) — lazy pull-through. A file is fetched
-  from upstream the first time someone asks for it, then cached in storage
-  forever. The serving node needs egress to upstream.
-- **Bulk sync** (`pypiron sync`) — push an allowlist ahead of time. A separate
-  HTTP client downloads selected packages and uploads them to the server. Only
-  the syncing host needs egress.
+- **On-demand proxy** — for a network with internet access. A package is pulled
+  from PyPI on first install, then cached forever. Nothing to curate up front.
+- **Bulk sync** — for an air-gapped network, or when you want a known set of
+  packages waiting before anyone asks. A separate client with internet access
+  pre-loads an approved package list onto the server, which never needs egress.
 
-Both write the same files to the same storage tree, so a server can run both: the
-proxy fills cache misses, and `sync` pre-loads what you know you need.
+Both land the same files in the same storage, so one server can do both at once:
+the proxy fills cache misses while `sync` pre-loads what you'll need.
 
 ## On-demand proxy
 
-Add `--proxy-upstream` to `serve`:
+Best when your serving node has internet access and you'd rather not maintain a
+list. Point `serve` at PyPI:
 
 ```bash
 pypiron serve --admin-pass "$ADMIN" --proxy-upstream https://pypi.org
 ```
 
-A request for a package the server doesn't hold is resolved against the upstream
-PEP 691 index. The package page is rendered with pypiron's own `/files/` URLs.
-On the first artifact GET, pypiron streams the file from upstream, verifies it
-against the upstream sha256, and commits it to storage. Every later request is
-served from local storage — **whether upstream is up or down**.
+Any package you don't already host is fetched from PyPI on first install,
+checksum-verified, and cached. Later installs serve straight from your own
+storage — **whether PyPI is up or down**.
 
-- Listings are cached for 60 seconds, so a new upstream release shows up within
-  about a minute; cached artifacts are immutable and kept forever.
-- If upstream is unreachable, a still-valid cached listing is reused and
-  already-cached packages keep installing.
-- Mirror-selection flags gate what the proxy serves and caches — the *same*
-  flags, env vars, and `[mirror]` table that `sync` uses (`--include-format
-  wheel`, `--exclude-newer`, the tag selectors). Set the slice once; it applies
-  to whichever you run. See
+- A new release on PyPI shows up within 60s; once cached, a file never changes
+  and is kept forever.
+- If PyPI is unreachable, the last good listing is reused and everything already
+  cached keeps installing.
+- The same selection rules `sync` uses — `--include-format wheel`,
+  `--exclude-newer`, the tag selectors — also gate what the proxy serves and
+  caches. Set the slice once in `[mirror]` and it applies to both. See
   [Configuration](../reference/configuration.md#mirror-selection).
-- An **approved-package list** (`--include-package` / `[mirror].include-packages`) makes
-  the proxy **fail-closed**: with a list set, only those names fall through to
-  upstream and every other name is `404`'d, and a version-pinned entry serves
-  only matching versions. With no list, the proxy serves any non-private name on
-  demand (the default). This is the same list `sync` mirrors — set it once, in
-  `[mirror]`, and the push and pull paths agree.
+- Set an **approved package list** (`--include-package` /
+  `[mirror].include-packages`) and the proxy goes **fail-closed**: only those
+  names reach PyPI, every other name is refused, and a version-pinned entry
+  serves only matching versions. With no list, any public name is served on
+  demand (the default). It's the same list `sync` uses — set it once in
+  `[mirror]` and both paths agree.
 
 !!! note
-    A name reserved by `--private-prefix`, already claimed `private` by an
-    upload, or outside a configured approved list never falls through to
-    upstream. That is the dependency-confusion defense — see
-    [Authentication](authentication.md) and the
+    A name reserved by `--private-prefix`, already reserved by a private upload,
+    or outside a configured approved list never falls through to PyPI. That is
+    the dependency-confusion defense — see
+    [Authentication](authentication.md) and
     [Add public PyPI](../guides/deploy.md#add-public-pypi).
 
 ## Bulk sync
 
-`pypiron sync` is a pure HTTP client. It reads packages from a PEP 691 source
-(PyPI by default), downloads the selected files, and POSTs each one to the
-destination's `/legacy/` endpoint as a **mirror upload** — carrying PyPI's true
-`upload-time` and yank state. The server owns every storage write, so `sync`
-needs nothing but the destination URL and an admin credential:
+Best when your serving node has no internet access, or when you want a known set
+of packages in place before anyone installs. A separate client with internet
+access pre-loads your approved package list onto the server — the server never
+needs egress.
+
+`pypiron sync` reads from PyPI, downloads the packages you've approved, and
+uploads each one to the destination as a **mirror upload** — preserving PyPI's
+real upload time and yank state. The server handles every storage write, so
+`sync` needs nothing but the destination URL and an admin credential:
 
 ```bash
 pypiron sync \
@@ -65,9 +66,9 @@ pypiron sync \
   --include-package "requests>=2.20,<3" --include-package numpy
 ```
 
-Put the allowlist and mirror rules in `pypiron.toml` instead (auto-discovered in
-the working directory). The allowlist and mirror rules live in `[mirror]` — shared with
-the proxy; only the destination is sync-specific (`[sync]`):
+Or put the approved list and mirror rules in `pypiron.toml` (auto-discovered in
+the working directory). They live in `[mirror]` — shared with the proxy; only
+the destination is sync-specific (`[sync]`):
 
 ```toml
 [mirror]
@@ -85,48 +86,45 @@ export PYPIRON_SYNC_ADMIN_PASS="$ADMIN"
 pypiron sync
 ```
 
-`--to` is required; there is no direct-to-storage mode. Full option list and the
-config-file layering rules are in
+`--to` is required — `sync` always writes through the server, never directly to
+storage. The full option list and config-file layering rules are in
 [Configuration](../reference/configuration.md#sync-mirror-over-http).
 
-### Re-sync: reconcile and conditional fetch
+### Re-syncing keeps the mirror current
 
-A re-`sync` does more than add new files. It **reconciles** the mutable metadata
-of files it already holds:
+Run `sync` again anytime — it does more than pull new files. It also reconciles
+the metadata of files you already hold with PyPI:
 
-- yank state is brought in line with upstream (set, cleared, or its reason
-  updated),
-- a file gone from upstream is flagged yanked `removed upstream` — kept
-  downloadable, just skipped by installers,
-- PEP 792 project status is relayed.
+- a yank is applied, cleared, or its reason updated to match upstream,
+- a release pulled from PyPI is marked yanked (`removed upstream`) — still
+  downloadable, skipped by installers,
+- each project's status (active, archived, and so on) is kept in sync with
+  upstream.
 
-**Artifacts are never deleted.** A mirror only ever grows.
+**Files are never deleted. A mirror only ever grows.**
 
-To keep "reconcile every run" cheap, each project is fetched conditionally. The
-last upstream ETag is remembered server-side and replayed as `If-None-Match`, so
-an unchanged upstream answers `304` and the whole project is skipped:
+Re-runs are cheap: projects unchanged upstream are skipped — only those whose
+listing changed are re-fetched and reconciled. A yank or removal *changes* the
+listing, so an ordinary `sync` picks it up; you don't need `--full` for a fresh
+yank:
 
 ```bash
-pypiron sync          # re-run anytime; unchanged projects 304 and are skipped
+pypiron sync          # re-run anytime; unchanged projects are skipped
 ```
 
-A normal run therefore reconciles every project whose upstream listing actually
-changed — and a yank or removal *does* change the listing, so it gets a `200` and
-is reconciled on an ordinary `sync`. `--full` is not required to pick up a fresh
-yank. Run it periodically (e.g. nightly) as the self-heal: it ignores the cursor
-and re-fetches every project unconditionally, closing the gaps a `304` can't
-see — a stale upstream-CDN response that 304s right after a yank, or dest-side
-drift (a manual admin yank toggle, a restore from backup) that no upstream change
-reflects:
+Run a full sweep periodically (say, nightly) to catch the rare things a quick
+re-run can miss — a stale PyPI CDN response that hides a fresh yank, or drift on
+your own side like a manual admin yank toggle or a restore from backup:
 
 ```bash
-pypiron sync --full   # ignore the cursor; re-fetch and fully reconcile everything
+pypiron sync --full   # re-fetch and fully reconcile every project
 ```
 
 !!! tip
-    The cursor is a pure cache. Delete it (`/sync/cursors`, admin-only) and the
-    next run re-fetches. Changing the source, a filter, or a package's
-    specifiers invalidates it automatically. Details in
+    Skipping unchanged projects relies on a cursor that's pure cache. Delete it
+    (`/sync/cursors`, admin-only) and the next run re-fetches from scratch.
+    Changing the source, a filter, or a package's version specifiers invalidates
+    it automatically. Details in
     [Configuration](../reference/configuration.md#re-sync-reconcile-and-conditional-fetch).
 
 ## Proxy vs sync
@@ -135,7 +133,7 @@ pypiron sync --full   # ignore the cursor; re-fetch and fully reconcile everythi
 | ------------------- | ------------------------------------ | ------------------------------------- |
 | When files arrive   | Lazily, on first request             | Ahead of time, when you run `sync`    |
 | Who initiates       | The serving node, per cache miss     | A separate client (any host with egress) |
-| Package set         | The `[mirror]` slice — any non-private name, or only an approved list if you set one | An explicit allowlist (required) |
+| Package set         | The `[mirror]` slice — any non-private name, or only an approved list if you set one | An explicit approved list (required) |
 | Egress from server  | Required (until cached)              | None — the syncing host needs it      |
 | Offline serving     | Cached files only                    | Everything you synced                 |
 | Reconcile yanks/removals | Listings refresh every 60s      | On re-sync (`--full` for a sweep)     |

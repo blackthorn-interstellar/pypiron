@@ -1,13 +1,17 @@
 # Download statistics
 
-pypiron counts artifact downloads per `(package, filename)` and rolls them up to
-versions. It is on by default (`--download-stats`). The counts are a best-effort
-analytic, not truth — see [Accuracy](#accuracy-and-freshness).
+See which packages — and which versions — your team installs. pypiron counts
+every download and rolls it up by version: spot what's heavily used, what's gone
+stale, who's pulling what. On by default; turn it off with `--download-stats
+false`.
+
+The counts are an analytic, not an audit log: a hard crash can lose recent
+downloads, but completed days are exact (see [Accuracy](#accuracy-and-freshness)).
 
 ## Reading the stats
 
-Two endpoints, both gated by read auth (when `--read-user` is set, the read,
-uploader, or admin credential all work; otherwise they are public).
+Two endpoints, both gated by read auth. With `--read-user` set, the read,
+uploader, or admin credential works; otherwise public.
 
 ### Per package
 
@@ -33,8 +37,7 @@ curl -u $READ http://localhost:8080/stats/downloads/acme
 ### Global
 
 `GET /stats/downloads` — last 30 days of per-day totals and the busiest
-packages, including today (recent, not-yet-frozen days are aggregated live on
-read, the same as the per-package endpoint).
+packages, including today.
 
 ```bash
 curl -u $READ http://localhost:8080/stats/downloads
@@ -51,51 +54,41 @@ curl -u $READ http://localhost:8080/stats/downloads
 
 ### In the browser
 
-Two human pages render the same numbers for an authorized reader (gated like the
-JSON endpoints above):
+Two pages render the same numbers for an authorized reader (gated like the JSON
+endpoints):
 
 - The homepage (`/`) leads its activity panel with a **Most Downloaded Packages**
-  chart — the top five over the last 30 days — linking to the full leaderboard.
+  chart — top five over the last 30 days — linking to the full leaderboard.
 - `GET /downloads/` is that leaderboard: the busiest packages (up to 500), each
   linked to its project page.
 
-Both read a short-lived cached ranking, so a public homepage never rescans the
-counter store on every hit. A public deployment (no read credential) shows these
-to everyone; a credentialed one shows them only to readers, so private names
-never leak.
-
-## How counting works
-
-Each node counts downloads in memory and flushes immutable delta segments under
-`_counters/` every `--counters-flush-interval-secs` (300 s default). The leader
-compacts each finished day into one frozen file per shard plus a small per-day
-summary, and prunes history past `--counters-retention-days`. There is no
-database — the counter store is files like everything else.
+These pages serve a cached ranking, so a public homepage stays fast under load. A
+public deployment (no read credential) shows them to everyone; a credentialed one
+shows them only to readers, so private names never leak.
 
 ## Accuracy and freshness
 
-- Counts are **lossy by design**: an in-memory tail can be lost on a hard crash,
-  and they are never used as the source of truth for anything.
-- **Frozen (closed) days are exact.** The leader has merged every node's deltas.
-- **Today lags one flush interval** — a download shows up after the next flush,
-  on both the per-package and global endpoints (recent days that haven't been
-  frozen yet are summed live from segments on read, so the global view is never
-  days behind).
-- Changing `--counters-resolution` is non-destructive; existing days keep the
-  resolution they were written with.
+- **Completed days are exact** — every node's counts are merged in.
+- **Today lags one flush interval.** A download shows up after the next flush
+  (300 s by default), on both the per-package and global endpoints — never days
+  behind.
+- **Recent downloads can be lost in a hard crash.** The counts are an analytic,
+  never the source of truth.
+- Changing `--counters-resolution` is safe: existing days keep the resolution
+  they were written with.
 
 ## Metrics
 
-`/metrics` carries only a single low-cardinality aggregate,
-`pypiron_downloads_total`. The per-package breakdown is deliberately kept off
-`/metrics` — registry-sized label cardinality would overwhelm Prometheus. Use
-the `/stats/` endpoints for per-package and per-version numbers.
+`/metrics` carries a single aggregate, `pypiron_downloads_total`. The
+per-package, per-version breakdown stays off `/metrics` — that many labels would
+overwhelm Prometheus — use the `/stats/` endpoints for it.
 
 ## Per-project attribution
 
-Usernames support Gmail-style subaddressing for attribution. Authenticating as
-`$READ+billing-api` records `billing-api` as a project tag, exposed in
-`/metrics` as `pypiron_project_requests_total{project="billing-api",route=...}`.
+Want to know which team is pulling what? Username tags do it. Authenticate as
+`$READ+billing-api` and pypiron records `billing-api` as a project tag, exposed
+in `/metrics` as
+`pypiron_project_requests_total{project="billing-api",route=...}`.
 
 === "uv"
 
@@ -110,27 +103,26 @@ Usernames support Gmail-style subaddressing for attribution. Authenticating as
     pip install --index-url http://read+billing-api:secret@localhost:8080/simple/ acme
     ```
 
-This is request attribution (which team is pulling), separate from the
-download-count store above. Details and the cardinality cap are in
+Request attribution (which team is pulling), separate from the download-count
+store above. Details and the cardinality cap:
 [Authentication](authentication.md) and the
 [Configuration reference](../reference/configuration.md#per-project-download-tracking).
 
 ## Cost
 
-Cost is dominated by flush PUTs, scaling with `flush_interval × nodes`. At the
-300 s default that is roughly **$0.04 per node per month** — effectively free for
-a private registry. Raise `--counters-flush-interval-secs` to spend less and
-accept staler "today" numbers.
+About **$0.04 per node per month** — effectively free for a private registry.
+Raise `--counters-flush-interval-secs` to spend less, at the cost of staler
+"today" numbers.
 
 ## Tuning
 
 | Knob | Default | Controls |
 | --- | --- | --- |
-| `--download-stats` | `true` | Enable counting (`false` = no-op store) |
-| `--counters-resolution` | `1d` | Intra-day bucket width (`1d`/`1h`/`30m`/`2h`) |
-| `--counters-flush-interval-secs` | `300` | Per-node flush cadence — the dominant cost knob |
-| `--counters-rollup-interval-secs` | `3600` | Leader compaction cadence |
+| `--download-stats` | `true` | Count downloads (`false` turns it off) |
+| `--counters-resolution` | `1d` | Time bucket within a day (`1d`/`1h`/`30m`/`2h`) |
+| `--counters-flush-interval-secs` | `300` | How often counts are written out — the dominant cost knob |
+| `--counters-rollup-interval-secs` | `3600` | How often completed days are finalized |
 | `--counters-retention-days` | `90` | Days of history kept |
 
-Exact flag/env definitions are in the
+Exact flag/env definitions:
 [Configuration reference](../reference/configuration.md#server).

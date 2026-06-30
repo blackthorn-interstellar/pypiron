@@ -1,15 +1,18 @@
 # Air-gapped mirror
 
-The serving node has no egress: it can't reach PyPI. Pre-load an allowlist of
-packages with `pypiron sync`, run from a host that *can* reach PyPI. This is the
-no-egress option from [Deploy](deploy.md) — the serve node is the same `serve`
-process, just without `--proxy-upstream`. Run it on any platform with the same
-[launchers](deploy.md#run-it-on-your-platform).
+Run a package server that never touches the internet — and still install
+everything your team needs from it. Choose which packages it carries by
+pre-loading an approved list with `pypiron sync` from a host that *can* reach
+PyPI.
 
-`sync` is a pure HTTP client. It needs the server's URL and the admin
-credential — nothing about where the server keeps its bytes (disk, S3, GCS,
-Azure). Each file is downloaded from the source and POSTed to the server's
-`/legacy/`; the server owns every storage write.
+This is the no-egress option from [Deploy](deploy.md): the serve node is the
+same `serve` process, without `--proxy-upstream`. Run it on any platform with
+the same [launchers](deploy.md#run-it-on-your-platform).
+
+`sync` runs from any host that can reach PyPI, whatever the server's storage —
+disk, S3, GCS, or Azure. It needs only the server URL and an admin credential:
+it downloads each file from PyPI and uploads it to the server's `/legacy/`
+endpoint.
 
 ```text
 PyPI  ──▶  sync host  ──▶  pypiron server  ──▶  developers / CI
@@ -21,16 +24,16 @@ Developers and CI installing from the air-gapped server need no internet either.
 ## 1. Start the server
 
 On the air-gapped node. `--admin-pass` enables the admin role (username
-defaults to `admin`), which is the credential `sync` authenticates with.
+defaults to `admin`) — the credential `sync` authenticates with.
 
 ```bash
 uvx pypiron serve --admin-pass "$ADMIN"
 ```
 
-With no `--proxy-upstream`, the server never tries to reach PyPI on its own.
-Everything it serves is what you push into it.
+Without `--proxy-upstream`, the server never reaches PyPI on its own. It serves
+only what you push into it.
 
-## 2. Define the allowlist
+## 2. Define the approved package list
 
 On the sync host, put the destination, credential, package set, and mirror rules in
 `pypiron.toml` — auto-discovered in the working directory.
@@ -46,10 +49,11 @@ to = "http://HOST:8080"
 admin-user = "admin"                     # password via PYPIRON_SYNC_ADMIN_PASS
 ```
 
-Each `[mirror].include-packages` entry is a name with optional PEP 440 specifiers, so you
-pin exactly the versions you want mirrored. The whole `[mirror]` slice — the
-allowlist included — is shared with the proxy: `include-format = ["wheel"]`
-skips sdists; `exclude-newer` mirrors only files PyPI received before the cutoff.
+Each `[mirror].include-packages` entry is a name and optional version constraint
+(e.g. `requests>=2.20,<3`) — pin the versions you want mirrored. The same
+`[mirror]` settings drive both the sync and the on-demand proxy:
+`include-format = ["wheel"]` skips sdists; `exclude-newer` mirrors only files
+PyPI received before the cutoff.
 
 ## 3. Run the sync
 
@@ -60,41 +64,35 @@ export PYPIRON_SYNC_ADMIN_PASS="$ADMIN"
 pypiron sync
 ```
 
-`sync` preflights the destination once (server reachable, credentials accepted),
-then mirrors each package in parallel and prints a live progress meter.
+`sync` checks the destination once (server reachable, credentials accepted),
+then mirrors each package in parallel with a live progress meter.
 
-Re-run it anytime. Each project is fetched conditionally: an unchanged upstream
-answers `304` and is skipped, and files the server already holds are skipped, so
-a re-run only moves what's new.
+Re-runs are cheap: sync skips projects unchanged upstream and files you already
+hold, so a repeat moves only what's new. See
+[Mirroring](../concepts/mirroring.md) for how it decides.
 
 !!! tip
     `pypiron sync --dry-run` prints what would be mirrored and writes nothing.
-    Use it to size a run before committing to the download.
+    Size a run before committing to the download.
 
 ## 4. Keep it current
 
-A normal run already reconciles yanks and removals: yanking or removing a file
-upstream changes the project's listing, so the conditional fetch gets a `200`
-(not a `304`) and reconciles it. You don't need `--full` to pick up a fresh yank.
-
-Run a full pass on a schedule (e.g. nightly) as the *self-heal* — it ignores the
-conditional-fetch memo and re-reconciles every project unconditionally, which
-closes the gaps a `304` can't see: a stale upstream-CDN response that answers
-`304` right after a yank, or dest-side drift (a manual admin yank toggle, a
-restore from backup) that no upstream change reflects.
+A normal run already picks up yanks and removals: installers stop seeing a file
+the moment upstream pulls it. Run a full pass on a schedule (e.g. nightly) to
+catch removals and yanks a quick re-sync misses:
 
 ```bash
 pypiron sync --full
 ```
 
-Either way: yank state is brought in line with upstream, and a file gone from
-upstream is flagged yanked `removed upstream` (kept downloadable, skipped by
-installers). Mirrored artifacts are never deleted.
+Either way, yank state matches upstream, and a file gone from upstream is marked
+yanked `removed upstream` — still downloadable, skipped by installers. Mirrored
+files are never deleted.
 
 ## Install from the mirror
 
-Point clients at the air-gapped server as their **only** index, so resolution
-never falls through to an unreachable PyPI.
+Point clients at the air-gapped server as their **only** index, so installs
+never fall through to an unreachable PyPI.
 
 === "uv"
     ```bash
@@ -106,15 +104,15 @@ never falls through to an unreachable PyPI.
     pip install --index-url http://HOST:8080/simple/ requests numpy
     ```
 
-If you set a read credential (`--read-user`/`--read-pass`), `/simple/` and
-`/files/` require auth — put the credentials in the index URL or your client's
-config. See [Authentication](../concepts/authentication.md).
+With a read credential (`--read-user`/`--read-pass`), `/simple/` and `/files/`
+require auth — put it in the index URL or your client's config. See
+[Authentication](../concepts/authentication.md).
 
 ## Mirror selection
 
-`exclude-newer` and `include-format` are two of the mirror rules that gate what a
-run adds. The full set — package include/exclude, format, python/abi/platform
-tags, date cutoffs — is in
+`exclude-newer` and `include-format` are two of the rules that gate what a run
+adds. The full set — package include/exclude, format, python/abi/platform tags,
+date cutoffs — is in
 [Configuration](../reference/configuration.md#mirror-selection), and the same
-`[mirror]` slice governs the on-demand proxy. For how mirroring reconciles yanks,
-removals, and project status, see [Mirroring](../concepts/mirroring.md).
+`[mirror]` settings govern the on-demand proxy. For how mirroring reconciles
+yanks, removals, and project status, see [Mirroring](../concepts/mirroring.md).

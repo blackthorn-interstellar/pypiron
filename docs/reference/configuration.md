@@ -1,14 +1,15 @@
 # Configuration
 
-The full reference. All options are available via CLI args and/or environment
-variables.
+Configure pypiron with flags, `PYPIRON_*` environment variables, or a
+`pypiron.toml` file. Every flag has an env var; precedence is CLI/env > file >
+defaults.
 
 ## Storage (`serve`)
 
-The server owns storage; `sync` is a pure HTTP client (see [Sync](#sync-mirror-over-http)).
-One binary, one storage layer. `disk` is the zero-dependency default; the three
-cloud backends (`s3`, `gcs`, `azure`) share a single implementation over the
-[`object_store`](https://docs.rs/object_store) crate. Pick one with `--storage`.
+`disk` is the zero-dependency default: point pypiron at a folder. For shared or
+multi-node deployments, pick a cloud bucket with `--storage` — `s3` (or any
+S3-compatible store), `gcs`, or `azure`. `sync` stores nothing; it's a pure HTTP
+client that uploads to a server (see [Sync](#sync-mirror-over-http)).
 
 | CLI Arg                            | Env Var               | Default               | Description                       |
 | ---------------------------------- | --------------------- | --------------------- | --------------------------------- |
@@ -24,12 +25,11 @@ cloud backends (`s3`, `gcs`, `azure`) share a single implementation over the
 | `--s3-endpoint-url`     | `PYPIRON_S3_ENDPOINT_URL`     | *(none)*            | S3-compatible endpoint (e.g., MinIO) |
 | `--s3-force-path-style` | `PYPIRON_S3_FORCE_PATH_STYLE` | `false`             | Force path-style addressing          |
 
-Region uses the standard `AWS_REGION` (the AWS SDK reads it too); there is
-intentionally no `PYPIRON_S3_REGION`/`PYPIRON_AWS_REGION`.
+Region comes from the standard `AWS_REGION` env var.
 
 **AWS credentials** follow the standard AWS chain: `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, web identity, or instance metadata.
-An `http://` endpoint (a local MinIO) is allowed automatically.
+An `http://` endpoint (local MinIO) is allowed automatically.
 
 ### Google Cloud Storage (`--storage gcs`)
 
@@ -41,9 +41,9 @@ An `http://` endpoint (a local MinIO) is allowed automatically.
 
 **GCS credentials**: a service-account key (via the flag or the standard
 `GOOGLE_*`/`GOOGLE_APPLICATION_CREDENTIALS` envs), otherwise Application Default
-Credentials. **Presigned redirects (`--artifact-delivery redirect`/`auto`)
-require a service-account key** — URL signing needs the private key, which ADC
-tokens do not provide. Under ADC, artifact downloads fall back to streaming.
+Credentials. **Presigned redirects (`--artifact-delivery redirect`/`auto`) need
+a service-account key** — URL signing needs the private key; ADC tokens don't
+have it. Under ADC, downloads stream.
 
 ### Azure Blob Storage (`--storage azure`)
 
@@ -57,13 +57,13 @@ tokens do not provide. Under ADC, artifact downloads fall back to streaming.
 
 **Azure credentials**: an account access key (via the flag or the standard
 `AZURE_*` envs), or a managed identity / bearer token. **Presigned redirects
-require the account key** — signed SAS URLs are derived from it; without it,
-artifact downloads stream.
+need the account key** — signed SAS URLs derive from it; without it, downloads
+stream.
 
 !!! warning
 
-    **Buckets/containers must already exist.** pypiron writes objects but does
-    not create the bucket or container — provision it first.
+    **Buckets/containers must already exist.** pypiron writes objects but
+    doesn't create the bucket or container — provision it first.
 
 ## Server
 
@@ -83,9 +83,9 @@ artifact downloads stream.
 | `--access-log`               | `PYPIRON_ACCESS_LOG`               | `false`        | Also log reads (downloads/listings), not just mutations (see below) |
 | `--access-log-format`        | `PYPIRON_ACCESS_LOG_FORMAT`        | `structured`   | `structured` (key=value/JSON) or `clf` (Combined Log Format) |
 | `--worker-interval-secs`     | `PYPIRON_WORKER_INTERVAL_SECS`     | `1`            | Worker tick interval (writes also nudge the worker directly) |
-| `--reconcile-interval-secs`  | `PYPIRON_RECONCILE_INTERVAL_SECS`  | `86400`        | Audit sweep interval (fingerprint-skipped; cost scales with churn) |
+| `--reconcile-interval-secs`  | `PYPIRON_RECONCILE_INTERVAL_SECS`  | `86400`        | Audit sweep interval (skips unchanged files; cost scales with churn) |
 | `--audit-on-boot`            | `PYPIRON_AUDIT_ON_BOOT`            | `true`         | Audit as soon as this node becomes leader        |
-| `--intent-grace-secs`        | `PYPIRON_INTENT_GRACE_SECS`        | `900`          | How long an in-flight write may defer its package's rebuild |
+| `--intent-grace-secs`        | `PYPIRON_INTENT_GRACE_SECS`        | `900`          | How long a write in progress may defer its package's rebuild |
 | `--lease-ttl-secs`           | `PYPIRON_LEASE_TTL_SECS`           | `30`           | Leader lease TTL (multi-node S3)                 |
 | `--artifact-delivery`        | `PYPIRON_ARTIFACT_DELIVERY`        | `auto`         | How artifact bytes reach clients (see below)     |
 | `--wait-on-upload`           | `PYPIRON_WAIT_ON_UPLOAD`           | `false`        | Wait for index visibility before returning 200   |
@@ -93,20 +93,22 @@ artifact downloads stream.
 | `--download-stats`           | `PYPIRON_DOWNLOAD_STATS`           | `true`         | Count per-package/version downloads per day (see below) |
 | `--counters-resolution`      | `PYPIRON_COUNTERS_RESOLUTION`      | `1d`           | Counter bucket width: `1d`/`1h`/`30m`/`2h` (whole minutes dividing a day) |
 | `--counters-flush-interval-secs`  | `PYPIRON_COUNTERS_FLUSH_INTERVAL_SECS`  | `300` | How often each node flushes counts (the dominant cost knob) |
-| `--counters-rollup-interval-secs` | `PYPIRON_COUNTERS_ROLLUP_INTERVAL_SECS` | `3600` | Leader compaction cadence (freeze finished days, prune) |
+| `--counters-rollup-interval-secs` | `PYPIRON_COUNTERS_ROLLUP_INTERVAL_SECS` | `3600` | How often finished days are compacted and old history pruned |
 | `--counters-retention-days`  | `PYPIRON_COUNTERS_RETENTION_DAYS`  | `90`           | Days of per-day counter history to keep           |
 
-The two default-on toggles — `--audit-on-boot` and `--download-stats` — are
-disabled with an explicit value, `--audit-on-boot false` /
-`--download-stats false` (or `PYPIRON_AUDIT_ON_BOOT=false` /
-`PYPIRON_DOWNLOAD_STATS=false`), not a `--no-` form.
+Disable the two default-on toggles — `--audit-on-boot`, `--download-stats` —
+with an explicit value: `--audit-on-boot false` / `--download-stats false` (or
+`PYPIRON_AUDIT_ON_BOOT=false` / `PYPIRON_DOWNLOAD_STATS=false`), not a `--no-`
+form.
 
-**Access log.** Each logged request is one line — method, path, status, latency,
+### Access log
+
+Each logged request is one line — method, path, status, latency,
 response size, client IP (honoring `X-Forwarded-For` / `X-Real-IP` behind a
-proxy), the project tag, and User-Agent. What gets logged depends on the request:
+proxy), project tag, and User-Agent. What's logged depends on the request:
 
 - **By default** (no `--access-log`) only **mutations** are logged — uploads,
-  deletes, yanks, status changes (any non-GET/HEAD) — at `info`. This is a small,
+  deletes, yanks, status changes (any non-GET/HEAD) — at `info`. A small,
   high-value audit trail. Reads (index listings, downloads) are **not** logged:
   an always-on read log becomes the workload at high request rates.
 - **`--access-log`** widens it to **every request**, the full access log.
@@ -125,21 +127,14 @@ Two renderings, via `--access-log-format`:
   parsers can't read), so it shares stdout with the diagnostic log; run
   `RUST_LOG=warn` for a near-pure access stream (CLF parsers skip the rest).
 
-**Download counters.** With `--download-stats` (on by default), each node counts
-artifact downloads per `(package, filename)` in memory and flushes immutable
-delta segments under `_counters/` every `--counters-flush-interval-secs`; the
-leader compacts a finished day into one frozen file per shard and writes a small
-per-day summary. Read them at `GET /stats/downloads/<pkg>` (per-package, last 30
-days, rolled up to versions; includes today) and `GET /stats/downloads`
-(global top packages + daily totals, closed days only) — both read-auth gated.
-Counts are a best-effort, *lossy* analytic (never truth). The **per-package**
-breakdown is deliberately kept off `/metrics` (registry-sized cardinality);
-`/metrics` carries only a single low-cardinality `pypiron_downloads_total`
-aggregate, and the root dashboard's Metrics section gains a per-node "Downloads"
-tile (accurate on S3, unlike "Files served"). Cost is dominated by
-flush PUTs (`flush_interval × nodes`): ~$0.04/node/month at the 300 s default,
-effectively free for a private registry. Frozen days are exact; today lags one
-flush interval. Changing the resolution is non-destructive (old days keep theirs).
+### Download counters
+
+`--download-stats` (on by default) counts artifact downloads per package and
+version, served at `GET /stats/downloads/<pkg>` and `GET /stats/downloads` (both
+read-auth gated). Costs about **$0.04 per node per month**, no database. Finished
+days are exact; today lags one flush interval. Tune it with the `--counters-*`
+flags above. Full detail in
+[Download statistics](../concepts/download-stats.md).
 
 !!! note "Large uploads"
 
@@ -149,31 +144,33 @@ flush interval. Changing the resolution is non-destructive (old days keep theirs
 
 ## Authentication
 
-Three optional basic-auth credentials, strictly ordered — admin ⊇ uploader ⊇
-reader:
+Three optional credentials, each a username/password flag pair (with matching
+`PYPIRON_*` env vars), also in the [Server](#server) table:
 
-| Credential | Flags | Grants |
-| --- | --- | --- |
-| admin | `--admin-user`/`--admin-pass` | everything: publish, mirror (backdating), delete, yank |
-| uploader | `--uploader-user`/`--uploader-pass` | publish ordinary uploads |
-| read | `--read-user`/`--read-pass` | read indexes and artifacts |
+| Credential | Flags |
+| --- | --- |
+| admin | `--admin-user` / `--admin-pass` |
+| uploader | `--uploader-user` / `--uploader-pass` |
+| read | `--read-user` / `--read-pass` |
 
 The admin username defaults to `admin`, so `--admin-pass secret` alone is a
-complete admin credential. With
-**no write credential** the server is **read-only** — open unauthenticated
-writes don't exist. With no read credential, reads are public. When
-`--read-user` is set, `/simple/` and `/files/` require auth (any of the three
-credentials works; `/health` and `/metrics` stay open for probes):
+complete admin credential. With no write credential the server is read-only;
+with no read credential, reads are public. Set `--read-user` and `--read-pass`
+and `/simple/` and `/files/` require auth (any of the three credentials works;
+`/health` and `/metrics` stay open for probes):
 
 ```bash
 pip install --index-url http://reader:secret@localhost:8080/simple/ mypackage
 ```
 
+What each role can do, how they nest, and the fail-closed rules:
+[Authentication](../concepts/authentication.md).
+
 ### Per-project download tracking
 
-Usernames support Gmail-style subaddressing. `reader+billing-api`
+Usernames support tags. `reader+billing-api`
 authenticates as `reader` (password still required) and records `billing-api`
-as a project tag — per-tag counts show up in `/metrics` as
+as a project tag — per-tag counts appear in `/metrics` as
 `pypiron_project_requests_total{project=...,route=...}` and in the debug
 request logs. With uv:
 
@@ -182,15 +179,15 @@ export UV_INDEX_COMPANY_USERNAME="reader+billing-api"
 export UV_INDEX_COMPANY_PASSWORD="secret"
 ```
 
-Works on open servers too: with no read credential configured, any volunteered
-username is parsed for attribution and the password is ignored. Tag cardinality
-in `/metrics` is capped (overflow lands in `_overflow`); tags are restricted to
+Works on open servers too: with no read credential, any volunteered username is
+parsed for attribution and the password ignored. Tag cardinality in `/metrics`
+is capped (overflow lands in `_overflow`); tags are restricted to
 `[A-Za-z0-9._-]`, max 64 chars.
 
 ## Sync (mirror over HTTP)
 
-`pypiron sync` mirrors packages from a PEP 691 source into a pypiron server. It
-is a pure HTTP client: each file is POSTed to the destination's `/legacy/` as a
+`pypiron sync` mirrors packages from a PEP 691 source into a pypiron server. A
+pure HTTP client: each file is POSTed to the destination's `/legacy/` as a
 mirror upload (carrying PyPI's true `upload-time` and yank state), and the
 server owns every storage write. Sync needs a destination URL and the admin
 credential — nothing about the server's storage backend.
@@ -207,31 +204,30 @@ credential — nothing about the server's storage backend.
 | `--spool-dir PATH`            | `PYPIRON_SYNC_SPOOL_DIR`         | system temp        | Download spool dir — real disk, not tmpfs, for large wheels |
 | `--dry-run`                   | `PYPIRON_SYNC_DRY_RUN`           | `false`            | Print what would be mirrored, write nothing             |
 
-`--to` is mandatory (there is no direct-to-storage mode); without it (and no
-`[sync].to`) the run refuses to start. Which packages get mirrored is the
-mirror name axis — `--include-package` / `--include-packages-from` /
-`[mirror].include-packages` (see [Mirror selection](#mirror-selection)) — and
-`sync` requires a non-empty set (it needs an explicit work list). The same scope
-governs the proxy.
+`--to` is mandatory (no direct-to-storage mode); without it (and no `[sync].to`)
+the run refuses to start. Which packages get mirrored is the mirror name axis —
+`--include-package` / `--include-packages-from` / `[mirror].include-packages`
+(see [Mirror selection](#mirror-selection)) — and `sync` requires a non-empty
+set: an explicit work list. The same scope governs the proxy.
 
 ## Re-sync, reconcile, and conditional fetch
 
 A re-`sync` doesn't just add new files — it *reconciles* what it already holds:
-yank state is brought in line with upstream (set, cleared, or its reason
-updated), a file gone from upstream is flagged yanked `removed upstream` (kept
-downloadable, just skipped by installers), and PEP 792 project status is
-relayed. Artifacts are never deleted.
+yank state is brought in line with upstream (set, cleared, or reason updated), a
+file gone from upstream is flagged yanked `removed upstream` (kept downloadable,
+skipped by installers), and PEP 792 project status is relayed. Artifacts are
+never deleted.
 
 To keep "reconcile every run" cheap, each project is fetched conditionally: the
 last upstream ETag is remembered server-side (`_sync/cursors.json`, served by
 the admin-only `GET`/`PUT /sync/cursors`) and replayed as `If-None-Match`, so an
-unchanged upstream answers `304` and the project is skipped entirely. The cursor
-is a pure cache — delete it and the next run re-fetches.
+unchanged upstream answers `304` and the project is skipped. The cursor is a
+pure cache — delete it and the next run re-fetches.
 
 - `--full` (`PYPIRON_SYNC_FULL`) — ignore the cursor memo: re-fetch every
   project unconditionally and fully reconcile. Run periodically (e.g. nightly)
-  as the self-heal, since a normal run only reconciles projects whose upstream
-  listing actually changed.
+  as a full catch-up, since a normal run only reconciles projects whose upstream
+  listing changed.
 
 The cursor key folds in the source URL, the resolved mirror selection, and each
 project's specifiers, so changing any of them invalidates the shortcut and
@@ -239,10 +235,10 @@ forces a full fetch.
 
 ## Mirror Selection
 
-`[mirror]` is the slice of PyPI you want — names *and* files. It is shared
-verbatim by `pypiron sync` (push mirror) and `serve --proxy-upstream` (on-demand
-pull mirror): set it once and both paths agree. Mirror selection gates only what
-is *added*; already-mirrored or already-cached files are never removed by later
+`[mirror]` is the slice of PyPI you want — names *and* files. Shared verbatim by
+`pypiron sync` (push mirror) and `serve --proxy-upstream` (on-demand pull
+mirror): set it once and both paths agree. Mirror selection gates only what is
+*added*; already-mirrored or already-cached files are never removed by later
 selection changes.
 
 | `[mirror]` key | CLI flag | Env var |
@@ -267,10 +263,10 @@ selection changes.
 
 Package specs use one syntax everywhere: a PEP 503-normalized name with optional
 PEP 440 specifiers (`requests`, `six==1.16.0`, `requests>=2.20,<3`). Inline TOML
-keys are arrays; CLI flags are singular and repeatable by design. Commas belong
-to PEP 440 specifiers, so `PYPIRON_INCLUDE_PACKAGE` and
-`PYPIRON_EXCLUDE_PACKAGE` each carry one spec. For automation with many names,
-prefer `PYPIRON_INCLUDE_PACKAGES_FROM` / `PYPIRON_EXCLUDE_PACKAGES_FROM`.
+keys are arrays; CLI flags are singular and repeatable. Commas belong to PEP 440
+specifiers, so `PYPIRON_INCLUDE_PACKAGE` and `PYPIRON_EXCLUDE_PACKAGE` each carry
+one spec. For many names, prefer `PYPIRON_INCLUDE_PACKAGES_FROM` /
+`PYPIRON_EXCLUDE_PACKAGES_FROM`.
 
 Selection has two stages, and exclude wins in both:
 
@@ -278,14 +274,14 @@ Selection has two stages, and exclude wins in both:
    the name matches an include spec, and no exclude spec matches. A bare
    `exclude-packages` name drops the whole project. A version-pinned exclude
    drops only files whose inferred version parses and satisfies the specifier.
-   If the version cannot be parsed, pypiron keeps the file because it cannot
-   prove the artifact is denied.
-2. File stage: surviving projects then pass through the format, tag, upload
-   time, yanked, size, prerelease, and Windows gates.
+   If the version can't be parsed, pypiron keeps the file — it can't prove the
+   artifact is denied.
+2. File stage: surviving projects pass through the format, tag, upload-time,
+   yanked, size, prerelease, and Windows gates.
 
 `sync` requires a non-empty work list from `include-packages` or
-`include-packages-from`; an exclude list alone is not work. The proxy has split
-semantics: empty include means an open proxy for any non-private name, while a
+`include-packages-from`; an exclude list alone isn't work. The proxy has split
+semantics: empty include means an open proxy for any non-private name; a
 non-empty include is a fail-closed allowlist. `exclude-packages` subtracts in
 both modes, so this is an open proxy minus a denylist:
 
@@ -296,10 +292,10 @@ pypiron serve \
   --exclude-package "demo<2"
 ```
 
-`include-format` accepts `wheel`, `sdist`, and `other`; it is repeatable and
+`include-format` accepts `wheel`, `sdist`, and `other`; repeatable and
 comma-separated (`--include-format wheel,sdist`). Unset means all formats.
 `wheel` is `.whl`; `sdist` is `.tar.gz`, `.tgz`, `.tar.bz2`, or `.zip`; `other`
-is everything else. `exclude-windows` still independently drops `.exe`, `.msi`,
+is everything else. `exclude-windows` independently drops `.exe`, `.msi`,
 `.winXX`, and Windows wheel platforms.
 
 Other file-axis rules:
@@ -317,27 +313,26 @@ Other file-axis rules:
 - Yanked files (PEP 592) are dropped by default. Pass `--include-yanked` or set
   `[mirror].include-yanked = true` to pull them anyway; they stay flagged yanked.
 - `--exclude-newer WHEN` keeps files received upstream before the cutoff.
-  **Defaults to `7`** — a sliding 7-day quarantine that holds freshly published
-  releases back from both the mirror and the proxy, so an install-then-yank
-  supply-chain attack has a week to be caught before any client can pull it. Set
-  `exclude-newer = ""` (an empty value) to turn the cooldown off and mirror
-  everything up to the present.
+  **Defaults to `7`** — a sliding 7-day quarantine that holds fresh releases back
+  from the mirror and the proxy, so an install-then-yank supply-chain attack has
+  a week to be caught before any client can pull it. Set `exclude-newer = ""`
+  (empty) to turn the cooldown off and mirror everything to the present.
 - `--exclude-older WHEN` keeps files received upstream at or after the cutoff.
 
 `<when>` (matching uv's `--exclude-newer`) is an **RFC 3339 timestamp**
 (`2024-01-01T00:00:00Z`), a **bare date** (`2008-12-03`, taken as 00:00:00 UTC),
 a **bare integer of days** ago (`7`), a **friendly duration** ago (`"30 days"`,
 `"24 hours"`, `"1 week"`), or an **ISO 8601 duration** ago (`P30D`, `PT24H`). A
-duration is resolved against the current time as a fixed number of seconds (a day
+duration resolves against the current time as a fixed number of seconds (a day
 is 24 h); calendar months and years are rejected. The same forms apply to the
 `[mirror]` `exclude-newer`/`exclude-older` keys. An empty value (`""`) means "no
-cutoff" — the explicit way to opt out of the default 7-day cooldown.
+cutoff" — the explicit opt-out from the default 7-day cooldown.
 
 Unlike uv's client-side `--exclude-newer` (which treats a file with no
 `upload-time` as unavailable), the mirror **keeps** a file whose upstream listing
-carries no parseable upload time — the time bounds only ever act on files that
-can be placed in time, so an upstream without PEP 700 timestamps still mirrors
-fully instead of going silently empty.
+carries no parseable upload time — time bounds act only on files that can be
+placed in time, so an upstream without PEP 700 timestamps still mirrors fully
+instead of going silently empty.
 
 A sync run prints a live progress meter on stderr (packages done, files/bytes
 mirrored, throughput, ETA) plus an always-on end-of-run summary; `--no-progress`
@@ -347,11 +342,11 @@ a file, the meter prints one fresh line every 30 s instead of repainting.
 ## The config file (`pypiron.toml`)
 
 Every subcommand reads `pypiron.toml` — pass `--config <path>` (global,
-`PYPIRON_CONFIG`) or let it be auto-discovered as `./pypiron.toml` in the working
+`PYPIRON_CONFIG`) or let it auto-discover as `./pypiron.toml` in the working
 directory. `serve` and `sync` use the whole file; the maintenance commands
-`verify-index`/`rebuild-index` read the `[serve]` storage selection so they
-target the same backend `serve` does. Precedence is **CLI/env > file >
-defaults**. Four parts:
+`verify-index`/`rebuild-index` read the `[serve]` storage selection to target
+the same backend `serve` does. Precedence is **CLI/env > file > defaults**. Four
+parts:
 
 - top-level `private-prefix` — the reserved private namespace, shared by both
   commands.
@@ -390,9 +385,9 @@ concurrency = 8
 relative to the config file, not the working directory. A CLI package source
 (`--include-package` and/or `--include-packages-from`, or the exclude twins)
 replaces the matching file source entirely; other options layer per-key. A
-boolean set `true` in the file can be turned on but not off by the absence of a
-flag — there is no flag for `false`, so clear it by setting it `false` (or
-deleting the line) in the file.
+boolean set `true` in the file can't be turned off by a missing flag — there is
+no flag for `false`, so clear it by setting it `false` (or deleting the line) in
+the file.
 
 ## Artifact delivery
 
@@ -408,7 +403,7 @@ that's what ends up in lockfiles and client caches, and it never expires.
 
 A presigned redirect moves the megabytes to object storage, but each response
 carries a freshly signed URL. Clients whose download caches are keyed by the
-serving URL (pip's HTTP cache) can never get a hit, so `redirect` silently turns
+serving URL (pip's HTTP cache) never get a hit, so `redirect` silently turns
 every fresh-environment pip install into a full re-download. uv is immune — it
 caches wheels by index and filename. `auto` resolves this per request; use
 `redirect` when node bandwidth is the binding constraint, `stream` when clients
@@ -438,18 +433,7 @@ operational endpoints (`/health`, `/metrics`, logging) live on the
 
 ## Storage layout
 
-The layout *is* the schema — full contract in
-[DESIGN.md](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/DESIGN.md#storage-layout-the-contract):
-
-```
-packages/<pkg>/<filename>                # artifact, immutable once written
-packages/<pkg>/<filename>.meta.json      # sidecar: sha256, size, version, upload-time, requires-python, yanked
-packages/<pkg>/<filename>.metadata       # PEP 658 core metadata, extracted from wheel
-packages/<pkg>/.origin                   # "private" | "mirror" — claimed at first write
-simple/index.html                        # materialized views (regenerable)
-simple/index.json
-simple/<pkg>/index.html
-simple/<pkg>/index.json
-_dirty/<pkg>                             # event markers: package needs index rebuild
-_leader/lease.json                       # multi-node lease (holder, term, expires-at)
-```
+pypiron stores every artifact and its metadata as plain files on disk or in your
+bucket — no database, so a backup is a copy of the directory. The exact on-disk
+layout is an internal contract; for that depth, see
+[DESIGN.md](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/DESIGN.md#storage-layout-the-contract).

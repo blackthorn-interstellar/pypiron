@@ -7,8 +7,11 @@
 
 An ultra-fast Python package server, written in Rust.
 
-One binary, no database. pypiron serves your private uploads, mirrors public PyPI
-on demand, and bulk-syncs allowlists — all behind one URL and one namespace.
+pypiron aims to be the fastest, most reliable PyPI server (and mirror) available.
+
+Host your private packages and mirror public PyPI from one URL. A drop-in
+replacement for pypiserver, pypicloud, bandersnatch, devpi, proxpi, dumb-pypi,
+simpleindex, and pypiprivate — and 5–90× faster than any of them.
 
 **Documentation:** <https://pypiron.com/>
 
@@ -16,22 +19,12 @@ on demand, and bulk-syncs allowlists — all behind one URL and one namespace.
   <img src="docs/assets/install-throughput.png" alt="Max sustained install throughput: pypiron vs bandersnatch, pypiserver, pypicloud, devpi, proxpi" width="760">
 </p>
 
-## Highlights
-
-- **Handles 5–90× more load** than other PyPI servers.
-- **Dead simple.** `uvx pypiron serve` and you're live — no database, no config.
-- **Works with the whole ecosystem.** uv, pip, poetry, twine, pipenv, hatch.
-- **Private and public together.** One URL serves your private packages and
-  caches public dependencies from PyPI on first use.
-- **Dependency-confusion defense.** Every name is exclusively private or
-  mirrored, claimed at first write — private names never fall through to upstream.
-- **Horizontal scaling that just works.** Point any number of nodes at one S3
-  bucket; reads need zero coordination and failover is automatic.
-- **Download tracking.** Per-package, per-version counts at
-  `GET /stats/downloads/<pkg>`; per-project labels in Prometheus `/metrics`.
-- **Supply-chain quarantine, on by default.** Releases younger than a sliding
-  7-day window are held back (`--exclude-newer`, tunable or `""` to disable);
-  `uv --exclude-newer` resolves against it.
+- **5–90× faster than any PyPI server.** 3,026 installs/s on 2 vCPU.
+- **Supply-chain quarantine, on by default.** New releases wait 7 days. Most attacks surface first.
+- **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
+- **Scales to a fleet.** Point any number of nodes at one bucket. No coordination.
+- **Works with everything.** uv, pip, poetry, pdm, twine, pipenv, hatch, flit.
+- **Download stats built in.**
 
 ## Quickstart
 
@@ -51,9 +44,8 @@ uv publish --publish-url http://localhost:8080/legacy/ \
 uv add --index http://localhost:8080/simple/ acme-widgets
 ```
 
-Setting a password enables a role: with only `--admin-pass`, writes need the
-admin credential and reads stay public. The pip/twine equivalents and the
-guided version are in [First steps](docs/getting-started/first-steps.md).
+Only `--admin-pass` set: writes need the admin credential, reads stay public.
+pip, twine, and poetry equivalents: <https://pypiron.com/#quickstart>.
 
 ## Going further
 

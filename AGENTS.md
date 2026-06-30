@@ -23,7 +23,9 @@ database. The guiding bias is against complexity: the best code is no code.
 - Two doc trees: the user manual is the mkdocs-material site under `docs/`
   (published to GitHub Pages; build with `make docs`, preview with
   `make docs-serve`); contributor/architecture/benchmark docs live in `dev/`.
-  Update the manual when you change user-visible behavior.
+  Update the manual when you change user-visible behavior. Write it the house
+  way — [dev/DOCS_STYLE.md](dev/DOCS_STYLE.md): for the user, not the builder
+  (outcome over mechanism, no in-house jargon, happy-path first).
 - Architecture and the storage-layout contract: [dev/DESIGN.md](dev/DESIGN.md)
   ([dev/VISION.md](dev/VISION.md) is the one-pager). Don't invent storage-tree
   or sidecar variants.

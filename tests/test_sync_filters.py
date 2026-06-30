@@ -260,6 +260,28 @@ def test_exclude_only_platform_tag_keeps_sdists(disk_server, pypiron_bin, tmp_pa
     )
 
 
+def test_exclude_python_tag_drops_wheels_keeps_sdists(disk_server, pypiron_bin, tmp_path):
+    """--exclude-python-tag drops matching wheels (this is the `no-pypy` recipe,
+    pp*) yet leaves sdists — they carry no tag, so an exclusion can't reach them.
+    six's only wheel is py2.py3, so excluding py3 drops it and keeps the sdist."""
+    pkg_list = _packages_list(tmp_path, f"{PACKAGE}==1.16.0")
+    rc, out, err = sync_to(
+        pypiron_bin,
+        disk_server,
+        "--include-packages-from",
+        str(pkg_list),
+        "--exclude-python-tag",
+        "py3",
+    )
+    assert rc == 0, f"sync failed:\n{out}\n{err}"
+    pkg_dir = disk_server["data_dir"] / "packages" / PACKAGE
+    files = sorted(p.name for p in pkg_dir.iterdir() if not p.name.startswith("."))
+    assert not any(f.endswith(".whl") for f in files), "the py2.py3 wheel must be excluded"
+    assert any(f.endswith(".tar.gz") for f in files), (
+        "the sdist must survive an exclusion-only filter"
+    )
+
+
 def test_include_format_sdist_keeps_sdists_only(disk_server, pypiron_bin, tmp_path):
     pkg_list = _packages_list(tmp_path, f"{PACKAGE}==1.16.0")
     rc, out, err = sync_to(

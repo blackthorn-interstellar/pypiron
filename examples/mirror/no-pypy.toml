@@ -1,0 +1,6 @@
+# No PyPy: keep CPython wheels and sdists, drop PyPy-only binaries. PyPy wheels
+# carry a python tag of pp39/pp310/… (and an ABI tag of pypy39_pp73/…); either
+# axis reaches them. exclude-python-tag is exclusion-only, so sdists are kept.
+[mirror]
+exclude-python-tag = ["pp*"]
+# Equivalent via the ABI axis: exclude-abi-tag = ["pypy*"]

@@ -1,0 +1,6 @@
+# Air-gapped full mirror: everything, no cooldown, including yanked files — a
+# complete offline copy you control. Pair with an include-packages-from work
+# list for `sync` (it needs an explicit scope; the proxy does not).
+[mirror]
+exclude-newer = ""        # turn OFF the default 7-day quarantine
+include-yanked = true

@@ -201,6 +201,24 @@ pub struct MirrorArgs {
     )]
     pub include_platform_tag: Vec<String>,
 
+    /// Exclude wheels whose python tag matches any of these (e.g. pp* drops PyPy). Supports '*' wildcard.
+    #[arg(
+        long = "exclude-python-tag",
+        env = "PYPIRON_EXCLUDE_PYTHON_TAG",
+        value_delimiter = ',',
+        value_name = "TAG"
+    )]
+    pub exclude_python_tag: Vec<String>,
+
+    /// Exclude wheels whose ABI tag matches any of these (e.g. pypy* drops PyPy). Supports '*' wildcard.
+    #[arg(
+        long = "exclude-abi-tag",
+        env = "PYPIRON_EXCLUDE_ABI_TAG",
+        value_delimiter = ',',
+        value_name = "TAG"
+    )]
+    pub exclude_abi_tag: Vec<String>,
+
     /// Exclude wheels whose platform tag matches any of these (supports '*' wildcard).
     #[arg(
         long = "exclude-platform-tag",
@@ -331,6 +349,14 @@ impl MirrorArgs {
             include_platform_tag: pick_vec(
                 &self.include_platform_tag,
                 file.and_then(|f| f.include_platform_tag.clone()),
+            ),
+            exclude_python_tag: pick_vec(
+                &self.exclude_python_tag,
+                file.and_then(|f| f.exclude_python_tag.clone()),
+            ),
+            exclude_abi_tag: pick_vec(
+                &self.exclude_abi_tag,
+                file.and_then(|f| f.exclude_abi_tag.clone()),
             ),
             exclude_platform_tag: pick_vec(
                 &self.exclude_platform_tag,
@@ -573,6 +599,10 @@ pub(crate) struct ResolvedMirror {
     pub(crate) include_python_tag: Vec<String>,
     pub(crate) include_abi_tag: Vec<String>,
     pub(crate) include_platform_tag: Vec<String>,
+    /// Exclusion-only wheel-tag gates (PyPy lives at python tag `pp*` / ABI
+    /// `pypy*`). Like `exclude_platform_tag`, they never gate sdists.
+    pub(crate) exclude_python_tag: Vec<String>,
+    pub(crate) exclude_abi_tag: Vec<String>,
     pub(crate) exclude_platform_tag: Vec<String>,
     pub(crate) exclude_newer: Option<Cutoff>,
     pub(crate) exclude_older: Option<Cutoff>,
@@ -1023,6 +1053,8 @@ fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
         &m.include_python_tag,
         &m.include_abi_tag,
         &m.include_platform_tag,
+        &m.exclude_python_tag,
+        &m.exclude_abi_tag,
         &m.exclude_platform_tag,
     ] {
         let mut sorted = tags.clone();
@@ -2185,6 +2217,12 @@ fn matches_mirror_inner(file: &SimpleFile, m: &ResolvedMirror, ignore_newer: boo
     if m.exclude_windows && is_windows_wheel_platform(&tags) {
         return false;
     }
+    if !m.exclude_python_tag.is_empty() && tokens_match_any(&tags.python, &m.exclude_python_tag) {
+        return false;
+    }
+    if !m.exclude_abi_tag.is_empty() && tokens_match_any(&tags.abi, &m.exclude_abi_tag) {
+        return false;
+    }
     if !m.exclude_platform_tag.is_empty()
         && tokens_match_any(&tags.platform, &m.exclude_platform_tag)
     {
@@ -2441,6 +2479,8 @@ mod tests {
             include_python_tag: vec![],
             include_abi_tag: vec![],
             include_platform_tag: vec![],
+            exclude_python_tag: vec![],
+            exclude_abi_tag: vec![],
             exclude_platform_tag: vec![],
             exclude_newer: None,
             exclude_older: None,
@@ -2570,6 +2610,45 @@ mod tests {
 
         // sdists carry no python tag — the floor never touches them.
         assert!(matches_mirror(&named_file("foo-1.0.tar.gz"), &f));
+    }
+
+    #[test]
+    fn exclude_python_and_abi_tag_drop_pypy_but_keep_cpython_and_sdists() {
+        // `no-pypy` recipe: drop wheels whose python tag is `pp*`.
+        let by_python = ResolvedMirror {
+            exclude_python_tag: vec!["pp*".into()],
+            ..base_filter()
+        };
+        assert!(!matches_mirror(
+            &named_file("foo-1.0-pp39-pypy39_pp73-linux_x86_64.whl"),
+            &by_python
+        ));
+        // CPython, version-agnostic, and sdists survive — exclusion-only never
+        // gates a non-wheel, and a CPython tag doesn't match `pp*`.
+        assert!(matches_mirror(
+            &named_file("foo-1.0-cp311-cp311-manylinux_2_17_x86_64.whl"),
+            &by_python
+        ));
+        assert!(matches_mirror(
+            &named_file("foo-1.0-py3-none-any.whl"),
+            &by_python
+        ));
+        assert!(matches_mirror(&named_file("foo-1.0.tar.gz"), &by_python));
+
+        // The ABI axis reaches the same PyPy wheel via `pypy*`.
+        let by_abi = ResolvedMirror {
+            exclude_abi_tag: vec!["pypy*".into()],
+            ..base_filter()
+        };
+        assert!(!matches_mirror(
+            &named_file("foo-1.0-pp39-pypy39_pp73-linux_x86_64.whl"),
+            &by_abi
+        ));
+        assert!(matches_mirror(
+            &named_file("foo-1.0-cp311-cp311-manylinux_2_17_x86_64.whl"),
+            &by_abi
+        ));
+        assert!(matches_mirror(&named_file("foo-1.0.tar.gz"), &by_abi));
     }
 
     #[test]

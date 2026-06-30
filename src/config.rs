@@ -58,6 +58,8 @@ pub struct MirrorConfig {
     pub include_python_tag: Option<Vec<String>>,
     pub include_abi_tag: Option<Vec<String>>,
     pub include_platform_tag: Option<Vec<String>>,
+    pub exclude_python_tag: Option<Vec<String>>,
+    pub exclude_abi_tag: Option<Vec<String>>,
     pub exclude_platform_tag: Option<Vec<String>>,
     pub exclude_newer: Option<String>,
     pub exclude_older: Option<String>,
@@ -233,6 +235,33 @@ mod tests {
         let err =
             toml::from_str::<ConfigFile>("[mirror]\ninclude-formatt = [\"wheel\"]\n").unwrap_err();
         assert!(err.to_string().contains("include-formatt"));
+    }
+
+    #[test]
+    fn shipped_mirror_examples_parse() {
+        // The recipe files under examples/mirror/ are user-facing config kept in
+        // step with the docs. deny_unknown_fields makes a renamed or typo'd knob
+        // fail here at parse time instead of silently rotting an example.
+        let lean: ConfigFile =
+            toml::from_str(include_str!("../examples/mirror/lean-linux-ci.toml")).unwrap();
+        assert_eq!(lean.mirror.include_format.unwrap(), ["wheel"]);
+        assert_eq!(
+            lean.mirror.exclude_platform_tag.unwrap(),
+            ["win*", "macosx_*"]
+        );
+
+        let no_pypy: ConfigFile =
+            toml::from_str(include_str!("../examples/mirror/no-pypy.toml")).unwrap();
+        assert_eq!(no_pypy.mirror.exclude_python_tag.unwrap(), ["pp*"]);
+
+        let stable: ConfigFile =
+            toml::from_str(include_str!("../examples/mirror/stable-only.toml")).unwrap();
+        assert_eq!(stable.mirror.exclude_prereleases, Some(true));
+
+        let air: ConfigFile =
+            toml::from_str(include_str!("../examples/mirror/air-gapped.toml")).unwrap();
+        assert_eq!(air.mirror.exclude_newer.as_deref(), Some(""));
+        assert_eq!(air.mirror.include_yanked, Some(true));
     }
 
     #[test]

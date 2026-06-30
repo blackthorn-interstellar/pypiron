@@ -1,0 +1,14 @@
+# Lean Linux CI mirror: wheels only, no Windows/macOS, supported Pythons,
+# released versions. Merge this [mirror] block into your pypiron.toml — it is
+# shared verbatim by `pypiron sync` and `serve --proxy-upstream`.
+#
+# Build the OS filter from exclude-platform-tag, never an include-platform-tag
+# allowlist: an allowlist silently drops pure-Python (`any`) wheels and every
+# sdist.
+[mirror]
+include-packages-from = "approved.txt"        # sync needs a work list; omit for a proxy
+include-format = ["wheel"]
+exclude-platform-tag = ["win*", "macosx_*"]    # drop Windows + macOS; keep `any` + sdists
+exclude-python-below = "3.9"                   # pin the floor; bump it on your schedule
+exclude-prereleases = true
+# exclude-newer defaults to "7" — the 7-day cooldown stays on unless you set it

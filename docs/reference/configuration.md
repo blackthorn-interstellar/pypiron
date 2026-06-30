@@ -251,6 +251,8 @@ selection changes.
 | `include-python-tag` | `--include-python-tag TAG` | `PYPIRON_INCLUDE_PYTHON_TAG` |
 | `include-abi-tag` | `--include-abi-tag TAG` | `PYPIRON_INCLUDE_ABI_TAG` |
 | `include-platform-tag` | `--include-platform-tag TAG` | `PYPIRON_INCLUDE_PLATFORM_TAG` |
+| `exclude-python-tag` | `--exclude-python-tag TAG` | `PYPIRON_EXCLUDE_PYTHON_TAG` |
+| `exclude-abi-tag` | `--exclude-abi-tag TAG` | `PYPIRON_EXCLUDE_ABI_TAG` |
 | `exclude-platform-tag` | `--exclude-platform-tag TAG` | `PYPIRON_EXCLUDE_PLATFORM_TAG` |
 | `exclude-python-below` | `--exclude-python-below X.Y` | `PYPIRON_EXCLUDE_PYTHON_BELOW` |
 | `exclude-larger` | `--exclude-larger SIZE` | `PYPIRON_EXCLUDE_LARGER` |
@@ -301,7 +303,12 @@ is everything else. `exclude-windows` independently drops `.exe`, `.msi`,
 Other file-axis rules:
 
 - `--include-python-tag`, `--include-abi-tag`, and `--include-platform-tag`
-  match wheel tags; `--exclude-platform-tag` supports `*` wildcards.
+  match wheel tags; the `--exclude-python-tag` / `--exclude-abi-tag` /
+  `--exclude-platform-tag` twins subtract by the same tags. All support `*`
+  wildcards. The exclude twins are exclusion-only: they drop matching wheels but
+  never touch sdists (which carry no tags), so `--exclude-python-tag pp*` (or
+  `--exclude-abi-tag pypy*`) drops PyPy wheels while leaving every sdist and
+  CPython wheel — the honest spelling of "no PyPy".
 - `--exclude-python-below X.Y` drops wheels built only for Python older than the
   floor. Version-agnostic wheels (`py3`, `py2.py3`), forward-compatible `abi3`
   wheels, and all sdists are kept.
@@ -338,6 +345,65 @@ A sync run prints a live progress meter on stderr (packages done, files/bytes
 mirrored, throughput, ETA) plus an always-on end-of-run summary; `--no-progress`
 (`PYPIRON_SYNC_NO_PROGRESS`) silences the live line. When stderr is redirected to
 a file, the meter prints one fresh line every 30 s instead of repainting.
+
+### Recipes
+
+Common slices, ready to paste into `[mirror]`. Each is built from the keys
+above — copy one, or merge two. Explicit CLI/env flags still override the file,
+and runnable copies live in [`examples/mirror/`](https://github.com/blackthorn-interstellar/pypiron/tree/master/examples/mirror).
+
+**Lean Linux CI mirror.** A small, fast mirror for Linux runners: wheels only,
+no Windows or macOS, supported Pythons, released versions. Drops the long-tail
+bulk CI never installs.
+
+```toml
+[mirror]
+include-packages-from = "approved.txt"        # sync needs a work list; omit for a proxy
+include-format = ["wheel"]
+exclude-platform-tag = ["win*", "macosx_*"]    # drop Windows + macOS; keep `any` + sdists
+exclude-python-below = "3.9"                   # pin the floor; bump it on your schedule
+exclude-prereleases = true
+# exclude-newer defaults to "7" — the 7-day cooldown stays on unless you set it
+```
+
+Build the OS filter from `exclude-platform-tag`, never an `include-platform-tag`
+allowlist: an allowlist silently drops pure-Python (`any`) wheels and every
+sdist, so the mirror builds clean and then can't install half of PyPI.
+Trade-off: a project that ships *only* an sdist won't be mirrored — add it back
+with a name include.
+
+**No PyPy.** Keep CPython wheels and sdists; drop PyPy-only binaries.
+
+```toml
+[mirror]
+exclude-python-tag = ["pp*"]    # PyPy wheels carry python tag pp39/pp310/…
+```
+
+Trade-off: a package that ships *only* PyPy wheels for some platform loses those
+files; its sdist (if any) still mirrors.
+
+**Stable only.** Released versions — no alpha, beta, rc, or dev.
+
+```toml
+[mirror]
+exclude-prereleases = true
+```
+
+Trade-off: a project that only ever publishes prereleases disappears entirely.
+Clear it by deleting the line.
+
+**Air-gapped full mirror.** Everything, no cooldown, including yanked files — a
+complete offline copy you control.
+
+```toml
+[mirror]
+exclude-newer = ""        # turn OFF the 7-day quarantine
+include-yanked = true
+```
+
+A recipe is a starting point your own keys and CLI flags override. A switch a
+recipe turns *on* can't be turned off by a missing flag — there's no flag for
+`false` — so clear it by setting it `false` (or deleting the line) in your file.
 
 ## The config file (`pypiron.toml`)
 

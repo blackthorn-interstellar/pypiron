@@ -1,0 +1,4 @@
+# Stable only: released versions, no alpha/beta/rc/dev. A project that only ever
+# publishes prereleases disappears entirely — clear it by deleting the line.
+[mirror]
+exclude-prereleases = true

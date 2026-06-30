@@ -9,10 +9,6 @@ An ultra-fast Python package server, written in Rust.
 
 pypiron aims to be the fastest, most reliable PyPI server (and mirror) available.
 
-Host your private packages and mirror public PyPI from one URL. A drop-in
-replacement for pypiserver, pypicloud, bandersnatch, devpi, proxpi, dumb-pypi,
-simpleindex, and pypiprivate — and 5–90× faster than any of them.
-
 **Documentation:** <https://pypiron.com/>
 
 <p align="center">
@@ -20,7 +16,7 @@ simpleindex, and pypiprivate — and 5–90× faster than any of them.
 </p>
 
 - **5–90× faster than any PyPI server.** 3,026 installs/s on 2 vCPU.
-- **So robust a single server could handle all of PyPI's traffic.**
+- **So robust a single server could handle all of PyPI's traffic.** PyPI averages ~100,000 requests/s — about 7,700 installs/s — and one 8-vCPU c7i.2xlarge clears that at pypiron's measured ~1,500 installs/s per vCPU.
 - **Supply-chain quarantine, on by default.** New releases wait 7 days. Most attacks surface first.
 - **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
 - **Scales to a fleet.** Point any number of nodes at one bucket. No coordination.

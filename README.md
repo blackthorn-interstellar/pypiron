@@ -20,6 +20,7 @@ simpleindex, and pypiprivate — and 5–90× faster than any of them.
 </p>
 
 - **5–90× faster than any PyPI server.** 3,026 installs/s on 2 vCPU.
+- **So robust a single server could handle all of PyPI's traffic.**
 - **Supply-chain quarantine, on by default.** New releases wait 7 days. Most attacks surface first.
 - **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
 - **Scales to a fleet.** Point any number of nodes at one bucket. No coordination.

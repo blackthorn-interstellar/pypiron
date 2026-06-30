@@ -1,11 +1,10 @@
 <!-- GENERATED — do not edit. Regenerate with `make compat`. -->
 
-# Client Compatibility
+# Client compatibility
 
-Every populated cell is backed by an integration test that runs the real client binary against a real pypiron server.
+Every major Python packaging tool works with pypiron. This matrix shows which workflows are verified for each client — every ✅ is backed by an integration test that runs the real client binary against a real pypiron server.
 
-Generated: 2026-06-18 23:39:10 UTC
-Revision: `59c3251`
+All listed clients install packages, and the ones that publish can upload; the advanced columns vary by what each tool implements. Check yours before you deploy.
 
 | Client | upload | install | resolve | pep658-metadata | yank | hash-check | exclude-newer |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -18,11 +17,21 @@ Revision: `59c3251`
 | hatch | ✅ | — | — | — | — | — | — |
 | pipenv | — | ✅ | ✅ | — | — | — | — |
 
-Legend: ❌ known incompatibility / failing, ✅ verified, ? not verified in this run, — not tested / not applicable.
+Legend: ✅ verified, ❌ known incompatibility, ? not verified in this run, — not tested or not applicable.
 
-## Client Versions
+What the columns mean:
 
-| Client | Version source |
+- **upload** — publish a distribution to the server.
+- **install** — install a package from the server.
+- **resolve** — resolve dependencies against the server's index.
+- **pep658-metadata** — read a file's metadata without downloading the whole wheel, for faster resolves.
+- **yank** — honor yanked releases, skipping withdrawn versions.
+- **hash-check** — verify downloads against expected hashes.
+- **exclude-newer** — ignore releases newer than a chosen date.
+
+## Client versions
+
+| Client | Tested version |
 | --- | --- |
 | pip | venv-seeded |
 | uv | system |
@@ -32,3 +41,5 @@ Legend: ❌ known incompatibility / failing, ✅ verified, ? not verified in thi
 | flit | 3.12.0 |
 | hatch | 1.17.0 |
 | pipenv | 2026.5.2 |
+
+<sub>Generated 2026-06-18 23:39:10 UTC from revision `59c3251`.</sub>

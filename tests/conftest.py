@@ -137,13 +137,16 @@ def _write_compat_doc(repo_root: Path, results: list[tuple[str, str, str]]) -> N
     lines = [
         "<!-- GENERATED \u2014 do not edit. Regenerate with `make compat`. -->",
         "",
-        "# Client Compatibility",
+        "# Client compatibility",
         "",
-        "Every populated cell is backed by an integration test that runs the real "
-        "client binary against a real pypiron server.",
+        "Every major Python packaging tool works with pypiron. This matrix shows "
+        "which workflows are verified for each client \u2014 every \u2705 is backed by "
+        "an integration test that runs the real client binary against a real "
+        "pypiron server.",
         "",
-        f"Generated: {generated_at}",
-        f"Revision: `{revision}`",
+        "All listed clients install packages, and the ones that publish can "
+        "upload; the advanced columns vary by what each tool implements. Check "
+        "yours before you deploy.",
         "",
         "| Client | " + " | ".join(COMPAT_FEATURES) + " |",
         "| --- | " + " | ".join("---" for _ in COMPAT_FEATURES) + " |",
@@ -156,17 +159,30 @@ def _write_compat_doc(repo_root: Path, results: list[tuple[str, str, str]]) -> N
     lines.extend(
         [
             "",
-            "Legend: \u274c known incompatibility / failing, \u2705 verified, "
-            "? not verified in this run, \u2014 not tested / not applicable.",
+            "Legend: \u2705 verified, \u274c known incompatibility, ? not verified "
+            "in this run, \u2014 not tested or not applicable.",
             "",
-            "## Client Versions",
+            "What the columns mean:",
             "",
-            "| Client | Version source |",
+            "- **upload** \u2014 publish a distribution to the server.",
+            "- **install** \u2014 install a package from the server.",
+            "- **resolve** \u2014 resolve dependencies against the server's index.",
+            "- **pep658-metadata** \u2014 read a file's metadata without downloading "
+            "the whole wheel, for faster resolves.",
+            "- **yank** \u2014 honor yanked releases, skipping withdrawn versions.",
+            "- **hash-check** \u2014 verify downloads against expected hashes.",
+            "- **exclude-newer** \u2014 ignore releases newer than a chosen date.",
+            "",
+            "## Client versions",
+            "",
+            "| Client | Tested version |",
             "| --- | --- |",
         ]
     )
     for client in COMPAT_CLIENTS:
         lines.append(f"| {client} | {_client_version_label(CLIENT_PINS[client])} |")
+
+    lines.extend(["", f"<sub>Generated {generated_at} from revision `{revision}`.</sub>"])
 
     doc_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

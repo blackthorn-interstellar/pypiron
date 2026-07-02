@@ -72,15 +72,15 @@ nav:
   - Guides:
       - Deploy: guides/deploy.md
       - Air-gapped mirror: guides/air-gapped-mirror.md
-  - Concepts:
-      - How it works: concepts/how-it-works.md
+  - Features:
       - Storage backends: concepts/storage.md
       - Authentication: concepts/authentication.md
-      - Mirroring & proxying: concepts/mirroring.md
+      - Mirroring: concepts/mirroring.md
       - Supply-chain defense: concepts/supply-chain.md
       - Artifact delivery: concepts/artifact-delivery.md
       - Download statistics: concepts/download-stats.md
   - Reference:
+      - How it works: concepts/how-it-works.md
       - CLI: reference/cli.md
       - Configuration: reference/configuration.md
       - Management API: reference/api.md

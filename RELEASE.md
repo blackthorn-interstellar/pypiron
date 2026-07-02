@@ -9,13 +9,19 @@ version-bump commit.
 ## Make a release
 
 ```bash
+make release-notes TO=HEAD
 git tag v0.2.0
 git push origin v0.2.0
 ```
 
-That's it. CI runs fmt/clippy/tests, builds wheels for all platforms plus the
-sdist, generates build-provenance attestations, and publishes to PyPI via
-trusted publishing. Nothing is published if the tests fail.
+That's it. The `make release-notes` step previews the GitHub Release body from
+the commits since the last `vX.Y.Z` tag; CI regenerates the same notes from the
+tag and uploads them with the Release. There is no checked-in changelog and no
+version-bump commit.
+
+CI runs fmt/clippy/tests, builds wheels for all platforms plus the sdist,
+generates build-provenance attestations, and publishes to PyPI via trusted
+publishing. Nothing is published if the tests fail.
 
 The same per-target builds double as standalone binaries: CI pulls the compiled
 executable out of each wheel (no second compile), and the `release-binaries` job

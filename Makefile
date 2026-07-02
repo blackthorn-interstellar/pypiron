@@ -1,4 +1,4 @@
-.PHONY: init init-rust init-python build dev run test test-rust test-python perf compat check cargo-check af fmt lint clean doc docs docs-serve build-wheel fuzz fuzz-build help
+.PHONY: init init-rust init-python build dev run test test-rust test-python perf compat check cargo-check af fmt lint clean doc docs docs-serve build-wheel release-notes fuzz fuzz-build help
 
 SHELL := /bin/bash
 
@@ -77,6 +77,10 @@ build-wheel:  ## Build Python wheel (local smoke-testing; releases happen in CI 
 	trap 'mv -f README.md.orig README.md' EXIT; \
 	uv run -- python scripts/transform_readme.py --target pypi && \
 	uv run -- maturin build --release
+
+TO ?= HEAD
+release-notes:  ## Preview release notes (TO=HEAD, optional FROM=vX.Y.Z TAG=vX.Y.Z)
+	@uv run -- python scripts/release_notes.py $(if $(FROM),--from $(FROM),) --to $(TO) $(if $(TAG),--tag $(TAG),)
 
 # Coverage-guided fuzzing of the input-parsing modules (needs nightly +
 # `cargo install cargo-fuzz`). TARGET=fuzz_names|fuzz_wheel|fuzz_wheelzip|fuzz_render|

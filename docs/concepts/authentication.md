@@ -96,6 +96,53 @@ tag — the `+tag` suffix is attribution, not identity.
 Per-project download and traffic accounting without minting a credential per
 team. See [Download statistics](download-stats.md).
 
+## Install tokens
+
+A single shared password copied into every CI job is one leak away from a long
+outage. Install tokens fix that without a user database: a client trades a
+credential for a **short-lived (5-minute) token** and uses that for the install,
+so a leaked CI log exposes a token that's already dead — not the durable
+password.
+
+Turn it on with a signing key (any node, identical everywhere):
+
+```bash
+pypiron serve --read-pass secret --token-signing-key "$(openssl rand -hex 32)"
+```
+
+Then mint a token and install with it. `create-token` auto-detects the repo,
+commit, and user and stamps them onto the token for attribution:
+
+```bash
+export UV_INDEX_COMPANY_USERNAME=__token__
+export UV_INDEX_COMPANY_PASSWORD=$(pypiron create-token --url http://localhost:8080 --auth reader:secret)
+uv add acme-widgets
+```
+
+The token is presented as the password under the conventional username
+`__token__` (the same convention PyPI uses), so any client speaks it with no
+special setup.
+
+**A token can never out-rank the credential that minted it.** The default role
+is `reader`; minting an `uploader` or `admin` token requires presenting an
+uploader or admin credential. On an open (public-read) server, a reader token
+needs no credential at all.
+
+The token is **stateless** — the server signs it (HMAC) and the 5-minute expiry
+lives inside it, so nothing is written to disk and there's nothing to clean up.
+That's also the one trade-off: a token can't be revoked before it expires, which
+the short lifetime makes a non-issue. Because verification is just a signature
+check, the signing key must be the same on every node, exactly like the other
+credentials.
+
+Under the hood, `create-token` is a thin client for `POST /tokens`:
+
+```bash
+curl -u reader:secret -X POST http://localhost:8080/tokens \
+  -d '{"role":"reader","repo":"github.com/acme/widgets","commit":"abc1234"}'
+# → {"token":"pypiron-…","username":"__token__","role":"reader","expires_in":300,…}
+```
+
 ## Privileged operations
 
 Delete, yank, and project status are admin-only, on the same endpoints as the

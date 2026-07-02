@@ -1,7 +1,7 @@
 # CLI
 
-Five commands: run a server, mirror packages, verify and rebuild indexes, and
-check health.
+Six commands: run a server, mirror packages, verify and rebuild indexes,
+check health, and mint an install token.
 
 ```bash
 pypiron serve          # run the server
@@ -9,6 +9,7 @@ pypiron sync           # mirror packages into a server over HTTP
 pypiron verify-index   # check that served indexes match the stored files (read-only)
 pypiron rebuild-index  # rebuild every index from the stored files, unconditionally
 pypiron healthcheck    # probe a running server's /health (exit 0/1)
+pypiron create-token   # mint a short-lived install token from a running server
 ```
 
 Every `--flag` has a matching `PYPIRON_*` environment variable. Values layer
@@ -163,6 +164,25 @@ With no `--url` it derives the port from `PYPIRON_BIND_ADDR` (the same knob
 `serve` reads, default 8080) and always probes loopback, so the baked-in
 container check follows a port override without being edited. Override the whole
 URL with `--url` / `PYPIRON_HEALTHCHECK_URL`.
+
+## create-token
+
+Mint a short-lived (5-minute) install token from a running server — a credential
+you can hand to a CI step without spreading the durable password. Requires the
+server to be started with `--token-signing-key`.
+
+```bash
+# Prints the token to stdout (notes go to stderr), so it pipes cleanly:
+export UV_INDEX_COMPANY_USERNAME=__token__
+export UV_INDEX_COMPANY_PASSWORD=$(pypiron create-token --url http://localhost:8080 --auth reader:secret)
+```
+
+`--url` / `PYPIRON_URL` points at the server; `--auth user:pass` / `PYPIRON_AUTH`
+is the credential to mint against (omit on an open server for a reader token).
+The repo, commit, and user are auto-detected from the working tree for
+attribution — override any with `--repo` / `--commit` / `--user`, or raise the
+tier with `--role` (capped at what `--auth` grants). Full flow:
+[Authentication](../concepts/authentication.md#install-tokens).
 
 ## Global flags
 

@@ -13,7 +13,7 @@ use axum::{
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
@@ -41,6 +41,7 @@ mod simple;
 mod status;
 mod storage;
 mod sync;
+mod token;
 mod upload;
 mod verify;
 mod web;
@@ -148,6 +149,42 @@ enum Commands {
     /// Self-contained — no `curl`/`wget` — so the slim container image can use it
     /// as its `HEALTHCHECK` and orchestrators can reuse it as a liveness probe.
     Healthcheck(HealthcheckArgs),
+    /// Mint a short-lived (5-minute) install token from a running server,
+    /// stamped with auto-detected repo/commit/user for attribution.
+    ///
+    /// Prints the token to stdout (everything else to stderr), so it pipes:
+    /// `export UV_INDEX_PYPIRON_PASSWORD=$(pypiron create-token --url …)` with
+    /// username `__token__`. Default role is reader.
+    CreateToken(CreateTokenArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct CreateTokenArgs {
+    /// Server base URL, e.g. `http://localhost:8080`.
+    #[arg(long, env = "PYPIRON_URL")]
+    url: String,
+
+    /// Role to request: `reader` (default), `uploader`, or `admin`. Cannot
+    /// exceed what `--auth` grants.
+    #[arg(long, default_value = "reader")]
+    role: String,
+
+    /// Credential to authenticate the mint request, as `user:pass`. Omit on an
+    /// open (public-read) server when requesting a reader token.
+    #[arg(long, env = "PYPIRON_AUTH")]
+    auth: Option<String>,
+
+    /// Override the auto-detected repository URL (`git remote get-url origin`).
+    #[arg(long)]
+    repo: Option<String>,
+
+    /// Override the auto-detected commit (`git rev-parse --short HEAD`).
+    #[arg(long)]
+    commit: Option<String>,
+
+    /// Override the auto-detected user (`$USER`, else `id -un`).
+    #[arg(long)]
+    user: Option<String>,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -206,6 +243,83 @@ async fn run_healthcheck(args: HealthcheckArgs) -> Result<()> {
     } else {
         anyhow::bail!("health probe {url} returned HTTP {}", status.as_u16());
     }
+}
+
+/// Run a command and return its trimmed stdout, or None on any failure (missing
+/// binary, nonzero exit, empty output) — auto-detection is best-effort.
+fn run_trimmed(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Best-effort current user: `$USER`/`$LOGNAME`, falling back to `id -un`.
+fn detect_user() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("LOGNAME").ok())
+        .filter(|s| !s.is_empty())
+        .or_else(|| run_trimmed("id", &["-un"]))
+}
+
+/// Mint a token from a running server and print it to stdout. Repo/commit/user
+/// are auto-detected from the working tree unless overridden; the actual
+/// gather-vs-route decision lives server-side, so we just submit what we find.
+async fn run_create_token(args: CreateTokenArgs) -> Result<()> {
+    let repo = args
+        .repo
+        .or_else(|| run_trimmed("git", &["remote", "get-url", "origin"]));
+    let commit = args
+        .commit
+        .or_else(|| run_trimmed("git", &["rev-parse", "--short", "HEAD"]));
+    let user = args.user.or_else(detect_user);
+
+    let url = format!("{}/tokens", args.url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "role": args.role,
+        "repo": repo,
+        "commit": commit,
+        "user": user,
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("building token client")?;
+    let mut request = client.post(&url).json(&body);
+    if let Some(auth) = args.auth.as_deref() {
+        let (u, p) = auth.split_once(':').unwrap_or((auth, ""));
+        request = request.basic_auth(u, Some(p));
+    }
+    let resp = request
+        .send()
+        .await
+        .with_context(|| format!("requesting a token from {url}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "token request failed (HTTP {}): {}",
+            status.as_u16(),
+            text.trim()
+        );
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).context("parsing token response")?;
+    let token = parsed
+        .get("token")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow!("token response missing `token` field"))?;
+    if let Some(exp) = parsed.get("expires_at").and_then(|t| t.as_str()) {
+        eprintln!(
+            "minted {} token (expires {exp}); install with username __token__",
+            args.role
+        );
+    }
+    println!("{token}");
+    Ok(())
 }
 
 /// Point a maintenance command (verify-index, rebuild-index) at the same
@@ -470,6 +584,14 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_READ_PASS")]
     read_pass: Option<String>,
 
+    /// Secret key for signing short-lived install tokens. When set, clients may
+    /// `POST /tokens` to mint a 5-minute bearer token (presented as basic-auth
+    /// username `__token__`); when unset, token minting and verification are
+    /// disabled. Tokens are stateless — the key must be identical across nodes,
+    /// like the other credentials. Generate with e.g. `openssl rand -hex 32`.
+    #[arg(long, env = "PYPIRON_TOKEN_SIGNING_KEY")]
+    token_signing_key: Option<String>,
+
     /// Serve unknown (non-private) packages on demand from this upstream
     /// simple index (e.g. https://pypi.org): package pages are answered from
     /// upstream metadata and artifacts are downloaded, verified, and cached
@@ -505,6 +627,9 @@ struct AppState {
     // (or any stronger credential).
     read_user: Option<String>,
     read_pass: Option<String>,
+    /// Secret for signing/verifying stateless install tokens. None disables
+    /// token auth entirely (mint endpoint refuses, `__token__` never verifies).
+    token_signing_key: Option<String>,
     private_prefix: Option<String>,
     artifact_delivery: ArtifactDelivery,
     /// Widen the access log from mutations-only (the default) to every request.
@@ -656,6 +781,7 @@ async fn main() -> Result<()> {
             run_serve(*args, config_path, serve_matches, cli.log_format).await
         }
         Some(Commands::Healthcheck(args)) => run_healthcheck(args).await,
+        Some(Commands::CreateToken(args)) => run_create_token(args).await,
         None => {
             // A global flag (e.g. --log-format) but no subcommand: nothing to
             // run, so show help. Truly-bare `pypiron` never reaches here —
@@ -954,6 +1080,7 @@ async fn run_serve(
         admin_pass: cli.admin_pass,
         read_user: cli.read_user,
         read_pass: cli.read_pass,
+        token_signing_key: cli.token_signing_key,
         private_prefix,
         artifact_delivery: cli.artifact_delivery,
         access_log: cli.access_log,
@@ -1056,6 +1183,9 @@ async fn run_serve(
         // The human download leaderboard (read-auth gated in-handler).
         .route("/downloads", get(downloads_page))
         .route("/downloads/", get(downloads_page))
+        // Mint a short-lived install token (gated in-handler: requires a signing
+        // key and a credential that already grants the requested role).
+        .route("/tokens", post(mint_token))
         // Operational endpoints: deliberately outside read auth — load
         // balancers and Prometheus scrapers don't carry package credentials.
         .route("/health", get(health))
@@ -3288,6 +3418,7 @@ impl AppState {
             admin_pass: None,
             read_user: None,
             read_pass: None,
+            token_signing_key: None,
             private_prefix: None,
             artifact_delivery: ArtifactDelivery::Auto,
             access_log: false,
@@ -3337,10 +3468,27 @@ impl AppState {
         self.uploader_credential().is_none() && self.admin_credential().is_none()
     }
 
+    /// The role granted by a valid `__token__` bearer token, if token auth is
+    /// configured and the presented token verifies and is unexpired. Returns
+    /// None otherwise (no key, not a token request, bad/expired token) — fail
+    /// closed. The `+tag` overlay is ignored here (`__token__+commit=…` still
+    /// resolves to token mode); the token itself carries its attribution.
+    fn token_role(&self, headers: &HeaderMap) -> Option<token::Role> {
+        let key = nonempty(self.token_signing_key.as_deref())?;
+        let (user, pass) = basic_credentials(headers)?;
+        let base = user.split_once('+').map_or(user.as_str(), |(b, _)| b);
+        if base != token::TOKEN_USERNAME {
+            return None;
+        }
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        token::verify(key, &pass, now).map(|c| c.role)
+    }
+
     /// Does the request authenticate as admin?
     fn is_admin(&self, headers: &HeaderMap) -> bool {
         self.admin_credential()
             .is_some_and(|(u, p)| check_basic_auth(headers, u, p).is_ok())
+            || self.token_role(headers) == Some(token::Role::Admin)
     }
 
     /// May the request publish? Admin ⊇ uploader.
@@ -3349,15 +3497,20 @@ impl AppState {
             || self
                 .uploader_credential()
                 .is_some_and(|(u, p)| check_basic_auth(headers, u, p).is_ok())
+            || self.token_role(headers) >= Some(token::Role::Uploader)
     }
 
     /// May the request read indexes and artifacts? Public unless a read
-    /// credential is configured; any stronger credential also reads
-    /// (admin ⊇ uploader ⊇ reader).
+    /// credential is configured; any stronger credential (or any valid token)
+    /// also reads (admin ⊇ uploader ⊇ reader).
     fn is_reader(&self, headers: &HeaderMap) -> bool {
         match self.read_credential() {
             None => true,
-            Some((u, p)) => check_basic_auth(headers, u, p).is_ok() || self.is_uploader(headers),
+            Some((u, p)) => {
+                check_basic_auth(headers, u, p).is_ok()
+                    || self.is_uploader(headers)
+                    || self.token_role(headers).is_some()
+            }
         }
     }
 }
@@ -3431,6 +3584,114 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCod
     } else {
         (StatusCode::UNAUTHORIZED, "Admin credential required".into())
     })
+}
+
+/// How long a minted install token is valid. Deliberately short: tokens are
+/// single-session, basically single-use, so a leaked one is dead within
+/// minutes — which is also why they need no revocation list (and no storage).
+const TOKEN_TTL_SECS: i64 = 300;
+
+/// Hold a gathered attribution value to something sane before it is signed into
+/// a token: trim, drop control chars (so it can't later forge a log line), cap
+/// length, and treat empty as absent. Charset is otherwise unrestricted — what
+/// we gather is independent of where it is later routed.
+fn clip_meta(value: Option<String>) -> Option<String> {
+    let v: String = value?
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(256)
+        .collect();
+    (!v.is_empty()).then_some(v)
+}
+
+#[derive(serde::Deserialize, Default)]
+struct MintRequest {
+    /// Requested role; defaults to `reader`. Cannot exceed what the presented
+    /// credential already grants.
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct MintResponse {
+    token: String,
+    username: &'static str,
+    role: &'static str,
+    expires_in: i64,
+    expires_at: String,
+}
+
+/// Mint a short-lived install token. Fail-closed: token auth must be configured
+/// (a signing key), and the presenting credential must already grant the
+/// requested role — a token can never escalate beyond the credential that
+/// minted it. On an open (public-read) server, a reader token needs no
+/// credential, since reader access is already public.
+async fn mint_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let key = nonempty(state.token_signing_key.as_deref()).ok_or((
+        StatusCode::FORBIDDEN,
+        "token minting is disabled (no --token-signing-key configured)".to_string(),
+    ))?;
+    let req: MintRequest = if body.trim().is_empty() {
+        MintRequest::default()
+    } else {
+        serde_json::from_str(&body)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))?
+    };
+    let role = match req.role.as_deref() {
+        None => token::Role::Reader,
+        Some(r) => {
+            token::Role::parse(r).ok_or((StatusCode::BAD_REQUEST, format!("unknown role: {r}")))?
+        }
+    };
+    let granted = match role {
+        token::Role::Reader => state.is_reader(&headers),
+        token::Role::Uploader => state.is_uploader(&headers),
+        token::Role::Admin => state.is_admin(&headers),
+    };
+    if !granted {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!("the supplied credential does not grant {role} (cannot mint a {role} token)"),
+        ));
+    }
+
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let claims = token::Claims {
+        role,
+        repo: clip_meta(req.repo),
+        commit: clip_meta(req.commit),
+        user: clip_meta(req.user),
+        iat: now,
+        exp: now + TOKEN_TTL_SECS,
+    };
+    let token = token::mint(key, &claims).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("minting token: {e}"),
+        )
+    })?;
+    let expires_at = OffsetDateTime::from_unix_timestamp(claims.exp)
+        .ok()
+        .and_then(|t| t.format(&Rfc3339).ok())
+        .unwrap_or_default();
+    Ok(Json(MintResponse {
+        token,
+        username: token::TOKEN_USERNAME,
+        role: role.as_str(),
+        expires_in: TOKEN_TTL_SECS,
+        expires_at,
+    }))
 }
 
 /// Length-independent constant-time byte equality, so credential checks don't

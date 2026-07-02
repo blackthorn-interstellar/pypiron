@@ -76,6 +76,7 @@ stream.
 | `--admin-pass`               | `PYPIRON_ADMIN_PASS`               | *(none)*       | Admin credential password (enables admin)        |
 | `--read-user`                | `PYPIRON_READ_USER`                | *(none)*       | Read credential — when set, reads require auth   |
 | `--read-pass`                | `PYPIRON_READ_PASS`                | *(none)*       | Read credential password                         |
+| `--token-signing-key`        | `PYPIRON_TOKEN_SIGNING_KEY`        | *(none)*       | Secret that signs short-lived install tokens; enables `POST /tokens` and `__token__` auth (see below) |
 | `--private-prefix`           | `PYPIRON_PRIVATE_PREFIX`           | *(none)*       | Reserve a namespace for private uploads          |
 | `--proxy-upstream`           | `PYPIRON_PROXY_UPSTREAM`           | *(none)*       | On-demand mirror of this upstream simple index (plus mirror-selection flags, see below) |
 | `--spool-dir`                | `PYPIRON_SPOOL_DIR`                | system temp    | Upload/proxy spool directory — real disk, not tmpfs |
@@ -183,6 +184,25 @@ Works on open servers too: with no read credential, any volunteered username is
 parsed for attribution and the password ignored. Tag cardinality in `/metrics`
 is capped (overflow lands in `_overflow`); tags are restricted to
 `[A-Za-z0-9._-]`, max 64 chars.
+
+### Install tokens
+
+Set `--token-signing-key` and a client can trade a credential for a short-lived
+(5-minute) install token instead of spreading the durable password across every
+CI step. The token is presented as basic-auth username `__token__`; its role
+never exceeds the credential that minted it (default `reader`).
+
+```bash
+# Mint from CI (auto-detects repo/commit/user), then install with it:
+export UV_INDEX_COMPANY_USERNAME=__token__
+export UV_INDEX_COMPANY_PASSWORD=$(pypiron create-token --url http://pypiron:8080 --auth reader:secret)
+uv sync
+```
+
+Tokens are stateless and self-expiring — nothing is stored, so the signing key
+must be identical on every node (like the other credentials). Generate one with
+`openssl rand -hex 32`. Full flow and the `POST /tokens` shape:
+[Authentication](../concepts/authentication.md#install-tokens).
 
 ## Sync (mirror over HTTP)
 

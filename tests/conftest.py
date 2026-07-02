@@ -394,6 +394,26 @@ def disk_server_read_auth(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]
 
 
 @pytest.fixture()
+def disk_server_token_auth(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Read-gated disk server that also signs short-lived install tokens."""
+    for server in _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=[
+            "--read-user",
+            "reader",
+            "--read-pass",
+            "readersecret",
+            "--token-signing-key",
+            "test-signing-key-0123456789abcdef",
+        ],
+    ):
+        server["read_user"] = "reader"
+        server["read_password"] = "readersecret"
+        yield server
+
+
+@pytest.fixture()
 def disk_server_admin_pass_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Disk server given only `--admin-pass`: the username defaults to `admin`."""
     data_dir = tmp_path_factory.mktemp("pypiron-admin-pass-only")

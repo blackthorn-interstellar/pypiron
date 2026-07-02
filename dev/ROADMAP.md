@@ -32,6 +32,7 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 - Origin exclusivity — every package `private` or `mirror`, claimed at first write; collisions rejected (dependency-confusion defense).
 - `--private-prefix` reserved namespace (normalized-name matching).
 - Three-tier basic auth (admin ⊇ uploader ⊇ reader); read-only by default when no write credential is set.
+- Stateless install tokens (`--token-signing-key`): `POST /tokens` (or `pypiron create-token`) mints a short-lived (5 min) HMAC-signed bearer token presented as `__token__`, capped at the minting credential's role, carrying auto-detected repo/commit/user for attribution. Self-expiring, nothing stored — distinct from the durable *Scoped API tokens* item below.
 
 **Operations & management**
 - `/health`, Prometheus `/metrics`, `--log-format json`, per-project traffic attribution via username subaddressing.
@@ -49,13 +50,14 @@ Tracked so they don't get lost. Not commitments — bucketed by intent.
 
 ### Maybe
 
-**Scoped API tokens.** One uploader and one admin credential means a single
-shared secret across every CI job and developer. Per-service tokens (rotate one
-without touching others) are the most commonly cited reason teams reach for
-devpi or Artifactory instead. Stays no-DB if we do it: token = random secret,
+**Scoped API tokens (durable).** Stateless install tokens (Shipped) cover the
+ephemeral CI case but can't be revoked before they expire and carry no
+per-package scope. The durable variant: a long-lived token = random secret,
 server stores a hash + scope in a file (`_tokens/<token-id>.json`), works as
-basic auth (`__token__` / `pypi-...`). Per-package "ownership" is this feature —
-a token scoped to `foo` *is* the ownership record.
+basic auth (`__token__` / `pypi-...`); rotate or revoke one without touching
+others. Per-package "ownership" is this feature — a token scoped to `foo` *is*
+the ownership record. Needs the one machinery the ephemeral tokens avoid: a
+leader-swept `_tokens/` prefix (mirror the `_counters/` retention sweep).
 
 **Explicit `--read-only` flag.** No credentials already means read-only. The
 remaining case is a credentialed deployment that wants serve-only replicas: a

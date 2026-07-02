@@ -50,12 +50,25 @@ pip, twine, and poetry equivalents: <https://pypiron.com/#quickstart>.
 - [Configuration](docs/reference/configuration.md) — every flag and its `PYPIRON_*` env var
 - [Benchmarks](docs/reference/benchmarks.md) — how the numbers above were measured
 
-## Alternatives
+## Comparison
 
-[bandersnatch](https://github.com/pypa/bandersnatch),
+Hover a checkmark for the caveat where your Markdown renderer supports it.
+
+| Feature | pypiron | bandersnatch | pypiserver | pypicloud | devpi | proxpi |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: |
+| Easy setup | <abbr title="Single binary, uvx, or Docker; hosts private packages, mirror sync, and proxy from one server.">✅</abbr> | — | <abbr title="Simple private package host over a local directory.">✅</abbr> | — | — | <abbr title="Simple caching proxy; no private uploads.">✅</abbr> |
+| Fast | <abbr title="3,026 real installs/s on 2 vCPU in the benchmark.">✅</abbr> | <abbr title="574 installs/s as a static nginx-served mirror.">✅</abbr> | — | — | — | — |
+| Scalable without database | <abbr title="Multi-node against S3, GCS, or Azure Blob; no database.">✅</abbr> | <abbr title="Static mirror tree served by nginx or object storage; no database.">✅</abbr> | — | — | — | — |
+| Nice human-readable pages | <abbr title="Dashboard, package search, download pages, project pages, and README rendering.">✅</abbr> | — | — | <abbr title="Has a web UI.">✅</abbr> | <abbr title="Has a web UI and README rendering.">✅</abbr> | <abbr title="Has a web UI.">✅</abbr> |
+| Download stats | <abbr title="Built-in global and per-package download counters.">✅</abbr> | — | — | — | — | — |
+| Disk-backed | <abbr title="Default local disk backend.">✅</abbr> | <abbr title="Writes a static mirror tree to disk.">✅</abbr> | <abbr title="Serves packages from local directories.">✅</abbr> | <abbr title="Supports filesystem package storage.">✅</abbr> | <abbr title="Default serverdir storage on local disk.">✅</abbr> | <abbr title="Disk-backed package cache.">✅</abbr> |
+| Cloud-storage-backed | <abbr title="S3, S3-compatible, GCS, and Azure Blob.">✅</abbr> | <abbr title="S3-compatible mirror storage.">✅</abbr> | — | <abbr title="S3, GCS, and Azure Blob package storage.">✅</abbr> | — | — |
+| Supports `exclude-newer` | <abbr title="Default 7-day holdback for proxy and sync; also preserves upload time for client-side cutoffs.">✅</abbr> | <abbr title="Mirror-time filtering for static mirrors.">✅</abbr> | — | — | — | — |
+
+Compared with [bandersnatch](https://github.com/pypa/bandersnatch),
 [pypiserver](https://github.com/pypiserver/pypiserver),
 [pypicloud](https://github.com/stevearc/pypicloud),
-[devpi](https://www.devpi.net/),
+[devpi](https://www.devpi.net/), and
 [proxpi](https://github.com/EpicWink/proxpi).
 
 ## License

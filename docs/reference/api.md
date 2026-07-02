@@ -62,6 +62,11 @@ target it; you don't call it by hand. Requires uploader (or admin) auth. See the
 
 ## Stats
 
+!!! warning "Beta"
+
+    Download statistics are new; the `/stats/` endpoints and JSON shapes may
+    still change.
+
 Per-package and global download counts at `GET /stats/downloads/<pkg>` and
 `GET /stats/downloads`, gated by read auth (public when no read credential is
 set), on by default (`--download-stats`). Full reference, JSON shapes, accuracy

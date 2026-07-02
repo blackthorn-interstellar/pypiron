@@ -76,7 +76,7 @@ stream.
 | `--admin-pass`               | `PYPIRON_ADMIN_PASS`               | *(none)*       | Admin credential password (enables admin)        |
 | `--read-user`                | `PYPIRON_READ_USER`                | *(none)*       | Read credential — when set, reads require auth   |
 | `--read-pass`                | `PYPIRON_READ_PASS`                | *(none)*       | Read credential password                         |
-| `--token-signing-key`        | `PYPIRON_TOKEN_SIGNING_KEY`        | *(none)*       | Secret that signs short-lived install tokens; enables `POST /tokens` and `__token__` auth (see below) |
+| `--token-signing-key`        | `PYPIRON_TOKEN_SIGNING_KEY`        | *(none)*       | **(beta)** Secret that signs short-lived install tokens; enables `POST /tokens` and `__token__` auth (see below) |
 | `--private-prefix`           | `PYPIRON_PRIVATE_PREFIX`           | *(none)*       | Reserve a namespace for private uploads          |
 | `--proxy-upstream`           | `PYPIRON_PROXY_UPSTREAM`           | *(none)*       | On-demand mirror of this upstream simple index (plus mirror-selection flags, see below) |
 | `--spool-dir`                | `PYPIRON_SPOOL_DIR`                | system temp    | Upload/proxy spool directory — real disk, not tmpfs |
@@ -91,7 +91,7 @@ stream.
 | `--artifact-delivery`        | `PYPIRON_ARTIFACT_DELIVERY`        | `auto`         | How artifact bytes reach clients (see below)     |
 | `--wait-on-upload`           | `PYPIRON_WAIT_ON_UPLOAD`           | `false`        | Wait for index visibility before returning 200   |
 | `--wait-on-upload-secs`      | `PYPIRON_WAIT_ON_UPLOAD_SECS`      | `10`           | Bound on the wait-on-upload poll                 |
-| `--download-stats`           | `PYPIRON_DOWNLOAD_STATS`           | `true`         | Count per-package/version downloads per day (see below) |
+| `--download-stats`           | `PYPIRON_DOWNLOAD_STATS`           | `true`         | **(beta)** Count per-package/version downloads per day (see below) |
 | `--counters-resolution`      | `PYPIRON_COUNTERS_RESOLUTION`      | `1d`           | Counter bucket width: `1d`/`1h`/`30m`/`2h` (whole minutes dividing a day) |
 | `--counters-flush-interval-secs`  | `PYPIRON_COUNTERS_FLUSH_INTERVAL_SECS`  | `300` | How often each node flushes counts (the dominant cost knob) |
 | `--counters-rollup-interval-secs` | `PYPIRON_COUNTERS_ROLLUP_INTERVAL_SECS` | `3600` | How often finished days are compacted and old history pruned |
@@ -129,6 +129,11 @@ Two renderings, via `--access-log-format`:
   `RUST_LOG=warn` for a near-pure access stream (CLF parsers skip the rest).
 
 ### Download counters
+
+!!! warning "Beta"
+
+    Download statistics are new; the `/stats/` endpoints and stored counter
+    format may still change.
 
 `--download-stats` (on by default) counts artifact downloads per package and
 version, served at `GET /stats/downloads/<pkg>` and `GET /stats/downloads` (both
@@ -186,6 +191,11 @@ is capped (overflow lands in `_overflow`); tags are restricted to
 `[A-Za-z0-9._-]`, max 64 chars.
 
 ### Install tokens
+
+!!! warning "Beta"
+
+    Install tokens are new; the token format and `POST /tokens` shape may still
+    change.
 
 Set `--token-signing-key` and a client can trade a credential for a short-lived
 (5-minute) install token instead of spreading the durable password across every

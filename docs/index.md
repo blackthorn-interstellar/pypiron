@@ -13,7 +13,7 @@ pypiron aims to be the fastest, most reliable PyPI server (and mirror) available
 - **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
 - **Scales to a fleet.** Point any number of nodes at one bucket. No coordination.
 - **Works with everything.** uv, pip, poetry, pdm, twine, pipenv, hatch, flit.
-- **Download stats built in.** ([details](concepts/download-stats.md))
+- **Download stats built in** (beta). ([details](concepts/download-stats.md))
 
 ## Quickstart
 

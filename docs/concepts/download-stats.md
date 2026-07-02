@@ -5,6 +5,11 @@ every download and rolls it up by version: spot what's heavily used, what's gone
 stale, who's pulling what. On by default; turn it off with `--download-stats
 false`.
 
+!!! warning "Beta"
+
+    Download statistics are new. The `/stats/` endpoints, JSON shapes, and
+    stored counter format may still change.
+
 The counts are an analytic, not an audit log: a hard crash can lose recent
 downloads, but completed days are exact (see [Accuracy](#accuracy-and-freshness)).
 

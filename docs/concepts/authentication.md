@@ -98,6 +98,11 @@ team. See [Download statistics](download-stats.md).
 
 ## Install tokens
 
+!!! warning "Beta"
+
+    Install tokens are new. The token format, attribution metadata, and the
+    `POST /tokens` shape may still change.
+
 A single shared password copied into every CI job is one leak away from a long
 outage. Install tokens fix that without a user database: a client trades a
 credential for a **short-lived (5-minute) token** and uses that for the install,

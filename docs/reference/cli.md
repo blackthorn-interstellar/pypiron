@@ -167,6 +167,11 @@ URL with `--url` / `PYPIRON_HEALTHCHECK_URL`.
 
 ## create-token
 
+!!! warning "Beta"
+
+    Install tokens are new; the token format and `POST /tokens` shape may still
+    change.
+
 Mint a short-lived (5-minute) install token from a running server — a credential
 you can hand to a CI step without spreading the durable password. Requires the
 server to be started with `--token-signing-key`.

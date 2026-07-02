@@ -105,7 +105,7 @@ Serves `http://localhost:8080`:
 <div class="grid cards" markdown>
 
 - :material-lightbulb: __How it works__ — why it's fast ([How it works](concepts/how-it-works.md))
-- :material-server-network: __Deploy__ — production setups ([Deploy](guides/deploy.md))
+- :material-server-network: __Setup__ — production setups ([Setup](guides/setup.md))
 - :material-cog: __Configuration__ — every flag ([Configuration](reference/configuration.md))
 
 </div>

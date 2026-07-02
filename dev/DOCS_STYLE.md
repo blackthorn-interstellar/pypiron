@@ -121,7 +121,7 @@ everywhere else.
 | Fact | Owner | Everyone else |
 | --- | --- | --- |
 | Start / publish / install loop | `index.md` | link, don't re-teach |
-| Storage backends + credentials | `concepts/storage.md` | `guides/deploy.md` shows the minimal "point at a bucket" + links |
+| Storage backends + credentials | `concepts/storage.md` | `guides/setup.md` shows the minimal "point at a bucket" + links |
 | Auth roles & model | `concepts/authentication.md` | `reference/configuration.md` lists the flags; others link |
 | Mirror reconcile / re-sync detail | `concepts/mirroring.md` | `guides/air-gapped-mirror.md` is task steps + links |
 | Download stats | `concepts/download-stats.md` | `reference/api.md` + `configuration.md` keep a one-liner + link |

@@ -2,7 +2,7 @@
 
 An ultra-fast Python package server, written in Rust.
 
-pypiron aims to be the fastest, most reliable PyPI server (and mirror) available.
+pypiron is the fastest, most reliable PyPI server (and mirror) available.
 
 ![Max sustained install throughput](assets/install-throughput.svg#only-light)
 ![Max sustained install throughput](assets/install-throughput-dark.svg#only-dark)

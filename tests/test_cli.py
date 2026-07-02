@@ -87,6 +87,44 @@ def test_verify_index_diverged_exits_1(pypiron_bin: Path, tmp_path: Path):
     assert "Error:" not in cp.stderr, cp.stderr
 
 
+# `config init` prints an annotated pypiron.toml to stdout. It is the guided
+# path to a first config: `pypiron config init > pypiron.toml`, then uncomment.
+
+
+def test_config_init_prints_annotated_template(pypiron_bin: Path):
+    """stdout carries every section header and a sampling of keys, all commented."""
+    cp = _run(pypiron_bin, "config", "init")
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    out = cp.stdout
+    for header in ("[serve]", "[mirror]", "[sync]"):
+        assert header in out, f"template missing {header!r}:\n{out}"
+    for key in ("bind-addr", "storage", "proxy-upstream", "include-packages", "to"):
+        assert f"# {key} = " in out, f"template missing commented `{key}`:\n{out}"
+    # Nothing is uncommented, so the emitted file is a no-op until edited.
+    assert "\nstorage = " not in out, "template should ship storage commented out"
+
+
+def test_config_init_output_loads_as_config(pypiron_bin: Path, tmp_path: Path):
+    """The emitted file is accepted by the real config loader end-to-end: write
+    it, then have `verify-index` load it via --config against an empty store
+    (converged → exit 0). Proves `config init` output is valid, not just pretty."""
+    cfg = tmp_path / "pypiron.toml"
+    cfg.write_text(_run(pypiron_bin, "config", "init").stdout)
+    store = tmp_path / "store"
+    store.mkdir()
+    cp = _run(
+        pypiron_bin,
+        "verify-index",
+        "--config",
+        str(cfg),
+        "--storage",
+        "disk",
+        "--data-dir",
+        str(store),
+    )
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+
+
 def test_serve_rejects_out_of_range_counter_knob(pypiron_bin: Path, tmp_path: Path):
     """An out-of-range counter knob fails closed at startup instead of silently
     clamping to 1 — a 0 retention would prune every finished day on the next

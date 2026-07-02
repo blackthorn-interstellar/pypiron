@@ -156,6 +156,22 @@ enum Commands {
     /// `export UV_INDEX_PYPIRON_PASSWORD=$(pypiron create-token --url …)` with
     /// username `__token__`. Default role is reader.
     CreateToken(CreateTokenArgs),
+    /// Work with pypiron.toml — currently just `config init`.
+    Config(ConfigArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Print an annotated pypiron.toml to stdout. Every knob is present,
+    /// commented out with its default, so you `> pypiron.toml` and uncomment
+    /// the lines you want.
+    Init,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -782,6 +798,14 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Healthcheck(args)) => run_healthcheck(args).await,
         Some(Commands::CreateToken(args)) => run_create_token(args).await,
+        Some(Commands::Config(args)) => match args.command {
+            // Pure stdout, no logging or config load — `config init > pypiron.toml`
+            // must emit only the template.
+            ConfigCommand::Init => {
+                print!("{}", config::TEMPLATE);
+                Ok(())
+            }
+        },
         None => {
             // A global flag (e.g. --log-format) but no subcommand: nothing to
             // run, so show help. Truly-bare `pypiron` never reaches here —

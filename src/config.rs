@@ -22,6 +22,13 @@ use tracing::info;
 
 pub const DEFAULT_CONFIG_PATH: &str = "pypiron.toml";
 
+/// The annotated starter config printed by `pypiron config init`. Every knob is
+/// present and commented out with its default, so the file doubles as the
+/// reference. When you add a field to any struct below, add its line here — the
+/// `annotated_template_uncomments_and_parses` test fails on a renamed or removed
+/// key, but a *newly added* one has to be documented by hand.
+pub const TEMPLATE: &str = include_str!("config_template.toml");
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ConfigFile {
@@ -262,6 +269,48 @@ mod tests {
             toml::from_str(include_str!("../examples/mirror/air-gapped.toml")).unwrap();
         assert_eq!(air.mirror.exclude_newer.as_deref(), Some(""));
         assert_eq!(air.mirror.include_yanked, Some(true));
+    }
+
+    #[test]
+    fn annotated_template_uncomments_and_parses() {
+        // Uncommenting every `# <key> = <value>` line must yield a config that
+        // still parses under deny_unknown_fields. A renamed or removed knob
+        // leaves a stale template line that this catches at build time.
+        let uncommented = TEMPLATE
+            .lines()
+            .map(|line| match line.strip_prefix("# ") {
+                Some(rest)
+                    if rest.split_once(" = ").is_some_and(|(k, _)| {
+                        !k.is_empty()
+                            && k.chars()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    }) =>
+                {
+                    rest.to_string()
+                }
+                _ => line.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let cfg: ConfigFile =
+            toml::from_str(&uncommented).expect("uncommented template must parse");
+
+        // Spot-check that documented defaults match the real ones and land in
+        // the right section.
+        assert_eq!(cfg.private_prefix.as_deref(), Some("acme"));
+        assert_eq!(cfg.serve.bind_addr.as_deref(), Some("0.0.0.0:8080"));
+        assert_eq!(cfg.serve.storage.as_deref(), Some("disk"));
+        assert_eq!(cfg.serve.artifact_delivery.as_deref(), Some("auto"));
+        assert_eq!(cfg.serve.counters_retention_days, Some(90));
+        assert_eq!(cfg.serve.s3_force_path_style, Some(false));
+        assert_eq!(cfg.mirror.exclude_newer.as_deref(), Some("7"));
+        assert_eq!(
+            cfg.mirror.include_format,
+            Some(vec!["wheel".to_string(), "sdist".to_string()])
+        );
+        assert_eq!(cfg.sync.to.as_deref(), Some("http://localhost:8080"));
+        assert_eq!(cfg.sync.concurrency, Some(4));
     }
 
     #[test]

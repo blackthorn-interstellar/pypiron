@@ -437,6 +437,13 @@ recipe turns *on* can't be turned off by a missing flag — there's no flag for
 
 ## The config file (`pypiron.toml`)
 
+Generate a starter file with every knob documented and commented out, then
+uncomment what you want:
+
+```bash
+pypiron config init > pypiron.toml
+```
+
 Every subcommand reads `pypiron.toml` — pass `--config <path>` (global,
 `PYPIRON_CONFIG`) or let it auto-discover as `./pypiron.toml` in the working
 directory. `serve` and `sync` use the whole file; the maintenance commands

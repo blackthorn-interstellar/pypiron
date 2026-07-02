@@ -1,7 +1,7 @@
 # CLI
 
-Six commands: run a server, mirror packages, verify and rebuild indexes,
-check health, and mint an install token.
+Seven commands: run a server, mirror packages, verify and rebuild indexes,
+check health, mint an install token, and print a starter config.
 
 ```bash
 pypiron serve          # run the server
@@ -10,6 +10,7 @@ pypiron verify-index   # check that served indexes match the stored files (read-
 pypiron rebuild-index  # rebuild every index from the stored files, unconditionally
 pypiron healthcheck    # probe a running server's /health (exit 0/1)
 pypiron create-token   # mint a short-lived install token from a running server
+pypiron config init    # print an annotated pypiron.toml to stdout
 ```
 
 Every `--flag` has a matching `PYPIRON_*` environment variable. Values layer
@@ -188,6 +189,22 @@ The repo, commit, and user are auto-detected from the working tree for
 attribution — override any with `--repo` / `--commit` / `--user`, or raise the
 tier with `--role` (capped at what `--auth` grants). Full flow:
 [Authentication](../concepts/authentication.md#install-tokens).
+
+## config init
+
+Print an annotated `pypiron.toml` to stdout — the guided way to a first config.
+Every knob is present, commented out, and shows its default, so you redirect it
+to a file and uncomment the lines you want:
+
+```bash
+pypiron config init > pypiron.toml
+```
+
+The emitted file is a no-op until you edit it: an untouched (all-commented) file
+matches the built-in defaults, and `serve`/`sync` auto-load `./pypiron.toml`.
+Secrets are deliberately absent — passwords, the token signing key, and the
+Azure access key come only from the CLI/env — so the file is safe to commit.
+Every key it lists is documented in [Configuration](configuration.md).
 
 ## Global flags
 

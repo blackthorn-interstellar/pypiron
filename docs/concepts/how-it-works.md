@@ -25,8 +25,8 @@ biggest cache is the client: uv and pip download a given wheel once, ever, and
 pypiron marks artifacts permanently cacheable since their bytes never change.
 Index pages revalidate cheaply, so an up-to-date client pays almost nothing.
 
-On cloud storage, pypiron hands the download straight to the bucket — the node
-never streams the wheel. See [Artifact delivery](artifact-delivery.md).
+On cloud storage, pypiron can hand the download straight to the bucket. The node
+serves the index; storage serves the wheel bytes.
 
 ## Add nodes without coordination
 
@@ -39,8 +39,7 @@ single-node; multiple nodes need cloud storage.)
 !!! note
     One URL and one namespace serve your private uploads, synced mirror
     packages, and on-demand proxied packages together. Each name is private or
-    public, never both. See [Mirroring](mirroring.md) and
-    [Add public PyPI](../guides/deploy.md#add-public-pypi).
+    public, never both. See [Add public PyPI](../guides/setup.md#add-public-pypi).
 
 The full storage layout — every path and metadata file — is in
 [DESIGN.md](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/DESIGN.md).

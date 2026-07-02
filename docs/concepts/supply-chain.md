@@ -12,15 +12,12 @@ releases, and tampered files. Each protection below answers one threat.
 
 ## Dependency confusion
 
-The attack (Birsan, 2021): you use a package name privately, an attacker
-publishes that same name — or a higher version — on public PyPI, and a resolver
-consulting both indexes pulls the attacker's copy.
+The trap: an internal package name also exists on public PyPI, and a resolver
+pulling from both indexes chooses the public copy.
 
 First defense: point clients at this one index. With uv use
-`--default-index`/`--index`; with pip use `--index-url`, never `--extra-index-url
-https://pypi.org/simple`. pip merges extra indexes by version with no priority —
-that merge *is* the vulnerability. The server, not the client, decides what
-exists.
+`--default-index`; with pip use `--index-url`, not `--extra-index-url
+https://pypi.org/simple`. Let the server decide what exists.
 
 pypiron enforces the rest: **each name is private or public, never both.** The
 first upload — a private push or a mirror sync — reserves the name for that
@@ -31,12 +28,8 @@ world. It stays reserved.
 - Collisions are hard errors, never merges — a package belongs to exactly one
   world, so its index never mixes private and upstream files.
 
-That reservation is durable. Deleting every file of a package does *not* release
-the name — otherwise a credentialed client could empty a mirror-owned public
-name and re-upload it as private, the dependency-confusion direction.
-Repurposing a name across worlds takes a deliberate operator action with direct
-storage access. ([storage-layout
-contract](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/DESIGN.md#storage-layout-the-contract))
+Deleting every file of a package does not release the name. Repurposing a name
+takes direct operator action in storage.
 
 ### Reserve a namespace
 
@@ -66,13 +59,8 @@ to upstream:
       -u admin -p "$ADMIN" dist/*
     ```
 
-!!! tip
-    Defense in depth: register your private names, or the prefix stem, on
-    pypi.org itself. Some laptop somewhere will always run `pip install` against
-    the defaults.
-
-See [Deploy → Private packages](../guides/deploy.md#private-packages) and
-[Deploy → Add public PyPI](../guides/deploy.md#add-public-pypi).
+See [Setup → Private packages](../guides/setup.md#private-packages) and
+[Setup → Add public PyPI](../guides/setup.md#add-public-pypi).
 
 ## Malicious recent releases
 
@@ -100,21 +88,6 @@ All `<when>` formats — durations, absolute timestamps, what slides versus what
 stays pinned — live in [Configuration → Mirror
 selection](../reference/configuration.md#mirror-selection).
 
-This composes with uv's own client-side `--exclude-newer`. pypiron stamps every
-file with an upload time — private uploads get their receipt time, mirrored files
-carry PyPI's true timestamp — and uv filters against it, so resolution is
-reproducible "as of" any date.
-
-```bash
-uv pip install --index-url http://HOST:8080/simple/ \
-  --exclude-newer 2026-01-01T00:00:00Z requests
-```
-
-!!! note
-    uv treats files without an upload time as unavailable and drops them from
-    resolution. See [Why this timestamp is the minimum
-    bar](../reference/standards.md#why-pep-700-is-the-minimum-bar-exclude-newer).
-
 !!! note "Only admins can backdate"
     An ordinary upload can only claim its receipt time, so a publisher can't
     sneak a package in under a cutoff. Setting any other timestamp — including
@@ -135,24 +108,15 @@ offline — Sigstore bundles check against a cached trust root with no egress �
 even an air-gapped build confirms the original publisher.
 
 pypiron is a relay, not a verifier: it never runs Sigstore or mints provenance,
-so a direct upload carrying first-party attestations is refused. See
-[Standards support](../reference/standards.md) for the spec-level detail.
+so a direct upload carrying first-party attestations is refused.
 
 ## The air-gapped endgame
 
-The proxy still talks to live PyPI on a cache miss. An [air-gapped
-mirror](../guides/air-gapped-mirror.md) removes that surface: the serving node
-has no egress, and `sync` pre-loads an approved, vetted package list from a host
-that does. Combine it with `--exclude-newer` and a private prefix, and the
-serving node resolves a fixed, reviewed corpus with no live upstream to attack.
+The proxy still talks to live PyPI on a cache miss. `sync` removes that surface:
+pre-load an approved package list from a host with egress, then serve from a node
+without egress.
 
 ## See also
 
-- [Mirroring](mirroring.md) — how `sync` carries timestamps, yank state, and
-  provenance forward.
-- [Authentication](authentication.md) — the admin/uploader/reader roles that
-  gate backdating and mirror uploads.
-- [Standards support](../reference/standards.md) — what is verified against real
-  clients.
 - [Configuration](../reference/configuration.md#mirror-selection) — the shared
   mirror-selection surface, with env-var and `[mirror]`-table equivalents.

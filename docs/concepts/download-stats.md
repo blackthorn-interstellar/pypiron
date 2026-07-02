@@ -1,27 +1,23 @@
 # Download statistics
 
-See which packages — and which versions — your team installs. pypiron counts
-every download and rolls it up by version: spot what's heavily used, what's gone
-stale, who's pulling what. On by default; turn it off with `--download-stats
-false`.
+See which packages and versions your team installs. On by default; turn it off
+with `--download-stats false`.
 
 !!! warning "Beta"
 
     Download statistics are new. The `/stats/` endpoints, JSON shapes, and
     stored counter format may still change.
 
-The counts are an analytic, not an audit log: a hard crash can lose recent
-downloads, but completed days are exact (see [Accuracy](#accuracy-and-freshness)).
+The counts are an analytic, not an audit log. A hard crash can lose recent
+downloads; completed days are exact.
 
 ## Reading the stats
 
-Two endpoints, both gated by read auth. With `--read-user` set, the read,
-uploader, or admin credential works; otherwise public.
+Two endpoints:
 
 ### Per package
 
-`GET /stats/downloads/<pkg>` — last 30 days, rolled up to versions, includes
-today.
+`GET /stats/downloads/<pkg>` - last 30 days by version.
 
 ```bash
 curl -u $READ http://localhost:8080/stats/downloads/acme
@@ -41,8 +37,7 @@ curl -u $READ http://localhost:8080/stats/downloads/acme
 
 ### Global
 
-`GET /stats/downloads` — last 30 days of per-day totals and the busiest
-packages, including today.
+`GET /stats/downloads` - last 30 days plus busiest packages.
 
 ```bash
 curl -u $READ http://localhost:8080/stats/downloads
@@ -57,19 +52,7 @@ curl -u $READ http://localhost:8080/stats/downloads
 }
 ```
 
-### In the browser
-
-Two pages render the same numbers for an authorized reader (gated like the JSON
-endpoints):
-
-- The homepage (`/`) leads its activity panel with a **Most Downloaded Packages**
-  chart — top five over the last 30 days — linking to the full leaderboard.
-- `GET /downloads/` is that leaderboard: the busiest packages (up to 500), each
-  linked to its project page.
-
-These pages serve a cached ranking, so a public homepage stays fast under load. A
-public deployment (no read credential) shows them to everyone; a credentialed one
-shows them only to readers, so private names never leak.
+The homepage and `/downloads/` render the same cached ranking.
 
 ## Accuracy and freshness
 
@@ -88,31 +71,6 @@ shows them only to readers, so private names never leak.
 per-package, per-version breakdown stays off `/metrics` — that many labels would
 overwhelm Prometheus — use the `/stats/` endpoints for it.
 
-## Per-project attribution
-
-Want to know which team is pulling what? Username tags do it. Authenticate as
-`$READ+billing-api` and pypiron records `billing-api` as a project tag, exposed
-in `/metrics` as
-`pypiron_project_requests_total{project="billing-api",route=...}`.
-
-=== "uv"
-
-    ```bash
-    export UV_INDEX_COMPANY_USERNAME="read+billing-api"
-    export UV_INDEX_COMPANY_PASSWORD="secret"
-    ```
-
-=== "pip"
-
-    ```bash
-    pip install --index-url http://read+billing-api:secret@localhost:8080/simple/ acme
-    ```
-
-Request attribution (which team is pulling), separate from the download-count
-store above. Details and the cardinality cap:
-[Authentication](authentication.md) and the
-[Configuration reference](../reference/configuration.md#per-project-download-tracking).
-
 ## Cost
 
 About **$0.04 per node per month** — effectively free for a private registry.
@@ -129,5 +87,4 @@ Raise `--counters-flush-interval-secs` to spend less, at the cost of staler
 | `--counters-rollup-interval-secs` | `3600` | How often completed days are finalized |
 | `--counters-retention-days` | `90` | Days of history kept |
 
-Exact flag/env definitions:
-[Configuration reference](../reference/configuration.md#server).
+Exact flag/env definitions: [Configuration](../reference/configuration.md#server).

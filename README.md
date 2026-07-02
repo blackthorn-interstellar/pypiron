@@ -46,8 +46,7 @@ pip, twine, and poetry equivalents: <https://pypiron.com/#quickstart>.
 
 ## Going further
 
-- [Deploy](docs/guides/deploy.md) — private, public proxy, S3, multi-node, Docker, Kubernetes
-- [Air-gapped mirror](docs/guides/air-gapped-mirror.md)
+- [Setup](docs/guides/setup.md) — private packages, public proxy, sync mirror, S3
 - [Configuration](docs/reference/configuration.md) — every flag and its `PYPIRON_*` env var
 - [Benchmarks](docs/reference/benchmarks.md) — how the numbers above were measured
 

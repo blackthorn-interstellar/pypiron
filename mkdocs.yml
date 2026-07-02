@@ -69,21 +69,9 @@ plugins:
 
 nav:
   - Home: index.md
-  - Guides:
-      - Deploy: guides/deploy.md
-      - Air-gapped mirror: guides/air-gapped-mirror.md
-  - Features:
-      - Storage backends: concepts/storage.md
-      - Authentication: concepts/authentication.md
-      - Mirroring: concepts/mirroring.md
-      - Supply-chain defense: concepts/supply-chain.md
-      - Artifact delivery: concepts/artifact-delivery.md
-      - Download statistics: concepts/download-stats.md
-  - Reference:
-      - How it works: concepts/how-it-works.md
-      - CLI: reference/cli.md
-      - Configuration: reference/configuration.md
-      - Management API: reference/api.md
-      - Client compatibility: reference/compatibility.md
-      - Standards support: reference/standards.md
-      - Benchmarks: reference/benchmarks.md
+  - Setup: guides/setup.md
+  - How it works: concepts/how-it-works.md
+  - Supply-chain defense: concepts/supply-chain.md
+  - Download statistics: concepts/download-stats.md
+  - Configuration: reference/configuration.md
+  - Benchmarks: reference/benchmarks.md

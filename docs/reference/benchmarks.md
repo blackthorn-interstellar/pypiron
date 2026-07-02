@@ -23,8 +23,7 @@ best cloud-backed config on the same small AWS box:
 !!! note
     bandersnatch pushes every wheel byte through its own NIC and saturates the
     network with CPU to spare. pypiron offloads wheel bytes to object storage, so
-    the node serves only index responses and scales to its CPU. See
-    [Artifact delivery](../concepts/artifact-delivery.md).
+    the node serves only index responses and scales to its CPU.
 
 ## Methodology
 

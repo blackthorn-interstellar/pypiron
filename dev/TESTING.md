@@ -19,11 +19,23 @@ actually succeeding against the server. Rules of thumb:
 - **Real backends.** Disk mode runs against a tmpdir; S3 against MinIO and Azure
   Blob against Azurite, both in Docker. These tests skip cleanly when Docker is
   unavailable. GCS has no blackbox test: no local emulator faithfully implements
-  object_store's GCS XML data-plane (fake-gcs-server rejects the conditional XML
-  PUT; Google's storage-testbench omits the required `ETag` header). The GCS
-  backend shares the single `object_store`-backed code path that the S3 and Azure
-  suites exercise end to end — only its builder config differs — so it is covered
-  by construction plus object_store's own GCS test suite against real GCS.
+  the GCS XML data-plane that `object_store` uses for writes. Verified against
+  object_store 0.13.2 and 0.14.0, both candidate emulators fail on the first
+  index write:
+  - **fake-gcs-server** (fsouza) routes the unsigned `PUT /{bucket}/{object}` to
+    its JSON upload handler and rejects it with `400 invalid uploadType` — it
+    accepts that path only for signed-URL uploads, which `object_store` doesn't
+    use for a normal put.
+  - **Google's storage-testbench** accepts the PUT and even enforces conditional
+    writes correctly (`if-generation-match: 0` → `412`), but its PUT response
+    omits the `ETag` header (and its GET omits `Last-Modified`), so every write
+    fails with `ETag Header missing from response`.
+
+  There is no `object_store` config to relax the ETag requirement or fall back to
+  the JSON API. The GCS backend shares the single `object_store`-backed code path
+  that the S3 and Azure suites exercise end to end — only its builder config
+  differs — so it is covered by construction plus object_store's own GCS test
+  suite against real GCS.
 - **Always fresh binaries.** The test fixture runs `cargo build` unconditionally —
   incremental builds make it a cheap no-op, and skipping it would silently test a
   stale binary.
@@ -43,7 +55,8 @@ assumptions about clients instead of the clients.
 | Performance | Hot read endpoints under load, release binary | pytest, `perf` marker, opt-in |
 
 Markers (`pyproject.toml`): `integration`, `s3` (needs Docker/MinIO), `azure`
-(needs Docker/Azurite), `perf`, `stress`. Default runs exclude `perf` and
+(needs Docker/Azurite), `chaos` (crash-point fault-injection sweeps),
+`compat(client, feature)`, `perf`, `stress`. Default runs exclude `perf` and
 `stress`.
 
 ## Client compatibility matrix
@@ -68,6 +81,35 @@ versions used for the matrix.
 As features land per [STANDARDS.md](../docs/reference/standards.md), each gets its blackbox test in
 the same style: yank → pip refuses to pick it unless pinned; immutability →
 re-upload of the same filename is rejected; caching → ETag round-trips as a 304.
+
+## Chaos and crash consistency
+
+The storage contract is write-to-tmp-then-rename on one filesystem, so the tests
+that matter most are the ones that interrupt it. Two blackbox suites inject real
+faults into the real binary and assert the tree is never left corrupt.
+
+- **Upstream fault injection** (`tests/test_chaos_upstream.py`): the proxy fetches
+  from an upstream that misbehaves on purpose — a body truncated mid-stream, a
+  `500`, a hash that doesn't match the metadata, a connection that hangs. Each
+  fault must surface as an error to the client and leave *nothing* behind: no
+  half-written blob in the cache, no dangling index entry, no poisoned file that a
+  later request would serve as good. A clean retry after the fault clears succeeds.
+- **Fleet convergence under kill** (`tests/test_chaos_fleet.py`): three nodes share
+  one MinIO bucket and take concurrent uploads while one is `SIGKILL`ed mid-write.
+  After restart the fleet must converge — every node renders byte-identical
+  indexes, and every acknowledged upload installs from every node. This is the
+  proof that an interrupted write can't split-brain the shared truth.
+
+Both run in Docker and skip cleanly without it, like the rest of the S3 suite.
+
+## What runs where
+
+| When | What |
+|---|---|
+| Every PR (CI) | fmt, clippy `-D warnings`, Rust unit, blackbox on disk + S3 (MinIO) + Azure (Azurite), `cargo-audit`, fuzz-target build smoke |
+| Nightly | coverage-guided fuzzing, all six targets |
+| Weekly | client compat matrix, full-PyPI corpus check, unit-test coverage |
+| Local / opt-in | `perf` and `stress` (release binary, excluded from default runs) |
 
 ## Performance testing
 

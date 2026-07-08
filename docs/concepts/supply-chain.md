@@ -120,3 +120,5 @@ without egress.
 
 - [Configuration](../reference/configuration.md#mirror-selection) — the shared
   mirror-selection surface, with env-var and `[mirror]`-table equivalents.
+- [How it's tested](testing.md) — how these defenses are verified: chaos, fuzzing,
+  and a full-PyPI parser check.

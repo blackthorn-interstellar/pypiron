@@ -100,6 +100,34 @@ Serves `http://localhost:8080`:
     poetry add acme-widgets
     ```
 
+## Tested like your supply chain depends on it
+
+Anyone can post a benchmark chart. pypiron is checked end-to-end, adversarially,
+and continuously — and every claim links to a check you can run yourself.
+([the full story](concepts/testing.md))
+
+- **The whole ecosystem, for real.** Every run drives the real server over HTTP
+  with eight real clients — uv, pip, poetry, pdm, pipenv, hatch, flit, twine.
+  Not mocks. ([details](concepts/testing.md#real-clients-real-server))
+- **All of PyPI. All of it.** The parsers chew through every file ever uploaded
+  to PyPI — all 17 million — and match ground truth on each one.
+  ([details](concepts/testing.md#every-file-on-pypi))
+- **Kill -9'd until it's boring.** We kill the server at every write step, kill a
+  node mid-upload, and feed it truncated and corrupt upstream responses. It
+  converges to an installable state every time.
+  ([details](concepts/testing.md#it-survives-being-killed))
+- **Fuzzed nightly, audited on every PR.** Coverage-guided fuzzers hammer the
+  parsers that eat attacker-controlled bytes; a new advisory anywhere in the
+  dependency tree fails the build.
+  ([details](concepts/testing.md#adversarial-inputs))
+- **Audited until the findings ran dry.** Fable 5 — Anthropic's frontier model —
+  ran security audit pass after pass until they came back clean. Over $7,000 of
+  frontier-model compute went into hardening pypiron.
+  ([details](concepts/testing.md#supply-chain-hygiene))
+- **Benchmarks with nothing to hide.** The chart above comes from published
+  docker-compose rigs for all five competitors. Re-run it. We'll wait.
+  ([details](concepts/testing.md#benchmarks-you-can-re-run))
+
 ## Next steps
 
 <div class="grid cards" markdown>
@@ -108,4 +136,18 @@ Serves `http://localhost:8080`:
 - :material-server-network: __Setup__ — production setups ([Setup](guides/setup.md))
 - :material-cog: __Configuration__ — every flag ([Configuration](reference/configuration.md))
 
+</div>
+
+## About the author
+
+<div style="display:flex; gap:1.25rem; align-items:center; flex-wrap:wrap; margin:1.5rem 0;">
+<img src="assets/bryce-drennan.jpg" alt="Bryce Drennan" width="120" style="border-radius:50%; flex-shrink:0;">
+<p style="flex:1; min-width:260px; margin:0;">
+pypiron is built by <strong>Bryce Drennan</strong>. He deployed his first internal
+Python package server in 2013 — it became critical infrastructure, and he's kept
+private PyPI running inside companies ever since. Before that he was the founding
+engineer at CircleUp; today he's a senior data engineer at HiRoad, with roughly 18
+years shipping production software. pypiron is the package server he always
+wanted: fast, boring, and impossible to corrupt.
+</p>
 </div>

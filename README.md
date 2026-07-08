@@ -7,7 +7,7 @@
 
 An ultra-fast Python package server, written in Rust.
 
-pypiron aims to be the fastest, most reliable PyPI server (and mirror) available.
+pypiron is the fastest, most reliable PyPI server (and mirror) available.
 
 <p align="center">
   <img src="docs/assets/install-throughput.png" alt="Max sustained install throughput: pypiron vs bandersnatch, pypiserver, pypicloud, devpi, proxpi" width="760">
@@ -47,6 +47,17 @@ pip, twine, and poetry equivalents: <https://pypiron.com/#quickstart>.
 - [Setup](docs/guides/setup.md) — private packages, public proxy, sync mirror, S3
 - [Configuration](docs/reference/configuration.md) — every flag and its `PYPIRON_*` env var
 - [Benchmarks](docs/reference/benchmarks.md) — how the numbers above were measured
+
+## Tested like your supply chain depends on it
+
+Anyone can post a benchmark chart. pypiron is validated end-to-end, adversarially, and continuously — and every claim below links to a check you can run yourself.
+
+- **The whole ecosystem, for real.** Every test run drives the real server over HTTP with eight real clients — uv, pip, poetry, pdm, pipenv, hatch, flit, twine. Not mocks: the [actual tools your team uses](dev/TESTING.md#client-compatibility-matrix).
+- **All of PyPI. All of it.** The parsers chew through [every file ever uploaded to PyPI — all 17 million](src/corpus_check.rs) — and match ground truth on each one.
+- **Kill -9'd until it's boring.** We kill the server at every step of every write, kill fleet nodes mid-upload, and feed it truncated, corrupted, and hash-mismatched upstream responses. It converges to a consistent, installable state every time ([crash sweep](tests/test_crash_consistency.py), [fleet chaos](tests/test_chaos_fleet.py), [upstream faults](tests/test_chaos_upstream.py)).
+- **Fuzzed nightly, audited on every PR.** Coverage-guided fuzzers hammer the parsers that eat attacker-controlled bytes [every night](.github/workflows/fuzz.yml); a new advisory anywhere in the dependency tree [fails the build](.github/workflows/ci.yml).
+- **Audited until the findings ran dry.** Fable 5 — Anthropic's frontier model — ran security audit pass after security audit pass until they came back clean. All told, over $7,000 of frontier-model compute (at API list prices) went into building and hardening pypiron.
+- **Benchmarks with nothing to hide.** The chart above comes from [published docker-compose rigs](bench/install/) for all five competitors. Re-run it. We'll wait.
 
 ## Comparison
 

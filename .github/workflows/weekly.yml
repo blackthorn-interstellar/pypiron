@@ -1,0 +1,82 @@
+name: Weekly
+
+# Slow quality checks that are too heavy for a per-PR merge gate: the full
+# multi-client compatibility matrix, the full-PyPI corpus check (hits the public
+# ClickHouse metadata mirror), and a Rust unit-test coverage summary. Runs weekly
+# and on demand.
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays, 06:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compat:
+    name: client compat matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - name: Sync dev dependencies
+        run: uv sync
+      # Exercises poetry/pdm/flit/hatch/pipenv against a real server (fetched on
+      # demand via uvx). Regenerates docs/reference/compatibility.md; the working-
+      # tree change is discarded, this only checks the clients still pass.
+      - name: Client compatibility matrix
+        run: make compat
+
+  corpus:
+    name: full-PyPI corpus check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # #[ignore]d test: parses real file metadata for the whole PyPI corpus from
+      # the public ClickHouse mirror (no auth). Long-running; not a merge gate.
+      - name: Corpus check against full PyPI metadata
+        run: cargo test --release corpus_full_pypi -- --ignored --nocapture
+
+  coverage:
+    name: coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+        with:
+          tool: cargo-llvm-cov
+      # `make -s` prints only the summary table (stdout); build noise goes to
+      # stderr. Fold it into the run's job summary — no external coverage service.
+      - name: Rust unit-test coverage summary
+        run: |
+          {
+            echo '### Rust unit-test coverage'
+            echo
+            echo '```text'
+            make -s coverage
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

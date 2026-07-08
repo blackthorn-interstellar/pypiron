@@ -52,6 +52,22 @@ jobs:
       - name: Clippy (fail on warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+        with:
+          tool: cargo-audit
+      # `make audit` carries the acknowledged-advisory ignore list and its
+      # justification (a couple of transitive quick-xml DoS advisories reachable
+      # only through trusted cloud-storage XML). Anything else fails the job.
+      - name: Audit dependencies for advisories
+        run: make audit
+
   test:
     name: tests
     runs-on: ubuntu-latest
@@ -67,9 +83,26 @@ jobs:
         run: cargo test --workspace --all-features --locked
 
   integration:
-    name: blackbox integration
+    # The product's center of gravity is the blackbox suite (dev/TESTING.md): the
+    # real binary driven over HTTP by real uv/pip/twine clients. The disk leg is the
+    # fast merge gate and explicitly excludes the s3/azure markers; the cloud legs
+    # run their own selection against MinIO/Azurite (Docker is preinstalled on the
+    # runner, so the fixtures find it instead of skipping). The multi-client compat
+    # matrix (poetry/pdm/flit/hatch via uvx) and the full-PyPI corpus check are too
+    # slow for a merge gate and run in the weekly workflow, not here.
+    name: blackbox (${{ matrix.backend }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: disk
+            markers: "not perf and not stress and not compat and not s3 and not azure"
+          - backend: s3
+            markers: "s3 and not perf and not stress"
+          - backend: azure
+            markers: "azure and not perf and not stress"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -79,12 +112,8 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - name: Sync dev dependencies
         run: uv sync
-      # The product's center of gravity is the blackbox suite (dev/TESTING.md):
-      # the real binary driven over HTTP by real uv/pip clients. S3/MinIO tests
-      # skip without Docker; the multi-client compat matrix (poetry/pdm/flit/
-      # hatch via uvx) stays a local `make compat` concern, not a merge gate.
-      - name: Blackbox suite (disk mode)
-        run: uv run -- pytest tests -m "not perf and not stress and not compat"
+      - name: Blackbox suite (${{ matrix.backend }} mode)
+        run: uv run -- pytest tests -m "${{ matrix.markers }}"
 
   python-lint:
     name: python lint (ruff)

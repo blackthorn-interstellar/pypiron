@@ -1,0 +1,67 @@
+name: Fuzz
+
+# Coverage-guided fuzzing of the input-parsing modules. Too slow for a merge gate
+# (ci.yml only smoke-compiles the targets), so it runs nightly and on demand. Each
+# target fuzzes for five minutes over a corpus that persists across runs, so the
+# inputs it discovers accumulate instead of starting from scratch every night.
+on:
+  schedule:
+    - cron: '0 3 * * *' # nightly, 03:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_names
+          - fuzz_wheel
+          - fuzz_wheelzip
+          - fuzz_render
+          - fuzz_coremeta
+          - fuzz_range
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+        with:
+          tool: cargo-fuzz
+      # Persist the growing corpus: a unique key always saves this run's corpus,
+      # and restore-keys pulls the most recent prior corpus to seed it.
+      - name: Restore fuzz corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+      # Pin the gnu host target: recent cargo-fuzz defaults to musl even on a gnu
+      # host, and musl's static libc is incompatible with ASan.
+      # https://github.com/rust-fuzz/cargo-fuzz/issues/398
+      # A crash exits non-zero and drops the reproducer in fuzz/artifacts/<target>.
+      - name: Fuzz for five minutes
+        run: cargo fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=300
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

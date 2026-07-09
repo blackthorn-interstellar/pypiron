@@ -73,6 +73,7 @@ nav:
   - How it works: concepts/how-it-works.md
   - Supply-chain defense: concepts/supply-chain.md
   - How it's tested: concepts/testing.md
+  - For AI agents: for-agents.md
   - Download statistics: concepts/download-stats.md
   - Configuration: reference/configuration.md
   - Benchmarks: reference/benchmarks.md

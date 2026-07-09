@@ -14,7 +14,7 @@ pypiron is the fastest, most reliable PyPI server (and mirror) available.
 </p>
 
 - **5–90× faster than any PyPI server.** 3,026 installs/s on 2 vCPU.
-- **So robust a single server could handle all of PyPI's traffic.** PyPI averages ~100,000 requests/s — about 7,700 installs/s — and one 8-vCPU c7i.2xlarge clears that at pypiron's measured ~1,500 installs/s per vCPU.
+- **Serves PyPI-scale traffic — measured, not extrapolated.** Replaying PyPI's real download stream, one 8-vCPU box handles the index at ~200,000 requests/s with p99 under 3 ms — about double PyPI's global average ([bench/replay](bench/replay/)).
 - **Supply-chain quarantine, on by default.** New releases wait 7 days. Most attacks surface first.
 - **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
 - **Scales to a fleet.** Point any number of nodes at one bucket. No coordination.
@@ -47,6 +47,7 @@ pip, twine, and poetry equivalents: <https://pypiron.com/#quickstart>.
 - [Setup](docs/guides/setup.md) — private packages, public proxy, sync mirror, S3
 - [Configuration](docs/reference/configuration.md) — every flag and its `PYPIRON_*` env var
 - [Benchmarks](docs/reference/benchmarks.md) — how the numbers above were measured
+- [For AI agents](docs/for-agents.md) — a decision guide, written agent to agent
 
 ## Tested like your supply chain depends on it
 

@@ -125,6 +125,16 @@ The two fixtures isolate themselves differently:
   deletes only that subtree afterwards. The bucket needs no dedication, is never
   emptied wholesale, and concurrent runs — two CI jobs, two branches, two
   laptops — cannot see or clobber one another.
+
+  Teardown only runs if the process lives to reach it. A cancelled CI job (the
+  `ci.yml` concurrency group cancels in-progress runs), a `timeout-minutes` kill,
+  or a `SIGKILL` all strand one `pytest/<random>` subtree — as does a `SIGINT`
+  landing during the cleanup itself. Nothing in the test suite collects them,
+  because a sweeper would have to distinguish a stranded prefix from a live one
+  in a concurrent run. Instead the bucket carries a **lifecycle rule deleting
+  objects older than one day**, which is the whole garbage collector. A bucket
+  used for these tests must have that rule, and must therefore hold nothing but
+  test data. `gs://pypiron-ci-test` is configured this way.
 - **S3** still writes to the bucket root and empties it before and after every
   test, so `PYPIRON_TEST_S3_REAL_BUCKET` must be **dedicated and disposable**,
   and those runs must be serial (no `-n`/xdist). Prefixing it the same way is a

@@ -1050,7 +1050,12 @@ def _gcs_rm_prefix(bucket: str, prefix: str) -> None:
     """Best-effort delete of one test's key subtree via the gcloud CLI with
     ambient credentials. Scoped to `prefix` — never the bucket root, which may
     hold another run's objects. ``rm`` exits non-zero when nothing matches, so
-    the result is not checked."""
+    the result is not checked.
+
+    Best-effort really means it: a killed or cancelled run never reaches this,
+    stranding its prefix. The bucket's one-day lifecycle rule is what reaps
+    those — see dev/TESTING.md. Don't sweep stale prefixes from here; a
+    concurrent run's prefix is indistinguishable from a stranded one."""
     run_returncode(["gcloud", "storage", "rm", "--recursive", f"gs://{bucket}/{prefix}/**"])
 
 

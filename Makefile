@@ -1,4 +1,4 @@
-.PHONY: init init-rust init-python build dev run test test-rust test-python perf compat check cargo-check af fmt lint audit coverage clean doc docs docs-serve build-wheel release-notes fuzz fuzz-build help
+.PHONY: init init-rust init-python build dev run test test-rust test-python test-s3-real test-gcs-real perf compat check cargo-check af fmt lint audit coverage clean doc docs docs-serve build-wheel release-notes fuzz fuzz-build help
 
 SHELL := /bin/bash
 
@@ -36,6 +36,12 @@ test-rust:  ## Run Rust unit tests
 test-python:  ## Run blackbox integration tests
 	uv run -- pytest tests
 
+test-s3-real:  ## Run the S3 blackbox suite against a REAL S3 bucket (set PYPIRON_TEST_S3_REAL_BUCKET + ambient AWS creds; the bucket is emptied around every test)
+	uv run -- pytest tests -m "s3 and not perf and not stress"
+
+test-gcs-real:  ## Run the GCS round-trip against a REAL GCS bucket (set PYPIRON_TEST_GCS_REAL_BUCKET + ambient GCS creds; the bucket is emptied around every test)
+	uv run -- pytest tests -m "gcs and not perf and not stress"
+
 perf:  ## Run performance benchmarks (builds release binary)
 	uv run -- pytest tests -m perf -s
 
@@ -67,6 +73,10 @@ audit:  ## Scan Cargo.lock for security advisories (needs cargo-audit: cargo ins
 	# released object_store permits it yet: the latest (0.14.0) pins quick-xml to
 	# ^0.40.1, still vulnerable. Bumping object_store therefore can't clear these.
 	# Drop both ignores the moment an object_store release ships quick-xml >= 0.41.
+	# Upstream (dev now lives in apache/arrow-rs-object-store):
+	#   fix merged to main 2026-07-02  https://github.com/apache/arrow-rs-object-store/pull/785
+	#   tracking issue (closed)       https://github.com/apache/arrow-rs-object-store/issues/787
+	#   ships in 0.14.1, target Aug 2026  https://github.com/apache/arrow-rs-object-store/issues/761
 	cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 
 coverage:  ## Rust unit-test line coverage summary (needs cargo-llvm-cov: cargo install cargo-llvm-cov)

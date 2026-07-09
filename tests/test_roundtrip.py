@@ -1,8 +1,9 @@
 """Round trip: upload a real wheel -> indexed -> bytes intact -> installable.
 
 Runs against the emulator-backed backends: disk (tmpdir), S3 (MinIO), and Azure
-Blob (Azurite) — the cloud ones in Docker. GCS shares the same object_store code
-path but has no faithful local emulator (see dev/TESTING.md).
+Blob (Azurite) — the cloud ones in Docker. GCS has no faithful local emulator
+(see dev/TESTING.md), so its parameter runs only when a real bucket is
+configured (PYPIRON_TEST_GCS_REAL_BUCKET) and skips otherwise.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ pytestmark = pytest.mark.integration
         pytest.param("disk_server", id="disk"),
         pytest.param("s3_server", id="s3", marks=pytest.mark.s3),
         pytest.param("azure_server", id="azure", marks=pytest.mark.azure),
+        pytest.param("gcs_server", id="gcs", marks=pytest.mark.gcs),
     ]
 )
 def server(request):

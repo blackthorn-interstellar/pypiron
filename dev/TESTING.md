@@ -35,7 +35,10 @@ actually succeeding against the server. Rules of thumb:
   the JSON API. The GCS backend shares the single `object_store`-backed code path
   that the S3 and Azure suites exercise end to end — only its builder config
   differs — so it is covered by construction plus object_store's own GCS test
-  suite against real GCS.
+  suite against real GCS. It now also has live end-to-end coverage: the weekly
+  `real-gcs` CI job (below) runs the round-trip against a real GCS bucket when
+  credentials are configured — GCS's only end-to-end test, since no emulator can
+  stand in for it.
 - **Always fresh binaries.** The test fixture runs `cargo build` unconditionally —
   incremental builds make it a cheap no-op, and skipping it would silently test a
   stale binary.
@@ -102,13 +105,35 @@ faults into the real binary and assert the tree is never left corrupt.
 
 Both run in Docker and skip cleanly without it, like the rest of the S3 suite.
 
+## Real cloud backends
+
+The emulators (MinIO, Azurite) are fast and hermetic but not the real thing, and
+GCS has no faithful emulator at all. To close the fidelity gap, the S3 suite and
+the GCS round-trip can run against **real buckets**, off by default:
+
+- `make test-s3-real` — set `PYPIRON_TEST_S3_REAL_BUCKET` and provide ambient AWS
+  credentials (env, profile, or instance role). The whole s3-marked suite then
+  targets that bucket instead of MinIO.
+- `make test-gcs-real` — set `PYPIRON_TEST_GCS_REAL_BUCKET` and provide GCS
+  credentials (a service-account JSON via `PYPIRON_TEST_GCS_SERVICE_ACCOUNT_PATH`
+  or `GOOGLE_APPLICATION_CREDENTIALS`, or ambient ADC). This is GCS's only
+  end-to-end coverage.
+
+pypiron writes to the bucket root — there is no per-run key prefix — so each
+bucket must be **dedicated and disposable**: the fixture empties it before and
+after every test to give each a clean slate. Runs must be serial (no `-n`/xdist),
+since the shared bucket is wiped per test. Both fixtures skip cleanly when their
+bucket env var is unset, so the default `make test` is unaffected. The weekly
+`real-s3` and `real-gcs` CI jobs run these against repo-configured buckets and
+no-op green when the repo has no such secrets.
+
 ## What runs where
 
 | When | What |
 |---|---|
 | Every PR (CI) | fmt, clippy `-D warnings`, Rust unit, blackbox on disk + S3 (MinIO) + Azure (Azurite), `cargo-audit`, fuzz-target build smoke |
 | Nightly | coverage-guided fuzzing, all six targets |
-| Weekly | client compat matrix, full-PyPI corpus check, unit-test coverage |
+| Weekly | client compat matrix, full-PyPI corpus check, unit-test coverage, real-S3 + real-GCS blackbox (when bucket secrets are configured) |
 | Local / opt-in | `perf` and `stress` (release binary, excluded from default runs) |
 
 ## Performance testing

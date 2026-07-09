@@ -56,7 +56,11 @@ def test_artifact_download_redirects_to_presigned_url(presigned_server):
     code, _, headers = http_get_no_redirect(url)
     assert code == 302
     location = headers["location"]
-    assert location.startswith(server["minio"]["endpoint"]), "redirect must point at S3"
+    endpoint = server["minio"]["endpoint"]
+    if endpoint:  # emulator: presigned URL points at the MinIO endpoint
+        assert location.startswith(endpoint), "redirect must point at S3"
+    else:  # real S3: presigned URL points at AWS, not back at the node
+        assert not location.startswith(server["base_url"]), "redirect must leave the node"
     assert "X-Amz-Signature" in location, "URL must be presigned"
     assert headers["cache-control"] == "no-cache", "expiring redirects must not be cached"
 

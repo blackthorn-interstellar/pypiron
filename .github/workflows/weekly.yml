@@ -80,3 +80,106 @@ jobs:
             make -s coverage
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Real-cloud fidelity legs. The per-PR integration job runs the S3/Azure
+  # suites against emulators (MinIO/Azurite) and GCS has no emulator at all
+  # (dev/TESTING.md). These jobs close that gap by running the blackbox backend
+  # suites against real buckets on a schedule. Each gates itself on a bucket
+  # secret and no-ops green when the repo isn't configured, so a fork or an
+  # unconfigured repo sees a passing, empty job rather than a failure.
+  #
+  # Both target a DEDICATED, DISPOSABLE bucket: pypiron writes to the bucket
+  # root (no per-run key prefix), so the fixtures empty the whole bucket before
+  # and after every test. Never point these at a bucket holding anything else.
+  real-s3:
+    name: blackbox (real S3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Repo config (Settings → Secrets and variables → Actions):
+    #   secret PYPIRON_TEST_S3_REAL_BUCKET — dedicated, disposable bucket (also
+    #                                        the on/off switch for this job).
+    #   secret AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY — credentials with
+    #                                        list/get/put/delete on that bucket.
+    #   var    PYPIRON_TEST_S3_REGION       — the bucket's region.
+    env:
+      PYPIRON_TEST_S3_REAL_BUCKET: ${{ secrets.PYPIRON_TEST_S3_REAL_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ vars.PYPIRON_TEST_S3_REGION }}
+      AWS_DEFAULT_REGION: ${{ vars.PYPIRON_TEST_S3_REGION }}
+    steps:
+      - name: Gate on configured bucket secret
+        id: gate
+        run: |
+          if [ -n "$PYPIRON_TEST_S3_REAL_BUCKET" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "PYPIRON_TEST_S3_REAL_BUCKET is unset — skipping the real-S3 leg."
+          fi
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: steps.gate.outputs.enabled == 'true'
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: steps.gate.outputs.enabled == 'true'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        if: steps.gate.outputs.enabled == 'true'
+      - name: Sync dev dependencies
+        if: steps.gate.outputs.enabled == 'true'
+        run: uv sync
+      # AWS CLI is preinstalled on the runner; the fixture uses it plus the
+      # ambient AWS_* credentials to empty the bucket around each test.
+      - name: Blackbox S3 suite against real S3
+        if: steps.gate.outputs.enabled == 'true'
+        run: make test-s3-real
+
+  real-gcs:
+    name: blackbox (real GCS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Repo config (Settings → Secrets and variables → Actions):
+    #   secret PYPIRON_TEST_GCS_REAL_BUCKET     — dedicated, disposable bucket
+    #                                             (also the on/off switch).
+    #   secret PYPIRON_TEST_GCS_SERVICE_ACCOUNT — service-account JSON key with
+    #                                             object admin on that bucket.
+    env:
+      PYPIRON_TEST_GCS_REAL_BUCKET: ${{ secrets.PYPIRON_TEST_GCS_REAL_BUCKET }}
+    steps:
+      - name: Gate on configured bucket secret
+        id: gate
+        run: |
+          if [ -n "$PYPIRON_TEST_GCS_REAL_BUCKET" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "PYPIRON_TEST_GCS_REAL_BUCKET is unset — skipping the real-GCS leg."
+          fi
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+      # Writes the SA key to a file and exports GOOGLE_APPLICATION_CREDENTIALS;
+      # the fixture passes that on to pypiron as the GCS service-account path
+      # (which also enables presigned-URL signing) and to gcloud for cleanup.
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          credentials_json: ${{ secrets.PYPIRON_TEST_GCS_SERVICE_ACCOUNT }}
+          export_environment_variables: true
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        if: steps.gate.outputs.enabled == 'true'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: steps.gate.outputs.enabled == 'true'
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: steps.gate.outputs.enabled == 'true'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        if: steps.gate.outputs.enabled == 'true'
+      - name: Sync dev dependencies
+        if: steps.gate.outputs.enabled == 'true'
+        run: uv sync
+      - name: Blackbox GCS round-trip against real GCS
+        if: steps.gate.outputs.enabled == 'true'
+        run: make test-gcs-real

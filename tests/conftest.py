@@ -669,9 +669,57 @@ def disk_server_uploader_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[D
 # ------------------------------ MinIO (S3) fixtures ---------------------------
 
 
+def _real_s3_config() -> Dict | None:
+    """Real-S3 target from the environment, or None to fall back to MinIO.
+
+    Set ``PYPIRON_TEST_S3_REAL_BUCKET`` to point the whole s3-marked suite at a
+    real bucket instead of the Docker emulator. pypiron writes to the bucket
+    root (there is no per-run key prefix to scope to), so the bucket must be
+    **dedicated and disposable**: the fixture empties it before and after every
+    test to give each a clean slate. Credentials come from the ambient AWS
+    environment (env vars, shared profile, or instance role), resolved exactly
+    the way ``object_store`` resolves them.
+    """
+    bucket = os.environ.get("PYPIRON_TEST_S3_REAL_BUCKET", "").strip()
+    if not bucket:
+        return None
+    return {
+        "endpoint": None,  # real AWS, not an emulator
+        "bucket": bucket,
+        "access_key": None,  # ambient credentials
+        "secret_key": None,
+        "region": os.environ.get("AWS_REGION", "").strip() or "us-east-1",
+        "real": True,
+    }
+
+
+def _s3_empty_bucket(bucket: str) -> None:
+    """Delete every object in a real S3 bucket, using the aws CLI with ambient
+    credentials. Skips the run if the CLI is unavailable."""
+    if not cmd_exists("aws"):
+        pytest.skip("aws CLI is required to manage the real S3 test bucket; not found on PATH")
+    run_checked(["aws", "s3", "rm", f"s3://{bucket}/", "--recursive"])
+
+
 @pytest.fixture()
 def minio(tmp_path_factory) -> Iterator[Dict]:
-    """Start MinIO via Docker on a free port with a fresh bucket; skip without Docker."""
+    """S3 backend for the s3-marked suite.
+
+    Default: a throwaway MinIO container with a fresh bucket (skips without
+    Docker). If ``PYPIRON_TEST_S3_REAL_BUCKET`` is set, targets that real S3
+    bucket instead (see ``_real_s3_config``), emptying it around each test so
+    every test still starts from an empty bucket. Real-bucket runs must be
+    serial — the shared bucket is wiped per test, so `-n`/xdist would corrupt
+    concurrent tests."""
+    real = _real_s3_config()
+    if real is not None:
+        _s3_empty_bucket(real["bucket"])
+        try:
+            yield real
+        finally:
+            _s3_empty_bucket(real["bucket"])
+        return
+
     if not cmd_exists("docker"):
         pytest.skip("docker is required for S3/MinIO integration tests; not found on PATH")
 
@@ -749,11 +797,7 @@ def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
         {
             "PYPIRON_STORAGE": "s3",
             "PYPIRON_S3_BUCKET": minio["bucket"],
-            "AWS_REGION": "us-east-1",
-            "PYPIRON_S3_ENDPOINT_URL": minio["endpoint"],
-            "PYPIRON_S3_FORCE_PATH_STYLE": "true",
-            "AWS_ACCESS_KEY_ID": minio["access_key"],
-            "AWS_SECRET_ACCESS_KEY": minio["secret_key"],
+            "AWS_REGION": minio.get("region") or "us-east-1",
             "PYPIRON_BIND_ADDR": bind,
             "PYPIRON_WORKER_INTERVAL_SECS": "1",
             "PYPIRON_ADMIN_USER": "admin",
@@ -763,6 +807,14 @@ def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
             "RUST_LOG": "info,pypiron=debug",
         }
     )
+    if minio.get("endpoint"):
+        # Emulator (MinIO): explicit endpoint, path-style addressing, fixed
+        # dev credentials. Real S3 has none of these — it relies on the ambient
+        # AWS credentials already carried over by os.environ.copy() above.
+        env["PYPIRON_S3_ENDPOINT_URL"] = minio["endpoint"]
+        env["PYPIRON_S3_FORCE_PATH_STYLE"] = "true"
+        env["AWS_ACCESS_KEY_ID"] = minio["access_key"]
+        env["AWS_SECRET_ACCESS_KEY"] = minio["secret_key"]
     return env
 
 
@@ -860,9 +912,64 @@ def _start_cloud_server(tmp_path_factory, pypiron_bin: Path, env: Dict, bind: st
 
 # GCS note: no local emulator faithfully implements object_store's GCS XML
 # data-plane (fake-gcs-server rejects the XML PUT; Google's storage-testbench
-# omits the required ETag), so GCS has no blackbox fixture. The GCS backend
+# omits the required ETag), so GCS has no *emulator* fixture. The GCS backend
 # shares the ObjectStorage code path exercised by the S3 and Azure suites; only
-# its builder config differs. See dev/TESTING.md.
+# its builder config differs. See dev/TESTING.md. The `gcs_server` fixture below
+# closes the gap end to end when a real bucket is configured (e.g. the weekly
+# real-gcs CI job) — GCS's only live coverage.
+
+
+def _real_gcs_config() -> Dict | None:
+    """Real-GCS target from the environment, or None to skip.
+
+    GCS has no faithful local emulator, so this is real-only. Set
+    ``PYPIRON_TEST_GCS_REAL_BUCKET`` to a **dedicated, disposable** bucket; the
+    fixture owns its whole contents and empties it around each test (pypiron
+    writes to the bucket root — no per-run key prefix). Credentials resolve the
+    way ``object_store`` resolves them: a service-account JSON via
+    ``PYPIRON_TEST_GCS_SERVICE_ACCOUNT_PATH`` or ``GOOGLE_APPLICATION_CREDENTIALS``
+    (also required for presigned URLs), otherwise ambient Application Default
+    Credentials.
+    """
+    bucket = os.environ.get("PYPIRON_TEST_GCS_REAL_BUCKET", "").strip()
+    if not bucket:
+        return None
+    sa_path = (
+        os.environ.get("PYPIRON_TEST_GCS_SERVICE_ACCOUNT_PATH", "").strip()
+        or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    )
+    return {"bucket": bucket, "service_account_path": sa_path or None}
+
+
+def _gcs_empty_bucket(bucket: str) -> None:
+    """Best-effort delete of every object in a real GCS bucket via the gcloud
+    CLI with ambient credentials. Skips the run if the CLI is unavailable.
+    ``rm`` exits non-zero on an empty match, so the result is not checked; the
+    per-test setup wipe means a stray leftover self-heals on the next run."""
+    if not cmd_exists("gcloud"):
+        pytest.skip("gcloud CLI is required to manage the real GCS test bucket; not found on PATH")
+    run_returncode(["gcloud", "storage", "rm", "--recursive", f"gs://{bucket}/**"])
+
+
+@pytest.fixture()
+def gcs_server(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """pypiron against a REAL GCS bucket — GCS has no local emulator, so this is
+    the only GCS end-to-end coverage. Skips unless ``PYPIRON_TEST_GCS_REAL_BUCKET``
+    (and credentials) are configured; see ``_real_gcs_config``."""
+    gcs = _real_gcs_config()
+    if gcs is None:
+        pytest.skip("real GCS test bucket not configured (set PYPIRON_TEST_GCS_REAL_BUCKET)")
+    _gcs_empty_bucket(gcs["bucket"])
+    port = find_free_port()
+    bind = f"127.0.0.1:{port}"
+    env = _cloud_creds_env(bind)
+    env.update({"PYPIRON_STORAGE": "gcs", "PYPIRON_GCS_BUCKET": gcs["bucket"]})
+    if gcs["service_account_path"]:
+        env["PYPIRON_GCS_SERVICE_ACCOUNT_PATH"] = gcs["service_account_path"]
+    try:
+        yield from _start_cloud_server(tmp_path_factory, pypiron_bin, env, bind, "gcs")
+    finally:
+        _gcs_empty_bucket(gcs["bucket"])
 
 
 # ------------------------------ Azurite fixtures ------------------------------

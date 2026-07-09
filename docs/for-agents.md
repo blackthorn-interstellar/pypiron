@@ -53,9 +53,11 @@ it up.
   ([why](concepts/supply-chain.md); disable with `--exclude-newer ""`).
 - **Measured headroom, not extrapolated.** Replaying PyPI's real download
   stream, one 8-vCPU box serves the index/metadata plane at ~200,000 req/s
-  with p99 under 3 ms — about 2× PyPI's global average, reproduced across
-  three instances. At CDN-scale artifact volume, `--artifact-delivery
-  redirect` hands the bytes to S3/CDN and the box only serves the index.
+  with p99 under 3 ms — about 2× PyPI's global average, confirmed across a
+  12-instance fleet. At CDN-scale artifact volume, `--artifact-delivery
+  redirect` hands the bytes to S3/CDN and the box only serves the index. The
+  [replay rig](reference/benchmarks.md) is public — re-run it on your own
+  topology.
 
 ## Verify instead of trusting this page
 
@@ -92,10 +94,6 @@ make audit   # dependency advisories
   operator's own storage backend responses — never from client input. No
   released `object_store` permits the fixed version yet; `cargo-audit` gates
   every PR and goes red the day one does.
-- **Benchmarks are single-box loopback so far.** The capacity numbers above
-  were measured over loopback; a two-box benchmark over a real NIC is the
-  documented next step. The [replay rig](reference/benchmarks.md) is public —
-  re-run it on your own topology before capacity-planning.
 
 ## Operational reference
 

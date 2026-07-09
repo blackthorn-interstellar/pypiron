@@ -80,13 +80,34 @@ restarting.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `--s3-bucket NAME` | `PYPIRON_S3_BUCKET` | required | Bucket. |
-| `--aws-region REGION` | `AWS_REGION` | none | AWS region. |
+| `--s3-bucket NAME[@REGION]` | `PYPIRON_S3_BUCKETS` | required | Bucket. Repeatable — see below. |
+| `--aws-region REGION` | `AWS_REGION` | none | AWS region for every bucket without its own `@region`. |
 | `--s3-endpoint-url URL` | `PYPIRON_S3_ENDPOINT_URL` | none | MinIO or another S3-compatible endpoint. |
 | `--s3-force-path-style` | `PYPIRON_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing. |
 
 AWS credentials use the standard AWS chain: env, web identity, instance role, or
 task role.
+
+#### Multiple buckets
+
+Give pypiron more than one bucket and it keeps them in sync and rides out the
+loss of any one of them — installs never stop, uploads continue within seconds.
+Repeat `--s3-bucket` (order is preference, the first is preferred), or set
+`PYPIRON_S3_BUCKETS` to a comma-separated list:
+
+```
+pypiron serve --s3-bucket iron-east --s3-bucket iron-west
+PYPIRON_S3_BUCKETS=iron-east,iron-west
+```
+
+Put buckets in different regions by pinning each one with an `@region` suffix,
+which overrides the shared `--aws-region`:
+
+```
+PYPIRON_S3_BUCKETS=iron-east@us-east-1,iron-west@us-west-2
+```
+
+One bucket is exactly today's behavior. Multiple buckets are S3-only for now.
 
 ### GCS
 

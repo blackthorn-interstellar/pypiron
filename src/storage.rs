@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use async_trait::async_trait;
 use axum::body::Body;
 use clap::{Args as ClapArgs, ValueEnum};
@@ -54,9 +54,18 @@ pub struct StorageArgs {
     #[arg(long, env = "PYPIRON_STORAGE_PREFIX")]
     pub storage_prefix: Option<String>,
 
-    /// S3 bucket name for package storage (required if --storage s3)
-    #[arg(long, env = "PYPIRON_S3_BUCKET")]
-    pub s3_bucket: Option<String>,
+    /// S3 bucket(s) for package storage (required if --storage s3). Repeat
+    /// `--s3-bucket` — or set `PYPIRON_S3_BUCKETS` to a comma-separated list —
+    /// for multi-bucket replication and failover; order is preference and the
+    /// first is preferred. Each entry may carry a per-bucket region as
+    /// `name@region` (e.g. `iron-east@us-east-1`).
+    #[arg(
+        long = "s3-bucket",
+        env = "PYPIRON_S3_BUCKETS",
+        value_delimiter = ',',
+        value_name = "NAME[@REGION]"
+    )]
+    pub s3_buckets: Vec<String>,
 
     /// AWS region (e.g., us-east-1)
     #[arg(long, env = "AWS_REGION")]
@@ -107,18 +116,46 @@ pub struct StorageArgs {
 }
 
 impl StorageArgs {
+    /// The node's default (preferred) storage handle — bucket 0. Preserves the
+    /// exact single-bucket construction, crash-injection wrapper included.
     pub async fn build(&self) -> Result<Arc<dyn Storage>> {
-        let storage = self.build_backend().await?;
+        self.build_all()
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no storage backend configured"))
+    }
+
+    /// One storage handle per configured bucket, in preference order: a single
+    /// handle for disk/GCS/Azure or a lone S3 bucket, the full list for
+    /// multi-bucket S3. Only bucket 0 gets the crash-injection wrapper.
+    pub async fn build_all(&self) -> Result<Vec<Arc<dyn Storage>>> {
+        let mut handles = self.build_backends().await?;
         // Crash-consistency hook for the chaos tests: abort the process just
-        // before the Nth mutating storage operation. Inert without the env
-        // var; see tests/test_crash_consistency.py.
-        if let Some(n) = std::env::var("PYPIRON_FAULT_ABORT_AFTER_WRITES")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-        {
-            return Ok(Arc::new(FaultInjectStorage::new(storage, n)));
+        // before the Nth mutating storage operation, on the node's default
+        // bucket only. Inert without the env var; see
+        // tests/test_crash_consistency.py.
+        if let Some(n) = fault_abort_after_writes() {
+            if let Some(first) = handles.first_mut() {
+                *first = Arc::new(FaultInjectStorage::new(first.clone(), n));
+            }
         }
-        Ok(storage)
+        Ok(handles)
+    }
+
+    /// Human-readable identity of each configured bucket, in the same order and
+    /// count as [`build_all`](Self::build_all), for topology stamping and logs.
+    pub fn bucket_names(&self) -> Vec<String> {
+        match self.storage {
+            StorageBackend::Disk => vec![self.resolved_data_dir()],
+            StorageBackend::S3 => self
+                .s3_buckets
+                .iter()
+                .map(|spec| parse_s3_bucket_spec(spec).0.to_string())
+                .collect(),
+            StorageBackend::Gcs => vec![self.gcs_bucket.clone().unwrap_or_default()],
+            StorageBackend::Azure => vec![self.azure_container.clone().unwrap_or_default()],
+        }
     }
 
     /// The disk data directory actually used, applying the default.
@@ -142,7 +179,8 @@ impl StorageArgs {
     pub fn describe(&self) -> String {
         let where_ = match self.storage {
             StorageBackend::Disk => format!("disk · {}", self.resolved_data_dir()),
-            StorageBackend::S3 => format!("s3 · {}", self.s3_bucket.as_deref().unwrap_or("?")),
+            StorageBackend::S3 if self.s3_buckets.is_empty() => "s3 · ?".to_string(),
+            StorageBackend::S3 => format!("s3 · {}", self.s3_buckets.join(", ")),
             StorageBackend::Gcs => format!("gcs · {}", self.gcs_bucket.as_deref().unwrap_or("?")),
             StorageBackend::Azure => {
                 format!("azure · {}", self.azure_container.as_deref().unwrap_or("?"))
@@ -154,7 +192,15 @@ impl StorageArgs {
         }
     }
 
-    async fn build_backend(&self) -> Result<Arc<dyn Storage>> {
+    async fn build_backends(&self) -> Result<Vec<Arc<dyn Storage>>> {
+        // Multi-bucket is S3-only for now; GCS/Azure/disk stay single-bucket.
+        if self.s3_buckets.len() > 1 && !matches!(self.storage, StorageBackend::S3) {
+            bail!(
+                "multi-bucket is S3-only for now: {} buckets were configured, \
+                 but --storage is not s3",
+                self.s3_buckets.len()
+            );
+        }
         let prefix = self.resolved_prefix()?;
         match self.storage {
             StorageBackend::Disk => {
@@ -164,46 +210,17 @@ impl StorageArgs {
                 if let Some(ref p) = prefix {
                     root.push(p);
                 }
-                Ok(Arc::new(DiskStorage::new(root)))
+                Ok(vec![Arc::new(DiskStorage::new(root))])
             }
             StorageBackend::S3 => {
-                let bucket = self
-                    .s3_bucket
-                    .clone()
-                    .ok_or_else(|| anyhow!("--s3-bucket is required when using --storage s3"))?;
-                // Credentials come from the standard AWS chain (env vars, web
-                // identity, instance metadata). The default S3ConditionalPut is
-                // ETag-match, so the single-PUT create-if-absent path works on
-                // S3 and S3-compatible stores out of the box; large artifacts
-                // are published with a multipart copy-if-not-exists.
-                let mut b = AmazonS3Builder::from_env()
-                    .with_bucket_name(bucket)
-                    .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
-                if let Some(ref r) = self.aws_region {
-                    b = b.with_region(r.clone());
+                if self.s3_buckets.is_empty() {
+                    bail!("--s3-bucket is required when using --storage s3");
                 }
-                if let Some(ref url) = self.s3_endpoint_url {
-                    b = b.with_endpoint(url.clone());
-                    if url.starts_with("http://") {
-                        b = b.with_allow_http(true);
-                    }
+                let mut handles = Vec::with_capacity(self.s3_buckets.len());
+                for spec in &self.s3_buckets {
+                    handles.push(self.build_one_s3(spec).await?);
                 }
-                if self.s3_force_path_style {
-                    b = b.with_virtual_hosted_style_request(false);
-                } else if self.s3_endpoint_url.is_none() {
-                    // Real AWS prefers virtual-hosted-style addressing; custom
-                    // endpoints (MinIO et al.) keep the path-style default.
-                    b = b.with_virtual_hosted_style_request(true);
-                }
-                let s3 = Arc::new(b.build().context("configure S3 backend")?);
-                let store: Arc<dyn ObjectStore> = s3.clone();
-                let signer: Arc<dyn Signer> = s3;
-                Ok(Arc::new(ObjectStorage::new(
-                    store,
-                    Some(signer),
-                    prefix,
-                    "s3",
-                )))
+                Ok(handles)
             }
             StorageBackend::Gcs => {
                 let bucket = self
@@ -228,7 +245,9 @@ impl StorageArgs {
                 let gcs = Arc::new(b.build().context("configure GCS backend")?);
                 let store: Arc<dyn ObjectStore> = gcs.clone();
                 let signer = can_sign.then_some(gcs as Arc<dyn Signer>);
-                Ok(Arc::new(ObjectStorage::new(store, signer, prefix, "gcs")))
+                Ok(vec![Arc::new(ObjectStorage::new(
+                    store, signer, prefix, "gcs",
+                ))])
             }
             StorageBackend::Azure => {
                 let container = self.azure_container.clone().ok_or_else(|| {
@@ -257,10 +276,72 @@ impl StorageArgs {
                 let az = Arc::new(b.build().context("configure Azure backend")?);
                 let store: Arc<dyn ObjectStore> = az.clone();
                 let signer = can_sign.then_some(az as Arc<dyn Signer>);
-                Ok(Arc::new(ObjectStorage::new(store, signer, prefix, "azure")))
+                Ok(vec![Arc::new(ObjectStorage::new(
+                    store, signer, prefix, "azure",
+                ))])
             }
         }
     }
+
+    /// Build one S3-backed [`Storage`] from a `name[@region]` bucket spec.
+    /// Credentials come from the standard AWS chain (env vars, web identity,
+    /// instance metadata). The default S3ConditionalPut is ETag-match, so the
+    /// single-PUT create-if-absent path works on S3 and S3-compatible stores out
+    /// of the box; large artifacts are published with a multipart copy-if-not-exists.
+    async fn build_one_s3(&self, spec: &str) -> Result<Arc<dyn Storage>> {
+        let prefix = self.resolved_prefix()?;
+        let (bucket, region) = parse_s3_bucket_spec(spec);
+        if bucket.is_empty() {
+            bail!("empty S3 bucket name in --s3-bucket value '{spec}'");
+        }
+        let mut b = AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
+        // Region precedence: per-bucket `@region` suffix, then the shared
+        // --aws-region, then the object-store builder's own default.
+        if let Some(r) = region.or(self.aws_region.as_deref()) {
+            b = b.with_region(r.to_string());
+        }
+        if let Some(ref url) = self.s3_endpoint_url {
+            b = b.with_endpoint(url.clone());
+            if url.starts_with("http://") {
+                b = b.with_allow_http(true);
+            }
+        }
+        if self.s3_force_path_style {
+            b = b.with_virtual_hosted_style_request(false);
+        } else if self.s3_endpoint_url.is_none() {
+            // Real AWS prefers virtual-hosted-style addressing; custom endpoints
+            // (MinIO et al.) keep the path-style default.
+            b = b.with_virtual_hosted_style_request(true);
+        }
+        let s3 = Arc::new(b.build().context("configure S3 backend")?);
+        let store: Arc<dyn ObjectStore> = s3.clone();
+        let signer: Arc<dyn Signer> = s3;
+        Ok(Arc::new(ObjectStorage::new(
+            store,
+            Some(signer),
+            prefix,
+            "s3",
+        )))
+    }
+}
+
+/// Parse an S3 bucket spec `name[@region]` into its parts. S3 bucket names cannot
+/// contain '@', so the first '@' unambiguously begins the region.
+fn parse_s3_bucket_spec(spec: &str) -> (&str, Option<&str>) {
+    match spec.split_once('@') {
+        Some((name, region)) if !region.is_empty() => (name, Some(region)),
+        Some((name, _)) => (name, None),
+        None => (spec, None),
+    }
+}
+
+/// The crash-injection write threshold from the environment, if set (chaos tests).
+fn fault_abort_after_writes() -> Option<i64> {
+    std::env::var("PYPIRON_FAULT_ABORT_AFTER_WRITES")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
 }
 
 /// Sentinel error for "object does not exist" — callers translate this to

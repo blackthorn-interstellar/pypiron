@@ -823,7 +823,7 @@ def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
     env.update(
         {
             "PYPIRON_STORAGE": "s3",
-            "PYPIRON_S3_BUCKET": minio["bucket"],
+            "PYPIRON_S3_BUCKETS": minio["bucket"],
             "AWS_REGION": minio.get("region") or "us-east-1",
             "PYPIRON_BIND_ADDR": bind,
             "PYPIRON_WORKER_INTERVAL_SECS": "1",

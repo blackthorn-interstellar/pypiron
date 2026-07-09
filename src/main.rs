@@ -21,6 +21,7 @@ use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand}
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{debug, info, warn};
 
+mod buckets;
 mod cache;
 mod config;
 mod coremeta;
@@ -48,6 +49,7 @@ mod web;
 mod wheel;
 mod worker;
 
+use buckets::{BucketHandle, BucketSet};
 use names::{
     checked_pkg_name, infer_package_from_filename, infer_version_from_filename, is_normalized,
     normalize_pkg_name,
@@ -647,6 +649,12 @@ type DownloadBoard = Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<(Strin
 #[derive(Clone)]
 struct AppState {
     storage: Arc<dyn Storage>,
+    /// All configured buckets and the currently-selected one. Single-bucket
+    /// deployments hold exactly one; `storage` is always `buckets.pin().storage`
+    /// so the two cannot diverge. Read pervasively once P1's pin-at-entry sweep
+    /// lands; held but unread in P0.
+    #[allow(dead_code)]
+    buckets: Arc<BucketSet>,
     // auth — two roles: uploader (publish) and admin (everything, incl. mirror,
     // delete, yank). Admin is a strict superset of uploader.
     uploader_user: Option<String>,
@@ -1019,7 +1027,13 @@ fn merge_storage_file(
     }
     storage.data_dir = storage.data_dir.take().or(f.data_dir.clone());
     storage.storage_prefix = storage.storage_prefix.take().or(f.storage_prefix.clone());
-    storage.s3_bucket = storage.s3_bucket.take().or(f.s3_bucket.clone());
+    // The config file carries a single `s3-bucket`; multi-bucket lists come from
+    // the CLI/env. Fold the file value in only when CLI/env named no bucket.
+    if storage.s3_buckets.is_empty() {
+        if let Some(b) = &f.s3_bucket {
+            storage.s3_buckets.push(b.clone());
+        }
+    }
     storage.aws_region = storage.aws_region.take().or(f.aws_region.clone());
     storage.s3_endpoint_url = storage.s3_endpoint_url.take().or(f.s3_endpoint_url.clone());
     storage.gcs_bucket = storage.gcs_bucket.take().or(f.gcs_bucket.clone());
@@ -1091,7 +1105,25 @@ async fn run_serve(
     }
 
     let storage_desc = cli.storage.describe();
-    let storage = cli.storage.build().await?;
+    let storages = cli.storage.build_all().await?;
+    let names = cli.storage.bucket_names();
+    debug_assert_eq!(storages.len(), names.len());
+    let handles: Vec<BucketHandle> = storages
+        .into_iter()
+        .zip(names)
+        .map(|(storage, name)| BucketHandle { storage, name })
+        .collect();
+    let buckets = Arc::new(BucketSet::new(handles));
+    // Fail closed on a mismatched bucket topology before serving a byte (no-op
+    // unless more than one bucket is configured).
+    buckets.verify_topology().await?;
+    if buckets.is_multi() {
+        info!(
+            count = buckets.len(),
+            "multi-bucket storage: replication and failover across configured buckets"
+        );
+    }
+    let storage = buckets.pin().storage.clone();
     let proxy = match cli.proxy_upstream.as_deref() {
         Some(upstream) => {
             let mirror = cli.mirror.resolve(Some(&file.mirror))?;
@@ -1130,6 +1162,7 @@ async fn run_serve(
 
     let state = Arc::new(AppState {
         storage,
+        buckets,
         uploader_user: cli.uploader_user,
         uploader_pass: cli.uploader_pass,
         admin_user: cli.admin_user,
@@ -3479,8 +3512,11 @@ impl AppState {
     /// State for one-shot storage operations (rebuild-index) — no credentials, no
     /// server, default knobs. Only the storage-facing fields matter.
     fn headless(storage: Arc<dyn Storage>) -> Self {
+        let buckets = Arc::new(BucketSet::single(storage));
+        let storage = buckets.pin().storage.clone();
         AppState {
             storage,
+            buckets,
             uploader_user: None,
             uploader_pass: None,
             admin_user: None,

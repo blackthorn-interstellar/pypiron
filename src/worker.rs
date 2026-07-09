@@ -1444,6 +1444,7 @@ mod tests {
         });
         let state = Arc::new(AppState {
             storage: storage.clone(),
+            buckets: Arc::new(crate::buckets::BucketSet::single(storage.clone())),
             uploader_user: None,
             uploader_pass: None,
             admin_user: None,
@@ -1548,6 +1549,7 @@ mod tests {
         });
         let state = Arc::new(AppState {
             storage: storage.clone(),
+            buckets: Arc::new(crate::buckets::BucketSet::single(storage.clone())),
             uploader_user: None,
             uploader_pass: None,
             admin_user: None,

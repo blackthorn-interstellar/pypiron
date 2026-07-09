@@ -191,7 +191,7 @@ cmd_serve() {  # serve <server>  -- pypiron | pypiserver | proxpi
       # The runtime image's ENTRYPOINT is already `pypiron`, so args start at the
       # subcommand (a leading `pypiron` here would exec `pypiron pypiron serve`).
       ssh_to "$RIG2_SERVER_IP" "sudo docker rm -f pypiron 2>/dev/null; sudo docker run -d --name pypiron --network host \
-        -e PYPIRON_BIND_ADDR=0.0.0.0:8080 -e PYPIRON_S3_BUCKET=${RIG_BUCKET} -e AWS_REGION=${RIG_REGION} \
+        -e PYPIRON_BIND_ADDR=0.0.0.0:8080 -e PYPIRON_S3_BUCKETS=${RIG_BUCKET} -e AWS_REGION=${RIG_REGION} \
         pypiron:bench-${RIG2_SERVER_ARCH} serve --storage=s3 --artifact-delivery=redirect \
         --uploader-user=admin --uploader-pass=secret --admin-user=admin --admin-pass=secret"
       echo "== seed corpus -> pypiron -> S3 (upload from the server)"

@@ -144,10 +144,10 @@ packages =
 def gen_pypicloud_dynamo_conf() -> None:
     """Render pypicloud-config-dynamo.gen.ini, substituting the rig bucket/region
     (pypicloud's ini does no env interpolation). Track 2, AWS-only."""
-    bucket = os.environ.get("PYPIRON_S3_BUCKET")
+    bucket = os.environ.get("PYPIRON_S3_BUCKETS")
     region = os.environ.get("AWS_REGION", "us-east-1")
     if not bucket:
-        raise SystemExit("Track 2 pypicloud needs PYPIRON_S3_BUCKET set (the rig bucket)")
+        raise SystemExit("Track 2 pypicloud needs PYPIRON_S3_BUCKETS set (the rig bucket)")
     tmpl = (COMPOSE / "pypicloud-config-dynamo.ini").read_text()
     out = tmpl.replace("__BUCKET__", bucket).replace("__REGION__", region)
     (COMPOSE / "pypicloud-config-dynamo.gen.ini").write_text(out)

@@ -101,7 +101,7 @@ def main():
     env = dict(
         os.environ,
         PYPIRON_STORAGE="s3",
-        PYPIRON_S3_BUCKET=BUCKET,
+        PYPIRON_S3_BUCKETS=BUCKET,
         AWS_REGION=REGION,
         PYPIRON_BIND_ADDR=f"127.0.0.1:{port}",
         PYPIRON_WORKER_INTERVAL_SECS="1",

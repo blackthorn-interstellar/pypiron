@@ -160,7 +160,7 @@ cmd_run() {
   load_env
   local track="${RIG_TRACK:-1}"
   local servers=("$@"); [[ ${#servers[@]} -eq 0 ]] && servers=(pypiron pypiserver devpi pypicloud bandersnatch proxpi)
-  local rigenv="PYPIRON_S3_BUCKET=${RIG_BUCKET} AWS_REGION=${RIG_REGION}"
+  local rigenv="PYPIRON_S3_BUCKETS=${RIG_BUCKET} AWS_REGION=${RIG_REGION}"
   local failed=()
   for s in "${servers[@]}"; do
     echo "== run ${s} (track ${track})"
@@ -177,7 +177,7 @@ cmd_capacity() {
   local track="${RIG_TRACK:-1}"
   local capflag="--capacity"; [[ "${RIG_INSTALL_MIX:-0}" == "1" ]] && capflag="--install-mix"
   local servers=("$@"); [[ ${#servers[@]} -eq 0 ]] && servers=(pypiron pypiserver devpi pypicloud bandersnatch proxpi)
-  local rigenv="PYPIRON_S3_BUCKET=${RIG_BUCKET} AWS_REGION=${RIG_REGION}"
+  local rigenv="PYPIRON_S3_BUCKETS=${RIG_BUCKET} AWS_REGION=${RIG_REGION}"
   local failed=()
   for s in "${servers[@]}"; do
     echo "== capacity ${s} (${capflag}, track ${track})"

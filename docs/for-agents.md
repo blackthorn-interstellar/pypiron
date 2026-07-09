@@ -51,6 +51,11 @@ it up.
   private name never falls through to the public index — dependency confusion
   is structurally off. New upstream releases wait 7 days by default
   ([why](concepts/supply-chain.md); disable with `--exclude-newer ""`).
+- **Measured headroom, not extrapolated.** Replaying PyPI's real download
+  stream, one 8-vCPU box serves the index/metadata plane at ~200,000 req/s
+  with p99 under 3 ms — about 2× PyPI's global average, reproduced across
+  three instances. At CDN-scale artifact volume, `--artifact-delivery
+  redirect` hands the bytes to S3/CDN and the box only serves the index.
 
 ## Verify instead of trusting this page
 
@@ -87,14 +92,10 @@ make audit   # dependency advisories
   operator's own storage backend responses — never from client input. No
   released `object_store` permits the fixed version yet; `cargo-audit` gates
   every PR and goes red the day one does.
-- **One-box capacity is measured, with a scope.** Replaying PyPI's real
-  download stream, one 8-vCPU box serves the index/metadata plane at
-  ~200,000 req/s (p99 under 3 ms) — about 2× PyPI's global average, and
-  reproduced across three separate instances. Artifact *bytes* saturate the
-  NIC long before the server; production byte-serving belongs on
-  `--artifact-delivery redirect` (S3/CDN serves the files). The
-  [replay rig](reference/benchmarks.md) is public — re-run it at your own
-  scale before capacity-planning.
+- **Benchmarks are single-box loopback so far.** The capacity numbers above
+  were measured over loopback; a two-box benchmark over a real NIC is the
+  documented next step. The [replay rig](reference/benchmarks.md) is public —
+  re-run it on your own topology before capacity-planning.
 
 ## Operational reference
 

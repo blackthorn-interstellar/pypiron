@@ -1,0 +1,4 @@
+# Generated traces and replay results — rebuild with trace_build.py / replay.py
+trace/
+*.results.json
+__pycache__/

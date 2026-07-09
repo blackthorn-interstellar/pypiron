@@ -256,6 +256,167 @@ of PyPI, frozen since ~2013) intentionally infer no version. The residual
 unrecoverable by construction, and harmless: sidecars carry authoritative
 versions everywhere except proxy/backfill inference.
 
+## Traffic replay: one box vs PyPI's real request stream
+
+Replaces the "one box could serve all of PyPI" back-of-the-envelope with a
+measurement against the real download stream. The trace is built from the public
+ClickHouse `pypi.pypi` per-download-event table (real files, real popularity,
+real installer mix, real artifact-vs-PEP 658-metadata split; sub-day arrival
+timing and `/simple/` index reads are modeled — see `bench/replay/README.md`).
+
+**Rig:** single **c7i.2xlarge** (8 vCPU Sapphire Rapids, 15 GB), AL2023 kernel
+6.1, 120 GB gp3, us-east-1, **disk backend**, HEAD build (rustc 1.96.1). Corpus:
+the 1M-request replay trace for 2026-06-28 — **41,507 real artifacts, 70.5 GB**
+seeded at real sizes (`seed.py --max-artifact-mb 0`, 131 s). Loadgen co-located
+(`oha` 1.4.7 over loopback, the single-box convention), so these are the
+**server's CPU/disk ceilings — the NIC is not exercised**.
+
+| Tier | conns | rps | p50 | p99 | notes |
+|---|---|---|---|---|---|
+| `/simple/` index | 256 | **202,069** | 1.20 ms | 2.62 ms | small buffered response |
+| `/simple/` index | 128 | 188,639 | 0.65 ms | 1.41 ms | |
+| PEP 658 `.metadata` | 128 | 188,546 | 0.65 ms | 1.39 ms | |
+| artifact, 100 KB (the common wheel) | 128 | **2,376** | 50.1 ms | 69.5 ms | ⚠ streaming-path stall |
+| artifact, 32 MB (streaming) | 8 | 24 | 330 ms | 410 ms | **6.25 Gbps** loopback |
+
+**PyPI's real pace** on 2026-06-28: ≥4.02B file requests/day ⇒ **≥46,500 req/s**
+(dataset lower bound — the sampled top files alone).
+
+What the numbers say, replacing the arithmetic:
+
+- **Index + metadata: the box wins outright.** ~190–200k rps at p99 <3 ms is
+  ~4× PyPI's *entire global* request rate, on one $0.36/hr box. The "one box
+  serves PyPI's index" claim holds — now measured, not extrapolated.
+- **Artifact bytes are NIC-bound, not server-bound.** Streaming tops out at
+  ~6.25 Gbps over loopback; real delivery caps at the instance NIC (~12.5 Gbps
+  on c7i.2xlarge). PyPI's artifact firehose is far past one NIC — which is
+  exactly the case for `--artifact-delivery redirect` (origin serves index +
+  302, S3/CDN serves bytes). Disk backend can't be PyPI's byte plane; it was
+  never meant to be.
+- **Finding — a ~40 ms Nagle/delayed-ACK stall on the artifact streaming path.**
+  Every `/files/` artifact response carries a ~40–50 ms tail stall (the delayed-
+  ACK signature: throughput scales linearly with connections, p50 pinned at
+  ~50 ms — 16→308, 64→1,205, 128→2,376, 256→4,504, 512→6,485 rps). It is
+  **absent on the buffered index/metadata responses** (sub-ms) and invisible on
+  large wheels (swamped by transfer time), but it pins small-wheel latency at
+  ~50 ms and caps small-artifact throughput at ~connections ÷ 50 ms. Since most
+  wheels are small (median ~149 KB), it throttles the common artifact case on
+  disk backend. Signature points at a missing `TCP_NODELAY` (or an uncorked
+  final write) on the streamed response; fixing it should lift both this and the
+  meter R6 artifact numbers. Not yet fixed — logged here for follow-up.
+  - **Update (2026-07-08): fix attempted (`.tcp_nodelay(true)`) — but see the
+    2026-07-09 verification below; it does NOT resolve the stall.** The proposed
+    root cause was axum 0.7.9 defaulting `tcp_nodelay: None`, so `set_nodelay` is
+    never called on accepted sockets (Nagle on); the streamed `/files/` body's
+    trailing chunk would then wait on the peer's delayed ACK (~40 ms), while
+    buffered index/metadata fit one segment and never stall. Fix proposed:
+    `.tcp_nodelay(true)` on the server builder in `src/main.rs` (one line). The
+    stall does not reproduce on macOS loopback (a c1 artifact served in ~0.52 ms
+    p50), so it had to be re-measured on Linux.
+  - **Update (2026-07-09): verified on Linux (c7i.2xlarge, disk backend) — the
+    `.tcp_nodelay(true)` fix does NOT resolve the stall; the diagnosis above is
+    wrong.** Two binaries built from the same tree (fix present vs the one line
+    reverted) were probed with `oha` on a single 100 KB artifact:
+
+    | binary | artifact c16 keepalive | c128 keepalive | artifact c16 **no keepalive** | index c128 |
+    |---|---|---|---|---|
+    | pre-fix (Nagle on) | 307 rps / p50 50.1 ms | 2,378 rps / 50.2 ms | 5,975 rps / **2.6 ms** | 203,511 rps / 0.61 ms |
+    | post-fix (`tcp_nodelay(true)`) | 304 rps / p50 50.1 ms | 2,415 rps / 50.2 ms | 5,955 rps / **2.6 ms** | 200,431 rps / 0.62 ms |
+
+    The stall is **byte-for-byte identical with and without the fix.** Decisive
+    controls: a minimal keepalive client showed ~50 ms per request with
+    `TCP_NODELAY` set on the server, the client, both, or neither — TCP_NODELAY
+    on either side changes nothing. And the stall is **keepalive-specific**:
+    `oha --disable-keepalive` (fresh connection per request) serves the same file
+    at 5,975 rps / 2.6 ms p50 (~19× faster), and buffered index responses never
+    stall even over keepalive. So it is **not** the Nagle/delayed-ACK deadlock:
+    disabling Nagle (which is what `tcp_nodelay` does) has no effect. The real
+    cause is in how the streamed `/files/` response body reconditions a **reused**
+    HTTP/1.1 connection for the next request (the buffered index path doesn't hit
+    it). Directions to investigate: whether the delayed ACK needs `TCP_QUICKACK`
+    (which `TCP_NODELAY` does not set), or whether the streamed body should be
+    buffered into a full response for small artifacts like the index path is.
+    `.tcp_nodelay(true)` is a confirmed **no-regression** (index and no-keepalive
+    numbers unchanged) but should not be recorded as the fix. Scope: measured on
+    Linux loopback — the same regime the original finding used; real-NIC and
+    real-client (uv/pip connection-pool) impact is still untested (needs a
+    2-box rig).
+  - **Update (2026-07-09): does NOT reproduce in Docker-on-Mac (linuxkit VM,
+    kernel 6.10.11), so no local wire-level diagnosis was possible.** A Linux
+    arm64 release binary was built and run inside a container with the same
+    100 KB artifact. Two independent signals show the keepalive stall is absent
+    in this environment: (1) `curl` over a single reused keepalive connection
+    served 4 sequential artifact GETs in **2.4 ms total**, and a `tcpdump -ttt`
+    on `lo` shows continuous data flow with microsecond inter-packet deltas —
+    **no ~40–50 ms gap anywhere** (a real per-request keepalive stall would put
+    a 50 ms gap before each reused request). (2) `oha` artifact c16 keepalive
+    (1,852 rps) ≈ c16 **no-keepalive** (1,816 rps) — the decisive ~19× keepalive
+    penalty seen on c7i is entirely absent. There is an incidental ~1,850 rps
+    artifact ceiling here, flat across c16/c128 and independent of keepalive —
+    that is the Docker-VM filesystem / blocking-IO path (virtiofs/overlay), not
+    the TCP stall. Conclusion: the stall needs the bare-metal Linux TCP stack
+    (c7i loopback) to manifest; the Docker Desktop VM's virtualized loopback
+    does not exhibit it, so a fix can only be verified on the c7i rig, not
+    locally. Evidence-based direction (from the c7i controls above, not from a
+    local repro): the stall lives **only** on the streaming `ReaderStream` body
+    and is **absent** on the in-memory `Bytes` index path — so buffering small
+    artifacts (below a size threshold covering the ~149 KB wheel median) into a
+    full non-streamed response, the way the index path already works, is the
+    change the evidence supports; it is portable (no Linux-only `TCP_QUICKACK`
+    re-arm dance) and bounded in memory. Not landed here: it changes the serving
+    path and cannot be latency-verified without the c7i rig.
+  - **Update (2026-07-09): buffering patch built, pending c7i verification.**
+    Implemented the small-artifact buffering in `src/storage.rs` (disk backend,
+    `RangeSpec::Full` arm): files `<= SMALL_ARTIFACT_BUFFER_MAX` (256 KiB) are
+    read fully and served as one in-memory body like the index path; larger
+    files still stream, and all range requests still stream. Locally verified
+    correctness only — headers identical to the streaming path (Content-Length,
+    Content-Type, Accept-Ranges, Cache-Control), byte content matches source
+    sha256, ranges still return 206; `make check` and full `make test` pass.
+    Whether it removes the keepalive stall is **not yet confirmed** — that waits
+    for the c7i rig, which does not reproduce in Docker-on-Mac.
+  - **Update (2026-07-09): c7i A/B run — the stall did NOT reproduce, so the
+    before/after can't be shown; the stall is instance-dependent even on c7i.**
+    Fresh c7i.2xlarge, **same AMI, kernel (6.1.176-220.360.amzn2023), and HEAD**
+    as the 2026-07-09 box that stalled deterministically (no commits landed in
+    between). Built THREE binaries and probed one 100 KB artifact:
+
+    | binary | 100 KB c16 keepalive | c128 keepalive | c16 no-keepalive | index c128 | 1 MB c16 |
+    |---|---|---|---|---|---|
+    | pure HEAD (no nodelay, no buffer) | 6,543 rps / p50 **2.4 ms** | 6,658 / 18 ms | 6,245 / 2.5 ms | 212,898 / 0.58 ms | 714 / 22 ms |
+    | pre-patch (nodelay only) | 6,672 rps / p50 **2.4 ms** | 6,807 / 18 ms | 6,404 / 2.5 ms | 215,196 / 0.58 ms | 724 / 22 ms |
+    | patched (nodelay + buffer) | 6,552 rps / p50 **2.4 ms** | 6,657 / 18 ms | 6,248 / 2.5 ms | 211,817 / 0.58 ms | 712 / 22 ms |
+
+    All three are identical — **pure HEAD already serves 100 KB over keepalive at
+    2.4 ms with no stall.** Confirmed three ways: oha keepalive ×3 (2.4 ms each),
+    oha keepalive ≈ no-keepalive (no ~19× penalty), and a deterministic
+    raw-socket keepalive client at **0.4 ms/request** (vs ~50 ms on the earlier
+    box, same client code). The 1 MB streamed case scales with bytes (22 ms), not
+    a fixed 50 ms — no stall there either. So this fresh c7i simply does not
+    exhibit the stall, and there is nothing for the buffering patch to fix here.
+    - **Revises the "needs c7i loopback" theory:** the stall is not deterministic
+      on c7i — it appeared on two earlier c7i instances and not on this third
+      one, with byte-identical code/kernel/AMI. It is an **instance/timing-
+      dependent** loopback Nagle/delayed-ACK race, not a code path that stalls on
+      demand. (This tempers the earlier "the stall is real and keepalive-specific"
+      note: real when it manifests, but it does not manifest on every c7i.)
+    - **Verdict on the buffering patch:** confirmed **no-regression** (identical
+      to pre-patch and pure HEAD across the whole matrix; correctness already
+      verified by `make test`). It remains architecturally the robust choice —
+      it serves small artifacts as one buffered body, exactly like the index
+      path that never stalled on any box — so landing it as hardening is
+      defensible. But it must **not** be recorded as a measured fix: no run has
+      shown a before/after collapse, because no controllable rig reliably
+      reproduces the stall. To claim "fixed", first find a rig where **pure HEAD
+      reliably stalls** (candidate: a 2-box real-NIC path rather than loopback),
+      then A/B there.
+- **The real mix runs with headroom.** Under `replay.py` at sub-saturation the
+  server served the real popularity mix (1.28M artifact + 698k index requests
+  observed) at ~45% CPU idle; the limiters were the single-threaded Python
+  loadgen and the artifact stall above, not the server's request handling. For
+  driving the server to its ceiling, `oha` (Rust, multi-core) is the right tool
+  and the source of the table above; `replay.py` is for mix/popularity realism.
+
 ## Full run details
 
 One subsection per benchmark session (meter runs, big-box runs, scale runs).

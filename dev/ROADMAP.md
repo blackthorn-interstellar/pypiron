@@ -20,6 +20,7 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 
 **Storage & indexing**
 - Disk (default, zero deps) and three cloud backends — S3 / S3-compatible, Google Cloud Storage, and Azure Blob — over one `object_store`-backed implementation.
+- `--storage-prefix` roots every key under one subtree, so a bucket can be shared (with other data, or with a second pypiron); reads and writes never leave the prefix.
 - Client-aware artifact delivery on cloud backends (`auto` / `redirect` / `stream`) via presigned URLs; streaming uploads (incremental hash, bounded RSS, multipart for large artifacts).
 - Crash-safe event-marker indexing (intent/commit pairs); fingerprint audit with cost proportional to churn; `pypiron verify-index` / `pypiron rebuild-index`.
 - Multi-node on any cloud backend via a sloppy leader lease (conditional writes, TTL, heartbeat).

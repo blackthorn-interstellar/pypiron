@@ -108,6 +108,7 @@ pub struct ServeConfig {
     // Storage backend selection (the same `--storage`/`--s3-*`/... knobs).
     pub storage: Option<String>,
     pub data_dir: Option<String>,
+    pub storage_prefix: Option<String>,
     pub s3_bucket: Option<String>,
     pub aws_region: Option<String>,
     pub s3_endpoint_url: Option<String>,

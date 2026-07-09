@@ -4,12 +4,13 @@ import base64
 import hashlib
 import hmac
 import os
+import shlex
 import subprocess
 import time
 from datetime import datetime, timezone
 from email.utils import formatdate
 from pathlib import Path
-from typing import Dict, Iterator
+from typing import Dict, Iterator, List
 
 import pytest
 
@@ -853,6 +854,83 @@ def _start_s3_server(
 def s3_server(tmp_path_factory, pypiron_bin: Path, minio: Dict) -> Iterator[Dict]:
     """pypiron configured against the MinIO S3 backend."""
     yield from _start_s3_server(tmp_path_factory, pypiron_bin, minio)
+
+
+#: Key prefix the `s3_server_prefixed` fixture roots pypiron under; the bucket
+#: also holds foreign keys outside it, which pypiron must leave alone.
+STORAGE_PREFIX = "tenant-a"
+
+
+@pytest.fixture()
+def s3_server_prefixed(tmp_path_factory, pypiron_bin: Path, minio: Dict) -> Iterator[Dict]:
+    """S3-backed server rooted under a key prefix, sharing the bucket."""
+    yield from _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        extra_env={"PYPIRON_STORAGE_PREFIX": STORAGE_PREFIX},
+    )
+
+
+@pytest.fixture()
+def s3_server_prefixed_presigned(
+    tmp_path_factory, pypiron_bin: Path, minio: Dict
+) -> Iterator[Dict]:
+    """Prefixed S3 server that redirects downloads to presigned URLs — the URL
+    has to be signed for the prefixed key, or the redirect 404s at the store."""
+    yield from _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        extra_env={
+            "PYPIRON_STORAGE_PREFIX": STORAGE_PREFIX,
+            "PYPIRON_ARTIFACT_DELIVERY": "redirect",
+        },
+    )
+
+
+def _mc(minio: Dict, script: str) -> str:
+    """Run a `mc` shell snippet against the MinIO container, returning stdout.
+    Mirrors the host.docker.internal → host-network fallback the `minio` fixture
+    uses. Skips only on a networking failure; a broken `mc` command is a bug and
+    must fail the test, not silently pass it."""
+    if not minio.get("endpoint"):
+        pytest.skip("mc bucket inspection targets the MinIO emulator, not a real S3 bucket")
+    port = minio["endpoint"].rsplit(":", 1)[1]
+    creds = f"{minio['access_key']}:{minio['secret_key']}"
+    attempts = []
+    for extra in (
+        ["-e", f"MC_HOST_local=http://{creds}@host.docker.internal:{port}"],
+        ["-e", f"MC_HOST_local=http://{creds}@127.0.0.1:{port}", "--network", "host"],
+    ):
+        rc, out, err = run_returncode(
+            ["docker", "run", "--rm", *extra, "--entrypoint", "sh", "minio/mc", "-c", script]
+        )
+        if rc == 0:
+            return out
+        attempts.append(f"rc={rc} {err.strip() or out.strip()}")
+    if any("unreachable" in a or "connection refused" in a.lower() for a in attempts):
+        pytest.skip("Unable to reach MinIO with minio/mc (check Docker networking)")
+    raise AssertionError(f"mc failed: {script!r}\n" + "\n".join(attempts))
+
+
+def minio_put_key(minio: Dict, key: str, body: str) -> None:
+    """Write a foreign object straight into the bucket, bypassing pypiron."""
+    dest = shlex.quote(f"local/{minio['bucket']}/{key}")
+    _mc(minio, f"printf %s {shlex.quote(body)} | mc pipe {dest}")
+
+
+def minio_get_key(minio: Dict, key: str) -> str:
+    """Read an object's body straight from the bucket, bypassing pypiron."""
+    target = shlex.quote(f"local/{minio['bucket']}/{key}")
+    return _mc(minio, f"mc cat {target}")
+
+
+def minio_list_keys(minio: Dict) -> List[str]:
+    """Every object key in the bucket, as pypiron-independent ground truth."""
+    root = f"local/{minio['bucket']}/"
+    out = _mc(minio, f"mc find {shlex.quote(root.rstrip('/'))}")
+    return sorted(ln[len(root) :] for ln in out.splitlines() if ln.startswith(root))
 
 
 @pytest.fixture()

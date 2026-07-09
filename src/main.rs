@@ -1018,6 +1018,7 @@ fn merge_storage_file(
         }
     }
     storage.data_dir = storage.data_dir.take().or(f.data_dir.clone());
+    storage.storage_prefix = storage.storage_prefix.take().or(f.storage_prefix.clone());
     storage.s3_bucket = storage.s3_bucket.take().or(f.s3_bucket.clone());
     storage.aws_region = storage.aws_region.take().or(f.aws_region.clone());
     storage.s3_endpoint_url = storage.s3_endpoint_url.take().or(f.s3_endpoint_url.clone());

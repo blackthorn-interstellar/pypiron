@@ -49,6 +49,11 @@ pub struct StorageArgs {
     #[arg(long, env = "PYPIRON_DATA_DIR")]
     pub data_dir: Option<String>,
 
+    /// Store everything under this key prefix, so pypiron can share a bucket
+    /// (e.g. "pypi" → "pypi/packages/..."). On disk, a subdirectory of --data-dir.
+    #[arg(long, env = "PYPIRON_STORAGE_PREFIX")]
+    pub storage_prefix: Option<String>,
+
     /// S3 bucket name for package storage (required if --storage s3)
     #[arg(long, env = "PYPIRON_S3_BUCKET")]
     pub s3_bucket: Option<String>,
@@ -125,23 +130,41 @@ impl StorageArgs {
         })
     }
 
+    /// The storage prefix in the normalized form the backends want, if set.
+    fn resolved_prefix(&self) -> Result<Option<String>> {
+        self.storage_prefix
+            .as_deref()
+            .map(normalize_prefix)
+            .transpose()
+    }
+
     /// Short, human-friendly description for the startup banner.
     pub fn describe(&self) -> String {
-        match self.storage {
+        let where_ = match self.storage {
             StorageBackend::Disk => format!("disk · {}", self.resolved_data_dir()),
             StorageBackend::S3 => format!("s3 · {}", self.s3_bucket.as_deref().unwrap_or("?")),
             StorageBackend::Gcs => format!("gcs · {}", self.gcs_bucket.as_deref().unwrap_or("?")),
             StorageBackend::Azure => {
                 format!("azure · {}", self.azure_container.as_deref().unwrap_or("?"))
             }
+        };
+        match &self.storage_prefix {
+            Some(p) => format!("{where_} · prefix {p}"),
+            None => where_,
         }
     }
 
     async fn build_backend(&self) -> Result<Arc<dyn Storage>> {
+        let prefix = self.resolved_prefix()?;
         match self.storage {
             StorageBackend::Disk => {
-                let data_dir = self.resolved_data_dir();
-                Ok(Arc::new(DiskStorage::new(&data_dir)))
+                // Disk has no key namespace to share, so the prefix is simply a
+                // subdirectory of the data dir — same tree, one level down.
+                let mut root = PathBuf::from(self.resolved_data_dir());
+                if let Some(ref p) = prefix {
+                    root.push(p);
+                }
+                Ok(Arc::new(DiskStorage::new(root)))
             }
             StorageBackend::S3 => {
                 let bucket = self
@@ -175,7 +198,12 @@ impl StorageArgs {
                 let s3 = Arc::new(b.build().context("configure S3 backend")?);
                 let store: Arc<dyn ObjectStore> = s3.clone();
                 let signer: Arc<dyn Signer> = s3;
-                Ok(Arc::new(ObjectStorage::new(store, Some(signer), "s3")))
+                Ok(Arc::new(ObjectStorage::new(
+                    store,
+                    Some(signer),
+                    prefix,
+                    "s3",
+                )))
             }
             StorageBackend::Gcs => {
                 let bucket = self
@@ -200,7 +228,7 @@ impl StorageArgs {
                 let gcs = Arc::new(b.build().context("configure GCS backend")?);
                 let store: Arc<dyn ObjectStore> = gcs.clone();
                 let signer = can_sign.then_some(gcs as Arc<dyn Signer>);
-                Ok(Arc::new(ObjectStorage::new(store, signer, "gcs")))
+                Ok(Arc::new(ObjectStorage::new(store, signer, prefix, "gcs")))
             }
             StorageBackend::Azure => {
                 let container = self.azure_container.clone().ok_or_else(|| {
@@ -229,7 +257,7 @@ impl StorageArgs {
                 let az = Arc::new(b.build().context("configure Azure backend")?);
                 let store: Arc<dyn ObjectStore> = az.clone();
                 let signer = can_sign.then_some(az as Arc<dyn Signer>);
-                Ok(Arc::new(ObjectStorage::new(store, signer, "azure")))
+                Ok(Arc::new(ObjectStorage::new(store, signer, prefix, "azure")))
             }
         }
     }
@@ -707,6 +735,9 @@ pub struct ObjectStorage {
     /// GCS with a service-account key; Azure with an account key or emulator).
     /// `None` means "serve it yourself" — never a hard failure.
     signer: Option<Arc<dyn Signer>>,
+    /// Root every key under this bare key prefix (no slashes at either end),
+    /// letting pypiron share a bucket. `None` means keys sit at the bucket root.
+    prefix: Option<String>,
     /// Backend name, for error context.
     backend: &'static str,
 }
@@ -733,12 +764,34 @@ impl ObjectStorage {
     pub fn new(
         store: Arc<dyn ObjectStore>,
         signer: Option<Arc<dyn Signer>>,
+        prefix: Option<String>,
         backend: &'static str,
     ) -> Self {
         Self {
             store,
             signer,
+            prefix,
             backend,
+        }
+    }
+
+    /// A logical key as an object_store path, rooted under the storage prefix.
+    /// Our keys carry no leading/trailing or doubled slashes, so this
+    /// round-trips exactly. The empty key addresses the prefix root itself.
+    fn oskey(&self, key: &str) -> OsPath {
+        match &self.prefix {
+            Some(p) => OsPath::from(format!("{p}/{key}")),
+            None => OsPath::from(key),
+        }
+    }
+
+    /// Inverse of [`Self::oskey`]: a store location back to a logical key.
+    /// `None` when the location lies outside the prefix — listings are always
+    /// prefix-scoped, so that means a store returned something we never wrote.
+    fn unkey<'a>(&self, loc: &'a str) -> Option<&'a str> {
+        match &self.prefix {
+            Some(p) => loc.strip_prefix(p.as_str())?.strip_prefix('/'),
+            None => Some(loc),
         }
     }
 
@@ -810,7 +863,7 @@ impl ObjectStorage {
 #[async_trait]
 impl Storage for ObjectStorage {
     async fn head_exists(&self, key: &str) -> Result<bool> {
-        match self.store.head(&oskey(key)).await {
+        match self.store.head(&self.oskey(key)).await {
             Ok(_) => Ok(true),
             Err(OsError::NotFound { .. }) => Ok(false),
             Err(e) => Err(anyhow::Error::from(e).context(format!("{}: head {key}", self.backend))),
@@ -822,14 +875,14 @@ impl Storage for ObjectStorage {
             return Ok(None);
         };
         let url = signer
-            .signed_url(reqwest::Method::GET, &oskey(key), expires)
+            .signed_url(reqwest::Method::GET, &self.oskey(key), expires)
             .await
             .with_context(|| format!("{}: presign {key}", self.backend))?;
         Ok(Some(url.to_string()))
     }
 
     async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>> {
-        let path = oskey(key);
+        let path = self.oskey(key);
         let Some(raw_range) = range else {
             return self.full_response(&path, key).await;
         };
@@ -882,7 +935,7 @@ impl Storage for ObjectStorage {
             ..Default::default()
         };
         self.store
-            .put_opts(&oskey(key), PutPayload::from(bytes), opts)
+            .put_opts(&self.oskey(key), PutPayload::from(bytes), opts)
             .await
             .with_context(|| format!("{}: put {key}", self.backend))?;
         Ok(())
@@ -901,7 +954,7 @@ impl Storage for ObjectStorage {
         };
         match self
             .store
-            .put_opts(&oskey(key), PutPayload::from(bytes), opts)
+            .put_opts(&self.oskey(key), PutPayload::from(bytes), opts)
             .await
         {
             Ok(_) => Ok(true),
@@ -934,9 +987,13 @@ impl Storage for ObjectStorage {
         // RSS), then publish atomically. copy_if_not_exists is the race-free
         // create-if-absent for large objects — native on GCS/Azure, a
         // multipart copy on S3.
-        let staging = oskey(&staging_key(key));
+        let staging = self.oskey(&staging_key(key));
         self.stream_multipart(&staging, path, content_type).await?;
-        let outcome = match self.store.copy_if_not_exists(&staging, &oskey(key)).await {
+        let outcome = match self
+            .store
+            .copy_if_not_exists(&staging, &self.oskey(key))
+            .await
+        {
             Ok(()) => Ok(true),
             Err(OsError::AlreadyExists { .. }) => Ok(false),
             Err(e) => {
@@ -948,7 +1005,7 @@ impl Storage for ObjectStorage {
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
-        match self.store.get(&oskey(key)).await {
+        match self.store.get(&self.oskey(key)).await {
             Ok(res) => Ok(res
                 .bytes()
                 .await
@@ -965,18 +1022,20 @@ impl Storage for ObjectStorage {
         // missing prefix is an empty listing, not an error.
         let res = self
             .store
-            .list_with_delimiter(Some(&oskey(dir_prefix)))
+            .list_with_delimiter(Some(&self.oskey(dir_prefix)))
             .await
             .with_context(|| format!("{}: list {dir_prefix}", self.backend))?;
         let mut entries: Vec<FileEntry> = res
             .objects
             .into_iter()
-            .map(|m| FileEntry {
-                key: m.location.as_ref().to_string(),
-                size: m.size,
-                last_modified: OffsetDateTime::from_unix_timestamp(m.last_modified.timestamp())
-                    .ok()
-                    .and_then(|t| t.format(&Rfc3339).ok()),
+            .filter_map(|m| {
+                Some(FileEntry {
+                    key: self.unkey(m.location.as_ref())?.to_string(),
+                    size: m.size,
+                    last_modified: OffsetDateTime::from_unix_timestamp(m.last_modified.timestamp())
+                        .ok()
+                        .and_then(|t| t.format(&Rfc3339).ok()),
+                })
             })
             .collect();
         entries.sort_by(|a, b| a.key.cmp(&b.key));
@@ -995,12 +1054,16 @@ impl Storage for ObjectStorage {
             Some(i) => &prefix[..=i],
             None => "",
         };
-        let list_prefix = (!dir.is_empty()).then(|| oskey(dir));
+        // A storage prefix always scopes the listing, even at the tree root —
+        // listing the whole bucket would return objects that aren't ours.
+        let list_prefix = (!dir.is_empty() || self.prefix.is_some()).then(|| self.oskey(dir));
         let mut stream = self.store.list(list_prefix.as_ref());
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
             let m = item.with_context(|| format!("{}: list_all {prefix}", self.backend))?;
-            let key = m.location.as_ref();
+            let Some(key) = self.unkey(m.location.as_ref()) else {
+                continue;
+            };
             if key.starts_with(prefix) {
                 out.push(ObjectMeta {
                     key: key.to_string(),
@@ -1015,7 +1078,7 @@ impl Storage for ObjectStorage {
 
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
         for k in keys {
-            let _ = self.store.delete(&oskey(k)).await;
+            let _ = self.store.delete(&self.oskey(k)).await;
         }
         Ok(())
     }
@@ -1025,7 +1088,7 @@ impl Storage for ObjectStorage {
     }
 
     async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
-        match self.store.get(&oskey(key)).await {
+        match self.store.get(&self.oskey(key)).await {
             Ok(res) => {
                 let etag = pack_version(&res.meta.e_tag, &res.meta.version);
                 let bytes = res
@@ -1044,7 +1107,7 @@ impl Storage for ObjectStorage {
         match self
             .store
             .put_opts(
-                &oskey(key),
+                &self.oskey(key),
                 PutPayload::from(bytes),
                 PutOptions::from(PutMode::Create),
             )
@@ -1061,7 +1124,7 @@ impl Storage for ObjectStorage {
         let opts = PutOptions::from(PutMode::Update(unpack_version(etag)));
         match self
             .store
-            .put_opts(&oskey(key), PutPayload::from(bytes), opts)
+            .put_opts(&self.oskey(key), PutPayload::from(bytes), opts)
             .await
         {
             Ok(res) => Ok(Some(pack_version(&res.e_tag, &res.version))),
@@ -1079,10 +1142,22 @@ impl Storage for ObjectStorage {
     }
 }
 
-/// A key as an object_store path. Our keys carry no leading/trailing or doubled
-/// slashes, so this round-trips exactly.
-fn oskey(key: &str) -> OsPath {
-    OsPath::from(key)
+/// Normalize a user-supplied storage prefix into a bare key prefix carrying no
+/// leading, trailing, or doubled slashes — the form `ObjectStorage` prepends.
+/// Rejects traversal and empty segments so a prefix cannot escape itself.
+pub fn normalize_prefix(raw: &str) -> Result<String> {
+    let p = raw.trim().trim_matches('/');
+    if p.is_empty() {
+        return Err(anyhow!("--storage-prefix must not be empty"));
+    }
+    if p.split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(anyhow!(
+            "--storage-prefix must not contain empty, '.', or '..' segments: {raw:?}"
+        ));
+    }
+    Ok(p.to_string())
 }
 
 /// Best-effort content type as object_store attributes (ignored by stores that
@@ -1220,6 +1295,39 @@ impl Storage for FaultInjectStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_prefix_strips_slashes_and_rejects_traversal() {
+        assert_eq!(normalize_prefix("pypi").unwrap(), "pypi");
+        assert_eq!(normalize_prefix("/pypi/").unwrap(), "pypi");
+        assert_eq!(normalize_prefix(" a/b ").unwrap(), "a/b");
+        for bad in ["", "/", "   ", "a//b", "../etc", "a/../b", "a/./b"] {
+            assert!(normalize_prefix(bad).is_err(), "expected reject: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn oskey_and_unkey_round_trip() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let keyed =
+            |p: Option<&str>| ObjectStorage::new(store.clone(), None, p.map(String::from), "mem");
+
+        let plain = keyed(None);
+        assert_eq!(plain.oskey("packages/a/x.whl").as_ref(), "packages/a/x.whl");
+        assert_eq!(plain.unkey("packages/a/x.whl"), Some("packages/a/x.whl"));
+
+        let pfx = keyed(Some("pypi"));
+        assert_eq!(
+            pfx.oskey("packages/a/x.whl").as_ref(),
+            "pypi/packages/a/x.whl"
+        );
+        assert_eq!(pfx.unkey("pypi/packages/a/x.whl"), Some("packages/a/x.whl"));
+        // The empty key addresses the prefix root, not the bucket root.
+        assert_eq!(pfx.oskey("").as_ref(), "pypi");
+        // A sibling that merely shares a name stem is not ours.
+        assert_eq!(pfx.unkey("pypi-other/packages/x"), None);
+        assert_eq!(pfx.unkey("other/x"), None);
+    }
 
     #[tokio::test]
     async fn disk_list_all_walks_filters_and_detects_change() {

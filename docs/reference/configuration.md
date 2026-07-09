@@ -59,6 +59,22 @@ containers must already exist.
 | --- | --- | --- | --- |
 | `--storage disk\|s3\|gcs\|azure` | `PYPIRON_STORAGE` | `disk` | Storage backend. |
 | `--data-dir PATH` | `PYPIRON_DATA_DIR` | `~/.pypiron/packages` | Disk root. |
+| `--storage-prefix PREFIX` | `PYPIRON_STORAGE_PREFIX` | none | Keep everything under one subtree, so pypiron can share a bucket. |
+
+### Sharing a bucket
+
+By default pypiron owns the whole bucket: artifacts land in `packages/`, indexes
+in `simple/`. Set `--storage-prefix pypi` and they move to `pypi/packages/` and
+`pypi/simple/` instead, leaving the rest of the bucket alone — pypiron neither
+reads nor writes outside its prefix. Two servers can share one bucket by taking
+different prefixes.
+
+On disk the prefix is simply a subdirectory of `--data-dir`.
+
+Point an existing server at a prefix and it will look empty: the prefix is part
+of every key, so it is chosen once, when the bucket is first populated. To adopt
+one later, move the objects (`aws s3 mv --recursive`, `gcloud storage mv`) before
+restarting.
 
 ### S3
 

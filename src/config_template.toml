@@ -29,6 +29,7 @@
 # cloud backends need the matching bucket/account keys below.
 # storage = "disk"
 # data-dir = "~/.pypiron/packages"          # disk: root folder
+# storage-prefix = "pypi"                   # share a bucket: keys become pypi/packages/...
 
 # S3, or any S3-compatible store such as MinIO. Region comes from AWS_REGION;
 # credentials from the standard AWS chain. The bucket must already exist.

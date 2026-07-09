@@ -1257,6 +1257,13 @@ async fn run_serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        // Hygiene default: set TCP_NODELAY on every accepted connection (axum
+        // leaves it off, i.e. Nagle on). Standard for a latency-sensitive HTTP
+        // server. NOTE: this is NOT the fix for the streamed-`/files/` keepalive
+        // stall recorded in dev/BENCHMARK_RESULTS.md — that stall was verified
+        // on Linux to be unaffected by TCP_NODELAY on either side; this line is
+        // kept only as a measured no-regression hygiene default.
+        .tcp_nodelay(true)
         .with_graceful_shutdown(async move {
             let _ = graceful_rx.await;
         })

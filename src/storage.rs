@@ -362,6 +362,16 @@ pub trait Storage: Send + Sync {
 /// EXDEV ("invalid cross-device link"), hardcoded so we don't pull in libc.
 const EXDEV: i32 = 18;
 
+/// Artifacts at or below this size are read fully into memory and served as a
+/// single in-memory body instead of a streamed file. The streamed-file path
+/// stalls small-artifact latency on a reused HTTP/1.1 keepalive connection
+/// (see dev/BENCHMARK_RESULTS.md); the in-memory path the index already uses
+/// does not. The median wheel is ~149 KB, so 256 KiB covers the common case
+/// while streaming still handles large artifacts. Worst-case extra RSS is this
+/// threshold times the number of concurrent small-artifact responses (~32 MB
+/// at 128 connections) — bounded, so this stays a const, not a config knob.
+const SMALL_ARTIFACT_BUFFER_MAX: u64 = 256 * 1024;
+
 /// ------------------------------ DiskStorage -------------------------------
 pub struct DiskStorage {
     root: PathBuf,
@@ -456,13 +466,21 @@ impl Storage for DiskStorage {
 
         let resp = match parse_range(range, size) {
             RangeSpec::Full => {
-                let file = fs::File::open(&path).await?;
-                Response::builder()
+                let builder = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_LENGTH, size)
                     .header(header::CONTENT_TYPE, "application/octet-stream")
-                    .header(header::ACCEPT_RANGES, "bytes")
-                    .body(Body::from_stream(ReaderStream::new(file)))?
+                    .header(header::ACCEPT_RANGES, "bytes");
+                if size <= SMALL_ARTIFACT_BUFFER_MAX {
+                    // Small artifacts: read fully and hand hyper one in-memory
+                    // body — same path the index uses, which avoids the reused-
+                    // keepalive streaming stall. Large files still stream.
+                    let bytes = fs::read(&path).await?;
+                    builder.body(Body::from(bytes))?
+                } else {
+                    let file = fs::File::open(&path).await?;
+                    builder.body(Body::from_stream(ReaderStream::new(file)))?
+                }
             }
             RangeSpec::Partial(start, end) => {
                 let mut file = fs::File::open(&path).await?;

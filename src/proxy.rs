@@ -21,6 +21,7 @@
 //! materialized index: already-cached packages keep installing.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -129,7 +130,7 @@ struct DownloadSlot {
 
 impl Drop for DownloadSlot {
     fn drop(&mut self) {
-        let mut map = self.inflight.lock().expect("inflight mutex poisoned");
+        let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(lock) = map.get(&self.key) {
             // We still hold `_guard` (one strong ref) and the map holds one.
             // Any count beyond that is a task already waiting on this key, so
@@ -137,6 +138,64 @@ impl Drop for DownloadSlot {
             if Arc::strong_count(lock) <= 2 {
                 map.remove(&self.key);
             }
+        }
+    }
+}
+
+/// DNS resolver that refuses to hand back private, loopback, or link-local
+/// addresses — the SSRF guard for the proxy's outbound fetches. Filtering at
+/// resolve time (rather than validating a hostname up front) also closes the
+/// DNS-rebind gap: reqwest connects to exactly the addresses returned here, on
+/// the initial request and on every redirect hop. The configured upstream host
+/// is exempt, so a self-hosted mirror on a private range still works.
+struct SsrfGuardResolver {
+    allow_host: Option<String>,
+}
+
+impl reqwest::dns::Resolve for SsrfGuardResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let exempt = self.allow_host.as_deref() == Some(host.as_str());
+        Box::pin(async move {
+            let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            let filtered: Vec<SocketAddr> = addrs
+                .filter(|addr| exempt || !is_forbidden_ip(&addr.ip()))
+                .collect();
+            if filtered.is_empty() {
+                return Err(format!(
+                    "refusing to connect to '{host}': resolves only to private/loopback addresses"
+                )
+                .into());
+            }
+            Ok(Box::new(filtered.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)
+        })
+    }
+}
+
+/// Private, loopback, link-local, or otherwise non-routable — never a valid
+/// target for an upstream fetch.
+fn is_forbidden_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0
+                // Carrier-grade NAT (100.64.0.0/10).
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_ip(&IpAddr::V4(v4));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // Unique-local fc00::/7.
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // Link-local fe80::/10.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
     }
 }
@@ -187,11 +246,27 @@ fn version_allowed(constraints: &[Option<VersionSpecifiers>], filename: &str) ->
 }
 
 impl Proxy {
-    pub fn new(upstream: &str, mirror: ResolvedMirror) -> Result<Self> {
+    pub fn new(upstream: &str, mirror: ResolvedMirror, allow_insecure: bool) -> Result<Self> {
         let upstream = upstream.trim_end_matches('/').to_string();
-        if !upstream.starts_with("http://") && !upstream.starts_with("https://") {
-            bail!("--proxy-upstream must be an http(s) URL, got '{upstream}'");
+        // Plaintext http:// lets a network MITM forge both the artifact bytes and
+        // the sha256 we check them against (they arrive over the same channel), so
+        // the hash stops being a control. Refuse it unless explicitly overridden.
+        if upstream.starts_with("http://") {
+            if !allow_insecure {
+                bail!(
+                    "--proxy-upstream is plaintext http://, which lets a network MITM forge \
+                     artifact hashes; pass --allow-insecure-upstream to override, got '{upstream}'"
+                );
+            }
+        } else if !upstream.starts_with("https://") {
+            bail!("--proxy-upstream must be an https URL, got '{upstream}'");
         }
+        // The upstream host is operator-chosen and trusted, so it is exempt from
+        // the SSRF guard below — an internal/self-hosted mirror on a private range
+        // must still work.
+        let allow_host = reqwest::Url::parse(&upstream)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string));
         // Derive the request-time allowlist index once. Empty scope → None, so
         // name_in_scope() short-circuits to "allow all" (the open-proxy default).
         let scope = (!mirror.include_packages.is_empty()).then(|| {
@@ -228,6 +303,11 @@ impl Proxy {
                 // that keep streaming. download_verified's retry loop turns the
                 // resulting error into a clean retry.
                 .read_timeout(Duration::from_secs(30))
+                // Refuse to connect to private/loopback/link-local addresses. A
+                // malicious or MITM'd upstream listing can point a companion URL
+                // (.metadata/.provenance — unlike artifacts, not hash-gated) at an
+                // internal endpoint and read the response back through us.
+                .dns_resolver(Arc::new(SsrfGuardResolver { allow_host }))
                 .build()?,
             listings: Mutex::new(HashMap::new()),
             inflight: Arc::new(Mutex::new(HashMap::new())),
@@ -240,7 +320,7 @@ impl Proxy {
         let lock = self
             .inflight
             .lock()
-            .expect("inflight mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .entry(key.to_string())
             .or_default()
             .clone();
@@ -554,7 +634,7 @@ impl Proxy {
             Listing::Found(found) => Some(found.clone()),
             Listing::Missing => None,
         };
-        let mut map = self.listings.lock().expect("listing lock poisoned");
+        let mut map = self.listings.lock().unwrap_or_else(|e| e.into_inner());
         if map.len() >= MAX_LISTINGS && !map.contains_key(pkg) {
             evict_listings(&mut map);
         }
@@ -571,7 +651,7 @@ impl Proxy {
     /// Cached listing lookup. `revive` refreshes the entry's timestamp and
     /// ignores expiry — the stale-on-upstream-error path.
     fn cached_listing(&self, pkg: &str, revive: bool) -> Option<Option<Arc<Found>>> {
-        let mut map = self.listings.lock().expect("listing lock poisoned");
+        let mut map = self.listings.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.get_mut(pkg)?;
         if revive {
             entry.fetched = Instant::now();
@@ -746,7 +826,7 @@ mod tests {
 
     #[test]
     fn relative_and_absolute_upstream_urls_resolve() {
-        let proxy = Proxy::new("https://pypi.org/", ResolvedMirror::default()).unwrap();
+        let proxy = Proxy::new("https://pypi.org/", ResolvedMirror::default(), false).unwrap();
         assert_eq!(proxy.upstream(), "https://pypi.org");
         let abs = proxy
             .resolve_url("six", "https://files.pythonhosted.org/p/six.whl")
@@ -760,10 +840,47 @@ mod tests {
 
     #[test]
     fn non_http_upstream_is_rejected() {
-        let err = Proxy::new("ftp://mirror", ResolvedMirror::default())
+        let err = Proxy::new("ftp://mirror", ResolvedMirror::default(), false)
             .map(|_| ())
             .unwrap_err();
-        assert!(err.to_string().contains("http(s)"));
+        assert!(err.to_string().contains("https"));
+    }
+
+    #[test]
+    fn plaintext_http_upstream_needs_opt_in() {
+        // Off by default: http:// lets a MITM forge the hashes we verify against.
+        let err = Proxy::new("http://mirror.internal", ResolvedMirror::default(), false)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("allow-insecure-upstream"));
+        // Explicit opt-in accepts it.
+        Proxy::new("http://mirror.internal", ResolvedMirror::default(), true).unwrap();
+    }
+
+    #[test]
+    fn ssrf_guard_blocks_private_addresses() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+        ] {
+            assert!(is_forbidden_ip(&ip), "{ip} should be blocked");
+        }
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(151, 101, 0, 223)), // files.pythonhosted.org
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 1)),
+        ] {
+            assert!(!is_forbidden_ip(&ip), "{ip} should be allowed");
+        }
     }
 
     fn spec(name: &str, specifiers: Option<&str>) -> crate::sync::PackageSpec {
@@ -775,7 +892,7 @@ mod tests {
 
     #[test]
     fn empty_scope_allows_every_name_and_version() {
-        let proxy = Proxy::new("https://pypi.org", ResolvedMirror::default()).unwrap();
+        let proxy = Proxy::new("https://pypi.org", ResolvedMirror::default(), false).unwrap();
         assert!(proxy.name_in_scope("anything"));
         assert!(proxy.version_in_scope("anything", "anything-1.0.0.tar.gz"));
     }
@@ -786,7 +903,7 @@ mod tests {
             include_packages: vec![spec("requests", Some(">=2.20,<3")), spec("numpy", None)],
             ..Default::default()
         };
-        let proxy = Proxy::new("https://pypi.org", filter).unwrap();
+        let proxy = Proxy::new("https://pypi.org", filter, false).unwrap();
         assert!(proxy.name_in_scope("requests"));
         assert!(proxy.name_in_scope("numpy"));
         assert!(
@@ -801,7 +918,7 @@ mod tests {
             include_packages: vec![spec("requests", Some(">=2.20,<3")), spec("numpy", None)],
             ..Default::default()
         };
-        let proxy = Proxy::new("https://pypi.org", filter).unwrap();
+        let proxy = Proxy::new("https://pypi.org", filter, false).unwrap();
         // Pinned name: only versions inside the range pass.
         assert!(proxy.version_in_scope("requests", "requests-2.31.0-py3-none-any.whl"));
         assert!(!proxy.version_in_scope("requests", "requests-2.10.0-py3-none-any.whl"));
@@ -820,7 +937,7 @@ mod tests {
             include_packages: vec![spec("foo", Some("==1.0")), spec("foo", Some("==3.0"))],
             ..Default::default()
         };
-        let proxy = Proxy::new("https://pypi.org", mirror).unwrap();
+        let proxy = Proxy::new("https://pypi.org", mirror, false).unwrap();
         assert!(proxy.version_in_scope("foo", "foo-1.0-py3-none-any.whl"));
         assert!(proxy.version_in_scope("foo", "foo-3.0-py3-none-any.whl"));
         assert!(!proxy.version_in_scope("foo", "foo-2.0-py3-none-any.whl"));
@@ -832,7 +949,7 @@ mod tests {
             exclude_packages: vec![spec("blocked", None)],
             ..Default::default()
         };
-        let proxy = Proxy::new("https://pypi.org", mirror).unwrap();
+        let proxy = Proxy::new("https://pypi.org", mirror, false).unwrap();
         assert!(proxy.name_in_scope("blocked"));
         assert!(proxy.name_fully_denied("blocked"));
         assert!(!proxy.version_in_scope("blocked", "blocked-1.0-py3-none-any.whl"));
@@ -846,7 +963,7 @@ mod tests {
             exclude_packages: vec![spec("demo", Some("<2"))],
             ..Default::default()
         };
-        let proxy = Proxy::new("https://pypi.org", mirror).unwrap();
+        let proxy = Proxy::new("https://pypi.org", mirror, false).unwrap();
         assert!(!proxy.name_fully_denied("demo"));
         assert!(!proxy.version_in_scope("demo", "demo-1.9-py3-none-any.whl"));
         assert!(proxy.version_in_scope("demo", "demo-2.0-py3-none-any.whl"));
@@ -860,7 +977,7 @@ mod tests {
             exclude_packages: vec![spec("demo", None), spec("pinned", Some("<2"))],
             ..Default::default()
         };
-        let proxy = Proxy::new("https://pypi.org", mirror).unwrap();
+        let proxy = Proxy::new("https://pypi.org", mirror, false).unwrap();
         assert!(proxy.name_in_scope("demo"));
         assert!(proxy.name_fully_denied("demo"));
         assert!(!proxy.version_in_scope("demo", "demo-3.0-py3-none-any.whl"));

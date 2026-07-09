@@ -618,6 +618,20 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_PROXY_UPSTREAM")]
     proxy_upstream: Option<String>,
 
+    /// Allow a plaintext `http://` proxy upstream. Off by default: over http a
+    /// network MITM controls both the artifact bytes and the sha256 we verify
+    /// them against, so the hash check stops being a security control.
+    #[arg(long, env = "PYPIRON_ALLOW_INSECURE_UPSTREAM")]
+    allow_insecure_upstream: bool,
+
+    /// Emit per-client `project` attribution labels on `/metrics`
+    /// (`pypiron_project_requests_total`). Off by default: `/metrics` is
+    /// unauthenticated, and the label is derived from the basic-auth username
+    /// subaddress, so exposing it lets any scraper enumerate internal project
+    /// names.
+    #[arg(long, env = "PYPIRON_METRICS_PROJECT_LABELS")]
+    metrics_project_labels: bool,
+
     /// The slice of PyPI the proxy serves and caches — names included. The same
     /// mirror-selection surface as `sync`, set once and shared: a `[mirror]` table
     /// in pypiron.toml governs both. With a package scope, the proxy serves only
@@ -648,6 +662,9 @@ struct AppState {
     token_signing_key: Option<String>,
     private_prefix: Option<String>,
     artifact_delivery: ArtifactDelivery,
+    /// Attach per-client `project` labels to `/metrics`. Off by default because
+    /// `/metrics` carries no auth; see the flag of the same name.
+    metrics_project_labels: bool,
     /// Widen the access log from mutations-only (the default) to every request.
     /// See `log_requests`.
     access_log: bool,
@@ -929,6 +946,16 @@ fn merge_serve_file(
     );
     fill!(cli.audit_on_boot, "audit_on_boot", f.audit_on_boot);
     fill!(
+        cli.allow_insecure_upstream,
+        "allow_insecure_upstream",
+        f.allow_insecure_upstream
+    );
+    fill!(
+        cli.metrics_project_labels,
+        "metrics_project_labels",
+        f.metrics_project_labels
+    );
+    fill!(
         cli.reconcile_interval_secs,
         "reconcile_interval_secs",
         f.reconcile_interval_secs
@@ -1067,7 +1094,11 @@ async fn run_serve(
     let proxy = match cli.proxy_upstream.as_deref() {
         Some(upstream) => {
             let mirror = cli.mirror.resolve(Some(&file.mirror))?;
-            Some(Arc::new(proxy::Proxy::new(upstream, mirror)?))
+            Some(Arc::new(proxy::Proxy::new(
+                upstream,
+                mirror,
+                cli.allow_insecure_upstream,
+            )?))
         }
         None => None,
     };
@@ -1107,6 +1138,7 @@ async fn run_serve(
         token_signing_key: cli.token_signing_key,
         private_prefix,
         artifact_delivery: cli.artifact_delivery,
+        metrics_project_labels: cli.metrics_project_labels,
         access_log: cli.access_log,
         access_log_format: cli.access_log_format,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
@@ -1589,7 +1621,12 @@ async fn track_metrics(
     next: Next,
 ) -> Response<Body> {
     let group = metrics::route_group(req.uri().path());
-    let project = project_tag(req.headers());
+    // Only read the project tag when labels are enabled; otherwise the
+    // unauthenticated /metrics endpoint would expose internal project names.
+    let project = state
+        .metrics_project_labels
+        .then(|| project_tag(req.headers()))
+        .flatten();
     let resp = next.run(req).await;
     let status = resp.status().as_u16();
     state.metrics.record_request(group, status);
@@ -3452,6 +3489,7 @@ impl AppState {
             token_signing_key: None,
             private_prefix: None,
             artifact_delivery: ArtifactDelivery::Auto,
+            metrics_project_labels: false,
             access_log: false,
             access_log_format: AccessLogFormat::Structured,
             worker_interval: Duration::from_secs(1),

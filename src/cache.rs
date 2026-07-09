@@ -232,7 +232,7 @@ impl IndexCache {
         };
 
         {
-            let mut entries = self.entries.lock().unwrap();
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             entries.insert(
                 key.to_string(),
                 Entry {
@@ -248,11 +248,14 @@ impl IndexCache {
     /// Drop a key after writing or deleting its index — same-process reads
     /// are fresh immediately, without waiting out the TTL.
     pub fn invalidate(&self, key: &str) {
-        self.entries.lock().unwrap().remove(key);
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
     }
 
     fn fresh(&self, key: &str) -> Option<Cached> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let entry = entries.map.get(key)?;
         (entry.fetched.elapsed() < self.ttl).then(|| entry.cached.clone())
     }
@@ -283,13 +286,13 @@ impl PresignCache {
     }
 
     pub fn fresh(&self, key: &str) -> Option<Arc<str>> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let (url, signed) = entries.get(key)?;
         (signed.elapsed() < self.ttl).then(|| url.clone())
     }
 
     pub fn put(&self, key: &str, url: Arc<str>) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.insert(key.to_string(), (url, Instant::now()));
         if entries.len() > PRESIGN_CACHE_MAX_ENTRIES {
             let ttl = self.ttl;
@@ -302,7 +305,10 @@ impl PresignCache {
 
     /// Deletes must stop handing out the dead URL immediately (same node).
     pub fn invalidate(&self, key: &str) {
-        self.entries.lock().unwrap().remove(key);
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
     }
 }
 

@@ -54,6 +54,14 @@
 # verifying and caching each artifact on first request. Scope what it will serve
 # with the [mirror] table below.
 # proxy-upstream = "https://pypi.org"
+# Allow a plaintext http:// upstream. Off by default: over http a MITM controls
+# both the bytes and the sha256 they're checked against, defeating verification.
+# allow-insecure-upstream = false
+
+# Attach per-client project labels to /metrics (pypiron_project_requests_total).
+# Off by default: /metrics is unauthenticated and the label is the basic-auth
+# username subaddress, so enabling it lets any scraper enumerate project names.
+# metrics-project-labels = false
 
 # How artifact bytes reach clients: auto | redirect | stream. auto redirects
 # cache-immune clients (uv) to presigned URLs and streams the rest; redirect

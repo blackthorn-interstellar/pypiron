@@ -90,6 +90,8 @@ pub struct ServeConfig {
     pub access_log: Option<bool>,
     pub access_log_format: Option<String>,
     pub proxy_upstream: Option<String>,
+    pub allow_insecure_upstream: Option<bool>,
+    pub metrics_project_labels: Option<bool>,
     pub spool_dir: Option<PathBuf>,
     pub wait_on_upload: Option<bool>,
     pub wait_on_upload_secs: Option<u64>,

@@ -346,6 +346,15 @@ def disk_server(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
 
 
 @pytest.fixture()
+def disk_server_project_labels(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server that attributes /metrics to per-client projects. Opt-in:
+    /metrics is unauthenticated, so the labels leak project names by default."""
+    yield from _start_disk_server(
+        tmp_path_factory, pypiron_bin, extra_args=["--metrics-project-labels"]
+    )
+
+
+@pytest.fixture()
 def disk_server_release(tmp_path_factory, pypiron_release_bin: Path) -> Iterator[Dict]:
     """Disk-mode server running the release binary (perf tests)."""
     yield from _start_disk_server(tmp_path_factory, pypiron_release_bin)
@@ -387,7 +396,14 @@ def disk_server_read_auth(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]
     for server in _start_disk_server(
         tmp_path_factory,
         pypiron_bin,
-        extra_args=["--read-user", "reader", "--read-pass", "readersecret"],
+        extra_args=[
+            "--read-user",
+            "reader",
+            "--read-pass",
+            "readersecret",
+            # This fixture's tests assert on per-project /metrics attribution.
+            "--metrics-project-labels",
+        ],
     ):
         server["read_user"] = "reader"
         server["read_password"] = "readersecret"
@@ -555,7 +571,16 @@ def _start_proxy_pair(
     proxy_gen = _start_disk_server(
         tmp_path_factory,
         pypiron_bin,
-        extra_args=["--proxy-upstream", upstream["base_url"], *cooldown, *proxy_extra_args],
+        # The upstream here is a loopback pypiron on plain http, which pypiron
+        # refuses without this opt-in: over http a MITM controls both the bytes
+        # and the sha256 they're checked against. No MITM on 127.0.0.1.
+        extra_args=[
+            "--proxy-upstream",
+            upstream["base_url"],
+            "--allow-insecure-upstream",
+            *cooldown,
+            *proxy_extra_args,
+        ],
     )
     proxy = next(proxy_gen)
     try:

@@ -88,9 +88,24 @@ def test_audit_counters_populate_across_passes(disk_server_fast_reconcile):
     assert _metric_value(body.decode(), "pypiron_audit_last_duration_seconds") is not None
 
 
-def test_metrics_attribute_project_without_read_auth(disk_server):
+def test_metrics_omit_project_labels_by_default(disk_server):
+    """/metrics is unauthenticated, so project attribution stays off until it is
+    asked for: the label carries the client's basic-auth username subaddress,
+    and any scraper could otherwise enumerate internal project names."""
+    headers = {"Authorization": _encode_basic_auth("ci+secret-project", "ignored")}
+    code, _, _ = http_get(f"{disk_server['simple']}index.json", headers=headers)
+    assert code == 200
+
+    _, body, _ = http_get(f"{disk_server['base_url']}/metrics")
+    text = body.decode()
+    assert "pypiron_project_requests_total" not in text, text
+    assert "secret-project" not in text, text
+
+
+def test_metrics_attribute_project_without_read_auth(disk_server_project_labels):
     """Open server: any volunteered basic-auth username is parsed for
     attribution — the password is never validated in this mode."""
+    disk_server = disk_server_project_labels
     headers = {"Authorization": _encode_basic_auth("ci+attrib-open", "ignored")}
     code, _, _ = http_get(f"{disk_server['simple']}index.json", headers=headers)
     assert code == 200

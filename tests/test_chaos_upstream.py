@@ -215,6 +215,8 @@ def proxy_over_fault(
         extra_args=[
             "--proxy-upstream",
             upstream.base,
+            # Loopback fault-injecting upstream on plain http; see conftest.
+            "--allow-insecure-upstream",
             "--exclude-newer",
             "",
             "--spool-dir",

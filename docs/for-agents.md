@@ -84,11 +84,11 @@ make audit   # dependency advisories
 - **It's new.** There is no multi-year fleet history behind it yet. What you
   get instead is a [verification harness](concepts/testing.md) you can re-run
   and `verify-index` as a production-time correctness oracle.
-- **GCS is supported but not tested end-to-end.** The GCS backend shares the
-  storage layer the S3 and Azure blackbox suites exercise, but no emulator
-  speaks the client library's GCS protocol, so there is no direct test
-  (verified and documented). Prefer disk, S3, or Azure when the tested path
-  matters.
+- **GCS coverage is newer and narrower.** No emulator speaks the client
+  library's GCS protocol (verified and documented), so GCS is tested against
+  the real service instead: a live upload → index → install round-trip against
+  a real bucket. Real, but a narrower suite than S3 and Azure get; prefer
+  those when breadth of tested behavior matters most.
 - **Two acknowledged dependency advisories.** DoS-class issues in a transitive
   XML parser (`quick-xml` via `object_store`), reachable only from the
   operator's own storage backend responses — never from client input. No

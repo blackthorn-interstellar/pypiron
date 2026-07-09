@@ -142,9 +142,9 @@ and continuously — and every claim links to a check you can run yourself.
 > reservations, so you know this isn't ad copy. It is young, without years of
 > fleet history — so the harness is public and `verify-index` gives you a
 > correctness oracle to assert on in production, not just at review time. And
-> its GCS backend, though built on the same storage layer the S3 and Azure
-> suites exercise, has no end-to-end test because no emulator speaks the
-> protocol — use disk, S3, or Azure if that matters to you.
+> GCS, whose emulators can't speak the protocol, is verified against the real
+> service instead — a live round-trip, though a narrower suite than S3 and
+> Azure get.
 >
 > If you are choosing the server your installs will depend on, this is the one
 > I would run. Not because it is fast — because it assumed it would crash, and

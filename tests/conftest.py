@@ -7,6 +7,7 @@ import os
 import shlex
 import subprocess
 import time
+import uuid
 from datetime import datetime, timezone
 from email.utils import formatdate
 from pathlib import Path
@@ -1018,18 +1019,19 @@ def _start_cloud_server(tmp_path_factory, pypiron_bin: Path, env: Dict, bind: st
 # omits the required ETag), so GCS has no *emulator* fixture. The GCS backend
 # shares the ObjectStorage code path exercised by the S3 and Azure suites; only
 # its builder config differs. See dev/TESTING.md. The `gcs_server` fixture below
-# closes the gap end to end when a real bucket is configured (e.g. the weekly
-# real-gcs CI job) — GCS's only live coverage.
+# closes the gap end to end when a real bucket is configured (e.g. the real-gcs
+# CI job, which runs on pushes to master) — GCS's only live coverage.
 
 
 def _real_gcs_config() -> Dict | None:
     """Real-GCS target from the environment, or None to skip.
 
     GCS has no faithful local emulator, so this is real-only. Set
-    ``PYPIRON_TEST_GCS_REAL_BUCKET`` to a **dedicated, disposable** bucket; the
-    fixture owns its whole contents and empties it around each test (pypiron
-    writes to the bucket root — no per-run key prefix). Credentials resolve the
-    way ``object_store`` resolves them: a service-account JSON via
+    ``PYPIRON_TEST_GCS_REAL_BUCKET`` to a bucket the credentials can write. Each
+    test gets its own ``--storage-prefix``, so the bucket needs no dedication and
+    is never emptied wholesale: concurrent runs (two CI jobs, two branches) share
+    it without seeing each other. Credentials resolve the way ``object_store``
+    resolves them: a service-account JSON via
     ``PYPIRON_TEST_GCS_SERVICE_ACCOUNT_PATH`` or ``GOOGLE_APPLICATION_CREDENTIALS``
     (also required for presigned URLs), otherwise ambient Application Default
     Credentials.
@@ -1044,35 +1046,44 @@ def _real_gcs_config() -> Dict | None:
     return {"bucket": bucket, "service_account_path": sa_path or None}
 
 
-def _gcs_empty_bucket(bucket: str) -> None:
-    """Best-effort delete of every object in a real GCS bucket via the gcloud
-    CLI with ambient credentials. Skips the run if the CLI is unavailable.
-    ``rm`` exits non-zero on an empty match, so the result is not checked; the
-    per-test setup wipe means a stray leftover self-heals on the next run."""
-    if not cmd_exists("gcloud"):
-        pytest.skip("gcloud CLI is required to manage the real GCS test bucket; not found on PATH")
-    run_returncode(["gcloud", "storage", "rm", "--recursive", f"gs://{bucket}/**"])
+def _gcs_rm_prefix(bucket: str, prefix: str) -> None:
+    """Best-effort delete of one test's key subtree via the gcloud CLI with
+    ambient credentials. Scoped to `prefix` — never the bucket root, which may
+    hold another run's objects. ``rm`` exits non-zero when nothing matches, so
+    the result is not checked."""
+    run_returncode(["gcloud", "storage", "rm", "--recursive", f"gs://{bucket}/{prefix}/**"])
 
 
 @pytest.fixture()
 def gcs_server(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """pypiron against a REAL GCS bucket — GCS has no local emulator, so this is
     the only GCS end-to-end coverage. Skips unless ``PYPIRON_TEST_GCS_REAL_BUCKET``
-    (and credentials) are configured; see ``_real_gcs_config``."""
+    (and credentials) are configured; see ``_real_gcs_config``.
+
+    Isolation comes from a per-test key prefix rather than from owning the
+    bucket, so this is safe to run concurrently with itself."""
     gcs = _real_gcs_config()
     if gcs is None:
         pytest.skip("real GCS test bucket not configured (set PYPIRON_TEST_GCS_REAL_BUCKET)")
-    _gcs_empty_bucket(gcs["bucket"])
+    if not cmd_exists("gcloud"):
+        pytest.skip("gcloud CLI is required to clean up the GCS test prefix; not found on PATH")
+    prefix = f"pytest/{uuid.uuid4().hex[:16]}"
     port = find_free_port()
     bind = f"127.0.0.1:{port}"
     env = _cloud_creds_env(bind)
-    env.update({"PYPIRON_STORAGE": "gcs", "PYPIRON_GCS_BUCKET": gcs["bucket"]})
+    env.update(
+        {
+            "PYPIRON_STORAGE": "gcs",
+            "PYPIRON_GCS_BUCKET": gcs["bucket"],
+            "PYPIRON_STORAGE_PREFIX": prefix,
+        }
+    )
     if gcs["service_account_path"]:
         env["PYPIRON_GCS_SERVICE_ACCOUNT_PATH"] = gcs["service_account_path"]
     try:
         yield from _start_cloud_server(tmp_path_factory, pypiron_bin, env, bind, "gcs")
     finally:
-        _gcs_empty_bucket(gcs["bucket"])
+        _gcs_rm_prefix(gcs["bucket"], prefix)
 
 
 # ------------------------------ Azurite fixtures ------------------------------

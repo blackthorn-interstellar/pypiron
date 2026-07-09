@@ -115,6 +115,61 @@ jobs:
       - name: Blackbox suite (${{ matrix.backend }} mode)
         run: uv run -- pytest tests -m "${{ matrix.markers }}"
 
+  real-gcs:
+    # GCS has no faithful local emulator (dev/TESTING.md), so this real-bucket
+    # run is its only end-to-end coverage. It is post-merge, not a merge gate:
+    # pull_request runs from a fork get no secrets, so it would report a green
+    # check having tested nothing — and a GCS outage should not redden a PR.
+    # Each test picks its own --storage-prefix, so runs never collide.
+    #
+    # Repo config (Settings → Secrets and variables → Actions):
+    #   secret PYPIRON_TEST_GCS_REAL_BUCKET     — bucket to test against
+    #                                             (also the on/off switch).
+    #   secret PYPIRON_TEST_GCS_SERVICE_ACCOUNT — service-account JSON key with
+    #                                             object admin on that bucket.
+    name: blackbox (real GCS)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYPIRON_TEST_GCS_REAL_BUCKET: ${{ secrets.PYPIRON_TEST_GCS_REAL_BUCKET }}
+    steps:
+      - name: Gate on configured bucket secret
+        id: gate
+        run: |
+          if [ -n "$PYPIRON_TEST_GCS_REAL_BUCKET" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "PYPIRON_TEST_GCS_REAL_BUCKET is unset — skipping the real-GCS leg."
+          fi
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+      # Writes the SA key to a file and exports GOOGLE_APPLICATION_CREDENTIALS;
+      # the fixture passes that on to pypiron as the GCS service-account path
+      # (which also enables presigned-URL signing) and to gcloud for cleanup.
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          credentials_json: ${{ secrets.PYPIRON_TEST_GCS_SERVICE_ACCOUNT }}
+          export_environment_variables: true
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        if: steps.gate.outputs.enabled == 'true'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: steps.gate.outputs.enabled == 'true'
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: steps.gate.outputs.enabled == 'true'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        if: steps.gate.outputs.enabled == 'true'
+      - name: Sync dev dependencies
+        if: steps.gate.outputs.enabled == 'true'
+        run: uv sync
+      - name: Blackbox GCS round-trip against real GCS
+        if: steps.gate.outputs.enabled == 'true'
+        run: make test-gcs-real
+
   python-lint:
     name: python lint (ruff)
     runs-on: ubuntu-latest

@@ -119,21 +119,31 @@ the GCS round-trip can run against **real buckets**, off by default:
   or `GOOGLE_APPLICATION_CREDENTIALS`, or ambient ADC). This is GCS's only
   end-to-end coverage.
 
-pypiron writes to the bucket root — there is no per-run key prefix — so each
-bucket must be **dedicated and disposable**: the fixture empties it before and
-after every test to give each a clean slate. Runs must be serial (no `-n`/xdist),
-since the shared bucket is wiped per test. Both fixtures skip cleanly when their
-bucket env var is unset, so the default `make test` is unaffected. The weekly
-`real-s3` and `real-gcs` CI jobs run these against repo-configured buckets and
-no-op green when the repo has no such secrets.
+The two fixtures isolate themselves differently:
+
+- **GCS** gives each test its own `--storage-prefix` (`pytest/<random>`) and
+  deletes only that subtree afterwards. The bucket needs no dedication, is never
+  emptied wholesale, and concurrent runs — two CI jobs, two branches, two
+  laptops — cannot see or clobber one another.
+- **S3** still writes to the bucket root and empties it before and after every
+  test, so `PYPIRON_TEST_S3_REAL_BUCKET` must be **dedicated and disposable**,
+  and those runs must be serial (no `-n`/xdist). Prefixing it the same way is a
+  straightforward follow-up.
+
+Both fixtures skip cleanly when their bucket env var is unset, so the default
+`make test` is unaffected, and both CI jobs no-op green when the repo has no such
+secrets. `real-gcs` runs in CI on pushes to `master` (not on pull requests: a
+fork PR gets no secrets and would report a green check having tested nothing);
+`real-s3` still runs weekly.
 
 ## What runs where
 
 | When | What |
 |---|---|
 | Every PR (CI) | fmt, clippy `-D warnings`, Rust unit, blackbox on disk + S3 (MinIO) + Azure (Azurite), `cargo-audit`, fuzz-target build smoke |
+| Push to `master` (CI) | all of the above, plus the real-GCS blackbox (when the bucket secret is configured) |
 | Nightly | coverage-guided fuzzing, all six targets |
-| Weekly | client compat matrix, full-PyPI corpus check, unit-test coverage, real-S3 + real-GCS blackbox (when bucket secrets are configured) |
+| Weekly | client compat matrix, full-PyPI corpus check, unit-test coverage, real-S3 blackbox (when the bucket secret is configured) |
 | Local / opt-in | `perf` and `stress` (release binary, excluded from default runs) |
 
 ## Performance testing

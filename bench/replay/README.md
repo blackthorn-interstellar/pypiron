@@ -4,10 +4,12 @@ Replays PyPI's **real download stream** against a pypiron server and reports wha
 it can actually serve — throughput, tail latency, and where it saturates —
 instead of the "one box could serve all of PyPI" back-of-the-envelope. Measured
 answer (one c7i.2xlarge, disk backend): ~**200k** index reads/s and ~**189k**
-metadata/s at p99 <3 ms (≈4× PyPI's whole request rate), artifact bytes
-NIC-bound, and a ~40 ms artifact-streaming stall worth fixing — see
-[Measured on AWS](#measured-on-aws-c7i2xlarge) and
-[dev/BENCHMARK_RESULTS.md](../../dev/BENCHMARK_RESULTS.md#traffic-replay-one-box-vs-pypis-real-request-stream).
+metadata/s at p99 <3 ms (≈4× PyPI's whole request rate, fleet-confirmed), and
+artifact bytes NIC-bound. The eye-catching "~50 ms artifact stall" in the
+loopback numbers below is a **loopback benchmarking artifact**, not a server
+ceiling — on a real NIC it's a ~1 % keepalive p99 tail (p50 sub-ms); see
+[Measured on AWS](#measured-on-aws-c7i2xlarge) and the
+[fleet root-cause](../../dev/BENCHMARK_RESULTS.md#traffic-replay-one-box-vs-pypis-real-request-stream).
 
 The pipeline is three stdlib scripts, in the shape of `bench/meter.py` and
 `bench/scale.py`:
@@ -125,14 +127,26 @@ exercised); PyPI's real pace that day was ≥46,500 file req/s.
 |---|---|---|---|---|
 | `/simple/` index | 256 | **202,069** | 2.62 ms | ~4.3× |
 | PEP 658 metadata | 128 | 188,546 | 1.39 ms | ~4.1× |
-| artifact, 100 KB wheel | 128 | 2,376 | 69.5 ms | ⚠ stalled |
+| artifact, 100 KB wheel | 128 | 2,376* | 69.5 ms* | *loopback artifact |
 | artifact, 32 MB stream | 8 | 24 | 410 ms | 6.25 Gbps |
 
-Index and metadata clear PyPI's whole request rate ~4× over with p99 under 3 ms.
-Artifact bytes are NIC-bound (that's what `--artifact-delivery redirect` is for).
-The 100 KB artifact tier is capped by a ~40 ms Nagle/delayed-ACK stall on the
-streaming path (rps scales linearly with connections; absent on index/metadata)
-— a real, fixable pypiron bug the replay surfaced, not a hardware limit.
+Index and metadata clear PyPI's whole request rate ~4× over with p99 under 3 ms
+— fleet-confirmed on 12 instances. Artifact bytes are NIC-bound (that's what
+`--artifact-delivery redirect` is for).
+
+*The 100 KB artifact p50 (~50 ms, so ~2,376 rps at 128 conns) is a **loopback
+benchmarking artifact, not a server ceiling.** Loopback's giant ~65 KB MSS makes
+every ~100 KB response fill the client's TCP receive window at a delayed-ACK
+boundary, so the server flow-control-stalls one delayed ACK (~50 ms) per request
+— on *every* request, which is what tanks the loopback p50. A 12-instance fleet
+study (`tcpdump` + toggles + a 2-box real-NIC run) pinned it down: it is a
+receive-window × delayed-ACK interaction (**not** Nagle — `TCP_NODELAY` doesn't
+fix it; only the client's `TCP_QUICKACK` does), and **over a real NIC it
+collapses to a ~1 % keepalive p99 tail with a sub-ms p50**. Full story and
+root-cause in
+[dev/BENCHMARK_RESULTS.md — fleet root-cause](../../dev/BENCHMARK_RESULTS.md#traffic-replay-one-box-vs-pypis-real-request-stream).
+Treat this row as "measure it on your own NIC topology," not as pypiron's
+small-artifact throughput.
 
 **Loadgen choice:** to drive a beefy server to its ceiling, use `oha` (Rust,
 multi-core) as above — `replay.py` is single-threaded and measures the

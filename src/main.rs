@@ -1259,10 +1259,10 @@ async fn run_serve(
         )
         // Hygiene default: set TCP_NODELAY on every accepted connection (axum
         // leaves it off, i.e. Nagle on). Standard for a latency-sensitive HTTP
-        // server. NOTE: this is NOT the fix for the streamed-`/files/` keepalive
-        // stall recorded in dev/BENCHMARK_RESULTS.md — that stall was verified
-        // on Linux to be unaffected by TCP_NODELAY on either side; this line is
-        // kept only as a measured no-regression hygiene default.
+        // server, and a measured no-regression. It does NOT address the
+        // instance-dependent small-artifact keepalive stall (a receive-window ×
+        // delayed-ACK interaction, unaffected by TCP_NODELAY) — see the
+        // "FLEET ROOT-CAUSE" entry in dev/BENCHMARK_RESULTS.md for that story.
         .tcp_nodelay(true)
         .with_graceful_shutdown(async move {
             let _ = graceful_rx.await;

@@ -410,6 +410,64 @@ What the numbers say, replacing the arithmetic:
       reproduces the stall. To claim "fixed", first find a rig where **pure HEAD
       reliably stalls** (candidate: a 2-box real-NIC path rather than loopback),
       then A/B there.
+  - **Update (2026-07-09): FLEET ROOT-CAUSE — supersedes the confusion above.**
+    A 12-instance fleet (4× c7i.2xlarge, 2× c7i.large, 2× m6i.large, 2× c6i.large,
+    2× t3.small; one pure-streaming binary built once and distributed) settled it.
+    - **The stall is universal on loopback, not instance-dependent. All 12/12
+      boxes stalled** at p50 ~50 ms (raw-socket keepalive; oha c16 keepalive
+      ~300–400 rps vs no-keepalive ~4,500–6,800 rps), across three CPU
+      generations (Cascade Lake 8259CL, Ice Lake 8375C, Sapphire Rapids 8488C),
+      identical kernel/`tsc`/`autocorking=1`/lo-offloads. The earlier "instance-
+      dependent / didn't reproduce" box (2026-07-09 above) is now the lone
+      outlier out of 15 boxes — a bad measurement or transient, **not** real
+      instance variance. The stall reproduces deterministically.
+    - **Wire verdict (`tcpdump -ttt` on `lo`): receive-window × delayed-ACK, not
+      Nagle.** Per request the server sends the 100 KB body, fills the client's
+      advertised receive window (`win 512 << wscale 7 = 65536 B`) leaving a small
+      trailing segment, then **stops with ~36 KB still unsent** — it is flow-
+      control-blocked waiting for a window-opening ACK. The client, with no
+      return data, **delays that ACK ~48–50 ms**. Then the transfer completes and
+      the next request proceeds. Owner: the server is flow-controlled; the
+      client's delayed ACK is the timer that fires.
+    - **Toggle bisection (one stalling box, re-probed after each):**
+      | toggle | result |
+      |---|---|
+      | server `TCP_NODELAY` (patched binary, streamed >256 KB file) | **still 50 ms** — nodelay does NOT fix it (Nagle is not the cause) |
+      | client `TCP_QUICKACK` (re-armed per recv) | **0.3 ms — fixed** (disables the client delayed ACK) |
+      | `sysctl net.ipv4.tcp_autocorking=0` | still 50 ms — not autocorking |
+      | body size | **non-monotonic, window-relative:** 64 KB clean, 100 KB stall, 128 KB clean, 192 KB stall, 256 KB stall — tracks the receive-window / autotune boundary, not a clean size threshold |
+    - **The committed patch `94c3a1f` (TCP_NODELAY + buffer ≤256 KiB) does NOT fix
+      it.** Buffering a small artifact into one `Bytes` body does not help once
+      the body exceeds the ~64 KB receive window: the *patched* binary still
+      stalled 50 ms serving 100 KB, 192 KB, and 256 KB. Only bodies that fit in
+      one window (≤~64 KB) are reliably clean — which is why the index path never
+      stalls, but the 256 KiB threshold is the wrong lever. Both halves of the
+      patch are confirmed **no-regressions** but neither is a fix.
+    - **2-box test over the real NIC (server + client, private IPs, same subnet):
+      the stall is a ~1 % p99 TAIL, not the every-request p50 seen on loopback.**
+      Client→server over the NIC: raw keepalive **median 0.5 ms** (max 42 ms);
+      oha keepalive **p50 0.63 ms / p99 50.05 ms**; no-keepalive p50 3.2 ms /
+      p99 5.0 ms; client `TCP_QUICKACK` removes even the tail. Loopback's giant
+      65 KB MSS makes every 100 KB response cross the window at a delayed-ACK
+      boundary; a real NIC (1448 MSS, window autotune) hits it only
+      occasionally. **So the loopback artifact-tier numbers (e.g. "2,376 rps /
+      p50 50 ms" for small wheels) massively overstate real-world impact** — in
+      production this is a p99 tail on keepalive artifact fetches, not a p50 wall.
+    - **Root cause, one line:** pypiron's `/files/` response fills the client TCP
+      receive window and then waits, and the client's delayed ACK adds ~50 ms;
+      it is a benchmark-loopback amplification of a normal-but-latency-adding
+      TCP flow-control / delayed-ACK interaction, and it is **not** fixed by
+      `TCP_NODELAY` or by buffering to 256 KiB.
+    - **Recommendation (do not implement here):** (1) correct the capacity docs —
+      the artifact p50 loopback numbers overstate reality; the honest artifact
+      story is "p99 ~50 ms keepalive tail on a real NIC, p50 fast." (2) Treat
+      `94c3a1f` as harmless hygiene, not a fix; consider reverting the 256 KiB
+      buffering (it adds a code path and RSS for no measured benefit) and keeping
+      only `tcp_nodelay(true)` as a standard hygiene default. (3) If the p99 tail
+      matters, the only lever that worked is the client's delayed ACK, which the
+      server can't set; a real mitigation would target the mid-body window-fill
+      pause (e.g. larger `SO_SNDBUF`/initial window, or a single `writev` of the
+      whole small body) and must be validated on the 2-box NIC rig, not loopback.
 - **The real mix runs with headroom.** Under `replay.py` at sub-saturation the
   server served the real popularity mix (1.28M artifact + 698k index requests
   observed) at ~45% CPU idle; the limiters were the single-threaded Python

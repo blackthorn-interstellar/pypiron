@@ -49,8 +49,20 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # #[ignore]d test: parses real file metadata for the whole PyPI corpus from
-      # the public ClickHouse mirror (no auth). Long-running; not a merge gate.
+      # #[ignore]d test: parses real file metadata for the whole PyPI corpus.
+      # It reads a local snapshot, so export one first from the public
+      # ClickHouse mirror (no auth) — same command as the src/corpus_check.rs
+      # module docs. Long-running; not a merge gate.
+      - name: Download corpus snapshot from ClickHouse mirror
+        run: |
+          mkdir -p bench/corpus
+          curl -sf --retry 3 \
+            'https://sql-clickhouse.clickhouse.com/?user=demo&enable_http_compression=1' \
+            -H 'Accept-Encoding: gzip' \
+            --data 'SELECT name, version, filename, packagetype FROM pypi.projects
+                    ORDER BY name, filename FORMAT TSV' \
+            -o bench/corpus/pypi-files.tsv.gz
+          ls -lh bench/corpus/pypi-files.tsv.gz
       - name: Corpus check against full PyPI metadata
         run: cargo test --release corpus_full_pypi -- --ignored --nocapture
 

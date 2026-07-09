@@ -152,10 +152,13 @@ pub async fn run_worker_until(
     // Only the index writer is singular, and only as a cost optimization:
     // rebuilds are idempotent, so the lease is sloppy. Disk is single-node
     // and skips leasing entirely.
-    let lease = state
-        .storage
+    // P4: becomes per-bucket/per-selection. The lease is pinned to bucket-0 at
+    // worker start for its whole life; generation cannot change until P4 wires
+    // switch(), so this is currently equivalent to pinning per tick.
+    let lease_storage = state.pin().storage.clone();
+    let lease = lease_storage
         .supports_leases()
-        .then(|| LeaseManager::new(state.storage.clone(), state.lease_ttl));
+        .then(|| LeaseManager::new(lease_storage.clone(), state.lease_ttl));
 
     // Markers are the primary freshness mechanism; the audit is the safety
     // net for what events cannot see (restores, out-of-band storage changes,
@@ -229,7 +232,10 @@ pub async fn run_worker_until(
                     // isn't dropped immediately.
                     let _guard = guard;
                     let started = Instant::now();
-                    if let Err(e) = audit(&state, false).await {
+                    // Pin once at spawn; the whole audit run reads and writes
+                    // against this one handle (design §3).
+                    let pinned = state.pin();
+                    if let Err(e) = audit(&state, pinned.storage.as_ref(), false).await {
                         error!(error=?e, "audit failed");
                     }
                     duration_out.store(started.elapsed().as_secs(), Ordering::Relaxed);
@@ -303,7 +309,11 @@ fn inventory_key() -> String {
 /// but a storage-write failure returns `false` so the caller can retry rather
 /// than drop the change. Best-effort — it must never strand markers or fail a
 /// rebuild.
-async fn publish_inventory(state: &AppState, inv: crate::metrics::Inventory) -> bool {
+async fn publish_inventory(
+    state: &AppState,
+    storage: &dyn Storage,
+    inv: crate::metrics::Inventory,
+) -> bool {
     state
         .metrics
         .set_inventory(inv.projects, inv.releases, inv.files, inv.bytes);
@@ -314,8 +324,7 @@ async fn publish_inventory(state: &AppState, inv: crate::metrics::Inventory) -> 
             return false;
         }
     };
-    match state
-        .storage
+    match storage
         .put_bytes(&inventory_key(), bytes, Some("application/json"))
         .await
     {
@@ -333,7 +342,8 @@ async fn publish_inventory(state: &AppState, inv: crate::metrics::Inventory) -> 
 /// until the first sweep writes it (never panics; no `unwrap` on the worker
 /// path).
 async fn refresh_inventory(state: &AppState) {
-    if let Ok(bytes) = state.storage.get_bytes(&inventory_key()).await {
+    let storage = state.pin().storage.clone();
+    if let Ok(bytes) = storage.get_bytes(&inventory_key()).await {
         if let Ok(inv) = serde_json::from_slice::<crate::metrics::Inventory>(&bytes) {
             state
                 .metrics
@@ -349,7 +359,7 @@ async fn refresh_inventory(state: &AppState) {
 /// the diff gets the deep treatment (sidecar reads, view rewrite, sidecar
 /// backfill, orphan pruning). `force_deep` ignores stored fingerprints and
 /// rebuilds everything — that is `pypiron rebuild-index`.
-pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
+pub async fn audit(state: &AppState, storage: &dyn Storage, force_deep: bool) -> Result<()> {
     let started = Instant::now();
     let mut live: Vec<String> = Vec::new();
     let mut dead: Vec<String> = Vec::new();
@@ -365,7 +375,7 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
     for chunk in crate::storage::SHARD_CHARS.chunks(SHARD_CONCURRENCY) {
         let audits = chunk
             .iter()
-            .map(|shard| audit_shard(state, *shard, force_deep));
+            .map(|shard| audit_shard(state, storage, *shard, force_deep));
         for (shard, result) in chunk.iter().zip(futures::future::join_all(audits).await) {
             match result {
                 Ok(result) => {
@@ -388,7 +398,7 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
     live.dedup();
     // Delta + CAS, not a blind overwrite: a package born mid-audit (its name
     // added by the tick) must not be clobbered by our older observation.
-    update_global_index(state, &live, &dead).await?;
+    update_global_index(state, storage, &live, &dead).await?;
     if failures > 0 {
         return Err(anyhow!("audit finished with {failures} failure(s)"));
     }
@@ -414,7 +424,7 @@ pub async fn audit(state: &AppState, force_deep: bool) -> Result<()> {
         inv.dirty = false;
         inv.totals()
     };
-    publish_inventory(state, totals).await;
+    publish_inventory(state, storage, totals).await;
     info!(
         packages = live.len(),
         rebuilt, skipped, duration_secs, "reconcile: sweep complete"
@@ -438,10 +448,15 @@ struct ShardAudit {
 }
 
 /// Audit every package whose name starts with `shard`.
-async fn audit_shard(state: &AppState, shard: char, force_deep: bool) -> Result<ShardAudit> {
+async fn audit_shard(
+    state: &AppState,
+    storage: &dyn Storage,
+    shard: char,
+    force_deep: bool,
+) -> Result<ShardAudit> {
     let (truth, views) = futures::future::try_join(
-        state.storage.list_all(&format!("{PACKAGES_PREFIX}{shard}")),
-        state.storage.list_all(&format!("{SIMPLE_PREFIX}{shard}")),
+        storage.list_all(&format!("{PACKAGES_PREFIX}{shard}")),
+        storage.list_all(&format!("{SIMPLE_PREFIX}{shard}")),
     )
     .await?;
 
@@ -464,7 +479,7 @@ async fn audit_shard(state: &AppState, shard: char, force_deep: bool) -> Result<
     let stored: std::collections::HashMap<String, String> = if force_deep {
         Default::default()
     } else {
-        match state.storage.get_bytes(&fp_key).await {
+        match storage.get_bytes(&fp_key).await {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(_) => Default::default(),
         }
@@ -521,11 +536,11 @@ async fn audit_shard(state: &AppState, shard: char, force_deep: bool) -> Result<
                     // Provably unchanged since the fingerprint was written.
                     return (pkg, Some(fp), has_artifacts, false, false);
                 }
-                match rebuild_package(state, &pkg).await {
+                match rebuild_package(state, storage, &pkg).await {
                     Ok(live_now) => {
                         // Fingerprint what the rebuild actually saw/wrote, not
                         // the pre-rebuild listing — two cheap per-package lists.
-                        let new_fp = package_fingerprint(state, &pkg).await.ok();
+                        let new_fp = package_fingerprint(storage, &pkg).await.ok();
                         (pkg, new_fp, live_now, true, false)
                     }
                     Err(e) => {
@@ -555,7 +570,7 @@ async fn audit_shard(state: &AppState, shard: char, force_deep: bool) -> Result<
     // `fresh` now holds exactly the packages that exist; anything left in
     // `stored` is gone and simply drops out of the rewritten shard.
     let bytes = serde_json::to_vec(&std::collections::BTreeMap::from_iter(fresh.iter()))?;
-    put_if_changed(state, &fp_key, bytes, "application/json").await?;
+    put_if_changed(state, storage, &fp_key, bytes, "application/json").await?;
     Ok(out)
 }
 
@@ -580,10 +595,10 @@ fn fingerprint(truth: &[&ObjectMeta], views: &[&ObjectMeta]) -> String {
 }
 
 /// Re-derive one package's fingerprint from fresh listings (post-rebuild).
-async fn package_fingerprint(state: &AppState, pkg: &str) -> Result<String> {
+async fn package_fingerprint(storage: &dyn Storage, pkg: &str) -> Result<String> {
     let (truth, views) = futures::future::try_join(
-        state.storage.list_all(&format!("{PACKAGES_PREFIX}{pkg}/")),
-        state.storage.list_all(&format!("{SIMPLE_PREFIX}{pkg}/")),
+        storage.list_all(&format!("{PACKAGES_PREFIX}{pkg}/")),
+        storage.list_all(&format!("{SIMPLE_PREFIX}{pkg}/")),
     )
     .await?;
     Ok(fingerprint(
@@ -593,7 +608,11 @@ async fn package_fingerprint(state: &AppState, pkg: &str) -> Result<String> {
 }
 
 async fn tick(state: &Arc<AppState>) -> Result<()> {
-    let entries = state.storage.list_dir_entries(DIRTY_PREFIX).await?;
+    // One pin per tick (design §3): every read and write below runs against this
+    // handle; the per-package rebuilds spawn with an owned clone of it.
+    let pinned = state.pin();
+    let storage = pinned.storage.as_ref();
+    let entries = storage.list_dir_entries(DIRTY_PREFIX).await?;
     if entries.is_empty() {
         return Ok(());
     }
@@ -668,9 +687,12 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
     for (pkg, keys) in work {
         let state = state.clone();
         let semaphore = semaphore.clone();
+        // Move an owned handle into the task — the tick's pin, so every rebuild
+        // this tick spawns writes to the same bucket it captured at entry.
+        let storage = pinned.storage.clone();
         handles.push(tokio::spawn(async move {
             let _permit = semaphore.acquire().await;
-            let rebuilt = match rebuild_package(&state, &pkg).await {
+            let rebuilt = match rebuild_package(&state, storage.as_ref(), &pkg).await {
                 Ok(has_artifacts) => Some(has_artifacts),
                 Err(e) => {
                     error!(package=%pkg, error=?e, "rebuild failed; markers retained for retry");
@@ -708,7 +730,7 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
     }
     // One batched global-index pass per tick: mass ingest of N new packages
     // rewrites the (corpus-sized) global views once, not N times.
-    update_global_index(state, &adds, &removes).await?;
+    update_global_index(state, storage, &adds, &removes).await?;
     // Flush the inventory once per tick if this tick's rebuilds changed it
     // (and a sweep has set the full baseline — before that the map is partial,
     // so we let the audit publish). Batched like the global index: one write
@@ -723,7 +745,7 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
         }
     };
     if let Some(totals) = pending {
-        if !publish_inventory(state, totals).await {
+        if !publish_inventory(state, storage, totals).await {
             // Persist failed; re-arm dirty so the next tick retries instead of
             // waiting for the next change or sweep. (A concurrent rebuild may
             // have re-set it already — harmless, the flush is idempotent.)
@@ -736,7 +758,7 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
     // event arriving during the rebuild is a new key and survives. A crash
     // anywhere before this line replays the whole tick — idempotent, so the
     // only cost is repeated work, never a lost update.
-    if let Err(e) = state.storage.delete_keys(&consumed).await {
+    if let Err(e) = storage.delete_keys(&consumed).await {
         warn!(error=?e, "could not consume markers; rebuilds will repeat");
     }
     if failures > 0 {
@@ -748,8 +770,8 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
 /// Regenerate one package's indexes from a storage listing.
 /// Returns whether the package still has artifacts; with none, its indexes
 /// are removed (index first, per the ordering invariant).
-pub async fn rebuild_package(state: &AppState, pkg: &str) -> Result<bool> {
-    rebuild_package_excluding(state, pkg, None).await
+pub async fn rebuild_package(state: &AppState, storage: &dyn Storage, pkg: &str) -> Result<bool> {
+    rebuild_package_excluding(state, storage, pkg, None).await
 }
 
 /// Like `rebuild_package`, but omitting one filename from the views. Deletion
@@ -757,6 +779,7 @@ pub async fn rebuild_package(state: &AppState, pkg: &str) -> Result<bool> {
 /// views may lag truth but never lead it.
 pub async fn rebuild_package_excluding(
     state: &AppState,
+    storage: &dyn Storage,
     pkg: &str,
     omit: Option<&str>,
 ) -> Result<bool> {
@@ -764,7 +787,7 @@ pub async fn rebuild_package_excluding(
         .metrics
         .index_rebuilds
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (mut files, mut raw) = list_artifacts(state, pkg).await?;
+    let (mut files, mut raw) = list_artifacts(storage, pkg).await?;
     if let Some(omit) = omit {
         files.retain(|f| f.filename != omit);
         raw.retain(|(filename, _)| filename != omit);
@@ -775,13 +798,13 @@ pub async fn rebuild_package_excluding(
     // audit, so the two inventory writers can't disagree.
     let live = !files.is_empty();
     if live {
-        write_pkg_indexes(state, pkg, &files).await?;
+        write_pkg_indexes(state, storage, pkg, &files).await?;
     } else {
         let keys = [
             format!("{SIMPLE_PREFIX}{pkg}/index.html"),
             format!("{SIMPLE_PREFIX}{pkg}/index.json"),
         ];
-        state.storage.delete_keys(&keys).await?;
+        storage.delete_keys(&keys).await?;
         for key in &keys {
             state.index_cache.invalidate(key);
         }
@@ -886,10 +909,10 @@ pub(crate) struct GlobalNames {
 /// All hosted package names, sorted — the human package browser's listing.
 /// Loads the global name set into memory on first use, so a freshly booted node
 /// still answers.
-pub async fn global_package_names(state: &AppState) -> Result<Vec<String>> {
+pub async fn global_package_names(state: &AppState, storage: &dyn Storage) -> Result<Vec<String>> {
     let mut guard = state.global_names.lock().await;
     if guard.is_none() {
-        *guard = Some(load_global_names(state).await?);
+        *guard = Some(load_global_names(storage).await?);
     }
     let mut names: Vec<String> = guard
         .as_ref()
@@ -909,7 +932,12 @@ pub async fn global_package_names(state: &AppState) -> Result<Vec<String>> {
 /// adding different names can never clobber each other: the loser reloads
 /// and reapplies. Deltas batch per worker tick, so mass ingest rewrites the
 /// (large) global index once per tick, not once per package.
-async fn update_global_index(state: &AppState, adds: &[String], removes: &[String]) -> Result<()> {
+async fn update_global_index(
+    state: &AppState,
+    storage: &dyn Storage,
+    adds: &[String],
+    removes: &[String],
+) -> Result<()> {
     if adds.is_empty() && removes.is_empty() {
         return Ok(());
     }
@@ -923,7 +951,7 @@ async fn update_global_index(state: &AppState, adds: &[String], removes: &[Strin
     let mut wrote_optimistic_html = false;
     for _attempt in 0..4 {
         if guard.is_none() {
-            *guard = Some(load_global_names(state).await?);
+            *guard = Some(load_global_names(storage).await?);
         }
         let cached = guard.as_mut().expect("just loaded");
         let mut changed = false;
@@ -939,6 +967,7 @@ async fn update_global_index(state: &AppState, adds: &[String], removes: &[Strin
                 packages.sort();
                 put_if_changed(
                     state,
+                    storage,
                     &format!("{SIMPLE_PREFIX}index.html"),
                     pep503_global_html(&packages).into_bytes(),
                     SIMPLE_HTML_CONTENT_TYPE,
@@ -949,7 +978,7 @@ async fn update_global_index(state: &AppState, adds: &[String], removes: &[Strin
         }
         let mut packages: Vec<String> = cached.names.iter().cloned().collect();
         packages.sort();
-        match write_global_indexes_cas(state, &packages, &cached.etag.clone()).await? {
+        match write_global_indexes_cas(state, storage, &packages, &cached.etag.clone()).await? {
             CasOutcome::Won(new_etag) => {
                 if let Some(cached) = guard.as_mut() {
                     // Pin the ETag the conditional write itself returned, not one
@@ -982,10 +1011,10 @@ async fn update_global_index(state: &AppState, adds: &[String], removes: &[Strin
 }
 
 /// Load the global name set (and its ETag) from the materialized JSON.
-async fn load_global_names(state: &AppState) -> Result<GlobalNames> {
+async fn load_global_names(storage: &dyn Storage) -> Result<GlobalNames> {
     let key = format!("{SIMPLE_PREFIX}index.json");
-    let (bytes, etag) = if state.storage.supports_leases() {
-        match state.storage.get_with_etag(&key).await? {
+    let (bytes, etag) = if storage.supports_leases() {
+        match storage.get_with_etag(&key).await? {
             Some((bytes, etag)) => (bytes, Some(etag)),
             None => (Vec::new(), None),
         }
@@ -994,7 +1023,7 @@ async fn load_global_names(state: &AppState) -> Result<GlobalNames> {
         // error must propagate. Swallowing a transient I/O error to empty here
         // would let the caller write back a near-empty global index, truncating
         // the package list off a phantom "zero packages" observation.
-        match state.storage.get_bytes(&key).await {
+        match storage.get_bytes(&key).await {
             Ok(bytes) => (bytes, None),
             Err(e) if is_not_found(&e) => (Vec::new(), None),
             Err(e) => return Err(e),
@@ -1034,16 +1063,16 @@ enum CasOutcome {
 /// `CasOutcome::Won` with the ETag the put itself returned.
 async fn write_global_indexes_cas(
     state: &AppState,
+    storage: &dyn Storage,
     packages: &[String],
     expected_etag: &Option<String>,
 ) -> Result<CasOutcome> {
     let json_key = format!("{SIMPLE_PREFIX}index.json");
     let json = pep691_global_json(packages).into_bytes();
-    if state.storage.supports_leases() {
+    if storage.supports_leases() {
         // HTML first: derived from the same list, unconditional, idempotent.
         let html_key = format!("{SIMPLE_PREFIX}index.html");
-        state
-            .storage
+        storage
             .put_bytes(
                 &html_key,
                 pep503_global_html(packages).into_bytes(),
@@ -1053,8 +1082,8 @@ async fn write_global_indexes_cas(
         state.index_cache.invalidate(&html_key);
         // Canonical JSON last, under CAS: its success is what consumes markers.
         let outcome = match expected_etag {
-            Some(etag) => state.storage.put_if_match(&json_key, etag, json).await?,
-            None => state.storage.put_if_none_match(&json_key, json).await?,
+            Some(etag) => storage.put_if_match(&json_key, etag, json).await?,
+            None => storage.put_if_none_match(&json_key, json).await?,
         };
         let Some(new_etag) = outcome else {
             return Ok(CasOutcome::Lost);
@@ -1062,7 +1091,7 @@ async fn write_global_indexes_cas(
         state.index_cache.invalidate(&json_key);
         return Ok(CasOutcome::Won(Some(new_etag)));
     }
-    write_global_indexes(state, packages).await?;
+    write_global_indexes(state, storage, packages).await?;
     Ok(CasOutcome::Won(None))
 }
 
@@ -1073,11 +1102,11 @@ async fn write_global_indexes_cas(
 /// file is dropped from the index (`load_file_metadata` returns `None`) yet
 /// still occupies storage, and the audit counts it off the listing.
 pub async fn list_artifacts(
-    state: &AppState,
+    storage: &dyn Storage,
     pkg: &str,
 ) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
-    let entries = state.storage.list_dir_entries(&prefix).await?;
+    let entries = storage.list_dir_entries(&prefix).await?;
     let names: HashSet<&str> = entries
         .iter()
         .filter_map(|e| e.key.strip_prefix(&prefix))
@@ -1103,7 +1132,7 @@ pub async fn list_artifacts(
         let loaded = futures::future::join_all(
             chunk
                 .iter()
-                .map(|(entry, filename)| load_file_metadata(state, entry, filename, &names)),
+                .map(|(entry, filename)| load_file_metadata(storage, entry, filename, &names)),
         )
         .await;
         metadata.extend(loaded.into_iter().flatten());
@@ -1114,14 +1143,14 @@ pub async fn list_artifacts(
 /// Load one artifact's index entry from its sidecar (backfilling if absent).
 /// None means "leave it out of the index" — reasons logged inside.
 async fn load_file_metadata(
-    state: &AppState,
+    storage: &dyn Storage,
     entry: &FileEntry,
     filename: &str,
     names: &HashSet<&str>,
 ) -> Option<FileMetadata> {
     let has_sidecar = names.contains(format!("{filename}{SIDECAR_SUFFIX}").as_str());
     let sc = if has_sidecar {
-        match read_sidecar(state, &entry.key).await {
+        match read_sidecar(storage, &entry.key).await {
             Ok(sc) => sc,
             Err(e) => {
                 // A present-but-unreadable sidecar is corruption, not a
@@ -1133,7 +1162,7 @@ async fn load_file_metadata(
             }
         }
     } else {
-        match backfill_sidecar(state, entry, filename).await {
+        match backfill_sidecar(storage, entry, filename).await {
             Ok(sc) => sc,
             Err(e) => {
                 warn!(error=?e, key=%entry.key, "could not backfill sidecar; skipping file");
@@ -1151,8 +1180,8 @@ async fn load_file_metadata(
     ))
 }
 
-async fn read_sidecar(state: &AppState, artifact_key: &str) -> Result<Sidecar> {
-    let bytes = state.storage.get_bytes(&sidecar_key(artifact_key)).await?;
+async fn read_sidecar(storage: &dyn Storage, artifact_key: &str) -> Result<Sidecar> {
+    let bytes = storage.get_bytes(&sidecar_key(artifact_key)).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
@@ -1164,8 +1193,12 @@ async fn read_sidecar(state: &AppState, artifact_key: &str) -> Result<Sidecar> {
 /// already be stale, and a concurrent upload's real sidecar (true timestamp,
 /// yank state) must always beat this fabricated one. Losing the race means
 /// the real sidecar exists — read and use it.
-async fn backfill_sidecar(state: &AppState, entry: &FileEntry, filename: &str) -> Result<Sidecar> {
-    let bytes = state.storage.get_bytes(&entry.key).await?;
+async fn backfill_sidecar(
+    storage: &dyn Storage,
+    entry: &FileEntry,
+    filename: &str,
+) -> Result<Sidecar> {
+    let bytes = storage.get_bytes(&entry.key).await?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let sc = Sidecar {
@@ -1176,8 +1209,7 @@ async fn backfill_sidecar(state: &AppState, entry: &FileEntry, filename: &str) -
         requires_python: None,
         yanked: Yanked::Flag(false),
     };
-    let created = state
-        .storage
+    let created = storage
         .put_if_absent(
             &sidecar_key(&entry.key),
             serde_json::to_vec(&sc)?,
@@ -1185,7 +1217,7 @@ async fn backfill_sidecar(state: &AppState, entry: &FileEntry, filename: &str) -
         )
         .await?;
     if !created {
-        return read_sidecar(state, &entry.key).await;
+        return read_sidecar(storage, &entry.key).await;
     }
     info!(key=%entry.key, "backfilled sidecar");
     Ok(sc)
@@ -1195,22 +1227,33 @@ async fn backfill_sidecar(state: &AppState, entry: &FileEntry, filename: &str) -
 /// touch storage (or bump mtimes/ETags) when nothing changed. A real write
 /// invalidates the in-process index cache so same-node reads are fresh
 /// immediately (other nodes are bounded by the cache TTL).
-async fn put_if_changed(state: &AppState, key: &str, bytes: Vec<u8>, ct: &str) -> Result<()> {
-    if let Ok(current) = state.storage.get_bytes(key).await {
+async fn put_if_changed(
+    state: &AppState,
+    storage: &dyn Storage,
+    key: &str,
+    bytes: Vec<u8>,
+    ct: &str,
+) -> Result<()> {
+    if let Ok(current) = storage.get_bytes(key).await {
         if current == bytes {
             return Ok(());
         }
     }
-    state.storage.put_bytes(key, bytes, Some(ct)).await?;
+    storage.put_bytes(key, bytes, Some(ct)).await?;
     state.index_cache.invalidate(key);
     Ok(())
 }
 
-async fn write_pkg_indexes(state: &AppState, pkg: &str, files: &[FileMetadata]) -> Result<()> {
+async fn write_pkg_indexes(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    files: &[FileMetadata],
+) -> Result<()> {
     // Status is per-project truth (PEP 792). A read error propagates — we
     // re-render against the prior index rather than assume `active` and, say,
     // re-expose links for a project that should be quarantined.
-    let status = crate::status::read_status(state.storage.as_ref(), pkg).await?;
+    let status = crate::status::read_status(storage, pkg).await?;
     // Quarantine omits file links; the delete-vs-render decision upstream still
     // keys on the real artifact count, so a quarantined project keeps a
     // status-bearing (link-free) page instead of 404ing.
@@ -1225,6 +1268,7 @@ async fn write_pkg_indexes(state: &AppState, pkg: &str, files: &[FileMetadata]) 
     let base = format!("{SIMPLE_PREFIX}{pkg}/");
     put_if_changed(
         state,
+        storage,
         &format!("{base}index.html"),
         html.into_bytes(),
         SIMPLE_HTML_CONTENT_TYPE,
@@ -1232,6 +1276,7 @@ async fn write_pkg_indexes(state: &AppState, pkg: &str, files: &[FileMetadata]) 
     .await?;
     put_if_changed(
         state,
+        storage,
         &format!("{base}index.json"),
         json.into_bytes(),
         SIMPLE_JSON_CONTENT_TYPE,
@@ -1240,12 +1285,17 @@ async fn write_pkg_indexes(state: &AppState, pkg: &str, files: &[FileMetadata]) 
     Ok(())
 }
 
-async fn write_global_indexes(state: &AppState, packages: &[String]) -> Result<()> {
+async fn write_global_indexes(
+    state: &AppState,
+    storage: &dyn Storage,
+    packages: &[String],
+) -> Result<()> {
     let html = pep503_global_html(packages);
     let json = pep691_global_json(packages);
 
     put_if_changed(
         state,
+        storage,
         &format!("{SIMPLE_PREFIX}index.html"),
         html.into_bytes(),
         SIMPLE_HTML_CONTENT_TYPE,
@@ -1253,6 +1303,7 @@ async fn write_global_indexes(state: &AppState, packages: &[String]) -> Result<(
     .await?;
     put_if_changed(
         state,
+        storage,
         &format!("{SIMPLE_PREFIX}index.json"),
         json.into_bytes(),
         SIMPLE_JSON_CONTENT_TYPE,
@@ -1443,7 +1494,6 @@ mod tests {
             sweep_entered: StdAtomicBool::new(false),
         });
         let state = Arc::new(AppState {
-            storage: storage.clone(),
             buckets: Arc::new(crate::buckets::BucketSet::single(storage.clone())),
             uploader_user: None,
             uploader_pass: None,
@@ -1548,7 +1598,6 @@ mod tests {
             sweep_entered: StdAtomicBool::new(false),
         });
         let state = Arc::new(AppState {
-            storage: storage.clone(),
             buckets: Arc::new(crate::buckets::BucketSet::single(storage.clone())),
             uploader_user: None,
             uploader_pass: None,

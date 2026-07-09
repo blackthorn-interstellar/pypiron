@@ -127,9 +127,24 @@ struct Entry {
 struct Entries {
     map: HashMap<String, Entry>,
     body_bytes: usize,
+    /// The selection generation these entries were built under. A bucket switch
+    /// (P4) bumps the pinned generation; the first access carrying the new value
+    /// clears everything so a page built from the old bucket can't be served for
+    /// the new one. Single-bucket stays generation 0 forever — the reconcile is
+    /// one `u64` compare that never clears.
+    generation: u64,
 }
 
 impl Entries {
+    /// Adopt the caller's selection generation, clearing first if it changed.
+    fn reconcile_generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.map.clear();
+            self.body_bytes = 0;
+            self.generation = generation;
+        }
+    }
+
     fn insert(&mut self, key: String, entry: Entry) {
         self.body_bytes += entry.cached.weight();
         if let Some(old) = self.map.insert(key, entry) {
@@ -204,12 +219,16 @@ impl IndexCache {
     /// (negatively cached). Returns the identity representation plus the
     /// precompressed gzip variant when one exists; ETags are the quoted
     /// SHA-256 of each representation's bytes, computed once per fill.
+    /// `generation` is the caller's pinned selection generation (design §3): a
+    /// change from what the cache last saw clears it so entries never leak
+    /// across a bucket switch.
     pub async fn get(
         &self,
         storage: &dyn Storage,
         key: &str,
+        generation: u64,
     ) -> Result<Option<(Variant, Option<Variant>)>> {
-        if let Some(hit) = self.fresh(key) {
+        if let Some(hit) = self.fresh(key, generation) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(hit.into_pair());
         }
@@ -233,6 +252,7 @@ impl IndexCache {
 
         {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries.reconcile_generation(generation);
             entries.insert(
                 key.to_string(),
                 Entry {
@@ -254,8 +274,9 @@ impl IndexCache {
             .remove(key);
     }
 
-    fn fresh(&self, key: &str) -> Option<Cached> {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+    fn fresh(&self, key: &str, generation: u64) -> Option<Cached> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.reconcile_generation(generation);
         let entry = entries.map.get(key)?;
         (entry.fetched.elapsed() < self.ttl).then(|| entry.cached.clone())
     }
@@ -272,33 +293,53 @@ pub const PRESIGN_CACHE_TTL: Duration = Duration::from_secs(300);
 pub const PRESIGN_EXPIRY: Duration = Duration::from_secs(3600);
 const PRESIGN_CACHE_MAX_ENTRIES: usize = 65_536;
 
+#[derive(Default)]
+struct PresignEntries {
+    map: HashMap<String, (Arc<str>, Instant)>,
+    /// Selection generation these URLs were signed against (design §3); see
+    /// [`Entries::generation`]. A switch clears them so a URL into the old
+    /// bucket is never handed out for the new one.
+    generation: u64,
+}
+
+impl PresignEntries {
+    fn reconcile_generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.map.clear();
+            self.generation = generation;
+        }
+    }
+}
+
 pub struct PresignCache {
     ttl: Duration,
-    entries: Mutex<HashMap<String, (Arc<str>, Instant)>>,
+    entries: Mutex<PresignEntries>,
 }
 
 impl PresignCache {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(PresignEntries::default()),
         }
     }
 
-    pub fn fresh(&self, key: &str) -> Option<Arc<str>> {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let (url, signed) = entries.get(key)?;
+    pub fn fresh(&self, key: &str, generation: u64) -> Option<Arc<str>> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.reconcile_generation(generation);
+        let (url, signed) = entries.map.get(key)?;
         (signed.elapsed() < self.ttl).then(|| url.clone())
     }
 
-    pub fn put(&self, key: &str, url: Arc<str>) {
+    pub fn put(&self, key: &str, url: Arc<str>, generation: u64) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.insert(key.to_string(), (url, Instant::now()));
-        if entries.len() > PRESIGN_CACHE_MAX_ENTRIES {
+        entries.reconcile_generation(generation);
+        entries.map.insert(key.to_string(), (url, Instant::now()));
+        if entries.map.len() > PRESIGN_CACHE_MAX_ENTRIES {
             let ttl = self.ttl;
-            entries.retain(|_, (_, signed)| signed.elapsed() < ttl);
-            if entries.len() > PRESIGN_CACHE_MAX_ENTRIES {
-                entries.clear();
+            entries.map.retain(|_, (_, signed)| signed.elapsed() < ttl);
+            if entries.map.len() > PRESIGN_CACHE_MAX_ENTRIES {
+                entries.map.clear();
             }
         }
     }
@@ -308,6 +349,7 @@ impl PresignCache {
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .map
             .remove(key);
     }
 }
@@ -330,7 +372,7 @@ mod tests {
         let cache = IndexCache::new(Duration::from_secs(60));
 
         let (identity, _) = cache
-            .get(&storage, "simple/foo/index.json")
+            .get(&storage, "simple/foo/index.json", 0)
             .await
             .unwrap()
             .unwrap();
@@ -340,7 +382,7 @@ mod tests {
 
         // Second read: served from RAM, same etag, no storage traffic.
         let (identity2, _) = cache
-            .get(&storage, "simple/foo/index.json")
+            .get(&storage, "simple/foo/index.json", 0)
             .await
             .unwrap()
             .unwrap();
@@ -355,12 +397,15 @@ mod tests {
         storage.insert("simple/foo/index.json", b"old".to_vec());
         let cache = IndexCache::new(Duration::from_millis(10));
 
-        cache.get(&storage, "simple/foo/index.json").await.unwrap();
+        cache
+            .get(&storage, "simple/foo/index.json", 0)
+            .await
+            .unwrap();
         storage.insert("simple/foo/index.json", b"new".to_vec());
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let (identity, _) = cache
-            .get(&storage, "simple/foo/index.json")
+            .get(&storage, "simple/foo/index.json", 0)
             .await
             .unwrap()
             .unwrap();
@@ -379,12 +424,15 @@ mod tests {
         storage.insert("simple/foo/index.json", b"old".to_vec());
         let cache = IndexCache::new(Duration::from_secs(60));
 
-        cache.get(&storage, "simple/foo/index.json").await.unwrap();
+        cache
+            .get(&storage, "simple/foo/index.json", 0)
+            .await
+            .unwrap();
         storage.insert("simple/foo/index.json", b"new".to_vec());
         cache.invalidate("simple/foo/index.json");
 
         let (identity, _) = cache
-            .get(&storage, "simple/foo/index.json")
+            .get(&storage, "simple/foo/index.json", 0)
             .await
             .unwrap()
             .unwrap();
@@ -401,12 +449,12 @@ mod tests {
         let cache = IndexCache::new(Duration::from_secs(60));
 
         assert!(cache
-            .get(&storage, "simple/nope/index.json")
+            .get(&storage, "simple/nope/index.json", 0)
             .await
             .unwrap()
             .is_none());
         assert!(cache
-            .get(&storage, "simple/nope/index.json")
+            .get(&storage, "simple/nope/index.json", 0)
             .await
             .unwrap()
             .is_none());
@@ -420,7 +468,7 @@ mod tests {
         storage.insert("simple/nope/index.json", b"born".to_vec());
         cache.invalidate("simple/nope/index.json");
         assert!(cache
-            .get(&storage, "simple/nope/index.json")
+            .get(&storage, "simple/nope/index.json", 0)
             .await
             .unwrap()
             .is_some());
@@ -436,7 +484,7 @@ mod tests {
         let cache = IndexCache::with_capacity(Duration::from_secs(60), 4 * 1024);
         for i in 0..8 {
             assert!(cache
-                .get(&storage, &format!("simple/p{i}/index.json"))
+                .get(&storage, &format!("simple/p{i}/index.json"), 0)
                 .await
                 .unwrap()
                 .is_some());
@@ -448,7 +496,7 @@ mod tests {
         );
         // Still serves correctly after eviction (refill path).
         assert!(cache
-            .get(&storage, "simple/p0/index.json")
+            .get(&storage, "simple/p0/index.json", 0)
             .await
             .unwrap()
             .is_some());
@@ -465,7 +513,7 @@ mod tests {
         let cache = IndexCache::with_capacity(Duration::from_secs(60), max_bytes);
         for i in 0..10_000 {
             assert!(cache
-                .get(&storage, &format!("simple/missing{i}/index.json"))
+                .get(&storage, &format!("simple/missing{i}/index.json"), 0)
                 .await
                 .unwrap()
                 .is_none());
@@ -480,21 +528,21 @@ mod tests {
     #[tokio::test]
     async fn presign_cache_round_trip_and_expiry() {
         let cache = PresignCache::new(Duration::from_millis(20));
-        assert!(cache.fresh("packages/p/a.whl").is_none());
-        cache.put("packages/p/a.whl", "https://signed.example/1".into());
+        assert!(cache.fresh("packages/p/a.whl", 0).is_none());
+        cache.put("packages/p/a.whl", "https://signed.example/1".into(), 0);
         assert_eq!(
-            cache.fresh("packages/p/a.whl").as_deref(),
+            cache.fresh("packages/p/a.whl", 0).as_deref(),
             Some("https://signed.example/1")
         );
         cache.invalidate("packages/p/a.whl");
         assert!(
-            cache.fresh("packages/p/a.whl").is_none(),
+            cache.fresh("packages/p/a.whl", 0).is_none(),
             "post-delete the URL must be gone immediately"
         );
-        cache.put("packages/p/a.whl", "https://signed.example/2".into());
+        cache.put("packages/p/a.whl", "https://signed.example/2".into(), 0);
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(
-            cache.fresh("packages/p/a.whl").is_none(),
+            cache.fresh("packages/p/a.whl", 0).is_none(),
             "expired URLs must not be served"
         );
     }
@@ -508,7 +556,7 @@ mod tests {
         let cache = IndexCache::new(Duration::from_secs(60));
 
         let (identity, gzip) = cache
-            .get(&storage, "simple/foo/index.json")
+            .get(&storage, "simple/foo/index.json", 0)
             .await
             .unwrap()
             .unwrap();
@@ -547,7 +595,7 @@ mod tests {
         let cache = IndexCache::new(Duration::from_secs(60));
 
         let (_, gz_tiny) = cache
-            .get(&storage, "simple/tiny/index.json")
+            .get(&storage, "simple/tiny/index.json", 0)
             .await
             .unwrap()
             .unwrap();
@@ -556,7 +604,7 @@ mod tests {
             "sub-1KB bodies must not carry a gzip variant"
         );
         let (_, gz_rand) = cache
-            .get(&storage, "simple/rand/index.json")
+            .get(&storage, "simple/rand/index.json", 0)
             .await
             .unwrap()
             .unwrap();
@@ -572,14 +620,61 @@ mod tests {
         storage.fail_next_get();
         let cache = IndexCache::new(Duration::from_secs(60));
 
-        assert!(cache.get(&storage, "simple/foo/index.json").await.is_err());
+        assert!(cache
+            .get(&storage, "simple/foo/index.json", 0)
+            .await
+            .is_err());
 
         // The error must not poison the cache as a negative entry.
         storage.insert("simple/foo/index.json", b"ok".to_vec());
         assert!(cache
-            .get(&storage, "simple/foo/index.json")
+            .get(&storage, "simple/foo/index.json", 0)
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn generation_change_clears_index_cache() {
+        // A bucket switch bumps the generation; an entry cached under the old
+        // one must not be served for the new bucket (which has different bytes).
+        let old = InMemStorage::default();
+        old.insert("simple/foo/index.json", b"east".to_vec());
+        let new = InMemStorage::default();
+        new.insert("simple/foo/index.json", b"west".to_vec());
+        let cache = IndexCache::new(Duration::from_secs(60));
+
+        let (a, _) = cache
+            .get(&old, "simple/foo/index.json", 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.body.as_ref(), b"east");
+        // Same key, new generation, different bucket: the stale entry is dropped.
+        let (b, _) = cache
+            .get(&new, "simple/foo/index.json", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            b.body.as_ref(),
+            b"west",
+            "old-generation entry must not leak"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_change_clears_presign_cache() {
+        let cache = PresignCache::new(Duration::from_secs(300));
+        cache.put("packages/p/a.whl", "https://east/1".into(), 0);
+        assert_eq!(
+            cache.fresh("packages/p/a.whl", 0).as_deref(),
+            Some("https://east/1")
+        );
+        // A switch to generation 1 must drop URLs signed against the old bucket.
+        assert!(
+            cache.fresh("packages/p/a.whl", 1).is_none(),
+            "presigned URL from the old generation must not survive a switch"
+        );
     }
 }

@@ -30,10 +30,11 @@ pub struct BucketHandle {
 #[derive(Clone)]
 pub struct Pinned {
     pub storage: Arc<dyn Storage>,
-    // Consumed by P1's pin-at-entry wiring and generation-tagged caches; carried
-    // but unread in P0.
-    #[allow(dead_code)]
+    /// The selection generation this context was captured under. Threaded into
+    /// the generation-tagged caches (src/cache.rs) so a switch can't serve one
+    /// bucket's bytes for another. Always 0 until P4 wires `switch()`.
     pub generation: u64,
+    // Read by P4's selection/logging; carried but unread until then.
     #[allow(dead_code)]
     pub index: usize,
 }

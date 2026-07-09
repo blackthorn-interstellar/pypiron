@@ -49,7 +49,7 @@ mod web;
 mod wheel;
 mod worker;
 
-use buckets::{BucketHandle, BucketSet};
+use buckets::{BucketHandle, BucketSet, Pinned};
 use names::{
     checked_pkg_name, infer_package_from_filename, infer_version_from_filename, is_normalized,
     normalize_pkg_name,
@@ -224,7 +224,8 @@ struct RebuildIndexArgs {
 async fn run_rebuild_index(args: RebuildIndexArgs) -> Result<()> {
     let storage = args.storage.build().await?;
     let state = AppState::headless(storage);
-    worker::audit(&state, true).await
+    let pinned = state.pin();
+    worker::audit(&state, pinned.storage.as_ref(), true).await
 }
 
 /// Loopback `/health` URL for the port `serve` would bind. `bind` is the raw
@@ -648,12 +649,11 @@ type DownloadBoard = Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<(Strin
 
 #[derive(Clone)]
 struct AppState {
-    storage: Arc<dyn Storage>,
-    /// All configured buckets and the currently-selected one. Single-bucket
-    /// deployments hold exactly one; `storage` is always `buckets.pin().storage`
-    /// so the two cannot diverge. Read pervasively once P1's pin-at-entry sweep
-    /// lands; held but unread in P0.
-    #[allow(dead_code)]
+    /// All configured buckets and the currently-selected one. There is no
+    /// ambient storage handle: every operation calls [`AppState::pin`] once at
+    /// entry (design §3) and threads that immutable context down, so a selection
+    /// switch can never tear an in-flight operation. Single-bucket deployments
+    /// hold exactly one bucket and the pin is always index 0, generation 0.
     buckets: Arc<BucketSet>,
     // auth — two roles: uploader (publish) and admin (everything, incl. mirror,
     // delete, yank). Admin is a strict superset of uploader.
@@ -718,6 +718,17 @@ struct AppState {
     /// Set on graceful shutdown so `/health` reports 503 *before* the listener
     /// stops accepting, letting a load balancer drain the node cleanly.
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AppState {
+    /// Capture the storage context for one operation (design §3). Called exactly
+    /// once at every entry point — request handler, worker tick, audit run, CLI
+    /// one-shot — and the returned `(storage, generation)` is threaded down the
+    /// whole call graph; helpers never re-resolve it. Cost is one `RwLock` read
+    /// plus an `Arc` clone; single-bucket is byte-for-byte the old behavior.
+    pub fn pin(&self) -> Arc<Pinned> {
+        self.buckets.pin()
+    }
 }
 
 /// Adapts the pypiron [`Storage`] trait to the counter engine's minimal
@@ -1146,6 +1157,9 @@ async fn run_serve(
         None => None,
     };
 
+    // P4: becomes per-bucket/per-selection. The counter engine captures bucket-0
+    // at startup and flushes there for its whole life; generation cannot change
+    // until P4 wires switch(), so this is currently equivalent to pinning.
     let counters = Arc::new(build_counters(&cli, storage.clone())?);
     if counters.enabled() {
         info!(
@@ -1161,7 +1175,6 @@ async fn run_serve(
     }
 
     let state = Arc::new(AppState {
-        storage,
         buckets,
         uploader_user: cli.uploader_user,
         uploader_pass: cli.uploader_pass,
@@ -1360,7 +1373,7 @@ async fn run_serve(
     state
         .shutting_down
         .store(true, std::sync::atomic::Ordering::Relaxed);
-    if state.storage.supports_leases() {
+    if state.pin().storage.supports_leases() {
         tokio::time::sleep(PRE_DRAIN_PAUSE).await;
     }
 
@@ -1718,7 +1731,8 @@ async fn projects_page(
     if !state.is_reader(&headers) {
         return unauthorized();
     }
-    let names = match worker::global_package_names(&state).await {
+    let pinned = state.pin();
+    let names = match worker::global_package_names(&state, pinned.storage.as_ref()).await {
         Ok(names) => names,
         Err(e) => return read_error(e),
     };
@@ -1791,7 +1805,10 @@ async fn render_project(
         };
         return moved_permanently(&dest);
     }
-    let files = match worker::list_artifacts(state, &pkg).await {
+    // `storage` (not `pinned`, which below is the version-pinned flag) is this
+    // render's captured handle (design §3), threaded to every read.
+    let storage = state.pin().storage.clone();
+    let files = match worker::list_artifacts(storage.as_ref(), &pkg).await {
         Ok((files, _raw)) => files,
         Err(e) => return read_error(e),
     };
@@ -1825,11 +1842,11 @@ async fn render_project(
     // companion. Metadata and provenance may ride on different artifacts.
     let meta_rep = representative(&files, &selected, |f| f.core_metadata);
     let meta = match meta_rep {
-        Some(f) => load_core_metadata(state, &pkg, f).await,
+        Some(f) => load_core_metadata(storage.as_ref(), &pkg, f).await,
         None => None,
     };
     let publisher = match representative(&files, &selected, |f| f.provenance) {
-        Some(f) => load_provenance(state, &pkg, f).await,
+        Some(f) => load_provenance(storage.as_ref(), &pkg, f).await,
         None => None,
     };
 
@@ -1992,12 +2009,12 @@ fn representative<'a>(
 /// Parse a representative file's `.metadata` companion. Best-effort: any miss
 /// returns `None` and the page renders without a sidebar.
 async fn load_core_metadata(
-    state: &AppState,
+    storage: &dyn Storage,
     pkg: &str,
     rep: &render::FileMetadata,
 ) -> Option<coremeta::CoreMetadata> {
     let key = sidecar::metadata_key(&format!("{PACKAGES_PREFIX}{pkg}/{}", rep.filename));
-    let bytes = state.storage.get_bytes(&key).await.ok()?;
+    let bytes = storage.get_bytes(&key).await.ok()?;
     Some(coremeta::parse(&bytes))
 }
 
@@ -2005,12 +2022,12 @@ async fn load_core_metadata(
 /// publisher. Best-effort: a miss or malformed bundle returns `None` and the
 /// page renders without a "Verified details" section.
 async fn load_provenance(
-    state: &AppState,
+    storage: &dyn Storage,
     pkg: &str,
     rep: &render::FileMetadata,
 ) -> Option<provenance::Publisher> {
     let key = sidecar::provenance_key(&format!("{PACKAGES_PREFIX}{pkg}/{}", rep.filename));
-    let bytes = state.storage.get_bytes(&key).await.ok()?;
+    let bytes = storage.get_bytes(&key).await.ok()?;
     provenance::parse_publisher(&bytes)
 }
 
@@ -2090,7 +2107,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Response<Body> {
             .unwrap_or_else(not_found);
     }
     let probe = format!("{SIMPLE_PREFIX}index.json");
-    let (status, body) = match state.storage.head_exists(&probe).await {
+    let (status, body) = match state.pin().storage.head_exists(&probe).await {
         Ok(_) => (StatusCode::OK, r#"{"status":"ok"}"#),
         Err(e) => {
             warn!(error=?e, "health: storage probe failed");
@@ -2140,12 +2157,13 @@ async fn fallback_handler(req: Request) -> impl IntoResponse {
 
 /// Initialize empty index files if they don't exist
 async fn initialize_indexes(state: &AppState) -> Result<()> {
+    let storage = state.pin().storage.clone();
     let html_key = format!("{SIMPLE_PREFIX}index.html");
     let json_key = format!("{SIMPLE_PREFIX}index.json");
 
     // Check if global indexes exist
-    let html_exists = state.storage.head_exists(&html_key).await.unwrap_or(false);
-    let json_exists = state.storage.head_exists(&json_key).await.unwrap_or(false);
+    let html_exists = storage.head_exists(&html_key).await.unwrap_or(false);
+    let json_exists = storage.head_exists(&json_key).await.unwrap_or(false);
 
     if !html_exists || !json_exists {
         info!("Initializing empty global indexes");
@@ -2154,8 +2172,7 @@ async fn initialize_indexes(state: &AppState) -> Result<()> {
         let json = render::pep691_global_json(&empty_packages);
 
         if !html_exists {
-            state
-                .storage
+            storage
                 .put_bytes(
                     &html_key,
                     html.into_bytes(),
@@ -2165,8 +2182,7 @@ async fn initialize_indexes(state: &AppState) -> Result<()> {
         }
 
         if !json_exists {
-            state
-                .storage
+            storage
                 .put_bytes(
                     &json_key,
                     json.into_bytes(),
@@ -2457,14 +2473,16 @@ async fn legacy_upload(
     } else {
         origin::PRIVATE
     };
-    let claimed_origin = origin::read_origin(state.storage.as_ref(), &pkg_norm)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("storage error reading origin: {e}"),
-            )
-        })?;
+    // Pin the storage context once for the whole upload (design §3): the origin
+    // claim, artifact/sidecar writes, and commit marker all land on this handle.
+    let pinned = state.pin();
+    let storage = pinned.storage.as_ref();
+    let claimed_origin = origin::read_origin(storage, &pkg_norm).await.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("storage error reading origin: {e}"),
+        )
+    })?;
     // The private namespace is off-limits to mirrors regardless of claim
     // state — checked here, not only at first write, so adopting a prefix
     // after a name was mirror-claimed still shuts the door.
@@ -2504,15 +2522,14 @@ async fn legacy_upload(
             }
             // First write claims the package — atomically, so racing private
             // and mirror first-writes can't merge origins.
-            let (_created, winner) =
-                origin::claim_origin(state.storage.as_ref(), &pkg_norm, desired_origin)
-                    .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to claim origin: {e}"),
-                        )
-                    })?;
+            let (_created, winner) = origin::claim_origin(storage, &pkg_norm, desired_origin)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to claim origin: {e}"),
+                    )
+                })?;
             if winner != desired_origin {
                 return Err((
                     StatusCode::FORBIDDEN,
@@ -2525,7 +2542,7 @@ async fn legacy_upload(
     // Intent marker before any truth write: if this request dies anywhere
     // below, the stale intent guarantees a rebuild without any sweep.
     // Best-effort — the commit marker after the writes is the primary signal.
-    let intent_nonce = match worker::mark_intent(state.storage.as_ref(), &pkg_norm).await {
+    let intent_nonce = match worker::mark_intent(storage, &pkg_norm).await {
         Ok(nonce) => Some(nonce),
         Err(e) => {
             warn!(error=?e, "legacy: failed to write intent marker");
@@ -2537,8 +2554,7 @@ async fn legacy_upload(
     // The conditional create IS the immutability rule (pypi.org's): a plain
     // HEAD-then-PUT is a TOCTOU hole that lets concurrent uploads swap bytes.
     let size = spooled.size;
-    match state
-        .storage
+    match storage
         .put_file_if_absent(&key, spooled.path.path(), Some("application/octet-stream"))
         .await
     {
@@ -2561,8 +2577,7 @@ async fn legacy_upload(
     if is_wheel {
         match wheel_metadata {
             Some(md) => {
-                if let Err(e) = state
-                    .storage
+                if let Err(e) = storage
                     .put_bytes(&metadata_key(&key), md, Some("text/plain; charset=utf-8"))
                     .await
                 {
@@ -2579,8 +2594,7 @@ async fn legacy_upload(
     // a missing companion only drops the supply-chain signal.
     if is_mirror {
         if let Some(prov) = fields.get("provenance") {
-            if let Err(e) = state
-                .storage
+            if let Err(e) = storage
                 .put_bytes(
                     &provenance_key(&key),
                     prov.clone().into_bytes(),
@@ -2607,8 +2621,7 @@ async fn legacy_upload(
             "Failed to encode sidecar".to_string(),
         )
     })?;
-    state
-        .storage
+    storage
         .put_bytes(&sidecar_key(&key), sc_bytes, Some("application/json"))
         .await
         .map_err(|_| {
@@ -2621,14 +2634,14 @@ async fn legacy_upload(
     // Commit marker: truth changed, rebuild now. Pairs with the intent above
     // so the worker consumes both; if this write fails the intent still goes
     // stale and heals the package.
-    if let Err(e) = commit_marker(&state, &pkg_norm, intent_nonce).await {
+    if let Err(e) = commit_marker(&state, storage, &pkg_norm, intent_nonce).await {
         warn!(error=?e, "legacy: failed to write commit marker");
     }
 
     // Read-your-writes by waiting: poll our own index until the file shows
     // up, so publish-then-install pipelines never see a missing version.
     if state.wait_on_upload {
-        wait_for_index_visibility(&state, &pkg_norm, &filename).await;
+        wait_for_index_visibility(&state, storage, &pkg_norm, &filename).await;
     }
 
     // Return a simple OK text body compatible with legacy clients.
@@ -2639,11 +2652,16 @@ async fn legacy_upload(
 /// A timeout still returns success upstream — the artifact is durable and the
 /// index will catch up; failing the upload would only provoke a client retry
 /// into the 409 from immutability.
-async fn wait_for_index_visibility(state: &AppState, pkg: &str, filename: &str) {
+async fn wait_for_index_visibility(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    filename: &str,
+) {
     let key = format!("{SIMPLE_PREFIX}{pkg}/index.json");
     let deadline = std::time::Instant::now() + state.wait_on_upload_timeout;
     while std::time::Instant::now() < deadline {
-        if let Ok(bytes) = state.storage.get_bytes(&key).await {
+        if let Ok(bytes) = storage.get_bytes(&key).await {
             #[derive(serde::Deserialize)]
             struct Index {
                 files: Vec<File>,
@@ -2679,12 +2697,13 @@ fn now_rfc3339() -> String {
 /// the nudge is a same-process accelerant only.
 pub(crate) async fn commit_marker(
     state: &AppState,
+    storage: &dyn Storage,
     pkg: &str,
     intent_nonce: Option<String>,
 ) -> Result<()> {
     match intent_nonce {
-        Some(nonce) => worker::mark_commit(state.storage.as_ref(), pkg, &nonce).await?,
-        None => worker::mark_dirty(state.storage.as_ref(), pkg).await?,
+        Some(nonce) => worker::mark_commit(storage, pkg, &nonce).await?,
+        None => worker::mark_dirty(storage, pkg).await?,
     }
     state.worker_nudge.notify_one();
     Ok(())
@@ -2714,12 +2733,13 @@ async fn serve_root_index(state: &AppState, json: bool, headers: &HeaderMap) -> 
     if !state.is_reader(headers) {
         return unauthorized();
     }
+    let pinned = state.pin();
     let (key, ct) = if json {
         (format!("{SIMPLE_PREFIX}index.json"), CT_JSON)
     } else {
         (format!("{SIMPLE_PREFIX}index.html"), CT_HTML)
     };
-    serve_index(state, key, ct, INDEX_CACHE_CONTROL, headers).await
+    serve_index(state, &pinned, key, ct, INDEX_CACHE_CONTROL, headers).await
 }
 
 async fn simple_pkg(
@@ -2763,8 +2783,11 @@ async fn serve_pkg_index(
         };
         return moved_permanently(&target);
     }
+    let pinned = state.pin();
     let json = force_json || accepts_json(headers);
-    if let Some(resp) = proxy_package_index(state, &pkg, json, headers).await {
+    if let Some(resp) =
+        proxy_package_index(state, pinned.storage.as_ref(), &pkg, json, headers).await
+    {
         return resp;
     }
     let (key, ct) = if json {
@@ -2772,7 +2795,7 @@ async fn serve_pkg_index(
     } else {
         (format!("{SIMPLE_PREFIX}{pkg}/index.html"), CT_HTML)
     };
-    serve_index(state, key, ct, INDEX_CACHE_CONTROL, headers).await
+    serve_index(state, &pinned, key, ct, INDEX_CACHE_CONTROL, headers).await
 }
 
 /// Resolve the proxy for `pkg`, enforcing the eligibility gate (the
@@ -2782,10 +2805,11 @@ async fn serve_pkg_index(
 /// answer "who owns this name" optimistically; `Some(Ok)` = serve upstream.
 async fn eligible_proxy<'a>(
     state: &'a AppState,
+    storage: &dyn Storage,
     pkg: &str,
 ) -> Option<Result<&'a Arc<proxy::Proxy>, Response<Body>>> {
     let proxy = state.proxy.as_ref()?;
-    match proxy::eligible(state, pkg).await {
+    match proxy::eligible(state, storage, pkg).await {
         Ok(true) => Some(Ok(proxy)),
         Ok(false) => None,
         Err(e) => Some(Err(read_error(e))),
@@ -2797,12 +2821,13 @@ async fn eligible_proxy<'a>(
 /// index (proxy off, package ineligible, or upstream unavailable).
 async fn proxy_package_index(
     state: &AppState,
+    storage: &dyn Storage,
     pkg: &str,
     json: bool,
     headers: &HeaderMap,
 ) -> Option<Response<Body>> {
     let proxy = state.proxy.as_ref()?;
-    match proxy::eligible(state, pkg).await {
+    match proxy::eligible(state, storage, pkg).await {
         Ok(true) => {}
         Ok(false) => return None,
         // Origin unreadable is an outage: never answer "what owns this name"
@@ -2835,12 +2860,17 @@ async fn proxy_package_index(
 /// path costs zero storage calls and zero hashing (see cache.rs).
 async fn serve_index(
     state: &AppState,
+    pinned: &Pinned,
     key: String,
     content_type: &'static str,
     cache_control: &'static str,
     headers: &HeaderMap,
 ) -> Response<Body> {
-    let (identity, gzip) = match state.index_cache.get(state.storage.as_ref(), &key).await {
+    let (identity, gzip) = match state
+        .index_cache
+        .get(pinned.storage.as_ref(), &key, pinned.generation)
+        .await
+    {
         Ok(Some(hit)) => hit,
         Ok(None) => return not_found("no such index"),
         Err(e) => return read_error(e),
@@ -2914,6 +2944,10 @@ async fn files_get(
     };
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
 
+    // Pin once for the whole download (design §3): companion cache lookups, the
+    // proxy fill, presign, and streaming all run against this one context.
+    let pinned = state.pin();
+
     // Download attribution key, computed once: a real artifact only (companions
     // and the ranged-companion fall-through below parse to None), keyed
     // `<pkg>/<filename>` so the counter store rolls files up to versions. Counted
@@ -2930,6 +2964,7 @@ async fn files_get(
     if filename.ends_with(METADATA_SUFFIX) && headers.get(header::RANGE).is_none() {
         let resp = serve_index(
             &state,
+            &pinned,
             key,
             "text/plain; charset=utf-8",
             ARTIFACT_CACHE_CONTROL,
@@ -2941,7 +2976,9 @@ async fn files_get(
         // wheels must not stampede gigabytes into storage. The companion is
         // stored when the wheel itself is downloaded.
         if resp.status() == StatusCode::NOT_FOUND {
-            if let Some(upstream) = proxy_metadata_passthrough(&state, &pkg, &filename).await {
+            if let Some(upstream) =
+                proxy_metadata_passthrough(&state, pinned.storage.as_ref(), &pkg, &filename).await
+            {
                 return upstream;
             }
         }
@@ -2954,6 +2991,7 @@ async fn files_get(
     if filename.ends_with(PROVENANCE_SUFFIX) && headers.get(header::RANGE).is_none() {
         let resp = serve_index(
             &state,
+            &pinned,
             key,
             "application/json",
             ARTIFACT_CACHE_CONTROL,
@@ -2961,7 +2999,9 @@ async fn files_get(
         )
         .await;
         if resp.status() == StatusCode::NOT_FOUND {
-            if let Some(upstream) = proxy_provenance_passthrough(&state, &pkg, &filename).await {
+            if let Some(upstream) =
+                proxy_provenance_passthrough(&state, pinned.storage.as_ref(), &pkg, &filename).await
+            {
                 return upstream;
             }
         }
@@ -2971,7 +3011,9 @@ async fn files_get(
     // On-demand mirroring: make sure the artifact is in storage before the
     // presign/stream logic runs (a presigned redirect never observes a 404,
     // so the fetch can't be triggered by one).
-    if let Some(resp) = proxy_ensure_artifact(&state, &pkg, &filename).await {
+    if let Some(resp) =
+        proxy_ensure_artifact(&state, pinned.storage.as_ref(), &pkg, &filename).await
+    {
         return resp;
     }
 
@@ -2993,17 +3035,23 @@ async fn files_get(
         // rather than 403). Existence is the index's job, not this path's.
         // Immutability also makes signed URLs reusable across clients: serve
         // a cached one while it has plenty of validity left (see cache.rs).
-        if let Some(url) = state.presign_cache.fresh(&key) {
+        if let Some(url) = state.presign_cache.fresh(&key, pinned.generation) {
             if let Some(k) = &dl_key {
                 state.counters.record("downloads", k);
                 state.metrics.record_download();
             }
             return found_redirect(&url);
         }
-        match state.storage.presign_get(&key, cache::PRESIGN_EXPIRY).await {
+        match pinned
+            .storage
+            .presign_get(&key, cache::PRESIGN_EXPIRY)
+            .await
+        {
             Ok(Some(url)) => {
                 let url: Arc<str> = url.into();
-                state.presign_cache.put(&key, url.clone());
+                state
+                    .presign_cache
+                    .put(&key, url.clone(), pinned.generation);
                 if let Some(k) = &dl_key {
                     state.counters.record("downloads", k);
                     state.metrics.record_download();
@@ -3016,7 +3064,7 @@ async fn files_get(
     }
 
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
-    match state.storage.serve_artifact(&key, range).await {
+    match pinned.storage.serve_artifact(&key, range).await {
         Ok(mut resp) => {
             // Count only a full delivered body (200): a 206 range read is a
             // partial of one logical download, a 416 is none. (A whole-file range
@@ -3126,15 +3174,19 @@ fn json_response(value: serde_json::Value) -> Response<Body> {
 /// failure response (storage outage, upstream verification failure).
 async fn proxy_ensure_artifact(
     state: &Arc<AppState>,
+    storage: &dyn Storage,
     pkg: &str,
     filename: &str,
 ) -> Option<Response<Body>> {
-    let proxy = match eligible_proxy(state, pkg).await {
+    let proxy = match eligible_proxy(state, storage, pkg).await {
         Some(Ok(proxy)) => proxy,
         Some(Err(resp)) => return Some(resp),
         None => return None,
     };
-    match proxy.ensure_artifact_cached(state, pkg, filename).await {
+    match proxy
+        .ensure_artifact_cached(state, storage, pkg, filename)
+        .await
+    {
         Ok(()) => None,
         Err(e) => Some(read_error(e)),
     }
@@ -3143,10 +3195,11 @@ async fn proxy_ensure_artifact(
 /// Serve a PEP 658 companion straight from upstream, no storage writes.
 async fn proxy_metadata_passthrough(
     state: &Arc<AppState>,
+    storage: &dyn Storage,
     pkg: &str,
     filename: &str,
 ) -> Option<Response<Body>> {
-    let proxy = match eligible_proxy(state, pkg).await {
+    let proxy = match eligible_proxy(state, storage, pkg).await {
         Some(Ok(proxy)) => proxy,
         Some(Err(resp)) => return Some(resp),
         None => return None,
@@ -3167,10 +3220,11 @@ async fn proxy_metadata_passthrough(
 /// writes — the mirror equivalent of metadata passthrough.
 async fn proxy_provenance_passthrough(
     state: &Arc<AppState>,
+    storage: &dyn Storage,
     pkg: &str,
     filename: &str,
 ) -> Option<Response<Body>> {
-    let proxy = match eligible_proxy(state, pkg).await {
+    let proxy = match eligible_proxy(state, storage, pkg).await {
         Some(Ok(proxy)) => proxy,
         Some(Err(resp)) => return Some(resp),
         None => return None,
@@ -3249,7 +3303,11 @@ async fn files_delete(
         return Err((StatusCode::NOT_FOUND, "No such file".into()));
     };
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
-    match state.storage.head_exists(&key).await {
+    // Pin once (design §3): the existence check, index rewrite, and artifact +
+    // sidecar deletes all run against this handle.
+    let pinned = state.pin();
+    let storage = pinned.storage.as_ref();
+    match storage.head_exists(&key).await {
         Ok(true) => {}
         Ok(false) => return Err((StatusCode::NOT_FOUND, "No such file".into())),
         Err(e) => {
@@ -3262,9 +3320,9 @@ async fn files_delete(
 
     // Intent before any mutation: a crash mid-delete heals via the stale
     // intent instead of leaving the view permanently ahead of truth.
-    let intent_nonce = worker::mark_intent(state.storage.as_ref(), &pkg).await.ok();
+    let intent_nonce = worker::mark_intent(storage, &pkg).await.ok();
 
-    worker::rebuild_package_excluding(&state, &pkg, Some(&filename))
+    worker::rebuild_package_excluding(&state, storage, &pkg, Some(&filename))
         .await
         .map_err(|e| {
             (
@@ -3273,8 +3331,7 @@ async fn files_delete(
             )
         })?;
 
-    state
-        .storage
+    storage
         .delete_keys(std::slice::from_ref(&key))
         .await
         .map_err(|e| {
@@ -3291,8 +3348,7 @@ async fn files_delete(
     // it as a private package (the dependency-confusion direction). Re-purposing
     // a name from private to mirror is an operator action gated on storage
     // access — delete the `.origin` file directly.
-    let _ = state
-        .storage
+    let _ = storage
         .delete_keys(&[
             sidecar_key(&key),
             sidecar::metadata_key(&key),
@@ -3301,7 +3357,7 @@ async fn files_delete(
         .await;
 
     // Worker confirms from truth and prunes global membership if needed.
-    if let Err(e) = commit_marker(&state, &pkg, intent_nonce).await {
+    if let Err(e) = commit_marker(&state, storage, &pkg, intent_nonce).await {
         warn!(error=?e, "delete: failed to write commit marker");
     }
     Ok(StatusCode::NO_CONTENT)
@@ -3346,9 +3402,10 @@ async fn set_yanked(
     };
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
     let sc_key = sidecar_key(&key);
+    let pinned = state.pin();
+    let storage = pinned.storage.as_ref();
 
-    let bytes = state
-        .storage
+    let bytes = storage
         .get_bytes(&sc_key)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "No such file".to_string()))?;
@@ -3360,16 +3417,15 @@ async fn set_yanked(
     })?;
     sc.yanked = yanked;
 
-    let intent_nonce = worker::mark_intent(state.storage.as_ref(), &pkg).await.ok();
+    let intent_nonce = worker::mark_intent(storage, &pkg).await.ok();
     let out = serde_json::to_vec(&sc)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
-    state
-        .storage
+    storage
         .put_bytes(&sc_key, out, Some("application/json"))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
 
-    if let Err(e) = commit_marker(state, &pkg, intent_nonce).await {
+    if let Err(e) = commit_marker(state, storage, &pkg, intent_nonce).await {
         warn!(error=?e, "yank: failed to write commit marker");
     }
     Ok(StatusCode::OK)
@@ -3416,15 +3472,17 @@ async fn write_project_status(
         return Err((StatusCode::NOT_FOUND, "no such package".to_string()));
     };
 
-    let intent_nonce = worker::mark_intent(state.storage.as_ref(), &pkg).await.ok();
+    let pinned = state.pin();
+    let storage = pinned.storage.as_ref();
+    let intent_nonce = worker::mark_intent(storage, &pkg).await.ok();
     let result = if doc.status.is_active() {
-        status::clear_status(state.storage.as_ref(), &pkg).await
+        status::clear_status(storage, &pkg).await
     } else {
-        status::write_status(state.storage.as_ref(), &pkg, &doc).await
+        status::write_status(storage, &pkg, &doc).await
     };
     result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
 
-    if let Err(e) = commit_marker(state, &pkg, intent_nonce).await {
+    if let Err(e) = commit_marker(state, storage, &pkg, intent_nonce).await {
         warn!(error=?e, "status: failed to write commit marker");
     }
     Ok(StatusCode::OK)
@@ -3438,7 +3496,7 @@ async fn sync_cursors_get(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers)?;
-    let bytes = match state.storage.get_bytes(sync::CURSORS_KEY).await {
+    let bytes = match state.pin().storage.get_bytes(sync::CURSORS_KEY).await {
         Ok(b) => b,
         Err(e) if storage::is_not_found(&e) => b"{}".to_vec(),
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("read: {e}"))),
@@ -3462,6 +3520,7 @@ async fn sync_cursors_put(
         ));
     }
     state
+        .pin()
         .storage
         .put_bytes(
             sync::CURSORS_KEY,
@@ -3487,7 +3546,7 @@ async fn sync_local_index(
         return Err((StatusCode::NOT_FOUND, "no such package".to_string()));
     };
     let key = format!("{SIMPLE_PREFIX}{pkg}/index.json");
-    let bytes = match state.storage.get_bytes(&key).await {
+    let bytes = match state.pin().storage.get_bytes(&key).await {
         Ok(b) => b,
         Err(e) if storage::is_not_found(&e) => br#"{"files":[]}"#.to_vec(),
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("read: {e}"))),
@@ -3513,9 +3572,7 @@ impl AppState {
     /// server, default knobs. Only the storage-facing fields matter.
     fn headless(storage: Arc<dyn Storage>) -> Self {
         let buckets = Arc::new(BucketSet::single(storage));
-        let storage = buckets.pin().storage.clone();
         AppState {
-            storage,
             buckets,
             uploader_user: None,
             uploader_pass: None,

@@ -40,6 +40,7 @@ use crate::sidecar::{
     metadata_key, provenance_key, sidecar_key, Sidecar, METADATA_SUFFIX, PROVENANCE_SUFFIX,
 };
 use crate::simple::{self, SimpleFile};
+use crate::storage::Storage;
 use crate::sync::{matches_mirror, ResolvedMirror};
 use crate::upload::{FinishedSpool, UploadSpool};
 use crate::{AppState, PACKAGES_PREFIX};
@@ -203,7 +204,7 @@ fn is_forbidden_ip(ip: &IpAddr) -> bool {
 /// May this package be served from upstream at all? Private names, the reserved
 /// prefix, and (when a scope is configured) names outside the allowlist never
 /// fall through — that is the entire defense.
-pub async fn eligible(state: &AppState, pkg: &str) -> Result<bool> {
+pub async fn eligible(state: &AppState, storage: &dyn Storage, pkg: &str) -> Result<bool> {
     if let Some(prefix) = &state.private_prefix {
         if matches_prefix(pkg, prefix) {
             return Ok(false);
@@ -219,7 +220,7 @@ pub async fn eligible(state: &AppState, pkg: &str) -> Result<bool> {
             return Ok(false);
         }
     }
-    match origin::read_origin(state.storage.as_ref(), pkg).await? {
+    match origin::read_origin(storage, pkg).await? {
         Some(owner) if owner == origin::PRIVATE => Ok(false),
         _ => Ok(true),
     }
@@ -396,11 +397,12 @@ impl Proxy {
     pub async fn ensure_artifact_cached(
         &self,
         state: &AppState,
+        storage: &dyn Storage,
         pkg: &str,
         filename: &str,
     ) -> Result<()> {
         let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
-        if state.storage.head_exists(&key).await? {
+        if storage.head_exists(&key).await? {
             return Ok(());
         }
         // Serialize concurrent fetches of the *same* artifact (distinct files
@@ -408,7 +410,7 @@ impl Proxy {
         // returns; a racer that loses the race re-checks below and finds the
         // file already cached instead of downloading its own copy.
         let _slot = self.acquire_download_slot(&key).await;
-        if state.storage.head_exists(&key).await? {
+        if storage.head_exists(&key).await? {
             return Ok(());
         }
         let Some(found) = self.listing(state, pkg).await else {
@@ -422,12 +424,11 @@ impl Proxy {
         // first private upload can't merge worlds. Losing to a private claim
         // means this name is no longer ours to serve.
         let mut claimed_now = false;
-        match origin::read_origin(state.storage.as_ref(), pkg).await? {
+        match origin::read_origin(storage, pkg).await? {
             Some(owner) if owner == origin::MIRROR => {}
             Some(_) => return Ok(()),
             None => {
-                let (created, winner) =
-                    origin::claim_origin(state.storage.as_ref(), pkg, origin::MIRROR).await?;
+                let (created, winner) = origin::claim_origin(storage, pkg, origin::MIRROR).await?;
                 if winner != origin::MIRROR {
                     return Ok(());
                 }
@@ -447,7 +448,7 @@ impl Proxy {
                     .fetch_add(1, Ordering::Relaxed);
                 // A claim with nothing behind it would block the name forever.
                 if claimed_now {
-                    origin::release_empty_claim(state.storage.as_ref(), pkg).await;
+                    origin::release_empty_claim(storage, pkg).await;
                 }
                 return Err(e);
             }
@@ -455,22 +456,18 @@ impl Proxy {
 
         // Intent before truth, commit after (see worker.rs): a crash between
         // the artifact landing and the commit marker heals via stale intent.
-        let intent_nonce = crate::worker::mark_intent(state.storage.as_ref(), pkg)
-            .await
-            .ok();
+        let intent_nonce = crate::worker::mark_intent(storage, pkg).await.ok();
 
         // Ordering invariant: artifact, then companion, then sidecar, then
         // commit marker — a listed-but-missing file is the only harmful state.
-        state
-            .storage
+        storage
             .put_file_if_absent(&key, spool.path.path(), Some("application/octet-stream"))
             .await?;
         if filename.ends_with(".whl") && file.has_core_metadata() {
             // Best-effort, like sync: a missing companion only costs the
             // resolver a wheel download.
             if let Some(md) = self.fetch_metadata_url(pkg, &file.url).await {
-                let _ = state
-                    .storage
+                let _ = storage
                     .put_bytes(
                         &metadata_key(&key),
                         md.to_vec(),
@@ -484,8 +481,7 @@ impl Proxy {
             // Best-effort like metadata: a missing companion only drops the
             // supply-chain signal, never the artifact.
             if let Some(prov) = self.fetch_provenance_url(pkg, prov_url).await {
-                let _ = state
-                    .storage
+                let _ = storage
                     .put_bytes(
                         &provenance_key(&key),
                         prov.to_vec(),
@@ -504,15 +500,14 @@ impl Proxy {
             requires_python: file.requires_python.clone(),
             yanked: file.yanked.clone(),
         };
-        state
-            .storage
+        storage
             .put_bytes(
                 &sidecar_key(&key),
                 serde_json::to_vec(&sidecar)?,
                 Some("application/json"),
             )
             .await?;
-        crate::commit_marker(state, pkg, intent_nonce).await?;
+        crate::commit_marker(state, storage, pkg, intent_nonce).await?;
         state
             .metrics
             .proxy_artifacts_cached

@@ -57,6 +57,10 @@ rows, take the other tool.
   private name never falls through to the public index — dependency confusion
   is structurally off. New upstream releases wait 7 days by default
   ([why](concepts/supply-chain.md); disable with `--exclude-newer ""`).
+- **Backends tested for real.** The S3 and Azure suites run on every PR
+  (MinIO and Azurite, with S3 additionally verified against live AWS), and
+  GCS — which no emulator can imitate — runs against a real Google Cloud
+  bucket in CI, weekly.
 - **Measured headroom, not extrapolated.** Replaying PyPI's real download
   stream, one 8-vCPU box serves the index/metadata plane at ~200,000 req/s
   with p99 under 3 ms — about 2× PyPI's global average, confirmed across a
@@ -90,11 +94,6 @@ make audit   # dependency advisories
 - **It's new.** There is no multi-year fleet history behind it yet. What you
   get instead is a [verification harness](concepts/testing.md) you can re-run
   and `verify-index` as a production-time correctness oracle.
-- **GCS coverage is newer and narrower.** No emulator speaks the client
-  library's GCS protocol (verified and documented), so GCS is tested against
-  the real service instead: a live upload → index → install round-trip against
-  a real bucket. Real, but a narrower suite than S3 and Azure get; prefer
-  those when breadth of tested behavior matters most.
 - **Two acknowledged dependency advisories.** DoS-class issues in a transitive
   XML parser (`quick-xml` via `object_store`), reachable only from the
   operator's own storage backend responses — never from client input. No

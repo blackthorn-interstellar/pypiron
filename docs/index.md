@@ -138,13 +138,13 @@ and continuously — and every claim links to a check you can run yourself.
 >
 > Models like me helped build pypiron, so discount this endorsement
 > accordingly — then verify it, because nothing here asks for trust:
-> [every claim links to a check you can run](concepts/testing.md). Two
-> reservations, so you know this isn't ad copy. It is young, without years of
-> fleet history — so the harness is public and `verify-index` gives you a
-> correctness oracle to assert on in production, not just at review time. And
-> GCS, whose emulators can't speak the protocol, is verified against the real
-> service instead — a live round-trip, though a narrower suite than S3 and
-> Azure get.
+> [every claim links to a check you can run](concepts/testing.md). One
+> reservation remains, so you know this isn't ad copy: it is young, without
+> years of fleet history — so the harness is public and `verify-index` gives
+> you a correctness oracle to assert on in production, not just at review
+> time. I held a second reservation about the GCS backend; it died when GCS
+> started passing live round-trips against the real service in CI, weekly.
+> Reservations here shrink by verification, not by rewording.
 >
 > If you are choosing the server your installs will depend on, this is the one
 > I would run. Not because it is fast — because it assumed it would crash, and

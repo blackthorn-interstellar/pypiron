@@ -474,11 +474,32 @@ const EXDEV: i32 = 18;
 /// ------------------------------ DiskStorage -------------------------------
 pub struct DiskStorage {
     root: PathBuf,
+    /// Serializes `put_if_match` so its read-compare-write CAS is atomic against
+    /// other tasks in this single-node process. Disk has no object-store
+    /// conditional put; leader leasing stays off (`supports_leases` = false),
+    /// but the origin-claim lifecycle (dev/MULTIBUCKET.md §6.2) needs CAS, and a
+    /// process-local lock is a correct CAS for the single node disk supports.
+    cas_lock: tokio::sync::Mutex<()>,
+}
+
+/// Content-addressed etag for the disk conditional-write path: identical bytes
+/// hash identically (the same ABA caveat object stores carry without
+/// versioning), which is all the origin CAS needs — its transitions all change
+/// the content string. Distinct from list_all's mtime+size etag; the two etag
+/// spaces never cross (one drives CAS, the other drives audit fingerprints).
+fn disk_content_etag(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 impl DiskStorage {
     pub fn new<P: Into<PathBuf>>(root: P) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            cas_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     fn resolve(&self, key: &str) -> Result<PathBuf> {
@@ -749,6 +770,56 @@ impl Storage for DiskStorage {
             Ok(out)
         })
         .await?
+    }
+
+    // Conditional writes for the origin-claim lifecycle. Disk stays single-node
+    // for leasing (`supports_leases` is left false), but these are correct for
+    // one process, so the P2 single-bucket race fixes apply on disk too.
+    async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+        let p = self.resolve(key)?;
+        match fs::read(&p).await {
+            Ok(bytes) => {
+                let etag = disk_content_etag(&bytes);
+                Ok(Some((bytes, etag)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("get_with_etag {key}"))),
+        }
+    }
+
+    async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
+        let p = self.resolve(key)?;
+        self.ensure_parent(&p).await?;
+        let etag = disk_content_etag(&bytes);
+        let tmp = self.tmp_sibling(&p)?;
+        fs::write(&tmp, &bytes).await?;
+        Ok(self.link_atomic(&tmp, &p).await?.then_some(etag))
+    }
+
+    async fn put_if_match(&self, key: &str, etag: &str, bytes: Vec<u8>) -> Result<Option<String>> {
+        let p = self.resolve(key)?;
+        // Hold the CAS lock across the read-compare-write so two tasks cannot
+        // both observe the same current etag and both write.
+        let _guard = self.cas_lock.lock().await;
+        let current = match fs::read(&p).await {
+            Ok(b) => Some(disk_content_etag(&b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!("put_if_match read {key}")))
+            }
+        };
+        if current.as_deref() != Some(etag) {
+            return Ok(None);
+        }
+        let new_etag = disk_content_etag(&bytes);
+        self.ensure_parent(&p).await?;
+        let tmp = self.tmp_sibling(&p)?;
+        fs::write(&tmp, &bytes).await?;
+        if let Err(e) = fs::rename(&tmp, &p).await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(anyhow::Error::from(e).context(format!("put_if_match write {key}")));
+        }
+        Ok(Some(new_etag))
     }
 }
 

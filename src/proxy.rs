@@ -421,22 +421,36 @@ impl Proxy {
         };
 
         // Claim before writing, exactly like sync: atomically, so a racing
-        // first private upload can't merge worlds. Losing to a private claim
-        // means this name is no longer ours to serve.
-        let mut claimed_now = false;
-        match origin::read_origin(storage, pkg).await? {
-            Some(owner) if owner == origin::MIRROR => {}
-            Some(_) => return Ok(()),
-            None => {
-                let (created, winner) = origin::claim_origin(storage, pkg, origin::MIRROR).await?;
-                if winner != origin::MIRROR {
+        // first private upload can't merge worlds. Capture the claim's exact
+        // identity (etag) so the pre-commit re-check below can prove the name is
+        // still ours after a slow download. Losing to a private claim means this
+        // name is no longer ours to serve.
+        let (claim_etag, claimed_now) = match origin::read_origin_versioned(storage, pkg).await? {
+            Some((content, etag)) if content == origin::MIRROR => (etag, false),
+            Some((content, _)) if content == origin::PRIVATE => return Ok(()),
+            // Absent object or the `unclaimed` sentinel — claim it for mirror.
+            _ => {
+                let claim = origin::claim_origin(storage, pkg, origin::MIRROR).await?;
+                if claim.owner != origin::MIRROR {
                     return Ok(());
                 }
-                // Only the creator may later release this claim; a racer that
-                // merely read back our peer's fresh MIRROR claim must not.
-                claimed_now = created;
+                // Always need the claim's etag for the pre-commit re-check; if we
+                // established it we already hold it, otherwise re-read the peer's
+                // fresh MIRROR claim (which is not ours to release).
+                let etag = match claim.etag {
+                    Some(etag) => etag,
+                    None => {
+                        origin::read_origin_versioned(storage, pkg)
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow!("mirror claim for '{pkg}' vanished after claim")
+                            })?
+                            .1
+                    }
+                };
+                (etag, claim.created)
             }
-        }
+        };
 
         info!(%pkg, %filename, upstream = %self.upstream, "proxy: caching artifact");
         let spool = match self.download_verified(state, pkg, file).await {
@@ -448,11 +462,31 @@ impl Proxy {
                     .fetch_add(1, Ordering::Relaxed);
                 // A claim with nothing behind it would block the name forever.
                 if claimed_now {
-                    origin::release_empty_claim(storage, pkg).await;
+                    origin::release_empty_claim(storage, pkg, &claim_etag).await;
                 }
                 return Err(e);
             }
         };
+
+        // Pre-commit re-check (dev/MULTIBUCKET.md §6.2): a slow download can
+        // straddle a mirror→private demotion (or a re-claim). Re-read the claim;
+        // if it is no longer the exact MIRROR claim this fill started against,
+        // abandon the fill and fall back to the private-name behavior — never
+        // commit mirror bytes into a name that went private mid-flight. One
+        // extra GET per first-time cache fill.
+        match origin::read_origin_versioned(storage, pkg).await? {
+            Some((content, etag)) if content == origin::MIRROR && etag == claim_etag => {}
+            _ => {
+                info!(%pkg, %filename, "proxy: origin claim changed mid-download; abandoning fill");
+                return Ok(());
+            }
+        }
+        // A tombstoned private filename must never be resurrected by a proxy
+        // fill (§6.4). Namespace rules make this near-impossible — private names
+        // don't proxy — but fail closed.
+        if crate::tombstone::is_tombstoned(storage, &key).await? {
+            return Ok(());
+        }
 
         // Intent before truth, commit after (see worker.rs): a crash between
         // the artifact landing and the commit marker heals via stale intent.
@@ -499,6 +533,9 @@ impl Proxy {
             upload_time: file.upload_time.clone().unwrap_or_default(),
             requires_python: file.requires_python.clone(),
             yanked: file.yanked.clone(),
+            // Proxy fills are mirror truth (§4/§6.2).
+            origin: Some(origin::MIRROR.to_string()),
+            yank_epoch: 0,
         };
         storage
             .put_bytes(

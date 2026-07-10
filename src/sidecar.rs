@@ -10,6 +10,10 @@ pub const METADATA_SUFFIX: &str = ".metadata";
 /// PEP 740 provenance object, relayed verbatim from upstream next to the
 /// artifact. Like `.metadata`, it is a served companion, not truth we author.
 pub const PROVENANCE_SUFFIX: &str = ".provenance";
+/// Delete marker: `<filename>.tombstone` next to where the artifact lived. A
+/// deleted private filename may never be reused (dev/MULTIBUCKET.md §6.4), and
+/// a crashed delete must converge to "gone" rather than resurrect the file.
+pub const TOMBSTONE_SUFFIX: &str = ".tombstone";
 
 /// PEP 592 yank state: `false`, `true`, or a reason string.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +68,25 @@ pub struct Sidecar {
     pub requires_python: Option<String>,
     #[serde(default)]
     pub yanked: Yanked,
+    /// Per-artifact origin (`"private"` | `"mirror"`), captured at write time so
+    /// the replicator can decide "replicate private truth only" from bucket
+    /// state alone, not from history (dev/MULTIBUCKET.md §4, §6.2). Legacy and
+    /// fabricated sidecars omit it; the worker backfills a missing value from
+    /// the package-level `.origin` claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Monotonic yank epoch, bumped on every yank/unyank flip (§6.5). The
+    /// cross-bucket merge takes the max epoch — no wall clocks, because two
+    /// buckets have two clocks and skew makes verdicts non-convergent. Absent
+    /// means 0 (never yanked).
+    #[serde(rename = "yank-epoch", default, skip_serializing_if = "is_zero_epoch")]
+    pub yank_epoch: u64,
+}
+
+/// Serde predicate: keep the common (never-yanked) sidecar free of epoch noise
+/// while still persisting any non-zero epoch the merge depends on.
+fn is_zero_epoch(epoch: &u64) -> bool {
+    *epoch == 0
 }
 
 /// Storage key of the sidecar for an artifact key.
@@ -81,13 +104,20 @@ pub fn provenance_key(artifact_key: &str) -> String {
     format!("{artifact_key}{PROVENANCE_SUFFIX}")
 }
 
-/// True if `filename` (no directory part) is an artifact, not a sidecar or dotfile.
+/// Storage key of the delete tombstone for an artifact key.
+pub fn tombstone_key(artifact_key: &str) -> String {
+    format!("{artifact_key}{TOMBSTONE_SUFFIX}")
+}
+
+/// True if `filename` (no directory part) is an artifact, not a sidecar,
+/// tombstone, or dotfile.
 pub fn is_artifact(filename: &str) -> bool {
     !filename.is_empty()
         && !filename.starts_with('.')
         && !filename.ends_with(SIDECAR_SUFFIX)
         && !filename.ends_with(METADATA_SUFFIX)
         && !filename.ends_with(PROVENANCE_SUFFIX)
+        && !filename.ends_with(TOMBSTONE_SUFFIX)
 }
 
 #[cfg(test)]
@@ -100,6 +130,7 @@ mod tests {
         assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.meta.json"));
         assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.metadata"));
         assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.provenance"));
+        assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.tombstone"));
         assert!(!is_artifact(".origin"));
         assert!(!is_artifact(".project-status.json"));
         assert!(!is_artifact(""));
@@ -149,5 +180,33 @@ mod tests {
         assert_eq!(reasoned.yanked, Yanked::Reason("broken".into()));
         let out = serde_json::to_string(&reasoned).unwrap();
         assert!(out.contains(r#""yanked":"broken""#));
+    }
+
+    #[test]
+    fn origin_and_yank_epoch_default_for_legacy_sidecars() {
+        // A pre-migration sidecar carries neither field: both must serde-default
+        // (origin None → "backfill from .origin", yank_epoch 0 → never yanked),
+        // or every legacy sidecar would fail to parse.
+        let legacy: Sidecar =
+            serde_json::from_str(r#"{"sha256":"a","size":1,"version":"1","upload-time":"t"}"#)
+                .unwrap();
+        assert_eq!(legacy.origin, None);
+        assert_eq!(legacy.yank_epoch, 0);
+        // The common case stays free of epoch/origin noise on the wire.
+        let out = serde_json::to_string(&legacy).unwrap();
+        assert!(!out.contains("yank-epoch"), "zero epoch must not serialize");
+        assert!(!out.contains("origin"), "absent origin must not serialize");
+
+        // A migrated sidecar round-trips both fields.
+        let migrated: Sidecar = serde_json::from_str(
+            r#"{"sha256":"a","size":1,"version":"1","upload-time":"t",
+                "origin":"private","yank-epoch":3}"#,
+        )
+        .unwrap();
+        assert_eq!(migrated.origin.as_deref(), Some("private"));
+        assert_eq!(migrated.yank_epoch, 3);
+        let out = serde_json::to_string(&migrated).unwrap();
+        assert!(out.contains(r#""origin":"private""#));
+        assert!(out.contains(r#""yank-epoch":3"#));
     }
 }

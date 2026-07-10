@@ -41,6 +41,7 @@ use crate::render::{
 };
 use crate::sidecar::{
     is_artifact, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, PROVENANCE_SUFFIX, SIDECAR_SUFFIX,
+    TOMBSTONE_SUFFIX,
 };
 use crate::storage::{is_not_found, FileEntry, ObjectMeta, Storage};
 use crate::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
@@ -1111,6 +1112,13 @@ pub async fn list_artifacts(
         .iter()
         .filter_map(|e| e.key.strip_prefix(&prefix))
         .collect();
+    // Tombstoned filenames leave every index (dev/MULTIBUCKET.md §6.4): a delete
+    // that crashed after the tombstone but before the artifact removal converges
+    // to "gone" here, rather than resurrecting the file.
+    let tombstoned: HashSet<&str> = names
+        .iter()
+        .filter_map(|f| f.strip_suffix(TOMBSTONE_SUFFIX))
+        .collect();
 
     // Sidecar reads fan out with bounded concurrency: a 2,000-file package
     // costs 2,000 GETs, and doing them serially put rebuilds at minutes of
@@ -1120,20 +1128,33 @@ pub async fn list_artifacts(
         .iter()
         .filter_map(|entry| {
             let filename = entry.key.strip_prefix(&prefix)?;
-            is_artifact(filename).then_some((entry, filename))
+            (is_artifact(filename) && !tombstoned.contains(filename)).then_some((entry, filename))
         })
         .collect();
     let raw: Vec<(String, u64)> = artifacts
         .iter()
         .map(|(entry, filename)| (filename.to_string(), entry.size))
         .collect();
+    // The per-artifact `origin` a fabricated sidecar records comes from the
+    // package-level `.origin` claim (§4). Read it once, and only when a backfill
+    // is actually needed, so the common all-sidecars-present rebuild pays
+    // nothing. Best-effort: a read error leaves the fabricated field unset (the
+    // replicator falls back to the claim), never failing the rebuild.
+    let needs_backfill = artifacts
+        .iter()
+        .any(|(_, f)| !names.contains(format!("{f}{SIDECAR_SUFFIX}").as_str()));
+    let pkg_origin = if needs_backfill {
+        crate::origin::read_origin(storage, pkg)
+            .await
+            .unwrap_or(None)
+    } else {
+        None
+    };
     let mut metadata = Vec::with_capacity(artifacts.len());
     for chunk in artifacts.chunks(SIDECAR_READ_CONCURRENCY) {
-        let loaded = futures::future::join_all(
-            chunk
-                .iter()
-                .map(|(entry, filename)| load_file_metadata(storage, entry, filename, &names)),
-        )
+        let loaded = futures::future::join_all(chunk.iter().map(|(entry, filename)| {
+            load_file_metadata(storage, entry, filename, &names, pkg_origin.as_deref())
+        }))
         .await;
         metadata.extend(loaded.into_iter().flatten());
     }
@@ -1147,6 +1168,7 @@ async fn load_file_metadata(
     entry: &FileEntry,
     filename: &str,
     names: &HashSet<&str>,
+    pkg_origin: Option<&str>,
 ) -> Option<FileMetadata> {
     let has_sidecar = names.contains(format!("{filename}{SIDECAR_SUFFIX}").as_str());
     let sc = if has_sidecar {
@@ -1162,7 +1184,7 @@ async fn load_file_metadata(
             }
         }
     } else {
-        match backfill_sidecar(storage, entry, filename).await {
+        match backfill_sidecar(storage, entry, filename, pkg_origin).await {
             Ok(sc) => sc,
             Err(e) => {
                 warn!(error=?e, key=%entry.key, "could not backfill sidecar; skipping file");
@@ -1197,6 +1219,7 @@ async fn backfill_sidecar(
     storage: &dyn Storage,
     entry: &FileEntry,
     filename: &str,
+    pkg_origin: Option<&str>,
 ) -> Result<Sidecar> {
     let bytes = storage.get_bytes(&entry.key).await?;
     let mut hasher = Sha256::new();
@@ -1208,6 +1231,10 @@ async fn backfill_sidecar(
         upload_time: entry.last_modified.clone().unwrap_or_default(),
         requires_python: None,
         yanked: Yanked::Flag(false),
+        // Fill the per-artifact origin from the package-level claim (§4); a
+        // legacy artifact predates the field, so the claim is the truth.
+        origin: pkg_origin.map(str::to_string),
+        yank_epoch: 0,
     };
     let created = storage
         .put_if_absent(
@@ -1482,6 +1509,8 @@ mod tests {
                 upload_time: "2026-01-01T00:00:00Z".into(),
                 requires_python: None,
                 yanked: Yanked::Flag(false),
+                origin: None,
+                yank_epoch: 0,
             })
             .unwrap(),
         );
@@ -1583,6 +1612,8 @@ mod tests {
                 upload_time: "2026-01-01T00:00:00Z".into(),
                 requires_python: None,
                 yanked: Yanked::Flag(false),
+                origin: None,
+                yank_epoch: 0,
             })
             .unwrap(),
         );

@@ -154,3 +154,28 @@ def test_delete_removes_file_then_package(stocked_server):
         time.sleep(0.2)
     else:
         pytest.fail("deleting the last file must 404 the package index and prune the global index")
+
+
+def test_deleted_filename_cannot_be_reused(stocked_server):
+    """A deleted filename is barred from reuse (dev/MULTIBUCKET.md §6.4). Once the
+    artifact bytes are gone, plain create-if-absent would readmit the re-upload;
+    the tombstone written at delete time is what makes it 409 instead."""
+    server = stocked_server
+    wheel = server["wheels"][NEW_VERSION]
+    creds = {"username": server["user"], "password": server["password"]}
+
+    code, _, _ = http_request_auth(
+        "DELETE", f"{server['base_url']}/files/{PACKAGE}/{wheel.name}", **creds
+    )
+    assert code == 204
+    _wait_index(server, lambda doc: wheel.name not in [f["filename"] for f in doc["files"]])
+
+    status, body = upload_legacy(
+        server["legacy"],
+        wheel,
+        username=server["user"],
+        password=server["password"],
+        expect_status=409,
+    )
+    assert status == 409
+    assert b"deleted and cannot be reused" in body, body

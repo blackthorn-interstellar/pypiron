@@ -250,10 +250,14 @@ def _assert_storage_clean(proxy: Dict, pkg: str, filename: str) -> None:
         stray = [p.name for p in pkg_dir.iterdir() if p.name.startswith(".tmp")]
         assert not stray, f"orphaned temp files in {pkg_dir}: {stray}"
         # A failed first fetch must release its origin claim, or the name is
-        # blocked forever.
-        assert not (pkg_dir / ".origin").exists(), (
-            "failed first fetch left an orphan .origin claim (name blocked forever)"
-        )
+        # blocked forever. The claim is a never-deleted object (dev/MULTIBUCKET.md
+        # §6.2), so release rewrites it to the "unclaimed" sentinel rather than
+        # deleting it — the name stays re-claimable either way.
+        origin_file = pkg_dir / ".origin"
+        if origin_file.exists():
+            assert origin_file.read_text().strip() == "unclaimed", (
+                "failed first fetch left a live origin claim (name blocked forever)"
+            )
     # The spool file self-cleans on every early-return path; give the drop a
     # moment to run, then require it empty.
     deadline = time.time() + 5.0

@@ -296,7 +296,12 @@ packages/<pkg>/<filename>                # artifact, immutable once written
 packages/<pkg>/<filename>.meta.json      # sidecar (see below)
 packages/<pkg>/<filename>.metadata       # PEP 658 core metadata, extracted from wheel
 packages/<pkg>/<filename>.provenance     # PEP 740 provenance object, relayed verbatim from upstream
-packages/<pkg>/.origin                   # "private" | "mirror" — claimed at first write
+packages/<pkg>/<filename>.tombstone      # delete marker (private files only): a deleted filename may
+                                         #   never be reused, and a crashed delete converges to "gone"
+                                         #   instead of resurrecting. Excluded from indexes; NEVER
+                                         #   lifecycle-expired (expiry would resurrect the delete).
+packages/<pkg>/.origin                   # "private" | "mirror" | "unclaimed" — a NEVER-DELETED claim
+                                         #   (see the origin-claim lifecycle below)
 packages/<pkg>/.project-status.json      # PEP 792 status ({status, reason?}); absent == active
 simple/index.html                        # materialized views (regenerable)
 simple/index.json
@@ -311,6 +316,13 @@ _sync/cursors.json                       # mirror-over-HTTP sync memo: pkg -> la
                                          #   never truth, never a view — delete it and the next
                                          #   sync re-fetches. Served by admin GET/PUT /sync/cursors.
 _leader/lease.json                       # multi-node lease (holder, term, expires-at)
+_topology/stamp.json                     # multi-bucket only: fail-closed config check — a hash of the
+                                         #   ordered bucket identities + operator topology generation,
+                                         #   CAS-written/verified on every reachable bucket at startup.
+                                         #   One bucket: absent, dormant.
+_repl/<dest>/<file>                      # RESERVED (P3): per-destination replication todo markers, the
+                                         #   _dirty/ idiom pointed at another bucket. Swept in every
+                                         #   bucket, drained on successful copy. Not yet written.
 _counters/<metric>/seg/<day>/<shard>/<id>.json   # download counters: node-flushed delta segments
                                          #   (write path; <id> is a unique per-incarnation id).
 _counters/<metric>/day/<day>/<shard>.json        # frozen per-shard day total (leader compaction);
@@ -341,11 +353,20 @@ Sidecar schema (`<filename>.meta.json`), all captured at write time:
   "version": "1.2.3",
   "upload-time": "2026-06-11T00:00:00Z",
   "requires-python": ">=3.9",
-  "yanked": false
+  "yanked": false,
+  "origin": "private",
+  "yank-epoch": 0
 }
 ```
 
-`yanked` may be `false` or a reason string (PEP 592). Rebuilds read sidecars only;
+`yanked` may be `false` or a reason string (PEP 592). `origin` (`"private"` |
+`"mirror"`) is the per-artifact origin, captured so the replicator can decide
+"replicate private truth only" from bucket state alone, not history; it is
+absent on legacy sidecars, where the worker backfills it from the package-level
+`.origin` claim. `yank-epoch` is a monotonic counter bumped on every yank/unyank
+flip — the cross-bucket merge takes the max epoch (no wall clocks, which two
+buckets cannot agree on); absent means 0. Both fields default when absent, so
+every pre-migration sidecar still parses. Rebuilds read sidecars only;
 if a sidecar is missing (legacy file), the rebuild backfills it by hashing the
 artifact once — create-only, so a real write-time sidecar always wins the race.
 PEP 658 serving falls out of the layout: `<artifact-url>.metadata` maps directly
@@ -356,6 +377,31 @@ consumer's end-to-end job and works offline against a cached Sigstore trust root
 and never synthesizes it, so a direct upload carrying first-party `attestations`
 is refused. A mirror serves a point-in-time snapshot, so the companion is treated
 as immutable like the artifact it describes.
+
+**Origin-claim lifecycle** (`.origin`, dev/MULTIBUCKET.md §6.2). The claim is a
+**never-deleted** object with a small monotone lattice of states, and every
+transition is a conditional write (CAS):
+
+```
+  (absent) --claim--> private            create-if-absent (put-if-none-match)
+  (absent) --claim--> mirror             create-if-absent
+ unclaimed --claim--> private | mirror   put-if-match on the sentinel
+    mirror --demote-> private            put-if-match (the ONLY demotion)
+    mirror --release-> unclaimed         put-if-match (orphan cleanup)
+   private is terminal
+```
+
+After creation the claim never returns to *absent*: absent is what authorizes a
+proxy to fill from upstream, so a failed first write (proxy/sync) releases by
+CAS-rewriting the claim to the `unclaimed` sentinel — never an unconditional
+delete, which could erase a claim that went `private` mid-flight and re-open the
+dependency-confusion window. `unclaimed` reads as "no claim" (a proxy may claim
+it) while keeping the object present. Reads that drive a CAS return the etag; the
+proxy re-checks it immediately before committing a fill, so a slow download that
+straddles a `mirror→private` demotion aborts instead of committing mirror bytes
+into a now-private name. Deletes never touch `.origin` — emptying a package must
+not release the name to the opposite world. Like tombstones, `.origin` is never
+lifecycle-expired.
 
 ## Honest scaling limits
 

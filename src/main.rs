@@ -43,6 +43,7 @@ mod status;
 mod storage;
 mod sync;
 mod token;
+mod tombstone;
 mod upload;
 mod verify;
 mod web;
@@ -2522,7 +2523,7 @@ async fn legacy_upload(
             }
             // First write claims the package — atomically, so racing private
             // and mirror first-writes can't merge origins.
-            let (_created, winner) = origin::claim_origin(storage, &pkg_norm, desired_origin)
+            let claim = origin::claim_origin(storage, &pkg_norm, desired_origin)
                 .await
                 .map_err(|e| {
                     (
@@ -2530,10 +2531,13 @@ async fn legacy_upload(
                         format!("Failed to claim origin: {e}"),
                     )
                 })?;
-            if winner != desired_origin {
+            if claim.owner != desired_origin {
                 return Err((
                     StatusCode::FORBIDDEN,
-                    format!("Package '{pkg_norm}' is {winner}-owned; {desired_origin} uploads are rejected"),
+                    format!(
+                        "Package '{pkg_norm}' is {}-owned; {desired_origin} uploads are rejected",
+                        claim.owner
+                    ),
                 ));
             }
         }
@@ -2549,6 +2553,26 @@ async fn legacy_upload(
             None
         }
     };
+
+    // A deleted private filename may never be reused (dev/MULTIBUCKET.md §6.4).
+    // The tombstone bars the name even after the artifact bytes are gone, which
+    // is the gap create-if-absent alone leaves: once the artifact no longer
+    // exists, put_file_if_absent would happily recreate it.
+    match tombstone::is_tombstoned(storage, &key).await {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("File '{filename}' was deleted and cannot be reused"),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("storage error checking tombstone: {e}"),
+            ));
+        }
+    }
 
     // Ordering invariant: artifact, then sidecars, then index job.
     // The conditional create IS the immutability rule (pypi.org's): a plain
@@ -2614,6 +2638,10 @@ async fn legacy_upload(
         upload_time,
         requires_python: fields.get("requires_python").cloned(),
         yanked,
+        // Per-artifact origin (§4/§6.2): the replicator decides "private only"
+        // from state, never from history.
+        origin: Some(desired_origin.to_string()),
+        yank_epoch: 0,
     };
     let sc_bytes = serde_json::to_vec(&sc).map_err(|_| {
         (
@@ -3331,6 +3359,33 @@ async fn files_delete(
             )
         })?;
 
+    // Tombstone a private delete BEFORE the artifact goes (dev/MULTIBUCKET.md
+    // §6.4): the filename is barred from reuse, and a crash between here and the
+    // artifact delete converges to "gone" (the index rebuild already drops
+    // tombstoned files) instead of resurrecting it. Mirror deletes are local
+    // cache management — a cached upstream file stays re-fillable forever — so
+    // they are never tombstoned. A read outage fails the delete rather than risk
+    // a silent-reuse gap.
+    let is_private = match origin::read_origin(storage, &pkg).await {
+        Ok(owner) => owner.as_deref() == Some(origin::PRIVATE),
+        Err(e) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("storage error reading origin: {e}"),
+            ));
+        }
+    };
+    if is_private {
+        tombstone::write(storage, &key, &filename)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("tombstone write failed: {e}"),
+                )
+            })?;
+    }
+
     storage
         .delete_keys(std::slice::from_ref(&key))
         .await
@@ -3415,6 +3470,13 @@ async fn set_yanked(
             format!("bad sidecar: {e}"),
         )
     })?;
+    // Bump the monotonic yank epoch on a real flip only (dev/MULTIBUCKET.md
+    // §6.5): the cross-bucket merge takes the max epoch, so a redundant re-yank
+    // must not inflate it and a no-op resync stays idempotent. Epochs replace
+    // wall clocks — two buckets have two clocks.
+    if sc.yanked.normalized() != yanked.normalized() {
+        sc.yank_epoch += 1;
+    }
     sc.yanked = yanked;
 
     let intent_nonce = worker::mark_intent(storage, &pkg).await.ok();

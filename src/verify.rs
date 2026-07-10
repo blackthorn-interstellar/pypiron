@@ -22,7 +22,9 @@ use crate::names::normalize_pkg_name;
 use crate::render::{
     pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
 };
-use crate::sidecar::{is_artifact, Sidecar, METADATA_SUFFIX, PROVENANCE_SUFFIX, SIDECAR_SUFFIX};
+use crate::sidecar::{
+    is_artifact, Sidecar, METADATA_SUFFIX, PROVENANCE_SUFFIX, SIDECAR_SUFFIX, TOMBSTONE_SUFFIX,
+};
 use crate::storage::{is_not_found, ObjectMeta, Storage, StorageArgs, SHARD_CHARS};
 use crate::{DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 
@@ -154,11 +156,19 @@ async fn check_package(
         .iter()
         .filter_map(|o| o.key.strip_prefix(&prefix))
         .collect();
+    // Tombstoned filenames are excluded from indexes (dev/MULTIBUCKET.md §6.4),
+    // so the oracle must exclude them too — otherwise a crashed delete that left
+    // an orphan artifact beside its tombstone would read as a stale-view forever.
+    let tombstoned: std::collections::HashSet<&str> = names
+        .iter()
+        .filter_map(|f| f.strip_suffix(TOMBSTONE_SUFFIX))
+        .collect();
     let artifacts: Vec<(&ObjectMeta, &str)> = objects
         .iter()
         .filter_map(|o| {
             let filename = o.key.strip_prefix(&prefix)?;
-            (!filename.contains('/') && is_artifact(filename)).then_some((o, filename))
+            (!filename.contains('/') && is_artifact(filename) && !tombstoned.contains(filename))
+                .then_some((o, filename))
         })
         .collect();
 

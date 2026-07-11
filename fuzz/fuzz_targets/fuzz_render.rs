@@ -128,17 +128,27 @@ fuzz_target!(|data: &[u8]| {
     serde_json::from_str::<serde_json::Value>(&json).expect("PEP 691 JSON is not valid JSON");
 
     // 2. The HTML `href` must be quote-safe and lossless.
+    // Match the real download anchor only — package names land in the <title>
+    // via encode_text (quotes unescaped), so a name containing the literal
+    // substring `href="/files/` would otherwise be a false first match and
+    // trip this assert (CI crash-4f0b102aa5f9287e84162c365827469bb16edd84).
     let html = render::pep503_package_html(&pkg, files, &status);
-    if let Some(start) = html.find("href=\"/files/") {
-        let after = &html[start + "href=\"".len()..];
+    const ANCHOR: &str = "<a href=\"";
+    if let Some(start) = html.find(ANCHOR) {
+        let after = &html[start + ANCHOR.len()..];
         if let Some(end) = after.find('"') {
             let raw_attr = &after[..end];
-            let decoded = html_escape::decode_html_entities(raw_attr);
-            let intended = format!("/files/{}/{}#sha256={}", pkg, fm.filename, fm.sha256);
-            assert_eq!(
-                decoded, intended,
-                "href attribute truncated/altered — HTML-attribute injection via an interpolated field"
-            );
+            // Only the download link is under test; skip if the first <a> is
+            // ever something else (today every package-html link is /files/).
+            if raw_attr.starts_with("/files/") {
+                let decoded = html_escape::decode_html_entities(raw_attr);
+                let intended = format!("/files/{}/{}#sha256={}", pkg, fm.filename, fm.sha256);
+                assert_eq!(
+                    decoded.as_ref(),
+                    intended.as_str(),
+                    "href attribute truncated/altered — HTML-attribute injection via an interpolated field"
+                );
+            }
         }
     }
 });

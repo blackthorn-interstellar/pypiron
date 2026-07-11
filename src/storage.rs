@@ -16,17 +16,49 @@ use tokio_util::io::ReaderStream;
 // Cloud object-store deps: S3, GCS, and Azure Blob behind one API. Disk is a
 // separate, dependency-free backend; everything remote shares one impl.
 use futures::StreamExt as _;
-use object_store::aws::{AmazonS3Builder, S3CopyIfNotExists};
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, S3CopyIfNotExists};
 use object_store::azure::MicrosoftAzureBuilder;
+use object_store::client::ClientConfigKey;
 use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
 use object_store::path::Path as OsPath;
 use object_store::signer::Signer;
 use object_store::{
     Attribute, Attributes, Error as OsError, GetOptions, GetRange, ObjectStore, ObjectStoreExt,
-    PutMode, PutMultipartOptions, PutOptions, PutPayload, UpdateVersion, WriteMultipart,
+    PutMode, PutMultipartOptions, PutOptions, PutPayload, RetryConfig, UpdateVersion,
+    WriteMultipart,
 };
 
 use crate::range::{parse_range, RangeSpec};
+
+/// S3 is the failover backend. One blackholed request must return in bounded
+/// time so its availability observation can move selection; object_store's
+/// defaults (10 retries over three minutes) make that impossible. Health and
+/// background maintenance apply their own one-second eligibility cancellation;
+/// data transfer keeps the route's one-hour bound so large uploads are not
+/// mistaken for dead buckets.
+const S3_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const S3_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+fn s3_retry_config() -> RetryConfig {
+    RetryConfig {
+        max_retries: 0,
+        retry_timeout: S3_REQUEST_TIMEOUT,
+        ..Default::default()
+    }
+}
+
+fn bound_s3_transport(builder: AmazonS3Builder) -> AmazonS3Builder {
+    builder
+        .with_config(
+            AmazonS3ConfigKey::Client(ClientConfigKey::ConnectTimeout),
+            format!("{}s", S3_CONNECT_TIMEOUT.as_secs()),
+        )
+        .with_config(
+            AmazonS3ConfigKey::Client(ClientConfigKey::Timeout),
+            format!("{}s", S3_REQUEST_TIMEOUT.as_secs()),
+        )
+        .with_retry(s3_retry_config())
+}
 
 /// Storage backend selection.
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -54,11 +86,13 @@ pub struct StorageArgs {
     #[arg(long, env = "PYPIRON_STORAGE_PREFIX")]
     pub storage_prefix: Option<String>,
 
-    /// S3 bucket(s) for package storage (required if --storage s3). Repeat
-    /// `--s3-bucket` — or set `PYPIRON_S3_BUCKETS` to a comma-separated list —
-    /// for multi-bucket replication and failover; order is preference and the
-    /// first is preferred. Each entry may carry a per-bucket region as
-    /// `name@region` (e.g. `iron-east@us-east-1`).
+    /// S3 bucket(s) for package storage. Supplying this selects S3, so
+    /// `--storage s3` is optional. Repeat `--s3-bucket` — or set
+    /// `PYPIRON_S3_BUCKETS` to a comma-separated list — for multi-bucket
+    /// replication and failover; order is preference and the first is
+    /// preferred. The legacy singular `PYPIRON_S3_BUCKET` remains accepted for
+    /// one bucket. Each entry may carry a per-bucket region as `name@region`
+    /// (e.g. `iron-east@us-east-1`).
     #[arg(
         long = "s3-bucket",
         env = "PYPIRON_S3_BUCKETS",
@@ -116,6 +150,26 @@ pub struct StorageArgs {
 }
 
 impl StorageArgs {
+    fn configured_s3_buckets(&self) -> Vec<String> {
+        resolve_s3_buckets(&self.s3_buckets, std::env::var("PYPIRON_S3_BUCKET").ok())
+    }
+
+    pub(crate) fn has_s3_bucket(&self) -> bool {
+        !self.configured_s3_buckets().is_empty()
+    }
+
+    /// A bucket list is itself an unambiguous S3 selection. This keeps the
+    /// customer contract to the one thing multi-bucket needs — an ordered list
+    /// — while preserving explicit GCS/Azure choices as configuration errors
+    /// instead of silently ignoring their backend-specific flags.
+    fn effective_backend(&self) -> StorageBackend {
+        if matches!(self.storage, StorageBackend::Disk) && self.has_s3_bucket() {
+            StorageBackend::S3
+        } else {
+            self.storage
+        }
+    }
+
     /// The node's default (preferred) storage handle — bucket 0. Preserves the
     /// exact single-bucket construction, crash-injection wrapper included.
     pub async fn build(&self) -> Result<Arc<dyn Storage>> {
@@ -146,10 +200,10 @@ impl StorageArgs {
     /// Human-readable identity of each configured bucket, in the same order and
     /// count as [`build_all`](Self::build_all), for topology stamping and logs.
     pub fn bucket_names(&self) -> Vec<String> {
-        match self.storage {
+        let s3_buckets = self.configured_s3_buckets();
+        match self.effective_backend() {
             StorageBackend::Disk => vec![self.resolved_data_dir()],
-            StorageBackend::S3 => self
-                .s3_buckets
+            StorageBackend::S3 => s3_buckets
                 .iter()
                 .map(|spec| parse_s3_bucket_spec(spec).0.to_string())
                 .collect(),
@@ -177,10 +231,11 @@ impl StorageArgs {
 
     /// Short, human-friendly description for the startup banner.
     pub fn describe(&self) -> String {
-        let where_ = match self.storage {
+        let s3_buckets = self.configured_s3_buckets();
+        let where_ = match self.effective_backend() {
             StorageBackend::Disk => format!("disk · {}", self.resolved_data_dir()),
-            StorageBackend::S3 if self.s3_buckets.is_empty() => "s3 · ?".to_string(),
-            StorageBackend::S3 => format!("s3 · {}", self.s3_buckets.join(", ")),
+            StorageBackend::S3 if s3_buckets.is_empty() => "s3 · ?".to_string(),
+            StorageBackend::S3 => format!("s3 · {}", s3_buckets.join(", ")),
             StorageBackend::Gcs => format!("gcs · {}", self.gcs_bucket.as_deref().unwrap_or("?")),
             StorageBackend::Azure => {
                 format!("azure · {}", self.azure_container.as_deref().unwrap_or("?"))
@@ -194,15 +249,18 @@ impl StorageArgs {
 
     async fn build_backends(&self) -> Result<Vec<Arc<dyn Storage>>> {
         // Multi-bucket is S3-only for now; GCS/Azure/disk stay single-bucket.
-        if self.s3_buckets.len() > 1 && !matches!(self.storage, StorageBackend::S3) {
+        let s3_buckets = self.configured_s3_buckets();
+        self.validate_cloud_selection(&s3_buckets)?;
+        let backend = self.effective_backend();
+        if s3_buckets.len() > 1 && !matches!(backend, StorageBackend::S3) {
             bail!(
                 "multi-bucket is S3-only for now: {} buckets were configured, \
                  but --storage is not s3",
-                self.s3_buckets.len()
+                s3_buckets.len()
             );
         }
         let prefix = self.resolved_prefix()?;
-        match self.storage {
+        match backend {
             StorageBackend::Disk => {
                 // Disk has no key namespace to share, so the prefix is simply a
                 // subdirectory of the data dir — same tree, one level down.
@@ -213,12 +271,13 @@ impl StorageArgs {
                 Ok(vec![Arc::new(DiskStorage::new(root))])
             }
             StorageBackend::S3 => {
-                if self.s3_buckets.is_empty() {
+                if s3_buckets.is_empty() {
                     bail!("--s3-bucket is required when using --storage s3");
                 }
-                let mut handles = Vec::with_capacity(self.s3_buckets.len());
-                for spec in &self.s3_buckets {
-                    handles.push(self.build_one_s3(spec).await?);
+                let mut handles = Vec::with_capacity(s3_buckets.len());
+                let failover = s3_buckets.len() > 1;
+                for spec in &s3_buckets {
+                    handles.push(self.build_one_s3(spec, failover).await?);
                 }
                 Ok(handles)
             }
@@ -283,20 +342,47 @@ impl StorageArgs {
         }
     }
 
+    fn validate_cloud_selection(&self, s3_buckets: &[String]) -> Result<()> {
+        if s3_buckets.is_empty() {
+            return Ok(());
+        }
+        let explicit_gcs = matches!(self.storage, StorageBackend::Gcs)
+            || self.gcs_bucket.is_some()
+            || self.gcs_service_account_path.is_some()
+            || self.gcs_endpoint_url.is_some();
+        let explicit_azure = matches!(self.storage, StorageBackend::Azure)
+            || self.azure_account.is_some()
+            || self.azure_container.is_some()
+            || self.azure_access_key.is_some()
+            || self.azure_endpoint_url.is_some()
+            || self.azure_use_emulator;
+        if explicit_gcs || explicit_azure {
+            bail!(
+                "S3 bucket configuration cannot be combined with explicit GCS or Azure configuration"
+            );
+        }
+        Ok(())
+    }
+
     /// Build one S3-backed [`Storage`] from a `name[@region]` bucket spec.
     /// Credentials come from the standard AWS chain (env vars, web identity,
     /// instance metadata). The default S3ConditionalPut is ETag-match, so the
     /// single-PUT create-if-absent path works on S3 and S3-compatible stores out
     /// of the box; large artifacts are published with a multipart copy-if-not-exists.
-    async fn build_one_s3(&self, spec: &str) -> Result<Arc<dyn Storage>> {
+    async fn build_one_s3(&self, spec: &str, failover: bool) -> Result<Arc<dyn Storage>> {
         let prefix = self.resolved_prefix()?;
         let (bucket, region) = parse_s3_bucket_spec(spec);
         if bucket.is_empty() {
             bail!("empty S3 bucket name in --s3-bucket value '{spec}'");
         }
-        let mut b = AmazonS3Builder::from_env()
+        let base = AmazonS3Builder::from_env()
             .with_bucket_name(bucket)
             .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
+        let mut b = if failover {
+            bound_s3_transport(base)
+        } else {
+            base
+        };
         // Region precedence: per-bucket `@region` suffix, then the shared
         // --aws-region, then the object-store builder's own default.
         if let Some(r) = region.or(self.aws_region.as_deref()) {
@@ -327,6 +413,16 @@ impl StorageArgs {
     }
 }
 
+fn resolve_s3_buckets(explicit: &[String], legacy: Option<String>) -> Vec<String> {
+    if !explicit.is_empty() {
+        return explicit.to_vec();
+    }
+    legacy
+        .filter(|bucket| !bucket.is_empty())
+        .into_iter()
+        .collect()
+}
+
 /// Parse an S3 bucket spec `name[@region]` into its parts. S3 bucket names cannot
 /// contain '@', so the first '@' unambiguously begins the region.
 fn parse_s3_bucket_spec(spec: &str) -> (&str, Option<&str>) {
@@ -350,9 +446,56 @@ fn fault_abort_after_writes() -> Option<i64> {
 #[error("not found: {0}")]
 pub struct NotFound(pub String);
 
+/// A remote bucket/container is missing, rather than one object inside it.
+/// Keep this distinct from [`NotFound`]: the health controller must fail over
+/// on the former and treat the latter as a successful store response.
+#[derive(Debug, thiserror::Error)]
+#[error("{backend} bucket unavailable: {detail}")]
+pub(crate) struct BucketUnavailable {
+    backend: &'static str,
+    detail: String,
+}
+
 /// True if `err` is (or wraps) a missing-object error.
 pub fn is_not_found(err: &anyhow::Error) -> bool {
     err.downcast_ref::<NotFound>().is_some()
+}
+
+pub(crate) fn is_bucket_unavailable(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<BucketUnavailable>().is_some())
+}
+
+pub(crate) fn message_is_missing_bucket(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("<code>nosuchbucket</code>")
+        || message.contains("\"code\":\"nosuchbucket\"")
+        || message.contains("specified bucket does not exist")
+}
+
+pub(crate) fn object_store_is_missing_bucket(error: &OsError) -> bool {
+    match error {
+        OsError::NotFound { source, .. } | OsError::Generic { source, .. } => {
+            message_is_missing_bucket(&source.to_string())
+        }
+        _ => false,
+    }
+}
+
+fn bucket_unavailable(backend: &str, error: &OsError) -> anyhow::Error {
+    // Do not preserve the typed object-level NotFound in the error chain: that
+    // variant also represents a missing bucket, which health must classify as
+    // an outage rather than a healthy missing key.
+    BucketUnavailable {
+        backend: match backend {
+            "s3" => "s3",
+            "gcs" => "gcs",
+            "azure" => "azure",
+            _ => "object storage",
+        },
+        detail: error.to_string(),
+    }
+    .into()
 }
 
 /// A file from a directory listing, with the metadata index rendering needs.
@@ -951,6 +1094,9 @@ impl ObjectStorage {
     async fn full_response(&self, path: &OsPath, key: &str) -> Result<Response<Body>> {
         let res = match self.store.get(path).await {
             Ok(r) => r,
+            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
+                return Err(bucket_unavailable(self.backend, &e))
+            }
             Err(OsError::NotFound { .. }) => return Err(NotFound(key.to_string()).into()),
             Err(e) => {
                 return Err(anyhow::Error::from(e).context(format!("{}: get {key}", self.backend)))
@@ -986,7 +1132,14 @@ impl ObjectStorage {
             .store
             .put_multipart_opts(staging, opts)
             .await
-            .with_context(|| format!("{}: begin multipart {staging}", self.backend))?;
+            .map_err(|error| {
+                if object_store_is_missing_bucket(&error) {
+                    bucket_unavailable(self.backend, &error)
+                } else {
+                    anyhow::Error::from(error)
+                        .context(format!("{}: begin multipart {staging}", self.backend))
+                }
+            })?;
         let mut writer = WriteMultipart::new_with_chunk_size(upload, MULTIPART_PART_SIZE);
         let mut buf = vec![0u8; READ_CHUNK];
         loop {
@@ -1017,6 +1170,9 @@ impl Storage for ObjectStorage {
     async fn head_exists(&self, key: &str) -> Result<bool> {
         match self.store.head(&self.oskey(key)).await {
             Ok(_) => Ok(true),
+            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
+                Err(bucket_unavailable(self.backend, &e))
+            }
             Err(OsError::NotFound { .. }) => Ok(false),
             Err(e) => Err(anyhow::Error::from(e).context(format!("{}: head {key}", self.backend))),
         }
@@ -1042,6 +1198,9 @@ impl Storage for ObjectStorage {
         // unsatisfiable range with 416 — one HEAD, only on ranged requests.
         let size = match self.store.head(&path).await {
             Ok(m) => m.size,
+            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
+                return Err(bucket_unavailable(self.backend, &e))
+            }
             Err(OsError::NotFound { .. }) => return Err(NotFound(key.to_string()).into()),
             Err(e) => {
                 return Err(anyhow::Error::from(e).context(format!("{}: head {key}", self.backend)))
@@ -1060,6 +1219,9 @@ impl Storage for ObjectStorage {
                 };
                 let res = match self.store.get_opts(&path, opts).await {
                     Ok(r) => r,
+                    Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
+                        return Err(bucket_unavailable(self.backend, &e))
+                    }
                     Err(OsError::NotFound { .. }) => return Err(NotFound(key.to_string()).into()),
                     Err(e) => {
                         return Err(
@@ -1089,7 +1251,13 @@ impl Storage for ObjectStorage {
         self.store
             .put_opts(&self.oskey(key), PutPayload::from(bytes), opts)
             .await
-            .with_context(|| format!("{}: put {key}", self.backend))?;
+            .map_err(|error| {
+                if object_store_is_missing_bucket(&error) {
+                    bucket_unavailable(self.backend, &error)
+                } else {
+                    anyhow::Error::from(error).context(format!("{}: put {key}", self.backend))
+                }
+            })?;
         Ok(())
     }
 
@@ -1111,6 +1279,9 @@ impl Storage for ObjectStorage {
         {
             Ok(_) => Ok(true),
             Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => Ok(false),
+            Err(e) if object_store_is_missing_bucket(&e) => {
+                Err(bucket_unavailable(self.backend, &e))
+            }
             Err(e) => {
                 Err(anyhow::Error::from(e)
                     .context(format!("{}: put_if_absent {key}", self.backend)))
@@ -1148,6 +1319,9 @@ impl Storage for ObjectStorage {
         {
             Ok(()) => Ok(true),
             Err(OsError::AlreadyExists { .. }) => Ok(false),
+            Err(e) if object_store_is_missing_bucket(&e) => {
+                Err(bucket_unavailable(self.backend, &e))
+            }
             Err(e) => {
                 Err(anyhow::Error::from(e).context(format!("{}: publish {key}", self.backend)))
             }
@@ -1163,6 +1337,9 @@ impl Storage for ObjectStorage {
                 .await
                 .with_context(|| format!("{}: read {key}", self.backend))?
                 .to_vec()),
+            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
+                Err(bucket_unavailable(self.backend, &e))
+            }
             Err(OsError::NotFound { .. }) => Err(NotFound(key.to_string()).into()),
             Err(e) => Err(anyhow::Error::from(e).context(format!("{}: get {key}", self.backend))),
         }
@@ -1172,11 +1349,20 @@ impl Storage for ObjectStorage {
         // list_with_delimiter is the directory listing: immediate files in
         // `objects`, sub-directories in `common_prefixes` (which we drop). A
         // missing prefix is an empty listing, not an error.
-        let res = self
+        let res = match self
             .store
             .list_with_delimiter(Some(&self.oskey(dir_prefix)))
             .await
-            .with_context(|| format!("{}: list {dir_prefix}", self.backend))?;
+        {
+            Ok(result) => result,
+            Err(error) if object_store_is_missing_bucket(&error) => {
+                return Err(bucket_unavailable(self.backend, &error))
+            }
+            Err(error) => {
+                return Err(anyhow::Error::from(error)
+                    .context(format!("{}: list {dir_prefix}", self.backend)))
+            }
+        };
         let mut entries: Vec<FileEntry> = res
             .objects
             .into_iter()
@@ -1212,7 +1398,16 @@ impl Storage for ObjectStorage {
         let mut stream = self.store.list(list_prefix.as_ref());
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
-            let m = item.with_context(|| format!("{}: list_all {prefix}", self.backend))?;
+            let m = match item {
+                Ok(meta) => meta,
+                Err(error) if object_store_is_missing_bucket(&error) => {
+                    return Err(bucket_unavailable(self.backend, &error))
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::from(error)
+                        .context(format!("{}: list_all {prefix}", self.backend)))
+                }
+            };
             let Some(key) = self.unkey(m.location.as_ref()) else {
                 continue;
             };
@@ -1230,7 +1425,18 @@ impl Storage for ObjectStorage {
 
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
         for k in keys {
-            let _ = self.store.delete(&self.oskey(k)).await;
+            match self.store.delete(&self.oskey(k)).await {
+                Ok(()) => {}
+                Err(error @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&error) => {
+                    return Err(bucket_unavailable(self.backend, &error))
+                }
+                Err(OsError::NotFound { .. }) => {}
+                Err(error) => {
+                    return Err(
+                        anyhow::Error::from(error).context(format!("{}: delete {k}", self.backend))
+                    )
+                }
+            }
         }
         Ok(())
     }
@@ -1250,6 +1456,9 @@ impl Storage for ObjectStorage {
                     .to_vec();
                 Ok(Some((bytes, etag)))
             }
+            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
+                Err(bucket_unavailable(self.backend, &e))
+            }
             Err(OsError::NotFound { .. }) => Ok(None),
             Err(e) => Err(anyhow::Error::from(e).context(format!("{}: get {key}", self.backend))),
         }
@@ -1267,6 +1476,9 @@ impl Storage for ObjectStorage {
         {
             Ok(res) => Ok(Some(pack_version(&res.e_tag, &res.version))),
             Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => Ok(None),
+            Err(e) if object_store_is_missing_bucket(&e) => {
+                Err(bucket_unavailable(self.backend, &e))
+            }
             Err(e) => Err(anyhow::Error::from(e)
                 .context(format!("{}: put_if_none_match {key}", self.backend))),
         }
@@ -1282,11 +1494,11 @@ impl Storage for ObjectStorage {
             Ok(res) => Ok(Some(pack_version(&res.e_tag, &res.version))),
             // A failed precondition, a concurrent conditional write, or a
             // since-deleted object: we lost, cleanly.
-            Err(
-                OsError::Precondition { .. }
-                | OsError::AlreadyExists { .. }
-                | OsError::NotFound { .. },
-            ) => Ok(None),
+            Err(OsError::Precondition { .. } | OsError::AlreadyExists { .. }) => Ok(None),
+            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
+                Err(bucket_unavailable(self.backend, &e))
+            }
+            Err(OsError::NotFound { .. }) => Ok(None),
             Err(e) => {
                 Err(anyhow::Error::from(e).context(format!("{}: put_if_match {key}", self.backend)))
             }
@@ -1447,6 +1659,122 @@ impl Storage for FaultInjectStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn storage_args(storage: StorageBackend) -> StorageArgs {
+        StorageArgs {
+            storage,
+            data_dir: None,
+            storage_prefix: None,
+            s3_buckets: Vec::new(),
+            aws_region: None,
+            s3_endpoint_url: None,
+            s3_force_path_style: false,
+            gcs_bucket: None,
+            gcs_service_account_path: None,
+            gcs_endpoint_url: None,
+            azure_account: None,
+            azure_container: None,
+            azure_access_key: None,
+            azure_endpoint_url: None,
+            azure_use_emulator: false,
+        }
+    }
+
+    #[test]
+    fn multi_s3_transport_disables_retries_without_a_short_transfer_deadline() {
+        let retry = s3_retry_config();
+        assert_eq!(retry.max_retries, 0);
+        assert_eq!(retry.retry_timeout, S3_REQUEST_TIMEOUT);
+
+        let builder = bound_s3_transport(AmazonS3Builder::new().with_bucket_name("packages"));
+        assert_eq!(
+            builder.get_config_value(&AmazonS3ConfigKey::Client(ClientConfigKey::ConnectTimeout)),
+            Some("2s".to_string())
+        );
+        assert_eq!(
+            builder.get_config_value(&AmazonS3ConfigKey::Client(ClientConfigKey::Timeout)),
+            Some("3600s".to_string())
+        );
+        // No explicit provider means the builder still constructs its normal
+        // WebIdentity/ECS/EKS/IMDS chain lazily. Static credentials also remain
+        // accepted. The bounded retry policy changes requests, not discovery.
+        builder.build().unwrap();
+        bound_s3_transport(
+            AmazonS3Builder::new()
+                .with_bucket_name("packages")
+                .with_access_key_id("test")
+                .with_secret_access_key("test"),
+        )
+        .build()
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_singular_s3_bucket_env_is_still_resolved() {
+        let previous = std::env::var_os("PYPIRON_S3_BUCKET");
+        std::env::set_var("PYPIRON_S3_BUCKET", "legacy-bucket");
+        let args = storage_args(StorageBackend::Disk);
+
+        assert_eq!(args.configured_s3_buckets(), ["legacy-bucket"]);
+        assert!(matches!(args.effective_backend(), StorageBackend::S3));
+
+        match previous {
+            Some(value) => std::env::set_var("PYPIRON_S3_BUCKET", value),
+            None => std::env::remove_var("PYPIRON_S3_BUCKET"),
+        }
+    }
+
+    #[test]
+    fn plural_s3_bucket_selection_wins_over_legacy_env_value() {
+        assert_eq!(
+            resolve_s3_buckets(
+                &["east".to_string(), "west".to_string()],
+                Some("legacy".to_string()),
+            ),
+            ["east", "west"]
+        );
+    }
+
+    #[test]
+    fn s3_bucket_rejects_explicit_gcs_or_azure_configuration() {
+        let s3 = vec!["packages".to_string()];
+
+        let mut gcs = storage_args(StorageBackend::Disk);
+        gcs.gcs_bucket = Some("gcs-packages".to_string());
+        assert!(gcs
+            .validate_cloud_selection(&s3)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be combined"));
+
+        let mut azure = storage_args(StorageBackend::Disk);
+        azure.azure_container = Some("azure-packages".to_string());
+        assert!(azure
+            .validate_cloud_selection(&s3)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be combined"));
+
+        assert!(storage_args(StorageBackend::Gcs)
+            .validate_cloud_selection(&s3)
+            .is_err());
+        assert!(storage_args(StorageBackend::Azure)
+            .validate_cloud_selection(&s3)
+            .is_err());
+    }
+
+    #[test]
+    fn distinguishes_missing_bucket_from_missing_object_text() {
+        assert!(message_is_missing_bucket(
+            "404 <Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message>"
+        ));
+        assert!(!message_is_missing_bucket(
+            "Object at location packages/no-such-bucket.whl not found"
+        ));
+        assert!(!message_is_missing_bucket(
+            "Object at location packages/NoSuchBucket.whl not found"
+        ));
+    }
 
     #[test]
     fn normalize_prefix_strips_slashes_and_rejects_traversal() {
@@ -1680,6 +2008,9 @@ pub mod test_support {
             true
         }
         async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            if self.fail_next_get.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("injected storage failure");
+            }
             Ok(self
                 .objects
                 .lock()

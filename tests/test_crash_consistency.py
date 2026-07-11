@@ -34,7 +34,7 @@ from .helpers import (
     wait_http_responding,
 )
 
-# No audit, fast ticks, 1s intent grace so crashed writers heal quickly.
+# No audit, fast ticks, minimum intent grace so crashed writers heal quickly.
 EVENT_ONLY_ARGS = [
     "--audit-on-boot",
     "false",
@@ -43,7 +43,7 @@ EVENT_ONLY_ARGS = [
     "--worker-interval-secs",
     "1",
     "--intent-grace-secs",
-    "1",
+    "3",
     "--admin-user",
     "admin",
     "--admin-pass",
@@ -272,7 +272,7 @@ def test_multi_node_s3_uploads_converge(pypiron_bin: Path, minio, tmp_path: Path
     event_only_env = {
         "PYPIRON_AUDIT_ON_BOOT": "false",
         "PYPIRON_RECONCILE_INTERVAL_SECS": "100000",
-        "PYPIRON_INTENT_GRACE_SECS": "1",
+        "PYPIRON_INTENT_GRACE_SECS": "3",
     }
 
     def start_node() -> Tuple[subprocess.Popen, str]:
@@ -352,7 +352,7 @@ def _chaos_s3_env(minio: Dict, bind: str) -> Dict[str, str]:
         {
             "PYPIRON_AUDIT_ON_BOOT": "false",
             "PYPIRON_RECONCILE_INTERVAL_SECS": "100000",
-            "PYPIRON_INTENT_GRACE_SECS": "1",
+            "PYPIRON_INTENT_GRACE_SECS": "3",
             "PYPIRON_LEASE_TTL_SECS": str(LEASE_TTL_SECS),
         }
     )

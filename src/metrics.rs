@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use crate::bucket_health::{HealthState, WorkerHealthSnapshot};
+
 /// Route groups, by path prefix. Order matches the counter matrix.
 pub const ROUTES: [&str; 6] = ["simple", "files", "legacy", "health", "metrics", "other"];
 /// Status classes. Order matches the counter matrix.
@@ -26,6 +28,16 @@ const CLASS_2XX: usize = 0;
 /// Past the cap, new tags land in [`OVERFLOW_TAG`].
 const MAX_PROJECT_TAGS: usize = 256;
 const OVERFLOW_TAG: &str = "_overflow";
+
+#[derive(Default)]
+struct BucketMetricState {
+    names: Vec<String>,
+    states: Vec<HealthState>,
+    selected_index: usize,
+    selection_generation: u64,
+    alarm_totals: HashMap<String, u64>,
+    topology_write_fenced: bool,
+}
 
 /// Index into [`ROUTES`] for a request path.
 pub fn route_group(path: &str) -> usize {
@@ -95,6 +107,26 @@ pub struct Metrics {
     /// atomics: only requests that carry credentials touch it, and the
     /// critical section is one map bump.
     project_requests: Mutex<HashMap<String, [u64; ROUTES.len()]>>,
+
+    /// True once more than one bucket is configured. The replication metrics
+    /// below are dormant machinery on a single-bucket node, so they are omitted
+    /// from the exposition entirely until multi-bucket is live (design §4/G).
+    multi_bucket: std::sync::atomic::AtomicBool,
+    /// Records (sidecar+artifact pairs) copied into another bucket, and their
+    /// artifact bytes — the quantifiable cost of keeping the warm copies warm.
+    pub replication_objects: AtomicU64,
+    pub replication_bytes: AtomicU64,
+    /// Byte-conflict freezes (§6.3): same filename, different bytes on two
+    /// buckets. Every nonzero value is a human-actionable split-brain.
+    pub replication_freezes: AtomicU64,
+    /// Last pairwise reconcile-diff wall duration, seconds, as f64 bits (gauge).
+    reconcile_diff_duration_bits: AtomicU64,
+    /// Undelivered `_repl/` markers, by destination bucket, as measured by the
+    /// last sweep (gauge). Low cardinality — one series per configured bucket.
+    marker_backlog: Mutex<HashMap<String, u64>>,
+    /// Latest P4 health/selection view. `None` until a multi-bucket worker
+    /// publishes its first snapshot; never populated by a single-bucket node.
+    bucket_health: Mutex<Option<BucketMetricState>>,
 }
 
 impl Metrics {
@@ -125,6 +157,77 @@ impl Metrics {
     pub fn set_audit_duration(&self, secs: f64) {
         self.audit_last_duration_bits
             .store(secs.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Arm the replication metric family (called once at startup when more than
+    /// one bucket is configured). Until then the family is omitted entirely.
+    pub fn set_multi_bucket(&self) {
+        self.multi_bucket.store(true, Ordering::Relaxed);
+    }
+
+    /// Count one replicated record: a sidecar+artifact pair copied into another
+    /// bucket, and its artifact bytes.
+    pub fn record_replicated(&self, bytes: u64) {
+        self.replication_objects.fetch_add(1, Ordering::Relaxed);
+        self.replication_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record the wall duration of the reconcile diff that just completed.
+    pub fn set_reconcile_diff_duration(&self, secs: f64) {
+        self.reconcile_diff_duration_bits
+            .store(secs.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Publish the per-destination `_repl/` marker backlog measured by a sweep.
+    pub fn set_marker_backlog(&self, dest: &str, count: u64) {
+        self.marker_backlog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(dest.to_string(), count);
+    }
+
+    /// Publish one worker health snapshot and accumulate its per-bucket alarm
+    /// deltas. This is the only P4 metrics update surface: names establish the
+    /// bounded label set, `generation` is the applied BucketSet generation, and
+    /// `topology_write_fenced` is the fail-closed runtime mismatch state.
+    ///
+    /// A single bucket is a hard no-op, even if called accidentally. Multi-bucket
+    /// mode is armed here as well as at startup so call ordering cannot suppress
+    /// the series.
+    pub fn update_bucket_health(
+        &self,
+        snapshot: &WorkerHealthSnapshot,
+        bucket_names: &[String],
+        generation: u64,
+        topology_write_fenced: bool,
+    ) {
+        if bucket_names.len() < 2 {
+            return;
+        }
+        self.set_multi_bucket();
+
+        let mut guard = self.bucket_health.lock().unwrap_or_else(|e| e.into_inner());
+        let state = guard.get_or_insert_with(BucketMetricState::default);
+        state.names = bucket_names.to_vec();
+        state.states = bucket_names
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                snapshot
+                    .states
+                    .get(index)
+                    .copied()
+                    .unwrap_or(HealthState::Unknown)
+            })
+            .collect();
+        state.selected_index = snapshot.selected_index;
+        state.selection_generation = generation;
+        state.topology_write_fenced = topology_write_fenced;
+        for (index, name) in bucket_names.iter().enumerate() {
+            let delta = snapshot.alarms.get(index).copied().unwrap_or(0);
+            let total = state.alarm_totals.entry(name.clone()).or_default();
+            *total = total.saturating_add(delta);
+        }
     }
 
     /// Publish the registry inventory measured by a clean sweep.
@@ -289,6 +392,58 @@ impl Metrics {
             out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
             out.push_str(&format!("{name} {value}\n"));
         }
+        // Replication family — emitted only on a multi-bucket node (design §G);
+        // a single-bucket node never runs replication, so the series would be a
+        // permanent row of zeros.
+        if self.multi_bucket.load(Ordering::Relaxed) {
+            for (name, help, value) in [
+                (
+                    "pypiron_replication_objects_total",
+                    "Records (sidecar+artifact) copied into another bucket.",
+                    &self.replication_objects,
+                ),
+                (
+                    "pypiron_replication_bytes_total",
+                    "Artifact bytes copied into other buckets.",
+                    &self.replication_bytes,
+                ),
+                (
+                    "pypiron_replication_freezes_total",
+                    "Byte-conflict freezes (same filename, different bytes on two buckets).",
+                    &self.replication_freezes,
+                ),
+            ] {
+                out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+                out.push_str(&format!("{name} {}\n", value.load(Ordering::Relaxed)));
+            }
+            let diff_secs =
+                f64::from_bits(self.reconcile_diff_duration_bits.load(Ordering::Relaxed));
+            out.push_str(
+                "# HELP pypiron_reconcile_diff_duration_seconds Wall duration of the last pairwise reconcile diff.\n",
+            );
+            out.push_str("# TYPE pypiron_reconcile_diff_duration_seconds gauge\n");
+            out.push_str(&format!(
+                "pypiron_reconcile_diff_duration_seconds {diff_secs}\n"
+            ));
+            let backlog = self
+                .marker_backlog
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            out.push_str(
+                "# HELP pypiron_replication_marker_backlog Undelivered _repl/ markers found on reachable source buckets, by destination.\n",
+            );
+            out.push_str("# TYPE pypiron_replication_marker_backlog gauge\n");
+            let mut dests: Vec<&String> = backlog.keys().collect();
+            dests.sort();
+            for dest in dests {
+                out.push_str(&format!(
+                    "pypiron_replication_marker_backlog{{dest=\"{dest}\"}} {}\n",
+                    backlog[dest]
+                ));
+            }
+            drop(backlog);
+            self.render_bucket_health(&mut out);
+        }
         let map = self
             .project_requests
             .lock()
@@ -311,6 +466,72 @@ impl Metrics {
         }
         out
     }
+
+    fn render_bucket_health(&self, out: &mut String) {
+        let guard = self.bucket_health.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(state) = guard.as_ref() else {
+            return;
+        };
+
+        out.push_str(
+            "# HELP pypiron_bucket_health_state Per-node bucket health: healthy=1, unknown=0, unhealthy=-1.\n",
+        );
+        out.push_str("# TYPE pypiron_bucket_health_state gauge\n");
+        out.push_str("# HELP pypiron_bucket_selected Selected bucket (one-hot).\n");
+        out.push_str("# TYPE pypiron_bucket_selected gauge\n");
+        out.push_str(
+            "# HELP pypiron_bucket_health_alarms_total Credential, CAS, KMS, quota, configuration, and other non-availability storage errors.\n",
+        );
+        out.push_str("# TYPE pypiron_bucket_health_alarms_total counter\n");
+        for (index, name) in state.names.iter().enumerate() {
+            let name = prometheus_label(name);
+            let labels = format!("bucket=\"{name}\",index=\"{index}\"");
+            let health = match state
+                .states
+                .get(index)
+                .copied()
+                .unwrap_or(HealthState::Unknown)
+            {
+                HealthState::Healthy => 1,
+                HealthState::Unknown => 0,
+                HealthState::Unhealthy => -1,
+            };
+            let selected = usize::from(index == state.selected_index);
+            let alarms = state
+                .alarm_totals
+                .get(&state.names[index])
+                .copied()
+                .unwrap_or(0);
+            out.push_str(&format!(
+                "pypiron_bucket_health_state{{{labels}}} {health}\n"
+            ));
+            out.push_str(&format!("pypiron_bucket_selected{{{labels}}} {selected}\n"));
+            out.push_str(&format!(
+                "pypiron_bucket_health_alarms_total{{{labels}}} {alarms}\n"
+            ));
+        }
+        out.push_str("# HELP pypiron_bucket_selection_generation Storage selection generation.\n");
+        out.push_str("# TYPE pypiron_bucket_selection_generation gauge\n");
+        out.push_str(&format!(
+            "pypiron_bucket_selection_generation {}\n",
+            state.selection_generation
+        ));
+        out.push_str(
+            "# HELP pypiron_bucket_topology_write_fenced Writes blocked by a runtime topology mismatch (1=fenced).\n",
+        );
+        out.push_str("# TYPE pypiron_bucket_topology_write_fenced gauge\n");
+        out.push_str(&format!(
+            "pypiron_bucket_topology_write_fenced {}\n",
+            u8::from(state.topology_write_fenced)
+        ));
+    }
+}
+
+fn prometheus_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Registry size: distinct projects with at least one artifact, distinct
@@ -378,6 +599,20 @@ impl MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker_snapshot(
+        selected_index: usize,
+        states: Vec<HealthState>,
+        alarms: Vec<u64>,
+    ) -> WorkerHealthSnapshot {
+        WorkerHealthSnapshot {
+            selected_index,
+            selection_change: None,
+            states,
+            topology_revalidation: Vec::new(),
+            alarms,
+        }
+    }
 
     #[test]
     fn matrix_indices_match_route_names() {
@@ -452,6 +687,101 @@ mod tests {
         );
         assert!(text.contains("pypiron_audit_packages_rebuilt_total 2"));
         assert!(text.contains("pypiron_audit_packages_skipped_total 40"));
+    }
+
+    #[test]
+    fn renders_multi_bucket_health_selection_alarms_generation_and_fence() {
+        let m = Metrics::new();
+        let names = vec![
+            "iron-east".to_string(),
+            "iron-west".to_string(),
+            "iron-eu".to_string(),
+        ];
+        m.update_bucket_health(
+            &worker_snapshot(
+                1,
+                vec![
+                    HealthState::Unhealthy,
+                    HealthState::Healthy,
+                    HealthState::Unknown,
+                ],
+                vec![2, 0, 3],
+            ),
+            &names,
+            7,
+            true,
+        );
+
+        let text = m.render();
+        assert!(text.contains("pypiron_bucket_health_state{bucket=\"iron-east\",index=\"0\"} -1"));
+        assert!(text.contains("pypiron_bucket_health_state{bucket=\"iron-west\",index=\"1\"} 1"));
+        assert!(text.contains("pypiron_bucket_health_state{bucket=\"iron-eu\",index=\"2\"} 0"));
+        assert!(text.contains("pypiron_bucket_selected{bucket=\"iron-east\",index=\"0\"} 0"));
+        assert!(text.contains("pypiron_bucket_selected{bucket=\"iron-west\",index=\"1\"} 1"));
+        assert!(
+            text.contains("pypiron_bucket_health_alarms_total{bucket=\"iron-east\",index=\"0\"} 2")
+        );
+        assert!(
+            text.contains("pypiron_bucket_health_alarms_total{bucket=\"iron-eu\",index=\"2\"} 3")
+        );
+        assert!(text.contains("pypiron_bucket_selection_generation 7"));
+        assert!(text.contains("pypiron_bucket_topology_write_fenced 1"));
+    }
+
+    #[test]
+    fn bucket_alarm_deltas_accumulate_and_gauges_replace() {
+        let m = Metrics::new();
+        let names = vec!["east".to_string(), "west".to_string()];
+        m.update_bucket_health(
+            &worker_snapshot(
+                0,
+                vec![HealthState::Healthy, HealthState::Unknown],
+                vec![2, 1],
+            ),
+            &names,
+            3,
+            true,
+        );
+        m.update_bucket_health(
+            &worker_snapshot(
+                1,
+                vec![HealthState::Healthy, HealthState::Healthy],
+                vec![4, 8],
+            ),
+            &names,
+            4,
+            false,
+        );
+
+        let text = m.render();
+        assert!(text.contains("pypiron_bucket_health_alarms_total{bucket=\"east\",index=\"0\"} 6"));
+        assert!(text.contains("pypiron_bucket_health_alarms_total{bucket=\"west\",index=\"1\"} 9"));
+        assert!(text.contains("pypiron_bucket_selected{bucket=\"west\",index=\"1\"} 1"));
+        assert!(text.contains("pypiron_bucket_selection_generation 4"));
+        assert!(text.contains("pypiron_bucket_topology_write_fenced 0"));
+    }
+
+    #[test]
+    fn single_bucket_health_update_emits_no_multi_bucket_families() {
+        let m = Metrics::new();
+        m.update_bucket_health(
+            &worker_snapshot(0, vec![HealthState::Healthy], vec![9]),
+            &["only".to_string()],
+            12,
+            true,
+        );
+        let text = m.render();
+        assert!(!text.contains("pypiron_bucket_health_state"));
+        assert!(!text.contains("pypiron_bucket_selected"));
+        assert!(!text.contains("pypiron_bucket_selection_generation"));
+        assert!(!text.contains("pypiron_bucket_health_alarms_total"));
+        assert!(!text.contains("pypiron_bucket_topology_write_fenced"));
+        assert!(!text.contains("pypiron_replication_objects_total"));
+    }
+
+    #[test]
+    fn prometheus_bucket_labels_are_escaped() {
+        assert_eq!(prometheus_label("east\\\"\nwest"), "east\\\\\\\"\\nwest");
     }
 
     #[test]

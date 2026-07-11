@@ -7,14 +7,55 @@
 //! at operation entry is P1; the selection health view that drives
 //! [`BucketSet::switch`] is P4.
 
+use std::collections::HashSet;
+use std::future::Future;
 use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::storage::{is_not_found, Storage};
+use crate::storage::Storage;
+
+/// Topology stamps are tiny control records. Never let their GET/CAS operations
+/// inherit the data path's deliberately generous transfer timeout: one hung
+/// bucket must not prevent a node from starting on the reachable topology.
+const TOPOLOGY_IO_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug)]
+struct TopologyIoTimeout;
+
+impl std::fmt::Display for TopologyIoTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "topology control I/O timed out after {} second",
+            TOPOLOGY_IO_TIMEOUT.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for TopologyIoTimeout {}
+
+async fn bounded_topology_io<T>(operation: impl Future<Output = Result<T>>) -> Result<T> {
+    match tokio::time::timeout(TOPOLOGY_IO_TIMEOUT, operation).await {
+        Ok(result) => result,
+        Err(_) => Err(TopologyIoTimeout.into()),
+    }
+}
+
+fn topology_error_is_availability<F>(
+    index: usize,
+    error: &anyhow::Error,
+    is_availability: &F,
+) -> bool
+where
+    F: Fn(usize, &anyhow::Error) -> bool,
+{
+    error.is::<TopologyIoTimeout>() || is_availability(index, error)
+}
 
 /// One configured bucket: its storage handle and its identity (the bucket name,
 /// used for topology stamping and log lines).
@@ -32,10 +73,10 @@ pub struct Pinned {
     pub storage: Arc<dyn Storage>,
     /// The selection generation this context was captured under. Threaded into
     /// the generation-tagged caches (src/cache.rs) so a switch can't serve one
-    /// bucket's bytes for another. Always 0 until P4 wires `switch()`.
+    /// bucket's bytes for another. Zero until the first health-driven switch.
     pub generation: u64,
-    // Read by P4's selection/logging; carried but unread until then.
-    #[allow(dead_code)]
+    /// This handle's position in the configured list — the replicator's source
+    /// index, used to address every *other* bucket (design §4).
     pub index: usize,
 }
 
@@ -49,6 +90,34 @@ pub struct Pinned {
 pub struct BucketSet {
     handles: Vec<BucketHandle>,
     current: RwLock<Arc<Pinned>>,
+    /// The topology generation established by startup verification or a local
+    /// migration. `None` until a multi-bucket topology has been verified.
+    topology_generation: RwLock<Option<u64>>,
+    /// Serializes this process's verify/migrate operations. Cross-process races
+    /// are still settled by storage CAS.
+    topology_lock: tokio::sync::Mutex<()>,
+    /// `new` cannot return `Result` without breaking the existing construction
+    /// surface. Preserve the error and fail startup before the first topology I/O.
+    duplicate_identity: Option<String>,
+}
+
+/// What a topology operation proved or changed. Unreachable indices are
+/// reported explicitly so health/retry machinery can revisit them later.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TopologyReport {
+    pub generation: Option<u64>,
+    pub verified_indices: Vec<usize>,
+    pub stamped_indices: Vec<usize>,
+    pub unreachable_indices: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopologyIndexStatus {
+    Dormant,
+    Verified,
+    Stamped,
+    Restamped,
+    Unreachable,
 }
 
 impl BucketSet {
@@ -68,6 +137,11 @@ impl BucketSet {
             !handles.is_empty(),
             "BucketSet requires at least one configured bucket"
         );
+        let mut seen = HashSet::with_capacity(handles.len());
+        let duplicate_identity = handles
+            .iter()
+            .find(|handle| !seen.insert(handle.name.clone()))
+            .map(|handle| handle.name.clone());
         let pinned = Arc::new(Pinned {
             storage: handles[0].storage.clone(),
             generation: 0,
@@ -76,6 +150,9 @@ impl BucketSet {
         Self {
             handles,
             current: RwLock::new(pinned),
+            topology_generation: RwLock::new(None),
+            topology_lock: tokio::sync::Mutex::new(()),
+            duplicate_identity,
         }
     }
 
@@ -96,15 +173,66 @@ impl BucketSet {
         self.handles.len()
     }
 
+    /// The configured buckets in preference order. The replicator (src/replicate.rs)
+    /// reads these to address destinations by index; `Pinned::index` names the
+    /// source. Kept read-only — selection state lives behind the `RwLock` above.
+    pub fn handles(&self) -> &[BucketHandle] {
+        &self.handles
+    }
+
     /// More than one bucket configured — the multi-bucket mechanisms are live.
     pub fn is_multi(&self) -> bool {
         self.handles.len() > 1
     }
 
+    /// The topology generation this process has verified. Single-bucket mode and
+    /// a multi-bucket set not yet verified return `None` without any I/O.
+    pub fn topology_generation(&self) -> Option<u64> {
+        *self
+            .topology_generation
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set_topology_generation(&self, generation: u64) {
+        *self
+            .topology_generation
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(generation);
+    }
+
+    fn validate_topology_config(&self) -> Result<()> {
+        if let Some(duplicate) = &self.duplicate_identity {
+            bail!(
+                "duplicate bucket identity '{duplicate}' in multi-bucket topology; each configured bucket must be unique"
+            );
+        }
+        for handle in &self.handles {
+            if !handle.storage.supports_leases() {
+                bail!(
+                    "multi-bucket requires a backend with conditional writes; \
+                     bucket '{}' does not support them",
+                    handle.name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn topology_identity(&self) -> (Vec<String>, String) {
+        let names: Vec<String> = self
+            .handles
+            .iter()
+            .map(|handle| handle.name.clone())
+            .collect();
+        let hash = topology_hash(&names);
+        (names, hash)
+    }
+
     /// Select a different bucket, bumping the generation so caches and any
     /// already-pinned contexts from the old selection are recognizably stale.
-    /// Nothing calls this yet; P4 drives it from the per-node health view. Kept
-    /// crate-visible and exercised by the tests so its contract is locked now.
+    /// Driven by the worker's per-node health view. Kept crate-visible so only
+    /// selection orchestration, not request handlers, can change it.
     #[allow(dead_code)]
     pub(crate) fn switch(&self, index: usize) -> Arc<Pinned> {
         let mut cur = self.current.write().unwrap_or_else(PoisonError::into_inner);
@@ -117,69 +245,378 @@ impl BucketSet {
         next
     }
 
-    /// Fail-closed topology check (design §7), run once at serve startup and only
-    /// when more than one bucket is configured. Every *reachable* bucket is
-    /// stamped with the configured topology if it has none, or checked against it
-    /// if it does; a mismatch refuses startup. Unreachable buckets are skipped
-    /// with a warning so a standby node can still boot during the very outage it
-    /// exists for. With a single bucket this does no I/O.
+    /// Conservative startup verification: no error is guessed to mean
+    /// availability. The observed-storage integration should call
+    /// [`verify_topology_with`](Self::verify_topology_with) with its strict error
+    /// classifier. Single-bucket mode performs zero I/O.
+    #[cfg(test)]
     pub async fn verify_topology(&self) -> Result<()> {
+        self.verify_topology_with(|_, _| false).await.map(drop)
+    }
+
+    /// Verify the ordered topology and one consistent generation across every
+    /// reachable bucket. Each tiny control operation has a one-second bound;
+    /// timeout means that bucket is unreachable. Returned storage errors are
+    /// skipped only when `is_availability(index, error)` says so, so auth, KMS,
+    /// quota, configuration, and unknown failures still fail closed.
+    pub async fn verify_topology_with<F>(&self, is_availability: F) -> Result<TopologyReport>
+    where
+        F: Fn(usize, &anyhow::Error) -> bool,
+    {
         if !self.is_multi() {
-            return Ok(());
+            return Ok(TopologyReport::default());
         }
-        // Multi-bucket relies on conditional writes (the topology CAS below,
-        // per-bucket leases, origin claims). A backend without them cannot
-        // participate safely, so refuse rather than degrade silently.
-        for handle in &self.handles {
-            if !handle.storage.supports_leases() {
+        let _guard = self.topology_lock.lock().await;
+        self.validate_topology_config()?;
+        let (names, expected_hash) = self.topology_identity();
+        let mut report = TopologyReport::default();
+        let mut reachable = Vec::new();
+        let mut generation = self.topology_generation();
+
+        // Read every reachable stamp before writing anything. The highest
+        // generation is authoritative: a lower generation may be a bucket that
+        // was unreachable during a partial migration and can still carry the
+        // previous topology. Only stamps tied at the highest generation must
+        // agree with the configured topology; lower stamps are CAS-restamped.
+        for (index, handle) in self.handles.iter().enumerate() {
+            match bounded_topology_io(handle.storage.get_with_etag(TOPOLOGY_STAMP_KEY)).await {
+                Ok(Some((bytes, etag))) => {
+                    let found = parse_stamp(&handle.name, &bytes)?;
+                    generation = Some(
+                        generation
+                            .map_or(found.generation, |current| current.max(found.generation)),
+                    );
+                    reachable.push((index, Some((found, etag))));
+                }
+                Ok(None) => reachable.push((index, None)),
+                Err(error) if topology_error_is_availability(index, &error, &is_availability) => {
+                    warn!(bucket=%handle.name, error=%error, "bucket unavailable during topology verification; deferring");
+                    report.unreachable_indices.push(index);
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("read topology stamp from bucket '{}'", handle.name)
+                    })
+                }
+            }
+        }
+
+        let generation = generation.unwrap_or(0);
+        let body = encode_stamp(&names, &expected_hash, generation)?;
+        // A conflict at the highest generation has no deterministic winner.
+        // Validate every such stamp before repairing even one laggard.
+        for (index, current) in &reachable {
+            if let Some((found, _)) = current {
+                if found.generation == generation {
+                    check_stamp_identity(
+                        &self.handles[*index].name,
+                        found,
+                        &expected_hash,
+                        &names,
+                    )?;
+                    report.verified_indices.push(*index);
+                }
+            }
+        }
+
+        for (index, current) in reachable {
+            let handle = &self.handles[index];
+            let result = match current {
+                Some((found, _)) if found.generation == generation => continue,
+                Some((_, etag)) => {
+                    bounded_topology_io(handle.storage.put_if_match(
+                        TOPOLOGY_STAMP_KEY,
+                        &etag,
+                        body.clone(),
+                    ))
+                    .await
+                }
+                None => {
+                    bounded_topology_io(
+                        handle
+                            .storage
+                            .put_if_none_match(TOPOLOGY_STAMP_KEY, body.clone()),
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok(Some(_)) => report.stamped_indices.push(index),
+                Ok(None) => {
+                    if verify_raced_stamp(
+                        handle,
+                        index,
+                        &expected_hash,
+                        &names,
+                        generation,
+                        &is_availability,
+                    )
+                    .await?
+                    {
+                        report.verified_indices.push(index);
+                    } else {
+                        report.unreachable_indices.push(index);
+                    }
+                }
+                Err(error) if topology_error_is_availability(index, &error, &is_availability) => {
+                    warn!(bucket=%handle.name, error=%error, "bucket became unavailable while stamping topology; deferring");
+                    report.unreachable_indices.push(index);
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("conditionally stamp topology on bucket '{}'", handle.name)
+                    })
+                }
+            }
+        }
+        report.unreachable_indices.sort_unstable();
+        report.unreachable_indices.dedup();
+        report.generation = Some(generation);
+        self.set_topology_generation(generation);
+        Ok(report)
+    }
+
+    /// Conservatively verify one bucket after a reachability transition. Use
+    /// [`verify_topology_index_with`](Self::verify_topology_index_with) once the
+    /// observed-storage error classifier is available.
+    #[cfg(test)]
+    pub async fn verify_topology_index(&self, index: usize) -> Result<TopologyIndexStatus> {
+        self.verify_topology_index_with(index, |_, _| false).await
+    }
+
+    /// Verify or conditionally re-stamp one bucket against the process's current
+    /// topology generation. A lower generation is a bucket that missed a local
+    /// migration and is CAS-restamped; equal/higher conflicting state fails.
+    pub async fn verify_topology_index_with<F>(
+        &self,
+        index: usize,
+        is_availability: F,
+    ) -> Result<TopologyIndexStatus>
+    where
+        F: Fn(usize, &anyhow::Error) -> bool,
+    {
+        let Some(handle) = self.handles.get(index) else {
+            bail!("bucket index {index} is out of range");
+        };
+        if !self.is_multi() {
+            return Ok(TopologyIndexStatus::Dormant);
+        }
+        let _guard = self.topology_lock.lock().await;
+        self.validate_topology_config()?;
+        let generation = self.topology_generation().ok_or_else(|| {
+            anyhow!("topology has not been verified; run startup verification first")
+        })?;
+        let (names, expected_hash) = self.topology_identity();
+        let target = encode_stamp(&names, &expected_hash, generation)?;
+
+        let current = match bounded_topology_io(handle.storage.get_with_etag(TOPOLOGY_STAMP_KEY))
+            .await
+        {
+            Ok(current) => current,
+            Err(error) if topology_error_is_availability(index, &error, &is_availability) => {
+                return Ok(TopologyIndexStatus::Unreachable)
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read topology stamp from bucket '{}'", handle.name))
+            }
+        };
+
+        match current {
+            None => match bounded_topology_io(
+                handle.storage.put_if_none_match(TOPOLOGY_STAMP_KEY, target),
+            )
+            .await
+            {
+                Ok(Some(_)) => Ok(TopologyIndexStatus::Stamped),
+                Ok(None) => {
+                    if verify_raced_stamp(
+                        handle,
+                        index,
+                        &expected_hash,
+                        &names,
+                        generation,
+                        &is_availability,
+                    )
+                    .await?
+                    {
+                        Ok(TopologyIndexStatus::Verified)
+                    } else {
+                        Ok(TopologyIndexStatus::Unreachable)
+                    }
+                }
+                Err(error) if topology_error_is_availability(index, &error, &is_availability) => {
+                    Ok(TopologyIndexStatus::Unreachable)
+                }
+                Err(error) => Err(error)
+                    .with_context(|| format!("stamp topology on bucket '{}'", handle.name)),
+            },
+            Some((bytes, etag)) => {
+                let found = parse_stamp(&handle.name, &bytes)?;
+                if found.generation == generation {
+                    check_stamp_identity(&handle.name, &found, &expected_hash, &names)?;
+                    return Ok(TopologyIndexStatus::Verified);
+                }
+                if found.generation > generation {
+                    bail!(
+                        "bucket '{}' has newer topology generation {}, local generation is {}",
+                        handle.name,
+                        found.generation,
+                        generation
+                    );
+                }
+                match bounded_topology_io(handle.storage.put_if_match(
+                    TOPOLOGY_STAMP_KEY,
+                    &etag,
+                    target,
+                ))
+                .await
+                {
+                    Ok(Some(_)) => Ok(TopologyIndexStatus::Restamped),
+                    Ok(None) => {
+                        if verify_raced_stamp(
+                            handle,
+                            index,
+                            &expected_hash,
+                            &names,
+                            generation,
+                            &is_availability,
+                        )
+                        .await?
+                        {
+                            Ok(TopologyIndexStatus::Verified)
+                        } else {
+                            Ok(TopologyIndexStatus::Unreachable)
+                        }
+                    }
+                    Err(error)
+                        if topology_error_is_availability(index, &error, &is_availability) =>
+                    {
+                        Ok(TopologyIndexStatus::Unreachable)
+                    }
+                    Err(error) => Err(error)
+                        .with_context(|| format!("re-stamp topology on bucket '{}'", handle.name)),
+                }
+            }
+        }
+    }
+
+    /// Deliberately migrate the configured topology. Every reachable stamp is
+    /// replaced with CAS (or create-if-absent), at one greater than the maximum
+    /// generation observed either in storage or previously verified locally.
+    /// Availability alone is tolerated and reported; every other error aborts.
+    #[cfg(test)]
+    pub async fn migrate_topology(&self) -> Result<TopologyReport> {
+        self.migrate_topology_with(|_, _| false).await
+    }
+
+    pub async fn migrate_topology_with<F>(&self, is_availability: F) -> Result<TopologyReport>
+    where
+        F: Fn(usize, &anyhow::Error) -> bool,
+    {
+        if !self.is_multi() {
+            return Ok(TopologyReport::default());
+        }
+        let _guard = self.topology_lock.lock().await;
+        self.validate_topology_config()?;
+        let (names, expected_hash) = self.topology_identity();
+        let mut report = TopologyReport::default();
+        let mut reachable = Vec::new();
+        let local_generation = self.topology_generation();
+        let mut max_observed_generation: Option<u64> = None;
+
+        for (index, handle) in self.handles.iter().enumerate() {
+            match bounded_topology_io(handle.storage.get_with_etag(TOPOLOGY_STAMP_KEY)).await {
+                Ok(Some((bytes, etag))) => {
+                    let found = parse_stamp(&handle.name, &bytes)?;
+                    max_observed_generation = Some(
+                        max_observed_generation
+                            .map_or(found.generation, |value| value.max(found.generation)),
+                    );
+                    reachable.push((index, Some(etag)));
+                }
+                Ok(None) => reachable.push((index, None)),
+                Err(error) if topology_error_is_availability(index, &error, &is_availability) => {
+                    warn!(bucket=%handle.name, error=%error, "bucket unavailable during topology migration; deferring");
+                    report.unreachable_indices.push(index);
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("read topology stamp from bucket '{}'", handle.name)
+                    })
+                }
+            }
+        }
+        if reachable.is_empty() {
+            bail!("cannot migrate topology: no configured bucket is reachable");
+        }
+        if let (Some(local), Some(observed)) = (local_generation, max_observed_generation) {
+            if observed < local {
                 bail!(
-                    "multi-bucket requires a backend with conditional writes; \
-                     bucket '{}' does not support them",
-                    handle.name
+                    "reachable topology generation regressed to {observed}; this process previously verified {local}"
                 );
             }
         }
+        let generation = max_observed_generation
+            .or(local_generation)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("topology generation overflow"))?;
+        let target = encode_stamp(&names, &expected_hash, generation)?;
 
-        let names: Vec<String> = self.handles.iter().map(|h| h.name.clone()).collect();
-        let expected = topology_hash(&names);
-        let stamp = TopologyStamp {
-            buckets: names.clone(),
-            hash: expected.clone(),
-            generation: 0,
-        };
-        let body = serde_json::to_vec(&stamp).context("serialize topology stamp")?;
-
-        for handle in &self.handles {
-            match handle.storage.get_bytes(TOPOLOGY_STAMP_KEY).await {
-                Ok(bytes) => check_stamp(&handle.name, &bytes, &expected, &names)?,
-                Err(e) if is_not_found(&e) => {
-                    // Claim it with create-if-absent so a racing node stamps it
-                    // exactly once; if we lose the race, re-read and verify what
-                    // the winner wrote (it might be a differently-ordered deploy).
-                    let won = handle
-                        .storage
-                        .put_if_none_match(TOPOLOGY_STAMP_KEY, body.clone())
-                        .await
-                        .with_context(|| format!("stamp topology on bucket '{}'", handle.name))?;
-                    if won.is_none() {
-                        let bytes = handle
+        for (index, etag) in reachable {
+            let handle = &self.handles[index];
+            let result = match etag {
+                Some(etag) => {
+                    bounded_topology_io(handle.storage.put_if_match(
+                        TOPOLOGY_STAMP_KEY,
+                        &etag,
+                        target.clone(),
+                    ))
+                    .await
+                }
+                None => {
+                    bounded_topology_io(
+                        handle
                             .storage
-                            .get_bytes(TOPOLOGY_STAMP_KEY)
-                            .await
-                            .with_context(|| {
-                                format!("re-read topology stamp on bucket '{}'", handle.name)
-                            })?;
-                        check_stamp(&handle.name, &bytes, &expected, &names)?;
+                            .put_if_none_match(TOPOLOGY_STAMP_KEY, target.clone()),
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok(Some(_)) => report.stamped_indices.push(index),
+                Ok(None) => {
+                    if verify_raced_stamp(
+                        handle,
+                        index,
+                        &expected_hash,
+                        &names,
+                        generation,
+                        &is_availability,
+                    )
+                    .await?
+                    {
+                        report.verified_indices.push(index);
+                    } else {
+                        report.unreachable_indices.push(index);
                     }
                 }
-                Err(e) => warn!(
-                    bucket = %handle.name,
-                    error = %e,
-                    "bucket unreachable during topology check; skipping (it will be verified when it returns)"
-                ),
+                Err(error) if topology_error_is_availability(index, &error, &is_availability) => {
+                    warn!(bucket=%handle.name, error=%error, "bucket became unavailable during topology migration; deferring");
+                    report.unreachable_indices.push(index);
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("migrate topology on bucket '{}'", handle.name))
+                }
             }
         }
-        Ok(())
+        report.unreachable_indices.sort_unstable();
+        report.unreachable_indices.dedup();
+        report.generation = Some(generation);
+        self.set_topology_generation(generation);
+        Ok(report)
     }
 }
 
@@ -190,11 +627,25 @@ pub const TOPOLOGY_STAMP_KEY: &str = "_topology/stamp.json";
 /// The stored topology stamp. `hash` is derived from `buckets` alone;
 /// `generation` is bumped by an operator re-stamp (`buckets migrate`, a later
 /// phase) and does not participate in the hash.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopologyStamp {
     pub buckets: Vec<String>,
     pub hash: String,
     pub generation: u64,
+}
+
+fn encode_stamp(names: &[String], hash: &str, generation: u64) -> Result<Vec<u8>> {
+    serde_json::to_vec(&TopologyStamp {
+        buckets: names.to_vec(),
+        hash: hash.to_string(),
+        generation,
+    })
+    .context("serialize topology stamp")
+}
+
+fn parse_stamp(bucket: &str, bytes: &[u8]) -> Result<TopologyStamp> {
+    serde_json::from_slice(bytes)
+        .with_context(|| format!("parse topology stamp on bucket '{bucket}'"))
 }
 
 /// Deterministic identity of an ordered bucket list: sha256 over the names joined
@@ -211,13 +662,15 @@ pub fn topology_hash(names: &[String]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Compare a bucket's existing stamp against the configured topology; a hash
-/// mismatch means two deployments disagree about the bucket set or its order —
-/// the one misconfiguration §7 checks hard.
-fn check_stamp(bucket: &str, bytes: &[u8], expected_hash: &str, expected: &[String]) -> Result<()> {
-    let found: TopologyStamp = serde_json::from_slice(bytes)
-        .with_context(|| format!("parse topology stamp on bucket '{bucket}'"))?;
-    if found.hash != expected_hash {
+/// Compare both redundant identity fields. Checking the list as well as its hash
+/// catches corrupt/manual stamps without leaning on collision resistance.
+fn check_stamp_identity(
+    bucket: &str,
+    found: &TopologyStamp,
+    expected_hash: &str,
+    expected: &[String],
+) -> Result<()> {
+    if found.hash != expected_hash || found.buckets != expected {
         bail!(
             "bucket '{bucket}' was stamped for a different bucket topology ({:?}) than this \
              node is configured with ({:?}); refusing to start. If you intend to change the \
@@ -229,16 +682,242 @@ fn check_stamp(bucket: &str, bytes: &[u8], expected_hash: &str, expected: &[Stri
     Ok(())
 }
 
+fn check_exact_stamp(
+    bucket: &str,
+    found: &TopologyStamp,
+    expected_hash: &str,
+    expected: &[String],
+    generation: u64,
+) -> Result<()> {
+    check_stamp_identity(bucket, found, expected_hash, expected)?;
+    if found.generation != generation {
+        bail!(
+            "bucket '{bucket}' has topology generation {}, expected {generation}",
+            found.generation
+        );
+    }
+    Ok(())
+}
+
+/// A failed conditional write means another process won. Accept it only when a
+/// fresh read proves that process wrote the exact intended stamp. Availability
+/// may defer the check; every other result fails closed.
+async fn verify_raced_stamp<F>(
+    handle: &BucketHandle,
+    index: usize,
+    expected_hash: &str,
+    expected: &[String],
+    generation: u64,
+    is_availability: &F,
+) -> Result<bool>
+where
+    F: Fn(usize, &anyhow::Error) -> bool,
+{
+    match bounded_topology_io(handle.storage.get_with_etag(TOPOLOGY_STAMP_KEY)).await {
+        Ok(Some((bytes, _))) => {
+            let found = parse_stamp(&handle.name, &bytes)?;
+            check_exact_stamp(&handle.name, &found, expected_hash, expected, generation)?;
+            Ok(true)
+        }
+        Ok(None) => bail!(
+            "topology stamp on bucket '{}' vanished after a conditional-write race",
+            handle.name
+        ),
+        Err(error) if topology_error_is_availability(index, &error, is_availability) => {
+            warn!(bucket=%handle.name, error=%error, "bucket unavailable while resolving topology CAS race; deferring");
+            Ok(false)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("re-read topology stamp on bucket '{}'", handle.name)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::DiskStorage;
+    use crate::storage::{test_support::InMemStorage, DiskStorage, FileEntry, ObjectMeta};
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    const NORMAL: u8 = 0;
+    const HANG: u8 = 1;
+    const FAIL: u8 = 2;
+
+    struct TopologyTestStorage {
+        inner: Arc<InMemStorage>,
+        read_mode: AtomicU8,
+        write_mode: AtomicU8,
+    }
+
+    impl TopologyTestStorage {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(InMemStorage::default()),
+                read_mode: AtomicU8::new(NORMAL),
+                write_mode: AtomicU8::new(NORMAL),
+            }
+        }
+
+        fn hang_reads(&self) {
+            self.read_mode.store(HANG, Ordering::SeqCst);
+        }
+
+        fn fail_reads(&self) {
+            self.read_mode.store(FAIL, Ordering::SeqCst);
+        }
+
+        fn hang_writes(&self) {
+            self.write_mode.store(HANG, Ordering::SeqCst);
+        }
+
+        async fn read_behavior(&self) -> Result<()> {
+            match self.read_mode.load(Ordering::SeqCst) {
+                HANG => std::future::pending().await,
+                FAIL => bail!("AccessDenied: test credential rejected"),
+                _ => Ok(()),
+            }
+        }
+
+        async fn write_behavior(&self) -> Result<()> {
+            match self.write_mode.load(Ordering::SeqCst) {
+                HANG => std::future::pending().await,
+                FAIL => bail!("AccessDenied: test credential rejected"),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for TopologyTestStorage {
+        async fn head_exists(&self, key: &str) -> Result<bool> {
+            self.inner.head_exists(key).await
+        }
+
+        async fn serve_artifact(
+            &self,
+            key: &str,
+            range: Option<&str>,
+        ) -> Result<axum::response::Response<axum::body::Body>> {
+            self.inner.serve_artifact(key, range).await
+        }
+
+        async fn presign_get(&self, key: &str, expires: Duration) -> Result<Option<String>> {
+            self.inner.presign_get(key, expires).await
+        }
+
+        async fn put_bytes(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+            content_type: Option<&str>,
+        ) -> Result<()> {
+            self.inner.put_bytes(key, bytes, content_type).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+            content_type: Option<&str>,
+        ) -> Result<bool> {
+            self.inner.put_if_absent(key, bytes, content_type).await
+        }
+
+        async fn put_file_if_absent(
+            &self,
+            key: &str,
+            path: &std::path::Path,
+            content_type: Option<&str>,
+        ) -> Result<bool> {
+            self.inner.put_file_if_absent(key, path, content_type).await
+        }
+
+        async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
+            self.inner.get_bytes(key).await
+        }
+
+        async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
+            self.inner.list_dir_entries(dir_prefix).await
+        }
+
+        async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+            self.inner.list_all(prefix).await
+        }
+
+        async fn delete_keys(&self, keys: &[String]) -> Result<()> {
+            self.inner.delete_keys(keys).await
+        }
+
+        fn supports_leases(&self) -> bool {
+            true
+        }
+
+        async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            self.read_behavior().await?;
+            self.inner.get_with_etag(key).await
+        }
+
+        async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
+            self.write_behavior().await?;
+            self.inner.put_if_none_match(key, bytes).await
+        }
+
+        async fn put_if_match(
+            &self,
+            key: &str,
+            etag: &str,
+            bytes: Vec<u8>,
+        ) -> Result<Option<String>> {
+            self.write_behavior().await?;
+            self.inner.put_if_match(key, etag, bytes).await
+        }
+    }
 
     fn handle(name: &str, root: &str) -> BucketHandle {
         BucketHandle {
             storage: Arc::new(DiskStorage::new(root)),
             name: name.to_string(),
         }
+    }
+
+    fn memory_handle(name: &str, storage: &Arc<InMemStorage>) -> BucketHandle {
+        BucketHandle {
+            storage: storage.clone(),
+            name: name.to_string(),
+        }
+    }
+
+    fn topology_test_handle(name: &str, storage: &Arc<TopologyTestStorage>) -> BucketHandle {
+        BucketHandle {
+            storage: storage.clone(),
+            name: name.to_string(),
+        }
+    }
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn stamp_bytes(values: &[&str], generation: u64) -> Vec<u8> {
+        let buckets = names(values);
+        let hash = topology_hash(&buckets);
+        encode_stamp(&buckets, &hash, generation).unwrap()
+    }
+
+    async fn seed_stamp(storage: &InMemStorage, values: &[&str], generation: u64) {
+        assert!(storage
+            .put_if_none_match(TOPOLOGY_STAMP_KEY, stamp_bytes(values, generation))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    async fn stored_stamp(storage: &InMemStorage) -> TopologyStamp {
+        let (bytes, _) = storage
+            .get_with_etag(TOPOLOGY_STAMP_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        parse_stamp("test", &bytes).unwrap()
     }
 
     #[test]
@@ -261,6 +940,284 @@ mod tests {
         assert_eq!(a.generation, b.generation);
         assert_eq!(a.index, b.index);
         assert!(Arc::ptr_eq(&a.storage, &b.storage));
+    }
+
+    #[tokio::test]
+    async fn single_bucket_topology_is_dormant_without_conditional_storage() {
+        let set = BucketSet::single(Arc::new(DiskStorage::new(
+            "/tmp/pypiron-bucketset-topology-single",
+        )));
+        set.verify_topology().await.unwrap();
+        assert_eq!(
+            set.migrate_topology().await.unwrap(),
+            TopologyReport::default()
+        );
+        assert_eq!(
+            set.verify_topology_index(0).await.unwrap(),
+            TopologyIndexStatus::Dormant
+        );
+        assert_eq!(set.topology_generation(), None);
+    }
+
+    #[tokio::test]
+    async fn duplicate_bucket_identities_are_rejected_before_stamping() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let set = BucketSet::new(vec![memory_handle("east", &a), memory_handle("east", &b)]);
+
+        let error = set.verify_topology().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("duplicate bucket identity 'east'"));
+        assert!(a.get_with_etag(TOPOLOGY_STAMP_KEY).await.unwrap().is_none());
+        assert!(b.get_with_etag(TOPOLOGY_STAMP_KEY).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_bounds_a_hung_bucket_as_unreachable() {
+        let reachable = Arc::new(InMemStorage::default());
+        let hung = Arc::new(TopologyTestStorage::new());
+        hung.hang_reads();
+        let set = BucketSet::new(vec![
+            memory_handle("east", &reachable),
+            topology_test_handle("west", &hung),
+        ]);
+
+        // The caller's classifier rejects every returned error. The internal
+        // control-I/O timeout is still availability, so east can start alone.
+        let report = set.verify_topology_with(|_, _| false).await.unwrap();
+        assert_eq!(report.generation, Some(0));
+        assert_eq!(report.stamped_indices, vec![0]);
+        assert_eq!(report.unreachable_indices, vec![1]);
+        assert_eq!(set.topology_generation(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn runtime_verification_and_race_proof_bound_hung_reads() {
+        let east = Arc::new(InMemStorage::default());
+        let west = Arc::new(TopologyTestStorage::new());
+        let set = BucketSet::new(vec![
+            memory_handle("east", &east),
+            topology_test_handle("west", &west),
+        ]);
+        set.verify_topology_with(|_, _| false).await.unwrap();
+
+        west.hang_reads();
+        assert_eq!(
+            set.verify_topology_index_with(1, |_, _| false)
+                .await
+                .unwrap(),
+            TopologyIndexStatus::Unreachable
+        );
+
+        let expected = names(&["east", "west"]);
+        let expected_hash = topology_hash(&expected);
+        assert!(!verify_raced_stamp(
+            &set.handles()[1],
+            1,
+            &expected_hash,
+            &expected,
+            0,
+            &|_, _| false,
+        )
+        .await
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn migration_bounds_a_hung_conditional_write() {
+        let east = Arc::new(InMemStorage::default());
+        let west = Arc::new(TopologyTestStorage::new());
+        let set = BucketSet::new(vec![
+            memory_handle("east", &east),
+            topology_test_handle("west", &west),
+        ]);
+        set.verify_topology_with(|_, _| false).await.unwrap();
+
+        west.hang_writes();
+        let report = set.migrate_topology_with(|_, _| false).await.unwrap();
+        assert_eq!(report.generation, Some(1));
+        assert_eq!(report.stamped_indices, vec![0]);
+        assert_eq!(report.unreachable_indices, vec![1]);
+        assert_eq!(set.topology_generation(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn returned_non_availability_errors_still_fail_closed() {
+        let east = Arc::new(InMemStorage::default());
+        let rejected = Arc::new(TopologyTestStorage::new());
+        rejected.fail_reads();
+        let set = BucketSet::new(vec![
+            memory_handle("east", &east),
+            topology_test_handle("west", &rejected),
+        ]);
+
+        let error = set.verify_topology_with(|_, _| false).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("read topology stamp from bucket 'west'"));
+        assert!(error.root_cause().to_string().contains("AccessDenied"));
+        assert_eq!(set.topology_generation(), None);
+        assert!(east
+            .get_with_etag(TOPOLOGY_STAMP_KEY)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_requires_one_generation_and_stamps_missing_with_it() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        seed_stamp(a.as_ref(), &["east", "west"], 7).await;
+        let set = BucketSet::new(vec![memory_handle("east", &a), memory_handle("west", &b)]);
+
+        let report = set.verify_topology_with(|_, _| false).await.unwrap();
+        assert_eq!(report.generation, Some(7));
+        assert_eq!(report.verified_indices, vec![0]);
+        assert_eq!(report.stamped_indices, vec![1]);
+        assert!(report.unreachable_indices.is_empty());
+        assert_eq!(set.topology_generation(), Some(7));
+        assert_eq!(stored_stamp(b.as_ref()).await.generation, 7);
+    }
+
+    #[tokio::test]
+    async fn startup_restamps_a_reachable_generation_laggard() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        seed_stamp(a.as_ref(), &["east", "west"], 3).await;
+        seed_stamp(b.as_ref(), &["east", "west"], 4).await;
+        let set = BucketSet::new(vec![memory_handle("east", &a), memory_handle("west", &b)]);
+
+        let report = set.verify_topology_with(|_, _| false).await.unwrap();
+        assert_eq!(report.generation, Some(4));
+        assert_eq!(report.verified_indices, vec![1]);
+        assert_eq!(report.stamped_indices, vec![0]);
+        assert_eq!(stored_stamp(a.as_ref()).await.generation, 4);
+        assert_eq!(set.topology_generation(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn startup_repairs_an_old_topology_below_the_highest_generation() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        seed_stamp(a.as_ref(), &["east", "west"], 8).await;
+        // West missed the migration and returns with both the old identity and
+        // the old generation. Generation 8 is the unambiguous authority.
+        seed_stamp(b.as_ref(), &["old-east", "old-west"], 7).await;
+        let set = BucketSet::new(vec![memory_handle("east", &a), memory_handle("west", &b)]);
+
+        let report = set.verify_topology_with(|_, _| false).await.unwrap();
+        assert_eq!(report.generation, Some(8));
+        assert_eq!(report.verified_indices, vec![0]);
+        assert_eq!(report.stamped_indices, vec![1]);
+        let repaired = stored_stamp(b.as_ref()).await;
+        assert_eq!(repaired.buckets, names(&["east", "west"]));
+        assert_eq!(repaired.generation, 8);
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_conflicting_topologies_at_the_highest_generation() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        seed_stamp(a.as_ref(), &["east", "west"], 8).await;
+        seed_stamp(b.as_ref(), &["west", "east"], 8).await;
+        let set = BucketSet::new(vec![memory_handle("east", &a), memory_handle("west", &b)]);
+
+        let error = set.verify_topology().await.unwrap_err();
+        assert!(error.to_string().contains("different bucket topology"));
+        assert_eq!(set.topology_generation(), None);
+        // Fail before any repair: equal-generation conflicts have no winner.
+        assert_eq!(
+            stored_stamp(a.as_ref()).await.buckets,
+            names(&["east", "west"])
+        );
+        assert_eq!(
+            stored_stamp(b.as_ref()).await.buckets,
+            names(&["west", "east"])
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_uses_max_generation_plus_one_and_runtime_heals_a_laggard() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        seed_stamp(a.as_ref(), &["old-east", "old-west"], 7).await;
+        seed_stamp(b.as_ref(), &["east", "west"], 4).await;
+        let set = BucketSet::new(vec![memory_handle("east", &a), memory_handle("west", &b)]);
+
+        let report = set.migrate_topology().await.unwrap();
+        assert_eq!(report.generation, Some(8));
+        assert_eq!(report.stamped_indices, vec![0, 1]);
+        assert_eq!(set.topology_generation(), Some(8));
+        for storage in [&a, &b] {
+            let stamp = stored_stamp(storage.as_ref()).await;
+            assert_eq!(stamp.buckets, names(&["east", "west"]));
+            assert_eq!(stamp.hash, topology_hash(&stamp.buckets));
+            assert_eq!(stamp.generation, 8);
+        }
+
+        // Simulate west having been unreachable during the migration and
+        // returning with its older stamp. Runtime verification must CAS it up.
+        b.put_bytes(
+            TOPOLOGY_STAMP_KEY,
+            stamp_bytes(&["old-east", "old-west"], 7),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            set.verify_topology_index(1).await.unwrap(),
+            TopologyIndexStatus::Restamped
+        );
+        assert_eq!(stored_stamp(b.as_ref()).await.generation, 8);
+    }
+
+    #[tokio::test]
+    async fn cas_race_accepts_only_the_exact_intended_stamp() {
+        let storage = Arc::new(InMemStorage::default());
+        seed_stamp(storage.as_ref(), &["old"], 2).await;
+        let (_, stale_etag) = storage
+            .get_with_etag(TOPOLOGY_STAMP_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        let intended_names = names(&["east", "west"]);
+        let intended_hash = topology_hash(&intended_names);
+        let intended = encode_stamp(&intended_names, &intended_hash, 3).unwrap();
+
+        // Another process wins with the same target. Our stale CAS loses, and
+        // the required re-read accepts exactly that result.
+        assert!(storage
+            .put_if_match(TOPOLOGY_STAMP_KEY, &stale_etag, intended.clone())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(storage
+            .put_if_match(TOPOLOGY_STAMP_KEY, &stale_etag, intended)
+            .await
+            .unwrap()
+            .is_none());
+        let handle = memory_handle("east", &storage);
+        assert!(
+            verify_raced_stamp(&handle, 0, &intended_hash, &intended_names, 3, &|_, _| {
+                false
+            },)
+            .await
+            .unwrap()
+        );
+
+        // A conflicting winner is never accepted as a successful race.
+        storage
+            .put_bytes(TOPOLOGY_STAMP_KEY, stamp_bytes(&["foreign"], 3), None)
+            .await
+            .unwrap();
+        let error = verify_raced_stamp(&handle, 0, &intended_hash, &intended_names, 3, &|_, _| {
+            false
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("different bucket topology"));
     }
 
     #[test]
@@ -305,10 +1262,11 @@ mod tests {
             generation: 0,
         };
         let bytes = serde_json::to_vec(&stamp).unwrap();
-        check_stamp("iron-east", &bytes, &stamp.hash, &names).unwrap();
+        let found = parse_stamp("iron-east", &bytes).unwrap();
+        check_stamp_identity("iron-east", &found, &stamp.hash, &names).unwrap();
 
         let wrong = topology_hash(&["other".to_string()]);
-        let err = check_stamp("iron-east", &bytes, &wrong, &names).unwrap_err();
+        let err = check_stamp_identity("iron-east", &found, &wrong, &names).unwrap_err();
         assert!(err.to_string().contains("different bucket topology"));
     }
 }

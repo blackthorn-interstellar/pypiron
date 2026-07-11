@@ -96,6 +96,8 @@ pub struct ServeConfig {
     pub wait_on_upload: Option<bool>,
     pub wait_on_upload_secs: Option<u64>,
     pub worker_interval_secs: Option<u64>,
+    pub bucket_leave_failures: Option<u32>,
+    pub bucket_return_healthy_secs: Option<u64>,
     pub intent_grace_secs: Option<u64>,
     pub audit_on_boot: Option<bool>,
     pub reconcile_interval_secs: Option<u64>,

@@ -24,13 +24,14 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 - Client-aware artifact delivery on cloud backends (`auto` / `redirect` / `stream`) via presigned URLs; streaming uploads (incremental hash, bounded RSS, multipart for large artifacts).
 - Crash-safe event-marker indexing (intent/commit pairs); fingerprint audit with cost proportional to churn; `pypiron verify-index` / `pypiron rebuild-index`.
 - Multi-node on any cloud backend via a sloppy leader lease (conditional writes, TTL, heartbeat).
+- Multi-bucket S3 failover and private-truth replication — ordered regional buckets survive one bucket failing; health-driven selection moves new work within seconds, while durable fan-out and full-diff reconciliation heal partitions. Conflicting private bytes freeze, and topology changes are explicit through `pypiron buckets migrate`.
 
 **Mirroring & proxying**
 - `pypiron sync` over HTTP (`--to`, the single writer is always the server), carrying PyPI's true `upload-time` so `--exclude-newer` stays historically correct; tag/time/format gates; `--include-package`/`--include-packages-from` work-list selection; `--exclude-package`/`--exclude-packages-from` subtraction; `pypiron.toml` config layering.
 - On-demand PyPI proxying (`--proxy-upstream`) — cache public dependencies on first use, origin-checked; an optional approved-package list (the shared `[mirror]` scope) makes it fail-closed, and package denies subtract in both scoped and open-proxy modes.
 
 **Security & access**
-- Origin exclusivity — every package `private` or `mirror`, claimed at first write; collisions rejected (dependency-confusion defense).
+- Origin exclusivity — every populated package is `private` or `mirror`, claimed at first write; collisions are rejected, and empty names cross origins only through `pypiron origin release` (dependency-confusion defense).
 - `--private-prefix` reserved namespace (normalized-name matching).
 - Three-tier basic auth (admin ⊇ uploader ⊇ reader); read-only by default when no write credential is set.
 - Stateless install tokens (`--token-signing-key`): `POST /tokens` (or `pypiron create-token`) mints a short-lived (5 min) HMAC-signed bearer token presented as `__token__`, capped at the minting credential's role, carrying auto-detected repo/commit/user for attribution. Self-expiring, nothing stored — distinct from the durable *Scoped API tokens* item below.
@@ -105,8 +106,9 @@ better than a bespoke tool. For S3, `aws s3 sync` exists. `pypiron sync` between
 servers covers cross-backend airgap movement. Not worth a command.
 
 **SQLite / Postgres mode.** The no-DB design *is* the answer. Single-node is one
-binary and one directory; serious deployments get S3 + multi-node lease. A
-database would delete the product's reason to exist.
+binary and one directory; serious deployments get S3 + multi-node lease, with
+optional regional multi-bucket failover. A database would delete the product's
+reason to exist.
 
 **Static/simple mode.** The whole server is this. Truth is files; the index is a
 materialized view; backups are rsync.

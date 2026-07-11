@@ -80,7 +80,7 @@ restarting.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `--s3-bucket NAME[@REGION]` | `PYPIRON_S3_BUCKETS` | required | Bucket. Repeatable — see below. |
+| `--s3-bucket NAME[@REGION]` | `PYPIRON_S3_BUCKETS` | required | Bucket. Repeatable — see below. Legacy `PYPIRON_S3_BUCKET` still selects one bucket. |
 | `--aws-region REGION` | `AWS_REGION` | none | AWS region for every bucket without its own `@region`. |
 | `--s3-endpoint-url URL` | `PYPIRON_S3_ENDPOINT_URL` | none | MinIO or another S3-compatible endpoint. |
 | `--s3-force-path-style` | `PYPIRON_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing. |
@@ -100,6 +100,12 @@ pypiron serve --s3-bucket iron-east --s3-bucket iron-west
 PYPIRON_S3_BUCKETS=iron-east,iron-west
 ```
 
+Supplying `--s3-bucket` selects S3; `--storage s3` is optional. The
+`pypiron.toml` `s3-bucket` key accepts one bucket. Use the repeatable CLI flag or
+the plural environment variable for a list.
+Existing single-bucket deployments may keep `PYPIRON_S3_BUCKET`; the plural
+variable or CLI flag wins when both are present.
+
 Put buckets in different regions by pinning each one with an `@region` suffix,
 which overrides the shared `--aws-region`:
 
@@ -107,7 +113,34 @@ which overrides the shared `--aws-region`:
 PYPIRON_S3_BUCKETS=iron-east@us-east-1,iron-west@us-west-2
 ```
 
-One bucket is exactly today's behavior. Multiple buckets are S3-only for now.
+One bucket starts no topology, health, replication, warm-index, or read-fence
+work. The shared filename-reuse guard still performs its documented tombstone
+check on upload. Multiple buckets are S3-only for now. In multi-bucket mode, a
+local package-index read adds initial and final exact origin GETs. A local
+artifact or companion read adds those two origin GETs,
+tombstone/frozen/mirror-quarantine HEADs, and a sidecar GET when the claim or
+quarantine marker requires one. Proxy paths add eligibility, claim, marker, and
+upstream work dynamically.
+All entries share one credential chain and `--s3-endpoint-url`. See
+[Multi-bucket failover](../guides/multi-bucket.md) for recovery behavior, costs,
+and limits.
+
+In multi-bucket mode S3 SDK retries are disabled. One-second topology probes
+switch new requests and cancel background work on an ineligible bucket without
+putting a short total deadline on real artifact transfers. An already in-flight
+transfer retains the normal one-hour route bound.
+Startup topology operations also have a one-second bound. An unreachable bucket
+may add that timeout for each attempted operation, but cannot block startup
+indefinitely when another configured bucket is reachable.
+Admin DELETE still removes private files, but returns `409` for mirror-cache
+entries. Cache eviction is unavailable in multi-bucket v1; do not apply a broad
+`packages/` lifecycle rule because private and mirror records share that prefix.
+Demotion manifests are deleted after promotion, but their content-addressed
+`_staging/repl/` members persist. Do not lifecycle-expire that prefix either: a
+live manifest may reference a retained member. The prefix also holds the
+never-deleted per-package `.promotion-lock` CAS sentinel. A holder heartbeats;
+recovery requires an unchanged lock ETag for the full intent grace and no live
+holder intent family before takeover.
 
 ### GCS
 
@@ -149,10 +182,12 @@ downloads stream through the node.
 | `--wait-on-upload-secs N` | `PYPIRON_WAIT_ON_UPLOAD_SECS` | `10` | Bound for that wait. |
 | `--access-log` | `PYPIRON_ACCESS_LOG` | `false` | Log reads too, not only mutations. |
 | `--access-log-format structured\|clf` | `PYPIRON_ACCESS_LOG_FORMAT` | `structured` | Structured logs or Combined Log Format. |
-| `--worker-interval-secs N` | `PYPIRON_WORKER_INTERVAL_SECS` | `1` | Peer-write poll cadence. |
-| `--intent-grace-secs N` | `PYPIRON_INTENT_GRACE_SECS` | `900` | Grace for an upload in progress. |
-| `--audit-on-boot true\|false` | `PYPIRON_AUDIT_ON_BOOT` | `true` | Audit when a node becomes leader. |
-| `--reconcile-interval-secs N` | `PYPIRON_RECONCILE_INTERVAL_SECS` | `86400` | Audit sweep interval. |
+| `--worker-interval-secs N` | `PYPIRON_WORKER_INTERVAL_SECS` | `1` | Dirty/replication poll and bucket-health probe cadence. |
+| `--bucket-leave-failures N` | `PYPIRON_BUCKET_LEAVE_FAILURES` | `3` | Consecutive timeout (including 408), connection, or 5xx failures before selecting the next bucket. |
+| `--bucket-return-healthy-secs N` | `PYPIRON_BUCKET_RETURN_HEALTHY_SECS` | `300` | Continuous health required before returning to a more-preferred bucket. |
+| `--intent-grace-secs N` | `PYPIRON_INTENT_GRACE_SECS` | `900` | Grace for an upload or cross-bucket package operation. Minimum `3`; maximum `9223372036854775807`. |
+| `--audit-on-boot true\|false` | `PYPIRON_AUDIT_ON_BOOT` | `true` | Run the selected-bucket audit and multi-bucket full diff on boot. |
+| `--reconcile-interval-secs N` | `PYPIRON_RECONCILE_INTERVAL_SECS` | `86400` | Selected-bucket audit and multi-bucket full-diff interval. |
 | `--lease-ttl-secs N` | `PYPIRON_LEASE_TTL_SECS` | `30` | Multi-node leader lease TTL. |
 | `--download-stats true\|false` | `PYPIRON_DOWNLOAD_STATS` | `true` | Count package downloads. |
 | `--counters-resolution DUR` | `PYPIRON_COUNTERS_RESOLUTION` | `1d` | Counter bucket width: `1d`, `1h`, `30m`, `2h`, etc. |
@@ -262,9 +297,42 @@ Tokens live for 5 minutes and cannot outrank the credential that minted them.
 | `pypiron healthcheck` | Probe `/health`; `--url` / `PYPIRON_HEALTHCHECK_URL` overrides the target. |
 | `pypiron verify-index` | Read-only full index check against the selected storage backend. |
 | `pypiron rebuild-index` | Rebuild every index from stored files. |
+| `pypiron buckets migrate` | Increment the multi-bucket topology generation and re-stamp every reachable configured bucket. |
+| `pypiron origin release PACKAGE` | Release an empty package name for deliberate private/public repurposing. Every configured bucket must be reachable and empty for that package. |
 
 `verify-index` and `rebuild-index` use the same storage flags as `serve`, and
-also read `[serve]` from `pypiron.toml`.
+also read `[serve]` from `pypiron.toml`. `buckets migrate` and `origin release`
+do too. Storage flags and their environment variables may also follow those
+nested commands.
+
+`buckets migrate` requires a multi-bucket target. To shrink to one bucket, stop
+the fleet and restart it with that bucket; topology stamps are dormant in
+single-bucket mode.
+
+Stop writes before `origin release`. It refuses a package with any package truth
+except `.origin`, or with pending write/replication work, and conditionally
+releases the claim on each configured bucket.
+
+## Multi-bucket metrics
+
+These series appear only when two or more buckets are configured:
+
+| Metric | Meaning |
+| --- | --- |
+| `pypiron_replication_objects_total` | Artifact records copied into another bucket. |
+| `pypiron_replication_bytes_total` | Artifact bytes copied into other buckets; companion metadata is not included. |
+| `pypiron_replication_freezes_total` | Conflicting same-name, different-byte uploads frozen for human resolution. Any increase needs attention. |
+| `pypiron_replication_marker_backlog{dest}` | Undelivered markers found on reachable source buckets. During a source outage this is a lower bound; it still exposes backlog on healthy sources instead of retaining a stale zero. |
+| `pypiron_reconcile_diff_duration_seconds` | Wall time of the last pairwise full comparison. |
+| `pypiron_bucket_health_state{bucket,index}` | Per-node view: healthy `1`, unknown `0`, unhealthy `-1`. |
+| `pypiron_bucket_selected{bucket,index}` | Per-node selected bucket: selected `1`, all others `0`. |
+| `pypiron_bucket_health_alarms_total{bucket,index}` | Storage errors that do not prove an outage, including credentials, permissions, CAS, KMS, quota, and configuration. |
+| `pypiron_bucket_selection_generation` | Number that changes when this node selects another bucket. |
+| `pypiron_bucket_topology_write_fenced` | `1` when a runtime topology mismatch has stopped mutations; reads remain available. |
+
+Alert on any freeze, a non-zero topology fence, persistent health alarms, or a
+backlog that keeps growing after its destination recovers. The backlog is a
+count of mutation markers, not bytes.
 
 ## Endpoints
 

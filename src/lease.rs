@@ -18,18 +18,24 @@ pub const LEASE_KEY: &str = "_leader/lease.json";
 struct Lease {
     holder: String,
     term: u64,
+    /// Bucket selection generation under which this authority was acquired.
+    /// Legacy leases deserialize as generation zero.
+    #[serde(default)]
+    generation: u64,
     #[serde(rename = "expires-at")]
     expires_at: i64,
 }
 
+#[derive(Clone)]
 pub struct LeaseManager {
     storage: Arc<dyn Storage>,
     holder: String,
     ttl_secs: i64,
+    generation: u64,
 }
 
 impl LeaseManager {
-    pub fn new(storage: Arc<dyn Storage>, ttl: Duration) -> Self {
+    pub fn new(storage: Arc<dyn Storage>, ttl: Duration, generation: u64) -> Self {
         let holder = format!(
             "{}-{}",
             std::process::id(),
@@ -39,6 +45,7 @@ impl LeaseManager {
             storage,
             holder,
             ttl_secs: ttl.as_secs().max(1) as i64,
+            generation,
         }
     }
 
@@ -76,6 +83,7 @@ impl LeaseManager {
                 // Corrupt lease: treat as expired and steal over its ETag.
                 holder: String::new(),
                 term: 0,
+                generation: 0,
                 expires_at: 0,
             },
         };
@@ -134,6 +142,7 @@ impl LeaseManager {
         serde_json::to_vec(&Lease {
             holder: self.holder.clone(),
             term,
+            generation: self.generation,
             expires_at: now + self.ttl_secs,
         })
         .unwrap_or_default()
@@ -149,7 +158,7 @@ mod tests {
     #[tokio::test]
     async fn release_deletes_own_lease_only() {
         let storage = Arc::new(InMemStorage::default());
-        let lm = LeaseManager::new(storage.clone(), Duration::from_secs(30));
+        let lm = LeaseManager::new(storage.clone(), Duration::from_secs(30), 0);
         assert!(lm.is_leader().await, "first node acquires the lease");
         lm.release().await;
         assert!(
@@ -158,9 +167,9 @@ mod tests {
         );
 
         // A foreign lease survives someone else's release.
-        let other = LeaseManager::new(storage.clone(), Duration::from_secs(30));
+        let other = LeaseManager::new(storage.clone(), Duration::from_secs(30), 0);
         assert!(other.is_leader().await);
-        let late = LeaseManager::new(storage.clone(), Duration::from_secs(30));
+        let late = LeaseManager::new(storage.clone(), Duration::from_secs(30), 0);
         assert!(!late.is_leader().await, "lease is held by `other`");
         late.release().await;
         assert!(
@@ -172,14 +181,24 @@ mod tests {
     #[tokio::test]
     async fn released_lease_is_acquired_immediately_not_after_ttl() {
         let storage = Arc::new(InMemStorage::default());
-        let a = LeaseManager::new(storage.clone(), Duration::from_secs(3600));
+        let a = LeaseManager::new(storage.clone(), Duration::from_secs(3600), 0);
         assert!(a.is_leader().await);
         a.release().await;
         // TTL is an hour; without release the successor would wait it out.
-        let b = LeaseManager::new(storage.clone(), Duration::from_secs(3600));
+        let b = LeaseManager::new(storage.clone(), Duration::from_secs(3600), 0);
         assert!(
             b.is_leader().await,
             "successor must acquire instantly after a graceful release"
         );
+    }
+
+    #[tokio::test]
+    async fn lease_records_the_selection_generation() {
+        let storage = Arc::new(InMemStorage::default());
+        let manager = LeaseManager::new(storage.clone(), Duration::from_secs(30), 7);
+        assert!(manager.is_leader().await);
+        let bytes = storage.get_bytes(LEASE_KEY).await.unwrap();
+        let lease: Lease = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(lease.generation, 7);
     }
 }

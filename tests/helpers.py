@@ -29,6 +29,21 @@ CLIENT_PINS = {
 }
 
 
+def origin_owner(raw: str | bytes) -> str:
+    """Read current nonce-bearing claims and legacy plain-text fixtures."""
+    text = raw.decode() if isinstance(raw, bytes) else raw
+    text = text.strip()
+    if text.startswith("{"):
+        body = json.loads(text)
+        owner = body.get("origin")
+        nonce = body.get("nonce")
+        assert owner in {"private", "mirror", "unclaimed"}, body
+        assert isinstance(nonce, str) and re.fullmatch(r"[0-9a-f]{32}", nonce), body
+        return owner
+    assert text in {"private", "mirror", "unclaimed"}, text
+    return text
+
+
 def uvx_client(client: str) -> list[str]:
     pin = CLIENT_PINS[client]
     if pin in {"venv-seeded", "system", "dev-dependency"}:

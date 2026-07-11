@@ -6,7 +6,7 @@ import shutil
 
 import pytest
 
-from .helpers import download_pypi_wheel, upload_legacy, wait_for_file_in_index
+from .helpers import download_pypi_wheel, origin_owner, upload_legacy, wait_for_file_in_index
 
 PACKAGE = "six"
 VERSION = "1.17.0"
@@ -25,7 +25,7 @@ def test_first_upload_claims_private_origin(disk_server, tmp_path):
     wait_for_file_in_index(disk_server["simple"], PACKAGE, wheel_path.name)
 
     origin = disk_server["data_dir"] / "packages" / PACKAGE / ".origin"
-    assert origin.read_text() == "private"
+    assert origin_owner(origin.read_text()) == "private"
 
 
 def test_upload_to_mirror_owned_name_rejected(disk_server, tmp_path):
@@ -62,7 +62,10 @@ def test_private_prefix_policy(disk_server_prefixed, tmp_path):
     shutil.copyfile(six_wheel, private)
     upload_legacy(server["legacy"], private, **creds)
     wait_for_file_in_index(server["simple"], "acme-foo", private.name)
-    assert (server["data_dir"] / "packages" / "acme-foo" / ".origin").read_text() == "private"
+    assert (
+        origin_owner((server["data_dir"] / "packages" / "acme-foo" / ".origin").read_text())
+        == "private"
+    )
 
 
 def test_origin_claim_survives_deletion(disk_server, tmp_path):
@@ -105,7 +108,7 @@ def test_origin_claim_survives_deletion(disk_server, tmp_path):
     assert code == 204
 
     # The claim is still mirror — a private re-upload remains forbidden.
-    assert (pkg_dir / ".origin").read_text() == "mirror"
+    assert origin_owner((pkg_dir / ".origin").read_text()) == "mirror"
     upload_legacy(disk_server["legacy"], wheel_path, expect_status=403, **creds)
 
 

@@ -18,6 +18,7 @@ from .helpers import (
     kill_process_tree,
     make_sdist,
     make_wheel,
+    origin_owner,
     sha256_file,
     upload_legacy,
     wait_for_file_in_index,
@@ -71,7 +72,7 @@ def test_proxy_serves_and_caches_upstream_package(proxy_pair, tmp_path):
     pkg_dir = proxy["data_dir"] / "packages" / "proxydemo"
     assert (pkg_dir / wheel.name).exists()
     assert (pkg_dir / f"{wheel.name}.meta.json").exists()
-    assert (pkg_dir / ".origin").read_text().strip() == "mirror"
+    assert origin_owner((pkg_dir / ".origin").read_text()) == "mirror"
 
     # Upstream dies; the cached artifact still serves (lockfiles keep working).
     kill_process_tree(upstream["proc"])
@@ -120,8 +121,9 @@ def test_private_package_never_falls_through(proxy_pair, tmp_path):
     code, _, _ = http_get(f"{proxy['base_url']}/files/mixedpkg/{upstream_wheel.name}")
     assert code == 404
     assert (
-        proxy["data_dir"] / "packages" / "mixedpkg" / ".origin"
-    ).read_text().strip() == "private"
+        origin_owner((proxy["data_dir"] / "packages" / "mixedpkg" / ".origin").read_text())
+        == "private"
+    )
 
 
 def test_private_prefix_blocks_proxy(proxy_pair_prefixed, tmp_path):

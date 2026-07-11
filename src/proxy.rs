@@ -27,7 +27,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use futures::StreamExt;
 use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::Client;
@@ -37,7 +37,8 @@ use crate::names::{infer_version_from_filename, matches_prefix};
 use crate::origin;
 use crate::render::{self, FileMetadata};
 use crate::sidecar::{
-    metadata_key, provenance_key, sidecar_key, Sidecar, METADATA_SUFFIX, PROVENANCE_SUFFIX,
+    frozen_key, metadata_key, provenance_key, sidecar_key, Sidecar, FROZEN_SUFFIX, METADATA_SUFFIX,
+    MIRROR_QUARANTINED_SUFFIX, PROVENANCE_SUFFIX, TOMBSTONE_SUFFIX,
 };
 use crate::simple::{self, SimpleFile};
 use crate::storage::Storage;
@@ -79,6 +80,7 @@ struct Found {
     files: Vec<SimpleFile>,
     html: RenderedIndex,
     json: RenderedIndex,
+    status: crate::status::ProjectStatusDoc,
 }
 
 enum Listing {
@@ -379,15 +381,58 @@ impl Proxy {
     pub async fn package_index(
         &self,
         state: &AppState,
+        storage: &dyn Storage,
         pkg: &str,
         json: bool,
-    ) -> Option<RenderedIndex> {
-        let found = self.listing(state, pkg).await?;
-        Some(if json {
-            found.json.clone()
+    ) -> Result<Option<RenderedIndex>> {
+        let Some(found) = self.listing(state, pkg).await else {
+            return Ok(None);
+        };
+        if !state.buckets.is_multi() {
+            return Ok(Some(if json {
+                found.json.clone()
+            } else {
+                found.html.clone()
+            }));
+        }
+        // Fetch first, then observe local fences. A freeze/delete that landed
+        // during the slow upstream request is therefore suppressed in this
+        // response instead of advertising a URL the file route rejects.
+        let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
+        let names: std::collections::HashSet<String> = storage
+            .list_dir_entries(&prefix)
+            .await?
+            .into_iter()
+            .filter_map(|entry| entry.key.strip_prefix(&prefix).map(str::to_string))
+            .collect();
+        let visible: Vec<FileMetadata> = found
+            .files
+            .iter()
+            .filter(|file| {
+                ![TOMBSTONE_SUFFIX, FROZEN_SUFFIX, MIRROR_QUARANTINED_SUFFIX]
+                    .iter()
+                    .any(|suffix| names.contains(&format!("{}{suffix}", file.filename)))
+            })
+            .map(SimpleFile::as_file_metadata)
+            .collect();
+        let render_files: &[FileMetadata] = if found.status.status.blocks_downloads() {
+            &[]
         } else {
-            found.html.clone()
-        })
+            &visible
+        };
+        Ok(Some(if json {
+            rendered(render::pep691_package_json(
+                pkg,
+                render_files,
+                &found.status,
+            ))
+        } else {
+            rendered(render::pep503_package_html(
+                pkg,
+                render_files,
+                &found.status,
+            ))
+        }))
     }
 
     /// Download-verify-commit one artifact on a local miss. `Ok(())` always
@@ -401,6 +446,9 @@ impl Proxy {
         pkg: &str,
         filename: &str,
     ) -> Result<()> {
+        if state.mutations_fenced() {
+            bail!("bucket topology mismatch; proxy cache writes are fenced");
+        }
         let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
         if storage.head_exists(&key).await? {
             return Ok(());
@@ -425,30 +473,33 @@ impl Proxy {
         // identity (etag) so the pre-commit re-check below can prove the name is
         // still ours after a slow download. Losing to a private claim means this
         // name is no longer ours to serve.
-        let (claim_etag, claimed_now) = match origin::read_origin_versioned(storage, pkg).await? {
-            Some((content, etag)) if content == origin::MIRROR => (etag, false),
-            Some((content, _)) if content == origin::PRIVATE => return Ok(()),
-            // Absent object or the `unclaimed` sentinel — claim it for mirror.
-            _ => {
-                let claim = origin::claim_origin(storage, pkg, origin::MIRROR).await?;
+        let claim_observation = match origin::read_origin_observation(storage, pkg).await? {
+            Some(observed) if observed.state == origin::OriginState::Mirror => observed,
+            Some(observed) if observed.state == origin::OriginState::Private => return Ok(()),
+            // A caller that already saw the sentinel passes it through so the
+            // claim goes straight to CAS instead of a guaranteed-losing create.
+            observed => {
+                let request = origin::ClaimRequest::new(
+                    origin::MIRROR,
+                    observed
+                        .as_ref()
+                        .filter(|value| value.state == origin::OriginState::Unclaimed),
+                );
+                let claim = origin::claim_origin(storage, pkg, request).await?;
                 if claim.owner != origin::MIRROR {
                     return Ok(());
                 }
-                // Always need the claim's etag for the pre-commit re-check; if we
-                // established it we already hold it, otherwise re-read the peer's
-                // fresh MIRROR claim (which is not ours to release).
-                let etag = match claim.etag {
-                    Some(etag) => etag,
-                    None => {
-                        origin::read_origin_versioned(storage, pkg)
-                            .await?
-                            .ok_or_else(|| {
-                                anyhow!("mirror claim for '{pkg}' vanished after claim")
-                            })?
-                            .1
-                    }
-                };
-                (etag, claim.created)
+                match claim.etag {
+                    Some(etag) => origin::OriginObservation {
+                        state: origin::OriginState::Mirror,
+                        etag,
+                        pending_manifest: None,
+                    },
+                    None => origin::read_origin_observation(storage, pkg)
+                        .await?
+                        .filter(|value| value.state == origin::OriginState::Mirror)
+                        .ok_or_else(|| anyhow!("mirror claim for '{pkg}' vanished after claim"))?,
+                }
             }
         };
 
@@ -460,70 +511,21 @@ impl Proxy {
                     .metrics
                     .proxy_artifact_errors
                     .fetch_add(1, Ordering::Relaxed);
-                // A claim with nothing behind it would block the name forever.
-                if claimed_now {
-                    origin::release_empty_claim(storage, pkg, &claim_etag).await;
-                }
+                // Empty-claim reclamation is deliberately audit-owned. A
+                // failure-path release cannot distinguish a slow live writer
+                // from an orphan and used to reopen names mid-publish.
                 return Err(e);
             }
         };
 
-        // Pre-commit re-check (dev/MULTIBUCKET.md §6.2): a slow download can
-        // straddle a mirror→private demotion (or a re-claim). Re-read the claim;
-        // if it is no longer the exact MIRROR claim this fill started against,
-        // abandon the fill and fall back to the private-name behavior — never
-        // commit mirror bytes into a name that went private mid-flight. One
-        // extra GET per first-time cache fill.
-        match origin::read_origin_versioned(storage, pkg).await? {
-            Some((content, etag)) if content == origin::MIRROR && etag == claim_etag => {}
-            _ => {
-                info!(%pkg, %filename, "proxy: origin claim changed mid-download; abandoning fill");
-                return Ok(());
-            }
-        }
-        // A tombstoned private filename must never be resurrected by a proxy
-        // fill (§6.4). Namespace rules make this near-impossible — private names
-        // don't proxy — but fail closed.
-        if crate::tombstone::is_tombstoned(storage, &key).await? {
-            return Ok(());
-        }
-
         // Intent before truth, commit after (see worker.rs): a crash between
         // the artifact landing and the commit marker heals via stale intent.
-        let intent_nonce = crate::worker::mark_intent(storage, pkg).await.ok();
+        let intent_nonce = if state.buckets.is_multi() {
+            Some(crate::worker::mark_intent(storage, pkg).await?)
+        } else {
+            crate::worker::mark_intent(storage, pkg).await.ok()
+        };
 
-        // Ordering invariant: artifact, then companion, then sidecar, then
-        // commit marker — a listed-but-missing file is the only harmful state.
-        storage
-            .put_file_if_absent(&key, spool.path.path(), Some("application/octet-stream"))
-            .await?;
-        if filename.ends_with(".whl") && file.has_core_metadata() {
-            // Best-effort, like sync: a missing companion only costs the
-            // resolver a wheel download.
-            if let Some(md) = self.fetch_metadata_url(pkg, &file.url).await {
-                let _ = storage
-                    .put_bytes(
-                        &metadata_key(&key),
-                        md.to_vec(),
-                        Some("text/plain; charset=utf-8"),
-                    )
-                    .await;
-            }
-        }
-        if let Some(prov_url) = &file.provenance {
-            // PEP 740 provenance, relayed verbatim alongside the artifact.
-            // Best-effort like metadata: a missing companion only drops the
-            // supply-chain signal, never the artifact.
-            if let Some(prov) = self.fetch_provenance_url(pkg, prov_url).await {
-                let _ = storage
-                    .put_bytes(
-                        &provenance_key(&key),
-                        prov.to_vec(),
-                        Some("application/json"),
-                    )
-                    .await;
-            }
-        }
         let sidecar = Sidecar {
             // Upstream's digest, verified against the downloaded bytes.
             sha256: spool.sha256.clone(),
@@ -537,13 +539,103 @@ impl Proxy {
             origin: Some(origin::MIRROR.to_string()),
             yank_epoch: 0,
         };
-        storage
-            .put_bytes(
-                &sidecar_key(&key),
-                serde_json::to_vec(&sidecar)?,
+        // Type the record before its artifact can exist. An orphan sidecar is
+        // inert; an orphan artifact would be backfilled from a later private
+        // package claim and launder public bytes into private truth.
+        let sidecar_key = sidecar_key(&key);
+        let sidecar_bytes = serde_json::to_vec(&sidecar)?;
+        if !storage
+            .put_if_absent(
+                &sidecar_key,
+                sidecar_bytes.clone(),
                 Some("application/json"),
             )
+            .await?
+        {
+            let existing = storage.get_bytes(&sidecar_key).await?;
+            if existing != sidecar_bytes {
+                crate::commit_marker(state, storage, pkg, intent_nonce).await?;
+                return Ok(());
+            }
+        }
+
+        // Pre-commit re-check (dev/MULTIBUCKET.md §6.2): a slow download can
+        // straddle a mirror→private demotion (or a re-claim). Re-read the claim;
+        // if it is no longer the exact MIRROR claim this fill started against,
+        // abandon the fill and fall back to the private-name behavior — never
+        // commit mirror bytes into a name that went private mid-flight. One
+        // extra GET per first-time cache fill.
+        // This is intentionally the final storage operation before the
+        // conditional artifact PUT. The redundant tombstone HEAD that used to
+        // sit here widened the fencing window and bought nothing: a mirror
+        // claim and a private tombstone cannot legally coexist.
+        match origin::read_origin_observation(storage, pkg).await? {
+            Some(observed) if observed == claim_observation => {}
+            _ => {
+                info!(%pkg, %filename, "proxy: origin claim changed mid-download; abandoning fill");
+                crate::commit_marker(state, storage, pkg, intent_nonce).await?;
+                return Ok(());
+            }
+        }
+
+        // Sidecar is durable and the exact package claim is still ours. Publish
+        // the artifact last; this read-to-PUT edge is the origin fence.
+        let created = storage
+            .put_file_if_absent(&key, spool.path.path(), Some("application/octet-stream"))
             .await?;
+        if !created {
+            // Another mirror writer won the immutable filename. Its own
+            // sidecar protocol completes the record; never overwrite it with
+            // metadata paired to our stale observation.
+            crate::commit_marker(state, storage, pkg, intent_nonce).await?;
+            return Ok(());
+        }
+        // Multi-bucket demotion can still win after the pre-PUT read. The
+        // record is already typed mirror, so never delete through a cross-object
+        // race; private precedence will quarantine and suppress it. A lone
+        // bucket cannot demote concurrently and skips this extra origin GET.
+        if !crate::post_publish_mirror_claim_is_current(state, storage, pkg, &claim_observation)
+            .await
+            .context("re-check mirror claim after artifact publish")?
+        {
+            crate::commit_marker(state, storage, pkg, intent_nonce).await?;
+            info!(%pkg, %filename, "proxy: origin changed after artifact publish; leaving typed mirror loser");
+            return Ok(());
+        }
+        if state.buckets.is_multi() && storage.head_exists(&frozen_key(&key)).await? {
+            // The marker suppresses the filename immediately. Leave the typed
+            // body for freeze recovery; deleting here would create another
+            // cross-object race with staged private promotion.
+            crate::commit_marker(state, storage, pkg, intent_nonce).await?;
+            return Ok(());
+        }
+        if filename.ends_with(".whl") && file.has_core_metadata() {
+            // Best-effort, like sync: a missing companion only costs the
+            // resolver a wheel download.
+            if let Some(md) = self.fetch_metadata_url(pkg, &file.url).await {
+                let _ = storage
+                    .put_if_absent(
+                        &metadata_key(&key),
+                        md.to_vec(),
+                        Some("text/plain; charset=utf-8"),
+                    )
+                    .await;
+            }
+        }
+        if let Some(prov_url) = &file.provenance {
+            // PEP 740 provenance, relayed verbatim alongside the artifact.
+            // Best-effort like metadata: a missing companion only drops the
+            // supply-chain signal, never the artifact.
+            if let Some(prov) = self.fetch_provenance_url(pkg, prov_url).await {
+                let _ = storage
+                    .put_if_absent(
+                        &provenance_key(&key),
+                        prov.to_vec(),
+                        Some("application/json"),
+                    )
+                    .await;
+            }
+        }
         crate::commit_marker(state, storage, pkg, intent_nonce).await?;
         state
             .metrics
@@ -728,6 +820,7 @@ impl Proxy {
             html: rendered(render::pep503_package_html(pkg, render_metas, &status)),
             json: rendered(render::pep691_package_json(pkg, render_metas, &status)),
             files,
+            status,
         })))
     }
 

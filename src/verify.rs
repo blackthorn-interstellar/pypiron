@@ -23,7 +23,8 @@ use crate::render::{
     pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
 };
 use crate::sidecar::{
-    is_artifact, Sidecar, METADATA_SUFFIX, PROVENANCE_SUFFIX, SIDECAR_SUFFIX, TOMBSTONE_SUFFIX,
+    is_artifact, Sidecar, FROZEN_SUFFIX, METADATA_SUFFIX, PROVENANCE_SUFFIX, SIDECAR_SUFFIX,
+    TOMBSTONE_SUFFIX,
 };
 use crate::storage::{is_not_found, ObjectMeta, Storage, StorageArgs, SHARD_CHARS};
 use crate::{DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
@@ -163,12 +164,19 @@ async fn check_package(
         .iter()
         .filter_map(|f| f.strip_suffix(TOMBSTONE_SUFFIX))
         .collect();
+    let frozen: std::collections::HashSet<&str> = names
+        .iter()
+        .filter_map(|f| f.strip_suffix(FROZEN_SUFFIX))
+        .collect();
     let artifacts: Vec<(&ObjectMeta, &str)> = objects
         .iter()
         .filter_map(|o| {
             let filename = o.key.strip_prefix(&prefix)?;
-            (!filename.contains('/') && is_artifact(filename) && !tombstoned.contains(filename))
-                .then_some((o, filename))
+            (!filename.contains('/')
+                && is_artifact(filename)
+                && !tombstoned.contains(filename)
+                && !frozen.contains(filename))
+            .then_some((o, filename))
         })
         .collect();
 

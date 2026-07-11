@@ -15,6 +15,7 @@ from packaging.version import Version
 
 from .helpers import (
     download_pypi_wheel,
+    origin_owner,
     pypi_project_json,
     run_checked,
     run_returncode,
@@ -89,7 +90,7 @@ def test_http_mirror_preserves_historical_timestamps(
     # The server wrote truth: mirror-owned, PyPI's timestamp in the sidecar,
     # and PEP 658 metadata extracted server-side from the wheel.
     pkg_dir = server["data_dir"] / "packages" / PACKAGE
-    assert (pkg_dir / ".origin").read_text() == "mirror"
+    assert origin_owner((pkg_dir / ".origin").read_text()) == "mirror"
     sidecar = json.loads((pkg_dir / f"{pypi_entry['filename']}.meta.json").read_text())
     assert sidecar["upload-time"] == pypi_entry["upload_time_iso_8601"]
     assert sidecar["sha256"] == pypi_entry["digests"]["sha256"]
@@ -172,7 +173,9 @@ def test_http_mirror_refuses_private_owned_names(disk_server, pypiron_bin, tmp_p
     # The failure is the private-name guard, not some unrelated error.
     assert "private" in (out + err), f"expected a private-name diagnostic:\n{out}\n{err}"
     pkg_dir = server["data_dir"] / "packages" / PACKAGE
-    assert (pkg_dir / ".origin").read_text() == "private", "the claim must be untouched"
+    assert origin_owner((pkg_dir / ".origin").read_text()) == "private", (
+        "the claim must be untouched"
+    )
     # No mirrored wheel may leak in alongside the private claim.
     wheels = sorted(p.name for p in pkg_dir.iterdir() if p.name.endswith(".whl"))
     assert wheels == [wheel_path.name], f"no mirrored files may appear, found {wheels}"
@@ -251,4 +254,7 @@ def test_mirror_requires_admin_credential(disk_server, tmp_path):
     index = wait_for_file_in_index(server["simple"], PACKAGE, wheel.name)
     (entry,) = [f for f in index["files"] if f["filename"] == wheel.name]
     assert entry["upload-time"] == "2014-01-01T00:00:00Z"
-    assert (server["data_dir"] / "packages" / PACKAGE / ".origin").read_text() == "mirror"
+    assert (
+        origin_owner((server["data_dir"] / "packages" / PACKAGE / ".origin").read_text())
+        == "mirror"
+    )

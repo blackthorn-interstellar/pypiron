@@ -49,7 +49,7 @@ AUTH = {"username": "admin", "password": "secret"}
 EVENT_ONLY_ENV = {
     "PYPIRON_AUDIT_ON_BOOT": "false",
     "PYPIRON_RECONCILE_INTERVAL_SECS": "100000",
-    "PYPIRON_INTENT_GRACE_SECS": "1",
+    "PYPIRON_INTENT_GRACE_SECS": "3",
     "PYPIRON_LEASE_TTL_SECS": "2",
 }
 

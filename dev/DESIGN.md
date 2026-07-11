@@ -57,7 +57,9 @@ job payload is redundant — the truth is the storage listing. Instead:
 1. A writer drops a unique, create-only **intent** marker
    (`_dirty/<pkg>!<nonce>.intent`) *before* touching truth, and a paired
    **commit** marker (`...<nonce>.commit`) *after*. Every event is its own
-   key — nothing is ever overwritten.
+   key — nothing is ever overwritten. A cross-bucket operation holds one
+   unique root on each bucket and rotates through `root~<seq>` family members
+   while it runs, creating the next pair before committing the old pair.
 2. The worker lists `_dirty/`, rebuilds each marked package from a fresh
    listing, updates the global index, and only **then** deletes exactly the
    marker keys it observed. Rebuild-before-delete is race-free because keys
@@ -67,7 +69,9 @@ job payload is redundant — the truth is the storage listing. Instead:
 3. A commit (or an intent whose pair arrived) rebuilds immediately. An
    unpaired intent younger than the grace period (`--intent-grace-secs`)
    means a writer is in flight — skip. Older means the writer crashed —
-   rebuild anyway. Either way the package heals without any sweep.
+   rebuild anyway. Age comes from the object's storage timestamp; a missing or
+   malformed timestamp stays live rather than licensing an unsafe takeover.
+   Either way the package heals without any sweep.
 4. Duplicate markers for the same package collapse into one rebuild for free.
 
 No claim races are possible because there is nothing to claim. This deletes a whole
@@ -168,8 +172,8 @@ it — publicly and wins. Defense in four layers, ordered by importance:
    The registry decides what exists: mirror allowlist + private uploads. uv shops
    can add client-side pinning via `tool.uv.index` with `explicit = true`.
 2. **Origin exclusivity (the mechanism).** Every package directory carries an
-   origin marker in the truth tree — `packages/<pkg>/.origin` = `private` or
-   `mirror` — claimed by first write. Private uploads to a mirror-owned name are
+   origin claim — `packages/<pkg>/.origin` — claimed by first write. Private
+   uploads to a mirror-owned name are
    rejected; sync refuses names that are private-owned. Collisions are hard
    errors, never merges. This closes the hole a prefix policy alone leaves open:
    without it, adding a private package's name to the mirror list would merge
@@ -179,8 +183,10 @@ it — publicly and wins. Defense in four layers, ordered by importance:
    claim is **durable**: deleting every artifact of a package does *not* release
    `.origin`, because that would let a credentialed client empty a mirror-owned
    public name and re-upload it as private (the dependency-confusion direction).
-   Re-purposing a name across worlds requires deleting the `.origin` file
-   directly — an operator action gated on storage access, the right boundary.
+   Re-purposing a name across worlds requires an empty package and the explicit
+   `pypiron origin release <pkg>` command. It conditionally rewrites the claim;
+   deleting `.origin` directly is forbidden because absence authorizes a proxy
+   fill.
 3. **Namespace prefix policy (the guardrail).** Optionally require private uploads
    to match a configured prefix (e.g. `acme-*`) and forbid sync from touching it.
    Makes intent auditable and prevents accidentally publishing an internal package
@@ -244,12 +250,15 @@ behavior, not popularity. Index pages always embed the stable `/files/` URLs;
 anything else would bake expiring signatures into lockfiles and cached index
 pages.
 
-The redirect path does no existence check — presigning is local HMAC math, so
-answering a redirect costs zero network round trips. A request for a missing
-artifact (a stale index race, or a hand-typed URL) gets a signed URL that S3
-answers with its own 404. That 404-not-403 depends on the server's
-credentials carrying `s3:ListBucket`, which they must anyway: index rebuilds,
-dirty-marker processing, and the reconcile sweep are all built on listing.
+The redirect path does no artifact-existence check — presigning is local HMAC
+math. In single-bucket mode, the visibility hardening adds zero storage calls.
+In multi-bucket mode, the request first applies the same origin and visibility
+fences as a streamed read; those control-object reads are not an artifact
+existence probe. A request for a missing artifact (a stale index race, or a
+hand-typed URL) gets a signed URL that S3 answers with its own 404. That
+404-not-403 depends on the server's credentials carrying `s3:ListBucket`, which
+they must anyway: index rebuilds, dirty-marker processing, and the reconcile
+sweep are all built on listing.
 
 ## Multi-node: sloppy leader election
 
@@ -261,6 +270,65 @@ proofs — because rebuilds are idempotent, dual leadership for a few seconds
 merely duplicates work.
 
 Disk backend is explicitly single-node; multi-node implies a cloud backend.
+
+## Multi-bucket: selection is local, convergence is global
+
+An ordered list of two or more S3 buckets turns every non-selected bucket into a
+warm writable copy. Each node independently selects the first bucket its health
+view calls healthy. A request pins one immutable `(storage, generation)` at
+entry; a selection change affects only new work. Leases carry that generation,
+and audit checks it before every write batch, so authority never crosses a
+bucket switch.
+
+Real traffic feeds the health view. A dedicated multi-only loop GETs the tiny,
+guaranteed topology stamp from every bucket on the worker cadence, with a
+one-second deadline and no overlapping sweep. Startup, runtime revalidation,
+and migration use the same per-operation bound. GET is required because S3's
+body-less HEAD 404 cannot distinguish a missing object from `NoSuchBucket`.
+The loop is independent of index, counter, and replication work, so a dead
+bucket's retries cannot stall publishes or selection. Only timeouts (including HTTP 408),
+connection failures, and 5xx count as availability failures; authentication,
+permission, CAS, KMS, quota,
+and configuration failures alarm without changing selection. Leaving is fast
+(three consecutive failures by default); returning to a more-preferred bucket
+requires five continuous healthy minutes. A switch invalidates generation-tagged
+caches and schedules an audit of the newly selected bucket.
+
+Private mutations write one durable `_repl/` marker per destination before the
+response, then fan out after the response. Every node may sweep markers from
+every configured bucket and run the periodic pairwise tree diff: both paths are
+conditional and idempotent, and selected-bucket leadership must not discard a
+different node's only working path to a warm bucket. Per-bucket leases still
+deduplicate index/audit work. Mirror/proxy caches, indexes, counters, and leases
+never copy. Each pairwise mutation also fences the package on both buckets with
+unique `_dirty/` intent roots. Long work rotates `root~<seq>` members every
+third of the intent grace, so an index worker cannot consume an old snapshot and
+open the package while replication is still active.
+
+Correctness does not depend on every node selecting the same bucket. Divergent
+writes merge under symmetric, clock-free rules: private beats mirror, deletes
+beat live records, artifact sets union, logical yank/status epochs settle
+metadata, and different private bytes under one filename freeze instead of
+choosing a winner. Two different mirror-cache bodies remain bucket-local and do
+not freeze. Mirror→private demotion stages the whole verified package and private
+project-status snapshot before `.origin` CASes to private with the exact
+`pending-manifest` owner. Publishers reject that transient barrier and
+promotion clears it only after convergence. A never-deleted per-package CAS
+sentinel serializes manifest executors; its holder heartbeats, and recovery may
+take over only after the same lock ETag remains unchanged for a full intent
+grace and the holder's complete intent family is no longer live. Thus a one-file
+package never becomes empty and mirror-local status cannot become private
+truth. The complete algebra and failure limits are in
+[MULTIBUCKET.md](MULTIBUCKET.md).
+
+Every reachable bucket carries `_topology/stamp.json`, a hash of the ordered
+bucket names plus an operator generation. Startup rejects disagreement. A
+runtime mismatch leaves reads available and fences mutations. Changing the list
+is explicit: stop the fleet, run `pypiron buckets migrate` with the new list,
+then restart every node on it. Single-bucket mode creates no topology stamp,
+health view, replication work, or probe traffic.
+Shrinking a multi-bucket fleet to one skips migration: stop the fleet and
+restart with the lone bucket, where topology stamps are dormant.
 
 ## Publish-then-install
 
@@ -296,19 +364,31 @@ packages/<pkg>/<filename>                # artifact, immutable once written
 packages/<pkg>/<filename>.meta.json      # sidecar (see below)
 packages/<pkg>/<filename>.metadata       # PEP 658 core metadata, extracted from wheel
 packages/<pkg>/<filename>.provenance     # PEP 740 provenance object, relayed verbatim from upstream
-packages/<pkg>/<filename>.tombstone      # delete marker (private files only): a deleted filename may
-                                         #   never be reused, and a crashed delete converges to "gone"
-                                         #   instead of resurrecting. Excluded from indexes; NEVER
-                                         #   lifecycle-expired (expiry would resurrect the delete).
-packages/<pkg>/.origin                   # "private" | "mirror" | "unclaimed" — a NEVER-DELETED claim
-                                         #   (see the origin-claim lifecycle below)
-packages/<pkg>/.project-status.json      # PEP 792 status ({status, reason?}); absent == active
+packages/<pkg>/<filename>.tombstone      # permanent filename-reuse fence: normally a private delete;
+                                         #   also accompanies a completed multi-bucket freeze. Excluded
+                                         #   from indexes; NEVER lifecycle-expired.
+packages/<pkg>/<filename>.frozen         # freeze marker (multi-bucket): two buckets committed different
+                                         #   bytes under one filename (a split-brain, §6.3). Quarantine
+                                         #   copies preserve both bodies; canonical records stay occupied
+                                         #   behind this marker plus a tombstone so a raced replacement is
+                                         #   never deleted. Indexes and direct reads reject the name. Written
+                                         #   FIRST so a quarantine crash remains a freeze; resolve by
+                                         #   publishing a new filename.
+packages/<pkg>/<filename>.mirror-quarantined # inert mirror loser under a private claim. Its canonical
+                                         #   body stays occupied to avoid delete/recreate ABA. It is hidden
+                                         #   unless a later private sidecar proves the marker stale.
+packages/<pkg>/.origin                   # nonce-bearing {origin, nonce, pending-manifest?} NEVER-DELETED
+                                         #   claim; pending-manifest is the CAS-owned promotion barrier;
+                                         #   plaintext private|mirror|unclaimed still reads
+packages/<pkg>/.project-status.json      # PEP 792 {status, reason?}; multi-bucket events also carry
+                                         #   pypiron-epoch + pypiron-origin. Absent == active@0.
 simple/index.html                        # materialized views (regenerable)
 simple/index.json
 simple/<pkg>/index.html
 simple/<pkg>/index.json
-_dirty/<pkg>!<nonce>.intent              # empty marker: a writer is touching this package
-_dirty/<pkg>!<nonce>.commit              # empty marker: truth changed, rebuild now
+_dirty/<pkg>!<root>[~<seq>].intent       # empty marker: a writer is touching this package;
+                                         #   cross-bucket work rotates one unique root family
+_dirty/<pkg>!<root>[~<seq>].commit       # empty marker: truth changed, rebuild now
 _state/fp-<shard>.json                   # audit fingerprints: pkg -> listing hash at last rebuild
 _state/inventory.json                    # regenerable aggregate (pkg/file counts); nodes read it for `/`
 _sync/cursors.json                       # mirror-over-HTTP sync memo: pkg -> last upstream ETag
@@ -320,9 +400,26 @@ _topology/stamp.json                     # multi-bucket only: fail-closed config
                                          #   ordered bucket identities + operator topology generation,
                                          #   CAS-written/verified on every reachable bucket at startup.
                                          #   One bucket: absent, dormant.
-_repl/<dest>/<file>                      # RESERVED (P3): per-destination replication todo markers, the
-                                         #   _dirty/ idiom pointed at another bucket. Swept in every
-                                         #   bucket, drained on successful copy. Not yet written.
+_repl/<dest-index>/<pkg>/<file>!<nonce>  # multi-bucket: per-destination replication todo marker. Written
+                                         #   in the bucket that accepted a private mutation before ack,
+                                         #   swept from every bucket, deleted after destination convergence.
+                                         #   <file> may be .origin or .project-status.json for package-level
+                                         #   truth. One bucket: never written.
+_quarantine/<pkg>/<file>@<sha12>         # multi-bucket: a frozen conflict or demoted mirror loser,
+                                         #   preserved under its own content hash (§6.2/§6.3).
+_staging/repl/<pkg>/<file>@<artifact-sha>-<sidecar-sha>/{sidecar,metadata,provenance,artifact}
+                                         #   verified package-demotion members; inert until named by manifest
+_staging/repl/<pkg>/<file>@<tombstone|frozen>-<fence-sha>/fence
+                                         #   staged delete/freeze fence; likewise inert until manifested
+_staging/repl/<pkg>/manifest@<sha>.json  # package-demotion commit marker. After this exists, recovery may
+                                         #   CAS .origin to private+pending-manifest and promote it.
+                                         #   Manifests delete on completion; shared content-addressed members
+                                         #   persist and remain inert if unreferenced. Do not lifecycle-expire
+                                         #   this prefix: a live manifest may reference any retained member.
+_staging/repl/<pkg>/.promotion-lock      # NEVER-DELETED CAS sentinel: held while one executor promotes a
+                                         #   manifest, heartbeated every grace/3; release CASes it to free.
+                                         #   Takeover requires one unchanged-ETag grace plus no live holder
+                                         #   intent family. Recovery prunes observations for gone manifests.
 _counters/<metric>/seg/<day>/<shard>/<id>.json   # download counters: node-flushed delta segments
                                          #   (write path; <id> is a unique per-incarnation id).
 _counters/<metric>/day/<day>/<shard>.json        # frozen per-shard day total (leader compaction);
@@ -337,12 +434,17 @@ _staging/<ts>-<pid>-<filename>           # cloud only: a >64 MB upload streams h
                                          #   Transient (the object-store analog of disk's .tmp +
                                          #   rename); never referenced by an index. A hard crash
                                          #   mid-publish may orphan one — harmless, like a leftover
-                                         #   .tmp on disk; expire with a bucket lifecycle rule.
+                                         #   .tmp on disk. Do not apply a broad _staging/ expiry rule:
+                                         #   committed _staging/repl manifests are recovery state.
 ```
 
 `<pkg>` is always the PEP 503 normalized name. Index rebuilds include only
-artifact files — sidecars (`.meta.json`, `.metadata`, `.provenance`) and dotfiles
-are excluded from listings by suffix/prefix.
+artifact files — metadata companions, tombstones, freeze markers, and dotfiles
+are excluded by suffix/prefix. A tombstone or freeze marker suppresses its base
+filename from indexes and direct server reads even while the canonical record
+remains occupied. A mirror-quarantine marker does the same until an adjacent
+private sidecar proves that promotion replaced the mirror loser, at which point
+the stale marker is inert.
 
 Sidecar schema (`<filename>.meta.json`), all captured at write time:
 
@@ -386,35 +488,89 @@ transition is a conditional write (CAS):
   (absent) --claim--> private            create-if-absent (put-if-none-match)
   (absent) --claim--> mirror             create-if-absent
  unclaimed --claim--> private | mirror   put-if-match on the sentinel
-    mirror --demote-> private            put-if-match (the ONLY demotion)
-    mirror --release-> unclaimed         put-if-match (orphan cleanup)
-   private is terminal
+mirror|private --stage-> private+pending-manifest  put-if-match (promotion barrier)
+private+pending-manifest --finish-> private        put-if-match
+    mirror --audit--> unclaimed          put-if-match (proven orphan cleanup)
+private|mirror --admin release-> unclaimed  put-if-match (empty package only)
+   private is terminal outside the explicit admin release
 ```
 
 After creation the claim never returns to *absent*: absent is what authorizes a
-proxy to fill from upstream, so a failed first write (proxy/sync) releases by
-CAS-rewriting the claim to the `unclaimed` sentinel — never an unconditional
-delete, which could erase a claim that went `private` mid-flight and re-open the
-dependency-confusion window. `unclaimed` reads as "no claim" (a proxy may claim
-it) while keeping the object present. Reads that drive a CAS return the etag; the
-proxy re-checks it immediately before committing a fill, so a slow download that
-straddles a `mirror→private` demotion aborts instead of committing mirror bytes
-into a now-private name. Deletes never touch `.origin` — emptying a package must
-not release the name to the opposite world. Like tombstones, `.origin` is never
-lifecycle-expired.
+proxy to fill from upstream. `unclaimed` reads as "no claim" while keeping the
+object present. Each state write is JSON with a fresh 128-bit nonce:
+
+```json
+{"origin":"private","nonce":"0123456789abcdef0123456789abcdef","pending-manifest":"_staging/repl/pkg/manifest@abc.json"}
+```
+
+The nonce prevents an etag ABA when disk etags are content hashes. Legacy
+plaintext claims still parse. `pending-manifest` is present only during staged
+private promotion and names the one committed manifest that owns the package.
+Reads that drive a CAS retain state, pending owner, and etag. Mirror writers put
+their create-only sidecar before the artifact and re-check that exact claim
+immediately before publish, so a slow download that straddles demotion either
+aborts or leaves a typed mirror loser.
+
+Request failures never release a claim. The leader audit may reclaim an empty
+mirror claim only after two identical observations separated by the intent
+grace, with no artifacts, live intents, or committed stage. It CAS-writes
+`unclaimed`, re-lists, and restores the old owner with a fresh nonce if activity
+appeared. The operator equivalent, `pypiron origin release <pkg>`, requires
+every configured bucket to be reachable and empty of all package truth except
+the claim, plus write intents, committed stage manifests, and replication
+markers for that package. Deletes never touch `.origin`. Like tombstones,
+`.origin` is never lifecycle-expired.
+An admin DELETE of mirror cache bytes remains local in single-bucket mode but is
+rejected with multiple buckets: deleting an artifact cannot be atomically fenced
+against a concurrent package-claim demotion, and a cache eviction must never
+manufacture a private tombstone.
+
+**Project-status lifecycle.** In multi-bucket mode the stored PEP 792 fields
+stay at the top level; `pypiron-epoch` is a monotonic local event counter and
+`pypiron-origin` records the private or mirror world that authored it. Legacy
+files omit both and read as epoch zero. Every multi-bucket set or clear
+CAS-bumps the epoch, and a clear persists an explicit `active` event instead of
+deleting the file. Single-bucket mode keeps the original plain-document PUT and
+active-marker DELETE. Private-tagged status beats mirror-tagged status; within
+one origin world, cross-bucket merge takes the greater epoch. Equal epochs take
+the more restrictive state, then the canonical record sha256 as a deterministic
+reason tie-break. Corrupt files and storage
+read failures never default to active.
+Mirror status stays local. A mirror→private staging manifest carries the
+private status (including implicit `active@0`) and the exact legacy destination
+version. After the claim CAS it replaces any tagged mirror event, including one
+that raced staging, at the source's private epoch. Tagged private history is
+never overwritten; legacy untagged bodies retain exact-version replacement.
+An already-private late-mirror repair persists a distinct manifest mode and
+skips demotion rebasing entirely. Reconciliation normalizes a tagged mirror
+event found under a private claim to private `active@0`. Crash recovery needs no
+source read.
 
 ## Honest scaling limits
 
 Measured against a fabricated full-PyPI-shaped corpus (see
 [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#scale-full-pypi-measured)):
 
-- Per-package write throughput is serialized through the leader — fine, uploads are
-  rare by definition.
+- Per-package index work is serialized through the bucket-local lease — fine,
+  uploads are rare by definition.
 - Global index regeneration is rare (only on package-set changes), batched per
   tick, and a multi-MB HTML file served statically with gzip is a non-event.
 - Polling `_dirty/` at a ~1s tick costs pennies a day in S3 LIST requests.
-- Every steady-state cost scales with what *changed*; only the audit (cheap
-  LISTs) and `rebuild-index`/`verify-index` (explicit) scale with what *exists*.
+- In single-bucket mode, every steady-state cost scales with what *changed*;
+  only the audit (cheap LISTs) and `rebuild-index`/`verify-index` (explicit)
+  scale with what *exists*. Filename non-reuse adds one tombstone HEAD per
+  upload; multi-bucket uploads add one `.frozen` HEAD. Private delete adds its
+  checked origin reads and tombstone write. Single-bucket serving adds no
+  origin or visibility-fence reads.
+- Multi-bucket mode adds per-node health probes and replication sweeps, plus one
+  extra private copy per destination and retained content-addressed demotion
+  stages. A local package-index read fences with an initial origin GET and a
+  final exact-observation GET. A local artifact or served companion read adds
+  those two origin GETs, tombstone/frozen/mirror-quarantine HEADs, and a sidecar
+  GET when the claim or quarantine marker requires one. Proxy fills and
+  passthroughs add eligibility, claim, marker, and upstream work dynamically;
+  they have no single fixed request count. The exact bucket/node formulas are
+  in the [user manual](../docs/guides/multi-bucket.md#cost-model).
 
 Backups and disaster recovery are a selling point, not a feature: it's just files.
 rsync it, version the bucket, done.

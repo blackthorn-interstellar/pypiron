@@ -24,7 +24,16 @@ from typing import Dict, Iterator, Tuple
 import pytest
 
 from .conftest import _start_disk_server
-from .helpers import find_free_port, http_get, make_wheel, run_checked, sha256_file
+from .helpers import (
+    find_free_port,
+    http_get,
+    make_wheel,
+    origin_owner,
+    run_checked,
+    sha256_file,
+    upload_legacy,
+    wait_for_file_in_index,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.chaos]
 
@@ -200,9 +209,12 @@ class _FaultServer:
         self.httpd.server_close()
 
 
-@pytest.fixture()
-def proxy_over_fault(
-    tmp_path_factory, pypiron_bin: Path, tmp_path: Path
+def _proxy_over_fault(
+    tmp_path_factory,
+    pypiron_bin: Path,
+    tmp_path: Path,
+    *,
+    worker_args: tuple[str, ...] = (),
 ) -> Iterator[Tuple[Dict, _FaultServer]]:
     """A real pypiron proxy pointed at a controllable fake upstream. The spool
     dir is isolated so a test can prove it drains after a failed download."""
@@ -221,6 +233,7 @@ def proxy_over_fault(
             "",
             "--spool-dir",
             str(spool),
+            *worker_args,
         ],
     )
     proxy = next(gen)
@@ -230,6 +243,30 @@ def proxy_over_fault(
     finally:
         gen.close()
         upstream.stop()
+
+
+@pytest.fixture()
+def proxy_over_fault(
+    tmp_path_factory, pypiron_bin: Path, tmp_path: Path
+) -> Iterator[Tuple[Dict, _FaultServer]]:
+    yield from _proxy_over_fault(tmp_path_factory, pypiron_bin, tmp_path)
+
+
+@pytest.fixture()
+def proxy_over_fault_reclaim(
+    tmp_path_factory, pypiron_bin: Path, tmp_path: Path
+) -> Iterator[Tuple[Dict, _FaultServer]]:
+    yield from _proxy_over_fault(
+        tmp_path_factory,
+        pypiron_bin,
+        tmp_path,
+        worker_args=(
+            "--intent-grace-secs",
+            "10",
+            "--reconcile-interval-secs",
+            "1",
+        ),
+    )
 
 
 # ------------------------------- assertions -----------------------------------
@@ -249,15 +286,11 @@ def _assert_storage_clean(proxy: Dict, pkg: str, filename: str) -> None:
         )
         stray = [p.name for p in pkg_dir.iterdir() if p.name.startswith(".tmp")]
         assert not stray, f"orphaned temp files in {pkg_dir}: {stray}"
-        # A failed first fetch must release its origin claim, or the name is
-        # blocked forever. The claim is a never-deleted object (dev/MULTIBUCKET.md
-        # §6.2), so release rewrites it to the "unclaimed" sentinel rather than
-        # deleting it — the name stays re-claimable either way.
+        # Failure-path claim release races live writers. Reclamation belongs to
+        # the leader audit; until then the exact mirror claim must remain present.
         origin_file = pkg_dir / ".origin"
-        if origin_file.exists():
-            assert origin_file.read_text().strip() == "unclaimed", (
-                "failed first fetch left a live origin claim (name blocked forever)"
-            )
+        assert origin_file.exists(), "failed first fetch lost its origin claim"
+        assert origin_owner(origin_file.read_text()) == "mirror"
     # The spool file self-cleans on every early-return path; give the drop a
     # moment to run, then require it empty.
     deadline = time.time() + 5.0
@@ -278,7 +311,7 @@ def _healthy_fetch_matches(proxy: Dict, pkg: str, filename: str, expected_sha: s
     )
     # And it committed cleanly this time.
     assert (_pkg_dir(proxy, pkg) / filename).exists()
-    assert (_pkg_dir(proxy, pkg) / ".origin").read_text().strip() == "mirror"
+    assert origin_owner((_pkg_dir(proxy, pkg) / ".origin").read_text()) == "mirror"
 
 
 # --------------------------------- tests --------------------------------------
@@ -338,7 +371,7 @@ def test_upstream_500_then_recovers_within_retries(proxy_over_fault, tmp_path):
     assert code == 200, "the proxy should have retried past a transient 500"
     assert hashlib.sha256(body).hexdigest() == sha256_file(wheel)
     assert (_pkg_dir(proxy, pkg) / filename).exists(), "recovered download was not committed"
-    assert (_pkg_dir(proxy, pkg) / ".origin").read_text().strip() == "mirror"
+    assert origin_owner((_pkg_dir(proxy, pkg) / ".origin").read_text()) == "mirror"
 
 
 def test_hash_mismatch_is_never_committed(proxy_over_fault, tmp_path):
@@ -360,6 +393,40 @@ def test_hash_mismatch_is_never_committed(proxy_over_fault, tmp_path):
 
     upstream.heal(pkg)
     _healthy_fetch_matches(proxy, pkg, filename, sha256_file(wheel))
+
+
+def test_worker_reclaims_failed_proxy_claim_for_private_upload(proxy_over_fault_reclaim, tmp_path):
+    """The real single-bucket audit releases a stable abandoned mirror claim."""
+    proxy, upstream = proxy_over_fault_reclaim
+    pkg = "reclaimfailedproxy"
+    mirror_wheel = make_wheel(pkg, "1.0", tmp_path / "mirror")
+    filename = upstream.register(pkg, mirror_wheel)
+    upstream.set_fault(pkg, "corrupt")
+
+    code, _, _ = http_get(f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT)
+    assert code != 200
+    origin_file = _pkg_dir(proxy, pkg) / ".origin"
+    assert origin_file.exists()
+    assert origin_owner(origin_file.read_text()) == "mirror"
+
+    deadline = time.monotonic() + 20
+    owner = "mirror"
+    while time.monotonic() < deadline:
+        owner = origin_owner(origin_file.read_text())
+        if owner == "unclaimed":
+            break
+        time.sleep(0.2)
+    assert owner == "unclaimed", "worker audits did not reclaim the abandoned mirror claim"
+
+    private_wheel = make_wheel(pkg, "2.0", tmp_path / "private")
+    upload_legacy(
+        proxy["legacy"],
+        private_wheel,
+        username=proxy["user"],
+        password=proxy["password"],
+    )
+    wait_for_file_in_index(proxy["simple"], pkg, private_wheel.name)
+    assert origin_owner(origin_file.read_text()) == "private"
 
 
 def test_hanging_upstream_is_bounded_and_clean(proxy_over_fault, tmp_path):

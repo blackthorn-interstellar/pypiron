@@ -1,8 +1,8 @@
 # Multi-bucket replication & failover
 
-Status: **proposed** — reviewed design, not implemented. Companion to
-[DESIGN.md](DESIGN.md); nothing here changes the storage-layout contract except
-the additions in §6.
+Status: **implemented** — architecture and merge contract. Companion to
+[DESIGN.md](DESIGN.md); the storage-layout additions are recorded in both
+documents.
 
 ## Vision
 
@@ -10,7 +10,8 @@ Hand pypiron a list of buckets instead of one, and stop thinking about
 regional failure. Installs never stop; publishing barely notices;
 partitions heal themselves. No promote step, no runbook, no failover
 drill. Cloud providers sell this as a premium managed product on their
-proprietary stack; pypiron carries it in the binary, on any object store.
+proprietary stack; pypiron carries it in the binary for S3 and compatible
+stores.
 
 The principles, distilled from four adversarial review rounds:
 
@@ -27,9 +28,10 @@ The principles, distilled from four adversarial review rounds:
    diff as backstop — idempotent, and crash-shaped like things pypiron
    already heals.
 4. **Fail closed on security, fail open on availability.** Private beats
-   mirror always; config errors alarm but never reroute; conflicting bytes
-   freeze and page a human (caches and lockfiles make any other answer a
-   lie). Reads and writes keep flowing through every partition.
+   mirror always; config errors alarm but never reroute; conflicting private
+   bytes freeze and page a human (caches and lockfiles make any other answer a
+   lie). Divergent mirror-cache bytes remain local. Reads and writes keep
+   flowing through every partition.
 5. **We write the tricky code so the customer doesn't operate it.**
    Machinery not needed for correctness is machinery that can't deadlock —
    review taught us to delete the failover state machine, not harden it.
@@ -73,13 +75,21 @@ PYPIRON_S3_BUCKETS=iron-east,iron-west,iron-eu
 - Two or more buckets, order = preference. `buckets[0]` is the **preferred**
   bucket; at any moment each node has one **active** bucket — the first one
   it observes healthy.
-- One bucket configured = exactly today's behavior; every mechanism in this
-  document is dormant.
+- One bucket configured starts none of this document's topology, health,
+  replication, or warm-index machinery. The shared filename-reuse hardening
+  remains: one tombstone HEAD per upload and the checked tombstone write on a
+  private delete. Multi-bucket uploads also check the first-written `.frozen`
+  conflict marker.
+- Supplying `--s3-bucket` selects S3; `--storage s3` is optional. An entry may
+  pin its region as `name@region`. The CLI flag is repeatable and the plural
+  environment variable is comma-delimited; legacy `PYPIRON_S3_BUCKET` still
+  selects one bucket; the TOML `s3-bucket` key remains a single-bucket value.
 - Buckets are **same-trust infrastructure**. A hostile bucket is out of
   scope: whoever writes your buckets owns your index, list of one or list
   of five.
-- v1 assumes one credential/identity with access to all buckets (S3 creds
-  are env-global today; per-bucket credentials are an open question, §13).
+- v1 is S3-only and uses one credential chain and one optional endpoint for
+  every bucket. Regions may differ per entry; providers and credentials may
+  not.
 
 ## 3. Invariants
 
@@ -129,22 +139,26 @@ PYPIRON_S3_BUCKETS=iron-east,iron-west,iron-eu
 
 ## 4. Steady state
 
-All nodes, all regions → `buckets[0]`. The leader (existing lease, in the
-preferred bucket) runs one new job:
+All nodes, all regions → `buckets[0]`. Every node runs replication maintenance;
+the work is conditional and idempotent, so duplicate attempts cost requests but
+cannot change the result. This is deliberate: a node that holds the preferred
+bucket's index lease may be unable to reach a warm bucket that another node can.
+The lease remains a cost optimization, never a connectivity gate.
 
 **Replicate**, from any bucket that took writes to every other configured
 bucket — in steady state, a star from `buckets[0]`. Three tiers, fastest
 first, each backstopping the one above:
 
-1. **Eager fan-out at upload time.** After the selected-bucket commit and
-   the client ack, the upload handler — which still holds the verified
-   bytes — immediately pushes sidecar-first copies to every other bucket.
-   Common-case replication lag: milliseconds. The client never waits on
-   these; another bucket being down costs the customer nothing.
-2. **Todo markers.** Any failed or skipped push drops a per-destination
-   marker in the bucket that took the write (`_repl/<dest>/<file>`, the
-   `_dirty/` idiom pointed at a second bucket — written O(1) at commit,
-   consumed and deleted by the replicator on success). The replicator
+1. **Durable todo marker, then eager fan-out.** Before acknowledging a private
+   mutation, the request writes one nonce-bearing marker per destination in
+   the selected bucket (`_repl/<dest-index>/<pkg>/<file>!<nonce>`). Truth is
+   already immutable at this point, so a marker-write failure is alarmed rather
+   than converted into a false-negative response that would make a correct
+   client retry into 409. The full diff remains the lost-marker proof. After
+   the ack, the handler immediately copies the record and deletes each exact
+   marker on success. Common-case replication lag: milliseconds; an
+   unavailable destination does not delay the response.
+2. **Todo-marker sweep.** The replicator
    sweeps markers in **every** configured bucket, not just the preferred
    one — a bucket that took direct writes during a deviation window drains
    home the same way. While a bucket is unreachable, markers destined for
@@ -161,6 +175,12 @@ final cursor. A destination being down means pushes fail, markers pile up,
 and nothing else happens. Crash-safe and idempotent by the same argument as
 every other worker job.
 
+Every pairwise replication mutation holds one unique `_dirty/` intent root on
+each bucket. Long work rotates both through `root~<seq>` family members every
+third of `--intent-grace-secs`: create the next pair, then commit the old pair.
+The worker treats the whole family as one holder. This closes package-index and
+promotion races without a new queue or clock protocol.
+
 Upload-time coordination (origin claim, create-if-absent 409, tombstone
 check) runs against the **node's selected bucket only**, before the ack;
 the eager pushes are ordinary replication writes and gate nothing. If the
@@ -173,15 +193,18 @@ What replicates (**private truth only**):
 
 | Object | Replicates? | Why |
 |---|---|---|
-| private artifacts + sidecars + `.metadata`/`.provenance`/`.project-status.json` | yes | the irreplaceable truth |
-| `.origin` claims | yes — on a fast tick, **ahead of artifacts** | shrinks the dependency-confusion window to seconds |
+| private artifacts + sidecars + `.metadata`/`.provenance` | yes | the irreplaceable truth |
+| private `.project-status.json` | yes | quarantine and lifecycle state must converge |
+| `.origin` claims | yes — **ahead of artifacts**, including origin-only claims | shrinks the dependency-confusion window to seconds |
 | tombstones (§6.4) | yes | deletes must not resurrect |
 | mirror/proxy-cached content | **no** | re-derivable from upstream per bucket; syncing it buys nothing and costs LIST storms, doubled storage, and cache-eviction anomalies |
 | `simple/` indexes | **no** | regenerable views; each bucket derives its own |
-| `_counters/`, `_dirty/`, `_leader/`, `_staging/` | no | derived / ephemeral / local |
+| `_staging/repl/` package-demotion records | retained recovery state | verified private records, delete/freeze fences, captured mirror versions, and the private project-status snapshot; manifests are removed after promotion, content-addressed members persist inert when unreferenced, and each package's CAS lock sentinel is never deleted |
+| `_counters/`, `_dirty/`, `_leader/`, upload `_staging/` | no | derived / ephemeral / local |
 
-Copy protocol per artifact record: **verified sidecar first, artifact last**,
-both sha256-checked against the source sidecar. Never gate on raw object
+Copy protocol per artifact record: verify the complete source record, establish
+the private package claim, then write **sidecar, companions, artifact last**.
+The artifact is sha256-checked against the source sidecar. Never gate on raw object
 presence (an artifact can exist pre-commit) and never on etag (not comparable
 across buckets, or across multipart strategies within one). Order matters
 because the index rebuilder backfills a fabricated sidecar for sidecar-less
@@ -203,10 +226,12 @@ unsafe; it is a brief dual-write window that reconciliation absorbs.
 
 ### Per-node selection
 Each node independently maintains a health view of every configured bucket
-(a data-plane probe plus errors observed on real traffic). Classification
-is strict and fail-closed:
+(a topology-stamp GET plus errors observed on real traffic). The multi-only
+health loop is independent of index, counter, and replication work; every
+probe has a one-second deadline. Classification is strict and fail-closed:
 
-- **Unhealthy signals**: timeouts, connection failures, 5xx.
+- **Unhealthy signals**: timeouts (including HTTP 408), connection failures,
+  5xx.
 - **Never unhealthy signals**: 403/401 (credentials), 412 (CAS traffic),
   KMS/quota/config errors. These alarm loudly and never affect selection —
   a misconfigured node must not wander off the preferred bucket.
@@ -219,25 +244,46 @@ more-preferred bucket only after it has been continuously healthy for much
 longer (minutes, knob), so a flapping bucket settles into "stay put"
 rather than oscillating.
 
+The shipped defaults are three consecutive availability failures to leave and
+300 continuous healthy seconds to return. `--bucket-leave-failures` /
+`PYPIRON_BUCKET_LEAVE_FAILURES` and `--bucket-return-healthy-secs` /
+`PYPIRON_BUCKET_RETURN_HEALTHY_SECS` tune them. The probe cadence is the normal
+`--worker-interval-secs` / `PYPIRON_WORKER_INTERVAL_SECS` (one second by
+default).
+
 Everything a node does follows its selection: uploads coordinate against
 it (§4), the worker and audit run against it, index reads serve from it,
 and redirect links presign against it.
 
 ### How redirect links know which bucket is up
-They don't — presigning is blind local HMAC math with no existence check
-and no network call, and that stays true. The redirect path *consumes* the
-health view; it never produces signal. The producers are the operations
-that already touch storage every second regardless of traffic: the lease
-heartbeat (a conditional write), dirty-marker reads, counter flushes —
-plus one cheap HEAD probe per non-selected bucket on the worker tick. Net:
-every node holds a ~1s-fresh, first-hand view of every configured bucket.
+They don't — presigning itself is blind local HMAC math with no artifact
+existence check or network call, and that stays true. Before signing or
+streaming, however, every local multi-bucket `/files/` request applies the
+selected bucket's visibility fence: an initial origin GET, tombstone/frozen/
+mirror-quarantine HEADs, a sidecar GET when the private claim or quarantine
+marker requires one, then a final origin GET proving the exact claim did not
+change. Local package-index reads likewise compare initial and final exact
+origin observations, so a staged promotion cannot leak a partial package.
+Proxy listings additionally filter the upstream result against local
+tombstone, frozen, and quarantine markers after the upstream fetch. Proxy fills
+and companion passthroughs add eligibility, claim, marker, and upstream checks,
+so their read count is higher and path-dependent. A single bucket skips this
+entire read fence, so the fence adds no storage I/O there.
 
-Blind signing is safe because the index and the presign share provenance:
-a node serves index pages derived from its selected bucket and signs URLs
-into that same bucket, so the file's existence was established by the
-index that advertised it — the same source the link points at. The
-sign-time check the design "skips" was never load-bearing. Two bounded
-consequences remain:
+The other health producer is one tiny topology-stamp GET per configured bucket
+on the worker cadence. A GET is deliberate: S3's body-less HEAD 404 cannot
+distinguish a missing key from a deleted bucket, while the guaranteed stamp GET
+preserves `NoSuchBucket`. Probe sweeps never overlap, and they run on a dedicated
+loop, so a blackhole cannot starve either selection or the selected bucket's
+index worker. In the healthy case every node holds a roughly
+worker-cadence-fresh, first-hand view.
+
+Signing without an artifact-existence probe is safe because the index and the
+presign share provenance: a node serves index pages derived from its selected
+bucket and signs URLs into that same bucket, so the file's existence was
+established by the index that advertised it — the same source the link points
+at. The visibility fence rejects pending, deleted, frozen, and quarantined
+records before this point. The remaining consequences and escape hatch are:
 
 - During a deviation window, a very fresh upload may not have replicated
   to the node's selected bucket yet (milliseconds in steady state, thanks
@@ -245,9 +291,9 @@ consequences remain:
   mixed-generation limit.
 - Links signed in the sub-second between a bucket dying and the node's
   probe noticing fail at the client; the retry arrives after the node has
-  reselected. Window = probe cadence (~1s). (A verify-before-redirect HEAD
-  could shave this, at a network round-trip per download — rejected; the
-  free 302 is a feature and the retry already heals it.)
+  reselected. Window = probe cadence (~1s). An additional artifact-existence
+  HEAD could shave this, but costs another request per download and the retry
+  already heals it.
 - Operators who want zero client-to-bucket dependency set
   `--artifact-delivery stream` and the node carries the bytes itself.
 
@@ -295,75 +341,143 @@ any order reach the same result. Precedence:
 ### 6.1 Artifacts — union
 Pull unit = sidecar + artifact + companions, verified by sidecar sha256.
 Same filename + same sha256 (the common "CI retried against the other side"
-case) is a no-op.
+case) does not copy the body; missing companions and logical yank state still
+merge.
 
 ### 6.2 Origin — monotone lattice, private is terminal
-- The only legal transition is mirror→private, via a new **CAS overwrite**
-  primitive (`If-Match` on the current claim content). The claim never
-  transits through absent — absent is what authorizes the proxy to fill
-  from upstream, and the whole point of the claim is that it can't.
-- Consequences for existing code (this is real work, not merge-job-local):
-  - Origin reads return a generation/etag.
-  - The proxy re-validates its claim generation immediately before commit —
-    today a slow upstream download can commit mirror bytes into a package
-    that went private mid-flight.
-  - `release_empty_claim` becomes a conditional delete (delete-if-match) —
-    today it is unconditional and can delete a now-private claim, producing
-    exactly the forbidden absent state.
-- Demotion order on merge: copy private artifacts in → CAS the claim →
-  quarantine local mirror files for that name (never serve a private name's
-  mirror leftovers; also never leave the package empty mid-demotion).
+- Claim bodies are nonce-bearing JSON with `origin`, a 128-bit `nonce`, and an
+  optional `pending-manifest` stage key. A
+  fresh nonce on every state write prevents etag ABA on the disk backend;
+  legacy plaintext claims still parse.
+- The normal lattice is absent→private/mirror, unclaimed→private/mirror, and
+  mirror→private. Every transition is create-if-absent or CAS. Once created,
+  the object never returns to absent — absence authorizes a proxy fill.
+  Private is terminal.
+- The proxy and legacy mirror upload write a create-only mirror sidecar before
+  the artifact, then re-read the exact mirror observation immediately before
+  the conditional artifact put. An orphan sidecar is inert; a late artifact is
+  always typed mirror. If demotion wins the final cross-object window, the
+  writer leaves that typed loser for private-precedence quarantine instead of
+  racing a delete against newer private truth.
+- Failed empty mirror claims are reclaimed by the leader audit, not the request
+  failure path: two empty/no-intent observations separated by the intent grace,
+  with no committed stage, then CAS to a fresh `unclaimed` body, followed by a
+  post-CAS re-list and restoration if activity appeared.
+- Deliberate repurposing is `pypiron origin release <pkg>`. It requires every
+  configured bucket to be reachable and the package to have no package truth
+  except `.origin`, nor pending write/replication manifests or markers; it
+  releases through CAS, never delete.
+- Demotion on merge is package-atomic in visibility: stage every verified
+  private record plus tombstone/freeze fence under `_staging/repl/`, capture
+  exact pre-CAS mirror artifact versions, write the package manifest, then CAS
+  `.origin` to private with `pending-manifest` naming that exact manifest. All
+  publishers reject the pending claim. Promotion is idempotent; its final CAS
+  clears `pending-manifest`. A manifest resumes after a crash and partial stages
+  without one are inert. Multiple committed manifests serialize through the
+  one claim. A one-file package never becomes empty during demotion. Completion
+  deletes only the manifest; shared content-addressed members persist and become
+  inert when unreferenced. A broad `_staging/repl/` lifecycle rule is unsafe
+  because a live manifest may still reference any retained member. Executors
+  serialize through `_staging/repl/<pkg>/.promotion-lock`, a never-deleted CAS
+  sentinel released to a fresh `free` body. A holder heartbeats it every third
+  of the intent grace. Recovery may take over only after the same lock ETag has
+  remained unchanged for a full grace and the holder's complete intent family
+  is no longer live. Recovery sweeps discard in-memory lock observations when
+  the package has no committed manifest, so stale proofs do not accumulate or
+  authorize a later takeover.
+- Captured mirror-only leftovers are copied to `_quarantine/` and marked with a
+  `.mirror-quarantined` companion. Their canonical cache bytes remain in place
+  but inert, unindexed, and unavailable through direct server reads. A later
+  private sidecar proves that promotion replaced the mirror loser and makes a
+  stale quarantine marker inert. Not deleting the artifact key is deliberate:
+  an ETag cannot distinguish a same-byte delete/recreate ABA, while retaining
+  the occupied key is safe and preserves filename immutability.
 - Sidecar gains per-artifact `origin` so private truth is derivable from
   state (§4).
 
-### 6.3 Byte conflict — freeze, never pick
-Same filename, different sha256, both committed: this is *always* a bug or
-an attack (create-if-absent forbids it within a bucket; only a split can
-produce it). No winner is chosen — not by configured primary (a one-line
+### 6.3 Private byte conflict — freeze, never pick
+Same filename, different sha256, both committed as private truth: this is
+*always* a bug or an attack (create-if-absent forbids it within a bucket; only a
+split can produce it). No winner is chosen — not by configured primary (a one-line
 misconfig makes both sides winners: silent permanent split-brain; and it
 doesn't generalize to N buckets), not by hash order (indexes and year-long
 immutable CDN caches have already served the "loser"; convergence-by-winner
 is a lie the caches ignore, and lockfiles pin the hashes). Instead:
 
-- Both bodies preserved under content-hash-suffixed quarantine keys —
-  moves, never deletes, never tombstones (a conflict must not poison the
-  name forever).
-- The filename is suppressed from indexes on all buckets. Deterministic,
-  side-independent, N-safe.
+- Both bodies are preserved under content-hash-suffixed quarantine keys.
+  `.frozen` is written first, before any fallible quarantine I/O; publishers
+  check it as a write fence. Quarantine and the permanent tombstone follow, but
+  the canonical record remains occupied and inert behind both markers. Deleting
+  it after the quarantine read could erase a different body that won a
+  concurrent CAS; a later reconciliation pass can quarantine that replacement.
+  Every crash shape remains recognizably a freeze and retries idempotently.
+- The filename is suppressed from indexes and rejected by new direct server
+  reads on all buckets. Deterministic, side-independent, N-safe.
 - Loud alarm (log + metric). A human resolves — in practice: publish a new
   version.
+
+Mirror/mirror is the deliberate exception. Proxy caches are bucket-local,
+replaceable snapshots; different bytes under the same filename neither copy nor
+freeze. If private truth exists on either side, private precedence stages the
+package and quarantines the mirror loser instead.
 
 ### 6.4 Deletes — tombstones, private files only
 - Durable per-file tombstone written **before** artifact removal (a crashed
   delete converges instead of resurrecting).
-- Checked by the upload path — filename reuse after delete becomes banned
-  (today it is possible; PyPI semantics say it shouldn't be) — and by index
-  rebuild.
+- Checked by the upload path and index rebuild — filename reuse after delete is
+  banned.
 - Never lifecycle-expired; expiry would resurrect deleted packages.
-- Mirror deletions are local cache management and never replicate — a
-  cached upstream file must remain re-fillable forever.
+- Mirror deletions are local cache management and never replicate. With one
+  bucket the admin DELETE remains available. With multiple buckets it is
+  rejected: cache eviction cannot be atomically separated from a concurrent
+  mirror→private demotion across two S3 objects, and cached bytes are replaceable.
 - Tombstones are a storage-layout-contract addition (DESIGN.md §layout);
   treat like a schema migration.
 
 ### 6.5 Yank — logical epoch, no wall clocks
 Sidecar gains `yank-epoch` (monotonic counter, bumped on every yank/unyank).
 Merge = max epoch; equal epoch with conflicting state = yanked wins
-(fail-closed); equal epoch, both yanked, different reasons = the record
-with the lexicographically smaller sidecar sha256 wins, purely to be
-deterministic. Wall-clock LWW is banned: two buckets have two clocks, and
-skew makes verdicts side-dependent and non-convergent.
+(fail-closed). Any residual same-epoch sidecar difference — including two
+byte-identical partition uploads with different captured metadata — takes the
+record with the lexicographically smaller sidecar sha256. Wall-clock LWW is
+banned: two buckets have two clocks, and skew makes verdicts side-dependent and
+non-convergent.
 
-### 6.6 Counters — not replicated
+### 6.6 Project status — logical epoch, explicit clears
+
+`.project-status.json` carries a monotonic `pypiron-epoch`. Every local status
+change CAS-increments it; returning to `active` writes an explicit event rather
+than deleting the file. Merge takes the greater epoch. Equal-epoch splits take
+the more restrictive state (`quarantined` ≻ `archived` ≻ `deprecated` ≻
+`active`), then the lexicographically smaller canonical-record sha256 for
+differing reasons. The rule is symmetric and clock-free.
+
+Mirror status is bucket-local cache metadata. A mirror→private staging manifest
+captures the private side's status (including implicit `active@0`) plus the exact
+destination status version. During promotion, tagged mirror status is
+replaceable, tagged private status is preserved, and legacy untagged status is
+replaced only when its exact captured ETag still matches. Reconciliation also
+normalizes any tagged mirror event found under an already-private claim to
+private `active@0`; a mirror request that straddled demotion can therefore never
+become fleet private truth.
+
+### 6.7 Counters — not replicated
 Per-bucket stats; they are derived and lossy by design. Sum offline if it
-ever matters.
+ever matters. Each flush, compact, or query pins one bucket for its entire call
+graph, so a selection switch cannot splice one counter operation across stores.
 
 ## 7. Coordination state
 
 Almost none — deliberately. There is no epoch object, no ACTIVE/DRAINING
-status, no cluster membership. Two pieces of shared state exist:
+status, no cluster membership. Three pieces of shared state exist:
 
-- **Per-bucket leases** (existing, unchanged): each bucket has its own
-  `_leader/` lease; leaders do idempotent derived work there.
+- **Per-bucket leases** (existing): each bucket has its own `_leader/` lease for
+  singular index/audit work. Marker delivery and the lost-marker full diff are
+  deliberately not gated by the selected bucket's lease; every node may attempt
+  their conditional, idempotent writes.
+- **Per-package promotion lock** — the never-deleted CAS sentinel described in
+  §6.2. It selects one manifest executor; heartbeat plus intent-family liveness
+  makes crash takeover safe. It never elects a bucket or gates ordinary work.
 - **Topology stamp** — the fail-closed configuration check: a
   deterministic hash of the ordered bucket identities plus an
   operator-controlled topology generation, written-or-verified by CAS
@@ -374,12 +488,20 @@ status, no cluster membership. Two pieces of shared state exist:
   deployments disagreeing about the bucket order is the one
   misconfiguration that degrades "disagreements are rare" to
   "disagreements are constant," so it is the one thing checked hard.
-  Validation requires only reachable buckets — a standby node must be able
-  to boot during the exact outage it exists for. Changing the topology
+  Every topology GET/CAS has a one-second control-plane deadline. An unreachable
+  bucket can add up to that timeout for each attempted operation, but cannot
+  block startup indefinitely. Validation requires only reachable buckets — a
+  standby node must be able to boot during the exact outage it exists for.
+  Changing the topology
   (replacing a dead bucket, adding one, reordering) is an explicit
-  operator action — `pypiron buckets migrate` bumps the generation and
-  re-stamps reachable buckets — so disaster recovery never bricks on a
-  stale stamp.
+  operator action — stop the fleet, run `pypiron buckets migrate` with the new
+  complete list, then restart every node on that list. The command bumps the
+  generation and re-stamps reachable buckets, so disaster recovery never
+  bricks on a stale stamp. A runtime mismatch leaves reads up and sets a sticky
+  write fence until restart.
+  Shrinking to one bucket is the exception: stop the fleet and restart with the
+  lone bucket. Single-bucket topology is dormant, so there is no stamp migration
+  to run.
 
 Everything v5 kept in coordination state (ACTIVE/REPLICA/DRAINING, fencing
 epochs, demotion protocol, bootstrap activation rules) is deleted, not
@@ -403,6 +525,9 @@ Everything above is already N-safe, by construction:
 Two is the sweet spot; three is for the paranoid; more works but each
 bucket is another full copy of private truth.
 
+The quantified steady-state request and byte formulas live in the user manual:
+[Multi-bucket failover — Cost model](../docs/guides/multi-bucket.md#cost-model).
+
 ## 9. Security posture
 
 - Same-trust buckets (§2). Fail-closed error classification (§5).
@@ -411,9 +536,12 @@ bucket is another full copy of private truth.
   until the claim replicates (seconds normally; partition-length during a
   split). Steady state self-heals via §6.2, but a client may have fetched
   upstream bytes in the window. Mitigations, in order of strength:
-  1. Reserve your private namespace in `[mirror]` include/exclude on all
-     nodes (structural — closes the window entirely; required guidance for
-     private+proxy deployments).
+  1. Set `--private-prefix` / `PYPIRON_PRIVATE_PREFIX` on all nodes. It both
+     constrains new private names and forbids proxy fills under the normalized
+     prefix. If the private set has no common prefix, omit the prefix guard and
+     put every exact private name in `[mirror]` excludes instead. This
+     structural rule closes the window and is required guidance for
+     private+proxy deployments.
   2. Claims replicate ahead of artifacts (§4).
 - In steady state (all nodes on one bucket) the window does not exist at all —
   an improvement this design has over any always-dual-writing scheme.
@@ -459,69 +587,60 @@ bucket is another full copy of private truth.
 
 ## 11. Honest limits
 
-- **Uploads pause seconds** on a true bucket outage: the node's own
-  leave-hysteresis plus one client retry. Reads don't pause at all.
+- **Operations pause seconds** on a true bucket outage: the node's own
+  leave-hysteresis plus one client retry. New reads switch with the node;
+  an operation already pinned to the failed bucket returns an error.
   Physics still applies — you cannot distinguish "down" from "slow"
   instantly — but because a wrong selection is safe, detection no longer
-  has to be conservative.
+  has to be conservative. Multi-bucket S3 disables SDK retries; the dedicated
+  one-second probes switch new traffic and cancel background work when a bucket
+  becomes ineligible. An artifact transfer already in flight keeps the normal
+  one-hour route bound so a legitimately slow upload is not cut off. The client
+  may cancel and retry against the new selection sooner.
 - **Cross-bucket duplicate rejection is best-effort.** Two uploads of the
   same filename through nodes selecting different buckets during a
   deviation window both receive 200 and freeze on merge (§6.3). Within one
   bucket — steady state, i.e. almost always — the 409 remains immediate.
 - **RPO = replication lag** for a destroyed (not partitioned) bucket:
-  private uploads acked in the last seconds may need re-publishing —
-  idempotent, and the uploader gets a clean error/retry.
-- **Frozen conflicts require a human** (§6.3). By design.
+  private uploads acknowledged in the last seconds may need re-publishing.
+- **Frozen conflicts require a human** (§6.3). The conflicted filename remains
+  immutable; resolve by publishing a new filename.
 - **Caches/CDNs** may serve pre-freeze bytes for a conflicted filename until
   TTLs expire. No merge rule can un-serve bytes.
-- **Issued presigned URLs cannot be revoked by a flip**; their TTL (knob,
-  keep it short) bounds the window. A client mid-install across a flip can
+- **Issued presigned URLs cannot be revoked by a flip**; their one-hour expiry
+  bounds the window. A client mid-install across a flip can
   observe mixed generations — an index fetched from the old bucket, a file
   404ing on the new — for one resolve cycle; install-level retry heals it.
 - **A write landed on a non-preferred bucket** during a deviation window
   reaches the other buckets within a marker-drain interval, not instantly.
   Bounded, never stranded.
 
-## 12. Implementation plan
+## 12. Implementation map
 
-Phases ship independently; each is valuable before the next lands.
+- **P0 — plumbing**: repeatable S3 bucket config, backend construction, and
+  topology stamps.
+- **P1 — pin-at-entry**: every operation captures one immutable storage handle
+  plus selection generation; caches are generation-tagged.
+- **P2/P2.5 — data-plane hardening**: nonce-bearing origin CAS, pre-commit
+  mirror fences, audit-only empty-claim reclamation, tombstones, delete-race
+  fencing, and the checked origin-release command.
+- **P3 — replicator**: pre-ack durable markers, post-ack eager fan-out,
+  lease-independent all-bucket marker sweeps, crash-resumable package staging
+  for mirror→private demotion, and a two-pass sequential full-diff backstop using the
+  merge rules in §6.
+- **P4 — selection**: real-traffic health observations, bounded topology-stamp
+  GET probes, asymmetric hysteresis, generation-safe switching, warm-bucket index
+  workers, runtime topology validation, and the topology migration command.
+- **P5 — proof and operations**: two- and three-bucket blackbox coverage,
+  Prometheus health/replication/fence metrics, and the user manual.
 
-- **P0 — plumbing**: repeatable bucket config; construct all backends;
-  topology stamps. No behavior change with one bucket.
-- **P1 — pin-at-entry**: every `state.storage` consumer captures once at
-  operation entry; generation-tagged caches. Wide but mechanical; the
-  proxy's mid-transaction re-reads are the known hot spot.
-- **P2 — data-plane hardening** (all of it also fixes latent single-bucket
-  races): per-artifact `origin` + `yank-epoch` sidecar fields; origin CAS +
-  generation fencing (proxy pre-commit re-check, conditional
-  `release_empty_claim`); tombstones + reuse-after-delete ban.
-- **P3 — replicator**: eager upload-time fan-out + `_repl/` todo markers +
-  full-diff backstop (private-only, claims-fast, sidecar-first,
-  sha256-verified); reconcile mode is the same job with merge rules armed.
-  At this point a second bucket is a warm, continuously verified DR copy —
-  shippable value before P4's selection machinery exists.
-- **P4 — selection**: per-bucket health views, strict error
-  classification, asymmetric leave/return hysteresis, generation bump on
-  switch, audit-on-selection, topology stamps + `buckets migrate`.
-- **P5 — proof**: blackbox matrix on two + three MinIOs — partition/heal,
-  selection switch under upload storm, cross-bucket duplicate
-  conflict-freeze, demotion race (proxy fill vs private upload vs merge),
-  tombstone convergence, yank-epoch convergence, straggler-write delivery
-  via markers after drift-back, marker drain after extended replica
-  outage, preferred-bucket flap (selections must settle, service must
-  never oscillate), cold-start under partition (divergence merges;
-  reserved private names stay protected). Docs: configuration.md knobs +
-  a user-manual page written outcome-first ("give pypiron two buckets in
-  different regions and it survives either one dying").
+## 13. Fixed v1 boundaries
 
-## 13. Open questions
-
-- Per-bucket region/endpoint syntax (`region:bucket`? auto-discover via
-  GetBucketLocation?) and whether mixed providers (S3 + GCS) are v1 or
-  later.
-- Per-bucket credentials — S3 creds are env-global today; needs config
-  plumbing if customers want distinct principals per bucket.
-- Replication cadence knobs and the fast-tick interval for claims.
-- Alarm surface for frozen conflicts (log+metric now; webhook later?).
-- Leave/return hysteresis defaults (seconds to leave, minutes to return) —
-  tune against the flap blackbox test.
+- S3 only. `name@region` is the per-bucket region syntax.
+- One credential chain and one endpoint for the ordered list. Per-bucket
+  credentials and mixed providers are later features, not hidden config.
+- Replication markers and health probes use `--worker-interval-secs`; the full
+  diff uses `--reconcile-interval-secs`. No second cadence surface.
+- Frozen conflicts alarm through logs and
+  `pypiron_replication_freezes_total`. Webhooks are outside v1.
+- Leave/return defaults are 3 failures and 300 healthy seconds.

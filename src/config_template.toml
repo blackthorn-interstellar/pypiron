@@ -92,7 +92,9 @@
 
 # Worker and multi-node tuning — the defaults are right for most deployments.
 # worker-interval-secs = 1                  # cadence for noticing peer nodes' writes
-# intent-grace-secs = 900                   # grace before a stalled upload's rebuild proceeds
+# bucket-leave-failures = 3                 # consecutive timeout/connect/5xx failures before switching
+# bucket-return-healthy-secs = 300           # stable recovery required before returning to a preferred bucket
+# intent-grace-secs = 900                   # upload/replication crash grace; range 3..9223372036854775807
 # audit-on-boot = true                      # self-heal sweep when a node becomes leader
 # reconcile-interval-secs = 86400           # audit sweep interval (an unchanged corpus is ~free)
 # lease-ttl-secs = 30                       # leader lease TTL (multi-node S3)

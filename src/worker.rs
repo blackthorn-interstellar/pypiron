@@ -20,7 +20,8 @@
 //! upgraded node drains what an old node wrote.
 
 use std::{
-    collections::HashSet,
+    collections::{hash_map::RandomState, HashSet},
+    hash::{BuildHasher, Hasher},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -30,7 +31,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::{error, info, warn};
 
 use crate::lease::LeaseManager;
@@ -40,8 +41,8 @@ use crate::render::{
     SIMPLE_HTML_CONTENT_TYPE, SIMPLE_JSON_CONTENT_TYPE,
 };
 use crate::sidecar::{
-    is_artifact, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, PROVENANCE_SUFFIX, SIDECAR_SUFFIX,
-    TOMBSTONE_SUFFIX,
+    is_artifact, sidecar_key, Sidecar, Yanked, FROZEN_SUFFIX, METADATA_SUFFIX, PROVENANCE_SUFFIX,
+    SIDECAR_SUFFIX, TOMBSTONE_SUFFIX,
 };
 use crate::storage::{is_not_found, FileEntry, ObjectMeta, Storage};
 use crate::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
@@ -53,20 +54,36 @@ use crate::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 /// sidecars are sub-KB objects, far below any S3 prefix limit.
 const SIDECAR_READ_CONCURRENCY: usize = 64;
 const PACKAGE_SWEEP_CONCURRENCY: usize = 8;
+/// Bound health-only storage calls independently of the object-store client's
+/// retry budget. A blackholed bucket must contribute one failure per worker
+/// cycle, not one failure after minutes of SDK retries.
+const BUCKET_HEALTH_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 const INTENT_SUFFIX: &str = ".intent";
 const COMMIT_SUFFIX: &str = ".commit";
 
-/// Unique per-event marker id: wall nanos + pid + process-local counter.
-/// Uniqueness is what makes delete-after-rebuild race-free.
-fn marker_nonce() -> String {
+/// Unique per-event marker id: wall nanos + pid + process-local counter +
+/// per-call randomized entropy. The deterministic fields make logs useful;
+/// entropy prevents two processes with the same pid and clock from claiming
+/// the same correctness-critical marker identity. Shared with the replicator's
+/// `_repl/` markers (src/replicate.rs), which reuse the idiom.
+pub(crate) fn marker_nonce() -> String {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{nanos}-{}-{seq}", std::process::id())
+    let pid = std::process::id();
+    let entropy = |domain: u64| {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u128(nanos);
+        hasher.write_u32(pid);
+        hasher.write_u64(seq);
+        hasher.write_u64(domain);
+        hasher.finish()
+    };
+    format!("{nanos}-{pid}-{seq}-{:016x}{:016x}", entropy(0), entropy(1))
 }
 
 /// Declare "I am about to change truth for `pkg`". Returns the nonce the
@@ -74,13 +91,27 @@ fn marker_nonce() -> String {
 /// worker rebuilds anyway after the grace period.
 pub async fn mark_intent(storage: &dyn Storage, pkg: &str) -> Result<String> {
     let nonce = marker_nonce();
-    put_marker(storage, pkg, &nonce, INTENT_SUFFIX).await?;
+    mark_intent_with_nonce(storage, pkg, &nonce).await?;
     Ok(nonce)
+}
+
+pub(crate) async fn mark_intent_with_nonce(
+    storage: &dyn Storage,
+    pkg: &str,
+    nonce: &str,
+) -> Result<()> {
+    put_marker(storage, pkg, nonce, INTENT_SUFFIX).await
 }
 
 /// Declare "truth changed for `pkg`": rebuild as soon as possible.
 pub async fn mark_commit(storage: &dyn Storage, pkg: &str, nonce: &str) -> Result<()> {
     put_marker(storage, pkg, nonce, COMMIT_SUFFIX).await
+}
+
+pub(crate) async fn clear_intent(storage: &dyn Storage, pkg: &str, nonce: &str) -> Result<()> {
+    storage
+        .delete_keys(&[format!("{DIRTY_PREFIX}{pkg}!{nonce}{INTENT_SUFFIX}")])
+        .await
 }
 
 /// Write an empty event marker `_dirty/<pkg>!<nonce><suffix>`.
@@ -107,6 +138,12 @@ struct Marker {
     is_commit: bool,
     /// Storage last-modified — staleness comes from the storage clock.
     written_at: Option<time::OffsetDateTime>,
+}
+
+struct DirtyWork {
+    package: String,
+    keys: Vec<String>,
+    stale_intents: u64,
 }
 
 /// Split a marker key into (package, marker). Legacy `_dirty/<pkg>` keys
@@ -146,20 +183,521 @@ fn parse_marker(entry: &FileEntry) -> Option<(String, Marker)> {
     ))
 }
 
+/// Group dirty events by package and select exactly the markers safe to
+/// consume now. Both the selected-bucket tick and warm-bucket drain use this
+/// transaction-log rule: any fresh unpaired intent defers the whole package;
+/// otherwise commits and paired intents are ready immediately, while stale
+/// unpaired intents heal a crashed writer.
+fn consumable_dirty_work(
+    entries: &[FileEntry],
+    now: time::OffsetDateTime,
+    intent_grace: time::Duration,
+) -> Vec<DirtyWork> {
+    let mut per_pkg: std::collections::HashMap<String, Vec<Marker>> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        if let Some((pkg, marker)) = parse_marker(entry) {
+            per_pkg.entry(pkg).or_default().push(marker);
+        }
+    }
+
+    let mut work = Vec::new();
+    for (package, markers) in per_pkg {
+        let commit_nonces: HashSet<&str> = markers
+            .iter()
+            .filter(|marker| marker.is_commit)
+            .filter_map(|marker| marker.nonce.as_deref())
+            .collect();
+        let mut stale_intents = 0;
+        let mut fresh_unpaired = false;
+        for marker in markers.iter().filter(|marker| !marker.is_commit) {
+            let paired = marker
+                .nonce
+                .as_deref()
+                .is_some_and(|nonce| commit_nonces.contains(nonce));
+            if paired {
+                continue;
+            }
+            let stale = marker
+                .written_at
+                .is_some_and(|written_at| now - written_at >= intent_grace);
+            if stale {
+                stale_intents += 1;
+            } else {
+                fresh_unpaired = true;
+                break;
+            }
+        }
+        if fresh_unpaired {
+            continue;
+        }
+        work.push(DirtyWork {
+            package,
+            keys: markers.into_iter().map(|marker| marker.key).collect(),
+            stale_intents,
+        });
+    }
+    work
+}
+
+fn topology_availability_error(_index: usize, error: &anyhow::Error) -> bool {
+    crate::bucket_health::classify(crate::observed_storage::signal_for_error(error))
+        == crate::bucket_health::SignalClass::AvailabilityFailure
+}
+
+/// Probe every bucket concurrently on the dedicated health loop. Probing the
+/// selected bucket is what bounds idle-node failover even when the ordinary
+/// worker is busy in a long index/counter operation; this loop is multi-only.
+async fn probe_buckets(state: &AppState) {
+    let probes = state
+        .buckets
+        .handles()
+        .iter()
+        .enumerate()
+        .map(|(index, handle)| {
+            async move {
+                match timeout(
+                    BUCKET_HEALTH_IO_TIMEOUT,
+                    // S3 reports a missing object and a missing bucket as the
+                    // same body-less 404 to HEAD. GET the tiny, guaranteed
+                    // multi-bucket topology stamp so NoSuchBucket retains its
+                    // typed response body and cannot look healthy.
+                    handle
+                        .storage
+                        .get_with_etag(crate::buckets::TOPOLOGY_STAMP_KEY),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        let signal = crate::observed_storage::signal_for_error(&error);
+                        match crate::bucket_health::classify(signal) {
+                            crate::bucket_health::SignalClass::AvailabilityFailure => {
+                                warn!(bucket=%handle.name, error=?error, "bucket health probe failed")
+                            }
+                            crate::bucket_health::SignalClass::Ignored => {
+                                error!(bucket=%handle.name, error=?error, "bucket health probe alarm (selection unchanged)")
+                            }
+                            crate::bucket_health::SignalClass::Healthy => {}
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(health) = &state.bucket_health {
+                            let _ = health.observe(
+                                index,
+                                crate::bucket_health::BucketSignal::Timeout,
+                            );
+                        }
+                        warn!(bucket=%handle.name, timeout_ms=BUCKET_HEALTH_IO_TIMEOUT.as_millis(), "bucket health probe timed out");
+                    }
+                }
+            }
+        });
+    futures::future::join_all(probes).await;
+}
+
+/// Availability selection has its own loop so no unrelated worker I/O can
+/// delay it. Requests continue pinning the switched `BucketSet` immediately;
+/// the index worker notices the generation on its next safe boundary.
+async fn run_bucket_health_until(
+    state: Arc<AppState>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        probe_buckets(&state).await;
+        maintain_bucket_selection(&state).await;
+        tokio::select! {
+            _ = sleep(state.worker_interval) => {}
+            _ = shutdown.changed() => break,
+        }
+    }
+}
+
+/// Check a bucket-local lease without inheriting a cloud SDK's multi-minute
+/// retry budget. `ObservedStorage` records completed calls; a cancelled timeout
+/// is recorded here because the wrapper never sees a result.
+async fn bounded_lease_check(state: &AppState, bucket: usize, lease: &LeaseManager) -> bool {
+    match timeout(BUCKET_HEALTH_IO_TIMEOUT, lease.is_leader()).await {
+        Ok(is_leader) => is_leader,
+        Err(_) => {
+            if let Some(health) = &state.bucket_health {
+                let _ = health.observe(bucket, crate::bucket_health::BucketSignal::Timeout);
+            }
+            warn!(
+                bucket = %state.buckets.handles()[bucket].name,
+                timeout_ms = BUCKET_HEALTH_IO_TIMEOUT.as_millis(),
+                "bucket lease check timed out"
+            );
+            false
+        }
+    }
+}
+
+async fn wait_until_bucket_ineligible(state: &AppState, index: usize) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if state
+            .bucket_health
+            .as_ref()
+            .is_some_and(|health| !health.bucket_eligible(index).unwrap_or(false))
+        {
+            return;
+        }
+    }
+}
+
+async fn wait_until_generation_changes(state: &AppState, generation: u64) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if state.pin().generation != generation {
+            return;
+        }
+    }
+}
+
+/// Validate recovered buckets' topology and apply at most one coalesced
+/// selection change. Entirely dormant in single-bucket mode.
+async fn maintain_bucket_selection(state: &Arc<AppState>) -> bool {
+    let Some(health) = &state.bucket_health else {
+        return false;
+    };
+    let mut snapshot = health.worker_tick();
+    for (index, alarms) in snapshot.alarms.iter().copied().enumerate() {
+        if alarms > 0 {
+            error!(bucket=%state.buckets.handles()[index].name, alarms, "bucket configuration/auth alarms (selection unchanged)");
+        }
+    }
+
+    // A selection candidate is usable only after its topology has been
+    // revalidated. Availability failures may recover on a later tick; a
+    // topology mismatch additionally raises the sticky write fence, but must
+    // also keep reads and presigns on the last validated bucket.
+    let mut selection_blocked = HashSet::new();
+    for index in &snapshot.topology_revalidation {
+        let verification = timeout(
+            BUCKET_HEALTH_IO_TIMEOUT,
+            state
+                .buckets
+                .verify_topology_index_with(*index, topology_availability_error),
+        )
+        .await;
+        match verification {
+            Err(_) => {
+                let _ = health.observe(*index, crate::bucket_health::BucketSignal::Timeout);
+                selection_blocked.insert(*index);
+                warn!(bucket=%state.buckets.handles()[*index].name, "bucket topology revalidation timed out");
+            }
+            Ok(Ok(crate::buckets::TopologyIndexStatus::Unreachable)) => {
+                selection_blocked.insert(*index);
+            }
+            Ok(Ok(_)) => {
+                if let Err(error) = health.topology_revalidated(*index) {
+                    error!(bucket=*index, error=%error, "could not acknowledge topology validation");
+                }
+            }
+            Ok(Err(error)) => {
+                // A healed partition exposed a differently stamped deployment.
+                // Reads stay available, but accepting new writes would turn a
+                // configuration error into continuous divergence.
+                state
+                    .writes_fenced
+                    .store(true, std::sync::atomic::Ordering::Release);
+                selection_blocked.insert(*index);
+                error!(bucket=*index, error=?error, "runtime bucket topology mismatch; writes fenced");
+            }
+        }
+    }
+
+    let mut changed = false;
+    if let Some(change) = snapshot.selection_change {
+        if !selection_blocked.contains(&change.to) {
+            let next = state.buckets.switch(change.to);
+            if let Err(error) = health.selection_applied(change.to) {
+                error!(bucket=change.to, error=%error, "could not acknowledge bucket selection");
+            } else {
+                // These caches describe the selected bucket, not the process.
+                // Index and presign caches clear through their generation tags;
+                // reset the remaining selected-bucket views explicitly.
+                *state.global_names.lock().await = None;
+                *state.inventory.lock().await = InventoryMap::default();
+                state.empty_origin_observations.lock().await.clear();
+                info!(
+                    from = %state.buckets.handles()[change.from].name,
+                    to = %state.buckets.handles()[change.to].name,
+                    generation = next.generation,
+                    "selected bucket changed"
+                );
+                changed = true;
+            }
+        }
+    }
+    let applied = state.pin();
+    snapshot.selected_index = applied.index;
+    let names: Vec<String> = state
+        .buckets
+        .handles()
+        .iter()
+        .map(|handle| handle.name.clone())
+        .collect();
+    state.metrics.update_bucket_health(
+        &snapshot,
+        &names,
+        applied.generation,
+        state
+            .writes_fenced
+            .load(std::sync::atomic::Ordering::Acquire),
+    );
+    changed
+}
+
+/// Whether `pkg` has an unpaired intent still inside the storage-clock grace
+/// window. A missing/malformed storage timestamp is conservatively live. The
+/// key prefix keeps this O(markers-for-one-package), not O(all markers).
+async fn has_live_intent(state: &AppState, storage: &dyn Storage, pkg: &str) -> Result<bool> {
+    Ok(stale_unpaired_intents(state, storage, pkg).await?.is_none())
+}
+
+/// Whether any writer intent still lacks its matching commit, regardless of
+/// age. Replication promotion uses the stronger form: once an intent goes stale
+/// the audit must first heal its crash shape before staged truth may classify or
+/// replace anything in that package.
+pub(crate) async fn has_unpaired_intent_ignoring(
+    storage: &dyn Storage,
+    pkg: &str,
+    ignored_nonce: Option<&str>,
+) -> Result<bool> {
+    let prefix = format!("{DIRTY_PREFIX}{pkg}!");
+    let entries = storage.list_all(&prefix).await?;
+    let commits: HashSet<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .key
+                .strip_prefix(&prefix)?
+                .strip_suffix(COMMIT_SUFFIX)
+                .map(str::to_string)
+        })
+        .collect();
+    Ok(entries.iter().any(|entry| {
+        entry
+            .key
+            .strip_prefix(&prefix)
+            .and_then(|event| event.strip_suffix(INTENT_SUFFIX))
+            .is_some_and(|nonce| {
+                !intent_is_ignored(nonce, ignored_nonce) && !commits.contains(nonce)
+            })
+    }))
+}
+
+/// Classify every unpaired intent by storage `last_modified`. `None` means at
+/// least one writer is still fresh (or lacks a trustworthy storage timestamp
+/// and is therefore conservatively live). `Some(keys)` contains only stale
+/// intent keys safe for a pending owner to consume before healing the crash
+/// shape. Storage time, not a writer nonce clock, keeps skewed nodes safe.
+pub(crate) async fn stale_unpaired_intents(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+) -> Result<Option<Vec<String>>> {
+    stale_unpaired_intents_ignoring(state, storage, pkg, None).await
+}
+
+pub(crate) async fn stale_unpaired_intents_ignoring(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    ignored_nonce: Option<&str>,
+) -> Result<Option<Vec<String>>> {
+    let prefix = format!("{DIRTY_PREFIX}{pkg}!");
+    let entries = storage.list_dir_entries(DIRTY_PREFIX).await?;
+    let commits: HashSet<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .key
+                .strip_prefix(&prefix)?
+                .strip_suffix(COMMIT_SUFFIX)
+                .map(str::to_string)
+        })
+        .collect();
+    let now = time::OffsetDateTime::now_utc();
+    let mut stale = Vec::new();
+    for entry in &entries {
+        let Some(nonce) = entry
+            .key
+            .strip_prefix(&prefix)
+            .and_then(|event| event.strip_suffix(INTENT_SUFFIX))
+        else {
+            continue;
+        };
+        if intent_is_ignored(nonce, ignored_nonce) {
+            continue;
+        }
+        if commits.contains(nonce) {
+            continue;
+        }
+        let Some(written) = entry.last_modified.as_deref().and_then(|raw| {
+            time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).ok()
+        }) else {
+            return Ok(None);
+        };
+        if now - written < state.intent_grace {
+            return Ok(None);
+        }
+        stale.push(entry.key.clone());
+    }
+    Ok(Some(stale))
+}
+
+fn intent_is_ignored(nonce: &str, ignored_root: Option<&str>) -> bool {
+    ignored_root.is_some_and(|root| {
+        nonce == root
+            || nonce
+                .strip_prefix(root)
+                .is_some_and(|suffix| suffix.starts_with('~'))
+    })
+}
+
+/// Whether one exact intent still proves a live lock holder. Missing and paired
+/// markers are inactive; a malformed/missing storage timestamp is live rather
+/// than an excuse to steal. Promotion-lock takeover additionally requires an
+/// unchanged lock ETag for the same grace window.
+pub(crate) async fn specific_intent_is_live(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    nonce: &str,
+) -> Result<bool> {
+    let prefix = format!("{DIRTY_PREFIX}{pkg}!");
+    let entries = storage.list_dir_entries(DIRTY_PREFIX).await?;
+    let commits: HashSet<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .key
+                .strip_prefix(&prefix)?
+                .strip_suffix(COMMIT_SUFFIX)
+                .map(str::to_string)
+        })
+        .collect();
+    let now = time::OffsetDateTime::now_utc();
+    for intent in &entries {
+        let Some(member) = intent
+            .key
+            .strip_prefix(&prefix)
+            .and_then(|event| event.strip_suffix(INTENT_SUFFIX))
+        else {
+            continue;
+        };
+        if !intent_is_ignored(member, Some(nonce)) || commits.contains(member) {
+            continue;
+        }
+        let Some(written) = intent.last_modified.as_deref().and_then(|raw| {
+            time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).ok()
+        }) else {
+            return Ok(true);
+        };
+        if now - written < state.intent_grace {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Reclaim an empty mirror claim only after two audit observations of the same
+/// nonce-bearing claim version separated by the intent grace. The proxy failure
+/// path deliberately does not release claims: only the leader audit has enough
+/// evidence to distinguish an orphan from a slow live writer.
+async fn reclaim_empty_mirror_claim(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    generation: u64,
+) -> Result<()> {
+    let key = (generation, pkg.to_string());
+    let Some(observed) = crate::origin::read_origin_observation(storage, pkg).await? else {
+        state.empty_origin_observations.lock().await.remove(&key);
+        return Ok(());
+    };
+    if observed.state != crate::origin::OriginState::Mirror {
+        state.empty_origin_observations.lock().await.remove(&key);
+        return Ok(());
+    }
+    if crate::origin::package_has_truth(storage, pkg).await?
+        || has_live_intent(state, storage, pkg).await?
+        || crate::replicate::has_committed_stage(storage, pkg).await?
+    {
+        state.empty_origin_observations.lock().await.remove(&key);
+        return Ok(());
+    }
+
+    let now = Instant::now();
+    let grace = std::time::Duration::from_secs(state.intent_grace.whole_seconds().max(0) as u64);
+    let ready = {
+        let mut observations = state.empty_origin_observations.lock().await;
+        match observations.get(&key) {
+            Some((etag, first)) if etag == &observed.etag => now.duration_since(*first) >= grace,
+            _ => {
+                observations.insert(key.clone(), (observed.etag.clone(), now));
+                false
+            }
+        }
+    };
+    if !ready {
+        return Ok(());
+    }
+
+    // Re-check intents immediately before consuming the exact claim version.
+    if has_live_intent(state, storage, pkg).await?
+        || crate::replicate::has_committed_stage(storage, pkg).await?
+    {
+        state.empty_origin_observations.lock().await.remove(&key);
+        return Ok(());
+    }
+    let released = crate::origin::release_observed_empty_mirror(storage, pkg, &observed).await?;
+    state.empty_origin_observations.lock().await.remove(&key);
+    let Some(unclaimed) = released else {
+        return Ok(());
+    };
+
+    // A writer can appear between the final list and the CAS. Re-list after the
+    // release; if anything appeared, immediately reclaim mirror with a fresh
+    // nonce. A concurrent private claim still wins and is never overwritten.
+    let appeared = crate::origin::package_has_truth(storage, pkg).await?
+        || has_live_intent(state, storage, pkg).await?
+        || crate::replicate::has_committed_stage(storage, pkg).await?;
+    if appeared {
+        let claim = crate::origin::claim_origin(
+            storage,
+            pkg,
+            crate::origin::ClaimRequest::new(crate::origin::MIRROR, Some(&unclaimed)),
+        )
+        .await?;
+        if claim.owner != crate::origin::MIRROR {
+            warn!(package=%pkg, owner=%claim.owner, "empty mirror claim changed while audit reverted a raced release");
+        }
+    }
+    Ok(())
+}
+
 pub async fn run_worker_until(
     state: Arc<AppState>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let health_task = state
+        .buckets
+        .is_multi()
+        .then(|| tokio::spawn(run_bucket_health_until(state.clone(), shutdown.clone())));
     // Only the index writer is singular, and only as a cost optimization:
     // rebuilds are idempotent, so the lease is sloppy. Disk is single-node
     // and skips leasing entirely.
-    // P4: becomes per-bucket/per-selection. The lease is pinned to bucket-0 at
-    // worker start for its whole life; generation cannot change until P4 wires
-    // switch(), so this is currently equivalent to pinning per tick.
-    let lease_storage = state.pin().storage.clone();
-    let lease = lease_storage
-        .supports_leases()
-        .then(|| LeaseManager::new(lease_storage.clone(), state.lease_ttl));
+    // Leadership is bucket-local. A selection generation change releases the
+    // old lease and constructs a manager on the new bucket before any leader
+    // work proceeds; authority never crosses buckets.
+    let mut lease: Option<LeaseManager> = None;
+    let mut warm_leases: Vec<Option<LeaseManager>> =
+        (0..state.buckets.len()).map(|_| None).collect();
+    let mut authority_generation = None;
 
     // Markers are the primary freshness mechanism; the audit is the safety
     // net for what events cannot see (restores, out-of-band storage changes,
@@ -179,6 +717,10 @@ pub async fn run_worker_until(
     // no matter how the interval is configured relative to corpus size.
     let last_audit_secs = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sweep_running = Arc::new(AtomicBool::new(false));
+    let reconcile_running = Arc::new(AtomicBool::new(false));
+    let replication_running = Arc::new(AtomicBool::new(false));
+    let stage_recovery_running = Arc::new(AtomicBool::new(false));
+    let warm_running = Arc::new(AtomicBool::new(false));
     // Clears the in-flight flag on drop — including a panic unwind inside the
     // spawned audit. Without it, a panicking sweep leaves the flag stuck `true`
     // and no further sweep is ever scheduled, silently disabling self-healing.
@@ -191,10 +733,59 @@ pub async fn run_worker_until(
     let mut last_inventory_refresh: Option<Instant> = None;
     let mut last_counter_flush: Option<Instant> = None;
     let mut last_counter_compact: Option<Instant> = None;
+    let mut last_bucket_maintenance: Option<Instant> = None;
+    let mut last_reconcile: Option<Instant> = if state.audit_on_boot {
+        None
+    } else {
+        Some(Instant::now())
+    };
     loop {
+        // Nudges make selected-bucket indexes visible quickly, but must not
+        // multiply the documented multi-bucket probe/LIST cadence. All periodic
+        // bucket maintenance shares this independent minimum interval.
+        let bucket_maintenance_due = state.buckets.is_multi()
+            && last_bucket_maintenance.is_none_or(|t| t.elapsed() >= state.worker_interval);
+        if bucket_maintenance_due {
+            last_bucket_maintenance = Some(Instant::now());
+        }
+        let selected = state.pin();
+        if authority_generation != Some(selected.generation) {
+            if authority_generation.is_some() {
+                // The leader on the newly selected bucket must audit its own
+                // views and refresh bucket-local inventory.
+                last_audit = None;
+                last_reconcile = None;
+                last_inventory_refresh = None;
+            }
+            if let Some(old) = lease.take() {
+                tokio::spawn(async move { old.release().await });
+            }
+            for slot in &mut warm_leases {
+                if let Some(old) = slot.take() {
+                    tokio::spawn(async move { old.release().await });
+                }
+            }
+            authority_generation = Some(selected.generation);
+            if selected.storage.supports_leases() {
+                lease = Some(LeaseManager::new(
+                    selected.storage.clone(),
+                    state.lease_ttl,
+                    selected.generation,
+                ));
+            }
+            for (index, handle) in state.buckets.handles().iter().enumerate() {
+                if index != selected.index && handle.storage.supports_leases() {
+                    warm_leases[index] = Some(LeaseManager::new(
+                        handle.storage.clone(),
+                        state.lease_ttl,
+                        selected.generation,
+                    ));
+                }
+            }
+        }
         let is_leader = match &lease {
             None => true,
-            Some(lm) => lm.is_leader().await,
+            Some(lm) => bounded_lease_check(&state, selected.index, lm).await,
         };
         // Refresh the in-memory inventory from the persisted view ONCE on boot
         // (a starting display, including a restart's last-known value), then
@@ -206,7 +797,10 @@ pub async fn run_worker_until(
             .is_none_or(|t| !is_leader && t.elapsed() >= INVENTORY_REFRESH_INTERVAL);
         if due_refresh {
             last_inventory_refresh = Some(Instant::now());
-            refresh_inventory(&state).await;
+            tokio::select! {
+                _ = refresh_inventory(&state) => {}
+                _ = wait_until_generation_changes(&state, selected.generation) => {}
+            }
         }
         // Counter flush (EVERY node, not leader-gated): drain the in-memory
         // download buffer to this node's own immutable segment. Best-effort;
@@ -215,7 +809,103 @@ pub async fn run_worker_until(
             || state.counters.flush_due()
         {
             last_counter_flush = Some(Instant::now());
-            state.counters.flush().await;
+            tokio::select! {
+                _ = state.counters.flush() => {}
+                _ = wait_until_generation_changes(&state, selected.generation) => {}
+            }
+        }
+
+        // Replication is correctness work, not selected-bucket leader work.
+        // Every node may attempt it; all writes are conditional/idempotent. A
+        // node that can reach a destination must not sit idle merely because a
+        // different node holds the selected bucket's index lease.
+        if bucket_maintenance_due && !replication_running.swap(true, Ordering::SeqCst) {
+            let state = state.clone();
+            let guard = SweepGuard(replication_running.clone());
+            tokio::spawn(async move {
+                let _guard = guard;
+                if let Err(e) = crate::replicate::sweep_all_markers(&state).await {
+                    error!(error=?e, "replicate: marker sweep failed");
+                }
+            });
+        }
+        // Stage recovery has its own task so a blackholed bucket cannot delay
+        // marker delivery or backlog publication between healthy buckets.
+        if bucket_maintenance_due && !stage_recovery_running.swap(true, Ordering::SeqCst) {
+            let state = state.clone();
+            let guard = SweepGuard(stage_recovery_running.clone());
+            tokio::spawn(async move {
+                let _guard = guard;
+                if let Err(e) = crate::replicate::resume_staged_packages(&state).await {
+                    error!(error=?e, "replicate: staged package recovery failed");
+                }
+            });
+        }
+
+        // Rebuild each warm copy's own indexes. Each bucket-local lease keeps
+        // duplicate work cheap, but selected-bucket leadership is irrelevant:
+        // another node may be the only one with a working path to this bucket.
+        if bucket_maintenance_due && !warm_running.swap(true, Ordering::SeqCst) {
+            let state = state.clone();
+            let leases = warm_leases.clone();
+            let selected_index = selected.index;
+            let guard = SweepGuard(warm_running.clone());
+            tokio::spawn(async move {
+                let _guard = guard;
+                let jobs = state
+                    .buckets
+                    .handles()
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| *idx != selected_index)
+                    .filter(|(idx, _)| {
+                        state.bucket_health.as_ref().is_none_or(|health| {
+                            health.bucket_eligible(*idx).unwrap_or(false)
+                        })
+                    })
+                    .map(|(idx, handle)| {
+                        let lease = leases[idx].clone();
+                        let job_state = state.clone();
+                        async move {
+                            if job_state.mutations_fenced() {
+                                return;
+                            }
+                            if let Some(lease) = &lease {
+                                if !bounded_lease_check(&job_state, idx, lease).await {
+                                    return;
+                                }
+                            }
+                            let result = tokio::select! {
+                                result = drain_dirty_uncached(&job_state, handle.storage.as_ref()) => result,
+                                _ = wait_until_bucket_ineligible(&job_state, idx) => {
+                                    Err(anyhow!("warm bucket became topology-ineligible"))
+                                }
+                            };
+                            if let Err(e) = result {
+                                error!(bucket=%handle.name, error=?e, "replicate: destination drain failed");
+                            }
+                        }
+                    });
+                futures::future::join_all(jobs).await;
+            });
+        }
+
+        // The lost-marker backstop is likewise safe to duplicate. Run it on
+        // every node so one lease holder's asymmetric network path cannot make
+        // another node's healthy path useless.
+        let reconcile_due = state.buckets.is_multi()
+            && last_reconcile.is_none_or(|t| t.elapsed() >= state.reconcile_interval);
+        if reconcile_due && !reconcile_running.swap(true, Ordering::SeqCst) {
+            last_reconcile = Some(Instant::now());
+            let state = state.clone();
+            let pinned = selected.clone();
+            let guard = SweepGuard(reconcile_running.clone());
+            tokio::spawn(async move {
+                let _guard = guard;
+                if let Err(e) = crate::replicate::reconcile(&state, &pinned).await {
+                    error!(error=?e, "reconcile failed");
+                }
+            });
         }
         if is_leader {
             let spacing = state.reconcile_interval.max(std::time::Duration::from_secs(
@@ -225,6 +915,11 @@ pub async fn run_worker_until(
             if due && !sweep_running.swap(true, Ordering::SeqCst) {
                 last_audit = Some(Instant::now());
                 let state = state.clone();
+                // This is the exact bucket/generation whose lease authorized the
+                // audit. The health task may switch selection before the spawned
+                // task starts; never re-pin onto that new bucket under the old
+                // bucket's lease.
+                let pinned = selected.clone();
                 let duration_out = last_audit_secs.clone();
                 let guard = SweepGuard(sweep_running.clone());
                 tokio::spawn(async move {
@@ -233,11 +928,15 @@ pub async fn run_worker_until(
                     // isn't dropped immediately.
                     let _guard = guard;
                     let started = Instant::now();
-                    // Pin once at spawn; the whole audit run reads and writes
-                    // against this one handle (design §3).
-                    let pinned = state.pin();
-                    if let Err(e) = audit(&state, pinned.storage.as_ref(), false).await {
-                        error!(error=?e, "audit failed");
+                    tokio::select! {
+                        result = audit(&state, &pinned, false) => {
+                            if let Err(e) = result {
+                                error!(error=?e, "audit failed");
+                            }
+                        }
+                        _ = wait_until_generation_changes(&state, pinned.generation) => {
+                            warn!(generation=pinned.generation, "audit cancelled after bucket selection changed");
+                        }
                     }
                     duration_out.store(started.elapsed().as_secs(), Ordering::Relaxed);
                 });
@@ -250,7 +949,7 @@ pub async fn run_worker_until(
             // Abandoning a rebuild mid-flight is safe: rebuilds are idempotent
             // and the next leader redoes the work.
             let leader_work = async {
-                if let Err(e) = tick(&state).await {
+                if let Err(e) = tick(&state, &selected).await {
                     error!(error=?e, "worker tick failed");
                 }
                 // Counter compaction (LEADER only): freeze finished days into one
@@ -267,6 +966,7 @@ pub async fn run_worker_until(
             };
             tokio::select! {
                 _ = leader_work => {}
+                _ = wait_until_generation_changes(&state, selected.generation) => {}
                 _ = shutdown.changed() => break,
             }
         }
@@ -284,6 +984,13 @@ pub async fn run_worker_until(
     // wait out the lease TTL (a restart used to be a TTL-long write outage).
     if let Some(lm) = &lease {
         lm.release().await;
+    }
+    for lease in warm_leases.into_iter().flatten() {
+        lease.release().await;
+    }
+    if let Some(task) = health_task {
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -360,7 +1067,13 @@ async fn refresh_inventory(state: &AppState) {
 /// the diff gets the deep treatment (sidecar reads, view rewrite, sidecar
 /// backfill, orphan pruning). `force_deep` ignores stored fingerprints and
 /// rebuilds everything — that is `pypiron rebuild-index`.
-pub async fn audit(state: &AppState, storage: &dyn Storage, force_deep: bool) -> Result<()> {
+pub async fn audit(
+    state: &AppState,
+    pinned: &crate::buckets::Pinned,
+    force_deep: bool,
+) -> Result<()> {
+    let storage = pinned.storage.as_ref();
+    let generation = pinned.generation;
     let started = Instant::now();
     let mut live: Vec<String> = Vec::new();
     let mut dead: Vec<String> = Vec::new();
@@ -376,7 +1089,7 @@ pub async fn audit(state: &AppState, storage: &dyn Storage, force_deep: bool) ->
     for chunk in crate::storage::SHARD_CHARS.chunks(SHARD_CONCURRENCY) {
         let audits = chunk
             .iter()
-            .map(|shard| audit_shard(state, storage, *shard, force_deep));
+            .map(|shard| audit_shard(state, storage, generation, *shard, force_deep));
         for (shard, result) in chunk.iter().zip(futures::future::join_all(audits).await) {
             match result {
                 Ok(result) => {
@@ -399,6 +1112,7 @@ pub async fn audit(state: &AppState, storage: &dyn Storage, force_deep: bool) ->
     live.dedup();
     // Delta + CAS, not a blind overwrite: a package born mid-audit (its name
     // added by the tick) must not be clobbered by our older observation.
+    require_generation(state, generation)?;
     update_global_index(state, storage, &live, &dead).await?;
     if failures > 0 {
         return Err(anyhow!("audit finished with {failures} failure(s)"));
@@ -452,6 +1166,7 @@ struct ShardAudit {
 async fn audit_shard(
     state: &AppState,
     storage: &dyn Storage,
+    generation: u64,
     shard: char,
     force_deep: bool,
 ) -> Result<ShardAudit> {
@@ -495,7 +1210,7 @@ async fn audit_shard(
         pkg_stats: Vec::new(),
     };
     let mut fresh: std::collections::HashMap<String, String> = Default::default();
-    let mut packages: Vec<(String, String, bool)> = Vec::with_capacity(by_pkg.len());
+    let mut packages: Vec<(String, String, bool, bool)> = Vec::with_capacity(by_pkg.len());
     for (pkg, (t, v)) in by_pkg {
         let fp = fingerprint(&t, &v);
         // Count artifacts and distinct versions straight off the listing — the
@@ -525,24 +1240,86 @@ async fn audit_shard(
                 },
             ));
         }
-        packages.push((pkg, fp, file_count > 0));
+        let has_package_view = v.iter().any(|object| {
+            object.key.ends_with("/index.json") || object.key.ends_with("/index.html")
+        });
+        packages.push((pkg, fp, file_count > 0, has_package_view));
     }
 
     for chunk in packages.chunks(PACKAGE_SWEEP_CONCURRENCY) {
-        let jobs = chunk.iter().map(|(pkg, fp, has_artifacts)| {
-            let unchanged = stored.get(pkg.as_str()) == Some(fp);
-            let (pkg, fp, has_artifacts) = (pkg.clone(), fp.clone(), *has_artifacts);
+        let jobs = chunk.iter().map(|(pkg, fp, has_artifacts, has_package_view)| {
+            let fingerprint_unchanged = stored.get(pkg.as_str()) == Some(fp);
+            let (pkg, fp, has_artifacts, has_package_view) = (
+                pkg.clone(),
+                fp.clone(),
+                *has_artifacts,
+                *has_package_view,
+            );
             async move {
+                if let Err(e) = require_generation(state, generation) {
+                    error!(package=%pkg, error=?e, "audit: selection changed before package batch");
+                    return (pkg, None, has_artifacts, false, true);
+                }
+                if state.buckets.is_multi() {
+                    match crate::origin::read_origin_observation(storage, &pkg).await {
+                        Ok(Some(observed)) if observed.pending_manifest.is_some() => {
+                            warn!(package=%pkg, "audit: staged promotion owns package; deferring maintenance");
+                            return (pkg, None, has_artifacts, false, true);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!(package=%pkg, error=?e, "audit: origin unreadable; deferring maintenance");
+                            return (pkg, None, has_artifacts, false, true);
+                        }
+                    }
+                }
+                let mut maintenance_failed = false;
+                let mut maintenance_changed = false;
+                if has_artifacts {
+                    state
+                        .empty_origin_observations
+                        .lock()
+                        .await
+                        .remove(&(generation, pkg.clone()));
+                    if state.buckets.is_multi() {
+                        match crate::replicate::quarantine_mirror_artifacts(storage, &pkg).await {
+                            Ok(0) => {}
+                            Ok(count) => {
+                                maintenance_changed = true;
+                                error!(package=%pkg, count, "audit: quarantined mirror artifacts under private claim");
+                            }
+                            Err(e) => {
+                                maintenance_failed = true;
+                                error!(package=%pkg, error=?e, "audit: private-claim quarantine failed");
+                            }
+                        }
+                    }
+                } else if let Err(e) =
+                    reclaim_empty_mirror_claim(state, storage, &pkg, generation).await
+                {
+                    error!(package=%pkg, error=?e, "audit: empty mirror claim proof failed");
+                    maintenance_failed = true;
+                }
+                let unchanged = fingerprint_unchanged && !maintenance_changed;
                 if unchanged {
                     // Provably unchanged since the fingerprint was written.
-                    return (pkg, Some(fp), has_artifacts, false, false);
+                    // Logical liveness follows the materialized package view,
+                    // not physical artifacts: frozen/quarantined canonical
+                    // evidence deliberately stays in `packages/` while dead.
+                    return (
+                        pkg,
+                        Some(fp),
+                        has_package_view,
+                        false,
+                        maintenance_failed,
+                    );
                 }
                 match rebuild_package(state, storage, &pkg).await {
                     Ok(live_now) => {
                         // Fingerprint what the rebuild actually saw/wrote, not
                         // the pre-rebuild listing — two cheap per-package lists.
                         let new_fp = package_fingerprint(storage, &pkg).await.ok();
-                        (pkg, new_fp, live_now, true, false)
+                        (pkg, new_fp, live_now, true, maintenance_failed)
                     }
                     Err(e) => {
                         // Conservative on failure: keep the package listed and
@@ -570,9 +1347,21 @@ async fn audit_shard(
 
     // `fresh` now holds exactly the packages that exist; anything left in
     // `stored` is gone and simply drops out of the rewritten shard.
+    require_generation(state, generation)?;
     let bytes = serde_json::to_vec(&std::collections::BTreeMap::from_iter(fresh.iter()))?;
     put_if_changed(state, storage, &fp_key, bytes, "application/json").await?;
     Ok(out)
+}
+
+fn require_generation(state: &AppState, expected: u64) -> Result<()> {
+    if state.mutations_fenced() {
+        bail!("bucket topology mismatch; audit mutations are fenced");
+    }
+    let current = state.pin().generation;
+    if current != expected {
+        bail!("bucket selection generation changed from {expected} to {current}");
+    }
+    Ok(())
 }
 
 /// The package a key belongs to: first path segment after `prefix`.
@@ -608,67 +1397,21 @@ async fn package_fingerprint(storage: &dyn Storage, pkg: &str) -> Result<String>
     ))
 }
 
-async fn tick(state: &Arc<AppState>) -> Result<()> {
-    // One pin per tick (design §3): every read and write below runs against this
+async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Result<()> {
+    // The caller passes the exact pin whose bucket-local lease authorized this
+    // tick. Selection may change concurrently, but this operation stays on that
     // handle; the per-package rebuilds spawn with an owned clone of it.
-    let pinned = state.pin();
     let storage = pinned.storage.as_ref();
     let entries = storage.list_dir_entries(DIRTY_PREFIX).await?;
     if entries.is_empty() {
         return Ok(());
     }
 
-    // Group events per package and decide what is consumable now.
-    let now = time::OffsetDateTime::now_utc();
-    let mut per_pkg: std::collections::HashMap<String, Vec<Marker>> =
-        std::collections::HashMap::new();
-    for entry in &entries {
-        if let Some((pkg, marker)) = parse_marker(entry) {
-            per_pkg.entry(pkg).or_default().push(marker);
-        }
-    }
-
-    let mut work: Vec<(String, Vec<String>)> = Vec::new();
-    // Per package, how many unpaired-but-stale intents we are about to heal —
-    // counted into the metric only once the rebuild actually consumes them.
-    let mut stale_by_pkg: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    for (pkg, markers) in per_pkg {
-        let commit_nonces: HashSet<&str> = markers
-            .iter()
-            .filter(|m| m.is_commit)
-            .filter_map(|m| m.nonce.as_deref())
-            .collect();
-        let mut stale_healed = 0u64;
-        let consumable: Vec<String> = markers
-            .iter()
-            .filter(|m| {
-                if m.is_commit {
-                    return true;
-                }
-                // Intent: consumable once its commit arrived (the pair is
-                // done) or once it is stale (the writer crashed mid-flight).
-                let paired = m
-                    .nonce
-                    .as_deref()
-                    .is_some_and(|n| commit_nonces.contains(n));
-                let stale = m.written_at.is_none_or(|t| now - t >= state.intent_grace);
-                // A stale, never-committed intent is a crashed writer healing.
-                if !paired && stale {
-                    stale_healed += 1;
-                }
-                paired || stale
-            })
-            .map(|m| m.key.clone())
-            .collect();
-        // Only fresh unpaired intents: a writer is mid-flight; its commit (or
-        // staleness) will bring the package back.
-        if !consumable.is_empty() {
-            if stale_healed > 0 {
-                stale_by_pkg.insert(pkg.clone(), stale_healed);
-            }
-            work.push((pkg, consumable));
-        }
-    }
+    let work = consumable_dirty_work(
+        &entries,
+        time::OffsetDateTime::now_utc(),
+        state.intent_grace,
+    );
     if work.is_empty() {
         return Ok(());
     }
@@ -685,7 +1428,12 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
     // unrelated packages. One failing package must not starve the namespace.
     let semaphore = Arc::new(tokio::sync::Semaphore::new(PACKAGE_SWEEP_CONCURRENCY));
     let mut handles = Vec::with_capacity(work.len());
-    for (pkg, keys) in work {
+    for DirtyWork {
+        package,
+        keys,
+        stale_intents,
+    } in work
+    {
         let state = state.clone();
         let semaphore = semaphore.clone();
         // Move an owned handle into the task — the tick's pin, so every rebuild
@@ -693,14 +1441,14 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
         let storage = pinned.storage.clone();
         handles.push(tokio::spawn(async move {
             let _permit = semaphore.acquire().await;
-            let rebuilt = match rebuild_package(&state, storage.as_ref(), &pkg).await {
+            let rebuilt = match rebuild_package(&state, storage.as_ref(), &package).await {
                 Ok(has_artifacts) => Some(has_artifacts),
                 Err(e) => {
-                    error!(package=%pkg, error=?e, "rebuild failed; markers retained for retry");
+                    error!(package=%package, error=?e, "rebuild failed; markers retained for retry");
                     None
                 }
             };
-            (pkg, keys, rebuilt)
+            (package, keys, stale_intents, rebuilt)
         }));
     }
     let mut failures = 0usize;
@@ -709,10 +1457,10 @@ async fn tick(state: &Arc<AppState>) -> Result<()> {
     let mut consumed: Vec<String> = Vec::new();
     for handle in handles {
         match handle.await {
-            Ok((pkg, keys, Some(live_now))) => {
+            Ok((pkg, keys, stale_intents, Some(live_now))) => {
                 // Markers for this package are now consumed; the stale intents
                 // among them are healed crashed writers.
-                healed += stale_by_pkg.get(&pkg).copied().unwrap_or(0);
+                healed += stale_intents;
                 if live_now {
                     adds.push(pkg);
                 } else {
@@ -784,11 +1532,82 @@ pub async fn rebuild_package_excluding(
     pkg: &str,
     omit: Option<&str>,
 ) -> Result<bool> {
+    let (live, raw) = rebuild_package_indexes(state, storage, pkg, omit).await?;
+    // Maintain the in-memory inventory. This is the one choke point every
+    // rebuild against the *selected* bucket — tick, audit, delete — flows
+    // through, and `upsert` is an idempotent absolute set, so concurrent or
+    // repeated rebuilds never double-count. The audit re-baselines the whole
+    // map periodically.
+    state
+        .inventory
+        .lock()
+        .await
+        .upsert(pkg, PkgStat::from_raw(&raw));
+    Ok(live)
+}
+
+/// Rebuild only a package's index views from `storage`'s own truth, touching no
+/// node-local inventory. `rebuild_package_excluding` layers the selected
+/// bucket's inventory on top; the replicator (src/replicate.rs) calls this
+/// directly against a *non-selected* destination bucket, where mixing that
+/// bucket's counts into the node's inventory (or its name cache) would be wrong.
+/// Returns `(still_live, raw_artifacts)`.
+pub async fn rebuild_package_indexes(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    omit: Option<&str>,
+) -> Result<(bool, Vec<(String, u64)>)> {
+    if !state.buckets.is_multi() {
+        return rebuild_package_indexes_inner(state, storage, pkg, omit, None).await;
+    }
+
+    // Package view generation reads several independently-versioned objects.
+    // Join the writer-intent fence so staged promotion cannot start between
+    // that read set and the final index PUT. This maintenance intent is removed
+    // after the derived view is complete; a process crash leaves it behind for
+    // the ordinary stale-intent healer.
+    let nonce = mark_intent(storage, pkg).await?;
+    let result = rebuild_package_indexes_inner(state, storage, pkg, omit, None).await;
+    match result {
+        Ok(value) => {
+            clear_intent(storage, pkg, &nonce).await?;
+            Ok(value)
+        }
+        Err(error) => {
+            // The failed rebuild may already have changed one of the derived
+            // views. Pair the intent so the ordinary worker retries it; never
+            // erase the only crash-recovery event on an error path.
+            let _ = mark_commit(storage, pkg, &nonce).await;
+            Err(error)
+        }
+    }
+}
+
+/// Complete the materialized package view while an exact promotion owner keeps
+/// request reads closed. The caller verifies the same owner again before
+/// clearing `.origin`.
+pub(crate) async fn rebuild_package_indexes_for_promotion(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    pending: &crate::origin::OriginObservation,
+) -> Result<(bool, Vec<(String, u64)>)> {
+    rebuild_package_indexes_inner(state, storage, pkg, None, Some(pending)).await
+}
+
+async fn rebuild_package_indexes_inner(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    omit: Option<&str>,
+    pending: Option<&crate::origin::OriginObservation>,
+) -> Result<(bool, Vec<(String, u64)>)> {
     state
         .metrics
         .index_rebuilds
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (mut files, mut raw) = list_artifacts(storage, pkg).await?;
+    let (mut files, mut raw) = list_artifacts_for_claim(storage, pkg, pending, true).await?;
     if let Some(omit) = omit {
         files.retain(|f| f.filename != omit);
         raw.retain(|(filename, _)| filename != omit);
@@ -810,16 +1629,7 @@ pub async fn rebuild_package_excluding(
             state.index_cache.invalidate(key);
         }
     }
-    // Maintain the in-memory inventory. This is the one choke point every
-    // rebuild — tick, audit, delete — flows through, and `upsert` is an
-    // idempotent absolute set, so concurrent or repeated rebuilds never
-    // double-count. The audit re-baselines the whole map periodically.
-    state
-        .inventory
-        .lock()
-        .await
-        .upsert(pkg, PkgStat::from_raw(&raw));
-    Ok(live)
+    Ok((live, raw))
 }
 
 /// One package's contribution to the registry inventory: artifact files in
@@ -1011,6 +1821,109 @@ async fn update_global_index(
     bail!("global index CAS retries exhausted")
 }
 
+/// Consume the `_dirty/` markers the replicator dropped in a *destination*
+/// bucket and rebuild that bucket's own indexes from its own truth (design §4:
+/// indexes are per-bucket derived views, never written cross-bucket). This is
+/// what keeps a warm copy's indexes fresh. Cache-free on purpose: it must
+/// not disturb the node-local name/inventory caches, which describe the
+/// *selected* bucket. A package that fails to rebuild keeps its markers for the
+/// next pass; a package whose global membership flips (first file in, or last
+/// file out) is threaded into the destination's own global index.
+pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Result<()> {
+    let entries = storage.list_dir_entries(DIRTY_PREFIX).await?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let work = consumable_dirty_work(
+        &entries,
+        time::OffsetDateTime::now_utc(),
+        state.intent_grace,
+    );
+    let mut adds = Vec::new();
+    let mut removes = Vec::new();
+    let mut consumed = Vec::new();
+    let mut healed = 0;
+    for DirtyWork {
+        package,
+        keys,
+        stale_intents,
+    } in work
+    {
+        match crate::origin::read_origin_observation(storage, &package).await {
+            Ok(Some(origin)) if origin.pending_manifest.is_some() => continue,
+            Ok(_) => {}
+            Err(e) => {
+                error!(package=%package, error=?e, "replicate: destination origin read failed; markers retained");
+                continue;
+            }
+        }
+        // A cheap HEAD decides whether global membership can flip, so the common
+        // "another file added to a package already listed" case never pays the
+        // full global-index read below.
+        let existed = storage
+            .head_exists(&format!("{SIMPLE_PREFIX}{package}/index.json"))
+            .await
+            .unwrap_or(false);
+        match rebuild_package_indexes(state, storage, &package, None).await {
+            Ok((live, _)) => {
+                if live && !existed {
+                    adds.push(package);
+                } else if !live && existed {
+                    removes.push(package);
+                }
+                healed += stale_intents;
+                consumed.extend(keys);
+            }
+            Err(e) => {
+                error!(package=%package, error=?e, "replicate: destination rebuild failed; markers retained")
+            }
+        }
+    }
+    if healed > 0 {
+        state
+            .metrics
+            .stale_intents_healed
+            .fetch_add(healed, std::sync::atomic::Ordering::Relaxed);
+    }
+    update_global_index_uncached(state, storage, &adds, &removes).await?;
+    if let Err(e) = storage.delete_keys(&consumed).await {
+        warn!(error=?e, "replicate: could not consume destination dirty markers");
+    }
+    Ok(())
+}
+
+/// Apply a package-name delta to a bucket's own global index, reading and
+/// writing that bucket's `simple/index.{json,html}` directly — never through the
+/// node-local name cache, which is pinned to the *selected* bucket. The
+/// replicator uses this for destination buckets on a genuine membership flip
+/// only. Single-writer in P3 (one node rebuilds every warm copy), so a plain
+/// read-modify-write is safe; P4's per-bucket leaders drive each bucket's own
+/// cached CAS path instead.
+pub async fn update_global_index_uncached(
+    state: &AppState,
+    storage: &dyn Storage,
+    adds: &[String],
+    removes: &[String],
+) -> Result<()> {
+    if adds.is_empty() && removes.is_empty() {
+        return Ok(());
+    }
+    let mut names = load_global_names(storage).await?.names;
+    let mut changed = false;
+    for pkg in adds {
+        changed |= names.insert(pkg.clone());
+    }
+    for pkg in removes {
+        changed |= names.remove(pkg);
+    }
+    if !changed {
+        return Ok(());
+    }
+    let mut packages: Vec<String> = names.into_iter().collect();
+    packages.sort();
+    write_global_indexes(state, storage, &packages).await
+}
+
 /// Load the global name set (and its ETag) from the materialized JSON.
 async fn load_global_names(storage: &dyn Storage) -> Result<GlobalNames> {
     let key = format!("{SIMPLE_PREFIX}index.json");
@@ -1106,6 +2019,56 @@ pub async fn list_artifacts(
     storage: &dyn Storage,
     pkg: &str,
 ) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
+    list_artifacts_for_claim(storage, pkg, None, true).await
+}
+
+/// Request-path project rendering in multi-bucket mode must never mutate truth
+/// without joining the promotion intent fence. The background worker owns
+/// legacy sidecar backfill; this view simply omits an untyped artifact for now.
+pub async fn list_artifacts_readonly(
+    storage: &dyn Storage,
+    pkg: &str,
+) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
+    list_artifacts_for_claim(storage, pkg, None, false).await
+}
+
+async fn list_artifacts_for_claim(
+    storage: &dyn Storage,
+    pkg: &str,
+    pending_owner: Option<&crate::origin::OriginObservation>,
+    backfill_missing: bool,
+) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
+    // Capture the exact pre-list claim. In particular, never fold a pending
+    // mirror->private promotion into ordinary private: doing so could backfill
+    // a bare mirror loser as fabricated private truth. If the claim changes
+    // after this read, the old classification is conservative (mirror remains
+    // mirror); the staged manifest's exact leftover capture handles the race.
+    let claim = match pending_owner {
+        Some(expected) => {
+            if crate::origin::read_origin_observation(storage, pkg)
+                .await?
+                .as_ref()
+                != Some(expected)
+            {
+                bail!("package '{pkg}' promotion owner changed before index rebuild");
+            }
+            Some((expected.state, expected.pending_manifest.clone()))
+        }
+        None => crate::origin::read_origin_claim(storage, pkg).await?,
+    };
+    if pending_owner.is_none()
+        && claim
+            .as_ref()
+            .and_then(|(_, pending)| pending.as_ref())
+            .is_some()
+    {
+        bail!("package '{pkg}' is under staged promotion");
+    }
+    let pkg_origin = claim.as_ref().and_then(|(state, _)| match state {
+        crate::origin::OriginState::Private => Some(crate::origin::PRIVATE),
+        crate::origin::OriginState::Mirror => Some(crate::origin::MIRROR),
+        crate::origin::OriginState::Unclaimed => None,
+    });
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
     let entries = storage.list_dir_entries(&prefix).await?;
     let names: HashSet<&str> = entries
@@ -1119,41 +2082,47 @@ pub async fn list_artifacts(
         .iter()
         .filter_map(|f| f.strip_suffix(TOMBSTONE_SUFFIX))
         .collect();
-
+    // Frozen filenames are likewise suppressed (dev/MULTIBUCKET.md §6.3): a
+    // byte conflict moved both bodies to `_quarantine/` and dropped a `.frozen`
+    // marker; the name must not resolve on any bucket until a human resolves it.
+    let frozen: HashSet<&str> = names
+        .iter()
+        .filter_map(|f| f.strip_suffix(FROZEN_SUFFIX))
+        .collect();
     // Sidecar reads fan out with bounded concurrency: a 2,000-file package
     // costs 2,000 GETs, and doing them serially put rebuilds at minutes of
     // wall clock on S3. Chunked join_all keeps listing order — index output
     // must stay deterministic.
+    let raw: Vec<(String, u64)> = entries
+        .iter()
+        .filter_map(|entry| {
+            let filename = entry.key.strip_prefix(&prefix)?;
+            is_artifact(filename).then_some((filename.to_string(), entry.size))
+        })
+        .collect();
     let artifacts: Vec<(&FileEntry, &str)> = entries
         .iter()
         .filter_map(|entry| {
             let filename = entry.key.strip_prefix(&prefix)?;
-            (is_artifact(filename) && !tombstoned.contains(filename)).then_some((entry, filename))
+            (is_artifact(filename) && !tombstoned.contains(filename) && !frozen.contains(filename))
+                .then_some((entry, filename))
         })
         .collect();
-    let raw: Vec<(String, u64)> = artifacts
-        .iter()
-        .map(|(entry, filename)| (filename.to_string(), entry.size))
-        .collect();
-    // The per-artifact `origin` a fabricated sidecar records comes from the
-    // package-level `.origin` claim (§4). Read it once, and only when a backfill
-    // is actually needed, so the common all-sidecars-present rebuild pays
-    // nothing. Best-effort: a read error leaves the fabricated field unset (the
-    // replicator falls back to the claim), never failing the rebuild.
-    let needs_backfill = artifacts
-        .iter()
-        .any(|(_, f)| !names.contains(format!("{f}{SIDECAR_SUFFIX}").as_str()));
-    let pkg_origin = if needs_backfill {
-        crate::origin::read_origin(storage, pkg)
-            .await
-            .unwrap_or(None)
-    } else {
-        None
-    };
+    // Read the package claim once. Besides typing a legacy sidecar backfill, it
+    // suppresses a typed mirror record that finished after the claim became
+    // private. Such bytes remain inert until replication quarantines them; they
+    // must never be rendered or backfilled as fabricated private truth.
     let mut metadata = Vec::with_capacity(artifacts.len());
     for chunk in artifacts.chunks(SIDECAR_READ_CONCURRENCY) {
         let loaded = futures::future::join_all(chunk.iter().map(|(entry, filename)| {
-            load_file_metadata(storage, entry, filename, &names, pkg_origin.as_deref())
+            load_file_metadata(
+                storage,
+                entry,
+                filename,
+                &names,
+                pkg_origin,
+                backfill_missing,
+            )
         }))
         .await;
         metadata.extend(loaded.into_iter().flatten());
@@ -1169,8 +2138,15 @@ async fn load_file_metadata(
     filename: &str,
     names: &HashSet<&str>,
     pkg_origin: Option<&str>,
+    backfill_missing: bool,
 ) -> Option<FileMetadata> {
     let has_sidecar = names.contains(format!("{filename}{SIDECAR_SUFFIX}").as_str());
+    let mirror_quarantined =
+        names.contains(format!("{filename}{}", crate::sidecar::MIRROR_QUARANTINED_SUFFIX).as_str());
+    if mirror_quarantined && !has_sidecar {
+        warn!(key=%entry.key, "quarantined mirror artifact has no sidecar; omitting from index");
+        return None;
+    }
     let sc = if has_sidecar {
         match read_sidecar(storage, &entry.key).await {
             Ok(sc) => sc,
@@ -1183,7 +2159,7 @@ async fn load_file_metadata(
                 return None;
             }
         }
-    } else {
+    } else if backfill_missing {
         match backfill_sidecar(storage, entry, filename, pkg_origin).await {
             Ok(sc) => sc,
             Err(e) => {
@@ -1191,7 +2167,19 @@ async fn load_file_metadata(
                 return None;
             }
         }
+    } else {
+        return None;
     };
+    if pkg_origin == Some(crate::origin::PRIVATE)
+        && sc.origin.as_deref() == Some(crate::origin::MIRROR)
+    {
+        warn!(key=%entry.key, "mirror artifact under private package claim; omitting from index");
+        return None;
+    }
+    if mirror_quarantined && sc.origin.as_deref() != Some(crate::origin::PRIVATE) {
+        warn!(key=%entry.key, "quarantined mirror artifact remains non-private; omitting from index");
+        return None;
+    }
     let core_metadata = names.contains(format!("{filename}{METADATA_SUFFIX}").as_str());
     let provenance = names.contains(format!("{filename}{PROVENANCE_SUFFIX}").as_str());
     Some(FileMetadata::from_sidecar(
@@ -1342,6 +2330,8 @@ async fn write_global_indexes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buckets::{BucketHandle, BucketSet, Pinned};
+    use crate::storage::test_support::InMemStorage;
     use crate::{AccessLogFormat, ArtifactDelivery};
     use axum::body::Body;
     use http::Response;
@@ -1352,6 +2342,79 @@ mod tests {
 
     fn raw(items: &[(&str, u64)]) -> Vec<(String, u64)> {
         items.iter().map(|(n, s)| (n.to_string(), *s)).collect()
+    }
+
+    #[test]
+    fn marker_nonces_carry_randomized_process_entropy() {
+        let first = marker_nonce();
+        let second = marker_nonce();
+        assert_ne!(first, second);
+        for nonce in [first, second] {
+            let entropy = nonce.rsplit('-').next().unwrap();
+            assert_eq!(entropy.len(), 32);
+            assert!(entropy.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn missing_intent_timestamp_defers_the_whole_package() {
+        let entries = vec![
+            FileEntry {
+                key: format!("{DIRTY_PREFIX}pkg!unknown.intent"),
+                size: 0,
+                last_modified: None,
+            },
+            FileEntry {
+                key: format!("{DIRTY_PREFIX}pkg!other.commit"),
+                size: 0,
+                last_modified: Some("2026-01-01T00:00:00Z".into()),
+            },
+        ];
+        assert!(consumable_dirty_work(
+            &entries,
+            time::OffsetDateTime::now_utc(),
+            time::Duration::ZERO,
+        )
+        .is_empty());
+    }
+
+    fn seed_private_artifact(storage: &InMemStorage, pkg: &str, filename: &str) {
+        let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+        storage.insert(&key, b"artifact".to_vec());
+        storage.insert(
+            &sidecar_key(&key),
+            serde_json::to_vec(&Sidecar {
+                sha256: "ab".repeat(32),
+                size: 8,
+                version: "1.0".to_string(),
+                upload_time: "2026-01-01T00:00:00Z".to_string(),
+                requires_python: None,
+                yanked: Yanked::Flag(false),
+                origin: Some(crate::origin::PRIVATE.to_string()),
+                yank_epoch: 0,
+            })
+            .unwrap(),
+        );
+    }
+
+    fn state_switched_after_pin(
+        first: Arc<InMemStorage>,
+        second: Arc<InMemStorage>,
+    ) -> (Arc<AppState>, Arc<Pinned>) {
+        let mut state = AppState::headless(first.clone());
+        state.buckets = Arc::new(BucketSet::new(vec![
+            BucketHandle {
+                storage: first,
+                name: "first".to_string(),
+            },
+            BucketHandle {
+                storage: second,
+                name: "second".to_string(),
+            },
+        ]));
+        let leased = state.pin();
+        state.buckets.switch(1);
+        (Arc::new(state), leased)
     }
 
     #[test]
@@ -1394,6 +2457,271 @@ mod tests {
         inv.upsert("a", PkgStat::default());
         let t = inv.totals();
         assert_eq!((t.projects, t.releases, t.files, t.bytes), (1, 2, 2, 25));
+    }
+
+    #[tokio::test]
+    async fn single_bucket_audit_reclaims_an_abandoned_empty_mirror_claim() {
+        let storage = Arc::new(InMemStorage::default());
+        storage.insert(
+            &crate::origin::origin_key("abandoned"),
+            br#"{"origin":"mirror","nonce":"00000000000000000000000000000000"}"#.to_vec(),
+        );
+        let mut state = AppState::headless(storage.clone());
+        state.intent_grace = time::Duration::ZERO;
+
+        reclaim_empty_mirror_claim(&state, storage.as_ref(), "abandoned", 0)
+            .await
+            .unwrap();
+        reclaim_empty_mirror_claim(&state, storage.as_ref(), "abandoned", 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::origin::read_origin_observation(storage.as_ref(), "abandoned")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::origin::OriginState::Unclaimed
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_mirror_claim_with_committed_stage_is_not_reclaimed() {
+        let storage = Arc::new(InMemStorage::default());
+        storage.insert(
+            &crate::origin::origin_key("staged"),
+            br#"{"origin":"mirror","nonce":"00000000000000000000000000000000"}"#.to_vec(),
+        );
+        storage.insert("_staging/repl/staged/manifest@one.json", b"{}".to_vec());
+        let mut state = AppState::headless(storage.clone());
+        state.intent_grace = time::Duration::ZERO;
+
+        reclaim_empty_mirror_claim(&state, storage.as_ref(), "staged", 0)
+            .await
+            .unwrap();
+        reclaim_empty_mirror_claim(&state, storage.as_ref(), "staged", 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::origin::read_origin_observation(storage.as_ref(), "staged")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::origin::OriginState::Mirror
+        );
+    }
+
+    #[tokio::test]
+    async fn leader_tick_stays_on_the_lease_matched_pin_after_a_switch() {
+        let first = Arc::new(InMemStorage::default());
+        let second = Arc::new(InMemStorage::default());
+        let (state, leased) = state_switched_after_pin(first.clone(), second.clone());
+        let pkg = "leasepin";
+        let filename = "leasepin-1.0-py3-none-any.whl";
+        let artifact = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+        first.insert(&artifact, b"leased bucket bytes".to_vec());
+        first.insert(
+            &sidecar_key(&artifact),
+            serde_json::to_vec(&Sidecar {
+                sha256: "ab".repeat(32),
+                size: 19,
+                version: "1.0".to_string(),
+                upload_time: "2026-01-01T00:00:00Z".to_string(),
+                requires_python: None,
+                yanked: Yanked::Flag(false),
+                origin: Some(crate::origin::PRIVATE.to_string()),
+                yank_epoch: 0,
+            })
+            .unwrap(),
+        );
+        mark_dirty(first.as_ref(), pkg).await.unwrap();
+
+        tick(&state, &leased).await.unwrap();
+
+        let index = format!("{SIMPLE_PREFIX}{pkg}/index.json");
+        assert!(first.head_exists(&index).await.unwrap());
+        assert!(
+            !second.head_exists(&index).await.unwrap(),
+            "a lease on the first bucket must not authorize a tick on the newly selected bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_drain_defers_a_whole_package_with_a_fresh_intent() {
+        let storage = Arc::new(InMemStorage::default());
+        let pkg = "writing";
+        seed_private_artifact(storage.as_ref(), pkg, "writing-1.0.whl");
+        let intent = format!("{DIRTY_PREFIX}{pkg}!fresh.intent");
+        let commit = format!("{DIRTY_PREFIX}{pkg}!unrelated.commit");
+        storage.insert(&intent, Vec::new());
+        storage.insert(&commit, Vec::new());
+        let mut state = AppState::headless(storage.clone());
+        // InMemStorage's fixed test timestamp remains fresh under this window.
+        state.intent_grace = time::Duration::weeks(10_000);
+
+        drain_dirty_uncached(&state, storage.as_ref())
+            .await
+            .unwrap();
+
+        assert!(storage.head_exists(&intent).await.unwrap());
+        assert!(storage.head_exists(&commit).await.unwrap());
+        assert!(!storage
+            .head_exists(&format!("{SIMPLE_PREFIX}{pkg}/index.json"))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn selected_tick_defers_a_whole_package_with_a_fresh_intent() {
+        let storage = Arc::new(InMemStorage::default());
+        let pkg = "writing";
+        seed_private_artifact(storage.as_ref(), pkg, "writing-1.0.whl");
+        let intent = format!("{DIRTY_PREFIX}{pkg}!fresh.intent");
+        let commit = format!("{DIRTY_PREFIX}{pkg}!unrelated.commit");
+        storage.insert(&intent, Vec::new());
+        storage.insert(&commit, Vec::new());
+        let mut state = AppState::headless(storage.clone());
+        state.intent_grace = time::Duration::weeks(10_000);
+        let state = Arc::new(state);
+        let pinned = state.pin();
+
+        tick(&state, &pinned).await.unwrap();
+
+        assert!(storage.head_exists(&intent).await.unwrap());
+        assert!(storage.head_exists(&commit).await.unwrap());
+        assert!(!storage
+            .head_exists(&format!("{SIMPLE_PREFIX}{pkg}/index.json"))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn warm_drain_defers_a_pending_promotion_package() {
+        let storage = Arc::new(InMemStorage::default());
+        let pkg = "promoting";
+        seed_private_artifact(storage.as_ref(), pkg, "promoting-1.0.whl");
+        crate::origin::claim_origin(storage.as_ref(), pkg, crate::origin::PRIVATE)
+            .await
+            .unwrap();
+        crate::origin::begin_private_promotion(
+            storage.as_ref(),
+            pkg,
+            "_staging/repl/promoting/manifest@one.json",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        mark_dirty(storage.as_ref(), pkg).await.unwrap();
+        let before = storage
+            .list_all(&format!("{DIRTY_PREFIX}{pkg}!"))
+            .await
+            .unwrap();
+        let state = AppState::headless(storage.clone());
+
+        drain_dirty_uncached(&state, storage.as_ref())
+            .await
+            .unwrap();
+
+        let after = storage
+            .list_all(&format!("{DIRTY_PREFIX}{pkg}!"))
+            .await
+            .unwrap();
+        assert_eq!(
+            after.iter().map(|entry| &entry.key).collect::<Vec<_>>(),
+            before.iter().map(|entry| &entry.key).collect::<Vec<_>>()
+        );
+        assert!(!storage
+            .head_exists(&format!("{SIMPLE_PREFIX}{pkg}/index.json"))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn pending_promotion_never_backfills_a_bare_mirror_body_as_private() {
+        let storage = Arc::new(InMemStorage::default());
+        let pkg = "promoting";
+        let filename = "promoting-1.0.whl";
+        crate::origin::claim_origin(storage.as_ref(), pkg, crate::origin::MIRROR)
+            .await
+            .unwrap();
+        storage.insert(
+            &format!("{PACKAGES_PREFIX}{pkg}/{filename}"),
+            b"public bytes".to_vec(),
+        );
+        crate::origin::begin_private_promotion(
+            storage.as_ref(),
+            pkg,
+            "_staging/repl/promoting/manifest@one.json",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(list_artifacts(storage.as_ref(), pkg).await.is_err());
+        assert!(!storage
+            .head_exists(&sidecar_key(&format!("{PACKAGES_PREFIX}{pkg}/{filename}")))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn pending_recovery_uses_storage_time_not_a_skewed_nonce_clock() {
+        let storage = Arc::new(InMemStorage::default());
+        storage.insert("_dirty/pkg!0-1-0.intent", Vec::new());
+        let mut state = AppState::headless(storage.clone());
+        // The nonce claims 1970, while InMemStorage's authoritative object
+        // timestamp is 2026. A huge grace keeps that storage timestamp fresh.
+        state.intent_grace = time::Duration::weeks(10_000);
+
+        assert!(stale_unpaired_intents(&state, storage.as_ref(), "pkg")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn audit_fast_path_keeps_retained_frozen_evidence_logically_dead() {
+        let storage = Arc::new(InMemStorage::default());
+        let pkg = "frozenpkg";
+        let filename = "frozenpkg-1.0.whl";
+        seed_private_artifact(storage.as_ref(), pkg, filename);
+        let artifact = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+        storage.insert(&format!("{artifact}{FROZEN_SUFFIX}"), b"{}".to_vec());
+        storage.insert(&format!("{artifact}{TOMBSTONE_SUFFIX}"), b"{}".to_vec());
+        let fp = package_fingerprint(storage.as_ref(), pkg).await.unwrap();
+        storage.insert(
+            &format!("{STATE_PREFIX}fp-f.json"),
+            serde_json::to_vec(&std::collections::HashMap::from([(pkg.to_string(), fp)])).unwrap(),
+        );
+        let state = AppState::headless(storage.clone());
+
+        let audit = audit_shard(&state, storage.as_ref(), 0, 'f', false)
+            .await
+            .unwrap();
+
+        assert_eq!(audit.live, Vec::<String>::new());
+        assert_eq!(audit.dead, vec![pkg.to_string()]);
+        assert_eq!(audit.skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn leader_audit_rejects_a_stale_lease_pin_instead_of_repinning() {
+        let first = Arc::new(InMemStorage::default());
+        let second = Arc::new(InMemStorage::default());
+        let (state, leased) = state_switched_after_pin(first, second.clone());
+
+        let error = audit(&state, &leased, true).await.unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("bucket selection generation changed"));
+        assert!(
+            second.list_all("").await.unwrap().is_empty(),
+            "an audit authorized on the old bucket must not re-pin and mutate the new bucket"
+        );
     }
 
     /// Storage stub whose `list_all("packages/...")` never returns — an audit
@@ -1524,6 +2852,8 @@ mod tests {
         });
         let state = Arc::new(AppState {
             buckets: Arc::new(crate::buckets::BucketSet::single(storage.clone())),
+            bucket_health: None,
+            writes_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             uploader_user: None,
             uploader_pass: None,
             admin_user: None,
@@ -1551,6 +2881,12 @@ mod tests {
             global_names: Arc::new(tokio::sync::Mutex::new(None)),
             inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
+            empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            promotion_lock_observations: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             counters: Arc::new(crate::counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),
@@ -1630,6 +2966,8 @@ mod tests {
         });
         let state = Arc::new(AppState {
             buckets: Arc::new(crate::buckets::BucketSet::single(storage.clone())),
+            bucket_health: None,
+            writes_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             uploader_user: None,
             uploader_pass: None,
             admin_user: None,
@@ -1657,6 +2995,12 @@ mod tests {
             global_names: Arc::new(tokio::sync::Mutex::new(None)),
             inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
+            empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            promotion_lock_observations: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             counters: Arc::new(crate::counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),

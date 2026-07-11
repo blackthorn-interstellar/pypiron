@@ -14,6 +14,17 @@ pub const PROVENANCE_SUFFIX: &str = ".provenance";
 /// deleted private filename may never be reused (dev/MULTIBUCKET.md §6.4), and
 /// a crashed delete must converge to "gone" rather than resurrect the file.
 pub const TOMBSTONE_SUFFIX: &str = ".tombstone";
+/// Freeze marker: `<filename>.frozen` beside where the artifact lived. Two
+/// buckets that committed different bytes under one filename (a split-brain,
+/// dev/MULTIBUCKET.md §6.3) both move their body to `_quarantine/` and drop this
+/// marker, which suppresses the filename from index rebuilds until a human
+/// resolves it. Unlike a tombstone the name is not permanently barred — the
+/// operator republishes a new version.
+pub const FROZEN_SUFFIX: &str = ".frozen";
+/// A mirror body preserved after its package became private. The live bytes are
+/// deliberately left in place (and omitted from indexes) so cleanup never
+/// opens an artifact-key ABA window for a concurrent private writer.
+pub const MIRROR_QUARANTINED_SUFFIX: &str = ".mirror-quarantined";
 
 /// PEP 592 yank state: `false`, `true`, or a reason string.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -109,8 +120,17 @@ pub fn tombstone_key(artifact_key: &str) -> String {
     format!("{artifact_key}{TOMBSTONE_SUFFIX}")
 }
 
+/// Storage key of the freeze marker for an artifact key.
+pub fn frozen_key(artifact_key: &str) -> String {
+    format!("{artifact_key}{FROZEN_SUFFIX}")
+}
+
+pub fn mirror_quarantined_key(artifact_key: &str) -> String {
+    format!("{artifact_key}{MIRROR_QUARANTINED_SUFFIX}")
+}
+
 /// True if `filename` (no directory part) is an artifact, not a sidecar,
-/// tombstone, or dotfile.
+/// tombstone, freeze marker, or dotfile.
 pub fn is_artifact(filename: &str) -> bool {
     !filename.is_empty()
         && !filename.starts_with('.')
@@ -118,6 +138,8 @@ pub fn is_artifact(filename: &str) -> bool {
         && !filename.ends_with(METADATA_SUFFIX)
         && !filename.ends_with(PROVENANCE_SUFFIX)
         && !filename.ends_with(TOMBSTONE_SUFFIX)
+        && !filename.ends_with(FROZEN_SUFFIX)
+        && !filename.ends_with(MIRROR_QUARANTINED_SUFFIX)
 }
 
 #[cfg(test)]
@@ -131,6 +153,10 @@ mod tests {
         assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.metadata"));
         assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.provenance"));
         assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.tombstone"));
+        assert!(!is_artifact("six-1.16.0-py2.py3-none-any.whl.frozen"));
+        assert!(!is_artifact(
+            "six-1.16.0-py2.py3-none-any.whl.mirror-quarantined"
+        ));
         assert!(!is_artifact(".origin"));
         assert!(!is_artifact(".project-status.json"));
         assert!(!is_artifact(""));

@@ -3,15 +3,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import http.client
 import os
 import shlex
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from email.utils import formatdate
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Iterator, List
+from urllib.parse import unquote, urlsplit
 
 import pytest
 
@@ -818,12 +822,646 @@ def minio(tmp_path_factory) -> Iterator[Dict]:
         run_returncode(["docker", "rm", "-f", name])
 
 
+def _minio_multi(buckets: List[str], label: str) -> Iterator[Dict]:
+    """Run one disposable MinIO with the requested buckets."""
+    if not cmd_exists("docker"):
+        pytest.skip("docker is required for S3/MinIO integration tests; not found on PATH")
+
+    name = f"pypiron-{label}-{uuid.uuid4().hex[:12]}"
+    try:
+        run_checked(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                name,
+                "-p",
+                "127.0.0.1::9000",
+                "-e",
+                "MINIO_ROOT_USER=minioadmin",
+                "-e",
+                "MINIO_ROOT_PASSWORD=minioadmin",
+                "minio/minio",
+                "server",
+                "/data",
+            ]
+        )
+        port_mapping = run_checked(["docker", "port", name, "9000/tcp"]).stdout.strip()
+        s3_port = int(port_mapping.rsplit(":", 1)[1])
+        wait_http_ok(f"http://127.0.0.1:{s3_port}/minio/health/ready", timeout=60.0)
+        for bucket in buckets:
+            made = False
+            for extra in (
+                [
+                    "-e",
+                    f"MC_HOST_local=http://minioadmin:minioadmin@host.docker.internal:{s3_port}",
+                ],
+                [
+                    "-e",
+                    f"MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:{s3_port}",
+                    "--network",
+                    "host",
+                ],
+            ):
+                rc, _, _ = run_returncode(
+                    [
+                        "docker",
+                        "run",
+                        "--rm",
+                        *extra,
+                        "minio/mc",
+                        "mb",
+                        "--ignore-existing",
+                        f"local/{bucket}",
+                    ]
+                )
+                if rc == 0:
+                    made = True
+                    break
+            if not made:
+                pytest.skip(
+                    "Unable to create MinIO buckets using minio/mc (check Docker networking)"
+                )
+        yield {
+            "endpoint": f"http://127.0.0.1:{s3_port}",
+            "buckets": buckets,
+            "bucket": buckets[0],
+            "access_key": "minioadmin",
+            "secret_key": "minioadmin",
+        }
+    finally:
+        run_returncode(["docker", "rm", "-f", name])
+
+
+@pytest.fixture()
+def minio_two(tmp_path_factory) -> Iterator[Dict]:
+    """Two buckets on one MinIO container for replication and selection."""
+    del tmp_path_factory
+    yield from _minio_multi(["pypiron-a", "pypiron-b"], "minio2")
+
+
+@pytest.fixture()
+def minio_three(tmp_path_factory) -> Iterator[Dict]:
+    """Three buckets on one MinIO container for ordered fallback tests."""
+    del tmp_path_factory
+    yield from _minio_multi(["pypiron-a", "pypiron-b", "pypiron-c"], "minio3")
+
+
+class BucketFaults:
+    """Thread-safe bucket-specific availability faults for the S3 proxy."""
+
+    def __init__(self) -> None:
+        self._failed: set[str] = set()
+        self._blackholed: set[str] = set()
+        self._dripped: dict[tuple[str, str], float] = {}
+        self._dripped_puts: dict[tuple[str, str], float] = {}
+        self._requests: list[tuple[str, str, str]] = []
+        self._lock = threading.Lock()
+
+    def fail(self, *buckets: str) -> None:
+        with self._lock:
+            self._failed.update(buckets)
+
+    def recover(self, *buckets: str) -> None:
+        with self._lock:
+            self._failed.difference_update(buckets)
+            self._blackholed.difference_update(buckets)
+
+    def blackhole(self, *buckets: str) -> None:
+        """Accept requests but withhold a response long enough to test timeouts."""
+        with self._lock:
+            self._blackholed.update(buckets)
+
+    def drip(self, bucket: str, key: str, *, duration: float = 11.0) -> None:
+        """Send one object's GET body steadily over ``duration`` seconds."""
+        with self._lock:
+            self._dripped[(bucket, key)] = duration
+
+    def drip_put(self, bucket: str, key: str, *, duration: float = 11.0) -> None:
+        """Read one object's PUT body steadily over ``duration`` seconds."""
+        with self._lock:
+            self._dripped_puts[(bucket, key)] = duration
+
+    def is_failed(self, bucket: str) -> bool:
+        with self._lock:
+            return bucket in self._failed
+
+    def is_blackholed(self, bucket: str) -> bool:
+        with self._lock:
+            return bucket in self._blackholed
+
+    def drip_duration(self, bucket: str, key: str) -> float | None:
+        with self._lock:
+            return self._dripped.get((bucket, key))
+
+    def put_drip_duration(self, bucket: str, key: str) -> float | None:
+        with self._lock:
+            return self._dripped_puts.get((bucket, key))
+
+    def record(self, bucket: str, method: str, target: str) -> None:
+        with self._lock:
+            self._requests.append((bucket, method, unquote(target)))
+
+    def count(
+        self, *, bucket: str | None = None, method: str | None = None, needle: str = ""
+    ) -> int:
+        with self._lock:
+            return sum(
+                1
+                for seen_bucket, seen_method, target in self._requests
+                if (bucket is None or bucket == seen_bucket)
+                and (method is None or method == seen_method)
+                and needle in target
+            )
+
+    def requests(self) -> list[tuple[str, str, str]]:
+        """Return an ordered snapshot for write-protocol assertions."""
+        with self._lock:
+            return list(self._requests)
+
+
+class _S3FaultProxyServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, origin_host: str, origin_port: int, faults: BucketFaults):
+        super().__init__(address, _S3FaultProxyHandler)
+        self.origin_host = origin_host
+        self.origin_port = origin_port
+        self.faults = faults
+
+
+class _S3FaultProxyHandler(BaseHTTPRequestHandler):
+    """Forward signed S3 requests byte-for-byte, preserving their Host header."""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_DELETE(self) -> None:
+        self._proxy()
+
+    def do_GET(self) -> None:
+        self._proxy()
+
+    def do_HEAD(self) -> None:
+        self._proxy()
+
+    def do_POST(self) -> None:
+        self._proxy()
+
+    def do_PUT(self) -> None:
+        self._proxy()
+
+    def log_message(self, _format: str, *_args) -> None:
+        pass
+
+    def _proxy(self) -> None:
+        path = urlsplit(self.path).path
+        bucket, _, key = path.lstrip("/").partition("/")
+        key = unquote(key)
+        self.server.faults.record(bucket, self.command, self.path)
+        if bucket and self.server.faults.is_failed(bucket):
+            self._send_error(503, b"injected bucket outage")
+            return
+        if bucket and self.server.faults.is_blackholed(bucket):
+            # Health-only calls are cancelled by pypiron after one second. Keep
+            # this connection silent much longer so the test distinguishes that
+            # bound from an immediate synthetic 503.
+            time.sleep(15)
+            try:
+                self._send_error(503, b"injected bucket blackhole")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        try:
+            put_drip_duration = (
+                self.server.faults.put_drip_duration(bucket, key) if self.command == "PUT" else None
+            )
+            body = self._request_body(drip_duration=put_drip_duration)
+        except (EOFError, OSError, ValueError):
+            self._send_error(400, b"invalid request body")
+            return
+
+        connection = http.client.HTTPConnection(
+            self.server.origin_host,
+            self.server.origin_port,
+            timeout=30,
+        )
+        try:
+            connection.putrequest(
+                self.command,
+                self.path,
+                skip_host=True,
+                skip_accept_encoding=True,
+            )
+            for name, value in self.headers.items():
+                connection.putheader(name, value)
+            connection.endheaders()
+            if body:
+                connection.send(body)
+            response = connection.getresponse()
+            response_body = response.read()
+            drip_duration = (
+                self.server.faults.drip_duration(bucket, key) if self.command == "GET" else None
+            )
+            self._send_upstream_response(response, response_body, drip_duration=drip_duration)
+        except (ConnectionError, OSError, http.client.HTTPException):
+            self._send_error(502, b"MinIO proxy upstream unavailable")
+        finally:
+            connection.close()
+
+    def _request_body(self, *, drip_duration: float | None = None) -> bytes:
+        transfer_encoding = self.headers.get("Transfer-Encoding", "").lower()
+        if "chunked" in transfer_encoding:
+            return self._chunked_body()
+        length = int(self.headers.get("Content-Length", "0"))
+        if drip_duration is None or length < 2:
+            body = self.rfile.read(length)
+        else:
+            body = self._drip_request_body(length, drip_duration)
+        if len(body) != length:
+            raise EOFError("short request body")
+        return body
+
+    def _drip_request_body(self, length: int, duration: float) -> bytes:
+        """Read a fixed-length request in small, regularly paced chunks."""
+        body = bytearray()
+        started = time.monotonic()
+        chunk_size = 64 * 1024
+        while len(body) < length:
+            if body:
+                target = started + duration * len(body) / length
+                time.sleep(max(0.0, target - time.monotonic()))
+            expected = min(chunk_size, length - len(body))
+            chunk = self.rfile.read(expected)
+            if len(chunk) != expected:
+                raise EOFError("short request body")
+            body.extend(chunk)
+        return bytes(body)
+
+    def _chunked_body(self) -> bytes:
+        """Read chunk framing intact; SigV4 streaming signatures live in it."""
+        body = bytearray()
+        while True:
+            line = self.rfile.readline(65537)
+            if not line or len(line) > 65536:
+                raise EOFError("missing chunk header")
+            body.extend(line)
+            size = int(line.split(b";", 1)[0].strip(), 16)
+            if size == 0:
+                while True:
+                    trailer = self.rfile.readline(65537)
+                    if not trailer or len(trailer) > 65536:
+                        raise EOFError("missing chunk trailer")
+                    body.extend(trailer)
+                    if trailer in {b"\r\n", b"\n"}:
+                        return bytes(body)
+            chunk = self.rfile.read(size + 2)
+            if len(chunk) != size + 2:
+                raise EOFError("short chunk")
+            body.extend(chunk)
+
+    def _send_upstream_response(
+        self, response, body: bytes, *, drip_duration: float | None = None
+    ) -> None:
+        hop_by_hop = {
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        }
+        self.send_response(response.status, response.reason)
+        has_head_length = False
+        for name, value in response.getheaders():
+            lower = name.lower()
+            if lower in hop_by_hop:
+                continue
+            if lower == "content-length":
+                if self.command == "HEAD":
+                    has_head_length = True
+                else:
+                    continue
+            self.send_header(name, value)
+        if self.command == "HEAD":
+            if not has_head_length:
+                self.send_header("Content-Length", "0")
+        else:
+            self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            if drip_duration is None or len(body) < 2:
+                self.wfile.write(body)
+            else:
+                chunk_count = min(12, len(body))
+                pause = drip_duration / (chunk_count - 1)
+                for index in range(chunk_count):
+                    start = index * len(body) // chunk_count
+                    end = (index + 1) * len(body) // chunk_count
+                    self.wfile.write(body[start:end])
+                    self.wfile.flush()
+                    if index + 1 < chunk_count:
+                        time.sleep(pause)
+        self.close_connection = True
+
+    def _send_error(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        self.close_connection = True
+
+
+def _minio_fault_proxy(minio: Dict) -> Iterator[Dict]:
+    origin = urlsplit(minio["endpoint"])
+    if origin.scheme != "http" or origin.hostname is None or origin.port is None:
+        raise ValueError("fault proxy requires an explicit HTTP MinIO endpoint")
+    faults = BucketFaults()
+    server = _S3FaultProxyServer(
+        ("127.0.0.1", 0),
+        origin.hostname,
+        origin.port,
+        faults,
+    )
+    thread = threading.Thread(target=server.serve_forever, name="s3-fault-proxy", daemon=True)
+    thread.start()
+    proxied = dict(minio)
+    proxied["server_endpoint"] = f"http://127.0.0.1:{server.server_port}"
+    proxied["faults"] = faults
+    try:
+        yield proxied
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture()
+def minio_two_proxy(minio_two: Dict) -> Iterator[Dict]:
+    yield from _minio_fault_proxy(minio_two)
+
+
+@pytest.fixture()
+def minio_three_proxy(minio_three: Dict) -> Iterator[Dict]:
+    yield from _minio_fault_proxy(minio_three)
+
+
+@pytest.fixture()
+def minio_two_dual_proxy(minio_two: Dict) -> Iterator[Dict]:
+    """One MinIO reached through two independently faultable S3 paths."""
+    left_gen = _minio_fault_proxy(minio_two)
+    left = next(left_gen)
+    right_gen = _minio_fault_proxy(minio_two)
+    try:
+        right = next(right_gen)
+        yield {"minio": minio_two, "left": left, "right": right}
+    finally:
+        right_gen.close()
+        left_gen.close()
+
+
+@pytest.fixture()
+def s3_server_multi(tmp_path_factory, pypiron_bin: Path, minio_two: Dict) -> Iterator[Dict]:
+    """pypiron configured against two MinIO buckets. A short reconcile interval
+    keeps the tier-3 diff backstop running every few seconds so tests never wait
+    out the daily default."""
+    yield from _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two,
+        extra_env={"PYPIRON_RECONCILE_INTERVAL_SECS": "3"},
+    )
+
+
+@pytest.fixture()
+def s3_server_multi_failover(
+    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
+) -> Iterator[Dict]:
+    """Two buckets behind a bucket-aware 503 proxy with short hysteresis."""
+    yield from _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        extra_env={"PYPIRON_AUDIT_ON_BOOT": "false"},
+        extra_args=[
+            "--bucket-leave-failures",
+            "1",
+            "--bucket-return-healthy-secs",
+            "4",
+        ],
+    )
+
+
+@pytest.fixture()
+def s3_server_multi_default_failover(
+    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
+) -> Iterator[Dict]:
+    """Two buckets using the shipped leave/return defaults."""
+    yield from _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        extra_env={"PYPIRON_AUDIT_ON_BOOT": "false"},
+    )
+
+
+@pytest.fixture()
+def s3_server_multi_cadence(
+    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
+) -> Iterator[Dict]:
+    """Long periodic cadence used to prove write nudges do not multiply scans."""
+    yield from _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        extra_env={
+            "PYPIRON_AUDIT_ON_BOOT": "false",
+            "PYPIRON_WORKER_INTERVAL_SECS": "60",
+        },
+    )
+
+
+@pytest.fixture()
+def s3_server_multi_reconcile_cost(
+    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
+) -> Iterator[Dict]:
+    """Short full-diff cadence behind the request-counting S3 proxy."""
+    yield from _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        extra_env={
+            "PYPIRON_AUDIT_ON_BOOT": "false",
+            "PYPIRON_RECONCILE_INTERVAL_SECS": "2",
+        },
+    )
+
+
+@pytest.fixture()
+def s3_server_three_failover(
+    tmp_path_factory, pypiron_bin: Path, minio_three_proxy: Dict
+) -> Iterator[Dict]:
+    """Three buckets behind the same path-aware availability proxy."""
+    yield from _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_three_proxy,
+        extra_env={"PYPIRON_AUDIT_ON_BOOT": "false"},
+        extra_args=[
+            "--bucket-leave-failures",
+            "1",
+            "--bucket-return-healthy-secs",
+            "4",
+        ],
+    )
+
+
+def _start_s3_server_pair(
+    tmp_path_factory,
+    pypiron_bin: Path,
+    minio_two_dual_proxy: Dict,
+    *,
+    extra_args=(),
+) -> Iterator[Dict]:
+    """Two nodes sharing a topology through independent availability views."""
+    common_args = [
+        "--bucket-leave-failures",
+        "1",
+        "--bucket-return-healthy-secs",
+        "2",
+        *extra_args,
+    ]
+    common_env = {
+        "PYPIRON_AUDIT_ON_BOOT": "false",
+        "PYPIRON_RECONCILE_INTERVAL_SECS": "3",
+    }
+    left_gen = _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_dual_proxy["left"],
+        extra_env=common_env,
+        extra_args=common_args,
+    )
+    left = next(left_gen)
+    right_gen = _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_dual_proxy["right"],
+        extra_env=common_env,
+        extra_args=common_args,
+    )
+    try:
+        right = next(right_gen)
+        yield {
+            "left": left,
+            "right": right,
+            "minio": minio_two_dual_proxy["minio"],
+        }
+    finally:
+        right_gen.close()
+        left_gen.close()
+
+
+@pytest.fixture()
+def s3_servers_multi(
+    tmp_path_factory, pypiron_bin: Path, minio_two_dual_proxy: Dict
+) -> Iterator[Dict]:
+    yield from _start_s3_server_pair(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_dual_proxy,
+    )
+
+
+@pytest.fixture()
+def s3_servers_multi_short_lease(
+    tmp_path_factory, pypiron_bin: Path, minio_two_dual_proxy: Dict
+) -> Iterator[Dict]:
+    """Two nodes with short bucket-local leases for asymmetric-path proofs."""
+    yield from _start_s3_server_pair(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_dual_proxy,
+        extra_args=("--lease-ttl-secs", "3"),
+    )
+
+
+@pytest.fixture()
+def s3_servers_multi_proxy(
+    tmp_path_factory, pypiron_bin: Path, minio_two_dual_proxy: Dict
+) -> Iterator[Dict]:
+    """Two independently partitionable S3 nodes proxying one real upstream."""
+    upstream_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    upstream = next(upstream_gen)
+    pair_gen = _start_s3_server_pair(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_dual_proxy,
+        extra_args=(
+            "--proxy-upstream",
+            upstream["base_url"],
+            "--allow-insecure-upstream",
+            "--exclude-newer",
+            "",
+        ),
+    )
+    try:
+        pair = next(pair_gen)
+        yield {**pair, "upstream": upstream}
+    finally:
+        pair_gen.close()
+        upstream_gen.close()
+
+
+@pytest.fixture()
+def s3_server_multi_proxy_prefixed(
+    tmp_path_factory, pypiron_bin: Path, minio_two: Dict
+) -> Iterator[Dict]:
+    """A multi-bucket proxy with an upstream-collision-proof private prefix."""
+    upstream_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    upstream = next(upstream_gen)
+    server_gen = _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two,
+        extra_env={
+            "PYPIRON_AUDIT_ON_BOOT": "false",
+            "PYPIRON_RECONCILE_INTERVAL_SECS": "3",
+        },
+        extra_args=[
+            "--proxy-upstream",
+            upstream["base_url"],
+            "--allow-insecure-upstream",
+            "--exclude-newer",
+            "",
+            "--private-prefix",
+            "acme",
+        ],
+    )
+    try:
+        server = next(server_gen)
+        yield {**server, "upstream": upstream}
+    finally:
+        server_gen.close()
+        upstream_gen.close()
+
+
 def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
+    # A two-bucket fixture carries a `buckets` list; a single-bucket one carries
+    # `bucket`. Either way pypiron reads the plural PYPIRON_S3_BUCKETS.
+    bucket_list = ",".join(minio["buckets"]) if minio.get("buckets") else minio["bucket"]
     env = os.environ.copy()
     env.update(
         {
             "PYPIRON_STORAGE": "s3",
-            "PYPIRON_S3_BUCKETS": minio["bucket"],
+            "PYPIRON_S3_BUCKETS": bucket_list,
             "AWS_REGION": minio.get("region") or "us-east-1",
             "PYPIRON_BIND_ADDR": bind,
             "PYPIRON_WORKER_INTERVAL_SECS": "1",
@@ -834,11 +1472,12 @@ def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
             "RUST_LOG": "info,pypiron=debug",
         }
     )
-    if minio.get("endpoint"):
+    endpoint = minio.get("server_endpoint", minio.get("endpoint"))
+    if endpoint:
         # Emulator (MinIO): explicit endpoint, path-style addressing, fixed
         # dev credentials. Real S3 has none of these — it relies on the ambient
         # AWS credentials already carried over by os.environ.copy() above.
-        env["PYPIRON_S3_ENDPOINT_URL"] = minio["endpoint"]
+        env["PYPIRON_S3_ENDPOINT_URL"] = endpoint
         env["PYPIRON_S3_FORCE_PATH_STYLE"] = "true"
         env["AWS_ACCESS_KEY_ID"] = minio["access_key"]
         env["AWS_SECRET_ACCESS_KEY"] = minio["secret_key"]
@@ -846,7 +1485,11 @@ def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
 
 
 def _start_s3_server(
-    tmp_path_factory, pypiron_bin: Path, minio: Dict, extra_env=None
+    tmp_path_factory,
+    pypiron_bin: Path,
+    minio: Dict,
+    extra_env=None,
+    extra_args=None,
 ) -> Iterator[Dict]:
     port = find_free_port()
     bind = f"127.0.0.1:{port}"
@@ -857,7 +1500,10 @@ def _start_s3_server(
 
     with open(log_path, "w") as log_file:
         proc = subprocess.Popen(
-            [str(pypiron_bin), "serve"], env=env, stdout=log_file, stderr=subprocess.STDOUT
+            [str(pypiron_bin), "serve", *(extra_args or [])],
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
         )
         try:
             wait_http_ok(f"http://{bind}/simple/index.json", timeout=30.0)
@@ -869,6 +1515,7 @@ def _start_s3_server(
                 "user": "admin",
                 "password": "secret",
                 "minio": minio,
+                "faults": minio.get("faults"),
                 "log_path": log_path,
                 "proc": proc,
             }
@@ -935,8 +1582,10 @@ def _mc(minio: Dict, script: str) -> str:
         if rc == 0:
             return out
         attempts.append(f"rc={rc} {err.strip() or out.strip()}")
-    if any("unreachable" in a or "connection refused" in a.lower() for a in attempts):
-        pytest.skip("Unable to reach MinIO with minio/mc (check Docker networking)")
+    if all("unreachable" in a or "connection refused" in a.lower() for a in attempts):
+        pytest.skip(
+            "Unable to reach MinIO with minio/mc (check Docker networking): " + "; ".join(attempts)
+        )
     raise AssertionError(f"mc failed: {script!r}\n" + "\n".join(attempts))
 
 
@@ -957,6 +1606,46 @@ def minio_list_keys(minio: Dict) -> List[str]:
     root = f"local/{minio['bucket']}/"
     out = _mc(minio, f"mc find {shlex.quote(root.rstrip('/'))}")
     return sorted(ln[len(root) :] for ln in out.splitlines() if ln.startswith(root))
+
+
+def minio_list_keys_in(minio: Dict, bucket: str) -> List[str]:
+    """Every object key in a named bucket (for the multi-bucket fixture)."""
+    root = f"local/{bucket}/"
+    out = _mc(minio, f"mc find {shlex.quote(root.rstrip('/'))}")
+    return sorted(ln[len(root) :] for ln in out.splitlines() if ln.startswith(root))
+
+
+def minio_get_key_in(minio: Dict, bucket: str, key: str) -> str:
+    """Read an object's body from a named bucket, bypassing pypiron."""
+    target = shlex.quote(f"local/{bucket}/{key}")
+    return _mc(minio, f"mc cat {target}")
+
+
+def minio_get_key_bytes_in(minio: Dict, bucket: str, key: str) -> bytes:
+    """Read a binary object from a named bucket, bypassing pypiron."""
+    target = shlex.quote(f"local/{bucket}/{key}")
+    return base64.b64decode(_mc(minio, f"mc cat {target} | base64"))
+
+
+def minio_put_key_in(minio: Dict, bucket: str, key: str, body: str) -> None:
+    """Write a foreign object straight into a named bucket, bypassing pypiron."""
+    dest = shlex.quote(f"local/{bucket}/{key}")
+    _mc(minio, f"printf %s {shlex.quote(body)} | mc pipe {dest}")
+
+
+def minio_key_exists_in(minio: Dict, bucket: str, key: str) -> bool:
+    """Whether a key exists in a named bucket."""
+    return key in minio_list_keys_in(minio, bucket)
+
+
+def minio_remove_bucket(minio: Dict, bucket: str) -> None:
+    """Delete a bucket and everything in it (simulates a destination outage)."""
+    _mc(minio, f"mc rb --force local/{shlex.quote(bucket)}")
+
+
+def minio_make_bucket(minio: Dict, bucket: str) -> None:
+    """(Re)create a bucket (simulates a destination coming back)."""
+    _mc(minio, f"mc mb --ignore-existing local/{shlex.quote(bucket)}")
 
 
 @pytest.fixture()

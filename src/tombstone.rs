@@ -34,10 +34,3 @@ pub async fn write(storage: &dyn Storage, artifact_key: &str, filename: &str) ->
         .await?;
     Ok(())
 }
-
-/// Whether `artifact_key`'s filename has been tombstoned (deleted and barred
-/// from reuse). Storage errors propagate — an outage must not read as "free to
-/// reuse", which is the filename-immutability / dependency-confusion direction.
-pub async fn is_tombstoned(storage: &dyn Storage, artifact_key: &str) -> Result<bool> {
-    storage.head_exists(&tombstone_key(artifact_key)).await
-}

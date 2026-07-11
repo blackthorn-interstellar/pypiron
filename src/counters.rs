@@ -1,7 +1,7 @@
 //! Distributed, S3-backed counter store. **Self-contained on purpose**: it
-//! depends only on the [`ObjectStore`] trait below, `time`, and `serde` — never
+//! depends only on the two tiny store traits below, `time`, and `serde` — never
 //! on `AppState`, `web`, or `crate::storage`. Lift it into its own crate by
-//! copying this one file and providing an [`ObjectStore`] impl for your backend.
+//! copying this one file and providing store implementations for your backend.
 //!
 //! ## Model (truth = immutable files, views = recomputations — the repo's bias)
 //! - **Record** (every node, hot path): bump a bounded in-memory map keyed by
@@ -44,11 +44,18 @@ pub const OVERFLOW_KEY: &str = "_overflow";
 
 const SUMMARY_FILE: &str = "_summary.json";
 
-/// The minimal object-store surface the engine needs. Map these onto any
-/// backend (the pypiron adapter wraps `crate::storage::Storage`). `get` returns
-/// `Ok(None)` for a genuinely-absent object and `Err` only for a *transient*
-/// failure — the engine relies on that distinction to never freeze a day from a
-/// failed read.
+/// Select one stable store handle for a complete flush, compaction, or query.
+/// The engine calls this exactly once at each public operation boundary and
+/// threads the returned handle through the whole call graph.
+pub trait ObjectStoreSelector: Send + Sync {
+    fn pin(&self) -> Box<dyn ObjectStore>;
+}
+
+/// The minimal object-store surface used after an operation is pinned. Map
+/// these onto any backend (the pypiron adapter wraps `crate::storage::Storage`).
+/// `get` returns `Ok(None)` for a genuinely-absent object and `Err` only for a
+/// *transient* failure — the engine relies on that distinction to never freeze a
+/// day from a failed read.
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>>;
@@ -153,7 +160,7 @@ struct Pending {
 /// The store. Construct enabled with [`Counters::new`], or [`Counters::disabled`]
 /// for a no-op instance (single-node tests, `--download-stats=false`).
 pub struct Counters {
-    store: Option<Box<dyn ObjectStore>>,
+    store: Option<Box<dyn ObjectStoreSelector>>,
     cfg: Config,
     /// Unique per process incarnation (`pid-nanos`), so two nodes — even two
     /// sharing a hostname — never write the same segment key.
@@ -165,7 +172,7 @@ pub struct Counters {
 }
 
 impl Counters {
-    pub fn new(store: Box<dyn ObjectStore>, cfg: Config) -> Self {
+    pub fn new(store: Box<dyn ObjectStoreSelector>, cfg: Config) -> Self {
         Self {
             store: Some(store),
             cfg,
@@ -249,9 +256,10 @@ impl Counters {
     /// Write the buffered deltas as immutable segments, then clear the buffer.
     /// Best-effort: a failed segment is re-buffered for the next flush.
     pub async fn flush(&self) {
-        let Some(store) = self.store.as_deref() else {
+        let Some(selector) = self.store.as_deref() else {
             return;
         };
+        let store = selector.pin();
         let taken = {
             let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             self.flush_due.store(false, Ordering::Relaxed);
@@ -299,9 +307,10 @@ impl Counters {
     /// summaries, and apply retention. Idempotent and crash-safe (recompute from
     /// immutable segments; frozen file is the sentinel; deletes are best-effort).
     pub async fn compact(&self) {
-        let Some(store) = self.store.as_deref() else {
+        let Some(selector) = self.store.as_deref() else {
             return;
         };
+        let store = selector.pin();
         let keys = match store.list(PREFIX).await {
             Ok(k) => k,
             Err(e) => {
@@ -330,7 +339,7 @@ impl Counters {
                 let _ = store.delete(seg_keys).await;
                 continue;
             }
-            match sum_segments(store, seg_keys).await {
+            match sum_segments(store.as_ref(), seg_keys).await {
                 Some(buckets) => {
                     let frozen_key = format!("{PREFIX}{metric}/day/{day}/{shard}.json");
                     let seg = Segment {
@@ -375,7 +384,7 @@ impl Counters {
 
         // Recompute each pending day's summary from its frozen shard files.
         for (metric, day) in to_summarize.into_keys() {
-            self.write_summary(store, &metric, &day).await;
+            self.write_summary(store.as_ref(), &metric, &day).await;
         }
 
         // Retention: drop frozen days (and any leftover segments) past the window.
@@ -433,15 +442,19 @@ impl Counters {
         to: Date,
     ) -> BTreeMap<String, BTreeMap<String, u64>> {
         let mut out = BTreeMap::new();
-        let Some(store) = self.store.as_deref() else {
+        let Some(selector) = self.store.as_deref() else {
             return out;
         };
+        let store = selector.pin();
         let shard = shard_of(pkg);
         let prefix = format!("{pkg}/");
         let mut day = from;
         loop {
             let ds = day_str(day);
-            if let Some(buckets) = self.read_day_shard(store, metric, &ds, shard).await {
+            if let Some(buckets) = self
+                .read_day_shard(store.as_ref(), metric, &ds, shard)
+                .await
+            {
                 let mut per_key: BTreeMap<String, u64> = BTreeMap::new();
                 for keys_at in buckets.values() {
                     for (key, c) in keys_at {
@@ -479,9 +492,10 @@ impl Counters {
         to: Date,
     ) -> BTreeMap<String, DaySummary> {
         let mut out = BTreeMap::new();
-        let Some(store) = self.store.as_deref() else {
+        let Some(selector) = self.store.as_deref() else {
             return out;
         };
+        let store = selector.pin();
         // Mirror of `compact`'s freeze gate: a day at or after this cutoff cannot
         // be frozen yet, so its absent summary means "still open", not "empty" —
         // those are the only days worth a live cross-shard scan.
@@ -501,7 +515,7 @@ impl Counters {
                     }
                 }
                 Ok(None) if ds >= close_cutoff => {
-                    if let Some(s) = self.summarize_day_live(store, metric, &ds).await {
+                    if let Some(s) = self.summarize_day_live(store.as_ref(), metric, &ds).await {
                         out.insert(ds, s);
                     }
                 }
@@ -711,6 +725,11 @@ mod tests {
             self.objects.lock().unwrap().len()
         }
     }
+    impl ObjectStoreSelector for MemStore {
+        fn pin(&self) -> Box<dyn ObjectStore> {
+            Box::new(self.clone())
+        }
+    }
     #[async_trait]
     impl ObjectStore for MemStore {
         async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -736,6 +755,19 @@ mod tests {
                 o.remove(k);
             }
             Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SwitchingStore {
+        stores: [MemStore; 2],
+        pins: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ObjectStoreSelector for SwitchingStore {
+        fn pin(&self) -> Box<dyn ObjectStore> {
+            let index = self.pins.fetch_add(1, Ordering::SeqCst) % self.stores.len();
+            Box::new(self.stores[index].clone())
         }
     }
 
@@ -927,6 +959,63 @@ mod tests {
         // Summary reflects the total.
         let sums = c.query_summaries("downloads", from, to).await;
         assert_eq!(sums[&yest].total, 5);
+    }
+
+    #[tokio::test]
+    async fn operations_pin_one_store_for_their_whole_call_graph() {
+        let first = MemStore::default();
+        let second = MemStore::default();
+        let pins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = Counters::new(
+            Box::new(SwitchingStore {
+                stores: [first.clone(), second.clone()],
+                pins: pins.clone(),
+            }),
+            Config {
+                grace_days: 0,
+                ..Config::default()
+            },
+        );
+
+        let old_day = day_str(
+            OffsetDateTime::now_utc()
+                .date()
+                .saturating_sub(time::Duration::days(3)),
+        );
+        let segment_key = format!("{PREFIX}downloads/seg/{old_day}/r/inc-0.json");
+        first
+            .put(
+                &segment_key,
+                serde_json::to_vec(&Segment {
+                    resolution_secs: 86_400,
+                    buckets: BTreeMap::from([(
+                        "00:00".to_string(),
+                        BTreeMap::from([("requests/r-1.0.whl".to_string(), 5)]),
+                    )]),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        c.compact().await;
+        assert_eq!(pins.load(Ordering::SeqCst), 1);
+        assert!(!first.objects.lock().unwrap().contains_key(&segment_key));
+        assert!(first
+            .objects
+            .lock()
+            .unwrap()
+            .contains_key(&format!("{PREFIX}downloads/day/{old_day}/r.json")));
+        assert_eq!(second.len(), 0, "compaction never crossed into next store");
+
+        let today = OffsetDateTime::now_utc().date();
+        let _ = c.query_package("downloads", "requests", today, today).await;
+        assert_eq!(pins.load(Ordering::SeqCst), 2);
+        let _ = c.query_summaries("downloads", today, today).await;
+        assert_eq!(pins.load(Ordering::SeqCst), 3);
+        c.record("downloads", "requests/r-2.0.whl");
+        c.flush().await;
+        assert_eq!(pins.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

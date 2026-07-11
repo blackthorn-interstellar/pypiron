@@ -70,6 +70,7 @@ plugins:
 nav:
   - Home: index.md
   - Setup: guides/setup.md
+  - Multi-bucket failover: guides/multi-bucket.md
   - How it works: concepts/how-it-works.md
   - Supply-chain defense: concepts/supply-chain.md
   - How it's tested: concepts/testing.md

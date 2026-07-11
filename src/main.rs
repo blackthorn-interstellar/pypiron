@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     body::Body,
     extract::{ConnectInfo, Multipart, Path, Query, Request, State},
@@ -19,8 +19,9 @@ use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
 use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
+mod bucket_health;
 mod buckets;
 mod cache;
 mod config;
@@ -32,11 +33,13 @@ mod lease;
 mod markdown;
 mod metrics;
 mod names;
+mod observed_storage;
 mod origin;
 mod provenance;
 mod proxy;
 mod range;
 mod render;
+mod replicate;
 mod sidecar;
 mod simple;
 mod status;
@@ -50,13 +53,15 @@ mod web;
 mod wheel;
 mod worker;
 
+use bucket_health::{HealthController, HealthPolicy};
 use buckets::{BucketHandle, BucketSet, Pinned};
 use names::{
     checked_pkg_name, infer_package_from_filename, infer_version_from_filename, is_normalized,
     normalize_pkg_name,
 };
 use sidecar::{
-    metadata_key, provenance_key, sidecar_key, Sidecar, Yanked, METADATA_SUFFIX, PROVENANCE_SUFFIX,
+    frozen_key, metadata_key, mirror_quarantined_key, provenance_key, sidecar_key, tombstone_key,
+    Sidecar, Yanked, METADATA_SUFFIX, PROVENANCE_SUFFIX,
 };
 use storage::{Storage, StorageArgs};
 
@@ -161,6 +166,50 @@ enum Commands {
     CreateToken(CreateTokenArgs),
     /// Work with pypiron.toml — currently just `config init`.
     Config(ConfigArgs),
+    /// Deliberate package-origin maintenance.
+    Origin(Box<OriginArgs>),
+    /// Deliberate multi-bucket topology maintenance.
+    Buckets(Box<BucketsArgs>),
+}
+
+#[derive(ClapArgs, Debug)]
+struct BucketsArgs {
+    #[command(subcommand)]
+    command: BucketsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum BucketsCommand {
+    /// Bump the topology generation and conditionally re-stamp every reachable
+    /// configured bucket after adding, removing, or reordering buckets.
+    Migrate(BucketsMigrateArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct BucketsMigrateArgs {
+    #[command(flatten)]
+    storage: StorageArgs,
+}
+
+#[derive(ClapArgs, Debug)]
+struct OriginArgs {
+    #[command(subcommand)]
+    command: OriginCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum OriginCommand {
+    /// Release an empty package claim for deliberate private/mirror repurposing.
+    /// Every configured bucket must be reachable and empty.
+    Release(OriginReleaseArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct OriginReleaseArgs {
+    /// Package name to release (PEP 503 normalization is applied).
+    package: String,
+    #[command(flatten)]
+    storage: StorageArgs,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -226,7 +275,7 @@ async fn run_rebuild_index(args: RebuildIndexArgs) -> Result<()> {
     let storage = args.storage.build().await?;
     let state = AppState::headless(storage);
     let pinned = state.pin();
-    worker::audit(&state, pinned.storage.as_ref(), true).await
+    worker::audit(&state, &pinned, true).await
 }
 
 /// Loopback `/health` URL for the port `serve` would bind. `bind` is the raw
@@ -361,6 +410,121 @@ fn apply_maintenance_config(
         .expect("dispatched subcommand always matches");
     merge_storage_file(storage, &file.serve, m)?;
     eprintln!("{subcommand}: storage backend {}", storage.describe());
+    Ok(())
+}
+
+fn apply_nested_maintenance_config(
+    storage: &mut StorageArgs,
+    config_path: Option<&std::path::Path>,
+    matches: &clap::ArgMatches,
+    command: &str,
+    subcommand: &str,
+) -> Result<()> {
+    let file = config::load(config_path)?;
+    let command_matches = matches
+        .subcommand_matches(command)
+        .and_then(|parent| parent.subcommand_matches(subcommand))
+        .expect("dispatched nested subcommand always matches");
+    merge_storage_file(storage, &file.serve, command_matches)?;
+    eprintln!(
+        "{command} {subcommand}: storage backend {}",
+        storage.describe()
+    );
+    Ok(())
+}
+
+async fn run_origin_release(args: OriginReleaseArgs) -> Result<()> {
+    let pkg = checked_pkg_name(&args.package)
+        .ok_or_else(|| anyhow!("invalid package name '{}'", args.package))?;
+    let storages = args.storage.build_all().await?;
+    // Preflight every bucket before the first CAS. Without this, discovering an
+    // artifact or outage on bucket B after releasing A would create exactly the
+    // partial-origin window this maintenance command exists to avoid.
+    let mut targets = Vec::new();
+    for storage in &storages {
+        if let Some(observed) = origin::releasable_for_repurpose(storage.as_ref(), &pkg).await? {
+            targets.push((storage.clone(), observed));
+        }
+    }
+    if targets.is_empty() {
+        anyhow::bail!("package '{pkg}' has no live origin claim to release");
+    }
+
+    let mut completed = Vec::new();
+    for (storage, observed) in targets {
+        let outcome =
+            origin::release_observed_for_repurpose(storage.as_ref(), &pkg, &observed).await;
+        match outcome {
+            Ok(Some(unclaimed)) => completed.push((storage, observed.state, unclaimed)),
+            Ok(None) => {
+                rollback_origin_releases(&pkg, &completed).await?;
+                anyhow::bail!("package '{pkg}' changed during origin release; no claims released");
+            }
+            Err(error) => {
+                rollback_origin_releases(&pkg, &completed).await?;
+                return Err(error).context(format!(
+                    "release origin for '{pkg}'; earlier bucket releases were rolled back"
+                ));
+            }
+        }
+    }
+    eprintln!(
+        "released origin claim for '{pkg}' on {} bucket(s)",
+        completed.len()
+    );
+    Ok(())
+}
+
+async fn rollback_origin_releases(
+    pkg: &str,
+    completed: &[(
+        Arc<dyn Storage>,
+        origin::OriginState,
+        origin::OriginObservation,
+    )],
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for (storage, original, unclaimed) in completed.iter().rev() {
+        if let Err(error) =
+            origin::restore_released_for_repurpose(storage.as_ref(), pkg, *original, unclaimed)
+                .await
+        {
+            failures.push(format!("{error:#}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "origin release failed and rollback was incomplete: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
+    let storages = args.storage.build_all().await?;
+    let names = args.storage.bucket_names();
+    let handles = storages
+        .into_iter()
+        .zip(names)
+        .map(|(storage, name)| BucketHandle { storage, name })
+        .collect();
+    let buckets = BucketSet::new(handles);
+    let report = buckets
+        .migrate_topology_with(|_, error| {
+            bucket_health::classify(observed_storage::signal_for_error(error))
+                == bucket_health::SignalClass::AvailabilityFailure
+        })
+        .await?;
+    let generation = report
+        .generation
+        .ok_or_else(|| anyhow!("no reachable bucket was available to migrate"))?;
+    eprintln!(
+        "topology generation {generation}: re-stamped {} bucket(s), {} unreachable",
+        report.stamped_indices.len(),
+        report.unreachable_indices.len()
+    );
     Ok(())
 }
 
@@ -514,6 +678,21 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_WORKER_INTERVAL_SECS", default_value = "1")]
     worker_interval_secs: u64,
 
+    /// Consecutive availability failures before leaving the selected bucket.
+    /// Only timeouts, connection failures, and 5xx count; auth/CAS/KMS/quota/
+    /// config errors alarm without changing selection.
+    #[arg(long, env = "PYPIRON_BUCKET_LEAVE_FAILURES", default_value = "3")]
+    bucket_leave_failures: u32,
+
+    /// Continuous healthy seconds required before returning to a recovered,
+    /// more-preferred bucket. The long return window prevents flap oscillation.
+    #[arg(
+        long,
+        env = "PYPIRON_BUCKET_RETURN_HEALTHY_SECS",
+        default_value = "300"
+    )]
+    bucket_return_healthy_secs: u64,
+
     /// Seconds an in-flight write may hold off its package's rebuild before
     /// the worker assumes the writer crashed and rebuilds anyway. Must exceed
     /// the slowest expected upload.
@@ -647,6 +826,11 @@ struct ServeArgs {
 /// Shared TTL cache of the ranked download leaderboard: `(computed_at, board)`,
 /// or `None` until first populated.
 type DownloadBoard = Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<(String, u64)>)>>>;
+type EmptyOriginObservations =
+    Arc<tokio::sync::Mutex<std::collections::HashMap<(u64, String), (String, std::time::Instant)>>>;
+type PromotionLockObservations = Arc<
+    tokio::sync::Mutex<std::collections::HashMap<(usize, String), (String, std::time::Instant)>>,
+>;
 
 #[derive(Clone)]
 struct AppState {
@@ -656,6 +840,14 @@ struct AppState {
     /// switch can never tear an in-flight operation. Single-bucket deployments
     /// hold exactly one bucket and the pin is always index 0, generation 0.
     buckets: Arc<BucketSet>,
+    /// Multi-bucket-only per-node availability view. `None` preserves the
+    /// single-bucket hot path: no observation wrapper, probes, or background
+    /// selection work.
+    bucket_health: Option<Arc<HealthController>>,
+    /// A runtime topology mismatch is sticky: reads remain available, but every
+    /// HTTP mutation is rejected until the operator fixes configuration and
+    /// restarts. The worker is the only writer of this fence.
+    writes_fenced: Arc<std::sync::atomic::AtomicBool>,
     // auth — two roles: uploader (publish) and admin (everything, incl. mirror,
     // delete, yank). Admin is a strict superset of uploader.
     uploader_user: Option<String>,
@@ -703,6 +895,14 @@ struct AppState {
     inventory: Arc<tokio::sync::Mutex<worker::InventoryMap>>,
     /// Wakes the worker immediately after a write drops a dirty marker.
     worker_nudge: Arc<tokio::sync::Notify>,
+    /// First empty-mirror observations retained across leader audits. A claim
+    /// is reclaimable only when its exact nonce-bearing version is still empty
+    /// on the same selection generation after the intent grace; process
+    /// restarts and bucket switches restart the proof.
+    empty_origin_observations: EmptyOriginObservations,
+    /// Monotonic proof that one exact promotion-lock ETag stopped heartbeating.
+    /// Recovery sweeps prune entries whose committed manifests disappeared.
+    promotion_lock_observations: PromotionLockObservations,
     /// Hand-rolled Prometheus counters served at /metrics.
     metrics: Arc<metrics::Metrics>,
     /// Distributed S3-backed event counters (per-package/version downloads per
@@ -730,16 +930,28 @@ impl AppState {
     pub fn pin(&self) -> Arc<Pinned> {
         self.buckets.pin()
     }
+
+    pub fn mutations_fenced(&self) -> bool {
+        self.writes_fenced
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
-/// Adapts the pypiron [`Storage`] trait to the counter engine's minimal
-/// [`counters::ObjectStore`]. This is the *only* coupling between the otherwise
-/// self-contained `counters` module and the rest of pypiron — lifting the engine
-/// into its own crate means reproducing just these four methods.
-struct CounterStore(Arc<dyn Storage>);
+/// Adapts pypiron's bucket selector to the counter engine. Selection happens
+/// once at the counter operation boundary; every nested I/O then uses the same
+/// captured storage handle.
+struct CounterStore(Arc<BucketSet>);
+
+impl counters::ObjectStoreSelector for CounterStore {
+    fn pin(&self) -> Box<dyn counters::ObjectStore> {
+        Box::new(PinnedCounterStore(self.0.pin().storage.clone()))
+    }
+}
+
+struct PinnedCounterStore(Arc<dyn Storage>);
 
 #[async_trait::async_trait]
-impl counters::ObjectStore for CounterStore {
+impl counters::ObjectStore for PinnedCounterStore {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         if self.0.supports_leases() {
             // Cloud: distinguishes a genuine miss (Ok(None)) from a transient
@@ -843,6 +1055,30 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Some(Commands::Origin(args)) => match args.command {
+            OriginCommand::Release(mut release) => {
+                apply_nested_maintenance_config(
+                    &mut release.storage,
+                    config_path.as_deref(),
+                    &matches,
+                    "origin",
+                    "release",
+                )?;
+                run_origin_release(release).await
+            }
+        },
+        Some(Commands::Buckets(args)) => match args.command {
+            BucketsCommand::Migrate(mut migrate) => {
+                apply_nested_maintenance_config(
+                    &mut migrate.storage,
+                    config_path.as_deref(),
+                    &matches,
+                    "buckets",
+                    "migrate",
+                )?;
+                run_buckets_migrate(migrate).await
+            }
+        },
         None => {
             // A global flag (e.g. --log-format) but no subcommand: nothing to
             // run, so show help. Truly-bare `pypiron` never reaches here —
@@ -856,7 +1092,7 @@ async fn main() -> Result<()> {
 
 /// Build the download-counter engine from CLI config, failing closed on a bad
 /// resolution. Disabled (`--download-stats=false`) yields a no-op store.
-fn build_counters(cli: &ServeArgs, storage: Arc<dyn Storage>) -> Result<counters::Counters> {
+fn build_counters(cli: &ServeArgs, buckets: Arc<BucketSet>) -> Result<counters::Counters> {
     if !cli.download_stats {
         return Ok(counters::Counters::disabled());
     }
@@ -871,7 +1107,7 @@ fn build_counters(cli: &ServeArgs, storage: Arc<dyn Storage>) -> Result<counters
     .checked()
     .map_err(|e| anyhow::anyhow!("counter config: {e}"))?;
     Ok(counters::Counters::new(
-        Box::new(CounterStore(storage)),
+        Box::new(CounterStore(buckets)),
         cfg,
     ))
 }
@@ -896,6 +1132,17 @@ fn parse_resolution_secs(s: &str) -> Result<u32> {
     };
     n.checked_mul(unit_secs)
         .ok_or_else(|| anyhow::anyhow!("'{s}': duration too large"))
+}
+
+fn validate_intent_grace_secs(seconds: u64) -> Result<()> {
+    if (3..=i64::MAX as u64).contains(&seconds) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "--intent-grace-secs must be between 3 and {} seconds",
+            i64::MAX
+        )
+    }
 }
 
 /// Did this arg come from the command line or an env var (as opposed to sitting
@@ -958,6 +1205,16 @@ fn merge_serve_file(
         cli.worker_interval_secs,
         "worker_interval_secs",
         f.worker_interval_secs
+    );
+    fill!(
+        cli.bucket_leave_failures,
+        "bucket_leave_failures",
+        f.bucket_leave_failures
+    );
+    fill!(
+        cli.bucket_return_healthy_secs,
+        "bucket_return_healthy_secs",
+        f.bucket_return_healthy_secs
     );
     fill!(
         cli.intent_grace_secs,
@@ -1041,7 +1298,7 @@ fn merge_storage_file(
     storage.storage_prefix = storage.storage_prefix.take().or(f.storage_prefix.clone());
     // The config file carries a single `s3-bucket`; multi-bucket lists come from
     // the CLI/env. Fold the file value in only when CLI/env named no bucket.
-    if storage.s3_buckets.is_empty() {
+    if !storage.has_s3_bucket() {
         if let Some(b) = &f.s3_bucket {
             storage.s3_buckets.push(b.clone());
         }
@@ -1080,6 +1337,7 @@ async fn run_serve(
     let file = config::load(config_path.as_deref())?;
     merge_serve_file(&mut cli, &file.serve, serve_matches)?;
     cli.private_prefix = cli.private_prefix.take().or(file.private_prefix.clone());
+    validate_intent_grace_secs(cli.intent_grace_secs)?;
 
     // Supplying only `--admin-pass` is enough to enable admin: the password is
     // the secret, the username is conventional. Fill in the default username
@@ -1117,9 +1375,32 @@ async fn run_serve(
     }
 
     let storage_desc = cli.storage.describe();
-    let storages = cli.storage.build_all().await?;
+    let raw_storages = cli.storage.build_all().await?;
     let names = cli.storage.bucket_names();
-    debug_assert_eq!(storages.len(), names.len());
+    debug_assert_eq!(raw_storages.len(), names.len());
+    let bucket_health = if raw_storages.len() > 1 {
+        Some(Arc::new(HealthController::new(
+            raw_storages.len(),
+            HealthPolicy::new(
+                cli.bucket_leave_failures,
+                Duration::from_secs(cli.bucket_return_healthy_secs),
+            )?,
+        )?))
+    } else {
+        None
+    };
+    let storages: Vec<Arc<dyn Storage>> = match &bucket_health {
+        Some(health) => raw_storages
+            .into_iter()
+            .enumerate()
+            .map(|(index, storage)| {
+                Ok::<Arc<dyn Storage>, anyhow::Error>(Arc::new(
+                    observed_storage::ObservedStorage::new(storage, index, health.clone())?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => raw_storages,
+    };
     let handles: Vec<BucketHandle> = storages
         .into_iter()
         .zip(names)
@@ -1128,14 +1409,45 @@ async fn run_serve(
     let buckets = Arc::new(BucketSet::new(handles));
     // Fail closed on a mismatched bucket topology before serving a byte (no-op
     // unless more than one bucket is configured).
-    buckets.verify_topology().await?;
+    let topology = buckets
+        .verify_topology_with(|_, error| {
+            bucket_health::classify(observed_storage::signal_for_error(error))
+                == bucket_health::SignalClass::AvailabilityFailure
+        })
+        .await?;
+    if let Some(health) = &bucket_health {
+        for index in topology
+            .verified_indices
+            .iter()
+            .chain(&topology.stamped_indices)
+        {
+            health.topology_revalidated(*index)?;
+        }
+        // Startup must work during the outage this feature exists for. Collapse
+        // a confirmed-unreachable preferred bucket through the leave threshold
+        // immediately; runtime observations retain normal hysteresis.
+        for index in &topology.unreachable_indices {
+            for _ in 0..cli.bucket_leave_failures {
+                health.observe(*index, bucket_health::BucketSignal::ConnectionFailure)?;
+            }
+        }
+        let initial = health.worker_tick();
+        if let Some(change) = initial.selection_change {
+            buckets.switch(change.to);
+            health.selection_applied(change.to)?;
+            warn!(
+                from = change.from,
+                to = change.to,
+                "preferred bucket unavailable at startup; selected reachable bucket"
+            );
+        }
+    }
     if buckets.is_multi() {
         info!(
             count = buckets.len(),
             "multi-bucket storage: replication and failover across configured buckets"
         );
     }
-    let storage = buckets.pin().storage.clone();
     let proxy = match cli.proxy_upstream.as_deref() {
         Some(upstream) => {
             let mirror = cli.mirror.resolve(Some(&file.mirror))?;
@@ -1158,10 +1470,9 @@ async fn run_serve(
         None => None,
     };
 
-    // P4: becomes per-bucket/per-selection. The counter engine captures bucket-0
-    // at startup and flushes there for its whole life; generation cannot change
-    // until P4 wires switch(), so this is currently equivalent to pinning.
-    let counters = Arc::new(build_counters(&cli, storage.clone())?);
+    // Counters are derived and per-bucket. Each flush, compaction, or query pins
+    // the selected handle once, so a switch applies only between operations.
+    let counters = Arc::new(build_counters(&cli, buckets.clone())?);
     if counters.enabled() {
         info!(
             resolution = %cli.counters_resolution,
@@ -1177,6 +1488,8 @@ async fn run_serve(
 
     let state = Arc::new(AppState {
         buckets,
+        bucket_health,
+        writes_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         uploader_user: cli.uploader_user,
         uploader_pass: cli.uploader_pass,
         admin_user: cli.admin_user,
@@ -1202,6 +1515,12 @@ async fn run_serve(
         global_names: Arc::new(tokio::sync::Mutex::new(None)),
         inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
         worker_nudge: Arc::new(tokio::sync::Notify::new()),
+        empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        promotion_lock_observations: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
         metrics: Arc::new(metrics::Metrics::new()),
         counters,
         download_board: Arc::new(std::sync::Mutex::new(None)),
@@ -1221,6 +1540,11 @@ async fn run_serve(
     }
     if state.proxy.is_some() && state.private_prefix.is_none() {
         warn!("proxy enabled without --private-prefix: new private uploads race public names for first claim; a reserved prefix closes that hole");
+    }
+
+    // Arm the replication metric family only when multi-bucket is live (§G).
+    if state.buckets.is_multi() {
+        state.metrics.set_multi_bucket();
     }
 
     // Initialize empty index files if they don't exist
@@ -1481,6 +1805,17 @@ async fn log_requests(
     let method = req.method().clone();
     let is_read = method == Method::GET || method == Method::HEAD;
     let health_or_metrics = matches!(req.uri().path(), "/health" | "/metrics");
+
+    if !is_read && state.mutations_fenced() {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from(
+                r#"{"error":"bucket topology mismatch; writes are fenced"}"#,
+            ))
+            .unwrap_or_else(not_found);
+    }
 
     // Decide up front whether this request could be logged, so the hot read path
     // does no timing or field work.
@@ -1809,10 +2144,33 @@ async fn render_project(
     // `storage` (not `pinned`, which below is the version-pinned flag) is this
     // render's captured handle (design §3), threaded to every read.
     let storage = state.pin().storage.clone();
-    let files = match worker::list_artifacts(storage.as_ref(), &pkg).await {
+    let before = match require_settled_package_read(state, storage.as_ref(), &pkg).await {
+        Ok(claim) => claim,
+        Err(error) => return read_error(error),
+    };
+    if state.buckets.is_multi()
+        && before
+            .as_ref()
+            .is_none_or(|value| value.state == origin::OriginState::Unclaimed)
+    {
+        return not_found("no such project");
+    }
+    let listed = if state.buckets.is_multi() {
+        worker::list_artifacts_readonly(storage.as_ref(), &pkg).await
+    } else {
+        worker::list_artifacts(storage.as_ref(), &pkg).await
+    };
+    let files = match listed {
         Ok((files, _raw)) => files,
         Err(e) => return read_error(e),
     };
+    if state.buckets.is_multi() {
+        match require_settled_package_read(state, storage.as_ref(), &pkg).await {
+            Ok(after) if after == before => {}
+            Ok(_) => return read_error(anyhow!("package '{pkg}' changed while rendering")),
+            Err(error) => return read_error(error),
+        }
+    }
     if files.is_empty() {
         return not_found("no such project");
     }
@@ -1852,6 +2210,13 @@ async fn render_project(
     };
 
     let downloads = download_summary(state, &pkg).await;
+    if state.buckets.is_multi() {
+        match require_settled_package_read(state, storage.as_ref(), &pkg).await {
+            Ok(after) if after == before => {}
+            Ok(_) => return read_error(anyhow!("package '{pkg}' changed while rendering")),
+            Err(error) => return read_error(error),
+        }
+    }
 
     html_ok(web::project_html(
         &page_context(state, headers),
@@ -2478,12 +2843,25 @@ async fn legacy_upload(
     // claim, artifact/sidecar writes, and commit marker all land on this handle.
     let pinned = state.pin();
     let storage = pinned.storage.as_ref();
-    let claimed_origin = origin::read_origin(storage, &pkg_norm).await.map_err(|e| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("storage error reading origin: {e}"),
-        )
-    })?;
+    let observed_origin = origin::read_origin_observation(storage, &pkg_norm)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("storage error reading origin: {e}"),
+            )
+        })?;
+    if observed_origin
+        .as_ref()
+        .and_then(|observed| observed.pending_manifest.as_ref())
+        .is_some()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Package '{pkg_norm}' is finishing private replication; retry shortly"),
+        ));
+    }
+    let mut write_fence = observed_origin.as_ref().cloned();
     // The private namespace is off-limits to mirrors regardless of claim
     // state — checked here, not only at first write, so adopting a prefix
     // after a name was mirror-claimed still shuts the door.
@@ -2497,17 +2875,54 @@ async fn legacy_upload(
             }
         }
     }
-    match claimed_origin.as_deref() {
-        Some(owner) if owner == desired_origin => {}
-        Some(owner) => {
+    if let Some(owner) = observed_origin.as_ref().map(|observed| observed.state) {
+        if matches!(
+            owner,
+            origin::OriginState::Mirror | origin::OriginState::Private
+        ) && owner.as_str() != desired_origin
+        {
             return Err((
                 StatusCode::FORBIDDEN,
                 format!(
-                    "Package '{pkg_norm}' is {owner}-owned; {desired_origin} uploads are rejected"
+                    "Package '{pkg_norm}' is {}-owned; {desired_origin} uploads are rejected",
+                    owner.as_str()
                 ),
             ));
         }
-        None => {
+    }
+
+    // In multi-bucket mode this marker is part of the package-promotion fence,
+    // not best effort: a promoter will not consume the origin claim while any
+    // writer that observed the old claim is still uncommitted.
+    let intent_nonce = if state.buckets.is_multi() {
+        Some(worker::mark_intent(storage, &pkg_norm).await.map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("failed to reserve package write: {e}"),
+            )
+        })?)
+    } else {
+        match worker::mark_intent(storage, &pkg_norm).await {
+            Ok(nonce) => Some(nonce),
+            Err(e) => {
+                warn!(error=?e, "legacy: failed to write intent marker");
+                None
+            }
+        }
+    };
+    match observed_origin.as_ref().map(|observed| observed.state) {
+        Some(origin::OriginState::Mirror) if desired_origin == origin::MIRROR => {}
+        Some(origin::OriginState::Private) if desired_origin == origin::PRIVATE => {}
+        Some(owner @ (origin::OriginState::Mirror | origin::OriginState::Private)) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "Package '{pkg_norm}' is {}-owned; {desired_origin} uploads are rejected",
+                    owner.as_str()
+                ),
+            ));
+        }
+        None | Some(origin::OriginState::Unclaimed) => {
             // A new private name must be inside the prefix; existing private
             // packages outside a newly-adopted prefix are grandfathered (only
             // first claims are gated, so adopting a prefix never bricks them).
@@ -2523,14 +2938,23 @@ async fn legacy_upload(
             }
             // First write claims the package — atomically, so racing private
             // and mirror first-writes can't merge origins.
-            let claim = origin::claim_origin(storage, &pkg_norm, desired_origin)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to claim origin: {e}"),
-                    )
-                })?;
+            let claim = origin::claim_origin(
+                storage,
+                &pkg_norm,
+                origin::ClaimRequest::new(
+                    desired_origin,
+                    observed_origin
+                        .as_ref()
+                        .filter(|observed| observed.state == origin::OriginState::Unclaimed),
+                ),
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to claim origin: {e}"),
+                )
+            })?;
             if claim.owner != desired_origin {
                 return Err((
                     StatusCode::FORBIDDEN,
@@ -2540,44 +2964,144 @@ async fn legacy_upload(
                     ),
                 ));
             }
+            // A claim can survive even when the uploader dies before writing
+            // an artifact. Queue that package-level truth immediately so the
+            // fast marker tier still reserves the private name everywhere;
+            // the later artifact marker remains independently idempotent.
+            if !is_mirror && claim.etag.is_some() && state.buckets.is_multi() {
+                match replicate::queue_fanout_markers(
+                    &state,
+                    &pinned,
+                    &pkg_norm,
+                    replicate::ORIGIN_MARKER,
+                )
+                .await
+                {
+                    Ok(markers) => replicate::spawn_eager_with_markers(
+                        &state,
+                        &pinned,
+                        pkg_norm.clone(),
+                        replicate::ORIGIN_MARKER.to_string(),
+                        markers,
+                    ),
+                    Err(e) => {
+                        error!(package=%pkg_norm, error=?e, "failed to queue durable origin replication marker");
+                        replicate::spawn_eager_with_markers(
+                            &state,
+                            &pinned,
+                            pkg_norm.clone(),
+                            replicate::ORIGIN_MARKER.to_string(),
+                            replicate::FanoutMarkers::default(),
+                        );
+                    }
+                }
+            }
+            write_fence = Some(match claim.etag {
+                Some(etag) => origin::OriginObservation {
+                    state: if is_mirror {
+                        origin::OriginState::Mirror
+                    } else {
+                        origin::OriginState::Private
+                    },
+                    etag,
+                    pending_manifest: None,
+                },
+                None => origin::read_origin_observation(storage, &pkg_norm)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("storage error re-reading origin claim: {e}"),
+                        )
+                    })?
+                    .filter(|observed| {
+                        observed.state.as_str() == desired_origin
+                            && observed.pending_manifest.is_none()
+                    })
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::CONFLICT,
+                            format!("Package '{pkg_norm}' changed origin while claiming"),
+                        )
+                    })?,
+            });
         }
     }
 
-    // Intent marker before any truth write: if this request dies anywhere
-    // below, the stale intent guarantees a rebuild without any sweep.
-    // Best-effort — the commit marker after the writes is the primary signal.
-    let intent_nonce = match worker::mark_intent(storage, &pkg_norm).await {
-        Ok(nonce) => Some(nonce),
-        Err(e) => {
-            warn!(error=?e, "legacy: failed to write intent marker");
-            None
-        }
+    let size = spooled.size;
+    let sc = Sidecar {
+        sha256,
+        size,
+        version,
+        upload_time,
+        requires_python: fields.get("requires_python").cloned(),
+        yanked,
+        // Per-artifact origin (§4/§6.2): the replicator decides "private only"
+        // from state, never from history.
+        origin: Some(desired_origin.to_string()),
+        yank_epoch: 0,
     };
-
-    // A deleted private filename may never be reused (dev/MULTIBUCKET.md §6.4).
-    // The tombstone bars the name even after the artifact bytes are gone, which
-    // is the gap create-if-absent alone leaves: once the artifact no longer
-    // exists, put_file_if_absent would happily recreate it.
-    match tombstone::is_tombstoned(storage, &key).await {
-        Ok(false) => {}
-        Ok(true) => {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("File '{filename}' was deleted and cannot be reused"),
-            ));
+    let sc_bytes = serde_json::to_vec(&sc).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to encode sidecar".to_string(),
+        )
+    })?;
+    if is_mirror {
+        let sc_key = sidecar_key(&key);
+        let created = storage
+            .put_if_absent(&sc_key, sc_bytes.clone(), Some("application/json"))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to store mirror sidecar: {e}"),
+                )
+            })?;
+        if !created {
+            let existing = storage.get_bytes(&sc_key).await.map_err(|e| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to verify mirror sidecar: {e}"),
+                )
+            })?;
+            if existing != sc_bytes {
+                let _ = commit_marker(&state, storage, &pkg_norm, intent_nonce).await;
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("File metadata already exists: {filename}"),
+                ));
+            }
         }
-        Err(e) => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("storage error checking tombstone: {e}"),
-            ));
+    }
+
+    // Every multi-bucket writer consumes the exact origin observation it began
+    // under. This closes the private-pending transition just as the older
+    // mirror-only fence closed demotion.
+    if let Some(ref expected) = write_fence {
+        match origin::read_origin_observation(storage, &pkg_norm).await {
+            Ok(Some(current)) if current == *expected => {}
+            Ok(_) => {
+                if let Err(e) = commit_marker(&state, storage, &pkg_norm, intent_nonce).await {
+                    warn!(error=?e, "legacy: failed to close abandoned intent marker");
+                }
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("Package '{pkg_norm}' changed origin during upload"),
+                ));
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("storage error re-checking origin claim: {e}"),
+                ));
+            }
         }
     }
 
     // Ordering invariant: artifact, then sidecars, then index job.
     // The conditional create IS the immutability rule (pypi.org's): a plain
     // HEAD-then-PUT is a TOCTOU hole that lets concurrent uploads swap bytes.
-    let size = spooled.size;
     match storage
         .put_file_if_absent(&key, spooled.path.path(), Some("application/octet-stream"))
         .await
@@ -2597,14 +3121,97 @@ async fn legacy_upload(
         }
     }
 
+    // The mirror sidecar already exists. In multi-bucket mode, if demotion won
+    // after the final fence, leave the typed loser in place for private-precedence
+    // quarantine; deleting here would race a newer private body under the same
+    // immutable key. Single-bucket mode cannot demote behind this writer, so the
+    // shared helper returns without another storage read.
+    if is_mirror {
+        let Some(expected) = write_fence.as_ref() else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "mirror upload lost its origin fence".to_string(),
+            ));
+        };
+        match post_publish_mirror_claim_is_current(&state, storage, &pkg_norm, expected).await {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(e) = commit_marker(&state, storage, &pkg_norm, intent_nonce).await {
+                    warn!(error=?e, "legacy: failed to close post-publish origin race");
+                }
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("Package '{pkg_norm}' changed origin during mirror upload"),
+                ));
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("storage error re-checking mirror claim after publish: {e}"),
+                ));
+            }
+        }
+    }
+
+    // One post-create tombstone HEAD preserves the single-bucket write path.
+    // Multi-bucket mode also checks `.frozen`, whose first-write ordering makes
+    // every interrupted freeze a durable filename fence. A fenced multi-bucket
+    // loser stays occupied and inert: deleting by key here could erase a staged
+    // private replacement that landed after this writer's cross-object read.
+    let filename_fenced = if state.buckets.is_multi() {
+        futures::future::try_join(
+            storage.head_exists(&tombstone_key(&key)),
+            storage.head_exists(&frozen_key(&key)),
+        )
+        .await
+        .map(|(tombstoned, frozen)| tombstoned || frozen)
+    } else {
+        storage.head_exists(&tombstone_key(&key)).await
+    };
+    match filename_fenced {
+        Ok(false) => {}
+        Ok(true) => {
+            if !state.buckets.is_multi() {
+                let _ = storage.delete_keys(std::slice::from_ref(&key)).await;
+            }
+            if let Err(e) = commit_marker(&state, storage, &pkg_norm, intent_nonce).await {
+                warn!(error=?e, "legacy: failed to close fenced upload intent");
+            }
+            return Err((
+                StatusCode::CONFLICT,
+                format!("File '{filename}' is frozen or deleted and cannot be reused"),
+            ));
+        }
+        Err(e) => {
+            if !state.buckets.is_multi() {
+                let _ = storage.delete_keys(std::slice::from_ref(&key)).await;
+            }
+            if let Err(commit_error) = commit_marker(&state, storage, &pkg_norm, intent_nonce).await
+            {
+                warn!(error=?commit_error, "legacy: failed to close filename-fence upload intent");
+            }
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("storage error checking filename fence: {e}"),
+            ));
+        }
+    }
+
     // PEP 658: capture the wheel's METADATA as a static file next to it.
     if is_wheel {
         match wheel_metadata {
             Some(md) => {
-                if let Err(e) = storage
-                    .put_bytes(&metadata_key(&key), md, Some("text/plain; charset=utf-8"))
-                    .await
-                {
+                let write = if is_mirror {
+                    storage
+                        .put_if_absent(&metadata_key(&key), md, Some("text/plain; charset=utf-8"))
+                        .await
+                        .map(|_| ())
+                } else {
+                    storage
+                        .put_bytes(&metadata_key(&key), md, Some("text/plain; charset=utf-8"))
+                        .await
+                };
+                if let Err(e) = write {
                     warn!(error=?e, %filename, "failed to store PEP 658 metadata");
                 }
             }
@@ -2619,7 +3226,7 @@ async fn legacy_upload(
     if is_mirror {
         if let Some(prov) = fields.get("provenance") {
             if let Err(e) = storage
-                .put_bytes(
+                .put_if_absent(
                     &provenance_key(&key),
                     prov.clone().into_bytes(),
                     Some("application/json"),
@@ -2631,39 +3238,51 @@ async fn legacy_upload(
         }
     }
 
-    let sc = Sidecar {
-        sha256,
-        size,
-        version,
-        upload_time,
-        requires_python: fields.get("requires_python").cloned(),
-        yanked,
-        // Per-artifact origin (§4/§6.2): the replicator decides "private only"
-        // from state, never from history.
-        origin: Some(desired_origin.to_string()),
-        yank_epoch: 0,
-    };
-    let sc_bytes = serde_json::to_vec(&sc).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to encode sidecar".to_string(),
-        )
-    })?;
-    storage
-        .put_bytes(&sidecar_key(&key), sc_bytes, Some("application/json"))
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to store sidecar".to_string(),
-            )
-        })?;
+    if !is_mirror {
+        storage
+            .put_bytes(&sidecar_key(&key), sc_bytes, Some("application/json"))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to store sidecar: {e}"),
+                )
+            })?;
+    }
 
     // Commit marker: truth changed, rebuild now. Pairs with the intent above
     // so the worker consumes both; if this write fails the intent still goes
     // stale and heals the package.
     if let Err(e) = commit_marker(&state, storage, &pkg_norm, intent_nonce).await {
         warn!(error=?e, "legacy: failed to write commit marker");
+    }
+
+    // Queue durable per-destination work before the ack, then perform the byte
+    // copies off the response path. Mirror cache content is intentionally local
+    // and pays none of this replication cost.
+    if !is_mirror {
+        match replicate::queue_fanout_markers(&state, &pinned, &pkg_norm, &filename).await {
+            Ok(markers) => replicate::spawn_eager_with_markers(
+                &state,
+                &pinned,
+                pkg_norm.clone(),
+                filename.clone(),
+                markers,
+            ),
+            Err(e) => {
+                // Truth is already immutable and committed. Returning 503 here
+                // would make a correct client retry hit 409. Alarm and kick the
+                // eager path; the full diff remains the final lost-marker proof.
+                error!(package=%pkg_norm, %filename, error=?e, "failed to queue durable replication marker");
+                replicate::spawn_eager_with_markers(
+                    &state,
+                    &pinned,
+                    pkg_norm.clone(),
+                    filename.clone(),
+                    replicate::FanoutMarkers::default(),
+                );
+            }
+        }
     }
 
     // Read-your-writes by waiting: poll our own index until the file shows
@@ -2737,6 +3356,24 @@ pub(crate) async fn commit_marker(
     Ok(())
 }
 
+/// Re-check a mirror writer's exact claim after its artifact becomes visible.
+/// Only multi-bucket replication can demote that claim concurrently. Keeping the
+/// single-bucket branch I/O-free preserves the original serving-path cost.
+pub(crate) async fn post_publish_mirror_claim_is_current(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    expected: &origin::OriginObservation,
+) -> Result<bool> {
+    if !state.buckets.is_multi() {
+        return Ok(true);
+    }
+    Ok(origin::read_origin_observation(storage, pkg)
+        .await?
+        .as_ref()
+        == Some(expected))
+}
+
 /// --- Simple index endpoints ----------------------------------------------
 const CT_JSON: &str = render::SIMPLE_JSON_CONTENT_TYPE;
 const CT_HTML: &str = render::SIMPLE_HTML_CONTENT_TYPE;
@@ -2744,6 +3381,137 @@ const CT_HTML: &str = render::SIMPLE_HTML_CONTENT_TYPE;
 const INDEX_CACHE_CONTROL: &str = "no-cache";
 /// Filenames are immutable, so artifact bytes can be cached forever.
 const ARTIFACT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+
+async fn require_settled_package_read(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+) -> Result<Option<origin::OriginObservation>> {
+    if !state.buckets.is_multi() {
+        return Ok(None);
+    }
+    let observed = origin::read_origin_observation(storage, pkg).await?;
+    if observed
+        .as_ref()
+        .and_then(|claim| claim.pending_manifest.as_ref())
+        .as_ref()
+        .is_some()
+    {
+        bail!("package '{pkg}' is finishing staged private promotion");
+    }
+    Ok(observed)
+}
+
+/// Multi-bucket markers are visibility fences, not merely index hints. A
+/// quarantined mirror body deliberately keeps its canonical key occupied, so
+/// direct and presigned downloads must reject it too. A stale quarantine marker
+/// becomes inert only after a private sidecar proves staged promotion won.
+async fn multi_bucket_file_visible(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    artifact_key: &str,
+) -> Result<bool> {
+    if !state.buckets.is_multi() {
+        return Ok(true);
+    }
+    let Some(claim) = require_settled_package_read(state, storage, pkg).await? else {
+        return Ok(false);
+    };
+    if claim.state == origin::OriginState::Unclaimed {
+        return Ok(false);
+    }
+    let ((tombstoned, frozen), mirror_quarantined) = futures::future::try_join(
+        futures::future::try_join(
+            storage.head_exists(&tombstone_key(artifact_key)),
+            storage.head_exists(&frozen_key(artifact_key)),
+        ),
+        storage.head_exists(&mirror_quarantined_key(artifact_key)),
+    )
+    .await?;
+    if tombstoned || frozen {
+        return Ok(false);
+    }
+
+    if mirror_quarantined || claim.state == origin::OriginState::Private {
+        let sidecar = match storage.get_bytes(&sidecar_key(artifact_key)).await {
+            Ok(bytes) => Some(serde_json::from_slice::<Sidecar>(&bytes)?),
+            Err(error) if storage::is_not_found(&error) => None,
+            Err(error) => return Err(error),
+        };
+        if mirror_quarantined
+            && sidecar.as_ref().and_then(|value| value.origin.as_deref()) != Some(origin::PRIVATE)
+        {
+            return Ok(false);
+        }
+        if claim.state == origin::OriginState::Private
+            && sidecar.as_ref().and_then(|value| value.origin.as_deref()) == Some(origin::MIRROR)
+        {
+            return Ok(false);
+        }
+    }
+    if origin::read_origin_observation(storage, pkg)
+        .await?
+        .as_ref()
+        != Some(&claim)
+    {
+        bail!("package '{pkg}' changed while checking artifact visibility");
+    }
+    Ok(true)
+}
+
+/// An unclaimed proxy companion may bypass local storage only when the package
+/// has no local body, companion, or permanent visibility fence. The exact
+/// claim recheck closes the LIST/HEAD window before the upstream fetch begins.
+async fn unowned_companion_passthrough_safe(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    artifact_key: &str,
+    companion_key: &str,
+) -> Result<bool> {
+    if !state.buckets.is_multi() {
+        return Ok(true);
+    }
+    let before = require_settled_package_read(state, storage, pkg).await?;
+    if before
+        .as_ref()
+        .is_some_and(|claim| claim.state != origin::OriginState::Unclaimed)
+    {
+        return Ok(false);
+    }
+    for key in [
+        artifact_key,
+        companion_key,
+        &tombstone_key(artifact_key),
+        &frozen_key(artifact_key),
+        &mirror_quarantined_key(artifact_key),
+    ] {
+        if storage.head_exists(key).await? {
+            return Ok(false);
+        }
+    }
+    Ok(require_settled_package_read(state, storage, pkg).await? == before)
+}
+
+async fn companion_passthrough_visible(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    artifact_key: &str,
+    companion_key: &str,
+    expected_claim: &Option<origin::OriginObservation>,
+) -> Result<bool> {
+    let visible = if multi_bucket_file_visible(state, storage, pkg, artifact_key).await? {
+        true
+    } else {
+        unowned_companion_passthrough_safe(state, storage, pkg, artifact_key, companion_key).await?
+    };
+    if !visible || !state.buckets.is_multi() {
+        return Ok(visible);
+    }
+    Ok(require_settled_package_read(state, storage, pkg).await? == *expected_claim)
+}
 
 async fn simple_root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
     serve_root_index(&state, accepts_json(&headers), &headers).await
@@ -2812,18 +3580,37 @@ async fn serve_pkg_index(
         return moved_permanently(&target);
     }
     let pinned = state.pin();
+    let claim = match require_settled_package_read(state, pinned.storage.as_ref(), &pkg).await {
+        Ok(claim) => claim,
+        Err(error) => return read_error(error),
+    };
     let json = force_json || accepts_json(headers);
-    if let Some(resp) =
+    let response = if let Some(resp) =
         proxy_package_index(state, pinned.storage.as_ref(), &pkg, json, headers).await
     {
-        return resp;
-    }
-    let (key, ct) = if json {
-        (format!("{SIMPLE_PREFIX}{pkg}/index.json"), CT_JSON)
+        resp
+    } else if state.buckets.is_multi()
+        && claim
+            .as_ref()
+            .is_none_or(|value| value.state == origin::OriginState::Unclaimed)
+    {
+        not_found("no such package")
     } else {
-        (format!("{SIMPLE_PREFIX}{pkg}/index.html"), CT_HTML)
+        let (key, ct) = if json {
+            (format!("{SIMPLE_PREFIX}{pkg}/index.json"), CT_JSON)
+        } else {
+            (format!("{SIMPLE_PREFIX}{pkg}/index.html"), CT_HTML)
+        };
+        serve_index(state, &pinned, key, ct, INDEX_CACHE_CONTROL, headers).await
     };
-    serve_index(state, &pinned, key, ct, INDEX_CACHE_CONTROL, headers).await
+    if state.buckets.is_multi() {
+        match require_settled_package_read(state, pinned.storage.as_ref(), &pkg).await {
+            Ok(after) if after == claim => {}
+            Ok(_) => return read_error(anyhow!("package '{pkg}' changed while serving its index")),
+            Err(error) => return read_error(error),
+        }
+    }
+    response
 }
 
 /// Resolve the proxy for `pkg`, enforcing the eligibility gate (the
@@ -2862,7 +3649,11 @@ async fn proxy_package_index(
         // questions optimistically (the dependency-confusion direction).
         Err(e) => return Some(read_error(e)),
     }
-    let rendered = proxy.package_index(state, pkg, json).await?;
+    let rendered = match proxy.package_index(state, storage, pkg, json).await {
+        Ok(Some(rendered)) => rendered,
+        Ok(None) => return None,
+        Err(error) => return Some(read_error(error)),
+    };
     let revalidated = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -2971,6 +3762,11 @@ async fn files_get(
         return not_found("not an artifact");
     };
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+    let artifact_filename = filename
+        .strip_suffix(METADATA_SUFFIX)
+        .or_else(|| filename.strip_suffix(PROVENANCE_SUFFIX))
+        .unwrap_or(&filename);
+    let artifact_key = format!("{PACKAGES_PREFIX}{pkg}/{artifact_filename}");
 
     // Pin once for the whole download (design §3): companion cache lookups, the
     // proxy fill, presign, and streaming all run against this one context.
@@ -2990,6 +3786,38 @@ async fn files_get(
     // the indexes instead of one storage GET per request. Range requests
     // fall through to storage; nobody range-reads a METADATA file.
     if filename.ends_with(METADATA_SUFFIX) && headers.get(header::RANGE).is_none() {
+        match multi_bucket_file_visible(&state, pinned.storage.as_ref(), &pkg, &artifact_key).await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                match unowned_companion_passthrough_safe(
+                    &state,
+                    pinned.storage.as_ref(),
+                    &pkg,
+                    &artifact_key,
+                    &key,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        if let Some(upstream) = proxy_metadata_passthrough(
+                            &state,
+                            pinned.storage.as_ref(),
+                            &pkg,
+                            &filename,
+                        )
+                        .await
+                        {
+                            return upstream;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => return read_error(error),
+                }
+                return not_found("artifact is fenced");
+            }
+            Err(error) => return read_error(error),
+        }
         let resp = serve_index(
             &state,
             &pinned,
@@ -3017,6 +3845,38 @@ async fn files_get(
     // metadata, served as JSON. A mirror snapshot is point-in-time, so it is
     // cached as immutably as the artifact it describes.
     if filename.ends_with(PROVENANCE_SUFFIX) && headers.get(header::RANGE).is_none() {
+        match multi_bucket_file_visible(&state, pinned.storage.as_ref(), &pkg, &artifact_key).await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                match unowned_companion_passthrough_safe(
+                    &state,
+                    pinned.storage.as_ref(),
+                    &pkg,
+                    &artifact_key,
+                    &key,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        if let Some(upstream) = proxy_provenance_passthrough(
+                            &state,
+                            pinned.storage.as_ref(),
+                            &pkg,
+                            &filename,
+                        )
+                        .await
+                        {
+                            return upstream;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => return read_error(error),
+                }
+                return not_found("artifact is fenced");
+            }
+            Err(error) => return read_error(error),
+        }
         let resp = serve_index(
             &state,
             &pinned,
@@ -3044,6 +3904,11 @@ async fn files_get(
     {
         return resp;
     }
+    match multi_bucket_file_visible(&state, pinned.storage.as_ref(), &pkg, &artifact_key).await {
+        Ok(true) => {}
+        Ok(false) => return not_found("artifact is fenced"),
+        Err(error) => return read_error(error),
+    }
 
     // S3 serves the megabytes, this node serves kilobytes of index: redirect
     // artifact downloads to a presigned URL — but only for clients whose
@@ -3056,9 +3921,11 @@ async fn files_get(
         ArtifactDelivery::Auto => redirect_safe_client(&headers),
     };
     if redirect && !filename.ends_with(METADATA_SUFFIX) && !filename.ends_with(PROVENANCE_SUFFIX) {
-        // No existence check: presigning is local HMAC math, so the redirect
-        // path costs zero network round trips. A signed URL to a missing key
-        // gets S3's own 404 (the server's credentials carry s3:ListBucket —
+        // No artifact-existence check: presigning itself is local HMAC math.
+        // Multi-bucket mode already paid its origin/marker visibility reads
+        // above; single-bucket mode still adds no storage round trip here. A
+        // signed URL to a missing key gets S3's own 404 (the server's
+        // credentials carry s3:ListBucket —
         // required for index rebuilds — which is what makes S3 say 404
         // rather than 403). Existence is the index's job, not this path's.
         // Immutability also makes signed URLs reusable across clients: serve
@@ -3227,12 +4094,26 @@ async fn proxy_metadata_passthrough(
     pkg: &str,
     filename: &str,
 ) -> Option<Response<Body>> {
+    let before = match require_settled_package_read(state, storage, pkg).await {
+        Ok(claim) => claim,
+        Err(error) => return Some(read_error(error)),
+    };
     let proxy = match eligible_proxy(state, storage, pkg).await {
         Some(Ok(proxy)) => proxy,
         Some(Err(resp)) => return Some(resp),
         None => return None,
     };
     let bytes = proxy.fetch_metadata(state, pkg, filename).await?;
+    let artifact_filename = filename.strip_suffix(METADATA_SUFFIX).unwrap_or(filename);
+    let artifact_key = format!("{PACKAGES_PREFIX}{pkg}/{artifact_filename}");
+    let companion_key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+    match companion_passthrough_visible(state, storage, pkg, &artifact_key, &companion_key, &before)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return Some(not_found("artifact is fenced")),
+        Err(error) => return Some(read_error(error)),
+    }
     Some(
         Response::builder()
             .status(StatusCode::OK)
@@ -3252,12 +4133,26 @@ async fn proxy_provenance_passthrough(
     pkg: &str,
     filename: &str,
 ) -> Option<Response<Body>> {
+    let before = match require_settled_package_read(state, storage, pkg).await {
+        Ok(claim) => claim,
+        Err(error) => return Some(read_error(error)),
+    };
     let proxy = match eligible_proxy(state, storage, pkg).await {
         Some(Ok(proxy)) => proxy,
         Some(Err(resp)) => return Some(resp),
         None => return None,
     };
     let bytes = proxy.fetch_provenance(state, pkg, filename).await?;
+    let artifact_filename = filename.strip_suffix(PROVENANCE_SUFFIX).unwrap_or(filename);
+    let artifact_key = format!("{PACKAGES_PREFIX}{pkg}/{artifact_filename}");
+    let companion_key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+    match companion_passthrough_visible(state, storage, pkg, &artifact_key, &companion_key, &before)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return Some(not_found("artifact is fenced")),
+        Err(error) => return Some(read_error(error)),
+    }
     Some(
         Response::builder()
             .status(StatusCode::OK)
@@ -3345,10 +4240,60 @@ async fn files_delete(
             ));
         }
     }
+    let intent_nonce = if state.buckets.is_multi() {
+        Some(worker::mark_intent(storage, &pkg).await.map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("failed to reserve delete: {e}"),
+            )
+        })?)
+    } else {
+        worker::mark_intent(storage, &pkg).await.ok()
+    };
 
-    // Intent before any mutation: a crash mid-delete heals via the stale
-    // intent instead of leaving the view permanently ahead of truth.
-    let intent_nonce = worker::mark_intent(storage, &pkg).await.ok();
+    // A mirror cache eviction cannot be made atomic with a concurrent
+    // mirror->private package demotion: the claim and artifact are separate S3
+    // objects. Manufacturing a private tombstone after any uncertain claim
+    // movement would propagate a cache eviction over real private truth.
+    // Refuse this unnecessary admin operation instead of pretending a
+    // cross-object transaction exists. Broad lifecycle expiry is not a safe
+    // substitute because private and mirror records share `packages/`.
+    let origin_before = match origin::read_origin_observation(storage, &pkg).await {
+        Ok(Some(observed))
+            if matches!(
+                observed.state,
+                origin::OriginState::Private | origin::OriginState::Mirror
+            ) =>
+        {
+            observed
+        }
+        Ok(_) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("artifact '{filename}' has no live origin claim; refusing delete"),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("storage error reading origin: {e}"),
+            ));
+        }
+    };
+    if origin_before.pending_manifest.is_some() {
+        let _ = commit_marker(&state, storage, &pkg, intent_nonce).await;
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Package '{pkg}' is finishing private replication; retry shortly"),
+        ));
+    }
+    if state.buckets.is_multi() && origin_before.state == origin::OriginState::Mirror {
+        let _ = commit_marker(&state, storage, &pkg, intent_nonce).await;
+        return Err((
+            StatusCode::CONFLICT,
+            "Mirror cache eviction is disabled with multiple buckets".into(),
+        ));
+    }
 
     worker::rebuild_package_excluding(&state, storage, &pkg, Some(&filename))
         .await
@@ -3359,6 +4304,24 @@ async fn files_delete(
             )
         })?;
 
+    if state.buckets.is_multi() {
+        let current = origin::read_origin_observation(storage, &pkg)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("storage error re-checking origin: {e}"),
+                )
+            })?;
+        if current.as_ref() != Some(&origin_before) {
+            let _ = commit_marker(&state, storage, &pkg, intent_nonce).await;
+            return Err((
+                StatusCode::CONFLICT,
+                format!("Package '{pkg}' changed origin during delete"),
+            ));
+        }
+    }
+
     // Tombstone a private delete BEFORE the artifact goes (dev/MULTIBUCKET.md
     // §6.4): the filename is barred from reuse, and a crash between here and the
     // artifact delete converges to "gone" (the index rebuild already drops
@@ -3366,16 +4329,8 @@ async fn files_delete(
     // cache management — a cached upstream file stays re-fillable forever — so
     // they are never tombstoned. A read outage fails the delete rather than risk
     // a silent-reuse gap.
-    let is_private = match origin::read_origin(storage, &pkg).await {
-        Ok(owner) => owner.as_deref() == Some(origin::PRIVATE),
-        Err(e) => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("storage error reading origin: {e}"),
-            ));
-        }
-    };
-    if is_private {
+    let replicate_delete = origin_before.state == origin::OriginState::Private;
+    if replicate_delete {
         tombstone::write(storage, &key, &filename)
             .await
             .map_err(|e| {
@@ -3395,6 +4350,7 @@ async fn files_delete(
                 format!("artifact delete failed: {e}"),
             )
         })?;
+
     // Stop handing out the dead URL immediately (same node; peers age out).
     state.presign_cache.invalidate(&key);
     // The `.origin` claim is durable on purpose: deleting every artifact must
@@ -3402,7 +4358,7 @@ async fn files_delete(
     // credentialed client could empty a mirror-owned public name and re-upload
     // it as a private package (the dependency-confusion direction). Re-purposing
     // a name from private to mirror is an operator action gated on storage
-    // access — delete the `.origin` file directly.
+    // access — `pypiron origin release <package>` performs a checked CAS.
     let _ = storage
         .delete_keys(&[
             sidecar_key(&key),
@@ -3414,6 +4370,29 @@ async fn files_delete(
     // Worker confirms from truth and prunes global membership if needed.
     if let Err(e) = commit_marker(&state, storage, &pkg, intent_nonce).await {
         warn!(error=?e, "delete: failed to write commit marker");
+    }
+    // A private delete carries a tombstone. Queue it durably before the ack;
+    // mirror cache eviction remains local and unreplicated.
+    if replicate_delete {
+        match replicate::queue_fanout_markers(&state, &pinned, &pkg, &filename).await {
+            Ok(markers) => replicate::spawn_eager_with_markers(
+                &state,
+                &pinned,
+                pkg.clone(),
+                filename.clone(),
+                markers,
+            ),
+            Err(e) => {
+                error!(package=%pkg, %filename, error=?e, "failed to queue durable delete replication marker");
+                replicate::spawn_eager_with_markers(
+                    &state,
+                    &pinned,
+                    pkg.clone(),
+                    filename.clone(),
+                    replicate::FanoutMarkers::default(),
+                );
+            }
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3445,7 +4424,7 @@ async fn yank_clear(
 
 /// Yank state lives in the sidecar — it is truth, so the system can heal.
 async fn set_yanked(
-    state: &AppState,
+    state: &Arc<AppState>,
     headers: &HeaderMap,
     package: &str,
     filename: &str,
@@ -3460,43 +4439,140 @@ async fn set_yanked(
     let pinned = state.pin();
     let storage = pinned.storage.as_ref();
 
-    let bytes = storage
-        .get_bytes(&sc_key)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "No such file".to_string()))?;
-    let mut sc: Sidecar = serde_json::from_slice(&bytes).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("bad sidecar: {e}"),
-        )
-    })?;
-    // Bump the monotonic yank epoch on a real flip only (dev/MULTIBUCKET.md
-    // §6.5): the cross-bucket merge takes the max epoch, so a redundant re-yank
-    // must not inflate it and a no-op resync stays idempotent. Epochs replace
-    // wall clocks — two buckets have two clocks.
-    if sc.yanked.normalized() != yanked.normalized() {
-        sc.yank_epoch += 1;
+    let desired = yanked.normalized();
+    let mut intent_nonce = if state.buckets.is_multi() {
+        Some(worker::mark_intent(storage, &pkg).await.map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("failed to reserve yank: {e}"),
+            )
+        })?)
+    } else {
+        None
+    };
+    if state.buckets.is_multi() {
+        let observed = origin::read_origin_observation(storage, &pkg)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("storage error reading origin: {e}"),
+                )
+            })?;
+        if observed
+            .as_ref()
+            .and_then(|value| value.pending_manifest.as_ref())
+            .is_some()
+        {
+            let _ = commit_marker(state, storage, &pkg, intent_nonce).await;
+            return Err((
+                StatusCode::CONFLICT,
+                format!("Package '{pkg}' is finishing private replication; retry shortly"),
+            ));
+        }
     }
-    sc.yanked = yanked;
+    let mut wrote = false;
+    let mut record_origin = None;
+    for _ in 0..8 {
+        let Some((bytes, etag)) = storage.get_with_etag(&sc_key).await.map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("sidecar read failed: {e}"),
+            )
+        })?
+        else {
+            return Err((StatusCode::NOT_FOUND, "No such file".to_string()));
+        };
+        let mut sc: Sidecar = serde_json::from_slice(&bytes).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("bad sidecar: {e}"),
+            )
+        })?;
+        if sc.yanked.normalized() == desired {
+            if let Some(nonce) = intent_nonce {
+                let _ = worker::mark_commit(storage, &pkg, &nonce).await;
+            }
+            return Ok(StatusCode::OK);
+        }
 
-    let intent_nonce = worker::mark_intent(storage, &pkg).await.ok();
-    let out = serde_json::to_vec(&sc)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
-    storage
-        .put_bytes(&sc_key, out, Some("application/json"))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
+        // Every real flip consumes the exact sidecar version it observed. Two
+        // nodes yanking during a partition may produce equal epochs (the merge
+        // has a deterministic tie-break), but two writers on one bucket cannot
+        // silently lose an increment through a blind overwrite.
+        sc.yank_epoch = sc.yank_epoch.saturating_add(1);
+        sc.yanked = desired.clone();
+        record_origin = sc.origin.clone();
+        if intent_nonce.is_none() {
+            intent_nonce = worker::mark_intent(storage, &pkg).await.ok();
+        }
+        let out = serde_json::to_vec(&sc)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
+        match storage.put_if_match(&sc_key, &etag, out).await {
+            Ok(Some(_)) => {
+                wrote = true;
+                break;
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")));
+            }
+        }
+    }
+    if !wrote {
+        return Err((
+            StatusCode::CONFLICT,
+            "sidecar changed repeatedly; retry the yank".to_string(),
+        ));
+    }
 
     if let Err(e) = commit_marker(state, storage, &pkg, intent_nonce).await {
         warn!(error=?e, "yank: failed to write commit marker");
+    }
+    let replicate_private = if !state.buckets.is_multi() {
+        false
+    } else if let Some(owner) = record_origin.as_deref() {
+        owner == origin::PRIVATE
+    } else {
+        origin::read_origin(storage, &pkg)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("storage error reading origin for replication: {e}"),
+                )
+            })?
+            .as_deref()
+            == Some(origin::PRIVATE)
+    };
+    if replicate_private {
+        match replicate::queue_fanout_markers(state, &pinned, &pkg, filename).await {
+            Ok(markers) => replicate::spawn_eager_with_markers(
+                state,
+                &pinned,
+                pkg.clone(),
+                filename.to_string(),
+                markers,
+            ),
+            Err(e) => {
+                error!(package=%pkg, %filename, error=?e, "failed to queue durable yank replication marker");
+                replicate::spawn_eager_with_markers(
+                    state,
+                    &pinned,
+                    pkg.clone(),
+                    filename.to_string(),
+                    replicate::FanoutMarkers::default(),
+                );
+            }
+        }
     }
     Ok(StatusCode::OK)
 }
 
 /// Set a project's PEP 792 status (admin). The body is the status doc, e.g.
-/// `{"status":"quarantined","reason":"..."}`. An `active` target carries no
-/// marker, so it is treated as a clear. This is how mirror-over-HTTP `sync`
-/// relays an upstream freeze; the marker is truth, so the index heals from it.
+/// `{"status":"quarantined","reason":"..."}`. An `active` target is a logical
+/// clear, retained as an epoch-bearing event for cross-bucket convergence. This
+/// is how mirror-over-HTTP `sync` relays an upstream freeze.
 async fn project_status_set(
     State(state): State<Arc<AppState>>,
     Path(package): Path<String>,
@@ -3521,12 +4597,13 @@ async fn project_status_clear(
     write_project_status(&state, &package, status::ProjectStatusDoc::default()).await
 }
 
-/// Write (or, for `active`, remove) the project-status marker, then rebuild the
-/// index — status changes what the listing renders (a quarantine serves no
-/// files). Marker is truth, so this is crash-safe via the intent/commit pair.
+/// Record a project-status event, then rebuild the index — status changes what
+/// the listing renders (a quarantine serves no files). Active clears remain as
+/// epoch-bearing truth so an older status on another bucket cannot resurrect.
+/// The intent/commit pair keeps the derived index crash-safe.
 /// Callers MUST enforce admin auth first.
 async fn write_project_status(
-    state: &AppState,
+    state: &Arc<AppState>,
     package: &str,
     doc: status::ProjectStatusDoc,
 ) -> Result<StatusCode, (StatusCode, String)> {
@@ -3536,8 +4613,50 @@ async fn write_project_status(
 
     let pinned = state.pin();
     let storage = pinned.storage.as_ref();
-    let intent_nonce = worker::mark_intent(storage, &pkg).await.ok();
-    let result = if doc.status.is_active() {
+    let intent_nonce = if state.buckets.is_multi() {
+        Some(worker::mark_intent(storage, &pkg).await.map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("failed to reserve status write: {e}"),
+            )
+        })?)
+    } else {
+        worker::mark_intent(storage, &pkg).await.ok()
+    };
+    let status_origin = if state.buckets.is_multi() {
+        let observed = origin::read_origin_observation(storage, &pkg)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("storage error reading origin for replication: {e}"),
+                )
+            })?;
+        if observed
+            .as_ref()
+            .and_then(|value| value.pending_manifest.as_ref())
+            .is_some()
+        {
+            let _ = commit_marker(state, storage, &pkg, intent_nonce).await;
+            return Err((
+                StatusCode::CONFLICT,
+                format!("Package '{pkg}' is finishing private replication; retry shortly"),
+            ));
+        }
+        match observed.as_ref().map(|value| value.state) {
+            Some(origin::OriginState::Private) => Some(status::StatusOrigin::Private),
+            Some(origin::OriginState::Mirror) => Some(status::StatusOrigin::Mirror),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let replicate_private = status_origin == Some(status::StatusOrigin::Private);
+    let result = if state.buckets.is_multi() {
+        status::advance_status(storage, &pkg, &doc, status_origin)
+            .await
+            .map(|_| ())
+    } else if doc.status.is_active() {
         status::clear_status(storage, &pkg).await
     } else {
         status::write_status(storage, &pkg, &doc).await
@@ -3546,6 +4665,34 @@ async fn write_project_status(
 
     if let Err(e) = commit_marker(state, storage, &pkg, intent_nonce).await {
         warn!(error=?e, "status: failed to write commit marker");
+    }
+    if replicate_private {
+        match replicate::queue_fanout_markers(
+            state,
+            &pinned,
+            &pkg,
+            replicate::PROJECT_STATUS_MARKER,
+        )
+        .await
+        {
+            Ok(markers) => replicate::spawn_eager_with_markers(
+                state,
+                &pinned,
+                pkg.clone(),
+                replicate::PROJECT_STATUS_MARKER.to_string(),
+                markers,
+            ),
+            Err(e) => {
+                error!(package=%pkg, error=?e, "failed to queue durable project-status replication marker");
+                replicate::spawn_eager_with_markers(
+                    state,
+                    &pinned,
+                    pkg.clone(),
+                    replicate::PROJECT_STATUS_MARKER.to_string(),
+                    replicate::FanoutMarkers::default(),
+                );
+            }
+        }
     }
     Ok(StatusCode::OK)
 }
@@ -3607,12 +4754,37 @@ async fn sync_local_index(
     let Some(pkg) = checked_pkg_name(&package) else {
         return Err((StatusCode::NOT_FOUND, "no such package".to_string()));
     };
+    let pinned = state.pin();
+    let before = require_settled_package_read(&state, pinned.storage.as_ref(), &pkg)
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+    if state.buckets.is_multi()
+        && before
+            .as_ref()
+            .is_none_or(|claim| claim.state == origin::OriginState::Unclaimed)
+    {
+        return Ok((
+            [(header::CONTENT_TYPE, "application/json")],
+            br#"{"files":[]}"#.to_vec(),
+        ));
+    }
     let key = format!("{SIMPLE_PREFIX}{pkg}/index.json");
-    let bytes = match state.pin().storage.get_bytes(&key).await {
+    let bytes = match pinned.storage.get_bytes(&key).await {
         Ok(b) => b,
         Err(e) if storage::is_not_found(&e) => br#"{"files":[]}"#.to_vec(),
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("read: {e}"))),
     };
+    if state.buckets.is_multi() {
+        let after = require_settled_package_read(&state, pinned.storage.as_ref(), &pkg)
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        if after != before {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("package '{pkg}' changed while reading its local index"),
+            ));
+        }
+    }
     Ok(([(header::CONTENT_TYPE, "application/json")], bytes))
 }
 
@@ -3636,6 +4808,8 @@ impl AppState {
         let buckets = Arc::new(BucketSet::single(storage));
         AppState {
             buckets,
+            bucket_health: None,
+            writes_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             uploader_user: None,
             uploader_pass: None,
             admin_user: None,
@@ -3661,6 +4835,12 @@ impl AppState {
             global_names: Arc::new(tokio::sync::Mutex::new(None)),
             inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
+            empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            promotion_lock_observations: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             metrics: Arc::new(metrics::Metrics::new()),
             counters: Arc::new(counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),
@@ -3979,6 +5159,268 @@ fn project_tag(headers: &HeaderMap) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn single_bucket_post_publish_mirror_check_is_storage_io_free() {
+        let storage = Arc::new(storage::test_support::InMemStorage::default());
+        // If the helper accidentally reads this malformed claim, parsing fails.
+        storage.insert(&origin::origin_key("pkg"), b"not an origin claim".to_vec());
+        let state = AppState::headless(storage.clone());
+        let expected = origin::OriginObservation {
+            state: origin::OriginState::Mirror,
+            etag: "unused-single-bucket-etag".to_string(),
+            pending_manifest: None,
+        };
+
+        assert!(
+            post_publish_mirror_claim_is_current(&state, storage.as_ref(), "pkg", &expected,)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_bucket_post_publish_mirror_check_reads_the_exact_claim() {
+        let first = Arc::new(storage::test_support::InMemStorage::default());
+        let second = Arc::new(storage::test_support::InMemStorage::default());
+        origin::claim_origin(first.as_ref(), "pkg", origin::MIRROR)
+            .await
+            .unwrap();
+        let expected = origin::read_origin_observation(first.as_ref(), "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut state = AppState::headless(first.clone());
+        state.buckets = Arc::new(BucketSet::new(vec![
+            BucketHandle {
+                storage: first.clone(),
+                name: "first".to_string(),
+            },
+            BucketHandle {
+                storage: second,
+                name: "second".to_string(),
+            },
+        ]));
+
+        assert!(
+            post_publish_mirror_claim_is_current(&state, first.as_ref(), "pkg", &expected,)
+                .await
+                .unwrap()
+        );
+        assert!(
+            origin::demote_observed_mirror(first.as_ref(), "pkg", &expected)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !post_publish_mirror_claim_is_current(&state, first.as_ref(), "pkg", &expected,)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_bucket_download_fences_pending_and_quarantined_mirror_bytes() {
+        let first = Arc::new(storage::test_support::InMemStorage::default());
+        let second = Arc::new(storage::test_support::InMemStorage::default());
+        let mut state = AppState::headless(first.clone());
+        state.buckets = Arc::new(BucketSet::new(vec![
+            BucketHandle {
+                storage: first.clone(),
+                name: "first".to_string(),
+            },
+            BucketHandle {
+                storage: second,
+                name: "second".to_string(),
+            },
+        ]));
+        let key = format!("{PACKAGES_PREFIX}pkg/pkg-1.whl");
+        first.insert(&key, b"public bytes".to_vec());
+        // A retained or legacy canonical body is not public authority without
+        // a settled owner in multi-bucket mode.
+        assert!(
+            !multi_bucket_file_visible(&state, first.as_ref(), "pkg", &key)
+                .await
+                .unwrap()
+        );
+        origin::claim_origin(first.as_ref(), "pkg", origin::PRIVATE)
+            .await
+            .unwrap();
+        let mut sidecar = Sidecar {
+            sha256: "ab".repeat(32),
+            size: 12,
+            version: "1".into(),
+            upload_time: "2026-01-01T00:00:00Z".into(),
+            requires_python: None,
+            yanked: Yanked::Flag(false),
+            origin: Some(origin::MIRROR.into()),
+            yank_epoch: 0,
+        };
+        first.insert(&sidecar_key(&key), serde_json::to_vec(&sidecar).unwrap());
+        first.insert(&mirror_quarantined_key(&key), b"{}".to_vec());
+
+        assert!(
+            !multi_bucket_file_visible(&state, first.as_ref(), "pkg", &key)
+                .await
+                .unwrap()
+        );
+
+        // A stale quarantine marker cannot hide a private winner forever.
+        sidecar.origin = Some(origin::PRIVATE.into());
+        first.insert(&sidecar_key(&key), serde_json::to_vec(&sidecar).unwrap());
+        assert!(
+            multi_bucket_file_visible(&state, first.as_ref(), "pkg", &key)
+                .await
+                .unwrap()
+        );
+
+        origin::begin_private_promotion(
+            first.as_ref(),
+            "pkg",
+            "_staging/repl/pkg/manifest@pending.json",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            multi_bucket_file_visible(&state, first.as_ref(), "pkg", &key)
+                .await
+                .is_err()
+        );
+
+        origin::claim_origin(first.as_ref(), "unclaimed", origin::PRIVATE)
+            .await
+            .unwrap();
+        assert!(origin::release_for_repurpose(first.as_ref(), "unclaimed")
+            .await
+            .unwrap());
+        let unclaimed_key = format!("{PACKAGES_PREFIX}unclaimed/unclaimed-1.whl");
+        first.insert(&unclaimed_key, b"retained bytes".to_vec());
+        assert!(
+            !multi_bucket_file_visible(&state, first.as_ref(), "unclaimed", &unclaimed_key)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_bucket_download_rejects_freeze_and_delete_markers() {
+        let first = Arc::new(storage::test_support::InMemStorage::default());
+        let second = Arc::new(storage::test_support::InMemStorage::default());
+        origin::claim_origin(first.as_ref(), "pkg", origin::PRIVATE)
+            .await
+            .unwrap();
+        let mut state = AppState::headless(first.clone());
+        state.buckets = Arc::new(BucketSet::new(vec![
+            BucketHandle {
+                storage: first.clone(),
+                name: "first".to_string(),
+            },
+            BucketHandle {
+                storage: second,
+                name: "second".to_string(),
+            },
+        ]));
+        let key = format!("{PACKAGES_PREFIX}pkg/pkg-1.whl");
+        first.insert(&key, b"bytes".to_vec());
+        first.insert(&frozen_key(&key), b"{}".to_vec());
+        assert!(
+            !multi_bucket_file_visible(&state, first.as_ref(), "pkg", &key)
+                .await
+                .unwrap()
+        );
+
+        first.delete_keys(&[frozen_key(&key)]).await.unwrap();
+        first.insert(&tombstone_key(&key), b"{}".to_vec());
+        assert!(
+            !multi_bucket_file_visible(&state, first.as_ref(), "pkg", &key)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_bucket_index_routes_require_a_settled_owner() {
+        let first = Arc::new(storage::test_support::InMemStorage::default());
+        let second = Arc::new(storage::test_support::InMemStorage::default());
+        let mut state = AppState::headless(first.clone());
+        state.buckets = Arc::new(BucketSet::new(vec![
+            BucketHandle {
+                storage: first.clone(),
+                name: "first".to_string(),
+            },
+            BucketHandle {
+                storage: second,
+                name: "second".to_string(),
+            },
+        ]));
+        let artifact = format!("{PACKAGES_PREFIX}pkg/pkg-1.whl");
+        first.insert(&artifact, b"bytes".to_vec());
+        first.insert(
+            &sidecar_key(&artifact),
+            serde_json::to_vec(&Sidecar {
+                sha256: "ab".repeat(32),
+                size: 5,
+                version: "1".into(),
+                upload_time: "2026-01-01T00:00:00Z".into(),
+                requires_python: None,
+                yanked: Yanked::Flag(false),
+                origin: Some(origin::PRIVATE.into()),
+                yank_epoch: 0,
+            })
+            .unwrap(),
+        );
+        first.insert(
+            &format!("{SIMPLE_PREFIX}pkg/index.json"),
+            br#"{"meta":{"api-version":"1.4"},"files":[]}"#.to_vec(),
+        );
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            serve_pkg_index(&state, "pkg", true, &headers)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            render_project(&state, &headers, "pkg", None).await.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        origin::claim_origin(first.as_ref(), "pkg", origin::PRIVATE)
+            .await
+            .unwrap();
+        assert_eq!(
+            serve_pkg_index(&state, "pkg", true, &headers)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            render_project(&state, &headers, "pkg", None).await.status(),
+            StatusCode::OK
+        );
+
+        origin::begin_private_promotion(
+            first.as_ref(),
+            "pkg",
+            "_staging/repl/pkg/manifest@pending.json",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serve_pkg_index(&state, "pkg", true, &headers)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            render_project(&state, &headers, "pkg", None).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
     fn basic_headers(user: &str, pass: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         let v = format!("Basic {}", b64.encode(format!("{user}:{pass}")));
@@ -4004,6 +5446,15 @@ mod tests {
             loopback_health_url(Some("not-an-addr")),
             "http://127.0.0.1:8080/health"
         );
+    }
+
+    #[test]
+    fn intent_grace_rejects_unsafe_or_unrepresentable_values() {
+        assert!(validate_intent_grace_secs(3).is_ok());
+        assert!(validate_intent_grace_secs(900).is_ok());
+        assert!(validate_intent_grace_secs(0).is_err());
+        assert!(validate_intent_grace_secs(2).is_err());
+        assert!(validate_intent_grace_secs(i64::MAX as u64 + 1).is_err());
     }
 
     #[test]

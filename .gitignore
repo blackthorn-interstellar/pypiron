@@ -60,3 +60,6 @@ dev/landscape/
 # Launch/marketing strategy — kept local, not published
 /marketing/
 dev/marketing/
+
+# Local marketing notes (not shipped)
+dev/MARKETING.md

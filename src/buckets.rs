@@ -301,6 +301,13 @@ impl BucketSet {
             }
         }
 
+        // Fail closed when nothing answered: committing a fabricated generation 0
+        // here permanently write-fences this node once the buckets recover at a
+        // higher generation (v1 review finding). Mirror `migrate_topology_with`'s
+        // no-reachable-bucket refusal.
+        if reachable.is_empty() {
+            bail!("cannot verify topology: no configured bucket is reachable at startup");
+        }
         let generation = generation.unwrap_or(0);
         let body = encode_stamp(&names, &expected_hash, generation)?;
         // A conflict at the highest generation has no deterministic winner.
@@ -374,6 +381,44 @@ impl BucketSet {
         report.generation = Some(generation);
         self.set_topology_generation(generation);
         Ok(report)
+    }
+
+    /// The member identities recorded by the highest-generation topology stamp on
+    /// any *reachable* bucket in this set, or `None` when no reachable bucket
+    /// carries a stamp yet. `migrate` uses this to learn the *previous* topology
+    /// so a bucket being dropped can be checked for undrained notes before it is
+    /// removed. Availability failures are skipped; every other error fails closed.
+    pub async fn stamped_member_names_with<F>(
+        &self,
+        is_availability: F,
+    ) -> Result<Option<Vec<String>>>
+    where
+        F: Fn(usize, &anyhow::Error) -> bool,
+    {
+        let mut best: Option<(u64, Vec<String>)> = None;
+        for (index, handle) in self.handles.iter().enumerate() {
+            match bounded_topology_io(handle.storage.get_with_etag(TOPOLOGY_STAMP_KEY)).await {
+                Ok(Some((bytes, _etag))) => {
+                    let found = parse_stamp(&handle.name, &bytes)?;
+                    if best
+                        .as_ref()
+                        .is_none_or(|(gen, _)| found.generation >= *gen)
+                    {
+                        best = Some((found.generation, found.buckets));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) if topology_error_is_availability(index, &error, &is_availability) => {
+                    warn!(bucket=%handle.name, error=%error, "bucket unreachable while reading topology stamp; skipping");
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("read topology stamp from bucket '{}'", handle.name)
+                    })
+                }
+            }
+        }
+        Ok(best.map(|(_, names)| names))
     }
 
     /// Conservatively verify one bucket after a reachability transition. Use
@@ -993,6 +1038,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_refuses_when_no_bucket_is_reachable() {
+        // Both buckets hang: the internal control-I/O timeout classes each as
+        // unreachable, so nothing answers. Committing a fabricated generation 0
+        // would write-fence the node once they recover higher; fail closed.
+        let east = Arc::new(TopologyTestStorage::new());
+        let west = Arc::new(TopologyTestStorage::new());
+        east.hang_reads();
+        west.hang_reads();
+        let set = BucketSet::new(vec![
+            topology_test_handle("east", &east),
+            topology_test_handle("west", &west),
+        ]);
+
+        let error = set.verify_topology_with(|_, _| false).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no configured bucket is reachable"));
+        assert_eq!(set.topology_generation(), None);
+    }
+
+    #[tokio::test]
     async fn runtime_verification_and_race_proof_bound_hung_reads() {
         let east = Arc::new(InMemStorage::default());
         let west = Arc::new(TopologyTestStorage::new());
@@ -1251,6 +1317,44 @@ mod tests {
         let x = vec!["ab".to_string(), "c".to_string()];
         let y = vec!["a".to_string(), "bc".to_string()];
         assert_ne!(topology_hash(&x), topology_hash(&y));
+    }
+
+    #[test]
+    fn scheme_qualified_identities_distinguish_same_name_across_backends() {
+        let s3 = Arc::new(InMemStorage::default());
+        let gs = Arc::new(InMemStorage::default());
+        // A legal mixed list: same bare name, different backend. The
+        // scheme-qualified identities differ, so duplicate detection accepts it.
+        let ok = BucketSet::new(vec![
+            memory_handle("s3://shared", &s3),
+            memory_handle("gs://shared", &gs),
+        ]);
+        assert!(ok.validate_topology_config().is_ok());
+
+        // The same identity twice is a real duplicate and stays refused.
+        let dup = BucketSet::new(vec![
+            memory_handle("s3://shared", &s3),
+            memory_handle("s3://shared", &gs),
+        ]);
+        let err = dup.validate_topology_config().unwrap_err();
+        assert!(err.to_string().contains("duplicate bucket identity"));
+    }
+
+    #[test]
+    fn cross_scheme_stamp_is_refused() {
+        // s3://iron and gs://iron are different buckets: neither the hash nor
+        // the identity check may treat a stamp from one as the other.
+        let expected = names(&["s3://iron"]);
+        let expected_hash = topology_hash(&expected);
+        let foreign_names = names(&["gs://iron"]);
+        assert_ne!(expected_hash, topology_hash(&foreign_names));
+        let foreign = TopologyStamp {
+            buckets: foreign_names.clone(),
+            hash: topology_hash(&foreign_names),
+            generation: 0,
+        };
+        let err = check_stamp_identity("iron", &foreign, &expected_hash, &expected).unwrap_err();
+        assert!(err.to_string().contains("different bucket topology"));
     }
 
     #[test]

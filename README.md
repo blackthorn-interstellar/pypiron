@@ -18,6 +18,7 @@ pypiron is the fastest, most reliable PyPI server (and mirror) available.
 - **Supply-chain quarantine, on by default.** New releases wait 7 days. Most attacks surface first.
 - **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
 - **Scales to a fleet.** Point any number of nodes at one bucket. No coordination.
+- **Survives a cloud outage.** List buckets across regions or clouds (S3 + GCS + Azure); uploads land on all of them, reads fail over.
 - **Works with everything.** uv, pip, poetry, pdm, twine, pipenv, hatch, flit.
 - **Download stats built in.**
 

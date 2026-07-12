@@ -38,6 +38,12 @@
 # s3-endpoint-url = "http://localhost:9000"   # point at an S3-compatible endpoint
 # s3-force-path-style = false
 
+# Multi-cloud replication and failover: a list of bucket URIs, any mix of
+# backends. Scheme is required; @region is S3-only; the first entry is
+# preferred. Each backend uses its native credential chain and the matching
+# endpoint knobs above/below. A single-entry list equals single-bucket mode.
+# buckets = ["s3://iron-east@us-east-1", "gs://iron-backup", "az://ironblob"]
+
 # Google Cloud Storage. A service-account key enables presigned redirects;
 # under Application Default Credentials (no key) downloads stream instead.
 # gcs-bucket = "my-bucket"
@@ -94,9 +100,11 @@
 # worker-interval-secs = 1                  # cadence for noticing peer nodes' writes
 # bucket-leave-failures = 3                 # consecutive timeout/connect/5xx failures before switching
 # bucket-return-healthy-secs = 300           # stable recovery required before returning to a preferred bucket
+# fanout-grace-secs = 30                     # pre-ack fan-out grace per secondary bucket before a repair note
 # intent-grace-secs = 900                   # upload/replication crash grace; range 3..9223372036854775807
 # audit-on-boot = true                      # self-heal sweep when a node becomes leader
 # reconcile-interval-secs = 86400           # audit sweep interval (an unchanged corpus is ~free)
+# repl-sweep-interval-secs = 300             # _repl/ repair-note sweep backstop (also fires on bucket heal)
 # lease-ttl-secs = 30                       # leader lease TTL (multi-node S3)
 
 

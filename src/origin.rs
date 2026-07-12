@@ -84,10 +84,6 @@ impl OriginState {
 pub struct OriginObservation {
     pub state: OriginState,
     pub etag: String,
-    /// A committed replication manifest currently owns the package. The
-    /// package remains logically private, but request-path mutations must wait
-    /// until that exact manifest has finished promotion.
-    pub pending_manifest: Option<String>,
 }
 
 /// Input to [`claim_origin`]. Existing callers pass an origin string. A caller
@@ -119,12 +115,6 @@ impl<'a> From<&'a str> for ClaimRequest<'a> {
 struct ClaimBody {
     origin: String,
     nonce: String,
-    #[serde(
-        rename = "pending-manifest",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pending_manifest: Option<String>,
 }
 
 /// Generate a 128-bit, lowercase-hex nonce without another dependency. Each
@@ -154,50 +144,24 @@ fn fresh_nonce() -> String {
 }
 
 fn encode_claim(state: OriginState) -> Result<Vec<u8>> {
-    encode_claim_with_pending(state, None)
-}
-
-fn encode_claim_with_pending(
-    state: OriginState,
-    pending_manifest: Option<&str>,
-) -> Result<Vec<u8>> {
-    if pending_manifest.is_some() && state != OriginState::Private {
-        bail!("only a private origin claim may carry a pending manifest");
-    }
     Ok(serde_json::to_vec(&ClaimBody {
         origin: state.as_str().to_string(),
         nonce: fresh_nonce(),
-        pending_manifest: pending_manifest.map(str::to_string),
     })?)
-}
-
-struct DecodedClaim {
-    state: OriginState,
-    pending_manifest: Option<String>,
 }
 
 /// Parse the nonce-bearing JSON format and the pre-P2.5 plain-text format.
 /// Malformed JSON and unknown states fail closed.
-fn decode_claim(bytes: &[u8]) -> Result<DecodedClaim> {
+fn decode_claim(bytes: &[u8]) -> Result<OriginState> {
     let text = std::str::from_utf8(bytes)?.trim();
     if text.starts_with('{') {
         let body: ClaimBody = serde_json::from_str(text)?;
         if body.nonce.len() != 32 || !body.nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("origin claim nonce must be 128-bit hex");
         }
-        let state = OriginState::parse(&body.origin)?;
-        if body.pending_manifest.is_some() && state != OriginState::Private {
-            bail!("only a private origin claim may carry a pending manifest");
-        }
-        Ok(DecodedClaim {
-            state,
-            pending_manifest: body.pending_manifest,
-        })
+        OriginState::parse(&body.origin)
     } else {
-        Ok(DecodedClaim {
-            state: OriginState::parse(text)?,
-            pending_manifest: None,
-        })
+        OriginState::parse(text)
     }
 }
 
@@ -216,23 +180,17 @@ pub fn origin_key(pkg: &str) -> String {
 /// would fail the exclusivity check open.
 pub async fn read_origin(storage: &dyn Storage, pkg: &str) -> Result<Option<String>> {
     Ok(match read_origin_claim(storage, pkg).await? {
-        Some((OriginState::Unclaimed, _)) | None => None,
-        Some((state, _)) => Some(state.as_str().to_string()),
+        Some(OriginState::Unclaimed) | None => None,
+        Some(state) => Some(state.as_str().to_string()),
     })
 }
 
-/// Read the logical claim plus its pending owner without requiring conditional
-/// storage support. Index rebuilds need the pending bit and the pre-CAS origin
-/// classification, but never use this view as CAS authority.
-pub async fn read_origin_claim(
-    storage: &dyn Storage,
-    pkg: &str,
-) -> Result<Option<(OriginState, Option<String>)>> {
+/// Read the logical claim without requiring conditional storage support.
+/// Index rebuilds need the pre-CAS origin classification, but never use this
+/// view as CAS authority.
+pub async fn read_origin_claim(storage: &dyn Storage, pkg: &str) -> Result<Option<OriginState>> {
     match storage.get_bytes(&origin_key(pkg)).await {
-        Ok(bytes) => {
-            let decoded = decode_claim(&bytes)?;
-            Ok(Some((decoded.state, decoded.pending_manifest)))
-        }
+        Ok(bytes) => Ok(Some(decode_claim(&bytes)?)),
         Err(e) if is_not_found(&e) => Ok(None),
         Err(e) => Err(e),
     }
@@ -246,14 +204,10 @@ pub async fn read_origin_observation(
     pkg: &str,
 ) -> Result<Option<OriginObservation>> {
     match storage.get_with_etag(&origin_key(pkg)).await? {
-        Some((bytes, etag)) => {
-            let decoded = decode_claim(&bytes)?;
-            Ok(Some(OriginObservation {
-                state: decoded.state,
-                etag,
-                pending_manifest: decoded.pending_manifest,
-            }))
-        }
+        Some((bytes, etag)) => Ok(Some(OriginObservation {
+            state: decode_claim(&bytes)?,
+            etag,
+        })),
         None => Ok(None),
     }
 }
@@ -380,73 +334,7 @@ pub async fn demote_observed_mirror(
         .map(|etag| OriginObservation {
             state: OriginState::Private,
             etag,
-            pending_manifest: None,
         }))
-}
-
-/// Atomically reserve a package for one committed replication manifest. The
-/// claim is already logically private while pending, so mirrors remain locked
-/// out; request-path mutations reject the pending marker until promotion
-/// completes. A different manifest owns the package when this returns `None`.
-pub async fn begin_private_promotion(
-    storage: &dyn Storage,
-    pkg: &str,
-    manifest_key: &str,
-) -> Result<Option<OriginObservation>> {
-    let expected_prefix = format!("_staging/repl/{pkg}/manifest@");
-    if !manifest_key.starts_with(&expected_prefix) {
-        bail!("replication manifest for '{pkg}' has an invalid key '{manifest_key}'");
-    }
-    for _ in 0..CLAIM_ATTEMPTS {
-        let observed = read_origin_observation(storage, pkg)
-            .await?
-            .ok_or_else(|| anyhow!("package '{pkg}' has no origin claim for staged promotion"))?;
-        if let Some(owner) = observed.pending_manifest.as_deref() {
-            return Ok((owner == manifest_key).then_some(observed));
-        }
-        if !matches!(observed.state, OriginState::Mirror | OriginState::Private) {
-            bail!(
-                "package '{pkg}' is '{}' while staged promotion requires mirror or private",
-                observed.state.as_str()
-            );
-        }
-        if let Some(etag) = storage
-            .put_if_match(
-                &origin_key(pkg),
-                &observed.etag,
-                encode_claim_with_pending(OriginState::Private, Some(manifest_key))?,
-            )
-            .await?
-        {
-            return Ok(Some(OriginObservation {
-                state: OriginState::Private,
-                etag,
-                pending_manifest: Some(manifest_key.to_string()),
-            }));
-        }
-    }
-    bail!("could not reserve '{pkg}' for staged promotion")
-}
-
-/// Release the exact pending-manifest reservation after every staged mutation
-/// has converged. A stale worker loses the CAS and leaves the current owner
-/// untouched.
-pub async fn finish_private_promotion(
-    storage: &dyn Storage,
-    pkg: &str,
-    observed: &OriginObservation,
-) -> Result<bool> {
-    if observed.state != OriginState::Private || observed.pending_manifest.is_none() {
-        return Ok(false);
-    }
-    Ok(storage
-        .put_if_match(
-            &origin_key(pkg),
-            &observed.etag,
-            encode_claim(OriginState::Private)?,
-        )
-        .await?
-        .is_some())
 }
 
 /// Compatibility wrapper for callers that still carry only an etag. Re-read the
@@ -494,7 +382,6 @@ pub async fn release_observed_empty_mirror(
         .map(|etag| OriginObservation {
             state: OriginState::Unclaimed,
             etag,
-            pending_manifest: None,
         }))
 }
 
@@ -538,21 +425,12 @@ pub async fn releasable_for_repurpose(
     pkg: &str,
 ) -> Result<Option<OriginObservation>> {
     let observed = read_origin_observation(storage, pkg).await?;
-    if observed
-        .as_ref()
-        .and_then(|value| value.pending_manifest.as_ref())
-        .is_some()
-    {
-        bail!("package '{pkg}' still has a committed replication manifest");
-    }
     let has_package_truth = package_has_truth(storage, pkg).await?;
     let dirty_prefix = format!("{DIRTY_PREFIX}{pkg}");
     let has_pending_write = storage.list_all(&dirty_prefix).await?.iter().any(|entry| {
         entry.key == dirty_prefix || entry.key.starts_with(&format!("{dirty_prefix}!"))
     });
-    if has_package_truth
-        || has_pending_write
-        || has_committed_stage_or_replication(storage, pkg).await?
+    if has_package_truth || has_pending_write || has_pending_replication_notes(storage, pkg).await?
     {
         bail!(
             "package '{pkg}' still has package truth, pending write markers, or replication work"
@@ -561,26 +439,39 @@ pub async fn releasable_for_repurpose(
     Ok(observed.filter(|value| value.state != OriginState::Unclaimed))
 }
 
-async fn has_committed_stage_or_replication(storage: &dyn Storage, pkg: &str) -> Result<bool> {
-    let stage_prefix = format!("_staging/repl/{pkg}/");
-    if storage.list_all(&stage_prefix).await?.iter().any(|entry| {
-        entry
-            .key
-            .strip_prefix(&stage_prefix)
-            .is_some_and(|name| name.starts_with("manifest@"))
-    }) {
-        return Ok(true);
+async fn has_pending_replication_notes(storage: &dyn Storage, pkg: &str) -> Result<bool> {
+    // `_repl/<dest>/<pkg>/…` notes are failure-only, so in steady state the tree
+    // is empty and the first bounded page settles it. Page rather than
+    // materialize the whole tree (which can be an arbitrarily large backlog),
+    // short-circuiting on the first note that names this package.
+    let mut after: Option<String> = None;
+    loop {
+        let page = storage
+            .list_page("_repl/", after.as_deref(), REPL_NOTE_SCAN_PAGE)
+            .await?;
+        let Some(last) = page.last() else {
+            return Ok(false);
+        };
+        if page.iter().any(|entry| repl_note_is_for(&entry.key, pkg)) {
+            return Ok(true);
+        }
+        after = Some(last.key.clone());
     }
-    Ok(storage.list_all("_repl/").await?.iter().any(|entry| {
-        let Some(rest) = entry.key.strip_prefix("_repl/") else {
-            return false;
-        };
-        let Some((_, rest)) = rest.split_once('/') else {
-            return false;
-        };
-        rest.strip_prefix(pkg)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-    }))
+}
+
+/// One page of `_repl/` keys to scan at a time; matches the sweep's page size.
+const REPL_NOTE_SCAN_PAGE: usize = 1_000;
+
+/// Whether a `_repl/<dest>/<pkg>/<file>!<nonce>` note names `pkg`.
+fn repl_note_is_for(key: &str, pkg: &str) -> bool {
+    let Some(rest) = key.strip_prefix("_repl/") else {
+        return false;
+    };
+    let Some((_, rest)) = rest.split_once('/') else {
+        return false;
+    };
+    rest.strip_prefix(pkg)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 pub async fn release_observed_for_repurpose(
@@ -614,7 +505,6 @@ pub async fn release_observed_for_repurpose(
     let unclaimed = OriginObservation {
         state: OriginState::Unclaimed,
         etag,
-        pending_manifest: None,
     };
 
     let package_prefix = format!("{PACKAGES_PREFIX}{pkg}/");
@@ -628,7 +518,7 @@ pub async fn release_observed_for_repurpose(
         || storage.list_all(&dirty_prefix).await?.iter().any(|entry| {
             entry.key == dirty_prefix || entry.key.starts_with(&format!("{dirty_prefix}!"))
         })
-        || has_committed_stage_or_replication(storage, pkg).await?;
+        || has_pending_replication_notes(storage, pkg).await?;
     if appeared {
         let restored = claim_origin(
             storage,
@@ -921,82 +811,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_manifest_is_a_cas_owned_private_barrier() {
-        let s = store();
-        claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
-        let first = "_staging/repl/pkg/manifest@one.json";
-        let pending = begin_private_promotion(s.as_ref(), "pkg", first)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(pending.state, OriginState::Private);
-        assert_eq!(pending.pending_manifest.as_deref(), Some(first));
-        assert_eq!(
-            read_origin(s.as_ref(), "pkg").await.unwrap().as_deref(),
-            Some(PRIVATE)
-        );
-
-        assert!(
-            begin_private_promotion(s.as_ref(), "pkg", "_staging/repl/pkg/manifest@two.json")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(finish_private_promotion(s.as_ref(), "pkg", &pending)
-            .await
-            .unwrap());
-        let settled = read_origin_observation(s.as_ref(), "pkg")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(settled.state, OriginState::Private);
-        assert_eq!(settled.pending_manifest, None);
-    }
-
-    #[tokio::test]
-    async fn stale_promotion_finisher_cannot_clear_a_newer_pending_owner() {
-        let s = store();
-        claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
-        let first_key = "_staging/repl/pkg/manifest@one.json";
-        let first = begin_private_promotion(s.as_ref(), "pkg", first_key)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(finish_private_promotion(s.as_ref(), "pkg", &first)
-            .await
-            .unwrap());
-
-        let second_key = "_staging/repl/pkg/manifest@two.json";
-        let second = begin_private_promotion(s.as_ref(), "pkg", second_key)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!finish_private_promotion(s.as_ref(), "pkg", &first)
-            .await
-            .unwrap());
-
-        let current = read_origin_observation(s.as_ref(), "pkg")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.etag, second.etag);
-        assert_eq!(current.pending_manifest.as_deref(), Some(second_key));
-    }
-
-    #[tokio::test]
     async fn operator_release_rejects_committed_replication_work() {
-        for key in [
-            "_staging/repl/pkg/manifest@one.json",
-            "_repl/1/pkg/pkg-1.whl!nonce",
-        ] {
-            let s = store();
-            claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
-            s.insert(key, b"{}".to_vec());
-            let error = releasable_for_repurpose(s.as_ref(), "pkg")
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains("replication"));
-        }
+        let s = store();
+        claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
+        s.insert("_repl/1/pkg/pkg-1.whl!nonce", b"{}".to_vec());
+        let error = releasable_for_repurpose(s.as_ref(), "pkg")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("replication"));
     }
 
     #[tokio::test]

@@ -71,6 +71,18 @@ pub struct Sidecar {
     pub version: String,
     #[serde(rename = "upload-time")]
     pub upload_time: String,
+    /// Server-stamped receive time (epoch milliseconds) used only as the
+    /// first-uploaded-wins tiebreak for the rare cross-partition byte conflict
+    /// (dev/MULTIBUCKET.md §Conflict resolution). Absent on legacy sidecars
+    /// and on mirror artifacts; a conflict with either side missing this field,
+    /// or with the two within a small skew window, degrades to quarantine-both
+    /// + alarm.
+    #[serde(
+        rename = "upload-epoch-ms",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub upload_epoch_ms: Option<u64>,
     #[serde(
         rename = "requires-python",
         default,
@@ -234,5 +246,26 @@ mod tests {
         let out = serde_json::to_string(&migrated).unwrap();
         assert!(out.contains(r#""origin":"private""#));
         assert!(out.contains(r#""yank-epoch":3"#));
+    }
+
+    #[test]
+    fn upload_epoch_ms_defaults_for_legacy_sidecars_and_round_trips() {
+        let legacy: Sidecar =
+            serde_json::from_str(r#"{"sha256":"a","size":1,"version":"1","upload-time":"t"}"#)
+                .unwrap();
+        assert_eq!(legacy.upload_epoch_ms, None);
+        let out = serde_json::to_string(&legacy).unwrap();
+        assert!(
+            !out.contains("upload-epoch-ms"),
+            "absent upload epoch must not serialize"
+        );
+
+        let stamped: Sidecar = serde_json::from_str(
+            r#"{"sha256":"a","size":1,"version":"1","upload-time":"t","upload-epoch-ms":1234}"#,
+        )
+        .unwrap();
+        assert_eq!(stamped.upload_epoch_ms, Some(1234));
+        let out = serde_json::to_string(&stamped).unwrap();
+        assert!(out.contains(r#""upload-epoch-ms":1234"#));
     }
 }

@@ -303,8 +303,25 @@ async fn run_bucket_health_until(
     state: Arc<AppState>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Only the storage probe is traffic-gated; selection maintenance runs every
+    // tick so a switch applies the instant an observation (a probe, or the
+    // worker's own I/O on the selected bucket) marks a bucket unhealthy.
+    let mut last_probe: Option<Instant> = None;
     loop {
-        probe_buckets(&state).await;
+        // Traffic-gated cadence (dev/MULTIBUCKET.md §Health): probe at full
+        // speed while there is recent request traffic OR any bucket is unhealthy
+        // or recovering — re-probing an unhealthy bucket is the only way it heals
+        // back, so that is never gated off. Otherwise decay to the idle cadence,
+        // accepting that the first request after idle may pay one bounded
+        // discovery timeout before failover.
+        let full_cadence =
+            state.recent_request_traffic() || state.any_bucket_unhealthy_or_recovering();
+        let probe_due =
+            full_cadence || last_probe.is_none_or(|t| t.elapsed() >= crate::IDLE_PROBE_INTERVAL);
+        if probe_due {
+            probe_buckets(&state).await;
+            last_probe = Some(Instant::now());
+        }
         maintain_bucket_selection(&state).await;
         tokio::select! {
             _ = sleep(state.worker_interval) => {}
@@ -393,6 +410,16 @@ async fn maintain_bucket_selection(state: &Arc<AppState>) -> bool {
             Ok(Ok(_)) => {
                 if let Err(error) = health.topology_revalidated(*index) {
                     error!(bucket=*index, error=%error, "could not acknowledge topology validation");
+                } else {
+                    // A bucket just crossed unhealthy→healthy. Fire the `_repl/`
+                    // sweep at once so drain starts seconds after heal instead of
+                    // waiting out the periodic backstop (dev/MULTIBUCKET.md
+                    // §Repair and convergence). The worker loop owns the sweep;
+                    // set the request flag and wake it.
+                    state
+                        .repl_sweep_requested
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    state.worker_nudge.notify_one();
                 }
             }
             Ok(Err(error)) => {
@@ -458,9 +485,9 @@ async fn has_live_intent(state: &AppState, storage: &dyn Storage, pkg: &str) -> 
 }
 
 /// Whether any writer intent still lacks its matching commit, regardless of
-/// age. Replication promotion uses the stronger form: once an intent goes stale
-/// the audit must first heal its crash shape before staged truth may classify or
-/// replace anything in that package.
+/// age. Callers use this when stale work must be healed before classifying the
+/// package's current truth.
+#[allow(dead_code)] // Base writer-intent primitive retained for repair callers.
 pub(crate) async fn has_unpaired_intent_ignoring(
     storage: &dyn Storage,
     pkg: &str,
@@ -492,8 +519,8 @@ pub(crate) async fn has_unpaired_intent_ignoring(
 /// Classify every unpaired intent by storage `last_modified`. `None` means at
 /// least one writer is still fresh (or lacks a trustworthy storage timestamp
 /// and is therefore conservatively live). `Some(keys)` contains only stale
-/// intent keys safe for a pending owner to consume before healing the crash
-/// shape. Storage time, not a writer nonce clock, keeps skewed nodes safe.
+/// intent keys safe to consume while healing the crash shape. Storage time, not
+/// a writer nonce clock, keeps skewed nodes safe.
 pub(crate) async fn stale_unpaired_intents(
     state: &AppState,
     storage: &dyn Storage,
@@ -549,59 +576,8 @@ pub(crate) async fn stale_unpaired_intents_ignoring(
     Ok(Some(stale))
 }
 
-fn intent_is_ignored(nonce: &str, ignored_root: Option<&str>) -> bool {
-    ignored_root.is_some_and(|root| {
-        nonce == root
-            || nonce
-                .strip_prefix(root)
-                .is_some_and(|suffix| suffix.starts_with('~'))
-    })
-}
-
-/// Whether one exact intent still proves a live lock holder. Missing and paired
-/// markers are inactive; a malformed/missing storage timestamp is live rather
-/// than an excuse to steal. Promotion-lock takeover additionally requires an
-/// unchanged lock ETag for the same grace window.
-pub(crate) async fn specific_intent_is_live(
-    state: &AppState,
-    storage: &dyn Storage,
-    pkg: &str,
-    nonce: &str,
-) -> Result<bool> {
-    let prefix = format!("{DIRTY_PREFIX}{pkg}!");
-    let entries = storage.list_dir_entries(DIRTY_PREFIX).await?;
-    let commits: HashSet<String> = entries
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .key
-                .strip_prefix(&prefix)?
-                .strip_suffix(COMMIT_SUFFIX)
-                .map(str::to_string)
-        })
-        .collect();
-    let now = time::OffsetDateTime::now_utc();
-    for intent in &entries {
-        let Some(member) = intent
-            .key
-            .strip_prefix(&prefix)
-            .and_then(|event| event.strip_suffix(INTENT_SUFFIX))
-        else {
-            continue;
-        };
-        if !intent_is_ignored(member, Some(nonce)) || commits.contains(member) {
-            continue;
-        }
-        let Some(written) = intent.last_modified.as_deref().and_then(|raw| {
-            time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).ok()
-        }) else {
-            return Ok(true);
-        };
-        if now - written < state.intent_grace {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+fn intent_is_ignored(nonce: &str, ignored_nonce: Option<&str>) -> bool {
+    ignored_nonce == Some(nonce)
 }
 
 /// Reclaim an empty mirror claim only after two audit observations of the same
@@ -625,7 +601,6 @@ async fn reclaim_empty_mirror_claim(
     }
     if crate::origin::package_has_truth(storage, pkg).await?
         || has_live_intent(state, storage, pkg).await?
-        || crate::replicate::has_committed_stage(storage, pkg).await?
     {
         state.empty_origin_observations.lock().await.remove(&key);
         return Ok(());
@@ -648,9 +623,7 @@ async fn reclaim_empty_mirror_claim(
     }
 
     // Re-check intents immediately before consuming the exact claim version.
-    if has_live_intent(state, storage, pkg).await?
-        || crate::replicate::has_committed_stage(storage, pkg).await?
-    {
+    if has_live_intent(state, storage, pkg).await? {
         state.empty_origin_observations.lock().await.remove(&key);
         return Ok(());
     }
@@ -664,8 +637,7 @@ async fn reclaim_empty_mirror_claim(
     // release; if anything appeared, immediately reclaim mirror with a fresh
     // nonce. A concurrent private claim still wins and is never overwritten.
     let appeared = crate::origin::package_has_truth(storage, pkg).await?
-        || has_live_intent(state, storage, pkg).await?
-        || crate::replicate::has_committed_stage(storage, pkg).await?;
+        || has_live_intent(state, storage, pkg).await?;
     if appeared {
         let claim = crate::origin::claim_origin(
             storage,
@@ -719,7 +691,6 @@ pub async fn run_worker_until(
     let sweep_running = Arc::new(AtomicBool::new(false));
     let reconcile_running = Arc::new(AtomicBool::new(false));
     let replication_running = Arc::new(AtomicBool::new(false));
-    let stage_recovery_running = Arc::new(AtomicBool::new(false));
     let warm_running = Arc::new(AtomicBool::new(false));
     // Clears the in-flight flag on drop — including a panic unwind inside the
     // spawned audit. Without it, a panicking sweep leaves the flag stuck `true`
@@ -734,6 +705,11 @@ pub async fn run_worker_until(
     let mut last_counter_flush: Option<Instant> = None;
     let mut last_counter_compact: Option<Instant> = None;
     let mut last_bucket_maintenance: Option<Instant> = None;
+    // The `_repl/` sweep runs on its own slow backstop (repl_sweep_interval),
+    // decoupled from the 1 s worker tick, plus immediately on a bucket heal
+    // (repl_sweep_requested). `None` fires one sweep on boot to drain any notes
+    // a predecessor left. (dev/MULTIBUCKET.md §Repair and convergence.)
+    let mut last_repl_sweep: Option<Instant> = None;
     let mut last_reconcile: Option<Instant> = if state.audit_on_boot {
         None
     } else {
@@ -819,7 +795,15 @@ pub async fn run_worker_until(
         // Every node may attempt it; all writes are conditional/idempotent. A
         // node that can reach a destination must not sit idle merely because a
         // different node holds the selected bucket's index lease.
-        if bucket_maintenance_due && !replication_running.swap(true, Ordering::SeqCst) {
+        let repl_sweep_forced = state.repl_sweep_requested.load(Ordering::SeqCst);
+        let repl_sweep_due = state.buckets.is_multi()
+            && (repl_sweep_forced
+                || last_repl_sweep.is_none_or(|t| t.elapsed() >= state.repl_sweep_interval));
+        if repl_sweep_due && !replication_running.swap(true, Ordering::SeqCst) {
+            // Consume the heal request only once a sweep actually starts, so a
+            // request arriving while a sweep is already in flight is not lost.
+            state.repl_sweep_requested.store(false, Ordering::SeqCst);
+            last_repl_sweep = Some(Instant::now());
             let state = state.clone();
             let guard = SweepGuard(replication_running.clone());
             tokio::spawn(async move {
@@ -829,19 +813,6 @@ pub async fn run_worker_until(
                 }
             });
         }
-        // Stage recovery has its own task so a blackholed bucket cannot delay
-        // marker delivery or backlog publication between healthy buckets.
-        if bucket_maintenance_due && !stage_recovery_running.swap(true, Ordering::SeqCst) {
-            let state = state.clone();
-            let guard = SweepGuard(stage_recovery_running.clone());
-            tokio::spawn(async move {
-                let _guard = guard;
-                if let Err(e) = crate::replicate::resume_staged_packages(&state).await {
-                    error!(error=?e, "replicate: staged package recovery failed");
-                }
-            });
-        }
-
         // Rebuild each warm copy's own indexes. Each bucket-local lease keeps
         // duplicate work cheap, but selected-bucket leadership is irrelevant:
         // another node may be the only one with a working path to this bucket.
@@ -1210,15 +1181,26 @@ async fn audit_shard(
         pkg_stats: Vec::new(),
     };
     let mut fresh: std::collections::HashMap<String, String> = Default::default();
-    let mut packages: Vec<(String, String, bool, bool)> = Vec::with_capacity(by_pkg.len());
+    let mut packages: Vec<(String, String, bool, bool, Vec<String>)> =
+        Vec::with_capacity(by_pkg.len());
     for (pkg, (t, v)) in by_pkg {
         let fp = fingerprint(&t, &v);
         // Count artifacts and distinct versions straight off the listing — the
         // same bytes the fingerprint already walked, so the inventory is free.
         let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
+        let members: HashSet<&str> = t
+            .iter()
+            .filter_map(|obj| obj.key.strip_prefix(&prefix))
+            .collect();
         let mut versions: HashSet<String> = HashSet::new();
         let mut file_count = 0u32;
         let mut pkg_bytes = 0u64;
+        // A live artifact body sitting beside its own `.tombstone` is a delete
+        // that crashed between the tombstone write and the body removal: the
+        // index hides it, but the bytes stay downloadable by direct URL. Detect
+        // it here from the listing already in hand (zero extra reads — the
+        // single-bucket audit stays free) and finish the delete below.
+        let mut interrupted_deletes: Vec<String> = Vec::new();
         for obj in &t {
             if let Some(filename) = obj.key.strip_prefix(&prefix) {
                 if is_artifact(filename) {
@@ -1226,6 +1208,14 @@ async fn audit_shard(
                     pkg_bytes += obj.size;
                     if let Some(version) = infer_version_from_filename(filename) {
                         versions.insert(version);
+                    }
+                    // A `.frozen` artifact deliberately retains its canonical
+                    // body beside a tombstone as evidence; only a bare tombstone
+                    // (no freeze) beside a live body is a crashed delete.
+                    if members.contains(format!("{filename}{TOMBSTONE_SUFFIX}").as_str())
+                        && !members.contains(format!("{filename}{FROZEN_SUFFIX}").as_str())
+                    {
+                        interrupted_deletes.push(filename.to_string());
                     }
                 }
             }
@@ -1243,17 +1233,27 @@ async fn audit_shard(
         let has_package_view = v.iter().any(|object| {
             object.key.ends_with("/index.json") || object.key.ends_with("/index.html")
         });
-        packages.push((pkg, fp, file_count > 0, has_package_view));
+        packages.push((
+            pkg,
+            fp,
+            file_count > 0,
+            has_package_view,
+            interrupted_deletes,
+        ));
     }
 
     for chunk in packages.chunks(PACKAGE_SWEEP_CONCURRENCY) {
-        let jobs = chunk.iter().map(|(pkg, fp, has_artifacts, has_package_view)| {
-            let fingerprint_unchanged = stored.get(pkg.as_str()) == Some(fp);
-            let (pkg, fp, has_artifacts, has_package_view) = (
+        let jobs = chunk
+            .iter()
+            .map(|(pkg, fp, has_artifacts, has_package_view, interrupted_deletes)| {
+            let fingerprint_unchanged =
+                stored.get(pkg.as_str()) == Some(fp) && interrupted_deletes.is_empty();
+            let (pkg, fp, has_artifacts, has_package_view, interrupted_deletes) = (
                 pkg.clone(),
                 fp.clone(),
                 *has_artifacts,
                 *has_package_view,
+                interrupted_deletes.clone(),
             );
             async move {
                 if let Err(e) = require_generation(state, generation) {
@@ -1262,10 +1262,6 @@ async fn audit_shard(
                 }
                 if state.buckets.is_multi() {
                     match crate::origin::read_origin_observation(storage, &pkg).await {
-                        Ok(Some(observed)) if observed.pending_manifest.is_some() => {
-                            warn!(package=%pkg, "audit: staged promotion owns package; deferring maintenance");
-                            return (pkg, None, has_artifacts, false, true);
-                        }
                         Ok(_) => {}
                         Err(e) => {
                             error!(package=%pkg, error=?e, "audit: origin unreadable; deferring maintenance");
@@ -1275,6 +1271,29 @@ async fn audit_shard(
                 }
                 let mut maintenance_failed = false;
                 let mut maintenance_changed = false;
+                // Complete any delete that crashed after its tombstone but before
+                // its body was removed (single- and multi-bucket alike). Runs
+                // only for the rare package the listing flagged, so the common
+                // path pays nothing.
+                if !interrupted_deletes.is_empty() {
+                    match crate::tombstone::complete_interrupted_deletes(
+                        storage,
+                        &pkg,
+                        &interrupted_deletes,
+                    )
+                    .await
+                    {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            maintenance_changed = true;
+                            error!(package=%pkg, count, "audit: completed interrupted delete(s) — orphaned body dropped");
+                        }
+                        Err(e) => {
+                            maintenance_failed = true;
+                            error!(package=%pkg, error=?e, "audit: completing interrupted delete failed");
+                        }
+                    }
+                }
                 if has_artifacts {
                     state
                         .empty_origin_observations
@@ -1559,16 +1578,15 @@ pub async fn rebuild_package_indexes(
     omit: Option<&str>,
 ) -> Result<(bool, Vec<(String, u64)>)> {
     if !state.buckets.is_multi() {
-        return rebuild_package_indexes_inner(state, storage, pkg, omit, None).await;
+        return rebuild_package_indexes_inner(state, storage, pkg, omit).await;
     }
 
     // Package view generation reads several independently-versioned objects.
-    // Join the writer-intent fence so staged promotion cannot start between
-    // that read set and the final index PUT. This maintenance intent is removed
-    // after the derived view is complete; a process crash leaves it behind for
-    // the ordinary stale-intent healer.
+    // Join the writer-intent fence across that read set and the final index PUT.
+    // This maintenance intent is removed after the derived view is complete; a
+    // process crash leaves it behind for the ordinary stale-intent healer.
     let nonce = mark_intent(storage, pkg).await?;
-    let result = rebuild_package_indexes_inner(state, storage, pkg, omit, None).await;
+    let result = rebuild_package_indexes_inner(state, storage, pkg, omit).await;
     match result {
         Ok(value) => {
             clear_intent(storage, pkg, &nonce).await?;
@@ -1584,30 +1602,17 @@ pub async fn rebuild_package_indexes(
     }
 }
 
-/// Complete the materialized package view while an exact promotion owner keeps
-/// request reads closed. The caller verifies the same owner again before
-/// clearing `.origin`.
-pub(crate) async fn rebuild_package_indexes_for_promotion(
-    state: &AppState,
-    storage: &dyn Storage,
-    pkg: &str,
-    pending: &crate::origin::OriginObservation,
-) -> Result<(bool, Vec<(String, u64)>)> {
-    rebuild_package_indexes_inner(state, storage, pkg, None, Some(pending)).await
-}
-
 async fn rebuild_package_indexes_inner(
     state: &AppState,
     storage: &dyn Storage,
     pkg: &str,
     omit: Option<&str>,
-    pending: Option<&crate::origin::OriginObservation>,
 ) -> Result<(bool, Vec<(String, u64)>)> {
     state
         .metrics
         .index_rebuilds
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (mut files, mut raw) = list_artifacts_for_claim(storage, pkg, pending, true).await?;
+    let (mut files, mut raw) = list_artifacts_for_claim(storage, pkg, true).await?;
     if let Some(omit) = omit {
         files.retain(|f| f.filename != omit);
         raw.retain(|(filename, _)| filename != omit);
@@ -1849,14 +1854,6 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
         stale_intents,
     } in work
     {
-        match crate::origin::read_origin_observation(storage, &package).await {
-            Ok(Some(origin)) if origin.pending_manifest.is_some() => continue,
-            Ok(_) => {}
-            Err(e) => {
-                error!(package=%package, error=?e, "replicate: destination origin read failed; markers retained");
-                continue;
-            }
-        }
         // A cheap HEAD decides whether global membership can flip, so the common
         // "another file added to a package already listed" case never pays the
         // full global-index read below.
@@ -2019,56 +2016,29 @@ pub async fn list_artifacts(
     storage: &dyn Storage,
     pkg: &str,
 ) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
-    list_artifacts_for_claim(storage, pkg, None, true).await
+    list_artifacts_for_claim(storage, pkg, true).await
 }
 
-/// Request-path project rendering in multi-bucket mode must never mutate truth
-/// without joining the promotion intent fence. The background worker owns
-/// legacy sidecar backfill; this view simply omits an untyped artifact for now.
+/// Request-path project rendering in multi-bucket mode never mutates truth. The
+/// background worker owns legacy sidecar backfill; this view simply omits an
+/// untyped artifact for now.
 pub async fn list_artifacts_readonly(
     storage: &dyn Storage,
     pkg: &str,
 ) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
-    list_artifacts_for_claim(storage, pkg, None, false).await
+    list_artifacts_for_claim(storage, pkg, false).await
 }
 
 async fn list_artifacts_for_claim(
     storage: &dyn Storage,
     pkg: &str,
-    pending_owner: Option<&crate::origin::OriginObservation>,
     backfill_missing: bool,
 ) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
-    // Capture the exact pre-list claim. In particular, never fold a pending
-    // mirror->private promotion into ordinary private: doing so could backfill
-    // a bare mirror loser as fabricated private truth. If the claim changes
-    // after this read, the old classification is conservative (mirror remains
-    // mirror); the staged manifest's exact leftover capture handles the race.
-    let claim = match pending_owner {
-        Some(expected) => {
-            if crate::origin::read_origin_observation(storage, pkg)
-                .await?
-                .as_ref()
-                != Some(expected)
-            {
-                bail!("package '{pkg}' promotion owner changed before index rebuild");
-            }
-            Some((expected.state, expected.pending_manifest.clone()))
-        }
-        None => crate::origin::read_origin_claim(storage, pkg).await?,
+    let pkg_origin = match crate::origin::read_origin_claim(storage, pkg).await? {
+        Some(crate::origin::OriginState::Private) => Some(crate::origin::PRIVATE),
+        Some(crate::origin::OriginState::Mirror) => Some(crate::origin::MIRROR),
+        Some(crate::origin::OriginState::Unclaimed) | None => None,
     };
-    if pending_owner.is_none()
-        && claim
-            .as_ref()
-            .and_then(|(_, pending)| pending.as_ref())
-            .is_some()
-    {
-        bail!("package '{pkg}' is under staged promotion");
-    }
-    let pkg_origin = claim.as_ref().and_then(|(state, _)| match state {
-        crate::origin::OriginState::Private => Some(crate::origin::PRIVATE),
-        crate::origin::OriginState::Mirror => Some(crate::origin::MIRROR),
-        crate::origin::OriginState::Unclaimed => None,
-    });
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
     let entries = storage.list_dir_entries(&prefix).await?;
     let names: HashSet<&str> = entries
@@ -2222,6 +2192,7 @@ async fn backfill_sidecar(
         // Fill the per-artifact origin from the package-level claim (§4); a
         // legacy artifact predates the field, so the claim is the truth.
         origin: pkg_origin.map(str::to_string),
+        upload_epoch_ms: None,
         yank_epoch: 0,
     };
     let created = storage
@@ -2391,6 +2362,7 @@ mod tests {
                 requires_python: None,
                 yanked: Yanked::Flag(false),
                 origin: Some(crate::origin::PRIVATE.to_string()),
+                upload_epoch_ms: None,
                 yank_epoch: 0,
             })
             .unwrap(),
@@ -2487,34 +2459,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_mirror_claim_with_committed_stage_is_not_reclaimed() {
-        let storage = Arc::new(InMemStorage::default());
-        storage.insert(
-            &crate::origin::origin_key("staged"),
-            br#"{"origin":"mirror","nonce":"00000000000000000000000000000000"}"#.to_vec(),
-        );
-        storage.insert("_staging/repl/staged/manifest@one.json", b"{}".to_vec());
-        let mut state = AppState::headless(storage.clone());
-        state.intent_grace = time::Duration::ZERO;
-
-        reclaim_empty_mirror_claim(&state, storage.as_ref(), "staged", 0)
-            .await
-            .unwrap();
-        reclaim_empty_mirror_claim(&state, storage.as_ref(), "staged", 0)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            crate::origin::read_origin_observation(storage.as_ref(), "staged")
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            crate::origin::OriginState::Mirror
-        );
-    }
-
-    #[tokio::test]
     async fn leader_tick_stays_on_the_lease_matched_pin_after_a_switch() {
         let first = Arc::new(InMemStorage::default());
         let second = Arc::new(InMemStorage::default());
@@ -2533,6 +2477,7 @@ mod tests {
                 requires_python: None,
                 yanked: Yanked::Flag(false),
                 origin: Some(crate::origin::PRIVATE.to_string()),
+                upload_epoch_ms: None,
                 yank_epoch: 0,
             })
             .unwrap(),
@@ -2594,75 +2539,6 @@ mod tests {
         assert!(storage.head_exists(&commit).await.unwrap());
         assert!(!storage
             .head_exists(&format!("{SIMPLE_PREFIX}{pkg}/index.json"))
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn warm_drain_defers_a_pending_promotion_package() {
-        let storage = Arc::new(InMemStorage::default());
-        let pkg = "promoting";
-        seed_private_artifact(storage.as_ref(), pkg, "promoting-1.0.whl");
-        crate::origin::claim_origin(storage.as_ref(), pkg, crate::origin::PRIVATE)
-            .await
-            .unwrap();
-        crate::origin::begin_private_promotion(
-            storage.as_ref(),
-            pkg,
-            "_staging/repl/promoting/manifest@one.json",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        mark_dirty(storage.as_ref(), pkg).await.unwrap();
-        let before = storage
-            .list_all(&format!("{DIRTY_PREFIX}{pkg}!"))
-            .await
-            .unwrap();
-        let state = AppState::headless(storage.clone());
-
-        drain_dirty_uncached(&state, storage.as_ref())
-            .await
-            .unwrap();
-
-        let after = storage
-            .list_all(&format!("{DIRTY_PREFIX}{pkg}!"))
-            .await
-            .unwrap();
-        assert_eq!(
-            after.iter().map(|entry| &entry.key).collect::<Vec<_>>(),
-            before.iter().map(|entry| &entry.key).collect::<Vec<_>>()
-        );
-        assert!(!storage
-            .head_exists(&format!("{SIMPLE_PREFIX}{pkg}/index.json"))
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn pending_promotion_never_backfills_a_bare_mirror_body_as_private() {
-        let storage = Arc::new(InMemStorage::default());
-        let pkg = "promoting";
-        let filename = "promoting-1.0.whl";
-        crate::origin::claim_origin(storage.as_ref(), pkg, crate::origin::MIRROR)
-            .await
-            .unwrap();
-        storage.insert(
-            &format!("{PACKAGES_PREFIX}{pkg}/{filename}"),
-            b"public bytes".to_vec(),
-        );
-        crate::origin::begin_private_promotion(
-            storage.as_ref(),
-            pkg,
-            "_staging/repl/promoting/manifest@one.json",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert!(list_artifacts(storage.as_ref(), pkg).await.is_err());
-        assert!(!storage
-            .head_exists(&sidecar_key(&format!("{PACKAGES_PREFIX}{pkg}/{filename}")))
             .await
             .unwrap());
     }
@@ -2838,6 +2714,7 @@ mod tests {
                 requires_python: None,
                 yanked: Yanked::Flag(false),
                 origin: None,
+                upload_epoch_ms: None,
                 yank_epoch: 0,
             })
             .unwrap(),
@@ -2868,6 +2745,10 @@ mod tests {
             access_log_format: AccessLogFormat::Structured,
             worker_interval: Duration::from_secs(10),
             reconcile_interval: Duration::from_secs(3600),
+            repl_sweep_interval: Duration::from_secs(300),
+            repl_sweep_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_request_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fanout_grace: Duration::from_secs(30),
             intent_grace: time::Duration::seconds(900),
             audit_on_boot: true,
             wait_on_upload: false,
@@ -2882,9 +2763,6 @@ mod tests {
             inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            promotion_lock_observations: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             metrics: Arc::new(crate::metrics::Metrics::new()),
@@ -2949,6 +2827,7 @@ mod tests {
                 requires_python: None,
                 yanked: Yanked::Flag(false),
                 origin: None,
+                upload_epoch_ms: None,
                 yank_epoch: 0,
             })
             .unwrap(),
@@ -2982,6 +2861,10 @@ mod tests {
             access_log_format: AccessLogFormat::Structured,
             worker_interval: Duration::from_millis(10),
             reconcile_interval: Duration::from_secs(3600),
+            repl_sweep_interval: Duration::from_secs(300),
+            repl_sweep_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_request_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fanout_grace: Duration::from_secs(30),
             intent_grace: time::Duration::seconds(900),
             audit_on_boot: true,
             wait_on_upload: false,
@@ -2996,9 +2879,6 @@ mod tests {
             inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            promotion_lock_observations: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             metrics: Arc::new(crate::metrics::Metrics::new()),

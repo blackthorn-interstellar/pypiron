@@ -80,8 +80,8 @@ restarting.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `--s3-bucket NAME[@REGION]` | `PYPIRON_S3_BUCKETS` | required | Bucket. Repeatable — see below. Legacy `PYPIRON_S3_BUCKET` still selects one bucket. |
-| `--aws-region REGION` | `AWS_REGION` | none | AWS region for every bucket without its own `@region`. |
+| `--s3-bucket NAME` | `PYPIRON_S3_BUCKET` | required | One S3 bucket. For several buckets (any backend) use `--buckets` — see [Multiple buckets](#multiple-buckets). |
+| `--aws-region REGION` | `AWS_REGION` | none | AWS region for a bucket without its own `@region`. |
 | `--s3-endpoint-url URL` | `PYPIRON_S3_ENDPOINT_URL` | none | MinIO or another S3-compatible endpoint. |
 | `--s3-force-path-style` | `PYPIRON_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing. |
 
@@ -90,57 +90,51 @@ task role.
 
 #### Multiple buckets
 
-Give pypiron more than one bucket and it keeps them in sync and rides out the
-loss of any one of them — installs never stop, uploads continue within seconds.
-Repeat `--s3-bucket` (order is preference, the first is preferred), or set
-`PYPIRON_S3_BUCKETS` to a comma-separated list:
+| Flag | Env | Default | Meaning |
+| --- | --- | --- | --- |
+| `--buckets URI,...` | `PYPIRON_BUCKETS` | none | Bucket URIs in preference order, any mix of backends. Enables replication and failover. |
+
+Give pypiron a list of buckets and it keeps them in sync and rides out the loss
+of any one — installs never stop, and an upload is durable on every reachable
+bucket before it returns. Set `--buckets` (or `PYPIRON_BUCKETS`) to a
+comma-separated list of URIs; the first is preferred:
 
 ```
-pypiron serve --s3-bucket iron-east --s3-bucket iron-west
-PYPIRON_S3_BUCKETS=iron-east,iron-west
+pypiron serve --buckets s3://iron-east,s3://iron-west
+PYPIRON_BUCKETS=s3://iron-east,s3://iron-west
 ```
 
-Supplying `--s3-bucket` selects S3; `--storage s3` is optional. The
-`pypiron.toml` `s3-bucket` key accepts one bucket. Use the repeatable CLI flag or
-the plural environment variable for a list.
-Existing single-bucket deployments may keep `PYPIRON_S3_BUCKET`; the plural
-variable or CLI flag wins when both are present.
+Each entry needs a scheme:
 
-Put buckets in different regions by pinning each one with an `@region` suffix,
-which overrides the shared `--aws-region`:
+- `s3://name` or `s3://name@region` — `@region` overrides the shared
+  `--aws-region` for that bucket.
+- `gs://name` — a GCS bucket.
+- `az://container` — an Azure blob container.
 
-```
-PYPIRON_S3_BUCKETS=iron-east@us-east-1,iron-west@us-west-2
-```
+Mix backends freely. `s3://iron-east@us-east-1,gs://iron-backup` replicates
+across two clouds and survives an entire provider outage. Each backend resolves
+its own native credentials (the AWS chain for S3, a service-account key or
+Application Default Credentials for GCS, the account key for Azure); a bucket
+whose backend is half-configured refuses to start. One bad URI fails startup
+before any bucket is contacted.
 
-One bucket starts no topology, health, replication, warm-index, or read-fence
-work. The shared filename-reuse guard still performs its documented tombstone
-check on upload. Multiple buckets are S3-only for now. In multi-bucket mode, a
-local package-index read adds initial and final exact origin GETs. A local
-artifact or companion read adds those two origin GETs,
-tombstone/frozen/mirror-quarantine HEADs, and a sidecar GET when the claim or
-quarantine marker requires one. Proxy paths add eligibility, claim, marker, and
-upstream work dynamically.
-All entries share one credential chain and `--s3-endpoint-url`. See
-[Multi-bucket failover](../guides/multi-bucket.md) for recovery behavior, costs,
-and limits.
+A single-entry `--buckets` list behaves exactly like configuring that one backend
+directly — no topology, health, replication, or read-fence work runs. The
+single-bucket flags (`--s3-bucket`, `--gcs-bucket`, `--azure-container`) and the
+`pypiron.toml` `s3-bucket` key are unchanged; use `--buckets` only for a list.
 
-In multi-bucket mode S3 SDK retries are disabled. One-second topology probes
-switch new requests and cancel background work on an ineligible bucket without
-putting a short total deadline on real artifact transfers. An already in-flight
-transfer retains the normal one-hour route bound.
-Startup topology operations also have a one-second bound. An unreachable bucket
-may add that timeout for each attempted operation, but cannot block startup
-indefinitely when another configured bucket is reachable.
-Admin DELETE still removes private files, but returns `409` for mirror-cache
-entries. Cache eviction is unavailable in multi-bucket v1; do not apply a broad
-`packages/` lifecycle rule because private and mirror records share that prefix.
-Demotion manifests are deleted after promotion, but their content-addressed
-`_staging/repl/` members persist. Do not lifecycle-expire that prefix either: a
-live manifest may reference a retained member. The prefix also holds the
-never-deleted per-package `.promotion-lock` CAS sentinel. A holder heartbeats;
-recovery requires an unchanged lock ETag for the full intent grace and no live
-holder intent family before takeover.
+In multi-bucket mode SDK retries are disabled and one-second topology probes
+switch new requests and cancel background work on an ineligible bucket, without
+putting a short deadline on real artifact transfers (an in-flight transfer keeps
+the normal one-hour bound). Startup and migration operations also carry a
+one-second bound per bucket, so an unreachable bucket can slow boot but never
+blocks it while another configured bucket is reachable. Admin DELETE still
+removes private files but returns `409` for proxy-cached entries — cache eviction
+across buckets is unavailable, so do not apply a broad `packages/` lifecycle rule
+(private and mirror records share that prefix).
+
+See [Multi-bucket failover](../guides/multi-bucket.md) for recovery behavior and
+operator rules.
 
 ### GCS
 
@@ -185,6 +179,8 @@ downloads stream through the node.
 | `--worker-interval-secs N` | `PYPIRON_WORKER_INTERVAL_SECS` | `1` | Dirty/replication poll and bucket-health probe cadence. |
 | `--bucket-leave-failures N` | `PYPIRON_BUCKET_LEAVE_FAILURES` | `3` | Consecutive timeout (including 408), connection, or 5xx failures before selecting the next bucket. |
 | `--bucket-return-healthy-secs N` | `PYPIRON_BUCKET_RETURN_HEALTHY_SECS` | `300` | Continuous health required before returning to a more-preferred bucket. |
+| `--fanout-grace-secs N` | `PYPIRON_FANOUT_GRACE_SECS` | `30` | Grace a lagging secondary bucket gets on upload before pypiron records a repair and returns. One slow bucket adds at most this to a publish. Multi-bucket only. |
+| `--repl-sweep-interval-secs N` | `PYPIRON_REPL_SWEEP_INTERVAL_SECS` | `300` | Backstop interval for draining pending cross-bucket repairs. Repairs also drain the moment a bucket recovers. Multi-bucket only. |
 | `--intent-grace-secs N` | `PYPIRON_INTENT_GRACE_SECS` | `900` | Grace for an upload or cross-bucket package operation. Minimum `3`; maximum `9223372036854775807`. |
 | `--audit-on-boot true\|false` | `PYPIRON_AUDIT_ON_BOOT` | `true` | Run the selected-bucket audit and multi-bucket full diff on boot. |
 | `--reconcile-interval-secs N` | `PYPIRON_RECONCILE_INTERVAL_SECS` | `86400` | Selected-bucket audit and multi-bucket full-diff interval. |
@@ -305,9 +301,12 @@ also read `[serve]` from `pypiron.toml`. `buckets migrate` and `origin release`
 do too. Storage flags and their environment variables may also follow those
 nested commands.
 
-`buckets migrate` requires a multi-bucket target. To shrink to one bucket, stop
-the fleet and restart it with that bucket; topology stamps are dormant in
-single-bucket mode.
+`buckets migrate` requires a multi-bucket target and **refuses while any bucket
+still has pending cross-bucket repairs**, so shrinking or reordering the list
+cannot strand a file's only copy on a bucket you are about to remove. If it
+refuses, let the fleet drain (or bring the lagging bucket back) and retry. To
+shrink to one bucket, stop the fleet and restart it with that bucket; topology
+stamps are dormant in single-bucket mode.
 
 Stop writes before `origin release`. It refuses a package with any package truth
 except `.origin`, or with pending write/replication work, and conditionally
@@ -321,8 +320,8 @@ These series appear only when two or more buckets are configured:
 | --- | --- |
 | `pypiron_replication_objects_total` | Artifact records copied into another bucket. |
 | `pypiron_replication_bytes_total` | Artifact bytes copied into other buckets; companion metadata is not included. |
-| `pypiron_replication_freezes_total` | Conflicting same-name, different-byte uploads frozen for human resolution. Any increase needs attention. |
-| `pypiron_replication_marker_backlog{dest}` | Undelivered markers found on reachable source buckets. During a source outage this is a lower bound; it still exposes backlog on healthy sources instead of retaining a stale zero. |
+| `pypiron_replication_freezes_total` | Same-name, different-byte upload collisions where the loser was quarantined (or both quarantined when the arrival order was too close to call). Needs a human. Any increase needs attention. |
+| `pypiron_replication_marker_backlog{dest}` | Pending cross-bucket repairs (fan-out failures awaiting drain) found on reachable source buckets. During a source outage this is a lower bound. |
 | `pypiron_reconcile_diff_duration_seconds` | Wall time of the last pairwise full comparison. |
 | `pypiron_bucket_health_state{bucket,index}` | Per-node view: healthy `1`, unknown `0`, unhealthy `-1`. |
 | `pypiron_bucket_selected{bucket,index}` | Per-node selected bucket: selected `1`, all others `0`. |
@@ -331,8 +330,8 @@ These series appear only when two or more buckets are configured:
 | `pypiron_bucket_topology_write_fenced` | `1` when a runtime topology mismatch has stopped mutations; reads remain available. |
 
 Alert on any freeze, a non-zero topology fence, persistent health alarms, or a
-backlog that keeps growing after its destination recovers. The backlog is a
-count of mutation markers, not bytes.
+backlog that keeps growing after its destination recovers. The backlog counts
+pending repairs, not bytes.
 
 ## Endpoints
 

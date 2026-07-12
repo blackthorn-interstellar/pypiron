@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import http.client
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -14,8 +15,8 @@ from datetime import datetime, timezone
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, Iterator, List
-from urllib.parse import unquote, urlsplit
+from typing import Dict, Iterator, List, Optional
+from urllib.parse import unquote, urlencode, urlsplit
 
 import pytest
 
@@ -1229,14 +1230,17 @@ def minio_two_dual_proxy(minio_two: Dict) -> Iterator[Dict]:
 
 @pytest.fixture()
 def s3_server_multi(tmp_path_factory, pypiron_bin: Path, minio_two: Dict) -> Iterator[Dict]:
-    """pypiron configured against two MinIO buckets. A short reconcile interval
-    keeps the tier-3 diff backstop running every few seconds so tests never wait
-    out the daily default."""
+    """pypiron configured against two MinIO buckets. Short reconcile and repl-
+    sweep intervals keep the tier-3 diff backstop and the `_repl/` note sweep
+    running every few seconds so tests never wait out the production defaults."""
     yield from _start_s3_server(
         tmp_path_factory,
         pypiron_bin,
         minio_two,
-        extra_env={"PYPIRON_RECONCILE_INTERVAL_SECS": "3"},
+        extra_env={
+            "PYPIRON_RECONCILE_INTERVAL_SECS": "3",
+            "PYPIRON_REPL_SWEEP_INTERVAL_SECS": "2",
+        },
     )
 
 
@@ -1313,7 +1317,10 @@ def s3_server_three_failover(
         tmp_path_factory,
         pypiron_bin,
         minio_three_proxy,
-        extra_env={"PYPIRON_AUDIT_ON_BOOT": "false"},
+        extra_env={
+            "PYPIRON_AUDIT_ON_BOOT": "false",
+            "PYPIRON_REPL_SWEEP_INTERVAL_SECS": "2",
+        },
         extra_args=[
             "--bucket-leave-failures",
             "1",
@@ -1341,6 +1348,7 @@ def _start_s3_server_pair(
     common_env = {
         "PYPIRON_AUDIT_ON_BOOT": "false",
         "PYPIRON_RECONCILE_INTERVAL_SECS": "3",
+        "PYPIRON_REPL_SWEEP_INTERVAL_SECS": "2",
     }
     left_gen = _start_s3_server(
         tmp_path_factory,
@@ -1453,15 +1461,24 @@ def s3_server_multi_proxy_prefixed(
         upstream_gen.close()
 
 
+def s3_buckets_uri(*names: str) -> str:
+    """The PYPIRON_BUCKETS value for an ordered list of MinIO bucket names: each
+    becomes an `s3://name` URI (region rides on the shared AWS_REGION knob)."""
+    return ",".join(f"s3://{name}" for name in names)
+
+
 def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
-    # A two-bucket fixture carries a `buckets` list; a single-bucket one carries
-    # `bucket`. Either way pypiron reads the plural PYPIRON_S3_BUCKETS.
-    bucket_list = ",".join(minio["buckets"]) if minio.get("buckets") else minio["bucket"]
+    # A multi-bucket fixture carries a `buckets` list, driven through the
+    # multi-cloud PYPIRON_BUCKETS URI list; a single-bucket one carries `bucket`
+    # and takes the singular PYPIRON_S3_BUCKET (ordinary single-bucket mode).
     env = os.environ.copy()
+    if minio.get("buckets"):
+        env["PYPIRON_BUCKETS"] = s3_buckets_uri(*minio["buckets"])
+    else:
+        env["PYPIRON_S3_BUCKET"] = minio["bucket"]
     env.update(
         {
             "PYPIRON_STORAGE": "s3",
-            "PYPIRON_S3_BUCKETS": bucket_list,
             "AWS_REGION": minio.get("region") or "us-east-1",
             "PYPIRON_BIND_ADDR": bind,
             "PYPIRON_WORKER_INTERVAL_SECS": "1",
@@ -1627,6 +1644,14 @@ def minio_get_key_bytes_in(minio: Dict, bucket: str, key: str) -> bytes:
     return base64.b64decode(_mc(minio, f"mc cat {target} | base64"))
 
 
+def minio_object_sha256(minio: Dict, bucket: str, key: str) -> str:
+    """sha256 hex of an object's bytes in a named bucket — the byte-equality
+    oracle. Existence-only checks pass when a copy lands corrupt or truncated;
+    convergence tests compare this against the source upload to prove the exact
+    bytes replicated."""
+    return hashlib.sha256(minio_get_key_bytes_in(minio, bucket, key)).hexdigest()
+
+
 def minio_put_key_in(minio: Dict, bucket: str, key: str, body: str) -> None:
     """Write a foreign object straight into a named bucket, bypassing pypiron."""
     dest = shlex.quote(f"local/{bucket}/{key}")
@@ -1636,6 +1661,11 @@ def minio_put_key_in(minio: Dict, bucket: str, key: str, body: str) -> None:
 def minio_key_exists_in(minio: Dict, bucket: str, key: str) -> bool:
     """Whether a key exists in a named bucket."""
     return key in minio_list_keys_in(minio, bucket)
+
+
+def minio_delete_key_in(minio: Dict, bucket: str, key: str) -> None:
+    """Delete one object from a named bucket, bypassing pypiron."""
+    _mc(minio, f"mc rm {shlex.quote(f'local/{bucket}/{key}')}")
 
 
 def minio_remove_bucket(minio: Dict, bucket: str) -> None:
@@ -1879,3 +1909,177 @@ def azure_server(tmp_path_factory, pypiron_bin: Path, azure: Dict) -> Iterator[D
         }
     )
     yield from _start_cloud_server(tmp_path_factory, pypiron_bin, env, bind, "azure")
+
+
+# ------------------------- Azurite object inspection --------------------------
+#
+# SharedKey-signed reads straight against Azurite, so the mixed-backend suite can
+# check the Azure leg of a fan-out without going through pypiron — the Azure
+# analog of the `mc`-driven MinIO helpers above. Stdlib only, mirroring
+# `_azurite_create_container`'s signing.
+
+
+def _azurite_port(azure: Dict) -> int:
+    port = urlsplit(azure["endpoint"]).port
+    assert port is not None, f"azure endpoint has no port: {azure['endpoint']!r}"
+    return port
+
+
+def _azurite_signed(port: int, method: str, path: str, query: Optional[Dict[str, str]] = None):
+    """One SharedKey-signed request to Azurite. `path` starts at the container
+    (`/container/blob`); `query` params join the canonical resource sorted."""
+    date = formatdate(timeval=time.time(), usegmt=True)
+    version = "2021-08-06"
+    canon_headers = f"x-ms-date:{date}\nx-ms-version:{version}\n"
+    resource = f"/{AZURITE_ACCOUNT}/{AZURITE_ACCOUNT}{path}"
+    for name in sorted(query or {}):
+        resource += f"\n{name}:{query[name]}"
+    string_to_sign = "\n".join([method] + [""] * 11 + [canon_headers + resource])
+    signature = base64.b64encode(
+        hmac.new(
+            base64.b64decode(AZURITE_KEY), string_to_sign.encode("utf-8"), hashlib.sha256
+        ).digest()
+    ).decode()
+    url = f"http://127.0.0.1:{port}/{AZURITE_ACCOUNT}{path}"
+    if query:
+        url += "?" + urlencode(query)
+    return _http_request(
+        url,
+        method=method,
+        headers={
+            "x-ms-date": date,
+            "x-ms-version": version,
+            "Authorization": f"SharedKey {AZURITE_ACCOUNT}:{signature}",
+        },
+    )
+
+
+def azurite_get_blob(azure: Dict, key: str) -> Optional[bytes]:
+    """A blob's bytes, or None if it does not exist (the 404 analog)."""
+    code, body, _ = _azurite_signed(_azurite_port(azure), "GET", f"/{azure['container']}/{key}")
+    if code == 404:
+        return None
+    assert code == 200, f"azurite GET {key} -> {code}: {body[:200]!r}"
+    return body
+
+
+def azurite_key_exists(azure: Dict, key: str) -> bool:
+    return azurite_get_blob(azure, key) is not None
+
+
+def azurite_object_sha256(azure: Dict, key: str) -> str:
+    body = azurite_get_blob(azure, key)
+    assert body is not None, f"azurite blob {key} is absent"
+    return hashlib.sha256(body).hexdigest()
+
+
+def azurite_list_keys(azure: Dict, prefix: str = "") -> List[str]:
+    """Every blob name in the container (optionally under `prefix`), as
+    pypiron-independent ground truth — the Azure analog of `minio_list_keys_in`."""
+    query = {"restype": "container", "comp": "list"}
+    if prefix:
+        query["prefix"] = prefix
+    code, body, _ = _azurite_signed(
+        _azurite_port(azure), "GET", f"/{azure['container']}", query=query
+    )
+    assert code == 200, f"azurite list -> {code}: {body[:200]!r}"
+    return sorted(re.findall(r"<Name>(.*?)</Name>", body.decode()))
+
+
+# --------------------------- Mixed-backend topology ---------------------------
+
+
+@pytest.fixture()
+def mixed_cloud(azure: Dict) -> Iterator[Dict]:
+    """A locally-runnable mixed-backend topology: one S3 bucket (MinIO, behind a
+    fault proxy so it can be made unavailable) plus one Azure container
+    (Azurite). Skips without Docker like the single-cloud suites.
+
+    fake-gcs-server is not faithful to object_store's GCS data plane (see the GCS
+    note above), so Azurite is the faithful local second cloud here; the GCS leg
+    of the multi-cloud claim is covered by the real-GCS job."""
+    minio_gen = _minio_multi(["pypiron-s3"], "mixeds3")
+    minio = next(minio_gen)
+    proxy_gen = _minio_fault_proxy(minio)
+    try:
+        proxied = next(proxy_gen)
+        yield {"s3": proxied, "azure": azure}
+    finally:
+        proxy_gen.close()
+        minio_gen.close()
+
+
+def _mixed_env(mixed: Dict, bind: str) -> Dict[str, str]:
+    s3 = mixed["s3"]
+    az = mixed["azure"]
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYPIRON_BIND_ADDR": bind,
+            # S3 preferred (index 0), Azure the failover (index 1).
+            "PYPIRON_BUCKETS": f"s3://{s3['bucket']},az://{az['container']}",
+            "PYPIRON_WORKER_INTERVAL_SECS": "1",
+            "PYPIRON_ADMIN_USER": "admin",
+            "PYPIRON_ADMIN_PASS": "secret",
+            "PYPIRON_UPLOADER_USER": "uploader",
+            "PYPIRON_UPLOADER_PASS": "uploadersecret",
+            # Stream artifacts so a failover read is a deterministic 200 with the
+            # bytes, never a presigned redirect to a specific store.
+            "PYPIRON_ARTIFACT_DELIVERY": "stream",
+            # S3 (MinIO through the fault proxy).
+            "PYPIRON_S3_ENDPOINT_URL": s3.get("server_endpoint", s3["endpoint"]),
+            "PYPIRON_S3_FORCE_PATH_STYLE": "true",
+            "AWS_REGION": "us-east-1",
+            "AWS_ACCESS_KEY_ID": s3["access_key"],
+            "AWS_SECRET_ACCESS_KEY": s3["secret_key"],
+            # Azure (Azurite).
+            "PYPIRON_AZURE_ACCOUNT": az["account"],
+            "PYPIRON_AZURE_CONTAINER": az["container"],
+            "PYPIRON_AZURE_ACCESS_KEY": az["key"],
+            "PYPIRON_AZURE_ENDPOINT_URL": az["endpoint"],
+            "RUST_LOG": "info,pypiron=debug",
+        }
+    )
+    return env
+
+
+def _start_mixed_cloud_server(
+    tmp_path_factory, pypiron_bin: Path, mixed: Dict, extra_env=None, extra_args=None
+) -> Iterator[Dict]:
+    port = find_free_port()
+    bind = f"127.0.0.1:{port}"
+    log_path = tmp_path_factory.mktemp("pypiron-mixed") / "server.log"
+    env = _mixed_env(mixed, bind)
+    if extra_env:
+        env.update(extra_env)
+    with open(log_path, "w") as log_file:
+        proc = subprocess.Popen(
+            [str(pypiron_bin), "serve", *(extra_args or [])],
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            wait_http_ok(f"http://{bind}/simple/index.json", timeout=30.0)
+            yield {
+                "bind": bind,
+                "base_url": f"http://{bind}",
+                "legacy": f"http://{bind}/legacy/",
+                "simple": f"http://{bind}/simple/",
+                "user": "admin",
+                "password": "secret",
+                "mixed": mixed,
+                "s3": mixed["s3"],
+                "azure": mixed["azure"],
+                "faults": mixed["s3"].get("faults"),
+                "log_path": log_path,
+                "proc": proc,
+            }
+        finally:
+            kill_process_tree(proc)
+
+
+@pytest.fixture()
+def mixed_cloud_server(tmp_path_factory, pypiron_bin: Path, mixed_cloud: Dict) -> Iterator[Dict]:
+    """pypiron serving a mixed S3+Azure two-bucket topology."""
+    yield from _start_mixed_cloud_server(tmp_path_factory, pypiron_bin, mixed_cloud)

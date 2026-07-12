@@ -1,4 +1,4 @@
-"""Multi-bucket replication and selection (dev/MULTIBUCKET.md §4-§7).
+"""Multi-bucket replication and selection (dev/MULTIBUCKET-v2.md).
 
 Real pypiron processes share two or three buckets on MinIO. Some tests give two
 nodes independent reachability views so both writable sides of a partition are
@@ -7,15 +7,19 @@ server reports.
 
 Covered: fan-out, durable backlog/drain, per-bucket indexes, failover under an
 upload storm, hysteresis/flap damping, bidirectional partition heal, duplicate
-freeze, tombstone/yank/status convergence, proxy-to-private demotion, cold-start
-divergence, origin-only claims, reserved namespaces, and three-bucket fallback.
+conflict quarantine, tombstone/yank/status convergence, proxy-to-private
+demotion, cold-start divergence, origin-only claims, reserved namespaces, and
+three-bucket fallback.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import signal
+import subprocess
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -25,23 +29,29 @@ import pytest
 from .conftest import (
     _s3_env,
     _start_s3_server,
+    minio_delete_key_in,
     minio_get_key_bytes_in,
     minio_get_key_in,
     minio_key_exists_in,
     minio_list_keys_in,
     minio_make_bucket,
+    minio_object_sha256,
     minio_put_key_in,
     minio_remove_bucket,
+    s3_buckets_uri,
 )
 from .helpers import (
     ACCEPT_PEP691,
+    find_free_port,
     http_get,
     http_request_auth,
+    kill_process_tree,
     make_wheel,
     origin_owner,
     run_returncode,
     upload_legacy,
     wait_for_file_in_index,
+    wait_http_ok,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.s3]
@@ -72,6 +82,13 @@ def _metrics(server) -> list[str]:
     return body.decode().splitlines()
 
 
+def _bare(name: str) -> str:
+    """Strip a bucket identity's scheme prefix (`s3://`, `gs://`, `az://`) so a
+    metric label compares equal to the plain MinIO bucket name a test holds."""
+    _, _, rest = name.partition("://")
+    return rest or name
+
+
 def _selected_bucket(server) -> str:
     selected = [
         match.group(1)
@@ -79,13 +96,13 @@ def _selected_bucket(server) -> str:
         if (match := _SELECTED_RE.match(line)) and match.group(2) == "1"
     ]
     assert len(selected) == 1, f"expected one selected bucket, got {selected}"
-    return selected[0]
+    return _bare(selected[0])
 
 
 def _bucket_health(server, bucket: str) -> int:
     for line in _metrics(server):
         match = _HEALTH_RE.match(line)
-        if match and match.group(1) == bucket:
+        if match and _bare(match.group(1)) == bucket:
             return int(match.group(2))
     raise AssertionError(f"missing health metric for {bucket}")
 
@@ -101,9 +118,17 @@ def _selection_generation(server) -> int:
 def _marker_backlog(server, bucket: str) -> int:
     for line in _metrics(server):
         match = _BACKLOG_RE.match(line)
-        if match and match.group(1) == bucket:
+        if match and _bare(match.group(1)) == bucket:
             return int(match.group(2))
     raise AssertionError(f"missing marker backlog metric for {bucket}")
+
+
+def _counter_value(server, name: str) -> int:
+    prefix = f"{name} "
+    for line in _metrics(server):
+        if line.startswith(prefix):
+            return int(line.removeprefix(prefix))
+    raise AssertionError(f"missing counter metric {name}")
 
 
 def _writes_fenced(server) -> bool:
@@ -719,32 +744,6 @@ def test_write_nudges_do_not_multiply_periodic_bucket_scans(s3_server_multi_cade
     assert after == before, f"periodic bucket scans escaped their cadence: {before=} {after=}"
 
 
-def test_full_diff_does_not_list_staging_once_per_package(s3_server_multi_reconcile_cost):
-    """Full-diff LIST cost stays linear in buckets, not packages times buckets."""
-    server = s3_server_multi_reconcile_cost
-    minio = server["minio"]
-    a, b = minio["buckets"]
-    filenames = []
-    for i in range(6):
-        pkg = f"costpkg{i}"
-        filename = f"costpkg{i}-1.0-py3-none-any.whl"
-        filenames.append((pkg, filename))
-        _seed_private_record(minio, a, pkg, filename, f"cost proof {i}")
-
-    for pkg, filename in filenames:
-        _eventually(
-            lambda pkg=pkg, filename=filename: minio_key_exists_in(
-                minio, b, f"packages/{pkg}/{filename}"
-            ),
-            timeout=20,
-            what=f"full diff copies {pkg}",
-        )
-    for pkg, _ in filenames:
-        assert server["faults"].count(needle=f"prefix=_staging/repl/{pkg}") == 0, (
-            f"full diff performed a per-package staging LIST for {pkg}"
-        )
-
-
 def test_upload_replicates_and_second_bucket_builds_its_own_index(
     minio_two, s3_server_multi, tmp_path
 ):
@@ -768,6 +767,18 @@ def test_upload_replicates_and_second_bucket_builds_its_own_index(
     )
     assert minio_key_exists_in(minio, b, f"{akey}.meta.json"), "sidecar must replicate too"
     assert minio_key_exists_in(minio, b, f"{akey}.metadata"), "PEP 658 metadata must replicate"
+    # Existence is not convergence: the fan-out must land the exact source bytes.
+    # Artifact bytes equal the uploaded wheel; sidecar and PEP 658 companion bytes
+    # equal the selected bucket's, so every bucket serves an identical record.
+    wheel_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    assert minio_object_sha256(minio, b, akey) == wheel_sha
+    assert minio_object_sha256(minio, b, akey) == minio_object_sha256(minio, a, akey)
+    assert minio_object_sha256(minio, b, f"{akey}.meta.json") == minio_object_sha256(
+        minio, a, f"{akey}.meta.json"
+    )
+    assert minio_object_sha256(minio, b, f"{akey}.metadata") == minio_object_sha256(
+        minio, a, f"{akey}.metadata"
+    )
     # Origin claim replicated as private (ahead of / alongside the artifact).
     claim = json.loads(minio_get_key_in(minio, b, f"packages/{pkg}/.origin"))
     assert claim["origin"] == "private"
@@ -819,6 +830,15 @@ def test_repl_marker_accumulates_then_drains_when_destination_returns(
         lambda: minio_key_exists_in(minio, b, akey),
         what="record delivered after the bucket returned",
     )
+    # The drained record must be the source bytes, not merely a present key.
+    wheel_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    _eventually(
+        lambda: minio_object_sha256(minio, b, akey) == wheel_sha,
+        what="drained artifact bytes match the source upload",
+    )
+    assert minio_object_sha256(minio, b, f"{akey}.meta.json") == minio_object_sha256(
+        minio, a, f"{akey}.meta.json"
+    )
     _eventually(
         lambda: not any(k.startswith("_repl/") for k in minio_list_keys_in(minio, a)),
         what="marker consumed after successful delivery",
@@ -867,13 +887,15 @@ def test_delete_propagates_tombstone_and_drops_from_both_indexes(
     )
 
 
-def test_byte_conflict_freezes_on_both_buckets(minio_two, s3_server_multi, tmp_path):
-    """Two buckets holding different bytes under one filename is a split-brain.
-    The reconcile diff quarantines both bodies, drops a `.frozen` suppression
-    marker on both, retains inert canonical evidence, removes the name from both
-    indexes, and counts the freeze — never picking a winner."""
-    server = s3_server_multi
-    minio = minio_two
+def test_byte_conflict_keeps_first_upload_and_quarantines_loser(s3_servers_multi, tmp_path):
+    """An ordered private/private conflict keeps the older upload everywhere.
+
+    The losing bytes remain recoverable under quarantine and the alarm counter
+    records that human review is required.
+    """
+    cluster = s3_servers_multi
+    server = cluster["left"]
+    minio = cluster["minio"]
     a, b = minio["buckets"]
     pkg = "conflicttest"
     wheel = make_wheel(pkg, "4.0", tmp_path)
@@ -886,54 +908,58 @@ def test_byte_conflict_freezes_on_both_buckets(minio_two, s3_server_multi, tmp_p
         what="identical copy replicated to B before the conflict",
     )
 
-    # Manufacture the conflict: overwrite B's artifact and sidecar with different
-    # bytes under the same filename, still claimed private — the exact shape a
-    # dual-write split would leave behind.
+    winner = wheel.read_bytes()
+    winner_sha = hashlib.sha256(winner).hexdigest()
+    winner_sidecar = json.loads(minio_get_key_in(minio, a, f"{akey}.meta.json"))
+    winner_epoch = winner_sidecar["upload-epoch-ms"]
+
+    # Isolate the two bucket views while manufacturing the otherwise-rare
+    # partition conflict, so reconcile cannot observe a half-written record.
+    _partition_nodes(cluster)
+
+    # Manufacture the later side of a partition conflict. Sidecar first and
+    # artifact last mirrors the server's crash-safe publish ordering.
     other = "these are different bytes than the wheel A published"
     other_sha = hashlib.sha256(other.encode()).hexdigest()
-    minio_put_key_in(minio, b, akey, other)
     sidecar = json.dumps(
         {
             "sha256": other_sha,
             "size": len(other),
             "version": "4.0",
             "upload-time": "2020-01-01T00:00:00Z",
+            "upload-epoch-ms": winner_epoch + 3_000,
             "yanked": False,
             "origin": "private",
         }
     )
     minio_put_key_in(minio, b, f"{akey}.meta.json", sidecar)
+    minio_put_key_in(minio, b, akey, other)
+    _heal_nodes(cluster, a, b)
 
-    # The reconcile diff freezes both sides.
-    fkey = f"{akey}.frozen"
-    _eventually(lambda: minio_key_exists_in(minio, a, fkey), what="freeze marker on A")
-    _eventually(lambda: minio_key_exists_in(minio, b, fkey), what="freeze marker on B")
-
-    # Both bodies are preserved under quarantine; canonical keys remain occupied
-    # and inert so cleanup cannot delete a replacement that raced the freeze.
+    loser_key = f"_quarantine/{pkg}/{wheel.name}@{other_sha[:12]}"
     _eventually(
-        lambda: any(k.startswith(f"_quarantine/{pkg}/") for k in minio_list_keys_in(minio, a)),
-        what="bucket A body quarantined",
+        lambda: minio_key_exists_in(minio, b, loser_key),
+        what="later bucket B body quarantined",
+    )
+    assert minio_get_key_bytes_in(minio, b, loser_key) == other.encode()
+    _eventually(
+        lambda: minio_get_key_bytes_in(minio, b, akey) == winner,
+        what="older bucket A bytes replace the loser on B",
+    )
+    assert minio_get_key_bytes_in(minio, a, akey) == winner
+    assert not minio_key_exists_in(minio, a, f"{akey}.frozen")
+    assert not minio_key_exists_in(minio, b, f"{akey}.frozen")
+    _eventually(
+        lambda: _index_has_file(minio, a, pkg, wheel.name),
+        what="winner remains indexed on A",
     )
     _eventually(
-        lambda: any(k.startswith(f"_quarantine/{pkg}/") for k in minio_list_keys_in(minio, b)),
-        what="bucket B body quarantined",
+        lambda: _index_has_file(minio, b, pkg, wheel.name),
+        what="winner remains indexed on B",
     )
 
-    _eventually(lambda: minio_key_exists_in(minio, a, akey), what="A evidence retained")
-    _eventually(lambda: minio_key_exists_in(minio, b, akey), what="B evidence retained")
-    _eventually(
-        lambda: not _index_has_file(minio, a, pkg, wheel.name),
-        what="name suppressed on A",
-    )
-    _eventually(
-        lambda: not _index_has_file(minio, b, pkg, wheel.name),
-        what="name suppressed on B",
-    )
-
-    # A freeze carries the same permanent filename-reuse fence as a delete.
-    # The existing one tombstone HEAD in the upload path rejects this before a
-    # client can receive a false 200 for a body that reconciliation will hide.
+    # Filename immutability still rejects a duplicate, while reads keep serving
+    # the first-uploaded bytes rather than suppressing the filename.
     code, _ = upload_legacy(
         server["legacy"],
         wheel,
@@ -942,22 +968,19 @@ def test_byte_conflict_freezes_on_both_buckets(minio_two, s3_server_multi, tmp_p
         expect_status=409,
     )
     assert code == 409
-    assert minio_key_exists_in(minio, a, akey)
-    code, _, _ = http_get(f"{server['base_url']}/files/{pkg}/{wheel.name}", timeout=10)
-    assert code == 404
-
-    # The freeze is counted (multi-bucket only metric family).
-    _, body, _ = http_get(f"{server['base_url']}/metrics")
-    freeze_line = next(
-        (
-            ln
-            for ln in body.decode().splitlines()
-            if ln.startswith("pypiron_replication_freezes_total ")
+    code, body, _ = http_get(f"{server['base_url']}/files/{pkg}/{wheel.name}", timeout=10)
+    assert code == 200
+    assert hashlib.sha256(body).hexdigest() == winner_sha
+    _eventually(
+        lambda: (
+            max(
+                _counter_value(cluster["left"], "pypiron_replication_conflict_quarantines_total"),
+                _counter_value(cluster["right"], "pypiron_replication_conflict_quarantines_total"),
+            )
+            >= 1
         ),
-        None,
+        what="byte-conflict alarm counter increments",
     )
-    assert freeze_line is not None, "freeze metric family must be present on a multi-bucket node"
-    assert int(freeze_line.rsplit(" ", 1)[1]) >= 1, freeze_line
 
 
 def test_follower_with_working_path_drains_leaders_marker(s3_servers_multi, tmp_path):
@@ -1139,8 +1162,8 @@ def test_partitioned_nodes_accept_writes_and_heal_both_directions(s3_servers_mul
     )
 
 
-def test_partitioned_duplicate_uploads_freeze_after_heal(s3_servers_multi, tmp_path):
-    """Two acknowledged uploads with one filename and different bytes freeze."""
+def test_partitioned_duplicate_uploads_keep_first_after_heal(s3_servers_multi, tmp_path):
+    """Two partitioned uploads converge to the older bytes with an alarm."""
     cluster = s3_servers_multi
     minio = cluster["minio"]
     a, b = _partition_nodes(cluster)
@@ -1153,60 +1176,76 @@ def test_partitioned_duplicate_uploads_freeze_after_heal(s3_servers_multi, tmp_p
         != hashlib.sha256(right_wheel.read_bytes()).digest()
     )
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        left = pool.submit(_upload, cluster["left"], left_wheel)
-        right = pool.submit(_upload, cluster["right"], right_wheel)
-        left.result(timeout=30)
-        right.result(timeout=30)
+    _upload(cluster["left"], left_wheel)
+    # The tiebreak deliberately distrusts clocks within two seconds. Keep this
+    # blackbox conflict outside that skew window so it exercises first-wins.
+    time.sleep(2.1)
+    _upload(cluster["right"], right_wheel)
 
     key = f"packages/{pkg}/{left_wheel.name}"
     assert minio_key_exists_in(minio, a, key)
     assert minio_key_exists_in(minio, b, key)
+    left_sidecar = json.loads(minio_get_key_in(minio, a, f"{key}.meta.json"))
+    right_sidecar = json.loads(minio_get_key_in(minio, b, f"{key}.meta.json"))
+    assert right_sidecar["upload-epoch-ms"] - left_sidecar["upload-epoch-ms"] > 2_000
+
+    winner = left_wheel.read_bytes()
+    loser = right_wheel.read_bytes()
+    loser_sha = hashlib.sha256(loser).hexdigest()
+    loser_key = f"_quarantine/{pkg}/{left_wheel.name}@{loser_sha[:12]}"
     _heal_nodes(cluster, a, b)
     for bucket in (a, b):
         _eventually(
-            lambda bucket=bucket: minio_key_exists_in(minio, bucket, f"{key}.frozen"),
+            lambda bucket=bucket: minio_get_key_bytes_in(minio, bucket, key) == winner,
             timeout=45,
-            what=f"duplicate name freezes in {bucket}",
+            what=f"first-uploaded bytes converge in {bucket}",
         )
         _eventually(
-            lambda bucket=bucket: minio_key_exists_in(minio, bucket, key),
+            lambda bucket=bucket: _index_has_file(minio, bucket, pkg, left_wheel.name),
             timeout=45,
-            what=f"frozen canonical evidence remains occupied in {bucket}",
+            what=f"winning duplicate remains indexed in {bucket}",
         )
-        _eventually(
-            lambda bucket=bucket: any(
-                item.startswith(f"_quarantine/{pkg}/{left_wheel.name}@")
-                for item in minio_list_keys_in(minio, bucket)
-            ),
-            timeout=45,
-            what=f"conflicting body is preserved in {bucket}",
-        )
-        _eventually(
-            lambda bucket=bucket: not _index_has_file(minio, bucket, pkg, left_wheel.name),
-            timeout=45,
-            what=f"frozen duplicate is suppressed in {bucket}'s index",
-        )
+        assert not minio_key_exists_in(minio, bucket, f"{key}.frozen")
+
+    _eventually(
+        lambda: minio_key_exists_in(minio, b, loser_key),
+        timeout=45,
+        what="later upload is preserved in B's quarantine",
+    )
+    assert minio_get_key_bytes_in(minio, b, loser_key) == loser
+    _eventually(
+        lambda: (
+            max(
+                _counter_value(cluster["left"], "pypiron_replication_conflict_quarantines_total"),
+                _counter_value(cluster["right"], "pypiron_replication_conflict_quarantines_total"),
+            )
+            >= 1
+        ),
+        timeout=45,
+        what="partition-conflict alarm counter increments",
+    )
 
     _eventually(
         lambda: _selected_bucket(cluster["left"]) == a,
         timeout=30,
-        what="left reads frozen evidence from A",
+        what="left reads the winner from A",
     )
-    code, _, _ = http_get(
+    code, body, _ = http_get(
         f"{cluster['left']['base_url']}/files/{pkg}/{left_wheel.name}", timeout=10
     )
-    assert code == 404
+    assert code == 200
+    assert body == winner
     cluster["right"]["faults"].fail(a)
     _eventually(
         lambda: _selected_bucket(cluster["right"]) == b,
         timeout=30,
-        what="right reads frozen evidence from B",
+        what="right reads the winner from B",
     )
-    code, _, _ = http_get(
+    code, body, _ = http_get(
         f"{cluster['right']['base_url']}/files/{pkg}/{right_wheel.name}", timeout=10
     )
-    assert code == 404
+    assert code == 200
+    assert body == winner
     cluster["right"]["faults"].recover(a)
 
 
@@ -1380,20 +1419,27 @@ def test_legacy_mirror_upload_publishes_sidecar_before_artifact(s3_servers_multi
         bucket,
         f"packages/{pkg}/{wheel.name}",
     )
+    sidecar = json.loads(
+        minio_get_key_in(cluster["minio"], bucket, f"packages/{pkg}/{wheel.name}.meta.json")
+    )
+    assert "upload-epoch-ms" not in sidecar
 
 
 def test_proxy_fill_vs_private_upload_demotes_and_quarantines(s3_servers_multi_proxy, tmp_path):
-    """A proxy fill on B and private publish on A converge private, not frozen.
+    """Private bytes supersede a same-filename mirror fill per artifact.
 
     The operations overlap while each node can reach only its selected bucket.
-    On heal the package-level demotion stages the private record, changes the
-    claim once, and preserves the mirror loser under quarantine.
+    On heal B's claim is demoted, the mirror bytes are preserved under
+    quarantine, and the private record lands directly without a promotion
+    barrier.
     """
     cluster = s3_servers_multi_proxy
     minio = cluster["minio"]
     pkg = "demotionrace"
-    mirror_wheel = make_wheel(pkg, "1.0", tmp_path)
-    private_wheel = make_wheel(pkg, "2.0", tmp_path)
+    mirror_wheel = make_wheel(pkg, "1.0", tmp_path / "mirror", description="upstream mirror build")
+    private_wheel = make_wheel(pkg, "1.0", tmp_path / "private", description="private build")
+    assert mirror_wheel.name == private_wheel.name
+    assert mirror_wheel.read_bytes() != private_wheel.read_bytes()
     _upload(cluster["upstream"], mirror_wheel)
     wait_for_file_in_index(cluster["upstream"]["simple"], pkg, mirror_wheel.name)
     a, b = _partition_nodes(cluster)
@@ -1425,52 +1471,48 @@ def test_proxy_fill_vs_private_upload_demotes_and_quarantines(s3_servers_multi_p
         what="B holds the mirror claim",
     )
 
-    private_key = f"packages/{pkg}/{private_wheel.name}"
-    mirror_key = f"packages/{pkg}/{mirror_wheel.name}"
+    artifact_key = f"packages/{pkg}/{private_wheel.name}"
+    mirror_sha = hashlib.sha256(mirror_wheel.read_bytes()).hexdigest()
+    quarantine_key = f"_quarantine/{pkg}/{mirror_wheel.name}@{mirror_sha[:12]}"
     _heal_nodes(cluster, a, b)
     _eventually(
         lambda: _claim_owner(minio, b, pkg) == "private",
         timeout=45,
-        what="B is atomically demoted to private",
+        what="B's mirror claim is demoted to private",
     )
     _eventually(
-        lambda: minio_key_exists_in(minio, b, private_key),
+        lambda: minio_get_key_bytes_in(minio, b, artifact_key) == private_wheel.read_bytes(),
         timeout=45,
-        what="staged private artifact is promoted in B",
+        what="private bytes supersede the mirror body in B",
     )
     _eventually(
-        lambda: minio_key_exists_in(minio, b, f"{mirror_key}.mirror-quarantined"),
-        timeout=45,
-        what="mirror loser is marked inert in B's live package tree",
-    )
-    assert minio_key_exists_in(minio, b, mirror_key), "cleanup must not open an ABA window"
-    assert not minio_key_exists_in(minio, a, mirror_key), "mirror cache must never replicate"
-    _eventually(
-        lambda: any(
-            key.startswith(f"_quarantine/{pkg}/{mirror_wheel.name}@")
-            for key in minio_list_keys_in(minio, b)
-        ),
+        lambda: minio_key_exists_in(minio, b, quarantine_key),
         timeout=45,
         what="B preserves the mirror loser under quarantine",
     )
+    assert minio_get_key_bytes_in(minio, b, quarantine_key) == mirror_wheel.read_bytes()
+    assert minio_get_key_bytes_in(minio, a, artifact_key) == private_wheel.read_bytes()
     _eventually(
-        lambda: (
-            _index_has_file(minio, b, pkg, private_wheel.name)
-            and not _index_has_file(minio, b, pkg, mirror_wheel.name)
-        ),
+        lambda: not minio_key_exists_in(minio, b, f"{artifact_key}.mirror-quarantined"),
         timeout=45,
-        what="B indexes only private truth after demotion",
+        what="supersede clears B's inert mirror marker",
+    )
+    _eventually(
+        lambda: _index_has_file(minio, b, pkg, private_wheel.name),
+        timeout=45,
+        what="B indexes the private winner after demotion",
     )
     cluster["right"]["faults"].fail(a)
     _eventually(
         lambda: _selected_bucket(cluster["right"]) == b,
         timeout=30,
-        what="right node selects bucket with retained quarantined mirror bytes",
+        what="right node selects the converged bucket B",
     )
-    code, _, _ = http_get(
-        f"{cluster['right']['base_url']}/files/{pkg}/{mirror_wheel.name}", timeout=10
+    code, body, _ = http_get(
+        f"{cluster['right']['base_url']}/files/{pkg}/{private_wheel.name}", timeout=10
     )
-    assert code == 404, "retained mirror quarantine bytes must not be directly downloadable"
+    assert code == 200
+    assert body == private_wheel.read_bytes()
     cluster["right"]["faults"].recover(a)
 
 
@@ -1537,8 +1579,10 @@ def test_cold_start_merges_preexisting_bucket_divergence(minio_two, pypiron_bin,
     right_pkg = "coldright"
     left_filename = "coldleft-1.0-py3-none-any.whl"
     right_filename = "coldright-1.0-py3-none-any.whl"
-    _seed_private_record(minio, a, left_pkg, left_filename, "private bytes from A")
-    _seed_private_record(minio, b, right_pkg, right_filename, "private bytes from B")
+    left_body = "private bytes from A"
+    right_body = "private bytes from B"
+    _seed_private_record(minio, a, left_pkg, left_filename, left_body)
+    _seed_private_record(minio, b, right_pkg, right_filename, right_body)
 
     server_gen = _start_s3_server(
         tmp_path_factory,
@@ -1551,9 +1595,9 @@ def test_cold_start_merges_preexisting_bucket_divergence(minio_two, pypiron_bin,
     )
     server = next(server_gen)
     try:
-        for bucket, pkg, filename in (
-            (b, left_pkg, left_filename),
-            (a, right_pkg, right_filename),
+        for bucket, pkg, filename, body in (
+            (b, left_pkg, left_filename, left_body),
+            (a, right_pkg, right_filename, right_body),
         ):
             key = f"packages/{pkg}/{filename}"
             _eventually(
@@ -1561,6 +1605,18 @@ def test_cold_start_merges_preexisting_bucket_divergence(minio_two, pypiron_bin,
                 timeout=45,
                 what=f"cold-start diff copies {pkg} into {bucket}",
             )
+            # The repaired copy must carry the seeded bytes, not just occupy the
+            # key, and its sidecar must describe those exact bytes.
+            body_sha = hashlib.sha256(body.encode()).hexdigest()
+            _eventually(
+                lambda bucket=bucket, key=key, body_sha=body_sha: (
+                    minio_object_sha256(minio, bucket, key) == body_sha
+                ),
+                timeout=45,
+                what=f"cold-start diff copies {pkg}'s exact bytes into {bucket}",
+            )
+            dest_sidecar = json.loads(minio_get_key_in(minio, bucket, f"{key}.meta.json"))
+            assert dest_sidecar["sha256"] == body_sha
             _eventually(
                 lambda bucket=bucket, pkg=pkg: _claim_owner(minio, bucket, pkg) == "private",
                 timeout=20,
@@ -1618,8 +1674,52 @@ def test_buckets_migrate_stamps_every_reachable_bucket(minio_two, pypiron_bin):
         assert rc == 0, f"topology migration failed:\n{out}\n{err}"
         for bucket in minio["buckets"]:
             stamp = json.loads(minio_get_key_in(minio, bucket, "_topology/stamp.json"))
-            assert stamp["buckets"] == minio["buckets"]
+            assert stamp["buckets"] == [f"s3://{name}" for name in minio["buckets"]]
             assert stamp["generation"] == expected_generation
+
+
+def test_migrate_refuses_to_drop_a_removed_bucket_holding_notes_then_succeeds(
+    minio_three, pypiron_bin
+):
+    """Shrinking the list must not strand a `_repl/` note on the bucket being
+    removed: a stranded note there can be a record's sole copy. Migrate refuses
+    while the removed bucket holds one, then succeeds once it is drained."""
+    minio = minio_three
+    a, b, c = minio["buckets"]
+    env = _s3_env(minio, "127.0.0.1:0")
+
+    # Establish the [a, b, c] topology.
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b, c)
+    rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
+    assert rc == 0, f"initial migration failed:\n{out}\n{err}"
+
+    # A fan-out note that only bucket c (the one we are about to drop) holds:
+    # `_repl/<dest>/<pkg>/<file>!<nonce>`.
+    note_key = "_repl/0/lonelypkg/lonelypkg-1.0-py3-none-any.whl!stranded"
+    minio_put_key_in(minio, c, note_key, "")
+
+    # Shrinking to [a, b] must be refused: c is being removed but still holds a note.
+    shrink_env = _s3_env(minio, "127.0.0.1:0")
+    shrink_env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b)
+    rc, out, err = run_returncode(
+        [str(pypiron_bin), "buckets", "migrate"], env=shrink_env, timeout=30
+    )
+    assert rc != 0, f"migrate dropped a removed bucket that still held notes:\n{out}\n{err}"
+    assert c in (out + err) and "undrained" in (out + err), f"unexpected error:\n{out}\n{err}"
+    # The topology was not shrunk: a and b still carry the three-bucket stamp.
+    for bucket in (a, b):
+        stamp = json.loads(minio_get_key_in(minio, bucket, "_topology/stamp.json"))
+        assert stamp["buckets"] == [f"s3://{name}" for name in (a, b, c)]
+
+    # Drain the note; the shrink now succeeds.
+    minio_delete_key_in(minio, c, note_key)
+    rc, out, err = run_returncode(
+        [str(pypiron_bin), "buckets", "migrate"], env=shrink_env, timeout=30
+    )
+    assert rc == 0, f"migrate refused a clean shrink:\n{out}\n{err}"
+    for bucket in (a, b):
+        stamp = json.loads(minio_get_key_in(minio, bucket, "_topology/stamp.json"))
+        assert stamp["buckets"] == [f"s3://{a}", f"s3://{b}"]
 
 
 def test_fresh_startup_repairs_member_that_missed_topology_migration(
@@ -1629,12 +1729,12 @@ def test_fresh_startup_repairs_member_that_missed_topology_migration(
     minio = minio_three_proxy
     a, b, c = minio["buckets"]
     env = _s3_env(minio, "127.0.0.1:0")
-    env["PYPIRON_S3_BUCKETS"] = f"{a},{b}"
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b)
     rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
     assert rc == 0, f"initial topology migration failed:\n{out}\n{err}"
 
     minio["faults"].fail(b)
-    env["PYPIRON_S3_BUCKETS"] = f"{a},{b},{c}"
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b, c)
     rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
     assert rc == 0, f"partial topology migration failed:\n{out}\n{err}"
     minio["faults"].recover(b)
@@ -1648,50 +1748,31 @@ def test_fresh_startup_repairs_member_that_missed_topology_migration(
     server = next(server_gen)
     try:
         stamp = json.loads(minio_get_key_in(minio, b, "_topology/stamp.json"))
-        assert stamp["buckets"] == [a, b, c]
+        assert stamp["buckets"] == [f"s3://{name}" for name in (a, b, c)]
         assert stamp["generation"] == 2
         assert _selected_bucket(server) == a
     finally:
         server_gen.close()
 
 
-def test_legacy_singular_s3_bucket_env_still_selects_s3(minio_two, pypiron_bin):
+def test_singular_s3_bucket_env_selects_single_bucket_s3(minio_two, pypiron_bin):
+    """The singular PYPIRON_S3_BUCKET is single-bucket mode on S3 — the one knob
+    that stays after the multi-bucket list moved to PYPIRON_BUCKETS URIs."""
     env = _s3_env(minio_two, "127.0.0.1:0")
     bucket = minio_two["buckets"][0]
-    pkg = "legacyenvclaim"
+    pkg = "singleenvclaim"
     minio_put_key_in(
         minio_two,
         bucket,
         f"packages/{pkg}/.origin",
         json.dumps({"origin": "private", "nonce": "1" * 32}),
     )
-    env.pop("PYPIRON_S3_BUCKETS")
+    env.pop("PYPIRON_BUCKETS", None)
     env["PYPIRON_S3_BUCKET"] = bucket
     rc, out, err = run_returncode([str(pypiron_bin), "origin", "release", pkg], env=env, timeout=30)
-    assert rc == 0, f"legacy singular env was rejected:\n{out}\n{err}"
+    assert rc == 0, f"singular env was rejected:\n{out}\n{err}"
     assert f"storage backend s3 · {bucket}" in err
     assert _claim_owner(minio_two, bucket, pkg) == "unclaimed"
-
-
-def test_s3_bucket_rejects_an_explicit_other_cloud(minio_two, pypiron_bin):
-    env = _s3_env(minio_two, "127.0.0.1:0")
-    rc, _, err = run_returncode(
-        [
-            str(pypiron_bin),
-            "buckets",
-            "migrate",
-            "--storage",
-            "gcs",
-            "--gcs-bucket",
-            "other-cloud",
-            "--s3-bucket",
-            minio_two["buckets"][0],
-        ],
-        env=env,
-        timeout=30,
-    )
-    assert rc != 0
-    assert "cannot be combined" in err
 
 
 def test_reserved_prefix_blocks_proxy_during_origin_only_divergence(
@@ -1726,3 +1807,247 @@ def test_reserved_prefix_blocks_proxy_during_origin_only_divergence(
         timeout=30,
         what="origin-only private claim converges without an artifact marker",
     )
+
+
+# ======================= Crash-mid-fan-out kill-point sweep ====================
+#
+# The single-bucket disk/S3 kill-point sweeps (test_crash_consistency.py) crash
+# across one bucket's write protocol. This extends the pattern to the v2 pre-ack
+# fan-out on a 2-bucket topology: sweep PYPIRON_FAULT_ABORT_AFTER_WRITES over a
+# private upload so the process aborts in every gap of the *selected* bucket's
+# write protocol (origin claim, sidecar, companions, artifact-last), the pre-ack
+# repair-note writes, and the post-ack index writes. After each crash a clean
+# node restarts with the boot audit, full-diff reconcile, and `_repl/` sweep on;
+# both buckets must converge to the same complete byte-equal record or a clean
+# absence, and neither may serve a half-record.
+#
+# Reachability note (reported per the task cap): FaultInjectStorage wraps bucket
+# 0 only — the selected/source bucket, which is never itself a fan-out
+# destination (src.rs `fanout_sync` skips `src_index`). A process-abort therefore
+# cannot land *inside* a secondary copy (mid-multipart, or after the secondary
+# sidecar before its artifact); those bucket-1 writes are uncounted. That window
+# is a graceful secondary failure rather than a crash, and is already covered by
+# the fault-proxy note-and-heal tests (`test_repl_marker_accumulates_then_drains`
+# and the partition suite). This sweep owns the selected-write and pre-ack
+# windows the existing machinery can reach.
+
+# Bounded so the whole-file gate stays under its time cap; each point still
+# recovers and verifies both buckets independently. The reachable windows are
+# bucket 0's (see the reachability note above), and these span boot init through
+# the selected-write protocol and the post-ack index writes.
+MULTIBUCKET_CRASH_KILL_POINTS = range(1, 7)
+
+
+def _start_multibucket_node(
+    pypiron_bin, minio, tmp_path, label, *, fault_after=None, extra_env=None
+):
+    """Launch one pypiron node against the two-bucket topology. Returns as soon
+    as the node answers or the process exits — a fault node may self-abort during
+    boot writes, and recovery proceeds either way."""
+    port = find_free_port()
+    bind = f"127.0.0.1:{port}"
+    env = _s3_env(minio, bind)
+    env["PYPIRON_AUDIT_ON_BOOT"] = "false"
+    if extra_env:
+        env.update(extra_env)
+    if fault_after is not None:
+        env["PYPIRON_FAULT_ABORT_AFTER_WRITES"] = str(fault_after)
+    log_path = tmp_path / f"{label}.log"
+    log = open(log_path, "w")
+    proc = subprocess.Popen(
+        [str(pypiron_bin), "serve"], env=env, stdout=log, stderr=subprocess.STDOUT
+    )
+    base = f"http://{bind}"
+    node = {
+        "proc": proc,
+        "base_url": base,
+        "legacy": f"{base}/legacy/",
+        "simple": f"{base}/simple/",
+        "log_path": log_path,
+        "user": "admin",
+        "password": "secret",
+    }
+    deadline = time.time() + 20
+    while time.time() < deadline and proc.poll() is None:
+        try:
+            http_get(f"{base}/simple/index.json", timeout=1)
+            break
+        except (ConnectionError, OSError):
+            time.sleep(0.2)
+    return node
+
+
+def _sigkill(proc) -> None:
+    """Ungraceful death: SIGKILL, no drain, no lease release."""
+    try:
+        os.kill(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _verify_bucket_rc(pypiron_bin, minio, bucket) -> int:
+    """Run the read-only `verify-index` oracle against one bucket in isolation.
+    verify builds only the default handle, so a single-bucket env points it at
+    exactly `bucket`: exit 0 means that bucket's served views match its own truth
+    (no sidecar/index without a matching artifact — no half-record)."""
+    env = _s3_env(minio, "127.0.0.1:0")
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(bucket)
+    env["PYPIRON_AUDIT_ON_BOOT"] = "false"
+    cp = subprocess.run(
+        [str(pypiron_bin), "verify-index"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return cp.returncode
+
+
+def _multibucket_converged(pypiron_bin, minio, a, b, pkg, filename, wheel_sha, *, acked) -> bool:
+    """Both buckets hold the same complete byte-equal record or a clean absence,
+    and neither serves a half-record."""
+    akey = f"packages/{pkg}/{filename}"
+    a_has = minio_key_exists_in(minio, a, akey)
+    b_has = minio_key_exists_in(minio, b, akey)
+    if a_has != b_has:
+        return False
+    if acked and not a_has:
+        # A 200 promised a durable record; a clean absence would be a lie.
+        return False
+    if a_has:
+        if minio_object_sha256(minio, a, akey) != wheel_sha:
+            return False
+        if minio_object_sha256(minio, b, akey) != wheel_sha:
+            return False
+        for bucket in (a, b):
+            if not minio_key_exists_in(minio, bucket, f"{akey}.meta.json"):
+                return False
+            if not _index_has_file(minio, bucket, pkg, filename):
+                return False
+    # Only run the (subprocess) oracle once cheap byte-convergence already holds.
+    return (
+        _verify_bucket_rc(pypiron_bin, minio, a) == 0
+        and _verify_bucket_rc(pypiron_bin, minio, b) == 0
+    )
+
+
+def test_multibucket_crash_during_fanout_upload_converges(minio_two, pypiron_bin, tmp_path):
+    """SIGABRT the node in each gap of the selected-write + pre-ack fan-out, then
+    prove both buckets converge — same complete byte-equal record or clean
+    absence, never a served half-record, and an acked upload never vanishes."""
+    minio = minio_two
+    a, b = minio["buckets"]
+    for kill_point in MULTIBUCKET_CRASH_KILL_POINTS:
+        pkg = f"fanoutcrash{kill_point}"
+        filename = f"{pkg}-1.0-py3-none-any.whl"
+        wheel = make_wheel(pkg, "1.0", tmp_path)
+        wheel_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+
+        node = _start_multibucket_node(
+            pypiron_bin, minio, tmp_path, f"crash-{kill_point}", fault_after=kill_point
+        )
+        acked = False
+        try:
+            upload_legacy(node["legacy"], wheel, username="admin", password="secret", timeout=10)
+            acked = True
+        except (RuntimeError, ConnectionError, OSError):
+            acked = False
+        # Give the nudged worker a moment to walk into the kill point too.
+        time.sleep(1.2)
+        _sigkill(node["proc"])
+
+        recovery = _start_multibucket_node(
+            pypiron_bin,
+            minio,
+            tmp_path,
+            f"recover-{kill_point}",
+            extra_env={
+                "PYPIRON_AUDIT_ON_BOOT": "true",
+                "PYPIRON_RECONCILE_INTERVAL_SECS": "3",
+                "PYPIRON_REPL_SWEEP_INTERVAL_SECS": "2",
+            },
+        )
+        try:
+            _eventually(
+                lambda: _multibucket_converged(
+                    pypiron_bin, minio, a, b, pkg, filename, wheel_sha, acked=acked
+                ),
+                timeout=90,
+                interval=2.0,
+                what=(
+                    f"both buckets converge after crash at kill point {kill_point} (acked={acked})"
+                ),
+            )
+        finally:
+            kill_process_tree(recovery["proc"])
+
+
+# ========================= Startup topology refusal ===========================
+
+
+def _serve_exits(pypiron_bin, minio, bucket_names, *, timeout=30):
+    """Launch `serve` with an explicit bucket list and wait for it to exit.
+    Returns (returncode, combined_output). Fails the test if it stays up — the
+    topology check runs before the bind, so a refusal is fast."""
+    port = find_free_port()
+    env = _s3_env(minio, f"127.0.0.1:{port}")
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(*bucket_names)
+    env["PYPIRON_AUDIT_ON_BOOT"] = "false"
+    proc = subprocess.Popen(
+        [str(pypiron_bin), "serve"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_process_tree(proc)
+        out, _ = proc.communicate(timeout=5)
+        raise AssertionError(f"serve did not refuse to start; it stayed up:\n{out}")
+    return proc.returncode, out
+
+
+def test_changed_bucket_list_without_migrate_refuses_to_start(minio_three, pypiron_bin, tmp_path):
+    """A node whose configured bucket list no longer matches the fleet's stamp —
+    a bucket added or the order changed without running `buckets migrate` — must
+    refuse to start. The matching list is the positive control and boots."""
+    minio = minio_three
+    a, b, c = minio["buckets"]
+
+    # Stamp the fleet at generation 1 for the [a, b] topology.
+    migrate_env = _s3_env(minio, "127.0.0.1:0")
+    migrate_env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b)
+    rc, out, err = run_returncode(
+        [str(pypiron_bin), "buckets", "migrate"], env=migrate_env, timeout=30
+    )
+    assert rc == 0, f"initial topology migration failed:\n{out}{err}"
+
+    # Positive control: the migrated list boots.
+    node = _start_multibucket_node(
+        pypiron_bin,
+        minio,
+        tmp_path,
+        "same-list",
+        extra_env={"PYPIRON_BUCKETS": s3_buckets_uri(a, b)},
+    )
+    try:
+        wait_http_ok(f"{node['base_url']}/simple/index.json", timeout=20)
+        assert node["proc"].poll() is None, "server exited despite a matching topology"
+    finally:
+        kill_process_tree(node["proc"])
+
+    # Negative: an added bucket without re-migrating refuses to start.
+    rc, out = _serve_exits(pypiron_bin, minio, (a, b, c))
+    assert rc != 0, f"adding a bucket without migrating should refuse to start:\n{out}"
+    assert "different bucket topology" in out and "refusing to start" in out, out
+
+    # Negative: a reordered list without re-migrating refuses to start.
+    rc, out = _serve_exits(pypiron_bin, minio, (b, a))
+    assert rc != 0, f"reordering buckets without migrating should refuse to start:\n{out}"
+    assert "different bucket topology" in out, out

@@ -493,7 +493,6 @@ impl Proxy {
                     Some(etag) => origin::OriginObservation {
                         state: origin::OriginState::Mirror,
                         etag,
-                        pending_manifest: None,
                     },
                     None => origin::read_origin_observation(storage, pkg)
                         .await?
@@ -538,6 +537,7 @@ impl Proxy {
             // Proxy fills are mirror truth (§4/§6.2).
             origin: Some(origin::MIRROR.to_string()),
             yank_epoch: 0,
+            upload_epoch_ms: None,
         };
         // Type the record before its artifact can exist. An orphan sidecar is
         // inert; an orphan artifact would be backfilled from a later private

@@ -21,7 +21,7 @@ use axum::response::Response;
 use object_store::client::{HttpError, HttpErrorKind};
 use object_store::Error as ObjectStoreError;
 
-use crate::bucket_health::{BucketSignal, HealthController, InvalidBucket};
+use crate::bucket_health::{classify, BucketSignal, HealthController, InvalidBucket, SignalClass};
 use crate::storage::{is_not_found, FileEntry, ObjectMeta, Storage};
 
 /// A storage handle tagged with its configured bucket index.
@@ -92,6 +92,15 @@ pub(crate) fn signal_for_error(error: &Error) -> BucketSignal {
         }
     }
 
+    // Typed availability detection runs before the text scan below. Object keys
+    // appear in object_store error Displays, so an outage whose text embeds a
+    // name like "quota-tool" or "slowdown-1.0" would otherwise be misread as an
+    // (ignored) quota/throttle alarm instead of the availability failure it is.
+    // The alarm scan applies only when the type does not prove an outage.
+    if let Some(signal) = typed_availability_signal(error) {
+        return signal;
+    }
+
     let text = error
         .chain()
         .map(ToString::to_string)
@@ -136,6 +145,48 @@ pub(crate) fn signal_for_error(error: &Error) -> BucketSignal {
     status_from_text(&text)
         .map(signal_for_status)
         .unwrap_or(BucketSignal::OtherError)
+}
+
+/// Availability failures the error *type* proves — timeouts, connection loss,
+/// and 5xx/408 statuses — independent of any object name embedded in the text.
+/// Returns `None` for everything else (auth, KMS, quota, config, CAS) so those
+/// still fail closed and never move selection.
+fn typed_availability_signal(error: &Error) -> Option<BucketSignal> {
+    for cause in error.chain() {
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>() {
+            if request.is_timeout() {
+                return Some(BucketSignal::Timeout);
+            }
+            if request.is_connect() {
+                return Some(BucketSignal::ConnectionFailure);
+            }
+            if let Some(status) = request.status() {
+                let signal = signal_for_status(status.as_u16());
+                if is_availability_signal(signal) {
+                    return Some(signal);
+                }
+            }
+        }
+        if let Some(http) = cause.downcast_ref::<HttpError>() {
+            match http.kind() {
+                HttpErrorKind::Timeout => return Some(BucketSignal::Timeout),
+                HttpErrorKind::Connect => return Some(BucketSignal::ConnectionFailure),
+                _ => {}
+            }
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if let Some(signal) = io_signal(io.kind()) {
+                if is_availability_signal(signal) {
+                    return Some(signal);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_availability_signal(signal: BucketSignal) -> bool {
+    matches!(classify(signal), SignalClass::AvailabilityFailure)
 }
 
 fn object_store_signal(error: &ObjectStoreError) -> Option<BucketSignal> {
@@ -219,6 +270,12 @@ fn semantic_alarm(text: &str) -> Option<BucketSignal> {
             "too many requests",
             "rate exceeded",
             "limit exceeded",
+            // GCS rate limiting (rateLimitExceeded / userRateLimitExceeded) and
+            // Azure throttling (ServerBusy) are the S3 SlowDown analog: alarm,
+            // but never evidence another bucket is safer, so don't fail over.
+            "ratelimitexceeded",
+            "serverbusy",
+            "server is busy",
         ],
     ) {
         return Some(BucketSignal::QuotaError);
@@ -332,6 +389,19 @@ impl Storage for ObservedStorage {
 
     async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         let result = self.inner.list_all(prefix).await;
+        self.record(&result);
+        result
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ObjectMeta>> {
+        // Forward to the inner backend so its native paging (S3 start-after) is
+        // used; the trait default would route back through our own `list_all`.
+        let result = self.inner.list_page(prefix, after, limit).await;
         self.record(&result);
         result
     }
@@ -560,6 +630,23 @@ mod tests {
             )),
         });
         assert_eq!(signal_for_error(&connect), BucketSignal::ConnectionFailure);
+    }
+
+    #[test]
+    fn a_typed_timeout_stays_an_outage_even_when_its_text_names_a_quota() {
+        // Object keys ride along in error Displays. A genuine timeout whose text
+        // embeds "quota" (e.g. a package named quota-tool) must classify by type
+        // as an availability failure, not as an ignored quota/throttle alarm.
+        let timeout = object_error(ObjectStoreError::Generic {
+            store: "S3",
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "GET quota-tool/quota-tool-1.0.whl timed out",
+            )),
+        });
+        let signal = signal_for_error(&timeout);
+        assert_eq!(signal, BucketSignal::Timeout);
+        assert_eq!(classify(signal), SignalClass::AvailabilityFailure);
     }
 
     #[test]

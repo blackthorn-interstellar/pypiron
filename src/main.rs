@@ -19,7 +19,7 @@ use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
 use clap::{Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 mod bucket_health;
 mod buckets;
@@ -511,11 +511,91 @@ async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
         .map(|(storage, name)| BucketHandle { storage, name })
         .collect();
     let buckets = BucketSet::new(handles);
+    let is_availability = |error: &anyhow::Error| {
+        bucket_health::classify(observed_storage::signal_for_error(error))
+            == bucket_health::SignalClass::AvailabilityFailure
+    };
+    // Refuse to change the topology while any reachable bucket still holds
+    // undrained `_repl/` repair notes: a stranded note may be the sole copy of a
+    // record not yet replicated, and shrinking/reordering could remove the
+    // bucket it points at. Let the sweep drain first. Surviving buckets that are
+    // unreachable are skipped — migrate itself tolerates them, and we cannot
+    // inspect them.
+    if buckets.is_multi() {
+        for handle in buckets.handles() {
+            match replicate::has_undrained_repl_notes(handle.storage.as_ref()).await {
+                Ok(false) => {}
+                Ok(true) => bail!(
+                    "bucket '{}' has undrained _repl/ repair notes; a stranded note may be a \
+                     record's only copy. Let the running server's sweep drain them (or wait for \
+                     the periodic sweep), then retry `pypiron buckets migrate`.",
+                    handle.name
+                ),
+                Err(error) if is_availability(&error) => {
+                    eprintln!(
+                        "migrate: bucket '{}' unreachable while checking for repair notes; skipping",
+                        handle.name
+                    );
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("check bucket '{}' for undrained repair notes", handle.name)
+                    })
+                }
+            }
+        }
+
+        // A bucket being *removed* from the list is the dangerous case the
+        // surviving-bucket loop above cannot see: it holds `_repl/` notes as a
+        // fan-out source, and a stranded note there can be a record's sole copy.
+        // Read the previous topology from the reachable new-list buckets, then
+        // check every member the new list drops. Unlike a surviving bucket, a
+        // removed bucket we cannot reach is a refusal: we must not drop a bucket
+        // we could not prove note-free.
+        let previous = buckets
+            .stamped_member_names_with(|_, error| is_availability(error))
+            .await
+            .context("read the previous topology to find buckets being removed")?;
+        if let Some(previous) = previous {
+            let new_names: std::collections::HashSet<&str> = buckets
+                .handles()
+                .iter()
+                .map(|handle| handle.name.as_str())
+                .collect();
+            for removed in previous
+                .iter()
+                .filter(|name| !new_names.contains(name.as_str()))
+            {
+                let storage = args
+                    .storage
+                    .build_one_by_identity(removed)
+                    .await
+                    .with_context(|| format!("connect to removed bucket '{removed}'"))?;
+                match replicate::has_undrained_repl_notes(storage.as_ref()).await {
+                    Ok(false) => {}
+                    Ok(true) => bail!(
+                        "bucket '{removed}' is being removed but still holds undrained _repl/ \
+                         repair notes; a stranded note there may be a record's only copy. Let the \
+                         running server's sweep drain them (or wait for the periodic sweep), then \
+                         retry `pypiron buckets migrate`."
+                    ),
+                    Err(error) if is_availability(&error) => bail!(
+                        "bucket '{removed}' is being removed but is unreachable, so its _repl/ \
+                         repair notes cannot be verified drained; refusing to drop a bucket that \
+                         may hold a record's only copy. Bring it back, let the sweep drain, then \
+                         retry `pypiron buckets migrate`. ({error:#})"
+                    ),
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("check removed bucket '{removed}' for undrained repair notes")
+                        })
+                    }
+                }
+            }
+        }
+    }
     let report = buckets
-        .migrate_topology_with(|_, error| {
-            bucket_health::classify(observed_storage::signal_for_error(error))
-                == bucket_health::SignalClass::AvailabilityFailure
-        })
+        .migrate_topology_with(|_, error| is_availability(error))
         .await?;
     let generation = report
         .generation
@@ -693,6 +773,14 @@ struct ServeArgs {
     )]
     bucket_return_healthy_secs: u64,
 
+    /// Grace period a synchronous multi-bucket fan-out gives each secondary
+    /// bucket, measured from the moment the selected bucket's write completed.
+    /// A secondary that cannot converge within it gets a durable `_repl/` repair
+    /// note (drained by the sweep) instead of blocking the ack further, so one
+    /// slow or hung bucket adds at most this much upload latency.
+    #[arg(long, env = "PYPIRON_FANOUT_GRACE_SECS", default_value = "30")]
+    fanout_grace_secs: u64,
+
     /// Seconds an in-flight write may hold off its package's rebuild before
     /// the worker assumes the writer crashed and rebuilds anyway. Must exceed
     /// the slowest expected upload.
@@ -712,6 +800,13 @@ struct ServeArgs {
     /// listing and nothing else.
     #[arg(long, env = "PYPIRON_RECONCILE_INTERVAL_SECS", default_value = "86400")]
     reconcile_interval_secs: u64,
+
+    /// Seconds between periodic `_repl/` repair-note sweeps (multi-bucket only).
+    /// Decoupled from `--worker-interval-secs`: notes exist only after a fan-out
+    /// failure, and the sweep also fires immediately when an unhealthy bucket
+    /// heals, so the 1 s tick never has to drive `_repl/` LISTs.
+    #[arg(long, env = "PYPIRON_REPL_SWEEP_INTERVAL_SECS", default_value = "300")]
+    repl_sweep_interval_secs: u64,
 
     /// Leader lease TTL in seconds (multi-node S3 only; sloppy by design)
     #[arg(long, env = "PYPIRON_LEASE_TTL_SECS", default_value = "30")]
@@ -828,9 +923,6 @@ struct ServeArgs {
 type DownloadBoard = Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<(String, u64)>)>>>;
 type EmptyOriginObservations =
     Arc<tokio::sync::Mutex<std::collections::HashMap<(u64, String), (String, std::time::Instant)>>>;
-type PromotionLockObservations = Arc<
-    tokio::sync::Mutex<std::collections::HashMap<(usize, String), (String, std::time::Instant)>>,
->;
 
 #[derive(Clone)]
 struct AppState {
@@ -873,6 +965,23 @@ struct AppState {
     // worker cfg
     worker_interval: Duration,
     reconcile_interval: Duration,
+    /// Periodic backstop cadence for the `_repl/` repair-note sweep, decoupled
+    /// from `worker_interval` so the 1 s tick never drives `_repl/` LISTs. The
+    /// sweep also fires immediately when an unhealthy bucket heals (see
+    /// `repl_sweep_requested`).
+    repl_sweep_interval: Duration,
+    /// Set by the health loop on a bucket's unhealthy→healthy transition to make
+    /// the worker sweep `_repl/` at once (drain starts seconds after heal),
+    /// instead of waiting out `repl_sweep_interval`. Cleared when a sweep starts.
+    repl_sweep_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// Unix seconds of the last client (non-health/metrics) request, touched
+    /// lock-free by the request path. The multi-bucket health loop reads it to
+    /// gate probe cadence: full speed with recent traffic, decayed when idle.
+    last_request_unix: Arc<std::sync::atomic::AtomicU64>,
+    /// Grace a synchronous pre-ack fan-out gives each secondary bucket, measured
+    /// from the selected bucket's write. A secondary that misses it gets a
+    /// `_repl/` repair note instead of blocking the ack (dev/MULTIBUCKET.md).
+    fanout_grace: Duration,
     /// How long an unpaired intent marker may sit before the worker treats
     /// its writer as crashed and rebuilds anyway. time::Duration because it
     /// is compared against storage timestamps.
@@ -900,9 +1009,6 @@ struct AppState {
     /// on the same selection generation after the intent grace; process
     /// restarts and bucket switches restart the proof.
     empty_origin_observations: EmptyOriginObservations,
-    /// Monotonic proof that one exact promotion-lock ETag stopped heartbeating.
-    /// Recovery sweeps prune entries whose committed manifests disappeared.
-    promotion_lock_observations: PromotionLockObservations,
     /// Hand-rolled Prometheus counters served at /metrics.
     metrics: Arc<metrics::Metrics>,
     /// Distributed S3-backed event counters (per-package/version downloads per
@@ -935,6 +1041,49 @@ impl AppState {
         self.writes_fenced
             .load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// Record that a client request just arrived (traffic signal for probe
+    /// gating). Lock-free and I/O-free — safe to call on every request.
+    fn note_request(&self) {
+        self.last_request_unix
+            .store(unix_now_secs(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a client request arrived within [`TRAFFIC_PROBE_WINDOW`]. When
+    /// true, the health loop keeps probes at full cadence so failover stays
+    /// fast; when false (and every bucket is healthy) probes decay to idle.
+    fn recent_request_traffic(&self) -> bool {
+        let last = self
+            .last_request_unix
+            .load(std::sync::atomic::Ordering::Relaxed);
+        last != 0 && unix_now_secs().saturating_sub(last) <= TRAFFIC_PROBE_WINDOW.as_secs()
+    }
+
+    /// Whether any configured bucket is currently unhealthy or recovering
+    /// (awaiting topology revalidation). Probing these is the only way heal-back
+    /// happens, so their presence forces full probe cadence regardless of idle.
+    fn any_bucket_unhealthy_or_recovering(&self) -> bool {
+        let Some(health) = &self.bucket_health else {
+            return false;
+        };
+        (0..self.buckets.len()).any(|index| !health.bucket_eligible(index).unwrap_or(true))
+    }
+}
+
+/// A client request within this window keeps multi-bucket health probes at full
+/// cadence. "The last few minutes" from dev/MULTIBUCKET.md §Health.
+const TRAFFIC_PROBE_WINDOW: Duration = Duration::from_secs(120);
+
+/// Idle probe cadence: one discovery probe per bucket about this often once
+/// there has been no traffic and every bucket is healthy. The first request
+/// after idle may pay one bounded discovery timeout (accepted, §Health).
+const IDLE_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Adapts pypiron's bucket selector to the counter engine. Selection happens
@@ -1217,6 +1366,11 @@ fn merge_serve_file(
         f.bucket_return_healthy_secs
     );
     fill!(
+        cli.fanout_grace_secs,
+        "fanout_grace_secs",
+        f.fanout_grace_secs
+    );
+    fill!(
         cli.intent_grace_secs,
         "intent_grace_secs",
         f.intent_grace_secs
@@ -1236,6 +1390,11 @@ fn merge_serve_file(
         cli.reconcile_interval_secs,
         "reconcile_interval_secs",
         f.reconcile_interval_secs
+    );
+    fill!(
+        cli.repl_sweep_interval_secs,
+        "repl_sweep_interval_secs",
+        f.repl_sweep_interval_secs
     );
     fill!(cli.lease_ttl_secs, "lease_ttl_secs", f.lease_ttl_secs);
     fill!(cli.download_stats, "download_stats", f.download_stats);
@@ -1296,11 +1455,12 @@ fn merge_storage_file(
     }
     storage.data_dir = storage.data_dir.take().or(f.data_dir.clone());
     storage.storage_prefix = storage.storage_prefix.take().or(f.storage_prefix.clone());
-    // The config file carries a single `s3-bucket`; multi-bucket lists come from
-    // the CLI/env. Fold the file value in only when CLI/env named no bucket.
-    if !storage.has_s3_bucket() {
-        if let Some(b) = &f.s3_bucket {
-            storage.s3_buckets.push(b.clone());
+    // Single-bucket S3 name and the multi-cloud `buckets` list both come from the
+    // file only when CLI/env supplied none — CLI/env always wins.
+    storage.s3_bucket = storage.s3_bucket.take().or(f.s3_bucket.clone());
+    if storage.buckets.is_empty() {
+        if let Some(list) = &f.buckets {
+            storage.buckets = list.clone();
         }
     }
     storage.aws_region = storage.aws_region.take().or(f.aws_region.clone());
@@ -1504,6 +1664,10 @@ async fn run_serve(
         access_log_format: cli.access_log_format,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
+        repl_sweep_interval: Duration::from_secs(cli.repl_sweep_interval_secs),
+        repl_sweep_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        last_request_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        fanout_grace: Duration::from_secs(cli.fanout_grace_secs),
         intent_grace: time::Duration::seconds(cli.intent_grace_secs as i64),
         audit_on_boot: cli.audit_on_boot,
         lease_ttl: Duration::from_secs(cli.lease_ttl_secs),
@@ -1516,9 +1680,6 @@ async fn run_serve(
         inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
         worker_nudge: Arc::new(tokio::sync::Notify::new()),
         empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
-        promotion_lock_observations: Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
         metrics: Arc::new(metrics::Metrics::new()),
@@ -2004,6 +2165,13 @@ async fn track_metrics(
     next: Next,
 ) -> Response<Body> {
     let group = metrics::route_group(req.uri().path());
+    // Traffic signal for multi-bucket probe gating: real client requests only.
+    // /health and /metrics are infra polls (a load balancer hits /health every
+    // second); counting them would pin probes at full cadence forever and
+    // defeat the idle decay. Groups 3 and 4 are /health and /metrics.
+    if group != 3 && group != 4 {
+        state.note_request();
+    }
     // Only read the project tag when labels are enabled; otherwise the
     // unauthenticated /metrics endpoint would expose internal project names.
     let project = state
@@ -2851,16 +3019,6 @@ async fn legacy_upload(
                 format!("storage error reading origin: {e}"),
             )
         })?;
-    if observed_origin
-        .as_ref()
-        .and_then(|observed| observed.pending_manifest.as_ref())
-        .is_some()
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("Package '{pkg_norm}' is finishing private replication; retry shortly"),
-        ));
-    }
     let mut write_fence = observed_origin.as_ref().cloned();
     // The private namespace is off-limits to mirrors regardless of claim
     // state — checked here, not only at first write, so adopting a prefix
@@ -2891,9 +3049,8 @@ async fn legacy_upload(
         }
     }
 
-    // In multi-bucket mode this marker is part of the package-promotion fence,
-    // not best effort: a promoter will not consume the origin claim while any
-    // writer that observed the old claim is still uncommitted.
+    // In multi-bucket mode the crash-recovery marker is correctness-critical;
+    // every writer that observed the old claim must pair it after committing.
     let intent_nonce = if state.buckets.is_multi() {
         Some(worker::mark_intent(storage, &pkg_norm).await.map_err(|e| {
             (
@@ -2964,37 +3121,13 @@ async fn legacy_upload(
                     ),
                 ));
             }
-            // A claim can survive even when the uploader dies before writing
-            // an artifact. Queue that package-level truth immediately so the
-            // fast marker tier still reserves the private name everywhere;
-            // the later artifact marker remains independently idempotent.
+            // A claim can survive even when the uploader dies before writing an
+            // artifact. Fan the package-level claim out to every healthy bucket
+            // before the artifact even lands locally, so the private name is
+            // reserved fleet-wide ahead of its bytes (the dependency-confusion
+            // boundary); the later artifact fan-out re-claims idempotently.
             if !is_mirror && claim.etag.is_some() && state.buckets.is_multi() {
-                match replicate::queue_fanout_markers(
-                    &state,
-                    &pinned,
-                    &pkg_norm,
-                    replicate::ORIGIN_MARKER,
-                )
-                .await
-                {
-                    Ok(markers) => replicate::spawn_eager_with_markers(
-                        &state,
-                        &pinned,
-                        pkg_norm.clone(),
-                        replicate::ORIGIN_MARKER.to_string(),
-                        markers,
-                    ),
-                    Err(e) => {
-                        error!(package=%pkg_norm, error=?e, "failed to queue durable origin replication marker");
-                        replicate::spawn_eager_with_markers(
-                            &state,
-                            &pinned,
-                            pkg_norm.clone(),
-                            replicate::ORIGIN_MARKER.to_string(),
-                            replicate::FanoutMarkers::default(),
-                        );
-                    }
-                }
+                replicate::fanout_sync(&state, &pinned, &pkg_norm, replicate::ORIGIN_MARKER).await;
             }
             write_fence = Some(match claim.etag {
                 Some(etag) => origin::OriginObservation {
@@ -3004,7 +3137,6 @@ async fn legacy_upload(
                         origin::OriginState::Private
                     },
                     etag,
-                    pending_manifest: None,
                 },
                 None => origin::read_origin_observation(storage, &pkg_norm)
                     .await
@@ -3014,10 +3146,7 @@ async fn legacy_upload(
                             format!("storage error re-reading origin claim: {e}"),
                         )
                     })?
-                    .filter(|observed| {
-                        observed.state.as_str() == desired_origin
-                            && observed.pending_manifest.is_none()
-                    })
+                    .filter(|observed| observed.state.as_str() == desired_origin)
                     .ok_or_else(|| {
                         (
                             StatusCode::CONFLICT,
@@ -3039,6 +3168,7 @@ async fn legacy_upload(
         // Per-artifact origin (§4/§6.2): the replicator decides "private only"
         // from state, never from history.
         origin: Some(desired_origin.to_string()),
+        upload_epoch_ms: (!is_mirror).then(now_epoch_millis),
         yank_epoch: 0,
     };
     let sc_bytes = serde_json::to_vec(&sc).map_err(|_| {
@@ -3076,8 +3206,7 @@ async fn legacy_upload(
     }
 
     // Every multi-bucket writer consumes the exact origin observation it began
-    // under. This closes the private-pending transition just as the older
-    // mirror-only fence closed demotion.
+    // under, closing concurrent origin changes around its artifact write.
     if let Some(ref expected) = write_fence {
         match origin::read_origin_observation(storage, &pkg_norm).await {
             Ok(Some(current)) if current == *expected => {}
@@ -3156,8 +3285,8 @@ async fn legacy_upload(
     // One post-create tombstone HEAD preserves the single-bucket write path.
     // Multi-bucket mode also checks `.frozen`, whose first-write ordering makes
     // every interrupted freeze a durable filename fence. A fenced multi-bucket
-    // loser stays occupied and inert: deleting by key here could erase a staged
-    // private replacement that landed after this writer's cross-object read.
+    // loser stays occupied and inert: deleting by key here could erase a private
+    // replacement that landed after this writer's cross-object read.
     let filename_fenced = if state.buckets.is_multi() {
         futures::future::try_join(
             storage.head_exists(&tombstone_key(&key)),
@@ -3257,32 +3386,11 @@ async fn legacy_upload(
         warn!(error=?e, "legacy: failed to write commit marker");
     }
 
-    // Queue durable per-destination work before the ack, then perform the byte
-    // copies off the response path. Mirror cache content is intentionally local
-    // and pays none of this replication cost.
+    // Stream the record to every other healthy bucket before the ack; any
+    // bucket that misses gets a durable `_repl/` note for the sweep. Mirror
+    // cache content is intentionally local and pays none of this cost.
     if !is_mirror {
-        match replicate::queue_fanout_markers(&state, &pinned, &pkg_norm, &filename).await {
-            Ok(markers) => replicate::spawn_eager_with_markers(
-                &state,
-                &pinned,
-                pkg_norm.clone(),
-                filename.clone(),
-                markers,
-            ),
-            Err(e) => {
-                // Truth is already immutable and committed. Returning 503 here
-                // would make a correct client retry hit 409. Alarm and kick the
-                // eager path; the full diff remains the final lost-marker proof.
-                error!(package=%pkg_norm, %filename, error=?e, "failed to queue durable replication marker");
-                replicate::spawn_eager_with_markers(
-                    &state,
-                    &pinned,
-                    pkg_norm.clone(),
-                    filename.clone(),
-                    replicate::FanoutMarkers::default(),
-                );
-            }
-        }
+        replicate::fanout_sync(&state, &pinned, &pkg_norm, &filename).await;
     }
 
     // Read-your-writes by waiting: poll our own index until the file shows
@@ -3334,6 +3442,16 @@ fn now_rfc3339() -> String {
         .replace_nanosecond(0)
         .unwrap_or_else(|_| OffsetDateTime::now_utc())
         .format(&Rfc3339)
+        .unwrap_or_default()
+}
+
+/// Current Unix epoch time in milliseconds for the private-upload conflict
+/// tiebreak. A pre-epoch or unrepresentable system clock degrades to a value
+/// that conflict reconciliation will quarantine rather than trusting blindly.
+fn now_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default()
 }
 
@@ -3390,22 +3508,13 @@ async fn require_settled_package_read(
     if !state.buckets.is_multi() {
         return Ok(None);
     }
-    let observed = origin::read_origin_observation(storage, pkg).await?;
-    if observed
-        .as_ref()
-        .and_then(|claim| claim.pending_manifest.as_ref())
-        .as_ref()
-        .is_some()
-    {
-        bail!("package '{pkg}' is finishing staged private promotion");
-    }
-    Ok(observed)
+    origin::read_origin_observation(storage, pkg).await
 }
 
 /// Multi-bucket markers are visibility fences, not merely index hints. A
 /// quarantined mirror body deliberately keeps its canonical key occupied, so
 /// direct and presigned downloads must reject it too. A stale quarantine marker
-/// becomes inert only after a private sidecar proves staged promotion won.
+/// becomes inert only after a private sidecar proves private precedence won.
 async fn multi_bucket_file_visible(
     state: &AppState,
     storage: &dyn Storage,
@@ -4280,13 +4389,6 @@ async fn files_delete(
             ));
         }
     };
-    if origin_before.pending_manifest.is_some() {
-        let _ = commit_marker(&state, storage, &pkg, intent_nonce).await;
-        return Err((
-            StatusCode::CONFLICT,
-            format!("Package '{pkg}' is finishing private replication; retry shortly"),
-        ));
-    }
     if state.buckets.is_multi() && origin_before.state == origin::OriginState::Mirror {
         let _ = commit_marker(&state, storage, &pkg, intent_nonce).await;
         return Err((
@@ -4371,28 +4473,10 @@ async fn files_delete(
     if let Err(e) = commit_marker(&state, storage, &pkg, intent_nonce).await {
         warn!(error=?e, "delete: failed to write commit marker");
     }
-    // A private delete carries a tombstone. Queue it durably before the ack;
-    // mirror cache eviction remains local and unreplicated.
+    // A private delete carries a tombstone. Fan it out to every healthy bucket
+    // before the ack; mirror cache eviction remains local and unreplicated.
     if replicate_delete {
-        match replicate::queue_fanout_markers(&state, &pinned, &pkg, &filename).await {
-            Ok(markers) => replicate::spawn_eager_with_markers(
-                &state,
-                &pinned,
-                pkg.clone(),
-                filename.clone(),
-                markers,
-            ),
-            Err(e) => {
-                error!(package=%pkg, %filename, error=?e, "failed to queue durable delete replication marker");
-                replicate::spawn_eager_with_markers(
-                    &state,
-                    &pinned,
-                    pkg.clone(),
-                    filename.clone(),
-                    replicate::FanoutMarkers::default(),
-                );
-            }
-        }
+        replicate::fanout_sync(&state, &pinned, &pkg, &filename).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -4450,27 +4534,6 @@ async fn set_yanked(
     } else {
         None
     };
-    if state.buckets.is_multi() {
-        let observed = origin::read_origin_observation(storage, &pkg)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("storage error reading origin: {e}"),
-                )
-            })?;
-        if observed
-            .as_ref()
-            .and_then(|value| value.pending_manifest.as_ref())
-            .is_some()
-        {
-            let _ = commit_marker(state, storage, &pkg, intent_nonce).await;
-            return Err((
-                StatusCode::CONFLICT,
-                format!("Package '{pkg}' is finishing private replication; retry shortly"),
-            ));
-        }
-    }
     let mut wrote = false;
     let mut record_origin = None;
     for _ in 0..8 {
@@ -4546,25 +4609,7 @@ async fn set_yanked(
             == Some(origin::PRIVATE)
     };
     if replicate_private {
-        match replicate::queue_fanout_markers(state, &pinned, &pkg, filename).await {
-            Ok(markers) => replicate::spawn_eager_with_markers(
-                state,
-                &pinned,
-                pkg.clone(),
-                filename.to_string(),
-                markers,
-            ),
-            Err(e) => {
-                error!(package=%pkg, %filename, error=?e, "failed to queue durable yank replication marker");
-                replicate::spawn_eager_with_markers(
-                    state,
-                    &pinned,
-                    pkg.clone(),
-                    filename.to_string(),
-                    replicate::FanoutMarkers::default(),
-                );
-            }
-        }
+        replicate::fanout_sync(state, &pinned, &pkg, filename).await;
     }
     Ok(StatusCode::OK)
 }
@@ -4632,17 +4677,6 @@ async fn write_project_status(
                     format!("storage error reading origin for replication: {e}"),
                 )
             })?;
-        if observed
-            .as_ref()
-            .and_then(|value| value.pending_manifest.as_ref())
-            .is_some()
-        {
-            let _ = commit_marker(state, storage, &pkg, intent_nonce).await;
-            return Err((
-                StatusCode::CONFLICT,
-                format!("Package '{pkg}' is finishing private replication; retry shortly"),
-            ));
-        }
         match observed.as_ref().map(|value| value.state) {
             Some(origin::OriginState::Private) => Some(status::StatusOrigin::Private),
             Some(origin::OriginState::Mirror) => Some(status::StatusOrigin::Mirror),
@@ -4667,32 +4701,7 @@ async fn write_project_status(
         warn!(error=?e, "status: failed to write commit marker");
     }
     if replicate_private {
-        match replicate::queue_fanout_markers(
-            state,
-            &pinned,
-            &pkg,
-            replicate::PROJECT_STATUS_MARKER,
-        )
-        .await
-        {
-            Ok(markers) => replicate::spawn_eager_with_markers(
-                state,
-                &pinned,
-                pkg.clone(),
-                replicate::PROJECT_STATUS_MARKER.to_string(),
-                markers,
-            ),
-            Err(e) => {
-                error!(package=%pkg, error=?e, "failed to queue durable project-status replication marker");
-                replicate::spawn_eager_with_markers(
-                    state,
-                    &pinned,
-                    pkg.clone(),
-                    replicate::PROJECT_STATUS_MARKER.to_string(),
-                    replicate::FanoutMarkers::default(),
-                );
-            }
-        }
+        replicate::fanout_sync(state, &pinned, &pkg, replicate::PROJECT_STATUS_MARKER).await;
     }
     Ok(StatusCode::OK)
 }
@@ -4824,6 +4833,10 @@ impl AppState {
             access_log_format: AccessLogFormat::Structured,
             worker_interval: Duration::from_secs(1),
             reconcile_interval: Duration::from_secs(86400),
+            repl_sweep_interval: Duration::from_secs(300),
+            repl_sweep_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_request_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fanout_grace: Duration::from_secs(30),
             intent_grace: time::Duration::seconds(900),
             audit_on_boot: true,
             lease_ttl: Duration::from_secs(30),
@@ -4836,9 +4849,6 @@ impl AppState {
             inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
             empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            promotion_lock_observations: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             metrics: Arc::new(metrics::Metrics::new()),
@@ -5168,7 +5178,6 @@ mod tests {
         let expected = origin::OriginObservation {
             state: origin::OriginState::Mirror,
             etag: "unused-single-bucket-etag".to_string(),
-            pending_manifest: None,
         };
 
         assert!(
@@ -5219,88 +5228,52 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn multi_bucket_download_fences_pending_and_quarantined_mirror_bytes() {
+    #[test]
+    fn probe_gating_tracks_traffic_and_unhealthy_buckets() {
+        use bucket_health::{BucketSignal, HealthController, HealthPolicy};
+
         let first = Arc::new(storage::test_support::InMemStorage::default());
         let second = Arc::new(storage::test_support::InMemStorage::default());
         let mut state = AppState::headless(first.clone());
+
+        // Traffic signal: cold until the request path notes a request, then warm.
+        assert!(!state.recent_request_traffic());
+        state.note_request();
+        assert!(state.recent_request_traffic());
+        // A request stamped outside the window no longer counts as recent.
+        state.last_request_unix.store(
+            unix_now_secs().saturating_sub(TRAFFIC_PROBE_WINDOW.as_secs() + 5),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert!(!state.recent_request_traffic());
+
+        // Single-bucket / no health view: nothing is ever unhealthy.
+        assert!(!state.any_bucket_unhealthy_or_recovering());
+
+        // Attach a two-bucket health view. All buckets start Unknown (eligible),
+        // so probes may decay when idle.
+        let health = Arc::new(
+            HealthController::new(2, HealthPolicy::new(1, Duration::from_secs(60)).unwrap())
+                .unwrap(),
+        );
         state.buckets = Arc::new(BucketSet::new(vec![
             BucketHandle {
-                storage: first.clone(),
-                name: "first".to_string(),
+                storage: first,
+                name: "east".to_string(),
             },
             BucketHandle {
                 storage: second,
-                name: "second".to_string(),
+                name: "west".to_string(),
             },
         ]));
-        let key = format!("{PACKAGES_PREFIX}pkg/pkg-1.whl");
-        first.insert(&key, b"public bytes".to_vec());
-        // A retained or legacy canonical body is not public authority without
-        // a settled owner in multi-bucket mode.
-        assert!(
-            !multi_bucket_file_visible(&state, first.as_ref(), "pkg", &key)
-                .await
-                .unwrap()
-        );
-        origin::claim_origin(first.as_ref(), "pkg", origin::PRIVATE)
-            .await
-            .unwrap();
-        let mut sidecar = Sidecar {
-            sha256: "ab".repeat(32),
-            size: 12,
-            version: "1".into(),
-            upload_time: "2026-01-01T00:00:00Z".into(),
-            requires_python: None,
-            yanked: Yanked::Flag(false),
-            origin: Some(origin::MIRROR.into()),
-            yank_epoch: 0,
-        };
-        first.insert(&sidecar_key(&key), serde_json::to_vec(&sidecar).unwrap());
-        first.insert(&mirror_quarantined_key(&key), b"{}".to_vec());
+        state.bucket_health = Some(health.clone());
+        assert!(!state.any_bucket_unhealthy_or_recovering());
 
-        assert!(
-            !multi_bucket_file_visible(&state, first.as_ref(), "pkg", &key)
-                .await
-                .unwrap()
-        );
-
-        // A stale quarantine marker cannot hide a private winner forever.
-        sidecar.origin = Some(origin::PRIVATE.into());
-        first.insert(&sidecar_key(&key), serde_json::to_vec(&sidecar).unwrap());
-        assert!(
-            multi_bucket_file_visible(&state, first.as_ref(), "pkg", &key)
-                .await
-                .unwrap()
-        );
-
-        origin::begin_private_promotion(
-            first.as_ref(),
-            "pkg",
-            "_staging/repl/pkg/manifest@pending.json",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(
-            multi_bucket_file_visible(&state, first.as_ref(), "pkg", &key)
-                .await
-                .is_err()
-        );
-
-        origin::claim_origin(first.as_ref(), "unclaimed", origin::PRIVATE)
-            .await
-            .unwrap();
-        assert!(origin::release_for_repurpose(first.as_ref(), "unclaimed")
-            .await
-            .unwrap());
-        let unclaimed_key = format!("{PACKAGES_PREFIX}unclaimed/unclaimed-1.whl");
-        first.insert(&unclaimed_key, b"retained bytes".to_vec());
-        assert!(
-            !multi_bucket_file_visible(&state, first.as_ref(), "unclaimed", &unclaimed_key)
-                .await
-                .unwrap()
-        );
+        // One availability failure (leave-after-1) drives a bucket Unhealthy,
+        // which must force full probe cadence — re-probing it is the only path
+        // back to healthy, so idle gating never applies while any bucket is down.
+        health.observe(1, BucketSignal::HttpStatus(503)).unwrap();
+        assert!(state.any_bucket_unhealthy_or_recovering());
     }
 
     #[tokio::test]
@@ -5336,88 +5309,6 @@ mod tests {
             !multi_bucket_file_visible(&state, first.as_ref(), "pkg", &key)
                 .await
                 .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn multi_bucket_index_routes_require_a_settled_owner() {
-        let first = Arc::new(storage::test_support::InMemStorage::default());
-        let second = Arc::new(storage::test_support::InMemStorage::default());
-        let mut state = AppState::headless(first.clone());
-        state.buckets = Arc::new(BucketSet::new(vec![
-            BucketHandle {
-                storage: first.clone(),
-                name: "first".to_string(),
-            },
-            BucketHandle {
-                storage: second,
-                name: "second".to_string(),
-            },
-        ]));
-        let artifact = format!("{PACKAGES_PREFIX}pkg/pkg-1.whl");
-        first.insert(&artifact, b"bytes".to_vec());
-        first.insert(
-            &sidecar_key(&artifact),
-            serde_json::to_vec(&Sidecar {
-                sha256: "ab".repeat(32),
-                size: 5,
-                version: "1".into(),
-                upload_time: "2026-01-01T00:00:00Z".into(),
-                requires_python: None,
-                yanked: Yanked::Flag(false),
-                origin: Some(origin::PRIVATE.into()),
-                yank_epoch: 0,
-            })
-            .unwrap(),
-        );
-        first.insert(
-            &format!("{SIMPLE_PREFIX}pkg/index.json"),
-            br#"{"meta":{"api-version":"1.4"},"files":[]}"#.to_vec(),
-        );
-        let headers = HeaderMap::new();
-
-        assert_eq!(
-            serve_pkg_index(&state, "pkg", true, &headers)
-                .await
-                .status(),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            render_project(&state, &headers, "pkg", None).await.status(),
-            StatusCode::NOT_FOUND
-        );
-
-        origin::claim_origin(first.as_ref(), "pkg", origin::PRIVATE)
-            .await
-            .unwrap();
-        assert_eq!(
-            serve_pkg_index(&state, "pkg", true, &headers)
-                .await
-                .status(),
-            StatusCode::OK
-        );
-        assert_eq!(
-            render_project(&state, &headers, "pkg", None).await.status(),
-            StatusCode::OK
-        );
-
-        origin::begin_private_promotion(
-            first.as_ref(),
-            "pkg",
-            "_staging/repl/pkg/manifest@pending.json",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            serve_pkg_index(&state, "pkg", true, &headers)
-                .await
-                .status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(
-            render_project(&state, &headers, "pkg", None).await.status(),
-            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 

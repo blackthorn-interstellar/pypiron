@@ -98,9 +98,11 @@ pub struct ServeConfig {
     pub worker_interval_secs: Option<u64>,
     pub bucket_leave_failures: Option<u32>,
     pub bucket_return_healthy_secs: Option<u64>,
+    pub fanout_grace_secs: Option<u64>,
     pub intent_grace_secs: Option<u64>,
     pub audit_on_boot: Option<bool>,
     pub reconcile_interval_secs: Option<u64>,
+    pub repl_sweep_interval_secs: Option<u64>,
     pub lease_ttl_secs: Option<u64>,
     pub download_stats: Option<bool>,
     pub counters_resolution: Option<String>,
@@ -112,6 +114,9 @@ pub struct ServeConfig {
     pub data_dir: Option<String>,
     pub storage_prefix: Option<String>,
     pub s3_bucket: Option<String>,
+    /// Multi-cloud replication/failover bucket list; comma-free here — a TOML
+    /// array of `s3://`/`gs://`/`az://` URIs. Empty/unset means single-bucket.
+    pub buckets: Option<Vec<String>>,
     pub aws_region: Option<String>,
     pub s3_endpoint_url: Option<String>,
     pub s3_force_path_style: Option<bool>,
@@ -229,6 +234,7 @@ mod tests {
             storage = "s3"
             s3-bucket = "acme-mirror"
             reconcile-interval-secs = 3600
+            repl-sweep-interval-secs = 120
             "#,
         )
         .unwrap();
@@ -240,6 +246,7 @@ mod tests {
         assert_eq!(cfg.serve.storage.as_deref(), Some("s3"));
         assert_eq!(cfg.serve.s3_bucket.as_deref(), Some("acme-mirror"));
         assert_eq!(cfg.serve.reconcile_interval_secs, Some(3600));
+        assert_eq!(cfg.serve.repl_sweep_interval_secs, Some(120));
     }
 
     #[test]

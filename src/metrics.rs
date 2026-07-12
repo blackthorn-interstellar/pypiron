@@ -119,6 +119,9 @@ pub struct Metrics {
     /// Byte-conflict freezes (§6.3): same filename, different bytes on two
     /// buckets. Every nonzero value is a human-actionable split-brain.
     pub replication_freezes: AtomicU64,
+    /// Different-byte private/private conflicts resolved by keeping the older
+    /// upload and quarantining the loser. Every event is an operator alarm.
+    pub replication_conflict_quarantines: AtomicU64,
     /// Last pairwise reconcile-diff wall duration, seconds, as f64 bits (gauge).
     reconcile_diff_duration_bits: AtomicU64,
     /// Undelivered `_repl/` markers, by destination bucket, as measured by the
@@ -412,6 +415,11 @@ impl Metrics {
                     "Byte-conflict freezes (same filename, different bytes on two buckets).",
                     &self.replication_freezes,
                 ),
+                (
+                    "pypiron_replication_conflict_quarantines_total",
+                    "Byte conflicts resolved by keeping the first upload and quarantining the loser.",
+                    &self.replication_conflict_quarantines,
+                ),
             ] {
                 out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
                 out.push_str(&format!("{name} {}\n", value.load(Ordering::Relaxed)));
@@ -692,6 +700,8 @@ mod tests {
     #[test]
     fn renders_multi_bucket_health_selection_alarms_generation_and_fence() {
         let m = Metrics::new();
+        m.replication_conflict_quarantines
+            .fetch_add(2, Ordering::Relaxed);
         let names = vec![
             "iron-east".to_string(),
             "iron-west".to_string(),
@@ -726,6 +736,7 @@ mod tests {
         );
         assert!(text.contains("pypiron_bucket_selection_generation 7"));
         assert!(text.contains("pypiron_bucket_topology_write_fenced 1"));
+        assert!(text.contains("pypiron_replication_conflict_quarantines_total 2"));
     }
 
     #[test]

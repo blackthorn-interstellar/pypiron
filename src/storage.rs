@@ -17,7 +17,7 @@ use tokio_util::io::ReaderStream;
 // separate, dependency-free backend; everything remote shares one impl.
 use futures::StreamExt as _;
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, S3CopyIfNotExists};
-use object_store::azure::MicrosoftAzureBuilder;
+use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::client::ClientConfigKey;
 use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
 use object_store::path::Path as OsPath;
@@ -30,34 +30,69 @@ use object_store::{
 
 use crate::range::{parse_range, RangeSpec};
 
-/// S3 is the failover backend. One blackholed request must return in bounded
-/// time so its availability observation can move selection; object_store's
-/// defaults (10 retries over three minutes) make that impossible. Health and
-/// background maintenance apply their own one-second eligibility cancellation;
-/// data transfer keeps the route's one-hour bound so large uploads are not
-/// mistaken for dead buckets.
-const S3_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const S3_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// In a failover topology one blackholed request must return in bounded time so
+/// its availability observation can move selection; object_store's defaults (10
+/// retries over three minutes) make that impossible. Health and background
+/// maintenance apply their own one-second eligibility cancellation; data
+/// transfer keeps the route's one-hour bound so large uploads are not mistaken
+/// for dead buckets. The bound is backend-neutral — every cloud in a mixed list
+/// gets it, because any one of them can be the hung bucket.
+const FAILOVER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const FAILOVER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-fn s3_retry_config() -> RetryConfig {
+fn failover_retry_config() -> RetryConfig {
     RetryConfig {
         max_retries: 0,
-        retry_timeout: S3_REQUEST_TIMEOUT,
+        retry_timeout: FAILOVER_REQUEST_TIMEOUT,
         ..Default::default()
     }
+}
+
+fn connect_timeout_str() -> String {
+    format!("{}s", FAILOVER_CONNECT_TIMEOUT.as_secs())
+}
+
+fn request_timeout_str() -> String {
+    format!("{}s", FAILOVER_REQUEST_TIMEOUT.as_secs())
 }
 
 fn bound_s3_transport(builder: AmazonS3Builder) -> AmazonS3Builder {
     builder
         .with_config(
             AmazonS3ConfigKey::Client(ClientConfigKey::ConnectTimeout),
-            format!("{}s", S3_CONNECT_TIMEOUT.as_secs()),
+            connect_timeout_str(),
         )
         .with_config(
             AmazonS3ConfigKey::Client(ClientConfigKey::Timeout),
-            format!("{}s", S3_REQUEST_TIMEOUT.as_secs()),
+            request_timeout_str(),
         )
-        .with_retry(s3_retry_config())
+        .with_retry(failover_retry_config())
+}
+
+fn bound_gcs_transport(builder: GoogleCloudStorageBuilder) -> GoogleCloudStorageBuilder {
+    builder
+        .with_config(
+            GoogleConfigKey::Client(ClientConfigKey::ConnectTimeout),
+            connect_timeout_str(),
+        )
+        .with_config(
+            GoogleConfigKey::Client(ClientConfigKey::Timeout),
+            request_timeout_str(),
+        )
+        .with_retry(failover_retry_config())
+}
+
+fn bound_azure_transport(builder: MicrosoftAzureBuilder) -> MicrosoftAzureBuilder {
+    builder
+        .with_config(
+            AzureConfigKey::Client(ClientConfigKey::ConnectTimeout),
+            connect_timeout_str(),
+        )
+        .with_config(
+            AzureConfigKey::Client(ClientConfigKey::Timeout),
+            request_timeout_str(),
+        )
+        .with_retry(failover_retry_config())
 }
 
 /// Storage backend selection.
@@ -86,20 +121,24 @@ pub struct StorageArgs {
     #[arg(long, env = "PYPIRON_STORAGE_PREFIX")]
     pub storage_prefix: Option<String>,
 
-    /// S3 bucket(s) for package storage. Supplying this selects S3, so
-    /// `--storage s3` is optional. Repeat `--s3-bucket` — or set
-    /// `PYPIRON_S3_BUCKETS` to a comma-separated list — for multi-bucket
-    /// replication and failover; order is preference and the first is
-    /// preferred. The legacy singular `PYPIRON_S3_BUCKET` remains accepted for
-    /// one bucket. Each entry may carry a per-bucket region as `name@region`
-    /// (e.g. `iron-east@us-east-1`).
+    /// A single S3 bucket for package storage. Supplying this selects S3, so
+    /// `--storage s3` is optional. For replication and failover across several
+    /// buckets — of any backend — use `--buckets` instead.
+    #[arg(long = "s3-bucket", env = "PYPIRON_S3_BUCKET")]
+    pub s3_bucket: Option<String>,
+
+    /// Multi-bucket replication and failover across a list of buckets, any mix
+    /// of backends. Comma-separated URIs, scheme required: `s3://name[@region]`
+    /// (`@region` is S3-only), `gs://name`, or `az://container`. Order is
+    /// preference — the first bucket is preferred. A single-entry list is
+    /// equivalent to configuring that one backend directly.
     #[arg(
-        long = "s3-bucket",
-        env = "PYPIRON_S3_BUCKETS",
+        long = "buckets",
+        env = "PYPIRON_BUCKETS",
         value_delimiter = ',',
-        value_name = "NAME[@REGION]"
+        value_name = "URI"
     )]
-    pub s3_buckets: Vec<String>,
+    pub buckets: Vec<String>,
 
     /// AWS region (e.g., us-east-1)
     #[arg(long, env = "AWS_REGION")]
@@ -149,19 +188,95 @@ pub struct StorageArgs {
     pub azure_use_emulator: bool,
 }
 
+/// One parsed `--buckets` entry: a backend, a bucket/container name, and an
+/// optional S3 region.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BucketSpec {
+    scheme: BucketScheme,
+    name: String,
+    /// S3-only: the per-bucket `@region` suffix.
+    region: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BucketScheme {
+    S3,
+    Gcs,
+    Azure,
+}
+
+impl BucketScheme {
+    /// The URI scheme prefix, used to make a bucket's topology identity
+    /// backend-qualified so `s3://x` and `gs://x` are never the same bucket.
+    fn as_prefix(self) -> &'static str {
+        match self {
+            BucketScheme::S3 => "s3",
+            BucketScheme::Gcs => "gs",
+            BucketScheme::Azure => "az",
+        }
+    }
+}
+
+impl BucketSpec {
+    /// Scheme-qualified bucket identity for topology stamps and duplicate
+    /// detection: `s3://name`, `gs://name`, `az://name`. The `@region` is
+    /// deliberately excluded — the same bucket reached from two regions is one
+    /// bucket — but the backend is not: two different clouds may host the same
+    /// name and must hash and compare distinctly.
+    fn identity(&self) -> String {
+        format!("{}://{}", self.scheme.as_prefix(), self.name)
+    }
+}
+
+/// Parse one `--buckets` URI. The scheme is required so a bare name can never be
+/// silently misfiled to the wrong backend; `@region` is accepted only on S3.
+fn parse_bucket_uri(entry: &str) -> Result<BucketSpec> {
+    let entry = entry.trim();
+    let Some((scheme, rest)) = entry.split_once("://") else {
+        bail!(
+            "bucket entry '{entry}' is missing a scheme; use s3://name[@region], gs://name, or az://container"
+        );
+    };
+    let scheme = match scheme {
+        "s3" => BucketScheme::S3,
+        "gs" => BucketScheme::Gcs,
+        "az" => BucketScheme::Azure,
+        other => bail!(
+            "bucket entry '{entry}' has unknown scheme '{other}://'; use s3://, gs://, or az://"
+        ),
+    };
+    let (name, region) = match rest.split_once('@') {
+        Some(_) if scheme != BucketScheme::S3 => {
+            bail!("bucket entry '{entry}' carries an @region, which is only valid on s3:// entries")
+        }
+        Some((_, "")) => bail!("bucket entry '{entry}' has an empty region after '@'"),
+        Some((name, region)) => (name, Some(region.to_string())),
+        None => (rest, None),
+    };
+    if name.is_empty() {
+        bail!("bucket entry '{entry}' has an empty bucket name");
+    }
+    Ok(BucketSpec {
+        scheme,
+        name: name.to_string(),
+        region,
+    })
+}
+
 impl StorageArgs {
-    fn configured_s3_buckets(&self) -> Vec<String> {
-        resolve_s3_buckets(&self.s3_buckets, std::env::var("PYPIRON_S3_BUCKET").ok())
+    /// The parsed `--buckets` list, empty when unset. Every entry is validated;
+    /// a bad URI is a startup error naming the offending entry.
+    fn bucket_specs(&self) -> Result<Vec<BucketSpec>> {
+        self.buckets.iter().map(|e| parse_bucket_uri(e)).collect()
     }
 
     pub(crate) fn has_s3_bucket(&self) -> bool {
-        !self.configured_s3_buckets().is_empty()
+        self.s3_bucket.as_deref().is_some_and(|b| !b.is_empty())
     }
 
-    /// A bucket list is itself an unambiguous S3 selection. This keeps the
-    /// customer contract to the one thing multi-bucket needs — an ordered list
-    /// — while preserving explicit GCS/Azure choices as configuration errors
-    /// instead of silently ignoring their backend-specific flags.
+    /// The single-bucket backend, when no `--buckets` list is configured. A lone
+    /// `--s3-bucket` is itself an unambiguous S3 selection, so `--storage s3` is
+    /// optional in that case; GCS and Azure require their explicit `--storage`.
     fn effective_backend(&self) -> StorageBackend {
         if matches!(self.storage, StorageBackend::Disk) && self.has_s3_bucket() {
             StorageBackend::S3
@@ -197,16 +312,24 @@ impl StorageArgs {
         Ok(handles)
     }
 
-    /// Human-readable identity of each configured bucket, in the same order and
-    /// count as [`build_all`](Self::build_all), for topology stamping and logs.
+    /// Identity of each configured bucket, in the same order and count as
+    /// [`build_all`](Self::build_all), for topology stamping and logs. A
+    /// `--buckets` list contributes its scheme-qualified identity (`s3://name`,
+    /// `gs://name`, `az://name`) so a backend mismatch can never hash the same;
+    /// single-bucket mode the one backend's bare name (its topology is dormant).
+    /// The identity never includes the `@region`.
     pub fn bucket_names(&self) -> Vec<String> {
-        let s3_buckets = self.configured_s3_buckets();
+        if !self.buckets.is_empty() {
+            // `build_all` parses first and fails on a bad URI, so by the time
+            // this is zipped against the handles the list is already valid.
+            return self
+                .bucket_specs()
+                .map(|specs| specs.iter().map(BucketSpec::identity).collect())
+                .unwrap_or_default();
+        }
         match self.effective_backend() {
             StorageBackend::Disk => vec![self.resolved_data_dir()],
-            StorageBackend::S3 => s3_buckets
-                .iter()
-                .map(|spec| parse_s3_bucket_spec(spec).0.to_string())
-                .collect(),
+            StorageBackend::S3 => vec![self.s3_bucket.clone().unwrap_or_default()],
             StorageBackend::Gcs => vec![self.gcs_bucket.clone().unwrap_or_default()],
             StorageBackend::Azure => vec![self.azure_container.clone().unwrap_or_default()],
         }
@@ -231,14 +354,20 @@ impl StorageArgs {
 
     /// Short, human-friendly description for the startup banner.
     pub fn describe(&self) -> String {
-        let s3_buckets = self.configured_s3_buckets();
-        let where_ = match self.effective_backend() {
-            StorageBackend::Disk => format!("disk · {}", self.resolved_data_dir()),
-            StorageBackend::S3 if s3_buckets.is_empty() => "s3 · ?".to_string(),
-            StorageBackend::S3 => format!("s3 · {}", s3_buckets.join(", ")),
-            StorageBackend::Gcs => format!("gcs · {}", self.gcs_bucket.as_deref().unwrap_or("?")),
-            StorageBackend::Azure => {
-                format!("azure · {}", self.azure_container.as_deref().unwrap_or("?"))
+        let where_ = if !self.buckets.is_empty() {
+            format!("multi-bucket · {}", self.buckets.join(", "))
+        } else {
+            match self.effective_backend() {
+                StorageBackend::Disk => format!("disk · {}", self.resolved_data_dir()),
+                StorageBackend::S3 => {
+                    format!("s3 · {}", self.s3_bucket.as_deref().unwrap_or("?"))
+                }
+                StorageBackend::Gcs => {
+                    format!("gcs · {}", self.gcs_bucket.as_deref().unwrap_or("?"))
+                }
+                StorageBackend::Azure => {
+                    format!("azure · {}", self.azure_container.as_deref().unwrap_or("?"))
+                }
             }
         };
         match &self.storage_prefix {
@@ -248,19 +377,31 @@ impl StorageArgs {
     }
 
     async fn build_backends(&self) -> Result<Vec<Arc<dyn Storage>>> {
-        // Multi-bucket is S3-only for now; GCS/Azure/disk stay single-bucket.
-        let s3_buckets = self.configured_s3_buckets();
-        self.validate_cloud_selection(&s3_buckets)?;
-        let backend = self.effective_backend();
-        if s3_buckets.len() > 1 && !matches!(backend, StorageBackend::S3) {
-            bail!(
-                "multi-bucket is S3-only for now: {} buckets were configured, \
-                 but --storage is not s3",
-                s3_buckets.len()
-            );
-        }
         let prefix = self.resolved_prefix()?;
-        match backend {
+        // A `--buckets` list is the multi-cloud path: parse every URI up front so
+        // one bad entry fails startup before any bucket is contacted, then build
+        // each with its backend's native builder. A single-entry list collapses
+        // to ordinary single-bucket mode on that backend (failover machinery
+        // stays dormant when there is only one handle).
+        if !self.buckets.is_empty() {
+            let specs = self.bucket_specs()?;
+            let failover = specs.len() > 1;
+            let mut handles = Vec::with_capacity(specs.len());
+            for spec in &specs {
+                handles.push(match spec.scheme {
+                    BucketScheme::S3 => {
+                        self.build_one_s3(&spec.name, spec.region.as_deref(), &prefix, failover)
+                            .await?
+                    }
+                    BucketScheme::Gcs => self.build_one_gcs(&spec.name, &prefix, failover).await?,
+                    BucketScheme::Azure => {
+                        self.build_one_azure(&spec.name, &prefix, failover).await?
+                    }
+                });
+            }
+            return Ok(handles);
+        }
+        match self.effective_backend() {
             StorageBackend::Disk => {
                 // Disk has no key namespace to share, so the prefix is simply a
                 // subdirectory of the data dir — same tree, one level down.
@@ -271,109 +412,65 @@ impl StorageArgs {
                 Ok(vec![Arc::new(DiskStorage::new(root))])
             }
             StorageBackend::S3 => {
-                if s3_buckets.is_empty() {
-                    bail!("--s3-bucket is required when using --storage s3");
-                }
-                let mut handles = Vec::with_capacity(s3_buckets.len());
-                let failover = s3_buckets.len() > 1;
-                for spec in &s3_buckets {
-                    handles.push(self.build_one_s3(spec, failover).await?);
-                }
-                Ok(handles)
+                let bucket = self
+                    .s3_bucket
+                    .as_deref()
+                    .filter(|b| !b.is_empty())
+                    .ok_or_else(|| anyhow!("--s3-bucket is required when using --storage s3"))?;
+                Ok(vec![self.build_one_s3(bucket, None, &prefix, false).await?])
             }
             StorageBackend::Gcs => {
                 let bucket = self
                     .gcs_bucket
                     .clone()
                     .ok_or_else(|| anyhow!("--gcs-bucket is required when using --storage gcs"))?;
-                let mut b = GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
-                // Presigning needs a service-account private key; ADC tokens
-                // cannot sign URLs, so presign is disabled under ADC.
-                let mut can_sign = false;
-                if let Some(ref p) = self.gcs_service_account_path {
-                    b = b.with_service_account_path(p.clone());
-                    can_sign = true;
-                }
-                if let Some(ref url) = self.gcs_endpoint_url {
-                    // Emulator (fake-gcs-server): point at it and skip signing.
-                    b = b
-                        .with_config(GoogleConfigKey::BaseUrl, url.clone())
-                        .with_config(GoogleConfigKey::SkipSignature, "true");
-                    can_sign = false;
-                }
-                let gcs = Arc::new(b.build().context("configure GCS backend")?);
-                let store: Arc<dyn ObjectStore> = gcs.clone();
-                let signer = can_sign.then_some(gcs as Arc<dyn Signer>);
-                Ok(vec![Arc::new(ObjectStorage::new(
-                    store, signer, prefix, "gcs",
-                ))])
+                Ok(vec![self.build_one_gcs(&bucket, &prefix, false).await?])
             }
             StorageBackend::Azure => {
                 let container = self.azure_container.clone().ok_or_else(|| {
                     anyhow!("--azure-container is required when using --storage azure")
                 })?;
-                let mut b = MicrosoftAzureBuilder::from_env().with_container_name(container);
-                // SAS presigning needs the account access key.
-                let mut can_sign = false;
-                if let Some(ref a) = self.azure_account {
-                    b = b.with_account(a.clone());
-                }
-                if let Some(ref k) = self.azure_access_key {
-                    b = b.with_access_key(k.clone());
-                    can_sign = true;
-                }
-                if self.azure_use_emulator {
-                    b = b.with_use_emulator(true);
-                    can_sign = true;
-                }
-                if let Some(ref url) = self.azure_endpoint_url {
-                    b = b.with_endpoint(url.clone());
-                    if url.starts_with("http://") {
-                        b = b.with_allow_http(true);
-                    }
-                }
-                let az = Arc::new(b.build().context("configure Azure backend")?);
-                let store: Arc<dyn ObjectStore> = az.clone();
-                let signer = can_sign.then_some(az as Arc<dyn Signer>);
-                Ok(vec![Arc::new(ObjectStorage::new(
-                    store, signer, prefix, "azure",
-                ))])
+                Ok(vec![
+                    self.build_one_azure(&container, &prefix, false).await?,
+                ])
             }
         }
     }
 
-    fn validate_cloud_selection(&self, s3_buckets: &[String]) -> Result<()> {
-        if s3_buckets.is_empty() {
-            return Ok(());
+    /// Build one S3-backed [`Storage`]. Credentials come from the standard AWS
+    /// chain (env vars, web identity, instance metadata). The default
+    /// S3ConditionalPut is ETag-match, so the single-PUT create-if-absent path
+    /// works on S3 and S3-compatible stores out of the box; large artifacts are
+    /// published with a multipart copy-if-not-exists. `region` is the per-bucket
+    /// `@region`, if any.
+    /// Build a single storage handle for a bucket named by its scheme-qualified
+    /// identity (`s3://name`, `gs://name`, `az://name`) as recorded in a topology
+    /// stamp. `migrate` uses this to reach a bucket being *removed* from the list
+    /// so its `_repl/` notes can be checked before it is dropped. Failover
+    /// (bounded transport, no SDK retries) is on so an unreachable removed bucket
+    /// fails fast rather than hanging the maintenance command.
+    pub async fn build_one_by_identity(&self, identity: &str) -> Result<Arc<dyn Storage>> {
+        let prefix = self.resolved_prefix()?;
+        let spec = parse_bucket_uri(identity)?;
+        match spec.scheme {
+            BucketScheme::S3 => {
+                self.build_one_s3(&spec.name, spec.region.as_deref(), &prefix, true)
+                    .await
+            }
+            BucketScheme::Gcs => self.build_one_gcs(&spec.name, &prefix, true).await,
+            BucketScheme::Azure => self.build_one_azure(&spec.name, &prefix, true).await,
         }
-        let explicit_gcs = matches!(self.storage, StorageBackend::Gcs)
-            || self.gcs_bucket.is_some()
-            || self.gcs_service_account_path.is_some()
-            || self.gcs_endpoint_url.is_some();
-        let explicit_azure = matches!(self.storage, StorageBackend::Azure)
-            || self.azure_account.is_some()
-            || self.azure_container.is_some()
-            || self.azure_access_key.is_some()
-            || self.azure_endpoint_url.is_some()
-            || self.azure_use_emulator;
-        if explicit_gcs || explicit_azure {
-            bail!(
-                "S3 bucket configuration cannot be combined with explicit GCS or Azure configuration"
-            );
-        }
-        Ok(())
     }
 
-    /// Build one S3-backed [`Storage`] from a `name[@region]` bucket spec.
-    /// Credentials come from the standard AWS chain (env vars, web identity,
-    /// instance metadata). The default S3ConditionalPut is ETag-match, so the
-    /// single-PUT create-if-absent path works on S3 and S3-compatible stores out
-    /// of the box; large artifacts are published with a multipart copy-if-not-exists.
-    async fn build_one_s3(&self, spec: &str, failover: bool) -> Result<Arc<dyn Storage>> {
-        let prefix = self.resolved_prefix()?;
-        let (bucket, region) = parse_s3_bucket_spec(spec);
+    async fn build_one_s3(
+        &self,
+        bucket: &str,
+        region: Option<&str>,
+        prefix: &Option<String>,
+        failover: bool,
+    ) -> Result<Arc<dyn Storage>> {
         if bucket.is_empty() {
-            bail!("empty S3 bucket name in --s3-bucket value '{spec}'");
+            bail!("empty S3 bucket name");
         }
         let base = AmazonS3Builder::from_env()
             .with_bucket_name(bucket)
@@ -401,35 +498,115 @@ impl StorageArgs {
             // (MinIO et al.) keep the path-style default.
             b = b.with_virtual_hosted_style_request(true);
         }
-        let s3 = Arc::new(b.build().context("configure S3 backend")?);
+        let s3 = Arc::new(
+            b.build()
+                .with_context(|| format!("configure S3 backend for bucket '{bucket}'"))?,
+        );
         let store: Arc<dyn ObjectStore> = s3.clone();
         let signer: Arc<dyn Signer> = s3;
         Ok(Arc::new(ObjectStorage::new(
             store,
             Some(signer),
-            prefix,
+            prefix.clone(),
             "s3",
         )))
     }
-}
 
-fn resolve_s3_buckets(explicit: &[String], legacy: Option<String>) -> Vec<String> {
-    if !explicit.is_empty() {
-        return explicit.to_vec();
+    /// Build one GCS-backed [`Storage`]. Credentials come from Application
+    /// Default Credentials unless a service-account key is given; presigning
+    /// needs that key, so under ADC (or an emulator) presign is disabled.
+    /// object_store maps create-if-absent and CAS to GCS generation
+    /// preconditions natively — no builder flag required.
+    async fn build_one_gcs(
+        &self,
+        bucket: &str,
+        prefix: &Option<String>,
+        failover: bool,
+    ) -> Result<Arc<dyn Storage>> {
+        if bucket.is_empty() {
+            bail!("empty GCS bucket name");
+        }
+        let base = GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
+        let mut b = if failover {
+            bound_gcs_transport(base)
+        } else {
+            base
+        };
+        let mut can_sign = false;
+        if let Some(ref p) = self.gcs_service_account_path {
+            b = b.with_service_account_path(p.clone());
+            can_sign = true;
+        }
+        if let Some(ref url) = self.gcs_endpoint_url {
+            // Emulator (fake-gcs-server): point at it and skip signing.
+            b = b
+                .with_config(GoogleConfigKey::BaseUrl, url.clone())
+                .with_config(GoogleConfigKey::SkipSignature, "true");
+            can_sign = false;
+        }
+        let gcs = Arc::new(
+            b.build()
+                .with_context(|| format!("configure GCS backend for bucket '{bucket}'"))?,
+        );
+        let store: Arc<dyn ObjectStore> = gcs.clone();
+        let signer = can_sign.then_some(gcs as Arc<dyn Signer>);
+        Ok(Arc::new(ObjectStorage::new(
+            store,
+            signer,
+            prefix.clone(),
+            "gcs",
+        )))
     }
-    legacy
-        .filter(|bucket| !bucket.is_empty())
-        .into_iter()
-        .collect()
-}
 
-/// Parse an S3 bucket spec `name[@region]` into its parts. S3 bucket names cannot
-/// contain '@', so the first '@' unambiguously begins the region.
-fn parse_s3_bucket_spec(spec: &str) -> (&str, Option<&str>) {
-    match spec.split_once('@') {
-        Some((name, region)) if !region.is_empty() => (name, Some(region)),
-        Some((name, _)) => (name, None),
-        None => (spec, None),
+    /// Build one Azure Blob-backed [`Storage`]. Credentials come from the Azure
+    /// environment chain; SAS presigning needs the account access key (or the
+    /// emulator). object_store maps create-if-absent to `If-None-Match: *` and
+    /// CAS to `If-Match` natively — no builder flag required.
+    async fn build_one_azure(
+        &self,
+        container: &str,
+        prefix: &Option<String>,
+        failover: bool,
+    ) -> Result<Arc<dyn Storage>> {
+        if container.is_empty() {
+            bail!("empty Azure container name");
+        }
+        let base = MicrosoftAzureBuilder::from_env().with_container_name(container);
+        let mut b = if failover {
+            bound_azure_transport(base)
+        } else {
+            base
+        };
+        let mut can_sign = false;
+        if let Some(ref a) = self.azure_account {
+            b = b.with_account(a.clone());
+        }
+        if let Some(ref k) = self.azure_access_key {
+            b = b.with_access_key(k.clone());
+            can_sign = true;
+        }
+        if self.azure_use_emulator {
+            b = b.with_use_emulator(true);
+            can_sign = true;
+        }
+        if let Some(ref url) = self.azure_endpoint_url {
+            b = b.with_endpoint(url.clone());
+            if url.starts_with("http://") {
+                b = b.with_allow_http(true);
+            }
+        }
+        let az = Arc::new(
+            b.build()
+                .with_context(|| format!("configure Azure backend for container '{container}'"))?,
+        );
+        let store: Arc<dyn ObjectStore> = az.clone();
+        let signer = can_sign.then_some(az as Arc<dyn Signer>);
+        Ok(Arc::new(ObjectStorage::new(
+            store,
+            signer,
+            prefix.clone(),
+            "azure",
+        )))
     }
 }
 
@@ -468,9 +645,16 @@ pub(crate) fn is_bucket_unavailable(err: &anyhow::Error) -> bool {
 
 pub(crate) fn message_is_missing_bucket(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
+    // S3 (and GCS, which shares the "specified bucket does not exist" wording)
+    // report a missing bucket; Azure reports a missing container. Both are the
+    // container-level outage the health controller must fail over on — distinct
+    // from a healthy missing object inside a live bucket.
     message.contains("<code>nosuchbucket</code>")
         || message.contains("\"code\":\"nosuchbucket\"")
         || message.contains("specified bucket does not exist")
+        || message.contains("<code>containernotfound</code>")
+        || message.contains("\"code\":\"containernotfound\"")
+        || message.contains("specified container does not exist")
 }
 
 pub(crate) fn object_store_is_missing_bucket(error: &OsError) -> bool {
@@ -578,6 +762,28 @@ pub trait Storage: Send + Sync {
     /// not a directory — `packages/a` matches every package starting with
     /// 'a', which is how callers parallelize (see [`SHARD_CHARS`]).
     async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
+
+    /// One bounded page of a flat listing: up to `limit` objects whose key
+    /// sorts strictly after `after` (or from the start when `after` is `None`),
+    /// in ascending key order. Lets a sweep or diff walk an unbounded prefix in
+    /// bounded batches — never holding the whole backlog or package tree
+    /// resident (dev/MULTIBUCKET.md, v1 review finding). The default derives
+    /// paging from [`list_all`](Storage::list_all); backends with native
+    /// pagination (S3/GCS/Azure) override it so the cap is honored at the wire
+    /// via start-after, not after a full listing.
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ObjectMeta>> {
+        let all = self.list_all(prefix).await?;
+        Ok(all
+            .into_iter()
+            .filter(|obj| after.is_none_or(|a| obj.key.as_str() > a))
+            .take(limit)
+            .collect())
+    }
 
     /// Delete multiple keys (best-effort).
     async fn delete_keys(&self, keys: &[String]) -> Result<()>;
@@ -1423,6 +1629,55 @@ impl Storage for ObjectStorage {
         Ok(out)
     }
 
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ObjectMeta>> {
+        // Same directory-vs-byte-prefix contract as `list_all`.
+        let dir = match prefix.rfind('/') {
+            Some(i) => &prefix[..=i],
+            None => "",
+        };
+        let list_prefix = (!dir.is_empty() || self.prefix.is_some()).then(|| self.oskey(dir));
+        // Native start-after: the client passes `offset` to ListObjectsV2, so a
+        // later page never re-lists earlier keys. Objects arrive in ascending
+        // key order, so the first `limit` matches are exactly the next page.
+        let offset = after.map(|a| self.oskey(a));
+        let mut stream = match &offset {
+            Some(offset) => self.store.list_with_offset(list_prefix.as_ref(), offset),
+            None => self.store.list(list_prefix.as_ref()),
+        };
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let m = match item {
+                Ok(meta) => meta,
+                Err(error) if object_store_is_missing_bucket(&error) => {
+                    return Err(bucket_unavailable(self.backend, &error))
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::from(error)
+                        .context(format!("{}: list_page {prefix}", self.backend)))
+                }
+            };
+            let Some(key) = self.unkey(m.location.as_ref()) else {
+                continue;
+            };
+            if key.starts_with(prefix) {
+                out.push(ObjectMeta {
+                    key: key.to_string(),
+                    size: m.size,
+                    etag: pack_version(&m.e_tag, &m.version),
+                });
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
         for k in keys {
             match self.store.delete(&self.oskey(k)).await {
@@ -1613,6 +1868,14 @@ impl Storage for FaultInjectStorage {
     async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         self.inner.list_all(prefix).await
     }
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ObjectMeta>> {
+        self.inner.list_page(prefix, after, limit).await
+    }
     fn supports_leases(&self) -> bool {
         self.inner.supports_leases()
     }
@@ -1665,7 +1928,8 @@ mod tests {
             storage,
             data_dir: None,
             storage_prefix: None,
-            s3_buckets: Vec::new(),
+            s3_bucket: None,
+            buckets: Vec::new(),
             aws_region: None,
             s3_endpoint_url: None,
             s3_force_path_style: false,
@@ -1682,9 +1946,9 @@ mod tests {
 
     #[test]
     fn multi_s3_transport_disables_retries_without_a_short_transfer_deadline() {
-        let retry = s3_retry_config();
+        let retry = failover_retry_config();
         assert_eq!(retry.max_retries, 0);
-        assert_eq!(retry.retry_timeout, S3_REQUEST_TIMEOUT);
+        assert_eq!(retry.retry_timeout, FAILOVER_REQUEST_TIMEOUT);
 
         let builder = bound_s3_transport(AmazonS3Builder::new().with_bucket_name("packages"));
         assert_eq!(
@@ -1710,63 +1974,88 @@ mod tests {
     }
 
     #[test]
-    fn legacy_singular_s3_bucket_env_is_still_resolved() {
-        let previous = std::env::var_os("PYPIRON_S3_BUCKET");
-        std::env::set_var("PYPIRON_S3_BUCKET", "legacy-bucket");
-        let args = storage_args(StorageBackend::Disk);
-
-        assert_eq!(args.configured_s3_buckets(), ["legacy-bucket"]);
+    fn lone_s3_bucket_selects_s3_without_a_buckets_list() {
+        let mut args = storage_args(StorageBackend::Disk);
+        assert!(!args.has_s3_bucket());
+        args.s3_bucket = Some("packages".to_string());
+        assert!(args.has_s3_bucket());
         assert!(matches!(args.effective_backend(), StorageBackend::S3));
-
-        match previous {
-            Some(value) => std::env::set_var("PYPIRON_S3_BUCKET", value),
-            None => std::env::remove_var("PYPIRON_S3_BUCKET"),
-        }
+        assert_eq!(args.bucket_names(), ["packages"]);
     }
 
     #[test]
-    fn plural_s3_bucket_selection_wins_over_legacy_env_value() {
+    fn bucket_uris_parse_backend_name_and_region() {
         assert_eq!(
-            resolve_s3_buckets(
-                &["east".to_string(), "west".to_string()],
-                Some("legacy".to_string()),
-            ),
-            ["east", "west"]
+            parse_bucket_uri("s3://iron-east@us-east-1").unwrap(),
+            BucketSpec {
+                scheme: BucketScheme::S3,
+                name: "iron-east".to_string(),
+                region: Some("us-east-1".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_bucket_uri(" gs://iron-backup ").unwrap(),
+            BucketSpec {
+                scheme: BucketScheme::Gcs,
+                name: "iron-backup".to_string(),
+                region: None,
+            }
+        );
+        assert_eq!(
+            parse_bucket_uri("az://ironblob").unwrap().scheme,
+            BucketScheme::Azure
         );
     }
 
     #[test]
-    fn s3_bucket_rejects_explicit_gcs_or_azure_configuration() {
-        let s3 = vec!["packages".to_string()];
+    fn bucket_uris_reject_bad_entries_by_name() {
+        for (entry, needle) in [
+            ("iron-east", "missing a scheme"),
+            ("ftp://iron-east", "unknown scheme"),
+            ("gs://iron@us-east-1", "only valid on s3://"),
+            ("az://iron@eastus", "only valid on s3://"),
+            ("s3://iron@", "empty region"),
+            ("s3://", "empty bucket name"),
+        ] {
+            let error = parse_bucket_uri(entry).unwrap_err().to_string();
+            assert!(
+                error.contains(needle) && error.contains(entry.trim()),
+                "entry {entry:?} error {error:?} should mention {needle:?}"
+            );
+        }
+    }
 
-        let mut gcs = storage_args(StorageBackend::Disk);
-        gcs.gcs_bucket = Some("gcs-packages".to_string());
-        assert!(gcs
-            .validate_cloud_selection(&s3)
-            .unwrap_err()
-            .to_string()
-            .contains("cannot be combined"));
+    #[test]
+    fn bucket_names_come_from_the_parsed_uri_list() {
+        let mut args = storage_args(StorageBackend::Disk);
+        args.buckets = vec![
+            "s3://iron-east@us-east-1".to_string(),
+            "gs://iron-backup".to_string(),
+            "az://ironblob".to_string(),
+        ];
+        assert_eq!(
+            args.bucket_names(),
+            ["s3://iron-east", "gs://iron-backup", "az://ironblob"]
+        );
+    }
 
-        let mut azure = storage_args(StorageBackend::Disk);
-        azure.azure_container = Some("azure-packages".to_string());
-        assert!(azure
-            .validate_cloud_selection(&s3)
-            .unwrap_err()
-            .to_string()
-            .contains("cannot be combined"));
-
-        assert!(storage_args(StorageBackend::Gcs)
-            .validate_cloud_selection(&s3)
-            .is_err());
-        assert!(storage_args(StorageBackend::Azure)
-            .validate_cloud_selection(&s3)
-            .is_err());
+    #[test]
+    fn same_name_across_backends_is_a_distinct_identity() {
+        let mut args = storage_args(StorageBackend::Disk);
+        args.buckets = vec!["s3://shared".to_string(), "gs://shared".to_string()];
+        // A legal mixed list: same name, different backend. The scheme-qualified
+        // identities differ, so nothing downstream mistakes them for a duplicate.
+        assert_eq!(args.bucket_names(), ["s3://shared", "gs://shared"]);
     }
 
     #[test]
     fn distinguishes_missing_bucket_from_missing_object_text() {
         assert!(message_is_missing_bucket(
             "404 <Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message>"
+        ));
+        // Azure reports a missing container as the same container-level outage.
+        assert!(message_is_missing_bucket(
+            "404 <Code>ContainerNotFound</Code><Message>The specified container does not exist.</Message>"
         ));
         assert!(!message_is_missing_bucket(
             "Object at location packages/no-such-bucket.whl not found"

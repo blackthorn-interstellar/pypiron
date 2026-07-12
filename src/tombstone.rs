@@ -10,8 +10,9 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::sidecar::tombstone_key;
+use crate::sidecar::{frozen_key, metadata_key, provenance_key, sidecar_key, tombstone_key};
 use crate::storage::Storage;
+use crate::PACKAGES_PREFIX;
 
 /// Minimal tombstone body. The filename is informational — the key already
 /// carries it — and there is deliberately no wall clock: a tombstone's meaning
@@ -33,4 +34,45 @@ pub async fn write(storage: &dyn Storage, artifact_key: &str, filename: &str) ->
         .put_if_absent(&tombstone_key(artifact_key), body, Some("application/json"))
         .await?;
     Ok(())
+}
+
+/// Finish a delete that crashed between writing the tombstone and removing the
+/// body. `filenames` are artifact base names the audit already observed sitting
+/// beside their own `.tombstone` in the same listing (single- and multi-bucket
+/// alike): the tombstone fences the name but the live bytes stayed downloadable
+/// by direct URL. Drop the body and its companions, keeping the tombstone — the
+/// exact tail of the ordinary delete path. Returns how many bodies were dropped.
+/// The tombstone HEAD is re-confirmed so a stale listing can never delete a body
+/// that is not actually fenced, and `.frozen` absence is re-confirmed so a frozen
+/// conflict (a preserved body behind a tombstone + freeze marker) is never
+/// mistaken for a crashed delete and dropped. Write ordering already keeps the
+/// two apart; this makes the invariant explicit at delete time.
+pub async fn complete_interrupted_deletes(
+    storage: &dyn Storage,
+    pkg: &str,
+    filenames: &[String],
+) -> Result<usize> {
+    let mut completed = 0;
+    for filename in filenames {
+        let akey = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+        if !storage.head_exists(&tombstone_key(&akey)).await? {
+            continue;
+        }
+        if storage.head_exists(&frozen_key(&akey)).await? {
+            continue;
+        }
+        if !storage.head_exists(&akey).await? {
+            continue;
+        }
+        storage
+            .delete_keys(&[
+                akey.clone(),
+                sidecar_key(&akey),
+                metadata_key(&akey),
+                provenance_key(&akey),
+            ])
+            .await?;
+        completed += 1;
+    }
+    Ok(completed)
 }

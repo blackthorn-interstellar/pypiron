@@ -1,206 +1,157 @@
 # Survive a bucket outage
 
-Give pypiron two S3 buckets in different regions. Installs keep working when
-either region dies, and publishing moves to the next bucket within seconds.
-No promotion command or DNS change.
+Give pypiron a list of buckets instead of one. Every upload lands on all of them
+before it returns, so losing a bucket — a region, or a whole cloud — never stops
+installs and never loses an acknowledged upload. No promotion command, no DNS
+change, no failover drill.
 
 ## Run it
 
-List buckets in preference order. The first is preferred:
+List buckets in preference order, as URIs. The first is preferred:
 
 ```bash
 pypiron serve \
-  --s3-bucket iron-east@us-east-1 \
-  --s3-bucket iron-west@us-west-2
+  --buckets s3://iron-east@us-east-1,s3://iron-west@us-west-2
 ```
 
-Or use one environment variable:
+Or one environment variable:
 
 ```bash
-export PYPIRON_S3_BUCKETS=iron-east@us-east-1,iron-west@us-west-2
+export PYPIRON_BUCKETS=s3://iron-east@us-east-1,s3://iron-west@us-west-2
 pypiron serve
 ```
 
-`--s3-bucket` selects S3; `--storage s3` is optional. Give every node the same
-ordered list. One bucket keeps the single-bucket behavior: no multi-bucket
-probes, replication, or background work.
-
-Multi-bucket mode is S3-only. All buckets use the same AWS credential chain and
-the same optional `--s3-endpoint-url`; `@REGION` selects a region per bucket.
-Use two different regions, not two names in the same failure domain.
-
-## Failure and recovery
-
-Each node serves from the first bucket it sees as healthy. Timeouts (including
-HTTP 408), connection failures, and 5xx responses count as outages.
-Authentication, permission, KMS, quota, and configuration errors raise alarms
-and do not send a misconfigured node to another bucket.
-
-Defaults:
-
-- Leave a failing bucket after three consecutive availability failures.
-- Probe every configured bucket once per one-second worker tick by reading its
-  tiny topology stamp. Each probe has a one-second deadline, independent of S3
-  SDK retries, and the health loop cannot be blocked by index or replication
-  work.
-- Multi-bucket S3 disables SDK retries. One-second health probes switch new
-  requests and cancel background work on an ineligible bucket; an in-flight
-  artifact transfer keeps the normal one-hour route bound so a large upload is
-  never mistaken for an outage.
-- Return to a recovered, more-preferred bucket after five continuous healthy
-  minutes.
-
-Tune those windows with `--bucket-leave-failures`,
-`--bucket-return-healthy-secs`, and `--worker-interval-secs`. Shorter return
-windows make a flapping region move traffic back and forth.
-
-`--intent-grace-secs` is also the crash-recovery window for cross-bucket package
-work. It must be from 3 through `9223372036854775807` seconds; keep it longer
-than the slowest expected upload or replication step. Long replication rotates
-fresh intent-family members and staged promotion heartbeats its CAS lock, so a
-healthy operation does not become stale merely because it runs past one grace.
-
-Private uploads, deletes, yanks, and project status changes copy to every other
-bucket. Failed copies stay queued in the bucket that accepted the change and
-drain after recovery. A full comparison on the reconcile interval catches
-missing queue entries; the default `--audit-on-boot=true` also runs one at boot.
-
-Public packages fetched through the proxy do not copy between buckets. Each
-bucket can fetch that replaceable cache from upstream again.
-Manual DELETE of a mirror-cached artifact is rejected in multi-bucket mode.
-Cache eviction is unavailable in v1: private and mirror records share the same
-`packages/` prefix, so a broad lifecycle rule can delete private truth. Cached
-bytes are retained until the bucket itself is retired.
-
-## Protect private names
-
-A new private name can exist on one side of a long partition before its claim
-reaches the other side. If proxying public PyPI, reserve the private namespace
-on every node:
+Each entry is a URI with a scheme: `s3://name` (add `@region` for S3),
+`gs://name`, or `az://container`. Mix clouds freely — a bucket in AWS and a
+bucket in Google is a supported, first-class setup, and it buys you survival of
+an entire cloud provider's outage:
 
 ```bash
 pypiron serve \
-  --s3-bucket iron-east@us-east-1 \
-  --s3-bucket iron-west@us-west-2 \
+  --buckets s3://iron-east@us-east-1,gs://iron-backup
+```
+
+Each backend uses its own native credentials (the AWS chain for S3, a
+service-account key or Application Default Credentials for GCS, the account key
+for Azure). A bucket with half its credentials configured refuses to start.
+
+Give every node the same ordered list. A one-bucket list is the same as pointing
+at that one bucket directly: no failover machinery runs.
+
+## What you get
+
+- **Uploads are durable everywhere at `200`.** The publish returns only once the
+  file is on every reachable bucket. If one bucket is slow or down, the upload
+  still succeeds and pypiron remembers to copy the file over when the bucket
+  comes back.
+- **Reads fail over on their own.** Each node serves from the first bucket it
+  sees as healthy and switches within seconds when that bucket stops answering.
+  Because every bucket already holds every file, the switch is seamless.
+- **Deletes stay deleted.** A deleted filename never comes back, on any bucket,
+  even if the delete happened while a bucket was unreachable.
+
+## Failure and recovery
+
+Each node watches every bucket and serves from the most-preferred healthy one.
+Timeouts, connection failures, and 5xx responses count as an outage.
+Authentication, permission, KMS, quota, and configuration errors raise alarms
+instead — a misconfigured node stays on its preferred bucket rather than fleeing
+to another.
+
+Defaults you can tune:
+
+- Leave a failing bucket after three failures in a row
+  (`--bucket-leave-failures`).
+- Return to a recovered, more-preferred bucket after five continuous healthy
+  minutes (`--bucket-return-healthy-secs`). The long return window keeps a
+  flapping region from bouncing traffic back and forth.
+- A lagging bucket on upload gets 30 seconds to catch up before pypiron records
+  a repair and returns (`--fanout-grace-secs`), so one slow bucket adds at most
+  that much to a publish.
+
+When a bucket recovers, the queued repairs drain automatically — right away when
+the bucket comes back, and on a slow safety-net sweep otherwise. A full
+comparison on a daily cadence (and at boot) catches anything a repair missed.
+You do nothing.
+
+Public packages fetched through the proxy are not copied between buckets — each
+bucket re-fetches that replaceable cache from upstream on its own. Deleting a
+proxy-cached file by hand is refused when you run more than one bucket.
+
+## If two uploads collide
+
+Two people can upload **different bytes under the same filename** only if they
+hit different buckets during a partition — otherwise the second upload is
+rejected immediately, exactly as with one bucket. When that rare collision
+happens, pypiron keeps the **first** upload (the one that arrived earliest by the
+server's clock) and quarantines the other. Nothing is deleted, nothing is
+silently overwritten, and `pypiron_replication_freezes_total` fires so **you get
+paged**. If the two arrived too close to call, pypiron quarantines *both* and
+still pages you. Either way, resolve it by publishing under a new filename.
+
+## Protect private names
+
+A brand-new private name can exist on one side of a long partition before its
+reservation reaches the other side. If you also proxy public PyPI, reserve the
+private namespace on every node:
+
+```bash
+pypiron serve \
+  --buckets s3://iron-east@us-east-1,s3://iron-west@us-west-2 \
   --private-prefix acme \
   --proxy-upstream https://pypi.org
 ```
 
-This reserves `acme` and `acme-*` for private uploads and prevents the proxy
-from filling them from public PyPI. If private names do not share one prefix,
-omit `--private-prefix` and deny every exact private name in the shared
-`[mirror]` rules instead.
+This reserves `acme` and `acme-*` for private uploads and stops the proxy from
+filling those names from public PyPI. If your private names share no prefix, drop
+`--private-prefix` and deny each exact private name in the `[mirror]` rules
+instead.
 
-## Change the bucket list
+## Operator rules
 
-The ordered names are stamped into every bucket. A node refuses a different
-order at startup. If a recovered bucket reveals a different stamp at runtime,
-reads continue and writes stop until an operator fixes the topology.
-The write fence is sticky; restart the node after the stamps are repaired.
-Each startup topology operation is bounded to one second. An unreachable bucket
-can delay boot by up to that timeout for each operation attempted against it,
-but cannot block startup indefinitely; a reachable fallback still allows boot.
+Two rules the design depends on. Follow them and multi-bucket is hands-off;
+break them and you can lose data.
 
-To add, remove, replace, or reorder buckets:
+**Restore backups fleet-wide, never one bucket.** If you ever restore from
+backup, restore *every* bucket to the same point in time. Rolling a single bucket
+back to an older snapshot resurrects packages and reservations you had deleted —
+pypiron trusts what the buckets currently hold, and an old snapshot lies to it.
+Since the buckets are just files, version them together (bucket versioning, or a
+coordinated snapshot) and restore them together.
+
+**Change the bucket list with a stop-migrate-restart.** The ordered list is
+stamped into every bucket; a node refuses a different list at startup, and if a
+recovered bucket reveals a different list at runtime, reads keep working but
+uploads stop until you fix it. To add, remove, replace, or reorder buckets:
 
 1. Stop the pypiron fleet.
 2. Run the migration once with the new complete list:
 
     ```bash
-    PYPIRON_S3_BUCKETS=iron-east@us-east-1,iron-eu@eu-west-1 \
+    PYPIRON_BUCKETS=s3://iron-east@us-east-1,gs://iron-eu \
       pypiron buckets migrate
     ```
 
 3. Start every node with that same list.
 
-The command increments the topology generation and updates every reachable
-configured bucket. It reports buckets that could not be reached; they are
-checked when they return.
+Migration **refuses to run while any bucket still has pending repairs**, so a
+file that only made it to a bucket you're about to remove can't be stranded. If
+it refuses, let the fleet finish draining (or bring the lagging bucket back) and
+run it again. Never run two nodes with different lists.
 
-Shrinking from two or more buckets to one is the exception: stop the fleet and
-restart it with the lone bucket. Single-bucket mode deliberately ignores
-topology stamps, so `buckets migrate` has nothing to update.
-
-## Cost model
-
-Let:
-
-- `N` = configured buckets.
-- `H` = pypiron nodes.
-- `B` = artifact bytes.
-- `S` = per-file metadata bytes.
-- `C` = optional core-metadata and provenance bytes.
-- `M` = number of those optional companion objects (`0` to `2`).
-- `W` = `--worker-interval-secs`.
-- `R` = `--reconcile-interval-secs`.
-- `T` = retained content-addressed `_staging/repl/` bytes across the buckets.
-
-For private files:
-
-| Cost | Formula |
-| --- | --- |
-| Stored bytes | about `N × (live private corpus) + T`; replication adds `(N - 1) × (live private corpus)`, and completed demotion/repair stages add retained `T` |
-| Replication traffic per file upload | `(N - 1) × (B + S + C)`, plus small claim and marker documents |
-| Added successful write mutations per destination and file | `M + 9`: replication marker; source and destination package intents; per-file metadata, optional companions, artifact, and destination index marker; both intent deletes; replication-marker delete |
-| Long replication | four more mutations per heartbeat: the next source/destination `root~seq` intents, then commits closing the prior pair |
-| First private file for a name | one extra origin-only job per destination: seven mutations when it wins the claim race (todo create/delete, source/destination intent create/delete, conditional origin claim); six if the file job already claimed it |
-| Outage backlog | `D × E` markers while `D` destinations are unavailable; `E` is one per private upload/delete/yank/status event, plus one for each newly claimed private name |
-| Healthy-path probe upper bound per fleet per day | `H × N × 86,400 / W` small topology-stamp GETs; a slow sweep never overlaps itself |
-| Fast replication-scan upper bound | `2 × H × N × 86,400 / W` LISTs: every node scans each bucket's `_staging/repl/` recovery tree and `_repl/` markers |
-| Warm-index scans | Normally `(N - 1) × 86,400 / W` `_dirty/` LISTs across bucket-local lease holders; the sloppy-lease fleet ceiling is `H × (N - 1) × 86,400 / W`. Unhealthy buckets are skipped; every node still attempts the small lease operation. |
-| Full comparison | `H × 4 × (N - 1)` complete `packages/` LIST walks every `R` seconds; two sequential peer passes guarantee N-bucket dissemination. The default boot audit and bucket-selection changes add one run. |
-| Local package-index visibility fence | two origin GETs: initial observation plus final exact-observation check; zero added read I/O with one bucket |
-| Local artifact or companion visibility fence | two origin GETs, tombstone/frozen/mirror-quarantine HEADs, and a sidecar GET when the private claim or quarantine marker requires one. With one bucket, this fence adds no read I/O. |
-| Proxy read paths | higher and dynamic: eligibility/claim checks, local marker filtering, and upstream fetch/fill or companion-passthrough work depend on cache state |
-
-The mutation rows count the eager operation itself. The worker later batches
-cleanup of paired dirty markers after rebuilding the destination view.
-
-Every upload performs the tombstone HEAD that enforces the PyPI rule that a
-deleted filename cannot be reused. Multi-bucket uploads also HEAD the `.frozen`
-marker: it is written first during conflict handling, so a crash before
-quarantine is still a recognizable, unreusable freeze.
-
-The request counts above describe the no-race, healthy path with destinations
-already private. A mirror-to-private demotion stages the whole package and costs
-more. Large prefixes need additional LIST pages and conditional-write races need
-retries. Full comparison intentionally runs on every node: the selected-bucket
-lease holder may not share another node's working path to a warm bucket. It
-performs per-package object reads after the fixed LIST walks, but no per-package
-staging LIST. `pypiron_replication_marker_backlog` is a reachable-source lower
-bound during an outage. Provider request metrics remain the billing authority.
-
-Committed stage manifests may share content-addressed members. Promotion
-deletes only its manifest; the members persist and count toward retained staging
-storage `T`, becoming inert when unreferenced. There is no broad safe lifecycle
-rule for `_staging/repl/`, because a live manifest may still reference any of
-those shared objects. Each package also keeps a never-deleted
-`_staging/repl/<pkg>/.promotion-lock` CAS sentinel. Its holder heartbeats every
-third of the intent grace; recovery takes over only after one full unchanged-ETag
-grace and no live holder intent family. Recovery sweeps forget observations for
-packages whose committed manifests are gone.
+Shrinking all the way down to one bucket is the exception: just stop the fleet
+and restart with the single bucket — there's no migration to run.
 
 ## Limits
 
-- Replication is asynchronous. Destroying the selected bucket immediately
-  after an upload can lose the last few seconds of acknowledged writes.
-- Two nodes writing different bytes under one filename on different sides of a
-  partition can both return success. Reconciliation preserves both bodies,
-  keeps each canonical record occupied behind its frozen marker and tombstone,
-  suppresses the filename from every index and new direct server read, and raises
-  `pypiron_replication_freezes_total`. Publish a new filename to resolve it.
-- Already-issued signed download URLs live until their one-hour expiry. A
-  client caught between bucket selections may need one install retry.
-- A CDN or already-cached client may still serve bytes seen before a conflict
-  froze that filename. Reconciliation cannot un-serve cached content.
-- Public proxy caches are per bucket. The first request after a switch may
-  fetch a public artifact from upstream again. Two mirror caches holding
-  different bytes do not freeze; only conflicting private truth does.
-- Changing bucket membership is an operator action. Run `pypiron buckets
-  migrate` when the new topology still has multiple buckets; use the restart-only
-  exception above when shrinking to one. Never deploy two different ordered
-  lists.
+- Destroying (not just disconnecting) a bucket in the seconds after an upload
+  that couldn't reach it can lose those last few writes; re-publish them.
+- Already-issued download links live until their one-hour expiry. A client caught
+  mid-switch may need one install retry.
+- A CDN or already-cached client can still serve bytes it fetched before a
+  collision was quarantined. No server can un-serve cached bytes.
+- A quarantined collision needs a human: publish a new filename to move on.
 
 See [Configuration](../reference/configuration.md#multiple-buckets) for every
 flag and [multi-bucket metrics](../reference/configuration.md#multi-bucket-metrics)
-for alert inputs.
+for what to alert on.

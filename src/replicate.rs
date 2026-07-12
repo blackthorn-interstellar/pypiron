@@ -6,23 +6,22 @@
 //! upstream (§4). Three tiers keep the buckets converged, fastest first, each
 //! backstopping the one above:
 //!
-//! 1. **Eager fan-out** ([`spawn_eager_with_markers`]): after an
-//!    upload/delete/yank commits, durably queue markers and push the changed
-//!    record to every other bucket.
-//! 2. **`_repl/` todo markers**: any failed eager push drops a marker in the
-//!    bucket that took the write; nodes sweep them each tick
-//!    ([`sweep_all_markers`]).
+//! 1. **Synchronous fan-out** ([`fanout_sync`]): before an upload/delete/yank
+//!    is acked, push the changed record to every other healthy bucket. A
+//!    healthy fleet acks with N copies and no note written.
+//! 2. **`_repl/` todo notes**: a fan-out that fails, times out, or is skipped
+//!    (destination ineligible) drops a note in the bucket that took the write;
+//!    nodes sweep them each tick ([`sweep_all_markers`]).
 //! 3. **Full diff** ([`reconcile`]): a pairwise tree diff as the backstop for
 //!    lost markers — the same copy path, with the merge rules armed.
 //!
 //! Every function here takes explicit `(source, destination)` storage handles:
 //! this is the one sanctioned two-handle operation (§3 invariant 2). The merge
-//! decision ([`decide`]) is a pure, symmetric, clock-free function so any two
-//! buckets reconciled by any node in any order reach the same result; the
-//! executor applies it with both handles.
+//! decision ([`decide`]) is a pure, symmetric function over durable record
+//! state. Upload timestamps are only used for the rare private/private byte
+//! conflict; the executor applies the decision with both handles.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -34,15 +33,14 @@ use crate::buckets::Pinned;
 #[cfg(test)]
 use crate::origin::read_origin;
 use crate::origin::{
-    begin_private_promotion, claim_origin, finish_private_promotion, read_origin_observation,
-    ClaimRequest, OriginState, MIRROR, PRIVATE,
+    claim_origin, read_origin_observation, ClaimRequest, OriginState, MIRROR, PRIVATE,
 };
 use crate::sidecar::{
     frozen_key, metadata_key, mirror_quarantined_key, provenance_key, sidecar_key, tombstone_key,
     Sidecar, Yanked, FROZEN_SUFFIX, MIRROR_QUARANTINED_SUFFIX, SIDECAR_SUFFIX, TOMBSTONE_SUFFIX,
 };
 use crate::status::{self, StatusConvergence};
-use crate::storage::{is_not_found, ObjectMeta, Storage};
+use crate::storage::{is_not_found, Storage};
 use crate::tombstone;
 use crate::worker;
 use crate::{AppState, PACKAGES_PREFIX};
@@ -51,17 +49,20 @@ use crate::{AppState, PACKAGES_PREFIX};
 /// object in the bucket that took the write (the `_dirty/` idiom pointed at a
 /// second bucket). O(1) at commit, consumed and deleted on a successful push.
 const REPL_PREFIX: &str = "_repl/";
-/// Completed package-demotion stages live here until promotion succeeds. A
-/// manifest is the commit marker: without it, partial stage objects are inert.
-const REPL_STAGING_PREFIX: &str = "_staging/repl/";
-const PROMOTION_LOCK_NAME: &str = ".promotion-lock";
-const MIN_PROMOTION_LOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(30);
 /// Frozen bodies land here, content-hash-suffixed, so both sides of a byte
 /// conflict are preserved as moves (never deletes): `_quarantine/<pkg>/<file>@<sha12>`.
 const QUARANTINE_PREFIX: &str = "_quarantine/";
 /// Bound on the origin-CAS retry loop in [`ensure_private_origin`]; the same
 /// rationale as [`origin`]'s own claim loop — a pathological storm fails closed.
 const ORIGIN_ATTEMPTS: usize = 8;
+/// Upload timestamps closer than this are not trustworthy enough to order a
+/// cross-partition byte conflict. Preserve both sides behind a freeze instead.
+const CONFLICT_SKEW_MS: u64 = 2_000;
+/// Page size for the paged `_repl/` sweep and the reconcile package scan: one
+/// S3 LIST page. Bounds resident memory so neither the failure backlog nor the
+/// full package tree is ever held in one Vec (dev/MULTIBUCKET.md, v1 review).
+const REPL_SWEEP_PAGE: usize = 1_000;
+const RECONCILE_SCAN_PAGE: usize = 1_000;
 
 /// Package-level marker members share the ordinary durable fan-out queue. They
 /// cannot collide with distribution filenames: valid artifacts never begin
@@ -74,337 +75,6 @@ fn require_replication_unfenced(state: &AppState) -> Result<()> {
         bail!("bucket topology mismatch; replication writes are fenced");
     }
     Ok(())
-}
-
-struct ReplicationIntents {
-    left: String,
-    right: String,
-    current: tokio::sync::Mutex<(String, String)>,
-    heartbeat_seq: std::sync::atomic::AtomicU64,
-}
-
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-enum PromotionLockBody {
-    Free {
-        nonce: String,
-    },
-    Held {
-        holder: String,
-        manifest: String,
-        nonce: String,
-    },
-}
-
-struct PromotionLease {
-    key: String,
-    holder: String,
-    manifest: String,
-    etag: tokio::sync::Mutex<String>,
-}
-
-impl PromotionLease {
-    fn held_body(&self) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(&PromotionLockBody::Held {
-            holder: self.holder.clone(),
-            manifest: self.manifest.clone(),
-            nonce: worker::marker_nonce(),
-        })?)
-    }
-
-    async fn require(&self, storage: &dyn Storage) -> Result<()> {
-        let Some((bytes, _)) = storage.get_with_etag(&self.key).await? else {
-            bail!("promotion lock '{}' vanished", self.key)
-        };
-        let body: PromotionLockBody = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse promotion lock {}", self.key))?;
-        if !matches!(
-            body,
-            PromotionLockBody::Held { holder, manifest, .. }
-                if holder == self.holder && manifest == self.manifest
-        ) {
-            bail!("promotion lock '{}' changed owner", self.key)
-        }
-        Ok(())
-    }
-
-    async fn renew(&self, storage: &dyn Storage) -> Result<()> {
-        let mut expected_etag = self.etag.lock().await;
-        let Some(next_etag) = storage
-            .put_if_match(&self.key, &expected_etag, self.held_body()?)
-            .await?
-        else {
-            bail!("promotion lock '{}' was lost during heartbeat", self.key)
-        };
-        *expected_etag = next_etag;
-        Ok(())
-    }
-
-    async fn release(&self, storage: &dyn Storage) -> Result<()> {
-        let expected_etag = self.etag.lock().await.clone();
-        let free = serde_json::to_vec(&PromotionLockBody::Free {
-            nonce: worker::marker_nonce(),
-        })?;
-        if storage
-            .put_if_match(&self.key, &expected_etag, free)
-            .await?
-            .is_none()
-        {
-            bail!("promotion lock '{}' changed before release", self.key)
-        }
-        Ok(())
-    }
-}
-
-fn promotion_lock_key(pkg: &str) -> String {
-    format!("{REPL_STAGING_PREFIX}{pkg}/{PROMOTION_LOCK_NAME}")
-}
-
-fn storage_identity(storage: &dyn Storage) -> usize {
-    std::ptr::from_ref(storage).cast::<()>() as usize
-}
-
-fn intent_grace_std(state: &AppState) -> std::time::Duration {
-    std::time::Duration::try_from(state.intent_grace).unwrap_or_default()
-}
-
-fn promotion_lock_grace(state: &AppState) -> std::time::Duration {
-    intent_grace_std(state).max(MIN_PROMOTION_LOCK_GRACE)
-}
-
-async fn acquire_promotion_lock(
-    state: &AppState,
-    storage: &dyn Storage,
-    staged: &StagedPackage,
-    holder: &str,
-) -> Result<Option<PromotionLease>> {
-    let key = promotion_lock_key(&staged.manifest.package);
-    let observation_key = (storage_identity(storage), key.clone());
-    for _ in 0..ORIGIN_ATTEMPTS {
-        let held = || {
-            serde_json::to_vec(&PromotionLockBody::Held {
-                holder: holder.to_string(),
-                manifest: staged.manifest_key.clone(),
-                nonce: worker::marker_nonce(),
-            })
-        };
-        let Some((bytes, etag)) = storage.get_with_etag(&key).await? else {
-            if let Some(etag) = storage.put_if_none_match(&key, held()?).await? {
-                state
-                    .promotion_lock_observations
-                    .lock()
-                    .await
-                    .remove(&observation_key);
-                return Ok(Some(PromotionLease {
-                    key,
-                    holder: holder.to_string(),
-                    manifest: staged.manifest_key.clone(),
-                    etag: tokio::sync::Mutex::new(etag),
-                }));
-            }
-            continue;
-        };
-        let body: PromotionLockBody = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse promotion lock {key}"))?;
-        let replace = match body {
-            PromotionLockBody::Free { .. } => true,
-            PromotionLockBody::Held {
-                holder: current,
-                manifest,
-                ..
-            } if current == holder && manifest == staged.manifest_key => {
-                state
-                    .promotion_lock_observations
-                    .lock()
-                    .await
-                    .remove(&observation_key);
-                return Ok(Some(PromotionLease {
-                    key,
-                    holder: holder.to_string(),
-                    manifest: staged.manifest_key.clone(),
-                    etag: tokio::sync::Mutex::new(etag),
-                }));
-            }
-            PromotionLockBody::Held {
-                holder: current, ..
-            } => {
-                let unchanged_for_grace = {
-                    let mut observations = state.promotion_lock_observations.lock().await;
-                    match observations.get_mut(&observation_key) {
-                        Some((observed_etag, first_seen)) if observed_etag == &etag => {
-                            first_seen.elapsed() >= promotion_lock_grace(state)
-                        }
-                        Some(observed) => {
-                            *observed = (etag.clone(), std::time::Instant::now());
-                            false
-                        }
-                        None => {
-                            observations.insert(
-                                observation_key.clone(),
-                                (etag.clone(), std::time::Instant::now()),
-                            );
-                            false
-                        }
-                    }
-                };
-                if !unchanged_for_grace
-                    || worker::specific_intent_is_live(
-                        state,
-                        storage,
-                        &staged.manifest.package,
-                        &current,
-                    )
-                    .await?
-                {
-                    return Ok(None);
-                }
-                true
-            }
-        };
-        if replace {
-            if let Some(next_etag) = storage.put_if_match(&key, &etag, held()?).await? {
-                state
-                    .promotion_lock_observations
-                    .lock()
-                    .await
-                    .remove(&observation_key);
-                return Ok(Some(PromotionLease {
-                    key,
-                    holder: holder.to_string(),
-                    manifest: staged.manifest_key.clone(),
-                    etag: tokio::sync::Mutex::new(next_etag),
-                }));
-            }
-        }
-    }
-    bail!(
-        "could not acquire promotion lock for '{}'",
-        staged.manifest.package
-    )
-}
-
-async fn run_with_promotion_heartbeat<T>(
-    state: &AppState,
-    storage: &dyn Storage,
-    lease: &PromotionLease,
-    operation: impl std::future::Future<Output = Result<T>>,
-) -> Result<T> {
-    let period = promotion_lock_grace(state) / 3;
-    let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-    tokio::pin!(operation);
-    let outcome = loop {
-        tokio::select! {
-            result = &mut operation => break result,
-            _ = heartbeat.tick() => {
-                if let Err(error) = lease.renew(storage).await {
-                    break Err(error.context("renew staged-promotion lock"));
-                }
-            }
-        }
-    };
-    let released = lease.release(storage).await;
-    match (outcome, released) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error.context("release staged-promotion lock")),
-        (Err(error), Err(release)) => Err(error.context(format!(
-            "release staged-promotion lock also failed: {release:#}"
-        ))),
-    }
-}
-
-async fn acquire_replication_intents(
-    left: &dyn Storage,
-    right: &dyn Storage,
-    pkg: &str,
-) -> Result<ReplicationIntents> {
-    let left_nonce = worker::mark_intent(left, pkg).await?;
-    match worker::mark_intent(right, pkg).await {
-        Ok(right_nonce) => Ok(ReplicationIntents {
-            left: left_nonce.clone(),
-            right: right_nonce.clone(),
-            current: tokio::sync::Mutex::new((left_nonce, right_nonce)),
-            heartbeat_seq: std::sync::atomic::AtomicU64::new(0),
-        }),
-        Err(error) => {
-            let _ = worker::clear_intent(left, pkg, &left_nonce).await;
-            Err(error)
-        }
-    }
-}
-
-async fn release_replication_intents(
-    left: &dyn Storage,
-    right: &dyn Storage,
-    pkg: &str,
-    intents: &ReplicationIntents,
-) -> Result<()> {
-    let (left_current, right_current) = intents.current.lock().await.clone();
-    let (left_result, right_result) = futures::future::join(
-        worker::clear_intent(left, pkg, &left_current),
-        worker::clear_intent(right, pkg, &right_current),
-    )
-    .await;
-    left_result?;
-    right_result
-}
-
-async fn commit_replication_intents(
-    left: &dyn Storage,
-    right: &dyn Storage,
-    pkg: &str,
-    intents: &ReplicationIntents,
-) {
-    let (left_current, right_current) = intents.current.lock().await.clone();
-    let _ = futures::future::join(
-        worker::mark_commit(left, pkg, &left_current),
-        worker::mark_commit(right, pkg, &right_current),
-    )
-    .await;
-}
-
-async fn run_with_replication_heartbeats<T>(
-    state: &AppState,
-    left: &dyn Storage,
-    right: &dyn Storage,
-    pkg: &str,
-    intents: &ReplicationIntents,
-    operation: impl std::future::Future<Output = Result<T>>,
-) -> Result<T> {
-    let period = (intent_grace_std(state) / 3).max(std::time::Duration::from_millis(10));
-    let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-    tokio::pin!(operation);
-    loop {
-        tokio::select! {
-            result = &mut operation => return result,
-            _ = heartbeat.tick() => {
-                let seq = intents
-                    .heartbeat_seq
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let next_left = format!("{}~{seq}", intents.left);
-                let next_right = format!("{}~{seq}", intents.right);
-                worker::mark_intent_with_nonce(left, pkg, &next_left)
-                    .await
-                    .context("create left replication heartbeat intent")?;
-                if let Err(error) = worker::mark_intent_with_nonce(right, pkg, &next_right).await {
-                    let _ = worker::mark_commit(left, pkg, &next_left).await;
-                    return Err(error.context("create right replication heartbeat intent"));
-                }
-                let (old_left, old_right) = {
-                    let mut current = intents.current.lock().await;
-                    let old = current.clone();
-                    *current = (next_left, next_right);
-                    old
-                };
-                futures::future::try_join(
-                    worker::mark_commit(left, pkg, &old_left),
-                    worker::mark_commit(right, pkg, &old_right),
-                )
-                .await
-                .context("close prior replication heartbeat intents")?;
-            }
-        }
-    }
 }
 
 /// Background replication may touch startup-validated idle buckets, but never
@@ -429,7 +99,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Merge algebra — pure, symmetric, clock-free (dev/MULTIBUCKET.md §6).
+// Merge algebra — pure and symmetric (dev/MULTIBUCKET.md §Conflict resolution).
 // Precedence: tombstone ≻ origin (private ≻ mirror) ≻ union ≻ freeze.
 // ---------------------------------------------------------------------------
 
@@ -472,7 +142,7 @@ enum RecordState {
     Frozen,
     /// Canonical mirror bytes deliberately retained behind a quarantine
     /// marker. They are absent for ordinary union, but a private peer may
-    /// supersede them through package staging.
+    /// supersede them directly per artifact.
     QuarantinedMirror,
     Live {
         sha: String,
@@ -545,6 +215,9 @@ enum Verdict {
     /// The `Side` is private, the other is a *different-byte* mirror: private
     /// wins — quarantine the mirror body and copy the private record over it.
     Supersede(Side),
+    /// Different private bytes were ordered by their server-stamped receive
+    /// times. The `Side` is the older winner; preserve and replace the loser.
+    QuarantineLoser(Side),
     /// Both sides committed different bytes under one filename: freeze both.
     Freeze,
     /// At least one side is tombstoned and the sides disagree: delete the file
@@ -563,11 +236,11 @@ fn decide(a: &Record, b: &Record) -> Verdict {
     // Tombstone ≻ everything. Converged (both tombstoned, no live body) is a
     // no-op so a settled delete never re-fires each diff.
     if a.tombstoned || b.tombstoned {
-        // Frozen canonical bodies are deliberately retained behind their
-        // durable markers. They are evidence, not live truth, so a settled
-        // fleet must not loop forever trying to delete them.
-        let frozen_settled = a.frozen && b.frozen;
-        if a.tombstoned && b.tombstoned && (frozen_settled || (!a.has_artifact && !b.has_artifact))
+        if a.tombstoned
+            && b.tombstoned
+            && a.frozen == b.frozen
+            && !a.has_artifact
+            && !b.has_artifact
         {
             return Verdict::Noop;
         }
@@ -626,7 +299,9 @@ fn decide(a: &Record, b: &Record) -> Verdict {
                 same_bytes(a, b, oa, ob)
             } else {
                 match (oa, ob) {
-                    (Origin::Private, Origin::Private) => Verdict::Freeze,
+                    (Origin::Private, Origin::Private) => conflict_winner(a, b)
+                        .map(Verdict::QuarantineLoser)
+                        .unwrap_or(Verdict::Freeze),
                     (Origin::Private, Origin::Mirror) => Verdict::Supersede(Side::A),
                     (Origin::Mirror, Origin::Private) => Verdict::Supersede(Side::B),
                     // Two mirror caches of the same name: each bucket manages its
@@ -639,6 +314,15 @@ fn decide(a: &Record, b: &Record) -> Verdict {
         // exists to keep the match total.
         (Tombstoned | Frozen, _) | (_, Tombstoned | Frozen) => Verdict::Noop,
     }
+}
+
+fn conflict_winner(a: &Record, b: &Record) -> Option<Side> {
+    let ta = a.sidecar.as_ref()?.upload_epoch_ms?;
+    let tb = b.sidecar.as_ref()?.upload_epoch_ms?;
+    if ta.abs_diff(tb) <= CONFLICT_SKEW_MS {
+        return None;
+    }
+    Some(if ta < tb { Side::A } else { Side::B })
 }
 
 /// Both sides hold the same bytes. Origin precedence (private ≻ mirror) first,
@@ -714,9 +398,6 @@ async fn read_pkg_origin(storage: &dyn Storage, pkg: &str) -> Result<Option<Orig
     let Some(observed) = read_origin_observation(storage, pkg).await? else {
         return Ok(None);
     };
-    if let Some(owner) = observed.pending_manifest {
-        bail!("package '{pkg}' is under staged promotion by '{owner}'");
-    }
     if observed.state == OriginState::Unclaimed {
         return Ok(None);
     }
@@ -827,15 +508,6 @@ async fn execute(
             if dirty_b {
                 worker::mark_dirty(b, pkg).await?;
             }
-            // A process may crash after durable freeze/tombstone markers but
-            // before the outer freeze path queues its index rebuild. Reassert
-            // the cheap derived-view event on every later frozen no-op.
-            if ra.frozen {
-                worker::mark_dirty(a, pkg).await?;
-            }
-            if rb.frozen {
-                worker::mark_dirty(b, pkg).await?;
-            }
         }
         Verdict::Copy(side) => {
             let (src, dst, rec) = pick(side);
@@ -858,10 +530,38 @@ async fn execute(
                 worker::mark_dirty(b, pkg).await?;
             }
         }
-        Verdict::Supersede(_) => bail!(
-            "private-over-mirror supersede for {pkg}/{filename} reached the per-file executor; package staging must run first"
-        ),
+        Verdict::Supersede(side) => {
+            let (src, dst, record) = pick(side);
+            supersede_record(state, src, dst, pkg, filename, record).await?;
+        }
+        Verdict::QuarantineLoser(winner) => {
+            let (src, dst, record) = pick(winner);
+            let loser = match winner {
+                Side::A => rb,
+                Side::B => ra,
+            };
+            error!(
+                package = %pkg,
+                filename = %filename,
+                winner = ?winner,
+                winner_sha = record.sidecar.as_ref().map(|s| s.sha256.as_str()).unwrap_or("?"),
+                loser_sha = loser.sidecar.as_ref().map(|s| s.sha256.as_str()).unwrap_or("?"),
+                "byte conflict: first-uploaded kept, loser quarantined; operator review required"
+            );
+            supersede_record(state, src, dst, pkg, filename, record).await?;
+            state
+                .metrics
+                .replication_conflict_quarantines
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Verdict::Freeze => {
+            error!(
+                package = %pkg,
+                filename = %filename,
+                sha_a = ra.sidecar.as_ref().map(|s| s.sha256.as_str()).unwrap_or("?"),
+                sha_b = rb.sidecar.as_ref().map(|s| s.sha256.as_str()).unwrap_or("?"),
+                "byte conflict: same filename, different bytes on two buckets — frozen on both, quarantined, suppressed from indexes; resolve by republishing a new version"
+            );
             freeze_side(a, pkg, filename).await?;
             freeze_side(b, pkg, filename).await?;
             worker::mark_dirty(a, pkg).await?;
@@ -870,13 +570,6 @@ async fn execute(
                 .metrics
                 .replication_freezes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            error!(
-                package = %pkg,
-                filename = %filename,
-                sha_a = ra.sidecar.as_ref().map(|s| s.sha256.as_str()).unwrap_or("?"),
-                sha_b = rb.sidecar.as_ref().map(|s| s.sha256.as_str()).unwrap_or("?"),
-                "byte conflict: same filename, different bytes on two buckets — frozen on both, quarantined, suppressed from indexes; resolve by republishing a new version"
-            );
         }
         Verdict::PropagateFreeze(frozen_side) => {
             // Freeze the side that lacks the marker.
@@ -1159,40 +852,72 @@ async fn read_listed_companion(
         .with_context(|| format!("read source companion {key}"))
 }
 
-/// Install the source sidecar without overwriting a concurrent writer. An
-/// existing sidecar is safe for this body only when it names the same sha and
-/// is private (or legacy-untyped under the now-private package claim).
+/// Install private sidecar truth under CAS. A body-less sidecar is inert and
+/// may be replaced; a mirror sidecar also yields to private truth. Once the
+/// destination body already matches the incoming sha, a different-sha sidecar
+/// is necessarily stale crash debris and may be repaired. A different-sha
+/// private sidecar backed by a different live body remains a hard conflict.
 async fn install_or_verify_sidecar(
     dst: &dyn Storage,
     key: &str,
     sidecar: &Sidecar,
 ) -> Result<bool> {
+    if sidecar.origin.as_deref() != Some(PRIVATE) {
+        bail!("replication source sidecar at {key} is not private truth");
+    }
     let bytes = serde_json::to_vec(sidecar)?;
-    if dst.put_if_absent(key, bytes, json()).await? {
-        return Ok(true);
-    }
-    let current = dst
-        .get_bytes(key)
-        .await
-        .with_context(|| format!("verify concurrently-created sidecar {key}"))?;
-    let current: Sidecar =
-        serde_json::from_slice(&current).with_context(|| format!("parse sidecar {key}"))?;
-    if current.sha256 != sidecar.sha256 {
-        bail!(
-            "concurrently-created sidecar at {key} names sha {}, expected {}",
-            current.sha256,
-            sidecar.sha256
-        );
-    }
-    if current.origin.as_deref() == Some(MIRROR) {
-        bail!("concurrently-created sidecar at {key} is mirror truth");
-    }
-    if let Some(raw) = current.origin.as_deref() {
-        if Origin::parse(raw).is_none() {
-            bail!("sidecar at {key} holds an unexpected origin '{raw}'");
+    let artifact = key
+        .strip_suffix(SIDECAR_SUFFIX)
+        .ok_or_else(|| anyhow!("sidecar key has no {SIDECAR_SUFFIX} suffix: {key}"))?;
+    for _ in 0..ORIGIN_ATTEMPTS {
+        let Some((current_bytes, etag)) = dst.get_with_etag(key).await? else {
+            if dst.put_if_absent(key, bytes.clone(), json()).await? {
+                return Ok(true);
+            }
+            continue;
+        };
+        if current_bytes == bytes {
+            return Ok(false);
+        }
+        let current: Sidecar = serde_json::from_slice(&current_bytes)
+            .with_context(|| format!("parse destination sidecar {key}"))?;
+        if let Some(raw) = current.origin.as_deref() {
+            if Origin::parse(raw).is_none() {
+                bail!("sidecar at {key} holds an unexpected origin '{raw}'");
+            }
+        }
+        let body = match dst.get_bytes(artifact).await {
+            Ok(body) => Some(body),
+            Err(error) if is_not_found(&error) => None,
+            Err(error) => return Err(error),
+        };
+        let body_matches = body
+            .as_deref()
+            .is_some_and(|body| sha256_hex(body) == sidecar.sha256);
+        let replace = if current.sha256 != sidecar.sha256 {
+            body.is_none() || body_matches || current.origin.as_deref() == Some(MIRROR)
+        } else {
+            match current.origin.as_deref() {
+                Some(MIRROR) | None => true,
+                Some(PRIVATE) => yank_merge(sidecar, &current) == MergeChoice::A,
+                Some(_) => false,
+            }
+        };
+        if !replace {
+            if current.sha256 != sidecar.sha256 {
+                bail!(
+                    "destination sidecar at {key} names sha {} backed by different private bytes; expected {}",
+                    current.sha256,
+                    sidecar.sha256
+                );
+            }
+            return Ok(false);
+        }
+        if dst.put_if_match(key, &etag, bytes.clone()).await?.is_some() {
+            return Ok(true);
         }
     }
-    Ok(false)
+    bail!("conditional sidecar replacement retries exhausted for {key}")
 }
 
 /// Copy a live private record into `dst` (dev/MULTIBUCKET.md §4 copy protocol):
@@ -1278,6 +1003,180 @@ async fn copy_live(
     Ok(false)
 }
 
+/// Replace one destination record with verified private truth. This is shared
+/// by mirror supersede and the timestamp-ordered private/private conflict path.
+/// The losing body is preserved before its conditional replacement; sidecar
+/// and companions then converge, and an absent artifact is published last.
+async fn supersede_record(
+    state: &AppState,
+    src: &dyn Storage,
+    dst: &dyn Storage,
+    pkg: &str,
+    filename: &str,
+    src_record: &Record,
+) -> Result<()> {
+    require_replication_unfenced(state)?;
+    let sidecar = src_record
+        .sidecar
+        .as_ref()
+        .ok_or_else(|| anyhow!("supersede verdict with no source sidecar"))?;
+    if sidecar.origin.as_deref() != Some(PRIVATE) {
+        bail!("supersede source for {pkg}/{filename} is not private truth");
+    }
+    let verified = verify_source_record(src, pkg, filename, src_record).await?;
+    ensure_private_origin(dst, pkg).await?;
+    let akey = artifact_key(pkg, filename);
+
+    // A marker that raced the merge read has precedence. Preserve the incoming
+    // private evidence, but never resurrect it through the fence.
+    if dst.head_exists(&frozen_key(&akey)).await? {
+        quarantine_bytes(dst, pkg, filename, &verified.artifact).await?;
+        freeze_side(dst, pkg, filename).await?;
+        worker::mark_dirty(dst, pkg).await?;
+        return Ok(());
+    }
+    if dst.head_exists(&tombstone_key(&akey)).await? {
+        if tombstone_side(dst, pkg, filename).await? {
+            worker::mark_dirty(dst, pkg).await?;
+        }
+        return Ok(());
+    }
+
+    let replace_companions = match dst.get_bytes(&sidecar_key(&akey)).await {
+        Ok(bytes) => {
+            let current: Sidecar = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse destination sidecar for {akey}"))?;
+            match current.origin.as_deref() {
+                Some(PRIVATE) => current.sha256 != sidecar.sha256,
+                Some(MIRROR) | None => true,
+                Some(raw) => bail!("destination sidecar for {akey} has invalid origin '{raw}'"),
+            }
+        }
+        Err(error) if is_not_found(&error) => false,
+        Err(error) => return Err(error),
+    };
+
+    let mut artifact_present = false;
+    if let Some((current, etag)) = dst.get_with_etag(&akey).await? {
+        if sha256_hex(&current) == sidecar.sha256 {
+            artifact_present = true;
+        } else {
+            quarantine_bytes(dst, pkg, filename, &current).await?;
+            if dst
+                .put_if_match(&akey, &etag, verified.artifact.clone())
+                .await?
+                .is_none()
+            {
+                bail!("destination artifact changed during supersede for {akey}");
+            }
+            state
+                .metrics
+                .record_replicated(verified.artifact.len() as u64);
+            artifact_present = true;
+        }
+    }
+
+    install_or_verify_sidecar(dst, &sidecar_key(&akey), sidecar).await?;
+    replace_companion(
+        dst,
+        &metadata_key(&akey),
+        verified.metadata,
+        Some("text/plain; charset=utf-8"),
+        replace_companions,
+    )
+    .await?;
+    replace_companion(
+        dst,
+        &provenance_key(&akey),
+        verified.provenance,
+        Some("application/json"),
+        replace_companions,
+    )
+    .await?;
+
+    if !artifact_present {
+        if dst
+            .put_if_absent(
+                &akey,
+                verified.artifact.clone(),
+                Some("application/octet-stream"),
+            )
+            .await?
+        {
+            state
+                .metrics
+                .record_replicated(verified.artifact.len() as u64);
+        } else {
+            let raced = dst
+                .get_bytes(&akey)
+                .await
+                .with_context(|| format!("verify raced destination artifact {akey}"))?;
+            let raced_sha = sha256_hex(&raced);
+            if raced_sha != sidecar.sha256 {
+                freeze_copy_race(state, src, dst, pkg, filename, &sidecar.sha256, &raced_sha)
+                    .await?;
+                return Ok(());
+            }
+        }
+    }
+
+    // A delete/freeze can race the publish. Reassert precedence after the
+    // complete record lands, then clear obsolete mirror quarantine state only
+    // when private truth remains live.
+    if dst.head_exists(&frozen_key(&akey)).await? {
+        quarantine_bytes(dst, pkg, filename, &verified.artifact).await?;
+        freeze_side(dst, pkg, filename).await?;
+    } else if dst.head_exists(&tombstone_key(&akey)).await? {
+        tombstone_side(dst, pkg, filename).await?;
+    } else {
+        dst.delete_keys(&[mirror_quarantined_key(&akey)]).await?;
+    }
+    worker::mark_dirty(dst, pkg).await?;
+    Ok(())
+}
+
+async fn replace_companion(
+    storage: &dyn Storage,
+    key: &str,
+    bytes: Option<Vec<u8>>,
+    content_type: Option<&str>,
+    replace: bool,
+) -> Result<bool> {
+    let Some(bytes) = bytes else {
+        if replace && storage.head_exists(key).await? {
+            storage.delete_keys(&[key.to_string()]).await?;
+            return Ok(true);
+        }
+        return Ok(false);
+    };
+    if !replace {
+        return put_if_absent_or_verify(storage, key, bytes, content_type).await;
+    }
+    for _ in 0..ORIGIN_ATTEMPTS {
+        match storage.get_with_etag(key).await? {
+            None => {
+                if storage
+                    .put_if_absent(key, bytes.clone(), content_type)
+                    .await?
+                {
+                    return Ok(true);
+                }
+            }
+            Some((current, _)) if current == bytes => return Ok(false),
+            Some((_, etag)) => {
+                if storage
+                    .put_if_match(key, &etag, bytes.clone())
+                    .await?
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    bail!("conditional companion replacement retries exhausted for {key}")
+}
+
 /// Drive `pkg`'s origin claim on `dst` to `private` (dev/MULTIBUCKET.md §6.2):
 /// create-if-absent, CAS the `unclaimed` sentinel, or demote a `mirror` claim —
 /// private is terminal, so a claim already private is a no-op. The one demotion
@@ -1291,17 +1190,14 @@ async fn ensure_private_origin(dst: &dyn Storage, pkg: &str) -> Result<()> {
                     return Ok(());
                 }
             }
-            Some(observed)
-                if observed.state == OriginState::Private
-                    && observed.pending_manifest.is_none() =>
-            {
-                return Ok(())
-            }
-            Some(observed) if observed.pending_manifest.is_some() => {
-                bail!("package '{pkg}' is under staged promotion")
-            }
+            Some(observed) if observed.state == OriginState::Private => return Ok(()),
             Some(observed) if observed.state == OriginState::Mirror => {
-                bail!("package '{pkg}' became mirror-owned; retry through staged private demotion")
+                if crate::origin::demote_observed_mirror(dst, pkg, &observed)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(());
+                }
             }
             Some(observed) if observed.state == OriginState::Unclaimed => {
                 let request = ClaimRequest::new(PRIVATE, Some(&observed));
@@ -1415,10 +1311,10 @@ async fn freeze_side(storage: &dyn Storage, pkg: &str, filename: &str) -> Result
     let marker_created = write_frozen_marker(storage, pkg, filename).await?;
     quarantine(storage, pkg, filename).await?;
     tombstone::write(storage, &akey, filename).await?;
-    // Keep the canonical record occupied behind `.frozen` + `.tombstone`.
-    // Deleting it after the quarantine GET can erase a different body that
-    // won a concurrent CAS. A later pass can quarantine any such replacement;
-    // serving and index rebuilds treat the markers as the visibility fence.
+    // Both durable fences and the quarantine copy precede the destructive
+    // move. A crash leaves either visible markers plus evidence or a complete
+    // settled freeze; a later pass finishes any retained canonical body.
+    drop_record_objects(storage, pkg, filename).await?;
     Ok(marker_created)
 }
 
@@ -1431,6 +1327,13 @@ async fn freeze_copy_race(
     source_sha: &str,
     destination_sha: &str,
 ) -> Result<()> {
+    error!(
+        package = %pkg,
+        filename = %filename,
+        sha_a = %source_sha,
+        sha_b = %destination_sha,
+        "byte conflict raced replication publish — frozen on both buckets"
+    );
     freeze_side(src, pkg, filename).await?;
     freeze_side(dst, pkg, filename).await?;
     worker::mark_dirty(src, pkg).await?;
@@ -1439,13 +1342,6 @@ async fn freeze_copy_race(
         .metrics
         .replication_freezes
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    error!(
-        package = %pkg,
-        filename = %filename,
-        sha_a = %source_sha,
-        sha_b = %destination_sha,
-        "byte conflict raced replication publish — frozen on both buckets"
-    );
     Ok(())
 }
 
@@ -1483,19 +1379,11 @@ async fn drop_record_objects(storage: &dyn Storage, pkg: &str, filename: &str) -
 /// private, yet one or more live artifacts still carry mirror sidecars. Preserve
 /// each body under its actual content hash, then remove the live record without
 /// tombstoning it. The caller rebuilds the package index after a non-zero count.
-async fn quarantine_mirror_artifacts_for(
-    storage: &dyn Storage,
-    pkg: &str,
-    pending_owner: Option<&crate::origin::OriginObservation>,
-) -> Result<usize> {
+pub async fn quarantine_mirror_artifacts(storage: &dyn Storage, pkg: &str) -> Result<usize> {
     let Some(claim) = read_origin_observation(storage, pkg).await? else {
         return Ok(0);
     };
-    let authorized = match pending_owner {
-        Some(expected) => &claim == expected,
-        None => claim.state == OriginState::Private && claim.pending_manifest.is_none(),
-    };
-    if !authorized {
+    if claim.state != OriginState::Private {
         return Ok(0);
     }
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
@@ -1538,1162 +1426,81 @@ async fn quarantine_mirror_artifacts_for(
     Ok(quarantined)
 }
 
-pub async fn quarantine_mirror_artifacts(storage: &dyn Storage, pkg: &str) -> Result<usize> {
-    quarantine_mirror_artifacts_for(storage, pkg, None).await
-}
+// ---------------------------------------------------------------------------
+// Tier 1 — synchronous fan-out (pre-ack).
+// ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-struct StagedEntry {
-    filename: String,
-    #[serde(default)]
-    kind: StagedEntryKind,
-    sha256: String,
-    base: String,
-    /// Destination artifact version observed before the package claim CAS. A
-    /// different version at promotion time is a post-stage writer, never safe
-    /// to classify from an older sidecar read.
-    #[serde(default)]
-    destination_etag: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum StagedEntryKind {
-    #[default]
-    Live,
-    Tombstone,
-    Frozen,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum StagedMode {
-    #[default]
-    Demotion,
-    PrivateRepair,
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-struct CapturedMirrorArtifact {
-    filename: String,
-    etag: String,
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-struct StagedManifest {
-    package: String,
-    #[serde(default)]
-    mode: StagedMode,
-    records: Vec<StagedEntry>,
-    /// Exact pre-CAS mirror bodies absent from the private source. This catches
-    /// crashed/legacy mirror uploads that have no typed sidecar and therefore
-    /// cannot be classified after the package claim becomes private.
-    #[serde(default)]
-    mirror_leftovers: Vec<CapturedMirrorArtifact>,
-    /// Private-side status captured with the staged package. Missing private
-    /// status is represented by the active epoch-zero default, so crash resume
-    /// never has to consult a now-unreachable source bucket.
-    status: StagedStatus,
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-struct StagedStatus {
-    doc: status::ProjectStatusDoc,
-    epoch: u64,
-    /// Exact mirror-local status version observed while staging. Demotion may
-    /// replace only this version: after it changes, the status belongs to the
-    /// now-private history and a stale manifest must never overwrite it.
-    destination_etag: Option<String>,
-}
-
-struct StagedPackage {
-    manifest: StagedManifest,
-    manifest_key: String,
-}
-
-fn staged_key(base: &str, member: &str) -> String {
-    format!("{base}/{member}")
-}
-
-/// Stage every live private record in `src` into `dst`, then write one manifest
-/// as the package-level commit marker. Crash shapes are deliberately boring:
+/// Stream a just-committed private record from the selected bucket to every
+/// other bucket *before* the client ack (dev/MULTIBUCKET.md, "Upload
+/// protocol"). Healthy secondaries are copied concurrently — each via the same
+/// [`replicate_record`] copy protocol as the sweep and full diff (origin claim,
+/// sidecar, companions, then the sha256-verified artifact last) — under one
+/// shared grace deadline measured from the selected write's completion.
 ///
-/// - before the manifest: partial `_staging/repl/` objects are inert;
-/// - after the manifest, before claim CAS: a later sweep can safely CAS once;
-/// - after CAS, during promotion: every staged record is independently
-///   verifiable and idempotent, so the manifest retries the unfinished tail.
-async fn stage_private_package(
-    src: &dyn Storage,
-    dst: &dyn Storage,
-    pkg: &str,
-) -> Result<StagedPackage> {
-    let source_claim = read_origin_observation(src, pkg)
-        .await?
-        .ok_or_else(|| anyhow!("cannot stage '{pkg}' without a source claim"))?;
-    if source_claim.state != OriginState::Private || source_claim.pending_manifest.is_some() {
-        bail!("cannot stage '{pkg}' from a non-private source claim");
-    }
-    let destination_claim = read_origin_observation(dst, pkg)
-        .await?
-        .ok_or_else(|| anyhow!("cannot stage '{pkg}' into a destination without a live claim"))?;
-    if destination_claim.pending_manifest.is_some() {
-        bail!("cannot stage '{pkg}' into a destination under staged promotion");
-    }
-    let mode = match destination_claim.state {
-        OriginState::Mirror => StagedMode::Demotion,
-        OriginState::Private => StagedMode::PrivateRepair,
-        OriginState::Unclaimed => {
-            bail!("cannot stage '{pkg}' into a destination without a live origin claim")
-        }
-    };
-    let source_status = status::read_status_versioned(src, pkg).await?;
-    let destination_status = status::read_status_versioned(dst, pkg).await?;
-    let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
-    let entries = src.list_dir_entries(&prefix).await?;
-    let destination_versions: HashMap<String, String> = dst
-        .list_all(&prefix)
-        .await?
-        .into_iter()
-        .map(|object| (object.key, object.etag))
-        .collect();
-    let names: HashSet<String> = entries
-        .iter()
-        .filter_map(|entry| entry.key.strip_prefix(&prefix).map(str::to_string))
-        .collect();
-    let pkg_origin = Some(Origin::Private);
-    let mut filenames: Vec<String> = candidate_filenames(&names).into_iter().collect();
-    filenames.sort();
-    let mut records = Vec::new();
-    for filename in filenames {
-        let record = record_from_names(src, pkg, &filename, &names, pkg_origin).await?;
-        let destination_etag = destination_versions
-            .get(&artifact_key(pkg, &filename))
-            .cloned();
-        let fence_kind = if record.frozen {
-            Some(StagedEntryKind::Frozen)
-        } else if record.tombstoned {
-            Some(StagedEntryKind::Tombstone)
-        } else {
-            None
-        };
-        if let Some(kind) = fence_kind {
-            let (source_key, label) = match kind {
-                StagedEntryKind::Frozen => (frozen_key(&artifact_key(pkg, &filename)), "frozen"),
-                StagedEntryKind::Tombstone => {
-                    (tombstone_key(&artifact_key(pkg, &filename)), "tombstone")
-                }
-                StagedEntryKind::Live => bail!("live record misclassified as a staged fence"),
-            };
-            let fence = src
-                .get_bytes(&source_key)
-                .await
-                .with_context(|| format!("read staged fence {source_key}"))?;
-            let fence_sha = sha256_hex(&fence);
-            let base = format!("{REPL_STAGING_PREFIX}{pkg}/{filename}@{label}-{fence_sha}");
-            put_if_absent_or_verify(dst, &staged_key(&base, "fence"), fence, json()).await?;
-            records.push(StagedEntry {
-                filename,
-                kind,
-                sha256: fence_sha,
-                base,
-                destination_etag,
-            });
-            continue;
-        }
-        if !matches!(
-            record.state(),
-            RecordState::Live {
-                origin: Origin::Private,
-                ..
-            }
-        ) {
-            continue;
-        }
-        let sidecar = record
-            .sidecar
-            .as_ref()
-            .ok_or_else(|| anyhow!("private stage source has no sidecar for {pkg}/{filename}"))?;
-        let verified = verify_source_record(src, pkg, &filename, &record).await?;
-        let sidecar_bytes = serde_json::to_vec(sidecar)?;
-        let sidecar_sha = sha256_hex(&sidecar_bytes);
-        let base = format!(
-            "{REPL_STAGING_PREFIX}{pkg}/{filename}@{}-{}",
-            sidecar.sha256, sidecar_sha
-        );
-        put_if_absent_or_verify(dst, &staged_key(&base, "sidecar"), sidecar_bytes, json()).await?;
-        if let Some(bytes) = verified.metadata {
-            put_if_absent_or_verify(
-                dst,
-                &staged_key(&base, "metadata"),
-                bytes,
-                Some("text/plain; charset=utf-8"),
-            )
-            .await?;
-        }
-        if let Some(bytes) = verified.provenance {
-            put_if_absent_or_verify(
-                dst,
-                &staged_key(&base, "provenance"),
-                bytes,
-                Some("application/json"),
-            )
-            .await?;
-        }
-        // Artifact last: a stage without it cannot be named by the manifest.
-        put_if_absent_or_verify(
-            dst,
-            &staged_key(&base, "artifact"),
-            verified.artifact,
-            Some("application/octet-stream"),
-        )
-        .await?;
-        records.push(StagedEntry {
-            filename,
-            kind: StagedEntryKind::Live,
-            sha256: sidecar.sha256.clone(),
-            base,
-            destination_etag,
-        });
-    }
-    let (status_doc, status_epoch) = source_status.map_or_else(
-        || (status::ProjectStatusDoc::default(), 0),
-        |status| (status.doc, status.epoch),
-    );
-    let manifest = StagedManifest {
-        package: pkg.to_string(),
-        mode,
-        mirror_leftovers: if mode == StagedMode::Demotion {
-            let staged_names: HashSet<&str> = records
-                .iter()
-                .map(|entry| entry.filename.as_str())
-                .collect();
-            destination_versions
-                .into_iter()
-                .filter_map(|(key, etag)| {
-                    let filename = key.strip_prefix(&prefix)?;
-                    (crate::sidecar::is_artifact(filename) && !staged_names.contains(filename))
-                        .then(|| CapturedMirrorArtifact {
-                            filename: filename.to_string(),
-                            etag,
-                        })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        },
-        records,
-        status: StagedStatus {
-            doc: status_doc,
-            epoch: status_epoch,
-            destination_etag: destination_status.map(|status| status.etag),
-        },
-    };
-    if read_origin_observation(src, pkg).await?.as_ref() != Some(&source_claim)
-        || read_origin_observation(dst, pkg).await?.as_ref() != Some(&destination_claim)
-    {
-        bail!("package '{pkg}' origin changed while staging; inert members retained for retry");
-    }
-    let body = serde_json::to_vec(&manifest)?;
-    let manifest_key = format!(
-        "{REPL_STAGING_PREFIX}{pkg}/manifest@{}.json",
-        sha256_hex(&body)
-    );
-    put_if_absent_or_verify(dst, &manifest_key, body, json()).await?;
-    Ok(StagedPackage {
-        manifest,
-        manifest_key,
-    })
-}
-
-async fn read_optional(storage: &dyn Storage, key: &str) -> Result<Option<Vec<u8>>> {
-    match storage.get_bytes(key).await {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if is_not_found(&e) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-async fn load_staged_record(
-    storage: &dyn Storage,
-    entry: &StagedEntry,
-) -> Result<(Sidecar, VerifiedSource)> {
-    let sidecar_key = staged_key(&entry.base, "sidecar");
-    let sidecar_bytes = storage
-        .get_bytes(&sidecar_key)
-        .await
-        .with_context(|| format!("read staged sidecar {sidecar_key}"))?;
-    let sidecar: Sidecar = serde_json::from_slice(&sidecar_bytes)
-        .with_context(|| format!("parse staged sidecar {sidecar_key}"))?;
-    if sidecar.sha256 != entry.sha256 || sidecar.origin.as_deref() != Some(PRIVATE) {
-        bail!(
-            "staged sidecar does not match manifest for {}",
-            entry.filename
-        );
-    }
-    let artifact_key = staged_key(&entry.base, "artifact");
-    let artifact = storage
-        .get_bytes(&artifact_key)
-        .await
-        .with_context(|| format!("read staged artifact {artifact_key}"))?;
-    let got = sha256_hex(&artifact);
-    if got != entry.sha256 {
-        bail!(
-            "staged artifact sha mismatch for {}: manifest {}, bytes {got}",
-            entry.filename,
-            entry.sha256
-        );
-    }
-    Ok((
-        sidecar,
-        VerifiedSource {
-            artifact,
-            metadata: read_optional(storage, &staged_key(&entry.base, "metadata")).await?,
-            provenance: read_optional(storage, &staged_key(&entry.base, "provenance")).await?,
-        },
-    ))
-}
-
-async fn load_staged_fence(storage: &dyn Storage, entry: &StagedEntry) -> Result<Vec<u8>> {
-    let key = staged_key(&entry.base, "fence");
-    let bytes = storage
-        .get_bytes(&key)
-        .await
-        .with_context(|| format!("read staged fence {key}"))?;
-    let got = sha256_hex(&bytes);
-    if got != entry.sha256 {
-        bail!(
-            "staged fence hash mismatch for {}: manifest {}, bytes {got}",
-            entry.filename,
-            entry.sha256
-        );
-    }
-    Ok(bytes)
-}
-
-/// Replace a small object through create/CAS only. Used after the package claim
-/// is private, when staged private truth is authoritative over mirror metadata.
-async fn put_exact(storage: &dyn Storage, key: &str, bytes: Vec<u8>) -> Result<bool> {
-    for _ in 0..ORIGIN_ATTEMPTS {
-        match storage.get_with_etag(key).await? {
-            None => {
-                if storage.put_if_absent(key, bytes.clone(), None).await? {
-                    return Ok(true);
-                }
-            }
-            Some((current, _)) if current == bytes => return Ok(false),
-            Some((_, etag)) => {
-                if storage
-                    .put_if_match(key, &etag, bytes.clone())
-                    .await?
-                    .is_some()
-                {
-                    return Ok(true);
-                }
-            }
-        }
-    }
-    bail!("conditional replace retries exhausted for {key}")
-}
-
-/// Install a staged private sidecar without regressing yank state written by a
-/// private racer. Mirror metadata is superseded; private metadata is merged by
-/// the same epoch/tie algebra as ordinary reconciliation, under CAS.
-async fn install_staged_sidecar(
-    storage: &dyn Storage,
-    key: &str,
-    staged: &Sidecar,
-    replace_legacy: bool,
-) -> Result<bool> {
-    let staged_bytes = serde_json::to_vec(staged)?;
-    for _ in 0..ORIGIN_ATTEMPTS {
-        match storage.get_with_etag(key).await? {
-            None => {
-                if storage
-                    .put_if_absent(key, staged_bytes.clone(), json())
-                    .await?
-                {
-                    return Ok(true);
-                }
-            }
-            Some((current_bytes, _)) if current_bytes == staged_bytes => return Ok(false),
-            Some((current_bytes, etag)) => {
-                let current: Sidecar = serde_json::from_slice(&current_bytes)
-                    .with_context(|| format!("parse destination sidecar {key}"))?;
-                let private = match current.origin.as_deref() {
-                    Some(PRIVATE) => true,
-                    Some(MIRROR) => false,
-                    None => !replace_legacy,
-                    Some(raw) => bail!("destination sidecar {key} has invalid origin '{raw}'"),
-                };
-                if private && current.sha256 != staged.sha256 {
-                    bail!(
-                        "destination sidecar {key} names sha {}, staged artifact is {}",
-                        current.sha256,
-                        staged.sha256
-                    );
-                }
-                if private && yank_merge(staged, &current) != MergeChoice::A {
-                    return Ok(false);
-                }
-                if storage
-                    .put_if_match(key, &etag, staged_bytes.clone())
-                    .await?
-                    .is_some()
-                {
-                    return Ok(true);
-                }
-            }
-        }
-    }
-    bail!("conditional sidecar merge retries exhausted for {key}")
-}
-
-async fn promote_staged_record(
-    state: &AppState,
-    storage: &dyn Storage,
-    pkg: &str,
-    entry: &StagedEntry,
-) -> Result<bool> {
-    if entry.kind != StagedEntryKind::Live {
-        let fence = load_staged_fence(storage, entry).await?;
-        let akey = artifact_key(pkg, &entry.filename);
-        match entry.kind {
-            StagedEntryKind::Tombstone => {
-                put_if_absent_or_verify(storage, &tombstone_key(&akey), fence, json()).await?;
-                drop_record_objects(storage, pkg, &entry.filename).await?;
-            }
-            StagedEntryKind::Frozen => {
-                put_if_absent_or_verify(storage, &frozen_key(&akey), fence, json()).await?;
-                quarantine(storage, pkg, &entry.filename).await?;
-                tombstone::write(storage, &akey, &entry.filename).await?;
-            }
-            StagedEntryKind::Live => bail!("live staged entry reached fence promotion"),
-        }
-        return Ok(true);
-    }
-    let (sidecar, staged) = load_staged_record(storage, entry).await?;
-    let VerifiedSource {
-        artifact,
-        metadata,
-        provenance,
-    } = staged;
-    let akey = artifact_key(pkg, &entry.filename);
-
-    // A manifest can outlive a later delete/freeze marker. Those states outrank
-    // a stale staged live record and must never be resurrected on retry.
-    if storage.head_exists(&frozen_key(&akey)).await? {
-        quarantine_bytes(storage, pkg, &entry.filename, &artifact).await?;
-        return freeze_side(storage, pkg, &entry.filename).await;
-    }
-    if storage.head_exists(&tombstone_key(&akey)).await? {
-        return tombstone_side(storage, pkg, &entry.filename).await;
-    }
-
-    let current_sidecar = read_optional(storage, &sidecar_key(&akey)).await?;
-    let current_origin = match current_sidecar.as_deref() {
-        Some(bytes) => {
-            let current: Sidecar = serde_json::from_slice(bytes)
-                .with_context(|| format!("parse destination sidecar for {akey}"))?;
-            match current.origin.as_deref() {
-                Some(PRIVATE) => Some(Origin::Private),
-                Some(MIRROR) => Some(Origin::Mirror),
-                None => None,
-                Some(raw) => bail!("destination sidecar for {akey} has invalid origin '{raw}'"),
-            }
-        }
-        None => None,
-    };
-    let replace_local_metadata = current_origin != Some(Origin::Private);
-    let mut changed = false;
-    let mut artifact_present = false;
-    if let Some((bytes, etag)) = storage.get_with_etag(&akey).await? {
-        if sha256_hex(&bytes) == entry.sha256 {
-            artifact_present = true;
-        } else if current_origin == Some(Origin::Private)
-            || entry.destination_etag.as_deref() != Some(etag.as_str())
-        {
-            // A private writer beat this (possibly stale) manifest. Preserve
-            // both committed bodies and suppress the filename. The artifact
-            // etag must be the exact pre-CAS mirror version; a sidecar read by
-            // itself cannot classify a writer that raced after the claim CAS.
-            write_frozen_marker(storage, pkg, &entry.filename).await?;
-            quarantine_bytes(storage, pkg, &entry.filename, &artifact).await?;
-            freeze_side(storage, pkg, &entry.filename).await?;
-            state
-                .metrics
-                .replication_freezes
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            error!(package=%pkg, filename=%entry.filename, "private artifact raced staged package promotion — frozen");
-            return Ok(true);
-        } else {
-            // Preserve the mirror loser, then atomically replace its body. The
-            // live artifact key never disappears, so a one-file package is not
-            // left empty during demotion.
-            quarantine_bytes(storage, pkg, &entry.filename, &bytes).await?;
-            if storage
-                .put_if_match(&akey, &etag, artifact.clone())
-                .await?
-                .is_none()
-            {
-                bail!("mirror artifact changed during staged promotion for {akey}");
-            }
-            state.metrics.record_replicated(artifact.len() as u64);
-            artifact_present = true;
-            changed = true;
-        }
-    }
-
-    // For an absent body, sidecar first and artifact last. Existing package
-    // indexes are not nudged until the complete record is in place.
-    changed |= install_staged_sidecar(
-        storage,
-        &sidecar_key(&akey),
-        &sidecar,
-        replace_local_metadata,
-    )
-    .await?;
-    for (suffix_key, staged_bytes) in [
-        (metadata_key(&akey), metadata),
-        (provenance_key(&akey), provenance),
-    ] {
-        match staged_bytes {
-            Some(bytes) if replace_local_metadata => {
-                changed |= put_exact(storage, &suffix_key, bytes).await?
-            }
-            Some(bytes) => {
-                changed |= put_if_absent_or_verify(storage, &suffix_key, bytes, None).await?
-            }
-            None if replace_local_metadata => {
-                storage.delete_keys(&[suffix_key]).await?;
-                changed = true;
-            }
-            None => {}
-        }
-    }
-    if !artifact_present {
-        if storage
-            .put_if_absent(&akey, artifact.clone(), Some("application/octet-stream"))
-            .await?
-        {
-            state.metrics.record_replicated(artifact.len() as u64);
-            changed = true;
-        } else {
-            let raced = storage.get_bytes(&akey).await?;
-            if sha256_hex(&raced) != entry.sha256 {
-                write_frozen_marker(storage, pkg, &entry.filename).await?;
-                quarantine_bytes(storage, pkg, &entry.filename, &artifact).await?;
-                freeze_side(storage, pkg, &entry.filename).await?;
-                worker::mark_dirty(storage, pkg).await?;
-                state
-                    .metrics
-                    .replication_freezes
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                error!(package=%pkg, filename=%entry.filename, "private artifact raced staged package promotion — frozen");
-                return Ok(true);
-            }
-        }
-    }
-    // A delete/freeze can start after the pre-mutation fence reads. Recheck
-    // after the artifact/sidecar converge so a publisher that crossed that
-    // window leaves only marker-fenced evidence, never newly visible truth.
-    if storage.head_exists(&frozen_key(&akey)).await? {
-        quarantine_bytes(storage, pkg, &entry.filename, &artifact).await?;
-        freeze_side(storage, pkg, &entry.filename).await?;
-        return Ok(true);
-    }
-    if storage.head_exists(&tombstone_key(&akey)).await? {
-        return tombstone_side(storage, pkg, &entry.filename).await;
-    }
-    Ok(changed)
-}
-
-/// Remove one exact mirror body that existed before the package claim CAS but
-/// had no source-private counterpart. The ETag check protects a post-stage
-/// writer. Sidecars are intentionally left inert: a stale mirror writer that
-/// passed its final claim read before demotion may still finish, and its typed
-/// sidecar lets the ordinary late-mirror cleanup identify that body.
-async fn quarantine_captured_mirror_leftover(
-    storage: &dyn Storage,
-    pkg: &str,
-    captured: &CapturedMirrorArtifact,
-) -> Result<bool> {
-    let key = artifact_key(pkg, &captured.filename);
-    let Some((bytes, etag)) = storage.get_with_etag(&key).await? else {
-        return Ok(false);
-    };
-    if etag != captured.etag {
-        return Ok(false);
-    }
-    // The manifest captured this exact artifact version while the package was
-    // mirror-owned. A sidecar backfill that raced the later claim CAS cannot
-    // reclassify those already-captured bytes as private truth.
-    quarantine_mirror_record(storage, pkg, &captured.filename, &bytes).await
-}
-
-async fn promote_staged_package(
-    state: &AppState,
-    storage: &dyn Storage,
-    staged: &StagedPackage,
-    pending: &crate::origin::OriginObservation,
-    lease: &PromotionLease,
-) -> Result<()> {
-    require_replication_unfenced(state)?;
-    let pkg = &staged.manifest.package;
-    require_promotion_execution_owner(storage, pkg, pending, lease).await?;
-    if staged.manifest.mode == StagedMode::Demotion {
-        require_promotion_execution_owner(storage, pkg, pending, lease).await?;
-        rebase_status_after_demotion(storage, pkg, &staged.manifest.status).await?;
-    }
-    for entry in &staged.manifest.records {
-        require_replication_unfenced(state)?;
-        require_promotion_execution_owner(storage, pkg, pending, lease).await?;
-        promote_staged_record(state, storage, pkg, entry).await?;
-    }
-    for leftover in &staged.manifest.mirror_leftovers {
-        require_promotion_execution_owner(storage, pkg, pending, lease).await?;
-        quarantine_captured_mirror_leftover(storage, pkg, leftover).await?;
-    }
-    require_promotion_execution_owner(storage, pkg, pending, lease).await?;
-    quarantine_mirror_artifacts_for(storage, pkg, Some(pending)).await?;
-    // This marker is part of manifest completion, not an optimization. A prior
-    // attempt may have applied every idempotent truth mutation and then failed
-    // here; every retry must reassert the derived-view/global-inventory event.
-    require_promotion_execution_owner(storage, pkg, pending, lease).await?;
-    worker::mark_dirty(storage, pkg).await?;
-    // Keep reads closed until the materialized package view matches the fully
-    // promoted truth. The ordinary dirty marker remains the crash replay and
-    // global-membership/inventory backstop.
-    require_promotion_execution_owner(storage, pkg, pending, lease).await?;
-    worker::rebuild_package_indexes_for_promotion(state, storage, pkg, pending).await?;
-    require_promotion_execution_owner(storage, pkg, pending, lease).await?;
-    Ok(())
-}
-
-async fn require_promotion_execution_owner(
-    storage: &dyn Storage,
-    pkg: &str,
-    expected: &crate::origin::OriginObservation,
-    lease: &PromotionLease,
-) -> Result<()> {
-    lease.require(storage).await?;
-    require_promotion_owner(storage, pkg, expected).await
-}
-
-async fn require_promotion_owner(
-    storage: &dyn Storage,
-    pkg: &str,
-    expected: &crate::origin::OriginObservation,
-) -> Result<()> {
-    if read_origin_observation(storage, pkg).await?.as_ref() == Some(expected) {
-        Ok(())
-    } else {
-        bail!("package '{pkg}' promotion owner changed while applying its manifest")
-    }
-}
-
-/// Acquire the package's CAS-owned promotion barrier, apply one committed
-/// manifest, then release the claim back to ordinary private operation. The
-/// pending manifest lives in `.origin`, so no separately-listed key can race a
-/// writer's final origin fence.
-async fn settle_staged_package(
-    state: &AppState,
-    storage: &dyn Storage,
-    staged: &StagedPackage,
-) -> Result<bool> {
-    settle_staged_package_ignoring(state, storage, staged, None).await
-}
-
-async fn settle_staged_package_ignoring(
-    state: &AppState,
-    storage: &dyn Storage,
-    staged: &StagedPackage,
-    ignored_intent: Option<&str>,
-) -> Result<bool> {
-    let pkg = &staged.manifest.package;
-    let owns_attempt = ignored_intent.is_none();
-    let attempt = match ignored_intent {
-        Some(value) => value.to_string(),
-        None => worker::mark_intent(storage, pkg).await?,
-    };
-    // The durable lock chooses exactly one executor. Losers never enter the
-    // mutual-defer protocol; a crashed holder is stealable only after both its
-    // lock ETag and intent have proved stale for the grace window.
-    let lease = match acquire_promotion_lock(state, storage, staged, &attempt).await {
-        Ok(Some(lease)) => lease,
-        Ok(None) => {
-            if owns_attempt {
-                worker::clear_intent(storage, pkg, &attempt).await?;
-            }
-            return Ok(false);
-        }
-        Err(error) => {
-            if owns_attempt {
-                let _ = worker::clear_intent(storage, pkg, &attempt).await;
-            }
-            return Err(error);
-        }
-    };
-    let operation = settle_staged_package_core(state, storage, staged, &attempt, &lease);
-    let result = run_with_promotion_heartbeat(state, storage, &lease, operation).await;
-    if !owns_attempt {
-        return result;
-    }
-    match result {
-        Ok(value) => {
-            worker::clear_intent(storage, pkg, &attempt).await?;
-            Ok(value)
-        }
-        Err(error) => {
-            // Promotion may have applied a prefix of its idempotent manifest.
-            // Pair the attempt intent so the view worker heals that prefix;
-            // clearing it here would erase the only replay event.
-            let _ = worker::mark_commit(storage, pkg, &attempt).await;
-            Err(error)
-        }
-    }
-}
-
-async fn settle_staged_package_core(
-    state: &AppState,
-    storage: &dyn Storage,
-    staged: &StagedPackage,
-    ignored_intent: &str,
-    lease: &PromotionLease,
-) -> Result<bool> {
-    require_replication_unfenced(state)?;
-    let pkg = &staged.manifest.package;
-    let observed = read_origin_observation(storage, pkg).await?;
-    match observed
-        .as_ref()
-        .and_then(|claim| claim.pending_manifest.as_deref())
-    {
-        Some(owner) if owner != staged.manifest_key => return Ok(false),
-        Some(_) => {
-            // This manifest already owns pending after a prior crash. Its stale
-            // intent recovery below must remain reachable.
-        }
-        None => {
-            wait_for_other_intents(state, storage, pkg, ignored_intent, lease).await?;
-        }
-    }
-    lease.require(storage).await?;
-    let Some(pending) = begin_private_promotion(storage, pkg, &staged.manifest_key).await? else {
-        return Ok(false);
-    };
-    require_replication_unfenced(state)?;
-    // A writer can have started between the first check and the origin CAS. Its
-    // final origin fence now sees pending and refuses truth, but wait for its
-    // intent to close before classifying any existing record. If that writer
-    // crashed, only this exact pending owner can heal the stale intent: normal
-    // rebuilds correctly refuse to cross the barrier.
-    require_promotion_execution_owner(storage, pkg, &pending, lease).await?;
-    let stale = wait_for_other_intents(state, storage, pkg, ignored_intent, lease).await?;
-    if !stale.is_empty() {
-        require_promotion_execution_owner(storage, pkg, &pending, lease).await?;
-        storage.delete_keys(&stale).await?;
-    }
-    require_promotion_execution_owner(storage, pkg, &pending, lease).await?;
-    if worker::has_unpaired_intent_ignoring(storage, pkg, Some(ignored_intent)).await? {
-        bail!("package '{pkg}' acquired a writer during promotion fencing");
-    }
-    promote_staged_package(state, storage, staged, &pending, lease).await?;
-    require_replication_unfenced(state)?;
-    require_promotion_execution_owner(storage, pkg, &pending, lease).await?;
-    if !finish_private_promotion(storage, pkg, &pending).await? {
-        bail!("package '{pkg}' promotion barrier changed before release");
-    }
-    // Delete only this manifest. Stage members are content-addressed and may be
-    // shared by another committed manifest; unreferenced members remain inert.
-    lease.require(storage).await?;
-    storage
-        .delete_keys(std::slice::from_ref(&staged.manifest_key))
-        .await?;
-    Ok(true)
-}
-
-async fn wait_for_other_intents(
-    state: &AppState,
-    storage: &dyn Storage,
-    pkg: &str,
-    own_intent: &str,
-    lease: &PromotionLease,
-) -> Result<Vec<String>> {
-    // A competing promotion attempt cannot hold this lock and will pair its
-    // intent immediately. Real writers get the configured slow-upload grace;
-    // after pending is acquired no new request mutation can cross its final
-    // claim fence.
-    let deadline = tokio::time::Instant::now()
-        + intent_grace_std(state).max(std::time::Duration::from_secs(1));
-    loop {
-        lease.require(storage).await?;
-        if let Some(stale) =
-            worker::stale_unpaired_intents_ignoring(state, storage, pkg, Some(own_intent)).await?
-        {
-            return Ok(stale);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("package '{pkg}' still has an active writer; staged promotion deferred");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
-
-async fn stage_demote_and_promote_ignoring(
-    state: &AppState,
-    private: &dyn Storage,
-    mirror: &dyn Storage,
-    pkg: &str,
-    ignored_intent: Option<&str>,
-) -> Result<()> {
-    require_replication_unfenced(state)?;
-    let staged = stage_private_package(private, mirror, pkg).await?;
-    if settle_staged_package_ignoring(state, mirror, &staged, ignored_intent).await? {
-        Ok(())
-    } else {
-        bail!("another committed manifest currently owns package '{pkg}'")
-    }
-}
-
-/// Replace mirror-world status with the source's private event. Tagged mirror
-/// writes are replaceable even when they land after staging; tagged private
-/// writes are acknowledged post-demotion history and always survive a stale
-/// manifest. Legacy untagged bodies retain the exact captured-ETag rule.
-async fn rebase_status_after_demotion(
-    destination: &dyn Storage,
-    pkg: &str,
-    authoritative: &StagedStatus,
-) -> Result<()> {
-    for _ in 0..ORIGIN_ATTEMPTS {
-        let current = status::read_status_versioned(destination, pkg).await?;
-        let current_etag = current.as_ref().map(|status| status.etag.as_str());
-        match current.as_ref().and_then(|status| status.origin) {
-            Some(status::StatusOrigin::Private) => return Ok(()),
-            Some(status::StatusOrigin::Mirror) => {}
-            None if current_etag == authoritative.destination_etag.as_deref() => {}
-            None => return Ok(()),
-        }
-        if current.is_none()
-            && authoritative.epoch == 0
-            && authoritative.doc == status::ProjectStatusDoc::default()
-        {
-            return Ok(());
-        }
-        if status::put_status_if_version(
-            destination,
-            pkg,
-            current_etag,
-            &authoritative.doc,
-            authoritative.epoch,
-            Some(status::StatusOrigin::Private),
-        )
-        .await?
-        {
-            worker::mark_dirty(destination, pkg).await?;
-            return Ok(());
-        }
-    }
-    bail!("status demotion retries exhausted for '{pkg}'")
-}
-
-/// Repair mirror sidecars that finished after the package claim was already
-/// private (the narrow proxy pre-put fence race). Stage the complete private
-/// package before replacing/quarantining any local mirror record, exactly like
-/// ordinary claim demotion but without another claim transition.
-async fn stage_private_over_local_mirror_ignoring(
-    state: &AppState,
-    private: &dyn Storage,
-    destination: &dyn Storage,
-    pkg: &str,
-    ignored_intent: Option<&str>,
-) -> Result<()> {
-    require_replication_unfenced(state)?;
-    let staged = stage_private_package(private, destination, pkg).await?;
-    if settle_staged_package_ignoring(state, destination, &staged, ignored_intent).await? {
-        Ok(())
-    } else {
-        bail!("another committed manifest currently owns package '{pkg}'")
-    }
-}
-
-async fn resume_staged_packages_in(state: &AppState, storage: &dyn Storage) -> Result<()> {
-    let objects = storage.list_all(REPL_STAGING_PREFIX).await?;
-    let manifests: Vec<String> = objects
-        .into_iter()
-        .map(|object| object.key)
-        .filter(|key| {
-            key.rsplit('/')
-                .next()
-                .is_some_and(|name| name.starts_with("manifest@"))
-        })
-        .collect();
-    let live_locks: HashSet<String> = manifests
-        .iter()
-        .filter_map(|manifest| {
-            let rest = manifest.strip_prefix(REPL_STAGING_PREFIX)?;
-            let (pkg, name) = rest.split_once('/')?;
-            name.starts_with("manifest@")
-                .then(|| promotion_lock_key(pkg))
-        })
-        .collect();
-    let storage_id = storage_identity(storage);
-    state
-        .promotion_lock_observations
-        .lock()
-        .await
-        .retain(|(observed_storage, key), _| {
-            *observed_storage != storage_id || live_locks.contains(key)
-        });
-    let mut failures = Vec::new();
-    for manifest_key in manifests {
-        let result: Result<()> = async {
-            require_replication_unfenced(state)?;
-            let bytes = storage.get_bytes(&manifest_key).await?;
-            let manifest: StagedManifest = serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse replication stage manifest {manifest_key}"))?;
-            let staged = StagedPackage {
-                manifest,
-                manifest_key: manifest_key.clone(),
-            };
-            settle_staged_package(state, storage, &staged).await?;
-            Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            failures.push(format!("{manifest_key}: {error:#}"));
-        }
-    }
-    if !failures.is_empty() {
-        bail!("staged manifest recovery failed: {}", failures.join("; "));
-    }
-    Ok(())
-}
-
-pub(crate) async fn has_committed_stage(storage: &dyn Storage, pkg: &str) -> Result<bool> {
-    let prefix = format!("{REPL_STAGING_PREFIX}{pkg}/");
-    Ok(storage.list_all(&prefix).await?.iter().any(|object| {
-        object
-            .key
-            .strip_prefix(&prefix)
-            .is_some_and(|name| name.starts_with("manifest@"))
-    }))
-}
-
-/// Resume any committed stage for one package. Marker retries use this narrow
-/// form so a crash after claim CAS does not wait for the next global sweep.
-async fn resume_staged_package(state: &AppState, storage: &dyn Storage, pkg: &str) -> Result<bool> {
-    let prefix = format!("{REPL_STAGING_PREFIX}{pkg}/");
-    let objects = storage.list_all(&prefix).await?;
-    let manifests: Vec<String> = objects
-        .into_iter()
-        .map(|object| object.key)
-        .filter(|key| {
-            key.rsplit('/')
-                .next()
-                .is_some_and(|name| name.starts_with("manifest@"))
-        })
-        .collect();
-    let found = !manifests.is_empty();
-    let mut failures = Vec::new();
-    for manifest_key in manifests {
-        let result: Result<()> = async {
-            require_replication_unfenced(state)?;
-            let bytes = storage.get_bytes(&manifest_key).await?;
-            let manifest: StagedManifest = serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse replication stage manifest {manifest_key}"))?;
-            if manifest.package != pkg {
-                bail!(
-                    "replication stage manifest {manifest_key} names package '{}' instead of '{pkg}'",
-                    manifest.package
-                );
-            }
-            let staged = StagedPackage {
-                manifest,
-                manifest_key: manifest_key.clone(),
-            };
-            settle_staged_package(state, storage, &staged).await?;
-            Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            failures.push(format!("{manifest_key}: {error:#}"));
-        }
-    }
-    if !failures.is_empty() {
-        bail!(
-            "staged package recovery failed for '{pkg}': {}",
-            failures.join("; ")
-        );
-    }
-    Ok(found)
-}
-
-async fn resume_pending_staged_package(
-    state: &AppState,
-    storage: &dyn Storage,
-    pkg: &str,
-) -> Result<bool> {
-    let pending = read_origin_observation(storage, pkg)
-        .await?
-        .and_then(|value| value.pending_manifest)
-        .is_some();
-    if pending {
-        resume_staged_package(state, storage, pkg).await
-    } else {
-        Ok(false)
-    }
-}
-
-pub async fn resume_staged_packages(state: &AppState) -> Result<()> {
-    let mut failures = Vec::new();
-    let jobs = state
-        .buckets
-        .handles()
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| bucket_eligible(state, *idx))
-        .map(|(idx, handle)| async move {
-            let result = tokio::select! {
-                result = resume_staged_packages_in(state, handle.storage.as_ref()) => result,
-                _ = wait_until_bucket_ineligible(state, idx) => {
-                    Err(anyhow!("bucket became topology-ineligible during stage recovery"))
-                }
-            };
-            (idx, result)
-        });
-    for (idx, result) in futures::future::join_all(jobs).await {
-        if let Err(e) = result {
-            failures.push(format!("bucket {idx}: {e:#}"));
-        }
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        bail!("staged package recovery failed: {}", failures.join("; "))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tier 1 — eager fan-out (post-ack).
-// ---------------------------------------------------------------------------
-
-/// Durable todo markers queued on the bucket that accepted a mutation. The
-/// request path creates these before acknowledging the client, then hands the
-/// token to [`spawn_eager_with_markers`], which removes each marker only after
-/// that destination has converged.
-#[derive(Default)]
-pub struct FanoutMarkers {
-    by_destination: HashMap<usize, String>,
-}
-
-/// Queue one durable marker per other configured bucket. A single-bucket node
-/// returns immediately without storage I/O. The caller decides how a queueing
-/// failure affects its response; any successfully-written partial set remains
-/// visible to the normal all-bucket sweeper.
-pub async fn queue_fanout_markers(
-    state: &AppState,
-    pinned: &Pinned,
-    pkg: &str,
-    filename: &str,
-) -> Result<FanoutMarkers> {
-    if !state.buckets.is_multi() {
-        return Ok(FanoutMarkers::default());
-    }
-    require_replication_unfenced(state)?;
-    let mut markers = FanoutMarkers::default();
-    for (idx, _) in state.buckets.handles().iter().enumerate() {
-        if idx == pinned.index {
-            continue;
-        }
-        let key = tokio::select! {
-            result = write_marker(pinned.storage.as_ref(), idx, pkg, filename) => result?,
-            _ = wait_until_bucket_ineligible(state, pinned.index) => {
-                bail!("selected bucket became ineligible while queueing replication markers")
-            }
-        };
-        markers.by_destination.insert(idx, key);
-    }
-    Ok(markers)
-}
-
-/// Kick eager fan-out for a mutation whose durable markers were already queued
-/// by [`queue_fanout_markers`]. Successful destinations consume their exact
-/// nonce-bearing marker; failures leave it for the sweeper.
-pub fn spawn_eager_with_markers(
-    state: &Arc<AppState>,
-    pinned: &Pinned,
-    pkg: String,
-    filename: String,
-    markers: FanoutMarkers,
-) {
+/// A secondary that fails, exceeds the grace deadline, becomes topology-
+/// ineligible mid-copy, or is already ineligible (so no copy is attempted) gets
+/// a durable `_repl/<dest>/…` note in the selected bucket before this returns.
+/// Notes are the failure path only: a healthy fleet acks with every bucket
+/// holding the record and no note written. A single-bucket node does no I/O.
+pub async fn fanout_sync(state: &AppState, pinned: &Pinned, pkg: &str, filename: &str) {
     if !state.buckets.is_multi() {
         return;
     }
-    let state = state.clone();
-    let src = pinned.storage.clone();
+    let src = pinned.storage.as_ref();
     let src_index = pinned.index;
-    tokio::spawn(async move {
-        eager_fanout(&state, src.as_ref(), src_index, &pkg, &filename, markers).await;
-    });
-}
+    // A fenced topology or an ineligible selected bucket cannot safely copy;
+    // every peer then gets a note so the eventual heal drains it. Health probes
+    // and topology verification are the only writers past this gate.
+    let can_copy = require_replication_unfenced(state).is_ok() && bucket_eligible(state, src_index);
+    let deadline = tokio::time::Instant::now() + state.fanout_grace;
 
-async fn eager_fanout(
-    state: &AppState,
-    src: &dyn Storage,
-    src_index: usize,
-    pkg: &str,
-    filename: &str,
-    mut markers: FanoutMarkers,
-) {
-    if let Err(error) = require_replication_unfenced(state) {
-        warn!(package=%pkg, filename=%filename, error=?error, "eager replication fenced; markers retained");
-        return;
-    }
-    if !bucket_eligible(state, src_index) {
-        warn!(package=%pkg, filename=%filename, source=src_index, "eager replication source is not topology-eligible; markers retained");
-        return;
-    }
     let jobs = state
         .buckets
         .handles()
         .iter()
         .enumerate()
-        .filter(|(idx, _)| *idx != src_index && bucket_eligible(state, *idx))
+        .filter(|(idx, _)| *idx != src_index)
         .map(|(idx, handle)| {
-            let marker = markers.by_destination.remove(&idx);
+            let attempt = can_copy && bucket_eligible(state, idx);
             async move {
+                if !attempt {
+                    return (idx, false);
+                }
                 let result = tokio::select! {
                     result = replicate_record(state, src, handle.storage.as_ref(), pkg, filename) => result,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        Err(anyhow!("fan-out to {} exceeded the grace deadline", handle.name))
+                    }
                     _ = wait_until_pair_ineligible(state, src_index, idx) => {
                         Err(anyhow!("source or destination became topology-ineligible"))
                     }
                 };
                 match result {
-                    Ok(()) => {
-                        if let Some(key) = marker {
-                            if let Err(e) = src.delete_keys(&[key]).await {
-                                warn!(dest=%handle.name, package=%pkg, filename=%filename, error=?e, "eager replication succeeded but its marker could not be consumed");
-                            }
-                        }
-                    }
+                    Ok(()) => (idx, true),
                     Err(e) => {
-                        warn!(dest=%handle.name, package=%pkg, filename=%filename, error=?e, "eager replication failed; leaving a marker for the sweep");
-                        if marker.is_none() {
-                            if let Err(e2) = write_marker(src, idx, pkg, filename).await {
-                                error!(dest=%handle.name, error=?e2, "could not write replication marker");
-                            }
-                        }
+                        warn!(dest=%handle.name, package=%pkg, filename=%filename, error=?e, "synchronous fan-out failed; leaving a repair note");
+                        (idx, false)
                     }
                 }
             }
         });
-    // Start every destination before awaiting any of them. A blackholed middle
-    // bucket may retain its marker, but cannot delay a healthy later bucket.
-    futures::future::join_all(jobs).await;
+    // Start every destination before awaiting any of them, so a blackholed
+    // middle bucket cannot delay a healthy later one (both are still bounded by
+    // the shared deadline). Then write one durable note per bucket that did not
+    // converge, before the caller acks.
+    for (idx, converged) in futures::future::join_all(jobs).await {
+        if converged {
+            continue;
+        }
+        if let Err(e) = write_marker(src, idx, pkg, filename).await {
+            error!(dest=idx, package=%pkg, filename=%filename, error=?e, "could not write replication repair note before ack");
+        }
+    }
 }
 
 /// Replicate one record from `src` into `dst` (tiers 1 and 2). Reads both
-/// sides, decides, and applies — the same merge that reconcile runs, so a byte
-/// conflict at the destination freezes rather than clobbers.
+/// sides, decides, and applies — the same merge that reconcile runs, so an
+/// ordered byte conflict quarantines the loser and an ambiguous one freezes.
 async fn replicate_record(
     state: &AppState,
     src: &dyn Storage,
@@ -2702,83 +1509,47 @@ async fn replicate_record(
     filename: &str,
 ) -> Result<()> {
     require_replication_unfenced(state)?;
-    // A complete stage may survive a crash immediately before or after the
-    // package claim CAS. Consume it before looking at per-file state; otherwise
-    // private/private claims with an old mirror sidecar would reach the
-    // deliberately-disabled per-file supersede path.
-    resume_pending_staged_package(state, src, pkg).await?;
-    resume_pending_staged_package(state, dst, pkg).await?;
-    let intents = acquire_replication_intents(src, dst, pkg).await?;
-    let operation = async {
-        let mut src_origin = read_pkg_origin(src, pkg).await?;
-        let mut dst_origin = read_pkg_origin(dst, pkg).await?;
-        match (src_origin, dst_origin) {
-            (Some(Origin::Private), Some(Origin::Mirror)) => {
-                stage_demote_and_promote_ignoring(state, src, dst, pkg, Some(&intents.right))
-                    .await?;
-                dst_origin = Some(Origin::Private);
+    let mut src_origin = read_pkg_origin(src, pkg).await?;
+    let mut dst_origin = read_pkg_origin(dst, pkg).await?;
+    match (src_origin, dst_origin) {
+        (Some(Origin::Private), Some(Origin::Mirror)) => {
+            ensure_private_origin(dst, pkg).await?;
+            if quarantine_mirror_artifacts(dst, pkg).await? > 0 {
+                worker::mark_dirty(dst, pkg).await?;
             }
-            (Some(Origin::Mirror), Some(Origin::Private)) => {
-                stage_demote_and_promote_ignoring(state, dst, src, pkg, Some(&intents.left))
-                    .await?;
-                src_origin = Some(Origin::Private);
-            }
-            (Some(Origin::Private), None) => {
-                ensure_private_origin(dst, pkg).await?;
-                dst_origin = Some(Origin::Private);
-            }
-            (None, Some(Origin::Private)) => {
-                ensure_private_origin(src, pkg).await?;
-                src_origin = Some(Origin::Private);
-            }
-            _ => {}
+            dst_origin = Some(Origin::Private);
         }
-
-        if filename == ORIGIN_MARKER {
-            return Ok(());
-        }
-        if filename == PROJECT_STATUS_MARKER {
-            if src_origin == Some(Origin::Private) || dst_origin == Some(Origin::Private) {
-                reconcile_project_status(src, dst, pkg).await?;
+        (Some(Origin::Mirror), Some(Origin::Private)) => {
+            ensure_private_origin(src, pkg).await?;
+            if quarantine_mirror_artifacts(src, pkg).await? > 0 {
+                worker::mark_dirty(src, pkg).await?;
             }
-            return Ok(());
+            src_origin = Some(Origin::Private);
         }
-        let a = read_record(src, pkg, filename).await?;
-        let b = read_record(dst, pkg, filename).await?;
-        let verdict = decide(&a, &b);
-        match verdict {
-            Verdict::Supersede(Side::A) => {
-                return stage_private_over_local_mirror_ignoring(
-                    state,
-                    src,
-                    dst,
-                    pkg,
-                    Some(&intents.right),
-                )
-                .await
-            }
-            Verdict::Supersede(Side::B) => {
-                return stage_private_over_local_mirror_ignoring(
-                    state,
-                    dst,
-                    src,
-                    pkg,
-                    Some(&intents.left),
-                )
-                .await
-            }
-            _ => {}
+        (Some(Origin::Private), None) => {
+            ensure_private_origin(dst, pkg).await?;
+            dst_origin = Some(Origin::Private);
         }
-        execute(state, (src, dst), pkg, filename, (&a, &b), verdict).await
-    };
-    let result = run_with_replication_heartbeats(state, src, dst, pkg, &intents, operation).await;
-    match result {
-        Ok(()) => release_replication_intents(src, dst, pkg, &intents).await,
-        Err(error) => {
-            commit_replication_intents(src, dst, pkg, &intents).await;
-            Err(error)
+        (None, Some(Origin::Private)) => {
+            ensure_private_origin(src, pkg).await?;
+            src_origin = Some(Origin::Private);
         }
+        _ => {}
     }
+
+    if filename == ORIGIN_MARKER {
+        return Ok(());
+    }
+    if filename == PROJECT_STATUS_MARKER {
+        if src_origin == Some(Origin::Private) || dst_origin == Some(Origin::Private) {
+            reconcile_project_status(src, dst, pkg).await?;
+        }
+        return Ok(());
+    }
+    let a = read_record(src, pkg, filename).await?;
+    let b = read_record(dst, pkg, filename).await?;
+    let verdict = decide(&a, &b);
+    execute(state, (src, dst), pkg, filename, (&a, &b), verdict).await
 }
 
 async fn normalize_mirror_status_under_private_claim(
@@ -2788,7 +1559,7 @@ async fn normalize_mirror_status_under_private_claim(
     let Some(claim) = read_origin_observation(storage, pkg).await? else {
         return Ok(false);
     };
-    if claim.state != OriginState::Private || claim.pending_manifest.is_some() {
+    if claim.state != OriginState::Private {
         return Ok(false);
     }
     let Some(initial_status) = status::read_status_versioned(storage, pkg).await? else {
@@ -2798,10 +1569,8 @@ async fn normalize_mirror_status_under_private_claim(
         return Ok(false);
     }
 
-    // Join the same package-intent protocol as request writers. If promotion
-    // starts first, the exact claim re-read below sees pending and we defer. If
-    // this intent starts first, both promotion checks retain the staged barrier
-    // until the status CAS is complete.
+    // Join the same base package-intent protocol as request writers. The exact
+    // claim re-read below keeps a concurrent owner transition fail-closed.
     let nonce = worker::mark_intent(storage, pkg).await?;
     let result: Result<bool> = async {
         if read_origin_observation(storage, pkg).await?.as_ref() != Some(&claim) {
@@ -2933,6 +1702,15 @@ pub async fn sweep_all_markers(state: &AppState) -> Result<()> {
     }
 }
 
+/// Whether a bucket holds any undrained `_repl/` repair note. A bounded
+/// existence check (one paged LIST capped at a single key), not a count: used by
+/// `buckets migrate` to refuse shrinking/reordering the topology while a repair
+/// note — potentially the sole copy of a record not yet replicated — is still
+/// stranded (dev/MULTIBUCKET.md §Kept from v1).
+pub async fn has_undrained_repl_notes(storage: &dyn Storage) -> Result<bool> {
+    Ok(!storage.list_page(REPL_PREFIX, None, 1).await?.is_empty())
+}
+
 fn publish_marker_backlog(state: &AppState, total: &HashMap<usize, u64>) {
     for (idx, handle) in state.buckets.handles().iter().enumerate() {
         state
@@ -2962,78 +1740,96 @@ async fn wait_until_pair_ineligible(state: &AppState, src: usize, dst: usize) {
 async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<HashMap<usize, u64>> {
     let handles = state.buckets.handles();
     let src = handles[src_index].storage.clone();
-    let markers = tokio::select! {
-        result = src.list_all(REPL_PREFIX) => result?,
-        _ = wait_until_bucket_ineligible(state, src_index) => {
-            bail!("source bucket {src_index} became ineligible during marker listing")
-        }
-    };
-    let mut by_destination: HashMap<usize, Vec<ReplMarker>> = HashMap::new();
-    for meta in markers {
-        let Some(marker) = parse_marker(&meta.key) else {
-            continue;
+    let mut remaining: HashMap<usize, u64> = HashMap::new();
+    let mut after: Option<String> = None;
+    // Page the `_repl/` tree so an arbitrarily large failure backlog is never
+    // materialized in one Vec (v1 review finding). Each bounded page is fully
+    // delivered before the next is listed; a page shorter than the cap is the
+    // tail. Consumed markers are deleted, but the key cursor advances by the
+    // page's last key, so retained (failed) markers are simply revisited next
+    // sweep rather than re-listed this pass.
+    loop {
+        let page = tokio::select! {
+            result = src.list_page(REPL_PREFIX, after.as_deref(), REPL_SWEEP_PAGE) => result?,
+            _ = wait_until_bucket_ineligible(state, src_index) => {
+                bail!("source bucket {src_index} became ineligible during marker listing")
+            }
         };
-        if handles.get(marker.dest).is_none() {
-            // Destination no longer configured — the marker cannot be
-            // delivered; drop it rather than retry forever.
-            let _ = src.delete_keys(&[marker.key]).await;
-            continue;
+        if page.is_empty() {
+            break;
         }
-        by_destination.entry(marker.dest).or_default().push(marker);
-    }
-    // Each destination owns its own 16-wide lane. A large blackholed-B prefix
-    // cannot consume every slot and prevent a later healthy-C marker starting.
-    let outcomes = futures::stream::iter(by_destination)
-        .map(|(dest_index, markers)| {
-            let src = src.clone();
-            async move {
-                if !bucket_eligible(state, dest_index) {
-                    return (dest_index, markers.len() as u64);
-                }
-                let dst = &handles[dest_index];
-                let results = futures::stream::iter(markers)
-                    .map(|marker| {
-                        let src = src.clone();
-                        async move {
-                            let result = tokio::select! {
-                                result = replicate_record(
-                                    state,
-                                    src.as_ref(),
-                                    dst.storage.as_ref(),
-                                    &marker.pkg,
-                                    &marker.filename,
-                                ) => result,
-                                _ = wait_until_pair_ineligible(state, src_index, dest_index) => {
-                                    Err(anyhow!("source or destination became topology-ineligible"))
-                                }
-                            };
-                            match result {
-                                Ok(()) => {
-                                    if let Err(e) = src.delete_keys(&[marker.key]).await {
-                                        warn!(dest=%dst.name, package=%marker.pkg, filename=%marker.filename, error=?e, "replication succeeded but marker could not be consumed");
-                                        return true;
+        let page_len = page.len();
+        after = page.last().map(|meta| meta.key.clone());
+
+        let mut by_destination: HashMap<usize, Vec<ReplMarker>> = HashMap::new();
+        for meta in &page {
+            let Some(marker) = parse_marker(&meta.key) else {
+                continue;
+            };
+            if handles.get(marker.dest).is_none() {
+                // Destination no longer configured — the marker cannot be
+                // delivered; drop it rather than retry forever.
+                let _ = src.delete_keys(&[marker.key]).await;
+                continue;
+            }
+            by_destination.entry(marker.dest).or_default().push(marker);
+        }
+        // Each destination owns its own 16-wide lane. A large blackholed-B prefix
+        // cannot consume every slot and prevent a later healthy-C marker starting.
+        let outcomes = futures::stream::iter(by_destination)
+            .map(|(dest_index, markers)| {
+                let src = src.clone();
+                async move {
+                    if !bucket_eligible(state, dest_index) {
+                        return (dest_index, markers.len() as u64);
+                    }
+                    let dst = &handles[dest_index];
+                    let results = futures::stream::iter(markers)
+                        .map(|marker| {
+                            let src = src.clone();
+                            async move {
+                                let result = tokio::select! {
+                                    result = replicate_record(
+                                        state,
+                                        src.as_ref(),
+                                        dst.storage.as_ref(),
+                                        &marker.pkg,
+                                        &marker.filename,
+                                    ) => result,
+                                    _ = wait_until_pair_ineligible(state, src_index, dest_index) => {
+                                        Err(anyhow!("source or destination became topology-ineligible"))
                                     }
-                                    false
-                                }
-                                Err(e) => {
-                                    warn!(dest=%dst.name, package=%marker.pkg, filename=%marker.filename, error=?e, "replication marker retry failed; retained");
-                                    true
+                                };
+                                match result {
+                                    Ok(()) => {
+                                        if let Err(e) = src.delete_keys(&[marker.key]).await {
+                                            warn!(dest=%dst.name, package=%marker.pkg, filename=%marker.filename, error=?e, "replication succeeded but marker could not be consumed");
+                                            return true;
+                                        }
+                                        false
+                                    }
+                                    Err(e) => {
+                                        warn!(dest=%dst.name, package=%marker.pkg, filename=%marker.filename, error=?e, "replication marker retry failed; retained");
+                                        true
+                                    }
                                 }
                             }
-                        }
-                    })
-                    .buffer_unordered(16)
-                    .collect::<Vec<_>>()
-                    .await;
-                (dest_index, results.into_iter().filter(|pending| *pending).count() as u64)
-            }
-        })
-        .buffer_unordered(handles.len().max(1))
-        .collect::<Vec<_>>()
-        .await;
-    let mut remaining: HashMap<usize, u64> = HashMap::new();
-    for (dest, count) in outcomes {
-        remaining.insert(dest, count);
+                        })
+                        .buffer_unordered(16)
+                        .collect::<Vec<_>>()
+                        .await;
+                    (dest_index, results.into_iter().filter(|pending| *pending).count() as u64)
+                }
+            })
+            .buffer_unordered(handles.len().max(1))
+            .collect::<Vec<_>>()
+            .await;
+        for (dest, count) in outcomes {
+            *remaining.entry(dest).or_default() += count;
+        }
+        if page_len < REPL_SWEEP_PAGE {
+            break;
+        }
     }
     Ok(remaining)
 }
@@ -3090,20 +1886,73 @@ pub async fn reconcile(state: &AppState, pinned: &Pinned) -> Result<()> {
     Ok(())
 }
 
-/// Group a flat `packages/` listing into `pkg -> {member filenames}` (the last
-/// path segment under `packages/<pkg>/`).
-fn group_by_pkg(objs: &[ObjectMeta]) -> HashMap<String, HashSet<String>> {
-    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
-    for obj in objs {
-        if let Some(rest) = obj.key.strip_prefix(PACKAGES_PREFIX) {
-            if let Some((pkg, member)) = rest.split_once('/') {
-                map.entry(pkg.to_string())
-                    .or_default()
-                    .insert(member.to_string());
-            }
+/// A bounded, in-order scan of the distinct package names under `packages/` on
+/// one bucket. Pages the flat listing (one S3 page resident at a time) and
+/// yields each package name once, in ascending order — never materializing the
+/// whole tree (v1 review finding). Two of these are merged by the reconcile diff.
+struct PackageScan<'a> {
+    storage: &'a dyn Storage,
+    after: Option<String>,
+    buf: std::collections::VecDeque<String>,
+    /// Last name emitted, to dedup a package whose file keys straddle a page
+    /// boundary (all of a package's keys are contiguous in sorted order).
+    last_emitted: Option<String>,
+    done: bool,
+}
+
+impl<'a> PackageScan<'a> {
+    fn new(storage: &'a dyn Storage) -> Self {
+        Self {
+            storage,
+            after: None,
+            buf: std::collections::VecDeque::new(),
+            last_emitted: None,
+            done: false,
         }
     }
-    map
+
+    /// Pull pages until at least one new package name is buffered or the tree is
+    /// exhausted. A page that adds no name (a package larger than one page)
+    /// simply advances the cursor and fetches the next.
+    async fn fill(&mut self) -> Result<()> {
+        while self.buf.is_empty() && !self.done {
+            let page = self
+                .storage
+                .list_page(PACKAGES_PREFIX, self.after.as_deref(), RECONCILE_SCAN_PAGE)
+                .await?;
+            if page.is_empty() {
+                self.done = true;
+                break;
+            }
+            let full = page.len() >= RECONCILE_SCAN_PAGE;
+            self.after = page.last().map(|obj| obj.key.clone());
+            for obj in &page {
+                if let Some((name, _)) = obj
+                    .key
+                    .strip_prefix(PACKAGES_PREFIX)
+                    .and_then(|rest| rest.split_once('/'))
+                {
+                    if self.last_emitted.as_deref() != Some(name) {
+                        self.buf.push_back(name.to_string());
+                        self.last_emitted = Some(name.to_string());
+                    }
+                }
+            }
+            if !full {
+                self.done = true;
+            }
+        }
+        Ok(())
+    }
+
+    async fn peek(&mut self) -> Result<Option<&str>> {
+        self.fill().await?;
+        Ok(self.buf.front().map(String::as_str))
+    }
+
+    fn advance(&mut self) {
+        self.buf.pop_front();
+    }
 }
 
 /// The distinct base filenames a package's member set implies — every artifact,
@@ -3134,157 +1983,43 @@ async fn package_member_names(storage: &dyn Storage, pkg: &str) -> Result<HashSe
 }
 
 /// Diff two buckets' private truth and converge them through the merge rules.
+/// Both `packages/` trees are walked page by page and merged by package name, so
+/// neither full listing is ever resident (v1 review finding); every package on
+/// either side is converged exactly once, in sorted order.
 async fn diff_pair(state: &AppState, a: &dyn Storage, b: &dyn Storage) -> Result<()> {
-    let (a_objs, b_objs) =
-        futures::future::try_join(a.list_all(PACKAGES_PREFIX), b.list_all(PACKAGES_PREFIX)).await?;
-    let a_map = group_by_pkg(&a_objs);
-    let b_map = group_by_pkg(&b_objs);
-    let pkgs: BTreeSet<&String> = a_map.keys().chain(b_map.keys()).collect();
+    let mut scan_a = PackageScan::new(a);
+    let mut scan_b = PackageScan::new(b);
     let mut failures = Vec::new();
-    for pkg in pkgs {
-        let result: Result<()> = async {
-            require_replication_unfenced(state)?;
-            // A pending `.origin` claim is a package-wide promotion barrier.
-            // Finish any committed stage before the ordinary pairwise algebra
-            // looks at the package's transient record set.
-            resume_pending_staged_package(state, a, pkg).await?;
-            resume_pending_staged_package(state, b, pkg).await?;
-            let intents = acquire_replication_intents(a, b, pkg).await?;
-            let locked_operation = async {
-                // Re-list only after both package intents are durable. The flat
-                // scan that discovered the package predates this fence.
-                let mut a_names = package_member_names(a, pkg).await?;
-                let mut b_names = package_member_names(b, pkg).await?;
-
-                let mut a_origin = read_pkg_origin(a, pkg).await?;
-                let mut b_origin = read_pkg_origin(b, pkg).await?;
-                match (a_origin, b_origin) {
-                    (Some(Origin::Private), Some(Origin::Mirror)) => {
-                        stage_demote_and_promote_ignoring(state, a, b, pkg, Some(&intents.right))
-                            .await?;
-                        b_names = package_member_names(b, pkg).await?;
-                        b_origin = Some(Origin::Private);
-                    }
-                    (Some(Origin::Mirror), Some(Origin::Private)) => {
-                        stage_demote_and_promote_ignoring(state, b, a, pkg, Some(&intents.left))
-                            .await?;
-                        a_names = package_member_names(a, pkg).await?;
-                        a_origin = Some(Origin::Private);
-                    }
-                    (Some(Origin::Private), None) => {
-                        ensure_private_origin(b, pkg).await?;
-                        b_origin = Some(Origin::Private);
-                    }
-                    (None, Some(Origin::Private)) => {
-                        ensure_private_origin(a, pkg).await?;
-                        a_origin = Some(Origin::Private);
-                    }
-                    _ => {}
-                }
-
-                if a_origin == Some(Origin::Private) || b_origin == Some(Origin::Private) {
-                    reconcile_project_status(a, b, pkg).await?;
-                }
-
-                let mut converged = false;
-                for _ in 0..3 {
-                    let mut filenames = candidate_filenames(&a_names);
-                    filenames.extend(candidate_filenames(&b_names));
-                    let mut restage = None;
-                    for filename in filenames {
-                        let ra = record_from_names(a, pkg, &filename, &a_names, a_origin).await?;
-                        let rb = record_from_names(b, pkg, &filename, &b_names, b_origin).await?;
-                        // A proxy/mirror writer can cross the final claim read and
-                        // finish after package demotion. Package-private +
-                        // artifact-mirror is therefore an invalid late record,
-                        // including when the filename is absent from the true
-                        // private source. Quarantine it here; ordinary `decide`
-                        // deliberately treats mirror-only cache entries as local.
-                        let late_a = a_origin == Some(Origin::Private)
-                            && matches!(
-                                ra.state(),
-                                RecordState::Live {
-                                    origin: Origin::Mirror,
-                                    ..
-                                }
-                            );
-                        let late_b = b_origin == Some(Origin::Private)
-                            && matches!(
-                                rb.state(),
-                                RecordState::Live {
-                                    origin: Origin::Mirror,
-                                    ..
-                                }
-                            );
-                        if late_a || late_b {
-                            if late_a && quarantine_mirror_artifacts(a, pkg).await? > 0 {
-                                worker::mark_dirty(a, pkg).await?;
-                                a_names = package_member_names(a, pkg).await?;
-                            }
-                            if late_b && quarantine_mirror_artifacts(b, pkg).await? > 0 {
-                                worker::mark_dirty(b, pkg).await?;
-                                b_names = package_member_names(b, pkg).await?;
-                            }
-                            restage = Some(if late_a { Side::B } else { Side::A });
-                            break;
-                        }
-                        let verdict = decide(&ra, &rb);
-                        match verdict {
-                            Verdict::Supersede(side) => {
-                                restage = Some(side);
-                                break;
-                            }
-                            _ => {
-                                execute(state, (a, b), pkg, &filename, (&ra, &rb), verdict).await?
-                            }
-                        }
-                    }
-                    match restage {
-                        Some(Side::A) => {
-                            stage_private_over_local_mirror_ignoring(
-                                state,
-                                a,
-                                b,
-                                pkg,
-                                Some(&intents.right),
-                            )
-                            .await?;
-                            b_names = package_member_names(b, pkg).await?;
-                        }
-                        Some(Side::B) => {
-                            stage_private_over_local_mirror_ignoring(
-                                state,
-                                b,
-                                a,
-                                pkg,
-                                Some(&intents.left),
-                            )
-                            .await?;
-                            a_names = package_member_names(a, pkg).await?;
-                        }
-                        None => {
-                            converged = true;
-                            break;
-                        }
-                    }
-                }
-                if !converged {
-                    bail!("package '{pkg}' kept exposing mirror records under a private claim");
-                }
-                Ok(())
-            };
-            let locked =
-                run_with_replication_heartbeats(state, a, b, pkg, &intents, locked_operation).await;
-            match locked {
-                Ok(()) => release_replication_intents(a, b, pkg, &intents).await,
-                Err(error) => {
-                    commit_replication_intents(a, b, pkg, &intents).await;
-                    Err(error)
-                }
+    loop {
+        let next_a = scan_a.peek().await?.map(str::to_string);
+        let next_b = scan_b.peek().await?.map(str::to_string);
+        let pkg = match (next_a, next_b) {
+            (None, None) => break,
+            (Some(a_pkg), None) => {
+                scan_a.advance();
+                a_pkg
             }
-        }
-        .await;
-        if let Err(error) = result {
+            (None, Some(b_pkg)) => {
+                scan_b.advance();
+                b_pkg
+            }
+            (Some(a_pkg), Some(b_pkg)) => match a_pkg.cmp(&b_pkg) {
+                std::cmp::Ordering::Less => {
+                    scan_a.advance();
+                    a_pkg
+                }
+                std::cmp::Ordering::Greater => {
+                    scan_b.advance();
+                    b_pkg
+                }
+                std::cmp::Ordering::Equal => {
+                    scan_a.advance();
+                    scan_b.advance();
+                    a_pkg
+                }
+            },
+        };
+        if let Err(error) = converge_package(state, a, b, &pkg).await {
             error!(package=%pkg, error=?error, "reconcile: package diff failed; continuing");
             failures.push(format!("{pkg}: {error:#}"));
         }
@@ -3296,6 +2031,116 @@ async fn diff_pair(state: &AppState, a: &dyn Storage, b: &dyn Storage) -> Result
     }
 }
 
+/// Converge one package across the two buckets through the merge rules. Called
+/// once per package by [`diff_pair`]; re-lists fresh member names because the
+/// paged scan that discovered the package may predate a writer.
+async fn converge_package(
+    state: &AppState,
+    a: &dyn Storage,
+    b: &dyn Storage,
+    pkg: &str,
+) -> Result<()> {
+    require_replication_unfenced(state)?;
+    // The flat scan that discovered the package may predate a writer;
+    // use fresh member listings for the per-package convergence pass.
+    let mut a_names = package_member_names(a, pkg).await?;
+    let mut b_names = package_member_names(b, pkg).await?;
+
+    let mut a_origin = read_pkg_origin(a, pkg).await?;
+    let mut b_origin = read_pkg_origin(b, pkg).await?;
+    match (a_origin, b_origin) {
+        (Some(Origin::Private), Some(Origin::Mirror)) => {
+            ensure_private_origin(b, pkg).await?;
+            if quarantine_mirror_artifacts(b, pkg).await? > 0 {
+                worker::mark_dirty(b, pkg).await?;
+            }
+            b_names = package_member_names(b, pkg).await?;
+            b_origin = Some(Origin::Private);
+        }
+        (Some(Origin::Mirror), Some(Origin::Private)) => {
+            ensure_private_origin(a, pkg).await?;
+            if quarantine_mirror_artifacts(a, pkg).await? > 0 {
+                worker::mark_dirty(a, pkg).await?;
+            }
+            a_names = package_member_names(a, pkg).await?;
+            a_origin = Some(Origin::Private);
+        }
+        (Some(Origin::Private), None) => {
+            ensure_private_origin(b, pkg).await?;
+            b_origin = Some(Origin::Private);
+        }
+        (None, Some(Origin::Private)) => {
+            ensure_private_origin(a, pkg).await?;
+            a_origin = Some(Origin::Private);
+        }
+        _ => {}
+    }
+
+    if a_origin == Some(Origin::Private) || b_origin == Some(Origin::Private) {
+        reconcile_project_status(a, b, pkg).await?;
+    }
+
+    let mut converged = false;
+    for _ in 0..3 {
+        let mut filenames = candidate_filenames(&a_names);
+        filenames.extend(candidate_filenames(&b_names));
+        let mut retry_after_late_mirror = false;
+        for filename in filenames {
+            let ra = record_from_names(a, pkg, &filename, &a_names, a_origin).await?;
+            let rb = record_from_names(b, pkg, &filename, &b_names, b_origin).await?;
+            // A proxy/mirror writer can cross the final claim read and
+            // finish after package demotion. Package-private +
+            // artifact-mirror is therefore an invalid late record,
+            // including when the filename is absent from the true
+            // private source. Quarantine it here; ordinary `decide`
+            // deliberately treats mirror-only cache entries as local.
+            let late_a = a_origin == Some(Origin::Private)
+                && matches!(
+                    ra.state(),
+                    RecordState::Live {
+                        origin: Origin::Mirror,
+                        ..
+                    }
+                );
+            let late_b = b_origin == Some(Origin::Private)
+                && matches!(
+                    rb.state(),
+                    RecordState::Live {
+                        origin: Origin::Mirror,
+                        ..
+                    }
+                );
+            if late_a || late_b {
+                if late_a {
+                    if quarantine_mirror_artifacts(a, pkg).await? > 0 {
+                        worker::mark_dirty(a, pkg).await?;
+                    }
+                    a_names = package_member_names(a, pkg).await?;
+                }
+                if late_b {
+                    if quarantine_mirror_artifacts(b, pkg).await? > 0 {
+                        worker::mark_dirty(b, pkg).await?;
+                    }
+                    b_names = package_member_names(b, pkg).await?;
+                }
+                retry_after_late_mirror = true;
+                break;
+            }
+            let verdict = decide(&ra, &rb);
+            execute(state, (a, b), pkg, &filename, (&ra, &rb), verdict).await?;
+        }
+        if retry_after_late_mirror {
+            continue;
+        }
+        converged = true;
+        break;
+    }
+    if !converged {
+        bail!("package '{pkg}' kept exposing mirror records under a private claim");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3305,27 +2150,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    struct LockPause {
-        acquired: tokio::sync::Notify,
-        release: tokio::sync::Notify,
-    }
-
     struct RaceOnCreateStorage {
         inner: InMemStorage,
         key: String,
         bytes: Vec<u8>,
         required_prior_key: Option<String>,
-        intent_before_cas: Option<String>,
-        fail_first_put_prefix: Option<String>,
-        fail_first_put_suffix: Option<String>,
         raced: AtomicBool,
-        cas_raced: AtomicBool,
-        put_failed: AtomicBool,
-        lock_pause: Option<Arc<LockPause>>,
-        lock_paused: AtomicBool,
-        lock_read_pause: Option<Arc<LockPause>>,
-        lock_read_paused: AtomicBool,
-        fresh_dirty_timestamps: bool,
     }
 
     impl RaceOnCreateStorage {
@@ -3335,60 +2165,13 @@ mod tests {
                 key,
                 bytes,
                 required_prior_key: None,
-                intent_before_cas: None,
-                fail_first_put_prefix: None,
-                fail_first_put_suffix: None,
                 raced: AtomicBool::new(false),
-                cas_raced: AtomicBool::new(false),
-                put_failed: AtomicBool::new(false),
-                lock_pause: None,
-                lock_paused: AtomicBool::new(false),
-                lock_read_pause: None,
-                lock_read_paused: AtomicBool::new(false),
-                fresh_dirty_timestamps: false,
             }
         }
 
         fn requiring_prior_key(mut self, key: String) -> Self {
             self.required_prior_key = Some(key);
             self
-        }
-
-        fn injecting_intent_before_cas(mut self, key: String) -> Self {
-            self.intent_before_cas = Some(key);
-            self
-        }
-
-        fn failing_first_put_under_ending(mut self, prefix: &str, suffix: &str) -> Self {
-            self.fail_first_put_prefix = Some(prefix.to_string());
-            self.fail_first_put_suffix = Some(suffix.to_string());
-            self
-        }
-
-        fn pausing_first_promotion_lock(mut self, pause: Arc<LockPause>) -> Self {
-            self.lock_pause = Some(pause);
-            self
-        }
-
-        fn pausing_first_promotion_lock_read(mut self, pause: Arc<LockPause>) -> Self {
-            self.lock_read_pause = Some(pause);
-            self
-        }
-
-        fn with_fresh_dirty_timestamps(mut self) -> Self {
-            self.fresh_dirty_timestamps = true;
-            self
-        }
-
-        fn should_fail_put(&self, key: &str) -> bool {
-            self.fail_first_put_prefix
-                .as_ref()
-                .is_some_and(|prefix| key.starts_with(prefix))
-                && self
-                    .fail_first_put_suffix
-                    .as_ref()
-                    .is_none_or(|suffix| key.ends_with(suffix))
-                && !self.put_failed.swap(true, Ordering::SeqCst)
         }
     }
 
@@ -3420,9 +2203,6 @@ mod tests {
             bytes: Vec<u8>,
             content_type: Option<&str>,
         ) -> Result<()> {
-            if self.should_fail_put(key) {
-                bail!("injected put failure under {key}");
-            }
             self.inner.put_bytes(key, bytes, content_type).await
         }
 
@@ -3432,9 +2212,6 @@ mod tests {
             bytes: Vec<u8>,
             content_type: Option<&str>,
         ) -> Result<bool> {
-            if self.should_fail_put(key) {
-                bail!("injected put failure under {key}");
-            }
             if key == self.key && !self.raced.swap(true, Ordering::SeqCst) {
                 if let Some(required) = &self.required_prior_key {
                     if !self.inner.head_exists(required).await? {
@@ -3461,15 +2238,7 @@ mod tests {
         }
 
         async fn list_dir_entries(&self, prefix: &str) -> Result<Vec<FileEntry>> {
-            let mut entries = self.inner.list_dir_entries(prefix).await?;
-            if self.fresh_dirty_timestamps && prefix == crate::DIRTY_PREFIX {
-                let now = time::OffsetDateTime::now_utc()
-                    .format(&time::format_description::well_known::Rfc3339)?;
-                for entry in &mut entries {
-                    entry.last_modified = Some(now.clone());
-                }
-            }
-            Ok(entries)
+            self.inner.list_dir_entries(prefix).await
         }
 
         async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
@@ -3485,31 +2254,11 @@ mod tests {
         }
 
         async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
-            let result = self.inner.get_with_etag(key).await?;
-            if result.is_some()
-                && key.ends_with(PROMOTION_LOCK_NAME)
-                && !self.lock_read_paused.swap(true, Ordering::SeqCst)
-            {
-                if let Some(pause) = &self.lock_read_pause {
-                    pause.acquired.notify_one();
-                    pause.release.notified().await;
-                }
-            }
-            Ok(result)
+            self.inner.get_with_etag(key).await
         }
 
         async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
-            let result = self.inner.put_if_none_match(key, bytes).await?;
-            if result.is_some()
-                && key.ends_with(PROMOTION_LOCK_NAME)
-                && !self.lock_paused.swap(true, Ordering::SeqCst)
-            {
-                if let Some(pause) = &self.lock_pause {
-                    pause.acquired.notify_one();
-                    pause.release.notified().await;
-                }
-            }
-            Ok(result)
+            self.inner.put_if_none_match(key, bytes).await
         }
 
         async fn put_if_match(
@@ -3518,11 +2267,6 @@ mod tests {
             etag: &str,
             bytes: Vec<u8>,
         ) -> Result<Option<String>> {
-            if key == self.key && !self.cas_raced.swap(true, Ordering::SeqCst) {
-                if let Some(intent) = &self.intent_before_cas {
-                    self.inner.insert(intent, Vec::new());
-                }
-            }
             self.inner.put_if_match(key, etag, bytes).await
         }
     }
@@ -3579,6 +2323,7 @@ mod tests {
             yanked,
             origin: Some(origin.to_string()),
             yank_epoch: epoch,
+            upload_epoch_ms: None,
         }
     }
 
@@ -3593,6 +2338,16 @@ mod tests {
             mirror_quarantined: false,
             pkg_origin: None,
         }
+    }
+
+    fn live_at(sha: &str, upload_epoch_ms: u64) -> Record {
+        let mut record = live(sha, PRIVATE);
+        record
+            .sidecar
+            .as_mut()
+            .expect("test record has a sidecar")
+            .upload_epoch_ms = Some(upload_epoch_ms);
+        record
     }
 
     fn absent() -> Record {
@@ -3619,11 +2374,19 @@ mod tests {
         storage.insert(&crate::origin::origin_key(pkg), origin.as_bytes().to_vec());
     }
 
-    async fn begin_staged_claim(storage: &dyn Storage, staged: &StagedPackage) {
-        begin_private_promotion(storage, &staged.manifest.package, &staged.manifest_key)
-            .await
-            .unwrap()
-            .unwrap();
+    fn seed_live_at(
+        storage: &InMemStorage,
+        pkg: &str,
+        filename: &str,
+        bytes: &[u8],
+        upload_epoch_ms: u64,
+    ) {
+        let key = artifact_key(pkg, filename);
+        storage.insert(&key, bytes.to_vec());
+        let mut sidecar = sc(&sha256_hex(bytes), PRIVATE, Yanked::Flag(false), 0);
+        sidecar.upload_epoch_ms = Some(upload_epoch_ms);
+        storage.insert(&sidecar_key(&key), serde_json::to_vec(&sidecar).unwrap());
+        storage.insert(&crate::origin::origin_key(pkg), b"private".to_vec());
     }
 
     #[test]
@@ -3661,12 +2424,71 @@ mod tests {
     }
 
     #[test]
-    fn byte_conflict_freezes() {
-        // Same filename, both private, different bytes: the split-brain freeze.
+    fn private_byte_conflict_uses_the_older_upload_epoch() {
+        assert_eq!(
+            decide(&live_at("x", 1_000), &live_at("y", 4_000)),
+            Verdict::QuarantineLoser(Side::A)
+        );
+        assert_eq!(
+            decide(&live_at("y", 4_000), &live_at("x", 1_000)),
+            Verdict::QuarantineLoser(Side::B)
+        );
+    }
+
+    #[test]
+    fn private_byte_conflict_without_a_trustworthy_epoch_freezes() {
+        // Legacy timestamps and clocks inside the skew window are ambiguous.
         assert_eq!(
             decide(&live("x", PRIVATE), &live("y", PRIVATE)),
             Verdict::Freeze
         );
+        assert_eq!(
+            decide(&live_at("x", 1_000), &live("y", PRIVATE)),
+            Verdict::Freeze
+        );
+        assert_eq!(
+            decide(&live_at("x", 1_000), &live_at("y", 3_000)),
+            Verdict::Freeze
+        );
+    }
+
+    #[tokio::test]
+    async fn private_conflict_quarantines_loser_and_is_stable_on_second_pass() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        seed_live_at(a.as_ref(), "pkg", filename, b"first", 1_000);
+        seed_live_at(b.as_ref(), "pkg", filename, b"second", 4_000);
+        let state = two_bucket_state(a.clone(), b.clone());
+
+        let ra = read_record(a.as_ref(), "pkg", filename).await.unwrap();
+        let rb = read_record(b.as_ref(), "pkg", filename).await.unwrap();
+        assert_eq!(decide(&ra, &rb), Verdict::QuarantineLoser(Side::A));
+        diff_pair(&state, a.as_ref(), b.as_ref()).await.unwrap();
+
+        assert_eq!(
+            b.get_bytes(&artifact_key("pkg", filename)).await.unwrap(),
+            b"first"
+        );
+        let loser_sha = sha256_hex(b"second");
+        let loser_key = format!("{QUARANTINE_PREFIX}pkg/{filename}@{}", &loser_sha[..12]);
+        assert_eq!(b.get_bytes(&loser_key).await.unwrap(), b"second");
+        assert_eq!(
+            state
+                .metrics
+                .replication_conflict_quarantines
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let settled_a = read_record(a.as_ref(), "pkg", filename).await.unwrap();
+        let settled_b = read_record(b.as_ref(), "pkg", filename).await.unwrap();
+        assert_eq!(decide(&settled_a, &settled_b), Verdict::Noop);
+        let before_a = a.list_all("").await.unwrap();
+        let before_b = b.list_all("").await.unwrap();
+        diff_pair(&state, a.as_ref(), b.as_ref()).await.unwrap();
+        assert_eq!(a.list_all("").await.unwrap(), before_a);
+        assert_eq!(b.list_all("").await.unwrap(), before_b);
     }
 
     #[test]
@@ -3729,6 +2551,37 @@ mod tests {
         assert_eq!(adopted.yanked, Yanked::Flag(false));
     }
 
+    #[tokio::test]
+    async fn private_copy_overwrites_a_bodyless_mirror_sidecar() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        seed_live(a.as_ref(), "pkg", filename, b"private", PRIVATE);
+        b.insert(&crate::origin::origin_key("pkg"), b"mirror".to_vec());
+        b.insert(
+            &sidecar_key(&key),
+            serde_json::to_vec(&sc(
+                &sha256_hex(b"orphaned mirror"),
+                MIRROR,
+                Yanked::Flag(false),
+                0,
+            ))
+            .unwrap(),
+        );
+        let state = two_bucket_state(a.clone(), b.clone());
+
+        replicate_record(&state, a.as_ref(), b.as_ref(), "pkg", filename)
+            .await
+            .unwrap();
+
+        assert_eq!(b.get_bytes(&key).await.unwrap(), b"private");
+        let copied: Sidecar =
+            serde_json::from_slice(&b.get_bytes(&sidecar_key(&key)).await.unwrap()).unwrap();
+        assert_eq!(copied.origin.as_deref(), Some(PRIVATE));
+        assert_eq!(copied.sha256, sha256_hex(b"private"));
+    }
+
     #[test]
     fn tombstone_wins_over_a_live_peer() {
         let mut t = absent();
@@ -3739,6 +2592,9 @@ mod tests {
         let mut t2 = absent();
         t2.tombstoned = true;
         assert_eq!(decide(&t, &t2), Verdict::Noop);
+        let mut frozen_tombstone = t2.clone();
+        frozen_tombstone.frozen = true;
+        assert_eq!(decide(&t, &frozen_tombstone), Verdict::Tombstone);
     }
 
     #[test]
@@ -3968,8 +2824,8 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(src.head_exists(&key).await.unwrap());
-        assert!(dst.head_exists(&key).await.unwrap());
+        assert!(!src.head_exists(&key).await.unwrap());
+        assert!(!dst.head_exists(&key).await.unwrap());
         assert!(src.head_exists(&frozen_key(&key)).await.unwrap());
         assert!(dst.head_exists(&frozen_key(&key)).await.unwrap());
         assert!(src.head_exists(&tombstone_key(&key)).await.unwrap());
@@ -4025,10 +2881,28 @@ mod tests {
         replicate_record(&state, a.as_ref(), b.as_ref(), "pkg", filename)
             .await
             .unwrap();
-        assert!(a.head_exists(&key).await.unwrap());
-        assert!(b.head_exists(&key).await.unwrap());
+        assert!(!a.head_exists(&key).await.unwrap());
+        assert!(!b.head_exists(&key).await.unwrap());
         assert_eq!(a.list_all(QUARANTINE_PREFIX).await.unwrap().len(), 1);
         assert_eq!(b.list_all(QUARANTINE_PREFIX).await.unwrap().len(), 1);
+
+        let settled_a = read_record(a.as_ref(), "pkg", filename).await.unwrap();
+        let settled_b = read_record(b.as_ref(), "pkg", filename).await.unwrap();
+        assert_eq!(decide(&settled_a, &settled_b), Verdict::Noop);
+        let before_a = a.list_all("").await.unwrap();
+        let before_b = b.list_all("").await.unwrap();
+        execute(
+            &state,
+            (a.as_ref(), b.as_ref()),
+            "pkg",
+            filename,
+            (&settled_a, &settled_b),
+            Verdict::Noop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.list_all("").await.unwrap(), before_a);
+        assert_eq!(b.list_all("").await.unwrap(), before_b);
     }
 
     #[tokio::test]
@@ -4043,7 +2917,7 @@ mod tests {
 
         assert!(storage.head_exists(&tombstone_key(&key)).await.unwrap());
         assert!(storage.head_exists(&frozen_key(&key)).await.unwrap());
-        assert!(storage.head_exists(&key).await.unwrap());
+        assert!(!storage.head_exists(&key).await.unwrap());
     }
 
     #[tokio::test]
@@ -4061,7 +2935,7 @@ mod tests {
 
         assert!(storage.head_exists(&tombstone_key(&key)).await.unwrap());
         assert!(storage.head_exists(&frozen_key(&key)).await.unwrap());
-        assert!(storage.head_exists(&key).await.unwrap());
+        assert!(!storage.head_exists(&key).await.unwrap());
     }
 
     #[tokio::test]
@@ -4082,7 +2956,7 @@ mod tests {
 
         storage.inner.delete_keys(&[qkey]).await.unwrap();
         freeze_side(&storage.inner, "pkg", filename).await.unwrap();
-        assert!(storage.inner.head_exists(&key).await.unwrap());
+        assert!(!storage.inner.head_exists(&key).await.unwrap());
         assert!(storage
             .inner
             .head_exists(&tombstone_key(&key))
@@ -4133,7 +3007,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_mirror_record_under_private_claim_is_repaired_by_package_staging() {
+    async fn private_supersede_demotes_per_artifact_and_clears_mirror_quarantine() {
         let private = Arc::new(InMemStorage::default());
         let late_mirror = Arc::new(InMemStorage::default());
         let filename = "pkg-1.whl";
@@ -4145,9 +3019,9 @@ mod tests {
             b"late mirror bytes",
             MIRROR,
         );
-        // The package claim was demoted after the proxy's final mirror check,
-        // but its artifact+sidecar finished afterward.
-        late_mirror.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
+        let mirror_marker = mirror_quarantined_key(&artifact_key("pkg", filename));
+        late_mirror.insert(&mirror_marker, b"{}".to_vec());
+        assert!(late_mirror.head_exists(&mirror_marker).await.unwrap());
         let state = two_bucket_state(private.clone(), late_mirror.clone());
 
         replicate_record(
@@ -4176,9 +3050,54 @@ mod tests {
         .unwrap();
         assert_eq!(sidecar.origin.as_deref(), Some(PRIVATE));
         assert_eq!(
-            late_mirror.list_all(QUARANTINE_PREFIX).await.unwrap().len(),
-            1
+            read_origin(late_mirror.as_ref(), "pkg")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(PRIVATE)
         );
+        let mirror_sha = sha256_hex(b"late mirror bytes");
+        let quarantine = format!("{QUARANTINE_PREFIX}pkg/{filename}@{}", &mirror_sha[..12]);
+        assert_eq!(
+            late_mirror.get_bytes(&quarantine).await.unwrap(),
+            b"late mirror bytes"
+        );
+        assert!(!late_mirror.head_exists(&mirror_marker).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn supersede_does_not_resurrect_a_tombstone_that_races_the_decision() {
+        let private = Arc::new(InMemStorage::default());
+        let mirror = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        seed_live(private.as_ref(), "pkg", filename, b"private", PRIVATE);
+        seed_live(mirror.as_ref(), "pkg", filename, b"mirror", MIRROR);
+        let state = two_bucket_state(private.clone(), mirror.clone());
+        let source = read_record(private.as_ref(), "pkg", filename)
+            .await
+            .unwrap();
+        let destination = read_record(mirror.as_ref(), "pkg", filename).await.unwrap();
+        let verdict = decide(&source, &destination);
+        assert_eq!(verdict, Verdict::Supersede(Side::A));
+
+        tombstone::write(mirror.as_ref(), &key, filename)
+            .await
+            .unwrap();
+        execute(
+            &state,
+            (private.as_ref(), mirror.as_ref()),
+            "pkg",
+            filename,
+            (&source, &destination),
+            verdict,
+        )
+        .await
+        .unwrap();
+
+        assert!(mirror.head_exists(&tombstone_key(&key)).await.unwrap());
+        assert!(!mirror.head_exists(&key).await.unwrap());
+        assert!(!mirror.head_exists(&sidecar_key(&key)).await.unwrap());
     }
 
     #[tokio::test]
@@ -4241,589 +3160,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_stage_without_manifest_is_inert() {
-        let storage = Arc::new(InMemStorage::default());
-        let filename = "pkg-1.whl";
-        seed_live(storage.as_ref(), "pkg", filename, b"mirror", MIRROR);
-        storage.insert(
-            &format!("{REPL_STAGING_PREFIX}pkg/partial/artifact"),
-            b"private".to_vec(),
-        );
-        let state = test_state(storage.clone());
-
-        resume_staged_packages_in(&state, storage.as_ref())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            read_origin(storage.as_ref(), "pkg")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(MIRROR)
-        );
-        assert_eq!(
-            storage
-                .get_bytes(&artifact_key("pkg", filename))
-                .await
-                .unwrap(),
-            b"mirror"
-        );
-        assert!(storage
-            .list_all(QUARANTINE_PREFIX)
-            .await
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn complete_stage_resumes_after_claim_cas_and_promotes_whole_package() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        let first = "pkg-1.whl";
-        let second = "pkg-2.whl";
-        let mirror_only = "pkg-0.whl";
-        seed_live(src.as_ref(), "pkg", first, b"private one", PRIVATE);
-        seed_live(src.as_ref(), "pkg", second, b"private two", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", first, b"old mirror one", MIRROR);
-        seed_live(dst.as_ref(), "pkg", mirror_only, b"old mirror zero", MIRROR);
-        dst.insert(
-            &status::status_key("pkg"),
-            br#"{"status":"quarantined","reason":"upstream mirror","pypiron-epoch":50}"#.to_vec(),
-        );
-        let state = test_state(dst.clone());
-
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        assert!(dst.head_exists(&staged.manifest_key).await.unwrap());
-        assert_eq!(
-            read_origin(dst.as_ref(), "pkg").await.unwrap().as_deref(),
-            Some(MIRROR)
-        );
-        assert_eq!(
-            dst.get_bytes(&artifact_key("pkg", first)).await.unwrap(),
-            b"old mirror one"
-        );
-
-        // Simulate a crash immediately after the one package-claim CAS. The
-        // retry has only the durable destination stage; the source is unused.
-        begin_staged_claim(dst.as_ref(), &staged).await;
-        drop(src);
-        assert!(resume_staged_package(&state, dst.as_ref(), "pkg")
-            .await
-            .unwrap());
-
-        assert_eq!(
-            dst.get_bytes(&artifact_key("pkg", first)).await.unwrap(),
-            b"private one"
-        );
-        assert_eq!(
-            dst.get_bytes(&artifact_key("pkg", second)).await.unwrap(),
-            b"private two"
-        );
-        assert!(dst
-            .head_exists(&artifact_key("pkg", mirror_only))
-            .await
-            .unwrap());
-        assert!(!dst
-            .head_exists(&tombstone_key(&artifact_key("pkg", mirror_only)))
-            .await
-            .unwrap());
-        assert_eq!(dst.list_all(QUARANTINE_PREFIX).await.unwrap().len(), 2);
-        let index = String::from_utf8(
-            dst.get_bytes(&format!("{}pkg/index.json", crate::SIMPLE_PREFIX))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(index.contains(first));
-        assert!(index.contains(second));
-        assert!(!index.contains(mirror_only));
-        assert!(read_origin_observation(dst.as_ref(), "pkg")
-            .await
-            .unwrap()
-            .unwrap()
-            .pending_manifest
-            .is_none());
-        assert!(!dst
-            .list_all(REPL_STAGING_PREFIX)
-            .await
-            .unwrap()
-            .iter()
-            .any(|object| object.key.contains("/manifest@")));
-        assert_eq!(
-            status::read_status(dst.as_ref(), "pkg").await.unwrap(),
-            status::ProjectStatusDoc::default(),
-            "mirror-local status must not launder through private demotion"
-        );
-        assert_eq!(
-            status::read_status_versioned(dst.as_ref(), "pkg")
-                .await
-                .unwrap()
-                .unwrap()
-                .epoch,
-            0,
-            "mirror-local epochs must not inflate private history",
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_same_manifest_recovery_has_one_lock_winner() {
-        let src = Arc::new(InMemStorage::default());
-        let pause = Arc::new(LockPause {
-            acquired: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        });
-        let dst = Arc::new(
-            RaceOnCreateStorage::new("never-raced".into(), Vec::new())
-                .pausing_first_promotion_lock(pause.clone()),
-        );
-        seed_live(src.as_ref(), "pkg", "pkg-1.whl", b"private", PRIVATE);
-        seed_live(&dst.inner, "pkg", "pkg-1.whl", b"mirror", MIRROR);
-        let state = test_state(dst.clone());
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-
-        let mut winner = Box::pin(settle_staged_package(&state, dst.as_ref(), &staged));
-        tokio::select! {
-            () = pause.acquired.notified() => {}
-            result = &mut winner => panic!("winner completed before lock pause: {result:?}"),
-        }
-        assert!(!settle_staged_package(&state, dst.as_ref(), &staged)
-            .await
-            .unwrap());
-        pause.release.notify_one();
-        assert!(winner.await.unwrap());
-
-        assert_eq!(
-            dst.get_bytes(&artifact_key("pkg", "pkg-1.whl"))
-                .await
-                .unwrap(),
-            b"private"
-        );
-        assert!(!dst.head_exists(&staged.manifest_key).await.unwrap());
-        assert!(!dst
-            .list_all(crate::DIRTY_PREFIX)
-            .await
-            .unwrap()
-            .iter()
-            .any(|entry| entry.key.ends_with(".intent")));
-        let lock: PromotionLockBody =
-            serde_json::from_slice(&dst.get_bytes(&promotion_lock_key("pkg")).await.unwrap())
-                .unwrap();
-        assert!(matches!(lock, PromotionLockBody::Free { .. }));
-    }
-
-    #[tokio::test]
-    async fn slow_lock_guard_crossing_heartbeat_does_not_deadlock_itself() {
-        let src = Arc::new(InMemStorage::default());
-        let pause = Arc::new(LockPause {
-            acquired: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        });
-        let dst = Arc::new(
-            RaceOnCreateStorage::new("never-raced".into(), Vec::new())
-                .pausing_first_promotion_lock_read(pause.clone()),
-        );
-        seed_live(src.as_ref(), "pkg", "pkg-1.whl", b"private", PRIVATE);
-        seed_live(&dst.inner, "pkg", "pkg-1.whl", b"mirror", MIRROR);
-        let mut state = test_state(dst.clone());
-        state.intent_grace = time::Duration::milliseconds(30);
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-
-        let release_guard = async {
-            pause.acquired.notified().await;
-            // Effective lock grace is 30 ms, so at least one heartbeat crosses
-            // the deliberately stalled ownership GET.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            pause.release.notify_one();
-        };
-        let (settled, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            tokio::join!(
-                settle_staged_package(&state, dst.as_ref(), &staged),
-                release_guard
-            )
-        })
-        .await
-        .expect("promotion lock guard deadlocked with its heartbeat");
-        assert!(settled.unwrap());
-    }
-
-    #[tokio::test]
-    async fn stale_promotion_lock_requires_one_full_unchanged_etag_grace() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        seed_live(src.as_ref(), "pkg", "pkg-1.whl", b"private", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", "pkg-1.whl", b"mirror", MIRROR);
-        let mut state = test_state(dst.clone());
-        state.intent_grace = time::Duration::ZERO;
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        let old_holder = "old-holder";
-        dst.insert(
-            &format!("{}pkg!{old_holder}.intent", crate::DIRTY_PREFIX),
-            Vec::new(),
-        );
-        dst.put_if_none_match(
-            &promotion_lock_key("pkg"),
-            serde_json::to_vec(&PromotionLockBody::Held {
-                holder: old_holder.into(),
-                manifest: staged.manifest_key.clone(),
-                nonce: worker::marker_nonce(),
-            })
-            .unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let attempt = worker::mark_intent(dst.as_ref(), "pkg").await.unwrap();
-
-        assert!(
-            acquire_promotion_lock(&state, dst.as_ref(), &staged, &attempt)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        let lease = acquire_promotion_lock(&state, dst.as_ref(), &staged, &attempt)
-            .await
-            .unwrap()
-            .expect("unchanged crashed lock should be stealable after grace");
-        lease.release(dst.as_ref()).await.unwrap();
-        worker::clear_intent(dst.as_ref(), "pkg", &attempt)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn live_rotated_intent_family_prevents_promotion_lock_takeover() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(
-            RaceOnCreateStorage::new("never-raced".into(), Vec::new())
-                .with_fresh_dirty_timestamps(),
-        );
-        seed_live(src.as_ref(), "pkg", "pkg-1.whl", b"private", PRIVATE);
-        seed_live(&dst.inner, "pkg", "pkg-1.whl", b"mirror", MIRROR);
-        let mut state = test_state(dst.clone());
-        state.intent_grace = time::Duration::milliseconds(30);
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        let root = "pair-root";
-        for suffix in [".intent", ".commit"] {
-            dst.inner.insert(
-                &format!("{}pkg!{root}{suffix}", crate::DIRTY_PREFIX),
-                Vec::new(),
-            );
-        }
-        dst.inner.insert(
-            &format!("{}pkg!{root}~0.intent", crate::DIRTY_PREFIX),
-            Vec::new(),
-        );
-        dst.put_if_none_match(
-            &promotion_lock_key("pkg"),
-            serde_json::to_vec(&PromotionLockBody::Held {
-                holder: root.into(),
-                manifest: staged.manifest_key.clone(),
-                nonce: worker::marker_nonce(),
-            })
-            .unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let attempt = worker::mark_intent(dst.as_ref(), "pkg").await.unwrap();
-
-        assert!(
-            acquire_promotion_lock(&state, dst.as_ref(), &staged, &attempt)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        assert!(
-            acquire_promotion_lock(&state, dst.as_ref(), &staged, &attempt)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn rotating_pair_heartbeat_survives_old_marker_snapshot_deletion() {
-        let left = InMemStorage::default();
-        let right = InMemStorage::default();
-        let mut state = test_state(Arc::new(InMemStorage::default()));
-        state.intent_grace = time::Duration::milliseconds(30);
-        let intents = acquire_replication_intents(&left, &right, "pkg")
-            .await
-            .unwrap();
-        let old_left = format!("{}pkg!{}.intent", crate::DIRTY_PREFIX, intents.left);
-        let old_right = format!("{}pkg!{}.intent", crate::DIRTY_PREFIX, intents.right);
-        let release = tokio::sync::Notify::new();
-        let operation = async {
-            release.notified().await;
-            Ok(())
-        };
-        let mut running = Box::pin(run_with_replication_heartbeats(
-            &state, &left, &right, "pkg", &intents, operation,
-        ));
-        let heartbeat_arrives = async {
-            loop {
-                if left
-                    .list_all(crate::DIRTY_PREFIX)
-                    .await
-                    .unwrap()
-                    .iter()
-                    .any(|entry| entry.key.contains('~') && entry.key.ends_with(".intent"))
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        };
-        tokio::select! {
-            () = heartbeat_arrives => {}
-            result = &mut running => panic!("heartbeat operation ended early: {result:?}"),
-        }
-
-        // A worker may delete exactly the keys it snapshotted before rotation.
-        // The fresh, unique family member must remain as the package fence.
-        left.delete_keys(&[old_left]).await.unwrap();
-        right.delete_keys(&[old_right]).await.unwrap();
-        assert!(worker::has_unpaired_intent_ignoring(&left, "pkg", None)
-            .await
-            .unwrap());
-        assert!(worker::has_unpaired_intent_ignoring(&right, "pkg", None)
-            .await
-            .unwrap());
-
-        release.notify_one();
-        running.await.unwrap();
-        release_replication_intents(&left, &right, "pkg", &intents)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn overlapping_manifests_keep_shared_members_for_later_recovery() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        seed_live(src.as_ref(), "pkg", "pkg-1.whl", b"one", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", "old-1.whl", b"mirror", MIRROR);
-        let state = test_state(dst.clone());
-
-        let first = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        seed_live(src.as_ref(), "pkg", "pkg-2.whl", b"two", PRIVATE);
-        let second = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-
-        assert!(settle_staged_package(&state, dst.as_ref(), &first)
-            .await
-            .unwrap());
-        drop(src);
-        assert!(settle_staged_package(&state, dst.as_ref(), &second)
-            .await
-            .unwrap());
-        assert_eq!(
-            dst.get_bytes(&artifact_key("pkg", "pkg-2.whl"))
-                .await
-                .unwrap(),
-            b"two"
-        );
-    }
-
-    #[tokio::test]
-    async fn staged_promotion_heals_a_provably_stale_writer_intent() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        seed_live(src.as_ref(), "pkg", "pkg-1.whl", b"private", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", "pkg-1.whl", b"mirror", MIRROR);
-        let mut state = test_state(dst.clone());
-        state.intent_grace = time::Duration::ZERO;
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        // Timestamp zero is provably stale. The exact pending owner may retire
-        // it and heal the crash shape instead of waiting forever.
-        dst.insert("_dirty/pkg!0-1-0.intent", Vec::new());
-
-        assert!(settle_staged_package(&state, dst.as_ref(), &staged)
-            .await
-            .unwrap());
-        assert_eq!(
-            read_origin(dst.as_ref(), "pkg").await.unwrap().as_deref(),
-            Some(PRIVATE)
-        );
-        assert!(!dst.head_exists("_dirty/pkg!0-1-0.intent").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn writer_starting_during_claim_cas_finishes_before_promotion() {
-        let src = Arc::new(InMemStorage::default());
-        let origin_key = crate::origin::origin_key("pkg");
-        let intent_key = format!(
-            "{}pkg!{}.intent",
-            crate::DIRTY_PREFIX,
-            worker::marker_nonce()
-        );
-        let dst = Arc::new(
-            RaceOnCreateStorage::new(origin_key, Vec::new())
-                .injecting_intent_before_cas(intent_key.clone()),
-        );
-        seed_live(src.as_ref(), "pkg", "pkg-1.whl", b"private", PRIVATE);
-        seed_live(&dst.inner, "pkg", "pkg-1.whl", b"mirror", MIRROR);
-        let mut state = test_state(dst.clone());
-        // InMemStorage exposes a fixed old storage timestamp. Keep it inside a
-        // deliberately huge grace for the first attempt, then expire it below.
-        state.intent_grace = time::Duration::weeks(10_000);
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-
-        let commit_key = intent_key.replace(".intent", ".commit");
-        let writer_finishes = async {
-            loop {
-                let pending = read_origin_observation(dst.as_ref(), "pkg")
-                    .await
-                    .unwrap()
-                    .and_then(|claim| claim.pending_manifest)
-                    .is_some();
-                if pending {
-                    dst.inner.insert(&commit_key, Vec::new());
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        };
-        let (settled, ()) = tokio::join!(
-            settle_staged_package(&state, dst.as_ref(), &staged),
-            writer_finishes
-        );
-        assert!(settled.unwrap());
-        assert_eq!(
-            dst.get_bytes(&artifact_key("pkg", "pkg-1.whl"))
-                .await
-                .unwrap(),
-            b"private"
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_promotion_worker_cannot_mutate_after_owner_changes() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        seed_live(src.as_ref(), "pkg", "pkg-1.whl", b"private", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", "pkg-1.whl", b"mirror", MIRROR);
-        let state = test_state(dst.clone());
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        let stale = begin_private_promotion(dst.as_ref(), "pkg", &staged.manifest_key)
-            .await
-            .unwrap()
-            .unwrap();
-        let attempt = worker::mark_intent(dst.as_ref(), "pkg").await.unwrap();
-        let lease = acquire_promotion_lock(&state, dst.as_ref(), &staged, &attempt)
-            .await
-            .unwrap()
-            .unwrap();
-        dst.insert(
-            &crate::origin::origin_key("pkg"),
-            serde_json::to_vec(&serde_json::json!({
-                "origin": PRIVATE,
-                "nonce": "0123456789abcdef0123456789abcdef",
-                "pending-manifest": "_staging/repl/pkg/manifest@new-owner.json"
-            }))
-            .unwrap(),
-        );
-
-        let error = promote_staged_package(&state, dst.as_ref(), &staged, &stale, &lease)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("promotion owner changed"));
-        assert_eq!(
-            dst.get_bytes(&artifact_key("pkg", "pkg-1.whl"))
-                .await
-                .unwrap(),
-            b"mirror"
-        );
-    }
-
-    #[tokio::test]
-    async fn promotion_retry_reasserts_dirty_after_truth_already_converged() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(
-            RaceOnCreateStorage::new("never-raced".into(), Vec::new())
-                .failing_first_put_under_ending(crate::DIRTY_PREFIX, ".commit"),
-        );
-        seed_live(src.as_ref(), "pkg", "pkg-1.whl", b"private", PRIVATE);
-        seed_live(&dst.inner, "pkg", "pkg-1.whl", b"mirror", MIRROR);
-        let state = test_state(dst.clone());
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-
-        let first = settle_staged_package(&state, dst.as_ref(), &staged).await;
-        assert!(first.is_err());
-        assert_eq!(
-            dst.get_bytes(&artifact_key("pkg", "pkg-1.whl"))
-                .await
-                .unwrap(),
-            b"private"
-        );
-        assert!(read_origin_observation(dst.as_ref(), "pkg")
-            .await
-            .unwrap()
-            .unwrap()
-            .pending_manifest
-            .is_some());
-
-        assert!(settle_staged_package(&state, dst.as_ref(), &staged)
-            .await
-            .unwrap());
-        assert!(!dst.list_all(crate::DIRTY_PREFIX).await.unwrap().is_empty());
-        assert!(read_origin_observation(dst.as_ref(), "pkg")
-            .await
-            .unwrap()
-            .unwrap()
-            .pending_manifest
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn topology_fence_blocks_stage_claim_transition() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        seed_live(src.as_ref(), "pkg", "pkg-1.whl", b"private", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", "pkg-1.whl", b"mirror", MIRROR);
-        let state = test_state(dst.clone());
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        state
-            .writes_fenced
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        assert!(settle_staged_package(&state, dst.as_ref(), &staged)
-            .await
-            .is_err());
-        assert_eq!(
-            read_origin(dst.as_ref(), "pkg").await.unwrap().as_deref(),
-            Some(MIRROR)
-        );
-        assert!(dst.head_exists(&staged.manifest_key).await.unwrap());
-    }
-
-    #[tokio::test]
     async fn late_mirror_status_under_private_claim_normalizes_to_active() {
         let a = InMemStorage::default();
         let b = InMemStorage::default();
@@ -4866,435 +3202,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demotion_quarantines_orphan_and_legacy_mirror_leftovers() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        seed_live(src.as_ref(), "pkg", "bar-1.whl", b"private", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", "bar-1.whl", b"mirror", MIRROR);
-
-        let orphan = artifact_key("pkg", "orphan-1.whl");
-        dst.insert(&orphan, b"orphan mirror body".to_vec());
-        let legacy = artifact_key("pkg", "legacy-1.whl");
-        dst.insert(&legacy, b"legacy mirror body".to_vec());
-        let mut legacy_sidecar = sc(
-            &sha256_hex(b"legacy mirror body"),
-            MIRROR,
-            Yanked::Flag(false),
-            0,
-        );
-        legacy_sidecar.origin = None;
-        dst.insert(
-            &sidecar_key(&legacy),
-            serde_json::to_vec(&legacy_sidecar).unwrap(),
-        );
-        let state = test_state(dst.clone());
-
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        assert_eq!(staged.manifest.mirror_leftovers.len(), 2);
-        begin_staged_claim(dst.as_ref(), &staged).await;
-        assert!(settle_staged_package(&state, dst.as_ref(), &staged)
-            .await
-            .unwrap());
-
-        for key in [&orphan, &legacy] {
-            assert!(dst.head_exists(key).await.unwrap());
-            assert!(dst.head_exists(&mirror_quarantined_key(key)).await.unwrap());
-        }
-        let quarantined = dst.list_all(QUARANTINE_PREFIX).await.unwrap();
-        assert!(quarantined
-            .iter()
-            .any(|object| object.key.contains("orphan-1.whl@")));
-        assert!(quarantined
-            .iter()
-            .any(|object| object.key.contains("legacy-1.whl@")));
-    }
-
-    #[tokio::test]
-    async fn demotion_manifest_carries_tombstone_and_freeze_fences() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        let deleted = "deleted-1.whl";
-        let frozen = "frozen-1.whl";
-        seed_live(src.as_ref(), "pkg", "bar-1.whl", b"private", PRIVATE);
-        seed_live(src.as_ref(), "pkg", deleted, b"deleted private", PRIVATE);
-        tombstone_side(src.as_ref(), "pkg", deleted).await.unwrap();
-        seed_live(src.as_ref(), "pkg", frozen, b"frozen private", PRIVATE);
-        freeze_side(src.as_ref(), "pkg", frozen).await.unwrap();
-        seed_live(dst.as_ref(), "pkg", "bar-1.whl", b"mirror", MIRROR);
-        seed_live(dst.as_ref(), "pkg", deleted, b"deleted mirror", MIRROR);
-        seed_live(dst.as_ref(), "pkg", frozen, b"frozen mirror", MIRROR);
-        let state = test_state(dst.clone());
-
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        begin_staged_claim(dst.as_ref(), &staged).await;
-        assert!(resume_staged_package(&state, dst.as_ref(), "pkg")
-            .await
-            .unwrap());
-
-        let deleted_key = artifact_key("pkg", deleted);
-        assert!(dst.head_exists(&tombstone_key(&deleted_key)).await.unwrap());
-        assert!(!dst.head_exists(&deleted_key).await.unwrap());
-        let frozen_key_name = artifact_key("pkg", frozen);
-        assert!(dst
-            .head_exists(&tombstone_key(&frozen_key_name))
-            .await
-            .unwrap());
-        assert!(dst
-            .head_exists(&frozen_key(&frozen_key_name))
-            .await
-            .unwrap());
-        assert!(dst.head_exists(&frozen_key_name).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn demotion_preserves_source_epoch_so_later_private_status_wins() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        let filename = "pkg-1.whl";
-        seed_live(src.as_ref(), "pkg", filename, b"private", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", filename, b"mirror", MIRROR);
-        let quarantined = status::ProjectStatusDoc {
-            status: status::ProjectStatus::Quarantined,
-            reason: Some("private review".into()),
-        };
-        assert_eq!(
-            status::advance_status(
-                src.as_ref(),
-                "pkg",
-                &quarantined,
-                Some(status::StatusOrigin::Private),
-            )
-            .await
-            .unwrap(),
-            1
-        );
-        dst.insert(
-            &status::status_key("pkg"),
-            br#"{"status":"quarantined","reason":"private review","pypiron-epoch":50}"#.to_vec(),
-        );
-        let state = test_state(dst.clone());
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        begin_staged_claim(dst.as_ref(), &staged).await;
-        assert!(settle_staged_package(&state, dst.as_ref(), &staged)
-            .await
-            .unwrap());
-
-        let demoted = status::read_status_versioned(dst.as_ref(), "pkg")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(demoted.doc, quarantined);
-        assert_eq!(demoted.epoch, 1);
-
-        let active = status::ProjectStatusDoc::default();
-        assert_eq!(
-            status::advance_status(
-                src.as_ref(),
-                "pkg",
-                &active,
-                Some(status::StatusOrigin::Private),
-            )
-            .await
-            .unwrap(),
-            2
-        );
-        reconcile_project_status(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        let converged = status::read_status_versioned(dst.as_ref(), "pkg")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(converged.doc, active);
-        assert_eq!(converged.epoch, 2);
-    }
-
-    #[tokio::test]
-    async fn stale_manifest_replay_preserves_later_private_status() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        let filename = "pkg-1.whl";
-        seed_live(src.as_ref(), "pkg", filename, b"private", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", filename, b"mirror", MIRROR);
-        let staged_status = status::ProjectStatusDoc {
-            status: status::ProjectStatus::Quarantined,
-            reason: Some("staged".into()),
-        };
-        status::advance_status(
-            src.as_ref(),
-            "pkg",
-            &staged_status,
-            Some(status::StatusOrigin::Private),
-        )
-        .await
-        .unwrap();
-        dst.insert(
-            &status::status_key("pkg"),
-            br#"{"status":"archived","reason":"upstream mirror","pypiron-epoch":50}"#.to_vec(),
-        );
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        begin_staged_claim(dst.as_ref(), &staged).await;
-        rebase_status_after_demotion(dst.as_ref(), "pkg", &staged.manifest.status)
-            .await
-            .unwrap();
-
-        let later = status::ProjectStatusDoc {
-            status: status::ProjectStatus::Active,
-            reason: None,
-        };
-        assert_eq!(
-            status::advance_status(
-                dst.as_ref(),
-                "pkg",
-                &later,
-                Some(status::StatusOrigin::Private),
-            )
-            .await
-            .unwrap(),
-            2
-        );
-
-        // A transient failure deleting the manifest makes recovery invoke the
-        // status step again. Its captured mirror etag is stale, so this replay
-        // must not replace the acknowledged private event.
-        rebase_status_after_demotion(dst.as_ref(), "pkg", &staged.manifest.status)
-            .await
-            .unwrap();
-        let current = status::read_status_versioned(dst.as_ref(), "pkg")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.doc, later);
-        assert_eq!(current.epoch, 2);
-    }
-
-    #[tokio::test]
-    async fn demotion_replaces_a_mirror_status_written_after_staging() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        seed_live(src.as_ref(), "pkg", "pkg-1.whl", b"private", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", "pkg-1.whl", b"mirror", MIRROR);
-        let private_status = status::ProjectStatusDoc {
-            status: status::ProjectStatus::Quarantined,
-            reason: Some("private review".into()),
-        };
-        status::advance_status(
-            src.as_ref(),
-            "pkg",
-            &private_status,
-            Some(status::StatusOrigin::Private),
-        )
-        .await
-        .unwrap();
-        let initial_mirror = status::ProjectStatusDoc {
-            status: status::ProjectStatus::Archived,
-            reason: Some("initial upstream".into()),
-        };
-        status::advance_status(
-            dst.as_ref(),
-            "pkg",
-            &initial_mirror,
-            Some(status::StatusOrigin::Mirror),
-        )
-        .await
-        .unwrap();
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-
-        let late_mirror = status::ProjectStatusDoc {
-            status: status::ProjectStatus::Deprecated,
-            reason: Some("late upstream".into()),
-        };
-        status::advance_status(
-            dst.as_ref(),
-            "pkg",
-            &late_mirror,
-            Some(status::StatusOrigin::Mirror),
-        )
-        .await
-        .unwrap();
-        begin_staged_claim(dst.as_ref(), &staged).await;
-        assert!(
-            settle_staged_package(&test_state(dst.clone()), dst.as_ref(), &staged)
-                .await
-                .unwrap()
-        );
-
-        let current = status::read_status_versioned(dst.as_ref(), "pkg")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.doc, private_status);
-        assert_eq!(current.epoch, 1);
-        assert_eq!(current.origin, Some(status::StatusOrigin::Private));
-    }
-
-    #[tokio::test]
-    async fn private_repair_manifest_never_rebases_newer_private_status() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        seed_live(src.as_ref(), "pkg", "pkg-1.whl", b"same", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", "pkg-1.whl", b"same", MIRROR);
-        // The package claim is already private; only the stale per-file mirror
-        // classification needs repair.
-        dst.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
-        let old = status::ProjectStatusDoc {
-            status: status::ProjectStatus::Archived,
-            reason: Some("old source".into()),
-        };
-        status::advance_status(
-            src.as_ref(),
-            "pkg",
-            &old,
-            Some(status::StatusOrigin::Private),
-        )
-        .await
-        .unwrap();
-        let newer = status::ProjectStatusDoc {
-            status: status::ProjectStatus::Quarantined,
-            reason: Some("new destination".into()),
-        };
-        status::advance_status(
-            dst.as_ref(),
-            "pkg",
-            &newer,
-            Some(status::StatusOrigin::Private),
-        )
-        .await
-        .unwrap();
-        status::advance_status(
-            dst.as_ref(),
-            "pkg",
-            &newer,
-            Some(status::StatusOrigin::Private),
-        )
-        .await
-        .unwrap();
-
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        assert_eq!(staged.manifest.mode, StagedMode::PrivateRepair);
-        assert!(
-            settle_staged_package(&test_state(dst.clone()), dst.as_ref(), &staged)
-                .await
-                .unwrap()
-        );
-        let current = status::read_status_versioned(dst.as_ref(), "pkg")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.doc, newer);
-        assert_eq!(current.epoch, 2);
-    }
-
-    #[tokio::test]
-    async fn tombstone_racing_a_complete_stage_prevents_resurrection() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        let filename = "pkg-1.whl";
-        let akey = artifact_key("pkg", filename);
-        seed_live(src.as_ref(), "pkg", filename, b"private", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", filename, b"mirror", MIRROR);
-        let state = test_state(dst.clone());
-
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        begin_staged_claim(dst.as_ref(), &staged).await;
-        dst.insert(&tombstone_key(&akey), b"{}".to_vec());
-
-        assert!(resume_staged_package(&state, dst.as_ref(), "pkg")
-            .await
-            .unwrap());
-        assert!(!dst.head_exists(&akey).await.unwrap());
-        assert!(dst.head_exists(&tombstone_key(&akey)).await.unwrap());
-        assert!(!dst
-            .list_all(REPL_STAGING_PREFIX)
-            .await
-            .unwrap()
-            .iter()
-            .any(|object| object.key.contains("/manifest@")));
-    }
-
-    #[tokio::test]
-    async fn post_stage_writer_with_stale_mirror_sidecar_freezes_both_bodies() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        let filename = "pkg-1.whl";
-        let akey = artifact_key("pkg", filename);
-        seed_live(src.as_ref(), "pkg", filename, b"private-a", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", filename, b"mirror", MIRROR);
-        let state = test_state(dst.clone());
-
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        begin_staged_claim(dst.as_ref(), &staged).await;
-        // The body changes after staging but before its writer publishes a new
-        // sidecar. Classification by the stale mirror sidecar would overwrite
-        // an acknowledged private body; the captured artifact etag catches it.
-        dst.insert(&akey, b"private-b".to_vec());
-
-        assert!(resume_staged_package(&state, dst.as_ref(), "pkg")
-            .await
-            .unwrap());
-        assert!(dst.head_exists(&akey).await.unwrap());
-        assert!(dst.head_exists(&frozen_key(&akey)).await.unwrap());
-        assert_eq!(dst.list_all(QUARANTINE_PREFIX).await.unwrap().len(), 2);
-        assert!(!dst
-            .list_all(REPL_STAGING_PREFIX)
-            .await
-            .unwrap()
-            .iter()
-            .any(|object| object.key.contains("/manifest@")));
-    }
-
-    #[tokio::test]
-    async fn staged_promotion_does_not_regress_a_private_yank_epoch() {
-        let src = Arc::new(InMemStorage::default());
-        let dst = Arc::new(InMemStorage::default());
-        let filename = "pkg-1.whl";
-        let akey = artifact_key("pkg", filename);
-        seed_live(src.as_ref(), "pkg", filename, b"same", PRIVATE);
-        seed_live(dst.as_ref(), "pkg", filename, b"same", MIRROR);
-        let state = test_state(dst.clone());
-
-        let staged = stage_private_package(src.as_ref(), dst.as_ref(), "pkg")
-            .await
-            .unwrap();
-        begin_staged_claim(dst.as_ref(), &staged).await;
-        dst.insert(
-            &sidecar_key(&akey),
-            serde_json::to_vec(&sc(
-                &sha256_hex(b"same"),
-                PRIVATE,
-                Yanked::Reason("newer".into()),
-                9,
-            ))
-            .unwrap(),
-        );
-
-        assert!(resume_staged_package(&state, dst.as_ref(), "pkg")
-            .await
-            .unwrap());
-        let sidecar: Sidecar =
-            serde_json::from_slice(&dst.get_bytes(&sidecar_key(&akey)).await.unwrap()).unwrap();
-        assert_eq!(sidecar.yank_epoch, 9);
-        assert_eq!(sidecar.yanked, Yanked::Reason("newer".into()));
-    }
-
-    #[tokio::test]
-    async fn queued_markers_are_durable_then_consumed_by_eager_success() {
+    async fn fanout_sync_copies_to_healthy_peer_and_writes_no_note() {
         let a = Arc::new(InMemStorage::default());
         let b = Arc::new(InMemStorage::default());
         let filename = "pkg-1.whl";
@@ -5302,13 +3210,45 @@ mod tests {
         let state = two_bucket_state(a.clone(), b.clone());
         let pinned = state.pin();
 
-        let markers = queue_fanout_markers(&state, &pinned, "pkg", filename)
-            .await
-            .unwrap();
-        assert_eq!(a.list_all(REPL_PREFIX).await.unwrap().len(), 1);
-        eager_fanout(&state, a.as_ref(), 0, "pkg", filename, markers).await;
+        fanout_sync(&state, &pinned, "pkg", filename).await;
         assert!(b.head_exists(&artifact_key("pkg", filename)).await.unwrap());
+        // The happy path leaves no note: the record is durable on every bucket
+        // at ack time.
         assert!(a.list_all(REPL_PREFIX).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fanout_sync_notes_an_ineligible_peer_without_copying() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        seed_live(a.as_ref(), "pkg", filename, b"wheel", PRIVATE);
+        let mut state = two_bucket_state(a.clone(), b.clone());
+        let health = Arc::new(
+            crate::bucket_health::HealthController::new(
+                2,
+                crate::bucket_health::HealthPolicy::new(1, std::time::Duration::from_secs(60))
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        // One availability failure crosses B into Unhealthy (leave threshold 1).
+        health
+            .observe(1, crate::bucket_health::BucketSignal::Timeout)
+            .unwrap();
+        state.bucket_health = Some(health);
+        let pinned = state.pin();
+
+        fanout_sync(&state, &pinned, "pkg", filename).await;
+        // No attempt against an ineligible bucket, but a durable note is left so
+        // the record reaches B when it heals.
+        assert!(!b.head_exists(&artifact_key("pkg", filename)).await.unwrap());
+        assert!(a
+            .list_all(&format!("{REPL_PREFIX}1/"))
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.key.contains("/pkg/")));
     }
 
     #[tokio::test]
@@ -5348,13 +3288,9 @@ mod tests {
         state.bucket_health = Some(health.clone());
         write_marker(a.as_ref(), 1, "from-a", from_a).await.unwrap();
         write_marker(b.as_ref(), 0, "from-b", from_b).await.unwrap();
-        let bad_manifest = format!("{REPL_STAGING_PREFIX}blocked/manifest@bad.json");
-        b.insert(&bad_manifest, b"not json".to_vec());
 
         // Every background path with an index-aware entry point skips B. The
-        // malformed manifest would fail stage recovery if B were read, and the
         // B-only private record would copy to A if the full diff touched it.
-        resume_staged_packages(&state).await.unwrap();
         reconcile(&state, &state.pin()).await.unwrap();
         assert!(
             !a.head_exists(&artifact_key("from-b", from_b))
@@ -5362,7 +3298,6 @@ mod tests {
                 .unwrap(),
             "pending topology validation must gate full-diff reads"
         );
-        b.delete_keys(&[bad_manifest]).await.unwrap();
 
         sweep_all_markers(&state).await.unwrap();
         assert!(
@@ -5436,7 +3371,7 @@ mod tests {
                 .head_exists(&frozen_key(&artifact_key("pkg", filename)))
                 .await
                 .unwrap());
-            assert!(storage
+            assert!(!storage
                 .head_exists(&artifact_key("pkg", filename))
                 .await
                 .unwrap());
@@ -5449,7 +3384,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_private_origin_creates_claims_but_refuses_unstaged_transitions() {
+    async fn ensure_private_origin_creates_demotes_and_is_idempotent() {
         // Absent → creates a private claim.
         let s = InMemStorage::default();
         ensure_private_origin(&s, "fresh").await.unwrap();
@@ -5458,13 +3393,12 @@ mod tests {
             Some(PRIVATE)
         );
 
-        // Mirror demotion must carry a committed package stage.
+        // Mirror → private is a direct CAS in v2.
         claim_origin(&s, "was-mirror", MIRROR).await.unwrap();
-        let error = ensure_private_origin(&s, "was-mirror").await.unwrap_err();
-        assert!(error.to_string().contains("staged private demotion"));
+        ensure_private_origin(&s, "was-mirror").await.unwrap();
         assert_eq!(
             read_origin(&s, "was-mirror").await.unwrap().as_deref(),
-            Some(MIRROR)
+            Some(PRIVATE)
         );
 
         // Already private → idempotent no-op.
@@ -5473,13 +3407,6 @@ mod tests {
             read_origin(&s, "fresh").await.unwrap().as_deref(),
             Some(PRIVATE)
         );
-
-        begin_private_promotion(&s, "fresh", "_staging/repl/fresh/manifest@pending.json")
-            .await
-            .unwrap()
-            .unwrap();
-        let error = ensure_private_origin(&s, "fresh").await.unwrap_err();
-        assert!(error.to_string().contains("under staged promotion"));
     }
 
     #[tokio::test]

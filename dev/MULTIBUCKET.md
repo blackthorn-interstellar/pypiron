@@ -6,6 +6,15 @@ additions are recorded in both documents. This document describes the shipped
 design (the "v2" synchronous fan-out design). The earlier async multi-master
 design it replaced is summarized in the postmortem at the end.
 
+The product goal is a **multi-region / multi-cloud package service** — an index
+that survives a region, or an entire cloud provider, going down. Buckets are the
+mechanism, not the goal: an ordered bucket list spanning regions or clouds is how
+the service gets there, and everything below is the contract that makes that
+survivable. The user manual sells the outcome (deploy nodes per region, share one
+list, ride out an outage) in
+[docs/guides/multi-region.md](../docs/guides/multi-region.md); this file is the
+mechanism.
+
 ## The design in one paragraph
 
 Hand pypiron an ordered list of buckets instead of one and it survives the loss
@@ -318,6 +327,11 @@ put-if-absent / put-if-match.
   bounds the window. A client mid-install across a switch may retry once.
 - Frozen conflicts require a human. Caches/CDNs may serve pre-freeze bytes until
   TTLs expire — no merge rule can un-serve bytes.
+- **No regional read-affinity (future work).** Every node reads from the first
+  healthy bucket in the shared order, so a node in a secondary region reads
+  cross-region in steady state. The feature buys outage survival, not read
+  locality; a node preferring its nearest bucket for reads is an open question
+  (tracked in [ROADMAP.md](ROADMAP.md)).
 
 ## 12. Operator rules the design requires
 

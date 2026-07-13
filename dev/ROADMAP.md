@@ -24,7 +24,7 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 - Client-aware artifact delivery on cloud backends (`auto` / `redirect` / `stream`) via presigned URLs; streaming uploads (incremental hash, bounded RSS, multipart for large artifacts).
 - Crash-safe event-marker indexing (intent/commit pairs); fingerprint audit with cost proportional to churn; `pypiron verify-index` / `pypiron rebuild-index`.
 - Multi-node on any cloud backend via a sloppy leader lease (conditional writes, TTL, heartbeat).
-- Multi-bucket S3 failover and private-truth replication — ordered regional buckets survive one bucket failing; health-driven selection moves new work within seconds, while durable fan-out and full-diff reconciliation heal partitions. Conflicting private bytes freeze, and topology changes are explicit through `pypiron buckets migrate`.
+- Multi-region / multi-cloud resilience — an ordered bucket list spanning regions or cloud providers (S3 + GCS + Azure) survives a region, or a whole cloud, going down. Uploads fan out to every reachable bucket before the ack (zero data loss for acked writes); health-driven selection moves new work within seconds, and durable fan-out plus full-diff reconciliation heal partitions. Conflicting private bytes freeze, and topology changes are explicit through `pypiron buckets migrate`. Buckets are the mechanism; [MULTIBUCKET.md](MULTIBUCKET.md) has the contract.
 
 **Mirroring & proxying**
 - `pypiron sync` over HTTP (`--to`, the single writer is always the server), carrying PyPI's true `upload-time` so `--exclude-newer` stays historically correct; tag/time/format gates; `--include-package`/`--include-packages-from` work-list selection; `--exclude-package`/`--exclude-packages-from` subtraction; `pypiron.toml` config layering.
@@ -51,6 +51,15 @@ performance change with its before/after.
 Tracked so they don't get lost. Not commitments — bucketed by intent.
 
 ### Maybe
+
+**Regional read-affinity.** Multi-region resilience (Shipped) fails the whole
+fleet over together, but every node reads from the same first-healthy bucket in
+the shared order — a node in a secondary region reads cross-region in steady
+state. The follow-up: let a node prefer its nearest bucket for reads (a per-node
+read preference distinct from the fleet-wide write order) so each region serves
+locally, while writes still fan out everywhere. Turns "survives an outage" into
+"survives an outage *and* reads locally." Open question: how a node expresses
+"nearest" without reintroducing per-node configuration drift.
 
 **Scoped API tokens (durable).** Stateless install tokens (Shipped) cover the
 ephemeral CI case but can't be revoked before they expire and carry no

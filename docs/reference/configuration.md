@@ -80,7 +80,7 @@ restarting.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `--s3-bucket NAME` | `PYPIRON_S3_BUCKET` | required | One S3 bucket. For several buckets (any backend) use `--buckets` — see [Multiple buckets](#multiple-buckets). |
+| `--s3-bucket NAME` | `PYPIRON_S3_BUCKET` | required | One S3 bucket. For several buckets (any backend) use `--buckets` — see [Multiple regions and clouds](#multiple-regions-and-clouds). |
 | `--aws-region REGION` | `AWS_REGION` | none | AWS region for a bucket without its own `@region`. |
 | `--s3-endpoint-url URL` | `PYPIRON_S3_ENDPOINT_URL` | none | MinIO or another S3-compatible endpoint. |
 | `--s3-force-path-style` | `PYPIRON_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing. |
@@ -88,26 +88,31 @@ restarting.
 AWS credentials use the standard AWS chain: env, web identity, instance role, or
 task role.
 
-#### Multiple buckets
+#### Multiple regions and clouds
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `--buckets URI,...` | `PYPIRON_BUCKETS` | none | Bucket URIs in preference order, any mix of backends. Enables replication and failover. |
+| `--buckets URI,...` | `PYPIRON_BUCKETS` | none | Bucket URIs in preference order, any mix of backends. Enables cross-region and cross-cloud replication and failover. |
 
-Give pypiron a list of buckets and it keeps them in sync and rides out the loss
-of any one — installs never stop, and an upload is durable on every reachable
-bucket before it returns. Set `--buckets` (or `PYPIRON_BUCKETS`) to a
-comma-separated list of URIs; the first is preferred:
+Spread the index across regions or cloud providers by giving pypiron a list of
+buckets instead of one. It keeps them in sync and rides out the loss of any one —
+a region, or a whole cloud. Installs never stop, and an upload is durable on every
+reachable bucket before it returns. Give every node the same ordered list; set
+`--buckets` (or `PYPIRON_BUCKETS`) to a comma-separated list of URIs, first is
+preferred:
 
 ```
-pypiron serve --buckets s3://iron-east,s3://iron-west
-PYPIRON_BUCKETS=s3://iron-east,s3://iron-west
+pypiron serve --buckets s3://iron-east@us-east-1,s3://iron-west@us-west-2
+PYPIRON_BUCKETS=s3://iron-east@us-east-1,s3://iron-west@us-west-2
 ```
 
 Each entry needs a scheme:
 
-- `s3://name` or `s3://name@region` — `@region` overrides the shared
-  `--aws-region` for that bucket.
+- `s3://name` or `s3://name@region` — `@region` sets the S3 client's signing and
+  endpoint region (SigV4 plus regional endpoints) for that bucket. One list can
+  span regions, so each S3 bucket carries its own; precedence is per-bucket
+  `@region`, then `--aws-region`, then the SDK default. `gs://` and `az://` need
+  no region — their endpoints do not encode one.
 - `gs://name` — a GCS bucket.
 - `az://container` — an Azure blob container.
 
@@ -133,8 +138,8 @@ removes private files but returns `409` for proxy-cached entries — cache evict
 across buckets is unavailable, so do not apply a broad `packages/` lifecycle rule
 (private and mirror records share that prefix).
 
-See [Multi-bucket failover](../guides/multi-bucket.md) for recovery behavior and
-operator rules.
+See [Survive a region or cloud outage](../guides/multi-region.md) for deployment,
+recovery behavior, and operator rules.
 
 ### GCS
 

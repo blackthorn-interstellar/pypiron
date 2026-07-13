@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -93,10 +94,83 @@ def pytest_collection_modifyitems(config, items):
         raise pytest.UsageError("\n".join(errors))
 
 
+def _tail(path, lines: int = 60) -> str:
+    try:
+        text = Path(path).read_text(errors="replace")
+    except OSError as exc:
+        return f"(unreadable: {exc})"
+    tail = text.splitlines()[-lines:]
+    return "\n".join(tail) if tail else "(empty)"
+
+
+def _mc_unchecked(minio: Dict, script: str) -> str:
+    """Best-effort `mc` snippet for diagnostics: never skips or raises."""
+    if not minio.get("endpoint"):
+        return "(no emulator endpoint)"
+    port = minio["endpoint"].rsplit(":", 1)[1]
+    creds = f"{minio['access_key']}:{minio['secret_key']}"
+    for extra in (
+        ["-e", f"MC_HOST_local=http://{creds}@host.docker.internal:{port}"],
+        ["-e", f"MC_HOST_local=http://{creds}@127.0.0.1:{port}", "--network", "host"],
+    ):
+        try:
+            rc, out, err = run_returncode(
+                ["docker", "run", "--rm", *extra, "--entrypoint", "sh", "minio/mc", "-c", script]
+            )
+        except OSError as exc:
+            return f"(mc unavailable: {exc})"
+        if rc == 0:
+            return out.strip() or "(empty)"
+    return f"(mc failed: {err.strip() or out.strip()})"
+
+
+def _dump_storage_diagnostics(item) -> None:
+    """On a failure in an S3/mixed fixture, print the evidence a bare assert
+    hides: the proxy request log, the pypiron server log, and the bucket
+    contents. Best-effort — a broken probe must not mask the real failure."""
+    server = None
+    candidates = list(getattr(item, "funcargs", {}).values())
+    # Pair fixtures (s3_servers_multi) nest their server dicts one level down
+    # under "left"/"right"; scan those too.
+    candidates.extend(
+        nested
+        for value in candidates
+        if isinstance(value, dict)
+        for nested in value.values()
+        if isinstance(nested, dict)
+    )
+    for value in candidates:
+        if (
+            isinstance(value, dict)
+            and "log_path" in value
+            and ("faults" in value or "minio" in value or "s3" in value)
+        ):
+            server = value
+            break
+    if server is None:
+        return
+    print(f"\n===== storage failure diagnostics for {item.nodeid} =====")
+    print(f"--- pypiron server log tail ({server.get('log_path')}) ---")
+    print(_tail(server.get("log_path")))
+    faults = server.get("faults")
+    proxy_log = getattr(faults, "log_path", None) if faults else None
+    if proxy_log:
+        print(f"--- s3 fault-proxy request log tail ({proxy_log}) ---")
+        print(_tail(proxy_log))
+    minio = server.get("minio") or server.get("s3")
+    if isinstance(minio, dict):
+        for bucket in minio.get("buckets") or ([minio["bucket"]] if minio.get("bucket") else []):
+            root = f"local/{bucket}/packages/"
+            print(f"--- mc ls --recursive {bucket}/packages/ ---")
+            print(_mc_unchecked(minio, f"mc ls --recursive {shlex.quote(root)}"))
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
+    if report.when in ("setup", "call") and report.failed:
+        _dump_storage_diagnostics(item)
     markers = list(item.iter_markers("compat"))
     if not markers:
         return
@@ -919,6 +993,10 @@ class BucketFaults:
         self._dripped_puts: dict[tuple[str, str], float] = {}
         self._requests: list[tuple[str, str, str]] = []
         self._lock = threading.Lock()
+        #: Per-fixture request log, set by ``_minio_fault_proxy``. On a test
+        #: failure the diagnostics hook tails it to show exactly what the proxy
+        #: saw and forwarded for each S3 call.
+        self.log_path: Optional[Path] = None
 
     def fail(self, *buckets: str) -> None:
         with self._lock:
@@ -990,12 +1068,27 @@ class _S3FaultProxyServer(ThreadingHTTPServer):
         self.origin_host = origin_host
         self.origin_port = origin_port
         self.faults = faults
+        self.log_path: Optional[Path] = None
+        self._log_lock = threading.Lock()
+
+    def log_request_line(self, line: str) -> None:
+        """Append one timestamped request line to the per-fixture proxy log."""
+        if self.log_path is None:
+            return
+        stamp = f"{time.strftime('%H:%M:%S')}.{int(time.time() * 1000) % 1000:03d}"
+        with self._log_lock:
+            with open(self.log_path, "a") as handle:
+                handle.write(f"{stamp} {line}\n")
 
 
 class _S3FaultProxyHandler(BaseHTTPRequestHandler):
     """Forward signed S3 requests byte-for-byte, preserving their Host header."""
 
     protocol_version = "HTTP/1.1"
+    # Cap a single accepted connection: a wedged read (the CI zero-byte trigger)
+    # must not pin a proxy thread forever. StreamRequestHandler.setup() applies
+    # this to the socket, so a stalled client trips it and the thread is freed.
+    timeout = 60
 
     def do_DELETE(self) -> None:
         self._proxy()
@@ -1015,12 +1108,20 @@ class _S3FaultProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, _format: str, *_args) -> None:
         pass
 
+    def _log(self, bucket: str, received: str, forwarded: int, upstream: str) -> None:
+        self.server.log_request_line(
+            f"{self.command} bucket={bucket or '-'} path={self.path} "
+            f"clen={received} forwarded={forwarded}B upstream={upstream}"
+        )
+
     def _proxy(self) -> None:
         path = urlsplit(self.path).path
         bucket, _, key = path.lstrip("/").partition("/")
         key = unquote(key)
         self.server.faults.record(bucket, self.command, self.path)
+        received = self.headers.get("Content-Length", "-")
         if bucket and self.server.faults.is_failed(bucket):
+            self._log(bucket, received, 0, "503-injected-outage")
             self._send_error(503, b"injected bucket outage")
             return
         if bucket and self.server.faults.is_blackholed(bucket):
@@ -1028,6 +1129,7 @@ class _S3FaultProxyHandler(BaseHTTPRequestHandler):
             # this connection silent much longer so the test distinguishes that
             # bound from an immediate synthetic 503.
             time.sleep(15)
+            self._log(bucket, received, 0, "503-injected-blackhole")
             try:
                 self._send_error(503, b"injected bucket blackhole")
             except (BrokenPipeError, ConnectionResetError):
@@ -1040,6 +1142,7 @@ class _S3FaultProxyHandler(BaseHTTPRequestHandler):
             )
             body = self._request_body(drip_duration=put_drip_duration)
         except (EOFError, OSError, ValueError):
+            self._log(bucket, received, 0, "400-invalid-body")
             self._send_error(400, b"invalid request body")
             return
 
@@ -1062,11 +1165,13 @@ class _S3FaultProxyHandler(BaseHTTPRequestHandler):
                 connection.send(body)
             response = connection.getresponse()
             response_body = response.read()
+            self._log(bucket, received, len(body), str(response.status))
             drip_duration = (
                 self.server.faults.drip_duration(bucket, key) if self.command == "GET" else None
             )
             self._send_upstream_response(response, response_body, drip_duration=drip_duration)
-        except (ConnectionError, OSError, http.client.HTTPException):
+        except (ConnectionError, OSError, http.client.HTTPException) as exc:
+            self._log(bucket, received, len(body), f"502-{type(exc).__name__}")
             self._send_error(502, b"MinIO proxy upstream unavailable")
         finally:
             connection.close()
@@ -1191,11 +1296,15 @@ def _minio_fault_proxy(minio: Dict) -> Iterator[Dict]:
         origin.port,
         faults,
     )
+    log_path = Path(tempfile.mkdtemp(prefix="s3-fault-proxy-")) / "requests.log"
+    server.log_path = log_path
+    faults.log_path = log_path
     thread = threading.Thread(target=server.serve_forever, name="s3-fault-proxy", daemon=True)
     thread.start()
     proxied = dict(minio)
     proxied["server_endpoint"] = f"http://127.0.0.1:{server.server_port}"
     proxied["faults"] = faults
+    proxied["proxy_log_path"] = log_path
     try:
         yield proxied
     finally:
@@ -1579,24 +1688,37 @@ def s3_server_prefixed_presigned(
     )
 
 
+#: Once one `mc` network mode works, every later call tries it first. On Linux
+#: CI host.docker.internal never resolves, so without this each byte-oracle
+#: poll burned a doomed docker run (seconds each) before the host-network
+#: fallback — enough, across `_eventually` loops, to blow the job budget.
+_MC_MODE_CACHE: list[str] | None = None
+
+
 def _mc(minio: Dict, script: str) -> str:
     """Run a `mc` shell snippet against the MinIO container, returning stdout.
     Mirrors the host.docker.internal → host-network fallback the `minio` fixture
     uses. Skips only on a networking failure; a broken `mc` command is a bug and
     must fail the test, not silently pass it."""
+    global _MC_MODE_CACHE
     if not minio.get("endpoint"):
         pytest.skip("mc bucket inspection targets the MinIO emulator, not a real S3 bucket")
     port = minio["endpoint"].rsplit(":", 1)[1]
     creds = f"{minio['access_key']}:{minio['secret_key']}"
+    modes = {
+        "internal": ["-e", f"MC_HOST_local=http://{creds}@host.docker.internal:{port}"],
+        "host": ["-e", f"MC_HOST_local=http://{creds}@127.0.0.1:{port}", "--network", "host"],
+    }
+    order = list(modes)
+    if _MC_MODE_CACHE and _MC_MODE_CACHE[0] in modes:
+        order.sort(key=lambda name: name != _MC_MODE_CACHE[0])
     attempts = []
-    for extra in (
-        ["-e", f"MC_HOST_local=http://{creds}@host.docker.internal:{port}"],
-        ["-e", f"MC_HOST_local=http://{creds}@127.0.0.1:{port}", "--network", "host"],
-    ):
+    for name in order:
         rc, out, err = run_returncode(
-            ["docker", "run", "--rm", *extra, "--entrypoint", "sh", "minio/mc", "-c", script]
+            ["docker", "run", "--rm", *modes[name], "--entrypoint", "sh", "minio/mc", "-c", script]
         )
         if rc == 0:
+            _MC_MODE_CACHE = [name]
             return out
         attempts.append(f"rc={rc} {err.strip() or out.strip()}")
     if all("unreachable" in a or "connection refused" in a.lower() for a in attempts):
@@ -1639,9 +1761,16 @@ def minio_get_key_in(minio: Dict, bucket: str, key: str) -> str:
 
 
 def minio_get_key_bytes_in(minio: Dict, bucket: str, key: str) -> bytes:
-    """Read a binary object from a named bucket, bypassing pypiron."""
+    """Read a binary object from a named bucket, bypassing pypiron.
+
+    Never pipe `mc cat` straight into base64: the pipeline exit code is
+    base64's, so a failed `mc cat` (e.g. unreachable host.docker.internal on a
+    Linux runner) reads as rc=0 with empty output — `_mc` then skips its
+    `--network host` fallback and an intact object hashes as zero bytes. The
+    `&&` chain keeps mc's own exit code, so a broken read fails over or fails
+    loudly instead of impersonating an empty object."""
     target = shlex.quote(f"local/{bucket}/{key}")
-    return base64.b64decode(_mc(minio, f"mc cat {target} | base64"))
+    return base64.b64decode(_mc(minio, f"mc cat {target} > /tmp/o && base64 < /tmp/o"))
 
 
 def minio_object_sha256(minio: Dict, bucket: str, key: str) -> str:

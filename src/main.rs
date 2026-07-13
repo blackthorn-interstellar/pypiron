@@ -3231,9 +3231,20 @@ async fn legacy_upload(
     // Ordering invariant: artifact, then sidecars, then index job.
     // The conditional create IS the immutability rule (pypi.org's): a plain
     // HEAD-then-PUT is a TOCTOU hole that lets concurrent uploads swap bytes.
-    match storage
-        .put_file_if_absent(&key, spooled.path.path(), Some("application/octet-stream"))
-        .await
+    // The write is verified (D1) and bounded (D3): a 200 that landed zero bytes
+    // never acks, and a wedged connection fails fast instead of parking on the
+    // one-hour transport ceiling. Immutability is preserved — an existing body
+    // is still a 409; only this writer's own corrupt debris is cleared so a
+    // retry starts from a clean key.
+    match storage::store_artifact_verified(
+        storage,
+        &key,
+        storage::ArtifactBody::Spool(spooled.path.path()),
+        size,
+        Some("application/octet-stream"),
+        storage::Existing::Reject,
+    )
+    .await
     {
         Ok(true) => {}
         Ok(false) => {

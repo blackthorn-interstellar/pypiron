@@ -716,6 +716,22 @@ pub trait Storage: Send + Sync {
     /// Check if an object exists.
     async fn head_exists(&self, key: &str) -> Result<bool>;
 
+    /// The stored size of `key` in bytes, or `None` if it is absent. One
+    /// metadata round-trip — a HEAD on the object stores, a stat on disk — used
+    /// by [`store_artifact_verified`] to confirm a just-written artifact
+    /// actually landed its bytes rather than a silent zero-byte 200.
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        // Correct for any backend via one bounded listing; the native backends
+        // override it with a single HEAD/stat. The exact key sorts ahead of any
+        // sidecar or companion sharing its prefix, so a tiny page suffices.
+        for obj in self.list_page(key, None, 4).await? {
+            if obj.key == key {
+                return Ok(Some(obj.size));
+            }
+        }
+        Ok(None)
+    }
+
     /// Serve an artifact as an HTTP response, honoring a `Range` header.
     /// Each backend uses its native range machinery (seek for disk, S3's own
     /// validation for S3). Errors mean "not found" to the caller.
@@ -817,6 +833,213 @@ pub trait Storage: Send + Sync {
     }
 }
 
+/// A wedged artifact write must fail in bounded time instead of parking on the
+/// one-hour transport ceiling ([`FAILOVER_REQUEST_TIMEOUT`]), yet a healthy
+/// multi-MiB upload dripping over a slow link must still finish. Budget a flat
+/// base plus a per-MiB allowance: generous enough that steady progress never
+/// trips it (the blackbox suite drips 16 MiB over 11s), tight enough that a
+/// stalled connection is abandoned long before the request deadline.
+const ARTIFACT_WRITE_TIMEOUT_BASE: std::time::Duration = std::time::Duration::from_secs(60);
+const ARTIFACT_WRITE_TIMEOUT_PER_MIB: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn artifact_write_timeout(payload_size: u64) -> std::time::Duration {
+    let mib = (payload_size / (1024 * 1024)).min(u32::MAX as u64) as u32;
+    ARTIFACT_WRITE_TIMEOUT_BASE + ARTIFACT_WRITE_TIMEOUT_PER_MIB * mib
+}
+
+fn artifact_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Bound one artifact write (D3): a connection that stops making progress is
+/// abandoned with a clear error instead of hanging on the transport ceiling.
+pub async fn bounded_artifact_write<T>(
+    key: &str,
+    payload_size: u64,
+    op: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let budget = artifact_write_timeout(payload_size);
+    match tokio::time::timeout(budget, op).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(anyhow!(
+            "artifact write to {key} exceeded {budget:?}; treating the connection as wedged"
+        )),
+    }
+}
+
+/// D1: HEAD `key` and require the stored object is exactly `expected_size`
+/// bytes. A conditional create that 200-acked but landed truncated or zero
+/// bytes (observed only behind CI's fault proxy) is caught here instead of
+/// being trusted and propagated as truth.
+pub async fn verify_stored_size(
+    storage: &dyn Storage,
+    key: &str,
+    expected_size: u64,
+) -> Result<()> {
+    let stored = storage
+        .stored_size(key)
+        .await
+        .with_context(|| format!("HEAD {key} to verify the stored artifact"))?
+        .ok_or_else(|| anyhow!("artifact {key} vanished immediately after a create success"))?;
+    if stored != expected_size {
+        bail!(
+            "artifact {key} stored {stored} bytes, expected {expected_size} (write landed corrupt)"
+        );
+    }
+    Ok(())
+}
+
+/// How an already-present body under an immutable artifact key is resolved by
+/// [`store_artifact_verified`].
+#[derive(Clone, Copy)]
+pub enum Existing<'a> {
+    /// Filenames are immutable (the upload path): a body already at the key is
+    /// the caller's conflict — returned as `Ok(false)`, never overwritten. A
+    /// create that lands corrupt is deleted so the caller's retry starts from a
+    /// clean key instead of being locked out by its own zero-byte debris.
+    Reject,
+    /// The sha256 is authoritative (the replication copy): a matching body
+    /// dedups (`Ok(false)`), a wrong one is stale crash debris repaired in
+    /// place, and either way the key ends holding exactly these bytes.
+    Repair(&'a str),
+}
+
+/// The body of an artifact write: already resident (replication) or spooled to
+/// disk and streamed so large uploads never sit in memory (upload).
+pub enum ArtifactBody<'a> {
+    Bytes(Vec<u8>),
+    Spool(&'a std::path::Path),
+}
+
+impl ArtifactBody<'_> {
+    async fn read_all(&self) -> Result<Vec<u8>> {
+        match self {
+            ArtifactBody::Bytes(bytes) => Ok(bytes.clone()),
+            ArtifactBody::Spool(path) => fs::read(path)
+                .await
+                .with_context(|| format!("read spool {} for repair", path.display())),
+        }
+    }
+}
+
+/// Store an immutable artifact at `key`, then prove the bytes that landed are
+/// the bytes we meant to write — the shared write primitive for the upload path
+/// and the replication copy.
+///
+/// D1: a conditional create that 200-acks but silently lands zero or truncated
+/// bytes used to be trusted and propagated. Every create success is now
+/// confirmed with one HEAD (`stored size == expected_size`); an already-present
+/// body is resolved by `existing`. D3: the write is bounded by a payload-scaled
+/// timeout so a wedged connection can never park the caller on the transport
+/// ceiling.
+///
+/// Returns `true` when this call is what put the correct bytes at `key` (a
+/// create or a repair) and `false` when an already-correct body was found.
+pub async fn store_artifact_verified(
+    storage: &dyn Storage,
+    key: &str,
+    body: ArtifactBody<'_>,
+    expected_size: u64,
+    content_type: Option<&str>,
+    existing: Existing<'_>,
+) -> Result<bool> {
+    let created = match &body {
+        ArtifactBody::Bytes(bytes) => {
+            bounded_artifact_write(
+                key,
+                expected_size,
+                storage.put_if_absent(key, bytes.clone(), content_type),
+            )
+            .await?
+        }
+        ArtifactBody::Spool(path) => {
+            bounded_artifact_write(
+                key,
+                expected_size,
+                storage.put_file_if_absent(key, path, content_type),
+            )
+            .await?
+        }
+    };
+    if created {
+        if let Err(error) = verify_stored_size(storage, key, expected_size).await {
+            if matches!(existing, Existing::Reject) {
+                // Our own just-created object is corrupt; drop it so an
+                // immutable retry is not permanently blocked by a 409 against
+                // debris only this writer could have left.
+                let _ = storage.delete_keys(&[key.to_string()]).await;
+            }
+            return Err(error);
+        }
+        return Ok(true);
+    }
+    let expected_sha = match existing {
+        Existing::Reject => return Ok(false),
+        Existing::Repair(sha) => sha,
+    };
+    let current = storage
+        .get_bytes(key)
+        .await
+        .with_context(|| format!("read back already-present artifact {key}"))?;
+    if artifact_sha256_hex(&current) == expected_sha {
+        return Ok(false);
+    }
+    // A wrong-sha body under an immutable key is stale crash debris (e.g. a
+    // zero-byte object a 200-acked-but-failed write left behind). Overwrite it
+    // with the correct bytes and re-verify, so heal converges instead of
+    // bailing forever on an object nothing could repair.
+    tracing::warn!(
+        key = %key,
+        expected_sha = %expected_sha,
+        "repairing artifact whose stored bytes do not match its sidecar"
+    );
+    let correct = body.read_all().await?;
+    bounded_artifact_write(
+        key,
+        expected_size,
+        storage.put_bytes(key, correct, content_type),
+    )
+    .await?;
+    let after = storage
+        .get_bytes(key)
+        .await
+        .with_context(|| format!("re-verify repaired artifact {key}"))?;
+    let after_sha = artifact_sha256_hex(&after);
+    if after_sha != expected_sha {
+        bail!(
+            "artifact {key} still wrong after repair: stored {after_sha}, expected {expected_sha}"
+        );
+    }
+    Ok(true)
+}
+
+/// Create `key` if absent — bounded (D3) and, on a create success, verified
+/// (D1). `true` means this call created the object; `false` means it already
+/// existed and the caller must reconcile the winner. Unlike
+/// [`store_artifact_verified`] this never overwrites a byte-divergent winner:
+/// the replication copy freezes that conflict rather than clobbering it.
+pub async fn create_artifact_verified(
+    storage: &dyn Storage,
+    key: &str,
+    bytes: Vec<u8>,
+    expected_size: u64,
+    content_type: Option<&str>,
+) -> Result<bool> {
+    let created = bounded_artifact_write(
+        key,
+        expected_size,
+        storage.put_if_absent(key, bytes, content_type),
+    )
+    .await?;
+    if created {
+        verify_stored_size(storage, key, expected_size).await?;
+    }
+    Ok(created)
+}
+
 /// EXDEV ("invalid cross-device link"), hardcoded so we don't pull in libc.
 const EXDEV: i32 = 18;
 
@@ -909,6 +1132,14 @@ impl Storage for DiskStorage {
     async fn head_exists(&self, key: &str) -> Result<bool> {
         let p = self.resolve(key)?;
         Ok(fs::metadata(p).await.is_ok())
+    }
+
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        match fs::metadata(self.resolve(key)?).await {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("stat {key}"))),
+        }
     }
 
     async fn presign_get(
@@ -1384,6 +1615,17 @@ impl Storage for ObjectStorage {
         }
     }
 
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        match self.store.head(&self.oskey(key)).await {
+            Ok(meta) => Ok(Some(meta.size)),
+            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
+                Err(bucket_unavailable(self.backend, &e))
+            }
+            Err(OsError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("{}: head {key}", self.backend))),
+        }
+    }
+
     async fn presign_get(&self, key: &str, expires: std::time::Duration) -> Result<Option<String>> {
         let Some(signer) = &self.signer else {
             return Ok(None);
@@ -1853,6 +2095,9 @@ impl Storage for FaultInjectStorage {
     async fn head_exists(&self, key: &str) -> Result<bool> {
         self.inner.head_exists(key).await
     }
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        self.inner.stored_size(key).await
+    }
     async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>> {
         self.inner.serve_artifact(key, range).await
     }
@@ -2166,6 +2411,26 @@ mod tests {
             pack_version(&Some("a".into()), &None),
             pack_version(&None, &Some("a".into())),
         );
+    }
+
+    #[test]
+    fn artifact_write_timeout_scales_by_whole_mib() {
+        use std::time::Duration;
+        // Base floor for anything under a MiB (rounds down).
+        assert_eq!(artifact_write_timeout(0), Duration::from_secs(60));
+        assert_eq!(
+            artifact_write_timeout(1024 * 1024 - 1),
+            Duration::from_secs(60)
+        );
+        // One second added per whole MiB.
+        assert_eq!(artifact_write_timeout(1024 * 1024), Duration::from_secs(61));
+        // The 16 MiB blackbox drip (11s) sits well inside its budget.
+        assert_eq!(
+            artifact_write_timeout(16 * 1024 * 1024),
+            Duration::from_secs(76)
+        );
+        // A pathological size saturates instead of overflowing the u32 multiply.
+        assert!(artifact_write_timeout(u64::MAX) >= Duration::from_secs(60));
     }
 }
 

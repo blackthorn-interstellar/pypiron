@@ -336,6 +336,12 @@ impl Storage for ObservedStorage {
         result
     }
 
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        let result = self.inner.stored_size(key).await;
+        self.record(&result);
+        result
+    }
+
     async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>> {
         let result = self.inner.serve_artifact(key, range).await;
         self.record(&result);

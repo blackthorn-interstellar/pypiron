@@ -40,7 +40,10 @@ use crate::sidecar::{
     Sidecar, Yanked, FROZEN_SUFFIX, MIRROR_QUARANTINED_SUFFIX, SIDECAR_SUFFIX, TOMBSTONE_SUFFIX,
 };
 use crate::status::{self, StatusConvergence};
-use crate::storage::{is_not_found, Storage};
+use crate::storage::{
+    bounded_artifact_write, create_artifact_verified, is_not_found, store_artifact_verified,
+    verify_stored_size, ArtifactBody, Existing, Storage,
+};
 use crate::tombstone;
 use crate::worker;
 use crate::{AppState, PACKAGES_PREFIX};
@@ -777,26 +780,28 @@ async fn copy_missing_object(
     put_if_absent_or_verify(dst, key, bytes, Some(content_type)).await
 }
 
+/// Publish a small companion (sidecar-adjacent `.metadata`/`.provenance`, a
+/// quarantine marker) under an immutable key. The bytes are their own identity,
+/// so a create is verified (D1), a match dedups, and a wrong-sha body — stale
+/// crash debris, e.g. a zero-byte companion a failed write left behind — is
+/// repaired in place rather than blocking every future sweep on a `bail!`.
 async fn put_if_absent_or_verify(
     storage: &dyn Storage,
     key: &str,
     bytes: Vec<u8>,
     content_type: Option<&str>,
 ) -> Result<bool> {
-    if storage
-        .put_if_absent(key, bytes.clone(), content_type)
-        .await?
-    {
-        return Ok(true);
-    }
-    let current = storage
-        .get_bytes(key)
-        .await
-        .with_context(|| format!("verify concurrently-created object {key}"))?;
-    if current != bytes {
-        bail!("concurrently-created object differs at {key}");
-    }
-    Ok(false)
+    let sha = sha256_hex(&bytes);
+    let size = bytes.len() as u64;
+    store_artifact_verified(
+        storage,
+        key,
+        ArtifactBody::Bytes(bytes),
+        size,
+        content_type,
+        Existing::Repair(&sha),
+    )
+    .await
 }
 
 struct VerifiedSource {
@@ -943,20 +948,30 @@ async fn copy_live(
     let verified = verify_source_record(src, pkg, filename, record).await?;
     require_replication_unfenced(state)?;
 
-    // A body that appeared after the merge read is safe only when it is the
-    // exact same immutable artifact. Do not touch its sidecar otherwise; the
-    // marker retry will observe the complete competing record and freeze it.
+    // A destination body already sitting under this immutable key with the
+    // wrong sha is stale crash debris — e.g. a zero-byte object a
+    // 200-acked-but-failed write left behind (D2). Heal could never converge
+    // while we bailed on it, so repair it in place with the sha-verified source
+    // bytes; the conditional create below then dedups. A body that first
+    // *appears during* this copy is still caught as a race at that create and
+    // frozen, never silently overwritten.
+    let mut changed = false;
     if dst.head_exists(&akey).await? {
         let current = dst
             .get_bytes(&akey)
             .await
             .with_context(|| format!("verify destination artifact {akey}"))?;
-        let got = sha256_hex(&current);
-        if got != sc.sha256 {
-            bail!(
-                "destination artifact appeared with sha {got} while copying {}",
-                sc.sha256
-            );
+        if sha256_hex(&current) != sc.sha256 {
+            store_artifact_verified(
+                dst,
+                &akey,
+                ArtifactBody::Bytes(verified.artifact.clone()),
+                verified.artifact.len() as u64,
+                Some("application/octet-stream"),
+                Existing::Repair(&sc.sha256),
+            )
+            .await?;
+            changed = true;
         }
     }
     // Origin claim first, ahead of the artifact — shrinks the dependency-
@@ -964,7 +979,7 @@ async fn copy_live(
     ensure_private_origin(dst, pkg).await?;
     // Sidecar first: an orphan sidecar is inert, but an orphan artifact would be
     // fabricated into truth by the destination's backfill (§4).
-    let mut changed = install_or_verify_sidecar(dst, &sidecar_key(&akey), sc).await?;
+    changed |= install_or_verify_sidecar(dst, &sidecar_key(&akey), sc).await?;
     if let Some(bytes) = verified.metadata {
         changed |= put_if_absent_or_verify(
             dst,
@@ -982,11 +997,17 @@ async fn copy_live(
     // Artifact last. Losing this conditional create must never be reported as
     // a copy: verify the winner. Same bytes converged; different bytes freeze
     // immediately so the source sidecar we installed cannot describe the
-    // competing body even briefly after this operation returns.
+    // competing body even briefly after this operation returns. The create is
+    // verified (D1) and bounded (D3) by the shared primitive.
     let len = verified.artifact.len() as u64;
-    if dst
-        .put_if_absent(&akey, verified.artifact, Some("application/octet-stream"))
-        .await?
+    if create_artifact_verified(
+        dst,
+        &akey,
+        verified.artifact,
+        len,
+        Some("application/octet-stream"),
+    )
+    .await?
     {
         state.metrics.record_replicated(len);
         return Ok(true);
@@ -1062,16 +1083,19 @@ async fn supersede_record(
             artifact_present = true;
         } else {
             quarantine_bytes(dst, pkg, filename, &current).await?;
-            if dst
-                .put_if_match(&akey, &etag, verified.artifact.clone())
-                .await?
-                .is_none()
+            let len = verified.artifact.len() as u64;
+            if bounded_artifact_write(
+                &akey,
+                len,
+                dst.put_if_match(&akey, &etag, verified.artifact.clone()),
+            )
+            .await?
+            .is_none()
             {
                 bail!("destination artifact changed during supersede for {akey}");
             }
-            state
-                .metrics
-                .record_replicated(verified.artifact.len() as u64);
+            verify_stored_size(dst, &akey, len).await?;
+            state.metrics.record_replicated(len);
             artifact_present = true;
         }
     }
@@ -1095,17 +1119,17 @@ async fn supersede_record(
     .await?;
 
     if !artifact_present {
-        if dst
-            .put_if_absent(
-                &akey,
-                verified.artifact.clone(),
-                Some("application/octet-stream"),
-            )
-            .await?
+        let len = verified.artifact.len() as u64;
+        if create_artifact_verified(
+            dst,
+            &akey,
+            verified.artifact.clone(),
+            len,
+            Some("application/octet-stream"),
+        )
+        .await?
         {
-            state
-                .metrics
-                .record_replicated(verified.artifact.len() as u64);
+            state.metrics.record_replicated(len);
         } else {
             let raced = dst
                 .get_bytes(&akey)

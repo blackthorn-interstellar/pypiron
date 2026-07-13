@@ -564,6 +564,11 @@ fn file_format(filename: &str) -> Format {
 /// parsed and validated up front.
 struct Resolved {
     src_base: String,
+    /// SSRF guard for the outbound artifact/provenance fetches. The source host
+    /// is exempt (it may be an internal mirror); every other listing-derived or
+    /// redirect target must resolve public. `sync` has no allow-host knobs — an
+    /// escape hatch belongs on the long-lived `serve` proxy, not a one-shot run.
+    guard: Arc<crate::ssrf::Guard>,
     dst_base: String,
     admin_user: Option<String>,
     admin_pass: Option<String>,
@@ -662,12 +667,23 @@ impl Resolved {
             bail!("--package-concurrency must be at least 1");
         }
 
+        let src_base = args
+            .src_base
+            .clone()
+            .or(sync.from)
+            .unwrap_or_else(|| "https://pypi.org".to_string());
+        // Both endpoints are operator-configured and trusted, so both are exempt
+        // — the destination is often an internal/private pypiron, and the shared
+        // client posts uploads and cursor state to it. Only listing-derived
+        // download targets (which may point anywhere) are guarded.
+        let dst_host: Vec<String> = reqwest::Url::parse(&dst_base)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .into_iter()
+            .collect();
         Ok(Self {
-            src_base: args
-                .src_base
-                .clone()
-                .or(sync.from)
-                .unwrap_or_else(|| "https://pypi.org".to_string()),
+            guard: Arc::new(crate::ssrf::Guard::new(&src_base, &dst_host, &[])?),
+            src_base,
             dst_base,
             admin_user: args.admin_user.clone().or(sync.admin_user),
             admin_pass: args.admin_pass.clone().or(sync.admin_pass),
@@ -1406,6 +1422,17 @@ pub async fn run_sync(args: SyncArgs, config_path: Option<PathBuf>) -> Result<()
 
     let client = Client::builder()
         .user_agent("pypiron-sync/0.1 (+https://github.com/blackthorn-interstellar/pypiron)")
+        // Same SSRF guard as the proxy: a malicious/MITM'd source listing can
+        // point a file or provenance URL at an internal address. Filter DNS
+        // results and follow redirects manually (guarded_get) so IP-literal hops
+        // are validated too. The source host itself is exempt.
+        .dns_resolver(Arc::new(crate::ssrf::SsrfGuardResolver::new(
+            resolved.guard.clone(),
+        )))
+        .redirect(reqwest::redirect::Policy::none())
+        // Ignore ambient HTTP(S)_PROXY/ALL_PROXY: a forward proxy would bypass
+        // the SsrfGuardResolver by connecting to name hosts on our behalf.
+        .no_proxy()
         // Bound the handshake and any mid-stream stall so a dead/dribbling
         // upstream fails a sync task cleanly (the retry loop absorbs it) instead
         // of hanging forever. read_timeout is per-read and resets on each chunk,
@@ -1934,16 +1961,25 @@ fn select_from_index(
 const MAX_PROVENANCE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Best-effort provenance fetch — supplemental, never fails the file.
-async fn download_provenance(client: &Client, url: &str) -> Option<Vec<u8>> {
-    let resp = match client
-        .get(url)
-        .send()
+async fn download_provenance(
+    client: &Client,
+    guard: &crate::ssrf::Guard,
+    url: &str,
+) -> Option<Vec<u8>> {
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(e) => {
+            warn!(%url, error=?e, "sync: unparseable provenance URL");
+            return None;
+        }
+    };
+    let resp = match crate::ssrf::guarded_get(client, guard, parsed, None)
         .await
-        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.error_for_status().map_err(Into::into))
     {
         Ok(resp) => resp,
         Err(e) => {
-            warn!(%url, error=?e, "sync: provenance fetch failed");
+            warn!(%url, error=?e, "sync: provenance fetch refused/failed");
             return None;
         }
     };
@@ -1981,6 +2017,7 @@ const DOWNLOAD_ATTEMPTS: u32 = 3;
 
 async fn download_verified(
     client: &Client,
+    guard: &crate::ssrf::Guard,
     file: &SimpleFile,
     spool_dir: &Path,
 ) -> Result<FinishedSpool> {
@@ -1989,7 +2026,7 @@ async fn download_verified(
         .ok_or_else(|| anyhow!("no sha256 for {}", file.filename))?;
     let mut last_err = None;
     for attempt in 1..=DOWNLOAD_ATTEMPTS {
-        match download_once(client, file, spool_dir).await {
+        match download_once(client, guard, file, spool_dir).await {
             Ok(spool) if spool.sha256.eq_ignore_ascii_case(expected) => return Ok(spool),
             Ok(spool) => {
                 last_err = Some(anyhow!(
@@ -1998,6 +2035,9 @@ async fn download_verified(
                     spool.sha256
                 ));
             }
+            // A guard refusal is deterministic — the target is forbidden, so
+            // fail fast rather than retry the same blocked URL with backoff.
+            Err(e) if e.downcast_ref::<crate::ssrf::Blocked>().is_some() => return Err(e),
             Err(e) => last_err = Some(e),
         }
         if attempt < DOWNLOAD_ATTEMPTS {
@@ -2016,10 +2056,15 @@ async fn download_verified(
 /// aborted before it can fill the disk.
 async fn download_once(
     client: &Client,
+    guard: &crate::ssrf::Guard,
     file: &SimpleFile,
     spool_dir: &Path,
 ) -> Result<FinishedSpool> {
-    let resp = client.get(&file.url).send().await?.error_for_status()?;
+    let url = reqwest::Url::parse(&file.url)
+        .with_context(|| format!("unparseable file URL for {}", file.filename))?;
+    let resp = crate::ssrf::guarded_get(client, guard, url, None)
+        .await?
+        .error_for_status()?;
     let mut spool = UploadSpool::new(spool_dir).await?;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -2049,7 +2094,7 @@ async fn upload_via_http(
     s: &Selected,
 ) -> Result<bool> {
     // Held until after the POST below: dropping the spool deletes its temp file.
-    let spool = download_verified(client, &s.file, &resolved.spool_dir).await?;
+    let spool = download_verified(client, &resolved.guard, &s.file, &resolved.spool_dir).await?;
 
     info!("  - uploading {}", s.file.filename);
     // Stream the spool file into the multipart body instead of re-buffering it
@@ -2097,7 +2142,7 @@ async fn upload_via_http(
     // stores it as the `.provenance` companion. Best-effort and UTF-8 (the
     // object is JSON), so a fetch failure just omits the supply-chain signal.
     if let Some(prov_url) = &s.file.provenance {
-        if let Some(prov) = download_provenance(client, prov_url).await {
+        if let Some(prov) = download_provenance(client, &resolved.guard, prov_url).await {
             if let Ok(text) = String::from_utf8(prov) {
                 form = form.text("provenance", text);
             }
@@ -3000,6 +3045,7 @@ mod tests {
 
     fn resolved_with(filter: ResolvedMirror, src_base: &str) -> Resolved {
         Resolved {
+            guard: Arc::new(crate::ssrf::Guard::new(src_base, &[], &[]).unwrap()),
             src_base: src_base.to_string(),
             dst_base: "https://dest.example".to_string(),
             admin_user: None,

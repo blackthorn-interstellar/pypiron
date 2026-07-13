@@ -57,6 +57,16 @@ impl SimpleFile {
                 .unwrap_or(false)
     }
 
+    /// PEP 714/658 core-metadata digest, if the listing carried one as a hash
+    /// object (`{"sha256": "…"}`). A bare `true` advertises the companion without
+    /// a digest, so returns `None` — nothing to verify against.
+    pub fn core_metadata_sha256(&self) -> Option<&str> {
+        [&self.core_metadata, &self.dist_info_metadata]
+            .into_iter()
+            .flatten()
+            .find_map(|v| v.get("sha256").and_then(serde_json::Value::as_str))
+    }
+
     /// Index entry rendered from this listing. `version` is left to filename
     /// inference downstream — the Simple API doesn't bind files to versions.
     pub fn as_file_metadata(&self) -> FileMetadata {

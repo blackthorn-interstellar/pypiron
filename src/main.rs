@@ -42,6 +42,7 @@ mod render;
 mod replicate;
 mod sidecar;
 mod simple;
+mod ssrf;
 mod status;
 mod storage;
 mod sync;
@@ -910,6 +911,22 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_METRICS_PROJECT_LABELS")]
     metrics_project_labels: bool,
 
+    /// Permit the proxy to fetch listing-derived URLs (artifact, `.metadata`,
+    /// `.provenance`, redirect targets) whose host matches this exact value, even
+    /// if it resolves to a private/internal address. Repeatable; comma-separated
+    /// in the env var. Empty by default: only the configured upstream host is
+    /// exempt. For a fully-internal deployment whose files live on a different
+    /// private host than the index.
+    #[arg(long, env = "PYPIRON_PROXY_ALLOW_HOST", value_delimiter = ',')]
+    proxy_allow_host: Vec<String>,
+
+    /// Permit the proxy to fetch listing-derived URLs whose IP falls in this
+    /// CIDR (e.g. `10.0.0.0/8`), even though it is otherwise private. Repeatable;
+    /// comma-separated in the env var. Empty by default. Same escape hatch as
+    /// `--proxy-allow-host`, keyed by address range instead of host name.
+    #[arg(long, env = "PYPIRON_PROXY_ALLOW_CIDR", value_delimiter = ',')]
+    proxy_allow_cidr: Vec<String>,
+
     /// The slice of PyPI the proxy serves and caches — names included. The same
     /// mirror-selection surface as `sync`, set once and shared: a `[mirror]` table
     /// in pypiron.toml governs both. With a package scope, the proxy serves only
@@ -1615,6 +1632,8 @@ async fn run_serve(
                 upstream,
                 mirror,
                 cli.allow_insecure_upstream,
+                &cli.proxy_allow_host,
+                &cli.proxy_allow_cidr,
             )?))
         }
         None => None,

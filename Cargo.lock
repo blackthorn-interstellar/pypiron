@@ -1291,6 +1291,7 @@ dependencies = [
  "futures",
  "html-escape",
  "http",
+ "ipnet",
  "mimalloc",
  "object_store",
  "pep440_rs",
@@ -1308,6 +1309,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zip",
 ]
 

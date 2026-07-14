@@ -118,6 +118,20 @@ fn maybe_gzip(identity: &[u8]) -> Option<Variant> {
     })
 }
 
+/// Build the identity + optional gzip representations of an index body without
+/// caching them. The read-through fallback renders a page fetched straight from
+/// the write pin (dev/READ_AFFINITY_VISION.md) so a package key is never
+/// populated in the read-pin index cache from anything but the read pin.
+pub fn build_variants(bytes: Vec<u8>) -> (Variant, Option<Variant>) {
+    let gzip = maybe_gzip(&bytes);
+    let etag = quoted_sha256(&bytes);
+    let identity = Variant {
+        body: bytes::Bytes::from(bytes),
+        etag,
+    };
+    (identity, gzip)
+}
+
 struct Entry {
     cached: Cached,
     fetched: Instant,
@@ -132,6 +146,12 @@ struct Entries {
     /// clears everything so a page built from the old bucket can't be served for
     /// the new one. Single-bucket stays generation 0 forever — the reconcile is
     /// one `u64` compare that never clears.
+    ///
+    /// Read affinity keeps both pins on one generation (src/buckets.rs), so the
+    /// key populates cleanly from a single pin: the root-index key is populated
+    /// only from the write pin, package index keys only from the read pin (the
+    /// write-pin read-through renders uncached via [`build_variants`]). One
+    /// populating pin per key means an entry never mixes two buckets' bytes.
     generation: u64,
 }
 

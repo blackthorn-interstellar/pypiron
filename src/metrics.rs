@@ -34,6 +34,7 @@ struct BucketMetricState {
     names: Vec<String>,
     states: Vec<HealthState>,
     selected_index: usize,
+    read_selected_index: usize,
     selection_generation: u64,
     alarm_totals: HashMap<String, u64>,
     topology_write_fenced: bool,
@@ -224,6 +225,7 @@ impl Metrics {
             })
             .collect();
         state.selected_index = snapshot.selected_index;
+        state.read_selected_index = snapshot.read_selected_index;
         state.selection_generation = generation;
         state.topology_write_fenced = topology_write_fenced;
         for (index, name) in bucket_names.iter().enumerate() {
@@ -485,8 +487,12 @@ impl Metrics {
             "# HELP pypiron_bucket_health_state Per-node bucket health: healthy=1, unknown=0, unhealthy=-1.\n",
         );
         out.push_str("# TYPE pypiron_bucket_health_state gauge\n");
-        out.push_str("# HELP pypiron_bucket_selected Selected bucket (one-hot).\n");
+        out.push_str("# HELP pypiron_bucket_selected Selected (write) bucket (one-hot).\n");
         out.push_str("# TYPE pypiron_bucket_selected gauge\n");
+        out.push_str(
+            "# HELP pypiron_bucket_read_selected Read-serving bucket for this node (one-hot).\n",
+        );
+        out.push_str("# TYPE pypiron_bucket_read_selected gauge\n");
         out.push_str(
             "# HELP pypiron_bucket_health_alarms_total Credential, CAS, KMS, quota, configuration, and other non-availability storage errors.\n",
         );
@@ -505,6 +511,7 @@ impl Metrics {
                 HealthState::Unhealthy => -1,
             };
             let selected = usize::from(index == state.selected_index);
+            let read_selected = usize::from(index == state.read_selected_index);
             let alarms = state
                 .alarm_totals
                 .get(&state.names[index])
@@ -514,6 +521,9 @@ impl Metrics {
                 "pypiron_bucket_health_state{{{labels}}} {health}\n"
             ));
             out.push_str(&format!("pypiron_bucket_selected{{{labels}}} {selected}\n"));
+            out.push_str(&format!(
+                "pypiron_bucket_read_selected{{{labels}}} {read_selected}\n"
+            ));
             out.push_str(&format!(
                 "pypiron_bucket_health_alarms_total{{{labels}}} {alarms}\n"
             ));
@@ -616,6 +626,8 @@ mod tests {
         WorkerHealthSnapshot {
             selected_index,
             selection_change: None,
+            read_selected_index: selected_index,
+            read_selection_change: None,
             states,
             topology_revalidation: Vec::new(),
             alarms,

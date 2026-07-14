@@ -1570,6 +1570,164 @@ def s3_server_multi_proxy_prefixed(
         upstream_gen.close()
 
 
+# ----------------------- Read-affinity fixtures (read locality) ----------------
+#
+# One node over two region-labeled buckets: writes home to the first bucket
+# (config order), reads pin to the node's own region bucket (the second). A
+# single bucket-aware fault proxy sees every S3 request, so a test asserts WHICH
+# bucket served a read from the ordered request log, and fails/recovers each
+# bucket independently. See dev/READ_AFFINITY_VISION.md and
+# tests/test_read_affinity.py. Additive: these reuse the existing multi-bucket
+# MinIO + fault-proxy fixtures without touching them.
+
+#: Region label on the write-home bucket (index 0) — never the node's region.
+READ_AFFINITY_WRITE_REGION = "left"
+#: Region label on the read-home bucket (index 1) — the node declares this region.
+READ_AFFINITY_NODE_REGION = "right"
+
+
+def read_affinity_buckets_uri(minio: Dict) -> str:
+    """`PYPIRON_BUCKETS` for the two-bucket topology with `@region` labels: the
+    first bucket is the write home (`@left`), the second the node's region
+    (`@right`). The `@region` never changes bucket identity, so the fleet stamp
+    is the same as the unlabeled list — only read affinity reads the labels."""
+    a, b = minio["buckets"][:2]
+    return f"s3://{a}@{READ_AFFINITY_WRITE_REGION},s3://{b}@{READ_AFFINITY_NODE_REGION}"
+
+
+def _start_read_affinity_server(
+    tmp_path_factory,
+    pypiron_bin: Path,
+    minio: Dict,
+    *,
+    node_region: str | None,
+    leave_failures: int,
+    return_healthy_secs: int,
+    repl_sweep_secs: int = 2,
+    reconcile_secs: int = 3,
+    extra_env=None,
+    extra_args=None,
+) -> Iterator[Dict]:
+    """One S3 node over the region-labeled two-bucket topology. `node_region`
+    declares the node's region via the operator override (an arbitrary label that
+    skips the cloud-metadata probe by design); `None` leaves the node
+    region-agnostic so reads follow the write pin. Streaming delivery keeps the
+    served bytes flowing through the node so the fault proxy records which bucket
+    answered."""
+    env = {
+        "PYPIRON_AUDIT_ON_BOOT": "false",
+        "PYPIRON_BUCKETS": read_affinity_buckets_uri(minio),
+        "PYPIRON_ARTIFACT_DELIVERY": "stream",
+        "PYPIRON_REPL_SWEEP_INTERVAL_SECS": str(repl_sweep_secs),
+        "PYPIRON_RECONCILE_INTERVAL_SECS": str(reconcile_secs),
+    }
+    if node_region is not None:
+        env["PYPIRON_NODE_REGION"] = node_region
+    if extra_env:
+        env.update(extra_env)
+    args = [
+        "--bucket-leave-failures",
+        str(leave_failures),
+        "--bucket-return-healthy-secs",
+        str(return_healthy_secs),
+        *(extra_args or []),
+    ]
+    yield from _start_s3_server(
+        tmp_path_factory, pypiron_bin, minio, extra_env=env, extra_args=args
+    )
+
+
+@pytest.fixture()
+def s3_server_read_affinity(
+    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
+) -> Iterator[Dict]:
+    """Reads pinned to the region bucket (B); writes home to A. Low leave
+    threshold and short return window so a sustained outage moves the read pin in
+    seconds and a recovery returns it under the drain gate."""
+    yield from _start_read_affinity_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        node_region=READ_AFFINITY_NODE_REGION,
+        leave_failures=1,
+        return_healthy_secs=2,
+    )
+
+
+@pytest.fixture()
+def s3_server_read_affinity_sticky(
+    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
+) -> Iterator[Dict]:
+    """Same topology with a high leave threshold: a brief bucket blip during a
+    publish drops a `_repl/` note without ever moving the read pin off B, so the
+    absence-read-through and lagging-tombstone windows are exercised on the
+    region bucket itself. The `_repl/` sweep stays fast so B still converges."""
+    yield from _start_read_affinity_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        node_region=READ_AFFINITY_NODE_REGION,
+        leave_failures=8,
+        return_healthy_secs=2,
+    )
+
+
+@pytest.fixture()
+def s3_server_read_affinity_no_region(
+    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
+) -> Iterator[Dict]:
+    """The fail-safe default: same labeled buckets, but the node's region
+    matches no configured bucket (it declares none, and the ambient AWS_REGION it
+    detects is not a bucket label), so its read pin equals its write pin (A).
+    Reads never touch B."""
+    yield from _start_read_affinity_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        node_region=None,
+        leave_failures=1,
+        return_healthy_secs=2,
+    )
+
+
+@pytest.fixture()
+def s3_server_read_affinity_proxy(
+    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
+) -> Iterator[Dict]:
+    """Read affinity plus a real proxy upstream. High leave threshold keeps reads
+    on B through a publish-time blip; long repair cadences keep B divergent so a
+    private name missing on B is served from the write home under a stable window
+    and the upstream is provably never consulted. The upstream is a disk node
+    with its access log on so a test can assert it saw no request for the name."""
+    upstream_gen = _start_disk_server(
+        tmp_path_factory, pypiron_bin, extra_env={"PYPIRON_ACCESS_LOG": "true"}
+    )
+    upstream = next(upstream_gen)
+    server_gen = _start_read_affinity_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        node_region=READ_AFFINITY_NODE_REGION,
+        leave_failures=8,
+        return_healthy_secs=2,
+        repl_sweep_secs=3600,
+        reconcile_secs=3600,
+        extra_args=[
+            "--proxy-upstream",
+            upstream["base_url"],
+            "--allow-insecure-upstream",
+            "--exclude-newer",
+            "",
+        ],
+    )
+    try:
+        server = next(server_gen)
+        yield {**server, "upstream": upstream}
+    finally:
+        server_gen.close()
+        upstream_gen.close()
+
+
 def s3_buckets_uri(*names: str) -> str:
     """The PYPIRON_BUCKETS value for an ordered list of MinIO bucket names: each
     becomes an `s3://name` URI (region rides on the shared AWS_REGION knob)."""

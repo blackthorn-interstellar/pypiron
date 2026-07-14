@@ -173,10 +173,32 @@ staged package-promotion protocol, no manifest, and no promotion lock.
 ## 6. Reads
 
 Every healthy bucket holds every record at ack time, so read failover is
-trivially correct: pin the selected bucket at entry, serve. No replication lag
+trivially correct: a read pins one bucket at entry and serves. No replication lag
 exists in steady state, which is why v2 has none of the read-path lag windows the
 async design fenced around (presign-404, 404-during-lag, proxy fill against a
 claim-lagged bucket).
+
+**Read selection (regional read-affinity).** The bucket a read pins is the
+node's **read selection**, distinct from the fleet-wide write/serialization
+selection: its region bucket when read-affinity is active, otherwise the write
+selection. Both pins share one selection generation so the generation-tagged
+caches do not thrash. Bytes come from the near bucket, judgment from the write
+bucket — every decision that could reach upstream (proxy fill, denying an
+unclaimed name, the origin claim that gates serving) is settled on the write pin,
+and the root index, counters, leases, and sync cursors stay on the write pin too.
+Presence on the read bucket is trusted; a **dangerous** absence (an origin claim
+whose miss would permit upstream fall-through) is confirmed on the write pin
+before any 404 or fill; a **bounded** absence (a not-yet-copied artifact, a
+missed yank) reads through to the write pin or is briefly accepted. The read pin
+leaves its bucket on the same availability streak the write pin uses
+(`--bucket-leave-failures`) and returns only after the return window
+(`--bucket-return-healthy-secs`) *and* a worker-confirmed caught-up check — no
+other bucket holds an undrained `_repl/<region>/` note. A node that matches no region
+reads from the write selection; misdetection costs latency, never correctness.
+Writes are untouched: every upload, claim, delete, and yank serializes and fans
+out on the write selection. Selection is observable at
+`pypiron_bucket_read_selected` beside `pypiron_bucket_selected`. The accepted
+imperfections this adds are in §11.
 
 The visibility fence shrinks to tombstone/frozen/quarantine checks — no
 pending-manifest states. Reads pay no per-download tombstone HEAD in
@@ -327,11 +349,19 @@ put-if-absent / put-if-match.
   bounds the window. A client mid-install across a switch may retry once.
 - Frozen conflicts require a human. Caches/CDNs may serve pre-freeze bytes until
   TTLs expire — no merge rule can un-serve bytes.
-- **No regional read-affinity (future work).** Every node reads from the first
-  healthy bucket in the shared order, so a node in a secondary region reads
-  cross-region in steady state. The feature buys outage survival, not read
-  locality; a node preferring its nearest bucket for reads is an open question
-  (tracked in [ROADMAP.md](ROADMAP.md)).
+- **Regional read-affinity accepts a bounded index lag for local reads.** Read
+  selection is per-node and distinct from the fleet-wide write order (§6): bytes
+  come from the region bucket, judgment from the write bucket. Presence on the
+  region bucket is trusted; a dangerous absence (an origin claim whose miss would
+  permit upstream fall-through) is confirmed on the write bucket before any 404 or
+  proxy fill; a bounded absence is accepted. The accepted part: a new release of
+  an existing package can lag a remote region's index by seconds until the copy
+  or the repair sweep lands (a brand-new package is covered by read-through and
+  never 404s), and a **yank or delete whose copy to a region bucket failed stays
+  visible in that region until the sweep drains** — the same window a failed-over
+  node has today. Reads return to a recovered region bucket only after it is
+  healthy for the return window *and* caught up, so a lagging bucket is slower,
+  never wrong.
 
 ## 12. Operator rules the design requires
 

@@ -378,6 +378,19 @@ async fn maintain_bucket_selection(state: &Arc<AppState>) -> bool {
     let Some(health) = &state.bucket_health else {
         return false;
     };
+    // Read affinity only: when the region bucket is healthy but not yet the read
+    // pin, a return is pending — confirm it holds no undrained repair notes
+    // before the tick may move reads back to it. Never runs on the request path,
+    // and only while a return is actually pending (dev/READ_AFFINITY_VISION.md).
+    if health.has_read_preference() {
+        match health.read_return_pending() {
+            Some(region) => {
+                let caught_up = region_bucket_caught_up(state, region).await;
+                health.set_region_caught_up(caught_up);
+            }
+            None => health.set_region_caught_up(false),
+        }
+    }
     let mut snapshot = health.worker_tick();
     for (index, alarms) in snapshot.alarms.iter().copied().enumerate() {
         if alarms > 0 {
@@ -458,8 +471,29 @@ async fn maintain_bucket_selection(state: &Arc<AppState>) -> bool {
             }
         }
     }
+
+    // Apply the read-pin switch through the same topology gating. A read switch
+    // only bumps the shared generation (clearing the generation-tagged index and
+    // presign caches); the write-scoped views cleared above are untouched.
+    if let Some(read_change) = snapshot.read_selection_change {
+        if !selection_blocked.contains(&read_change.to) {
+            let next = state.buckets.switch_read(read_change.to);
+            if let Err(error) = health.read_selection_applied(read_change.to) {
+                error!(bucket=read_change.to, error=%error, "could not acknowledge read bucket selection");
+            } else {
+                info!(
+                    from = %state.buckets.handles()[read_change.from].name,
+                    to = %state.buckets.handles()[read_change.to].name,
+                    generation = next.generation,
+                    "read bucket changed"
+                );
+            }
+        }
+    }
+
     let applied = state.pin();
     snapshot.selected_index = applied.index;
+    snapshot.read_selected_index = state.buckets.read_pin().index;
     let names: Vec<String> = state
         .buckets
         .handles()
@@ -475,6 +509,37 @@ async fn maintain_bucket_selection(state: &Arc<AppState>) -> bool {
             .load(std::sync::atomic::Ordering::Acquire),
     );
     changed
+}
+
+/// Whether the region bucket `region` has no repair still owed to it: every
+/// other bucket's `_repl/<region>/` tree is empty. Conservative — an unreachable
+/// peer or any error defers the return, keeping reads on the write bucket
+/// (slower, never wrong). Bounded single-key LISTs; only called when a read
+/// return is pending, never on the request path.
+async fn region_bucket_caught_up(state: &AppState, region: usize) -> bool {
+    for (index, handle) in state.buckets.handles().iter().enumerate() {
+        if index == region {
+            continue;
+        }
+        match timeout(
+            BUCKET_HEALTH_IO_TIMEOUT,
+            crate::replicate::has_undrained_repl_notes_for(handle.storage.as_ref(), region),
+        )
+        .await
+        {
+            Ok(Ok(false)) => {}
+            Ok(Ok(true)) => return false,
+            Ok(Err(error)) => {
+                warn!(bucket=%handle.name, target=region, error=?error, "could not confirm region bucket caught up; deferring read return");
+                return false;
+            }
+            Err(_) => {
+                warn!(bucket=%handle.name, target=region, "region caught-up check timed out; deferring read return");
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Whether `pkg` has an unpaired intent still inside the storage-clock grace

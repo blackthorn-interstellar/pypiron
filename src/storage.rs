@@ -128,10 +128,11 @@ pub struct StorageArgs {
     pub s3_bucket: Option<String>,
 
     /// Multi-bucket replication and failover across a list of buckets, any mix
-    /// of backends. Comma-separated URIs, scheme required: `s3://name[@region]`
-    /// (`@region` is S3-only), `gs://name`, or `az://container`. Order is
-    /// preference — the first bucket is preferred. A single-entry list is
-    /// equivalent to configuring that one backend directly.
+    /// of backends. Comma-separated URIs, scheme required: `s3://name[@region]`,
+    /// `gs://name[@region]`, or `az://container[@region]`. The optional
+    /// `@region` labels the bucket's region (and selects the S3 signing region).
+    /// Order is preference — the first bucket is preferred. A single-entry list
+    /// is equivalent to configuring that one backend directly.
     #[arg(
         long = "buckets",
         env = "PYPIRON_BUCKETS",
@@ -189,17 +190,19 @@ pub struct StorageArgs {
 }
 
 /// One parsed `--buckets` entry: a backend, a bucket/container name, and an
-/// optional S3 region.
+/// optional region annotation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct BucketSpec {
-    scheme: BucketScheme,
-    name: String,
-    /// S3-only: the per-bucket `@region` suffix.
-    region: Option<String>,
+pub(crate) struct BucketSpec {
+    pub(crate) scheme: BucketScheme,
+    pub(crate) name: String,
+    /// The optional per-bucket `@region` annotation. On S3 it also selects the
+    /// signing region; on every scheme it labels the bucket's region for node
+    /// read affinity. Never part of the bucket's topology identity.
+    pub(crate) region: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BucketScheme {
+pub(crate) enum BucketScheme {
     S3,
     Gcs,
     Azure,
@@ -229,7 +232,8 @@ impl BucketSpec {
 }
 
 /// Parse one `--buckets` URI. The scheme is required so a bare name can never be
-/// silently misfiled to the wrong backend; `@region` is accepted only on S3.
+/// silently misfiled to the wrong backend; an optional `@region` annotation is
+/// accepted on any scheme.
 fn parse_bucket_uri(entry: &str) -> Result<BucketSpec> {
     let entry = entry.trim();
     let Some((scheme, rest)) = entry.split_once("://") else {
@@ -246,9 +250,6 @@ fn parse_bucket_uri(entry: &str) -> Result<BucketSpec> {
         ),
     };
     let (name, region) = match rest.split_once('@') {
-        Some(_) if scheme != BucketScheme::S3 => {
-            bail!("bucket entry '{entry}' carries an @region, which is only valid on s3:// entries")
-        }
         Some((_, "")) => bail!("bucket entry '{entry}' has an empty region after '@'"),
         Some((name, region)) => (name, Some(region.to_string())),
         None => (rest, None),
@@ -265,8 +266,11 @@ fn parse_bucket_uri(entry: &str) -> Result<BucketSpec> {
 
 impl StorageArgs {
     /// The parsed `--buckets` list, empty when unset. Every entry is validated;
-    /// a bad URI is a startup error naming the offending entry.
-    fn bucket_specs(&self) -> Result<Vec<BucketSpec>> {
+    /// a bad URI is a startup error naming the offending entry. In the same order
+    /// and count as [`build_all`](Self::build_all)/[`bucket_names`](Self::bucket_names),
+    /// so a spec's index matches its storage handle — the read-affinity startup
+    /// matches the node's region against these to pick its read bucket.
+    pub(crate) fn bucket_specs(&self) -> Result<Vec<BucketSpec>> {
         self.buckets.iter().map(|e| parse_bucket_uri(e)).collect()
     }
 
@@ -2246,9 +2250,22 @@ mod tests {
                 region: None,
             }
         );
+        // `@region` is a plain annotation on every scheme, not just S3.
         assert_eq!(
-            parse_bucket_uri("az://ironblob").unwrap().scheme,
-            BucketScheme::Azure
+            parse_bucket_uri("gs://iron-backup@us-central1").unwrap(),
+            BucketSpec {
+                scheme: BucketScheme::Gcs,
+                name: "iron-backup".to_string(),
+                region: Some("us-central1".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_bucket_uri("az://ironblob@eastus").unwrap(),
+            BucketSpec {
+                scheme: BucketScheme::Azure,
+                name: "ironblob".to_string(),
+                region: Some("eastus".to_string()),
+            }
         );
     }
 
@@ -2257,9 +2274,8 @@ mod tests {
         for (entry, needle) in [
             ("iron-east", "missing a scheme"),
             ("ftp://iron-east", "unknown scheme"),
-            ("gs://iron@us-east-1", "only valid on s3://"),
-            ("az://iron@eastus", "only valid on s3://"),
             ("s3://iron@", "empty region"),
+            ("gs://iron@", "empty region"),
             ("s3://", "empty bucket name"),
         ] {
             let error = parse_bucket_uri(entry).unwrap_err().to_string();
@@ -2291,6 +2307,23 @@ mod tests {
         // A legal mixed list: same name, different backend. The scheme-qualified
         // identities differ, so nothing downstream mistakes them for a duplicate.
         assert_eq!(args.bucket_names(), ["s3://shared", "gs://shared"]);
+    }
+
+    #[test]
+    fn annotated_region_does_not_change_bucket_identity() {
+        // The topology stamp hashes bucket identity, which must be byte-identical
+        // whether or not a `@region` annotation is present, on every scheme.
+        for (annotated, bare) in [
+            ("s3://iron@us-east-1", "s3://iron"),
+            ("gs://iron@us-central1", "gs://iron"),
+            ("az://iron@eastus", "az://iron"),
+        ] {
+            assert_eq!(
+                parse_bucket_uri(annotated).unwrap().identity(),
+                parse_bucket_uri(bare).unwrap().identity(),
+                "region annotation on {annotated:?} must not change identity"
+            );
+        }
     }
 
     #[test]

@@ -25,6 +25,7 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 - Crash-safe event-marker indexing (intent/commit pairs); fingerprint audit with cost proportional to churn; `pypiron verify-index` / `pypiron rebuild-index`.
 - Multi-node on any cloud backend via a sloppy leader lease (conditional writes, TTL, heartbeat).
 - Multi-region / multi-cloud resilience — an ordered bucket list spanning regions or cloud providers (S3 + GCS + Azure) survives a region, or a whole cloud, going down. Uploads fan out to every reachable bucket before the ack (zero data loss for acked writes); health-driven selection moves new work within seconds, and durable fan-out plus full-diff reconciliation heal partitions. Conflicting private bytes freeze, and topology changes are explicit through `pypiron buckets migrate`. Buckets are the mechanism; [MULTIBUCKET.md](MULTIBUCKET.md) has the contract.
+- Regional read-affinity — label buckets with `@region` (any scheme) and each node serves reads (index pages, artifact downloads, presigned redirects) from its own region's bucket, while every upload still fans out to every bucket before the ack. Nodes detect their region automatically (AWS/GCP/Azure metadata) or take `--node-region` for on-prem/MinIO; a node that matches no region reads from the preferred bucket, exactly as before, so misdetection costs latency, never correctness. Read selection is per-node and distinct from the fleet-wide write order: bytes from the near bucket, judgment from the write bucket. An acked file never 404s (absences read through to the write bucket), private names never fall through to upstream on a local miss, and reads return to a recovered region bucket only after it is healthy and caught up. Contract in [MULTIBUCKET.md](MULTIBUCKET.md) §6 and §11.
 
 **Mirroring & proxying**
 - `pypiron sync` over HTTP (`--to`, the single writer is always the server), carrying PyPI's true `upload-time` so `--exclude-newer` stays historically correct; tag/time/format gates; `--include-package`/`--include-packages-from` work-list selection; `--exclude-package`/`--exclude-packages-from` subtraction; `pypiron.toml` config layering.
@@ -52,14 +53,13 @@ Tracked so they don't get lost. Not commitments — bucketed by intent.
 
 ### Maybe
 
-**Regional read-affinity.** Multi-region resilience (Shipped) fails the whole
-fleet over together, but every node reads from the same first-healthy bucket in
-the shared order — a node in a secondary region reads cross-region in steady
-state. The follow-up: let a node prefer its nearest bucket for reads (a per-node
-read preference distinct from the fleet-wide write order) so each region serves
-locally, while writes still fan out everywhere. Turns "survives an outage" into
-"survives an outage *and* reads locally." Open question: how a node expresses
-"nearest" without reintroducing per-node configuration drift.
+**Region-biased index rebuilds.** Regional read-affinity (Shipped) serves reads
+locally, but a bucket's index-rebuild and warm-lease work can still be driven by
+a node in another region — the write that materializes a remote region's index
+runs wherever the lease landed. The follow-up: bias each bucket's rebuild toward
+a node in that bucket's own region, so the materializing write runs near the
+bucket it writes. Pure latency/egress optimization; correctness is unaffected
+either way, which is why it's a *maybe*.
 
 **Scoped API tokens (durable).** Stateless install tokens (Shipped) cover the
 ephemeral CI case but can't be revoked before they expire and carry no

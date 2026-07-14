@@ -141,10 +141,15 @@ pub struct SelectionChange {
 /// Effects for the async caller to apply after an observation or timer tick.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HealthUpdate {
-    /// The selected bucket after applying this update, changed or not.
+    /// The selected *write* bucket after applying this update, changed or not.
     pub selected_index: usize,
-    /// Present only when selection changed.
+    /// Present only when the write selection changed.
     pub selection_change: Option<SelectionChange>,
+    /// The selected *read* bucket after applying this update (equals
+    /// `selected_index` when the node has no region read preference).
+    pub read_selected_index: usize,
+    /// Present only when the read selection changed.
+    pub read_selection_change: Option<SelectionChange>,
     /// Buckets that became reachable and must have their topology stamp checked
     /// before writes rely on them. One observation produces at most one entry;
     /// a vector keeps the wiring ready for batched probes without changing API.
@@ -194,6 +199,18 @@ pub struct BucketHealth {
     policy: HealthPolicy,
     buckets: Vec<BucketStatus>,
     selected: usize,
+    /// This node's region bucket, when one was matched at startup. `None` (no
+    /// region, unlabelled buckets, or single-bucket) means reads always follow
+    /// the write selection — behaviorally identical to a node with no affinity.
+    read_preference: Option<usize>,
+    /// The bucket reads should be served from: the region bucket while it is
+    /// usable, otherwise the write selection (dev/READ_AFFINITY_VISION.md).
+    read_selected: usize,
+    /// Worker-supplied: whether the region bucket currently holds no undrained
+    /// replication notes. Gates *return* of reads to the region bucket; a stale
+    /// value can only keep reads on the write bucket, never send them to a
+    /// lagging one. The request path never sets this.
+    region_caught_up: bool,
 }
 
 /// One worker-cycle view of health observed by request and worker threads.
@@ -203,6 +220,12 @@ pub struct WorkerHealthSnapshot {
     /// Coalesces observations into the one switch the worker needs to apply.
     /// Repeated until [`HealthController::selection_applied`] acknowledges it.
     pub selection_change: Option<SelectionChange>,
+    /// The read bucket this node should serve reads from (equals
+    /// `selected_index` when the node has no region read preference).
+    pub read_selected_index: usize,
+    /// The one read-pin switch the worker needs to apply, repeated until
+    /// [`HealthController::read_selection_applied`] acknowledges it.
+    pub read_selection_change: Option<SelectionChange>,
     pub states: Vec<HealthState>,
     /// Sorted, deduplicated, and repeated until acknowledged. The worker must
     /// validate these topology stamps before it applies a selection that depends
@@ -216,6 +239,10 @@ pub struct WorkerHealthSnapshot {
 struct ControllerState {
     health: BucketHealth,
     applied_selected: usize,
+    /// The read bucket the worker has actually applied to the [`BucketSet`]. Like
+    /// `applied_selected`, a read selection is repeated in every snapshot until
+    /// [`HealthController::read_selection_applied`] acknowledges it.
+    applied_read_selected: usize,
     topology_revalidation: BTreeSet<usize>,
     /// Recovered buckets remain ineligible until their topology stamp passes.
     /// This must live beside the selector: a worker-local skip leaves the pure
@@ -241,6 +268,7 @@ impl HealthController {
             state: Mutex::new(ControllerState {
                 health: BucketHealth::new(bucket_count, policy)?,
                 applied_selected: 0,
+                applied_read_selected: 0,
                 topology_revalidation: BTreeSet::new(),
                 topology_blocked: BTreeSet::new(),
                 alarms: vec![0; bucket_count],
@@ -311,6 +339,57 @@ impl HealthController {
         Ok(())
     }
 
+    /// Seed this node's region read preference and where its read pin starts.
+    /// Called once at startup; a node with no region match never calls this and
+    /// its read selection stays equal to the write selection forever.
+    pub fn configure_read_affinity(
+        &self,
+        preference: usize,
+        read_selected: usize,
+    ) -> Result<(), InvalidBucket> {
+        self.validate_bucket(preference)?;
+        self.validate_bucket(read_selected)?;
+        let mut state = self.lock();
+        state.health.set_read_affinity(preference, read_selected);
+        state.applied_read_selected = read_selected;
+        Ok(())
+    }
+
+    /// Whether this node has a region read preference at all. False for a node
+    /// that matched no bucket, so the worker skips read-affinity maintenance
+    /// entirely (its reads follow the write pin natively).
+    pub fn has_read_preference(&self) -> bool {
+        self.lock().health.read_preference.is_some()
+    }
+
+    /// Feed the worker's caught-up determination into the pure state machine.
+    /// Only ever gates *return* of reads to the region bucket.
+    pub fn set_region_caught_up(&self, caught_up: bool) {
+        self.lock().health.region_caught_up = caught_up;
+    }
+
+    /// The region bucket when checking whether reads may return to it is
+    /// worthwhile: a region preference exists, that bucket is Healthy and
+    /// topology-eligible, and reads are not already served from it. `None`
+    /// otherwise, so the worker runs the caught-up LIST only when it matters.
+    pub fn read_return_pending(&self) -> Option<usize> {
+        let state = self.lock();
+        let region = state.health.read_preference?;
+        if state.applied_read_selected == region {
+            return None;
+        }
+        let healthy =
+            state.health.buckets.get(region).map(|b| b.state) == Some(HealthState::Healthy);
+        (healthy && !state.topology_blocked.contains(&region)).then_some(region)
+    }
+
+    /// Confirm that the worker applied the desired read selection.
+    pub fn read_selection_applied(&self, index: usize) -> Result<(), InvalidBucket> {
+        self.validate_bucket(index)?;
+        self.lock().applied_read_selected = index;
+        Ok(())
+    }
+
     /// Confirm one recovered bucket's topology stamp. Pending validation is
     /// repeated in every snapshot until this ack, so transient failures retry.
     pub fn topology_revalidated(&self, index: usize) -> Result<(), InvalidBucket> {
@@ -367,6 +446,28 @@ impl HealthController {
                 to: selected_index,
             });
 
+        // Read selection: only a node with a region preference maintains a
+        // distinct read pin. Without one, reads follow the write pin natively
+        // (BucketSet::read_pin aliases pin), so never emit a read switch — that
+        // would double-bump the shared generation on every write failover. With a
+        // preference, take the pure machine's choice, but a topology-blocked
+        // region bucket falls back to the write selection just like a write
+        // candidate does above (a recovered stamp is not yet trustworthy).
+        let (read_selected_index, read_selection_change) = if state.health.read_preference.is_some()
+        {
+            let mut index = state.health.read_selected;
+            if state.topology_blocked.contains(&index) {
+                index = selected_index;
+            }
+            let change = (index != state.applied_read_selected).then_some(SelectionChange {
+                from: state.applied_read_selected,
+                to: index,
+            });
+            (index, change)
+        } else {
+            (selected_index, None)
+        };
+
         let topology_revalidation = state.topology_revalidation.iter().copied().collect();
         let alarms = state.alarms.clone();
         state.alarms.fill(0);
@@ -380,6 +481,8 @@ impl HealthController {
         WorkerHealthSnapshot {
             selected_index,
             selection_change,
+            read_selected_index,
+            read_selection_change,
             states,
             topology_revalidation,
             alarms,
@@ -406,11 +509,27 @@ impl BucketHealth {
             policy,
             buckets,
             selected: 0,
+            read_preference: None,
+            read_selected: 0,
+            region_caught_up: false,
         })
     }
 
     pub fn selected_index(&self) -> usize {
         self.selected
+    }
+
+    #[cfg(test)]
+    pub fn read_selected_index(&self) -> usize {
+        self.read_selected
+    }
+
+    /// Seed the node's region read preference and the bucket reads start from.
+    /// Called once at startup; `read_selected` is where the read pin was seeded
+    /// (the region bucket if reachable, else the write selection).
+    fn set_read_affinity(&mut self, preference: usize, read_selected: usize) {
+        self.read_preference = Some(preference);
+        self.read_selected = read_selected;
     }
 
     #[cfg(test)]
@@ -464,6 +583,7 @@ impl BucketHealth {
 
     fn evaluate(&mut self, now: Instant, topology_revalidation: Vec<usize>) -> HealthUpdate {
         let previous = self.selected;
+        let previous_read = self.read_selected;
 
         if self.buckets[self.selected].state == HealthState::Unhealthy {
             // Availability wins over return hysteresis when the current bucket is
@@ -490,14 +610,56 @@ impl BucketHealth {
             }
         }
 
+        self.evaluate_read(now);
+
         HealthUpdate {
             selected_index: self.selected,
             selection_change: (self.selected != previous).then_some(SelectionChange {
                 from: previous,
                 to: self.selected,
             }),
+            read_selected_index: self.read_selected,
+            read_selection_change: (self.read_selected != previous_read).then_some(
+                SelectionChange {
+                    from: previous_read,
+                    to: self.read_selected,
+                },
+            ),
             topology_revalidation,
         }
+    }
+
+    /// Choose the read bucket, on top of the just-computed write selection.
+    ///
+    /// The region bucket serves reads only while it is Healthy; it is abandoned
+    /// the instant it fails its availability streak (the same rule the write pin
+    /// uses to leave), and reads fall back to the write selection. Returning to
+    /// it is deliberately slow: it must prove continuous health for the full
+    /// return window *and* the worker must have confirmed it is caught up. When
+    /// the region bucket is also the write selection the caught-up gate is moot —
+    /// the write home is truth by definition.
+    fn evaluate_read(&mut self, now: Instant) {
+        let Some(region) = self.read_preference else {
+            self.read_selected = self.selected;
+            return;
+        };
+        if self.read_selected == region {
+            if self.buckets[region].state == HealthState::Unhealthy {
+                self.read_selected = self.selected;
+            }
+            return;
+        }
+        let status = &self.buckets[region];
+        let healthy_for_window = status.state == HealthState::Healthy
+            && status.healthy_since.is_some_and(|since| {
+                now.saturating_duration_since(since) >= self.policy.return_after_healthy
+            });
+        self.read_selected =
+            if region == self.selected || (healthy_for_window && self.region_caught_up) {
+                region
+            } else {
+                self.selected
+            };
     }
 }
 
@@ -915,6 +1077,120 @@ mod tests {
         let snapshot = controller.worker_tick();
         assert_eq!(snapshot.alarms, vec![0, 800]);
         assert_eq!(snapshot.selected_index, 0);
+    }
+
+    #[test]
+    fn read_returns_to_region_only_after_window_and_caught_up() {
+        let base = Instant::now();
+        // The node's region is the non-preferred bucket (index 1); reads start
+        // following the write selection (bucket 0).
+        let mut health = BucketHealth::new(2, policy(3, 10)).unwrap();
+        health.set_read_affinity(1, 0);
+        health.observe(1, BucketSignal::Success, base).unwrap();
+
+        // Window not elapsed: reads stay on the write bucket.
+        assert_eq!(health.tick(at(base, 5)).read_selected_index, 0);
+        // Window elapsed but not caught up: still on the write bucket.
+        health.region_caught_up = false;
+        assert_eq!(health.tick(at(base, 11)).read_selected_index, 0);
+        // Caught up and window elapsed: reads return to the region bucket, and
+        // the write selection never moved.
+        health.region_caught_up = true;
+        let update = health.tick(at(base, 12));
+        assert_eq!(update.read_selected_index, 1);
+        assert_eq!(
+            update.read_selection_change,
+            Some(SelectionChange { from: 0, to: 1 })
+        );
+        assert_eq!(update.selected_index, 0);
+        assert_eq!(health.selected_index(), 0);
+    }
+
+    #[test]
+    fn read_leaves_region_immediately_on_the_leave_threshold() {
+        let base = Instant::now();
+        let mut health = BucketHealth::new(2, policy(3, 10)).unwrap();
+        health.set_read_affinity(1, 1);
+        health.observe(1, BucketSignal::Success, base).unwrap();
+        assert_eq!(health.read_selected_index(), 1);
+
+        for _ in 0..2 {
+            let update = health.observe(1, BucketSignal::Timeout, base).unwrap();
+            assert_eq!(update.read_selected_index, 1, "holds below the threshold");
+        }
+        let update = health.observe(1, BucketSignal::Timeout, base).unwrap();
+        assert_eq!(update.read_selected_index, 0);
+        assert_eq!(
+            update.read_selection_change,
+            Some(SelectionChange { from: 1, to: 0 })
+        );
+    }
+
+    #[test]
+    fn no_read_preference_tracks_the_write_selection_in_every_state() {
+        let base = Instant::now();
+        let mut health = BucketHealth::new(2, policy(1, 10)).unwrap();
+        health.observe(1, BucketSignal::Success, base).unwrap();
+        let update = health.observe(0, BucketSignal::Timeout, base).unwrap();
+        assert_eq!(update.selected_index, 1);
+        assert_eq!(update.read_selected_index, 1);
+        assert_eq!(
+            update.read_selection_change,
+            Some(SelectionChange { from: 0, to: 1 })
+        );
+    }
+
+    #[test]
+    fn read_preference_never_perturbs_the_write_selection() {
+        // Same scenario as `failover_chooses_the_most_preferred_known_healthy_bucket`,
+        // but with a region read preference set: the write selection is identical.
+        let base = Instant::now();
+        let mut health = BucketHealth::new(3, policy(1, 60)).unwrap();
+        health.set_read_affinity(2, 0);
+        health.observe(2, BucketSignal::Success, base).unwrap();
+        health.observe(1, BucketSignal::Success, base).unwrap();
+
+        let update = health.observe(0, BucketSignal::Timeout, base).unwrap();
+        assert_eq!(update.selected_index, 1);
+        assert_eq!(
+            update.selection_change,
+            Some(SelectionChange { from: 0, to: 1 })
+        );
+    }
+
+    #[test]
+    fn controller_reports_read_selection_and_pending_return() {
+        let base = Instant::now();
+        let controller = HealthController::new(2, policy(1, 10)).unwrap();
+        controller.configure_read_affinity(1, 0).unwrap();
+
+        // Region bucket 1 becomes reachable; a topology check blocks it until
+        // acknowledged, so no return is pending yet.
+        controller
+            .observe_at(1, BucketSignal::Success, base)
+            .unwrap();
+        assert_eq!(controller.read_return_pending(), None);
+        controller.topology_revalidated(1).unwrap();
+        assert_eq!(controller.read_return_pending(), Some(1));
+
+        // With caught_up confirmed and the window elapsed, the worker snapshot
+        // proposes the read switch; the write selection is untouched.
+        controller.set_region_caught_up(true);
+        let snap = controller.worker_tick_at(at(base, 11));
+        assert_eq!(snap.selected_index, 0);
+        assert_eq!(snap.read_selected_index, 1);
+        assert_eq!(
+            snap.read_selection_change,
+            Some(SelectionChange { from: 0, to: 1 })
+        );
+        controller.read_selection_applied(1).unwrap();
+        assert_eq!(controller.read_return_pending(), None);
+        assert_eq!(
+            controller
+                .worker_tick_at(at(base, 12))
+                .read_selection_change,
+            None
+        );
     }
 
     #[test]

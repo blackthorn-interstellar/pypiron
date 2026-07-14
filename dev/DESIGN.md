@@ -292,6 +292,28 @@ holding the record and no note written. Deletes, yanks, and status changes fan
 out the same way. Because every bucket holds everything at ack time, reads pin
 one bucket and serve with no replication-lag windows.
 
+Beside the fleet-wide write selection, each node holds a per-node **read
+selection** (regional read-affinity): its region bucket when one is labeled and
+matched, otherwise the write selection. A bucket carries an optional `@region`
+label on any scheme (on S3 it also picks the signing region); a node learns its
+own region once at boot, off the request path — `--node-region`, then AWS
+environment, then instance metadata (AWS/GCP/Azure). Reads — package index,
+artifact bytes, companion cache, presign, streaming — pin the read selection;
+the two pins share one selection generation so the caches do not thrash. Bytes
+come from the near bucket, judgment from the write bucket: every decision that
+could reach upstream (proxy fill, an unclaimed-name denial, the origin claim that
+gates serving) is settled on the write pin, and the root index, counters, leases,
+and sync cursors stay on the write pin too. Presence on the read bucket is
+trusted; a dangerous absence is confirmed on the write pin before any 404 or
+fall-through; a bounded absence (a not-yet-copied artifact, a missed yank) reads
+through to the write pin or is briefly accepted. The read pin leaves its bucket
+on the same availability streak the write pin uses and returns only after the
+full return window *and* a worker-confirmed caught-up check (no other bucket
+holds an undrained `_repl/<region>/` note). A node that matches no region reads from the write
+selection — misdetection costs latency, never correctness — and writes never
+move off the write selection. The read-selection contract is in
+[MULTIBUCKET.md](MULTIBUCKET.md#6-reads).
+
 Real traffic feeds the health view. A dedicated multi-only loop GETs the tiny,
 guaranteed topology stamp from every bucket, with a one-second deadline and no
 overlapping sweep. Startup, runtime revalidation, and migration use the same
@@ -569,10 +591,14 @@ Measured against a fabricated full-PyPI-shaped corpus (see
   origin or visibility-fence reads.
 - Multi-bucket mode adds per-node health probes and failure-only repair-note
   sweeps, plus one extra private copy per destination. A local package-index read
-  fences with an initial origin GET and a
+  fences on the read pin with an initial origin GET and a
   final exact-observation GET. A local artifact or served companion read adds
   those two origin GETs, tombstone/frozen/mirror-quarantine HEADs, and a sidecar
-  GET when the claim or quarantine marker requires one. Proxy fills and
+  GET when the claim or quarantine marker requires one. Under read-affinity these
+  fence reads run against the region (read) bucket, where presence is trusted;
+  only when the read bucket lacks the claim is the upstream-eligibility decision
+  re-confirmed on the write pin, so a dangerous absence is never trusted locally.
+  Proxy fills and
   passthroughs add eligibility, claim, marker, and upstream work dynamically;
   they have no single fixed request count.
 

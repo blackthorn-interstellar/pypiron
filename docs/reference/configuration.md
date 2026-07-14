@@ -106,15 +106,22 @@ pypiron serve --buckets s3://iron-east@us-east-1,s3://iron-west@us-west-2
 PYPIRON_BUCKETS=s3://iron-east@us-east-1,s3://iron-west@us-west-2
 ```
 
-Each entry needs a scheme:
+Each entry needs a scheme and may carry an optional `@region` label:
 
-- `s3://name` or `s3://name@region` — `@region` sets the S3 client's signing and
-  endpoint region (SigV4 plus regional endpoints) for that bucket. One list can
-  span regions, so each S3 bucket carries its own; precedence is per-bucket
-  `@region`, then `--aws-region`, then the SDK default. `gs://` and `az://` need
-  no region — their endpoints do not encode one.
-- `gs://name` — a GCS bucket.
-- `az://container` — an Azure blob container.
+- `s3://name` or `s3://name@region` — an S3 bucket.
+- `gs://name` or `gs://name@region` — a GCS bucket.
+- `az://container` or `az://container@region` — an Azure blob container.
+
+The `@region` label names the bucket's region. Every node compares its own
+region to these labels to pick the bucket it reads from — reads stay in-region
+while writes still fan out everywhere (see
+[Reads stay in their region](../guides/multi-region.md#reads-stay-in-their-region)).
+The label is part of the shared list, so it is identical on every node and does
+not affect a bucket's identity or the fleet's bucket order. On S3 it additionally
+selects the client's signing and endpoint region (SigV4 plus regional
+endpoints); precedence there is per-bucket `@region`, then `--aws-region`, then
+the SDK default. GCS and Azure endpoints do not encode a region, so on those
+backends the label steers reads only.
 
 Mix backends freely. `s3://iron-east@us-east-1,gs://iron-backup` replicates
 across two clouds and survives an entire provider outage. Each backend resolves
@@ -188,6 +195,7 @@ downloads stream through the node.
 | `--worker-interval-secs N` | `PYPIRON_WORKER_INTERVAL_SECS` | `1` | Dirty/replication poll and bucket-health probe cadence. |
 | `--bucket-leave-failures N` | `PYPIRON_BUCKET_LEAVE_FAILURES` | `3` | Consecutive timeout (including 408), connection, or 5xx failures before selecting the next bucket. |
 | `--bucket-return-healthy-secs N` | `PYPIRON_BUCKET_RETURN_HEALTHY_SECS` | `300` | Continuous health required before returning to a more-preferred bucket. |
+| `--node-region LABEL` | `PYPIRON_NODE_REGION` | detected | This node's region, matched against bucket `@region` labels to choose the bucket it reads from. Cloud nodes detect it automatically (AWS/GCP/Azure); set it for on-prem or MinIO. Steers reads only, never writes. Multi-bucket only. |
 | `--fanout-grace-secs N` | `PYPIRON_FANOUT_GRACE_SECS` | `30` | Grace a lagging secondary bucket gets on upload before pypiron records a repair and returns. One slow bucket adds at most this to a publish. Multi-bucket only. |
 | `--repl-sweep-interval-secs N` | `PYPIRON_REPL_SWEEP_INTERVAL_SECS` | `300` | Backstop interval for draining pending cross-bucket repairs. Repairs also drain the moment a bucket recovers. Multi-bucket only. |
 | `--intent-grace-secs N` | `PYPIRON_INTENT_GRACE_SECS` | `900` | Grace for an upload or cross-bucket package operation. Minimum `3`; maximum `9223372036854775807`. |
@@ -333,7 +341,8 @@ These series appear only when two or more buckets are configured:
 | `pypiron_replication_marker_backlog{dest}` | Pending cross-bucket repairs (fan-out failures awaiting drain) found on reachable source buckets. During a source outage this is a lower bound. |
 | `pypiron_reconcile_diff_duration_seconds` | Wall time of the last pairwise full comparison. |
 | `pypiron_bucket_health_state{bucket,index}` | Per-node view: healthy `1`, unknown `0`, unhealthy `-1`. |
-| `pypiron_bucket_selected{bucket,index}` | Per-node selected bucket: selected `1`, all others `0`. |
+| `pypiron_bucket_selected{bucket,index}` | Per-node selected bucket for writes: selected `1`, all others `0`. |
+| `pypiron_bucket_read_selected{bucket,index}` | Per-node bucket serving reads: the region bucket while it is healthy and caught up, otherwise the same as `pypiron_bucket_selected`. |
 | `pypiron_bucket_health_alarms_total{bucket,index}` | Storage errors that do not prove an outage, including credentials, permissions, CAS, KMS, quota, and configuration. |
 | `pypiron_bucket_selection_generation` | Number that changes when this node selects another bucket. |
 | `pypiron_bucket_topology_write_fenced` | `1` when a runtime topology mismatch has stopped mutations; reads remain available. |

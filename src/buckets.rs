@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -89,7 +90,22 @@ pub struct Pinned {
 /// stale handle with a fresh generation.
 pub struct BucketSet {
     handles: Vec<BucketHandle>,
+    /// The fleet-wide *write* selection: the bucket every write, first-write
+    /// claim, and coordination decision serializes on. [`pin`](Self::pin).
     current: RwLock<Arc<Pinned>>,
+    /// The node's *read* selection: its region bucket while that bucket is
+    /// healthy and caught up, otherwise the write selection (read affinity,
+    /// dev/READ_AFFINITY_VISION.md). Only consulted when `read_active` is set; in
+    /// the common mode [`read_pin`](Self::read_pin) returns the write pin itself.
+    read_current: RwLock<Arc<Pinned>>,
+    /// Whether this node maintains a distinct read pin. `false` (no region match
+    /// or single bucket) makes `read_pin` an alias of `pin` at the same cost.
+    read_active: AtomicBool,
+    /// One shared selection generation for both pins: any switch of either bumps
+    /// it, and each pin carries the value inside its own `Arc<Pinned>`. Keeping
+    /// both pins on one generation is what stops the shared caches (src/cache.rs)
+    /// from thrashing between them.
+    generation: AtomicU64,
     /// The topology generation established by startup verification or a local
     /// migration. `None` until a multi-bucket topology has been verified.
     topology_generation: RwLock<Option<u64>>,
@@ -149,7 +165,10 @@ impl BucketSet {
         });
         Self {
             handles,
-            current: RwLock::new(pinned),
+            current: RwLock::new(pinned.clone()),
+            read_current: RwLock::new(pinned),
+            read_active: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             topology_generation: RwLock::new(None),
             topology_lock: tokio::sync::Mutex::new(()),
             duplicate_identity,
@@ -165,6 +184,44 @@ impl BucketSet {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The storage context request *reads* should use. When read affinity is
+    /// active this is the node's region bucket (while healthy and caught up);
+    /// otherwise it is byte-for-byte [`pin`](Self::pin) — no distinct selection
+    /// is maintained, so single-bucket and no-region-match nodes pay nothing and
+    /// read from the same bucket they write. Never used for writes or any
+    /// origin-claim decision that could reach upstream (dev/READ_AFFINITY_VISION.md).
+    pub fn read_pin(&self) -> Arc<Pinned> {
+        if self.read_active.load(Ordering::Acquire) {
+            self.read_current
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        } else {
+            self.pin()
+        }
+    }
+
+    /// Whether this node maintains a distinct read pin.
+    #[cfg(test)]
+    pub fn read_affinity_active(&self) -> bool {
+        self.read_active.load(Ordering::Acquire)
+    }
+
+    fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Republish a pin at a new generation without moving its bucket, so both
+    /// pins always report the same (latest) generation.
+    fn republish_generation(lock: &RwLock<Arc<Pinned>>, generation: u64) {
+        let mut current = lock.write().unwrap_or_else(PoisonError::into_inner);
+        *current = Arc::new(Pinned {
+            storage: current.storage.clone(),
+            generation,
+            index: current.index,
+        });
     }
 
     /// Number of configured buckets.
@@ -229,20 +286,63 @@ impl BucketSet {
         (names, hash)
     }
 
-    /// Select a different bucket, bumping the generation so caches and any
-    /// already-pinned contexts from the old selection are recognizably stale.
-    /// Driven by the worker's per-node health view. Kept crate-visible so only
-    /// selection orchestration, not request handlers, can change it.
-    #[allow(dead_code)]
+    /// Select a different *write* bucket, bumping the shared generation so caches
+    /// and any already-pinned contexts from the old selection are recognizably
+    /// stale. Driven by the worker's per-node health view. Kept crate-visible so
+    /// only selection orchestration, not request handlers, can change it.
     pub(crate) fn switch(&self, index: usize) -> Arc<Pinned> {
-        let mut cur = self.current.write().unwrap_or_else(PoisonError::into_inner);
+        let generation = self.bump_generation();
         let next = Arc::new(Pinned {
             storage: self.handles[index].storage.clone(),
-            generation: cur.generation + 1,
+            generation,
             index,
         });
-        *cur = next.clone();
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = next.clone();
+        // Lift the read pin to the same generation (its bucket unchanged) so the
+        // two pins never diverge; harmless when the read pin will itself switch
+        // this tick. A no-op in the common mode where no read pin is active.
+        if self.read_active.load(Ordering::Acquire) {
+            Self::republish_generation(&self.read_current, generation);
+        }
         next
+    }
+
+    /// Select a different *read* bucket, bumping the shared generation. The write
+    /// pin is republished at the same generation (its bucket unchanged) so a
+    /// handler never pairs a storage handle from one pin with a generation from
+    /// the other. Crate-private like [`switch`](Self::switch).
+    pub(crate) fn switch_read(&self, index: usize) -> Arc<Pinned> {
+        let generation = self.bump_generation();
+        let next = Arc::new(Pinned {
+            storage: self.handles[index].storage.clone(),
+            generation,
+            index,
+        });
+        *self
+            .read_current
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = next.clone();
+        self.read_active.store(true, Ordering::Release);
+        Self::republish_generation(&self.current, generation);
+        next
+    }
+
+    /// Activate read affinity and point the read pin at `index` at the *current*
+    /// generation — startup seeding, once the node's region bucket is known. No
+    /// generation bump: nothing is cached yet, and both pins must share one
+    /// generation.
+    pub(crate) fn seed_read_pin(&self, index: usize) {
+        let generation = self.generation.load(Ordering::Acquire);
+        let seeded = Arc::new(Pinned {
+            storage: self.handles[index].storage.clone(),
+            generation,
+            index,
+        });
+        *self
+            .read_current
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = seeded;
+        self.read_active.store(true, Ordering::Release);
     }
 
     /// Conservative startup verification: no error is guessed to mean
@@ -1305,6 +1405,65 @@ mod tests {
         // New pins observe the new selection.
         assert_eq!(set.pin().index, 1);
         assert_eq!(set.pin().generation, 1);
+    }
+
+    #[test]
+    fn read_pin_aliases_write_pin_until_read_affinity_is_active() {
+        let set = BucketSet::new(vec![
+            handle("east", "/tmp/pypiron-bucketset-read-a"),
+            handle("west", "/tmp/pypiron-bucketset-read-b"),
+        ]);
+        assert!(!set.read_affinity_active());
+        // No distinct read selection: read_pin observes the same context as pin,
+        // and a write switch carries reads with it.
+        assert!(Arc::ptr_eq(&set.read_pin().storage, &set.pin().storage));
+        set.switch(1);
+        assert_eq!(set.read_pin().index, 1);
+        assert_eq!(set.read_pin().generation, set.pin().generation);
+    }
+
+    #[test]
+    fn read_switch_moves_read_pin_and_shares_one_generation() {
+        let set = BucketSet::new(vec![
+            handle("east", "/tmp/pypiron-bucketset-read-c"),
+            handle("west", "/tmp/pypiron-bucketset-read-d"),
+        ]);
+        let write_before = set.pin();
+        assert_eq!(write_before.index, 0);
+
+        let read = set.switch_read(1);
+        assert!(set.read_affinity_active());
+        assert_eq!(read.index, 1);
+        assert_eq!(read.generation, 1);
+
+        // The write pin's *bucket* is unchanged, but it adopts the bumped
+        // generation so both pins carry one generation from within their Arc.
+        let write_after = set.pin();
+        assert_eq!(write_after.index, 0);
+        assert!(Arc::ptr_eq(&write_after.storage, &write_before.storage));
+        assert_eq!(write_after.generation, 1);
+        assert_eq!(set.read_pin().index, 1);
+        assert_eq!(set.read_pin().generation, write_after.generation);
+
+        // A subsequent write switch keeps the read pin's bucket and lifts both to
+        // the same new generation.
+        set.switch(1);
+        assert_eq!(set.pin().generation, set.read_pin().generation);
+        assert_eq!(set.read_pin().index, 1);
+    }
+
+    #[test]
+    fn seed_read_pin_activates_reads_without_bumping_generation() {
+        let set = BucketSet::new(vec![
+            handle("east", "/tmp/pypiron-bucketset-read-e"),
+            handle("west", "/tmp/pypiron-bucketset-read-f"),
+        ]);
+        set.seed_read_pin(1);
+        assert!(set.read_affinity_active());
+        assert_eq!(set.read_pin().index, 1);
+        // No switch happened, so the shared generation stays 0 and both pins agree.
+        assert_eq!(set.read_pin().generation, 0);
+        assert_eq!(set.pin().generation, 0);
     }
 
     #[test]

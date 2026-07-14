@@ -33,6 +33,7 @@ mod lease;
 mod markdown;
 mod metrics;
 mod names;
+mod node_region;
 mod observed_storage;
 mod origin;
 mod provenance;
@@ -774,6 +775,13 @@ struct ServeArgs {
     )]
     bucket_return_healthy_secs: u64,
 
+    /// This node's region label. Cloud nodes auto-detect it from the platform
+    /// (environment then instance metadata); set this to override detection,
+    /// e.g. for on-prem or MinIO fleets. Region only steers reads to a near
+    /// bucket — it never changes where writes go.
+    #[arg(long, env = "PYPIRON_NODE_REGION")]
+    node_region: Option<String>,
+
     /// Grace period a synchronous multi-bucket fan-out gives each secondary
     /// bucket, measured from the moment the selected bucket's write completed.
     /// A secondary that cannot converge within it gets a durable `_repl/` repair
@@ -1052,6 +1060,15 @@ impl AppState {
     /// plus an `Arc` clone; single-bucket is byte-for-byte the old behavior.
     pub fn pin(&self) -> Arc<Pinned> {
         self.buckets.pin()
+    }
+
+    /// Capture the storage context for one operation's *reads*. Equals
+    /// [`pin`](Self::pin) unless this node has an active region read pin, in which
+    /// case reads are served from the near bucket while writes and every
+    /// upstream-claim decision stay on [`pin`](Self::pin) (read affinity,
+    /// dev/READ_AFFINITY_VISION.md).
+    pub fn read_pin(&self) -> Arc<Pinned> {
+        self.buckets.read_pin()
     }
 
     pub fn mutations_fenced(&self) -> bool {
@@ -1624,6 +1641,46 @@ async fn run_serve(
             count = buckets.len(),
             "multi-bucket storage: replication and failover across configured buckets"
         );
+    }
+    // Learn this node's region once at startup (operator override, then platform
+    // environment, then instance metadata) and, in a multi-bucket fleet, pin the
+    // node's reads to its region bucket. Detection only labels the node; it never
+    // moves a write (dev/READ_AFFINITY_VISION.md).
+    let node_region = node_region::detect(cli.node_region.as_deref()).await;
+    if let (Some(health), Some(node)) = (&bucket_health, &node_region) {
+        let specs = cli.storage.bucket_specs()?;
+        match specs
+            .iter()
+            .position(|spec| node_region::matches(node, spec))
+        {
+            Some(region) => {
+                // A read pin is only worth seeding to a bucket that startup could
+                // reach; otherwise reads follow the write pin until the worker
+                // confirms the region bucket recovered and caught up.
+                let write_index = buckets.pin().index;
+                let reachable = !topology.unreachable_indices.contains(&region);
+                let read_index = if reachable { region } else { write_index };
+                health.configure_read_affinity(region, read_index)?;
+                if reachable {
+                    buckets.seed_read_pin(region);
+                    info!(
+                        region = %node.region,
+                        bucket = %buckets.handles()[region].name,
+                        "read affinity: serving reads from region bucket"
+                    );
+                } else {
+                    warn!(
+                        region = %node.region,
+                        bucket = %buckets.handles()[region].name,
+                        "read affinity: region bucket unreachable at startup; reads follow the write bucket until it recovers"
+                    );
+                }
+            }
+            None => info!(
+                region = %node.region,
+                "read affinity: no configured bucket is labeled for this node's region; reads follow the write bucket"
+            ),
+        }
     }
     let proxy = match cli.proxy_upstream.as_deref() {
         Some(upstream) => {
@@ -3652,6 +3709,28 @@ async fn companion_passthrough_visible(
     Ok(require_settled_package_read(state, storage, pkg).await? == *expected_claim)
 }
 
+/// Visibility fence with read-through. Presence on the read pin is trusted; a
+/// negative read-pin result is re-checked on the write pin before it can 404 (a
+/// lagging region bucket must never make a client miss an acked file). The write
+/// pin is authoritative — deletions and tombstones serialize there — so its
+/// answer is final. Identical to a single [`multi_bucket_file_visible`] when the
+/// two pins are the same bucket (dev/READ_AFFINITY_VISION.md).
+async fn file_visible_read_through(
+    state: &AppState,
+    read: &Pinned,
+    write: &Pinned,
+    pkg: &str,
+    artifact_key: &str,
+) -> Result<bool> {
+    if multi_bucket_file_visible(state, read.storage.as_ref(), pkg, artifact_key).await? {
+        return Ok(true);
+    }
+    if read.index == write.index {
+        return Ok(false);
+    }
+    multi_bucket_file_visible(state, write.storage.as_ref(), pkg, artifact_key).await
+}
+
 async fn simple_root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
     serve_root_index(&state, accepts_json(&headers), &headers).await
 }
@@ -3718,38 +3797,160 @@ async fn serve_pkg_index(
         };
         return moved_permanently(&target);
     }
-    let pinned = state.pin();
-    let claim = match require_settled_package_read(state, pinned.storage.as_ref(), &pkg).await {
-        Ok(claim) => claim,
-        Err(error) => return read_error(error),
-    };
+    // Reads come from the region-local pin, and the origin claim that gates
+    // serving is observed on whichever bucket actually serves the bytes — so a
+    // region catch-up landing the `.origin` mid-serve can never trip the
+    // coherence recheck. Any decision that could reach upstream — the proxy
+    // index, and denying an "unclaimed" name — is settled on the write pin
+    // (dev/READ_AFFINITY_VISION.md).
+    let read_pinned = state.read_pin();
+    let write_pinned = state.pin();
+    let same_pin = read_pinned.index == write_pinned.index;
     let json = force_json || accepts_json(headers);
-    let response = if let Some(resp) =
-        proxy_package_index(state, pinned.storage.as_ref(), &pkg, json, headers).await
+    let (key, ct) = if json {
+        (format!("{SIMPLE_PREFIX}{pkg}/index.json"), CT_JSON)
+    } else {
+        (format!("{SIMPLE_PREFIX}{pkg}/index.html"), CT_HTML)
+    };
+
+    // Upstream (proxy) path: eligibility, render, and the mid-serve coherence
+    // recheck all run on the write pin inside `proxy_package_index`.
+    if let Some(resp) =
+        proxy_package_index(state, write_pinned.storage.as_ref(), &pkg, json, headers).await
     {
-        resp
-    } else if state.buckets.is_multi()
-        && claim
+        return resp;
+    }
+
+    // Local index. In multi-bucket, an "unclaimed" read-pin observation is
+    // confirmed on the write pin before denying the name; a write-owned claim the
+    // region bucket has not seen yet is served through from the write home.
+    if state.buckets.is_multi() {
+        let read_claim =
+            match require_settled_package_read(state, read_pinned.storage.as_ref(), &pkg).await {
+                Ok(claim) => claim,
+                Err(error) => return read_error(error),
+            };
+        if read_claim
             .as_ref()
             .is_none_or(|value| value.state == origin::OriginState::Unclaimed)
-    {
-        not_found("no such package")
-    } else {
-        let (key, ct) = if json {
-            (format!("{SIMPLE_PREFIX}{pkg}/index.json"), CT_JSON)
-        } else {
-            (format!("{SIMPLE_PREFIX}{pkg}/index.html"), CT_HTML)
-        };
-        serve_index(state, &pinned, key, ct, INDEX_CACHE_CONTROL, headers).await
-    };
-    if state.buckets.is_multi() {
-        match require_settled_package_read(state, pinned.storage.as_ref(), &pkg).await {
-            Ok(after) if after == claim => {}
-            Ok(_) => return read_error(anyhow!("package '{pkg}' changed while serving its index")),
-            Err(error) => return read_error(error),
+        {
+            match unclaimed_confirmed_absent(state, &write_pinned, same_pin, &pkg).await {
+                Ok(true) => return not_found("no such package"),
+                Ok(false) => {}
+                Err(error) => return read_error(error),
+            }
         }
+        return serve_local_index_fenced(
+            state,
+            &read_pinned,
+            &write_pinned,
+            same_pin,
+            &pkg,
+            key,
+            ct,
+            headers,
+            read_claim,
+        )
+        .await;
     }
-    response
+    serve_local_index_fenced(
+        state,
+        &read_pinned,
+        &write_pinned,
+        same_pin,
+        &pkg,
+        key,
+        ct,
+        headers,
+        None,
+    )
+    .await
+}
+
+/// Serve a package index from the read pin, reading through to the write home on
+/// a miss — with the origin coherence recheck pinned to whichever bucket actually
+/// serves the bytes. Served locally from the read pin → the pre-observation
+/// (`read_baseline`, already read by the caller) and the recheck are the read
+/// pin's; served through from the write home → both are the write pin's, so a
+/// region catch-up mid-serve never 503s (dev/READ_AFFINITY_VISION.md).
+#[allow(clippy::too_many_arguments)]
+async fn serve_local_index_fenced(
+    state: &AppState,
+    read: &Pinned,
+    write: &Pinned,
+    same_pin: bool,
+    pkg: &str,
+    key: String,
+    content_type: &'static str,
+    headers: &HeaderMap,
+    read_baseline: Option<origin::OriginObservation>,
+) -> Response<Body> {
+    let resp = serve_index(
+        state,
+        read,
+        key.clone(),
+        content_type,
+        INDEX_CACHE_CONTROL,
+        headers,
+    )
+    .await;
+    if resp.status() != StatusCode::NOT_FOUND {
+        // Served from the read pin: recheck the read pin against its baseline.
+        if state.buckets.is_multi() {
+            match require_settled_package_read(state, read.storage.as_ref(), pkg).await {
+                Ok(after) if after == read_baseline => {}
+                Ok(_) => {
+                    return read_error(anyhow!("package '{pkg}' changed while serving its index"))
+                }
+                Err(error) => return read_error(error),
+            }
+        }
+        return resp;
+    }
+    if same_pin {
+        return resp; // 404 on the only bucket; nothing to read through to.
+    }
+    // Read-through to the write home: baseline and recheck are both the write
+    // pin's, so a repair sweep landing the region bucket's `.origin` never trips.
+    let write_baseline =
+        match require_settled_package_read(state, write.storage.as_ref(), pkg).await {
+            Ok(claim) => claim,
+            Err(error) => return read_error(error),
+        };
+    let resp = serve_index_uncached(
+        write.storage.as_ref(),
+        &key,
+        content_type,
+        INDEX_CACHE_CONTROL,
+        headers,
+    )
+    .await;
+    match require_settled_package_read(state, write.storage.as_ref(), pkg).await {
+        Ok(after) if after == write_baseline => {}
+        Ok(_) => return read_error(anyhow!("package '{pkg}' changed while serving its index")),
+        Err(error) => return read_error(error),
+    }
+    resp
+}
+
+/// Confirm a read-pin "no claim" against the write pin before it can deny a
+/// package. Returns true when the write pin also holds no real claim (a genuine
+/// 404), false when the write home owns a claim the region bucket has not yet
+/// seen (serve it through). Fail-closed on names (dev/READ_AFFINITY_VISION.md).
+async fn unclaimed_confirmed_absent(
+    state: &AppState,
+    write: &Pinned,
+    same_pin: bool,
+    pkg: &str,
+) -> Result<bool> {
+    if same_pin {
+        return Ok(true);
+    }
+    Ok(
+        require_settled_package_read(state, write.storage.as_ref(), pkg)
+            .await?
+            .is_none_or(|value| value.state == origin::OriginState::Unclaimed),
+    )
 }
 
 /// Resolve the proxy for `pkg`, enforcing the eligibility gate (the
@@ -3781,6 +3982,15 @@ async fn proxy_package_index(
     headers: &HeaderMap,
 ) -> Option<Response<Body>> {
     let proxy = state.proxy.as_ref()?;
+    // Coherence baseline on this (write) pin, taken before the eligibility read so
+    // the fence covers the whole eligible→render span: serving an upstream index
+    // for a name that gains a local claim mid-serve would be a dependency-confusion
+    // leak, so the origin is rechecked on the same pin before the page is returned.
+    // Free in single-bucket mode (no I/O) and skipped by the recheck below.
+    let before = match require_settled_package_read(state, storage, pkg).await {
+        Ok(claim) => claim,
+        Err(e) => return Some(read_error(e)),
+    };
     match proxy::eligible(state, storage, pkg).await {
         Ok(true) => {}
         Ok(false) => return None,
@@ -3801,7 +4011,7 @@ async fn proxy_package_index(
     let builder = Response::builder()
         .header(header::ETAG, &*rendered.etag)
         .header(header::CACHE_CONTROL, INDEX_CACHE_CONTROL);
-    let resp = if revalidated {
+    let response = if revalidated {
         builder.status(StatusCode::NOT_MODIFIED).body(Body::empty())
     } else {
         builder
@@ -3810,7 +4020,18 @@ async fn proxy_package_index(
             .header(header::CONTENT_LENGTH, rendered.body.len())
             .body(Body::from(rendered.body.clone()))
     };
-    Some(resp.unwrap_or_else(not_found))
+    if state.buckets.is_multi() {
+        match require_settled_package_read(state, storage, pkg).await {
+            Ok(after) if after == before => {}
+            Ok(_) => {
+                return Some(read_error(anyhow!(
+                    "package '{pkg}' changed while serving its index"
+                )))
+            }
+            Err(e) => return Some(read_error(e)),
+        }
+    }
+    Some(response.unwrap_or_else(not_found))
 }
 
 /// Serve a materialized index file with a content-hash ETag; conditional GETs
@@ -3833,7 +4054,74 @@ async fn serve_index(
         Ok(None) => return not_found("no such index"),
         Err(e) => return read_error(e),
     };
+    render_index_variant(&identity, &gzip, content_type, cache_control, headers)
+}
 
+/// Serve `key` straight from a storage handle without touching the read-pin
+/// index cache — the read-through fallback for a page missing on the region
+/// bucket. Bounded to the rare region-lag case; the hot path stays the cached
+/// read-pin [`serve_index`] (dev/READ_AFFINITY_VISION.md).
+async fn serve_index_uncached(
+    storage: &dyn Storage,
+    key: &str,
+    content_type: &'static str,
+    cache_control: &'static str,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    match storage.get_bytes(key).await {
+        Ok(bytes) => {
+            let (identity, gzip) = cache::build_variants(bytes);
+            render_index_variant(&identity, &gzip, content_type, cache_control, headers)
+        }
+        Err(e) if storage::is_not_found(&e) => not_found("no such index"),
+        Err(e) => read_error(e),
+    }
+}
+
+/// Serve an index/companion from the read pin, reading through to the write pin
+/// on a miss so a lagging region bucket never 404s a page the write home holds
+/// (dev/READ_AFFINITY_VISION.md). Identical to [`serve_index`] when the two pins
+/// are the same bucket. The write-pin fallback renders uncached, keeping package
+/// keys populated only from the read pin.
+async fn serve_index_local(
+    state: &AppState,
+    read: &Pinned,
+    write: &Pinned,
+    key: String,
+    content_type: &'static str,
+    cache_control: &'static str,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let resp = serve_index(
+        state,
+        read,
+        key.clone(),
+        content_type,
+        cache_control,
+        headers,
+    )
+    .await;
+    if read.index == write.index || resp.status() != StatusCode::NOT_FOUND {
+        return resp;
+    }
+    serve_index_uncached(
+        write.storage.as_ref(),
+        &key,
+        content_type,
+        cache_control,
+        headers,
+    )
+    .await
+}
+
+/// Render one cached index representation, negotiating gzip and conditional GETs.
+fn render_index_variant(
+    identity: &cache::Variant,
+    gzip: &Option<cache::Variant>,
+    content_type: &'static str,
+    cache_control: &'static str,
+    headers: &HeaderMap,
+) -> Response<Body> {
     // Content negotiation against the precompressed variant: zero per-request
     // CPU — big indexes were NIC-bound, and gzip is a ~5-7x cut in bytes.
     // Each representation carries its own strong ETag (hence Vary).
@@ -3842,9 +4130,9 @@ async fn serve_index(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.contains("gzip"))
         .unwrap_or(false);
-    let (variant, encoding) = match (&gzip, accepts_gzip) {
+    let (variant, encoding) = match (gzip, accepts_gzip) {
         (Some(gz), true) => (gz, Some("gzip")),
-        _ => (&identity, None),
+        _ => (identity, None),
     };
 
     let revalidated = headers
@@ -3907,9 +4195,14 @@ async fn files_get(
         .unwrap_or(&filename);
     let artifact_key = format!("{PACKAGES_PREFIX}{pkg}/{artifact_filename}");
 
-    // Pin once for the whole download (design §3): companion cache lookups, the
-    // proxy fill, presign, and streaming all run against this one context.
-    let pinned = state.pin();
+    // Pin both selections once for the whole download (design §3). Reads —
+    // fences, companion cache, presign, streaming — run against the region-local
+    // read pin; the proxy fill and every upstream-claim decision run against the
+    // write pin (bytes from the near bucket, judgment from the write home,
+    // dev/READ_AFFINITY_VISION.md). In the common mode the two are one context.
+    let read_pinned = state.read_pin();
+    let write_pinned = state.pin();
+    let same_pin = read_pinned.index == write_pinned.index;
 
     // Download attribution key, computed once: a real artifact only (companions
     // and the ranged-companion fall-through below parse to None), keyed
@@ -3925,13 +4218,16 @@ async fn files_get(
     // the indexes instead of one storage GET per request. Range requests
     // fall through to storage; nobody range-reads a METADATA file.
     if filename.ends_with(METADATA_SUFFIX) && headers.get(header::RANGE).is_none() {
-        match multi_bucket_file_visible(&state, pinned.storage.as_ref(), &pkg, &artifact_key).await
+        match file_visible_read_through(&state, &read_pinned, &write_pinned, &pkg, &artifact_key)
+            .await
         {
             Ok(true) => {}
             Ok(false) => {
+                // Upstream passthrough is judged on the write pin: an unclaimed
+                // origin must be authoritative before any fall-through.
                 match unowned_companion_passthrough_safe(
                     &state,
-                    pinned.storage.as_ref(),
+                    write_pinned.storage.as_ref(),
                     &pkg,
                     &artifact_key,
                     &key,
@@ -3941,7 +4237,7 @@ async fn files_get(
                     Ok(true) => {
                         if let Some(upstream) = proxy_metadata_passthrough(
                             &state,
-                            pinned.storage.as_ref(),
+                            write_pinned.storage.as_ref(),
                             &pkg,
                             &filename,
                         )
@@ -3957,9 +4253,10 @@ async fn files_get(
             }
             Err(error) => return read_error(error),
         }
-        let resp = serve_index(
+        let resp = serve_index_local(
             &state,
-            &pinned,
+            &read_pinned,
+            &write_pinned,
             key,
             "text/plain; charset=utf-8",
             ARTIFACT_CACHE_CONTROL,
@@ -3972,7 +4269,8 @@ async fn files_get(
         // stored when the wheel itself is downloaded.
         if resp.status() == StatusCode::NOT_FOUND {
             if let Some(upstream) =
-                proxy_metadata_passthrough(&state, pinned.storage.as_ref(), &pkg, &filename).await
+                proxy_metadata_passthrough(&state, write_pinned.storage.as_ref(), &pkg, &filename)
+                    .await
             {
                 return upstream;
             }
@@ -3984,13 +4282,14 @@ async fn files_get(
     // metadata, served as JSON. A mirror snapshot is point-in-time, so it is
     // cached as immutably as the artifact it describes.
     if filename.ends_with(PROVENANCE_SUFFIX) && headers.get(header::RANGE).is_none() {
-        match multi_bucket_file_visible(&state, pinned.storage.as_ref(), &pkg, &artifact_key).await
+        match file_visible_read_through(&state, &read_pinned, &write_pinned, &pkg, &artifact_key)
+            .await
         {
             Ok(true) => {}
             Ok(false) => {
                 match unowned_companion_passthrough_safe(
                     &state,
-                    pinned.storage.as_ref(),
+                    write_pinned.storage.as_ref(),
                     &pkg,
                     &artifact_key,
                     &key,
@@ -4000,7 +4299,7 @@ async fn files_get(
                     Ok(true) => {
                         if let Some(upstream) = proxy_provenance_passthrough(
                             &state,
-                            pinned.storage.as_ref(),
+                            write_pinned.storage.as_ref(),
                             &pkg,
                             &filename,
                         )
@@ -4016,9 +4315,10 @@ async fn files_get(
             }
             Err(error) => return read_error(error),
         }
-        let resp = serve_index(
+        let resp = serve_index_local(
             &state,
-            &pinned,
+            &read_pinned,
+            &write_pinned,
             key,
             "application/json",
             ARTIFACT_CACHE_CONTROL,
@@ -4027,7 +4327,8 @@ async fn files_get(
         .await;
         if resp.status() == StatusCode::NOT_FOUND {
             if let Some(upstream) =
-                proxy_provenance_passthrough(&state, pinned.storage.as_ref(), &pkg, &filename).await
+                proxy_provenance_passthrough(&state, write_pinned.storage.as_ref(), &pkg, &filename)
+                    .await
             {
                 return upstream;
             }
@@ -4037,13 +4338,15 @@ async fn files_get(
 
     // On-demand mirroring: make sure the artifact is in storage before the
     // presign/stream logic runs (a presigned redirect never observes a 404,
-    // so the fetch can't be triggered by one).
+    // so the fetch can't be triggered by one). The fill runs entirely on the
+    // write pin — origin claims and the 409-serialized PUT stay on the write home.
     if let Some(resp) =
-        proxy_ensure_artifact(&state, pinned.storage.as_ref(), &pkg, &filename).await
+        proxy_ensure_artifact(&state, write_pinned.storage.as_ref(), &pkg, &filename).await
     {
         return resp;
     }
-    match multi_bucket_file_visible(&state, pinned.storage.as_ref(), &pkg, &artifact_key).await {
+    match file_visible_read_through(&state, &read_pinned, &write_pinned, &pkg, &artifact_key).await
+    {
         Ok(true) => {}
         Ok(false) => return not_found("artifact is fenced"),
         Err(error) => return read_error(error),
@@ -4069,15 +4372,32 @@ async fn files_get(
         // rather than 403). Existence is the index's job, not this path's.
         // Immutability also makes signed URLs reusable across clients: serve
         // a cached one while it has plenty of validity left (see cache.rs).
-        if let Some(url) = state.presign_cache.fresh(&key, pinned.generation) {
+        // The presign cache is keyed by the (shared) read-pin generation and
+        // populated only from this read-pin-routed path.
+        if let Some(url) = state.presign_cache.fresh(&key, read_pinned.generation) {
             if let Some(k) = &dl_key {
                 state.counters.record("downloads", k);
                 state.metrics.record_download();
             }
             return found_redirect(&url);
         }
-        match pinned
-            .storage
+        // Presign the bucket that actually holds the bytes: the read pin when the
+        // object is present there, otherwise the write pin — never hand out a URL
+        // that will 404. The HEAD is skipped when the two pins are one bucket, so
+        // single-region and no-affinity nodes add no round trip here.
+        let presign_storage = if same_pin {
+            read_pinned.storage.clone()
+        } else {
+            match read_pinned.storage.head_exists(&key).await {
+                Ok(true) => read_pinned.storage.clone(),
+                Ok(false) => write_pinned.storage.clone(),
+                Err(e) => {
+                    warn!(error=?e, %key, "read-pin existence check failed; presigning the write pin");
+                    write_pinned.storage.clone()
+                }
+            }
+        };
+        match presign_storage
             .presign_get(&key, cache::PRESIGN_EXPIRY)
             .await
         {
@@ -4085,7 +4405,7 @@ async fn files_get(
                 let url: Arc<str> = url.into();
                 state
                     .presign_cache
-                    .put(&key, url.clone(), pinned.generation);
+                    .put(&key, url.clone(), read_pinned.generation);
                 if let Some(k) = &dl_key {
                     state.counters.record("downloads", k);
                     state.metrics.record_download();
@@ -4098,26 +4418,36 @@ async fn files_get(
     }
 
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
-    match pinned.storage.serve_artifact(&key, range).await {
-        Ok(mut resp) => {
-            // Count only a full delivered body (200): a 206 range read is a
-            // partial of one logical download, a 416 is none. (A whole-file range
-            // served as 206 — rare, e.g. `curl -C-`/`wget -c` — is undercounted;
-            // download stats are best-effort, so we don't parse Content-Range.)
-            if resp.status() == StatusCode::OK {
-                if let Some(k) = &dl_key {
-                    state.counters.record("downloads", k);
-                    state.metrics.record_download();
-                }
+    // Stream from the read pin; on any failure (a not-found on a lagging region
+    // bucket, or an error) read through to the write pin once before mapping to
+    // 404/503 (dev/READ_AFFINITY_VISION.md).
+    let mut resp = match read_pinned.storage.serve_artifact(&key, range).await {
+        Ok(resp) => resp,
+        Err(read_err) => {
+            if same_pin {
+                return read_error(read_err);
             }
-            resp.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static(ARTIFACT_CACHE_CONTROL),
-            );
-            resp
+            match write_pinned.storage.serve_artifact(&key, range).await {
+                Ok(resp) => resp,
+                Err(e) => return read_error(e),
+            }
         }
-        Err(e) => read_error(e),
+    };
+    // Count only a full delivered body (200): a 206 range read is a partial of
+    // one logical download, a 416 is none. (A whole-file range served as 206 —
+    // rare, e.g. `curl -C-`/`wget -c` — is undercounted; download stats are
+    // best-effort, so we don't parse Content-Range.)
+    if resp.status() == StatusCode::OK {
+        if let Some(k) = &dl_key {
+            state.counters.record("downloads", k);
+            state.metrics.record_download();
+        }
     }
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(ARTIFACT_CACHE_CONTROL),
+    );
+    resp
 }
 
 /// Per-package counter series: `GET /stats/:metric/:package` (read-auth gated).

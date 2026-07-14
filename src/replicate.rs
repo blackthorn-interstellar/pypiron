@@ -1735,6 +1735,17 @@ pub async fn has_undrained_repl_notes(storage: &dyn Storage) -> Result<bool> {
     Ok(!storage.list_page(REPL_PREFIX, None, 1).await?.is_empty())
 }
 
+/// Whether this bucket holds any undrained `_repl/<dest>/` note — a repair still
+/// owed *to* bucket `dest`. The read-affinity worker checks every other bucket
+/// with this before it lets reads return to `dest` (its region bucket): an
+/// outstanding note means `dest` is missing an acked file, so reads stay on the
+/// write bucket until it drains (dev/READ_AFFINITY_VISION.md). Same bounded
+/// single-key LIST as [`has_undrained_repl_notes`].
+pub async fn has_undrained_repl_notes_for(storage: &dyn Storage, dest: usize) -> Result<bool> {
+    let prefix = format!("{REPL_PREFIX}{dest}/");
+    Ok(!storage.list_page(&prefix, None, 1).await?.is_empty())
+}
+
 fn publish_marker_backlog(state: &AppState, total: &HashMap<usize, u64>) {
     for (idx, handle) in state.buckets.handles().iter().enumerate() {
         state

@@ -69,7 +69,13 @@ def test_reconcile_prunes_stale_views(disk_server_fast_reconcile, tmp_path):
     else:
         pytest.fail("reconcile did not prune the stale package index")
 
-    global_idx = get_index_json(server["simple"])
-    assert PACKAGE not in [p["name"] for p in global_idx["projects"]], (
-        "reconcile must remove vanished packages from the global index"
-    )
+    # The global index is a separate view updated moments after the package
+    # prune, so it gets the same deadline rather than an instant assert.
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        global_idx = get_index_json(server["simple"])
+        if PACKAGE not in [p["name"] for p in global_idx["projects"]]:
+            break
+        time.sleep(0.2)
+    else:
+        pytest.fail("reconcile must remove vanished packages from the global index")

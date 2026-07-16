@@ -146,6 +146,28 @@ secrets. `real-gcs` runs in CI on pushes to `master` (not on pull requests: a
 fork PR gets no secrets and would report a green check having tested nothing);
 `real-s3` still runs weekly.
 
+## Parallelism
+
+The suite runs under pytest-xdist by default (`-n auto` in `addopts`; CI passes
+`-n 8` — the tests are wait-bound, so oversubscribing the runner's cores pays).
+Isolation is by construction, not by locking:
+
+- **One emulator container per worker, one uuid-named bucket per test.** MinIO
+  and Azurite are session-scoped fixtures — containers are the expensive part —
+  and each test creates and drops its own `pypiron-*-<uuid>` buckets/containers
+  on them. No two tests, and no two workers, ever share a bucket.
+- **Ports**: servers get ports from `find_free_port`, which under xdist probes a
+  per-worker range (the bare bind-then-close trick is a cross-process race).
+  Containers get daemon-assigned ports (`-p 127.0.0.1::9000` + `docker port`).
+- **Serial escapes** (`-n 0`, already wired into the Makefile targets):
+  `make perf` (xdist swallows `-s` and parallel load corrupts timings),
+  `make compat` (results aggregate in-process; the doc writer refuses to run
+  under xdist), and `make test-s3-real` (the shared real bucket is wiped per
+  test; the fixture fails loudly if it sees an xdist worker).
+
+Debugging a single test? `pytest tests/test_x.py -n 0` gets you serial
+execution, working `-s`, and pdb.
+
 ## What runs where
 
 | When | What |

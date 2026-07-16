@@ -6,7 +6,6 @@ import hmac
 import http.client
 import os
 import re
-import shlex
 import subprocess
 import tempfile
 import threading
@@ -16,8 +15,8 @@ from datetime import datetime, timezone
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
-from urllib.parse import unquote, urlencode, urlsplit
+from typing import Dict, Iterator, List, Optional, Tuple
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import pytest
 
@@ -103,29 +102,19 @@ def _tail(path, lines: int = 60) -> str:
     return "\n".join(tail) if tail else "(empty)"
 
 
-def _mc_unchecked(minio: Dict, script: str) -> str:
-    """Best-effort `mc` snippet for diagnostics: never skips or raises."""
+def _minio_ls_unchecked(minio: Dict, bucket: str, prefix: str) -> str:
+    """Best-effort bucket listing for diagnostics: never skips or raises."""
     if not minio.get("endpoint"):
         return "(no emulator endpoint)"
-    port = minio["endpoint"].rsplit(":", 1)[1]
-    creds = f"{minio['access_key']}:{minio['secret_key']}"
-    for extra in (
-        ["-e", f"MC_HOST_local=http://{creds}@host.docker.internal:{port}"],
-        ["-e", f"MC_HOST_local=http://{creds}@127.0.0.1:{port}", "--network", "host"],
-    ):
-        try:
-            rc, out, err = run_returncode(
-                ["docker", "run", "--rm", *extra, "--entrypoint", "sh", "minio/mc", "-c", script]
-            )
-        except OSError as exc:
-            return f"(mc unavailable: {exc})"
-        if rc == 0:
-            return out.strip() or "(empty)"
-    return f"(mc failed: {err.strip() or out.strip()})"
+    try:
+        keys = _s3_list(minio, bucket, prefix)
+    except (AssertionError, OSError) as exc:
+        return f"(list failed: {exc})"
+    return "\n".join(keys) or "(empty)"
 
 
-def _dump_storage_diagnostics(item) -> None:
-    """On a failure in an S3/mixed fixture, print the evidence a bare assert
+def _storage_diagnostics(item) -> str | None:
+    """On a failure in an S3/mixed fixture, collect the evidence a bare assert
     hides: the proxy request log, the pypiron server log, and the bucket
     contents. Best-effort — a broken probe must not mask the real failure."""
     server = None
@@ -148,21 +137,20 @@ def _dump_storage_diagnostics(item) -> None:
             server = value
             break
     if server is None:
-        return
-    print(f"\n===== storage failure diagnostics for {item.nodeid} =====")
-    print(f"--- pypiron server log tail ({server.get('log_path')}) ---")
-    print(_tail(server.get("log_path")))
+        return None
+    lines = [f"--- pypiron server log tail ({server.get('log_path')}) ---"]
+    lines.append(_tail(server.get("log_path")))
     faults = server.get("faults")
     proxy_log = getattr(faults, "log_path", None) if faults else None
     if proxy_log:
-        print(f"--- s3 fault-proxy request log tail ({proxy_log}) ---")
-        print(_tail(proxy_log))
+        lines.append(f"--- s3 fault-proxy request log tail ({proxy_log}) ---")
+        lines.append(_tail(proxy_log))
     minio = server.get("minio") or server.get("s3")
     if isinstance(minio, dict):
         for bucket in minio.get("buckets") or ([minio["bucket"]] if minio.get("bucket") else []):
-            root = f"local/{bucket}/packages/"
-            print(f"--- mc ls --recursive {bucket}/packages/ ---")
-            print(_mc_unchecked(minio, f"mc ls --recursive {shlex.quote(root)}"))
+            lines.append(f"--- objects under {bucket}/packages/ ---")
+            lines.append(_minio_ls_unchecked(minio, bucket, "packages/"))
+    return "\n".join(lines)
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -170,7 +158,12 @@ def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
     if report.when in ("setup", "call") and report.failed:
-        _dump_storage_diagnostics(item)
+        # A report section, not print(): xdist swallows worker stdout, but
+        # sections ride the report back to the controller and land in the
+        # failure output either way.
+        diagnostics = _storage_diagnostics(item)
+        if diagnostics:
+            report.sections.append(("storage failure diagnostics", diagnostics))
     markers = list(item.iter_markers("compat"))
     if not markers:
         return
@@ -199,6 +192,14 @@ def pytest_runtest_makereport(item, call):
 def pytest_sessionfinish(session, exitstatus):
     if not session.config.getoption("--write-compat-doc"):
         return
+    # Compat results accumulate in each process's config; under xdist they
+    # stay in the workers and the controller would overwrite the doc with an
+    # empty matrix. Workers must never write (each holds a partial matrix),
+    # and the controller fails loudly instead — `make compat` passes -n 0.
+    if hasattr(session.config, "workerinput"):
+        return
+    if session.config.pluginmanager.hasplugin("dsession"):
+        raise pytest.UsageError("--write-compat-doc needs a serial run: pass -n 0")
     _write_compat_doc(Path(session.config.rootpath), session.config._compat_results)
 
 
@@ -807,102 +808,41 @@ def _s3_empty_bucket(bucket: str) -> None:
     run_checked(["aws", "s3", "rm", f"s3://{bucket}/", "--recursive"])
 
 
-@pytest.fixture()
-def minio(tmp_path_factory) -> Iterator[Dict]:
-    """S3 backend for the s3-marked suite.
-
-    Default: a throwaway MinIO container with a fresh bucket (skips without
-    Docker). If ``PYPIRON_TEST_S3_REAL_BUCKET`` is set, targets that real S3
-    bucket instead (see ``_real_s3_config``), emptying it around each test so
-    every test still starts from an empty bucket. Real-bucket runs must be
-    serial — the shared bucket is wiped per test, so `-n`/xdist would corrupt
-    concurrent tests."""
-    real = _real_s3_config()
-    if real is not None:
-        _s3_empty_bucket(real["bucket"])
-        try:
-            yield real
-        finally:
-            _s3_empty_bucket(real["bucket"])
-        return
-
-    if not cmd_exists("docker"):
-        pytest.skip("docker is required for S3/MinIO integration tests; not found on PATH")
-
-    s3_port = find_free_port()
-    name = f"pypiron-minio-{s3_port}-{int(time.time())}"
-    bucket = "pypiron-test"
-    run_checked(
-        [
-            "docker",
-            "run",
-            "-d",
-            "--name",
-            name,
-            "-p",
-            f"{s3_port}:9000",
-            "-e",
-            "MINIO_ROOT_USER=minioadmin",
-            "-e",
-            "MINIO_ROOT_PASSWORD=minioadmin",
-            "minio/minio",
-            "server",
-            "/data",
-        ]
-    )
-
-    try:
-        wait_http_ok(f"http://127.0.0.1:{s3_port}/minio/health/ready", timeout=60.0)
-
-        # Create the bucket with minio/mc; host.docker.internal first, host network fallback.
-        rc, _, _ = run_returncode(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "-e",
-                f"MC_HOST_local=http://minioadmin:minioadmin@host.docker.internal:{s3_port}",
-                "minio/mc",
-                "mb",
-                "--ignore-existing",
-                f"local/{bucket}",
-            ]
-        )
-        if rc != 0:
-            rc, _, _ = run_returncode(
-                [
-                    "docker",
-                    "run",
-                    "--rm",
-                    "--network",
-                    "host",
-                    "-e",
-                    f"MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:{s3_port}",
-                    "minio/mc",
-                    "mb",
-                    "--ignore-existing",
-                    f"local/{bucket}",
-                ]
+def _docker_published_port(name: str, container_port: str) -> int:
+    """The host port the daemon published for a container, polled briefly:
+    under parallel session startup a just-started container can take a moment
+    to report its mapping (and a one-shot read gave IndexError on a daemon
+    hiccup, failing every test on that worker)."""
+    deadline = time.time() + 30.0
+    while True:
+        rc, out, _ = run_returncode(["docker", "port", name, container_port])
+        first = out.strip().splitlines()[0] if out.strip() else ""
+        if rc == 0 and ":" in first:
+            return int(first.rsplit(":", 1)[1])
+        if time.time() >= deadline:
+            _, state, _ = run_returncode(
+                ["docker", "inspect", "-f", "{{.State.Status}} {{.State.Error}}", name]
             )
-        if rc != 0:
-            pytest.skip("Unable to create MinIO bucket using minio/mc (check Docker networking)")
-
-        yield {
-            "endpoint": f"http://127.0.0.1:{s3_port}",
-            "bucket": bucket,
-            "access_key": "minioadmin",
-            "secret_key": "minioadmin",
-        }
-    finally:
-        run_returncode(["docker", "rm", "-f", name])
+            raise RuntimeError(
+                f"container {name} published no port for {container_port} "
+                f"(state: {state.strip() or 'unknown'})"
+            )
+        time.sleep(0.5)
 
 
-def _minio_multi(buckets: List[str], label: str) -> Iterator[Dict]:
-    """Run one disposable MinIO with the requested buckets."""
+@pytest.fixture(scope="session")
+def _minio_container() -> Iterator[Dict]:
+    """One MinIO container per session (per xdist worker, under -n).
+
+    Containers are the expensive part — a docker run + health poll + docker rm
+    per test is what tripled the CI s3 leg — while buckets are free, so tests
+    isolate by creating their own uuid-named buckets on this shared container
+    (see _minio_buckets). The docker daemon assigns the host port: publishing a
+    pre-picked "free" port is a bind race under xdist."""
     if not cmd_exists("docker"):
         pytest.skip("docker is required for S3/MinIO integration tests; not found on PATH")
 
-    name = f"pypiron-{label}-{uuid.uuid4().hex[:12]}"
+    name = f"pypiron-minio-{uuid.uuid4().hex[:12]}"
     try:
         run_checked(
             [
@@ -922,46 +862,10 @@ def _minio_multi(buckets: List[str], label: str) -> Iterator[Dict]:
                 "/data",
             ]
         )
-        port_mapping = run_checked(["docker", "port", name, "9000/tcp"]).stdout.strip()
-        s3_port = int(port_mapping.rsplit(":", 1)[1])
+        s3_port = _docker_published_port(name, "9000/tcp")
         wait_http_ok(f"http://127.0.0.1:{s3_port}/minio/health/ready", timeout=60.0)
-        for bucket in buckets:
-            made = False
-            for extra in (
-                [
-                    "-e",
-                    f"MC_HOST_local=http://minioadmin:minioadmin@host.docker.internal:{s3_port}",
-                ],
-                [
-                    "-e",
-                    f"MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:{s3_port}",
-                    "--network",
-                    "host",
-                ],
-            ):
-                rc, _, _ = run_returncode(
-                    [
-                        "docker",
-                        "run",
-                        "--rm",
-                        *extra,
-                        "minio/mc",
-                        "mb",
-                        "--ignore-existing",
-                        f"local/{bucket}",
-                    ]
-                )
-                if rc == 0:
-                    made = True
-                    break
-            if not made:
-                pytest.skip(
-                    "Unable to create MinIO buckets using minio/mc (check Docker networking)"
-                )
         yield {
             "endpoint": f"http://127.0.0.1:{s3_port}",
-            "buckets": buckets,
-            "bucket": buckets[0],
             "access_key": "minioadmin",
             "secret_key": "minioadmin",
         }
@@ -969,18 +873,69 @@ def _minio_multi(buckets: List[str], label: str) -> Iterator[Dict]:
         run_returncode(["docker", "rm", "-f", name])
 
 
-@pytest.fixture()
-def minio_two(tmp_path_factory) -> Iterator[Dict]:
-    """Two buckets on one MinIO container for replication and selection."""
-    del tmp_path_factory
-    yield from _minio_multi(["pypiron-a", "pypiron-b"], "minio2")
+def _minio_buckets(container: Dict, count: int, label: str) -> Iterator[Dict]:
+    """Provision fresh uuid-named buckets on the session container, drop them
+    afterwards (tests push real payloads — 72 MiB uploads — that must not pile
+    up in the shared container). A single-bucket config carries only `bucket`
+    so `_s3_env` keeps it in ordinary single-bucket mode; multi-bucket configs
+    add the `buckets` list that switches it to the PYPIRON_BUCKETS topology."""
+    names = [f"pypiron-{label}-{uuid.uuid4().hex[:8]}" for _ in range(count)]
+    cfg = dict(container)
+    cfg["bucket"] = names[0]
+    if count > 1:
+        cfg["buckets"] = names
+    for name in names:
+        minio_make_bucket(cfg, name)
+    try:
+        yield cfg
+    finally:
+        # Best-effort: a test may have deleted its bucket on purpose (outage
+        # simulation), and teardown must not mask the test's own outcome.
+        for name in names:
+            try:
+                minio_remove_bucket(cfg, name)
+            except (AssertionError, OSError):
+                pass
 
 
 @pytest.fixture()
-def minio_three(tmp_path_factory) -> Iterator[Dict]:
-    """Three buckets on one MinIO container for ordered fallback tests."""
-    del tmp_path_factory
-    yield from _minio_multi(["pypiron-a", "pypiron-b", "pypiron-c"], "minio3")
+def minio(request) -> Iterator[Dict]:
+    """S3 backend for the s3-marked suite.
+
+    Default: a fresh uuid-named bucket on the session MinIO container (skips
+    without Docker). If ``PYPIRON_TEST_S3_REAL_BUCKET`` is set, targets that
+    real S3 bucket instead (see ``_real_s3_config``), emptying it around each
+    test so every test still starts from an empty bucket. Real-bucket runs
+    must be serial — the shared bucket is wiped per test, so `-n`/xdist would
+    corrupt concurrent tests; `make test-s3-real` passes `-n 0`."""
+    real = _real_s3_config()
+    if real is not None:
+        if os.environ.get("PYTEST_XDIST_WORKER"):
+            pytest.fail(
+                "PYPIRON_TEST_S3_REAL_BUCKET wipes a shared bucket around every "
+                "test; run serially (make test-s3-real, or pass -n 0)"
+            )
+        _s3_empty_bucket(real["bucket"])
+        try:
+            yield real
+        finally:
+            _s3_empty_bucket(real["bucket"])
+        return
+
+    # Lazy so the real-bucket branch above never demands Docker.
+    yield from _minio_buckets(request.getfixturevalue("_minio_container"), 1, "s3")
+
+
+@pytest.fixture()
+def minio_two(_minio_container: Dict) -> Iterator[Dict]:
+    """Two buckets on the session MinIO container for replication and selection."""
+    yield from _minio_buckets(_minio_container, 2, "m2")
+
+
+@pytest.fixture()
+def minio_three(_minio_container: Dict) -> Iterator[Dict]:
+    """Three buckets on the session MinIO container for ordered fallback tests."""
+    yield from _minio_buckets(_minio_container, 3, "m3")
 
 
 class BucketFaults:
@@ -1846,89 +1801,131 @@ def s3_server_prefixed_presigned(
     )
 
 
-#: Once one `mc` network mode works, every later call tries it first. On Linux
-#: CI host.docker.internal never resolves, so without this each byte-oracle
-#: poll burned a doomed docker run (seconds each) before the host-network
-#: fallback — enough, across `_eventually` loops, to blow the job budget.
-_MC_MODE_CACHE: list[str] | None = None
+# ------------------------- MinIO object inspection ----------------------------
+#
+# SigV4-signed requests straight against the MinIO emulator, so tests can check
+# bucket contents without going through pypiron — ground truth spoken in the
+# real S3 wire protocol, stdlib only, mirroring the Azurite helpers below.
+# In-process HTTP rather than a `docker run minio/mc` per probe: the oracle is
+# polled inside `_eventually` loops, and a container per poll starves both the
+# polls and the product's own convergence once tests run in parallel.
 
 
-def _mc(minio: Dict, script: str) -> str:
-    """Run a `mc` shell snippet against the MinIO container, returning stdout.
-    Mirrors the host.docker.internal → host-network fallback the `minio` fixture
-    uses. Skips only on a networking failure; a broken `mc` command is a bug and
-    must fail the test, not silently pass it."""
-    global _MC_MODE_CACHE
+def _s3_signed(
+    minio: Dict,
+    method: str,
+    path: str,
+    query: Optional[Dict[str, str]] = None,
+    data: bytes = b"",
+) -> Tuple[int, bytes]:
+    """One SigV4-signed request to the MinIO emulator. `path` starts at the
+    bucket (`/bucket/key`); returns (status, body) — callers decide which
+    statuses are acceptable."""
     if not minio.get("endpoint"):
-        pytest.skip("mc bucket inspection targets the MinIO emulator, not a real S3 bucket")
-    port = minio["endpoint"].rsplit(":", 1)[1]
-    creds = f"{minio['access_key']}:{minio['secret_key']}"
-    modes = {
-        "internal": ["-e", f"MC_HOST_local=http://{creds}@host.docker.internal:{port}"],
-        "host": ["-e", f"MC_HOST_local=http://{creds}@127.0.0.1:{port}", "--network", "host"],
-    }
-    order = list(modes)
-    if _MC_MODE_CACHE and _MC_MODE_CACHE[0] in modes:
-        order.sort(key=lambda name: name != _MC_MODE_CACHE[0])
-    attempts = []
-    for name in order:
-        rc, out, err = run_returncode(
-            ["docker", "run", "--rm", *modes[name], "--entrypoint", "sh", "minio/mc", "-c", script]
-        )
-        if rc == 0:
-            _MC_MODE_CACHE = [name]
-            return out
-        attempts.append(f"rc={rc} {err.strip() or out.strip()}")
-    if all("unreachable" in a or "connection refused" in a.lower() for a in attempts):
-        pytest.skip(
-            "Unable to reach MinIO with minio/mc (check Docker networking): " + "; ".join(attempts)
-        )
-    raise AssertionError(f"mc failed: {script!r}\n" + "\n".join(attempts))
+        pytest.skip("bucket inspection targets the MinIO emulator, not a real S3 bucket")
+    host = minio["endpoint"].split("://", 1)[1]
+    uri = quote(path, safe="/")
+    encoded_query = "&".join(
+        f"{quote(k, safe='')}={quote(str(v), safe='')}" for k, v in sorted((query or {}).items())
+    )
+    amz_date = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    payload_hash = hashlib.sha256(data).hexdigest()
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    canonical_request = "\n".join(
+        [
+            method,
+            uri,
+            encoded_query,
+            f"host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n",
+            signed_headers,
+            payload_hash,
+        ]
+    )
+    scope = f"{amz_date[:8]}/us-east-1/s3/aws4_request"
+    string_to_sign = "\n".join(
+        [
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            scope,
+            hashlib.sha256(canonical_request.encode()).hexdigest(),
+        ]
+    )
+    key = f"AWS4{minio['secret_key']}".encode()
+    for step in scope.split("/"):
+        key = hmac.new(key, step.encode(), hashlib.sha256).digest()
+    signature = hmac.new(key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    url = f"{minio['endpoint']}{uri}"
+    if encoded_query:
+        url += f"?{encoded_query}"
+    code, body, _ = _http_request(
+        url,
+        method=method,
+        headers={
+            "x-amz-date": amz_date,
+            "x-amz-content-sha256": payload_hash,
+            "Authorization": (
+                f"AWS4-HMAC-SHA256 Credential={minio['access_key']}/{scope}, "
+                f"SignedHeaders={signed_headers}, Signature={signature}"
+            ),
+        },
+        data=data or None,
+    )
+    return code, body
+
+
+def _s3_list(minio: Dict, bucket: str, prefix: str = "") -> List[str]:
+    """Every key under `prefix` in a bucket, following ListObjectsV2 pagination.
+    Raises on a missing bucket — `_eventually` treats that as "not yet"."""
+    keys: List[str] = []
+    token = None
+    while True:
+        query = {"list-type": "2", "prefix": prefix}
+        if token:
+            query["continuation-token"] = token
+        code, body = _s3_signed(minio, "GET", f"/{bucket}", query=query)
+        assert code == 200, f"list {bucket} -> {code}: {body[:200]!r}"
+        text = body.decode()
+        keys.extend(re.findall(r"<Key>(.*?)</Key>", text))
+        match = re.search(r"<NextContinuationToken>(.*?)</NextContinuationToken>", text)
+        if not match:
+            return keys
+        token = match.group(1)
 
 
 def minio_put_key(minio: Dict, key: str, body: str) -> None:
     """Write a foreign object straight into the bucket, bypassing pypiron."""
-    dest = shlex.quote(f"local/{minio['bucket']}/{key}")
-    _mc(minio, f"printf %s {shlex.quote(body)} | mc pipe {dest}")
+    minio_put_key_in(minio, minio["bucket"], key, body)
 
 
 def minio_get_key(minio: Dict, key: str) -> str:
     """Read an object's body straight from the bucket, bypassing pypiron."""
-    target = shlex.quote(f"local/{minio['bucket']}/{key}")
-    return _mc(minio, f"mc cat {target}")
+    return minio_get_key_in(minio, minio["bucket"], key)
 
 
 def minio_list_keys(minio: Dict) -> List[str]:
     """Every object key in the bucket, as pypiron-independent ground truth."""
-    root = f"local/{minio['bucket']}/"
-    out = _mc(minio, f"mc find {shlex.quote(root.rstrip('/'))}")
-    return sorted(ln[len(root) :] for ln in out.splitlines() if ln.startswith(root))
+    return minio_list_keys_in(minio, minio["bucket"])
 
 
 def minio_list_keys_in(minio: Dict, bucket: str) -> List[str]:
     """Every object key in a named bucket (for the multi-bucket fixture)."""
-    root = f"local/{bucket}/"
-    out = _mc(minio, f"mc find {shlex.quote(root.rstrip('/'))}")
-    return sorted(ln[len(root) :] for ln in out.splitlines() if ln.startswith(root))
+    return sorted(_s3_list(minio, bucket))
 
 
 def minio_get_key_in(minio: Dict, bucket: str, key: str) -> str:
     """Read an object's body from a named bucket, bypassing pypiron."""
-    target = shlex.quote(f"local/{bucket}/{key}")
-    return _mc(minio, f"mc cat {target}")
+    return minio_get_key_bytes_in(minio, bucket, key).decode()
 
 
 def minio_get_key_bytes_in(minio: Dict, bucket: str, key: str) -> bytes:
     """Read a binary object from a named bucket, bypassing pypiron.
 
-    Never pipe `mc cat` straight into base64: the pipeline exit code is
-    base64's, so a failed `mc cat` (e.g. unreachable host.docker.internal on a
-    Linux runner) reads as rc=0 with empty output — `_mc` then skips its
-    `--network host` fallback and an intact object hashes as zero bytes. The
-    `&&` chain keeps mc's own exit code, so a broken read fails over or fails
-    loudly instead of impersonating an empty object."""
-    target = shlex.quote(f"local/{bucket}/{key}")
-    return base64.b64decode(_mc(minio, f"mc cat {target} > /tmp/o && base64 < /tmp/o"))
+    A failed read must raise, never return b"" — an empty body impersonates a
+    zero-byte object and existence/byte-equality oracles silently pass on
+    corruption (the CI zero-byte lesson, commit e08371b)."""
+    code, body = _s3_signed(minio, "GET", f"/{bucket}/{key}")
+    assert code == 200, f"get {bucket}/{key} -> {code}: {body[:200]!r}"
+    return body
 
 
 def minio_object_sha256(minio: Dict, bucket: str, key: str) -> str:
@@ -1941,28 +1938,54 @@ def minio_object_sha256(minio: Dict, bucket: str, key: str) -> str:
 
 def minio_put_key_in(minio: Dict, bucket: str, key: str, body: str) -> None:
     """Write a foreign object straight into a named bucket, bypassing pypiron."""
-    dest = shlex.quote(f"local/{bucket}/{key}")
-    _mc(minio, f"printf %s {shlex.quote(body)} | mc pipe {dest}")
+    code, resp = _s3_signed(minio, "PUT", f"/{bucket}/{key}", data=body.encode())
+    assert code == 200, f"put {bucket}/{key} -> {code}: {resp[:200]!r}"
 
 
 def minio_key_exists_in(minio: Dict, bucket: str, key: str) -> bool:
-    """Whether a key exists in a named bucket."""
-    return key in minio_list_keys_in(minio, bucket)
+    """Whether a key exists in a named bucket. A missing bucket raises — the
+    caller is asking about a key, and "no bucket" must not read as "no key"."""
+    code, _ = _s3_signed(minio, "HEAD", f"/{bucket}/{key}")
+    if code == 200:
+        return True
+    # HeadObject carries no error body, so HeadBucket distinguishes "no key"
+    # from "no bucket". (Not ListObjects with max-keys=0: MinIO answers 200 to
+    # that even for a bucket that does not exist.)
+    bucket_code, _ = _s3_signed(minio, "HEAD", f"/{bucket}")
+    assert bucket_code == 200, f"bucket {bucket} -> {bucket_code}"
+    assert code == 404, f"head {bucket}/{key} -> {code}"
+    return False
 
 
 def minio_delete_key_in(minio: Dict, bucket: str, key: str) -> None:
     """Delete one object from a named bucket, bypassing pypiron."""
-    _mc(minio, f"mc rm {shlex.quote(f'local/{bucket}/{key}')}")
+    code, resp = _s3_signed(minio, "DELETE", f"/{bucket}/{key}")
+    assert code == 204, f"delete {bucket}/{key} -> {code}: {resp[:200]!r}"
 
 
 def minio_remove_bucket(minio: Dict, bucket: str) -> None:
-    """Delete a bucket and everything in it (simulates a destination outage)."""
-    _mc(minio, f"mc rb --force local/{shlex.quote(bucket)}")
+    """Delete a bucket and everything in it (simulates a destination outage).
+
+    Sweep-and-delete retries on BucketNotEmpty: a live pypiron keeps writing
+    (markers, index rebuilds) between the key sweep and the bucket DELETE, so
+    one pass is a race it can lose (`mc rb --force` retried the same way)."""
+    deadline = time.time() + 30.0
+    while True:
+        for key in minio_list_keys_in(minio, bucket):
+            code, resp = _s3_signed(minio, "DELETE", f"/{bucket}/{key}")
+            assert code in (204, 404), f"delete {bucket}/{key} -> {code}: {resp[:200]!r}"
+        code, resp = _s3_signed(minio, "DELETE", f"/{bucket}")
+        if code == 204:
+            return
+        assert code == 409 and time.time() < deadline, (
+            f"remove bucket {bucket} -> {code}: {resp[:200]!r}"
+        )
 
 
 def minio_make_bucket(minio: Dict, bucket: str) -> None:
     """(Re)create a bucket (simulates a destination coming back)."""
-    _mc(minio, f"mc mb --ignore-existing local/{shlex.quote(bucket)}")
+    code, resp = _s3_signed(minio, "PUT", f"/{bucket}")
+    assert code in (200, 409), f"make bucket {bucket} -> {code}: {resp[:200]!r}"
 
 
 @pytest.fixture()
@@ -2136,48 +2159,67 @@ def _azurite_create_container(port: int, container: str) -> int:
     return code
 
 
-@pytest.fixture()
-def azure(tmp_path_factory) -> Iterator[Dict]:
-    """Start Azurite via Docker with a fresh container; skip without Docker."""
+@pytest.fixture(scope="session")
+def _azurite_container() -> Iterator[Dict]:
+    """One Azurite per session (per xdist worker); tests isolate by uuid-named
+    blob containers, mirroring the session MinIO arrangement. The docker daemon
+    assigns the host port for the same bind-race reason."""
     if not cmd_exists("docker"):
         pytest.skip("docker is required for Azure integration tests; not found on PATH")
 
-    port = find_free_port()
-    name = f"pypiron-azurite-{port}-{int(time.time())}"
-    container = "pypiron-test"
-    endpoint = f"http://127.0.0.1:{port}/{AZURITE_ACCOUNT}"
-    run_checked(
-        [
-            "docker",
-            "run",
-            "-d",
-            "--name",
-            name,
-            "-p",
-            f"{port}:10000",
-            "mcr.microsoft.com/azure-storage/azurite",
-            "azurite-blob",
-            "--blobHost",
-            "0.0.0.0",
-            "--blobPort",
-            "10000",
-            "--skipApiVersionCheck",
-        ]
-    )
+    name = f"pypiron-azurite-{uuid.uuid4().hex[:12]}"
     try:
+        run_checked(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                name,
+                "-p",
+                "127.0.0.1::10000",
+                "mcr.microsoft.com/azure-storage/azurite",
+                "azurite-blob",
+                "--blobHost",
+                "0.0.0.0",
+                "--blobPort",
+                "10000",
+                "--skipApiVersionCheck",
+            ]
+        )
+        port = _docker_published_port(name, "10000/tcp")
         # Azurite answers (a 400 for the bare account URL is "up and responding").
         wait_http_responding(f"http://127.0.0.1:{port}/{AZURITE_ACCOUNT}", timeout=60.0)
-        code = _azurite_create_container(port, container)
-        if code not in (201, 409):
-            pytest.skip(f"unable to create Azurite container (status {code})")
+        yield {"port": port}
+    finally:
+        run_returncode(["docker", "rm", "-f", name])
+
+
+def _azurite_delete_container(port: int, container: str) -> None:
+    """Best-effort drop of a test's blob container from the session Azurite."""
+    try:
+        _azurite_signed(port, "DELETE", f"/{container}", {"restype": "container"})
+    except OSError:
+        pass
+
+
+@pytest.fixture()
+def azure(_azurite_container: Dict) -> Iterator[Dict]:
+    """A fresh uuid-named blob container on the session Azurite."""
+    port = _azurite_container["port"]
+    container = f"pypiron-az-{uuid.uuid4().hex[:8]}"
+    code = _azurite_create_container(port, container)
+    if code not in (201, 409):
+        pytest.skip(f"unable to create Azurite container (status {code})")
+    try:
         yield {
-            "endpoint": endpoint,
+            "endpoint": f"http://127.0.0.1:{port}/{AZURITE_ACCOUNT}",
             "account": AZURITE_ACCOUNT,
             "key": AZURITE_KEY,
             "container": container,
         }
     finally:
-        run_returncode(["docker", "rm", "-f", name])
+        _azurite_delete_container(port, container)
 
 
 @pytest.fixture()
@@ -2277,7 +2319,7 @@ def azurite_list_keys(azure: Dict, prefix: str = "") -> List[str]:
 
 
 @pytest.fixture()
-def mixed_cloud(azure: Dict) -> Iterator[Dict]:
+def mixed_cloud(azure: Dict, _minio_container: Dict) -> Iterator[Dict]:
     """A locally-runnable mixed-backend topology: one S3 bucket (MinIO, behind a
     fault proxy so it can be made unavailable) plus one Azure container
     (Azurite). Skips without Docker like the single-cloud suites.
@@ -2285,7 +2327,7 @@ def mixed_cloud(azure: Dict) -> Iterator[Dict]:
     fake-gcs-server is not faithful to object_store's GCS data plane (see the GCS
     note above), so Azurite is the faithful local second cloud here; the GCS leg
     of the multi-cloud claim is covered by the real-GCS job."""
-    minio_gen = _minio_multi(["pypiron-s3"], "mixeds3")
+    minio_gen = _minio_buckets(_minio_container, 1, "mixed")
     minio = next(minio_gen)
     proxy_gen = _minio_fault_proxy(minio)
     try:

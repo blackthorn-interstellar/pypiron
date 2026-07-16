@@ -112,8 +112,15 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - name: Sync dev dependencies
         run: uv sync
+      # Pre-build so the xdist workers' ensure_built calls are cheap no-ops
+      # instead of eight processes contending on cargo's target-dir lock.
+      - name: Build server binary
+        run: cargo build --locked
+      # -n 8 (not auto=4): the tests are wait-bound — containers, HTTP polls,
+      # deliberate drip/hysteresis windows — so oversubscribing the 4-vCPU
+      # runner keeps it busy. --durations so the leg reports where time goes.
       - name: Blackbox suite (${{ matrix.backend }} mode)
-        run: uv run -- pytest tests -m "${{ matrix.markers }}"
+        run: uv run -- pytest tests -m "${{ matrix.markers }}" -n 8 --durations=25
 
   real-gcs:
     # GCS has no faithful local emulator (dev/TESTING.md), so this real-bucket

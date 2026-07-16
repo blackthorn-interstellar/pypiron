@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import platform
 import re
 import shutil
@@ -11,6 +12,7 @@ import subprocess
 import time
 import uuid
 import zipfile
+import zlib
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -157,12 +159,59 @@ def kill_process_tree(proc: subprocess.Popen) -> None:
 # ----------------------------- Network helpers -------------------------------
 
 
+#: Next candidate in this worker's port range; see find_free_port.
+_next_worker_port: Optional[int] = None
+
+#: Each xdist worker probes a disjoint 180-port slice of 21000-31799 — below
+#: the OS ephemeral range, so the kernel never hands our listener ports out as
+#: outgoing source ports between probe and server bind.
+_WORKER_PORT_SPAN = 180
+_WORKER_PORT_BASE = 21000
+_WORKER_SLOTS = 60
+
+
 def find_free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    """A free localhost port for a server about to be spawned.
+
+    Serial runs use an OS-assigned ephemeral port. Under pytest-xdist that is
+    a cross-process race — bind/close/return means two workers can be handed
+    the same port before either server binds it — so each worker instead scans
+    its own disjoint range, and a sequential cursor avoids handing the same
+    port out twice in a row within a worker."""
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker is None:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    global _next_worker_port
+    index = int("".join(filter(str.isdigit, worker)) or "0")
+    if index >= _WORKER_SLOTS:
+        raise RuntimeError(
+            f"xdist worker {worker} exceeds the {_WORKER_SLOTS}-slot port map; "
+            "run with fewer workers or widen _WORKER_SLOTS/_WORKER_PORT_BASE"
+        )
+    # Salt the slot with the test-run id: concurrent pytest sessions on one
+    # machine (the norm in this repo) must not walk the same ranges in
+    # lockstep. The shift is constant within a session, so worker slots stay
+    # disjoint; the pid offset desynchronizes the rare cross-session slot tie.
+    salt = zlib.crc32(os.environ.get("PYTEST_XDIST_TESTRUNUID", "").encode())
+    low = _WORKER_PORT_BASE + ((index + salt) % _WORKER_SLOTS) * _WORKER_PORT_SPAN
+    if _next_worker_port is None:
+        _next_worker_port = low + (os.getpid() % _WORKER_PORT_SPAN)
+    for _ in range(_WORKER_PORT_SPAN):
+        _next_worker_port = low + (_next_worker_port - low + 1) % _WORKER_PORT_SPAN
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", _next_worker_port))
+        except OSError:
+            continue
+        finally:
+            s.close()
+        return _next_worker_port
+    raise RuntimeError(f"no free port in worker range {low}-{low + _WORKER_PORT_SPAN - 1}")
 
 
 def _http_request(

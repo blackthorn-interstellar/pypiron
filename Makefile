@@ -37,16 +37,19 @@ test-python:  ## Run blackbox integration tests
 	uv run -- pytest tests
 
 test-s3-real:  ## Run the S3 blackbox suite against a REAL S3 bucket (set PYPIRON_TEST_S3_REAL_BUCKET + ambient AWS creds; the bucket is emptied around every test)
-	uv run -- pytest tests -m "s3 and not perf and not stress"
+	# -n 0: the shared real bucket is wiped per test; parallel workers would corrupt each other.
+	uv run -- pytest tests -m "s3 and not perf and not stress" -n 0
 
-test-gcs-real:  ## Run the GCS round-trip against a REAL GCS bucket (set PYPIRON_TEST_GCS_REAL_BUCKET + ambient GCS creds; the bucket is emptied around every test)
+test-gcs-real:  ## Run the GCS round-trip against a REAL GCS bucket (set PYPIRON_TEST_GCS_REAL_BUCKET + ambient GCS creds; each test isolates under its own key prefix)
 	uv run -- pytest tests -m "gcs and not perf and not stress"
 
 perf:  ## Run performance benchmarks (builds release binary)
-	uv run -- pytest tests -m perf -s
+	# -n 0: xdist swallows -s and concurrent runs corrupt the timings.
+	uv run -- pytest tests -m perf -s -n 0
 
 compat:  ## Generate the client compatibility matrix
-	uv run -- pytest tests -m "compat and not perf and not stress" --write-compat-doc
+	# -n 0: compat results aggregate in-process; xdist workers can't feed the doc writer.
+	uv run -- pytest tests -m "compat and not perf and not stress" --write-compat-doc -n 0
 
 check: af cargo-check lint test-rust  ## Format, lint, and unit-test
 

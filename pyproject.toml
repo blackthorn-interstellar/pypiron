@@ -28,6 +28,13 @@ bindings = "bin"
 # Strip debug symbols to reduce binary size
 strip = true
 
+[tool.uv]
+# Don't build/install the crate on `uv sync`: that's a full maturin release
+# build (~2.5 min in CI) and nothing consumes it — the test suite builds and
+# runs the debug binary itself (tests/helpers.py ensure_built). Release wheels
+# are built by maturin-action in CI, which doesn't go through uv sync.
+package = false
+
 [dependency-groups]
 dev = [
     "maturin",
@@ -56,7 +63,10 @@ markers = [
     "chaos: crash-point fault injection sweeps (slow-ish, deterministic)",
     "compat(client, feature): client compatibility coverage point for docs/reference/compatibility.md",
 ]
-addopts = "-m 'not perf and not stress'"
+# -n auto: tests isolate by uuid bucket/container/port, so they parallelize.
+# The serial-only targets (perf timing, the compat doc's result aggregation,
+# real-bucket runs that wipe a shared bucket) pass -n 0 in the Makefile.
+addopts = "-m 'not perf and not stress' -n auto"
 testpaths = [
     "tests",
 ]

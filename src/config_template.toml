@@ -67,6 +67,12 @@
 # both the bytes and the sha256 they're checked against, defeating verification.
 # allow-insecure-upstream = false
 
+# Supply-chain security — malware blocking plus the org audit, from one OSV feed
+# (the same database uv audit uses). On by default: protection nobody configured
+# is the point. The feed is a URL or a local path; the startup log names it.
+# advisory-feed = "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip"   # "" disables the feature
+# malware-block = true                      # refuse to serve/cache files in the feed's malware block set
+
 # Attach per-client project labels to /metrics (pypiron_project_requests_total).
 # Off by default: /metrics is unauthenticated and the label is the basic-auth
 # username subaddress, so enabling it lets any scraper enumerate project names.

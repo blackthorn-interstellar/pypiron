@@ -51,6 +51,16 @@ performance change with its before/after.
 
 Tracked so they don't get lost. Not commitments — bucketed by intent.
 
+### In progress
+
+**Advisories: malware blocking + org audit.** One OSV feed (the PyPI export uv
+audit also uses) powers two on-by-default features: a malware blocklist enforced
+where bytes are served — closing the lockfile-pins-cached-malware gap a caching
+mirror inherits from PyPI — and an org-level audit joining the corpus, the
+download counters, and the advisory index. Vulnerabilities are reported, never
+blocked; malware is blocked, never negotiated. Shipped in blackbox-tested rungs;
+full design, acceptance criteria, and rung list in [ADVISORIES.md](ADVISORIES.md).
+
 ### Maybe
 
 **Region-biased index rebuilds.** Regional read-affinity (Shipped) serves reads

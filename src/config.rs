@@ -91,6 +91,8 @@ pub struct ServeConfig {
     pub access_log_format: Option<String>,
     pub proxy_upstream: Option<String>,
     pub allow_insecure_upstream: Option<bool>,
+    pub advisory_feed: Option<String>,
+    pub malware_block: Option<bool>,
     pub metrics_project_labels: Option<bool>,
     pub spool_dir: Option<PathBuf>,
     pub wait_on_upload: Option<bool>,
@@ -316,6 +318,13 @@ mod tests {
         assert_eq!(cfg.serve.artifact_delivery.as_deref(), Some("auto"));
         assert_eq!(cfg.serve.counters_retention_days, Some(90));
         assert_eq!(cfg.serve.s3_force_path_style, Some(false));
+        // Advisory knobs are Option-in-clap (defaults resolved in code), so the
+        // template documents the resolved defaults; assert the comment matches.
+        assert_eq!(
+            cfg.serve.advisory_feed.as_deref(),
+            Some("https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip")
+        );
+        assert_eq!(cfg.serve.malware_block, Some(true));
         assert_eq!(cfg.mirror.exclude_newer.as_deref(), Some("7"));
         assert_eq!(
             cfg.mirror.include_format,

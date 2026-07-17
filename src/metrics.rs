@@ -40,6 +40,13 @@ struct BucketMetricState {
     topology_write_fenced: bool,
 }
 
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Index into [`ROUTES`] for a request path.
 pub fn route_group(path: &str) -> usize {
     if path == "/simple" || path.starts_with("/simple/") {
@@ -131,11 +138,22 @@ pub struct Metrics {
     /// Latest P4 health/selection view. `None` until a multi-bucket worker
     /// publishes its first snapshot; never populated by a single-bucket node.
     bucket_health: Mutex<Option<BucketMetricState>>,
+    /// Unix seconds of this node's last successful advisory-snapshot refresh
+    /// (leader source poll, or a follower's storage check). 0 = never — the
+    /// `pypiron_advisory_snapshot_age_seconds` gauge is omitted until then.
+    advisory_last_refresh_unix: AtomicU64,
 }
 
 impl Metrics {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Mark this node's advisory snapshot as freshly refreshed (resets the age
+    /// gauge). Called once per successful refresh cycle by the worker tick.
+    pub fn advisory_refresh_ok(&self) {
+        self.advisory_last_refresh_unix
+            .store(unix_now_secs(), Ordering::Relaxed);
     }
 
     /// Count a request against a project attribution tag. The tag must
@@ -372,6 +390,18 @@ impl Metrics {
         out.push_str(&format!(
             "pypiron_audit_last_duration_seconds {audit_secs}\n"
         ));
+        // Advisory snapshot staleness (per node). Emitted only once a refresh has
+        // succeeded — a permanent zero on a node that never armed the feature
+        // would be a misleading "0 seconds old". Age is computed at render time.
+        let advisory_refresh = self.advisory_last_refresh_unix.load(Ordering::Relaxed);
+        if advisory_refresh != 0 {
+            let age = unix_now_secs().saturating_sub(advisory_refresh);
+            out.push_str(
+                "# HELP pypiron_advisory_snapshot_age_seconds Seconds since this node last refreshed the advisory snapshot.\n",
+            );
+            out.push_str("# TYPE pypiron_advisory_snapshot_age_seconds gauge\n");
+            out.push_str(&format!("pypiron_advisory_snapshot_age_seconds {age}\n"));
+        }
         for (name, help, value) in [
             (
                 "pypiron_registry_projects",

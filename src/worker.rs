@@ -783,6 +783,13 @@ pub async fn run_worker_until(
     // (repl_sweep_requested). `None` fires one sweep on boot to drain any notes
     // a predecessor left. (dev/MULTIBUCKET.md §Repair and convergence.)
     let mut last_repl_sweep: Option<Instant> = None;
+    // Advisory refresh is always-on (never gated on multi-bucket): the malware
+    // block set and audit index are global truth-cache. `None` fires one refresh
+    // on the first tick; the memo carries the leader's conditional-GET etag and
+    // its failing-state (warn on transition, not per attempt).
+    let advisory_enabled = state.advisory_feed.is_some() || state.malware_block;
+    let mut last_advisory_refresh: Option<Instant> = None;
+    let mut advisory_memo = crate::advisories::RefreshMemo::default();
     let mut last_reconcile: Option<Instant> = if state.audit_on_boot {
         None
     } else {
@@ -861,6 +868,35 @@ pub async fn run_worker_until(
             tokio::select! {
                 _ = state.counters.flush() => {}
                 _ = wait_until_generation_changes(&state, selected.generation) => {}
+            }
+        }
+
+        // Advisory refresh (EVERY node): the leader refetches the source and
+        // persists changed bytes; every node reloads from storage when FEED_KEY's
+        // etag moves. On the reconcile cadence, or immediately when a PUT set
+        // `advisory_reload_asap`. Never disarmed by a bucket switch — the snapshot
+        // is global truth-cache, so it runs on the selected handle without
+        // resetting on a generation change.
+        if advisory_enabled {
+            let forced = state.advisory_reload_asap.load(Ordering::SeqCst);
+            let due = forced
+                || last_advisory_refresh.is_none_or(|t| t.elapsed() >= state.reconcile_interval);
+            if due {
+                last_advisory_refresh = Some(Instant::now());
+                crate::advisories::refresh(
+                    crate::advisories::RefreshCtx {
+                        storage: selected.storage.as_ref(),
+                        slot: &state.advisories,
+                        metrics: &state.metrics,
+                    },
+                    state.advisory_feed.as_deref(),
+                    is_leader,
+                    &mut advisory_memo,
+                )
+                .await;
+                if forced {
+                    state.advisory_reload_asap.store(false, Ordering::SeqCst);
+                }
             }
         }
 
@@ -3035,6 +3071,12 @@ mod tests {
             proxy: None,
             started: std::time::Instant::now(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            advisory_feed: None,
+            malware_block: false,
+            advisories: Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::advisories::AdvisoryState::default(),
+            ))),
+            advisory_reload_asap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -3154,6 +3196,12 @@ mod tests {
             proxy: None,
             started: std::time::Instant::now(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            advisory_feed: None,
+            malware_block: false,
+            advisories: Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::advisories::AdvisoryState::default(),
+            ))),
+            advisory_reload_asap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

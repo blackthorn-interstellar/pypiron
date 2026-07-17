@@ -25,9 +25,9 @@ use tracing::{debug, info, warn};
 // name so the bare `worker::`, `storage::`, … paths throughout this file (from
 // its life as the crate root) keep resolving.
 use crate::{
-    bucket_health, buckets, cache, config, coremeta, counters, metrics, names, node_region,
-    observed_storage, origin, project_cache, provenance, proxy, render, replicate, sidecar, status,
-    storage, sync, token, tombstone, upload, verify, web, wheel, worker,
+    advisories, bucket_health, buckets, cache, config, coremeta, counters, metrics, names,
+    node_region, observed_storage, origin, project_cache, provenance, proxy, render, replicate,
+    sidecar, status, storage, sync, token, tombstone, upload, verify, web, wheel, worker,
 };
 
 use bucket_health::{HealthController, HealthPolicy};
@@ -900,6 +900,21 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_PROXY_ALLOW_CIDR", value_delimiter = ',')]
     proxy_allow_cidr: Vec<String>,
 
+    /// Advisory feed (OSV PyPI export): a URL or a local path. Powers malware
+    /// blocking and the org audit. Defaults to the OSV PyPI export URL (the
+    /// startup log names the URL it will poll); `""` disables the feature
+    /// entirely. `Option` with no clap default so startup can tell an explicit
+    /// setting (fail-closed if it can't produce a snapshot) from the default.
+    #[arg(long, env = "PYPIRON_ADVISORY_FEED")]
+    advisory_feed: Option<String>,
+
+    /// Refuse to serve or cache artifacts whose (name, version) is in the feed's
+    /// malware block set. Default true. Requires a snapshot source — the feed, or
+    /// a previously delivered `_advisories/` copy. `Option` with no clap default
+    /// so an explicit `--malware-block true` is distinguishable from the default.
+    #[arg(long, env = "PYPIRON_MALWARE_BLOCK", action = clap::ArgAction::Set)]
+    malware_block: Option<bool>,
+
     /// The slice of PyPI the proxy serves and caches — names included. The same
     /// mirror-selection surface as `sync`, set once and shared: a `[mirror]` table
     /// in pypiron.toml governs both. With a package scope, the proxy serves only
@@ -1018,6 +1033,18 @@ pub struct AppState {
     /// Set on graceful shutdown so `/health` reports 503 *before* the listener
     /// stops accepting, letting a load balancer drain the node cleanly.
     pub shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Resolved advisory feed (a URL or a local path), post-empty-filter. `None`
+    /// means the feature is disabled (`--advisory-feed ""`).
+    pub advisory_feed: Option<String>,
+    /// Whether malware blocking is armed (enforcement lands in a later rung).
+    pub malware_block: bool,
+    /// The live advisory snapshot every request-path probe reads. A global
+    /// truth-cache: NEVER reset on a bucket-generation change — a failover must
+    /// not disarm blocking.
+    pub advisories: Arc<std::sync::RwLock<Arc<advisories::AdvisoryState>>>,
+    /// Set by `PUT /advisories/feed` so the worker runs the storage reload on its
+    /// next tick regardless of the reconcile period, then clears it.
+    pub advisory_reload_asap: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -1042,6 +1069,12 @@ impl AppState {
     pub fn mutations_fenced(&self) -> bool {
         self.writes_fenced
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The current advisory snapshot: lock, clone the inner `Arc`, drop the
+    /// guard. Cheap enough for the request path; recovers a poisoned lock.
+    pub fn advisory_snapshot(&self) -> Arc<advisories::AdvisoryState> {
+        advisories::AdvisoryState::read(&self.advisories)
     }
 
     /// Record that a client request just arrived (traffic signal for probe
@@ -1428,6 +1461,8 @@ fn merge_serve_file(
     // Server-only Option knobs: CLI/env wins when present, else the file.
     cli.proxy_upstream = cli.proxy_upstream.take().or(f.proxy_upstream.clone());
     cli.spool_dir = cli.spool_dir.take().or(f.spool_dir.clone());
+    cli.advisory_feed = cli.advisory_feed.take().or(f.advisory_feed.clone());
+    cli.malware_block = cli.malware_block.or(f.malware_block);
 
     // Storage selection is shared with the maintenance commands, so it lives in
     // its own helper.
@@ -1489,6 +1524,37 @@ fn merge_storage_file(
     Ok(())
 }
 
+/// Obtain the startup advisory snapshot for an *enabled* feature. Returns the
+/// snapshot and whether one actually loaded (which arms the staleness gauge).
+/// Bails only when an *explicit* advisory setting cannot produce a snapshot
+/// (AC7) — the always-on defaults warn and continue, so an air-gapped box that
+/// never asked for this is never bricked.
+async fn advisory_obtain(
+    storage: &dyn Storage,
+    feed: Option<&str>,
+    explicit: bool,
+) -> Result<(advisories::AdvisoryState, bool)> {
+    if let Some(url) = feed {
+        info!(feed = %url, "advisory feed: polling for the malware block set and org audit");
+    }
+    if let Some(state) = advisories::obtain_at_startup(storage, feed).await {
+        return Ok((state, true));
+    }
+    if explicit {
+        anyhow::bail!(
+            "advisory feed is configured but no snapshot could be obtained: the source was \
+             unreachable and no stored _advisories/ snapshot exists. Point --advisory-feed at a \
+             reachable URL or local zip, deliver one with `pypiron sync --advisory-feed`, or set \
+             --advisory-feed \"\" to disable malware blocking."
+        );
+    }
+    warn!(
+        "malware blocking armed but unfed: no advisory snapshot is available yet, so nothing is \
+         blocked. It self-arms the moment a snapshot arrives (a local-path ferry or a sync push)."
+    );
+    Ok((advisories::AdvisoryState::default(), false))
+}
+
 async fn run_serve(
     mut cli: ServeArgs,
     config_path: Option<std::path::PathBuf>,
@@ -1501,6 +1567,13 @@ async fn run_serve(
     // mirror selection itself is resolved through sync's one shared path, so the proxy and
     // a sync run can never drift.
     let file = config::load(config_path.as_deref())?;
+    // Capture whether the advisory knobs were set explicitly BEFORE the merge
+    // folds file/default values in — startup posture is fail-closed only for an
+    // explicit request (AC7), never for the always-on defaults.
+    let explicit_advisory_feed =
+        arg_from_cli_or_env(serve_matches, "advisory_feed") || file.serve.advisory_feed.is_some();
+    let explicit_malware_block =
+        arg_from_cli_or_env(serve_matches, "malware_block") || file.serve.malware_block.is_some();
     merge_serve_file(&mut cli, &file.serve, serve_matches)?;
     cli.private_prefix = cli.private_prefix.take().or(file.private_prefix.clone());
     validate_intent_grace_secs(cli.intent_grace_secs)?;
@@ -1694,6 +1767,34 @@ async fn run_serve(
         info!("access log enabled — logging every request decreases throughput ~7-10%");
     }
 
+    // Advisory snapshot: resolve the feed (default OSV URL; `""` disables), then
+    // obtain it synchronously before serving a byte — fail-closed by intent.
+    let malware_block_flag = cli.malware_block.unwrap_or(true);
+    let advisory_feed = cli
+        .advisory_feed
+        .take()
+        .unwrap_or_else(|| advisories::DEFAULT_FEED_URL.to_string());
+    let advisory_feed = {
+        let trimmed = advisory_feed.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    // Fully off only when the feed is empty AND blocking wasn't explicitly asked
+    // for: an empty feed disables the whole feature, blocking included.
+    let advisory_off = advisory_feed.is_none() && !(explicit_malware_block && malware_block_flag);
+    let (advisory_state, advisory_loaded) = if advisory_off {
+        (advisories::AdvisoryState::default(), false)
+    } else {
+        let pinned = buckets.pin();
+        advisory_obtain(
+            pinned.storage.as_ref(),
+            advisory_feed.as_deref(),
+            explicit_advisory_feed || explicit_malware_block,
+        )
+        .await?
+    };
+    // Effective blocking is off whenever the feature is off.
+    let malware_block = !advisory_off && malware_block_flag;
+
     let state = Arc::new(AppState {
         buckets,
         bucket_health,
@@ -1737,7 +1838,15 @@ async fn run_serve(
         proxy,
         started: std::time::Instant::now(),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        advisory_feed,
+        malware_block,
+        advisories: Arc::new(std::sync::RwLock::new(Arc::new(advisory_state))),
+        advisory_reload_asap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
+    // A snapshot loaded at startup is a successful refresh — arm the gauge.
+    if advisory_loaded {
+        state.metrics.advisory_refresh_ok();
+    }
 
     // Genuine misconfiguration hazards warn in any log format. The benign
     // facts (read-only, no-admin, public reads, proxy upstream) are surfaced in
@@ -1810,6 +1919,12 @@ async fn run_serve(
         // upstream ETag each sync job saw, so a fresh/ephemeral sync host stays
         // conditional. Admin-gated; opaque JSON the server never interprets.
         .route("/sync/cursors", get(sync_cursors_get).put(sync_cursors_put))
+        // The advisory snapshot push/pull path: a reader pulls the stored zip
+        // (etag-conditioned), an admin pushes a delivered snapshot.
+        .route(
+            "/advisories/feed",
+            get(advisories_feed_get).put(advisories_feed_put),
+        )
         // The locally-materialized PEP 691 index, bypassing the on-demand
         // proxy: a mirror-over-HTTP `sync` reconciles against the dest's own
         // truth (which files it holds, their yank state), not a proxied
@@ -3225,24 +3340,17 @@ pub async fn publish_record(
         }
     }
 
-    // In multi-bucket mode the crash-recovery marker is correctness-critical;
-    // every writer that observed the old claim must pair it after committing.
-    let intent_nonce = if state.buckets.is_multi() {
-        Some(worker::mark_intent(storage, &pkg_norm).await.map_err(|e| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("failed to reserve package write: {e}"),
-            )
-        })?)
-    } else {
-        match worker::mark_intent(storage, &pkg_norm).await {
-            Ok(nonce) => Some(nonce),
-            Err(e) => {
-                warn!(error=?e, "legacy: failed to write intent marker");
-                None
-            }
-        }
-    };
+    // The crash-recovery marker is correctness-critical in every mode: it is the
+    // only durable signal that carries a global-index membership change (a new
+    // name appearing) to the worker. Dropping it before touching truth — and
+    // refusing the write if it fails — keeps the audit a safety net for external
+    // change, never a substitute for pypiron's own bookkeeping.
+    let intent_nonce = Some(worker::mark_intent(storage, &pkg_norm).await.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("failed to reserve package write: {e}"),
+        )
+    })?);
     match observed_origin.as_ref().map(|observed| observed.state) {
         Some(origin::OriginState::Mirror) if desired_origin == origin::MIRROR => {}
         Some(origin::OriginState::Private) if desired_origin == origin::PRIVATE => {}
@@ -4852,16 +4960,17 @@ pub async fn delete_record(
             ));
         }
     }
-    let intent_nonce = if state.buckets.is_multi() {
-        Some(worker::mark_intent(storage, pkg).await.map_err(|e| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("failed to reserve delete: {e}"),
-            )
-        })?)
-    } else {
-        worker::mark_intent(storage, pkg).await.ok()
-    };
+    // Correctness-critical in every mode: deleting a package's last file prunes
+    // it from the global index, and the intent marker is the only durable signal
+    // that carries that removal to the worker. Fail the delete before touching
+    // truth if the marker can't be written, rather than mutate truth with no
+    // breadcrumb and leave the prune to the external-change audit.
+    let intent_nonce = Some(worker::mark_intent(storage, pkg).await.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("failed to reserve delete: {e}"),
+        )
+    })?);
 
     // A mirror cache eviction cannot be made atomic with a concurrent
     // mirror->private package demotion: the claim and artifact are separate S3
@@ -5274,6 +5383,86 @@ async fn sync_cursors_put(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Serve the stored advisory-snapshot zip (reader-gated), so a mirror-over-HTTP
+/// `sync` can pull it from an upstream pypiron. The ETag is the zip's sha256;
+/// `If-None-Match` short-circuits to 304 (an unchanged feed transfers nothing).
+/// 404 when no snapshot has been delivered yet.
+async fn advisories_feed_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !state.is_reader(&headers) {
+        return unauthorized();
+    }
+    let bytes = match advisories::stored_feed_bytes(state.pin().storage.as_ref()).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return not_found("no advisory snapshot"),
+        Err(e) => return read_error(e),
+    };
+    let etag = format!("\"{}\"", advisories::sha256_hex(&bytes));
+    let revalidated = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "*" || v.contains(&etag))
+        .unwrap_or(false);
+    let builder = Response::builder().header(header::ETAG, &etag);
+    let response = if revalidated {
+        builder.status(StatusCode::NOT_MODIFIED).body(Body::empty())
+    } else {
+        builder
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/zip")
+            .header(header::CONTENT_LENGTH, bytes.len())
+            .body(Body::from(bytes))
+    };
+    response.unwrap_or_else(not_found)
+}
+
+/// Accept a pushed advisory snapshot (admin) — the sync-delivery path for
+/// air-gapped destinations. Authenticate before parsing (a client must not probe
+/// well-formed vs malformed via the status), validate it parses, persist it
+/// verbatim, then arm an immediate worker reload so blocking self-arms without a
+/// restart.
+async fn advisories_feed_put(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
+    // Validate before persisting — the stored copy is what every node loads, so
+    // a garbage PUT must never overwrite a good snapshot. Parse off the runtime.
+    let bytes = body.to_vec();
+    let for_parse = bytes.clone();
+    match tokio::task::spawn_blocking(move || advisories::parse_feed(&for_parse)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("not a valid advisory feed: {e}"),
+            ))
+        }
+        Err(_) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "advisory parse task failed".into(),
+            ))
+        }
+    }
+    state
+        .pin()
+        .storage
+        .put_bytes(advisories::FEED_KEY, bytes, Some("application/zip"))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
+    // Load it this worker tick regardless of the reconcile period, and wake the
+    // worker now so the load is ~immediate rather than up to a tick away.
+    state
+        .advisory_reload_asap
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state.worker_nudge.notify_one();
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// The locally-materialized PEP 691 index for a package, read straight from
 /// storage so the on-demand proxy never shadows it. Admin-gated; a package with
 /// no local index yet is an empty listing, not a 404 (so the caller treats it
@@ -5382,6 +5571,12 @@ impl AppState {
             proxy: None,
             started: std::time::Instant::now(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            advisory_feed: None,
+            malware_block: false,
+            advisories: Arc::new(std::sync::RwLock::new(Arc::new(
+                advisories::AdvisoryState::default(),
+            ))),
+            advisory_reload_asap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

@@ -436,6 +436,14 @@ _sync/cursors.json                       # mirror-over-HTTP sync memo: pkg -> la
                                          #   (config-keyed). Pure cache for conditional fetch;
                                          #   never truth, never a view — delete it and the next
                                          #   sync re-fetches. Served by admin GET/PUT /sync/cursors.
+_advisories/osv-pypi.zip                 # the OSV PyPI advisory export, carried VERBATIM (like
+                                         #   .provenance): powers the malware block set + org audit.
+                                         #   A CARRIED cache — delete it and the leader refetches
+                                         #   (or a sync/ferry re-delivers). Never truth, never a
+                                         #   view, NEVER fanned out as truth across buckets, so a
+                                         #   failover never disarms blocking. Reader GET / admin PUT
+                                         #   /advisories/feed. (quarantined.json + report.json join
+                                         #   it here in later rungs — see ADVISORIES.md.)
 _leader/lease.json                       # multi-node lease (holder, term, expires-at)
 _topology/stamp.json                     # multi-bucket only: fail-closed config check — a hash of the
                                          #   ordered bucket identities + operator topology generation,

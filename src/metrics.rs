@@ -75,6 +75,12 @@ pub struct Metrics {
     /// per-package/version breakdown lives in the counter store (`_counters/`),
     /// never here, to keep the scrape payload off registry-sized cardinality.
     downloads: AtomicU64,
+    /// Artifact downloads refused by the malware byte gate (an advisory-blocked
+    /// version, or a quarantined project). Unlabeled on purpose — the package,
+    /// version, and advisory ids go to the warn log, keeping `/metrics`
+    /// low-cardinality. A nonzero rate is the active-remediation signal: some
+    /// machine still *asks* for malware — an incident, not a statistic.
+    blocked_downloads: AtomicU64,
     /// Package index rebuilds (worker + reconcile + deletes).
     pub index_rebuilds: AtomicU64,
     /// Full reconcile sweeps completed.
@@ -280,6 +286,12 @@ impl Metrics {
         self.downloads.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count one download refused by the malware byte gate (advisory-blocked or
+    /// quarantined). Called at the single block site in the file handler.
+    pub fn record_blocked_download(&self) {
+        self.blocked_downloads.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_request(&self, route: usize, status: u16) {
         let class = match status {
             200..=299 => 0,
@@ -327,6 +339,11 @@ impl Metrics {
                 "pypiron_downloads_total",
                 "Artifact downloads served (real artifacts; streamed 200s and presigned 302s).",
                 &self.downloads,
+            ),
+            (
+                "pypiron_blocked_downloads_total",
+                "Artifact downloads refused by the malware byte gate (advisory-blocked or quarantined).",
+                &self.blocked_downloads,
             ),
             (
                 "pypiron_index_rebuilds_total",
@@ -710,6 +727,9 @@ mod tests {
         assert!(text.contains("pypiron_http_requests_total{route=\"simple\",status=\"2xx\"} 1"));
         assert!(text.contains("# TYPE pypiron_downloads_total counter"));
         assert!(text.contains("pypiron_downloads_total 1"));
+        // The malware byte-gate tripwire is always present (at zero until a block).
+        assert!(text.contains("# TYPE pypiron_blocked_downloads_total counter"));
+        assert!(text.contains("pypiron_blocked_downloads_total 0"));
         assert!(text.contains("pypiron_http_requests_total{route=\"simple\",status=\"4xx\"} 1"));
         assert!(text.contains("pypiron_proxy_artifacts_cached_total 3"));
         assert!(text.contains("# TYPE pypiron_http_requests_total counter"));

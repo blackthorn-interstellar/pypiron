@@ -130,14 +130,25 @@ impl AdvisoryDb {
 }
 
 /// The `MAL-*` ids that condemn `name_norm` at `version` (empty = not blocked).
-/// `name_norm` must already be [`normalize_pkg_name`]-normalized.
-pub fn blocking_advisories<'a>(db: &'a AdvisoryDb, name_norm: &str, version: &str) -> Vec<&'a str> {
+/// `name_norm` must already be [`normalize_pkg_name`]-normalized. `version` is
+/// `None` when the filename yielded no parseable version (a legacy binary
+/// format): fail-closed, only an all-versions rule (the "this package is
+/// malware" case) still condemns it — an exact/range rule is a claim about a
+/// specific version we can't read, so it can't be proven and doesn't fire.
+pub fn blocking_advisories<'a>(
+    db: &'a AdvisoryDb,
+    name_norm: &str,
+    version: Option<&str>,
+) -> Vec<&'a str> {
     db.block
         .get(name_norm)
         .map(|rules| {
             rules
                 .iter()
-                .filter(|rule| rule.scope.matches(version))
+                .filter(|rule| match version {
+                    Some(v) => rule.scope.matches(v),
+                    None => matches!(rule.scope, VersionScope::AllVersions),
+                })
                 .map(|rule| rule.id.as_str())
                 .collect()
         })
@@ -881,28 +892,36 @@ mod tests {
         )]);
         let db = parse_feed(&zip).unwrap();
         assert_eq!(
-            blocking_advisories(&db, "evil-pkg", "1.0.0"),
+            blocking_advisories(&db, "evil-pkg", Some("1.0.0")),
             ["MAL-2024-0001"]
         );
-        assert!(blocking_advisories(&db, "evil-pkg", "1.0.1").is_empty());
+        assert!(blocking_advisories(&db, "evil-pkg", Some("1.0.1")).is_empty());
         // Name normalization applies on the query side too.
-        assert!(blocking_advisories(&db, "notevil", "1.0.0").is_empty());
+        assert!(blocking_advisories(&db, "notevil", Some("1.0.0")).is_empty());
+        // An exact-version rule can't be proven against an unknown version.
+        assert!(blocking_advisories(&db, "evil-pkg", None).is_empty());
     }
 
     #[test]
     fn all_versions_blocks_everything_including_unparseable() {
         let zip = osv_zip(&[("MAL-2.json", mal_all("MAL-2024-0002", "badpkg"))]);
         let db = parse_feed(&zip).unwrap();
-        assert_eq!(blocking_advisories(&db, "badpkg", "0.1"), ["MAL-2024-0002"]);
         assert_eq!(
-            blocking_advisories(&db, "badpkg", "99.99.99"),
+            blocking_advisories(&db, "badpkg", Some("0.1")),
+            ["MAL-2024-0002"]
+        );
+        assert_eq!(
+            blocking_advisories(&db, "badpkg", Some("99.99.99")),
             ["MAL-2024-0002"]
         );
         // An unparseable version must still be blocked (fail-closed sentinel).
         assert_eq!(
-            blocking_advisories(&db, "badpkg", "not-a-version"),
+            blocking_advisories(&db, "badpkg", Some("not-a-version")),
             ["MAL-2024-0002"]
         );
+        // A filename that yields no version at all is likewise blocked by an
+        // all-versions rule (the byte-gate's legacy-format path).
+        assert_eq!(blocking_advisories(&db, "badpkg", None), ["MAL-2024-0002"]);
     }
 
     #[test]
@@ -915,7 +934,7 @@ mod tests {
         assert!(advisories_for(&db, "widget", "2.20.0").is_empty());
         assert!(advisories_for(&db, "widget", "2.21.0").is_empty());
         // A PYSEC advisory never blocks — it is audit-only.
-        assert!(blocking_advisories(&db, "widget", "2.19.0").is_empty());
+        assert!(blocking_advisories(&db, "widget", Some("2.19.0")).is_empty());
     }
 
     #[test]
@@ -952,7 +971,7 @@ mod tests {
             "affected": [{"package": {"ecosystem": "npm", "name": "widget"}, "versions": ["1.0"]}],
         });
         let db = parse_feed(&osv_zip(&[("w.json", withdrawn), ("n.json", npm)])).unwrap();
-        assert!(blocking_advisories(&db, "widget", "1.0").is_empty());
+        assert!(blocking_advisories(&db, "widget", Some("1.0")).is_empty());
         assert!(advisories_for(&db, "widget", "1.0").is_empty());
     }
 
@@ -972,7 +991,7 @@ mod tests {
         let bytes = zip.finish().unwrap().into_inner();
         let db = parse_feed(&bytes).unwrap();
         assert_eq!(
-            blocking_advisories(&db, "goodpkg", "1.0.0"),
+            blocking_advisories(&db, "goodpkg", Some("1.0.0")),
             ["MAL-2024-0005"]
         );
     }
@@ -982,15 +1001,24 @@ mod tests {
         // The feed says 1.0; a request for 1.0.0 is the same PEP 440 version.
         let zip = osv_zip(&[("M.json", mal_exact("MAL-2024-0006", "pkg", "1.0"))]);
         let db = parse_feed(&zip).unwrap();
-        assert_eq!(blocking_advisories(&db, "pkg", "1.0.0"), ["MAL-2024-0006"]);
-        assert_eq!(blocking_advisories(&db, "pkg", "1.0"), ["MAL-2024-0006"]);
+        assert_eq!(
+            blocking_advisories(&db, "pkg", Some("1.0.0")),
+            ["MAL-2024-0006"]
+        );
+        assert_eq!(
+            blocking_advisories(&db, "pkg", Some("1.0")),
+            ["MAL-2024-0006"]
+        );
     }
 
     #[test]
     fn mal_advisory_is_both_blocked_and_audited() {
         let zip = osv_zip(&[("M.json", mal_exact("MAL-2024-0007", "pkg", "1.0.0"))]);
         let db = parse_feed(&zip).unwrap();
-        assert_eq!(blocking_advisories(&db, "pkg", "1.0.0"), ["MAL-2024-0007"]);
+        assert_eq!(
+            blocking_advisories(&db, "pkg", Some("1.0.0")),
+            ["MAL-2024-0007"]
+        );
         // Malware also shows in the audit index (with a blocked flag downstream).
         assert_eq!(advisories_for(&db, "pkg", "1.0.0")[0].id, "MAL-2024-0007");
         assert_eq!(db.block_names(), 1);

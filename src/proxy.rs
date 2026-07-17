@@ -32,6 +32,7 @@ use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::Client;
 use tracing::{info, warn};
 
+use crate::advisories;
 use crate::names::{infer_version_from_filename, matches_prefix};
 use crate::origin;
 use crate::render::{self, FileMetadata};
@@ -564,6 +565,24 @@ impl Proxy {
         let Some(file) = found.files.iter().find(|f| f.filename == filename) else {
             return Ok(()); // not upstream, or filtered out
         };
+
+        // Malware fill refusal: never download-and-cache a version OSV condemns —
+        // the server-side twin of uv's pre-sync check, so malware in the feed
+        // before anyone here requests it never lands in storage. Origin is mirror
+        // by definition on this path, so no origin read. The refused GET then
+        // falls through to the byte gate (unclaimed origin → 403); nothing is
+        // written here — no artifact, no sidecar, no origin claim.
+        if state.malware_block {
+            let snap = state.advisory_snapshot();
+            if let Some(db) = &snap.db {
+                let version = infer_version_from_filename(filename);
+                let ids = advisories::blocking_advisories(db, pkg, version.as_deref());
+                if !ids.is_empty() {
+                    warn!(%pkg, %filename, advisories = ?ids, "proxy: refused malware fill");
+                    return Ok(());
+                }
+            }
+        }
 
         // Claim before writing, exactly like sync: atomically, so a racing
         // first private upload can't merge worlds. Capture the claim's exact

@@ -1,18 +1,22 @@
-"""Advisory snapshot pipeline (rung 3): the feed loads into a live snapshot,
-the reader-GET / admin-PUT `/advisories/feed` push path works, and startup is
-fail-closed by intent (AC7). Everything through the real binary over HTTP.
+"""Advisory snapshot pipeline + malware enforcement.
 
-Enforcement (the byte gate) and the audit report land in later rungs; this file
-covers the snapshot plumbing and the module-level fixture helpers those rungs
-reuse.
+Rung 3 (snapshot plumbing): the feed loads into a live snapshot, the reader-GET /
+admin-PUT `/advisories/feed` push path works, and startup is fail-closed by
+intent (AC7). Rung 4 (enforcement): the malware byte gate refuses blocked bytes
+where they're served (AC1), private origin exempts a same-named package (AC2),
+the on-demand proxy refuses to fill a blocked version (AC3), and a dead feed
+degrades freshness, never availability (AC6). Everything through the real binary
+over HTTP, driven by real `uv`.
 """
 
 from __future__ import annotations
 
+import http.server
 import json
 import os
 import re
 import subprocess
+import threading
 import time
 import zipfile
 from contextlib import contextmanager
@@ -20,13 +24,18 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import _start_disk_server
+from .conftest import _start_disk_server, _start_proxy_pair
 from .helpers import (
     _encode_basic_auth,
     find_free_port,
     http_get,
     http_request_auth,
     kill_process_tree,
+    make_wheel,
+    run_checked,
+    run_returncode,
+    upload_legacy,
+    wait_for_file_in_index,
     wait_http_responding,
 )
 
@@ -331,6 +340,180 @@ def test_default_disk_server_stays_advisory_hermetic(disk_server):
     assert not (Path(disk_server["data_dir"]) / "_advisories").exists()
 
 
+# ------------------------------ enforcement (rung 4) -------------------------
+
+
+def test_ac1_byte_gate_blocks_mal_version_by_default(
+    tmp_path_factory, pypiron_bin, tmp_path, uv_path, uv_venv
+):
+    """AC1: with only --advisory-feed (no --malware-block — default-on is the
+    point), a mirror-origin file matching a MAL advisory 403s at the byte gate
+    with the advisory id in the body, the pinned install fails, and the tripwire
+    metric increments. A clean version of the same project still installs, proving
+    the block is version-scoped, not name-scoped."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    with advisory_server(tmp_path_factory, pypiron_bin, feed) as server:
+        base = server["base_url"]
+        # The synchronous startup obtain means the snapshot is loaded before the
+        # listener binds; confirm the gate is armed.
+        assert _poll_metric(base, "pypiron_advisory_snapshot_age_seconds") is not None
+
+        bad = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+        clean = make_wheel(MAL_EXACT_PKG, "1.4.0", tmp_path)
+        _mirror_upload(server, bad)
+        _mirror_upload(server, clean)
+        wait_for_file_in_index(server["simple"], MAL_EXACT_PKG, bad.name)
+        wait_for_file_in_index(server["simple"], MAL_EXACT_PKG, clean.name)
+
+        before = _metric_value(_metrics_text(base), "pypiron_blocked_downloads_total")
+        assert before is not None, "the blocked-downloads counter should always render"
+
+        # Direct GET of the malicious wheel → 403 naming the advisory id byte-exactly.
+        code, body, _ = http_get(f"{base}/files/{MAL_EXACT_PKG}/{bad.name}")
+        assert code == 403, (code, body)
+        assert MAL_EXACT_ID.encode() in body, body
+        assert _poll_blocked_at_least(base, before + 1), "tripwire metric never incremented"
+
+        # A pinned install of the bad version fails (uv can't fetch the wheel).
+        rc, out, err = _uv_install(
+            uv_path, uv_venv, server, f"{MAL_EXACT_PKG}=={MAL_EXACT_VERSION}"
+        )
+        assert rc != 0, f"install of malware succeeded:\n{out}\n{err}"
+
+        # The clean version of the SAME project installs normally.
+        rc, out, err = _uv_install(uv_path, uv_venv, server, f"{MAL_EXACT_PKG}==1.4.0")
+        assert rc == 0, f"clean version failed to install:\n{out}\n{err}"
+        run_checked([str(uv_venv), "-c", f"import {_import_name(MAL_EXACT_PKG)}"])
+
+
+def test_ac2_private_package_sharing_mal_name_installs(
+    tmp_path_factory, pypiron_bin, tmp_path, uv_path, uv_venv
+):
+    """AC2: a private-origin package sharing a malicious (all-versions) name
+    installs normally — origin exclusivity is the proof that a same-named private
+    package is not the one OSV named."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    with advisory_server(tmp_path_factory, pypiron_bin, feed) as server:
+        base = server["base_url"]
+        assert _poll_metric(base, "pypiron_advisory_snapshot_age_seconds") is not None
+
+        # A plain uploader-cred upload (no mirror field) claims PRIVATE origin.
+        wheel = make_wheel(MAL_ALL_PKG, "1.0.0", tmp_path)
+        upload_legacy(
+            server["legacy"],
+            wheel,
+            username=server["uploader_user"],
+            password=server["uploader_password"],
+        )
+        wait_for_file_in_index(server["simple"], MAL_ALL_PKG, wheel.name)
+
+        # Sanity: the byte gate does allow this private file directly.
+        code, _, _ = http_get(f"{base}/files/{MAL_ALL_PKG}/{wheel.name}")
+        assert code in (200, 302), code
+
+        rc, out, err = _uv_install(uv_path, uv_venv, server, f"{MAL_ALL_PKG}==1.0.0")
+        assert rc == 0, f"private package sharing a MAL name failed to install:\n{out}\n{err}"
+        run_checked([str(uv_venv), "-c", f"import {_import_name(MAL_ALL_PKG)}"])
+
+
+def test_ac3_proxy_refuses_to_fill_mal_version(
+    tmp_path_factory, pypiron_bin, tmp_path, uv_path, uv_venv
+):
+    """AC3: a fresh proxy asked for a MAL version refuses the fill — the install
+    fails, the tripwire metric increments, and no artifact or sidecar is written
+    to the proxy's storage. A clean package still proxies and caches."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    with _advisory_proxy_pair(tmp_path_factory, pypiron_bin, feed) as pair:
+        upstream, proxy = pair["upstream"], pair["proxy"]
+        pbase = proxy["base_url"]
+        assert _poll_metric(pbase, "pypiron_advisory_snapshot_age_seconds") is not None
+
+        # Upstream hosts the malicious wheel (the upstream has no gate of its own).
+        bad = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+        upload_legacy(
+            upstream["legacy"],
+            bad,
+            username=upstream["uploader_user"],
+            password=upstream["uploader_password"],
+        )
+        wait_for_file_in_index(upstream["simple"], MAL_EXACT_PKG, bad.name)
+
+        before = _metric_value(_metrics_text(pbase), "pypiron_blocked_downloads_total")
+        assert before is not None
+
+        # Install through the proxy fails: the fill is refused, then the byte gate
+        # 403s the unclaimed name.
+        rc, out, err = _uv_install(uv_path, uv_venv, proxy, f"{MAL_EXACT_PKG}=={MAL_EXACT_VERSION}")
+        assert rc != 0, f"proxy install of malware succeeded:\n{out}\n{err}"
+
+        # Direct GET through the proxy → 403 naming the id (deterministic bump).
+        code, body, _ = http_get(f"{pbase}/files/{MAL_EXACT_PKG}/{bad.name}")
+        assert code == 403, (code, body)
+        assert MAL_EXACT_ID.encode() in body, body
+        assert _poll_blocked_at_least(pbase, before + 1)
+
+        # The refusal wrote nothing: no artifact, no sidecar, not even a claim.
+        pkg_dir = Path(proxy["data_dir"]) / "packages" / MAL_EXACT_PKG
+        assert not (pkg_dir / bad.name).exists(), "malware artifact was cached despite refusal"
+        assert not (pkg_dir / f"{bad.name}.meta.json").exists(), "malware sidecar was written"
+        assert not (pkg_dir / ".origin").exists(), "a mirror claim was made for refused malware"
+
+        # Positive control: a clean package still proxies and caches.
+        good = make_wheel("cleanlib", "2.0.0", tmp_path)
+        upload_legacy(
+            upstream["legacy"],
+            good,
+            username=upstream["uploader_user"],
+            password=upstream["uploader_password"],
+        )
+        wait_for_file_in_index(upstream["simple"], "cleanlib", good.name)
+        rc, out, err = _uv_install(uv_path, uv_venv, proxy, "cleanlib==2.0.0")
+        assert rc == 0, f"clean package failed to proxy:\n{out}\n{err}"
+        run_checked([str(uv_venv), "-c", "import cleanlib"])
+        assert (Path(proxy["data_dir"]) / "packages" / "cleanlib" / good.name).exists()
+
+
+def test_ac6_dead_feed_keeps_serving_and_ages_gauge(
+    tmp_path_factory, pypiron_bin, tmp_path, uv_path, uv_venv
+):
+    """AC6: killing the feed source after a snapshot exists degrades freshness,
+    never availability — clean installs still proceed and the staleness gauge
+    rises (no network on the serve path). No timing/latency assertions."""
+    feed_bytes = make_osv_zip(tmp_path / "osv.zip", canonical_records()).read_bytes()
+    # Clear proxy env so the SSRF-guarded feed client reaches loopback directly.
+    direct = {"HTTP_PROXY": "", "HTTPS_PROXY": "", "ALL_PROXY": "", "NO_PROXY": "*"}
+    with _local_feed_server(feed_bytes) as (feed_url, stop_feed):
+        with advisory_server(
+            tmp_path_factory,
+            pypiron_bin,
+            feed_url,
+            extra_args=["--reconcile-interval-secs", "2"],
+            extra_env=direct,
+        ) as server:
+            base = server["base_url"]
+            # The snapshot loaded from the live feed → gauge armed.
+            assert _poll_metric(base, "pypiron_advisory_snapshot_age_seconds") is not None
+
+            # Kill the feed; pypiron must keep serving from the last snapshot.
+            stop_feed()
+
+            # A clean package still installs — the serve path never touches the feed.
+            good = make_wheel("stillfine", "1.0.0", tmp_path)
+            _mirror_upload(server, good)
+            wait_for_file_in_index(server["simple"], "stillfine", good.name)
+            rc, out, err = _uv_install(uv_path, uv_venv, server, "stillfine==1.0.0")
+            assert rc == 0, f"clean install failed after feed death:\n{out}\n{err}"
+            run_checked([str(uv_venv), "-c", "import stillfine"])
+
+            # Staleness climbs across two reads ≥3s apart — no refresh can land.
+            age1 = _metric_value(_metrics_text(base), "pypiron_advisory_snapshot_age_seconds")
+            assert age1 is not None
+            time.sleep(3.5)
+            age2 = _metric_value(_metrics_text(base), "pypiron_advisory_snapshot_age_seconds")
+            assert age2 is not None
+            assert age2 > age1, f"staleness gauge did not rise after feed death: {age1} -> {age2}"
+
+
 # ------------------------------- test helpers --------------------------------
 
 
@@ -400,3 +583,126 @@ def _hand_start(
         kill_process_tree(proc)
         raise
     return proc, base, log_path
+
+
+# --------------------------- enforcement helpers -----------------------------
+
+
+def _mirror_upload(server, dist: Path) -> None:
+    """Publish `dist` as a mirror-origin file (admin cred + mirror field), the way
+    a sync would — the origin a byte-gate block requires. Mirrors _mirror_upload
+    in test_project_status.py."""
+    upload_legacy(
+        server["legacy"],
+        dist,
+        username=server["admin_user"],
+        password=server["admin_password"],
+        fields={"mirror": "true"},
+    )
+
+
+def _import_name(name: str) -> str:
+    """The importable module `make_wheel` bakes into a wheel for `name`."""
+    return re.sub(r"\W+", "_", name).strip("_").lower()
+
+
+def _uv_install(uv_path, venv: Path, server, spec: str):
+    """`uv pip install <spec>` against `server`'s index, no cache. Returns
+    (rc, stdout, stderr); a nonzero rc is a failed install (what a block causes)."""
+    return run_returncode(
+        [
+            uv_path,
+            "pip",
+            "install",
+            "--python",
+            str(venv),
+            "--index-url",
+            server["simple"],
+            "--no-cache",
+            spec,
+        ],
+        timeout=180,
+    )
+
+
+def _metrics_text(base_url: str) -> str:
+    code, body, _ = http_get(f"{base_url}/metrics")
+    assert code == 200, code
+    return body.decode()
+
+
+def _poll_blocked_at_least(base_url: str, threshold: float, *, timeout: float = 10.0) -> bool:
+    """The blocked-downloads counter updates in-handler before the 403 returns, but
+    /metrics is a separate request — poll briefly to avoid any read ordering flake."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        value = _metric_value(_metrics_text(base_url), "pypiron_blocked_downloads_total")
+        if value is not None and value >= threshold:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+@contextmanager
+def _advisory_proxy_pair(tmp_path_factory, pypiron_bin, feed):
+    """A proxy pair whose PROXY side is fed the advisory zip (the --advisory-feed
+    CLI flag overrides the conftest hermetic disable). Reuses _start_proxy_pair so
+    the upstream/cooldown wiring stays identical to the shared fixtures."""
+    gen = _start_proxy_pair(
+        tmp_path_factory, pypiron_bin, proxy_extra_args=["--advisory-feed", str(feed)]
+    )
+    pair = next(gen)
+    try:
+        yield pair
+    finally:
+        gen.close()
+
+
+class _FeedHandler(http.server.BaseHTTPRequestHandler):
+    """Serves a fixed advisory zip with an ETag, honoring If-None-Match — the OSV
+    export stand-in for AC6, so the source can be killed mid-flight."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):  # noqa: D102 - silence default stderr spam
+        pass
+
+    def do_GET(self):  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+        payload = self.server.payload  # type: ignore[attr-defined]
+        etag = self.server.etag  # type: ignore[attr-defined]
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("ETag", etag)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+@contextmanager
+def _local_feed_server(payload: bytes):
+    """Serve `payload` as the advisory zip over loopback HTTP. Yields
+    (feed_url, stop) where `stop()` shuts the source down so a test can observe
+    pypiron degrading gracefully once the feed dies."""
+    port = find_free_port()
+    httpd = http.server.HTTPServer(("127.0.0.1", port), _FeedHandler)
+    httpd.payload = payload  # type: ignore[attr-defined]
+    httpd.etag = '"osv-fixture"'  # type: ignore[attr-defined]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    stopped = {"done": False}
+
+    def stop():
+        if not stopped["done"]:
+            httpd.shutdown()
+            httpd.server_close()
+            stopped["done"] = True
+
+    try:
+        yield f"http://127.0.0.1:{port}/osv.zip", stop
+    finally:
+        stop()
+        thread.join(timeout=5)

@@ -4556,6 +4556,19 @@ async fn files_get(
     {
         return resp;
     }
+    // Malware byte gate: the single enforcement chokepoint, before the
+    // presign/stream split so a cached signed URL is gated too. Origin is judged
+    // on the write home. A no-op unless blocking is armed and a snapshot is fed.
+    if let Some(resp) = advisory_byte_gate(
+        &state,
+        write_pinned.storage.as_ref(),
+        &pkg,
+        artifact_filename,
+    )
+    .await
+    {
+        return resp;
+    }
     match file_visible_read_through(&state, &read_pinned, &write_pinned, &pkg, &artifact_key).await
     {
         Ok(true) => {}
@@ -4741,6 +4754,88 @@ fn json_response(value: serde_json::Value) -> Response<Body> {
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(bytes))
         .unwrap_or_else(not_found)
+}
+
+/// A `403 application/json` refusal with no-store caching — the malware byte
+/// gate's response shape ([`json_response`]'s 403 sibling; that one is 200-only).
+fn blocked_response(value: serde_json::Value) -> Response<Body> {
+    let bytes = serde_json::to_vec(&value).unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(bytes))
+        .unwrap_or_else(not_found)
+}
+
+/// The malware byte gate: the single enforcement chokepoint where advisory-blocked
+/// bytes are refused. Runs once in [`files_get`] before the presign/stream split,
+/// so a cached signed URL is gated too. `Some(403)` refuses; `None` allows.
+///
+/// The common path is a pure hash probe with zero I/O: disabled, unfed, or no hit
+/// all return `None` before any storage read. Only a genuine advisory/quarantine
+/// hit pays the origin read that proves the name isn't private — OSV names live in
+/// PyPI's namespace, and origin exclusivity is the proof that a same-named private
+/// package is not that package. `storage` is the write-pin (origin claims are
+/// judged on the write home). Fail-closed throughout: an unclaimed/mirror origin
+/// or a storage error on a hit blocks.
+async fn advisory_byte_gate(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    artifact_filename: &str,
+) -> Option<Response<Body>> {
+    if !state.malware_block {
+        return None;
+    }
+    let snap = state.advisory_snapshot();
+    if snap.db.is_none() && snap.quarantined.is_empty() {
+        return None; // armed but unfed: nothing to block yet
+    }
+    let version = infer_version_from_filename(artifact_filename);
+    let ids: Vec<&str> = snap
+        .db
+        .as_ref()
+        .map(|db| advisories::blocking_advisories(db, pkg, version.as_deref()))
+        .unwrap_or_default();
+    let quarantined = snap.quarantined.contains(pkg);
+    if ids.is_empty() && !quarantined {
+        return None; // the common path: no origin read, no I/O
+    }
+
+    // A hit — but a private-origin name never consults either set. Fast pre-check
+    // on the configured private prefix (no I/O), then the authoritative claim.
+    if let Some(prefix) = &state.private_prefix {
+        if names::matches_prefix(pkg, prefix) {
+            return None;
+        }
+    }
+    match origin::read_origin_claim(storage, pkg).await {
+        Ok(Some(origin::OriginState::Private)) => return None,
+        // Mirror, the unclaimed sentinel, or no claim at all: not proven private,
+        // so a same-named blocked artifact is refused (fail-closed).
+        Ok(_) => {}
+        Err(e) => {
+            // Only reachable on a probe hit; a storage read error fails closed.
+            warn!(error = ?e, %pkg, "advisory gate: origin read failed; blocking fail-closed");
+        }
+    }
+
+    state.metrics.record_blocked_download();
+    if ids.is_empty() {
+        warn!(%pkg, "blocked download: project quarantined upstream");
+        return Some(blocked_response(serde_json::json!({
+            "error": "project quarantined upstream",
+            "package": pkg,
+        })));
+    }
+    warn!(%pkg, version = ?version, advisories = ?ids, "blocked download: malware advisory");
+    Some(blocked_response(serde_json::json!({
+        "error": "blocked by malware advisory",
+        "package": pkg,
+        "version": version,
+        "advisories": ids,
+    })))
 }
 
 /// Proxy hook for artifact downloads: fetch-and-commit on a local miss.

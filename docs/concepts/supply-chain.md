@@ -7,7 +7,7 @@ releases, and tampered files. Each protection below answers one threat.
 | Threat | How pypiron stops it | Control |
 | --- | --- | --- |
 | Dependency confusion | Each name is private or public, never both; private names stay reserved | `--private-prefix`, point clients at one index |
-| Malicious recent releases | Hold back releases younger than a cutoff | `--exclude-newer` (sync or serve) |
+| Malicious fresh releases | A dependency cooldown holds new releases back until they've been vetted | `--exclude-newer` (sync or serve) |
 | Tampered or unattributed files | Filenames can never be overwritten; PyPI's provenance travels with each file | `<filename>.provenance` |
 
 ## Dependency confusion
@@ -62,11 +62,14 @@ to upstream:
 See [Setup → Private packages](../guides/setup.md#private-packages) and
 [Setup → Add public PyPI](../guides/setup.md#add-public-pypi).
 
-## Malicious recent releases
+## Dependency cooldown
 
 A compromised maintainer account or a typosquat is most dangerous in its first
-hours, before anyone notices. pypiron holds back releases younger than a cutoff,
-so resolution lands on versions old enough to have been caught.
+hours, before anyone notices. A **dependency cooldown** puts a window between
+when a release is published and when pypiron will serve it, so resolution lands
+on versions old enough for a bad one to have surfaced and been pulled. It's the
+same practice uv, npm, and Dependabot have standardized on — enforced here at
+the server, for every client at once.
 
 **On by default: new releases wait seven days, on a sliding window.** The proxy
 applies it on every read (re-checked per request, so the window keeps sliding);

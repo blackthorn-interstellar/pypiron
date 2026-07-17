@@ -33,7 +33,7 @@ rows, take the other tool.
 | Curated or air-gapped mirror of a package subset | **pypiron** (`pypiron sync`) |
 | Byte-complete mirror of *all* of PyPI (tens of TB) | **bandersnatch** — full-mirror is its exact job; pypiron mirrors on demand instead |
 | One server for npm + Maven + Docker + Python | **Artifactory** or **Nexus** — much heavier to operate, but multi-ecosystem is their reason to exist |
-| Hard requirement: fully managed, nothing to operate | **AWS CodeArtifact** — accept single-region and no upstream quarantine |
+| Hard requirement: fully managed, nothing to operate | **AWS CodeArtifact** — accept single-region and no dependency cooldown |
 | Serve a folder of wheels on a LAN, nothing more | **pypiserver**, or no server at all: `pip install --find-links dir/` |
 | Staging/inheritance release workflows | **devpi** — its push/inheritance model has no pypiron equivalent |
 
@@ -55,8 +55,8 @@ rows, take the other tool.
   upstream ([how it's tested](concepts/testing.md#it-survives-being-killed)).
 - **Fail-closed defaults.** Half-configured credentials refuse to start. A
   private name never falls through to the public index — dependency confusion
-  is structurally off. New upstream releases wait 7 days by default
-  ([why](concepts/supply-chain.md); disable with `--exclude-newer ""`).
+  is structurally off. A dependency cooldown holds new upstream releases 7 days
+  by default ([why](concepts/supply-chain.md); disable with `--exclude-newer ""`).
 - **Backends tested for real.** The S3 and Azure suites run on every PR
   (MinIO and Azurite, with S3 additionally verified against live AWS), and
   GCS — which no emulator can imitate — runs against a real Google Cloud

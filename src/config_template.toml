@@ -137,10 +137,11 @@
 # exclude-larger = "250MB"                  # drop artifacts larger than this
 # include-yanked = false                    # yanked files are dropped by default
 
-# Supply-chain cooldown: keep only files first seen upstream before this cutoff.
-# Defaults to "7" — a sliding 7-day quarantine so a freshly published (and
-# quickly yanked) release is held back. Accepts a timestamp, a date, a day
-# count, or a duration ("30 days"). Set "" to mirror right up to now.
+# Dependency cooldown: keep only files first seen upstream before this cutoff,
+# so a freshly published (and quickly yanked) release is held back until it's
+# had time to be vetted. Defaults to "7" — a sliding 7-day window. Accepts a
+# timestamp, a date, a day count, or a duration ("30 days"). Set "" to mirror
+# right up to now.
 # exclude-newer = "7"
 # exclude-older = "2020-01-01"              # keep only files at or after this cutoff
 

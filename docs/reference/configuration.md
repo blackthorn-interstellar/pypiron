@@ -254,7 +254,8 @@ Rules:
 - `exclude-platform-tag = ["win*", "macosx_*"]` is the usual Linux CI filter.
 - `exclude-python-below = "3.9"` drops wheels built only for older Pythons but
   keeps sdists, `py3`, and `abi3`.
-- `exclude-newer` defaults to `7`: a sliding 7-day hold. `""` disables it.
+- `exclude-newer` sets the dependency cooldown; defaults to `7`, a sliding 7-day
+  hold. `""` disables it.
 - `WHEN` accepts an RFC 3339 timestamp, bare date, bare day count, friendly
   duration (`"30 days"`), or ISO 8601 duration (`P30D`).
 - Yanked files are excluded unless `include-yanked = true`.

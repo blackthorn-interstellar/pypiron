@@ -57,8 +57,8 @@ proxy-upstream = "https://pypi.org"
 exclude-newer = "7 days"
 ```
 
-`exclude-newer` is the default. Keeping it in the file makes the one useful
-mirror policy visible: fresh releases wait a week.
+`exclude-newer` sets the dependency cooldown and is on by default. Keeping it in
+the file makes the one useful mirror policy visible: fresh releases wait a week.
 
 Install private and public packages from the same URL:
 

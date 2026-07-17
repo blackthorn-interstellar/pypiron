@@ -182,21 +182,25 @@ pub struct VerifyChainArgs {
 pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
     let storage = args.storage.build().await?;
 
-    // 1. Load every link, sorted by seq.
-    let mut entries = storage.list_all(CHAIN_PREFIX).await?;
-    entries.retain(|o| seq_from_key(&o.key).is_some());
-    entries.sort_by_key(|o| seq_from_key(&o.key).unwrap_or(0));
+    // 1. Load every link, sorted by seq. A key that does not parse as a seq is
+    // not a chain link and is dropped in the same pass.
+    let mut entries: Vec<(u64, String)> = storage
+        .list_all(CHAIN_PREFIX)
+        .await?
+        .into_iter()
+        .filter_map(|o| seq_from_key(&o.key).map(|seq| (seq, o.key)))
+        .collect();
+    entries.sort_by_key(|(seq, _)| *seq);
     if entries.is_empty() {
         println!("no chain");
         return Ok(true);
     }
     let mut links: Vec<(u64, Vec<u8>, ChainLink)> = Vec::with_capacity(entries.len());
-    for obj in &entries {
-        let seq = seq_from_key(&obj.key).expect("filtered to parseable keys");
-        let bytes = storage.get_bytes(&obj.key).await?;
-        let link: ChainLink = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing chain link {}", obj.key))?;
-        links.push((seq, bytes, link));
+    for (seq, key) in &entries {
+        let bytes = storage.get_bytes(key).await?;
+        let link: ChainLink =
+            serde_json::from_slice(&bytes).with_context(|| format!("parsing chain link {key}"))?;
+        links.push((*seq, bytes, link));
     }
 
     // 2. Chain integrity. A broken chain makes replay meaningless, so report and

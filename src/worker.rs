@@ -1183,13 +1183,27 @@ pub async fn audit(
     // Tamper-evident checkpoints. On an empty chain the first pass commits the
     // whole corpus (genesis), so unchanged packages must surface their shas
     // once; steady state commits only churn. Deciding this up front tells the
-    // shard pass whether to read unchanged packages' sidecars. A read error
-    // conservatively defers genesis to a later pass (best-effort; self-heals).
-    let genesis = state.transparency
-        && crate::transparency::read_head(storage)
-            .await
-            .map(|head| head.is_none())
-            .unwrap_or(false);
+    // shard pass whether to read unchanged packages' sidecars.
+    //
+    // `None` = the chain head could not be read this pass. We then skip the
+    // checkpoint write entirely, rather than risk a *partial* genesis: treating
+    // the error as "not genesis" while a later succeeding read inside
+    // `write_chain_link` sees the empty chain would write seq 0 committing only
+    // the churned packages, permanently omitting never-churned artifacts with no
+    // re-genesis path. Skipping leaves the empty chain intact so the next pass
+    // (whose read succeeds) performs a true whole-corpus genesis.
+    let genesis_state: Option<bool> = if state.transparency {
+        match crate::transparency::read_head(storage).await {
+            Ok(head) => Some(head.is_none()),
+            Err(e) => {
+                warn!(error=?e, "transparency: chain head unreadable; checkpoint deferred this pass");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let genesis = genesis_state == Some(true);
 
     // Shards enumerate in parallel — that is what the sharding is for. The
     // bound keeps peak memory at a few shards' worth of listings (a shard is
@@ -1261,9 +1275,11 @@ pub async fn audit(
     // Append the tamper-evident checkpoint last, once views and inventory are
     // settled. Best-effort: a checkpoint failure logs and alarms but never fails
     // the audit itself.
-    if state.transparency {
+    // Only write when we could determine genesis-vs-incremental this pass; a
+    // `None` (unreadable head) is deferred above to avoid a partial genesis.
+    if let Some(is_genesis) = genesis_state {
         let mut delta: crate::transparency::Delta = deltas.into_iter().collect();
-        if genesis {
+        if is_genesis {
             // Genesis has no prior state to remove from, so an empty map is pure
             // noise; keep only packages that actually hold committable files.
             delta.retain(|_, files| !files.is_empty());
@@ -1283,6 +1299,12 @@ pub async fn audit(
 /// a package the incremental audit did not rebuild; steady-state passes never
 /// call it, so the churn-sized audit cost is preserved.
 async fn current_package_shas(storage: &dyn Storage, pkg: &str) -> Result<FileShas> {
+    // `false` = do not backfill missing sidecars, deliberately asymmetric with
+    // the rebuild path's `true`. A legacy artifact with no sidecar is simply
+    // omitted from this genesis commitment; a later rebuild backfills its
+    // sidecar and commits it as ordinary churn. An uncommitted file never
+    // triggers a verify-chain violation, so the omission is safe — and this
+    // keeps genesis read-only, doing no writes of its own.
     let (files, _raw) = list_artifacts_for_claim(storage, pkg, false).await?;
     Ok(files.into_iter().map(|f| (f.filename, f.sha256)).collect())
 }

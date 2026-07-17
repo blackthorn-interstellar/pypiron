@@ -779,7 +779,14 @@ async fn run_seed(
             // markers alone must converge the tick path over every crash
             // schedule, so an audit repair IS a protocol violation.
             audit_view_repairs += 1;
-            if fail_percent == 0 {
+            // Crash-only always records the diff — a repair there is a
+            // violation. Fault mode is silent by default (repairs are within
+            // contract), but VOPR_LOG_REPAIRS makes each one inspectable: which
+            // seed, which round, which view keys drifted. So a jump in the
+            // aggregate count is a grep, not a re-derivation — the tier-3
+            // backstop firing is exactly the signal worth watching.
+            let log_repair = fail_percent == 0 || std::env::var_os("VOPR_LOG_REPAIRS").is_some();
+            if log_repair {
                 let changed: Vec<String> = views_before_audit
                     .iter()
                     .zip(views_after_audit.iter())
@@ -802,10 +809,17 @@ async fn run_seed(
                             })
                     })
                     .collect();
-                violations_pre.push(format!(
-                    "AUDIT_REPAIRED_VIEWS: crash-only run needed the audit to converge views \
-                     — the marker protocol failed to self-heal: {changed:#?}"
-                ));
+                if fail_percent == 0 {
+                    violations_pre.push(format!(
+                        "AUDIT_REPAIRED_VIEWS: crash-only run needed the audit to converge views \
+                         — the marker protocol failed to self-heal: {changed:#?}"
+                    ));
+                } else {
+                    eprintln!(
+                        "vopr: seed {seed} round {round} — audit repaired {} view key(s) under fault injection (fail-percent {fail_percent}); the marker path fell through to the tier-3 backstop: {changed:#?}",
+                        changed.len()
+                    );
+                }
             }
         }
         // Fixpoint: no markers and no storage change over a full round.

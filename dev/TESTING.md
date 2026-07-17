@@ -169,7 +169,24 @@ failure still reproduces from the explicit `--seed N` command it prints),
 logs failures and keeps exploring, and heartbeats once a minute;
 `VOPR_SECS=600 make vopr-soak` timeboxes instead and exits non-zero if any
 seed failed. At ~600+ seeds/second, an overnight soak covers tens of
-millions of schedules.
+millions of schedules. Output is also appended to `vopr-soak.log` (gitignored)
+so findings survive the terminal.
+
+The heartbeat reports an **audit-view-repairs** count: how often a run's cheap
+marker/tick/reconcile path left a view unconverged and the tier-3 audit
+backstop had to repair it. In crash-only profiles (`--fail-percent 0`) that is
+a hard violation — the markers must self-heal every crash schedule — and the
+seed fails with the drifted keys dumped. Under injected storage failures it is
+within contract (the audit is the documented safety net), so it is only a
+statistic. Treat that statistic as a watched baseline, not a target of zero:
+the audit exists precisely because the fast path cannot be guaranteed to
+converge under arbitrary failure, so a nonzero count is partly the system
+working as designed — the signal to investigate is the count *rising*. To see
+which seeds and keys are behind it, run with `VOPR_LOG_REPAIRS=1`: every
+fault-mode repair then prints its seed, round, and the exact view keys that
+drifted (silent by default, since repairs are expected there). `VOPR_TRACE=1`
+(optionally `VOPR_TRACE_FILE=path`) captures the full storage-op trace for
+diffing a determinism violation.
 
 ## Real cloud backends
 

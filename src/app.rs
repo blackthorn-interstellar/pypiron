@@ -26,8 +26,8 @@ use tracing::{debug, info, warn};
 // its life as the crate root) keep resolving.
 use crate::{
     bucket_health, buckets, cache, config, coremeta, counters, metrics, names, node_region,
-    observed_storage, origin, provenance, proxy, render, replicate, sidecar, status, storage, sync,
-    token, tombstone, upload, verify, web, wheel, worker,
+    observed_storage, origin, project_cache, provenance, proxy, render, replicate, sidecar, status,
+    storage, sync, token, tombstone, upload, verify, web, wheel, worker,
 };
 
 use bucket_health::{HealthController, HealthPolicy};
@@ -984,6 +984,9 @@ pub struct AppState {
     pub index_cache: Arc<cache::IndexCache>,
     /// Reused presigned GET URLs for immutable artifacts; see cache.rs.
     pub presign_cache: Arc<cache::PresignCache>,
+    /// RAM-served rendered `/project/<pkg>/` pages; see project_cache.rs. Spares
+    /// the human project page a full package-prefix scan + sidecar parse per hit.
+    pub project_cache: Arc<project_cache::ProjectCache>,
     /// Where upload spools live (must be real disk, not tmpfs).
     pub spool_dir: std::path::PathBuf,
     /// In-memory global-index name set + the lock serializing its writes.
@@ -1719,6 +1722,7 @@ async fn run_serve(
         wait_on_upload: cli.wait_on_upload,
         wait_on_upload_timeout: Duration::from_secs(cli.wait_on_upload_secs),
         index_cache: Arc::new(cache::IndexCache::new(cache::INDEX_CACHE_TTL)),
+        project_cache: Arc::new(project_cache::ProjectCache::new(cache::INDEX_CACHE_TTL)),
         presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
         spool_dir: cli.spool_dir.unwrap_or_else(std::env::temp_dir),
         global_names: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2354,9 +2358,32 @@ async fn render_project(
         };
         return moved_permanently(&dest);
     }
+    // Serve the rendered page straight from RAM when it's warm: the human project
+    // page is otherwise a full package-prefix scan + per-file sidecar parse on
+    // every hit (see project_cache.rs). The render embeds the request's base URL
+    // (the install snippet's index URL), so the key includes it; the worker drops
+    // a package's entries the instant it rebuilds, and the TTL bounds the rest.
+    // `write_pin` is captured once (design §3) so the cache generation and the
+    // storage handle come from the same selection.
+    let base_url = base_url_from_headers(headers);
+    let write_pin = state.pin();
+    let generation = write_pin.generation;
+    let cache_key = project_cache::key(&pkg, requested_version, &base_url);
+    // Serve a fresh — or, under a concurrent burst past the TTL, single-flight
+    // stale — page straight from RAM. Only the one reader that claims the
+    // re-render falls through to the scan below, so a hot key costs one render
+    // per TTL, not one per request. The claim rides along to the `put` below and
+    // releases when it drops (at the put, or on any early return here), so an
+    // aborted render can't strand the key as forever-refilling.
+    let _render_claim = match state.project_cache.get(&cache_key, generation) {
+        project_cache::Lookup::Fresh(cached) | project_cache::Lookup::Stale(cached) => {
+            return html_ok_bytes(cached);
+        }
+        project_cache::Lookup::MustRender(claim) => claim,
+    };
     // `storage` (not `pinned`, which below is the version-pinned flag) is this
     // render's captured handle (design §3), threaded to every read.
-    let storage = state.pin().storage.clone();
+    let storage = write_pin.storage.clone();
     let before = match require_settled_package_read(state, storage.as_ref(), &pkg).await {
         Ok(claim) => claim,
         Err(error) => return read_error(error),
@@ -2431,7 +2458,9 @@ async fn render_project(
         }
     }
 
-    html_ok(web::project_html(
+    // `page_context` rebuilds the same base URL as the cache key (deterministic
+    // in the request headers), so the cached bytes always match their key.
+    let html = web::project_html(
         &page_context(state, headers),
         &pkg,
         &files,
@@ -2440,7 +2469,10 @@ async fn render_project(
         meta.as_ref(),
         publisher.as_ref(),
         &downloads,
-    ))
+    );
+    let body = bytes::Bytes::from(html);
+    state.project_cache.put(cache_key, body.clone(), generation);
+    html_ok_bytes(body)
 }
 
 /// Last-30-day download counts for a package, filenames rolled up to versions
@@ -2661,6 +2693,12 @@ fn is_plausible_host(h: &str) -> bool {
 }
 
 fn html_ok(body: String) -> Response<Body> {
+    html_ok_bytes(bytes::Bytes::from(body))
+}
+
+/// Like [`html_ok`] but from already-rendered bytes — a cached-page serve is a
+/// refcount bump, not a copy (see project_cache.rs).
+fn html_ok_bytes(body: bytes::Bytes) -> Response<Body> {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -5296,6 +5334,7 @@ impl AppState {
             wait_on_upload: false,
             wait_on_upload_timeout: Duration::from_secs(10),
             index_cache: Arc::new(cache::IndexCache::new(cache::INDEX_CACHE_TTL)),
+            project_cache: Arc::new(project_cache::ProjectCache::new(cache::INDEX_CACHE_TTL)),
             presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
             spool_dir: std::env::temp_dir(),
             global_names: Arc::new(tokio::sync::Mutex::new(None)),

@@ -318,6 +318,52 @@ def test_per_version_page_pins_install_and_validates_version(disk_server, tmp_pa
     assert code == 404
 
 
+def test_project_page_reflects_new_upload_after_caching(disk_server, tmp_path):
+    """The /project/ page is served from a RAM cache (a full package-prefix scan
+    plus per-file sidecar parse per hit is too slow to repeat), but a later
+    upload must still surface: the worker drops the cached page when it rebuilds
+    the package's indexes, and the short TTL bounds the rest. Warm the cache with
+    one render, publish a new version, then poll until the page reflects it."""
+    v1 = make_wheel("cachepkg", "1.0.0", tmp_path)
+    upload_legacy(
+        disk_server["legacy"],
+        v1,
+        username=disk_server["user"],
+        password=disk_server["password"],
+    )
+    wait_for_project_in_global(disk_server["simple"], "cachepkg")
+
+    # First render warms the cache with a page that knows only 1.0.0.
+    code, body, _ = http_get(f"{disk_server['base_url']}/project/cachepkg/")
+    assert code == 200
+    html = body.decode()
+    assert 'href="/files/cachepkg/cachepkg-1.0.0-py3-none-any.whl"' in html
+    assert "cachepkg-2.0.0-py3-none-any.whl" not in html
+
+    # Publish a new version.
+    v2 = make_wheel("cachepkg", "2.0.0", tmp_path)
+    upload_legacy(
+        disk_server["legacy"],
+        v2,
+        username=disk_server["user"],
+        password=disk_server["password"],
+    )
+
+    # The cache must not pin the page to 1.0.0: within the worker interval the
+    # page reflects the new upload (invalidation on rebuild, plus the TTL).
+    deadline = time.time() + 15.0
+    latest = ""
+    while time.time() < deadline:
+        code, body, _ = http_get(f"{disk_server['base_url']}/project/cachepkg/")
+        latest = body.decode() if code == 200 else ""
+        if "cachepkg-2.0.0-py3-none-any.whl" in latest:
+            break
+        time.sleep(0.2)
+    assert 'href="/files/cachepkg/cachepkg-2.0.0-py3-none-any.whl"' in latest, (
+        "the cached /project/ page never reflected the 2.0.0 upload"
+    )
+
+
 def test_version_page_redirect_does_not_reflect_traversal(disk_server, tmp_path):
     """A non-normalized name 301s to the canonical URL, but the (not-yet-
     validated) version segment is percent-encoded so a `..%2f..%2f` payload can't

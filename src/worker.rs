@@ -1733,6 +1733,11 @@ async fn rebuild_package_indexes_inner(
             state.index_cache.invalidate(key);
         }
     }
+    // Drop the package's cached human `/project/` pages the same way the simple
+    // indexes are invalidated above: this runs only when a package actually
+    // changed (its fingerprint/dirty marker moved), so a same-node reader sees
+    // the upload immediately instead of waiting out the cache TTL.
+    state.project_cache.invalidate_package(pkg);
     Ok((live, raw))
 }
 
@@ -2909,6 +2914,9 @@ mod tests {
             wait_on_upload_timeout: Duration::from_secs(1),
             lease_ttl: Duration::from_secs(30),
             index_cache: Arc::new(crate::cache::IndexCache::new(crate::cache::INDEX_CACHE_TTL)),
+            project_cache: Arc::new(crate::project_cache::ProjectCache::new(
+                crate::cache::INDEX_CACHE_TTL,
+            )),
             presign_cache: Arc::new(crate::cache::PresignCache::new(
                 crate::cache::PRESIGN_CACHE_TTL,
             )),
@@ -3025,6 +3033,9 @@ mod tests {
             wait_on_upload_timeout: Duration::from_secs(1),
             lease_ttl: Duration::from_secs(30),
             index_cache: Arc::new(crate::cache::IndexCache::new(crate::cache::INDEX_CACHE_TTL)),
+            project_cache: Arc::new(crate::project_cache::ProjectCache::new(
+                crate::cache::INDEX_CACHE_TTL,
+            )),
             presign_cache: Arc::new(crate::cache::PresignCache::new(
                 crate::cache::PRESIGN_CACHE_TTL,
             )),

@@ -34,7 +34,17 @@
 //!   - CONSERVATION: acknowledged bytes are never silently lost — a file is
 //!     live, or its filename was deleted/frozen by an authorized operation;
 //!   - LIVENESS (bounded): the fleet reaches quiescence within the drain
-//!     budget — no livelock.
+//!     budget — no livelock;
+//!   - REPAIR TAXONOMY: every view the tier-3 audit had to repair is
+//!     classified from the run's effect history (see `Observer` below).
+//!     ORDERING (truth changed with no durable breadcrumb ever covering it)
+//!     and PREMATURE-CONSUMPTION (the breadcrumb existed and was destroyed
+//!     without converging the view) fail the seed in every profile; only the
+//!     documented CONCURRENT-RACE divergence (an unleased rebuild clobbering
+//!     a fresher one, `tests/model_event_protocol.rs`) remains a reported
+//!     statistic, with the audit as its designed backstop. Crash-only
+//!     profiles additionally keep their blanket any-repair-is-a-violation
+//!     gate.
 //!
 //! Determinism is self-checked, not assumed: every run whose seed is a
 //! multiple of `--recheck-every` executes twice and must produce an identical
@@ -91,6 +101,301 @@ impl Rng {
 }
 
 // ---------------------------------------------------------------------------
+// Repair classifier: passive effect history + audit-repair taxonomy.
+//
+// Every successful protocol-relevant storage effect — truth mutation, truth
+// listing, view write, marker/note create and consume, global-index write —
+// is recorded with a logical-op attribution. When the tier-3 audit repairs a
+// view the fast path left unconverged, this history answers *why*. It is pure
+// observation (no rng, no awaits, no extra storage ops), so recording can
+// never perturb the run it explains, and no differential replay is needed —
+// a replay under altered semantics would shift the seed-derived fault
+// schedule and could silently misclassify a real bug as a benign race.
+//
+//   1 ORDERING: an unreflected truth mutation was never covered by any
+//     durable breadcrumb (a `_dirty/` marker on that bucket, or a `_repl/`
+//     note aimed at it). Writers put intent before truth, the merge executor
+//     brackets both sides, rebuilds fence themselves — so this must be zero.
+//   2 PREMATURE-CONSUMPTION: breadcrumbs existed but the system destroyed
+//     the signal without converging the view — a consumer that never listed
+//     truth past the mutation it retired (the stale-intent-heal shape), or a
+//     rebuild that consumed its markers while leaving a view inconsistent
+//     with the very truth it listed (a poisoned derivation). Avoidable; must
+//     be zero. Drift the tests below cannot explain is also reported here,
+//     conservatively: an unexplained repair is a bug in the protocol or in
+//     this classifier, and either deserves a failing seed.
+//   3 CONCURRENT-RACE: a rebuild that listed truth earlier overwrote the
+//     view written by a rebuild that listed later — the documented unleased
+//     concurrent-rebuild divergence (tests/model_event_protocol.rs,
+//     `concurrent_rebuild_without_lease_diverges`). The audit is its
+//     designed backstop; reported as a statistic, never a violation.
+// ---------------------------------------------------------------------------
+
+tokio::task_local! {
+    /// Logical-op attribution for effect history. Set per workload op and per
+    /// heal-phase protocol call. Does not cross `tokio::spawn`: the tick's
+    /// per-package rebuild tasks are attributed by session inference instead
+    /// (see `Observer::attribution`).
+    static OP_ID: u64;
+}
+
+/// Attribution ids at or above this are inferred rebuild sessions, not ops.
+const SYNTH_BASE: u64 = 1 << 32;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EffectKind {
+    /// Successful mutation under `packages/<pkg>/` (put or delete).
+    TruthWrite,
+    /// `list_dir` of `packages/<pkg>/` — the read a rebuild derives from.
+    TruthList,
+    /// `list_dir` of `_dirty/` — bounds a tick's consume window.
+    MarkerList,
+    /// Put or delete of `simple/<pkg>/index.{html,json}`.
+    ViewWrite,
+    MarkerPut,
+    MarkerDel,
+    /// `_repl/` note create/consume; `bucket` is the *covered destination*.
+    NotePut,
+    NoteDel,
+    /// Write of `simple/index.{json,html}`; `names` carries the name set.
+    GlobalWrite,
+}
+
+struct Effect {
+    seq: u64,
+    kind: EffectKind,
+    node: usize,
+    bucket: usize,
+    att: u64,
+    pkg: String,
+    /// Full storage key for markers/notes (interval matching); empty otherwise.
+    key: String,
+    /// GlobalWrite only: the package names the write claims exist.
+    names: Vec<String>,
+}
+
+/// Inferred rebuild sessions: a monotonic counter, plus (node, bucket, pkg) →
+/// the id of that key's currently-open session.
+type SynthSessions = (u64, std::collections::HashMap<(usize, usize, String), u64>);
+
+#[derive(Default)]
+struct Observer {
+    seq: AtomicU64,
+    effects: Mutex<Vec<Effect>>,
+    /// Open inferred sessions for unattributed (tick-spawned) rebuild tasks,
+    /// keyed by (node, bucket, pkg). The fleet-wide tick lock guarantees at
+    /// most one live unattributed rebuild per key, so inference is exact.
+    synth: Mutex<SynthSessions>,
+}
+
+impl Observer {
+    /// Resolve the recording op: the task-local op id when present, else the
+    /// open (or freshly opened, when `opens_session`) inferred session.
+    fn attribution(&self, node: usize, bucket: usize, pkg: &str, opens_session: bool) -> u64 {
+        if let Ok(id) = OP_ID.try_with(|id| *id) {
+            return id;
+        }
+        let mut synth = self.synth.lock().expect("synth lock");
+        let key = (node, bucket, pkg.to_string());
+        if opens_session {
+            synth.0 += 1;
+            let id = SYNTH_BASE + synth.0;
+            synth.1.insert(key, id);
+            id
+        } else {
+            synth.1.get(&key).copied().unwrap_or(0)
+        }
+    }
+
+    fn record(&self, kind: EffectKind, node: usize, bucket: usize, pkg: &str, key: &str) {
+        self.record_named(kind, node, bucket, pkg, key, Vec::new());
+    }
+
+    fn record_named(
+        &self,
+        kind: EffectKind,
+        node: usize,
+        bucket: usize,
+        pkg: &str,
+        key: &str,
+        names: Vec<String>,
+    ) {
+        let att = self.attribution(node, bucket, pkg, kind == EffectKind::TruthList);
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        self.effects.lock().expect("effects lock").push(Effect {
+            seq,
+            kind,
+            node,
+            bucket,
+            att,
+            pkg: pkg.to_string(),
+            key: key.to_string(),
+            names,
+        });
+    }
+
+    /// Record one successful write/delete effect for `key` on (node, bucket).
+    /// `bytes` is the written body when the caller has it (name-set parsing).
+    fn observe_mutation(&self, node: usize, bucket: usize, key: &str, bytes: Option<&[u8]>) {
+        if let Some(rest) = key.strip_prefix("_dirty/") {
+            let pkg = rest.split('!').next().unwrap_or(rest);
+            self.record(EffectKind::MarkerPut, node, bucket, pkg, key);
+        } else if let Some((dest, pkg)) = parse_note_key(key) {
+            self.record(EffectKind::NotePut, node, dest, &pkg, key);
+        } else if let Some(pkg) = key
+            .strip_prefix("packages/")
+            .and_then(|r| r.split('/').next())
+        {
+            self.record(EffectKind::TruthWrite, node, bucket, pkg, key);
+        } else if key == "simple/index.json" {
+            let names = bytes.map(global_names_from_json).unwrap_or_default();
+            self.record_named(EffectKind::GlobalWrite, node, bucket, "", key, names);
+        } else if key == "simple/index.html" {
+            let names = bytes.map(global_names_from_html).unwrap_or_default();
+            self.record_named(EffectKind::GlobalWrite, node, bucket, "", key, names);
+        } else if let Some(pkg) = view_key_package(key) {
+            self.record(EffectKind::ViewWrite, node, bucket, pkg, key);
+        }
+    }
+
+    fn observe_list(&self, node: usize, bucket: usize, prefix: &str) {
+        if prefix == "_dirty/" {
+            self.record(EffectKind::MarkerList, node, bucket, "", prefix);
+        } else if let Some(pkg) = prefix
+            .strip_prefix("packages/")
+            .and_then(|r| r.strip_suffix('/'))
+        {
+            if !pkg.contains('/') {
+                self.record(EffectKind::TruthList, node, bucket, pkg, prefix);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Vec<Effect> {
+        let effects = self.effects.lock().expect("effects lock");
+        effects
+            .iter()
+            .map(|e| Effect {
+                seq: e.seq,
+                kind: e.kind,
+                node: e.node,
+                bucket: e.bucket,
+                att: e.att,
+                pkg: e.pkg.clone(),
+                key: e.key.clone(),
+                names: e.names.clone(),
+            })
+            .collect()
+    }
+
+    /// Mint one fresh inferred-session attribution — used to stand in for a
+    /// warm-bucket audit write that bypassed the traced view.
+    fn fresh_synth_att(&self) -> u64 {
+        let mut synth = self.synth.lock().expect("synth lock");
+        synth.0 += 1;
+        SYNTH_BASE + synth.0
+    }
+
+    /// Record the effects a warm-bucket audit write would have produced had it
+    /// flowed through the traced view (it writes raw SimStorage instead), so a
+    /// later round's classification sees the convergence it achieved. `att` is
+    /// one fresh synthetic id shared across the round's synthesized writes; a
+    /// rebuild lists truth then writes the view, so mirror that pair for view
+    /// keys to give the synthetic ViewWrite a fresh TruthList to be tied to.
+    fn synth_view_write(&self, bucket: usize, key: &str, after: Option<&[u8]>, att: u64) {
+        if key == "simple/index.json" {
+            let names = after.map(global_names_from_json).unwrap_or_default();
+            self.push_effect(EffectKind::GlobalWrite, 0, bucket, "", key, names, att);
+        } else if key == "simple/index.html" {
+            let names = after.map(global_names_from_html).unwrap_or_default();
+            self.push_effect(EffectKind::GlobalWrite, 0, bucket, "", key, names, att);
+        } else if let Some(pkg) = view_key_package(key) {
+            let list_key = format!("packages/{pkg}/");
+            self.push_effect(
+                EffectKind::TruthList,
+                0,
+                bucket,
+                pkg,
+                &list_key,
+                Vec::new(),
+                att,
+            );
+            self.push_effect(EffectKind::ViewWrite, 0, bucket, pkg, key, Vec::new(), att);
+        }
+    }
+
+    /// Push a fully-specified effect with a fresh seq and explicit attribution
+    /// (no task-local / session inference).
+    #[allow(clippy::too_many_arguments)]
+    fn push_effect(
+        &self,
+        kind: EffectKind,
+        node: usize,
+        bucket: usize,
+        pkg: &str,
+        key: &str,
+        names: Vec<String>,
+        att: u64,
+    ) {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        self.effects.lock().expect("effects lock").push(Effect {
+            seq,
+            kind,
+            node,
+            bucket,
+            att,
+            pkg: pkg.to_string(),
+            key: key.to_string(),
+            names,
+        });
+    }
+}
+
+/// `simple/<pkg>/index.html|json` → pkg.
+fn view_key_package(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix("simple/")?;
+    let (pkg, file) = rest.split_once('/')?;
+    (file == "index.html" || file == "index.json").then_some(pkg)
+}
+
+/// `_repl/<dest>/<pkg>/<file>!<nonce>` → (dest bucket, pkg).
+fn parse_note_key(key: &str) -> Option<(usize, String)> {
+    let rest = key.strip_prefix("_repl/")?;
+    let (dest, rest) = rest.split_once('/')?;
+    let dest = dest.parse::<usize>().ok()?;
+    let (pkg, _) = rest.split_once('/')?;
+    Some((dest, pkg.to_string()))
+}
+
+fn global_names_from_json(bytes: &[u8]) -> Vec<String> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|doc| {
+            doc.get("projects").and_then(|p| p.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+                    .map(str::to_string)
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// The global HTML lists one `/simple/<name>/` href per package.
+fn global_names_from_html(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut names: Vec<String> = text
+        .split("href=\"/simple/")
+        .skip(1)
+        .filter_map(|rest| rest.split('/').next())
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+// ---------------------------------------------------------------------------
 // Fault plan + per-node storage view.
 // ---------------------------------------------------------------------------
 
@@ -119,6 +424,8 @@ struct FaultPlan {
     healing: AtomicBool,
     rng_stream: Mutex<Rng>,
     trace: Mutex<TraceHasher>,
+    /// Effect history for the audit-repair classifier. Pure observation.
+    obs: Observer,
 }
 
 struct TraceHasher {
@@ -160,6 +467,7 @@ impl FaultPlan {
                 events: 0,
                 log: std::env::var_os("VOPR_TRACE").map(|_| Vec::new()),
             }),
+            obs: Observer::default(),
         })
     }
 
@@ -260,6 +568,11 @@ struct FaultView {
 }
 
 impl FaultView {
+    /// Capture the body only for the two global-index keys (name-set parsing).
+    fn global_body(&self, key: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+        (key == "simple/index.json" || key == "simple/index.html").then(|| bytes.to_vec())
+    }
+
     async fn gate(&self, op: &'static str, key: &str) -> Result<()> {
         let (fate, delay) = self.plan.admit(self.node, self.bucket, op, key);
         tokio::time::sleep(delay).await;
@@ -304,11 +617,23 @@ impl Storage for FaultView {
         } else {
             self.gate("put", key).await?;
         }
-        self.inner.put_bytes(key, bytes, ct).await
+        let body = self.global_body(key, &bytes);
+        self.inner.put_bytes(key, bytes, ct).await?;
+        self.plan
+            .obs
+            .observe_mutation(self.node, self.bucket, key, body.as_deref());
+        Ok(())
     }
     async fn put_if_absent(&self, key: &str, bytes: Vec<u8>, ct: Option<&str>) -> Result<bool> {
         self.gate("put_if_absent", key).await?;
-        self.inner.put_if_absent(key, bytes, ct).await
+        let body = self.global_body(key, &bytes);
+        let created = self.inner.put_if_absent(key, bytes, ct).await?;
+        if created {
+            self.plan
+                .obs
+                .observe_mutation(self.node, self.bucket, key, body.as_deref());
+        }
+        Ok(created)
     }
     async fn put_file_if_absent(
         &self,
@@ -317,7 +642,13 @@ impl Storage for FaultView {
         ct: Option<&str>,
     ) -> Result<bool> {
         self.gate("put_file", key).await?;
-        self.inner.put_file_if_absent(key, path, ct).await
+        let created = self.inner.put_file_if_absent(key, path, ct).await?;
+        if created {
+            self.plan
+                .obs
+                .observe_mutation(self.node, self.bucket, key, None);
+        }
+        Ok(created)
     }
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
         self.gate("get", key).await?;
@@ -325,7 +656,11 @@ impl Storage for FaultView {
     }
     async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
         self.gate("list_dir", dir_prefix).await?;
-        self.inner.list_dir_entries(dir_prefix).await
+        let entries = self.inner.list_dir_entries(dir_prefix).await?;
+        self.plan
+            .obs
+            .observe_list(self.node, self.bucket, dir_prefix);
+        Ok(entries)
     }
     async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         self.gate("list_all", prefix).await?;
@@ -343,7 +678,24 @@ impl Storage for FaultView {
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
         let label = keys.first().map(String::as_str).unwrap_or("");
         self.gate("delete", label).await?;
-        self.inner.delete_keys(keys).await
+        self.inner.delete_keys(keys).await?;
+        for key in keys {
+            if let Some(rest) = key.strip_prefix("_dirty/") {
+                let pkg = rest.split('!').next().unwrap_or(rest);
+                self.plan
+                    .obs
+                    .record(EffectKind::MarkerDel, self.node, self.bucket, pkg, key);
+            } else if let Some((dest, pkg)) = parse_note_key(key) {
+                self.plan
+                    .obs
+                    .record(EffectKind::NoteDel, self.node, dest, &pkg, key);
+            } else {
+                self.plan
+                    .obs
+                    .observe_mutation(self.node, self.bucket, key, None);
+            }
+        }
+        Ok(())
     }
     fn supports_leases(&self) -> bool {
         true
@@ -354,7 +706,14 @@ impl Storage for FaultView {
     }
     async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
         self.gate("put_inm", key).await?;
-        self.inner.put_if_none_match(key, bytes).await
+        let body = self.global_body(key, &bytes);
+        let outcome = self.inner.put_if_none_match(key, bytes).await?;
+        if outcome.is_some() {
+            self.plan
+                .obs
+                .observe_mutation(self.node, self.bucket, key, body.as_deref());
+        }
+        Ok(outcome)
     }
     async fn put_if_match(&self, key: &str, etag: &str, bytes: Vec<u8>) -> Result<Option<String>> {
         if key == "simple/index.json" {
@@ -364,6 +723,7 @@ impl Storage for FaultView {
         } else {
             self.gate("put_im", key).await?;
         }
+        let body = self.global_body(key, &bytes);
         let outcome = self.inner.put_if_match(key, etag, bytes).await;
         if key == "simple/index.json" {
             if let Ok(result) = &outcome {
@@ -373,6 +733,11 @@ impl Storage for FaultView {
                     if result.is_some() { "won" } else { "lost" },
                 ]);
             }
+        }
+        if let Ok(Some(_)) = &outcome {
+            self.plan
+                .obs
+                .observe_mutation(self.node, self.bucket, key, body.as_deref());
         }
         outcome
     }
@@ -400,6 +765,10 @@ struct Fleet {
     /// event-protocol model covers it exhaustively and documents that only
     /// the audit heals its stale-rebuild clobber.
     tick_lock: Vec<Arc<tokio::sync::Mutex<()>>>,
+    /// Monotonic logical-op counter: each spawned workload op and each direct
+    /// heal-phase protocol call runs in its own `OP_ID` scope so the observer
+    /// can attribute effects. Interior-mutable so `&self` helpers can bump it.
+    next_op: std::cell::Cell<u64>,
 }
 
 #[derive(Default)]
@@ -468,11 +837,19 @@ impl Fleet {
             clock,
             ledger: Arc::new(Mutex::new(Ledger::default())),
             tick_lock,
+            next_op: std::cell::Cell::new(0),
         }
     }
 
+    /// Next logical-op id for effect attribution (never zero; zero is the
+    /// "no open inferred session" sentinel in `Observer::attribution`).
+    fn fresh_op(&self) -> u64 {
+        self.next_op.set(self.next_op.get() + 1);
+        self.next_op.get()
+    }
+
     fn spawn_on(&mut self, node: usize, fut: impl Future<Output = ()> + 'static) {
-        let handle = tokio::task::spawn_local(fut);
+        let handle = tokio::task::spawn_local(OP_ID.scope(self.fresh_op(), fut));
         self.nodes[node].tasks.push(handle);
     }
 
@@ -580,6 +957,8 @@ struct RunOutcome {
     trace_log: Option<Vec<String>>,
     acked: usize,
     audit_view_repairs: u64,
+    /// Audit repairs split by taxonomy class: [ordering, premature, race].
+    repairs_by_class: [u64; 3],
     violations: Vec<String>,
 }
 
@@ -674,6 +1053,7 @@ async fn run_seed(
     clock.advance(std::time::Duration::from_secs(120)); // all intents stale
     let mut quiesced = false;
     let mut audit_view_repairs: u64 = 0;
+    let mut repairs_by_class: [u64; 3] = [0; 3]; // [ordering, premature, race]
     let mut last_fingerprint: Option<Vec<BTreeMap<String, Vec<u8>>>> = None;
     for round in 0..12 {
         // Drain markers across every node until none remain (bounded).
@@ -681,13 +1061,28 @@ async fn run_seed(
             for node in 0..nodes {
                 let state = fleet.nodes[node].state.clone();
                 let pinned = state.pin();
-                let _ = worker::tick(&state, &pinned).await;
+                OP_ID
+                    .scope(fleet.fresh_op(), async {
+                        let _ = worker::tick(&state, &pinned).await;
+                    })
+                    .await;
                 if buckets > 1 {
-                    let _ = replicate::sweep_all_markers(&state).await;
+                    OP_ID
+                        .scope(fleet.fresh_op(), async {
+                            let _ = replicate::sweep_all_markers(&state).await;
+                        })
+                        .await;
                     for (idx, handle) in state.buckets.handles().iter().enumerate() {
                         if idx != pinned.index {
-                            let _ =
-                                worker::drain_dirty_uncached(&state, handle.storage.as_ref()).await;
+                            OP_ID
+                                .scope(fleet.fresh_op(), async {
+                                    let _ = worker::drain_dirty_uncached(
+                                        &state,
+                                        handle.storage.as_ref(),
+                                    )
+                                    .await;
+                                })
+                                .await;
                         }
                     }
                 }
@@ -708,16 +1103,33 @@ async fn run_seed(
         let leader = fleet.nodes[0].state.clone();
         let pinned = leader.pin();
         if buckets > 1 {
-            let _ = replicate::reconcile(&leader, &pinned).await;
+            OP_ID
+                .scope(fleet.fresh_op(), async {
+                    let _ = replicate::reconcile(&leader, &pinned).await;
+                })
+                .await;
             // ...which this drain pass consumes, rebuilding the affected
             // views, before the audits are allowed to look.
             for _ in 0..3 {
-                let _ = worker::tick(&leader, &pinned).await;
-                let _ = replicate::sweep_all_markers(&leader).await;
+                OP_ID
+                    .scope(fleet.fresh_op(), async {
+                        let _ = worker::tick(&leader, &pinned).await;
+                    })
+                    .await;
+                OP_ID
+                    .scope(fleet.fresh_op(), async {
+                        let _ = replicate::sweep_all_markers(&leader).await;
+                    })
+                    .await;
                 for (idx, handle) in leader.buckets.handles().iter().enumerate() {
                     if idx != pinned.index {
-                        let _ =
-                            worker::drain_dirty_uncached(&leader, handle.storage.as_ref()).await;
+                        OP_ID
+                            .scope(fleet.fresh_op(), async {
+                                let _ =
+                                    worker::drain_dirty_uncached(&leader, handle.storage.as_ref())
+                                        .await;
+                            })
+                            .await;
                     }
                 }
                 clock.advance(std::time::Duration::from_secs(90));
@@ -738,7 +1150,14 @@ async fn run_seed(
                     .collect()
             })
             .collect();
-        if let Err(e) = worker::audit(&leader, &pinned, false).await {
+        // Every effect the classifier explains happened before this round's
+        // audits; the audits' own repair writes carry seq >= boundary and are
+        // excluded from the analysis (they are the repair, not its cause).
+        let boundary = fleet.plan.obs.seq.load(Ordering::SeqCst);
+        if let Err(e) = OP_ID
+            .scope(fleet.fresh_op(), worker::audit(&leader, &pinned, false))
+            .await
+        {
             violations_pre.push(format!(
                 "AUDIT: leader audit failed on round {round}: {e:?}"
             ));
@@ -752,7 +1171,13 @@ async fn run_seed(
                 bucket.clone() as Arc<dyn Storage>
             ));
             let audit_pin = audit_state.pin();
-            if let Err(e) = worker::audit(&audit_state, &audit_pin, false).await {
+            if let Err(e) = OP_ID
+                .scope(
+                    fleet.fresh_op(),
+                    worker::audit(&audit_state, &audit_pin, false),
+                )
+                .await
+            {
                 violations_pre.push(format!(
                     "AUDIT: warm-bucket audit failed on round {round}: {e:?}"
                 ));
@@ -772,53 +1197,126 @@ async fn run_seed(
             .collect();
         if views_before_audit != views_after_audit {
             // The audit repaired views the tick/sweep path had not converged.
-            // Under injected storage failures this is within the system's
-            // contract — markers are retained on failure and the audit is the
-            // documented safety net — so it is a reported statistic there. In
-            // a crash-only run (--fail-percent 0) there is no such excuse:
-            // markers alone must converge the tick path over every crash
-            // schedule, so an audit repair IS a protocol violation.
+            // Classify each repair from the effect history captured before this
+            // round's audits: ORDERING and PREMATURE-CONSUMPTION are avoidable
+            // signal-loss bugs and fail the seed in every profile; the
+            // documented CONCURRENT-RACE clobber is a reported statistic (the
+            // audit is its designed backstop). A crash-only run additionally
+            // keeps its blanket gate: markers alone must converge over every
+            // crash schedule, so ANY repair there is a violation.
             audit_view_repairs += 1;
-            // Crash-only always records the diff — a repair there is a
-            // violation. Fault mode is silent by default (repairs are within
-            // contract), but VOPR_LOG_REPAIRS makes each one inspectable: which
-            // seed, which round, which view keys drifted. So a jump in the
-            // aggregate count is a grep, not a re-derivation — the tier-3
-            // backstop firing is exactly the signal worth watching.
-            let log_repair = fail_percent == 0 || std::env::var_os("VOPR_LOG_REPAIRS").is_some();
-            if log_repair {
-                let changed: Vec<String> = views_before_audit
+            // Deduped diff: one entry per (bucket, key) whose bytes actually
+            // changed (the old before.keys().chain(after.keys()) double-listed
+            // keys present on both sides).
+            let mut diffs: Vec<ViewDiff> = Vec::new();
+            for (idx, (before, after)) in views_before_audit
+                .iter()
+                .zip(views_after_audit.iter())
+                .enumerate()
+            {
+                let mut keys: std::collections::BTreeSet<&String> = before.keys().collect();
+                keys.extend(after.keys());
+                for k in keys {
+                    if before.get(k) != after.get(k) {
+                        diffs.push((
+                            idx,
+                            k.clone(),
+                            before.get(k).cloned(),
+                            after.get(k).cloned(),
+                        ));
+                    }
+                }
+            }
+            let findings = classify_round(&fleet.plan.obs.snapshot(), boundary, &diffs);
+            for f in &findings {
+                repairs_by_class[(f.class - 1) as usize] += 1;
+            }
+            // Per-bucket "key before=.. after=.." dump for message context.
+            let bucket_dump = |b: usize| -> Vec<String> {
+                diffs
                     .iter()
-                    .zip(views_after_audit.iter())
-                    .enumerate()
-                    .flat_map(|(idx, (before, after))| {
-                        before
-                            .keys()
-                            .chain(after.keys())
-                            .filter(|k| before.get(*k) != after.get(*k))
-                            .map(move |k| {
-                                format!(
-                                    "bucket{idx}:{k} before={:?} after={:?}",
-                                    before
-                                        .get(k)
-                                        .map(|v| String::from_utf8_lossy(v).into_owned()),
-                                    after
-                                        .get(k)
-                                        .map(|v| String::from_utf8_lossy(v).into_owned()),
-                                )
-                            })
+                    .filter(|(idx, _, _, _)| *idx == b)
+                    .map(|(idx, k, before, after)| {
+                        format!(
+                            "bucket{idx}:{k} before={:?} after={:?}",
+                            before
+                                .as_ref()
+                                .map(|v| String::from_utf8_lossy(v).into_owned()),
+                            after
+                                .as_ref()
+                                .map(|v| String::from_utf8_lossy(v).into_owned()),
+                        )
+                    })
+                    .collect()
+            };
+            let changed: Vec<String> = (0..fleet.buckets.len()).flat_map(&bucket_dump).collect();
+            if fail_percent == 0 {
+                // Crash-only: keep the blanket AUDIT_REPAIRED_VIEWS gate exactly
+                // as strict as before; append the findings for diagnosability.
+                let findings_desc: Vec<String> = findings
+                    .iter()
+                    .map(|f| {
+                        format!(
+                            "[class {}] bucket{} {}: {}",
+                            f.class, f.bucket, f.subject, f.detail
+                        )
                     })
                     .collect();
-                if fail_percent == 0 {
-                    violations_pre.push(format!(
-                        "AUDIT_REPAIRED_VIEWS: crash-only run needed the audit to converge views \
-                         — the marker protocol failed to self-heal: {changed:#?}"
-                    ));
-                } else {
+                violations_pre.push(format!(
+                    "AUDIT_REPAIRED_VIEWS: crash-only run needed the audit to converge views \
+                     — the marker protocol failed to self-heal: {changed:#?}\nfindings: {findings_desc:#?}"
+                ));
+            } else {
+                // Fault mode: ORDERING/PREMATURE-CONSUMPTION are violations;
+                // CONCURRENT-RACE is only a statistic. Messages are
+                // seed-agnostic (bucket, subject, detail, that bucket's diff) so
+                // the same bug groups across seeds.
+                for f in &findings {
+                    match f.class {
+                        1 => violations_pre.push(format!(
+                            "AUDIT_ORDERING: bucket{} {} — {} | changed: {:#?}",
+                            f.bucket,
+                            f.subject,
+                            f.detail,
+                            bucket_dump(f.bucket)
+                        )),
+                        2 => violations_pre.push(format!(
+                            "AUDIT_PREMATURE_CONSUMPTION: bucket{} {} — {} | changed: {:#?}",
+                            f.bucket,
+                            f.subject,
+                            f.detail,
+                            bucket_dump(f.bucket)
+                        )),
+                        _ => {}
+                    }
+                }
+                if std::env::var_os("VOPR_LOG_REPAIRS").is_some() {
                     eprintln!(
                         "vopr: seed {seed} round {round} — audit repaired {} view key(s) under fault injection (fail-percent {fail_percent}); the marker path fell through to the tier-3 backstop: {changed:#?}",
                         changed.len()
                     );
+                    for f in &findings {
+                        eprintln!(
+                            "  [class {}] bucket{} {}: {}",
+                            f.class, f.bucket, f.subject, f.detail
+                        );
+                    }
+                }
+            }
+            // Warm-bucket audits write straight to SimStorage (bypassing the
+            // traced view), so their repair writes are invisible to the
+            // observer. Synthesize them — one fresh inferred attribution for the
+            // round — so a later round that re-examines the same package sees
+            // the convergence they achieved rather than misreading a stale gap.
+            if diffs.iter().any(|(idx, _, _, _)| *idx >= 1) {
+                let synth_att = fleet.plan.obs.fresh_synth_att();
+                for (idx, key, _before, after) in &diffs {
+                    if *idx >= 1 {
+                        fleet
+                            .plan
+                            .obs
+                            .synth_view_write(*idx, key, after.as_deref(), synth_att);
+                    }
                 }
             }
         }
@@ -1065,8 +1563,332 @@ async fn run_seed(
         trace_log: fleet.plan.take_log(),
         acked: ledger.acked.len(),
         audit_view_repairs,
+        repairs_by_class,
         violations,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Audit-repair classifier (pure: no rng, no awaits, no storage).
+//
+// Given the effect history, the seq boundary captured just before a round's
+// audits, and the view keys that round's audit had to change, explain each
+// repair. The per-package tests run in severity order and the first match
+// wins, so a poisoned rebuild that also raced is reported as the (worse)
+// premature-consumption it is, never downgraded to the benign race.
+// ---------------------------------------------------------------------------
+
+/// One changed view key a round's audit produced: (bucket, key, before, after).
+type ViewDiff = (usize, String, Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// One breadcrumb key's events within a (bucket, pkg): the put seqs, and the
+/// (del seq, del att, del node) triples that retired them.
+type KeyEvents = (Vec<u64>, Vec<(u64, u64, usize)>);
+
+struct RepairFinding {
+    bucket: usize,
+    subject: String,
+    class: u8,
+    detail: String,
+}
+
+/// A breadcrumb's lifetime `[put_seq, del_seq)`; `del_seq == u64::MAX` while it
+/// is still live at the boundary. `del_att`/`del_node` attribute the consuming
+/// op (for the blind-consumption test). `is_note` picks the `_repl/` note
+/// interpretation over the `_dirty/` marker one.
+struct Interval {
+    put_seq: u64,
+    del_seq: u64,
+    del_att: u64,
+    del_node: usize,
+    is_note: bool,
+}
+
+fn opt(o: Option<u64>) -> String {
+    match o {
+        Some(v) => v.to_string(),
+        None => "none".to_string(),
+    }
+}
+
+/// Max seq of a TruthList on (bucket, pkg) by op `att`, strictly before `before`.
+fn l_of(live: &[&Effect], bucket: usize, pkg: &str, att: u64, before: u64) -> Option<u64> {
+    live.iter()
+        .filter(|e| {
+            e.kind == EffectKind::TruthList
+                && e.bucket == bucket
+                && e.pkg == pkg
+                && e.att == att
+                && e.seq < before
+        })
+        .map(|e| e.seq)
+        .max()
+}
+
+/// The seq at which the op that consumed a `_dirty/` marker actually listed
+/// this package's truth. Exact for an op that listed truth itself (`direct`);
+/// for a tick — whose batch marker-delete runs on the main task but whose
+/// per-package rebuild listing lives in a `tokio::spawn`ed child that does not
+/// inherit the op id — infer the child's listing: the last TruthList on this
+/// (bucket, pkg, node) between the tick's own `_dirty/` listing and the delete.
+/// The fleet-wide tick lock bounds this to one live rebuild per key, so the
+/// inference is exact too.
+fn consumer_list_seq(
+    live: &[&Effect],
+    bucket: usize,
+    pkg: &str,
+    att: u64,
+    node: usize,
+    del_seq: u64,
+) -> Option<u64> {
+    if let Some(direct) = l_of(live, bucket, pkg, att, del_seq) {
+        return Some(direct);
+    }
+    let window_start = live
+        .iter()
+        .filter(|e| e.kind == EffectKind::MarkerList && e.att == att && e.seq < del_seq)
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0);
+    live.iter()
+        .filter(|e| {
+            e.kind == EffectKind::TruthList
+                && e.bucket == bucket
+                && e.pkg == pkg
+                && e.node == node
+                && e.seq > window_start
+                && e.seq < del_seq
+        })
+        .map(|e| e.seq)
+        .max()
+}
+
+/// Explain one repaired (bucket, pkg) view: which taxonomy class, and why.
+fn analyze(live: &[&Effect], boundary: u64, bucket: usize, pkg: &str) -> RepairFinding {
+    let finding = |class: u8, detail: String| RepairFinding {
+        bucket,
+        subject: pkg.to_string(),
+        class,
+        detail,
+    };
+
+    let mut view_writes: Vec<&Effect> = live
+        .iter()
+        .filter(|e| e.kind == EffectKind::ViewWrite && e.bucket == bucket && e.pkg == pkg)
+        .copied()
+        .collect();
+    view_writes.sort_by_key(|e| e.seq);
+    let mutations: Vec<&Effect> = live
+        .iter()
+        .filter(|e| e.kind == EffectKind::TruthWrite && e.bucket == bucket && e.pkg == pkg)
+        .copied()
+        .collect();
+
+    // Breadcrumb lifetimes: pair put/del by identical full key (unique per
+    // creation; the i-th put with the i-th del if a key is ever reused).
+    let intervals = |put_kind: EffectKind, del_kind: EffectKind, is_note: bool| -> Vec<Interval> {
+        let mut by_key: BTreeMap<&str, KeyEvents> = BTreeMap::new();
+        for e in live.iter() {
+            if e.bucket != bucket || e.pkg != pkg {
+                continue;
+            }
+            if e.kind == put_kind {
+                by_key.entry(e.key.as_str()).or_default().0.push(e.seq);
+            } else if e.kind == del_kind {
+                by_key
+                    .entry(e.key.as_str())
+                    .or_default()
+                    .1
+                    .push((e.seq, e.att, e.node));
+            }
+        }
+        let mut out = Vec::new();
+        for (_key, (mut puts, mut dels)) in by_key {
+            puts.sort_unstable();
+            dels.sort_unstable();
+            for (i, put_seq) in puts.into_iter().enumerate() {
+                let (del_seq, del_att, del_node) = dels.get(i).copied().unwrap_or((u64::MAX, 0, 0));
+                out.push(Interval {
+                    put_seq,
+                    del_seq,
+                    del_att,
+                    del_node,
+                    is_note,
+                });
+            }
+        }
+        out
+    };
+    let dirty_intervals = intervals(EffectKind::MarkerPut, EffectKind::MarkerDel, false);
+    let note_intervals = intervals(EffectKind::NotePut, EffectKind::NoteDel, true);
+
+    // O_f: the final view the fast path left in place (or the boundary, if the
+    // fast path never wrote a view for this package).
+    let (v_f, att_f, l_f) = match view_writes.last() {
+        Some(o) => (o.seq, o.att, l_of(live, bucket, pkg, o.att, o.seq)),
+        None => (boundary, 0, None),
+    };
+    // Mutations the final view could not have reflected: it listed truth before
+    // them, or never listed at all.
+    let unseen: Vec<&Effect> = mutations
+        .iter()
+        .filter(|m| l_f.is_none_or(|l| m.seq > l))
+        .copied()
+        .collect();
+    let covering = |m_seq: u64| -> Vec<&Interval> {
+        dirty_intervals
+            .iter()
+            .chain(note_intervals.iter())
+            .filter(|iv| iv.put_seq < m_seq && m_seq < iv.del_seq)
+            .collect()
+    };
+
+    // TEST 1 — ORDERING: an unreflected mutation with no live breadcrumb over
+    // it. Nothing durable could have told the system to rebuild.
+    for m in &unseen {
+        if covering(m.seq).is_empty() {
+            return finding(
+                1,
+                format!(
+                    "truth mutation {}@{} had no live breadcrumb (no _dirty/ marker on this bucket, no _repl/ note aimed at it)",
+                    m.key, m.seq
+                ),
+            );
+        }
+    }
+    // TEST 2a — poisoned derivation: the final view op listed truth past every
+    // mutation, yet the view it wrote still disagrees with that truth.
+    if !view_writes.is_empty() && unseen.is_empty() && !mutations.is_empty() {
+        return finding(
+            2,
+            format!(
+                "op {} listed truth@{} and wrote the final view@{}, yet the view disagrees with that truth — a poisoned derivation consumed the signal",
+                att_f,
+                opt(l_f),
+                v_f
+            ),
+        );
+    }
+    // TEST 2b — blind consumption: every breadcrumb covering an unreflected
+    // mutation was retired by a consumer that had already listed truth (or
+    // never listed it), destroying the signal without acting on it.
+    for m in &unseen {
+        let cov = covering(m.seq);
+        if cov.is_empty() {
+            continue;
+        }
+        let all_blind = cov.iter().all(|iv| {
+            if iv.del_seq == u64::MAX {
+                return false; // still live at the boundary — signal not lost
+            }
+            if iv.is_note {
+                // A sweep may retire a note only after re-arming the
+                // destination's own dirty marker (att == the sweep's op); doing
+                // so hands the mutation to the dirty path rather than dropping it.
+                let re_armed = live.iter().any(|e| {
+                    e.kind == EffectKind::MarkerPut
+                        && e.bucket == bucket
+                        && e.pkg == pkg
+                        && e.att == iv.del_att
+                        && e.seq < iv.del_seq
+                });
+                !re_armed
+            } else {
+                consumer_list_seq(live, bucket, pkg, iv.del_att, iv.del_node, iv.del_seq)
+                    .is_none_or(|cl| cl < m.seq)
+            }
+        });
+        if all_blind {
+            return finding(
+                2,
+                format!(
+                    "breadcrumbs covering truth mutation {}@{} were all consumed blind (every consumer listed truth before the mutation, or never)",
+                    m.key, m.seq
+                ),
+            );
+        }
+    }
+    // TEST 3 — CONCURRENT-RACE: the surviving view write listed truth strictly
+    // older than a different op's earlier view write it overwrote — the
+    // documented unleased-rebuild clobber the audit backs up.
+    for g in &view_writes {
+        if g.seq < v_f && g.att != att_f {
+            if let Some(l_g) = l_of(live, bucket, pkg, g.att, g.seq) {
+                if l_f.is_none_or(|lf| l_g > lf) {
+                    return finding(
+                        3,
+                        format!(
+                            "unleased concurrent rebuild: final view write@{} (listed@{:?}) overwrote fresher view write@{} (listed@{})",
+                            v_f, l_f, g.seq, l_g
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    // FALLBACK — unexplained drift is conservatively premature-consumption: an
+    // unexplained repair is a protocol or classifier bug, and either must fail
+    // the seed rather than hide. Dump this view's effects to make it diagnosable.
+    let dump: Vec<String> = live
+        .iter()
+        .filter(|e| e.bucket == bucket && e.pkg == pkg)
+        .map(|e| format!("{:?}@{} att={} {}", e.kind, e.seq, e.att, e.key))
+        .collect();
+    finding(
+        2,
+        format!(
+            "unexplained drift — conservatively premature-consumption; effects: [{}]",
+            dump.join("; ")
+        ),
+    )
+}
+
+/// Classify every view key a round's audit changed. Global-index diffs expand
+/// to the package names whose membership flipped; per-package diffs collapse
+/// the html+json pair to a single finding.
+fn classify_round(effects: &[Effect], boundary: u64, diffs: &[ViewDiff]) -> Vec<RepairFinding> {
+    let live: Vec<&Effect> = effects.iter().filter(|e| e.seq < boundary).collect();
+    let mut findings = Vec::new();
+    let mut seen: std::collections::BTreeSet<(usize, String)> = std::collections::BTreeSet::new();
+    for (bucket, key, before, after) in diffs {
+        if key == "simple/index.json" || key == "simple/index.html" {
+            let names = |bytes: &Option<Vec<u8>>| -> std::collections::BTreeSet<String> {
+                match (key.as_str(), bytes) {
+                    ("simple/index.json", Some(b)) => global_names_from_json(b),
+                    ("simple/index.html", Some(b)) => global_names_from_html(b),
+                    _ => Vec::new(),
+                }
+                .into_iter()
+                .collect()
+            };
+            let before_names = names(before);
+            let after_names = names(after);
+            let flipped: Vec<&String> = before_names.symmetric_difference(&after_names).collect();
+            if flipped.is_empty() {
+                // Bytes differ but the name set did not — the audit rewrote the
+                // global index without a membership change we can attribute.
+                findings.push(RepairFinding {
+                    bucket: *bucket,
+                    subject: key.clone(),
+                    class: 2,
+                    detail: format!(
+                        "global index {key} bytes changed but its package set did not — conservatively premature-consumption"
+                    ),
+                });
+                continue;
+            }
+            for name in flipped {
+                if seen.insert((*bucket, name.clone())) {
+                    findings.push(analyze(&live, boundary, *bucket, name));
+                }
+            }
+        } else if let Some(pkg) = view_key_package(key) {
+            if seen.insert((*bucket, pkg.to_string())) {
+                findings.push(analyze(&live, boundary, *bucket, pkg));
+            }
+        }
+    }
+    findings
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,6 +2023,7 @@ fn main() {
     let mut total_events: u64 = 0;
     let mut total_acked: usize = 0;
     let mut total_audit_repairs: u64 = 0;
+    let mut total_repairs_by_class: [u64; 3] = [0; 3]; // [ordering, premature, race]
     let mut failed_seeds: Vec<u64> = Vec::new();
     let mut determinism_violations: Vec<u64> = Vec::new();
     let mut explored: u64 = 0;
@@ -1221,6 +2044,12 @@ fn main() {
         total_events += outcome.trace_events;
         total_acked += outcome.acked;
         total_audit_repairs += outcome.audit_view_repairs;
+        for (total, add) in total_repairs_by_class
+            .iter_mut()
+            .zip(outcome.repairs_by_class)
+        {
+            *total += add;
+        }
         if args.recheck_every > 0 && seed.is_multiple_of(args.recheck_every) {
             let again = run_once(seed, &profile);
             if again.trace_hash != outcome.trace_hash {
@@ -1268,7 +2097,10 @@ fn main() {
         // the running counters without flooding the log.
         if keep_going && last_report.elapsed().as_secs() >= 60 {
             println!(
-                "vopr: progress — {explored} seeds, {total_events} storage-op interleavings, {total_acked} acked uploads, {total_audit_repairs} audit view repairs, {} failed, {} determinism violations, {:?} elapsed",
+                "vopr: progress — {explored} seeds, {total_events} storage-op interleavings, {total_acked} acked uploads, {total_audit_repairs} audit view repairs ({} ordering, {} premature, {} concurrent-race), {} failed, {} determinism violations, {:?} elapsed",
+                total_repairs_by_class[0],
+                total_repairs_by_class[1],
+                total_repairs_by_class[2],
                 failed_seeds.len(),
                 determinism_violations.len(),
                 started.elapsed()
@@ -1285,7 +2117,10 @@ fn main() {
         )
     };
     println!(
-        "vopr: {explored} seeds explored, {total_events} storage-op interleavings, {total_acked} acked uploads verified, {total_audit_repairs} audit view repairs, {profile_desc} in {:?} — {}",
+        "vopr: {explored} seeds explored, {total_events} storage-op interleavings, {total_acked} acked uploads verified, {total_audit_repairs} audit view repairs ({} ordering, {} premature, {} concurrent-race), {profile_desc} in {:?} — {}",
+        total_repairs_by_class[0],
+        total_repairs_by_class[1],
+        total_repairs_by_class[2],
         started.elapsed(),
         if failed_seeds.is_empty() && determinism_violations.is_empty() {
             "all invariants held".to_string()

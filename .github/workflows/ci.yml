@@ -98,6 +98,21 @@ jobs:
           cargo run --example vopr -- --seed 1784486481 --nodes 3 --buckets 3 --ops 120 --fail-percent 3
           cargo run --example vopr -- --seed 1784817003 --nodes 2 --buckets 3 --ops 80 --fail-percent 3
           cargo run --example vopr -- --seed 1784521773 --nodes 3 --buckets 1 --ops 80 --fail-percent 0
+          # Convergence regressions the audit-repair taxonomy soak surfaced, each
+          # a failed storage op once treated as authoritative (the family of
+          # commit e860792). 7384/19900: a sidecar read/backfill availability
+          # error was laundered into "corrupt/skip", so the rebuild derived an
+          # empty view and DELETED a live single-file package, then consumed its
+          # own dirty markers (two topologies). 19026: a failed global-index CAS
+          # left the name delta absorbed into the cache with the old ETag pinned,
+          # so every retry saw changed=false and left a dead package listed.
+          # 47843: the empty-view poisoning under two buckets. One seed per
+          # failure shape; the rotating soak (nightly simulation.yml) re-explores
+          # the wider space (14402, 23921, 41013, ...).
+          cargo run --example vopr -- --seed 7384 --nodes 2 --buckets 1 --ops 80 --fail-percent 3
+          cargo run --example vopr -- --seed 19900 --nodes 3 --buckets 1 --ops 80 --fail-percent 3
+          cargo run --example vopr -- --seed 19026 --nodes 2 --buckets 1 --ops 160 --fail-percent 3
+          cargo run --example vopr -- --seed 47843 --nodes 2 --buckets 2 --ops 120 --fail-percent 3
 
   integration:
     # The product's center of gravity is the blackbox suite (dev/TESTING.md): the

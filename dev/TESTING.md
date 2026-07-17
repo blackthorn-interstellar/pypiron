@@ -172,21 +172,44 @@ seed failed. At ~600+ seeds/second, an overnight soak covers tens of
 millions of schedules. Output is also appended to `vopr-soak.log` (gitignored)
 so findings survive the terminal.
 
-The heartbeat reports an **audit-view-repairs** count: how often a run's cheap
-marker/tick/reconcile path left a view unconverged and the tier-3 audit
-backstop had to repair it. In crash-only profiles (`--fail-percent 0`) that is
-a hard violation — the markers must self-heal every crash schedule — and the
-seed fails with the drifted keys dumped. Under injected storage failures it is
-within contract (the audit is the documented safety net), so it is only a
-statistic. Treat that statistic as a watched baseline, not a target of zero:
-the audit exists precisely because the fast path cannot be guaranteed to
-converge under arbitrary failure, so a nonzero count is partly the system
-working as designed — the signal to investigate is the count *rising*. To see
-which seeds and keys are behind it, run with `VOPR_LOG_REPAIRS=1`: every
-fault-mode repair then prints its seed, round, and the exact view keys that
-drifted (silent by default, since repairs are expected there). `VOPR_TRACE=1`
+The heartbeat and final summary report an **audit-view-repairs** count: how
+often a run's cheap marker/tick/reconcile path left a view unconverged and the
+tier-3 audit backstop had to repair it. Every fault-mode repair is *classified*
+from the run's recorded effect history — no replays — into one of three causes:
+
+1. **ordering** — truth was mutated with no durable breadcrumb ever covering it
+   (a `_dirty/` marker on that bucket or a `_repl/` note aimed at it). The fast
+   path never had a chance to converge the view.
+2. **premature-consumption** — breadcrumbs existed but were destroyed without
+   converging the view: a consumer that never listed past the mutation it
+   retired, or a rebuild that consumed its own markers while leaving a view
+   inconsistent with the truth it listed.
+3. **concurrent-race** — an unleased concurrent rebuild overwrote a fresher one
+   (`concurrent_rebuild_without_lease_diverges`, tests/model_event_protocol.rs),
+   the one case for which the audit is the *documented* backstop.
+
+Classes 1 and 2 are hard violations in **every** profile and fail the seed with
+a reproduce command: both mean the fast path destroyed the only signal that
+should have converged the view — the exact bug family this simulator exists to
+catch. Crash-only profiles (`--fail-percent 0`) additionally keep the blanket
+"any repair is a violation" gate: with no injected failures the markers must
+self-heal every schedule. Class 3 is the only legal statistic; the heartbeat and
+summary print the per-class breakdown — `X audit view repairs (a ordering, b
+premature, c concurrent-race)`. Drift the classifier cannot explain is reported
+as class 2 on purpose: conservative, so an unmodelled hazard fails the seed
+rather than hiding.
+
+To see which seeds and keys are behind a repair, run with `VOPR_LOG_REPAIRS=1`:
+every fault-mode repair then prints its **class** and causal detail alongside its
+seed, round, and the exact drifted view keys (silent by default). `VOPR_TRACE=1`
 (optionally `VOPR_TRACE_FILE=path`) captures the full storage-op trace for
 diffing a determinism violation.
+
+The honest statement about zero: the *avoidable* classes (1 and 2) are zero by
+enforcement — a run that produces one fails. Whether the **total** can reach zero
+is exactly the open per-package-leasing design decision behind class 3: until a
+rebuild takes a per-package lease, two unleased rebuilds can still race, and the
+audit remains their documented backstop.
 
 ## Real cloud backends
 

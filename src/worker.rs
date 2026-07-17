@@ -29,7 +29,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use sha2::{Digest, Sha256};
 use tokio::time::{sleep, timeout};
 use tracing::{error, info, warn};
@@ -1862,6 +1862,33 @@ async fn update_global_index(
         return Ok(());
     }
     let mut guard = state.global_names.lock().await;
+    // Invariant: the cached name set must never outlive a write we could not
+    // prove landed. `update_global_index_locked` absorbs the delta into the
+    // cache *before* the conditional write; if that write (or its currency
+    // probe) errors, the delta is already applied against the old pinned ETag. A
+    // surviving cache makes the retry compute `changed = false`, the ETag probe
+    // still matches (nothing moved), and the tick returns Ok — consuming the
+    // dirty markers and dropping the delta until the audit (a dead package left
+    // listed globally; the sim caught this as seed 19026). Drop the cache on
+    // every error so the retry reloads from storage and re-detects the delta.
+    let result = update_global_index_locked(state, storage, adds, removes, &mut guard).await;
+    if result.is_err() {
+        *guard = None;
+    }
+    result
+}
+
+/// The CAS loop for [`update_global_index`], operating on the held cache guard.
+/// Split out so the wrapper can invalidate the cache on any error exit (see the
+/// invariant there). On success the cache stays pinned to the ETag the write
+/// returned; never add an error path here that leaves the cache mutated.
+async fn update_global_index_locked(
+    state: &AppState,
+    storage: &dyn Storage,
+    adds: &[String],
+    removes: &[String],
+    guard: &mut Option<GlobalNames>,
+) -> Result<()> {
     // Once we lose a CAS we have already written an optimistic HTML for a name
     // set that lost. If the reload then makes our delta a no-op (the winner
     // already added our name), `changed` is false and we would return leaving
@@ -1978,11 +2005,20 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
     {
         // A cheap HEAD decides whether global membership can flip, so the common
         // "another file added to a package already listed" case never pays the
-        // full global-index read below.
-        let existed = storage
+        // full global-index read below. An availability error here is not proof
+        // the view is absent: swallowing it to `false` would skip a dead
+        // package's `removes` delta and leave it listed until the audit. Treat it
+        // like a rebuild failure — retain the markers and retry next pass.
+        let existed = match storage
             .head_exists(&format!("{SIMPLE_PREFIX}{package}/index.json"))
             .await
-            .unwrap_or(false);
+        {
+            Ok(existed) => existed,
+            Err(e) => {
+                error!(package=%package, error=?e, "replicate: could not probe global membership; markers retained");
+                continue;
+            }
+        };
         match rebuild_package_indexes(state, storage, &package, None).await {
             Ok((live, _)) => {
                 // Same paused-writer hazard as the tick: a stale intent's
@@ -2226,13 +2262,24 @@ async fn list_artifacts_for_claim(
             )
         }))
         .await;
-        metadata.extend(loaded.into_iter().flatten());
+        // An availability error on any file fails the whole listing: a rebuild
+        // must not derive a view from a partial read. Dropping a file it could
+        // not confirm would look like a deletion and delete the view, consuming
+        // the markers that were the only retry signal. Only a deliberate
+        // `Ok(None)` omission is skipped.
+        for file in loaded {
+            metadata.extend(file?);
+        }
     }
     Ok((metadata, raw))
 }
 
 /// Load one artifact's index entry from its sidecar (backfilling if absent).
-/// None means "leave it out of the index" — reasons logged inside.
+/// `Ok(None)` means "leave it out of the index" — a deliberate omission whose
+/// reason is logged inside. `Err` is an availability failure reading storage: it
+/// must fail the whole rebuild so the package's `_dirty/` markers are retained
+/// and the next tick retries, rather than deriving a wrong (often empty) view
+/// from a transient error and letting the caller consume the markers.
 async fn load_file_metadata(
     storage: &dyn Storage,
     entry: &FileEntry,
@@ -2240,60 +2287,72 @@ async fn load_file_metadata(
     names: &HashSet<&str>,
     pkg_origin: Option<&str>,
     backfill_missing: bool,
-) -> Option<FileMetadata> {
+) -> Result<Option<FileMetadata>> {
     let has_sidecar = names.contains(format!("{filename}{SIDECAR_SUFFIX}").as_str());
     let mirror_quarantined =
         names.contains(format!("{filename}{}", crate::sidecar::MIRROR_QUARANTINED_SUFFIX).as_str());
     if mirror_quarantined && !has_sidecar {
         warn!(key=%entry.key, "quarantined mirror artifact has no sidecar; omitting from index");
-        return None;
+        return Ok(None);
     }
     let sc = if has_sidecar {
-        match read_sidecar(storage, &entry.key).await {
-            Ok(sc) => sc,
-            Err(e) => {
-                // A present-but-unreadable sidecar is corruption, not a
-                // legacy file. Backfilling would fabricate fresh metadata
-                // over it — silently resetting a security yank to false.
-                // Leave the file out of the index until an operator looks.
-                error!(error=?e, key=%entry.key, "corrupt sidecar; omitting file from index (will not fabricate metadata)");
-                return None;
-            }
+        match read_listed_sidecar(storage, &entry.key).await? {
+            Some(sc) => sc,
+            None => return Ok(None),
         }
     } else if backfill_missing {
-        match backfill_sidecar(storage, entry, filename, pkg_origin).await {
-            Ok(sc) => sc,
-            Err(e) => {
-                warn!(error=?e, key=%entry.key, "could not backfill sidecar; skipping file");
-                return None;
-            }
+        match backfill_sidecar(storage, entry, filename, pkg_origin).await? {
+            Some(sc) => sc,
+            None => return Ok(None),
         }
     } else {
-        return None;
+        return Ok(None);
     };
     if pkg_origin == Some(crate::origin::PRIVATE)
         && sc.origin.as_deref() == Some(crate::origin::MIRROR)
     {
         warn!(key=%entry.key, "mirror artifact under private package claim; omitting from index");
-        return None;
+        return Ok(None);
     }
     if mirror_quarantined && sc.origin.as_deref() != Some(crate::origin::PRIVATE) {
         warn!(key=%entry.key, "quarantined mirror artifact remains non-private; omitting from index");
-        return None;
+        return Ok(None);
     }
     let core_metadata = names.contains(format!("{filename}{METADATA_SUFFIX}").as_str());
     let provenance = names.contains(format!("{filename}{PROVENANCE_SUFFIX}").as_str());
-    Some(FileMetadata::from_sidecar(
+    Ok(Some(FileMetadata::from_sidecar(
         filename,
         sc,
         core_metadata,
         provenance,
-    ))
+    )))
 }
 
-async fn read_sidecar(storage: &dyn Storage, artifact_key: &str) -> Result<Sidecar> {
-    let bytes = storage.get_bytes(&sidecar_key(artifact_key)).await?;
-    Ok(serde_json::from_slice(&bytes)?)
+/// Read a sidecar a listing said exists, distinguishing the outcomes a rebuild
+/// must treat differently. `Ok(Some)` is the record. `Ok(None)` is a deliberate
+/// omission: parse failure = corruption (never fabricate metadata over it — that
+/// could silently reset a security yank to false), or a not-found = the sidecar
+/// vanished between listing and read (a concurrent delete, whose own `_dirty/`
+/// marker reconverges a later rebuild). `Err` = an availability failure: fail
+/// the rebuild so its markers retry, never laundering a transient read error
+/// into an authoritative "omit".
+async fn read_listed_sidecar(storage: &dyn Storage, artifact_key: &str) -> Result<Option<Sidecar>> {
+    let key = sidecar_key(artifact_key);
+    let bytes = match storage.get_bytes(&key).await {
+        Ok(bytes) => bytes,
+        Err(e) if is_not_found(&e) => {
+            warn!(key=%artifact_key, "sidecar vanished before read; omitting file from index");
+            return Ok(None);
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading sidecar {key}")),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(sc) => Ok(Some(sc)),
+        Err(e) => {
+            error!(error=?e, key=%artifact_key, "corrupt sidecar; omitting file from index (will not fabricate metadata)");
+            Ok(None)
+        }
+    }
 }
 
 /// Hash-once-and-backfill for files that predate write-time sidecars.
@@ -2304,13 +2363,32 @@ async fn read_sidecar(storage: &dyn Storage, artifact_key: &str) -> Result<Sidec
 /// already be stale, and a concurrent upload's real sidecar (true timestamp,
 /// yank state) must always beat this fabricated one. Losing the race means
 /// the real sidecar exists — read and use it.
+///
+/// `Ok(Some)` is the record to index. `Ok(None)` is a deliberate omission: the
+/// artifact vanished before we could hash it, or it changed/vanished under the
+/// fabrication (which we retract) — both owned by the concurrent mutator's own
+/// `_dirty/` marker, so a later rebuild converges. `Err` is an availability
+/// failure anywhere in the sequence: propagate it so the rebuild fails and its
+/// markers retry, never a fabricated observation of "changed".
 async fn backfill_sidecar(
     storage: &dyn Storage,
     entry: &FileEntry,
     filename: &str,
     pkg_origin: Option<&str>,
-) -> Result<Sidecar> {
-    let bytes = storage.get_bytes(&entry.key).await?;
+) -> Result<Option<Sidecar>> {
+    let bytes = match storage.get_bytes(&entry.key).await {
+        Ok(bytes) => bytes,
+        // Vanished between the listing and this read (a concurrent delete or a
+        // crashed publish clearing unacked debris). Its deleter holds the marker;
+        // omit the file and let a later rebuild converge.
+        Err(e) if is_not_found(&e) => {
+            warn!(key=%entry.key, "artifact vanished before backfill; omitting file from index");
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {} to backfill its sidecar", entry.key))
+        }
+    };
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let sc = Sidecar {
@@ -2335,7 +2413,10 @@ async fn backfill_sidecar(
         )
         .await?;
     if !created {
-        return read_sidecar(storage, &entry.key).await;
+        // Lost the create race: a real sidecar exists. Read and use it — an
+        // unparseable/absent winner is the racing writer's to own (`Ok(None)`),
+        // an availability error propagates.
+        return read_listed_sidecar(storage, &entry.key).await;
     }
     // The hash read above and the create are not atomic: a failed publish
     // deleting its own unacked debris can free the immutable name in between,
@@ -2349,23 +2430,44 @@ async fn backfill_sidecar(
             hasher.update(&now);
             format!("{:x}", hasher.finalize()) == sc.sha256
         }
-        Err(_) => false,
+        // Genuinely vanished after we hashed it — the exact hazard this confirm
+        // guards; retract.
+        Err(e) if is_not_found(&e) => false,
+        // State unknown: never fabricate a "changed" observation from a transient
+        // error. Propagate and let the whole rebuild retry.
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("confirming {} after backfilling its sidecar", entry.key))
+        }
     };
     if !confirmed {
         let retract = match storage.get_bytes(&sidecar_key(&entry.key)).await {
             Ok(current) => current == fabricated,
-            Err(_) => false,
+            // Already gone — nothing of ours to retract.
+            Err(e) if is_not_found(&e) => false,
+            // Unknown state; propagate rather than guess, and retry the rebuild.
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "reading back fabricated sidecar for {} before retraction",
+                        entry.key
+                    )
+                })
+            }
         };
         if retract {
-            let _ = storage.delete_keys(&[sidecar_key(&entry.key)]).await;
+            storage
+                .delete_keys(&[sidecar_key(&entry.key)])
+                .await
+                .with_context(|| format!("retracting fabricated sidecar for {}", entry.key))?;
         }
-        bail!(
-            "artifact {} changed or vanished while backfilling its sidecar; retracted",
-            entry.key
-        );
+        // The artifact changed or vanished under us; any fabrication of ours is
+        // retracted. Omit the file — the mutator holds its own marker.
+        warn!(key=%entry.key, "artifact changed or vanished while backfilling its sidecar; retracted, omitting file");
+        return Ok(None);
     }
     info!(key=%entry.key, "backfilled sidecar");
-    Ok(sc)
+    Ok(Some(sc))
 }
 
 /// Write only if the stored object differs — idempotent rebuilds shouldn't

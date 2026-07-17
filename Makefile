@@ -124,15 +124,16 @@ fuzz-build:  ## Compile all fuzz targets (CI smoke test)
 # Deterministic-simulation soak (dev/TESTING.md §"Deterministic simulation").
 # Rotates through every topology (nodes 2-3, buckets 1-3, fault + crash-only),
 # prints a progress heartbeat every minute, and on a failure logs the exact
-# `--seed N` reproduce command and keeps exploring. Fresh seed territory each
-# launch. Pipe to a file to keep findings; Ctrl-C to stop. On macOS,
+# `--seed N` reproduce command and keeps exploring. Everything is also appended
+# to vopr-soak.log so findings survive the terminal. Ctrl-C to stop. On macOS,
 # `caffeinate -i make vopr-soak` keeps the box awake. VOPR_SECS timeboxes
 # instead of running forever (exits non-zero if any seed failed).
 VOPR_SECS ?=
 vopr-soak:  ## Run the deterministic simulator continuously across rotating topologies (VOPR_SECS=n to timebox)
-	cargo run --release --example vopr -- \
+	set -o pipefail; cargo run --release --example vopr -- \
 		$(if $(VOPR_SECS),--max-secs $(VOPR_SECS),--forever) \
-		--rotate --recheck-every 500 --start-seed $$(date +%s)
+		--rotate --recheck-every 500 --start-seed $$(date +%s) \
+		2>&1 | tee -a vopr-soak.log
 
 help:  ## Display this help message
 	@grep -h -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'

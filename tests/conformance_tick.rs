@@ -167,15 +167,31 @@ async fn stale_unpaired_intent_heals_the_crashed_writer() {
     assert_eq!(licensed.len(), 1, "stale intent selected: {licensed:?}");
     run_tick(&state).await;
 
+    // The stale intent is consumed, but its writer may only be paused past the
+    // grace and can still mutate after the healing rebuild's listing — so the
+    // heal re-arms a fresh dirty marker, and the next tick re-derives from
+    // post-mutation truth before the package goes quiet.
+    let rearmed = remaining_markers(&storage);
+    assert_eq!(
+        rearmed.len(),
+        1,
+        "stale intent healed, re-arm marker left: {rearmed:?}"
+    );
     assert!(
-        remaining_markers(&storage).is_empty(),
-        "stale intent healed"
+        rearmed[0].ends_with(".commit"),
+        "re-arm is an unpaired commit: {rearmed:?}"
     );
     assert!(
         storage
             .dump()
             .contains_key(&format!("simple/{PKG}/index.html")),
         "package rebuilt anyway"
+    );
+
+    run_tick(&state).await;
+    assert!(
+        remaining_markers(&storage).is_empty(),
+        "the re-arm drains on the next tick"
     );
 }
 

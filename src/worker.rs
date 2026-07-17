@@ -1561,6 +1561,21 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
     for handle in handles {
         match handle.await {
             Ok((pkg, keys, stale_intents, Some(live_now))) => {
+                // A stale unpaired intent is *presumed* crashed — but the
+                // writer may merely be paused past the grace and can still
+                // mutate truth between this rebuild's listing and the marker
+                // consumption below, then die before its commit. Consuming its
+                // intent would erase the only signal covering those writes, so
+                // re-arm a fresh dirty marker first: the next tick re-derives
+                // from post-mutation truth (a no-op when nothing changed). If
+                // the re-arm cannot be written, retain the originals instead.
+                if stale_intents > 0 {
+                    if let Err(e) = mark_dirty(pinned.storage.as_ref(), &pkg).await {
+                        error!(package=%pkg, error=?e, "could not re-arm dirty marker after healing stale intent; markers retained");
+                        failures += 1;
+                        continue;
+                    }
+                }
                 // Markers for this package are now consumed; the stale intents
                 // among them are healed crashed writers.
                 healed += stale_intents;
@@ -1965,6 +1980,15 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
             .unwrap_or(false);
         match rebuild_package_indexes(state, storage, &package, None).await {
             Ok((live, _)) => {
+                // Same paused-writer hazard as the tick: a stale intent's
+                // writer may still mutate after this rebuild's listing, so
+                // re-arm before consuming or retain the originals.
+                if stale_intents > 0 {
+                    if let Err(e) = mark_dirty(storage, &package).await {
+                        error!(package=%package, error=?e, "replicate: could not re-arm dirty marker after healing stale intent; markers retained");
+                        continue;
+                    }
+                }
                 if live && !existed {
                     adds.push(package);
                 } else if !live && existed {
@@ -2297,15 +2321,43 @@ async fn backfill_sidecar(
         upload_epoch_ms: None,
         yank_epoch: 0,
     };
+    let fabricated = serde_json::to_vec(&sc)?;
     let created = storage
         .put_if_absent(
             &sidecar_key(&entry.key),
-            serde_json::to_vec(&sc)?,
+            fabricated.clone(),
             Some("application/json"),
         )
         .await?;
     if !created {
         return read_sidecar(storage, &entry.key).await;
+    }
+    // The hash read above and the create are not atomic: a failed publish
+    // deleting its own unacked debris can free the immutable name in between,
+    // and a later upload would then inherit a sidecar describing dead bytes.
+    // Confirm the body still holds the hashed bytes; otherwise retract the
+    // fabrication — comparing first, so a real sidecar that already replaced
+    // ours is never the casualty.
+    let confirmed = match storage.get_bytes(&entry.key).await {
+        Ok(now) => {
+            let mut hasher = Sha256::new();
+            hasher.update(&now);
+            format!("{:x}", hasher.finalize()) == sc.sha256
+        }
+        Err(_) => false,
+    };
+    if !confirmed {
+        let retract = match storage.get_bytes(&sidecar_key(&entry.key)).await {
+            Ok(current) => current == fabricated,
+            Err(_) => false,
+        };
+        if retract {
+            let _ = storage.delete_keys(&[sidecar_key(&entry.key)]).await;
+        }
+        bail!(
+            "artifact {} changed or vanished while backfilling its sidecar; retracted",
+            entry.key
+        );
     }
     info!(key=%entry.key, "backfilled sidecar");
     Ok(sc)

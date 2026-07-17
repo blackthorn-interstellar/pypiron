@@ -91,6 +91,13 @@ jobs:
           # Crash-only mode: no injected storage failures, so the marker
           # protocol must converge with zero audit repairs — a hard invariant.
           cargo run --example vopr -- --seeds 20 --nodes 3 --buckets 2 --ops 80 --fail-percent 0
+          # Regression seeds: schedules that once produced a torn record (live
+          # body + stale backfilled sidecar) reconcile refused to heal, and a
+          # paused delete whose stale intent a concurrent tick consumed with a
+          # pre-mutation rebuild (lost signal, crash-only audit repair).
+          cargo run --example vopr -- --seed 1784486481 --nodes 3 --buckets 3 --ops 120 --fail-percent 3
+          cargo run --example vopr -- --seed 1784817003 --nodes 2 --buckets 3 --ops 80 --fail-percent 3
+          cargo run --example vopr -- --seed 1784521773 --nodes 3 --buckets 1 --ops 80 --fail-percent 0
 
   integration:
     # The product's center of gravity is the blackbox suite (dev/TESTING.md): the

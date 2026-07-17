@@ -188,7 +188,13 @@ impl FaultPlan {
     }
 
     /// Decide this op's fate and unique virtual latency.
-    fn admit(&self, node: usize, op: &str, key: &str) -> (OpFate, std::time::Duration) {
+    fn admit(
+        &self,
+        node: usize,
+        bucket: usize,
+        op: &str,
+        key: &str,
+    ) -> (OpFate, std::time::Duration) {
         let seq = self.op_seq.fetch_add(1, Ordering::SeqCst);
         let jitter = {
             let mut rng = self.rng_stream.lock().expect("rng lock");
@@ -197,7 +203,7 @@ impl FaultPlan {
         // Unique deadline per op: total order over wakeups.
         let delay = std::time::Duration::from_nanos(jitter * 1_000 + seq + 1);
         self.trace.lock().expect("trace lock").record(&[
-            &node.to_string(),
+            &format!("n{node}b{bucket}"),
             op,
             key,
             &seq.to_string(),
@@ -249,12 +255,13 @@ impl FaultPlan {
 struct FaultView {
     inner: Arc<SimStorage>,
     node: usize,
+    bucket: usize,
     plan: Arc<FaultPlan>,
 }
 
 impl FaultView {
     async fn gate(&self, op: &'static str, key: &str) -> Result<()> {
-        let (fate, delay) = self.plan.admit(self.node, op, key);
+        let (fate, delay) = self.plan.admit(self.node, self.bucket, op, key);
         tokio::time::sleep(delay).await;
         match fate {
             OpFate::Ok => Ok(()),
@@ -417,6 +424,7 @@ fn build_node_state(
             storage: Arc::new(FaultView {
                 inner: bucket.clone(),
                 node,
+                bucket: idx,
                 plan: plan.clone(),
             }) as Arc<dyn Storage>,
             name: format!("bucket-{idx}"),
@@ -900,7 +908,7 @@ async fn run_seed(
                     .collect();
                 let detail: Vec<String> = diff
                     .iter()
-                    .take(4)
+                    .take(10)
                     .map(|k| {
                         format!(
                             "{k}: b0={:?} b{idx}={:?}",

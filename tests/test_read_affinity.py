@@ -400,8 +400,10 @@ def test_region_bucket_failover_and_drain_gated_return(
     # The real note above drains in a blink once B is back — too fast to observe
     # the gate holding reads off B. Seed a second note B can never satisfy on its
     # own so the drain gate is provably what keeps reads on A, isolated from the
-    # healthy-return window. Its source record's artifact bytes do not match its
-    # sidecar sha, so the copy verifier rejects it and the sweep retains the note.
+    # healthy-return window. Its source record's sidecar is unreadable, which
+    # nothing may fabricate over (an operator problem by doctrine — a sha
+    # mismatch no longer qualifies, since reconcile heals those), so the copy
+    # fails and the sweep retains the note.
     hold_pkg = "holdopen"
     hold_file = "holdopen-1.0-py3-none-any.whl"
     hold_akey = f"packages/{hold_pkg}/{hold_file}"
@@ -412,22 +414,8 @@ def test_region_bucket_failover_and_drain_gated_return(
         f"packages/{hold_pkg}/.origin",
         json.dumps({"origin": "private", "nonce": "b" * 32}),
     )
-    minio_put_key_in(
-        minio,
-        a,
-        f"{hold_akey}.meta.json",
-        json.dumps(
-            {
-                "sha256": "0" * 64,
-                "size": 5,
-                "version": "1.0",
-                "upload-time": "2020-01-01T00:00:00Z",
-                "yanked": False,
-                "origin": "private",
-            }
-        ),
-    )
-    minio_put_key_in(minio, a, hold_akey, "bytes")  # sha256("bytes") != "0" * 64
+    minio_put_key_in(minio, a, f"{hold_akey}.meta.json", "not json")
+    minio_put_key_in(minio, a, hold_akey, "bytes")
     minio_put_key_in(minio, a, hold_note, "")
 
     # Recover B. The healthy window elapses and the real note drains — B ends up

@@ -901,8 +901,31 @@ async fn verify_source_record(
         .with_context(|| format!("read source artifact {akey}"))?;
     let got = sha256_hex(&artifact);
     if got != sidecar.sha256 {
+        // A live body whose sidecar names different bytes is a torn record:
+        // the immutable name was freed (a failed publish deletes its own
+        // unacked debris) and re-created while a sidecar fabricated for the
+        // dead bytes survived. The body is the only truth those bytes have —
+        // drop the stale sidecar and signal a rebuild so the tick path
+        // refabricates it from the body; the next reconcile pass copies the
+        // healed record. Re-read before deleting: a real writer may have
+        // already replaced the sidecar since this record was listed.
+        let sckey = sidecar_key(&akey);
+        let still_stale = match src.get_bytes(&sckey).await {
+            Ok(bytes) => serde_json::from_slice::<Sidecar>(&bytes)
+                .map(|current| current.sha256 != got)
+                .unwrap_or(false),
+            Err(_) => false,
+        };
+        if still_stale {
+            src.delete_keys(std::slice::from_ref(&sckey))
+                .await
+                .with_context(|| format!("drop stale sidecar {sckey}"))?;
+            worker::mark_dirty(src, pkg)
+                .await
+                .with_context(|| format!("mark {pkg} dirty after dropping stale sidecar"))?;
+        }
         bail!(
-            "source artifact sha mismatch for {akey}: sidecar {}, bytes {got}",
+            "source artifact sha mismatch for {akey}: sidecar {}, bytes {got}; stale sidecar dropped for rebuild",
             sidecar.sha256
         );
     }
@@ -2934,6 +2957,32 @@ mod tests {
             .head_exists(&crate::origin::origin_key("pkg"))
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn torn_source_record_drops_stale_sidecar_for_rebuild() {
+        let src = Arc::new(InMemStorage::default());
+        let dst = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        // A torn record: a failed publish freed the immutable name after a
+        // sidecar was fabricated for its bytes, and a later upload re-created
+        // the body — live bytes now disagree with the surviving sidecar.
+        seed_live(src.as_ref(), "pkg", filename, b"dead bytes", PRIVATE);
+        let akey = artifact_key("pkg", filename);
+        src.insert(&akey, b"live bytes".to_vec());
+        let state = test_state(src.clone());
+
+        let err = replicate_record(&state, src.as_ref(), dst.as_ref(), "pkg", filename)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("source artifact sha mismatch"));
+        // The stale sidecar is dropped and the package marked dirty, so the
+        // tick path refabricates the sidecar from the live body and the next
+        // reconcile pass copies the healed record.
+        assert!(!src.head_exists(&sidecar_key(&akey)).await.unwrap());
+        assert!(!src.list_page("_dirty/", None, 1).await.unwrap().is_empty());
+        // The live body itself is untouched.
+        assert_eq!(src.get_bytes(&akey).await.unwrap(), b"live bytes");
     }
 
     #[tokio::test]

@@ -260,19 +260,20 @@ def test_ac7_explicit_unreachable_source_refuses_start(pypiron_bin, tmp_path):
     assert "advisory" in (cp.stdout + cp.stderr).lower()
 
 
-def test_ac7_implicit_default_starts_unfed_then_self_arms(tmp_path_factory, pypiron_bin, tmp_path):
+def test_ac7_implicit_default_starts_unfed_then_self_arms(pypiron_bin, tmp_path):
     """The always-on default must never brick a box that never asked: with the OSV
     URL unreachable (a dead forward proxy standing in), the server starts, serves,
     warns that blocking is armed but unfed, and self-arms when a snapshot arrives —
-    no restart."""
+    no restart. Hand-rolled (clean env) so it exercises the true implicit default,
+    independent of the conftest advisory-disable other tests rely on."""
     env = _dead_proxy_env()
-    with advisory_server(tmp_path_factory, pypiron_bin, feed=None, extra_env=env) as server:
-        base = server["base_url"]
-        # It serves despite being unfed.
+    proc, base, log_path = _hand_start(pypiron_bin, tmp_path / "data", [], extra_env=env)
+    try:
+        # It binds immediately (the implicit obtain is non-blocking) and serves.
         code, _, _ = http_get(f"{base}/simple/index.json")
         assert code == 200
-        # The armed-but-unfed warning is emitted.
-        _wait_log_contains(Path(server["log_path"]), "armed but unfed")
+        # The worker's first (background) obtain fails → armed-but-unfed warning.
+        _wait_log_contains(log_path, "armed but unfed")
         # No snapshot yet → the gauge is absent (not a misleading zero).
         code, body, _ = http_get(f"{base}/metrics")
         assert code == 200
@@ -286,28 +287,27 @@ def test_ac7_implicit_default_starts_unfed_then_self_arms(tmp_path_factory, pypi
         assert code == 204
         age = _poll_metric(base, "pypiron_advisory_snapshot_age_seconds")
         assert age is not None, "gauge never appeared after the snapshot was pushed"
+    finally:
+        kill_process_tree(proc)
 
 
-def test_restart_from_stored_snapshot_satisfies_fail_closed(
-    tmp_path_factory, pypiron_bin, tmp_path
-):
+def test_restart_from_stored_snapshot_satisfies_fail_closed(pypiron_bin, tmp_path):
     """After a snapshot has been delivered, an explicit --malware-block restart with
     the source still unreachable starts cleanly from the stored snapshot alone."""
     env = _dead_proxy_env()
     feed_bytes = make_osv_zip(tmp_path / "osv.zip", canonical_records()).read_bytes()
+    data_dir = tmp_path / "data"
 
-    # First boot (unfed default), seed the snapshot via PUT, then stop.
-    with advisory_server(tmp_path_factory, pypiron_bin, feed=None, extra_env=env) as server:
-        data_dir = Path(server["data_dir"])
+    # First boot (implicit default, unfed), seed the snapshot via PUT, then stop.
+    proc, base, _log = _hand_start(pypiron_bin, data_dir, [], extra_env=env)
+    try:
         code, _, _ = http_request_auth(
-            "PUT",
-            f"{server['base_url']}/advisories/feed",
-            username="admin",
-            password="secret",
-            data=feed_bytes,
+            "PUT", f"{base}/advisories/feed", username="admin", password="secret", data=feed_bytes
         )
         assert code == 204
-        assert _poll_metric(server["base_url"], "pypiron_advisory_snapshot_age_seconds") is not None
+        assert _poll_metric(base, "pypiron_advisory_snapshot_age_seconds") is not None
+    finally:
+        kill_process_tree(proc)
 
     # Respawn on the SAME data dir with an explicit demand to block and the source
     # still unreachable: the stored snapshot must satisfy the fail-closed check.
@@ -319,6 +319,16 @@ def test_restart_from_stored_snapshot_satisfies_fail_closed(
         assert age is not None, "restart did not arm blocking from the stored snapshot"
     finally:
         kill_process_tree(proc)
+
+
+def test_default_disk_server_stays_advisory_hermetic(disk_server):
+    """Regression pin for hermeticity: a plain default disk server (advisory
+    disabled in the shared test env) makes no OSV fetch and writes no
+    `_advisories/` snapshot, so the suite never depends on the network."""
+    code, body, _ = http_get(f"{disk_server['base_url']}/metrics")
+    assert code == 200
+    assert _metric_value(body.decode(), "pypiron_advisory_snapshot_age_seconds") is None
+    assert not (Path(disk_server["data_dir"]) / "_advisories").exists()
 
 
 # ------------------------------- test helpers --------------------------------
@@ -356,8 +366,9 @@ def _serve_expect_exit(pypiron_bin, data_dir: Path, extra_args, *, timeout: floa
 def _hand_start(
     pypiron_bin, data_dir: Path, extra_args, *, extra_env=None, boot_timeout: float = 25.0
 ):
-    """Start a server on an existing data dir (restart tests), returning
-    (proc, base_url, log_path)."""
+    """Start a server on `data_dir` with a clean env (the implicit advisory
+    default, no conftest disable), returning (proc, base_url, log_path)."""
+    data_dir.mkdir(parents=True, exist_ok=True)
     port = find_free_port()
     bind = f"127.0.0.1:{port}"
     env = os.environ.copy()

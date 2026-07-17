@@ -1524,15 +1524,14 @@ fn merge_storage_file(
     Ok(())
 }
 
-/// Obtain the startup advisory snapshot for an *enabled* feature. Returns the
-/// snapshot and whether one actually loaded (which arms the staleness gauge).
-/// Bails only when an *explicit* advisory setting cannot produce a snapshot
-/// (AC7) — the always-on defaults warn and continue, so an air-gapped box that
-/// never asked for this is never bricked.
-async fn advisory_obtain(
+/// Synchronously obtain the startup snapshot for an *explicitly* configured
+/// advisory setting. Fail-closed needs the answer before serving, so this blocks
+/// and bails (AC7) when neither the source nor a stored `_advisories/` copy
+/// yields a snapshot. The implicit default never calls this — it binds
+/// immediately and lets the worker obtain in the background.
+async fn advisory_obtain_explicit(
     storage: &dyn Storage,
     feed: Option<&str>,
-    explicit: bool,
 ) -> Result<(advisories::AdvisoryState, bool)> {
     if let Some(url) = feed {
         info!(feed = %url, "advisory feed: polling for the malware block set and org audit");
@@ -1540,19 +1539,12 @@ async fn advisory_obtain(
     if let Some(state) = advisories::obtain_at_startup(storage, feed).await {
         return Ok((state, true));
     }
-    if explicit {
-        anyhow::bail!(
-            "advisory feed is configured but no snapshot could be obtained: the source was \
-             unreachable and no stored _advisories/ snapshot exists. Point --advisory-feed at a \
-             reachable URL or local zip, deliver one with `pypiron sync --advisory-feed`, or set \
-             --advisory-feed \"\" to disable malware blocking."
-        );
-    }
-    warn!(
-        "malware blocking armed but unfed: no advisory snapshot is available yet, so nothing is \
-         blocked. It self-arms the moment a snapshot arrives (a local-path ferry or a sync push)."
+    anyhow::bail!(
+        "advisory feed is configured but no snapshot could be obtained: the source was \
+         unreachable and no stored _advisories/ snapshot exists. Point --advisory-feed at a \
+         reachable URL or local zip, deliver one with `pypiron sync --advisory-feed`, or set \
+         --advisory-feed \"\" to disable malware blocking."
     );
-    Ok((advisories::AdvisoryState::default(), false))
 }
 
 async fn run_serve(
@@ -1767,8 +1759,7 @@ async fn run_serve(
         info!("access log enabled — logging every request decreases throughput ~7-10%");
     }
 
-    // Advisory snapshot: resolve the feed (default OSV URL; `""` disables), then
-    // obtain it synchronously before serving a byte — fail-closed by intent.
+    // Advisory snapshot: resolve the feed (default OSV URL; `""` disables).
     let malware_block_flag = cli.malware_block.unwrap_or(true);
     let advisory_feed = cli
         .advisory_feed
@@ -1781,16 +1772,22 @@ async fn run_serve(
     // Fully off only when the feed is empty AND blocking wasn't explicitly asked
     // for: an empty feed disables the whole feature, blocking included.
     let advisory_off = advisory_feed.is_none() && !(explicit_malware_block && malware_block_flag);
+    let advisory_explicit = explicit_advisory_feed || explicit_malware_block;
     let (advisory_state, advisory_loaded) = if advisory_off {
         (advisories::AdvisoryState::default(), false)
-    } else {
+    } else if advisory_explicit {
+        // Explicit intent is fail-closed: block startup until we have the answer,
+        // and refuse to serve if no snapshot can be obtained (AC7).
         let pinned = buckets.pin();
-        advisory_obtain(
-            pinned.storage.as_ref(),
-            advisory_feed.as_deref(),
-            explicit_advisory_feed || explicit_malware_block,
-        )
-        .await?
+        advisory_obtain_explicit(pinned.storage.as_ref(), advisory_feed.as_deref()).await?
+    } else {
+        // The always-on default must never delay or brick a box that never asked:
+        // bind immediately and let the worker's first (background) tick obtain the
+        // snapshot — it self-arms on success and warns armed-but-unfed otherwise.
+        if let Some(url) = &advisory_feed {
+            info!(feed = %url, "advisory feed: polling for the malware block set and org audit (loading in background)");
+        }
+        (advisories::AdvisoryState::default(), false)
     };
     // Effective blocking is off whenever the feature is off.
     let malware_block = !advisory_off && malware_block_flag;

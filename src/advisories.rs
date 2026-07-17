@@ -481,7 +481,7 @@ impl FeedSource {
                 )
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(guard.clone())))
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(std::time::Duration::from_secs(300))
+                .read_timeout(std::time::Duration::from_secs(60))
                 .build()
                 .context("building advisory feed HTTP client")?;
             Some((client, guard))
@@ -678,6 +678,9 @@ pub struct RefreshMemo {
     http_etag: Option<String>,
     /// Whether the source was failing on the previous tick (warn on transition).
     source_failing: bool,
+    /// Whether we have already warned that blocking is armed but unfed, so the
+    /// "armed but unfed" line is logged once per unfed period, not per tick.
+    unfed_warned: bool,
 }
 
 /// One advisory refresh cycle. The leader half (leader with a source feed)
@@ -744,8 +747,22 @@ pub async fn refresh(
 
     // Arm the gauge only once a snapshot is actually loaded — an armed-but-unfed
     // node has nothing to age.
-    if refreshed_ok && AdvisoryState::read(ctx.slot).db.is_some() {
+    let has_snapshot = AdvisoryState::read(ctx.slot).db.is_some();
+    if refreshed_ok && has_snapshot {
         ctx.metrics.advisory_refresh_ok();
+    }
+
+    // Armed but unfed: the feature is on but no snapshot is available yet. Warn
+    // once (this is where the implicit default lands after its first background
+    // obtain fails), and re-arm the warning if a later loss ever recurs.
+    if !has_snapshot && !memo.unfed_warned {
+        warn!(
+            "malware blocking armed but unfed: no advisory snapshot is available yet, so nothing \
+             is blocked. It self-arms the moment a snapshot arrives (a local-path ferry or a sync push)."
+        );
+        memo.unfed_warned = true;
+    } else if has_snapshot {
+        memo.unfed_warned = false;
     }
 }
 

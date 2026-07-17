@@ -392,6 +392,11 @@ def _start_disk_server(
 
     env = os.environ.copy()
     env.setdefault("RUST_LOG", "info,pypiron=debug")
+    # Advisory blocking is on by default and would fetch the ~30 MB OSV export at
+    # startup — non-hermetic and slow for every test server. Disable it by default;
+    # advisory tests re-enable it explicitly (a --advisory-feed CLI flag overrides
+    # this, and the implicit-default tests hand-roll their own start).
+    env.setdefault("PYPIRON_ADVISORY_FEED", "")
     if extra_env:
         env.update(extra_env)
 

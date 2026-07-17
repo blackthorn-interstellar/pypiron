@@ -107,13 +107,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Origin {
+pub enum Origin {
     Private,
     Mirror,
 }
 
 impl Origin {
-    fn parse(s: &str) -> Option<Origin> {
+    pub fn parse(s: &str) -> Option<Origin> {
         match s {
             PRIVATE => Some(Origin::Private),
             MIRROR => Some(Origin::Mirror),
@@ -125,22 +125,22 @@ impl Origin {
 /// One bucket's view of a single filename in a package: which of its objects
 /// exist, and (if readable) the sidecar that carries sha256/origin/yank state.
 #[derive(Clone, Debug)]
-struct Record {
-    sidecar: Option<Sidecar>,
-    has_artifact: bool,
-    has_metadata: bool,
-    has_provenance: bool,
-    tombstoned: bool,
-    frozen: bool,
-    mirror_quarantined: bool,
+pub struct Record {
+    pub sidecar: Option<Sidecar>,
+    pub has_artifact: bool,
+    pub has_metadata: bool,
+    pub has_provenance: bool,
+    pub tombstoned: bool,
+    pub frozen: bool,
+    pub mirror_quarantined: bool,
     /// Package-level origin, used only as a fallback when a live artifact's
     /// sidecar omits its own `origin` (a legacy/backfilled record).
-    pkg_origin: Option<Origin>,
+    pub pkg_origin: Option<Origin>,
 }
 
 /// The normalized state a [`Record`] resolves to for the merge.
 #[derive(Clone, PartialEq, Eq, Debug)]
-enum RecordState {
+pub enum RecordState {
     Tombstoned,
     Frozen,
     /// Canonical mirror bytes deliberately retained behind a quarantine
@@ -159,7 +159,7 @@ enum RecordState {
 }
 
 impl Record {
-    fn origin(&self) -> Option<Origin> {
+    pub fn origin(&self) -> Option<Origin> {
         self.sidecar
             .as_ref()
             .and_then(|s| s.origin.as_deref())
@@ -167,7 +167,7 @@ impl Record {
             .or(self.pkg_origin)
     }
 
-    fn state(&self) -> RecordState {
+    pub fn state(&self) -> RecordState {
         if self.tombstoned {
             return RecordState::Tombstoned;
         }
@@ -199,7 +199,7 @@ impl Record {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Side {
+pub enum Side {
     A,
     B,
 }
@@ -208,7 +208,7 @@ enum Side {
 /// `decide(b, a)` name the same physical outcome (with the side swapped), so a
 /// bidirectional diff cannot double-apply.
 #[derive(Clone, PartialEq, Eq, Debug)]
-enum Verdict {
+pub enum Verdict {
     Noop,
     /// The `Side`'s live private record is copied to the other (absent) side.
     Copy(Side),
@@ -235,15 +235,27 @@ enum Verdict {
 
 /// The core merge decision (dev/MULTIBUCKET.md §6). No I/O, no clocks; every
 /// input is bucket state. Unit-tested exhaustively below.
-fn decide(a: &Record, b: &Record) -> Verdict {
-    // Tombstone ≻ everything. Converged (both tombstoned, no live body) is a
-    // no-op so a settled delete never re-fires each diff.
+/// A tombstoned record with nothing left to clean: no body, no sidecar, no
+/// companions. Only this settles a delete — a sidecar or companion orphaned
+/// beside its tombstone (a delete that crashed between removing the artifact
+/// and removing its companions) must keep re-firing until dropped, or the
+/// debris survives every future diff.
+fn settled_delete(record: &Record) -> bool {
+    !record.has_artifact
+        && record.sidecar.is_none()
+        && !record.has_metadata
+        && !record.has_provenance
+}
+
+pub fn decide(a: &Record, b: &Record) -> Verdict {
+    // Tombstone ≻ everything. Converged (both tombstoned, nothing left to
+    // clean) is a no-op so a settled delete never re-fires each diff.
     if a.tombstoned || b.tombstoned {
         if a.tombstoned
             && b.tombstoned
             && a.frozen == b.frozen
-            && !a.has_artifact
-            && !b.has_artifact
+            && settled_delete(a)
+            && settled_delete(b)
         {
             return Verdict::Noop;
         }
@@ -319,7 +331,7 @@ fn decide(a: &Record, b: &Record) -> Verdict {
     }
 }
 
-fn conflict_winner(a: &Record, b: &Record) -> Option<Side> {
+pub fn conflict_winner(a: &Record, b: &Record) -> Option<Side> {
     let ta = a.sidecar.as_ref()?.upload_epoch_ms?;
     let tb = b.sidecar.as_ref()?.upload_epoch_ms?;
     if ta.abs_diff(tb) <= CONFLICT_SKEW_MS {
@@ -330,7 +342,7 @@ fn conflict_winner(a: &Record, b: &Record) -> Option<Side> {
 
 /// Both sides hold the same bytes. Origin precedence (private ≻ mirror) first,
 /// then the yank merge (§6.5). Adopt the winner's sidecar wholesale.
-fn same_bytes(a: &Record, b: &Record, oa: Origin, ob: Origin) -> Verdict {
+pub fn same_bytes(a: &Record, b: &Record, oa: Origin, ob: Origin) -> Verdict {
     match (oa, ob) {
         (Origin::Private, Origin::Mirror) => return Verdict::AdoptSidecar(Side::A),
         (Origin::Mirror, Origin::Private) => return Verdict::AdoptSidecar(Side::B),
@@ -351,13 +363,13 @@ fn same_bytes(a: &Record, b: &Record, oa: Origin, ob: Origin) -> Verdict {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MergeChoice {
+pub enum MergeChoice {
     A,
     B,
     Equal,
 }
 
-fn is_yanked(sc: &Sidecar) -> bool {
+pub fn is_yanked(sc: &Sidecar) -> bool {
     !matches!(sc.yanked.normalized(), Yanked::Flag(false))
 }
 
@@ -365,7 +377,7 @@ fn is_yanked(sc: &Sidecar) -> bool {
 /// conflicting state resolves to yanked (fail-closed); a residual tie (both
 /// yanked, different reasons) breaks on the lexicographically smaller sidecar
 /// sha256. Never a wall clock — two buckets have two clocks.
-fn yank_merge(a: &Sidecar, b: &Sidecar) -> MergeChoice {
+pub fn yank_merge(a: &Sidecar, b: &Sidecar) -> MergeChoice {
     if a.yank_epoch > b.yank_epoch {
         return MergeChoice::A;
     }
@@ -466,7 +478,7 @@ async fn record_from_names(
 
 /// Build a [`Record`] with its own listing + origin read (the single-file eager
 /// / marker-sweep path).
-async fn read_record(storage: &dyn Storage, pkg: &str, filename: &str) -> Result<Record> {
+pub async fn read_record(storage: &dyn Storage, pkg: &str, filename: &str) -> Result<Record> {
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
     let entries = storage.list_dir_entries(&prefix).await?;
     let names: HashSet<String> = entries
@@ -484,7 +496,7 @@ async fn read_record(storage: &dyn Storage, pkg: &str, filename: &str) -> Result
 /// Apply the merge decision for one filename. `a`/`b` are the two storage
 /// handles the records were read against; the executor writes to whichever the
 /// verdict names and marks that bucket dirty so its own leader rebuilds it.
-async fn execute(
+pub async fn execute(
     state: &AppState,
     stores: (&dyn Storage, &dyn Storage),
     pkg: &str,
@@ -495,13 +507,62 @@ async fn execute(
     require_replication_unfenced(state)?;
     let (a, b) = stores;
     let (ra, rb) = recs;
+    // Bracket every truth-mutating verdict in the same intent/commit marker
+    // pair the write path uses, on both buckets. A bare post-mutation
+    // mark_dirty is not crash-safe: an executor that dies between mutating a
+    // bucket and signaling it leaves changed truth with no rebuild signal and
+    // (when the copy itself completed) no repair note either — the view then
+    // stays stale until that bucket's next audit. The intent lands before the
+    // first mutation, so a crash anywhere leaves a marker that goes stale and
+    // heals; the commit pairs it on success for an immediate rebuild.
+    // Only the sides a verdict can mutate get the bracket — the pre-ack
+    // fan-out runs the Copy path on every multi-bucket upload, and a pair of
+    // no-op markers on the untouched source would be pure ack-latency.
+    let (bracket_a, bracket_b) = match &verdict {
+        Verdict::Noop => (false, false),
+        Verdict::Copy(side) | Verdict::Supersede(side) | Verdict::QuarantineLoser(side) => {
+            match side {
+                Side::A => (false, true), // the named side is the source
+                Side::B => (true, false),
+            }
+        }
+        Verdict::PropagateFreeze(side) => match side {
+            Side::A => (false, true), // the named side already carries the marker
+            Side::B => (true, false),
+        },
+        Verdict::AdoptSidecar(_) | Verdict::Freeze | Verdict::FinishFreeze | Verdict::Tombstone => {
+            (true, true)
+        }
+    };
+    let intent_a = if bracket_a {
+        Some(worker::mark_intent(a, pkg).await?)
+    } else {
+        None
+    };
+    let intent_b = if bracket_b {
+        match worker::mark_intent(b, pkg).await {
+            Ok(nonce) => Some(nonce),
+            Err(error) => {
+                // Pair the first intent before propagating: a mere storage
+                // error on the second bucket must not leave a fresh unpaired
+                // intent deferring the package for the whole grace period.
+                if let Some(nonce) = &intent_a {
+                    let _ = worker::mark_commit(a, pkg, nonce).await;
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let pick = |side: Side| -> (&dyn Storage, &dyn Storage, &Record) {
         match side {
             Side::A => (a, b, ra),
             Side::B => (b, a, rb),
         }
     };
-    match verdict {
+    let result = async {
+        match verdict {
         Verdict::Noop => {
             let (dirty_a, dirty_b) =
                 repair_same_sha_companions((a, b), pkg, filename, (ra, rb)).await?;
@@ -611,8 +672,21 @@ async fn execute(
                 worker::mark_dirty(b, pkg).await?;
             }
         }
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    // Pair the intents even on error: the mutation may be partial, and an
+    // immediate rebuild-from-truth converges the views either way. A commit
+    // that fails to write leaves its intent to go stale and heal — the signal
+    // is never lost, only delayed by the grace period.
+    if let Some(nonce) = intent_a {
+        let _ = worker::mark_commit(a, pkg, &nonce).await;
+    }
+    if let Some(nonce) = intent_b {
+        let _ = worker::mark_commit(b, pkg, &nonce).await;
+    }
+    result
 }
 
 /// Conditionally converge an immutable artifact's sidecar. Returns which side
@@ -1358,10 +1432,20 @@ async fn freeze_copy_race(
         sha_b = %destination_sha,
         "byte conflict raced replication publish — frozen on both buckets"
     );
-    freeze_side(src, pkg, filename).await?;
-    freeze_side(dst, pkg, filename).await?;
-    worker::mark_dirty(src, pkg).await?;
-    worker::mark_dirty(dst, pkg).await?;
+    // The caller's bracket covers only the destination; this rare race arm
+    // also mutates the SOURCE, so it carries its own intent/commit pair —
+    // a crash mid-freeze must not leave changed source truth with no rebuild
+    // signal (the same reasoning as execute's bracketing).
+    let src_intent = worker::mark_intent(src, pkg).await?;
+    let result = async {
+        freeze_side(src, pkg, filename).await?;
+        freeze_side(dst, pkg, filename).await?;
+        worker::mark_dirty(dst, pkg).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let _ = worker::mark_commit(src, pkg, &src_intent).await;
+    result?;
     state
         .metrics
         .replication_freezes
@@ -1377,7 +1461,28 @@ async fn tombstone_side(storage: &dyn Storage, pkg: &str, filename: &str) -> Res
     let already = storage.head_exists(&tombstone_key(&akey)).await?;
     let had_body = storage.head_exists(&akey).await?;
     if already && !had_body {
-        return Ok(false);
+        // The body is gone, but a delete that crashed between its artifact
+        // removal and its companion removals leaves a sidecar/companion
+        // orphaned beside the tombstone. Finish the job — otherwise `decide`
+        // re-fires Tombstone on every diff and this early return would starve
+        // the cleanup forever. Report change only when debris existed.
+        let (sidecar_left, metadata_left, provenance_left) = futures::future::try_join3(
+            storage.head_exists(&sidecar_key(&akey)),
+            storage.head_exists(&metadata_key(&akey)),
+            storage.head_exists(&provenance_key(&akey)),
+        )
+        .await?;
+        if !sidecar_left && !metadata_left && !provenance_left {
+            return Ok(false);
+        }
+        storage
+            .delete_keys(&[
+                sidecar_key(&akey),
+                metadata_key(&akey),
+                provenance_key(&akey),
+            ])
+            .await?;
+        return Ok(true);
     }
     tombstone::write(storage, &akey, filename).await?;
     drop_record_objects(storage, pkg, filename).await?;
@@ -1796,7 +1901,9 @@ async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<Hash
         let page_len = page.len();
         after = page.last().map(|meta| meta.key.clone());
 
-        let mut by_destination: HashMap<usize, Vec<ReplMarker>> = HashMap::new();
+        // BTreeMap: destinations drain in index order, deterministically.
+        let mut by_destination: std::collections::BTreeMap<usize, Vec<ReplMarker>> =
+            std::collections::BTreeMap::new();
         for meta in &page {
             let Some(marker) = parse_marker(&meta.key) else {
                 continue;
@@ -1837,6 +1944,21 @@ async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<Hash
                                 };
                                 match result {
                                     Ok(()) => {
+                                        // The note's existence proves a fan-out went wrong
+                                        // mid-flight, and the destination's "rebuild your
+                                        // view" dirty marker may have been the write that
+                                        // failed. The record may since have converged (this
+                                        // retry decides Noop), so re-signal unconditionally:
+                                        // one idempotent rebuild is cheap, a warm bucket
+                                        // holding live truth with no view is not. The note
+                                        // is only consumed once the signal is durable.
+                                        if let Err(e) =
+                                            worker::mark_dirty(dst.storage.as_ref(), &marker.pkg)
+                                                .await
+                                        {
+                                            warn!(dest=%dst.name, package=%marker.pkg, filename=%marker.filename, error=?e, "replication succeeded but destination rebuild signal failed; marker retained");
+                                            return true;
+                                        }
                                         if let Err(e) = src.delete_keys(&[marker.key]).await {
                                             warn!(dest=%dst.name, package=%marker.pkg, filename=%marker.filename, error=?e, "replication succeeded but marker could not be consumed");
                                             return true;
@@ -2117,8 +2239,14 @@ async fn converge_package(
 
     let mut converged = false;
     for _ in 0..3 {
-        let mut filenames = candidate_filenames(&a_names);
-        filenames.extend(candidate_filenames(&b_names));
+        let mut filenames: Vec<String> = candidate_filenames(&a_names)
+            .union(&candidate_filenames(&b_names))
+            .cloned()
+            .collect();
+        // Deterministic verdict order (the set iterates in RandomState order);
+        // each verdict is independent, but seeded-simulator replays and log
+        // forensics both want one canonical order.
+        filenames.sort();
         let mut retry_after_late_mirror = false;
         for filename in filenames {
             let ra = record_from_names(a, pkg, &filename, &a_names, a_origin).await?;

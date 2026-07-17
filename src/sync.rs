@@ -592,7 +592,7 @@ struct Resolved {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct ResolvedMirror {
+pub struct ResolvedMirror {
     /// The package include scope (the mirror's name axis). Empty means "no name
     /// restriction": `sync` rejects that (it needs an explicit work list), but
     /// the `serve` proxy treats it as "serve any non-private name", preserving

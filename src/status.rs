@@ -78,7 +78,7 @@ struct StoredProjectStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum StatusOrigin {
+pub enum StatusOrigin {
     Private,
     Mirror,
 }

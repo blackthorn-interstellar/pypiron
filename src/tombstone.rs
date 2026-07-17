@@ -61,9 +61,11 @@ pub async fn complete_interrupted_deletes(
         if storage.head_exists(&frozen_key(&akey)).await? {
             continue;
         }
-        if !storage.head_exists(&akey).await? {
-            continue;
-        }
+        // The caller flags filenames whose listing shows record objects left
+        // beside a bare tombstone — a live body (crash before the artifact
+        // delete) or an orphaned sidecar/companion (crash between the artifact
+        // delete and the companion deletes). Either way the tombstone
+        // authorizes dropping whatever remains.
         storage
             .delete_keys(&[
                 akey.clone(),

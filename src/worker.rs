@@ -68,6 +68,9 @@ const COMMIT_SUFFIX: &str = ".commit";
 /// the same correctness-critical marker identity. Shared with the replicator's
 /// `_repl/` markers (src/replicate.rs), which reuse the idiom.
 pub(crate) fn marker_nonce() -> String {
+    if let Some(n) = crate::clock::sim_nonce() {
+        return n;
+    }
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -132,23 +135,23 @@ pub async fn mark_dirty(storage: &dyn Storage, pkg: &str) -> Result<()> {
 }
 
 /// One parsed `_dirty/` entry.
-struct Marker {
-    key: String,
-    nonce: Option<String>,
-    is_commit: bool,
+pub struct Marker {
+    pub key: String,
+    pub nonce: Option<String>,
+    pub is_commit: bool,
     /// Storage last-modified — staleness comes from the storage clock.
-    written_at: Option<time::OffsetDateTime>,
+    pub written_at: Option<time::OffsetDateTime>,
 }
 
-struct DirtyWork {
-    package: String,
-    keys: Vec<String>,
-    stale_intents: u64,
+pub struct DirtyWork {
+    pub package: String,
+    pub keys: Vec<String>,
+    pub stale_intents: u64,
 }
 
 /// Split a marker key into (package, marker). Legacy `_dirty/<pkg>` keys
 /// parse as nonce-less commits.
-fn parse_marker(entry: &FileEntry) -> Option<(String, Marker)> {
+pub fn parse_marker(entry: &FileEntry) -> Option<(String, Marker)> {
     let rest = entry.key.strip_prefix(DIRTY_PREFIX)?;
     let written_at = entry.last_modified.as_deref().and_then(|ts| {
         time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339).ok()
@@ -188,7 +191,7 @@ fn parse_marker(entry: &FileEntry) -> Option<(String, Marker)> {
 /// transaction-log rule: any fresh unpaired intent defers the whole package;
 /// otherwise commits and paired intents are ready immediately, while stale
 /// unpaired intents heal a crashed writer.
-fn consumable_dirty_work(
+pub fn consumable_dirty_work(
     entries: &[FileEntry],
     now: time::OffsetDateTime,
     intent_grace: time::Duration,
@@ -237,6 +240,11 @@ fn consumable_dirty_work(
             stale_intents,
         });
     }
+    // Deterministic work order: the per-package grouping above iterates a
+    // HashMap, whose order varies per process. Sorting costs nothing at these
+    // sizes and makes tick behavior a pure function of the listing — which
+    // the deterministic simulator (dev/MOONSHOT.md rung 1) replays by seed.
+    work.sort_by(|a, b| a.package.cmp(&b.package));
     work
 }
 
@@ -612,7 +620,7 @@ pub(crate) async fn stale_unpaired_intents_ignoring(
                 .map(str::to_string)
         })
         .collect();
-    let now = time::OffsetDateTime::now_utc();
+    let now = crate::clock::now_utc();
     let mut stale = Vec::new();
     for entry in &entries {
         let Some(nonce) = entry
@@ -1260,12 +1268,6 @@ async fn audit_shard(
         let mut versions: HashSet<String> = HashSet::new();
         let mut file_count = 0u32;
         let mut pkg_bytes = 0u64;
-        // A live artifact body sitting beside its own `.tombstone` is a delete
-        // that crashed between the tombstone write and the body removal: the
-        // index hides it, but the bytes stay downloadable by direct URL. Detect
-        // it here from the listing already in hand (zero extra reads — the
-        // single-bucket audit stays free) and finish the delete below.
-        let mut interrupted_deletes: Vec<String> = Vec::new();
         for obj in &t {
             if let Some(filename) = obj.key.strip_prefix(&prefix) {
                 if is_artifact(filename) {
@@ -1274,17 +1276,38 @@ async fn audit_shard(
                     if let Some(version) = infer_version_from_filename(filename) {
                         versions.insert(version);
                     }
-                    // A `.frozen` artifact deliberately retains its canonical
-                    // body beside a tombstone as evidence; only a bare tombstone
-                    // (no freeze) beside a live body is a crashed delete.
-                    if members.contains(format!("{filename}{TOMBSTONE_SUFFIX}").as_str())
-                        && !members.contains(format!("{filename}{FROZEN_SUFFIX}").as_str())
-                    {
-                        interrupted_deletes.push(filename.to_string());
-                    }
                 }
             }
         }
+        // Any record object sitting beside its own bare `.tombstone` is a
+        // delete that crashed mid-removal: a live body (crash before the
+        // artifact delete — the bytes stay downloadable by direct URL) or an
+        // orphaned sidecar/companion (crash between the artifact delete and
+        // the companion deletes — permanent debris the merge would otherwise
+        // re-visit forever). A `.frozen` marker deliberately retains its
+        // record as evidence and is skipped. Detected from the listing
+        // already in hand, so the single-bucket audit stays free.
+        let mut interrupted_deletes: Vec<String> = Vec::new();
+        for member in &members {
+            let Some(filename) = member.strip_suffix(TOMBSTONE_SUFFIX) else {
+                continue;
+            };
+            if members.contains(format!("{filename}{FROZEN_SUFFIX}").as_str()) {
+                continue;
+            }
+            let remnants = [
+                filename.to_string(),
+                format!("{filename}{SIDECAR_SUFFIX}"),
+                format!("{filename}{METADATA_SUFFIX}"),
+                format!("{filename}{PROVENANCE_SUFFIX}"),
+            ];
+            if remnants.iter().any(|key| members.contains(key.as_str())) {
+                interrupted_deletes.push(filename.to_string());
+            }
+        }
+        // `members` is a HashSet: sort so the repair order (and therefore the
+        // storage-op order a deterministic simulation replays) is stable.
+        interrupted_deletes.sort();
         if file_count > 0 {
             out.pkg_stats.push((
                 pkg.clone(),
@@ -1481,7 +1504,7 @@ async fn package_fingerprint(storage: &dyn Storage, pkg: &str) -> Result<String>
     ))
 }
 
-async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Result<()> {
+pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Result<()> {
     // The caller passes the exact pin whose bucket-local lease authorized this
     // tick. Selection may change concurrently, but this operation stays on that
     // handle; the per-package rebuilds spawn with an owned clone of it.
@@ -1491,11 +1514,7 @@ async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Result<
         return Ok(());
     }
 
-    let work = consumable_dirty_work(
-        &entries,
-        time::OffsetDateTime::now_utc(),
-        state.intent_grace,
-    );
+    let work = consumable_dirty_work(&entries, crate::clock::now_utc(), state.intent_grace);
     if work.is_empty() {
         return Ok(());
     }
@@ -1743,7 +1762,7 @@ impl PkgStat {
 /// `_state/inventory.json`. `ready` gates publishing until the first audit has
 /// established the full baseline; `dirty` marks an unpublished change.
 #[derive(Default)]
-pub(crate) struct InventoryMap {
+pub struct InventoryMap {
     pkgs: std::collections::HashMap<String, PkgStat>,
     ready: bool,
     dirty: bool,
@@ -1782,7 +1801,7 @@ impl InventoryMap {
 /// the materialized JSON it was loaded from (None on backends without ETags).
 /// At 780k names a membership check against storage costs a 45 MB GET +
 /// parse; against this it costs a hash lookup.
-pub(crate) struct GlobalNames {
+pub struct GlobalNames {
     etag: Option<String>,
     names: HashSet<String>,
 }
@@ -1843,6 +1862,28 @@ async fn update_global_index(
             changed |= cached.names.remove(pkg);
         }
         if !changed {
+            // The delta landed entirely inside the cached set. On a backend
+            // with peer writers that is NOT yet proof of a no-op: a peer may
+            // have changed the stored set since this cache was pinned (add a
+            // name this node never saw, so this node's remove of it dedups
+            // against thin air — leaving a dead package listed globally until
+            // the audit, a divergence the deterministic simulator caught).
+            // One bounded LIST validates currency; a moved ETag reloads and
+            // reapplies. Single-writer backends (disk) skip the probe — no
+            // peers, and their listing/CAS etags live in different spaces.
+            if storage.supports_leases() {
+                let key = format!("{SIMPLE_PREFIX}index.json");
+                let current = storage
+                    .list_page(&key, None, 1)
+                    .await?
+                    .into_iter()
+                    .find(|meta| meta.key == key)
+                    .map(|meta| meta.etag);
+                if current != cached.etag {
+                    *guard = None;
+                    continue;
+                }
+            }
             if wrote_optimistic_html {
                 let mut packages: Vec<String> = cached.names.iter().cloned().collect();
                 packages.sort();
@@ -1904,11 +1945,7 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
     if entries.is_empty() {
         return Ok(());
     }
-    let work = consumable_dirty_work(
-        &entries,
-        time::OffsetDateTime::now_utc(),
-        state.intent_grace,
-    );
+    let work = consumable_dirty_work(&entries, crate::clock::now_utc(), state.intent_grace);
     let mut adds = Vec::new();
     let mut removes = Vec::new();
     let mut consumed = Vec::new();

@@ -81,6 +81,16 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Unit tests
         run: cargo test --workspace --all-features --locked
+      # A taste of the nightly deterministic simulation (dev/MOONSHOT.md rung 1)
+      # as a merge gate: a couple dozen seeded multi-node fault schedules, each
+      # exactly reproducible from its printed seed. The volume runs nightly in
+      # simulation.yml.
+      - name: VOPR smoke
+        run: |
+          cargo run --example vopr -- --seeds 20 --nodes 2 --buckets 2 --ops 80
+          # Crash-only mode: no injected storage failures, so the marker
+          # protocol must converge with zero audit repairs — a hard invariant.
+          cargo run --example vopr -- --seeds 20 --nodes 3 --buckets 2 --ops 80 --fail-percent 0
 
   integration:
     # The product's center of gravity is the blackbox suite (dev/TESTING.md): the

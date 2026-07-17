@@ -1,7 +1,8 @@
 # Moonshot: the package server that can't lie
 
-Author: Claude Fable 5, 2026-07-08. Status: proposal — nothing here is committed
-roadmap until it survives the same scrutiny as everything else in dev/.
+Author: Claude Fable 5, 2026-07-08. Status: rungs 1 and 2 shipped 2026-07-17
+(see the per-rung notes below); rung 3 remains a proposal pending its design
+decision against DESIGN.md.
 
 ## The frame
 
@@ -35,6 +36,14 @@ single-threaded simulator with a seeded RNG.
   forcing function that improves the code even if the simulator never ships.
 - **Exit criterion:** a nightly `vopr` job whose seed count and
   interleavings-explored counter are published like the fuzz corpus is.
+- **Shipped 2026-07-17:** `examples/vopr.rs` over the seams carved for it —
+  `src/clock.rs` (simulated wall clock + deterministic nonces), `src/sim.rs`
+  (virtually-clocked in-memory storage with object-store CAS semantics), the
+  publish/delete/yank protocol cores extracted from the HTTP handlers, and
+  deterministic work ordering in the worker and reconciler. Smoke on every PR
+  (ci.yml), volume nightly with published counters
+  (.github/workflows/simulation.yml). Details: dev/TESTING.md
+  §"Deterministic simulation (the VOPR)".
 
 ## Rung 2 — A machine-checked convergence proof
 
@@ -57,6 +66,16 @@ logic is already close to extractable; the spike below finds out.
   interleavings up to depth N — here is the model."
 - **Exit criterion:** stateright model checked in CI; a conformance suite
   binding model transitions to `src/` behavior; one README sentence.
+- **Shipped 2026-07-17:** two models in `tests/model_event_protocol.rs` and
+  `tests/model_replication.rs`, transitions bound to the real
+  `consumable_dirty_work` and `decide`; conformance suites
+  (`tests/conformance_tick.rs`, `conformance_execute_matches_model`) drive the
+  real `tick`/`execute` against in-memory buckets and require the model's
+  predictions exactly. Bounded configs gate every merge via `cargo test`; deep
+  configs run nightly. The spike's verdict on the protocol: clean — the merge
+  algebra and marker selection were already pure functions, which is why the
+  models could bind to them directly. README sentence: §"Tested like your
+  supply chain depends on it".
 
 ## Rung 3 — Tamper-evidence, not tamper-resistance
 

@@ -53,6 +53,8 @@ assumptions about clients instead of the clients.
 | Layer | What | How it runs |
 |---|---|---|
 | Rust unit | Pure functions: rendering, parsing, normalization | `cargo test`, fast, no I/O |
+| Model checking | Every interleaving of the event protocol + replication merge, bounded | `cargo test` (`tests/model_*.rs`), deep configs nightly |
+| Deterministic simulation | Seeded multi-node fault schedules against the real code | `cargo run --example vopr`, smoke on PR, volume nightly |
 | Blackbox integration | Real binary + real clients + real packages, disk / S3 / Azure | pytest, `integration` marker |
 | Standards conformance | PEP 503/629/691/700 behavior asserted over HTTP | pytest, part of integration |
 | Performance | Hot read endpoints under load, release binary | pytest, `perf` marker, opt-in |
@@ -104,6 +106,63 @@ faults into the real binary and assert the tree is never left corrupt.
   proof that an interrupted write can't split-brain the shared truth.
 
 Both run in Docker and skip cleanly without it, like the rest of the S3 suite.
+
+## Machine-checked models (stateright)
+
+The chaos suites *sample* failure schedules; the models in `tests/model_*.rs`
+*enumerate* them (dev/MOONSHOT.md rung 2). Two stateright models cover the two
+protocols everything else rests on:
+
+- **Event protocol** (`tests/model_event_protocol.rs`): writers running the
+  intent/commit marker dance, workers running list → rebuild → global-index CAS
+  → delete-observed-markers, crashes between any two steps, and clock advances
+  past the intent grace. Checked invariants: an acknowledged upload is durable
+  and eventually visible; at quiescence every view equals a fresh derivation
+  from truth; a tombstoned file never resurrects.
+- **Replication merge** (`tests/model_replication.rs`): two buckets, partition-
+  shaped double publishes, mirror-vs-private races, yanks, deletes, interrupted
+  freezes. Checked invariants: buckets converge at merge fixpoint; acknowledged
+  bytes are never silently lost (conflict losers land in quarantine, only an
+  authorized delete destroys); deletes settle dead everywhere.
+
+The models don't get to invent the semantics they check: transitions call the
+real `worker::consumable_dirty_work` and `replicate::decide`, and two
+conformance suites keep the rest honest — `tests/conformance_tick.rs` drives
+the real `worker::tick` against marker fixtures and asserts it consumes exactly
+what the selection rule licenses, and `conformance_execute_matches_model`
+(in `tests/model_replication.rs`) enumerates record pairs, runs the real
+`replicate::execute` on in-memory buckets, and requires the model executor to
+predict the resulting state exactly. Code and model can only drift into a
+failing test.
+
+Bounded configurations run in `cargo test` (seconds); the deep configurations
+run nightly (`.github/workflows/simulation.yml`) with their state counts
+published in the job summary.
+
+## Deterministic simulation (the VOPR)
+
+`examples/vopr.rs` (dev/MOONSHOT.md rung 1, the FoundationDB/TigerBeetle
+technique): an entire multi-node fleet — nodes, buckets, writers, the worker,
+replication fan-out, sweep, and tree diff — runs single-threaded on a paused
+tokio runtime. Wall-clock reads route through `src/clock.rs`'s simulated
+override, storage goes through `sim::SimStorage` behind per-node fault views,
+and every scheduling choice derives from one 8-byte seed: injected latencies,
+storage failures, node crashes at storage-op boundaries (power cut between two
+ops — the task is parked and aborted, in-memory state dies, storage survives),
+cold restarts, and clock jumps past the intent grace.
+
+After the chaos phase the harness heals the fleet, drains it to quiescence,
+and asserts: every acknowledged upload is durable, listed, and byte-correct on
+every bucket; views equal a fresh derivation from truth; buckets converge; no
+`_dirty/` or `_repl/` debris remains; and acknowledged bytes are never lost
+without an authorized delete or freeze. Determinism itself is verified, not
+assumed: recurring seeds run twice and must produce identical storage-op trace
+hashes — so any failure reproduces exactly with
+`cargo run --example vopr -- --seed N`.
+
+A 20-seed smoke runs on every PR (ci.yml); thousands of fresh seeds run
+nightly with counters published in the job summary
+(`.github/workflows/simulation.yml`).
 
 ## Real cloud backends
 
@@ -172,9 +231,9 @@ execution, working `-s`, and pdb.
 
 | When | What |
 |---|---|
-| Every PR (CI) | fmt, clippy `-D warnings`, Rust unit, blackbox on disk + S3 (MinIO) + Azure (Azurite), `cargo-audit`, fuzz-target build smoke |
+| Every PR (CI) | fmt, clippy `-D warnings`, Rust unit, model checking (bounded configs) + conformance suites, VOPR smoke (fault + crash-only profiles), blackbox on disk + S3 (MinIO) + Azure (Azurite), `cargo-audit`, fuzz-target build smoke |
 | Push to `master` (CI) | all of the above, plus the real-GCS blackbox (when the bucket secret is configured) |
-| Nightly | coverage-guided fuzzing, all six targets |
+| Nightly | coverage-guided fuzzing (all six targets); deterministic simulation at volume + deep model configs (simulation.yml, counters published per run) |
 | Weekly | client compat matrix, full-PyPI corpus check, unit-test coverage, real-S3 blackbox (when the bucket secret is configured) |
 | Local / opt-in | `perf` and `stress` (release binary, excluded from default runs) |
 

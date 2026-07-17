@@ -45,6 +45,16 @@ pulldown-cmark = { version = "0.13.4", default-features = false }
 # old to accept the `-Wno-error=date-time` flag libmimalloc-sys passes, so the C
 # build fails there. Those two are niche (the system allocator is fine); the common
 # cloud arches (x86_64/aarch64) keep the win. main.rs gates the allocator to match.
+[dev-dependencies]
+# Rung 2 of dev/MOONSHOT.md: the stateright model checker exhaustively verifies
+# the event protocol and the multi-bucket merge over all bounded interleavings
+# (tests/model_*.rs). Dev-only: never linked into the shipped binary.
+stateright = "0.31"
+# The deterministic simulator (examples/vopr.rs) runs the fleet on a paused
+# virtual-time runtime; `start_paused` lives behind tokio's test-util feature.
+# Feature unification scopes this to test/example builds only.
+tokio = { version = "1", features = ["test-util"] }
+
 [target.'cfg(not(any(target_arch = "s390x", target_arch = "powerpc64")))'.dependencies]
 mimalloc = "0.1.52"
 

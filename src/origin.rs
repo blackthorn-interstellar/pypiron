@@ -121,6 +121,9 @@ struct ClaimBody {
 /// `RandomState` carries fresh process randomness; the clock/counter inputs also
 /// make successive calls distinct even on platforms with coarse clocks.
 fn fresh_nonce() -> String {
+    if let Some(n) = crate::clock::sim_nonce() {
+        return n;
+    }
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);

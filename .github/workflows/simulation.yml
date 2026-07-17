@@ -1,0 +1,91 @@
+name: Simulation
+
+# Deterministic simulation testing (dev/MOONSHOT.md rung 1) plus the deep
+# stateright model configurations (rung 2). The merge gate runs a small VOPR
+# smoke and the bounded model checks inside `cargo test`; this nightly job is
+# where the real interleaving volume happens — simulated time costs nothing,
+# so thousands of seeded fault schedules run per night. Every failure names
+# the 8-byte seed that reproduces it exactly.
+on:
+  schedule:
+    - cron: '30 3 * * *' # nightly, 03:30 UTC (fuzz runs at 03:00)
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: 'Seeds per profile'
+        default: '50000'
+
+env:
+  CARGO_TERM_COLOR: always
+  SEEDS: ${{ github.event.inputs.seeds || '50000' }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vopr:
+    name: vopr (${{ matrix.profile.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          # Fault profiles inject storage failures; the audit is a documented
+          # safety net there, and its repair count is published below. The
+          # crash-only profiles permit ZERO audit repairs: markers alone must
+          # converge every crash schedule.
+          - { name: single-bucket, nodes: 2, buckets: 1, ops: 160, extra: '' }
+          - { name: multi-bucket, nodes: 3, buckets: 2, ops: 160, extra: '' }
+          - { name: single-bucket-crash-only, nodes: 3, buckets: 1, ops: 160, extra: '--fail-percent 0' }
+          - { name: multi-bucket-crash-only, nodes: 3, buckets: 2, ops: 160, extra: '--fail-percent 0' }
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Seeds rotate nightly (day number scales the start), so every night
+      # explores fresh schedules while any night's failure still reproduces
+      # from its printed seed.
+      - name: Run seeded simulation
+        run: |
+          START=$(( ( $(date +%s) / 86400 ) * ${SEEDS} ))
+          cargo run --release --example vopr -- \
+            --seeds "${SEEDS}" --start-seed "${START}" \
+            --nodes ${{ matrix.profile.nodes }} \
+            --buckets ${{ matrix.profile.buckets }} \
+            --ops ${{ matrix.profile.ops }} ${{ matrix.profile.extra }} | tee vopr.out
+      - name: Publish counters
+        if: always()
+        run: |
+          echo '### VOPR — ${{ matrix.profile.name }}' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -20 vopr.out >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  model-deep:
+    name: stateright (deep configurations)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Exhaustively check the deep model configurations
+        run: |
+          cargo test --release --test model_replication --test model_event_protocol \
+            -- --ignored --nocapture 2>&1 | tee model.out
+      - name: Publish state counts
+        if: always()
+        run: |
+          echo '### Stateright — deep configurations' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E "unique states|test result" model.out >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

@@ -62,7 +62,7 @@ impl LeaseManager {
     }
 
     async fn try_hold(&self) -> anyhow::Result<bool> {
-        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let now = crate::clock::now_utc().unix_timestamp();
         let storage = self.storage.as_ref();
 
         let Some((bytes, etag)) = storage.get_with_etag(LEASE_KEY).await? else {

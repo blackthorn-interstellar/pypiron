@@ -1,8 +1,9 @@
 # Moonshot: the package server that can't lie
 
 Author: Claude Fable 5, 2026-07-08. Status: rungs 1 and 2 shipped 2026-07-17
-(see the per-rung notes below); rung 3 remains a proposal pending its design
-decision against DESIGN.md.
+(see the per-rung notes below); rung 3's design decision was made 2026-07-17 —
+full per-write CT rejected, hash-chained audit checkpoints adopted (see the
+per-rung note).
 
 ## The frame
 
@@ -98,6 +99,33 @@ beside artifacts, an append-only history any client can audit.
   approval. If the contract can't absorb it cleanly, this rung waits.
 - **Force multiplier:** the corruption bounty stops relying on our
   adjudication — a winning claim is a Merkle inconsistency anyone can check.
+- **Decided 2026-07-17:** full per-write certificate-transparency is
+  **rejected**, on three counts. (1) A signed tree head on every write requires
+  strictly serialized appends — the exact opposite of this architecture's core
+  property, sloppy leader election, where dual leadership merely duplicates
+  idempotent work. A forked tree cannot be healed by convergence, because a
+  healed fork is a rewritten history: the precise crime a transparency log
+  exists to expose. (2) Per-artifact proof material is a storage family the
+  DESIGN.md contract can't absorb cleanly. (3) No client in the ecosystem
+  verifies inclusion proofs today, so per-write granularity has no consumer.
+  **Replaced by** keyless, hash-chained audit checkpoints (see DESIGN.md
+  §"Tamper-evident checkpoints"): the daily leader audit already fingerprints
+  the corpus, and it now additionally writes an append-only, hash-chained
+  checkpoint committing per-file artifact hashes, sized by churn like the audit
+  itself. On by default, zero configuration. The trust anchor is the object
+  store, not an operator key — server-assigned timestamps plus optional Object
+  Lock / retention on the checkpoint prefix make the chain physically
+  append-only even against full storage credentials: one bucket setting, no key
+  ceremony. The guarantee: an attacker with storage credentials who rewrites a
+  committed artifact — even fixing up sidecars and fingerprints consistently —
+  is provable from the chain, because the historical checkpoint that committed
+  the original hash cannot itself be rewritten. Operator signing (ed25519,
+  portable heads for a status page or the corruption bounty) is **deferred** as
+  an additive layer; its first customer is the public mirror, where portable
+  third-party-checkable heads turn the bounty from "we adjudicate" into "anyone
+  can check." Full per-write CT is not to be revisited until a client that
+  verifies inclusion proofs exists in the wild — that single fact is the only
+  thing that changes the math.
 
 ## Satellites (cheap, compounding, already in motion)
 

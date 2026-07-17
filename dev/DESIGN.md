@@ -104,6 +104,61 @@ requests instead of ~$11 of GETs per old-style sweep. `pypiron rebuild-index` is
 same pass with fingerprints ignored — the rebuild-the-world button. `pypiron
 verify` is its read-only twin: recompute everything, diff, exit nonzero.
 
+## Tamper-evident checkpoints
+
+Every integrity check the server runs — audit fingerprints, `verify-index`,
+sidecar hashes — lives in the same bucket an attacker with storage credentials
+controls. A consistent rewrite of artifact + sidecar + fingerprint passes all
+of them: each check re-reads the doctored bytes and finds them self-consistent.
+The checkpoint chain is the one artifact designed to sit *outside* that blast
+radius — an append-only witness whose history a later rewrite cannot silently
+edit.
+
+Each leader audit (daily plus one on boot) additionally writes
+`_transparency/chain/<seq>.json` — create-only, CAS-allocated (`If-None-Match`
+on the next `seq`; a racing dual leader loses the CAS, re-reads, and re-chains,
+so no new coordination is introduced). A checkpoint carries `seq`, the sha256 of
+the previous checkpoint, and a churn-sized delta: for each package whose
+fingerprint changed since the last checkpoint, the per-file map filename →
+artifact sha256, taken from the sidecar. Genesis commits the whole corpus.
+Replaying the chain from genesis reconstructs the full expected
+`(pkg, filename, sha256)` state — the same churn economics as the audit it rides
+on, cost scaling with what changed, not what exists.
+
+What v1 commits is artifact **identity** only, the sidecar sha256. Yank flips,
+project status, and metadata companions are deliberately *not* committed: they
+change legitimately and are not the supply-chain surface. That keeps the
+violation definition sharp. A violation is exactly one of two things: a
+committed filename's sha256 changed, or a committed filename vanished with no
+tombstone. A tombstoned disappearance is a legitimate private delete, not tamper.
+
+`pypiron verify-chain` walks the chain (checking the hash links), replays it,
+re-lists storage, and reports violations, exiting nonzero. Anyone with bucket
+read access can run it — the check does not depend on the server's own good
+behavior.
+
+The trust anchor, stated honestly: the chain is only as append-only as the
+storage is. In-bucket and unsigned, it already defeats the content-rewrite
+attack — the historical checkpoint committing the original hash cannot be
+*consistently* rewritten without leaving a contradiction, and a forged append
+can only stack new claims on top of the sealed history, never erase the
+contradiction below it. What in-bucket storage alone does not close is rollback
+or truncation of the chain itself; that case is closed by enabling Object Lock
+or a retention policy on `_transparency/`. Server-assigned timestamps plus WORM
+are the anchor — the same mechanism enterprises already accept for SEC 17a-4
+record-keeping — and it is one bucket setting, no key ceremony. No lock, no
+rollback guarantee; the manual says so plainly. Operator signing for
+auditor-portable evidence is a deferred additive layer (see
+[MOONSHOT.md](MOONSHOT.md) rung 3).
+
+The chain is a third kind of state, and the taxonomy should be honest about it:
+not truth, not a regenerable view, but an append-only **witness**. Deleting it
+never breaks the server — the chain simply restarts at a new genesis and the
+tamper-evidence history resets. Like leases and counters it stays on the write
+pin and is never replicated across buckets, and it is never lifecycle-expired.
+It is on by default, and the audit's cost philosophy carries over intact:
+checkpoint size scales with churn, not corpus size.
+
 ## Write-time metadata capture: never compute at read or rebuild time
 
 The upload request already provides `name`, `version`, and `sha256_digest` as form
@@ -456,6 +511,13 @@ _repl/<dest-index>/<pkg>/<file>!<nonce>  # multi-bucket repair note, FAILURE-PAT
                                          #   convergence. A healthy fan-out writes none. <file> may be
                                          #   .origin or .project-status.json for package-level truth.
                                          #   One bucket: never written.
+_transparency/chain/<seq>.json           # append-only hash-chained audit checkpoint; create-only,
+                                         #   CAS-allocated seq (If-None-Match). Commits per-file artifact
+                                         #   sha256 deltas, churn-sized like the audit. A WITNESS — never
+                                         #   truth, never a view; delete resets tamper-evidence history,
+                                         #   never breaks the server. Never replicated, never lifecycle-
+                                         #   expired. Recommended hardening: Object Lock / retention on
+                                         #   this prefix.
 _quarantine/<pkg>/<file>@<sha12>         # multi-bucket: a frozen conflict loser or demoted mirror loser,
                                          #   preserved under its own content hash. Quarantine is per
                                          #   artifact, never deleted; there is no staging tree.

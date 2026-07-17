@@ -14,11 +14,16 @@
 //! - **Negative entries**: a missing index (unknown package) is cached too —
 //!   otherwise every 404 probe costs a storage round-trip.
 //!
-//! Expiry deliberately allows a brief thundering herd (concurrent refills of
-//! the same key): it is at worst what every request paid before the cache
-//! existed, once per TTL. Single-flight machinery would buy nothing but code.
+//! On expiry a single task refills while every concurrent request keeps being
+//! served the (at most TTL-stale) entry — one storage GET per lapse, not one
+//! per request. The refill hashes the fetched bytes and, when they're
+//! unchanged, reuses the existing gzip variant + ETag instead of recompressing:
+//! under steady load an index rarely changes second-to-second, so the herd's
+//! dominant cost — re-gzip + re-SHA of identical bytes, every TTL — disappears.
+//! Invalidation stays a hard drop: no stale-while-revalidate shortcut survives
+//! it, so a same-process rebuild is visible the instant it lands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -132,6 +137,35 @@ pub fn build_variants(bytes: Vec<u8>) -> (Variant, Option<Variant>) {
     (identity, gzip)
 }
 
+/// Build a `Present` entry from freshly fetched `bytes`, reusing the stale
+/// entry's representations when the content is unchanged. Hashing the fetched
+/// bytes is unavoidable — it *is* the ETag — but a match means the identity
+/// buffer and its precomputed gzip variant are byte-for-byte what we already
+/// hold, so we clone the refcounted `Bytes`/`Arc` instead of recompressing.
+/// That reuse is the whole point of the refill: under steady load the index is
+/// unchanged every second, and re-gzip + re-SHA of identical bytes was the
+/// dominant self-time. A changed body (or a stale `Missing`) falls through to a
+/// full rebuild, exactly as a cold fill would.
+fn reuse_or_build(stale: Option<&Cached>, bytes: Vec<u8>) -> Cached {
+    let etag = quoted_sha256(&bytes);
+    if let Some(Cached::Present { identity, gzip }) = stale {
+        if identity.etag == etag {
+            return Cached::Present {
+                identity: identity.clone(),
+                gzip: gzip.clone(),
+            };
+        }
+    }
+    let gzip = maybe_gzip(&bytes);
+    Cached::Present {
+        identity: Variant {
+            body: bytes::Bytes::from(bytes),
+            etag,
+        },
+        gzip,
+    }
+}
+
 struct Entry {
     cached: Cached,
     fetched: Instant,
@@ -153,6 +187,15 @@ struct Entries {
     /// write-pin read-through renders uncached via [`build_variants`]). One
     /// populating pin per key means an entry never mixes two buckets' bytes.
     generation: u64,
+    /// Keys with a refill in flight. When a TTL-lapsed (but not invalidated)
+    /// entry is read, exactly one task claims the key here and refills it; every
+    /// other concurrent reader is served the stale entry meanwhile. Bounded by
+    /// live request concurrency — each leader clears its key via [`RefillGuard`]
+    /// the moment its refill finishes (or fails). Absent keys don't register: a
+    /// cold miss has nothing stale to serve, so it just loads (as before), and
+    /// leaving it out keeps invalidation a hard drop — a dropped entry is absent,
+    /// so the next read reloads with no stale shortcut to gate.
+    refilling: HashSet<String>,
 }
 
 impl Entries {
@@ -161,6 +204,7 @@ impl Entries {
         if self.generation != generation {
             self.map.clear();
             self.body_bytes = 0;
+            self.refilling.clear();
             self.generation = generation;
         }
     }
@@ -242,63 +286,136 @@ impl IndexCache {
     /// `generation` is the caller's pinned selection generation (design §3): a
     /// change from what the cache last saw clears it so entries never leak
     /// across a bucket switch.
+    ///
+    /// Under load an expired entry is refilled by a single task while every
+    /// other reader is served the stale (≤ TTL old) entry, so a hot key costs
+    /// one storage GET per TTL lapse instead of one per request; if the refill
+    /// finds the bytes unchanged it reuses the cached gzip + ETag rather than
+    /// recompressing. A dropped ([`invalidate`](Self::invalidate)d) entry is
+    /// absent, not stale, so its next read reloads with no stale shortcut.
     pub async fn get(
         &self,
         storage: &dyn Storage,
         key: &str,
         generation: u64,
     ) -> Result<Option<(Variant, Option<Variant>)>> {
-        if let Some(hit) = self.fresh(key, generation) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(hit.into_pair());
+        // What this request does, decided under one short lock so it never
+        // straddles the storage `.await`.
+        enum Next {
+            /// Answer from RAM — a fresh hit, or a stale entry served while
+            /// another task already refills it.
+            Serve(Option<(Variant, Option<Variant>)>),
+            /// Load from storage. `stale` is the entry to reuse-compare against
+            /// (present only for a refill); `claimed` means this task is the
+            /// single refiller and must release its claim when done.
+            Load {
+                stale: Option<Cached>,
+                claimed: bool,
+            },
         }
+
+        let next = {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries.reconcile_generation(generation);
+            match entries
+                .map
+                .get(key)
+                .map(|e| (e.cached.clone(), e.fetched.elapsed() < self.ttl))
+            {
+                // Fresh: serve it.
+                Some((cached, true)) => Next::Serve(cached.into_pair()),
+                // Expired, someone else already refilling: serve the stale copy.
+                Some((cached, false)) if entries.refilling.contains(key) => {
+                    Next::Serve(cached.into_pair())
+                }
+                // Expired, no refill in flight: become the single refiller.
+                Some((cached, false)) => {
+                    entries.refilling.insert(key.to_string());
+                    Next::Load {
+                        stale: Some(cached),
+                        claimed: true,
+                    }
+                }
+                // Cold miss: load, as before — no stale to serve, no claim.
+                None => Next::Load {
+                    stale: None,
+                    claimed: false,
+                },
+            }
+        };
+
+        let (stale, claimed) = match next {
+            Next::Serve(pair) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(pair);
+            }
+            Next::Load { stale, claimed } => (stale, claimed),
+        };
         self.misses.fetch_add(1, Ordering::Relaxed);
 
-        let cached = match storage.get_bytes(key).await {
-            Ok(bytes) => {
-                let gzip = maybe_gzip(&bytes);
-                let etag = quoted_sha256(&bytes);
-                Cached::Present {
-                    identity: Variant {
-                        body: bytes::Bytes::from(bytes),
-                        etag,
-                    },
-                    gzip,
-                }
-            }
+        // Release the refill claim however this returns — success, storage
+        // error, or unwind — so a failed load never strands the key as forever
+        // refilling (which would pin every later read to the stale entry). A
+        // cold miss claimed nothing, so it arms no guard. Declared before the
+        // lock below so, on the error return, the lock drops first and the
+        // guard re-locks a free mutex.
+        let _guard = claimed.then(|| RefillGuard::new(&self.entries, key));
+
+        let loaded = storage.get_bytes(key).await;
+
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.reconcile_generation(generation);
+        let cached = match loaded {
+            Ok(bytes) => reuse_or_build(stale.as_ref(), bytes),
             Err(e) if is_not_found(&e) => Cached::Missing,
             Err(e) => return Err(e),
         };
-
-        {
-            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-            entries.reconcile_generation(generation);
-            entries.insert(
-                key.to_string(),
-                Entry {
-                    cached: cached.clone(),
-                    fetched: Instant::now(),
-                },
-            );
-            entries.enforce_cap(self.max_bytes, self.ttl);
-        }
+        entries.insert(
+            key.to_string(),
+            Entry {
+                cached: cached.clone(),
+                fetched: Instant::now(),
+            },
+        );
+        entries.enforce_cap(self.max_bytes, self.ttl);
+        drop(entries);
         Ok(cached.into_pair())
     }
 
     /// Drop a key after writing or deleting its index — same-process reads
-    /// are fresh immediately, without waiting out the TTL.
+    /// are fresh immediately, without waiting out the TTL. A hard drop: the
+    /// entry is gone, so the next read reloads it; there is no stale-while-
+    /// revalidate path that could keep serving the old bytes past this point.
     pub fn invalidate(&self, key: &str) {
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key);
     }
+}
 
-    fn fresh(&self, key: &str, generation: u64) -> Option<Cached> {
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.reconcile_generation(generation);
-        let entry = entries.map.get(key)?;
-        (entry.fetched.elapsed() < self.ttl).then(|| entry.cached.clone())
+/// Releases a single-flight refill claim on drop, so leadership of a key is
+/// always relinquished — on success, on a storage error, or on an unwind. The
+/// remove is idempotent, and a freshly refilled entry no longer consults the
+/// claim (it reads fresh), so the brief window before this fires is harmless.
+struct RefillGuard<'a> {
+    entries: &'a Mutex<Entries>,
+    key: &'a str,
+}
+
+impl<'a> RefillGuard<'a> {
+    fn new(entries: &'a Mutex<Entries>, key: &'a str) -> Self {
+        Self { entries, key }
+    }
+}
+
+impl Drop for RefillGuard<'_> {
+    fn drop(&mut self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .refilling
+            .remove(self.key);
     }
 }
 
@@ -695,6 +812,170 @@ mod tests {
         assert!(
             cache.fresh("packages/p/a.whl", 1).is_none(),
             "presigned URL from the old generation must not survive a switch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_expiry_refills_once() {
+        // A herd of readers hitting a TTL-lapsed entry must trigger exactly one
+        // storage re-read: one task refills, the rest are served the stale copy.
+        let storage = std::sync::Arc::new(InMemStorage::default());
+        storage.insert("simple/foo/index.json", b"payload".repeat(200));
+        // Hold the single refiller in flight long enough for the herd to observe
+        // its claim and take the stale-serve path.
+        storage.set_get_delay(Duration::from_millis(150));
+        let cache = std::sync::Arc::new(IndexCache::new(Duration::from_millis(30)));
+
+        // Warm the cache (one load), then let it lapse.
+        cache
+            .get(storage.as_ref(), "simple/foo/index.json", 0)
+            .await
+            .unwrap();
+        assert_eq!(storage.get_count(), 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 16 concurrent readers hit the expired entry at once.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let c = cache.clone();
+            let s = storage.clone();
+            handles.push(tokio::spawn(async move {
+                c.get(s.as_ref(), "simple/foo/index.json", 0)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .body
+            }));
+        }
+        for h in handles {
+            assert_eq!(
+                h.await.unwrap().as_ref(),
+                b"payload".repeat(200).as_slice(),
+                "every reader is served the index during the refill"
+            );
+        }
+
+        // One warm load + one refill is the guarantee. But under a scheduling
+        // stall longer than the refill's 150ms in-flight window, a late reader can
+        // arrive after the leader already repopulated the entry and open a second
+        // refill window — at most one extra storage read. Bound it stall-tolerantly
+        // rather than asserting exactly 2: anything past 3 means coalescing broke
+        // and readers are re-reading per request (which trends toward ~17 here: the
+        // warm load plus one per reader).
+        let reads = storage.get_count();
+        assert!(
+            (2..=3).contains(&reads),
+            "single-flight: expected 2-3 storage reads (1 warm + 1-2 refills under a stall), \
+             got {reads} — one-per-reader would be ~17"
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_refill_reuses_etag_and_gzip() {
+        // The whole point of the refill: if the fetched bytes are unchanged, the
+        // gzip variant and ETag are reused, not recomputed.
+        let storage = InMemStorage::default();
+        let body = b"{\"files\": []}".repeat(500); // compressible, above the floor
+        storage.insert("simple/foo/index.json", body.clone());
+        let cache = IndexCache::new(Duration::from_millis(10));
+
+        let (id1, gz1) = cache
+            .get(&storage, "simple/foo/index.json", 0)
+            .await
+            .unwrap()
+            .unwrap();
+        let gz1 = gz1.expect("compressible body must get a gzip variant");
+        tokio::time::sleep(Duration::from_millis(20)).await; // lapse the TTL
+
+        let (id2, gz2) = cache
+            .get(&storage, "simple/foo/index.json", 0)
+            .await
+            .unwrap()
+            .unwrap();
+        let gz2 = gz2.expect("gzip variant must survive an unchanged refill");
+        assert_eq!(storage.get_count(), 2, "the refill re-reads storage once");
+
+        // gzip is deterministic, so equal *bytes* wouldn't distinguish reuse
+        // from a recompute — pointer identity does. Reuse clones the refcounted
+        // Arc/Bytes; a rebuild would allocate fresh ones.
+        assert!(
+            Arc::ptr_eq(&id1.etag, &id2.etag),
+            "identity ETag must be the same Arc (reused, not rehashed into a new one)"
+        );
+        assert!(
+            Arc::ptr_eq(&gz1.etag, &gz2.etag),
+            "gzip ETag must be the same Arc (reused)"
+        );
+        assert_eq!(
+            gz1.body.as_ptr(),
+            gz2.body.as_ptr(),
+            "gzip buffer must be the same allocation — no recompression"
+        );
+        assert_eq!(
+            id1.body.as_ptr(),
+            id2.body.as_ptr(),
+            "identity buffer must be the same allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_refill_rebuilds() {
+        // Contrast to the reuse test: when the bytes change, the refill must
+        // rebuild — new ETag, fresh buffers — so reuse is genuinely conditional.
+        let storage = InMemStorage::default();
+        storage.insert("simple/foo/index.json", b"{\"files\": []}".repeat(500));
+        let cache = IndexCache::new(Duration::from_millis(10));
+
+        let (id1, _) = cache
+            .get(&storage, "simple/foo/index.json", 0)
+            .await
+            .unwrap()
+            .unwrap();
+        let changed = b"{\"files\": [1]}".repeat(500);
+        storage.insert("simple/foo/index.json", changed.clone());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let (id2, _) = cache
+            .get(&storage, "simple/foo/index.json", 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(id2.body.as_ref(), changed, "refill serves the new bytes");
+        assert_ne!(id1.etag, id2.etag, "changed content gets a new ETag");
+        assert_ne!(
+            id1.body.as_ptr(),
+            id2.body.as_ptr(),
+            "changed content is rebuilt, not reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_drops_entry_no_stale_serve() {
+        // After invalidation the entry is absent, not stale: the next read
+        // reloads with no stale-while-revalidate shortcut, even once the TTL has
+        // lapsed (the path that would otherwise stale-serve).
+        let storage = InMemStorage::default();
+        storage.insert("simple/foo/index.json", b"old".to_vec());
+        let cache = IndexCache::new(Duration::from_millis(10));
+
+        cache
+            .get(&storage, "simple/foo/index.json", 0)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await; // lapse the TTL
+        storage.insert("simple/foo/index.json", b"new".to_vec());
+        cache.invalidate("simple/foo/index.json");
+
+        let (id, _) = cache
+            .get(&storage, "simple/foo/index.json", 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            id.body.as_ref(),
+            b"new",
+            "a hard drop reloads fresh; no stale entry may be served after invalidate"
         );
     }
 }

@@ -2472,7 +2472,7 @@ mod tests {
 pub mod test_support {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -2480,6 +2480,10 @@ pub mod test_support {
         objects: Mutex<HashMap<String, Vec<u8>>>,
         gets: AtomicUsize,
         fail_next_get: AtomicBool,
+        /// Artificial `get_bytes` latency in milliseconds (0 = none). Lets a
+        /// test hold one loader in flight long enough for concurrent readers to
+        /// observe the single-flight refill claim.
+        get_delay_ms: AtomicU64,
     }
 
     impl InMemStorage {
@@ -2491,6 +2495,10 @@ pub mod test_support {
         }
         pub fn fail_next_get(&self) {
             self.fail_next_get.store(true, Ordering::SeqCst);
+        }
+        pub fn set_get_delay(&self, delay: std::time::Duration) {
+            self.get_delay_ms
+                .store(delay.as_millis() as u64, Ordering::SeqCst);
         }
     }
 
@@ -2548,6 +2556,10 @@ pub mod test_support {
             self.gets.fetch_add(1, Ordering::SeqCst);
             if self.fail_next_get.swap(false, Ordering::SeqCst) {
                 anyhow::bail!("injected storage failure");
+            }
+            let delay = self.get_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
             self.objects
                 .lock()

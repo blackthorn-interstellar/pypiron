@@ -72,6 +72,7 @@ nav:
   - Setup: guides/setup.md
   - How it works: concepts/how-it-works.md
   - Supply-chain defense: concepts/supply-chain.md
+  - Tamper-evident checkpoints: concepts/transparency.md
   - How it's tested: concepts/testing.md
   - Multi-region resilience: guides/multi-region.md
   - For AI agents: for-agents.md

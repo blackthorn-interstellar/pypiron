@@ -18,7 +18,9 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$HERE/../.." && pwd)
 REGION=${REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}
 STACK_NAME=${STACK_NAME:-pypiron-soak}
-S3_BUCKET=${S3_BUCKET:-}
+# One dedicated bucket per account, reused by every run (push-bundle/apply/…).
+# Deriving it from the account id means you never accidentally spin up a second.
+S3_BUCKET=${S3_BUCKET:-pypiron-soak-$(command aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}
 BUNDLE_KEY=${BUNDLE_KEY:-soak/bundle.tar.gz}
 FINDINGS_PREFIX=${FINDINGS_PREFIX:-soak/findings/}
 SNS_TOPIC=${SNS_TOPIC:-}

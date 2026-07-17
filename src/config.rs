@@ -103,6 +103,7 @@ pub struct ServeConfig {
     pub fanout_grace_secs: Option<u64>,
     pub intent_grace_secs: Option<u64>,
     pub audit_on_boot: Option<bool>,
+    pub transparency: Option<bool>,
     pub reconcile_interval_secs: Option<u64>,
     pub repl_sweep_interval_secs: Option<u64>,
     pub lease_ttl_secs: Option<u64>,

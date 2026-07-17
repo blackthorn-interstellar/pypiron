@@ -112,6 +112,7 @@
 # intent-grace-secs = 900                   # upload/replication crash grace; range 3..9223372036854775807
 # audit-on-boot = true                      # self-heal sweep when a node becomes leader
 # reconcile-interval-secs = 86400           # audit sweep interval (an unchanged corpus is ~free)
+# transparency = true                       # write tamper-evident checkpoints (pypiron verify-chain)
 # repl-sweep-interval-secs = 300             # _repl/ repair-note sweep backstop (also fires on bucket heal)
 # lease-ttl-secs = 30                       # leader lease TTL (multi-node S3)
 

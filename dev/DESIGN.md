@@ -30,8 +30,14 @@ at any time and get the same answer. This single property does most of the
 architectural work:
 
 - **Split-brain is harmless.** Two workers rebuilding the same package index do
-  redundant work and converge. So leader election can be *sloppy* — it is a cost
-  optimization (avoid duplicate LISTs/PUTs), not a correctness requirement.
+  redundant work and converge — with one machine-checked precision (the
+  event-protocol model, tests/model_event_protocol.rs): rebuilds from
+  *identical* truth snapshots converge outright, while *staggered* concurrent
+  rebuilds of one package can leave a stale view standing until the periodic
+  audit's fingerprint diff repairs it. So leader election can be *sloppy* — a
+  brief dual-leader window costs at worst duplicate work plus an
+  audit-healed view, never lost truth — and remains a cost optimization
+  (avoid duplicate LISTs/PUTs), not a correctness requirement.
 - **Events cannot be lost.** Markers are unique create-only keys written around
   every truth change (intent before, commit after) and only consumed after the
   work they announce is done. At-least-once processing is free because rebuilds

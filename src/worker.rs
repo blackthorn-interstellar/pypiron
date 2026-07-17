@@ -45,6 +45,7 @@ use crate::sidecar::{
     SIDECAR_SUFFIX, TOMBSTONE_SUFFIX,
 };
 use crate::storage::{is_not_found, FileEntry, ObjectMeta, Storage};
+use crate::transparency::FileShas;
 use crate::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 
 /// Bounded fan-out for storage round-trips during rebuilds and sweeps.
@@ -1177,15 +1178,35 @@ pub async fn audit(
     let mut rebuilt = 0usize;
     let mut skipped = 0usize;
     let mut pkg_stats: Vec<(String, PkgStat)> = Vec::new();
+    let mut deltas: Vec<(String, FileShas)> = Vec::new();
+
+    // Tamper-evident checkpoints. On an empty chain the first pass commits the
+    // whole corpus (genesis), so unchanged packages must surface their shas
+    // once; steady state commits only churn. Deciding this up front tells the
+    // shard pass whether to read unchanged packages' sidecars. A read error
+    // conservatively defers genesis to a later pass (best-effort; self-heals).
+    let genesis = state.transparency
+        && crate::transparency::read_head(storage)
+            .await
+            .map(|head| head.is_none())
+            .unwrap_or(false);
 
     // Shards enumerate in parallel — that is what the sharding is for. The
     // bound keeps peak memory at a few shards' worth of listings (a shard is
     // ~1/36th of the corpus).
     const SHARD_CONCURRENCY: usize = 6;
     for chunk in crate::storage::SHARD_CHARS.chunks(SHARD_CONCURRENCY) {
-        let audits = chunk
-            .iter()
-            .map(|shard| audit_shard(state, storage, generation, *shard, force_deep));
+        let audits = chunk.iter().map(|shard| {
+            audit_shard(
+                state,
+                storage,
+                generation,
+                *shard,
+                force_deep,
+                state.transparency,
+                genesis,
+            )
+        });
         for (shard, result) in chunk.iter().zip(futures::future::join_all(audits).await) {
             match result {
                 Ok(result) => {
@@ -1195,6 +1216,7 @@ pub async fn audit(
                     skipped += result.skipped;
                     failures += result.failures;
                     pkg_stats.extend(result.pkg_stats);
+                    deltas.extend(result.deltas);
                 }
                 Err(e) => {
                     error!(shard=%shard, error=?e, "audit: shard failed");
@@ -1236,11 +1258,113 @@ pub async fn audit(
         inv.totals()
     };
     publish_inventory(state, storage, totals).await;
+    // Append the tamper-evident checkpoint last, once views and inventory are
+    // settled. Best-effort: a checkpoint failure logs and alarms but never fails
+    // the audit itself.
+    if state.transparency {
+        let mut delta: crate::transparency::Delta = deltas.into_iter().collect();
+        if genesis {
+            // Genesis has no prior state to remove from, so an empty map is pure
+            // noise; keep only packages that actually hold committable files.
+            delta.retain(|_, files| !files.is_empty());
+        }
+        write_chain_link(state, storage, generation, delta).await;
+    }
     info!(
         packages = live.len(),
         rebuilt, skipped, duration_secs, "reconcile: sweep complete"
     );
     Ok(())
+}
+
+/// Read a package's current committed file→sha256 map straight from its
+/// sidecars — the renderable set (tombstoned/frozen/mirror-quarantined excluded,
+/// exactly as the index is built). Used only to seed the genesis checkpoint for
+/// a package the incremental audit did not rebuild; steady-state passes never
+/// call it, so the churn-sized audit cost is preserved.
+async fn current_package_shas(storage: &dyn Storage, pkg: &str) -> Result<FileShas> {
+    let (files, _raw) = list_artifacts_for_claim(storage, pkg, false).await?;
+    Ok(files.into_iter().map(|f| (f.filename, f.sha256)).collect())
+}
+
+/// Append a hash-chained transparency checkpoint committing this pass's changed
+/// packages. Best-effort: any failure logs and alarms but never fails the audit
+/// (the next audit re-attempts). Leader-gated by construction — called only from
+/// `audit`, after the fingerprint and global-index writes, on the same pin and
+/// generation.
+async fn write_chain_link(
+    state: &AppState,
+    storage: &dyn Storage,
+    generation: u64,
+    delta: crate::transparency::Delta,
+) {
+    if delta.is_empty() {
+        return; // chain grows on churn only
+    }
+    // Two attempts: a racing dual leader can win the create-CAS at our seq, so
+    // re-read the head and re-chain once. A second loss means a peer is keeping
+    // the chain current — defer to the next audit rather than spin or overwrite.
+    for attempt in 0..2 {
+        if let Err(e) = require_generation(state, generation) {
+            warn!(error=?e, "transparency: generation changed; checkpoint skipped");
+            return;
+        }
+        let (seq, prev_sha256) = match crate::transparency::read_head(storage).await {
+            Ok(Some((head_seq, bytes))) => (head_seq + 1, crate::transparency::sha256_hex(&bytes)),
+            Ok(None) => (0, String::new()),
+            Err(e) => {
+                error!(error=?e, "transparency: could not read chain head; checkpoint skipped");
+                return;
+            }
+        };
+        let created =
+            match crate::clock::now_utc().format(&time::format_description::well_known::Rfc3339) {
+                Ok(created) => created,
+                Err(e) => {
+                    error!(error=?e, "transparency: timestamp format failed; checkpoint skipped");
+                    return;
+                }
+            };
+        let link = crate::transparency::ChainLink {
+            seq,
+            prev_sha256,
+            created,
+            packages: delta.clone(),
+        };
+        let bytes = match crate::transparency::link_bytes(&link) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(error=?e, "transparency: serialize failed; checkpoint skipped");
+                return;
+            }
+        };
+        match storage
+            .put_if_none_match(&crate::transparency::chain_key(seq), bytes)
+            .await
+        {
+            Ok(Some(_)) => {
+                info!(
+                    seq,
+                    packages = link.packages.len(),
+                    "transparency: checkpoint written"
+                );
+                return;
+            }
+            Ok(None) => {
+                if attempt == 1 {
+                    warn!(
+                        seq,
+                        "transparency: lost checkpoint CAS twice; deferring to next audit"
+                    );
+                }
+                // Otherwise loop: re-read the head and re-chain onto it.
+            }
+            Err(e) => {
+                error!(error=?e, seq, "transparency: checkpoint write failed");
+                return;
+            }
+        }
+    }
 }
 
 struct ShardAudit {
@@ -1256,15 +1380,26 @@ struct ShardAudit {
     /// every package with at least one artifact. Summed to re-baseline the
     /// in-memory inventory map authoritatively each sweep.
     pkg_stats: Vec<(String, PkgStat)>,
+    /// Transparency-checkpoint deltas: each package that changed this pass (or,
+    /// at genesis, every package) → its complete current file→sha256 map. Empty
+    /// when `--transparency` is off. An empty inner map means the package went
+    /// away (a removal on chain replay).
+    deltas: Vec<(String, FileShas)>,
 }
 
-/// Audit every package whose name starts with `shard`.
+/// Audit every package whose name starts with `shard`. `collect_deltas` gathers
+/// transparency-checkpoint deltas (off when `--transparency` is disabled);
+/// `need_full_shas` additionally reads unchanged packages' sidecars so the
+/// genesis checkpoint can commit the whole corpus — a one-time cost only when
+/// the chain is empty.
 async fn audit_shard(
     state: &AppState,
     storage: &dyn Storage,
     generation: u64,
     shard: char,
     force_deep: bool,
+    collect_deltas: bool,
+    need_full_shas: bool,
 ) -> Result<ShardAudit> {
     let (truth, views) = futures::future::try_join(
         storage.list_all(&format!("{PACKAGES_PREFIX}{shard}")),
@@ -1304,6 +1439,7 @@ async fn audit_shard(
         skipped: 0,
         failures: 0,
         pkg_stats: Vec::new(),
+        deltas: Vec::new(),
     };
     let mut fresh: std::collections::HashMap<String, String> = Default::default();
     let mut packages: Vec<(String, String, bool, bool, Vec<String>)> =
@@ -1398,14 +1534,14 @@ async fn audit_shard(
             async move {
                 if let Err(e) = require_generation(state, generation) {
                     error!(package=%pkg, error=?e, "audit: selection changed before package batch");
-                    return (pkg, None, has_artifacts, false, true);
+                    return (pkg, None, has_artifacts, false, true, None);
                 }
                 if state.buckets.is_multi() {
                     match crate::origin::read_origin_observation(storage, &pkg).await {
                         Ok(_) => {}
                         Err(e) => {
                             error!(package=%pkg, error=?e, "audit: origin unreadable; deferring maintenance");
-                            return (pkg, None, has_artifacts, false, true);
+                            return (pkg, None, has_artifacts, false, true, None);
                         }
                     }
                 }
@@ -1465,33 +1601,48 @@ async fn audit_shard(
                     // Logical liveness follows the materialized package view,
                     // not physical artifacts: frozen/quarantined canonical
                     // evidence deliberately stays in `packages/` while dead.
+                    // Only the genesis pass needs this package's shas (its
+                    // rebuild didn't run); steady state contributes no delta.
+                    let delta = if collect_deltas && need_full_shas && !maintenance_failed {
+                        current_package_shas(storage, &pkg).await.ok()
+                    } else {
+                        None
+                    };
                     return (
                         pkg,
                         Some(fp),
                         has_package_view,
                         false,
                         maintenance_failed,
+                        delta,
                     );
                 }
-                match rebuild_package(state, storage, &pkg).await {
-                    Ok(live_now) => {
+                match rebuild_package_excluding(state, storage, &pkg, None).await {
+                    Ok((live_now, shas)) => {
                         // Fingerprint what the rebuild actually saw/wrote, not
                         // the pre-rebuild listing — two cheap per-package lists.
                         let new_fp = package_fingerprint(storage, &pkg).await.ok();
-                        (pkg, new_fp, live_now, true, maintenance_failed)
+                        // The rebuild's own sidecar reads produced `shas`; commit
+                        // them (an empty map = the package became dead).
+                        let delta = collect_deltas.then_some(shas);
+                        (pkg, new_fp, live_now, true, maintenance_failed, delta)
                     }
                     Err(e) => {
                         // Conservative on failure: keep the package listed and
                         // its views rather than pruning on a bad observation.
                         error!(package=%pkg, error=?e, "audit: package rebuild failed");
-                        (pkg, None, has_artifacts, false, true)
+                        (pkg, None, has_artifacts, false, true, None)
                     }
                 }
             }
         });
-        for (pkg, fp, live_now, was_rebuilt, failed) in futures::future::join_all(jobs).await {
+        for (pkg, fp, live_now, was_rebuilt, failed, delta) in futures::future::join_all(jobs).await
+        {
             if let Some(fp) = fp {
                 fresh.insert(pkg.clone(), fp);
+            }
+            if let Some(shas) = delta {
+                out.deltas.push((pkg.clone(), shas));
             }
             if live_now || failed {
                 out.live.push(pkg);
@@ -1690,7 +1841,9 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
 /// Returns whether the package still has artifacts; with none, its indexes
 /// are removed (index first, per the ordering invariant).
 pub async fn rebuild_package(state: &AppState, storage: &dyn Storage, pkg: &str) -> Result<bool> {
-    rebuild_package_excluding(state, storage, pkg, None).await
+    Ok(rebuild_package_excluding(state, storage, pkg, None)
+        .await?
+        .0)
 }
 
 /// Like `rebuild_package`, but omitting one filename from the views. Deletion
@@ -1701,8 +1854,8 @@ pub async fn rebuild_package_excluding(
     storage: &dyn Storage,
     pkg: &str,
     omit: Option<&str>,
-) -> Result<bool> {
-    let (live, raw) = rebuild_package_indexes(state, storage, pkg, omit).await?;
+) -> Result<(bool, FileShas)> {
+    let (live, raw, shas) = rebuild_package_indexes(state, storage, pkg, omit).await?;
     // Maintain the in-memory inventory. This is the one choke point every
     // rebuild against the *selected* bucket — tick, audit, delete — flows
     // through, and `upsert` is an idempotent absolute set, so concurrent or
@@ -1713,7 +1866,9 @@ pub async fn rebuild_package_excluding(
         .lock()
         .await
         .upsert(pkg, PkgStat::from_raw(&raw));
-    Ok(live)
+    // `shas` is the renderable file→sha256 map the transparency audit commits;
+    // the delete/tick callers discard it, the audit threads it into the chain.
+    Ok((live, shas))
 }
 
 /// Rebuild only a package's index views from `storage`'s own truth, touching no
@@ -1721,13 +1876,14 @@ pub async fn rebuild_package_excluding(
 /// bucket's inventory on top; the replicator (src/replicate.rs) calls this
 /// directly against a *non-selected* destination bucket, where mixing that
 /// bucket's counts into the node's inventory (or its name cache) would be wrong.
-/// Returns `(still_live, raw_artifacts)`.
+/// Returns `(still_live, raw_artifacts, file_shas)`, where `file_shas` is the
+/// renderable file→sha256 map (the transparency chain's commitment).
 pub async fn rebuild_package_indexes(
     state: &AppState,
     storage: &dyn Storage,
     pkg: &str,
     omit: Option<&str>,
-) -> Result<(bool, Vec<(String, u64)>)> {
+) -> Result<(bool, Vec<(String, u64)>, FileShas)> {
     if !state.buckets.is_multi() {
         return rebuild_package_indexes_inner(state, storage, pkg, omit).await;
     }
@@ -1758,7 +1914,7 @@ async fn rebuild_package_indexes_inner(
     storage: &dyn Storage,
     pkg: &str,
     omit: Option<&str>,
-) -> Result<(bool, Vec<(String, u64)>)> {
+) -> Result<(bool, Vec<(String, u64)>, FileShas)> {
     state
         .metrics
         .index_rebuilds
@@ -1768,6 +1924,12 @@ async fn rebuild_package_indexes_inner(
         files.retain(|f| f.filename != omit);
         raw.retain(|(filename, _)| filename != omit);
     }
+    // The renderable files carry the sha256 each one's sidecar just yielded —
+    // the transparency chain's commitment, captured here at no extra reads.
+    let shas: FileShas = files
+        .iter()
+        .map(|f| (f.filename.clone(), f.sha256.clone()))
+        .collect();
     // Index membership keys on the *renderable* files; inventory keys on the
     // *stored* files (raw). They differ only for a corrupt-sidecar file, which
     // is dropped from the index but still counted as stored — matching the
@@ -1790,7 +1952,7 @@ async fn rebuild_package_indexes_inner(
     // changed (its fingerprint/dirty marker moved), so a same-node reader sees
     // the upload immediately instead of waiting out the cache TTL.
     state.project_cache.invalidate_package(pkg);
-    Ok((live, raw))
+    Ok((live, raw, shas))
 }
 
 /// One package's contribution to the registry inventory: artifact files in
@@ -2072,7 +2234,7 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
             }
         };
         match rebuild_package_indexes(state, storage, &package, None).await {
-            Ok((live, _)) => {
+            Ok((live, _, _)) => {
                 // Same paused-writer hazard as the tick: a stale intent's
                 // writer may still mutate after this rebuild's listing, so
                 // re-arm before consuming or retain the originals.
@@ -2887,7 +3049,7 @@ mod tests {
         );
         let state = AppState::headless(storage.clone());
 
-        let audit = audit_shard(&state, storage.as_ref(), 0, 'f', false)
+        let audit = audit_shard(&state, storage.as_ref(), 0, 'f', false, false, false)
             .await
             .unwrap();
 
@@ -3064,6 +3226,7 @@ mod tests {
             fanout_grace: Duration::from_secs(30),
             intent_grace: time::Duration::seconds(900),
             audit_on_boot: true,
+            transparency: true,
             wait_on_upload: false,
             wait_on_upload_timeout: Duration::from_secs(1),
             lease_ttl: Duration::from_secs(30),
@@ -3189,6 +3352,7 @@ mod tests {
             fanout_grace: Duration::from_secs(30),
             intent_grace: time::Duration::seconds(900),
             audit_on_boot: true,
+            transparency: true,
             wait_on_upload: false,
             wait_on_upload_timeout: Duration::from_secs(1),
             lease_ttl: Duration::from_secs(30),

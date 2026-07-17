@@ -39,6 +39,7 @@ pub mod storage;
 pub mod sync;
 pub mod token;
 pub mod tombstone;
+pub mod transparency;
 pub mod upload;
 pub mod verify;
 pub mod web;

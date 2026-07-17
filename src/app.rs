@@ -27,7 +27,8 @@ use tracing::{debug, info, warn};
 use crate::{
     advisories, bucket_health, buckets, cache, config, coremeta, counters, metrics, names,
     node_region, observed_storage, origin, project_cache, provenance, proxy, render, replicate,
-    sidecar, status, storage, sync, token, tombstone, upload, verify, web, wheel, worker,
+    sidecar, status, storage, sync, token, tombstone, transparency, upload, verify, web, wheel,
+    worker,
 };
 
 use bucket_health::{HealthController, HealthPolicy};
@@ -118,6 +119,17 @@ enum Commands {
     /// rule of thumb: ~$1-1.5 and ~20-30 min per million files (single node,
     /// default concurrency). To only check for drift, use read-only `verify-index`.
     RebuildIndex(Box<RebuildIndexArgs>),
+    /// Server maintenance: replay the tamper-evident checkpoint chain against
+    /// storage and report any artifact that was rewritten or vanished
+    /// out-of-band (read-only); exits nonzero on any violation
+    ///
+    /// Run on a server node against the same storage backend `serve` uses (it
+    /// reads the `[serve]` storage config from --config / pypiron.toml). Catches
+    /// the one attack every other check misses: an attacker with your storage
+    /// credentials rewriting an artifact and its recorded sha256 together. Files
+    /// present in storage but not yet committed to the chain are fine — the
+    /// chain lags truth by at most one audit.
+    VerifyChain(Box<transparency::VerifyChainArgs>),
     /// Probe a running server's `/health` and exit 0 (healthy) or 1
     /// (unreachable / unhealthy).
     ///
@@ -768,6 +780,15 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_AUDIT_ON_BOOT", default_value_t = true, action = clap::ArgAction::Set)]
     audit_on_boot: bool,
 
+    /// Write tamper-evident checkpoints: each audit appends a hash-chained link
+    /// under `_transparency/chain/` committing the sha256 of every changed
+    /// package's files, so `pypiron verify-chain` can later catch an out-of-band
+    /// artifact rewrite. On by default; disable with `--transparency false` (or
+    /// `PYPIRON_TRANSPARENCY=false`). Off only stops new links — verify-chain
+    /// still checks whatever chain exists.
+    #[arg(long, env = "PYPIRON_TRANSPARENCY", default_value_t = true, action = clap::ArgAction::Set)]
+    transparency: bool,
+
     /// Seconds between audit sweeps. Day-to-day freshness rides the event
     /// markers; the audit only catches out-of-band storage changes, so daily
     /// is plenty. Fingerprint shards make an unchanged corpus cost a flat
@@ -992,6 +1013,9 @@ pub struct AppState {
     /// is compared against storage timestamps.
     pub intent_grace: time::Duration,
     pub audit_on_boot: bool,
+    /// Whether the leader audit appends tamper-evident checkpoint links under
+    /// `_transparency/`. Off stops new links; verify-chain still reads the chain.
+    pub transparency: bool,
     pub lease_ttl: Duration,
     pub wait_on_upload: bool,
     pub wait_on_upload_timeout: Duration,
@@ -1227,6 +1251,25 @@ pub async fn cli_main() -> Result<()> {
             )?;
             run_rebuild_index(*args).await
         }
+        Some(Commands::VerifyChain(mut args)) => {
+            apply_maintenance_config(
+                &mut args.storage,
+                config_path.as_deref(),
+                &matches,
+                "verify-chain",
+            )?;
+            // Same grep/diff exit-code idiom as verify-index: 0 valid, 1 a
+            // violation (rows already on stdout), 2 could-not-run.
+            #[allow(clippy::exit)]
+            match transparency::run_verify_chain(*args).await {
+                Ok(true) => Ok(()),
+                Ok(false) => std::process::exit(1),
+                Err(e) => {
+                    eprintln!("Error: {e:?}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some(Commands::Serve(args)) => {
             let serve_matches = matches
                 .subcommand_matches("serve")
@@ -1415,6 +1458,7 @@ fn merge_serve_file(
         f.intent_grace_secs
     );
     fill!(cli.audit_on_boot, "audit_on_boot", f.audit_on_boot);
+    fill!(cli.transparency, "transparency", f.transparency);
     fill!(
         cli.allow_insecure_upstream,
         "allow_insecure_upstream",
@@ -1816,6 +1860,7 @@ async fn run_serve(
         fanout_grace: Duration::from_secs(cli.fanout_grace_secs),
         intent_grace: time::Duration::seconds(cli.intent_grace_secs as i64),
         audit_on_boot: cli.audit_on_boot,
+        transparency: cli.transparency,
         lease_ttl: Duration::from_secs(cli.lease_ttl_secs),
         wait_on_upload: cli.wait_on_upload,
         wait_on_upload_timeout: Duration::from_secs(cli.wait_on_upload_secs),
@@ -5549,6 +5594,7 @@ impl AppState {
             fanout_grace: Duration::from_secs(30),
             intent_grace: time::Duration::seconds(900),
             audit_on_boot: true,
+            transparency: true,
             lease_ttl: Duration::from_secs(30),
             wait_on_upload: false,
             wait_on_upload_timeout: Duration::from_secs(10),

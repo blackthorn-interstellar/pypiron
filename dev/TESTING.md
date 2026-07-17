@@ -160,9 +160,16 @@ assumed: recurring seeds run twice and must produce identical storage-op trace
 hashes — so any failure reproduces exactly with
 `cargo run --example vopr -- --seed N`.
 
-A 20-seed smoke runs on every PR (ci.yml); thousands of fresh seeds run
+A smoke runs on every PR (ci.yml); tens of thousands of fresh seeds run
 nightly with counters published in the job summary
-(`.github/workflows/simulation.yml`).
+(`.github/workflows/simulation.yml`). For local soaking, `make vopr-soak`
+runs continuously across rotating topologies (nodes 2–3, buckets 1–3,
+fault and crash-only profiles — the profile derives from the seed, so a
+failure still reproduces from the explicit `--seed N` command it prints),
+logs failures and keeps exploring, and heartbeats once a minute;
+`VOPR_SECS=600 make vopr-soak` timeboxes instead and exits non-zero if any
+seed failed. At ~600+ seeds/second, an overnight soak covers tens of
+millions of schedules.
 
 ## Real cloud backends
 

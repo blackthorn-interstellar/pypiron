@@ -1059,6 +1059,45 @@ struct Args {
     ops: u64,
     recheck_every: u64,
     fail_percent: u64,
+    /// Soak mode: never stop; failures are logged (with their exact repro
+    /// command) and exploration continues with the next seed.
+    forever: bool,
+    /// Timebox: explore until this many wall-clock seconds elapse, logging
+    /// failures like `--forever`, then exit non-zero if anything failed.
+    max_secs: Option<u64>,
+    /// Derive (nodes, buckets, ops, fail-percent) per seed instead of using
+    /// the fixed flags — one soak covers every topology. The profile is a
+    /// pure function of the seed, and every failure line prints the resolved
+    /// flags, so reproduction is still one explicit command.
+    rotate: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Profile {
+    nodes: usize,
+    buckets: usize,
+    ops: u64,
+    fail_percent: u64,
+}
+
+fn profile_for(seed: u64, args: &Args) -> Profile {
+    if !args.rotate {
+        return Profile {
+            nodes: args.nodes,
+            buckets: args.buckets,
+            ops: args.ops,
+            fail_percent: args.fail_percent,
+        };
+    }
+    let mut rng = Rng::new(seed ^ 0x0507_A7E5);
+    Profile {
+        nodes: 2 + rng.below(2) as usize,   // 2..=3
+        buckets: 1 + rng.below(3) as usize, // 1..=3: no-replication through 3-way fan-out
+        ops: [80, 120, 160, 200][rng.below(4) as usize],
+        // Half the schedules crash-only, where audit repairs are hard
+        // violations; half with injected storage failures.
+        fail_percent: if rng.chance(50) { 0 } else { 3 },
+    }
 }
 
 fn parse_args() -> Args {
@@ -1070,6 +1109,9 @@ fn parse_args() -> Args {
         ops: 120,
         recheck_every: 10,
         fail_percent: 3,
+        forever: false,
+        max_secs: None,
+        rotate: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -1091,6 +1133,9 @@ fn parse_args() -> Args {
             "--ops" => args.ops = grab(),
             "--recheck-every" => args.recheck_every = grab(),
             "--fail-percent" => args.fail_percent = grab(),
+            "--forever" => args.forever = true,
+            "--max-secs" => args.max_secs = Some(grab()),
+            "--rotate" => args.rotate = true,
             "--verbose" => {}
             other => panic!("unknown flag {other} (see examples/vopr.rs)"),
         }
@@ -1104,7 +1149,7 @@ fn dump_trace(outcome: &RunOutcome) {
     }
 }
 
-fn run_once(seed: u64, args: &Args) -> RunOutcome {
+fn run_once(seed: u64, profile: &Profile) -> RunOutcome {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .start_paused(true)
@@ -1113,10 +1158,10 @@ fn run_once(seed: u64, args: &Args) -> RunOutcome {
     let local = tokio::task::LocalSet::new();
     runtime.block_on(local.run_until(run_seed(
         seed,
-        args.nodes,
-        args.buckets,
-        args.ops,
-        args.fail_percent,
+        profile.nodes,
+        profile.buckets,
+        profile.ops,
+        profile.fail_percent,
     )))
 }
 
@@ -1130,18 +1175,32 @@ fn main() {
     }
     let args = parse_args();
     let started = std::time::Instant::now();
+    let keep_going = args.forever || args.max_secs.is_some();
     let mut total_events: u64 = 0;
     let mut total_acked: usize = 0;
     let mut total_audit_repairs: u64 = 0;
-    for i in 0..args.seeds {
-        let seed = args.start_seed + i;
-        let outcome = run_once(seed, &args);
+    let mut failed_seeds: Vec<u64> = Vec::new();
+    let mut determinism_violations: Vec<u64> = Vec::new();
+    let mut explored: u64 = 0;
+    let mut last_report = std::time::Instant::now();
+    loop {
+        if let Some(budget) = args.max_secs {
+            if started.elapsed().as_secs() >= budget {
+                break;
+            }
+        } else if !args.forever && explored >= args.seeds {
+            break;
+        }
+        let seed = args.start_seed + explored;
+        explored += 1;
+        let profile = profile_for(seed, &args);
+        let outcome = run_once(seed, &profile);
         dump_trace(&outcome);
         total_events += outcome.trace_events;
         total_acked += outcome.acked;
         total_audit_repairs += outcome.audit_view_repairs;
         if args.recheck_every > 0 && seed.is_multiple_of(args.recheck_every) {
-            let again = run_once(seed, &args);
+            let again = run_once(seed, &profile);
             if again.trace_hash != outcome.trace_hash {
                 eprintln!(
                     "vopr: DETERMINISM VIOLATION seed={seed}: trace {:#x} vs {:#x}",
@@ -1160,7 +1219,10 @@ fn main() {
                 } else {
                     eprintln!("rerun with VOPR_TRACE=1 to diff the traces");
                 }
-                std::process::exit(3);
+                if !keep_going {
+                    std::process::exit(3);
+                }
+                determinism_violations.push(seed);
             }
         }
         if !outcome.violations.is_empty() {
@@ -1171,13 +1233,52 @@ fn main() {
             for violation in &outcome.violations {
                 eprintln!("  {violation}");
             }
-            eprintln!("reproduce: cargo run --release --example vopr -- --seed {seed} --nodes {} --buckets {} --ops {}", args.nodes, args.buckets, args.ops);
-            std::process::exit(2);
+            eprintln!(
+                "reproduce: cargo run --release --example vopr -- --seed {seed} --nodes {} --buckets {} --ops {} --fail-percent {}",
+                profile.nodes, profile.buckets, profile.ops, profile.fail_percent
+            );
+            if !keep_going {
+                std::process::exit(2);
+            }
+            failed_seeds.push(seed);
+        }
+        // Soak-log heartbeat: one line a minute proves liveness and carries
+        // the running counters without flooding the log.
+        if keep_going && last_report.elapsed().as_secs() >= 60 {
+            println!(
+                "vopr: progress — {explored} seeds, {total_events} storage-op interleavings, {total_acked} acked uploads, {total_audit_repairs} audit view repairs, {} failed, {} determinism violations, {:?} elapsed",
+                failed_seeds.len(),
+                determinism_violations.len(),
+                started.elapsed()
+            );
+            last_report = std::time::Instant::now();
         }
     }
+    let profile_desc = if args.rotate {
+        "rotating(nodes 2-3, buckets 1-3, ops 80-200, fault+crash-only)".to_string()
+    } else {
+        format!(
+            "nodes={} buckets={} ops/run={} fail-percent={}",
+            args.nodes, args.buckets, args.ops, args.fail_percent
+        )
+    };
     println!(
-        "vopr: {} seeds explored, {} storage-op interleavings, {} acked uploads verified, {} audit view repairs, nodes={} buckets={} ops/run={} in {:?} — all invariants held",
-        args.seeds, total_events, total_acked, total_audit_repairs, args.nodes, args.buckets,
-        args.ops, started.elapsed()
+        "vopr: {explored} seeds explored, {total_events} storage-op interleavings, {total_acked} acked uploads verified, {total_audit_repairs} audit view repairs, {profile_desc} in {:?} — {}",
+        started.elapsed(),
+        if failed_seeds.is_empty() && determinism_violations.is_empty() {
+            "all invariants held".to_string()
+        } else {
+            format!(
+                "{} FAILED seeds {failed_seeds:?}, {} determinism violations {determinism_violations:?}",
+                failed_seeds.len(),
+                determinism_violations.len()
+            )
+        }
     );
+    if !determinism_violations.is_empty() {
+        std::process::exit(3);
+    }
+    if !failed_seeds.is_empty() {
+        std::process::exit(2);
+    }
 }

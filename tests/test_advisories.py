@@ -5,8 +5,11 @@ admin-PUT `/advisories/feed` push path works, and startup is fail-closed by
 intent (AC7). Rung 4 (enforcement): the malware byte gate refuses blocked bytes
 where they're served (AC1), private origin exempts a same-named package (AC2),
 the on-demand proxy refuses to fill a blocked version (AC3), and a dead feed
-degrades freshness, never availability (AC6). Everything through the real binary
-over HTTP, driven by real `uv`.
+degrades freshness, never availability (AC6). Rung 5 (listings + quarantine): the
+materialized and proxy-rendered listings scrub blocked files, origin-aware (AC4),
+and a relayed PEP 792 `quarantined` status blocks the byte gate after the worker's
+next sweep (AC5). Everything through the real binary over HTTP, driven by real
+`uv`.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from .conftest import _start_disk_server, _start_proxy_pair
 from .helpers import (
     _encode_basic_auth,
     find_free_port,
+    get_index_json,
     http_get,
     http_request_auth,
     kill_process_tree,
@@ -362,7 +366,10 @@ def test_ac1_byte_gate_blocks_mal_version_by_default(
         clean = make_wheel(MAL_EXACT_PKG, "1.4.0", tmp_path)
         _mirror_upload(server, bad)
         _mirror_upload(server, clean)
-        wait_for_file_in_index(server["simple"], MAL_EXACT_PKG, bad.name)
+        # The blocked wheel is cached in storage (the upload is synchronous) but no
+        # longer listed — rung 5 scrubs it from the index (AC4). The byte gate is
+        # the guarantee for the direct URL below; wait on the clean file as the
+        # rebuild sync point instead.
         wait_for_file_in_index(server["simple"], MAL_EXACT_PKG, clean.name)
 
         before = _metric_value(_metrics_text(base), "pypiron_blocked_downloads_total")
@@ -514,7 +521,188 @@ def test_ac6_dead_feed_keeps_serving_and_ages_gauge(
             assert age2 > age1, f"staleness gauge did not rise after feed death: {age1} -> {age2}"
 
 
+# --------------------------- listings + quarantine (rung 5) ------------------
+
+
+def test_ac4_materialized_listing_scrubs_blocked_file(
+    tmp_path_factory, pypiron_bin, tmp_path, uv_path, uv_venv
+):
+    """AC4 (materialized): after the worker rebuilds the index, a MAL-blocked file
+    is gone from both the PEP 503 HTML and PEP 691 JSON listings, while a clean
+    version of the same project and an unrelated clean package still list and
+    install. A private package sharing the all-versions MAL name keeps every file
+    listed — the scrub is origin-aware (mirror only)."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    with advisory_server(tmp_path_factory, pypiron_bin, feed) as server:
+        base = server["base_url"]
+        # Explicit feed → synchronous startup obtain, so the scrub is armed before
+        # the first rebuild ever runs.
+        assert _poll_metric(base, "pypiron_advisory_snapshot_age_seconds") is not None
+
+        # The malware landed in storage before OSV named it (mirror-cached), plus a
+        # clean version of the same project and an unrelated clean package.
+        bad = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+        clean = make_wheel(MAL_EXACT_PKG, "1.4.0", tmp_path)
+        other = make_wheel("cleanmate", "1.0.0", tmp_path)
+        for dist in (bad, clean, other):
+            _mirror_upload(server, dist)
+        wait_for_file_in_index(server["simple"], MAL_EXACT_PKG, clean.name)
+        wait_for_file_in_index(server["simple"], "cleanmate", other.name)
+
+        # PEP 691 JSON: the blocked file is scrubbed; the clean one remains.
+        names = {f["filename"] for f in get_index_json(server["simple"], MAL_EXACT_PKG)["files"]}
+        assert bad.name not in names, f"blocked file still listed in JSON: {names}"
+        assert clean.name in names, f"clean file missing from JSON: {names}"
+
+        # PEP 503 HTML: same scrub, same render path (render.rs takes pre-filtered files).
+        code, body, _ = http_get(f"{server['simple']}{MAL_EXACT_PKG}/")
+        assert code == 200, code
+        html = body.decode()
+        assert bad.name not in html, "blocked file still linked in HTML"
+        assert clean.name in html, "clean file missing from HTML"
+
+        # A name-scoped block would break this; the version-scoped scrub doesn't.
+        rc, out, err = _uv_install(uv_path, uv_venv, server, f"{MAL_EXACT_PKG}==1.4.0")
+        assert rc == 0, f"clean version failed to install:\n{out}\n{err}"
+        run_checked([str(uv_venv), "-c", f"import {_import_name(MAL_EXACT_PKG)}"])
+
+        # Origin-aware guard: a PRIVATE package sharing the all-versions MAL name
+        # keeps listing (origin exclusivity — it is not the package OSV named).
+        priv = make_wheel(MAL_ALL_PKG, "1.0.0", tmp_path)
+        upload_legacy(
+            server["legacy"],
+            priv,
+            username=server["uploader_user"],
+            password=server["uploader_password"],
+        )
+        priv_doc = wait_for_file_in_index(server["simple"], MAL_ALL_PKG, priv.name)
+        assert any(f["filename"] == priv.name for f in priv_doc["files"]), (
+            "a private package sharing a MAL name was wrongly scrubbed"
+        )
+
+
+def test_ac4_proxy_listing_scrubs_blocked_file(
+    tmp_path_factory, pypiron_bin, tmp_path, uv_path, uv_venv
+):
+    """AC4 (proxy): the proxy's rendered PEP 503/691 listing excludes an upstream
+    MAL-blocked file but keeps a clean version, which then installs through the
+    proxy. Proxy listings are mirror-origin by definition, so the scrub is
+    unconditional (no origin read)."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    with _advisory_proxy_pair(tmp_path_factory, pypiron_bin, feed) as pair:
+        upstream, proxy = pair["upstream"], pair["proxy"]
+        pbase = proxy["base_url"]
+        assert _poll_metric(pbase, "pypiron_advisory_snapshot_age_seconds") is not None
+
+        # Upstream hosts a blocked and a clean version (it has no gate of its own).
+        bad = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+        clean = make_wheel(MAL_EXACT_PKG, "1.4.0", tmp_path)
+        for dist in (bad, clean):
+            upload_legacy(
+                upstream["legacy"],
+                dist,
+                username=upstream["uploader_user"],
+                password=upstream["uploader_password"],
+            )
+        wait_for_file_in_index(upstream["simple"], MAL_EXACT_PKG, clean.name)
+
+        # The proxy's rendered listing scrubs the blocked file, keeps the clean one.
+        names = {f["filename"] for f in get_index_json(proxy["simple"], MAL_EXACT_PKG)["files"]}
+        assert bad.name not in names, f"proxy listed a blocked file: {names}"
+        assert clean.name in names, f"proxy dropped the clean file: {names}"
+
+        code, body, _ = http_get(f"{proxy['simple']}{MAL_EXACT_PKG}/")
+        assert code == 200, code
+        html = body.decode()
+        assert bad.name not in html, "proxy HTML linked a blocked file"
+        assert clean.name in html, "proxy HTML dropped the clean file"
+
+        # The clean version proxies and installs.
+        rc, out, err = _uv_install(uv_path, uv_venv, proxy, f"{MAL_EXACT_PKG}==1.4.0")
+        assert rc == 0, f"clean version failed to proxy-install:\n{out}\n{err}"
+        run_checked([str(uv_venv), "-c", f"import {_import_name(MAL_EXACT_PKG)}"])
+
+
+def test_ac5_quarantine_reaches_the_byte_gate_after_sweep(tmp_path_factory, pypiron_bin, tmp_path):
+    """AC5: a mirror-origin file of a project with relayed PEP 792 `quarantined`
+    status 403s at the byte gate after the worker's next sweep derives the
+    quarantined set (bounded by one reconcile interval); the listing empties
+    immediately at render time as before. Clearing the status dequarantines — the
+    gate serves the file again once the derived set updates, so dequarantine
+    propagates too. A non-MAL name, so the block is purely the relayed quarantine."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    # A fast reconcile sweep so the worker-derived quarantined set turns over quickly.
+    with advisory_server(
+        tmp_path_factory, pypiron_bin, feed, extra_args=["--reconcile-interval-secs", "2"]
+    ) as server:
+        base = server["base_url"]
+        assert _poll_metric(base, "pypiron_advisory_snapshot_age_seconds") is not None
+
+        pkg = "quarantinee"
+        wheel = make_wheel(pkg, "1.0.0", tmp_path)
+        _mirror_upload(server, wheel)
+        wait_for_file_in_index(server["simple"], pkg, wheel.name)
+
+        file_url = f"{base}/files/{pkg}/{wheel.name}"
+        # Before quarantine the gate serves the file (no advisory, no quarantine).
+        assert _poll_http_status(file_url, {200, 302}), "clean mirror file was not served"
+
+        before = _metric_value(_metrics_text(base), "pypiron_blocked_downloads_total")
+        assert before is not None
+
+        # Relay a PEP 792 quarantine via the admin endpoint (as a sync would).
+        status_url = f"{base}/project/{pkg}/status"
+        admin = {"username": server["admin_user"], "password": server["admin_password"]}
+        code, _, _ = http_request_auth(
+            "POST", status_url, data=b'{"status":"quarantined"}', **admin
+        )
+        assert code == 200, code
+
+        # The listing empties immediately at render time (existing PEP 792 behavior).
+        doc = _wait_index_empty(server["simple"], pkg)
+        assert doc["project-status"]["status"] == "quarantined"
+        assert doc["files"] == []
+
+        # The byte gate blocks after the next sweep derives the quarantined set.
+        blocked = _poll_http_status(file_url, {403})
+        assert blocked is not None, "quarantine never reached the byte gate within the bound"
+        assert b"quarantined" in blocked[1], blocked
+        assert _poll_blocked_at_least(base, before + 1), "tripwire metric never moved"
+
+        # Clearing the status dequarantines: the gate serves the file again once the
+        # derived set drops it (dequarantine must propagate, not just quarantine).
+        code, _, _ = http_request_auth("DELETE", status_url, **admin)
+        assert code == 200, code
+        assert _poll_http_status(file_url, {200, 302}), (
+            "dequarantine never reached the byte gate within the bound"
+        )
+
+
 # ------------------------------- test helpers --------------------------------
+
+
+def _poll_http_status(url: str, accept: set, *, timeout: float = 30.0):
+    """Poll GET(url) until its status is in `accept`; return (code, body) or None.
+    The quarantined set is worker-derived, so the gate turns over on the sweep, not
+    the request — a bounded poll, never a blind sleep."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        code, body, _ = http_get(url)
+        if code in accept:
+            return code, body
+        time.sleep(0.2)
+    return None
+
+
+def _wait_index_empty(simple_url: str, pkg: str, *, timeout: float = 30.0) -> dict:
+    """Poll `pkg`'s PEP 691 index until quarantine has emptied its file list."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        doc = get_index_json(simple_url, pkg)
+        if doc.get("files") == [] and doc.get("project-status", {}).get("status") == "quarantined":
+            return doc
+        time.sleep(0.2)
+    raise AssertionError(f"index for {pkg} never emptied under quarantine within {timeout}s")
 
 
 def _dead_proxy_env() -> dict:

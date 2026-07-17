@@ -62,6 +62,11 @@ const BUCKET_HEALTH_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const INTENT_SUFFIX: &str = ".intent";
 const COMMIT_SUFFIX: &str = ".commit";
 
+/// The per-project PEP 792 status sidecar as it appears in a `packages/<pkg>/`
+/// listing (prefix stripped). Presence in the listing is the cheap gate before
+/// the sweep pays a status read to derive the quarantined-project set (rung 5).
+const PROJECT_STATUS_FILE: &str = ".project-status.json";
+
 /// Unique per-event marker id: wall nanos + pid + process-local counter +
 /// per-call randomized entropy. The deterministic fields make logs useful;
 /// entropy prevents two processes with the same pid and clock from claiming
@@ -1177,6 +1182,9 @@ pub async fn audit(
     let mut rebuilt = 0usize;
     let mut skipped = 0usize;
     let mut pkg_stats: Vec<(String, PkgStat)> = Vec::new();
+    // Accumulated across every shard — the quarantined set is fleet-wide truth, so
+    // it may only be published once the whole corpus has been swept (below).
+    let mut quarantined_names: Vec<String> = Vec::new();
 
     // Shards enumerate in parallel — that is what the sharding is for. The
     // bound keeps peak memory at a few shards' worth of listings (a shard is
@@ -1195,6 +1203,7 @@ pub async fn audit(
                     skipped += result.skipped;
                     failures += result.failures;
                     pkg_stats.extend(result.pkg_stats);
+                    quarantined_names.extend(result.quarantined);
                 }
                 Err(e) => {
                     error!(shard=%shard, error=?e, "audit: shard failed");
@@ -1212,6 +1221,18 @@ pub async fn audit(
     update_global_index(state, storage, &live, &dead).await?;
     if failures > 0 {
         return Err(anyhow!("audit finished with {failures} failure(s)"));
+    }
+    // A clean full cycle: publish the quarantined set for the byte gate. Only
+    // when blocking is armed (the gate is the sole consumer) so a blocking-off
+    // server never writes `_advisories/`. Persists on change only, and swaps the
+    // leader's own in-memory set immediately (see `advisories::publish_quarantined`).
+    if state.malware_block {
+        let set: std::collections::BTreeSet<String> = quarantined_names.into_iter().collect();
+        if let Err(e) =
+            crate::advisories::publish_quarantined(storage, &state.advisories, set).await
+        {
+            warn!(error=?e, "audit: publishing quarantined set failed; serving last set");
+        }
     }
     let duration_secs = started.elapsed().as_secs_f64();
     let m = &state.metrics;
@@ -1251,6 +1272,10 @@ struct ShardAudit {
     /// Provably unchanged (fingerprint hit): zero reads spent.
     skipped: usize,
     failures: usize,
+    /// Packages in this shard whose PEP 792 status blocks downloads
+    /// (`quarantined`), derived from the sidecars the listing flagged. Merged
+    /// across shards into the fleet quarantined set once a full sweep completes.
+    quarantined: Vec<String>,
     /// Per-package inventory derived from the shard listing (no extra reads):
     /// artifact files (sidecars excluded), bytes, and distinct releases, for
     /// every package with at least one artifact. Summed to re-baseline the
@@ -1304,8 +1329,13 @@ async fn audit_shard(
         skipped: 0,
         failures: 0,
         pkg_stats: Vec::new(),
+        quarantined: Vec::new(),
     };
     let mut fresh: std::collections::HashMap<String, String> = Default::default();
+    // Packages whose listing shows the PEP 792 sidecar: the rare set that pays a
+    // status read below to derive the quarantined set. Only collected when the
+    // byte gate would consult it, so a blocking-off server does zero extra work.
+    let mut status_pkgs: Vec<String> = Vec::new();
     let mut packages: Vec<(String, String, bool, bool, Vec<String>)> =
         Vec::with_capacity(by_pkg.len());
     for (pkg, (t, v)) in by_pkg {
@@ -1317,6 +1347,9 @@ async fn audit_shard(
             .iter()
             .filter_map(|obj| obj.key.strip_prefix(&prefix))
             .collect();
+        if state.malware_block && members.contains(PROJECT_STATUS_FILE) {
+            status_pkgs.push(pkg.clone());
+        }
         let mut versions: HashSet<String> = HashSet::new();
         let mut file_count = 0u32;
         let mut pkg_bytes = 0u64;
@@ -1509,6 +1542,27 @@ async fn audit_shard(
     require_generation(state, generation)?;
     let bytes = serde_json::to_vec(&std::collections::BTreeMap::from_iter(fresh.iter()))?;
     put_if_changed(state, storage, &fp_key, bytes, "application/json").await?;
+
+    // Derive this shard's quarantined-project set: a status read for each of the
+    // (rare) sidecar-bearing packages, bounded like the rebuild fan-out. A read
+    // failure is a shard failure — `audit` then refuses to publish a set that
+    // might be missing a still-quarantined project (a partial set flaps
+    // dequarantines), so the last-published set stands.
+    for chunk in status_pkgs.chunks(PACKAGE_SWEEP_CONCURRENCY) {
+        let reads = chunk
+            .iter()
+            .map(|pkg| async move { (pkg, crate::status::read_status(storage, pkg).await) });
+        for (pkg, result) in futures::future::join_all(reads).await {
+            match result {
+                Ok(doc) if doc.status.blocks_downloads() => out.quarantined.push(pkg.clone()),
+                Ok(_) => {}
+                Err(e) => {
+                    error!(package=%pkg, error=?e, "audit: quarantined-set status read failed");
+                    out.failures += 1;
+                }
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -2543,6 +2597,43 @@ async fn put_if_changed(
     Ok(())
 }
 
+/// The renderable files with MAL-blocked ones removed, or `None` when no scrub
+/// applies — blocking disarmed/unfed, no file blocked, or a package that isn't
+/// mirror-origin (a private package sharing a MAL name keeps listing, and the
+/// byte gate is the guarantee either way). The origin read is paid only on a
+/// blocked-file hit; the common package is a pure hash probe. Fail-open on the
+/// origin read: a listing we couldn't prove mirror is left intact, and the gate
+/// still 403s the download.
+async fn malware_scrubbed_files(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    files: &[FileMetadata],
+) -> Option<Vec<FileMetadata>> {
+    if !state.malware_block {
+        return None;
+    }
+    let snap = state.advisory_snapshot();
+    let db = snap.db.as_ref()?;
+    let is_blocked = |file: &FileMetadata| {
+        let version = infer_version_from_filename(&file.filename);
+        !crate::advisories::blocking_advisories(db, pkg, version.as_deref()).is_empty()
+    };
+    if !files.iter().any(&is_blocked) {
+        return None; // common path: no hit, no origin read
+    }
+    match crate::origin::read_origin_claim(storage, pkg).await {
+        Ok(Some(crate::origin::OriginState::Mirror)) => Some(
+            files
+                .iter()
+                .filter(|file| !is_blocked(file))
+                .cloned()
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 async fn write_pkg_indexes(
     state: &AppState,
     storage: &dyn Storage,
@@ -2553,6 +2644,13 @@ async fn write_pkg_indexes(
     // re-render against the prior index rather than assume `active` and, say,
     // re-expose links for a project that should be quarantined.
     let status = crate::status::read_status(storage, pkg).await?;
+    // Malware scrub: drop individual MAL-blocked files from the rendered view
+    // (the byte gate is the guarantee; a scrubbed listing is hygiene). Only
+    // mirror-origin packages are filtered, so a private package sharing a MAL
+    // name keeps listing (origin exclusivity, the gate's exemption). No-op unless
+    // blocking is armed and a snapshot is loaded.
+    let scrubbed = malware_scrubbed_files(state, storage, pkg, files).await;
+    let files: &[FileMetadata] = scrubbed.as_deref().unwrap_or(files);
     // Quarantine omits file links; the delete-vs-render decision upstream still
     // keys on the real artifact count, so a quarantined project keeps a
     // status-bearing (link-free) page instead of 404ing.

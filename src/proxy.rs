@@ -246,6 +246,22 @@ impl PresenceCache {
     }
 }
 
+/// Is `pkg`'s `filename` condemned by a MAL advisory in the live snapshot?
+/// Proxy listings are mirror-origin by definition, so this never reads origin —
+/// the block applies unconditionally. A no-op (`false`) unless blocking is armed
+/// and a snapshot is loaded; the common file is a pure hash probe.
+fn advisory_blocks(state: &AppState, pkg: &str, filename: &str) -> bool {
+    if !state.malware_block {
+        return false;
+    }
+    let snap = state.advisory_snapshot();
+    let Some(db) = &snap.db else {
+        return false;
+    };
+    let version = infer_version_from_filename(filename);
+    !advisories::blocking_advisories(db, pkg, version.as_deref()).is_empty()
+}
+
 /// May this package be served from upstream at all? Private names, the reserved
 /// prefix, and (when a scope is configured) names outside the allowlist never
 /// fall through — that is the entire defense.
@@ -480,6 +496,10 @@ impl Proxy {
                     .iter()
                     .any(|suffix| names.contains(&format!("{}{suffix}", file.filename)))
             })
+            // Re-scrub blocked files here too: `found` is cached for a TTL, so a
+            // MAL advisory that arrived after the listing was fetched is caught at
+            // render time even against a stale cache entry.
+            .filter(|file| !advisory_blocks(state, pkg, &file.filename))
             .map(SimpleFile::as_file_metadata)
             .collect();
         let render_files: &[FileMetadata] = if found.status.status.blocks_downloads() {
@@ -880,7 +900,7 @@ impl Proxy {
             .metrics
             .proxy_listing_fetches
             .fetch_add(1, Ordering::Relaxed);
-        let listing = match self.fetch_listing(pkg).await {
+        let listing = match self.fetch_listing(state, pkg).await {
             Ok(listing) => listing,
             Err(e) => {
                 state
@@ -928,7 +948,7 @@ impl Proxy {
         })
     }
 
-    async fn fetch_listing(&self, pkg: &str) -> Result<Listing> {
+    async fn fetch_listing(&self, state: &AppState, pkg: &str) -> Result<Listing> {
         let Some(index) =
             simple::fetch_index(&self.client, &self.upstream, pkg, Some(SMALL_FETCH_TIMEOUT))
                 .await?
@@ -949,6 +969,10 @@ impl Proxy {
             // only matching versions, exactly as `sync` mirrors only matching
             // versions. No scope → kept.
             .filter(|f| self.version_in_scope(pkg, &f.filename))
+            // Malware scrub: a proxy listing is mirror-origin by definition, so a
+            // MAL-blocked version is dropped unconditionally (no origin read).
+            // Best-effort — the byte gate and fill refusal are the guarantees.
+            .filter(|f| !advisory_blocks(state, pkg, &f.filename))
             .collect();
         let metas: Vec<FileMetadata> = files.iter().map(SimpleFile::as_file_metadata).collect();
         let render_metas: &[FileMetadata] = if status.status.blocks_downloads() {

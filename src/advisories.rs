@@ -429,15 +429,22 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 #[derive(Default)]
 pub struct AdvisoryState {
     /// The parsed views, or `None` until the first snapshot loads (armed but
-    /// unfed — nothing to block yet, degraded not fatal).
-    pub db: Option<AdvisoryDb>,
+    /// unfed — nothing to block yet, degraded not fatal). Behind an `Arc` so a
+    /// quarantined-set swap (a separate, more frequent event) carries the whole
+    /// db forward with a refcount bump — never a deep clone under the write lock.
+    pub db: Option<Arc<AdvisoryDb>>,
     /// Content identity of the loaded snapshot (hex sha256 of the zip).
     pub zip_sha256: Option<String>,
     /// The storage `ObjectMeta.etag` the loaded snapshot was read at, so the
     /// follower reload skips the 32 MB GET when the key hasn't moved.
     pub storage_etag: Option<String>,
-    /// Worker-derived `quarantined` projects (rung 5); carried across reloads.
+    /// Worker-derived `quarantined` projects (rung 5), consulted by the byte
+    /// gate. Carried across feed reloads; swapped by its own etag-gated reload.
     pub quarantined: HashSet<String>,
+    /// The storage `ObjectMeta.etag` [`QUARANTINED_KEY`] was read at, so the
+    /// every-node reload skips the GET when the set hasn't moved. Absent key and
+    /// never-loaded both read as `None` → an empty set that never un-blocks.
+    pub quarantined_etag: Option<String>,
     /// Unix seconds of the load (0 = never loaded).
     pub loaded_unix: u64,
 }
@@ -603,10 +610,11 @@ async fn load_from_storage(storage: &dyn Storage) -> Result<Option<AdvisoryState
     let bytes = storage.get_bytes(FEED_KEY).await?;
     let (db, sha) = parse_off_thread(bytes).await?;
     Ok(Some(AdvisoryState {
-        db: Some(db),
+        db: Some(Arc::new(db)),
         zip_sha256: Some(sha),
         storage_etag: Some(etag),
         quarantined: HashSet::new(),
+        quarantined_etag: None,
         loaded_unix: unix_now(),
     }))
 }
@@ -666,10 +674,11 @@ async fn obtain_from_source(storage: &dyn Storage, feed: &str) -> Option<Advisor
         warn!(error = %e, "advisory feed: persisting snapshot failed; loading in-memory");
     }
     Some(AdvisoryState {
-        db: Some(db),
+        db: Some(Arc::new(db)),
         zip_sha256: Some(sha),
         storage_etag: feed_storage_etag(storage).await.unwrap_or(None),
         quarantined: HashSet::new(),
+        quarantined_etag: None,
         loaded_unix: unix_now(),
     })
 }
@@ -756,6 +765,14 @@ pub async fn refresh(
         Err(e) => debug!(error = %e, "advisory feed: storage reload failed; serving last snapshot"),
     }
 
+    // Every-node quarantined-set reload, on the same tick as the zip. The leader
+    // derives and publishes it from its audit sweep; every node (leader included)
+    // adopts it here when the key's etag moves. Independent of the feed snapshot's
+    // staleness gauge — the quarantined set has its own storage object.
+    if let Err(e) = reload_quarantined(&ctx).await {
+        debug!(error = %e, "advisory feed: quarantined reload failed; serving last set");
+    }
+
     // Arm the gauge only once a snapshot is actually loaded — an armed-but-unfed
     // node has nothing to age.
     let has_snapshot = AdvisoryState::read(ctx.slot).db.is_some();
@@ -815,16 +832,113 @@ async fn reload(ctx: &RefreshCtx<'_>) -> Result<bool> {
     }
     let bytes = ctx.storage.get_bytes(FEED_KEY).await?;
     let (db, sha) = parse_off_thread(bytes).await?;
-    let quarantined = AdvisoryState::read(ctx.slot).quarantined.clone();
-    let next = Arc::new(AdvisoryState {
+    let db = Arc::new(db);
+    // Read the quarantined set under the same lock we store under (no await
+    // between), so a concurrent `publish_quarantined`/`reload_quarantined` swap
+    // is carried forward instead of clobbered — the two swaps each preserve the
+    // other's field.
+    let mut guard = ctx.slot.write().unwrap_or_else(|p| p.into_inner());
+    *guard = Arc::new(AdvisoryState {
         db: Some(db),
         zip_sha256: Some(sha),
         storage_etag: Some(etag),
-        quarantined,
+        quarantined: guard.quarantined.clone(),
+        quarantined_etag: guard.quarantined_etag.clone(),
         loaded_unix: unix_now(),
     });
-    *ctx.slot.write().unwrap_or_else(|p| p.into_inner()) = next;
     Ok(true)
+}
+
+/// `QUARANTINED_KEY`'s current storage etag (a 1-key LIST, no body), or `None`
+/// when the leader has never written the set — which reads as an empty set.
+async fn quarantined_storage_etag(storage: &dyn Storage) -> Result<Option<String>> {
+    let page = storage.list_page(QUARANTINED_KEY, None, 1).await?;
+    Ok(page
+        .into_iter()
+        .find(|m| m.key == QUARANTINED_KEY)
+        .map(|m| m.etag))
+}
+
+/// Parse the persisted quarantined-set JSON (a sorted string array) into a set.
+fn parse_quarantined(bytes: &[u8]) -> Result<HashSet<String>> {
+    let names: Vec<String> = serde_json::from_slice(bytes).context("parsing quarantined set")?;
+    Ok(names.into_iter().collect())
+}
+
+/// Every-node half for the quarantined set: reload it when `QUARANTINED_KEY`'s
+/// storage etag moves, exactly like the zip. An absent key is an empty set (the
+/// leader has published nothing, or a dequarantine emptied it — the leader writes
+/// `[]`, never deletes, so followers still see the etag move). A garbage body
+/// warns and keeps the previous set: a corrupt read must never un-quarantine.
+/// The db is carried forward under the lock (see [`reload`]).
+async fn reload_quarantined(ctx: &RefreshCtx<'_>) -> Result<()> {
+    let etag = quarantined_storage_etag(ctx.storage).await?;
+    if etag == AdvisoryState::read(ctx.slot).quarantined_etag {
+        return Ok(()); // unchanged (same etag, or still-absent None == None)
+    }
+    let quarantined = match &etag {
+        None => HashSet::new(),
+        Some(_) => match parse_quarantined(&ctx.storage.get_bytes(QUARANTINED_KEY).await?) {
+            Ok(set) => set,
+            Err(e) => {
+                warn!(error = %e, "advisory feed: quarantined set did not parse; keeping previous");
+                return Ok(());
+            }
+        },
+    };
+    swap_quarantined(ctx.slot, quarantined, etag);
+    Ok(())
+}
+
+/// Swap the quarantined set and its etag into the live snapshot, carrying the db
+/// and feed identity forward under the write lock (a refcount bump each, no deep
+/// clone, no await). Shared by the leader's immediate swap and the every-node
+/// reload.
+fn swap_quarantined(
+    slot: &RwLock<Arc<AdvisoryState>>,
+    quarantined: HashSet<String>,
+    quarantined_etag: Option<String>,
+) {
+    let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
+    *guard = Arc::new(AdvisoryState {
+        db: guard.db.clone(),
+        zip_sha256: guard.zip_sha256.clone(),
+        storage_etag: guard.storage_etag.clone(),
+        quarantined,
+        quarantined_etag,
+        loaded_unix: guard.loaded_unix,
+    });
+}
+
+/// Leader: publish the worker-derived quarantined set. Writes `QUARANTINED_KEY`
+/// only when the set actually changed from what's loaded (including an empty
+/// array on a transition to empty, so a dequarantine propagates to followers),
+/// then swaps the leader's own in-memory set immediately so its byte gate reflects
+/// the change without waiting for the next etag poll. `set` must be the result of
+/// a *complete* sweep — a partial set would flap dequarantines.
+pub async fn publish_quarantined(
+    storage: &dyn Storage,
+    slot: &RwLock<Arc<AdvisoryState>>,
+    set: std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let current = AdvisoryState::read(slot);
+    let unchanged = current.quarantined.len() == set.len()
+        && set.iter().all(|name| current.quarantined.contains(name));
+    if unchanged {
+        return Ok(());
+    }
+    // BTreeSet iterates sorted, so the persisted array is stable — an unchanged
+    // set never rewrites the key and stampedes followers into a reload.
+    let names: Vec<&String> = set.iter().collect();
+    let bytes = serde_json::to_vec(&names).context("serializing quarantined set")?;
+    storage
+        .put_bytes(QUARANTINED_KEY, bytes, Some("application/json"))
+        .await
+        .context("persisting quarantined set")?;
+    // Adopt the just-written etag so this node's own reload poll no-ops.
+    let etag = quarantined_storage_etag(storage).await.unwrap_or(None);
+    swap_quarantined(slot, set.into_iter().collect(), etag);
+    Ok(())
 }
 
 /// Read the persisted snapshot bytes for `GET /advisories/feed`, or `None` when

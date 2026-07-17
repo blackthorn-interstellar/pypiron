@@ -59,6 +59,17 @@ const MAX_LISTINGS: usize = 8192;
 const SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Same retry budget as `sync`: at CDN scale, transient errors are routine.
 const DOWNLOAD_ATTEMPTS: u32 = 3;
+/// How long a positive "already cached locally" observation is trusted before a
+/// re-verifying HEAD. Artifacts are immutable, so present→absent only happens on
+/// a delete/prune (rare) or a bucket switch (handled by the generation key), and
+/// a stale hit can only ever skip an upstream fetch and serve local bytes (or a
+/// local 404) — never trigger a fetch — so the bound is about freshness, not
+/// safety. Matches [`LISTING_TTL`].
+const PRESENCE_TTL: Duration = Duration::from_secs(60);
+/// Hard ceiling on remembered artifact keys, mirroring [`MAX_LISTINGS`]: each
+/// distinct proxied download inserts one entry, so without a cap a stream of
+/// distinct downloads grows the map until OOM.
+const MAX_PRESENCE: usize = 65_536;
 
 /// A package page rendered from the upstream listing, ETag precomputed.
 #[derive(Clone)]
@@ -123,6 +134,9 @@ pub struct Proxy {
     /// [`DownloadSlot`]), so it stays bounded by live concurrency, not by the
     /// number of distinct artifacts ever proxied.
     inflight: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Warm-hit accelerator: artifact keys proven present in local storage, so a
+    /// repeat proxied download skips its existence HEAD. See [`PresenceCache`].
+    presence: PresenceCache,
 }
 
 /// Held for the whole download-verify-commit of one artifact key. Dropping it
@@ -145,6 +159,89 @@ impl Drop for DownloadSlot {
                 map.remove(&self.key);
             }
         }
+    }
+}
+
+/// A bounded, generation-keyed set of artifact keys proven to exist in local
+/// storage, so the warm-hit download path can skip its existence HEAD. A proxied
+/// `GET /files/...` for an already-cached artifact needs no upstream work at all;
+/// a positive hit here lets it serve the local bytes directly.
+///
+/// Safe by construction: an entry only ever *elides a HEAD and serves whatever is
+/// on disk*. It can never authorize an upstream fetch — that stays gated by
+/// [`eligible`] on the miss path — so no stale entry can breach the origin fence.
+/// A bucket switch bumps `generation` and clears the map; a delete/prune is
+/// bounded by [`PRESENCE_TTL`] (a stale hit serves a local 404, which the next
+/// post-TTL GET heals by re-HEADing).
+struct PresenceCache {
+    ttl: Duration,
+    max: usize,
+    inner: Mutex<PresenceInner>,
+}
+
+#[derive(Default)]
+struct PresenceInner {
+    seen: HashMap<String, Instant>,
+    generation: u64,
+}
+
+impl PresenceInner {
+    /// Adopt `generation`, clearing every prior observation if it changed — a
+    /// bucket switch invalidates existence proofs taken against the old bucket.
+    fn reconcile(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.seen.clear();
+            self.generation = generation;
+        }
+    }
+}
+
+impl PresenceCache {
+    fn new(ttl: Duration, max: usize) -> Self {
+        Self {
+            ttl,
+            max,
+            inner: Mutex::new(PresenceInner::default()),
+        }
+    }
+
+    /// True when `key` was proven present within the TTL under this generation.
+    fn present(&self, key: &str, generation: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.reconcile(generation);
+        inner
+            .seen
+            .get(key)
+            .is_some_and(|seen| seen.elapsed() < self.ttl)
+    }
+
+    /// Remember that `key` exists locally under `generation`. Stays bounded like
+    /// the listings cache: at the cap, drop expired entries, then clear outright
+    /// if the live set alone still fills it (a re-HEAD per hot key, once).
+    fn record(&self, key: &str, generation: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.reconcile(generation);
+        if inner.seen.len() >= self.max && !inner.seen.contains_key(key) {
+            let ttl = self.ttl;
+            inner.seen.retain(|_, seen| seen.elapsed() < ttl);
+            if inner.seen.len() >= self.max {
+                inner.seen.clear();
+            }
+        }
+        inner.seen.insert(key.to_string(), Instant::now());
+    }
+
+    /// Forget `key`'s existence proof after its artifact is deleted or pruned, so
+    /// the next proxied download re-HEADs (and re-mirrors) instead of serving a
+    /// stale "present" that now points at a local 404. A hard drop, like the
+    /// sibling caches' invalidate: this positive-only cache makes it a plain
+    /// remove, and TTL is only the fallback for removals that can't reach here.
+    fn invalidate(&self, key: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .seen
+            .remove(key);
     }
 }
 
@@ -273,6 +370,7 @@ impl Proxy {
             guard,
             listings: Mutex::new(HashMap::new()),
             inflight: Arc::new(Mutex::new(HashMap::new())),
+            presence: PresenceCache::new(PRESENCE_TTL, MAX_PRESENCE),
         })
     }
 
@@ -335,6 +433,15 @@ impl Proxy {
         &self.upstream
     }
 
+    /// Drop a deleted/pruned artifact's presence proof so the warm-hit path stops
+    /// eliding its HEAD. Without this a delete inside [`PRESENCE_TTL`] would keep
+    /// a stale "present" that serves a local 404 where a re-mirror should happen;
+    /// the admin delete path calls this the same place it invalidates the presign
+    /// cache. `key` is the artifact storage key (`packages/<pkg>/<file>`).
+    pub fn invalidate_presence(&self, key: &str) {
+        self.presence.invalidate(key);
+    }
+
     /// The package page rendered from the upstream listing; `None` means
     /// "serve the local index instead" (upstream 404 or unreachable).
     pub async fn package_index(
@@ -394,6 +501,33 @@ impl Proxy {
         }))
     }
 
+    /// Warm-hit fast path for a proxied artifact download. `Ok(true)` means the
+    /// artifact is already in local storage and can be served as-is — the caller
+    /// must NOT run the eligibility fence, because serving already-local bytes is
+    /// always safe (the fence gates *fetching* from upstream, never local
+    /// delivery). `Ok(false)` means "not known present"; the caller runs the full
+    /// [`eligible`] → [`Proxy::ensure_artifact_cached`] path.
+    ///
+    /// A presence-cache hit costs zero storage ops; a miss pays one HEAD and,
+    /// when the file is present, records it so the next hit is free. This is what
+    /// turns a warm proxied download from three storage ops (origin read +
+    /// existence HEAD + serve) into one (serve).
+    pub async fn artifact_cached_locally(
+        &self,
+        storage: &dyn Storage,
+        key: &str,
+        generation: u64,
+    ) -> Result<bool> {
+        if self.presence.present(key, generation) {
+            return Ok(true);
+        }
+        if storage.head_exists(key).await? {
+            self.presence.record(key, generation);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Download-verify-commit one artifact on a local miss. `Ok(())` always
     /// falls through to normal serving — including when the file simply
     /// doesn't exist upstream (the local 404 is the right answer). `Err` is
@@ -409,6 +543,10 @@ impl Proxy {
             bail!("bucket topology mismatch; proxy cache writes are fenced");
         }
         let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+        // On the cold-miss path this repeats the HEAD `artifact_cached_locally`
+        // just did (its miss is what routed us here) — accepted redundancy: it
+        // only costs on the rare miss, and keeping it lets this function be called
+        // on its own and stay correct (the slot racer below re-checks here too).
         if storage.head_exists(&key).await? {
             return Ok(());
         }
@@ -1097,5 +1235,54 @@ mod tests {
         assert!(!proxy.version_in_scope("demo", "demo-3.0-py3-none-any.whl"));
         assert!(!proxy.version_in_scope("pinned", "pinned-1.5-py3-none-any.whl"));
         assert!(proxy.version_in_scope("pinned", "pinned-2.0-py3-none-any.whl"));
+    }
+
+    #[test]
+    fn presence_cache_records_then_serves_from_ram() {
+        let cache = PresenceCache::new(Duration::from_secs(60), 4);
+        assert!(!cache.present("packages/p/a.whl", 0));
+        cache.record("packages/p/a.whl", 0);
+        assert!(cache.present("packages/p/a.whl", 0));
+    }
+
+    #[test]
+    fn presence_cache_generation_switch_invalidates() {
+        // A bucket switch bumps the generation; an existence proof taken against
+        // the old bucket must not be trusted for the new one.
+        let cache = PresenceCache::new(Duration::from_secs(60), 4);
+        cache.record("packages/p/a.whl", 0);
+        assert!(cache.present("packages/p/a.whl", 0));
+        assert!(
+            !cache.present("packages/p/a.whl", 1),
+            "old-generation observation must not survive a switch"
+        );
+        cache.record("packages/p/a.whl", 1);
+        assert!(cache.present("packages/p/a.whl", 1));
+    }
+
+    #[test]
+    fn presence_cache_expires_after_ttl() {
+        let cache = PresenceCache::new(Duration::from_millis(10), 4);
+        cache.record("packages/p/a.whl", 0);
+        assert!(cache.present("packages/p/a.whl", 0));
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(
+            !cache.present("packages/p/a.whl", 0),
+            "a stale observation must be re-verified, not trusted"
+        );
+    }
+
+    #[test]
+    fn presence_cache_stays_bounded() {
+        // A flood of distinct downloads must not grow the map past its cap.
+        let cache = PresenceCache::new(Duration::from_secs(60), 8);
+        for i in 0..10_000 {
+            cache.record(&format!("packages/p/f{i}.whl"), 0);
+        }
+        let len = cache.inner.lock().unwrap().seen.len();
+        assert!(
+            len <= 8,
+            "presence cache grew to {len} entries past its cap"
+        );
     }
 }

@@ -15,6 +15,7 @@ from .helpers import (
     ACCEPT_PEP691,
     get_index_json,
     http_get,
+    http_request_auth,
     kill_process_tree,
     make_sdist,
     make_wheel,
@@ -123,6 +124,50 @@ def test_private_package_never_falls_through(proxy_pair, tmp_path):
     assert (
         origin_owner((proxy["data_dir"] / "packages" / "mixedpkg" / ".origin").read_text())
         == "private"
+    )
+
+
+def test_local_origin_warm_download_stays_local(proxy_pair, tmp_path):
+    """The warm-hit fast path serves already-local bytes without running the
+    eligibility fence, so it must never substitute upstream bytes for a
+    local-origin name. A private name that also exists upstream (a different
+    version — the dependency-confusion shape) keeps serving the LOCAL file on
+    every repeat, and the upstream version is never served or cached. As a
+    control, a name that exists only upstream still fills on a miss: the fence is
+    skipped only when the bytes are already local, which is always safe."""
+    upstream, proxy = proxy_pair["upstream"], proxy_pair["proxy"]
+
+    # Same name owned locally (1.0) and upstream (2.0). The proxy must serve only
+    # its own local file, warm path included.
+    local = make_wheel("warmmixed", "1.0", tmp_path / "local")
+    _upload(proxy, local, "warmmixed")
+    upstream_wheel = make_wheel("warmmixed", "2.0", tmp_path / "up")
+    _upload(upstream, upstream_wheel, "warmmixed")
+
+    # Warm path: repeated downloads of the local file all serve the LOCAL bytes.
+    for _ in range(4):
+        code, body, _ = http_get(f"{proxy['base_url']}/files/warmmixed/{local.name}")
+        assert code == 200
+        assert hashlib.sha256(body).hexdigest() == sha256_file(local)
+    # The upstream version is never reachable through the private name.
+    code, _, _ = http_get(f"{proxy['base_url']}/files/warmmixed/{upstream_wheel.name}")
+    assert code == 404, "upstream version served for a private name — dependency confusion"
+    assert (
+        origin_owner((proxy["data_dir"] / "packages" / "warmmixed" / ".origin").read_text())
+        == "private"
+    )
+
+    # Control: a name that exists only upstream still fills from upstream on a miss
+    # and serves the verified bytes, cached as mirror origin.
+    up_only = make_wheel("warmupstream", "3.0", tmp_path / "only")
+    _upload(upstream, up_only, "warmupstream")
+    code, body, _ = http_get(f"{proxy['base_url']}/files/warmupstream/{up_only.name}")
+    assert code == 200
+    assert hashlib.sha256(body).hexdigest() == sha256_file(up_only)
+    assert (proxy["data_dir"] / "packages" / "warmupstream" / up_only.name).exists()
+    assert (
+        origin_owner((proxy["data_dir"] / "packages" / "warmupstream" / ".origin").read_text())
+        == "mirror"
     )
 
 
@@ -239,3 +284,41 @@ def test_unknown_package_404s_through_proxy(proxy_pair):
         headers={"Accept": ACCEPT_PEP691},
     )
     assert code == 404
+
+
+def test_deleted_mirror_file_reheals_within_presence_ttl(proxy_pair, tmp_path):
+    """A mirror-cached artifact deleted through the admin API must re-mirror on the
+    next request, not serve a stale 404. The warm-hit presence cache records a file
+    only once it is already on disk, so the *second* GET arms the proof; the delete
+    then has to invalidate it, or a re-request inside PRESENCE_TTL (60s) hits the
+    stale "present", skips the re-mirror HEAD, and 404s where upstream still has the
+    file."""
+    upstream, proxy = proxy_pair["upstream"], proxy_pair["proxy"]
+    wheel = make_wheel("reheal", "1.0", tmp_path)
+    _upload(upstream, wheel, "reheal")
+
+    url = f"{proxy['base_url']}/files/reheal/{wheel.name}"
+    cached = proxy["data_dir"] / "packages" / "reheal" / wheel.name
+
+    # GET #1 downloads-verifies-caches the file; GET #2 finds it on disk and records
+    # the presence proof (the warm-hit fast path). Both serve the verified bytes.
+    for _ in range(2):
+        code, body, _ = http_get(url)
+        assert code == 200
+        assert hashlib.sha256(body).hexdigest() == sha256_file(wheel)
+    assert cached.exists()
+
+    # Admin-delete the cached artifact — a single-bucket mirror eviction.
+    code, _, _ = http_request_auth(
+        "DELETE", url, username=proxy["user"], password=proxy["password"]
+    )
+    assert code == 204
+    assert not cached.exists(), "delete must remove the cached artifact"
+
+    # Re-request immediately, well inside PRESENCE_TTL: the presence proof must have
+    # been invalidated by the delete, so the proxy re-mirrors from upstream and
+    # serves 200. Before the fix the stale presence entry served a local 404.
+    code, body, _ = http_get(url)
+    assert code == 200, "a deleted mirror file must re-mirror from upstream, not 404"
+    assert hashlib.sha256(body).hexdigest() == sha256_file(wheel)
+    assert cached.exists(), "the re-request must re-cache the artifact from upstream"

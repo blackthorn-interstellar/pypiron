@@ -4440,8 +4440,14 @@ async fn files_get(
     // presign/stream logic runs (a presigned redirect never observes a 404,
     // so the fetch can't be triggered by one). The fill runs entirely on the
     // write pin — origin claims and the 409-serialized PUT stay on the write home.
-    if let Some(resp) =
-        proxy_ensure_artifact(&state, write_pinned.storage.as_ref(), &pkg, &filename).await
+    if let Some(resp) = proxy_ensure_artifact(
+        &state,
+        write_pinned.storage.as_ref(),
+        &pkg,
+        &filename,
+        write_pinned.generation,
+    )
+    .await
     {
         return resp;
     }
@@ -4641,12 +4647,33 @@ async fn proxy_ensure_artifact(
     storage: &dyn Storage,
     pkg: &str,
     filename: &str,
+    generation: u64,
 ) -> Option<Response<Body>> {
-    let proxy = match eligible_proxy(state, storage, pkg).await {
-        Some(Ok(proxy)) => proxy,
-        Some(Err(resp)) => return Some(resp),
-        None => return None,
-    };
+    let proxy = state.proxy.as_ref()?;
+    let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+    // Warm-hit fast path: an artifact already in local storage is always safe to
+    // serve as-is. The origin/eligibility fence exists to gate *upstream fetches*,
+    // not local delivery, so a cached file skips it entirely — and skips the
+    // origin read it would cost — and falls through to normal serving. This is the
+    // whole optimization: a warm proxied download drops from three storage ops
+    // (origin read + existence HEAD + serve) to one (serve).
+    match proxy
+        .artifact_cached_locally(storage, &key, generation)
+        .await
+    {
+        Ok(true) => return None,
+        Ok(false) => {}
+        Err(e) => return Some(read_error(e)),
+    }
+    // Local miss: the full fence applies before any upstream contact. A private or
+    // out-of-scope name stops here and never reaches upstream. `eligible` has no
+    // side effects, so gating it behind the existence check changes nothing for a
+    // name that does fall through — it just no longer pays on the warm path.
+    match proxy::eligible(state, storage, pkg).await {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => return Some(read_error(e)),
+    }
     match proxy
         .ensure_artifact_cached(state, storage, pkg, filename)
         .await
@@ -4931,6 +4958,12 @@ pub async fn delete_record(
 
     // Stop handing out the dead URL immediately (same node; peers age out).
     state.presign_cache.invalidate(&key);
+    // Same for the proxy's warm-hit presence proof: without this, a re-request
+    // inside PRESENCE_TTL would hit the stale "present" and serve a local 404
+    // instead of re-mirroring the file from upstream (peers age out via the TTL).
+    if let Some(proxy) = &state.proxy {
+        proxy.invalidate_presence(&key);
+    }
     // The `.origin` claim is durable on purpose: deleting every artifact must
     // not release the name for the *opposite* world to re-claim. Otherwise a
     // credentialed client could empty a mirror-owned public name and re-upload

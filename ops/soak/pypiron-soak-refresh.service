@@ -1,0 +1,9 @@
+# Oneshot invoked by pypiron-soak-refresh.timer. Runs as root: it restarts other
+# units and writes into /opt/pypiron-soak.
+[Unit]
+Description=pypiron VOPR soak — refresh the binary bundle from S3
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/pypiron-soak/soak.env
+ExecStart=/opt/pypiron-soak/fetch-bundle.sh

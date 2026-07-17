@@ -1,0 +1,48 @@
+name: Soak bundle
+
+# Build the aarch64 VOPR binary + ops scripts into the S3 bundle the soak fleet
+# runs. On every master push the fleet self-refreshes onto the new bundle within
+# ~10 min — this is how a merged fix reaches the running soak. Inert until you
+# set the repo variables below, so it never fails on an unconfigured repo:
+#   vars.SOAK_S3_BUCKET   - target bucket (e.g. my-bucket)
+#   vars.SOAK_BUNDLE_KEY  - key (default soak/bundle.tar.gz)
+#   vars.SOAK_AWS_ROLE    - IAM role ARN to assume via GitHub OIDC (s3:PutObject
+#                           on the bundle key)
+#   vars.SOAK_AWS_REGION  - region (default us-east-1)
+on:
+  push:
+    branches: [master]
+    paths: [src/**, examples/vopr.rs, Cargo.toml, Cargo.lock, ops/soak/**]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write # for AWS OIDC
+  contents: read
+
+jobs:
+  bundle:
+    if: vars.SOAK_S3_BUCKET != ''
+    runs-on: ubuntu-24.04-arm # native arm64 → aarch64 binary, no cross-compile
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build vopr
+        run: cargo build --release --example vopr --locked
+      - name: Stage bundle
+        run: |
+          mkdir -p stage
+          cp target/release/examples/vopr stage/vopr
+          cp ops/soak/report.py ops/soak/install.sh ops/soak/fetch-bundle.sh \
+             ops/soak/pypiron-soak@.service ops/soak/pypiron-soak-reporter.service \
+             ops/soak/pypiron-soak-refresh.service ops/soak/pypiron-soak-refresh.timer stage/
+          tar czf bundle.tar.gz -C stage .
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.SOAK_AWS_ROLE }}
+          aws-region: ${{ vars.SOAK_AWS_REGION || 'us-east-1' }}
+      - name: Upload bundle
+        run: |
+          aws s3 cp bundle.tar.gz \
+            "s3://${{ vars.SOAK_S3_BUCKET }}/${{ vars.SOAK_BUNDLE_KEY || 'soak/bundle.tar.gz' }}"

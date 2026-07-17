@@ -1,0 +1,24 @@
+# One reporter per box. It follows the merged journal of every soak instance
+# and writes deduped findings to S3 (ops/soak/report.py). Single process => one
+# shared in-process seen-set => no wasted re-writes. If it dies, systemd
+# restarts it; S3 keys are the signature hashes, so a restart never duplicates a
+# finding. Config (bucket/prefix/optional SNS topic/region) comes from the
+# EnvironmentFile, written at boot from the stack's parameters. Auth is the
+# instance IAM role — no secret on the box.
+[Unit]
+Description=pypiron VOPR soak — S3 finding reporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=soak
+SupplementaryGroups=systemd-journal
+WorkingDirectory=/opt/pypiron-soak
+EnvironmentFile=/etc/pypiron-soak/soak.env
+ExecStart=/bin/sh -c 'exec journalctl -u "pypiron-soak@*.service" -f -n0 -o cat | /usr/bin/python3 /opt/pypiron-soak/report.py'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

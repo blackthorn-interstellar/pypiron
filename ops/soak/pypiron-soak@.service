@@ -1,0 +1,26 @@
+# One VOPR soak process per CPU core. The soak is single-threaded per seed
+# (a current-thread runtime), so N instances of this template — one per core —
+# are how the box uses all its cores. install.sh enables one per nproc.
+#
+# %i is just an instance label; each process picks a random 64-bit --start-seed
+# so every (core, boot) explores a disjoint region of the 2^64 seed space and a
+# reclaimed-and-replaced spot instance churns fresh schedules. Every failing
+# seed still prints its exact value + repro command, so nothing is lost by not
+# persisting a cursor.
+[Unit]
+Description=pypiron VOPR soak (core %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=soak
+WorkingDirectory=/opt/pypiron-soak
+ExecStart=/bin/sh -c 'exec /opt/pypiron-soak/vopr --forever --rotate --start-seed "$(od -An -N8 -tu8 /dev/urandom | tr -d " \n")"'
+Restart=always
+RestartSec=2
+MemoryHigh=768M
+OOMPolicy=continue
+
+[Install]
+WantedBy=multi-user.target

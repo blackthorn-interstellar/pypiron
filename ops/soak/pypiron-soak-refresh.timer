@@ -1,0 +1,12 @@
+# Check S3 for a new bundle every ~10 minutes. A published fix reaches the whole
+# fleet within one interval; instances self-heal onto new code with no push.
+[Unit]
+Description=pypiron VOPR soak — periodic bundle refresh
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

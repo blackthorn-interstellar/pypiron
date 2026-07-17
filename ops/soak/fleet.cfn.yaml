@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  pypiron VOPR soak fleet — a self-healing Auto Scaling Group of Graviton spot
+  instances that run the deterministic simulator forever and write deduped
+  findings to S3. Pure IAM: the box holds no GitHub credential, no toolchain,
+  no repo — it downloads a prebuilt bundle from S3 and soaks. Compute-optimized
+  (c7g/c6g/m7g), NOT burstable t4g: the soak pins every core at 100%, and
+  burstable credits would throttle it to baseline. Spot + price-capacity-
+  optimized maximizes seeds per dollar; the ASG replaces reclaimed instances.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the fleet (egress to S3; no inbound).
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets (ideally across AZs) for spot diversification.
+  S3Bucket:
+    Type: String
+    Description: Bucket holding the soak bundle and receiving findings.
+  BundleKey:
+    Type: String
+    Default: soak/bundle.tar.gz
+    Description: Key of the prebuilt bundle (vopr binary + ops scripts).
+  FindingsPrefix:
+    Type: String
+    Default: soak/findings/
+    Description: Prefix under which the reporter writes one object per distinct bug.
+  SnsTopicArn:
+    Type: String
+    Default: ''
+    Description: Optional SNS topic to notify on each new distinct finding.
+  DesiredCapacity:
+    Type: Number
+    Default: 1
+    Description: >
+      Instances to keep running. 1x c7g.large (2 vCPU) ~= $22/mo on spot and
+      fits a $25 budget; raise for more seeds/resilience (see README.md).
+  MaxSize:
+    Type: Number
+    Default: 2
+  Al2023Arm64Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Resolves the latest Amazon Linux 2023 arm64 AMI at deploy time.
+  RootVolumeGb:
+    Type: Number
+    Default: 8
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Optional — email for the $-budget alarm (blank to skip the budget).
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 25
+
+Conditions:
+  HasBudget: !Not [!Equals [!Ref NotificationEmail, '']]
+  HasSns: !Not [!Equals [!Ref SnsTopicArn, '']]
+
+Resources:
+  SoakRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Session Manager shell access with zero inbound ports.
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: soak-s3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement: !If
+              - HasSns
+              - - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/${BundleKey}
+                - Effect: Allow
+                  Action: s3:PutObject
+                  Resource: !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/${FindingsPrefix}*
+                - Effect: Allow
+                  Action: sns:Publish
+                  Resource: !Ref SnsTopicArn
+              - - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/${BundleKey}
+                - Effect: Allow
+                  Action: s3:PutObject
+                  Resource: !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/${FindingsPrefix}*
+
+  SoakInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref SoakRole]
+
+  SoakSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: pypiron soak - egress only, no inbound (uses SSM for shell)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: outbound to S3 / SSM
+      Tags: [{ Key: Name, Value: pypiron-soak }]
+
+  SoakLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-lt
+      LaunchTemplateData:
+        ImageId: !Ref Al2023Arm64Ami
+        IamInstanceProfile: { Arn: !GetAtt SoakInstanceProfile.Arn }
+        SecurityGroupIds: [!Ref SoakSecurityGroup]
+        MetadataOptions:
+          HttpTokens: required # IMDSv2 only
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref RootVolumeGb
+              VolumeType: gp3
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}' }]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # First-boot bootstrap: fetch the bundle from S3 and hand off to
+            # install.sh. No git, no toolchain — AL2023 ships python3 + aws CLI.
+            set -euxo pipefail
+            exec > >(tee /var/log/soak-bootstrap.log) 2>&1
+
+            mkdir -p /opt/pypiron-soak /etc/pypiron-soak
+            cat >/etc/pypiron-soak/soak.env <<ENV
+            PYPIRON_SOAK_S3_BUCKET=${S3Bucket}
+            PYPIRON_SOAK_S3_PREFIX=${FindingsPrefix}
+            PYPIRON_SOAK_BUNDLE_KEY=${BundleKey}
+            PYPIRON_SOAK_SNS_TOPIC=${SnsTopicArn}
+            AWS_REGION=${AWS::Region}
+            ENV
+
+            aws s3 cp "s3://${S3Bucket}/${BundleKey}" /tmp/bundle.tar.gz --region ${AWS::Region}
+            tar xzf /tmp/bundle.tar.gz -C /opt/pypiron-soak
+            aws s3api head-object --bucket "${S3Bucket}" --key "${BundleKey}" \
+              --region ${AWS::Region} --query ETag --output text >/opt/pypiron-soak/.bundle.etag
+            /opt/pypiron-soak/install.sh
+
+  SoakAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${AWS::StackName}
+      VPCZoneIdentifier: !Ref SubnetIds
+      MinSize: 0
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      HealthCheckType: EC2
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: 0 # 100% spot
+          SpotAllocationStrategy: price-capacity-optimized
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref SoakLaunchTemplate
+            Version: !GetAtt SoakLaunchTemplate.LatestVersionNumber
+          # Diversified Graviton compute pools (run-only, so 2 GB mediums are
+          # fine and cheapest). More pools => fewer simultaneous spot reclaims.
+          Overrides:
+            - InstanceType: c7g.medium
+            - InstanceType: c6g.medium
+            - InstanceType: c7g.large
+            - InstanceType: c6g.large
+            - InstanceType: m7g.medium
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+          PropagateAtLaunch: true
+
+  SoakBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudget
+    Properties:
+      Budget:
+        BudgetName: !Sub ${AWS::StackName}-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref NotificationEmail }
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref NotificationEmail }
+
+Outputs:
+  AsgName:
+    Value: !Ref SoakAsg
+  RoleArn:
+    Value: !GetAtt SoakRole.Arn

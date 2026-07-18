@@ -213,12 +213,28 @@ pub(crate) async fn guarded_get(
     url: Url,
     timeout: Option<Duration>,
 ) -> Result<Response> {
+    guarded_get_with(client, guard, url, timeout, |req| req).await
+}
+
+/// Like [`guarded_get`], but the caller decorates each per-hop request builder —
+/// e.g. to attach a conditional `If-None-Match`. The decorator runs on every hop
+/// so the header survives redirects, and the SSRF re-validation is identical.
+pub(crate) async fn guarded_get_with<F>(
+    client: &Client,
+    guard: &Guard,
+    url: Url,
+    timeout: Option<Duration>,
+    decorate: F,
+) -> Result<Response>
+where
+    F: Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+{
     let mut current = url;
     for _ in 0..=MAX_REDIRECTS {
         // Re-validate every hop, including the upstream-host re-exemption (see
         // check_target): a redirect Location is as untrusted as the listing URL.
         guard.check_target(&current)?;
-        let mut req = client.get(current.clone());
+        let mut req = decorate(client.get(current.clone()));
         if let Some(t) = timeout {
             req = req.timeout(t);
         }

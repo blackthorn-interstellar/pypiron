@@ -22,7 +22,7 @@ use zip::ZipArchive;
 
 use crate::metrics::Metrics;
 use crate::names::normalize_pkg_name;
-use crate::ssrf::{Guard, SsrfGuardResolver};
+use crate::ssrf::{guarded_get_with, Guard, SsrfGuardResolver};
 use crate::storage::{self, Storage};
 
 /// The verbatim snapshot, written by whichever source delivered it (leader OSV
@@ -624,7 +624,13 @@ impl FeedSource {
                 .user_agent(
                     "pypiron-advisory/0.1 (+https://github.com/blackthorn-interstellar/pypiron)",
                 )
+                // The resolver catches name targets (and DNS-rebind); IP-literal
+                // targets are caught by guarded_get's pre-flight, which owns
+                // redirect-following so every hop is re-validated. Auto-follow
+                // would let a redirect Location reach a forbidden literal the
+                // resolver never sees — so disable it and go through guarded_get.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(guard.clone())))
+                .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .read_timeout(std::time::Duration::from_secs(60))
                 .build()
@@ -641,7 +647,7 @@ impl FeedSource {
 
     async fn poll(&self, http_etag: Option<&str>) -> Result<RawFetch> {
         match &self.url_client {
-            Some((client, _guard)) => fetch_url(client, &self.feed, http_etag).await,
+            Some((client, guard)) => fetch_url(client, guard, &self.feed, http_etag).await,
             None => {
                 let bytes = read_path_capped(&self.feed).await?;
                 Ok(RawFetch::Bytes {
@@ -672,19 +678,23 @@ pub async fn fetch_feed_bytes(feed: &str) -> Result<Vec<u8>> {
 /// body; otherwise the ETag rides back for the next poll.
 async fn fetch_url(
     client: &reqwest::Client,
+    guard: &Guard,
     url: &str,
     if_none_match: Option<&str>,
 ) -> Result<RawFetch> {
     use futures::StreamExt;
 
-    let mut req = client.get(url);
-    if let Some(tag) = if_none_match {
-        req = req.header(reqwest::header::IF_NONE_MATCH, tag);
-    }
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("fetching {url}"))?;
+    // Route through the SSRF pre-flight (like proxy/sync): check_target runs on
+    // the initial URL and re-validates every redirect Location, so an IP-literal
+    // hop the DNS resolver can't see is refused rather than followed.
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("parsing advisory feed URL {url}"))?;
+    let resp = guarded_get_with(client, guard, parsed, None, |req| match if_none_match {
+        Some(tag) => req.header(reqwest::header::IF_NONE_MATCH, tag),
+        None => req,
+    })
+    .await
+    .with_context(|| format!("fetching {url}"))?;
     if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Ok(RawFetch::NotModified);
     }

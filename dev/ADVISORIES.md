@@ -1,6 +1,6 @@
 # Advisories: malware blocking and the org audit
 
-Status: design sketch, pre-implementation. One advisory feed powers two
+Status: implemented as of 2026-07-17. One advisory feed powers two
 features: a malware blocklist enforced where bytes are served, and an
 org-level audit report. Vulnerabilities are reported, never blocked;
 malware is blocked, never negotiated. Everything is on by default —

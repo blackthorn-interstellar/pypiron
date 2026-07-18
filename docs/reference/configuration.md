@@ -185,6 +185,8 @@ downloads stream through the node.
 | `--allow-insecure-upstream` | `PYPIRON_ALLOW_INSECURE_UPSTREAM` | `false` | Permit a plaintext `http://` proxy upstream. Off by default: over http a network MITM controls both the artifact bytes and the sha256 they are verified against, so the hash check stops being a control. |
 | `--proxy-allow-host HOST` | `PYPIRON_PROXY_ALLOW_HOST` | none | Permit the proxy to fetch listing-derived URLs (artifact, `.metadata`, `.provenance`, redirect targets) whose host matches `HOST` exactly, even if it resolves to a private address. Repeatable; comma-separated in the env var. Only the configured upstream host is exempt otherwise. |
 | `--proxy-allow-cidr CIDR` | `PYPIRON_PROXY_ALLOW_CIDR` | none | Like `--proxy-allow-host`, but permits any target IP inside `CIDR` (e.g. `10.0.0.0/8`). Repeatable; comma-separated in the env var. |
+| `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | OSV PyPI export | Feed for malware blocking and the org audit: a URL or local path to the [OSV](https://osv.dev) PyPI advisory export. Defaults to `https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip` (named in the startup log); a URL fetch honors `HTTP(S)_PROXY`. `""` disables both features. |
+| `--malware-block true\|false` | `PYPIRON_MALWARE_BLOCK` | `true` | Refuse to serve or cache files the feed flags as malicious. Needs a snapshot source — the feed, or one delivered earlier by `sync`. Explicit `true` that can't obtain a snapshot refuses startup; the default warns "armed but unfed" and self-arms when a snapshot arrives. |
 | `--metrics-project-labels` | `PYPIRON_METRICS_PROJECT_LABELS` | `false` | Attach per-client `project` labels to `/metrics`. Off by default: `/metrics` is unauthenticated and the label derives from the auth username subaddress, so exposing it lets any scraper enumerate internal project names. |
 | `--spool-dir PATH` | `PYPIRON_SPOOL_DIR` | system temp | Upload/proxy spool directory. |
 | `--artifact-delivery auto\|redirect\|stream` | `PYPIRON_ARTIFACT_DELIVERY` | `auto` | Redirect object-store downloads when the client handles it well; otherwise stream. |
@@ -216,6 +218,12 @@ to the network. Half-configured credentials refuse startup.
 Username tags are for attribution: `reader+billing-api` authenticates as
 `reader` and records `billing-api` in request metrics. Tags are capped and
 restricted to `[A-Za-z0-9._-]`.
+
+With the advisory feed enabled, `/metrics` carries two series:
+`pypiron_advisory_snapshot_age_seconds` (age of the loaded snapshot — alert when
+it climbs past your refresh window) and `pypiron_blocked_downloads_total`
+(refused malware downloads; a nonzero rate means a client is still asking for a
+known-bad file).
 
 ## Mirror selection
 
@@ -273,6 +281,7 @@ directly.
 | `--admin-user USER` | `PYPIRON_SYNC_ADMIN_USER` | none | Destination admin user. |
 | `--admin-pass PASS` | `PYPIRON_SYNC_ADMIN_PASS` | none | Destination admin password. |
 | `--private-prefix PREFIX` | `PYPIRON_PRIVATE_PREFIX` | none | Refuse to mirror private names. |
+| `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | relay from `--from` | Ferry the advisory snapshot to `--to` alongside the packages. Unset relays the source server's feed (`GET <from>/advisories/feed`); a URL or path fetches that instead; `""` disables. Best-effort: a feed-less source or a destination without the endpoint warns and the package sync proceeds. Also `[sync].advisory-feed`. |
 | `--concurrency N` | `PYPIRON_SYNC_CONCURRENCY` | `4` | Transfers within one package. |
 | `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8` | Packages in parallel. |
 | `--spool-dir PATH` | `PYPIRON_SYNC_SPOOL_DIR` | system temp | Download spool directory. |
@@ -364,6 +373,9 @@ pending repairs, not bytes.
 | `/metrics` | open | Prometheus metrics. |
 | `/stats/downloads` | read | Global download stats. |
 | `/stats/downloads/<pkg>` | read | Per-package download stats. |
+| `/audit` | admin | Org audit: hosted packages a known advisory affects, ranked by installs (HTML). |
+| `/audit.json` | admin | The same audit report as JSON. |
+| `/advisories/feed` | read (GET), admin (PUT) | Advisory snapshot: readers pull it (etag-conditioned); an admin pushes a delivered one. |
 | `/tokens` | read/uploader/admin, or open reader token | Mint install tokens. |
 | `/files/.../yank` | admin | Yank a file. |
 | `/files/.../delete` | admin | Delete a file. |

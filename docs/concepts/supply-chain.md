@@ -1,14 +1,18 @@
 # Supply-chain defense
 
 Mixing private packages with a public PyPI mirror is where supply-chain attacks
-slip in. pypiron shuts three doors: dependency confusion, malicious fresh
-releases, and tampered files. Each protection below answers one threat.
+slip in. pypiron closes those doors at the server, so every client behind it —
+uv, old pip, poetry, CI, a lockfile from two years ago — gets the same
+protection at once, on by default. It also reports where you're still exposed,
+ranked by what your org installs most.
 
-| Threat | How pypiron stops it | Control |
-| --- | --- | --- |
-| Dependency confusion | Each name is private or public, never both; private names stay reserved | `--private-prefix`, point clients at one index |
-| Malicious fresh releases | A dependency cooldown holds new releases back until they've been vetted | `--exclude-newer` (sync or serve) |
-| Tampered or unattributed files | Filenames can never be overwritten; PyPI's provenance travels with each file | `<filename>.provenance` |
+| Threat | How pypiron stops it |
+| --- | --- |
+| Dependency confusion | Each name is private or public, never both. Private names stay reserved. |
+| Malicious fresh releases | New releases wait seven days — long enough for a bad one to surface. |
+| Known malware | Files a public advisory flags as malicious are refused: no install, no cache. |
+| A release pulled upstream | When PyPI quarantines or removes a project, pypiron stops serving it too. |
+| Tampered or unattributed files | Filenames are never overwritten. PyPI's provenance travels with each file. |
 
 ## Dependency confusion
 
@@ -62,7 +66,7 @@ to upstream:
 See [Setup → Private packages](../guides/setup.md#private-packages) and
 [Setup → Add public PyPI](../guides/setup.md#add-public-pypi).
 
-## Dependency cooldown
+## New releases wait
 
 A compromised maintainer account or a typosquat is most dangerous in its first
 hours, before anyone notices. A **dependency cooldown** puts a window between
@@ -97,6 +101,45 @@ selection](../reference/configuration.md#mirror-selection).
     mirror uploads that carry PyPI's original time — requires the admin
     credential; with none configured, those uploads are refused.
 
+## Known malware never installs
+
+A cooldown buys time; it can't catch what's already confirmed bad. Some releases
+aren't merely risky — they're catalogued malware, in the public advisory
+databases (the same source `uv audit` reads). pypiron refuses to serve those
+files. Ask for a flagged version and the download is refused, naming the
+advisory that condemned it; the on-demand proxy won't fetch and cache one in the
+first place. On by default — you don't turn it on.
+
+This closes a gap every caching mirror has. When a resolver locks a dependency
+through pypiron, it pins a download URL to *this* server. Later PyPI pulls a
+compromised release: it vanishes from pypi.org, but every lockfile in your org
+keeps asking pypiron for the copy it cached — and a plain mirror keeps handing
+it back, forever. pypiron checks the advisory feed at the door instead, so the
+file it served yesterday stops today, the moment the advisory lands — a fresh uv
+run and a two-year-old lockfile alike. One place to fix it; every client fixed.
+
+A private package that happens to share a malicious public name still installs.
+pypiron blocks only the public package the advisory names — a private name of
+your own is, by construction, not that package.
+
+Availability wins over freshness. If the feed source goes unreachable, clean
+packages keep installing and nothing slows down; blocking just stops getting
+fresher, and a staleness gauge climbs so you can alert before it drifts. It
+degrades toward stale, never toward down. A blocked download is itself worth an
+alert: it means some machine in your fleet is still asking for malware.
+
+Blocking can be turned off, or the whole advisory feature disabled, from
+[Configuration → Server](../reference/configuration.md#server).
+
+## Pulled upstream, pulled here
+
+PyPI sometimes quarantines a project outright — a compromised account, a malware
+finding — freezing it so nothing new resolves. pypiron relays that state. A
+quarantined project lists no files here, and a direct download of one is
+refused, so a URL already pinned in a lockfile can't route around the empty
+listing. When a single file is removed upstream, `sync` marks it withdrawn the
+same way. Whatever PyPI stops standing behind, pypiron stops serving.
+
 ## Provenance and immutability
 
 A filename, once uploaded, is never replaced (PyPI's own rule); pypiron rejects
@@ -113,15 +156,52 @@ even an air-gapped build confirms the original publisher.
 pypiron is a relay, not a verifier: it never runs Sigstore or mints provenance,
 so a direct upload carrying first-party attestations is refused.
 
+## Know what you're exposed to
+
+Blocking stops malware. It says nothing about the ordinary vulnerabilities
+already sitting in packages you host — those are reported, not blocked, because
+blocking on a CVE would break your pinned builds by Tuesday. The audit is that
+report: every hosted package a known advisory affects, with its severity and the
+version that fixes it, **ranked by how often your org installs it.** The top of
+the list is your real exposure — the vulnerable thing everyone pulls a hundred
+times a day, not the one nobody touches.
+
+No client-side tool can produce this. `uv audit` answers "what does *this*
+project depend on"; pypiron already holds the whole corpus, every download
+count, and the same advisory feed, so it answers "what does the *org* host and
+install." It's a plain page at `/audit` (with a JSON twin for scripts), and each
+project's own page carries the advisory list for that package. Admin-only: a
+ranked list of your soft spots is exactly what an attacker would want, so it
+rides the strongest credential.
+
 ## The air-gapped endgame
 
 The proxy still talks to live PyPI on a cache miss. `sync` removes that surface:
 pre-load an approved package list from a host with egress, then serve from a node
 without egress.
 
+Malware blocking crosses the same gap. A server with no internet can't fetch the
+advisory feed itself, so you deliver it. A pypiron-to-pypiron `sync` ferries the
+feed alongside the packages on its own; against a public source, point `sync` at
+the OSV export on the connected side:
+
+```bash
+pypiron sync --to http://airgapped:8080 \
+  --advisory-feed https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip
+```
+
+No sync in the picture? Point the server's own `--advisory-feed` at a local file
+and have your ferry drop a fresh copy there on whatever schedule it runs. However
+the feed arrives, blocking and the audit behave identically — an unfed
+air-gapped box says so in its logs until the first feed lands, then arms itself
+without a restart.
+
 ## See also
 
-- [Configuration](../reference/configuration.md#mirror-selection) — the shared
-  mirror-selection surface, with env-var and `[mirror]`-table equivalents.
+- [Configuration → Server](../reference/configuration.md#server) — the advisory
+  feed and malware-blocking knobs, the `/audit` and feed endpoints, and the
+  metrics to alert on.
+- [Configuration → Mirror selection](../reference/configuration.md#mirror-selection)
+  — the shared cooldown surface, with env-var and `[mirror]`-table equivalents.
 - [How it's tested](testing.md) — how these defenses are verified: chaos, fuzzing,
   and a full-PyPI parser check.

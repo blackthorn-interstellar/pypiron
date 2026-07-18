@@ -497,8 +497,15 @@ _advisories/osv-pypi.zip                 # the OSV PyPI advisory export, carried
                                          #   (or a sync/ferry re-delivers). Never truth, never a
                                          #   view, NEVER fanned out as truth across buckets, so a
                                          #   failover never disarms blocking. Reader GET / admin PUT
-                                         #   /advisories/feed. (quarantined.json + report.json join
-                                         #   it here in later rungs — see ADVISORIES.md.)
+                                         #   /advisories/feed.
+_advisories/quarantined.json             # worker-derived set: normalized names whose relayed PEP 792
+                                         #   status is `quarantined`, so the byte gate refuses their
+                                         #   mirror-origin files by a hash probe. Republished only on
+                                         #   a clean sweep; reloaded on the same etag tick as the zip.
+_advisories/report.json                  # the org audit: hosted (name, version) rows a known advisory
+                                         #   affects, joined with 30-day counters, ranked by installs.
+                                         #   Served admin-gated at /audit + /audit.json. Both this and
+                                         #   quarantined.json are DERIVED from the zip + corpus.
 _leader/lease.json                       # multi-node lease (holder, term, expires-at)
 _topology/stamp.json                     # multi-bucket only: fail-closed config check — a hash of the
                                          #   ordered bucket identities + operator topology generation,

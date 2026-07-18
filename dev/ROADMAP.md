@@ -36,6 +36,7 @@ What's shipped, what's on the table, and what we've decided against. The bar for
 - `--private-prefix` reserved namespace (normalized-name matching).
 - Three-tier basic auth (admin ⊇ uploader ⊇ reader); read-only by default when no write credential is set.
 - Stateless install tokens (`--token-signing-key`): `POST /tokens` (or `pypiron create-token`) mints a short-lived (5 min) HMAC-signed bearer token presented as `__token__`, capped at the minting credential's role, carrying auto-detected repo/commit/user for attribution. Self-expiring, nothing stored — distinct from the durable *Scoped API tokens* item below.
+- **Advisories: malware blocking + org audit** — one OSV feed (the PyPI export `uv audit` uses) powers two on-by-default features: known-malware files refused where bytes are served, closing the lockfile-pins-cached-malware gap a caching mirror inherits from PyPI; and an admin org audit joining the corpus, download counters, and the advisory index, ranked by what the org installs. Malware is blocked, vulnerabilities reported. Design and acceptance criteria in [ADVISORIES.md](ADVISORIES.md); the user story is [Supply-chain defense](../docs/concepts/supply-chain.md).
 
 **Operations & management**
 - `/health`, Prometheus `/metrics`, `--log-format json`, per-project traffic attribution via username subaddressing.
@@ -50,16 +51,6 @@ performance change with its before/after.
 ## Planned
 
 Tracked so they don't get lost. Not commitments — bucketed by intent.
-
-### In progress
-
-**Advisories: malware blocking + org audit.** One OSV feed (the PyPI export uv
-audit also uses) powers two on-by-default features: a malware blocklist enforced
-where bytes are served — closing the lockfile-pins-cached-malware gap a caching
-mirror inherits from PyPI — and an org-level audit joining the corpus, the
-download counters, and the advisory index. Vulnerabilities are reported, never
-blocked; malware is blocked, never negotiated. Shipped in blackbox-tested rungs;
-full design, acceptance criteria, and rung list in [ADVISORIES.md](ADVISORIES.md).
 
 ### Maybe
 

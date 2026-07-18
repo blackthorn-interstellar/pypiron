@@ -92,6 +92,20 @@ def test_a_token_cannot_exceed_its_minting_credential(disk_server_token_auth):
     assert _mint(server, role="superuser", auth=admin)[0] == 400
 
 
+def test_a_token_cannot_mint_another_token(disk_server_token_auth):
+    # A leaked token must not refresh itself indefinitely: minting requires a base
+    # credential, so presenting a token as the minting credential is refused. This
+    # keeps the short TTL meaningful — the basis for carrying no revocation list.
+    server = disk_server_token_auth
+    _, body, _ = _mint(
+        server, role="uploader", auth=(server["admin_user"], server["admin_password"])
+    )
+    token = json.loads(body)["token"]
+    # The token can read/publish, but it cannot mint — for its own role or a lesser.
+    assert _mint(server, role="uploader", auth=("__token__", token))[0] == 403
+    assert _mint(server, role="reader", auth=("__token__", token))[0] == 403
+
+
 def test_an_uploader_token_can_publish(disk_server_token_auth, tmp_path):
     server = disk_server_token_auth
     # Mint an uploader token (admin credential grants uploader), then publish a

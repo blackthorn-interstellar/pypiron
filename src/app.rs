@@ -6114,6 +6114,17 @@ async fn mint_token(
         StatusCode::FORBIDDEN,
         "token minting is disabled (no --token-signing-key configured)".to_string(),
     ))?;
+    // A token cannot mint tokens. Minting requires a base (username/password)
+    // credential, so a leaked token can't refresh itself into a fresh full TTL
+    // indefinitely — the short expiry stays meaningful, which is the whole basis
+    // for carrying no revocation list (see TOKEN_TTL_SECS). token_role is Some
+    // only when the presented credential is itself a valid __token__ bearer.
+    if state.token_role(&headers).is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "a token cannot mint tokens; authenticate with a configured credential".to_string(),
+        ));
+    }
     let req: MintRequest = if body.trim().is_empty() {
         MintRequest::default()
     } else {

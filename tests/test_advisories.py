@@ -40,6 +40,7 @@ from .helpers import (
     find_free_port,
     get_index_json,
     http_get,
+    http_head,
     http_request_auth,
     kill_process_tree,
     make_wheel,
@@ -350,6 +351,26 @@ def test_default_disk_server_stays_advisory_hermetic(disk_server):
     assert code == 200
     assert _metric_value(body.decode(), "pypiron_advisory_snapshot_age_seconds") is None
     assert not (Path(disk_server["data_dir"]) / "_advisories").exists()
+
+
+def test_leader_reseeds_snapshot_deleted_from_under_it(tmp_path_factory, pypiron_bin, tmp_path):
+    """`_advisories/` is not replicated, so a failover to a never-seeded bucket
+    would leave the snapshot nowhere reachable and boot a fresh node unfed. The
+    leader re-seeds the bytes it retains in memory when FEED_KEY is absent on its
+    selected bucket. Single-bucket disk exercises the same path: delete the zip out
+    from under an armed server and it reappears byte-identical."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    seeded = feed.read_bytes()
+    with advisory_server(
+        tmp_path_factory, pypiron_bin, feed, extra_args=["--reconcile-interval-secs", "2"]
+    ) as server:
+        assert _poll_metric(server["base_url"], "pypiron_advisory_snapshot_age_seconds") is not None
+        stored = _stored_feed_path(server)
+        assert stored.read_bytes() == seeded, "server did not arm from the local zip"
+        stored.unlink()  # simulate a failover onto a bucket that never had it
+        assert not stored.exists()
+        # The leader's next tick detects the absence and re-persists the retained bytes.
+        _wait_file_bytes(stored, seeded, timeout=15.0)
 
 
 # ------------------------------ enforcement (rung 4) -------------------------
@@ -797,6 +818,18 @@ def test_ac10_unchanged_second_run_transfers_no_body(tmp_path_factory, pypiron_b
         _wait_file_bytes(stored, fixture.read_bytes())
         mtime_before = stored.stat().st_mtime_ns
 
+        # The etag-conditioned skip relies on a stable, quoted HEAD ETag — the
+        # served-from-memory fast path must not read+re-hash the 32 MB zip nor drift
+        # the ETag across polls. HEAD sends no body; GET agrees on the same ETag.
+        feed_url = f"{dbase}/advisories/feed"
+        code, hbody, hhdr = http_head(feed_url)
+        assert code == 200, (code, hbody)
+        etag = hhdr.get("etag")
+        assert etag and etag.startswith('"') and etag.endswith('"'), f"unquoted HEAD ETag: {etag!r}"
+        assert hbody == b"", "HEAD returned a body"
+        assert http_head(feed_url)[2].get("etag") == etag, "HEAD ETag drifted across polls"
+        assert http_get(feed_url)[2].get("etag") == etag, "GET and HEAD ETags disagree"
+
         rc, out, err = _advisory_sync(pypiron_bin, source, dest, "relayok", advisory_feed=fixture)
         assert rc == 0, f"second sync failed:\n{out}\n{err}"
         assert "advisory feed unchanged; skipping push" in (out + err), out + err
@@ -1050,6 +1083,38 @@ def test_ac8_audit_report_lists_seeded_rows_with_downloads(
         assert MAL_ALL_ID not in body.decode(), "private package's page showed a MAL advisory"
 
 
+def test_quarantine_badges_the_project_panel(tmp_path_factory, pypiron_bin, tmp_path):
+    """The project-panel `blocked` badge rolls in quarantine too, mirroring the
+    /audit report — a badge is what the byte gate 403s. An informational
+    vulnerability starts unbadged; once the project is quarantined and the worker
+    derives the set, the same row is badged."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    with advisory_server(
+        tmp_path_factory, pypiron_bin, feed, extra_args=["--reconcile-interval-secs", "2"]
+    ) as server:
+        base = server["base_url"]
+        assert _poll_metric(base, "pypiron_advisory_snapshot_age_seconds") is not None
+        # A mirror-origin release the PYSEC advisory matches (2.0.0 < 2.4.0).
+        wheel = make_wheel(PYSEC_PKG, "2.0.0", tmp_path)
+        _mirror_upload(server, wheel)
+        wait_for_file_in_index(server["simple"], PYSEC_PKG, wheel.name)
+
+        page = f"{base}/project/{PYSEC_PKG}/"
+        # The rendered badge, not the always-present CSS class `.aud-blocked{...}`.
+        badge = '<span class="aud-blocked">blocked</span>'
+        code, body, _ = http_get(page)
+        assert code == 200 and PYSEC_ID in body.decode(), (code, body)
+        assert badge not in body.decode(), "an unquarantined vulnerability was badged blocked"
+
+        # Relay a PEP 792 quarantine; after the sweep derives the set the row is badged.
+        admin = {"username": server["admin_user"], "password": server["admin_password"]}
+        code, _, _ = http_request_auth(
+            "POST", f"{base}/project/{PYSEC_PKG}/status", data=b'{"status":"quarantined"}', **admin
+        )
+        assert code == 200, code
+        assert _poll_page_contains(page, badge), "quarantine never badged the project panel"
+
+
 def test_ac9_audit_id_byte_equals_osv_record(tmp_path_factory, pypiron_bin, tmp_path):
     """AC9: the advisory id in the `/audit.json` PYSEC row is byte-identical to the
     id in the seeded OSV record — the parser never rewrites identity."""
@@ -1174,6 +1239,18 @@ def _poll_http_status(url: str, accept: set, *, timeout: float = 30.0):
             return code, body
         time.sleep(0.2)
     return None
+
+
+def _poll_page_contains(url: str, needle: str, *, timeout: float = 30.0) -> bool:
+    """Poll GET(url) until `needle` is in the rendered body (worker-derived state
+    plus the 1s project-page cache both settle within the bound)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        code, body, _ = http_get(url)
+        if code == 200 and needle in body.decode(errors="replace"):
+            return True
+        time.sleep(0.2)
+    return False
 
 
 def _wait_index_empty(simple_url: str, pkg: str, *, timeout: float = 30.0) -> dict:

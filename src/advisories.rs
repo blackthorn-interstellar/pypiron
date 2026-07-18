@@ -555,6 +555,13 @@ pub struct AdvisoryState {
     pub db: Option<Arc<AdvisoryDb>>,
     /// Content identity of the loaded snapshot (hex sha256 of the zip).
     pub zip_sha256: Option<String>,
+    /// The verbatim snapshot bytes, retained in memory (~32 MB, behind an `Arc`
+    /// so state swaps stay refcount bumps). `_advisories/` is NOT replicated, so
+    /// after a failover to a never-seeded bucket the zip would exist nowhere
+    /// reachable; the leader re-seeds these bytes when it finds `FEED_KEY` absent
+    /// on its selected bucket, keeping a fresh node from booting unfed. Also lets
+    /// `GET /advisories/feed` serve without a 32 MB storage read + re-hash.
+    pub zip: Option<Arc<Vec<u8>>>,
     /// The storage `ObjectMeta.etag` the loaded snapshot was read at, so the
     /// follower reload skips the 32 MB GET when the key hasn't moved.
     pub storage_etag: Option<String>,
@@ -720,11 +727,14 @@ async fn read_path_capped(path: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("reading advisory feed {path}"))
 }
 
-/// Parse feed bytes off the async runtime (a full export is CPU-bound).
-async fn parse_off_thread(bytes: Vec<u8>) -> Result<(AdvisoryDb, String)> {
+/// Parse feed bytes off the async runtime (a full export is CPU-bound). Takes an
+/// `Arc` so the caller retains the same bytes (as [`AdvisoryState::zip`]) without
+/// a second copy — the parse borrows them, the caller keeps the `Arc`.
+async fn parse_off_thread(bytes: Arc<Vec<u8>>) -> Result<(AdvisoryDb, String)> {
     tokio::task::spawn_blocking(move || {
-        let db = parse_feed(&bytes)?;
-        Ok((db, sha256_hex(&bytes)))
+        let slice: &[u8] = &bytes;
+        let db = parse_feed(slice)?;
+        Ok((db, sha256_hex(slice)))
     })
     .await
     .context("advisory parse task panicked")?
@@ -732,7 +742,7 @@ async fn parse_off_thread(bytes: Vec<u8>) -> Result<(AdvisoryDb, String)> {
 
 /// Read `FEED_KEY`'s current storage etag (via a 1-key LIST, no body), or `None`
 /// when no snapshot exists yet.
-async fn feed_storage_etag(storage: &dyn Storage) -> Result<Option<String>> {
+pub async fn feed_storage_etag(storage: &dyn Storage) -> Result<Option<String>> {
     let page = storage.list_page(FEED_KEY, None, 1).await?;
     Ok(page.into_iter().find(|m| m.key == FEED_KEY).map(|m| m.etag))
 }
@@ -742,11 +752,12 @@ async fn load_from_storage(storage: &dyn Storage) -> Result<Option<AdvisoryState
     let Some(etag) = feed_storage_etag(storage).await? else {
         return Ok(None);
     };
-    let bytes = storage.get_bytes(FEED_KEY).await?;
-    let (db, sha) = parse_off_thread(bytes).await?;
+    let zip = Arc::new(storage.get_bytes(FEED_KEY).await?);
+    let (db, sha) = parse_off_thread(zip.clone()).await?;
     Ok(Some(AdvisoryState {
         db: Some(Arc::new(db)),
         zip_sha256: Some(sha),
+        zip: Some(zip),
         storage_etag: Some(etag),
         quarantined: HashSet::new(),
         quarantined_etag: None,
@@ -795,7 +806,8 @@ async fn obtain_from_source(storage: &dyn Storage, feed: &str) -> Option<Advisor
     };
     // Parse once — this both validates the bytes (never seed a bad snapshot with
     // an error page or truncated body) and yields the db to load.
-    let (db, sha) = match parse_off_thread(bytes.clone()).await {
+    let zip = Arc::new(bytes);
+    let (db, sha) = match parse_off_thread(zip.clone()).await {
         Ok(pair) => pair,
         Err(e) => {
             warn!(error = %e, "advisory feed: source did not parse; trying stored snapshot");
@@ -803,7 +815,7 @@ async fn obtain_from_source(storage: &dyn Storage, feed: &str) -> Option<Advisor
         }
     };
     if let Err(e) = storage
-        .put_bytes(FEED_KEY, bytes, Some("application/zip"))
+        .put_bytes(FEED_KEY, (*zip).clone(), Some("application/zip"))
         .await
     {
         warn!(error = %e, "advisory feed: persisting snapshot failed; loading in-memory");
@@ -811,6 +823,7 @@ async fn obtain_from_source(storage: &dyn Storage, feed: &str) -> Option<Advisor
     Some(AdvisoryState {
         db: Some(Arc::new(db)),
         zip_sha256: Some(sha),
+        zip: Some(zip),
         storage_etag: feed_storage_etag(storage).await.unwrap_or(None),
         quarantined: HashSet::new(),
         quarantined_etag: None,
@@ -871,6 +884,16 @@ pub async fn refresh(
                     }
                 }
             }
+        }
+    }
+
+    // The leader re-seeds a snapshot it holds onto a selected bucket that lacks
+    // it — the failover-to-a-starved-bucket heal (`_advisories/` isn't fanned out
+    // as truth, so nothing else would). Runs for any leader (a storage-delivered
+    // feed has no source poll above but must still re-seed).
+    if is_leader {
+        if let Err(e) = reseed_if_absent(&ctx).await {
+            debug!(error = %e, "advisory feed: re-seed check failed; will retry next tick");
         }
     }
 
@@ -947,12 +970,38 @@ async fn poll_and_persist(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut RefreshMe
     if Some(&sha) == loaded_sha.as_ref() {
         return Ok(());
     }
-    // Validate before persisting — the storage copy is what every node loads.
+    // Validate before persisting — the storage copy is what every node loads. The
+    // every-node reload then reads it back and retains the bytes as `zip`.
+    let bytes = Arc::new(bytes);
     parse_off_thread(bytes.clone()).await?;
     ctx.storage
-        .put_bytes(FEED_KEY, bytes, Some("application/zip"))
+        .put_bytes(FEED_KEY, (*bytes).clone(), Some("application/zip"))
         .await
         .context("persisting advisory snapshot")?;
+    Ok(())
+}
+
+/// Leader-only: if the selected bucket is missing `FEED_KEY` but we hold a
+/// snapshot in memory, re-persist the retained bytes. Because `_advisories/` is
+/// never fanned out as truth, a failover to a never-seeded bucket would leave the
+/// zip nowhere reachable — running nodes stay armed on their in-memory copy, but a
+/// fresh node booting onto that bucket (feed maybe unreachable) would come up
+/// armed-but-unfed and serve malware. Re-seeding heals that as long as one armed
+/// node survives; the write is once per absence (the next tick sees the key
+/// present and the normal etag flow resumes). A full-fleet cold start onto a
+/// starved bucket with the feed unreachable is still operator-ferry territory.
+async fn reseed_if_absent(ctx: &RefreshCtx<'_>) -> Result<()> {
+    let Some(zip) = AdvisoryState::read(ctx.slot).zip.clone() else {
+        return Ok(()); // nothing retained to re-seed
+    };
+    if feed_storage_etag(ctx.storage).await?.is_some() {
+        return Ok(()); // the key is present on the selected bucket
+    }
+    ctx.storage
+        .put_bytes(FEED_KEY, (*zip).clone(), Some("application/zip"))
+        .await
+        .context("re-seeding advisory snapshot onto a bucket missing it")?;
+    info!("advisory feed: re-seeded the snapshot onto a selected bucket that was missing it");
     Ok(())
 }
 
@@ -965,8 +1014,8 @@ async fn reload(ctx: &RefreshCtx<'_>) -> Result<bool> {
     if Some(&etag) == AdvisoryState::read(ctx.slot).storage_etag.as_ref() {
         return Ok(false);
     }
-    let bytes = ctx.storage.get_bytes(FEED_KEY).await?;
-    let (db, sha) = parse_off_thread(bytes).await?;
+    let zip = Arc::new(ctx.storage.get_bytes(FEED_KEY).await?);
+    let (db, sha) = parse_off_thread(zip.clone()).await?;
     let db = Arc::new(db);
     // Read the quarantined set under the same lock we store under (no await
     // between), so a concurrent `publish_quarantined`/`reload_quarantined` swap
@@ -976,6 +1025,7 @@ async fn reload(ctx: &RefreshCtx<'_>) -> Result<bool> {
     *guard = Arc::new(AdvisoryState {
         db: Some(db),
         zip_sha256: Some(sha),
+        zip: Some(zip),
         storage_etag: Some(etag),
         quarantined: guard.quarantined.clone(),
         quarantined_etag: guard.quarantined_etag.clone(),
@@ -1038,6 +1088,7 @@ fn swap_quarantined(
     *guard = Arc::new(AdvisoryState {
         db: guard.db.clone(),
         zip_sha256: guard.zip_sha256.clone(),
+        zip: guard.zip.clone(),
         storage_etag: guard.storage_etag.clone(),
         quarantined,
         quarantined_etag,

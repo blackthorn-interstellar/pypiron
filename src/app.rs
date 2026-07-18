@@ -2659,6 +2659,9 @@ async fn advisory_panel_rows(
     let Some(db) = snap.db.as_deref() else {
         return Vec::new();
     };
+    // A quarantined project is refused wholesale at the byte gate, so its rows are
+    // blocked regardless of advisory kind — mirror the /audit report's roll-in.
+    let quarantined = snap.quarantined.contains(pkg);
     let mut rows: Vec<web::AdvisoryPanelRow> = Vec::new();
     for version in versions {
         for record in advisories::advisories_for(db, pkg, version) {
@@ -2667,7 +2670,7 @@ async fn advisory_panel_rows(
                 id: record.id.clone(),
                 severity: record.severity.clone(),
                 fixed_in: record.fixed_in.clone(),
-                blocked: record.id.starts_with("MAL-"),
+                blocked: quarantined || record.id.starts_with("MAL-"),
             });
         }
     }
@@ -5587,35 +5590,70 @@ async fn sync_cursors_put(
 
 /// Serve the stored advisory-snapshot zip (reader-gated), so a mirror-over-HTTP
 /// `sync` can pull it from an upstream pypiron. The ETag is the zip's sha256;
-/// `If-None-Match` short-circuits to 304 (an unchanged feed transfers nothing).
-/// 404 when no snapshot has been delivered yet.
+/// `If-None-Match` short-circuits to 304 and HEAD sends headers only (each sync
+/// poll is one of these). 404 when no snapshot has been delivered yet.
 async fn advisories_feed_get(
     State(state): State<Arc<AppState>>,
+    method: Method,
     headers: HeaderMap,
 ) -> Response<Body> {
     if !state.is_reader(&headers) {
         return unauthorized();
     }
-    let bytes = match advisories::stored_feed_bytes(state.pin().storage.as_ref()).await {
+    let storage = state.pin().storage.clone();
+    // The current storage etag (a 1-key LIST, no body) is the cheap currency
+    // check. When it matches the loaded snapshot, serve the ETag and bytes from
+    // memory — a sync poll (HEAD/304) then costs no 32 MB read and no re-hash.
+    let storage_etag = match advisories::feed_storage_etag(storage.as_ref()).await {
+        Ok(Some(e)) => e,
+        Ok(None) => return not_found("no advisory snapshot"),
+        Err(e) => return read_error(e),
+    };
+    let snap = state.advisory_snapshot();
+    if snap.storage_etag.as_deref() == Some(storage_etag.as_str()) {
+        if let (Some(sha), Some(zip)) = (&snap.zip_sha256, &snap.zip) {
+            return serve_advisory_bytes(&method, &headers, &format!("\"{sha}\""), zip);
+        }
+    }
+    // Slow path: storage moved under us (or this node hasn't loaded it) — read the
+    // bytes and hash them so the ETag always matches the body served.
+    let bytes = match advisories::stored_feed_bytes(storage.as_ref()).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return not_found("no advisory snapshot"),
         Err(e) => return read_error(e),
     };
     let etag = format!("\"{}\"", advisories::sha256_hex(&bytes));
+    serve_advisory_bytes(&method, &headers, &etag, &bytes)
+}
+
+/// Build the advisory-feed response: 304 on a matching `If-None-Match`, headers
+/// only for HEAD, else the full zip body. Shared by the fast (in-memory) and slow
+/// (read-through) paths so both negotiate identically.
+fn serve_advisory_bytes(
+    method: &Method,
+    headers: &HeaderMap,
+    etag: &str,
+    bytes: &[u8],
+) -> Response<Body> {
     let revalidated = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim() == "*" || v.contains(&etag))
+        .map(|v| v.trim() == "*" || v.contains(etag))
         .unwrap_or(false);
-    let builder = Response::builder().header(header::ETAG, &etag);
+    let builder = Response::builder().header(header::ETAG, etag);
     let response = if revalidated {
         builder.status(StatusCode::NOT_MODIFIED).body(Body::empty())
     } else {
-        builder
+        let builder = builder
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/zip")
-            .header(header::CONTENT_LENGTH, bytes.len())
-            .body(Body::from(bytes))
+            .header(header::CONTENT_LENGTH, bytes.len());
+        // HEAD advertises the size without materializing (or sending) the body.
+        if method == Method::HEAD {
+            builder.body(Body::empty())
+        } else {
+            builder.body(Body::from(bytes.to_vec()))
+        }
     };
     response.unwrap_or_else(not_found)
 }

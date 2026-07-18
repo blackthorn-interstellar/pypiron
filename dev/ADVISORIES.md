@@ -54,8 +54,13 @@ to `_advisories/osv-pypi.zip` — the same carry-don't-author pattern as
 key and compare `ObjectMeta.etag` (a LIST, no body; the Storage trait
 has no conditional GET, and `get_with_etag` transfers the full 32 MB),
 fetching only when the etag moves. The HTTP `If-None-Match` refetch
-applies to the leader's OSV pull, not to storage. Every node parses the
-snapshot into two in-memory structures:
+applies to the leader's OSV pull, not to storage. Because `_advisories/`
+is never fanned out as truth, each node retains the verbatim zip in memory
+and the leader re-persists it whenever it finds `FEED_KEY` absent on its
+selected bucket, so a failover to a never-seeded bucket self-heals as long
+as one armed node survives — a full-fleet cold start onto a starved bucket
+with the feed unreachable is the one case that still needs an operator
+ferry. Every node parses the snapshot into two in-memory structures:
 
 - **Block set** — normalized name → malicious version set (or all-versions
   sentinel), from `MAL-*` advisories only.

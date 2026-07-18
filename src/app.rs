@@ -2523,14 +2523,15 @@ async fn render_project(
     // Serve the rendered page straight from RAM when it's warm: the human project
     // page is otherwise a full package-prefix scan + per-file sidecar parse on
     // every hit (see project_cache.rs). The render embeds the request's base URL
-    // (the install snippet's index URL), so the key includes it; the worker drops
-    // a package's entries the instant it rebuilds, and the TTL bounds the rest.
-    // `write_pin` is captured once (design §3) so the cache generation and the
-    // storage handle come from the same selection.
-    let base_url = base_url_from_headers(headers);
+    // (the install snippet's index URL) as a sentinel that serve_project_page
+    // fills in per request, so the cache key is host-independent — a forged Host /
+    // X-Forwarded-Host can't thrash it with distinct keys, each a full scan. The
+    // worker drops a package's entries the instant it rebuilds, and the TTL bounds
+    // the rest. `write_pin` is captured once (design §3) so the cache generation
+    // and the storage handle come from the same selection.
     let write_pin = state.pin();
     let generation = write_pin.generation;
-    let cache_key = project_cache::key(&pkg, requested_version, &base_url);
+    let cache_key = project_cache::key(&pkg, requested_version);
     // Serve a fresh — or, under a concurrent burst past the TTL, single-flight
     // stale — page straight from RAM. Only the one reader that claims the
     // re-render falls through to the scan below, so a hot key costs one render
@@ -2539,7 +2540,7 @@ async fn render_project(
     // aborted render can't strand the key as forever-refilling.
     let _render_claim = match state.project_cache.get(&cache_key, generation) {
         project_cache::Lookup::Fresh(cached) | project_cache::Lookup::Stale(cached) => {
-            return html_ok_bytes(cached);
+            return serve_project_page(cached, headers);
         }
         project_cache::Lookup::MustRender(claim) => claim,
     };
@@ -2624,10 +2625,13 @@ async fn render_project(
     // hosted versions. The cached page may lag the live db by a TTL — accepted,
     // the rows are informational (the byte gate is the guarantee either way).
     let advisory_panel = advisory_panel_rows(state, storage.as_ref(), &pkg, &versions).await;
-    // `page_context` rebuilds the same base URL as the cache key (deterministic
-    // in the request headers), so the cached bytes always match their key.
+    // Render host-independently: the base URL is a sentinel that serve_project_page
+    // replaces with the request's real host, so the cached bytes are identical for
+    // every host and safe to share.
+    let mut ctx = page_context(state, headers);
+    ctx.base_url = project_cache::BASE_URL_SENTINEL.to_string();
     let html = web::project_html(
-        &page_context(state, headers),
+        &ctx,
         &pkg,
         &files,
         &selected,
@@ -2639,7 +2643,26 @@ async fn render_project(
     );
     let body = bytes::Bytes::from(html);
     state.project_cache.put(cache_key, body.clone(), generation);
-    html_ok_bytes(body)
+    serve_project_page(body, headers)
+}
+
+/// Serve a project page whose cached bytes carry [`project_cache::BASE_URL_SENTINEL`]:
+/// fill in this request's real host and hand back the response. Because the cache
+/// key is host-independent, a forged Host / X-Forwarded-Host can neither thrash
+/// the cache with distinct keys — each a full package-prefix scan — nor poison
+/// another visitor's install snippet. The substitution is one scan of an
+/// already-rendered page, negligible beside the storage scan the cache avoids.
+fn serve_project_page(body: bytes::Bytes, headers: &HeaderMap) -> Response<Body> {
+    match std::str::from_utf8(&body) {
+        Ok(text) if text.contains(project_cache::BASE_URL_SENTINEL) => {
+            let base_url = base_url_from_headers(headers);
+            html_ok_bytes(bytes::Bytes::from(
+                text.replace(project_cache::BASE_URL_SENTINEL, &base_url),
+            ))
+        }
+        // No sentinel (or non-UTF8, which a rendered page never is): serve as-is.
+        _ => html_ok_bytes(body),
+    }
 }
 
 /// The per-package advisory panel rows: the in-memory audit index matched against

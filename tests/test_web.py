@@ -364,6 +364,37 @@ def test_project_page_reflects_new_upload_after_caching(disk_server, tmp_path):
     )
 
 
+def test_project_page_fills_request_host_from_shared_cache(disk_server, tmp_path):
+    """The /project/ page is cached host-independently — a forged Host /
+    X-Forwarded-Host can't thrash the per-package-scan cache with distinct keys —
+    and the request's real host is filled into the install snippet at serve time.
+    So two hosts share one cached render yet each sees its own index URL, and
+    neither poisons the other (nor does the internal sentinel ever leak)."""
+    wheel = make_wheel("hostpkg", "1.0.0", tmp_path)
+    upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+    )
+    wait_for_project_in_global(disk_server["simple"], "hostpkg")
+
+    url = f"{disk_server['base_url']}/project/hostpkg/"
+    # First host warms the cache.
+    code, body, _ = http_get(url, headers={"X-Forwarded-Host": "a.example"})
+    assert code == 200
+    a = body.decode()
+    assert "http://a.example/simple/" in a
+    # A second host hits the SAME cached render but must see its OWN index URL,
+    # never the first host's (no cache poisoning), and the sentinel never leaks.
+    code, body, _ = http_get(url, headers={"X-Forwarded-Host": "b.example"})
+    assert code == 200
+    b = body.decode()
+    assert "http://b.example/simple/" in b
+    assert "a.example" not in b
+    assert "pypiron-base-url" not in b
+
+
 def test_version_page_redirect_does_not_reflect_traversal(disk_server, tmp_path):
     """A non-normalized name 301s to the canonical URL, but the (not-yet-
     validated) version segment is percent-encoded so a `..%2f..%2f` payload can't

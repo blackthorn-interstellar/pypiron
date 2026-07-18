@@ -26,11 +26,13 @@
 //!   per hot key, once per TTL.
 //!
 //! The render embeds the request's base URL (the install snippet's index URL),
-//! so entries key on `(package, version, base_url)` and one host's URL never
-//! leaks into another host's page. Access control is enforced *before* the cache
-//! (the handler rejects a non-reader up front), exactly as `/simple/` does, so
-//! the cached bytes are identical for every authorized reader and nothing leaks
-//! across auth outcomes.
+//! but entries key only on `(package, version)`: the page is rendered with a
+//! host sentinel and the real host is filled in at serve time (see
+//! [`BASE_URL_SENTINEL`]), so a forged Host header can't thrash the cache with
+//! distinct keys or leak one host's URL into another's page. Access control is
+//! enforced *before* the cache (the handler rejects a non-reader up front),
+//! exactly as `/simple/` does, so the cached bytes are identical for every
+//! authorized reader and nothing leaks across auth outcomes.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -44,22 +46,30 @@ use bytes::Bytes;
 pub const PROJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Fixed per-entry overhead charged to the ceiling so a flood of distinct keys
-/// (an attacker cycling Host headers or version segments) bounds its own entry
-/// count through the same cap instead of growing the map until OOM.
+/// (an attacker cycling version segments) bounds its own entry count through the
+/// same cap instead of growing the map until OOM.
 const ENTRY_OVERHEAD_BYTES: usize = 256;
 
-/// The field separator in a cache key. A normalized package name, a version, and
-/// a plausible host are all drawn from a restricted character set that excludes
-/// this control byte, so keys are unambiguous and a package's prefix (used for
-/// invalidation) can never match across a package boundary.
+/// The field separator in a cache key. A normalized package name and a version
+/// are both drawn from a restricted character set that excludes this control
+/// byte, so keys are unambiguous and a package's prefix (used for invalidation)
+/// can never match across a package boundary.
 const KEY_SEP: char = '\u{1f}';
 
-/// The cache key for one rendered page: package, requested version (empty for
-/// the latest view), and the request's base URL — every input the render varies
-/// on beyond the package's own files.
-pub fn key(pkg: &str, version: Option<&str>, base_url: &str) -> String {
-    format!("{pkg}{KEY_SEP}{}{KEY_SEP}{base_url}", version.unwrap_or(""))
+/// The cache key for one rendered page: package and requested version (empty for
+/// the latest view). Deliberately host-independent — the page is rendered with
+/// [`BASE_URL_SENTINEL`] and the request's real host is filled in at serve time —
+/// so a forged Host / X-Forwarded-Host header can neither multiply the key set
+/// into an unbounded full-scan flood nor poison another visitor's install snippet.
+pub fn key(pkg: &str, version: Option<&str>) -> String {
+    format!("{pkg}{KEY_SEP}{}", version.unwrap_or(""))
 }
+
+/// Placeholder the project page is rendered with in place of the request's base
+/// URL (`scheme://host`). Cached bytes carry this sentinel; `app::serve_project_page`
+/// substitutes the request's real host per serve. The `\u{1}` delimiters can't
+/// occur in a rendered host, package name, or version, so it never collides.
+pub const BASE_URL_SENTINEL: &str = "\u{1}pypiron-base-url\u{1}";
 
 /// The prefix covering every cached page for a package, across all versions and
 /// hosts — what [`ProjectCache::invalidate_package`] drops.
@@ -300,7 +310,7 @@ mod tests {
     #[test]
     fn hit_within_ttl_miss_after() {
         let cache = ProjectCache::new(Duration::from_millis(20));
-        let k = key("foo", None, "http://h");
+        let k = key("foo", None);
         assert!(
             matches!(cache.get(&k, 0), Lookup::MustRender(_)),
             "cold key must render"
@@ -318,49 +328,41 @@ mod tests {
     }
 
     #[test]
-    fn version_and_base_url_are_distinct_keys() {
+    fn version_is_a_distinct_key() {
         let cache = ProjectCache::new(Duration::from_secs(60));
-        cache.put(key("foo", None, "http://a"), body("latest-a"), 0);
-        cache.put(key("foo", Some("1.0"), "http://a"), body("v1-a"), 0);
-        cache.put(key("foo", None, "http://b"), body("latest-b"), 0);
+        cache.put(key("foo", None), body("latest"), 0);
+        cache.put(key("foo", Some("1.0")), body("v1"), 0);
         assert_eq!(
-            served(cache.get(&key("foo", None, "http://a"), 0)).as_deref(),
-            Some(b"latest-a".as_ref())
+            served(cache.get(&key("foo", None), 0)).as_deref(),
+            Some(b"latest".as_ref())
         );
         assert_eq!(
-            served(cache.get(&key("foo", Some("1.0"), "http://a"), 0)).as_deref(),
-            Some(b"v1-a".as_ref())
-        );
-        assert_eq!(
-            served(cache.get(&key("foo", None, "http://b"), 0)).as_deref(),
-            Some(b"latest-b".as_ref()),
-            "one host's page must not answer for another"
+            served(cache.get(&key("foo", Some("1.0")), 0)).as_deref(),
+            Some(b"v1".as_ref()),
+            "a pinned version must not answer for the latest view"
         );
     }
 
     #[test]
-    fn invalidate_package_drops_all_versions_and_hosts() {
+    fn invalidate_package_drops_all_versions() {
         let cache = ProjectCache::new(Duration::from_secs(60));
-        cache.put(key("foo", None, "http://a"), body("latest"), 0);
-        cache.put(key("foo", Some("1.0"), "http://b"), body("v1"), 0);
-        cache.put(key("foobar", None, "http://a"), body("sibling"), 0);
+        cache.put(key("foo", None), body("latest"), 0);
+        cache.put(key("foo", Some("1.0")), body("v1"), 0);
+        cache.put(key("foobar", None), body("sibling"), 0);
         cache.invalidate_package("foo");
         assert!(
-            matches!(
-                cache.get(&key("foo", None, "http://a"), 0),
-                Lookup::MustRender(_)
-            ),
+            matches!(cache.get(&key("foo", None), 0), Lookup::MustRender(_)),
             "invalidation must clear the latest view"
         );
         assert!(
             matches!(
-                cache.get(&key("foo", Some("1.0"), "http://b"), 0),
+                cache.get(&key("foo", Some("1.0")), 0),
                 Lookup::MustRender(_)
             ),
-            "invalidation must clear pinned versions on every host"
+            "invalidation must clear pinned versions"
         );
         assert_eq!(
-            served(cache.get(&key("foobar", None, "http://a"), 0)).as_deref(),
+            served(cache.get(&key("foobar", None), 0)).as_deref(),
             Some(b"sibling".as_ref()),
             "a prefix sibling must survive — 'foo' must not match 'foobar'"
         );
@@ -372,7 +374,7 @@ mod tests {
         let cache = ProjectCache::with_capacity(Duration::from_secs(60), 4 * 1024);
         for i in 0..8 {
             cache.put(
-                key(&format!("p{i}"), None, "h"),
+                key(&format!("p{i}"), None),
                 Bytes::from(vec![b'x'; 1024]),
                 0,
             );
@@ -387,7 +389,7 @@ mod tests {
     #[test]
     fn generation_change_clears_everything() {
         let cache = ProjectCache::new(Duration::from_secs(60));
-        let k = key("foo", None, "h");
+        let k = key("foo", None);
         cache.put(k.clone(), body("gen0"), 0);
         assert_eq!(served(cache.get(&k, 0)).as_deref(), Some(b"gen0".as_ref()));
         // A bucket switch bumps the generation: the old entry must not survive.
@@ -405,7 +407,7 @@ mod tests {
         // sits in a live variable while the herd calls `get`), so the invariant is
         // proven without leaning on thread scheduling.
         let cache = ProjectCache::new(Duration::from_millis(20));
-        let k = key("busy", None, "h");
+        let k = key("busy", None);
         cache.put(k.clone(), body("stale"), 0);
         std::thread::sleep(Duration::from_millis(30)); // lapse the TTL
 
@@ -438,7 +440,7 @@ mod tests {
         // a lapsed key, invalidation removes the page, so the next read re-renders
         // rather than being served the now-dropped stale bytes.
         let cache = ProjectCache::new(Duration::from_millis(20));
-        let k = key("racey", None, "h");
+        let k = key("racey", None);
         cache.put(k.clone(), body("stale"), 0);
         std::thread::sleep(Duration::from_millis(30)); // lapse the TTL
         let claim = cache.get(&k, 0); // one render now in flight (refilling holds the key)

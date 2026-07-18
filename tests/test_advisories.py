@@ -11,8 +11,12 @@ and a relayed PEP 792 `quarantined` status blocks the byte gate after the worker
 next sweep (AC5). Rung 6 (sync relay): `pypiron sync` ferries the snapshot across
 the air gap — a local zip, a URL, or the source server's own feed — pushing it to
 the destination's admin PUT etag-conditioned, on by default, tolerant of a
-feed-less source/dest (AC10's blocking half; audit rows are rung 7). Everything
-through the real binary over HTTP, driven by real `uv`.
+feed-less source/dest (AC10's blocking half). Rungs 7-8 (audit report + panel):
+the org audit materializes `_advisories/report.json` and serves it admin-gated at
+`/audit` + `/audit.json` — exactly the seeded vulnerable/malicious rows with
+download counts (AC8), advisory ids byte-equal to the feed (AC9), rows on an
+air-gapped relayed dest (AC10 audit half) — plus a per-project advisory panel.
+Everything through the real binary over HTTP, driven by real `uv`.
 """
 
 from __future__ import annotations
@@ -914,6 +918,245 @@ def test_ac10_opt_out_and_feedless_source_are_tolerant(tmp_path_factory, pypiron
         assert clean.name in names, f"package missing after tolerant relay: {names}"
     finally:
         dst_gen.close()
+        src_gen.close()
+
+
+# ------------------------------ audit report + panel (rungs 7-8) -------------
+#
+# The org audit materializes `_advisories/report.json` (walked inventory ×
+# advisory index × 30-day counters), served admin-gated at `/audit` (HTML) and
+# `/audit.json`. A per-project advisory panel on `/project/<pkg>/` reads the same
+# index. Vulnerabilities are informational (`blocked=false`); malware is blocked.
+
+
+def _row_for(rows: list, package: str, version: str):
+    """The report row for (package, version), or None."""
+    for row in rows:
+        if row["package"] == package and row["version"] == version:
+            return row
+    return None
+
+
+def _poll_audit_rows(server, predicate, *, timeout: float = 40.0) -> dict:
+    """Poll `/audit.json` (admin creds) until `predicate(rows)` holds; return the
+    parsed report. Bounded — the report turns over on the leader sweep, not the
+    request, and a download row additionally waits on the counter flush."""
+    url = f"{server['base_url']}/audit.json"
+    admin = {"username": server["admin_user"], "password": server["admin_password"]}
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        code, body, _ = http_request_auth("GET", url, **admin)
+        if code == 200:
+            last = json.loads(body)
+            if predicate(last.get("rows", [])):
+                return last
+        time.sleep(0.2)
+    raise AssertionError(
+        f"/audit.json never satisfied the predicate within {timeout}s; last={last}"
+    )
+
+
+def test_ac8_audit_report_lists_seeded_rows_with_downloads(
+    tmp_path_factory, pypiron_bin, tmp_path, uv_path, uv_venv
+):
+    """AC8: `/audit.json` (admin) lists exactly the seeded vulnerable/malicious rows
+    — ids, fixed-in, download counts after a real install, a `blocked` flag true
+    only for malware — while a private same-named package is excluded. A valid
+    lower-role credential is insufficient (403); no credential is a 401. `/audit`
+    HTML shows the same ids. Folds in the rung-8 project panel (shared seeds): the
+    vulnerable package's page shows its advisory id, the private same-named
+    package's page does not (origin exclusivity)."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    # Fast reconcile so the leader sweep rebuilds the report quickly; fast counters
+    # so a download flushes within a second (see disk_server_fast_counters).
+    fast = ["--reconcile-interval-secs", "2", "--counters-flush-interval-secs", "1"]
+    with advisory_server(tmp_path_factory, pypiron_bin, feed, extra_args=fast) as server:
+        base = server["base_url"]
+        assert _poll_metric(base, "pypiron_advisory_snapshot_age_seconds") is not None
+
+        # Seed: a mirror-origin vulnerable (non-MAL, installable) release, a
+        # mirror-origin MAL release, and a PRIVATE package sharing a MAL name.
+        vuln = make_wheel(PYSEC_PKG, "2.0.0", tmp_path)  # < 2.4.0 → vulnerable
+        malware = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+        private = make_wheel(MAL_ALL_PKG, "1.0.0", tmp_path)
+        _mirror_upload(server, vuln)
+        _mirror_upload(server, malware)
+        upload_legacy(
+            server["legacy"],
+            private,
+            username=server["uploader_user"],
+            password=server["uploader_password"],
+        )
+        # The vulnerable and private files list (only MAL-blocked files are
+        # scrubbed); the MAL file is cached but scrubbed — the audit walk still
+        # sees its bytes in packages/.
+        wait_for_file_in_index(server["simple"], PYSEC_PKG, vuln.name)
+        wait_for_file_in_index(server["simple"], MAL_ALL_PKG, private.name)
+
+        # A real install of the vulnerable release drives its download counter.
+        rc, out, err = _uv_install(uv_path, uv_venv, server, f"{PYSEC_PKG}==2.0.0")
+        assert rc == 0, f"vulnerable (non-MAL) release failed to install:\n{out}\n{err}"
+        run_checked([str(uv_venv), "-c", f"import {_import_name(PYSEC_PKG)}"])
+
+        # Poll until the counter flush + a sweep both land: both seeded rows present
+        # and the PYSEC row carries the recorded download.
+        def seeded(rows):
+            pysec = _row_for(rows, PYSEC_PKG, "2.0.0")
+            mal = _row_for(rows, MAL_EXACT_PKG, MAL_EXACT_VERSION)
+            return pysec is not None and pysec["downloads_30d"] >= 1 and mal is not None
+
+        rows = _poll_audit_rows(server, seeded)["rows"]
+
+        # Exactly the seeded expectations: the PYSEC row and the MAL row, no more.
+        assert len(rows) == 2, f"unexpected audit row set: {rows}"
+        pysec = _row_for(rows, PYSEC_PKG, "2.0.0")
+        assert pysec["advisories"] == [PYSEC_ID], pysec
+        assert pysec["fixed_in"] == [PYSEC_FIXED_IN], pysec
+        assert pysec["blocked"] is False, "a vulnerability is informational, never blocked"
+        assert pysec["origin"] == "mirror", pysec
+        mal = _row_for(rows, MAL_EXACT_PKG, MAL_EXACT_VERSION)
+        assert mal["advisories"] == [MAL_EXACT_ID], mal
+        assert mal["blocked"] is True, "a MAL match must be flagged blocked"
+        # The private same-named package never appears (origin exclusivity).
+        assert all(row["package"] != MAL_ALL_PKG for row in rows), f"private row leaked: {rows}"
+
+        # Auth: a valid uploader is understood but insufficient (403); none is 401.
+        code, _, _ = http_request_auth(
+            "GET",
+            f"{base}/audit.json",
+            username=server["uploader_user"],
+            password=server["uploader_password"],
+        )
+        assert code == 403, "a valid lower-role credential must not read the audit"
+        code, _, _ = http_get(f"{base}/audit.json")
+        assert code == 401
+
+        # `/audit` HTML (admin) renders the same advisory ids.
+        code, html, _ = http_request_auth(
+            "GET", f"{base}/audit", username=server["admin_user"], password=server["admin_password"]
+        )
+        assert code == 200, code
+        text = html.decode()
+        assert PYSEC_ID in text and MAL_EXACT_ID in text, "audit HTML missing advisory ids"
+
+        # Rung-8 panel: the vulnerable package's project page shows its advisory id;
+        # the private same-named package's page does not.
+        code, body, _ = http_get(f"{base}/project/{PYSEC_PKG}/")
+        assert code == 200, code
+        assert PYSEC_ID in body.decode(), "project panel missing the advisory id"
+        code, body, _ = http_get(f"{base}/project/{MAL_ALL_PKG}/")
+        assert code == 200, code
+        assert MAL_ALL_ID not in body.decode(), "private package's page showed a MAL advisory"
+
+
+def test_ac9_audit_id_byte_equals_osv_record(tmp_path_factory, pypiron_bin, tmp_path):
+    """AC9: the advisory id in the `/audit.json` PYSEC row is byte-identical to the
+    id in the seeded OSV record — the parser never rewrites identity."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    with advisory_server(
+        tmp_path_factory, pypiron_bin, feed, extra_args=["--reconcile-interval-secs", "2"]
+    ) as server:
+        assert _poll_metric(server["base_url"], "pypiron_advisory_snapshot_age_seconds") is not None
+        vuln = make_wheel(PYSEC_PKG, "2.0.0", tmp_path)
+        _mirror_upload(server, vuln)
+        wait_for_file_in_index(server["simple"], PYSEC_PKG, vuln.name)
+
+        report = _poll_audit_rows(
+            server, lambda rows: _row_for(rows, PYSEC_PKG, "2.0.0") is not None
+        )
+        row = _row_for(report["rows"], PYSEC_PKG, "2.0.0")
+        expected_id = canonical_records()[PYSEC_ID]["id"]
+        assert row["advisories"] == [expected_id], (row, expected_id)
+
+
+def test_audit_endpoints_are_admin_gated(tmp_path_factory, pypiron_bin, tmp_path):
+    """The audit surfaces ride the strongest credential (an org's ranked vuln list
+    is attacker recon): admin reads (200), a valid lower-role credential (reader or
+    uploader) is understood but insufficient (403), and no credential is a 401 with
+    the auth challenge. A read-gated server so a literal reader credential exists."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    read_auth = ["--read-user", "reader", "--read-pass", "readersecret"]
+    with advisory_server(tmp_path_factory, pypiron_bin, feed, extra_args=read_auth) as server:
+        base = server["base_url"]
+        assert _poll_metric(base, "pypiron_advisory_snapshot_age_seconds") is not None
+        for path in ("/audit.json", "/audit"):
+            url = f"{base}{path}"
+            code, _, _ = http_request_auth("GET", url, username="admin", password="secret")
+            assert code == 200, (path, code)
+            # A valid reader credential exercises the read-credential branch → 403.
+            code, _, _ = http_request_auth("GET", url, username="reader", password="readersecret")
+            assert code == 403, (path, code)
+            # A valid uploader credential likewise → 403.
+            code, _, _ = http_request_auth(
+                "GET", url, username="uploader", password="uploadersecret"
+            )
+            assert code == 403, (path, code)
+            # No credential → 401 with the WWW-Authenticate challenge.
+            code, _, headers = http_get(url)
+            assert code == 401, (path, code)
+            assert headers.get("www-authenticate") == 'Basic realm="PypIron"', path
+
+
+def test_absent_report_is_empty_with_note_not_404(tmp_path_factory, pypiron_bin, tmp_path):
+    """Before any report is materialized, `/audit.json` (admin) is an empty-rows body
+    carrying a clear note — never a 404 (the endpoint always exists)."""
+    # A dead-proxy default server: armed but unfed, so no snapshot and no report.
+    proc, base, log = _hand_start(pypiron_bin, tmp_path / "data", [], extra_env=_dead_proxy_env())
+    try:
+        _wait_log_contains(log, "armed but unfed")
+        code, body, _ = http_request_auth(
+            "GET", f"{base}/audit.json", username="admin", password="secret"
+        )
+        assert code == 200, code
+        doc = json.loads(body)
+        assert doc["rows"] == []
+        assert doc["note"] == "no advisory snapshot loaded yet", doc
+        # The HTML surface renders the note as a banner, not a 404.
+        code, html, _ = http_request_auth(
+            "GET", f"{base}/audit", username="admin", password="secret"
+        )
+        assert code == 200, code
+        assert "no advisory snapshot loaded yet" in html.decode()
+    finally:
+        kill_process_tree(proc)
+
+
+def test_ac10_audit_rows_on_relayed_dest(tmp_path_factory, pypiron_bin, tmp_path):
+    """AC10 (audit half): after `sync --advisory-feed <zip>` relays the snapshot and
+    the MAL artifact to an air-gapped dest, the dest's own leader sweep materializes
+    the report — poll dest `/audit.json` (admin) until the synced MAL row appears
+    with `blocked=true`."""
+    fixture = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    src_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    source = next(src_gen)
+    dproc, dbase, _dlog = _hand_start(
+        pypiron_bin,
+        tmp_path / "dest",
+        ["--reconcile-interval-secs", "2"],
+        extra_env=_dead_proxy_env(),
+    )
+    dest = _dest_dict(dbase, tmp_path / "dest")
+    try:
+        bad = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+        _mirror_upload(source, bad)
+        wait_for_file_in_index(source["simple"], MAL_EXACT_PKG, bad.name)
+
+        rc, out, err = _advisory_sync(
+            pypiron_bin, source, dest, MAL_EXACT_PKG, advisory_feed=fixture
+        )
+        assert rc == 0, f"sync failed:\n{out}\n{err}"
+        _wait_file_bytes(_stored_feed_path(dest), fixture.read_bytes())
+
+        report = _poll_audit_rows(
+            dest, lambda rows: _row_for(rows, MAL_EXACT_PKG, MAL_EXACT_VERSION) is not None
+        )
+        row = _row_for(report["rows"], MAL_EXACT_PKG, MAL_EXACT_VERSION)
+        assert row["advisories"] == [MAL_EXACT_ID], row
+        assert row["blocked"] is True, row
+        assert row["origin"] == "mirror", row
+    finally:
+        kill_process_tree(dproc)
         src_gen.close()
 
 

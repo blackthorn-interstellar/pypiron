@@ -47,13 +47,14 @@ def test_uploader_cannot_delete_or_yank(disk_server, tmp_path):
     wait_for_file_in_index(disk_server["simple"], PACKAGE, wheel.name)
 
     base = disk_server["base_url"]
-    # Delete and yank are admin-only — the uploader credential gets 401.
+    # Delete and yank are admin-only — a valid uploader credential is understood
+    # but insufficient, so it's a 403 (not a 401 re-challenge of a working cred).
     code, _, _ = http_request_auth("DELETE", f"{base}/files/{PACKAGE}/{wheel.name}", **up)
-    assert code == 401
+    assert code == 403
     code, _, _ = http_request_auth(
         "POST", f"{base}/files/{PACKAGE}/{wheel.name}/yank", data=b"oops", **up
     )
-    assert code == 401
+    assert code == 403
 
     # The artifact and index are untouched.
     assert (disk_server["data_dir"] / "packages" / PACKAGE / wheel.name).exists()

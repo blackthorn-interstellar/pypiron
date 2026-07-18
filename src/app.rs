@@ -1967,6 +1967,11 @@ async fn run_serve(
             "/advisories/feed",
             get(advisories_feed_get).put(advisories_feed_put),
         )
+        // The org audit report: the ranked list of hosted (package, version) rows
+        // a known advisory affects. Admin-gated (attacker recon) — HTML + JSON.
+        .route("/audit", get(audit_page))
+        .route("/audit/", get(audit_page))
+        .route("/audit.json", get(audit_json))
         // The locally-materialized PEP 691 index, bypassing the on-demand
         // proxy: a mirror-over-HTTP `sync` reconciles against the dest's own
         // truth (which files it holds, their yank state), not a proxied
@@ -2615,6 +2620,10 @@ async fn render_project(
         }
     }
 
+    // Per-package advisory panel (rung 8): the in-memory audit index against the
+    // hosted versions. The cached page may lag the live db by a TTL — accepted,
+    // the rows are informational (the byte gate is the guarantee either way).
+    let advisory_panel = advisory_panel_rows(state, storage.as_ref(), &pkg, &versions).await;
     // `page_context` rebuilds the same base URL as the cache key (deterministic
     // in the request headers), so the cached bytes always match their key.
     let html = web::project_html(
@@ -2626,10 +2635,66 @@ async fn render_project(
         meta.as_ref(),
         publisher.as_ref(),
         &downloads,
+        &advisory_panel,
     );
     let body = bytes::Bytes::from(html);
     state.project_cache.put(cache_key, body.clone(), generation);
     html_ok_bytes(body)
+}
+
+/// The per-package advisory panel rows: the in-memory audit index matched against
+/// the package's hosted `versions`. Empty (no panel) when the db is unfed, the
+/// package is private-origin (origin exclusivity — a same-named private package is
+/// not the one OSV named), or nothing matches. Mirrors the byte gate's laziness:
+/// the origin read is paid only on an actual advisory match, and a read error
+/// suppresses the panel (informational rows must never falsely flag a private
+/// package). The `blocked` badge marks `MAL-*` matches (what the gate 403s).
+async fn advisory_panel_rows(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    versions: &[String],
+) -> Vec<web::AdvisoryPanelRow> {
+    let snap = state.advisory_snapshot();
+    let Some(db) = snap.db.as_deref() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<web::AdvisoryPanelRow> = Vec::new();
+    for version in versions {
+        for record in advisories::advisories_for(db, pkg, version) {
+            rows.push(web::AdvisoryPanelRow {
+                version: version.clone(),
+                id: record.id.clone(),
+                severity: record.severity.clone(),
+                fixed_in: record.fixed_in.clone(),
+                blocked: record.id.starts_with("MAL-"),
+            });
+        }
+    }
+    if rows.is_empty() {
+        return rows; // no match → no origin read, no panel
+    }
+    // A match — but a private-origin name is never the package OSV named. Fast
+    // private-prefix pre-check (no I/O), then the authoritative claim.
+    if let Some(prefix) = &state.private_prefix {
+        if names::matches_prefix(pkg, prefix) {
+            return Vec::new();
+        }
+    }
+    match origin::read_origin_claim(storage, pkg).await {
+        Ok(Some(origin::OriginState::Private)) => return Vec::new(),
+        Ok(_) => {}
+        Err(e) => {
+            warn!(error = ?e, %pkg, "advisory panel: origin read failed; omitting panel");
+            return Vec::new();
+        }
+    }
+    // Deterministic: newest version first, then advisory id; drop exact dupes.
+    rows.sort_by(|a, b| {
+        names::version_cmp_desc(&a.version, &b.version).then_with(|| a.id.cmp(&b.id))
+    });
+    rows.dedup_by(|a, b| a.version == b.version && a.id == b.id);
+    rows
 }
 
 /// Last-30-day download counts for a package, filenames rolled up to versions
@@ -5600,6 +5665,69 @@ async fn advisories_feed_put(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The note surfaced (JSON field + HTML banner) when no audit report has been
+/// materialized yet — a feed is set but no leader sweep has run, or no snapshot
+/// is loaded. Distinct from an empty-but-materialized report (a loaded feed that
+/// nothing hosted matches), which renders as an empty row set with no note.
+const AUDIT_ABSENT_NOTE: &str = "no advisory snapshot loaded yet";
+
+/// The org audit as JSON (admin-gated): the ranked hosted (package, version) rows
+/// a known advisory affects — ids, fixed-in, 30-day downloads, blocked flag.
+/// Served byte-verbatim from the stored report (admin-only, low traffic, so no
+/// cache). An unmaterialized report is an empty-rows body with a note, never a 404
+/// — the endpoint always exists. An org's ranked vulnerability list is attacker
+/// recon, so it rides the strongest credential.
+async fn audit_json(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
+    let json_response = |bytes: Vec<u8>| {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(bytes))
+            .unwrap_or_else(not_found)
+    };
+    match advisories::stored_report_bytes(state.pin().storage.as_ref()).await {
+        Ok(Some(bytes)) => Ok(json_response(bytes)),
+        Ok(None) => {
+            let empty = serde_json::json!({
+                "generated_unix": 0,
+                "feed_sha256": "",
+                "rows": [],
+                "note": AUDIT_ABSENT_NOTE,
+            });
+            Ok(json_response(
+                serde_json::to_vec(&empty).unwrap_or_default(),
+            ))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("reading audit report: {e}"),
+        )),
+    }
+}
+
+/// The org audit as server-rendered HTML (admin-gated): the same ranked rows as
+/// `/audit.json`, rendered the house way. Reads the stored report per request (no
+/// cache — admin-only, low traffic); an unmaterialized report renders an empty
+/// table under a banner note, never a 404.
+async fn audit_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
+    if let Err((code, msg)) = require_admin(&state, &headers) {
+        return (code, msg).into_response();
+    }
+    let report = match advisories::stored_report(state.pin().storage.as_ref()).await {
+        Ok(report) => report,
+        Err(e) => return read_error(e),
+    };
+    html_ok(web::audit_html(
+        &page_context(&state, &headers),
+        report.as_ref(),
+        AUDIT_ABSENT_NOTE,
+    ))
+}
+
 /// The locally-materialized PEP 691 index for a package, read straight from
 /// storage so the on-demand proxy never shadows it. Admin-gated; a package with
 /// no local index yet is an empty listing, not a 404 (so the caller treats it
@@ -5786,6 +5914,29 @@ impl AppState {
             }
         }
     }
+
+    /// Whether the request presents credentials that validly authenticate as some
+    /// role *below* admin (reader or uploader). Distinguishes a wrong-role request
+    /// (→ 403) from an anonymous or bad-credential one (→ 401) at an admin gate.
+    /// Public-read (no read credential configured) is deliberately NOT counted:
+    /// an anonymous request on such a server authenticates as nobody, so it still
+    /// gets 401, never 403. Constant-time password compares throughout.
+    fn authenticates_below_admin(&self, headers: &HeaderMap) -> bool {
+        // A valid uploader — a real uploader credential, or an uploader/admin
+        // token (admin is already excluded by the caller).
+        if self.is_uploader(headers) {
+            return true;
+        }
+        // A valid token of any configured role (covers a reader token).
+        if self.token_role(headers).is_some() {
+            return true;
+        }
+        // The configured read credential, actually presented and matching.
+        match self.read_credential() {
+            Some((u, p)) => check_basic_auth(headers, u, p).is_ok(),
+            None => false,
+        }
+    }
 }
 
 /// Treat an empty string as an unset value. An empty environment variable
@@ -5844,19 +5995,29 @@ fn valid_artifact_filename(filename: &str) -> bool {
     !filename.contains('/') && !filename.contains('\\') && sidecar::is_artifact(filename)
 }
 
-/// Gate the privileged routes (delete, yank) behind the admin credential.
+/// Gate the privileged routes (delete, yank, status, feed push, audit) behind the
+/// admin credential, with RFC 7235/7231-correct status codes:
+/// - no admin credential configured at all → 403 (the operation is disabled for
+///   everyone, not an authentication challenge);
+/// - credentials that validly authenticate as a lower role (reader or uploader)
+///   but not admin → 403 (understood, insufficient — never re-challenge a
+///   credential that already worked);
+/// - no credentials, or credentials that authenticate as nobody → 401 (with the
+///   `WWW-Authenticate` challenge added by middleware).
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
     if state.is_admin(headers) {
         return Ok(());
     }
-    Err(if state.admin_credential().is_none() {
-        (
+    if state.admin_credential().is_none() {
+        return Err((
             StatusCode::FORBIDDEN,
             "This operation is disabled (no admin credential configured)".into(),
-        )
-    } else {
-        (StatusCode::UNAUTHORIZED, "Admin credential required".into())
-    })
+        ));
+    }
+    if state.authenticates_below_admin(headers) {
+        return Err((StatusCode::FORBIDDEN, "Admin credential required".into()));
+    }
+    Err((StatusCode::UNAUTHORIZED, "Admin credential required".into()))
 }
 
 /// How long a minted install token is valid. Deliberately short: tokens are

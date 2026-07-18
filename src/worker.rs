@@ -1187,6 +1187,14 @@ pub async fn audit(
     // it may only be published once the whole corpus has been swept (below).
     let mut quarantined_names: Vec<String> = Vec::new();
     let mut deltas: Vec<(String, FileShas)> = Vec::new();
+    // Advisory-report inventory: `(package, filenames)` for advisory-matched names,
+    // accumulated across shards and joined against the audit index in the tail.
+    let mut inventory: Vec<(String, Vec<String>)> = Vec::new();
+    // Capture the advisory snapshot once, so the shard walk's inventory filter and
+    // the report tail's join both use the same db and stamp the same feed sha —
+    // the materialized report is then consistent with what the walk gathered.
+    let advisory_snapshot = state.advisory_snapshot();
+    let advisory_db = advisory_snapshot.db.clone();
 
     // Tamper-evident checkpoints. On an empty chain the first pass commits the
     // whole corpus (genesis), so unchanged packages must surface their shas
@@ -1227,6 +1235,7 @@ pub async fn audit(
                 force_deep,
                 state.transparency,
                 genesis,
+                advisory_db.as_deref(),
             )
         });
         for (shard, result) in chunk.iter().zip(futures::future::join_all(audits).await) {
@@ -1240,6 +1249,7 @@ pub async fn audit(
                     pkg_stats.extend(result.pkg_stats);
                     quarantined_names.extend(result.quarantined);
                     deltas.extend(result.deltas);
+                    inventory.extend(result.inventory);
                 }
                 Err(e) => {
                     error!(shard=%shard, error=?e, "audit: shard failed");
@@ -1258,6 +1268,10 @@ pub async fn audit(
     if failures > 0 {
         return Err(anyhow!("audit finished with {failures} failure(s)"));
     }
+    // The fleet-wide quarantined set derived this sweep (empty unless blocking is
+    // armed — the status reads that populate it are gated on `malware_block`).
+    // Shared by the byte-gate publish below and the report's `blocked` flag.
+    let quarantined_set: HashSet<String> = quarantined_names.iter().cloned().collect();
     // A clean full cycle: publish the quarantined set for the byte gate. Only
     // when blocking is armed (the gate is the sole consumer) so a blocking-off
     // server never writes `_advisories/`. Persists on change only, and swaps the
@@ -1268,6 +1282,20 @@ pub async fn audit(
             crate::advisories::publish_quarantined(storage, &state.advisories, set).await
         {
             warn!(error=?e, "audit: publishing quarantined set failed; serving last set");
+        }
+    }
+    // Materialize the org audit report: the walked inventory joined with the audit
+    // index and 30-day counters. Leader-only by construction (the audit runs under
+    // the leader gate). Built whenever a snapshot is loaded (feed set ⇒ audit
+    // exists), independent of the blocking toggle. Best-effort — a failure keeps
+    // the last report and never fails the sweep; the write is conditioned on
+    // change, so an unchanged corpus/feed doesn't churn the key.
+    if let Some(db) = advisory_db.as_deref() {
+        let feed_sha = advisory_snapshot.zip_sha256.as_deref().unwrap_or_default();
+        if let Err(e) =
+            build_advisory_report(state, storage, db, inventory, &quarantined_set, feed_sha).await
+        {
+            warn!(error=?e, "audit: building advisory report failed; keeping last report");
         }
     }
     let duration_secs = started.elapsed().as_secs_f64();
@@ -1432,6 +1460,12 @@ struct ShardAudit {
     /// when `--transparency` is off. An empty inner map means the package went
     /// away (a removal on chain replay).
     deltas: Vec<(String, FileShas)>,
+    /// Advisory-report inventory: `(package, artifact filenames)` for every
+    /// package this shard holds whose name is in the audit index. Collected from
+    /// the listing already in hand (no extra reads), and only for advisory-matched
+    /// names, so it stays proportional to the corpus ∩ OSV, not corpus size. The
+    /// sweep tail resolves versions and joins downloads to materialize the report.
+    inventory: Vec<(String, Vec<String>)>,
 }
 
 /// Audit every package whose name starts with `shard`. `collect_deltas` gathers
@@ -1439,6 +1473,7 @@ struct ShardAudit {
 /// `need_full_shas` additionally reads unchanged packages' sidecars so the
 /// genesis checkpoint can commit the whole corpus — a one-time cost only when
 /// the chain is empty.
+#[allow(clippy::too_many_arguments)]
 async fn audit_shard(
     state: &AppState,
     storage: &dyn Storage,
@@ -1447,6 +1482,7 @@ async fn audit_shard(
     force_deep: bool,
     collect_deltas: bool,
     need_full_shas: bool,
+    advisory_db: Option<&crate::advisories::AdvisoryDb>,
 ) -> Result<ShardAudit> {
     let (truth, views) = futures::future::try_join(
         storage.list_all(&format!("{PACKAGES_PREFIX}{shard}")),
@@ -1488,6 +1524,7 @@ async fn audit_shard(
         pkg_stats: Vec::new(),
         quarantined: Vec::new(),
         deltas: Vec::new(),
+        inventory: Vec::new(),
     };
     let mut fresh: std::collections::HashMap<String, String> = Default::default();
     // Packages whose listing shows the PEP 792 sidecar: the rare set that pays a
@@ -1511,6 +1548,11 @@ async fn audit_shard(
         let mut versions: HashSet<String> = HashSet::new();
         let mut file_count = 0u32;
         let mut pkg_bytes = 0u64;
+        // Collect artifact filenames for the advisory report, but only for names
+        // the audit index carries — the corpus ∩ OSV, a tiny set — so the walk
+        // stays free for everything else. Version resolution happens in the tail.
+        let advisory_matched = advisory_db.is_some_and(|db| db.audit_has_name(&pkg));
+        let mut advisory_filenames: Vec<String> = Vec::new();
         for obj in &t {
             if let Some(filename) = obj.key.strip_prefix(&prefix) {
                 if is_artifact(filename) {
@@ -1519,8 +1561,14 @@ async fn audit_shard(
                     if let Some(version) = infer_version_from_filename(filename) {
                         versions.insert(version);
                     }
+                    if advisory_matched {
+                        advisory_filenames.push(filename.to_string());
+                    }
                 }
             }
+        }
+        if advisory_matched && !advisory_filenames.is_empty() {
+            out.inventory.push((pkg.clone(), advisory_filenames));
         }
         // Any record object sitting beside its own bare `.tombstone` is a
         // delete that crashed mid-removal: a live body (crash before the
@@ -1737,6 +1785,98 @@ async fn audit_shard(
         }
     }
     Ok(out)
+}
+
+/// Materialize the org audit report from the walked inventory. For each
+/// advisory-matched package: read its origin claim (the row's label; the pure
+/// join drops private-origin rows), resolve each artifact's version, and roll up
+/// its 30-day download counts. The join then produces the ranked rows, written on
+/// change. Matched packages are the corpus ∩ OSV — a tiny set — so the per-package
+/// origin read and counter query here are cheap. No `unwrap`/`panic` on this
+/// worker path; a per-package read failure skips that package, never the report.
+async fn build_advisory_report(
+    state: &AppState,
+    storage: &dyn Storage,
+    db: &crate::advisories::AdvisoryDb,
+    inventory: Vec<(String, Vec<String>)>,
+    quarantined: &HashSet<String>,
+    feed_sha256: &str,
+) -> Result<()> {
+    let to = time::OffsetDateTime::now_utc().date();
+    let from = to.saturating_sub(time::Duration::days(29));
+    let mut entries: Vec<crate::advisories::AuditInventory> = Vec::new();
+    for (pkg, filenames) in inventory {
+        let origin = match crate::origin::read_origin_claim(storage, &pkg).await {
+            Ok(Some(claim)) => claim.as_str(),
+            Ok(None) => crate::origin::UNCLAIMED,
+            Err(e) => {
+                warn!(package=%pkg, error=?e, "audit report: origin read failed; skipping package");
+                continue;
+            }
+        };
+        // 30-day downloads for this package, rolled up filename → version.
+        let series = state
+            .counters
+            .query_package("downloads", &pkg, from, to)
+            .await;
+        let mut downloads: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        for files in series.values() {
+            for (filename, count) in files {
+                if let Some(version) = infer_version_from_filename(filename) {
+                    *downloads.entry(version).or_insert(0) += count;
+                }
+            }
+        }
+        for version in resolve_report_versions(storage, &pkg, &filenames).await {
+            let downloads_30d = downloads.get(&version).copied().unwrap_or(0);
+            entries.push(crate::advisories::AuditInventory {
+                package: pkg.clone(),
+                version,
+                origin: origin.to_string(),
+                downloads_30d,
+            });
+        }
+    }
+    let generated_unix = time::OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
+    let report =
+        crate::advisories::build_report(&entries, db, quarantined, generated_unix, feed_sha256);
+    crate::advisories::write_report_if_changed(storage, &report).await
+}
+
+/// Resolve a matched package's artifact filenames to a sorted, deduped version
+/// set: infer from the filename, fall back to the sidecar's version for a name
+/// PEP 440 can't read, and skip a file whose version stays unknown. The fallback
+/// reads only unparseable names (a rare legacy shape), bounded like every sweep.
+async fn resolve_report_versions(
+    storage: &dyn Storage,
+    pkg: &str,
+    filenames: &[String],
+) -> Vec<String> {
+    let mut versions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut unparseable: Vec<&String> = Vec::new();
+    for filename in filenames {
+        match infer_version_from_filename(filename) {
+            Some(version) => {
+                versions.insert(version);
+            }
+            None => unparseable.push(filename),
+        }
+    }
+    for chunk in unparseable.chunks(SIDECAR_READ_CONCURRENCY) {
+        let reads = chunk.iter().map(|filename| {
+            let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+            async move { storage.get_bytes(&sidecar_key(&key)).await }
+        });
+        for bytes in futures::future::join_all(reads).await.into_iter().flatten() {
+            if let Ok(sc) = serde_json::from_slice::<Sidecar>(&bytes) {
+                if !sc.version.is_empty() {
+                    versions.insert(sc.version);
+                }
+            }
+        }
+    }
+    versions.into_iter().collect()
 }
 
 fn require_generation(state: &AppState, expected: u64) -> Result<()> {
@@ -3169,7 +3309,7 @@ mod tests {
         );
         let state = AppState::headless(storage.clone());
 
-        let audit = audit_shard(&state, storage.as_ref(), 0, 'f', false, false, false)
+        let audit = audit_shard(&state, storage.as_ref(), 0, 'f', false, false, false, None)
             .await
             .unwrap();
 

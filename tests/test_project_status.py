@@ -140,7 +140,7 @@ def test_admin_status_endpoint_sets_and_clears(disk_server, tmp_path):
         username=server["uploader_user"],
         password=server["uploader_password"],
     )
-    assert code == 401, "status authoring is admin-only"
+    assert code == 403, "status authoring is admin-only (a valid uploader is insufficient)"
 
     # A malformed/unknown status body is a 400, not a silent no-op.
     code, _, _ = http_request_auth("POST", status_url, data=b'{"status":"frozen"}', **admin)

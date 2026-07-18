@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 use base64::Engine;
 use html_escape::{encode_double_quoted_attribute, encode_text};
 
+use crate::advisories::Report;
 use crate::coremeta::CoreMetadata;
 use crate::markdown;
 use crate::metrics::{Inventory, MetricsSnapshot};
@@ -109,6 +110,17 @@ pub struct DashboardData<'a> {
     pub top_downloads: &'a [(String, u64)],
 }
 
+/// One row of the per-package advisory panel (rung 8): an advisory affecting one
+/// hosted version of the package on the project page. `blocked` marks a `MAL-*`
+/// match — what the byte gate 403s; a vulnerability is informational.
+pub struct AdvisoryPanelRow {
+    pub version: String,
+    pub id: String,
+    pub severity: String,
+    pub fixed_in: Vec<String>,
+    pub blocked: bool,
+}
+
 const PAGE_CSS: &str = "\
 /* pypiron color scheme — iron & rust, after the logo: warm rust-orange accent\
    on warm steel/charcoal neutrals. Shared by every page and our docs. Tokens:\
@@ -162,6 +174,14 @@ table.dlboard th{text-align:left;color:var(--muted);font-weight:600;border-botto
 table.dlboard td{border-bottom:1px solid var(--border);padding:7px 10px;word-break:break-word}\
 table.dlboard td.rank{color:var(--muted);width:3em;text-align:right;font-variant-numeric:tabular-nums}\
 table.dlboard td.count{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}\
+table.dlboard.audit td{vertical-align:top}\
+table.dlboard.audit code{font-size:12px}\
+/* Advisory badges: a filled rust pill for a blocked (MAL) match, muted text\
+   otherwise. Shared by the /audit table and the project page's sidebar panel. */\
+.aud-blocked{display:inline-block;color:#fff;background:var(--accent);border-radius:5px;padding:0 7px;font-size:12px;white-space:nowrap}\
+.aud-ok{color:var(--muted);font-size:12px}\
+.aud-list li{margin:7px 0}\
+.aud-meta{display:block;color:var(--muted);font-size:12px;margin-top:1px}\
 main.wide{max-width:1000px}\
 /* The project page drops main's top padding because its full-width header band\
    already supplies it; the (bandless) landing page keeps its padding. */\
@@ -534,6 +554,79 @@ pub fn downloads_html(ctx: &PageContext, top: &[(String, u64)]) -> String {
     shell("pypiron · downloads", "", &body, false, false)
 }
 
+/// The org audit report (`/audit`, admin-gated): the ranked list of hosted
+/// (package, version) rows a known advisory affects, each linked to its project
+/// page. `report` is the stored report parsed, or `None` when none has been
+/// materialized yet — then `absent_note` renders as a banner and the table is
+/// empty. Every interpolated string (advisory ids, versions, package names) is
+/// escaped: advisory data is external feed input.
+pub fn audit_html(ctx: &PageContext, report: Option<&Report>, absent_note: &str) -> String {
+    let rows = report.map(|r| r.rows.as_slice()).unwrap_or(&[]);
+    let banner = if report.is_none() {
+        format!("<p class=\"note\">{}</p>", encode_text(absent_note))
+    } else if rows.is_empty() {
+        "<p class=\"empty\">No hosted package matches a known advisory.</p>".to_string()
+    } else {
+        String::new()
+    };
+    let table = if rows.is_empty() {
+        String::new()
+    } else {
+        let body: String = rows
+            .iter()
+            .map(|row| {
+                let ids = row
+                    .advisories
+                    .iter()
+                    .map(|id| encode_text(id).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let fixed = if row.fixed_in.is_empty() {
+                    "—".to_string()
+                } else {
+                    encode_text(&row.fixed_in.join(", ")).to_string()
+                };
+                let status = if row.blocked {
+                    "<span class=\"aud-blocked\">blocked</span>"
+                } else {
+                    "<span class=\"aud-ok\">advisory</span>"
+                };
+                format!(
+                    "<tr><td><a href=\"/project/{href}/\">{name}</a></td>\
+<td>{version}</td><td>{ids}</td><td>{severity}</td><td>{fixed}</td>\
+<td class=\"count\">{downloads}</td><td>{status}</td></tr>",
+                    href = encode_double_quoted_attribute(&row.package),
+                    name = encode_text(&row.package),
+                    version = encode_text(&row.version),
+                    severity = encode_text(&row.severity),
+                    downloads = group_thousands(row.downloads_30d),
+                )
+            })
+            .collect();
+        format!(
+            "<table class=\"dlboard audit\">\
+<thead><tr><th>Package</th><th>Version</th><th>Advisories</th><th>Severity</th>\
+<th>Fixed in</th><th class=\"count\">Downloads</th><th>Status</th></tr></thead>\
+<tbody>{body}</tbody></table>",
+        )
+    };
+    let count = rows.len();
+    let tag = format!(
+        "{} affected release{} · ranked by 30-day downloads",
+        group_thousands(count as u64),
+        if count == 1 { "" } else { "s" },
+    );
+    let body = format!(
+        "<header class=\"hero compact\">{logo}<h1>Advisory Audit</h1>\
+<p class=\"tag\">{tag}</p></header>{banner}{table}\
+<nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/projects/\">Browse all packages</a></nav>\
+{footer}",
+        logo = logo_link(),
+        footer = version_footer(ctx.version),
+    );
+    shell("pypiron · audit", "", &body, false, false)
+}
+
 /// A human-readable project page modelled on pypi.org. `files` is *every*
 /// artifact for the package (any order); `selected` is the version this view
 /// focuses on — the latest, or the one in the URL on a per-version page — and
@@ -554,6 +647,7 @@ pub fn project_html(
     meta: Option<&CoreMetadata>,
     publisher: Option<&Publisher>,
     downloads: &[(String, u64)],
+    advisories: &[AdvisoryPanelRow],
 ) -> String {
     let index_url = format!("{}/simple/", ctx.base_url);
     // The one index URL, top-right, in a copy field (same style as the landing
@@ -626,13 +720,14 @@ pub fn project_html(
     // attestation + the package's self-declared details) with the tab panels on
     // the right.
     let body = format!(
-        "<div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{downloads}{verified}{details}</aside>\
+        "<div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{advisories}{downloads}{verified}{details}</aside>\
 <div class=\"pcontent\">{desc}{history}{dl}</div></div>\
 <nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/projects/\">All packages</a> · \
 <a href=\"/simple/{name}/\">Simple index</a></nav>\
 {footer}{TABS_JS}",
         name = encode_text(pkg),
         nav = nav_section(),
+        advisories = advisory_panel_section(advisories),
         downloads = downloads_section(downloads),
         verified = verified_section(publisher),
         details = meta_sections(meta),
@@ -782,6 +877,47 @@ fn files_panel(pkg: &str, files: &[&FileMetadata]) -> String {
         "<section class=\"tabpanel\" id=\"files\"><h2>Files</h2><table class=\"files-t\">\
 <thead><tr><th>File</th><th>Size</th><th>Uploaded</th></tr></thead>\
 <tbody>{rows}</tbody></table></section>",
+    )
+}
+
+/// The "Security advisories" sidebar section (rung 8): the advisories affecting
+/// the package's hosted versions, from the in-memory audit index. Empty input
+/// renders nothing — no panel for a clean, private-origin, or unfed package. All
+/// feed-derived strings (ids, versions, severity) are escaped: external input.
+/// The `blocked` pill marks a `MAL-*` match (what the byte gate 403s).
+fn advisory_panel_section(rows: &[AdvisoryPanelRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let items: String = rows
+        .iter()
+        .map(|row| {
+            let badge = if row.blocked {
+                " <span class=\"aud-blocked\">blocked</span>"
+            } else {
+                ""
+            };
+            let severity = if row.severity.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", encode_text(&row.severity))
+            };
+            let fixed = if row.fixed_in.is_empty() {
+                String::new()
+            } else {
+                format!(" · fixed in {}", encode_text(&row.fixed_in.join(", ")))
+            };
+            format!(
+                "<li><code>{id}</code>{badge}\
+<span class=\"aud-meta\">{version}{severity}{fixed}</span></li>",
+                id = encode_text(&row.id),
+                version = encode_text(&row.version),
+            )
+        })
+        .collect();
+    format!(
+        "<section class=\"sb sb-advisories\"><h2>Security advisories</h2>\
+<ul class=\"vals aud-list\">{items}</ul></section>"
     )
 }
 
@@ -1216,6 +1352,7 @@ mod tests {
             Some(&m),
             None,
             &[],
+            &[],
         );
 
         // Slim brand strip (home link + index URL field), then a package banner.
@@ -1284,6 +1421,7 @@ mod tests {
             Some(&m),
             None,
             &[],
+            &[],
         );
         // The banner and install snippet pin the selected version.
         assert!(html.contains("<span class=\"pver\">14.3.0</span>"));
@@ -1316,6 +1454,7 @@ mod tests {
             Some(&m),
             Some(&pubr),
             &[],
+            &[],
         );
         assert!(html.contains("<h2>Verified details</h2>"));
         // The publisher rows render; the GitHub repo becomes a link.
@@ -1340,7 +1479,7 @@ mod tests {
             "1.0",
             "2026-01-01T00:00:00Z",
         )];
-        let html = project_html(&ctx(), "x", &files, "1.0", false, Some(&m), None, &[]);
+        let html = project_html(&ctx(), "x", &files, "1.0", false, Some(&m), None, &[], &[]);
         assert!(html.contains("<pre class=\"readme\">"));
         assert!(html.contains("shown unrendered"));
         assert!(html.contains("Plain * text &amp; &lt;not&gt; markdown"));
@@ -1354,7 +1493,7 @@ mod tests {
             "1.0",
             "2026-01-01T00:00:00Z",
         )];
-        let html = project_html(&ctx(), "x", &files, "1.0", false, None, None, &[]);
+        let html = project_html(&ctx(), "x", &files, "1.0", false, None, None, &[], &[]);
         // Tabs always present; description falls back to a placeholder.
         assert!(html.contains("data-tab=\"description\""));
         assert!(html.contains("This release has no project description."));

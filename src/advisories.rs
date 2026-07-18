@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use pep440_rs::Version;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 use zip::ZipArchive;
@@ -34,7 +34,9 @@ pub const FEED_KEY: &str = "_advisories/osv-pypi.zip";
 /// byte-gate probe (rung 5). Defined now; unused until then.
 pub const QUARANTINED_KEY: &str = "_advisories/quarantined.json";
 
-/// Materialized org audit report (rung 7). Defined now; unused until then.
+/// Materialized org audit report: the walked inventory joined with the advisory
+/// index and 30-day download counters, rebuilt at the end of each leader audit
+/// sweep and served (admin-gated) at `/audit` and `/audit.json`.
 pub const REPORT_KEY: &str = "_advisories/report.json";
 
 /// The OSV bulk export for the PyPI ecosystem — the same database `uv audit`
@@ -128,6 +130,13 @@ impl AdvisoryDb {
     pub fn audit_records(&self) -> usize {
         self.audit.values().map(Vec::len).sum()
     }
+
+    /// Whether any advisory in the audit index names `name_norm`. The cheap
+    /// coarse filter that keeps the audit report's inventory collection
+    /// proportional to matched packages (the corpus ∩ OSV), not corpus size.
+    pub fn audit_has_name(&self, name_norm: &str) -> bool {
+        self.audit.contains_key(name_norm)
+    }
 }
 
 /// The `MAL-*` ids that condemn `name_norm` at `version` (empty = not blocked).
@@ -179,6 +188,116 @@ fn version_eq(a: &str, b: &str) -> bool {
     match (a.parse::<Version>(), b.parse::<Version>()) {
         (Ok(va), Ok(vb)) => va == vb,
         _ => a == b,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Org audit report (rung 7): the inventory × audit-index join, materialized.
+// ---------------------------------------------------------------------------
+
+/// One (package, version) the audit walked, with its resolved origin and 30-day
+/// download count — the worker-supplied input to the pure [`build_report`] join.
+/// `origin` is the claim label ([`crate::origin::PRIVATE`]/`MIRROR`/`UNCLAIMED`).
+pub struct AuditInventory {
+    pub package: String,
+    pub version: String,
+    pub origin: String,
+    pub downloads_30d: u64,
+}
+
+/// One materialized audit row: a hosted (package, version) that a known advisory
+/// affects. Serialized verbatim into [`REPORT_KEY`] and served by `/audit.json`,
+/// so field names are the JSON contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReportRow {
+    pub package: String,
+    pub version: String,
+    pub origin: String,
+    /// Advisory ids affecting this version (sorted, deduped; never rewritten).
+    pub advisories: Vec<String>,
+    pub severity: String,
+    pub fixed_in: Vec<String>,
+    pub downloads_30d: u64,
+    /// Whether the byte gate would 403 this file: a `MAL-*` match (on the
+    /// included non-private origin) or a quarantined project. Vulnerabilities are
+    /// informational (`false`); malware is blocked (`true`).
+    pub blocked: bool,
+}
+
+/// The materialized org audit: the join of hosted inventory with the advisory
+/// index, ranked by downloads. `generated_unix` stamps the build time;
+/// `feed_sha256` is the snapshot the rows were derived from.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Report {
+    pub generated_unix: u64,
+    pub feed_sha256: String,
+    pub rows: Vec<ReportRow>,
+}
+
+/// Join walked inventory × the audit index into the materialized report. Pure and
+/// unit-tested — no I/O, deterministic output. Private-origin entries are excluded
+/// (OSV names live in PyPI's namespace; origin exclusivity proves a same-named
+/// private package is not the one OSV named — `Unclaimed` counts as non-private,
+/// included). An entry no advisory affects yields no row (the report lists only
+/// vulnerable/malicious inventory). `blocked` mirrors the byte gate: a `MAL-*`
+/// match or a quarantined project. Rows sort by downloads descending, then
+/// package/version, so an unchanged corpus serializes byte-identically.
+pub fn build_report(
+    inventory: &[AuditInventory],
+    db: &AdvisoryDb,
+    quarantined: &HashSet<String>,
+    generated_unix: u64,
+    feed_sha256: &str,
+) -> Report {
+    let mut rows = Vec::new();
+    for item in inventory {
+        if item.origin == crate::origin::PRIVATE {
+            continue;
+        }
+        let records = advisories_for(db, &item.package, &item.version);
+        if records.is_empty() {
+            continue;
+        }
+        let mut advisories: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
+        advisories.sort();
+        advisories.dedup();
+        // Severity: the first non-empty among the matched records (one package's
+        // advisories, usually one). Verbatim from the feed, never rewritten.
+        let severity = records
+            .iter()
+            .map(|r| r.severity.as_str())
+            .find(|s| !s.is_empty())
+            .unwrap_or_default()
+            .to_string();
+        let mut fixed_in: Vec<String> = records
+            .iter()
+            .flat_map(|r| r.fixed_in.iter().cloned())
+            .collect();
+        fixed_in.sort();
+        fixed_in.dedup();
+        let blocked = !blocking_advisories(db, &item.package, Some(&item.version)).is_empty()
+            || quarantined.contains(&item.package);
+        rows.push(ReportRow {
+            package: item.package.clone(),
+            version: item.version.clone(),
+            origin: item.origin.clone(),
+            advisories,
+            severity,
+            fixed_in,
+            downloads_30d: item.downloads_30d,
+            blocked,
+        });
+    }
+    rows.sort_by(|a, b| {
+        b.downloads_30d
+            .cmp(&a.downloads_30d)
+            .then_with(|| a.package.cmp(&b.package))
+            .then_with(|| a.version.cmp(&b.version))
+    });
+    Report {
+        generated_unix,
+        feed_sha256: feed_sha256.to_string(),
+        rows,
     }
 }
 
@@ -967,6 +1086,46 @@ pub async fn stored_feed_bytes(storage: &dyn Storage) -> Result<Option<Vec<u8>>>
     }
 }
 
+/// Persist the audit report to [`REPORT_KEY`], but only when its content changed
+/// (rows + feed identity) from the stored copy — `generated_unix` alone never
+/// rewrites it, so an unchanged corpus and feed don't churn the key every sweep.
+/// A stored report that won't read is treated as changed and overwritten.
+pub async fn write_report_if_changed(storage: &dyn Storage, report: &Report) -> Result<()> {
+    if let Ok(existing) = storage.get_bytes(REPORT_KEY).await {
+        if let Ok(prev) = serde_json::from_slice::<Report>(&existing) {
+            if prev.feed_sha256 == report.feed_sha256 && prev.rows == report.rows {
+                return Ok(());
+            }
+        }
+    }
+    let bytes = serde_json::to_vec(report).context("serializing advisory report")?;
+    storage
+        .put_bytes(REPORT_KEY, bytes, Some("application/json"))
+        .await
+        .context("persisting advisory report")
+}
+
+/// Read the stored audit report bytes for `/audit.json`, or `None` when no report
+/// has been materialized yet.
+pub async fn stored_report_bytes(storage: &dyn Storage) -> Result<Option<Vec<u8>>> {
+    match storage.get_bytes(REPORT_KEY).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if storage::is_not_found(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Read and parse the stored audit report for the `/audit` HTML page, or `None`
+/// when none has been materialized yet.
+pub async fn stored_report(storage: &dyn Storage) -> Result<Option<Report>> {
+    match stored_report_bytes(storage).await? {
+        Some(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes).context("parsing advisory report")?,
+        )),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,5 +1312,95 @@ mod tests {
         assert_eq!(advisories_for(&db, "pkg", "1.0.0")[0].id, "MAL-2024-0007");
         assert_eq!(db.block_names(), 1);
         assert_eq!(db.audit_records(), 1);
+    }
+
+    fn inv(package: &str, version: &str, origin: &str, downloads: u64) -> AuditInventory {
+        AuditInventory {
+            package: package.into(),
+            version: version.into(),
+            origin: origin.into(),
+            downloads_30d: downloads,
+        }
+    }
+
+    #[test]
+    fn report_join_filters_private_ranks_and_flags_blocked() {
+        let db = parse_feed(&osv_zip(&[
+            ("m.json", mal_exact("MAL-2024-1", "evil", "1.0.0")),
+            ("p.json", pysec_fixed("PYSEC-2024-2", "widget", "2.0.0")),
+        ]))
+        .unwrap();
+        let quarantined = HashSet::new();
+        let inventory = vec![
+            // Vulnerable but not blocked (PYSEC is audit-only) — top of the rank.
+            inv("widget", "1.5.0", "mirror", 10),
+            // Malware → blocked.
+            inv("evil", "1.0.0", "mirror", 5),
+            // Private-origin same name as the MAL package → excluded entirely.
+            inv("evil", "1.0.0", "private", 999),
+            // Fixed version of the vulnerable package → no row.
+            inv("widget", "2.0.0", "mirror", 3),
+            // No advisory → no row (even at the top of downloads).
+            inv("clean", "9.9.9", "mirror", 100),
+        ];
+        let report = build_report(&inventory, &db, &quarantined, 123, "deadbeef");
+        assert_eq!(report.generated_unix, 123);
+        assert_eq!(report.feed_sha256, "deadbeef");
+        assert_eq!(
+            report.rows.len(),
+            2,
+            "private/fixed/clean rows must be dropped"
+        );
+        // Sorted by downloads descending: widget (10) then evil (5).
+        let widget = &report.rows[0];
+        assert_eq!(
+            (widget.package.as_str(), widget.version.as_str()),
+            ("widget", "1.5.0")
+        );
+        assert_eq!(widget.advisories, ["PYSEC-2024-2"]);
+        assert_eq!(widget.severity, "7.5");
+        assert_eq!(widget.fixed_in, ["2.0.0"]);
+        assert_eq!(widget.downloads_30d, 10);
+        assert!(
+            !widget.blocked,
+            "a vulnerability is informational, not blocked"
+        );
+        let evil = &report.rows[1];
+        assert_eq!(evil.package, "evil");
+        assert_eq!(evil.advisories, ["MAL-2024-1"]);
+        assert_eq!(evil.origin, "mirror");
+        assert!(evil.blocked, "a MAL match must be flagged blocked");
+    }
+
+    #[test]
+    fn report_quarantine_flags_blocked_without_mal() {
+        let db = parse_feed(&osv_zip(&[(
+            "p.json",
+            pysec_fixed("PYSEC-2024-2", "widget", "2.0.0"),
+        )]))
+        .unwrap();
+        let quarantined: HashSet<String> = ["widget".to_string()].into_iter().collect();
+        let report = build_report(
+            &[inv("widget", "1.0.0", "mirror", 1)],
+            &db,
+            &quarantined,
+            0,
+            "",
+        );
+        assert_eq!(report.rows.len(), 1);
+        // A vulnerable row whose project is ALSO quarantined is blocked (the byte
+        // gate would 403 it), even though PYSEC never blocks on its own.
+        assert!(report.rows[0].blocked);
+    }
+
+    #[test]
+    fn audit_has_name_filters_to_indexed_packages() {
+        let db = parse_feed(&osv_zip(&[(
+            "p.json",
+            pysec_fixed("PYSEC-2024-2", "widget", "2.0.0"),
+        )]))
+        .unwrap();
+        assert!(db.audit_has_name("widget"));
+        assert!(!db.audit_has_name("unheard-of"));
     }
 }

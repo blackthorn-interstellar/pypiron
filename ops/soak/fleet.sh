@@ -5,6 +5,7 @@
 #   ./fleet.sh apply                # create/update the fleet (default VPC if unset)
 #   ./fleet.sh status               # stack + instances + finding count
 #   ./fleet.sh findings             # list the deduped findings in S3
+#   ./fleet.sh seeds                # how many seeds the fleet has checked
 #   ./fleet.sh destroy [--all]      # tear down the fleet; --all also deletes the bucket
 #
 # The fleet holds no GitHub credential: the box downloads the bundle and writes
@@ -138,6 +139,35 @@ findings() {
     done
 }
 
+# seeds: sum the live per-core seed counters across the fleet, via SSM. The
+# counter is per-process and resets when a soak restarts (e.g. a spot reclaim),
+# so this is "seeds since the current instances started," not lifetime.
+seeds() {
+    local iids total=0
+    iids=$(aws ec2 describe-instances \
+        --filters "Name=tag:Name,Values=${STACK_NAME}" "Name=instance-state-name,Values=running" \
+        --query 'Reservations[].Instances[].InstanceId' --output text)
+    if [ -z "$iids" ]; then
+        echo "no running instances"
+        return
+    fi
+    local snippet b64
+    snippet='for u in $(systemctl list-units "pypiron-soak@*" --no-legend --plain | grep -oE "^[^ ]+"); do journalctl -u "$u" -o cat --no-pager | grep -a "seeds," | tail -1; done'
+    b64=$(printf '%s' "$snippet" | base64 | tr -d '\n')
+    for iid in $iids; do
+        local cid out n
+        cid=$(aws ssm send-command --instance-ids "$iid" --document-name AWS-RunShellScript \
+            --parameters commands="echo $b64 | base64 -d | bash" --query Command.CommandId --output text)
+        aws ssm wait command-executed --command-id "$cid" --instance-id "$iid" 2>/dev/null || true
+        out=$(aws ssm get-command-invocation --command-id "$cid" --instance-id "$iid" \
+            --query StandardOutputContent --output text 2>/dev/null || true)
+        n=$(printf '%s' "$out" | grep -oE '[0-9]+ seeds' | awk '{s+=$1} END{print s+0}')
+        echo "  $iid: $n seeds"
+        total=$((total + n))
+    done
+    echo "TOTAL: $total seeds explored (since current instances started; resets on spot reclaim)"
+}
+
 # destroy: tear down the compute. By default the bucket (your findings) is
 # preserved; `destroy --all` also empties and deletes it.
 destroy() {
@@ -162,9 +192,10 @@ case "${1:-}" in
     apply) apply ;;
     status) status ;;
     findings) findings ;;
+    seeds) seeds ;;
     destroy) shift; destroy "$@" ;;
     *)
-        echo "usage: $0 {push-bundle|apply|status|findings|destroy [--all]}" >&2
+        echo "usage: $0 {push-bundle|apply|status|findings|seeds|destroy [--all]}" >&2
         exit 2
         ;;
 esac

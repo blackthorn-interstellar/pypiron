@@ -10,7 +10,9 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::sidecar::{frozen_key, metadata_key, provenance_key, sidecar_key, tombstone_key};
+use crate::sidecar::{
+    frozen_key, metadata_key, mirror_quarantined_key, provenance_key, sidecar_key, tombstone_key,
+};
 use crate::storage::Storage;
 use crate::PACKAGES_PREFIX;
 
@@ -77,4 +79,52 @@ pub async fn complete_interrupted_deletes(
         completed += 1;
     }
     Ok(completed)
+}
+
+/// Drop sidecar/companion objects stranded beside an artifact that no longer
+/// exists and carries no deliberate marker. Two crash-safe writers can leave
+/// this debris: a failed upload whose `store_artifact_verified` rollback deletes
+/// its own just-written body *after* the background audit read that body and
+/// fabricated a sidecar for it (worker::backfill_sidecar's confirm/retract has a
+/// race window and a non-durable retract), and an interrupted sidecar-first
+/// replication copy (replicate::copy_live) that never reaches its artifact
+/// write. With no artifact to list and no `.tombstone` to trigger
+/// [`complete_interrupted_deletes`], such companions are invisible to every
+/// future rebuild, and the cross-bucket merge reads them as `Absent`
+/// (RecordState maps sidecar-without-artifact to `Absent`) so `decide` returns
+/// `Noop` — the debris then survives every diff and diverges the buckets
+/// forever. `filenames` are artifact base names the audit already observed with
+/// a companion but no anchoring body/marker in the same listing. Each base is
+/// re-verified against a fresh HEAD before its companions are removed, so a
+/// body or marker that landed after the listing (a sidecar-first copy about to
+/// write its artifact, or a fresh upload) is never clobbered. Returns how many
+/// bases were cleaned.
+pub async fn drop_orphan_companions(
+    storage: &dyn Storage,
+    pkg: &str,
+    filenames: &[String],
+) -> Result<usize> {
+    let mut dropped = 0;
+    for filename in filenames {
+        let akey = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+        // Any anchor re-observed under a fresh read means the companions still
+        // describe real evidence (a live body, a fenced name, or quarantined
+        // canonical bytes) — leave them untouched.
+        if storage.head_exists(&akey).await?
+            || storage.head_exists(&tombstone_key(&akey)).await?
+            || storage.head_exists(&frozen_key(&akey)).await?
+            || storage.head_exists(&mirror_quarantined_key(&akey)).await?
+        {
+            continue;
+        }
+        storage
+            .delete_keys(&[
+                sidecar_key(&akey),
+                metadata_key(&akey),
+                provenance_key(&akey),
+            ])
+            .await?;
+        dropped += 1;
+    }
+    Ok(dropped)
 }

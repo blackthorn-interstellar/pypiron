@@ -1468,6 +1468,13 @@ struct ShardAudit {
     inventory: Vec<(String, Vec<String>)>,
 }
 
+/// One package's audit inputs, derived from the flat listing in a single pass:
+/// `(name, fingerprint, has-live-artifacts, has-materialized-view,
+/// interrupted-deletes, orphaned-companions)`. The two trailing lists are the
+/// debris the listing flagged for repair (a crashed delete's remnants, and a
+/// companion stranded beside a vanished artifact).
+type PackageAudit = (String, String, bool, bool, Vec<String>, Vec<String>);
+
 /// Audit every package whose name starts with `shard`. `collect_deltas` gathers
 /// transparency-checkpoint deltas (off when `--transparency` is disabled);
 /// `need_full_shas` additionally reads unchanged packages' sidecars so the
@@ -1531,8 +1538,7 @@ async fn audit_shard(
     // status read below to derive the quarantined set. Only collected when the
     // byte gate would consult it, so a blocking-off server does zero extra work.
     let mut status_pkgs: Vec<String> = Vec::new();
-    let mut packages: Vec<(String, String, bool, bool, Vec<String>)> =
-        Vec::with_capacity(by_pkg.len());
+    let mut packages: Vec<PackageAudit> = Vec::with_capacity(by_pkg.len());
     for (pkg, (t, v)) in by_pkg {
         let fp = fingerprint(&t, &v);
         // Count artifacts and distinct versions straight off the listing — the
@@ -1599,6 +1605,40 @@ async fn audit_shard(
         // `members` is a HashSet: sort so the repair order (and therefore the
         // storage-op order a deterministic simulation replays) is stable.
         interrupted_deletes.sort();
+        // A companion (sidecar/metadata/provenance) sitting beside NO artifact
+        // and NO deliberate marker is stranded debris — the mirror image of the
+        // orphaned-artifact backfill above. A failed upload's own rollback
+        // deleting bytes the audit had already fabricated a sidecar for, or an
+        // interrupted sidecar-first replication copy, leaves it. With no
+        // artifact to list and no tombstone to trigger the interrupted-delete
+        // sweep, it hides from every rebuild; and the cross-bucket merge reads
+        // sidecar-without-artifact as `Absent`, so the tree diff never converges
+        // it away. Flag the base for a re-verified drop; quarantined mirror
+        // bytes keep their sidecar as canonical evidence and are excluded.
+        let mut orphan_companions: Vec<String> = Vec::new();
+        for member in &members {
+            let Some(filename) = member
+                .strip_suffix(SIDECAR_SUFFIX)
+                .or_else(|| member.strip_suffix(METADATA_SUFFIX))
+                .or_else(|| member.strip_suffix(PROVENANCE_SUFFIX))
+            else {
+                continue;
+            };
+            if !is_artifact(filename) {
+                continue;
+            }
+            let anchored = members.contains(filename)
+                || members.contains(format!("{filename}{TOMBSTONE_SUFFIX}").as_str())
+                || members.contains(format!("{filename}{FROZEN_SUFFIX}").as_str())
+                || members.contains(
+                    format!("{filename}{}", crate::sidecar::MIRROR_QUARANTINED_SUFFIX).as_str(),
+                );
+            if !anchored {
+                orphan_companions.push(filename.to_string());
+            }
+        }
+        orphan_companions.sort();
+        orphan_companions.dedup();
         if file_count > 0 {
             out.pkg_stats.push((
                 pkg.clone(),
@@ -1618,21 +1658,24 @@ async fn audit_shard(
             file_count > 0,
             has_package_view,
             interrupted_deletes,
+            orphan_companions,
         ));
     }
 
     for chunk in packages.chunks(PACKAGE_SWEEP_CONCURRENCY) {
         let jobs = chunk
             .iter()
-            .map(|(pkg, fp, has_artifacts, has_package_view, interrupted_deletes)| {
-            let fingerprint_unchanged =
-                stored.get(pkg.as_str()) == Some(fp) && interrupted_deletes.is_empty();
-            let (pkg, fp, has_artifacts, has_package_view, interrupted_deletes) = (
+            .map(|(pkg, fp, has_artifacts, has_package_view, interrupted_deletes, orphan_companions)| {
+            let fingerprint_unchanged = stored.get(pkg.as_str()) == Some(fp)
+                && interrupted_deletes.is_empty()
+                && orphan_companions.is_empty();
+            let (pkg, fp, has_artifacts, has_package_view, interrupted_deletes, orphan_companions) = (
                 pkg.clone(),
                 fp.clone(),
                 *has_artifacts,
                 *has_package_view,
                 interrupted_deletes.clone(),
+                orphan_companions.clone(),
             );
             async move {
                 if let Err(e) = require_generation(state, generation) {
@@ -1670,6 +1713,28 @@ async fn audit_shard(
                         Err(e) => {
                             maintenance_failed = true;
                             error!(package=%pkg, error=?e, "audit: completing interrupted delete failed");
+                        }
+                    }
+                }
+                // Drop companions stranded beside a vanished artifact with no
+                // marker — debris the tree diff would otherwise carry forever.
+                // Same rare-package gating as the interrupted-delete sweep.
+                if !orphan_companions.is_empty() {
+                    match crate::tombstone::drop_orphan_companions(
+                        storage,
+                        &pkg,
+                        &orphan_companions,
+                    )
+                    .await
+                    {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            maintenance_changed = true;
+                            error!(package=%pkg, count, "audit: dropped orphaned sidecar/companion(s) with no artifact");
+                        }
+                        Err(e) => {
+                            maintenance_failed = true;
+                            error!(package=%pkg, error=?e, "audit: dropping orphaned companion failed");
                         }
                     }
                 }

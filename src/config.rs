@@ -143,6 +143,10 @@ pub struct SyncConfig {
     pub admin_pass: Option<String>,
     pub concurrency: Option<usize>,
     pub package_concurrency: Option<usize>,
+    /// Advisory snapshot to ferry to the destination. Unset relays the source
+    /// server's snapshot (on by default); a URL/path fetches that feed; `""`
+    /// disables the relay. Shares the `PYPIRON_ADVISORY_FEED` concept with serve.
+    pub advisory_feed: Option<String>,
 }
 
 /// Load configuration. An explicit `--config` path must exist; without one,

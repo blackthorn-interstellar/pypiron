@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tokio::fs;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{self, ConfigFile, MirrorConfig};
 use crate::names::{
@@ -76,6 +76,22 @@ pub struct SyncArgs {
     /// Refuse to mirror names inside this private namespace (PEP 503-normalized)
     #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
     pub private_prefix: Option<String>,
+
+    /// Ferry the advisory snapshot (the OSV malware/vulnerability feed) to the
+    /// destination alongside the packages. Unset (the default): relay the source
+    /// server's snapshot — `GET <from>/advisories/feed` — when `--from` is set, so
+    /// a plain pypiron→pypiron sync carries security metadata across the air gap on
+    /// its own. A URL or local path fetches that feed instead (e.g. the OSV export
+    /// on the connected side); `""` disables the relay. Whatever is obtained is
+    /// pushed to the destination's admin `PUT /advisories/feed`, etag-conditioned
+    /// so an unchanged feed transfers nothing. Best-effort: a source or destination
+    /// without a feed warns, and the package sync proceeds.
+    #[arg(
+        long = "advisory-feed",
+        env = "PYPIRON_ADVISORY_FEED",
+        value_name = "URL|PATH"
+    )]
+    pub advisory_feed: Option<String>,
 
     /// Parallel downloads/uploads within one package (default 4).
     #[arg(long, env = "PYPIRON_SYNC_CONCURRENCY")]
@@ -573,6 +589,14 @@ struct Resolved {
     admin_user: Option<String>,
     admin_pass: Option<String>,
     private_prefix: Option<String>,
+    /// The advisory-feed source for the relay. `None` = relay from the sync source
+    /// (on by default, gated on [`Self::src_explicit`]); `Some("")` after trim =
+    /// disabled; `Some(url|path)` = fetch that. See [`push_advisory_feed`].
+    advisory_feed: Option<String>,
+    /// Whether `--from`/`[sync].from` was explicitly set. The source-relay default
+    /// only fires against an operator-named source — a bare `sync` (implicit
+    /// pypi.org, which has no feed endpoint) must never surprise-egress for it.
+    src_explicit: bool,
     concurrency: usize,
     package_concurrency: usize,
     spool_dir: PathBuf,
@@ -667,6 +691,11 @@ impl Resolved {
             bail!("--package-concurrency must be at least 1");
         }
 
+        // Capture whether a source was named before `sync.from` is consumed below
+        // — the advisory source-relay default fires only against an explicit
+        // `--from`, never the implicit pypi.org fallback.
+        let src_explicit = args.src_base.is_some() || sync.from.is_some();
+        let advisory_feed = args.advisory_feed.clone().or(sync.advisory_feed);
         let src_base = args
             .src_base
             .clone()
@@ -688,6 +717,8 @@ impl Resolved {
             admin_user: args.admin_user.clone().or(sync.admin_user),
             admin_pass: args.admin_pass.clone().or(sync.admin_pass),
             private_prefix: args.private_prefix.clone().or(cfg.private_prefix),
+            advisory_feed,
+            src_explicit,
             concurrency,
             package_concurrency,
             spool_dir: args.spool_dir.clone().unwrap_or_else(std::env::temp_dir),
@@ -1242,6 +1273,195 @@ async fn save_cursors(client: &Client, resolved: &Resolved, cursors: &Cursors) {
     }
 }
 
+/// Ferry the advisory snapshot to the destination. Obtains the feed (an explicit
+/// URL/path, or — the default — a relay of the sync source's own snapshot),
+/// validates that it parses, and pushes it to the destination's admin
+/// `PUT /advisories/feed`, etag-conditioned via a prior `HEAD` so an unchanged
+/// feed transfers no body.
+///
+/// Best-effort, exactly like [`save_cursors`]: every failure warns once and the
+/// package sync proceeds. It never returns an error and is never allowed to fail
+/// the run — the packages are the job; the feed is supply-chain metadata riding
+/// along. `""` (the opt-out) skips it entirely, issuing no requests.
+async fn push_advisory_feed(client: &Client, resolved: &Resolved) {
+    let bytes = match resolved.advisory_feed.as_deref().map(str::trim) {
+        // Explicit opt-out: no fetch, no push, no requests.
+        Some("") => return,
+        // Explicit source: a local zip, or a URL fetched through the same
+        // SSRF-guarded, proxy-honoring, size-capped client the server's own feed
+        // polling uses (never a second client shape).
+        Some(feed) => match crate::advisories::fetch_feed_bytes(feed).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(error = %e, feed, "advisory feed: could not read the configured feed; skipping advisory push (package sync continues)");
+                return;
+            }
+        },
+        // Default: relay the source server's snapshot, but only against an
+        // operator-named `--from`. A bare sync defaults its source to pypi.org,
+        // which has no feed endpoint — never surprise-egress for it.
+        None => {
+            if !resolved.src_explicit {
+                debug!("advisory feed: no --from source set; skipping the advisory relay");
+                return;
+            }
+            match relay_from_source(client, resolved).await {
+                Some(bytes) => bytes,
+                None => return, // relay_from_source already warned
+            }
+        }
+    };
+
+    // Validate before pushing garbage — the stored copy is what every destination
+    // node loads. Parse off the runtime (a real export is ~32 MB).
+    let to_parse = bytes.clone();
+    match tokio::task::spawn_blocking(move || crate::advisories::parse_feed(&to_parse)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            warn!(error = %e, "advisory feed: obtained feed did not parse; skipping advisory push (package sync continues)");
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, "advisory feed: parse task failed; skipping advisory push (package sync continues)");
+            return;
+        }
+    }
+
+    push_feed_to_dest(client, resolved, bytes).await;
+}
+
+/// Relay the sync source's advisory snapshot: `GET <from>/advisories/feed`
+/// through the sync client (which exempts the trusted, operator-named source from
+/// the SSRF guard, so an internal mirror on a private address works — unlike the
+/// public-only feed client). Unauthenticated, matching how sync reads the source's
+/// indexes. 404/401/403 (no feed to relay) or an unreachable source warns once and
+/// yields `None`; there is deliberately no fallback to the OSV URL.
+async fn relay_from_source(client: &Client, resolved: &Resolved) -> Option<Vec<u8>> {
+    let url = format!(
+        "{}/advisories/feed",
+        resolved.src_base.trim_end_matches('/')
+    );
+    let resp = match client.get(&url).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(error = %e, "advisory feed: source has no advisory feed reachable; skipping the relay (package sync continues)");
+            return None;
+        }
+    };
+    let status = resp.status();
+    if matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+    ) {
+        warn!(%status, "advisory feed: source has no advisory feed to relay; skipping (package sync continues)");
+        return None;
+    }
+    match read_capped_feed_body(resp).await {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            warn!(error = %e, "advisory feed: reading the source feed failed; skipping the relay (package sync continues)");
+            None
+        }
+    }
+}
+
+/// Read a feed response body into memory with the same ceiling the server applies
+/// to its own pulls, so a hostile/misconfigured source can't OOM the sync host.
+async fn read_capped_feed_body(resp: reqwest::Response) -> Result<Vec<u8>> {
+    let cap = crate::advisories::MAX_FEED_BYTES;
+    if resp.content_length().is_some_and(|len| len > cap) {
+        bail!("advisory feed exceeds {cap} bytes (Content-Length)");
+    }
+    let mut bytes = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading advisory feed body")?;
+        if bytes.len() as u64 + chunk.len() as u64 > cap {
+            bail!("advisory feed exceeds {cap} bytes");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// Push the validated snapshot to the destination, etag-conditioned. A `HEAD`
+/// (served by axum's `GET` route with the body stripped, so the ETag header comes
+/// back free) yields the destination's stored-snapshot ETag — the zip's sha256,
+/// double-quoted, exactly as `advisories_feed_get` computes it. Equal to ours →
+/// skip (no body moves); a `404` (no snapshot yet) or a mismatch → `PUT`. A HEAD
+/// that returns 401/403/405, or a PUT the destination rejects (404/405/401/403 or
+/// any error), warns once and the package sync proceeds.
+async fn push_feed_to_dest(client: &Client, resolved: &Resolved, bytes: Vec<u8>) {
+    let base = resolved.dst_base.trim_end_matches('/');
+    let url = format!("{base}/advisories/feed");
+    // Match the destination's ETag encoding byte-for-byte (see advisories_feed_get)
+    // so an unchanged feed is recognized and transfers nothing.
+    let our_etag = format!("\"{}\"", crate::advisories::sha256_hex(&bytes));
+
+    match head_dest_feed(client, resolved, &url).await {
+        Ok((status, etag)) if status.is_success() => {
+            if etag.as_deref() == Some(our_etag.as_str()) {
+                info!("advisory feed unchanged; skipping push");
+                return;
+            }
+            // A snapshot exists but differs (or carried no ETag) → push below.
+        }
+        // No snapshot yet (or no endpoint) — the PUT below delivers or decides.
+        Ok((reqwest::StatusCode::NOT_FOUND, _)) => {}
+        Ok((status, _)) => {
+            warn!(%status, "destination does not accept advisory feeds; skipping advisory push (package sync continues)");
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, "advisory feed: destination HEAD failed; skipping advisory push (package sync continues)");
+            return;
+        }
+    }
+
+    let mut req = client
+        .put(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/zip")
+        .body(bytes);
+    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
+        req = req.basic_auth(u, Some(p));
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            info!("advisory snapshot pushed to destination");
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            warn!(%status, "destination does not accept advisory feeds; skipping advisory push (package sync continues)");
+        }
+        Err(e) => {
+            warn!(error = %e, "advisory feed: destination PUT failed; skipping advisory push (package sync continues)");
+        }
+    }
+}
+
+/// `HEAD` the destination feed with the dest admin credential, returning its
+/// `(status, ETag)`. The ETag is `None` unless the destination held a snapshot to
+/// report one.
+async fn head_dest_feed(
+    client: &Client,
+    resolved: &Resolved,
+    url: &str,
+) -> Result<(reqwest::StatusCode, Option<String>)> {
+    let mut req = client.head(url);
+    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
+        req = req.basic_auth(u, Some(p));
+    }
+    let resp = req.send().await?;
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    Ok((resp.status(), etag))
+}
+
 /// Live throughput meter for a sync run — a tqdm-style one-liner on stderr with
 /// rate and ETA. Counters are atomic so the background ticker can read them while
 /// the package/file fan-out updates them.
@@ -1452,6 +1672,11 @@ pub async fn run_sync(args: SyncArgs, config_path: Option<PathBuf>) -> Result<()
     // credentials becomes a single clear error here, not the same failure echoed
     // once per file.
     preflight(&client, &resolved).await?;
+
+    // Ferry the advisory snapshot across the air gap before the package loop. The
+    // packages are the job; the feed is best-effort supply-chain metadata riding
+    // along, so a missing feed never fails the run (like save_cursors).
+    push_advisory_feed(&client, &resolved).await;
 
     // The conditional-fetch memo from the last run; an empty map (first run,
     // --full, or any read error) simply means every project full-fetches.
@@ -3051,6 +3276,8 @@ mod tests {
             admin_user: None,
             admin_pass: None,
             private_prefix: None,
+            advisory_feed: None,
+            src_explicit: false,
             concurrency: 1,
             package_concurrency: 1,
             spool_dir: std::env::temp_dir(),

@@ -8,8 +8,11 @@ the on-demand proxy refuses to fill a blocked version (AC3), and a dead feed
 degrades freshness, never availability (AC6). Rung 5 (listings + quarantine): the
 materialized and proxy-rendered listings scrub blocked files, origin-aware (AC4),
 and a relayed PEP 792 `quarantined` status blocks the byte gate after the worker's
-next sweep (AC5). Everything through the real binary over HTTP, driven by real
-`uv`.
+next sweep (AC5). Rung 6 (sync relay): `pypiron sync` ferries the snapshot across
+the air gap — a local zip, a URL, or the source server's own feed — pushing it to
+the destination's admin PUT etag-conditioned, on by default, tolerant of a
+feed-less source/dest (AC10's blocking half; audit rows are rung 7). Everything
+through the real binary over HTTP, driven by real `uv`.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from .helpers import (
     make_wheel,
     run_checked,
     run_returncode,
+    sync_to,
     upload_legacy,
     wait_for_file_in_index,
     wait_http_responding,
@@ -676,6 +680,241 @@ def test_ac5_quarantine_reaches_the_byte_gate_after_sweep(tmp_path_factory, pypi
         assert _poll_http_status(file_url, {200, 302}), (
             "dequarantine never reached the byte gate within the bound"
         )
+
+
+# ------------------------------ sync relay (rung 6) --------------------------
+#
+# `pypiron sync` ferries the advisory snapshot across the air gap: fetch the feed
+# (a local zip, a URL, or — the default — the source server's own snapshot) and
+# push it to the destination's admin PUT /advisories/feed, etag-conditioned. On by
+# default; `""` opts out; a feed-less source/dest warns and the package sync
+# proceeds. AC10's blocking half is proven here (audit rows are rung 7).
+
+
+def _dest_dict(base: str, data_dir: Path) -> dict:
+    """A `sync_to`-shaped server dict for a `_hand_start` destination (which
+    returns a bare (proc, base, log) tuple, not a fixture dict)."""
+    return {
+        "base_url": base,
+        "simple": f"{base}/simple/",
+        "legacy": f"{base}/legacy/",
+        # Both credential shapes: sync_to reads admin_user, but eagerly evaluates
+        # server["user"] as its .get default, so the plain keys must exist too.
+        "user": "admin",
+        "password": "secret",
+        "admin_user": "admin",
+        "admin_password": "secret",
+        "data_dir": data_dir,
+    }
+
+
+def _advisory_sync(pypiron_bin, source, dest, pkg, *extra, advisory_feed=None):
+    """Run `pypiron sync` source→dest for one package. The wheels are seeded moments
+    before, so the default 7-day cooldown is disabled (as the reconcile tests do),
+    and info logs are pinned so the skip/warn assertions don't depend on ambient
+    RUST_LOG. `advisory_feed=None` passes no flag (the default source-relay); any
+    other value (including `""`, the opt-out) is passed as `--advisory-feed`."""
+    args = ["--include-package", pkg, "--exclude-newer", ""]
+    if advisory_feed is not None:
+        args += ["--advisory-feed", str(advisory_feed)]
+    return sync_to(
+        pypiron_bin,
+        dest,
+        *args,
+        *extra,
+        source=source["base_url"],
+        env={**os.environ, "RUST_LOG": "info,pypiron=info"},
+    )
+
+
+def test_ac10_sync_relays_snapshot_to_air_gapped_dest(
+    tmp_path_factory, pypiron_bin, tmp_path, uv_path, uv_venv
+):
+    """AC10 core: a dest with no --advisory-feed and no outbound network (dead
+    proxy) receives the snapshot from `sync --advisory-feed <local zip>`, then blocks
+    the synced MAL artifact — direct GET 403 with the id, pinned install fails, and
+    the tripwire moves. The snapshot lands verbatim under the reserved prefix."""
+    fixture = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    src_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    source = next(src_gen)
+    dproc, dbase, _dlog = _hand_start(
+        pypiron_bin, tmp_path / "dest", [], extra_env=_dead_proxy_env()
+    )
+    dest = _dest_dict(dbase, tmp_path / "dest")
+    try:
+        bad = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+        _mirror_upload(source, bad)
+        wait_for_file_in_index(source["simple"], MAL_EXACT_PKG, bad.name)
+
+        rc, out, err = _advisory_sync(
+            pypiron_bin, source, dest, MAL_EXACT_PKG, advisory_feed=fixture
+        )
+        assert rc == 0, f"sync failed:\n{out}\n{err}"
+
+        # The snapshot landed verbatim under the dest's reserved prefix.
+        stored = _stored_feed_path(dest)
+        _wait_file_bytes(stored, fixture.read_bytes())
+
+        # The synced MAL artifact (mirror-origin on the dest) 403s at the byte gate,
+        # naming the advisory id byte-exactly.
+        file_url = f"{dbase}/files/{MAL_EXACT_PKG}/{bad.name}"
+        blocked = _poll_http_status(file_url, {403})
+        assert blocked is not None, "MAL artifact never blocked after the relayed snapshot"
+        assert MAL_EXACT_ID.encode() in blocked[1], blocked
+        assert _poll_blocked_at_least(dbase, 1), "tripwire metric never moved on the dest"
+
+        # The pinned install of the blocked version fails (uv can't fetch the wheel).
+        rc, out, err = _uv_install(uv_path, uv_venv, dest, f"{MAL_EXACT_PKG}=={MAL_EXACT_VERSION}")
+        assert rc != 0, f"install of relayed-blocked malware succeeded:\n{out}\n{err}"
+    finally:
+        kill_process_tree(dproc)
+        src_gen.close()
+
+
+def test_ac10_unchanged_second_run_transfers_no_body(tmp_path_factory, pypiron_bin, tmp_path):
+    """AC10 (etag-conditioned): a second identical sync with an unchanged feed logs
+    the skip line and does not rewrite the dest's stored snapshot (the HEAD ETag
+    matches, so no body moves)."""
+    fixture = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    src_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    source = next(src_gen)
+    dproc, dbase, _dlog = _hand_start(
+        pypiron_bin, tmp_path / "dest", [], extra_env=_dead_proxy_env()
+    )
+    dest = _dest_dict(dbase, tmp_path / "dest")
+    try:
+        clean = make_wheel("relayok", "1.0.0", tmp_path)
+        _mirror_upload(source, clean)
+        wait_for_file_in_index(source["simple"], "relayok", clean.name)
+
+        rc, out, err = _advisory_sync(pypiron_bin, source, dest, "relayok", advisory_feed=fixture)
+        assert rc == 0, f"first sync failed:\n{out}\n{err}"
+        stored = _stored_feed_path(dest)
+        _wait_file_bytes(stored, fixture.read_bytes())
+        mtime_before = stored.stat().st_mtime_ns
+
+        rc, out, err = _advisory_sync(pypiron_bin, source, dest, "relayok", advisory_feed=fixture)
+        assert rc == 0, f"second sync failed:\n{out}\n{err}"
+        assert "advisory feed unchanged; skipping push" in (out + err), out + err
+        assert stored.stat().st_mtime_ns == mtime_before, "an unchanged feed rewrote the snapshot"
+    finally:
+        kill_process_tree(dproc)
+        src_gen.close()
+
+
+def test_ac10_restart_blocks_from_relayed_snapshot(tmp_path_factory, pypiron_bin, tmp_path):
+    """AC10 (restart): after a relayed snapshot exists, respawning the dest with an
+    explicit --malware-block and the source still unreachable starts cleanly from the
+    stored snapshot alone and still 403s the MAL artifact."""
+    fixture = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    env = _dead_proxy_env()
+    src_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    source = next(src_gen)
+    ddata = tmp_path / "dest"
+    dproc, dbase, _dlog = _hand_start(pypiron_bin, ddata, [], extra_env=env)
+    dest = _dest_dict(dbase, ddata)
+    bad = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+    try:
+        _mirror_upload(source, bad)
+        wait_for_file_in_index(source["simple"], MAL_EXACT_PKG, bad.name)
+        rc, out, err = _advisory_sync(
+            pypiron_bin, source, dest, MAL_EXACT_PKG, advisory_feed=fixture
+        )
+        assert rc == 0, f"sync failed:\n{out}\n{err}"
+        _wait_file_bytes(_stored_feed_path(dest), fixture.read_bytes())
+        assert _poll_http_status(f"{dbase}/files/{MAL_EXACT_PKG}/{bad.name}", {403}) is not None
+    finally:
+        kill_process_tree(dproc)
+
+    # Respawn on the SAME data dir with an explicit demand to block and the source
+    # still unreachable: the stored (relayed) snapshot satisfies fail-closed.
+    dproc, dbase, _dlog = _hand_start(
+        pypiron_bin, ddata, ["--malware-block", "true"], extra_env=env
+    )
+    try:
+        blocked = _poll_http_status(f"{dbase}/files/{MAL_EXACT_PKG}/{bad.name}", {403})
+        assert blocked is not None, "restart did not block from the stored relayed snapshot"
+        assert MAL_EXACT_ID.encode() in blocked[1], blocked
+    finally:
+        kill_process_tree(dproc)
+        src_gen.close()
+
+
+def test_ac10_default_on_relay_from_source(tmp_path_factory, pypiron_bin, tmp_path):
+    """On by default: a source armed with the fixture via admin PUT, a plain sync
+    with NO advisory flag, and the unfed dest receives the snapshot (relayed from the
+    source) and blocks the synced MAL artifact — the "on by default" proof."""
+    fixture_bytes = make_osv_zip(tmp_path / "osv.zip", canonical_records()).read_bytes()
+    src_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    source = next(src_gen)
+    dproc, dbase, _dlog = _hand_start(
+        pypiron_bin, tmp_path / "dest", [], extra_env=_dead_proxy_env()
+    )
+    dest = _dest_dict(dbase, tmp_path / "dest")
+    try:
+        # Arm the SOURCE with the fixture via admin PUT. Its own advisory feature is
+        # off (the shared test env sets PYPIRON_ADVISORY_FEED=""), but the push/pull
+        # endpoints work regardless — GET serves whatever PUT stored.
+        code, _, _ = http_request_auth(
+            "PUT",
+            f"{source['base_url']}/advisories/feed",
+            username=source["admin_user"],
+            password=source["admin_password"],
+            data=fixture_bytes,
+        )
+        assert code == 204, code
+        gcode, gbody, _ = http_get(f"{source['base_url']}/advisories/feed")
+        assert gcode == 200 and gbody == fixture_bytes, (gcode, len(gbody))
+
+        bad = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+        _mirror_upload(source, bad)
+        wait_for_file_in_index(source["simple"], MAL_EXACT_PKG, bad.name)
+
+        # Plain sync, NO --advisory-feed flag → the default source-relay fires.
+        rc, out, err = _advisory_sync(pypiron_bin, source, dest, MAL_EXACT_PKG)
+        assert rc == 0, f"sync failed:\n{out}\n{err}"
+
+        _wait_file_bytes(_stored_feed_path(dest), fixture_bytes)
+        blocked = _poll_http_status(f"{dbase}/files/{MAL_EXACT_PKG}/{bad.name}", {403})
+        assert blocked is not None, "the default relay did not deliver a blocking snapshot"
+        assert MAL_EXACT_ID.encode() in blocked[1], blocked
+    finally:
+        kill_process_tree(dproc)
+        src_gen.close()
+
+
+def test_ac10_opt_out_and_feedless_source_are_tolerant(tmp_path_factory, pypiron_bin, tmp_path):
+    """`--advisory-feed ""` issues no advisory requests (no `_advisories/` appears on
+    the dest), and the default relay against a feed-less source warns but still
+    completes the package sync (the package lands on the dest)."""
+    src_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    source = next(src_gen)  # feature off, no snapshot → a feed-less source
+    dst_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    dest = next(dst_gen)  # feature off → never writes `_advisories/` on its own
+    try:
+        clean = make_wheel("okpkg", "1.0.0", tmp_path)
+        _mirror_upload(source, clean)
+        wait_for_file_in_index(source["simple"], "okpkg", clean.name)
+
+        # Opt-out: `--advisory-feed ""` → no advisory requests at all.
+        rc, out, err = _advisory_sync(pypiron_bin, source, dest, "okpkg", advisory_feed="")
+        assert rc == 0, f"opt-out sync failed:\n{out}\n{err}"
+        wait_for_file_in_index(dest["simple"], "okpkg", clean.name)
+        assert not (Path(dest["data_dir"]) / "_advisories").exists(), "opt-out delivered a feed"
+
+        # Default relay against a feed-less source: it warns, but the package sync
+        # completes. --full re-processes the (unchanged) source rather than 304'ing.
+        rc, out, err = _advisory_sync(pypiron_bin, source, dest, "okpkg", "--full")
+        assert rc == 0, f"default-relay sync failed:\n{out}\n{err}"
+        assert "source has no advisory feed" in (out + err), out + err
+        assert not (Path(dest["data_dir"]) / "_advisories").exists(), (
+            "feed-less source delivered a feed"
+        )
+        names = {f["filename"] for f in get_index_json(dest["simple"], "okpkg")["files"]}
+        assert clean.name in names, f"package missing after tolerant relay: {names}"
+    finally:
+        dst_gen.close()
+        src_gen.close()
 
 
 # ------------------------------- test helpers --------------------------------

@@ -44,8 +44,9 @@ pub const DEFAULT_FEED_URL: &str =
     "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip";
 
 /// Hard ceiling on a fetched/read feed. The real export is ~32 MB; 256 MB is
-/// generous headroom that still refuses a hostile or runaway body.
-const MAX_FEED_BYTES: u64 = 256 * 1024 * 1024;
+/// generous headroom that still refuses a hostile or runaway body. Public so the
+/// `sync` relay caps a source-server pull with the same bound.
+pub const MAX_FEED_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Per-entry ceiling inside the zip. OSV records are KBs; this only refuses a
 /// decompression bomb hiding in one member.
@@ -522,6 +523,21 @@ impl FeedSource {
                     http_etag: None,
                 })
             }
+        }
+    }
+}
+
+/// Fetch a feed source (a `http(s)` URL or a local path) to bytes, once, for the
+/// `sync` relay's explicit `--advisory-feed`. Reuses the server's own
+/// [`FeedSource`] — a URL rides the SSRF-guarded, proxy-honoring, 60s-read,
+/// size-capped client; a path is read with the same ceiling. Unconditional (no
+/// `If-None-Match`), so a source that answers `304` to a first request is
+/// misbehaving and errors rather than silently yielding no bytes.
+pub async fn fetch_feed_bytes(feed: &str) -> Result<Vec<u8>> {
+    match FeedSource::new(feed)?.poll(None).await? {
+        RawFetch::Bytes { bytes, .. } => Ok(bytes),
+        RawFetch::NotModified => {
+            bail!("advisory feed source answered 304 to an unconditional fetch")
         }
     }
 }

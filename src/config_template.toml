@@ -165,3 +165,10 @@
 # admin-pass = "secret"                     # better: set PYPIRON_SYNC_ADMIN_PASS
 # concurrency = 4                           # parallel transfers within one package
 # package-concurrency = 8                   # packages synced in parallel
+
+# Ferry the advisory snapshot (OSV malware/vuln feed) across the air gap to the
+# destination's PUT /advisories/feed, etag-conditioned so an unchanged feed
+# transfers nothing. Unset (default): relay the source server's snapshot
+# (GET <from>/advisories/feed) when --from is set — on by default. A URL or local
+# path fetches that feed instead; "" disables the relay.
+# advisory-feed = "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip"

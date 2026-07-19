@@ -60,6 +60,23 @@ def test_upload_with_bad_digest_rejected(disk_server, tmp_path):
     assert not artifact.exists(), "artifact must not be written when the digest check fails"
 
 
+def test_upload_with_version_disagreeing_with_filename_rejected(disk_server, tmp_path):
+    """The filename's version is authoritative (PEP 427/625): a `version` form
+    field that disagrees with it is rejected, so every consumer that rules on
+    the filename alone — the project page's cheap version check, the advisory
+    byte gate — can trust it. Every standard build tool derives the filename
+    from the metadata, so only a hand-crafted upload can trip this."""
+    wheel_path = download_pypi_wheel(PACKAGE, NEW_VERSION, tmp_path)
+    _upload(disk_server, wheel_path, fields={"version": "9.9.9"}, expect_status=400)
+
+    artifact = disk_server["data_dir"] / "packages" / PACKAGE / wheel_path.name
+    assert not artifact.exists(), "artifact must not be written when the version check fails"
+
+    # The same wheel with the truthful version still publishes.
+    _upload(disk_server, wheel_path)
+    wait_for_file_in_index(disk_server["simple"], PACKAGE, wheel_path.name)
+
+
 def test_sidecar_backfilled_for_legacy_files(disk_server, tmp_path):
     # A file that predates sidecars: dropped straight into the packages tree.
     legacy_wheel = download_pypi_wheel(PACKAGE, OLD_VERSION, tmp_path)

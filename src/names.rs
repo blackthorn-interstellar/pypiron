@@ -99,9 +99,12 @@ pub fn matches_prefix(pkg: &str, prefix: &str) -> bool {
 }
 
 /// Best-effort version extraction from an artifact filename.
-/// Fallback only — sidecars carry the authoritative version. Legacy binary
-/// formats (.egg/.exe/.msi/.rpm/.dmg/.deb, 0.86% of PyPI, frozen since ~2013)
-/// are intentionally None: their version grammar is per-tool guesswork.
+/// Authoritative for `.whl`/sdist uploads — publishing rejects a `version` that
+/// disagrees with the name (PEP 427/625 require them to correspond), so the
+/// project page and the advisory byte gate can both rule on the filename alone.
+/// Legacy binary formats (.egg/.exe/.msi/.rpm/.dmg/.deb, 0.86% of PyPI, frozen
+/// since ~2013) are intentionally None: their version grammar is per-tool
+/// guesswork, so those keep taking the sidecar's word for it.
 pub fn infer_version_from_filename(filename: &str) -> Option<String> {
     if let Some(stem) = filename.strip_suffix(".whl") {
         // PEP 427: distribution-version(-build)?-python-abi-platform.whl
@@ -109,6 +112,23 @@ pub fn infer_version_from_filename(filename: &str) -> Option<String> {
     }
     let stem = strip_sdist_ext(filename)?;
     split_sdist_stem(stem).map(|(_, v)| v.to_string())
+}
+
+/// Fold a version to the form a filename and its metadata share: lowercased,
+/// with every run of non-alphanumerics collapsed to one separator. PEP 427
+/// escapes a wheel filename's version (metadata `1.0-1` is named `1.0_1`), so
+/// the two spellings must compare equal wherever one stands in for the other.
+/// Folding can only merge distinct versions, never split one.
+pub fn fold_version(version: &str) -> String {
+    let mut folded = String::with_capacity(version.len());
+    for ch in version.chars() {
+        if ch.is_ascii_alphanumeric() {
+            folded.push(ch.to_ascii_lowercase());
+        } else if !folded.ends_with('_') {
+            folded.push('_');
+        }
+    }
+    folded.trim_matches('_').to_string()
 }
 
 /// Order two version strings newest-first by PEP 440 semantics (so `1.10` sorts
@@ -288,6 +308,17 @@ mod tests {
             infer_package_from_filename("102003634-0.0.2-py3.11.egg"),
             "102003634"
         );
+    }
+
+    #[test]
+    fn fold_version_equates_escaped_and_metadata_spellings() {
+        // PEP 427 escaping: metadata `1.0-1` is named `1.0_1`.
+        assert_eq!(fold_version("1.0-1"), fold_version("1.0_1"));
+        // Case and separator runs fold; distinct digits never merge.
+        assert_eq!(fold_version("1.0.RC1"), fold_version("1.0.-rc1"));
+        assert_eq!(fold_version("1.0+local.2"), fold_version("1.0_local_2"));
+        assert_ne!(fold_version("1.0-1"), fold_version("1.0-2"));
+        assert_ne!(fold_version("1.0"), fold_version("1.0.1"));
     }
 
     #[test]

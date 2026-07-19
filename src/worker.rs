@@ -2691,61 +2691,6 @@ pub async fn list_artifacts_readonly(
     list_artifacts_for_claim(storage, pkg, false).await
 }
 
-/// The filenames of a package's live artifacts: the package-prefix LIST and
-/// nothing else — no sidecar GET per file, so it costs one storage call whatever
-/// the package's size. The project page uses it to settle "is this version
-/// hosted?" before paying for [`list_artifacts`] (see `app::render_project`).
-pub async fn list_artifact_filenames(storage: &dyn Storage, pkg: &str) -> Result<Vec<String>> {
-    let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
-    let entries = storage.list_dir_entries(&prefix).await?;
-    let names: HashSet<&str> = entries
-        .iter()
-        .filter_map(|e| e.key.strip_prefix(&prefix))
-        .collect();
-    let suppressed = SuppressedNames::of(&names);
-    // Off `entries`, not the set, so the order stays the listing's.
-    Ok(entries
-        .iter()
-        .filter_map(|entry| entry.key.strip_prefix(&prefix))
-        .filter(|filename| suppressed.is_live_artifact(filename))
-        .map(str::to_string)
-        .collect())
-}
-
-/// Artifact filenames a listing must not resolve, derived from the marker files
-/// sitting beside them.
-struct SuppressedNames<'a> {
-    /// Tombstoned filenames leave every index (dev/MULTIBUCKET.md §6.4): a delete
-    /// that crashed after the tombstone but before the artifact removal converges
-    /// to "gone" here, rather than resurrecting the file.
-    tombstoned: HashSet<&'a str>,
-    /// Frozen filenames are likewise suppressed (dev/MULTIBUCKET.md §6.3): a byte
-    /// conflict moved both bodies to `_quarantine/` and dropped a `.frozen`
-    /// marker; the name must not resolve on any bucket until a human resolves it.
-    frozen: HashSet<&'a str>,
-}
-
-impl<'a> SuppressedNames<'a> {
-    fn of(names: &HashSet<&'a str>) -> Self {
-        Self {
-            tombstoned: names
-                .iter()
-                .filter_map(|f| f.strip_suffix(TOMBSTONE_SUFFIX))
-                .collect(),
-            frozen: names
-                .iter()
-                .filter_map(|f| f.strip_suffix(FROZEN_SUFFIX))
-                .collect(),
-        }
-    }
-
-    fn is_live_artifact(&self, filename: &str) -> bool {
-        is_artifact(filename)
-            && !self.tombstoned.contains(filename)
-            && !self.frozen.contains(filename)
-    }
-}
-
 async fn list_artifacts_for_claim(
     storage: &dyn Storage,
     pkg: &str,
@@ -2762,7 +2707,20 @@ async fn list_artifacts_for_claim(
         .iter()
         .filter_map(|e| e.key.strip_prefix(&prefix))
         .collect();
-    let suppressed = SuppressedNames::of(&names);
+    // Tombstoned filenames leave every index (dev/MULTIBUCKET.md §6.4): a delete
+    // that crashed after the tombstone but before the artifact removal converges
+    // to "gone" here, rather than resurrecting the file.
+    let tombstoned: HashSet<&str> = names
+        .iter()
+        .filter_map(|f| f.strip_suffix(TOMBSTONE_SUFFIX))
+        .collect();
+    // Frozen filenames are likewise suppressed (dev/MULTIBUCKET.md §6.3): a
+    // byte conflict moved both bodies to `_quarantine/` and dropped a `.frozen`
+    // marker; the name must not resolve on any bucket until a human resolves it.
+    let frozen: HashSet<&str> = names
+        .iter()
+        .filter_map(|f| f.strip_suffix(FROZEN_SUFFIX))
+        .collect();
     // Sidecar reads fan out with bounded concurrency: a 2,000-file package
     // costs 2,000 GETs, and doing them serially put rebuilds at minutes of
     // wall clock on S3. Chunked join_all keeps listing order — index output
@@ -2778,8 +2736,7 @@ async fn list_artifacts_for_claim(
         .iter()
         .filter_map(|entry| {
             let filename = entry.key.strip_prefix(&prefix)?;
-            suppressed
-                .is_live_artifact(filename)
+            (is_artifact(filename) && !tombstoned.contains(filename) && !frozen.contains(filename))
                 .then_some((entry, filename))
         })
         .collect();

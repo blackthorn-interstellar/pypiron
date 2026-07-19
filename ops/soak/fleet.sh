@@ -123,7 +123,8 @@ status() {
         --filters "Name=tag:Name,Values=${STACK_NAME}" "Name=instance-state-name,Values=running,pending" \
         --query 'Reservations[].Instances[].[InstanceId,InstanceType,InstanceLifecycle,State.Name]' \
         --output text || true
-    echo "== findings ==" && aws s3 ls "s3://${S3_BUCKET}/${FINDINGS_PREFIX}" 2>/dev/null \
+    # `s3 ls` exits 1 on an empty prefix; under pipefail that would fail status.
+    echo "== findings ==" && { aws s3 ls "s3://${S3_BUCKET}/${FINDINGS_PREFIX}" 2>/dev/null || true; } \
         | wc -l | sed 's/^/  distinct findings in S3: /'
 }
 
@@ -132,7 +133,8 @@ findings() {
     local keys
     keys=$(aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$FINDINGS_PREFIX" \
         --query 'Contents[].Key' --output text 2>/dev/null || true)
-    [ -z "$keys" ] && { echo "(no findings yet)"; return; }
+    # `--output text` prints the literal "None" when Contents is null (no keys).
+    case "$keys" in "" | None) echo "(no findings yet)"; return ;; esac
     for k in $keys; do
         aws s3 cp "s3://$S3_BUCKET/$k" - 2>/dev/null \
             | python3 -c 'import sys,json; d=json.load(sys.stdin); print("-", d["title"]); print("   ", d["repro"])'

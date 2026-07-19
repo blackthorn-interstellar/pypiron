@@ -93,6 +93,7 @@ pub struct ServeConfig {
     pub allow_insecure_upstream: Option<bool>,
     pub advisory_feed: Option<String>,
     pub malware_block: Option<bool>,
+    pub malware_probe_secs: Option<u64>,
     pub metrics_project_labels: Option<bool>,
     pub spool_dir: Option<PathBuf>,
     pub wait_on_upload: Option<bool>,
@@ -330,6 +331,7 @@ mod tests {
             Some("https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip")
         );
         assert_eq!(cfg.serve.malware_block, Some(true));
+        assert_eq!(cfg.serve.malware_probe_secs, Some(120));
         assert_eq!(cfg.mirror.exclude_newer.as_deref(), Some("7"));
         assert_eq!(
             cfg.mirror.include_format,

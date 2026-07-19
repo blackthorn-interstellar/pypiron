@@ -148,6 +148,10 @@ pub struct Metrics {
     /// (leader source poll, or a follower's storage check). 0 = never — the
     /// `pypiron_advisory_snapshot_age_seconds` gauge is omitted until then.
     advisory_last_refresh_unix: AtomicU64,
+    /// Unix seconds of this node's last successful malware-probe cycle (a CSV poll,
+    /// including a 304). 0 = never — the `pypiron_malware_probe_age_seconds` gauge
+    /// is omitted until the first probe lands.
+    malware_probe_last_unix: AtomicU64,
 }
 
 impl Metrics {
@@ -159,6 +163,13 @@ impl Metrics {
     /// gauge). Called once per successful refresh cycle by the worker tick.
     pub fn advisory_refresh_ok(&self) {
         self.advisory_last_refresh_unix
+            .store(unix_now_secs(), Ordering::Relaxed);
+    }
+
+    /// Mark this node's malware probe as freshly polled (resets the probe-age
+    /// gauge). Called once per successful probe cycle, a 304 included.
+    pub fn malware_probe_ok(&self) {
+        self.malware_probe_last_unix
             .store(unix_now_secs(), Ordering::Relaxed);
     }
 
@@ -418,6 +429,18 @@ impl Metrics {
             );
             out.push_str("# TYPE pypiron_advisory_snapshot_age_seconds gauge\n");
             out.push_str(&format!("pypiron_advisory_snapshot_age_seconds {age}\n"));
+        }
+        // Malware-probe staleness (per node). Emitted only once a probe has
+        // succeeded — a node that never armed the probe would otherwise show a
+        // misleading "0 seconds". Age is computed at render time.
+        let probe_refresh = self.malware_probe_last_unix.load(Ordering::Relaxed);
+        if probe_refresh != 0 {
+            let age = unix_now_secs().saturating_sub(probe_refresh);
+            out.push_str(
+                "# HELP pypiron_malware_probe_age_seconds Seconds since this node's last successful malware probe (CSV poll).\n",
+            );
+            out.push_str("# TYPE pypiron_malware_probe_age_seconds gauge\n");
+            out.push_str(&format!("pypiron_malware_probe_age_seconds {age}\n"));
         }
         for (name, help, value) in [
             (

@@ -1453,3 +1453,256 @@ def _local_feed_server(payload: bytes):
     finally:
         stop()
         thread.join(timeout=5)
+
+
+# ------------------------------ malware probe --------------------------------
+#
+# Each node polls OSV's per-advisory feed (modified_id.csv + <ID>.json, siblings
+# of all.zip) to block a newly-published MAL within minutes, ahead of the daily
+# snapshot. These serve a MUTABLE fake OSV export from loopback so a test can
+# publish/withdraw an advisory after startup and watch the byte gate follow —
+# asserting on the fixture's request log that the daily zip was never re-fetched.
+
+
+class _MutableFeedState:
+    """The fake OSV export's shared state: a fixed baseline zip, a mutable set of
+    per-advisory records (drives modified_id.csv + <ID>.json), and a request log."""
+
+    def __init__(self, zip_bytes: bytes, baseline_records: dict):
+        self.lock = threading.Lock()
+        self.zip_bytes = zip_bytes
+        self.records = dict(baseline_records)
+        self.csv_version = 0
+        self.log: list[tuple[str, str]] = []
+
+    def csv_body(self) -> bytes:
+        rows = sorted(self.records.values(), key=lambda r: r["modified"], reverse=True)
+        return "".join(f"{r['modified']},{r['id']}\n" for r in rows).encode()
+
+    def csv_etag(self) -> str:
+        return f'"csv-{self.csv_version}"'
+
+
+class _ProbeFeedHandler(http.server.BaseHTTPRequestHandler):
+    """Serves all.zip, modified_id.csv (ETag-conditional), and <ID>.json, logging
+    every request so a test can prove the zip wasn't re-fetched."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):  # noqa: D102 - silence default stderr spam
+        pass
+
+    def do_HEAD(self):  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+        self._serve(head=True)
+
+    def do_GET(self):  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+        self._serve(head=False)
+
+    def _serve(self, head: bool) -> None:
+        st: _MutableFeedState = self.server.state  # type: ignore[attr-defined]
+        inm = self.headers.get("If-None-Match")
+        path = self.path
+        with st.lock:
+            st.log.append(("HEAD" if head else "GET", path))
+            if path.endswith("/all.zip"):
+                resp = (200, st.zip_bytes, "application/zip", '"osv-zip"')
+            elif path.endswith("/modified_id.csv"):
+                etag = st.csv_etag()
+                resp = (200, st.csv_body(), "text/csv", etag)
+            elif path.endswith(".json"):
+                adv_id = path.rsplit("/", 1)[-1][: -len(".json")]
+                rec = st.records.get(adv_id)
+                resp = (
+                    (200, json.dumps(rec).encode(), "application/json", f'"{adv_id}"')
+                    if rec is not None
+                    else (404, b"", "text/plain", None)
+                )
+            else:
+                resp = (404, b"", "text/plain", None)
+        status, body, ctype, etag = resp
+        # A matching ETag short-circuits to 304 with no body (the common poll).
+        if status == 200 and etag is not None and inm == etag:
+            self.send_response(304)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        if etag is not None:
+            self.send_header("ETag", etag)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head and body:
+            self.wfile.write(body)
+
+
+class _FeedControl:
+    """Test-side handle to a running `_probe_feed_server`."""
+
+    def __init__(self, state: _MutableFeedState):
+        self._st = state
+
+    def publish(self, record: dict) -> None:
+        with self._st.lock:
+            self._st.records[record["id"]] = record
+            self._st.csv_version += 1
+
+    def withdraw(self, adv_id: str, modified: str) -> None:
+        with self._st.lock:
+            rec = dict(self._st.records[adv_id])
+            rec["withdrawn"] = modified
+            rec["modified"] = modified  # a withdrawal bumps modified (reappears atop)
+            self._st.records[adv_id] = rec
+            self._st.csv_version += 1
+
+    def count(self, method: str, needle: str) -> int:
+        with self._st.lock:
+            return sum(1 for (m, p) in self._st.log if m == method and needle in p)
+
+
+@contextmanager
+def _probe_feed_server(baseline_records: dict, tmp_path: Path):
+    """Serve a mutable fake OSV export over loopback at `.../PyPI/all.zip`. Yields
+    (feed_url, control); the baseline zip sets the probe watermark, and `control`
+    publishes/withdraws advisories that surface only via the CSV + per-advisory
+    JSON (never the zip)."""
+    zip_bytes = make_osv_zip(tmp_path / "baseline.zip", baseline_records).read_bytes()
+    st = _MutableFeedState(zip_bytes, baseline_records)
+    port = find_free_port()
+    httpd = http.server.HTTPServer(("127.0.0.1", port), _ProbeFeedHandler)
+    httpd.state = st  # type: ignore[attr-defined]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{port}/PyPI/all.zip", _FeedControl(st)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def _baseline_records() -> dict:
+    """One dated, unrelated advisory — sets the snapshot watermark the probe
+    backfills from without naming any test package."""
+    return {
+        "OSV-BASE-1": {
+            "id": "OSV-BASE-1",
+            "modified": "2024-02-01T00:00:00Z",
+            "summary": "unrelated baseline advisory",
+            "affected": [
+                {"package": {"ecosystem": "PyPI", "name": "baseline-pkg"}, "versions": ["9.9.9"]}
+            ],
+        }
+    }
+
+
+def _mal_record(mal_id: str, pkg: str, version: str, modified: str) -> dict:
+    return {
+        "id": mal_id,
+        "modified": modified,
+        "summary": f"malware in {pkg}",
+        "affected": [{"package": {"ecosystem": "PyPI", "name": pkg}, "versions": [version]}],
+    }
+
+
+# The forward-proxy vars are cleared so the SSRF-guarded feed client reaches
+# loopback directly (as the AC6 live-feed test does).
+_DIRECT_EGRESS = {"HTTP_PROXY": "", "HTTPS_PROXY": "", "ALL_PROXY": "", "NO_PROXY": "*"}
+
+
+def test_probe_blocks_new_mal_ahead_of_daily_feed(tmp_path_factory, pypiron_bin, tmp_path):
+    """A MAL published after startup blocks the file within a probe interval,
+    without the daily zip being re-fetched (asserted on the fixture request log),
+    and withdrawing it un-blocks on the next probe. ETag/304 behavior shows up as
+    repeated CSV polls that transfer no advisory JSON until the CSV changes."""
+    pkg, ver = "probemal", "1.0.0"
+    mal_id = "MAL-2025-70001"
+    with _probe_feed_server(_baseline_records(), tmp_path) as (feed_url, feed):
+        with advisory_server(
+            tmp_path_factory,
+            pypiron_bin,
+            feed_url,
+            extra_args=["--malware-probe-secs", "2"],
+            extra_env=_DIRECT_EGRESS,
+        ) as server:
+            base = server["base_url"]
+            # Baseline snapshot armed and the probe has completed at least one cycle.
+            assert _poll_metric(base, "pypiron_advisory_snapshot_age_seconds") is not None
+            assert _poll_metric(base, "pypiron_malware_probe_age_seconds") is not None
+
+            # A mirror-origin file no advisory yet names — served normally.
+            wheel = make_wheel(pkg, ver, tmp_path)
+            _mirror_upload(server, wheel)
+            wait_for_file_in_index(server["simple"], pkg, wheel.name)
+            file_url = f"{base}/files/{pkg}/{wheel.name}"
+            assert _poll_http_status(file_url, {200, 302}), (
+                "clean file not served before the advisory"
+            )
+
+            # Let the startup zip fetches settle, then baseline the request counts.
+            time.sleep(1.5)
+            zip_before = feed.count("GET", "/all.zip")
+            csv_before = feed.count("GET", "/modified_id.csv")
+
+            # Publish a brand-new MAL for the file, newer than the snapshot watermark.
+            feed.publish(_mal_record(mal_id, pkg, ver, "2025-01-01T00:00:00Z"))
+
+            # Within a couple of probe intervals the byte gate 403s, naming the id.
+            blocked = _poll_http_status(file_url, {403}, timeout=30)
+            assert blocked is not None, "the probe never blocked the newly-published MAL"
+            assert mal_id.encode() in blocked[1], blocked
+            assert _poll_blocked_at_least(base, 1), "tripwire metric never moved"
+
+            # The block came from the probe, not a fresh daily snapshot: the zip was
+            # not re-fetched, while the CSV was polled and the advisory JSON pulled.
+            assert feed.count("GET", "/all.zip") == zip_before, "the probe re-fetched the daily zip"
+            assert feed.count("GET", "/modified_id.csv") > csv_before, (
+                "the probe never polled the CSV"
+            )
+            assert feed.count("GET", f"/{mal_id}.json") >= 1, (
+                "the probe never fetched the advisory JSON"
+            )
+
+            # Withdrawing the advisory un-blocks on the next probe.
+            feed.withdraw(mal_id, "2025-06-01T00:00:00Z")
+            assert _poll_http_status(file_url, {200, 302}, timeout=30), (
+                "withdrawal never un-blocked the file"
+            )
+
+
+def test_probe_backfills_new_mal_after_restart(tmp_path_factory, pypiron_bin, tmp_path):
+    """The overlay is in-memory only: a MAL published while a node was down (present
+    in the CSV/JSON but never the stored zip) is re-discovered and blocked by the
+    probe after a restart — proving the backfill from the stored snapshot's
+    watermark, with no persisted probe state."""
+    pkg, ver = "backfillmal", "2.2.2"
+    mal_id = "MAL-2025-70002"
+    data_dir = tmp_path / "data"
+    args = ["--advisory-feed", "PLACEHOLDER", "--malware-probe-secs", "2"]
+    with _probe_feed_server(_baseline_records(), tmp_path) as (feed_url, feed):
+        args[1] = feed_url
+        # Boot 1: arm from the feed, persist the snapshot, seed a mirror-origin file.
+        proc, base, _log = _hand_start(pypiron_bin, data_dir, args, extra_env=_DIRECT_EGRESS)
+        dest = _dest_dict(base, data_dir)
+        try:
+            assert _poll_metric(base, "pypiron_advisory_snapshot_age_seconds") is not None
+            assert _stored_feed_path(dest).exists(), "boot 1 never persisted the snapshot"
+            wheel = make_wheel(pkg, ver, tmp_path)
+            _mirror_upload(dest, wheel)
+            wait_for_file_in_index(dest["simple"], pkg, wheel.name)
+        finally:
+            kill_process_tree(proc)
+
+        # Publish a MAL newer than the stored snapshot — only in the CSV/JSON.
+        feed.publish(_mal_record(mal_id, pkg, ver, "2025-01-01T00:00:00Z"))
+
+        # Boot 2 on the SAME data dir: empty overlay, stored snapshot's watermark;
+        # the probe backfills the MAL and the byte gate blocks.
+        proc, base, _log = _hand_start(pypiron_bin, data_dir, args, extra_env=_DIRECT_EGRESS)
+        try:
+            file_url = f"{base}/files/{pkg}/{wheel.name}"
+            blocked = _poll_http_status(file_url, {403}, timeout=30)
+            assert blocked is not None, "restart did not backfill the probe overlay"
+            assert mal_id.encode() in blocked[1], blocked
+        finally:
+            kill_process_tree(proc)

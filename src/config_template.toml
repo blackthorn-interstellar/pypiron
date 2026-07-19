@@ -72,6 +72,7 @@
 # is the point. The feed is a URL or a local path; the startup log names it.
 # advisory-feed = "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip"   # "" disables the feature
 # malware-block = true                      # refuse to serve/cache files in the feed's malware block set
+# malware-probe-secs = 120                  # block new OSV malware within minutes, ahead of the daily feed; 0 disables
 
 # Attach per-client project labels to /metrics (pypiron_project_requests_total).
 # Off by default: /metrics is unauthenticated and the label is the basic-auth

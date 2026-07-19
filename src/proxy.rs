@@ -32,7 +32,6 @@ use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::Client;
 use tracing::{info, warn};
 
-use crate::advisories;
 use crate::names::{infer_version_from_filename, matches_prefix};
 use crate::origin;
 use crate::render::{self, FileMetadata};
@@ -255,11 +254,11 @@ fn advisory_blocks(state: &AppState, pkg: &str, filename: &str) -> bool {
         return false;
     }
     let snap = state.advisory_snapshot();
-    let Some(db) = &snap.db else {
+    if !snap.has_block_data() {
         return false;
-    };
+    }
     let version = infer_version_from_filename(filename);
-    !advisories::blocking_advisories(db, pkg, version.as_deref()).is_empty()
+    !snap.blocking(pkg, version.as_deref()).is_empty()
 }
 
 /// May this package be served from upstream at all? Private names, the reserved
@@ -594,9 +593,9 @@ impl Proxy {
         // written here — no artifact, no sidecar, no origin claim.
         if state.malware_block {
             let snap = state.advisory_snapshot();
-            if let Some(db) = &snap.db {
+            if snap.has_block_data() {
                 let version = infer_version_from_filename(filename);
-                let ids = advisories::blocking_advisories(db, pkg, version.as_deref());
+                let ids = snap.blocking(pkg, version.as_deref());
                 if !ids.is_empty() {
                     warn!(%pkg, %filename, advisories = ?ids, "proxy: refused malware fill");
                     return Ok(());

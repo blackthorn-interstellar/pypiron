@@ -115,8 +115,15 @@ through pypiron, it pins a download URL to *this* server. Later PyPI pulls a
 compromised release: it vanishes from pypi.org, but every lockfile in your org
 keeps asking pypiron for the copy it cached — and a plain mirror keeps handing
 it back, forever. pypiron checks the advisory feed at the door instead, so the
-file it served yesterday stops today, the moment the advisory lands — a fresh uv
-run and a two-year-old lockfile alike. One place to fix it; every client fixed.
+file it served yesterday stops today — a fresh uv run and a two-year-old lockfile
+alike. One place to fix it; every client fixed.
+
+A new advisory lands fast. Every node also watches OSV for individual
+just-published malware advisories and starts blocking within minutes of
+publication — no waiting for the next daily refresh, and clients whose own audit
+cache still won't know for up to a day are already covered at the door. The full
+advisory snapshot still refreshes daily; a withdrawn advisory un-blocks on that
+same daily cadence.
 
 A private package that happens to share a malicious public name still installs.
 pypiron blocks only the public package the advisory names — a private name of
@@ -195,6 +202,10 @@ and have your ferry drop a fresh copy there on whatever schedule it runs. Howeve
 the feed arrives, blocking and the audit behave identically — an unfed
 air-gapped box says so in its logs until the first feed lands, then arms itself
 without a restart.
+
+A server with egress blocks a new advisory within minutes of publication (it
+watches OSV directly); a ferried, air-gapped mirror is only as fresh as its last
+delivery, so run `pypiron sync` on an hourly cron for hourly baselines.
 
 ## See also
 

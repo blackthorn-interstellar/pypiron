@@ -187,6 +187,7 @@ downloads stream through the node.
 | `--proxy-allow-cidr CIDR` | `PYPIRON_PROXY_ALLOW_CIDR` | none | Like `--proxy-allow-host`, but permits any target IP inside `CIDR` (e.g. `10.0.0.0/8`). Repeatable; comma-separated in the env var. |
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | OSV PyPI export | Feed for malware blocking and the org audit: a URL or local path to the [OSV](https://osv.dev) PyPI advisory export. Defaults to `https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip` (named in the startup log); a URL fetch honors `HTTP(S)_PROXY`. `""` disables both features. |
 | `--malware-block true\|false` | `PYPIRON_MALWARE_BLOCK` | `true` | Refuse to serve or cache files the feed flags as malicious. Needs a snapshot source — the feed, or one delivered earlier by `sync`. Explicit `true` that can't obtain a snapshot refuses startup; the default warns "armed but unfed" and self-arms when a snapshot arrives. |
+| `--malware-probe-secs N` | `PYPIRON_MALWARE_PROBE_SECS` | `120` | How often each node checks OSV for a just-published malware advisory and blocks it within minutes, ahead of the daily feed refresh. Near-zero bandwidth (a conditional check that transfers nothing most polls) and no stored state. `0` disables; inert unless blocking is armed and the feed is the OSV `all.zip` URL. |
 | `--metrics-project-labels` | `PYPIRON_METRICS_PROJECT_LABELS` | `false` | Attach per-client `project` labels to `/metrics`. Off by default: `/metrics` is unauthenticated and the label derives from the auth username subaddress, so exposing it lets any scraper enumerate internal project names. |
 | `--spool-dir PATH` | `PYPIRON_SPOOL_DIR` | system temp | Upload/proxy spool directory. |
 | `--artifact-delivery auto\|redirect\|stream` | `PYPIRON_ARTIFACT_DELIVERY` | `auto` | Redirect object-store downloads when the client handles it well; otherwise stream. |
@@ -219,11 +220,12 @@ Username tags are for attribution: `reader+billing-api` authenticates as
 `reader` and records `billing-api` in request metrics. Tags are capped and
 restricted to `[A-Za-z0-9._-]`.
 
-With the advisory feed enabled, `/metrics` carries two series:
+With the advisory feed enabled, `/metrics` carries three series:
 `pypiron_advisory_snapshot_age_seconds` (age of the loaded snapshot — alert when
-it climbs past your refresh window) and `pypiron_blocked_downloads_total`
-(refused malware downloads; a nonzero rate means a client is still asking for a
-known-bad file).
+it climbs past your refresh window), `pypiron_malware_probe_age_seconds` (time
+since the last malware probe, once the probe has run at least once), and
+`pypiron_blocked_downloads_total` (refused malware downloads; a nonzero rate
+means a client is still asking for a known-bad file).
 
 ## Mirror selection
 

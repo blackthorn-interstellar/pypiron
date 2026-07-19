@@ -936,6 +936,14 @@ struct ServeArgs {
     #[arg(long, env = "PYPIRON_MALWARE_BLOCK", action = clap::ArgAction::Set)]
     malware_block: Option<bool>,
 
+    /// How often (seconds) each node probes OSV's per-advisory feed to block a
+    /// newly-published malware advisory within minutes, ahead of the daily feed
+    /// refresh. Near-zero bandwidth (a conditional CSV GET that 304s most polls)
+    /// and no persisted state. `0` disables; inert unless the feed is the OSV
+    /// `all.zip` URL. Default 120.
+    #[arg(long, env = "PYPIRON_MALWARE_PROBE_SECS", default_value_t = 120)]
+    malware_probe_secs: u64,
+
     /// The slice of PyPI the proxy serves and caches — names included. The same
     /// mirror-selection surface as `sync`, set once and shared: a `[mirror]` table
     /// in pypiron.toml governs both. With a package scope, the proxy serves only
@@ -1062,6 +1070,10 @@ pub struct AppState {
     pub advisory_feed: Option<String>,
     /// Whether malware blocking is armed (enforcement lands in a later rung).
     pub malware_block: bool,
+    /// Per-node malware-probe interval. `Duration::ZERO` disables it; the worker
+    /// also holds it inert unless blocking is armed and the feed is the OSV
+    /// `all.zip` URL (the CSV/per-advisory siblings only exist there).
+    pub malware_probe: Duration,
     /// The live advisory snapshot every request-path probe reads. A global
     /// truth-cache: NEVER reset on a bucket-generation change — a failover must
     /// not disarm blocking.
@@ -1475,6 +1487,11 @@ fn merge_serve_file(
         f.reconcile_interval_secs
     );
     fill!(
+        cli.malware_probe_secs,
+        "malware_probe_secs",
+        f.malware_probe_secs
+    );
+    fill!(
         cli.repl_sweep_interval_secs,
         "repl_sweep_interval_secs",
         f.repl_sweep_interval_secs
@@ -1882,6 +1899,7 @@ async fn run_serve(
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         advisory_feed,
         malware_block,
+        malware_probe: Duration::from_secs(cli.malware_probe_secs),
         advisories: Arc::new(std::sync::RwLock::new(Arc::new(advisory_state))),
         advisory_reload_asap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
@@ -4991,15 +5009,12 @@ async fn advisory_byte_gate(
         return None;
     }
     let snap = state.advisory_snapshot();
-    if snap.db.is_none() && snap.quarantined.is_empty() {
+    if !snap.has_block_data() && snap.quarantined.is_empty() {
         return None; // armed but unfed: nothing to block yet
     }
     let version = infer_version_from_filename(artifact_filename);
-    let ids: Vec<&str> = snap
-        .db
-        .as_ref()
-        .map(|db| advisories::blocking_advisories(db, pkg, version.as_deref()))
-        .unwrap_or_default();
+    // Baseline block set ∪ the per-node probe overlay.
+    let ids: Vec<String> = snap.blocking(pkg, version.as_deref());
     let quarantined = snap.quarantined.contains(pkg);
     if ids.is_empty() && !quarantined {
         return None; // the common path: no origin read, no I/O
@@ -5966,6 +5981,7 @@ impl AppState {
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advisory_feed: None,
             malware_block: false,
+            malware_probe: Duration::ZERO,
             advisories: Arc::new(std::sync::RwLock::new(Arc::new(
                 advisories::AdvisoryState::default(),
             ))),

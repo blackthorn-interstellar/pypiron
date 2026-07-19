@@ -802,6 +802,24 @@ pub async fn run_worker_until(
         crate::advisories::RefreshMemo::default(),
     ));
     let advisory_running = Arc::new(AtomicBool::new(false));
+    // Malware probe (every node): block a newly-published MAL-* advisory within
+    // minutes, ahead of the daily feed. Inert unless blocking is armed, the
+    // interval is nonzero, and the feed is the OSV `all.zip` URL (its CSV and
+    // per-advisory siblings are what the probe polls). Spawned like the advisory
+    // tick so a slow fetch can't stall the loop; the memo is per-node (no shared
+    // state), an in-flight flag serializes runs.
+    let probe_enabled = state.malware_block
+        && !state.malware_probe.is_zero()
+        && state
+            .advisory_feed
+            .as_deref()
+            .and_then(crate::advisories::probe_base)
+            .is_some();
+    let mut last_probe: Option<Instant> = None;
+    let probe_memo = Arc::new(tokio::sync::Mutex::new(
+        crate::advisories::ProbeMemo::default(),
+    ));
+    let probe_running = Arc::new(AtomicBool::new(false));
     let mut last_reconcile: Option<Instant> = if state.audit_on_boot {
         None
     } else {
@@ -919,6 +937,36 @@ pub async fn run_worker_until(
                     )
                     .await;
                 });
+            }
+        }
+
+        // Malware probe tick (EVERY node): poll OSV's per-advisory feed to block a
+        // fresh MAL-* advisory ahead of the daily snapshot. Spawned off the loop
+        // like the advisory refresh; the in-flight flag serializes runs.
+        if probe_enabled {
+            let due = last_probe.is_none_or(|t| t.elapsed() >= state.malware_probe);
+            if due && !probe_running.swap(true, Ordering::SeqCst) {
+                last_probe = Some(Instant::now());
+                let job_state = state.clone();
+                let pinned = selected.clone();
+                let memo = probe_memo.clone();
+                let guard = SweepGuard(probe_running.clone());
+                if let Some(feed) = job_state.advisory_feed.clone() {
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        let mut memo = memo.lock().await;
+                        crate::advisories::probe(
+                            crate::advisories::RefreshCtx {
+                                storage: pinned.storage.as_ref(),
+                                slot: &job_state.advisories,
+                                metrics: &job_state.metrics,
+                            },
+                            &feed,
+                            &mut memo,
+                        )
+                        .await;
+                    });
+                }
             }
         }
 
@@ -3577,6 +3625,7 @@ mod tests {
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advisory_feed: None,
             malware_block: false,
+            malware_probe: Duration::ZERO,
             advisories: Arc::new(std::sync::RwLock::new(Arc::new(
                 crate::advisories::AdvisoryState::default(),
             ))),
@@ -3703,6 +3752,7 @@ mod tests {
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advisory_feed: None,
             malware_block: false,
+            malware_probe: Duration::ZERO,
             advisories: Arc::new(std::sync::RwLock::new(Arc::new(
                 crate::advisories::AdvisoryState::default(),
             ))),

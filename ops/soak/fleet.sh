@@ -3,7 +3,7 @@
 #
 #   ./fleet.sh push-bundle          # build the aarch64 binary + upload the bundle to S3
 #   ./fleet.sh apply                # create/update the fleet (default VPC if unset)
-#   ./fleet.sh status               # stack + instances + finding count
+#   ./fleet.sh status               # stack + instances + finding count + seeds
 #   ./fleet.sh findings             # list the deduped findings in S3
 #   ./fleet.sh seeds                # how many seeds the fleet has checked
 #   ./fleet.sh destroy [--all]      # tear down the fleet; --all also deletes the bucket
@@ -126,6 +126,7 @@ status() {
     # `s3 ls` exits 1 on an empty prefix; under pipefail that would fail status.
     echo "== findings ==" && { aws s3 ls "s3://${S3_BUCKET}/${FINDINGS_PREFIX}" 2>/dev/null || true; } \
         | wc -l | sed 's/^/  distinct findings in S3: /'
+    echo "== seeds ==" && seeds   # SSM round-trip per box, so this is the slow part
 }
 
 findings() {

@@ -276,6 +276,30 @@ def http_get_no_redirect(
         conn.close()
 
 
+def _post_no_redirect(
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    data: Optional[bytes] = None,
+    timeout: float = 10.0,
+) -> Tuple[int, bytes, Dict[str, str]]:
+    """POST without following redirects (for asserting the raw status)."""
+    import http.client
+    from urllib.parse import urlparse
+
+    p = urlparse(url)
+    conn = http.client.HTTPConnection(p.hostname, p.port, timeout=timeout)
+    try:
+        path = p.path + (f"?{p.query}" if p.query else "")
+        conn.request("POST", path, body=data, headers=headers or {})
+        resp = conn.getresponse()
+        body = resp.read()
+        resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+        return resp.status, body, resp_headers
+    finally:
+        conn.close()
+
+
 def http_request_auth(
     method: str,
     url: str,
@@ -533,12 +557,15 @@ def upload_legacy(
     fields: Optional[Dict[str, str]] = None,
     timeout: float = 30.0,
     expect_status: int = 200,
+    follow_redirects: bool = True,
 ) -> Tuple[int, bytes]:
     """POST multipart/form-data to /legacy the way twine does.
 
     Sends the standard metadata fields (:action, name, version, sha256_digest)
     plus the file in field "content". `fields` overrides/extends the defaults.
-    Returns (status, body); raises if status != expect_status.
+    Returns (status, body); raises if status != expect_status. Set
+    `follow_redirects=False` to observe the server's raw status (urllib would
+    otherwise transparently chase a 3xx and mask it).
     """
     filename = wheel_path.name
     file_bytes = wheel_path.read_bytes()
@@ -583,9 +610,12 @@ def upload_legacy(
     if username and password:
         hdrs["Authorization"] = _encode_basic_auth(username, password)
 
-    code, resp_body, _ = _http_request(
-        legacy_url, method="POST", headers=hdrs, data=body, timeout=timeout
-    )
+    if follow_redirects:
+        code, resp_body, _ = _http_request(
+            legacy_url, method="POST", headers=hdrs, data=body, timeout=timeout
+        )
+    else:
+        code, resp_body, _ = _post_no_redirect(legacy_url, headers=hdrs, data=body, timeout=timeout)
     if code != expect_status:
         raise RuntimeError(
             f"Upload returned {code}, expected {expect_status}: {resp_body.decode('utf-8', 'replace')}"

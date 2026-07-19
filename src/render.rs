@@ -52,7 +52,11 @@ impl FileMetadata {
             filename: filename.to_string(),
             sha256: sc.sha256,
             size: sc.size,
-            upload_time: Some(sc.upload_time),
+            // PEP 691 makes `upload-time` optional. A mirrored/backfilled file
+            // can carry an empty sidecar timestamp (`unwrap_or_default()` on an
+            // upstream listing that omitted it, or a backend with no
+            // last-modified); omit the field rather than emit an invalid `""`.
+            upload_time: Some(sc.upload_time).filter(|t| !t.trim().is_empty()),
             version: Some(sc.version).filter(|v| !v.is_empty()),
             yanked: sc.yanked,
             requires_python: sc.requires_python,
@@ -473,5 +477,53 @@ mod tests {
         let doc: serde_json::Value =
             serde_json::from_str(&pep691_package_json("six", &[flagged], &active())).unwrap();
         assert_eq!(doc["files"][0]["yanked"], true);
+    }
+
+    fn sidecar(upload_time: &str) -> Sidecar {
+        Sidecar {
+            sha256: "abc123".into(),
+            size: 11236,
+            version: "1.16.0".into(),
+            upload_time: upload_time.into(),
+            upload_epoch_ms: None,
+            requires_python: None,
+            yanked: Yanked::Flag(false),
+            origin: None,
+            yank_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn empty_sidecar_upload_time_is_omitted_not_emitted_empty() {
+        // PEP 691 makes `upload-time` optional; an empty/whitespace sidecar
+        // value (mirrored/backfilled files) must omit the key, never emit the
+        // invalid RFC 3339 value `""`.
+        for blank in ["", "   "] {
+            let m = FileMetadata::from_sidecar(
+                "six-1.16.0-py2.py3-none-any.whl",
+                sidecar(blank),
+                false,
+                false,
+            );
+            assert_eq!(m.upload_time, None);
+            let doc: serde_json::Value =
+                serde_json::from_str(&pep691_package_json("six", &[m], &active())).unwrap();
+            assert!(
+                doc["files"][0].get("upload-time").is_none(),
+                "blank upload-time must be omitted, got {:?}",
+                doc["files"][0].get("upload-time")
+            );
+        }
+
+        // A real timestamp still round-trips.
+        let m = FileMetadata::from_sidecar(
+            "six-1.16.0-py2.py3-none-any.whl",
+            sidecar("2026-06-11T00:00:00Z"),
+            false,
+            false,
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&pep691_package_json("six", &[m], &active())).unwrap();
+        assert_eq!(doc["files"][0]["upload-time"], "2026-06-11T00:00:00Z");
     }
 }

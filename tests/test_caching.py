@@ -8,6 +8,7 @@ from .helpers import (
     ACCEPT_PEP691,
     download_pypi_wheel,
     http_get,
+    http_head,
     upload_legacy,
     wait_for_file_in_index,
     wait_for_project_in_global,
@@ -95,3 +96,35 @@ def test_artifact_range_requests(server):
     # Unsatisfiable
     code, _, _ = http_get(url, headers={"Range": f"bytes={size + 1000}-"})
     assert code == 416
+
+
+def test_accept_ranges_and_head_get_parity(server):
+    """Regression guard for uv#18998: Accept-Ranges is advertised and HEAD
+    mirrors GET's headers with an empty body.
+
+    Our helpers use urllib's default (non-uv) User-Agent, so even the S3 backend
+    serves bytes directly here rather than issuing a 302 presigned redirect
+    (redirect_safe_client only redirects uv/* clients) — this exercises
+    pypiron's own byte-serving path on both fixtures.
+    """
+    size = len(server["wheel_path"].read_bytes())
+    url = f"{server['base_url']}/files/{PACKAGE}/{server['wheel_path'].name}"
+
+    code, body, get_headers = http_get(url)
+    assert code == 200
+    assert len(body) == size
+    assert get_headers["accept-ranges"] == "bytes"
+
+    # HEAD hits the same handler as GET; headers must match, body must be empty.
+    code, head_body, head_headers = http_head(url)
+    assert code == 200
+    assert head_body == b""
+    assert head_headers["accept-ranges"] == "bytes"
+    assert head_headers["content-length"] == get_headers["content-length"]
+    assert head_headers["content-type"] == get_headers["content-type"]
+
+    # A ranged GET is answered with 206 and a correct Content-Range.
+    code, body, headers = http_get(url, headers={"Range": "bytes=0-99"})
+    assert code == 206
+    assert body == server["wheel_path"].read_bytes()[:100]
+    assert headers["content-range"] == f"bytes 0-99/{size}"

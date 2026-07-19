@@ -246,6 +246,23 @@ def test_parse_oha_rps_is_completed_200_rate_not_summary_rps():
     assert mn_ramp.parse_oha(sec, "15s")["rps"] == 20.0  # 300/15, not 9999
 
 
+def test_parse_oha_counts_302_when_ok_status_is_302():
+    # Redirect-mode wheel class: oha runs --redirect 0, so a served presign completes
+    # as a 302 (there are no 200s in the wheel section).
+    sec = _sec({"302": 4139}, 0, err={"aborted due to deadline": 6})
+    r = mn_ramp.parse_oha(sec, "15s", ok_status=302)
+    assert r["ok"] == 4139
+    assert r["total"] == 4139  # deadline aborts excluded
+    assert abs(r["rps"] - 4139 / 15.0) < 1e-9  # completed-302 rate
+
+
+def test_parse_oha_default_ok_status_ignores_302_section():
+    # The default (200) parser sees zero 200s in a pure-302 section.
+    sec = _sec({"302": 500}, 0)
+    assert mn_ramp.parse_oha(sec, "15s")["ok"] == 0
+    assert mn_ramp.parse_oha(sec, "15s", ok_status=302)["ok"] == 500
+
+
 # --- R1/R2/R6: aggregate_step + guards --------------------------------------
 
 
@@ -473,3 +490,106 @@ def test_main_refuses_when_byte_anchor_never_holds(monkeypatch):
     monkeypatch.setattr("sys.argv", ["mn_ramp", "--output", "results/_unused.json"])
     with pytest.raises(SystemExit, match="byte anchor never held"):
         mn_ramp.main()
+
+
+# --- C1/C2: redirect wheel-mode (302 + concurrent sampler) ------------------
+
+REDIRECT_CONSTS = {**CONSTS, "wheel_mode": "redirect", "wheel_ok_status": 302}
+SAMPLE_OK = {"ok": 200, "total": 200, "size_mismatch": 0}
+
+
+def _redirect_step(c: int, installs: float, cpu: float, sample: dict) -> dict:
+    """A redirect-mode ramp step: the wheel oha counts 302s (bytes ~0 by design) and
+    the concurrent sampler carries the wheel-delivery verdict."""
+    w_ok = int(round(installs * WPI * 15))
+    row = _orow(w_ok=w_ok, w_bytes=0.0, i_ok=w_ok, i_bytes=w_ok * 2000, c_idx=c, c_whl=c)
+    return mn_ramp.aggregate_step(c, [row], cpu, REDIRECT_CONSTS, sample)
+
+
+def test_redirect_mode_nulls_mix_and_records_sample():
+    row = _orow(w_ok=1000, w_bytes=0.0, i_ok=1000, i_bytes=1000 * 2000)
+    step = mn_ramp.aggregate_step(512, [row], 50.0, REDIRECT_CONSTS, SAMPLE_OK)
+    assert step["mix_r"] is None  # byte anchor disabled in redirect mode
+    assert step["mix_ok"] is True
+    assert step["sample_ok"] == 200
+    assert step["sample_total"] == 200
+    assert step["sample_size_mismatch"] == 0
+    assert step["installs_per_sec"] == round((1000 / 15) / WPI, 1)  # from 302 completions
+    assert mn_ramp.is_collapse(step, best_installs=step["installs_per_sec"]) is None
+
+
+def test_redirect_mode_skips_byte_anchor_guard():
+    # Wheel bytes far above the anchor would raise in follow mode; redirect must not
+    # (the wheel oha never pulls bytes, so the anchor is meaningless there).
+    row = _orow(w_ok=100, w_bytes=100 * MEAN_MB * 2.0 * 1e6, i_ok=100, i_bytes=100 * 2000)
+    step = mn_ramp.aggregate_step(512, [row], 50.0, REDIRECT_CONSTS, SAMPLE_OK)
+    assert step["mix_r"] is None  # no RuntimeError raised
+
+
+def test_follow_mode_step_has_null_sample_fields():
+    row = _orow(w_ok=655, w_bytes=655 * MEAN_MB * 1e6, i_ok=655, i_bytes=655 * 2000)
+    step = mn_ramp.aggregate_step(512, [row], 50.0, CONSTS)  # follow mode, no sampler
+    assert step["sample_ok"] is None
+    assert step["sample_total"] is None
+    assert step["sample_size_mismatch"] is None
+    assert step["mix_r"] == 1.0  # follow mode keeps the byte anchor
+
+
+def test_sample_breach_predicate():
+    assert mn_ramp.sample_breach({"sample_total": None}) is False  # follow mode
+    assert mn_ramp.sample_breach({"sample_total": None, "sample_ok": None}) is False
+    assert mn_ramp.sample_breach(SAMPLE_OK | {"sample_total": 200, "sample_ok": 200}) is False
+    assert mn_ramp.sample_breach({"sample_ok": 199, "sample_total": 200, "sample_size_mismatch": 0}) is False
+    assert mn_ramp.sample_breach({"sample_ok": 198, "sample_total": 200, "sample_size_mismatch": 0}) is True
+    assert mn_ramp.sample_breach({"sample_ok": 200, "sample_total": 200, "sample_size_mismatch": 1}) is True
+    assert mn_ramp.sample_breach({"sample_ok": 0, "sample_total": 0, "sample_size_mismatch": 0}) is True
+
+
+def test_is_collapse_returns_sample_when_sampler_fails():
+    row = _orow(w_ok=1000, w_bytes=0.0, i_ok=1000, i_bytes=1000 * 2000)
+    bad = {"ok": 100, "total": 200, "size_mismatch": 0}  # 0.5 delivery ratio
+    step = mn_ramp.aggregate_step(512, [row], 50.0, REDIRECT_CONSTS, bad)
+    assert step["wheel_ok_pct"] == 100.0  # the 302 oha itself is clean
+    assert mn_ramp.is_collapse(step, best_installs=1000.0) == "sample"
+
+
+def test_is_collapse_sample_on_size_mismatch():
+    row = _orow(w_ok=1000, w_bytes=0.0, i_ok=1000, i_bytes=1000 * 2000)
+    truncated = {"ok": 200, "total": 200, "size_mismatch": 3}  # truncated bodies
+    step = mn_ramp.aggregate_step(512, [row], 50.0, REDIRECT_CONSTS, truncated)
+    assert mn_ramp.is_collapse(step, best_installs=1000.0) == "sample"
+
+
+def test_redirect_summarize_never_peaks_a_sample_failed_step():
+    bad = {"ok": 100, "total": 200, "size_mismatch": 0}
+    ramp = [
+        _redirect_step(512, 900, 70, SAMPLE_OK),
+        _redirect_step(1024, 1500, 90, bad),  # highest installs but sampler failed
+        _redirect_step(2048, 400, 40, SAMPLE_OK),
+    ]
+    ramp[1]["breach"] = "sample"
+    peak, _, _ = mn_ramp.summarize(ramp, cpu_break=190)
+    assert peak["per_node_c"] == 512  # not the higher-installs sample-failed step
+
+
+def redirect_cliff(knee: int, ceil: float, cpu_at_knee: float):
+    """Redirect-mode server that serves cleanly to `knee`, then over-concurrency
+    trips S3 SlowDowns so the wheel-verify sampler starts failing."""
+
+    def measure(c: int) -> dict:
+        if c <= knee:
+            f = c / knee
+            return _redirect_step(c, ceil * f, cpu_at_knee * f, SAMPLE_OK)
+        return _redirect_step(c, ceil * 0.9, cpu_at_knee * 1.05, {"ok": 150, "total": 200, "size_mismatch": 0})
+
+    return measure
+
+
+def test_redirect_find_ceiling_breaks_on_sampler_failure():
+    measure = redirect_cliff(knee=10000, ceil=2900, cpu_at_knee=180)
+    ramp, breach = mn_ramp.find_ceiling(measure, c_start=64, c_max=65536, cpu_break=190)
+    peak, bound, _ = mn_ramp.summarize(ramp, cpu_break=190)
+    assert breach == "sample"  # the sampler breach over the knee
+    assert peak["per_node_c"] <= 10000  # never a sample-failed point
+    assert not mn_ramp.sample_breach(peak)  # the peak's sampler was healthy
+    assert peak["installs_per_sec"] > 2900 * 8192 / 10000  # beat the coarse step

@@ -90,12 +90,17 @@ def build_mix(tier: str) -> dict:
     return m
 
 
-def push_runner(index_regex: str, wheel_regex: str) -> None:
+def push_runner(index_regex: str, wheel_regex: str, wheel_redirect: int = 5) -> None:
     """Ship a runner that fires TWO concurrent ohas — one index-only, one wheel-only —
     so wheel completions are counted independently of cheap index hits (oha reports
     only ONE aggregate status/byte total per process). Regexes are embedded
     single-quoted (safe — no quotes in them) and scp'd, avoiding ssh/shell quoting
-    the metachars. stderr is discarded so it can't corrupt the JSON stream."""
+    the metachars. stderr is discarded so it can't corrupt the JSON stream.
+
+    wheel_redirect is the wheel oha's --redirect value: 5 (follow the 302 and pull
+    wheel bytes — the full-byte boundary) in follow mode, 0 (never follow — a served
+    presign completes as a 302, and the concurrent sampler verifies the bytes) in
+    redirect mode. The index oha always follows (index pages are 200s anyway)."""
     runner = (
         "#!/bin/bash\n"
         'DUR="$1"; CIDX="$2"; CWHL="$3"\n'
@@ -103,7 +108,7 @@ def push_runner(index_regex: str, wheel_regex: str) -> None:
         '/home/ec2-user/oha --no-tui --json --redirect 5 -z "$DUR" -c "$CIDX" -H "$H1" -H "$H2" \\\n'
         f"  --rand-regex-url '{index_regex}' >/tmp/oha_idx.json 2>/dev/null &\n"
         "PI=$!\n"
-        '/home/ec2-user/oha --no-tui --json --redirect 5 -z "$DUR" -c "$CWHL" -H "$H1" -H "$H2" \\\n'
+        f'/home/ec2-user/oha --no-tui --json --redirect {wheel_redirect} -z "$DUR" -c "$CWHL" -H "$H1" -H "$H2" \\\n'
         f"  --rand-regex-url '{wheel_regex}' >/tmp/oha_whl.json 2>/dev/null &\n"
         "PW=$!\n"
         "wait $PI; wait $PW\n"
@@ -117,13 +122,92 @@ def push_runner(index_regex: str, wheel_regex: str) -> None:
     p.unlink()
 
 
-def parse_oha(section: str, duration: str) -> dict:
-    """Parse ONE oha JSON section into completed-200 counts + body bytes. `rps` is the
-    completed-200 rate (ok/dur), NOT summary.requestsPerSec — that is the monotone-
-    truthful signal: a stalled body never lands in status["200"] or totalData. A -z
+SAMPLE_K = 200  # wheel URLs the sampler verifies per step, spread across the window
+
+# stdlib-only sampler shipped to a loadgen. It reads a pre-built {url: expected_size}
+# map (scp'd, NEVER re-fetched from the index), GETs a random sample of wheel URLs
+# FOLLOWING the 302 to object storage, and asserts a final 200 with the exact
+# expected body length — catching broken presigns, S3 SlowDown 503s, and truncated
+# bodies that a --redirect 0 wheel oha (which only ever sees pypiron's 302) cannot.
+SAMPLER_SRC = r'''#!/usr/bin/env python3
+import json, random, sys, time, urllib.request
+
+def main():
+    mapfile, dur_s, k = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
+    wmap = json.loads(open(mapfile).read())
+    urls = list(wmap.keys())
+    ok = total = mismatch = 0
+    if urls and k > 0:
+        rng = random.Random()
+        interval = dur_s / k
+        start = time.time()
+        for i in range(k):
+            target = start + i * interval
+            now = time.time()
+            if target > now:
+                time.sleep(target - now)
+            url = rng.choice(urls)
+            total += 1
+            try:
+                with urllib.request.urlopen(url, timeout=30) as r:
+                    body = r.read()
+                if r.status == 200:
+                    if len(body) == wmap[url]:
+                        ok += 1
+                    else:
+                        mismatch += 1
+            except Exception:
+                pass  # non-200 / broken presign / 503 -> lowers ok/total, not a mismatch
+    print(json.dumps({"ok": ok, "total": total, "size_mismatch": mismatch}))
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def push_sampler(url_size_map: dict) -> None:
+    """Ship the redirect-mode sampler + its {url: expected_size} map to each loadgen
+    (the sampler runs on LGS[0]; shipping to all keeps them interchangeable)."""
+    s = HERE / "_wheel_sampler.py"
+    m = HERE / "_wheelmap.json"
+    s.write_text(SAMPLER_SRC)
+    m.write_text(json.dumps(url_size_map))
+    for ip in LGS:
+        scp(str(s), ip, "/home/ec2-user/wheel_sampler.py")
+        scp(str(m), ip, "/home/ec2-user/wheelmap.json")
+    s.unlink()
+    m.unlink()
+
+
+def run_sampler(dur_s: int, k: int = SAMPLE_K) -> dict:
+    """Run the sampler on a loadgen across the step window; return its verdict.
+    A failed/absent sampler returns total=0 so the step is treated as INVALID (a
+    redirect-mode step is healthy ONLY on a passing sampler)."""
+    fail = {"ok": 0, "total": 0, "size_mismatch": 0}
+    if not LGS:
+        return fail
+    out = ssh_run(
+        LGS[0],
+        f"python3.11 /home/ec2-user/wheel_sampler.py /home/ec2-user/wheelmap.json {dur_s} {k}",
+        timeout=dur_s + 120,
+    )
+    if out.returncode != 0:
+        return fail
+    try:
+        return json.loads(out.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, ValueError, IndexError):
+        return fail
+
+
+def parse_oha(section: str, duration: str, ok_status: int = 200) -> dict:
+    """Parse ONE oha JSON section into completed-`ok_status` counts + body bytes. `rps`
+    is the completed rate (ok/dur), NOT summary.requestsPerSec — that is the monotone-
+    truthful signal: a stalled body never lands in status[ok_status] or totalData. A -z
     deadline aborts in-flight requests into errorDistribution and EXCLUDES them from
     both status and bytes, so benign deadline aborts must NOT count as failures; only
-    real errors (reset/refused/body-read) do."""
+    real errors (reset/refused/body-read) do. ok_status is the success code for the
+    class: 200 for full-byte (index pages, followed wheels), 302 for redirect-mode
+    wheels (oha runs --redirect 0, so a served presign completes as a 302)."""
     default = float(duration[:-1])
     try:
         d = json.loads(section)
@@ -136,7 +220,7 @@ def parse_oha(section: str, duration: str) -> dict:
     completed = sum(st.values())
     deadline = sum(v for k, v in err.items() if "deadline" in k.lower())
     real_err = sum(err.values()) - deadline
-    ok = st.get("200", 0)
+    ok = st.get(str(ok_status), 0)
     dur = s.get("total") or default
     return {
         "ok": ok,
@@ -148,9 +232,10 @@ def parse_oha(section: str, duration: str) -> dict:
     }
 
 
-def run_node(ip: str, duration: str, c: int, wheel_frac: float) -> dict:
+def run_node(ip: str, duration: str, c: int, wheel_frac: float, wheel_ok_status: int = 200) -> dict:
     """Drive one loadgen's two-oha runner at per-node concurrency `c`, split index vs
-    wheel by the mix's wheel fraction, and parse both sections."""
+    wheel by the mix's wheel fraction, and parse both sections. wheel_ok_status is the
+    wheel class's success code (200 followed-byte, 302 redirect-mode presign)."""
     c_whl = max(1, round(c * wheel_frac))
     c_idx = max(1, c - c_whl)
     out = ssh_run(
@@ -175,7 +260,7 @@ def run_node(ip: str, duration: str, c: int, wheel_frac: float) -> dict:
         "c_idx": c_idx,
         "c_whl": c_whl,
         "idx": parse_oha(idx_sec, duration),
-        "whl": parse_oha(whl_sec, duration),
+        "whl": parse_oha(whl_sec, duration, ok_status=wheel_ok_status),
     }
 
 
@@ -234,10 +319,19 @@ def mix_ratio(wheel_bytes: float, wheel_ok: int, mean_wheel_bytes: float) -> flo
     return (wheel_bytes / wheel_ok) / mean_wheel_bytes
 
 
-def aggregate_step(c: int, node_rows: list[dict], scpu: float, consts: dict) -> dict:
-    """Aggregate all N nodes' two-oha rows into one byte-truthful ramp step.
-    installs/s is derived from COMPLETED wheel fetches only, so it cannot inflate
-    when wheel delivery stalls while cheap index hits keep completing."""
+def aggregate_step(
+    c: int, node_rows: list[dict], scpu: float, consts: dict, sample: dict | None = None
+) -> dict:
+    """Aggregate all N nodes' two-oha rows into one ramp step. installs/s is derived
+    from COMPLETED wheel fetches only (302s in redirect mode, 200s in follow mode),
+    so it cannot inflate when wheel delivery stalls while cheap index hits complete.
+
+    In redirect mode wheel bytes are ~0 by design (the wheel oha never follows the
+    302), so the byte-anchor / mix-integrity guards do NOT apply — mix_r is None and
+    mix_ok is True. The concurrent `sample` (a following verify of a wheel-URL sample)
+    replaces them: its ok/total + size_mismatch are recorded, and is_collapse treats a
+    failed sampler as its own "sample" breach. `sample` is None in follow mode."""
+    redirect = consts.get("wheel_mode") == "redirect"
     wpi = consts["wheels_per_install"]
     mwb = consts["mean_wheel_bytes"]
     tol = consts["mix_tol"]
@@ -257,12 +351,12 @@ def aggregate_step(c: int, node_rows: list[dict], scpu: float, consts: dict) -> 
     installs = round(wheel_rps / wpi, 1) if wpi else 0.0
     mb_per_install = mwb * wpi / 1e6
     r = mix_ratio(wheel_bytes, wheel_ok, mwb)
-    if r > 1 + ANCHOR_HARD and wheel_ok >= 30:  # R6 per-step hard stop (upward = impossible)
+    if not redirect and r > 1 + ANCHOR_HARD and wheel_ok >= 30:  # R6 per-step hard stop
         raise RuntimeError(
             f"byte-anchor broken at c={c}: served mean {r:.2f}x manifest "
             f"(wheel_ok={wheel_ok}, bytes={wheel_bytes}); harness miscount, refusing to emit a number"
         )
-    return {
+    step = {
         "per_node_c": c,
         "agg_concurrency": c * N,
         "c_idx": node_rows[0]["c_idx"] if node_rows else 0,
@@ -287,32 +381,63 @@ def aggregate_step(c: int, node_rows: list[dict], scpu: float, consts: dict) -> 
         "index_p99_ms": index_p99,
         "mb_per_install": round((wheel_bytes / wheel_ok / 1e6) * wpi, 3) if wheel_ok else 0.0,
         "installs_from_bytes": round(wheel_mbps / mb_per_install, 1) if mb_per_install else 0.0,
-        "mix_r": round(r, 3),
-        "mix_ok": bool(wheel_ok > 0 and r >= 1 - tol),  # R2
+        # Byte-anchor mix integrity — disabled (None/True) in redirect mode, where the
+        # sampler below is the wheel-delivery gate instead.
+        "mix_r": None if redirect else round(r, 3),
+        "mix_ok": True if redirect else bool(wheel_ok > 0 and r >= 1 - tol),  # R2
+        # Redirect-mode sampler verdict (None in follow mode — no sampler runs).
+        "sample_ok": sample["ok"] if sample is not None else None,
+        "sample_total": sample["total"] if sample is not None else None,
+        "sample_size_mismatch": sample["size_mismatch"] if sample is not None else None,
     }
+    return step
 
 
 def measure_step(c: int, duration: str, consts: dict) -> dict:
     """Drive all N loadgens (two ohas each) at per-node concurrency `c` for `duration`
-    in lockstep, average the server's CPU over the same window, and aggregate."""
-    with ThreadPoolExecutor(max_workers=N + 1) as pool:
-        cpu_fut = pool.submit(server_cpu_window, int(duration[:-1]))
+    in lockstep, average the server's CPU over the same window, and — in redirect mode
+    — run the wheel-verify sampler across the same window, then aggregate."""
+    redirect = consts.get("wheel_mode") == "redirect"
+    dur_s = int(duration[:-1])
+    wheel_ok_status = consts.get("wheel_ok_status", 200)
+    with ThreadPoolExecutor(max_workers=N + 2) as pool:
+        cpu_fut = pool.submit(server_cpu_window, dur_s)
+        sample_fut = pool.submit(run_sampler, dur_s) if redirect else None
         rows = [
             f.result()
-            for f in [pool.submit(run_node, ip, duration, c, consts["wheel_frac"]) for ip in LGS]
+            for f in [
+                pool.submit(run_node, ip, duration, c, consts["wheel_frac"], wheel_ok_status)
+                for ip in LGS
+            ]
         ]
         scpu = cpu_fut.result()
-    return aggregate_step(c, rows, scpu, consts)
+        sample = sample_fut.result() if sample_fut is not None else None
+    return aggregate_step(c, rows, scpu, consts, sample)
+
+
+def sample_breach(step: dict) -> bool:
+    """True if a redirect-mode step's wheel-verify sampler FAILED. A step is healthy
+    only if sample_ok/sample_total >= 0.995 AND sample_size_mismatch == 0; total <= 0
+    means the sampler failed or never ran, which invalidates a redirect-mode step.
+    Follow-mode steps carry sample_total None and never breach here."""
+    st = step.get("sample_total")
+    if st is None:
+        return False
+    ok = step.get("sample_ok") or 0
+    return st <= 0 or bool(step.get("sample_size_mismatch")) or (ok / st) < 0.995
 
 
 def is_collapse(step: dict, best_installs: float) -> str | None:
     """Why this step is NOT a sustainable point, or None if healthy. Order matters:
-    real wheel failures first, then the mix-integrity breach (count-high / bytes-low
-    survivorship — the R2 target), then a genuine retrograde in wheel-truthful
-    installs. Server-CPU saturation is NOT a collapse: it's the wall we're hunting,
-    handled by the caller."""
+    real wheel failures first, then the sampler breach (redirect mode's wheel-delivery
+    gate — broken presigns / S3 SlowDown / truncated bodies), then the mix-integrity
+    breach (follow mode's count-high / bytes-low survivorship — the R2 target), then a
+    genuine retrograde in wheel-truthful installs. Server-CPU saturation is NOT a
+    collapse: it's the wall we're hunting, handled by the caller."""
     if step["wheel_ok_pct"] < 99.0:
         return "errors"  # real wheel failures
+    if sample_breach(step):
+        return "sample"  # redirect mode: the following-verify sampler failed
     if not step["mix_ok"]:
         return "mix"  # R2: bytes-per-install off constant
     if best_installs and step["installs_per_sec"] < 0.85 * best_installs:
@@ -331,7 +456,9 @@ def summarize(ramp: list[dict], cpu_break: float) -> tuple[dict, str, float]:
     healthy = [
         s
         for s in ramp
-        if s.get("breach") not in ("collapse", "errors", "mix") and s.get("mix_ok", True)
+        if s.get("breach") not in ("collapse", "errors", "mix", "sample")
+        and s.get("mix_ok", True)
+        and not sample_breach(s)
     ]
     peak = max(healthy or ramp, key=lambda s: s["installs_per_sec"])
     order = sorted(ramp, key=lambda s: s["per_node_c"])
@@ -468,30 +595,48 @@ def main() -> None:
         default=0.20,
         help="mix-integrity band: served mean wheel size vs mix mean",
     )
+    ap.add_argument(
+        "--wheel-mode",
+        choices=["follow", "redirect"],
+        default="follow",
+        help="follow: wheel oha pulls bytes (200, byte-anchored). redirect: wheel oha "
+        "counts the 302 presign (bytes offloaded to object storage), and a concurrent "
+        "sampler verifies wheel delivery. Use redirect for S3-redirect servers.",
+    )
     ap.add_argument("--output", default="results/mnramp-pypiron-t2.json")
     args = ap.parse_args()
 
     global INDEX_URL, CONTAINER
     INDEX_URL = args.index_url
     CONTAINER = args.container
+    redirect = args.wheel_mode == "redirect"
     m = build_mix(args.tier)
     consts = {
         "wheels_per_install": m["wheels_per_install"],
         "mean_wheel_bytes": m["mean_wheel_bytes"],
         "wheel_frac": m["wheel_frac"],
         "mix_tol": args.mix_tol,
+        "wheel_mode": args.wheel_mode,
+        "wheel_ok_status": 302 if redirect else 200,
     }
-    push_runner(m["index_regex"], m["wheel_regex"])
+    push_runner(m["index_regex"], m["wheel_regex"], wheel_redirect=0 if redirect else 5)
+    if redirect:
+        push_sampler(dict(zip(m["wheel_urls"], m["wheel_sizes"])))
     mode = "fixed ladder" if args.ladder else "AUTO-SEARCH (bracket -> bisect)"
-    print(f"driving {N} loadgens in lockstep vs {PRIV}:8080 (Track 2, bytes from S3) — {mode}\n")
+    byte_path = "302 presign + sampler verify" if redirect else "bytes from S3"
+    print(f"driving {N} loadgens in lockstep vs {PRIV}:8080 (Track 2, {byte_path}) — {mode}\n")
 
     def measure(c: int) -> dict:
         s = measure_step(c, args.duration, consts)
+        integrity = (
+            f"sample={s['sample_ok']}/{s['sample_total']}(mm={s['sample_size_mismatch']})"
+            if redirect
+            else f"mix_r={s['mix_r']}  {s['agg_mb_per_sec']:>6} MB/s"
+        )
         print(
             f"  c={c}x{N}={c * N:<7} {s['agg_rps']:>8} rps  {s['installs_per_sec']:>7} inst/s  "
-            f"wheel={s['wheel_rps']:>8} idx={s['index_rps']:>8}  {s['agg_mb_per_sec']:>6} MB/s  "
-            f"mix_r={s['mix_r']}  p99={s['p99_ms']:>7}ms  ok={s['ok_pct']}%  "
-            f"serverCPU={s['server_cpu_pct']}%"
+            f"wheel={s['wheel_rps']:>8} idx={s['index_rps']:>8}  {integrity}  "
+            f"p99={s['p99_ms']:>7}ms  ok={s['ok_pct']}%  serverCPU={s['server_cpu_pct']}%"
         )
         return s
 
@@ -507,18 +652,26 @@ def main() -> None:
             plateau_eps=args.plateau_eps,
         )
 
-    # R6 fail-loud: never emit a number the byte anchor can't back.
+    # R6 fail-loud: never emit a number the byte anchor can't back. In redirect mode
+    # wheel bytes are ~0 by design, so the byte anchor does not apply — the sampler is
+    # the gate instead (a sampler-failed step is excluded from the peak by summarize).
     if consts["wheels_per_install"] <= 0 or consts["mean_wheel_bytes"] <= 0:
         raise SystemExit("degenerate mix constants — refusing to emit a number")
-    if any(s["wheel_ok"] > 0 for s in ramp) and not any(s["mix_ok"] for s in ramp):
+    if not redirect and any(s["wheel_ok"] > 0 for s in ramp) and not any(s["mix_ok"] for s in ramp):
         raise SystemExit(
             "byte anchor never held: served wheel bytes match the mix on NO step — "
             "harness miscalibrated (mix/sizes/parse), refusing to emit a number"
+        )
+    if redirect and not any(not sample_breach(s) for s in ramp):
+        raise SystemExit(
+            "wheel-verify sampler failed on EVERY step: no step delivered wheels with the "
+            "expected bytes (broken presigns / S3 errors / bad sampler), refusing to emit a number"
         )
 
     peak, bound, peak_mbs = summarize(ramp, args.cpu_break)
     out = {
         "label": f"{args.container}-t2-mn",
+        "wheel_mode": args.wheel_mode,
         "loadgens": N,
         "reqs_per_install": m["reqs_per_install"],
         "peak_agg_rps": peak["agg_rps"],

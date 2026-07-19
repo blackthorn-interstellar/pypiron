@@ -149,7 +149,7 @@ def build_install_mix(index_url: str, arch: str, tier: str) -> dict:
     reqs_per_install = (sum(pkgs_per) / len(pkgs_per)) * 2 if pkgs_per else 1.0
 
     base = index_url.rstrip("/") + "/"
-    index_urls, wheel_urls, dropped = [], [], 0
+    index_urls, wheel_urls, wheel_sizes, dropped = [], [], [], 0
     total_wheel_bytes = 0
     hdr = {"Accept": "application/vnd.pypi.simple.v1+json"}
     for nm in sorted(canonical):
@@ -162,6 +162,7 @@ def build_install_mix(index_url: str, arch: str, tier: str) -> dict:
         href = find_wheel_href(iu, body, canonical[nm])
         if href and served_ok(href):
             wheel_urls.append(href)
+            wheel_sizes.append(size_by_file[canonical[nm]])
             total_wheel_bytes += size_by_file[canonical[nm]]
         else:
             dropped += 1
@@ -170,6 +171,11 @@ def build_install_mix(index_url: str, arch: str, tier: str) -> dict:
         "regex": paths_regex(index_urls + wheel_urls),  # combined — for capacity.main only
         "index_regex": paths_regex(index_urls),
         "wheel_regex": paths_regex(wheel_urls),
+        # Parallel arrays (url, expected byte size) for the redirect-mode sampler:
+        # it GETs a sample of these wheel URLs following the 302 and asserts the
+        # body length. Shipped to the loadgen so the sampler never re-hits the index.
+        "wheel_urls": wheel_urls,
+        "wheel_sizes": wheel_sizes,
         "reqs_per_install": round(reqs_per_install, 1),
         "wheels_per_install": round(reqs_per_install / 2, 3),  # = mean closure size
         "n_index": n_i,

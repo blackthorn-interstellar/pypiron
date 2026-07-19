@@ -177,14 +177,15 @@ cmd_deploy() {
 
 UV_IMG="ghcr.io/astral-sh/uv:0.9.30-python3.11-bookworm-slim"
 
-cmd_serve() {  # serve <server>  -- pypiron | pypiserver | proxpi
+cmd_serve() {  # serve <server>  -- pypiron | pypiserver | proxpi | devpi | pypicloud | bandersnatch
   load_env
   local server="${1:-pypiron}"
   # All servers run --network host, not -p 8080:8080: a flamegraph showed Docker's
   # bridge/NAT + conntrack cost ~24% of throughput on a small box (and a single-box
   # deployment wouldn't bridge-NAT). Host networking measures the server, not docker
   # — and every server gets the same treatment, which is the fairness requirement.
-  local wheels="/home/ec2-user/pypiron/bench/install/wheelhouse/${ARCH}/${TIER}"
+  local bi="/home/ec2-user/pypiron/bench/install"
+  local wheels="${bi}/wheelhouse/${ARCH}/${TIER}"
   case "$server" in
     pypiron)
       echo "== start pypiron Track 2 (S3 + presigned redirect) on the server"
@@ -227,8 +228,70 @@ cmd_serve() {  # serve <server>  -- pypiron | pypiserver | proxpi
         -w /repo/bench/install ${UV_IMG} \
         python3 drive.py --mode warm --index-url http://localhost:5000/index/ --host localhost:5000 \
         --tier ${TIER} --arch ${ARCH}" ;;
+    devpi)
+      # Hybrid pull-through cache fronted by an nginx sidecar that serves cached
+      # wheels off disk directly (/+f/ — the documented prod path; bare :3141 streams
+      # every byte through Python). Two host-net containers share the serverdir
+      # volume (devpi rw, nginx ro); the shipped nginx-devpi.conf's `proxy_pass
+      # http://devpi:3141` is rewritten to 127.0.0.1 because host-net has no compose
+      # DNS. Warm class: install the corpus once through root/pypi WITH egress so
+      # devpi caches the upstream files; the measured run serves from cache.
+      echo "== start devpi (:3141) + nginx sidecar (:8080, /+f/ direct) on the server"
+      ssh_to "$RIG2_SERVER_IP" "sudo docker rm -f devpi devpi-nginx 2>/dev/null; sudo docker volume create devpi-data >/dev/null; \
+        sudo docker run -d --name devpi --network host -e DEVPI_PASSWORD=benchmark -v devpi-data:/devpi/server \
+        jonasal/devpi-server:6.20.1 --threads 50 --keyfs-cache-size 100000"
+      echo "-- wait devpi ready (:3141), then start the nginx front"
+      ssh_to "$RIG2_SERVER_IP" 'for _ in $(seq 1 60); do curl -fsS http://localhost:3141/root/pypi/+simple/ >/dev/null 2>&1 && break; sleep 2; done'
+      ssh_to "$RIG2_SERVER_IP" "sed 's#http://devpi:3141#http://127.0.0.1:3141#' ${bi}/compose/nginx-devpi.conf > /home/ec2-user/nginx-devpi.host.conf; \
+        sudo docker run -d --name devpi-nginx --network host -v devpi-data:/devpi/server:ro \
+        -v /home/ec2-user/nginx-devpi.host.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.27"
+      ssh_to "$RIG2_SERVER_IP" 'for _ in $(seq 1 30); do curl -fsS http://localhost:8080/root/pypi/+simple/ >/dev/null 2>&1 && break; sleep 2; done'
+      echo "== warm-seed corpus through devpi (egress on)"
+      ssh_to "$RIG2_SERVER_IP" "cd pypiron/bench/install && sudo docker run --rm --network host -v \$(pwd)/../..:/repo \
+        -w /repo/bench/install ${UV_IMG} \
+        python3 drive.py --mode warm --index-url http://localhost:8080/root/pypi/+simple/ --host localhost:8080 \
+        --tier ${TIER} --arch ${ARCH}" ;;
+    pypicloud)
+      # Track 2 (redirect-mode server): S3 blob storage + DynamoDB metadata cache, its
+      # real cloud-native combo; storage=s3 issues a 302 to the S3 object for wheels
+      # (the architectural boundary the redirect-mode sampler verifies). The ini does
+      # no env interpolation, so substitute the rig bucket/region in with sed (mirrors
+      # bench.gen_pypicloud_dynamo_conf). Archived tool (Python 3.9), amd64-only image
+      # — disclosed. Warm class: install once (cache-mode fills S3+DynamoDB), tolerate
+      # its documented version-pin gap (warm-min-ok 0.95). pypicloud auto-creates its
+      # DynamoDB tables on startup (needs dynamodb perms on the instance profile).
+      echo "== start pypicloud Track 2 (S3 + DynamoDB, uwsgi x4) on the server"
+      ssh_to "$RIG2_SERVER_IP" "sed -e 's#__BUCKET__#${RIG_BUCKET}#g' -e 's#__REGION__#${RIG_REGION}#g' \
+        ${bi}/compose/pypicloud-config-dynamo.ini > /home/ec2-user/pypicloud-config.gen.ini; \
+        sudo docker rm -f pypicloud 2>/dev/null; sudo docker run -d --name pypicloud --network host --platform linux/amd64 \
+        -e AWS_DEFAULT_REGION=${RIG_REGION} -e PYPICLOUD_S3_BUCKET=${RIG_BUCKET} \
+        -v /home/ec2-user/pypicloud-config.gen.ini:/etc/pypicloud/config.ini:ro stevearc/pypicloud:1.3.12"
+      echo "-- wait pypicloud ready (:8080, creates DynamoDB tables on boot)"
+      ssh_to "$RIG2_SERVER_IP" 'for _ in $(seq 1 90); do curl -fsS http://localhost:8080/simple/ >/dev/null 2>&1 && break; sleep 2; done'
+      echo "== warm-seed corpus into pypicloud (cache-mode fills S3+DynamoDB; egress on)"
+      ssh_to "$RIG2_SERVER_IP" "cd pypiron/bench/install && sudo docker run --rm --network host -v \$(pwd)/../..:/repo \
+        -w /repo/bench/install ${UV_IMG} \
+        python3 drive.py --mode warm --index-url http://localhost:8080/simple/ --host localhost:8080 \
+        --tier ${TIER} --arch ${ARCH} --warm-min-ok 0.95" ;;
+    bandersnatch)
+      # Batch mirror (runs ONCE, then exits) → static PEP 503/691 tree served by nginx
+      # (pure sendfile: "the static-file ceiling"). The release-level allowlist is the
+      # exact corpus pins — the allowlist does NOT resolve deps, so bench.py generates
+      # bandersnatch.gen.conf from the full-closure manifest. Mirroring pulls from
+      # pypi.org (egress at seed only; the measured nginx run needs none).
+      echo "== bandersnatch: generate allowlist conf, then mirror the ${TIER} corpus once (egress on)"
+      ssh_to "$RIG2_SERVER_IP" "cd pypiron/bench/install && sudo docker run --rm -v \$(pwd)/../..:/repo \
+        -w /repo/bench/install ${UV_IMG} python3 -c \"import bench; bench.gen_bandersnatch_conf('${TIER}','${ARCH}')\""
+      ssh_to "$RIG2_SERVER_IP" "sudo docker volume create bander-mirror >/dev/null; sudo docker rm -f bander-web 2>/dev/null; \
+        sudo docker run --rm --network host -v bander-mirror:/data/pypi \
+        -v ${bi}/compose/bandersnatch.gen.conf:/conf/bandersnatch.gen.conf:ro \
+        pypa/bandersnatch:7.1.0 bandersnatch -c /conf/bandersnatch.gen.conf mirror"
+      echo "== serve the static mirror tree via nginx (:8080, pure sendfile)"
+      ssh_to "$RIG2_SERVER_IP" "sudo docker run -d --name bander-web --network host -v bander-mirror:/data/pypi:ro \
+        -v ${bi}/compose/nginx-bander.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.27-alpine"
+      ssh_to "$RIG2_SERVER_IP" 'for _ in $(seq 1 30); do curl -fsS http://localhost:8080/simple/ >/dev/null 2>&1 && break; sleep 2; done' ;;
     *)
-      echo "rig2 serve supports: pypiron | pypiserver | proxpi (got '$server')" >&2; exit 2 ;;
+      echo "rig2 serve supports: pypiron | pypiserver | proxpi | devpi | pypicloud | bandersnatch (got '$server')" >&2; exit 2 ;;
   esac
   echo "== served + seeded ($server)"
 }

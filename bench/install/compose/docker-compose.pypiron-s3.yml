@@ -6,7 +6,7 @@
 #
 # AWS-only: needs a real bucket + credentials (the rig instance profile, reached
 # via IMDS — rig.sh sets the metadata hop limit to 2 so the container can read
-# it). Set PYPIRON_S3_BUCKETS + AWS_REGION. Seeded by upload (stored to S3).
+# it). Set RIG_BUCKET + AWS_REGION. Seeded by upload (stored to S3).
 
 services:
   pypiron:
@@ -15,7 +15,6 @@ services:
     command:
       - pypiron
       - serve
-      - --storage=s3
       - --artifact-delivery=redirect
       - --uploader-user=admin
       - --uploader-pass=secret
@@ -23,6 +22,6 @@ services:
       - --admin-pass=secret
     environment:
       PYPIRON_BIND_ADDR: "0.0.0.0:8080"
-      PYPIRON_S3_BUCKETS: ${PYPIRON_S3_BUCKETS:?set PYPIRON_S3_BUCKETS to the rig bucket}
+      PYPIRON_BUCKETS: s3://${RIG_BUCKET:?set RIG_BUCKET to the rig bucket}
       AWS_REGION: ${AWS_REGION:-us-east-1}
     networks: [bench]

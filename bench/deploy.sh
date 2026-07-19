@@ -56,8 +56,7 @@ ssh "${SSH_OPTS[@]}" "$LG" "chmod 600 .ssh/rig.pem && \
 
 echo "== writing server env + loadgen helpers"
 ssh "${SSH_OPTS[@]}" "$SV" "cat > .server-env" <<EOF
-export PYPIRON_STORAGE=s3
-export PYPIRON_S3_BUCKETS=${RIG_BUCKET}
+export PYPIRON_BUCKETS=s3://${RIG_BUCKET}
 export AWS_REGION=${RIG_REGION}
 export PYPIRON_UPLOADER_USER=admin
 export PYPIRON_UPLOADER_PASS=secret

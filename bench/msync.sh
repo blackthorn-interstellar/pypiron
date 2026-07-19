@@ -58,12 +58,12 @@ run() {
 case "$MODE" in
   m1-direct)
     run "$BIN" sync --filter-packages-list "$M1_LIST" --only-wheels \
-      --storage s3 --s3-bucket "$TARGET" ;;
+      --buckets "s3://$TARGET" ;;
   m2-torch)
     echo torch > /tmp/m2-packages.txt
     run "$BIN" sync --filter-packages-list /tmp/m2-packages.txt --only-wheels \
       --python-tag cp312 --platform-tag 'manylinux*' \
-      --storage s3 --s3-bucket "$TARGET" ;;
+      --buckets "s3://$TARGET" ;;
   m3-http)
     run "$BIN" sync --filter-packages-list "$M1_LIST" --only-wheels \
       --to "$TARGET" --username admin --password secret ;;

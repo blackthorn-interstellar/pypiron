@@ -17,16 +17,18 @@
 # FINDING THE CEILING IS THE POINT. pypiron's index+302 path is so cheap that a
 # small loadgen fleet saturates ITSELF (pulling wheel bytes from S3) long before
 # the server's CPU — a rig-limited number that understates pypiron and isn't a
-# ceiling at all (dev/BENCHMARK_RESULTS.md §14 vs §15). So the default fleet is
-# sized to drive the default server to its CPU wall (4× c7i.8xlarge → a 2-vCPU
-# r7i.large, per §15), and if a run still fails to saturate the server the script
+# ceiling at all (dev/BENCHMARK_INSTALL.md §14 vs §15). So the default fleet is
+# sized to drive the default server to its CPU wall (8× c7i.8xlarge → a 2-vCPU
+# r7i.large — the fleet that found the real 3,026 inst/s knee in §18; 4× tops out
+# near 1,700 and mis-reads its own thrash as the server breaking), and if a run
+# still fails to saturate the server the script
 # flags the result as a rig-limited LOWER BOUND and tells you to scale up — it
 # never reports a rig-limited number as the ceiling.
 #
 # The rig is REUSED if one is already up; pass --up to force a fresh one. Knobs
 # (rig2.sh's, via env):
 #   RIG2_SERVER_TYPE  (def r7i.large)   the box customers run pypiron on
-#   RIG2_LOADGEN_TYPE (def c7i.8xlarge), RIG2_LOADGENS (def 4)  the ceiling fleet
+#   RIG2_LOADGEN_TYPE (def c7i.8xlarge), RIG2_LOADGENS (def 8)  the ceiling fleet
 #   RIG2_LADDER       optional fixed per-node ladder; unset => auto-search the ceiling
 # A bigger/faster server needs a bigger fleet to saturate — watch for the
 # rig-limited warning and raise RIG2_LOADGENS / RIG2_LOADGEN_TYPE if it fires.
@@ -97,7 +99,7 @@ echo "-- wrote ${IMG_TGZ} ($(du -h "$IMG_TGZ" | cut -f1))"
 export RIG2_SERVER_TYPE="${RIG2_SERVER_TYPE:-r7i.large}" \
        RIG2_SERVER_ARCH="$ARCH" RIG_ARCH="$ARCH" \
        RIG2_LOADGEN_TYPE="${RIG2_LOADGEN_TYPE:-c7i.8xlarge}" \
-       RIG2_LOADGENS="${RIG2_LOADGENS:-4}" RIG_TIER="$TIER" \
+       RIG2_LOADGENS="${RIG2_LOADGENS:-8}" RIG_TIER="$TIER" \
        RIG2_SERVER_IMG="$IMG_TGZ"
 
 rig_running() {
@@ -111,12 +113,26 @@ rig_running() {
   [[ "$st" == "running" ]]
 }
 
+# From here on the rig costs money, so --down must survive a mid-run failure:
+# `set -e` aborts straight past the teardown at the bottom, which once stranded a
+# full fleet after the server failed to start. The trap tears down on ANY exit
+# path when --down was asked for.
+teardown_on_exit() {
+  local rc=$?
+  [[ "$TEARDOWN" == 1 ]] || return $rc
+  [[ $rc -eq 0 ]] || echo "!! failed (rc=$rc) — tearing the rig down as --down requested"
+  "${HERE}/rig2.sh" down || echo "!! TEARDOWN FAILED — check for running instances!"
+  return $rc
+}
+
 if [[ "$FORCE_UP" == 1 ]] || ! rig_running; then
   echo "== rig up (${RIG2_SERVER_TYPE} server + ${RIG2_LOADGENS}× ${RIG2_LOADGEN_TYPE})"
   "${HERE}/rig2.sh" up
 else
   echo "== reusing running rig ($(grep RIG2_SERVER_IP "${HERE}/.rig2.env" | cut -d= -f2))"
 fi
+# Supersedes the ctx-only EXIT trap above (one EXIT trap wins, so it does both).
+trap 'teardown_on_exit; rm -rf "$ctx"' EXIT
 
 # ---- 3. deploy the image, serve Track 2, ramp to the installs/sec ceiling -----
 "${HERE}/rig2.sh" deploy
@@ -140,43 +156,31 @@ else
 fi
 python3 "${HERE}/mn_ramp.py" "${RAMP_ARGS[@]}"
 
-# Stamp the result and classify the bound. The server's limit was FOUND — so the
-# peak is a real ceiling, server-bound — if it saturated CPU, OR if throughput
-# COLLAPSED while the server was under real load: the rig drove it PAST its knee,
-# which a rig-limited run cannot do (a collapse is the server breaking, not the
-# fleet). It is rig-limited only when the fleet maxed first — throughput rose to
-# the safety cap with no collapse, or collapsed with the server near-idle.
+# Stamp run metadata onto the result. The bound verdict is mn_ramp's — it is now
+# derived from the byte-truthful wheel-completion metric with peak-adjacent
+# evidence, so this stamper only ADDS metadata and TRUSTS mn_ramp's `bound` (no
+# re-derivation; the old two-threshold divergence is gone).
 python3 - "${HERE}/results/cmp-pypiron.json" "$REF" "$RIG2_SERVER_TYPE" "$RIG2_LOADGENS" "$RIG2_LOADGEN_TYPE" "$CORES" <<'PY'
 import json, sys
 from pathlib import Path
 path, ref, server, lg_n, lg_type, cores = sys.argv[1:7]
-cores = int(cores)
-p = Path(path)
-d = json.loads(p.read_text())
-ramp = d.get("ramp", [])
-peak_cpu = max((s.get("server_cpu_pct", 0) or 0) for s in ramp) if ramp else 0.0
-collapsed = any(s.get("breach") in ("collapse", "errors") for s in ramp)
-saturated = peak_cpu >= 0.85 * cores * 100
-server_bound = saturated or (collapsed and peak_cpu >= 0.5 * cores * 100)
+d = json.loads(Path(path).read_text())
 d["pypiron_version"] = ref
 d["server_type"] = server
 d["loadgen"] = f"{int(lg_n)}x {lg_type}"
-d["server_cores"] = cores
-d["peak_server_cpu_pct"] = round(peak_cpu, 1)
-d["bound"] = "server-bound" if server_bound else "rig-limited"
-p.write_text(json.dumps(d, indent=2))
+d["server_cores"] = int(cores)
+d.setdefault("peak_server_cpu_pct",
+             round(max((s.get("server_cpu_pct", 0) or 0) for s in d.get("ramp", [])), 1)
+             if d.get("ramp") else 0.0)          # mn_ramp already stamps it; fallback only
+Path(path).write_text(json.dumps(d, indent=2))
+bound = d["bound"]                                # TRUST mn_ramp — do NOT recompute
 inst, rps = d["peak_installs_per_sec"], d["peak_agg_rps"]
-print(f"\n  pypiron {ref}: peak {inst} installs/s ({rps} rps) on {server} "
-      f"[{int(lg_n)}x {lg_type}]")
-print(f"  server CPU peaked {peak_cpu:.0f}% of {cores * 100}%; "
-      f"{'collapsed past the knee' if collapsed else 'no collapse'} — "
-      f"{'SERVER-BOUND (real ceiling)' if server_bound else 'rig-limited'}")
-if not server_bound:
-    print("\n  ⚠⚠  RIG-LIMITED — the loadgen fleet maxed before the server broke;")
-    print("      this is a LOWER BOUND, not pypiron's ceiling. Scale up:")
-    print(f"      RIG2_LOADGENS={int(lg_n) * 2} RIG2_LOADGEN_TYPE={lg_type} "
-          f"./benchmark.sh {ref}\n")
+print(f"\n  pypiron {ref}: peak {inst} installs/s ({rps} rps) on {server} [{int(lg_n)}x {lg_type}]")
+print(f"  server CPU peaked {d['peak_server_cpu_pct']:.0f}% of {int(cores)*100}% — "
+      f"{'SERVER-BOUND (real ceiling)' if bound == 'server-bound' else 'rig-limited'}")
+if bound != "server-bound":
+    print("\n  RIG-LIMITED — the loadgen fleet maxed before the server broke; LOWER BOUND. Scale up:")
+    print(f"      RIG2_LOADGENS={int(lg_n)*2} RIG2_LOADGEN_TYPE={lg_type} ./benchmark.sh {ref}\n")
 PY
 
-[[ "$TEARDOWN" == 1 ]] && { echo "== teardown"; "${HERE}/rig2.sh" down; }
-echo "== done: results/cmp-pypiron.json"
+echo "== done: results/cmp-pypiron.json"   # teardown (if --down) runs via the EXIT trap

@@ -58,6 +58,19 @@ def regex_escape(s: str) -> str:
     return "".join(out)
 
 
+def paths_regex(urls: List[str]) -> str:
+    """rand_regex for a set of same-host URLs: keep the common scheme://host:port a
+    literal prefix (oha mishandles a varying host) and vary only the PATH in the
+    alternation. Bench hosts are dot-free service names, so the prefix needs no
+    escaping."""
+    parts = urlsplit(urls[0])
+    prefix = f"{parts.scheme}://{parts.netloc}"
+    paths = [
+        urlsplit(u).path + (f"?{urlsplit(u).query}" if urlsplit(u).query else "") for u in urls
+    ]
+    return prefix + "(" + "|".join(regex_escape(pp) for pp in paths) + ")"
+
+
 def pick_canonical(filenames: List[str], arch: str) -> str:
     """One wheel per package, chosen identically for every server (a py3.11 /
     linux <arch> install's wheel) so the mix is the same workload everywhere."""
@@ -106,21 +119,25 @@ def served_ok(url: str) -> bool:
     return False
 
 
-def build_install_mix(index_url: str, arch: str, tier: str) -> Tuple[str, float, int, int, int]:
+def build_install_mix(index_url: str, arch: str, tier: str) -> dict:
     """Build the realistic install-traffic URL mix: every package's index page +
     its ONE canonical wheel. The canonical (name->wheel) set is chosen from the
     manifest identically for every server, so the mix is the SAME workload (same
     wheel sizes) everywhere — fixing the per-server divergence. Each wheel is
     GET/HEAD-preverified 200 on this server and DROPPED (counted) if unservable,
-    so the ramp never 404s mid-flight. Returns (rand_regex, reqs_per_install,
-    n_index, n_wheel, n_dropped)."""
+    so the ramp never 404s mid-flight. Returns a dict with the combined regex plus
+    per-class (index/wheel) regexes and the corpus constants the byte-truthful
+    metric anchors on (wheels_per_install, mean_wheel_bytes, wheel_frac)."""
     manifest = json.loads(manifest_path(tier, arch).read_text())
     by_name: Dict[str, List[str]] = {}
+    size_by_file: Dict[str, int] = {}
     for w in manifest["wheels"]:
         by_name.setdefault(pep503(w["name"]), []).append(w["filename"])
+        size_by_file[w["filename"]] = w["size"]
     canonical = {nm: pick_canonical(fns, arch) for nm, fns in by_name.items()}
 
     pkgs_per: List[int] = []
+    # TODO(tier-bleed): filter closures to tier via select_projects
     for c in sorted(closures_dir(arch).glob("*.txt")):
         n = sum(
             1
@@ -133,6 +150,7 @@ def build_install_mix(index_url: str, arch: str, tier: str) -> Tuple[str, float,
 
     base = index_url.rstrip("/") + "/"
     index_urls, wheel_urls, dropped = [], [], 0
+    total_wheel_bytes = 0
     hdr = {"Accept": "application/vnd.pypi.simple.v1+json"}
     for nm in sorted(canonical):
         iu = base + nm + "/"
@@ -144,18 +162,23 @@ def build_install_mix(index_url: str, arch: str, tier: str) -> Tuple[str, float,
         href = find_wheel_href(iu, body, canonical[nm])
         if href and served_ok(href):
             wheel_urls.append(href)
+            total_wheel_bytes += size_by_file[canonical[nm]]
         else:
             dropped += 1
-    mix = index_urls + wheel_urls
-    # oha --rand-regex-url mishandles a varying scheme/host/port, so keep the
-    # common scheme://host:port a literal prefix and vary only the PATH in the
-    # alternation (matches oha's documented working form). Bench hosts are
-    # dot-free service names, so the prefix needs no escaping.
-    parts = urlsplit(mix[0])
-    prefix = f"{parts.scheme}://{parts.netloc}"
-    paths = [urlsplit(u).path + (f"?{urlsplit(u).query}" if urlsplit(u).query else "") for u in mix]
-    regex = prefix + "(" + "|".join(regex_escape(pp) for pp in paths) + ")"
-    return regex, round(reqs_per_install, 1), len(index_urls), len(wheel_urls), dropped
+    n_i, n_w = len(index_urls), len(wheel_urls)
+    return {
+        "regex": paths_regex(index_urls + wheel_urls),  # combined — for capacity.main only
+        "index_regex": paths_regex(index_urls),
+        "wheel_regex": paths_regex(wheel_urls),
+        "reqs_per_install": round(reqs_per_install, 1),
+        "wheels_per_install": round(reqs_per_install / 2, 3),  # = mean closure size
+        "n_index": n_i,
+        "n_wheel": n_w,
+        "dropped": dropped,
+        "total_wheel_bytes": total_wheel_bytes,
+        "mean_wheel_bytes": (total_wheel_bytes / n_w) if n_w else 0.0,
+        "wheel_frac": (n_w / (n_i + n_w)) if (n_i + n_w) else 0.0,
+    }
 
 
 def oha_run(
@@ -386,9 +409,9 @@ def main() -> None:
     wait_ready(args.index_url)
 
     if args.install_mix:
-        regex, reqs_per_install, n_index, n_wheel, n_dropped = build_install_mix(
-            args.index_url, args.arch, args.tier
-        )
+        m = build_install_mix(args.index_url, args.arch, args.tier)
+        regex, reqs_per_install = m["regex"], m["reqs_per_install"]
+        n_index, n_wheel, n_dropped = m["n_index"], m["n_wheel"], m["dropped"]
         print(
             f"capacity {args.label}: install-mix ramp ({n_index} index + {n_wheel} wheel URLs, "
             f"{n_dropped} dropped/unservable, ~{reqs_per_install} reqs/install)"

@@ -120,8 +120,7 @@ def upload(base: str, wheel: Path) -> None:
 def server_env(port: int, audit_on_boot: bool, reconcile: int) -> dict:
     return dict(
         os.environ,
-        PYPIRON_STORAGE="s3",
-        PYPIRON_S3_BUCKETS=BUCKET,
+        PYPIRON_BUCKETS=f"s3://{BUCKET}",
         AWS_REGION=REGION,
         PYPIRON_BIND_ADDR=f"127.0.0.1:{port}",
         PYPIRON_WORKER_INTERVAL_SECS="1",

@@ -16,7 +16,6 @@ services:
     command:
       - pypiron
       - serve
-      - --storage=disk
       - --data-dir=/data
       - --artifact-delivery=stream
       - --uploader-user=admin

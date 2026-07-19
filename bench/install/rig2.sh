@@ -274,20 +274,19 @@ cmd_serve() {  # serve <server>  -- pypiron | pypiserver | proxpi | devpi | pypi
         python3 drive.py --mode warm --index-url http://localhost:8080/simple/ --host localhost:8080 \
         --tier ${TIER} --arch ${ARCH} --warm-min-ok 0.95" ;;
     bandersnatch)
-      # Batch mirror (runs ONCE, then exits) → static PEP 503/691 tree served by nginx
-      # (pure sendfile: "the static-file ceiling"). The release-level allowlist is the
-      # exact corpus pins — the allowlist does NOT resolve deps, so bench.py generates
-      # bandersnatch.gen.conf from the full-closure manifest. Mirroring pulls from
-      # pypi.org (egress at seed only; the measured nginx run needs none).
-      echo "== bandersnatch: generate allowlist conf, then mirror the ${TIER} corpus once (egress on)"
-      ssh_to "$RIG2_SERVER_IP" "cd pypiron/bench/install && sudo docker run --rm -v \$(pwd)/../..:/repo \
-        -w /repo/bench/install ${UV_IMG} python3 -c \"import bench; bench.gen_bandersnatch_conf('${TIER}','${ARCH}')\""
-      ssh_to "$RIG2_SERVER_IP" "sudo docker volume create bander-mirror >/dev/null; sudo docker rm -f bander-web 2>/dev/null; \
-        sudo docker run --rm --network host -v bander-mirror:/data/pypi \
-        -v ${bi}/compose/bandersnatch.gen.conf:/conf/bandersnatch.gen.conf:ro \
-        pypa/bandersnatch:7.1.0 bandersnatch -c /conf/bandersnatch.gen.conf mirror"
-      echo "== serve the static mirror tree via nginx (:8080, pure sendfile)"
-      ssh_to "$RIG2_SERVER_IP" "sudo docker run -d --name bander-web --network host -v bander-mirror:/data/pypi:ro \
+      # Static PEP 503 tree served by nginx (pure sendfile: "the static-file
+      # ceiling"). The tree is built by bander_tree.py from the wheelhouse
+      # already on the box — a real `bandersnatch mirror` run would re-download
+      # from pypi.org the very hash-pinned bytes the wheelhouse holds, spending
+      # minutes of egress for an identical serving surface. Setup, not
+      # measurement (BENCHMARK_INSTALL.md §0); disclosed in the results doc.
+      echo "== bandersnatch: build the static web tree from the wheelhouse (no mirror)"
+      ssh_to "$RIG2_SERVER_IP" "sudo rm -rf /home/ec2-user/bander-web && python3 ${bi}/bander_tree.py \
+        --manifest ${bi}/lock/${ARCH}/wheelhouse.${TIER}.json \
+        --wheelhouse ${bi}/wheelhouse/${ARCH}/${TIER} --out /home/ec2-user/bander-web"
+      echo "== serve the static tree via nginx (:8080, pure sendfile)"
+      ssh_to "$RIG2_SERVER_IP" "sudo docker rm -f bander-web 2>/dev/null; \
+        sudo docker run -d --name bander-web --network host -v /home/ec2-user/bander-web:/data/pypi/web:ro \
         -v ${bi}/compose/nginx-bander.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.27-alpine"
       ssh_to "$RIG2_SERVER_IP" 'for _ in $(seq 1 30); do curl -fsS http://localhost:8080/simple/ >/dev/null 2>&1 && break; sleep 2; done' ;;
     *)

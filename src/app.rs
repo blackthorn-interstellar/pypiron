@@ -1540,11 +1540,6 @@ fn merge_storage_file(
     f: &config::ServeConfig,
     m: &clap::ArgMatches,
 ) -> Result<()> {
-    if !arg_from_cli_or_env(m, "storage") {
-        if let Some(v) = &f.storage {
-            storage.storage = serve_value_enum("storage", v)?;
-        }
-    }
     if !arg_from_cli_or_env(m, "s3_force_path_style") {
         if let Some(v) = f.s3_force_path_style {
             storage.s3_force_path_style = v;
@@ -1557,17 +1552,14 @@ fn merge_storage_file(
     }
     storage.data_dir = storage.data_dir.take().or(f.data_dir.clone());
     storage.storage_prefix = storage.storage_prefix.take().or(f.storage_prefix.clone());
-    // Single-bucket S3 name and the multi-cloud `buckets` list both come from the
-    // file only when CLI/env supplied none — CLI/env always wins.
-    storage.s3_bucket = storage.s3_bucket.take().or(f.s3_bucket.clone());
+    // The `buckets` list comes from the file only when CLI/env supplied none —
+    // CLI/env always wins.
     if storage.buckets.is_empty() {
         if let Some(list) = &f.buckets {
             storage.buckets = list.clone();
         }
     }
-    storage.aws_region = storage.aws_region.take().or(f.aws_region.clone());
     storage.s3_endpoint_url = storage.s3_endpoint_url.take().or(f.s3_endpoint_url.clone());
-    storage.gcs_bucket = storage.gcs_bucket.take().or(f.gcs_bucket.clone());
     storage.gcs_service_account_path = storage
         .gcs_service_account_path
         .take()
@@ -1577,11 +1569,19 @@ fn merge_storage_file(
         .take()
         .or(f.gcs_endpoint_url.clone());
     storage.azure_account = storage.azure_account.take().or(f.azure_account.clone());
-    storage.azure_container = storage.azure_container.take().or(f.azure_container.clone());
     storage.azure_endpoint_url = storage
         .azure_endpoint_url
         .take()
         .or(f.azure_endpoint_url.clone());
+    // Per-bucket overrides are TOML-only (no CLI/env form), so they come from the
+    // file whenever the file has them. All six `StorageArgs` embeds fold the same
+    // `[serve]` table here, so serve and the maintenance commands resolve the
+    // identical per-bucket config.
+    if storage.overrides.is_empty() {
+        if let Some(map) = &f.bucket {
+            storage.overrides = map.clone();
+        }
+    }
     Ok(())
 }
 
@@ -1665,6 +1665,12 @@ async fn run_serve(
             );
         }
     }
+
+    // Fail closed on a per-bucket override that names a bucket outside the list
+    // (typo protection), and warn on a --data-dir that --buckets makes moot —
+    // both before any bucket is contacted.
+    cli.storage.validate_override_keys()?;
+    cli.storage.warn_if_data_dir_ignored();
 
     let storage_desc = cli.storage.describe();
     let raw_storages = cli.storage.build_all().await?;

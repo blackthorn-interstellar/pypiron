@@ -123,16 +123,14 @@ The same `[mirror]` table drives proxy and sync. Proxy can run open; sync needs
 ## Object storage
 
 Use object storage when you want more than one node, or when the package store
-should live outside the VM. The bucket must already exist.
+should live outside the VM. Point `--buckets` at a bucket that already exists:
 
 ```toml
 private-prefix = "acme"
 
 [serve]
 bind-addr = "0.0.0.0:8080"
-storage = "s3"
-s3-bucket = "acme-pypiron"
-aws-region = "us-east-1"
+buckets = ["s3://acme-pypiron@us-east-1"]
 proxy-upstream = "https://pypi.org"
 
 [mirror]
@@ -140,8 +138,11 @@ exclude-newer = "7 days"
 ```
 
 AWS credentials come from the standard AWS chain: environment, web identity,
-instance role, or task role. GCS and Azure have equivalent keys in
-[Configuration](../reference/configuration.md#storage).
+instance role, or task role. GCS (`gs://`) and Azure (`az://`) work the same way
+with their own credentials — see
+[Configuration](../reference/configuration.md#storage). Several buckets across
+regions or clouds ride out an outage: [Survive a region or cloud
+outage](multi-region.md).
 
 ## Run it
 
@@ -156,7 +157,6 @@ services:
       - "8080:8080"
     environment:
       PYPIRON_ADMIN_PASS: ${PYPIRON_ADMIN_PASS}
-      AWS_REGION: us-east-1
     volumes:
       - ./pypiron.toml:/etc/pypiron/pypiron.toml:ro
 ```

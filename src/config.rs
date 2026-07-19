@@ -14,6 +14,7 @@
 //! Unknown keys are hard errors — a typo'd mirror rule that silently no-ops is
 //! how you mirror the wrong thing.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -113,24 +114,52 @@ pub struct ServeConfig {
     pub counters_flush_interval_secs: Option<u64>,
     pub counters_rollup_interval_secs: Option<u64>,
     pub counters_retention_days: Option<i64>,
-    // Storage backend selection (the same `--storage`/`--s3-*`/... knobs).
-    pub storage: Option<String>,
+    // Storage selection: disk (default) or object storage via `buckets`.
     pub data_dir: Option<String>,
     pub storage_prefix: Option<String>,
-    pub s3_bucket: Option<String>,
-    /// Multi-cloud replication/failover bucket list; comma-free here — a TOML
-    /// array of `s3://`/`gs://`/`az://` URIs. Empty/unset means single-bucket.
+    /// Object-storage bucket list: a TOML array of `s3://`/`gs://`/`az://` URIs.
+    /// Empty/unset means disk; one entry is single-bucket; several enable
+    /// replication and failover.
     pub buckets: Option<Vec<String>>,
-    pub aws_region: Option<String>,
     pub s3_endpoint_url: Option<String>,
     pub s3_force_path_style: Option<bool>,
-    pub gcs_bucket: Option<String>,
     pub gcs_service_account_path: Option<String>,
     pub gcs_endpoint_url: Option<String>,
     pub azure_account: Option<String>,
-    pub azure_container: Option<String>,
     pub azure_endpoint_url: Option<String>,
     pub azure_use_emulator: Option<bool>,
+    /// Per-bucket overrides, keyed by bucket URI (`[serve.bucket."s3://name"]`).
+    /// The config file's one nested table: the rare fleet where buckets need
+    /// different endpoints or credentials names them here. Matched to a bucket
+    /// by identity (`scheme://name`, `@region` excluded), so a key written with
+    /// or without a region resolves to the same bucket. Secrets never live in
+    /// the file — `env-prefix` names where they do.
+    pub bucket: Option<HashMap<String, BucketOverride>>,
+}
+
+/// `[serve.bucket."scheme://name"]`: overrides for one bucket. Every field is
+/// optional and valid only for the matching scheme (a wrong-scheme field is a
+/// startup error). `endpoint-url` applies to any scheme; `force-path-style` is
+/// S3-only; `env-prefix` names an env var prefix holding the bucket's secret
+/// (S3 or Azure); `service-account-path` is a GCS key file; `account` is the
+/// Azure storage account. TOML-only by design — there is no CLI/env form.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct BucketOverride {
+    /// S3/GCS/Azure endpoint URL for this bucket, overriding the backend-wide
+    /// endpoint flag. `http://` implies allow-http.
+    pub endpoint_url: Option<String>,
+    /// Force S3 path-style addressing for this bucket (S3 only).
+    pub force_path_style: Option<bool>,
+    /// Env var prefix for this bucket's scoped credentials (S3/Azure). S3 reads
+    /// `<P>AWS_ACCESS_KEY_ID` + `<P>AWS_SECRET_ACCESS_KEY` (+ optional
+    /// `<P>AWS_SESSION_TOKEN`); Azure reads `<P>AZURE_ACCESS_KEY`.
+    pub env_prefix: Option<String>,
+    /// Path to a GCS service-account JSON key for this bucket (GCS only); also
+    /// enables presigned URLs for it.
+    pub service_account_path: Option<String>,
+    /// Azure storage account name for this bucket (Azure only).
+    pub account: Option<String>,
 }
 
 /// `[sync]`: the push-mirror job. The package scope and mirror rules live in
@@ -239,8 +268,7 @@ mod tests {
             [serve]
             bind-addr = "127.0.0.1:9000"
             proxy-upstream = "https://pypi.org"
-            storage = "s3"
-            s3-bucket = "acme-mirror"
+            buckets = ["s3://acme-mirror"]
             reconcile-interval-secs = 3600
             repl-sweep-interval-secs = 120
             "#,
@@ -251,10 +279,43 @@ mod tests {
             cfg.serve.proxy_upstream.as_deref(),
             Some("https://pypi.org")
         );
-        assert_eq!(cfg.serve.storage.as_deref(), Some("s3"));
-        assert_eq!(cfg.serve.s3_bucket.as_deref(), Some("acme-mirror"));
+        assert_eq!(cfg.serve.buckets.unwrap(), ["s3://acme-mirror"]);
         assert_eq!(cfg.serve.reconcile_interval_secs, Some(3600));
         assert_eq!(cfg.serve.repl_sweep_interval_secs, Some(120));
+    }
+
+    #[test]
+    fn parses_per_bucket_overrides() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [serve]
+            buckets = ["s3://iron-east@us-east-1", "s3://minio-cache"]
+
+            [serve.bucket."s3://minio-cache"]
+            endpoint-url = "http://minio.internal:9000"
+            force-path-style = true
+            env-prefix = "MINIO_CACHE_"
+            "#,
+        )
+        .unwrap();
+        let bucket = cfg.serve.bucket.expect("bucket table present");
+        let ov = bucket.get("s3://minio-cache").expect("keyed override");
+        assert_eq!(
+            ov.endpoint_url.as_deref(),
+            Some("http://minio.internal:9000")
+        );
+        assert_eq!(ov.force_path_style, Some(true));
+        assert_eq!(ov.env_prefix.as_deref(), Some("MINIO_CACHE_"));
+        assert!(ov.service_account_path.is_none());
+        assert!(ov.account.is_none());
+    }
+
+    #[test]
+    fn unknown_bucket_override_field_is_rejected() {
+        let err =
+            toml::from_str::<ConfigFile>("[serve.bucket.\"s3://x\"]\nendpont-url = \"http://x\"\n")
+                .unwrap_err();
+        assert!(err.to_string().contains("endpont-url"));
     }
 
     #[test]
@@ -320,7 +381,6 @@ mod tests {
         // the right section.
         assert_eq!(cfg.private_prefix.as_deref(), Some("acme"));
         assert_eq!(cfg.serve.bind_addr.as_deref(), Some("0.0.0.0:8080"));
-        assert_eq!(cfg.serve.storage.as_deref(), Some("disk"));
         assert_eq!(cfg.serve.artifact_delivery.as_deref(), Some("auto"));
         assert_eq!(cfg.serve.counters_retention_days, Some(90));
         assert_eq!(cfg.serve.s3_force_path_style, Some(false));

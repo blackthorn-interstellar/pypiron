@@ -43,8 +43,9 @@ thinner or lose to a mid-run upstream fetch.
    a response/edge cache another lacks.** We do not handicap devpi or
    bandersnatch by running them bare, and we do not bolt a shared front-cache on
    everyone (that benchmarks nginx, not the tools).
-2. **No self-cheating for pypiron.** In the head-to-head ranking, pypiron runs
-   `--storage disk --artifact-delivery stream` — disk always streams every byte
+2. **No self-cheating for pypiron.** In the head-to-head ranking, pypiron runs on
+   disk (the default — no `--buckets`) with `--artifact-delivery stream` — disk
+   always streams every byte
    through the node, the level playing field. Its S3 + presigned-redirect
    byte-offload (a real architectural edge no competitor has) appears **only**
    in the separately-labeled best-cloud track (§1), never folded into the
@@ -106,11 +107,13 @@ anonymous read, pinned `uv` + Python for all. Images **pinned by digest**.
 
 ### pypiron
 `pypiron:bench` built from source at the pinned commit (the ghcr tag job is
-disabled; only digest pushes happen). Track 1: `serve --storage disk --data-dir
-/data --artifact-delivery stream`. Single binary, no sidecar. **Warm:** `twine
+disabled; only digest pushes happen). Track 1: `serve --data-dir /data
+--artifact-delivery stream` (disk is the default). Single binary, no sidecar.
+**Warm:** `twine
 upload` the shared wheelhouse to `/legacy/` as mirror-origin (admin creds);
 worker (1 s) + audit-on-boot materialize the `/simple/` indexes. Track 2 (S2
-sidebar): `--storage s3 --artifact-delivery redirect`. Index path `/simple/`.
+sidebar): `--buckets s3://<bucket> --artifact-delivery redirect`. Index path
+`/simple/`.
 **Fairness:** never `--artifact-delivery auto` in the head-to-head (could hide an
 S3 redirect).
 

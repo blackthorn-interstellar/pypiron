@@ -44,6 +44,7 @@ from .helpers import (
     ACCEPT_PEP691,
     find_free_port,
     http_get,
+    http_get_no_redirect,
     http_request_auth,
     kill_process_tree,
     make_wheel,
@@ -1755,24 +1756,37 @@ def test_fresh_startup_repairs_member_that_missed_topology_migration(
         server_gen.close()
 
 
-def test_singular_s3_bucket_env_selects_single_bucket_s3(minio_two, pypiron_bin):
-    """The singular PYPIRON_S3_BUCKET is single-bucket mode on S3 — the one knob
-    that stays after the multi-bucket list moved to PYPIRON_BUCKETS URIs."""
-    env = _s3_env(minio_two, "127.0.0.1:0")
-    bucket = minio_two["buckets"][0]
-    pkg = "singleenvclaim"
-    minio_put_key_in(
-        minio_two,
-        bucket,
-        f"packages/{pkg}/.origin",
-        json.dumps({"origin": "private", "nonce": "1" * 32}),
+def test_single_entry_buckets_keeps_single_bucket_guarantees(
+    minio, tmp_path_factory, pypiron_bin, tmp_path
+):
+    """A one-entry `--buckets s3://x` list is ordinary single-bucket mode: it
+    writes no topology stamp object and still serves presigned redirects — the
+    old single-bucket guarantees survive the move off the singular flag."""
+    server_gen = _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        extra_env={"PYPIRON_ARTIFACT_DELIVERY": "redirect"},
     )
-    env.pop("PYPIRON_BUCKETS", None)
-    env["PYPIRON_S3_BUCKET"] = bucket
-    rc, out, err = run_returncode([str(pypiron_bin), "origin", "release", pkg], env=env, timeout=30)
-    assert rc == 0, f"singular env was rejected:\n{out}\n{err}"
-    assert f"storage backend s3 · {bucket}" in err
-    assert _claim_owner(minio_two, bucket, pkg) == "unclaimed"
+    server = next(server_gen)
+    try:
+        bucket = minio["bucket"]
+        pkg = "singlebucket"
+        wheel = make_wheel(pkg, "1.0", tmp_path)
+        upload_legacy(server["legacy"], wheel, username=server["user"], password=server["password"])
+        wait_for_file_in_index(server["simple"], pkg, wheel.name)
+
+        # Single-bucket S3 still signs artifact GETs (302 to a presigned URL).
+        code, _, headers = http_get_no_redirect(f"{server['base_url']}/files/{pkg}/{wheel.name}")
+        assert code == 302, f"expected a presigned redirect, got {code}"
+        assert "X-Amz-Signature" in headers["location"], "single-bucket URL must be presigned"
+
+        # No topology stamp: single-bucket mode never stamps a topology identity.
+        assert not minio_key_exists_in(minio, bucket, "_topology/stamp.json"), (
+            "single-bucket mode must not write a topology stamp"
+        )
+    finally:
+        server_gen.close()
 
 
 def test_reserved_prefix_blocks_proxy_during_origin_only_divergence(

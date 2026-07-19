@@ -56,7 +56,7 @@ def test_serve_help_lists_serve_flags(pypiron_bin: Path):
     cp = _run(pypiron_bin, "serve", "--help")
     assert cp.returncode == 0
     out = cp.stdout + cp.stderr
-    for flag in ("--bind-addr", "--storage", "--admin-user", "--proxy-upstream"):
+    for flag in ("--bind-addr", "--buckets", "--admin-user", "--proxy-upstream"):
         assert flag in out, f"`serve --help` missing {flag!r}:\n{out}"
 
 
@@ -66,7 +66,7 @@ def test_serve_help_lists_serve_flags(pypiron_bin: Path):
 
 def test_verify_index_converged_exits_0(pypiron_bin: Path, tmp_path: Path):
     """An empty (or already-consistent) store has nothing to diverge."""
-    cp = _run(pypiron_bin, "verify-index", "--storage", "disk", "--data-dir", str(tmp_path))
+    cp = _run(pypiron_bin, "verify-index", "--data-dir", str(tmp_path))
     assert cp.returncode == 0, cp.stdout + cp.stderr
 
 
@@ -80,7 +80,7 @@ def test_verify_index_diverged_exits_1(pypiron_bin: Path, tmp_path: Path):
     orphan.parent.mkdir(parents=True)
     orphan.write_text("<!DOCTYPE html><html><body></body></html>")
 
-    cp = _run(pypiron_bin, "verify-index", "--storage", "disk", "--data-dir", str(tmp_path))
+    cp = _run(pypiron_bin, "verify-index", "--data-dir", str(tmp_path))
     assert cp.returncode == 1, f"expected diverged exit 1:\n{cp.stdout}{cp.stderr}"
     assert "orphan-view" in cp.stdout, cp.stdout
     # The expected outcome must not masquerade as a tool error on stderr.
@@ -98,10 +98,10 @@ def test_config_init_prints_annotated_template(pypiron_bin: Path):
     out = cp.stdout
     for header in ("[serve]", "[mirror]", "[sync]"):
         assert header in out, f"template missing {header!r}:\n{out}"
-    for key in ("bind-addr", "storage", "proxy-upstream", "include-packages", "to"):
+    for key in ("bind-addr", "buckets", "proxy-upstream", "include-packages", "to"):
         assert f"# {key} = " in out, f"template missing commented `{key}`:\n{out}"
     # Nothing is uncommented, so the emitted file is a no-op until edited.
-    assert "\nstorage = " not in out, "template should ship storage commented out"
+    assert "\nbuckets = " not in out, "template should ship buckets commented out"
 
 
 def test_config_init_output_loads_as_config(pypiron_bin: Path, tmp_path: Path):
@@ -117,8 +117,6 @@ def test_config_init_output_loads_as_config(pypiron_bin: Path, tmp_path: Path):
         "verify-index",
         "--config",
         str(cfg),
-        "--storage",
-        "disk",
         "--data-dir",
         str(store),
     )
@@ -143,9 +141,9 @@ def test_serve_rejects_out_of_range_counter_knob(pypiron_bin: Path, tmp_path: Pa
 
 
 def test_verify_index_could_not_run_exits_2(pypiron_bin: Path):
-    """An unworkable config (s3 with no bucket) is an operational failure, not a
-    divergence — exit 2 keeps it distinct from a real diff."""
-    cp = _run(pypiron_bin, "verify-index", "--storage", "s3")
+    """An unworkable config (a bucket URI with no scheme) is an operational
+    failure, not a divergence — exit 2 keeps it distinct from a real diff."""
+    cp = _run(pypiron_bin, "verify-index", "--buckets", "not-a-uri")
     assert cp.returncode == 2, f"expected could-not-run exit 2:\n{cp.stdout}{cp.stderr}"
     assert "Error:" in cp.stderr, cp.stderr
 

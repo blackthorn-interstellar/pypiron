@@ -68,10 +68,19 @@ PYPIRON_BUCKETS=s3://iron-east@us-east-1,gs://iron-eu
   first-class configuration. Order is the only preference signal.
 - A **one-entry** `--buckets` list is equivalent to configuring that one backend
   directly; the failover machinery stays dormant when there is only one handle
-  (`BucketSet::is_multi()` is false).
-- Single-bucket mode via `--storage` + `--s3-bucket` / `--gcs-bucket` /
-  `--azure-container` is unchanged. `--s3-bucket` selects one S3 bucket and is
-  distinct from the multi-cloud `--buckets` list.
+  (`BucketSet::is_multi()` is false). `--buckets` is the only storage-selection
+  surface — no `--storage`, no per-backend name flags. Absent, storage is disk at
+  `--data-dir`.
+- Backend-wide flags (`--s3-endpoint-url`, `--s3-force-path-style`,
+  `--gcs-service-account-path`, `--gcs-endpoint-url`, `--azure-account`,
+  `--azure-access-key`, `--azure-endpoint-url`, `--azure-use-emulator`) set one
+  default for every bucket of that backend. When one endpoint or credential set
+  is not enough, a `[serve.bucket."scheme://name"]` table in `pypiron.toml`
+  overrides `endpoint-url`, `force-path-style` (s3), `env-prefix` (s3/azure
+  scoped secrets), `service-account-path` (gcs), or `account` (azure) for one
+  bucket. Secrets stay in env — `env-prefix` only names them. TOML-only by design;
+  no indexed env namespace. Full contract:
+  [docs/reference/configuration.md](../docs/reference/configuration.md#per-bucket-overrides).
 - Buckets are **same-trust infrastructure**. A hostile bucket is out of scope:
   whoever writes your buckets owns your index, list of one or list of five.
 
@@ -323,7 +332,14 @@ put-if-absent / put-if-match.
   standard AWS chain, GCS uses a service-account key or Application Default
   Credentials, Azure uses its account key. A bucket whose backend is
   half-configured fails startup closed. Every URI is parsed up front, so one bad
-  entry fails before any bucket is contacted.
+  entry fails before any bucket is contacted. Two buckets of one backend needing
+  distinct credentials or endpoints (two AWS accounts, AWS + MinIO) take a
+  per-bucket `[serve.bucket."..."]` table: `env-prefix` names each bucket's scoped
+  secret env vars (`<P>AWS_ACCESS_KEY_ID`/`<P>AWS_SECRET_ACCESS_KEY`/optional
+  `<P>AWS_SESSION_TOKEN` for S3, `<P>AZURE_ACCESS_KEY` for Azure), applied on top
+  of the native chain so an explicit scoped key wins. Every override is validated
+  at startup before any bucket I/O — unknown-bucket key, wrong-scheme field, and
+  half-set `env-prefix` credentials each refuse to start.
 - **Backend-neutral error classification.** Availability vs. alarm
   classification is derived from the `object_store` error, not from S3-specific
   types, so failover and fail-closed behavior are identical across clouds.

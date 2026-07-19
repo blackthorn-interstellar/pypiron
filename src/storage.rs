@@ -1,8 +1,9 @@
 use anyhow::{anyhow, bail, Context as _, Result};
 use async_trait::async_trait;
 use axum::body::Body;
-use clap::{Args as ClapArgs, ValueEnum};
+use clap::Args as ClapArgs;
 use http::{header, Response, StatusCode};
+use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +17,7 @@ use tokio_util::io::ReaderStream;
 // Cloud object-store deps: S3, GCS, and Azure Blob behind one API. Disk is a
 // separate, dependency-free backend; everything remote shares one impl.
 use futures::StreamExt as _;
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, S3CopyIfNotExists};
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3CopyIfNotExists};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::client::ClientConfigKey;
 use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
@@ -24,10 +25,11 @@ use object_store::path::Path as OsPath;
 use object_store::signer::Signer;
 use object_store::{
     Attribute, Attributes, Error as OsError, GetOptions, GetRange, ObjectStore, ObjectStoreExt,
-    PutMode, PutMultipartOptions, PutOptions, PutPayload, RetryConfig, UpdateVersion,
-    WriteMultipart,
+    PutMode, PutMultipartOptions, PutOptions, PutPayload, RetryConfig, StaticCredentialProvider,
+    UpdateVersion, WriteMultipart,
 };
 
+use crate::config::BucketOverride;
 use crate::range::{parse_range, RangeSpec};
 
 /// In a failover topology one blackholed request must return in bounded time so
@@ -95,23 +97,10 @@ fn bound_azure_transport(builder: MicrosoftAzureBuilder) -> MicrosoftAzureBuilde
         .with_retry(failover_retry_config())
 }
 
-/// Storage backend selection.
-#[derive(Copy, Clone, Debug, ValueEnum)]
-pub enum StorageBackend {
-    Disk,
-    S3,
-    Gcs,
-    Azure,
-}
-
-/// Storage configuration shared by `serve` and `sync` — one binary, one
-/// storage layer, no second implementation.
+/// Storage configuration for `serve` and the maintenance commands — one binary,
+/// one storage layer, no second implementation. (`sync` never embeds this.)
 #[derive(ClapArgs, Debug, Clone)]
 pub struct StorageArgs {
-    /// Storage backend to use: "disk", "s3", "gcs", or "azure"
-    #[arg(long, env = "PYPIRON_STORAGE", value_enum, default_value_t = StorageBackend::Disk)]
-    pub storage: StorageBackend,
-
     /// Root data directory for disk storage (defaults to $HOME/.pypiron/packages)
     #[arg(long, env = "PYPIRON_DATA_DIR")]
     pub data_dir: Option<String>,
@@ -121,18 +110,13 @@ pub struct StorageArgs {
     #[arg(long, env = "PYPIRON_STORAGE_PREFIX")]
     pub storage_prefix: Option<String>,
 
-    /// A single S3 bucket for package storage. Supplying this selects S3, so
-    /// `--storage s3` is optional. For replication and failover across several
-    /// buckets — of any backend — use `--buckets` instead.
-    #[arg(long = "s3-bucket", env = "PYPIRON_S3_BUCKET")]
-    pub s3_bucket: Option<String>,
-
-    /// Multi-bucket replication and failover across a list of buckets, any mix
-    /// of backends. Comma-separated URIs, scheme required: `s3://name[@region]`,
-    /// `gs://name[@region]`, or `az://container[@region]`. The optional
-    /// `@region` labels the bucket's region (and selects the S3 signing region).
-    /// Order is preference — the first bucket is preferred. A single-entry list
-    /// is equivalent to configuring that one backend directly.
+    /// Object storage: one or more bucket URIs, any mix of backends. Scheme
+    /// required: `s3://name[@region]`, `gs://name[@region]`, or
+    /// `az://container[@region]`, comma-separated. The optional `@region` labels
+    /// the bucket's region (and selects the S3 signing region). Order is
+    /// preference — the first bucket is preferred. A single entry is ordinary
+    /// single-bucket mode; several enable replication and failover. Unset means
+    /// disk at `--data-dir`.
     #[arg(
         long = "buckets",
         env = "PYPIRON_BUCKETS",
@@ -141,11 +125,7 @@ pub struct StorageArgs {
     )]
     pub buckets: Vec<String>,
 
-    /// AWS region (e.g., us-east-1)
-    #[arg(long, env = "AWS_REGION")]
-    pub aws_region: Option<String>,
-
-    /// S3 endpoint URL (for S3-compatible services)
+    /// S3 endpoint URL (for S3-compatible services); applies to every s3:// bucket
     #[arg(long, env = "PYPIRON_S3_ENDPOINT_URL")]
     pub s3_endpoint_url: Option<String>,
 
@@ -153,11 +133,7 @@ pub struct StorageArgs {
     #[arg(long, env = "PYPIRON_S3_FORCE_PATH_STYLE")]
     pub s3_force_path_style: bool,
 
-    // --- Google Cloud Storage (--storage gcs) ---
-    /// GCS bucket name for package storage (required if --storage gcs)
-    #[arg(long, env = "PYPIRON_GCS_BUCKET")]
-    pub gcs_bucket: Option<String>,
-
+    // --- Google Cloud Storage (gs:// buckets) ---
     /// Path to a GCS service-account JSON key. Without it, Application Default
     /// Credentials are used — but presigned URLs are then unavailable.
     #[arg(long, env = "PYPIRON_GCS_SERVICE_ACCOUNT_PATH")]
@@ -167,14 +143,10 @@ pub struct StorageArgs {
     #[arg(long, env = "PYPIRON_GCS_ENDPOINT_URL")]
     pub gcs_endpoint_url: Option<String>,
 
-    // --- Azure Blob Storage (--storage azure) ---
-    /// Azure storage account name (required if --storage azure)
+    // --- Azure Blob Storage (az:// buckets) ---
+    /// Azure storage account name
     #[arg(long, env = "PYPIRON_AZURE_ACCOUNT")]
     pub azure_account: Option<String>,
-
-    /// Azure blob container for package storage (required if --storage azure)
-    #[arg(long, env = "PYPIRON_AZURE_CONTAINER")]
-    pub azure_container: Option<String>,
 
     /// Azure storage account access key. Enables presigned (SAS) URLs.
     #[arg(long, env = "PYPIRON_AZURE_ACCESS_KEY")]
@@ -187,6 +159,13 @@ pub struct StorageArgs {
     /// Use the Azurite storage emulator (well-known dev account and key)
     #[arg(long, env = "PYPIRON_AZURE_USE_EMULATOR")]
     pub azure_use_emulator: bool,
+
+    /// Per-bucket overrides from `[serve.bucket."scheme://name"]` in
+    /// pypiron.toml, keyed by the raw TOML URI. TOML-only by design — not a CLI
+    /// arg — so `clap(skip)`; `merge_storage_file` populates it from the same
+    /// `[serve]` table serve and the maintenance commands already read.
+    #[clap(skip)]
+    pub overrides: HashMap<String, BucketOverride>,
 }
 
 /// One parsed `--buckets` entry: a backend, a bucket/container name, and an
@@ -274,19 +253,119 @@ impl StorageArgs {
         self.buckets.iter().map(|e| parse_bucket_uri(e)).collect()
     }
 
-    pub(crate) fn has_s3_bucket(&self) -> bool {
-        self.s3_bucket.as_deref().is_some_and(|b| !b.is_empty())
+    /// Fail startup when a `[serve.bucket."..."]` key names a bucket outside the
+    /// configured `--buckets` list — typo protection, listing the valid
+    /// identities. Serve-only by design: `buckets migrate` deliberately reaches
+    /// a bucket being *removed* from the list (via
+    /// [`build_one_by_identity`](Self::build_one_by_identity)), so its override
+    /// must not be rejected there.
+    pub(crate) fn validate_override_keys(&self) -> Result<()> {
+        if self.overrides.is_empty() {
+            return Ok(());
+        }
+        let valid: Vec<String> = self
+            .bucket_specs()?
+            .iter()
+            .map(BucketSpec::identity)
+            .collect();
+        // Identity strips `@region`, so two distinct TOML keys (e.g.
+        // "s3://cache" and "s3://cache@us-west-2") can collapse to one bucket.
+        // `override_for` returns the first HashMap match, so a collision would
+        // apply one of two contradictory tables non-deterministically across
+        // restarts — silently picking an endpoint or credential set by hash
+        // order. Reject it at startup, naming both keys, so the config is
+        // fail-closed rather than order-dependent.
+        let mut seen: HashMap<String, &str> = HashMap::new();
+        for key in self.overrides.keys() {
+            let id = parse_bucket_uri(key)
+                .with_context(|| format!("per-bucket override key '{key}'"))?
+                .identity();
+            if !valid.contains(&id) {
+                bail!(
+                    "per-bucket override key '{key}' names bucket '{id}', which is not in the \
+                     configured bucket list. Valid buckets: {}",
+                    valid.join(", ")
+                );
+            }
+            if let Some(prev) = seen.insert(id.clone(), key) {
+                bail!(
+                    "per-bucket override keys '{prev}' and '{key}' both resolve to bucket '{id}' \
+                     (the '@region' suffix is not part of a bucket's identity); declare each \
+                     bucket's override exactly once"
+                );
+            }
+        }
+        Ok(())
     }
 
-    /// The single-bucket backend, when no `--buckets` list is configured. A lone
-    /// `--s3-bucket` is itself an unambiguous S3 selection, so `--storage s3` is
-    /// optional in that case; GCS and Azure require their explicit `--storage`.
-    fn effective_backend(&self) -> StorageBackend {
-        if matches!(self.storage, StorageBackend::Disk) && self.has_s3_bucket() {
-            StorageBackend::S3
-        } else {
-            self.storage
+    /// A `--data-dir` alongside `--buckets` is a benign default (the Dockerfile
+    /// ships `PYPIRON_DATA_DIR=/data`), not a second source of truth: the buckets
+    /// win and disk is unused. Warn rather than fail (fail-closed rule 5d).
+    pub(crate) fn warn_if_data_dir_ignored(&self) {
+        if !self.buckets.is_empty() && self.data_dir.is_some() {
+            tracing::warn!(
+                "--data-dir is set but ignored because --buckets selects object storage; \
+                 disk is used only when no buckets are configured"
+            );
         }
+    }
+
+    /// The per-bucket override for `spec`, matched by identity (`scheme://name`,
+    /// `@region` excluded) so a key written with or without a region resolves to
+    /// the same bucket. Validates the matched override's fields against the
+    /// bucket's scheme and its `env-prefix` credentials before returning it, so a
+    /// misconfigured override fails before any bucket I/O.
+    fn override_for(&self, spec: &BucketSpec) -> Result<Option<&BucketOverride>> {
+        let want = spec.identity();
+        for (key, ov) in &self.overrides {
+            let key_id = parse_bucket_uri(key)
+                .with_context(|| format!("per-bucket override key '{key}'"))?
+                .identity();
+            if key_id == want {
+                self.validate_override(spec, ov)?;
+                return Ok(Some(ov));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Fail-closed field validation for one matched override: reject a field that
+    /// does not apply to the bucket's scheme (rule 5c) and require `env-prefix`
+    /// credentials to be whole (rule 5b), naming the offending bucket.
+    fn validate_override(&self, spec: &BucketSpec, ov: &BucketOverride) -> Result<()> {
+        let id = spec.identity();
+        match spec.scheme {
+            BucketScheme::S3 => {
+                if ov.service_account_path.is_some() {
+                    bail!("per-bucket override for '{id}' sets 'service-account-path', which applies only to gs:// buckets");
+                }
+                if ov.account.is_some() {
+                    bail!("per-bucket override for '{id}' sets 'account', which applies only to az:// buckets");
+                }
+                validate_env_prefix_s3(&id, ov.env_prefix.as_deref())?;
+            }
+            BucketScheme::Gcs => {
+                if ov.force_path_style.is_some() {
+                    bail!("per-bucket override for '{id}' sets 'force-path-style', which applies only to s3:// buckets");
+                }
+                if ov.env_prefix.is_some() {
+                    bail!("per-bucket override for '{id}' sets 'env-prefix', which applies only to s3:// and az:// buckets; a gs:// bucket's credentials are a key file — use 'service-account-path'");
+                }
+                if ov.account.is_some() {
+                    bail!("per-bucket override for '{id}' sets 'account', which applies only to az:// buckets");
+                }
+            }
+            BucketScheme::Azure => {
+                if ov.force_path_style.is_some() {
+                    bail!("per-bucket override for '{id}' sets 'force-path-style', which applies only to s3:// buckets");
+                }
+                if ov.service_account_path.is_some() {
+                    bail!("per-bucket override for '{id}' sets 'service-account-path', which applies only to gs:// buckets");
+                }
+                validate_env_prefix_azure(&id, ov.env_prefix.as_deref())?;
+            }
+        }
+        Ok(())
     }
 
     /// The node's default (preferred) storage handle — bucket 0. Preserves the
@@ -318,25 +397,19 @@ impl StorageArgs {
 
     /// Identity of each configured bucket, in the same order and count as
     /// [`build_all`](Self::build_all), for topology stamping and logs. A
-    /// `--buckets` list contributes its scheme-qualified identity (`s3://name`,
-    /// `gs://name`, `az://name`) so a backend mismatch can never hash the same;
-    /// single-bucket mode the one backend's bare name (its topology is dormant).
-    /// The identity never includes the `@region`.
+    /// `--buckets` list contributes each bucket's scheme-qualified identity
+    /// (`s3://name`, `gs://name`, `az://name`) so a backend mismatch can never
+    /// hash the same; with no list, the single disk data directory. The identity
+    /// never includes the `@region`.
     pub fn bucket_names(&self) -> Vec<String> {
-        if !self.buckets.is_empty() {
-            // `build_all` parses first and fails on a bad URI, so by the time
-            // this is zipped against the handles the list is already valid.
-            return self
-                .bucket_specs()
-                .map(|specs| specs.iter().map(BucketSpec::identity).collect())
-                .unwrap_or_default();
+        if self.buckets.is_empty() {
+            return vec![self.resolved_data_dir()];
         }
-        match self.effective_backend() {
-            StorageBackend::Disk => vec![self.resolved_data_dir()],
-            StorageBackend::S3 => vec![self.s3_bucket.clone().unwrap_or_default()],
-            StorageBackend::Gcs => vec![self.gcs_bucket.clone().unwrap_or_default()],
-            StorageBackend::Azure => vec![self.azure_container.clone().unwrap_or_default()],
-        }
+        // `build_all` parses first and fails on a bad URI, so by the time this is
+        // zipped against the handles the list is already valid.
+        self.bucket_specs()
+            .map(|specs| specs.iter().map(BucketSpec::identity).collect())
+            .unwrap_or_default()
     }
 
     /// The disk data directory actually used, applying the default.
@@ -358,21 +431,10 @@ impl StorageArgs {
 
     /// Short, human-friendly description for the startup banner.
     pub fn describe(&self) -> String {
-        let where_ = if !self.buckets.is_empty() {
-            format!("multi-bucket · {}", self.buckets.join(", "))
+        let where_ = if self.buckets.is_empty() {
+            format!("disk · {}", self.resolved_data_dir())
         } else {
-            match self.effective_backend() {
-                StorageBackend::Disk => format!("disk · {}", self.resolved_data_dir()),
-                StorageBackend::S3 => {
-                    format!("s3 · {}", self.s3_bucket.as_deref().unwrap_or("?"))
-                }
-                StorageBackend::Gcs => {
-                    format!("gcs · {}", self.gcs_bucket.as_deref().unwrap_or("?"))
-                }
-                StorageBackend::Azure => {
-                    format!("azure · {}", self.azure_container.as_deref().unwrap_or("?"))
-                }
-            }
+            format!("buckets · {}", self.buckets.join(", "))
         };
         match &self.storage_prefix {
             Some(p) => format!("{where_} · prefix {p}"),
@@ -382,63 +444,41 @@ impl StorageArgs {
 
     async fn build_backends(&self) -> Result<Vec<Arc<dyn Storage>>> {
         let prefix = self.resolved_prefix()?;
-        // A `--buckets` list is the multi-cloud path: parse every URI up front so
-        // one bad entry fails startup before any bucket is contacted, then build
-        // each with its backend's native builder. A single-entry list collapses
-        // to ordinary single-bucket mode on that backend (failover machinery
-        // stays dormant when there is only one handle).
-        if !self.buckets.is_empty() {
-            let specs = self.bucket_specs()?;
-            let failover = specs.len() > 1;
-            let mut handles = Vec::with_capacity(specs.len());
-            for spec in &specs {
-                handles.push(match spec.scheme {
-                    BucketScheme::S3 => {
-                        self.build_one_s3(&spec.name, spec.region.as_deref(), &prefix, failover)
-                            .await?
-                    }
-                    BucketScheme::Gcs => self.build_one_gcs(&spec.name, &prefix, failover).await?,
-                    BucketScheme::Azure => {
-                        self.build_one_azure(&spec.name, &prefix, failover).await?
-                    }
-                });
+        // No `--buckets` list is the disk default. Disk has no key namespace to
+        // share, so the prefix is simply a subdirectory of the data dir — same
+        // tree, one level down.
+        if self.buckets.is_empty() {
+            let mut root = PathBuf::from(self.resolved_data_dir());
+            if let Some(ref p) = prefix {
+                root.push(p);
             }
-            return Ok(handles);
+            return Ok(vec![Arc::new(DiskStorage::new(root))]);
         }
-        match self.effective_backend() {
-            StorageBackend::Disk => {
-                // Disk has no key namespace to share, so the prefix is simply a
-                // subdirectory of the data dir — same tree, one level down.
-                let mut root = PathBuf::from(self.resolved_data_dir());
-                if let Some(ref p) = prefix {
-                    root.push(p);
+        // A `--buckets` list is object storage: parse every URI up front so one
+        // bad entry fails startup before any bucket is contacted, then build each
+        // with its backend's native builder. A single-entry list is ordinary
+        // single-bucket mode (failover machinery stays dormant with one handle).
+        let specs = self.bucket_specs()?;
+        let failover = specs.len() > 1;
+        let mut handles = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            let ov = self.override_for(spec)?;
+            handles.push(match spec.scheme {
+                BucketScheme::S3 => {
+                    self.build_one_s3(&spec.name, spec.region.as_deref(), &prefix, failover, ov)
+                        .await?
                 }
-                Ok(vec![Arc::new(DiskStorage::new(root))])
-            }
-            StorageBackend::S3 => {
-                let bucket = self
-                    .s3_bucket
-                    .as_deref()
-                    .filter(|b| !b.is_empty())
-                    .ok_or_else(|| anyhow!("--s3-bucket is required when using --storage s3"))?;
-                Ok(vec![self.build_one_s3(bucket, None, &prefix, false).await?])
-            }
-            StorageBackend::Gcs => {
-                let bucket = self
-                    .gcs_bucket
-                    .clone()
-                    .ok_or_else(|| anyhow!("--gcs-bucket is required when using --storage gcs"))?;
-                Ok(vec![self.build_one_gcs(&bucket, &prefix, false).await?])
-            }
-            StorageBackend::Azure => {
-                let container = self.azure_container.clone().ok_or_else(|| {
-                    anyhow!("--azure-container is required when using --storage azure")
-                })?;
-                Ok(vec![
-                    self.build_one_azure(&container, &prefix, false).await?,
-                ])
-            }
+                BucketScheme::Gcs => {
+                    self.build_one_gcs(&spec.name, &prefix, failover, ov)
+                        .await?
+                }
+                BucketScheme::Azure => {
+                    self.build_one_azure(&spec.name, &prefix, failover, ov)
+                        .await?
+                }
+            });
         }
+        Ok(handles)
     }
 
     /// Build one S3-backed [`Storage`]. Credentials come from the standard AWS
@@ -456,13 +496,14 @@ impl StorageArgs {
     pub async fn build_one_by_identity(&self, identity: &str) -> Result<Arc<dyn Storage>> {
         let prefix = self.resolved_prefix()?;
         let spec = parse_bucket_uri(identity)?;
+        let ov = self.override_for(&spec)?;
         match spec.scheme {
             BucketScheme::S3 => {
-                self.build_one_s3(&spec.name, spec.region.as_deref(), &prefix, true)
+                self.build_one_s3(&spec.name, spec.region.as_deref(), &prefix, true, ov)
                     .await
             }
-            BucketScheme::Gcs => self.build_one_gcs(&spec.name, &prefix, true).await,
-            BucketScheme::Azure => self.build_one_azure(&spec.name, &prefix, true).await,
+            BucketScheme::Gcs => self.build_one_gcs(&spec.name, &prefix, true, ov).await,
+            BucketScheme::Azure => self.build_one_azure(&spec.name, &prefix, true, ov).await,
         }
     }
 
@@ -472,6 +513,7 @@ impl StorageArgs {
         region: Option<&str>,
         prefix: &Option<String>,
         failover: bool,
+        ov: Option<&BucketOverride>,
     ) -> Result<Arc<dyn Storage>> {
         if bucket.is_empty() {
             bail!("empty S3 bucket name");
@@ -484,23 +526,61 @@ impl StorageArgs {
         } else {
             base
         };
-        // Region precedence: per-bucket `@region` suffix, then the shared
-        // --aws-region, then the object-store builder's own default.
-        if let Some(r) = region.or(self.aws_region.as_deref()) {
+        // Region precedence: the per-bucket `@region` suffix, else the builder's
+        // own default (which `from_env()` seeds from ambient AWS_REGION /
+        // AWS_DEFAULT_REGION).
+        if let Some(r) = region {
             b = b.with_region(r.to_string());
         }
-        if let Some(ref url) = self.s3_endpoint_url {
+        // Endpoint and addressing: from_env → backend-wide flag → per-bucket
+        // override (the override wins).
+        let endpoint = ov
+            .and_then(|o| o.endpoint_url.clone())
+            .or_else(|| self.s3_endpoint_url.clone());
+        let force_path_style = ov
+            .and_then(|o| o.force_path_style)
+            .unwrap_or(self.s3_force_path_style);
+        if let Some(ref url) = endpoint {
             b = b.with_endpoint(url.clone());
             if url.starts_with("http://") {
                 b = b.with_allow_http(true);
             }
         }
-        if self.s3_force_path_style {
+        if force_path_style {
             b = b.with_virtual_hosted_style_request(false);
-        } else if self.s3_endpoint_url.is_none() {
+        } else if endpoint.is_none() {
             // Real AWS prefers virtual-hosted-style addressing; custom endpoints
             // (MinIO et al.) keep the path-style default.
             b = b.with_virtual_hosted_style_request(true);
+        }
+        // Per-bucket scoped credentials via env-prefix. Explicit `with_*` beats
+        // `from_env()`, so this bucket authenticates with its own keys while the
+        // rest fall through to the ambient AWS chain. Presence was validated at
+        // startup (rule 5b); the pattern-match is a fail-closed backstop.
+        if let Some(env_prefix) = ov
+            .and_then(|o| o.env_prefix.as_deref())
+            .filter(|p| !p.is_empty())
+        {
+            if let (Some(id), Some(secret)) = (
+                env_nonempty(&format!("{env_prefix}AWS_ACCESS_KEY_ID")),
+                env_nonempty(&format!("{env_prefix}AWS_SECRET_ACCESS_KEY")),
+            ) {
+                // Install the scoped credential as an explicit provider rather
+                // than via `with_access_key_id`/`with_secret_access_key`: those
+                // leave the builder's `token` seeded by `from_env()` from the
+                // ambient AWS_SESSION_TOKEN, so a bucket authenticated with a
+                // second account's permanent IAM keys would be signed with the
+                // host role's session token and rejected (InvalidToken). A
+                // StaticCredentialProvider carries exactly the scoped token —
+                // the prefixed AWS_SESSION_TOKEN if set, otherwise none — and
+                // nothing ambient leaks in.
+                let token = env_nonempty(&format!("{env_prefix}AWS_SESSION_TOKEN"));
+                b = b.with_credentials(Arc::new(StaticCredentialProvider::new(AwsCredential {
+                    key_id: id,
+                    secret_key: secret,
+                    token,
+                })));
+            }
         }
         let s3 = Arc::new(
             b.build()
@@ -526,6 +606,7 @@ impl StorageArgs {
         bucket: &str,
         prefix: &Option<String>,
         failover: bool,
+        ov: Option<&BucketOverride>,
     ) -> Result<Arc<dyn Storage>> {
         if bucket.is_empty() {
             bail!("empty GCS bucket name");
@@ -537,14 +618,22 @@ impl StorageArgs {
             base
         };
         let mut can_sign = false;
-        if let Some(ref p) = self.gcs_service_account_path {
-            b = b.with_service_account_path(p.clone());
+        // Service-account key: per-bucket override wins over the backend-wide
+        // flag. A per-bucket key enables presigning for this bucket alone.
+        let sa_path = ov
+            .and_then(|o| o.service_account_path.clone())
+            .or_else(|| self.gcs_service_account_path.clone());
+        if let Some(p) = sa_path {
+            b = b.with_service_account_path(p);
             can_sign = true;
         }
-        if let Some(ref url) = self.gcs_endpoint_url {
+        let endpoint = ov
+            .and_then(|o| o.endpoint_url.clone())
+            .or_else(|| self.gcs_endpoint_url.clone());
+        if let Some(url) = endpoint {
             // Emulator (fake-gcs-server): point at it and skip signing.
             b = b
-                .with_config(GoogleConfigKey::BaseUrl, url.clone())
+                .with_config(GoogleConfigKey::BaseUrl, url)
                 .with_config(GoogleConfigKey::SkipSignature, "true");
             can_sign = false;
         }
@@ -571,6 +660,7 @@ impl StorageArgs {
         container: &str,
         prefix: &Option<String>,
         failover: bool,
+        ov: Option<&BucketOverride>,
     ) -> Result<Arc<dyn Storage>> {
         if container.is_empty() {
             bail!("empty Azure container name");
@@ -582,18 +672,36 @@ impl StorageArgs {
             base
         };
         let mut can_sign = false;
-        if let Some(ref a) = self.azure_account {
-            b = b.with_account(a.clone());
+        // Account: per-bucket override wins over the backend-wide flag.
+        let account = ov
+            .and_then(|o| o.account.clone())
+            .or_else(|| self.azure_account.clone());
+        if let Some(a) = account {
+            b = b.with_account(a);
         }
         if let Some(ref k) = self.azure_access_key {
             b = b.with_access_key(k.clone());
             can_sign = true;
         }
+        // Per-bucket scoped key via env-prefix (explicit beats from_env and the
+        // backend-wide key). Presence validated at startup (rule 5b).
+        if let Some(env_prefix) = ov
+            .and_then(|o| o.env_prefix.as_deref())
+            .filter(|p| !p.is_empty())
+        {
+            if let Some(key) = env_nonempty(&format!("{env_prefix}AZURE_ACCESS_KEY")) {
+                b = b.with_access_key(key);
+                can_sign = true;
+            }
+        }
         if self.azure_use_emulator {
             b = b.with_use_emulator(true);
             can_sign = true;
         }
-        if let Some(ref url) = self.azure_endpoint_url {
+        let endpoint = ov
+            .and_then(|o| o.endpoint_url.clone())
+            .or_else(|| self.azure_endpoint_url.clone());
+        if let Some(url) = endpoint {
             b = b.with_endpoint(url.clone());
             if url.starts_with("http://") {
                 b = b.with_allow_http(true);
@@ -612,6 +720,56 @@ impl StorageArgs {
             "azure",
         )))
     }
+}
+
+/// An environment variable's value, treating empty as unset — an empty
+/// `PYPIRON`/`AWS`/`AZURE` var is a common container footgun (`value: ""`), and
+/// a scoped credential must fail closed on it, not silently read blank.
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// Require both halves of an S3 `env-prefix` credential to be present (rule 5b):
+/// one half is unusable and none-at-all means scoped creds were promised but not
+/// delivered. Names the bucket and the exact env vars so the fix is obvious.
+fn validate_env_prefix_s3(id: &str, prefix: Option<&str>) -> Result<()> {
+    let Some(prefix) = prefix.filter(|p| !p.is_empty()) else {
+        return Ok(());
+    };
+    let key_id = env_nonempty(&format!("{prefix}AWS_ACCESS_KEY_ID"));
+    let secret = env_nonempty(&format!("{prefix}AWS_SECRET_ACCESS_KEY"));
+    match (key_id.is_some(), secret.is_some()) {
+        (true, true) => Ok(()),
+        (false, false) => bail!(
+            "per-bucket override for '{id}' sets env-prefix '{prefix}' but neither \
+             {prefix}AWS_ACCESS_KEY_ID nor {prefix}AWS_SECRET_ACCESS_KEY is set; scoped \
+             credentials were promised but none were delivered"
+        ),
+        (true, false) => bail!(
+            "per-bucket override for '{id}' sets env-prefix '{prefix}' but \
+             {prefix}AWS_SECRET_ACCESS_KEY is empty/unset"
+        ),
+        (false, true) => bail!(
+            "per-bucket override for '{id}' sets env-prefix '{prefix}' but \
+             {prefix}AWS_ACCESS_KEY_ID is empty/unset"
+        ),
+    }
+}
+
+/// Require an Azure `env-prefix` credential to be present (rule 5b): a set
+/// prefix with no `<P>AZURE_ACCESS_KEY` promised scoped creds and delivered none.
+fn validate_env_prefix_azure(id: &str, prefix: Option<&str>) -> Result<()> {
+    let Some(prefix) = prefix.filter(|p| !p.is_empty()) else {
+        return Ok(());
+    };
+    if env_nonempty(&format!("{prefix}AZURE_ACCESS_KEY")).is_none() {
+        bail!(
+            "per-bucket override for '{id}' sets env-prefix '{prefix}' but \
+             {prefix}AZURE_ACCESS_KEY is empty/unset; scoped credentials were promised \
+             but none were delivered"
+        );
+    }
+    Ok(())
 }
 
 /// The crash-injection write threshold from the environment, if set (chaos tests).
@@ -2172,25 +2330,136 @@ impl Storage for FaultInjectStorage {
 mod tests {
     use super::*;
 
-    fn storage_args(storage: StorageBackend) -> StorageArgs {
+    fn storage_args() -> StorageArgs {
         StorageArgs {
-            storage,
             data_dir: None,
             storage_prefix: None,
-            s3_bucket: None,
             buckets: Vec::new(),
-            aws_region: None,
             s3_endpoint_url: None,
             s3_force_path_style: false,
-            gcs_bucket: None,
             gcs_service_account_path: None,
             gcs_endpoint_url: None,
             azure_account: None,
-            azure_container: None,
             azure_access_key: None,
             azure_endpoint_url: None,
             azure_use_emulator: false,
+            overrides: HashMap::new(),
         }
+    }
+
+    fn args_with(buckets: &[&str], overrides: &[(&str, BucketOverride)]) -> StorageArgs {
+        let mut a = storage_args();
+        a.buckets = buckets.iter().map(|s| s.to_string()).collect();
+        a.overrides = overrides
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        a
+    }
+
+    #[test]
+    fn override_key_outside_the_bucket_list_is_rejected() {
+        let args = args_with(
+            &["s3://real"],
+            &[(
+                "s3://typo",
+                BucketOverride {
+                    endpoint_url: Some("http://x".into()),
+                    ..Default::default()
+                },
+            )],
+        );
+        let err = args.validate_override_keys().unwrap_err().to_string();
+        assert!(err.contains("s3://typo"), "{err}");
+        assert!(err.contains("s3://real"), "{err}");
+    }
+
+    #[test]
+    fn two_override_keys_for_one_bucket_are_rejected() {
+        // "s3://cache" and "s3://cache@us-west-2" collapse to one identity;
+        // accepting both would let `override_for` pick a table by hash order.
+        let args = args_with(
+            &["s3://cache"],
+            &[
+                (
+                    "s3://cache",
+                    BucketOverride {
+                        endpoint_url: Some("http://a".into()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "s3://cache@us-west-2",
+                    BucketOverride {
+                        endpoint_url: Some("http://b".into()),
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+        let err = args.validate_override_keys().unwrap_err().to_string();
+        assert!(err.contains("s3://cache"), "{err}");
+        assert!(err.contains("both resolve to bucket"), "{err}");
+    }
+
+    #[test]
+    fn override_key_matches_bucket_ignoring_region() {
+        // A key carrying @region resolves to the same identity as the plain URI.
+        let args = args_with(
+            &["s3://cache@us-west-2"],
+            &[(
+                "s3://cache",
+                BucketOverride {
+                    endpoint_url: Some("http://minio:9000".into()),
+                    ..Default::default()
+                },
+            )],
+        );
+        args.validate_override_keys()
+            .expect("region is not identity");
+        let spec = parse_bucket_uri("s3://cache@us-west-2").unwrap();
+        let ov = args
+            .override_for(&spec)
+            .unwrap()
+            .expect("resolved by identity");
+        assert_eq!(ov.endpoint_url.as_deref(), Some("http://minio:9000"));
+    }
+
+    #[test]
+    fn wrong_scheme_override_field_is_rejected() {
+        // `account` is Azure-only; on an s3:// bucket it must fail closed.
+        let args = args_with(
+            &["s3://b"],
+            &[(
+                "s3://b",
+                BucketOverride {
+                    account: Some("acct".into()),
+                    ..Default::default()
+                },
+            )],
+        );
+        let spec = parse_bucket_uri("s3://b").unwrap();
+        let err = args.override_for(&spec).unwrap_err().to_string();
+        assert!(err.contains("account"), "{err}");
+        assert!(err.contains("s3://b"), "{err}");
+    }
+
+    #[test]
+    fn env_prefix_on_gcs_is_rejected() {
+        let args = args_with(
+            &["gs://g"],
+            &[(
+                "gs://g",
+                BucketOverride {
+                    env_prefix: Some("P_".into()),
+                    ..Default::default()
+                },
+            )],
+        );
+        let spec = parse_bucket_uri("gs://g").unwrap();
+        let err = args.override_for(&spec).unwrap_err().to_string();
+        assert!(err.contains("env-prefix"), "{err}");
+        assert!(err.contains("service-account-path"), "{err}");
     }
 
     #[test]
@@ -2223,13 +2492,11 @@ mod tests {
     }
 
     #[test]
-    fn lone_s3_bucket_selects_s3_without_a_buckets_list() {
-        let mut args = storage_args(StorageBackend::Disk);
-        assert!(!args.has_s3_bucket());
-        args.s3_bucket = Some("packages".to_string());
-        assert!(args.has_s3_bucket());
-        assert!(matches!(args.effective_backend(), StorageBackend::S3));
-        assert_eq!(args.bucket_names(), ["packages"]);
+    fn no_buckets_is_disk_at_the_data_dir() {
+        let mut args = storage_args();
+        args.data_dir = Some("/data".to_string());
+        assert_eq!(args.bucket_names(), ["/data"]);
+        assert_eq!(args.describe(), "disk · /data");
     }
 
     #[test]
@@ -2288,7 +2555,7 @@ mod tests {
 
     #[test]
     fn bucket_names_come_from_the_parsed_uri_list() {
-        let mut args = storage_args(StorageBackend::Disk);
+        let mut args = storage_args();
         args.buckets = vec![
             "s3://iron-east@us-east-1".to_string(),
             "gs://iron-backup".to_string(),
@@ -2302,7 +2569,7 @@ mod tests {
 
     #[test]
     fn same_name_across_backends_is_a_distinct_identity() {
-        let mut args = storage_args(StorageBackend::Disk);
+        let mut args = storage_args();
         args.buckets = vec!["s3://shared".to_string(), "gs://shared".to_string()];
         // A legal mixed list: same name, different backend. The scheme-qualified
         // identities differ, so nothing downstream mistakes them for a duplicate.

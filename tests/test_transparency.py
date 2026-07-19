@@ -45,11 +45,11 @@ def _cli(bin_path: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 def _verify_chain(bin_path: Path, data_dir: Path) -> subprocess.CompletedProcess:
-    return _cli(bin_path, "verify-chain", "--storage", "disk", "--data-dir", str(data_dir))
+    return _cli(bin_path, "verify-chain", "--data-dir", str(data_dir))
 
 
 def _rebuild_index(bin_path: Path, data_dir: Path) -> subprocess.CompletedProcess:
-    return _cli(bin_path, "rebuild-index", "--storage", "disk", "--data-dir", str(data_dir))
+    return _cli(bin_path, "rebuild-index", "--data-dir", str(data_dir))
 
 
 def _chain_links(data_dir: Path) -> list[Path]:

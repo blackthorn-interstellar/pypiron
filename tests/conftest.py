@@ -943,6 +943,54 @@ def minio_three(_minio_container: Dict) -> Iterator[Dict]:
     yield from _minio_buckets(_minio_container, 3, "m3")
 
 
+@pytest.fixture(scope="session")
+def _minio_container_alt() -> Iterator[Dict]:
+    """A second MinIO container with DIFFERENT root credentials, for the
+    per-bucket-credentials tests: a bucket here is reachable only with these
+    keys, so the ambient AWS_* creds (which belong to the primary container)
+    cannot sign for it. Narrowly scoped — only test_bucket_overrides.py requests
+    it — so only that file pays for the extra container."""
+    if not cmd_exists("docker"):
+        pytest.skip("docker is required for S3/MinIO integration tests; not found on PATH")
+
+    name = f"pypiron-minio-alt-{uuid.uuid4().hex[:12]}"
+    try:
+        run_checked(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                name,
+                "-p",
+                "127.0.0.1::9000",
+                "-e",
+                "MINIO_ROOT_USER=altadmin",
+                "-e",
+                "MINIO_ROOT_PASSWORD=altsecret123",
+                "minio/minio",
+                "server",
+                "/data",
+            ]
+        )
+        s3_port = _docker_published_port(name, "9000/tcp")
+        wait_http_ok(f"http://127.0.0.1:{s3_port}/minio/health/ready", timeout=60.0)
+        yield {
+            "endpoint": f"http://127.0.0.1:{s3_port}",
+            "access_key": "altadmin",
+            "secret_key": "altsecret123",
+        }
+    finally:
+        run_returncode(["docker", "rm", "-f", name])
+
+
+@pytest.fixture()
+def minio_alt(_minio_container_alt: Dict) -> Iterator[Dict]:
+    """One fresh uuid-named bucket on the second (different-credentials) MinIO
+    container."""
+    yield from _minio_buckets(_minio_container_alt, 1, "alt")
+
+
 class BucketFaults:
     """Thread-safe bucket-specific availability faults for the S3 proxy."""
 
@@ -1695,17 +1743,15 @@ def s3_buckets_uri(*names: str) -> str:
 
 
 def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
-    # A multi-bucket fixture carries a `buckets` list, driven through the
-    # multi-cloud PYPIRON_BUCKETS URI list; a single-bucket one carries `bucket`
-    # and takes the singular PYPIRON_S3_BUCKET (ordinary single-bucket mode).
+    # Both single- and multi-bucket fixtures go through the one `--buckets` knob:
+    # a `buckets` list becomes the multi-bucket topology, a single `bucket` a
+    # one-entry `s3://name` list (ordinary single-bucket mode). Region rides on
+    # the ambient AWS_REGION knob.
     env = os.environ.copy()
-    if minio.get("buckets"):
-        env["PYPIRON_BUCKETS"] = s3_buckets_uri(*minio["buckets"])
-    else:
-        env["PYPIRON_S3_BUCKET"] = minio["bucket"]
+    names = minio.get("buckets") or [minio["bucket"]]
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(*names)
     env.update(
         {
-            "PYPIRON_STORAGE": "s3",
             "AWS_REGION": minio.get("region") or "us-east-1",
             "PYPIRON_BIND_ADDR": bind,
             "PYPIRON_WORKER_INTERVAL_SECS": "1",
@@ -1988,9 +2034,19 @@ def minio_remove_bucket(minio: Dict, bucket: str) -> None:
 
 
 def minio_make_bucket(minio: Dict, bucket: str) -> None:
-    """(Re)create a bucket (simulates a destination coming back)."""
-    code, resp = _s3_signed(minio, "PUT", f"/{bucket}")
-    assert code in (200, 409), f"make bucket {bucket} -> {code}: {resp[:200]!r}"
+    """(Re)create a bucket (simulates a destination coming back).
+
+    Retries on 503 XMinioServerNotInitialized: a bucket PUT issued right after
+    the container starts can race MinIO's own init and lose."""
+    deadline = time.time() + 30.0
+    while True:
+        code, resp = _s3_signed(minio, "PUT", f"/{bucket}")
+        if code in (200, 409):
+            return
+        assert code == 503 and time.time() < deadline, (
+            f"make bucket {bucket} -> {code}: {resp[:200]!r}"
+        )
+        time.sleep(0.5)
 
 
 @pytest.fixture()
@@ -2112,8 +2168,7 @@ def gcs_server(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     env = _cloud_creds_env(bind)
     env.update(
         {
-            "PYPIRON_STORAGE": "gcs",
-            "PYPIRON_GCS_BUCKET": gcs["bucket"],
+            "PYPIRON_BUCKETS": f"gs://{gcs['bucket']}",
             "PYPIRON_STORAGE_PREFIX": prefix,
         }
     )
@@ -2235,9 +2290,8 @@ def azure_server(tmp_path_factory, pypiron_bin: Path, azure: Dict) -> Iterator[D
     env = _cloud_creds_env(bind)
     env.update(
         {
-            "PYPIRON_STORAGE": "azure",
+            "PYPIRON_BUCKETS": f"az://{azure['container']}",
             "PYPIRON_AZURE_ACCOUNT": azure["account"],
-            "PYPIRON_AZURE_CONTAINER": azure["container"],
             "PYPIRON_AZURE_ACCESS_KEY": azure["key"],
             "PYPIRON_AZURE_ENDPOINT_URL": azure["endpoint"],
         }
@@ -2366,9 +2420,8 @@ def _mixed_env(mixed: Dict, bind: str) -> Dict[str, str]:
             "AWS_REGION": "us-east-1",
             "AWS_ACCESS_KEY_ID": s3["access_key"],
             "AWS_SECRET_ACCESS_KEY": s3["secret_key"],
-            # Azure (Azurite).
+            # Azure (Azurite); the container comes from the az:// bucket URI.
             "PYPIRON_AZURE_ACCOUNT": az["account"],
-            "PYPIRON_AZURE_CONTAINER": az["container"],
             "PYPIRON_AZURE_ACCESS_KEY": az["key"],
             "PYPIRON_AZURE_ENDPOINT_URL": az["endpoint"],
             "RUST_LOG": "info,pypiron=debug",

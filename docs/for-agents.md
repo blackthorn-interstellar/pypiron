@@ -207,7 +207,7 @@ An unreserved endorsement of what it is, not a claim that it is everything:
 | Metrics | `GET /metrics` (Prometheus) |
 | Audit | `GET /audit` — org-wide advisory report (admin) |
 | Config | every `--flag` ⇔ `PYPIRON_FLAG`; `pypiron config init` prints an annotated TOML |
-| Storage | `--storage disk\|s3\|gcs\|azure`; multi-bucket, multi-cloud bucket lists; `--storage-prefix` roots all keys |
+| Storage | disk by default; `--buckets s3://…,gs://…,az://…` for object storage, one entry or a multi-cloud list; `--storage-prefix` roots all keys |
 | Logs | `--log-format json`, one object per line |
 | Version | `pypiron --version` → `X.Y.Z (git-hash)` |
 | Integrity | `pypiron verify-index` — exit 0 converged / 1 diverged / 2 error; `pypiron verify-chain` for the audit history |

@@ -25,9 +25,7 @@ private-prefix = "acme"
 
 [serve]
 bind-addr = "0.0.0.0:8080"
-storage = "s3"
-s3-bucket = "acme-pypiron"
-aws-region = "us-east-1"
+buckets = ["s3://acme-pypiron@us-east-1"]
 proxy-upstream = "https://pypi.org"
 
 [mirror]
@@ -52,14 +50,133 @@ files, but env is cleaner: `PYPIRON_SYNC_ADMIN_PASS`.
 
 ## Storage
 
-`disk` is the default. Use object storage for multiple nodes. Buckets and
-containers must already exist.
+Disk is the default — no configuration, artifacts under `~/.pypiron/packages`.
+Point `--buckets` at object storage for more than one node, or to keep the store
+off the box. Buckets must already exist.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `--storage disk\|s3\|gcs\|azure` | `PYPIRON_STORAGE` | `disk` | Storage backend. |
-| `--data-dir PATH` | `PYPIRON_DATA_DIR` | `~/.pypiron/packages` | Disk root. |
+| `--buckets URI,...` | `PYPIRON_BUCKETS` | none (disk) | One or more bucket URIs, any mix of backends, in preference order. Unset means disk. |
+| `--data-dir PATH` | `PYPIRON_DATA_DIR` | `~/.pypiron/packages` | Disk root. Ignored when `--buckets` is set. |
 | `--storage-prefix PREFIX` | `PYPIRON_STORAGE_PREFIX` | none | Keep everything under one subtree, so pypiron can share a bucket. |
+
+`--buckets` is the one knob that picks where artifacts live. One entry is
+single-bucket mode; several enable replication and failover — see [Multiple
+regions and clouds](#multiple-regions-and-clouds).
+
+### One bucket
+
+```
+pypiron serve --buckets s3://acme-pypiron
+```
+
+That is the whole setup. Credentials come from the backend's native chain — for
+S3 the standard AWS chain (env vars, web identity, instance role, task role) — so
+there is nothing else to set. `PYPIRON_BUCKETS=s3://acme-pypiron` and the file
+form are equivalent:
+
+```toml
+[serve]
+buckets = ["s3://acme-pypiron"]
+```
+
+A single-entry list behaves exactly like a directly configured backend: no
+topology, health, or replication machinery runs.
+
+Every URI carries a scheme, and may carry an `@region`:
+
+- `s3://name` or `s3://name@region` — S3 bucket.
+- `gs://name` or `gs://name@region` — GCS bucket.
+- `az://container` or `az://container@region` — Azure blob container.
+
+`@region` labels the bucket's region. On S3 it also selects the signing and
+endpoint region (otherwise the ambient `AWS_REGION` / `AWS_DEFAULT_REGION`, then
+the SDK default). In a multi-bucket fleet the label also steers in-region reads.
+
+### Credentials by backend
+
+Each backend resolves its own native credentials. A bucket whose backend is
+half-configured refuses to start.
+
+- **S3** — the standard AWS chain: env vars, web identity, instance role, task
+  role.
+- **GCS** — a service-account key (`--gcs-service-account-path`) enables
+  presigned redirects; without one, Application Default Credentials are used and
+  downloads stream through the node.
+- **Azure** — the account access key (`--azure-access-key`) enables presigned
+  (SAS) redirects.
+
+### Backend-wide settings
+
+These apply to every bucket of their backend — the common case of one endpoint or
+one account:
+
+| Flag | Env | Default | Meaning |
+| --- | --- | --- | --- |
+| `--s3-endpoint-url URL` | `PYPIRON_S3_ENDPOINT_URL` | none | S3-compatible endpoint (MinIO et al.); every `s3://` bucket. |
+| `--s3-force-path-style` | `PYPIRON_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing; every `s3://` bucket. |
+| `--gcs-service-account-path PATH` | `PYPIRON_GCS_SERVICE_ACCOUNT_PATH` | none | GCS service-account JSON key. Enables presigned redirects. |
+| `--gcs-endpoint-url URL` | `PYPIRON_GCS_ENDPOINT_URL` | none | GCS local emulator or custom endpoint. |
+| `--azure-account NAME` | `PYPIRON_AZURE_ACCOUNT` | none | Azure storage account. |
+| `--azure-access-key KEY` | `PYPIRON_AZURE_ACCESS_KEY` | none | Azure account key; enables signed (SAS) URLs. CLI/env only, never in the file. |
+| `--azure-endpoint-url URL` | `PYPIRON_AZURE_ENDPOINT_URL` | none | Azurite or custom endpoint. |
+| `--azure-use-emulator` | `PYPIRON_AZURE_USE_EMULATOR` | `false` | Use Azurite defaults. |
+
+When one endpoint or one account is not enough — two S3 accounts, AWS plus MinIO,
+two Azure accounts in one list — override per bucket instead.
+
+### Per-bucket overrides
+
+For the rare fleet where buckets need different endpoints or credentials, give a
+bucket its own `[serve.bucket."URI"]` table in `pypiron.toml`. TOML only — there
+is no CLI or env form.
+
+```toml
+[serve]
+buckets = ["s3://iron-east@us-east-1", "s3://minio-cache"]
+
+[serve.bucket."s3://minio-cache"]
+endpoint-url = "http://minio.internal:9000"
+force-path-style = true
+env-prefix = "MINIO_CACHE_"   # reads MINIO_CACHE_AWS_ACCESS_KEY_ID / ..._AWS_SECRET_ACCESS_KEY
+```
+
+The table is keyed by the bucket's URI, matched on `scheme://name` — any `@region`
+is ignored, so `"s3://minio-cache"` and `"s3://minio-cache@us-west-2"` name the
+same bucket. Fields are scheme-specific:
+
+| Field | Schemes | Meaning |
+| --- | --- | --- |
+| `endpoint-url` | any | Endpoint for this bucket, overriding the backend-wide flag. An `http://` value allows plaintext. |
+| `force-path-style` | s3 | Path-style addressing for this bucket. |
+| `env-prefix` | s3, azure | Names the env vars holding this bucket's credentials (below). |
+| `service-account-path` | gcs | Service-account JSON key for this bucket. Also enables presigned redirects for it. |
+| `account` | azure | Storage account for this bucket. |
+
+Secrets never live in the file. `env-prefix` names *where* the credentials are,
+and pypiron reads them from the environment:
+
+- **S3** — `<PREFIX>AWS_ACCESS_KEY_ID`, `<PREFIX>AWS_SECRET_ACCESS_KEY`, and
+  optional `<PREFIX>AWS_SESSION_TOKEN`.
+- **Azure** — `<PREFIX>AZURE_ACCESS_KEY`.
+- **GCS** has no `env-prefix`: its credential is a key file, so use
+  `service-account-path` instead.
+
+Everything is validated at startup, before any bucket is touched:
+
+- An override keyed to a bucket not in `--buckets` fails, listing the valid
+  buckets (typo protection).
+- An `env-prefix` with only one credential half set — or neither — fails: scoped
+  credentials were promised and none delivered.
+- A field used on the wrong scheme fails, naming the field and bucket.
+
+### What is per-bucket, what is backend-wide
+
+- **Per-bucket:** the URI and its `@region`, plus every `[serve.bucket."..."]`
+  field — endpoint, path style, credentials, account, service-account key.
+- **Backend-wide:** the `--s3-*`, `--gcs-*`, and `--azure-*` flags and the ambient
+  credential chains. They set the default for every bucket of that backend; a
+  per-bucket table overrides them for one bucket.
 
 ### Sharing a bucket
 
@@ -69,26 +186,14 @@ in `simple/`. Set `--storage-prefix pypi` and they move to `pypi/packages/` and
 reads nor writes outside its prefix. Two servers can share one bucket by taking
 different prefixes.
 
-On disk the prefix is simply a subdirectory of `--data-dir`.
+On disk the prefix is a subdirectory of `--data-dir`.
 
 Point an existing server at a prefix and it will look empty: the prefix is part
 of every key, so it is chosen once, when the bucket is first populated. To adopt
 one later, move the objects (`aws s3 mv --recursive`, `gcloud storage mv`) before
 restarting.
 
-### S3
-
-| Flag | Env | Default | Meaning |
-| --- | --- | --- | --- |
-| `--s3-bucket NAME` | `PYPIRON_S3_BUCKET` | required | One S3 bucket. For several buckets (any backend) use `--buckets` — see [Multiple regions and clouds](#multiple-regions-and-clouds). |
-| `--aws-region REGION` | `AWS_REGION` | none | AWS region for a bucket without its own `@region`. |
-| `--s3-endpoint-url URL` | `PYPIRON_S3_ENDPOINT_URL` | none | MinIO or another S3-compatible endpoint. |
-| `--s3-force-path-style` | `PYPIRON_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing. |
-
-AWS credentials use the standard AWS chain: env, web identity, instance role, or
-task role.
-
-#### Multiple regions and clouds
+### Multiple regions and clouds
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
@@ -118,10 +223,10 @@ while writes still fan out everywhere (see
 [Reads stay in their region](../guides/multi-region.md#reads-stay-in-their-region)).
 The label is part of the shared list, so it is identical on every node and does
 not affect a bucket's identity or the fleet's bucket order. On S3 it additionally
-selects the client's signing and endpoint region (SigV4 plus regional
-endpoints); precedence there is per-bucket `@region`, then `--aws-region`, then
-the SDK default. GCS and Azure endpoints do not encode a region, so on those
-backends the label steers reads only.
+selects the client's signing and endpoint region; precedence there is per-bucket
+`@region`, then the ambient `AWS_REGION` / `AWS_DEFAULT_REGION`, then the SDK
+default. GCS and Azure endpoints do not encode a region, so on those backends the
+label steers reads only.
 
 Mix backends freely. `s3://iron-east@us-east-1,gs://iron-backup` replicates
 across two clouds and survives an entire provider outage. Each backend resolves
@@ -131,9 +236,7 @@ whose backend is half-configured refuses to start. One bad URI fails startup
 before any bucket is contacted.
 
 A single-entry `--buckets` list behaves exactly like configuring that one backend
-directly — no topology, health, replication, or read-fence work runs. The
-single-bucket flags (`--s3-bucket`, `--gcs-bucket`, `--azure-container`) and the
-`pypiron.toml` `s3-bucket` key are unchanged; use `--buckets` only for a list.
+directly — no topology, health, replication, or read-fence work runs.
 
 In multi-bucket mode SDK retries are disabled and one-second topology probes
 switch new requests and cancel background work on an ineligible bucket, without
@@ -147,27 +250,6 @@ across buckets is unavailable, so do not apply a broad `packages/` lifecycle rul
 
 See [Survive a region or cloud outage](../guides/multi-region.md) for deployment,
 recovery behavior, and operator rules.
-
-### GCS
-
-| Flag | Env | Default | Meaning |
-| --- | --- | --- | --- |
-| `--gcs-bucket NAME` | `PYPIRON_GCS_BUCKET` | required | Bucket. |
-| `--gcs-service-account-path PATH` | `PYPIRON_GCS_SERVICE_ACCOUNT_PATH` | none | Service-account JSON key. |
-| `--gcs-endpoint-url URL` | `PYPIRON_GCS_ENDPOINT_URL` | none | Local emulator or custom endpoint. |
-
-Without a service-account key, GCS uses Application Default Credentials and
-downloads stream through the node.
-
-### Azure
-
-| Flag | Env | Default | Meaning |
-| --- | --- | --- | --- |
-| `--azure-account NAME` | `PYPIRON_AZURE_ACCOUNT` | required | Storage account. |
-| `--azure-container NAME` | `PYPIRON_AZURE_CONTAINER` | required | Blob container. |
-| `--azure-access-key KEY` | `PYPIRON_AZURE_ACCESS_KEY` | none | Account key, also used for signed URLs. |
-| `--azure-endpoint-url URL` | `PYPIRON_AZURE_ENDPOINT_URL` | none | Azurite or custom endpoint. |
-| `--azure-use-emulator` | `PYPIRON_AZURE_USE_EMULATOR` | `false` | Use Azurite defaults. |
 
 ## Server
 

@@ -2491,6 +2491,43 @@ async fn project_version_page(
     render_project(&state, &headers, &raw, Some(&version)).await
 }
 
+/// Whether any of `filenames` could be an artifact of `requested` — the
+/// filename-only evidence the project page rules on before it pays for a full
+/// metadata scan.
+///
+/// Deliberately permissive, because it may only *reject*: the authoritative
+/// version is the sidecar's, and a filename carries the PEP 427-escaped form of
+/// it (or, for a legacy binary format, none at all). So a filename whose version
+/// can't be inferred forces the scan, and the comparison folds both sides so an
+/// escaped `1.0_1` still matches its metadata version `1.0-1`. A wrong "could
+/// exist" costs one scan that then 404s on the real version list; a wrong "could
+/// not" would hide a hosted release, so the doubt always resolves to the scan.
+fn version_may_exist(filenames: &[String], requested: &str) -> bool {
+    let wanted = fold_version(requested);
+    filenames
+        .iter()
+        .any(|filename| match infer_version_from_filename(filename) {
+            Some(found) => fold_version(&found) == wanted,
+            None => true,
+        })
+}
+
+/// Fold a version to the form a filename and its metadata share: lowercased,
+/// with every run of non-alphanumerics collapsed to one separator. Folding can
+/// only merge distinct versions, never split one — the safe direction for
+/// [`version_may_exist`].
+fn fold_version(version: &str) -> String {
+    let mut folded = String::with_capacity(version.len());
+    for ch in version.chars() {
+        if ch.is_ascii_alphanumeric() {
+            folded.push(ch.to_ascii_lowercase());
+        } else if !folded.ends_with('_') {
+            folded.push('_');
+        }
+    }
+    folded.trim_matches('_').to_string()
+}
+
 /// Shared project-page renderer. `requested_version` is `None` for the latest
 /// view; when present it's validated against the hosted versions (so an
 /// arbitrary path segment is never reflected) and pins the install snippet.
@@ -2547,6 +2584,26 @@ async fn render_project(
     // `storage` (not `pinned`, which below is the version-pinned flag) is this
     // render's captured handle (design §3), threaded to every read.
     let storage = write_pin.storage.clone();
+    // Settle "no such version" *before* the scan below, which is one LIST plus a
+    // sidecar GET per artifact file. A negative answer is never cached (each
+    // unknown version is a distinct cache key, and we don't store 404s), so
+    // without this an anonymous client cycling `/project/<popular-pkg>/<random>/`
+    // turns every request into a full package scan — request amplification /
+    // denial of wallet, defeating the page cache exactly as the forged-Host cache
+    // key did (eaa18d8). The package-prefix listing alone is one storage call
+    // whatever the package's size, and every artifact filename carries its
+    // version (PEP 427/625 — the same evidence the advisory byte gate rules on),
+    // so it settles the question for O(1) calls instead of O(files). An empty
+    // listing falls through so a missing package still answers "no such project".
+    if let Some(requested) = requested_version {
+        let filenames = match worker::list_artifact_filenames(storage.as_ref(), &pkg).await {
+            Ok(filenames) => filenames,
+            Err(e) => return read_error(e),
+        };
+        if !filenames.is_empty() && !version_may_exist(&filenames, requested) {
+            return not_found("no such version");
+        }
+    }
     let before = match require_settled_package_read(state, storage.as_ref(), &pkg).await {
         Ok(claim) => claim,
         Err(error) => return read_error(error),
@@ -6259,6 +6316,36 @@ fn project_tag(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_version_is_rejected_from_filenames_alone() {
+        let files = vec![
+            "pkg-1.0.0-py3-none-any.whl".to_string(),
+            "pkg-1.2.0.tar.gz".to_string(),
+        ];
+        assert!(version_may_exist(&files, "1.0.0"));
+        assert!(version_may_exist(&files, "1.2.0"));
+        assert!(!version_may_exist(&files, "9.9.9"));
+        assert!(!version_may_exist(&files, "../../simple"));
+    }
+
+    #[test]
+    fn a_versions_escaped_and_metadata_forms_match() {
+        // PEP 427 escapes a wheel filename's version; the sidecar keeps the
+        // metadata form, and the page links *that*. Both must resolve.
+        let files = vec!["pkg-1.0_1-py3-none-any.whl".to_string()];
+        assert!(version_may_exist(&files, "1.0-1"));
+        assert!(version_may_exist(&files, "1.0_1"));
+        assert!(!version_may_exist(&files, "1.0-2"));
+    }
+
+    #[test]
+    fn an_uninferable_filename_forces_the_full_scan() {
+        // A legacy binary format carries no parseable version, so the filename
+        // evidence is inconclusive and nothing may be rejected on it.
+        let files = vec!["pkg-1.0.macosx-10.9.egg".to_string()];
+        assert!(version_may_exist(&files, "anything"));
+    }
 
     #[tokio::test]
     async fn single_bucket_post_publish_mirror_check_is_storage_io_free() {

@@ -318,6 +318,40 @@ def test_per_version_page_pins_install_and_validates_version(disk_server, tmp_pa
     assert code == 404
 
 
+def test_unknown_version_404s_without_the_sidecar_scan(disk_server, tmp_path):
+    """An unknown version must 404 off the package listing alone. The full render
+    is one LIST plus a sidecar GET per artifact file and its negative result is
+    never cached, so a client cycling `/project/<pkg>/<random>/` would otherwise
+    force a full package scan per request (request amplification).
+
+    The scan is observable: it backfills any artifact missing its sidecar. Delete
+    one, ask for a version that does not exist, and the sidecar must still be
+    gone — proof no per-file work ran. Asking for a real version brings it back,
+    so the assertion is a real discriminator and not a broken listing."""
+    wheel = make_wheel("scanpkg", "1.0.0", tmp_path)
+    upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+    )
+    wait_for_project_in_global(disk_server["simple"], "scanpkg")
+
+    sidecar = disk_server["data_dir"] / "packages" / "scanpkg" / f"{wheel.name}.meta.json"
+    assert sidecar.exists(), "upload should have written a sidecar"
+    sidecar.unlink()
+
+    code, _, _ = http_get(f"{disk_server['base_url']}/project/scanpkg/9.9.9/")
+    assert code == 404
+    assert not sidecar.exists(), "unknown version paid for the per-file sidecar scan"
+
+    # The hosted version still renders — and does pay for the scan.
+    code, body, _ = http_get(f"{disk_server['base_url']}/project/scanpkg/1.0.0/")
+    assert code == 200
+    assert "scanpkg==1.0.0" in body.decode()
+    assert sidecar.exists(), "rendering a real version should have backfilled the sidecar"
+
+
 def test_project_page_reflects_new_upload_after_caching(disk_server, tmp_path):
     """The /project/ page is served from a RAM cache (a full package-prefix scan
     plus per-file sidecar parse per hit is too slow to repeat), but a later

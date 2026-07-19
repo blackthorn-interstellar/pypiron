@@ -35,7 +35,7 @@ declare -A CFG=(
   [proxpi]="/index/ 5000 100 4 follow"
   [devpi]="/root/pypi/+simple/ 8080 SAT 4 follow"
   [pypicloud]="/simple/ 8080 SAT 4 redirect"
-  [bandersnatch]="/simple/ 8080 SAT 64 follow"
+  [bandersnatch]="/simple/ 8080 SAT 4 follow"
 )
 
 CORES="$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$RIG_KEY" \

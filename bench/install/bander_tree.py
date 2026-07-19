@@ -18,7 +18,9 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
+import shutil
 from collections import defaultdict
 from pathlib import Path
 
@@ -41,7 +43,13 @@ def build_tree(manifest: dict, wheelhouse: Path, out: Path) -> int:
             raise FileNotFoundError(f"manifest wheel missing from wheelhouse: {src}")
         dst = packages / w["filename"]
         if not dst.exists():
-            dst.hardlink_to(src)
+            # Hardlink is the fast, space-free path; fall back to a copy when the
+            # OS refuses it (fs.protected_hardlinks on root-owned wheels, or a
+            # cross-device src). nginx serves either as an identical sendfile.
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copyfile(src, dst)
         projects[canonical(w["name"])].append(w)
 
     for proj, wheels in projects.items():

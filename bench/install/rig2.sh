@@ -186,6 +186,13 @@ cmd_serve() {  # serve <server>  -- pypiron | pypiserver | proxpi | devpi | pypi
   # — and every server gets the same treatment, which is the fairness requirement.
   local bi="/home/ec2-user/pypiron/bench/install"
   local wheels="${bi}/wheelhouse/${ARCH}/${TIER}"
+  # Every server runs --network host and binds :8080, so a container left running
+  # from a PRIOR serve squats the port: the new server's listener silently fails to
+  # bind (nginx: "Address in use") and the ramp measures the OLD server instead —
+  # e.g. a bandersnatch/pypiserver follow-mode ramp landing on a leftover pypiron/
+  # pypicloud and pulling wheel bytes from S3 (physically impossible NIC throughput).
+  # Clear every known server container first so only the requested one owns :8080.
+  ssh_to "$RIG2_SERVER_IP" "sudo docker rm -f pypiron pypiserver proxpi devpi devpi-nginx pypicloud bander-web 2>/dev/null || true"
   case "$server" in
     pypiron)
       echo "== start pypiron Track 2 (S3 + presigned redirect) on the server"

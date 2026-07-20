@@ -13,7 +13,7 @@ use crate::bucket_health::{HealthState, WorkerHealthSnapshot};
 use crate::clock::unix_now_secs;
 
 /// Route groups, by path prefix. Order matches the counter matrix.
-pub const ROUTES: [&str; 6] = ["simple", "files", "legacy", "health", "metrics", "other"];
+pub(crate) const ROUTES: [&str; 6] = ["simple", "files", "legacy", "health", "metrics", "other"];
 /// Status classes. Order matches the counter matrix.
 const STATUS_CLASSES: [&str; 4] = ["2xx", "3xx", "4xx", "5xx"];
 

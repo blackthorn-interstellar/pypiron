@@ -2052,7 +2052,7 @@ pub async fn rebuild_package_excluding(
 
 /// The outcome of rebuilding a package's derived index views (see
 /// [`rebuild_package_indexes`]).
-pub struct RebuiltPackage {
+pub(crate) struct RebuiltPackage {
     /// Whether the package still has renderable artifacts (`false` means the
     /// index views were removed).
     still_live: bool,
@@ -2067,7 +2067,7 @@ pub struct RebuiltPackage {
 /// bucket's inventory on top; the replicator (src/replicate.rs) calls this
 /// directly against a *non-selected* destination bucket, where mixing that
 /// bucket's counts into the node's inventory (or its name cache) would be wrong.
-pub async fn rebuild_package_indexes(
+pub(crate) async fn rebuild_package_indexes(
     state: &AppState,
     storage: &dyn Storage,
     pkg: &str,
@@ -2467,7 +2467,7 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
 /// only. Single-writer in P3 (one node rebuilds every warm copy), so a plain
 /// read-modify-write is safe; P4's per-bucket leaders drive each bucket's own
 /// cached CAS path instead.
-pub async fn update_global_index_uncached(
+pub(crate) async fn update_global_index_uncached(
     state: &AppState,
     storage: &dyn Storage,
     adds: &[String],

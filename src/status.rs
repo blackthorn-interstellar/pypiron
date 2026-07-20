@@ -94,7 +94,7 @@ pub struct VersionedProjectStatus {
 
 /// Deterministic, symmetric status merge result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusWinner {
+pub(crate) enum StatusWinner {
     InSync,
     Left,
     Right,
@@ -208,7 +208,7 @@ fn status_digest(status: &VersionedProjectStatus) -> [u8; 32] {
 /// produce two different events at the same epoch; the more restrictive state
 /// wins, then the lexicographically smaller canonical-record digest settles
 /// differing reasons. No bucket identity participates, so all pair orders agree.
-pub fn merge_status(
+pub(crate) fn merge_status(
     left: Option<&VersionedProjectStatus>,
     right: Option<&VersionedProjectStatus>,
 ) -> StatusWinner {

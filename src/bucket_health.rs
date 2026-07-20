@@ -140,7 +140,7 @@ pub struct SelectionChange {
 
 /// Effects for the async caller to apply after an observation or timer tick.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HealthUpdate {
+pub(crate) struct HealthUpdate {
     /// The selected *write* bucket after applying this update, changed or not.
     pub selected_index: usize,
     /// Present only when the write selection changed.
@@ -158,7 +158,7 @@ pub struct HealthUpdate {
 
 impl HealthUpdate {
     #[cfg(test)]
-    pub fn has_transition(&self) -> bool {
+    pub(crate) fn has_transition(&self) -> bool {
         self.selection_change.is_some() || !self.topology_revalidation.is_empty()
     }
 }
@@ -195,7 +195,7 @@ impl BucketStatus {
 /// after its configured failure streak. A healthy selected bucket returns to a
 /// more-preferred one only after that bucket has stayed continuously healthy for
 /// the configured duration.
-pub struct BucketHealth {
+pub(crate) struct BucketHealth {
     policy: HealthPolicy,
     buckets: Vec<BucketStatus>,
     selected: usize,
@@ -305,7 +305,7 @@ impl HealthController {
     }
 
     #[cfg(test)]
-    pub fn health_state(&self, index: usize) -> Result<HealthState, InvalidBucket> {
+    pub(crate) fn health_state(&self, index: usize) -> Result<HealthState, InvalidBucket> {
         self.validate_bucket(index)?;
         Ok(self
             .lock()

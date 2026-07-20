@@ -2141,7 +2141,7 @@ impl Storage for ObjectStorage {
 /// Normalize a user-supplied storage prefix into a bare key prefix carrying no
 /// leading, trailing, or doubled slashes — the form `ObjectStorage` prepends.
 /// Rejects traversal and empty segments so a prefix cannot escape itself.
-pub fn normalize_prefix(raw: &str) -> Result<String> {
+pub(crate) fn normalize_prefix(raw: &str) -> Result<String> {
     let p = raw.trim().trim_matches('/');
     if p.is_empty() {
         return Err(anyhow!("--storage-prefix must not be empty"));

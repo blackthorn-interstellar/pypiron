@@ -35,12 +35,12 @@ pub const FEED_KEY: &str = "_advisories/osv-pypi.zip";
 
 /// Worker-derived set of PEP 792 `quarantined` projects, persisted for the
 /// byte-gate probe (rung 5). Defined now; unused until then.
-pub const QUARANTINED_KEY: &str = "_advisories/quarantined.json";
+pub(crate) const QUARANTINED_KEY: &str = "_advisories/quarantined.json";
 
 /// Materialized org audit report: the walked inventory joined with the advisory
 /// index and 30-day download counters, rebuilt at the end of each leader audit
 /// sweep and served (admin-gated) at `/audit` and `/audit.json`.
-pub const REPORT_KEY: &str = "_advisories/report.json";
+pub(crate) const REPORT_KEY: &str = "_advisories/report.json";
 
 /// The OSV bulk export for the PyPI ecosystem — the same database `uv audit`
 /// queries live, so advisory ids shown by pypiron and by a laptop always agree.
@@ -129,7 +129,7 @@ pub struct AdvisoryDb {
 
 impl AdvisoryDb {
     /// Distinct package names carrying at least one malware-block rule.
-    pub fn block_names(&self) -> usize {
+    pub(crate) fn block_names(&self) -> usize {
         self.block.len()
     }
 
@@ -140,7 +140,7 @@ impl AdvisoryDb {
     }
 
     /// Total advisory records in the audit index.
-    pub fn audit_records(&self) -> usize {
+    pub(crate) fn audit_records(&self) -> usize {
         self.audit.values().map(Vec::len).sum()
     }
 
@@ -731,7 +731,7 @@ fn build_feed_client(url: &str) -> Result<(reqwest::Client, Arc<Guard>)> {
 
 /// A resolved feed source. Built once per process (the URL client and its SSRF
 /// guard are reused across polls); a local path holds no client.
-pub struct FeedSource {
+pub(crate) struct FeedSource {
     feed: String,
     url_client: Option<(reqwest::Client, Arc<Guard>)>,
 }

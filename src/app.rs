@@ -4077,7 +4077,7 @@ async fn yank_handler(
 /// every real change, pairs an intent/commit marker so the derived index heals,
 /// and fans a private flip out to every healthy bucket. Split out of
 /// [`yank_handler`] so a deterministic simulator can drive it without axum.
-pub async fn set_yank(
+pub(crate) async fn set_yank(
     state: &AppState,
     pinned: &buckets::Pinned,
     pkg: &str,

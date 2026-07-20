@@ -38,7 +38,7 @@ use crate::PACKAGES_PREFIX;
 
 /// Namespace for the chain. `replicate.rs` only ever touches `packages/`, so the
 /// chain is excluded from replication for free — no exclusion code needed.
-pub const CHAIN_PREFIX: &str = "_transparency/chain/";
+pub(crate) const CHAIN_PREFIX: &str = "_transparency/chain/";
 
 /// Fixed-width zero-padded seq so a lexicographic listing is numeric order.
 const SEQ_WIDTH: usize = 16;
@@ -57,7 +57,7 @@ pub fn chain_key(seq: u64) -> String {
 }
 
 /// Parse the seq out of a chain-link key, or `None` if it is not one.
-pub fn seq_from_key(key: &str) -> Option<u64> {
+pub(crate) fn seq_from_key(key: &str) -> Option<u64> {
     key.strip_prefix(CHAIN_PREFIX)?
         .strip_suffix(".json")?
         .parse()
@@ -113,7 +113,7 @@ pub fn replay<'a>(links: impl IntoIterator<Item = &'a ChainLink>) -> Delta {
 }
 
 /// One observed problem, printed as `kind\tpackage\tdetail`.
-pub struct Violation {
+pub(crate) struct Violation {
     pub kind: &'static str,
     pub package: String,
     pub detail: String,
@@ -123,7 +123,7 @@ pub struct Violation {
 /// to the previous link's exact bytes. `links` must be sorted by seq ascending;
 /// each tuple carries the on-disk bytes the sha is taken over and the link
 /// parsed from them. An empty vec means the chain is intact.
-pub fn check_integrity(links: &[(u64, Vec<u8>, ChainLink)]) -> Vec<Violation> {
+pub(crate) fn check_integrity(links: &[(u64, Vec<u8>, ChainLink)]) -> Vec<Violation> {
     let mut violations = Vec::new();
     for (i, (seq, _, link)) in links.iter().enumerate() {
         if link.seq != *seq {

@@ -205,7 +205,7 @@ impl BucketSet {
 
     /// Whether this node maintains a distinct read pin.
     #[cfg(test)]
-    pub fn read_affinity_active(&self) -> bool {
+    pub(crate) fn read_affinity_active(&self) -> bool {
         self.read_active.load(Ordering::Acquire)
     }
 
@@ -244,7 +244,7 @@ impl BucketSet {
 
     /// The topology generation this process has verified. Single-bucket mode and
     /// a multi-bucket set not yet verified return `None` without any I/O.
-    pub fn topology_generation(&self) -> Option<u64> {
+    pub(crate) fn topology_generation(&self) -> Option<u64> {
         *self
             .topology_generation
             .read()
@@ -350,7 +350,7 @@ impl BucketSet {
     /// [`verify_topology_with`](Self::verify_topology_with) with its strict error
     /// classifier. Single-bucket mode performs zero I/O.
     #[cfg(test)]
-    pub async fn verify_topology(&self) -> Result<()> {
+    pub(crate) async fn verify_topology(&self) -> Result<()> {
         self.verify_topology_with(|_, _| false).await.map(drop)
     }
 
@@ -525,7 +525,7 @@ impl BucketSet {
     /// [`verify_topology_index_with`](Self::verify_topology_index_with) once the
     /// observed-storage error classifier is available.
     #[cfg(test)]
-    pub async fn verify_topology_index(&self, index: usize) -> Result<TopologyIndexStatus> {
+    pub(crate) async fn verify_topology_index(&self, index: usize) -> Result<TopologyIndexStatus> {
         self.verify_topology_index_with(index, |_, _| false).await
     }
 
@@ -651,7 +651,7 @@ impl BucketSet {
     /// generation observed either in storage or previously verified locally.
     /// Availability alone is tolerated and reported; every other error aborts.
     #[cfg(test)]
-    pub async fn migrate_topology(&self) -> Result<TopologyReport> {
+    pub(crate) async fn migrate_topology(&self) -> Result<TopologyReport> {
         self.migrate_topology_with(|_, _| false).await
     }
 
@@ -773,7 +773,7 @@ pub const TOPOLOGY_STAMP_KEY: &str = "_topology/stamp.json";
 /// `generation` is bumped by an operator re-stamp (`buckets migrate`, a later
 /// phase) and does not participate in the hash.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TopologyStamp {
+pub(crate) struct TopologyStamp {
     pub buckets: Vec<String>,
     pub hash: String,
     pub generation: u64,
@@ -796,7 +796,7 @@ fn parse_stamp(bucket: &str, bytes: &[u8]) -> Result<TopologyStamp> {
 /// Deterministic identity of an ordered bucket list: sha256 over the names joined
 /// by a NUL byte (which no bucket name can contain), so two deployments agree iff
 /// they list the same buckets in the same order.
-pub fn topology_hash(names: &[String]) -> String {
+pub(crate) fn topology_hash(names: &[String]) -> String {
     let mut hasher = Sha256::new();
     for (i, name) in names.iter().enumerate() {
         if i > 0 {

@@ -219,7 +219,7 @@ pub async fn read_origin_observation(
 /// The content is canonical (`private`, `mirror`, or `unclaimed`) even when the
 /// stored body is nonce-bearing JSON.
 #[cfg(test)]
-pub async fn read_origin_versioned(
+pub(crate) async fn read_origin_versioned(
     storage: &dyn Storage,
     pkg: &str,
 ) -> Result<Option<(String, String)>> {
@@ -344,7 +344,7 @@ pub async fn demote_observed_mirror(
 /// state and require that this exact etag currently proves `mirror` before CAS.
 /// New code should retain and pass the [`OriginObservation`] directly.
 #[cfg(test)]
-pub async fn demote_mirror_to_private(
+pub(crate) async fn demote_mirror_to_private(
     storage: &dyn Storage,
     pkg: &str,
     expected_etag: &str,
@@ -401,7 +401,7 @@ pub(crate) async fn package_has_truth(storage: &dyn Storage, pkg: &str) -> Resul
 /// Compatibility wrapper for existing proxy callers that carry only an etag.
 /// Re-read and bind it back to its state before performing the mirror-only CAS.
 #[cfg(test)]
-pub async fn release_empty_claim(storage: &dyn Storage, pkg: &str, expected_etag: &str) {
+pub(crate) async fn release_empty_claim(storage: &dyn Storage, pkg: &str, expected_etag: &str) {
     let result = async {
         let Some(observed) = read_origin_observation(storage, pkg).await? else {
             return Ok::<(), anyhow::Error>(());
@@ -577,7 +577,7 @@ pub async fn restore_released_for_repurpose(
 }
 
 #[cfg(test)]
-pub async fn release_for_repurpose(storage: &dyn Storage, pkg: &str) -> Result<bool> {
+pub(crate) async fn release_for_repurpose(storage: &dyn Storage, pkg: &str) -> Result<bool> {
     let Some(observed) = releasable_for_repurpose(storage, pkg).await? else {
         return Ok(false);
     };

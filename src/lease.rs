@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::storage::Storage;
 
-pub const LEASE_KEY: &str = "_leader/lease.json";
+pub(crate) const LEASE_KEY: &str = "_leader/lease.json";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Lease {

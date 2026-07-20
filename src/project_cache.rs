@@ -43,7 +43,7 @@ use bytes::Bytes;
 /// Memory ceiling for cached pages. A rendered page for a many-thousand-file
 /// package is a few MB; this holds a healthy working set and, like the index
 /// cache, clears wholesale rather than growing unbounded.
-pub const PROJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const PROJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Fixed per-entry overhead charged to the ceiling so a flood of distinct keys
 /// (an attacker cycling version segments) bounds its own entry count through the

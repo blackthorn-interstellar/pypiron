@@ -261,7 +261,7 @@ pub fn decide(a: &Record, b: &Record) -> Verdict {
     }
 }
 
-pub fn conflict_winner(a: &Record, b: &Record) -> Option<Side> {
+pub(crate) fn conflict_winner(a: &Record, b: &Record) -> Option<Side> {
     let ta = a.sidecar.as_ref()?.upload_epoch_ms?;
     let tb = b.sidecar.as_ref()?.upload_epoch_ms?;
     if ta.abs_diff(tb) <= CONFLICT_SKEW_MS {

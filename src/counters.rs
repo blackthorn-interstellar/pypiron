@@ -40,7 +40,7 @@ pub const PREFIX: &str = "_counters/";
 
 /// In-memory keys past the cap fold into this catch-all so a flood of distinct
 /// (or hostile) keys can never grow a node's memory without bound.
-pub const OVERFLOW_KEY: &str = "_overflow";
+pub(crate) const OVERFLOW_KEY: &str = "_overflow";
 
 const SUMMARY_FILE: &str = "_summary.json";
 
@@ -222,7 +222,7 @@ impl Counters {
         self.record_n(metric, key, 1);
     }
 
-    pub fn record_n(&self, metric: &str, key: &str, n: u64) {
+    pub(crate) fn record_n(&self, metric: &str, key: &str, n: u64) {
         if self.store.is_none() || n == 0 {
             return;
         }

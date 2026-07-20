@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing::info;
 
-pub const DEFAULT_CONFIG_PATH: &str = "pypiron.toml";
+pub(crate) const DEFAULT_CONFIG_PATH: &str = "pypiron.toml";
 
 /// The annotated starter config printed by `pypiron config init`. Every knob is
 /// present and commented out with its default, so the file doubles as the

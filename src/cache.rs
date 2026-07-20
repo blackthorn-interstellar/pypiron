@@ -40,7 +40,7 @@ pub const INDEX_CACHE_TTL: Duration = Duration::from_secs(1);
 /// entries are pruned; if that isn't enough the cache is cleared outright —
 /// a once-per-TTL refill storm is the same cost the cache saves a thousand
 /// times over, and "bounded and dumb" beats an LRU nobody will ever tune.
-pub const INDEX_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const INDEX_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 
 /// One cacheable representation: body bytes plus the ETag identifying them.
 /// `Bytes` so responses share the buffer refcounted instead of memcpying it —

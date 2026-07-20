@@ -100,7 +100,8 @@ pub fn enable_sim(start: OffsetDateTime) -> SimClockGuard {
 
 /// Advance the global override by `d`. A no-op (never a panic) when the override
 /// is not enabled, so callers need not branch on sim state.
-pub fn sim_advance(d: std::time::Duration) {
+#[cfg(test)]
+pub(crate) fn sim_advance(d: std::time::Duration) {
     if !SIM_ENABLED.load(Ordering::Relaxed) {
         return;
     }

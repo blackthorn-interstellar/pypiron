@@ -413,11 +413,11 @@ impl Proxy {
     /// True when no scope is configured; otherwise true only if the name is on
     /// the allowlist. The version axis is enforced separately, per file, in the
     /// listing.
-    pub fn name_in_scope(&self, pkg: &str) -> bool {
+    pub(crate) fn name_in_scope(&self, pkg: &str) -> bool {
         self.scope.as_ref().is_none_or(|m| m.contains_key(pkg))
     }
 
-    pub fn name_fully_denied(&self, pkg: &str) -> bool {
+    pub(crate) fn name_fully_denied(&self, pkg: &str) -> bool {
         self.deny
             .as_ref()
             .and_then(|m| m.get(pkg))

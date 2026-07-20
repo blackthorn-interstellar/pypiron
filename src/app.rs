@@ -3138,6 +3138,81 @@ fn render_index_variant(
     result.unwrap_or_else(not_found)
 }
 
+/// Serve an artifact's PEP 658 metadata or PEP 740 provenance companion: a
+/// RAM-cached read-through with the multi-bucket fence check, then upstream
+/// passthrough when the wheel isn't cached yet. Metadata and provenance differ
+/// only in `companion` (suffix, content type, upstream fetch).
+#[allow(clippy::too_many_arguments)]
+async fn serve_companion(
+    state: &Arc<AppState>,
+    read: &Pinned,
+    write: &Pinned,
+    pkg: &str,
+    artifact_key: &str,
+    key: String,
+    filename: &str,
+    headers: &HeaderMap,
+    companion: Companion,
+) -> Response<Body> {
+    match file_visible_read_through(state, read, write, pkg, artifact_key).await {
+        Ok(true) => {}
+        Ok(false) => {
+            // Upstream passthrough is judged on the write pin: an unclaimed
+            // origin must be authoritative before any fall-through.
+            match unowned_companion_passthrough_safe(
+                state,
+                write.storage.as_ref(),
+                pkg,
+                artifact_key,
+                &key,
+            )
+            .await
+            {
+                Ok(true) => {
+                    if let Some(upstream) = proxy_companion_passthrough(
+                        state,
+                        write.storage.as_ref(),
+                        pkg,
+                        filename,
+                        companion,
+                    )
+                    .await
+                    {
+                        return upstream;
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => return read_error(error),
+            }
+            return not_found("artifact is fenced");
+        }
+        Err(error) => return read_error(error),
+    }
+    let resp = serve_index_local(
+        state,
+        read,
+        write,
+        key,
+        companion.content_type(),
+        ARTIFACT_CACHE_CONTROL,
+        headers,
+    )
+    .await;
+    // Not stored yet (wheel not cached): pass upstream companion bytes through
+    // without writing anything — a resolver probing dozens of candidate wheels
+    // must not stampede gigabytes into storage. The companion is stored when the
+    // wheel itself is downloaded.
+    if resp.status() == StatusCode::NOT_FOUND {
+        if let Some(upstream) =
+            proxy_companion_passthrough(state, write.storage.as_ref(), pkg, filename, companion)
+                .await
+        {
+            return upstream;
+        }
+    }
+    resp
+}
+
 /// --- Artifact download endpoint ------------------------------------------
 /// Serves artifacts and their PEP 658 `<filename>.metadata` companions; both
 /// are immutable. Sidecar JSON and dotfiles are not served.
@@ -3189,127 +3264,38 @@ async fn files_get(
     let dl_key = (method == Method::GET && sidecar::is_artifact(&filename))
         .then(|| format!("{pkg}/{filename}"));
 
-    // PEP 658 metadata is immutable, tiny, and hammered by resolvers (uv
-    // fetches one per candidate wheel) — serve it from the same RAM cache as
-    // the indexes instead of one storage GET per request. Range requests
-    // fall through to storage; nobody range-reads a METADATA file.
+    // PEP 658 metadata and PEP 740 provenance companions are immutable, tiny,
+    // and hammered by resolvers (uv fetches one per candidate wheel) — served
+    // from the same RAM cache as the indexes, falling through to upstream
+    // passthrough when the wheel isn't cached yet. Range requests fall through
+    // to storage; nobody range-reads a companion.
     if filename.ends_with(METADATA_SUFFIX) && headers.get(header::RANGE).is_none() {
-        match file_visible_read_through(&state, &read_pinned, &write_pinned, &pkg, &artifact_key)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                // Upstream passthrough is judged on the write pin: an unclaimed
-                // origin must be authoritative before any fall-through.
-                match unowned_companion_passthrough_safe(
-                    &state,
-                    write_pinned.storage.as_ref(),
-                    &pkg,
-                    &artifact_key,
-                    &key,
-                )
-                .await
-                {
-                    Ok(true) => {
-                        if let Some(upstream) = proxy_metadata_passthrough(
-                            &state,
-                            write_pinned.storage.as_ref(),
-                            &pkg,
-                            &filename,
-                        )
-                        .await
-                        {
-                            return upstream;
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(error) => return read_error(error),
-                }
-                return not_found("artifact is fenced");
-            }
-            Err(error) => return read_error(error),
-        }
-        let resp = serve_index_local(
+        return serve_companion(
             &state,
             &read_pinned,
             &write_pinned,
+            &pkg,
+            &artifact_key,
             key,
-            "text/plain; charset=utf-8",
-            ARTIFACT_CACHE_CONTROL,
+            &filename,
             &headers,
+            Companion::Metadata,
         )
         .await;
-        // Not stored yet (wheel not cached): pass upstream metadata through
-        // without writing anything — a resolver probing dozens of candidate
-        // wheels must not stampede gigabytes into storage. The companion is
-        // stored when the wheel itself is downloaded.
-        if resp.status() == StatusCode::NOT_FOUND {
-            if let Some(upstream) =
-                proxy_metadata_passthrough(&state, write_pinned.storage.as_ref(), &pkg, &filename)
-                    .await
-            {
-                return upstream;
-            }
-        }
-        return resp;
     }
-
-    // PEP 740 provenance companion: same RAM-cache + passthrough story as
-    // metadata, served as JSON. A mirror snapshot is point-in-time, so it is
-    // cached as immutably as the artifact it describes.
     if filename.ends_with(PROVENANCE_SUFFIX) && headers.get(header::RANGE).is_none() {
-        match file_visible_read_through(&state, &read_pinned, &write_pinned, &pkg, &artifact_key)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                match unowned_companion_passthrough_safe(
-                    &state,
-                    write_pinned.storage.as_ref(),
-                    &pkg,
-                    &artifact_key,
-                    &key,
-                )
-                .await
-                {
-                    Ok(true) => {
-                        if let Some(upstream) = proxy_provenance_passthrough(
-                            &state,
-                            write_pinned.storage.as_ref(),
-                            &pkg,
-                            &filename,
-                        )
-                        .await
-                        {
-                            return upstream;
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(error) => return read_error(error),
-                }
-                return not_found("artifact is fenced");
-            }
-            Err(error) => return read_error(error),
-        }
-        let resp = serve_index_local(
+        return serve_companion(
             &state,
             &read_pinned,
             &write_pinned,
+            &pkg,
+            &artifact_key,
             key,
-            "application/json",
-            ARTIFACT_CACHE_CONTROL,
+            &filename,
             &headers,
+            Companion::Provenance,
         )
         .await;
-        if resp.status() == StatusCode::NOT_FOUND {
-            if let Some(upstream) =
-                proxy_provenance_passthrough(&state, write_pinned.storage.as_ref(), &pkg, &filename)
-                    .await
-            {
-                return upstream;
-            }
-        }
-        return resp;
     }
 
     // On-demand mirroring: make sure the artifact is in storage before the
@@ -3651,51 +3637,39 @@ async fn proxy_ensure_artifact(
     }
 }
 
-/// Serve a PEP 658 companion straight from upstream, no storage writes.
-async fn proxy_metadata_passthrough(
-    state: &Arc<AppState>,
-    storage: &dyn Storage,
-    pkg: &str,
-    filename: &str,
-) -> Option<Response<Body>> {
-    let before = match require_settled_package_read(state, storage, pkg).await {
-        Ok(claim) => claim,
-        Err(error) => return Some(read_error(error)),
-    };
-    let proxy = match eligible_proxy(state, storage, pkg).await {
-        Some(Ok(proxy)) => proxy,
-        Some(Err(resp)) => return Some(resp),
-        None => return None,
-    };
-    let bytes = proxy.fetch_metadata(state, pkg, filename).await?;
-    let artifact_filename = filename.strip_suffix(METADATA_SUFFIX).unwrap_or(filename);
-    let artifact_key = format!("{PACKAGES_PREFIX}{pkg}/{artifact_filename}");
-    let companion_key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
-    match companion_passthrough_visible(state, storage, pkg, &artifact_key, &companion_key, &before)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return Some(not_found("artifact is fenced")),
-        Err(error) => return Some(read_error(error)),
-    }
-    Some(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .header(header::CACHE_CONTROL, ARTIFACT_CACHE_CONTROL)
-            .header(header::CONTENT_LENGTH, bytes.len())
-            .body(Body::from(bytes))
-            .unwrap_or_else(not_found),
-    )
+/// Which sidecar companion of an artifact is being served. Metadata (PEP 658)
+/// and provenance (PEP 740) follow identical fence, passthrough, and caching
+/// rules; only the suffix, upstream fetch, and content type differ.
+#[derive(Clone, Copy)]
+enum Companion {
+    Metadata,
+    Provenance,
 }
 
-/// Serve a PEP 740 provenance companion straight from upstream, no storage
-/// writes — the mirror equivalent of metadata passthrough.
-async fn proxy_provenance_passthrough(
+impl Companion {
+    fn suffix(self) -> &'static str {
+        match self {
+            Companion::Metadata => METADATA_SUFFIX,
+            Companion::Provenance => PROVENANCE_SUFFIX,
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Companion::Metadata => "text/plain; charset=utf-8",
+            Companion::Provenance => "application/json",
+        }
+    }
+}
+
+/// Serve an artifact's PEP 658 metadata or PEP 740 provenance companion straight
+/// from upstream, no storage writes.
+async fn proxy_companion_passthrough(
     state: &Arc<AppState>,
     storage: &dyn Storage,
     pkg: &str,
     filename: &str,
+    companion: Companion,
 ) -> Option<Response<Body>> {
     let before = match require_settled_package_read(state, storage, pkg).await {
         Ok(claim) => claim,
@@ -3706,8 +3680,13 @@ async fn proxy_provenance_passthrough(
         Some(Err(resp)) => return Some(resp),
         None => return None,
     };
-    let bytes = proxy.fetch_provenance(state, pkg, filename).await?;
-    let artifact_filename = filename.strip_suffix(PROVENANCE_SUFFIX).unwrap_or(filename);
+    let bytes = match companion {
+        Companion::Metadata => proxy.fetch_metadata(state, pkg, filename).await,
+        Companion::Provenance => proxy.fetch_provenance(state, pkg, filename).await,
+    }?;
+    let artifact_filename = filename
+        .strip_suffix(companion.suffix())
+        .unwrap_or(filename);
     let artifact_key = format!("{PACKAGES_PREFIX}{pkg}/{artifact_filename}");
     let companion_key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
     match companion_passthrough_visible(state, storage, pkg, &artifact_key, &companion_key, &before)
@@ -3720,7 +3699,7 @@ async fn proxy_provenance_passthrough(
     Some(
         Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_TYPE, companion.content_type())
             .header(header::CACHE_CONTROL, ARTIFACT_CACHE_CONTROL)
             .header(header::CONTENT_LENGTH, bytes.len())
             .body(Body::from(bytes))

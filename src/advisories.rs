@@ -444,6 +444,21 @@ pub fn parse_feed(zip_bytes: &[u8]) -> Result<AdvisoryDb> {
     Ok(db)
 }
 
+/// Iterate an advisory's PyPI-ecosystem affected clauses paired with their
+/// normalized package name, skipping non-PyPI ecosystems and unservable names.
+fn pypi_clauses(adv: &OsvAdvisory) -> impl Iterator<Item = (String, &OsvAffected)> {
+    adv.affected.iter().filter_map(|affected| {
+        if !affected
+            .package
+            .ecosystem
+            .eq_ignore_ascii_case(PYPI_ECOSYSTEM)
+        {
+            return None;
+        }
+        checked_osv_name(&affected.package.name).map(|name| (name, affected))
+    })
+}
+
 /// Fold one advisory into the db. Returns false (→ skip count) when the entry is
 /// withdrawn or names no PyPI package. Never rewrites the id (AC9: byte-equal).
 fn ingest_advisory(db: &mut AdvisoryDb, adv: &OsvAdvisory) -> bool {
@@ -466,17 +481,7 @@ fn ingest_advisory(db: &mut AdvisoryDb, adv: &OsvAdvisory) -> bool {
         .unwrap_or_default();
 
     let mut matched_pypi = false;
-    for affected in &adv.affected {
-        if !affected
-            .package
-            .ecosystem
-            .eq_ignore_ascii_case(PYPI_ECOSYSTEM)
-        {
-            continue;
-        }
-        let Some(name) = checked_osv_name(&affected.package.name) else {
-            continue;
-        };
+    for (name, affected) in pypi_clauses(adv) {
         matched_pypi = true;
         let scope = scope_for(affected);
         if is_malware {
@@ -594,27 +599,17 @@ fn mal_rules(adv: &OsvAdvisory) -> Vec<(String, MalRule)> {
     if adv.withdrawn.is_some() || adv.id.is_empty() || !adv.id.starts_with("MAL-") {
         return Vec::new();
     }
-    let mut rules = Vec::new();
-    for affected in &adv.affected {
-        if !affected
-            .package
-            .ecosystem
-            .eq_ignore_ascii_case(PYPI_ECOSYSTEM)
-        {
-            continue;
-        }
-        let Some(name) = checked_osv_name(&affected.package.name) else {
-            continue;
-        };
-        rules.push((
-            name,
-            MalRule {
-                id: adv.id.clone(),
-                scope: scope_for(affected),
-            },
-        ));
-    }
-    rules
+    pypi_clauses(adv)
+        .map(|(name, affected)| {
+            (
+                name,
+                MalRule {
+                    id: adv.id.clone(),
+                    scope: scope_for(affected),
+                },
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -794,8 +789,6 @@ async fn fetch_url(
     url: &str,
     if_none_match: Option<&str>,
 ) -> Result<RawFetch> {
-    use futures::StreamExt;
-
     // Route through the SSRF pre-flight (like proxy/sync): check_target runs on
     // the initial URL and re-validates every redirect Location, so an IP-literal
     // hop the DNS resolver can't see is refused rather than followed.
@@ -819,20 +812,8 @@ async fn fetch_url(
     {
         bail!("advisory feed exceeds {MAX_FEED_BYTES} bytes (Content-Length)");
     }
-    let http_etag = resp
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let mut bytes = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("reading {url}"))?;
-        if bytes.len() as u64 + chunk.len() as u64 > MAX_FEED_BYTES {
-            bail!("advisory feed exceeds {MAX_FEED_BYTES} bytes");
-        }
-        bytes.extend_from_slice(&chunk);
-    }
+    let http_etag = response_etag(&resp);
+    let bytes = read_body_capped(resp, MAX_FEED_BYTES, url).await?;
     Ok(RawFetch::Bytes { bytes, http_etag })
 }
 
@@ -862,11 +843,17 @@ async fn parse_off_thread(bytes: Arc<Vec<u8>>) -> Result<(AdvisoryDb, String)> {
     .context("advisory parse task panicked")?
 }
 
+/// Read `key`'s current storage etag (via a 1-key LIST, no body), or `None` when
+/// the key is absent.
+async fn key_storage_etag(storage: &dyn Storage, key: &str) -> Result<Option<String>> {
+    let page = storage.list_page(key, None, 1).await?;
+    Ok(page.into_iter().find(|m| m.key == key).map(|m| m.etag))
+}
+
 /// Read `FEED_KEY`'s current storage etag (via a 1-key LIST, no body), or `None`
 /// when no snapshot exists yet.
 pub async fn feed_storage_etag(storage: &dyn Storage) -> Result<Option<String>> {
-    let page = storage.list_page(FEED_KEY, None, 1).await?;
-    Ok(page.into_iter().find(|m| m.key == FEED_KEY).map(|m| m.etag))
+    key_storage_etag(storage, FEED_KEY).await
 }
 
 /// Load the persisted snapshot from storage, or `None` when the key is absent.
@@ -975,6 +962,33 @@ pub struct RefreshMemo {
     unfed_warned: bool,
 }
 
+/// Latch source reachability and log only on a state change: a first failure
+/// warns, a first recovery informs, and steady state stays silent. Returns the
+/// success payload so the caller can do cycle-specific work on `Ok`.
+fn note_source_result<T>(
+    source_failing: &mut bool,
+    result: Result<T>,
+    recovered: &str,
+    failed: &str,
+) -> Option<T> {
+    match result {
+        Ok(v) => {
+            if *source_failing {
+                info!("{recovered}");
+                *source_failing = false;
+            }
+            Some(v)
+        }
+        Err(e) => {
+            if !*source_failing {
+                warn!(error = %e, "{failed}");
+                *source_failing = true;
+            }
+            None
+        }
+    }
+}
+
 /// One advisory refresh cycle. The leader half (leader with a source feed)
 /// refetches the source and persists changed bytes verbatim; the every-node half
 /// reloads from storage when `FEED_KEY`'s etag moves. Failures keep serving the
@@ -993,20 +1007,16 @@ pub async fn refresh(
 
     if leads_source {
         if let Some(feed) = feed {
-            match poll_and_persist(&ctx, feed, memo).await {
-                Ok(()) => {
-                    if memo.source_failing {
-                        info!("advisory feed: source reachable again");
-                        memo.source_failing = false;
-                    }
-                    refreshed_ok = true;
-                }
-                Err(e) => {
-                    if !memo.source_failing {
-                        warn!(error = %e, "advisory feed: source unreachable; serving last snapshot");
-                        memo.source_failing = true;
-                    }
-                }
+            let result = poll_and_persist(&ctx, feed, memo).await;
+            if note_source_result(
+                &mut memo.source_failing,
+                result,
+                "advisory feed: source reachable again",
+                "advisory feed: source unreachable; serving last snapshot",
+            )
+            .is_some()
+            {
+                refreshed_ok = true;
             }
         }
     }
@@ -1164,11 +1174,7 @@ async fn reload(ctx: &RefreshCtx<'_>) -> Result<bool> {
 /// `QUARANTINED_KEY`'s current storage etag (a 1-key LIST, no body), or `None`
 /// when the leader has never written the set — which reads as an empty set.
 async fn quarantined_storage_etag(storage: &dyn Storage) -> Result<Option<String>> {
-    let page = storage.list_page(QUARANTINED_KEY, None, 1).await?;
-    Ok(page
-        .into_iter()
-        .find(|m| m.key == QUARANTINED_KEY)
-        .map(|m| m.etag))
+    key_storage_etag(storage, QUARANTINED_KEY).await
 }
 
 /// Parse the persisted quarantined-set JSON (a sorted string array) into a set.
@@ -1443,11 +1449,7 @@ impl ProbeSource {
         let resp = resp
             .error_for_status()
             .with_context(|| format!("fetching {url}"))?;
-        let etag = resp
-            .headers()
-            .get(reqwest::header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        let etag = response_etag(&resp);
         let bytes = read_body_capped(resp, MAX_FEED_BYTES, &url).await?;
         let is_full = (bytes.len() as u64) < end;
         Ok(Some(CsvFetch {
@@ -1481,6 +1483,14 @@ struct CsvFetch {
     text: String,
     etag: Option<String>,
     is_full: bool,
+}
+
+/// The response's `ETag` header as an owned string, if present and UTF-8.
+fn response_etag(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 /// Stream a response body into memory under a hard cap.
@@ -1530,23 +1540,17 @@ async fn walk_csv(
 /// behavior, never fail-open. `feed` is the `.../all.zip` URL; the CSV and
 /// per-advisory URLs are its siblings. Runs on every node (not leader-gated).
 pub async fn probe(ctx: RefreshCtx<'_>, feed: &str, memo: &mut ProbeMemo) {
-    match probe_once(&ctx, feed, memo).await {
-        Ok(armed) => {
-            if memo.source_failing {
-                info!("malware probe: advisory source reachable again");
-                memo.source_failing = false;
-            }
-            // Arm the age gauge only when a cycle actually ran (a snapshot exists);
-            // an idle armed-but-unfed node has nothing to age.
-            if armed {
-                ctx.metrics.malware_probe_ok();
-            }
-        }
-        Err(e) => {
-            if !memo.source_failing {
-                warn!(error = %e, "malware probe: advisory source unreachable; serving the daily baseline");
-                memo.source_failing = true;
-            }
+    let result = probe_once(&ctx, feed, memo).await;
+    if let Some(armed) = note_source_result(
+        &mut memo.source_failing,
+        result,
+        "malware probe: advisory source reachable again",
+        "malware probe: advisory source unreachable; serving the daily baseline",
+    ) {
+        // Arm the age gauge only when a cycle actually ran (a snapshot exists);
+        // an idle armed-but-unfed node has nothing to age.
+        if armed {
+            ctx.metrics.malware_probe_ok();
         }
     }
 }
@@ -1623,14 +1627,19 @@ async fn probe_once(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut ProbeMemo) -> R
     Ok(true)
 }
 
-/// Read the persisted snapshot bytes for `GET /advisories/feed`, or `None` when
-/// no snapshot exists.
-pub async fn stored_feed_bytes(storage: &dyn Storage) -> Result<Option<Vec<u8>>> {
-    match storage.get_bytes(FEED_KEY).await {
+/// Read a storage key's bytes, mapping a "not found" error to `None`.
+async fn get_optional_bytes(storage: &dyn Storage, key: &str) -> Result<Option<Vec<u8>>> {
+    match storage.get_bytes(key).await {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if storage::is_not_found(&e) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Read the persisted snapshot bytes for `GET /advisories/feed`, or `None` when
+/// no snapshot exists.
+pub async fn stored_feed_bytes(storage: &dyn Storage) -> Result<Option<Vec<u8>>> {
+    get_optional_bytes(storage, FEED_KEY).await
 }
 
 /// Persist the audit report to [`REPORT_KEY`], but only when its content changed
@@ -1655,11 +1664,7 @@ pub async fn write_report_if_changed(storage: &dyn Storage, report: &Report) -> 
 /// Read the stored audit report bytes for `/audit.json`, or `None` when no report
 /// has been materialized yet.
 pub async fn stored_report_bytes(storage: &dyn Storage) -> Result<Option<Vec<u8>>> {
-    match storage.get_bytes(REPORT_KEY).await {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if storage::is_not_found(&e) => Ok(None),
-        Err(e) => Err(e),
-    }
+    get_optional_bytes(storage, REPORT_KEY).await
 }
 
 /// Read and parse the stored audit report for the `/audit` HTML page, or `None`

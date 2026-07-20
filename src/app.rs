@@ -2050,7 +2050,7 @@ async fn legacy_upload(
 /// of [`legacy_upload`] so a deterministic simulator can exercise this state
 /// machine directly; the handler owns every HTTP concern above it.
 pub async fn publish_record(
-    state: &Arc<AppState>,
+    state: &AppState,
     pinned: &buckets::Pinned,
     req: PublishRequest,
 ) -> Result<(StatusCode, &'static str), (StatusCode, String)> {
@@ -3201,7 +3201,7 @@ fn render_index_variant(
 /// passthrough when the wheel isn't cached yet. Metadata and provenance differ
 /// only in `companion` (suffix, content type, upstream fetch).
 async fn serve_companion(
-    state: &Arc<AppState>,
+    state: &AppState,
     pins: &Pins<'_>,
     pkg: &str,
     filename: &str,
@@ -3677,7 +3677,7 @@ async fn advisory_byte_gate(
 /// was already there, or doesn't exist upstream either); `Some` is a hard
 /// failure response (storage outage, upstream verification failure).
 async fn proxy_ensure_artifact(
-    state: &Arc<AppState>,
+    state: &AppState,
     storage: &dyn Storage,
     pkg: &str,
     filename: &str,
@@ -3745,7 +3745,7 @@ impl Companion {
 /// Serve an artifact's PEP 658 metadata or PEP 740 provenance companion straight
 /// from upstream, no storage writes.
 async fn proxy_companion_passthrough(
-    state: &Arc<AppState>,
+    state: &AppState,
     storage: &dyn Storage,
     pkg: &str,
     filename: &str,
@@ -3868,7 +3868,7 @@ async fn files_delete(
 /// → replication fan-out → 204. Split out of [`files_delete`] so a deterministic
 /// simulator can drive it without axum.
 pub async fn delete_record(
-    state: &Arc<AppState>,
+    state: &AppState,
     pinned: &buckets::Pinned,
     pkg: &str,
     filename: &str,
@@ -4051,7 +4051,7 @@ async fn yank_clear(
 
 /// Yank state lives in the sidecar — it is truth, so the system can heal.
 async fn yank_handler(
-    state: &Arc<AppState>,
+    state: &AppState,
     headers: &HeaderMap,
     package: &str,
     filename: &str,
@@ -4071,7 +4071,7 @@ async fn yank_handler(
 /// and fans a private flip out to every healthy bucket. Split out of
 /// [`yank_handler`] so a deterministic simulator can drive it without axum.
 pub async fn set_yank(
-    state: &Arc<AppState>,
+    state: &AppState,
     pinned: &buckets::Pinned,
     pkg: &str,
     filename: &str,
@@ -4205,7 +4205,7 @@ async fn project_status_clear(
 /// The intent/commit pair keeps the derived index crash-safe.
 /// Callers MUST enforce admin auth first.
 async fn write_project_status(
-    state: &Arc<AppState>,
+    state: &AppState,
     package: &str,
     doc: status::ProjectStatusDoc,
 ) -> Result<StatusCode, (StatusCode, String)> {

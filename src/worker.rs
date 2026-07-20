@@ -258,7 +258,7 @@ async fn wait_until_generation_changes(state: &AppState, generation: u64) {
 
 /// Validate recovered buckets' topology and apply at most one coalesced
 /// selection change. Entirely dormant in single-bucket mode.
-async fn maintain_bucket_selection(state: &Arc<AppState>) -> bool {
+async fn maintain_bucket_selection(state: &AppState) -> bool {
     let Some(health) = &state.bucket_health else {
         return false;
     };

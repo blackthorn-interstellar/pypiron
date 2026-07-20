@@ -110,7 +110,10 @@ pub fn render_limited(md: &str) -> String {
 fn open_close(tag: &Tag) -> (String, &'static str) {
     match tag {
         Tag::Paragraph => ("<p>".into(), "</p>"),
-        Tag::Heading { level, .. } => (format!("<{}>", heading(*level)), heading_end(*level)),
+        Tag::Heading { level, .. } => {
+            let (open, close) = heading_tags(*level);
+            (format!("<{open}>"), close)
+        }
         Tag::BlockQuote(_) => ("<blockquote>".into(), "</blockquote>"),
         Tag::CodeBlock(_) => ("<pre><code>".into(), "</code></pre>"),
         Tag::List(Some(_)) => ("<ol>".into(), "</ol>"),
@@ -137,25 +140,15 @@ fn open_close(tag: &Tag) -> (String, &'static str) {
     }
 }
 
-fn heading(l: HeadingLevel) -> &'static str {
+/// The open-tag name and matching close tag for a heading level.
+fn heading_tags(l: HeadingLevel) -> (&'static str, &'static str) {
     match l {
-        HeadingLevel::H1 => "h1",
-        HeadingLevel::H2 => "h2",
-        HeadingLevel::H3 => "h3",
-        HeadingLevel::H4 => "h4",
-        HeadingLevel::H5 => "h5",
-        HeadingLevel::H6 => "h6",
-    }
-}
-
-fn heading_end(l: HeadingLevel) -> &'static str {
-    match l {
-        HeadingLevel::H1 => "</h1>",
-        HeadingLevel::H2 => "</h2>",
-        HeadingLevel::H3 => "</h3>",
-        HeadingLevel::H4 => "</h4>",
-        HeadingLevel::H5 => "</h5>",
-        HeadingLevel::H6 => "</h6>",
+        HeadingLevel::H1 => ("h1", "</h1>"),
+        HeadingLevel::H2 => ("h2", "</h2>"),
+        HeadingLevel::H3 => ("h3", "</h3>"),
+        HeadingLevel::H4 => ("h4", "</h4>"),
+        HeadingLevel::H5 => ("h5", "</h5>"),
+        HeadingLevel::H6 => ("h6", "</h6>"),
     }
 }
 

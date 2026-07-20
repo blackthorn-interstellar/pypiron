@@ -66,6 +66,18 @@ impl FileMetadata {
     }
 }
 
+/// The shared opening of a PEP 503 HTML index: `<html><head>` plus the PEP 629
+/// repository-version meta. Each caller appends its own `<title>…</head><body>`.
+fn html_head_open() -> String {
+    format!(r#"<html><head><meta name="pypi:repository-version" content="{API_VERSION}">"#)
+}
+
+/// The minimal PEP 691 body (only the api-version) used as the serialization
+/// fallback when a full index somehow fails to serialize.
+fn pep691_meta_only() -> String {
+    format!("{{\"meta\":{{\"api-version\":\"{API_VERSION}\"}}}}")
+}
+
 /// Render minimal PEP 503 per‑package HTML (with PEP 629 version meta and, for
 /// a non-active project, the PEP 792 `pypi:project-status` meta). Quarantine
 /// link-omission is the caller's job — it passes an empty `files` slice.
@@ -76,9 +88,7 @@ pub fn pep503_package_html(
 ) -> String {
     // Links are relative to the API under /files/<pkg>/<filename>
     let mut body = String::new();
-    body.push_str(&format!(
-        r#"<html><head><meta name="pypi:repository-version" content="{API_VERSION}">"#
-    ));
+    body.push_str(&html_head_open());
     // PEP 792: emit the status marker only when non-active (active MAY be, and
     // here is, omitted). `reason` is arbitrary text, so it must be escaped.
     if !status.status.is_active() {
@@ -144,9 +154,8 @@ pub fn pep503_package_html(
 /// Render minimal PEP 503 global HTML index (with PEP 629 version meta).
 pub fn pep503_global_html(packages: &[String]) -> String {
     let mut body = String::new();
-    body.push_str(&format!(
-        r#"<html><head><meta name="pypi:repository-version" content="{API_VERSION}"><title>Simple index</title></head><body>"#
-    ));
+    body.push_str(&html_head_open());
+    body.push_str(r#"<title>Simple index</title></head><body>"#);
     for p in packages {
         let p_attr = encode_double_quoted_attribute(p);
         let p_text = encode_text(p);
@@ -244,8 +253,7 @@ pub fn pep691_package_json(
         versions,
         files,
     };
-    serde_json::to_string(&doc)
-        .unwrap_or_else(|_| format!("{{\"meta\":{{\"api-version\":\"{API_VERSION}\"}}}}"))
+    serde_json::to_string(&doc).unwrap_or_else(|_| pep691_meta_only())
 }
 
 #[derive(Serialize)]
@@ -277,8 +285,7 @@ pub fn pep691_global_json(packages: &[String]) -> String {
         },
         projects,
     };
-    serde_json::to_string(&doc)
-        .unwrap_or_else(|_| format!("{{\"meta\":{{\"api-version\":\"{API_VERSION}\"}}}}"))
+    serde_json::to_string(&doc).unwrap_or_else(|_| pep691_meta_only())
 }
 
 #[cfg(test)]

@@ -367,12 +367,10 @@ impl Counters {
         // idempotent, so skip days that already have a summary (no churn).
         let have_summary: std::collections::HashSet<(&str, &str)> = keys
             .iter()
-            .filter_map(
-                |k| match k.strip_prefix(PREFIX)?.split('/').collect::<Vec<_>>()[..] {
-                    [metric, "day", day, file] if file == SUMMARY_FILE => Some((metric, day)),
-                    _ => None,
-                },
-            )
+            .filter_map(|k| match key_parts(k)?[..] {
+                [metric, "day", day, file] if file == SUMMARY_FILE => Some((metric, day)),
+                _ => None,
+            })
             .collect();
         for (metric, day, _shard) in &layout.frozen {
             if day.as_str() >= retain_cutoff.as_str()
@@ -417,12 +415,7 @@ impl Counters {
                 return; // transient: skip writing a partial summary
             };
             let seg: Segment = serde_json::from_slice(&bytes).unwrap_or_default();
-            for keys_at in seg.buckets.values() {
-                for (key, c) in keys_at {
-                    *totals.entry(key.clone()).or_insert(0) += c;
-                    total += c;
-                }
-            }
+            fold_buckets(&seg.buckets, &mut totals, &mut total);
         }
         let summary = rank_summary(totals, total);
         let key = format!("{prefix}{SUMMARY_FILE}");
@@ -551,12 +544,7 @@ impl Counters {
                 continue;
             };
             any = true;
-            for keys_at in buckets.values() {
-                for (key, c) in keys_at {
-                    *totals.entry(key.clone()).or_insert(0) += c;
-                    total += c;
-                }
-            }
+            fold_buckets(&buckets, &mut totals, &mut total);
         }
         any.then(|| rank_summary(totals, total))
     }
@@ -582,6 +570,23 @@ impl Counters {
         }
         sum_segments(store, &seg_keys).await
     }
+}
+
+/// Flatten a shard's bucket map into a running per-key `totals` and grand
+/// `total`, dropping the (time-)bucket dimension — the shape a day summary needs.
+fn fold_buckets(buckets: &BucketMap, totals: &mut BTreeMap<String, u64>, total: &mut u64) {
+    for keys_at in buckets.values() {
+        for (key, c) in keys_at {
+            *totals.entry(key.clone()).or_insert(0) += c;
+            *total += c;
+        }
+    }
+}
+
+/// Split a `_counters/` key into its `/`-separated components past `PREFIX`, or
+/// `None` when the key is not under the prefix.
+fn key_parts(key: &str) -> Option<Vec<&str>> {
+    Some(key.strip_prefix(PREFIX)?.split('/').collect())
 }
 
 /// Sum a set of segment objects into one [`BucketMap`]. Returns `None` on any
@@ -619,10 +624,9 @@ impl Layout {
         let mut segments: BTreeMap<(String, String, char), Vec<String>> = BTreeMap::new();
         let mut frozen = std::collections::HashSet::new();
         for k in keys {
-            let Some(rest) = k.strip_prefix(PREFIX) else {
+            let Some(parts) = key_parts(k) else {
                 continue;
             };
-            let parts: Vec<&str> = rest.split('/').collect();
             // <metric>/seg/<day>/<shard>/<file>   |   <metric>/day/<day>/<shard>.json
             match parts.as_slice() {
                 [metric, "seg", day, shard, _file] => {
@@ -646,8 +650,7 @@ impl Layout {
 
     /// The `<day>` component of any counter key, for retention.
     fn day_of<'a>(&self, key: &'a str) -> Option<&'a str> {
-        let rest = key.strip_prefix(PREFIX)?;
-        let parts: Vec<&str> = rest.split('/').collect();
+        let parts = key_parts(key)?;
         match parts.as_slice() {
             [_metric, "seg", day, _shard, _file] => Some(day),
             [_metric, "day", day, _file] => Some(day),

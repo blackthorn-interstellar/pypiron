@@ -34,6 +34,7 @@ pub mod pages;
 pub mod project_cache;
 pub mod provenance;
 pub mod proxy;
+pub mod publish;
 pub mod range;
 pub mod render;
 pub mod replicate;
@@ -60,9 +61,10 @@ pub mod worker;
 // re-export: every reference to them is already a qualified `crate::cli::X` /
 // `crate::pages::X` path.
 pub use app::{
-    delete_record, publish_record, AccessLogFormat, AppState, ArtifactDelivery, PublishBody,
-    PublishRequest, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX,
+    AccessLogFormat, AppState, ArtifactDelivery, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX,
 };
+pub use publish::{delete_record, publish_record, PublishBody, PublishRequest};
 // Reached only by sibling modules over flat `crate::X` paths, so re-exported at
 // crate visibility rather than widened to `pub`.
-pub(crate) use app::{post_publish_mirror_claim_is_current, IDLE_PROBE_INTERVAL};
+pub(crate) use app::IDLE_PROBE_INTERVAL;
+pub(crate) use publish::post_publish_mirror_claim_is_current;

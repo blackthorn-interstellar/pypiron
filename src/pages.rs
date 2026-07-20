@@ -20,8 +20,8 @@ use crate::app::{
     unauthorized, AppState, ArtifactDelivery, PACKAGES_PREFIX, SIMPLE_PREFIX, VERSION,
 };
 use crate::{
-    advisories, coremeta, counters, names, origin, project_cache, provenance, render, sidecar,
-    storage, web, worker,
+    advisories, coremeta, counters, html, names, origin, project_cache, provenance, render,
+    sidecar, storage, worker,
 };
 use names::{checked_pkg_name, infer_version_from_filename};
 use sidecar::Yanked;
@@ -39,18 +39,18 @@ pub async fn root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
     // Registry inventory (counts only) is public — shown under the header.
     let inventory = state.metrics.inventory();
     if !state.is_reader(&headers) {
-        return html_ok(web::landing_html(&ctx, inventory.as_ref(), None));
+        return html_ok(html::landing_html(&ctx, inventory.as_ref(), None));
     }
     let snap = state.metrics.snapshot();
     let (cache_hits, cache_misses) = state.index_cache.stats();
     let board = download_leaderboard(&state).await;
-    let dash = web::DashboardData {
+    let dash = html::DashboardData {
         snapshot: &snap,
         cache_hits,
         cache_misses,
         top_downloads: &board,
     };
-    html_ok(web::landing_html(&ctx, inventory.as_ref(), Some(&dash)))
+    html_ok(html::landing_html(&ctx, inventory.as_ref(), Some(&dash)))
 }
 
 /// Optional `?q=` search term for the package browser.
@@ -76,7 +76,7 @@ pub async fn projects_page(
         Ok(names) => names,
         Err(e) => return read_error(e),
     };
-    html_ok(web::projects_html(
+    html_ok(html::projects_html(
         &page_context(&state, &headers),
         &names,
         browse.q.as_deref().unwrap_or(""),
@@ -95,7 +95,10 @@ pub async fn downloads_page(
         return unauthorized();
     }
     let board = download_leaderboard(&state).await;
-    html_ok(web::downloads_html(&page_context(&state, &headers), &board))
+    html_ok(html::downloads_html(
+        &page_context(&state, &headers),
+        &board,
+    ))
 }
 
 /// The human project page (`/project/<pkg>/`): the latest version, tabbed into
@@ -127,7 +130,7 @@ pub async fn project_version_page(
 ///
 /// The view's list is derived exactly as the page's own authoritative list is —
 /// sidecar version, filename-inferred fallback (`render::pep691_project_json` /
-/// `web::file_version`) — so membership here has parity with the real check,
+/// `html::file_version`) — so membership here has parity with the real check,
 /// legacy formats included. Staleness only lags in safe directions: a deleted
 /// version still listed costs one scan that 404s properly, and a just-uploaded
 /// version missing from the view isn't visible on `/simple/` yet either.
@@ -256,7 +259,7 @@ async fn render_project(
     // latest by PEP 440 order.
     let mut versions: Vec<String> = files
         .iter()
-        .filter_map(web::file_version)
+        .filter_map(html::file_version)
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -304,7 +307,7 @@ async fn render_project(
     // every host and safe to share.
     let mut ctx = page_context(state, headers);
     ctx.base_url = project_cache::BASE_URL_SENTINEL.to_string();
-    let html = web::project_html(
+    let html = html::project_html(
         &ctx,
         &pkg,
         &files,
@@ -351,7 +354,7 @@ async fn advisory_panel_rows(
     storage: &dyn Storage,
     pkg: &str,
     versions: &[String],
-) -> Vec<web::AdvisoryPanelRow> {
+) -> Vec<html::AdvisoryPanelRow> {
     let snap = state.advisory_snapshot();
     let Some(db) = snap.db.as_deref() else {
         return Vec::new();
@@ -359,10 +362,10 @@ async fn advisory_panel_rows(
     // A quarantined project is refused wholesale at the byte gate, so its rows are
     // blocked regardless of advisory kind — mirror the /audit report's roll-in.
     let quarantined = snap.quarantined.contains(pkg);
-    let mut rows: Vec<web::AdvisoryPanelRow> = Vec::new();
+    let mut rows: Vec<html::AdvisoryPanelRow> = Vec::new();
     for version in versions {
         for record in advisories::advisories_for(db, pkg, version) {
-            rows.push(web::AdvisoryPanelRow {
+            rows.push(html::AdvisoryPanelRow {
                 version: version.clone(),
                 id: record.id.clone(),
                 severity: record.severity.clone(),
@@ -521,7 +524,7 @@ fn is_prerelease(v: &str) -> bool {
 fn fully_yanked(files: &[render::FileMetadata], version: &str) -> bool {
     let mut vers = files
         .iter()
-        .filter(|f| web::file_version(f).as_deref() == Some(version))
+        .filter(|f| html::file_version(f).as_deref() == Some(version))
         .peekable();
     vers.peek().is_some() && vers.all(|f| !matches!(f.yanked, Yanked::Flag(false)))
 }
@@ -535,7 +538,7 @@ fn representative<'a>(
 ) -> Option<&'a render::FileMetadata> {
     files
         .iter()
-        .filter(|f| want(f) && web::file_version(f).as_deref() == Some(version))
+        .filter(|f| want(f) && html::file_version(f).as_deref() == Some(version))
         .max_by(|a, b| a.upload_time.cmp(&b.upload_time))
 }
 
@@ -568,8 +571,8 @@ async fn load_provenance(
 /// reverse proxy's `X-Forwarded-Proto`/`-Host`, falling back to the `Host`
 /// header; the host is restricted to a plausible charset (it lands in the page
 /// as escaped text, but we keep it tidy too).
-pub fn page_context(state: &AppState, headers: &HeaderMap) -> web::PageContext {
-    web::PageContext {
+pub fn page_context(state: &AppState, headers: &HeaderMap) -> html::PageContext {
+    html::PageContext {
         base_url: base_url_from_headers(headers),
         version: VERSION,
         proxy_enabled: state.proxy.is_some(),

@@ -645,7 +645,7 @@ pub struct Inventory {
 }
 
 /// A copy of the request counters at one instant, with the derived numbers the
-/// dashboard shows. Plain data so [`crate::web::dashboard_html`] stays a pure
+/// dashboard shows. Plain data so [`crate::html::dashboard_html`] stays a pure
 /// function that can be unit-tested without spinning up [`Metrics`].
 pub struct MetricsSnapshot {
     /// `requests[route][status_class]`, indexed by [`ROUTES`]/`STATUS_CLASSES`.

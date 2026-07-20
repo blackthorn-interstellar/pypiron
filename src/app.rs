@@ -25,9 +25,9 @@ use tracing::{debug, info, warn};
 // name so the bare `worker::`, `storage::`, … paths throughout this file (from
 // its life as the crate root) keep resolving.
 use crate::{
-    advisories, bucket_health, buckets, cache, config, counters, markers, metrics, names,
+    advisories, bucket_health, buckets, cache, config, counters, html, markers, metrics, names,
     node_region, observed_storage, origin, project_cache, proxy, render, replicate, sidecar,
-    status, storage, sync, token, tombstone, transparency, upload, verify, web, wheel, worker,
+    status, storage, sync, token, tombstone, transparency, upload, verify, wheel, worker,
 };
 
 use bucket_health::{HealthController, HealthPolicy};
@@ -1613,7 +1613,7 @@ async fn favicon() -> Response<Body> {
         StatusCode::OK,
         "image/x-icon",
         "public, max-age=86400",
-        web::FAVICON_ICO,
+        html::FAVICON_ICO,
     )
 }
 
@@ -4450,7 +4450,7 @@ async fn audit_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         Ok(report) => report,
         Err(e) => return read_error(e),
     };
-    html_ok(web::audit_html(
+    html_ok(html::audit_html(
         &page_context(&state, &headers),
         report.as_ref(),
         AUDIT_ABSENT_NOTE,

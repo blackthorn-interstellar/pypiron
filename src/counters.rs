@@ -1,6 +1,6 @@
 //! Distributed, S3-backed counter store. **Self-contained on purpose**: it
 //! depends only on the two tiny store traits below, `time`, and `serde` — never
-//! on `AppState`, `web`, or `crate::storage`. Lift it into its own crate by
+//! on `AppState`, `html`, or `crate::storage`. Lift it into its own crate by
 //! copying this one file and providing store implementations for your backend.
 //!
 //! ## Model (truth = immutable files, views = recomputations — the repo's bias)

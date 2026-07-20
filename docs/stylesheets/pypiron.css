@@ -1,5 +1,5 @@
 /* pypiron docs theme — iron & rust, lifted from the server's own scheme (the
-   :root / dark tokens at the top of PAGE_CSS in src/web.rs).
+   :root / dark tokens at the top of PAGE_CSS in src/html.rs).
 
    We recolor Material's BUILT-IN `default` (light) and `slate` (dark) schemes
    rather than inventing custom scheme names. That matters: a custom scheme

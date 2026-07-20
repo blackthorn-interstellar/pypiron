@@ -19,6 +19,7 @@ pub mod coremeta;
 mod corpus_check;
 pub mod counters;
 pub mod hash;
+pub mod html;
 pub mod lease;
 pub mod markdown;
 pub mod markers;
@@ -46,7 +47,6 @@ pub mod tombstone;
 pub mod transparency;
 pub mod upload;
 pub mod verify;
-pub mod web;
 pub mod wheel;
 pub mod worker;
 

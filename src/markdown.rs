@@ -152,7 +152,7 @@ fn heading_tags(l: HeadingLevel) -> (&'static str, &'static str) {
 
 /// Allow only `http`/`https` URLs into an `href` — author-controlled metadata
 /// must never smuggle in `javascript:` or `data:` schemes. Applied here to
-/// README links/images, and shared with [`crate::web`], which applies the same
+/// README links/images, and shared with [`crate::html`], which applies the same
 /// policy to package project links.
 pub(crate) fn safe_href(url: &str) -> Option<&str> {
     // Compare on bytes: a metadata URL is arbitrary UTF-8, and slicing a `&str`

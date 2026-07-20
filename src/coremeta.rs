@@ -5,7 +5,7 @@
 //! The page renders the description as Markdown only when it declares
 //! `Description-Content-Type: text/markdown` (via the locked-down whitelist in
 //! [`crate::markdown`]); reStructuredText and plain text are shown verbatim in a
-//! `<pre>`. See [`CoreMetadata::is_markdown`] and [`crate::web::project_html`].
+//! `<pre>`. See [`CoreMetadata::is_markdown`] and [`crate::html::project_html`].
 
 /// Display fields lifted from a wheel's `METADATA` (or an sdist's `PKG-INFO`).
 /// Every field is optional — legacy and minimal artifacts omit most of them.

@@ -1347,14 +1347,12 @@ async fn log_requests(
     let health_or_metrics = matches!(req.uri().path(), "/health" | "/metrics");
 
     if !is_read && state.mutations_fenced() {
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from(
-                r#"{"error":"bucket topology mismatch; writes are fenced"}"#,
-            ))
-            .unwrap_or_else(not_found);
+        return simple_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application/json",
+            "no-cache",
+            r#"{"error":"bucket topology mismatch; writes are fenced"}"#,
+        );
     }
 
     // Decide up front whether this request could be logged, so the hot read path
@@ -1579,12 +1577,12 @@ async fn health(State(state): State<Arc<AppState>>) -> Response<Body> {
         .shutting_down
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from(r#"{"status":"draining"}"#))
-            .unwrap_or_else(not_found);
+        return simple_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application/json",
+            "no-cache",
+            r#"{"status":"draining"}"#,
+        );
     }
     let probe = format!("{SIMPLE_PREFIX}index.json");
     let (status, body) = match state.pin().storage.head_exists(&probe).await {
@@ -1594,34 +1592,29 @@ async fn health(State(state): State<Arc<AppState>>) -> Response<Body> {
             (StatusCode::SERVICE_UNAVAILABLE, r#"{"status":"degraded"}"#)
         }
     };
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from(body))
-        .unwrap_or_else(not_found)
+    simple_response(status, "application/json", "no-cache", body)
 }
 
 /// Prometheus text exposition of the process counters.
 async fn serve_metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from(state.metrics.render()))
-        .unwrap_or_else(not_found)
+    simple_response(
+        StatusCode::OK,
+        "text/plain; version=0.0.4",
+        "no-cache",
+        state.metrics.render(),
+    )
 }
 
 /// The site icon, carved from the logo. Static and immutable per build, so it's
 /// served straight from the embedded bytes with a day-long cache and no auth —
 /// browsers fetch it unprompted, before any credential is in play.
 async fn favicon() -> Response<Body> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "image/x-icon")
-        .header(header::CACHE_CONTROL, "public, max-age=86400")
-        .body(Body::from(web::FAVICON_ICO))
-        .unwrap_or_else(not_found)
+    simple_response(
+        StatusCode::OK,
+        "image/x-icon",
+        "public, max-age=86400",
+        web::FAVICON_ICO,
+    )
 }
 
 /// Fallback handler for unmatched routes
@@ -3012,11 +3005,7 @@ async fn proxy_package_index(
         Ok(None) => return None,
         Err(error) => return Some(read_error(error)),
     };
-    let revalidated = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim() == "*" || v.contains(&*rendered.etag))
-        .unwrap_or(false);
+    let revalidated = if_none_match(headers, &[&*rendered.etag]);
     let builder = Response::builder()
         .header(header::ETAG, &*rendered.etag)
         .header(header::CACHE_CONTROL, INDEX_CACHE_CONTROL);
@@ -3139,11 +3128,7 @@ fn render_index_variant(
         _ => (identity, None),
     };
 
-    let revalidated = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim() == "*" || v.contains(&*variant.etag) || v.contains(&*identity.etag))
-        .unwrap_or(false);
+    let revalidated = if_none_match(headers, &[&*variant.etag, &*identity.etag]);
 
     let mut builder = Response::builder()
         .header(header::ETAG, &*variant.etag)
@@ -3531,26 +3516,44 @@ async fn stats_summary_get(
 
 /// A `200 application/json` response with no-store caching, or a 404 if the body
 /// can't be built. Shared by the `/stats` endpoints.
+/// Build a response from a status, content type, cache-control, and body, with
+/// the (practically infallible) builder error mapped to a 404. The shape behind
+/// the fixed-payload responders — health, metrics, favicon, the JSON APIs.
+fn simple_response(
+    status: StatusCode,
+    content_type: &'static str,
+    cache_control: &'static str,
+    body: impl Into<Body>,
+) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(body.into())
+        .unwrap_or_else(not_found)
+}
+
+/// Whether the request's `If-None-Match` is a 304 revalidation hit: `*`, or the
+/// header lists any of `etags`. The conditional-GET check shared by the index
+/// and advisory responders.
+fn if_none_match(headers: &HeaderMap, etags: &[&str]) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "*" || etags.iter().any(|e| v.contains(*e)))
+        .unwrap_or(false)
+}
+
 fn json_response(value: serde_json::Value) -> Response<Body> {
     let bytes = serde_json::to_vec(&value).unwrap_or_default();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from(bytes))
-        .unwrap_or_else(not_found)
+    simple_response(StatusCode::OK, "application/json", "no-store", bytes)
 }
 
 /// A `403 application/json` refusal with no-store caching — the malware byte
 /// gate's response shape ([`json_response`]'s 403 sibling; that one is 200-only).
 fn blocked_response(value: serde_json::Value) -> Response<Body> {
     let bytes = serde_json::to_vec(&value).unwrap_or_default();
-    Response::builder()
-        .status(StatusCode::FORBIDDEN)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from(bytes))
-        .unwrap_or_else(not_found)
+    simple_response(StatusCode::FORBIDDEN, "application/json", "no-store", bytes)
 }
 
 /// The malware byte gate: the single enforcement chokepoint where advisory-blocked
@@ -4297,11 +4300,7 @@ fn serve_advisory_bytes(
     etag: &str,
     bytes: &[u8],
 ) -> Response<Body> {
-    let revalidated = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim() == "*" || v.contains(etag))
-        .unwrap_or(false);
+    let revalidated = if_none_match(headers, &[etag]);
     let builder = Response::builder().header(header::ETAG, etag);
     let response = if revalidated {
         builder.status(StatusCode::NOT_MODIFIED).body(Body::empty())

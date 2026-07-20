@@ -55,16 +55,10 @@ use crate::upload::{FinishedSpool, UploadSpool};
 /// configured. Mirroring is admin-gated, so every request to the destination
 /// carries this basic-auth header (a bare, unauthenticated dest is only valid
 /// in tests / open setups).
-trait AdminAuth {
-    fn with_admin_auth(self, resolved: &Resolved) -> Self;
-}
-
-impl AdminAuth for reqwest::RequestBuilder {
-    fn with_admin_auth(self, resolved: &Resolved) -> Self {
-        match (&resolved.admin_user, &resolved.admin_pass) {
-            (Some(u), Some(p)) => self.basic_auth(u, Some(p)),
-            _ => self,
-        }
+fn with_admin_auth(req: reqwest::RequestBuilder, resolved: &Resolved) -> reqwest::RequestBuilder {
+    match (&resolved.admin_user, &resolved.admin_pass) {
+        (Some(u), Some(p)) => req.basic_auth(u, Some(p)),
+        _ => req,
     }
 }
 
@@ -1214,7 +1208,7 @@ impl UpstreamFiles {
 /// recur once per file.
 async fn preflight(client: &Client, resolved: &Resolved) -> Result<()> {
     let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
-    let req = client.get(&url).with_admin_auth(resolved);
+    let req = with_admin_auth(client.get(&url), resolved);
     let resp = req.send().await.with_context(|| {
         format!(
             "cannot reach sync destination {} — is the server running and the URL correct?",
@@ -1256,7 +1250,7 @@ async fn load_cursors(client: &Client, resolved: &Resolved) -> Cursors {
         return Cursors::new();
     }
     let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
-    let req = client.get(&url).with_admin_auth(resolved);
+    let req = with_admin_auth(client.get(&url), resolved);
     match req.send().await {
         Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
         _ => Cursors::new(),
@@ -1275,7 +1269,7 @@ async fn save_cursors(client: &Client, resolved: &Resolved, cursors: &Cursors) {
         }
     };
     let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
-    let req = client.put(&url).body(body).with_admin_auth(resolved);
+    let req = with_admin_auth(client.put(&url).body(body), resolved);
     let result = async {
         let resp = req.send().await?;
         if !resp.status().is_success() {
@@ -1436,11 +1430,13 @@ async fn push_feed_to_dest(client: &Client, resolved: &Resolved, bytes: Vec<u8>)
         }
     }
 
-    let req = client
-        .put(&url)
-        .header(reqwest::header::CONTENT_TYPE, "application/zip")
-        .body(bytes)
-        .with_admin_auth(resolved);
+    let req = with_admin_auth(
+        client
+            .put(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/zip")
+            .body(bytes),
+        resolved,
+    );
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             info!("advisory snapshot pushed to destination");
@@ -1463,7 +1459,7 @@ async fn head_dest_feed(
     resolved: &Resolved,
     url: &str,
 ) -> Result<(reqwest::StatusCode, Option<String>)> {
-    let req = client.head(url).with_admin_auth(resolved);
+    let req = with_admin_auth(client.head(url), resolved);
     let resp = req.send().await?;
     let etag = resp
         .headers()
@@ -2000,10 +1996,12 @@ async fn fetch_local_index(
         "{}/sync/local-index/{pkg}",
         resolved.dst_base.trim_end_matches('/')
     );
-    let req = client
-        .get(&url)
-        .header(reqwest::header::ACCEPT, SIMPLE_JSON_CONTENT_TYPE)
-        .with_admin_auth(resolved);
+    let req = with_admin_auth(
+        client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, SIMPLE_JSON_CONTENT_TYPE),
+        resolved,
+    );
     let resp = req.send().await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
@@ -2042,12 +2040,14 @@ async fn apply_yank_http(
     yanked: &Yanked,
 ) -> Result<()> {
     let url = format!("{base}/files/{pkg}/{filename}/yank");
-    let req = match yanked {
-        Yanked::Flag(false) => client.delete(&url),
-        Yanked::Flag(true) => client.post(&url).body(String::new()),
-        Yanked::Reason(reason) => client.post(&url).body(reason.clone()),
-    }
-    .with_admin_auth(resolved);
+    let req = with_admin_auth(
+        match yanked {
+            Yanked::Flag(false) => client.delete(&url),
+            Yanked::Flag(true) => client.post(&url).body(String::new()),
+            Yanked::Reason(reason) => client.post(&url).body(reason.clone()),
+        },
+        resolved,
+    );
     let resp = req.send().await?;
     if !resp.status().is_success() {
         return Err(http_body_error(resp, &format!("yank update failed for {filename}")).await);
@@ -2078,12 +2078,14 @@ async fn relay_status(
     let url = format!("{base}/project/{pkg}/status");
     // Active carries no marker, so an active target is a clear (DELETE); any
     // freeze is a POST of the status doc — same set/clear shape as yank.
-    let req = if desired.status.is_active() {
-        client.delete(&url)
-    } else {
-        client.post(&url).json(&desired)
-    }
-    .with_admin_auth(resolved);
+    let req = with_admin_auth(
+        if desired.status.is_active() {
+            client.delete(&url)
+        } else {
+            client.post(&url).json(&desired)
+        },
+        resolved,
+    );
     let resp = req.send().await?;
     if !resp.status().is_success() {
         return Err(http_body_error(resp, &format!("status update failed for {pkg}")).await);
@@ -2375,10 +2377,7 @@ async fn upload_via_http(
         }
     }
 
-    let req = client
-        .post(endpoint)
-        .multipart(form)
-        .with_admin_auth(resolved);
+    let req = with_admin_auth(client.post(endpoint).multipart(form), resolved);
     let resp = req.send().await?;
     if resp.status() == reqwest::StatusCode::CONFLICT {
         return Ok(false);

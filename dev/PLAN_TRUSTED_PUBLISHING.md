@@ -68,8 +68,8 @@ never have to understand — or even notice — any of this. Hard requirements:
   `provenance_key`), `provenance` key / `data-provenance` attr in indexes,
   publisher summary on the human page (`src/provenance.rs::parse_publisher`,
   `src/pages.rs::load_provenance`).
-- First-party `attestations` are refused fail-closed at `src/app.rs` (~line
-  3315, in `legacy_upload`). Phase 2 replaces this refusal for
+- First-party `attestations` are refused fail-closed in `src/publish.rs`
+  (in `legacy_upload`). Phase 2 replaces this refusal for
   publisher-authenticated uploads; it stays for everything else.
 - `PublishRequest.provenance: Option<String>` already threads a provenance JSON
   body through `publish_record` into the companion write — Phase 2 reuses it
@@ -78,7 +78,7 @@ never have to understand — or even notice — any of this. Hard requirements:
   to be; verify with a blackbox test, fix if gated on mirror).
 - Token machinery: `src/token.rs` (HMAC-SHA256 stateless tokens, `Claims`
   {role, repo, commit, user, iat, exp}), minted at `POST /tokens`
-  (`src/app.rs` `mint_token`, route ~line 1988), presented as basic-auth user
+  (`src/admin.rs` `mint_token`, route `POST /tokens`), presented as basic-auth user
   `__token__`, verified in `AppState::token_role` (~line 5877). 5-minute TTL.
 - Auth tiers: `is_admin` / `is_uploader` / `is_reader` in `src/app.rs`
   (~5849–5940). Constant-time compares (`ct_eq`). Fail-closed philosophy:

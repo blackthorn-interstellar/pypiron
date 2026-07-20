@@ -88,6 +88,20 @@ fn bound_azure_transport(builder: MicrosoftAzureBuilder) -> MicrosoftAzureBuilde
     bound_transport!(builder, AzureConfigKey::Client)
 }
 
+// Point a custom-endpoint builder (S3 or Azure — same inherent methods, no
+// shared trait) at `$url`, allowing plaintext only when the URL is `http://`.
+// A macro, not a fn, so it spans both builder types.
+macro_rules! with_http_endpoint {
+    ($b:expr, $url:expr) => {{
+        let b = $b.with_endpoint($url.clone());
+        if $url.starts_with("http://") {
+            b.with_allow_http(true)
+        } else {
+            b
+        }
+    }};
+}
+
 /// Storage configuration for `serve` and the maintenance commands — one binary,
 /// one storage layer, no second implementation. (`sync` never embeds this.)
 #[derive(ClapArgs, Debug, Clone)]
@@ -532,10 +546,7 @@ impl StorageArgs {
             .and_then(|o| o.force_path_style)
             .unwrap_or(self.s3_force_path_style);
         if let Some(ref url) = endpoint {
-            b = b.with_endpoint(url.clone());
-            if url.starts_with("http://") {
-                b = b.with_allow_http(true);
-            }
+            b = with_http_endpoint!(b, url);
         }
         if force_path_style {
             b = b.with_virtual_hosted_style_request(false);
@@ -693,10 +704,7 @@ impl StorageArgs {
             .and_then(|o| o.endpoint_url.clone())
             .or_else(|| self.azure_endpoint_url.clone());
         if let Some(url) = endpoint {
-            b = b.with_endpoint(url.clone());
-            if url.starts_with("http://") {
-                b = b.with_allow_http(true);
-            }
+            b = with_http_endpoint!(b, url);
         }
         let az = Arc::new(
             b.build()

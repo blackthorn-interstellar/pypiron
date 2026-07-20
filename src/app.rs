@@ -3183,18 +3183,21 @@ fn render_index_variant(
 /// RAM-cached read-through with the multi-bucket fence check, then upstream
 /// passthrough when the wheel isn't cached yet. Metadata and provenance differ
 /// only in `companion` (suffix, content type, upstream fetch).
-#[allow(clippy::too_many_arguments)]
 async fn serve_companion(
     state: &Arc<AppState>,
     pins: &Pins<'_>,
     pkg: &str,
-    artifact_key: &str,
-    key: String,
     filename: &str,
     headers: &HeaderMap,
     companion: Companion,
 ) -> Response<Body> {
-    match file_visible_read_through(state, pins, pkg, artifact_key).await {
+    // The companion (`<file>.metadata` / `.provenance`) and the artifact it
+    // annotates, both keyed the same way the caller keys them — derived here
+    // from `(pkg, filename)` so this signature carries only what varies.
+    let artifact_filename = filename.strip_suffix(companion.suffix()).unwrap_or(filename);
+    let artifact_key = format!("{PACKAGES_PREFIX}{pkg}/{artifact_filename}");
+    let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+    match file_visible_read_through(state, pins, pkg, &artifact_key).await {
         Ok(true) => {}
         Ok(false) => {
             // Upstream passthrough is judged on the write pin: an unclaimed
@@ -3203,7 +3206,7 @@ async fn serve_companion(
                 state,
                 pins.write.storage.as_ref(),
                 pkg,
-                artifact_key,
+                &artifact_key,
                 &key,
             )
             .await
@@ -3278,12 +3281,6 @@ async fn files_get(
     else {
         return not_found("not an artifact");
     };
-    let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
-    let artifact_filename = filename
-        .strip_suffix(METADATA_SUFFIX)
-        .or_else(|| filename.strip_suffix(PROVENANCE_SUFFIX))
-        .unwrap_or(&filename);
-    let artifact_key = format!("{PACKAGES_PREFIX}{pkg}/{artifact_filename}");
 
     // Pin both selections once for the whole download (design §3). Reads —
     // fences, companion cache, presign, streaming — run against the region-local
@@ -3313,8 +3310,6 @@ async fn files_get(
             &state,
             &pins,
             &pkg,
-            &artifact_key,
-            key,
             &filename,
             &headers,
             Companion::Metadata,
@@ -3326,14 +3321,22 @@ async fn files_get(
             &state,
             &pins,
             &pkg,
-            &artifact_key,
-            key,
             &filename,
             &headers,
             Companion::Provenance,
         )
         .await;
     }
+
+    // Past the companion exits: this is a real artifact request. Its storage key
+    // and the artifact it resolves to (identical here, since a bare artifact has
+    // no companion suffix to strip) are only needed on this path.
+    let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+    let artifact_filename = filename
+        .strip_suffix(METADATA_SUFFIX)
+        .or_else(|| filename.strip_suffix(PROVENANCE_SUFFIX))
+        .unwrap_or(&filename);
+    let artifact_key = format!("{PACKAGES_PREFIX}{pkg}/{artifact_filename}");
 
     // On-demand mirroring: make sure the artifact is in storage before the
     // presign/stream logic runs (a presigned redirect never observes a 404,

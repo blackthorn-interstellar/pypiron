@@ -8,16 +8,16 @@ Pipfile.lock, and installs into a virtualenv it manages.
 from __future__ import annotations
 
 import os
-import re
 import sys
-import uuid
 from pathlib import Path
 
 import pytest
 
 from .helpers import (
     make_wheel,
+    module_name,
     run_checked,
+    unique_package,
     upload_legacy,
     uvx_client,
     wait_for_file_in_index,
@@ -26,14 +26,6 @@ from .helpers import (
 VERSION = "1.0.0"
 
 pytestmark = pytest.mark.integration
-
-
-def _unique_package() -> str:
-    return f"pypiron-compat-pipenv-{uuid.uuid4().hex[:8]}"
-
-
-def _module_name(package: str) -> str:
-    return re.sub(r"\W+", "_", package).strip("_").lower()
 
 
 def _pipenv_env(tmp_path: Path) -> dict[str, str]:
@@ -78,7 +70,7 @@ def _write_pipfile(project_dir: Path, *, simple_url: str, package: str) -> None:
 @pytest.mark.compat("pipenv", "install")
 @pytest.mark.compat("pipenv", "resolve")
 def test_pipenv_locks_and_installs_from_simple_index(disk_server, tmp_path):
-    package = _unique_package()
+    package = unique_package("pipenv")
     wheel_path = make_wheel(package, VERSION, tmp_path / "dist")
     upload_legacy(
         disk_server["legacy"],
@@ -106,7 +98,7 @@ def test_pipenv_locks_and_installs_from_simple_index(disk_server, tmp_path):
     assert package in (project_dir / "Pipfile.lock").read_text(encoding="utf-8")
 
     run_checked(
-        [*pipenv, "run", "python", "-c", f"import {_module_name(package)}"],
+        [*pipenv, "run", "python", "-c", f"import {module_name(package)}"],
         cwd=project_dir,
         env=env,
         timeout=300,

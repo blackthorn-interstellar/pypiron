@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import os
-import re
 import sys
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -13,7 +11,9 @@ import pytest
 
 from .helpers import (
     make_wheel,
+    module_name,
     run_checked,
+    unique_package,
     upload_legacy,
     uvx_client,
     wait_for_file_in_index,
@@ -22,14 +22,6 @@ from .helpers import (
 VERSION = "1.0.0"
 
 pytestmark = pytest.mark.integration
-
-
-def _unique_package() -> str:
-    return f"pypiron-compat-pdm-{uuid.uuid4().hex[:8]}"
-
-
-def _module_name(package: str) -> str:
-    return re.sub(r"\W+", "_", package).strip("_").lower()
 
 
 def _pdm_env(tmp_path: Path, *, simple_url: Optional[str] = None) -> dict[str, str]:
@@ -74,7 +66,7 @@ def _write_pyproject(
 
 @pytest.mark.compat("pdm", "upload")
 def test_pdm_publish_uploads_to_legacy_endpoint(disk_server, tmp_path):
-    package = _unique_package()
+    package = unique_package("pdm")
     project_dir = tmp_path / "publisher"
     dist_dir = project_dir / "dist"
     project_dir.mkdir()
@@ -105,7 +97,7 @@ def test_pdm_publish_uploads_to_legacy_endpoint(disk_server, tmp_path):
 @pytest.mark.compat("pdm", "install")
 @pytest.mark.compat("pdm", "resolve")
 def test_pdm_locks_and_installs_from_simple_index(disk_server, tmp_path):
-    package = _unique_package()
+    package = unique_package("pdm")
     wheel_path = make_wheel(package, VERSION, tmp_path / "dist")
     upload_legacy(
         disk_server["legacy"],
@@ -137,7 +129,7 @@ def test_pdm_locks_and_installs_from_simple_index(disk_server, tmp_path):
 
     run_checked([*pdm, "-n", "install"], cwd=consumer_dir, env=env, timeout=300)
     run_checked(
-        [*pdm, "run", "python", "-c", f"import {_module_name(package)}"],
+        [*pdm, "run", "python", "-c", f"import {module_name(package)}"],
         cwd=consumer_dir,
         env=env,
         timeout=300,

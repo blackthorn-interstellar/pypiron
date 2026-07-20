@@ -31,6 +31,16 @@ CLIENT_PINS = {
 }
 
 
+def module_name(package: str) -> str:
+    """The importable module name a build backend derives from a package name."""
+    return re.sub(r"\W+", "_", package).strip("_").lower()
+
+
+def unique_package(client: str) -> str:
+    """A collision-free ``pypiron-compat-<client>-<rand>`` distribution name."""
+    return f"pypiron-compat-{client}-{uuid.uuid4().hex[:8]}"
+
+
 def origin_owner(raw: str | bytes) -> str:
     """Read current nonce-bearing claims and legacy plain-text fixtures."""
     text = raw.decode() if isinstance(raw, bytes) else raw

@@ -31,10 +31,10 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use serde::{Deserialize, Serialize};
 
+use crate::app::PACKAGES_PREFIX;
 use crate::hash::sha256_hex;
 use crate::sidecar::{Sidecar, SIDECAR_SUFFIX, TOMBSTONE_SUFFIX};
 use crate::storage::{is_not_found, Storage, StorageArgs};
-use crate::PACKAGES_PREFIX;
 
 /// Namespace for the chain. `replicate.rs` only ever touches `packages/`, so the
 /// chain is excluded from replication for free — no exclusion code needed.

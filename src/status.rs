@@ -12,9 +12,9 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::app::PACKAGES_PREFIX;
 use crate::replicate::Origin;
 use crate::storage::Storage;
-use crate::PACKAGES_PREFIX;
 
 /// A PEP 792 project status marker. Unknown values are rejected at parse time
 /// (no `#[serde(other)]`): a corrupt or typo'd marker must never silently read

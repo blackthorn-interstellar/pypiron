@@ -33,6 +33,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::{sleep, timeout};
 use tracing::{error, info, warn};
 
+use crate::app::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 use crate::hash::sha256_hex;
 use crate::lease::LeaseManager;
 use crate::markers::{
@@ -50,7 +51,6 @@ use crate::sidecar::{
 };
 use crate::storage::{is_not_found, FileEntry, ObjectMeta, Storage};
 use crate::transparency::FileShas;
-use crate::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 
 /// Bounded fan-out for storage round-trips during rebuilds and sweeps.
 /// High enough to collapse per-file latency, low enough to never matter
@@ -213,8 +213,8 @@ async fn run_bucket_health_until(
         // discovery timeout before failover.
         let full_cadence =
             state.recent_request_traffic() || state.any_bucket_unhealthy_or_recovering();
-        let probe_due =
-            full_cadence || last_probe.is_none_or(|t| t.elapsed() >= crate::IDLE_PROBE_INTERVAL);
+        let probe_due = full_cadence
+            || last_probe.is_none_or(|t| t.elapsed() >= crate::app::IDLE_PROBE_INTERVAL);
         if probe_due {
             probe_buckets(&state).await;
             last_probe = Some(Instant::now());
@@ -3004,9 +3004,9 @@ async fn write_global_indexes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{AccessLogFormat, ArtifactDelivery};
     use crate::buckets::{BucketHandle, BucketSet, Pinned};
     use crate::storage::test_support::InMemStorage;
-    use crate::{AccessLogFormat, ArtifactDelivery};
     use axum::body::Body;
     use http::Response;
     use std::collections::HashMap;

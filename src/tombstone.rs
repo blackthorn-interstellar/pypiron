@@ -10,11 +10,11 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::app::PACKAGES_PREFIX;
 use crate::sidecar::{
     frozen_key, metadata_key, mirror_quarantined_key, provenance_key, sidecar_key, tombstone_key,
 };
 use crate::storage::Storage;
-use crate::PACKAGES_PREFIX;
 
 /// Minimal tombstone body. The filename is informational — the key already
 /// carries it — and there is deliberately no wall clock: a tombstone's meaning

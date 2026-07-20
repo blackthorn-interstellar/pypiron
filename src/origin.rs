@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use tracing::warn;
 
+use crate::app::{DIRTY_PREFIX, PACKAGES_PREFIX};
 use crate::storage::{is_not_found, Storage};
-use crate::{DIRTY_PREFIX, PACKAGES_PREFIX};
 
 pub const PRIVATE: &str = "private";
 pub const MIRROR: &str = "mirror";

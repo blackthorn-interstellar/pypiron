@@ -32,6 +32,7 @@ use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::Client;
 use tracing::{info, warn};
 
+use crate::app::{AppState, PACKAGES_PREFIX};
 use crate::hash::sha256_hex;
 use crate::names::{infer_version_from_filename, matches_prefix};
 use crate::origin;
@@ -45,7 +46,6 @@ use crate::ssrf::{self, Guard, SsrfGuardResolver};
 use crate::storage::Storage;
 use crate::sync::{matches_mirror, ResolvedMirror};
 use crate::upload::{FinishedSpool, UploadSpool};
-use crate::{AppState, PACKAGES_PREFIX};
 
 /// How long an upstream package listing (or its absence) is reused before
 /// refetching. Bounds the lag for "a new release appeared upstream"; the
@@ -730,9 +730,14 @@ impl Proxy {
         // record is already typed mirror, so never delete through a cross-object
         // race; private precedence will quarantine and suppress it. A lone
         // bucket cannot demote concurrently and skips this extra origin GET.
-        if !crate::post_publish_mirror_claim_is_current(state, storage, pkg, &claim_observation)
-            .await
-            .context("re-check mirror claim after artifact publish")?
+        if !crate::publish::post_publish_mirror_claim_is_current(
+            state,
+            storage,
+            pkg,
+            &claim_observation,
+        )
+        .await
+        .context("re-check mirror claim after artifact publish")?
         {
             crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
             info!(%pkg, %filename, "proxy: origin changed after artifact publish; leaving typed mirror loser");

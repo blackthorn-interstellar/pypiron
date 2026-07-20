@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use clap::Args as ClapArgs;
 
+use crate::app::{DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 use crate::names::normalize_pkg_name;
 use crate::render::{
     pep503_global_html, pep503_project_html, pep691_global_json, pep691_project_json, FileMetadata,
@@ -27,7 +28,6 @@ use crate::sidecar::{
     TOMBSTONE_SUFFIX,
 };
 use crate::storage::{is_not_found, ObjectMeta, Storage, StorageArgs, SHARD_CHARS};
-use crate::{DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 
 const SHARD_CONCURRENCY: usize = 8;
 const PACKAGE_CONCURRENCY: usize = 16;

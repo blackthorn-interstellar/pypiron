@@ -54,18 +54,10 @@ pub mod verify;
 pub mod wheel;
 pub mod worker;
 
-// Items that lived at the crate root when `main.rs` was the root (AppState, the
-// storage-layout prefixes, the record read/write path) are re-exported here so
-// the historical flat `crate::X` / `pypiron::X` paths keep resolving. This list
-// is explicit — not `pub use app::*` — so the real dependency direction between
-// the crate root and its modules stays visible. `cli` and `pages` need no
-// re-export: every reference to them is already a qualified `crate::cli::X` /
-// `crate::pages::X` path.
-pub use app::{
-    AccessLogFormat, AppState, ArtifactDelivery, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX,
-};
+// `AppState` and the record write path are re-exported at the crate root only
+// because out-of-tree consumers reach them over `pypiron::X`: the integration
+// tests (`tests/*.rs`) and the deterministic simulator (`examples/vopr.rs`).
+// Everything internal resolves through its owning module (`crate::app::X`,
+// `crate::publish::X`, …) — there is no flat-path shim for sibling modules.
+pub use app::AppState;
 pub use publish::{delete_record, publish_record, PublishBody, PublishRequest};
-// Reached only by sibling modules over flat `crate::X` paths, so re-exported at
-// crate visibility rather than widened to `pub`.
-pub(crate) use app::IDLE_PROBE_INTERVAL;
-pub(crate) use publish::post_publish_mirror_claim_is_current;

@@ -28,6 +28,7 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use futures::StreamExt as _;
 use tracing::{error, warn};
 
+use crate::app::{AppState, PACKAGES_PREFIX};
 use crate::buckets::Pinned;
 use crate::hash::sha256_hex;
 use crate::markers;
@@ -48,7 +49,6 @@ use crate::storage::{
 use crate::tombstone;
 #[cfg(test)]
 use crate::worker;
-use crate::{AppState, PACKAGES_PREFIX};
 
 mod decide;
 pub use decide::*;
@@ -3135,7 +3135,11 @@ mod tests {
             status::read_status(b.as_ref(), "pkg").await.unwrap(),
             quarantined
         );
-        assert!(!b.list_all(crate::DIRTY_PREFIX).await.unwrap().is_empty());
+        assert!(!b
+            .list_all(crate::app::DIRTY_PREFIX)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

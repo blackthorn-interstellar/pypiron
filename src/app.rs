@@ -4214,15 +4214,14 @@ async fn write_project_status(
                     format!("storage error reading origin for replication: {e}"),
                 )
             })?;
-        match observed.as_ref().map(|value| value.state) {
-            Some(origin::OriginState::Private) => Some(status::StatusOrigin::Private),
-            Some(origin::OriginState::Mirror) => Some(status::StatusOrigin::Mirror),
-            _ => None,
-        }
+        observed
+            .as_ref()
+            .map(|value| value.state)
+            .and_then(|state| replicate::Origin::try_from(state).ok())
     } else {
         None
     };
-    let replicate_private = status_origin == Some(status::StatusOrigin::Private);
+    let replicate_private = status_origin == Some(replicate::Origin::Private);
     let result = if state.buckets.is_multi() {
         status::advance_status(storage, &pkg, &doc, status_origin)
             .await

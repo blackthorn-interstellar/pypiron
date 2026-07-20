@@ -1426,7 +1426,7 @@ async fn normalize_mirror_status_under_private_claim(
     let Some(initial_status) = status::read_status_versioned(storage, pkg).await? else {
         return Ok(false);
     };
-    if initial_status.origin != Some(status::StatusOrigin::Mirror) {
+    if initial_status.origin != Some(Origin::Mirror) {
         return Ok(false);
     }
 
@@ -1442,7 +1442,7 @@ async fn normalize_mirror_status_under_private_claim(
             let Some(current) = current else {
                 return Ok(false);
             };
-            if current.origin != Some(status::StatusOrigin::Mirror) {
+            if current.origin != Some(Origin::Mirror) {
                 return Ok(false);
             }
             if status::put_status_if_version(
@@ -1451,7 +1451,7 @@ async fn normalize_mirror_status_under_private_claim(
                 Some(&current.etag),
                 &status::ProjectStatusDoc::default(),
                 0,
-                Some(status::StatusOrigin::Private),
+                Some(Origin::Private),
             )
             .await?
             {
@@ -2829,7 +2829,7 @@ mod tests {
             status: status::ProjectStatus::Quarantined,
             reason: Some("late public status".into()),
         };
-        status::advance_status(&b, "pkg", &late, Some(status::StatusOrigin::Mirror))
+        status::advance_status(&b, "pkg", &late, Some(Origin::Mirror))
             .await
             .unwrap();
 
@@ -2840,7 +2840,7 @@ mod tests {
             .unwrap();
         assert_eq!(normalized.doc, status::ProjectStatusDoc::default());
         assert_eq!(normalized.epoch, 0);
-        assert_eq!(normalized.origin, Some(status::StatusOrigin::Private));
+        assert_eq!(normalized.origin, Some(Origin::Private));
         assert_eq!(
             status::read_status(&b, "pkg").await.unwrap(),
             status::ProjectStatusDoc::default(),
@@ -3102,14 +3102,9 @@ mod tests {
             status: status::ProjectStatus::Quarantined,
             reason: Some("investigating".into()),
         };
-        status::advance_status(
-            a.as_ref(),
-            "pkg",
-            &quarantined,
-            Some(status::StatusOrigin::Private),
-        )
-        .await
-        .unwrap();
+        status::advance_status(a.as_ref(), "pkg", &quarantined, Some(Origin::Private))
+            .await
+            .unwrap();
         let state = two_bucket_state(a.clone(), b.clone());
 
         replicate_record(&state, a.as_ref(), b.as_ref(), "pkg", PROJECT_STATUS_MARKER)
@@ -3132,14 +3127,9 @@ mod tests {
             status: status::ProjectStatus::Archived,
             reason: None,
         };
-        status::advance_status(
-            a.as_ref(),
-            "pkg",
-            &archived,
-            Some(status::StatusOrigin::Mirror),
-        )
-        .await
-        .unwrap();
+        status::advance_status(a.as_ref(), "pkg", &archived, Some(Origin::Mirror))
+            .await
+            .unwrap();
         let state = two_bucket_state(a.clone(), b.clone());
 
         replicate_record(&state, a.as_ref(), b.as_ref(), "pkg", PROJECT_STATUS_MARKER)

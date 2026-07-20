@@ -12,6 +12,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::replicate::Origin;
 use crate::storage::Storage;
 use crate::PACKAGES_PREFIX;
 
@@ -68,19 +69,14 @@ struct StoredProjectStatus {
     epoch: u64,
     /// Which package-origin world authored this event. Old markers omit it;
     /// demotion keeps exact-ETag fallback semantics for those legacy bodies.
+    /// The same [`Origin`] the merge algebra uses; its lowercase serde form keeps
+    /// stored `pypiron-origin` values byte-identical.
     #[serde(
         rename = "pypiron-origin",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    origin: Option<StatusOrigin>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum StatusOrigin {
-    Private,
-    Mirror,
+    origin: Option<Origin>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -92,7 +88,7 @@ fn is_zero(value: &u64) -> bool {
 pub struct VersionedProjectStatus {
     pub doc: ProjectStatusDoc,
     pub epoch: u64,
-    pub(crate) origin: Option<StatusOrigin>,
+    pub(crate) origin: Option<Origin>,
     pub etag: String,
 }
 
@@ -184,7 +180,7 @@ pub async fn read_status_versioned(
 pub(crate) fn encode_status(
     doc: &ProjectStatusDoc,
     epoch: u64,
-    origin: Option<StatusOrigin>,
+    origin: Option<Origin>,
 ) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&StoredProjectStatus {
         doc: doc.clone(),
@@ -233,14 +229,12 @@ pub fn merge_status(
             }
         }
         (Some(left), Some(right))
-            if left.origin == Some(StatusOrigin::Private)
-                && right.origin == Some(StatusOrigin::Mirror) =>
+            if left.origin == Some(Origin::Private) && right.origin == Some(Origin::Mirror) =>
         {
             StatusWinner::Left
         }
         (Some(left), Some(right))
-            if left.origin == Some(StatusOrigin::Mirror)
-                && right.origin == Some(StatusOrigin::Private) =>
+            if left.origin == Some(Origin::Mirror) && right.origin == Some(Origin::Private) =>
         {
             StatusWinner::Right
         }
@@ -250,10 +244,10 @@ pub fn merge_status(
             StatusWinner::InSync
         }
         (Some(left), Some(right)) if left.doc == right.doc => match (left.origin, right.origin) {
-            (Some(StatusOrigin::Private), _) => StatusWinner::Left,
-            (_, Some(StatusOrigin::Private)) => StatusWinner::Right,
-            (Some(StatusOrigin::Mirror), None) => StatusWinner::Left,
-            (None, Some(StatusOrigin::Mirror)) => StatusWinner::Right,
+            (Some(Origin::Private), _) => StatusWinner::Left,
+            (_, Some(Origin::Private)) => StatusWinner::Right,
+            (Some(Origin::Mirror), None) => StatusWinner::Left,
+            (None, Some(Origin::Mirror)) => StatusWinner::Right,
             _ => StatusWinner::InSync,
         },
         (Some(left), Some(right)) => {
@@ -281,7 +275,7 @@ pub(crate) async fn put_status_if_version(
     expected_etag: Option<&str>,
     doc: &ProjectStatusDoc,
     epoch: u64,
-    origin: Option<StatusOrigin>,
+    origin: Option<Origin>,
 ) -> Result<bool> {
     let key = status_key(pkg);
     let bytes = encode_status(doc, epoch, origin)?;
@@ -298,7 +292,7 @@ pub async fn advance_status(
     storage: &dyn Storage,
     pkg: &str,
     doc: &ProjectStatusDoc,
-    origin: Option<StatusOrigin>,
+    origin: Option<Origin>,
 ) -> Result<u64> {
     for _ in 0..STATUS_CAS_ATTEMPTS {
         let current = read_status_versioned(storage, pkg).await?;
@@ -423,8 +417,7 @@ mod tests {
             r#"{"status":"quarantined","reason":"bad release","pypiron-epoch":7}"#
         );
         assert_eq!(
-            String::from_utf8(encode_status(&doc, 7, Some(StatusOrigin::Private)).unwrap())
-                .unwrap(),
+            String::from_utf8(encode_status(&doc, 7, Some(Origin::Private)).unwrap()).unwrap(),
             r#"{"status":"quarantined","reason":"bad release","pypiron-epoch":7,"pypiron-origin":"private"}"#
         );
     }
@@ -597,9 +590,9 @@ mod tests {
         );
 
         let mut private = versioned(ProjectStatus::Active, None, 1);
-        private.origin = Some(StatusOrigin::Private);
+        private.origin = Some(Origin::Private);
         let mut mirror = versioned(ProjectStatus::Quarantined, None, 99);
-        mirror.origin = Some(StatusOrigin::Mirror);
+        mirror.origin = Some(Origin::Mirror);
         assert_eq!(
             merge_status(Some(&private), Some(&mirror)),
             StatusWinner::Left,

@@ -7,6 +7,7 @@
 
 use crate::origin::{OriginState, MIRROR, PRIVATE};
 use crate::sidecar::{Sidecar, Yanked};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Upload timestamps closer than this are not trustworthy enough to order a
@@ -18,7 +19,12 @@ const CONFLICT_SKEW_MS: u64 = 2_000;
 /// a package that already holds a private or mirror claim — so the narrowing from
 /// the canonical claim type is explicit ([`TryFrom<OriginState>`]) rather than a
 /// second enum with its own parser.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// The lowercase serde form (`"private"`/`"mirror"`) is the same string persisted
+/// as the `pypiron-origin` field of a `.project-status.json` sidecar and exchanged
+/// over sync, so this one type both drives the merge and tags a status event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Origin {
     Private,
     Mirror,

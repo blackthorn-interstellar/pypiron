@@ -3831,6 +3831,12 @@ pub(crate) fn read_error(err: anyhow::Error) -> Response<Body> {
     resp
 }
 
+/// Map a write-path failure to a `500` with a `"<label>: <err>"` body — the shape
+/// the admin/mutation handlers repeat when a storage or encode step fails.
+fn internal(label: &'static str, e: impl std::fmt::Display) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("{label}: {e}"))
+}
+
 // --- Deletion + yank (PEP 592) ----------------------------------------------
 
 /// Delete an artifact. Ordering invariant: the file leaves the index first,
@@ -4121,8 +4127,7 @@ pub async fn set_yank(
         if intent_nonce.is_none() {
             intent_nonce = markers::mark_intent(storage, pkg).await.ok();
         }
-        let out = serde_json::to_vec(&sc)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
+        let out = serde_json::to_vec(&sc).map_err(|e| internal("encode", e))?;
         match storage.put_if_match(&sc_key, &etag, out).await {
             Ok(Some(_)) => {
                 wrote = true;
@@ -4130,7 +4135,7 @@ pub async fn set_yank(
             }
             Ok(None) => continue,
             Err(e) => {
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")));
+                return Err(internal("write", e));
             }
         }
     }
@@ -4246,7 +4251,7 @@ async fn write_project_status(
     } else {
         status::write_status(storage, &pkg, &doc).await
     };
-    result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
+    result.map_err(|e| internal("write", e))?;
 
     if let Err(e) = markers::commit_marker(state, storage, &pkg, intent_nonce).await {
         warn!(error=?e, "status: failed to write commit marker");
@@ -4268,7 +4273,7 @@ async fn sync_cursors_get(
     let bytes = match state.pin().storage.get_bytes(sync::CURSORS_KEY).await {
         Ok(b) => b,
         Err(e) if storage::is_not_found(&e) => b"{}".to_vec(),
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("read: {e}"))),
+        Err(e) => return Err(internal("read", e)),
     };
     Ok(([(header::CONTENT_TYPE, "application/json")], bytes))
 }
@@ -4297,7 +4302,7 @@ async fn sync_cursors_put(
             Some("application/json"),
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
+        .map_err(|e| internal("write", e))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4402,7 +4407,7 @@ async fn advisories_feed_put(
         .storage
         .put_bytes(advisories::FEED_KEY, bytes, Some("application/zip"))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
+        .map_err(|e| internal("write", e))?;
     // Load it this worker tick regardless of the reconcile period, and wake the
     // worker now so the load is ~immediate rather than up to a tick away.
     state
@@ -4446,10 +4451,7 @@ async fn audit_json(
             });
             Ok(json_response(empty))
         }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("reading audit report: {e}"),
-        )),
+        Err(e) => Err(internal("reading audit report", e)),
     }
 }
 
@@ -4503,7 +4505,7 @@ async fn sync_local_index(
     let bytes = match pinned.storage.get_bytes(&key).await {
         Ok(b) => b,
         Err(e) if storage::is_not_found(&e) => br#"{"files":[]}"#.to_vec(),
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("read: {e}"))),
+        Err(e) => return Err(internal("read", e)),
     };
     if state.buckets.is_multi() {
         let after = require_settled_package_read(&state, pinned.storage.as_ref(), &pkg)

@@ -3211,7 +3211,9 @@ async fn serve_companion(
     // The companion (`<file>.metadata` / `.provenance`) and the artifact it
     // annotates, both keyed the same way the caller keys them — derived here
     // from `(pkg, filename)` so this signature carries only what varies.
-    let artifact_filename = filename.strip_suffix(companion.suffix()).unwrap_or(filename);
+    let artifact_filename = filename
+        .strip_suffix(companion.suffix())
+        .unwrap_or(filename);
     let artifact_key = format!("{PACKAGES_PREFIX}{pkg}/{artifact_filename}");
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
     match file_visible_read_through(state, pins, pkg, &artifact_key).await {
@@ -3262,9 +3264,14 @@ async fn serve_companion(
     // must not stampede gigabytes into storage. The companion is stored when the
     // wheel itself is downloaded.
     if resp.status() == StatusCode::NOT_FOUND {
-        if let Some(upstream) =
-            proxy_companion_passthrough(state, pins.write.storage.as_ref(), pkg, filename, companion)
-                .await
+        if let Some(upstream) = proxy_companion_passthrough(
+            state,
+            pins.write.storage.as_ref(),
+            pkg,
+            filename,
+            companion,
+        )
+        .await
         {
             return upstream;
         }

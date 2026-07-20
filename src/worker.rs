@@ -2427,7 +2427,9 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
             }
         };
         match rebuild_package_indexes(state, storage, &package, None).await {
-            Ok(RebuiltPackage { still_live: live, .. }) => {
+            Ok(RebuiltPackage {
+                still_live: live, ..
+            }) => {
                 // Same paused-writer hazard as the tick: a stale intent's
                 // writer may still mutate after this rebuild's listing, so
                 // re-arm before consuming or retain the originals.

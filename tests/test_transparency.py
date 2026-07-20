@@ -60,9 +60,7 @@ def _chain_links(data_dir: Path) -> list[Path]:
     # (see tmp_sibling in src/storage.rs); it is not committed chain data. Skip it
     # so a parallel run never reads — or parses the sequence of — an uncommitted
     # link (that is how `int(p.stem)` hit `.tmp-...-0000000000000001`).
-    return sorted(
-        p for p in chain_dir.glob("*.json") if not p.name.startswith(".tmp-")
-    )
+    return sorted(p for p in chain_dir.glob("*.json") if not p.name.startswith(".tmp-"))
 
 
 def _artifact_and_sidecar(data_dir: Path, pkg: str) -> tuple[Path, Path]:

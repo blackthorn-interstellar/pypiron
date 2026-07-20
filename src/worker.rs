@@ -3116,6 +3116,85 @@ mod tests {
         items.iter().map(|(n, s)| (n.to_string(), *s)).collect()
     }
 
+    /// A minimal private/mirror sidecar for a seeded artifact — only the fields
+    /// worker tests vary (`size` to match the bytes, `origin`) are parameters;
+    /// the rest are fixed, mirroring replicate's `sc` fixture.
+    fn test_sidecar(size: u64, origin: Option<&str>) -> Sidecar {
+        Sidecar {
+            sha256: "ab".repeat(32),
+            size,
+            version: "1.0".to_string(),
+            upload_time: "2026-01-01T00:00:00Z".to_string(),
+            requires_python: None,
+            yanked: Yanked::Flag(false),
+            origin: origin.map(str::to_string),
+            upload_epoch_ms: None,
+            yank_epoch: 0,
+        }
+    }
+
+    /// The single-bucket headless `AppState` the worker end-to-end tests run
+    /// against. The two call sites differed only in `worker_interval`, so that is
+    /// the one override.
+    fn test_app_state(storage: Arc<dyn Storage>, worker_interval: Duration) -> Arc<AppState> {
+        Arc::new(AppState {
+            buckets: Arc::new(crate::buckets::BucketSet::single(storage)),
+            bucket_health: None,
+            writes_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            uploader_user: None,
+            uploader_pass: None,
+            admin_user: None,
+            admin_pass: None,
+            read_user: None,
+            read_pass: None,
+            token_signing_key: None,
+            private_prefix: None,
+            artifact_delivery: ArtifactDelivery::Auto,
+            metrics_project_labels: false,
+            access_log: false,
+            access_log_format: AccessLogFormat::Structured,
+            worker_interval,
+            reconcile_interval: Duration::from_secs(3600),
+            repl_sweep_interval: Duration::from_secs(300),
+            repl_sweep_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_request_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fanout_grace: Duration::from_secs(30),
+            intent_grace: time::Duration::seconds(900),
+            audit_on_boot: true,
+            transparency: true,
+            wait_on_upload: false,
+            wait_on_upload_timeout: Duration::from_secs(1),
+            lease_ttl: Duration::from_secs(30),
+            index_cache: Arc::new(crate::cache::IndexCache::new(crate::cache::INDEX_CACHE_TTL)),
+            project_cache: Arc::new(crate::project_cache::ProjectCache::new(
+                crate::cache::INDEX_CACHE_TTL,
+            )),
+            presign_cache: Arc::new(crate::cache::PresignCache::new(
+                crate::cache::PRESIGN_CACHE_TTL,
+            )),
+            spool_dir: std::env::temp_dir(),
+            global_names: Arc::new(tokio::sync::Mutex::new(None)),
+            inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
+            worker_nudge: Arc::new(tokio::sync::Notify::new()),
+            empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            counters: Arc::new(crate::counters::Counters::disabled()),
+            download_board: Arc::new(std::sync::Mutex::new(None)),
+            proxy: None,
+            started: std::time::Instant::now(),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            advisory_feed: None,
+            malware_block: false,
+            malware_probe: Duration::ZERO,
+            advisories: Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::advisories::AdvisoryState::default(),
+            ))),
+            advisory_reload_asap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
     #[test]
     fn marker_nonces_carry_randomized_process_entropy() {
         let first = marker_nonce();
@@ -3155,18 +3234,7 @@ mod tests {
         storage.insert(&key, b"artifact".to_vec());
         storage.insert(
             &sidecar_key(&key),
-            serde_json::to_vec(&Sidecar {
-                sha256: "ab".repeat(32),
-                size: 8,
-                version: "1.0".to_string(),
-                upload_time: "2026-01-01T00:00:00Z".to_string(),
-                requires_python: None,
-                yanked: Yanked::Flag(false),
-                origin: Some(crate::origin::PRIVATE.to_string()),
-                upload_epoch_ms: None,
-                yank_epoch: 0,
-            })
-            .unwrap(),
+            serde_json::to_vec(&test_sidecar(8, Some(crate::origin::PRIVATE))).unwrap(),
         );
     }
 
@@ -3270,18 +3338,7 @@ mod tests {
         first.insert(&artifact, b"leased bucket bytes".to_vec());
         first.insert(
             &sidecar_key(&artifact),
-            serde_json::to_vec(&Sidecar {
-                sha256: "ab".repeat(32),
-                size: 19,
-                version: "1.0".to_string(),
-                upload_time: "2026-01-01T00:00:00Z".to_string(),
-                requires_python: None,
-                yanked: Yanked::Flag(false),
-                origin: Some(crate::origin::PRIVATE.to_string()),
-                upload_epoch_ms: None,
-                yank_epoch: 0,
-            })
-            .unwrap(),
+            serde_json::to_vec(&test_sidecar(19, Some(crate::origin::PRIVATE))).unwrap(),
         );
         mark_dirty(first.as_ref(), pkg).await.unwrap();
 
@@ -3507,18 +3564,7 @@ mod tests {
         );
         objects.insert(
             format!("{PACKAGES_PREFIX}{pkg}/{wheel}{SIDECAR_SUFFIX}"),
-            serde_json::to_vec(&Sidecar {
-                sha256: "ab".repeat(32),
-                size: 16,
-                version: "1.0".into(),
-                upload_time: "2026-01-01T00:00:00Z".into(),
-                requires_python: None,
-                yanked: Yanked::Flag(false),
-                origin: None,
-                upload_epoch_ms: None,
-                yank_epoch: 0,
-            })
-            .unwrap(),
+            serde_json::to_vec(&test_sidecar(16, None)).unwrap(),
         );
         objects.insert(
             format!("{SIMPLE_PREFIX}index.json"),
@@ -3528,62 +3574,7 @@ mod tests {
             objects: Mutex::new(objects),
             sweep_entered: StdAtomicBool::new(false),
         });
-        let state = Arc::new(AppState {
-            buckets: Arc::new(crate::buckets::BucketSet::single(storage.clone())),
-            bucket_health: None,
-            writes_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            uploader_user: None,
-            uploader_pass: None,
-            admin_user: None,
-            admin_pass: None,
-            read_user: None,
-            read_pass: None,
-            token_signing_key: None,
-            private_prefix: None,
-            artifact_delivery: ArtifactDelivery::Auto,
-            metrics_project_labels: false,
-            access_log: false,
-            access_log_format: AccessLogFormat::Structured,
-            worker_interval: Duration::from_secs(10),
-            reconcile_interval: Duration::from_secs(3600),
-            repl_sweep_interval: Duration::from_secs(300),
-            repl_sweep_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_request_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            fanout_grace: Duration::from_secs(30),
-            intent_grace: time::Duration::seconds(900),
-            audit_on_boot: true,
-            transparency: true,
-            wait_on_upload: false,
-            wait_on_upload_timeout: Duration::from_secs(1),
-            lease_ttl: Duration::from_secs(30),
-            index_cache: Arc::new(crate::cache::IndexCache::new(crate::cache::INDEX_CACHE_TTL)),
-            project_cache: Arc::new(crate::project_cache::ProjectCache::new(
-                crate::cache::INDEX_CACHE_TTL,
-            )),
-            presign_cache: Arc::new(crate::cache::PresignCache::new(
-                crate::cache::PRESIGN_CACHE_TTL,
-            )),
-            spool_dir: std::env::temp_dir(),
-            global_names: Arc::new(tokio::sync::Mutex::new(None)),
-            inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
-            worker_nudge: Arc::new(tokio::sync::Notify::new()),
-            empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            metrics: Arc::new(crate::metrics::Metrics::new()),
-            counters: Arc::new(crate::counters::Counters::disabled()),
-            download_board: Arc::new(std::sync::Mutex::new(None)),
-            proxy: None,
-            started: std::time::Instant::now(),
-            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            advisory_feed: None,
-            malware_block: false,
-            malware_probe: Duration::ZERO,
-            advisories: Arc::new(std::sync::RwLock::new(Arc::new(
-                crate::advisories::AdvisoryState::default(),
-            ))),
-            advisory_reload_asap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        });
+        let state = test_app_state(storage.clone(), Duration::from_secs(10));
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let worker = tokio::spawn(run_worker_until(state.clone(), shutdown_rx));
@@ -3631,18 +3622,7 @@ mod tests {
         );
         objects.insert(
             format!("{PACKAGES_PREFIX}{pkg}/{wheel}{SIDECAR_SUFFIX}"),
-            serde_json::to_vec(&Sidecar {
-                sha256: "ab".repeat(32),
-                size: 16,
-                version: "1.0".into(),
-                upload_time: "2026-01-01T00:00:00Z".into(),
-                requires_python: None,
-                yanked: Yanked::Flag(false),
-                origin: None,
-                upload_epoch_ms: None,
-                yank_epoch: 0,
-            })
-            .unwrap(),
+            serde_json::to_vec(&test_sidecar(16, None)).unwrap(),
         );
         // Global index already lists the package, so the tick path skips the
         // global rebuild (which would also hit the stalled list_all).
@@ -3655,62 +3635,7 @@ mod tests {
             objects: Mutex::new(objects),
             sweep_entered: StdAtomicBool::new(false),
         });
-        let state = Arc::new(AppState {
-            buckets: Arc::new(crate::buckets::BucketSet::single(storage.clone())),
-            bucket_health: None,
-            writes_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            uploader_user: None,
-            uploader_pass: None,
-            admin_user: None,
-            admin_pass: None,
-            read_user: None,
-            read_pass: None,
-            token_signing_key: None,
-            private_prefix: None,
-            artifact_delivery: ArtifactDelivery::Auto,
-            metrics_project_labels: false,
-            access_log: false,
-            access_log_format: AccessLogFormat::Structured,
-            worker_interval: Duration::from_millis(10),
-            reconcile_interval: Duration::from_secs(3600),
-            repl_sweep_interval: Duration::from_secs(300),
-            repl_sweep_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_request_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            fanout_grace: Duration::from_secs(30),
-            intent_grace: time::Duration::seconds(900),
-            audit_on_boot: true,
-            transparency: true,
-            wait_on_upload: false,
-            wait_on_upload_timeout: Duration::from_secs(1),
-            lease_ttl: Duration::from_secs(30),
-            index_cache: Arc::new(crate::cache::IndexCache::new(crate::cache::INDEX_CACHE_TTL)),
-            project_cache: Arc::new(crate::project_cache::ProjectCache::new(
-                crate::cache::INDEX_CACHE_TTL,
-            )),
-            presign_cache: Arc::new(crate::cache::PresignCache::new(
-                crate::cache::PRESIGN_CACHE_TTL,
-            )),
-            spool_dir: std::env::temp_dir(),
-            global_names: Arc::new(tokio::sync::Mutex::new(None)),
-            inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
-            worker_nudge: Arc::new(tokio::sync::Notify::new()),
-            empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            metrics: Arc::new(crate::metrics::Metrics::new()),
-            counters: Arc::new(crate::counters::Counters::disabled()),
-            download_board: Arc::new(std::sync::Mutex::new(None)),
-            proxy: None,
-            started: std::time::Instant::now(),
-            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            advisory_feed: None,
-            malware_block: false,
-            malware_probe: Duration::ZERO,
-            advisories: Arc::new(std::sync::RwLock::new(Arc::new(
-                crate::advisories::AdvisoryState::default(),
-            ))),
-            advisory_reload_asap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        });
+        let state = test_app_state(storage.clone(), Duration::from_millis(10));
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let worker = tokio::spawn(run_worker_until(state, shutdown_rx));

@@ -2701,23 +2701,51 @@ async fn file_visible_read_through(
 }
 
 async fn simple_root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
-    serve_root_index(&state, accepts_json(&headers), &headers).await
+    serve_root_index(&state, IndexFormat::negotiated(&headers), &headers).await
 }
 
 async fn simple_root_json(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    serve_root_index(&state, true, &headers).await
+    serve_root_index(&state, IndexFormat::Json, &headers).await
+}
+
+/// Which representation of a `/simple/` index to serve: PEP 691 JSON or the
+/// legacy HTML. An explicit `…/index.json` route forces `Json`; a bare route
+/// carries the format it declares (`Html`) and content-negotiates up from there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexFormat {
+    Html,
+    Json,
+}
+
+impl IndexFormat {
+    fn is_json(self) -> bool {
+        matches!(self, IndexFormat::Json)
+    }
+
+    /// The content-negotiated format for a route that didn't force one.
+    fn negotiated(headers: &HeaderMap) -> Self {
+        if accepts_json(headers) {
+            IndexFormat::Json
+        } else {
+            IndexFormat::Html
+        }
+    }
 }
 
 /// The global `/simple/` index, in JSON or HTML.
-async fn serve_root_index(state: &AppState, json: bool, headers: &HeaderMap) -> Response<Body> {
+async fn serve_root_index(
+    state: &AppState,
+    format: IndexFormat,
+    headers: &HeaderMap,
+) -> Response<Body> {
     if !state.is_reader(headers) {
         return unauthorized();
     }
     let pinned = state.pin();
-    let (key, ct) = if json {
+    let (key, ct) = if format.is_json() {
         (format!("{SIMPLE_PREFIX}index.json"), CT_JSON)
     } else {
         (format!("{SIMPLE_PREFIX}index.html"), CT_HTML)
@@ -2730,7 +2758,7 @@ async fn simple_pkg(
     Path(raw): Path<String>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    serve_pkg_index(&state, &raw, false, &headers).await
+    serve_pkg_index(&state, &raw, IndexFormat::Html, &headers).await
 }
 
 async fn simple_pkg_json(
@@ -2738,7 +2766,7 @@ async fn simple_pkg_json(
     Path(raw): Path<String>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    serve_pkg_index(&state, &raw, true, &headers).await
+    serve_pkg_index(&state, &raw, IndexFormat::Json, &headers).await
 }
 
 /// A package's `/simple/<pkg>/` page. `force_json` is the explicit-`index.json`
@@ -2747,7 +2775,7 @@ async fn simple_pkg_json(
 async fn serve_pkg_index(
     state: &AppState,
     raw: &str,
-    force_json: bool,
+    requested: IndexFormat,
     headers: &HeaderMap,
 ) -> Response<Body> {
     if !state.is_reader(headers) {
@@ -2759,7 +2787,7 @@ async fn serve_pkg_index(
     // PEP 503: the canonical URL is the normalized one; everything else 301s
     // there, so URL-keyed caches (CDNs, edge proxies) never split entries.
     if raw != pkg {
-        let target = if force_json {
+        let target = if requested.is_json() {
             format!("/simple/{pkg}/index.json")
         } else {
             format!("/simple/{pkg}/")
@@ -2775,8 +2803,12 @@ async fn serve_pkg_index(
     let read_pinned = state.read_pin();
     let write_pinned = state.pin();
     let same_pin = read_pinned.index == write_pinned.index;
-    let json = force_json || accepts_json(headers);
-    let (key, ct) = if json {
+    let format = if requested.is_json() {
+        IndexFormat::Json
+    } else {
+        IndexFormat::negotiated(headers)
+    };
+    let (key, ct) = if format.is_json() {
         (format!("{SIMPLE_PREFIX}{pkg}/index.json"), CT_JSON)
     } else {
         (format!("{SIMPLE_PREFIX}{pkg}/index.html"), CT_HTML)
@@ -2785,7 +2817,7 @@ async fn serve_pkg_index(
     // Upstream (proxy) path: eligibility, render, and the mid-serve coherence
     // recheck all run on the write pin inside `proxy_package_index`.
     if let Some(resp) =
-        proxy_package_index(state, write_pinned.storage.as_ref(), &pkg, json, headers).await
+        proxy_package_index(state, write_pinned.storage.as_ref(), &pkg, format, headers).await
     {
         return resp;
     }
@@ -2992,7 +3024,7 @@ async fn proxy_package_index(
     state: &AppState,
     storage: &dyn Storage,
     pkg: &str,
-    json: bool,
+    format: IndexFormat,
     headers: &HeaderMap,
 ) -> Option<Response<Body>> {
     let proxy = state.proxy.as_ref()?;
@@ -3012,7 +3044,10 @@ async fn proxy_package_index(
         // questions optimistically (the dependency-confusion direction).
         Err(e) => return Some(read_error(e)),
     }
-    let rendered = match proxy.package_index(state, storage, pkg, json).await {
+    let rendered = match proxy
+        .package_index(state, storage, pkg, format.is_json())
+        .await
+    {
         Ok(Some(rendered)) => rendered,
         Ok(None) => return None,
         Err(error) => return Some(read_error(error)),
@@ -3026,7 +3061,10 @@ async fn proxy_package_index(
     } else {
         builder
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, if json { CT_JSON } else { CT_HTML })
+            .header(
+                header::CONTENT_TYPE,
+                if format.is_json() { CT_JSON } else { CT_HTML },
+            )
             .header(header::CONTENT_LENGTH, rendered.body.len())
             .body(Body::from(rendered.body.clone()))
     };

@@ -266,10 +266,15 @@ def http_head(
     return _http_request(url, method="HEAD", headers=headers, timeout=timeout)
 
 
-def http_get_no_redirect(
-    url: str, *, headers: Optional[Dict[str, str]] = None, timeout: float = 10.0
+def _raw_request(
+    method: str,
+    url: str,
+    *,
+    data: Optional[bytes] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = 10.0,
 ) -> Tuple[int, bytes, Dict[str, str]]:
-    """GET without following redirects (for asserting 302s)."""
+    """Issue one request without following redirects (for asserting raw 3xx)."""
     import http.client
     from urllib.parse import urlparse
 
@@ -277,13 +282,20 @@ def http_get_no_redirect(
     conn = http.client.HTTPConnection(p.hostname, p.port, timeout=timeout)
     try:
         path = p.path + (f"?{p.query}" if p.query else "")
-        conn.request("GET", path, headers=headers or {})
+        conn.request(method, path, body=data, headers=headers or {})
         resp = conn.getresponse()
         body = resp.read()
-        headers = {k.lower(): v for k, v in resp.getheaders()}
-        return resp.status, body, headers
+        resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+        return resp.status, body, resp_headers
     finally:
         conn.close()
+
+
+def http_get_no_redirect(
+    url: str, *, headers: Optional[Dict[str, str]] = None, timeout: float = 10.0
+) -> Tuple[int, bytes, Dict[str, str]]:
+    """GET without following redirects (for asserting 302s)."""
+    return _raw_request("GET", url, headers=headers, timeout=timeout)
 
 
 def _post_no_redirect(
@@ -294,20 +306,7 @@ def _post_no_redirect(
     timeout: float = 10.0,
 ) -> Tuple[int, bytes, Dict[str, str]]:
     """POST without following redirects (for asserting the raw status)."""
-    import http.client
-    from urllib.parse import urlparse
-
-    p = urlparse(url)
-    conn = http.client.HTTPConnection(p.hostname, p.port, timeout=timeout)
-    try:
-        path = p.path + (f"?{p.query}" if p.query else "")
-        conn.request("POST", path, body=data, headers=headers or {})
-        resp = conn.getresponse()
-        body = resp.read()
-        resp_headers = {k.lower(): v for k, v in resp.getheaders()}
-        return resp.status, body, resp_headers
-    finally:
-        conn.close()
+    return _raw_request("POST", url, data=data, headers=headers, timeout=timeout)
 
 
 def http_request_auth(
@@ -349,18 +348,40 @@ def get_index_json(simple_url: str, package: Optional[str] = None, *, timeout: f
     )
 
 
+# Sentinel a predicate returns while the condition is not yet met; anything
+# else (including None) counts as success and is handed back to the caller.
+_PENDING = object()
+
+
+def _poll_until(predicate, *, timeout: float, interval: float):
+    """Call `predicate()` until it returns a non-`_PENDING` value or `timeout`
+    elapses, sleeping `interval` between tries. Returns the predicate's value on
+    success, or `_PENDING` if it timed out — the caller decides how to raise."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = predicate()
+        if result is not _PENDING:
+            return result
+        time.sleep(interval)
+    return _PENDING
+
+
 def wait_http_ok(url: str, *, timeout: float = 15.0, interval: float = 0.1) -> None:
     """Poll until GET returns 2xx or timeout."""
-    deadline = time.time() + timeout
     last_err = None
-    while time.time() < deadline:
+
+    def probe():
+        nonlocal last_err
         try:
             code, _, _ = _http_request(url)
             if 200 <= code < 300:
-                return
+                return True
         except Exception as e:  # noqa: BLE001
             last_err = e
-        time.sleep(interval)
+        return _PENDING
+
+    if _poll_until(probe, timeout=timeout, interval=interval) is not _PENDING:
+        return
     if last_err:
         raise TimeoutError(f"Timed out waiting for {url}: last error: {last_err}")
     raise TimeoutError(f"Timed out waiting for {url}")
@@ -368,15 +389,19 @@ def wait_http_ok(url: str, *, timeout: float = 15.0, interval: float = 0.1) -> N
 
 def wait_http_responding(url: str, *, timeout: float = 15.0, interval: float = 0.1) -> None:
     """Poll until GET returns any HTTP status (readiness for auth-gated servers)."""
-    deadline = time.time() + timeout
     last_err = None
-    while time.time() < deadline:
+
+    def probe():
+        nonlocal last_err
         try:
             _http_request(url)
-            return
+            return True
         except Exception as e:  # noqa: BLE001
             last_err = e
-        time.sleep(interval)
+        return _PENDING
+
+    if _poll_until(probe, timeout=timeout, interval=interval) is not _PENDING:
+        return
     raise TimeoutError(f"Timed out waiting for {url}: last error: {last_err}")
 
 
@@ -415,8 +440,8 @@ def wait_for_file_in_index(
     simple_url: str, package: str, filename: str, *, timeout: float = 30.0
 ) -> dict:
     """Poll the PEP 691 package index until `filename` appears; return the index doc."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+
+    def probe():
         try:
             data = http_get_json(
                 f"{simple_url}{package}/index.json", headers={"Accept": ACCEPT_PEP691}
@@ -425,7 +450,11 @@ def wait_for_file_in_index(
                 return data
         except (RuntimeError, ConnectionError):
             pass
-        time.sleep(0.2)
+        return _PENDING
+
+    result = _poll_until(probe, timeout=timeout, interval=0.2)
+    if result is not _PENDING:
+        return result
     raise TimeoutError(f"{filename} did not appear in index for {package} within {timeout}s")
 
 
@@ -442,15 +471,18 @@ def wait_for_project_in_global(
     global index right after an upload must wait for this or race the worker.
     """
     accept = {"Accept": ACCEPT_PEP691, **(headers or {})}
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+
+    def probe():
         try:
             data = http_get_json(f"{simple_url}index.json", headers=accept)
             if package in [p.get("name") for p in data.get("projects", [])]:
-                return
+                return True
         except (RuntimeError, ConnectionError):
             pass
-        time.sleep(0.2)
+        return _PENDING
+
+    if _poll_until(probe, timeout=timeout, interval=0.2) is not _PENDING:
+        return
     raise TimeoutError(f"{package} did not appear in the global index within {timeout}s")
 
 

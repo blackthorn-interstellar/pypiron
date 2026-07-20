@@ -1683,17 +1683,48 @@ impl ObjectStorage {
         }
     }
 
+    /// Classify a non-typed object_store error into an `anyhow` error: a missing
+    /// bucket/container becomes the [`BucketUnavailable`] fail-over signal (so the
+    /// health controller can move selection); every other error keeps its
+    /// operation context. Used where the store call has no "missing object" case.
+    fn store_err(&self, error: OsError, op: &str, key: impl std::fmt::Display) -> anyhow::Error {
+        if object_store_is_missing_bucket(&error) {
+            bucket_unavailable(self.backend, &error)
+        } else {
+            anyhow::Error::from(error).context(format!("{}: {op} {key}", self.backend))
+        }
+    }
+
+    /// Classify a GET-family error where a typed `NotFound` means "missing
+    /// object". `None` says the object is simply absent — the caller decides what
+    /// that means (404, empty listing, skip); `Some` is a fatal error already
+    /// wrapped with the bucket-outage signal or operation context. Note the
+    /// asymmetry with [`Self::store_err`]: here a missing bucket is only surfaced
+    /// through the typed `NotFound` path, so a non-`NotFound` error is never
+    /// reclassified as a bucket outage.
+    fn classify_get(
+        &self,
+        error: OsError,
+        op: &str,
+        key: impl std::fmt::Display,
+    ) -> Option<anyhow::Error> {
+        match error {
+            e @ OsError::NotFound { .. } if object_store_is_missing_bucket(&e) => {
+                Some(bucket_unavailable(self.backend, &e))
+            }
+            OsError::NotFound { .. } => None,
+            e => Some(anyhow::Error::from(e).context(format!("{}: {op} {key}", self.backend))),
+        }
+    }
+
     /// GET the whole object as a 200 response.
     async fn full_response(&self, path: &OsPath, key: &str) -> Result<Response<Body>> {
         let res = match self.store.get(path).await {
             Ok(r) => r,
-            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
-                return Err(bucket_unavailable(self.backend, &e))
-            }
-            Err(OsError::NotFound { .. }) => return Err(NotFound(key.to_string()).into()),
-            Err(e) => {
-                return Err(anyhow::Error::from(e).context(format!("{}: get {key}", self.backend)))
-            }
+            Err(e) => match self.classify_get(e, "get", key) {
+                None => return Err(NotFound(key.to_string()).into()),
+                Some(err) => return Err(err),
+            },
         };
         let size = res.meta.size;
         let ct = content_type_of(&res.attributes);
@@ -1725,14 +1756,7 @@ impl ObjectStorage {
             .store
             .put_multipart_opts(staging, opts)
             .await
-            .map_err(|error| {
-                if object_store_is_missing_bucket(&error) {
-                    bucket_unavailable(self.backend, &error)
-                } else {
-                    anyhow::Error::from(error)
-                        .context(format!("{}: begin multipart {staging}", self.backend))
-                }
-            })?;
+            .map_err(|error| self.store_err(error, "begin multipart", staging))?;
         let mut writer = WriteMultipart::new_with_chunk_size(upload, MULTIPART_PART_SIZE);
         let mut buf = vec![0u8; READ_CHUNK];
         loop {
@@ -1763,22 +1787,20 @@ impl Storage for ObjectStorage {
     async fn head_exists(&self, key: &str) -> Result<bool> {
         match self.store.head(&self.oskey(key)).await {
             Ok(_) => Ok(true),
-            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
-                Err(bucket_unavailable(self.backend, &e))
-            }
-            Err(OsError::NotFound { .. }) => Ok(false),
-            Err(e) => Err(anyhow::Error::from(e).context(format!("{}: head {key}", self.backend))),
+            Err(e) => match self.classify_get(e, "head", key) {
+                None => Ok(false),
+                Some(err) => Err(err),
+            },
         }
     }
 
     async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
         match self.store.head(&self.oskey(key)).await {
             Ok(meta) => Ok(Some(meta.size)),
-            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
-                Err(bucket_unavailable(self.backend, &e))
-            }
-            Err(OsError::NotFound { .. }) => Ok(None),
-            Err(e) => Err(anyhow::Error::from(e).context(format!("{}: head {key}", self.backend))),
+            Err(e) => match self.classify_get(e, "head", key) {
+                None => Ok(None),
+                Some(err) => Err(err),
+            },
         }
     }
 
@@ -1802,13 +1824,10 @@ impl Storage for ObjectStorage {
         // unsatisfiable range with 416 — one HEAD, only on ranged requests.
         let size = match self.store.head(&path).await {
             Ok(m) => m.size,
-            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
-                return Err(bucket_unavailable(self.backend, &e))
-            }
-            Err(OsError::NotFound { .. }) => return Err(NotFound(key.to_string()).into()),
-            Err(e) => {
-                return Err(anyhow::Error::from(e).context(format!("{}: head {key}", self.backend)))
-            }
+            Err(e) => match self.classify_get(e, "head", key) {
+                None => return Err(NotFound(key.to_string()).into()),
+                Some(err) => return Err(err),
+            },
         };
         match parse_range(Some(raw_range), size) {
             RangeSpec::Full => self.full_response(&path, key).await,
@@ -1823,15 +1842,10 @@ impl Storage for ObjectStorage {
                 };
                 let res = match self.store.get_opts(&path, opts).await {
                     Ok(r) => r,
-                    Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
-                        return Err(bucket_unavailable(self.backend, &e))
-                    }
-                    Err(OsError::NotFound { .. }) => return Err(NotFound(key.to_string()).into()),
-                    Err(e) => {
-                        return Err(
-                            anyhow::Error::from(e).context(format!("{}: get {key}", self.backend))
-                        )
-                    }
+                    Err(e) => match self.classify_get(e, "get", key) {
+                        None => return Err(NotFound(key.to_string()).into()),
+                        Some(err) => return Err(err),
+                    },
                 };
                 let ct = content_type_of(&res.attributes);
                 let len = end - start + 1;
@@ -1855,13 +1869,7 @@ impl Storage for ObjectStorage {
         self.store
             .put_opts(&self.oskey(key), PutPayload::from(bytes), opts)
             .await
-            .map_err(|error| {
-                if object_store_is_missing_bucket(&error) {
-                    bucket_unavailable(self.backend, &error)
-                } else {
-                    anyhow::Error::from(error).context(format!("{}: put {key}", self.backend))
-                }
-            })?;
+            .map_err(|error| self.store_err(error, "put", key))?;
         Ok(())
     }
 
@@ -1883,13 +1891,7 @@ impl Storage for ObjectStorage {
         {
             Ok(_) => Ok(true),
             Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => Ok(false),
-            Err(e) if object_store_is_missing_bucket(&e) => {
-                Err(bucket_unavailable(self.backend, &e))
-            }
-            Err(e) => {
-                Err(anyhow::Error::from(e)
-                    .context(format!("{}: put_if_absent {key}", self.backend)))
-            }
+            Err(e) => Err(self.store_err(e, "put_if_absent", key)),
         }
     }
 
@@ -1923,12 +1925,7 @@ impl Storage for ObjectStorage {
         {
             Ok(()) => Ok(true),
             Err(OsError::AlreadyExists { .. }) => Ok(false),
-            Err(e) if object_store_is_missing_bucket(&e) => {
-                Err(bucket_unavailable(self.backend, &e))
-            }
-            Err(e) => {
-                Err(anyhow::Error::from(e).context(format!("{}: publish {key}", self.backend)))
-            }
+            Err(e) => Err(self.store_err(e, "publish", key)),
         };
         let _ = self.store.delete(&staging).await;
         outcome
@@ -1941,11 +1938,10 @@ impl Storage for ObjectStorage {
                 .await
                 .with_context(|| format!("{}: read {key}", self.backend))?
                 .to_vec()),
-            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
-                Err(bucket_unavailable(self.backend, &e))
-            }
-            Err(OsError::NotFound { .. }) => Err(NotFound(key.to_string()).into()),
-            Err(e) => Err(anyhow::Error::from(e).context(format!("{}: get {key}", self.backend))),
+            Err(e) => match self.classify_get(e, "get", key) {
+                None => Err(NotFound(key.to_string()).into()),
+                Some(err) => Err(err),
+            },
         }
     }
 
@@ -1959,13 +1955,7 @@ impl Storage for ObjectStorage {
             .await
         {
             Ok(result) => result,
-            Err(error) if object_store_is_missing_bucket(&error) => {
-                return Err(bucket_unavailable(self.backend, &error))
-            }
-            Err(error) => {
-                return Err(anyhow::Error::from(error)
-                    .context(format!("{}: list {dir_prefix}", self.backend)))
-            }
+            Err(error) => return Err(self.store_err(error, "list", dir_prefix)),
         };
         let mut entries: Vec<FileEntry> = res
             .objects
@@ -2004,13 +1994,7 @@ impl Storage for ObjectStorage {
         while let Some(item) = stream.next().await {
             let m = match item {
                 Ok(meta) => meta,
-                Err(error) if object_store_is_missing_bucket(&error) => {
-                    return Err(bucket_unavailable(self.backend, &error))
-                }
-                Err(error) => {
-                    return Err(anyhow::Error::from(error)
-                        .context(format!("{}: list_all {prefix}", self.backend)))
-                }
+                Err(error) => return Err(self.store_err(error, "list_all", prefix)),
             };
             let Some(key) = self.unkey(m.location.as_ref()) else {
                 continue;
@@ -2051,13 +2035,7 @@ impl Storage for ObjectStorage {
         while let Some(item) = stream.next().await {
             let m = match item {
                 Ok(meta) => meta,
-                Err(error) if object_store_is_missing_bucket(&error) => {
-                    return Err(bucket_unavailable(self.backend, &error))
-                }
-                Err(error) => {
-                    return Err(anyhow::Error::from(error)
-                        .context(format!("{}: list_page {prefix}", self.backend)))
-                }
+                Err(error) => return Err(self.store_err(error, "list_page", prefix)),
             };
             let Some(key) = self.unkey(m.location.as_ref()) else {
                 continue;
@@ -2080,15 +2058,10 @@ impl Storage for ObjectStorage {
         for k in keys {
             match self.store.delete(&self.oskey(k)).await {
                 Ok(()) => {}
-                Err(error @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&error) => {
-                    return Err(bucket_unavailable(self.backend, &error))
-                }
-                Err(OsError::NotFound { .. }) => {}
-                Err(error) => {
-                    return Err(
-                        anyhow::Error::from(error).context(format!("{}: delete {k}", self.backend))
-                    )
-                }
+                Err(error) => match self.classify_get(error, "delete", k) {
+                    None => {}
+                    Some(err) => return Err(err),
+                },
             }
         }
         Ok(())
@@ -2109,11 +2082,10 @@ impl Storage for ObjectStorage {
                     .to_vec();
                 Ok(Some((bytes, etag)))
             }
-            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
-                Err(bucket_unavailable(self.backend, &e))
-            }
-            Err(OsError::NotFound { .. }) => Ok(None),
-            Err(e) => Err(anyhow::Error::from(e).context(format!("{}: get {key}", self.backend))),
+            Err(e) => match self.classify_get(e, "get", key) {
+                None => Ok(None),
+                Some(err) => Err(err),
+            },
         }
     }
 
@@ -2129,11 +2101,7 @@ impl Storage for ObjectStorage {
         {
             Ok(res) => Ok(Some(pack_version(&res.e_tag, &res.version))),
             Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => Ok(None),
-            Err(e) if object_store_is_missing_bucket(&e) => {
-                Err(bucket_unavailable(self.backend, &e))
-            }
-            Err(e) => Err(anyhow::Error::from(e)
-                .context(format!("{}: put_if_none_match {key}", self.backend))),
+            Err(e) => Err(self.store_err(e, "put_if_none_match", key)),
         }
     }
 
@@ -2148,13 +2116,10 @@ impl Storage for ObjectStorage {
             // A failed precondition, a concurrent conditional write, or a
             // since-deleted object: we lost, cleanly.
             Err(OsError::Precondition { .. } | OsError::AlreadyExists { .. }) => Ok(None),
-            Err(e @ OsError::NotFound { .. }) if object_store_is_missing_bucket(&e) => {
-                Err(bucket_unavailable(self.backend, &e))
-            }
-            Err(OsError::NotFound { .. }) => Ok(None),
-            Err(e) => {
-                Err(anyhow::Error::from(e).context(format!("{}: put_if_match {key}", self.backend)))
-            }
+            Err(e) => match self.classify_get(e, "put_if_match", key) {
+                None => Ok(None),
+                Some(err) => Err(err),
+            },
         }
     }
 }

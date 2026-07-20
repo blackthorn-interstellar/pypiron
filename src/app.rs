@@ -1406,18 +1406,19 @@ async fn log_requests(
         let time = OffsetDateTime::now_utc()
             .format(CLF_TIME)
             .unwrap_or_default();
-        let line = format_clf(
-            &host,
-            authuser.as_deref(),
-            &time,
-            &method,
-            &target,
-            &format!("{version:?}"),
-            status.as_u16(),
+        let proto = format!("{version:?}");
+        let line = format_clf(&AccessLogLine {
+            host: &host,
+            authuser: authuser.as_deref(),
+            time: &time,
+            method: &method,
+            target: &target,
+            proto: &proto,
+            status: status.as_u16(),
             bytes,
-            referer.as_deref(),
-            ua.as_deref(),
-        );
+            referer: referer.as_deref(),
+            ua: ua.as_deref(),
+        });
         // CLF bypasses tracing; a locked, whole-line write keeps it from
         // interleaving with the diagnostic log on the shared stdout.
         let mut out = std::io::stdout().lock();
@@ -1482,21 +1483,37 @@ fn client_ip(headers: &HeaderMap, peer: Option<std::net::IpAddr>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-/// Render one Combined Log Format line. Pure (no clock) so it unit-tests; the
-/// caller supplies the formatted timestamp. Missing fields render as `-`.
-#[allow(clippy::too_many_arguments)]
-fn format_clf(
-    host: &str,
-    authuser: Option<&str>,
-    time: &str,
-    method: &Method,
-    target: &str,
-    proto: &str,
+/// The fields of one Combined Log Format line, borrowed from the request/response
+/// parts the caller has already computed. Grouped so [`format_clf`] reads by name.
+#[derive(Clone, Copy)]
+struct AccessLogLine<'a> {
+    host: &'a str,
+    authuser: Option<&'a str>,
+    time: &'a str,
+    method: &'a Method,
+    target: &'a str,
+    proto: &'a str,
     status: u16,
     bytes: Option<u64>,
-    referer: Option<&str>,
-    ua: Option<&str>,
-) -> String {
+    referer: Option<&'a str>,
+    ua: Option<&'a str>,
+}
+
+/// Render one Combined Log Format line. Pure (no clock) so it unit-tests; the
+/// caller supplies the formatted timestamp. Missing fields render as `-`.
+fn format_clf(line: &AccessLogLine<'_>) -> String {
+    let &AccessLogLine {
+        host,
+        authuser,
+        time,
+        method,
+        target,
+        proto,
+        status,
+        bytes,
+        referer,
+        ua,
+    } = line;
     let dash = |s: Option<&str>| match s {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => "-".to_string(),
@@ -5020,34 +5037,34 @@ mod tests {
     fn clf_line_full_and_missing() {
         // All fields present.
         assert_eq!(
-            format_clf(
-                "10.0.0.5",
-                Some("ci"),
-                "10/Oct/2000:13:55:36 +0000",
-                &Method::GET,
-                "/simple/flask/",
-                "HTTP/1.1",
-                200,
-                Some(1532),
-                Some("http://ref"),
-                Some("uv/0.4.0"),
-            ),
+            format_clf(&AccessLogLine {
+                host: "10.0.0.5",
+                authuser: Some("ci"),
+                time: "10/Oct/2000:13:55:36 +0000",
+                method: &Method::GET,
+                target: "/simple/flask/",
+                proto: "HTTP/1.1",
+                status: 200,
+                bytes: Some(1532),
+                referer: Some("http://ref"),
+                ua: Some("uv/0.4.0"),
+            }),
             "10.0.0.5 - ci [10/Oct/2000:13:55:36 +0000] \"GET /simple/flask/ HTTP/1.1\" 200 1532 \"http://ref\" \"uv/0.4.0\""
         );
         // Missing host/user/bytes/referer/ua all collapse to `-`.
         assert_eq!(
-            format_clf(
-                "",
-                None,
-                "10/Oct/2000:13:55:36 +0000",
-                &Method::POST,
-                "/legacy/",
-                "HTTP/1.1",
-                503,
-                None,
-                None,
-                None,
-            ),
+            format_clf(&AccessLogLine {
+                host: "",
+                authuser: None,
+                time: "10/Oct/2000:13:55:36 +0000",
+                method: &Method::POST,
+                target: "/legacy/",
+                proto: "HTTP/1.1",
+                status: 503,
+                bytes: None,
+                referer: None,
+                ua: None,
+            }),
             "- - - [10/Oct/2000:13:55:36 +0000] \"POST /legacy/ HTTP/1.1\" 503 - \"-\" \"-\""
         );
     }
@@ -5056,18 +5073,18 @@ mod tests {
     fn clf_authuser_drops_control_chars() {
         // A base64 username can decode to arbitrary UTF-8, including CR/LF/ESC.
         // Those must not survive into the line: no forged second record, no ANSI.
-        let line = format_clf(
-            "10.0.0.5",
-            Some("evil\r\n10.0.0.6 - - [x] \"GET /forged\" 200 0 \"\" \"\"\x1b[31m"),
-            "10/Oct/2000:13:55:36 +0000",
-            &Method::GET,
-            "/simple/flask/",
-            "HTTP/1.1",
-            200,
-            Some(1532),
-            None,
-            None,
-        );
+        let line = format_clf(&AccessLogLine {
+            host: "10.0.0.5",
+            authuser: Some("evil\r\n10.0.0.6 - - [x] \"GET /forged\" 200 0 \"\" \"\"\x1b[31m"),
+            time: "10/Oct/2000:13:55:36 +0000",
+            method: &Method::GET,
+            target: "/simple/flask/",
+            proto: "HTTP/1.1",
+            status: 200,
+            bytes: Some(1532),
+            referer: None,
+            ua: None,
+        });
         assert!(!line.contains('\n'), "no embedded newline: {line:?}");
         assert!(!line.contains('\r'), "no embedded CR: {line:?}");
         assert!(!line.contains('\x1b'), "no ANSI escape: {line:?}");

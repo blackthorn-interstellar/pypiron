@@ -6,6 +6,7 @@
 //! This is not a public API — it is the server's own internals made linkable
 //! for verification. Nothing here is semver-stable.
 
+pub mod admin;
 pub mod advisories;
 pub mod app;
 pub mod bucket_health;

@@ -625,7 +625,7 @@ fn mal_rules(adv: &OsvAdvisory) -> Vec<(String, MalRule)> {
 /// `Arc<RwLock<Arc<AdvisoryState>>>`: a reader takes the lock, clones the inner
 /// `Arc`, and drops the guard immediately, so probes never contend with a
 /// refresh swap. A poisoned lock is recovered, never a panic path.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct AdvisoryState {
     /// The parsed views, or `None` until the first snapshot loads (armed but
     /// unfed — nothing to block yet, degraded not fatal). Behind an `Arc` so a
@@ -1154,9 +1154,9 @@ async fn reload(ctx: &RefreshCtx<'_>) -> Result<bool> {
         // A fresh baseline clears the probe overlay: it now covers everything up
         // to its watermark, and the next probe backfills anything still newer.
         overlay: Arc::default(),
-        quarantined: guard.quarantined.clone(),
-        quarantined_etag: guard.quarantined_etag.clone(),
         loaded_unix: unix_now_secs(),
+        // Carry the quarantined set + its etag forward (read under this lock).
+        ..(**guard).clone()
     });
     Ok(true)
 }
@@ -1213,14 +1213,9 @@ fn swap_quarantined(
 ) {
     let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
     *guard = Arc::new(AdvisoryState {
-        db: guard.db.clone(),
-        zip_sha256: guard.zip_sha256.clone(),
-        zip: guard.zip.clone(),
-        storage_etag: guard.storage_etag.clone(),
-        overlay: guard.overlay.clone(),
         quarantined,
         quarantined_etag,
-        loaded_unix: guard.loaded_unix,
+        ..(**guard).clone()
     });
 }
 
@@ -1404,14 +1399,8 @@ fn apply_probe_overlay(
     let mut overlay = (*guard.overlay).clone();
     merge_overlay(&mut overlay, added, withdrawn);
     *guard = Arc::new(AdvisoryState {
-        db: guard.db.clone(),
-        zip_sha256: guard.zip_sha256.clone(),
-        zip: guard.zip.clone(),
-        storage_etag: guard.storage_etag.clone(),
         overlay: Arc::new(overlay),
-        quarantined: guard.quarantined.clone(),
-        quarantined_etag: guard.quarantined_etag.clone(),
-        loaded_unix: guard.loaded_unix,
+        ..(**guard).clone()
     });
 }
 

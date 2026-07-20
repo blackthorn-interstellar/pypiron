@@ -126,7 +126,7 @@ pub async fn project_version_page(
 /// 404 a hosted release).
 ///
 /// The view's list is derived exactly as the page's own authoritative list is —
-/// sidecar version, filename-inferred fallback (`render::pep691_package_json` /
+/// sidecar version, filename-inferred fallback (`render::pep691_project_json` /
 /// `web::file_version`) — so membership here has parity with the real check,
 /// legacy formats included. Staleness only lags in safe directions: a deleted
 /// version still listed costs one scan that 404s properly, and a just-uploaded

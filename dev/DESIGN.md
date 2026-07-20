@@ -456,6 +456,8 @@ target. For a multi-tenant pypi.org clone it wouldn't, and we shouldn't try.
 Everything in one tree, on disk or any cloud backend (S3, GCS, Azure). This
 layout *is* the schema — treat changes to it like database migrations.
 
+**Vocabulary:** "project" is the spec/web-facing surface (the Simple API and HTML pages, per PEP 503/691); "package" is the stored entity under `packages/` below.
+
 ```
 packages/<pkg>/<filename>                # artifact, immutable once written
 packages/<pkg>/<filename>.meta.json      # sidecar (see below)

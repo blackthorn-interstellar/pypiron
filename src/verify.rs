@@ -20,7 +20,7 @@ use clap::Args as ClapArgs;
 
 use crate::names::normalize_pkg_name;
 use crate::render::{
-    pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
+    pep503_global_html, pep503_project_html, pep691_global_json, pep691_project_json, FileMetadata,
 };
 use crate::sidecar::{
     is_artifact, Sidecar, FROZEN_SUFFIX, METADATA_SUFFIX, PROVENANCE_SUFFIX, SIDECAR_SUFFIX,
@@ -243,11 +243,11 @@ async fn check_package(
         for (suffix, expected) in [
             (
                 "index.html",
-                pep503_package_html(pkg, render_files, &status),
+                pep503_project_html(pkg, render_files, &status),
             ),
             (
                 "index.json",
-                pep691_package_json(pkg, render_files, &status),
+                pep691_project_json(pkg, render_files, &status),
             ),
         ] {
             match storage.get_bytes(&format!("{base}{suffix}")).await {

@@ -508,13 +508,13 @@ impl Proxy {
             &visible
         };
         Ok(Some(if json {
-            rendered(render::pep691_package_json(
+            rendered(render::pep691_project_json(
                 pkg,
                 render_files,
                 &found.status,
             ))
         } else {
-            rendered(render::pep503_package_html(
+            rendered(render::pep503_project_html(
                 pkg,
                 render_files,
                 &found.status,
@@ -981,8 +981,8 @@ impl Proxy {
             &metas
         };
         Ok(Listing::Found(Arc::new(Found {
-            html: rendered(render::pep503_package_html(pkg, render_metas, &status)),
-            json: rendered(render::pep691_package_json(pkg, render_metas, &status)),
+            html: rendered(render::pep503_project_html(pkg, render_metas, &status)),
+            json: rendered(render::pep691_project_json(pkg, render_metas, &status)),
             files,
             status,
         })))

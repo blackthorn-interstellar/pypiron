@@ -81,7 +81,7 @@ fn pep691_meta_only() -> String {
 /// Render minimal PEP 503 per‑package HTML (with PEP 629 version meta and, for
 /// a non-active project, the PEP 792 `pypi:project-status` meta). Quarantine
 /// link-omission is the caller's job — it passes an empty `files` slice.
-pub fn pep503_package_html(
+pub fn pep503_project_html(
     package: &str,
     files: &[FileMetadata],
     status: &ProjectStatusDoc,
@@ -206,7 +206,7 @@ struct Pep691Meta<'a> {
 /// PEP 691 + PEP 700 package JSON (with the PEP 792 `project-status` object for
 /// a non-active project). Quarantine link-omission is the caller's job — it
 /// passes an empty `files` slice, which empties `versions` too.
-pub fn pep691_package_json(
+pub fn pep691_project_json(
     package: &str,
     files: &[FileMetadata],
     status: &ProjectStatusDoc,
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn package_json_has_pep700_fields() {
-        let json = pep691_package_json("six", &[meta(Some("1.16.0"))], &active());
+        let json = pep691_project_json("six", &[meta(Some("1.16.0"))], &active());
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(doc["meta"]["api-version"], "1.4");
         assert_eq!(doc["versions"][0], "1.16.0");
@@ -323,14 +323,14 @@ mod tests {
 
     #[test]
     fn package_json_versions_fall_back_to_filename_inference() {
-        let json = pep691_package_json("six", &[meta(None)], &active());
+        let json = pep691_project_json("six", &[meta(None)], &active());
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(doc["versions"][0], "1.16.0");
     }
 
     #[test]
     fn package_html_has_hash_fragment_and_version_meta() {
-        let html = pep503_package_html("six", &[meta(None)], &active());
+        let html = pep503_project_html("six", &[meta(None)], &active());
         assert!(html.contains("#sha256=abc123"));
         assert!(!html.contains("data-yanked"));
         assert!(html.contains(r#"<meta name="pypi:repository-version" content="1.4">"#));
@@ -339,10 +339,10 @@ mod tests {
     #[test]
     fn active_status_is_omitted_entirely() {
         // PEP 792 lets us omit the active marker; we do, in both formats.
-        let html = pep503_package_html("six", &[meta(Some("1.16.0"))], &active());
+        let html = pep503_project_html("six", &[meta(Some("1.16.0"))], &active());
         assert!(!html.contains("pypi:project-status"));
 
-        let doc: serde_json::Value = serde_json::from_str(&pep691_package_json(
+        let doc: serde_json::Value = serde_json::from_str(&pep691_project_json(
             "six",
             &[meta(Some("1.16.0"))],
             &active(),
@@ -359,13 +359,13 @@ mod tests {
             status: ProjectStatus::Archived,
             reason: Some(r#"moved to "foo""#.into()),
         };
-        let html = pep503_package_html("six", &[meta(Some("1.16.0"))], &status);
+        let html = pep503_project_html("six", &[meta(Some("1.16.0"))], &status);
         assert!(html.contains(r#"<meta name="pypi:project-status" content="archived">"#));
         assert!(html.contains(
             r#"<meta name="pypi:project-status-reason" content="moved to &quot;foo&quot;">"#
         ));
 
-        let doc: serde_json::Value = serde_json::from_str(&pep691_package_json(
+        let doc: serde_json::Value = serde_json::from_str(&pep691_project_json(
             "six",
             &[meta(Some("1.16.0"))],
             &status,
@@ -385,12 +385,12 @@ mod tests {
         };
         assert!(status.status.blocks_downloads());
 
-        let html = pep503_package_html("six", &[], &status);
+        let html = pep503_project_html("six", &[], &status);
         assert!(html.contains(r#"<meta name="pypi:project-status" content="quarantined">"#));
         assert!(!html.contains("<a href"));
 
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[], &status)).unwrap();
+            serde_json::from_str(&pep691_project_json("six", &[], &status)).unwrap();
         assert_eq!(doc["project-status"]["status"], "quarantined");
         assert_eq!(doc["files"].as_array().unwrap().len(), 0);
         assert_eq!(doc["versions"].as_array().unwrap().len(), 0);
@@ -402,20 +402,20 @@ mod tests {
         m.requires_python = Some(">=3.9".into());
         m.core_metadata = true;
 
-        let html = pep503_package_html("six", &[m.clone()], &active());
+        let html = pep503_project_html("six", &[m.clone()], &active());
         assert!(html.contains(r#"data-requires-python="&gt;=3.9""#));
         assert!(html.contains(r#"data-core-metadata="true""#));
         assert!(html.contains(r#"data-dist-info-metadata="true""#));
 
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[m], &active())).unwrap();
+            serde_json::from_str(&pep691_project_json("six", &[m], &active())).unwrap();
         assert_eq!(doc["files"][0]["requires-python"], ">=3.9");
         assert_eq!(doc["files"][0]["core-metadata"], true);
         assert_eq!(doc["files"][0]["dist-info-metadata"], true);
 
         let plain = meta(None);
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[plain], &active())).unwrap();
+            serde_json::from_str(&pep691_project_json("six", &[plain], &active())).unwrap();
         assert!(doc["files"][0].get("requires-python").is_none());
         assert!(doc["files"][0].get("core-metadata").is_none());
     }
@@ -425,13 +425,13 @@ mod tests {
         let mut m = meta(Some("1.16.0"));
         m.provenance = true;
 
-        let html = pep503_package_html("six", &[m.clone()], &active());
+        let html = pep503_project_html("six", &[m.clone()], &active());
         assert!(html.contains(
             r#"data-provenance="/files/six/six-1.16.0-py2.py3-none-any.whl.provenance""#
         ));
 
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[m], &active())).unwrap();
+            serde_json::from_str(&pep691_project_json("six", &[m], &active())).unwrap();
         assert_eq!(
             doc["files"][0]["provenance"],
             "/files/six/six-1.16.0-py2.py3-none-any.whl.provenance"
@@ -439,10 +439,10 @@ mod tests {
 
         // Absent companion → no field / attribute at all.
         let plain = meta(None);
-        let html = pep503_package_html("six", std::slice::from_ref(&plain), &active());
+        let html = pep503_project_html("six", std::slice::from_ref(&plain), &active());
         assert!(!html.contains("data-provenance"));
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[plain], &active())).unwrap();
+            serde_json::from_str(&pep691_project_json("six", &[plain], &active())).unwrap();
         assert!(doc["files"][0].get("provenance").is_none());
     }
 
@@ -454,7 +454,7 @@ mod tests {
         let mut m = meta(Some("1.0"));
         m.filename = r#"a" onmouseover=alert(1) x.whl"#.into();
         m.sha256 = r#"b"><script>"#.into();
-        let html = pep503_package_html("six", &[m], &active());
+        let html = pep503_project_html("six", &[m], &active());
         // In the href the quote is escaped, so the attribute never terminates
         // early (the raw `href="/files/six/a"` breakout must not appear).
         assert!(
@@ -470,19 +470,19 @@ mod tests {
         let mut yanked = meta(Some("1.16.0"));
         yanked.yanked = Yanked::Reason("broken \"wheel\"".into());
 
-        let html = pep503_package_html("six", &[yanked.clone()], &active());
+        let html = pep503_project_html("six", &[yanked.clone()], &active());
         assert!(html.contains(r#"data-yanked="broken &quot;wheel&quot;""#));
 
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[yanked], &active())).unwrap();
+            serde_json::from_str(&pep691_project_json("six", &[yanked], &active())).unwrap();
         assert_eq!(doc["files"][0]["yanked"], "broken \"wheel\"");
 
         let mut flagged = meta(Some("1.16.0"));
         flagged.yanked = Yanked::Flag(true);
-        let html = pep503_package_html("six", &[flagged.clone()], &active());
+        let html = pep503_project_html("six", &[flagged.clone()], &active());
         assert!(html.contains(r#"data-yanked="""#));
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[flagged], &active())).unwrap();
+            serde_json::from_str(&pep691_project_json("six", &[flagged], &active())).unwrap();
         assert_eq!(doc["files"][0]["yanked"], true);
     }
 
@@ -514,7 +514,7 @@ mod tests {
             );
             assert_eq!(m.upload_time, None);
             let doc: serde_json::Value =
-                serde_json::from_str(&pep691_package_json("six", &[m], &active())).unwrap();
+                serde_json::from_str(&pep691_project_json("six", &[m], &active())).unwrap();
             assert!(
                 doc["files"][0].get("upload-time").is_none(),
                 "blank upload-time must be omitted, got {:?}",
@@ -530,7 +530,7 @@ mod tests {
             false,
         );
         let doc: serde_json::Value =
-            serde_json::from_str(&pep691_package_json("six", &[m], &active())).unwrap();
+            serde_json::from_str(&pep691_project_json("six", &[m], &active())).unwrap();
         assert_eq!(doc["files"][0]["upload-time"], "2026-06-11T00:00:00Z");
     }
 }

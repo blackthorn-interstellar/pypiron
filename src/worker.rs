@@ -41,7 +41,7 @@ use crate::markers::{
 };
 use crate::names::infer_version_from_filename;
 use crate::render::{
-    pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
+    pep503_global_html, pep503_project_html, pep691_global_json, pep691_project_json, FileMetadata,
     SIMPLE_HTML_CONTENT_TYPE, SIMPLE_JSON_CONTENT_TYPE,
 };
 use crate::sidecar::{
@@ -2931,8 +2931,8 @@ async fn write_pkg_indexes(
     } else {
         files
     };
-    let html = pep503_package_html(pkg, render_files, &status);
-    let json = pep691_package_json(pkg, render_files, &status);
+    let html = pep503_project_html(pkg, render_files, &status);
+    let json = pep691_project_json(pkg, render_files, &status);
 
     let base = format!("{SIMPLE_PREFIX}{pkg}/");
     put_if_changed(

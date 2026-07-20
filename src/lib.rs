@@ -26,6 +26,7 @@ pub mod names;
 pub mod node_region;
 pub mod observed_storage;
 pub mod origin;
+pub mod pages;
 pub mod project_cache;
 pub mod provenance;
 pub mod proxy;
@@ -54,3 +55,4 @@ pub mod worker;
 // `cli` but keeps its crate-flat paths the same way.
 pub use app::*;
 pub use cli::*;
+pub use pages::*;

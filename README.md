@@ -74,16 +74,23 @@ Hover a checkmark for the caveat where your Markdown renderer supports it.
 | --- | :---: | :---: | :---: | :---: | :---: | :---: |
 | Easy setup | <abbr title="Single binary, uvx, or Docker; hosts private packages, mirror sync, and proxy from one server.">✅</abbr> | — | <abbr title="Simple private package host over a local directory.">✅</abbr> | — | — | <abbr title="Simple caching proxy; no private uploads.">✅</abbr> |
 | Fast | <abbr title="8,288 verified installs/s on 2 vCPU in the benchmark.">✅</abbr> | <abbr title="77 installs/s as a static nginx-served mirror — NIC-bound on the same box.">✅</abbr> | — | — | — | — |
+| Private package hosting | <abbr title="Publish with twine or uv; admin/uploader/reader credentials plus short-lived install tokens.">✅</abbr> | — | <abbr title="Upload endpoint with htpasswd auth.">✅</abbr> | <abbr title="Upload endpoint with access-control lists.">✅</abbr> | <abbr title="Private indexes with per-index access control.">✅</abbr> | — |
+| Caching PyPI proxy | <abbr title="Caches public packages from PyPI on first install, behind the same URL as your private ones.">✅</abbr> | — | — | <abbr title="Its fallback = cache mode stores and re-serves upstream packages.">✅</abbr> | <abbr title="Caches PyPI through its root/pypi mirror index.">✅</abbr> | <abbr title="A caching PyPI proxy is its core purpose.">✅</abbr> |
+| Sync mirror | <abbr title="Mirrors a chosen subset of upstream: include/exclude by name, wheel tags, format, size, Python floor, and pre-release.">✅</abbr> | <abbr title="A full or filtered PyPI mirror is its core purpose.">✅</abbr> | — | — | — | — |
+| Dependency cooldown | <abbr title="New releases wait 7 days by default, enforced at the server for every client; upload times are preserved for client-side exclude-newer.">✅</abbr> | — | — | — | — | — |
+| Malware blocking | <abbr title="Refuses any file the OSV advisory feed flags as malware — at upload, on proxy fill, and in listings; on by default.">✅</abbr> | — | — | — | — | — |
+| No dependency confusion | <abbr title="A name is yours or PyPI's, never both; a private name never falls through to upstream.">✅</abbr> | — | — | — | <abbr title="Privately uploaded names block upstream mirror lookups by default.">✅</abbr> | — |
+| Vulnerability audit | <abbr title="/audit lists every hosted or proxied package a known advisory affects, ranked by your install counts.">✅</abbr> | — | — | — | — | — |
 | Scalable without database | <abbr title="Multi-node against S3, GCS, or Azure Blob; no database.">✅</abbr> | <abbr title="Static mirror tree served by nginx or object storage; no database.">✅</abbr> | — | — | — | — |
-| Human-readable package pages | <abbr title="Dashboard, package search, download pages, project pages, and README rendering.">✅</abbr> | — | — | <abbr title="Has a web UI.">✅</abbr> | <abbr title="Has a web UI and README rendering.">✅</abbr> | <abbr title="Has a web UI.">✅</abbr> |
+| Multi-region / multi-cloud failover | <abbr title="One bucket list spanning regions and clouds (S3 + GCS + Azure); every upload lands on all of them before the ack, and reads fail over with zero data loss.">✅</abbr> | — | — | — | <abbr title="Master-to-replica streaming replication; each replica keeps a full copy.">✅</abbr> | — |
+| Human-readable package pages | <abbr title="Dashboard, package search, download pages, project pages, and README rendering.">✅</abbr> | — | — | <abbr title="Has a web UI.">✅</abbr> | <abbr title="Web UI and README rendering via devpi-web.">✅</abbr> | — |
 | Download stats | <abbr title="Built-in global and per-package download counters.">✅</abbr> | — | — | — | — | — |
 | Disk-backed | <abbr title="Default local disk backend.">✅</abbr> | <abbr title="Writes a static mirror tree to disk.">✅</abbr> | <abbr title="Serves packages from local directories.">✅</abbr> | <abbr title="Supports filesystem package storage.">✅</abbr> | <abbr title="Default serverdir storage on local disk.">✅</abbr> | <abbr title="Disk-backed package cache.">✅</abbr> |
 | Cloud-storage-backed | <abbr title="S3, S3-compatible, GCS, and Azure Blob.">✅</abbr> | <abbr title="S3-compatible mirror storage.">✅</abbr> | — | <abbr title="S3, GCS, and Azure Blob package storage.">✅</abbr> | — | — |
-| Supports `exclude-newer` | <abbr title="Default 7-day holdback for proxy and sync; also preserves upload time for client-side cutoffs.">✅</abbr> | <abbr title="Mirror-time filtering for static mirrors.">✅</abbr> | — | — | — | — |
 
 Compared with [bandersnatch](https://github.com/pypa/bandersnatch),
 [pypiserver](https://github.com/pypiserver/pypiserver),
-[pypicloud](https://github.com/stevearc/pypicloud),
+[pypicloud](https://github.com/stevearc/pypicloud) (archived since 2023),
 [devpi](https://www.devpi.net/), and
 [proxpi](https://github.com/EpicWink/proxpi).
 

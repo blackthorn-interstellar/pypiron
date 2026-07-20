@@ -873,20 +873,33 @@ pub fn merge_serve_file(
             }
         };
     }
+    // Like `fill!`, but the file value is a string parsed into a value-enum
+    // (`$key` names the table key in a parse error).
+    macro_rules! fill_enum {
+        ($field:expr, $id:literal, $key:literal, $val:expr) => {
+            if !arg_from_cli_or_env(m, $id) {
+                if let Some(v) = $val {
+                    $field = serve_value_enum($key, v)?;
+                }
+            }
+        };
+    }
 
     // Server knobs (defaulted scalars / bools / enums).
     fill!(cli.bind_addr, "bind_addr", f.bind_addr.clone());
-    if !arg_from_cli_or_env(m, "artifact_delivery") {
-        if let Some(v) = &f.artifact_delivery {
-            cli.artifact_delivery = serve_value_enum("artifact-delivery", v)?;
-        }
-    }
+    fill_enum!(
+        cli.artifact_delivery,
+        "artifact_delivery",
+        "artifact-delivery",
+        &f.artifact_delivery
+    );
     fill!(cli.access_log, "access_log", f.access_log);
-    if !arg_from_cli_or_env(m, "access_log_format") {
-        if let Some(v) = &f.access_log_format {
-            cli.access_log_format = serve_value_enum("access-log-format", v)?;
-        }
-    }
+    fill_enum!(
+        cli.access_log_format,
+        "access_log_format",
+        "access-log-format",
+        &f.access_log_format
+    );
     fill!(cli.wait_on_upload, "wait_on_upload", f.wait_on_upload);
     fill!(
         cli.wait_on_upload_secs,

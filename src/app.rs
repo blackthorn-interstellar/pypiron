@@ -2843,6 +2843,29 @@ async fn serve_pkg_index(
     .await
 }
 
+/// The multi-bucket coherence recheck: re-read the origin claim after serving and
+/// confirm it still matches the `baseline` taken before the read. `None` means
+/// the name is unchanged (proceed); `Some(response)` is the error the caller must
+/// return (wrapping in `Some` where its own return type is `Option`) — either the
+/// claim moved mid-serve or the reread failed. Callers gate on
+/// `state.buckets.is_multi()`; single-bucket never rechecks. Load-bearing for
+/// read-your-write coherence across buckets (dev/READ_AFFINITY_VISION.md).
+pub(crate) async fn recheck_settled(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    baseline: &Option<origin::OriginObservation>,
+    action: &str,
+) -> Option<Response<Body>> {
+    match require_settled_package_read(state, storage, pkg).await {
+        Ok(after) if after == *baseline => None,
+        Ok(_) => Some(read_error(anyhow!(
+            "package '{pkg}' changed while {action}"
+        ))),
+        Err(error) => Some(read_error(error)),
+    }
+}
+
 /// Serve a package index from the read pin, reading through to the write home on
 /// a miss — with the origin coherence recheck pinned to whichever bucket actually
 /// serves the bytes. Served locally from the read pin → the pre-observation
@@ -2873,12 +2896,16 @@ async fn serve_local_index_fenced(
     if resp.status() != StatusCode::NOT_FOUND {
         // Served from the read pin: recheck the read pin against its baseline.
         if state.buckets.is_multi() {
-            match require_settled_package_read(state, read.storage.as_ref(), pkg).await {
-                Ok(after) if after == read_baseline => {}
-                Ok(_) => {
-                    return read_error(anyhow!("package '{pkg}' changed while serving its index"))
-                }
-                Err(error) => return read_error(error),
+            if let Some(resp) = recheck_settled(
+                state,
+                read.storage.as_ref(),
+                pkg,
+                &read_baseline,
+                "serving its index",
+            )
+            .await
+            {
+                return resp;
             }
         }
         return resp;
@@ -2901,10 +2928,16 @@ async fn serve_local_index_fenced(
         headers,
     )
     .await;
-    match require_settled_package_read(state, write.storage.as_ref(), pkg).await {
-        Ok(after) if after == write_baseline => {}
-        Ok(_) => return read_error(anyhow!("package '{pkg}' changed while serving its index")),
-        Err(error) => return read_error(error),
+    if let Some(resp) = recheck_settled(
+        state,
+        write.storage.as_ref(),
+        pkg,
+        &write_baseline,
+        "serving its index",
+    )
+    .await
+    {
+        return resp;
     }
     resp
 }
@@ -2997,14 +3030,9 @@ async fn proxy_package_index(
             .body(Body::from(rendered.body.clone()))
     };
     if state.buckets.is_multi() {
-        match require_settled_package_read(state, storage, pkg).await {
-            Ok(after) if after == before => {}
-            Ok(_) => {
-                return Some(read_error(anyhow!(
-                    "package '{pkg}' changed while serving its index"
-                )))
-            }
-            Err(e) => return Some(read_error(e)),
+        if let Some(resp) = recheck_settled(state, storage, pkg, &before, "serving its index").await
+        {
+            return Some(resp);
         }
     }
     Some(response.unwrap_or_else(not_found))

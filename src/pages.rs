@@ -7,7 +7,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -17,8 +16,8 @@ use time::OffsetDateTime;
 use tracing::warn;
 
 use crate::app::{
-    moved_permanently, not_found, read_error, require_settled_package_read, unauthorized, AppState,
-    ArtifactDelivery, PACKAGES_PREFIX, SIMPLE_PREFIX, VERSION,
+    moved_permanently, not_found, read_error, recheck_settled, require_settled_package_read,
+    unauthorized, AppState, ArtifactDelivery, PACKAGES_PREFIX, SIMPLE_PREFIX, VERSION,
 };
 use crate::{
     advisories, coremeta, counters, names, origin, project_cache, provenance, render, sidecar,
@@ -243,10 +242,10 @@ async fn render_project(
         Err(e) => return read_error(e),
     };
     if state.buckets.is_multi() {
-        match require_settled_package_read(state, storage.as_ref(), &pkg).await {
-            Ok(after) if after == before => {}
-            Ok(_) => return read_error(anyhow!("package '{pkg}' changed while rendering")),
-            Err(error) => return read_error(error),
+        if let Some(resp) =
+            recheck_settled(state, storage.as_ref(), &pkg, &before, "rendering").await
+        {
+            return resp;
         }
     }
     if files.is_empty() {
@@ -289,10 +288,10 @@ async fn render_project(
 
     let downloads = download_summary(state, &pkg).await;
     if state.buckets.is_multi() {
-        match require_settled_package_read(state, storage.as_ref(), &pkg).await {
-            Ok(after) if after == before => {}
-            Ok(_) => return read_error(anyhow!("package '{pkg}' changed while rendering")),
-            Err(error) => return read_error(error),
+        if let Some(resp) =
+            recheck_settled(state, storage.as_ref(), &pkg, &before, "rendering").await
+        {
+            return resp;
         }
     }
 

@@ -1589,7 +1589,10 @@ fn publish_marker_backlog(state: &AppState, total: &HashMap<usize, u64>) {
     }
 }
 
-async fn wait_until_bucket_ineligible(state: &AppState, index: usize) {
+/// Resolve once the bucket leaves the eligible set (health failure or a
+/// recovery still awaiting topology validation). Shared with the worker's job
+/// loop so both paths abandon a stalled bucket on the same predicate.
+pub(crate) async fn wait_until_bucket_ineligible(state: &AppState, index: usize) {
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if !bucket_eligible(state, index) {

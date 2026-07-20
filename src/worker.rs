@@ -365,19 +365,6 @@ async fn bounded_lease_check(state: &AppState, bucket: usize, lease: &LeaseManag
     }
 }
 
-async fn wait_until_bucket_ineligible(state: &AppState, index: usize) {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if state
-            .bucket_health
-            .as_ref()
-            .is_some_and(|health| !health.bucket_eligible(index).unwrap_or(false))
-        {
-            return;
-        }
-    }
-}
-
 async fn wait_until_generation_changes(state: &AppState, generation: u64) {
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -996,7 +983,7 @@ pub async fn run_worker_until(
                             }
                             let result = tokio::select! {
                                 result = drain_dirty_uncached(&job_state, handle.storage.as_ref()) => result,
-                                _ = wait_until_bucket_ineligible(&job_state, idx) => {
+                                _ = crate::replicate::wait_until_bucket_ineligible(&job_state, idx) => {
                                     Err(anyhow!("warm bucket became topology-ineligible"))
                                 }
                             };

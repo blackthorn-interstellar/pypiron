@@ -17,9 +17,10 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::warn;
 
 use crate::app::{
-    if_none_match, internal, nonempty, not_found, read_error, require_admin,
-    require_settled_package_read, simple_response, unauthorized, AppState, SIMPLE_PREFIX,
+    if_none_match, internal, not_found, read_error, require_settled_package_read, simple_response,
+    unauthorized, AppState, SIMPLE_PREFIX,
 };
+use crate::auth::{nonempty, require_admin};
 use crate::names::{checked_pkg_name, infer_version_from_filename};
 use crate::pages::{html_ok, page_context, rank_packages};
 use crate::{advisories, html, origin, storage, sync, token};

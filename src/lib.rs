@@ -9,6 +9,7 @@
 pub mod admin;
 pub mod advisories;
 pub mod app;
+pub mod auth;
 pub mod bucket_health;
 pub mod buckets;
 pub mod cache;

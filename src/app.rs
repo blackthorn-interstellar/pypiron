@@ -3473,6 +3473,14 @@ async fn files_get(
 }
 
 /// Per-package counter series: `GET /stats/:metric/:package` (read-auth gated).
+/// The inclusive date window both `/stats` surfaces report over: today back
+/// through the 29 prior days (30 days total).
+fn last_30d_window() -> (time::Date, time::Date) {
+    let to = OffsetDateTime::now_utc().date();
+    let from = to.saturating_sub(time::Duration::days(29));
+    (from, to)
+}
+
 /// Up to the last 30 days of daily counts, filenames rolled up to versions, plus
 /// a grand total. Frozen days are exact; today is best-effort. Deliberately a
 /// separate surface from `/metrics`, which stays low-cardinality.
@@ -3487,8 +3495,7 @@ async fn stats_get(
     let Some(pkg) = checked_pkg_name(&package) else {
         return not_found("not a package");
     };
-    let to = OffsetDateTime::now_utc().date();
-    let from = to.saturating_sub(time::Duration::days(29));
+    let (from, to) = last_30d_window();
     let series = state.counters.query_package(&metric, &pkg, from, to).await;
 
     let mut days: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> =
@@ -3522,8 +3529,7 @@ async fn stats_summary_get(
     if !state.is_reader(&headers) {
         return unauthorized();
     }
-    let to = OffsetDateTime::now_utc().date();
-    let from = to.saturating_sub(time::Duration::days(29));
+    let (from, to) = last_30d_window();
     let summaries = state.counters.query_summaries(&metric, from, to).await;
 
     let mut total: u64 = 0;
@@ -3543,7 +3549,7 @@ async fn stats_summary_get(
 }
 
 /// A `200 application/json` response with no-store caching, or a 404 if the body
-/// can't be built. Shared by the `/stats` endpoints.
+/// can't be built. Shared by the `/stats` and `/audit.json` endpoints.
 /// Build a response from a status, content type, cache-control, and body, with
 /// the (practically infallible) builder error mapped to a 404. The shape behind
 /// the fixed-payload responders — health, metrics, favicon, the JSON APIs.
@@ -4409,15 +4415,14 @@ async fn audit_json(
     headers: HeaderMap,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     require_admin(&state, &headers)?;
-    let json_response = |bytes: Vec<u8>| {
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(bytes))
-            .unwrap_or_else(not_found)
-    };
     match advisories::stored_report_bytes(state.pin().storage.as_ref()).await {
-        Ok(Some(bytes)) => Ok(json_response(bytes)),
+        // Verbatim bytes from the stored report; the shared no-store shape.
+        Ok(Some(bytes)) => Ok(simple_response(
+            StatusCode::OK,
+            "application/json",
+            "no-store",
+            bytes,
+        )),
         Ok(None) => {
             let empty = serde_json::json!({
                 "generated_unix": 0,
@@ -4425,9 +4430,7 @@ async fn audit_json(
                 "rows": [],
                 "note": AUDIT_ABSENT_NOTE,
             });
-            Ok(json_response(
-                serde_json::to_vec(&empty).unwrap_or_default(),
-            ))
+            Ok(json_response(empty))
         }
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,

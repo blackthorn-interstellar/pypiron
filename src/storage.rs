@@ -31,7 +31,7 @@ use object_store::{
 
 use crate::config::BucketOverride;
 use crate::hash::sha256_hex;
-use crate::range::{parse_range, RangeSpec};
+use crate::range::{parse_range, read_capacity, RangeSpec};
 
 /// In a failover topology one blackholed request must return in bounded time so
 /// its availability observation can move selection; object_store's defaults (10
@@ -1354,7 +1354,10 @@ impl Storage for DiskStorage {
                     .header(header::CONTENT_LENGTH, size)
                     .header(header::CONTENT_TYPE, "application/octet-stream")
                     .header(header::ACCEPT_RANGES, "bytes")
-                    .body(Body::from_stream(ReaderStream::new(file)))?
+                    .body(Body::from_stream(ReaderStream::with_capacity(
+                        file,
+                        read_capacity(size),
+                    )))?
             }
             RangeSpec::Partial(start, end) => {
                 let mut file = fs::File::open(&path).await?;
@@ -1366,7 +1369,10 @@ impl Storage for DiskStorage {
                     .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"))
                     .header(header::CONTENT_TYPE, "application/octet-stream")
                     .header(header::ACCEPT_RANGES, "bytes")
-                    .body(Body::from_stream(ReaderStream::new(file.take(len))))?
+                    .body(Body::from_stream(ReaderStream::with_capacity(
+                        file.take(len),
+                        read_capacity(len),
+                    )))?
             }
             RangeSpec::Unsatisfiable => Response::builder()
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)

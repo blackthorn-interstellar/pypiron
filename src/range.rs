@@ -54,9 +54,28 @@ pub fn parse_range(header: Option<&str>, size: u64) -> RangeSpec {
     RangeSpec::Partial(start, end)
 }
 
+/// Read-buffer size for streaming an artifact body from disk: a 64 KiB chunk,
+/// but never larger than the number of bytes being served, so a small wheel
+/// doesn't reserve 64 KiB to move a few KB. 64 KiB captures nearly all the
+/// syscall amortization over `ReaderStream`'s 4 KiB default while keeping the
+/// per-transfer memory footprint tight under high concurrency on small hosts.
+/// Floored at 1 so a zero-length body never requests a zero-capacity buffer.
+pub fn read_capacity(len: u64) -> usize {
+    const MAX: usize = 64 * 1024;
+    usize::try_from(len).unwrap_or(MAX).clamp(1, MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_capacity_caps_at_file_size() {
+        assert_eq!(read_capacity(0), 1); // never zero-capacity
+        assert_eq!(read_capacity(10_000), 10_000); // small file: exact fit
+        assert_eq!(read_capacity(64 * 1024), 64 * 1024); // at the cap
+        assert_eq!(read_capacity(5_000_000), 64 * 1024); // large file: capped
+    }
 
     #[test]
     fn range_parsing() {

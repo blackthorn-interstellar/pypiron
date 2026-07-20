@@ -20,6 +20,7 @@ from .helpers import (
     sha256_file,
     upload_legacy,
     wait_for_file_in_index,
+    wait_for_project_in_global,
 )
 
 PACKAGE = "six"
@@ -45,6 +46,9 @@ def test_lost_marker_is_harmless(disk_server_fast_reconcile, tmp_path):
     assert entry["hashes"]["sha256"] == sha256_file(wheel_path)
     assert (pkg_dir / f"{wheel_path.name}.meta.json").exists()
 
+    # The global index is a separate view written after the package index, so
+    # poll for it rather than racing the sweep with an instant assert.
+    wait_for_project_in_global(server["simple"], PACKAGE, timeout=15.0)
     global_idx = get_index_json(server["simple"])
     assert PACKAGE in [p["name"] for p in global_idx["projects"]]
 

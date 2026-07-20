@@ -40,7 +40,7 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tokio::fs;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{self, ConfigFile, MirrorConfig};
+use crate::config::{self, ConfigFile, UpstreamConfig};
 use crate::names::{
     checked_pkg_name, infer_version_from_filename, matches_prefix, normalize_pkg_name,
     parse_wheel_tags, WheelTags,
@@ -154,7 +154,7 @@ pub struct SyncArgs {
 /// The slice of PyPI to mirror/proxy. One surface, flattened into both `sync`
 /// and `serve`: the same mirror flags and `PYPIRON_INCLUDE_*`/`PYPIRON_EXCLUDE_*`
 /// env vars govern the push mirror and the on-demand proxy alike. The file form
-/// is the `[mirror]` table in pypiron.toml (see [`MirrorConfig`]).
+/// is the `[mirror]` table in pypiron.toml (see [`UpstreamConfig`]).
 #[derive(Debug, Clone, Default, Args)]
 pub struct MirrorArgs {
     /// Include these packages: a name with optional PEP 440 specifiers
@@ -332,7 +332,7 @@ impl MirrorArgs {
     /// The raw `--exclude-older` input (CLI/env over file), trimmed —
     /// kept verbatim so sync's [`config_key`] hashes a value that is stable
     /// across runs rather than the now-relative instant a duration resolves to.
-    pub(crate) fn exclude_older_raw(&self, file: Option<&MirrorConfig>) -> Option<String> {
+    pub(crate) fn exclude_older_raw(&self, file: Option<&UpstreamConfig>) -> Option<String> {
         self.exclude_older
             .as_deref()
             .or(file.and_then(|f| f.exclude_older.as_deref()))
@@ -344,7 +344,7 @@ impl MirrorArgs {
     /// The raw `--exclude-newer` input after precedence, defaulting to `"7"` (the
     /// 7-day quarantine). The single source of that default: both the parsed
     /// `Cutoff` and [`config_key`]'s hash derive from this, so they can't drift.
-    fn exclude_newer_input<'a>(&'a self, file: Option<&'a MirrorConfig>) -> &'a str {
+    fn exclude_newer_input<'a>(&'a self, file: Option<&'a UpstreamConfig>) -> &'a str {
         self.exclude_newer
             .as_deref()
             .or(file.and_then(|f| f.exclude_newer.as_deref()))
@@ -355,7 +355,7 @@ impl MirrorArgs {
     /// [`Self::exclude_older_raw`], a relative duration must hash to a *stable*
     /// value across runs. `""` (the opt-out) trims to `None`, matching
     /// [`parse_cutoff`]'s "no cutoff".
-    pub(crate) fn exclude_newer_raw(&self, file: Option<&MirrorConfig>) -> Option<String> {
+    pub(crate) fn exclude_newer_raw(&self, file: Option<&UpstreamConfig>) -> Option<String> {
         let raw = self.exclude_newer_input(file).trim();
         (!raw.is_empty()).then(|| raw.to_owned())
     }
@@ -365,7 +365,7 @@ impl MirrorArgs {
     /// the two can never drift. Precedence is CLI/env > file > default; a bool
     /// set in the file can be turned *on* but not off by the absence of a flag
     /// (clap cannot express an explicit `false`).
-    pub(crate) fn resolve(&self, file: Option<&MirrorConfig>) -> Result<ResolvedMirror> {
+    pub(crate) fn resolve(&self, file: Option<&UpstreamConfig>) -> Result<ResolvedMirror> {
         Ok(ResolvedMirror {
             include_packages: self.resolve_include_packages(file)?,
             exclude_packages: self.resolve_exclude_packages(file)?,
@@ -428,7 +428,7 @@ impl MirrorArgs {
         })
     }
 
-    fn resolve_include_packages(&self, file: Option<&MirrorConfig>) -> Result<Vec<PackageSpec>> {
+    fn resolve_include_packages(&self, file: Option<&UpstreamConfig>) -> Result<Vec<PackageSpec>> {
         resolve_packages(
             &self.include_package,
             self.include_packages_from.as_deref(),
@@ -445,7 +445,7 @@ impl MirrorArgs {
         )
     }
 
-    fn resolve_exclude_packages(&self, file: Option<&MirrorConfig>) -> Result<Vec<PackageSpec>> {
+    fn resolve_exclude_packages(&self, file: Option<&UpstreamConfig>) -> Result<Vec<PackageSpec>> {
         resolve_packages(
             &self.exclude_package,
             self.exclude_packages_from.as_deref(),
@@ -3046,7 +3046,7 @@ mod tests {
     #[test]
     fn yanked_is_excluded_by_default_unless_opted_in() {
         let exclude =
-            |f: MirrorArgs, file: Option<&MirrorConfig>| f.resolve(file).unwrap().exclude_yanked;
+            |f: MirrorArgs, file: Option<&UpstreamConfig>| f.resolve(file).unwrap().exclude_yanked;
         // Nothing set: yanked is dropped by default.
         assert!(exclude(MirrorArgs::default(), None));
         // CLI/env opt-out (--include-yanked) mirrors them again.
@@ -3058,13 +3058,13 @@ mod tests {
             None
         ));
         // File opt-out (`[mirror].include-yanked = true`).
-        let on = MirrorConfig {
+        let on = UpstreamConfig {
             include_yanked: Some(true),
             ..Default::default()
         };
         assert!(!exclude(MirrorArgs::default(), Some(&on)));
         // An explicit `include-yanked = false` keeps the default exclusion.
-        let off = MirrorConfig {
+        let off = UpstreamConfig {
             include_yanked: Some(false),
             ..Default::default()
         };
@@ -3073,7 +3073,7 @@ mod tests {
 
     #[test]
     fn exclude_newer_defaults_to_a_seven_day_quarantine() {
-        let newer = |a: MirrorArgs, f: Option<&MirrorConfig>| a.resolve(f).unwrap().exclude_newer;
+        let newer = |a: MirrorArgs, f: Option<&UpstreamConfig>| a.resolve(f).unwrap().exclude_newer;
 
         // Nothing set: a sliding 7-day window, stored as a *relative* duration so
         // it keeps advancing in a long-lived proxy instead of freezing at startup.
@@ -3092,7 +3092,7 @@ mod tests {
         )
         .is_none());
         // ...or via the `[mirror]` table.
-        let off = MirrorConfig {
+        let off = UpstreamConfig {
             exclude_newer: Some(String::new()),
             ..Default::default()
         };

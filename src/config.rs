@@ -37,7 +37,7 @@ pub struct ConfigFile {
     /// `serve` proxy — the dependency-confusion control belongs in one place.
     pub private_prefix: Option<String>,
     #[serde(default)]
-    pub mirror: MirrorConfig,
+    pub mirror: UpstreamConfig,
     #[serde(default)]
     pub serve: ServeConfig,
     #[serde(default)]
@@ -48,7 +48,7 @@ pub struct ConfigFile {
 /// mirror CLI flags; consumed by both `sync` and `serve --proxy-upstream`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct MirrorConfig {
+pub struct UpstreamConfig {
     /// Inline package scope; each entry is a name with optional PEP 440
     /// specifiers (e.g. "requests>=2.20,<3"), same syntax as a packages.txt
     /// line. The slice's name axis: `sync` mirrors exactly these, and the

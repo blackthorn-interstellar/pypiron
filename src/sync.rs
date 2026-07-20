@@ -51,6 +51,31 @@ use crate::simple::{self, IndexFetch, SimpleFile, SimpleIndex};
 use crate::status::ProjectStatusDoc;
 use crate::upload::{FinishedSpool, UploadSpool};
 
+/// Attach the destination admin credential to a request builder when one is
+/// configured. Mirroring is admin-gated, so every request to the destination
+/// carries this basic-auth header (a bare, unauthenticated dest is only valid
+/// in tests / open setups).
+trait AdminAuth {
+    fn with_admin_auth(self, resolved: &Resolved) -> Self;
+}
+
+impl AdminAuth for reqwest::RequestBuilder {
+    fn with_admin_auth(self, resolved: &Resolved) -> Self {
+        match (&resolved.admin_user, &resolved.admin_pass) {
+            (Some(u), Some(p)) => self.basic_auth(u, Some(p)),
+            _ => self,
+        }
+    }
+}
+
+/// Turn a non-success response into an error carrying the status code and a
+/// best-effort body snippet. `action` names what failed (e.g. `"upload failed"`).
+async fn http_body_error(resp: reqwest::Response, action: &str) -> anyhow::Error {
+    let code = resp.status();
+    let body = resp.text().await.unwrap_or_else(|_| "<no body>".into());
+    anyhow!("{action} [{code}]: {body}")
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct SyncArgs {
     /// Source index base (default: https://pypi.org). Read over the PEP 691
@@ -1189,10 +1214,7 @@ impl UpstreamFiles {
 /// recur once per file.
 async fn preflight(client: &Client, resolved: &Resolved) -> Result<()> {
     let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
-    let mut req = client.get(&url);
-    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
-        req = req.basic_auth(u, Some(p));
-    }
+    let req = client.get(&url).with_admin_auth(resolved);
     let resp = req.send().await.with_context(|| {
         format!(
             "cannot reach sync destination {} — is the server running and the URL correct?",
@@ -1234,10 +1256,7 @@ async fn load_cursors(client: &Client, resolved: &Resolved) -> Cursors {
         return Cursors::new();
     }
     let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
-    let mut req = client.get(&url);
-    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
-        req = req.basic_auth(u, Some(p));
-    }
+    let req = client.get(&url).with_admin_auth(resolved);
     match req.send().await {
         Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
         _ => Cursors::new(),
@@ -1256,10 +1275,7 @@ async fn save_cursors(client: &Client, resolved: &Resolved, cursors: &Cursors) {
         }
     };
     let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
-    let mut req = client.put(&url).body(body);
-    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
-        req = req.basic_auth(u, Some(p));
-    }
+    let req = client.put(&url).body(body).with_admin_auth(resolved);
     let result = async {
         let resp = req.send().await?;
         if !resp.status().is_success() {
@@ -1420,13 +1436,11 @@ async fn push_feed_to_dest(client: &Client, resolved: &Resolved, bytes: Vec<u8>)
         }
     }
 
-    let mut req = client
+    let req = client
         .put(&url)
         .header(reqwest::header::CONTENT_TYPE, "application/zip")
-        .body(bytes);
-    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
-        req = req.basic_auth(u, Some(p));
-    }
+        .body(bytes)
+        .with_admin_auth(resolved);
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             info!("advisory snapshot pushed to destination");
@@ -1449,10 +1463,7 @@ async fn head_dest_feed(
     resolved: &Resolved,
     url: &str,
 ) -> Result<(reqwest::StatusCode, Option<String>)> {
-    let mut req = client.head(url);
-    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
-        req = req.basic_auth(u, Some(p));
-    }
+    let req = client.head(url).with_admin_auth(resolved);
     let resp = req.send().await?;
     let etag = resp
         .headers()
@@ -1989,12 +2000,10 @@ async fn fetch_local_index(
         "{}/sync/local-index/{pkg}",
         resolved.dst_base.trim_end_matches('/')
     );
-    let mut req = client
+    let req = client
         .get(&url)
-        .header(reqwest::header::ACCEPT, SIMPLE_JSON_CONTENT_TYPE);
-    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
-        req = req.basic_auth(u, Some(p));
-    }
+        .header(reqwest::header::ACCEPT, SIMPLE_JSON_CONTENT_TYPE)
+        .with_admin_auth(resolved);
     let resp = req.send().await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
@@ -2033,19 +2042,15 @@ async fn apply_yank_http(
     yanked: &Yanked,
 ) -> Result<()> {
     let url = format!("{base}/files/{pkg}/{filename}/yank");
-    let mut req = match yanked {
+    let req = match yanked {
         Yanked::Flag(false) => client.delete(&url),
         Yanked::Flag(true) => client.post(&url).body(String::new()),
         Yanked::Reason(reason) => client.post(&url).body(reason.clone()),
-    };
-    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
-        req = req.basic_auth(u, Some(p));
     }
+    .with_admin_auth(resolved);
     let resp = req.send().await?;
     if !resp.status().is_success() {
-        let code = resp.status();
-        let body = resp.text().await.unwrap_or_else(|_| "<no body>".into());
-        bail!("yank update failed for {filename} [{code}]: {body}");
+        return Err(http_body_error(resp, &format!("yank update failed for {filename}")).await);
     }
     Ok(())
 }
@@ -2073,19 +2078,15 @@ async fn relay_status(
     let url = format!("{base}/project/{pkg}/status");
     // Active carries no marker, so an active target is a clear (DELETE); any
     // freeze is a POST of the status doc — same set/clear shape as yank.
-    let mut req = if desired.status.is_active() {
+    let req = if desired.status.is_active() {
         client.delete(&url)
     } else {
         client.post(&url).json(&desired)
-    };
-    if let (Some(u), Some(p)) = (&resolved.admin_user, &resolved.admin_pass) {
-        req = req.basic_auth(u, Some(p));
     }
+    .with_admin_auth(resolved);
     let resp = req.send().await?;
     if !resp.status().is_success() {
-        let code = resp.status();
-        let body = resp.text().await.unwrap_or_else(|_| "<no body>".into());
-        bail!("status update failed for {pkg} [{code}]: {body}");
+        return Err(http_body_error(resp, &format!("status update failed for {pkg}")).await);
     }
     Ok(())
 }
@@ -2374,18 +2375,16 @@ async fn upload_via_http(
         }
     }
 
-    let mut req = client.post(endpoint).multipart(form);
-    if let (Some(u), Some(p)) = (resolved.admin_user.as_ref(), resolved.admin_pass.as_ref()) {
-        req = req.basic_auth(u, Some(p));
-    }
+    let req = client
+        .post(endpoint)
+        .multipart(form)
+        .with_admin_auth(resolved);
     let resp = req.send().await?;
     if resp.status() == reqwest::StatusCode::CONFLICT {
         return Ok(false);
     }
     if !resp.status().is_success() {
-        let code = resp.status();
-        let body = resp.text().await.unwrap_or_else(|_| "<no body>".into());
-        bail!("upload failed [{code}]: {body}");
+        return Err(http_body_error(resp, "upload failed").await);
     }
     Ok(true)
 }

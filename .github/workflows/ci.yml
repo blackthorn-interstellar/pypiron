@@ -131,10 +131,13 @@ jobs:
         include:
           - backend: disk
             markers: "not perf and not stress and not compat and not s3 and not azure"
+            workers: 8
           - backend: s3
             markers: "s3 and not perf and not stress"
+            workers: 4
           - backend: azure
             markers: "azure and not perf and not stress"
+            workers: 8
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -148,11 +151,17 @@ jobs:
       # instead of eight processes contending on cargo's target-dir lock.
       - name: Build server binary
         run: cargo build --locked
-      # -n 8 (not auto=4): the tests are wait-bound — containers, HTTP polls,
-      # deliberate drip/hysteresis windows — so oversubscribing the 4-vCPU
-      # runner keeps it busy. --durations so the leg reports where time goes.
+      # Worker count is per-leg (matrix.workers). disk/azure run at -n 8: their
+      # waits are truly wait-bound — containers, HTTP polls — so oversubscribing
+      # the 4-vCPU runner keeps it busy. The s3 leg runs at -n 4 (one worker per
+      # vCPU): its multi-region fault-injection tests assert on real timing
+      # windows (1s bucket-health probe deadlines, hysteresis/drip windows), and
+      # 2x oversubscription starves the CPU enough that a probe to a *healthy*
+      # bucket times out — a spurious failover the tests then flag. Honest
+      # scheduling, not oversubscription, is what those windows need.
+      # --durations so each leg reports where time goes.
       - name: Blackbox suite (${{ matrix.backend }} mode)
-        run: uv run -- pytest tests -m "${{ matrix.markers }}" -n 8 --durations=25
+        run: uv run -- pytest tests -m "${{ matrix.markers }}" -n ${{ matrix.workers }} --durations=25
 
   real-gcs:
     # GCS has no faithful local emulator (dev/TESTING.md), so this real-bucket

@@ -509,12 +509,12 @@ def test_private_name_never_falls_through_on_a_region_bucket_absence(
     assert body == private_wheel.read_bytes()
     assert hashlib.sha256(body).hexdigest() != hashlib.sha256(public_wheel.read_bytes()).hexdigest()
 
-    # The index the resolver reads is private and local too.
-    code, idx, _ = http_get(
-        f"{server['simple']}{pkg}/index.json", headers={"Accept": ACCEPT_PEP691}
-    )
-    assert code == 200
-    assert any(f["filename"] == private_wheel.name for f in json.loads(idx)["files"])
+    # The index the resolver reads is private and local too. The write home
+    # materializes its package index asynchronously after the claim lands, and
+    # the region-bucket read-through only surfaces it once A has built it — so
+    # poll for the file instead of racing that indexer with a bare GET.
+    idx = wait_for_file_in_index(server["simple"], pkg, private_wheel.name)
+    assert any(f["filename"] == private_wheel.name for f in idx["files"])
 
     # The upstream proves it: not one request carried this name after the seed.
     new_upstream = upstream["log_path"].read_text()[len(upstream_before) :]

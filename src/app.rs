@@ -4016,7 +4016,7 @@ async fn yank_set(
     } else {
         Yanked::Reason(reason)
     };
-    set_yanked(&state, &headers, &package, &filename, yanked).await
+    yank_handler(&state, &headers, &package, &filename, yanked).await
 }
 
 /// Un-yank a file.
@@ -4025,11 +4025,11 @@ async fn yank_clear(
     Path((package, filename)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    set_yanked(&state, &headers, &package, &filename, Yanked::Flag(false)).await
+    yank_handler(&state, &headers, &package, &filename, Yanked::Flag(false)).await
 }
 
 /// Yank state lives in the sidecar — it is truth, so the system can heal.
-async fn set_yanked(
+async fn yank_handler(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     package: &str,
@@ -4048,7 +4048,7 @@ async fn set_yanked(
 /// so the flip is a bounded compare-and-set loop that bumps the yank epoch on
 /// every real change, pairs an intent/commit marker so the derived index heals,
 /// and fans a private flip out to every healthy bucket. Split out of
-/// [`set_yanked`] so a deterministic simulator can drive it without axum.
+/// [`yank_handler`] so a deterministic simulator can drive it without axum.
 pub async fn set_yank(
     state: &Arc<AppState>,
     pinned: &buckets::Pinned,

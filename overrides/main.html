@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+
+<!--
+  Theme override: inject the OpenAI Ads pixel into every page's <head>.
+  Loads async from bzrcdn.openai.com; measures ad-campaign engagement.
+  Disclosed to visitors in docs/privacy.md. Set debug:true to verify firing
+  in the browser console.
+-->
+{% block extrahead %}
+  {{ super() }}
+  <script>!function(w,d,s,u){if(w.oaiq)return;var q=function(){q.q.push(arguments)};q.q=[];w.oaiq=q;var j=d.createElement(s);j.async=1;j.src=u;var f=d.getElementsByTagName(s)[0];f.parentNode.insertBefore(j,f)}(window,document,"script","https://bzrcdn.openai.com/sdk/oaiq.min.js");oaiq("init",{pixelId:"TL5g8QKkG3CbEKsjjH3pRo",debug:false});</script>
+{% endblock %}

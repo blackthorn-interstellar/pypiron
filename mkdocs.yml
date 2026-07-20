@@ -10,6 +10,7 @@ edit_uri: edit/master/docs/
 
 theme:
   name: material
+  custom_dir: overrides
   logo: assets/pypiron-logo-256.png
   favicon: assets/pypiron-logo-256.png
   features:
@@ -79,3 +80,4 @@ nav:
   - Download statistics: concepts/download-stats.md
   - Configuration: reference/configuration.md
   - Benchmarks: reference/benchmarks.md
+  - Privacy: privacy.md

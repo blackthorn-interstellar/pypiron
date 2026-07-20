@@ -213,35 +213,6 @@ base URL, serve OSV's `querybatch` shape from our snapshot — client-side
 `uv audit` then works fully air-gapped against pypiron, zero invented
 standards.
 
-## TODO
-
-Rungs, each shippable and blackbox-tested before the next:
-
-1. ROADMAP.md: move this from unlisted to Planned, pointing here.
-2. `advisories.rs`: zip fetch/read, OSV parse, block set + audit index;
-   unit tests for parsing/matching (pure functions only).
-3. Worker refresh + `_advisories/osv-pypi.zip` persistence + follower
-   reload + `pypiron_advisory_snapshot_age_seconds` gauge + admin
-   `PUT /advisories/feed` / `GET /advisories/feed` (the push path).
-4. Byte-gate enforcement (direct + presign) + proxy-fill refusal +
-   `pypiron_blocked_downloads_total`; startup fail-closed rule.
-   Blackbox: `tests/test_advisories.py`.
-5. Listing filters (proxy render + rebuild); worker-derived
-   quarantined-project set + its byte-gate probe for mirror-origin
-   files.
-6. Sync relay: `--advisory-feed` on `pypiron sync` — fetch from OSV or
-   the source server, etag-conditioned push to the destination. On by
-   default (`""` opts out); a destination without the endpoint warns
-   and the package sync proceeds.
-7. Audit report materialization + `/audit` + `/audit.json`, admin-gated;
-   counters join.
-8. `/project/<pkg>/` advisory panel.
-9. Docs: user-manual supply-chain page (cooldown default + PEP 792 relay
-   + malware blocking + audit, as one story) + `configuration.md` knobs.
-
-Storage-layout note: `_advisories/` is a new reserved top-level prefix —
-add it to the layout contract in [DESIGN.md](DESIGN.md) in rung 3.
-
 ## Acceptance criteria
 
 All via the real binary over HTTP with real clients unless marked

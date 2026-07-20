@@ -21,6 +21,7 @@ pub mod counters;
 pub mod hash;
 pub mod lease;
 pub mod markdown;
+pub mod markers;
 pub mod metrics;
 pub mod names;
 pub mod node_region;

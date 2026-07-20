@@ -30,6 +30,7 @@ use tracing::{error, warn};
 
 use crate::buckets::Pinned;
 use crate::hash::sha256_hex;
+use crate::markers;
 #[cfg(test)]
 use crate::origin::read_origin;
 use crate::origin::{
@@ -45,6 +46,7 @@ use crate::storage::{
     verify_stored_size, ArtifactBody, Existing, Storage,
 };
 use crate::tombstone;
+#[cfg(test)]
 use crate::worker;
 use crate::{AppState, PACKAGES_PREFIX};
 
@@ -220,19 +222,19 @@ pub async fn execute(
         }
     };
     let intent_a = if bracket_a {
-        Some(worker::mark_intent(a, pkg).await?)
+        Some(markers::mark_intent(a, pkg).await?)
     } else {
         None
     };
     let intent_b = if bracket_b {
-        match worker::mark_intent(b, pkg).await {
+        match markers::mark_intent(b, pkg).await {
             Ok(nonce) => Some(nonce),
             Err(error) => {
                 // Pair the first intent before propagating: a mere storage
                 // error on the second bucket must not leave a fresh unpaired
                 // intent deferring the package for the whole grace period.
                 if let Some(nonce) = &intent_a {
-                    let _ = worker::mark_commit(a, pkg, nonce).await;
+                    let _ = markers::mark_commit(a, pkg, nonce).await;
                 }
                 return Err(error);
             }
@@ -252,16 +254,16 @@ pub async fn execute(
             let (dirty_a, dirty_b) =
                 repair_same_sha_companions((a, b), pkg, filename, (ra, rb)).await?;
             if dirty_a {
-                worker::mark_dirty(a, pkg).await?;
+                markers::mark_dirty(a, pkg).await?;
             }
             if dirty_b {
-                worker::mark_dirty(b, pkg).await?;
+                markers::mark_dirty(b, pkg).await?;
             }
         }
         Verdict::Copy(side) => {
             let (src, dst, rec) = pick(side);
             if copy_live(state, src, dst, pkg, filename, rec).await? {
-                worker::mark_dirty(dst, pkg).await?;
+                markers::mark_dirty(dst, pkg).await?;
             }
         }
         Verdict::AdoptSidecar(_) => {
@@ -273,10 +275,10 @@ pub async fn execute(
             let (dirty_a, dirty_b) =
                 repair_same_sha_companions((a, b), pkg, filename, (ra, rb)).await?;
             if adopted_a || dirty_a {
-                worker::mark_dirty(a, pkg).await?;
+                markers::mark_dirty(a, pkg).await?;
             }
             if adopted_b || dirty_b {
-                worker::mark_dirty(b, pkg).await?;
+                markers::mark_dirty(b, pkg).await?;
             }
         }
         Verdict::Supersede(side) => {
@@ -313,8 +315,8 @@ pub async fn execute(
             );
             freeze_side(a, pkg, filename).await?;
             freeze_side(b, pkg, filename).await?;
-            worker::mark_dirty(a, pkg).await?;
-            worker::mark_dirty(b, pkg).await?;
+            markers::mark_dirty(a, pkg).await?;
+            markers::mark_dirty(b, pkg).await?;
             state
                 .metrics
                 .replication_freezes
@@ -327,13 +329,13 @@ pub async fn execute(
                 Side::B => a,
             };
             freeze_side(target, pkg, filename).await?;
-            worker::mark_dirty(target, pkg).await?;
+            markers::mark_dirty(target, pkg).await?;
         }
         Verdict::FinishFreeze => {
             freeze_side(a, pkg, filename).await?;
             freeze_side(b, pkg, filename).await?;
-            worker::mark_dirty(a, pkg).await?;
-            worker::mark_dirty(b, pkg).await?;
+            markers::mark_dirty(a, pkg).await?;
+            markers::mark_dirty(b, pkg).await?;
         }
         Verdict::Tombstone => {
             // A freeze carries a tombstone solely as its permanent upload
@@ -351,10 +353,10 @@ pub async fn execute(
                 )
             };
             if ca {
-                worker::mark_dirty(a, pkg).await?;
+                markers::mark_dirty(a, pkg).await?;
             }
             if cb {
-                worker::mark_dirty(b, pkg).await?;
+                markers::mark_dirty(b, pkg).await?;
             }
         }
         }
@@ -366,10 +368,10 @@ pub async fn execute(
     // that fails to write leaves its intent to go stale and heal — the signal
     // is never lost, only delayed by the grace period.
     if let Some(nonce) = intent_a {
-        let _ = worker::mark_commit(a, pkg, &nonce).await;
+        let _ = markers::mark_commit(a, pkg, &nonce).await;
     }
     if let Some(nonce) = intent_b {
-        let _ = worker::mark_commit(b, pkg, &nonce).await;
+        let _ = markers::mark_commit(b, pkg, &nonce).await;
     }
     result
 }
@@ -605,7 +607,7 @@ async fn verify_source_record(
             src.delete_keys(std::slice::from_ref(&sckey))
                 .await
                 .with_context(|| format!("drop stale sidecar {sckey}"))?;
-            worker::mark_dirty(src, pkg)
+            markers::mark_dirty(src, pkg)
                 .await
                 .with_context(|| format!("mark {pkg} dirty after dropping stale sidecar"))?;
         }
@@ -835,12 +837,12 @@ async fn supersede_record(
     if dst.head_exists(&frozen_key(&akey)).await? {
         quarantine_bytes(dst, pkg, filename, &verified.artifact).await?;
         freeze_side(dst, pkg, filename).await?;
-        worker::mark_dirty(dst, pkg).await?;
+        markers::mark_dirty(dst, pkg).await?;
         return Ok(());
     }
     if dst.head_exists(&tombstone_key(&akey)).await? {
         if tombstone_side(dst, pkg, filename).await? {
-            worker::mark_dirty(dst, pkg).await?;
+            markers::mark_dirty(dst, pkg).await?;
         }
         return Ok(());
     }
@@ -937,7 +939,7 @@ async fn supersede_record(
     } else {
         dst.delete_keys(&[mirror_quarantined_key(&akey)]).await?;
     }
-    worker::mark_dirty(dst, pkg).await?;
+    markers::mark_dirty(dst, pkg).await?;
     Ok(())
 }
 
@@ -1144,15 +1146,15 @@ async fn freeze_copy_race(
     // also mutates the SOURCE, so it carries its own intent/commit pair —
     // a crash mid-freeze must not leave changed source truth with no rebuild
     // signal (the same reasoning as execute's bracketing).
-    let src_intent = worker::mark_intent(src, pkg).await?;
+    let src_intent = markers::mark_intent(src, pkg).await?;
     let result = async {
         freeze_side(src, pkg, filename).await?;
         freeze_side(dst, pkg, filename).await?;
-        worker::mark_dirty(dst, pkg).await?;
+        markers::mark_dirty(dst, pkg).await?;
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    let _ = worker::mark_commit(src, pkg, &src_intent).await;
+    let _ = markers::mark_commit(src, pkg, &src_intent).await;
     result?;
     state
         .metrics
@@ -1354,7 +1356,7 @@ async fn reconcile_split_origin(
         (Some(Origin::Private), Some(Origin::Mirror)) => {
             ensure_private_origin(b, pkg).await?;
             if quarantine_mirror_artifacts(b, pkg).await? > 0 {
-                worker::mark_dirty(b, pkg).await?;
+                markers::mark_dirty(b, pkg).await?;
             }
             scanned_b = true;
             b_origin = Some(Origin::Private);
@@ -1362,7 +1364,7 @@ async fn reconcile_split_origin(
         (Some(Origin::Mirror), Some(Origin::Private)) => {
             ensure_private_origin(a, pkg).await?;
             if quarantine_mirror_artifacts(a, pkg).await? > 0 {
-                worker::mark_dirty(a, pkg).await?;
+                markers::mark_dirty(a, pkg).await?;
             }
             scanned_a = true;
             a_origin = Some(Origin::Private);
@@ -1430,7 +1432,7 @@ async fn normalize_mirror_status_under_private_claim(
 
     // Join the same base package-intent protocol as request writers. The exact
     // claim re-read below keeps a concurrent owner transition fail-closed.
-    let nonce = worker::mark_intent(storage, pkg).await?;
+    let nonce = markers::mark_intent(storage, pkg).await?;
     let result: Result<bool> = async {
         if read_origin_observation(storage, pkg).await?.as_ref() != Some(&claim) {
             return Ok(false);
@@ -1459,7 +1461,7 @@ async fn normalize_mirror_status_under_private_claim(
         bail!("could not normalize late mirror status for private package '{pkg}'")
     }
     .await;
-    let committed = worker::mark_commit(storage, pkg, &nonce).await;
+    let committed = markers::mark_commit(storage, pkg, &nonce).await;
     match (result, committed) {
         (Ok(changed), Ok(())) => Ok(changed),
         (Err(error), _) => Err(error),
@@ -1475,10 +1477,10 @@ async fn reconcile_project_status(a: &dyn Storage, b: &dyn Storage, pkg: &str) -
     match status::reconcile_status_pair(a, b, pkg).await? {
         StatusConvergence::InSync => {}
         StatusConvergence::UpdatedLeft => {
-            worker::mark_dirty(a, pkg).await?;
+            markers::mark_dirty(a, pkg).await?;
         }
         StatusConvergence::UpdatedRight => {
-            worker::mark_dirty(b, pkg).await?;
+            markers::mark_dirty(b, pkg).await?;
         }
     }
     Ok(())
@@ -1496,7 +1498,7 @@ async fn write_marker(
 ) -> Result<String> {
     let key = format!(
         "{REPL_PREFIX}{dest}/{pkg}/{filename}!{}",
-        worker::marker_nonce()
+        markers::marker_nonce()
     );
     storage.put_bytes(&key, Vec::new(), None).await?;
     Ok(key)
@@ -1511,7 +1513,7 @@ struct ReplMarker {
 
 /// Parse `_repl/<dest>/<pkg>/<file>!<nonce>`. Package names and filenames carry
 /// no `!`, and the nonce carries no `/`, so the split is unambiguous.
-fn parse_marker(key: &str) -> Option<ReplMarker> {
+fn parse_repl_marker(key: &str) -> Option<ReplMarker> {
     let rest = key.strip_prefix(REPL_PREFIX)?;
     let (dest, rest) = rest.split_once('/')?;
     let dest = dest.parse::<usize>().ok()?;
@@ -1638,7 +1640,7 @@ async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<Hash
         let mut by_destination: std::collections::BTreeMap<usize, Vec<ReplMarker>> =
             std::collections::BTreeMap::new();
         for meta in &page {
-            let Some(marker) = parse_marker(&meta.key) else {
+            let Some(marker) = parse_repl_marker(&meta.key) else {
                 continue;
             };
             if handles.get(marker.dest).is_none() {
@@ -1686,7 +1688,7 @@ async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<Hash
                                         // holding live truth with no view is not. The note
                                         // is only consumed once the signal is durable.
                                         if let Err(e) =
-                                            worker::mark_dirty(dst.storage.as_ref(), &marker.pkg)
+                                            markers::mark_dirty(dst.storage.as_ref(), &marker.pkg)
                                                 .await
                                         {
                                             warn!(dest=%dst.name, package=%marker.pkg, filename=%marker.filename, error=?e, "replication succeeded but destination rebuild signal failed; marker retained");
@@ -1990,13 +1992,13 @@ async fn converge_package(
             if late_a || late_b {
                 if late_a {
                     if quarantine_mirror_artifacts(a, pkg).await? > 0 {
-                        worker::mark_dirty(a, pkg).await?;
+                        markers::mark_dirty(a, pkg).await?;
                     }
                     a_names = package_member_names(a, pkg).await?;
                 }
                 if late_b {
                     if quarantine_mirror_artifacts(b, pkg).await? > 0 {
-                        worker::mark_dirty(b, pkg).await?;
+                        markers::mark_dirty(b, pkg).await?;
                     }
                     b_names = package_member_names(b, pkg).await?;
                 }

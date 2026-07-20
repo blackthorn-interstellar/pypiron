@@ -32,7 +32,7 @@
 //! `pypiron::worker::consumable_dirty_work` over real `_dirty/<pkg>!<nonce>
 //! .intent|.commit` `FileEntry` keys built from the model's logical clock, and
 //! consumes exactly the keys that function returns. Marker keys are parsed back
-//! with the real `pypiron::worker::parse_marker`. If the pairing / grace / stale
+//! with the real `pypiron::markers::parse_marker`. If the pairing / grace / stale
 //! rules in `src/worker.rs` change, this model's transitions change with them —
 //! that is the proof-cannot-silently-rot binding rung 2 asks for.
 //!
@@ -80,8 +80,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use pypiron::markers::parse_marker;
 use pypiron::storage::FileEntry;
-use pypiron::worker::{consumable_dirty_work, parse_marker};
+use pypiron::worker::consumable_dirty_work;
 use stateright::{Checker, Model, Property};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};

@@ -20,8 +20,7 @@
 //! upgraded node drains what an old node wrote.
 
 use std::{
-    collections::{hash_map::RandomState, HashSet},
-    hash::{BuildHasher, Hasher},
+    collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -36,6 +35,10 @@ use tracing::{error, info, warn};
 
 use crate::hash::sha256_hex;
 use crate::lease::LeaseManager;
+use crate::markers::{
+    clear_intent, mark_commit, mark_dirty, mark_intent, parse_marker, Marker, COMMIT_SUFFIX,
+    INTENT_SUFFIX,
+};
 use crate::names::infer_version_from_filename;
 use crate::render::{
     pep503_global_html, pep503_package_html, pep691_global_json, pep691_package_json, FileMetadata,
@@ -61,136 +64,15 @@ const PACKAGE_SWEEP_CONCURRENCY: usize = 8;
 /// cycle, not one failure after minutes of SDK retries.
 const BUCKET_HEALTH_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-const INTENT_SUFFIX: &str = ".intent";
-const COMMIT_SUFFIX: &str = ".commit";
-
 /// The per-project PEP 792 status sidecar as it appears in a `packages/<pkg>/`
 /// listing (prefix stripped). Presence in the listing is the cheap gate before
 /// the sweep pays a status read to derive the quarantined-project set (rung 5).
 const PROJECT_STATUS_FILE: &str = ".project-status.json";
 
-/// Unique per-event marker id: wall nanos + pid + process-local counter +
-/// per-call randomized entropy. The deterministic fields make logs useful;
-/// entropy prevents two processes with the same pid and clock from claiming
-/// the same correctness-critical marker identity. Shared with the replicator's
-/// `_repl/` markers (src/replicate.rs), which reuse the idiom.
-pub(crate) fn marker_nonce() -> String {
-    if let Some(n) = crate::clock::sim_nonce() {
-        return n;
-    }
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid = std::process::id();
-    let entropy = |domain: u64| {
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u128(nanos);
-        hasher.write_u32(pid);
-        hasher.write_u64(seq);
-        hasher.write_u64(domain);
-        hasher.finish()
-    };
-    format!("{nanos}-{pid}-{seq}-{:016x}{:016x}", entropy(0), entropy(1))
-}
-
-/// Declare "I am about to change truth for `pkg`". Returns the nonce the
-/// writer must commit with. If the writer dies, the intent goes stale and the
-/// worker rebuilds anyway after the grace period.
-pub async fn mark_intent(storage: &dyn Storage, pkg: &str) -> Result<String> {
-    let nonce = marker_nonce();
-    mark_intent_with_nonce(storage, pkg, &nonce).await?;
-    Ok(nonce)
-}
-
-pub(crate) async fn mark_intent_with_nonce(
-    storage: &dyn Storage,
-    pkg: &str,
-    nonce: &str,
-) -> Result<()> {
-    put_marker(storage, pkg, nonce, INTENT_SUFFIX).await
-}
-
-/// Declare "truth changed for `pkg`": rebuild as soon as possible.
-pub async fn mark_commit(storage: &dyn Storage, pkg: &str, nonce: &str) -> Result<()> {
-    put_marker(storage, pkg, nonce, COMMIT_SUFFIX).await
-}
-
-pub(crate) async fn clear_intent(storage: &dyn Storage, pkg: &str, nonce: &str) -> Result<()> {
-    storage
-        .delete_keys(&[format!("{DIRTY_PREFIX}{pkg}!{nonce}{INTENT_SUFFIX}")])
-        .await
-}
-
-/// Write an empty event marker `_dirty/<pkg>!<nonce><suffix>`.
-async fn put_marker(storage: &dyn Storage, pkg: &str, nonce: &str, suffix: &str) -> Result<()> {
-    storage
-        .put_bytes(
-            &format!("{DIRTY_PREFIX}{pkg}!{nonce}{suffix}"),
-            Vec::new(),
-            None,
-        )
-        .await
-}
-
-/// Mark a package as needing an index rebuild (an unpaired commit event, for
-/// callers whose truth change already happened).
-pub async fn mark_dirty(storage: &dyn Storage, pkg: &str) -> Result<()> {
-    mark_commit(storage, pkg, &marker_nonce()).await
-}
-
-/// One parsed `_dirty/` entry.
-pub struct Marker {
-    pub key: String,
-    pub nonce: Option<String>,
-    pub is_commit: bool,
-    /// Storage last-modified — staleness comes from the storage clock.
-    pub written_at: Option<time::OffsetDateTime>,
-}
-
 pub struct DirtyWork {
     pub package: String,
     pub keys: Vec<String>,
     pub stale_intents: u64,
-}
-
-/// Split a marker key into (package, marker). Legacy `_dirty/<pkg>` keys
-/// parse as nonce-less commits.
-pub fn parse_marker(entry: &FileEntry) -> Option<(String, Marker)> {
-    let rest = entry.key.strip_prefix(DIRTY_PREFIX)?;
-    let written_at = entry.last_modified.as_deref().and_then(|ts| {
-        time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339).ok()
-    });
-    let Some((pkg, event)) = rest.split_once('!') else {
-        return Some((
-            rest.to_string(),
-            Marker {
-                key: entry.key.clone(),
-                nonce: None,
-                is_commit: true,
-                written_at,
-            },
-        ));
-    };
-    let (nonce, is_commit) = if let Some(n) = event.strip_suffix(COMMIT_SUFFIX) {
-        (n, true)
-    } else if let Some(n) = event.strip_suffix(INTENT_SUFFIX) {
-        (n, false)
-    } else {
-        // Unknown suffix: treat as a commit so nothing rots in the prefix.
-        (event, true)
-    };
-    Some((
-        pkg.to_string(),
-        Marker {
-            key: entry.key.clone(),
-            nonce: Some(nonce.to_string()),
-            is_commit,
-            written_at,
-        },
-    ))
 }
 
 /// Group dirty events by package and select exactly the markers safe to
@@ -3193,18 +3075,6 @@ mod tests {
             ))),
             advisory_reload_asap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
-    }
-
-    #[test]
-    fn marker_nonces_carry_randomized_process_entropy() {
-        let first = marker_nonce();
-        let second = marker_nonce();
-        assert_ne!(first, second);
-        for nonce in [first, second] {
-            let entropy = nonce.rsplit('-').next().unwrap();
-            assert_eq!(entropy.len(), 32);
-            assert!(entropy.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        }
     }
 
     #[test]

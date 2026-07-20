@@ -54,7 +54,15 @@ def _rebuild_index(bin_path: Path, data_dir: Path) -> subprocess.CompletedProces
 
 def _chain_links(data_dir: Path) -> list[Path]:
     chain_dir = data_dir / "_transparency" / "chain"
-    return sorted(chain_dir.glob("*.json")) if chain_dir.is_dir() else []
+    if not chain_dir.is_dir():
+        return []
+    # A write-to-tmp-then-rename in flight leaves a `.tmp-<nonce>-...json` sibling
+    # (see tmp_sibling in src/storage.rs); it is not committed chain data. Skip it
+    # so a parallel run never reads — or parses the sequence of — an uncommitted
+    # link (that is how `int(p.stem)` hit `.tmp-...-0000000000000001`).
+    return sorted(
+        p for p in chain_dir.glob("*.json") if not p.name.startswith(".tmp-")
+    )
 
 
 def _artifact_and_sidecar(data_dir: Path, pkg: str) -> tuple[Path, Path]:

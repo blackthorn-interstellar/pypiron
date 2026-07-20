@@ -50,10 +50,17 @@ pub mod web;
 pub mod wheel;
 pub mod worker;
 
-// Keep every historical `crate::X` path valid: the items that lived at the
-// crate root when `main.rs` was the root (AppState, the storage-layout
-// prefixes, shared helpers) are re-exported here. The CLI surface moved to
-// `cli` but keeps its crate-flat paths the same way.
-pub use app::*;
-pub use cli::*;
-pub use pages::*;
+// Items that lived at the crate root when `main.rs` was the root (AppState, the
+// storage-layout prefixes, the record read/write path) are re-exported here so
+// the historical flat `crate::X` / `pypiron::X` paths keep resolving. This list
+// is explicit — not `pub use app::*` — so the real dependency direction between
+// the crate root and its modules stays visible. `cli` and `pages` need no
+// re-export: every reference to them is already a qualified `crate::cli::X` /
+// `crate::pages::X` path.
+pub use app::{
+    delete_record, publish_record, AccessLogFormat, AppState, ArtifactDelivery, PublishBody,
+    PublishRequest, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX,
+};
+// Reached only by sibling modules over flat `crate::X` paths, so re-exported at
+// crate visibility rather than widened to `pub`.
+pub(crate) use app::{post_publish_mirror_claim_is_current, IDLE_PROBE_INTERVAL};

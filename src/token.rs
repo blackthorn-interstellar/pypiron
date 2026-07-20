@@ -127,7 +127,7 @@ pub fn verify(signing_key: &str, token: &str, now_unix: i64) -> Option<Claims> {
     let (payload, mac) = body.split_once('.')?;
     let expected = b64url.encode(hmac_sha256(signing_key.as_bytes(), payload.as_bytes()));
     // Constant-time compare so a forged token can't be tuned byte-by-byte.
-    if !crate::ct_eq(mac, &expected) {
+    if !ct_eq(mac, &expected) {
         return None;
     }
     let claims: Claims = serde_json::from_slice(&b64url.decode(payload).ok()?).ok()?;
@@ -135,6 +135,21 @@ pub fn verify(signing_key: &str, token: &str, now_unix: i64) -> Option<Claims> {
         return None;
     }
     Some(claims)
+}
+
+/// Length-independent constant-time byte equality, so credential checks don't
+/// leak the secret one prefix-byte at a time (CWE-208). The length may leak;
+/// the bytes do not.
+pub(crate) fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]

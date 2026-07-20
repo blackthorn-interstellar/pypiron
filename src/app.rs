@@ -4715,28 +4715,13 @@ async fn mint_token(
     }))
 }
 
-/// Length-independent constant-time byte equality, so credential checks don't
-/// leak the secret one prefix-byte at a time (CWE-208). The length may leak;
-/// the bytes do not.
-pub(crate) fn ct_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 fn check_basic_auth(headers: &HeaderMap, user: &str, pass: &str) -> Result<()> {
     let (u, p) = basic_credentials(headers).ok_or_else(|| anyhow!("missing basic auth"))?;
     // Gmail-style subaddressing: `ci+billing-api` authenticates as `ci`; the
     // suffix is a project attribution tag, not part of the identity.
     let base = u.split_once('+').map_or(u.as_str(), |(b, _)| b);
     // Username is not a secret; the password is — compare it in constant time.
-    if (u == user || base == user) && ct_eq(&p, pass) {
+    if (u == user || base == user) && token::ct_eq(&p, pass) {
         Ok(())
     } else {
         Err(anyhow!("bad credentials"))

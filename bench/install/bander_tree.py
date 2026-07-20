@@ -67,9 +67,7 @@ def build_tree(manifest: dict, wheelhouse: Path, out: Path) -> int:
         )
 
     root = out / "simple"
-    listing = "\n".join(
-        f'    <a href="{p}/">{p}</a><br/>' for p in sorted(projects)
-    )
+    listing = "\n".join(f'    <a href="{p}/">{p}</a><br/>' for p in sorted(projects))
     root.joinpath("index.html").write_text(
         "<!DOCTYPE html>\n<html>\n  <head><title>Simple index</title></head>\n"
         f"  <body>\n{listing}\n  </body>\n</html>\n"

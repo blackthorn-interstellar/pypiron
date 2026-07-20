@@ -129,7 +129,7 @@ SAMPLE_K = 200  # wheel URLs the sampler verifies per step, spread across the wi
 # FOLLOWING the 302 to object storage, and asserts a final 200 with the exact
 # expected body length — catching broken presigns, S3 SlowDown 503s, and truncated
 # bodies that a --redirect 0 wheel oha (which only ever sees pypiron's 302) cannot.
-SAMPLER_SRC = r'''#!/usr/bin/env python3
+SAMPLER_SRC = r"""#!/usr/bin/env python3
 import json, random, sys, time, urllib.request
 
 def main():
@@ -162,7 +162,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
+"""
 
 
 def push_sampler(url_size_map: dict) -> None:

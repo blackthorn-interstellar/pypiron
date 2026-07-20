@@ -539,10 +539,22 @@ def test_sample_breach_predicate():
     assert mn_ramp.sample_breach({"sample_total": None}) is False  # follow mode
     assert mn_ramp.sample_breach({"sample_total": None, "sample_ok": None}) is False
     assert mn_ramp.sample_breach(SAMPLE_OK | {"sample_total": 200, "sample_ok": 200}) is False
-    assert mn_ramp.sample_breach({"sample_ok": 199, "sample_total": 200, "sample_size_mismatch": 0}) is False
-    assert mn_ramp.sample_breach({"sample_ok": 198, "sample_total": 200, "sample_size_mismatch": 0}) is True
-    assert mn_ramp.sample_breach({"sample_ok": 200, "sample_total": 200, "sample_size_mismatch": 1}) is True
-    assert mn_ramp.sample_breach({"sample_ok": 0, "sample_total": 0, "sample_size_mismatch": 0}) is True
+    assert (
+        mn_ramp.sample_breach({"sample_ok": 199, "sample_total": 200, "sample_size_mismatch": 0})
+        is False
+    )
+    assert (
+        mn_ramp.sample_breach({"sample_ok": 198, "sample_total": 200, "sample_size_mismatch": 0})
+        is True
+    )
+    assert (
+        mn_ramp.sample_breach({"sample_ok": 200, "sample_total": 200, "sample_size_mismatch": 1})
+        is True
+    )
+    assert (
+        mn_ramp.sample_breach({"sample_ok": 0, "sample_total": 0, "sample_size_mismatch": 0})
+        is True
+    )
 
 
 def test_is_collapse_returns_sample_when_sampler_fails():
@@ -580,7 +592,9 @@ def redirect_cliff(knee: int, ceil: float, cpu_at_knee: float):
         if c <= knee:
             f = c / knee
             return _redirect_step(c, ceil * f, cpu_at_knee * f, SAMPLE_OK)
-        return _redirect_step(c, ceil * 0.9, cpu_at_knee * 1.05, {"ok": 150, "total": 200, "size_mismatch": 0})
+        return _redirect_step(
+            c, ceil * 0.9, cpu_at_knee * 1.05, {"ok": 150, "total": 200, "size_mismatch": 0}
+        )
 
     return measure
 

@@ -3943,12 +3943,7 @@ pub async fn delete_record(
 
     worker::rebuild_package_excluding(state, storage, pkg, Some(filename))
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("index rewrite failed: {e}"),
-            )
-        })?;
+        .map_err(|e| internal("index rewrite failed", e))?;
 
     if state.buckets.is_multi() {
         let current = origin::read_origin_observation(storage, pkg)
@@ -3979,23 +3974,13 @@ pub async fn delete_record(
     if replicate_delete {
         tombstone::write(storage, &key, filename)
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("tombstone write failed: {e}"),
-                )
-            })?;
+            .map_err(|e| internal("tombstone write failed", e))?;
     }
 
     storage
         .delete_keys(std::slice::from_ref(&key))
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("artifact delete failed: {e}"),
-            )
-        })?;
+        .map_err(|e| internal("artifact delete failed", e))?;
 
     // Stop handing out the dead URL immediately (same node; peers age out).
     state.presign_cache.invalidate(&key);

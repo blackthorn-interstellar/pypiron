@@ -101,6 +101,11 @@ fn artifact_key(pkg: &str, filename: &str) -> String {
 // Precedence: tombstone ≻ origin (private ≻ mirror) ≻ union ≻ freeze.
 // ---------------------------------------------------------------------------
 
+/// A live record's origin: the two [`OriginState`] variants a *claimed* package
+/// can hold. `Unclaimed` is unrepresentable here — a record is only ever read for
+/// a package that already holds a private or mirror claim — so the narrowing from
+/// the canonical claim type is explicit ([`TryFrom<OriginState>`]) rather than a
+/// second enum with its own parser.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Origin {
     Private,
@@ -109,10 +114,22 @@ pub enum Origin {
 
 impl Origin {
     pub fn parse(s: &str) -> Option<Origin> {
-        match s {
-            PRIVATE => Some(Origin::Private),
-            MIRROR => Some(Origin::Mirror),
-            _ => None,
+        OriginState::parse(s)
+            .ok()
+            .and_then(|state| state.try_into().ok())
+    }
+}
+
+impl TryFrom<OriginState> for Origin {
+    type Error = OriginState;
+
+    /// Narrow a claim state to a record origin. `Unclaimed` has no record-origin
+    /// meaning and is returned as the `Err` so callers fold it into "no origin".
+    fn try_from(state: OriginState) -> Result<Self, Self::Error> {
+        match state {
+            OriginState::Private => Ok(Origin::Private),
+            OriginState::Mirror => Ok(Origin::Mirror),
+            OriginState::Unclaimed => Err(state),
         }
     }
 }
@@ -408,17 +425,8 @@ async fn read_pkg_origin(storage: &dyn Storage, pkg: &str) -> Result<Option<Orig
     let Some(observed) = read_origin_observation(storage, pkg).await? else {
         return Ok(None);
     };
-    if observed.state == OriginState::Unclaimed {
-        return Ok(None);
-    }
-    Origin::parse(observed.state.as_str())
-        .map(Some)
-        .ok_or_else(|| {
-            anyhow!(
-                "origin claim for '{pkg}' holds an unexpected value '{}'",
-                observed.state.as_str()
-            )
-        })
+    // `Unclaimed` narrows to `None`; a claimed state to its record origin.
+    Ok(observed.state.try_into().ok())
 }
 
 /// Build a [`Record`] from a package listing already in hand (the diff path):

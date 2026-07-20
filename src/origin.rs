@@ -59,7 +59,7 @@ impl OriginState {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub fn parse(value: &str) -> Result<Self> {
         match value {
             UNCLAIMED => Ok(OriginState::Unclaimed),
             MIRROR => Ok(OriginState::Mirror),

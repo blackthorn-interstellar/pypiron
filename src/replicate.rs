@@ -1337,20 +1337,28 @@ pub async fn fanout_sync(state: &AppState, pinned: &Pinned, pkg: &str, filename:
     }
 }
 
+/// The outcome of [`reconcile_split_origin`]: each side's origin after promoting
+/// a lone private claim, and whether that side's mirror artifacts were scanned
+/// (so a caller caching the member listing refreshes the scanned side).
+struct SplitOriginReconciled {
+    a_origin: Option<Origin>,
+    b_origin: Option<Origin>,
+    scanned_a: bool,
+    scanned_b: bool,
+}
+
 /// Reconcile a cross-bucket origin split before a package is diffed. When
 /// exactly one side holds the private claim, promote the peer's claim to private
 /// and quarantine any mirror bodies stranded on it (marking that side dirty so
-/// its own leader rebuilds). Returns the reconciled `(a, b)` origins and, per
-/// side, whether its mirror artifacts were scanned — a caller that caches the
-/// member listing must refresh the scanned side. Any other pairing (already
-/// agreeing, or neither private) is left untouched.
+/// its own leader rebuilds). Any other pairing (already agreeing, or neither
+/// private) is left untouched.
 async fn reconcile_split_origin(
     a: &dyn Storage,
     b: &dyn Storage,
     pkg: &str,
     mut a_origin: Option<Origin>,
     mut b_origin: Option<Origin>,
-) -> Result<(Option<Origin>, Option<Origin>, bool, bool)> {
+) -> Result<SplitOriginReconciled> {
     let (mut scanned_a, mut scanned_b) = (false, false);
     match (a_origin, b_origin) {
         (Some(Origin::Private), Some(Origin::Mirror)) => {
@@ -1379,7 +1387,12 @@ async fn reconcile_split_origin(
         }
         _ => {}
     }
-    Ok((a_origin, b_origin, scanned_a, scanned_b))
+    Ok(SplitOriginReconciled {
+        a_origin,
+        b_origin,
+        scanned_a,
+        scanned_b,
+    })
 }
 
 /// Replicate one record from `src` into `dst` (tiers 1 and 2). Reads both
@@ -1395,8 +1408,11 @@ async fn replicate_record(
     require_replication_unfenced(state)?;
     let src_origin = read_pkg_origin(src, pkg).await?;
     let dst_origin = read_pkg_origin(dst, pkg).await?;
-    let (src_origin, dst_origin, _, _) =
-        reconcile_split_origin(src, dst, pkg, src_origin, dst_origin).await?;
+    let SplitOriginReconciled {
+        a_origin: src_origin,
+        b_origin: dst_origin,
+        ..
+    } = reconcile_split_origin(src, dst, pkg, src_origin, dst_origin).await?;
 
     if filename == ORIGIN_MARKER {
         return Ok(());
@@ -1940,8 +1956,12 @@ async fn converge_package(
 
     let a_origin = read_pkg_origin(a, pkg).await?;
     let b_origin = read_pkg_origin(b, pkg).await?;
-    let (a_origin, b_origin, scanned_a, scanned_b) =
-        reconcile_split_origin(a, b, pkg, a_origin, b_origin).await?;
+    let SplitOriginReconciled {
+        a_origin,
+        b_origin,
+        scanned_a,
+        scanned_b,
+    } = reconcile_split_origin(a, b, pkg, a_origin, b_origin).await?;
     if scanned_a {
         a_names = package_member_names(a, pkg).await?;
     }

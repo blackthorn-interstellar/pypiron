@@ -2030,7 +2030,11 @@ pub async fn rebuild_package_excluding(
     pkg: &str,
     omit: Option<&str>,
 ) -> Result<(bool, FileShas)> {
-    let (live, raw, shas) = rebuild_package_indexes(state, storage, pkg, omit).await?;
+    let RebuiltPackage {
+        still_live: live,
+        raw_artifacts: raw,
+        file_shas: shas,
+    } = rebuild_package_indexes(state, storage, pkg, omit).await?;
     // Maintain the in-memory inventory. This is the one choke point every
     // rebuild against the *selected* bucket — tick, audit, delete — flows
     // through, and `upsert` is an idempotent absolute set, so concurrent or
@@ -2046,19 +2050,29 @@ pub async fn rebuild_package_excluding(
     Ok((live, shas))
 }
 
+/// The outcome of rebuilding a package's derived index views (see
+/// [`rebuild_package_indexes`]).
+pub struct RebuiltPackage {
+    /// Whether the package still has renderable artifacts (`false` means the
+    /// index views were removed).
+    still_live: bool,
+    /// The raw `(filename, size)` listing — the inventory writer's input.
+    raw_artifacts: Vec<(String, u64)>,
+    /// The renderable file→sha256 map (the transparency chain's commitment).
+    file_shas: FileShas,
+}
+
 /// Rebuild only a package's index views from `storage`'s own truth, touching no
 /// node-local inventory. `rebuild_package_excluding` layers the selected
 /// bucket's inventory on top; the replicator (src/replicate.rs) calls this
 /// directly against a *non-selected* destination bucket, where mixing that
 /// bucket's counts into the node's inventory (or its name cache) would be wrong.
-/// Returns `(still_live, raw_artifacts, file_shas)`, where `file_shas` is the
-/// renderable file→sha256 map (the transparency chain's commitment).
 pub async fn rebuild_package_indexes(
     state: &AppState,
     storage: &dyn Storage,
     pkg: &str,
     omit: Option<&str>,
-) -> Result<(bool, Vec<(String, u64)>, FileShas)> {
+) -> Result<RebuiltPackage> {
     if !state.buckets.is_multi() {
         return rebuild_package_indexes_inner(state, storage, pkg, omit).await;
     }
@@ -2089,7 +2103,7 @@ async fn rebuild_package_indexes_inner(
     storage: &dyn Storage,
     pkg: &str,
     omit: Option<&str>,
-) -> Result<(bool, Vec<(String, u64)>, FileShas)> {
+) -> Result<RebuiltPackage> {
     state
         .metrics
         .index_rebuilds
@@ -2127,7 +2141,11 @@ async fn rebuild_package_indexes_inner(
     // changed (its fingerprint/dirty marker moved), so a same-node reader sees
     // the upload immediately instead of waiting out the cache TTL.
     state.project_cache.invalidate_package(pkg);
-    Ok((live, raw, shas))
+    Ok(RebuiltPackage {
+        still_live: live,
+        raw_artifacts: raw,
+        file_shas: shas,
+    })
 }
 
 /// One package's contribution to the registry inventory: artifact files in
@@ -2409,7 +2427,7 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
             }
         };
         match rebuild_package_indexes(state, storage, &package, None).await {
-            Ok((live, _, _)) => {
+            Ok(RebuiltPackage { still_live: live, .. }) => {
                 // Same paused-writer hazard as the tick: a stale intent's
                 // writer may still mutate after this rebuild's listing, so
                 // re-arm before consuming or retain the originals.

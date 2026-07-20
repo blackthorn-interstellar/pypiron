@@ -137,7 +137,7 @@ jobs:
             workers: 4
           - backend: azure
             markers: "azure and not perf and not stress"
-            workers: 8
+            workers: 4
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -151,15 +151,17 @@ jobs:
       # instead of eight processes contending on cargo's target-dir lock.
       - name: Build server binary
         run: cargo build --locked
-      # Worker count is per-leg (matrix.workers). disk/azure run at -n 8: their
-      # waits are truly wait-bound — containers, HTTP polls — so oversubscribing
-      # the 4-vCPU runner keeps it busy. The s3 leg runs at -n 4 (one worker per
-      # vCPU): its multi-region fault-injection tests assert on real timing
+      # Worker count is per-leg (matrix.workers). The disk leg runs at -n 8: it
+      # carries no fault-injection markers, so its waits are truly wait-bound —
+      # containers, HTTP polls — and oversubscribing the 4-vCPU runner keeps it
+      # busy. Both cloud legs (s3 and azure) run at -n 4, one worker per vCPU:
+      # they carry multi-region fault-injection tests that assert on real timing
       # windows (1s bucket-health probe deadlines, hysteresis/drip windows), and
       # 2x oversubscription starves the CPU enough that a probe to a *healthy*
-      # bucket times out — a spurious failover the tests then flag. Honest
-      # scheduling, not oversubscription, is what those windows need.
-      # --durations so each leg reports where time goes.
+      # bucket times out — a spurious failover the tests then flag. The azure
+      # leg's `azure` marker collects test_multicloud's failover-timing test,
+      # which is the same family. Honest scheduling, not oversubscription, is
+      # what those windows need. --durations so each leg reports where time goes.
       - name: Blackbox suite (${{ matrix.backend }} mode)
         run: uv run -- pytest tests -m "${{ matrix.markers }}" -n ${{ matrix.workers }} --durations=25
 

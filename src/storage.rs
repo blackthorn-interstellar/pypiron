@@ -1717,6 +1717,60 @@ impl ObjectStorage {
         }
     }
 
+    /// Drain a listing `stream`, keeping objects whose logical key starts with
+    /// the exact byte `prefix` (object_store lists by directory; the byte-prefix
+    /// filter is ours). Stops after `limit` matches — pass `usize::MAX` for an
+    /// unbounded listing. Objects arrive in ascending key order; callers wanting
+    /// a total order sort the result themselves.
+    async fn list_matching(
+        &self,
+        mut stream: impl futures::Stream<Item = object_store::Result<object_store::ObjectMeta>> + Unpin,
+        prefix: &str,
+        op: &str,
+        limit: usize,
+    ) -> Result<Vec<ObjectMeta>> {
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let m = match item {
+                Ok(meta) => meta,
+                Err(error) => return Err(self.store_err(error, op, prefix)),
+            };
+            let Some(key) = self.unkey(m.location.as_ref()) else {
+                continue;
+            };
+            if key.starts_with(prefix) {
+                out.push(ObjectMeta {
+                    key: key.to_string(),
+                    size: m.size,
+                    etag: pack_version(&m.e_tag, &m.version),
+                });
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The enclosing directory object_store should list, plus whether to scope
+    /// the listing at all, for our raw byte-prefix contract. A storage prefix
+    /// always scopes the listing (even at the tree root — listing the whole
+    /// bucket would return objects that aren't ours).
+    fn list_dir_prefix(&self, prefix: &str) -> Option<OsPath> {
+        // object_store's list() treats the prefix as a directory (it appends a
+        // '/'), but our contract is a raw byte prefix: SHARD_CHARS passes
+        // "packages/a" to match "packages/alpha". So list the enclosing
+        // directory and filter by the exact byte prefix. A trailing-slash
+        // prefix ("packages/foo/") lists only that directory; a sharded prefix
+        // ("packages/a") lists "packages/" — the audit fans those out across
+        // shards in parallel.
+        let dir = match prefix.rfind('/') {
+            Some(i) => &prefix[..=i],
+            None => "",
+        };
+        (!dir.is_empty() || self.prefix.is_some()).then(|| self.oskey(dir))
+    }
+
     /// GET the whole object as a 200 response.
     async fn full_response(&self, path: &OsPath, key: &str) -> Result<Response<Body>> {
         let res = match self.store.get(path).await {
@@ -1975,38 +2029,11 @@ impl Storage for ObjectStorage {
     }
 
     async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
-        // object_store's list() treats the prefix as a directory (it appends a
-        // '/'), but our contract is a raw byte prefix: SHARD_CHARS passes
-        // "packages/a" to match "packages/alpha". So list the enclosing
-        // directory and filter by the exact byte prefix. A trailing-slash
-        // prefix ("packages/foo/") lists only that directory; a sharded prefix
-        // ("packages/a") lists "packages/" — the audit fans those out across
-        // shards in parallel.
-        let dir = match prefix.rfind('/') {
-            Some(i) => &prefix[..=i],
-            None => "",
-        };
-        // A storage prefix always scopes the listing, even at the tree root —
-        // listing the whole bucket would return objects that aren't ours.
-        let list_prefix = (!dir.is_empty() || self.prefix.is_some()).then(|| self.oskey(dir));
-        let mut stream = self.store.list(list_prefix.as_ref());
-        let mut out = Vec::new();
-        while let Some(item) = stream.next().await {
-            let m = match item {
-                Ok(meta) => meta,
-                Err(error) => return Err(self.store_err(error, "list_all", prefix)),
-            };
-            let Some(key) = self.unkey(m.location.as_ref()) else {
-                continue;
-            };
-            if key.starts_with(prefix) {
-                out.push(ObjectMeta {
-                    key: key.to_string(),
-                    size: m.size,
-                    etag: pack_version(&m.e_tag, &m.version),
-                });
-            }
-        }
+        let list_prefix = self.list_dir_prefix(prefix);
+        let stream = self.store.list(list_prefix.as_ref());
+        let mut out = self
+            .list_matching(stream, prefix, "list_all", usize::MAX)
+            .await?;
         out.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
     }
@@ -2017,41 +2044,16 @@ impl Storage for ObjectStorage {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ObjectMeta>> {
-        // Same directory-vs-byte-prefix contract as `list_all`.
-        let dir = match prefix.rfind('/') {
-            Some(i) => &prefix[..=i],
-            None => "",
-        };
-        let list_prefix = (!dir.is_empty() || self.prefix.is_some()).then(|| self.oskey(dir));
+        let list_prefix = self.list_dir_prefix(prefix);
         // Native start-after: the client passes `offset` to ListObjectsV2, so a
         // later page never re-lists earlier keys. Objects arrive in ascending
         // key order, so the first `limit` matches are exactly the next page.
         let offset = after.map(|a| self.oskey(a));
-        let mut stream = match &offset {
+        let stream = match &offset {
             Some(offset) => self.store.list_with_offset(list_prefix.as_ref(), offset),
             None => self.store.list(list_prefix.as_ref()),
         };
-        let mut out = Vec::new();
-        while let Some(item) = stream.next().await {
-            let m = match item {
-                Ok(meta) => meta,
-                Err(error) => return Err(self.store_err(error, "list_page", prefix)),
-            };
-            let Some(key) = self.unkey(m.location.as_ref()) else {
-                continue;
-            };
-            if key.starts_with(prefix) {
-                out.push(ObjectMeta {
-                    key: key.to_string(),
-                    size: m.size,
-                    etag: pack_version(&m.e_tag, &m.version),
-                });
-                if out.len() >= limit {
-                    break;
-                }
-            }
-        }
-        Ok(out)
+        self.list_matching(stream, prefix, "list_page", limit).await
     }
 
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {

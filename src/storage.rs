@@ -59,43 +59,33 @@ fn request_timeout_str() -> String {
     format!("{}s", FAILOVER_REQUEST_TIMEOUT.as_secs())
 }
 
+// Apply the failover transport bounds — bounded connect/request timeouts and no
+// retries (see `failover_retry_config`) — to a cloud builder. Each backend has
+// its own config-key enum and object_store exposes no shared builder trait, so a
+// macro over the `Client(..)` variant path removes the duplication where a
+// generic fn cannot. `$client_key` is that variant (e.g. `AmazonS3ConfigKey::Client`).
+macro_rules! bound_transport {
+    ($builder:expr, $client_key:path) => {
+        $builder
+            .with_config(
+                $client_key(ClientConfigKey::ConnectTimeout),
+                connect_timeout_str(),
+            )
+            .with_config($client_key(ClientConfigKey::Timeout), request_timeout_str())
+            .with_retry(failover_retry_config())
+    };
+}
+
 fn bound_s3_transport(builder: AmazonS3Builder) -> AmazonS3Builder {
-    builder
-        .with_config(
-            AmazonS3ConfigKey::Client(ClientConfigKey::ConnectTimeout),
-            connect_timeout_str(),
-        )
-        .with_config(
-            AmazonS3ConfigKey::Client(ClientConfigKey::Timeout),
-            request_timeout_str(),
-        )
-        .with_retry(failover_retry_config())
+    bound_transport!(builder, AmazonS3ConfigKey::Client)
 }
 
 fn bound_gcs_transport(builder: GoogleCloudStorageBuilder) -> GoogleCloudStorageBuilder {
-    builder
-        .with_config(
-            GoogleConfigKey::Client(ClientConfigKey::ConnectTimeout),
-            connect_timeout_str(),
-        )
-        .with_config(
-            GoogleConfigKey::Client(ClientConfigKey::Timeout),
-            request_timeout_str(),
-        )
-        .with_retry(failover_retry_config())
+    bound_transport!(builder, GoogleConfigKey::Client)
 }
 
 fn bound_azure_transport(builder: MicrosoftAzureBuilder) -> MicrosoftAzureBuilder {
-    builder
-        .with_config(
-            AzureConfigKey::Client(ClientConfigKey::ConnectTimeout),
-            connect_timeout_str(),
-        )
-        .with_config(
-            AzureConfigKey::Client(ClientConfigKey::Timeout),
-            request_timeout_str(),
-        )
-        .with_retry(failover_retry_config())
+    bound_transport!(builder, AzureConfigKey::Client)
 }
 
 /// Storage configuration for `serve` and the maintenance commands — one binary,

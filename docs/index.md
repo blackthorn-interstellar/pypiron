@@ -12,6 +12,7 @@ pypiron is the fastest, most reliable PyPI server (and mirror) available.
 - **Dependency cooldown, on by default.** New releases wait 7 days. Most attacks surface first. ([how](concepts/supply-chain.md))
 - **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
 - **Scales to a fleet.** Point any number of nodes at one bucket. No coordination.
+- **Survives a region — or a whole cloud — going down.** Run nodes across regions or clouds on one bucket list; reads fail over with zero data loss. ([how](guides/multi-region.md))
 - **Works with everything.** uv, pip, poetry, pdm, twine, pipenv, hatch, flit.
 - **Download stats built in** (beta). ([details](concepts/download-stats.md))
 
@@ -84,13 +85,13 @@ Serves `http://localhost:8080`:
 === "uv"
 
     ```bash
-    uv add --index http://localhost:8080/simple/ acme-widgets
+    uv add --default-index http://localhost:8080/simple/ acme-widgets
     ```
 
 === "pip"
 
     ```bash
-    pip install --extra-index-url http://localhost:8080/simple/ acme-widgets
+    pip install --index-url http://localhost:8080/simple/ acme-widgets
     ```
 
 === "poetry"

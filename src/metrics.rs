@@ -401,28 +401,27 @@ impl Metrics {
                 &self.proxy_artifact_errors,
             ),
         ] {
-            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
-            out.push_str(&format!("{name} {}\n", value.load(Ordering::Relaxed)));
+            emit_counter(&mut out, name, help, value.load(Ordering::Relaxed));
         }
         let audit_secs = f64::from_bits(self.audit_last_duration_bits.load(Ordering::Relaxed));
-        out.push_str(
-            "# HELP pypiron_audit_last_duration_seconds Wall duration of the last completed audit pass.\n",
+        emit_gauge(
+            &mut out,
+            "pypiron_audit_last_duration_seconds",
+            "Wall duration of the last completed audit pass.",
+            audit_secs,
         );
-        out.push_str("# TYPE pypiron_audit_last_duration_seconds gauge\n");
-        out.push_str(&format!(
-            "pypiron_audit_last_duration_seconds {audit_secs}\n"
-        ));
         // Advisory snapshot staleness (per node). Emitted only once a refresh has
         // succeeded — a permanent zero on a node that never armed the feature
         // would be a misleading "0 seconds old". Age is computed at render time.
         let advisory_refresh = self.advisory_last_refresh_unix.load(Ordering::Relaxed);
         if advisory_refresh != 0 {
             let age = unix_now_secs().saturating_sub(advisory_refresh);
-            out.push_str(
-                "# HELP pypiron_advisory_snapshot_age_seconds Seconds since this node last refreshed the advisory snapshot.\n",
+            emit_gauge(
+                &mut out,
+                "pypiron_advisory_snapshot_age_seconds",
+                "Seconds since this node last refreshed the advisory snapshot.",
+                age,
             );
-            out.push_str("# TYPE pypiron_advisory_snapshot_age_seconds gauge\n");
-            out.push_str(&format!("pypiron_advisory_snapshot_age_seconds {age}\n"));
         }
         // Malware-probe staleness (per node). Emitted only once a probe has
         // succeeded — a node that never armed the probe would otherwise show a
@@ -430,11 +429,12 @@ impl Metrics {
         let probe_refresh = self.malware_probe_last_unix.load(Ordering::Relaxed);
         if probe_refresh != 0 {
             let age = unix_now_secs().saturating_sub(probe_refresh);
-            out.push_str(
-                "# HELP pypiron_malware_probe_age_seconds Seconds since this node's last successful malware probe (CSV poll).\n",
+            emit_gauge(
+                &mut out,
+                "pypiron_malware_probe_age_seconds",
+                "Seconds since this node's last successful malware probe (CSV poll).",
+                age,
             );
-            out.push_str("# TYPE pypiron_malware_probe_age_seconds gauge\n");
-            out.push_str(&format!("pypiron_malware_probe_age_seconds {age}\n"));
         }
         for (name, help, value) in [
             (
@@ -458,8 +458,7 @@ impl Metrics {
                 self.inventory_bytes.load(Ordering::Relaxed),
             ),
         ] {
-            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
-            out.push_str(&format!("{name} {value}\n"));
+            emit_gauge(&mut out, name, help, value);
         }
         // Replication family — emitted only on a multi-bucket node (design §G);
         // a single-bucket node never runs replication, so the series would be a
@@ -487,18 +486,16 @@ impl Metrics {
                     &self.replication_conflict_quarantines,
                 ),
             ] {
-                out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
-                out.push_str(&format!("{name} {}\n", value.load(Ordering::Relaxed)));
+                emit_counter(&mut out, name, help, value.load(Ordering::Relaxed));
             }
             let diff_secs =
                 f64::from_bits(self.reconcile_diff_duration_bits.load(Ordering::Relaxed));
-            out.push_str(
-                "# HELP pypiron_reconcile_diff_duration_seconds Wall duration of the last pairwise reconcile diff.\n",
+            emit_gauge(
+                &mut out,
+                "pypiron_reconcile_diff_duration_seconds",
+                "Wall duration of the last pairwise reconcile diff.",
+                diff_secs,
             );
-            out.push_str("# TYPE pypiron_reconcile_diff_duration_seconds gauge\n");
-            out.push_str(&format!(
-                "pypiron_reconcile_diff_duration_seconds {diff_secs}\n"
-            ));
             let backlog = self
                 .marker_backlog
                 .lock()
@@ -592,21 +589,33 @@ impl Metrics {
                 "pypiron_bucket_health_alarms_total{{{labels}}} {alarms}\n"
             ));
         }
-        out.push_str("# HELP pypiron_bucket_selection_generation Storage selection generation.\n");
-        out.push_str("# TYPE pypiron_bucket_selection_generation gauge\n");
-        out.push_str(&format!(
-            "pypiron_bucket_selection_generation {}\n",
-            state.selection_generation
-        ));
-        out.push_str(
-            "# HELP pypiron_bucket_topology_write_fenced Writes blocked by a runtime topology mismatch (1=fenced).\n",
+        emit_gauge(
+            out,
+            "pypiron_bucket_selection_generation",
+            "Storage selection generation.",
+            state.selection_generation,
         );
-        out.push_str("# TYPE pypiron_bucket_topology_write_fenced gauge\n");
-        out.push_str(&format!(
-            "pypiron_bucket_topology_write_fenced {}\n",
-            u8::from(state.topology_write_fenced)
-        ));
+        emit_gauge(
+            out,
+            "pypiron_bucket_topology_write_fenced",
+            "Writes blocked by a runtime topology mismatch (1=fenced).",
+            u8::from(state.topology_write_fenced),
+        );
     }
+}
+
+/// Emit a single-value counter metric: `# HELP`, `# TYPE`, and the value line.
+fn emit_counter(out: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
+    out.push_str(&format!(
+        "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
+    ));
+}
+
+/// Emit a single-value gauge metric: `# HELP`, `# TYPE`, and the value line.
+fn emit_gauge(out: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
+    out.push_str(&format!(
+        "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+    ));
 }
 
 fn prometheus_label(value: &str) -> String {

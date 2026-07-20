@@ -1335,6 +1335,51 @@ pub async fn fanout_sync(state: &AppState, pinned: &Pinned, pkg: &str, filename:
     }
 }
 
+/// Reconcile a cross-bucket origin split before a package is diffed. When
+/// exactly one side holds the private claim, promote the peer's claim to private
+/// and quarantine any mirror bodies stranded on it (marking that side dirty so
+/// its own leader rebuilds). Returns the reconciled `(a, b)` origins and, per
+/// side, whether its mirror artifacts were scanned — a caller that caches the
+/// member listing must refresh the scanned side. Any other pairing (already
+/// agreeing, or neither private) is left untouched.
+async fn reconcile_split_origin(
+    a: &dyn Storage,
+    b: &dyn Storage,
+    pkg: &str,
+    mut a_origin: Option<Origin>,
+    mut b_origin: Option<Origin>,
+) -> Result<(Option<Origin>, Option<Origin>, bool, bool)> {
+    let (mut scanned_a, mut scanned_b) = (false, false);
+    match (a_origin, b_origin) {
+        (Some(Origin::Private), Some(Origin::Mirror)) => {
+            ensure_private_origin(b, pkg).await?;
+            if quarantine_mirror_artifacts(b, pkg).await? > 0 {
+                worker::mark_dirty(b, pkg).await?;
+            }
+            scanned_b = true;
+            b_origin = Some(Origin::Private);
+        }
+        (Some(Origin::Mirror), Some(Origin::Private)) => {
+            ensure_private_origin(a, pkg).await?;
+            if quarantine_mirror_artifacts(a, pkg).await? > 0 {
+                worker::mark_dirty(a, pkg).await?;
+            }
+            scanned_a = true;
+            a_origin = Some(Origin::Private);
+        }
+        (Some(Origin::Private), None) => {
+            ensure_private_origin(b, pkg).await?;
+            b_origin = Some(Origin::Private);
+        }
+        (None, Some(Origin::Private)) => {
+            ensure_private_origin(a, pkg).await?;
+            a_origin = Some(Origin::Private);
+        }
+        _ => {}
+    }
+    Ok((a_origin, b_origin, scanned_a, scanned_b))
+}
+
 /// Replicate one record from `src` into `dst` (tiers 1 and 2). Reads both
 /// sides, decides, and applies — the same merge that reconcile runs, so an
 /// ordered byte conflict quarantines the loser and an ambiguous one freezes.
@@ -1346,33 +1391,10 @@ async fn replicate_record(
     filename: &str,
 ) -> Result<()> {
     require_replication_unfenced(state)?;
-    let mut src_origin = read_pkg_origin(src, pkg).await?;
-    let mut dst_origin = read_pkg_origin(dst, pkg).await?;
-    match (src_origin, dst_origin) {
-        (Some(Origin::Private), Some(Origin::Mirror)) => {
-            ensure_private_origin(dst, pkg).await?;
-            if quarantine_mirror_artifacts(dst, pkg).await? > 0 {
-                worker::mark_dirty(dst, pkg).await?;
-            }
-            dst_origin = Some(Origin::Private);
-        }
-        (Some(Origin::Mirror), Some(Origin::Private)) => {
-            ensure_private_origin(src, pkg).await?;
-            if quarantine_mirror_artifacts(src, pkg).await? > 0 {
-                worker::mark_dirty(src, pkg).await?;
-            }
-            src_origin = Some(Origin::Private);
-        }
-        (Some(Origin::Private), None) => {
-            ensure_private_origin(dst, pkg).await?;
-            dst_origin = Some(Origin::Private);
-        }
-        (None, Some(Origin::Private)) => {
-            ensure_private_origin(src, pkg).await?;
-            src_origin = Some(Origin::Private);
-        }
-        _ => {}
-    }
+    let src_origin = read_pkg_origin(src, pkg).await?;
+    let dst_origin = read_pkg_origin(dst, pkg).await?;
+    let (src_origin, dst_origin, _, _) =
+        reconcile_split_origin(src, dst, pkg, src_origin, dst_origin).await?;
 
     if filename == ORIGIN_MARKER {
         return Ok(());
@@ -1911,34 +1933,15 @@ async fn converge_package(
     let mut a_names = package_member_names(a, pkg).await?;
     let mut b_names = package_member_names(b, pkg).await?;
 
-    let mut a_origin = read_pkg_origin(a, pkg).await?;
-    let mut b_origin = read_pkg_origin(b, pkg).await?;
-    match (a_origin, b_origin) {
-        (Some(Origin::Private), Some(Origin::Mirror)) => {
-            ensure_private_origin(b, pkg).await?;
-            if quarantine_mirror_artifacts(b, pkg).await? > 0 {
-                worker::mark_dirty(b, pkg).await?;
-            }
-            b_names = package_member_names(b, pkg).await?;
-            b_origin = Some(Origin::Private);
-        }
-        (Some(Origin::Mirror), Some(Origin::Private)) => {
-            ensure_private_origin(a, pkg).await?;
-            if quarantine_mirror_artifacts(a, pkg).await? > 0 {
-                worker::mark_dirty(a, pkg).await?;
-            }
-            a_names = package_member_names(a, pkg).await?;
-            a_origin = Some(Origin::Private);
-        }
-        (Some(Origin::Private), None) => {
-            ensure_private_origin(b, pkg).await?;
-            b_origin = Some(Origin::Private);
-        }
-        (None, Some(Origin::Private)) => {
-            ensure_private_origin(a, pkg).await?;
-            a_origin = Some(Origin::Private);
-        }
-        _ => {}
+    let a_origin = read_pkg_origin(a, pkg).await?;
+    let b_origin = read_pkg_origin(b, pkg).await?;
+    let (a_origin, b_origin, scanned_a, scanned_b) =
+        reconcile_split_origin(a, b, pkg, a_origin, b_origin).await?;
+    if scanned_a {
+        a_names = package_member_names(a, pkg).await?;
+    }
+    if scanned_b {
+        b_names = package_member_names(b, pkg).await?;
     }
 
     if a_origin == Some(Origin::Private) || b_origin == Some(Origin::Private) {

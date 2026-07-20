@@ -359,17 +359,51 @@ def pip_venv(tmp_path_factory, uv_path: str) -> Path:
 # ---------------------------- Disk server fixture -----------------------------
 
 
+# Credential profiles for _start_disk_server: the serve args to pass and the
+# credential keys to advertise in the yielded dict.
+#   "full"            — admin (everything, incl. mirror/delete/yank) plus a
+#                       publish-only uploader; `user`/`password` mirror the admin
+#                       credential (a superset) so any-operation tests keep working.
+#   "admin-pass-only" — only `--admin-pass`; the username defaults to `admin`.
+#   "none"            — no credentials at all: read-only, every write disabled.
+_DISK_SERVER_CREDS = {
+    "full": {
+        "args": [
+            "--admin-user",
+            "admin",
+            "--admin-pass",
+            "secret",
+            "--uploader-user",
+            "uploader",
+            "--uploader-pass",
+            "uploadersecret",
+        ],
+        "extra": {
+            "user": "admin",
+            "password": "secret",
+            "admin_user": "admin",
+            "admin_password": "secret",
+            "uploader_user": "uploader",
+            "uploader_password": "uploadersecret",
+        },
+    },
+    "admin-pass-only": {
+        "args": ["--admin-pass", "secret"],
+        "extra": {"admin_user": "admin", "admin_password": "secret"},
+    },
+    "none": {"args": [], "extra": {}},
+}
+
+
 def _start_disk_server(
-    tmp_path_factory, bin_path: Path, extra_args=(), extra_env=None
+    tmp_path_factory, bin_path: Path, extra_args=(), extra_env=None, creds="full"
 ) -> Iterator[Dict]:
     data_dir = tmp_path_factory.mktemp("pypiron-data")
     log_path = data_dir.parent / f"{data_dir.name}-server.log"
     port = find_free_port()
     bind = f"127.0.0.1:{port}"
 
-    # Two roles: admin (everything, incl. mirror/delete/yank) and uploader
-    # (publish only). The dict's `user`/`password` are the admin credential —
-    # a superset — so tests that do any operation through them keep working.
+    profile = _DISK_SERVER_CREDS[creds]
     args = [
         str(bin_path),
         "serve",
@@ -377,14 +411,7 @@ def _start_disk_server(
         bind,
         "--data-dir",
         str(data_dir),
-        "--admin-user",
-        "admin",
-        "--admin-pass",
-        "secret",
-        "--uploader-user",
-        "uploader",
-        "--uploader-pass",
-        "uploadersecret",
+        *profile["args"],
         "--worker-interval-secs",
         "1",
         *extra_args,
@@ -411,15 +438,10 @@ def _start_disk_server(
                 "base_url": f"http://{bind}",
                 "legacy": f"http://{bind}/legacy/",
                 "simple": f"http://{bind}/simple/",
-                "user": "admin",
-                "password": "secret",
-                "admin_user": "admin",
-                "admin_password": "secret",
-                "uploader_user": "uploader",
-                "uploader_password": "uploadersecret",
                 "data_dir": data_dir,
                 "log_path": log_path,
                 "proc": proc,
+                **profile["extra"],
             }
         finally:
             kill_process_tree(proc)
@@ -519,77 +541,13 @@ def disk_server_token_auth(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict
 @pytest.fixture()
 def disk_server_admin_pass_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Disk server given only `--admin-pass`: the username defaults to `admin`."""
-    data_dir = tmp_path_factory.mktemp("pypiron-admin-pass-only")
-    port = find_free_port()
-    bind = f"127.0.0.1:{port}"
-    log_path = data_dir.parent / f"{data_dir.name}-server.log"
-    args = [
-        str(pypiron_bin),
-        "serve",
-        "--bind-addr",
-        bind,
-        "--data-dir",
-        str(data_dir),
-        "--admin-pass",
-        "secret",
-        "--worker-interval-secs",
-        "1",
-    ]
-    env = os.environ.copy()
-    env.setdefault("RUST_LOG", "info,pypiron=debug")
-    with open(log_path, "w") as log_file:
-        proc = subprocess.Popen(args, env=env, stdout=log_file, stderr=subprocess.STDOUT)
-        try:
-            wait_http_ok(f"http://{bind}/simple/index.json", timeout=20.0)
-            yield {
-                "bind": bind,
-                "base_url": f"http://{bind}",
-                "legacy": f"http://{bind}/legacy/",
-                "simple": f"http://{bind}/simple/",
-                "admin_user": "admin",
-                "admin_password": "secret",
-                "data_dir": data_dir,
-                "log_path": log_path,
-                "proc": proc,
-            }
-        finally:
-            kill_process_tree(proc)
+    yield from _start_disk_server(tmp_path_factory, pypiron_bin, creds="admin-pass-only")
 
 
 @pytest.fixture()
 def disk_server_no_creds(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Disk server with no credentials at all: read-only, every write disabled."""
-    data_dir = tmp_path_factory.mktemp("pypiron-no-creds")
-    port = find_free_port()
-    bind = f"127.0.0.1:{port}"
-    log_path = data_dir.parent / f"{data_dir.name}-server.log"
-    args = [
-        str(pypiron_bin),
-        "serve",
-        "--bind-addr",
-        bind,
-        "--data-dir",
-        str(data_dir),
-        "--worker-interval-secs",
-        "1",
-    ]
-    env = os.environ.copy()
-    env.setdefault("RUST_LOG", "info,pypiron=debug")
-    with open(log_path, "w") as log_file:
-        proc = subprocess.Popen(args, env=env, stdout=log_file, stderr=subprocess.STDOUT)
-        try:
-            wait_http_ok(f"http://{bind}/simple/index.json", timeout=20.0)
-            yield {
-                "bind": bind,
-                "base_url": f"http://{bind}",
-                "legacy": f"http://{bind}/legacy/",
-                "simple": f"http://{bind}/simple/",
-                "data_dir": data_dir,
-                "log_path": log_path,
-                "proc": proc,
-            }
-        finally:
-            kill_process_tree(proc)
+    yield from _start_disk_server(tmp_path_factory, pypiron_bin, creds="none")
 
 
 @pytest.fixture()

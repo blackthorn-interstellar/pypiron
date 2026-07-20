@@ -2960,16 +2960,28 @@ async fn unclaimed_confirmed_absent(
 /// the name is ineligible (private / reserved prefix), so fall through to local
 /// serving; `Some(Err)` = origin unreadable, an outage to surface rather than
 /// answer "who owns this name" optimistically; `Some(Ok)` = serve upstream.
+/// Whether the on-demand proxy should answer for `pkg`. `FallThrough`: serve the
+/// local index instead (proxy off or the name ineligible); `Serve`: the eligible
+/// upstream to fetch from; `Deny`: an origin-read outage, return this error
+/// rather than answer a "who owns this name" question optimistically.
+enum ProxyDecision<'a> {
+    FallThrough,
+    Serve(&'a Arc<proxy::Proxy>),
+    Deny(Response<Body>),
+}
+
 async fn eligible_proxy<'a>(
     state: &'a AppState,
     storage: &dyn Storage,
     pkg: &str,
-) -> Option<Result<&'a Arc<proxy::Proxy>, Response<Body>>> {
-    let proxy = state.proxy.as_ref()?;
+) -> ProxyDecision<'a> {
+    let Some(proxy) = state.proxy.as_ref() else {
+        return ProxyDecision::FallThrough;
+    };
     match proxy::eligible(state, storage, pkg).await {
-        Ok(true) => Some(Ok(proxy)),
-        Ok(false) => None,
-        Err(e) => Some(Err(read_error(e))),
+        Ok(true) => ProxyDecision::Serve(proxy),
+        Ok(false) => ProxyDecision::FallThrough,
+        Err(e) => ProxyDecision::Deny(read_error(e)),
     }
 }
 
@@ -3707,9 +3719,9 @@ async fn proxy_companion_passthrough(
         Err(error) => return Some(read_error(error)),
     };
     let proxy = match eligible_proxy(state, storage, pkg).await {
-        Some(Ok(proxy)) => proxy,
-        Some(Err(resp)) => return Some(resp),
-        None => return None,
+        ProxyDecision::Serve(proxy) => proxy,
+        ProxyDecision::Deny(resp) => return Some(resp),
+        ProxyDecision::FallThrough => return None,
     };
     let bytes = match companion {
         Companion::Metadata => proxy.fetch_metadata(state, pkg, filename).await,

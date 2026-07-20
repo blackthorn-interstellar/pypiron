@@ -10,10 +10,13 @@ An ultra-fast Python package server, written in Rust.
 pypiron is the fastest, most reliable PyPI server (and mirror) available.
 
 <p align="center">
-  <img src="docs/assets/install-throughput.png" alt="Max sustained install throughput: pypiron vs bandersnatch, pypiserver, pypicloud, devpi, proxpi" width="760">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/install-throughput-dark.svg">
+    <img src="docs/assets/install-throughput.svg" alt="Max sustained install throughput: pypiron vs bandersnatch, pypiserver, pypicloud, devpi, proxpi" width="760">
+  </picture>
 </p>
 
-- **5–90× faster than any PyPI server.** 3,026 installs/s on 2 vCPU.
+- **100×+ faster than any PyPI server.** 8,288 verified installs/s on 2 vCPU.
 - **Serves PyPI-scale traffic — measured, not extrapolated.** Replaying PyPI's real download stream, one 8-vCPU box handles the index at ~200,000 requests/s with p99 under 3 ms — about double PyPI's global average ([bench/replay](bench/replay/)).
 - **Supply-chain quarantine, on by default.** New releases wait 7 days. Most attacks surface first.
 - **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
@@ -70,7 +73,7 @@ Hover a checkmark for the caveat where your Markdown renderer supports it.
 | Feature | pypiron | bandersnatch | pypiserver | pypicloud | devpi | proxpi |
 | --- | :---: | :---: | :---: | :---: | :---: | :---: |
 | Easy setup | <abbr title="Single binary, uvx, or Docker; hosts private packages, mirror sync, and proxy from one server.">✅</abbr> | — | <abbr title="Simple private package host over a local directory.">✅</abbr> | — | — | <abbr title="Simple caching proxy; no private uploads.">✅</abbr> |
-| Fast | <abbr title="3,026 real installs/s on 2 vCPU in the benchmark.">✅</abbr> | <abbr title="574 installs/s as a static nginx-served mirror.">✅</abbr> | — | — | — | — |
+| Fast | <abbr title="8,288 verified installs/s on 2 vCPU in the benchmark.">✅</abbr> | <abbr title="77 installs/s as a static nginx-served mirror — NIC-bound on the same box.">✅</abbr> | — | — | — | — |
 | Scalable without database | <abbr title="Multi-node against S3, GCS, or Azure Blob; no database.">✅</abbr> | <abbr title="Static mirror tree served by nginx or object storage; no database.">✅</abbr> | — | — | — | — |
 | Human-readable package pages | <abbr title="Dashboard, package search, download pages, project pages, and README rendering.">✅</abbr> | — | — | <abbr title="Has a web UI.">✅</abbr> | <abbr title="Has a web UI and README rendering.">✅</abbr> | <abbr title="Has a web UI.">✅</abbr> |
 | Download stats | <abbr title="Built-in global and per-package download counters.">✅</abbr> | — | — | — | — | — |

@@ -27,8 +27,14 @@ THEMES = {
     "light": {"bg": "white", "text": "#1f2328", "axis": "#8b949e", "grid": "#eaecef"},
     "dark": {"bg": "#1f1813", "text": "#ece5dd", "axis": "#a59a8f", "grid": "#352c24"},
 }
-XMAX = 3400.0  # axis ceiling (longest bar ~3,026/s; leaves room for its label)
+XMAX = 9500.0  # axis ceiling (longest bar ~8,288/s; leaves room for its label)
 ALIAS = {"bander": "bandersnatch"}  # cmp-bander-ceiling.json -> bandersnatch
+# Redirect-architecture servers are measured at their architectural boundary
+# (delivery-verified 302s, not bytes through the node) — disclosed on the chart.
+FOOTNOTE = (
+    "† redirect architecture: installs counted as delivery-verified 302s "
+    "(bytes served by object storage); others serve wheel bytes through the node"
+)
 
 
 def server_of(path: Path) -> str:
@@ -39,14 +45,21 @@ def server_of(path: Path) -> str:
 
 
 def collect() -> list[tuple[str, float]]:
-    """Each server's peak installs/sec (max across its runs), sorted high→low."""
+    """Each server's peak installs/sec (max across its runs), sorted high→low.
+    Redirect-mode servers get a dagger on their label (see FOOTNOTE)."""
     best: dict[str, float] = {}
+    modes: dict[str, str] = {}
     for f in sorted(RESULTS.glob("cmp-*.json")):
-        v = json.loads(f.read_text()).get("peak_installs_per_sec")
+        d = json.loads(f.read_text())
+        v = d.get("peak_installs_per_sec")
         if v is not None:
             s = server_of(f)
             best[s] = max(best.get(s, 0.0), float(v))
-    return sorted(best.items(), key=lambda kv: -kv[1])
+            modes[s] = d.get("wheel_mode", "follow")
+    return sorted(
+        ((s + ("†" if modes.get(s) == "redirect" else ""), v) for s, v in best.items()),
+        key=lambda kv: -kv[1],
+    )
 
 
 def nice_ticks(top: float, n: int = 5) -> list[float]:
@@ -63,7 +76,8 @@ def svg(data: list[tuple[str, float]], title: str, subtitle: str, theme: dict[st
     head = 56 if title else 14
     plot_w = W - LABEL - PAD_R
     base = head + len(data) * ROW
-    H = base + 40
+    footnote = any(name.endswith("†") for name, _ in data)
+    H = base + (56 if footnote else 40)
     top = XMAX
     ticks = nice_ticks(top)
 
@@ -108,6 +122,10 @@ def svg(data: list[tuple[str, float]], title: str, subtitle: str, theme: dict[st
         s.append(
             f'<text x="{x(v) + 8:.1f}" y="{ty:.1f}" font-size="12" font-weight="{weight}" '
             f'fill="{TEXT}">{int(v + 0.5):,}/s</text>'
+        )
+    if footnote:
+        s.append(
+            f'<text x="{LABEL}" y="{base + 50}" font-size="10" fill="{AXIS}">{FOOTNOTE}</text>'
         )
     s.append("</svg>")
     return "\n".join(s)

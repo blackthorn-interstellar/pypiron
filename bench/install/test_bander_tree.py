@@ -24,13 +24,11 @@ def _fixture(tmp_path, filenames):
 
 
 def test_build_tree_shape_and_anchors(tmp_path):
-    manifest, wh = _fixture(
-        tmp_path, ["flask-3.0.0-py3-none-any.whl", "idna-3.7-py3-none-any.whl"]
-    )
+    manifest, wh = _fixture(tmp_path, ["flask-3.0.0-py3-none-any.whl", "idna-3.7-py3-none-any.whl"])
     out = tmp_path / "web"
     assert build_tree(manifest, wh, out) == 2
     idx = (out / "simple" / "flask" / "index.html").read_text()
-    assert '../../packages/flask-3.0.0-py3-none-any.whl#sha256=' in idx
+    assert "../../packages/flask-3.0.0-py3-none-any.whl#sha256=" in idx
     assert (out / "packages" / "idna-3.7-py3-none-any.whl").stat().st_size == 10
     root = (out / "simple" / "index.html").read_text()
     assert '<a href="flask/">flask</a>' in root

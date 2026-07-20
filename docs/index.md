@@ -7,7 +7,7 @@ pypiron is the fastest, most reliable PyPI server (and mirror) available.
 ![Max sustained install throughput](assets/install-throughput.svg#only-light)
 ![Max sustained install throughput](assets/install-throughput-dark.svg#only-dark)
 
-- **5–90× faster than any PyPI server.** 3,026 installs/s on 2 vCPU. ([benchmarks](reference/benchmarks.md))
+- **100×+ faster than any PyPI server.** 8,288 verified installs/s on 2 vCPU. ([benchmarks](reference/benchmarks.md))
 - **Serves PyPI-scale traffic — measured, not extrapolated.** Replaying PyPI's real download stream, one 8-vCPU box handles the index at ~200,000 requests/s with p99 under 3 ms — about double PyPI's global average.
 - **Dependency cooldown, on by default.** New releases wait 7 days. Most attacks surface first. ([how](concepts/supply-chain.md))
 - **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.

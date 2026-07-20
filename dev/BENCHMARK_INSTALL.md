@@ -464,6 +464,12 @@ out-serves the control — the rig, not pypiron, is the bottleneck.
 
 ## 14. Six-way install-throughput comparison — 2026-06-20
 
+> **⚠ Superseded by §19 (2026-07-19).** The installs/s metric these sections
+> used (agg req/s ÷ 13.1) inflated under saturation — completed cheap index
+> requests were counted as installs while wheel fetches stalled. The absolute
+> numbers here are retracted; the methodology history remains.
+
+
 The headline number: **max sustained real-install throughput** on one realistic
 small server, every server in its best cloud-backed config, driven by `oha`
 replaying the install-mix (index + wheel URLs in install proportions) and
@@ -525,6 +531,12 @@ point. pypicloud has 2 documented unservable wheels (redis cache-mode pin).
 
 ## 15. pypiron's true (server-bound) ceiling — 2026-06-20
 
+> **⚠ Superseded by §19 (2026-07-19).** The installs/s metric these sections
+> used (agg req/s ÷ 13.1) inflated under saturation — completed cheap index
+> requests were counted as installs while wheel fetches stalled. The absolute
+> numbers here are retracted; the methodology history remains.
+
+
 §14 reported pypiron at 1,022 installs/s but **rig-limited** (node 43% CPU; the 2
 loadgens, busy pulling wheels from S3, were the bottleneck). Scaling the loadgen
 fleet to **4× c7i.8xlarge** (~50 Gbps aggregate, enough S3-download capacity to
@@ -550,6 +562,12 @@ were already server-bound in §14 (their numbers are real ceilings); only pypiro
 and bandersnatch had headroom left, and this pins pypiron's.
 
 ## 16. bandersnatch's true ceiling — NIC-bound, not CPU-bound (2026-06-20)
+
+> **⚠ Superseded by §19 (2026-07-19).** The installs/s metric these sections
+> used (agg req/s ÷ 13.1) inflated under saturation — completed cheap index
+> requests were counted as installs while wheel fetches stalled. The absolute
+> numbers here are retracted; the methodology history remains.
+
 
 §14 had bandersnatch at ≥512 (node ~60% CPU — not saturated). Re-run with the same
 4× c7i.8xlarge fleet that pinned pypiron:
@@ -581,6 +599,12 @@ carries only index + 302s, so it scales to its CPU. A bigger-NIC box lifts
 bandersnatch's number, but the byte-egress tax is structural; pypiron never pays it.
 
 ## 17. Post-mimalloc ceiling — mimalloc + an 8-loadgen fleet (2026-06-24)
+
+> **⚠ Superseded by §19 (2026-07-19).** The installs/s metric these sections
+> used (agg req/s ÷ 13.1) inflated under saturation — completed cheap index
+> requests were counted as installs while wheel fetches stalled. The absolute
+> numbers here are retracted; the methodology history remains.
+
 
 Two things changed since §15: (1) **mimalloc** as the global allocator (commit
 `98db902`) cut per-request CPU on this allocation-heavy index+302 path; (2) §15's
@@ -627,6 +651,12 @@ pypicloud's 47, pypiron at its true ceiling is now **~33× and ~60×**.
 
 ## 18. Auto-searched ceiling — the knee the fixed ladder missed (2026-06-24)
 
+> **⚠ Superseded by §19 (2026-07-19).** The installs/s metric these sections
+> used (agg req/s ÷ 13.1) inflated under saturation — completed cheap index
+> requests were counted as installs while wheel fetches stalled. The absolute
+> numbers here are retracted; the methodology history remains.
+
+
 §17's fixed ladder sampled 65,536 then jumped to 98,304 conns and reported 2,845
 (the 65,536 step) — but never looked between, where the curve was still rising with
 CPU headroom. The adaptive search (`mn_ramp` with no `--ladder`: exponential bracket
@@ -653,3 +683,68 @@ benchmark.sh) now reads a collapse-under-load as server-bound, not just a CPU ba
 
 Final true-ceiling ranking (r7i.large, 2 vCPU, host-net, real S3-download install-mix):
 pypiron 3,026 ≫ bandersnatch 574 ≫ pypiserver 85 > pypicloud 47 > devpi 35 > proxpi 32.
+
+## 19. The metric was wrong — correction, new harness, and the re-run (2026-07-19)
+
+**Every absolute installs/s figure in §14–§18 is retracted.** The metric was
+`aggregate req/s ÷ 13.1`, which assumes completed requests match the URL mix.
+Under saturation wheel fetches stall while cheap index requests keep
+completing, so the number inflates without bound — survivorship, not
+throughput. Caught on a 16-loadgen run whose "peak" (7,717 inst/s) sat at a
+step where MB-per-install had fallen 17.27 → 1.57 (bytes crater ~11× while the
+"install" count climbs) and one step read 67.8k rps at an impossible 0.45%
+CPU (the one-shot docker-stats gauge). Byte-anchored reinterpretation of the
+historical runs: the published 3,026 was a rig-limited artifact of the fleet's
+S3 pull (~6–13× inflated); bandersnatch's 574 was ~14× inflated (its real wall
+is the NIC). The *ranking* survived; the absolutes did not.
+
+**The fixed harness (77f0f73, b173bbe, 8c14b7d, a7bd0bf):**
+
+- installs/s = **completed wheel fetches ÷ wheels-per-install** (6.553, derived
+  from the mix). Each loadgen runs two ohas — index class and wheel class split
+  by mix ratio — so cheap index completions can never masquerade as installs.
+- **Redirect architectures measured at their boundary**: pypiron and pypicloud
+  302 to object storage by design, so their wheel class counts completed 302s
+  (`--wheel-mode redirect`) — *verified*, not assumed: a sampler follows ~200
+  fresh random wheel URLs per step through the redirect and asserts exact
+  Content-Length; a step without ≥99.5% verified delivery is invalid. Proven
+  fail-closed locally: killing MinIO mid-step left pypiron happily signing
+  302s into the void and only the sampler flagged it. Byte-serving servers
+  (devpi, bandersnatch, pypiserver, proxpi) keep full downloads through the
+  node — that is *their* architectural boundary.
+- Guards: per-step mix-integrity (bytes-per-install vs corpus constant),
+  byte-anchor cross-check, per-class ok%; server CPU is a windowed /proc/stat
+  delta including softirq (the docker-stats one-shot read 0.45% under 68k rps);
+  `server-bound` requires evidence *at the peak step*.
+- bandersnatch's static tree is built from the frozen wheelhouse by
+  `bander_tree.py` (identical serving surface; a real mirror run re-downloads
+  the same hash-pinned bytes from pypi.org — setup, not measurement, per §0).
+- Ops lesson: all servers bind host-net :8080, and a leftover container from a
+  prior serve silently kept the port — a "bandersnatch" ramp measured a
+  leftover pypiron 302ing to S3 at a physically impossible 45 Gbps "NIC"
+  throughput. Caught by physics-checking verification, fixed by clearing all
+  known server containers before each serve.
+
+**The re-run** (r7i.large 2 vCPU server, 4× c7i.8xlarge loadgens, lite corpus,
+us-east-1, host networking, egress-free measured runs; every result
+independently verified for coherence, physics, and cross-file consistency):
+
+| Rank | Server | Mode | Installs/s | Bound / mechanism |
+|---|---|---|---|---|
+| 1 | **pypiron** | redirect† | **8,288** | server CPU (199% of 200%), sampler 200/200 at peak, clean post-peak decline |
+| 2 | devpi | follow | 78 | index-path starvation at ~12.2 Gbps egress (NIC edge) |
+| 3 | bandersnatch | follow | 77 | box NIC (1,512 MB/s = 97% of 12.5 Gbps), CPU to spare; byte-anchored ~68–69 |
+| 4 | pypiserver | follow | 69 | CPU + NIC, gunicorn cached-dir |
+| 5 | pypicloud | redirect† | 42 | uwsgi CPU (94.5%) — knife-edge single healthy step; corpus n_wheel=271 (10 dropped by its own serving) |
+| 6 | proxpi | follow | 32 | single GIL worker CPU |
+
+† delivery-verified 302s (see above). The byte-servers cluster at 69–78
+because the *box NIC* is their shared wall — that is the architectural point,
+not an artifact. pypicloud is pypiron's like-for-like peer (also S3-redirect):
+its Python index+redirect layer caps at 42/s where pypiron's Rust one does
+8,288 — ~200×. pypiron's 8,288 = 93.5k req/s mixed (46.7k/core) at p99 1.3 ms.
+
+Also this cycle: a profile→fix→A/B optimization loop on the serving path
+(samply, MinIO-backed Track-2 shape, ≥3% gate) returned an honest null — the
+July 17 wins already took the fat; no dominant hot function remains. The
+8,288 is the unoptimized-further serving path.

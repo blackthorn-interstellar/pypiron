@@ -1,30 +1,33 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="780" height="210" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
-<rect width="780" height="210" fill="#1f1813"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="226" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="780" height="226" fill="#1f1813"/>
 <line x1="130.0" y1="14" x2="130.0" y2="170" stroke="#352c24" stroke-width="1"/>
 <text x="130.0" y="188" font-size="11" fill="#a59a8f" text-anchor="middle">0</text>
-<line x1="297.6" y1="14" x2="297.6" y2="170" stroke="#352c24" stroke-width="1"/>
-<text x="297.6" y="188" font-size="11" fill="#a59a8f" text-anchor="middle">1,000</text>
-<line x1="465.3" y1="14" x2="465.3" y2="170" stroke="#352c24" stroke-width="1"/>
-<text x="465.3" y="188" font-size="11" fill="#a59a8f" text-anchor="middle">2,000</text>
-<line x1="632.9" y1="14" x2="632.9" y2="170" stroke="#352c24" stroke-width="1"/>
-<text x="632.9" y="188" font-size="11" fill="#a59a8f" text-anchor="middle">3,000</text>
+<line x1="250.0" y1="14" x2="250.0" y2="170" stroke="#352c24" stroke-width="1"/>
+<text x="250.0" y="188" font-size="11" fill="#a59a8f" text-anchor="middle">2,000</text>
+<line x1="370.0" y1="14" x2="370.0" y2="170" stroke="#352c24" stroke-width="1"/>
+<text x="370.0" y="188" font-size="11" fill="#a59a8f" text-anchor="middle">4,000</text>
+<line x1="490.0" y1="14" x2="490.0" y2="170" stroke="#352c24" stroke-width="1"/>
+<text x="490.0" y="188" font-size="11" fill="#a59a8f" text-anchor="middle">6,000</text>
+<line x1="610.0" y1="14" x2="610.0" y2="170" stroke="#352c24" stroke-width="1"/>
+<text x="610.0" y="188" font-size="11" fill="#a59a8f" text-anchor="middle">8,000</text>
 <text x="415.0" y="204" font-size="11" fill="#a59a8f" text-anchor="middle">installs / second (higher is better)</text>
-<text x="118" y="30.5" font-size="13" font-weight="700" fill="#ece5dd" text-anchor="end">pypiron</text>
-<rect x="130" y="19.0" width="507.4" height="16" rx="2" fill="#e07b45"/>
-<text x="645.4" y="30.5" font-size="12" font-weight="700" fill="#ece5dd">3,026/s</text>
-<text x="118" y="56.5" font-size="13" font-weight="400" fill="#ece5dd" text-anchor="end">bandersnatch</text>
-<rect x="130" y="45.0" width="96.3" height="16" rx="2" fill="#e07b45"/>
-<text x="234.3" y="56.5" font-size="12" font-weight="400" fill="#ece5dd">574/s</text>
-<text x="118" y="82.5" font-size="13" font-weight="400" fill="#ece5dd" text-anchor="end">pypiserver</text>
-<rect x="130" y="71.0" width="14.2" height="16" rx="2" fill="#e07b45"/>
-<text x="152.2" y="82.5" font-size="12" font-weight="400" fill="#ece5dd">85/s</text>
-<text x="118" y="108.5" font-size="13" font-weight="400" fill="#ece5dd" text-anchor="end">pypicloud</text>
-<rect x="130" y="97.0" width="7.9" height="16" rx="2" fill="#e07b45"/>
-<text x="145.9" y="108.5" font-size="12" font-weight="400" fill="#ece5dd">47/s</text>
-<text x="118" y="134.5" font-size="13" font-weight="400" fill="#ece5dd" text-anchor="end">devpi</text>
-<rect x="130" y="123.0" width="5.8" height="16" rx="2" fill="#e07b45"/>
-<text x="143.8" y="134.5" font-size="12" font-weight="400" fill="#ece5dd">35/s</text>
+<text x="118" y="30.5" font-size="13" font-weight="700" fill="#ece5dd" text-anchor="end">pypiron†</text>
+<rect x="130" y="19.0" width="497.3" height="16" rx="2" fill="#e07b45"/>
+<text x="635.3" y="30.5" font-size="12" font-weight="700" fill="#ece5dd">8,288/s</text>
+<text x="118" y="56.5" font-size="13" font-weight="400" fill="#ece5dd" text-anchor="end">devpi</text>
+<rect x="130" y="45.0" width="4.7" height="16" rx="2" fill="#e07b45"/>
+<text x="142.7" y="56.5" font-size="12" font-weight="400" fill="#ece5dd">78/s</text>
+<text x="118" y="82.5" font-size="13" font-weight="400" fill="#ece5dd" text-anchor="end">bandersnatch</text>
+<rect x="130" y="71.0" width="4.6" height="16" rx="2" fill="#e07b45"/>
+<text x="142.6" y="82.5" font-size="12" font-weight="400" fill="#ece5dd">77/s</text>
+<text x="118" y="108.5" font-size="13" font-weight="400" fill="#ece5dd" text-anchor="end">pypiserver</text>
+<rect x="130" y="97.0" width="4.1" height="16" rx="2" fill="#e07b45"/>
+<text x="142.1" y="108.5" font-size="12" font-weight="400" fill="#ece5dd">69/s</text>
+<text x="118" y="134.5" font-size="13" font-weight="400" fill="#ece5dd" text-anchor="end">pypicloud†</text>
+<rect x="130" y="123.0" width="2.5" height="16" rx="2" fill="#e07b45"/>
+<text x="140.5" y="134.5" font-size="12" font-weight="400" fill="#ece5dd">42/s</text>
 <text x="118" y="160.5" font-size="13" font-weight="400" fill="#ece5dd" text-anchor="end">proxpi</text>
-<rect x="130" y="149.0" width="5.3" height="16" rx="2" fill="#e07b45"/>
-<text x="143.3" y="160.5" font-size="12" font-weight="400" fill="#ece5dd">32/s</text>
+<rect x="130" y="149.0" width="1.9" height="16" rx="2" fill="#e07b45"/>
+<text x="139.9" y="160.5" font-size="12" font-weight="400" fill="#ece5dd">32/s</text>
+<text x="130" y="220" font-size="10" fill="#a59a8f">† redirect architecture: installs counted as delivery-verified 302s (bytes served by object storage); others serve wheel bytes through the node</text>
 </svg>

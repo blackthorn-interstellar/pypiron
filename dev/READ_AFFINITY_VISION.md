@@ -1,5 +1,9 @@
 # Read affinity
 
+> **Status: shipped** (2026-07-14). This is the design record; the user-facing
+> feature and how to turn it on live in
+> [the multi-region guide](../docs/guides/multi-region.md).
+
 Every region serves reads from its own bucket; writes keep a single home. A
 multi-region fleet gets local read latency and zero steady-state cross-region
 egress with nothing new to configure and no weakening of upload serialization.

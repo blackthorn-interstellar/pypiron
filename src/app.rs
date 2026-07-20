@@ -2802,7 +2802,7 @@ async fn serve_pkg_index(
     // (dev/READ_AFFINITY_VISION.md).
     let read_pinned = state.read_pin();
     let write_pinned = state.pin();
-    let same_pin = read_pinned.index == write_pinned.index;
+    let pins = Pins::new(&read_pinned, &write_pinned);
     let format = if requested.is_json() {
         IndexFormat::Json
     } else {
@@ -2835,37 +2835,15 @@ async fn serve_pkg_index(
             .as_ref()
             .is_none_or(|value| value.state == origin::OriginState::Unclaimed)
         {
-            match unclaimed_confirmed_absent(state, &write_pinned, same_pin, &pkg).await {
+            match unclaimed_confirmed_absent(state, &pins, &pkg).await {
                 Ok(true) => return not_found("no such package"),
                 Ok(false) => {}
                 Err(error) => return read_error(error),
             }
         }
-        return serve_local_index_fenced(
-            state,
-            &read_pinned,
-            &write_pinned,
-            same_pin,
-            &pkg,
-            key,
-            ct,
-            headers,
-            read_claim,
-        )
-        .await;
+        return serve_local_index_fenced(state, &pins, &pkg, key, ct, headers, read_claim).await;
     }
-    serve_local_index_fenced(
-        state,
-        &read_pinned,
-        &write_pinned,
-        same_pin,
-        &pkg,
-        key,
-        ct,
-        headers,
-        None,
-    )
-    .await
+    serve_local_index_fenced(state, &pins, &pkg, key, ct, headers, None).await
 }
 
 /// The multi-bucket coherence recheck: re-read the origin claim after serving and
@@ -2891,18 +2869,35 @@ pub(crate) async fn recheck_settled(
     }
 }
 
+/// The pin/fence state the read-through index path threads together: the
+/// region-local read pin, the write home, and whether they are the same bucket
+/// (`same_pin`, so a single-bucket 404 needn't read through to itself). Grouped
+/// so the fenced serve functions don't thread the trio positionally.
+struct Pins<'a> {
+    read: &'a Pinned,
+    write: &'a Pinned,
+    same_pin: bool,
+}
+
+impl<'a> Pins<'a> {
+    fn new(read: &'a Pinned, write: &'a Pinned) -> Self {
+        Pins {
+            read,
+            write,
+            same_pin: read.index == write.index,
+        }
+    }
+}
+
 /// Serve a package index from the read pin, reading through to the write home on
 /// a miss — with the origin coherence recheck pinned to whichever bucket actually
 /// serves the bytes. Served locally from the read pin → the pre-observation
 /// (`read_baseline`, already read by the caller) and the recheck are the read
 /// pin's; served through from the write home → both are the write pin's, so a
 /// region catch-up mid-serve never 503s (dev/READ_AFFINITY_VISION.md).
-#[allow(clippy::too_many_arguments)]
 async fn serve_local_index_fenced(
     state: &AppState,
-    read: &Pinned,
-    write: &Pinned,
-    same_pin: bool,
+    pins: &Pins<'_>,
     pkg: &str,
     key: String,
     content_type: &'static str,
@@ -2911,7 +2906,7 @@ async fn serve_local_index_fenced(
 ) -> Response<Body> {
     let resp = serve_index(
         state,
-        read,
+        pins.read,
         key.clone(),
         content_type,
         INDEX_CACHE_CONTROL,
@@ -2923,7 +2918,7 @@ async fn serve_local_index_fenced(
         if state.buckets.is_multi() {
             if let Some(resp) = recheck_settled(
                 state,
-                read.storage.as_ref(),
+                pins.read.storage.as_ref(),
                 pkg,
                 &read_baseline,
                 "serving its index",
@@ -2935,18 +2930,18 @@ async fn serve_local_index_fenced(
         }
         return resp;
     }
-    if same_pin {
+    if pins.same_pin {
         return resp; // 404 on the only bucket; nothing to read through to.
     }
     // Read-through to the write home: baseline and recheck are both the write
     // pin's, so a repair sweep landing the region bucket's `.origin` never trips.
     let write_baseline =
-        match require_settled_package_read(state, write.storage.as_ref(), pkg).await {
+        match require_settled_package_read(state, pins.write.storage.as_ref(), pkg).await {
             Ok(claim) => claim,
             Err(error) => return read_error(error),
         };
     let resp = serve_index_uncached(
-        write.storage.as_ref(),
+        pins.write.storage.as_ref(),
         &key,
         content_type,
         INDEX_CACHE_CONTROL,
@@ -2955,7 +2950,7 @@ async fn serve_local_index_fenced(
     .await;
     if let Some(resp) = recheck_settled(
         state,
-        write.storage.as_ref(),
+        pins.write.storage.as_ref(),
         pkg,
         &write_baseline,
         "serving its index",
@@ -2971,17 +2966,12 @@ async fn serve_local_index_fenced(
 /// package. Returns true when the write pin also holds no real claim (a genuine
 /// 404), false when the write home owns a claim the region bucket has not yet
 /// seen (serve it through). Fail-closed on names (dev/READ_AFFINITY_VISION.md).
-async fn unclaimed_confirmed_absent(
-    state: &AppState,
-    write: &Pinned,
-    same_pin: bool,
-    pkg: &str,
-) -> Result<bool> {
-    if same_pin {
+async fn unclaimed_confirmed_absent(state: &AppState, pins: &Pins<'_>, pkg: &str) -> Result<bool> {
+    if pins.same_pin {
         return Ok(true);
     }
     Ok(
-        require_settled_package_read(state, write.storage.as_ref(), pkg)
+        require_settled_package_read(state, pins.write.storage.as_ref(), pkg)
             .await?
             .is_none_or(|value| value.state == origin::OriginState::Unclaimed),
     )
@@ -3128,8 +3118,7 @@ async fn serve_index_uncached(
 /// keys populated only from the read pin.
 async fn serve_index_local(
     state: &AppState,
-    read: &Pinned,
-    write: &Pinned,
+    pins: &Pins<'_>,
     key: String,
     content_type: &'static str,
     cache_control: &'static str,
@@ -3137,18 +3126,18 @@ async fn serve_index_local(
 ) -> Response<Body> {
     let resp = serve_index(
         state,
-        read,
+        pins.read,
         key.clone(),
         content_type,
         cache_control,
         headers,
     )
     .await;
-    if read.index == write.index || resp.status() != StatusCode::NOT_FOUND {
+    if pins.same_pin || resp.status() != StatusCode::NOT_FOUND {
         return resp;
     }
     serve_index_uncached(
-        write.storage.as_ref(),
+        pins.write.storage.as_ref(),
         &key,
         content_type,
         cache_control,
@@ -3253,8 +3242,7 @@ async fn serve_companion(
     }
     let resp = serve_index_local(
         state,
-        read,
-        write,
+        &Pins::new(read, write),
         key,
         companion.content_type(),
         ARTIFACT_CACHE_CONTROL,

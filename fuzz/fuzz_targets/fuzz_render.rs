@@ -124,7 +124,7 @@ fuzz_target!(|data: &[u8]| {
     let files = std::slice::from_ref(&fm);
 
     // 1. PEP 691 JSON must always parse.
-    let json = render::pep691_package_json(&pkg, files, &status);
+    let json = render::pep691_project_json(&pkg, files, &status);
     serde_json::from_str::<serde_json::Value>(&json).expect("PEP 691 JSON is not valid JSON");
 
     // 2. The HTML `href` must be quote-safe and lossless.
@@ -132,7 +132,7 @@ fuzz_target!(|data: &[u8]| {
     // via encode_text (quotes unescaped), so a name containing the literal
     // substring `href="/files/` would otherwise be a false first match and
     // trip this assert (CI crash-4f0b102aa5f9287e84162c365827469bb16edd84).
-    let html = render::pep503_package_html(&pkg, files, &status);
+    let html = render::pep503_project_html(&pkg, files, &status);
     const ANCHOR: &str = "<a href=\"";
     if let Some(start) = html.find(ANCHOR) {
         let after = &html[start + ANCHOR.len()..];

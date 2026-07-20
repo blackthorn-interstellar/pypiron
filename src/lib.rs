@@ -11,6 +11,7 @@ pub mod app;
 pub mod bucket_health;
 pub mod buckets;
 pub mod cache;
+pub mod cli;
 pub mod clock;
 pub mod config;
 pub mod coremeta;
@@ -49,5 +50,7 @@ pub mod worker;
 
 // Keep every historical `crate::X` path valid: the items that lived at the
 // crate root when `main.rs` was the root (AppState, the storage-layout
-// prefixes, shared helpers) are re-exported here.
+// prefixes, shared helpers) are re-exported here. The CLI surface moved to
+// `cli` but keeps its crate-flat paths the same way.
 pub use app::*;
+pub use cli::*;

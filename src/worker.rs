@@ -564,38 +564,6 @@ async fn has_live_intent(state: &AppState, storage: &dyn Storage, pkg: &str) -> 
     Ok(stale_unpaired_intents(state, storage, pkg).await?.is_none())
 }
 
-/// Whether any writer intent still lacks its matching commit, regardless of
-/// age. Callers use this when stale work must be healed before classifying the
-/// package's current truth.
-#[allow(dead_code)] // Base writer-intent primitive retained for repair callers.
-pub(crate) async fn has_unpaired_intent_ignoring(
-    storage: &dyn Storage,
-    pkg: &str,
-    ignored_nonce: Option<&str>,
-) -> Result<bool> {
-    let prefix = format!("{DIRTY_PREFIX}{pkg}!");
-    let entries = storage.list_all(&prefix).await?;
-    let commits: HashSet<String> = entries
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .key
-                .strip_prefix(&prefix)?
-                .strip_suffix(COMMIT_SUFFIX)
-                .map(str::to_string)
-        })
-        .collect();
-    Ok(entries.iter().any(|entry| {
-        entry
-            .key
-            .strip_prefix(&prefix)
-            .and_then(|event| event.strip_suffix(INTENT_SUFFIX))
-            .is_some_and(|nonce| {
-                !intent_is_ignored(nonce, ignored_nonce) && !commits.contains(nonce)
-            })
-    }))
-}
-
 /// Classify every unpaired intent by storage `last_modified`. `None` means at
 /// least one writer is still fresh (or lacks a trustworthy storage timestamp
 /// and is therefore conservatively live). `Some(keys)` contains only stale

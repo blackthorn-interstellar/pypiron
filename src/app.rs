@@ -1116,8 +1116,10 @@ impl AppState {
     /// Record that a client request just arrived (traffic signal for probe
     /// gating). Lock-free and I/O-free — safe to call on every request.
     fn note_request(&self) {
-        self.last_request_unix
-            .store(unix_now_secs(), std::sync::atomic::Ordering::Relaxed);
+        self.last_request_unix.store(
+            crate::clock::unix_now_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Whether a client request arrived within [`TRAFFIC_PROBE_WINDOW`]. When
@@ -1127,7 +1129,8 @@ impl AppState {
         let last = self
             .last_request_unix
             .load(std::sync::atomic::Ordering::Relaxed);
-        last != 0 && unix_now_secs().saturating_sub(last) <= TRAFFIC_PROBE_WINDOW.as_secs()
+        last != 0
+            && crate::clock::unix_now_secs().saturating_sub(last) <= TRAFFIC_PROBE_WINDOW.as_secs()
     }
 
     /// Whether any configured bucket is currently unhealthy or recovering
@@ -1149,13 +1152,6 @@ const TRAFFIC_PROBE_WINDOW: Duration = Duration::from_secs(120);
 /// there has been no traffic and every bucket is healthy. The first request
 /// after idle may pay one bounded discovery timeout (accepted, §Health).
 pub(crate) const IDLE_PROBE_INTERVAL: Duration = Duration::from_secs(60);
-
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// Adapts pypiron's bucket selector to the counter engine. Selection happens
 /// once at the counter operation boundary; every nested I/O then uses the same
@@ -6438,7 +6434,7 @@ mod tests {
         assert!(state.recent_request_traffic());
         // A request stamped outside the window no longer counts as recent.
         state.last_request_unix.store(
-            unix_now_secs().saturating_sub(TRAFFIC_PROBE_WINDOW.as_secs() + 5),
+            crate::clock::unix_now_secs().saturating_sub(TRAFFIC_PROBE_WINDOW.as_secs() + 5),
             std::sync::atomic::Ordering::Relaxed,
         );
         assert!(!state.recent_request_traffic());

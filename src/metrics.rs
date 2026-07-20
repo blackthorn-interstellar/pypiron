@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::bucket_health::{HealthState, WorkerHealthSnapshot};
+use crate::clock::unix_now_secs;
 
 /// Route groups, by path prefix. Order matches the counter matrix.
 pub const ROUTES: [&str; 6] = ["simple", "files", "legacy", "health", "metrics", "other"];
@@ -38,13 +39,6 @@ struct BucketMetricState {
     selection_generation: u64,
     alarm_totals: HashMap<String, u64>,
     topology_write_fenced: bool,
-}
-
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Index into [`ROUTES`] for a request path.

@@ -60,6 +60,18 @@ pub fn now_epoch_millis() -> u64 {
         .unwrap_or_default()
 }
 
+/// Seconds since the Unix epoch, read straight from the system clock — NOT
+/// sim-virtualized, unlike [`now_utc`]/[`now_epoch_millis`]. For operational
+/// timestamps (metrics, probe cadence, feed-poll freshness) that never gate the
+/// correctness protocol, so the simulator has no reason to control them and
+/// every caller read the raw clock directly already. Pre-epoch clocks map to 0.
+pub fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// `None` in production. When the override is enabled, a unique deterministic
 /// nonce (`sim0`, `sim1`, …) that replaces the random marker/claim entropy so
 /// the simulator's histories are reproducible.

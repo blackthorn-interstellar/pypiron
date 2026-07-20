@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use pep440_rs::Version;
@@ -21,6 +21,7 @@ use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 use zip::ZipArchive;
 
+use crate::clock::unix_now_secs;
 use crate::hash::sha256_hex;
 use crate::metrics::Metrics;
 use crate::names::normalize_pkg_name;
@@ -695,13 +696,6 @@ impl AdvisoryState {
     }
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn is_url(feed: &str) -> bool {
     feed.starts_with("http://") || feed.starts_with("https://")
 }
@@ -890,7 +884,7 @@ async fn load_from_storage(storage: &dyn Storage) -> Result<Option<AdvisoryState
         overlay: Arc::default(),
         quarantined: HashSet::new(),
         quarantined_etag: None,
-        loaded_unix: unix_now(),
+        loaded_unix: unix_now_secs(),
     }))
 }
 
@@ -957,7 +951,7 @@ async fn obtain_from_source(storage: &dyn Storage, feed: &str) -> Option<Advisor
         overlay: Arc::default(),
         quarantined: HashSet::new(),
         quarantined_etag: None,
-        loaded_unix: unix_now(),
+        loaded_unix: unix_now_secs(),
     })
 }
 
@@ -1162,7 +1156,7 @@ async fn reload(ctx: &RefreshCtx<'_>) -> Result<bool> {
         overlay: Arc::default(),
         quarantined: guard.quarantined.clone(),
         quarantined_etag: guard.quarantined_etag.clone(),
-        loaded_unix: unix_now(),
+        loaded_unix: unix_now_secs(),
     });
     Ok(true)
 }

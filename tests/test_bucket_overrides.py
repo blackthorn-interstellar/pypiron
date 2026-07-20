@@ -1,4 +1,4 @@
-"""Per-bucket overrides (dev/PLAN_BUCKET_CONFIG.md, phase 2).
+"""Per-bucket overrides (dev/MULTIBUCKET.md).
 
 Real pypiron against two INDEPENDENT MinIO containers with different root
 credentials, so a bucket is reachable only with its own scoped keys. The

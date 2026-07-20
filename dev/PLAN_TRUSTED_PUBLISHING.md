@@ -67,7 +67,7 @@ never have to understand — or even notice — any of this. Hard requirements:
   (`src/proxy.rs` `fetch_provenance*`, `src/sidecar.rs` `PROVENANCE_SUFFIX`,
   `provenance_key`), `provenance` key / `data-provenance` attr in indexes,
   publisher summary on the human page (`src/provenance.rs::parse_publisher`,
-  `src/app.rs::load_provenance`).
+  `src/pages.rs::load_provenance`).
 - First-party `attestations` are refused fail-closed at `src/app.rs` (~line
   3315, in `legacy_upload`). Phase 2 replaces this refusal for
   publisher-authenticated uploads; it stays for everything else.

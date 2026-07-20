@@ -30,8 +30,8 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
+use crate::hash::sha256_hex;
 use crate::sidecar::{Sidecar, SIDECAR_SUFFIX, TOMBSTONE_SUFFIX};
 use crate::storage::{is_not_found, Storage, StorageArgs};
 use crate::PACKAGES_PREFIX;
@@ -83,13 +83,6 @@ pub struct ChainLink {
 /// `prev-sha256` commits to.
 pub fn link_bytes(link: &ChainLink) -> Result<Vec<u8>> {
     serde_json::to_vec(link).context("serializing chain link")
-}
-
-/// Hex sha256 of arbitrary bytes.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 /// Read the highest-seq link (the chain head) as `(seq, exact bytes)`, or `None`

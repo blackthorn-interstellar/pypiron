@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 
 use crate::buckets::Pinned;
+use crate::hash::sha256_hex;
 #[cfg(test)]
 use crate::origin::read_origin;
 use crate::origin::{
@@ -93,12 +94,6 @@ fn bucket_eligible(state: &AppState, index: usize) -> bool {
 
 fn artifact_key(pkg: &str, filename: &str) -> String {
     format!("{PACKAGES_PREFIX}{pkg}/{filename}")
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 // ---------------------------------------------------------------------------

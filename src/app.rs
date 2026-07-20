@@ -5732,7 +5732,7 @@ async fn advisories_feed_get(
         Ok(None) => return not_found("no advisory snapshot"),
         Err(e) => return read_error(e),
     };
-    let etag = format!("\"{}\"", advisories::sha256_hex(&bytes));
+    let etag = format!("\"{}\"", crate::hash::sha256_hex(&bytes));
     serve_advisory_bytes(&method, &headers, &etag, &bytes)
 }
 

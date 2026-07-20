@@ -16,12 +16,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use pep440_rs::Version;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 use zip::ZipArchive;
 
+use crate::hash::sha256_hex;
 use crate::metrics::Metrics;
 use crate::names::normalize_pkg_name;
 use crate::ssrf::{guarded_get, guarded_get_with, Guard, SsrfGuardResolver};
@@ -614,12 +614,6 @@ fn mal_rules(adv: &OsvAdvisory) -> Vec<(String, MalRule)> {
         ));
     }
     rules
-}
-
-/// Hex sha256 of the verbatim feed bytes — the snapshot's content identity and
-/// the `GET /advisories/feed` ETag.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 // ---------------------------------------------------------------------------

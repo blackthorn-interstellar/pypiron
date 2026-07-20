@@ -17,6 +17,7 @@ pub mod coremeta;
 #[cfg(test)]
 mod corpus_check;
 pub mod counters;
+pub mod hash;
 pub mod lease;
 pub mod markdown;
 pub mod metrics;

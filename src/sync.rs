@@ -1398,7 +1398,7 @@ async fn push_feed_to_dest(client: &Client, resolved: &Resolved, bytes: Vec<u8>)
     let url = format!("{base}/advisories/feed");
     // Match the destination's ETag encoding byte-for-byte (see advisories_feed_get)
     // so an unchanged feed is recognized and transfers nothing.
-    let our_etag = format!("\"{}\"", crate::advisories::sha256_hex(&bytes));
+    let our_etag = format!("\"{}\"", crate::hash::sha256_hex(&bytes));
 
     match head_dest_feed(client, resolved, &url).await {
         Ok((status, etag)) if status.is_success() => {

@@ -32,6 +32,7 @@ use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::Client;
 use tracing::{info, warn};
 
+use crate::hash::sha256_hex;
 use crate::names::{infer_version_from_filename, matches_prefix};
 use crate::origin;
 use crate::render::{self, FileMetadata};
@@ -1060,11 +1061,6 @@ impl Proxy {
         let base = reqwest::Url::parse(&format!("{}/simple/{pkg}/", self.upstream))?;
         Ok(base.join(raw)?)
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Read an upstream companion body into memory with a hard ceiling. The local

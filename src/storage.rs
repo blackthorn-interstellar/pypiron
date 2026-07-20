@@ -30,6 +30,7 @@ use object_store::{
 };
 
 use crate::config::BucketOverride;
+use crate::hash::sha256_hex;
 use crate::range::{parse_range, RangeSpec};
 
 /// In a failover topology one blackholed request must return in bounded time so
@@ -1009,13 +1010,6 @@ fn artifact_write_timeout(payload_size: u64) -> std::time::Duration {
     ARTIFACT_WRITE_TIMEOUT_BASE + ARTIFACT_WRITE_TIMEOUT_PER_MIB * mib
 }
 
-fn artifact_sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
-
 /// Bound one artifact write (D3): a connection that stops making progress is
 /// abandoned with a clear error instead of hanging on the transport ceiling.
 pub async fn bounded_artifact_write<T>(
@@ -1146,7 +1140,7 @@ pub async fn store_artifact_verified(
         .get_bytes(key)
         .await
         .with_context(|| format!("read back already-present artifact {key}"))?;
-    if artifact_sha256_hex(&current) == expected_sha {
+    if sha256_hex(&current) == expected_sha {
         return Ok(false);
     }
     // A wrong-sha body under an immutable key is stale crash debris (e.g. a
@@ -1169,7 +1163,7 @@ pub async fn store_artifact_verified(
         .get_bytes(key)
         .await
         .with_context(|| format!("re-verify repaired artifact {key}"))?;
-    let after_sha = artifact_sha256_hex(&after);
+    let after_sha = sha256_hex(&after);
     if after_sha != expected_sha {
         bail!(
             "artifact {key} still wrong after repair: stored {after_sha}, expected {expected_sha}"

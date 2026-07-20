@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::{sleep, timeout};
 use tracing::{error, info, warn};
 
+use crate::hash::sha256_hex;
 use crate::lease::LeaseManager;
 use crate::names::infer_version_from_filename;
 use crate::render::{
@@ -1429,7 +1430,7 @@ async fn write_chain_link(
             return;
         }
         let (seq, prev_sha256) = match crate::transparency::read_head(storage).await {
-            Ok(Some((head_seq, bytes))) => (head_seq + 1, crate::transparency::sha256_hex(&bytes)),
+            Ok(Some((head_seq, bytes))) => (head_seq + 1, sha256_hex(&bytes)),
             Ok(None) => (0, String::new()),
             Err(e) => {
                 error!(error=?e, "transparency: could not read chain head; checkpoint skipped");
@@ -2932,10 +2933,8 @@ async fn backfill_sidecar(
             return Err(e).with_context(|| format!("reading {} to backfill its sidecar", entry.key))
         }
     };
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
     let sc = Sidecar {
-        sha256: format!("{:x}", hasher.finalize()),
+        sha256: sha256_hex(&bytes),
         size: entry.size,
         version: infer_version_from_filename(filename).unwrap_or_default(),
         upload_time: entry.last_modified.clone().unwrap_or_default(),
@@ -2968,11 +2967,7 @@ async fn backfill_sidecar(
     // fabrication — comparing first, so a real sidecar that already replaced
     // ours is never the casualty.
     let confirmed = match storage.get_bytes(&entry.key).await {
-        Ok(now) => {
-            let mut hasher = Sha256::new();
-            hasher.update(&now);
-            format!("{:x}", hasher.finalize()) == sc.sha256
-        }
+        Ok(now) => sha256_hex(&now) == sc.sha256,
         // Genuinely vanished after we hashed it — the exact hazard this confirm
         // guards; retract.
         Err(e) if is_not_found(&e) => false,

@@ -112,33 +112,38 @@ fn is_zero_epoch(epoch: &u64) -> bool {
     *epoch == 0
 }
 
+/// Storage key of a companion object: the artifact key with its suffix appended.
+fn companion_key(artifact_key: &str, suffix: &str) -> String {
+    format!("{artifact_key}{suffix}")
+}
+
 /// Storage key of the sidecar for an artifact key.
 pub fn sidecar_key(artifact_key: &str) -> String {
-    format!("{artifact_key}{SIDECAR_SUFFIX}")
+    companion_key(artifact_key, SIDECAR_SUFFIX)
 }
 
 /// Storage key of the PEP 658 metadata file for an artifact key.
 pub fn metadata_key(artifact_key: &str) -> String {
-    format!("{artifact_key}{METADATA_SUFFIX}")
+    companion_key(artifact_key, METADATA_SUFFIX)
 }
 
 /// Storage key of the PEP 740 provenance companion for an artifact key.
 pub fn provenance_key(artifact_key: &str) -> String {
-    format!("{artifact_key}{PROVENANCE_SUFFIX}")
+    companion_key(artifact_key, PROVENANCE_SUFFIX)
 }
 
 /// Storage key of the delete tombstone for an artifact key.
 pub fn tombstone_key(artifact_key: &str) -> String {
-    format!("{artifact_key}{TOMBSTONE_SUFFIX}")
+    companion_key(artifact_key, TOMBSTONE_SUFFIX)
 }
 
 /// Storage key of the freeze marker for an artifact key.
 pub fn frozen_key(artifact_key: &str) -> String {
-    format!("{artifact_key}{FROZEN_SUFFIX}")
+    companion_key(artifact_key, FROZEN_SUFFIX)
 }
 
 pub fn mirror_quarantined_key(artifact_key: &str) -> String {
-    format!("{artifact_key}{MIRROR_QUARANTINED_SUFFIX}")
+    companion_key(artifact_key, MIRROR_QUARANTINED_SUFFIX)
 }
 
 /// True if `filename` (no directory part) is an artifact, not a sidecar,

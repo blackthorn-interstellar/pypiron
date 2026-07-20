@@ -10,8 +10,9 @@ It is a static site with no accounts, no forms, and no data you submit to us.
 Pages on this site load an advertising pixel from OpenAI
 (`oaiq`, served from `bzrcdn.openai.com`). It records that a page was viewed,
 along with standard request information your browser sends — IP address,
-user-agent, and the referring page. We use it for one thing: measuring how our
-advertising performs and which pages bring people here.
+user-agent, and the referring page. On pages with installation instructions, it
+also records when you copy or select an install command. We use this for one
+thing: measuring how our advertising performs and which pages bring people here.
 
 OpenAI processes this data as described in its
 [privacy policy](https://openai.com/policies/privacy-policy/). We do not sell it,

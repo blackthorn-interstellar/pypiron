@@ -8,5 +8,37 @@
 -->
 {% block extrahead %}
   {{ super() }}
-  <script>!function(w,d,s,u){if(w.oaiq)return;var q=function(){q.q.push(arguments)};q.q=[];w.oaiq=q;var j=d.createElement(s);j.async=1;j.src=u;var f=d.getElementsByTagName(s)[0];f.parentNode.insertBefore(j,f)}(window,document,"script","https://bzrcdn.openai.com/sdk/oaiq.min.js");oaiq("init",{pixelId:"TL5g8QKkG3CbEKsjjH3pRo",debug:false});</script>
+  <script>!function(w,d,s,u){if(w.oaiq)return;var q=function(){q.q.push(arguments)};q.q=[];w.oaiq=q;var j=d.createElement(s);j.async=1;j.src=u;var f=d.getElementsByTagName(s)[0];f.parentNode.insertBefore(j,f)}(window,document,"script","https://bzrcdn.openai.com/sdk/oaiq.min.js");oaiq("init",{pixelId:"TL5g8QKkG3CbEKsjjH3pRo",debug:false});oaiq("measure","page_viewed",{type:"page_viewed"});</script>
+
+  <!--
+    Conversion signal: intent to install pypiron itself. A single "install"
+    event, fired at most once per page load from either trigger (copy button or
+    manual highlight), gated on INSTALL so the many client-usage snippets (pip/uv
+    pointed at a running server) don't count as installs.
+  -->
+  <script>
+  (function () {
+    var INSTALL = /pip install pypiron|uvx pypiron|docker run[\s\S]{0,120}?pypiron|download\/pypiron/i;
+    var fired = false;
+    function install() {
+      if (fired || !window.oaiq) return;
+      fired = true;
+      oaiq("measure", "custom", { type: "custom" }, { custom_event_name: "install" });
+    }
+    // Copy button (mkdocs-material renders one .md-clipboard per code block).
+    document.addEventListener("click", function (e) {
+      var btn = e.target.closest && e.target.closest(".md-clipboard");
+      if (!btn) return;
+      var target = btn.getAttribute("data-clipboard-target");
+      var code = (target && document.querySelector(target)) ||
+                 (btn.closest(".highlight") || document).querySelector("code");
+      if (code && INSTALL.test(code.innerText)) install();
+    });
+    // Manual highlight of an install command.
+    document.addEventListener("mouseup", function () {
+      var text = window.getSelection ? String(window.getSelection()) : "";
+      if (text.length > 3 && INSTALL.test(text)) install();
+    });
+  })();
+  </script>
 {% endblock %}

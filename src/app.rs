@@ -337,6 +337,156 @@ impl AppState {
         };
         (0..self.buckets.len()).any(|index| !health.bucket_eligible(index).unwrap_or(true))
     }
+
+    /// State for one-shot storage operations (rebuild-index) — no credentials, no
+    /// server, default knobs. Only the storage-facing fields matter.
+    pub fn headless(storage: Arc<dyn Storage>) -> Self {
+        let buckets = Arc::new(BucketSet::single(storage));
+        AppState {
+            buckets,
+            bucket_health: None,
+            writes_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            uploader_user: None,
+            uploader_pass: None,
+            admin_user: None,
+            admin_pass: None,
+            read_user: None,
+            read_pass: None,
+            token_signing_key: None,
+            private_prefix: None,
+            artifact_delivery: ArtifactDelivery::Auto,
+            metrics_project_labels: false,
+            access_log: false,
+            access_log_format: AccessLogFormat::Structured,
+            worker_interval: Duration::from_secs(1),
+            reconcile_interval: Duration::from_secs(86400),
+            repl_sweep_interval: Duration::from_secs(300),
+            repl_sweep_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_request_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fanout_grace: Duration::from_secs(30),
+            intent_grace: time::Duration::seconds(900),
+            audit_on_boot: true,
+            transparency: true,
+            lease_ttl: Duration::from_secs(30),
+            wait_on_upload: false,
+            wait_on_upload_timeout: Duration::from_secs(10),
+            index_cache: Arc::new(cache::IndexCache::new(cache::INDEX_CACHE_TTL)),
+            project_cache: Arc::new(project_cache::ProjectCache::new(cache::INDEX_CACHE_TTL)),
+            presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
+            spool_dir: std::env::temp_dir(),
+            global_names: Arc::new(tokio::sync::Mutex::new(None)),
+            inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
+            worker_nudge: Arc::new(tokio::sync::Notify::new()),
+            empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            metrics: Arc::new(metrics::Metrics::new()),
+            counters: Arc::new(counters::Counters::disabled()),
+            download_board: Arc::new(std::sync::Mutex::new(None)),
+            proxy: None,
+            started: std::time::Instant::now(),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            advisory_feed: None,
+            malware_block: false,
+            malware_probe: Duration::ZERO,
+            advisories: Arc::new(std::sync::RwLock::new(Arc::new(
+                advisories::AdvisoryState::default(),
+            ))),
+            advisory_reload_asap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// The configured uploader credential, if any (both halves required).
+    fn uploader_credential(&self) -> Option<(&str, &str)> {
+        cred_pair(self.uploader_user.as_deref(), self.uploader_pass.as_deref())
+    }
+
+    /// The configured admin credential, if any. Its presence is what enables
+    /// the privileged operations (mirror, delete, yank).
+    fn admin_credential(&self) -> Option<(&str, &str)> {
+        cred_pair(self.admin_user.as_deref(), self.admin_pass.as_deref())
+    }
+
+    /// The configured read credential, if any (both halves required).
+    pub(crate) fn read_credential(&self) -> Option<(&str, &str)> {
+        cred_pair(self.read_user.as_deref(), self.read_pass.as_deref())
+    }
+
+    /// No write credential configured: every write path is disabled and the
+    /// server is read-only. Unauthenticated open writes were a footgun on the
+    /// default 0.0.0.0 bind, not a dev convenience.
+    fn uploads_disabled(&self) -> bool {
+        self.uploader_credential().is_none() && self.admin_credential().is_none()
+    }
+
+    /// The role granted by a valid `__token__` bearer token, if token auth is
+    /// configured and the presented token verifies and is unexpired. Returns
+    /// None otherwise (no key, not a token request, bad/expired token) — fail
+    /// closed. The `+tag` overlay is ignored here (`__token__+commit=…` still
+    /// resolves to token mode); the token itself carries its attribution.
+    fn token_role(&self, headers: &HeaderMap) -> Option<token::Role> {
+        let key = nonempty(self.token_signing_key.as_deref())?;
+        let (user, pass) = basic_credentials(headers)?;
+        let base = user.split_once('+').map_or(user.as_str(), |(b, _)| b);
+        if base != token::TOKEN_USERNAME {
+            return None;
+        }
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        token::verify(key, &pass, now).map(|c| c.role)
+    }
+
+    /// Does the request authenticate as admin?
+    fn is_admin(&self, headers: &HeaderMap) -> bool {
+        self.admin_credential()
+            .is_some_and(|(u, p)| check_basic_auth(headers, u, p).is_ok())
+            || self.token_role(headers) == Some(token::Role::Admin)
+    }
+
+    /// May the request publish? Admin ⊇ uploader.
+    fn is_uploader(&self, headers: &HeaderMap) -> bool {
+        self.is_admin(headers)
+            || self
+                .uploader_credential()
+                .is_some_and(|(u, p)| check_basic_auth(headers, u, p).is_ok())
+            || self.token_role(headers) >= Some(token::Role::Uploader)
+    }
+
+    /// May the request read indexes and artifacts? Public unless a read
+    /// credential is configured; any stronger credential (or any valid token)
+    /// also reads (admin ⊇ uploader ⊇ reader).
+    pub(crate) fn is_reader(&self, headers: &HeaderMap) -> bool {
+        match self.read_credential() {
+            None => true,
+            Some((u, p)) => {
+                check_basic_auth(headers, u, p).is_ok()
+                    || self.is_uploader(headers)
+                    || self.token_role(headers).is_some()
+            }
+        }
+    }
+
+    /// Whether the request presents credentials that validly authenticate as some
+    /// role *below* admin (reader or uploader). Distinguishes a wrong-role request
+    /// (→ 403) from an anonymous or bad-credential one (→ 401) at an admin gate.
+    /// Public-read (no read credential configured) is deliberately NOT counted:
+    /// an anonymous request on such a server authenticates as nobody, so it still
+    /// gets 401, never 403. Constant-time password compares throughout.
+    fn authenticates_below_admin(&self, headers: &HeaderMap) -> bool {
+        // A valid uploader — a real uploader credential, or an uploader/admin
+        // token (admin is already excluded by the caller).
+        if self.is_uploader(headers) {
+            return true;
+        }
+        // A valid token of any configured role (covers a reader token).
+        if self.token_role(headers).is_some() {
+            return true;
+        }
+        // The configured read credential, actually presented and matching.
+        match self.read_credential() {
+            Some((u, p)) => check_basic_auth(headers, u, p).is_ok(),
+            None => false,
+        }
+    }
 }
 
 /// A client request within this window keeps multi-bucket health probes at full
@@ -4329,158 +4479,6 @@ fn accepts_json(headers: &HeaderMap) -> bool {
         }
     }
     false
-}
-
-impl AppState {
-    /// State for one-shot storage operations (rebuild-index) — no credentials, no
-    /// server, default knobs. Only the storage-facing fields matter.
-    pub fn headless(storage: Arc<dyn Storage>) -> Self {
-        let buckets = Arc::new(BucketSet::single(storage));
-        AppState {
-            buckets,
-            bucket_health: None,
-            writes_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            uploader_user: None,
-            uploader_pass: None,
-            admin_user: None,
-            admin_pass: None,
-            read_user: None,
-            read_pass: None,
-            token_signing_key: None,
-            private_prefix: None,
-            artifact_delivery: ArtifactDelivery::Auto,
-            metrics_project_labels: false,
-            access_log: false,
-            access_log_format: AccessLogFormat::Structured,
-            worker_interval: Duration::from_secs(1),
-            reconcile_interval: Duration::from_secs(86400),
-            repl_sweep_interval: Duration::from_secs(300),
-            repl_sweep_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_request_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            fanout_grace: Duration::from_secs(30),
-            intent_grace: time::Duration::seconds(900),
-            audit_on_boot: true,
-            transparency: true,
-            lease_ttl: Duration::from_secs(30),
-            wait_on_upload: false,
-            wait_on_upload_timeout: Duration::from_secs(10),
-            index_cache: Arc::new(cache::IndexCache::new(cache::INDEX_CACHE_TTL)),
-            project_cache: Arc::new(project_cache::ProjectCache::new(cache::INDEX_CACHE_TTL)),
-            presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
-            spool_dir: std::env::temp_dir(),
-            global_names: Arc::new(tokio::sync::Mutex::new(None)),
-            inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
-            worker_nudge: Arc::new(tokio::sync::Notify::new()),
-            empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            metrics: Arc::new(metrics::Metrics::new()),
-            counters: Arc::new(counters::Counters::disabled()),
-            download_board: Arc::new(std::sync::Mutex::new(None)),
-            proxy: None,
-            started: std::time::Instant::now(),
-            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            advisory_feed: None,
-            malware_block: false,
-            malware_probe: Duration::ZERO,
-            advisories: Arc::new(std::sync::RwLock::new(Arc::new(
-                advisories::AdvisoryState::default(),
-            ))),
-            advisory_reload_asap: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
-    /// The configured uploader credential, if any (both halves required).
-    fn uploader_credential(&self) -> Option<(&str, &str)> {
-        cred_pair(self.uploader_user.as_deref(), self.uploader_pass.as_deref())
-    }
-
-    /// The configured admin credential, if any. Its presence is what enables
-    /// the privileged operations (mirror, delete, yank).
-    fn admin_credential(&self) -> Option<(&str, &str)> {
-        cred_pair(self.admin_user.as_deref(), self.admin_pass.as_deref())
-    }
-
-    /// The configured read credential, if any (both halves required).
-    pub(crate) fn read_credential(&self) -> Option<(&str, &str)> {
-        cred_pair(self.read_user.as_deref(), self.read_pass.as_deref())
-    }
-
-    /// No write credential configured: every write path is disabled and the
-    /// server is read-only. Unauthenticated open writes were a footgun on the
-    /// default 0.0.0.0 bind, not a dev convenience.
-    fn uploads_disabled(&self) -> bool {
-        self.uploader_credential().is_none() && self.admin_credential().is_none()
-    }
-
-    /// The role granted by a valid `__token__` bearer token, if token auth is
-    /// configured and the presented token verifies and is unexpired. Returns
-    /// None otherwise (no key, not a token request, bad/expired token) — fail
-    /// closed. The `+tag` overlay is ignored here (`__token__+commit=…` still
-    /// resolves to token mode); the token itself carries its attribution.
-    fn token_role(&self, headers: &HeaderMap) -> Option<token::Role> {
-        let key = nonempty(self.token_signing_key.as_deref())?;
-        let (user, pass) = basic_credentials(headers)?;
-        let base = user.split_once('+').map_or(user.as_str(), |(b, _)| b);
-        if base != token::TOKEN_USERNAME {
-            return None;
-        }
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        token::verify(key, &pass, now).map(|c| c.role)
-    }
-
-    /// Does the request authenticate as admin?
-    fn is_admin(&self, headers: &HeaderMap) -> bool {
-        self.admin_credential()
-            .is_some_and(|(u, p)| check_basic_auth(headers, u, p).is_ok())
-            || self.token_role(headers) == Some(token::Role::Admin)
-    }
-
-    /// May the request publish? Admin ⊇ uploader.
-    fn is_uploader(&self, headers: &HeaderMap) -> bool {
-        self.is_admin(headers)
-            || self
-                .uploader_credential()
-                .is_some_and(|(u, p)| check_basic_auth(headers, u, p).is_ok())
-            || self.token_role(headers) >= Some(token::Role::Uploader)
-    }
-
-    /// May the request read indexes and artifacts? Public unless a read
-    /// credential is configured; any stronger credential (or any valid token)
-    /// also reads (admin ⊇ uploader ⊇ reader).
-    pub(crate) fn is_reader(&self, headers: &HeaderMap) -> bool {
-        match self.read_credential() {
-            None => true,
-            Some((u, p)) => {
-                check_basic_auth(headers, u, p).is_ok()
-                    || self.is_uploader(headers)
-                    || self.token_role(headers).is_some()
-            }
-        }
-    }
-
-    /// Whether the request presents credentials that validly authenticate as some
-    /// role *below* admin (reader or uploader). Distinguishes a wrong-role request
-    /// (→ 403) from an anonymous or bad-credential one (→ 401) at an admin gate.
-    /// Public-read (no read credential configured) is deliberately NOT counted:
-    /// an anonymous request on such a server authenticates as nobody, so it still
-    /// gets 401, never 403. Constant-time password compares throughout.
-    fn authenticates_below_admin(&self, headers: &HeaderMap) -> bool {
-        // A valid uploader — a real uploader credential, or an uploader/admin
-        // token (admin is already excluded by the caller).
-        if self.is_uploader(headers) {
-            return true;
-        }
-        // A valid token of any configured role (covers a reader token).
-        if self.token_role(headers).is_some() {
-            return true;
-        }
-        // The configured read credential, actually presented and matching.
-        match self.read_credential() {
-            Some((u, p)) => check_basic_auth(headers, u, p).is_ok(),
-            None => false,
-        }
-    }
 }
 
 /// Treat an empty string as an unset value. An empty environment variable

@@ -1992,6 +1992,19 @@ async fn package_fingerprint(storage: &dyn Storage, pkg: &str) -> Result<String>
     ))
 }
 
+/// Publish the tally of crashed-writer intents healed during a drain. Shared by
+/// the selected-bucket [`tick`] and the destination [`drain_dirty_uncached`] —
+/// the two schedulers are otherwise separate, but both heal a stale intent by
+/// re-arming its marker and then report the same counter identically.
+fn record_stale_intents_healed(state: &AppState, healed: u64) {
+    if healed > 0 {
+        state
+            .metrics
+            .stale_intents_healed
+            .fetch_add(healed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Result<()> {
     // The caller passes the exact pin whose bucket-local lease authorized this
     // tick. Selection may change concurrently, but this operation stays on that
@@ -2077,12 +2090,7 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
             _ => failures += 1,
         }
     }
-    if healed > 0 {
-        state
-            .metrics
-            .stale_intents_healed
-            .fetch_add(healed, std::sync::atomic::Ordering::Relaxed);
-    }
+    record_stale_intents_healed(state, healed);
     // One batched global-index pass per tick: mass ingest of N new packages
     // rewrites the (corpus-sized) global views once, not N times.
     update_global_index(state, storage, &adds, &removes).await?;
@@ -2542,12 +2550,7 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
             }
         }
     }
-    if healed > 0 {
-        state
-            .metrics
-            .stale_intents_healed
-            .fetch_add(healed, std::sync::atomic::Ordering::Relaxed);
-    }
+    record_stale_intents_healed(state, healed);
     update_global_index_uncached(state, storage, &adds, &removes).await?;
     if let Err(e) = storage.delete_keys(&consumed).await {
         warn!(error=?e, "replicate: could not consume destination dirty markers");

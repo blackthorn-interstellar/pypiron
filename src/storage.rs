@@ -1271,6 +1271,34 @@ impl DiskStorage {
         let _ = fs::remove_file(tmp).await;
         created
     }
+
+    /// Crash-safe overwrite: write `bytes` to a temp sibling of `dest`, then
+    /// atomically rename it into place, removing the temp on a failed rename. A
+    /// crash leaves either the prior file or nothing at `dest`, never a torn
+    /// write (atomicity, not durability — see `put_bytes`). `ctx`, when set,
+    /// labels the rename failure.
+    async fn write_rename(&self, dest: &Path, bytes: &[u8], ctx: Option<&str>) -> Result<()> {
+        let tmp = self.tmp_sibling(dest)?;
+        fs::write(&tmp, bytes).await?;
+        if let Err(e) = fs::rename(&tmp, dest).await {
+            let _ = fs::remove_file(&tmp).await;
+            let e = anyhow::Error::from(e);
+            return Err(match ctx {
+                Some(c) => e.context(c.to_string()),
+                None => e,
+            });
+        }
+        Ok(())
+    }
+
+    /// Crash-safe create-if-absent: write `bytes` to a temp sibling of `dest`,
+    /// then hard-link it into place. `Ok(false)` means the destination already
+    /// existed; the temp is always removed.
+    async fn write_link(&self, dest: &Path, bytes: &[u8]) -> Result<bool> {
+        let tmp = self.tmp_sibling(dest)?;
+        fs::write(&tmp, bytes).await?;
+        self.link_atomic(&tmp, dest).await
+    }
 }
 
 #[async_trait]
@@ -1354,13 +1382,7 @@ impl Storage for DiskStorage {
         // are already atomic.
         let p = self.resolve(key)?;
         self.ensure_parent(&p).await?;
-        let tmp = self.tmp_sibling(&p)?;
-        fs::write(&tmp, bytes).await?;
-        if let Err(e) = fs::rename(&tmp, &p).await {
-            let _ = fs::remove_file(&tmp).await;
-            return Err(e.into());
-        }
-        Ok(())
+        self.write_rename(&p, &bytes, None).await
     }
 
     async fn put_if_absent(
@@ -1373,9 +1395,7 @@ impl Storage for DiskStorage {
         // create-if-absent with full content, unlike create_new + write.
         let p = self.resolve(key)?;
         self.ensure_parent(&p).await?;
-        let tmp = self.tmp_sibling(&p)?;
-        fs::write(&tmp, bytes).await?;
-        self.link_atomic(&tmp, &p).await
+        self.write_link(&p, &bytes).await
     }
 
     async fn put_file_if_absent(
@@ -1517,9 +1537,7 @@ impl Storage for DiskStorage {
         let p = self.resolve(key)?;
         self.ensure_parent(&p).await?;
         let etag = disk_content_etag(&bytes);
-        let tmp = self.tmp_sibling(&p)?;
-        fs::write(&tmp, &bytes).await?;
-        Ok(self.link_atomic(&tmp, &p).await?.then_some(etag))
+        Ok(self.write_link(&p, &bytes).await?.then_some(etag))
     }
 
     async fn put_if_match(&self, key: &str, etag: &str, bytes: Vec<u8>) -> Result<Option<String>> {
@@ -1539,12 +1557,8 @@ impl Storage for DiskStorage {
         }
         let new_etag = disk_content_etag(&bytes);
         self.ensure_parent(&p).await?;
-        let tmp = self.tmp_sibling(&p)?;
-        fs::write(&tmp, &bytes).await?;
-        if let Err(e) = fs::rename(&tmp, &p).await {
-            let _ = fs::remove_file(&tmp).await;
-            return Err(anyhow::Error::from(e).context(format!("put_if_match write {key}")));
-        }
+        self.write_rename(&p, &bytes, Some(&format!("put_if_match write {key}")))
+            .await?;
         Ok(Some(new_etag))
     }
 }

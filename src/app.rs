@@ -2676,18 +2676,17 @@ async fn companion_passthrough_visible(
 /// two pins are the same bucket (dev/READ_AFFINITY_VISION.md).
 async fn file_visible_read_through(
     state: &AppState,
-    read: &Pinned,
-    write: &Pinned,
+    pins: &Pins<'_>,
     pkg: &str,
     artifact_key: &str,
 ) -> Result<bool> {
-    if multi_bucket_file_visible(state, read.storage.as_ref(), pkg, artifact_key).await? {
+    if multi_bucket_file_visible(state, pins.read.storage.as_ref(), pkg, artifact_key).await? {
         return Ok(true);
     }
-    if read.index == write.index {
+    if pins.same_pin {
         return Ok(false);
     }
-    multi_bucket_file_visible(state, write.storage.as_ref(), pkg, artifact_key).await
+    multi_bucket_file_visible(state, pins.write.storage.as_ref(), pkg, artifact_key).await
 }
 
 async fn simple_root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
@@ -3187,8 +3186,7 @@ fn render_index_variant(
 #[allow(clippy::too_many_arguments)]
 async fn serve_companion(
     state: &Arc<AppState>,
-    read: &Pinned,
-    write: &Pinned,
+    pins: &Pins<'_>,
     pkg: &str,
     artifact_key: &str,
     key: String,
@@ -3196,14 +3194,14 @@ async fn serve_companion(
     headers: &HeaderMap,
     companion: Companion,
 ) -> Response<Body> {
-    match file_visible_read_through(state, read, write, pkg, artifact_key).await {
+    match file_visible_read_through(state, pins, pkg, artifact_key).await {
         Ok(true) => {}
         Ok(false) => {
             // Upstream passthrough is judged on the write pin: an unclaimed
             // origin must be authoritative before any fall-through.
             match unowned_companion_passthrough_safe(
                 state,
-                write.storage.as_ref(),
+                pins.write.storage.as_ref(),
                 pkg,
                 artifact_key,
                 &key,
@@ -3213,7 +3211,7 @@ async fn serve_companion(
                 Ok(true) => {
                     if let Some(upstream) = proxy_companion_passthrough(
                         state,
-                        write.storage.as_ref(),
+                        pins.write.storage.as_ref(),
                         pkg,
                         filename,
                         companion,
@@ -3232,7 +3230,7 @@ async fn serve_companion(
     }
     let resp = serve_index_local(
         state,
-        &Pins::new(read, write),
+        pins,
         key,
         companion.content_type(),
         ARTIFACT_CACHE_CONTROL,
@@ -3245,7 +3243,7 @@ async fn serve_companion(
     // wheel itself is downloaded.
     if resp.status() == StatusCode::NOT_FOUND {
         if let Some(upstream) =
-            proxy_companion_passthrough(state, write.storage.as_ref(), pkg, filename, companion)
+            proxy_companion_passthrough(state, pins.write.storage.as_ref(), pkg, filename, companion)
                 .await
         {
             return upstream;
@@ -3294,7 +3292,7 @@ async fn files_get(
     // dev/READ_AFFINITY_VISION.md). In the common mode the two are one context.
     let read_pinned = state.read_pin();
     let write_pinned = state.pin();
-    let same_pin = read_pinned.index == write_pinned.index;
+    let pins = Pins::new(&read_pinned, &write_pinned);
 
     // Download attribution key, computed once: a real artifact only (companions
     // and the ranged-companion fall-through below parse to None), keyed
@@ -3313,8 +3311,7 @@ async fn files_get(
     if filename.ends_with(METADATA_SUFFIX) && headers.get(header::RANGE).is_none() {
         return serve_companion(
             &state,
-            &read_pinned,
-            &write_pinned,
+            &pins,
             &pkg,
             &artifact_key,
             key,
@@ -3327,8 +3324,7 @@ async fn files_get(
     if filename.ends_with(PROVENANCE_SUFFIX) && headers.get(header::RANGE).is_none() {
         return serve_companion(
             &state,
-            &read_pinned,
-            &write_pinned,
+            &pins,
             &pkg,
             &artifact_key,
             key,
@@ -3367,8 +3363,7 @@ async fn files_get(
     {
         return resp;
     }
-    match file_visible_read_through(&state, &read_pinned, &write_pinned, &pkg, &artifact_key).await
-    {
+    match file_visible_read_through(&state, &pins, &pkg, &artifact_key).await {
         Ok(true) => {}
         Ok(false) => return not_found("artifact is fenced"),
         Err(error) => return read_error(error),
@@ -3407,7 +3402,7 @@ async fn files_get(
         // object is present there, otherwise the write pin — never hand out a URL
         // that will 404. The HEAD is skipped when the two pins are one bucket, so
         // single-region and no-affinity nodes add no round trip here.
-        let presign_storage = if same_pin {
+        let presign_storage = if pins.same_pin {
             read_pinned.storage.clone()
         } else {
             match read_pinned.storage.head_exists(&key).await {
@@ -3446,7 +3441,7 @@ async fn files_get(
     let mut resp = match read_pinned.storage.serve_artifact(&key, range).await {
         Ok(resp) => resp,
         Err(read_err) => {
-            if same_pin {
+            if pins.same_pin {
                 return read_error(read_err);
             }
             match write_pinned.storage.serve_artifact(&key, range).await {

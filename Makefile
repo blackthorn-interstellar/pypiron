@@ -1,4 +1,4 @@
-.PHONY: init init-rust init-python build dev run test test-rust test-python test-s3-real test-gcs-real perf compat check cargo-check af fmt lint audit coverage clean doc docs docs-serve build-wheel release-notes fuzz fuzz-build vopr-soak help
+.PHONY: init init-rust init-python build dev run test test-rust test-python test-s3-real test-gcs-real perf compat check cargo-check af fmt lint audit coverage clean doc docs docs-serve docs-truth build-wheel release-notes fuzz fuzz-build vopr-soak help
 
 SHELL := /bin/bash
 
@@ -96,6 +96,9 @@ docs:  ## Build the user-facing docs site (mkdocs, strict)
 
 docs-serve:  ## Live-preview the docs site at http://127.0.0.1:8000
 	uv run --group docs -- mkdocs serve
+
+docs-truth: dev  ## Advisory: flag/env/default drift between the CLI and configuration.md/config_template.toml (not in `check`)
+	uv run -- python scripts/check_docs.py --bin target/debug/pypiron
 
 build-wheel:  ## Build Python wheel (local smoke-testing; releases happen in CI via git tag)
 	# Same as CI: rewrite the README's relative links/logo to absolute URLs so the

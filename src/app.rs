@@ -760,6 +760,12 @@ async fn run_serve(
     cli.private_prefix = cli.private_prefix.take().or(file.private_prefix.clone());
     validate_intent_grace_secs(cli.intent_grace_secs)?;
 
+    // Load the operator's extra upstream trust roots (a corporate MITM CA) before
+    // any outbound client is built — the advisory obtain, the proxy upstream, and
+    // the worker probe all read them. Fail-closed: a bad --upstream-ca-cert bundle
+    // refuses to start rather than surfacing on the first upstream fetch.
+    crate::upstream_tls::init(cli.upstream_ca_cert.as_deref())?;
+
     // Supplying only `--admin-pass` is enough to enable admin: the password is
     // the secret, the username is conventional. Fill in the default username
     // only alongside a password, so the no-admin (read-only) configuration keeps

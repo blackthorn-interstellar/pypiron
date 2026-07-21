@@ -782,6 +782,19 @@ pub struct ServeArgs {
     #[arg(long, env = "PYPIRON_ALLOW_INSECURE_UPSTREAM")]
     pub(crate) allow_insecure_upstream: bool,
 
+    /// PEM bundle of extra CA certificates to trust for **upstream** TLS — the
+    /// private root a corporate forwarding TLS proxy (a MITM appliance) presents.
+    /// Augments the built-in roots (a direct fetch of public PyPI keeps working);
+    /// it does not replace them. Applied to the proxy upstream fetch and the
+    /// advisory feed/probe. Loaded fail-closed at startup: a missing or
+    /// unparseable bundle refuses to start.
+    #[arg(
+        long = "upstream-ca-cert",
+        env = "PYPIRON_UPSTREAM_CA_CERT",
+        value_name = "PEM"
+    )]
+    pub(crate) upstream_ca_cert: Option<std::path::PathBuf>,
+
     /// Emit per-client `project` attribution labels on `/metrics`
     /// (`pypiron_project_requests_total`). Off by default: `/metrics` is
     /// unauthenticated, and the label is derived from the basic-auth username

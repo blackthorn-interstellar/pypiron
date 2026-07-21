@@ -50,6 +50,7 @@ pub mod token;
 pub mod tombstone;
 pub mod transparency;
 pub mod upload;
+pub mod upstream_tls;
 pub mod verify;
 pub mod wheel;
 pub mod worker;

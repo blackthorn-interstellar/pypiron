@@ -167,6 +167,18 @@ pub struct SyncArgs {
     #[arg(long = "no-progress", env = "PYPIRON_SYNC_NO_PROGRESS")]
     pub no_progress: bool,
 
+    /// PEM bundle of extra CA certificates to trust for the **source** TLS — the
+    /// private root a corporate forwarding TLS proxy (a MITM appliance) presents.
+    /// Augments the built-in roots (a direct fetch of public PyPI keeps working);
+    /// it does not replace them. Loaded fail-closed at startup: a missing or
+    /// unparseable bundle aborts the run.
+    #[arg(
+        long = "upstream-ca-cert",
+        env = "PYPIRON_UPSTREAM_CA_CERT",
+        value_name = "PEM"
+    )]
+    pub upstream_ca_cert: Option<PathBuf>,
+
     /// Mirror selection flags (names, formats, tags, upload-time).
     #[command(flatten)]
     pub mirror: MirrorArgs,
@@ -1732,30 +1744,42 @@ pub async fn run_sync(args: SyncArgs, config_path: Option<PathBuf>) -> Result<()
     let cfg = config::load(config_path.as_deref())?;
     let resolved = Resolved::merge(&args, cfg).await?;
 
-    let client = Client::builder()
-        .user_agent("pypiron-sync/0.1 (+https://github.com/blackthorn-interstellar/pypiron)")
-        // Same SSRF guard as the proxy: a malicious/MITM'd source listing can
-        // point a file or provenance URL at an internal address. Filter DNS
-        // results and follow redirects manually (guarded_get) so IP-literal hops
-        // are validated too. The source host itself is exempt.
-        .dns_resolver(Arc::new(crate::ssrf::SsrfGuardResolver::new(
-            resolved.guard.clone(),
-        )))
-        .redirect(reqwest::redirect::Policy::none())
-        // Ignore ambient HTTP(S)_PROXY/ALL_PROXY: a forward proxy would bypass
-        // the SsrfGuardResolver by connecting to name hosts on our behalf.
-        .no_proxy()
-        // Bound the handshake and any mid-stream stall so a dead/dribbling
-        // upstream fails a sync task cleanly (the retry loop absorbs it) instead
-        // of hanging forever. read_timeout is per-read and resets on each chunk,
-        // so it never bounds a large artifact that keeps streaming. The 300 s (vs
-        // a tighter handshake) covers the *quiet* wait after a multi-GB upload is
-        // sent, while the destination hashes it and PUTs it to object storage
-        // before answering — at 30 s a 2–3 GB wheel (torch, the nvidia-cu* CUDA
-        // libs, tensorflow) timed the client out mid-write and never persisted.
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .read_timeout(std::time::Duration::from_secs(300))
-        .build()?;
+    // Extra upstream trust roots (a corporate MITM CA presented on the source
+    // TLS) before the client is built. Fail-closed: a bad --upstream-ca-cert
+    // bundle aborts the run here rather than surfacing on the first fetch.
+    crate::upstream_tls::init(args.upstream_ca_cert.as_deref())?;
+
+    let client = crate::upstream_tls::apply(
+        Client::builder()
+            .user_agent("pypiron-sync/0.1 (+https://github.com/blackthorn-interstellar/pypiron)")
+            // Same SSRF guard as the proxy: a malicious/MITM'd source listing can
+            // point a file or provenance URL at an internal address. Filter DNS
+            // results and follow redirects manually (guarded_get) so IP-literal
+            // hops are validated too. The source host itself is exempt.
+            .dns_resolver(Arc::new(crate::ssrf::SsrfGuardResolver::new(
+                resolved.guard.clone(),
+            )))
+            .redirect(reqwest::redirect::Policy::none())
+            // Honor ambient HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY so sync
+            // works behind a corporate forward proxy. With a proxy the resolver
+            // no longer sees name targets (the proxy resolves them), so
+            // name-based SSRF enforcement moves to the proxy egress ACL; the
+            // IP-literal pre-flight in guarded_get still blocks every internal
+            // literal on every hop. See the `ssrf` module docs.
+            //
+            // Bound the handshake and any mid-stream stall so a dead/dribbling
+            // upstream fails a sync task cleanly (the retry loop absorbs it)
+            // instead of hanging forever. read_timeout is per-read and resets on
+            // each chunk, so it never bounds a large artifact that keeps
+            // streaming. The 300 s (vs a tighter handshake) covers the *quiet*
+            // wait after a multi-GB upload is sent, while the destination hashes
+            // it and PUTs it to object storage before answering — at 30 s a
+            // 2–3 GB wheel (torch, the nvidia-cu* CUDA libs, tensorflow) timed
+            // the client out mid-write and never persisted.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(300)),
+    )
+    .build()?;
 
     let endpoint = normalize_legacy_endpoint(&resolved.dst_base);
     info!("mirror-over-HTTP mode: uploading to {endpoint}");

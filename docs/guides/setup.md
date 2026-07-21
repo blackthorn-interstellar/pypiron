@@ -69,6 +69,13 @@ uv add --default-index http://HOST:8080/simple/ requests acme-widgets
 With the proxy on, do not point clients at PyPI as an extra index. pypiron owns
 resolution and keeps private names private.
 
+If the server only reaches the internet through a corporate forward proxy, set the
+standard `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` environment variables — the proxy
+upstream, `sync`, and the advisory feed all honor them. If that proxy intercepts
+TLS with a private CA, add `--upstream-ca-cert /path/to/corp-ca.pem` so it
+validates without turning verification off. Details:
+[Behind a forward proxy](../reference/configuration.md#behind-a-forward-proxy-or-tls-interception).
+
 ## Mirror with sync
 
 Use `sync` when the server should not talk to PyPI, or when CI should install

@@ -713,19 +713,26 @@ enum RawFetch {
 /// per-node probe.
 fn build_feed_client(url: &str) -> Result<(reqwest::Client, Arc<Guard>)> {
     let guard = Arc::new(Guard::new(url, &[], &[])?);
-    let client = reqwest::Client::builder()
-        .user_agent("pypiron-advisory/0.1 (+https://github.com/blackthorn-interstellar/pypiron)")
-        // The resolver catches name targets (and DNS-rebind); IP-literal targets
-        // are caught by guarded_get's pre-flight, which owns redirect-following so
-        // every hop is re-validated. Auto-follow would let a redirect Location
-        // reach a forbidden literal the resolver never sees — so disable it and go
-        // through guarded_get.
-        .dns_resolver(Arc::new(SsrfGuardResolver::new(guard.clone())))
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(60))
-        .build()
-        .context("building advisory feed HTTP client")?;
+    // Already proxy-honoring (no `.no_proxy()`); `upstream_tls::apply` adds the
+    // operator's --upstream-ca-cert roots so an OSV pull through a corporate MITM
+    // TLS proxy validates. Both are set once at startup, before this runs.
+    let client = crate::upstream_tls::apply(
+        reqwest::Client::builder()
+            .user_agent(
+                "pypiron-advisory/0.1 (+https://github.com/blackthorn-interstellar/pypiron)",
+            )
+            // The resolver catches name targets (and DNS-rebind); IP-literal
+            // targets are caught by guarded_get's pre-flight, which owns
+            // redirect-following so every hop is re-validated. Auto-follow would
+            // let a redirect Location reach a forbidden literal the resolver never
+            // sees — so disable it and go through guarded_get.
+            .dns_resolver(Arc::new(SsrfGuardResolver::new(guard.clone())))
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(60)),
+    )
+    .build()
+    .context("building advisory feed HTTP client")?;
     Ok((client, guard))
 }
 

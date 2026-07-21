@@ -359,31 +359,37 @@ impl Proxy {
             mirror,
             scope,
             deny,
-            client: Client::builder()
-                .user_agent(
-                    "pypiron-proxy/0.1 (+https://github.com/blackthorn-interstellar/pypiron)",
-                )
-                .connect_timeout(Duration::from_secs(10))
-                // Inactivity timeout between reads, reset on each chunk: an
-                // upstream that connects then stalls mid-stream can't hang a
-                // client-facing request forever. Does NOT bound large downloads
-                // that keep streaming. download_verified's retry loop turns the
-                // resulting error into a clean retry.
-                .read_timeout(Duration::from_secs(30))
-                // Refuse to connect to private/loopback/link-local addresses. A
-                // malicious or MITM'd upstream listing can point a companion URL
-                // (.metadata/.provenance — unlike artifacts, not hash-gated) at an
-                // internal endpoint and read the response back through us. The
-                // resolver catches name targets (and DNS-rebind on redirects);
-                // IP-literal targets are caught by the pre-flight in guarded_get,
-                // which is why redirects are followed manually below.
-                .dns_resolver(Arc::new(SsrfGuardResolver::new(guard.clone())))
-                .redirect(reqwest::redirect::Policy::none())
-                // Ignore ambient HTTP(S)_PROXY/ALL_PROXY. A forward proxy would
-                // receive name hosts verbatim and connect on our behalf, so the
-                // SsrfGuardResolver never runs — our fetches must go direct.
-                .no_proxy()
-                .build()?,
+            client: crate::upstream_tls::apply(
+                Client::builder()
+                    .user_agent(
+                        "pypiron-proxy/0.1 (+https://github.com/blackthorn-interstellar/pypiron)",
+                    )
+                    .connect_timeout(Duration::from_secs(10))
+                    // Inactivity timeout between reads, reset on each chunk: an
+                    // upstream that connects then stalls mid-stream can't hang a
+                    // client-facing request forever. Does NOT bound large
+                    // downloads that keep streaming. download_verified's retry
+                    // loop turns the resulting error into a clean retry.
+                    .read_timeout(Duration::from_secs(30))
+                    // Refuse to connect to private/loopback/link-local addresses.
+                    // A malicious or MITM'd upstream listing can point a companion
+                    // URL (.metadata/.provenance — unlike artifacts, not
+                    // hash-gated) at an internal endpoint and read the response
+                    // back through us. The resolver catches name targets (and
+                    // DNS-rebind on redirects); IP-literal targets are caught by
+                    // the pre-flight in guarded_get, which is why redirects are
+                    // followed manually below.
+                    .dns_resolver(Arc::new(SsrfGuardResolver::new(guard.clone())))
+                    // Honor ambient HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY so
+                    // the proxy works behind a corporate forward proxy. With a
+                    // proxy the resolver no longer sees name targets (the proxy
+                    // resolves them), so name-based SSRF enforcement moves to the
+                    // proxy egress ACL; the IP-literal pre-flight in guarded_get
+                    // still blocks every internal literal on every hop. See the
+                    // `ssrf` module docs.
+                    .redirect(reqwest::redirect::Policy::none()),
+            )
+            .build()?,
             guard,
             listings: Mutex::new(HashMap::new()),
             inflight: Arc::new(Mutex::new(HashMap::new())),

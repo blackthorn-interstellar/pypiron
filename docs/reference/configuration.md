@@ -267,6 +267,7 @@ recovery behavior, and operator rules.
 | `--allow-insecure-upstream` | `PYPIRON_ALLOW_INSECURE_UPSTREAM` | `false` | Permit a plaintext `http://` proxy upstream. Off by default: over http a network MITM controls both the artifact bytes and the sha256 they are verified against, so the hash check stops being a control. |
 | `--proxy-allow-host HOST` | `PYPIRON_PROXY_ALLOW_HOST` | none | Permit the proxy to fetch listing-derived URLs (artifact, `.metadata`, `.provenance`, redirect targets) whose host matches `HOST` exactly, even if it resolves to a private address. Repeatable; comma-separated in the env var. Only the configured upstream host is exempt otherwise. |
 | `--proxy-allow-cidr CIDR` | `PYPIRON_PROXY_ALLOW_CIDR` | none | Like `--proxy-allow-host`, but permits any target IP inside `CIDR` (e.g. `10.0.0.0/8`). Repeatable; comma-separated in the env var. |
+| `--upstream-ca-cert PEM` | `PYPIRON_UPSTREAM_CA_CERT` | none | PEM bundle of extra CA certificates to trust for **upstream** TLS — the private root a corporate forwarding TLS proxy (a MITM appliance) presents. Augments the built-in roots (a direct fetch of public PyPI keeps working); it does not replace them. Applied to the proxy upstream fetch and the advisory feed/probe. Loaded fail-closed at startup: a missing or unparseable bundle refuses to start. See [Behind a forward proxy](#behind-a-forward-proxy-or-tls-interception). |
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | OSV PyPI export | Feed for malware blocking and the org audit: a URL or local path to the [OSV](https://osv.dev) PyPI advisory export. Defaults to `https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip` (named in the startup log); a URL fetch honors `HTTP(S)_PROXY`. `""` disables both features. |
 | `--malware-block true\|false` | `PYPIRON_MALWARE_BLOCK` | `true` | Refuse to serve or cache files the feed flags as malicious. Needs a snapshot source — the feed, or one delivered earlier by `sync`. Explicit `true` that can't obtain a snapshot refuses startup; the default warns "armed but unfed" and self-arms when a snapshot arrives. |
 | `--malware-probe-secs N` | `PYPIRON_MALWARE_PROBE_SECS` | `120` | How often each node checks OSV for a just-published malware advisory and blocks it within minutes, ahead of the daily feed refresh. Near-zero bandwidth (a conditional check that transfers nothing most polls) and no stored state. `0` disables; inert unless blocking is armed and the feed is the OSV `all.zip` URL. |
@@ -308,6 +309,30 @@ it climbs past your refresh window), `pypiron_malware_probe_age_seconds` (time
 since the last malware probe, once the probe has run at least once), and
 `pypiron_blocked_downloads_total` (refused malware downloads; a nonzero rate
 means a client is still asking for a known-bad file).
+
+### Behind a forward proxy or TLS interception
+
+In a locked-down network the only way out is a corporate forward proxy, often one
+that terminates TLS with a private root CA. pypiron works through both:
+
+- **Forward proxy.** `pypiron sync`, the on-demand proxy's upstream fetch, and the
+  advisory feed poll all honor the standard `HTTPS_PROXY`, `HTTP_PROXY`,
+  `ALL_PROXY`, and `NO_PROXY` environment variables. Set them and outbound traffic
+  routes through the proxy; no flag needed. (The cloud instance-metadata probe is
+  the deliberate exception — it always goes direct to the link-local address.)
+- **Custom CA.** When the proxy re-signs TLS with a private root, point
+  `--upstream-ca-cert` at that CA's PEM bundle. It is loaded once at startup and
+  *augments* the built-in roots, so a direct fetch of public PyPI still validates
+  while the corporate CA is also trusted. A bundle that can't be read or parsed
+  refuses startup (fail-closed).
+
+Enabling a proxy is an explicit operator act, and it shifts where one SSRF check
+enforces. The IP-literal pre-flight is unaffected: an internal address supplied by
+a listing — `127.0.0.1`, `10.x`, the `169.254.169.254` metadata endpoint, their
+IPv6 and NAT64 (`64:ff9b::`) forms — is still refused on the initial request and
+every redirect hop. But a *name* target is resolved by the proxy, not by pypiron,
+so name-based SSRF enforcement moves to the proxy's own egress ACL — which is the
+intended egress control point once a proxy is in the path.
 
 ## Mirror selection
 
@@ -363,6 +388,7 @@ directly.
 | `--from URL` | `PYPIRON_SYNC_FROM` | `https://pypi.org` | Source simple index. Name it in full when it lives off the standard `/simple` path (devpi: `.../<user>/<index>/+simple`). |
 | `--source-user USER` | `PYPIRON_SYNC_SOURCE_USER` | none | Username for an authenticated source (private devpi/Artifactory/Nexus). Sent only to the source host — never on an off-host redirect. Requires `--source-pass`; also `[sync].source-user`. |
 | `--source-pass PASS` | `PYPIRON_SYNC_SOURCE_PASS` | none | Password for an authenticated source. Requires `--source-user`; also `[sync].source-pass`. |
+| `--upstream-ca-cert PEM` | `PYPIRON_UPSTREAM_CA_CERT` | none | PEM bundle of extra CA certificates to trust for the **source** TLS — the private root a corporate forwarding TLS proxy (a MITM appliance) presents. Augments the built-in roots; loaded fail-closed at startup. See [Behind a forward proxy](#behind-a-forward-proxy-or-tls-interception). |
 | `--to URL` | `PYPIRON_SYNC_TO` | required | Destination pypiron URL. |
 | `--admin-user USER` | `PYPIRON_SYNC_ADMIN_USER` | none | Destination admin user. |
 | `--admin-pass PASS` | `PYPIRON_SYNC_ADMIN_PASS` | none | Destination admin password. |

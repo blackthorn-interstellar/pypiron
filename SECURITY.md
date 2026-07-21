@@ -26,3 +26,33 @@ upstream `sync`/proxy (which makes outbound requests on the server's behalf) and
 anonymous uploads. Review
 [docs/reference/configuration.md](docs/reference/configuration.md) and keep
 untrusted features disabled in production.
+
+## Verify a release
+
+Every wheel, sdist, release binary, and container image is published with a
+signed build-provenance attestation — proof it was built by this repository's CI
+and hasn't been swapped since. Check one with the GitHub CLI:
+
+```bash
+# A wheel or sdist you downloaded from PyPI
+gh attestation verify ./pypiron-<version>-<platform>.whl \
+  --repo blackthorn-interstellar/pypiron
+
+# A release binary
+curl -LO https://github.com/blackthorn-interstellar/pypiron/releases/latest/download/pypiron-x86_64-unknown-linux-musl.tar.gz
+gh attestation verify pypiron-x86_64-unknown-linux-musl.tar.gz \
+  --repo blackthorn-interstellar/pypiron
+
+# The container image, checked by digest without pulling it
+gh attestation verify oci://ghcr.io/blackthorn-interstellar/pypiron:latest \
+  --repo blackthorn-interstellar/pypiron
+```
+
+**Exit status 0 is the signal**: the artifact's digest matched an attestation
+issued by this repo's GitHub Actions. A non-zero exit means it didn't — treat the
+artifact as unverified. Verification needs the GitHub CLI **2.49 or newer** (2.21
+has no `attestation` command), network access, and a `gh auth login` session.
+
+The full trust model — what pypiron defends, what it does not, and the two
+acknowledged dependency advisories — is in
+[docs/concepts/security-model.md](docs/concepts/security-model.md).

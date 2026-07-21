@@ -67,10 +67,12 @@ lint:  ## Run clippy and ruff lints
 	uv run -- ruff check tests bench scripts
 
 audit:  ## Scan Cargo.lock for security advisories (needs cargo-audit: cargo install cargo-audit)
-	# Fails on any advisory except the two acknowledged below. Both are quick-xml
-	# DoS bugs (quadratic attribute parsing; unbounded namespace-decl allocation),
-	# reached only through object_store's S3/Azure/GCS XML-response parsing. That
-	# XML is only ever parsed from the operator's own configured, trusted storage
+	# Fails on any advisory except the two acknowledged below, both quick-xml DoS:
+	#   RUSTSEC-2026-0194  quadratic runtime on duplicate start-tag attribute names
+	#   RUSTSEC-2026-0195  unbounded namespace-decl allocation (memory exhaustion)
+	# Both are reached only through object_store's S3/Azure/GCS XML-response
+	# parsing, and that XML is only ever parsed from the operator's own configured,
+	# trusted storage
 	# backend's responses — never from client/request input — so neither DoS is
 	# reachable from a pypiron request. The fix is quick-xml >= 0.41.0, but no
 	# released object_store permits it yet: the latest (0.14.0) pins quick-xml to

@@ -19,7 +19,7 @@
 //!     `Location` in the manual redirect loop below.
 
 use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +61,14 @@ pub(crate) fn is_forbidden_ip(ip: &IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4() {
                 return is_forbidden_ip(&IpAddr::V4(v4));
             }
+            // NAT64 well-known prefix (64:ff9b::/96, RFC 6052): a NAT64 gateway
+            // translates these straight to the embedded IPv4 — including a
+            // private one — so judge them as that v4. Increasingly reachable on
+            // IPv6-only cloud subnets running DNS64/NAT64. `to_ipv4()` misses it
+            // (the prefix is neither all-zero nor `::ffff`), so decode explicitly.
+            if let Some(v4) = nat64_embedded_v4(v6) {
+                return is_forbidden_ip(&IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -68,10 +76,31 @@ pub(crate) fn is_forbidden_ip(ip: &IpAddr) -> bool {
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 // Link-local fe80::/10.
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
-            // 6to4 (2002::/16), Teredo (2001::/32), and NAT64 (64:ff9b::/96)
-            // embed IPv4 but aren't routable to an internal target; accepted as
-            // low-risk rather than decoded here.
+            // 6to4 (2002::/16) and Teredo (2001::/32) also embed IPv4, but route
+            // via a relay rather than straight to the embedded address, so a
+            // private embed isn't reachable through them; accepted as low-risk.
+            // (NAT64, which does translate directly, is decoded above.)
         }
+    }
+}
+
+/// The IPv4 address embedded in a NAT64 well-known-prefix address
+/// (`64:ff9b::/96`, RFC 6052), or `None` when `v6` is not in that prefix. The low
+/// 32 bits are a real IPv4 target a NAT64 gateway forwards to, so
+/// `64:ff9b::10.0.0.1` must be judged as `10.0.0.1`, not waved through as a
+/// public-looking v6 literal.
+fn nat64_embedded_v4(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = v6.segments();
+    // Prefix is 64:ff9b: in the first two segments and zeroes through bit 96.
+    if s[0] == 0x0064 && s[1] == 0xff9b && (s[2] | s[3] | s[4] | s[5]) == 0 {
+        Some(Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            (s[6] & 0xff) as u8,
+            (s[7] >> 8) as u8,
+            (s[7] & 0xff) as u8,
+        ))
+    } else {
+        None
     }
 }
 
@@ -132,6 +161,16 @@ impl Guard {
     /// sees them. Name hosts pass through untouched: they are validated at
     /// connect time by [`SsrfGuardResolver`], which also closes DNS-rebind.
     pub(crate) fn check_target(&self, url: &Url) -> Result<()> {
+        // Only http/https can reach an internal service through reqwest; reject
+        // every other scheme up front rather than lean on the client refusing to
+        // speak it. Runs on every hop, so a redirect to `file://`/`gopher://` —
+        // which carries no host the address rules could catch — is refused here.
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(Blocked(format!(
+                "refusing to fetch '{url}': only http/https targets are allowed"
+            ))
+            .into());
+        }
         let Some(host) = url.host() else {
             return Err(Blocked(format!("refusing to fetch '{url}': URL has no host")).into());
         };
@@ -265,7 +304,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn is_forbidden_ip_blocks_private_and_allows_public() {
@@ -288,6 +326,10 @@ mod tests {
             // IPv4-compatible (deprecated) IPv6 form — reachable on dual-stack.
             "::169.254.169.254".parse().unwrap(),
             "::127.0.0.1".parse().unwrap(),
+            // NAT64 well-known prefix embedding the metadata endpoint and a
+            // private v4 — a NAT64 gateway would forward straight to them.
+            "64:ff9b::169.254.169.254".parse().unwrap(),
+            "64:ff9b::10.0.0.1".parse().unwrap(),
         ] {
             assert!(is_forbidden_ip(&ip), "{ip} should be blocked");
         }
@@ -295,6 +337,9 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(151, 101, 0, 223)), // files.pythonhosted.org
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 1)),
+            // NAT64 embedding a *public* v4 stays allowed — we fold to the embed,
+            // not blanket-block the prefix.
+            "64:ff9b::8.8.8.8".parse().unwrap(),
         ] {
             assert!(!is_forbidden_ip(&ip), "{ip} should be allowed");
         }
@@ -315,6 +360,8 @@ mod tests {
             "http://[::ffff:169.254.169.254]/x",
             // IPv4-compatible IPv6 form of a loopback — must fold to v4.
             "http://[::127.0.0.1]/x",
+            // NAT64 well-known prefix embedding a private v4 — must fold to v4.
+            "http://[64:ff9b::10.0.0.1]/x",
             // Decimal-encoded 127.0.0.1 — the URL parser folds it to a literal.
             "http://2130706433/x",
         ] {
@@ -343,6 +390,25 @@ mod tests {
         guard
             .check_target(&url("https://files.pythonhosted.org/p/x.whl"))
             .unwrap();
+    }
+
+    #[test]
+    fn check_target_refuses_non_http_schemes() {
+        let guard = Guard::new("https://pypi.org", &[], &[]).unwrap();
+        for target in [
+            "file:///etc/passwd",
+            "gopher://8.8.8.8/x",
+            "ftp://8.8.8.8/x",
+        ] {
+            let err = guard
+                .check_target(&url(target))
+                .expect_err(&format!("{target} must be refused"));
+            assert!(err.to_string().contains("http/https"));
+            assert!(
+                err.downcast_ref::<Blocked>().is_some(),
+                "{target} refusal must be a Blocked error"
+            );
+        }
     }
 
     #[test]

@@ -139,9 +139,10 @@ nodes, any mix of clouds, no database, no leader election you have to operate.
   inferring it from logs. `pypiron verify-chain` does the same for history.
 - **Automation-native surfaces.** Every `--flag` is a `PYPIRON_FLAG` env var
   ([all of them](reference/configuration.md)); PEP 691 JSON at
-  `/simple/index.json` and `/simple/<package>/index.json`; `GET /health`;
-  Prometheus at `/metrics`; `--log-format json`; a self-contained Docker
-  `HEALTHCHECK`; `pypiron healthcheck` exits 0/1.
+  `/simple/index.json` and `/simple/<package>/index.json`; `GET /health`
+  (liveness) and `GET /ready` (readiness for a load balancer); Prometheus at
+  `/metrics`; `--log-format json`; a self-contained Docker `HEALTHCHECK`;
+  `pypiron healthcheck` exits 0/1.
 - **Your retries cannot corrupt it.** Kill it mid-write and it converges —
   proven exhaustively at every write step, on a multi-node fleet, and against
   a hostile upstream ([how it's tested](concepts/testing.md#it-survives-being-killed)).
@@ -164,7 +165,8 @@ Sixty seconds, no cleanup beyond killing the process:
 ```bash
 pypiron serve --admin-pass test --proxy-upstream https://pypi.org &
 sleep 2
-curl -fsS http://localhost:8080/health                      # {"status":"ok"}
+curl -fsS http://localhost:8080/health                      # {"status":"ok"}    (liveness)
+curl -fsS http://localhost:8080/ready                       # {"status":"ready"} (can serve reads)
 curl -fsS http://localhost:8080/simple/six/index.json       # PEP 691 JSON
 pip install --index-url http://localhost:8080/simple/ six   # proxied + cached
 ```
@@ -203,7 +205,7 @@ An unreserved endorsement of what it is, not a claim that it is everything:
 | --- | --- |
 | Index | `/simple/` and `/simple/<package>/` (HTML); PEP 691 JSON at `.../index.json` |
 | Upload | `POST /legacy/` — uv, twine, and poetry compatible |
-| Health | `GET /health`; `pypiron healthcheck` (exit 0/1); Docker image has a built-in `HEALTHCHECK` |
+| Health | `GET /health` (liveness) and `GET /ready` (readiness — point a load balancer here); `pypiron healthcheck` (exit 0/1); Docker image has a built-in `HEALTHCHECK` |
 | Metrics | `GET /metrics` (Prometheus) |
 | Audit | `GET /audit` — org-wide advisory report (admin) |
 | Config | every `--flag` ⇔ `PYPIRON_FLAG`; `pypiron config init` prints an annotated TOML |

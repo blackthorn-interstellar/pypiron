@@ -453,7 +453,8 @@ pending repairs, not bytes.
 | `/simple/` | read | Package index. |
 | `/files/<pkg>/<file>` | read | Artifact bytes. |
 | `/legacy/` | uploader/admin | Upload API. |
-| `/health` | open | Load balancer health. |
+| `/health` | open | Liveness: the process is up. Always `200` while serving (a Kubernetes `livenessProbe`). |
+| `/ready` | open | Readiness: this node can serve reads. Point your load balancer and a Kubernetes `readinessProbe` here. |
 | `/metrics` | open | Prometheus metrics. |
 | `/stats/downloads` | read | Global download stats. |
 | `/stats/downloads/<pkg>` | read | Per-package download stats. |

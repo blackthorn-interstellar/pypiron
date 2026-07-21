@@ -180,8 +180,9 @@ WantedBy=multi-user.target
 ```
 
 For local disk storage, mount a data volume and set `data-dir` in `[serve]`.
-For S3, run more containers with the same config behind a load balancer. Health
-check: `/health`.
+For S3, run more containers with the same config behind a load balancer. Point
+the load balancer's health check at `/ready` (it turns 503 the moment a node
+starts draining, so the balancer stops it before shutdown).
 
 ## Proxy or sync?
 

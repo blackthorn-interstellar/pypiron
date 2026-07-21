@@ -25,11 +25,31 @@ use crate::names::{checked_pkg_name, infer_version_from_filename};
 use crate::pages::{html_ok, page_context, rank_packages};
 use crate::{advisories, html, origin, storage, sync, token};
 
-/// Liveness + storage reachability. A storage error is the only failure mode:
-/// `Ok(false)` (probe object missing) still proves storage answers. During a
-/// graceful shutdown this reports 503 first, so a load balancer drains the node
-/// before the listener stops accepting (see the shutdown path in `run_serve`).
-pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Response<Body> {
+/// Liveness: is the process up? Always `200 {"status":"ok"}` while the listener
+/// is serving — no storage I/O, and it stays `200` right through a graceful
+/// shutdown. This is the probe a Kubernetes `livenessProbe` keys on, so a storage
+/// blip or an in-progress drain never gets the pod killed and restarted.
+/// Whether this node can actually serve reads is the separate question answered
+/// by [`ready`] — which is what a load balancer keys on.
+pub(crate) async fn health() -> Response<Body> {
+    simple_response(
+        StatusCode::OK,
+        "application/json",
+        "no-cache",
+        r#"{"status":"ok"}"#,
+    )
+}
+
+/// Readiness: can this node serve reads right now? During a graceful shutdown it
+/// reports `503 {"status":"draining"}` first, so a load balancer pulls the node
+/// out of rotation before the listener stops accepting (see the shutdown path in
+/// `run_serve`) — the pre-drain pause only works if the LB keys on this endpoint,
+/// not on [`health`]. Otherwise it HEAD-probes the read pin's storage: a reply
+/// (even `Ok(false)`, the probe object missing) proves storage answers, so
+/// `200 {"status":"ready"}`; a storage error is `503 {"status":"degraded"}`.
+/// The read pin is the bucket this node actually reads from, so a node whose near
+/// bucket is down reports not-ready while liveness stays up.
+pub(crate) async fn ready(State(state): State<Arc<AppState>>) -> Response<Body> {
     if state
         .shutting_down
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -42,10 +62,10 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Response<Body>
         );
     }
     let probe = format!("{SIMPLE_PREFIX}index.json");
-    let (status, body) = match state.pin().storage.head_exists(&probe).await {
-        Ok(_) => (StatusCode::OK, r#"{"status":"ok"}"#),
+    let (status, body) = match state.read_pin().storage.head_exists(&probe).await {
+        Ok(_) => (StatusCode::OK, r#"{"status":"ready"}"#),
         Err(e) => {
-            warn!(error=?e, "health: storage probe failed");
+            warn!(error=?e, "ready: storage probe failed");
             (StatusCode::SERVICE_UNAVAILABLE, r#"{"status":"degraded"}"#)
         }
     };

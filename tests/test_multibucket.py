@@ -299,6 +299,50 @@ def test_preferred_bucket_503_switches_and_uploads_continue(s3_server_multi_fail
     )
 
 
+def test_ready_degrades_only_when_all_buckets_down_health_stays_up(s3_server_multi_failover):
+    """The health split under failover. /health is pure liveness — 200 while the
+    process serves, no storage I/O. /ready tracks the read path: one bucket down
+    and the survivor still serves reads, so /ready holds 200; both down and no
+    node can serve reads, so /ready turns 503 degraded while /health stays 200
+    (liveness must not flap, or Kubernetes would restart the pod mid-outage);
+    recover and /ready returns."""
+    server = s3_server_multi_failover
+    base = server["base_url"]
+
+    def health() -> tuple[int, dict]:
+        code, body, _ = http_get(f"{base}/health", timeout=3)
+        return code, (json.loads(body) if body else {})
+
+    def ready() -> tuple[int, dict]:
+        code, body, _ = http_get(f"{base}/ready", timeout=3)
+        return code, (json.loads(body) if body else {})
+
+    # One bucket down: the node fails over and the survivor serves reads.
+    a, b = _fail_to_second(server)
+    assert _bucket_health(server, a) == -1, "the downed bucket reports unhealthy"
+    assert health() == (200, {"status": "ok"})
+    assert ready() == (200, {"status": "ready"}), "the survivor keeps this node ready"
+
+    # Both buckets down: no bucket can serve reads, so /ready degrades — but the
+    # process is still up, so /health must not flap.
+    server["faults"].fail(b)
+    _eventually(
+        lambda: ready() == (503, {"status": "degraded"}),
+        timeout=30,
+        what="/ready degrades to 503 when no bucket can serve reads",
+    )
+    assert health() == (200, {"status": "ok"}), "liveness holds while both buckets are down"
+
+    # Recovery: a bucket serves reads again, so /ready comes back.
+    server["faults"].recover(a, b)
+    _eventually(
+        lambda: ready() == (200, {"status": "ready"}),
+        timeout=30,
+        what="/ready recovers once a bucket serves reads again",
+    )
+    assert health() == (200, {"status": "ok"})
+
+
 def test_shipped_defaults_leave_a_blackholed_bucket_within_seconds(
     s3_server_multi_default_failover, tmp_path
 ):

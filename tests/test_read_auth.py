@@ -1,5 +1,5 @@
 """--read-user/--read-pass: when set, index and artifact reads require basic
-auth; any stronger credential (uploader, admin) also reads; /health and
+auth; any stronger credential (uploader, admin) also reads; /health, /ready, and
 /metrics stay open for probes and scrapers."""
 
 from __future__ import annotations
@@ -55,6 +55,8 @@ def test_any_configured_credential_reads(disk_server_read_auth):
 def test_health_and_metrics_bypass_read_auth(disk_server_read_auth):
     server = disk_server_read_auth
     code, _, _ = http_get(f"{server['base_url']}/health")
+    assert code == 200
+    code, _, _ = http_get(f"{server['base_url']}/ready")
     assert code == 200
     code, _, _ = http_get(f"{server['base_url']}/metrics")
     assert code == 200

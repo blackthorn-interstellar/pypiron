@@ -49,7 +49,7 @@ pub fn route_group(path: &str) -> usize {
         1
     } else if path == "/legacy" || path.starts_with("/legacy/") {
         2
-    } else if path == "/health" {
+    } else if path == "/health" || path == "/ready" {
         3
     } else if path == "/metrics" {
         4
@@ -738,6 +738,7 @@ mod tests {
         assert_eq!(ROUTES[route_group("/files/six/six.whl")], "files");
         assert_eq!(ROUTES[route_group("/legacy/")], "legacy");
         assert_eq!(ROUTES[route_group("/health")], "health");
+        assert_eq!(ROUTES[route_group("/ready")], "health");
         assert_eq!(ROUTES[route_group("/metrics")], "metrics");
         assert_eq!(ROUTES[route_group("/nope")], "other");
     }

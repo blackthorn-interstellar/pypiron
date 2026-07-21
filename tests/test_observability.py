@@ -19,6 +19,15 @@ def test_health_reports_ok(disk_server):
     assert headers.get("content-type") == "application/json"
 
 
+def test_ready_reports_ready(disk_server):
+    """/ready is the can-serve-reads probe: with storage reachable it is 200
+    {"status":"ready"} (distinct from /health's liveness {"status":"ok"})."""
+    code, body, headers = http_get(f"{disk_server['base_url']}/ready")
+    assert code == 200
+    assert json.loads(body) == {"status": "ready"}
+    assert headers.get("content-type") == "application/json"
+
+
 def test_metrics_count_requests(disk_server):
     # Generate one known-good simple request, then scrape.
     code, _, _ = http_get(f"{disk_server['simple']}index.json")
@@ -175,11 +184,13 @@ def test_mutations_logged_by_default(disk_server):
 
 
 def test_health_and_metrics_excluded_from_access_log(disk_server_access_log_info):
-    """Full access log on, but at info: reads are logged, /health and /metrics
-    are not (they log only at debug — LBs and Prometheus poll them constantly)."""
+    """Full access log on, but at info: reads are logged, the operational probes
+    (/health, /ready, /metrics) are not (they log only at debug — LBs and
+    Prometheus poll them constantly)."""
     server = disk_server_access_log_info
     http_get(f"{server['simple']}index.json", headers={"User-Agent": "probe-read/1"})
     http_get(f"{server['base_url']}/health")
+    http_get(f"{server['base_url']}/ready")
     http_get(f"{server['base_url']}/metrics")
 
     # The read IS logged (firehose at info), proving the log is live...
@@ -188,11 +199,12 @@ def test_health_and_metrics_excluded_from_access_log(disk_server_access_log_info
         lambda ln: "pypiron::access" in ln and "probe-read/1" in ln,
     )
     assert read, "a normal read should be logged with --access-log"
-    # ...but no access line names /health or /metrics.
+    # ...but no access line names a probe endpoint.
     access_lines = [
         ln for ln in server["log_path"].read_text().splitlines() if "pypiron::access" in ln
     ]
-    assert not [ln for ln in access_lines if "/health" in ln or "/metrics" in ln], access_lines
+    probed = [ln for ln in access_lines if "/health" in ln or "/ready" in ln or "/metrics" in ln]
+    assert not probed, access_lines
 
 
 def test_access_log_structured_json_fields(disk_server_access_log_json):

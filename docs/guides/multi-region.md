@@ -29,7 +29,9 @@ export PYPIRON_BUCKETS=s3://iron-a@us-east-1,s3://iron-b@eu-west-1
 ```
 
 Put a health-checked load balancer or failover DNS in front of the nodes, keyed
-on `/health`. Every region can serve the full index; the front door picks which
+on `/ready` (it reports `503` on a node that can no longer serve reads, and
+during a graceful shutdown, so the front door pulls it out before it stops
+accepting). Every region can serve the full index; the front door picks which
 region a client reaches.
 
 ## What survives
@@ -50,8 +52,8 @@ You do nothing.
 
 1. A bucket starts failing. After three consecutive failures, each node stops
    using it and serves from the next one in the list.
-2. `/health` fails on nodes that can no longer reach any bucket, and your load
-   balancer routes clients to a surviving region. Installs continue.
+2. `/ready` turns `503` on nodes that can no longer reach any bucket, and your
+   load balancer routes clients to a surviving region. Installs continue.
 3. Uploads keep succeeding on the remaining buckets, and pypiron queues a repair
    for the one that is down.
 4. When the bucket recovers, the repairs drain — immediately on recovery, with a

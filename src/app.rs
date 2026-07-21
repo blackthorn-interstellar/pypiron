@@ -41,7 +41,7 @@ use crate::cli::{
 };
 
 use crate::admin::{
-    advisories_feed_get, advisories_feed_put, audit_json, audit_page, health, mint_token,
+    advisories_feed_get, advisories_feed_put, audit_json, audit_page, health, mint_token, ready,
     serve_metrics, stats_get, stats_summary_get, sync_cursors_get, sync_cursors_put,
     sync_local_index,
 };
@@ -1141,7 +1141,11 @@ async fn run_serve(
         .route("/tokens", post(mint_token))
         // Operational endpoints: deliberately outside read auth — load
         // balancers and Prometheus scrapers don't carry package credentials.
+        // /health is liveness (is the process up); /ready is readiness (can this
+        // node serve reads) — a load balancer keys on /ready so the shutdown
+        // drain works.
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/metrics", get(serve_metrics))
         // Catch-all for debugging unmatched routes
         .fallback(fallback_handler)
@@ -1216,10 +1220,12 @@ async fn run_serve(
         std::process::exit(130);
     });
 
-    // Fail /health first, so a load balancer pulls this node out of rotation
-    // before we stop accepting — otherwise new requests race straight into
-    // connection-refused during the drain. Only cloud (multi-node, LB-fronted)
-    // deployments need the pause; disk is single-node, so Ctrl-C stays instant.
+    // Flip /ready to 503 first, so a load balancer pulls this node out of
+    // rotation before we stop accepting — otherwise new requests race straight
+    // into connection-refused during the drain. (/health stays 200: liveness
+    // must not flap during a graceful drain, or k8s would restart the pod
+    // mid-shutdown.) Only cloud (multi-node, LB-fronted) deployments need the
+    // pause; disk is single-node, so Ctrl-C stays instant.
     state
         .shutting_down
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1312,9 +1318,10 @@ async fn shutdown_signal() {
 /// mutations — uploads, deletes, yanks, status changes (any non-GET/HEAD) — at
 /// `info`, and stays silent on the high-volume reads (index listings, downloads)
 /// so the log doesn't become the workload. `--access-log` widens it to every
-/// request (the full access log). Either way, `/health` and `/metrics` are logged
-/// only at `debug`: load balancers and Prometheus poll them constantly, so an
-/// info-level access log would drown in them.
+/// request (the full access log). Either way, the operational probes (`/health`,
+/// `/ready`, `/metrics`) are logged only at `debug`: load balancers and
+/// Prometheus poll them constantly, so an info-level access log would drown in
+/// them.
 ///
 /// Records are `tracing` events on the `pypiron::access` target, so `RUST_LOG`
 /// tunes them (`pypiron::access=warn` keeps only failures, `=off` silences them)
@@ -1329,7 +1336,7 @@ async fn log_requests(
 ) -> Response<Body> {
     let method = req.method().clone();
     let is_read = method == Method::GET || method == Method::HEAD;
-    let health_or_metrics = matches!(req.uri().path(), "/health" | "/metrics");
+    let probe_endpoint = matches!(req.uri().path(), "/health" | "/ready" | "/metrics");
 
     if !is_read && state.mutations_fenced() {
         return simple_response(
@@ -1342,7 +1349,7 @@ async fn log_requests(
 
     // Decide up front whether this request could be logged, so the hot read path
     // does no timing or field work.
-    let consider = if health_or_metrics {
+    let consider = if probe_endpoint {
         // Only ever at debug — checked here so frequent probes cost nothing
         // at the default info level.
         tracing::enabled!(target: "pypiron::access", tracing::Level::DEBUG)
@@ -1429,9 +1436,9 @@ async fn log_requests(
             )
         };
     }
-    // /health & /metrics only reach here when debug is enabled, so keep them at
-    // debug; otherwise 5xx at warn so failures surface under a warn filter.
-    if health_or_metrics {
+    // The operational probes only reach here when debug is enabled, so keep them
+    // at debug; otherwise 5xx at warn so failures surface under a warn filter.
+    if probe_endpoint {
         access_event!(debug);
     } else if status.is_server_error() {
         access_event!(warn);

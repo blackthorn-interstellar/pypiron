@@ -794,10 +794,16 @@ async fn fetch_url(
     // hop the DNS resolver can't see is refused rather than followed.
     let parsed =
         reqwest::Url::parse(url).with_context(|| format!("parsing advisory feed URL {url}"))?;
-    let resp = guarded_get_with(client, guard, parsed, None, |req| match if_none_match {
-        Some(tag) => req.header(reqwest::header::IF_NONE_MATCH, tag),
-        None => req,
-    })
+    let resp = guarded_get_with(
+        client,
+        guard,
+        parsed,
+        None,
+        |req, _hop| match if_none_match {
+            Some(tag) => req.header(reqwest::header::IF_NONE_MATCH, tag),
+            None => req,
+        },
+    )
     .await
     .with_context(|| format!("fetching {url}"))?;
     if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
@@ -1434,7 +1440,7 @@ impl ProbeSource {
         let url = format!("{}/modified_id.csv", self.base);
         let parsed = reqwest::Url::parse(&url).with_context(|| format!("parsing {url}"))?;
         let range = format!("bytes=0-{}", end.saturating_sub(1));
-        let resp = guarded_get_with(&self.client, &self.guard, parsed, None, |req| {
+        let resp = guarded_get_with(&self.client, &self.guard, parsed, None, |req, _hop| {
             let req = req.header(reqwest::header::RANGE, &range);
             match if_none_match {
                 Some(tag) => req.header(reqwest::header::IF_NONE_MATCH, tag),

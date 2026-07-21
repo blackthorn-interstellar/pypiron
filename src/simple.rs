@@ -128,23 +128,44 @@ pub enum IndexFetch {
     },
 }
 
+/// The PEP 503 simple-index root for a source `base`. A `--from` that names only
+/// the index host (`https://pypi.org`) gets the standard `/simple` appended; a
+/// base that already ends in its simple segment is honored verbatim, so a source
+/// whose listing lives off the standard path works by naming it in full. That is
+/// what lets a migration drain devpi — its per-index listing is
+/// `<base>/USER/INDEX/+simple/`, not `/simple/` — as well as Artifactory
+/// (`.../api/pypi/<repo>/simple`) and Nexus (`.../repository/<repo>/simple`).
+pub(crate) fn simple_root(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    match base.rsplit('/').next() {
+        Some("simple") | Some("+simple") => base.to_string(),
+        _ => format!("{base}/simple"),
+    }
+}
+
 /// Fetch a package's PEP 691 JSON listing from `base`, optionally conditional
 /// on a previously-seen ETag. `if_none_match` rides as `If-None-Match`; a `304`
 /// short-circuits with [`IndexFetch::NotModified`] (no body, no parse). The
 /// ETag is opaque — only ever compared for equality. `timeout` bounds the whole
 /// request for latency-sensitive callers; `None` relies on the client's own
-/// timeouts.
+/// timeouts. `auth` attaches basic-auth for an authenticated source (the listing
+/// URL is always the source host, and the client follows no redirects, so the
+/// credential never travels off-host here).
 pub async fn fetch_index_conditional(
     client: &Client,
     base: &str,
     pkg: &str,
     timeout: Option<Duration>,
     if_none_match: Option<&str>,
+    auth: Option<(&str, &str)>,
 ) -> Result<IndexFetch> {
-    let url = format!("{}/simple/{pkg}/", base.trim_end_matches('/'));
+    let url = format!("{}/{pkg}/", simple_root(base));
     let mut req = client
         .get(&url)
         .header(reqwest::header::ACCEPT, SIMPLE_JSON_CONTENT_TYPE);
+    if let Some((user, pass)) = auth {
+        req = req.basic_auth(user, Some(pass));
+    }
     if let Some(t) = timeout {
         req = req.timeout(t);
     }
@@ -215,7 +236,7 @@ pub async fn fetch_index(
     pkg: &str,
     timeout: Option<Duration>,
 ) -> Result<Option<SimpleIndex>> {
-    match fetch_index_conditional(client, base, pkg, timeout, None).await? {
+    match fetch_index_conditional(client, base, pkg, timeout, None, None).await? {
         IndexFetch::Found { index, .. } => Ok(Some(index)),
         IndexFetch::NotFound => Ok(None),
         // We sent no `If-None-Match`, so a 304 is the source misbehaving.
@@ -231,6 +252,33 @@ mod tests {
 
     fn simple_file(json: serde_json::Value) -> SimpleFile {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn simple_root_appends_or_honors_explicit_base() {
+        // Host-only source: the standard /simple path is appended.
+        assert_eq!(simple_root("https://pypi.org"), "https://pypi.org/simple");
+        assert_eq!(simple_root("https://pypi.org/"), "https://pypi.org/simple");
+        // An explicit simple base is honored as-is (no double /simple).
+        assert_eq!(
+            simple_root("https://pypi.org/simple"),
+            "https://pypi.org/simple"
+        );
+        // devpi's per-index +simple listing is honored verbatim, so a migration
+        // can name it directly as --from.
+        assert_eq!(
+            simple_root("http://127.0.0.1:3141/user/dev/+simple"),
+            "http://127.0.0.1:3141/user/dev/+simple"
+        );
+        // Artifactory / Nexus explicit simple bases, and their host-form.
+        assert_eq!(
+            simple_root("https://art/artifactory/api/pypi/repo/simple/"),
+            "https://art/artifactory/api/pypi/repo/simple"
+        );
+        assert_eq!(
+            simple_root("https://nexus/repository/repo"),
+            "https://nexus/repository/repo/simple"
+        );
     }
 
     #[test]

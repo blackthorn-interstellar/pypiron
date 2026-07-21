@@ -360,11 +360,14 @@ directly.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `--from URL` | `PYPIRON_SYNC_FROM` | `https://pypi.org` | Source simple index. |
+| `--from URL` | `PYPIRON_SYNC_FROM` | `https://pypi.org` | Source simple index. Name it in full when it lives off the standard `/simple` path (devpi: `.../<user>/<index>/+simple`). |
+| `--source-user USER` | `PYPIRON_SYNC_SOURCE_USER` | none | Username for an authenticated source (private devpi/Artifactory/Nexus). Sent only to the source host — never on an off-host redirect. Requires `--source-pass`; also `[sync].source-user`. |
+| `--source-pass PASS` | `PYPIRON_SYNC_SOURCE_PASS` | none | Password for an authenticated source. Requires `--source-user`; also `[sync].source-pass`. |
 | `--to URL` | `PYPIRON_SYNC_TO` | required | Destination pypiron URL. |
 | `--admin-user USER` | `PYPIRON_SYNC_ADMIN_USER` | none | Destination admin user. |
 | `--admin-pass PASS` | `PYPIRON_SYNC_ADMIN_PASS` | none | Destination admin password. |
 | `--private-prefix PREFIX` | `PYPIRON_PRIVATE_PREFIX` | none | Refuse to mirror private names. |
+| `--as-private` | `PYPIRON_SYNC_AS_PRIVATE` | `false` | Migrate the source into pypiron's private namespace (`origin = private`) instead of mirroring it. Timestamps and yank state are not preserved — migrated files carry the migration date. See [Migrate off another index](../guides/migrate.md). |
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | relay from `--from` | Ferry the advisory snapshot to `--to` alongside the packages. Unset relays the source server's feed (`GET <from>/advisories/feed`); a URL or path fetches that instead; `""` disables. Best-effort: a feed-less source or a destination without the endpoint warns and the package sync proceeds. Also `[sync].advisory-feed`. |
 | `--concurrency N` | `PYPIRON_SYNC_CONCURRENCY` | `4` | Transfers within one package. |
 | `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8` | Packages in parallel. |

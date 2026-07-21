@@ -252,12 +252,16 @@ pub(crate) async fn guarded_get(
     url: Url,
     timeout: Option<Duration>,
 ) -> Result<Response> {
-    guarded_get_with(client, guard, url, timeout, |req| req).await
+    guarded_get_with(client, guard, url, timeout, |req, _hop| req).await
 }
 
 /// Like [`guarded_get`], but the caller decorates each per-hop request builder —
-/// e.g. to attach a conditional `If-None-Match`. The decorator runs on every hop
-/// so the header survives redirects, and the SSRF re-validation is identical.
+/// e.g. to attach a conditional `If-None-Match`, or basic-auth scoped to one
+/// host. The decorator is handed the hop's URL alongside the builder and runs on
+/// every hop, so it can key on where the request is actually going: a credential
+/// attached only when the hop host matches the source never leaks onto an
+/// off-host redirect (a CDN, an attacker `Location`). The header/decoration
+/// survives redirects, and the SSRF re-validation is identical.
 pub(crate) async fn guarded_get_with<F>(
     client: &Client,
     guard: &Guard,
@@ -266,14 +270,14 @@ pub(crate) async fn guarded_get_with<F>(
     decorate: F,
 ) -> Result<Response>
 where
-    F: Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    F: Fn(reqwest::RequestBuilder, &Url) -> reqwest::RequestBuilder,
 {
     let mut current = url;
     for _ in 0..=MAX_REDIRECTS {
         // Re-validate every hop, including the upstream-host re-exemption (see
         // check_target): a redirect Location is as untrusted as the listing URL.
         guard.check_target(&current)?;
-        let mut req = decorate(client.get(current.clone()));
+        let mut req = decorate(client.get(current.clone()), &current);
         if let Some(t) = timeout {
             req = req.timeout(t);
         }

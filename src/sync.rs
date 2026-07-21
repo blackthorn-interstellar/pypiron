@@ -78,6 +78,17 @@ pub struct SyncArgs {
     #[arg(long = "from", env = "PYPIRON_SYNC_FROM")]
     pub src_base: Option<String>,
 
+    /// Username for an authenticated source index (a private devpi, Artifactory,
+    /// or Nexus). Attaches basic-auth to the source, scoped to the source host —
+    /// never sent on an off-host redirect. Requires `--source-pass`.
+    #[arg(long = "source-user", env = "PYPIRON_SYNC_SOURCE_USER")]
+    pub source_user: Option<String>,
+
+    /// Password for an authenticated source index. Prefer the
+    /// `PYPIRON_SYNC_SOURCE_PASS` env var over the CLI. Requires `--source-user`.
+    #[arg(long = "source-pass", env = "PYPIRON_SYNC_SOURCE_PASS")]
+    pub source_pass: Option<String>,
+
     /// Destination pypiron base URL. Sync mirrors over HTTP: each file is POSTed
     /// to the server's `/legacy/`, authenticated with the server's admin
     /// credential. Required (here or as `[sync].to`).
@@ -95,6 +106,16 @@ pub struct SyncArgs {
     /// Refuse to mirror names inside this private namespace (PEP 503-normalized)
     #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
     pub private_prefix: Option<String>,
+
+    /// Migrate the source into pypiron's *private* namespace instead of mirroring
+    /// it. Each drained package lands `origin = private` — your own package, not a
+    /// PyPI mirror — so it is served from your index and never falls through to an
+    /// upstream. Use it to move packages off a private devpi/Artifactory/Nexus.
+    /// Timestamps and yank state are not preserved: migrated files carry the
+    /// migration date. Don't combine with `--private-prefix` (a name outside the
+    /// prefix would be refused as a private upload).
+    #[arg(long = "as-private", env = "PYPIRON_SYNC_AS_PRIVATE")]
+    pub as_private: bool,
 
     /// Ferry the advisory snapshot (the OSV malware/vulnerability feed) to the
     /// destination alongside the packages. Unset (the default): relay the source
@@ -595,6 +616,55 @@ fn file_format(filename: &str) -> Format {
     }
 }
 
+/// Basic-auth for an authenticated source index, carrying the source host so
+/// the credential can be scoped to it. The one leak an unscoped credential would
+/// cause is being sent on an off-host redirect (a CDN, a hostile `Location`);
+/// [`hop_auth`] enforces the host match on every hop.
+#[derive(Debug, Clone)]
+struct SourceAuth {
+    host: String,
+    user: String,
+    pass: String,
+}
+
+/// Resolve the source basic-auth from CLI/config. Fail closed: one half of the
+/// pair without the other refuses to start (a partial credential is a
+/// misconfiguration, never a silent fall-through to an anonymous fetch), and
+/// credentials with no host to scope them to are refused.
+fn resolve_source_auth(
+    src_base: &str,
+    user: Option<String>,
+    pass: Option<String>,
+) -> Result<Option<SourceAuth>> {
+    match (user, pass) {
+        (None, None) => Ok(None),
+        (Some(user), Some(pass)) => {
+            let host = reqwest::Url::parse(src_base)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .ok_or_else(|| {
+                    anyhow!("--source-user/--source-pass set but --from '{src_base}' has no host")
+                })?;
+            Ok(Some(SourceAuth { host, user, pass }))
+        }
+        _ => bail!(
+            "--source-user and --source-pass must be set together (or [sync].source-user/source-pass) to authenticate the source index"
+        ),
+    }
+}
+
+/// The basic-auth to attach on one download hop: the source credential, but only
+/// when the hop's host matches the source. An off-host redirect gets nothing —
+/// this is what keeps the source credential from leaking to a CDN or an
+/// attacker-chosen `Location`.
+fn hop_auth<'a>(
+    source_auth: Option<&'a SourceAuth>,
+    hop: &reqwest::Url,
+) -> Option<(&'a str, &'a str)> {
+    let a = source_auth?;
+    (hop.host_str() == Some(a.host.as_str())).then_some((a.user.as_str(), a.pass.as_str()))
+}
+
 /// Everything resolved: CLI/env over pypiron.toml over defaults, all inputs
 /// parsed and validated up front.
 struct Resolved {
@@ -607,6 +677,14 @@ struct Resolved {
     dst_base: String,
     admin_user: Option<String>,
     admin_pass: Option<String>,
+    /// Basic-auth for the source index, host-scoped so it is only ever attached
+    /// to a hop whose host matches the source. `None` unless both `--source-user`
+    /// and `--source-pass` are set (a partial pair refuses startup).
+    source_auth: Option<SourceAuth>,
+    /// Migrate mode (`--as-private`): drain the source into the private namespace
+    /// (`origin = private`) rather than mirror it. Suppresses the `mirror` form
+    /// field and the mirror-only metadata, and skips yank reconcile / status relay.
+    as_private: bool,
     private_prefix: Option<String>,
     /// The advisory-feed source for the relay. `None` = relay from the sync source
     /// (on by default, gated on [`Self::src_explicit`]); `Some("")` after trim =
@@ -729,12 +807,19 @@ impl Resolved {
             .and_then(|u| u.host_str().map(str::to_string))
             .into_iter()
             .collect();
+        let source_auth = resolve_source_auth(
+            &src_base,
+            args.source_user.clone().or(sync.source_user),
+            args.source_pass.clone().or(sync.source_pass),
+        )?;
         Ok(Self {
             guard: Arc::new(crate::ssrf::Guard::new(&src_base, &dst_host, &[])?),
             src_base,
             dst_base,
             admin_user: args.admin_user.clone().or(sync.admin_user),
             admin_pass: args.admin_pass.clone().or(sync.admin_pass),
+            source_auth,
+            as_private: args.as_private,
             private_prefix: args.private_prefix.clone().or(cfg.private_prefix),
             advisory_feed,
             src_explicit,
@@ -1806,21 +1891,30 @@ async fn sync_one_package(
             })
             .map(|c| c.etag.as_str())
     };
-    let (index, etag, last_serial) =
-        match simple::fetch_index_conditional(client, &resolved.src_base, pkg, None, if_none_match)
-            .await?
-        {
-            IndexFetch::NotModified => {
-                info!("{pkg}: upstream unchanged since last sync (304)");
-                return Ok(PackageOutcome { new_cursor: None });
-            }
-            IndexFetch::NotFound => bail!("Package not found on source: {pkg}"),
-            IndexFetch::Found {
-                index,
-                etag,
-                last_serial,
-            } => (index, etag, last_serial),
-        };
+    let (index, etag, last_serial) = match simple::fetch_index_conditional(
+        client,
+        &resolved.src_base,
+        pkg,
+        None,
+        if_none_match,
+        resolved
+            .source_auth
+            .as_ref()
+            .map(|a| (a.user.as_str(), a.pass.as_str())),
+    )
+    .await?
+    {
+        IndexFetch::NotModified => {
+            info!("{pkg}: upstream unchanged since last sync (304)");
+            return Ok(PackageOutcome { new_cursor: None });
+        }
+        IndexFetch::NotFound => bail!("Package not found on source: {pkg}"),
+        IndexFetch::Found {
+            index,
+            etag,
+            last_serial,
+        } => (index, etag, last_serial),
+    };
 
     let (selected, upstream_status, upstream_files, next_eligible_at) =
         select_from_index(index, resolved, spec);
@@ -1908,56 +2002,62 @@ async fn sync_one_package(
     // until `--full`.
     let mut hold_cursor = false;
 
-    match &local {
-        Some(local) => {
-            // Reconcile mutable metadata of files already mirrored: yank
-            // set/cleared to match upstream, and files gone upstream flagged
-            // removed.
-            //
-            // A quarantined upstream (PEP 792) MUST offer no files, so its
-            // listing is empty by design — not because every file was removed.
-            // Skip reconcile then (the status relay below blocks downloads
-            // instead); flagging every file "removed upstream" would be both
-            // wrong and a storm of churn that reverts when the quarantine lifts.
-            let dest_blocks = local
-                .project_status
-                .as_ref()
-                .is_some_and(|d| d.status.blocks_downloads());
-            if !upstream_blocks {
-                if dest_blocks {
-                    // The quarantine is lifting: the dest's index is still the
-                    // frozen (empty) render, so there are no files to diff yet.
-                    // The relay below clears the freeze; hold the cursor so the
-                    // next run reconciles for real once the dest rebuilds.
-                    hold_cursor = true;
-                } else if let Err(e) =
-                    reconcile_yanks(client, resolved, pkg, local, &upstream_files).await
-                {
-                    error!(package=%pkg, error=?e, "reconcile failed");
+    // `--as-private` is a one-shot drain into the private namespace: there is no
+    // upstream to keep yank state in step with, and a private origin has no PEP
+    // 792 status to relay. Skip both — files already present were still skipped
+    // above, so a re-run stays cheap.
+    if !resolved.as_private {
+        match &local {
+            Some(local) => {
+                // Reconcile mutable metadata of files already mirrored: yank
+                // set/cleared to match upstream, and files gone upstream flagged
+                // removed.
+                //
+                // A quarantined upstream (PEP 792) MUST offer no files, so its
+                // listing is empty by design — not because every file was removed.
+                // Skip reconcile then (the status relay below blocks downloads
+                // instead); flagging every file "removed upstream" would be both
+                // wrong and a storm of churn that reverts when the quarantine lifts.
+                let dest_blocks = local
+                    .project_status
+                    .as_ref()
+                    .is_some_and(|d| d.status.blocks_downloads());
+                if !upstream_blocks {
+                    if dest_blocks {
+                        // The quarantine is lifting: the dest's index is still the
+                        // frozen (empty) render, so there are no files to diff yet.
+                        // The relay below clears the freeze; hold the cursor so the
+                        // next run reconciles for real once the dest rebuilds.
+                        hold_cursor = true;
+                    } else if let Err(e) =
+                        reconcile_yanks(client, resolved, pkg, local, &upstream_files).await
+                    {
+                        error!(package=%pkg, error=?e, "reconcile failed");
+                        errors += 1;
+                    }
+                }
+
+                // Relay PEP 792 project status regardless of the block — that relay
+                // is how the freeze reaches the dest in the first place.
+                // Authoritative for a mirror, so it both sets and clears.
+                if let Err(e) = relay_status(client, resolved, pkg, local, &upstream_status).await {
+                    error!(package=%pkg, error=?e, "status relay failed");
                     errors += 1;
                 }
             }
-
-            // Relay PEP 792 project status regardless of the block — that relay
-            // is how the freeze reaches the dest in the first place.
-            // Authoritative for a mirror, so it both sets and clears.
-            if let Err(e) = relay_status(client, resolved, pkg, local, &upstream_status).await {
-                error!(package=%pkg, error=?e, "status relay failed");
-                errors += 1;
-            }
-        }
-        None => {
-            // An older dest without `/sync/local-index`: the per-file yank set at
-            // upload time still holds, so a plain mirror is fine. But a
-            // project-level freeze (quarantine/archive/deprecate) can't be
-            // relayed — fail loud rather than silently advance the cursor over an
-            // un-enforced freeze (a later 304 would mask it forever).
-            if upstream_frozen {
-                error!(
-                    package=%pkg,
-                    "destination has no /sync/local-index endpoint; cannot relay project status — refusing to advance the cursor over an un-enforced freeze"
-                );
-                errors += 1;
+            None => {
+                // An older dest without `/sync/local-index`: the per-file yank set at
+                // upload time still holds, so a plain mirror is fine. But a
+                // project-level freeze (quarantine/archive/deprecate) can't be
+                // relayed — fail loud rather than silently advance the cursor over an
+                // un-enforced freeze (a later 304 would mask it forever).
+                if upstream_frozen {
+                    error!(
+                        package=%pkg,
+                        "destination has no /sync/local-index endpoint; cannot relay project status — refusing to advance the cursor over an un-enforced freeze"
+                    );
+                    errors += 1;
+                }
             }
         }
     }
@@ -2109,15 +2209,15 @@ fn select_from_index(
     // by `--exclude-newer`. `None` if nothing is in the cooldown.
     Option<i64>,
 ) {
-    let base_url = format!(
-        "{}/simple/{}/",
-        resolved.src_base.trim_end_matches('/'),
-        spec.name
-    );
+    // Resolve relative URLs against the SAME listing URL the fetch used (see
+    // simple_root) — an explicit `+simple`/`simple` base must climb from the
+    // right depth, or devpi's `../../+f/...` links resolve to the wrong path.
+    let base_url = format!("{}/{}/", simple::simple_root(&resolved.src_base), spec.name);
 
     // PEP 691 file URLs may be relative; resolve them (and provenance URLs)
     // against the index page so a non-PyPI source — another pypiron, whose
-    // listings are root-relative — works, not just PyPI's absolute CDN links.
+    // listings are root-relative, or devpi — works, not just PyPI's absolute CDN
+    // links.
     let base = reqwest::Url::parse(&base_url).ok();
     let resolve = |raw: &str| -> String {
         base.as_ref()
@@ -2193,6 +2293,7 @@ async fn download_provenance(
     client: &Client,
     guard: &crate::ssrf::Guard,
     url: &str,
+    source_auth: Option<&SourceAuth>,
 ) -> Option<Vec<u8>> {
     let parsed = match reqwest::Url::parse(url) {
         Ok(u) => u,
@@ -2201,16 +2302,23 @@ async fn download_provenance(
             return None;
         }
     };
-    let resp = match crate::ssrf::guarded_get(client, guard, parsed, None)
+    let resp =
+        match crate::ssrf::guarded_get_with(client, guard, parsed, None, |req, hop| match hop_auth(
+            source_auth,
+            hop,
+        ) {
+            Some((u, p)) => req.basic_auth(u, Some(p)),
+            None => req,
+        })
         .await
         .and_then(|r| r.error_for_status().map_err(Into::into))
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            warn!(%url, error=?e, "sync: provenance fetch refused/failed");
-            return None;
-        }
-    };
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!(%url, error=?e, "sync: provenance fetch refused/failed");
+                return None;
+            }
+        };
     if resp
         .content_length()
         .is_some_and(|len| len > MAX_PROVENANCE_BYTES)
@@ -2248,13 +2356,14 @@ async fn download_verified(
     guard: &crate::ssrf::Guard,
     file: &SimpleFile,
     spool_dir: &Path,
+    source_auth: Option<&SourceAuth>,
 ) -> Result<FinishedSpool> {
     let expected = file
         .sha256()
         .ok_or_else(|| anyhow!("no sha256 for {}", file.filename))?;
     let mut last_err = None;
     for attempt in 1..=DOWNLOAD_ATTEMPTS {
-        match download_once(client, guard, file, spool_dir).await {
+        match download_once(client, guard, file, spool_dir, source_auth).await {
             Ok(spool) if spool.sha256.eq_ignore_ascii_case(expected) => return Ok(spool),
             Ok(spool) => {
                 last_err = Some(anyhow!(
@@ -2287,12 +2396,18 @@ async fn download_once(
     guard: &crate::ssrf::Guard,
     file: &SimpleFile,
     spool_dir: &Path,
+    source_auth: Option<&SourceAuth>,
 ) -> Result<FinishedSpool> {
     let url = reqwest::Url::parse(&file.url)
         .with_context(|| format!("unparseable file URL for {}", file.filename))?;
-    let resp = crate::ssrf::guarded_get(client, guard, url, None)
-        .await?
-        .error_for_status()?;
+    let resp = crate::ssrf::guarded_get_with(client, guard, url, None, |req, hop| {
+        match hop_auth(source_auth, hop) {
+            Some((u, p)) => req.basic_auth(u, Some(p)),
+            None => req,
+        }
+    })
+    .await?
+    .error_for_status()?;
     let mut spool = UploadSpool::new(spool_dir).await?;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -2322,7 +2437,14 @@ async fn upload_via_http(
     s: &Selected,
 ) -> Result<bool> {
     // Held until after the POST below: dropping the spool deletes its temp file.
-    let spool = download_verified(client, &resolved.guard, &s.file, &resolved.spool_dir).await?;
+    let spool = download_verified(
+        client,
+        &resolved.guard,
+        &s.file,
+        &resolved.spool_dir,
+        resolved.source_auth.as_ref(),
+    )
+    .await?;
 
     info!("  - uploading {}", s.file.filename);
     // Stream the spool file into the multipart body instead of re-buffering it
@@ -2335,44 +2457,59 @@ async fn upload_via_http(
         .file_name(s.file.filename.clone())
         .mime_str("application/octet-stream")?;
 
-    let (yanked, yanked_reason) = match &s.file.yanked {
-        Yanked::Flag(f) => (*f, None),
-        Yanked::Reason(r) => (true, Some(r.clone())),
-    };
     let mut form = multipart::Form::new()
         .text(":action", "file_upload")
         .text("protocol_version", "1")
-        .text("mirror", "true")
         .text("name", pkg.to_string())
         .text(
             "sha256_digest",
             s.file.sha256().unwrap_or_default().to_string(),
         )
-        .text("yanked", if yanked { "true" } else { "false" })
         .part("content", part);
     // The Simple API doesn't bind files to versions; send the filename-inferred
     // one when we have it, else let the server infer it the same way.
     if let Some(v) = &s.version {
         form = form.text("version", v.clone());
     }
-    if let Some(ts) = &s.file.upload_time {
-        form = form.text("upload_time", ts.clone());
-    }
-    if let Some(reason) = &yanked_reason {
-        if !reason.trim().is_empty() {
-            form = form.text("yanked_reason", reason.trim().to_string());
-        }
-    }
     if let Some(rp) = &s.file.requires_python {
         form = form.text("requires_python", rp.clone());
     }
-    // PEP 740: forward the provenance object verbatim; the receiving server
-    // stores it as the `.provenance` companion. Best-effort and UTF-8 (the
-    // object is JSON), so a fetch failure just omits the supply-chain signal.
-    if let Some(prov_url) = &s.file.provenance {
-        if let Some(prov) = download_provenance(client, &resolved.guard, prov_url).await {
-            if let Ok(text) = String::from_utf8(prov) {
-                form = form.text("provenance", text);
+    // Mirror-only metadata. `--as-private` omits all of it: with no `mirror`
+    // field the server takes the private path (origin=private), and a non-mirror
+    // upload rejects `upload_time`/`yanked`/`yanked_reason` outright. Migrated
+    // files therefore carry the migration date, not the source's original time,
+    // and no yank state — the documented v1 trade.
+    if !resolved.as_private {
+        let (yanked, yanked_reason) = match &s.file.yanked {
+            Yanked::Flag(f) => (*f, None),
+            Yanked::Reason(r) => (true, Some(r.clone())),
+        };
+        form = form
+            .text("mirror", "true")
+            .text("yanked", if yanked { "true" } else { "false" });
+        if let Some(ts) = &s.file.upload_time {
+            form = form.text("upload_time", ts.clone());
+        }
+        if let Some(reason) = &yanked_reason {
+            if !reason.trim().is_empty() {
+                form = form.text("yanked_reason", reason.trim().to_string());
+            }
+        }
+        // PEP 740: forward the provenance object verbatim; the receiving server
+        // stores it as the `.provenance` companion. Best-effort and UTF-8 (the
+        // object is JSON), so a fetch failure just omits the supply-chain signal.
+        if let Some(prov_url) = &s.file.provenance {
+            if let Some(prov) = download_provenance(
+                client,
+                &resolved.guard,
+                prov_url,
+                resolved.source_auth.as_ref(),
+            )
+            .await
+            {
+                if let Ok(text) = String::from_utf8(prov) {
+                    form = form.text("provenance", text);
+                }
             }
         }
     }
@@ -2687,6 +2824,50 @@ fn normalize_legacy_endpoint(dst_base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_auth_resolves_and_fails_closed() {
+        // Neither half set: anonymous source, no auth.
+        assert!(resolve_source_auth("https://pypi.org", None, None)
+            .unwrap()
+            .is_none());
+        // Both set: host captured from --from for scoping.
+        let a = resolve_source_auth(
+            "http://devpi.internal:3141/team/dev/+simple",
+            Some("reader".into()),
+            Some("secret".into()),
+        )
+        .unwrap()
+        .expect("auth present");
+        assert_eq!(a.host, "devpi.internal");
+        assert_eq!((a.user.as_str(), a.pass.as_str()), ("reader", "secret"));
+        // One half without the other refuses to start (fail-closed).
+        for (u, p) in [
+            (Some("reader".to_string()), None),
+            (None, Some("secret".to_string())),
+        ] {
+            let err = resolve_source_auth("https://pypi.org", u, p).unwrap_err();
+            assert!(err.to_string().contains("must be set together"));
+        }
+    }
+
+    #[test]
+    fn hop_auth_attaches_only_on_the_source_host() {
+        let a = SourceAuth {
+            host: "devpi.internal".into(),
+            user: "reader".into(),
+            pass: "secret".into(),
+        };
+        // Same host (any port/scheme): the credential attaches.
+        let on_host = reqwest::Url::parse("http://devpi.internal:3141/team/dev/+f/x.whl").unwrap();
+        assert_eq!(hop_auth(Some(&a), &on_host), Some(("reader", "secret")));
+        // Off-host redirect (a CDN, a hostile Location): nothing — the source
+        // credential must never leave the source host.
+        let off_host = reqwest::Url::parse("https://cdn.evil.example/x.whl").unwrap();
+        assert_eq!(hop_auth(Some(&a), &off_host), None);
+        // No credential configured: nothing to attach.
+        assert_eq!(hop_auth(None, &on_host), None);
+    }
 
     #[test]
     fn ensure_http_scheme_defaults_and_preserves() {
@@ -3273,6 +3454,8 @@ mod tests {
             dst_base: "https://dest.example".to_string(),
             admin_user: None,
             admin_pass: None,
+            source_auth: None,
+            as_private: false,
             private_prefix: None,
             advisory_feed: None,
             src_explicit: false,

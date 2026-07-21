@@ -71,6 +71,7 @@ plugins:
 nav:
   - Home: index.md
   - Setup: guides/setup.md
+  - Migrate off another index: guides/migrate.md
   - How it works: concepts/how-it-works.md
   - Supply-chain defense: concepts/supply-chain.md
   - Tamper-evident checkpoints: concepts/transparency.md

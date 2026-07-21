@@ -62,6 +62,7 @@ markers = [
     "perf: performance benchmarks against the release binary (disabled by default)",
     "chaos: crash-point fault injection sweeps (slow-ish, deterministic)",
     "compat(client, feature): client compatibility coverage point for docs/reference/compatibility.md",
+    "devpi: migration tests that drive a real devpi-server (fetched via uv tool run) as the source; skip cleanly when devpi can't be fetched/started",
 ]
 # -n auto: tests isolate by uuid bucket/container/port, so they parallelize.
 # The serial-only targets (perf timing, the compat doc's result aggregation,

@@ -171,6 +171,11 @@ pub struct SyncConfig {
     pub to: Option<String>,
     pub admin_user: Option<String>,
     pub admin_pass: Option<String>,
+    /// Credentials for an authenticated source index (a private devpi,
+    /// Artifactory, or Nexus). Both are required together; prefer supplying the
+    /// password via `PYPIRON_SYNC_SOURCE_PASS`.
+    pub source_user: Option<String>,
+    pub source_pass: Option<String>,
     pub concurrency: Option<usize>,
     pub package_concurrency: Option<usize>,
     /// Advisory snapshot to ferry to the destination. Unset relays the source

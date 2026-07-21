@@ -476,6 +476,98 @@ def disk_server_fast_reconcile(tmp_path_factory, pypiron_bin: Path) -> Iterator[
     )
 
 
+# ------------------------------ devpi source ----------------------------------
+
+# devpi is the incumbent private index a migration drains from. It is not on the
+# PATH — it is fetched on demand via `uv tool run`, pinned so the fixture is
+# reproducible. Reads are anonymous; uploads require the index owner's password,
+# which is what the migration's --source-user/--source-pass exercise.
+DEVPI_SERVER_PIN = "6.15.0"
+DEVPI_CLIENT_PIN = "7.2.0"
+DEVPI_USER = "migrate"
+DEVPI_PASS = "migrate-secret"
+DEVPI_INDEX = "dev"
+
+
+def _start_devpi_server(tmp_path_factory, uv: str) -> Iterator[Dict]:
+    server_dir = tmp_path_factory.mktemp("devpi")
+    client_dir = server_dir / "client"
+    log_path = server_dir.parent / f"{server_dir.name}-devpi.log"
+    port = find_free_port()
+    base = f"http://127.0.0.1:{port}"
+
+    server_from = [uv, "tool", "run", "--from", f"devpi-server=={DEVPI_SERVER_PIN}"]
+    client_env = {**os.environ, "DEVPI_CLIENTDIR": str(client_dir)}
+
+    def devpi(*args, timeout=120):
+        run_checked(
+            [uv, "tool", "run", "--from", f"devpi-client=={DEVPI_CLIENT_PIN}", "devpi", *args],
+            env=client_env,
+            timeout=timeout,
+        )
+
+    # The first `uv tool run` fetches devpi (slow, network). If it can't be
+    # fetched or initialized (offline, cache miss), skip cleanly — the S3/compat
+    # pattern for an optional external dependency.
+    try:
+        run_checked(
+            [*server_from, "devpi-init", "--serverdir", str(server_dir)],
+            timeout=300,
+        )
+    except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        pytest.skip(f"devpi-server unavailable (cannot fetch/init): {e}")
+
+    with open(log_path, "w") as log_file:
+        proc = subprocess.Popen(
+            [
+                *server_from,
+                "devpi-server",
+                "--serverdir",
+                str(server_dir),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+            ],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            wait_http_responding(f"{base}/", timeout=60.0)
+            # Authenticated index: root creates a user with a password, the user
+            # owns a standalone index (bases= — no PyPI fallthrough), so the
+            # source holds exactly what we upload.
+            devpi("use", base)
+            devpi("login", "root", "--password", "")
+            devpi("user", "-c", DEVPI_USER, f"password={DEVPI_PASS}", "email=migrate@example.com")
+            devpi("login", DEVPI_USER, "--password", DEVPI_PASS)
+            devpi("index", "-c", DEVPI_INDEX, "bases=", "volatile=True")
+            devpi("use", f"{DEVPI_USER}/{DEVPI_INDEX}")
+            yield {
+                "base_url": base,
+                # What `pypiron sync --from` points at: devpi's per-index PEP 503
+                # listing lives at `<base>/<user>/<index>/+simple`.
+                "source": f"{base}/{DEVPI_USER}/{DEVPI_INDEX}/+simple",
+                # The legacy upload endpoint (twine speaks it), auth-gated.
+                "upload_url": f"{base}/{DEVPI_USER}/{DEVPI_INDEX}/",
+                "user": DEVPI_USER,
+                "password": DEVPI_PASS,
+                "port": port,
+                "log_path": log_path,
+                "proc": proc,
+            }
+        finally:
+            kill_process_tree(proc)
+
+
+@pytest.fixture()
+def devpi_server(tmp_path_factory, uv_path: str) -> Iterator[Dict]:
+    """A real devpi-server with an authenticated user index, as a migration
+    *source*. Fetched via `uv tool run` (pinned); skips cleanly when devpi can't
+    be fetched or started."""
+    yield from _start_devpi_server(tmp_path_factory, uv_path)
+
+
 @pytest.fixture()
 def disk_server_prefixed(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Disk server reserving the `acme` namespace for private uploads."""

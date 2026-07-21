@@ -54,6 +54,7 @@ punish them. This one I will stand behind.
 | Hard requirement: fully managed, nothing to operate | **AWS CodeArtifact** — accept single-region and no dependency cooldown |
 | Serve a folder of wheels on a LAN, nothing more | **pypiserver**, or no server at all: `pip install --find-links dir/` |
 | Staging/inheritance release workflows | **devpi** — its push/inheritance model has no pypiron equivalent |
+| Moving *off* devpi/Artifactory/Nexus onto pypiron | **pypiron** (`sync --as-private` — see [Migrate off another index](guides/migrate.md)) |
 
 ## The verification stack — why I stopped hedging
 

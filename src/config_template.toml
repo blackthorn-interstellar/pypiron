@@ -165,6 +165,10 @@
 # [mirror] table above decides WHAT gets mirrored.
 # to = "http://localhost:8080"
 # from = "https://pypi.org"                 # source PEP 691 index
+# Source credentials — set only when the source index requires auth (migrating
+# off a private devpi/Artifactory/Nexus). Prefer PYPIRON_SYNC_SOURCE_PASS.
+# source-user = "reader"
+# source-pass = "secret"                    # better: set PYPIRON_SYNC_SOURCE_PASS
 # Destination admin credential (mirroring is admin-only). Prefer supplying the
 # password via PYPIRON_SYNC_ADMIN_PASS over committing it here.
 # admin-user = "admin"

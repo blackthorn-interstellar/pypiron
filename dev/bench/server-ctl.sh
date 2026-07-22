@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # (Re)start the pypiron server in a meter mode: default | sync | proxy.
-# Reads storage/auth env from $PYPIRON_ENV_FILE (default bench/.server-env),
+# Reads storage/auth env from $PYPIRON_ENV_FILE (default dev/bench/.server-env),
 # binary path from $PYPIRON_BIN (default target/release/pypiron).
 # Used directly and as meter.py --restart-cmd. Idempotent; waits for health.
 set -euo pipefail

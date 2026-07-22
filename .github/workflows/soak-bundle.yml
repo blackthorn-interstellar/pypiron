@@ -12,7 +12,7 @@ name: Soak bundle
 on:
   push:
     branches: [master]
-    paths: [src/**, examples/vopr.rs, Cargo.toml, Cargo.lock, ops/soak/**]
+    paths: [src/**, examples/vopr.rs, Cargo.toml, Cargo.lock, dev/ops/soak/**]
   workflow_dispatch: {}
 
 permissions:
@@ -34,9 +34,9 @@ jobs:
         run: |
           mkdir -p stage
           cp target/release/examples/vopr stage/vopr
-          cp ops/soak/report.py ops/soak/install.sh ops/soak/fetch-bundle.sh \
-             ops/soak/pypiron-soak@.service ops/soak/pypiron-soak-reporter.service \
-             ops/soak/pypiron-soak-refresh.service ops/soak/pypiron-soak-refresh.timer stage/
+          cp dev/ops/soak/report.py dev/ops/soak/install.sh dev/ops/soak/fetch-bundle.sh \
+             dev/ops/soak/pypiron-soak@.service dev/ops/soak/pypiron-soak-reporter.service \
+             dev/ops/soak/pypiron-soak-refresh.service dev/ops/soak/pypiron-soak-refresh.timer stage/
           tar czf bundle.tar.gz -C stage .
       - uses: aws-actions/configure-aws-credentials@v4
         with:

@@ -18,7 +18,7 @@ info (`RUST_LOG=warn,pypiron::access=info`) with the diagnostic log quiet so it
 doesn't skew the baseline; `clf` is flag-gated and emits regardless.
 
 Usage:
-  python bench/access_log_overhead.py [--duration 3s] [--connections 50]
+  python dev/bench/access_log_overhead.py [--duration 3s] [--connections 50]
                                       [--rounds 8] [--endpoint /simple/index.json]
 """
 

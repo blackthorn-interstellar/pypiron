@@ -53,6 +53,8 @@ docs = [
 ]
 
 [tool.pytest.ini_options]
+# All regenerable local state lives under .local/ so the repo root stays legible.
+cache_dir = ".local/pytest_cache"
 markers = [
     "stress: long-running, network-heavy tests (disabled by default)",
     "integration: integration tests that may hit the network or spawn services",
@@ -74,6 +76,7 @@ testpaths = [
 
 [tool.ruff]
 line-length = 100
+cache-dir = ".local/ruff_cache"
 
 [tool.ruff.lint]
 # Deliberately minimal: pyflakes (real bugs — unused imports, undefined names)

@@ -66,7 +66,7 @@ Prereqs: `aws` configured, `docker` (for the one-time bundle build), and an S3
 bucket you own.
 
 ```bash
-cd ops/soak
+cd dev/ops/soak
 export S3_BUCKET=your-bucket
 ./fleet.sh push-bundle                 # build aarch64 vopr + upload the bundle
 EMAIL=you@example.com ./fleet.sh apply # default VPC/subnets; budget alarm to EMAIL

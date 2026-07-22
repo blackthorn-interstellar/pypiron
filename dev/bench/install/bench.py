@@ -25,7 +25,7 @@ OHA_VERSION = "v1.4.7"
 
 def ensure_oha(arch: str) -> None:
     """Download a static oha binary (matching the loadgen container arch) into
-    bench/install/.bin/oha (bind-mounted into the loadgen at /repo). Idempotent."""
+    dev/bench/install/.bin/oha (bind-mounted into the loadgen at /repo). Idempotent."""
     binary = HERE / ".bin" / "oha"
     if binary.exists():
         return

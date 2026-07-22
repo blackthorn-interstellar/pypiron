@@ -20,7 +20,7 @@ ssh "${SSH_OPTS[@]}" "$LG" "python3 pypiron/bench/meter.py seed --base-url ${BAS
 
 echo "== running meter suite"
 ssh "${SSH_OPTS[@]}" "$LG" "source ~/.cargo/env 2>/dev/null || true; \
-  cd pypiron && python3 bench/meter.py run \
+  cd pypiron && python3 dev/bench/meter.py run \
     --base-url ${BASE} \
     --duration 30s --connections 64 \
     --rig 't4g.small(unlimited)+S3 us-east-1, loadgen c7gn.4xlarge' \
@@ -31,4 +31,4 @@ ssh "${SSH_OPTS[@]}" "$LG" "source ~/.cargo/env 2>/dev/null || true; \
 
 mkdir -p "${HERE}/results"
 scp "${SSH_OPTS[@]}" "${LG}:${LABEL}.json" "${HERE}/results/${LABEL}.json"
-echo "== results in bench/results/${LABEL}.json"
+echo "== results in dev/bench/results/${LABEL}.json"

@@ -7,7 +7,7 @@ bytes when a sidecar exists. So a storage tree with 0-byte artifacts and real
 sidecars exercises exactly the same code as a real mirror, at ~1/40,000th of
 the bytes.
 
-Realism comes from the corpus downloads in bench/corpus/ (see
+Realism comes from the corpus downloads in dev/bench/corpus/ (see
 src/corpus_check.rs for provenance):
   - real project names (all 779,934 of them),
   - real files-per-project distribution (median 4, p99 262, max 43,145),

@@ -109,7 +109,7 @@ changed, nothing else happens at any scale.
 The S3 row above was extrapolation; this validates its basis on a real
 same-region bucket (us-east-1, `c7g.4xlarge`, 2026-06-12, commit `be4db39` +
 event-driven-indexer work). Corpus: the fabricated **5k tier** (5,000 packages
-/ 104,645 files / **219,298 objects**), seeded with `bench/scale.py seed` and
+/ 104,645 files / **219,298 objects**), seeded with `dev/bench/scale.py seed` and
 synced to S3. Full procedure and conditional-write validation in
 [Run 009](#run-009--2026-06-12--event-driven-audit--conditional-writes-on-real-aws-s3).
 
@@ -137,7 +137,7 @@ kept because the corpus method and the failure math are the reference.
 
 Nothing in the read or sweep path opens artifact bytes when a sidecar exists,
 so a storage tree of **0-byte artifacts + real sidecars** exercises the same
-code as a real mirror at ~1/40,000th of the disk. `bench/scale.py seed`
+code as a real mirror at ~1/40,000th of the disk. `dev/bench/scale.py seed`
 fabricates such trees using the real PyPI project names and the real
 files-per-project distribution (median 4, p90 35, p99 262, max 43,145 —
 `ddtrace`), sampled deterministically. Ground truth came from the public
@@ -262,7 +262,7 @@ Replaces the "one box could serve all of PyPI" back-of-the-envelope with a
 measurement against the real download stream. The trace is built from the public
 ClickHouse `pypi.pypi` per-download-event table (real files, real popularity,
 real installer mix, real artifact-vs-PEP 658-metadata split; sub-day arrival
-timing and `/simple/` index reads are modeled — see `bench/replay/README.md`).
+timing and `/simple/` index reads are modeled — see `dev/bench/replay/README.md`).
 
 **Rig:** single **c7i.2xlarge** (8 vCPU Sapphire Rapids, 15 GB), AL2023 kernel
 6.1, 120 GB gp3, us-east-1, **disk backend**, HEAD build (rustc 1.96.1). Corpus:
@@ -509,11 +509,11 @@ timeout is real behavior under S3-ish latency, not harness noise.
 
 ### Run 001 — 2026-06-12 — reference-rig baseline #0 (meter row 0)
 
-- Commit: `b79dd16` (src/ unmodified; bench/ harness uncommitted) · Binary built on loadgen from the same tree
+- Commit: `b79dd16` (src/ unmodified; dev/bench/ harness uncommitted) · Binary built on loadgen from the same tree
 - Rig: server `t4g.small` unlimited (single instance) + loadgen `c7gn.4xlarge`, us-east-1, bucket `pypiron-bench-<account-id>-us-east-1`
 - Config: S3 backend, `--artifact-delivery auto`, worker tick 1s, reconcile 300s — customer defaults otherwise
 - Corpus: meter preset (bench-small ×10, torchsim ×2000); seeding 2,010 files through `/legacy/` took **88s ≈ 23 files/s** (pre-M1 data point)
-- Suite: `bench/run-baseline.sh baseline-0` (oha `-z 30s -c 64`); raw JSON in `bench/results/baseline-0.json`
+- Suite: `dev/bench/run-baseline.sh baseline-0` (oha `-z 30s -c 64`); raw JSON in `dev/bench/results/baseline-0.json`
 
 | Scenario | rps | p50 ms | p95 ms | p99 ms | ok% | Notes |
 |---|---|---|---|---|---|---|
@@ -537,7 +537,7 @@ stream; everything else is the optimization backlog, in priority order.
 ### Run 004 — 2026-06-12 — Phase 2 brag box, meter shape (pre-multipart)
 
 - Commit: `b79dd16`+P1b · Rig: server `c7gn.2xlarge` (8 vCPU, 50 Gbps) + loadgen `c7gn.4xlarge`, us-east-1, same bucket/corpus
-- Suite: meter shape (oha `-z 30s -c 64`); raw JSON `bench/results/bragbox-meter.json`. NOT a meter-series row (different hardware).
+- Suite: meter shape (oha `-z 30s -c 64`); raw JSON `dev/bench/results/bragbox-meter.json`. NOT a meter-series row (different hardware).
 
 | Scenario | rps | p50 ms | p99 ms | Notes |
 |---|---|---|---|---|
@@ -553,7 +553,7 @@ stream; everything else is the optimization backlog, in priority order.
 ### Run 005 — 2026-06-12 — Phase 2 brag box, post-multipart + Tier 2
 
 - Commit: `b79dd16`+P1b+multipart · Same rig as Run 004
-- Raw JSON: `bench/results/bragbox-meter2.json`, `bench/results/tier2-bragbox.json`
+- Raw JSON: `dev/bench/results/bragbox-meter2.json`, `dev/bench/results/tier2-bragbox.json`
 
 Multipart upload effect (parallel 16 MB parts, conditional complete):
 W1 100MB wall 3.8s → **1.32s**; W1-torch 900MB wall 32.7s → **18.0s** (the
@@ -583,8 +583,8 @@ metric is EBS-bound. No code-level juice left at this tier.
 
 - Rig: server `c7gn.2xlarge` + loadgen `c7gn.4xlarge`, us-east-1, real S3
 - Corpus: 10,000 synthetic packages × 10 files seeded direct-to-S3
-  (`bench/seed_s3.py`, 320k PUTs in 657s), on top of the meter corpus
-- Raw JSON: `bench/results/phase3-medium.json` (before), `phase3-medium-fixed.json` (after)
+  (`dev/bench/seed_s3.py`, 320k PUTs in 657s), on top of the meter corpus
+- Raw JSON: `dev/bench/results/phase3-medium.json` (before), `phase3-medium-fixed.json` (after)
 
 Two scale defects found, fixed, and regression-tested:
 
@@ -659,11 +659,11 @@ Accept-Encoding by default, which silently invalidated the first attempt):
 
 - Commit: `be4db39` + this change (global-index CAS HTML-ordering fix; audit/election
   metrics) · Rig: `c7g.4xlarge` in **us-east-1**, same-region real S3 bucket (not MinIO)
-- Corpus: fabricated 5k tier via `bench/scale.py seed --packages 5000` (realistic
+- Corpus: fabricated 5k tier via `dev/bench/scale.py seed --packages 5000` (realistic
   files-per-project distribution, RNG seed 42) → **5,000 packages / 104,645 files /
   219,298 objects** (209,290 truth + 10,004 views), synced with `aws s3 sync`
-- Scripts: `bench/s3_cas_validate.py`, `bench/s3_scale_measure.py`,
-  `bench/s3_upload_during_steady.py`
+- Scripts: `dev/bench/s3_cas_validate.py`, `dev/bench/s3_scale_measure.py`,
+  `dev/bench/s3_upload_during_steady.py`
 
 **Conditional writes — validated against the real thing.** MinIO only approximates
 S3's `If-None-Match`/`If-Match`; this confirms S3 returns the precondition errors
@@ -705,7 +705,7 @@ Template:
 ### Run NNN — YYYY-MM-DD — <short description>
 
 - Commit: `<sha>` · Rig: <server instance> + <loadgen instance>, <region> · Corpus: <preset>
-- Suite: <meter | tier-1 | ...> · Command: `bench/run.sh <suite>`
+- Suite: <meter | tier-1 | ...> · Command: `dev/bench/run.sh <suite>`
 
 | Scenario | rps | p50 | p95 | p99 | RSS peak | Notes |
 |---|---|---|---|---|---|---|

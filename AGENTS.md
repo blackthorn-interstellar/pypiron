@@ -4,6 +4,26 @@ pypiron is a single-crate Rust PyPI server (index, upload, mirror, on-demand
 proxy). Truth is files on disk/S3; indexes are regenerable views. One binary, no
 database. The guiding bias is against complexity: the best code is no code.
 
+## Where things live
+```
+src/        the crate (src/assets/ holds the bytes embedded in the binary)
+tests/      Python blackbox suite — the real binary over HTTP
+examples/   the vopr simulator + user-facing mirror config recipes
+fuzz/       cargo-fuzz targets
+docs/       the user manual (mkdocs site; docs/.overrides is theme, not a page)
+dev/        everything contributor-facing: design/testing docs, bench/, ops/, scripts/
+private/    a separate, gitignored git repo — see below
+.local/     all regenerable local state (dev data dir, mkdocs build, tool caches)
+```
+Root-level files are the ones their tooling requires there. Keep it that way:
+new scripts go in `dev/scripts/`, new contributor docs in `dev/`.
+
+`private/` is its own git repo nested in the checkout and gitignored by this
+one — unpublished strategy, competitive research, session history. Read and
+edit it like any other file; commit with `git -C private`. Nothing there can
+reach this repo's history. Anything a contributor needs to build, test, or
+reason about pypiron belongs in `dev/` instead.
+
 ## Before you finish
 - Run `make check` (format, `cargo check`, clippy `-D warnings`, Rust unit tests)
   and fix everything it reports. A change isn't done until it passes.
@@ -47,4 +67,4 @@ database. The guiding bias is against complexity: the best code is no code.
 - Conventional commits; spell out `feature` (not `feat`). Bug-fix messages state
   the root cause and how it was addressed.
 - The repo version stays `0.0.0`; real versions come from `vX.Y.Z` git tags and
-  are stamped by CI. See [RELEASE.md](RELEASE.md).
+  are stamped by CI. See [RELEASE.md](dev/RELEASE.md).

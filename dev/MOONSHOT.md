@@ -136,7 +136,7 @@ beside artifacts, an append-only history any client can audit.
   published uptime, Prometheus dashboards, hourly `verify-index` on a status
   page, honest incident write-ups. Compresses "no fleet history" into "watch
   the history accumulate."
-- **Traffic replay bench** (`bench/replay/`) — real PyPI download events
+- **Traffic replay bench** (`dev/bench/replay/`) — real PyPI download events
   replayed at multiples of real pace; replaces the capacity arithmetic with a
   measurement. Built; AWS-rig run pending.
 - **Attestation verification** — verify PEP 740 provenance at ingest instead of

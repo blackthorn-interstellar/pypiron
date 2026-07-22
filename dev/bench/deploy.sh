@@ -25,7 +25,7 @@ wait_ssh "$LG"; wait_ssh "$SV"
 echo "== syncing source to loadgen"
 rsync -az -e "ssh ${SSH_OPTS[*]}" --delete \
   --exclude target --exclude .git --exclude data --exclude downloaded --exclude dist \
-  --exclude bench/.keys --exclude bench/.rig.env --exclude bench/results \
+  --exclude dev/bench/.keys --exclude dev/bench/.rig.env --exclude dev/bench/results \
   "${REPO}/" "${LG}:pypiron/"
 
 echo "== building on loadgen + installing oha"

@@ -78,7 +78,7 @@ kinds of evidence, each one checkable by you:
   node crashes parked at every storage-operation boundary, partitions,
   hostile-upstream corruption — is derived from a seed, so any failure
   replays exactly, down to the byte. It re-runs seeds against itself to prove
-  its own determinism. An always-on cloud fleet (`ops/soak/`) runs it
+  its own determinism. An always-on cloud fleet (`dev/ops/soak/`) runs it
   `--forever` with rotating topologies, deduplicates findings by signature,
   and feeds a verified auto-fixer. During development this harness caught
   real bugs — each one fixed and its class gated. The current standing count

@@ -20,10 +20,10 @@ build:  ## Build the project in release mode
 dev:  ## Build the project in development mode
 	cargo build
 
-run:  ## Run a local dev server (./data, admin/secret, http://127.0.0.1:8080)
+run:  ## Run a local dev server (./.local/data, admin/secret, http://127.0.0.1:8080)
 	cargo run --release -- \
 		--bind-addr 127.0.0.1:8080 \
-		--data-dir ./data \
+		--data-dir ./.local/data \
 		--admin-user admin \
 		--admin-pass secret \
 		--worker-interval-secs 1
@@ -59,12 +59,12 @@ cargo-check:  ## Check the project for compilation errors
 af: fmt
 fmt:  ## Format Rust (rustfmt) and Python (ruff: sort imports, then format)
 	cargo fmt --all
-	uv run -- ruff check --fix tests bench scripts
-	uv run -- ruff format tests bench scripts
+	uv run -- ruff check --fix tests dev/bench dev/scripts
+	uv run -- ruff format tests dev/bench dev/scripts
 
 lint:  ## Run clippy and ruff lints
 	cargo clippy --all-targets -- -D warnings
-	uv run -- ruff check tests bench scripts
+	uv run -- ruff check tests dev/bench dev/scripts
 
 audit:  ## Scan Cargo.lock for security advisories (needs cargo-audit: cargo install cargo-audit)
 	# Fails on any advisory except the two acknowledged below, both quick-xml DoS:
@@ -100,7 +100,7 @@ docs-serve:  ## Live-preview the docs site at http://127.0.0.1:8000
 	uv run --group docs -- mkdocs serve
 
 docs-truth: dev  ## Advisory: flag/env/default drift between the CLI and configuration.md/config_template.toml (not in `check`)
-	uv run -- python scripts/check_docs.py --bin target/debug/pypiron
+	uv run -- python dev/scripts/check_docs.py --bin target/debug/pypiron
 
 build-wheel:  ## Build Python wheel (local smoke-testing; releases happen in CI via git tag)
 	# Same as CI: rewrite the README's relative links/logo to absolute URLs so the
@@ -108,12 +108,12 @@ build-wheel:  ## Build Python wheel (local smoke-testing; releases happen in CI 
 	# (the trap runs even if the build fails).
 	@cp README.md README.md.orig; \
 	trap 'mv -f README.md.orig README.md' EXIT; \
-	uv run -- python scripts/transform_readme.py --target pypi && \
+	uv run -- python dev/scripts/transform_readme.py --target pypi && \
 	uv run -- maturin build --release
 
 TO ?= HEAD
 release-notes:  ## Preview release notes (TO=HEAD, optional FROM=vX.Y.Z TAG=vX.Y.Z)
-	@uv run -- python scripts/release_notes.py $(if $(FROM),--from $(FROM),) --to $(TO) $(if $(TAG),--tag $(TAG),)
+	@uv run -- python dev/scripts/release_notes.py $(if $(FROM),--from $(FROM),) --to $(TO) $(if $(TAG),--tag $(TAG),)
 
 # Coverage-guided fuzzing of the input-parsing modules (needs nightly +
 # `cargo install cargo-fuzz`). TARGET=fuzz_names|fuzz_wheel|fuzz_wheelzip|fuzz_render|
@@ -130,15 +130,16 @@ fuzz-build:  ## Compile all fuzz targets (CI smoke test)
 # Rotates through every topology (nodes 2-3, buckets 1-3, fault + crash-only),
 # prints a progress heartbeat every minute, and on a failure logs the exact
 # `--seed N` reproduce command and keeps exploring. Everything is also appended
-# to vopr-soak.log so findings survive the terminal. Ctrl-C to stop. On macOS,
+# to .local/vopr-soak.log so findings survive the terminal. Ctrl-C to stop. On macOS,
 # `caffeinate -i make vopr-soak` keeps the box awake. VOPR_SECS timeboxes
 # instead of running forever (exits non-zero if any seed failed).
 VOPR_SECS ?=
 vopr-soak:  ## Run the deterministic simulator continuously across rotating topologies (VOPR_SECS=n to timebox)
+	@mkdir -p .local
 	set -o pipefail; cargo run --release --example vopr -- \
 		$(if $(VOPR_SECS),--max-secs $(VOPR_SECS),--forever) \
 		--rotate --recheck-every 500 --start-seed $$(date +%s) \
-		2>&1 | tee -a vopr-soak.log
+		2>&1 | tee -a .local/vopr-soak.log
 
 help:  ## Display this help message
 	@grep -h -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'

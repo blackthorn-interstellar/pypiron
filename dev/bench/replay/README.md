@@ -11,20 +11,20 @@ ceiling — on a real NIC it's a ~1 % keepalive p99 tail (p50 sub-ms); see
 [Measured on AWS](#measured-on-aws-c7i2xlarge) and the
 [fleet root-cause](../../dev/BENCHMARK_RESULTS.md#traffic-replay-one-box-vs-pypis-real-request-stream).
 
-The pipeline is three stdlib scripts, in the shape of `bench/meter.py` and
-`bench/scale.py`:
+The pipeline is three stdlib scripts, in the shape of `dev/bench/meter.py` and
+`dev/bench/scale.py`:
 
 ```sh
 # 1. pull a real trace from the public ClickHouse PyPI dataset (~1-2 min)
-uv run -- python bench/replay/trace_build.py --requests 1000000 --date 2026-06-28
+uv run -- python dev/bench/replay/trace_build.py --requests 1000000 --date 2026-06-28
 
 # 2. fabricate just the artifacts the trace touches into a data dir
-uv run -- python bench/replay/seed.py --data-dir /tmp/replay --max-artifact-mb 0
+uv run -- python dev/bench/replay/seed.py --data-dir /tmp/replay --max-artifact-mb 0
 
 # 3. boot pypiron against it, then replay at recorded pace and faster
 target/release/pypiron serve --data-dir /tmp/replay --admin-user admin \
   --admin-pass secret --bind-addr 127.0.0.1:8080 &
-uv run -- python bench/replay/replay.py --speed 1,2,5 --connections 64
+uv run -- python dev/bench/replay/replay.py --speed 1,2,5 --connections 64
 ```
 
 ## What's real and what's modeled

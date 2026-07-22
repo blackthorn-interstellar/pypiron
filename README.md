@@ -17,7 +17,7 @@ pypiron is the fastest, most reliable PyPI server (and mirror) available.
 </p>
 
 - **100×+ faster than any PyPI server.** 8,288 verified installs/s on 2 vCPU.
-- **Serves PyPI-scale traffic — measured, not extrapolated.** Replaying PyPI's real download stream, one 8-vCPU box handles the index at ~200,000 requests/s with p99 under 3 ms — about double PyPI's global average ([bench/replay](bench/replay/)).
+- **Serves PyPI-scale traffic — measured, not extrapolated.** Replaying PyPI's real download stream, one 8-vCPU box handles the index at ~200,000 requests/s with p99 under 3 ms — about double PyPI's global average ([dev/bench/replay](dev/bench/replay/)).
 - **Dependency cooldown, on by default.** New releases wait 7 days. Most attacks surface first.
 - **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
 - **Scales to a fleet.** Point any number of nodes at one bucket. No coordination.
@@ -64,7 +64,7 @@ Anyone can post a benchmark chart. pypiron is validated end-to-end, adversariall
 - **A fleet in a bottle, every night.** Deterministic simulation runs a whole multi-node fleet single-threaded on virtual time — on the order of a hundred thousand seeded crash/fault/restart schedules per night, every failure [reproducible from an 8-byte seed](dev/TESTING.md#deterministic-simulation-the-vopr) ([the simulator](examples/vopr.rs)).
 - **Fuzzed nightly, audited on every PR.** Coverage-guided fuzzers hammer the parsers that eat attacker-controlled bytes [every night](.github/workflows/fuzz.yml); a new advisory anywhere in the dependency tree [fails the build](.github/workflows/ci.yml).
 - **Audited until the findings ran dry.** Fable 5 — Anthropic's frontier model — ran security audit pass after security audit pass until they came back clean. All told, over $7,000 of frontier-model compute (at API list prices) went into building and hardening pypiron.
-- **Benchmarks with nothing to hide.** The chart above comes from [published docker-compose rigs](bench/install/) for all five competitors. Re-run it. We'll wait.
+- **Benchmarks with nothing to hide.** The chart above comes from [published docker-compose rigs](dev/bench/install/) for all five competitors. Re-run it. We'll wait.
 
 ## Comparison
 

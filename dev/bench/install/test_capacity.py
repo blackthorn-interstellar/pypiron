@@ -1,6 +1,6 @@
 """Unit tests for capacity.analyze_ramp (the one pure function — ramp -> verdict).
 
-Run: uv run -- pytest bench/install/test_capacity.py
+Run: uv run -- pytest dev/bench/install/test_capacity.py
 (Not part of `make check`'s blackbox suite, which targets tests/.)
 """
 

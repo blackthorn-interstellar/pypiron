@@ -5,7 +5,7 @@ models each server's throughput-vs-concurrency curve, and hand-built oha/proc-st
 fixtures exercise the parsers, so we prove the search converges on the WHEEL-count
 knee and classifies the bottleneck without spending an AWS fleet.
 
-Run: uv run -- pytest bench/install/test_mn_ramp.py
+Run: uv run -- pytest dev/bench/install/test_mn_ramp.py
 (Not part of `make check`'s blackbox suite, which targets tests/.)
 """
 

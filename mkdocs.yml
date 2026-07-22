@@ -4,13 +4,18 @@ site_author: Blackthorn Interstellar
 site_url: https://pypiron.com/
 copyright: Copyright &copy; 2025 Blackthorn Interstellar
 
+# Build output lands under .local/ with the rest of the regenerable local state.
+site_dir: .local/site
+
 repo_url: https://github.com/blackthorn-interstellar/pypiron
 repo_name: blackthorn-interstellar/pypiron
 edit_uri: edit/master/docs/
 
 theme:
   name: material
-  custom_dir: overrides
+  # Dot-prefixed so mkdocs skips it when walking docs_dir (it's a template
+  # directory, not a page).
+  custom_dir: docs/.overrides
   logo: assets/pypiron-logo-256.png
   favicon: assets/pypiron-logo-256.png
   features:

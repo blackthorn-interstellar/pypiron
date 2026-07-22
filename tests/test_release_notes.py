@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def load_release_notes():
-    path = Path(__file__).parents[1] / "scripts" / "release_notes.py"
+    path = Path(__file__).parents[1] / "dev" / "scripts" / "release_notes.py"
     spec = importlib.util.spec_from_file_location("release_notes", path)
     assert spec is not None
     assert spec.loader is not None

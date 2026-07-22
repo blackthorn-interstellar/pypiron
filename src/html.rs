@@ -28,14 +28,14 @@ use crate::sidecar::Yanked;
 
 /// Downscaled logo (110×128, ~26 KB), embedded so the page makes zero external
 /// requests. The full-resolution asset stays in `docs/`.
-const LOGO_PNG: &[u8] = include_bytes!("../assets/pypiron-logo-128.png");
+const LOGO_PNG: &[u8] = include_bytes!("assets/pypiron-logo-128.png");
 
 /// Multi-size favicon (16/32/48) carved from the logo, embedded so the browser's
 /// automatic `/favicon.ico` request is answered from memory (and never 404s into
 /// the fallback log). Regenerate from the square original with:
 /// `magick dev/pypiron-logo-orig.png -background none \
-///   -define icon:auto-resize=48,32,16 assets/favicon.ico`
-pub const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
+///   -define icon:auto-resize=48,32,16 src/assets/favicon.ico`
+pub const FAVICON_ICO: &[u8] = include_bytes!("assets/favicon.ico");
 
 /// The logo as a `data:` URI, base64-encoded once on first use.
 fn logo_data_uri() -> &'static str {

@@ -1,17 +1,20 @@
+# All regenerable local state — dev server data dir, mkdocs build, tool caches,
+# the vopr soak log — lands here so the repo root stays legible.
+/.local/
+
 # Rust
 /target
 .cargo/
 
 # Python
-/downloaded
 /dist
-.test-venv
 *.pyc
 __pycache__/
 *.egg-info/
 .eggs/
 *.whl
 *.tar.gz
+.venv/
 
 # Build artifacts
 build/
@@ -24,43 +27,32 @@ build/
 
 # macOS
 .DS_Store
-pypiron-data/
+
 # Bench harness local state
-bench/.keys/
-bench/.server-env
-bench/.rig.env
-bench/results/
-/data/
+dev/bench/.keys/
+dev/bench/.server-env
+dev/bench/.rig.env
+dev/bench/results/
 # Bulk PyPI corpus downloads (95MB+, see src/corpus_check.rs)
-bench/corpus/
+dev/bench/corpus/
 # Install-bench: downloaded wheels + results are regenerable from lock/ (committed)
-bench/install/wheelhouse/
-bench/install/results/
+dev/bench/install/wheelhouse/
+dev/bench/install/results/
 # downloaded oha load-tester binary
-bench/install/.bin/
+dev/bench/install/.bin/
 # rig state: instance IPs, bucket name, SSH key — never commit
-bench/install/.keys/
-bench/install/.rig.env
-bench/install/.rig2.env*
+dev/bench/install/.keys/
+dev/bench/install/.rig.env
+dev/bench/install/.rig2.env*
 # aarch64 corpus is generated on demand for local validation; x86_64 is committed
-bench/install/lock/aarch64/
+dev/bench/install/lock/aarch64/
 # generated at run time from the manifest / rig env
-bench/install/compose/bandersnatch.gen.conf
-bench/install/compose/pypicloud-config-dynamo.gen.ini
+dev/bench/install/compose/bandersnatch.gen.conf
+dev/bench/install/compose/pypicloud-config-dynamo.gen.ini
+
 # Transient README backup from `make build-wheel`'s transform/restore
 /README.md.orig
 
-# mkdocs build output (regenerable; published via CI)
-/site/
-
-# Internal security audit — kept locally, not published (see SECURITY.md for disclosure)
-dev/SECURITY_AUDIT.md
-# Landscape report: generated output + source kept locally, regenerated via dev/landscape/compile.py
-dev/landscape/
-# Launch/marketing strategy — kept local, not published
-/marketing/
-dev/marketing/
-
-# Local marketing notes (not shipped)
-dev/MARKETING.md
-vopr-soak.log
+# Nested private repo: unpublished docs, scripts, and strategy. Has its own
+# .git, and is never part of this repo's history.
+/private/

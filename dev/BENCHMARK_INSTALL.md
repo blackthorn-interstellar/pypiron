@@ -6,8 +6,8 @@ proxpi** — on the same workload, each set up the way you would actually run it
 
 This is the C2/C3 `uv pip install` tier named in
 [BENCHMARKS.md](BENCHMARKS.md#tier-4--absurd-load--chaos-the-demo). It lives in
-`bench/install/` as a **new** family; it does not touch the frozen
-[`bench/meter.py`](../bench/meter.py) (whose shape is comparability-load-bearing).
+`dev/bench/install/` as a **new** family; it does not touch the frozen
+[`dev/bench/meter.py`](bench/meter.py) (whose shape is comparability-load-bearing).
 House style is inherited: stdlib-only Python, real `uv`/`pip`/`twine` clients,
 real wheels, results as `{"meta","results"}` JSON + a markdown table.
 
@@ -84,7 +84,7 @@ compose stacks run in both places; only the AWS run yields citable absolutes
 (per [BENCHMARKS.md](BENCHMARKS.md): disk numbers are host-dependent, a loose
 floor).
 
-- **Topology** (extends [`bench/aws-up.sh`](../bench/aws-up.sh)): one
+- **Topology** (extends [`dev/bench/aws-up.sh`](bench/aws-up.sh)): one
   **server-under-test** instance + one oversized **loadgen** instance (runs
   `uv`, never the suspect), same VPC/AZ, us-east-1. **Exactly one server runs at
   a time** on the identically-sized instance; servers are torn down and the next
@@ -177,7 +177,7 @@ apply uniformly.
 ## 4. Corpus (frozen, reproducible)
 
 ### 4.1 Selection (~100 projects)
-`bench/install/lock/projects.toml` — a curated list balancing popularity and
+`dev/bench/install/lock/projects.toml` — a curated list balancing popularity and
 dependency realism: web frameworks, data/sci, DL, data-eng, DB drivers, cloud
 SDKs, http/validation, CLI, testing, plus a **heavy-native quota** (numpy, scipy,
 pandas, pyarrow, torch, scikit-learn, pydantic-core, cryptography, grpcio,
@@ -200,9 +200,9 @@ only on an explicit committed bump.
 
 ### 4.4 Committed vs seeded
 Commit (small text): `projects.toml`, `corpus-*.pylock.toml`, `closures/*.txt`
-under `bench/install/lock/` (a non-ignored path — `bench/corpus/` is gitignored).
+under `dev/bench/install/lock/` (a non-ignored path — `dev/bench/corpus/` is gitignored).
 **Never commit wheels.** `wheelhouse.py` downloads the union into
-`bench/install/wheelhouse/` (gitignored) and sha256-verifies against the lock —
+`dev/bench/install/wheelhouse/` (gitignored) and sha256-verifies against the lock —
 the single shared byte source every private host is seeded from; proxies/mirrors
 warm-by-install pinned to the same lock so their caches converge on the same
 files.
@@ -274,10 +274,10 @@ server-side bytes.
 ## 8. Layout
 
 ```
-bench/install/
+dev/bench/install/
   lock/                  # COMMITTED: projects.toml, corpus-*.pylock.toml, closures/*.txt
   compose/               # docker-compose.<system>.yml + configs (nginx-devpi.conf, config.ini, bandersnatch.conf, nginx-bander.conf)
-  benchlib.py            # shared helpers (reuses bench/meter.py)
+  benchlib.py            # shared helpers (reuses dev/bench/meter.py)
   corpus.py              # selection -> projects.toml
   freeze.py              # uv compile/export -> lock/
   wheelhouse.py          # download union -> wheelhouse/, sha256-verify
@@ -327,7 +327,7 @@ teardown pattern and the seeded sampler.
 
 ## 9. Results
 
-`{"meta": {...}, "results": {...}}` to `bench/install/results/` + a markdown
+`{"meta": {...}, "results": {...}}` to `dev/bench/install/results/` + a markdown
 table to stdout. `meta` adds: `track` (1|2), `corpus_tier`, `uv_version`,
 `python`, `matrix`, `sampler_seed`, `sampling_mode`, `concurrency`, per-server
 image digest, pypiron commit. Headline table appended to a **new** section of

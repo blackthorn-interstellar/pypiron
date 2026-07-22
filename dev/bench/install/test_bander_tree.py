@@ -1,5 +1,5 @@
 """Unit tests for bander_tree (static bandersnatch-shaped tree from the
-wheelhouse). Run: uv run -- pytest bench/install/test_bander_tree.py"""
+wheelhouse). Run: uv run -- pytest dev/bench/install/test_bander_tree.py"""
 
 from __future__ import annotations
 

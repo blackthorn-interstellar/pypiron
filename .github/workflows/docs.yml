@@ -37,7 +37,8 @@ jobs:
         run: uv run --group docs -- mkdocs build --strict
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
-          path: site
+          # mkdocs.yml sets site_dir to .local/site.
+          path: .local/site
 
   deploy:
     name: deploy (github pages)

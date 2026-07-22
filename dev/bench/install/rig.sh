@@ -14,10 +14,10 @@
 #   up       provision bucket + IAM + SG + key + instance (Docker via user-data)
 #   deploy   rsync repo, build pypiron image, fetch the wheelhouse on the box
 #   run S..  run bench.py for each server (default: all six), Track 1
-#   results  scp the results JSON back to bench/install/results/
+#   results  scp the results JSON back to dev/bench/install/results/
 #   down     terminate the instance (keeps bucket/IAM/key for reuse)
 #
-# Reuses the proven plumbing shape of bench/aws-up.sh. Writes bench/install/.rig.env.
+# Reuses the proven plumbing shape of dev/bench/aws-up.sh. Writes dev/bench/install/.rig.env.
 set -euo pipefail
 
 REGION="${RIG_REGION:-us-east-1}"

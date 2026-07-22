@@ -10,9 +10,9 @@ described:
 
 It is mechanical on purpose — flags, env vars, defaults, template keys, not
 prose — so it stays quiet unless a real rename or default change slips past the
-docs. Stdlib only, like scripts/transform_readme.py. Run from the repo root:
+docs. Stdlib only, like dev/scripts/transform_readme.py. Run from the repo root:
 
-    python scripts/check_docs.py --bin target/debug/pypiron
+    python dev/scripts/check_docs.py --bin target/debug/pypiron
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 [package]
 name = "pypiron"
 # Permanent placeholder: real versions come from git tags (vX.Y.Z).
-# CI stamps the tag version in before building wheels. See RELEASE.md.
+# CI stamps the tag version in before building wheels. See dev/RELEASE.md.
 version = "0.0.0"
 edition = "2021"
 

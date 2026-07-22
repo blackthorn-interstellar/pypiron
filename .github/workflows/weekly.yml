@@ -53,18 +53,18 @@ jobs:
       # (17M rows). The ClickHouse playground caps demo queries at 100k result
       # rows, so CI uses a pinned snapshot published as a release asset. To
       # refresh: export per the src/corpus_check.rs module docs, then
-      # `gh release create corpus-<date> bench/corpus/pypi-files.tsv.gz` and
+      # `gh release create corpus-<date> dev/bench/corpus/pypi-files.tsv.gz` and
       # update the tag here. Long-running; not a merge gate.
       - name: Download corpus snapshot (release asset)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p bench/corpus
+          mkdir -p dev/bench/corpus
           gh release download corpus-2026-06-12 \
             --repo "$GITHUB_REPOSITORY" \
             --pattern pypi-files.tsv.gz \
-            --output bench/corpus/pypi-files.tsv.gz
-          ls -lh bench/corpus/pypi-files.tsv.gz
+            --output dev/bench/corpus/pypi-files.tsv.gz
+          ls -lh dev/bench/corpus/pypi-files.tsv.gz
       - name: Corpus check against full PyPI metadata
         run: cargo test --release corpus_full_pypi -- --ignored --nocapture
 

@@ -26,7 +26,7 @@ marketing; we don't do marketing.
   the S3 code path (and its op counts) is what's always being measured.
 - **Baseline before bandage.** No performance change touches `src/` until
   reference-rig baseline #0 is recorded in BENCHMARK_RESULTS.md. Until that
-  row exists, the only thing being built is `bench/` tooling. Optimizing
+  row exists, the only thing being built is `dev/bench/` tooling. Optimizing
   before measuring would orphan every "after" of its "before" — the one
   mistake this whole document exists to prevent.
 - **The loadgen is never the suspect.** Size the load-creation rig as big as
@@ -175,7 +175,7 @@ scoped IAM user (EC2 + one bucket), never account root.
 - **Load gen:** 1–2 × `c7gn.4xlarge` running `oha` (plus `uv` for C2/C3).
   Scale loadgen until the *server* is the bottleneck, never assume.
 - **S3:** same region, gateway VPC endpoint (free, and removes NAT noise).
-- **Repeatability:** one `bench/aws-up.sh` → instance IDs + IPs; `bench/run.sh
+- **Repeatability:** one `dev/bench/aws-up.sh` → instance IDs + IPs; `dev/bench/run.sh
   <suite>` rsyncs the pinned binary, runs, pulls JSON results; `aws-down.sh`.
 - **Cost honesty:** spot c7gn.2xlarge ≈ $0.25/hr; a full Tier-1+2 session
   < $5. Seeding `large` (~3M PUTs) ≈ $15 one-time into a keep-around bucket;
@@ -187,12 +187,12 @@ scoped IAM user (EC2 + one bucket), never account root.
 
 ## Deliverables
 
-- `bench/` — corpus generator, run scripts, AWS up/down, results collector.
+- `dev/bench/` — corpus generator, run scripts, AWS up/down, results collector.
   Plain scripts, no framework.
 - `docs/BENCHMARK_RESULTS.md` — append-only log: the meter series (one row of
   headline numbers per run, any two rows comparable), full per-run detail,
   and an improvements log pairing every optimization with its before/after.
 - README "Performance" section — the brag sheet, every claim linking to a
   results row.
-- `make perf` stays as the loose local regression floor; the `bench/` suite is
+- `make perf` stays as the loose local regression floor; the `dev/bench/` suite is
   where absolute numbers live.

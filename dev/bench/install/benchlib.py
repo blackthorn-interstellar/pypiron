@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Shared helpers for the realistic install benchmark (bench/install/).
+"""Shared helpers for the realistic install benchmark (dev/bench/install/).
 
-Stdlib only, like meter.py. Reuses the frozen bench/meter.py helpers by path
+Stdlib only, like meter.py. Reuses the frozen dev/bench/meter.py helpers by path
 import rather than duplicating them — meter.py must not be edited (its shape is
 comparability-load-bearing for the meter series).
 """
@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List
 
-HERE = Path(__file__).resolve().parent  # bench/install
+HERE = Path(__file__).resolve().parent  # dev/bench/install
 BENCH = HERE.parent  # bench
 REPO = BENCH.parent  # repo root
 LOCK = HERE / "lock"

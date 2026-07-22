@@ -10,7 +10,7 @@
 //!   -H 'Accept-Encoding: gzip' \
 //!   --data 'SELECT name, version, filename, packagetype FROM pypi.projects
 //!           ORDER BY name, filename FORMAT TSV' \
-//!   -o bench/corpus/pypi-files.tsv.gz
+//!   -o dev/bench/corpus/pypi-files.tsv.gz
 //! ```
 //!
 //! Run with: `cargo test --release corpus_full_pypi -- --ignored --nocapture`
@@ -250,10 +250,10 @@ mod tests {
     /// regression that worsens real-world coverage fails loudly. Requires the
     /// corpus download (see module docs); ignored by default.
     #[test]
-    #[ignore = "needs bench/corpus/pypi-files.tsv.gz (95MB download)"]
+    #[ignore = "needs dev/bench/corpus/pypi-files.tsv.gz (95MB download)"]
     fn corpus_full_pypi() {
         let corpus =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bench/corpus/pypi-files.tsv.gz");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dev/bench/corpus/pypi-files.tsv.gz");
         let report = run(&corpus);
         report.print();
 

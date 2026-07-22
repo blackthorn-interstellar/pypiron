@@ -5,16 +5,10 @@ target/
 .github/
 docs/
 tests/
-bench/
+dev/
 fuzz/
-data/
-dist/
-downloaded/
-pypiron-data/
+.local/
 .venv/
-.test-venv/
-.pytest_cache/
-.ruff_cache/
 .claude/
 .cargo/
 *.whl
@@ -25,4 +19,3 @@ pypiron-data/
 pyproject.toml
 uv.lock
 README.md
-RELEASE.md

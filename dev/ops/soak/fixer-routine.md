@@ -36,7 +36,7 @@ routine needs AWS creds (list/move findings) and its own GitHub push creds.
 > 2. For each finding object:
 >    a. Read it (`aws s3 cp … -`); it has `repro`, `title`, `signature`.
 >    b. Claim it: `aws s3 mv` it to `soak/findings-fixing/` (a lightweight lock).
->    c. Run the `vopr-verified-fix` Workflow (ops/soak/verify_fix.workflow.js)
+>    c. Run the `vopr-verified-fix` Workflow (dev/ops/soak/verify_fix.workflow.js)
 >       with `{ repro, signature, commit: true }`.
 >    d. On the returned `outcome`:
 >       - `committed` → `aws s3 mv` the object to `soak/findings-resolved/`. (The

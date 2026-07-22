@@ -2,7 +2,7 @@
 # Stand up the reference rig in us-east-1:
 #   server  = t4g.small (unlimited credits) + instance profile scoped to the bench bucket
 #   loadgen = c7gn.4xlarge (deliberately oversized; the loadgen is never the suspect)
-# Writes connection info to bench/.rig.env. Idempotent-ish: reuses IAM/SG/bucket/keypair.
+# Writes connection info to dev/bench/.rig.env. Idempotent-ish: reuses IAM/SG/bucket/keypair.
 set -euo pipefail
 
 REGION=us-east-1
@@ -110,5 +110,5 @@ export RIG_SERVER_IP=$(q "$SERVER_ID" PublicIpAddress)
 export RIG_SERVER_PRIVATE_IP=$(q "$SERVER_ID" PrivateIpAddress)
 export RIG_LOADGEN_IP=$(q "$LOADGEN_ID" PublicIpAddress)
 EOF
-echo "== rig up; wrote bench/.rig.env"
+echo "== rig up; wrote dev/bench/.rig.env"
 cat "${HERE}/.rig.env"

@@ -7,7 +7,7 @@ every doc link is dead. CI runs this before `maturin build` so the README baked
 into the wheel/sdist metadata points at absolute github.com / raw URLs, while the
 file on GitHub stays relative. Mirrors uv's scripts/transform_readme.py.
 
-Run from the repo root: `python scripts/transform_readme.py --target pypi`.
+Run from the repo root: `python dev/scripts/transform_readme.py --target pypi`.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ RAW = f"https://raw.githubusercontent.com/{REPO}/{{ref}}/"
 def _ref() -> str:
     """Pin URLs to the release tag once CI has stamped the version, else master.
 
-    The repo permanently carries version 0.0.0 (see RELEASE.md); CI stamps the
+    The repo permanently carries version 0.0.0 (see dev/RELEASE.md); CI stamps the
     real vX.Y.Z into Cargo.toml before building. Read it with a regex rather than
     tomllib so the script runs on the older Pythons some CI runners default to.
     """

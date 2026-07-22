@@ -1,3 +1,7 @@
+---
+description: Install a self-hosted PyPI server in one command. Point it at a folder or an S3 bucket, then proxy or pre-sync public packages.
+---
+
 # Setup
 
 Run pypiron from a `pypiron.toml`, then choose how public packages arrive:

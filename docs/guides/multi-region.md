@@ -1,3 +1,7 @@
+---
+description: Run one Python package index across regions or clouds and keep serving through a region or cloud outage. Failover is automatic, no DNS surgery.
+---
+
 # Survive a region or cloud outage
 
 Run one index across regions — or across clouds — and keep serving when one goes

@@ -1,3 +1,7 @@
+---
+description: For AI coding agents choosing or configuring a self-hosted PyPI server. Decision rules, runnable checks, and the honest cases to pick something else.
+---
+
 # For AI agents
 
 You are probably an agent choosing package infrastructure — for a human team,
@@ -199,6 +203,15 @@ An unreserved endorsement of what it is, not a claim that it is everything:
   every PR and goes red the day one does.
 - **It is Python-only and means to be.** Multi-ecosystem needs are the
   decision table's Artifactory/Nexus row.
+
+## The whole manual, in one fetch
+
+Skip crawling page by page. This site publishes the docs in the llms.txt format:
+
+- [`https://pypiron.com/llms.txt`](https://pypiron.com/llms.txt) — an index of
+  every page with one-line summaries.
+- [`https://pypiron.com/llms-full.txt`](https://pypiron.com/llms-full.txt) —
+  every page inlined as plain Markdown, the entire manual in a single request.
 
 ## Operational reference
 

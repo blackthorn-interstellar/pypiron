@@ -72,11 +72,43 @@ markdown_extensions:
 
 plugins:
   - search
+  # Emit /llms.txt (an index) and /llms-full.txt (every page inlined) for coding
+  # agents that fetch them when pointed at docs. Sections mirror the nav.
+  - llmstxt:
+      full_output: llms-full.txt
+      sections:
+        Start here:
+          - index.md
+          - guides/setup.md
+          - guides/migrate.md
+        Compare:
+          - compare/index.md
+          - compare/pypiron-vs-devpi.md
+          - compare/pypiron-vs-pypiserver.md
+          - compare/pypiron-vs-artifactory.md
+        How it works:
+          - concepts/how-it-works.md
+          - concepts/supply-chain.md
+          - concepts/transparency.md
+          - concepts/security-model.md
+          - concepts/testing.md
+          - guides/multi-region.md
+          - concepts/download-stats.md
+          - for-agents.md
+        Reference:
+          - reference/configuration.md
+          - reference/benchmarks.md
+          - privacy.md
 
 nav:
   - Home: index.md
   - Setup: guides/setup.md
   - Migrate off another index: guides/migrate.md
+  - Compare:
+      - compare/index.md
+      - pypiron vs devpi: compare/pypiron-vs-devpi.md
+      - pypiron vs pypiserver: compare/pypiron-vs-pypiserver.md
+      - pypiron vs Artifactory: compare/pypiron-vs-artifactory.md
   - How it works: concepts/how-it-works.md
   - Supply-chain defense: concepts/supply-chain.md
   - Tamper-evident checkpoints: concepts/transparency.md

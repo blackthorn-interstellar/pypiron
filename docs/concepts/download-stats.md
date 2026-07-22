@@ -1,3 +1,7 @@
+---
+description: See which packages and versions your team installs from your private PyPI server. On by default, a lightweight analytic, not an audit log.
+---
+
 # Download statistics
 
 See which packages and versions your team installs. On by default; turn it off

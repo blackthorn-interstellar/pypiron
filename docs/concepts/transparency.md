@@ -1,3 +1,7 @@
+---
+description: Tamper-evident checkpoints for your PyPI server. An append-only, hash-chained log catches an attacker who rewrites an artifact and its checksum.
+---
+
 # Tamper-evident checkpoints
 
 Everything pypiron serves is verified against a sha256 recorded next to each

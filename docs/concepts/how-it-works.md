@@ -1,3 +1,7 @@
+---
+description: Why a self-hosted PyPI server can be this fast and hard to break. The index rebuilds itself from your files, so there's nothing to back up but a directory.
+---
+
 # How it works
 
 pypiron serves a package index like a CDN serves a website — mostly static

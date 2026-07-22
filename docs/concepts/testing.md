@@ -1,3 +1,7 @@
+---
+description: How pypiron is tested. The real server driven end-to-end by uv, pip, poetry, and twine, adversarially and continuously. Every claim links to a check.
+---
+
 # How it's tested
 
 You're about to point every install your team runs at this server. Here's what

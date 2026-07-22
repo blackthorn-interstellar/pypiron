@@ -1,3 +1,7 @@
+---
+description: Privacy for the pypiron documentation site. A static site with no accounts and no forms, plus the advertising pixel it loads and what it records.
+---
+
 # Privacy
 
 *Last updated: July 2026*

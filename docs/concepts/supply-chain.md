@@ -1,3 +1,7 @@
+---
+description: Stop dependency-confusion and malicious fresh releases at your PyPI server. Private names stay private, new releases wait 7 days, on by default.
+---
+
 # Supply-chain defense
 
 Mixing private packages with a public PyPI mirror is where supply-chain attacks

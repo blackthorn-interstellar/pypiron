@@ -1,3 +1,7 @@
+---
+description: The security model of a fail-closed PyPI server. Private names never reach public PyPI, secrets compare in constant time, releases you can verify.
+---
+
 # Security model
 
 pypiron is fail-closed by default: a half-configured credential refuses startup,

@@ -1,3 +1,7 @@
+---
+description: Every pypiron flag, PYPIRON_ environment variable, and pypiron.toml setting for running a self-hosted PyPI server, with defaults and precedence.
+---
+
 # Configuration
 
 Configure pypiron with flags, `PYPIRON_*` environment variables, or

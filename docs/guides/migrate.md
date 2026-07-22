@@ -1,3 +1,7 @@
+---
+description: Move private packages off devpi, Artifactory, or Nexus into a self-hosted PyPI server in one command. No re-uploads, no PyPI round-trip.
+---
+
 # Move your packages off devpi, Artifactory, or Nexus
 
 Pull your private packages out of an old index and into pypiron in one command.

@@ -8,6 +8,22 @@
 -->
 {% block extrahead %}
   {{ super() }}
+
+  {#- Social / Open Graph cards. Per-page title + description where set, one
+      shared 1200x630 card image. -#}
+  {% set og_title = page.title ~ " · " ~ config.site_name if page and page.title and not page.is_homepage else config.site_name %}
+  {% set og_desc = page.meta.description if page and page.meta and page.meta.description else config.site_description %}
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="{{ config.site_name }}">
+  <meta property="og:title" content="{{ og_title }}">
+  <meta property="og:description" content="{{ og_desc }}">
+  <meta property="og:image" content="https://pypiron.com/assets/og-card.png">
+  <meta property="og:url" content="{{ page.canonical_url }}">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{ og_title }}">
+  <meta name="twitter:description" content="{{ og_desc }}">
+  <meta name="twitter:image" content="https://pypiron.com/assets/og-card.png">
+
   <script>!function(w,d,s,u){if(w.oaiq)return;var q=function(){q.q.push(arguments)};q.q=[];w.oaiq=q;var j=d.createElement(s);j.async=1;j.src=u;var f=d.getElementsByTagName(s)[0];f.parentNode.insertBefore(j,f)}(window,document,"script","https://bzrcdn.openai.com/sdk/oaiq.min.js");oaiq("init",{pixelId:"TL5g8QKkG3CbEKsjjH3pRo",debug:false});oaiq("measure","page_viewed",{type:"page_viewed"});</script>
 
   <!--

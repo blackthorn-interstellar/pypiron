@@ -1,3 +1,7 @@
+---
+description: Benchmarks. pypiron sustains 8,288 verified installs/s on 2 vCPU, 100x faster than every other PyPI server. Full six-way field, reproducible.
+---
+
 # Benchmarks
 
 pypiron is 100×+ faster than other PyPI servers at sustained install throughput.

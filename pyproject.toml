@@ -49,6 +49,7 @@ dev = [
 ]
 # User-facing docs site (mkdocs-material). Build: `make docs`; serve: `make docs-serve`.
 docs = [
+    "mkdocs-llmstxt>=0.4.0 ; python_full_version >= '3.9'",
     "mkdocs-material>=9.5",
 ]
 

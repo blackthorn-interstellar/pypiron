@@ -45,7 +45,10 @@ reason about pypiron belongs in `dev/` instead.
   `make docs-serve`); contributor/architecture/benchmark docs live in `dev/`.
   Update the manual when you change user-visible behavior. Write it the house
   way — [dev/DOCS_STYLE.md](dev/DOCS_STYLE.md): for the user, not the builder
-  (outcome over mechanism, no in-house jargon, happy-path first).
+  (outcome over mechanism, no in-house jargon, happy-path first). A new manual
+  page goes in BOTH `nav:` and the `llmstxt` plugin's `sections:` in
+  mkdocs.yml — the second list doesn't track nav and a missing page fails
+  silently. Every page carries a front-matter `description:` (≤160 chars).
 - Architecture and the storage-layout contract: [dev/DESIGN.md](dev/DESIGN.md)
   ([dev/VISION.md](dev/VISION.md) is the one-pager). Don't invent storage-tree
   or sidecar variants.

@@ -1,3 +1,7 @@
+---
+description: A self-hosted PyPI server and mirror in Rust. 100x faster installs, private packages, an on-demand PyPI cache, and supply-chain defense built in.
+---
+
 # pypiron
 
 An ultra-fast Python package server, written in Rust.

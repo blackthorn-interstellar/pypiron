@@ -213,6 +213,17 @@ async fn read_index_capped(resp: reqwest::Response) -> Result<SimpleIndex> {
     {
         bail!("upstream index exceeds {MAX_INDEX_BYTES} bytes (Content-Length)");
     }
+    // Capture the declared type before the body is consumed. Artifactory and
+    // Nexus default corporate deployments to the HTML PEP 503 simple API, and a
+    // fat-fingered credential yields a 200 HTML login page — neither is JSON, so
+    // a bare `serde_json::from_slice` would surface an opaque "expected value at
+    // line 1 column 1". We fail closed with the cause and the fix instead.
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let mut buf: Vec<u8> =
         Vec::with_capacity(resp.content_length().map_or(0, |l| l.min(MAX_INDEX_BYTES)) as usize);
     let mut stream = resp.bytes_stream();
@@ -223,7 +234,38 @@ async fn read_index_capped(resp: reqwest::Response) -> Result<SimpleIndex> {
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(serde_json::from_slice(&buf)?)
+    serde_json::from_slice(&buf).map_err(|_| non_json_index_error(&content_type, &buf))
+}
+
+/// The migration promise is "one command"; the failure mode that breaks it is a
+/// source that answers 200 with something other than PEP 691 JSON. Turn that
+/// into one actionable line naming the cause (HTML simple index vs. some other
+/// non-JSON body) and the fix, never a raw serde error. We do NOT scrape HTML —
+/// the deliverable is a clear refusal, so the operator points `--from` at a
+/// JSON-capable endpoint (or fixes the credential behind a login page).
+fn non_json_index_error(content_type: &str, body: &[u8]) -> anyhow::Error {
+    let ct = content_type.split(';').next().unwrap_or("").trim();
+    let declared = if ct.is_empty() { "none" } else { ct };
+    let looks_html = ct.eq_ignore_ascii_case("text/html")
+        || body
+            .iter()
+            .find(|b| !b.is_ascii_whitespace())
+            .is_some_and(|b| *b == b'<');
+    if looks_html {
+        anyhow::anyhow!(
+            "source returned an HTML page (Content-Type: {declared}), not the \
+             PEP 691 JSON pypiron migration requires — point --from at a \
+             JSON-capable endpoint, or check credentials if this is a login page. \
+             Artifactory/Nexus serve HTML PEP 503 by default; pypiron does not \
+             scrape HTML."
+        )
+    } else {
+        anyhow::anyhow!(
+            "source returned a non-JSON response (Content-Type: {declared}) where \
+             pypiron migration requires a PEP 691 JSON simple index — point --from \
+             at a JSON-capable endpoint or check credentials."
+        )
+    }
 }
 
 /// Fetch a package's PEP 691 JSON listing from `base`. `Ok(None)` on a 404 —
@@ -337,6 +379,33 @@ mod tests {
         }))
         .unwrap();
         assert!(future.project_status.is_none());
+    }
+
+    #[test]
+    fn non_json_index_error_names_html_and_the_fix() {
+        // An HTML content-type (Artifactory/Nexus default, or a login page).
+        let e = non_json_index_error("text/html; charset=utf-8", b"<!DOCTYPE html>");
+        let msg = e.to_string();
+        assert!(msg.contains("HTML page"), "{msg}");
+        assert!(msg.contains("text/html"), "{msg}");
+        assert!(msg.contains("PEP 691 JSON"), "{msg}");
+        assert!(msg.contains("--from"), "{msg}");
+
+        // No/opaque content-type but an HTML-looking body still reads as HTML.
+        let sniffed = non_json_index_error("application/octet-stream", b"  \n<html><body>");
+        assert!(sniffed.to_string().contains("HTML page"), "{sniffed}");
+
+        // A genuinely non-HTML, non-JSON body reports the declared type and the fix.
+        let other = non_json_index_error("text/plain", b"not json, not html");
+        let msg = other.to_string();
+        assert!(msg.contains("non-JSON response"), "{msg}");
+        assert!(msg.contains("text/plain"), "{msg}");
+        assert!(msg.contains("--from"), "{msg}");
+
+        // A missing content-type is reported as "none", never a raw serde error.
+        assert!(non_json_index_error("", b"garbage")
+            .to_string()
+            .contains("none"));
     }
 
     #[test]

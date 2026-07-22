@@ -38,7 +38,7 @@ toml = "1.1.2"
 # Already in the tree via reqwest; used directly to classify a URL host as an
 # IP literal vs a name in the SSRF guard.
 url = "2"
-object_store = { version = "0.13.2", features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.14.1", features = ["aws", "gcp", "azure"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 
 # mimalloc on every arch except s390x/ppc64le: their manylinux2014 cross-GCC is too

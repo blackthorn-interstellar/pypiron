@@ -67,22 +67,7 @@ lint:  ## Run clippy and ruff lints
 	uv run -- ruff check tests dev/bench dev/scripts
 
 audit:  ## Scan Cargo.lock for security advisories (needs cargo-audit: cargo install cargo-audit)
-	# Fails on any advisory except the two acknowledged below, both quick-xml DoS:
-	#   RUSTSEC-2026-0194  quadratic runtime on duplicate start-tag attribute names
-	#   RUSTSEC-2026-0195  unbounded namespace-decl allocation (memory exhaustion)
-	# Both are reached only through object_store's S3/Azure/GCS XML-response
-	# parsing, and that XML is only ever parsed from the operator's own configured,
-	# trusted storage
-	# backend's responses — never from client/request input — so neither DoS is
-	# reachable from a pypiron request. The fix is quick-xml >= 0.41.0, but no
-	# released object_store permits it yet: the latest (0.14.0) pins quick-xml to
-	# ^0.40.1, still vulnerable. Bumping object_store therefore can't clear these.
-	# Drop both ignores the moment an object_store release ships quick-xml >= 0.41.
-	# Upstream (dev now lives in apache/arrow-rs-object-store):
-	#   fix merged to main 2026-07-02  https://github.com/apache/arrow-rs-object-store/pull/785
-	#   tracking issue (closed)       https://github.com/apache/arrow-rs-object-store/issues/787
-	#   ships in 0.14.1, target Aug 2026  https://github.com/apache/arrow-rs-object-store/issues/761
-	cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+	cargo audit
 
 coverage:  ## Rust unit-test line coverage summary (needs cargo-llvm-cov: cargo install cargo-llvm-cov)
 	cargo llvm-cov --summary-only

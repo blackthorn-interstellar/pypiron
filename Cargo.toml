@@ -4,6 +4,13 @@ name = "pypiron"
 # CI stamps the tag version in before building wheels. See dev/RELEASE.md.
 version = "0.0.0"
 edition = "2021"
+description = "Ultra-fast self-hosted PyPI server and mirror in Rust — private index, proxy cache, supply-chain defense. One binary, no database."
+homepage = "https://pypiron.com"
+repository = "https://github.com/blackthorn-interstellar/pypiron"
+readme = "README.md"
+license = "MIT"
+keywords = ["pypi", "package-registry", "mirror", "self-hosted", "python"]
+categories = ["development-tools", "web-programming"]
 
 [dependencies]
 anyhow = "1"

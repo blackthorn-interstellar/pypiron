@@ -88,11 +88,8 @@ Hover a checkmark for the caveat where your Markdown renderer supports it.
 | Disk-backed | <abbr title="Default local disk backend.">✅</abbr> | <abbr title="Writes a static mirror tree to disk.">✅</abbr> | <abbr title="Serves packages from local directories.">✅</abbr> | <abbr title="Supports filesystem package storage.">✅</abbr> | <abbr title="Default serverdir storage on local disk.">✅</abbr> | <abbr title="Disk-backed package cache.">✅</abbr> |
 | Cloud-storage-backed | <abbr title="S3, S3-compatible, GCS, and Azure Blob.">✅</abbr> | <abbr title="S3-compatible mirror storage.">✅</abbr> | — | <abbr title="S3, GCS, and Azure Blob package storage.">✅</abbr> | — | — |
 
-Compared with [bandersnatch](https://github.com/pypa/bandersnatch),
-[pypiserver](https://github.com/pypiserver/pypiserver),
-[pypicloud](https://github.com/stevearc/pypicloud) (archived since 2023),
-[devpi](https://www.devpi.net/), and
-[proxpi](https://github.com/EpicWink/proxpi).
+Full write-ups — pypiron vs devpi, pypiserver, and Artifactory, plus which tool
+fits which job: <https://pypiron.com/compare/>.
 
 ## License
 

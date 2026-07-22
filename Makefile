@@ -1,4 +1,4 @@
-.PHONY: init init-rust init-python build dev run test test-rust test-python test-s3-real test-gcs-real perf compat check cargo-check af fmt lint audit coverage clean doc docs docs-serve docs-truth build-wheel release-notes fuzz fuzz-build vopr-soak help
+.PHONY: init init-rust init-python build dev run test test-rust test-python test-s3-real test-gcs-real perf compat check cargo-check af fmt lint audit coverage clean doc docs docs-serve docs-truth build-wheel release-notes fuzz fuzz-build vopr-soak dr-drill help
 
 SHELL := /bin/bash
 
@@ -140,6 +140,10 @@ vopr-soak:  ## Run the deterministic simulator continuously across rotating topo
 		$(if $(VOPR_SECS),--max-secs $(VOPR_SECS),--forever) \
 		--rotate --recheck-every 500 --start-seed $$(date +%s) \
 		2>&1 | tee -a .local/vopr-soak.log
+
+dr-drill:  ## Disaster-recovery drill: back up, wipe, restore truth only, reinstall byte-identical (prints N/N + wall-clock)
+	# -s: surface the "N/N restored byte-identical" line and the wall-clock numbers.
+	uv run -- pytest tests/test_dr_drill.py -s -n 0
 
 help:  ## Display this help message
 	@grep -h -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'

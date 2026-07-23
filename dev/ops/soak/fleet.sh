@@ -16,7 +16,7 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "$HERE/../.." && pwd)
+REPO_ROOT=$(git -C "$HERE" rev-parse --show-toplevel)
 REGION=${REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}
 STACK_NAME=${STACK_NAME:-pypiron-soak}
 # One dedicated bucket per account, reused by every run (push-bundle/apply/…).

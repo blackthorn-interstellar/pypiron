@@ -114,7 +114,7 @@ Without a bucket the reporter still records findings to a local fallback file.
 | `pypiron-soak-reporter.service` | one reporter per box, follows the merged soak journal |
 | `fetch-bundle.sh` + `pypiron-soak-refresh.{service,timer}` | poll S3, reinstall + restart when the bundle changes |
 | `install.sh` | wire the units up from an extracted bundle (idempotent) |
-| `../../.github/workflows/soak-bundle.yml` | CI: build arm64 + ship the bundle to S3 on master push |
+| `../../../.github/workflows/soak-bundle.yml` | CI: build arm64 + ship the bundle to S3 on master push |
 | `verify_fix.workflow.js` | reproduce → fix in src/ → **verify gate** → commit/escalate |
 | `fixer-routine.md` | the hourly cloud-routine prompt that drains findings |
 

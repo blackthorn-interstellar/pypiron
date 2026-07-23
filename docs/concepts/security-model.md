@@ -79,30 +79,21 @@ design; know them before you lean on the rest.
 
 ## Dependency advisories
 
-pypiron carries two acknowledged advisories in a transitive dependency. Both are
-**affected, with mitigation** — not "not affected". Here's the honest read.
+Every change runs `cargo audit` with no ignore flags. The audit is clean.
 
-- **RUSTSEC-2026-0194** — quadratic parsing time on duplicate attribute names.
-- **RUSTSEC-2026-0195** — unbounded allocation on namespace declarations.
+It was not always. Through v0.0.14 pypiron carried two denial-of-service
+advisories in `quick-xml` (RUSTSEC-2026-0194, quadratic parsing on duplicate
+attributes; RUSTSEC-2026-0195, unbounded allocation on namespace declarations),
+pulled in through `object_store` — the library pypiron uses to talk to S3, GCS,
+and Azure. The vulnerable code parsed only XML from the storage endpoint you
+configured and authenticated to, never anything from a package client, and the
+default disk backend never invoked it at all. No released `object_store`
+permitted the fixed `quick-xml`, so the advisories were documented here instead
+of hidden behind audit exceptions, with the gate set to turn red the day a fix
+shipped.
 
-Both are denial-of-service bugs in `quick-xml`, pulled in through `object_store`,
-the library pypiron uses to talk to S3, GCS, and Azure.
-
-**Where the path goes.** `quick-xml` only parses the XML that `object_store`
-receives from a cloud backend — bucket listings, multipart replies, error bodies.
-That XML arrives from one place: the storage endpoint you configured and
-authenticated to. It never comes from a package client. The default disk backend
-never invokes `quick-xml` at all.
-
-**So the exposure is narrow.** Run a cloud backend, and a hostile or
-malfunctioning storage endpoint could stall or exhaust the one node parsing its
-response. That is the whole blast radius: a single node, driven by your own
-storage, never by a client install.
-
-**Why it's still open.** The fix is in a newer `quick-xml`, but no released
-`object_store` permits that version yet — a transitive pin holds the line, so
-bumping `object_store` can't clear it today. `cargo-audit` runs on every change
-and turns red the day a fixed `object_store` ships, which forces the upgrade.
+That day came: `object_store` 0.14.1 allows the fixed `quick-xml` 0.41, pypiron
+took the bump, and releases after v0.0.14 carry no known advisories.
 
 ## Verify a release
 

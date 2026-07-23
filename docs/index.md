@@ -11,14 +11,12 @@ pypiron is the fastest, most reliable PyPI server (and mirror) available.
 ![Max sustained install throughput](assets/install-throughput.svg#only-light)
 ![Max sustained install throughput](assets/install-throughput-dark.svg#only-dark)
 
-- **100×+ faster than any PyPI server.** 8,288 verified installs/s on 2 vCPU. ([benchmarks](reference/benchmarks.md))
-- **Serves PyPI-scale traffic — measured, not extrapolated.** Replaying PyPI's real download stream, one 8-vCPU box handles the index at ~200,000 requests/s with p99 under 3 ms — about double PyPI's global average.
-- **Dependency cooldown, on by default.** New releases wait 7 days. Most attacks surface first. ([how](concepts/supply-chain.md))
-- **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
-- **Scales to a fleet.** Point any number of nodes at one bucket. No coordination.
-- **Survives a region — or a whole cloud — going down.** Run nodes across regions or clouds on one bucket list; reads fail over with zero data loss. ([how](guides/multi-region.md))
-- **Works with everything.** uv, pip, poetry, pdm, twine, pipenv, hatch, flit.
-- **Download stats built in** (beta). ([details](concepts/download-stats.md))
+- **100× faster than any PyPI server.** 8,288 verified installs/s on 2 vCPU. ([benchmarks](reference/benchmarks.md))
+- **Secure by default.** New releases wait 7 days, known malware never installs, no dependency confusion, air-gap ready. Measured on 2024+ compromises of established PyPI packages: 34% blocked on day 0, 86% with a 30-day cooldown. ([defense](concepts/supply-chain.md))
+- **Absurdly well-tested.** [Fuzzing](concepts/testing.md#adversarial-inputs), [chaos](concepts/testing.md#it-survives-being-killed), [deterministic simulation](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#deterministic-simulation-the-vopr), [model checking](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#machine-checked-models-stateright), [real clouds](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#real-cloud-backends), [perf](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#performance-testing), and [all 17 million files on PyPI](concepts/testing.md#every-file-on-pypi).
+- **Infinite scale.** One 8-vCPU box: PyPI's real index traffic at 200,000 requests/s, p99 under 3 ms. Or any number of nodes on one bucket. ([replay](https://github.com/blackthorn-interstellar/pypiron/tree/master/dev/bench/replay))
+- **Works through outages.** Cross-region, cross-cloud (S3 + GCS + Azure), automatic failover, zero data loss. ([multi-region](guides/multi-region.md))
+- **Works with everything.** uv, pip, poetry, pdm, pipenv, hatch, flit, twine.
 
 ## Quickstart
 

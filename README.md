@@ -16,14 +16,12 @@ pypiron is the fastest, most reliable PyPI server (and mirror) available.
   </picture>
 </p>
 
-- **100×+ faster than any PyPI server.** 8,288 verified installs/s on 2 vCPU.
-- **Serves PyPI-scale traffic — measured, not extrapolated.** Replaying PyPI's real download stream, one 8-vCPU box handles the index at ~200,000 requests/s with p99 under 3 ms ([dev/bench/replay](dev/bench/replay/)).
-- **Dependency cooldown, on by default.** New releases wait 7 days. Most attacks surface first.
-- **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
-- **Scales to a fleet.** Point any number of nodes at one bucket. No coordination.
-- **Survives a region — or a whole cloud — going down.** Run nodes across regions or clouds (S3 + GCS + Azure) on one bucket list; every upload lands on all of them, and reads fail over with zero data loss.
-- **Works with everything.** uv, pip, poetry, pdm, twine, pipenv, hatch, flit.
-- **Download stats built in** (beta).
+- **100× faster than any PyPI server.** 8,288 verified installs/s on 2 vCPU. ([benchmarks](docs/reference/benchmarks.md))
+- **Secure by default.** New releases wait 7 days, known malware never installs, no dependency confusion, air-gap ready. Measured on 2024+ compromises of established PyPI packages: 34% blocked on day 0, 86% with a 30-day cooldown. ([defense](docs/concepts/supply-chain.md))
+- **Absurdly well-tested.** [Fuzzing](dev/TESTING.md#fuzzing), [chaos](dev/TESTING.md#chaos-and-crash-consistency), [deterministic simulation](dev/TESTING.md#deterministic-simulation-the-vopr), [model checking](dev/TESTING.md#machine-checked-models-stateright), [real clouds](dev/TESTING.md#real-cloud-backends), [perf](dev/TESTING.md#performance-testing), and [all 17 million files on PyPI](src/corpus_check.rs).
+- **Infinite scale.** One 8-vCPU box: PyPI's real index traffic at 200,000 requests/s, p99 under 3 ms. Or any number of nodes on one bucket. ([replay](dev/bench/replay/))
+- **Works through outages.** Cross-region, cross-cloud (S3 + GCS + Azure), automatic failover, zero data loss. ([multi-region](docs/guides/multi-region.md))
+- **Works with everything.** uv, pip, poetry, pdm, pipenv, hatch, flit, twine.
 
 **Status: beta.** Young project, tested like an old one — run it, break it,
 [file issues](https://github.com/blackthorn-interstellar/pypiron/issues).

@@ -79,6 +79,12 @@ on versions old enough for a bad one to have surfaced and been pulled. It's the
 same practice uv, npm, and Dependabot have standardized on — enforced here at
 the server, for every client at once.
 
+How much does the wait buy? Measured against the full OSV malware feed, for
+compromised releases of established packages (2024+ uploads): the advisory
+check alone blocks 34% on release day; a cooldown raises that to 55% at 3 days,
+56% at 7 days, and 86% at 30 days. The default seven days catches the fast
+reports; a 30-day window catches most of the rest.
+
 **On by default: new releases wait seven days, on a sliding window.** The proxy
 applies it on every read (re-checked per request, so the window keeps sliding);
 `sync` applies it to what a run mirrors. Widen the window, pin an absolute "as

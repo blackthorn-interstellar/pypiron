@@ -41,6 +41,35 @@ Sentence-level before/after:
 - "You can point any number of nodes at one bucket with no coordination to set
   up." → "Point any number of nodes at one bucket. No coordination."
 
+## Claim, proof, link
+
+The shape for hero bullets and any list that sells (the README, `index.md`,
+`compare/*`):
+
+- **Claim:** bold, four words or fewer, a verdict — "Secure by default."
+  "Infinite scale." "Works through outages." A cocky claim is fine when the
+  number that follows earns it; a cocky claim with no number is the marketing
+  the Voice section bans.
+- **Proof:** one number or a few concrete nouns, as fragments. "One 8-vCPU box:
+  200,000 requests/s." "Cross-region, cross-cloud, automatic failover." A
+  measured figure keeps its frame — "86% with a 30-day cooldown (2024+
+  compromises)" — the frame is part of the number, not a hedge.
+- **Link:** one target that holds the evidence. The link does the arguing so
+  the sentence doesn't: no "measured, not extrapolated", no "not mocks", no
+  methodology mid-claim. A doubter clicks; a believer keeps reading.
+
+One claim per bullet, two rendered lines max, five-ish bullets per list. Merge
+features into themes (fast, secure, tested, scales, survives outages) instead
+of adding a ninth bullet.
+
+> **Before:** **Serves PyPI-scale traffic — measured, not extrapolated.**
+> Replaying PyPI's real download stream, one 8-vCPU box handles the index at
+> ~200,000 requests/s with p99 under 3 ms.
+
+> **After:** **Infinite scale.** One 8-vCPU box: PyPI's real index traffic at
+> 200,000 requests/s, p99 under 3 ms. Or any number of nodes on one bucket.
+> ([replay](…))
+
 ## Two trees, two audiences
 
 - **`docs/`** is the user manual (mkdocs-material → GitHub Pages). Audience: a
@@ -143,6 +172,7 @@ everywhere else.
 ## Checklist before you commit a doc change
 
 - First sentence is a benefit or a task — not an architecture fact.
+- A bullet that sells follows claim → proof → link — no inline self-defense.
 - No word from the "don't write" list survives (outside `standards.md` / `dev/`).
 - Every feature says *why it matters* before *which flag*.
 - The simplest working command comes first; auth/advanced is a later turn.

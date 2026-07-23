@@ -32,9 +32,16 @@ build/
 dev/bench/.keys/
 dev/bench/.server-env
 dev/bench/.rig.env
-dev/bench/results/
-# Bulk PyPI corpus downloads (95MB+, see src/corpus_check.rs)
-dev/bench/corpus/
+# Bench results are scratch, except the tracked microbench series (spec:
+# dev/bench/MICROBENCH.md — git history is the trend line).
+dev/bench/results/*
+!dev/bench/results/microbench-*.json
+# Bulk PyPI corpus downloads (95MB+, see src/corpus_check.rs). The 4.8MB
+# filecounts file IS committed: the fabricator (dev/bench/fabricate.py) and
+# the CI op-pin lane sample the real project-name/file-count distribution
+# from it, on every clone.
+dev/bench/corpus/*
+!dev/bench/corpus/pypi-project-filecounts.tsv.gz
 # Install-bench: downloaded wheels + results are regenerable from lock/ (committed)
 dev/bench/install/wheelhouse/
 dev/bench/install/results/

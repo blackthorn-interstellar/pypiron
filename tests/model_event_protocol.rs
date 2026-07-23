@@ -1,5 +1,5 @@
 //! Machine-checked convergence proof for pypiron's single-bucket event
-//! protocol — dev/MOONSHOT.md rung 2, driven by the `stateright` model checker.
+//! protocol, driven by the `stateright` model checker.
 //!
 //! # What is modeled
 //!

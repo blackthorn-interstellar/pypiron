@@ -1,4 +1,4 @@
-//! Multi-bucket replication and reconciliation (dev/MULTIBUCKET.md §4, §6).
+//! Multi-bucket replication and reconciliation.
 //!
 //! Only **private truth** replicates — a private file's sidecar, artifact,
 //! `.metadata`/`.provenance` companions, its package origin claim, and its
@@ -65,7 +65,7 @@ const QUARANTINE_PREFIX: &str = "_quarantine/";
 const ORIGIN_ATTEMPTS: usize = 8;
 /// Page size for the paged `_repl/` sweep and the reconcile package scan: one
 /// S3 LIST page. Bounds resident memory so neither the failure backlog nor the
-/// full package tree is ever held in one Vec (dev/MULTIBUCKET.md, v1 review).
+/// full package tree is ever held in one Vec.
 const REPL_SWEEP_PAGE: usize = 1_000;
 const RECONCILE_SCAN_PAGE: usize = 1_000;
 
@@ -709,7 +709,7 @@ async fn install_or_verify_sidecar(
     bail!("conditional sidecar replacement retries exhausted for {key}")
 }
 
-/// Copy a live private record into `dst` (dev/MULTIBUCKET.md §4 copy protocol):
+/// Copy a live private record into `dst`:
 /// origin claim first, then sidecar, companions, and the artifact **last** —
 /// each verified against the source sidecar's sha256, never an etag or raw
 /// presence. The source artifact and listed companions are read before the
@@ -985,7 +985,7 @@ async fn replace_companion(
     bail!("conditional companion replacement retries exhausted for {key}")
 }
 
-/// Drive `pkg`'s origin claim on `dst` to `private` (dev/MULTIBUCKET.md §6.2):
+/// Drive `pkg`'s origin claim on `dst` to `private`:
 /// create-if-absent, CAS the `unclaimed` sentinel, or demote a `mirror` claim —
 /// private is terminal, so a claim already private is a no-op. The one demotion
 /// primitive; never a delete (which could re-open the name to a proxy fill).
@@ -1092,7 +1092,7 @@ async fn quarantine_mirror_record(
     .await
 }
 
-/// Freeze one bucket's copy of a filename (dev/MULTIBUCKET.md §6.3). The richer
+/// Freeze one bucket's copy of a filename. The richer
 /// `.frozen` marker lands first, so even a crash during quarantine is still
 /// recognizably a freeze rather than an ordinary delete. Publishers check both
 /// marker kinds. The tombstone follows as the permanent filename-reuse fence,
@@ -1270,8 +1270,8 @@ pub async fn quarantine_mirror_artifacts(storage: &dyn Storage, pkg: &str) -> Re
 // ---------------------------------------------------------------------------
 
 /// Stream a just-committed private record from the selected bucket to every
-/// other bucket *before* the client ack (dev/MULTIBUCKET.md, "Upload
-/// protocol"). Healthy secondaries are copied concurrently — each via the same
+/// other bucket *before* the client ack. Healthy secondaries are copied
+/// concurrently — each via the same
 /// [`replicate_record`] copy protocol as the sweep and full diff (origin claim,
 /// sidecar, companions, then the sha256-verified artifact last) — under one
 /// shared grace deadline measured from the selected write's completion.
@@ -1583,7 +1583,7 @@ pub async fn sweep_all_markers(state: &AppState) -> Result<()> {
 /// existence check (one paged LIST capped at a single key), not a count: used by
 /// `buckets migrate` to refuse shrinking/reordering the topology while a repair
 /// note — potentially the sole copy of a record not yet replicated — is still
-/// stranded (dev/MULTIBUCKET.md §Kept from v1).
+/// stranded.
 pub async fn has_undrained_repl_notes(storage: &dyn Storage) -> Result<bool> {
     Ok(!storage.list_page(REPL_PREFIX, None, 1).await?.is_empty())
 }
@@ -1592,7 +1592,7 @@ pub async fn has_undrained_repl_notes(storage: &dyn Storage) -> Result<bool> {
 /// owed *to* bucket `dest`. The read-affinity worker checks every other bucket
 /// with this before it lets reads return to `dest` (its region bucket): an
 /// outstanding note means `dest` is missing an acked file, so reads stay on the
-/// write bucket until it drains (dev/READ_AFFINITY_VISION.md). Same bounded
+/// write bucket until it drains. Same bounded
 /// single-key LIST as [`has_undrained_repl_notes`].
 pub async fn has_undrained_repl_notes_for(storage: &dyn Storage, dest: usize) -> Result<bool> {
     let prefix = format!("{REPL_PREFIX}{dest}/");

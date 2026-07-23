@@ -3,7 +3,7 @@
 //! the dependency-confusion defense (dev/DESIGN.md).
 //!
 //! The claim is a **never-deleted** object with a monotone lattice of states
-//! (dev/MULTIBUCKET.md §6.2). Legal transitions, all conditional (CAS):
+//!. Legal transitions, all conditional (CAS):
 //!
 //! ```text
 //!   (absent) --claim--> private          (create-if-absent)
@@ -316,7 +316,7 @@ pub async fn claim_origin<'a>(
     ))
 }
 
-/// The only legal demotion (dev/MULTIBUCKET.md §6.2): CAS an observation proven
+/// The only legal demotion: CAS an observation proven
 /// to be `mirror` to a fresh `private` body. A stale observation loses. Passing
 /// any other state is a fail-closed no-op.
 pub async fn demote_observed_mirror(

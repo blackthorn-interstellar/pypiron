@@ -1,5 +1,5 @@
 """Read affinity: every region serves reads from its own bucket, writes keep a
-single home (dev/READ_AFFINITY_VISION.md).
+single home.
 
 One real pypiron node runs over two region-labeled buckets on MinIO
 (`s3://a@left,s3://b@right`) and declares its region as `right`, so its write

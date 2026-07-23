@@ -194,7 +194,7 @@ pub struct AppState {
     pub last_request_unix: Arc<std::sync::atomic::AtomicU64>,
     /// Grace a synchronous pre-ack fan-out gives each secondary bucket, measured
     /// from the selected bucket's write. A secondary that misses it gets a
-    /// `_repl/` repair note instead of blocking the ack (dev/MULTIBUCKET.md).
+    /// `_repl/` repair note instead of blocking the ack.
     pub fanout_grace: Duration,
     /// How long an unpaired intent marker may sit before the worker treats
     /// its writer as crashed and rebuilds anyway. time::Duration because it
@@ -276,8 +276,7 @@ impl AppState {
     /// Capture the storage context for one operation's *reads*. Equals
     /// [`pin`](Self::pin) unless this node has an active region read pin, in which
     /// case reads are served from the near bucket while writes and every
-    /// upstream-claim decision stay on [`pin`](Self::pin) (read affinity,
-    /// dev/READ_AFFINITY_VISION.md).
+    /// upstream-claim decision stay on [`pin`](Self::pin) (read affinity).
     pub fn read_pin(&self) -> Arc<Pinned> {
         self.buckets.read_pin()
     }
@@ -475,7 +474,7 @@ impl AppState {
 }
 
 /// A client request within this window keeps multi-bucket health probes at full
-/// cadence. "The last few minutes" from dev/MULTIBUCKET.md §Health.
+/// cadence — "the last few minutes."
 const TRAFFIC_PROBE_WINDOW: Duration = Duration::from_secs(120);
 
 /// Idle probe cadence: one discovery probe per bucket about this often once
@@ -884,7 +883,7 @@ async fn run_serve(
     // Learn this node's region once at startup (operator override, then platform
     // environment, then instance metadata) and, in a multi-bucket fleet, pin the
     // node's reads to its region bucket. Detection only labels the node; it never
-    // moves a write (dev/READ_AFFINITY_VISION.md).
+    // moves a write.
     let node_region = node_region::detect(cli.node_region.as_deref()).await;
     if let (Some(health), Some(node)) = (&bucket_health, &node_region) {
         let specs = cli.storage.bucket_specs()?;
@@ -1663,7 +1662,7 @@ pub(crate) async fn require_settled_package_read(
 /// return (wrapping in `Some` where its own return type is `Option`) — either the
 /// claim moved mid-serve or the reread failed. Callers gate on
 /// `state.buckets.is_multi()`; single-bucket never rechecks. Load-bearing for
-/// read-your-write coherence across buckets (dev/READ_AFFINITY_VISION.md).
+/// read-your-write coherence across buckets.
 pub(crate) async fn recheck_settled(
     state: &AppState,
     storage: &dyn Storage,

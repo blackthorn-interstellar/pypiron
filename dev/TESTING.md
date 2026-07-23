@@ -110,7 +110,7 @@ Both run in Docker and skip cleanly without it, like the rest of the S3 suite.
 ## Machine-checked models (stateright)
 
 The chaos suites *sample* failure schedules; the models in `tests/model_*.rs`
-*enumerate* them (dev/MOONSHOT.md rung 2). Two stateright models cover the two
+*enumerate* them. Two stateright models cover the two
 protocols everything else rests on:
 
 - **Event protocol** (`tests/model_event_protocol.rs`): writers running the
@@ -141,7 +141,7 @@ published in the job summary.
 
 ## Deterministic simulation (the VOPR)
 
-`examples/vopr.rs` (dev/MOONSHOT.md rung 1, the FoundationDB/TigerBeetle
+`examples/vopr.rs` (the FoundationDB/TigerBeetle
 technique): an entire multi-node fleet — nodes, buckets, writers, the worker,
 replication fan-out, sweep, and tree diff — runs single-threaded on a paused
 tokio runtime. Wall-clock reads route through `src/clock.rs`'s simulated

@@ -1,4 +1,4 @@
-"""Multi-bucket replication and selection (dev/MULTIBUCKET-v2.md).
+"""Multi-bucket replication and selection.
 
 Real pypiron processes share two or three buckets on MinIO. Some tests give two
 nodes independent reachability views so both writable sides of a partition are

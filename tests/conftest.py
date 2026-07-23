@@ -1634,8 +1634,8 @@ def s3_server_multi_proxy_prefixed(
 # (config order), reads pin to the node's own region bucket (the second). A
 # single bucket-aware fault proxy sees every S3 request, so a test asserts WHICH
 # bucket served a read from the ordered request log, and fails/recovers each
-# bucket independently. See dev/READ_AFFINITY_VISION.md and
-# tests/test_read_affinity.py. Additive: these reuse the existing multi-bucket
+# bucket independently. See tests/test_read_affinity.py. Additive: these reuse
+# the existing multi-bucket
 # MinIO + fault-proxy fixtures without touching them.
 
 #: Region label on the write-home bucket (index 0) — never the node's region.

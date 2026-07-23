@@ -168,7 +168,7 @@ async fn companion_passthrough_visible(
 /// lagging region bucket must never make a client miss an acked file). The write
 /// pin is authoritative — deletions and tombstones serialize there — so its
 /// answer is final. Identical to a single [`multi_bucket_file_visible`] when the
-/// two pins are the same bucket (dev/READ_AFFINITY_VISION.md).
+/// two pins are the same bucket.
 async fn file_visible_read_through(
     state: &AppState,
     pins: &Pins<'_>,
@@ -286,7 +286,7 @@ async fn serve_pkg_index(
     // region catch-up landing the `.origin` mid-serve can never trip the
     // coherence recheck. Any decision that could reach upstream — the proxy
     // index, and denying an "unclaimed" name — is settled on the write pin
-    // (dev/READ_AFFINITY_VISION.md).
+    //.
     let read_pinned = state.read_pin();
     let write_pinned = state.pin();
     let pins = Pins::new(&read_pinned, &write_pinned);
@@ -338,7 +338,7 @@ async fn serve_pkg_index(
 /// serves the bytes. Served locally from the read pin → the pre-observation
 /// (`read_baseline`, already read by the caller) and the recheck are the read
 /// pin's; served through from the write home → both are the write pin's, so a
-/// region catch-up mid-serve never 503s (dev/READ_AFFINITY_VISION.md).
+/// region catch-up mid-serve never 503s.
 async fn serve_local_index_fenced(
     state: &AppState,
     pins: &Pins<'_>,
@@ -409,7 +409,7 @@ async fn serve_local_index_fenced(
 /// Confirm a read-pin "no claim" against the write pin before it can deny a
 /// package. Returns true when the write pin also holds no real claim (a genuine
 /// 404), false when the write home owns a claim the region bucket has not yet
-/// seen (serve it through). Fail-closed on names (dev/READ_AFFINITY_VISION.md).
+/// seen (serve it through). Fail-closed on names.
 async fn unclaimed_confirmed_absent(state: &AppState, pins: &Pins<'_>, pkg: &str) -> Result<bool> {
     if pins.same_pin {
         return Ok(true);
@@ -537,7 +537,7 @@ async fn serve_index(
 /// Serve `key` straight from a storage handle without touching the read-pin
 /// index cache — the read-through fallback for a page missing on the region
 /// bucket. Bounded to the rare region-lag case; the hot path stays the cached
-/// read-pin [`serve_index`] (dev/READ_AFFINITY_VISION.md).
+/// read-pin [`serve_index`].
 async fn serve_index_uncached(
     storage: &dyn Storage,
     key: &str,
@@ -557,7 +557,7 @@ async fn serve_index_uncached(
 
 /// Serve an index/companion from the read pin, reading through to the write pin
 /// on a miss so a lagging region bucket never 404s a page the write home holds
-/// (dev/READ_AFFINITY_VISION.md). Identical to [`serve_index`] when the two pins
+///. Identical to [`serve_index`] when the two pins
 /// are the same bucket. The write-pin fallback renders uncached, keeping package
 /// keys populated only from the read pin.
 async fn serve_index_local(
@@ -747,8 +747,8 @@ pub(crate) async fn files_get(
     // Pin both selections once for the whole download (design §3). Reads —
     // fences, companion cache, presign, streaming — run against the region-local
     // read pin; the proxy fill and every upstream-claim decision run against the
-    // write pin (bytes from the near bucket, judgment from the write home,
-    // dev/READ_AFFINITY_VISION.md). In the common mode the two are one context.
+    // write pin (bytes from the near bucket, judgment from the write home).
+    // In the common mode the two are one context.
     let read_pinned = state.read_pin();
     let write_pinned = state.pin();
     let pins = Pins::new(&read_pinned, &write_pinned);
@@ -902,7 +902,7 @@ pub(crate) async fn files_get(
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     // Stream from the read pin; on any failure (a not-found on a lagging region
     // bucket, or an error) read through to the write pin once before mapping to
-    // 404/503 (dev/READ_AFFINITY_VISION.md).
+    // 404/503.
     let mut resp = match read_pinned.storage.serve_artifact(&key, range).await {
         Ok(resp) => resp,
         Err(read_err) => {

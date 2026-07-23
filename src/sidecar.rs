@@ -11,12 +11,12 @@ pub const METADATA_SUFFIX: &str = ".metadata";
 /// artifact. Like `.metadata`, it is a served companion, not truth we author.
 pub const PROVENANCE_SUFFIX: &str = ".provenance";
 /// Delete marker: `<filename>.tombstone` next to where the artifact lived. A
-/// deleted private filename may never be reused (dev/MULTIBUCKET.md §6.4), and
+/// deleted private filename may never be reused, and
 /// a crashed delete must converge to "gone" rather than resurrect the file.
 pub const TOMBSTONE_SUFFIX: &str = ".tombstone";
 /// Freeze marker: `<filename>.frozen` beside where the artifact lived. Two
-/// buckets that committed different bytes under one filename (a split-brain,
-/// dev/MULTIBUCKET.md §6.3) both move their body to `_quarantine/` and drop this
+/// buckets that committed different bytes under one filename (a split-brain)
+/// both move their body to `_quarantine/` and drop this
 /// marker, which suppresses the filename from index rebuilds until a human
 /// resolves it. Unlike a tombstone the name is not permanently barred — the
 /// operator republishes a new version.
@@ -73,7 +73,7 @@ pub struct Sidecar {
     pub upload_time: String,
     /// Server-stamped receive time (epoch milliseconds) used only as the
     /// first-uploaded-wins tiebreak for the rare cross-partition byte conflict
-    /// (dev/MULTIBUCKET.md §Conflict resolution). Absent on legacy sidecars
+    ///. Absent on legacy sidecars
     /// and on mirror artifacts; a conflict with either side missing this field,
     /// or with the two within a small skew window, degrades to quarantine-both
     /// + alarm.
@@ -93,7 +93,7 @@ pub struct Sidecar {
     pub yanked: Yanked,
     /// Per-artifact origin (`"private"` | `"mirror"`), captured at write time so
     /// the replicator can decide "replicate private truth only" from bucket
-    /// state alone, not from history (dev/MULTIBUCKET.md §4, §6.2). Legacy and
+    /// state alone, not from history. Legacy and
     /// fabricated sidecars omit it; the worker backfills a missing value from
     /// the package-level `.origin` claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]

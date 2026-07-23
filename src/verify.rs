@@ -157,7 +157,7 @@ async fn check_package(
         .iter()
         .filter_map(|o| o.key.strip_prefix(&prefix))
         .collect();
-    // Tombstoned filenames are excluded from indexes (dev/MULTIBUCKET.md §6.4),
+    // Tombstoned filenames are excluded from indexes,
     // so the oracle must exclude them too — otherwise a crashed delete that left
     // an orphan artifact beside its tombstone would read as a stale-view forever.
     let tombstoned: std::collections::HashSet<&str> = names

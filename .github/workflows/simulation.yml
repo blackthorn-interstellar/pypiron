@@ -1,7 +1,7 @@
 name: Simulation
 
-# Deterministic simulation testing (dev/MOONSHOT.md rung 1) plus the deep
-# stateright model configurations (rung 2). The merge gate runs a small VOPR
+# Deterministic simulation testing plus the deep
+# stateright model configurations. The merge gate runs a small VOPR
 # smoke and the bounded model checks inside `cargo test`; this nightly job is
 # where the real interleaving volume happens — simulated time costs nothing,
 # so thousands of seeded fault schedules run per night. Every failure names

@@ -125,7 +125,7 @@ fn maybe_gzip(identity: &[u8]) -> Option<Variant> {
 
 /// Build the identity + optional gzip representations of an index body without
 /// caching them. The read-through fallback renders a page fetched straight from
-/// the write pin (dev/READ_AFFINITY_VISION.md) so a package key is never
+/// the write pin so a package key is never
 /// populated in the read-pin index cache from anything but the read pin.
 pub fn build_variants(bytes: Vec<u8>) -> (Variant, Option<Variant>) {
     let gzip = maybe_gzip(&bytes);

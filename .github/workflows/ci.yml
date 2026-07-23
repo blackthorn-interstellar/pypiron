@@ -81,7 +81,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Unit tests
         run: cargo test --workspace --all-features --locked
-      # A taste of the nightly deterministic simulation (dev/MOONSHOT.md rung 1)
+      # A taste of the nightly deterministic simulation
       # as a merge gate: a couple dozen seeded multi-node fault schedules, each
       # exactly reproducible from its printed seed. The volume runs nightly in
       # simulation.yml.

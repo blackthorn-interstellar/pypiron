@@ -944,7 +944,7 @@ pub trait Storage: Send + Sync {
     /// sorts strictly after `after` (or from the start when `after` is `None`),
     /// in ascending key order. Lets a sweep or diff walk an unbounded prefix in
     /// bounded batches — never holding the whole backlog or package tree
-    /// resident (dev/MULTIBUCKET.md, v1 review finding). The default derives
+    /// resident. The default derives
     /// paging from [`list_all`](Storage::list_all); backends with native
     /// pagination (S3/GCS/Azure) override it so the cap is honored at the wire
     /// via start-after, not after a full listing.
@@ -1203,7 +1203,7 @@ pub struct DiskStorage {
     /// Serializes `put_if_match` so its read-compare-write CAS is atomic against
     /// other tasks in this single-node process. Disk has no object-store
     /// conditional put; leader leasing stays off (`supports_leases` = false),
-    /// but the origin-claim lifecycle (dev/MULTIBUCKET.md §6.2) needs CAS, and a
+    /// but the origin-claim lifecycle needs CAS, and a
     /// process-local lock is a correct CAS for the single node disk supports.
     cas_lock: tokio::sync::Mutex<()>,
 }

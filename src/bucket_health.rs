@@ -204,7 +204,7 @@ pub(crate) struct BucketHealth {
     /// the write selection — behaviorally identical to a node with no affinity.
     read_preference: Option<usize>,
     /// The bucket reads should be served from: the region bucket while it is
-    /// usable, otherwise the write selection (dev/READ_AFFINITY_VISION.md).
+    /// usable, otherwise the write selection.
     read_selected: usize,
     /// Worker-supplied: whether the region bucket currently holds no undrained
     /// replication notes. Gates *return* of reads to the region bucket; a stale

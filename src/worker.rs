@@ -132,7 +132,7 @@ pub fn consumable_dirty_work(
     // Deterministic work order: the per-package grouping above iterates a
     // HashMap, whose order varies per process. Sorting costs nothing at these
     // sizes and makes tick behavior a pure function of the listing — which
-    // the deterministic simulator (dev/MOONSHOT.md rung 1) replays by seed.
+    // the deterministic simulator replays by seed.
     work.sort_by(|a, b| a.package.cmp(&b.package));
     work
 }
@@ -205,7 +205,7 @@ async fn run_bucket_health_until(
     // worker's own I/O on the selected bucket) marks a bucket unhealthy.
     let mut last_probe: Option<Instant> = None;
     loop {
-        // Traffic-gated cadence (dev/MULTIBUCKET.md §Health): probe at full
+        // Traffic-gated cadence: probe at full
         // speed while there is recent request traffic OR any bucket is unhealthy
         // or recovering — re-probing an unhealthy bucket is the only way it heals
         // back, so that is never gated off. Otherwise decay to the idle cadence,
@@ -265,7 +265,7 @@ async fn maintain_bucket_selection(state: &AppState) -> bool {
     // Read affinity only: when the region bucket is healthy but not yet the read
     // pin, a return is pending — confirm it holds no undrained repair notes
     // before the tick may move reads back to it. Never runs on the request path,
-    // and only while a return is actually pending (dev/READ_AFFINITY_VISION.md).
+    // and only while a return is actually pending.
     if health.has_read_preference() {
         match health.read_return_pending() {
             Some(region) => {
@@ -310,8 +310,7 @@ async fn maintain_bucket_selection(state: &AppState) -> bool {
                 } else {
                     // A bucket just crossed unhealthy→healthy. Fire the `_repl/`
                     // sweep at once so drain starts seconds after heal instead of
-                    // waiting out the periodic backstop (dev/MULTIBUCKET.md
-                    // §Repair and convergence). The worker loop owns the sweep;
+                    // waiting out the periodic backstop. The worker loop owns the sweep;
                     // set the request flag and wake it.
                     state
                         .repl_sweep_requested
@@ -625,7 +624,7 @@ pub async fn run_worker_until(
     // The `_repl/` sweep runs on its own slow backstop (repl_sweep_interval),
     // decoupled from the 1 s worker tick, plus immediately on a bucket heal
     // (repl_sweep_requested). `None` fires one sweep on boot to drain any notes
-    // a predecessor left. (dev/MULTIBUCKET.md §Repair and convergence.)
+    // a predecessor left.
     let mut last_repl_sweep: Option<Instant> = None;
     // Advisory refresh is always-on (never gated on multi-bucket): the malware
     // block set and audit index are global truth-cache. `None` fires one refresh
@@ -2616,14 +2615,14 @@ async fn list_artifacts_for_claim(
         .iter()
         .filter_map(|e| e.key.strip_prefix(&prefix))
         .collect();
-    // Tombstoned filenames leave every index (dev/MULTIBUCKET.md §6.4): a delete
+    // Tombstoned filenames leave every index: a delete
     // that crashed after the tombstone but before the artifact removal converges
     // to "gone" here, rather than resurrecting the file.
     let tombstoned: HashSet<&str> = names
         .iter()
         .filter_map(|f| f.strip_suffix(TOMBSTONE_SUFFIX))
         .collect();
-    // Frozen filenames are likewise suppressed (dev/MULTIBUCKET.md §6.3): a
+    // Frozen filenames are likewise suppressed: a
     // byte conflict moved both bodies to `_quarantine/` and dropped a `.frozen`
     // marker; the name must not resolve on any bucket until a human resolves it.
     let frozen: HashSet<&str> = names

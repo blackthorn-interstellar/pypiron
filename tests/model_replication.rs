@@ -1,5 +1,5 @@
-//! Stateright model of the multi-bucket replication merge (dev/MOONSHOT.md
-//! rung 2, second model): two buckets, private/mirror writers, yanks, deletes,
+//! Stateright model of the multi-bucket replication merge (second model):
+//! two buckets, private/mirror writers, yanks, deletes,
 //! partition-shaped double publishes, and the merge protocol that reconciles
 //! them.
 //!

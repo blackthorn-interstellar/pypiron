@@ -54,7 +54,7 @@ from .helpers import (
 
 pytestmark = pytest.mark.integration
 
-# Canonical fixture advisories, per the ADVISORIES.md acceptance preamble: one
+# Canonical fixture advisories: one
 # MAL exact-version, one MAL all-versions (introduced "0"), one PYSEC with a
 # fixed-in. IDs are asserted byte-equal by later rungs (AC9), so keep them stable.
 MAL_EXACT_ID = "MAL-2024-91001"

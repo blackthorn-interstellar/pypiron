@@ -1,5 +1,5 @@
 //! Delete tombstones: `<filename>.tombstone` beside where a private artifact
-//! lived (dev/MULTIBUCKET.md §6.4). A deleted private filename may never be
+//! lived. A deleted private filename may never be
 //! reused (PyPI semantics), and a crashed delete must converge to "gone" rather
 //! than resurrect the file. Tombstones are written before the artifact is
 //! removed, checked on every write path, filtered out of indexes, and never

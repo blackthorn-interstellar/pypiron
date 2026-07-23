@@ -1,5 +1,5 @@
 //! Conformance: the real worker tick vs the pure marker-selection rule
-//! (dev/MOONSHOT.md rung 2). The stateright event-protocol model binds its
+//!. The stateright event-protocol model binds its
 //! worker transition to `worker::consumable_dirty_work`; this suite closes the
 //! remaining gap by driving the REAL `worker::tick` — listing, rebuild, global
 //! index CAS, and marker consumption — against a deterministic in-memory

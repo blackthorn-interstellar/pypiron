@@ -157,7 +157,7 @@ def test_delete_removes_file_then_package(stocked_server):
 
 
 def test_deleted_filename_cannot_be_reused(stocked_server):
-    """A deleted filename is barred from reuse (dev/MULTIBUCKET.md §6.4). Once the
+    """A deleted filename is barred from reuse. Once the
     artifact bytes are gone, plain create-if-absent would readmit the re-upload;
     the tombstone written at delete time is what makes it 409 instead."""
     server = stocked_server

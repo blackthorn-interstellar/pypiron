@@ -1,8 +1,8 @@
 //! Wall-clock and entropy reads on a protocol path, funneled through one seam.
 //!
 //! Every time-of-day and marker-identity read the correctness protocol depends
-//! on goes through this module so the deterministic simulator (dev/MOONSHOT.md
-//! rung 1) can virtualize time and marker identity: freeze the clock, advance
+//! on goes through this module so the deterministic simulator
+//! can virtualize time and marker identity: freeze the clock, advance
 //! it by hand, and replace random nonces with a counted sequence, making a whole
 //! fleet's execution reproducible. Production takes the real-clock branch,
 //! paying one relaxed atomic load of overhead per call.

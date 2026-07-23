@@ -701,7 +701,7 @@ impl Proxy {
             }
         }
 
-        // Pre-commit re-check (dev/MULTIBUCKET.md §6.2): a slow download can
+        // Pre-commit re-check: a slow download can
         // straddle a mirror→private demotion (or a re-claim). Re-read the claim;
         // if it is no longer the exact MIRROR claim this fill started against,
         // abandon the fill and fall back to the private-name behavior — never

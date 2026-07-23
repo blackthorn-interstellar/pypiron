@@ -1,5 +1,5 @@
 //! Deterministic in-memory storage and fleet helpers for the verification
-//! harnesses: the deterministic simulator's backend (dev/MOONSHOT.md rung 1)
+//! harnesses: the deterministic simulator's backend
 //! and the conformance suites' bucket (rung 2).
 //!
 //! Always compiled — like [`crate::storage::FaultInjectStorage`], the existing

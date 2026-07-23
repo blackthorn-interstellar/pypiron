@@ -1,7 +1,7 @@
 //! Advisory snapshot: the OSV PyPI export parsed into two in-memory views —
 //! a malware **block set** (`MAL-*` ids only) and an **audit index**
 //! (everything). One feed, two features: enforcement where bytes are served
-//! and an org-level audit. See [dev/ADVISORIES.md](../dev/ADVISORIES.md).
+//! and an org-level audit.
 //!
 //! Parsing and matching are pure and unit-tested here; the fetch/persist/reload
 //! plumbing (the rest of this file) is exercised blackbox. The snapshot is a

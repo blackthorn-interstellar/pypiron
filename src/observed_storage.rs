@@ -8,7 +8,7 @@
 //! HTTP 5xx count as availability failures.
 //!
 //! `presign_get` is deliberately unobserved. Signing is blind local math, so it
-//! carries no evidence that the bucket is reachable (dev/MULTIBUCKET.md §5).
+//! carries no evidence that the bucket is reachable.
 
 use std::path::Path;
 use std::sync::Arc;

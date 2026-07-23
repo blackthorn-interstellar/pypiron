@@ -1020,8 +1020,8 @@ pub async fn delete_record(
         }
     }
 
-    // Tombstone a private delete BEFORE the artifact goes (dev/MULTIBUCKET.md
-    // §6.4): the filename is barred from reuse, and a crash between here and the
+    // Tombstone a private delete BEFORE the artifact goes:
+    // the filename is barred from reuse, and a crash between here and the
     // artifact delete converges to "gone" (the index rebuild already drops
     // tombstoned files) instead of resurrecting it. Mirror deletes are local
     // cache management — a cached upstream file stays re-fillable forever — so

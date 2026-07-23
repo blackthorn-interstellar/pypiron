@@ -148,8 +148,7 @@ or a retention policy on `_transparency/`. Server-assigned timestamps plus WORM
 are the anchor — the same mechanism enterprises already accept for SEC 17a-4
 record-keeping — and it is one bucket setting, no key ceremony. No lock, no
 rollback guarantee; the manual says so plainly. Operator signing for
-auditor-portable evidence is a deferred additive layer (see
-[MOONSHOT.md](MOONSHOT.md) rung 3).
+auditor-portable evidence is a deferred additive layer.
 
 The chain is a third kind of state, and the taxonomy should be honest about it:
 not truth, not a regenerable view, but an append-only **witness**. Deleting it
@@ -372,8 +371,7 @@ on the same availability streak the write pin uses and returns only after the
 full return window *and* a worker-confirmed caught-up check (no other bucket
 holds an undrained `_repl/<region>/` note). A node that matches no region reads from the write
 selection — misdetection costs latency, never correctness — and writes never
-move off the write selection. The read-selection contract is in
-[MULTIBUCKET.md](MULTIBUCKET.md#6-reads).
+move off the write selection.
 
 Real traffic feeds the health view. A dedicated multi-only loop GETs the tiny,
 guaranteed topology stamp from every bucket, with a one-second deadline and no
@@ -415,8 +413,7 @@ untrustworthy and the conflict degrades to **quarantine-both + alarm** behind
 resolves by publishing a new filename. Private-over-mirror demotion is a
 per-artifact operation on the ordinary copy path: drive `.origin` to private,
 move the mirror body to `_quarantine/` behind a `.mirror-quarantined` marker,
-copy the private record over. There is no staged package-promotion protocol. The
-complete algebra and failure limits are in [MULTIBUCKET.md](MULTIBUCKET.md).
+copy the private record over. There is no staged package-promotion protocol.
 
 Every reachable bucket carries `_topology/stamp.json`, a hash of the ordered
 bucket names plus an operator generation. Startup rejects disagreement. A
@@ -595,7 +592,7 @@ and never synthesizes it, so a direct upload carrying first-party `attestations`
 is refused. A mirror serves a point-in-time snapshot, so the companion is treated
 as immutable like the artifact it describes.
 
-**Origin-claim lifecycle** (`.origin`, see [MULTIBUCKET.md](MULTIBUCKET.md)). The
+**Origin-claim lifecycle** (`.origin`). The
 claim is a **never-deleted** object with a small monotone lattice of states, and
 every transition is a conditional write (CAS):
 

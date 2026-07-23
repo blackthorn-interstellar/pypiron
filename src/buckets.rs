@@ -1,4 +1,4 @@
-//! Multi-bucket selection primitives (design: dev/MULTIBUCKET.md).
+//! Multi-bucket selection primitives.
 //!
 //! P0 lays the types with zero behavior change: with one configured bucket a
 //! [`BucketSet`] is a thin wrapper that always pins index 0, [`BucketSet::is_multi`]
@@ -94,8 +94,8 @@ pub struct BucketSet {
     /// claim, and coordination decision serializes on. [`pin`](Self::pin).
     current: RwLock<Arc<Pinned>>,
     /// The node's *read* selection: its region bucket while that bucket is
-    /// healthy and caught up, otherwise the write selection (read affinity,
-    /// dev/READ_AFFINITY_VISION.md). Only consulted when `read_active` is set; in
+    /// healthy and caught up, otherwise the write selection (read affinity).
+    /// Only consulted when `read_active` is set; in
     /// the common mode [`read_pin`](Self::read_pin) returns the write pin itself.
     read_current: RwLock<Arc<Pinned>>,
     /// Whether this node maintains a distinct read pin. `false` (no region match
@@ -191,7 +191,7 @@ impl BucketSet {
     /// otherwise it is byte-for-byte [`pin`](Self::pin) — no distinct selection
     /// is maintained, so single-bucket and no-region-match nodes pay nothing and
     /// read from the same bucket they write. Never used for writes or any
-    /// origin-claim decision that could reach upstream (dev/READ_AFFINITY_VISION.md).
+    /// origin-claim decision that could reach upstream.
     pub fn read_pin(&self) -> Arc<Pinned> {
         if self.read_active.load(Ordering::Acquire) {
             self.read_current

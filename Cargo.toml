@@ -53,7 +53,7 @@ pulldown-cmark = { version = "0.13.4", default-features = false }
 # build fails there. Those two are niche (the system allocator is fine); the common
 # cloud arches (x86_64/aarch64) keep the win. main.rs gates the allocator to match.
 [dev-dependencies]
-# Rung 2 of dev/MOONSHOT.md: the stateright model checker exhaustively verifies
+# The stateright model checker exhaustively verifies
 # the event protocol and the multi-bucket merge over all bounded interleavings
 # (tests/model_*.rs). Dev-only: never linked into the shipped binary.
 stateright = "0.31"

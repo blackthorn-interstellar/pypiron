@@ -1,4 +1,4 @@
-//! Merge algebra — pure and symmetric (dev/MULTIBUCKET.md §Conflict resolution).
+//! Merge algebra — pure and symmetric.
 //! Precedence: tombstone ≻ origin (private ≻ mirror) ≻ union ≻ freeze.
 //!
 //! Split out of [`super`][crate::replicate] as the no-I/O decision core: every
@@ -163,7 +163,7 @@ pub enum Verdict {
     FinishFreeze,
 }
 
-/// The core merge decision (dev/MULTIBUCKET.md §6). No I/O, no clocks; every
+/// The core merge decision. No I/O, no clocks; every
 /// input is bucket state. Unit-tested exhaustively below.
 /// A tombstoned record with nothing left to clean: no body, no sidecar, no
 /// companions. Only this settles a delete — a sidecar or companion orphaned
@@ -303,7 +303,7 @@ pub fn is_yanked(sc: &Sidecar) -> bool {
     !matches!(sc.yanked.normalized(), Yanked::Flag(false))
 }
 
-/// Yank merge (dev/MULTIBUCKET.md §6.5): max epoch wins; on an equal epoch a
+/// Yank merge: max epoch wins; on an equal epoch a
 /// conflicting state resolves to yanked (fail-closed); a residual tie (both
 /// yanked, different reasons) breaks on the lexicographically smaller sidecar
 /// sha256. Never a wall clock — two buckets have two clocks.

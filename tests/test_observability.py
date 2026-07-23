@@ -261,3 +261,33 @@ def test_access_log_clf_format(disk_server_access_log_clf):
     assert m.group("status") == "200"
     assert m.group("ua") == "pytest-clf/2.0"
     assert m.group("host").startswith("127.0.0.1")
+
+
+def test_forwarded_for_ignored_without_trusted_proxy(disk_server_access_log_json):
+    """The audit log records the direct peer, not a client-set X-Forwarded-For —
+    otherwise a caller forges its own logged source. --trusted-proxy opts in."""
+    server = disk_server_access_log_json
+    headers = {
+        "User-Agent": "pytest-xff/1.0",
+        "X-Forwarded-For": "203.0.113.9",
+        "X-Real-IP": "203.0.113.9",
+    }
+    code, _, _ = http_get(f"{server['simple']}index.json", headers=headers)
+    assert code == 200
+
+    line = _wait_for_line(
+        server["log_path"],
+        lambda ln: '"target":"pypiron::access"' in ln and "pytest-xff/1.0" in ln,
+    )
+    assert line, "no structured access event was logged"
+    fields = json.loads(line)["fields"]
+    # The forged headers are ignored; the real peer (loopback) is logged.
+    assert fields["client"].startswith("127.0.0.1")
+    assert "203.0.113.9" not in str(fields["client"])
+
+
+def test_responses_carry_nosniff(disk_server):
+    """Defense-in-depth: every response sets X-Content-Type-Options: nosniff."""
+    for path in ("/health", "/simple/index.json"):
+        _, _, headers = http_get(f"{disk_server['base_url']}{path}")
+        assert headers.get("x-content-type-options") == "nosniff", path

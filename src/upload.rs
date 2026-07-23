@@ -5,10 +5,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use tokio::fs::File;
+use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
 static SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -45,19 +46,52 @@ pub struct FinishedSpool {
 }
 
 impl UploadSpool {
+    /// Create a fresh spool file. The name carries wall-nanos + pid + a
+    /// process-local counter (the house idiom, cf. `markers::marker_nonce`) so it
+    /// is unique and unpredictable without a CSPRNG dependency. The file is opened
+    /// `O_CREAT|O_EXCL` mode 0600: exclusive creation refuses to follow a
+    /// pre-planted symlink or reuse an existing inode (killing the shared-tmp
+    /// symlink-truncate vector), and owner-only mode keeps private package bytes
+    /// unreadable to co-tenant users — a property the disk backend then carries
+    /// into the stored artifact, which hard-links this inode. A name that already
+    /// exists (a crashed run's leak after pid recycling, or a local attacker
+    /// pre-creating the path) is handled by re-deriving and retrying, so exclusive
+    /// creation can never wedge uploads.
     pub async fn new(dir: &Path) -> Result<Self> {
-        let name = format!(
-            "pypiron-upload-{}-{}.spool",
-            std::process::id(),
-            SPOOL_COUNTER.fetch_add(1, Ordering::Relaxed),
-        );
-        let path = dir.join(name);
-        let file = File::create(&path).await?;
-        Ok(Self {
-            file,
-            path: TempPath(path),
-            hasher: Sha256::new(),
-            size: 0,
+        let mut last_err = None;
+        for _ in 0..8 {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let seq = SPOOL_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!(
+                "pypiron-upload-{nanos}-{}-{seq}.spool",
+                std::process::id()
+            ));
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            match opts.open(&path).await {
+                Ok(file) => {
+                    return Ok(Self {
+                        file,
+                        path: TempPath(path),
+                        hasher: Sha256::new(),
+                        size: 0,
+                    })
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(anyhow::Error::from(e).context("open upload spool")),
+            }
+        }
+        Err(match last_err {
+            Some(e) => anyhow::Error::from(e).context("open upload spool: name kept colliding"),
+            None => anyhow::anyhow!("open upload spool: no attempt made"),
         })
     }
 

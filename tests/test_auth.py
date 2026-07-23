@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from .helpers import (
+    _encode_basic_auth,
+    _http_request,
     download_pypi_wheel,
     http_get,
     http_request_auth,
@@ -67,6 +69,51 @@ def test_uploader_cannot_delete_or_yank(disk_server, tmp_path):
     assert code == 200
     code, _, _ = http_request_auth("DELETE", f"{base}/files/{PACKAGE}/{wheel.name}", **admin)
     assert code == 204
+
+
+def test_csrf_guard_blocks_cross_site_mutations(disk_server, tmp_path):
+    """Cached Basic creds are ambient authority: a browser holding them must not be
+    ridden from another site to forge a mutation. The guard keys off Sec-Fetch-Site
+    (Origin for older browsers); CLI clients send neither header and pass through."""
+    wheel = download_pypi_wheel(PACKAGE, VERSION, tmp_path)
+    admin = {"username": disk_server["admin_user"], "password": disk_server["admin_password"]}
+    # Baseline: a normal upload (no fetch metadata — the CLI path) works.
+    upload_legacy(disk_server["legacy"], wheel, **admin)
+    wait_for_file_in_index(disk_server["simple"], PACKAGE, wheel.name)
+
+    auth = _encode_basic_auth(disk_server["admin_user"], disk_server["admin_password"])
+    yank_url = f"{disk_server['base_url']}/files/{PACKAGE}/{wheel.name}/yank"
+
+    # A cross-site POST carrying valid admin creds is rejected before the handler,
+    # for both the multipart upload and the string-body yank.
+    for url in (disk_server["legacy"], yank_url):
+        code, _, _ = _http_request(
+            url,
+            method="POST",
+            headers={"Authorization": auth, "Sec-Fetch-Site": "cross-site"},
+            data=b"x",
+        )
+        assert code == 403, url
+
+    # An older browser sends no Sec-Fetch-Site; a foreign Origin is caught instead.
+    code, _, _ = _http_request(
+        yank_url,
+        method="POST",
+        headers={"Authorization": auth, "Origin": "https://evil.example"},
+        data=b"bad",
+    )
+    assert code == 403
+
+    # Same-origin browser requests and CLI requests (neither header) pass through.
+    code, _, _ = _http_request(
+        yank_url,
+        method="POST",
+        headers={"Authorization": auth, "Sec-Fetch-Site": "same-origin"},
+        data=b"reason",
+    )
+    assert code == 200
+    code, _, _ = http_request_auth("POST", yank_url, data=b"reason", **admin)
+    assert code == 200
 
 
 def test_401_carries_www_authenticate(disk_server):

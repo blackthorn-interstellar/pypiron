@@ -214,6 +214,11 @@ pub struct AppState {
     /// See `log_requests`.
     pub access_log: bool,
     pub access_log_format: AccessLogFormat,
+    /// Honor `X-Forwarded-For`/`X-Real-IP` for the logged client IP. Off by
+    /// default: those headers are client-settable, so trusting them ungated lets
+    /// any direct caller forge its audit-logged address. Enable only behind a
+    /// reverse proxy that sets them.
+    pub trusted_proxy: bool,
     // worker cfg
     pub worker_interval: Duration,
     pub reconcile_interval: Duration,
@@ -445,6 +450,7 @@ impl AppState {
             metrics_project_labels: false,
             access_log: false,
             access_log_format: AccessLogFormat::Structured,
+            trusted_proxy: false,
             worker_interval: Duration::from_secs(1),
             reconcile_interval: Duration::from_secs(86400),
             repl_sweep_interval: Duration::from_secs(300),
@@ -1126,6 +1132,7 @@ async fn run_serve(
         metrics_project_labels: cli.metrics_project_labels,
         access_log: cli.access_log,
         access_log_format: cli.access_log_format,
+        trusted_proxy: cli.trusted_proxy,
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
         repl_sweep_interval: Duration::from_secs(cli.repl_sweep_interval_secs),
@@ -1281,6 +1288,12 @@ async fn run_serve(
         .with_state(state.clone())
         // Axum's default 2 MB body limit would reject any real wheel.
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
+        // CSRF guard for state-changing requests, and `nosniff` on every
+        // response. Both sit *after* `.merge(streaming)` so they wrap /legacy and
+        // the /files DELETE too, and *inside* log_requests so a blocked cross-site
+        // attempt still lands in the audit log.
+        .layer(middleware::from_fn(csrf_guard))
+        .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn_with_state(state.clone(), log_requests))
         .layer(middleware::from_fn(add_www_authenticate))
         .layer(middleware::from_fn_with_state(state.clone(), track_metrics));
@@ -1497,7 +1510,7 @@ async fn log_requests(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
-    let host = client_ip(req.headers(), peer);
+    let host = client_ip(req.headers(), peer, state.trusted_proxy);
     // CLF-only fields: skip the work for the structured path.
     let version = req.version();
     let authuser = clf
@@ -1581,19 +1594,24 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The client's address for logging: `X-Forwarded-For` (leftmost) or
-/// `X-Real-IP` when set by a trusted proxy, else the direct peer, else `-`.
-fn client_ip(headers: &HeaderMap, peer: Option<std::net::IpAddr>) -> String {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        let first = xff.split(',').next().unwrap_or("").trim();
-        if !first.is_empty() {
-            return first.to_string();
+/// The client's address for logging. Only behind a reverse proxy
+/// (`--trusted-proxy`) do the proxy-set `X-Forwarded-For` (leftmost) or
+/// `X-Real-IP` win; otherwise those headers are ignored — they are
+/// client-settable, so an ungated direct caller could forge its audit-logged
+/// address — and the direct peer is used, else `-`.
+fn client_ip(headers: &HeaderMap, peer: Option<std::net::IpAddr>, trusted_proxy: bool) -> String {
+    if trusted_proxy {
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            let first = xff.split(',').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return first.to_string();
+            }
         }
-    }
-    if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let real = real.trim();
-        if !real.is_empty() {
-            return real.to_string();
+        if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+            let real = real.trim();
+            if !real.is_empty() {
+                return real.to_string();
+            }
         }
     }
     peer.map(|ip| ip.to_string())
@@ -1651,6 +1669,71 @@ fn format_clf(line: &AccessLogLine<'_>) -> String {
         referer = dash(referer),
         ua = dash(ua),
     )
+}
+
+/// Reject state-changing requests a browser initiated cross-site. pypiron's HTTP
+/// Basic credentials are ambient authority: a browser that cached them for this
+/// origin (say, after an admin opened a read-gated page) re-attaches them to a
+/// cross-site form POST, exactly like a cookie — the classic CSRF-with-Basic
+/// vector. The command-line clients (pip/uv/twine, `pypiron sync`) send no fetch
+/// metadata, so on an unsafe method the rule is: trust the browser's own
+/// `Sec-Fetch-Site` (allow only `same-origin`/`none`); if the client is too old
+/// to send it, fall back to matching `Origin`'s authority against our `Host`; a
+/// request with neither header is a non-browser client and passes. Header-only —
+/// it never touches the body, so /legacy's auth-before-body order and upload
+/// streaming are preserved. Safe methods (GET/HEAD/OPTIONS) are ignored.
+async fn csrf_guard(req: Request, next: Next) -> Response<Body> {
+    let method = req.method();
+    let unsafe_method =
+        *method != Method::GET && *method != Method::HEAD && *method != Method::OPTIONS;
+    if unsafe_method {
+        let headers = req.headers();
+        if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+            // Browser fetch metadata: authoritative and unspoofable by page JS.
+            if !site.eq_ignore_ascii_case("same-origin") && !site.eq_ignore_ascii_case("none") {
+                return csrf_blocked();
+            }
+        } else if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+            // Pre-fetch-metadata browser: compare Origin's authority to our Host.
+            if !origin_matches_host(origin, headers) {
+                return csrf_blocked();
+            }
+        }
+        // Neither header: a non-browser client (pip/uv/twine, pypiron CLI). Allow.
+    }
+    next.run(req).await
+}
+
+/// A cross-site mutation gets a bare 403 — a browser page can't read the body and
+/// a CLI client never reaches here.
+fn csrf_blocked() -> Response<Body> {
+    (StatusCode::FORBIDDEN, "cross-site request blocked").into_response()
+}
+
+/// True when `Origin`'s authority (host[:port]) equals our own `Host` header.
+/// Keys off `Host`, never `X-Forwarded-Host`, so a proxy rewrite can't force a
+/// match; a `null` or malformed Origin never matches.
+fn origin_matches_host(origin: &str, headers: &HeaderMap) -> bool {
+    let Some((_scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|host| host.eq_ignore_ascii_case(authority))
+}
+
+/// Defense-in-depth: `X-Content-Type-Options: nosniff` on every response so a
+/// browser can't MIME-sniff a body into an executable type. Every pypiron
+/// response already carries an explicit, correct Content-Type, so this only
+/// forecloses future regressions.
+async fn security_headers(req: Request, next: Next) -> Response<Body> {
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    resp
 }
 
 /// RFC 7235: a 401 without `WWW-Authenticate` is malformed, and pip's keyring
@@ -1893,6 +1976,33 @@ pub(crate) fn internal(label: &'static str, e: impl std::fmt::Display) -> (Statu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_ip_honors_forwarded_headers_only_behind_trusted_proxy() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let peer = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+
+        let mut fwd = HeaderMap::new();
+        fwd.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.9, 10.0.0.1"),
+        );
+        // Ungated (default): client-set forwarding headers are ignored, so the
+        // direct peer is logged and a caller can't forge its audit address.
+        assert_eq!(client_ip(&fwd, peer, false), "127.0.0.1");
+        // Behind a trusted proxy: the leftmost X-Forwarded-For entry wins.
+        assert_eq!(client_ip(&fwd, peer, true), "203.0.113.9");
+
+        // X-Real-IP is the fallback when X-Forwarded-For is absent, again only
+        // when the proxy is trusted.
+        let mut real = HeaderMap::new();
+        real.insert("x-real-ip", HeaderValue::from_static("198.51.100.7"));
+        assert_eq!(client_ip(&real, peer, false), "127.0.0.1");
+        assert_eq!(client_ip(&real, peer, true), "198.51.100.7");
+
+        // No headers and no peer → "-".
+        assert_eq!(client_ip(&HeaderMap::new(), None, true), "-");
+    }
 
     #[test]
     fn probe_gating_tracks_traffic_and_unhealthy_buckets() {

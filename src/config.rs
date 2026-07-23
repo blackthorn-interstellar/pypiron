@@ -90,6 +90,7 @@ pub struct ServeConfig {
     pub artifact_delivery: Option<String>,
     pub access_log: Option<bool>,
     pub access_log_format: Option<String>,
+    pub trusted_proxy: Option<bool>,
     pub proxy_upstream: Option<String>,
     pub allow_insecure_upstream: Option<bool>,
     pub advisory_feed: Option<String>,

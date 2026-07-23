@@ -616,6 +616,13 @@ pub struct ServeArgs {
     )]
     pub(crate) access_log_format: AccessLogFormat,
 
+    /// Honor `X-Forwarded-For`/`X-Real-IP` for the logged client IP. Off by
+    /// default: those headers are client-settable, so trusting them ungated lets
+    /// a direct caller forge its audit-logged address. Enable only when pypiron
+    /// sits behind a reverse proxy that sets them.
+    #[arg(long, env = "PYPIRON_TRUSTED_PROXY")]
+    pub(crate) trusted_proxy: bool,
+
     /// Worker interval in seconds. The nudge path makes same-process writes
     /// visible at rebuild speed regardless; this is the marker-poll cadence
     /// for peer nodes' writes. 1s costs ~$0.45/month in S3 LISTs.
@@ -907,6 +914,7 @@ pub fn merge_serve_file(
         &f.artifact_delivery
     );
     fill!(cli.access_log, "access_log", f.access_log);
+    fill!(cli.trusted_proxy, "trusted_proxy", f.trusted_proxy);
     fill_enum!(
         cli.access_log_format,
         "access_log_format",

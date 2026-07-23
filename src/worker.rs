@@ -3062,6 +3062,7 @@ mod tests {
             metrics_project_labels: false,
             access_log: false,
             access_log_format: AccessLogFormat::Structured,
+            trusted_proxy: false,
             worker_interval,
             reconcile_interval: Duration::from_secs(3600),
             repl_sweep_interval: Duration::from_secs(300),

@@ -25,7 +25,12 @@ draws the line, and how to prove the release you're about to run is authentic.
 proven otherwise. Credentials compare in constant time, so a wrong guess leaks no
 timing. A half-configured credential disables its role instead of enabling a
 bypassable one. Private names never fall through to upstream, so nobody can shadow
-one with a public package of the same name.
+one with a public package of the same name. A browser can't be turned against you:
+cross-site state-changing requests are rejected, so cached Basic credentials can't
+be ridden from another site to forge an upload or a yank, and every response
+carries `X-Content-Type-Options: nosniff`. Client-set `X-Forwarded-For`/`X-Real-IP`
+are ignored for the audit log unless you enable `--trusted-proxy`, so a direct
+caller can't forge its logged address.
 
 **Trusted — your storage backend.** The S3, GCS, Azure, or disk backend you
 configure is your data behind your keys, and pypiron treats its responses as
@@ -76,6 +81,15 @@ design; know them before you lean on the rest.
   relays PyPI's provenance; it never mints or re-verifies attestations itself. A
   malicious upload that PyPI accepted and signed is one pypiron will carry across.
   Your own private uploads are a separate world you control.
+- **Online credential guessing and request floods.** pypiron does no in-process
+  rate limiting — a single stateless binary can't count requests across replicas,
+  and the job belongs at the edge. Put a request-rate limit on your reverse proxy
+  or load balancer. Failed logins already appear in the audit log as `401`/`403`
+  events at `info` level (so keep `pypiron::access=info` if you feed them to
+  fail2ban or a SIEM — raising it to `warn` keeps only 5xx and drops them); key any
+  ban on the real peer address, or trust the logged client field only when pypiron
+  sits behind a proxy with `--trusted-proxy`, since otherwise an attacker sets that
+  `X-Forwarded-For` themselves.
 
 ## Dependency advisories
 

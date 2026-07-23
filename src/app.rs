@@ -23,9 +23,9 @@ use tracing::{debug, info, warn};
 // name so the bare `worker::`, `storage::`, … paths throughout this file (from
 // its life as the crate root) keep resolving.
 use crate::{
-    advisories, bucket_health, buckets, cache, config, counted_storage, counters, html, metrics,
-    names, node_region, observed_storage, origin, project_cache, proxy, render, storage, sync,
-    token, transparency, verify, worker,
+    advisories, bucket_health, buckets, cache, config, counters, html, metrics, names, node_region,
+    observed_storage, origin, project_cache, proxy, render, storage, sync, token, transparency,
+    verify, worker,
 };
 
 use bucket_health::{HealthController, HealthPolicy};
@@ -807,18 +807,7 @@ async fn run_serve(
     cli.storage.warn_if_data_dir_ignored();
 
     let storage_desc = cli.storage.describe();
-    // Built before storage so every backend call — boot-time index init
-    // included — lands in `pypiron_storage_ops_total`.
-    let metrics = Arc::new(metrics::Metrics::new());
-    let raw_storages: Vec<Arc<dyn Storage>> = cli
-        .storage
-        .build_all()
-        .await?
-        .into_iter()
-        .map(|s| {
-            Arc::new(counted_storage::CountedStorage::new(s, metrics.clone())) as Arc<dyn Storage>
-        })
-        .collect();
+    let raw_storages = cli.storage.build_all().await?;
     let names = cli.storage.bucket_names();
     debug_assert_eq!(raw_storages.len(), names.len());
     let bucket_health = if raw_storages.len() > 1 {
@@ -1042,7 +1031,7 @@ async fn run_serve(
         empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
-        metrics,
+        metrics: Arc::new(metrics::Metrics::new()),
         counters,
         download_board: Arc::new(std::sync::Mutex::new(None)),
         proxy,

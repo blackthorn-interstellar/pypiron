@@ -275,8 +275,9 @@ def cmd_run(args) -> None:
             },
             "endpoints": {},
         }
+        only = set(args.only.split(",")) if args.only else None
         ctx = assign_targets(data)
-        readers = [ep for ep in ENDPOINTS if not ep.mutates]
+        readers = [ep for ep in ENDPOINTS if not ep.mutates and (only is None or ep.name in only)]
         for ep in readers:
             r = run_read_endpoint(args.bin, data, tmp / f"{ep.name}.log", ep, ctx)
             result["endpoints"][ep.name] = r
@@ -285,31 +286,38 @@ def cmd_run(args) -> None:
                 f"p95={r['warm']['p95_ms']}ms ops(cold)={r['cold_ops']} ops(warm)={r['warm_ops']}"
             )
 
-        # Worst-case first hit: the corpus's biggest package, fresh process.
-        monster = manifest["largest"]["name"]
-        mctx = Ctx(targets={"simple-pkg-html": monster}, versions={monster: "0.0.0"})
-        mep = next(ep for ep in ENDPOINTS if ep.name == "simple-pkg-html")
-        server = start_server(args.bin, data, tmp / "monster.log", sweep=False)
-        try:
-            _, cold_ms, body = hit(server["base"], mep, mctx, 0)
-            result["monster"] = {
-                "package": monster,
-                "files": manifest["largest"]["files"],
-                "cold_ms": round(cold_ms, 3),
-                "bytes": len(body),
-                "rss_mb": round(rss_mb(server["proc"].pid), 1),
-            }
-            print(f"monster {monster} ({manifest['largest']['files']} files): {cold_ms:.1f}ms")
-        finally:
-            stop_server(server)
+        if only is None or "monster" in only:
+            # Worst-case first hit: the corpus's biggest package, fresh process.
+            monster = manifest["largest"]["name"]
+            mctx = Ctx(targets={"simple-pkg-html": monster}, versions={monster: "0.0.0"})
+            mep = next(ep for ep in ENDPOINTS if ep.name == "simple-pkg-html")
+            server = start_server(args.bin, data, tmp / "monster.log", sweep=False)
+            try:
+                _, cold_ms, body = hit(server["base"], mep, mctx, 0)
+                result["monster"] = {
+                    "package": monster,
+                    "files": manifest["largest"]["files"],
+                    "cold_ms": round(cold_ms, 3),
+                    "bytes": len(body),
+                    "rss_mb": round(rss_mb(server["proc"].pid), 1),
+                }
+                print(f"monster {monster} ({manifest['largest']['files']} files): {cold_ms:.1f}ms")
+            finally:
+                stop_server(server)
 
-        print("write phase (snapshot -> mutate -> restore -> verify)")
-        writes = run_write_phase(args.bin, data, tmp / "writes.log", tmp / "aux-snapshot")
-        result["endpoints"].update({k: v for k, v in writes.items() if k != "upload-visible"})
-        result["upload_visible_secs"] = writes["upload-visible"]["secs"]
+        if only is None or any(ep.mutates and ep.name in only for ep in ENDPOINTS):
+            print("write phase (snapshot -> mutate -> restore -> verify)")
+            writes = run_write_phase(args.bin, data, tmp / "writes.log", tmp / "aux-snapshot")
+            result["endpoints"].update({k: v for k, v in writes.items() if k != "upload-visible"})
+            result["upload_visible_secs"] = writes["upload-visible"]["secs"]
         starts = [r["startup_secs"] for r in result["endpoints"].values() if "startup_secs" in r]
-        result["startup_secs_median"] = sorted(starts)[len(starts) // 2]
+        if starts:
+            result["startup_secs_median"] = sorted(starts)[len(starts) // 2]
 
+    if args.dry or only is not None:
+        # Partial or exploratory runs never overwrite the committed series.
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
     RESULTS_DIR.mkdir(exist_ok=True)
     out = RESULTS_DIR / f"microbench-{args.packages}.json"
     out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
@@ -354,6 +362,9 @@ def main() -> None:
         p.add_argument("--bin", default=str(REPO / "target" / "release" / "pypiron"))
         p.add_argument("--packages", type=int, default=50000 if name != "pins" else CI_PACKAGES)
         p.add_argument("--seed", type=int, default=42)
+        if name == "run":
+            p.add_argument("--only", help="comma-separated endpoint names (or 'monster')")
+            p.add_argument("--dry", action="store_true", help="print JSON, never write results/")
         p.set_defaults(fn=fn)
     args = ap.parse_args()
     args.fn(args)

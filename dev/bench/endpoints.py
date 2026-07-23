@@ -722,20 +722,28 @@ def ops_delta(before: dict, after: dict) -> dict:
     return {op: after[op] - before[op] for op in OPS if after[op] != before[op]}
 
 
-def ops_settled(base: str, timeout: float = 10.0, quiet: float = 0.05) -> dict:
+def ops_settled(base: str, timeout: float = 20.0, quiet: float = 0.15, streak: int = 3) -> dict:
     """The op snapshot once the worker's async tail has stopped moving.
 
     A mutation returns its HTTP response before the nudged worker finishes the
-    index rebuild; two identical snapshots `quiet` apart mean that tail landed.
+    index rebuild. One quiet gap is not proof: on a loaded CI runner the worker
+    can pause >50ms mid-tail and leak its next op into the following endpoint's
+    measurement window (seen as a stray delete on sync-cursors-put). Require
+    `streak` consecutive identical snapshots `quiet` apart — sustained silence.
     """
     last = ops_snapshot(base)
+    same = 0
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(quiet)
         cur = ops_snapshot(base)
         if cur == last:
-            return cur
-        last = cur
+            same += 1
+            if same >= streak:
+                return cur
+        else:
+            same = 0
+            last = cur
     raise TimeoutError("storage ops never settled")
 
 

@@ -527,9 +527,11 @@ impl Counters {
     }
 
     /// Build a [`DaySummary`] for `day` from live state — the same shape
-    /// [`Counters::write_summary`] freezes, but computed on read by summing every
-    /// shard via [`Counters::read_day_shard`] (so a shard's frozen file still wins
-    /// over its open segments). `None` when no shard has data for the day.
+    /// [`Counters::write_summary`] freezes, but computed on read. The caller only
+    /// reaches here for an *open* day (`compact` never froze it), so instead of
+    /// probing all shards this lists the day's two prefixes once, still letting a
+    /// frozen shard file that raced in win over that shard's open segments. `None`
+    /// when no shard has data for the day.
     async fn summarize_day_live(
         &self,
         store: &dyn ObjectStore,
@@ -539,13 +541,42 @@ impl Counters {
         let mut totals: BTreeMap<String, u64> = BTreeMap::new();
         let mut total: u64 = 0;
         let mut any = false;
-        for shard in all_shards() {
-            let Some(buckets) = self.read_day_shard(store, metric, day, shard).await else {
-                continue;
+
+        // Frozen shard files are near-always absent for an open day, but honor
+        // any that raced in — a leader ahead of this clock-behind querier whose
+        // best-effort summary write failed — so it still wins over stragglers.
+        // One prefix LIST replaces the 37 blind per-shard frozen GETs.
+        let mut frozen_shards: std::collections::HashSet<char> = std::collections::HashSet::new();
+        let day_prefix = format!("{PREFIX}{metric}/day/{day}/");
+        for k in store.list(&day_prefix).await.unwrap_or_default() {
+            let Some(shard) = frozen_shard_of(&k) else {
+                continue; // _summary.json or a stray key
             };
-            any = true;
-            fold_buckets(&buckets, &mut totals, &mut total);
+            if let Ok(Some(bytes)) = store.get(&k).await {
+                let seg: Segment = serde_json::from_slice(&bytes).unwrap_or_default();
+                fold_buckets(&seg.buckets, &mut totals, &mut total);
+                frozen_shards.insert(shard);
+                any = true;
+            }
         }
+
+        // Open segments for every not-yet-frozen shard, summed in one pass. One
+        // prefix LIST replaces the per-shard segment LISTs.
+        let seg_prefix = format!("{PREFIX}{metric}/seg/{day}/");
+        let open: Vec<String> = store
+            .list(&seg_prefix)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|k| seg_shard_of(k).is_some_and(|s| !frozen_shards.contains(&s)))
+            .collect();
+        if !open.is_empty() {
+            if let Some(buckets) = sum_segments(store, &open).await {
+                fold_buckets(&buckets, &mut totals, &mut total);
+                any = true;
+            }
+        }
+
         any.then(|| rank_summary(totals, total))
     }
 
@@ -587,6 +618,26 @@ fn fold_buckets(buckets: &BucketMap, totals: &mut BTreeMap<String, u64>, total: 
 /// `None` when the key is not under the prefix.
 fn key_parts(key: &str) -> Option<Vec<&str>> {
     Some(key.strip_prefix(PREFIX)?.split('/').collect())
+}
+
+/// The shard of a frozen day-shard key `<metric>/day/<day>/<shard>.json`.
+/// `None` for the day's `_summary.json` or any non-shard key — so the `_`
+/// catch-all shard is never confused with the `_summary` file's leading `_`.
+fn frozen_shard_of(key: &str) -> Option<char> {
+    match key_parts(key)?[..] {
+        [_metric, "day", _day, file] if file != SUMMARY_FILE => {
+            file.strip_suffix(".json").and_then(first_char)
+        }
+        _ => None,
+    }
+}
+
+/// The shard of an open segment key `<metric>/seg/<day>/<shard>/<file>`.
+fn seg_shard_of(key: &str) -> Option<char> {
+    match key_parts(key)?[..] {
+        [_metric, "seg", _day, shard, _file] => first_char(shard),
+        _ => None,
+    }
 }
 
 /// Sum a set of segment objects into one [`BucketMap`]. Returns `None` on any
@@ -670,12 +721,6 @@ fn shard_of(key: &str) -> char {
         Some(c) if c.is_ascii_alphanumeric() => c.to_ascii_lowercase(),
         _ => '_',
     }
-}
-
-/// Every shard label in deterministic order — the inverse of [`shard_of`]: the
-/// package tree's first-character fan-out (`0-9`, `a-z`) plus the `_` catch-all.
-fn all_shards() -> impl Iterator<Item = char> {
-    ('0'..='9').chain('a'..='z').chain(std::iter::once('_'))
 }
 
 /// Total + top-50 (count desc, then key asc) — the on-disk [`DaySummary`] shape,

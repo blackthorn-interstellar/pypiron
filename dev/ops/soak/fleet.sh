@@ -186,6 +186,21 @@ for s in live:
           f"{s.get('cores', '?')}c  {s.get('seeds', 0):,} seeds  ({int(age(s) or 0)}s ago)")
 if not live:
     print("  no live workers reporting (last update > 15 min ago)")
+
+# Per-commit rollup: "the current run" is the commit the fleet is soaking now,
+# which spans segments (each reporter restart starts a new one).
+by_commit = {}
+for s in segments:
+    by_commit.setdefault(s.get("commit", "?"), []).append(s)
+recent = sorted(by_commit.items(),
+                key=lambda kv: max(s.get("updated_at", "") for s in kv[1]), reverse=True)
+for commit, segs in recent[:5]:
+    tag = " (current)" if any(s in live for s in segs) else ""
+    print(f"  commit {commit}: {sum(s.get('seeds', 0) for s in segs):,} seeds "
+          f"in {len(segs)} segment(s){tag}")
+if len(recent) > 5:
+    print(f"  (+{len(recent) - 5} older commits, counted in lifetime)")
+
 total = {k: sum(s.get(k, 0) for s in segments) for k in ("seeds", "interleavings", "acked_uploads")}
 print(f"  lifetime: {len(segments)} segments, {total['seeds']:,} seeds, "
       f"{total['interleavings']:,} interleavings, {total['acked_uploads']:,} acked uploads")

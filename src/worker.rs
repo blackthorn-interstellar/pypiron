@@ -736,10 +736,6 @@ pub async fn run_worker_until(
                 _ = state.counters.flush() => {}
                 _ = wait_until_generation_changes(&state, selected.generation) => {}
             }
-            // Drop the per-package /stats cache now that this node's own writes are
-            // in the store, so a same-node poll reads its own just-flushed counts
-            // (the TTL bounds other nodes). Off the hot path, once per flush.
-            state.invalidate_package_stats();
         }
 
         // Advisory refresh (EVERY node): the leader refetches the source and
@@ -2574,13 +2570,9 @@ async fn write_global_indexes_cas(
             return Ok(CasOutcome::Lost);
         };
         state.index_cache.invalidate(&json_key);
-        // The `/projects/` browser is another render of this same name set, so
-        // drop its cached page alongside the global simple index.
-        state.invalidate_projects_page();
         return Ok(CasOutcome::Won(Some(new_etag)));
     }
     write_global_indexes(state, storage, packages).await?;
-    state.invalidate_projects_page();
     Ok(CasOutcome::Won(None))
 }
 
@@ -3091,9 +3083,6 @@ mod tests {
             metrics: Arc::new(crate::metrics::Metrics::new()),
             counters: Arc::new(crate::counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),
-            summary_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            package_stats_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),

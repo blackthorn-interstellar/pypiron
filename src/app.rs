@@ -23,9 +23,9 @@ use tracing::{debug, info, warn};
 // name so the bare `worker::`, `storage::`, … paths throughout this file (from
 // its life as the crate root) keep resolving.
 use crate::{
-    advisories, bucket_health, buckets, cache, config, counters, html, metrics, names, node_region,
-    observed_storage, origin, project_cache, proxy, render, storage, sync, token, transparency,
-    verify, worker,
+    advisories, bucket_health, buckets, cache, config, counted_storage, counters, html, metrics,
+    names, node_region, observed_storage, origin, project_cache, proxy, render, storage, sync,
+    token, transparency, verify, worker,
 };
 
 use bucket_health::{HealthController, HealthPolicy};
@@ -135,6 +135,44 @@ const CLF_TIME: &[time::format_description::FormatItem<'_>] = time::macros::form
 /// Shared TTL cache of the ranked download leaderboard: `(computed_at, board)`,
 /// or `None` until first populated.
 type DownloadBoard = Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<(String, u64)>)>>>;
+/// Metric-keyed TTL cache of the `/stats/:metric` day-summaries: `metric ->
+/// (computed_at, summaries)`. The global-stats twin of [`DownloadBoard`] — same
+/// bounded staleness — but keyed by the request's `:metric`, so the map bounds
+/// itself with a wholesale clear (in practice only `downloads` is ever recorded).
+type SummaryCache = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            (
+                std::time::Instant,
+                Arc<std::collections::BTreeMap<String, counters::DaySummary>>,
+            ),
+        >,
+    >,
+>;
+/// `(metric, package)`-keyed TTL cache of the `/stats/:metric/:package` daily
+/// series: `(metric, package) -> (computed_at, day -> sub-key -> count)`. The
+/// per-package twin of [`SummaryCache`] — same bounded staleness — but keyed by
+/// the request's `(:metric, :package)`, a high-cardinality read-gated path, so
+/// the map bounds itself with a wholesale clear and the worker drops it after
+/// each counter flush (same-node read-your-writes; the TTL bounds other nodes).
+type PackageStatsCache = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            (String, String),
+            (
+                std::time::Instant,
+                Arc<std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>>,
+            ),
+        >,
+    >,
+>;
+/// Single-slot cache of the fully-rendered empty-query `/projects/` browser page:
+/// `(rendered_at, generation, bytes)`, or `None` until first populated. The page
+/// is a host-independent render of the whole name set — identical bytes for every
+/// request — so one refcounted `Bytes` serves them all; the worker drops it when
+/// the name set changes and the TTL bounds cross-node staleness.
+type ProjectsPageCache = Arc<std::sync::Mutex<Option<(std::time::Instant, u64, bytes::Bytes)>>>;
 type EmptyOriginObservations =
     Arc<tokio::sync::Mutex<std::collections::HashMap<(u64, String), (String, std::time::Instant)>>>;
 
@@ -238,6 +276,28 @@ pub struct AppState {
     /// the homepage marquee and `/downloads/` so a public homepage doesn't rescan
     /// the counter store on every hit; the numbers lag a flush interval anyway.
     pub download_board: DownloadBoard,
+    /// Metric-keyed TTL cache of the global `/stats/:metric` day-summaries, so a
+    /// repeated global-stats poll doesn't rescan the counter store every hit —
+    /// the same idiom [`download_board`](Self::download_board) applies to the
+    /// homepage marquee. Bounded by a wholesale clear (`:metric` is a read-gated
+    /// path param); the numbers lag a counter flush anyway.
+    pub summary_cache: SummaryCache,
+    /// `(metric, package)`-keyed TTL cache of the `/stats/:metric/:package` daily
+    /// series, so a repeatedly-polled dashboard endpoint doesn't rescan a
+    /// package's 30-day counter window on every hit. The per-package twin of
+    /// [`summary_cache`](Self::summary_cache); high-cardinality `:package` keys
+    /// are bounded by a wholesale clear, and the worker drops it after each
+    /// counter flush so a same-node reader sees its own writes (TTL bounds
+    /// other nodes) — the [`project_cache`](Self::project_cache) invalidation model.
+    pub package_stats_cache: PackageStatsCache,
+    /// Single-slot TTL cache of the rendered empty-query `/projects/` browser
+    /// page. That page re-renders the whole name set — a sort plus a multi-MB
+    /// escape/concat — on every hit for bytes identical across requests; caching
+    /// the finished page collapses a warm hit to a refcounted clone. Only the
+    /// empty query is cached (a `?q=` search is rare and per-query keys would be
+    /// unbounded); the worker drops it when the name set changes, the TTL bounds
+    /// other nodes.
+    pub projects_page_cache: ProjectsPageCache,
     /// On-demand upstream mirroring (None unless --proxy-upstream is set).
     pub proxy: Option<Arc<proxy::Proxy>>,
     /// Process start, for the homepage uptime readout.
@@ -290,6 +350,49 @@ impl AppState {
     /// guard. Cheap enough for the request path; recovers a poisoned lock.
     pub fn advisory_snapshot(&self) -> Arc<advisories::AdvisoryState> {
         advisories::AdvisoryState::read(&self.advisories)
+    }
+
+    /// Serve the cached empty-query `/projects/` page when it is warm and was
+    /// built under the current selection generation; `None` on a cold slot, past
+    /// the TTL, or after a bucket switch (generation mismatch), when the caller
+    /// renders and [`store_projects_page`](Self::store_projects_page)s it.
+    pub(crate) fn projects_page_cached(&self, generation: u64) -> Option<bytes::Bytes> {
+        let guard = self
+            .projects_page_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (at, gen, body) = guard.as_ref()?;
+        (*gen == generation && at.elapsed() < cache::INDEX_CACHE_TTL).then(|| body.clone())
+    }
+
+    /// Cache the freshly rendered empty-query `/projects/` page under the current
+    /// selection generation.
+    pub(crate) fn store_projects_page(&self, generation: u64, body: bytes::Bytes) {
+        *self
+            .projects_page_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some((std::time::Instant::now(), generation, body));
+    }
+
+    /// Drop the cached `/projects/` page after the global name set changes, so a
+    /// same-node reader sees the new listing at once (the TTL bounds other nodes).
+    /// A hard drop, mirroring the index cache's invalidation.
+    pub(crate) fn invalidate_projects_page(&self) {
+        *self
+            .projects_page_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Drop the per-package stats cache after a counter flush, so a same-node
+    /// reader sees its own just-flushed download counts at once (the TTL bounds
+    /// other nodes). Mirrors [`invalidate_projects_page`](Self::invalidate_projects_page).
+    pub(crate) fn invalidate_package_stats(&self) {
+        self.package_stats_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Record that a client request just arrived (traffic signal for probe
@@ -367,6 +470,9 @@ impl AppState {
             metrics: Arc::new(metrics::Metrics::new()),
             counters: Arc::new(counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),
+            summary_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            package_stats_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -807,7 +913,18 @@ async fn run_serve(
     cli.storage.warn_if_data_dir_ignored();
 
     let storage_desc = cli.storage.describe();
-    let raw_storages = cli.storage.build_all().await?;
+    // Built before storage so every backend call — boot-time index init
+    // included — lands in `pypiron_storage_ops_total`.
+    let metrics = Arc::new(metrics::Metrics::new());
+    let raw_storages: Vec<Arc<dyn Storage>> = cli
+        .storage
+        .build_all()
+        .await?
+        .into_iter()
+        .map(|s| {
+            Arc::new(counted_storage::CountedStorage::new(s, metrics.clone())) as Arc<dyn Storage>
+        })
+        .collect();
     let names = cli.storage.bucket_names();
     debug_assert_eq!(raw_storages.len(), names.len());
     let bucket_health = if raw_storages.len() > 1 {
@@ -1031,9 +1148,12 @@ async fn run_serve(
         empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
-        metrics: Arc::new(metrics::Metrics::new()),
+        metrics,
         counters,
         download_board: Arc::new(std::sync::Mutex::new(None)),
+        summary_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        package_stats_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
         proxy,
         started: std::time::Instant::now(),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),

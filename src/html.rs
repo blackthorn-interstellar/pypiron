@@ -11,6 +11,7 @@
 //! from the `Host`/`X-Forwarded-*` headers) is HTML-escaped: the page reflects
 //! a client-controlled header, so it must never let it break out of its text.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -741,11 +742,13 @@ pub fn project_html(
 
 /// A file's version: the sidecar value, else inferred from the filename. Shared
 /// with the request handler, which uses it to enumerate and select versions.
-pub(crate) fn file_version(f: &FileMetadata) -> Option<String> {
+/// Borrows the sidecar string; only the filename-inferred fallback allocates.
+pub(crate) fn file_version(f: &FileMetadata) -> Option<Cow<'_, str>> {
     f.version
-        .clone()
+        .as_deref()
         .filter(|v| !v.is_empty())
-        .or_else(|| infer_version_from_filename(&f.filename))
+        .map(Cow::Borrowed)
+        .or_else(|| infer_version_from_filename(&f.filename).map(Cow::Owned))
 }
 
 /// The sidebar's "Navigation" block — the three tab links. With JS off they act
@@ -802,7 +805,7 @@ fn release_history_panel(pkg: &str, files: &[FileMetadata], selected: &str) -> S
     let mut by_ver: HashMap<String, (Option<String>, u32)> = HashMap::new();
     for f in files {
         let Some(v) = file_version(f) else { continue };
-        let e = by_ver.entry(v).or_insert((None, 0));
+        let e = by_ver.entry(v.into_owned()).or_insert((None, 0));
         e.1 += 1;
         if f.upload_time.as_deref() > e.0.as_deref() {
             e.0 = f.upload_time.clone();

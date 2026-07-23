@@ -1187,15 +1187,6 @@ pub async fn audit(
             warn!(error=?e, "audit: building advisory report failed; keeping last report");
         }
     }
-    let duration_secs = started.elapsed().as_secs_f64();
-    let m = &state.metrics;
-    m.reconcile_sweeps
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    m.audit_packages_rebuilt
-        .fetch_add(rebuilt as u64, std::sync::atomic::Ordering::Relaxed);
-    m.audit_packages_skipped
-        .fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
-    m.set_audit_duration(duration_secs);
     // Authoritatively re-baseline the in-memory map from truth (heals any
     // between-sweep delta drift, restores it after a restart), then publish the
     // map's own totals — the exact value a subsequent tick flush would publish,
@@ -1224,6 +1215,18 @@ pub async fn audit(
         }
         write_chain_link(state, storage, generation, delta).await;
     }
+    // Publish completion metrics only after the sweep's last storage write:
+    // the bench harness's `wait_swept` treats `audit_last_duration_seconds` as
+    // "the sweep is finished", so nothing may land after these publish.
+    let duration_secs = started.elapsed().as_secs_f64();
+    let m = &state.metrics;
+    m.reconcile_sweeps
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    m.audit_packages_rebuilt
+        .fetch_add(rebuilt as u64, std::sync::atomic::Ordering::Relaxed);
+    m.audit_packages_skipped
+        .fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
+    m.set_audit_duration(duration_secs);
     info!(
         packages = live.len(),
         rebuilt, skipped, duration_secs, "reconcile: sweep complete"

@@ -232,8 +232,8 @@ jobs:
         run: uv sync
       - name: Ruff lint and format check
         run: |
-          uv run -- ruff check tests bench scripts
-          uv run -- ruff format --check tests bench scripts
+          uv run -- ruff check tests dev/bench dev/scripts
+          uv run -- ruff format --check tests dev/bench dev/scripts
 
   fuzz-build:
     name: fuzz build (smoke)

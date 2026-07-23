@@ -116,6 +116,7 @@ pub struct ServeConfig {
     pub counters_flush_interval_secs: Option<u64>,
     pub counters_rollup_interval_secs: Option<u64>,
     pub counters_retention_days: Option<i64>,
+    pub index_cache_ttl_secs: Option<u64>,
     // Storage selection: disk (default) or object storage via `buckets`.
     pub data_dir: Option<String>,
     pub storage_prefix: Option<String>,

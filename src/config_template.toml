@@ -116,6 +116,7 @@
 
 # Worker and multi-node tuning — the defaults are right for most deployments.
 # worker-interval-secs = 1                  # cadence for noticing peer nodes' writes
+# index-cache-ttl-secs = 1                  # staleness bound on page caches; single-node can raise freely
 # bucket-leave-failures = 3                 # consecutive timeout/connect/5xx failures before switching
 # bucket-return-healthy-secs = 300           # stable recovery required before returning to a preferred bucket
 # fanout-grace-secs = 30                     # pre-ack fan-out grace per secondary bucket before a repair note

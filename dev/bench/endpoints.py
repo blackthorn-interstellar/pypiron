@@ -465,6 +465,11 @@ QUIESCE_ARGS = (
     "86400",
     "--worker-interval-secs",
     "86400",
+    # Day-long index-cache TTL: warm hits stay 0-op instead of racing the 1s
+    # default's revalidation read (single-node invalidation is exact, so the
+    # long TTL never serves stale bytes here).
+    "--index-cache-ttl-secs",
+    "86400",
 )
 # Sweep-at-boot: same silence afterward, but the boot audit runs and renders
 # every index. Used to build caches and to prepare fresh CI trees.
@@ -474,6 +479,8 @@ SWEEP_ARGS = (
     "--reconcile-interval-secs",
     "86400",
     "--worker-interval-secs",
+    "86400",
+    "--index-cache-ttl-secs",
     "86400",
 )
 

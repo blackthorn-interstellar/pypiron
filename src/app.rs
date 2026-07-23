@@ -369,7 +369,7 @@ impl AppState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let (at, gen, body) = guard.as_ref()?;
-        (*gen == generation && at.elapsed() < cache::INDEX_CACHE_TTL).then(|| body.clone())
+        (*gen == generation && at.elapsed() < self.index_cache.ttl()).then(|| body.clone())
     }
 
     /// Cache the freshly rendered empty-query `/projects/` page under the current
@@ -1149,8 +1149,12 @@ async fn run_serve(
         lease_ttl: Duration::from_secs(cli.lease_ttl_secs),
         wait_on_upload: cli.wait_on_upload,
         wait_on_upload_timeout: Duration::from_secs(cli.wait_on_upload_secs),
-        index_cache: Arc::new(cache::IndexCache::new(cache::INDEX_CACHE_TTL)),
-        project_cache: Arc::new(project_cache::ProjectCache::new(cache::INDEX_CACHE_TTL)),
+        index_cache: Arc::new(cache::IndexCache::new(Duration::from_secs(
+            cli.index_cache_ttl_secs,
+        ))),
+        project_cache: Arc::new(project_cache::ProjectCache::new(Duration::from_secs(
+            cli.index_cache_ttl_secs,
+        ))),
         presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
         spool_dir: cli.spool_dir.unwrap_or_else(std::env::temp_dir),
         global_names: Arc::new(tokio::sync::Mutex::new(None)),

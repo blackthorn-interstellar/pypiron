@@ -743,6 +743,14 @@ pub struct ServeArgs {
     )]
     pub(crate) counters_rollup_interval_secs: u64,
 
+    /// Staleness bound on the in-memory index/page caches, in seconds. Only
+    /// matters multi-node: a node's own writes invalidate its caches exactly, so
+    /// the TTL bounds how long ANOTHER node's index write can go unseen here.
+    /// Single-node deployments can raise it freely to drop the once-per-TTL
+    /// revalidation read.
+    #[arg(long, env = "PYPIRON_INDEX_CACHE_TTL_SECS", default_value = "1")]
+    pub(crate) index_cache_ttl_secs: u64,
+
     /// Days of per-day counter history to keep before deletion.
     #[arg(long, env = "PYPIRON_COUNTERS_RETENTION_DAYS", default_value = "90")]
     pub(crate) counters_retention_days: i64,
@@ -1013,6 +1021,11 @@ pub fn merge_serve_file(
         cli.counters_rollup_interval_secs,
         "counters_rollup_interval_secs",
         f.counters_rollup_interval_secs
+    );
+    fill!(
+        cli.index_cache_ttl_secs,
+        "index_cache_ttl_secs",
+        f.index_cache_ttl_secs
     );
     fill!(
         cli.counters_retention_days,

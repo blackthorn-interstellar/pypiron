@@ -261,6 +261,12 @@ impl IndexCache {
         Self::with_capacity(ttl, INDEX_CACHE_MAX_BYTES)
     }
 
+    /// The staleness bound this cache was built with — the one configured knob
+    /// every 1s-tier page cache shares (see `--index-cache-ttl-secs`).
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     pub fn with_capacity(ttl: Duration, max_bytes: usize) -> Self {
         Self {
             ttl,

@@ -17,13 +17,16 @@ pypiron is the fastest, most reliable PyPI server (and mirror) available.
 </p>
 
 - **100×+ faster than any PyPI server.** 8,288 verified installs/s on 2 vCPU.
-- **Serves PyPI-scale traffic — measured, not extrapolated.** Replaying PyPI's real download stream, one 8-vCPU box handles the index at ~200,000 requests/s with p99 under 3 ms — about double PyPI's global average ([dev/bench/replay](dev/bench/replay/)).
+- **Serves PyPI-scale traffic — measured, not extrapolated.** Replaying PyPI's real download stream, one 8-vCPU box handles the index at ~200,000 requests/s with p99 under 3 ms ([dev/bench/replay](dev/bench/replay/)).
 - **Dependency cooldown, on by default.** New releases wait 7 days. Most attacks surface first.
 - **Private and public, one URL.** A name is yours or PyPI's, never both. No dependency confusion.
 - **Scales to a fleet.** Point any number of nodes at one bucket. No coordination.
 - **Survives a region — or a whole cloud — going down.** Run nodes across regions or clouds (S3 + GCS + Azure) on one bucket list; every upload lands on all of them, and reads fail over with zero data loss.
 - **Works with everything.** uv, pip, poetry, pdm, twine, pipenv, hatch, flit.
 - **Download stats built in** (beta).
+
+**Status: beta.** Young project, tested like an old one — run it, break it,
+[file issues](https://github.com/blackthorn-interstellar/pypiron/issues).
 
 ## Quickstart
 

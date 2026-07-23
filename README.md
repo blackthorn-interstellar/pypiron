@@ -30,6 +30,10 @@ pypiron is the fastest, most reliable PyPI server (and mirror) available.
 
 ## Quickstart
 
+<p align="center">
+  <img src="docs/assets/demo.gif" alt="Demo: uvx pypiron serve, uv publish, uv pip install — a working private index in seconds" width="900">
+</p>
+
 ```bash
 # 1. Start a server (serves http://localhost:8080) — native binary…
 uvx pypiron serve --admin-pass "$ADMIN"

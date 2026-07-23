@@ -279,7 +279,6 @@ async fn render_project(
         .filter_map(html::file_version)
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
-        .map(std::borrow::Cow::into_owned)
         .collect();
     versions.sort_by(|a, b| names::version_cmp_desc(a, b));
     let (selected, pinned) = match requested_version {

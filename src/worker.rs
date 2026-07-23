@@ -2570,9 +2570,13 @@ async fn write_global_indexes_cas(
             return Ok(CasOutcome::Lost);
         };
         state.index_cache.invalidate(&json_key);
+        // The `/projects/` browser is another render of this same name set, so
+        // drop its cached page alongside the global simple index.
+        state.invalidate_projects_page();
         return Ok(CasOutcome::Won(Some(new_etag)));
     }
     write_global_indexes(state, storage, packages).await?;
+    state.invalidate_projects_page();
     Ok(CasOutcome::Won(None))
 }
 
@@ -3083,6 +3087,7 @@ mod tests {
             metrics: Arc::new(crate::metrics::Metrics::new()),
             counters: Arc::new(crate::counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),
+            projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -501,6 +501,47 @@ def test_projects_index_lists_packages_linking_to_project_pages(disk_server, tmp
     assert 'href="/projects/"' in root_body.decode()
 
 
+def test_projects_index_reflects_new_upload_after_caching(disk_server, tmp_path):
+    # The browser page is served from a rendered-bytes cache. A new upload must
+    # still show up: the worker drops the cached page when the name set changes
+    # (and the short TTL bounds any residual staleness), so a warm cache never
+    # hides a freshly published package.
+    first = make_wheel("cachefirst", "1.0.0", tmp_path)
+    upload_legacy(
+        disk_server["legacy"],
+        first,
+        username=disk_server["user"],
+        password=disk_server["password"],
+    )
+    wait_for_project_in_global(disk_server["simple"], "cachefirst")
+
+    # Warm the cache with the one-package listing.
+    code, body, _ = http_get(f"{disk_server['base_url']}/projects/")
+    assert code == 200
+    assert 'href="/project/cachefirst/"' in body.decode()
+
+    # Publish a second package; the cached page must not outlive the change.
+    second = make_wheel("cachesecond", "1.0.0", tmp_path)
+    upload_legacy(
+        disk_server["legacy"],
+        second,
+        username=disk_server["user"],
+        password=disk_server["password"],
+    )
+    wait_for_project_in_global(disk_server["simple"], "cachesecond")
+
+    deadline = time.time() + 10.0
+    html = ""
+    while time.time() < deadline:
+        _, body, _ = http_get(f"{disk_server['base_url']}/projects/")
+        html = body.decode()
+        if 'href="/project/cachesecond/"' in html:
+            break
+        time.sleep(0.2)
+    assert 'href="/project/cachefirst/"' in html
+    assert 'href="/project/cachesecond/"' in html
+
+
 def test_projects_search_filters_to_matching_names(disk_server, tmp_path):
     for name in ("searchapple", "searchberry"):
         wheel = make_wheel(name, "1.0.0", tmp_path)

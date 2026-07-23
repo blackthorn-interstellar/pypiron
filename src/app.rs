@@ -135,6 +135,12 @@ const CLF_TIME: &[time::format_description::FormatItem<'_>] = time::macros::form
 /// Shared TTL cache of the ranked download leaderboard: `(computed_at, board)`,
 /// or `None` until first populated.
 type DownloadBoard = Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<(String, u64)>)>>>;
+/// Single-slot cache of the fully-rendered empty-query `/projects/` browser page:
+/// `(rendered_at, generation, bytes)`, or `None` until first populated. The page
+/// is a host-independent render of the whole name set — identical bytes for every
+/// request — so one refcounted `Bytes` serves them all; the worker drops it when
+/// the name set changes and the TTL bounds cross-node staleness.
+type ProjectsPageCache = Arc<std::sync::Mutex<Option<(std::time::Instant, u64, bytes::Bytes)>>>;
 type EmptyOriginObservations =
     Arc<tokio::sync::Mutex<std::collections::HashMap<(u64, String), (String, std::time::Instant)>>>;
 
@@ -238,6 +244,14 @@ pub struct AppState {
     /// the homepage marquee and `/downloads/` so a public homepage doesn't rescan
     /// the counter store on every hit; the numbers lag a flush interval anyway.
     pub download_board: DownloadBoard,
+    /// Single-slot TTL cache of the rendered empty-query `/projects/` browser
+    /// page. That page re-renders the whole name set — a sort plus a multi-MB
+    /// escape/concat — on every hit for bytes identical across requests; caching
+    /// the finished page collapses a warm hit to a refcounted clone. Only the
+    /// empty query is cached (a `?q=` search is rare and per-query keys would be
+    /// unbounded); the worker drops it when the name set changes, the TTL bounds
+    /// other nodes.
+    pub projects_page_cache: ProjectsPageCache,
     /// On-demand upstream mirroring (None unless --proxy-upstream is set).
     pub proxy: Option<Arc<proxy::Proxy>>,
     /// Process start, for the homepage uptime readout.
@@ -290,6 +304,39 @@ impl AppState {
     /// guard. Cheap enough for the request path; recovers a poisoned lock.
     pub fn advisory_snapshot(&self) -> Arc<advisories::AdvisoryState> {
         advisories::AdvisoryState::read(&self.advisories)
+    }
+
+    /// Serve the cached empty-query `/projects/` page when it is warm and was
+    /// built under the current selection generation; `None` on a cold slot, past
+    /// the TTL, or after a bucket switch (generation mismatch), when the caller
+    /// renders and [`store_projects_page`](Self::store_projects_page)s it.
+    pub(crate) fn projects_page_cached(&self, generation: u64) -> Option<bytes::Bytes> {
+        let guard = self
+            .projects_page_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (at, gen, body) = guard.as_ref()?;
+        (*gen == generation && at.elapsed() < cache::INDEX_CACHE_TTL).then(|| body.clone())
+    }
+
+    /// Cache the freshly rendered empty-query `/projects/` page under the current
+    /// selection generation.
+    pub(crate) fn store_projects_page(&self, generation: u64, body: bytes::Bytes) {
+        *self
+            .projects_page_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some((std::time::Instant::now(), generation, body));
+    }
+
+    /// Drop the cached `/projects/` page after the global name set changes, so a
+    /// same-node reader sees the new listing at once (the TTL bounds other nodes).
+    /// A hard drop, mirroring the index cache's invalidation.
+    pub(crate) fn invalidate_projects_page(&self) {
+        *self
+            .projects_page_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Record that a client request just arrived (traffic signal for probe
@@ -367,6 +414,7 @@ impl AppState {
             metrics: Arc::new(metrics::Metrics::new()),
             counters: Arc::new(counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),
+            projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1045,6 +1093,7 @@ async fn run_serve(
         metrics,
         counters,
         download_board: Arc::new(std::sync::Mutex::new(None)),
+        projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
         proxy,
         started: std::time::Instant::now(),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -72,15 +72,32 @@ pub async fn projects_page(
         return unauthorized();
     }
     let pinned = state.pin();
+    let query = browse.q.as_deref().unwrap_or("");
+    // The empty-query browser — the hot path — renders the whole name set into
+    // host-independent bytes identical for every request (a name sort+clone plus
+    // a multi-MB escape/concat, redone per hit for nothing). Serve it from a
+    // single slot so a warm hit is a refcounted `Bytes` clone. The worker drops
+    // the slot the instant the name set changes (write_global_indexes_cas); the
+    // TTL bounds cross-node staleness. A `?q=` search stays live — it's rare, its
+    // result set is smaller, and caching per distinct query would be the
+    // unbounded-key hazard the other caches explicitly guard against.
+    let cacheable = query.trim().is_empty();
+    if cacheable {
+        if let Some(body) = state.projects_page_cached(pinned.generation) {
+            return html_ok_bytes(body);
+        }
+    }
     let names = match worker::global_package_names(&state, pinned.storage.as_ref()).await {
         Ok(names) => names,
         Err(e) => return read_error(e),
     };
-    html_ok(html::projects_html(
-        &page_context(&state, &headers),
-        &names,
-        browse.q.as_deref().unwrap_or(""),
-    ))
+    let html = html::projects_html(&page_context(&state, &headers), &names, query);
+    if cacheable {
+        let body = bytes::Bytes::from(html);
+        state.store_projects_page(pinned.generation, body.clone());
+        return html_ok_bytes(body);
+    }
+    html_ok(html)
 }
 
 /// The download leaderboard (`/downloads/`): the most-downloaded packages over

@@ -1,0 +1,13 @@
+Metadata-Version: 2.1
+Namu: demo
+Version: 1.2.3
+SummaMetadata-Version: 2.1
+Name: demo
+Version: 1.2.3
+Summary: A demo
+Author-email: a@b.com
+License-Expression: MIT
+Reqython :: 3
+Requires-Dist:=2
+
+# Retext here.

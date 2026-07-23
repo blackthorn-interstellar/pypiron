@@ -21,14 +21,41 @@ fuzz_target!(|data: &[u8]| {
     // defaults rather than erroring, so it must accept literally any byte string.
     let m = coremeta::parse(data);
 
-    // Every `Project-URL` line is split on the first comma into (label, url); a
-    // line without a comma is dropped. So the count of project_urls coming from
-    // `project-url` headers can only ever be <= the count of `home-page` +
-    // `project-url` headers — a cheap shape check that the splitter never
-    // fabricates entries.
+    // Shape invariant: every `project_urls` entry comes from exactly one header —
+    // a `Home-page` line contributes 1, a `Project-URL` line contributes 0 or 1
+    // (dropped when it carries no comma to split on). So the splitter can never
+    // fabricate more entries than there were matching header lines. Count those
+    // the way the parser enumerates headers (decode lossily, stop at the first
+    // blank line where the body begins, skip folded continuation lines) and
+    // assert the count is an upper bound. A regression that double-counts or
+    // invents an entry trips this.
+    let text = String::from_utf8_lossy(data);
+    let mut header_urls = 0usize;
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        if content.is_empty() {
+            break; // the body starts here; later lines are not headers
+        }
+        if line.starts_with([' ', '\t']) {
+            continue; // a folded continuation of the previous header, not a new one
+        }
+        if let Some((key, _)) = content.split_once(':') {
+            let key = key.trim().to_ascii_lowercase();
+            if key == "home-page" || key == "project-url" {
+                header_urls += 1;
+            }
+        }
+    }
+    assert!(
+        m.project_urls.len() <= header_urls,
+        "parse fabricated project_urls: {} entries from {} Home-page/Project-URL header lines (input {text:?})",
+        m.project_urls.len(),
+        header_urls,
+    );
+
+    // Touch every stored field so the fuzzer must keep them valid UTF-8 (they
+    // came from a lossy decode).
     for (label, url) in &m.project_urls {
-        // Fields are stored trimmed; this just touches the strings so the
-        // fuzzer must keep them valid UTF-8 (they came from a lossy decode).
         let _ = (label.len(), url.len());
     }
 

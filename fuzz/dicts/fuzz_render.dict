@@ -1,0 +1,13 @@
+# Fields that land in PEP 691 JSON and PEP 503 HTML attributes.
+"/files/"
+"#sha256="
+"<a href=\""
+"data-yanked"
+"data-dist-info-metadata"
+"data-provenance"
+"requires-python"
+"\">"
+"\"/>"
+"true"
+"false"
+"null"

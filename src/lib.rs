@@ -31,6 +31,7 @@ pub mod names;
 pub mod node_region;
 pub mod observed_storage;
 pub mod origin;
+pub mod osv;
 pub mod pages;
 pub mod project_cache;
 pub mod provenance;

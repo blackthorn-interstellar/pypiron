@@ -34,6 +34,8 @@ jobs:
           - fuzz_render
           - fuzz_coremeta
           - fuzz_range
+          - fuzz_markdown
+          - fuzz_advisories
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -56,8 +58,16 @@ jobs:
       # host, and musl's static libc is incompatible with ASan.
       # https://github.com/rust-fuzz/cargo-fuzz/issues/398
       # A crash exits non-zero and drops the reproducer in fuzz/artifacts/<target>.
+      # Pass both the tracked seeds (fuzz/seeds/, so a cold cache still cold-starts
+      # from known-interesting inputs and the fuzz_render crash reproducers replay
+      # forever) and the persisted corpus (new finds land in fuzz/corpus/), plus the
+      # target's dictionary.
       - name: Fuzz for five minutes
-        run: cargo fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=300
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          cargo fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu \
+            fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
+            -dict=fuzz/dicts/${{ matrix.target }}.dict -max_total_time=300
       - name: Upload crash reproducers
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

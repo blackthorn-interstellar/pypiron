@@ -390,14 +390,33 @@ target asserts "never panic" plus a domain invariant:
 
 | Target | Module | Invariant beyond no-panic |
 |---|---|---|
-| `fuzz_names` | `names.rs` | PEP 503 normalization is idempotent; wheel-tag fields never empty |
+| `fuzz_names` | `names.rs` | PEP 503 normalization is idempotent; wheel-tag fields never empty; `version_cmp_desc` is a total order (reflexive, antisymmetric); `checked_pkg_name` only ever approves a normalized name |
 | `fuzz_wheel` | `wheel.rs` | raw bytes: extracted METADATA stays under the 16 MiB cap |
 | `fuzz_wheelzip` | `wheel.rs` | valid zips: METADATA is the first one-slash `*.dist-info/METADATA`, decoys never win |
 | `fuzz_render` | `render.rs` | PEP 691 JSON always valid; HTML `href` can't break out of its attribute |
-| `fuzz_coremeta` | `coremeta.rs` | RFC 822 METADATA parse is total over any bytes |
+| `fuzz_coremeta` | `coremeta.rs` | RFC 822 METADATA parse is total over any bytes; `project_urls` never exceeds the count of `Home-page`/`Project-URL` header lines |
 | `fuzz_range` | `range.rs` | a resolved `Partial(start, end)` is always `start <= end < size` |
+| `fuzz_markdown` | `markdown.rs` | `render_limited` (the README sanitizer — no downstream escaping) emits only whitelisted tags and only `safe_href`-approved `http`/`https` link/image URLs; the multibyte-slice class that once panicked `safe_href` stays dead |
+| `fuzz_advisories` | `osv.rs` | `parse_feed` is total over any bytes; the version matchers are total over any version string; an `AllVersions` scope is fail-closed (blocks every version, unparseable included); no parsed record field exceeds `MAX_ENTRY_BYTES`; `block_names <= audit_records` |
+
+Add a fuzz target for any pure function that parses bytes an uploader, client, or
+upstream index controls.
+
+Each target replays two corpora: `fuzz/seeds/<target>/` is tracked and read-only
+(cold-start inputs plus permanent regression seeds — the `fuzz_render` crash
+reproducers live there so they replay forever), while `fuzz/corpus/<target>/` is
+gitignored and machine-grown (new finds accumulate there across runs). A libFuzzer
+dictionary in `fuzz/dicts/<target>.dict` seeds the mutator with the structural
+tokens each parser keys on (zip magics, RFC 822 header names, Range grammar,
+Markdown/unsafe-scheme bait, …). `make fuzz` and the nightly workflow pass all
+three (seeds + corpus + dict) automatically.
 
 ```sh
-make fuzz FUZZ_TARGET=fuzz_range FUZZ_SECS=60   # run one target
+make fuzz FUZZ_TARGET=fuzz_range FUZZ_SECS=60   # run one target (seeds + corpus + dict)
 make fuzz-build                                 # compile all (CI smoke test)
 ```
+
+`fuzz_advisories` fuzzes the OSV parse/match core, which lives in its own leaf
+module `src/osv.rs` (the async fetch/persist/reload plumbing stays in
+`src/advisories.rs`); the target `#[path]`-includes `osv.rs` plus `names.rs`, its
+only crate dependency, like the other fuzzed modules.

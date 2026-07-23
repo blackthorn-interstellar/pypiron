@@ -1,0 +1,11 @@
+# Zip structure + wheel member names for the raw-bytes METADATA extractor.
+"PK\x03\x04"
+"PK\x01\x02"
+"PK\x05\x06"
+"PK\x06\x06"
+"PK\x06\x07"
+".dist-info/METADATA"
+".dist-info/"
+"METADATA"
+"WHEEL"
+"RECORD"

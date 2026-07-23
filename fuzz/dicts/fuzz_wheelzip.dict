@@ -1,0 +1,10 @@
+# Zip structure + the member names the selection oracle cares about.
+"PK\x03\x04"
+"PK\x01\x02"
+"PK\x05\x06"
+".dist-info/METADATA"
+".dist-info/RECORD"
+".dist-info/"
+"METADATA"
+"WHEEL"
+"-1.0.dist-info/METADATA"

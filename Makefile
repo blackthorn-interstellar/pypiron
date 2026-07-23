@@ -105,11 +105,17 @@ release-notes:  ## Preview release notes (TO=HEAD, optional FROM=vX.Y.Z TAG=vX.Y
 
 # Coverage-guided fuzzing of the input-parsing modules (needs nightly +
 # `cargo install cargo-fuzz`). TARGET=fuzz_names|fuzz_wheel|fuzz_wheelzip|fuzz_render|
-# fuzz_coremeta|fuzz_range, SECS overrides time.
+# fuzz_coremeta|fuzz_range|fuzz_markdown|fuzz_advisories, SECS overrides time. Runs against both
+# the tracked seeds (fuzz/seeds/, replayed forever) and the machine-grown corpus
+# (fuzz/corpus/, gitignored — new finds land there), with the target's dictionary
+# when one exists.
 FUZZ_TARGET ?= fuzz_render
 FUZZ_SECS ?= 60
 fuzz:  ## Run a fuzz target (FUZZ_TARGET=fuzz_render FUZZ_SECS=60)
-	cargo +nightly fuzz run $(FUZZ_TARGET) -- -max_total_time=$(FUZZ_SECS)
+	@mkdir -p fuzz/corpus/$(FUZZ_TARGET) fuzz/seeds/$(FUZZ_TARGET)
+	cargo +nightly fuzz run $(FUZZ_TARGET) fuzz/corpus/$(FUZZ_TARGET) fuzz/seeds/$(FUZZ_TARGET) -- \
+		$$(test -f fuzz/dicts/$(FUZZ_TARGET).dict && echo -dict=fuzz/dicts/$(FUZZ_TARGET).dict) \
+		-max_total_time=$(FUZZ_SECS)
 
 fuzz-build:  ## Compile all fuzz targets (CI smoke test)
 	cargo +nightly fuzz build

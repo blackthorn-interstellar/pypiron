@@ -2,17 +2,17 @@
   "endpoints": {
     "advisories-feed-get": {
       "bytes": 0,
-      "cold_ms": 0.383,
+      "cold_ms": 0.622,
       "cold_ops": {
         "list": 1
       },
-      "rss_mb": 13.2,
-      "startup_secs": 0.028,
+      "rss_mb": 13.5,
+      "startup_secs": 0.031,
       "warm": {
-        "max_ms": 0.404,
+        "max_ms": 0.631,
         "n": 100,
-        "p50_ms": 0.271,
-        "p95_ms": 0.376
+        "p50_ms": 0.318,
+        "p95_ms": 0.433
       },
       "warm_ops": {
         "list": 1
@@ -24,10 +24,10 @@
         "write": 1
       },
       "warm": {
-        "max_ms": 0.988,
+        "max_ms": 0.892,
         "n": 5,
-        "p50_ms": 0.833,
-        "p95_ms": 0.988
+        "p50_ms": 0.695,
+        "p95_ms": 0.892
       },
       "warm_ops": {
         "list": 1,
@@ -36,17 +36,17 @@
     },
     "artifact-download": {
       "bytes": 0,
-      "cold_ms": 0.468,
+      "cold_ms": 0.714,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 13.1,
-      "startup_secs": 0.024,
+      "rss_mb": 13.5,
+      "startup_secs": 0.029,
       "warm": {
-        "max_ms": 0.402,
+        "max_ms": 0.478,
         "n": 100,
-        "p50_ms": 0.183,
-        "p95_ms": 0.285
+        "p50_ms": 0.288,
+        "p95_ms": 0.407
       },
       "warm_ops": {
         "read": 1
@@ -54,82 +54,82 @@
     },
     "audit-json": {
       "bytes": 88,
-      "cold_ms": 0.304,
+      "cold_ms": 0.343,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 13.3,
-      "startup_secs": 0.029,
+      "rss_mb": 13.5,
+      "startup_secs": 0.031,
       "warm": {
-        "max_ms": 0.458,
+        "max_ms": 0.444,
         "n": 100,
-        "p50_ms": 0.262,
-        "p95_ms": 0.383
+        "p50_ms": 0.289,
+        "p95_ms": 0.382
       },
       "warm_ops": {
         "read": 1
       }
     },
     "audit-page": {
-      "bytes": 47817,
-      "cold_ms": 0.617,
+      "bytes": 47811,
+      "cold_ms": 0.436,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 13.9,
-      "startup_secs": 0.028,
+      "rss_mb": 14.2,
+      "startup_secs": 0.029,
       "warm": {
-        "max_ms": 0.476,
+        "max_ms": 0.451,
         "n": 100,
-        "p50_ms": 0.318,
-        "p95_ms": 0.422
+        "p50_ms": 0.292,
+        "p95_ms": 0.404
       },
       "warm_ops": {
         "read": 1
       }
     },
     "downloads-page": {
-      "bytes": 48033,
-      "cold_ms": 2.961,
+      "bytes": 48029,
+      "cold_ms": 1.411,
       "cold_ops": {
-        "list": 74,
-        "read": 105
+        "list": 4,
+        "read": 44
       },
-      "rss_mb": 14.3,
-      "startup_secs": 0.028,
+      "rss_mb": 14.2,
+      "startup_secs": 0.03,
       "warm": {
-        "max_ms": 0.972,
+        "max_ms": 0.297,
         "n": 100,
-        "p50_ms": 0.28,
-        "p95_ms": 0.403
+        "p50_ms": 0.172,
+        "p95_ms": 0.259
       },
       "warm_ops": {}
     },
     "fallback-404": {
       "bytes": 46,
-      "cold_ms": 0.295,
+      "cold_ms": 0.477,
       "cold_ops": {},
-      "rss_mb": 13.2,
-      "startup_secs": 0.024,
+      "rss_mb": 13.4,
+      "startup_secs": 0.031,
       "warm": {
-        "max_ms": 0.467,
+        "max_ms": 0.459,
         "n": 100,
-        "p50_ms": 0.204,
-        "p95_ms": 0.361
+        "p50_ms": 0.283,
+        "p95_ms": 0.368
       },
       "warm_ops": {}
     },
     "favicon": {
       "bytes": 15086,
-      "cold_ms": 0.271,
+      "cold_ms": 0.214,
       "cold_ops": {},
-      "rss_mb": 13.2,
-      "startup_secs": 0.024,
+      "rss_mb": 13.1,
+      "startup_secs": 0.027,
       "warm": {
-        "max_ms": 0.328,
+        "max_ms": 0.27,
         "n": 100,
-        "p50_ms": 0.176,
-        "p95_ms": 0.266
+        "p50_ms": 0.148,
+        "p95_ms": 0.237
       },
       "warm_ops": {}
     },
@@ -141,10 +141,10 @@
         "write": 5
       },
       "warm": {
-        "max_ms": 2.632,
+        "max_ms": 2.433,
         "n": 5,
-        "p50_ms": 2.343,
-        "p95_ms": 2.632
+        "p50_ms": 2.336,
+        "p95_ms": 2.433
       },
       "warm_ops": {
         "delete": 5,
@@ -155,46 +155,46 @@
     },
     "health": {
       "bytes": 15,
-      "cold_ms": 0.232,
+      "cold_ms": 0.286,
       "cold_ops": {},
-      "rss_mb": 13.2,
-      "startup_secs": 0.027,
+      "rss_mb": 13.3,
+      "startup_secs": 0.032,
       "warm": {
-        "max_ms": 0.454,
+        "max_ms": 0.494,
         "n": 100,
-        "p50_ms": 0.239,
-        "p95_ms": 0.357
+        "p50_ms": 0.255,
+        "p95_ms": 0.351
       },
       "warm_ops": {}
     },
     "metrics": {
       "bytes": 4788,
-      "cold_ms": 0.3,
+      "cold_ms": 0.334,
       "cold_ops": {},
-      "rss_mb": 13.1,
-      "startup_secs": 0.024,
+      "rss_mb": 13.3,
+      "startup_secs": 0.033,
       "warm": {
-        "max_ms": 0.367,
+        "max_ms": 2.971,
         "n": 100,
-        "p50_ms": 0.189,
-        "p95_ms": 0.278
+        "p50_ms": 0.254,
+        "p95_ms": 0.348
       },
       "warm_ops": {}
     },
     "project-page": {
-      "bytes": 51204,
-      "cold_ms": 2.678,
+      "bytes": 51198,
+      "cold_ms": 5.603,
       "cold_ops": {
         "list": 31,
-        "read": 35
+        "read": 48
       },
-      "rss_mb": 14.4,
-      "startup_secs": 0.027,
+      "rss_mb": 14.9,
+      "startup_secs": 0.028,
       "warm": {
-        "max_ms": 0.569,
+        "max_ms": 0.518,
         "n": 100,
-        "p50_ms": 0.21,
-        "p95_ms": 0.329
+        "p50_ms": 0.298,
+        "p95_ms": 0.406
       },
       "warm_ops": {}
     },
@@ -206,10 +206,10 @@
         "write": 4
       },
       "warm": {
-        "max_ms": 1.422,
+        "max_ms": 1.241,
         "n": 5,
-        "p50_ms": 1.129,
-        "p95_ms": 1.422
+        "p50_ms": 0.928,
+        "p95_ms": 1.241
       },
       "warm_ops": {
         "delete": 2,
@@ -226,10 +226,10 @@
         "write": 5
       },
       "warm": {
-        "max_ms": 1.37,
+        "max_ms": 1.45,
         "n": 5,
-        "p50_ms": 1.157,
-        "p95_ms": 1.37
+        "p50_ms": 1.182,
+        "p95_ms": 1.45
       },
       "warm_ops": {
         "delete": 1,
@@ -239,190 +239,184 @@
       }
     },
     "project-version-page": {
-      "bytes": 55170,
-      "cold_ms": 10.77,
+      "bytes": 55164,
+      "cold_ms": 9.621,
       "cold_ops": {
         "list": 31,
-        "read": 70
+        "read": 83
       },
-      "rss_mb": 16.8,
-      "startup_secs": 0.024,
+      "rss_mb": 17.3,
+      "startup_secs": 0.028,
       "warm": {
-        "max_ms": 0.435,
+        "max_ms": 0.441,
         "n": 100,
-        "p50_ms": 0.195,
-        "p95_ms": 0.358
+        "p50_ms": 0.284,
+        "p95_ms": 0.375
       },
       "warm_ops": {}
     },
     "projects-page": {
-      "bytes": 3160270,
-      "cold_ms": 20.912,
+      "bytes": 3160264,
+      "cold_ms": 21.156,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 56.7,
-      "startup_secs": 0.027,
+      "rss_mb": 44.2,
+      "startup_secs": 0.033,
       "warm": {
-        "max_ms": 14.333,
+        "max_ms": 1.961,
         "n": 100,
-        "p50_ms": 12.95,
-        "p95_ms": 13.95
+        "p50_ms": 0.6,
+        "p95_ms": 1.602
       },
       "warm_ops": {}
     },
     "ready": {
       "bytes": 18,
-      "cold_ms": 0.39,
+      "cold_ms": 0.345,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 13.2,
-      "startup_secs": 0.028,
+      "rss_mb": 13.5,
+      "startup_secs": 0.031,
       "warm": {
-        "max_ms": 0.352,
+        "max_ms": 0.42,
         "n": 100,
-        "p50_ms": 0.19,
-        "p95_ms": 0.31
+        "p50_ms": 0.271,
+        "p95_ms": 0.37
       },
       "warm_ops": {
         "read": 1
       }
     },
     "root-page": {
-      "bytes": 51443,
-      "cold_ms": 3.8,
+      "bytes": 51439,
+      "cold_ms": 1.87,
       "cold_ops": {
-        "list": 74,
-        "read": 105
+        "list": 4,
+        "read": 44
       },
-      "rss_mb": 14.2,
-      "startup_secs": 0.029,
+      "rss_mb": 14.6,
+      "startup_secs": 0.028,
       "warm": {
-        "max_ms": 0.517,
+        "max_ms": 0.346,
         "n": 100,
-        "p50_ms": 0.213,
-        "p95_ms": 0.35
+        "p50_ms": 0.187,
+        "p95_ms": 0.277
       },
       "warm_ops": {}
     },
     "simple-pkg-html": {
       "bytes": 4019,
-      "cold_ms": 1.383,
+      "cold_ms": 1.023,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 13.4,
-      "startup_secs": 0.029,
+      "rss_mb": 14.1,
+      "startup_secs": 0.533,
       "warm": {
-        "max_ms": 0.49,
+        "max_ms": 0.54,
         "n": 100,
-        "p50_ms": 0.173,
-        "p95_ms": 0.355
+        "p50_ms": 0.261,
+        "p95_ms": 0.38
       },
       "warm_ops": {}
     },
     "simple-pkg-json": {
       "bytes": 1170,
-      "cold_ms": 1.16,
+      "cold_ms": 1.26,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 13.5,
-      "startup_secs": 0.029,
+      "rss_mb": 14.0,
+      "startup_secs": 0.031,
       "warm": {
-        "max_ms": 0.402,
+        "max_ms": 0.42,
         "n": 100,
-        "p50_ms": 0.17,
-        "p95_ms": 0.265
+        "p50_ms": 0.25,
+        "p95_ms": 0.36
       },
       "warm_ops": {}
     },
     "simple-root-html": {
       "bytes": 2862089,
-      "cold_ms": 67.763,
+      "cold_ms": 68.173,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 17.0,
-      "startup_secs": 0.024,
+      "rss_mb": 17.3,
+      "startup_secs": 0.029,
       "warm": {
-        "max_ms": 1.152,
+        "max_ms": 2.141,
         "n": 100,
-        "p50_ms": 0.615,
-        "p95_ms": 0.869
+        "p50_ms": 0.602,
+        "p95_ms": 1.398
       },
       "warm_ops": {}
     },
     "simple-root-json": {
       "bytes": 2912015,
-      "cold_ms": 71.14,
+      "cold_ms": 70.775,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 17.0,
-      "startup_secs": 0.029,
+      "rss_mb": 17.3,
+      "startup_secs": 0.033,
       "warm": {
-        "max_ms": 1.429,
+        "max_ms": 1.583,
         "n": 100,
-        "p50_ms": 0.833,
-        "p95_ms": 1.112
+        "p50_ms": 0.572,
+        "p95_ms": 1.273
       },
       "warm_ops": {}
     },
     "stats-pkg": {
       "bytes": 63,
-      "cold_ms": 0.92,
+      "cold_ms": 1.054,
       "cold_ops": {
         "list": 30,
         "read": 30
       },
-      "rss_mb": 13.7,
-      "startup_secs": 0.027,
+      "rss_mb": 13.4,
+      "startup_secs": 0.029,
       "warm": {
-        "max_ms": 1.481,
+        "max_ms": 0.446,
         "n": 100,
-        "p50_ms": 0.889,
-        "p95_ms": 1.253
+        "p50_ms": 0.256,
+        "p95_ms": 0.35
       },
-      "warm_ops": {
-        "list": 30,
-        "read": 30
-      }
+      "warm_ops": {}
     },
     "stats-summary": {
-      "bytes": 97,
-      "cold_ms": 4.139,
+      "bytes": 100,
+      "cold_ms": 1.715,
       "cold_ops": {
-        "list": 74,
-        "read": 105
+        "list": 4,
+        "read": 44
       },
-      "rss_mb": 13.8,
-      "startup_secs": 0.024,
+      "rss_mb": 13.6,
+      "startup_secs": 0.023,
       "warm": {
-        "max_ms": 4.827,
+        "max_ms": 0.577,
         "n": 100,
-        "p50_ms": 3.125,
-        "p95_ms": 4.196
+        "p50_ms": 0.151,
+        "p95_ms": 0.283
       },
-      "warm_ops": {
-        "list": 74,
-        "read": 105
-      }
+      "warm_ops": {}
     },
     "sync-cursors-get": {
       "bytes": 2,
-      "cold_ms": 0.467,
+      "cold_ms": 0.406,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 13.3,
-      "startup_secs": 0.026,
+      "rss_mb": 13.5,
+      "startup_secs": 0.033,
       "warm": {
-        "max_ms": 0.522,
+        "max_ms": 0.581,
         "n": 100,
-        "p50_ms": 0.279,
-        "p95_ms": 0.449
+        "p50_ms": 0.26,
+        "p95_ms": 0.41
       },
       "warm_ops": {
         "read": 1
@@ -433,10 +427,10 @@
         "write": 1
       },
       "warm": {
-        "max_ms": 0.947,
+        "max_ms": 1.05,
         "n": 5,
-        "p50_ms": 0.736,
-        "p95_ms": 0.947
+        "p50_ms": 0.654,
+        "p95_ms": 1.05
       },
       "warm_ops": {
         "write": 1
@@ -444,17 +438,17 @@
     },
     "sync-local-index": {
       "bytes": 7301,
-      "cold_ms": 0.838,
+      "cold_ms": 1.097,
       "cold_ops": {
         "read": 1
       },
       "rss_mb": 13.5,
-      "startup_secs": 0.026,
+      "startup_secs": 0.031,
       "warm": {
-        "max_ms": 0.436,
+        "max_ms": 0.984,
         "n": 100,
-        "p50_ms": 0.251,
-        "p95_ms": 0.366
+        "p50_ms": 0.283,
+        "p95_ms": 0.375
       },
       "warm_ops": {
         "read": 1
@@ -462,15 +456,15 @@
     },
     "tokens-mint": {
       "bytes": 224,
-      "cold_ms": 0.524,
+      "cold_ms": 0.467,
       "cold_ops": {},
-      "rss_mb": 13.2,
-      "startup_secs": 0.024,
+      "rss_mb": 13.5,
+      "startup_secs": 0.033,
       "warm": {
-        "max_ms": 0.414,
+        "max_ms": 0.461,
         "n": 100,
-        "p50_ms": 0.199,
-        "p95_ms": 0.374
+        "p50_ms": 0.273,
+        "p95_ms": 0.377
       },
       "warm_ops": {}
     },
@@ -482,10 +476,10 @@
         "write": 10
       },
       "warm": {
-        "max_ms": 14.707,
+        "max_ms": 12.938,
         "n": 5,
-        "p50_ms": 12.277,
-        "p95_ms": 14.707
+        "p50_ms": 11.009,
+        "p95_ms": 12.938
       },
       "warm_ops": {
         "delete": 1,
@@ -502,10 +496,10 @@
         "write": 5
       },
       "warm": {
-        "max_ms": 1.805,
+        "max_ms": 1.77,
         "n": 5,
-        "p50_ms": 1.611,
-        "p95_ms": 1.805
+        "p50_ms": 1.433,
+        "p95_ms": 1.77
       },
       "warm_ops": {
         "delete": 1,
@@ -522,10 +516,10 @@
         "write": 5
       },
       "warm": {
-        "max_ms": 1.446,
+        "max_ms": 1.365,
         "n": 5,
-        "p50_ms": 1.318,
-        "p95_ms": 1.446
+        "p50_ms": 1.208,
+        "p95_ms": 1.365
       },
       "warm_ops": {
         "delete": 1,
@@ -535,7 +529,7 @@
       }
     }
   },
-  "git_rev": "c914314",
+  "git_rev": "59b37e2",
   "host": {
     "cpus": 10,
     "machine": "arm64",
@@ -543,18 +537,18 @@
   },
   "monster": {
     "bytes": 8146754,
-    "cold_ms": 145.587,
+    "cold_ms": 142.521,
     "files": 45636,
     "package": "pyagrum-nightly",
-    "rss_mb": 25.6
+    "rss_mb": 25.8
   },
   "schema": 1,
-  "startup_secs_median": 0.027,
+  "startup_secs_median": 0.031,
   "tier": {
     "files": 1206496,
     "packages": 50000,
     "seed": 42,
     "tree_format": 1
   },
-  "upload_visible_secs": 0.045
+  "upload_visible_secs": 0.052
 }

@@ -1,7 +1,12 @@
 //! Authentication and authorization: the credential-pairing and Basic-auth
 //! decoders behind [`crate::app::AppState`]'s role checks, the admin request
-//! guard, and the project-attribution tag. Split out of `app.rs`; the role
-//! predicates themselves stay methods on `AppState`.
+//! guard, the project-attribution tag, and the failed-login throttle. Split
+//! out of `app.rs`; the role predicates themselves stay methods on `AppState`.
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -9,6 +14,7 @@ use base64::engine::general_purpose::STANDARD as b64;
 use base64::Engine;
 
 use crate::app::AppState;
+use crate::clock;
 use crate::token;
 
 /// Treat an empty string as an unset value. An empty environment variable
@@ -136,6 +142,144 @@ pub(crate) fn project_tag(headers: &HeaderMap) -> Option<String> {
     ok.then(|| tag.to_string())
 }
 
+/// Default `--login-cooldown-secs`: five minutes, the fail2ban/Grafana-order
+/// posture. Shared by the CLI default and `LoginThrottle::default`.
+pub(crate) const DEFAULT_LOGIN_COOLDOWN_SECS: u64 = 300;
+
+/// Failed logins before the cooldown engages. Not a knob: the tunable is the
+/// cooldown itself; five is the sshd/fail2ban convention and far more retries
+/// than any real client needs before its operator fixes the credential.
+const LOGIN_FAIL_LIMIT: u32 = 5;
+
+/// Addresses the throttle will track before shedding state. Only a guesser
+/// spread across tens of thousands of addresses in one cooldown window can
+/// reach it — a scale where per-address throttling is moot and the edge/WAF
+/// is the real defense — so past the cap the map fails open (sheds) rather
+/// than growing without bound or refusing addresses it has never seen.
+const LOGIN_THROTTLE_CAP: usize = 32 * 1024;
+
+/// One address's recent failed-login history. Millisecond epoch timestamps
+/// come from [`clock::now_epoch_millis`] so the deterministic simulator can
+/// drive expiry; the clock is wall time, not monotonic, so an NTP step skews a
+/// cooldown by at most the step, in a known direction, and self-heals.
+#[derive(Clone, Copy, Default)]
+struct FailWindow {
+    count: u32,
+    last_ms: u64,
+    blocked_until_ms: u64,
+}
+
+/// Per-address brute-force throttle on failed logins. [`LOGIN_FAIL_LIMIT`]
+/// failures from one address, each within the cooldown of the last, and that
+/// address's credential-bearing requests are refused (429) until the cooldown
+/// passes — without evaluating the credential, so even a correct guess during
+/// the cooldown confirms nothing. Successes are never counted and anonymous
+/// requests never participate, so the throttle cannot lock out an address that
+/// isn't already failing logins. State is per process: each replica enforces
+/// its own budget, bounding a fleet's aggregate at replicas × the limit.
+#[derive(Clone)]
+pub struct LoginThrottle {
+    cooldown_ms: u64,
+    map: Arc<Mutex<HashMap<IpAddr, FailWindow>>>,
+}
+
+impl Default for LoginThrottle {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(DEFAULT_LOGIN_COOLDOWN_SECS))
+    }
+}
+
+impl LoginThrottle {
+    /// A throttle enforcing `cooldown`; zero disables it entirely.
+    pub(crate) fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown_ms: cooldown.as_millis().min(u64::MAX as u128) as u64,
+            map: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Seconds (rounded up, so never a `Retry-After: 0`) until `ip` may
+    /// attempt to log in again, or None when it isn't blocked.
+    pub(crate) fn blocked_secs(&self, ip: IpAddr) -> Option<u64> {
+        self.blocked_secs_at(throttle_key(ip), clock::now_epoch_millis())
+    }
+
+    /// Count one failed login from `ip`.
+    pub(crate) fn record_failure(&self, ip: IpAddr) {
+        self.record_failure_at(throttle_key(ip), clock::now_epoch_millis());
+    }
+
+    fn blocked_secs_at(&self, key: IpAddr, now_ms: u64) -> Option<u64> {
+        if self.cooldown_ms == 0 {
+            return None;
+        }
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let w = map.get(&key)?;
+        if w.blocked_until_ms > now_ms {
+            return Some((w.blocked_until_ms - now_ms).div_ceil(1000));
+        }
+        if now_ms.saturating_sub(w.last_ms) >= self.cooldown_ms {
+            // Fully decayed and unblocked: drop it, so a quiet server's map
+            // returns to empty instead of holding every address that ever
+            // fumbled a password.
+            map.remove(&key);
+        }
+        None
+    }
+
+    fn record_failure_at(&self, key: IpAddr, now_ms: u64) {
+        if self.cooldown_ms == 0 {
+            return;
+        }
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= LOGIN_THROTTLE_CAP && !map.contains_key(&key) {
+            let cooldown = self.cooldown_ms;
+            map.retain(|_, w| {
+                w.blocked_until_ms > now_ms || now_ms.saturating_sub(w.last_ms) < cooldown
+            });
+            if map.len() >= LOGIN_THROTTLE_CAP {
+                map.clear();
+            }
+        }
+        let w = map.entry(key).or_default();
+        if now_ms.saturating_sub(w.last_ms) >= self.cooldown_ms {
+            // Failures further apart than the cooldown never accumulate.
+            w.count = 0;
+        }
+        w.count += 1;
+        w.last_ms = now_ms;
+        if w.count >= LOGIN_FAIL_LIMIT {
+            w.blocked_until_ms = now_ms.saturating_add(self.cooldown_ms);
+            w.count = 0;
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+/// The address failures are counted against. IPv4 stands alone; IPv6 collapses
+/// to its /64, because one host commonly owns a whole /64 (SLAAC) and counting
+/// exact v6 addresses would hand a guesser 2^64 fresh identities. A v4-mapped
+/// v6 address keys as the v4 address it carries — collapsing those to their
+/// shared /64 would put the entire v4 internet behind one dual-stack listener
+/// into a single bucket.
+fn throttle_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            IpAddr::V6(octets.into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::HeaderValue;
@@ -223,6 +367,94 @@ mod tests {
         assert!(check_basic_auth(&basic_headers("cif+billing-api", "tok"), "ci", "tok").is_err());
         // A configured username containing '+' still matches itself exactly.
         assert!(check_basic_auth(&basic_headers("ci+team", "tok"), "ci+team", "tok").is_ok());
+    }
+
+    /// The pure `_at` transitions, driven by hand-rolled clocks — the global
+    /// sim-clock override is process-wide and off limits to parallel tests.
+    #[test]
+    fn login_throttle_blocks_after_limit_and_expires() {
+        let t = LoginThrottle::new(Duration::from_secs(300));
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let start = 1_000_000;
+        for i in 0..4 {
+            t.record_failure_at(ip, start + i * 1_000);
+            assert_eq!(t.blocked_secs_at(ip, start + i * 1_000), None);
+        }
+        // Fifth failure within the window: blocked for the full cooldown,
+        // reported rounded up (never Retry-After: 0).
+        t.record_failure_at(ip, start + 4_000);
+        assert_eq!(t.blocked_secs_at(ip, start + 4_000), Some(300));
+        assert_eq!(t.blocked_secs_at(ip, start + 4_000 + 299_500), Some(1));
+        // Cooldown over: unblocked, and the stale entry is swept on lookup.
+        assert_eq!(t.blocked_secs_at(ip, start + 4_000 + 300_000), None);
+        assert_eq!(t.len(), 0);
+        // Other addresses were never affected.
+        assert_eq!(
+            t.blocked_secs_at("203.0.113.10".parse().unwrap(), start),
+            None
+        );
+    }
+
+    #[test]
+    fn login_failures_slower_than_the_cooldown_never_block() {
+        let t = LoginThrottle::new(Duration::from_secs(300));
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        for i in 0..20u64 {
+            let now = 1_000_000 + i * 300_000;
+            t.record_failure_at(ip, now);
+            assert_eq!(t.blocked_secs_at(ip, now), None, "attempt {i}");
+        }
+    }
+
+    #[test]
+    fn login_throttle_zero_cooldown_disables() {
+        let t = LoginThrottle::new(Duration::ZERO);
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        for _ in 0..20 {
+            t.record_failure_at(ip, 1_000_000);
+        }
+        assert_eq!(t.blocked_secs_at(ip, 1_000_000), None);
+        assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn login_throttle_key_masks_ipv6_to_slash_64() {
+        let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:bbbb::2".parse().unwrap();
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(throttle_key(a), throttle_key(b));
+        assert_ne!(throttle_key(a), throttle_key(c));
+        // IPv4 stands alone; a v4-mapped v6 keys as its v4, NOT as the shared
+        // ::ffff:0:0/64 (which would bucket the whole v4 internet together).
+        let v4: IpAddr = "192.0.2.7".parse().unwrap();
+        assert_eq!(throttle_key(v4), v4);
+        let mapped: IpAddr = "::ffff:192.0.2.7".parse().unwrap();
+        assert_eq!(throttle_key(mapped), v4);
+        let other_mapped: IpAddr = "::ffff:192.0.2.8".parse().unwrap();
+        assert_ne!(throttle_key(mapped), throttle_key(other_mapped));
+    }
+
+    #[test]
+    fn login_throttle_sheds_state_at_the_cap() {
+        let t = LoginThrottle::new(Duration::from_secs(300));
+        let now = 1_000_000;
+        // Distinct live addresses up to the cap, then one more: the sweep finds
+        // nothing expired, so the map sheds entirely rather than growing.
+        for i in 0..LOGIN_THROTTLE_CAP as u32 {
+            t.record_failure_at(IpAddr::V4(std::net::Ipv4Addr::from(i)), now);
+        }
+        assert_eq!(t.len(), LOGIN_THROTTLE_CAP);
+        t.record_failure_at("203.0.113.9".parse().unwrap(), now);
+        assert_eq!(t.len(), 1);
+        // With the old entries expired instead, the sweep alone makes room:
+        // the cap-filling addresses decay and the newcomer is the survivor.
+        let t = LoginThrottle::new(Duration::from_secs(300));
+        for i in 0..LOGIN_THROTTLE_CAP as u32 {
+            t.record_failure_at(IpAddr::V4(std::net::Ipv4Addr::from(i)), now);
+        }
+        let later = now + 400_000;
+        t.record_failure_at("198.51.100.1".parse().unwrap(), later);
+        assert_eq!(t.len(), 1);
     }
 
     #[test]

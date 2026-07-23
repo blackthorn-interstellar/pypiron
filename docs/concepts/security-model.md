@@ -23,14 +23,15 @@ draws the line, and how to prove the release you're about to run is authentic.
 
 **Untrusted — every client request.** Anything a client sends is hostile until
 proven otherwise. Credentials compare in constant time, so a wrong guess leaks no
-timing. A half-configured credential disables its role instead of enabling a
-bypassable one. Private names never fall through to upstream, so nobody can shadow
-one with a public package of the same name. A browser can't be turned against you:
-cross-site state-changing requests are rejected, so cached Basic credentials can't
-be ridden from another site to forge an upload or a yank, and every response
-carries `X-Content-Type-Options: nosniff`. Client-set `X-Forwarded-For`/`X-Real-IP`
-are ignored for the audit log unless you enable `--trusted-proxy`, so a direct
-caller can't forge its logged address.
+timing — and repeated wrong guesses earn a lockout (see below). A half-configured
+credential disables its role instead of enabling a bypassable one. Private names
+never fall through to upstream, so nobody can shadow one with a public package of
+the same name. A browser can't be turned against you: cross-site state-changing
+requests are rejected, so cached Basic credentials can't be ridden from another
+site to forge an upload or a yank, and every response carries
+`X-Content-Type-Options: nosniff`. Client-set `X-Forwarded-For`/`X-Real-IP`
+are ignored for the audit log and the login throttle unless you enable
+`--trusted-proxy`, so a direct caller can't forge its logged address.
 
 **Trusted — your storage backend.** The S3, GCS, Azure, or disk backend you
 configure is your data behind your keys, and pypiron treats its responses as
@@ -61,6 +62,15 @@ Each links to how it works:
 - **In-place tampering** — an artifact swapped after upload. `verify-chain`
   replays the hash-chained log and names anything that changed.
   [Tamper-evident checkpoints](transparency.md)
+- **Online password guessing** — a client hammering login with candidate
+  secrets. Five failed logins from one address and that address is locked out
+  of logging in for five minutes; even a correct guess during the cooldown is
+  refused, so a hit can't be confirmed. Successful logins are never counted and
+  anonymous traffic is never throttled, so the lockout can't be turned against
+  clients that aren't guessing. Each instance enforces its own budget, so a
+  fleet of N replicas still bounds a guesser at N× one instance's rate. Tune or
+  disable with `--login-cooldown-secs` —
+  [configuration](../reference/configuration.md).
 
 ## What pypiron does not defend
 
@@ -81,15 +91,16 @@ design; know them before you lean on the rest.
   relays PyPI's provenance; it never mints or re-verifies attestations itself. A
   malicious upload that PyPI accepted and signed is one pypiron will carry across.
   Your own private uploads are a separate world you control.
-- **Online credential guessing and request floods.** pypiron does no in-process
-  rate limiting — a single stateless binary can't count requests across replicas,
-  and the job belongs at the edge. Put a request-rate limit on your reverse proxy
-  or load balancer. Failed logins already appear in the audit log as `401`/`403`
-  events at `info` level (so keep `pypiron::access=info` if you feed them to
-  fail2ban or a SIEM — raising it to `warn` keeps only 5xx and drops them); key any
-  ban on the real peer address, or trust the logged client field only when pypiron
-  sits behind a proxy with `--trusted-proxy`, since otherwise an attacker sets that
-  `X-Forwarded-For` themselves.
+- **Request floods.** Failed logins are throttled in-process (see above), but
+  volumetric floods — hammering the index, download, or metadata endpoints —
+  are the edge's job: put a request-rate limit on your reverse proxy or load
+  balancer. The access log gives an edge ban its signal: failed logins appear
+  as `401` events and throttled attempts as `429`s at `info` level (keep
+  `pypiron::access=info` if you feed them to fail2ban or a SIEM — raising it to
+  `warn` keeps only 5xx and drops them); key any ban on the real peer address,
+  or trust the logged client field only when pypiron sits behind a proxy with
+  `--trusted-proxy`, since otherwise an attacker sets that `X-Forwarded-For`
+  themselves.
 
 ## Dependency advisories
 

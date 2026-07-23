@@ -3063,6 +3063,7 @@ mod tests {
             access_log: false,
             access_log_format: AccessLogFormat::Structured,
             trusted_proxy: false,
+            login_throttle: Default::default(),
             worker_interval,
             reconcile_interval: Duration::from_secs(3600),
             repl_sweep_interval: Duration::from_secs(300),

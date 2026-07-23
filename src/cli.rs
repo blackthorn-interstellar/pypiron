@@ -623,6 +623,19 @@ pub struct ServeArgs {
     #[arg(long, env = "PYPIRON_TRUSTED_PROXY")]
     pub(crate) trusted_proxy: bool,
 
+    /// Failed-login cooldown in seconds. An address that fails login five
+    /// times, each within this window of the last, is refused further
+    /// credential-bearing requests (429 with Retry-After) until the window
+    /// passes. Successful logins are never counted and anonymous requests are
+    /// never throttled. Enforced per instance. 0 disables (rely on an edge
+    /// rate limit instead).
+    #[arg(
+        long,
+        env = "PYPIRON_LOGIN_COOLDOWN_SECS",
+        default_value_t = crate::auth::DEFAULT_LOGIN_COOLDOWN_SECS
+    )]
+    pub(crate) login_cooldown_secs: u64,
+
     /// Worker interval in seconds. The nudge path makes same-process writes
     /// visible at rebuild speed regardless; this is the marker-poll cadence
     /// for peer nodes' writes. 1s costs ~$0.45/month in S3 LISTs.
@@ -915,6 +928,11 @@ pub fn merge_serve_file(
     );
     fill!(cli.access_log, "access_log", f.access_log);
     fill!(cli.trusted_proxy, "trusted_proxy", f.trusted_proxy);
+    fill!(
+        cli.login_cooldown_secs,
+        "login_cooldown_secs",
+        f.login_cooldown_secs
+    );
     fill_enum!(
         cli.access_log_format,
         "access_log_format",

@@ -102,6 +102,10 @@
 # access-log = false
 # access-log-format = "structured"          # structured | clf
 
+# Failed-login cooldown: five failed logins from one address, each within this
+# window of the last, lock that address out of logging in for the window.
+# login-cooldown-secs = 300                 # 0 disables
+
 # Download statistics (beta) — count per-package/version downloads per day.
 # About $0.04 per node per month, no database.
 # download-stats = true

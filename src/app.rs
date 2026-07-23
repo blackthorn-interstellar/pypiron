@@ -47,7 +47,7 @@ use crate::admin::{
 };
 use crate::auth::{
     basic_credentials, check_basic_auth, cred_pair, credential_pair_error, nonempty, project_tag,
-    resolve_admin_user,
+    resolve_admin_user, LoginThrottle,
 };
 use crate::pages::{downloads_page, project_page, project_version_page, projects_page, root};
 use crate::publish::{
@@ -219,6 +219,8 @@ pub struct AppState {
     /// any direct caller forge its audit-logged address. Enable only behind a
     /// reverse proxy that sets them.
     pub trusted_proxy: bool,
+    /// Per-address failed-login throttle; see `--login-cooldown-secs`.
+    pub login_throttle: LoginThrottle,
     // worker cfg
     pub worker_interval: Duration,
     pub reconcile_interval: Duration,
@@ -451,6 +453,7 @@ impl AppState {
             access_log: false,
             access_log_format: AccessLogFormat::Structured,
             trusted_proxy: false,
+            login_throttle: LoginThrottle::default(),
             worker_interval: Duration::from_secs(1),
             reconcile_interval: Duration::from_secs(86400),
             repl_sweep_interval: Duration::from_secs(300),
@@ -1133,6 +1136,7 @@ async fn run_serve(
         access_log: cli.access_log,
         access_log_format: cli.access_log_format,
         trusted_proxy: cli.trusted_proxy,
+        login_throttle: LoginThrottle::new(Duration::from_secs(cli.login_cooldown_secs)),
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
         repl_sweep_interval: Duration::from_secs(cli.repl_sweep_interval_secs),
@@ -1485,6 +1489,25 @@ async fn log_requests(
         );
     }
 
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    // Failed-login throttle: only requests presenting credentials participate —
+    // anonymous traffic can't guess a password and is never held up. Keyed by
+    // the same address the audit log records (the forwarded header behind
+    // `--trusted-proxy`, else the peer), falling back to the peer when the
+    // forwarded value isn't an address.
+    let login_ip = if req.headers().contains_key(header::AUTHORIZATION) {
+        client_ip(req.headers(), peer, state.trusted_proxy)
+            .parse()
+            .ok()
+            .or(peer)
+    } else {
+        None
+    };
+    let login_refused_secs = login_ip.and_then(|ip| state.login_throttle.blocked_secs(ip));
+
     // Decide up front whether this request could be logged, so the hot read path
     // does no timing or field work.
     let consider = if probe_endpoint {
@@ -1497,7 +1520,7 @@ async fn log_requests(
         !is_read // default audit: mutations only
     };
     if !consider {
-        return next.run(req).await;
+        return run_throttling_logins(&state, req, next, login_ip, login_refused_secs).await;
     }
 
     let clf = state.access_log && matches!(state.access_log_format, AccessLogFormat::Clf);
@@ -1506,10 +1529,6 @@ async fn log_requests(
     let target = req.uri().to_string();
     let project = project_tag(req.headers());
     let ua = header_str(req.headers(), header::USER_AGENT);
-    let peer = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip());
     let host = client_ip(req.headers(), peer, state.trusted_proxy);
     // CLF-only fields: skip the work for the structured path.
     let version = req.version();
@@ -1523,7 +1542,7 @@ async fn log_requests(
     };
 
     let start = std::time::Instant::now();
-    let response = next.run(req).await;
+    let response = run_throttling_logins(&state, req, next, login_ip, login_refused_secs).await;
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
     let status = response.status();
     let bytes = response
@@ -1584,6 +1603,43 @@ async fn log_requests(
         access_event!(info);
     }
     response
+}
+
+/// Dispatch `req`, feeding the failed-login throttle. A currently-blocked
+/// address is refused before its credential is evaluated, so even a correct
+/// guess during the cooldown confirms nothing; a 401 coming back — a credential
+/// that authenticated as nobody, never a role denial (403) — records one
+/// failure. Both dispatch paths of `log_requests` funnel through here, so
+/// throttled refusals still reach the access log and metrics.
+async fn run_throttling_logins(
+    state: &AppState,
+    req: Request,
+    next: Next,
+    login_ip: Option<std::net::IpAddr>,
+    login_refused_secs: Option<u64>,
+) -> Response<Body> {
+    if let Some(secs) = login_refused_secs {
+        return too_many_logins(secs);
+    }
+    let response = next.run(req).await;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        if let Some(ip) = login_ip {
+            state.login_throttle.record_failure(ip);
+        }
+    }
+    response
+}
+
+/// The refusal for a login-throttled address. `Retry-After` carries when trying
+/// again can work, so a misconfigured CI job's operator sees a cooldown, not an
+/// outage.
+fn too_many_logins(retry_secs: u64) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(header::RETRY_AFTER, retry_secs)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from("Too many failed logins; wait out the cooldown"))
+        .unwrap_or_else(not_found)
 }
 
 /// A header's value as an owned `String`, if present and valid UTF-8.
@@ -1775,10 +1831,11 @@ async fn track_metrics(
     let resp = next.run(req).await;
     let status = resp.status().as_u16();
     state.metrics.record_request(group, status);
-    // Attribute traffic to the client's project tag — except on auth
-    // failures, where the tag never validated against anything.
+    // Attribute traffic to the client's project tag — except on auth failures
+    // and login-throttled refusals, where the tag never validated against
+    // anything.
     if let Some(tag) = project {
-        if status != 401 && status != 403 {
+        if !matches!(status, 401 | 403 | 429) {
             state.metrics.record_project(&tag, group);
         }
     }

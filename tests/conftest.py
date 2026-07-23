@@ -610,6 +610,45 @@ def disk_server_read_auth(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]
         yield server
 
 
+def _start_login_cooldown_server(
+    tmp_path_factory, bin_path: Path, cooldown_secs: int
+) -> Iterator[Dict]:
+    """Read-auth disk server with an explicit failed-login cooldown."""
+    for server in _start_disk_server(
+        tmp_path_factory,
+        bin_path,
+        extra_args=[
+            "--read-user",
+            "reader",
+            "--read-pass",
+            "readersecret",
+            "--login-cooldown-secs",
+            str(cooldown_secs),
+        ],
+    ):
+        server["read_user"] = "reader"
+        server["read_password"] = "readersecret"
+        yield server
+
+
+@pytest.fixture()
+def disk_server_login_cooldown(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Failed-login throttle at the default five-minute cooldown."""
+    yield from _start_login_cooldown_server(tmp_path_factory, pypiron_bin, 300)
+
+
+@pytest.fixture()
+def disk_server_login_cooldown_short(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Failed-login throttle with a cooldown short enough to watch expire."""
+    yield from _start_login_cooldown_server(tmp_path_factory, pypiron_bin, 2)
+
+
+@pytest.fixture()
+def disk_server_login_cooldown_off(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """--login-cooldown-secs 0: the failed-login throttle disabled."""
+    yield from _start_login_cooldown_server(tmp_path_factory, pypiron_bin, 0)
+
+
 @pytest.fixture()
 def disk_server_token_auth(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Read-gated disk server that also signs short-lived install tokens."""

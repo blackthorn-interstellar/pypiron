@@ -277,7 +277,7 @@ payload before signature verification for anything security-relevant.
   Actions and GitLab CI snippets end-to-end (permissions/`id_tokens` block →
   curl or one-liner exchange → `twine upload`). Lead with the outcome: "a
   password is not enough to publish this package."
-- `dev/ROADMAP.md` Security & access: add the shipped line, marked
+- `private/ROADMAP.md` Security & access: add the shipped line, marked
   experimental.
 
 ### Acceptance
@@ -437,7 +437,7 @@ verifying attestations or be refused. Startup-refuse an entry setting it while
 - Revise the recorded stance: `dev/DESIGN.md` §"PEP 740" (~line 581) — relay
   for mirror stays; first-party acceptance now exists behind
   publisher-verified uploads + pinned trust root; pypiron still never
-  *synthesizes* attestations. `dev/ROADMAP.md` line ~13 updated to match.
+  *synthesizes* attestations. `private/ROADMAP.md` line ~13 updated to match.
 - `docs/reference/standards.md`: PEP 740 row → served + accepted-with-
   verification, flagged experimental (note the Rekor caveat if item 5 was
   skipped).

@@ -56,8 +56,11 @@ reason about pypiron belongs in `dev/` instead.
   output: [docs/reference/standards.md](docs/reference/standards.md).
 - Every `--flag` is also a `PYPIRON_FLAG` env var; document new knobs in
   [docs/reference/configuration.md](docs/reference/configuration.md).
-- Check [dev/ROADMAP.md](dev/ROADMAP.md) before adding features — respect the
-  "rejected" list; don't re-litigate it.
+- Check `private/ROADMAP.md` (the nested private repo) before adding features —
+  respect the "Not planned" list; don't re-litigate it.
+- A shipped v1 with a named deferred phase gets a `private/ROADMAP.md` entry in
+  the same session, or the deferral doesn't exist — deferrals without a roadmap
+  home are silent deletions.
 - No `unwrap`/`expect`/`panic!` on a request or worker path; return errors with
   `anyhow` context. Catch specific errors, never a blanket match.
 - Security is fail-closed: a half-configured credential refuses startup, secrets

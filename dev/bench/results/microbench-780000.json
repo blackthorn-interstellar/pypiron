@@ -1,0 +1,549 @@
+{
+  "endpoints": {
+    "advisories-feed-get": {
+      "bytes": 0,
+      "cold_ms": 0.552,
+      "cold_ops": {
+        "list": 1
+      },
+      "rss_mb": 20.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.39,
+        "n": 100,
+        "p50_ms": 0.347,
+        "p95_ms": 0.368
+      },
+      "warm_ops": {
+        "list": 1
+      }
+    },
+    "advisories-feed-put": {
+      "cold_ops": {
+        "list": 1,
+        "write": 1
+      },
+      "warm": {
+        "max_ms": 0.596,
+        "n": 5,
+        "p50_ms": 0.502,
+        "p95_ms": 0.596
+      },
+      "warm_ops": {
+        "list": 1,
+        "write": 1
+      }
+    },
+    "artifact-download": {
+      "bytes": 0,
+      "cold_ms": 0.474,
+      "cold_ops": {
+        "read": 1
+      },
+      "rss_mb": 20.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.39,
+        "n": 100,
+        "p50_ms": 0.354,
+        "p95_ms": 0.375
+      },
+      "warm_ops": {
+        "read": 1
+      }
+    },
+    "audit-json": {
+      "bytes": 88,
+      "cold_ms": 0.385,
+      "cold_ops": {
+        "read": 1
+      },
+      "rss_mb": 20.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.37,
+        "n": 100,
+        "p50_ms": 0.333,
+        "p95_ms": 0.345
+      },
+      "warm_ops": {
+        "read": 1
+      }
+    },
+    "audit-page": {
+      "bytes": 47811,
+      "cold_ms": 0.653,
+      "cold_ops": {
+        "read": 1
+      },
+      "rss_mb": 28.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.417,
+        "n": 100,
+        "p50_ms": 0.375,
+        "p95_ms": 0.39
+      },
+      "warm_ops": {
+        "read": 1
+      }
+    },
+    "downloads-page": {
+      "bytes": 48013,
+      "cold_ms": 1.632,
+      "cold_ops": {
+        "list": 4,
+        "read": 31
+      },
+      "rss_mb": 28.6,
+      "startup_secs": 0.024,
+      "warm": {
+        "max_ms": 0.375,
+        "n": 100,
+        "p50_ms": 0.338,
+        "p95_ms": 0.355
+      },
+      "warm_ops": {}
+    },
+    "fallback-404": {
+      "bytes": 46,
+      "cold_ms": 0.487,
+      "cold_ops": {},
+      "rss_mb": 20.6,
+      "startup_secs": 0.024,
+      "warm": {
+        "max_ms": 0.384,
+        "n": 100,
+        "p50_ms": 0.325,
+        "p95_ms": 0.343
+      },
+      "warm_ops": {}
+    },
+    "favicon": {
+      "bytes": 15086,
+      "cold_ms": 0.502,
+      "cold_ops": {},
+      "rss_mb": 20.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.316,
+        "n": 100,
+        "p50_ms": 0.295,
+        "p95_ms": 0.309
+      },
+      "warm_ops": {}
+    },
+    "files-delete": {
+      "cold_ops": {
+        "delete": 4,
+        "list": 3,
+        "read": 5,
+        "write": 3
+      },
+      "warm": {
+        "max_ms": 1.571,
+        "n": 5,
+        "p50_ms": 1.356,
+        "p95_ms": 1.571
+      },
+      "warm_ops": {
+        "delete": 5,
+        "list": 3,
+        "read": 7,
+        "write": 5
+      }
+    },
+    "health": {
+      "bytes": 15,
+      "cold_ms": 0.346,
+      "cold_ops": {},
+      "rss_mb": 20.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.33,
+        "n": 100,
+        "p50_ms": 0.289,
+        "p95_ms": 0.305
+      },
+      "warm_ops": {}
+    },
+    "metrics": {
+      "bytes": 4772,
+      "cold_ms": 0.352,
+      "cold_ops": {},
+      "rss_mb": 20.6,
+      "startup_secs": 0.024,
+      "warm": {
+        "max_ms": 0.328,
+        "n": 100,
+        "p50_ms": 0.304,
+        "p95_ms": 0.317
+      },
+      "warm_ops": {}
+    },
+    "project-page": {
+      "bytes": 51143,
+      "cold_ms": 3.303,
+      "cold_ops": {
+        "list": 31,
+        "read": 35
+      },
+      "rss_mb": 28.6,
+      "startup_secs": 0.024,
+      "warm": {
+        "max_ms": 0.402,
+        "n": 100,
+        "p50_ms": 0.366,
+        "p95_ms": 0.381
+      },
+      "warm_ops": {}
+    },
+    "project-status-clear": {
+      "cold_ops": {
+        "delete": 2,
+        "list": 2,
+        "read": 5,
+        "write": 4
+      },
+      "warm": {
+        "max_ms": 0.827,
+        "n": 5,
+        "p50_ms": 0.731,
+        "p95_ms": 0.827
+      },
+      "warm_ops": {
+        "delete": 2,
+        "list": 2,
+        "read": 5,
+        "write": 4
+      }
+    },
+    "project-status-set": {
+      "cold_ops": {
+        "delete": 1,
+        "list": 2,
+        "read": 5,
+        "write": 5
+      },
+      "warm": {
+        "max_ms": 1.053,
+        "n": 5,
+        "p50_ms": 0.896,
+        "p95_ms": 1.053
+      },
+      "warm_ops": {
+        "delete": 1,
+        "list": 2,
+        "read": 5,
+        "write": 5
+      }
+    },
+    "project-version-page": {
+      "bytes": 51249,
+      "cold_ms": 3.753,
+      "cold_ops": {
+        "list": 31,
+        "read": 36
+      },
+      "rss_mb": 28.6,
+      "startup_secs": 0.024,
+      "warm": {
+        "max_ms": 0.426,
+        "n": 100,
+        "p50_ms": 0.365,
+        "p95_ms": 0.381
+      },
+      "warm_ops": {}
+    },
+    "projects-page": {
+      "bytes": 47985091,
+      "cold_ms": 1000.814,
+      "cold_ops": {
+        "read": 1
+      },
+      "rss_mb": 396.8,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 681.782,
+        "n": 100,
+        "p50_ms": 39.538,
+        "p95_ms": 40.488
+      },
+      "warm_ops": {}
+    },
+    "ready": {
+      "bytes": 18,
+      "cold_ms": 0.369,
+      "cold_ops": {
+        "read": 1
+      },
+      "rss_mb": 20.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.346,
+        "n": 100,
+        "p50_ms": 0.317,
+        "p95_ms": 0.331
+      },
+      "warm_ops": {
+        "read": 1
+      }
+    },
+    "root-page": {
+      "bytes": 51263,
+      "cold_ms": 1.516,
+      "cold_ops": {
+        "list": 4,
+        "read": 31
+      },
+      "rss_mb": 28.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.391,
+        "n": 100,
+        "p50_ms": 0.349,
+        "p95_ms": 0.378
+      },
+      "warm_ops": {}
+    },
+    "simple-pkg-html": {
+      "bytes": 1778,
+      "cold_ms": 10.007,
+      "cold_ops": {
+        "read": 1
+      },
+      "rss_mb": 16.8,
+      "startup_secs": 0.029,
+      "warm": {
+        "max_ms": 0.35,
+        "n": 100,
+        "p50_ms": 0.312,
+        "p95_ms": 0.332
+      },
+      "warm_ops": {}
+    },
+    "simple-pkg-json": {
+      "bytes": 3687,
+      "cold_ms": 2.043,
+      "cold_ops": {
+        "read": 1
+      },
+      "rss_mb": 24.5,
+      "startup_secs": 0.024,
+      "warm": {
+        "max_ms": 0.375,
+        "n": 100,
+        "p50_ms": 0.312,
+        "p95_ms": 0.331
+      },
+      "warm_ops": {}
+    },
+    "simple-root-html": {
+      "bytes": 44085865,
+      "cold_ms": 1812.55,
+      "cold_ops": {
+        "read": 1
+      },
+      "rss_mb": 110.4,
+      "startup_secs": 0.024,
+      "warm": {
+        "max_ms": 253.735,
+        "n": 100,
+        "p50_ms": 36.712,
+        "p95_ms": 38.395
+      },
+      "warm_ops": {}
+    },
+    "simple-root-json": {
+      "bytes": 44856001,
+      "cold_ms": 1894.966,
+      "cold_ops": {
+        "read": 1
+      },
+      "rss_mb": 119.1,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 265.416,
+        "n": 100,
+        "p50_ms": 37.381,
+        "p95_ms": 38.439
+      },
+      "warm_ops": {}
+    },
+    "stats-pkg": {
+      "bytes": 65,
+      "cold_ms": 2.0,
+      "cold_ops": {
+        "list": 30,
+        "read": 31
+      },
+      "rss_mb": 20.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.313,
+        "n": 100,
+        "p50_ms": 0.288,
+        "p95_ms": 0.303
+      },
+      "warm_ops": {}
+    },
+    "stats-summary": {
+      "bytes": 90,
+      "cold_ms": 1.253,
+      "cold_ops": {
+        "list": 4,
+        "read": 31
+      },
+      "rss_mb": 20.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.307,
+        "n": 100,
+        "p50_ms": 0.288,
+        "p95_ms": 0.3
+      },
+      "warm_ops": {}
+    },
+    "sync-cursors-get": {
+      "bytes": 2,
+      "cold_ms": 0.395,
+      "cold_ops": {
+        "read": 1
+      },
+      "rss_mb": 20.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.374,
+        "n": 100,
+        "p50_ms": 0.318,
+        "p95_ms": 0.337
+      },
+      "warm_ops": {
+        "read": 1
+      }
+    },
+    "sync-cursors-put": {
+      "cold_ops": {
+        "write": 1
+      },
+      "warm": {
+        "max_ms": 0.55,
+        "n": 5,
+        "p50_ms": 0.464,
+        "p95_ms": 0.55
+      },
+      "warm_ops": {
+        "write": 1
+      }
+    },
+    "sync-local-index": {
+      "bytes": 6477,
+      "cold_ms": 0.928,
+      "cold_ops": {
+        "read": 1
+      },
+      "rss_mb": 20.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.351,
+        "n": 100,
+        "p50_ms": 0.329,
+        "p95_ms": 0.343
+      },
+      "warm_ops": {
+        "read": 1
+      }
+    },
+    "tokens-mint": {
+      "bytes": 224,
+      "cold_ms": 0.44,
+      "cold_ops": {},
+      "rss_mb": 20.6,
+      "startup_secs": 0.023,
+      "warm": {
+        "max_ms": 0.361,
+        "n": 100,
+        "p50_ms": 0.319,
+        "p95_ms": 0.342
+      },
+      "warm_ops": {}
+    },
+    "upload-legacy": {
+      "cold_ops": {
+        "list": 2,
+        "read": 10,
+        "write": 8
+      },
+      "warm": {
+        "max_ms": 1.958,
+        "n": 5,
+        "p50_ms": 1.701,
+        "p95_ms": 1.958
+      },
+      "warm_ops": {
+        "read": 4,
+        "write": 6
+      }
+    },
+    "yank-clear": {
+      "cold_ops": {
+        "delete": 1,
+        "list": 2,
+        "read": 6,
+        "write": 5
+      },
+      "warm": {
+        "max_ms": 1.0,
+        "n": 5,
+        "p50_ms": 0.982,
+        "p95_ms": 1.0
+      },
+      "warm_ops": {
+        "delete": 1,
+        "list": 2,
+        "read": 6,
+        "write": 5
+      }
+    },
+    "yank-set": {
+      "cold_ops": {
+        "read": 1,
+        "write": 3
+      },
+      "warm": {
+        "max_ms": 1.362,
+        "n": 5,
+        "p50_ms": 1.029,
+        "p95_ms": 1.362
+      },
+      "warm_ops": {
+        "delete": 1,
+        "list": 2,
+        "read": 6,
+        "write": 5
+      }
+    }
+  },
+  "git_rev": "08dffb3",
+  "host": {
+    "cpus": 8,
+    "machine": "aarch64",
+    "platform": "Linux-6.1.176-221.367.amzn2023.aarch64-aarch64-with-glibc2.34"
+  },
+  "monster": {
+    "bytes": 8146754,
+    "cold_ms": 286.464,
+    "files": 45636,
+    "package": "pyagrum-nightly",
+    "rss_mb": 38.6
+  },
+  "schema": 1,
+  "startup_secs_median": 0.023,
+  "tier": {
+    "files": 17130626,
+    "packages": 770210,
+    "seed": 42,
+    "tree_format": 1
+  },
+  "upload_visible_secs": 0.991
+}

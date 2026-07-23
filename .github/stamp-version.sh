@@ -10,6 +10,13 @@ TAG="${1:?usage: stamp-version.sh vX.Y.Z}"
 }
 V="${BASH_REMATCH[1]}"
 
+# Record the commit id BEFORE the seds below dirty the tree, and hand it to
+# build.rs via the env (the same override the Docker build uses). Without this,
+# every wheel's --version reports "<sha>-dirty" — the dirt being our own stamp.
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+    echo "PYPIRON_GIT_HASH=$(git describe --always --dirty --exclude='*')" >> "$GITHUB_ENV"
+fi
+
 # No trailing $ anchors: tolerate CRLF checkouts on Windows runners.
 sed -i.bak "s/^version = \"0.0.0\"/version = \"$V\"/" Cargo.toml
 # Cargo.lock pins pypiron's own version; stamp it too so --locked builds (e.g. from sdist) work.

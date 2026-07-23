@@ -1,8 +1,9 @@
 //! Bake the git commit into the binary as `PYPIRON_GIT_HASH`.
 //!
-//! Order of truth: an explicit `PYPIRON_GIT_HASH` env var (set by the Docker
-//! build, where `.git` is excluded from the context) wins; otherwise we ask git
-//! directly (the common case for local and CI wheel builds, which have `.git`);
+//! Order of truth: an explicit `PYPIRON_GIT_HASH` env var wins — set by the
+//! Docker build (`.git` excluded from the context) and by stamp-version.sh in
+//! release CI (the version stamp dirties the tree, so asking git there would
+//! report `-dirty`); otherwise we ask git directly (the local-dev case);
 //! failing both (e.g. an sdist build from an extracted tarball) we record
 //! `unknown`.
 use std::process::Command;

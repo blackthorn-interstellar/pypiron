@@ -83,29 +83,40 @@ def ensure_cache(bin_path: str, packages: int, seed: int = 42) -> Path:
 
 # --------------------------- write-probe protection ---------------------------
 #
-# The mutation phase only ever touches (a) packages/<probe>/ dirs it creates
-# and (b) files OUTSIDE per-package dirs (global indexes, _sync/, _advisories/,
-# _transparency/, intent markers). So: snapshot every non-package file
-# byte-for-byte, restore + delete probe dirs after, verify by re-hash. The CI
-# lane proves this set is complete with a full-tree walk on its small tier.
+# The mutation phase only ever touches (a) per-package dirs it creates for the
+# probe packages — under packages/ AND under the rendered simple/ tree — and
+# (b) shared files outside any per-package dir (global indexes, _sync/,
+# _advisories/, _transparency/, intent markers). So: snapshot the shared files
+# byte-for-byte, restore them + delete the probe dirs after, verify by re-hash.
+# Never treat per-package dirs of OTHER packages as snapshot material: at the
+# 780k tier that is ~1.6M rendered index files, which overflows any tmp dir
+# (learned the ENOSPC way). The CI lane proves the narrow set is complete with
+# a full-tree walk on its small tier.
+
+# Trees with one subdirectory per package; only their top-level files are aux.
+_PER_PACKAGE_TREES = ("packages", "simple")
 
 
 def _aux_files(data_dir: Path) -> list:
-    """Every file under data_dir except those inside packages/<pkg>/.
-
-    Never descends into the per-package dirs — at the 50k tier that walk would
-    visit 1.2M files to find a dozen.
-    """
+    """Every shared file: everything except contents of per-package dirs."""
     data_dir = Path(data_dir)
     out = []
     for entry in data_dir.iterdir():
-        if entry.name == "packages":
+        if entry.name in _PER_PACKAGE_TREES:
             out.extend(p.relative_to(data_dir) for p in entry.iterdir() if p.is_file())
         elif entry.is_file():
             out.append(entry.relative_to(data_dir))
         else:
             out.extend(p.relative_to(data_dir) for p in entry.rglob("*") if p.is_file())
     return out
+
+
+def _per_package_dirs(data_dir: Path) -> dict:
+    return {
+        tree: {p.name for p in (Path(data_dir) / tree).iterdir() if p.is_dir()}
+        for tree in _PER_PACKAGE_TREES
+        if (Path(data_dir) / tree).is_dir()
+    }
 
 
 def tree_digest(data_dir: Path, rels: list) -> str:
@@ -122,15 +133,20 @@ def snapshot_aux(data_dir: Path, dest: Path) -> dict:
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(Path(data_dir) / rel, target)
-    pkg_dirs = {p.name for p in (Path(data_dir) / "packages").iterdir() if p.is_dir()}
-    return {"rels": rels, "digest": tree_digest(data_dir, rels), "pkg_dirs": pkg_dirs}
+    return {
+        "rels": rels,
+        "digest": tree_digest(data_dir, rels),
+        "dirs": _per_package_dirs(data_dir),
+    }
 
 
 def restore_aux(data_dir: Path, dest: Path, snap: dict, probe_prefix: str) -> None:
     data_dir = Path(data_dir)
-    # Probe packages vanish wholesale; nothing else under packages/ was touched.
-    for p in (data_dir / "packages").glob(f"{probe_prefix}-*"):
-        shutil.rmtree(p)
+    # Probe dirs vanish wholesale from every per-package tree; nothing else
+    # under those trees was touched.
+    for tree in _PER_PACKAGE_TREES:
+        for p in (data_dir / tree).glob(f"{probe_prefix}-*"):
+            shutil.rmtree(p)
     # Delete aux files that did not exist before, restore the rest byte-for-byte.
     before = set(map(str, snap["rels"]))
     for rel in _aux_files(data_dir):
@@ -142,12 +158,17 @@ def restore_aux(data_dir: Path, dest: Path, snap: dict, probe_prefix: str) -> No
 
 def verify_pristine(data_dir: Path, snap: dict, probe_prefix: str) -> None:
     data_dir = Path(data_dir)
-    leftovers = list((data_dir / "packages").glob(f"{probe_prefix}-*"))
-    if leftovers:
-        raise AssertionError(f"probe leftovers: {leftovers}")
-    pkg_dirs = {p.name for p in (data_dir / "packages").iterdir() if p.is_dir()}
-    if pkg_dirs != snap["pkg_dirs"]:
-        raise AssertionError(f"package set changed: {pkg_dirs ^ snap['pkg_dirs']}")
+    for tree in _PER_PACKAGE_TREES:
+        leftovers = list((data_dir / tree).glob(f"{probe_prefix}-*"))
+        if leftovers:
+            raise AssertionError(f"probe leftovers: {leftovers}")
+    dirs = _per_package_dirs(data_dir)
+    if dirs != snap["dirs"]:
+        diff = {
+            tree: dirs.get(tree, set()) ^ snap["dirs"].get(tree, set())
+            for tree in set(dirs) | set(snap["dirs"])
+        }
+        raise AssertionError(f"per-package dir sets changed: {diff}")
     rels = _aux_files(data_dir)
     if {str(r) for r in rels} != {str(r) for r in snap["rels"]}:
         raise AssertionError(

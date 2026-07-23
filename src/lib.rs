@@ -19,6 +19,7 @@ pub mod config;
 pub mod coremeta;
 #[cfg(test)]
 mod corpus_check;
+pub mod counted_storage;
 pub mod counters;
 pub mod hash;
 pub mod html;

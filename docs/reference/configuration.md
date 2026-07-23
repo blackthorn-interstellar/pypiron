@@ -307,6 +307,12 @@ Username tags are for attribution: `reader+billing-api` authenticates as
 `reader` and records `billing-api` in request metrics. Tags are capped and
 restricted to `[A-Za-z0-9._-]`.
 
+`/metrics` always carries `pypiron_storage_ops_total{op="read"|"write"|"list"|"delete"}`:
+backend calls issued through the storage layer. On an object-store deployment
+these are your billable S3/GCS/Azure requests — a climbing per-request ratio
+against `pypiron_http_requests_total` is read amplification worth
+investigating before the bill notices it.
+
 With the advisory feed enabled, `/metrics` carries three series:
 `pypiron_advisory_snapshot_age_seconds` (age of the loaded snapshot — alert when
 it climbs past your refresh window), `pypiron_malware_probe_age_seconds` (time

@@ -17,6 +17,21 @@ pub(crate) const ROUTES: [&str; 6] = ["simple", "files", "legacy", "health", "me
 /// Status classes. Order matches the counter matrix.
 const STATUS_CLASSES: [&str; 4] = ["2xx", "3xx", "4xx", "5xx"];
 
+/// Storage-op classes. Order matches the counter row.
+const STORAGE_OPS: [&str; 4] = ["read", "write", "list", "delete"];
+
+/// One class per [`crate::storage::Storage`] trait call, coarse on purpose:
+/// the question answered is "how many backend requests does this cost" — the
+/// S3 bill, the per-endpoint budget the micro-benchmarks pin exact. Counted by
+/// [`crate::counted_storage::CountedStorage`] on the serve path.
+#[derive(Clone, Copy)]
+pub enum StorageOp {
+    Read = 0,
+    Write = 1,
+    List = 2,
+    Delete = 3,
+}
+
 /// Index of the `files` route and the `2xx` status class in the matrix above.
 /// The dashboard's "files served" tile is files-route successes; naming the
 /// indices (and asserting them in a test) keeps that out of magic numbers.
@@ -75,6 +90,8 @@ pub struct Metrics {
     /// low-cardinality. A nonzero rate is the active-remediation signal: some
     /// machine still *asks* for malware — an incident, not a statistic.
     blocked_downloads: AtomicU64,
+    /// storage_ops[StorageOp]: backend calls issued through the Storage trait.
+    storage_ops: [AtomicU64; STORAGE_OPS.len()],
     /// Package index rebuilds (worker + reconcile + deletes).
     pub index_rebuilds: AtomicU64,
     /// Full reconcile sweeps completed.
@@ -307,6 +324,11 @@ impl Metrics {
         self.requests[route][class].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One backend call of the given class went through the Storage trait.
+    pub fn record_storage_op(&self, op: StorageOp) {
+        self.storage_ops[op as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A consistent-enough point-in-time copy of the request counters for the
     /// human dashboard (`/dashboard`). Atomics are read individually, not under
     /// a global lock, so totals can be off by a handful under concurrent
@@ -338,6 +360,15 @@ impl Metrics {
                     "pypiron_http_requests_total{{route=\"{route}\",status=\"{class}\"}} {v}\n"
                 ));
             }
+        }
+        out.push_str(
+            "# HELP pypiron_storage_ops_total Backend calls issued through the storage layer, \
+             by class.\n",
+        );
+        out.push_str("# TYPE pypiron_storage_ops_total counter\n");
+        for (i, op) in STORAGE_OPS.iter().enumerate() {
+            let v = self.storage_ops[i].load(Ordering::Relaxed);
+            out.push_str(&format!("pypiron_storage_ops_total{{op=\"{op}\"}} {v}\n"));
         }
         for (name, help, value) in [
             (
@@ -711,6 +742,20 @@ mod tests {
     fn matrix_indices_match_route_names() {
         assert_eq!(ROUTES[ROUTE_FILES], "files");
         assert_eq!(STATUS_CLASSES[CLASS_2XX], "2xx");
+    }
+
+    #[test]
+    fn storage_ops_render_by_class() {
+        let m = Metrics::new();
+        m.record_storage_op(StorageOp::Read);
+        m.record_storage_op(StorageOp::Read);
+        m.record_storage_op(StorageOp::List);
+        let out = m.render();
+        assert!(out.contains("pypiron_storage_ops_total{op=\"read\"} 2\n"));
+        assert!(out.contains("pypiron_storage_ops_total{op=\"list\"} 1\n"));
+        // Zero-valued classes still render: delta measurement needs the row.
+        assert!(out.contains("pypiron_storage_ops_total{op=\"write\"} 0\n"));
+        assert!(out.contains("pypiron_storage_ops_total{op=\"delete\"} 0\n"));
     }
 
     #[test]

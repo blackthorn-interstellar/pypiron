@@ -57,8 +57,8 @@ pypiron sync \
 
 ## Artifactory and Nexus
 
-Same command, different source URL. Both serve the standard simple API behind
-basic auth — point `--from` at the repository's simple endpoint:
+Same command, different source URL — point `--from` at the repository's simple
+endpoint:
 
 - **Artifactory:** `https://<host>/artifactory/api/pypi/<repo>/simple`
 - **Nexus:** `https://<host>/repository/<repo>/simple`
@@ -73,8 +73,30 @@ pypiron sync \
   --include-package internal-app
 ```
 
-devpi is tested end-to-end; the Artifactory and Nexus URLs above are their
-standard simple-API paths.
+**One prerequisite: the source must serve the JSON simple API (PEP 691).**
+pypiron reads the modern JSON index; it does not scrape the older HTML index.
+
+- **Artifactory** serves HTML by default. Turn on JSON per repository:
+  **Administration > Artifactory Settings > Packages Settings > PyPI > Enable
+  simple json format**. (If JSON is off, Artifactory falls back to HTML.)
+- **Nexus** serves the JSON simple API from **3.93** onward (3.94 adds file
+  sizes and upload times). Older Nexus is HTML-only — upgrade before migrating.
+
+If the source is still HTML-only, the migration stops with a clear message
+instead of a cryptic parse error:
+
+```
+source returned an HTML page (Content-Type: text/html), not the PEP 691 JSON
+pypiron migration requires — point --from at a JSON-capable endpoint, or check
+credentials if this is a login page.
+```
+
+The same message appears if a wrong credential lands you on a login page — check
+`--source-user`/`--source-pass` before assuming the endpoint is wrong.
+
+devpi is tested end-to-end. The Artifactory and Nexus paths above are their
+standard simple-API endpoints; the JSON-indexing prerequisite is the one thing to
+confirm first.
 
 ## Migrating everything
 

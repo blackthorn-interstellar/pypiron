@@ -26,6 +26,10 @@ Parameters:
     Type: String
     Default: soak/findings/
     Description: Prefix under which the reporter writes one object per distinct bug.
+  StatusPrefix:
+    Type: String
+    Default: soak/status/
+    Description: Prefix under which each reporter segment puts its live status object.
   SnsTopicArn:
     Type: String
     Default: ''
@@ -82,7 +86,9 @@ Resources:
                   Resource: !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/${BundleKey}
                 - Effect: Allow
                   Action: s3:PutObject
-                  Resource: !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/${FindingsPrefix}*
+                  Resource:
+                    - !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/${FindingsPrefix}*
+                    - !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/${StatusPrefix}*
                 - Effect: Allow
                   Action: sns:Publish
                   Resource: !Ref SnsTopicArn
@@ -91,7 +97,9 @@ Resources:
                   Resource: !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/${BundleKey}
                 - Effect: Allow
                   Action: s3:PutObject
-                  Resource: !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/${FindingsPrefix}*
+                  Resource:
+                    - !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/${FindingsPrefix}*
+                    - !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/${StatusPrefix}*
 
   SoakInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -140,6 +148,7 @@ Resources:
             cat >/etc/pypiron-soak/soak.env <<ENV
             PYPIRON_SOAK_S3_BUCKET=${S3Bucket}
             PYPIRON_SOAK_S3_PREFIX=${FindingsPrefix}
+            PYPIRON_SOAK_STATUS_PREFIX=${StatusPrefix}
             PYPIRON_SOAK_BUNDLE_KEY=${BundleKey}
             PYPIRON_SOAK_SNS_TOPIC=${SnsTopicArn}
             AWS_REGION=${AWS::Region}

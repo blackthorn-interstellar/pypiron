@@ -5,13 +5,13 @@
 #   ./fleet.sh apply                # create/update the fleet (default VPC if unset)
 #   ./fleet.sh status               # stack + instances + finding count + seeds
 #   ./fleet.sh findings             # list the deduped findings in S3
-#   ./fleet.sh seeds                # how many seeds the fleet has checked
+#   ./fleet.sh seeds                # seed totals from the fleet's S3 status objects
 #   ./fleet.sh destroy [--all]      # tear down the fleet; --all also deletes the bucket
 #
 # The fleet holds no GitHub credential: the box downloads the bundle and writes
 # findings entirely through its IAM role. Idempotent (CloudFormation reconciles).
 # Overridable via env:
-#   REGION STACK_NAME S3_BUCKET BUNDLE_KEY FINDINGS_PREFIX SNS_TOPIC
+#   REGION STACK_NAME S3_BUCKET BUNDLE_KEY FINDINGS_PREFIX STATUS_PREFIX SNS_TOPIC
 #   DESIRED MAX EMAIL BUDGET VPC_ID SUBNET_IDS
 set -euo pipefail
 
@@ -24,6 +24,7 @@ STACK_NAME=${STACK_NAME:-pypiron-soak}
 S3_BUCKET=${S3_BUCKET:-pypiron-soak-$(command aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}
 BUNDLE_KEY=${BUNDLE_KEY:-soak/bundle.tar.gz}
 FINDINGS_PREFIX=${FINDINGS_PREFIX:-soak/findings/}
+STATUS_PREFIX=${STATUS_PREFIX:-soak/status/}
 SNS_TOPIC=${SNS_TOPIC:-}
 DESIRED=${DESIRED:-1}
 MAX=${MAX:-2}
@@ -62,7 +63,9 @@ push_bundle() {
     ensure_bucket # idempotent: create the dedicated bucket if it's not there yet
     local stage
     stage=$(mktemp -d)
-    trap 'rm -rf "$stage"' RETURN
+    # Self-clearing: a RETURN trap stays armed for the caller's return too,
+    # where the local is gone (set -u would abort).
+    trap 'rm -rf "$stage"; trap - RETURN' RETURN
     echo "building aarch64 vopr in a linux/arm64 container (no host target/ touched)..."
     # Stamp the git hash from the host (the container has the repo read-only and
     # would trip git's dubious-ownership guard). Repo mounted read-only; build
@@ -76,7 +79,8 @@ push_bundle() {
         -w /src "$RUST_IMAGE" \
         bash -c "CARGO_TARGET_DIR=/tmp/t cargo build --release --example vopr --locked && cp /tmp/t/release/examples/vopr /out/vopr"
     for f in "${BUNDLE_FILES[@]}"; do cp "$HERE/$f" "$stage/$f"; done
-    tar czf "$stage/bundle.tar.gz" -C "$stage" vopr "${BUNDLE_FILES[@]}"
+    printf '%s' "$githash" >"$stage/commit" # the reporter keys status objects by this
+    tar czf "$stage/bundle.tar.gz" -C "$stage" vopr commit "${BUNDLE_FILES[@]}"
     aws s3 cp "$stage/bundle.tar.gz" "s3://$S3_BUCKET/$BUNDLE_KEY"
     echo "pushed s3://$S3_BUCKET/$BUNDLE_KEY — the fleet refreshes within ~10 min."
 }
@@ -108,7 +112,8 @@ apply() {
         --parameter-overrides \
         "VpcId=${VPC_ID}" "SubnetIds=${SUBNET_IDS}" \
         "S3Bucket=${S3_BUCKET}" "BundleKey=${BUNDLE_KEY}" \
-        "FindingsPrefix=${FINDINGS_PREFIX}" "SnsTopicArn=${SNS_TOPIC}" \
+        "FindingsPrefix=${FINDINGS_PREFIX}" "StatusPrefix=${STATUS_PREFIX}" \
+        "SnsTopicArn=${SNS_TOPIC}" \
         "DesiredCapacity=${DESIRED}" "MaxSize=${MAX}" \
         "MonthlyBudgetUsd=${BUDGET}" "NotificationEmail=${EMAIL}"
     echo "deployed. Instances take ~1-2 min to fetch the bundle and start soaking."
@@ -126,7 +131,7 @@ status() {
     # `s3 ls` exits 1 on an empty prefix; under pipefail that would fail status.
     echo "== findings ==" && { aws s3 ls "s3://${S3_BUCKET}/${FINDINGS_PREFIX}" 2>/dev/null || true; } \
         | wc -l | sed 's/^/  distinct findings in S3: /'
-    echo "== seeds ==" && seeds   # SSM round-trip per box, so this is the slow part
+    echo "== seeds ==" && seeds
 }
 
 findings() {
@@ -142,33 +147,49 @@ findings() {
     done
 }
 
-# seeds: sum the live per-core seed counters across the fleet, via SSM. The
-# counter is per-process and resets when a soak restarts (e.g. a spot reclaim),
-# so this is "seeds since the current instances started," not lifetime.
+# seeds: aggregate the per-segment status objects the reporters put to S3
+# (one JSON per reporter process lifetime, updated every ~60s, final-flushed on
+# shutdown). Pure S3 reads — no SSM, works even mid-reclaim. Summing every
+# segment is the lifetime total; segments never overlap, so it can only
+# undercount (restart gaps), never double count.
 seeds() {
-    local iids total=0
-    iids=$(aws ec2 describe-instances \
-        --filters "Name=tag:Name,Values=${STACK_NAME}" "Name=instance-state-name,Values=running" \
-        --query 'Reservations[].Instances[].InstanceId' --output text)
-    if [ -z "$iids" ]; then
-        echo "no running instances"
-        return
-    fi
-    local snippet b64
-    snippet='for u in $(systemctl list-units "pypiron-soak@*" --no-legend --plain | grep -oE "^[^ ]+"); do journalctl -u "$u" -o cat --no-pager | grep -a "seeds," | tail -1; done'
-    b64=$(printf '%s' "$snippet" | base64 | tr -d '\n')
-    for iid in $iids; do
-        local cid out n
-        cid=$(aws ssm send-command --instance-ids "$iid" --document-name AWS-RunShellScript \
-            --parameters commands="echo $b64 | base64 -d | bash" --query Command.CommandId --output text)
-        aws ssm wait command-executed --command-id "$cid" --instance-id "$iid" 2>/dev/null || true
-        out=$(aws ssm get-command-invocation --command-id "$cid" --instance-id "$iid" \
-            --query StandardOutputContent --output text 2>/dev/null || true)
-        n=$(printf '%s' "$out" | grep -oE '[0-9]+ seeds' | awk '{s+=$1} END{print s+0}')
-        echo "  $iid: $n seeds"
-        total=$((total + n))
-    done
-    echo "TOTAL: $total seeds explored (since current instances started; resets on spot reclaim)"
+    : "${S3_BUCKET:?set S3_BUCKET}"
+    local tmp
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"; trap - RETURN' RETURN
+    aws s3 sync "s3://${S3_BUCKET}/${STATUS_PREFIX}" "$tmp" --quiet 2>/dev/null || true
+    python3 - "$tmp" <<'PY'
+import datetime, json, pathlib, sys
+
+now = datetime.datetime.now(datetime.timezone.utc)
+segments = []
+for p in sorted(pathlib.Path(sys.argv[1]).glob("*.json")):
+    try:
+        segments.append(json.loads(p.read_text()))
+    except (ValueError, OSError):
+        print(f"  (unreadable status object: {p.name})")
+if not segments:
+    print("  no status objects yet — the fleet writes one within ~1 min of soaking")
+    raise SystemExit
+
+def age(seg):
+    try:
+        ts = datetime.datetime.fromisoformat(seg["updated_at"])
+    except (KeyError, ValueError):
+        return None
+    return (now - ts).total_seconds()
+
+live = [s for s in segments if not s.get("final") and (age(s) or 1e9) < 900]
+for s in live:
+    print(f"  LIVE {s.get('commit', '?')} {s.get('uuid', '?')[:8]} "
+          f"{s.get('instance_id') or '?'} {s.get('instance_type') or '?'} "
+          f"{s.get('cores', '?')}c  {s.get('seeds', 0):,} seeds  ({int(age(s) or 0)}s ago)")
+if not live:
+    print("  no live workers reporting (last update > 15 min ago)")
+total = {k: sum(s.get(k, 0) for s in segments) for k in ("seeds", "interleavings", "acked_uploads")}
+print(f"  lifetime: {len(segments)} segments, {total['seeds']:,} seeds, "
+      f"{total['interleavings']:,} interleavings, {total['acked_uploads']:,} acked uploads")
+PY
 }
 
 # destroy: tear down the compute. By default the bucket (your findings) is

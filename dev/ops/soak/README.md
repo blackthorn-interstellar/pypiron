@@ -91,6 +91,24 @@ findings); `./fleet.sh destroy --all` empties and deletes the bucket too. It's a
 single dedicated bucket named by account, so re-runs reuse it — buckets don't
 pile up.
 
+## Seed tracking (`fleet.sh seeds`)
+
+Each reporter process is one **segment**: at start it mints a uuid and then
+puts a single JSON object to `s3://…/soak/status/<commit>-<uuid>.json` every
+~60s — accumulated seeds/interleavings (reset-safe against soak restarts,
+baselined from the journal so a reporter restart never double counts), per-unit
+gauges, instance id/type, and a findings count. On SIGTERM/SIGINT (bundle
+refresh, spot reclaim's shutdown, `systemctl stop`) it flushes a last snapshot
+with `final: true`, so a segment's object is its total; a hard kill just loses
+the final ≤60s. One writer per key + S3's atomic whole-object PUT = safe
+concurrent writes with zero coordination.
+
+`fleet.sh seeds` (also part of `status`) lists the prefix and aggregates: live
+segments (updated <15 min ago) individually, plus the lifetime sum over every
+segment ever. Segments never overlap, so the sum can only undercount slightly
+(restart gaps) — never inflate. No SSM, so it works mid-reclaim and needs only
+S3 read access.
+
 ## Run the finder on any box (no AWS)
 
 The fleet is orchestration around one idempotent installer. On any Linux box,
@@ -110,7 +128,7 @@ Without a bucket the reporter still records findings to a local fallback file.
 | `fleet.cfn.yaml` | CloudFormation: IAM (S3 get bundle / put findings), SG, launch template (+ bootstrap), spot ASG, budget |
 | `fleet.sh` | `push-bundle` / `apply` / `status` / `findings` / `destroy` |
 | `pypiron-soak@.service` | one soak process per core (`vopr --forever --rotate`, random start-seed) |
-| `report.py` | journal → deduped S3 findings (seed-agnostic signatures, rate-capped, fail-open) |
+| `report.py` | journal → deduped S3 findings (seed-agnostic signatures, rate-capped, fail-open) + per-segment status objects (seed totals, final-flush on shutdown) |
 | `pypiron-soak-reporter.service` | one reporter per box, follows the merged soak journal |
 | `fetch-bundle.sh` + `pypiron-soak-refresh.{service,timer}` | poll S3, reinstall + restart when the bundle changes |
 | `install.sh` | wire the units up from an extracted bundle (idempotent) |

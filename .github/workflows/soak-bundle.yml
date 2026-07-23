@@ -34,6 +34,7 @@ jobs:
         run: |
           mkdir -p stage
           cp target/release/examples/vopr stage/vopr
+          git rev-parse --short HEAD > stage/commit
           cp dev/ops/soak/report.py dev/ops/soak/install.sh dev/ops/soak/fetch-bundle.sh \
              dev/ops/soak/pypiron-soak@.service dev/ops/soak/pypiron-soak-reporter.service \
              dev/ops/soak/pypiron-soak-refresh.service dev/ops/soak/pypiron-soak-refresh.timer stage/

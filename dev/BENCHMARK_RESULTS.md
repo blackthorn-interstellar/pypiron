@@ -68,6 +68,14 @@ Every landed optimization, paired with the meter runs that bracket it.
 | 2026-06-12 | Precompressed gzip index/metadata variants (cache.rs) | R2 torch-index reads | 8,296 → 27,287 rps at half the wire bytes (NIC-bound → CPU-bound) |
 | 2026-06-12 | Worker nudge on writes (Notify) + 1s default tick | W3 visible p50 / W4 sync p99 | 1.35s → 0.68s / 1.83s → 0.82s |
 | 2026-06-12 | Cache bodies as `Bytes` (refcount, not memcpy) | per-response copy removed | ~430 MB/s of memcpy off the 2-vCPU hot path |
+| 2026-07-23 | `/projects/` browser render cache (9be18bb, pages.rs) | microbench projects-page warm p50 @50k pkgs | 12.95ms → 0.60ms |
+| 2026-07-23 | `/stats/:metric` summary TTL cache (3539423, admin.rs) | microbench stats-summary warm @50k | 3.13ms + 105 reads/74 lists per request → 0.15ms + **0 storage ops** |
+| 2026-07-23 | `/stats/:metric/:package` series TTL cache (2b46874, admin.rs) | microbench stats-pkg warm @50k | 0.89ms + 30 reads/30 lists per request → 0.26ms + **0 storage ops** |
+| 2026-07-23 | Counters live day-summary shard fan-out collapsed to two LISTs (59b37e2, counters.rs) | cold global-stats refill (root/downloads/stats-summary) | 74 fanned-out LISTs → **4**; root-page cold 3.8ms → 1.9ms (would be ~178 sequential S3 round-trips per refill) |
+
+The 2026-07-23 rows came out of the endpoint micro-benchmark loop
+(dev/bench/MICROBENCH.md); a fifth candidate (borrowing `file_version` instead
+of cloning) measured no_change and was reverted rather than kept on vibes.
 
 ## Scale: full-PyPI, measured
 

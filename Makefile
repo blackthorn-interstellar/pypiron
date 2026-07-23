@@ -1,4 +1,4 @@
-.PHONY: init init-rust init-python build dev run test test-rust test-python test-s3-real test-gcs-real perf compat check cargo-check af fmt lint audit coverage clean doc docs docs-serve docs-truth build-wheel release-notes fuzz fuzz-build vopr-soak dr-drill help
+.PHONY: init init-rust init-python build dev run test test-rust test-python test-s3-real test-gcs-real perf microbench compat check cargo-check af fmt lint audit coverage clean doc docs docs-serve docs-truth build-wheel release-notes fuzz fuzz-build vopr-soak dr-drill help
 
 SHELL := /bin/bash
 
@@ -46,6 +46,9 @@ test-gcs-real:  ## Run the GCS round-trip against a REAL GCS bucket (set PYPIRON
 perf:  ## Run performance benchmarks (builds release binary)
 	# -n 0: xdist swallows -s and concurrent runs corrupt the timings.
 	uv run -- pytest tests -m perf -s -n 0
+
+microbench: build  ## Tracked per-endpoint latencies at the 50k-package tier (dev/bench/MICROBENCH.md)
+	python3 dev/bench/microbench.py run --packages $(or $(PACKAGES),50000)
 
 compat:  ## Generate the client compatibility matrix
 	# -n 0: compat results aggregate in-process; xdist workers can't feed the doc writer.

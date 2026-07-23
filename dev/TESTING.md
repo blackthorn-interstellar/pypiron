@@ -303,6 +303,30 @@ optimization gets a before/after.
   flake.
 - Run with `make perf`; excluded from default test runs.
 
+### Per-endpoint micro-benchmarks
+
+Spec: [dev/bench/MICROBENCH.md](bench/MICROBENCH.md). Two lanes over one
+canonical endpoint table ([dev/bench/endpoints.py](bench/endpoints.py)) that
+covers every route in the router — a drift test fails when a route is added
+without a bench entry.
+
+- **CI lane** (`tests/test_endpoint_bench.py`, runs in the default suite):
+  deterministic asserts only. Every endpoint's exact per-request storage-op
+  counts (`pypiron_storage_ops_total` deltas, cold and warm) must equal the
+  pins in the table — an accidental O(n) storage access fails the build; a
+  wall-time never does. After an intentional storage-access change, refresh
+  the pins with `dev/bench/microbench.py pins --bin target/debug/pypiron` and
+  commit the diff.
+- **Tracked lane** (`make microbench`): cold + warm latency per endpoint at a
+  50k-package / 1.2M-file PyPI-shaped tier, plus startup time, worst-case
+  first-hit (the corpus's biggest package), RSS, and upload-to-visible.
+  Results land in `dev/bench/results/microbench-<tier>.json` (committed; git
+  history is the trend line). Never gates a PR. The tier is fabricated once
+  and cached post-sweep under `.local/microbench/`, so a run starts in
+  seconds; write endpoints run behind a verified snapshot/restore that keeps
+  the cache byte-pristine. Full-PyPI scale is the same harness with
+  `--packages 780000` on a throwaway cloud box.
+
 ## Running
 
 ```sh
@@ -310,6 +334,7 @@ make test            # cargo test + pytest (perf/stress excluded)
 make test-rust       # unit tests only
 make test-python     # blackbox integration tests
 make perf            # performance benchmarks (builds release binary)
+make microbench      # tracked per-endpoint latencies at the 50k tier
 ```
 
 ## Fuzzing

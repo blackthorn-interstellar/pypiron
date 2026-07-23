@@ -28,90 +28,38 @@ from __future__ import annotations
 
 import argparse
 import base64
-import gzip
 import hashlib
 import io
 import json
 import os
-import random
 import re
 import subprocess
 import time
 import urllib.error
 import urllib.request
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import fabricate
+
 REPO = Path(__file__).resolve().parent.parent
-FILECOUNTS = REPO / "bench" / "corpus" / "pypi-project-filecounts.tsv.gz"
-
-
-def normalize(name: str) -> str:
-    return re.sub(r"[-_.]+", "-", name).lower().strip("-")
-
 
 # ---------------------------------- seed -----------------------------------
 
 
-def load_projects() -> list[tuple[str, int]]:
-    """(normalized name, file count) for every real PyPI project, deduped."""
-    counts: dict[str, int] = {}
-    with gzip.open(FILECOUNTS, "rt", encoding="utf-8") as fh:
-        for line in fh:
-            name, _, cnt = line.rstrip("\n").partition("\t")
-            norm = normalize(name)
-            if norm:
-                counts[norm] = counts.get(norm, 0) + int(cnt)
-    return sorted(counts.items())
-
-
-def seed_package(pkg_dir: Path, name: str, n_files: int) -> int:
-    pkg_dir.mkdir(parents=True, exist_ok=True)
-    for i in range(n_files):
-        version = f"0.{i}.0"
-        filename = f"{name}-{version}.tar.gz"
-        artifact = pkg_dir / filename
-        artifact.touch()
-        sidecar = {
-            "sha256": hashlib.sha256(filename.encode()).hexdigest(),
-            "size": 0,
-            "version": version,
-            "upload-time": f"2025-01-{(i % 28) + 1:02d}T00:00:00Z",
-            "yanked": False,
-        }
-        (pkg_dir / f"{filename}.meta.json").write_text(json.dumps(sidecar))
-    return n_files
-
-
 def cmd_seed(args: argparse.Namespace) -> None:
-    projects = load_projects()
-    rng = random.Random(args.seed)
-    sample = projects if args.packages >= len(projects) else rng.sample(projects, args.packages)
-    total_files = sum(c for _, c in sample)
-    print(f"seeding {len(sample):,} packages / {total_files:,} files -> {args.dest}")
-
-    packages_root = Path(args.dest) / "packages"
     start = time.monotonic()
-    done_files = 0
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [
-            pool.submit(seed_package, packages_root / name, name, count) for name, count in sample
-        ]
-        for i, fut in enumerate(futures, 1):
-            done_files += fut.result()
-            if i % 5000 == 0:
-                rate = done_files / (time.monotonic() - start)
-                print(f"  {i:,} pkgs, {done_files:,} files ({rate:,.0f} files/s)")
+
+    def progress(pkgs: int, files: int) -> None:
+        rate = files / (time.monotonic() - start)
+        print(f"  {pkgs:,} pkgs, {files:,} files ({rate:,.0f} files/s)")
+
+    print(f"seeding {args.packages:,} packages -> {args.dest}")
+    manifest = fabricate.fabricate_tree(
+        Path(args.dest), args.packages, seed=args.seed, workers=args.workers, progress=progress
+    )
     elapsed = time.monotonic() - start
-    print(f"seeded in {elapsed:,.1f}s ({total_files / elapsed:,.0f} files/s)")
-    manifest = {
-        "packages": len(sample),
-        "files": total_files,
-        "seed": args.seed,
-        "sample_names": [n for n, _ in sample[:50]],
-    }
-    (Path(args.dest) / "scale-manifest.json").write_text(json.dumps(manifest, indent=2))
+    print(f"seeded {manifest['files']:,} files in {elapsed:,.1f}s")
 
 
 # ----------------------------------- run -----------------------------------

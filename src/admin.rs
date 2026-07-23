@@ -106,16 +106,16 @@ pub(crate) async fn stats_get(
         return not_found("not a package");
     };
     let (from, to) = last_30d_window();
-    let series = state.counters.query_package(&metric, &pkg, from, to).await;
+    let series = cached_package_series(&state, &metric, &pkg, from, to).await;
 
     let mut days: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> =
         std::collections::BTreeMap::new();
     let mut total: u64 = 0;
-    for (day, files) in series {
-        let by_ver = days.entry(day).or_default();
+    for (day, files) in series.iter() {
+        let by_ver = days.entry(day.clone()).or_default();
         for (filename, count) in files {
             total += count;
-            let ver = infer_version_from_filename(&filename).unwrap_or_else(|| "unknown".into());
+            let ver = infer_version_from_filename(filename).unwrap_or_else(|| "unknown".into());
             *by_ver.entry(ver).or_insert(0) += count;
         }
     }
@@ -127,12 +127,13 @@ pub(crate) async fn stats_get(
     }))
 }
 
-/// How long a cached `/stats/:metric` summary set stays warm before a rescan.
-/// Matches the download board's interval and rationale: the global totals
-/// already lag a counter flush, so a minute of staleness is invisible while it
-/// spares a repeated poll a full counter-store rescan (a 30-day window over an
-/// open day is ~100 reads + ~70 cross-shard lists — the cost `stats-summary`
-/// otherwise paid every hit).
+/// How long a cached `/stats` set — the global `:metric` summary or a per-package
+/// `:metric/:package` series — stays warm before a rescan. Matches the download
+/// board's interval and rationale: the totals already lag a counter flush, so a
+/// minute of staleness is invisible while it spares a repeated poll a full
+/// counter-store rescan (a 30-day window over an open day is ~100 reads + ~70
+/// cross-shard lists for the summary, ~30 reads + ~30 lists for one package —
+/// the cost these endpoints otherwise paid every hit).
 const SUMMARY_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Cap on distinct `:metric` keys held in the summary cache. `:metric` is a
@@ -140,6 +141,13 @@ const SUMMARY_CACHE_TTL: Duration = Duration::from_secs(60);
 /// without bound; past the cap it is cleared wholesale (the presign-cache
 /// idiom). In practice only `downloads` is ever recorded, so this is never hit.
 const SUMMARY_CACHE_MAX_METRICS: usize = 64;
+
+/// Cap on distinct `(metric, package)` keys held in the per-package stats cache.
+/// Unlike `:metric`, `:package` is high-cardinality, so the cap protects against
+/// a caller cycling it (or a large fleet of watched packages); past it the map
+/// is pruned of expired entries then, if still over, cleared wholesale — the
+/// same bounding `SUMMARY_CACHE_MAX_METRICS` applies, sized for real dashboards.
+const PACKAGE_STATS_CACHE_MAX: usize = 4096;
 
 /// The global day-summaries for `metric`, served from a short metric-keyed TTL
 /// cache so a repeated `/stats/:metric` poll doesn't rescan the counter store on
@@ -178,6 +186,49 @@ async fn cached_summaries(
         }
     }
     summaries
+}
+
+/// The per-package daily series for `(metric, package)`, served from the short
+/// TTL cache keyed on the pair so a repeated `/stats/:metric/:package` poll
+/// doesn't rescan the package's 30-day counter window on every hit — the
+/// per-package twin of [`cached_summaries`]. Computes and stores on a cold or
+/// expired entry; the worker drops the whole cache after each counter flush, so
+/// a same-node poll never lags its own writes past a flush interval.
+async fn cached_package_series(
+    state: &AppState,
+    metric: &str,
+    pkg: &str,
+    from: time::Date,
+    to: time::Date,
+) -> Arc<std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>> {
+    let cache_key = (metric.to_string(), pkg.to_string());
+    {
+        let guard = state
+            .package_stats_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((at, series)) = guard.get(&cache_key) {
+            if at.elapsed() < SUMMARY_CACHE_TTL {
+                return series.clone();
+            }
+        }
+    }
+    let series = Arc::new(state.counters.query_package(metric, pkg, from, to).await);
+    let mut guard = state
+        .package_stats_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.insert(cache_key, (Instant::now(), series.clone()));
+    // Bound the map: past the cap drop expired entries, and clear outright if the
+    // live set still exceeds it — `:package` is a high-cardinality read-gated path
+    // param, so a caller cycling it can't grow the map without bound.
+    if guard.len() > PACKAGE_STATS_CACHE_MAX {
+        guard.retain(|_, (at, _)| at.elapsed() < SUMMARY_CACHE_TTL);
+        if guard.len() > PACKAGE_STATS_CACHE_MAX {
+            guard.clear();
+        }
+    }
+    series
 }
 
 /// Global counter summary: `GET /stats/:metric` (read-auth gated). The last 30

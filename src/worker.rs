@@ -736,6 +736,10 @@ pub async fn run_worker_until(
                 _ = state.counters.flush() => {}
                 _ = wait_until_generation_changes(&state, selected.generation) => {}
             }
+            // Drop the per-package /stats cache now that this node's own writes are
+            // in the store, so a same-node poll reads its own just-flushed counts
+            // (the TTL bounds other nodes). Off the hot path, once per flush.
+            state.invalidate_package_stats();
         }
 
         // Advisory refresh (EVERY node): the leader refetches the source and
@@ -3088,6 +3092,7 @@ mod tests {
             counters: Arc::new(crate::counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),
             summary_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            package_stats_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),

@@ -117,7 +117,7 @@ ENDPOINTS: list = [
         path="/stats/downloads/{pkg}",
         routes=(("GET", "/stats/:metric/:package"),),
         cold_ops={"read": 30, "list": 30},
-        warm_ops={"read": 30, "list": 30},
+        warm_ops={},  # (metric, package)-keyed TTL cache; warm hits are 0 storage ops
         bytes_range=(2, 5000),
     ),
     _e(

@@ -150,6 +150,23 @@ type SummaryCache = Arc<
         >,
     >,
 >;
+/// `(metric, package)`-keyed TTL cache of the `/stats/:metric/:package` daily
+/// series: `(metric, package) -> (computed_at, day -> sub-key -> count)`. The
+/// per-package twin of [`SummaryCache`] — same bounded staleness — but keyed by
+/// the request's `(:metric, :package)`, a high-cardinality read-gated path, so
+/// the map bounds itself with a wholesale clear and the worker drops it after
+/// each counter flush (same-node read-your-writes; the TTL bounds other nodes).
+type PackageStatsCache = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            (String, String),
+            (
+                std::time::Instant,
+                Arc<std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>>,
+            ),
+        >,
+    >,
+>;
 /// Single-slot cache of the fully-rendered empty-query `/projects/` browser page:
 /// `(rendered_at, generation, bytes)`, or `None` until first populated. The page
 /// is a host-independent render of the whole name set — identical bytes for every
@@ -265,6 +282,14 @@ pub struct AppState {
     /// homepage marquee. Bounded by a wholesale clear (`:metric` is a read-gated
     /// path param); the numbers lag a counter flush anyway.
     pub summary_cache: SummaryCache,
+    /// `(metric, package)`-keyed TTL cache of the `/stats/:metric/:package` daily
+    /// series, so a repeatedly-polled dashboard endpoint doesn't rescan a
+    /// package's 30-day counter window on every hit. The per-package twin of
+    /// [`summary_cache`](Self::summary_cache); high-cardinality `:package` keys
+    /// are bounded by a wholesale clear, and the worker drops it after each
+    /// counter flush so a same-node reader sees its own writes (TTL bounds
+    /// other nodes) — the [`project_cache`](Self::project_cache) invalidation model.
+    pub package_stats_cache: PackageStatsCache,
     /// Single-slot TTL cache of the rendered empty-query `/projects/` browser
     /// page. That page re-renders the whole name set — a sort plus a multi-MB
     /// escape/concat — on every hit for bytes identical across requests; caching
@@ -360,6 +385,16 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    /// Drop the per-package stats cache after a counter flush, so a same-node
+    /// reader sees its own just-flushed download counts at once (the TTL bounds
+    /// other nodes). Mirrors [`invalidate_projects_page`](Self::invalidate_projects_page).
+    pub(crate) fn invalidate_package_stats(&self) {
+        self.package_stats_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
     /// Record that a client request just arrived (traffic signal for probe
     /// gating). Lock-free and I/O-free — safe to call on every request.
     fn note_request(&self) {
@@ -436,6 +471,7 @@ impl AppState {
             counters: Arc::new(counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),
             summary_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            package_stats_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),
@@ -1116,6 +1152,7 @@ async fn run_serve(
         counters,
         download_board: Arc::new(std::sync::Mutex::new(None)),
         summary_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        package_stats_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
         proxy,
         started: std::time::Instant::now(),

@@ -5,6 +5,7 @@
 //! `app.rs`/`auth.rs` and are imported here.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -23,7 +24,7 @@ use crate::app::{
 use crate::auth::{nonempty, require_admin};
 use crate::names::{checked_pkg_name, infer_version_from_filename};
 use crate::pages::{html_ok, page_context, rank_packages};
-use crate::{advisories, html, origin, storage, sync, token};
+use crate::{advisories, counters, html, origin, storage, sync, token};
 
 /// Liveness: is the process up? Always `200 {"status":"ok"}` while the listener
 /// is serving — no storage I/O, and it stays `200` right through a graceful
@@ -126,10 +127,64 @@ pub(crate) async fn stats_get(
     }))
 }
 
+/// How long a cached `/stats/:metric` summary set stays warm before a rescan.
+/// Matches the download board's interval and rationale: the global totals
+/// already lag a counter flush, so a minute of staleness is invisible while it
+/// spares a repeated poll a full counter-store rescan (a 30-day window over an
+/// open day is ~100 reads + ~70 cross-shard lists — the cost `stats-summary`
+/// otherwise paid every hit).
+const SUMMARY_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Cap on distinct `:metric` keys held in the summary cache. `:metric` is a
+/// read-gated path param, so a caller cycling it must never grow the map
+/// without bound; past the cap it is cleared wholesale (the presign-cache
+/// idiom). In practice only `downloads` is ever recorded, so this is never hit.
+const SUMMARY_CACHE_MAX_METRICS: usize = 64;
+
+/// The global day-summaries for `metric`, served from a short metric-keyed TTL
+/// cache so a repeated `/stats/:metric` poll doesn't rescan the counter store on
+/// every hit — the same TTL-cache idiom the download leaderboard applies to the
+/// homepage marquee. Computes and stores on a cold or expired entry.
+async fn cached_summaries(
+    state: &AppState,
+    metric: &str,
+    from: time::Date,
+    to: time::Date,
+) -> Arc<std::collections::BTreeMap<String, counters::DaySummary>> {
+    {
+        let guard = state
+            .summary_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((at, summaries)) = guard.get(metric) {
+            if at.elapsed() < SUMMARY_CACHE_TTL {
+                return summaries.clone();
+            }
+        }
+    }
+    let summaries = Arc::new(state.counters.query_summaries(metric, from, to).await);
+    let mut guard = state
+        .summary_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.insert(metric.to_string(), (Instant::now(), summaries.clone()));
+    // Bound the map: drop expired entries once past the cap, and clear outright
+    // if the live set still exceeds it (a caller cycling `:metric` can't grow it
+    // without bound). Only `downloads` is ever recorded, so this never fires.
+    if guard.len() > SUMMARY_CACHE_MAX_METRICS {
+        guard.retain(|_, (at, _)| at.elapsed() < SUMMARY_CACHE_TTL);
+        if guard.len() > SUMMARY_CACHE_MAX_METRICS {
+            guard.clear();
+        }
+    }
+    summaries
+}
+
 /// Global counter summary: `GET /stats/:metric` (read-auth gated). The last 30
 /// days of per-day totals and the busiest packages, from the leader-written
 /// per-day summaries (top keys are rolled up to packages — approximate at the
-/// tail, fine for a dashboard glance).
+/// tail, fine for a dashboard glance). Served from a short TTL cache
+/// ([`cached_summaries`]) so a repeated poll doesn't rescan the counter store.
 pub(crate) async fn stats_summary_get(
     State(state): State<Arc<AppState>>,
     Path(metric): Path<String>,
@@ -139,11 +194,11 @@ pub(crate) async fn stats_summary_get(
         return unauthorized();
     }
     let (from, to) = last_30d_window();
-    let summaries = state.counters.query_summaries(&metric, from, to).await;
+    let summaries = cached_summaries(&state, &metric, from, to).await;
 
     let mut total: u64 = 0;
     let mut days: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    for (day, s) in &summaries {
+    for (day, s) in summaries.iter() {
         total += s.total;
         days.insert(day.clone(), s.total);
     }

@@ -3087,6 +3087,7 @@ mod tests {
             metrics: Arc::new(crate::metrics::Metrics::new()),
             counters: Arc::new(crate::counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),
+            summary_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),

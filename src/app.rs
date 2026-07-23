@@ -135,6 +135,21 @@ const CLF_TIME: &[time::format_description::FormatItem<'_>] = time::macros::form
 /// Shared TTL cache of the ranked download leaderboard: `(computed_at, board)`,
 /// or `None` until first populated.
 type DownloadBoard = Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<(String, u64)>)>>>;
+/// Metric-keyed TTL cache of the `/stats/:metric` day-summaries: `metric ->
+/// (computed_at, summaries)`. The global-stats twin of [`DownloadBoard`] — same
+/// bounded staleness — but keyed by the request's `:metric`, so the map bounds
+/// itself with a wholesale clear (in practice only `downloads` is ever recorded).
+type SummaryCache = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            (
+                std::time::Instant,
+                Arc<std::collections::BTreeMap<String, counters::DaySummary>>,
+            ),
+        >,
+    >,
+>;
 /// Single-slot cache of the fully-rendered empty-query `/projects/` browser page:
 /// `(rendered_at, generation, bytes)`, or `None` until first populated. The page
 /// is a host-independent render of the whole name set — identical bytes for every
@@ -244,6 +259,12 @@ pub struct AppState {
     /// the homepage marquee and `/downloads/` so a public homepage doesn't rescan
     /// the counter store on every hit; the numbers lag a flush interval anyway.
     pub download_board: DownloadBoard,
+    /// Metric-keyed TTL cache of the global `/stats/:metric` day-summaries, so a
+    /// repeated global-stats poll doesn't rescan the counter store every hit —
+    /// the same idiom [`download_board`](Self::download_board) applies to the
+    /// homepage marquee. Bounded by a wholesale clear (`:metric` is a read-gated
+    /// path param); the numbers lag a counter flush anyway.
+    pub summary_cache: SummaryCache,
     /// Single-slot TTL cache of the rendered empty-query `/projects/` browser
     /// page. That page re-renders the whole name set — a sort plus a multi-MB
     /// escape/concat — on every hit for bytes identical across requests; caching
@@ -414,6 +435,7 @@ impl AppState {
             metrics: Arc::new(metrics::Metrics::new()),
             counters: Arc::new(counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),
+            summary_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
             started: std::time::Instant::now(),
@@ -1093,6 +1115,7 @@ async fn run_serve(
         metrics,
         counters,
         download_board: Arc::new(std::sync::Mutex::new(None)),
+        summary_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
         proxy,
         started: std::time::Instant::now(),

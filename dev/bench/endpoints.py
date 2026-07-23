@@ -198,7 +198,7 @@ ENDPOINTS: list = [
         routes=(("GET", "/stats/:metric"),),
         target="global",
         cold_ops={"read": 104, "list": 74},
-        warm_ops={"read": 104, "list": 74},
+        warm_ops={},
         bytes_range=(2, 5000),
     ),
     _e(

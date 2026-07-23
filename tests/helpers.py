@@ -486,6 +486,45 @@ def wait_for_project_in_global(
     raise TimeoutError(f"{package} did not appear in the global index within {timeout}s")
 
 
+def wait_storage_ops_quiet(
+    base_url: str, *, timeout: float = 20.0, quiet: float = 0.25, streak: int = 5
+) -> None:
+    """Wait until the storage WRITE/DELETE counters hold still for `streak`
+    consecutive samples `quiet` seconds apart — the async writer is done
+    mutating the tree.
+
+    A test that snapshots, digests, or tars the data tree must call this first:
+    an upload's HTTP response returns before the worker's view writes (package
+    index, global index, inventory) have all landed. Only mutations count —
+    the worker's idle ticks read and list on a cadence that never goes silent.
+    Sustained silence, not one quiet gap — a loaded box can pause the worker
+    mid-tail.
+    """
+
+    def ops() -> tuple:
+        code, body, _ = http_get(f"{base_url}/metrics")
+        assert code == 200, code
+        return tuple(
+            sorted(
+                line
+                for line in body.decode().splitlines()
+                if line.startswith("pypiron_storage_ops_total")
+                and ('op="write"' in line or 'op="delete"' in line)
+            )
+        )
+
+    deadline = time.monotonic() + timeout
+    last, run = None, 0
+    while time.monotonic() < deadline:
+        cur = ops()
+        run = run + 1 if cur == last else 1
+        last = cur
+        if run >= streak:
+            return
+        time.sleep(quiet)
+    raise TimeoutError(f"storage ops never settled within {timeout}s")
+
+
 # ------------------------------ File / Hashing --------------------------------
 
 

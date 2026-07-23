@@ -56,6 +56,7 @@ from .helpers import (
     upload_legacy,
     wait_for_file_in_index,
     wait_http_responding,
+    wait_storage_ops_quiet,
 )
 
 pytestmark = pytest.mark.integration
@@ -188,6 +189,9 @@ def test_dr_drill(pypiron_bin, tmp_path, uv_path, uv_venv):
         # The backup is a point-in-time snapshot; anything uploaded after it (the
         # post-backup package) is by construction not in it. That gap IS the RPO
         # — it equals the backup cadence, nothing subtler.
+        # Let the worker's post-upload view writes land first: tar of a tree
+        # still being rendered exits 1 ("file changed as we read it").
+        wait_storage_ops_quiet(server["base_url"])
         t0 = time.monotonic()
         backup_tar = work / "backup.tar.gz"
         subprocess.run(

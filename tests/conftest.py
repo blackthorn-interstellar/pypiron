@@ -1470,6 +1470,31 @@ def s3_server_multi_failover(
 
 
 @pytest.fixture()
+def s3_server_multi_counters_failover(
+    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
+) -> Iterator[Dict]:
+    """Two buckets behind a 503 proxy, flushing and rolling up download counters
+    every second so a finished day freezes and reseeds within a test's patience
+    (counter cross-bucket replication)."""
+    yield from _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        extra_env={"PYPIRON_AUDIT_ON_BOOT": "false"},
+        extra_args=[
+            "--bucket-leave-failures",
+            "1",
+            "--bucket-return-healthy-secs",
+            "4",
+            "--counters-flush-interval-secs",
+            "1",
+            "--counters-rollup-interval-secs",
+            "1",
+        ],
+    )
+
+
+@pytest.fixture()
 def s3_server_multi_default_failover(
     tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
 ) -> Iterator[Dict]:

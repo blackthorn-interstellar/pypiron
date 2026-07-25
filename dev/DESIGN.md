@@ -580,15 +580,19 @@ _transparency/chain/<seq>.json           # append-only hash-chained audit checkp
 _quarantine/<pkg>/<file>@<sha12>         # multi-bucket: a frozen conflict loser or demoted mirror loser,
                                          #   preserved under its own content hash. Quarantine is per
                                          #   artifact, never deleted; there is no staging tree.
-_counters/<metric>/seg/<day>/<shard>/<id>.json   # download counters: node-flushed delta segments
-                                         #   (write path; <id> is a unique per-incarnation id).
-_counters/<metric>/day/<day>/<shard>.json        # frozen per-shard day total (leader compaction);
+_counters/seg/<metric>/<day>/<shard>/<id>.json   # download counters: node-flushed delta segments
+                                         #   (write path; <id> is a unique per-incarnation id). LIVE
+                                         #   TALLIES — bucket-local, never replicated; a failover
+                                         #   loses at most the current day (the declared loss window).
+_counters/day/<metric>/<day>/<shard>.json        # frozen per-shard day total (leader compaction);
                                          #   a frozen file wins over the seg dir, so a crash mid-
                                          #   compaction can't double-count or shrink a total.
-_counters/<metric>/day/<day>/_summary.json       # per-day total + busiest keys (dashboard reads).
-                                         #   All of _counters/ is a DERIVED, LOSSY analytic — never
-                                         #   truth, never a view of truth; delete it freely (like
-                                         #   _sync/). Sharded by package first char (0-9a-z, _).
+_counters/day/<metric>/<day>/_summary.json       # per-day total + busiest keys (dashboard reads).
+                                         #   The _counters/day/ ROLLUP is leader-authored, immutable
+                                         #   truth: reseeded to every bucket so a failover keeps the
+                                         #   /audit ranking and /stats history. The seg/day split sits
+                                         #   above <metric> so a static prefix classifies each half.
+                                         #   Sharded by package first char (0-9a-z, _).
 _staging/<ts>-<pid>-<filename>           # cloud only: a >64 MB upload streams here, then
                                          #   copy-if-not-exists publishes it to its final key.
                                          #   Transient (the object-store analog of disk's .tmp +
@@ -599,13 +603,15 @@ _staging/<ts>-<pid>-<filename>           # cloud only: a >64 MB upload streams h
 
 **Replication class (multi-bucket).** Every top-level prefix is classified in one
 registry — `src/layout.rs`, enforced by a unit test so a new prefix without a
-declared class fails CI. Four classes:
+declared class fails CI. Six classes:
 
 | Prefix | Class | Replicates? |
 | --- | --- | --- |
 | `packages/` | truth-replicated | yes, per record — three-tier fan-out → `_repl/` notes → reconcile; private truth and `sync --to` mirror snapshots (sidecar `replicate=true`) both replicate so any bucket serves the whole corpus. The one exception under this prefix is proxy-cache fills (mirror sidecar, `replicate` absent/false): re-derivable from upstream, so bucket-local |
 | `_advisories/osv-pypi.zip`, `_advisories/quarantined.json` | singleton-replicated | yes — leader-authored control files written write-through to every healthy bucket + reseed-if-absent |
-| `simple/`, `_advisories/report.json`, `_state/`, `_sync/cursors.json`, `_counters/`, `_quarantine/`, `_transparency/chain/` | derived-per-bucket | no — each bucket rebuilds/re-derives its own from the truth it holds |
+| `_counters/day/` | replicated-rollup | yes — leader-authored, immutable day-rollups reseeded copy-if-absent to every bucket, so a failover keeps the /audit ranking and /stats history |
+| `_counters/seg/` | declared-loss | no — the current day's un-rolled-up live tallies; a failover loses at most one day, the one totality exemption, annotated with its bound |
+| `simple/`, `_advisories/report.json`, `_state/`, `_sync/cursors.json`, `_quarantine/`, `_transparency/chain/` | derived-per-bucket | no — each bucket rebuilds/re-derives its own from the truth it holds |
 | `_leader/lease.json`, `_repl/`, `_topology/stamp.json`, `_staging/`, `_dirty/` | coordination-per-bucket | no — bucket-local by design; replicating it would be wrong |
 
 `_format/stamp.json` is the one top-level prefix deliberately not yet in the

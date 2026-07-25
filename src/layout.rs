@@ -27,14 +27,29 @@ pub enum Class {
     /// write-through to all healthy buckets ([`write_singleton`]) and healed by
     /// reseed-if-absent.
     SingletonReplicated,
-    /// Regenerable per-bucket views (indexes, audit report, counters, sync
-    /// cursors, fingerprint state, frozen-conflict bodies). Never copied — each
-    /// bucket rebuilds or re-derives its own from the truth it holds.
+    /// Regenerable per-bucket views (indexes, audit report, sync cursors,
+    /// fingerprint state, frozen-conflict bodies). Never copied — each bucket
+    /// rebuilds or re-derives its own from the truth it holds.
     DerivedPerBucket,
     /// Per-bucket coordination state (leases, `_repl/` notes, topology stamps,
     /// staging, dirty worklist). Bucket-local by design; replicating it would be
     /// wrong, not merely wasteful.
     CoordinationPerBucket,
+    /// Leader-authored rolled-up data files — immutable once written — that must
+    /// exist on every bucket so a failover finds the whole history, not a hole.
+    /// Written write-through / healed by copy-if-absent reseed (the same
+    /// mechanism as [`Class::SingletonReplicated`], but many keys rather than one
+    /// fixed key). The counter day-rollups are the exhibit: losing them on a
+    /// failover would zero the audit's download ranking during the incident it
+    /// exists for. See [`crate::counters::Counters::reseed_rollups`].
+    ReplicatedRollup,
+    /// A narrow, explicitly-bounded acceptable-loss window — the one totality
+    /// exemption for state that is neither derived (not re-computable) nor
+    /// coordination scratch. Not replicated by design; the `why` states the loss
+    /// bound. The counter live tallies are the exhibit: the current day's
+    /// un-rolled-up segments, at most one day, per the DESIGN.md totality
+    /// principle.
+    DeclaredLoss,
 }
 
 impl Class {
@@ -45,6 +60,8 @@ impl Class {
             Class::SingletonReplicated => "singleton-replicated",
             Class::DerivedPerBucket => "derived-per-bucket",
             Class::CoordinationPerBucket => "coordination-per-bucket",
+            Class::ReplicatedRollup => "replicated-rollup",
+            Class::DeclaredLoss => "declared-loss",
         }
     }
 }
@@ -94,9 +111,14 @@ pub const MANIFEST: &[PrefixClass] = &[
         why: "dirty-package worklist for the local index rebuild; bucket-local",
     },
     PrefixClass {
-        prefix: crate::counters::PREFIX,
-        class: Class::DerivedPerBucket,
-        why: "download counters: per-node immutable segments aggregated locally (judgment call — cross-bucket aggregation pending)",
+        prefix: crate::counters::DAY_PREFIX,
+        class: Class::ReplicatedRollup,
+        why: "download-counter day-rollups (frozen shard totals + summaries): leader-authored immutable truth, reseeded to every bucket so a failover keeps the /audit ranking and /stats history",
+    },
+    PrefixClass {
+        prefix: crate::counters::SEG_PREFIX,
+        class: Class::DeclaredLoss,
+        why: "download-counter live tallies (current day's un-rolled-up segments): declared acceptable loss ≤ current day, by design, per DESIGN.md totality principle",
     },
     PrefixClass {
         prefix: crate::lease::LEASE_KEY,
@@ -247,6 +269,8 @@ mod tests {
             Class::SingletonReplicated,
             Class::DerivedPerBucket,
             Class::CoordinationPerBucket,
+            Class::ReplicatedRollup,
+            Class::DeclaredLoss,
         ] {
             assert!(
                 MANIFEST.iter().any(|entry| entry.class == class),
@@ -265,6 +289,19 @@ mod tests {
         assert_eq!(
             classify("simple/requests/index.html"),
             Some(Class::DerivedPerBucket)
+        );
+        // Counter day-rollups replicate; the current day's live segments do not.
+        assert_eq!(
+            classify("_counters/day/downloads/2026-01-01/r.json"),
+            Some(Class::ReplicatedRollup)
+        );
+        assert_eq!(
+            classify("_counters/day/downloads/2026-01-01/_summary.json"),
+            Some(Class::ReplicatedRollup)
+        );
+        assert_eq!(
+            classify("_counters/seg/downloads/2026-01-01/r/inc-0.json"),
+            Some(Class::DeclaredLoss)
         );
         assert_eq!(
             classify(crate::advisories::FEED_KEY),
@@ -303,7 +340,8 @@ mod tests {
             crate::advisories::FEED_KEY,
             crate::advisories::QUARANTINED_KEY,
             crate::advisories::REPORT_KEY,
-            crate::counters::PREFIX,
+            crate::counters::DAY_PREFIX,
+            crate::counters::SEG_PREFIX,
             crate::lease::LEASE_KEY,
             crate::replicate::QUARANTINE_PREFIX,
             crate::replicate::REPL_PREFIX,

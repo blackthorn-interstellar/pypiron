@@ -14,6 +14,7 @@ three-bucket fallback.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import os
@@ -2671,3 +2672,82 @@ def test_verify_chain_tolerates_a_chain_current_bucket_missing_sidecars(
     assert rc == 1, f"a committed file gone from every bucket must fault:\n{out}{err}"
     assert "vanished" in out, out
     assert wheel.name in out, out
+
+
+def test_counter_day_rollups_replicate_and_survive_failover(
+    s3_server_multi_counters_failover,
+):
+    """A finished day's download-counter rollup freezes on the write bucket and is
+    mirrored to the peer, so a bucket failover keeps /stats history and the /audit
+    ranking. Only the current day's un-rolled-up live tallies are the declared,
+    bounded loss. Bucket reads go straight to MinIO, bypassing the fault proxy."""
+    server = s3_server_multi_counters_failover
+    minio = server["minio"]
+    a, b = minio["buckets"][:2]
+
+    _eventually(
+        lambda: _selected_bucket(server) == a,
+        timeout=15,
+        what="preferred write bucket selected",
+    )
+
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    past = (today - datetime.timedelta(days=3)).isoformat()
+    today_s = today.isoformat()
+    seg = json.dumps(
+        {
+            "resolution_secs": 86400,
+            "buckets": {"00:00": {"requests/requests-9.9.9-py3-none-any.whl": 7}},
+        }
+    )
+    past_seg = f"_counters/seg/downloads/{past}/r/injected-0.json"
+    today_seg = f"_counters/seg/downloads/{today_s}/r/injected-0.json"
+    # Inject a finished past day AND a current-day live tally straight into the
+    # write bucket — storage is the counter contract.
+    minio_put_key_in(minio, a, past_seg, seg)
+    minio_put_key_in(minio, a, today_seg, seg)
+
+    frozen = f"_counters/day/downloads/{past}/r.json"
+    summary = f"_counters/day/downloads/{past}/_summary.json"
+
+    # Leader compaction freezes the finished day; the rollup reseed mirrors it and
+    # its summary to the peer bucket.
+    _eventually(
+        lambda: (
+            minio_key_exists_in(minio, a, frozen)
+            and minio_key_exists_in(minio, b, frozen)
+            and minio_key_exists_in(minio, b, summary)
+        ),
+        timeout=45,
+        what="finished-day rollup frozen on the write bucket and reseeded to the peer",
+    )
+    # The peer holds the exact rollup bytes, not an empty placeholder.
+    assert minio_object_sha256(minio, a, frozen) == minio_object_sha256(minio, b, frozen)
+    assert json.loads(minio_get_key_in(minio, b, summary))["total"] == 7
+
+    # The current day's live segment is NEVER mirrored — the declared loss window.
+    assert minio_key_exists_in(minio, a, today_seg)
+    assert not minio_key_exists_in(minio, b, today_seg)
+
+    # Before failover, the server serves the rolled-up history at /stats.
+    code, body, _ = http_request_auth(
+        "GET",
+        server["base_url"] + "/stats/downloads",
+        username="admin",
+        password="secret",
+    )
+    assert code == 200, body
+    stats = json.loads(body)
+    assert stats["days"].get(past) == 7, stats
+    # /stats rolls the per-file keys up to the package name.
+    assert "requests" in stats["top"], stats
+
+    # Fail the write bucket: the node fails over to the peer, which holds the
+    # replicated history — it survives the very outage the audit report exists for.
+    _fail_to_second(server)
+    assert minio_key_exists_in(minio, b, frozen)
+    assert json.loads(minio_get_key_in(minio, b, summary))["total"] == 7
+
+    # The server, now serving from the peer, stays up.
+    code, _, _ = http_get(server["base_url"] + "/ready")
+    assert code == 200

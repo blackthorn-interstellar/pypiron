@@ -959,6 +959,14 @@ pub async fn run_worker_until(
                 {
                     last_counter_compact = Some(Instant::now());
                     state.counters.compact().await;
+                    // Mirror the freshly-frozen day-rollups to every healthy peer
+                    // (and heal a peer that was down when it froze), so a bucket
+                    // failover keeps the /audit ranking and /stats history — the
+                    // current day's un-rolled-up live tallies are the declared,
+                    // bounded loss. Both write-through and backstop, once a cycle;
+                    // a no-op on a single-bucket node.
+                    let peers = state.counter_rollup_peers(selected.index);
+                    state.counters.reseed_rollups(&peers).await;
                 }
             };
             tokio::select! {

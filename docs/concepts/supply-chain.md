@@ -197,6 +197,11 @@ project's own page carries the advisory list for that package. Admin-only: a
 ranked list of your soft spots is exactly what an attacker would want, so it
 rides the strongest credential.
 
+Running more than one bucket, that ranking survives a bucket failover: the
+download history it ranks by is copied to every bucket, so switching to another
+bucket keeps the list intact — at most the current day's in-progress counts go
+missing, during the very outage the report is for.
+
 ## The air-gapped endgame
 
 The proxy still talks to live PyPI on a cache miss. `sync` removes that surface:

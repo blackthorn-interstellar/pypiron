@@ -66,6 +66,10 @@ The homepage and `/downloads/` render the same cached ranking.
   behind.
 - **Recent downloads can be lost in a hard crash.** The counts are an analytic,
   never the source of truth.
+- **History survives a bucket failover.** With more than one bucket, each
+  finished day's totals are copied to every bucket, so failing over to another
+  bucket keeps your full history — you lose at most the current day's in-progress
+  counts.
 - Changing `--counters-resolution` is safe: existing days keep the resolution
   they were written with.
 

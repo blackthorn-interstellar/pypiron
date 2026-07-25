@@ -384,6 +384,36 @@ impl AppState {
             .collect()
     }
 
+    /// The eligible peer buckets a leader mirrors counter day-rollups onto
+    /// ([`crate::counters::Counters::reseed_rollups`]), excluding the write pin at
+    /// `primary_index`. Same eligibility as [`AppState::singleton_replicas`] — a
+    /// leader-authored write fan-out, so it is gated on the topology write-fence —
+    /// but wrapped as the counter engine's own store so it never sees pypiron's
+    /// `Storage`. Empty for a single-bucket or fenced node.
+    pub(crate) fn counter_rollup_peers(
+        &self,
+        primary_index: usize,
+    ) -> Vec<Box<dyn counters::ObjectStore>> {
+        if !self.buckets.is_multi() || self.mutations_fenced() {
+            return Vec::new();
+        }
+        self.buckets
+            .handles()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != primary_index)
+            .filter(|(index, _)| {
+                self.bucket_health
+                    .as_ref()
+                    .is_none_or(|health| health.bucket_eligible(*index).unwrap_or(false))
+            })
+            .map(|(_, handle)| {
+                Box::new(PinnedCounterStore(handle.storage.clone()))
+                    as Box<dyn counters::ObjectStore>
+            })
+            .collect()
+    }
+
     /// The current advisory snapshot: lock, clone the inner `Arc`, drop the
     /// guard. Cheap enough for the request path; recovers a poisoned lock.
     pub fn advisory_snapshot(&self) -> Arc<advisories::AdvisoryState> {
@@ -630,12 +660,44 @@ pub(crate) const IDLE_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Adapts pypiron's bucket selector to the counter engine. Selection happens
 /// once at the counter operation boundary; every nested I/O then uses the same
-/// captured storage handle.
-struct CounterStore(Arc<BucketSet>);
+/// captured storage handle. In a multi-bucket fleet it also exposes the eligible
+/// peer buckets so a query can sum the current day's live segments fleet-wide
+/// (rolled-up history reads from the pin — it is replicated).
+struct CounterStore {
+    buckets: Arc<BucketSet>,
+    health: Option<Arc<HealthController>>,
+}
 
 impl counters::ObjectStoreSelector for CounterStore {
     fn pin(&self) -> Box<dyn counters::ObjectStore> {
-        Box::new(PinnedCounterStore(self.0.pin().storage.clone()))
+        Box::new(PinnedCounterStore(self.buckets.pin().storage.clone()))
+    }
+
+    /// The eligible peer buckets (excluding the write pin) a current-day read
+    /// also sums, so an open day split by a selection change stays whole. Empty
+    /// for a single bucket. Best-effort and lossy by design — a down peer's share
+    /// of the open day is the declared loss — so, unlike a write fan-out, this
+    /// read path does not gate on the topology write-fence.
+    fn reachable_peers(&self) -> Vec<Box<dyn counters::ObjectStore>> {
+        if !self.buckets.is_multi() {
+            return Vec::new();
+        }
+        let primary = self.buckets.pin().index;
+        self.buckets
+            .handles()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != primary)
+            .filter(|(index, _)| {
+                self.health
+                    .as_ref()
+                    .is_none_or(|h| h.bucket_eligible(*index).unwrap_or(false))
+            })
+            .map(|(_, handle)| {
+                Box::new(PinnedCounterStore(handle.storage.clone()))
+                    as Box<dyn counters::ObjectStore>
+            })
+            .collect()
     }
 }
 
@@ -806,7 +868,11 @@ pub async fn cli_main() -> Result<()> {
 
 /// Build the download-counter engine from CLI config, failing closed on a bad
 /// resolution. Disabled (`--download-stats=false`) yields a no-op store.
-fn build_counters(cli: &ServeArgs, buckets: Arc<BucketSet>) -> Result<counters::Counters> {
+fn build_counters(
+    cli: &ServeArgs,
+    buckets: Arc<BucketSet>,
+    health: Option<Arc<HealthController>>,
+) -> Result<counters::Counters> {
     if !cli.download_stats {
         return Ok(counters::Counters::disabled());
     }
@@ -821,7 +887,7 @@ fn build_counters(cli: &ServeArgs, buckets: Arc<BucketSet>) -> Result<counters::
     .checked()
     .map_err(|e| anyhow::anyhow!("counter config: {e}"))?;
     Ok(counters::Counters::new(
-        Box::new(CounterStore(buckets)),
+        Box::new(CounterStore { buckets, health }),
         cfg,
     ))
 }
@@ -1146,9 +1212,15 @@ async fn run_serve(
         None => None,
     };
 
-    // Counters are derived and per-bucket. Each flush, compaction, or query pins
-    // the selected handle once, so a switch applies only between operations.
-    let counters = Arc::new(build_counters(&cli, buckets.clone())?);
+    // Counter day-rollups are replicated truth (the leader mirrors them to every
+    // bucket); the current day's live tallies are per-bucket, declared loss. Each
+    // flush, compaction, or query pins the selected handle once, so a switch
+    // applies only between operations; the health view lets a query reach peers.
+    let counters = Arc::new(build_counters(
+        &cli,
+        buckets.clone(),
+        bucket_health.clone(),
+    )?);
     if counters.enabled() {
         info!(
             resolution = %cli.counters_resolution,

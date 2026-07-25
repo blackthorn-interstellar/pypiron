@@ -23,6 +23,20 @@
 //! compact shards in parallel. Cost and object-count scale with *days*, not with
 //! resolution or download volume; only key *cardinality* (distinct keys/day)
 //! grows the per-shard files, which is why the in-memory map is hard-capped.
+//!
+//! ## Fleet shape (the two top-level prefixes)
+//! The key space splits the moment-of-write role above the metric so a
+//! multi-bucket fleet can classify a key by a static prefix (`src/layout.rs`):
+//! - `_counters/day/…` — the **rollup**: frozen per-shard day totals and their
+//!   summaries. Leader-authored, immutable once written, and the durable truth a
+//!   dashboard/audit reads. The engine offers [`Counters::reseed_rollups`] so an
+//!   embedder can mirror this subtree to every bucket (copy-if-absent), keeping a
+//!   bucket failover from zeroing history. The engine itself stays single-store.
+//! - `_counters/seg/…` — the **live tallies**: per-node open-day delta segments,
+//!   not yet rolled up. These are never mirrored; losing a bucket loses at most
+//!   its share of the current day (the declared, bounded loss window). To keep an
+//!   open day whole across a mid-day selection change, a query sums its segments
+//!   across every bucket [`ObjectStoreSelector::reachable_peers`] adds, best-effort.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,6 +52,15 @@ use tracing::warn;
 /// index rebuilds like every other `_`-prefixed key. See dev/DESIGN.md.
 pub const PREFIX: &str = "_counters/";
 
+/// The rollup subtree: frozen per-shard day totals + summaries. Leader-authored,
+/// immutable, the replicated truth a failover bucket must hold. See
+/// [`Counters::reseed_rollups`] and the layout manifest.
+pub const DAY_PREFIX: &str = "_counters/day/";
+
+/// The live-tally subtree: per-node open-day delta segments, never replicated —
+/// their loss is the declared ≤1-day window. See the layout manifest.
+pub const SEG_PREFIX: &str = "_counters/seg/";
+
 /// In-memory keys past the cap fold into this catch-all so a flood of distinct
 /// (or hostile) keys can never grow a node's memory without bound.
 pub(crate) const OVERFLOW_KEY: &str = "_overflow";
@@ -49,6 +72,18 @@ const SUMMARY_FILE: &str = "_summary.json";
 /// threads the returned handle through the whole call graph.
 pub trait ObjectStoreSelector: Send + Sync {
     fn pin(&self) -> Box<dyn ObjectStore>;
+
+    /// The *other* reachable stores (excluding the [`pin`](Self::pin)ned primary)
+    /// a best-effort read of the *current* day's un-rolled-up live segments should
+    /// also sum, so an open day stays whole when a mid-day selection change split
+    /// its segments across buckets. Default: none — a single-bucket read uses only
+    /// the pinned store and is byte-for-byte unchanged. A multi-bucket embedder
+    /// returns the eligible peer buckets; a store that is down is simply absent,
+    /// and its share of the current day is the declared loss. Never consulted for
+    /// rolled-up (`day/`) history — that is replicated truth, read from the pin.
+    fn reachable_peers(&self) -> Vec<Box<dyn ObjectStore>> {
+        Vec::new()
+    }
 }
 
 /// The minimal object-store surface used after an operation is pinned. Map
@@ -271,7 +306,7 @@ impl Counters {
             }
             let seq = self.seq.fetch_add(1, Ordering::Relaxed);
             let key = format!(
-                "{PREFIX}{metric}/seg/{day}/{shard}/{}-{seq}.json",
+                "{SEG_PREFIX}{metric}/{day}/{shard}/{}-{seq}.json",
                 self.incarnation
             );
             let seg = Segment {
@@ -341,7 +376,7 @@ impl Counters {
             }
             match sum_segments(store.as_ref(), seg_keys).await {
                 Some(buckets) => {
-                    let frozen_key = format!("{PREFIX}{metric}/day/{day}/{shard}.json");
+                    let frozen_key = format!("{DAY_PREFIX}{metric}/{day}/{shard}.json");
                     let seg = Segment {
                         resolution_secs: self.cfg.resolution_secs,
                         buckets,
@@ -368,7 +403,7 @@ impl Counters {
         let have_summary: std::collections::HashSet<(&str, &str)> = keys
             .iter()
             .filter_map(|k| match key_parts(k)?[..] {
-                [metric, "day", day, file] if file == SUMMARY_FILE => Some((metric, day)),
+                ["day", metric, day, file] if file == SUMMARY_FILE => Some((metric, day)),
                 _ => None,
             })
             .collect();
@@ -400,7 +435,7 @@ impl Counters {
     }
 
     async fn write_summary(&self, store: &dyn ObjectStore, metric: &str, day: &str) {
-        let prefix = format!("{PREFIX}{metric}/day/{day}/");
+        let prefix = format!("{DAY_PREFIX}{metric}/{day}/");
         let keys = match store.list(&prefix).await {
             Ok(k) => k,
             Err(_) => return,
@@ -439,13 +474,14 @@ impl Counters {
             return out;
         };
         let store = selector.pin();
+        let peers = selector.reachable_peers();
         let shard = shard_of(pkg);
         let prefix = format!("{pkg}/");
         let mut day = from;
         loop {
             let ds = day_str(day);
             if let Some(buckets) = self
-                .read_day_shard(store.as_ref(), metric, &ds, shard)
+                .read_day_shard(store.as_ref(), &peers, metric, &ds, shard)
                 .await
             {
                 let mut per_key: BTreeMap<String, u64> = BTreeMap::new();
@@ -489,6 +525,9 @@ impl Counters {
             return out;
         };
         let store = selector.pin();
+        // Peer buckets summed only for the open day's live segments (below); the
+        // rolled-up history is replicated, so a frozen day reads from the pin.
+        let peers = selector.reachable_peers();
         // Mirror of `compact`'s freeze gate: a day at or after this cutoff cannot
         // be frozen yet, so its absent summary means "still open", not "empty" —
         // those are the only days worth a live cross-shard scan.
@@ -500,7 +539,7 @@ impl Counters {
         let mut day = from;
         loop {
             let ds = day_str(day);
-            let key = format!("{PREFIX}{metric}/day/{ds}/{SUMMARY_FILE}");
+            let key = format!("{DAY_PREFIX}{metric}/{ds}/{SUMMARY_FILE}");
             match store.get(&key).await {
                 Ok(Some(bytes)) => {
                     if let Ok(s) = serde_json::from_slice::<DaySummary>(&bytes) {
@@ -508,7 +547,10 @@ impl Counters {
                     }
                 }
                 Ok(None) if ds >= close_cutoff => {
-                    if let Some(s) = self.summarize_day_live(store.as_ref(), metric, &ds).await {
+                    if let Some(s) = self
+                        .summarize_open_day(store.as_ref(), &peers, metric, &ds)
+                        .await
+                    {
                         out.insert(ds, s);
                     }
                 }
@@ -530,11 +572,15 @@ impl Counters {
     /// [`Counters::write_summary`] freezes, but computed on read. The caller only
     /// reaches here for an *open* day (`compact` never froze it), so instead of
     /// probing all shards this lists the day's two prefixes once, still letting a
-    /// frozen shard file that raced in win over that shard's open segments. `None`
-    /// when no shard has data for the day.
-    async fn summarize_day_live(
+    /// frozen shard file that raced in win over that shard's open segments. Open
+    /// segments are summed across the pinned `primary` and every `peer` bucket, so
+    /// a day split over buckets by a mid-day selection change stays whole; a peer
+    /// that is down contributes nothing (the declared loss). `None` when no shard
+    /// on any reachable bucket has data for the day.
+    async fn summarize_open_day(
         &self,
-        store: &dyn ObjectStore,
+        primary: &dyn ObjectStore,
+        peers: &[Box<dyn ObjectStore>],
         metric: &str,
         day: &str,
     ) -> Option<DaySummary> {
@@ -545,14 +591,15 @@ impl Counters {
         // Frozen shard files are near-always absent for an open day, but honor
         // any that raced in — a leader ahead of this clock-behind querier whose
         // best-effort summary write failed — so it still wins over stragglers.
-        // One prefix LIST replaces the 37 blind per-shard frozen GETs.
+        // Replicated, so the primary's copy stands in for the whole fleet; one
+        // prefix LIST replaces the 37 blind per-shard frozen GETs.
         let mut frozen_shards: std::collections::HashSet<char> = std::collections::HashSet::new();
-        let day_prefix = format!("{PREFIX}{metric}/day/{day}/");
-        for k in store.list(&day_prefix).await.unwrap_or_default() {
+        let day_prefix = format!("{DAY_PREFIX}{metric}/{day}/");
+        for k in primary.list(&day_prefix).await.unwrap_or_default() {
             let Some(shard) = frozen_shard_of(&k) else {
                 continue; // _summary.json or a stray key
             };
-            if let Ok(Some(bytes)) = store.get(&k).await {
+            if let Ok(Some(bytes)) = primary.get(&k).await {
                 let seg: Segment = serde_json::from_slice(&bytes).unwrap_or_default();
                 fold_buckets(&seg.buckets, &mut totals, &mut total);
                 frozen_shards.insert(shard);
@@ -560,17 +607,28 @@ impl Counters {
             }
         }
 
-        // Open segments for every not-yet-frozen shard, summed in one pass. One
-        // prefix LIST replaces the per-shard segment LISTs.
-        let seg_prefix = format!("{PREFIX}{metric}/seg/{day}/");
-        let open: Vec<String> = store
-            .list(&seg_prefix)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|k| seg_shard_of(k).is_some_and(|s| !frozen_shards.contains(&s)))
-            .collect();
-        if !open.is_empty() {
+        // Open segments for every not-yet-frozen shard, summed in one pass per
+        // reachable bucket. A per-bucket read failure drops only that bucket's
+        // share of the open day (the declared loss window), never the whole day.
+        // Each segment key lives on exactly one bucket (segments are never
+        // replicated), so deduping by key makes the sum robust to the same bucket
+        // appearing twice — a selection switch racing between the pin and the peer
+        // enumeration — which would otherwise double-count.
+        let seg_prefix = format!("{SEG_PREFIX}{metric}/{day}/");
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for store in std::iter::once(primary).chain(peers.iter().map(|p| p.as_ref())) {
+            let listed = match store.list(&seg_prefix).await {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            let open: Vec<String> = listed
+                .into_iter()
+                .filter(|k| seg_shard_of(k).is_some_and(|s| !frozen_shards.contains(&s)))
+                .filter(|k| seen.insert(k.clone()))
+                .collect();
+            if open.is_empty() {
+                continue;
+            }
             if let Some(buckets) = sum_segments(store, &open).await {
                 fold_buckets(&buckets, &mut totals, &mut total);
                 any = true;
@@ -580,26 +638,115 @@ impl Counters {
         any.then(|| rank_summary(totals, total))
     }
 
-    /// Frozen file wins; otherwise sum the open day's live segments. `None` means
-    /// no data for that day-shard.
+    /// Frozen file wins; otherwise sum the open day's live segments. A rolled-up
+    /// (frozen) shard is replicated, so the `primary` pin holds it and stands in
+    /// for the fleet. An open day's segments are summed across `primary` and every
+    /// `peer` bucket so a day split by a mid-day selection change stays whole; a
+    /// down peer contributes nothing (the declared loss). `None` means no data for
+    /// that day-shard on any reachable bucket.
     async fn read_day_shard(
         &self,
-        store: &dyn ObjectStore,
+        primary: &dyn ObjectStore,
+        peers: &[Box<dyn ObjectStore>],
         metric: &str,
         day: &str,
         shard: char,
     ) -> Option<BucketMap> {
-        let frozen_key = format!("{PREFIX}{metric}/day/{day}/{shard}.json");
-        if let Ok(Some(bytes)) = store.get(&frozen_key).await {
+        let frozen_key = format!("{DAY_PREFIX}{metric}/{day}/{shard}.json");
+        if let Ok(Some(bytes)) = primary.get(&frozen_key).await {
             let seg: Segment = serde_json::from_slice(&bytes).unwrap_or_default();
             return Some(seg.buckets);
         }
-        let seg_prefix = format!("{PREFIX}{metric}/seg/{day}/{shard}/");
-        let seg_keys = store.list(&seg_prefix).await.ok()?;
-        if seg_keys.is_empty() {
-            return None;
+        let seg_prefix = format!("{SEG_PREFIX}{metric}/{day}/{shard}/");
+        let mut acc: BucketMap = BTreeMap::new();
+        let mut any = false;
+        // Dedup keys across buckets: each segment lives on exactly one bucket, so a
+        // key seen twice is the same bucket read twice (a selection switch racing
+        // the pin/peer enumeration) — sum it once, never double.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for store in std::iter::once(primary).chain(peers.iter().map(|p| p.as_ref())) {
+            let seg_keys = match store.list(&seg_prefix).await {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            let fresh: Vec<String> = seg_keys
+                .into_iter()
+                .filter(|k| seen.insert(k.clone()))
+                .collect();
+            if fresh.is_empty() {
+                continue;
+            }
+            if let Some(buckets) = sum_segments(store, &fresh).await {
+                merge_bucketmap(&mut acc, buckets);
+                any = true;
+            }
         }
-        sum_segments(store, &seg_keys).await
+        any.then_some(acc)
+    }
+
+    /// Leader-only, multi-bucket: mirror every rolled-up counter file (the frozen
+    /// per-shard day totals and their summaries under `_counters/day/`) present on
+    /// the pinned (write) bucket onto each `peer` that lacks it. Copy-if-absent —
+    /// a frozen rollup is immutable, so a peer that already holds the key holds the
+    /// right bytes (newest-wins is trivially satisfied). This is both the
+    /// write-through for a freshly-frozen day and the backstop for a peer that was
+    /// down when it froze or joined the fleet later, so a failover to any bucket
+    /// finds the whole history. The live `_counters/seg/` tallies are never copied
+    /// (the declared ≤1-day loss window). A no-op when `peers` is empty
+    /// (single-bucket) or the store is disabled. Best-effort per peer: one
+    /// unreachable peer never blocks healing the others; the next cycle retries.
+    pub async fn reseed_rollups(&self, peers: &[Box<dyn ObjectStore>]) {
+        if peers.is_empty() {
+            return;
+        }
+        let Some(selector) = self.store.as_deref() else {
+            return;
+        };
+        let primary = selector.pin();
+        let rollups = match primary.list(DAY_PREFIX).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!(error=?e, "counter rollup reseed: listing the primary failed; retries next cycle");
+                return;
+            }
+        };
+        for peer in peers {
+            let present: std::collections::HashSet<String> = match peer.list(DAY_PREFIX).await {
+                Ok(keys) => keys.into_iter().collect(),
+                Err(e) => {
+                    warn!(error=?e, "counter rollup reseed: listing a peer failed; retries next cycle");
+                    continue;
+                }
+            };
+            for key in &rollups {
+                if present.contains(key) {
+                    continue; // immutable rollup already mirrored
+                }
+                match primary.get(key).await {
+                    Ok(Some(bytes)) => {
+                        if let Err(e) = peer.put(key, bytes).await {
+                            warn!(error=?e, %key, "counter rollup reseed: writing a peer failed; retries next cycle");
+                        }
+                    }
+                    // Listed then vanished (raced retention): nothing to copy.
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(error=?e, %key, "counter rollup reseed: reading the primary failed; retries next cycle");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Fold one storage bucket's [`BucketMap`] into a cross-bucket accumulator,
+/// summing the counts of any `(time-bucket, key)` the two share.
+fn merge_bucketmap(acc: &mut BucketMap, src: BucketMap) {
+    for (bucket, keys) in src {
+        let dest = acc.entry(bucket).or_default();
+        for (key, c) in keys {
+            *dest.entry(key).or_insert(0) += c;
+        }
     }
 }
 
@@ -620,22 +767,22 @@ fn key_parts(key: &str) -> Option<Vec<&str>> {
     Some(key.strip_prefix(PREFIX)?.split('/').collect())
 }
 
-/// The shard of a frozen day-shard key `<metric>/day/<day>/<shard>.json`.
+/// The shard of a frozen day-shard key `day/<metric>/<day>/<shard>.json`.
 /// `None` for the day's `_summary.json` or any non-shard key — so the `_`
 /// catch-all shard is never confused with the `_summary` file's leading `_`.
 fn frozen_shard_of(key: &str) -> Option<char> {
     match key_parts(key)?[..] {
-        [_metric, "day", _day, file] if file != SUMMARY_FILE => {
+        ["day", _metric, _day, file] if file != SUMMARY_FILE => {
             file.strip_suffix(".json").and_then(first_char)
         }
         _ => None,
     }
 }
 
-/// The shard of an open segment key `<metric>/seg/<day>/<shard>/<file>`.
+/// The shard of an open segment key `seg/<metric>/<day>/<shard>/<file>`.
 fn seg_shard_of(key: &str) -> Option<char> {
     match key_parts(key)?[..] {
-        [_metric, "seg", _day, shard, _file] => first_char(shard),
+        ["seg", _metric, _day, shard, _file] => first_char(shard),
         _ => None,
     }
 }
@@ -678,9 +825,9 @@ impl Layout {
             let Some(parts) = key_parts(k) else {
                 continue;
             };
-            // <metric>/seg/<day>/<shard>/<file>   |   <metric>/day/<day>/<shard>.json
+            // seg/<metric>/<day>/<shard>/<file>   |   day/<metric>/<day>/<shard>.json
             match parts.as_slice() {
-                [metric, "seg", day, shard, _file] => {
+                ["seg", metric, day, shard, _file] => {
                     if let Some(s) = first_char(shard) {
                         segments
                             .entry((metric.to_string(), day.to_string(), s))
@@ -688,7 +835,7 @@ impl Layout {
                             .push(k.clone());
                     }
                 }
-                [metric, "day", day, file] if *file != SUMMARY_FILE => {
+                ["day", metric, day, file] if *file != SUMMARY_FILE => {
                     if let Some(s) = file.strip_suffix(".json").and_then(first_char) {
                         frozen.insert((metric.to_string(), day.to_string(), s));
                     }
@@ -703,8 +850,8 @@ impl Layout {
     fn day_of<'a>(&self, key: &'a str) -> Option<&'a str> {
         let parts = key_parts(key)?;
         match parts.as_slice() {
-            [_metric, "seg", day, _shard, _file] => Some(day),
-            [_metric, "day", day, _file] => Some(day),
+            ["seg", _metric, day, _shard, _file] => Some(day),
+            ["day", _metric, day, _file] => Some(day),
             _ => None,
         }
     }
@@ -817,6 +964,38 @@ mod tests {
             let index = self.pins.fetch_add(1, Ordering::SeqCst) % self.stores.len();
             Box::new(self.stores[index].clone())
         }
+    }
+
+    /// A multi-bucket fleet: a fixed primary plus peer buckets exposed through
+    /// [`ObjectStoreSelector::reachable_peers`], so a query sums an open day's
+    /// live segments across every bucket.
+    #[derive(Clone)]
+    struct FleetStore {
+        primary: MemStore,
+        peers: Vec<MemStore>,
+    }
+    impl ObjectStoreSelector for FleetStore {
+        fn pin(&self) -> Box<dyn ObjectStore> {
+            Box::new(self.primary.clone())
+        }
+        fn reachable_peers(&self) -> Vec<Box<dyn ObjectStore>> {
+            self.peers
+                .iter()
+                .map(|p| Box::new(p.clone()) as Box<dyn ObjectStore>)
+                .collect()
+        }
+    }
+
+    /// One day-shard segment holding a single `key -> count` at bucket `00:00`.
+    fn seg_bytes(key: &str, count: u64) -> Vec<u8> {
+        serde_json::to_vec(&Segment {
+            resolution_secs: 86_400,
+            buckets: BTreeMap::from([(
+                "00:00".to_string(),
+                BTreeMap::from([(key.to_string(), count)]),
+            )]),
+        })
+        .unwrap()
     }
 
     fn engine(store: MemStore, cfg: Config) -> Counters {
@@ -970,7 +1149,7 @@ mod tests {
         };
         store
             .put(
-                &format!("{PREFIX}downloads/seg/{yest}/r/inc-0.json"),
+                &format!("{SEG_PREFIX}downloads/{yest}/r/inc-0.json"),
                 serde_json::to_vec(&seg).unwrap(),
             )
             .await
@@ -978,15 +1157,15 @@ mod tests {
 
         c.compact().await;
         // Segment gone, frozen file written, summary written.
-        let frozen = format!("{PREFIX}downloads/day/{yest}/r.json");
+        let frozen = format!("{DAY_PREFIX}downloads/{yest}/r.json");
         assert!(store.objects.lock().unwrap().contains_key(&frozen));
         assert!(store
             .objects
             .lock()
             .unwrap()
-            .contains_key(&format!("{PREFIX}downloads/day/{yest}/{SUMMARY_FILE}")));
+            .contains_key(&format!("{DAY_PREFIX}downloads/{yest}/{SUMMARY_FILE}")));
         let remaining_segs = store
-            .list(&format!("{PREFIX}downloads/seg/{yest}/"))
+            .list(&format!("{SEG_PREFIX}downloads/{yest}/"))
             .await
             .unwrap();
         assert!(remaining_segs.is_empty(), "segments deleted after freeze");
@@ -1030,7 +1209,7 @@ mod tests {
                 .date()
                 .saturating_sub(time::Duration::days(3)),
         );
-        let segment_key = format!("{PREFIX}downloads/seg/{old_day}/r/inc-0.json");
+        let segment_key = format!("{SEG_PREFIX}downloads/{old_day}/r/inc-0.json");
         first
             .put(
                 &segment_key,
@@ -1053,7 +1232,7 @@ mod tests {
             .objects
             .lock()
             .unwrap()
-            .contains_key(&format!("{PREFIX}downloads/day/{old_day}/r.json")));
+            .contains_key(&format!("{DAY_PREFIX}downloads/{old_day}/r.json")));
         assert_eq!(second.len(), 0, "compaction never crossed into next store");
 
         let today = OffsetDateTime::now_utc().date();
@@ -1090,12 +1269,12 @@ mod tests {
         };
         store
             .put(
-                &format!("{PREFIX}downloads/day/{day}/r.json"),
+                &format!("{DAY_PREFIX}downloads/{day}/r.json"),
                 serde_json::to_vec(&frozen).unwrap(),
             )
             .await
             .unwrap();
-        let summary_key = format!("{PREFIX}downloads/day/{day}/{SUMMARY_FILE}");
+        let summary_key = format!("{DAY_PREFIX}downloads/{day}/{SUMMARY_FILE}");
         assert!(!store.objects.lock().unwrap().contains_key(&summary_key));
 
         c.compact().await;
@@ -1130,7 +1309,7 @@ mod tests {
         };
         store
             .put(
-                &format!("{PREFIX}downloads/day/{day}/r.json"),
+                &format!("{DAY_PREFIX}downloads/{day}/r.json"),
                 serde_json::to_vec(&frozen).unwrap(),
             )
             .await
@@ -1145,7 +1324,7 @@ mod tests {
         };
         store
             .put(
-                &format!("{PREFIX}downloads/seg/{day}/r/late-0.json"),
+                &format!("{SEG_PREFIX}downloads/{day}/r/late-0.json"),
                 serde_json::to_vec(&straggler).unwrap(),
             )
             .await
@@ -1206,7 +1385,7 @@ mod tests {
         let today = day_str(OffsetDateTime::now_utc().date());
         store
             .put(
-                &format!("{PREFIX}downloads/day/{today}/{SUMMARY_FILE}"),
+                &format!("{DAY_PREFIX}downloads/{today}/{SUMMARY_FILE}"),
                 serde_json::to_vec(&DaySummary {
                     total: 10,
                     top: BTreeMap::from([("requests/r-1.0.whl".to_string(), 10u64)]),
@@ -1218,7 +1397,7 @@ mod tests {
         // A straggler segment for the same day that must be IGNORED.
         store
             .put(
-                &format!("{PREFIX}downloads/seg/{today}/r/late-0.json"),
+                &format!("{SEG_PREFIX}downloads/{today}/r/late-0.json"),
                 serde_json::to_vec(&Segment {
                     resolution_secs: 86_400,
                     buckets: BTreeMap::from([(
@@ -1250,7 +1429,7 @@ mod tests {
         let old = day_str(today.saturating_sub(time::Duration::days(5)));
         store
             .put(
-                &format!("{PREFIX}downloads/day/{old}/{SUMMARY_FILE}"),
+                &format!("{DAY_PREFIX}downloads/{old}/{SUMMARY_FILE}"),
                 serde_json::to_vec(&DaySummary {
                     total: 7,
                     top: BTreeMap::from([("flask/f-1.0.whl".to_string(), 7u64)]),
@@ -1274,5 +1453,157 @@ mod tests {
         // absent from the result, and paid no cross-shard scan.
         let empty = day_str(today.saturating_sub(time::Duration::days(3)));
         assert!(!sums.contains_key(&empty));
+    }
+
+    #[tokio::test]
+    async fn reseed_rollups_mirrors_frozen_days_but_never_live_segments() {
+        // The multi-bucket contract: a frozen day's rollup (shard totals +
+        // summary) fans out to every peer so a failover finds the history; the
+        // current day's live segments stay put (the declared ≤1-day loss window).
+        let primary = MemStore::default();
+        let peer = MemStore::default();
+        // grace_days 0 so a past day is immediately closeable.
+        let c = engine(
+            primary.clone(),
+            Config {
+                grace_days: 0,
+                ..Default::default()
+            },
+        );
+
+        let today = OffsetDateTime::now_utc().date();
+        let past = day_str(today.saturating_sub(time::Duration::days(3)));
+        let today_s = day_str(today);
+        // A closeable past-day segment (freezes into a rollup)...
+        primary
+            .put(
+                &format!("{SEG_PREFIX}downloads/{past}/r/inc-0.json"),
+                seg_bytes("requests/r-1.0.whl", 5),
+            )
+            .await
+            .unwrap();
+        // ...and today's live segment, which must never be replicated.
+        primary
+            .put(
+                &format!("{SEG_PREFIX}downloads/{today_s}/f/inc-0.json"),
+                seg_bytes("flask/f-1.0.whl", 3),
+            )
+            .await
+            .unwrap();
+
+        c.compact().await; // freezes the past day; today's segment survives as-is
+        let frozen = format!("{DAY_PREFIX}downloads/{past}/r.json");
+        let summary = format!("{DAY_PREFIX}downloads/{past}/{SUMMARY_FILE}");
+        assert!(primary.objects.lock().unwrap().contains_key(&frozen));
+        assert!(primary.objects.lock().unwrap().contains_key(&summary));
+        assert!(!peer.objects.lock().unwrap().contains_key(&frozen));
+
+        let peers: Vec<Box<dyn ObjectStore>> = vec![Box::new(peer.clone())];
+        c.reseed_rollups(&peers).await;
+
+        // The frozen rollup and its summary are mirrored to the peer...
+        assert!(peer.objects.lock().unwrap().contains_key(&frozen));
+        assert!(peer.objects.lock().unwrap().contains_key(&summary));
+        // ...but no live segment (of any day) ever is.
+        assert!(peer
+            .objects
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|k| !k.starts_with(SEG_PREFIX)));
+
+        // Copy-if-absent is idempotent: a second reseed changes nothing.
+        let before = peer.objects.lock().unwrap().clone();
+        c.reseed_rollups(&peers).await;
+        assert_eq!(*peer.objects.lock().unwrap(), before);
+
+        // A node that fails over to the peer reads the full frozen history — the
+        // audit ranking / stats survive the loss of the primary bucket.
+        let survivor = engine(peer.clone(), Config::default());
+        let from = today.saturating_sub(time::Duration::days(4));
+        let sums = survivor.query_summaries("downloads", from, today).await;
+        assert_eq!(sums[&past].total, 5, "frozen history survived on the peer");
+        // Today's tally was only ever on the primary: it is the declared loss.
+        assert!(!sums.contains_key(&today_s));
+    }
+
+    #[tokio::test]
+    async fn open_day_sums_live_segments_across_reachable_buckets() {
+        // A mid-day selection change split today's segments over two buckets. A
+        // stats/report read must sum both so the open day stays whole.
+        let primary = MemStore::default();
+        let peer = MemStore::default();
+        let today = OffsetDateTime::now_utc().date();
+        let today_s = day_str(today);
+        primary
+            .put(
+                &format!("{SEG_PREFIX}downloads/{today_s}/r/inc-0.json"),
+                seg_bytes("requests/r-1.0.whl", 2),
+            )
+            .await
+            .unwrap();
+        peer.put(
+            &format!("{SEG_PREFIX}downloads/{today_s}/f/inc-0.json"),
+            seg_bytes("flask/f-1.0.whl", 3),
+        )
+        .await
+        .unwrap();
+
+        let c = Counters::new(
+            Box::new(FleetStore {
+                primary: primary.clone(),
+                peers: vec![peer.clone()],
+            }),
+            Config::default(),
+        );
+
+        let sums = c.query_summaries("downloads", today, today).await;
+        assert_eq!(
+            sums[&today_s].total, 5,
+            "open day summed across both buckets"
+        );
+        assert_eq!(sums[&today_s].top["requests/r-1.0.whl"], 2);
+        assert_eq!(sums[&today_s].top["flask/f-1.0.whl"], 3);
+
+        // A package whose shard's segments live only on the peer is still counted.
+        let series = c.query_package("downloads", "flask", today, today).await;
+        assert_eq!(series[&today_s]["f-1.0.whl"], 3);
+
+        // Losing the peer degrades to only the primary's live tallies (declared
+        // loss) — never an error, never the frozen history.
+        let solo = engine(primary.clone(), Config::default());
+        let sums = solo.query_summaries("downloads", today, today).await;
+        assert_eq!(
+            sums[&today_s].total, 2,
+            "peer down: its share of today is lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_day_read_dedups_a_bucket_seen_as_both_pin_and_peer() {
+        // A selection switch racing the pin/peer enumeration can surface the same
+        // bucket twice; its segments must be summed once, not doubled.
+        let primary = MemStore::default();
+        let today = OffsetDateTime::now_utc().date();
+        let today_s = day_str(today);
+        primary
+            .put(
+                &format!("{SEG_PREFIX}downloads/{today_s}/r/inc-0.json"),
+                seg_bytes("requests/r-1.0.whl", 4),
+            )
+            .await
+            .unwrap();
+        let c = Counters::new(
+            Box::new(FleetStore {
+                primary: primary.clone(),
+                peers: vec![primary.clone()], // the racing duplicate
+            }),
+            Config::default(),
+        );
+
+        let sums = c.query_summaries("downloads", today, today).await;
+        assert_eq!(sums[&today_s].total, 4, "same bucket twice is not doubled");
+        let series = c.query_package("downloads", "requests", today, today).await;
+        assert_eq!(series[&today_s]["r-1.0.whl"], 4);
     }
 }

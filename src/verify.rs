@@ -40,28 +40,18 @@ pub struct VerifyArgs {
 }
 
 /// One observed divergence, printed as `kind\tpackage\tdetail`.
-struct Divergence {
-    kind: &'static str,
-    package: String,
-    detail: String,
+pub struct Divergence {
+    pub kind: &'static str,
+    pub package: String,
+    pub detail: String,
 }
 
-/// Run the read-only diff. `Ok(true)` = converged, `Ok(false)` = diverged
-/// (rows + summary already printed to stdout), `Err` = the check could not run.
-/// The caller maps these to exit codes 0 / 1 / 2.
-pub async fn run_verify(args: VerifyArgs) -> Result<bool> {
-    let storage = args.storage.build().await?;
-
-    let pending = storage.list_dir_entries(DIRTY_PREFIX).await?;
-    if !pending.is_empty() {
-        eprintln!(
-            "warning: {} dirty marker(s) pending — in-flight packages may report stale views",
-            pending.len()
-        );
-    }
-
-    let truth = enumerate_grouped(storage.as_ref(), PACKAGES_PREFIX).await?;
-    let views = enumerate_grouped(storage.as_ref(), SIMPLE_PREFIX).await?;
+/// The pure diff: recompute every view from truth and return what disagrees.
+/// Read-only and storage-agnostic, so the deterministic simulator can point it
+/// at an in-memory bucket and get the same byte-strict verdict the CLI gives.
+pub async fn verify_storage(storage: &dyn Storage) -> Result<Vec<Divergence>> {
+    let truth = enumerate_grouped(storage, PACKAGES_PREFIX).await?;
+    let views = enumerate_grouped(storage, SIMPLE_PREFIX).await?;
 
     let mut divergences: Vec<Divergence> = Vec::new();
     let mut live_packages: Vec<String> = Vec::new();
@@ -70,7 +60,7 @@ pub async fn run_verify(args: VerifyArgs) -> Result<bool> {
     for chunk in packages.chunks(PACKAGE_CONCURRENCY) {
         let checks = chunk
             .iter()
-            .map(|(pkg, objects)| check_package(storage.as_ref(), pkg, objects));
+            .map(|(pkg, objects)| check_package(storage, pkg, objects));
         for result in futures::future::join_all(checks).await {
             let (pkg, has_artifacts, mut divs) = result?;
             if has_artifacts {
@@ -92,15 +82,37 @@ pub async fn run_verify(args: VerifyArgs) -> Result<bool> {
     }
 
     live_packages.sort();
-    check_global(storage.as_ref(), &live_packages, &mut divergences).await;
+    check_global(storage, &live_packages, &mut divergences).await;
+    Ok(divergences)
+}
+
+/// Run the read-only diff. `Ok(true)` = converged, `Ok(false)` = diverged
+/// (rows + summary already printed to stdout), `Err` = the check could not run.
+/// The caller maps these to exit codes 0 / 1 / 2.
+pub async fn run_verify(args: VerifyArgs) -> Result<bool> {
+    let storage = args.storage.build().await?;
+
+    let pending = storage.list_dir_entries(DIRTY_PREFIX).await?;
+    if !pending.is_empty() {
+        eprintln!(
+            "warning: {} dirty marker(s) pending — in-flight packages may report stale views",
+            pending.len()
+        );
+    }
+
+    // Counted, then released: the summary's totals must not hold a second copy
+    // of the truth map alive across the diff (a full mirror is ~10^6 objects).
+    let (packages, files) = {
+        let truth = enumerate_grouped(storage.as_ref(), PACKAGES_PREFIX).await?;
+        (truth.len(), truth.values().map(Vec::len).sum::<usize>())
+    };
+    let divergences = verify_storage(storage.as_ref()).await?;
 
     for d in &divergences {
         println!("{}\t{}\t{}", d.kind, d.package, d.detail);
     }
     println!(
-        "verify: {} packages, {} files, {} divergence(s)",
-        truth.len(),
-        truth.values().map(Vec::len).sum::<usize>(),
+        "verify: {packages} packages, {files} files, {} divergence(s)",
         divergences.len()
     );
     // Diverged is an expected, scriptable outcome — return it as data (the rows

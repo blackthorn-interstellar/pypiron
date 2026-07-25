@@ -197,13 +197,40 @@ ops — the task is parked and aborted, in-memory state dies, storage survives),
 cold restarts, and clock jumps past the intent grace.
 
 After the chaos phase the harness heals the fleet, drains it to quiescence,
-and asserts: every acknowledged upload is durable, listed, and byte-correct on
-every bucket; views equal a fresh derivation from truth; buckets converge; no
-`_dirty/` or `_repl/` debris remains; and acknowledged bytes are never lost
-without an authorized delete or freeze. Determinism itself is verified, not
-assumed: recurring seeds run twice and must produce identical storage-op trace
-hashes — so any failure reproduces exactly with
-`cargo run --example vopr -- --seed N`.
+and asserts:
+
+- **durability** — every acknowledged upload is byte-correct, sidecar-backed and
+  index-listed on every bucket;
+- **ack totality** — dev/DESIGN.md's totality principle, checked at the moment
+  the `200` is returned rather than at quiescence, because the heal phase's
+  `reconcile` would otherwise repair the defect before any invariant looks: each
+  peer bucket already held the record, or the selected bucket already held a
+  durable `_repl/<peer>/` note owing it. Crash-only profiles treat a miss as a
+  hard violation (the protocol must fan out or note on every schedule); under
+  injected storage failures the note write can itself fail, so there it is a
+  reported statistic. Scoped to `publish_record` only — proxy-cache fills
+  replicate asynchronously with no pre-ack fan-out *by design* (bf913b9), so
+  this must never be generalized to all durable writes;
+- **views == truth** — `verify::verify_storage`, the same byte-strict oracle
+  behind `pypiron verify`, re-renders every view from each bucket's truth and
+  diffs the bytes. The product's own checker, not a harness-local approximation;
+- **convergence** — all buckets hold identical truth and views;
+- **tombstone monotonicity** — a filename whose most recent *ack* was a `204`
+  never stands in a bucket without its tombstone. A re-publish after a delete is
+  legal resurrection, so the rule is last-writer, not set-membership;
+- **no leaks** — no `_dirty/` or `_repl/` debris remains;
+- **conservation** — acknowledged bytes are never lost without an authorized
+  delete or freeze;
+- **liveness** — the fleet quiesces within the drain budget.
+
+Determinism itself is verified, not assumed: recurring seeds (`--recheck-every`)
+run twice and must produce an identical storage-op trace hash *and* an identical
+final world — every bucket's bytes plus the ledger. The trace hash alone only
+proves the two runs issued the same *calls*; a nondeterminism downstream of the
+op sequence (an unvirtualized clock read, say) makes the same calls with
+different bytes, and the state hash is what catches it. The rerun's own invariant
+verdict counts too, so a seed that passes once and fails once is red. Any failure
+reproduces exactly with `cargo run --example vopr -- --seed N`.
 
 A smoke runs on every PR (ci.yml); tens of thousands of fresh seeds run
 nightly with counters published in the job summary
@@ -248,7 +275,12 @@ To see which seeds and keys are behind a repair, run with `VOPR_LOG_REPAIRS=1`:
 every fault-mode repair then prints its **class** and causal detail alongside its
 seed, round, and the exact drifted view keys (silent by default). `VOPR_TRACE=1`
 (optionally `VOPR_TRACE_FILE=path`) captures the full storage-op trace for
-diffing a determinism violation.
+diffing a determinism violation. `VOPR_TRACE_FILE` is also how you prove a new
+oracle did not *perturb* the schedule: an invariant must read the raw
+`Arc<SimStorage>`, never a `FaultView` — a `FaultView` call consumes an
+op-sequence number, draws from the rng stream, and records a trace event, which
+silently shifts every later fault decision and invalidates every pinned seed.
+Diff the trace files from before and after; they must be byte-identical.
 
 The honest statement about zero: the *avoidable* classes (1 and 2) are zero by
 enforcement — a run that produces one fails. Whether the **total** can reach zero

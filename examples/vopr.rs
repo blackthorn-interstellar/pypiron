@@ -26,10 +26,18 @@
 //! What is checked once the fleet quiesces (faults healed, workers drained):
 //!   - DURABILITY: every acknowledged upload's bytes, sidecar, package-view
 //!     entry, and global-index entry exist — on every bucket;
-//!   - VIEWS == TRUTH: each bucket's materialized indexes equal a fresh
-//!     derivation from its truth tree (views may lag, never lead, and at
-//!     quiescence they may not even lag);
+//!   - ACK_TOTALITY: at the moment a publish acked, every other bucket already
+//!     held the record or was owed it by a durable `_repl/` note (dev/DESIGN.md's
+//!     totality principle). Checked at the ack, because the heal phase's
+//!     `reconcile` would otherwise launder the defect. `publish_record` only:
+//!     proxy-cache fills replicate asynchronously by design (bf913b9);
+//!   - VIEWS == TRUTH: `verify::verify_storage` — the product's own byte-strict
+//!     `pypiron verify` oracle — re-renders every view from each bucket's truth
+//!     and diffs the bytes;
 //!   - CONVERGENCE: all buckets hold identical truth and views;
+//!   - TOMBSTONE MONOTONICITY: a filename whose most recent ack was a 204 delete
+//!     never stands in a bucket without its tombstone — no silent resurrection
+//!     of a removed (compromised) artifact;
 //!   - NO LEAKS: no unconsumed `_dirty/` markers, no undrained `_repl/` notes;
 //!   - CONSERVATION: acknowledged bytes are never silently lost — a file is
 //!     live, or its filename was deleted/frozen by an authorized operation;
@@ -46,9 +54,12 @@
 //!     profiles additionally keep their blanket any-repair-is-a-violation
 //!     gate.
 //!
-//! Determinism is self-checked, not assumed: every run whose seed is a
-//! multiple of `--recheck-every` executes twice and must produce an identical
-//! storage-op trace hash.
+//! Determinism is self-checked, not assumed: every run whose seed is a multiple
+//! of `--recheck-every` executes twice and must produce an identical storage-op
+//! trace hash *and* an identical final world (bucket bytes + ledger), because a
+//! nondeterminism downstream of the op sequence — an unvirtualized clock read,
+//! say — issues the same calls with different bytes. The rerun's own invariant
+//! verdict counts too: a seed that passes once and fails once is a red seed.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -777,6 +788,24 @@ struct Ledger {
     acked: BTreeMap<(String, String), Vec<u8>>,
     /// Filenames an acknowledged (204) delete removed.
     deleted: std::collections::BTreeSet<(String, String)>,
+    /// Per filename, whether the most recent *acknowledged* operation was the
+    /// delete. `acked` and `deleted` are unordered sets, but resurrection is a
+    /// last-writer question: re-publishing a filename after deleting it is
+    /// legal, and only a filename whose latest ack was the 204 may not be
+    /// standing in a bucket. Ledger inserts happen under this mutex immediately
+    /// after the status code the client saw, so overwriting one flag per
+    /// filename *is* that ordering — no separate sequence number needed.
+    ///
+    /// Today this is equivalent to `deleted`, because `publish_record`'s
+    /// tombstone fence rejects any re-publish of a deleted private filename, so
+    /// no ack can follow a 204. It is written the ordered way anyway: mirror
+    /// filenames are re-fillable by design (see `delete_record`), so the day a
+    /// legal resurrection path exists the unordered form would false-fail every
+    /// one of them — and the tempting fix would be to weaken this oracle.
+    last_ack_deleted: BTreeMap<(String, String), bool>,
+    /// Publishes that acked while a peer bucket held neither the record nor a
+    /// note owing it — totality failures, recorded at the ack.
+    ack_totality: Vec<String>,
     published_attempts: u64,
     delete_attempts: u64,
 }
@@ -874,10 +903,57 @@ impl Fleet {
 // Workload ops.
 // ---------------------------------------------------------------------------
 
+/// ACK_TOTALITY, evaluated at the ack: dev/DESIGN.md's totality principle says
+/// an upload is not acknowledged until every bucket either holds it or is owed
+/// it by a durable note. Checked here rather than at quiescence because the heal
+/// phase's `reconcile` launders exactly this defect — it copies a single-bucket
+/// ack into place before any invariant looks.
+///
+/// Pure by construction: `SimStorage::keys()` reads the raw bucket, never the
+/// traced `FaultView`, so it consumes no op-sequence number, draws no rng, and
+/// records no trace event. No awaits.
+///
+/// SCOPE: `publish_record` only. Commit bf913b9 made proxy-cache fills
+/// replicate asynchronously with no pre-ack fan-out by design
+/// (`replicate::spawn_proxy_fill_notes` writes its notes after the response is
+/// served), so this must never be generalized to all durable writes.
+fn ack_totality_failures(
+    buckets: &[Arc<SimStorage>],
+    selected: usize,
+    pkg: &str,
+    fname: &str,
+) -> Vec<String> {
+    if buckets.len() < 2 {
+        return Vec::new();
+    }
+    let akey = format!("packages/{pkg}/{fname}");
+    let mkey = format!("{akey}.meta.json");
+    let selected_keys = buckets[selected].keys();
+    buckets
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != selected)
+        .filter(|(i, peer)| {
+            let keys = peer.keys();
+            let has_record = keys.contains(&akey) && keys.contains(&mkey);
+            let owed = format!("_repl/{i}/{pkg}/{fname}!");
+            !has_record && !selected_keys.iter().any(|k| k.starts_with(&owed))
+        })
+        .map(|(i, _)| {
+            format!(
+                "ACK_TOTALITY: publish of {akey} acked while bucket {i} held neither the record \
+                 nor a _repl/{i}/ note — the 200 claimed a durability it did not have (publish \
+                 only; proxy fills are async by design, see bf913b9)"
+            )
+        })
+        .collect()
+}
+
 async fn op_publish(
     state: Arc<AppState>,
     ledger: Arc<Mutex<Ledger>>,
     clock: Arc<SimClock>,
+    buckets: Vec<Arc<SimStorage>>,
     pkg: String,
     file: u8,
     variant: u8,
@@ -908,11 +984,11 @@ async fn op_publish(
     };
     let pinned = state.pin();
     if pypiron::publish_record(&state, &pinned, req).await.is_ok() {
-        ledger
-            .lock()
-            .expect("ledger lock")
-            .acked
-            .insert((pkg, fname), body);
+        let mut failures = ack_totality_failures(&buckets, pinned.index, &pkg, &fname);
+        let mut ledger = ledger.lock().expect("ledger lock");
+        ledger.ack_totality.append(&mut failures);
+        ledger.acked.insert((pkg.clone(), fname.clone()), body);
+        ledger.last_ack_deleted.insert((pkg, fname), false);
     }
 }
 
@@ -924,11 +1000,9 @@ async fn op_delete(state: Arc<AppState>, ledger: Arc<Mutex<Ledger>>, pkg: String
         .await
         .is_ok()
     {
-        ledger
-            .lock()
-            .expect("ledger lock")
-            .deleted
-            .insert((pkg, fname));
+        let mut ledger = ledger.lock().expect("ledger lock");
+        ledger.deleted.insert((pkg.clone(), fname.clone()));
+        ledger.last_ack_deleted.insert((pkg, fname), true);
     }
 }
 
@@ -954,8 +1028,12 @@ async fn op_reconcile(state: Arc<AppState>) {
 struct RunOutcome {
     trace_hash: u64,
     trace_events: u64,
+    /// Fingerprint of the final world (bucket bytes + ledger) — see [`state_hash`].
+    state_hash: u64,
     trace_log: Option<Vec<String>>,
     acked: usize,
+    /// Publishes that acked without fleet-wide durability or a note owing it.
+    ack_totality: u64,
     audit_view_repairs: u64,
     /// Audit repairs split by taxonomy class: [ordering, premature, race].
     repairs_by_class: [u64; 3],
@@ -996,7 +1074,11 @@ async fn run_seed(
                 let file = rng.below(u64::from(FILES_PER_PKG)) as u8;
                 let variant = rng.below(2) as u8;
                 let clock = fleet.clock.clone();
-                fleet.spawn_on(node, op_publish(state, ledger, clock, pkg, file, variant));
+                let buckets = fleet.buckets.clone();
+                fleet.spawn_on(
+                    node,
+                    op_publish(state, ledger, clock, buckets, pkg, file, variant),
+                );
             }
             40..=49 => {
                 let pkg = PACKAGES[rng.below(PACKAGES.len() as u64) as usize].to_string();
@@ -1334,8 +1416,8 @@ async fn run_seed(
         last_fingerprint = Some(snapshot);
     }
 
-    // ---- Invariants.
-    let ledger = fleet.ledger.lock().expect("ledger lock");
+    // ---- Invariants. The ledger stays unlocked until the last await is behind
+    // us: `verify_storage` is async, and a std guard may not cross an await.
     let mut violations = violations_pre;
     if !quiesced {
         let leftovers: Vec<String> = fleet
@@ -1356,6 +1438,24 @@ async fn run_seed(
     }
     let dumps: Vec<BTreeMap<String, Vec<u8>>> =
         fleet.buckets.iter().map(|bucket| bucket.dump()).collect();
+
+    // VIEWS == TRUTH, byte-strict: the product's own oracle (`pypiron verify`)
+    // re-renders every view from that bucket's truth and diffs the bytes. Run
+    // against the raw `SimStorage` — never the traced `FaultView` — so it
+    // consumes no op-sequence numbers and cannot shift the fault schedule.
+    for (idx, bucket) in fleet.buckets.iter().enumerate() {
+        match pypiron::verify::verify_storage(bucket.as_ref()).await {
+            Ok(divergences) => violations.extend(divergences.into_iter().map(|d| {
+                format!(
+                    "VERIFY: bucket {idx} diverged from its own truth: {} {} — {}",
+                    d.kind, d.package, d.detail
+                )
+            })),
+            Err(e) => violations.push(format!("VERIFY: bucket {idx} could not be verified: {e:?}")),
+        }
+    }
+
+    let ledger = fleet.ledger.lock().expect("ledger lock");
 
     // Convergence: identical truth + views across buckets.
     if buckets > 1 {
@@ -1479,49 +1579,21 @@ async fn run_seed(
             }
         }
 
-        // Views == a fresh derivation from truth (membership form).
-        for pkg in PACKAGES {
-            let prefix = format!("packages/{pkg}/");
-            let live: Vec<String> = dump
-                .keys()
-                .filter_map(|k| k.strip_prefix(&prefix))
-                .filter(|name| pypiron::sidecar::is_artifact(name))
-                .filter(|name| {
-                    !dump.contains_key(&format!("{prefix}{name}.tombstone"))
-                        && !dump.contains_key(&format!("{prefix}{name}.frozen"))
-                        && !dump.contains_key(&format!("{prefix}{name}.mirror-quarantined"))
-                })
-                .map(str::to_string)
-                .collect();
-            let view = dump
-                .get(&format!("simple/{pkg}/index.json"))
-                .map(|b| String::from_utf8_lossy(b).into_owned());
-            match (&view, live.is_empty()) {
-                (None, true) => {}
-                (None, false) => violations.push(format!(
-                    "VIEW: bucket {bucket_idx} has live files for {pkg} but no view"
-                )),
-                (Some(_), true) => violations.push(format!(
-                    "VIEW: bucket {bucket_idx} lists empty package {pkg} (view leads truth)"
-                )),
-                (Some(json), false) => {
-                    for name in &live {
-                        if !json.contains(name.as_str()) {
-                            violations.push(format!(
-                                "VIEW: bucket {bucket_idx} view of {pkg} misses live {name}"
-                            ));
-                        }
-                    }
-                    let global = dump
-                        .get("simple/index.json")
-                        .map(|b| String::from_utf8_lossy(b).into_owned())
-                        .unwrap_or_default();
-                    if !global.contains(pkg) {
-                        violations.push(format!(
-                            "GLOBAL: bucket {bucket_idx} global index misses live {pkg}"
-                        ));
-                    }
-                }
+        // Tombstone monotonicity: a filename whose latest ack was the 204 must
+        // not be standing in any bucket without its tombstone. This is the
+        // compromised-artifact removal path — a silent resurrection passes every
+        // other oracle here, since `ledger.deleted` is only ever an exemption.
+        for ((pkg, fname), deleted_last) in &ledger.last_ack_deleted {
+            let akey = format!("packages/{pkg}/{fname}");
+            if *deleted_last
+                && dump.contains_key(&akey)
+                && !dump.contains_key(&format!("{akey}.tombstone"))
+            {
+                violations.push(format!(
+                    "TOMBSTONE_MONOTONICITY: {akey} was acked-deleted (204) but bucket \
+                     {bucket_idx} holds the artifact with no .tombstone — a deleted filename \
+                     came back"
+                ));
             }
         }
 
@@ -1556,16 +1628,61 @@ async fn run_seed(
         }
     }
 
+    // Crash-only: the protocol must fan out or leave a note on every schedule,
+    // so a totality miss is a hard violation. Under injected storage failures a
+    // note write can itself fail, so there it is a reported statistic — the same
+    // split the audit-repair taxonomy uses.
+    if fail_percent == 0 {
+        violations.extend(ledger.ack_totality.iter().cloned());
+    }
+
     let (trace_hash, trace_events) = fleet.plan.trace_hash();
     RunOutcome {
         trace_hash,
         trace_events,
+        state_hash: state_hash(&dumps, &ledger),
         trace_log: fleet.plan.take_log(),
         acked: ledger.acked.len(),
+        ack_totality: ledger.ack_totality.len() as u64,
         audit_view_repairs,
         repairs_by_class,
         violations,
     }
+}
+
+/// FNV-1a over one field, with the same delimiter mix `TraceHasher` uses.
+fn mix(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x100000001B3);
+    }
+    *hash ^= 0x1F;
+    *hash = hash.wrapping_mul(0x100000001B3);
+}
+
+/// Fingerprint of the world a run ended in: every bucket's bytes plus the
+/// ledger. The trace hash proves two runs issued the same *calls*; this proves
+/// they produced the same *bytes*, catching nondeterminism downstream of the op
+/// sequence (an unvirtualized clock read, say) that a trace comparison reports
+/// as green.
+fn state_hash(dumps: &[BTreeMap<String, Vec<u8>>], ledger: &Ledger) -> u64 {
+    let mut hash = 0xcbf29ce484222325;
+    for dump in dumps {
+        for (key, bytes) in dump {
+            mix(&mut hash, key.as_bytes());
+            mix(&mut hash, bytes);
+        }
+    }
+    for ((pkg, fname), body) in &ledger.acked {
+        mix(&mut hash, pkg.as_bytes());
+        mix(&mut hash, fname.as_bytes());
+        mix(&mut hash, body);
+    }
+    for (pkg, fname) in &ledger.deleted {
+        mix(&mut hash, pkg.as_bytes());
+        mix(&mut hash, fname.as_bytes());
+    }
+    hash
 }
 
 // ---------------------------------------------------------------------------
@@ -2022,6 +2139,7 @@ fn main() {
     let keep_going = args.forever || args.max_secs.is_some();
     let mut total_events: u64 = 0;
     let mut total_acked: usize = 0;
+    let mut total_ack_totality: u64 = 0;
     let mut total_audit_repairs: u64 = 0;
     let mut total_repairs_by_class: [u64; 3] = [0; 3]; // [ordering, premature, race]
     let mut failed_seeds: Vec<u64> = Vec::new();
@@ -2039,10 +2157,11 @@ fn main() {
         let seed = args.start_seed + explored;
         explored += 1;
         let profile = profile_for(seed, &args);
-        let outcome = run_once(seed, &profile);
+        let mut outcome = run_once(seed, &profile);
         dump_trace(&outcome);
         total_events += outcome.trace_events;
         total_acked += outcome.acked;
+        total_ack_totality += outcome.ack_totality;
         total_audit_repairs += outcome.audit_view_repairs;
         for (total, add) in total_repairs_by_class
             .iter_mut()
@@ -2074,6 +2193,24 @@ fn main() {
                     std::process::exit(3);
                 }
                 determinism_violations.push(seed);
+            } else if again.state_hash != outcome.state_hash {
+                eprintln!(
+                    "vopr: DETERMINISM VIOLATION seed={seed}: op traces matched but the final \
+                     world differs ({:#x} vs {:#x}) — nondeterminism is downstream of the op \
+                     sequence: same calls, different bytes",
+                    outcome.state_hash, again.state_hash
+                );
+                if !keep_going {
+                    std::process::exit(3);
+                }
+                determinism_violations.push(seed);
+            }
+            // The rerun's own verdict was previously thrown away, so a seed that
+            // passed run 1 and failed run 2 was reported green. The primary
+            // block below owns the exit; this only makes sure the rerun's
+            // violations are seen and counted.
+            if !again.violations.is_empty() && outcome.violations.is_empty() {
+                outcome.violations = again.violations;
             }
         }
         if !outcome.violations.is_empty() {
@@ -2097,7 +2234,7 @@ fn main() {
         // the running counters without flooding the log.
         if keep_going && last_report.elapsed().as_secs() >= 60 {
             println!(
-                "vopr: progress — {explored} seeds, {total_events} storage-op interleavings, {total_acked} acked uploads, {total_audit_repairs} audit view repairs ({} ordering, {} premature, {} concurrent-race), {} failed, {} determinism violations, {:?} elapsed",
+                "vopr: progress — {explored} seeds, {total_events} storage-op interleavings, {total_acked} acked uploads, {total_ack_totality} ack-totality misses, {total_audit_repairs} audit view repairs ({} ordering, {} premature, {} concurrent-race), {} failed, {} determinism violations, {:?} elapsed",
                 total_repairs_by_class[0],
                 total_repairs_by_class[1],
                 total_repairs_by_class[2],
@@ -2117,7 +2254,7 @@ fn main() {
         )
     };
     println!(
-        "vopr: {explored} seeds explored, {total_events} storage-op interleavings, {total_acked} acked uploads verified, {total_audit_repairs} audit view repairs ({} ordering, {} premature, {} concurrent-race), {profile_desc} in {:?} — {}",
+        "vopr: {explored} seeds explored, {total_events} storage-op interleavings, {total_acked} acked uploads verified, {total_ack_totality} ack-totality misses, {total_audit_repairs} audit view repairs ({} ordering, {} premature, {} concurrent-race), {profile_desc} in {:?} — {}",
         total_repairs_by_class[0],
         total_repairs_by_class[1],
         total_repairs_by_class[2],

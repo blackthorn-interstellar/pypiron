@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 
 import pytest
 
@@ -322,3 +323,54 @@ def test_deleted_mirror_file_reheals_within_presence_ttl(proxy_pair, tmp_path):
     assert code == 200, "a deleted mirror file must re-mirror from upstream, not 404"
     assert hashlib.sha256(body).hexdigest() == sha256_file(wheel)
     assert cached.exists(), "the re-request must re-cache the artifact from upstream"
+
+
+def test_proxy_persists_upstream_quarantine_status(proxy_pair, tmp_path):
+    """The proxy relayed upstream PEP 792 status only into its in-memory listing,
+    so a lockfile-pinned `/files/` URL served cached bytes of an upstream-
+    quarantined project ungated. The proxy now persists the observed status to
+    `.project-status.json` (mirror origin) — the durable set the malware/
+    quarantine byte gate consults, so those bytes get refused."""
+    upstream, proxy = proxy_pair["upstream"], proxy_pair["proxy"]
+    pkg = "quarantinedup"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    _upload(upstream, wheel, pkg)
+
+    # Upstream quarantines the project (the admin PEP 792 endpoint).
+    admin_user = upstream.get("admin_user", upstream["user"])
+    admin_pass = upstream.get("admin_password", upstream["password"])
+    code, _, _ = http_request_auth(
+        "POST",
+        f"{upstream['base_url']}/project/{pkg}/status",
+        username=admin_user,
+        password=admin_pass,
+        data=json.dumps({"status": "quarantined", "reason": "compromised"}).encode(),
+    )
+    assert code == 200, f"upstream status set returned {code}"
+
+    # Wait until the upstream's own listing carries the quarantine…
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        code, body, _ = http_get(f"{upstream['simple']}{pkg}/", headers={"Accept": ACCEPT_PEP691})
+        doc = json.loads(body) if code == 200 else {}
+        if doc.get("project-status", {}).get("status") == "quarantined":
+            break
+        time.sleep(0.3)
+    else:
+        raise AssertionError("upstream never published the quarantine")
+
+    # …then a proxy listing fetch observes it and persists it durably. Before the
+    # fix, the proxy showed the freeze in its listing but never wrote it to disk.
+    status_path = proxy["data_dir"] / "packages" / pkg / ".project-status.json"
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        http_get(f"{proxy['simple']}{pkg}/", headers={"Accept": ACCEPT_PEP691})
+        if status_path.exists():
+            break
+        time.sleep(0.3)
+    else:
+        raise AssertionError("proxy never persisted the upstream quarantine status")
+
+    doc = json.loads(status_path.read_text())
+    assert doc["status"] == "quarantined"
+    assert doc.get("pypiron-origin") == "mirror", "persisted proxy status must be mirror-origin"

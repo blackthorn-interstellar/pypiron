@@ -23,6 +23,7 @@ pub mod counted_storage;
 pub mod counters;
 pub mod hash;
 pub mod html;
+pub mod layout;
 pub mod lease;
 pub mod markdown;
 pub mod markers;

@@ -353,6 +353,37 @@ impl AppState {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// The eligible peer buckets a leader-authored control singleton (the advisory
+    /// feed, the quarantined set) writes through to and reseeds onto, excluding
+    /// the selected `primary_index`. Empty for a single-bucket node, a fenced
+    /// topology, or when no peer is currently healthy — callers then write only
+    /// the primary and let reseed-if-absent heal the rest. Mirrors the
+    /// replicator's eligibility gate (background writes never touch a bucket known
+    /// unhealthy or awaiting topology revalidation).
+    pub(crate) fn singleton_replicas(
+        &self,
+        primary_index: usize,
+    ) -> Vec<crate::layout::ReplicaTarget<'_>> {
+        if !self.buckets.is_multi() || self.mutations_fenced() {
+            return Vec::new();
+        }
+        self.buckets
+            .handles()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != primary_index)
+            .filter(|(index, _)| {
+                self.bucket_health
+                    .as_ref()
+                    .is_none_or(|health| health.bucket_eligible(*index).unwrap_or(false))
+            })
+            .map(|(_, handle)| crate::layout::ReplicaTarget {
+                storage: handle.storage.as_ref(),
+                name: handle.name.as_str(),
+            })
+            .collect()
+    }
+
     /// The current advisory snapshot: lock, clone the inner `Arc`, drop the
     /// guard. Cheap enough for the request path; recovers a poisoned lock.
     pub fn advisory_snapshot(&self) -> Arc<advisories::AdvisoryState> {

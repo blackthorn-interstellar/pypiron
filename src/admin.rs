@@ -406,12 +406,20 @@ pub(crate) async fn advisories_feed_put(
             ))
         }
     }
-    state
-        .pin()
-        .storage
-        .put_bytes(advisories::FEED_KEY, bytes, Some("application/zip"))
-        .await
-        .map_err(|e| internal("write", e))?;
+    // Write-through to every healthy bucket: the selected bucket is authoritative
+    // (its etag drives the reload); peers get it best-effort so a failover to any
+    // bucket serves the admin-pushed snapshot. Single-bucket mode writes once.
+    let pinned = state.pin();
+    let replicas = state.singleton_replicas(pinned.index);
+    crate::layout::write_singleton(
+        pinned.storage.as_ref(),
+        &replicas,
+        advisories::FEED_KEY,
+        bytes,
+        Some("application/zip"),
+    )
+    .await
+    .map_err(|e| internal("write", e))?;
     // Load it this worker tick regardless of the reconcile period, and wake the
     // worker now so the load is ~immediate rather than up to a tick away.
     state

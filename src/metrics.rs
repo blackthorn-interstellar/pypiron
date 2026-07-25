@@ -156,9 +156,17 @@ pub struct Metrics {
     /// publishes its first snapshot; never populated by a single-bucket node.
     bucket_health: Mutex<Option<BucketMetricState>>,
     /// Unix seconds of this node's last successful advisory-snapshot refresh
-    /// (leader source poll, or a follower's storage check). 0 = never — the
-    /// `pypiron_advisory_snapshot_age_seconds` gauge is omitted until then.
+    /// (leader source poll, or a follower's storage check) — a read-liveness
+    /// signal, NOT staleness: a ferry that keeps re-reading the same dead file
+    /// refreshes successfully forever. 0 = never; the
+    /// `pypiron_advisory_last_refresh_age_seconds` gauge is omitted until then.
     advisory_last_refresh_unix: AtomicU64,
+    /// Unix seconds of the newest OSV `modified` timestamp in the loaded feed —
+    /// the snapshot's *content* age, which the staleness alert must page on. Stale
+    /// bytes keep this fixed while wall time advances, so the age climbs even when
+    /// every read "succeeds". 0 = no feed loaded, or none carried a timestamp; the
+    /// `pypiron_advisory_snapshot_age_seconds` gauge is omitted until then.
+    advisory_content_modified_unix: AtomicU64,
     /// Unix seconds of this node's last successful malware-probe cycle (a CSV poll,
     /// including a 304). 0 = never — the `pypiron_malware_probe_age_seconds` gauge
     /// is omitted until the first probe lands.
@@ -170,11 +178,25 @@ impl Metrics {
         Self::default()
     }
 
-    /// Mark this node's advisory snapshot as freshly refreshed (resets the age
-    /// gauge). Called once per successful refresh cycle by the worker tick.
+    /// Mark this node's advisory read as fresh (a source poll or storage check
+    /// succeeded). This is read-liveness only — it never proves the *content*
+    /// advanced, so it feeds a separate gauge from the staleness alert. Called
+    /// once per successful refresh cycle by the worker tick.
     pub fn advisory_refresh_ok(&self) {
         self.advisory_last_refresh_unix
             .store(unix_now_secs(), Ordering::Relaxed);
+    }
+
+    /// Record the newest OSV `modified` timestamp (unix seconds) in the loaded
+    /// feed — the input to the content-staleness gauge. A non-positive timestamp
+    /// (no parseable `modified`) is ignored, leaving the gauge omitted. Called
+    /// every refresh from the live snapshot's watermark, so identical stale bytes
+    /// keep the same value and the age climbs.
+    pub fn advisory_content_modified(&self, modified_unix: i64) {
+        if modified_unix > 0 {
+            self.advisory_content_modified_unix
+                .store(modified_unix as u64, Ordering::Relaxed);
+        }
     }
 
     /// Mark this node's malware probe as freshly polled (resets the probe-age
@@ -441,16 +463,31 @@ impl Metrics {
             "Wall duration of the last completed audit pass.",
             audit_secs,
         );
-        // Advisory snapshot staleness (per node). Emitted only once a refresh has
-        // succeeded — a permanent zero on a node that never armed the feature
-        // would be a misleading "0 seconds old". Age is computed at render time.
+        // Advisory snapshot staleness (per node) — CONTENT age, from the newest
+        // OSV `modified` timestamp in the loaded feed, not read success. This is
+        // what a "page when age > 48h" alert watches: a ferry re-reading a dead
+        // file refreshes forever, but the content stops advancing, so this climbs.
+        // Emitted only once a feed with a parseable timestamp has loaded.
+        let advisory_modified = self.advisory_content_modified_unix.load(Ordering::Relaxed);
+        if advisory_modified != 0 {
+            let age = unix_now_secs().saturating_sub(advisory_modified);
+            emit_gauge(
+                &mut out,
+                "pypiron_advisory_snapshot_age_seconds",
+                "Seconds since the newest advisory in the loaded feed was modified (content staleness).",
+                age,
+            );
+        }
+        // Advisory read liveness (per node): seconds since a source poll or
+        // storage check last succeeded. A separate signal from staleness — it
+        // catches a node that stopped reading at all, without masking stale bytes.
         let advisory_refresh = self.advisory_last_refresh_unix.load(Ordering::Relaxed);
         if advisory_refresh != 0 {
             let age = unix_now_secs().saturating_sub(advisory_refresh);
             emit_gauge(
                 &mut out,
-                "pypiron_advisory_snapshot_age_seconds",
-                "Seconds since this node last refreshed the advisory snapshot.",
+                "pypiron_advisory_last_refresh_age_seconds",
+                "Seconds since this node last successfully refreshed the advisory snapshot (read liveness).",
                 age,
             );
         }

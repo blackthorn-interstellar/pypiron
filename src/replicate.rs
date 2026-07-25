@@ -56,10 +56,10 @@ pub use decide::*;
 /// Todo-marker prefix: `_repl/<dest-index>/<pkg>/<file>!<nonce>`, an empty
 /// object in the bucket that took the write (the `_dirty/` idiom pointed at a
 /// second bucket). O(1) at commit, consumed and deleted on a successful push.
-const REPL_PREFIX: &str = "_repl/";
+pub(crate) const REPL_PREFIX: &str = "_repl/";
 /// Frozen bodies land here, content-hash-suffixed, so both sides of a byte
 /// conflict are preserved as moves (never deletes): `_quarantine/<pkg>/<file>@<sha12>`.
-const QUARANTINE_PREFIX: &str = "_quarantine/";
+pub(crate) const QUARANTINE_PREFIX: &str = "_quarantine/";
 /// Bound on the origin-CAS retry loop in [`ensure_private_origin`]; the same
 /// rationale as [`origin`]'s own claim loop — a pathological storm fails closed.
 const ORIGIN_ATTEMPTS: usize = 8;

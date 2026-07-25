@@ -2109,3 +2109,171 @@ def test_changed_bucket_list_without_migrate_refuses_to_start(minio_three, pypir
     rc, out = _serve_exits(pypiron_bin, minio, (b, a))
     assert rc != 0, f"reordering buckets without migrating should refuse to start:\n{out}"
     assert "different bucket topology" in out, out
+
+
+# ======================= Advisory control singletons ==========================
+#
+# The advisory feed (`_advisories/osv-pypi.zip`) and the worker-derived
+# quarantined set (`_advisories/quarantined.json`) are leader-authored control
+# SINGLETONS: written write-through to every healthy bucket and reseed-if-absent
+# healed, so a failover to any bucket stays armed. These prove the fail-closed
+# behavior the archetype (a failover clearing the byte gate) used to break.
+
+from .test_advisories import canonical_records, make_osv_zip  # noqa: E402
+
+_FEED_KEY = "_advisories/osv-pypi.zip"
+_QUARANTINED_KEY = "_advisories/quarantined.json"
+
+
+def _mirror_upload_s3(server, wheel) -> None:
+    """Publish `wheel` as a mirror-origin file — the origin a byte-gate block
+    requires (a private-origin name is never gated)."""
+    upload_legacy(
+        server["legacy"],
+        wheel,
+        username=server["user"],
+        password=server["password"],
+        fields={"mirror": "true"},
+    )
+
+
+def _poll_status(url: str, accept: set, *, timeout: float = 30.0):
+    """Poll `url` (no redirect) until its status is in `accept`."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        code, body, _ = http_get_no_redirect(url, timeout=3)
+        if code in accept:
+            return code, body
+        last = code
+        time.sleep(0.3)
+    raise AssertionError(f"{url} never returned {accept} within {timeout}s (last={last})")
+
+
+def _assert_status_stays(url: str, accept: set, *, hold: float = 4.0) -> None:
+    """Assert `url`'s status stays within `accept` across `hold` seconds."""
+    deadline = time.time() + hold
+    while time.time() < deadline:
+        code, _, _ = http_get_no_redirect(url, timeout=3)
+        assert code in accept, f"{url} returned {code}, expected one of {accept}"
+        time.sleep(0.3)
+
+
+def test_quarantine_survives_singleton_loss_across_two_buckets(
+    minio_two, pypiron_bin, tmp_path, tmp_path_factory
+):
+    """A quarantined project's cached bytes stay refused on a 2-bucket fleet even
+    after the quarantined-set singleton is deleted from BOTH buckets — the fail-
+    open the archetype used to hit on failover. The set is written write-through
+    to both buckets, an absent key retains the loaded set (never un-quarantines),
+    and reseed-if-absent restores the singleton on both buckets."""
+    minio = minio_two
+    a, b = minio["buckets"]
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    server_gen = _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        extra_args=[
+            "--advisory-feed",
+            str(feed),
+            "--malware-block",
+            "true",
+            "--reconcile-interval-secs",
+            "2",
+        ],
+    )
+    try:
+        server = next(server_gen)
+        base = server["base_url"]
+        admin = {"username": server["user"], "password": server["password"]}
+
+        pkg = "quarantinee"
+        wheel = make_wheel(pkg, "1.0.0", tmp_path)
+        _mirror_upload_s3(server, wheel)
+        wait_for_file_in_index(server["simple"], pkg, wheel.name)
+
+        file_url = f"{base}/files/{pkg}/{wheel.name}"
+        # Clean mirror file serves before quarantine.
+        _poll_status(file_url, {200, 302})
+
+        # Relay a PEP 792 quarantine (as a sync would).
+        code, _, _ = http_request_auth(
+            "POST", f"{base}/project/{pkg}/status", data=b'{"status":"quarantined"}', **admin
+        )
+        assert code == 200, code
+
+        # The byte gate refuses once the sweep derives the quarantined set.
+        _poll_status(file_url, {403})
+
+        # The singleton was written write-through to BOTH buckets.
+        _eventually(
+            lambda: (
+                minio_key_exists_in(minio, a, _QUARANTINED_KEY)
+                and minio_key_exists_in(minio, b, _QUARANTINED_KEY)
+            ),
+            what="quarantined.json replicated to both buckets",
+        )
+
+        # Delete the singleton from both buckets: a lost control file must NOT
+        # un-block. The in-memory set is retained on an absent key, and reseed
+        # restores the object — the download stays refused throughout.
+        minio_delete_key_in(minio, a, _QUARANTINED_KEY)
+        minio_delete_key_in(minio, b, _QUARANTINED_KEY)
+        _assert_status_stays(file_url, {403})
+
+        # reseed-if-absent heals the singleton back onto both buckets.
+        _eventually(
+            lambda: (
+                minio_key_exists_in(minio, a, _QUARANTINED_KEY)
+                and minio_key_exists_in(minio, b, _QUARANTINED_KEY)
+            ),
+            what="quarantined.json reseeded onto both buckets after deletion",
+        )
+    finally:
+        server_gen.close()
+
+
+def test_advisory_feed_reseeds_onto_a_starved_second_bucket(
+    minio_two, pypiron_bin, tmp_path, tmp_path_factory
+):
+    """The advisory feed snapshot lands on every bucket: it is written through to
+    the peer and reseed-if-absent restores it if a bucket loses it. A second
+    bucket that never held the feed (or lost it) is healed without a resync — so
+    a fresh node booting onto it comes up armed, not armed-but-unfed."""
+    minio = minio_two
+    a, b = minio["buckets"]
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    server_gen = _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        extra_args=[
+            "--advisory-feed",
+            str(feed),
+            "--malware-block",
+            "true",
+            "--reconcile-interval-secs",
+            "2",
+        ],
+    )
+    try:
+        next(server_gen)  # start the server; this test inspects buckets directly
+        # The feed snapshot reaches both buckets (selected write + peer reseed).
+        _eventually(
+            lambda: (
+                minio_key_exists_in(minio, a, _FEED_KEY)
+                and minio_key_exists_in(minio, b, _FEED_KEY)
+            ),
+            what="advisory feed replicated to both buckets",
+        )
+
+        # Starve the second (peer) bucket, then confirm reseed restores it.
+        minio_delete_key_in(minio, b, _FEED_KEY)
+        assert not minio_key_exists_in(minio, b, _FEED_KEY)
+        _eventually(
+            lambda: minio_key_exists_in(minio, b, _FEED_KEY),
+            what="advisory feed reseeded onto the starved second bucket",
+        )
+    finally:
+        server_gen.close()

@@ -157,6 +157,12 @@ refused, so a URL already pinned in a lockfile can't route around the empty
 listing. When a single file is removed upstream, `sync` marks it withdrawn the
 same way. Whatever PyPI stops standing behind, pypiron stops serving.
 
+This quarantine refusal is a distinct protection from malware blocking, and it
+stands on its own. Turning malware blocking off (`--malware-block=false`)
+disables the OSV advisory byte gate — files a malware advisory names — but a
+project PyPI has quarantined is still refused. The two are separate guarantees;
+one switch does not silence the other.
+
 ## Provenance and immutability
 
 A filename, once uploaded, is never replaced (PyPI's own rule); pypiron rejects

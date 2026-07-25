@@ -511,6 +511,12 @@ pub struct RefreshCtx<'a> {
     pub storage: &'a dyn Storage,
     pub slot: &'a RwLock<Arc<AdvisoryState>>,
     pub metrics: &'a Metrics,
+    /// Other configured, currently-eligible buckets the leader-authored control
+    /// singletons (`FEED_KEY`, `QUARANTINED_KEY`) write through to and reseed
+    /// onto. Empty in single-bucket mode — that path is byte-for-byte unchanged.
+    /// Built by the worker from the live health view (see
+    /// [`crate::app::AppState::singleton_replicas`]).
+    pub replicas: &'a [crate::layout::ReplicaTarget<'a>],
 }
 
 /// Leader-only in-memory refresh memo, owned by the worker loop (never in shared
@@ -629,11 +635,18 @@ pub async fn refresh(
         debug!(error = %e, "advisory feed: quarantined reload failed; serving last set");
     }
 
-    // Arm the gauge only once a snapshot is actually loaded — an armed-but-unfed
-    // node has nothing to age.
-    let has_snapshot = AdvisoryState::read(ctx.slot).db.is_some();
+    // Arm the gauges only once a snapshot is actually loaded — an armed-but-unfed
+    // node has nothing to age. The read-liveness gauge tracks this cycle's
+    // success; the staleness gauge tracks the loaded feed's content watermark, so
+    // re-reading identical stale bytes lets the staleness alert age out.
+    let snap = AdvisoryState::read(ctx.slot);
+    let has_snapshot = snap.db.is_some();
     if refreshed_ok && has_snapshot {
         ctx.metrics.advisory_refresh_ok();
+    }
+    if let Some(watermark) = snap.db.as_ref().and_then(|db| db.watermark()) {
+        ctx.metrics
+            .advisory_content_modified(watermark.unix_timestamp());
     }
 
     // Armed but unfed: the feature is on but no snapshot is available yet. Warn
@@ -672,34 +685,83 @@ async fn poll_and_persist(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut RefreshMe
     // every-node reload then reads it back and retains the bytes as `zip`.
     let bytes = Arc::new(bytes);
     parse_off_thread(bytes.clone()).await?;
-    ctx.storage
-        .put_bytes(FEED_KEY, (*bytes).clone(), Some("application/zip"))
-        .await
-        .context("persisting advisory snapshot")?;
+    // Write-through to every healthy bucket: the selected bucket is authoritative
+    // (its etag drives this node's reload); peers get the snapshot best-effort so
+    // a failover to any of them stays armed. Single-bucket mode writes once.
+    crate::layout::write_singleton(
+        ctx.storage,
+        ctx.replicas,
+        FEED_KEY,
+        (*bytes).clone(),
+        Some("application/zip"),
+    )
+    .await
+    .context("persisting advisory snapshot")?;
     Ok(())
 }
 
-/// Leader-only: if the selected bucket is missing `FEED_KEY` but we hold a
-/// snapshot in memory, re-persist the retained bytes. Because `_advisories/` is
-/// never fanned out as truth, a failover to a never-seeded bucket would leave the
-/// zip nowhere reachable — running nodes stay armed on their in-memory copy, but a
-/// fresh node booting onto that bucket (feed maybe unreachable) would come up
-/// armed-but-unfed and serve malware. Re-seeding heals that as long as one armed
-/// node survives; the write is once per absence (the next tick sees the key
-/// present and the normal etag flow resumes). A full-fleet cold start onto a
-/// starved bucket with the feed unreachable is still operator-ferry territory.
+/// Leader-only: reseed the control singletons onto any configured bucket missing
+/// them, from a node that holds the data in memory. The two singletons
+/// (`FEED_KEY`, `QUARANTINED_KEY`) are leader-authored and — unlike package truth
+/// — never ride the `_repl/` fan-out, so a failover to a never-seeded bucket, or
+/// a fresh bucket added to the fleet, would leave them nowhere reachable: a node
+/// booting onto that bucket comes up armed-but-unfed (malware) or with an empty
+/// quarantine set. Re-seeding heals that as long as one node still holds the
+/// data; each write is once per absence (the next tick sees the key present).
+/// Both the selected bucket and every eligible peer are checked. A full-fleet
+/// cold start onto starved buckets with the feed unreachable is still
+/// operator-ferry territory.
 async fn reseed_if_absent(ctx: &RefreshCtx<'_>) -> Result<()> {
-    let Some(zip) = AdvisoryState::read(ctx.slot).zip.clone() else {
-        return Ok(()); // nothing retained to re-seed
-    };
-    if feed_storage_etag(ctx.storage).await?.is_some() {
-        return Ok(()); // the key is present on the selected bucket
+    let snap = AdvisoryState::read(ctx.slot);
+    if let Some(zip) = snap.zip.clone() {
+        reseed_key_if_absent(ctx, FEED_KEY, &zip, Some("application/zip")).await?;
     }
-    ctx.storage
-        .put_bytes(FEED_KEY, (*zip).clone(), Some("application/zip"))
-        .await
-        .context("re-seeding advisory snapshot onto a bucket missing it")?;
-    info!("advisory feed: re-seeded the snapshot onto a selected bucket that was missing it");
+    // Only reseed the quarantined set when this node actually holds a published
+    // one (a real etag): an unloaded/absent set has nothing authoritative to seed,
+    // and seeding `[]` would be indistinguishable from a real empty publish.
+    if snap.quarantined_etag.is_some() {
+        let bytes = serialize_quarantined_names(snap.quarantined.iter())?;
+        reseed_key_if_absent(ctx, QUARANTINED_KEY, &bytes, Some("application/json")).await?;
+    }
+    Ok(())
+}
+
+/// Reseed one control singleton onto the selected bucket and every eligible peer
+/// that is currently missing it. The selected-bucket write propagates its error
+/// (the caller logs at debug and retries next tick); peer writes are best-effort
+/// so one unreachable peer never blocks healing the others.
+async fn reseed_key_if_absent(
+    ctx: &RefreshCtx<'_>,
+    key: &str,
+    bytes: &[u8],
+    content_type: Option<&str>,
+) -> Result<()> {
+    if key_storage_etag(ctx.storage, key).await?.is_none() {
+        ctx.storage
+            .put_bytes(key, bytes.to_vec(), content_type)
+            .await
+            .with_context(|| format!("re-seeding {key} onto the selected bucket"))?;
+        info!(key, "advisory feed: re-seeded a control singleton onto the selected bucket that was missing it");
+    }
+    for replica in ctx.replicas {
+        match key_storage_etag(replica.storage, key).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = replica
+                    .storage
+                    .put_bytes(key, bytes.to_vec(), content_type)
+                    .await
+                {
+                    warn!(bucket = %replica.name, key, error = ?error, "re-seeding a control singleton onto a peer failed; will retry");
+                } else {
+                    info!(bucket = %replica.name, key, "advisory feed: re-seeded a control singleton onto a peer bucket missing it");
+                }
+            }
+            Err(error) => {
+                warn!(bucket = %replica.name, key, error = ?error, "re-seed absence check on a peer failed; will retry")
+            }
+        }
+    }
     Ok(())
 }
 
@@ -747,26 +809,47 @@ fn parse_quarantined(bytes: &[u8]) -> Result<HashSet<String>> {
     Ok(names.into_iter().collect())
 }
 
+/// Serialize a quarantined-set to the persisted JSON shape (a sorted string
+/// array), so an unchanged set serializes byte-identically regardless of the
+/// iteration order of its in-memory `HashSet`. Shared by the leader publish and
+/// the reseed backstop.
+fn serialize_quarantined_names<'a>(names: impl Iterator<Item = &'a String>) -> Result<Vec<u8>> {
+    let mut sorted: Vec<&String> = names.collect();
+    sorted.sort();
+    serde_json::to_vec(&sorted).context("serializing quarantined set")
+}
+
 /// Every-node half for the quarantined set: reload it when `QUARANTINED_KEY`'s
-/// storage etag moves, exactly like the zip. An absent key is an empty set (the
-/// leader has published nothing, or a dequarantine emptied it — the leader writes
-/// `[]`, never deletes, so followers still see the etag move). A garbage body
-/// warns and keeps the previous set: a corrupt read must never un-quarantine.
-/// The db is carried forward under the lock (see [`reload`]).
+/// storage etag moves, exactly like the zip. A dequarantine is a real publish of
+/// `[]` (the leader writes it, never deletes), so followers see the etag move and
+/// adopt the empty set. But an *absent* key — a failover to a bucket that was
+/// never seeded, or one that lost the singleton — is NOT a dequarantine: retain
+/// the previously loaded set (fail-closed) and warn, exactly as the corrupt-body
+/// branch already does. A reseed heals the missing key; until then the byte gate
+/// keeps refusing quarantined bytes instead of clearing on failover. The db is
+/// carried forward under the lock (see [`reload`]).
 async fn reload_quarantined(ctx: &RefreshCtx<'_>) -> Result<()> {
     let etag = quarantined_storage_etag(ctx.storage).await?;
-    if etag == AdvisoryState::read(ctx.slot).quarantined_etag {
+    let loaded_etag = AdvisoryState::read(ctx.slot).quarantined_etag.clone();
+    if etag == loaded_etag {
         return Ok(()); // unchanged (same etag, or still-absent None == None)
     }
-    let quarantined = match &etag {
-        None => HashSet::new(),
-        Some(_) => match parse_quarantined(&ctx.storage.get_bytes(QUARANTINED_KEY).await?) {
-            Ok(set) => set,
-            Err(e) => {
-                warn!(error = %e, "advisory feed: quarantined set did not parse; keeping previous");
-                return Ok(());
-            }
-        },
+    let Some(_) = &etag else {
+        // The key vanished on the selected bucket. Distinguish this from a
+        // present-but-empty publish (which carries an etag): retain the set we
+        // last loaded rather than swap in an empty one that would un-block
+        // quarantined downloads on failover.
+        if loaded_etag.is_some() {
+            warn!("advisory feed: quarantined set absent on the selected bucket; retaining the previously loaded set (reseed will heal)");
+        }
+        return Ok(());
+    };
+    let quarantined = match parse_quarantined(&ctx.storage.get_bytes(QUARANTINED_KEY).await?) {
+        Ok(set) => set,
+        Err(e) => {
+            warn!(error = %e, "advisory feed: quarantined set did not parse; keeping previous");
+            return Ok(());
+        }
     };
     swap_quarantined(ctx.slot, quarantined, etag);
     Ok(())
@@ -797,6 +880,7 @@ fn swap_quarantined(
 /// a *complete* sweep — a partial set would flap dequarantines.
 pub async fn publish_quarantined(
     storage: &dyn Storage,
+    replicas: &[crate::layout::ReplicaTarget<'_>],
     slot: &RwLock<Arc<AdvisoryState>>,
     set: std::collections::BTreeSet<String>,
 ) -> Result<()> {
@@ -806,14 +890,19 @@ pub async fn publish_quarantined(
     if unchanged {
         return Ok(());
     }
-    // BTreeSet iterates sorted, so the persisted array is stable — an unchanged
-    // set never rewrites the key and stampedes followers into a reload.
-    let names: Vec<&String> = set.iter().collect();
-    let bytes = serde_json::to_vec(&names).context("serializing quarantined set")?;
-    storage
-        .put_bytes(QUARANTINED_KEY, bytes, Some("application/json"))
-        .await
-        .context("persisting quarantined set")?;
+    // A sorted array — an unchanged set serializes byte-identically and never
+    // rewrites the key to stampede followers into a reload. Written write-through
+    // to every healthy bucket so the byte gate stays armed after a failover.
+    let bytes = serialize_quarantined_names(set.iter())?;
+    crate::layout::write_singleton(
+        storage,
+        replicas,
+        QUARANTINED_KEY,
+        bytes,
+        Some("application/json"),
+    )
+    .await
+    .context("persisting quarantined set")?;
     // Adopt the just-written etag so this node's own reload poll no-ops.
     let etag = quarantined_storage_etag(storage).await.unwrap_or(None);
     swap_quarantined(slot, set.into_iter().collect(), etag);

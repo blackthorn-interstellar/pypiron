@@ -766,11 +766,14 @@ pub async fn run_worker_until(
                 tokio::spawn(async move {
                     let _guard = guard;
                     let mut memo = memo.lock().await;
+                    // Peers the leader-authored control singletons replicate onto.
+                    let replicas = job_state.singleton_replicas(pinned.index);
                     crate::advisories::refresh(
                         crate::advisories::RefreshCtx {
                             storage: pinned.storage.as_ref(),
                             slot: &job_state.advisories,
                             metrics: &job_state.metrics,
+                            replicas: &replicas,
                         },
                         job_state.advisory_feed.as_deref(),
                         leader,
@@ -801,6 +804,9 @@ pub async fn run_worker_until(
                                 storage: pinned.storage.as_ref(),
                                 slot: &job_state.advisories,
                                 metrics: &job_state.metrics,
+                                // The probe only mutates the in-memory overlay; it
+                                // writes no control singleton, so it needs no peers.
+                                replicas: &[],
                             },
                             &feed,
                             &mut memo,
@@ -989,7 +995,7 @@ pub async fn run_worker_until(
 /// package → hash of the (key, size, etag) listing its views were built
 /// from. They are views of views — regenerable, never trusted over truth. A
 /// lost shard merely means its packages rebuild once.
-const STATE_PREFIX: &str = "_state/";
+pub(crate) const STATE_PREFIX: &str = "_state/";
 
 /// How often each node refreshes its in-memory inventory from the persisted
 /// view. Followers never rebuild, so this is how the leader's value reaches
@@ -1157,21 +1163,22 @@ pub async fn audit(
     if failures > 0 {
         return Err(anyhow!("audit finished with {failures} failure(s)"));
     }
-    // The fleet-wide quarantined set derived this sweep (empty unless blocking is
-    // armed — the status reads that populate it are gated on `malware_block`).
-    // Shared by the byte-gate publish below and the report's `blocked` flag.
+    // The fleet-wide quarantined set derived this sweep. Shared by the byte-gate
+    // publish below and the report's `blocked` flag.
     let quarantined_set: HashSet<String> = quarantined_names.iter().cloned().collect();
-    // A clean full cycle: publish the quarantined set for the byte gate. Only
-    // when blocking is armed (the gate is the sole consumer) so a blocking-off
-    // server never writes `_advisories/`. Persists on change only, and swaps the
-    // leader's own in-memory set immediately (see `advisories::publish_quarantined`).
-    if state.malware_block {
-        let set: std::collections::BTreeSet<String> = quarantined_names.into_iter().collect();
-        if let Err(e) =
-            crate::advisories::publish_quarantined(storage, &state.advisories, set).await
-        {
-            warn!(error=?e, "audit: publishing quarantined set failed; serving last set");
-        }
+    // A clean full cycle: publish the quarantined set for the byte gate,
+    // independent of `--malware-block` — PEP 792 quarantine refusal is a separate
+    // guarantee from OSV blocking (a compromised project PyPI froze stays refused
+    // even with malware blocking off). `publish_quarantined` persists on change
+    // only, so an empty set (no quarantined project) writes nothing; a non-empty
+    // one is written write-through to every healthy bucket and swaps this leader's
+    // own in-memory set immediately.
+    let set: std::collections::BTreeSet<String> = quarantined_names.into_iter().collect();
+    let replicas = state.singleton_replicas(pinned.index);
+    if let Err(e) =
+        crate::advisories::publish_quarantined(storage, &replicas, &state.advisories, set).await
+    {
+        warn!(error=?e, "audit: publishing quarantined set failed; serving last set");
     }
     // Materialize the org audit report: the walked inventory joined with the audit
     // index and 30-day counters. Leader-only by construction (the audit runs under
@@ -1427,8 +1434,10 @@ async fn audit_shard(
     };
     let mut fresh: std::collections::HashMap<String, String> = Default::default();
     // Packages whose listing shows the PEP 792 sidecar: the rare set that pays a
-    // status read below to derive the quarantined set. Only collected when the
-    // byte gate would consult it, so a blocking-off server does zero extra work.
+    // status read below to derive the quarantined set. Collected independent of
+    // `--malware-block` — quarantine refusal is a separate guarantee from OSV
+    // blocking — but only for projects that actually carry a status marker, so a
+    // deployment with none does zero extra work.
     let mut status_pkgs: Vec<String> = Vec::new();
     let mut packages: Vec<PackageAudit> = Vec::with_capacity(by_pkg.len());
     for (pkg, (t, v)) in by_pkg {
@@ -1440,7 +1449,7 @@ async fn audit_shard(
             .iter()
             .filter_map(|obj| obj.key.strip_prefix(&prefix))
             .collect();
-        if state.malware_block && members.contains(PROJECT_STATUS_FILE) {
+        if members.contains(PROJECT_STATUS_FILE) {
             status_pkgs.push(pkg.clone());
         }
         let mut versions: HashSet<String> = HashSet::new();

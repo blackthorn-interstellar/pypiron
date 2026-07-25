@@ -1659,7 +1659,7 @@ const READ_CHUNK: usize = 8 * 1024 * 1024;
 
 /// Staging keys live here; large uploads land under this prefix and are then
 /// published (copy-if-not-exists) to their final key. Always cleaned up.
-const STAGING_PREFIX: &str = "_staging/";
+pub(crate) const STAGING_PREFIX: &str = "_staging/";
 
 /// Packs object_store's (e_tag, version) pair into one opaque token. Stores use
 /// differing combinations to express a conditional update (S3/Azure: ETag; GCS:

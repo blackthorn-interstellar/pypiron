@@ -110,11 +110,19 @@ def canonical_records() -> dict:
     }
 
 
+# Every real OSV record carries a `modified` timestamp; the snapshot-staleness
+# gauge reads the newest one as the feed's content watermark. Stamp any fixture
+# record that omits it so the gauge arms (a fixed past instant keeps the content
+# age large and monotonically rising with wall time).
+_DEFAULT_MODIFIED = "2024-01-01T00:00:00Z"
+
+
 def make_osv_zip(path: Path, records: dict) -> Path:
     """Write `{id: advisory-dict}` as flat `<id>.json` members — the shape of the
     OSV PyPI export, small enough to seed a hermetic test (no network)."""
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
         for adv_id, record in records.items():
+            record = {"modified": _DEFAULT_MODIFIED, **record}
             zf.writestr(f"{adv_id}.json", json.dumps(record))
     return path
 
@@ -354,11 +362,11 @@ def test_default_disk_server_stays_advisory_hermetic(disk_server):
 
 
 def test_leader_reseeds_snapshot_deleted_from_under_it(tmp_path_factory, pypiron_bin, tmp_path):
-    """`_advisories/` is not replicated, so a failover to a never-seeded bucket
-    would leave the snapshot nowhere reachable and boot a fresh node unfed. The
-    leader re-seeds the bytes it retains in memory when FEED_KEY is absent on its
-    selected bucket. Single-bucket disk exercises the same path: delete the zip out
-    from under an armed server and it reappears byte-identical."""
+    """The advisory snapshot is a leader-authored control singleton: multi-bucket,
+    it write-throughs to every bucket, but a bucket can still lose it. The leader
+    re-seeds the bytes it retains in memory when FEED_KEY is absent on its selected
+    bucket. Single-bucket disk exercises the same path: delete the zip out from
+    under an armed server and it reappears byte-identical."""
     feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
     seeded = feed.read_bytes()
     with advisory_server(
@@ -705,6 +713,53 @@ def test_ac5_quarantine_reaches_the_byte_gate_after_sweep(tmp_path_factory, pypi
         assert _poll_http_status(file_url, {200, 302}), (
             "dequarantine never reached the byte gate within the bound"
         )
+
+
+def test_quarantine_enforced_when_malware_block_is_off(tmp_path_factory, pypiron_bin, tmp_path):
+    """`--malware-block=false` disables OSV MAL-* byte blocking but NOT PEP 792
+    quarantine refusal — the two are independent guarantees. A MAL-flagged mirror
+    file serves (malware blocking is off), yet a quarantined project's file is
+    still 403'd once the sweep derives the set. Regression for gap 5: one knob no
+    longer silently disables the other."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    with advisory_server(
+        tmp_path_factory,
+        pypiron_bin,
+        feed,
+        extra_args=["--malware-block", "false", "--reconcile-interval-secs", "2"],
+    ) as server:
+        base = server["base_url"]
+        admin = {"username": server["admin_user"], "password": server["admin_password"]}
+
+        # A MAL-flagged mirror file: with malware blocking off it must serve, and
+        # its listing is not scrubbed either (scrub is OSV blocking, also off).
+        mal = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+        _mirror_upload(server, mal)
+        wait_for_file_in_index(server["simple"], MAL_EXACT_PKG, mal.name)
+        mal_url = f"{base}/files/{MAL_EXACT_PKG}/{mal.name}"
+        assert _poll_http_status(mal_url, {200, 302}), (
+            "a MAL file must serve when --malware-block=false"
+        )
+
+        # A separate non-MAL project, refused purely by relayed PEP 792 quarantine.
+        pkg = "frozenmate"
+        wheel = make_wheel(pkg, "1.0.0", tmp_path)
+        _mirror_upload(server, wheel)
+        wait_for_file_in_index(server["simple"], pkg, wheel.name)
+        file_url = f"{base}/files/{pkg}/{wheel.name}"
+        assert _poll_http_status(file_url, {200, 302}), "clean mirror file was not served"
+
+        code, _, _ = http_request_auth(
+            "POST", f"{base}/project/{pkg}/status", data=b'{"status":"quarantined"}', **admin
+        )
+        assert code == 200, code
+
+        blocked = _poll_http_status(file_url, {403})
+        assert blocked is not None, "quarantine not enforced with --malware-block=false"
+        assert b"quarantined" in blocked[1], blocked
+
+        # The MAL file still serves throughout — malware blocking stayed off.
+        assert _poll_http_status(mal_url, {200, 302}), "the MAL file must still serve"
 
 
 # ------------------------------ sync relay (rung 6) --------------------------

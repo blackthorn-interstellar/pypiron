@@ -956,17 +956,20 @@ async fn advisory_byte_gate(
     pkg: &str,
     artifact_filename: &str,
 ) -> Option<Response<Body>> {
-    if !state.malware_block {
-        return None;
-    }
     let snap = state.advisory_snapshot();
-    if !snap.has_block_data() && snap.quarantined.is_empty() {
-        return None; // armed but unfed: nothing to block yet
-    }
-    let version = infer_version_from_filename(artifact_filename);
-    // Baseline block set ∪ the per-node probe overlay.
-    let ids: Vec<String> = snap.blocking(pkg, version.as_deref());
+    // Two independent protections share this chokepoint:
+    //   * PEP 792 quarantine — a project whose upstream status blocks downloads.
+    //     Enforced whenever a quarantine set is loaded, INDEPENDENT of the malware
+    //     toggle: `--malware-block=false` disables OSV blocking, not quarantine.
+    //   * OSV MAL-* advisory blocking — gated by `--malware-block`.
     let quarantined = snap.quarantined.contains(pkg);
+    let version = infer_version_from_filename(artifact_filename);
+    let ids: Vec<String> = if state.malware_block {
+        // Baseline block set ∪ the per-node probe overlay.
+        snap.blocking(pkg, version.as_deref())
+    } else {
+        Vec::new()
+    };
     if ids.is_empty() && !quarantined {
         return None; // the common path: no origin read, no I/O
     }

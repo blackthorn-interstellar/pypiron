@@ -492,15 +492,18 @@ _sync/cursors.json                       # mirror-over-HTTP sync memo: pkg -> la
                                          #   sync re-fetches. Served by admin GET/PUT /sync/cursors.
 _advisories/osv-pypi.zip                 # the OSV PyPI advisory export, carried VERBATIM (like
                                          #   .provenance): powers the malware block set + org audit.
-                                         #   A CARRIED cache — delete it and the leader refetches
-                                         #   (or a sync/ferry re-delivers). Never truth, never a
-                                         #   view, NEVER fanned out as truth across buckets, so a
-                                         #   failover never disarms blocking. Reader GET / admin PUT
+                                         #   A leader-authored control SINGLETON: written write-through
+                                         #   to every healthy bucket on each publish and reseed-if-absent
+                                         #   healed, so a failover to any bucket stays armed. Delete it
+                                         #   and the leader refetches (or a sync/ferry re-delivers).
+                                         #   Never per-package truth. Reader GET / admin PUT
                                          #   /advisories/feed.
 _advisories/quarantined.json             # worker-derived set: normalized names whose relayed PEP 792
                                          #   status is `quarantined`, so the byte gate refuses their
-                                         #   mirror-origin files by a hash probe. Republished only on
-                                         #   a clean sweep; reloaded on the same etag tick as the zip.
+                                         #   mirror-origin files by a hash probe. A control SINGLETON,
+                                         #   replicated like the zip. Republished only on a clean sweep;
+                                         #   reloaded on the same etag tick as the zip. An ABSENT key on
+                                         #   failover retains the last set (never un-quarantines).
 _advisories/report.json                  # the org audit: hosted (name, version) rows a known advisory
                                          #   affects, joined with 30-day counters, ranked by installs.
                                          #   Served admin-gated at /audit + /audit.json. Both this and
@@ -543,6 +546,22 @@ _staging/<ts>-<pid>-<filename>           # cloud only: a >64 MB upload streams h
                                          #   mid-publish may orphan one — harmless, like a leftover
                                          #   .tmp on disk.
 ```
+
+**Replication class (multi-bucket).** Every top-level prefix is classified in one
+registry — `src/layout.rs`, enforced by a unit test so a new prefix without a
+declared class fails CI. Four classes:
+
+| Prefix | Class | Replicates? |
+| --- | --- | --- |
+| `packages/` | truth-replicated | yes — three-tier fan-out → `_repl/` notes → reconcile; any bucket serves the whole corpus |
+| `_advisories/osv-pypi.zip`, `_advisories/quarantined.json` | singleton-replicated | yes — leader-authored control files written write-through to every healthy bucket + reseed-if-absent |
+| `simple/`, `_advisories/report.json`, `_state/`, `_sync/cursors.json`, `_counters/`, `_quarantine/`, `_transparency/chain/` | derived-per-bucket | no — each bucket rebuilds/re-derives its own from the truth it holds |
+| `_leader/lease.json`, `_repl/`, `_topology/stamp.json`, `_staging/`, `_dirty/` | coordination-per-bucket | no — bucket-local by design; replicating it would be wrong |
+
+The transparency chain sits in derived-per-bucket because it is bucket-local
+today (each bucket carries its own genesis); making `verify-chain` bucket-aware
+is a separate, tracked design task. Counters are a flagged judgment call —
+per-node segments aggregated locally, with cross-bucket aggregation still pending.
 
 `<pkg>` is always the PEP 503 normalized name. Index rebuilds include only
 artifact files — metadata companions, tombstones, freeze markers, and dotfiles

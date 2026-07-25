@@ -135,8 +135,8 @@ pub const MANIFEST: &[PrefixClass] = &[
     },
     PrefixClass {
         prefix: crate::transparency::CHAIN_PREFIX,
-        class: Class::DerivedPerBucket,
-        why: "per-bucket tamper-evidence checkpoint chain; today bucket-local (gap 9 revisits cross-bucket verify)",
+        class: Class::SingletonReplicated,
+        why: "tamper-evidence checkpoint chain: immutable leader-authored links written through to every bucket so a failover continues the chain, not a fresh genesis",
     },
 ];
 

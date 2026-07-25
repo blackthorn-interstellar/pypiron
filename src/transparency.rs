@@ -25,19 +25,29 @@
 //! check could not run. A chain that lags truth (files in storage not yet
 //! committed) is fine — verify never faults uncommitted files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::app::PACKAGES_PREFIX;
 use crate::hash::sha256_hex;
 use crate::sidecar::{Sidecar, SIDECAR_SUFFIX, TOMBSTONE_SUFFIX};
 use crate::storage::{is_not_found, Storage, StorageArgs};
 
-/// Namespace for the chain. `replicate.rs` only ever touches `packages/`, so the
-/// chain is excluded from replication for free — no exclusion code needed.
+/// Namespace for the chain. Classified [`SingletonReplicated`] in the storage
+/// layout manifest (`crate::layout`): each immutable, leader-authored link is
+/// written through to every healthy bucket after the audit commits it (see
+/// [`reseed_chain_to_peers`]), so a failover leader reads the latest seq from its
+/// own bucket and *continues* the chain instead of restarting at a fresh genesis
+/// that would launder the tamper history. The truth fan-out (`replicate.rs`) only
+/// touches `packages/`; the chain rides this dedicated create-if-absent
+/// write-through instead — links are immutable per seq, so a peer that already
+/// holds a seq is never overwritten.
+///
+/// [`SingletonReplicated`]: crate::layout::Class::SingletonReplicated
 pub(crate) const CHAIN_PREFIX: &str = "_transparency/chain/";
 
 /// Fixed-width zero-padded seq so a lexicographic listing is numeric order.
@@ -94,6 +104,78 @@ pub async fn read_head(storage: &dyn Storage) -> Result<Option<(u64, Vec<u8>)>> 
     };
     let bytes = storage.get_bytes(&chain_key(max)).await?;
     Ok(Some((max, bytes)))
+}
+
+/// Mirror the primary's current chain head to every healthy peer that lags it,
+/// so a failover to any bucket continues this chain rather than starting a fresh
+/// genesis that would launder tamper history. Each immutable link is written
+/// create-if-absent (`put_if_none_match`): a peer already holding a seq is left
+/// untouched, and a peer holding a *divergent* seq (a forked chain) is never
+/// overwritten — `verify-chain` adjudicates that divergence rather than laundering
+/// it here.
+///
+/// This is both the write-through (the leader just appended a link) and the
+/// backstop (a peer that missed writes, or a freshly added bucket, is backfilled).
+/// It runs every audit regardless of churn, so an idle fleet still converges.
+/// Best-effort and a no-op in single-bucket mode (empty `replicas`) or on an empty
+/// chain.
+pub async fn reseed_chain_to_peers(
+    primary: &dyn Storage,
+    replicas: &[crate::layout::ReplicaTarget<'_>],
+) {
+    if replicas.is_empty() {
+        return;
+    }
+    let (seq, bytes) = match read_head(primary).await {
+        Ok(Some(head)) => head,
+        Ok(None) => return, // no chain yet — nothing to mirror
+        Err(e) => {
+            warn!(error = ?e, "transparency: reading chain head for peer reseed failed; retries next audit");
+            return;
+        }
+    };
+    for replica in replicas {
+        if let Err(e) = catch_up_replica(primary, replica, seq, &bytes).await {
+            warn!(
+                bucket = %replica.name,
+                seq,
+                error = ?e,
+                "transparency: chain reseed to a peer failed; retries next audit"
+            );
+        }
+    }
+}
+
+/// Copy every chain link a single peer is missing, from its head up to `seq`
+/// (whose bytes are `head_bytes`), oldest first so the peer's chain stays a
+/// gapless prefix. A peer already current with (or ahead of) `seq` is a no-op;
+/// an empty peer (a freshly added bucket) is seeded the whole chain.
+async fn catch_up_replica(
+    primary: &dyn Storage,
+    replica: &crate::layout::ReplicaTarget<'_>,
+    seq: u64,
+    head_bytes: &[u8],
+) -> Result<()> {
+    let start = match read_head(replica.storage).await? {
+        // Current or ahead: a longer/equal peer chain is either identical (done)
+        // or a divergence for verify-chain to catch — never overwrite it.
+        Some((peer_head, _)) if peer_head >= seq => return Ok(()),
+        Some((peer_head, _)) => peer_head + 1,
+        None => 0,
+    };
+    for s in start..=seq {
+        let bytes = if s == seq {
+            head_bytes.to_vec()
+        } else {
+            primary.get_bytes(&chain_key(s)).await?
+        };
+        replica
+            .storage
+            .put_if_none_match(&chain_key(s), bytes)
+            .await
+            .with_context(|| format!("writing chain link {s} to peer {}", replica.name))?;
+    }
+    Ok(())
 }
 
 /// Apply deltas in order to reconstruct the expected `(package → file→sha)`
@@ -169,14 +251,24 @@ pub struct VerifyChainArgs {
     pub storage: StorageArgs,
 }
 
-/// Run the read-only chain verification. `Ok(true)` = chain valid and storage
-/// matches, `Ok(false)` = a violation (rows + summary already on stdout), `Err`
-/// = the check could not run. The caller maps these to exit 0 / 1 / 2.
-pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
-    let storage = args.storage.build().await?;
+/// One bucket's loaded chain, for the cross-bucket verification.
+struct BucketChain<'a> {
+    name: &'a str,
+    storage: &'a dyn Storage,
+    /// Links sorted ascending by seq: `(seq, on-disk bytes, parsed link)`.
+    links: Vec<(u64, Vec<u8>, ChainLink)>,
+}
 
-    // 1. Load every link, sorted by seq. A key that does not parse as a seq is
-    // not a chain link and is dropped in the same pass.
+impl BucketChain<'_> {
+    /// The highest committed seq, or `None` for an empty chain.
+    fn head(&self) -> Option<u64> {
+        self.links.last().map(|(s, _, _)| *s)
+    }
+}
+
+/// Load one bucket's chain, sorted by seq. A key that does not parse as a seq is
+/// not a chain link and is dropped in the same pass.
+async fn load_chain(storage: &dyn Storage) -> Result<Vec<(u64, Vec<u8>, ChainLink)>> {
     let mut entries: Vec<(u64, String)> = storage
         .list_all(CHAIN_PREFIX)
         .await?
@@ -184,38 +276,22 @@ pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
         .filter_map(|o| seq_from_key(&o.key).map(|seq| (seq, o.key)))
         .collect();
     entries.sort_by_key(|(seq, _)| *seq);
-    if entries.is_empty() {
-        println!("no chain");
-        return Ok(true);
-    }
-    let mut links: Vec<(u64, Vec<u8>, ChainLink)> = Vec::with_capacity(entries.len());
+    let mut links = Vec::with_capacity(entries.len());
     for (seq, key) in &entries {
         let bytes = storage.get_bytes(key).await?;
         let link: ChainLink =
             serde_json::from_slice(&bytes).with_context(|| format!("parsing chain link {key}"))?;
         links.push((*seq, bytes, link));
     }
+    Ok(links)
+}
 
-    // 2. Chain integrity. A broken chain makes replay meaningless, so report and
-    // stop before the storage diff.
-    let integrity = check_integrity(&links);
-    if !integrity.is_empty() {
-        for v in &integrity {
-            println!("{}\t{}\t{}", v.kind, v.package, v.detail);
-        }
-        println!(
-            "verify-chain: {} link(s), chain integrity broken ({} violation(s))",
-            links.len(),
-            integrity.len()
-        );
-        return Ok(false);
-    }
-
-    // 3. Warn (not fault) on an in-place sha change of an already-committed
-    // filename across the chain — legitimate only for the rare mirror→private
-    // demotion. A running replay-so-far gives the "already committed" view.
+/// Warn (not fault) on an in-place sha change of an already-committed filename
+/// across a chain — legitimate only for the rare mirror→private demotion. A
+/// running replay-so-far gives the "already committed" view.
+fn warn_in_chain_sha_changes(links: &[(u64, Vec<u8>, ChainLink)]) {
     let mut so_far: Delta = BTreeMap::new();
-    for (_, _, link) in &links {
+    for (_, _, link) in links {
         for (pkg, files) in &link.packages {
             if let Some(prev) = so_far.get(pkg) {
                 for (filename, sha) in files {
@@ -235,48 +311,195 @@ pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
             }
         }
     }
+}
 
-    // Expected state is the full replay of the (now-verified) chain.
-    let expected = replay(links.iter().map(|(_, _, link)| link));
+/// Run the read-only chain verification across every configured bucket. `Ok(true)`
+/// = every bucket's chain is valid and its storage matches, `Ok(false)` = a
+/// violation (rows + summary already on stdout), `Err` = the check could not run.
+/// The caller maps these to exit 0 / 1 / 2.
+///
+/// Multi-bucket semantics: (a) each bucket's chain must hash-link internally;
+/// (b) every bucket's chain must be a prefix of the longest valid chain — a
+/// shorter one is merely *lagging* (reported, not a fault), a divergent or
+/// restarted one is a violation; (c) the longest valid chain is replayed and its
+/// expected `(package, filename, sha256)` state is diffed against **each**
+/// bucket's sidecars, so a tamper on any single bucket is caught. The walk is
+/// metadata-only — chain links plus sidecar reads, never artifact bytes.
+pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
+    let storages = args.storage.build_all().await?;
+    let names = args.storage.bucket_names();
 
-    // 4. Diff the expected state against storage, batched like verify-index.
-    let checks: Vec<(&String, &String, &String)> = expected
-        .iter()
-        .flat_map(|(pkg, files)| files.iter().map(move |(f, sha)| (pkg, f, sha)))
-        .collect();
-    let mut violations: Vec<Violation> = Vec::new();
-    for chunk in checks.chunks(DIFF_CONCURRENCY) {
-        let diffs = chunk
-            .iter()
-            .map(|(pkg, filename, sha)| diff_one(storage.as_ref(), pkg, filename, sha));
-        for result in futures::future::join_all(diffs).await {
-            if let Some(v) = result? {
-                violations.push(v);
+    // Load every bucket's chain. A storage error is could-not-run (exit 2): a
+    // bucket we cannot read cannot be verified, and a silent skip could hide a
+    // tamper.
+    let mut chains: Vec<BucketChain> = Vec::with_capacity(storages.len());
+    for (storage, name) in storages.iter().zip(names.iter()) {
+        let links = load_chain(storage.as_ref())
+            .await
+            .with_context(|| format!("loading chain from bucket {name}"))?;
+        chains.push(BucketChain {
+            name,
+            storage: storage.as_ref(),
+            links,
+        });
+    }
+
+    // Bucket-tagged violations (exit 1) and lagging reports (informational).
+    let mut violations: Vec<(String, Violation)> = Vec::new();
+
+    // 1. Per-bucket integrity. A broken chain can neither be the reference nor be
+    // prefix-checked, so exclude it from reference selection; its rows still
+    // report and fault.
+    let mut integrity_broken: HashSet<usize> = HashSet::new();
+    for (i, chain) in chains.iter().enumerate() {
+        let iv = check_integrity(&chain.links);
+        if !iv.is_empty() {
+            integrity_broken.insert(i);
+            for v in iv {
+                violations.push((chain.name.to_string(), v));
             }
         }
     }
 
-    for v in &violations {
-        println!("{}\t{}\t{}", v.kind, v.package, v.detail);
+    // 2. Reference = the longest integrity-clean, non-empty chain. A tie keeps the
+    // first in bucket order; a same-length divergent peer then fails the prefix
+    // check in step 3.
+    let reference = chains
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| !integrity_broken.contains(i) && !c.links.is_empty())
+        .max_by_key(|(_, c)| c.head().unwrap_or(0))
+        .map(|(i, _)| i);
+
+    let Some(ref_idx) = reference else {
+        // No usable reference: either every bucket is empty (no chain anywhere)
+        // or every present chain is integrity-broken.
+        if violations.is_empty() {
+            println!("no chain");
+            return Ok(true);
+        }
+        print_violations(&violations);
+        println!(
+            "verify-chain: {} bucket(s), no valid chain to replay ({} violation(s))",
+            chains.len(),
+            violations.len()
+        );
+        return Ok(false);
+    };
+
+    let ref_chain = &chains[ref_idx];
+    let ref_head = ref_chain.head().unwrap_or(0);
+    // seq → sha of the reference links, for the prefix comparison.
+    let ref_shas: BTreeMap<u64, String> = ref_chain
+        .links
+        .iter()
+        .map(|(s, b, _)| (*s, sha256_hex(b)))
+        .collect();
+
+    // 3. Cross-bucket prefix check. Each other integrity-clean chain must match
+    // the reference on every seq it holds. A mismatch is a divergence (a restarted
+    // or tampered chain) → violation; a clean but shorter chain is lagging →
+    // reported, not a fault.
+    let mut lagging: Vec<(String, Option<u64>)> = Vec::new();
+    for (i, chain) in chains.iter().enumerate() {
+        if i == ref_idx || integrity_broken.contains(&i) {
+            continue;
+        }
+        let mut diverged = false;
+        for (s, b, _) in &chain.links {
+            let matches = ref_shas.get(s).is_some_and(|rs| rs == &sha256_hex(b));
+            if !matches {
+                diverged = true;
+                violations.push((
+                    chain.name.to_string(),
+                    Violation {
+                        kind: "chain-diverged",
+                        package: String::new(),
+                        detail: format!(
+                            "link seq {s} differs from the longest chain (bucket {}); \
+                             a restarted or tampered chain, not a prefix",
+                            ref_chain.name
+                        ),
+                    },
+                ));
+            }
+        }
+        if !diverged && chain.head() != Some(ref_head) {
+            lagging.push((chain.name.to_string(), chain.head()));
+        }
     }
+
+    // 4. Warn on a legitimate-looking in-place sha change across the reference.
+    warn_in_chain_sha_changes(&ref_chain.links);
+
+    // 5. Replay the reference and diff its expected state against every bucket's
+    // sidecars. A bucket current with the reference faults on a vanished
+    // commitment; a lagging bucket may simply not have replicated that truth yet,
+    // so there a *missing* sidecar is not a fault — but a present-but-wrong sha
+    // still is, since that is a tamper regardless of chain lag.
+    let expected = replay(ref_chain.links.iter().map(|(_, _, l)| l));
+    let checks: Vec<(&String, &String, &String)> = expected
+        .iter()
+        .flat_map(|(pkg, files)| files.iter().map(move |(f, sha)| (pkg, f, sha)))
+        .collect();
+    let lagging_names: HashSet<&str> = lagging.iter().map(|(n, _)| n.as_str()).collect();
+    for chain in &chains {
+        let fault_on_vanish = !lagging_names.contains(chain.name);
+        for chunk in checks.chunks(DIFF_CONCURRENCY) {
+            let diffs = chunk.iter().map(|(pkg, filename, sha)| {
+                diff_one(chain.storage, pkg, filename, sha, fault_on_vanish)
+            });
+            for result in futures::future::join_all(diffs).await {
+                if let Some(v) = result? {
+                    violations.push((chain.name.to_string(), v));
+                }
+            }
+        }
+    }
+
+    for (name, head) in &lagging {
+        match head {
+            Some(h) => println!(
+                "chain-lagging\t{name}\thead seq {h} of {ref_head} — a prefix of the longest chain (OK)"
+            ),
+            None => println!(
+                "chain-lagging\t{name}\tno chain yet; longest is seq {ref_head} (OK)"
+            ),
+        }
+    }
+    print_violations(&violations);
     println!(
-        "verify-chain: {} link(s), {} committed file(s), {} violation(s)",
-        links.len(),
+        "verify-chain: {} bucket(s), reference bucket {} ({} link(s), {} committed file(s)), \
+         {} lagging, {} violation(s)",
+        chains.len(),
+        ref_chain.name,
+        ref_chain.links.len(),
         checks.len(),
+        lagging.len(),
         violations.len()
     );
     Ok(violations.is_empty())
 }
 
+/// Print bucket-tagged violation rows as `bucket\tkind\tpackage\tdetail`.
+fn print_violations(violations: &[(String, Violation)]) {
+    for (bucket, v) in violations {
+        println!("{bucket}\t{}\t{}\t{}", v.kind, v.package, v.detail);
+    }
+}
+
 /// Diff one committed `(package, filename, sha)` against storage. The sidecar is
 /// the sha of record: present-but-different is a tamper; gone-with-no-tombstone
 /// is a vanish; gone-with-tombstone is a legitimate delete the chain hasn't
-/// caught up to yet.
+/// caught up to yet. When `fault_on_vanish` is false (a bucket whose chain lags
+/// the reference), an absent sidecar is treated as un-replicated truth rather
+/// than a vanish — but a present, contradicting sha is still a tamper.
 async fn diff_one(
     storage: &dyn Storage,
     pkg: &str,
     filename: &str,
     expected_sha: &str,
+    fault_on_vanish: bool,
 ) -> Result<Option<Violation>> {
     let base = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
     match storage.get_bytes(&format!("{base}{SIDECAR_SUFFIX}")).await {
@@ -304,6 +527,10 @@ async fn diff_one(
             Ok(None)
         }
         Err(e) if is_not_found(&e) => {
+            if !fault_on_vanish {
+                // A lagging bucket has not necessarily replicated this truth yet.
+                return Ok(None);
+            }
             let tombstone = format!("{base}{TOMBSTONE_SUFFIX}");
             if storage.head_exists(&tombstone).await? {
                 Ok(None)

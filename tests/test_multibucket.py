@@ -2464,3 +2464,158 @@ def test_advisory_feed_reseeds_onto_a_starved_second_bucket(
         )
     finally:
         server_gen.close()
+
+
+# --------------------------------------------------------------------------- #
+# Transparency chain: multi-bucket replication + bucket-aware verify-chain.
+
+
+_CHAIN_PREFIX = "_transparency/chain/"
+
+
+def _chain_seqs_in(minio, bucket) -> list[int]:
+    """The committed chain seqs present in `bucket`, ascending."""
+    seqs = []
+    for key in minio_list_keys_in(minio, bucket):
+        if key.startswith(_CHAIN_PREFIX) and key.endswith(".json"):
+            stem = key[len(_CHAIN_PREFIX) : -len(".json")]
+            if stem.isdigit():
+                seqs.append(int(stem))
+    return sorted(seqs)
+
+
+def _chain_key(seq: int) -> str:
+    """The storage key for chain link `seq` (16-wide zero-padded, per SEQ_WIDTH)."""
+    return f"{_CHAIN_PREFIX}{seq:016d}.json"
+
+
+def _verify_chain_s3(pypiron_bin, minio):
+    """Run `pypiron verify-chain` against the whole multi-bucket topology."""
+    env = _s3_env(minio, "127.0.0.1:0")
+    return run_returncode([str(pypiron_bin), "verify-chain"], env=env, timeout=90)
+
+
+def test_verify_chain_catches_a_tamper_on_the_second_bucket(
+    minio_two, s3_server_multi, tmp_path, pypiron_bin
+):
+    """A sidecar rewritten on the SECOND bucket only. Single-bucket verify-chain
+    reads bucket 0 and never sees it; the bucket-aware walk replays the longest
+    chain and diffs it against EVERY bucket's sidecars, so the tamper on B is
+    caught (exit 1) and named, while A stays clean."""
+    server = s3_server_multi
+    minio = minio_two
+    a, b = minio["buckets"]
+    pkg = "chaintampb"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    _upload(server, wheel)
+    wait_for_file_in_index(server["simple"], pkg, wheel.name)
+
+    akey = f"packages/{pkg}/{wheel.name}"
+    sidecar_key = f"{akey}.meta.json"
+    _eventually(
+        lambda: minio_key_exists_in(minio, b, sidecar_key),
+        what="sidecar replicated to B",
+    )
+    # The audit commits the sha into the chain, written through to both buckets.
+    _eventually(
+        lambda: _chain_seqs_in(minio, a) and _chain_seqs_in(minio, b),
+        what="chain link written and replicated to both buckets",
+    )
+
+    # Stop the server so its reconcile cannot fight the manual tamper.
+    kill_process_tree(server["proc"])
+
+    # Baseline: the bucket-aware walk passes across both buckets.
+    rc, out, err = _verify_chain_s3(pypiron_bin, minio)
+    assert rc == 0, f"baseline must be clean:\n{out}{err}"
+
+    # Rewrite ONLY bucket B's sidecar sha256 so it no longer matches the committed
+    # sha — an out-of-band tamper on the peer bucket.
+    meta = json.loads(minio_get_key_in(minio, b, sidecar_key))
+    meta["sha256"] = "0" * 64
+    minio_put_key_in(minio, b, sidecar_key, json.dumps(meta))
+
+    rc, out, err = _verify_chain_s3(pypiron_bin, minio)
+    assert rc == 1, f"tamper on the second bucket must be caught:\n{out}{err}"
+    assert "hash-changed" in out, out
+    assert wheel.name in out, out
+    # Rows are bucket-tagged: B is named on the violation, A (untampered) is not.
+    tampered = [ln for ln in out.splitlines() if "hash-changed" in ln]
+    assert any(b in ln for ln in tampered), tampered
+    assert all(a not in ln for ln in tampered), tampered
+
+
+def test_failover_continues_the_chain_instead_of_restarting_genesis(
+    minio_two, s3_server_multi, tmp_path, pypiron_bin
+):
+    """The replicated chain lets a failover leader CONTINUE the seq. Bucket A
+    leads and writes genesis (seq 0), replicated to B. A is then removed; the node
+    fails over to B, and B's leader reads the replicated head and appends seq 1 —
+    not a fresh genesis. Without replication B would have held no chain and
+    restarted at seq 0, laundering the history."""
+    server = s3_server_multi
+    minio = minio_two
+    a, b = minio["buckets"]
+
+    wheel1 = make_wheel("chainconta", "1.0", tmp_path)
+    _upload(server, wheel1)
+    wait_for_file_in_index(server["simple"], "chainconta", wheel1.name)
+    # Genesis reaches BOTH buckets (leader write + write-through).
+    _eventually(
+        lambda: _chain_seqs_in(minio, a) == [0] and _chain_seqs_in(minio, b) == [0],
+        what="genesis chain link replicated to both buckets",
+    )
+
+    # Remove the leader's bucket; the node fails over to B.
+    minio_remove_bucket(minio, a)
+    try:
+        wheel2 = make_wheel("chaincontb", "1.0", tmp_path)
+        _retry_upload(server, wheel2, timeout=30)
+        wait_for_file_in_index(server["simple"], "chaincontb", wheel2.name)
+        _eventually(
+            lambda: _selected_bucket(server) == b,
+            timeout=30,
+            what="node selects bucket B after A is removed",
+        )
+        # The failover leader continues the chain: seq 1 on B, gapless from 0.
+        _eventually(
+            lambda: _chain_seqs_in(minio, b) == [0, 1],
+            timeout=30,
+            what="failover leader appends seq 1 rather than restarting genesis",
+        )
+    finally:
+        minio_make_bucket(minio, a)
+
+
+def test_verify_chain_reports_a_lagging_bucket_without_faulting(
+    minio_two, s3_server_multi, tmp_path, pypiron_bin
+):
+    """A bucket whose chain is a strict prefix of the longest is merely lagging:
+    verify-chain reports it and still exits 0. Two links are built and replicated
+    to both buckets; B's newest link is then dropped, leaving B a prefix of A."""
+    server = s3_server_multi
+    minio = minio_two
+    a, b = minio["buckets"]
+
+    _upload(server, make_wheel("chainlaga", "1.0", tmp_path))
+    _eventually(
+        lambda: _chain_seqs_in(minio, a) and _chain_seqs_in(minio, b),
+        what="first chain link on both buckets",
+    )
+    _upload(server, make_wheel("chainlagb", "1.0", tmp_path))
+    # A second link, replicated to both, so both hold seqs [0, 1].
+    _eventually(
+        lambda: _chain_seqs_in(minio, a) == [0, 1] and _chain_seqs_in(minio, b) == [0, 1],
+        what="second chain link replicated to both buckets",
+    )
+
+    # Stop the server, then drop B's newest link so its chain is a strict prefix.
+    kill_process_tree(server["proc"])
+    minio_delete_key_in(minio, b, _chain_key(1))
+    assert _chain_seqs_in(minio, b) == [0], _chain_seqs_in(minio, b)
+
+    rc, out, err = _verify_chain_s3(pypiron_bin, minio)
+    assert rc == 0, f"a lagging (prefix) bucket must not fault:\n{out}{err}"
+    lagging = [ln for ln in out.splitlines() if "chain-lagging" in ln]
+    assert lagging, f"the lagging bucket must be reported:\n{out}"
+    assert any(b in ln for ln in lagging), lagging

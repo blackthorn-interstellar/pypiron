@@ -135,7 +135,13 @@ tombstone. A tombstoned disappearance is a legitimate private delete, not tamper
 `pypiron verify-chain` walks the chain (checking the hash links), replays it,
 re-lists storage, and reports violations, exiting nonzero. Anyone with bucket
 read access can run it — the check does not depend on the server's own good
-behavior.
+behavior. In a multi-bucket fleet it walks **every** bucket: it verifies each
+bucket's chain internally, requires every bucket's chain to be a prefix of the
+longest one (a shorter chain is *lagging* — reported, not a fault; a divergent or
+restarted chain is a violation), then replays that longest chain and diffs its
+expected state against **each** bucket's sidecars — so a tamper on any single
+bucket is caught, not just the preferred one. The walk stays metadata-only: chain
+links and sidecar reads, never artifact bytes.
 
 The trust anchor, stated honestly: the chain is only as append-only as the
 storage is. In-bucket and unsigned, it already defeats the content-rewrite
@@ -151,12 +157,18 @@ rollback guarantee; the manual says so plainly. Operator signing for
 auditor-portable evidence is a deferred additive layer.
 
 The chain is a third kind of state, and the taxonomy should be honest about it:
-not truth, not a regenerable view, but an append-only **witness**. Deleting it
-never breaks the server — the chain simply restarts at a new genesis and the
-tamper-evidence history resets. Like leases and counters it stays on the write
-pin and is never replicated across buckets, and it is never lifecycle-expired.
-It is on by default, and the audit's cost philosophy carries over intact:
-checkpoint size scales with churn, not corpus size.
+not truth, not a regenerable view, but an append-only **witness**. Deleting the
+whole tree never breaks the server — the chain simply restarts at a new genesis
+and the tamper-evidence history resets — and it is never lifecycle-expired.
+Across a fleet it is a **singleton-replicated** control record (the storage-layout
+manifest, `src/layout.rs`): each immutable, leader-authored link is written
+through to every healthy bucket right after the audit commits it (create-if-absent
+per seq, with a backfill for a bucket that missed writes). That closes the
+failover hole — a new leader reads the latest seq from its own bucket and
+*continues* the chain instead of restarting at a fresh genesis that would launder
+the very history the chain exists to protect. It is on by default, and the audit's
+cost philosophy carries over intact: checkpoint size scales with churn, not corpus
+size, and the write-through is one small PUT per peer per link.
 
 ## Write-time metadata capture: never compute at read or rebuild time
 

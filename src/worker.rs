@@ -1220,7 +1220,7 @@ pub async fn audit(
             // noise; keep only packages that actually hold committable files.
             delta.retain(|_, files| !files.is_empty());
         }
-        write_chain_link(state, storage, generation, delta).await;
+        write_chain_link(state, pinned, generation, delta).await;
     }
     // Publish completion metrics only after the sweep's last storage write:
     // the bench harness's `wait_swept` treats `audit_last_duration_seconds` as
@@ -1264,13 +1264,32 @@ async fn current_package_shas(storage: &dyn Storage, pkg: &str) -> Result<FileSh
 /// generation.
 async fn write_chain_link(
     state: &AppState,
+    pinned: &crate::buckets::Pinned,
+    generation: u64,
+    delta: crate::transparency::Delta,
+) {
+    let storage = pinned.storage.as_ref();
+    // Append a link only on churn, then always mirror the chain head to lagging
+    // peers. The reseed is both the write-through for the link we just appended
+    // and the backstop for a peer that missed writes or was added later, so a
+    // failover to any bucket continues the chain even when the fleet is idle.
+    if !delta.is_empty() {
+        append_chain_link(state, storage, generation, delta).await;
+    }
+    let replicas = state.singleton_replicas(pinned.index);
+    crate::transparency::reseed_chain_to_peers(storage, &replicas).await;
+}
+
+/// Append one hash-chained link committing `delta` to the primary bucket. Two
+/// attempts: a racing dual leader can win the create-CAS at our seq, so re-read
+/// the head and re-chain once; a second loss means a peer is keeping the chain
+/// current, so defer to the next audit rather than spin or overwrite.
+async fn append_chain_link(
+    state: &AppState,
     storage: &dyn Storage,
     generation: u64,
     delta: crate::transparency::Delta,
 ) {
-    if delta.is_empty() {
-        return; // chain grows on churn only
-    }
     // Two attempts: a racing dual leader can win the create-CAS at our seq, so
     // re-read the head and re-chain once. A second loss means a peer is keeping
     // the chain current — defer to the next audit rather than spin or overwrite.
@@ -1318,6 +1337,8 @@ async fn write_chain_link(
                     packages = link.packages.len(),
                     "transparency: checkpoint written"
                 );
+                // The write-through to peers is the caller's always-run reseed,
+                // which mirrors this new head to every lagging bucket.
                 return;
             }
             Ok(None) => {

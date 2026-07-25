@@ -42,6 +42,16 @@ live truth by at most one audit cycle, and a not-yet-recorded file is simply not
 yet under watch. A file you deleted through pypiron is clean too: the deletion is
 recorded, so verify-chain expects it gone.
 
+## Every bucket, not just one
+
+If you run across multiple buckets or regions, the checkpoint log rides along to
+all of them, and `verify-chain` checks each one. It replays the fullest log it
+finds and compares it against what **every** bucket holds — so a file rewritten
+in one region is caught, not just the one your server happens to prefer. A bucket
+that hasn't caught up yet is reported as lagging, not flagged as tampered. And
+because the log travels with your data, losing a bucket and failing over to
+another keeps the same unbroken history instead of quietly starting fresh.
+
 ## Close the rollback gap
 
 The chain proves nobody rewrote a file's history — as long as the history itself

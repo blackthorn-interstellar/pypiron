@@ -2619,3 +2619,55 @@ def test_verify_chain_reports_a_lagging_bucket_without_faulting(
     lagging = [ln for ln in out.splitlines() if "chain-lagging" in ln]
     assert lagging, f"the lagging bucket must be reported:\n{out}"
     assert any(b in ln for ln in lagging), lagging
+
+
+def test_verify_chain_tolerates_a_chain_current_bucket_missing_sidecars(
+    minio_two, s3_server_multi, tmp_path, pypiron_bin
+):
+    """The chain and the sidecars replicate on independently paced paths: the chain
+    is written through whole in one audit, sidecars fan out + reconcile after. So a
+    bucket is routinely *chain-current* while its sidecars are still trickling in.
+    verify-chain must NOT read that as a vanished tamper — the truth still lives on
+    the peer. Vanish is a fleet property: it faults only when the committed file is
+    gone from EVERY bucket. (Regression: keying vanish on chain lag false-faulted
+    the whole onboarding window.)"""
+    server = s3_server_multi
+    minio = minio_two
+    a, b = minio["buckets"]
+    pkg = "chaincurrmiss"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    _upload(server, wheel)
+    wait_for_file_in_index(server["simple"], pkg, wheel.name)
+
+    sidecar_key = f"packages/{pkg}/{wheel.name}.meta.json"
+    # Sidecar and the chain link both reach B: B is fully chain-current, NOT lagging.
+    _eventually(
+        lambda: minio_key_exists_in(minio, b, sidecar_key),
+        what="sidecar replicated to B",
+    )
+    _eventually(
+        lambda: _chain_seqs_in(minio, a) == _chain_seqs_in(minio, b) and _chain_seqs_in(minio, a),
+        what="chain link replicated to both buckets (B is current, not lagging)",
+    )
+
+    # Stop the server so reconcile cannot re-copy the sidecar we remove.
+    kill_process_tree(server["proc"])
+
+    # Drop B's sidecar only — B stays chain-current. This is exactly the state a
+    # freshly onboarded / recovering bucket sits in while its corpus backfills.
+    minio_delete_key_in(minio, b, sidecar_key)
+    assert not minio_key_exists_in(minio, b, sidecar_key)
+    assert minio_key_exists_in(minio, a, sidecar_key), "A still holds the truth"
+
+    rc, out, err = _verify_chain_s3(pypiron_bin, minio)
+    assert rc == 0, (
+        f"a chain-current bucket with an un-replicated sidecar must not fault:\n{out}{err}"
+    )
+    assert "vanished" not in out, f"the truth still lives on A — no vanish:\n{out}"
+
+    # But a fleet-wide loss IS still caught, chain lag or not: drop it on A too.
+    minio_delete_key_in(minio, a, sidecar_key)
+    rc, out, err = _verify_chain_s3(pypiron_bin, minio)
+    assert rc == 1, f"a committed file gone from every bucket must fault:\n{out}{err}"
+    assert "vanished" in out, out
+    assert wheel.name in out, out

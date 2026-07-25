@@ -322,9 +322,15 @@ fn warn_in_chain_sha_changes(links: &[(u64, Vec<u8>, ChainLink)]) {
 /// (b) every bucket's chain must be a prefix of the longest valid chain — a
 /// shorter one is merely *lagging* (reported, not a fault), a divergent or
 /// restarted one is a violation; (c) the longest valid chain is replayed and its
-/// expected `(package, filename, sha256)` state is diffed against **each**
-/// bucket's sidecars, so a tamper on any single bucket is caught. The walk is
-/// metadata-only — chain links plus sidecar reads, never artifact bytes.
+/// expected `(package, filename, sha256)` state is diffed against every bucket's
+/// sidecars. A present sidecar whose sha contradicts the commitment is caught on
+/// **any** single bucket (`hash-changed`), so a silent byte-rewrite anywhere
+/// faults. A committed file gone with no tombstone is a `vanished` fault only when
+/// it is absent from **every** bucket — a truth still held on any peer is intact,
+/// and one bucket's missing sidecar is ordinary replication lag, never faulted
+/// (which also denies an attacker a per-bucket vanish exemption via chain
+/// truncation). The walk is metadata-only — chain links plus sidecar reads, never
+/// artifact bytes.
 pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
     let storages = args.storage.build_all().await?;
     let names = args.storage.bucket_names();
@@ -433,28 +439,90 @@ pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
     warn_in_chain_sha_changes(&ref_chain.links);
 
     // 5. Replay the reference and diff its expected state against every bucket's
-    // sidecars. A bucket current with the reference faults on a vanished
-    // commitment; a lagging bucket may simply not have replicated that truth yet,
-    // so there a *missing* sidecar is not a fault — but a present-but-wrong sha
-    // still is, since that is a tamper regardless of chain lag.
+    // sidecars. Two independent verdicts per committed file:
+    //   - hash-changed: a present sidecar whose sha contradicts the commitment is a
+    //     tamper on *that* bucket, always faulted — the core silent-rewrite signal.
+    //   - vanished: a committed file gone with no tombstone. This is a *fleet*
+    //     property — it faults only when the truth is absent from EVERY bucket,
+    //     never for one bucket's missing sidecar. The chain (write-through, whole
+    //     chain in a single audit — `reseed_chain_to_peers`) and sidecars (fan-out
+    //     at upload + reconcile backstop) replicate on independently paced paths, so
+    //     a bucket is routinely chain-current while its sidecars still trickle in;
+    //     faulting per-bucket absence would fire a tamper alarm during exactly the
+    //     onboarding/recovery events this tool audits. Keying vanish on the fleet
+    //     also refuses the fail-open where an attacker truncates a peer's newest
+    //     chain links to earn a lag exemption and then deletes its sidecars: there
+    //     is no per-bucket exemption to earn, and a truth still present on any peer
+    //     is intact regardless of chain lag (reconcile re-copies the lost replica).
     let expected = replay(ref_chain.links.iter().map(|(_, _, l)| l));
     let checks: Vec<(&String, &String, &String)> = expected
         .iter()
         .flat_map(|(pkg, files)| files.iter().map(move |(f, sha)| (pkg, f, sha)))
         .collect();
-    let lagging_names: HashSet<&str> = lagging.iter().map(|(n, _)| n.as_str()).collect();
-    for chain in &chains {
-        let fault_on_vanish = !lagging_names.contains(chain.name);
-        for chunk in checks.chunks(DIFF_CONCURRENCY) {
-            let diffs = chunk.iter().map(|(pkg, filename, sha)| {
-                diff_one(chain.storage, pkg, filename, sha, fault_on_vanish)
-            });
-            for result in futures::future::join_all(diffs).await {
-                if let Some(v) = result? {
-                    violations.push((chain.name.to_string(), v));
+
+    // Per committed file: is the truth held (matching/present sidecar or tombstone)
+    // on any bucket, and which buckets are cleanly absent?
+    let mut covered = vec![false; checks.len()];
+    let mut absent_in: Vec<Vec<usize>> = vec![Vec::new(); checks.len()];
+    for (bi, chain) in chains.iter().enumerate() {
+        for (ci, chunk) in checks.chunks(DIFF_CONCURRENCY).enumerate() {
+            let probes = chunk
+                .iter()
+                .map(|(pkg, filename, sha)| probe_presence(chain.storage, pkg, filename, sha));
+            for (j, presence) in futures::future::join_all(probes)
+                .await
+                .into_iter()
+                .enumerate()
+            {
+                let fi = ci * DIFF_CONCURRENCY + j;
+                let (pkg, filename, expected_sha) = checks[fi];
+                match presence? {
+                    // Present truth or a legitimate delete: the file survives here.
+                    Presence::Match | Presence::Tombstone => covered[fi] = true,
+                    // Present but unparseable: still not a vanish, but flag it.
+                    Presence::Corrupt(e) => {
+                        covered[fi] = true;
+                        violations.push((
+                            chain.name.to_string(),
+                            Violation {
+                                kind: "corrupt-sidecar",
+                                package: pkg.clone(),
+                                detail: format!("{filename}: {e}"),
+                            },
+                        ));
+                    }
+                    // Present, contradicting sha: a tamper on this bucket, always.
+                    Presence::WrongSha(actual) => violations.push((
+                        chain.name.to_string(),
+                        Violation {
+                            kind: "hash-changed",
+                            package: pkg.clone(),
+                            detail: format!(
+                                "{filename}: committed {expected_sha} but the sidecar now holds {actual}"
+                            ),
+                        },
+                    )),
+                    Presence::Absent => absent_in[fi].push(bi),
                 }
             }
         }
+    }
+
+    // Fleet-wide vanish: a committed file cleanly absent somewhere and held nowhere.
+    for fi in 0..checks.len() {
+        if covered[fi] || absent_in[fi].is_empty() {
+            continue;
+        }
+        let (pkg, filename, _) = checks[fi];
+        let buckets: Vec<&str> = absent_in[fi].iter().map(|&bi| chains[bi].name).collect();
+        violations.push((
+            buckets.join(","),
+            Violation {
+                kind: "vanished",
+                package: pkg.clone(),
+                detail: format!("{filename}: committed sidecar is gone with no tombstone"),
+            },
+        ));
     }
 
     for (name, head) in &lagging {
@@ -488,58 +556,44 @@ fn print_violations(violations: &[(String, Violation)]) {
     }
 }
 
-/// Diff one committed `(package, filename, sha)` against storage. The sidecar is
-/// the sha of record: present-but-different is a tamper; gone-with-no-tombstone
-/// is a vanish; gone-with-tombstone is a legitimate delete the chain hasn't
-/// caught up to yet. When `fault_on_vanish` is false (a bucket whose chain lags
-/// the reference), an absent sidecar is treated as un-replicated truth rather
-/// than a vanish — but a present, contradicting sha is still a tamper.
-async fn diff_one(
+/// One bucket's view of a committed `(package, filename, sha)`, folded into the
+/// fleet-wide verdict by `run_verify_chain`.
+enum Presence {
+    /// Sidecar present, sha matches the commitment.
+    Match,
+    /// Sidecar present but its sha contradicts the commitment — a tamper.
+    WrongSha(String),
+    /// Sidecar present but unparseable.
+    Corrupt(String),
+    /// No sidecar, but a tombstone marks a legitimate delete the chain hasn't
+    /// caught up to yet.
+    Tombstone,
+    /// No sidecar and no tombstone.
+    Absent,
+}
+
+/// Classify one committed `(package, filename, sha)` against a single bucket's
+/// storage. The sidecar is the sha of record; the caller decides what each
+/// presence means for the fleet.
+async fn probe_presence(
     storage: &dyn Storage,
     pkg: &str,
     filename: &str,
     expected_sha: &str,
-    fault_on_vanish: bool,
-) -> Result<Option<Violation>> {
+) -> Result<Presence> {
     let base = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
     match storage.get_bytes(&format!("{base}{SIDECAR_SUFFIX}")).await {
-        Ok(bytes) => {
-            let sc: Sidecar = match serde_json::from_slice(&bytes) {
-                Ok(sc) => sc,
-                Err(e) => {
-                    return Ok(Some(Violation {
-                        kind: "corrupt-sidecar",
-                        package: pkg.to_string(),
-                        detail: format!("{filename}: {e}"),
-                    }))
-                }
-            };
-            if sc.sha256 != expected_sha {
-                return Ok(Some(Violation {
-                    kind: "hash-changed",
-                    package: pkg.to_string(),
-                    detail: format!(
-                        "{filename}: committed {expected_sha} but the sidecar now holds {}",
-                        sc.sha256
-                    ),
-                }));
-            }
-            Ok(None)
-        }
+        Ok(bytes) => match serde_json::from_slice::<Sidecar>(&bytes) {
+            Ok(sc) if sc.sha256 == expected_sha => Ok(Presence::Match),
+            Ok(sc) => Ok(Presence::WrongSha(sc.sha256)),
+            Err(e) => Ok(Presence::Corrupt(e.to_string())),
+        },
         Err(e) if is_not_found(&e) => {
-            if !fault_on_vanish {
-                // A lagging bucket has not necessarily replicated this truth yet.
-                return Ok(None);
-            }
             let tombstone = format!("{base}{TOMBSTONE_SUFFIX}");
             if storage.head_exists(&tombstone).await? {
-                Ok(None)
+                Ok(Presence::Tombstone)
             } else {
-                Ok(Some(Violation {
-                    kind: "vanished",
-                    package: pkg.to_string(),
-                    detail: format!("{filename}: committed sidecar is gone with no tombstone"),
-                }))
+                Ok(Presence::Absent)
             }
         }
         Err(e) => Err(e),

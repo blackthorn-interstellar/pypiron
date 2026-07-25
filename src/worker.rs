@@ -2275,6 +2275,15 @@ impl InventoryMap {
 pub struct GlobalNames {
     etag: Option<String>,
     names: HashSet<String>,
+    /// Whether `simple/index.html` is known to render exactly `names`.
+    /// `changed` detection reads only the canonical JSON, so a freshly loaded
+    /// cache knows nothing about the HTML: it is written *first* and
+    /// unconditionally, which leaves it ahead of the JSON when a write crashes
+    /// between the two, and behind it when the crash lands on the reconcile
+    /// after a lost CAS. Either way the next delta may dedup and return, and
+    /// nothing else revisits the HTML — the audit reaches the same gate. So a
+    /// load starts `false` and the first no-op delta reconciles once.
+    html_current: bool,
 }
 
 /// All hosted package names, sorted — the human package browser's listing.
@@ -2340,13 +2349,6 @@ async fn update_global_index_locked(
     removes: &[String],
     guard: &mut Option<GlobalNames>,
 ) -> Result<()> {
-    // Once we lose a CAS we have already written an optimistic HTML for a name
-    // set that lost. If the reload then makes our delta a no-op (the winner
-    // already added our name), `changed` is false and we would return leaving
-    // that stale HTML as the final write — a drift nothing else heals (the
-    // audit reaches the same `changed` gate). So on that path, reconcile HTML
-    // to the now-canonical set before returning.
-    let mut wrote_optimistic_html = false;
     for _attempt in 0..4 {
         if guard.is_none() {
             *guard = Some(load_global_names(storage).await?);
@@ -2382,17 +2384,18 @@ async fn update_global_index_locked(
                     continue;
                 }
             }
-            if wrote_optimistic_html {
+            // Currency of the *JSON* is not currency of the HTML: it is written
+            // first and unconditionally, so a lost CAS or a crash can leave it
+            // either ahead of or behind the set this cache was loaded from, and
+            // returning here would make that the final word — a drift nothing
+            // heals, since the audit reaches this same gate. Reconcile once per
+            // cache load, then never again for that cache: steady state is a
+            // pure hash lookup, and a real change writes both views anyway.
+            if !cached.html_current {
                 let mut packages: Vec<String> = cached.names.iter().cloned().collect();
                 packages.sort();
-                put_if_changed(
-                    state,
-                    storage,
-                    &format!("{SIMPLE_PREFIX}index.html"),
-                    pep503_global_html(&packages).into_bytes(),
-                    SIMPLE_HTML_CONTENT_TYPE,
-                )
-                .await?;
+                reconcile_global_html(state, storage, &packages).await?;
+                cached.html_current = true;
             }
             return Ok(());
         }
@@ -2405,17 +2408,18 @@ async fn update_global_index_locked(
                     // from a follow-up GET — a peer could land a write between the
                     // two and we'd pin its ETag against our stale name set.
                     cached.etag = new_etag;
+                    cached.html_current = true;
                 }
                 return Ok(());
             }
             CasOutcome::Lost => {}
         }
-        // Lost the CAS to a peer: another node updated the name set under us.
-        // We already wrote an optimistic HTML this iteration; remember that so
-        // a subsequent no-op reload still reconciles it. Count the conflict
-        // (operators watch this to confirm dual leadership converges rather
-        // than corrupts), then drop the cache, reload, reapply the delta.
-        wrote_optimistic_html = true;
+        // Lost the CAS to a peer: another node updated the name set under us,
+        // and the optimistic HTML we wrote this iteration is now for a set that
+        // lost. Dropping the cache is what heals it — the reload clears
+        // `html_current`, so a reload whose delta turns into a no-op still
+        // reconciles the HTML above. Count the conflict first (operators watch
+        // this to confirm dual leadership converges rather than corrupts).
         state
             .metrics
             .global_cas_conflicts
@@ -2520,7 +2524,8 @@ pub(crate) async fn update_global_index_uncached(
     if adds.is_empty() && removes.is_empty() {
         return Ok(());
     }
-    let mut names = load_global_names(storage).await?.names;
+    let loaded = load_global_names(storage).await?;
+    let mut names = loaded.names;
     let mut changed = false;
     for pkg in adds {
         changed |= names.insert(pkg.clone());
@@ -2528,12 +2533,44 @@ pub(crate) async fn update_global_index_uncached(
     for pkg in removes {
         changed |= names.remove(pkg);
     }
-    if !changed {
-        return Ok(());
-    }
     let mut packages: Vec<String> = names.into_iter().collect();
     packages.sort();
+    if !changed {
+        // Every call here loads fresh, so it knows the JSON and nothing about
+        // the HTML — same hazard as the cached path (HTML is written first, so a
+        // crash strands it ahead of or behind the JSON). Reconcile instead of
+        // returning blind.
+        return reconcile_global_html(state, storage, &packages).await;
+    }
     write_global_indexes(state, storage, &packages).await
+}
+
+/// Rewrite `simple/index.html` when it disagrees with `packages`. Unlike
+/// [`put_if_changed`] this never *creates* the view: the HTML is always written
+/// before the canonical JSON, so an absent one means the bucket has published no
+/// global index at all and the set is necessarily empty. Materializing one here
+/// would be pure churn — and a view whose bytes move at quiescence is exactly
+/// what the simulator flags as a premature marker consumption.
+async fn reconcile_global_html(
+    state: &AppState,
+    storage: &dyn Storage,
+    packages: &[String],
+) -> Result<()> {
+    let key = format!("{SIMPLE_PREFIX}index.html");
+    let current = match storage.get_bytes(&key).await {
+        Ok(bytes) => bytes,
+        Err(e) if is_not_found(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let expected = pep503_global_html(packages).into_bytes();
+    if current == expected {
+        return Ok(());
+    }
+    storage
+        .put_bytes(&key, expected, Some(SIMPLE_HTML_CONTENT_TYPE))
+        .await?;
+    state.index_cache.invalidate(&key);
+    Ok(())
 }
 
 /// Load the global name set (and its ETag) from the materialized JSON.
@@ -2567,7 +2604,11 @@ async fn load_global_names(storage: &dyn Storage) -> Result<GlobalNames> {
         Ok(g) => g.projects.into_iter().map(|p| p.name).collect(),
         Err(_) => HashSet::new(),
     };
-    Ok(GlobalNames { etag, names })
+    Ok(GlobalNames {
+        etag,
+        names,
+        html_current: false,
+    })
 }
 
 /// Outcome of a global-index conditional write.
@@ -2580,11 +2621,14 @@ enum CasOutcome {
 
 /// Write both global views. The canonical JSON — the one `changed` detection
 /// reloads from — is written LAST, under CAS where supported, so that a crash
-/// between the two writes is healed by replay: stale JSON re-detects the change
-/// and rewrites both. (JSON-first stranded a stale HTML that the name-set-change
-/// gate never revisited without an audit; the disk path already orders it this
-/// way.) HTML is last-writer-wins; a racing loser rewrites it on its retry, so
-/// the iteration whose JSON CAS finally wins always left a matching HTML.
+/// between the two writes leaves the *derived* view wrong rather than the
+/// authority. It is not self-healing: replay only rewrites both when the name
+/// set moves again, which a shrinking mirror may never do, so the HTML a crash
+/// strands (ahead of the JSON here, behind it when the crash lands on a
+/// post-CAS-loss reconcile) is healed by `GlobalNames::html_current` instead —
+/// see [`update_global_index_locked`]. HTML is last-writer-wins; a racing loser
+/// rewrites it on its retry, so the iteration whose JSON CAS finally wins
+/// always left a matching HTML.
 /// Returns `CasOutcome::Lost` when the conditional write lost the race, else
 /// `CasOutcome::Won` with the ETag the put itself returned.
 async fn write_global_indexes_cas(
@@ -3607,6 +3651,99 @@ mod tests {
         assert!(
             rebuilt,
             "dirty marker was not processed while the sweep was running — sweep starves the event path"
+        );
+    }
+
+    async fn global_html(storage: &InMemStorage) -> String {
+        let bytes = storage
+            .get_bytes(&format!("{SIMPLE_PREFIX}index.html"))
+            .await
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Crash residue, HTML *ahead*: the global views are written HTML-first,
+    /// canonical-JSON-last, so a crash in between leaves an HTML listing a name
+    /// the JSON never got. The absent JSON then reads back as the empty set, a
+    /// removals-only delta dedups against nothing, and the no-change gate used
+    /// to return leaving the stranded HTML as the final word (vopr seed 28024).
+    #[tokio::test]
+    async fn a_no_change_delta_reconciles_a_global_html_stranded_by_a_crash() {
+        let storage = Arc::new(InMemStorage::default());
+        storage.insert(
+            &format!("{SIMPLE_PREFIX}index.html"),
+            pep503_global_html(&["ghost".to_string()]).into_bytes(),
+        );
+        let state = AppState::headless(storage.clone());
+
+        update_global_index(&state, storage.as_ref(), &[], &["ghost".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            global_html(&storage).await,
+            pep503_global_html(&[]),
+            "a dedupping delta must still reconcile an HTML that a crashed write stranded"
+        );
+    }
+
+    /// Crash residue, HTML *behind*: a node that loses the CAS has already
+    /// written an optimistic HTML for the set that lost; crashing before its
+    /// reconcile leaves the HTML older than the JSON. A later delta that dedups
+    /// against that (correct) JSON must still republish the HTML — and having
+    /// done so once, must not re-read it on every subsequent no-op tick.
+    #[tokio::test]
+    async fn a_no_change_delta_republishes_a_global_html_left_behind_the_json() {
+        let storage = Arc::new(InMemStorage::default());
+        let live = vec!["alpha".to_string()];
+        storage.insert(
+            &format!("{SIMPLE_PREFIX}index.json"),
+            pep691_global_json(&live).into_bytes(),
+        );
+        storage.insert(
+            &format!("{SIMPLE_PREFIX}index.html"),
+            pep503_global_html(&[]).into_bytes(),
+        );
+        let state = AppState::headless(storage.clone());
+
+        update_global_index(&state, storage.as_ref(), &live, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            global_html(&storage).await,
+            pep503_global_html(&live),
+            "an HTML left behind the canonical JSON must be republished"
+        );
+
+        let reads = storage.get_count();
+        update_global_index(&state, storage.as_ref(), &live, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_count(),
+            reads,
+            "the reconcile is once per cache load; a steady-state no-op delta must not read the global HTML"
+        );
+    }
+
+    /// The reconcile must not *create* views: a bucket that has never published
+    /// a global index is empty by construction, and materializing one on a no-op
+    /// delta is churn the audit oracle reads as a premature marker consumption.
+    #[tokio::test]
+    async fn a_no_change_delta_does_not_publish_a_global_index_that_never_existed() {
+        let storage = Arc::new(InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+
+        update_global_index(&state, storage.as_ref(), &[], &["ghost".to_string()])
+            .await
+            .unwrap();
+
+        assert!(
+            !storage
+                .head_exists(&format!("{SIMPLE_PREFIX}index.html"))
+                .await
+                .unwrap(),
+            "a no-op delta must not materialize a global index into a bucket that has none"
         );
     }
 }

@@ -383,6 +383,56 @@ impl StorageArgs {
             .ok_or_else(|| anyhow!("no storage backend configured"))
     }
 
+    /// [`build`](Self::build) plus the storage-format read gate — the write-open
+    /// entry point for a headless op (rebuild-index) that mutates the default
+    /// bucket. The gate runs strictly: a bucket whose format cannot be verified —
+    /// a real GET error or a hang past the one-second control bound — refuses
+    /// rather than being written blind, and the operator retries once it is
+    /// reachable. New writers should build through this, not `build`, so the gate
+    /// can never be forgotten.
+    pub async fn build_for_write(&self) -> Result<Arc<dyn Storage>> {
+        let storage = self.build().await?;
+        let name = self.bucket_names().into_iter().next().unwrap_or_default();
+        let handles = [crate::buckets::BucketHandle {
+            storage: storage.clone(),
+            name,
+        }];
+        crate::format::verify_format(&handles, |_, _| false).await?;
+        Ok(storage)
+    }
+
+    /// [`build_all`](Self::build_all) plus the storage-format read gate over every
+    /// configured bucket — the write-open entry point for a headless op that
+    /// mutates the whole fleet (`buckets migrate`, `origin release`).
+    ///
+    /// Unlike [`build_for_write`](Self::build_for_write), this skips an
+    /// availability failure (serve's classifier, one-second control bound folded
+    /// in) rather than refusing: these ops are designed to defer an unreachable
+    /// member, and they defer its WRITES under the same bound, so a hung member is
+    /// never verified-skipped here yet written blind there. `buckets migrate`
+    /// partial-migrates and repairs the missed member on a later startup;
+    /// `origin release` re-checks every bucket in its own preflight and aborts if
+    /// one is unreachable. A reachable member stamped with a newer format still
+    /// refuses; the serve gate is the backstop when a skipped member recovers.
+    pub async fn build_all_for_write(&self) -> Result<Vec<Arc<dyn Storage>>> {
+        let storages = self.build_all().await?;
+        let handles: Vec<crate::buckets::BucketHandle> = storages
+            .iter()
+            .cloned()
+            .zip(self.bucket_names())
+            .map(|(storage, name)| crate::buckets::BucketHandle { storage, name })
+            .collect();
+        let availability = |_: usize, error: &anyhow::Error| {
+            crate::bucket_health::classify(crate::observed_storage::signal_for_error(error))
+                == crate::bucket_health::SignalClass::AvailabilityFailure
+        };
+        crate::format::verify_format(&handles, |index, error| {
+            crate::buckets::topology_error_is_availability(index, error, &availability)
+        })
+        .await?;
+        Ok(storages)
+    }
+
     /// One storage handle per configured bucket, in preference order: a single
     /// handle for disk/GCS/Azure or a lone S3 bucket, the full list for
     /// multi-bucket S3. Only bucket 0 gets the crash-injection wrapper.

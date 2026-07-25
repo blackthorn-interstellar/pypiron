@@ -531,6 +531,13 @@ _topology/stamp.json                     # multi-bucket only: fail-closed config
                                          #   ordered bucket identities + operator topology generation,
                                          #   CAS-written/verified on every reachable bucket at startup.
                                          #   One bucket: absent, dormant.
+_format/stamp.json                       # storage-format fence — a single integer the on-disk layout
+                                         #   is at. ABSENT == format 1, the permanent rule; never written
+                                         #   while at format 1. A future format bump stamps the new
+                                         #   number (its first writer is the format-upgrade tooling);
+                                         #   an older binary reads it at startup and REFUSES rather than
+                                         #   writing an older layout into a newer tree. Read-only gate
+                                         #   today — nothing here writes it.
 _repl/<dest-index>/<pkg>/<file>!<nonce>  # multi-bucket repair note, FAILURE-PATH ONLY. Written in the
                                          #   selected bucket before ack when a synchronous fan-out to a
                                          #   destination fails/times out; drained by the sweep (on that
@@ -576,6 +583,13 @@ declared class fails CI. Four classes:
 | `simple/`, `_advisories/report.json`, `_state/`, `_sync/cursors.json`, `_counters/`, `_quarantine/`, `_transparency/chain/` | derived-per-bucket | no — each bucket rebuilds/re-derives its own from the truth it holds |
 | `_leader/lease.json`, `_repl/`, `_topology/stamp.json`, `_staging/`, `_dirty/` | coordination-per-bucket | no — bucket-local by design; replicating it would be wrong |
 
+`_format/stamp.json` is the one top-level prefix deliberately not yet in the
+`src/layout.rs` manifest: nothing writes it at format 1 (absent == format 1), so
+there is no class to enforce until the format-2 stamp-writer/CAS-bump tooling
+ships — the parked format-2 deferral in `private/ROADMAP.md`. When written it will
+be fleet-uniform and write-through replicated (like the singleton control files),
+not bucket-local, so its MANIFEST row lands with that writer, not here.
+
 The transparency chain sits in derived-per-bucket because it is bucket-local
 today (each bucket carries its own genesis); making `verify-chain` bucket-aware
 is a separate, tracked design task. Counters are a flagged judgment call —
@@ -588,6 +602,44 @@ filename from indexes and direct server reads even while the canonical record
 remains occupied. A mirror-quarantine marker does the same until an adjacent
 private sidecar proves the demotion replaced the mirror loser, at which point the
 stale marker is inert.
+
+**Storage-format bump policy (`_format/stamp.json`).** The whole tree is at a
+single format number; today that number is 1 and no stamp is written (absent ==
+format 1, permanently). The load-bearing rules:
+
+- An additive field with a safe serde default never bumps the format — only a
+  rename, move, or semantic reinterpretation of existing bytes does.
+- The stamp records the format pypiron *writes*, never the maximum it can read.
+  A fresh format-N node must not stamp N on first boot against an N-1 tree, or it
+  poisons rollback; the number advances only on a deliberate bump.
+- A bump is rolling and zero-downtime: upgrade every binary fleet-wide first
+  (they keep writing N-1), *then* one explicit CAS flip by the format-upgrade
+  tooling. A binary rolled back past the bump refuses at its next start — that
+  refusal is the safety net. Unlike `buckets migrate`, no fleet stop is needed.
+- The gate is startup-only; straggler safety rests on operator ordering (upgrade
+  before flip). If a future bump proves stragglers real, the leader-lease
+  per-tick read (`src/lease.rs`) is the near-free re-check hook — deferred until
+  then.
+- Any future *runtime* format detection must be per-bucket quarantine
+  (selection-blocked style, per-bucket gauge), never a global write fence and
+  never a process exit; startup-total refusal applies to startup alone.
+- A corrupt stamp refuses (it is not silently recreated): stamps write
+  atomically on every backend, so a byte that will not parse is foreign
+  interference, not a torn write. Absent is the valid format-1 state.
+- Indexes under `simple/` are exempt: they are regenerable views, so a rebuild
+  *is* their migration.
+
+The gate reaches the tree through `StorageArgs::build_for_write` /
+`build_all_for_write` (serve calls it directly on the same handles it hands
+topology, ordered format → topology → serve). `sim.rs` is untouched — it injects
+raw storages and never goes through `StorageArgs`, so it never carries a stamp.
+
+*Rejected — a per-sidecar `writer` field* (so it is not re-added): sidecar bytes
+flow through raw byte-equality (`src/publish.rs`, `src/proxy.rs`) and the
+replication merge tiebreak digests whole sidecars (`src/replicate/decide.rs`), so
+any writer-varying field would manufacture spurious conflicts and churn.
+Per-write provenance, if ever needed, belongs in an append-only home, not the
+sidecar.
 
 Sidecar schema (`<filename>.meta.json`), all captured at write time:
 

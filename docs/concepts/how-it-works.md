@@ -40,6 +40,15 @@ through the bucket, and since every rebuild produces the same result, a brief
 overlap repeats work but can't corrupt anything. (The disk backend is
 single-node; multiple nodes need cloud storage.)
 
+## Upgrade without corrupting your store
+
+pypiron stamps nothing on your storage today. If a future release ever changes
+the on-disk layout, it ships that change as a numbered storage format, and an
+older binary pointed at a newer store refuses to start instead of writing the
+old shape into it. Upgrades stay rolling — you roll the new binaries out, then
+flip the format once, with no downtime — and if a stale binary comes back, the
+message it prints tells you exactly what to deploy.
+
 !!! note
     One URL and one namespace serve your private uploads, synced mirror
     packages, and on-demand proxied packages together. Each name is private or

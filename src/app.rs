@@ -73,7 +73,7 @@ pub(crate) const VERSION: &str = concat!(
 
 /// One-shot deep audit against a storage backend, no server attached.
 async fn run_rebuild_index(args: RebuildIndexArgs) -> Result<()> {
-    let storage = args.storage.build().await?;
+    let storage = args.storage.build_for_write().await?;
     let state = AppState::headless(storage);
     let pinned = state.pin();
     worker::audit(&state, &pinned, true).await
@@ -996,6 +996,21 @@ async fn run_serve(
         .map(|(storage, name)| BucketHandle { storage, name })
         .collect();
     let buckets = Arc::new(BucketSet::new(handles));
+    // Fail closed on a storage format newer than this binary writes BEFORE the
+    // topology stamp is parsed: an older binary must refuse a newer tree rather
+    // than front-run a topology error against a layout it cannot read. Same
+    // handles, same availability classifier; runs single-bucket too (topology
+    // no-ops there, the format gate does not). Fold the one-second control bound
+    // in like topology, so a bucket too slow to answer is skipped as an outage
+    // rather than refused — multi-bucket startup must survive that.
+    let format_availability = |_: usize, error: &anyhow::Error| {
+        bucket_health::classify(observed_storage::signal_for_error(error))
+            == bucket_health::SignalClass::AvailabilityFailure
+    };
+    crate::format::verify_format(buckets.handles(), |index, error| {
+        crate::buckets::topology_error_is_availability(index, error, &format_availability)
+    })
+    .await?;
     // Fail closed on a mismatched bucket topology before serving a byte (no-op
     // unless more than one bucket is configured).
     let topology = buckets

@@ -40,14 +40,22 @@ impl std::fmt::Display for TopologyIoTimeout {
 
 impl std::error::Error for TopologyIoTimeout {}
 
-async fn bounded_topology_io<T>(operation: impl Future<Output = Result<T>>) -> Result<T> {
+/// Bound one tiny control operation so a hung bucket cannot park startup on the
+/// data path's transfer ceiling. Shared with the storage-format gate
+/// (src/format.rs), which fences the same reachable buckets at startup.
+pub(crate) async fn bounded_topology_io<T>(
+    operation: impl Future<Output = Result<T>>,
+) -> Result<T> {
     match tokio::time::timeout(TOPOLOGY_IO_TIMEOUT, operation).await {
         Ok(result) => result,
         Err(_) => Err(TopologyIoTimeout.into()),
     }
 }
 
-fn topology_error_is_availability<F>(
+/// A control-I/O error is availability when it is the internal one-second bound
+/// (a bucket too slow to answer) or the caller's classifier says so. Shared with
+/// the storage-format gate so both fence the fleet with one rule.
+pub(crate) fn topology_error_is_availability<F>(
     index: usize,
     error: &anyhow::Error,
     is_availability: &F,

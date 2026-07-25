@@ -223,6 +223,12 @@ def test_dr_drill(pypiron_bin, tmp_path, uv_path, uv_venv):
     assert not (data_dir / "simple").exists(), (
         "views must NOT be restored — the drill proves they regenerate from truth"
     )
+    # A truth-only restore carries no `_format/` stamp, and that is exactly the
+    # DR-blessed state: absent == format 1. Both the offline rebuild below and the
+    # fresh server in step 7 must accept it and serve.
+    assert not (data_dir / "_format").exists(), (
+        "a restored truth-only tree must carry no _format/ stamp (absent == format 1)"
+    )
 
     # --- 6. Regenerate the views offline, then gate on the read-only oracle.
     t0 = time.monotonic()
@@ -230,6 +236,9 @@ def test_dr_drill(pypiron_bin, tmp_path, uv_path, uv_venv):
     assert rebuilt.returncode == 0, rebuilt.stdout + rebuilt.stderr
     rebuild_secs = time.monotonic() - t0
     assert (data_dir / "simple").is_dir(), "rebuild-index must regenerate the simple/ views"
+    assert not (data_dir / "_format").exists(), (
+        "headless rebuild-index must not create a _format/ stamp (absent == format 1)"
+    )
 
     verified = _cli(pypiron_bin, "verify-index", "--data-dir", str(data_dir))
     assert verified.returncode == 0, (

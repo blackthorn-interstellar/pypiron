@@ -377,7 +377,7 @@ pub fn apply_nested_maintenance_config(
 pub async fn run_origin_release(args: OriginReleaseArgs) -> Result<()> {
     let pkg = checked_pkg_name(&args.package)
         .ok_or_else(|| anyhow!("invalid package name '{}'", args.package))?;
-    let storages = args.storage.build_all().await?;
+    let storages = args.storage.build_all_for_write().await?;
     // Preflight every bucket before the first CAS. Without this, discovering an
     // artifact or outage on bucket B after releasing A would create exactly the
     // partial-origin window this maintenance command exists to avoid.
@@ -448,7 +448,7 @@ async fn rollback_origin_releases(
 const MIGRATE_UNIQUE_SAMPLE: usize = 5;
 
 pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
-    let storages = args.storage.build_all().await?;
+    let storages = args.storage.build_all_for_write().await?;
     let names = args.storage.bucket_names();
     let handles = storages
         .into_iter()

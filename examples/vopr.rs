@@ -76,6 +76,122 @@ const PACKAGES: [&str; 2] = ["vopr-alpha", "vopr-beta"];
 const FILES_PER_PKG: u8 = 2;
 const SIM_START: &str = "2026-01-01T00:00:00Z";
 
+// ---------------------------------------------------------------------------
+// `--break <name>`: mutation testing for the oracles themselves.
+//
+// An invariant nobody has watched go red is not a test — it is an assertion of
+// faith that costs runtime forever and reports reassurance. Each break is ONE
+// deliberate defect, named after what it breaks, that a specific oracle is
+// supposed to catch; CI asserts the run FAILS with that oracle's text. The
+// harness owns every break (no product-code hooks ship in the binary), and it
+// is inert by default: every injection point is a comparison against
+// `Break::None` that draws no rng, consumes no op-sequence number, and records
+// no trace event, so the pinned seed corpus is untouched when idle.
+// ---------------------------------------------------------------------------
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Break {
+    None,
+    /// Truncate a materialized view: torn write, truth untouched → VIEWS==TRUTH.
+    View,
+    /// Blackhole peer bucket 1 and drop the note that owes it → ACK_TOTALITY.
+    Fanout,
+    /// End the rerun of a seed in a different world → world-state determinism.
+    Rerun,
+    /// Restore an acked-deleted artifact, tombstone gone → TOMBSTONE_MONOTONICITY.
+    Resurrect,
+    /// Mutate truth with no breadcrumb over it → audit-repair class 1 ORDERING.
+    Ordering,
+}
+
+impl Break {
+    fn parse(name: &str) -> Break {
+        match name {
+            "none" => Break::None,
+            "view" => Break::View,
+            "fanout" => Break::Fanout,
+            "rerun" => Break::Rerun,
+            "resurrect" => Break::Resurrect,
+            "ordering" => Break::Ordering,
+            other => panic!("unknown --break {other} (view|fanout|rerun|resurrect|ordering)"),
+        }
+    }
+}
+
+/// Inject the selected defect. Called at two points, and only when a break is
+/// selected: `pre_audit` is inside the first heal round with the fast path
+/// already drained, so a truth mutation there is one the audit alone can
+/// converge; otherwise it is post-quiescence, just before the invariants, where
+/// nothing can launder the damage. `rerun` is true on a seed's second
+/// execution. Everything writes raw `SimStorage` — never a `FaultView` — so a
+/// break perturbs storage, never the schedule.
+async fn apply_break(
+    brk: Break,
+    pre_audit: bool,
+    rerun: bool,
+    buckets: &[Arc<SimStorage>],
+    obs: &Observer,
+    ledger: &Mutex<Ledger>,
+) {
+    match (brk, pre_audit) {
+        // Class-1 ORDERING by construction: truth grows a file with no `_dirty/`
+        // marker and no `_repl/` note anywhere covering it, so nothing durable
+        // can tell the fast path to rebuild and only the audit's fingerprint
+        // diff can converge the view. The clone reuses a live record's sidecar
+        // (same version, different wheel tag) so the added file renders like any
+        // other and the repaired view is byte-clean.
+        (Break::Ordering, true) => {
+            let dump = buckets[0].dump();
+            let live = dump.iter().find_map(|(key, sidecar)| {
+                let akey = key.strip_suffix(".meta.json")?;
+                Some((akey.to_string(), dump.get(akey)?.clone(), sidecar.clone()))
+            });
+            if let Some((akey, body, sidecar)) = live {
+                let clone = akey.replace("py3-none", "py2-none");
+                buckets[0].insert(&clone, body);
+                buckets[0].insert(&format!("{clone}.meta.json"), sidecar);
+                obs.observe_mutation(0, 0, &clone, None);
+            }
+        }
+        // A torn view write: the last byte never landed. Truth is untouched, so
+        // the byte-strict re-render must disagree. A run that materialized no
+        // package view at all gets the other arm of the same oracle — a view
+        // left standing for a package with no files.
+        (Break::View, false) => {
+            let dump = buckets[0].dump();
+            match dump.iter().find(|(key, _)| view_key_package(key).is_some()) {
+                Some((key, bytes)) => {
+                    buckets[0].insert(key, bytes[..bytes.len().saturating_sub(1)].to_vec())
+                }
+                None => buckets[0].insert("simple/vopr-ghost/index.json", b"{}".to_vec()),
+            }
+        }
+        // Nondeterminism downstream of the op sequence: the rerun issues the
+        // identical storage-op trace (this write bypasses the traced view) and
+        // still ends in a different world. Deliberately parked at a key no other
+        // oracle reads, so the state hash is the only thing that can catch it.
+        (Break::Rerun, false) if rerun => {
+            buckets[0].insert("_vopr/break-rerun", b"second execution only".to_vec());
+        }
+        // A removed (compromised) artifact comes back: its bytes are restored
+        // and the tombstone that forbade it is gone.
+        (Break::Resurrect, false) => {
+            let victim = {
+                let ledger = ledger.lock().expect("ledger lock");
+                ledger
+                    .last_ack_deleted
+                    .iter()
+                    .find(|(_, deleted)| **deleted)
+                    .map(|((pkg, fname), _)| format!("packages/{pkg}/{fname}"))
+            };
+            if let Some(akey) = victim {
+                let _ = buckets[0].delete_keys(&[format!("{akey}.tombstone")]).await;
+                buckets[0].insert(&akey, b"resurrected".to_vec());
+            }
+        }
+        _ => {}
+    }
+}
+
 fn filename(pkg: &str, file: u8) -> String {
     // Wheel filenames escape dashes in the distribution segment; a dashed
     // package name here would parse as distribution "vopr", version "alpha".
@@ -437,6 +553,8 @@ struct FaultPlan {
     trace: Mutex<TraceHasher>,
     /// Effect history for the audit-repair classifier. Pure observation.
     obs: Observer,
+    /// The selected deliberate defect, `Break::None` in every ordinary run.
+    brk: Break,
 }
 
 struct TraceHasher {
@@ -465,7 +583,7 @@ impl TraceHasher {
 }
 
 impl FaultPlan {
-    fn new(seed: u64, nodes: usize, fail_percent: u64) -> Arc<Self> {
+    fn new(seed: u64, nodes: usize, fail_percent: u64, brk: Break) -> Arc<Self> {
         Arc::new(FaultPlan {
             op_seq: AtomicU64::new(0),
             fail_percent,
@@ -479,6 +597,7 @@ impl FaultPlan {
                 log: std::env::var_os("VOPR_TRACE").map(|_| Vec::new()),
             }),
             obs: Observer::default(),
+            brk,
         })
     }
 
@@ -584,10 +703,22 @@ impl FaultView {
         (key == "simple/index.json" || key == "simple/index.html").then(|| bytes.to_vec())
     }
 
+    /// `--break fanout` is armed: peer bucket 1 blackholes every chaos-phase op
+    /// (below) *and* the `_repl/1/` note that is supposed to owe it never lands
+    /// (`put_bytes`), so a publish acks with neither the copy nor the promise —
+    /// a totality violation and nothing else. It heals with the fault plan, so
+    /// the heal phase still converges every other oracle.
+    fn fanout_break(&self) -> bool {
+        self.plan.brk == Break::Fanout && !self.plan.healing.load(Ordering::SeqCst)
+    }
+
     async fn gate(&self, op: &'static str, key: &str) -> Result<()> {
         let (fate, delay) = self.plan.admit(self.node, self.bucket, op, key);
         tokio::time::sleep(delay).await;
         match fate {
+            OpFate::Ok if self.bucket == 1 && self.fanout_break() => Err(anyhow!(
+                "vopr: --break fanout blackholed peer bucket 1 ({op} {key})"
+            )),
             OpFate::Ok => Ok(()),
             OpFate::Fail => Err(anyhow!("vopr: injected storage failure ({op} {key})")),
             OpFate::Crash => {
@@ -627,6 +758,9 @@ impl Storage for FaultView {
             self.gate("put", &format!("{key} => {body}")).await?;
         } else {
             self.gate("put", key).await?;
+        }
+        if key.starts_with("_repl/1/") && self.fanout_break() {
+            return Ok(()); // the note owing the blackholed peer is dropped
         }
         let body = self.global_body(key, &bytes);
         self.inner.put_bytes(key, bytes, ct).await?;
@@ -844,9 +978,10 @@ impl Fleet {
         nodes: usize,
         bucket_count: usize,
         fail_percent: u64,
+        brk: Break,
         clock: Arc<SimClock>,
     ) -> Fleet {
-        let plan = FaultPlan::new(seed, nodes, fail_percent);
+        let plan = FaultPlan::new(seed, nodes, fail_percent, brk);
         let buckets: Vec<Arc<SimStorage>> = (0..bucket_count)
             .map(|_| SimStorage::new(clock.clone()))
             .collect();
@@ -1040,19 +1175,20 @@ struct RunOutcome {
     violations: Vec<String>,
 }
 
-async fn run_seed(
-    seed: u64,
-    nodes: usize,
-    buckets: usize,
-    ops: u64,
-    fail_percent: u64,
-) -> RunOutcome {
+async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
+    let Profile {
+        nodes,
+        buckets,
+        ops,
+        fail_percent,
+        brk,
+    } = profile;
     let start =
         time::OffsetDateTime::parse(SIM_START, &time::format_description::well_known::Rfc3339)
             .expect("valid sim start");
     let clock = SimClock::new(start);
     let _guard = clock.install_global();
-    let mut fleet = Fleet::new(seed, nodes, buckets, fail_percent, clock.clone());
+    let mut fleet = Fleet::new(seed, nodes, buckets, fail_percent, brk, clock.clone());
     let mut rng = Rng::new(seed);
 
     // ---- Chaos phase: seed-driven interleaving of ops, faults, and time.
@@ -1216,6 +1352,17 @@ async fn run_seed(
                 }
                 clock.advance(std::time::Duration::from_secs(90));
             }
+        }
+        if brk != Break::None && round == 0 {
+            apply_break(
+                brk,
+                true,
+                rerun,
+                &fleet.buckets,
+                &fleet.plan.obs,
+                &fleet.ledger,
+            )
+            .await;
         }
         // With ticks lease-serialized and the diff drained, the marker path
         // must have converged every view on its own — snapshot them so an
@@ -1436,6 +1583,17 @@ async fn run_seed(
             "LIVENESS: fleet did not quiesce within the drain budget; leftover markers: {leftovers:?}"
         ));
     }
+    if brk != Break::None {
+        apply_break(
+            brk,
+            false,
+            rerun,
+            &fleet.buckets,
+            &fleet.plan.obs,
+            &fleet.ledger,
+        )
+        .await;
+    }
     let dumps: Vec<BTreeMap<String, Vec<u8>>> =
         fleet.buckets.iter().map(|bucket| bucket.dump()).collect();
 
@@ -1445,7 +1603,7 @@ async fn run_seed(
     // consumes no op-sequence numbers and cannot shift the fault schedule.
     for (idx, bucket) in fleet.buckets.iter().enumerate() {
         match pypiron::verify::verify_storage(bucket.as_ref()).await {
-            Ok(divergences) => violations.extend(divergences.into_iter().map(|d| {
+            Ok(report) => violations.extend(report.divergences.into_iter().map(|d| {
                 format!(
                     "VERIFY: bucket {idx} diverged from its own truth: {} {} — {}",
                     d.kind, d.package, d.detail
@@ -2031,6 +2189,9 @@ struct Args {
     /// pure function of the seed, and every failure line prints the resolved
     /// flags, so reproduction is still one explicit command.
     rotate: bool,
+    /// Deliberate defect to inject (`--break`), for mutation-testing the
+    /// oracles. `Break::None` in every ordinary run.
+    brk: Break,
 }
 
 #[derive(Clone, Copy)]
@@ -2039,6 +2200,7 @@ struct Profile {
     buckets: usize,
     ops: u64,
     fail_percent: u64,
+    brk: Break,
 }
 
 fn profile_for(seed: u64, args: &Args) -> Profile {
@@ -2048,6 +2210,7 @@ fn profile_for(seed: u64, args: &Args) -> Profile {
             buckets: args.buckets,
             ops: args.ops,
             fail_percent: args.fail_percent,
+            brk: args.brk,
         };
     }
     let mut rng = Rng::new(seed ^ 0x0507_A7E5);
@@ -2058,6 +2221,7 @@ fn profile_for(seed: u64, args: &Args) -> Profile {
         // Half the schedules crash-only, where audit repairs are hard
         // violations; half with injected storage failures.
         fail_percent: if rng.chance(50) { 0 } else { 3 },
+        brk: args.brk,
     }
 }
 
@@ -2073,9 +2237,17 @@ fn parse_args() -> Args {
         forever: false,
         max_secs: None,
         rotate: false,
+        brk: Break::None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
+        if flag == "--break" {
+            let name = it
+                .next()
+                .unwrap_or_else(|| panic!("missing value for --break"));
+            args.brk = Break::parse(&name);
+            continue;
+        }
         let mut grab = || {
             it.next()
                 .unwrap_or_else(|| panic!("missing value for {flag}"))
@@ -2110,20 +2282,14 @@ fn dump_trace(outcome: &RunOutcome) {
     }
 }
 
-fn run_once(seed: u64, profile: &Profile) -> RunOutcome {
+fn run_once(seed: u64, profile: &Profile, rerun: bool) -> RunOutcome {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .start_paused(true)
         .build()
         .expect("build paused runtime");
     let local = tokio::task::LocalSet::new();
-    runtime.block_on(local.run_until(run_seed(
-        seed,
-        profile.nodes,
-        profile.buckets,
-        profile.ops,
-        profile.fail_percent,
-    )))
+    runtime.block_on(local.run_until(run_seed(seed, *profile, rerun)))
 }
 
 fn main() {
@@ -2157,7 +2323,7 @@ fn main() {
         let seed = args.start_seed + explored;
         explored += 1;
         let profile = profile_for(seed, &args);
-        let mut outcome = run_once(seed, &profile);
+        let mut outcome = run_once(seed, &profile, false);
         dump_trace(&outcome);
         total_events += outcome.trace_events;
         total_acked += outcome.acked;
@@ -2170,7 +2336,7 @@ fn main() {
             *total += add;
         }
         if args.recheck_every > 0 && seed.is_multiple_of(args.recheck_every) {
-            let again = run_once(seed, &profile);
+            let again = run_once(seed, &profile, true);
             if again.trace_hash != outcome.trace_hash {
                 eprintln!(
                     "vopr: DETERMINISM VIOLATION seed={seed}: trace {:#x} vs {:#x}",

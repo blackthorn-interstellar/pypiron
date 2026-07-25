@@ -113,6 +113,35 @@ jobs:
           cargo run --example vopr -- --seed 19900 --nodes 3 --buckets 1 --ops 80 --fail-percent 3
           cargo run --example vopr -- --seed 19026 --nodes 2 --buckets 1 --ops 160 --fail-percent 3
           cargo run --example vopr -- --seed 47843 --nodes 2 --buckets 2 --ops 120 --fail-percent 3
+      # Mutation-testing the oracles themselves. Each `--break` is ONE deliberate
+      # defect the named invariant exists to catch, so the run MUST fail with
+      # that invariant's text — an invariant nobody has watched go red is an
+      # assertion of faith, not a test. The seed range is pinned and the
+      # simulator is deterministic, so this is a gate, not a sample; the number
+      # of fresh seeds each break needs (K) is recorded in dev/TESTING.md.
+      - name: Oracle kill proofs (--break)
+        run: |
+          fail=0
+          check() { # name expected-text flags...
+            local name="$1" expect="$2"; shift 2
+            if out=$(cargo run --example vopr -- --seeds 3 "$@" --break "$name" 2>&1); then
+              echo "::error::--break $name passed — the oracle behind '$expect' is dead"
+              fail=1
+            elif ! grep -qF "$expect" <<<"$out"; then
+              echo "::error::--break $name failed for the wrong reason; expected '$expect'"
+              tail -30 <<<"$out"
+              fail=1
+            else
+              echo "ok: --break $name red '$expect'"
+            fi
+          }
+          check view      "VERIFY: bucket 0 diverged"  --nodes 2 --buckets 1 --ops 80
+          check fanout    "ACK_TOTALITY:"              --nodes 2 --buckets 2 --ops 80 --fail-percent 0
+          check rerun     "op traces matched but the final world differs" \
+                                                       --nodes 2 --buckets 2 --ops 80 --recheck-every 1
+          check resurrect "TOMBSTONE_MONOTONICITY:"    --nodes 2 --buckets 1 --ops 80
+          check ordering  "AUDIT_ORDERING:"            --nodes 2 --buckets 1 --ops 80
+          exit $fail
 
   integration:
     # The product's center of gravity is the blackbox suite (dev/TESTING.md): the

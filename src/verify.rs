@@ -46,12 +46,25 @@ pub struct Divergence {
     pub detail: String,
 }
 
+/// What one pass over storage found: the truth it counted and the views that
+/// disagreed with it.
+pub struct VerifyReport {
+    pub packages: usize,
+    pub files: usize,
+    pub divergences: Vec<Divergence>,
+}
+
 /// The pure diff: recompute every view from truth and return what disagrees.
 /// Read-only and storage-agnostic, so the deterministic simulator can point it
 /// at an in-memory bucket and get the same byte-strict verdict the CLI gives.
-pub async fn verify_storage(storage: &dyn Storage) -> Result<Vec<Divergence>> {
+/// The truth counts come back with the diff because enumerating `packages/` is
+/// the expensive part on a real mirror — a caller that wants totals must not
+/// pay for a second listing pass.
+pub async fn verify_storage(storage: &dyn Storage) -> Result<VerifyReport> {
     let truth = enumerate_grouped(storage, PACKAGES_PREFIX).await?;
     let views = enumerate_grouped(storage, SIMPLE_PREFIX).await?;
+    let package_count = truth.len();
+    let file_count = truth.values().map(Vec::len).sum::<usize>();
 
     let mut divergences: Vec<Divergence> = Vec::new();
     let mut live_packages: Vec<String> = Vec::new();
@@ -83,7 +96,11 @@ pub async fn verify_storage(storage: &dyn Storage) -> Result<Vec<Divergence>> {
 
     live_packages.sort();
     check_global(storage, &live_packages, &mut divergences).await;
-    Ok(divergences)
+    Ok(VerifyReport {
+        packages: package_count,
+        files: file_count,
+        divergences,
+    })
 }
 
 /// Run the read-only diff. `Ok(true)` = converged, `Ok(false)` = diverged
@@ -100,25 +117,24 @@ pub async fn run_verify(args: VerifyArgs) -> Result<bool> {
         );
     }
 
-    // Counted, then released: the summary's totals must not hold a second copy
-    // of the truth map alive across the diff (a full mirror is ~10^6 objects).
-    let (packages, files) = {
-        let truth = enumerate_grouped(storage.as_ref(), PACKAGES_PREFIX).await?;
-        (truth.len(), truth.values().map(Vec::len).sum::<usize>())
-    };
-    let divergences = verify_storage(storage.as_ref()).await?;
+    // One pass: the diff counts the truth it already enumerated, so the summary
+    // totals cost nothing extra and no second copy of the truth map (a full
+    // mirror is ~10^6 objects) is ever alive.
+    let report = verify_storage(storage.as_ref()).await?;
 
-    for d in &divergences {
+    for d in &report.divergences {
         println!("{}\t{}\t{}", d.kind, d.package, d.detail);
     }
     println!(
-        "verify: {packages} packages, {files} files, {} divergence(s)",
-        divergences.len()
+        "verify: {} packages, {} files, {} divergence(s)",
+        report.packages,
+        report.files,
+        report.divergences.len()
     );
     // Diverged is an expected, scriptable outcome — return it as data (the rows
     // and summary are already on stdout) rather than routing it through the
     // error channel, which is reserved for "could not run".
-    Ok(divergences.is_empty())
+    Ok(report.divergences.is_empty())
 }
 
 /// Flat-list `prefix` across shards and group objects by first path segment

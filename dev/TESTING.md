@@ -288,6 +288,53 @@ is exactly the open per-package-leasing design decision behind class 3: until a
 rebuild takes a per-package lease, two unleased rebuilds can still race, and the
 audit remains their documented backstop.
 
+### Proving the oracles can go red (`--break`)
+
+An invariant nobody has watched fail is not a test — it is an assertion of faith
+that costs runtime forever and reports reassurance. `--break <name>` injects ONE
+deliberate defect that a named oracle is supposed to catch; the run must then
+FAIL with that oracle's text, and ci.yml's **Oracle kill proofs** step gates on
+exactly that. Every break lives in the harness — no product-code hook ships in
+the binary — and writes raw `SimStorage`, never a `FaultView`, so it perturbs
+storage and never the schedule.
+
+| `--break`   | the injected defect | must red | K |
+|---|---|---|---|
+| `view`      | a torn view write (the last byte never landed), truth untouched | `VERIFY: … stale-view` | 1 |
+| `fanout`    | peer bucket 1 blackholes the chaos phase *and* the `_repl/1/` note owing it is dropped | `ACK_TOTALITY:` (needs `--fail-percent 0`, where it is the hard gate) | 1 |
+| `rerun`     | a seed's second execution ends in a different world off an identical op trace | `DETERMINISM VIOLATION … same calls, different bytes` (needs `--recheck-every 1`) | 1 |
+| `resurrect` | an acked-deleted artifact's bytes come back with its tombstone gone | `TOMBSTONE_MONOTONICITY:` | 3 |
+| `ordering`  | truth grows a file with no `_dirty/` marker and no `_repl/` note ever covering it | `AUDIT_ORDERING:` (repair class 1) | 3 |
+
+K is how many fresh seeds the break needs to red with ≥99.8% confidence.
+`view`, `fanout` and `rerun` red on every seed (300/300 measured); `resurrect`
+(272/300) and `ordering` (266/300) need a run that actually produced the state
+they corrupt — an acked `204`, and a live artifact+sidecar pair, respectively —
+so a schedule that ended with every file tombstoned leaves them inert. CI
+samples nothing: the seed range is pinned and the simulator is deterministic.
+
+`--break ordering` is the first execution the ~310-line repair classifier has
+ever had. It mutates truth with no durable breadcrumb over it, which is the
+class-1 definition verbatim, and `analyze()` returns class 1 with the causal
+detail — the classifier is sound, it had simply never been handed a class-1
+input by the product.
+
+Off by default and provably free: every injection point is a comparison against
+`Break::None` that draws no rng, consumes no op-sequence number and records no
+trace event. Prove it the way this document already demands of a new oracle —
+`VOPR_TRACE_FILE` captured before and after must be byte-identical, and the
+pinned baselines must reproduce to the digit.
+
+**Reachable by the workload, or sound but unreachable?** Four of the five are
+reachable: the workload produces the states that red them. TOMBSTONE
+MONOTONICITY does not — `publish_record`'s tombstone fence rejects a re-publish
+of a deleted filename, so no ack can follow a `204` and the invariant cannot
+fire on today's workload at any seed count. `--break resurrect` proves the
+*oracle* is sound even though the *product* cannot reach the state, which is
+the honest status of that guard: mirror filenames are re-fillable by design, so
+the day a legal resurrection path lands it is already watched. An
+unreachable-but-sound guard is legitimate; an unproven one is not.
+
 ## Real cloud backends
 
 The emulators (MinIO, Azurite) are fast and hermetic but not the real thing, and

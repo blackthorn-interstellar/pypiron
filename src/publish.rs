@@ -535,10 +535,11 @@ pub async fn publish_record(
             }
             // A claim can survive even when the uploader dies before writing an
             // artifact. Fan the package-level claim out to every healthy bucket
-            // before the artifact even lands locally, so the private name is
-            // reserved fleet-wide ahead of its bytes (the dependency-confusion
-            // boundary); the later artifact fan-out re-claims idempotently.
-            if !is_mirror && claim.etag.is_some() && state.buckets.is_multi() {
+            // before the artifact even lands locally, so the name is reserved
+            // fleet-wide ahead of its bytes (the dependency-confusion boundary);
+            // the later artifact fan-out re-claims idempotently. A `sync --to`
+            // snapshot claim replicates too — it shrinks the same window.
+            if claim.etag.is_some() && state.buckets.is_multi() {
                 replicate::fanout_sync(state, pinned, &pkg_norm, replicate::ORIGIN_MARKER, None)
                     .await;
             }
@@ -582,6 +583,10 @@ pub async fn publish_record(
         origin: Some(desired_origin.to_string()),
         upload_epoch_ms: (!is_mirror).then(now_epoch_millis),
         yank_epoch: 0,
+        // A `sync --to` upload is a snapshot: mirror content the operator chose,
+        // which replicates as truth. (Private replicates from its origin; the
+        // bit only steers mirror-origin records, so private stays false.)
+        replicate: is_mirror,
     };
     let sc_bytes = serde_json::to_vec(&sc).map_err(|_| {
         (
@@ -819,18 +824,17 @@ pub async fn publish_record(
     }
 
     // Stream the record to every other healthy bucket before the ack; any
-    // bucket that misses gets a durable `_repl/` note for the sweep. Mirror
-    // cache content is intentionally local and pays none of this cost.
-    if !is_mirror {
-        // The verified spool is still alive here; pass it so each peer reads the
-        // artifact from local disk instead of GETting it back from the source
-        // bucket. In-memory (simulator) uploads carry no spool file.
-        let spool = match &body {
-            PublishBody::Spool(temp) => Some(temp.path()),
-            PublishBody::Bytes(_) => None,
-        };
-        replicate::fanout_sync(state, pinned, &pkg_norm, &filename, spool).await;
-    }
+    // bucket that misses gets a durable `_repl/` note for the sweep. A
+    // `sync --to` upload is a replicating snapshot, so it fans out exactly like
+    // private truth (proxy-cache fills never reach `store_upload`, so every
+    // `is_mirror` here is a snapshot). The verified spool is still alive; pass
+    // it so each peer reads the artifact from local disk instead of GETting it
+    // back from the source bucket. In-memory (simulator) uploads carry no spool.
+    let spool = match &body {
+        PublishBody::Spool(temp) => Some(temp.path()),
+        PublishBody::Bytes(_) => None,
+    };
+    replicate::fanout_sync(state, pinned, &pkg_norm, &filename, spool).await;
 
     // Read-your-writes by waiting: poll our own index until the file shows
     // up, so publish-then-install pipelines never see a missing version.
@@ -1151,6 +1155,7 @@ pub(crate) async fn set_yank(
     };
     let mut wrote = false;
     let mut record_origin = None;
+    let mut record_replicate = false;
     for _ in 0..8 {
         let Some((bytes, etag)) = storage.get_with_etag(&sc_key).await.map_err(|e| {
             (
@@ -1181,6 +1186,7 @@ pub(crate) async fn set_yank(
         sc.yank_epoch = sc.yank_epoch.saturating_add(1);
         sc.yanked = desired.clone();
         record_origin = sc.origin.clone();
+        record_replicate = sc.replicate;
         if intent_nonce.is_none() {
             intent_nonce = markers::mark_intent(storage, pkg).await.ok();
         }
@@ -1206,23 +1212,33 @@ pub(crate) async fn set_yank(
     if let Err(e) = markers::commit_marker(state, storage, pkg, intent_nonce).await {
         warn!(error=?e, "yank: failed to write commit marker");
     }
-    let replicate_private = if !state.buckets.is_multi() {
+    // A yank replicates when it rides truth: private always, and a mirror
+    // snapshot (replicate=true) — closing the "mirror yank never converges"
+    // gap. A proxy cache's yank stays bucket-local. The sidecar just written
+    // carries both the origin and the replicate bit, so no extra read on the
+    // common path; only a legacy sidecar with no typed origin falls back to the
+    // package claim (where a mirror is a cache, so only private replicates).
+    let replicate_this = if !state.buckets.is_multi() {
         false
-    } else if let Some(owner) = record_origin.as_deref() {
-        owner == origin::PRIVATE
     } else {
-        origin::read_origin(storage, pkg)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("storage error reading origin for replication: {e}"),
-                )
-            })?
-            .as_deref()
-            == Some(origin::PRIVATE)
+        match record_origin.as_deref() {
+            Some(origin::PRIVATE) => true,
+            Some(origin::MIRROR) => record_replicate,
+            _ => {
+                origin::read_origin(storage, pkg)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("storage error reading origin for replication: {e}"),
+                        )
+                    })?
+                    .as_deref()
+                    == Some(origin::PRIVATE)
+            }
+        }
     };
-    if replicate_private {
+    if replicate_this {
         replicate::fanout_sync(state, pinned, pkg, filename, None).await;
     }
     Ok(StatusCode::OK)

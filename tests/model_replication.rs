@@ -75,6 +75,9 @@ struct AbsSidecar {
     yank_epoch: u8,
     /// Server-stamped receive time (ms). `None` on mirror/backfilled sidecars.
     epoch_ms: Option<u16>,
+    /// `sync --to` snapshot bit. True only on a replicating mirror snapshot;
+    /// false on private (private replicates from origin) and on proxy caches.
+    replicate: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
@@ -188,6 +191,7 @@ fn to_sidecar(a: &AbsSidecar) -> Sidecar {
         ),
         upload_epoch_ms: a.epoch_ms.map(u64::from),
         yank_epoch: u64::from(a.yank_epoch),
+        replicate: a.replicate,
     }
 }
 
@@ -292,7 +296,10 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
             let (Some(byte), Some(sc)) = (rec.artifact, rec.sidecar) else {
                 unreachable!("Copy verdict from a non-live record");
             };
-            dst.pkg_origin = Some(MOrigin::Private);
+            // A private copy claims the destination private; a `sync --to`
+            // snapshot claims it mirror (ensure_mirror_origin never demotes a
+            // private peer — but a Copy destination is Absent, so unclaimed).
+            dst.pkg_origin = Some(sc.origin);
             let drec = &mut dst.files[file as usize];
             drec.artifact = Some(byte);
             drec.sidecar = Some(sc);
@@ -312,6 +319,19 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
                 }
                 (MOrigin::Mirror, MOrigin::Private) => {
                     a.files[file as usize].sidecar = Some(sb);
+                }
+                // Two replicated snapshots converge their yank state; two proxy
+                // caches (either side non-replicating) stay bucket-local.
+                (MOrigin::Mirror, MOrigin::Mirror) if sa.replicate && sb.replicate => {
+                    match pypiron::replicate::yank_merge(&to_sidecar(&sa), &to_sidecar(&sb)) {
+                        pypiron::replicate::MergeChoice::A => {
+                            b.files[file as usize].sidecar = Some(sa);
+                        }
+                        pypiron::replicate::MergeChoice::B => {
+                            a.files[file as usize].sidecar = Some(sb);
+                        }
+                        pypiron::replicate::MergeChoice::Equal => {}
+                    }
                 }
                 (MOrigin::Mirror, MOrigin::Mirror) => {}
                 (MOrigin::Private, MOrigin::Private) => {
@@ -385,6 +405,8 @@ fn backfill_once(w: &World, bucket: u8, file: u8) -> Option<World> {
         yanked: false,
         yank_epoch: 0,
         epoch_ms: None,
+        // A backfilled sidecar cannot prove it was a snapshot: stays a cache.
+        replicate: false,
     });
     Some(next)
 }
@@ -451,6 +473,7 @@ fn writer_step(w: &World, idx: usize) -> Option<World> {
                 yanked: false,
                 yank_epoch: 0,
                 epoch_ms: Some(epoch),
+                replicate: false,
             });
             next.acked.insert((file, byte));
             advance(&mut next, WriterPc::Done);
@@ -475,6 +498,7 @@ fn writer_step(w: &World, idx: usize) -> Option<World> {
                 yanked: false,
                 yank_epoch: 0,
                 epoch_ms: None,
+                replicate: false,
             });
             advance(&mut next, WriterPc::SidecarWritten);
             Some(next)
@@ -928,6 +952,16 @@ mod conformance {
             yanked,
             yank_epoch,
             epoch_ms,
+            // `snap` below builds the replicating-snapshot variants.
+            replicate: false,
+        };
+        let snap = |sha_of: u8, yanked: bool, yank_epoch: u8| AbsSidecar {
+            sha_of,
+            origin: MOrigin::Mirror,
+            yanked,
+            yank_epoch,
+            epoch_ms: None,
+            replicate: true,
         };
         vec![
             // Absent.
@@ -959,7 +993,7 @@ mod conformance {
                 sidecar: Some(sc(0, MOrigin::Private, true, 2, Some(0))),
                 ..FileRec::default()
             },
-            // Live mirror (two different cached bodies).
+            // Live mirror caches (two different cached bodies, bucket-local).
             FileRec {
                 artifact: Some(0),
                 sidecar: Some(sc(0, MOrigin::Mirror, false, 0, None)),
@@ -968,6 +1002,24 @@ mod conformance {
             FileRec {
                 artifact: Some(1),
                 sidecar: Some(sc(1, MOrigin::Mirror, false, 0, None)),
+                ..FileRec::default()
+            },
+            // Live mirror SNAPSHOTS (replicate=true): two byte variants and a
+            // yanked one, so the conformance pass exercises the snapshot Copy,
+            // the two-snapshot divergent Freeze, and the mirror yank merge.
+            FileRec {
+                artifact: Some(0),
+                sidecar: Some(snap(0, false, 0)),
+                ..FileRec::default()
+            },
+            FileRec {
+                artifact: Some(1),
+                sidecar: Some(snap(1, false, 0)),
+                ..FileRec::default()
+            },
+            FileRec {
+                artifact: Some(0),
+                sidecar: Some(snap(0, true, 2)),
                 ..FileRec::default()
             },
             // Orphan: bare artifact, no sidecar (crashed writer debris).
@@ -1105,6 +1157,7 @@ mod conformance {
             sha_of,
             origin,
             yanked: !matches!(sc.yanked.normalized(), Yanked::Flag(false)),
+            replicate: sc.replicate,
             yank_epoch: u8::try_from(sc.yank_epoch).expect("small epochs"),
             epoch_ms: sc
                 .upload_epoch_ms

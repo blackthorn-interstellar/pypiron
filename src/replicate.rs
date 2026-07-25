@@ -415,6 +415,11 @@ async fn adopt_sidecar_cas(
         let choice = match (left_origin, right_origin) {
             (Origin::Private, Origin::Mirror) => MergeChoice::A,
             (Origin::Mirror, Origin::Private) => MergeChoice::B,
+            // Two replicated snapshots converge their yank state (§6.5); two
+            // proxy caches (or a snapshot vs a cache) stay bucket-local.
+            (Origin::Mirror, Origin::Mirror) if left.replicate && right.replicate => {
+                yank_merge(&left, &right)
+            }
             (Origin::Mirror, Origin::Mirror) => MergeChoice::Equal,
             (Origin::Private, Origin::Private) => yank_merge(&left, &right),
         };
@@ -462,10 +467,12 @@ async fn repair_same_sha_companions(
             RecordState::Live {
                 sha: sha_a,
                 origin: origin_a,
+                ..
             },
             RecordState::Live {
                 sha: sha_b,
                 origin: origin_b,
+                ..
             },
         ) if sha_a == sha_b => (origin_a, origin_b),
         _ => return Ok((false, false)),
@@ -796,12 +803,25 @@ async fn copy_live(
             changed = true;
         }
     }
+    // A `sync --to` snapshot (mirror origin, replicate=true) replicates as
+    // truth on the mirror-safe path: it claims MIRROR create-if-absent (never
+    // demoting a private claim) and installs a mirror sidecar (never overwriting
+    // private truth). Private records take the private path unchanged.
+    let is_mirror = matches!(record.origin(), Some(Origin::Mirror));
     // Origin claim first, ahead of the artifact — shrinks the dependency-
-    // confusion window (§4): the name is private before its bytes land.
-    ensure_private_origin(dst, pkg).await?;
+    // confusion window (§4): the name is claimed before its bytes land.
+    if is_mirror {
+        ensure_mirror_origin(dst, pkg).await?;
+    } else {
+        ensure_private_origin(dst, pkg).await?;
+    }
     // Sidecar first: an orphan sidecar is inert, but an orphan artifact would be
     // fabricated into truth by the destination's backfill (§4).
-    changed |= install_or_verify_sidecar(dst, &sidecar_key(&akey), sc).await?;
+    changed |= if is_mirror {
+        install_or_verify_mirror_sidecar(dst, &sidecar_key(&akey), sc).await?
+    } else {
+        install_or_verify_sidecar(dst, &sidecar_key(&akey), sc).await?
+    };
     if let Some(bytes) = verified.metadata {
         changed |= put_if_absent_or_verify(
             dst,
@@ -1061,6 +1081,116 @@ async fn ensure_private_origin(dst: &dyn Storage, pkg: &str) -> Result<()> {
         }
     }
     bail!("could not make '{pkg}' private on the destination after {ORIGIN_ATTEMPTS} attempts")
+}
+
+/// Drive `pkg`'s origin claim on `dst` to at least `mirror`:
+/// create-if-absent, or CAS the `unclaimed` sentinel. A claim already `private`
+/// is left untouched — private is terminal and outranks mirror everywhere, so a
+/// replicated snapshot NEVER demotes it (the mirror analogue of
+/// [`ensure_private_origin`], which does demote). A claim already `mirror` is a
+/// no-op. Any real claim a racer installed (private or mirror) is accepted.
+async fn ensure_mirror_origin(dst: &dyn Storage, pkg: &str) -> Result<()> {
+    for _ in 0..ORIGIN_ATTEMPTS {
+        match read_origin_observation(dst, pkg).await? {
+            None => {
+                // Absent: create-if-absent. A racer may beat us to a real claim;
+                // either private (which we must not demote) or mirror is fine.
+                let owner = claim_origin(dst, pkg, MIRROR).await?.owner;
+                if owner == MIRROR || owner == PRIVATE {
+                    return Ok(());
+                }
+            }
+            Some(observed) if observed.state == OriginState::Mirror => return Ok(()),
+            // Private outranks a replicated mirror snapshot; leave it terminal.
+            Some(observed) if observed.state == OriginState::Private => return Ok(()),
+            Some(observed) if observed.state == OriginState::Unclaimed => {
+                let request = ClaimRequest::new(MIRROR, Some(&observed));
+                let owner = claim_origin(dst, pkg, request).await?.owner;
+                if owner == MIRROR || owner == PRIVATE {
+                    return Ok(());
+                }
+            }
+            Some(observed) => {
+                bail!(
+                    "origin claim for '{pkg}' holds unsupported state '{}'",
+                    observed.state.as_str()
+                )
+            }
+        }
+    }
+    bail!("could not make '{pkg}' mirror on the destination after {ORIGIN_ATTEMPTS} attempts")
+}
+
+/// Install a replicated mirror snapshot's sidecar under CAS. A `replicate=true`
+/// mirror sidecar is accepted (unlike [`install_or_verify_sidecar`], which is
+/// private-only), but private truth on the destination is NEVER overwritten —
+/// private outranks mirror everywhere. Same-sha crash debris is repaired in
+/// place; a different-sha mirror body is a split-brain resolved by the freeze
+/// path, not here. Returns whether the destination sidecar changed.
+async fn install_or_verify_mirror_sidecar(
+    dst: &dyn Storage,
+    key: &str,
+    sidecar: &Sidecar,
+) -> Result<bool> {
+    if sidecar.origin.as_deref() != Some(MIRROR) || !sidecar.replicate {
+        bail!("mirror replication source sidecar at {key} is not a replicated snapshot");
+    }
+    let bytes = serde_json::to_vec(sidecar)?;
+    let artifact = key
+        .strip_suffix(SIDECAR_SUFFIX)
+        .ok_or_else(|| anyhow!("sidecar key has no {SIDECAR_SUFFIX} suffix: {key}"))?;
+    for _ in 0..ORIGIN_ATTEMPTS {
+        let Some((current_bytes, etag)) = dst.get_with_etag(key).await? else {
+            if dst.put_if_absent(key, bytes.clone(), json()).await? {
+                return Ok(true);
+            }
+            continue;
+        };
+        if current_bytes == bytes {
+            return Ok(false);
+        }
+        let current: Sidecar = serde_json::from_slice(&current_bytes)
+            .with_context(|| format!("parse destination sidecar {key}"))?;
+        if let Some(raw) = current.origin.as_deref() {
+            if Origin::parse(raw).is_none() {
+                bail!("sidecar at {key} holds an unexpected origin '{raw}'");
+            }
+        }
+        // Private truth outranks a replicated mirror snapshot; leave it in place.
+        if current.origin.as_deref() == Some(PRIVATE) {
+            return Ok(false);
+        }
+        let replace = if current.sha256 != sidecar.sha256 {
+            // A different-sha mirror sidecar is replaceable only as stale crash
+            // debris: the destination body must be absent or already our bytes.
+            let body = match dst.get_bytes(artifact).await {
+                Ok(body) => Some(body),
+                Err(error) if is_not_found(&error) => None,
+                Err(error) => return Err(error),
+            };
+            body.is_none()
+                || body
+                    .as_deref()
+                    .is_some_and(|body| sha256_hex(body) == sidecar.sha256)
+        } else {
+            // Same bytes: the higher yank epoch wins (§6.5).
+            yank_merge(sidecar, &current) == MergeChoice::A
+        };
+        if !replace {
+            if current.sha256 != sidecar.sha256 {
+                bail!(
+                    "destination mirror sidecar at {key} names sha {} backed by different bytes; expected {}",
+                    current.sha256,
+                    sidecar.sha256
+                );
+            }
+            return Ok(false);
+        }
+        if dst.put_if_match(key, &etag, bytes.clone()).await?.is_some() {
+            return Ok(true);
+        }
+    }
+    bail!("conditional mirror sidecar replacement retries exhausted for {key}")
 }
 
 /// Preserve an artifact body at `_quarantine/<pkg>/<file>@<actual-sha12>` before
@@ -3273,6 +3403,67 @@ mod tests {
             read_origin(&s, "fresh").await.unwrap().as_deref(),
             Some(PRIVATE)
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_mirror_origin_claims_but_never_demotes_private() {
+        let s = InMemStorage::default();
+        // Absent → creates a mirror claim (a snapshot replicating into a fresh
+        // bucket).
+        ensure_mirror_origin(&s, "fresh").await.unwrap();
+        assert_eq!(
+            read_origin(&s, "fresh").await.unwrap().as_deref(),
+            Some(MIRROR)
+        );
+        // Already mirror → idempotent.
+        ensure_mirror_origin(&s, "fresh").await.unwrap();
+        assert_eq!(
+            read_origin(&s, "fresh").await.unwrap().as_deref(),
+            Some(MIRROR)
+        );
+        // Private → left terminal; a snapshot NEVER demotes private truth.
+        claim_origin(&s, "owned", PRIVATE).await.unwrap();
+        ensure_mirror_origin(&s, "owned").await.unwrap();
+        assert_eq!(
+            read_origin(&s, "owned").await.unwrap().as_deref(),
+            Some(PRIVATE)
+        );
+    }
+
+    #[tokio::test]
+    async fn install_mirror_sidecar_accepts_snapshot_but_yields_to_private() {
+        let s = InMemStorage::default();
+        let akey = artifact_key("pkg", "pkg-1.0-py3-none-any.whl");
+        let key = sidecar_key(&akey);
+        let mut snapshot = decide::tests::sc("abc", MIRROR, crate::sidecar::Yanked::Flag(false), 0);
+        snapshot.replicate = true;
+
+        // Fresh install of a replicating snapshot sidecar.
+        assert!(install_or_verify_mirror_sidecar(&s, &key, &snapshot)
+            .await
+            .unwrap());
+        // Idempotent second pass.
+        assert!(!install_or_verify_mirror_sidecar(&s, &key, &snapshot)
+            .await
+            .unwrap());
+
+        // A non-replicating (cache) or private-origin source is rejected: only a
+        // replicating snapshot sidecar takes this path.
+        let mut cache = snapshot.clone();
+        cache.replicate = false;
+        assert!(install_or_verify_mirror_sidecar(&s, &key, &cache)
+            .await
+            .is_err());
+
+        // Private truth on the destination is never overwritten by a snapshot.
+        let s2 = InMemStorage::default();
+        let private = decide::tests::sc("abc", PRIVATE, crate::sidecar::Yanked::Flag(false), 0);
+        s2.insert(&key, serde_json::to_vec(&private).unwrap());
+        assert!(!install_or_verify_mirror_sidecar(&s2, &key, &snapshot)
+            .await
+            .unwrap());
+        let stored: Sidecar = serde_json::from_slice(&s2.get_bytes(&key).await.unwrap()).unwrap();
+        assert_eq!(stored.origin.as_deref(), Some(PRIVATE));
     }
 
     #[tokio::test]

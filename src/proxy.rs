@@ -680,6 +680,9 @@ impl Proxy {
             origin: Some(origin::MIRROR.to_string()),
             yank_epoch: 0,
             upload_epoch_ms: None,
+            // A proxy fill is a bucket-local cache, re-derivable from upstream —
+            // never a replicating snapshot. This is the documented carve-out.
+            replicate: false,
         };
         // Type the record before its artifact can exist. An orphan sidecar is
         // inert; an orphan artifact would be backfilled from a later private
@@ -929,6 +932,15 @@ impl Proxy {
             Listing::Found(found) => Some(found.clone()),
             Listing::Missing => None,
         };
+        // Persist the observed upstream status durably. The in-memory listing
+        // renders the freeze, but a lockfile-pinned `/files/...` download of an
+        // already-cached artifact never re-fetches the listing — only the
+        // durable `.project-status.json`, folded into the byte gate's
+        // quarantined set by the audit sweep, blocks those bytes.
+        if let Listing::Found(found) = &listing {
+            self.persist_observed_status(state, pkg, &found.status)
+                .await;
+        }
         let mut map = self.listings.lock().unwrap_or_else(|e| e.into_inner());
         if map.len() >= MAX_LISTINGS && !map.contains_key(pkg) {
             evict_listings(&mut map);
@@ -957,6 +969,23 @@ impl Proxy {
             Listing::Found(found) => Some(found.clone()),
             Listing::Missing => None,
         })
+    }
+
+    /// Persist the upstream PEP 792 status so the byte gate blocks cached bytes
+    /// of an upstream-quarantined project (see the call site). Mirror-origin
+    /// only; an operator-authored (private-origin) status is never clobbered.
+    /// Best-effort: a write failure only leaves the durable status one poll
+    /// stale — the in-memory listing still renders the freeze.
+    async fn persist_observed_status(
+        &self,
+        state: &AppState,
+        pkg: &str,
+        observed: &crate::status::ProjectStatusDoc,
+    ) {
+        let pinned = state.pin();
+        if let Err(e) = reconcile_observed_status(pinned.storage.as_ref(), pkg, observed).await {
+            warn!(%pkg, error=?e, "proxy: failed to persist upstream project status");
+        }
     }
 
     async fn fetch_listing(&self, state: &AppState, pkg: &str) -> Result<Listing> {
@@ -1072,6 +1101,40 @@ impl Proxy {
         let base = reqwest::Url::parse(&format!("{}/simple/{pkg}/", self.upstream))?;
         Ok(base.join(raw)?)
     }
+}
+
+/// Bring the durable `.project-status.json` into line with an observed upstream
+/// status. Writes only on a real change (idempotent under repeated polls), never
+/// clobbers an operator-authored private-origin status, and skips the write when
+/// upstream is the active default and no marker exists. A change marks the
+/// package dirty so its own leader rebuilds the (now file-less, if quarantined)
+/// index; the audit sweep separately folds a quarantine into the byte gate's set.
+async fn reconcile_observed_status(
+    storage: &dyn Storage,
+    pkg: &str,
+    observed: &crate::status::ProjectStatusDoc,
+) -> Result<()> {
+    match crate::status::read_status_versioned(storage, pkg).await? {
+        // An operator-authored (private-origin) status is authoritative; the
+        // proxy never overwrites it with a relayed upstream observation.
+        Some(cur) if cur.origin == Some(crate::replicate::Origin::Private) => return Ok(()),
+        // Durable status already reflects upstream: nothing to write.
+        Some(cur) if &cur.doc == observed => return Ok(()),
+        Some(_) => {}
+        // No marker yet and upstream is the active default: absence already
+        // means active, so a write would only add noise.
+        None if observed == &crate::status::ProjectStatusDoc::default() => return Ok(()),
+        None => {}
+    }
+    crate::status::advance_status(
+        storage,
+        pkg,
+        observed,
+        Some(crate::replicate::Origin::Mirror),
+    )
+    .await?;
+    crate::markers::mark_dirty(storage, pkg).await?;
+    Ok(())
 }
 
 /// Read an upstream companion body into memory with a hard ceiling. The local

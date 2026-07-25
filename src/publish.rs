@@ -539,7 +539,8 @@ pub async fn publish_record(
             // reserved fleet-wide ahead of its bytes (the dependency-confusion
             // boundary); the later artifact fan-out re-claims idempotently.
             if !is_mirror && claim.etag.is_some() && state.buckets.is_multi() {
-                replicate::fanout_sync(state, pinned, &pkg_norm, replicate::ORIGIN_MARKER).await;
+                replicate::fanout_sync(state, pinned, &pkg_norm, replicate::ORIGIN_MARKER, None)
+                    .await;
             }
             write_fence = Some(match claim.etag {
                 Some(etag) => origin::OriginObservation {
@@ -821,7 +822,14 @@ pub async fn publish_record(
     // bucket that misses gets a durable `_repl/` note for the sweep. Mirror
     // cache content is intentionally local and pays none of this cost.
     if !is_mirror {
-        replicate::fanout_sync(state, pinned, &pkg_norm, &filename).await;
+        // The verified spool is still alive here; pass it so each peer reads the
+        // artifact from local disk instead of GETting it back from the source
+        // bucket. In-memory (simulator) uploads carry no spool file.
+        let spool = match &body {
+            PublishBody::Spool(temp) => Some(temp.path()),
+            PublishBody::Bytes(_) => None,
+        };
+        replicate::fanout_sync(state, pinned, &pkg_norm, &filename, spool).await;
     }
 
     // Read-your-writes by waiting: poll our own index until the file shows
@@ -1068,7 +1076,7 @@ pub async fn delete_record(
     // A private delete carries a tombstone. Fan it out to every healthy bucket
     // before the ack; mirror cache eviction remains local and unreplicated.
     if replicate_delete {
-        replicate::fanout_sync(state, pinned, pkg, filename).await;
+        replicate::fanout_sync(state, pinned, pkg, filename, None).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1215,7 +1223,7 @@ pub(crate) async fn set_yank(
             == Some(origin::PRIVATE)
     };
     if replicate_private {
-        replicate::fanout_sync(state, pinned, pkg, filename).await;
+        replicate::fanout_sync(state, pinned, pkg, filename, None).await;
     }
     Ok(StatusCode::OK)
 }
@@ -1306,7 +1314,7 @@ async fn write_project_status(
         warn!(error=?e, "status: failed to write commit marker");
     }
     if replicate_private {
-        replicate::fanout_sync(state, &pinned, &pkg, replicate::PROJECT_STATUS_MARKER).await;
+        replicate::fanout_sync(state, &pinned, &pkg, replicate::PROJECT_STATUS_MARKER, None).await;
     }
     Ok(StatusCode::OK)
 }

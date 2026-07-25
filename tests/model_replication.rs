@@ -1243,6 +1243,7 @@ mod conformance {
                     FILES[0],
                     (&real_ra, &real_rb),
                     real_verdict,
+                    pypiron::replicate::ArtifactSource::Bucket,
                 )
                 .await
                 .unwrap_or_else(|e| {

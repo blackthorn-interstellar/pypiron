@@ -190,6 +190,7 @@ pub async fn execute(
     filename: &str,
     recs: (&Record, &Record),
     verdict: Verdict,
+    source: ArtifactSource<'_>,
 ) -> Result<()> {
     require_replication_unfenced(state)?;
     let (a, b) = stores;
@@ -262,7 +263,7 @@ pub async fn execute(
         }
         Verdict::Copy(side) => {
             let (src, dst, rec) = pick(side);
-            if copy_live(state, src, dst, pkg, filename, rec).await? {
+            if copy_live(state, src, dst, pkg, filename, rec, source).await? {
                 markers::mark_dirty(dst, pkg).await?;
             }
         }
@@ -283,7 +284,7 @@ pub async fn execute(
         }
         Verdict::Supersede(side) => {
             let (src, dst, record) = pick(side);
-            supersede_record(state, src, dst, pkg, filename, record).await?;
+            supersede_record(state, src, dst, pkg, filename, record, source).await?;
         }
         Verdict::QuarantineLoser(winner) => {
             let (src, dst, record) = pick(winner);
@@ -299,7 +300,7 @@ pub async fn execute(
                 loser_sha = loser.sidecar.as_ref().map(|s| s.sha256.as_str()).unwrap_or("?"),
                 "byte conflict: first-uploaded kept, loser quarantined; operator review required"
             );
-            supersede_record(state, src, dst, pkg, filename, record).await?;
+            supersede_record(state, src, dst, pkg, filename, record, source).await?;
             state
                 .metrics
                 .replication_conflict_quarantines
@@ -571,23 +572,59 @@ struct VerifiedSource {
     provenance: Option<Vec<u8>>,
 }
 
+/// Where a copy reads the artifact bytes it verifies against the source
+/// sidecar. `Bucket` is the universal source — the sweep, reconcile, and every
+/// peer of an already-committed record read the artifact back from the source
+/// bucket. A live upload additionally still holds its just-written, verified
+/// spool, so its pre-ack fan-out reads that local file once per peer instead of
+/// GETting the same bytes back out of the source bucket (~one full artifact GET
+/// saved per upload). The sha256 check against the sidecar is byte-identical
+/// either way: the spool never bypasses verification.
+#[derive(Clone, Copy)]
+pub enum ArtifactSource<'a> {
+    Bucket,
+    Spool(&'a std::path::Path),
+}
+
+impl ArtifactSource<'_> {
+    async fn read_artifact(&self, src: &dyn Storage, akey: &str) -> Result<Vec<u8>> {
+        match self {
+            ArtifactSource::Bucket => src
+                .get_bytes(akey)
+                .await
+                .with_context(|| format!("read source artifact {akey}")),
+            ArtifactSource::Spool(path) => tokio::fs::read(path)
+                .await
+                .with_context(|| format!("read upload spool {} for fan-out", path.display())),
+        }
+    }
+}
+
 async fn verify_source_record(
     src: &dyn Storage,
     pkg: &str,
     filename: &str,
     record: &Record,
+    source: ArtifactSource<'_>,
 ) -> Result<VerifiedSource> {
     let sidecar = record
         .sidecar
         .as_ref()
         .ok_or_else(|| anyhow!("copy verdict with no source sidecar"))?;
     let akey = artifact_key(pkg, filename);
-    let artifact = src
-        .get_bytes(&akey)
-        .await
-        .with_context(|| format!("read source artifact {akey}"))?;
+    let artifact = source.read_artifact(src, &akey).await?;
     let got = sha256_hex(&artifact);
     if got != sidecar.sha256 {
+        // A spool whose bytes disagree with the sidecar built from the same
+        // upload is a caller bug, not crash debris: fail loudly rather than run
+        // the bucket source's torn-record repair against a local file.
+        if let ArtifactSource::Spool(path) = source {
+            bail!(
+                "upload spool {} hashes to {got} but its sidecar names {} for {akey}",
+                path.display(),
+                sidecar.sha256
+            );
+        }
         // A live body whose sidecar names different bytes is a torn record:
         // the immutable name was freed (a failed publish deletes its own
         // unacked debris) and re-created while a sidecar fabricated for the
@@ -723,13 +760,14 @@ async fn copy_live(
     pkg: &str,
     filename: &str,
     record: &Record,
+    source: ArtifactSource<'_>,
 ) -> Result<bool> {
     let sc = record
         .sidecar
         .as_ref()
         .ok_or_else(|| anyhow!("copy verdict with no source sidecar"))?;
     let akey = artifact_key(pkg, filename);
-    let verified = verify_source_record(src, pkg, filename, record).await?;
+    let verified = verify_source_record(src, pkg, filename, record, source).await?;
     require_replication_unfenced(state)?;
 
     // A destination body already sitting under this immutable key with the
@@ -819,6 +857,7 @@ async fn supersede_record(
     pkg: &str,
     filename: &str,
     src_record: &Record,
+    source: ArtifactSource<'_>,
 ) -> Result<()> {
     require_replication_unfenced(state)?;
     let sidecar = src_record
@@ -828,7 +867,7 @@ async fn supersede_record(
     if sidecar.origin.as_deref() != Some(PRIVATE) {
         bail!("supersede source for {pkg}/{filename} is not private truth");
     }
-    let verified = verify_source_record(src, pkg, filename, src_record).await?;
+    let verified = verify_source_record(src, pkg, filename, src_record, source).await?;
     ensure_private_origin(dst, pkg).await?;
     let akey = artifact_key(pkg, filename);
 
@@ -1281,12 +1320,22 @@ pub async fn quarantine_mirror_artifacts(storage: &dyn Storage, pkg: &str) -> Re
 /// a durable `_repl/<dest>/…` note in the selected bucket before this returns.
 /// Notes are the failure path only: a healthy fleet acks with every bucket
 /// holding the record and no note written. A single-bucket node does no I/O.
-pub async fn fanout_sync(state: &AppState, pinned: &Pinned, pkg: &str, filename: &str) {
+pub async fn fanout_sync(
+    state: &AppState,
+    pinned: &Pinned,
+    pkg: &str,
+    filename: &str,
+    spool: Option<&std::path::Path>,
+) {
     if !state.buckets.is_multi() {
         return;
     }
     let src = pinned.storage.as_ref();
     let src_index = pinned.index;
+    // The just-committed upload still holds its verified spool; every peer reads
+    // it locally instead of GETting the artifact back from the source bucket.
+    // Yank/delete/marker fan-outs carry no spool and read the bucket as before.
+    let source = spool.map_or(ArtifactSource::Bucket, ArtifactSource::Spool);
     // A fenced topology or an ineligible selected bucket cannot safely copy;
     // every peer then gets a note so the eventual heal drains it. Health probes
     // and topology verification are the only writers past this gate.
@@ -1306,7 +1355,7 @@ pub async fn fanout_sync(state: &AppState, pinned: &Pinned, pkg: &str, filename:
                     return (idx, false);
                 }
                 let result = tokio::select! {
-                    result = replicate_record(state, src, handle.storage.as_ref(), pkg, filename) => result,
+                    result = replicate_record(state, src, handle.storage.as_ref(), pkg, filename, source) => result,
                     _ = tokio::time::sleep_until(deadline) => {
                         Err(anyhow!("fan-out to {} exceeded the grace deadline", handle.name))
                     }
@@ -1404,6 +1453,7 @@ async fn replicate_record(
     dst: &dyn Storage,
     pkg: &str,
     filename: &str,
+    source: ArtifactSource<'_>,
 ) -> Result<()> {
     require_replication_unfenced(state)?;
     let src_origin = read_pkg_origin(src, pkg).await?;
@@ -1426,7 +1476,7 @@ async fn replicate_record(
     let a = read_record(src, pkg, filename).await?;
     let b = read_record(dst, pkg, filename).await?;
     let verdict = decide(&a, &b);
-    execute(state, (src, dst), pkg, filename, (&a, &b), verdict).await
+    execute(state, (src, dst), pkg, filename, (&a, &b), verdict, source).await
 }
 
 async fn normalize_mirror_status_under_private_claim(
@@ -1688,6 +1738,7 @@ async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<Hash
                                         dst.storage.as_ref(),
                                         &marker.pkg,
                                         &marker.filename,
+                                        ArtifactSource::Bucket,
                                     ) => result,
                                     _ = wait_until_pair_ineligible(state, src_index, dest_index) => {
                                         Err(anyhow!("source or destination became topology-ineligible"))
@@ -2026,7 +2077,16 @@ async fn converge_package(
                 break;
             }
             let verdict = decide(&ra, &rb);
-            execute(state, (a, b), pkg, &filename, (&ra, &rb), verdict).await?;
+            execute(
+                state,
+                (a, b),
+                pkg,
+                &filename,
+                (&ra, &rb),
+                verdict,
+                ArtifactSource::Bucket,
+            )
+            .await?;
         }
         if retry_after_late_mirror {
             continue;
@@ -2310,6 +2370,7 @@ mod tests {
             filename,
             (&left, &right),
             verdict,
+            ArtifactSource::Bucket,
         )
         .await
         .unwrap();
@@ -2341,9 +2402,16 @@ mod tests {
         );
         let state = two_bucket_state(a.clone(), b.clone());
 
-        replicate_record(&state, a.as_ref(), b.as_ref(), "pkg", filename)
-            .await
-            .unwrap();
+        replicate_record(
+            &state,
+            a.as_ref(),
+            b.as_ref(),
+            "pkg",
+            filename,
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(b.get_bytes(&key).await.unwrap(), b"private");
         let copied: Sidecar =
@@ -2413,9 +2481,17 @@ mod tests {
         let record = live(&sha256_hex(b"expected bytes"), PRIVATE);
         let state = test_state(dst.clone());
 
-        let err = copy_live(&state, &src, dst.as_ref(), "pkg", filename, &record)
-            .await
-            .unwrap_err();
+        let err = copy_live(
+            &state,
+            &src,
+            dst.as_ref(),
+            "pkg",
+            filename,
+            &record,
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("source artifact sha mismatch"));
         assert!(!dst
             .head_exists(&sidecar_key(&artifact_key("pkg", filename)))
@@ -2440,9 +2516,16 @@ mod tests {
         src.insert(&akey, b"live bytes".to_vec());
         let state = test_state(src.clone());
 
-        let err = replicate_record(&state, src.as_ref(), dst.as_ref(), "pkg", filename)
-            .await
-            .unwrap_err();
+        let err = replicate_record(
+            &state,
+            src.as_ref(),
+            dst.as_ref(),
+            "pkg",
+            filename,
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("source artifact sha mismatch"));
         // The stale sidecar is dropped and the package marked dirty, so the
         // tick path refabricates the sidecar from the live body and the next
@@ -2465,9 +2548,16 @@ mod tests {
         src.insert(&metadata, b"Metadata-Version: 2.4\n".to_vec());
         let state = test_state(src.clone());
 
-        replicate_record(&state, src.as_ref(), dst.as_ref(), "pkg", filename)
-            .await
-            .unwrap();
+        replicate_record(
+            &state,
+            src.as_ref(),
+            dst.as_ref(),
+            "pkg",
+            filename,
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             dst.get_bytes(&metadata).await.unwrap(),
             b"Metadata-Version: 2.4\n"
@@ -2499,11 +2589,17 @@ mod tests {
         let state = test_state(src.clone());
         let record = live(&sha256_hex(source_bytes), PRIVATE);
 
-        assert!(
-            !copy_live(&state, src.as_ref(), dst.as_ref(), "pkg", filename, &record,)
-                .await
-                .unwrap()
-        );
+        assert!(!copy_live(
+            &state,
+            src.as_ref(),
+            dst.as_ref(),
+            "pkg",
+            filename,
+            &record,
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap());
         assert!(!src.head_exists(&key).await.unwrap());
         assert!(!dst.head_exists(&key).await.unwrap());
         assert!(src.head_exists(&frozen_key(&key)).await.unwrap());
@@ -2534,16 +2630,96 @@ mod tests {
         let state = test_state(src.clone());
         let record = live(&sha256_hex(bytes), PRIVATE);
 
-        assert!(
-            copy_live(&state, src.as_ref(), dst.as_ref(), "pkg", filename, &record,)
-                .await
-                .unwrap()
-        );
+        assert!(copy_live(
+            &state,
+            src.as_ref(),
+            dst.as_ref(),
+            "pkg",
+            filename,
+            &record,
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap());
         assert_eq!(dst.get_bytes(&key).await.unwrap(), bytes);
         let sidecar: Sidecar =
             serde_json::from_slice(&dst.get_bytes(&sidecar_key(&key)).await.unwrap()).unwrap();
         assert_eq!(sidecar.sha256, sha256_hex(bytes));
         assert!(!dst.head_exists(&frozen_key(&key)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn spool_source_copies_without_reading_the_source_bucket() {
+        // The upload fan-out fast path: the artifact bytes come from the local
+        // verified spool, so the source bucket is never asked for the body.
+        // Prove it by leaving the source bucket's artifact absent — a bucket
+        // read would fail; the spool read must succeed and land the bytes on
+        // dst, sha-verified exactly as the bucket source is.
+        let bytes = b"spooled wheel bytes";
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let src = Arc::new(InMemStorage::default());
+        let dst = Arc::new(InMemStorage::default());
+        let state = test_state(src.clone());
+        let record = live(&sha256_hex(bytes), PRIVATE);
+
+        let spool =
+            std::env::temp_dir().join(format!("pypiron-spool-ok-{}.bin", std::process::id()));
+        tokio::fs::write(&spool, bytes).await.unwrap();
+
+        assert!(copy_live(
+            &state,
+            src.as_ref(),
+            dst.as_ref(),
+            "pkg",
+            filename,
+            &record,
+            ArtifactSource::Spool(&spool),
+        )
+        .await
+        .unwrap());
+
+        assert_eq!(dst.get_bytes(&key).await.unwrap(), bytes);
+        let sidecar: Sidecar =
+            serde_json::from_slice(&dst.get_bytes(&sidecar_key(&key)).await.unwrap()).unwrap();
+        assert_eq!(sidecar.sha256, sha256_hex(bytes));
+        // The source bucket body was never seeded: the copy read the spool.
+        assert!(!src.head_exists(&key).await.unwrap());
+        let _ = tokio::fs::remove_file(&spool).await;
+    }
+
+    #[tokio::test]
+    async fn spool_source_that_disagrees_with_its_sidecar_fails_loudly() {
+        // A spool whose bytes do not hash to the sidecar's sha is a caller bug,
+        // not crash debris: bail before writing anything, never run the bucket
+        // source's torn-record repair against a local file.
+        let filename = "pkg-1.whl";
+        let src = Arc::new(InMemStorage::default());
+        let dst = Arc::new(InMemStorage::default());
+        let state = test_state(src.clone());
+        let record = live(&sha256_hex(b"correct wheel"), PRIVATE);
+
+        let spool =
+            std::env::temp_dir().join(format!("pypiron-spool-bad-{}.bin", std::process::id()));
+        tokio::fs::write(&spool, b"tampered wheel").await.unwrap();
+
+        let err = copy_live(
+            &state,
+            src.as_ref(),
+            dst.as_ref(),
+            "pkg",
+            filename,
+            &record,
+            ArtifactSource::Spool(&spool),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("upload spool"));
+        assert!(!dst
+            .head_exists(&artifact_key("pkg", filename))
+            .await
+            .unwrap());
+        let _ = tokio::fs::remove_file(&spool).await;
     }
 
     #[tokio::test]
@@ -2558,9 +2734,16 @@ mod tests {
         b.insert(&frozen_key(&key), b"{}".to_vec());
         let state = test_state(a.clone());
 
-        replicate_record(&state, a.as_ref(), b.as_ref(), "pkg", filename)
-            .await
-            .unwrap();
+        replicate_record(
+            &state,
+            a.as_ref(),
+            b.as_ref(),
+            "pkg",
+            filename,
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap();
         assert!(!a.head_exists(&key).await.unwrap());
         assert!(!b.head_exists(&key).await.unwrap());
         assert_eq!(a.list_all(QUARANTINE_PREFIX).await.unwrap().len(), 1);
@@ -2578,6 +2761,7 @@ mod tests {
             filename,
             (&settled_a, &settled_b),
             Verdict::Noop,
+            ArtifactSource::Bucket,
         )
         .await
         .unwrap();
@@ -2710,6 +2894,7 @@ mod tests {
             late_mirror.as_ref(),
             "pkg",
             filename,
+            ArtifactSource::Bucket,
         )
         .await
         .unwrap();
@@ -2771,6 +2956,7 @@ mod tests {
             filename,
             (&source, &destination),
             verdict,
+            ArtifactSource::Bucket,
         )
         .await
         .unwrap();
@@ -2890,7 +3076,7 @@ mod tests {
         let state = two_bucket_state(a.clone(), b.clone());
         let pinned = state.pin();
 
-        fanout_sync(&state, &pinned, "pkg", filename).await;
+        fanout_sync(&state, &pinned, "pkg", filename, None).await;
         assert!(b.head_exists(&artifact_key("pkg", filename)).await.unwrap());
         // The happy path leaves no note: the record is durable on every bucket
         // at ack time.
@@ -2919,7 +3105,7 @@ mod tests {
         state.bucket_health = Some(health);
         let pinned = state.pin();
 
-        fanout_sync(&state, &pinned, "pkg", filename).await;
+        fanout_sync(&state, &pinned, "pkg", filename, None).await;
         // No attempt against an ineligible bucket, but a durable note is left so
         // the record reaches B when it heals.
         assert!(!b.head_exists(&artifact_key("pkg", filename)).await.unwrap());
@@ -3127,9 +3313,16 @@ mod tests {
             .unwrap();
         let state = two_bucket_state(a.clone(), b.clone());
 
-        replicate_record(&state, a.as_ref(), b.as_ref(), "pkg", PROJECT_STATUS_MARKER)
-            .await
-            .unwrap();
+        replicate_record(
+            &state,
+            a.as_ref(),
+            b.as_ref(),
+            "pkg",
+            PROJECT_STATUS_MARKER,
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             status::read_status(b.as_ref(), "pkg").await.unwrap(),
@@ -3156,9 +3349,16 @@ mod tests {
             .unwrap();
         let state = two_bucket_state(a.clone(), b.clone());
 
-        replicate_record(&state, a.as_ref(), b.as_ref(), "pkg", PROJECT_STATUS_MARKER)
-            .await
-            .unwrap();
+        replicate_record(
+            &state,
+            a.as_ref(),
+            b.as_ref(),
+            "pkg",
+            PROJECT_STATUS_MARKER,
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             status::read_status(b.as_ref(), "pkg").await.unwrap(),

@@ -34,7 +34,10 @@ routine needs AWS creds (list/move findings) and its own GitHub push creds.
 > 1. `aws s3 ls s3://$SOAK_S3_BUCKET/soak/findings/`. Take at most **3** objects
 >    (findings are rare; leave the rest for next hour).
 > 2. For each finding object:
->    a. Read it (`aws s3 cp … -`); it has `repro`, `title`, `signature`.
+>    a. Read it (`aws s3 cp … -`); it has `repro`, `title`, `signature`, and
+>       `commit` — the sha of the binary that found it. If `repro` no longer
+>       reproduces on master, check out that sha before calling it stale: a
+>       schedule-perturbing change retires seeds, it does not fix bugs.
 >    b. Claim it: `aws s3 mv` it to `soak/findings-fixing/` (a lightweight lock).
 >    c. Run the `vopr-verified-fix` Workflow (dev/ops/soak/verify_fix.workflow.js)
 >       with `{ repro, signature, commit: true }`.

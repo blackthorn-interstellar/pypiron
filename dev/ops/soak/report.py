@@ -88,14 +88,20 @@ PROGRESS_RE = re.compile(
     r"^vopr: progress — (\d+) seeds, (\d+) storage-op interleavings, (\d+) acked uploads"
 )
 # Volatile bits to erase so the same bug yields one stable signature across
-# seeds: per-op sequence tags (@191), per-seed nonces (!991), heal-round
-# indices, the per-seed leftover lists, concrete bucket indices, and the
-# `| changed:` dump tail.
-SEQ_TAG_RE = re.compile(r"@\d+")
-NONCE_RE = re.compile(r"!\d+")
-LIST_RE = re.compile(r"\[[^\]]*\]")
-ROUND_RE = re.compile(r"\bround \d+\b")
-BUCKET_RE = re.compile(r"\bbucket\d+\b")
+# seeds. The rule is that a signature is the message *template*: in a violation
+# every number (bucket index, key count, op tag, trace hash) and every workload
+# name is per-seed data, never identity, so erasing them can merge two seeds but
+# never two oracles — each carries its own NAME: prefix and prose.
+SEQ_TAG_RE = re.compile(r"@\d+")  # per-op sequence tag
+NONCE_RE = re.compile(r"!\d+")  # per-seed nonce
+LIST_RE = re.compile(r"\[[^\]]*\]")  # per-seed leftover/key dumps
+# The simulator's whole workload is `vopr-<name>` packages and their wheels
+# (examples/vopr.rs PACKAGES/filename); which one a seed happened to hit is data.
+ARTIFACT_RE = re.compile(r"\bvopr[-_][a-z0-9]+-\d[^\s/]*?\.whl\b")
+PKG_RE = re.compile(r"\bvopr[-_][a-z0-9]+\b")
+BUCKET_RE = re.compile(r"\bbucket ?\d+\b")  # both `bucket0` and `bucket 0`
+HEX_RE = re.compile(r"\b0x[0-9a-f]+\b")  # determinism trace/state hashes
+NUM_RE = re.compile(r"\b\d+\b")  # residual indices/counts: `(0 names)`, `_repl/1/`
 TAIL_RE = re.compile(r"\s*(\|\s*changed:|changed:).*$", re.DOTALL)
 WS_RE = re.compile(r"\s+")
 
@@ -105,9 +111,12 @@ def signature(violation: str) -> str:
     s = TAIL_RE.sub("", violation)  # drop the multi-line per-seed diff dump
     s = SEQ_TAG_RE.sub("", s)
     s = NONCE_RE.sub("", s)
-    s = ROUND_RE.sub("round N", s)
     s = LIST_RE.sub("[…]", s)
+    s = ARTIFACT_RE.sub("<file>", s)
+    s = PKG_RE.sub("<pkg>", s)
     s = BUCKET_RE.sub("bucketN", s)
+    s = HEX_RE.sub("0xN", s)
+    s = NUM_RE.sub("N", s)
     s = WS_RE.sub(" ", s).strip().strip("-").strip()
     return s
 
@@ -220,6 +229,10 @@ class StatusTracker:
 
 @dataclass
 class Reporter:
+    # The bundle commit the repro was produced by: a finding outlives the binary
+    # that found it, and a schedule-perturbing change to the simulator retires
+    # the `--seed N` in `repro` without a trace unless the sha rides along.
+    commit: str = "unknown"
     seen: set[str] = field(default_factory=set)  # signature hashes handled this run
     filed_times: list[float] = field(default_factory=list)
 
@@ -250,6 +263,7 @@ class Reporter:
             "first_seed": seed,
             "raw": raw.strip(),
             "kind": kind,
+            "commit": self.commit,
             "ts": time.time(),
         }
         if DRY_RUN:
@@ -358,8 +372,9 @@ def journal_events():
 
 
 def main() -> int:
-    rep = Reporter()
-    tracker = StatusTracker(commit=read_commit())
+    commit = read_commit()
+    rep = Reporter(commit=commit)
+    tracker = StatusTracker(commit=commit)
     tracker.instance_id = imds("instance-id")
     tracker.instance_type = imds("instance-type")
     baseline_from_journal(tracker)

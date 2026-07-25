@@ -139,11 +139,10 @@ of preference: **reword it as a benefit**, **delete it**, or **move it to
 | knee, server-bound, load fleet | peak throughput *(mechanics → benchmark methodology)* |
 | presigned redirect / 302 | hands the download straight to object storage |
 | Gmail-style subaddressing | username tags (`reader+billing-api`) |
-| PEP 503 / 691 / 658 / 700 / 740 / 792 | name the behavior; keep PEP numbers only on `reference/standards.md` |
+| PEP 503 / 691 / 658 / 700 / 740 / 792 | name the behavior; keep PEP numbers to `dev/` |
 
-PEP numbers, crate names, and storage internals are *correct* on
-`reference/standards.md` and in `dev/` — that's their home. They're noise
-everywhere else.
+PEP numbers, crate names, and storage internals are *correct* in `dev/` — that's
+their home. They're noise everywhere else.
 
 ## Say it once — who owns what
 
@@ -173,7 +172,7 @@ everywhere else.
 
 - First sentence is a benefit or a task — not an architecture fact.
 - A bullet that sells follows claim → proof → link — no inline self-defense.
-- No word from the "don't write" list survives (outside `standards.md` / `dev/`).
+- No word from the "don't write" list survives (outside `dev/`).
 - Every feature says *why it matters* before *which flag*.
 - The simplest working command comes first; auth/advanced is a later turn.
 - Nothing here is already owned by another page (check the map).

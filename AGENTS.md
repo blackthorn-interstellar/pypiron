@@ -53,7 +53,7 @@ reason about pypiron belongs in `dev/` instead.
   ([dev/VISION.md](dev/VISION.md) is the one-pager). Don't invent storage-tree
   or sidecar variants.
 - Standards support is behavior verified against real clients, not spec-shaped
-  output: [docs/reference/standards.md](docs/reference/standards.md).
+  output.
 - Every `--flag` is also a `PYPIRON_FLAG` env var; document new knobs in
   [docs/reference/configuration.md](docs/reference/configuration.md).
 - Check `private/ROADMAP.md` (the nested private repo) before adding features —

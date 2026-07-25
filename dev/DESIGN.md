@@ -345,6 +345,22 @@ Disk backend is explicitly single-node; multi-node implies a cloud backend.
 
 ## Multi-bucket: synchronous fan-out, local selection
 
+**The totality principle.** Every byte of durable state in one bucket belongs in
+every bucket. Replication may lag — minutes of divergence while fan-out, notes,
+and sweeps converge is the accepted cost of availability — but a state class that
+never converges **by design** is a bug, not a trade-off, no matter how defensible
+the carve-out sounds in isolation (that reasoning is exactly how the air-gapped
+mirror gap of 2026-07 shipped). Only two exemptions exist, and both must satisfy
+a test: *derived* state (indexes, audit reports) converges by recomputation from
+converged truth — losing it loses nothing; *coordination scratch* (leases,
+`_repl/` notes, topology stamps) is per-bucket by definition — losing it may cost
+work, never data. Narrow, explicitly-annotated loss windows are permitted where
+totality would be absurd (e.g. the current day's live download tallies before
+rollup), and each must be declared in `src/layout.rs` with its loss bound. The
+acceptance test for all of it: **any single surviving bucket rebuilds the whole
+service** — enforced by the layout-manifest test and the single-survivor blackbox
+test, which every new feature's state must pass through.
+
 An ordered list of two or more bucket URIs — any mix of S3, GCS, and Azure —
 turns every non-selected bucket into a warm writable copy. Each node
 independently selects the first bucket its health view calls healthy. A request

@@ -10,6 +10,8 @@ Reads need zero coordination and the server is fully cache-correct — filenames
 
 For multi-node, only the index writer is singular: a conditional-write lease on the bucket, sloppy by design — rebuilds are idempotent, so split-brain merely duplicates work.
 
+For multi-bucket, replication is total: everything durable in one bucket belongs in every bucket, eventually — short lag is acceptable, permanent by-design divergence is not. Any single surviving bucket rebuilds the whole service.
+
 An optional synchronous upload mode waits for index visibility before returning 200, for publish-then-install CI pipelines.
 
 Mirrored packages carry PyPI's original upload times in their sidecars, and every package is exclusively private or mirrored, claimed at first write.

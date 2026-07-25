@@ -91,6 +91,11 @@ jobs:
           # Crash-only mode: no injected storage failures, so the marker
           # protocol must converge with zero audit repairs — a hard invariant.
           cargo run --example vopr -- --seeds 20 --nodes 3 --buckets 2 --ops 80 --fail-percent 0
+          # A taste of the rotating profile too: the two above pin the fixed
+          # workload (2 packages x 2 files, one op mix), so they would never see
+          # a wide-entity or delete-heavy schedule. Reproduce with
+          # `--seed N --rotate`; the volume runs nightly.
+          cargo run --example vopr -- --seeds 30 --rotate
           # Regression seeds: schedules that once produced a torn record (live
           # body + stale backfilled sidecar) reconcile refused to heal, and a
           # paused delete whose stale intent a concurrent tick consumed with a

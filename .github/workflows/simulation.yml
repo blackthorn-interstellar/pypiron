@@ -43,6 +43,15 @@ jobs:
           - { name: multi-bucket, nodes: 3, buckets: 2, ops: 160, extra: '' }
           - { name: single-bucket-crash-only, nodes: 3, buckets: 1, ops: 160, extra: '--fail-percent 0' }
           - { name: multi-bucket-crash-only, nodes: 3, buckets: 2, ops: 160, extra: '--fail-percent 0' }
+          # The four above pin a topology AND the fixed workload (2 packages x 2
+          # files, one hardcoded op mix), so between them they re-explore one
+          # shape however many seeds they burn. This one rotates everything the
+          # seed can vary — topology, entity counts, and the op-class weights
+          # (swarm testing) — which is what found the class-2 global-index
+          # divergence at seed 1067836. Its nodes/buckets/ops below are ignored:
+          # --rotate derives the whole profile from the seed, and a failure
+          # reproduces with `--seed N --rotate`.
+          - { name: rotating-swarm, nodes: 2, buckets: 2, ops: 160, extra: '--rotate' }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:

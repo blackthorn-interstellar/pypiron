@@ -54,6 +54,16 @@
 //!     profiles additionally keep their blanket any-repair-is-a-violation
 //!     gate.
 //!
+//! The *workload* is seed-derived too, not a constant. A fixed workload is the
+//! quiet way a simulator stops finding things: four filenames and one frozen op
+//! mix explore one shape of the state space forever, however many seeds you
+//! burn. So each rotating seed draws its own entity count (1-6 packages x 1-4
+//! files) and its own op-class weight vector — swarm testing (Groce et al.):
+//! rather than one average mix, sample many extreme ones, because a rare
+//! interleaving is only rare under the average. Every class keeps a nonzero
+//! floor, so no seed can silently stop publishing and report green on a run
+//! that verified nothing.
+//!
 //! Determinism is self-checked, not assumed: every run whose seed is a multiple
 //! of `--recheck-every` executes twice and must produce an identical storage-op
 //! trace hash *and* an identical final world (bucket bytes + ledger), because a
@@ -72,8 +82,51 @@ use pypiron::sim::{SimClock, SimStorage};
 use pypiron::storage::{FileEntry, ObjectMeta, Storage};
 use pypiron::{replicate, worker, AppState};
 
-const PACKAGES: [&str; 2] = ["vopr-alpha", "vopr-beta"];
-const FILES_PER_PKG: u8 = 2;
+/// Package names the workload draws from; a profile uses the first `packages`
+/// of them, so widening the workload is a superset of the old two-name one and
+/// every pinned seed still means what its comment says. Dashed on purpose:
+/// `filename()` has to escape the dash to build a parseable wheel name.
+const PACKAGE_NAMES: [&str; 6] = [
+    "vopr-alpha",
+    "vopr-beta",
+    "vopr-gamma",
+    "vopr-delta",
+    "vopr-epsilon",
+    "vopr-zeta",
+];
+
+/// Chaos-loop op classes, in the order `pick_op` indexes them.
+const OP_CLASSES: usize = 8;
+const OP_LABELS: [&str; OP_CLASSES] = [
+    "publish",
+    "delete",
+    "tick",
+    "sweep",
+    "reconcile",
+    "jump",
+    "crash",
+    "nudge",
+];
+
+/// The historical fixed mix, out of 100 — what a non-rotating run uses, so an
+/// explicit `--nodes/--buckets/--ops` command means exactly what it always did.
+const DEFAULT_OP_WEIGHTS: [u16; OP_CLASSES] = [40, 10, 25, 7, 4, 5, 5, 4];
+
+/// Per-class swarm bounds `(floor, span)`: a rotating seed's weight is
+/// `floor + rng.below(span)`. The floors are the honesty constraint — a class
+/// that could reach zero would hand some seeds a run that never publishes,
+/// verifies nothing, and still reports green.
+const OP_WEIGHT_BOUNDS: [(u16, u16); OP_CLASSES] = [
+    (6, 45), // publish — the only op that creates work to verify
+    (2, 20), // delete
+    (3, 30), // worker tick (the rebuild fast path)
+    (1, 12), // replication sweep
+    (1, 10), // reconcile (tree diff)
+    (1, 10), // clock jump past the intent grace
+    (1, 10), // schedule a crash
+    (1, 10), // clock nudge
+];
+
 const SIM_START: &str = "2026-01-01T00:00:00Z";
 
 // ---------------------------------------------------------------------------
@@ -1179,10 +1232,14 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
     let Profile {
         nodes,
         buckets,
+        packages,
+        files,
         ops,
         fail_percent,
+        weights,
         brk,
     } = profile;
+    let weight_total: u64 = weights.iter().map(|w| u64::from(*w)).sum();
     let start =
         time::OffsetDateTime::parse(SIM_START, &time::format_description::well_known::Rfc3339)
             .expect("valid sim start");
@@ -1204,10 +1261,10 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
         }
         let state = fleet.nodes[node].state.clone();
         let ledger = fleet.ledger.clone();
-        match rng.below(100) {
-            0..=39 => {
-                let pkg = PACKAGES[rng.below(PACKAGES.len() as u64) as usize].to_string();
-                let file = rng.below(u64::from(FILES_PER_PKG)) as u8;
+        match pick_op(&weights, weight_total, &mut rng) {
+            0 => {
+                let pkg = PACKAGE_NAMES[rng.below(packages as u64) as usize].to_string();
+                let file = rng.below(u64::from(files)) as u8;
                 let variant = rng.below(2) as u8;
                 let clock = fleet.clock.clone();
                 let buckets = fleet.buckets.clone();
@@ -1216,30 +1273,30 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                     op_publish(state, ledger, clock, buckets, pkg, file, variant),
                 );
             }
-            40..=49 => {
-                let pkg = PACKAGES[rng.below(PACKAGES.len() as u64) as usize].to_string();
-                let file = rng.below(u64::from(FILES_PER_PKG)) as u8;
+            1 => {
+                let pkg = PACKAGE_NAMES[rng.below(packages as u64) as usize].to_string();
+                let file = rng.below(u64::from(files)) as u8;
                 fleet.spawn_on(node, op_delete(state, ledger, pkg, file));
             }
-            50..=74 => {
+            2 => {
                 let lease = fleet.tick_lock[0].clone(); // every pin selects bucket 0
                 fleet.spawn_on(node, op_tick(state, lease));
             }
-            75..=81 => {
+            3 => {
                 if buckets > 1 {
                     fleet.spawn_on(node, op_sweep(state));
                 }
             }
-            82..=85 => {
+            4 => {
                 if buckets > 1 {
                     fleet.spawn_on(node, op_reconcile(state));
                 }
             }
-            86..=90 => {
+            5 => {
                 // Jump past the intent grace: crashed writers become healable.
                 clock.advance(std::time::Duration::from_secs(90));
             }
-            91..=95 => {
+            6 => {
                 fleet.plan.schedule_crash_soon(node, 12);
                 // Give the doomed node's in-flight work a chance to hit the
                 // crash point before the driver aborts it.
@@ -2175,6 +2232,8 @@ struct Args {
     start_seed: u64,
     nodes: usize,
     buckets: usize,
+    packages: usize,
+    files: u8,
     ops: u64,
     recheck_every: u64,
     fail_percent: u64,
@@ -2184,10 +2243,12 @@ struct Args {
     /// Timebox: explore until this many wall-clock seconds elapse, logging
     /// failures like `--forever`, then exit non-zero if anything failed.
     max_secs: Option<u64>,
-    /// Derive (nodes, buckets, ops, fail-percent) per seed instead of using
-    /// the fixed flags — one soak covers every topology. The profile is a
-    /// pure function of the seed, and every failure line prints the resolved
-    /// flags, so reproduction is still one explicit command.
+    /// Derive the whole profile — topology, entity counts and op mix — per
+    /// seed instead of using the fixed flags, so one soak covers every shape.
+    /// It is a pure function of the seed alone, which is what makes
+    /// `--seed N --rotate` an exact reproduction; failures print the resolved
+    /// dimensions beside that command so you can read the shape without
+    /// rerunning it.
     rotate: bool,
     /// Deliberate defect to inject (`--break`), for mutation-testing the
     /// oracles. `Break::None` in every ordinary run.
@@ -2198,9 +2259,37 @@ struct Args {
 struct Profile {
     nodes: usize,
     buckets: usize,
+    /// How many of `PACKAGE_NAMES` this seed's workload uses.
+    packages: usize,
+    /// Files per package (each becomes version `<file+1>.0`).
+    files: u8,
     ops: u64,
     fail_percent: u64,
+    /// Op-class mix for the chaos loop — see `OP_WEIGHT_BOUNDS`.
+    weights: [u16; OP_CLASSES],
     brk: Break,
+}
+
+impl Profile {
+    /// The resolved dimensions, printed next to every reproduce command. A
+    /// failure you cannot read the shape of is a failure you debug twice.
+    fn describe(&self) -> String {
+        let mix: Vec<String> = OP_LABELS
+            .iter()
+            .zip(self.weights)
+            .map(|(label, weight)| format!("{label} {weight}"))
+            .collect();
+        format!(
+            "nodes={} buckets={} packages={} files={} ops={} fail-percent={} weights=[{}]",
+            self.nodes,
+            self.buckets,
+            self.packages,
+            self.files,
+            self.ops,
+            self.fail_percent,
+            mix.join(", ")
+        )
+    }
 }
 
 fn profile_for(seed: u64, args: &Args) -> Profile {
@@ -2208,21 +2297,71 @@ fn profile_for(seed: u64, args: &Args) -> Profile {
         return Profile {
             nodes: args.nodes,
             buckets: args.buckets,
+            packages: args.packages,
+            files: args.files,
             ops: args.ops,
             fail_percent: args.fail_percent,
+            weights: DEFAULT_OP_WEIGHTS,
             brk: args.brk,
         };
     }
     let mut rng = Rng::new(seed ^ 0x0507_A7E5);
+    let mut weights = [0u16; OP_CLASSES];
+    for (weight, (floor, span)) in weights.iter_mut().zip(OP_WEIGHT_BOUNDS) {
+        *weight = floor + rng.below(u64::from(span)) as u16;
+    }
     Profile {
         nodes: 2 + rng.below(2) as usize,   // 2..=3
         buckets: 1 + rng.below(3) as usize, // 1..=3: no-replication through 3-way fan-out
+        // Entity counts skew small: a run's op budget is fixed, so every extra
+        // filename thins the interleavings each one gets. The tail reaches 6x4
+        // = 24 filenames, enough for concurrent rebuilds to collide on
+        // different packages; the mode stays cheap enough to keep throughput.
+        packages: [1, 2, 2, 3, 3, 4, 5, 6][rng.below(8) as usize],
+        files: [1, 2, 2, 3, 4][rng.below(5) as usize],
         ops: [80, 120, 160, 200][rng.below(4) as usize],
         // Half the schedules crash-only, where audit repairs are hard
         // violations; half with injected storage failures.
         fail_percent: if rng.chance(50) { 0 } else { 3 },
+        weights,
         brk: args.brk,
     }
+}
+
+/// The one command that re-runs exactly this seed. A rotating profile is a
+/// pure function of the seed, so `--seed N --rotate` is complete on its own —
+/// including the entity counts and the op-weight vector, which have no useful
+/// flag form. A fixed profile has to carry its flags.
+fn reproduce_command(seed: u64, args: &Args, profile: &Profile) -> String {
+    if args.rotate {
+        return format!("cargo run --release --example vopr -- --seed {seed} --rotate");
+    }
+    format!(
+        "cargo run --release --example vopr -- --seed {seed} --nodes {} --buckets {} \
+         --packages {} --files {} --ops {} --fail-percent {}",
+        profile.nodes,
+        profile.buckets,
+        profile.packages,
+        profile.files,
+        profile.ops,
+        profile.fail_percent
+    )
+}
+
+/// Weighted choice over the op classes. Exactly one rng draw regardless of the
+/// mix, so the weights change *which* op a step runs, never how much of the
+/// seed's entropy it consumes — that is what lets `DEFAULT_OP_WEIGHTS` keep
+/// non-rotating runs byte-identical to the pre-swarm `rng.below(100)` arms.
+fn pick_op(weights: &[u16; OP_CLASSES], total: u64, rng: &mut Rng) -> usize {
+    let mut point = rng.below(total);
+    for (idx, weight) in weights.iter().enumerate() {
+        let weight = u64::from(*weight);
+        if point < weight {
+            return idx;
+        }
+        point -= weight;
+    }
+    OP_CLASSES - 1
 }
 
 fn parse_args() -> Args {
@@ -2231,6 +2370,8 @@ fn parse_args() -> Args {
         start_seed: 1,
         nodes: 2,
         buckets: 2,
+        packages: 2,
+        files: 2,
         ops: 120,
         recheck_every: 10,
         fail_percent: 3,
@@ -2263,6 +2404,22 @@ fn parse_args() -> Args {
             "--start-seed" => args.start_seed = grab(),
             "--nodes" => args.nodes = grab() as usize,
             "--buckets" => args.buckets = grab() as usize,
+            // Both are rng moduli and one indexes PACKAGE_NAMES, so an
+            // out-of-range value would divide by zero or panic mid-soak.
+            "--packages" => {
+                let n = grab() as usize;
+                assert!(
+                    (1..=PACKAGE_NAMES.len()).contains(&n),
+                    "--packages must be 1..={}",
+                    PACKAGE_NAMES.len()
+                );
+                args.packages = n;
+            }
+            "--files" => {
+                let n = grab();
+                assert!((1..=64).contains(&n), "--files must be 1..=64");
+                args.files = n as u8;
+            }
             "--ops" => args.ops = grab(),
             "--recheck-every" => args.recheck_every = grab(),
             "--fail-percent" => args.fail_percent = grab(),
@@ -2355,6 +2512,11 @@ fn main() {
                 } else {
                     eprintln!("rerun with VOPR_TRACE=1 to diff the traces");
                 }
+                eprintln!(
+                    "reproduce: {} --recheck-every 1\nprofile: {}",
+                    reproduce_command(seed, &args, &profile),
+                    profile.describe()
+                );
                 if !keep_going {
                     std::process::exit(3);
                 }
@@ -2365,6 +2527,11 @@ fn main() {
                      world differs ({:#x} vs {:#x}) — nondeterminism is downstream of the op \
                      sequence: same calls, different bytes",
                     outcome.state_hash, again.state_hash
+                );
+                eprintln!(
+                    "reproduce: {} --recheck-every 1\nprofile: {}",
+                    reproduce_command(seed, &args, &profile),
+                    profile.describe()
                 );
                 if !keep_going {
                     std::process::exit(3);
@@ -2387,10 +2554,8 @@ fn main() {
             for violation in &outcome.violations {
                 eprintln!("  {violation}");
             }
-            eprintln!(
-                "reproduce: cargo run --release --example vopr -- --seed {seed} --nodes {} --buckets {} --ops {} --fail-percent {}",
-                profile.nodes, profile.buckets, profile.ops, profile.fail_percent
-            );
+            eprintln!("reproduce: {}", reproduce_command(seed, &args, &profile));
+            eprintln!("profile: {}", profile.describe());
             if !keep_going {
                 std::process::exit(2);
             }
@@ -2412,11 +2577,13 @@ fn main() {
         }
     }
     let profile_desc = if args.rotate {
-        "rotating(nodes 2-3, buckets 1-3, ops 80-200, fault+crash-only)".to_string()
+        "rotating(nodes 2-3, buckets 1-3, packages 1-6, files 1-4, ops 80-200, \
+         swarmed op mix, fault+crash-only)"
+            .to_string()
     } else {
         format!(
-            "nodes={} buckets={} ops/run={} fail-percent={}",
-            args.nodes, args.buckets, args.ops, args.fail_percent
+            "nodes={} buckets={} packages={} files={} ops/run={} fail-percent={}",
+            args.nodes, args.buckets, args.packages, args.files, args.ops, args.fail_percent
         )
     };
     println!(

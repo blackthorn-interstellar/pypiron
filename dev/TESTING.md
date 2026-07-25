@@ -196,6 +196,29 @@ storage failures, node crashes at storage-op boundaries (power cut between two
 ops — the task is parked and aborted, in-memory state dies, storage survives),
 cold restarts, and clock jumps past the intent grace.
 
+The *workload* derives from the seed too, and that matters more than it sounds.
+A fixed workload is the quiet way a simulator stops finding things: for a long
+time this one ran two packages × two files and one hardcoded op mix on every
+seed, so tens of millions of interleavings re-explored a single shape and the
+extra seeds bought nothing. Each rotating seed now draws its own entity count
+(1–6 packages × 1–4 files, skewed small so throughput survives) and its own
+op-class weight vector — swarm testing: instead of one average mix, sample many
+extreme ones, because a rare interleaving is only rare *under the average*. The
+seed that finally broke the global-index convergence path (below) drew a
+delete-heavy mix no fixed workload would ever have run. Every class keeps a
+nonzero floor, so no seed can quietly stop publishing and report green on a run
+that verified nothing.
+
+Rotation is a pure function of the seed alone, so `--seed N --rotate`
+reproduces a failure exactly — including the entity counts and the weight
+vector, which have no useful flag form. Every failure prints that command and,
+beside it, a `profile:` line with the resolved dimensions so you can read the
+shape without rerunning. A *non*-rotating run (explicit `--nodes/--buckets/…`)
+keeps the historical fixed workload — the first two package names, two files,
+the pre-swarm op mix — so every pinned seed below still means exactly what its
+comment says; that was verified with byte-identical `VOPR_TRACE_FILE` dumps
+across the change, not assumed.
+
 After the chaos phase the harness heals the fleet, drains it to quiescence,
 and asserts:
 
@@ -230,19 +253,23 @@ proves the two runs issued the same *calls*; a nondeterminism downstream of the
 op sequence (an unvirtualized clock read, say) makes the same calls with
 different bytes, and the state hash is what catches it. The rerun's own invariant
 verdict counts too, so a seed that passes once and fails once is red. Any failure
-reproduces exactly with `cargo run --example vopr -- --seed N`.
+reproduces exactly with `cargo run --example vopr -- --seed N --rotate`.
 
 A smoke runs on every PR (ci.yml); tens of thousands of fresh seeds run
 nightly with counters published in the job summary
 (`.github/workflows/simulation.yml`). For local soaking, `make vopr-soak`
-runs continuously across rotating topologies (nodes 2–3, buckets 1–3,
-fault and crash-only profiles — the profile derives from the seed, so a
-failure still reproduces from the explicit `--seed N` command it prints),
-logs failures and keeps exploring, and heartbeats once a minute;
-`VOPR_SECS=600 make vopr-soak` timeboxes instead and exits non-zero if any
-seed failed. At ~600+ seeds/second, an overnight soak covers tens of
-millions of schedules. Output is also appended to `vopr-soak.log` (gitignored)
-so findings survive the terminal.
+runs continuously across rotating profiles (nodes 2–3, buckets 1–3,
+packages 1–6, files 1–4, swarmed op mix, fault and crash-only), logs failures
+and keeps exploring, and heartbeats once a minute; `VOPR_SECS=600 make
+vopr-soak` timeboxes instead and exits non-zero if any seed failed. At ~380
+seeds/second an overnight soak still covers tens of millions of schedules —
+down from ~495 before the workload widened, because each seed now drives more
+entities. That trade was made deliberately and on measurement: seeds/second
+fell 24%, but *storage-op interleavings* per second fell only 10% (707k → 633k)
+and acked uploads per seed rose 60% (3.3 → 5.3), so a second of soak now buys
+more verified protocol work, not less. Entity counts skew small precisely to
+keep that ratio; the 6×4 tail is the minority of seeds. Output is also appended
+to `vopr-soak.log` (gitignored) so findings survive the terminal.
 
 The heartbeat and final summary report an **audit-view-repairs** count: how
 often a run's cheap marker/tick/reconcile path left a view unconverged and the
@@ -288,6 +315,25 @@ is exactly the open per-package-leasing design decision behind class 3: until a
 rebuild takes a per-package lease, two unleased rebuilds can still race, and the
 audit remains their documented backstop.
 
+The classifier is no longer theoretical. It sat at a flat zero for tens of
+millions of interleavings under the old fixed workload — which read as
+reassurance and was really just the same shape re-explored. Widening the
+workload produced its first execution on real product behavior within 150k
+seeds: seed 1067836 (`--seed 1067836 --rotate`), a crash-only 3-node/3-bucket
+run whose swarmed mix drew **delete 20 against publish 7**, left the global
+`simple/index.html` listing a package the truth no longer had and missing one it
+did, and only the tier-3 audit converged it. `analyze()` classified both drifted
+views as class 2 with the causal detail — *op N listed truth@245 and wrote the
+final view@276, yet the view disagrees with that truth: a poisoned derivation
+consumed the signal*. It is the same family as the fix in commit 1bc3ce9
+(global `simple/index.html` staleness after a crash) and is open, not fixed
+here. Note which knob found it: both drifted packages were `vopr-alpha` and
+`vopr-beta`, the two the old workload already had, so it was the **op-weight
+swarm**, not the extra entities. Under the fixed 40-publish/10-delete mix a
+delete-dominant stretch that long is exponentially unlikely — not impossible,
+which is the point of swarming: sampling the mix itself turns a tail schedule
+into a routine one instead of waiting out its probability.
+
 ### Proving the oracles can go red (`--break`)
 
 An invariant nobody has watched fail is not a test — it is an assertion of faith
@@ -306,18 +352,27 @@ storage and never the schedule.
 | `resurrect` | an acked-deleted artifact's bytes come back with its tombstone gone | `TOMBSTONE_MONOTONICITY:` | 3 |
 | `ordering`  | truth grows a file with no `_dirty/` marker and no `_repl/` note ever covering it | `AUDIT_ORDERING:` (repair class 1) | 3 |
 
-K is how many fresh seeds the break needs to red with ≥99.8% confidence.
-`view`, `fanout` and `rerun` red on every seed (300/300 measured); `resurrect`
-(272/300) and `ordering` (266/300) need a run that actually produced the state
-they corrupt — an acked `204`, and a live artifact+sidecar pair, respectively —
-so a schedule that ended with every file tombstoned leaves them inert. CI
-samples nothing: the seed range is pinned and the simulator is deterministic.
+K is how many fresh seeds the break needs to red with ≥99.8% confidence, and the
+table's K is for the **pinned CI flags**, which are non-rotating — so widening
+the workload left every one of them unchanged, re-measured at exactly the old
+numbers (300/300, 300/300, 272/300, 266/300 over 300 fresh seeds). `view`,
+`fanout` and `rerun` red on every seed; `resurrect` and `ordering` need a run
+that actually produced the state they corrupt — an acked `204`, and a live
+artifact+sidecar pair, respectively — so a schedule that ended with every file
+tombstoned leaves them inert. CI samples nothing: the seed range is pinned and
+the simulator is deterministic.
 
-`--break ordering` is the first execution the ~310-line repair classifier has
-ever had. It mutates truth with no durable breadcrumb over it, which is the
-class-1 definition verbatim, and `analyze()` returns class 1 with the causal
-detail — the classifier is sound, it had simply never been handed a class-1
-input by the product.
+Under `--rotate` the same breaks red at different rates, because the rotating
+profile varies the *topology* the break needs: `view` 300/300 and `rerun`
+300/300 (K=1), `resurrect` 265/300 (K=3), `ordering` 219/300 (K=5), `fanout`
+91/300 (K=18). `fanout`'s drop is not a weaker oracle — it is arithmetic: the
+break needs ≥2 buckets *and* `--fail-percent 0`, and rotation supplies both on
+about a third of seeds. Keep the gate on the pinned non-rotating flags; that is
+what makes it a gate rather than a sample.
+
+`--break ordering` is still the only class-**1** input the classifier has ever
+been handed; the product has never produced one. Class 2 is no longer synthetic
+— seed 1067836 above is the real thing.
 
 Off by default and provably free: every injection point is a comparison against
 `Break::None` that draws no rng, consumes no op-sequence number and records no
@@ -329,11 +384,25 @@ pinned baselines must reproduce to the digit.
 reachable: the workload produces the states that red them. TOMBSTONE
 MONOTONICITY does not — `publish_record`'s tombstone fence rejects a re-publish
 of a deleted filename, so no ack can follow a `204` and the invariant cannot
-fire on today's workload at any seed count. `--break resurrect` proves the
-*oracle* is sound even though the *product* cannot reach the state, which is
-the honest status of that guard: mirror filenames are re-fillable by design, so
-the day a legal resurrection path lands it is already watched. An
-unreachable-but-sound guard is legitimate; an unproven one is not.
+fire on today's workload at any seed count. Widening the workload did not change
+that and could not have: the fence is a product rule, not a shortage of
+filenames, and 150k wide seeds (795k acked uploads, 251M interleavings) produced
+zero. `--break resurrect` proves the *oracle* is sound even though the *product*
+cannot reach the state, which is the honest status of that guard: mirror
+filenames are re-fillable by design, so the day a legal resurrection path lands
+it is already watched. An unreachable-but-sound guard is legitimate; an unproven
+one is not.
+
+Class 3 (concurrent-race) is unreachable for a different and more interesting
+reason, worth writing down so nobody re-derives it: the harness's own
+`tick_lock` serializes rebuilds to model the production bucket lease, so two
+unleased rebuilds never race. Removing that lease *still* produced zero repairs
+over 26k wide seeds, and so did truncating the heal phase's drain budget until
+two thirds of seeds failed on other oracles — the marker/tick/sweep/reconcile
+fast path simply converges views without the audit on essentially every schedule
+this simulator can build. The audit is a backstop for a hazard the product does
+not exhibit here; that is a result, not a gap, and it is why the class-2 hit
+above matters so much.
 
 ## Real cloud backends
 
@@ -402,7 +471,7 @@ execution, working `-s`, and pdb.
 
 | When | What |
 |---|---|
-| Every PR (CI) | fmt, clippy `-D warnings`, Rust unit, model checking (bounded configs) + conformance suites, VOPR smoke (fault + crash-only profiles), blackbox on disk + S3 (MinIO) + Azure (Azurite), `cargo-audit`, fuzz-target build smoke |
+| Every PR (CI) | fmt, clippy `-D warnings`, Rust unit, model checking (bounded configs) + conformance suites, VOPR smoke (fault + crash-only + rotating profiles), blackbox on disk + S3 (MinIO) + Azure (Azurite), `cargo-audit`, fuzz-target build smoke |
 | Push to `master` (CI) | all of the above, plus the real-GCS blackbox (when the bucket secret is configured) |
 | Nightly | coverage-guided fuzzing (all six targets); deterministic simulation at volume + deep model configs (simulation.yml, counters published per run) |
 | Weekly | client compat matrix, full-PyPI corpus check, unit-test coverage, real-S3 blackbox (when the bucket secret is configured) |

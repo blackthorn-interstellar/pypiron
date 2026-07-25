@@ -395,15 +395,21 @@ periodic backstop (`--repl-sweep-interval-secs`, default 300, decoupled from the
 etags) is the lost-note backstop. Every node may sweep and diff — both paths are
 conditional and idempotent, and selected-bucket leadership must not discard a
 different node's only working path to a warm bucket. Per-bucket leases still
-deduplicate index/audit work. Mirror/proxy caches, indexes, counters, and leases
-never copy.
+deduplicate index/audit work. `sync --to` mirror snapshots (sidecar
+`replicate=true`) replicate as truth on the same three tiers as private —
+they are the operator's chosen corpus, not re-derivable. Proxy caches (mirror
+sidecars with `replicate` absent/false), indexes, counters, and leases never
+copy.
 
 Correctness does not depend on every node selecting the same bucket. The merge
 (`replicate::decide`, pure and unit-tested) has precedence
 **tombstone ≻ origin (private ≻ mirror) ≻ union ≻ freeze**: deletes beat live
 records, private beats mirror, artifact sets union, and logical yank/status
 epochs settle metadata. Two different mirror-cache bodies remain bucket-local and
-do not freeze. Different **private** bytes under one filename — possible only
+do not freeze; two different **snapshot** bodies (both `replicate=true`) under
+one filename freeze both sides — mirror sidecars carry no `upload-epoch-ms`, so
+there is no trustworthy order and the fail-closed path is the only safe one.
+Different **private** bytes under one filename — possible only
 when a partition moved the serialization point — resolve **first-uploaded-wins**:
 each private sidecar carries `upload-epoch-ms` (server-stamped receive time), the
 older wins, and the loser is quarantined, never deleted. When the two epochs are
@@ -553,7 +559,7 @@ declared class fails CI. Four classes:
 
 | Prefix | Class | Replicates? |
 | --- | --- | --- |
-| `packages/` | truth-replicated | yes — three-tier fan-out → `_repl/` notes → reconcile; any bucket serves the whole corpus |
+| `packages/` | truth-replicated | yes, per record — three-tier fan-out → `_repl/` notes → reconcile; private truth and `sync --to` mirror snapshots (sidecar `replicate=true`) both replicate so any bucket serves the whole corpus. The one exception under this prefix is proxy-cache fills (mirror sidecar, `replicate` absent/false): re-derivable from upstream, so bucket-local |
 | `_advisories/osv-pypi.zip`, `_advisories/quarantined.json` | singleton-replicated | yes — leader-authored control files written write-through to every healthy bucket + reseed-if-absent |
 | `simple/`, `_advisories/report.json`, `_state/`, `_sync/cursors.json`, `_counters/`, `_quarantine/`, `_transparency/chain/` | derived-per-bucket | no — each bucket rebuilds/re-derives its own from the truth it holds |
 | `_leader/lease.json`, `_repl/`, `_topology/stamp.json`, `_staging/`, `_dirty/` | coordination-per-bucket | no — bucket-local by design; replicating it would be wrong |
@@ -583,7 +589,8 @@ Sidecar schema (`<filename>.meta.json`), all captured at write time:
   "requires-python": ">=3.9",
   "yanked": false,
   "origin": "private",
-  "yank-epoch": 0
+  "yank-epoch": 0,
+  "replicate": false
 }
 ```
 
@@ -598,8 +605,12 @@ legacy sidecars and on mirror artifacts; a conflict with either side missing it,
 or with the two within a 2 s skew, degrades to quarantine-both + alarm.
 `yank-epoch` is a monotonic counter bumped on every yank/unyank flip — the
 cross-bucket merge takes the max epoch (no wall clocks, which two buckets cannot
-agree on); absent means 0. Both fields default when absent, so
-every pre-migration sidecar still parses. Rebuilds read sidecars only;
+agree on); absent means 0. `replicate` marks a `sync --to` mirror snapshot: a
+mirror sidecar with `replicate=true` replicates as truth like private, while a
+proxy-cache fill (the bit absent/false) stays bucket-local. It is only consulted
+for mirror-origin records — private replicates from its origin regardless.
+All three fields default when absent, so every pre-migration sidecar still
+parses (a legacy/proxy mirror sidecar reads as a bucket-local cache). Rebuilds read sidecars only;
 if a sidecar is missing (legacy file), the rebuild backfills it by hashing the
 artifact once — create-only, so a real write-time sidecar always wins the race.
 PEP 658 serving falls out of the layout: `<artifact-url>.metadata` maps directly

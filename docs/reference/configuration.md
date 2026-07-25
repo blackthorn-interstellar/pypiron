@@ -242,6 +242,14 @@ before any bucket is contacted.
 A single-entry `--buckets` list behaves exactly like configuring that one backend
 directly — no topology, health, replication, or read-fence work runs.
 
+Replication keeps a full copy of your truth on every bucket: your own uploads
+**and** the corpus you pulled in with `sync --to`. Budget for roughly your
+private-plus-mirrored footprint times the number of buckets. The on-demand proxy
+cache (packages fetched from public PyPI on first request) is the exception — it
+stays bucket-local and is not doubled, because any bucket can re-fetch it from
+upstream. There are no new knobs: snapshot replication is on whenever you run
+more than one bucket.
+
 In multi-bucket mode SDK retries are disabled and one-second topology probes
 switch new requests and cancel background work on an ineligible bucket, without
 putting a short deadline on real artifact transfers (an in-flight transfer keeps

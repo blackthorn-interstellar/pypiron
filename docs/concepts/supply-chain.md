@@ -203,6 +203,12 @@ The proxy still talks to live PyPI on a cache miss. `sync` removes that surface:
 pre-load an approved package list from a host with egress, then serve from a node
 without egress.
 
+That synced corpus is truth, not a cache: run more than one bucket and it
+replicates to every one of them, so an air-gapped fleet survives a bucket or a
+whole region failing over with its mirror intact — no upstream to re-fetch from,
+and none needed. (See [Survive a region or cloud
+outage](../guides/multi-region.md).)
+
 Malware blocking crosses the same gap. A server with no internet can't fetch the
 advisory feed itself, so you deliver it. A pypiron-to-pypiron `sync` ferries the
 feed alongside the packages on its own; against a public source, point `sync` at

@@ -47,6 +47,10 @@ region a client reaches.
 - **Acknowledged uploads.** A publish returns `200` only once the file is on
   every reachable bucket — two buckets, two copies, before the client hears
   success. If one bucket was down, pypiron copies the file over when it returns.
+- **Your mirrored corpus.** Packages you pulled in with `sync --to` replicate
+  as truth just like your own uploads, so every bucket holds the whole mirror.
+  Only the lazy proxy cache (packages fetched on demand from public PyPI) stays
+  bucket-local — it is re-fetchable from upstream, so there is nothing to lose.
 - **Deletes.** A deleted filename never comes back, even if a bucket was
   unreachable when you deleted it.
 
@@ -93,6 +97,11 @@ client hears `200`.
 ```toml
 buckets = ["s3://iron-east@us-east-1", "s3://iron-west@us-west-2"]
 ```
+
+Your own uploads and your `sync --to` mirror both live in every region's bucket,
+so a local install of either pulls bytes from nearby and pays no cross-region
+egress. (On-demand proxy fills are the exception — each region caches those
+itself from upstream.)
 
 That label is the only new configuration, and it's identical on every node. Each
 node detects its own region at boot from its cloud's instance metadata (AWS, GCP,
@@ -181,9 +190,11 @@ proxy-upstream = "https://pypi.org"
 from public PyPI. If your private names share no prefix, deny each exact name in
 the `[mirror]` rules instead.
 
-Public packages fetched through the proxy are not copied between buckets — each
-bucket re-fetches that replaceable cache from upstream. Deleting a proxy-cached
-file by hand is refused when you run more than one bucket.
+Public packages fetched **on demand through the proxy** are the one thing not
+copied between buckets — each bucket re-fetches that replaceable cache from
+upstream. Anything you deliberately mirror with `sync --to` is not a cache: it
+replicates to every bucket like your own uploads. Deleting a proxy-cached file
+by hand is refused when you run more than one bucket.
 
 ## Limits
 

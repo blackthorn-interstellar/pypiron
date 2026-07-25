@@ -1892,6 +1892,68 @@ def test_migrate_seeds_backfill_sentinel_and_reconcile_drains_it(
         server_gen.close()
 
 
+def test_migrate_single_to_multi_fences_the_new_empty_bucket(minio_two, pypiron_bin):
+    """The single-bucket -> multi-bucket expansion. Single mode never writes a
+    topology stamp, so `buckets migrate` has no previous member list to diff and
+    cannot learn which bucket it added. It identifies the addition by content
+    instead: the bucket already holding `packages/` is the established source and
+    keeps serving region reads, while the new empty bucket is fenced by a backfill
+    sentinel until a clean reconcile proves it caught up. Without this fence the
+    fresh, empty region bucket serves reads the instant migrate returns -- the
+    exact failover hole the sentinel exists to close."""
+    minio = minio_two
+    a, b = minio["buckets"]
+    # 'a' is an existing single-bucket deployment: it holds a corpus and, because
+    # single-bucket mode never stamps, carries no topology stamp.
+    minio_put_key_in(minio, a, "packages/existing/existing-1.0-py3-none-any.whl", "bytes")
+    env = _s3_env(minio, "127.0.0.1:0")
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b)
+    rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
+    assert rc == 0, f"single->multi migration failed:\n{out}\n{err}"
+
+    # The new empty bucket b (index 1) is fenced by a sentinel on its peer a.
+    assert [k for k in minio_list_keys_in(minio, a) if k.startswith("_repl/1/_backfill!")], (
+        f"single->multi seeded no backfill sentinel for the new empty bucket:\n{out}\n{err}"
+    )
+    # The established corpus bucket a (index 0) is fenced nowhere: it keeps serving.
+    for bucket in (a, b):
+        assert not [k for k in minio_list_keys_in(minio, bucket) if k.startswith("_repl/0/")], (
+            "the bucket that already holds the corpus must keep serving region reads"
+        )
+    # The new bucket owes itself no note.
+    assert not [k for k in minio_list_keys_in(minio, b) if k.startswith("_repl/")]
+
+
+def test_backfill_sentinel_does_not_wedge_a_later_migrate(minio_three, pypiron_bin):
+    """A seeded backfill sentinel is an empty gate marker, not a stranded repair
+    note: it must never block the next `buckets migrate`. Adding a third bucket
+    while the second's sentinel is still undrained (no server has reconciled yet)
+    succeeds, seeds the third's fence, and leaves the earlier one in place -- the
+    fence's durability does not depend on the added-set being recomputed."""
+    minio = minio_three
+    a, b, c = minio["buckets"]
+    # 'a' holds a corpus; establish [a, b] so b is fenced by a live sentinel.
+    minio_put_key_in(minio, a, "packages/existing/existing-1.0-py3-none-any.whl", "bytes")
+    env = _s3_env(minio, "127.0.0.1:0")
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b)
+    rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
+    assert rc == 0, f"establishing [a, b] failed:\n{out}\n{err}"
+    assert [k for k in minio_list_keys_in(minio, a) if k.startswith("_repl/1/_backfill!")]
+
+    # Add c while b's sentinel is still undrained.
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b, c)
+    rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
+    assert rc == 0, f"a live backfill sentinel wedged the next migrate:\n{out}\n{err}"
+    # c (index 2) is now fenced on both its peers, and b's earlier fence survives.
+    for bucket in (a, b):
+        assert [
+            k for k in minio_list_keys_in(minio, bucket) if k.startswith("_repl/2/_backfill!")
+        ], f"no sentinel for the newly-added bucket c on peer {bucket}"
+    assert [k for k in minio_list_keys_in(minio, a) if k.startswith("_repl/1/_backfill!")], (
+        "the earlier sentinel for b was lost across the second migrate"
+    )
+
+
 def test_fresh_startup_repairs_member_that_missed_topology_migration(
     minio_three_proxy, pypiron_bin, tmp_path_factory
 ):

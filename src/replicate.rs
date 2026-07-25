@@ -1772,13 +1772,43 @@ pub async fn sweep_all_markers(state: &AppState) -> Result<()> {
     }
 }
 
-/// Whether a bucket holds any undrained `_repl/` repair note. A bounded
-/// existence check (one paged LIST capped at a single key), not a count: used by
-/// `buckets migrate` to refuse shrinking/reordering the topology while a repair
-/// note — potentially the sole copy of a record not yet replicated — is still
-/// stranded.
+/// Whether a bucket holds any undrained `_repl/` *repair note* — a real fan-out
+/// marker (`_repl/<dest>/<pkg>/<file>!<nonce>`) that may be a record's sole copy.
+/// Backfill sentinels (`_repl/<dest>/_backfill!<nonce>`) share the prefix but are
+/// empty gate markers, not repair notes: they fence a freshly-added bucket's
+/// region reads, never a topology reshape, so they are deliberately excluded —
+/// otherwise seeding one on `buckets migrate` would wedge every later migrate
+/// until a server ran a reconcile. `buckets migrate` uses this to refuse
+/// shrinking/reordering while a genuine repair note is still stranded. Bounded:
+/// pages `_repl/` and returns on the first key that [`parse_repl_marker`] accepts;
+/// the sentinel count is O(buckets²), so at most a page or two are skipped.
 pub async fn has_undrained_repl_notes(storage: &dyn Storage) -> Result<bool> {
-    Ok(!storage.list_page(REPL_PREFIX, None, 1).await?.is_empty())
+    let mut after: Option<String> = None;
+    loop {
+        let page = storage
+            .list_page(REPL_PREFIX, after.as_deref(), REPL_SWEEP_PAGE)
+            .await?;
+        if page.iter().any(|obj| parse_repl_marker(&obj.key).is_some()) {
+            return Ok(true);
+        }
+        if page.len() < REPL_SWEEP_PAGE {
+            return Ok(false);
+        }
+        after = page.last().map(|obj| obj.key.clone());
+    }
+}
+
+/// Whether a bucket holds no artifact under `packages/` — a bounded single-key
+/// LIST. `buckets migrate` uses it when no prior topology stamp exists (the
+/// single-bucket → multi-bucket expansion, where single mode never stamps a
+/// member list to diff against): a bucket that already holds corpus is the
+/// established source and keeps serving region reads, while an empty one is
+/// fenced with a backfill sentinel until a clean reconcile proves it caught up.
+pub async fn bucket_is_corpus_empty(storage: &dyn Storage) -> Result<bool> {
+    Ok(storage
+        .list_page(crate::app::PACKAGES_PREFIX, None, 1)
+        .await?
+        .is_empty())
 }
 
 /// Whether this bucket holds any undrained `_repl/<dest>/` note — a repair still

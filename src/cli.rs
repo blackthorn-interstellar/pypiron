@@ -460,9 +460,12 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
         bucket_health::classify(observed_storage::signal_for_error(error))
             == bucket_health::SignalClass::AvailabilityFailure
     };
-    // New-topology indices that were not in the previous stamped member list —
-    // buckets this migration adds. Each needs a backfill sentinel once the
-    // re-stamp lands, so it serves no region reads until the corpus converges.
+    // Buckets this migration adds to an existing fleet — a freshly-added bucket
+    // holds none of the corpus yet, so it must serve no region reads until a
+    // clean reconcile proves it caught up. Identified by diffing the previous
+    // stamped member list, or (single-bucket → multi-bucket, where no prior stamp
+    // exists to diff) by which buckets are still empty of corpus. Each is fenced
+    // with a backfill sentinel seeded *before* the re-stamp commits (see below).
     let mut added_indices: Vec<usize> = Vec::new();
     // Refuse to change the topology while any reachable bucket still holds
     // undrained `_repl/` repair notes: a stranded note may be the sole copy of a
@@ -505,87 +508,174 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
             .stamped_member_names_with(|_, error| is_availability(error))
             .await
             .context("read the previous topology to find buckets being removed")?;
-        if let Some(previous) = previous {
-            for (index, handle) in buckets.handles().iter().enumerate() {
-                if !previous.iter().any(|name| name == &handle.name) {
-                    added_indices.push(index);
+        match previous {
+            // Buckets in the new list but absent from the previous stamped
+            // topology are the ones this migration adds.
+            Some(previous) => {
+                for (index, handle) in buckets.handles().iter().enumerate() {
+                    if !previous.iter().any(|name| name == &handle.name) {
+                        added_indices.push(index);
+                    }
                 }
-            }
-            let new_names: std::collections::HashSet<&str> = buckets
-                .handles()
-                .iter()
-                .map(|handle| handle.name.as_str())
-                .collect();
-            let survivors: Vec<Arc<dyn Storage>> = buckets
-                .handles()
-                .iter()
-                .map(|handle| handle.storage.clone())
-                .collect();
-            for removed in previous
-                .iter()
-                .filter(|name| !new_names.contains(name.as_str()))
-            {
-                let storage = args
-                    .storage
-                    .build_one_by_identity(removed)
-                    .await
-                    .with_context(|| format!("connect to removed bucket '{removed}'"))?;
-                match replicate::has_undrained_repl_notes(storage.as_ref()).await {
-                    Ok(false) => {}
-                    Ok(true) => bail!(
-                        "bucket '{removed}' is being removed but still holds undrained _repl/ \
+                let new_names: std::collections::HashSet<&str> = buckets
+                    .handles()
+                    .iter()
+                    .map(|handle| handle.name.as_str())
+                    .collect();
+                let survivors: Vec<Arc<dyn Storage>> = buckets
+                    .handles()
+                    .iter()
+                    .map(|handle| handle.storage.clone())
+                    .collect();
+                for removed in previous
+                    .iter()
+                    .filter(|name| !new_names.contains(name.as_str()))
+                {
+                    let storage = args
+                        .storage
+                        .build_one_by_identity(removed)
+                        .await
+                        .with_context(|| format!("connect to removed bucket '{removed}'"))?;
+                    match replicate::has_undrained_repl_notes(storage.as_ref()).await {
+                        Ok(false) => {}
+                        Ok(true) => bail!(
+                            "bucket '{removed}' is being removed but still holds undrained _repl/ \
                          repair notes; a stranded note there may be a record's only copy. Let the \
                          running server's sweep drain them (or wait for the periodic sweep), then \
                          retry `pypiron buckets migrate`."
-                    ),
-                    Err(error) if is_availability(&error) => bail!(
+                        ),
+                        Err(error) if is_availability(&error) => bail!(
                         "bucket '{removed}' is being removed but is unreachable, so its _repl/ \
                          repair notes cannot be verified drained; refusing to drop a bucket that \
                          may hold a record's only copy. Bring it back, let the sweep drain, then \
                          retry `pypiron buckets migrate`. ({error:#})"
                     ),
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("check removed bucket '{removed}' for undrained repair notes")
-                        })
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "check removed bucket '{removed}' for undrained repair notes"
+                                )
+                            })
+                        }
                     }
-                }
 
-                // An empty `_repl/` tree proves nothing about content the fleet
-                // never fanned out — a snapshot seeded out-of-band, or a bucket
-                // whose backfill has not converged. Diff its `packages/` against
-                // every surviving bucket and refuse the drop if it is the sole
-                // copy of any artifact. `--force` accepts the loss.
-                if !args.force {
-                    let samples = replicate::artifacts_unique_to_removed(
-                        storage.as_ref(),
-                        &survivors,
-                        MIGRATE_UNIQUE_SAMPLE,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
+                    // An empty `_repl/` tree proves nothing about content the fleet
+                    // never fanned out — a snapshot seeded out-of-band, or a bucket
+                    // whose backfill has not converged. Diff its `packages/` against
+                    // every surviving bucket and refuse the drop if it is the sole
+                    // copy of any artifact. `--force` accepts the loss.
+                    if !args.force {
+                        let samples = replicate::artifacts_unique_to_removed(
+                            storage.as_ref(),
+                            &survivors,
+                            MIGRATE_UNIQUE_SAMPLE,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
                             "diff removed bucket '{removed}' against surviving buckets; a survivor \
                              that could not be inspected is treated as a refusal, never a drop"
                         )
-                    })?;
-                    if !samples.is_empty() {
-                        let examples = samples.join(", ");
-                        bail!(
-                            "bucket '{removed}' is being removed but is the only copy of \
+                        })?;
+                        if !samples.is_empty() {
+                            let examples = samples.join(", ");
+                            bail!(
+                                "bucket '{removed}' is being removed but is the only copy of \
                              {}{} artifact(s), e.g. {examples}. Dropping it loses that content. \
                              Back the corpus up onto a surviving bucket first (add the survivor, \
                              let replication converge, then remove this one), or pass --force to \
                              accept the data loss.",
-                            samples.len(),
-                            if samples.len() >= MIGRATE_UNIQUE_SAMPLE {
-                                "+"
-                            } else {
-                                ""
-                            }
-                        );
+                                samples.len(),
+                                if samples.len() >= MIGRATE_UNIQUE_SAMPLE {
+                                    "+"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
                     }
                 }
+            }
+            // No reachable bucket carries a topology stamp: the source is
+            // single-bucket mode (which never stamps) or a first-ever multi-bucket
+            // migration. There is no previous member list to diff, so identify the
+            // freshly-added buckets by content — a bucket already holding
+            // `packages/` is the established source and keeps serving region
+            // reads, while every bucket still empty of corpus is fenced until a
+            // clean reconcile proves it caught up. This is the primary
+            // single-bucket → multi-bucket expansion path.
+            None => {
+                for (index, handle) in buckets.handles().iter().enumerate() {
+                    match replicate::bucket_is_corpus_empty(handle.storage.as_ref()).await {
+                        Ok(true) => added_indices.push(index),
+                        Ok(false) => {}
+                        Err(error) if is_availability(&error) => {
+                            // Cannot prove it already holds corpus, so fence it
+                            // fail-closed; the sentinel lands on its reachable
+                            // peers, so an unreachable dest is still gated.
+                            eprintln!(
+                                "migrate: bucket '{}' unreachable while checking for existing \
+                                 corpus; fencing it until a clean reconcile",
+                                handle.name
+                            );
+                            added_indices.push(index);
+                        }
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("check bucket '{}' for existing corpus", handle.name)
+                            })
+                        }
+                    }
+                }
+            }
+        }
+
+        // Seed each freshly-added bucket's backfill sentinel *before* committing
+        // the topology stamp (write-ahead gate). The stamp is what a retry reads
+        // back as the "previous" topology and what makes the new buckets live; if
+        // seeding ran only after it, a crash — or every peer seed failing once —
+        // between the two would leave an empty bucket serving region reads
+        // forever, because the retry would see previous == the new list and seed
+        // nothing. Seeding first, and refusing to stamp when a new bucket cannot
+        // be gated on any reachable peer, keeps it fenced until reconcile drains
+        // it. Sentinels orphaned by a later bail are empty and harmless — the next
+        // clean reconcile drains them.
+        for &dest in &added_indices {
+            let mut seeded_any = false;
+            for (peer, handle) in buckets.handles().iter().enumerate() {
+                if peer == dest {
+                    continue;
+                }
+                match replicate::seed_backfill_sentinel(handle.storage.as_ref(), dest).await {
+                    Ok(()) => seeded_any = true,
+                    Err(error) if is_availability(&error) => {
+                        eprintln!(
+                            "migrate: peer '{}' unreachable while gating new bucket '{}'; \
+                             skipping this peer",
+                            handle.name,
+                            buckets.handles()[dest].name
+                        );
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "seed the backfill sentinel for new bucket '{}' on peer '{}'; \
+                                 refusing to commit a topology that would expose an ungated, \
+                                 empty bucket to region reads",
+                                buckets.handles()[dest].name,
+                                handle.name
+                            )
+                        });
+                    }
+                }
+            }
+            if !seeded_any {
+                bail!(
+                    "could not seed the backfill sentinel for new bucket '{}' on any reachable \
+                     peer; refusing to commit a topology that would let an unconverged bucket \
+                     serve region reads. Bring a peer back, then retry `pypiron buckets migrate`.",
+                    buckets.handles()[dest].name
+                );
             }
         }
     }
@@ -601,29 +691,9 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
         report.unreachable_indices.len()
     );
 
-    // Seed a backfill sentinel for every bucket this migration adds to an
-    // existing fleet. A freshly-added bucket holds none of the corpus yet, so it
-    // must serve no region reads until a clean reconcile pass proves it caught
-    // up. O(1) per added bucket: one empty marker on each surviving peer, riding
-    // the read-affinity `_repl/<dest>/` gate. Best-effort — a peer we cannot seed
-    // simply degrades to the pre-existing "reads follow the write pin" default.
-    for &dest in &added_indices {
-        for (peer, handle) in buckets.handles().iter().enumerate() {
-            if peer == dest {
-                continue;
-            }
-            if let Err(error) =
-                replicate::seed_backfill_sentinel(handle.storage.as_ref(), dest).await
-            {
-                eprintln!(
-                    "migrate: could not seed the backfill sentinel for new bucket '{}' on peer \
-                     '{}' ({error:#}); its region reads are not gated on this peer",
-                    buckets.handles()[dest].name,
-                    handle.name
-                );
-            }
-        }
-    }
+    // The backfill sentinels were already seeded above, before the stamp
+    // committed, so a freshly-added bucket is fenced the moment its topology is
+    // live — no crash window between the stamp and the gate.
     if !added_indices.is_empty() {
         eprintln!(
             "seeded backfill sentinels for {} newly-added bucket(s); they serve no region reads \

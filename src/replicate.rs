@@ -1595,6 +1595,18 @@ async fn replicate_record(
     } = reconcile_split_origin(src, dst, pkg, src_origin, dst_origin).await?;
 
     if filename == ORIGIN_MARKER {
+        // The `.origin` marker fans out (and is swept) only for a first-write
+        // claim from `store_upload` — never a proxy fill — so a mirror claim
+        // here is always a `sync --to` snapshot reservation, not a bucket-local
+        // cache. Reserve it on the peer ahead of the artifact, the same
+        // pre-bytes dependency-confusion boundary `reconcile_split_origin` gives
+        // a private claim above; the later artifact fan-out re-claims
+        // idempotently. A mirror claim never demotes private truth on the peer.
+        // (Left out of `reconcile_split_origin` on purpose: the full diff shares
+        // it and must keep a proxy cache's origin bucket-local.)
+        if src_origin == Some(Origin::Mirror) {
+            ensure_mirror_origin(dst, pkg).await?;
+        }
         return Ok(());
     }
     if filename == PROJECT_STATUS_MARKER {
@@ -3484,6 +3496,66 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
+            Some(PRIVATE)
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_marker_fanout_reserves_a_mirror_snapshot_claim_on_the_peer() {
+        // A `sync --to` snapshot's first-write claim fans out its `.origin`
+        // marker before any bytes land. The peer must reserve MIRROR the same
+        // way a private claim reserves PRIVATE — otherwise the pre-artifact
+        // dependency-confusion window stays open on every peer during fan-out.
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        a.insert(&crate::origin::origin_key("pkg"), b"mirror".to_vec());
+        let state = two_bucket_state(a.clone(), b.clone());
+
+        replicate_record(
+            &state,
+            a.as_ref(),
+            b.as_ref(),
+            "pkg",
+            ORIGIN_MARKER,
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_origin(b.as_ref(), "pkg").await.unwrap().as_deref(),
+            Some(MIRROR)
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_marker_fanout_never_demotes_private_truth_to_mirror() {
+        // A mirror snapshot claim reaching a peer that already holds private
+        // truth leaves it terminal — private outranks mirror everywhere.
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        a.insert(&crate::origin::origin_key("pkg"), b"mirror".to_vec());
+        b.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
+        let state = two_bucket_state(a.clone(), b.clone());
+
+        replicate_record(
+            &state,
+            a.as_ref(),
+            b.as_ref(),
+            "pkg",
+            ORIGIN_MARKER,
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_origin(b.as_ref(), "pkg").await.unwrap().as_deref(),
+            Some(PRIVATE)
+        );
+        // The reconcile split promotes the mirror source to private truth.
+        assert_eq!(
+            read_origin(a.as_ref(), "pkg").await.unwrap().as_deref(),
             Some(PRIVATE)
         );
     }

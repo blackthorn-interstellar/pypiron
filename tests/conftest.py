@@ -1659,6 +1659,84 @@ def s3_servers_multi_proxy(
         upstream_gen.close()
 
 
+#: The malware advisory the single-survivor fixture arms its byte gate with: a
+#: MAL record blocking one exact (package, version) so a mirror upload of it 403s.
+SURVIVOR_MAL_ID = "MAL-2099-0001"
+SURVIVOR_MAL_PKG = "survivor-malware"
+SURVIVOR_MAL_VERSION = "6.6.6"
+
+
+def _write_survivor_feed(path: Path) -> Path:
+    """A one-record OSV zip in the flat `<id>.json` export shape, blocking exactly
+    SURVIVOR_MAL_PKG==SURVIVOR_MAL_VERSION. Self-contained so the single-survivor
+    fixture needs no cross-test import."""
+    import json as _json
+    import zipfile
+
+    record = {
+        "id": SURVIVOR_MAL_ID,
+        "modified": "2099-01-01T00:00:00Z",
+        "summary": f"malware in {SURVIVOR_MAL_PKG} {SURVIVOR_MAL_VERSION}",
+        "affected": [
+            {
+                "package": {"ecosystem": "PyPI", "name": SURVIVOR_MAL_PKG},
+                "versions": [SURVIVOR_MAL_VERSION],
+            }
+        ],
+    }
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr(f"{SURVIVOR_MAL_ID}.json", _json.dumps(record))
+    return path
+
+
+@pytest.fixture()
+def s3_server_multi_survivor(
+    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
+) -> Iterator[Dict]:
+    """One node over two buckets behind the fault proxy, carrying EVERY replicated
+    state class at once — private/snapshot/proxy-fill packages, an armed advisory
+    feed, the transparency chain, and the counter rollup — for the single-survivor
+    acceptance test. A real disk upstream feeds proxy fills; short reconcile/sweep/
+    counter cadences and a one-failure leave threshold converge and fail over
+    within a test's patience, and a long return threshold keeps the failed bucket
+    down for the duration of the survivor assertions."""
+    upstream_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    upstream = next(upstream_gen)
+    feed = _write_survivor_feed(tmp_path_factory.mktemp("survivor-feed") / "osv.zip")
+    try:
+        server_gen = _start_s3_server(
+            tmp_path_factory,
+            pypiron_bin,
+            minio_two_proxy,
+            extra_env={
+                "PYPIRON_RECONCILE_INTERVAL_SECS": "2",
+                "PYPIRON_REPL_SWEEP_INTERVAL_SECS": "2",
+            },
+            extra_args=[
+                "--proxy-upstream",
+                upstream["base_url"],
+                "--allow-insecure-upstream",
+                "--exclude-newer",
+                "",
+                "--advisory-feed",
+                str(feed),
+                "--bucket-leave-failures",
+                "1",
+                "--bucket-return-healthy-secs",
+                "600",
+                "--counters-flush-interval-secs",
+                "1",
+                "--counters-rollup-interval-secs",
+                "1",
+            ],
+        )
+        server = next(server_gen)
+        yield {**server, "upstream": upstream, "feed": feed}
+    finally:
+        server_gen.close()
+        upstream_gen.close()
+
+
 @pytest.fixture()
 def s3_server_multi_proxy_prefixed(
     tmp_path_factory, pypiron_bin: Path, minio_two: Dict

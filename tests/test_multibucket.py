@@ -28,6 +28,9 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from .conftest import (
+    SURVIVOR_MAL_ID,
+    SURVIVOR_MAL_PKG,
+    SURVIVOR_MAL_VERSION,
     _s3_env,
     _start_s3_server,
     minio_delete_key_in,
@@ -2751,3 +2754,175 @@ def test_counter_day_rollups_replicate_and_survive_failover(
     # The server, now serving from the peer, stays up.
     code, _, _ = http_get(server["base_url"] + "/ready")
     assert code == 200
+
+
+# ---------------------------------------------------------------------------
+# The single-survivor acceptance test (the totality principle, dev/DESIGN.md).
+
+
+def _mirror_upload(server, wheel) -> None:
+    """Publish `wheel` as a `sync --to` snapshot (mirror=true), the replicating
+    mirror-origin path."""
+    upload_legacy(
+        server["legacy"],
+        wheel,
+        username=server["user"],
+        password=server["password"],
+        fields={"mirror": "true", "yanked": "false", "upload_time": "2021-06-01T00:00:00Z"},
+    )
+
+
+def _uv_install(uv_path, venv, index_url: str, spec: str):
+    """`uv pip install <spec>` against `index_url`, no cache; rc 0 == installed."""
+    return run_returncode(
+        [
+            uv_path,
+            "pip",
+            "install",
+            "--python",
+            str(venv),
+            "--index-url",
+            index_url,
+            "--no-cache",
+            spec,
+        ],
+        timeout=180,
+    )
+
+
+def test_single_survivor_every_state_class_serves_from_one_bucket(
+    s3_server_multi_survivor, uv_path, uv_venv, pypiron_bin, tmp_path
+):
+    """THE single-survivor test — the named acceptance test for dev/DESIGN.md's
+    totality principle ("any single surviving bucket rebuilds the whole service").
+    It seeds EVERY replicated state class into a two-bucket fleet — a private
+    upload, a `sync --to` snapshot, a proxy fill (the async-cache class this track
+    adds), an armed advisory/quarantine feed, a transparency-chain link, and a
+    counter day-rollup — forces convergence, then makes the preferred/write bucket
+    A permanently unreachable and proves the whole service runs from bucket B
+    alone: all three package kinds install, quarantine is still enforced,
+    verify-chain passes against B, and /audit + /stats history are intact. This is
+    the test that stops a future feature from silently reintroducing per-bucket
+    truth."""
+    server = s3_server_multi_survivor
+    minio = server["minio"]
+    a, b = minio["buckets"][:2]
+    base = server["base_url"]
+
+    _eventually(lambda: _selected_bucket(server) == a, timeout=15, what="write bucket A selected")
+
+    # --- Seed every replicated state class on the live fleet ---
+    # 1. Private upload — pre-ack fan-out to both buckets.
+    priv = make_wheel("survivorpriv", "1.0", tmp_path)
+    _upload(server, priv)
+    wait_for_file_in_index(server["simple"], "survivorpriv", priv.name)
+    priv_key = f"packages/survivorpriv/{priv.name}"
+
+    # 2. sync --to snapshot — pre-ack fan-out.
+    snap = make_wheel("survivorsnap", "1.0", tmp_path)
+    _mirror_upload(server, snap)
+    wait_for_file_in_index(server["simple"], "survivorsnap", snap.name)
+    snap_key = f"packages/survivorsnap/{snap.name}"
+
+    # 3. Proxy fill — the async-cache class: fetched on demand from the upstream,
+    #    committed to A, then replicated to B by a post-serve `_repl/` note.
+    cached = make_wheel("survivorcache", "1.0", tmp_path)
+    _upload(server["upstream"], cached)
+    wait_for_file_in_index(server["upstream"]["simple"], "survivorcache", cached.name)
+    code, body, _ = http_get(f"{base}/files/survivorcache/{cached.name}", timeout=30)
+    assert code == 200 and body == cached.read_bytes(), "proxy fill did not serve the artifact"
+    cache_key = f"packages/survivorcache/{cached.name}"
+
+    # 4. Advisory/quarantine — a blocked mirror wheel matching the fixture's feed.
+    mal = make_wheel(SURVIVOR_MAL_PKG, SURVIVOR_MAL_VERSION, tmp_path)
+    _mirror_upload(server, mal)
+    mal_key = f"packages/{SURVIVOR_MAL_PKG}/{mal.name}"
+    mal_url = f"{base}/files/{SURVIVOR_MAL_PKG}/{mal.name}"
+    _eventually(
+        lambda: http_get(mal_url)[0] == 403,
+        timeout=20,
+        what="malware wheel is byte-gated before failover",
+    )
+
+    # 5. Counter day-rollup — inject a finished past day straight into the write
+    #    bucket; the leader freezes it and reseeds the rollup + summary to B.
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    past = (today - datetime.timedelta(days=3)).isoformat()
+    seg = json.dumps(
+        {"resolution_secs": 86400, "buckets": {"00:00": {f"survivorpriv/{priv.name}": 5}}}
+    )
+    minio_put_key_in(minio, a, f"_counters/seg/downloads/{past}/r/injected-0.json", seg)
+    frozen = f"_counters/day/downloads/{past}/r.json"
+
+    # --- Force convergence: every class must land on bucket B ---
+    for key, what in (
+        (priv_key, "private upload"),
+        (snap_key, "sync snapshot"),
+        (cache_key, "proxy cache (async note)"),
+        (mal_key, "quarantined mirror wheel"),
+        (frozen, "counter day-rollup"),
+    ):
+        _eventually(
+            lambda key=key: minio_key_exists_in(minio, b, key),
+            timeout=45,
+            what=f"{what} converges to bucket B",
+        )
+    # The proxy fill converged byte-for-byte (rigorous async-cache-replication proof).
+    assert minio_object_sha256(minio, b, cache_key) == minio_object_sha256(minio, a, cache_key)
+    # A transparency-chain link was committed and replicated to B.
+    _eventually(
+        lambda: bool(_chain_seqs_in(minio, b)),
+        timeout=45,
+        what="transparency chain link replicated to B",
+    )
+
+    # --- Make bucket A permanently unreachable; the node fails over to B ---
+    server["faults"].fail(a)
+    _eventually(
+        lambda: _selected_bucket(server) == b,
+        timeout=30,
+        what="node selects bucket B after A goes unreachable",
+    )
+
+    # --- The whole service runs from bucket B alone ---
+    # All three package kinds install from B's index (private, snapshot, cache).
+    for pkg, wheel in (
+        ("survivorpriv", priv),
+        ("survivorsnap", snap),
+        ("survivorcache", cached),
+    ):
+        rc, out, err = _uv_install(uv_path, uv_venv, server["simple"], f"{pkg}==1.0")
+        assert rc == 0, f"{pkg} did not install from the surviving bucket:\n{out}\n{err}"
+
+    # Quarantine is still enforced (advisory feed + blocked wheel both on B).
+    code, body, _ = http_get(mal_url)
+    assert code == 403, (code, body)
+    assert SURVIVOR_MAL_ID.encode() in body, body
+
+    # verify-chain passes against bucket B alone (the chain + sidecars replicated).
+    verify_env = _s3_env({**minio, "buckets": [b]}, "127.0.0.1:0")
+    rc, out, err = run_returncode([str(pypiron_bin), "verify-chain"], env=verify_env, timeout=90)
+    assert rc == 0, f"verify-chain must pass on the survivor bucket:\n{out}{err}"
+
+    # /stats history is intact — the rolled-up past day survived on B.
+    def _stats_day():
+        code, body, _ = http_request_auth(
+            "GET", f"{base}/stats/downloads", username="admin", password="secret"
+        )
+        assert code == 200, body
+        return json.loads(body)["days"].get(past) == 5
+
+    _eventually(_stats_day, timeout=20, what="/stats history intact on the survivor bucket")
+
+    # /audit is intact — rebuilt on B from the replicated feed + converged corpus,
+    # and still names the blocked package.
+    def _audit_has_malware():
+        code, body, _ = http_request_auth(
+            "GET", f"{base}/audit.json", username="admin", password="secret"
+        )
+        assert code == 200, body
+        return SURVIVOR_MAL_PKG.encode() in body
+
+    _eventually(
+        _audit_has_malware, timeout=30, what="/audit intact and names the blocked package on B"
+    )

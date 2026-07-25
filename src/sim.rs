@@ -13,12 +13,12 @@
 //! content hashes, and timestamps read from a virtual [`SimClock`] rather than
 //! the wall clock. Given the same operations it produces byte-identical states.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use axum::body::Body;
 use http::{header, Response, StatusCode};
@@ -26,7 +26,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::app::AppState;
 use crate::buckets::{BucketHandle, BucketSet};
-use crate::storage::{FileEntry, NotFound, ObjectMeta, Storage};
+use crate::storage::{
+    CopyOrigin, CopyOutcome, CopyProvider, FileEntry, NotFound, ObjectMeta, Storage,
+};
 
 /// An Arc-shareable virtual clock. Independent from the global override in
 /// [`crate::clock`]: many `SimStorage`s can share one `SimClock` for consistent
@@ -112,6 +114,31 @@ struct Inner {
     next_version: u64,
 }
 
+/// A fault the sim injects into [`SimStorage::server_side_copy`], mirroring the
+/// three real failure modes the replication transport ladder must survive:
+/// a denied copy, a timed-out copy, and S3's phantom 200-with-error-body (the
+/// verb reports success but writes nothing). Every one drives the ladder back to
+/// streaming, so convergence is invariant to them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyFault {
+    Denied,
+    Timeout,
+    /// Reports `Copied` but writes no bytes — the caller's post-copy size verify
+    /// (or the boot probe's HEAD) catches it.
+    Phantom,
+}
+
+/// Registry of copy-capable sim buckets by copy id. A server-side copy on the
+/// destination has no access to the source bucket's `BTreeMap` (they are
+/// independent, like two real buckets), so — exactly as a cloud provider bridges
+/// two buckets it hosts — the destination looks the source up here and moves the
+/// bytes. Test-only: only [`SimStorage::new_copy_source`] registers.
+static SIM_COPY_REGISTRY: OnceLock<Mutex<HashMap<String, Weak<SimStorage>>>> = OnceLock::new();
+
+fn sim_copy_registry() -> &'static Mutex<HashMap<String, Weak<SimStorage>>> {
+    SIM_COPY_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Deterministic in-memory [`Storage`], modeled on
 /// `storage::test_support::InMemStorage` but with versioned etags and
 /// clock-stamped timestamps so it behaves like a real object store under the
@@ -119,6 +146,12 @@ struct Inner {
 pub struct SimStorage {
     clock: Arc<SimClock>,
     inner: Mutex<Inner>,
+    /// This bucket's server-side-copy identity, when it participates in the copy
+    /// transport (set by [`new_copy_source`](Self::new_copy_source)). `None`
+    /// buckets never copy — the ladder streams, as in single-bucket mode.
+    copy_id: Option<String>,
+    /// A sticky fault applied to every [`server_side_copy`](Storage::server_side_copy).
+    copy_fault: Mutex<Option<CopyFault>>,
 }
 
 impl SimStorage {
@@ -129,7 +162,34 @@ impl SimStorage {
                 objects: BTreeMap::new(),
                 next_version: 0,
             }),
+            copy_id: None,
+            copy_fault: Mutex::new(None),
         })
+    }
+
+    /// A copy-capable sim bucket, registered under `copy_id` so a peer's
+    /// server-side copy can find it. Ids must be unique within a run.
+    pub fn new_copy_source(clock: Arc<SimClock>, copy_id: &str) -> Arc<SimStorage> {
+        let this = Arc::new(SimStorage {
+            clock,
+            inner: Mutex::new(Inner {
+                objects: BTreeMap::new(),
+                next_version: 0,
+            }),
+            copy_id: Some(copy_id.to_string()),
+            copy_fault: Mutex::new(None),
+        });
+        let mut reg = sim_copy_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reg.retain(|_, weak| weak.strong_count() > 0);
+        reg.insert(copy_id.to_string(), Arc::downgrade(&this));
+        this
+    }
+
+    /// Inject (or clear, with `None`) the sticky copy fault for this bucket.
+    pub fn set_copy_fault(&self, fault: Option<CopyFault>) {
+        *self.copy_fault.lock().unwrap_or_else(|e| e.into_inner()) = fault;
     }
 
     /// Recover from a poisoned lock instead of panicking: a determinism run must
@@ -349,6 +409,51 @@ impl Storage for SimStorage {
             }
             _ => Ok(None),
         }
+    }
+
+    fn copy_origin(&self) -> Option<CopyOrigin> {
+        self.copy_id.as_ref().map(|id| CopyOrigin {
+            // Real-cloud-like: provider S3 with no custom endpoint, so two sim
+            // buckets read as a cross-region-eligible pair.
+            provider: CopyProvider::S3,
+            location: id.clone(),
+            endpoint: None,
+            account: None,
+        })
+    }
+
+    async fn copy_credential_identity(&self) -> Result<Option<String>> {
+        // All sim buckets share one identity, so any copy-capable pair passes
+        // the static eligibility filter (the boot probe then verifies for real).
+        Ok(self.copy_id.as_ref().map(|_| "sim".to_string()))
+    }
+
+    async fn server_side_copy(
+        &self,
+        src: &CopyOrigin,
+        src_key: &str,
+        dst_key: &str,
+        _expected_size: u64,
+    ) -> Result<CopyOutcome> {
+        if self.copy_id.is_none() {
+            return Ok(CopyOutcome::NotCopyable);
+        }
+        match *self.copy_fault.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(CopyFault::Denied) => bail!("sim server-side copy denied"),
+            Some(CopyFault::Timeout) => bail!("sim server-side copy timed out"),
+            // Report success but write nothing — the phantom 200-with-error-body.
+            Some(CopyFault::Phantom) => return Ok(CopyOutcome::Copied),
+            None => {}
+        }
+        let source = sim_copy_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&src.location)
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| anyhow!("sim copy source '{}' is not registered", src.location))?;
+        let bytes = source.get_bytes(src_key).await?;
+        self.put_bytes(dst_key, bytes, None).await?;
+        Ok(CopyOutcome::Copied)
     }
 }
 

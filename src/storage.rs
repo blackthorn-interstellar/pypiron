@@ -17,10 +17,14 @@ use tokio_util::io::ReaderStream;
 // Cloud object-store deps: S3, GCS, and Azure Blob behind one API. Disk is a
 // separate, dependency-free backend; everything remote shares one impl.
 use futures::StreamExt as _;
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3CopyIfNotExists};
-use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
+use object_store::aws::{
+    AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, AwsCredentialProvider, S3CopyIfNotExists,
+};
+use object_store::azure::{
+    AzureConfigKey, AzureCredential, AzureCredentialProvider, MicrosoftAzureBuilder,
+};
 use object_store::client::ClientConfigKey;
-use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
+use object_store::gcp::{GcpCredentialProvider, GoogleCloudStorageBuilder, GoogleConfigKey};
 use object_store::path::Path as OsPath;
 use object_store::signer::Signer;
 use object_store::{
@@ -638,14 +642,28 @@ impl StorageArgs {
             b.build()
                 .with_context(|| format!("configure S3 backend for bucket '{bucket}'"))?,
         );
+        let creds = s3.credentials().clone();
         let store: Arc<dyn ObjectStore> = s3.clone();
         let signer: Arc<dyn Signer> = s3;
-        Ok(Arc::new(ObjectStorage::new(
-            store,
-            Some(signer),
-            prefix.clone(),
-            "s3",
-        )))
+        let mut storage = ObjectStorage::new(store, Some(signer), prefix.clone(), "s3");
+        // Server-side copy is a multi-bucket-only replication transport; single
+        // buckets never replicate, so they carry no copy material.
+        if failover {
+            let resolved_region = region
+                .map(str::to_string)
+                .or_else(|| env_nonempty("AWS_REGION"))
+                .or_else(|| env_nonempty("AWS_DEFAULT_REGION"))
+                .unwrap_or_else(|| "us-east-1".to_string());
+            storage = storage.with_copy(CopyBackend::S3 {
+                client: copy_http_client()?,
+                creds,
+                region: resolved_region,
+                bucket: bucket.to_string(),
+                endpoint: endpoint.clone(),
+                virtual_hosted: !force_path_style && endpoint.is_none(),
+            });
+        }
+        Ok(Arc::new(storage))
     }
 
     /// Build one GCS-backed [`Storage`]. Credentials come from Application
@@ -682,10 +700,10 @@ impl StorageArgs {
         let endpoint = ov
             .and_then(|o| o.endpoint_url.clone())
             .or_else(|| self.gcs_endpoint_url.clone());
-        if let Some(url) = endpoint {
+        if let Some(url) = &endpoint {
             // Emulator (fake-gcs-server): point at it and skip signing.
             b = b
-                .with_config(GoogleConfigKey::BaseUrl, url)
+                .with_config(GoogleConfigKey::BaseUrl, url.clone())
                 .with_config(GoogleConfigKey::SkipSignature, "true");
             can_sign = false;
         }
@@ -693,14 +711,19 @@ impl StorageArgs {
             b.build()
                 .with_context(|| format!("configure GCS backend for bucket '{bucket}'"))?,
         );
+        let creds = gcs.credentials().clone();
         let store: Arc<dyn ObjectStore> = gcs.clone();
         let signer = can_sign.then_some(gcs as Arc<dyn Signer>);
-        Ok(Arc::new(ObjectStorage::new(
-            store,
-            signer,
-            prefix.clone(),
-            "gcs",
-        )))
+        let mut storage = ObjectStorage::new(store, signer, prefix.clone(), "gcs");
+        if failover {
+            storage = storage.with_copy(CopyBackend::Gcs {
+                client: copy_http_client()?,
+                creds,
+                bucket: bucket.to_string(),
+                endpoint: endpoint.clone(),
+            });
+        }
+        Ok(Arc::new(storage))
     }
 
     /// Build one Azure Blob-backed [`Storage`]. Credentials come from the Azure
@@ -725,15 +748,18 @@ impl StorageArgs {
         };
         let mut can_sign = false;
         // Account: per-bucket override wins over the backend-wide flag.
-        let account = ov
+        let mut copy_account = ov
             .and_then(|o| o.account.clone())
             .or_else(|| self.azure_account.clone());
-        if let Some(a) = account {
-            b = b.with_account(a);
+        if let Some(a) = &copy_account {
+            b = b.with_account(a.clone());
         }
+        // The account key doubles as Shared Key signing material for Copy Blob.
+        let mut shared_key: Option<String> = None;
         if let Some(ref k) = self.azure_access_key {
             b = b.with_access_key(k.clone());
             can_sign = true;
+            shared_key = Some(k.clone());
         }
         // Per-bucket scoped key via env-prefix (explicit beats from_env and the
         // backend-wide key). Presence validated at startup (rule 5b).
@@ -742,32 +768,49 @@ impl StorageArgs {
             .filter(|p| !p.is_empty())
         {
             if let Some(key) = env_nonempty(&format!("{env_prefix}AZURE_ACCESS_KEY")) {
-                b = b.with_access_key(key);
+                b = b.with_access_key(key.clone());
                 can_sign = true;
+                shared_key = Some(key);
             }
         }
         if self.azure_use_emulator {
             b = b.with_use_emulator(true);
             can_sign = true;
+            // Azurite's well-known account + key, so an emulator copy can sign.
+            copy_account.get_or_insert_with(|| "devstoreaccount1".to_string());
+            shared_key.get_or_insert_with(|| {
+                "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==".to_string()
+            });
         }
         let endpoint = ov
             .and_then(|o| o.endpoint_url.clone())
             .or_else(|| self.azure_endpoint_url.clone());
-        if let Some(url) = endpoint {
+        if let Some(url) = &endpoint {
             b = with_http_endpoint!(b, url);
         }
         let az = Arc::new(
             b.build()
                 .with_context(|| format!("configure Azure backend for container '{container}'"))?,
         );
+        let creds = az.credentials().clone();
         let store: Arc<dyn ObjectStore> = az.clone();
         let signer = can_sign.then_some(az as Arc<dyn Signer>);
-        Ok(Arc::new(ObjectStorage::new(
-            store,
-            signer,
-            prefix.clone(),
-            "azure",
-        )))
+        let mut storage = ObjectStorage::new(store, signer, prefix.clone(), "azure");
+        // Copy Blob is same-account only; without a resolvable account we cannot
+        // build the source/destination URLs, so copy stays off (the ladder streams).
+        if failover {
+            if let Some(account) = copy_account {
+                storage = storage.with_copy(CopyBackend::Azure {
+                    client: copy_http_client()?,
+                    creds,
+                    account,
+                    container: container.to_string(),
+                    endpoint: endpoint.clone(),
+                    shared_key,
+                });
+            }
+        }
+        Ok(Arc::new(storage))
     }
 }
 
@@ -1041,6 +1084,120 @@ pub trait Storage: Send + Sync {
         _bytes: Vec<u8>,
     ) -> Result<Option<String>> {
         Err(anyhow!("leases are not supported by this backend"))
+    }
+
+    /// This backend's identity as a server-side-copy *source*, or `None` when it
+    /// can never be one (Disk, or a cloud backend whose signing material is
+    /// unreachable). See [`CopyOrigin`]; multi-bucket replication only.
+    fn copy_origin(&self) -> Option<CopyOrigin> {
+        None
+    }
+
+    /// The credential identity this backend authenticates as, for the boot
+    /// copy-eligibility matrix's static pre-filter (`None` = unknown, so the
+    /// per-cell boot verification decides alone). One metadata round-trip at
+    /// boot; never on a request path.
+    async fn copy_credential_identity(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Copy `src_key` from the sibling backend `src` describes into `dst_key` on
+    /// self, server-side — zero bytes cross this node. `expected_size` lets a
+    /// backend refuse an object too large for its single-request copy verb.
+    /// `Copied` = the object now exists on self (provider success parsed);
+    /// `NotCopyable` = this backend cannot serve the copy, so the caller streams
+    /// (not an error); `Err` = a copy was attempted and failed, so the caller
+    /// streams and then leaves its repair note. The default cannot copy.
+    async fn server_side_copy(
+        &self,
+        src: &CopyOrigin,
+        src_key: &str,
+        dst_key: &str,
+        expected_size: u64,
+    ) -> Result<CopyOutcome> {
+        let _ = (src, src_key, dst_key, expected_size);
+        Ok(CopyOutcome::NotCopyable)
+    }
+}
+
+/// Which cloud a [`CopyOrigin`] belongs to. A server-side copy is always
+/// same-provider, so this is the first thing eligibility compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyProvider {
+    S3,
+    Gcs,
+    Azure,
+}
+
+/// A backend's identity as a server-side-copy *source*: enough for the boot
+/// eligibility matrix to decide whether a destination can pull from it, and
+/// enough for the destination's copy verb to name it. Produced by
+/// [`Storage::copy_origin`].
+#[derive(Clone, Debug)]
+pub struct CopyOrigin {
+    pub provider: CopyProvider,
+    /// The source bucket/container name, named by the destination's copy verb
+    /// (S3 `x-amz-copy-source`, GCS source bucket, Azure source blob URL).
+    pub location: String,
+    /// A custom endpoint (MinIO, Azurite, a GCS emulator) or `None` for the real
+    /// cloud. Two custom-endpoint backends are copy-compatible only when equal;
+    /// two real-AWS buckets in different regions are (CopyObject is cross-region).
+    pub endpoint: Option<String>,
+    /// Azure storage account (Copy Blob is same-account only); `None` elsewhere.
+    pub account: Option<String>,
+}
+
+impl CopyOrigin {
+    /// Stable per-handle key for the boot matrix's verified set. Bucket
+    /// identities are unique within a topology, so this never collides.
+    pub fn handle_key(&self) -> String {
+        format!(
+            "{:?}|{}|{}|{}",
+            self.provider,
+            self.location,
+            self.endpoint.as_deref().unwrap_or(""),
+            self.account.as_deref().unwrap_or(""),
+        )
+    }
+}
+
+/// Outcome of a [`Storage::server_side_copy`] attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyOutcome {
+    /// Copied server-side; the object now exists on the destination.
+    Copied,
+    /// This backend cannot serve the copy (cross-provider, oversize, or no
+    /// signing material). The caller streams; not an error.
+    NotCopyable,
+}
+
+/// Whether `dst` may server-side-copy from `src`: same provider, compatible
+/// endpoints, and — for S3/Azure — the same credential identity. Real AWS
+/// cross-region is eligible (endpoints both `None`); two distinct custom
+/// endpoints (separate MinIO clusters) are not. The boot verification then
+/// confirms each eligible cell against the live buckets.
+pub fn copy_pair_eligible(
+    dst: &CopyOrigin,
+    dst_identity: Option<&str>,
+    src: &CopyOrigin,
+    src_identity: Option<&str>,
+) -> bool {
+    if dst.provider != src.provider || dst.endpoint != src.endpoint {
+        return false;
+    }
+    match dst.provider {
+        // Same access key = same account = readable-src/writable-dst by default.
+        // A custom endpoint whose identity we could not resolve still qualifies
+        // on equal-endpoint alone; the boot copy verifies it for real.
+        CopyProvider::S3 => match (dst_identity, src_identity) {
+            (Some(a), Some(b)) => a == b,
+            _ => dst.endpoint.is_some(),
+        },
+        // One process carries one GCS credential chain; the boot copy gates the
+        // rest (a project the credential cannot write simply fails the cell).
+        CopyProvider::Gcs => true,
+        // Copy Blob is same-account only.
+        CopyProvider::Azure => dst.account.is_some() && dst.account == src.account,
     }
 }
 
@@ -1696,6 +1853,145 @@ pub struct ObjectStorage {
     prefix: Option<String>,
     /// Backend name, for error context.
     backend: &'static str,
+    /// Server-side-copy material for the replication transport, when this
+    /// backend can originate one ([`Storage::server_side_copy`]). `None` in
+    /// single-bucket mode and on any backend without reachable signing material.
+    copy: Option<CopyBackend>,
+}
+
+/// Everything the destination side needs to sign and issue a server-side copy
+/// verb (S3 CopyObject, GCS rewrite, Azure Copy Blob), captured from our own
+/// config where object_store hides it. Held on the *destination* backend: the
+/// copy is originated and signed by the destination, referencing the source
+/// bucket by name (same credential identity by the boot matrix's precondition).
+enum CopyBackend {
+    S3 {
+        client: reqwest::Client,
+        creds: AwsCredentialProvider,
+        region: String,
+        bucket: String,
+        endpoint: Option<String>,
+        virtual_hosted: bool,
+    },
+    Gcs {
+        client: reqwest::Client,
+        creds: GcpCredentialProvider,
+        bucket: String,
+        endpoint: Option<String>,
+    },
+    Azure {
+        client: reqwest::Client,
+        creds: AzureCredentialProvider,
+        account: String,
+        container: String,
+        endpoint: Option<String>,
+        /// The base64 account key, when configured — enables Shared Key signing.
+        /// Absent under Azure AD / managed identity, where a bearer token is used.
+        shared_key: Option<String>,
+    },
+}
+
+/// S3's single-request CopyObject cap. A larger object needs multipart copy;
+/// wheels never approach it, so we decline instead and let the caller stream.
+const S3_MAX_SINGLE_COPY: u64 = 5 * 1024 * 1024 * 1024;
+/// The real GCS JSON API host; the rewrite endpoint lives under `/storage/v1`.
+const DEFAULT_GCS_BASE: &str = "https://storage.googleapis.com";
+const AZURE_BLOB_SUFFIX: &str = "blob.core.windows.net";
+const AZURE_COPY_VERSION: &str = "2021-08-06";
+
+fn copy_now() -> OffsetDateTime {
+    OffsetDateTime::now_utc()
+}
+
+/// Build the bounded HTTP client the copy verbs use. Server-side copies move no
+/// bytes through this node, but a slow control plane or a multi-hop GCS rewrite
+/// still needs headroom; a dead endpoint fails fast on the connect bound.
+fn copy_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(FAILOVER_CONNECT_TIMEOUT)
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .context("build the server-side-copy HTTP client")
+}
+
+/// A cloud endpoint URL's authority (`host[:port]`), the value both the request
+/// `Host` header and the SigV4 signed `host` header carry.
+fn endpoint_authority(endpoint: &str) -> Result<String> {
+    let url = url::Url::parse(endpoint).with_context(|| format!("parse endpoint {endpoint}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("endpoint {endpoint} has no host"))?;
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+/// First `n` chars of an error body, for bounded log/error context.
+fn clip(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// The S3 CopyObject destination request URL, its `Host` authority, and the
+/// canonical URI to sign. Virtual-hosted for real AWS (`bucket.s3.region.…`),
+/// path-style for a custom endpoint (`endpoint/bucket/key`). `enc_dst_key` is
+/// the URI-encoded destination object key.
+fn s3_copy_target(
+    virtual_hosted: bool,
+    endpoint: Option<&str>,
+    bucket: &str,
+    region: &str,
+    enc_dst_key: &str,
+) -> Result<(String, String, String)> {
+    if virtual_hosted {
+        let host = format!("{bucket}.s3.{region}.amazonaws.com");
+        Ok((
+            format!("https://{host}/{enc_dst_key}"),
+            host,
+            format!("/{enc_dst_key}"),
+        ))
+    } else {
+        let base = endpoint
+            .ok_or_else(|| anyhow!("path-style S3 copy requires a configured endpoint"))?
+            .trim_end_matches('/');
+        Ok((
+            format!("{base}/{bucket}/{enc_dst_key}"),
+            endpoint_authority(base)?,
+            format!("/{bucket}/{enc_dst_key}"),
+        ))
+    }
+}
+
+/// The GCS JSON-API `rewriteTo` URL for one source→destination object pair. Both
+/// object names are fully URL-encoded (slashes become `%2F`).
+fn gcs_rewrite_url(
+    base: &str,
+    src_bucket: &str,
+    src_key: &str,
+    dst_bucket: &str,
+    dst_key: &str,
+) -> String {
+    let base = base.trim_end_matches('/');
+    let enc_src = crate::reqsign::uri_encode(src_key, false);
+    let enc_dst = crate::reqsign::uri_encode(dst_key, false);
+    format!("{base}/storage/v1/b/{src_bucket}/o/{enc_src}/rewriteTo/b/{dst_bucket}/o/{enc_dst}")
+}
+
+/// The Azure Blob service base URL for an account, honoring a custom endpoint
+/// (Azurite) when configured.
+fn azure_blob_base(account: &str, endpoint: Option<&str>) -> String {
+    match endpoint {
+        Some(e) => e.trim_end_matches('/').to_string(),
+        None => format!("https://{account}.{AZURE_BLOB_SUFFIX}"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct GcsRewriteResponse {
+    #[serde(default)]
+    done: bool,
+    #[serde(rename = "rewriteToken", default)]
+    rewrite_token: Option<String>,
 }
 
 /// At or below this size an upload is a single conditional PUT; above it the
@@ -1728,6 +2024,271 @@ impl ObjectStorage {
             signer,
             prefix,
             backend,
+            copy: None,
+        }
+    }
+
+    /// Attach the server-side-copy material for a multi-bucket fleet. Chained by
+    /// the cloud builders; single-bucket handles never call it (copy stays off).
+    fn with_copy(mut self, copy: CopyBackend) -> Self {
+        self.copy = Some(copy);
+        self
+    }
+
+    /// The storage-prefix-rooted object key as a plain string — the form the
+    /// hand-rolled copy verbs sign (they cannot take an [`OsPath`]). The source
+    /// and destination share one process-wide `--storage-prefix`.
+    fn prefixed(&self, key: &str) -> String {
+        match &self.prefix {
+            Some(p) => format!("{p}/{key}"),
+            None => key.to_string(),
+        }
+    }
+
+    /// S3 CopyObject: a signed `PUT` whose `x-amz-copy-source` names the source
+    /// bucket + key. Cross-bucket and cross-region; overwrites the destination
+    /// key (the caller's sidecar-first ordering is the divergence gate, so this
+    /// only ever lands sha-adjudicated truth). Handles S3's 200-with-error-body.
+    async fn s3_copy(
+        &self,
+        copy: &CopyBackend,
+        src_bucket: &str,
+        src_key: &str,
+        dst_key: &str,
+        expected_size: u64,
+    ) -> Result<CopyOutcome> {
+        let CopyBackend::S3 {
+            client,
+            creds,
+            region,
+            bucket,
+            endpoint,
+            virtual_hosted,
+        } = copy
+        else {
+            return Ok(CopyOutcome::NotCopyable);
+        };
+        if expected_size > S3_MAX_SINGLE_COPY {
+            return Ok(CopyOutcome::NotCopyable);
+        }
+        let cred = creds
+            .get_credential()
+            .await
+            .map_err(|e| anyhow!("resolve S3 credential for copy: {e}"))?;
+        let enc_dst = crate::reqsign::uri_encode(dst_key, true);
+        let (url, host, canonical_uri) = s3_copy_target(
+            *virtual_hosted,
+            endpoint.as_deref(),
+            bucket,
+            region,
+            &enc_dst,
+        )?;
+        let copy_source = format!(
+            "/{src_bucket}/{}",
+            crate::reqsign::uri_encode(src_key, true)
+        );
+        let cred_ref = crate::reqsign::AwsCredential {
+            key_id: &cred.key_id,
+            secret: &cred.secret_key,
+            token: cred.token.as_deref(),
+        };
+        let extra_headers = [("x-amz-copy-source".to_string(), copy_source)];
+        let signed = crate::reqsign::sign_s3_request(
+            &crate::reqsign::S3Request {
+                method: "PUT",
+                canonical_uri: &canonical_uri,
+                canonical_query: "",
+                host: &host,
+                extra_headers: &extra_headers,
+                payload_sha256_hex: crate::reqsign::EMPTY_PAYLOAD_SHA256,
+            },
+            &cred_ref,
+            region,
+            "s3",
+            copy_now(),
+        );
+        let mut req = client.put(&url);
+        for (name, value) in &signed {
+            req = req.header(name.as_str(), value.as_str());
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("S3 CopyObject PUT {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "S3 CopyObject to {dst_key} failed: HTTP {status}: {}",
+                clip(&body, 400)
+            );
+        }
+        // S3 answers CopyObject with 200 even on some failures, carrying an
+        // <Error> element instead of <CopyObjectResult>. Treat that as a failed
+        // copy so the ladder streams.
+        if body.contains("<Error>") || !body.contains("<CopyObjectResult") {
+            bail!(
+                "S3 CopyObject to {dst_key} returned a 200 error body: {}",
+                clip(&body, 400)
+            );
+        }
+        Ok(CopyOutcome::Copied)
+    }
+
+    /// GCS rewrite: a bearer-authorized `POST` that copies within GCS. A large
+    /// object comes back `done:false` with a continuation token; drive the loop
+    /// to completion.
+    async fn gcs_copy(
+        &self,
+        copy: &CopyBackend,
+        src_bucket: &str,
+        src_key: &str,
+        dst_key: &str,
+    ) -> Result<CopyOutcome> {
+        let CopyBackend::Gcs {
+            client,
+            creds,
+            bucket,
+            endpoint,
+        } = copy
+        else {
+            return Ok(CopyOutcome::NotCopyable);
+        };
+        let base = endpoint.as_deref().unwrap_or(DEFAULT_GCS_BASE);
+        let cred = creds
+            .get_credential()
+            .await
+            .map_err(|e| anyhow!("resolve GCS credential for copy: {e}"))?;
+        let rewrite_url = gcs_rewrite_url(base, src_bucket, src_key, bucket, dst_key);
+        let mut token: Option<String> = None;
+        // Bounded so a control plane that never reports done cannot spin forever;
+        // each hop rewrites a fixed slab, which covers multi-GB objects.
+        for _ in 0..10_000 {
+            let url = match &token {
+                Some(t) => format!(
+                    "{rewrite_url}?rewriteToken={}",
+                    crate::reqsign::uri_encode(t, false)
+                ),
+                None => rewrite_url.clone(),
+            };
+            let resp = client
+                .post(&url)
+                .header("authorization", format!("Bearer {}", cred.bearer))
+                .header("content-length", "0")
+                .send()
+                .await
+                .with_context(|| format!("GCS rewrite POST {rewrite_url}"))?;
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                bail!(
+                    "GCS rewrite to {dst_key} failed: HTTP {status}: {}",
+                    clip(&body, 400)
+                );
+            }
+            let parsed: GcsRewriteResponse = serde_json::from_str(&body)
+                .with_context(|| format!("parse GCS rewrite response: {}", clip(&body, 400)))?;
+            if parsed.done {
+                return Ok(CopyOutcome::Copied);
+            }
+            match parsed.rewrite_token {
+                Some(t) => token = Some(t),
+                None => {
+                    bail!("GCS rewrite to {dst_key} is not done but returned no continuation token")
+                }
+            }
+        }
+        bail!("GCS rewrite to {dst_key} did not complete within the continuation bound")
+    }
+
+    /// Azure Copy Blob: a `PUT` whose `x-ms-copy-source` names the source blob
+    /// URL, same storage account. Small blobs complete synchronously; a pending
+    /// (async) copy is reported as a failure so the ladder streams (wheels never
+    /// go async).
+    async fn azure_copy(
+        &self,
+        copy: &CopyBackend,
+        src: &CopyOrigin,
+        src_key: &str,
+        dst_key: &str,
+    ) -> Result<CopyOutcome> {
+        let CopyBackend::Azure {
+            client,
+            creds,
+            account,
+            container,
+            endpoint,
+            shared_key,
+        } = copy
+        else {
+            return Ok(CopyOutcome::NotCopyable);
+        };
+        if src.account.as_deref() != Some(account.as_str()) {
+            return Ok(CopyOutcome::NotCopyable);
+        }
+        let base = azure_blob_base(account, endpoint.as_deref());
+        let enc_src = crate::reqsign::uri_encode(src_key, true);
+        let enc_dst = crate::reqsign::uri_encode(dst_key, true);
+        let src_url = format!("{base}/{}/{enc_src}", src.location);
+        let dst_url = format!("{base}/{container}/{enc_dst}");
+        let date = crate::reqsign::rfc1123(copy_now());
+        let ms_headers: Vec<(String, String)> = vec![
+            ("x-ms-copy-source".to_string(), src_url),
+            ("x-ms-date".to_string(), date),
+            ("x-ms-version".to_string(), AZURE_COPY_VERSION.to_string()),
+        ];
+        let authorization = match shared_key {
+            Some(key) => {
+                let resource = format!("/{container}/{enc_dst}");
+                crate::reqsign::azure_shared_key_authorization(
+                    account,
+                    key,
+                    "PUT",
+                    &resource,
+                    &ms_headers,
+                )?
+            }
+            None => {
+                let cred = creds
+                    .get_credential()
+                    .await
+                    .map_err(|e| anyhow!("resolve Azure credential for copy: {e}"))?;
+                match &*cred {
+                    AzureCredential::BearerToken(token) => format!("Bearer {token}"),
+                    // A SAS token cannot originate a Copy Blob signature here.
+                    _ => return Ok(CopyOutcome::NotCopyable),
+                }
+            }
+        };
+        let mut req = client
+            .put(&dst_url)
+            .header("content-length", "0")
+            .header("authorization", authorization);
+        for (name, value) in &ms_headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("Azure Copy Blob PUT {dst_url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "Azure Copy Blob to {dst_key} failed: HTTP {status}: {}",
+                clip(&body, 400)
+            );
+        }
+        match resp
+            .headers()
+            .get("x-ms-copy-status")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some("success") => Ok(CopyOutcome::Copied),
+            other => bail!(
+                "Azure Copy Blob to {dst_key} did not complete synchronously (x-ms-copy-status: {})",
+                other.unwrap_or("<none>")
+            ),
         }
     }
 
@@ -2192,6 +2753,79 @@ impl Storage for ObjectStorage {
             },
         }
     }
+
+    fn copy_origin(&self) -> Option<CopyOrigin> {
+        Some(match self.copy.as_ref()? {
+            CopyBackend::S3 {
+                bucket, endpoint, ..
+            } => CopyOrigin {
+                provider: CopyProvider::S3,
+                location: bucket.clone(),
+                endpoint: endpoint.clone(),
+                account: None,
+            },
+            CopyBackend::Gcs {
+                bucket, endpoint, ..
+            } => CopyOrigin {
+                provider: CopyProvider::Gcs,
+                location: bucket.clone(),
+                endpoint: endpoint.clone(),
+                account: None,
+            },
+            CopyBackend::Azure {
+                container,
+                account,
+                endpoint,
+                ..
+            } => CopyOrigin {
+                provider: CopyProvider::Azure,
+                location: container.clone(),
+                endpoint: endpoint.clone(),
+                account: Some(account.clone()),
+            },
+        })
+    }
+
+    async fn copy_credential_identity(&self) -> Result<Option<String>> {
+        match self.copy.as_ref() {
+            Some(CopyBackend::S3 { creds, .. }) => {
+                let cred = creds
+                    .get_credential()
+                    .await
+                    .map_err(|e| anyhow!("resolve S3 credential identity: {e}"))?;
+                Ok(Some(cred.key_id.clone()))
+            }
+            Some(CopyBackend::Azure { account, .. }) => Ok(Some(account.clone())),
+            Some(CopyBackend::Gcs { .. }) | None => Ok(None),
+        }
+    }
+
+    async fn server_side_copy(
+        &self,
+        src: &CopyOrigin,
+        src_key: &str,
+        dst_key: &str,
+        expected_size: u64,
+    ) -> Result<CopyOutcome> {
+        let Some(copy) = self.copy.as_ref() else {
+            return Ok(CopyOutcome::NotCopyable);
+        };
+        let src_key = self.prefixed(src_key);
+        let dst_key = self.prefixed(dst_key);
+        match (copy, src.provider) {
+            (CopyBackend::S3 { .. }, CopyProvider::S3) => {
+                self.s3_copy(copy, &src.location, &src_key, &dst_key, expected_size)
+                    .await
+            }
+            (CopyBackend::Gcs { .. }, CopyProvider::Gcs) => {
+                self.gcs_copy(copy, &src.location, &src_key, &dst_key).await
+            }
+            (CopyBackend::Azure { .. }, CopyProvider::Azure) => {
+                self.azure_copy(copy, src, &src_key, &dst_key).await
+            }
+            _ => Ok(CopyOutcome::NotCopyable),
+        }
+    }
 }
 
 /// Normalize a user-supplied storage prefix into a bare key prefix carrying no
@@ -2358,6 +2992,138 @@ impl Storage for FaultInjectStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn s3_origin(bucket: &str, endpoint: Option<&str>) -> CopyOrigin {
+        CopyOrigin {
+            provider: CopyProvider::S3,
+            location: bucket.to_string(),
+            endpoint: endpoint.map(String::from),
+            account: None,
+        }
+    }
+
+    #[test]
+    fn copy_eligibility_real_aws_is_cross_region_within_an_account() {
+        // Two real-AWS buckets (no custom endpoint), same access key — copyable
+        // even across regions (CopyObject resolves the source region itself).
+        let a = s3_origin("bucket-a", None);
+        let b = s3_origin("bucket-b", None);
+        assert!(copy_pair_eligible(&a, Some("AKIA"), &b, Some("AKIA")));
+        // Different access keys (separate accounts): not eligible.
+        assert!(!copy_pair_eligible(&a, Some("AKIA"), &b, Some("AKIB")));
+    }
+
+    #[test]
+    fn copy_eligibility_distinct_custom_endpoints_are_not_copyable() {
+        // Two separate MinIO clusters: same provider, different endpoints — no.
+        let a = s3_origin("b", Some("http://minio-a:9000"));
+        let b = s3_origin("b2", Some("http://minio-b:9000"));
+        assert!(!copy_pair_eligible(&a, Some("k"), &b, Some("k")));
+        // One MinIO, two buckets (same endpoint): copyable.
+        let c = s3_origin("b1", Some("http://minio:9000"));
+        let d = s3_origin("b2", Some("http://minio:9000"));
+        assert!(copy_pair_eligible(&c, Some("k"), &d, Some("k")));
+    }
+
+    #[test]
+    fn copy_eligibility_rejects_cross_provider_and_cross_account_azure() {
+        let s3 = s3_origin("b", None);
+        let gcs = CopyOrigin {
+            provider: CopyProvider::Gcs,
+            location: "b".to_string(),
+            endpoint: None,
+            account: None,
+        };
+        assert!(!copy_pair_eligible(&s3, Some("k"), &gcs, Some("k")));
+        let az1 = CopyOrigin {
+            provider: CopyProvider::Azure,
+            location: "c1".to_string(),
+            endpoint: None,
+            account: Some("acct1".to_string()),
+        };
+        let az2 = CopyOrigin {
+            provider: CopyProvider::Azure,
+            location: "c2".to_string(),
+            endpoint: None,
+            account: Some("acct2".to_string()),
+        };
+        // Copy Blob is same-account only.
+        assert!(!copy_pair_eligible(&az1, None, &az2, None));
+        let az2_same = CopyOrigin {
+            account: Some("acct1".to_string()),
+            ..az2
+        };
+        assert!(copy_pair_eligible(&az1, None, &az2_same, None));
+    }
+
+    #[test]
+    fn s3_copy_target_virtual_hosted_vs_path_style() {
+        // Real AWS: virtual-hosted, regional host, key at the root.
+        let (url, host, uri) =
+            s3_copy_target(true, None, "iron-east", "us-west-2", "packages/p/p-1.whl").unwrap();
+        assert_eq!(
+            url,
+            "https://iron-east.s3.us-west-2.amazonaws.com/packages/p/p-1.whl"
+        );
+        assert_eq!(host, "iron-east.s3.us-west-2.amazonaws.com");
+        assert_eq!(uri, "/packages/p/p-1.whl");
+        // MinIO: path-style, host is the endpoint authority, bucket in the path.
+        let (url, host, uri) = s3_copy_target(
+            false,
+            Some("http://127.0.0.1:9000"),
+            "b",
+            "us-east-1",
+            "packages/p/p-1.whl",
+        )
+        .unwrap();
+        assert_eq!(url, "http://127.0.0.1:9000/b/packages/p/p-1.whl");
+        assert_eq!(host, "127.0.0.1:9000");
+        assert_eq!(uri, "/b/packages/p/p-1.whl");
+        // Path-style with no endpoint is a misconfiguration.
+        assert!(s3_copy_target(false, None, "b", "us-east-1", "k").is_err());
+    }
+
+    #[test]
+    fn gcs_rewrite_url_encodes_object_slashes() {
+        let url = gcs_rewrite_url(
+            "https://storage.googleapis.com/",
+            "src-bucket",
+            "packages/p/p-1.whl",
+            "dst-bucket",
+            "packages/p/p-1.whl",
+        );
+        assert_eq!(
+            url,
+            "https://storage.googleapis.com/storage/v1/b/src-bucket/o/packages%2Fp%2Fp-1.whl/rewriteTo/b/dst-bucket/o/packages%2Fp%2Fp-1.whl"
+        );
+    }
+
+    #[test]
+    fn azure_blob_base_uses_account_or_endpoint() {
+        assert_eq!(
+            azure_blob_base("iron", None),
+            "https://iron.blob.core.windows.net"
+        );
+        assert_eq!(
+            azure_blob_base(
+                "devstoreaccount1",
+                Some("http://127.0.0.1:10000/devstoreaccount1/")
+            ),
+            "http://127.0.0.1:10000/devstoreaccount1"
+        );
+    }
+
+    #[test]
+    fn copy_origin_handle_key_is_distinct_per_bucket() {
+        assert_ne!(
+            s3_origin("a", None).handle_key(),
+            s3_origin("b", None).handle_key()
+        );
+        assert_eq!(
+            s3_origin("a", None).handle_key(),
+            s3_origin("a", None).handle_key()
+        );
+    }
 
     fn storage_args() -> StorageArgs {
         StorageArgs {

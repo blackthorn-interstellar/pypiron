@@ -1316,4 +1316,161 @@ mod conformance {
         eprintln!("conformance_execute_matches_model: {checked} record pairs verified");
         assert!(checked > 100, "vocabulary shrank unexpectedly: {checked}");
     }
+
+    /// The artifact transport (stream vs server-side copy, with or without an
+    /// injected copy fault) is a generator dimension the merge never sees:
+    /// `decide` runs on records that carry no transport, and `execute` must land
+    /// the same bucket state whichever way the bytes moved. This asserts that
+    /// invariance over every `Copy` verdict in the vocabulary, exercising the
+    /// real boot matrix (`build_copy_matrix`) and the per-op ladder against the
+    /// sim's byte-move copy and its three faults.
+    #[tokio::test]
+    async fn convergence_is_transport_invariant() {
+        use pypiron::buckets::TOPOLOGY_STAMP_KEY;
+        use pypiron::replicate::{execute, read_record, ArtifactSource};
+        use pypiron::sim::CopyFault;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Transport {
+            Stream,
+            Copy,
+            CopyFaulted(CopyFault),
+        }
+        let transports = [
+            Transport::Stream,
+            Transport::Copy,
+            Transport::CopyFaulted(CopyFault::Denied),
+            Transport::CopyFaulted(CopyFault::Timeout),
+            Transport::CopyFaulted(CopyFault::Phantom),
+        ];
+
+        // Run one Copy-verdict scenario under one transport; return the two
+        // buckets at the abstraction.
+        async fn run(world: &World, transport: Transport, tag: &str) -> (BucketAbs, BucketAbs) {
+            let clock = SimClock::new(
+                time::OffsetDateTime::parse(
+                    "2026-01-01T00:00:00Z",
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .expect("valid timestamp"),
+            );
+            let copy = !matches!(transport, Transport::Stream);
+            let (bucket_a, bucket_b) = if copy {
+                (
+                    SimStorage::new_copy_source(clock.clone(), &format!("{tag}-a")),
+                    SimStorage::new_copy_source(clock.clone(), &format!("{tag}-b")),
+                )
+            } else {
+                (
+                    SimStorage::new(clock.clone()),
+                    SimStorage::new(clock.clone()),
+                )
+            };
+            materialize(&world.buckets[0], &bucket_a).await;
+            materialize(&world.buckets[1], &bucket_b).await;
+            let state = multi_bucket_state(vec![
+                ("a".to_string(), bucket_a.clone() as Arc<dyn Storage>),
+                ("b".to_string(), bucket_b.clone() as Arc<dyn Storage>),
+            ]);
+            if copy {
+                // The boot probe copies each bucket's topology stamp; seed it,
+                // build+install the matrix on a clean (unfaulted) fleet, then
+                // clear the stamp so the abstraction never sees it.
+                bucket_a.insert(TOPOLOGY_STAMP_KEY, b"stamp".to_vec());
+                bucket_b.insert(TOPOLOGY_STAMP_KEY, b"stamp".to_vec());
+                let matrix =
+                    pypiron::buckets::build_copy_matrix(state.buckets.handles(), &[0, 1]).await;
+                assert_eq!(
+                    matrix.copyable_pairs(),
+                    2,
+                    "both sim pairs should verify copyable at boot"
+                );
+                state.buckets.install_copy_matrix(matrix);
+                bucket_a
+                    .delete_keys(std::slice::from_ref(&TOPOLOGY_STAMP_KEY.to_string()))
+                    .await
+                    .unwrap();
+                bucket_b
+                    .delete_keys(std::slice::from_ref(&TOPOLOGY_STAMP_KEY.to_string()))
+                    .await
+                    .unwrap();
+                // Inject the per-op fault *after* the matrix is built, so the
+                // ladder attempts the copy (matrix says it can) and then falls
+                // back to streaming when it fails.
+                if let Transport::CopyFaulted(fault) = transport {
+                    bucket_a.set_copy_fault(Some(fault));
+                    bucket_b.set_copy_fault(Some(fault));
+                }
+            }
+            let ra = read_record(bucket_a.as_ref(), PKG, FILES[0])
+                .await
+                .expect("read record a");
+            let rb = read_record(bucket_b.as_ref(), PKG, FILES[0])
+                .await
+                .expect("read record b");
+            let verdict = decide(&ra, &rb);
+            execute(
+                &state,
+                (bucket_a.as_ref(), bucket_b.as_ref()),
+                PKG,
+                FILES[0],
+                (&ra, &rb),
+                verdict,
+                ArtifactSource::Bucket,
+            )
+            .await
+            .expect("execute");
+            (
+                abstract_bucket(&bucket_a).await,
+                abstract_bucket(&bucket_b).await,
+            )
+        }
+
+        let vocab = vocabulary();
+        let mut copy_scenarios = 0usize;
+        for (ai, rec_a) in vocab.iter().enumerate() {
+            for (bi, rec_b) in vocab.iter().enumerate() {
+                let world = World {
+                    buckets: [
+                        BucketAbs {
+                            pkg_origin: implied_pkg_origin(rec_a),
+                            files: [*rec_a, FileRec::default()],
+                            quarantine: BTreeSet::new(),
+                        },
+                        BucketAbs {
+                            pkg_origin: implied_pkg_origin(rec_b),
+                            files: [*rec_b, FileRec::default()],
+                            quarantine: BTreeSet::new(),
+                        },
+                    ],
+                    writers: Vec::new(),
+                    acked: BTreeSet::new(),
+                    delete_started: BTreeSet::new(),
+                };
+                // Only the copy verdict routes through the artifact transport.
+                let ra = to_record(&world.buckets[0], 0);
+                let rb = to_record(&world.buckets[1], 0);
+                if !matches!(decide(&ra, &rb), Verdict::Copy(_)) {
+                    continue;
+                }
+                let baseline = run(&world, Transport::Stream, &format!("s-{ai}-{bi}")).await;
+                for (ti, transport) in transports.iter().enumerate().skip(1) {
+                    let got = run(&world, *transport, &format!("c{ti}-{ai}-{bi}")).await;
+                    assert_eq!(
+                        got, baseline,
+                        "transport {transport:?} diverged from streaming\n a={rec_a:?}\n b={rec_b:?}",
+                    );
+                }
+                copy_scenarios += 1;
+            }
+        }
+        eprintln!(
+            "convergence_is_transport_invariant: {copy_scenarios} copy scenarios × {} transports",
+            transports.len()
+        );
+        assert!(
+            copy_scenarios > 10,
+            "expected many copy scenarios, got {copy_scenarios}"
+        );
+    }
 }

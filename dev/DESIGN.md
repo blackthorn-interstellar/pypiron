@@ -429,6 +429,15 @@ they are the operator's chosen corpus, not re-derivable. Proxy caches (mirror
 sidecars with `replicate` absent/false), indexes, counters, and leases never
 copy.
 
+The artifact leg of every copy (fan-out, sweep, reconcile) runs a stateless
+transport ladder: a boot-computed matrix says whether the destination can pull
+the source server-side (same provider, same credential identity, matching custom
+endpoint — real AWS cross-region qualifies, two MinIO endpoints do not), and if
+so it issues a signed CopyObject/rewrite/Copy Blob (zero bytes through the node)
+before falling back to streaming and then the `_repl/` note. The matrix is
+verified once at boot by copying the topology stamp per pair; `decide` and the
+merge algebra never see the transport, so convergence is transport-invariant.
+
 Correctness does not depend on every node selecting the same bucket. The merge
 (`replicate::decide`, pure and unit-tested) has precedence
 **tombstone ≻ origin (private ≻ mirror) ≻ union ≻ freeze**: deletes beat live

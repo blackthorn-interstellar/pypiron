@@ -250,6 +250,18 @@ stays bucket-local and is not doubled, because any bucket can re-fetch it from
 upstream. There are no new knobs: snapshot replication is on whenever you run
 more than one bucket.
 
+When two buckets live on the same cloud under the same credentials, pypiron asks
+that cloud to copy an artifact directly between them (S3 CopyObject, GCS rewrite,
+Azure Copy Blob) instead of pulling every byte through the node and pushing it
+back — same-region copies cost a request instead of transfer, and cross-region
+ones skip the node's network entirely. Two real AWS regions in one account
+qualify; two separate MinIO endpoints or two different clouds do not, and fall
+back to streaming. pypiron works this out once at startup — verifying each pair
+with a throwaway copy — and logs the result one line per bucket pair (a
+`replication copy matrix` entry reading `transport=copy` or `transport=stream`),
+so you can see which pairs take the fast path. There is nothing to configure and
+nothing changes about what ends up on each bucket; only how the bytes get there.
+
 In multi-bucket mode SDK retries are disabled and one-second topology probes
 switch new requests and cancel background work on an ineligible bucket, without
 putting a short deadline on real artifact transfers (an in-flight transfer keeps

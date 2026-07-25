@@ -440,6 +440,30 @@ impl Storage for ObservedStorage {
         self.record(&result);
         result
     }
+
+    // The server-side-copy transport is a raw signed HTTP call outside
+    // object_store, so it drives neither this availability observer nor the op
+    // counter; forward the trait surface unobserved (a copy failure falls back
+    // to streaming, which is observed).
+    fn copy_origin(&self) -> Option<crate::storage::CopyOrigin> {
+        self.inner.copy_origin()
+    }
+
+    async fn copy_credential_identity(&self) -> Result<Option<String>> {
+        self.inner.copy_credential_identity().await
+    }
+
+    async fn server_side_copy(
+        &self,
+        src: &crate::storage::CopyOrigin,
+        src_key: &str,
+        dst_key: &str,
+        expected_size: u64,
+    ) -> Result<crate::storage::CopyOutcome> {
+        self.inner
+            .server_side_copy(src, src_key, dst_key, expected_size)
+            .await
+    }
 }
 
 #[cfg(test)]

@@ -141,6 +141,12 @@ pub struct Metrics {
     /// artifact bytes — the quantifiable cost of keeping the warm copies warm.
     pub replication_objects: AtomicU64,
     pub replication_bytes: AtomicU64,
+    /// The subset of `replication_objects` whose artifact bytes moved
+    /// provider-side (S3 CopyObject / GCS rewrite / Azure Copy Blob) instead of
+    /// streaming through this node. A nonzero value is the transport ladder
+    /// actually taking the fast path; the microbench asserts it, and the ratio
+    /// to `replication_objects` is the copy-vs-stream mix.
+    pub replication_server_side_copies: AtomicU64,
     /// Byte-conflict freezes (§6.3): same filename, different bytes on two
     /// buckets. Every nonzero value is a human-actionable split-brain.
     pub replication_freezes: AtomicU64,
@@ -242,6 +248,15 @@ impl Metrics {
     pub fn record_replicated(&self, bytes: u64) {
         self.replication_objects.fetch_add(1, Ordering::Relaxed);
         self.replication_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Count one replicated record whose artifact moved provider-side (server-
+    /// side copy). Also counts it as a replicated record so the totals stay
+    /// whole; the extra counter isolates the fast-path share.
+    pub fn record_server_side_copy(&self, bytes: u64) {
+        self.record_replicated(bytes);
+        self.replication_server_side_copies
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record the wall duration of the reconcile diff that just completed.
@@ -542,6 +557,11 @@ impl Metrics {
                     "pypiron_replication_bytes_total",
                     "Artifact bytes copied into other buckets.",
                     &self.replication_bytes,
+                ),
+                (
+                    "pypiron_replication_server_side_copies_total",
+                    "Replicated records whose artifact moved provider-side (CopyObject/rewrite/Copy Blob).",
+                    &self.replication_server_side_copies,
                 ),
                 (
                     "pypiron_replication_freezes_total",

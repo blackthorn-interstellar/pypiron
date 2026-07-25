@@ -42,6 +42,7 @@ pub mod publish;
 pub mod range;
 pub mod render;
 pub mod replicate;
+pub mod reqsign;
 pub mod serve;
 pub mod sidecar;
 pub mod sim;

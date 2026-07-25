@@ -10,15 +10,15 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{info, warn};
 
-use crate::storage::Storage;
+use crate::storage::{copy_pair_eligible, CopyOrigin, CopyOutcome, Storage};
 
 /// Topology stamps are tiny control records. Never let their GET/CAS operations
 /// inherit the data path's deliberately generous transfer timeout: one hung
@@ -123,6 +123,33 @@ pub struct BucketSet {
     /// `new` cannot return `Result` without breaking the existing construction
     /// surface. Preserve the error and fail startup before the first topology I/O.
     duplicate_identity: Option<String>,
+    /// The boot-computed server-side-copy transport matrix
+    /// ([`build_copy_matrix`]). Set once at startup for a multi-bucket fleet;
+    /// unset (an empty matrix, everything streams) single-bucket and in tests.
+    copy_matrix: OnceLock<Arc<CopyMatrix>>,
+}
+
+/// Boot-verified server-side-copy eligibility, keyed by
+/// `(destination handle_key, source handle_key)`. Membership means the pair is
+/// statically eligible (same provider, compatible endpoints, same credential
+/// identity) *and* a real stamp copy succeeded at boot. Everything not in the
+/// set streams — the ladder is stateless and consults this per copy op.
+#[derive(Default, Debug)]
+pub struct CopyMatrix {
+    eligible: HashSet<(String, String)>,
+}
+
+impl CopyMatrix {
+    /// Whether `dst` may pull `src`'s objects server-side.
+    pub fn allows(&self, dst: &CopyOrigin, src: &CopyOrigin) -> bool {
+        self.eligible
+            .contains(&(dst.handle_key(), src.handle_key()))
+    }
+
+    /// Number of copyable ordered pairs (for logging / tests).
+    pub fn copyable_pairs(&self) -> usize {
+        self.eligible.len()
+    }
 }
 
 /// What a topology operation proved or changed. Unreachable indices are
@@ -180,7 +207,24 @@ impl BucketSet {
             topology_generation: RwLock::new(None),
             topology_lock: tokio::sync::Mutex::new(()),
             duplicate_identity,
+            copy_matrix: OnceLock::new(),
         }
+    }
+
+    /// The boot-computed server-side-copy transport matrix. Empty (everything
+    /// streams) until [`install_copy_matrix`](Self::install_copy_matrix) runs —
+    /// single-bucket mode and tests never set it.
+    pub fn copy_matrix(&self) -> Arc<CopyMatrix> {
+        self.copy_matrix
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(CopyMatrix::default()))
+    }
+
+    /// Install the boot-computed transport matrix. Idempotent-safe: a second
+    /// call (there is only ever one, at startup) is ignored.
+    pub fn install_copy_matrix(&self, matrix: CopyMatrix) {
+        let _ = self.copy_matrix.set(Arc::new(matrix));
     }
 
     /// Capture the current storage context. Every operation calls this once at
@@ -776,6 +820,104 @@ impl BucketSet {
 /// Storage key of the topology stamp — the fail-closed record of which buckets a
 /// deployment was configured with, in what order (design §7).
 pub const TOPOLOGY_STAMP_KEY: &str = "_topology/stamp.json";
+
+/// Compute (and log, one line per ordered pair) the server-side-copy transport
+/// matrix for a multi-bucket fleet. A pair is *statically* eligible when it is
+/// the same provider with compatible endpoints and the same credential identity
+/// ([`copy_pair_eligible`]); each eligible cell is then *verified* by copying the
+/// source's topology stamp to a throwaway staging key on the destination and
+/// deleting it. A cell that fails verification (a permission gap, a cross-account
+/// pair the static filter let through) downgrades to streaming with a warn-level
+/// alarm, instead of surprising every later upload. `reachable` are the indices
+/// whose topology stamp startup confirmed present — only those can be a copy
+/// source. Returns an empty matrix (everything streams) for a single bucket.
+pub async fn build_copy_matrix(handles: &[BucketHandle], reachable: &[usize]) -> CopyMatrix {
+    let mut eligible = HashSet::new();
+    if handles.len() < 2 {
+        return CopyMatrix { eligible };
+    }
+    // Resolve each backend's copy origin and credential identity once.
+    let mut origins: Vec<Option<CopyOrigin>> = Vec::with_capacity(handles.len());
+    let mut identities: Vec<Option<String>> = Vec::with_capacity(handles.len());
+    for handle in handles {
+        origins.push(handle.storage.copy_origin());
+        identities.push(
+            handle
+                .storage
+                .copy_credential_identity()
+                .await
+                .unwrap_or(None),
+        );
+    }
+    for &dst in reachable {
+        for &src in reachable {
+            if dst == src {
+                continue;
+            }
+            let dst_name = handles[dst].name.as_str();
+            let src_name = handles[src].name.as_str();
+            let (Some(dst_o), Some(src_o)) = (&origins[dst], &origins[src]) else {
+                info!(destination = %dst_name, source = %src_name, transport = "stream", reason = "no server-side-copy support", "replication copy matrix");
+                continue;
+            };
+            if !copy_pair_eligible(
+                dst_o,
+                identities[dst].as_deref(),
+                src_o,
+                identities[src].as_deref(),
+            ) {
+                info!(destination = %dst_name, source = %src_name, transport = "stream", reason = "ineligible (provider/endpoint/identity)", "replication copy matrix");
+                continue;
+            }
+            match verify_copy_cell(handles[dst].storage.as_ref(), src_o).await {
+                Ok(()) => {
+                    eligible.insert((dst_o.handle_key(), src_o.handle_key()));
+                    info!(destination = %dst_name, source = %src_name, transport = "copy", "replication copy matrix");
+                }
+                Err(error) => {
+                    warn!(destination = %dst_name, source = %src_name, transport = "stream", error = ?error, "replication copy matrix: server-side copy unavailable, downgraded to streaming");
+                }
+            }
+        }
+    }
+    CopyMatrix { eligible }
+}
+
+/// Prove a copy cell by copying the source's topology stamp to a throwaway
+/// staging key on the destination, confirming it landed (catches an S3
+/// 200-with-error-body phantom), and deleting it. `_staging/` is the fleet's
+/// classified transient-scratch prefix; the probe never outlives boot.
+async fn verify_copy_cell(dst: &dyn Storage, src: &CopyOrigin) -> Result<()> {
+    let scratch = format!(
+        "{}copy-probe-{}",
+        crate::storage::STAGING_PREFIX,
+        crate::markers::marker_nonce()
+    );
+    let outcome = dst
+        .server_side_copy(src, TOPOLOGY_STAMP_KEY, &scratch, 0)
+        .await;
+    if !matches!(outcome, Ok(CopyOutcome::Copied)) {
+        // Best-effort cleanup even on a non-copy (nothing likely landed).
+        let _ = dst.delete_keys(std::slice::from_ref(&scratch)).await;
+        match outcome {
+            Ok(_) => bail!("destination reported the source is not copyable"),
+            Err(e) => return Err(e),
+        }
+    }
+    // Confirm the object landed (catches an S3 200-with-error-body phantom)
+    // before deleting the probe.
+    let present = dst
+        .stored_size(&scratch)
+        .await
+        .context("HEAD the copy probe object")?;
+    dst.delete_keys(std::slice::from_ref(&scratch))
+        .await
+        .context("delete the copy probe object")?;
+    if present.is_none() {
+        bail!("copy reported success but the probe object is absent");
+    }
+    Ok(())
+}
 
 /// The stored topology stamp. `hash` is derived from `buckets` alone;
 /// `generation` is bumped by an operator re-stamp (`buckets migrate`, a later

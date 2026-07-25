@@ -131,4 +131,27 @@ impl Storage for CountedStorage {
         self.count(StorageOp::Write);
         self.inner.put_if_match(key, etag, bytes).await
     }
+
+    // A server-side copy is a raw signed HTTP call, not an object_store op, so it
+    // is deliberately *not* counted here — that absence is exactly what lets the
+    // microbench op-count fall when the copy transport replaces a GET+PUT.
+    fn copy_origin(&self) -> Option<crate::storage::CopyOrigin> {
+        self.inner.copy_origin()
+    }
+
+    async fn copy_credential_identity(&self) -> Result<Option<String>> {
+        self.inner.copy_credential_identity().await
+    }
+
+    async fn server_side_copy(
+        &self,
+        src: &crate::storage::CopyOrigin,
+        src_key: &str,
+        dst_key: &str,
+        expected_size: u64,
+    ) -> Result<crate::storage::CopyOutcome> {
+        self.inner
+            .server_side_copy(src, src_key, dst_key, expected_size)
+            .await
+    }
 }

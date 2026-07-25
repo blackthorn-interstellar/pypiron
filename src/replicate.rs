@@ -45,7 +45,7 @@ use crate::sidecar::{
 use crate::status::{self, StatusConvergence};
 use crate::storage::{
     bounded_artifact_write, create_artifact_verified, is_not_found, store_artifact_verified,
-    verify_stored_size, ArtifactBody, Existing, Storage,
+    verify_stored_size, ArtifactBody, CopyOrigin, CopyOutcome, Existing, Storage,
 };
 use crate::tombstone;
 #[cfg(test)]
@@ -615,6 +615,52 @@ async fn verify_source_record(
     record: &Record,
     source: ArtifactSource<'_>,
 ) -> Result<VerifiedSource> {
+    let akey = artifact_key(pkg, filename);
+    let artifact = verify_source_artifact(src, pkg, filename, record, source).await?;
+    let Companions {
+        metadata,
+        provenance,
+    } = read_source_companions(src, &akey, record).await?;
+    Ok(VerifiedSource {
+        artifact,
+        metadata,
+        provenance,
+    })
+}
+
+/// The source's listed companions (metadata, provenance). Small and re-authored
+/// on the destination whichever artifact transport is used, so they are read
+/// separately from the (large) artifact bytes.
+struct Companions {
+    metadata: Option<Vec<u8>>,
+    provenance: Option<Vec<u8>>,
+}
+
+async fn read_source_companions(
+    src: &dyn Storage,
+    akey: &str,
+    record: &Record,
+) -> Result<Companions> {
+    let metadata = read_listed_companion(src, &metadata_key(akey), record.has_metadata).await?;
+    let provenance =
+        read_listed_companion(src, &provenance_key(akey), record.has_provenance).await?;
+    Ok(Companions {
+        metadata,
+        provenance,
+    })
+}
+
+/// Read the source artifact bytes and verify them against the source sidecar's
+/// sha256 — the check the server-side copy transport skips (bytes never touch
+/// this node) and the stream transport relies on. A torn record (sidecar names
+/// bytes the body no longer holds) is repaired for a rebuild here.
+async fn verify_source_artifact(
+    src: &dyn Storage,
+    pkg: &str,
+    filename: &str,
+    record: &Record,
+    source: ArtifactSource<'_>,
+) -> Result<Vec<u8>> {
     let sidecar = record
         .sidecar
         .as_ref()
@@ -661,14 +707,7 @@ async fn verify_source_record(
             sidecar.sha256
         );
     }
-    let metadata = read_listed_companion(src, &metadata_key(&akey), record.has_metadata).await?;
-    let provenance =
-        read_listed_companion(src, &provenance_key(&akey), record.has_provenance).await?;
-    Ok(VerifiedSource {
-        artifact,
-        metadata,
-        provenance,
-    })
+    Ok(artifact)
 }
 
 async fn read_listed_companion(
@@ -775,35 +814,27 @@ async fn copy_live(
         .as_ref()
         .ok_or_else(|| anyhow!("copy verdict with no source sidecar"))?;
     let akey = artifact_key(pkg, filename);
-    let verified = verify_source_record(src, pkg, filename, record, source).await?;
+    // Companions are small and re-authored on the destination whichever way the
+    // artifact bytes move; read them up front. The (large) artifact bytes are
+    // read only on the stream path — the server-side copy transport never pulls
+    // them through this node.
+    let companions = read_source_companions(src, &akey, record).await?;
+    // When the boot matrix says this destination can pull this source
+    // server-side, that is the artifact transport; on any miss the ladder falls
+    // through to streaming. The sidecar installed below — before the artifact —
+    // is the divergence gate in both cases, so a competing body is caught there.
+    let copy_origin = copy_transport(state, src, dst);
+    // Stream transport reads + sha-verifies the source bytes *before* the first
+    // destination mutation, so a bad source never publishes a sidecar. The copy
+    // transport cannot pre-verify (the bytes never touch this node); it trusts
+    // the provider's byte-exact copy and the post-copy size check, and the
+    // reconcile sha-diff is the backstop.
+    let streamed = match &copy_origin {
+        None => Some(verify_source_artifact(src, pkg, filename, record, source).await?),
+        Some(_) => None,
+    };
     require_replication_unfenced(state)?;
 
-    // A destination body already sitting under this immutable key with the
-    // wrong sha is stale crash debris — e.g. a zero-byte object a
-    // 200-acked-but-failed write left behind (D2). Heal could never converge
-    // while we bailed on it, so repair it in place with the sha-verified source
-    // bytes; the conditional create below then dedups. A body that first
-    // *appears during* this copy is still caught as a race at that create and
-    // frozen, never silently overwritten.
-    let mut changed = false;
-    if dst.head_exists(&akey).await? {
-        let current = dst
-            .get_bytes(&akey)
-            .await
-            .with_context(|| format!("verify destination artifact {akey}"))?;
-        if sha256_hex(&current) != sc.sha256 {
-            store_artifact_verified(
-                dst,
-                &akey,
-                ArtifactBody::Bytes(verified.artifact.clone()),
-                verified.artifact.len() as u64,
-                Some("application/octet-stream"),
-                Existing::Repair(&sc.sha256),
-            )
-            .await?;
-            changed = true;
-        }
-    }
     // A `sync --to` snapshot (mirror origin, replicate=true) replicates as
     // truth on the mirror-safe path: it claims MIRROR create-if-absent (never
     // demoting a private claim) and installs a mirror sidecar (never overwriting
@@ -817,13 +848,16 @@ async fn copy_live(
         ensure_private_origin(dst, pkg).await?;
     }
     // Sidecar first: an orphan sidecar is inert, but an orphan artifact would be
-    // fabricated into truth by the destination's backfill (§4).
-    changed |= if is_mirror {
+    // fabricated into truth by the destination's backfill (§4). A destination
+    // that already holds a different-sha private body is caught here and bails
+    // before any artifact write — the divergence gate the copy transport relies
+    // on to overwrite safely.
+    let mut changed = if is_mirror {
         install_or_verify_mirror_sidecar(dst, &sidecar_key(&akey), sc).await?
     } else {
         install_or_verify_sidecar(dst, &sidecar_key(&akey), sc).await?
     };
-    if let Some(bytes) = verified.metadata {
+    if let Some(bytes) = companions.metadata {
         changed |= put_if_absent_or_verify(
             dst,
             &metadata_key(&akey),
@@ -832,31 +866,84 @@ async fn copy_live(
         )
         .await?;
     }
-    if let Some(bytes) = verified.provenance {
+    if let Some(bytes) = companions.provenance {
         changed |=
             put_if_absent_or_verify(dst, &provenance_key(&akey), bytes, Some("application/json"))
                 .await?;
+    }
+
+    // Artifact leg, transport ladder. First the server-side copy when eligible:
+    // it lands the bytes provider-side (zero through this node) and verifies the
+    // stored size. On oversize (`NotCopyable`) or any failure, fall through to
+    // streaming — the caller writes a repair note only if streaming also fails.
+    if let Some(src_o) = &copy_origin {
+        match server_side_copy_artifact(state, dst, &akey, sc, src_o).await {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                warn!(package = %pkg, filename = %filename, error = ?error, "server-side copy failed; streaming the artifact instead");
+            }
+        }
+    }
+
+    // Stream the artifact: use the pre-verified bytes on the pure-stream path, or
+    // read + verify them now if a copy was attempted and missed.
+    let artifact = match streamed {
+        Some(bytes) => bytes,
+        None => verify_source_artifact(src, pkg, filename, record, source).await?,
+    };
+    finish_stream_leg(state, src, dst, pkg, filename, sc, &akey, artifact, changed).await
+}
+
+/// Land the (already verified) artifact bytes on the destination: repair a
+/// stale-debris body in place, then publish the artifact last under a
+/// conditional create, freezing a raced competing body. Shared by the pure
+/// stream path and the copy transport's fallback.
+#[allow(clippy::too_many_arguments)]
+async fn finish_stream_leg(
+    state: &AppState,
+    src: &dyn Storage,
+    dst: &dyn Storage,
+    pkg: &str,
+    filename: &str,
+    sc: &Sidecar,
+    akey: &str,
+    artifact: Vec<u8>,
+    mut changed: bool,
+) -> Result<bool> {
+    // A destination body already under this immutable key with the wrong sha is
+    // stale crash debris (e.g. a zero-byte object a 200-acked-but-failed write
+    // left behind, D2); repair it in place, then the conditional create dedups.
+    if dst.head_exists(akey).await? {
+        let current = dst
+            .get_bytes(akey)
+            .await
+            .with_context(|| format!("verify destination artifact {akey}"))?;
+        if sha256_hex(&current) != sc.sha256 {
+            store_artifact_verified(
+                dst,
+                akey,
+                ArtifactBody::Bytes(artifact.clone()),
+                artifact.len() as u64,
+                Some("application/octet-stream"),
+                Existing::Repair(&sc.sha256),
+            )
+            .await?;
+            changed = true;
+        }
     }
     // Artifact last. Losing this conditional create must never be reported as
     // a copy: verify the winner. Same bytes converged; different bytes freeze
     // immediately so the source sidecar we installed cannot describe the
     // competing body even briefly after this operation returns. The create is
     // verified (D1) and bounded (D3) by the shared primitive.
-    let len = verified.artifact.len() as u64;
-    if create_artifact_verified(
-        dst,
-        &akey,
-        verified.artifact,
-        len,
-        Some("application/octet-stream"),
-    )
-    .await?
-    {
+    let len = artifact.len() as u64;
+    if create_artifact_verified(dst, akey, artifact, len, Some("application/octet-stream")).await? {
         state.metrics.record_replicated(len);
         return Ok(true);
     }
     let raced = dst
-        .get_bytes(&akey)
+        .get_bytes(akey)
         .await
         .with_context(|| format!("verify raced destination artifact {akey}"))?;
     let raced_sha = sha256_hex(&raced);
@@ -865,6 +952,41 @@ async fn copy_live(
     }
     freeze_copy_race(state, src, dst, pkg, filename, &sc.sha256, &raced_sha).await?;
     Ok(false)
+}
+
+/// The source's [`CopyOrigin`] when the boot matrix has verified that `dst` can
+/// pull it server-side; `None` (stream) otherwise. Stateless — consulted per
+/// copy op, so a boot-downgraded cell never attempts a copy.
+fn copy_transport(state: &AppState, src: &dyn Storage, dst: &dyn Storage) -> Option<CopyOrigin> {
+    let src_o = src.copy_origin()?;
+    let dst_o = dst.copy_origin()?;
+    state
+        .buckets
+        .copy_matrix()
+        .allows(&dst_o, &src_o)
+        .then_some(src_o)
+}
+
+/// Attempt the server-side artifact copy. `Ok(true)` = copied and size-verified;
+/// `Ok(false)` = the backend declined (e.g. oversize) so the caller streams;
+/// `Err` = a copy was attempted and failed. The destination sidecar (installed
+/// before this leg) already gates divergence, so overwriting adjudicated truth
+/// here is safe — the copy verb has no create-if-absent on S3 by design.
+async fn server_side_copy_artifact(
+    state: &AppState,
+    dst: &dyn Storage,
+    akey: &str,
+    sc: &Sidecar,
+    src_o: &CopyOrigin,
+) -> Result<bool> {
+    match dst.server_side_copy(src_o, akey, akey, sc.size).await? {
+        CopyOutcome::NotCopyable => Ok(false),
+        CopyOutcome::Copied => {
+            verify_stored_size(dst, akey, sc.size).await?;
+            state.metrics.record_server_side_copy(sc.size);
+            Ok(true)
+        }
+    }
 }
 
 /// Replace one destination record with verified private truth. This is shared

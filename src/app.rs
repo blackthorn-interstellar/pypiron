@@ -1051,6 +1051,24 @@ async fn run_serve(
             count = buckets.len(),
             "multi-bucket storage: replication and failover across configured buckets"
         );
+        // Compute the server-side-copy transport matrix from the reachable,
+        // stamp-verified buckets, and log it one line per pair. A pair that can
+        // copy moves replicated bytes provider-side (zero bytes through this
+        // node); every other pair streams. Off the request path, at boot only.
+        let mut reachable: Vec<usize> = topology
+            .verified_indices
+            .iter()
+            .chain(&topology.stamped_indices)
+            .copied()
+            .collect();
+        reachable.sort_unstable();
+        reachable.dedup();
+        let matrix = crate::buckets::build_copy_matrix(buckets.handles(), &reachable).await;
+        info!(
+            copyable_pairs = matrix.copyable_pairs(),
+            "replication transport matrix computed"
+        );
+        buckets.install_copy_matrix(matrix);
     }
     // Learn this node's region once at startup (operator override, then platform
     // environment, then instance metadata) and, in a multi-bucket fleet, pin the

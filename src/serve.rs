@@ -804,7 +804,7 @@ pub(crate) async fn files_get(
     // presign/stream logic runs (a presigned redirect never observes a 404,
     // so the fetch can't be triggered by one). The fill runs entirely on the
     // write pin — origin claims and the 409-serialized PUT stay on the write home.
-    if let Some(resp) = proxy_ensure_artifact(
+    match proxy_ensure_artifact(
         &state,
         write_pinned.storage.as_ref(),
         &pkg,
@@ -813,7 +813,20 @@ pub(crate) async fn files_get(
     )
     .await
     {
-        return resp;
+        ProxyEnsure::Fail(resp) => return resp,
+        ProxyEnsure::Serve { filled } => {
+            if filled {
+                // Off the request's critical path: a fresh fill just committed to
+                // the write bucket, so replicate it to peers asynchronously. The
+                // response is served without waiting on the per-peer notes.
+                crate::replicate::spawn_proxy_fill_notes(
+                    state.clone(),
+                    write_pinned.index,
+                    pkg.to_string(),
+                    filename.clone(),
+                );
+            }
+        }
     }
     // Malware byte gate: the single enforcement chokepoint, before the
     // presign/stream split so a cached signed URL is gated too. Origin is judged
@@ -1009,18 +1022,26 @@ async fn advisory_byte_gate(
     })))
 }
 
+/// Outcome of the proxy artifact hook. `Fail` is a hard failure response
+/// (storage outage, upstream verification failure). `Serve` falls through to
+/// normal serving; `filled` says THIS request committed a fresh cache fill, so
+/// the caller schedules the off-request-path peer replication notes.
+enum ProxyEnsure {
+    Serve { filled: bool },
+    Fail(Response<Body>),
+}
+
 /// Proxy hook for artifact downloads: fetch-and-commit on a local miss.
-/// `None` means fall through to normal serving (the file is now in storage,
-/// was already there, or doesn't exist upstream either); `Some` is a hard
-/// failure response (storage outage, upstream verification failure).
 async fn proxy_ensure_artifact(
     state: &AppState,
     storage: &dyn Storage,
     pkg: &str,
     filename: &str,
     generation: u64,
-) -> Option<Response<Body>> {
-    let proxy = state.proxy.as_ref()?;
+) -> ProxyEnsure {
+    let Some(proxy) = state.proxy.as_ref() else {
+        return ProxyEnsure::Serve { filled: false };
+    };
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
     // Warm-hit fast path: an artifact already in local storage is always safe to
     // serve as-is. The origin/eligibility fence exists to gate *upstream fetches*,
@@ -1032,9 +1053,9 @@ async fn proxy_ensure_artifact(
         .artifact_cached_locally(storage, &key, generation)
         .await
     {
-        Ok(true) => return None,
+        Ok(true) => return ProxyEnsure::Serve { filled: false },
         Ok(false) => {}
-        Err(e) => return Some(read_error(e)),
+        Err(e) => return ProxyEnsure::Fail(read_error(e)),
     }
     // Local miss: the full fence applies before any upstream contact. A private or
     // out-of-scope name stops here and never reaches upstream. `eligible` has no
@@ -1042,15 +1063,15 @@ async fn proxy_ensure_artifact(
     // name that does fall through — it just no longer pays on the warm path.
     match proxy::eligible(state, storage, pkg).await {
         Ok(true) => {}
-        Ok(false) => return None,
-        Err(e) => return Some(read_error(e)),
+        Ok(false) => return ProxyEnsure::Serve { filled: false },
+        Err(e) => return ProxyEnsure::Fail(read_error(e)),
     }
     match proxy
         .ensure_artifact_cached(state, storage, pkg, filename)
         .await
     {
-        Ok(()) => None,
-        Err(e) => Some(read_error(e)),
+        Ok(filled) => ProxyEnsure::Serve { filled },
+        Err(e) => ProxyEnsure::Fail(read_error(e)),
     }
 }
 

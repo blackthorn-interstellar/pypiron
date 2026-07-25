@@ -242,13 +242,14 @@ before any bucket is contacted.
 A single-entry `--buckets` list behaves exactly like configuring that one backend
 directly — no topology, health, replication, or read-fence work runs.
 
-Replication keeps a full copy of your truth on every bucket: your own uploads
-**and** the corpus you pulled in with `sync --to`. Budget for roughly your
-private-plus-mirrored footprint times the number of buckets. The on-demand proxy
-cache (packages fetched from public PyPI on first request) is the exception — it
-stays bucket-local and is not doubled, because any bucket can re-fetch it from
-upstream. There are no new knobs: snapshot replication is on whenever you run
-more than one bucket.
+Replication keeps a full copy of your truth on every bucket: your own uploads,
+the corpus you pulled in with `sync --to`, **and** the on-demand proxy cache
+(packages fetched from public PyPI on first request). The proxy cache converges
+in the background — a fetch is served the instant it lands, and its copy to the
+other buckets follows within minutes, off the download path — so budget for
+roughly your private-plus-mirrored-plus-proxied footprint times the number of
+buckets. There are no new knobs: replication is on whenever you run more than
+one bucket.
 
 When two buckets live on the same cloud under the same credentials, pypiron asks
 that cloud to copy an artifact directly between them (S3 CopyObject, GCS rewrite,

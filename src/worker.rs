@@ -2853,9 +2853,10 @@ async fn backfill_sidecar(
         origin: pkg_origin.map(str::to_string),
         upload_epoch_ms: None,
         yank_epoch: 0,
-        // A backfilled sidecar cannot prove it was a `sync --to` snapshot, so it
-        // stays a bucket-local cache until a real sync re-stamps replicate=true.
-        replicate: false,
+        // A backfilled sidecar cannot prove it was a `sync --to` snapshot, so its
+        // provenance stays "cache" until a real sync re-stamps snapshot=true.
+        // (Both replicate; the bit is provenance only.)
+        snapshot: false,
     };
     let fabricated = serde_json::to_vec(&sc)?;
     let created = storage
@@ -3083,7 +3084,7 @@ mod tests {
             origin: origin.map(str::to_string),
             upload_epoch_ms: None,
             yank_epoch: 0,
-            replicate: false,
+            snapshot: false,
         }
     }
 

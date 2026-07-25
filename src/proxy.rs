@@ -555,17 +555,19 @@ impl Proxy {
         Ok(false)
     }
 
-    /// Download-verify-commit one artifact on a local miss. `Ok(())` always
-    /// falls through to normal serving — including when the file simply
-    /// doesn't exist upstream (the local 404 is the right answer). `Err` is
-    /// a hard failure (storage outage, exhausted verification retries).
+    /// Download-verify-commit one artifact on a local miss. `Ok(false)` falls
+    /// through to normal serving with nothing newly written — the file was
+    /// already cached, isn't upstream (the local 404 is the right answer), or the
+    /// fill lost a race. `Ok(true)` means THIS call committed a fresh cache fill,
+    /// so the caller schedules the off-request-path peer replication notes. `Err`
+    /// is a hard failure (storage outage, exhausted verification retries).
     pub async fn ensure_artifact_cached(
         &self,
         state: &AppState,
         storage: &dyn Storage,
         pkg: &str,
         filename: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if state.mutations_fenced() {
             bail!("bucket topology mismatch; proxy cache writes are fenced");
         }
@@ -575,7 +577,7 @@ impl Proxy {
         // only costs on the rare miss, and keeping it lets this function be called
         // on its own and stay correct (the slot racer below re-checks here too).
         if storage.head_exists(&key).await? {
-            return Ok(());
+            return Ok(false);
         }
         // Serialize concurrent fetches of the *same* artifact (distinct files
         // still download in parallel). The slot is held until this function
@@ -583,13 +585,13 @@ impl Proxy {
         // file already cached instead of downloading its own copy.
         let _slot = self.acquire_download_slot(&key).await;
         if storage.head_exists(&key).await? {
-            return Ok(());
+            return Ok(false);
         }
         let Some(found) = self.listing(state, pkg).await else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(file) = found.files.iter().find(|f| f.filename == filename) else {
-            return Ok(()); // not upstream, or filtered out
+            return Ok(false); // not upstream, or filtered out
         };
 
         // Malware fill refusal: never download-and-cache a version OSV condemns —
@@ -605,7 +607,7 @@ impl Proxy {
                 let ids = snap.blocking(pkg, version.as_deref());
                 if !ids.is_empty() {
                     warn!(%pkg, %filename, advisories = ?ids, "proxy: refused malware fill");
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
@@ -617,7 +619,7 @@ impl Proxy {
         // name is no longer ours to serve.
         let claim_observation = match origin::read_origin_observation(storage, pkg).await? {
             Some(observed) if observed.state == origin::OriginState::Mirror => observed,
-            Some(observed) if observed.state == origin::OriginState::Private => return Ok(()),
+            Some(observed) if observed.state == origin::OriginState::Private => return Ok(false),
             // A caller that already saw the sentinel passes it through so the
             // claim goes straight to CAS instead of a guaranteed-losing create.
             observed => {
@@ -629,7 +631,7 @@ impl Proxy {
                 );
                 let claim = origin::claim_origin(storage, pkg, request).await?;
                 if claim.owner != origin::MIRROR {
-                    return Ok(());
+                    return Ok(false);
                 }
                 match claim.etag {
                     Some(etag) => origin::OriginObservation {
@@ -680,9 +682,11 @@ impl Proxy {
             origin: Some(origin::MIRROR.to_string()),
             yank_epoch: 0,
             upload_epoch_ms: None,
-            // A proxy fill is a bucket-local cache, re-derivable from upstream —
-            // never a replicating snapshot. This is the documented carve-out.
-            replicate: false,
+            // A proxy fill is a cache, not a `sync --to` snapshot — but it still
+            // replicates, asynchronously via a post-serve `_repl/` note (the
+            // handler schedules them once this fill commits). The bit is only
+            // provenance now, not a replication carve-out.
+            snapshot: false,
         };
         // Type the record before its artifact can exist. An orphan sidecar is
         // inert; an orphan artifact would be backfilled from a later private
@@ -700,7 +704,7 @@ impl Proxy {
             let existing = storage.get_bytes(&sidecar_key).await?;
             if existing != sidecar_bytes {
                 crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -719,7 +723,7 @@ impl Proxy {
             _ => {
                 info!(%pkg, %filename, "proxy: origin claim changed mid-download; abandoning fill");
                 crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -733,7 +737,7 @@ impl Proxy {
             // sidecar protocol completes the record; never overwrite it with
             // metadata paired to our stale observation.
             crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
-            return Ok(());
+            return Ok(false);
         }
         // Multi-bucket demotion can still win after the pre-PUT read. The
         // record is already typed mirror, so never delete through a cross-object
@@ -750,14 +754,14 @@ impl Proxy {
         {
             crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
             info!(%pkg, %filename, "proxy: origin changed after artifact publish; leaving typed mirror loser");
-            return Ok(());
+            return Ok(false);
         }
         if state.buckets.is_multi() && storage.head_exists(&frozen_key(&key)).await? {
             // The marker suppresses the filename immediately. Leave the typed
             // body for freeze recovery; deleting here would create another
             // cross-object race with staged private promotion.
             crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
-            return Ok(());
+            return Ok(false);
         }
         if filename.ends_with(".whl") && file.has_core_metadata() {
             // Best-effort, like sync: a missing companion only costs the
@@ -791,7 +795,9 @@ impl Proxy {
             .metrics
             .proxy_artifacts_cached
             .fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        // A fresh fill committed: signal the caller to schedule the peer
+        // replication notes off the request's critical path.
+        Ok(true)
     }
 
     /// PEP 658 companion for a not-yet-cached wheel, fetched from upstream

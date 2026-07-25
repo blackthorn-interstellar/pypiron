@@ -104,14 +104,16 @@ pub struct Sidecar {
     /// means 0 (never yanked).
     #[serde(rename = "yank-epoch", default, skip_serializing_if = "is_zero_epoch")]
     pub yank_epoch: u64,
-    /// True on a `sync --to` snapshot: mirror content the operator chose, which
-    /// replicates as truth across every bucket exactly like private does.
-    /// Absent (serde-default `false`) on proxy-cache fills and every legacy
-    /// sidecar, which stay bucket-local — the documented mirror carve-out. Only
-    /// consulted for mirror-origin records; private already replicates from its
-    /// origin alone.
+    /// Provenance of a mirror record: `true` on a `sync --to` snapshot (mirror
+    /// content the operator chose), absent (serde-default `false`) on a proxy-
+    /// cache fill and every legacy sidecar. Both replicate as truth now — the bit
+    /// records *how* a mirror record entered the fleet (which picks its
+    /// propagation mechanism at write time: pre-ack fan-out for a snapshot, an
+    /// async post-serve `_repl/` note for a cache), not *whether* it replicates.
+    /// The replication merge does not arbitrate it. Meaningless for private
+    /// records, which replicate from their origin regardless.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub replicate: bool,
+    pub snapshot: bool,
 }
 
 /// Serde predicate: keep the common (never-yanked) sidecar free of epoch noise
@@ -120,8 +122,8 @@ fn is_zero_epoch(epoch: &u64) -> bool {
     *epoch == 0
 }
 
-/// Serde predicate: a cache (non-replicating) sidecar omits the bit entirely, so
-/// every legacy and proxy sidecar keeps its exact on-disk bytes.
+/// Serde predicate: a cache sidecar omits the `snapshot` bit entirely, so every
+/// legacy and proxy sidecar keeps its exact on-disk bytes.
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -268,28 +270,28 @@ mod tests {
     }
 
     #[test]
-    fn replicate_defaults_false_for_legacy_sidecars_and_round_trips() {
-        // A legacy/proxy sidecar carries no `replicate` field: it must default
-        // to false (bucket-local cache) and never serialize the bit, so the
-        // common case stays byte-identical on disk.
+    fn snapshot_defaults_false_for_legacy_sidecars_and_round_trips() {
+        // A legacy/proxy sidecar carries no `snapshot` field: it must default to
+        // false (a proxy cache) and never serialize the bit, so the common case
+        // stays byte-identical on disk.
         let legacy: Sidecar =
             serde_json::from_str(r#"{"sha256":"a","size":1,"version":"1","upload-time":"t"}"#)
                 .unwrap();
-        assert!(!legacy.replicate);
+        assert!(!legacy.snapshot);
         let out = serde_json::to_string(&legacy).unwrap();
         assert!(
-            !out.contains("replicate"),
-            "a cache sidecar must not serialize the replicate bit"
+            !out.contains("snapshot"),
+            "a cache sidecar must not serialize the snapshot bit"
         );
 
         // A snapshot sidecar round-trips the bit.
         let snapshot: Sidecar = serde_json::from_str(
-            r#"{"sha256":"a","size":1,"version":"1","upload-time":"t","origin":"mirror","replicate":true}"#,
+            r#"{"sha256":"a","size":1,"version":"1","upload-time":"t","origin":"mirror","snapshot":true}"#,
         )
         .unwrap();
-        assert!(snapshot.replicate);
+        assert!(snapshot.snapshot);
         let out = serde_json::to_string(&snapshot).unwrap();
-        assert!(out.contains(r#""replicate":true"#));
+        assert!(out.contains(r#""snapshot":true"#));
     }
 
     #[test]

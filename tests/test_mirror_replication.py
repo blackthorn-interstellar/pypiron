@@ -1,13 +1,15 @@
-"""Mirror snapshots replicate as truth across buckets.
+"""Mirror content replicates as truth across buckets.
 
-`sync --to` uploads (``mirror=true``) are the operator's chosen corpus, so a
-multi-bucket fleet replicates them exactly like private truth: fan-out before
+`sync --to` uploads (``mirror=true``, sidecar ``snapshot=true``) are the
+operator's chosen corpus, replicated exactly like private truth: fan-out before
 ack, then any single bucket serves the whole mirror index. Proxy-cache fills
-(``replicate=false``) stay bucket-local — the documented carve-out. Assertions
-inspect each bucket directly through `mc`, independent of what a server reports.
+(``snapshot=false``) also replicate now — asynchronously, via a post-serve
+``_repl/`` note the sweep drains — so the fleet converges on cached bytes too.
+Assertions inspect each bucket directly through `mc`, independent of what a
+server reports.
 
-Covered: snapshot fan-out + failover, the cache carve-out under reconcile, and
-mirror-yank convergence (the confirmed "mirror yank never converges" gap).
+Covered: snapshot fan-out + failover, async cache convergence under the sweep,
+and mirror-yank convergence (the confirmed "mirror yank never converges" gap).
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from .helpers import (
     http_get,
     http_request_auth,
     make_wheel,
+    origin_owner,
     upload_legacy,
     wait_for_file_in_index,
 )
@@ -80,9 +83,9 @@ def _mirror_upload(server, wheel) -> None:
 
 
 def _seed_mirror_cache_record(minio, bucket, pkg, filename, body: str) -> None:
-    """Seed a proxy-cache-shaped mirror record (no `replicate` bit) directly
-    into one bucket, the way a proxy fill lands it: bucket-local truth that
-    must NEVER ride the replicator."""
+    """Seed a proxy-cache-shaped mirror record (no `snapshot` bit) directly into
+    one bucket, the way a proxy fill lands it: mirror truth that now converges
+    across buckets asynchronously."""
     key = f"packages/{pkg}/{filename}"
     sidecar = {
         "sha256": hashlib.sha256(body.encode()).hexdigest(),
@@ -100,9 +103,9 @@ def _seed_mirror_cache_record(minio, bucket, pkg, filename, body: str) -> None:
 
 def _seed_mirror_snapshot_record(minio, bucket, pkg, filename, body: str) -> None:
     """Seed a `sync --to` snapshot record — a mirror sidecar carrying
-    ``replicate=true`` — directly into one bucket, the way an existing
-    single-bucket mirror corpus already holds it. Unlike a proxy-cache record it
-    MUST ride the replicator, so a bucket added later backfills it."""
+    ``snapshot=true`` — directly into one bucket, the way an existing
+    single-bucket mirror corpus already holds it. It rides the replicator, so a
+    bucket added later backfills it."""
     key = f"packages/{pkg}/{filename}"
     sidecar = {
         "sha256": hashlib.sha256(body.encode()).hexdigest(),
@@ -111,7 +114,7 @@ def _seed_mirror_snapshot_record(minio, bucket, pkg, filename, body: str) -> Non
         "upload-time": "2021-06-01T00:00:00Z",
         "yanked": False,
         "origin": "mirror",
-        "replicate": True,
+        "snapshot": True,
     }
     claim = {"origin": "mirror", "nonce": hashlib.sha256(pkg.encode()).hexdigest()[:32]}
     minio_put_key_in(minio, bucket, f"packages/{pkg}/.origin", json.dumps(claim))
@@ -139,7 +142,7 @@ def test_mirror_snapshot_replicates_and_survives_write_bucket_loss(
     minio_two, s3_server_multi, tmp_path
 ):
     """The archetype: a `sync --to` snapshot lands in BOTH buckets (origin
-    mirror, replicate=true), so killing the write bucket still serves the
+    mirror, snapshot=true), so killing the write bucket still serves the
     mirror bytes from the peer — what multi-region.md promised but the old
     bucket-local mirror could never deliver."""
     server = s3_server_multi
@@ -164,7 +167,7 @@ def test_mirror_snapshot_replicates_and_survives_write_bucket_loss(
     for bucket in (a, b):
         sidecar = json.loads(minio_get_key_in(minio, bucket, f"{akey}.meta.json"))
         assert sidecar["origin"] == "mirror", bucket
-        assert sidecar["replicate"] is True, bucket
+        assert sidecar["snapshot"] is True, bucket
         claim = json.loads(minio_get_key_in(minio, bucket, f"packages/{pkg}/.origin"))
         assert claim["origin"] == "mirror", bucket
 
@@ -181,12 +184,12 @@ def test_mirror_snapshot_replicates_and_survives_write_bucket_loss(
         minio_make_bucket(minio, a)
 
 
-def test_proxy_cache_mirror_record_is_not_replicated(minio_two, s3_server_multi, tmp_path):
-    """The carve-out: a proxy-cache mirror record (replicate=false) is
-    re-derivable per bucket, so it must stay bucket-local even as the tier-3
-    diff converges everything else. A private canary that DOES replicate proves
-    the reconciler actually ran. The running `s3_server_multi` node is what
-    drives the tier-3 diff between the two buckets."""
+def test_proxy_cache_mirror_record_replicates_to_the_peer(minio_two, s3_server_multi, tmp_path):
+    """The totality fix: a proxy-cache mirror record (snapshot=false) is no longer
+    bucket-local — the tier-3 diff now copies it to the peer, byte-for-byte, so a
+    single surviving bucket serves cached bytes too. Seeded straight into one
+    bucket the way a fill lands it; the running `s3_server_multi` node drives the
+    diff. A private canary that also replicates keeps the assertion honest."""
     minio = minio_two
     a, b = minio["buckets"]
 
@@ -196,17 +199,28 @@ def test_proxy_cache_mirror_record_is_not_replicated(minio_two, s3_server_multi,
     )
     priv_key = "packages/cacheproof/cacheproof-1.0-py3-none-any.whl"
     cache_key = "packages/cachelocal/cachelocal-1.0-py3-none-any.whl"
+    cache_meta = f"{cache_key}.meta.json"
 
     _eventually(
         lambda: minio_key_exists_in(minio, b, priv_key),
         timeout=30,
         what="private truth reconciles to the peer (proves the diff ran)",
     )
-    # The reconciler visited the tree; the cache record must not have ridden along.
-    assert not minio_key_exists_in(minio, b, cache_key), "a proxy cache must stay bucket-local"
-    assert not minio_key_exists_in(
-        minio, b, "packages/cachelocal/cachelocal-1.0-py3-none-any.whl.meta.json"
+    # The cache record now converges to the peer, sidecar and body both.
+    _eventually(
+        lambda: (
+            minio_key_exists_in(minio, b, cache_key) and minio_key_exists_in(minio, b, cache_meta)
+        ),
+        timeout=30,
+        what="proxy cache converges to the peer bucket",
     )
+    assert minio_object_sha256(minio, b, cache_key) == minio_object_sha256(minio, a, cache_key)
+    # It arrives as a mirror record (origin mirror, no snapshot bit): a cache, not
+    # promoted to a `sync --to` snapshot.
+    peer_sidecar = json.loads(minio_get_key_in(minio, b, cache_meta))
+    assert peer_sidecar["origin"] == "mirror"
+    assert peer_sidecar.get("snapshot", False) is False
+    assert origin_owner(minio_get_key_in(minio, b, "packages/cachelocal/.origin")) == "mirror"
 
 
 def test_mirror_snapshot_yank_converges_across_buckets(minio_two, s3_server_multi, tmp_path):
@@ -263,7 +277,7 @@ def test_existing_mirror_corpus_backfills_onto_an_added_bucket(
       * leave the pre-seeded package intact (reconcile degrades to a verify pass,
         never a duplicate or a corruption),
 
-    then a fresh `sync --to` upload of a new package stamps ``replicate=true`` and
+    then a fresh `sync --to` upload of a new package stamps ``snapshot=true`` and
     fans out to both buckets — the re-sync path the migration guide points at.
     """
     server = s3_server_multi
@@ -288,12 +302,12 @@ def test_existing_mirror_corpus_backfills_onto_an_added_bucket(
         what="existing corpus backfilled onto the added bucket",
     )
     assert minio_object_sha256(minio, b, bf_key) == minio_object_sha256(minio, a, bf_key)
-    assert json.loads(minio_get_key_in(minio, b, f"{bf_key}.meta.json"))["replicate"] is True
+    assert json.loads(minio_get_key_in(minio, b, f"{bf_key}.meta.json"))["snapshot"] is True
 
     # The pre-seeded package is untouched and still matches a.
     assert minio_object_sha256(minio, b, ps_key) == minio_object_sha256(minio, a, ps_key)
 
-    # Re-run `sync --to`: a fresh mirror upload on the fleet stamps replicate=true
+    # Re-run `sync --to`: a fresh mirror upload on the fleet stamps snapshot=true
     # and fans out to both buckets.
     fresh = make_wheel("corpusfresh", "2.0", tmp_path)
     _mirror_upload(server, fresh)
@@ -307,7 +321,7 @@ def test_existing_mirror_corpus_backfills_onto_an_added_bucket(
         )
         assert minio_object_sha256(minio, bucket, fresh_key) == fresh_sha, bucket
         assert (
-            json.loads(minio_get_key_in(minio, bucket, f"{fresh_key}.meta.json"))["replicate"]
+            json.loads(minio_get_key_in(minio, bucket, f"{fresh_key}.meta.json"))["snapshot"]
             is True
         ), bucket
 

@@ -424,10 +424,17 @@ etags) is the lost-note backstop. Every node may sweep and diff — both paths a
 conditional and idempotent, and selected-bucket leadership must not discard a
 different node's only working path to a warm bucket. Per-bucket leases still
 deduplicate index/audit work. `sync --to` mirror snapshots (sidecar
-`replicate=true`) replicate as truth on the same three tiers as private —
-they are the operator's chosen corpus, not re-derivable. Proxy caches (mirror
-sidecars with `replicate` absent/false), indexes, counters, and leases never
-copy.
+`snapshot=true`) replicate as truth on the same three tiers as private — the
+operator's chosen corpus. Proxy-cache fills (sidecar `snapshot` absent/false)
+replicate too, but **asynchronously**: the fill is served the instant it commits
+to the write bucket, then — after the response, off the request's critical path —
+one durable `_repl/<peer>/…` note per peer is written in that bucket, and the
+ordinary sweep drains it over the same copy path. A crash before the note is
+written is healed by the tier-3 diff, which now copies a mirror cache to an absent
+peer. There is no pre-ack fan-out for a fill (zero added download latency). Only
+indexes, counters, and leases never copy. The sidecar `snapshot` bit is thus
+provenance — snapshot vs cache, which picks the *mechanism* (pre-ack fan-out vs
+async note) — not a statement of *whether* a mirror record replicates.
 
 The artifact leg of every copy (fan-out, sweep, reconcile) runs a stateless
 transport ladder: a boot-computed matrix says whether the destination can pull
@@ -442,10 +449,15 @@ Correctness does not depend on every node selecting the same bucket. The merge
 (`replicate::decide`, pure and unit-tested) has precedence
 **tombstone ≻ origin (private ≻ mirror) ≻ union ≻ freeze**: deletes beat live
 records, private beats mirror, artifact sets union, and logical yank/status
-epochs settle metadata. Two different mirror-cache bodies remain bucket-local and
-do not freeze; two different **snapshot** bodies (both `replicate=true`) under
-one filename freeze both sides — mirror sidecars carry no `upload-epoch-ms`, so
-there is no trustworthy order and the fail-closed path is the only safe one.
+epochs settle metadata. Two different **mirror** bodies under one immutable PyPI
+filename freeze both sides — snapshot, cache, or a mixed pair alike (both are
+sha-verified against upstream before commit, so a byte divergence is an upstream-
+compromise signal, not transit corruption). Mirror sidecars carry no
+`upload-epoch-ms`, so there is no trustworthy order and the fail-closed freeze is
+the only safe path. Two same-byte mirror records converge their yank/metadata
+through the same merge private uses; the `snapshot` bit is provenance the merge
+does not arbitrate (it rides the yank-merge winner), so a cache and a snapshot of
+the same bytes converge deterministically rather than sitting divergent.
 Different **private** bytes under one filename — possible only
 when a partition moved the serialization point — resolve **first-uploaded-wins**:
 each private sidecar carries `upload-epoch-ms` (server-stamped receive time), the
@@ -607,11 +619,11 @@ declared class fails CI. Six classes:
 
 | Prefix | Class | Replicates? |
 | --- | --- | --- |
-| `packages/` | truth-replicated | yes, per record — three-tier fan-out → `_repl/` notes → reconcile; private truth and `sync --to` mirror snapshots (sidecar `replicate=true`) both replicate so any bucket serves the whole corpus. The one exception under this prefix is proxy-cache fills (mirror sidecar, `replicate` absent/false): re-derivable from upstream, so bucket-local |
-| `_advisories/osv-pypi.zip`, `_advisories/quarantined.json` | singleton-replicated | yes — leader-authored control files written write-through to every healthy bucket + reseed-if-absent |
+| `packages/` | truth-replicated | yes, per record — three-tier fan-out → `_repl/` notes → reconcile. Private truth and `sync --to` snapshots (sidecar `snapshot=true`) fan out pre-ack; proxy-cache fills (sidecar `snapshot` absent/false) replicate too but **asynchronously** — a post-serve `_repl/` note the sweep drains, healed by the reconcile diff — so any bucket serves the whole corpus, cached bytes included |
+| `_advisories/osv-pypi.zip`, `_advisories/quarantined.json`, `_transparency/chain/` | singleton-replicated | yes — leader-authored control records written write-through to every healthy bucket + reseed-if-absent; the chain is written through so a failover continues the seq rather than restarting genesis, and `verify-chain` walks every bucket |
 | `_counters/day/` | replicated-rollup | yes — leader-authored, immutable day-rollups reseeded copy-if-absent to every bucket, so a failover keeps the /audit ranking and /stats history |
 | `_counters/seg/` | declared-loss | no — the current day's un-rolled-up live tallies; a failover loses at most one day, the one totality exemption, annotated with its bound |
-| `simple/`, `_advisories/report.json`, `_state/`, `_sync/cursors.json`, `_quarantine/`, `_transparency/chain/` | derived-per-bucket | no — each bucket rebuilds/re-derives its own from the truth it holds |
+| `simple/`, `_advisories/report.json`, `_state/`, `_sync/cursors.json`, `_quarantine/` | derived-per-bucket | no — each bucket rebuilds/re-derives its own from the truth it holds |
 | `_leader/lease.json`, `_repl/`, `_topology/stamp.json`, `_staging/`, `_dirty/` | coordination-per-bucket | no — bucket-local by design; replicating it would be wrong |
 
 `_format/stamp.json` is the one top-level prefix deliberately not yet in the
@@ -621,10 +633,11 @@ ships — the parked format-2 deferral in `private/ROADMAP.md`. When written it 
 be fleet-uniform and write-through replicated (like the singleton control files),
 not bucket-local, so its MANIFEST row lands with that writer, not here.
 
-The transparency chain sits in derived-per-bucket because it is bucket-local
-today (each bucket carries its own genesis); making `verify-chain` bucket-aware
-is a separate, tracked design task. Counters are a flagged judgment call —
-per-node segments aggregated locally, with cross-bucket aggregation still pending.
+The transparency chain is singleton-replicated: leader-authored links are written
+through to every bucket so a failover continues the chain instead of restarting at
+genesis, and `verify-chain` walks every bucket's chain and diffs it against every
+bucket's sidecars. Counters split by half — the immutable day-rollups replicate,
+the current day's live segments are the one declared-loss window.
 
 `<pkg>` is always the PEP 503 normalized name. Index rebuilds include only
 artifact files — metadata companions, tombstones, freeze markers, and dotfiles
@@ -685,7 +698,7 @@ Sidecar schema (`<filename>.meta.json`), all captured at write time:
   "yanked": false,
   "origin": "private",
   "yank-epoch": 0,
-  "replicate": false
+  "snapshot": false
 }
 ```
 
@@ -700,12 +713,14 @@ legacy sidecars and on mirror artifacts; a conflict with either side missing it,
 or with the two within a 2 s skew, degrades to quarantine-both + alarm.
 `yank-epoch` is a monotonic counter bumped on every yank/unyank flip — the
 cross-bucket merge takes the max epoch (no wall clocks, which two buckets cannot
-agree on); absent means 0. `replicate` marks a `sync --to` mirror snapshot: a
-mirror sidecar with `replicate=true` replicates as truth like private, while a
-proxy-cache fill (the bit absent/false) stays bucket-local. It is only consulted
-for mirror-origin records — private replicates from its origin regardless.
-All three fields default when absent, so every pre-migration sidecar still
-parses (a legacy/proxy mirror sidecar reads as a bucket-local cache). Rebuilds read sidecars only;
+agree on); absent means 0. `snapshot` records a mirror record's provenance: a
+`sync --to` snapshot (`snapshot=true`) fans out pre-ack, a proxy-cache fill (the
+bit absent/false) replicates asynchronously via a post-serve note. Both are
+truth that converges — the bit picks the mechanism, never *whether* a mirror
+record replicates, and the merge does not arbitrate it. Private replicates from
+its origin regardless. All fields default when absent, so every pre-migration
+sidecar still parses (a legacy/proxy mirror sidecar reads as a cache). Rebuilds
+read sidecars only;
 if a sidecar is missing (legacy file), the rebuild backfills it by hashing the
 artifact once — create-only, so a real write-time sidecar always wins the race.
 PEP 658 serving falls out of the layout: `<artifact-url>.metadata` maps directly
@@ -757,9 +772,18 @@ be reachable and empty of all package truth except the claim, plus no write
 intents or replication notes for that package. Deletes never touch `.origin`.
 Like tombstones, `.origin` is never lifecycle-expired.
 An admin DELETE of mirror cache bytes remains local in single-bucket mode but is
-rejected with multiple buckets: deleting an artifact cannot be atomically fenced
-against a concurrent mirror→private demotion, and a cache eviction must never
-manufacture a private tombstone.
+rejected with multiple buckets — now doubly. It never could be atomically fenced
+against a concurrent mirror→private demotion, and manufacturing a private
+tombstone after an uncertain claim movement would propagate an eviction over
+private truth. And now that a cache replicates, evicting it on one bucket would
+just resurrect from a peer copy on the next reconcile, while a fleet-wide *mirror*
+tombstone would permanently bar a re-fillable filename — the opposite of a cache's
+contract. So a cache leaves the fleet only by demotion-quarantine (a private
+upload of the same name supersedes it, the existing per-artifact path) or by
+`origin release` (every bucket reachable and empty). There is deliberately no
+per-file multi-bucket cache purge; a fail-closed "purge across all reachable
+buckets" operation, the same shape as `origin release`, is a parked follow-up
+(`private/ROADMAP.md`).
 
 **Project-status lifecycle.** In multi-bucket mode the stored PEP 792 fields
 stay at the top level; `pypiron-epoch` is a monotonic local event counter and

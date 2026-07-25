@@ -75,9 +75,10 @@ struct AbsSidecar {
     yank_epoch: u8,
     /// Server-stamped receive time (ms). `None` on mirror/backfilled sidecars.
     epoch_ms: Option<u16>,
-    /// `sync --to` snapshot bit. True only on a replicating mirror snapshot;
-    /// false on private (private replicates from origin) and on proxy caches.
-    replicate: bool,
+    /// Provenance of a mirror record: true on a `sync --to` snapshot, false on a
+    /// proxy cache and on private records. Both mirror kinds replicate now — the
+    /// merge does not arbitrate this bit; it only rides the yank_merge winner.
+    snapshot: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
@@ -168,6 +169,13 @@ struct Fleet {
     expect_supersede: bool,
     expect_yank_propagation: bool,
     expect_delete_propagation: bool,
+    /// Baseline liveness: some acked private upload reaches both buckets. Off for
+    /// mirror-only fleets (no private upload) and the freeze fleet (nothing lands
+    /// live), where a different `sometimes` probe is the reachability check.
+    expect_upload_replicates: bool,
+    /// A mirror cache filled on one bucket ends up live on BOTH (async cache
+    /// replication converges through the same read → decide → execute path).
+    expect_mirror_replicates: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +199,7 @@ fn to_sidecar(a: &AbsSidecar) -> Sidecar {
         ),
         upload_epoch_ms: a.epoch_ms.map(u64::from),
         yank_epoch: u64::from(a.yank_epoch),
-        replicate: a.replicate,
+        snapshot: a.snapshot,
     }
 }
 
@@ -296,9 +304,10 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
             let (Some(byte), Some(sc)) = (rec.artifact, rec.sidecar) else {
                 unreachable!("Copy verdict from a non-live record");
             };
-            // A private copy claims the destination private; a `sync --to`
-            // snapshot claims it mirror (ensure_mirror_origin never demotes a
-            // private peer — but a Copy destination is Absent, so unclaimed).
+            // A private copy claims the destination private; a mirror copy
+            // (snapshot OR proxy cache — both replicate now) claims it mirror
+            // (ensure_mirror_origin never demotes a private peer — but a Copy
+            // destination is Absent, so unclaimed).
             dst.pkg_origin = Some(sc.origin);
             let drec = &mut dst.files[file as usize];
             drec.artifact = Some(byte);
@@ -320,21 +329,10 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
                 (MOrigin::Mirror, MOrigin::Private) => {
                     a.files[file as usize].sidecar = Some(sb);
                 }
-                // Two replicated snapshots converge their yank state; two proxy
-                // caches (either side non-replicating) stay bucket-local.
-                (MOrigin::Mirror, MOrigin::Mirror) if sa.replicate && sb.replicate => {
-                    match pypiron::replicate::yank_merge(&to_sidecar(&sa), &to_sidecar(&sb)) {
-                        pypiron::replicate::MergeChoice::A => {
-                            b.files[file as usize].sidecar = Some(sa);
-                        }
-                        pypiron::replicate::MergeChoice::B => {
-                            a.files[file as usize].sidecar = Some(sb);
-                        }
-                        pypiron::replicate::MergeChoice::Equal => {}
-                    }
-                }
-                (MOrigin::Mirror, MOrigin::Mirror) => {}
-                (MOrigin::Private, MOrigin::Private) => {
+                // Any two same-byte mirror records (snapshot, cache, or mixed)
+                // converge their yank state exactly like two private records —
+                // yank_merge, fail-closed, the snapshot bit riding the winner.
+                (MOrigin::Mirror, MOrigin::Mirror) | (MOrigin::Private, MOrigin::Private) => {
                     match pypiron::replicate::yank_merge(&to_sidecar(&sa), &to_sidecar(&sb)) {
                         pypiron::replicate::MergeChoice::A => {
                             b.files[file as usize].sidecar = Some(sa);
@@ -406,7 +404,7 @@ fn backfill_once(w: &World, bucket: u8, file: u8) -> Option<World> {
         yank_epoch: 0,
         epoch_ms: None,
         // A backfilled sidecar cannot prove it was a snapshot: stays a cache.
-        replicate: false,
+        snapshot: false,
     });
     Some(next)
 }
@@ -473,7 +471,7 @@ fn writer_step(w: &World, idx: usize) -> Option<World> {
                 yanked: false,
                 yank_epoch: 0,
                 epoch_ms: Some(epoch),
-                replicate: false,
+                snapshot: false,
             });
             next.acked.insert((file, byte));
             advance(&mut next, WriterPc::Done);
@@ -498,7 +496,7 @@ fn writer_step(w: &World, idx: usize) -> Option<World> {
                 yanked: false,
                 yank_epoch: 0,
                 epoch_ms: None,
-                replicate: false,
+                snapshot: false,
             });
             advance(&mut next, WriterPc::SidecarWritten);
             Some(next)
@@ -593,29 +591,40 @@ fn quiescent(w: &World) -> bool {
     writers_settled(w) && merge_fixpoint(w)
 }
 
-/// The private-world projection two quiescent buckets must agree on. Mirror
-/// caches are deliberately bucket-local and excluded.
-fn private_projection(bucket: &BucketAbs, file: u8) -> (bool, bool, Option<(u8, AbsSidecar)>) {
+/// The truth-projection two quiescent buckets must agree on. Now that a mirror
+/// cache replicates too, the projection includes the live mirror record — the
+/// totality claim covers every replicated state class, not just private.
+type Projection = (
+    bool,
+    bool,
+    Option<(u8, AbsSidecar)>,
+    Option<(u8, AbsSidecar)>,
+);
+
+fn truth_projection(bucket: &BucketAbs, file: u8) -> Projection {
     let rec = bucket.files[file as usize];
     // Mirror Record::state()'s precedence: tombstone/freeze markers suppress
     // a record even while its canonical body remains occupied (an interrupted
-    // delete leaves exactly that shape). A mirror-quarantine marker under a
-    // *private* sidecar is stale and falls through, like the real resolver.
-    let live_private = match (rec.artifact, rec.sidecar) {
+    // delete leaves exactly that shape). A mirror-quarantine marker suppresses a
+    // mirror body (a demotion loser), and under a *private* sidecar it is stale
+    // and falls through, like the real resolver.
+    let live = |want_private: bool| match (rec.artifact, rec.sidecar) {
         (Some(byte), Some(sc))
-            if sc.origin == MOrigin::Private && !rec.tombstoned && !rec.frozen =>
+            if (sc.origin == MOrigin::Private) == want_private
+                && !rec.tombstoned
+                && !rec.frozen
+                && (want_private || !rec.mirror_q) =>
         {
             Some((byte, sc))
         }
         _ => None,
     };
-    (rec.tombstoned, rec.frozen, live_private)
+    (rec.tombstoned, rec.frozen, live(true), live(false))
 }
 
 fn converged(w: &World) -> bool {
-    (0..FILES.len() as u8).all(|file| {
-        private_projection(&w.buckets[0], file) == private_projection(&w.buckets[1], file)
-    })
+    (0..FILES.len() as u8)
+        .all(|file| truth_projection(&w.buckets[0], file) == truth_projection(&w.buckets[1], file))
 }
 
 fn acked_bytes_survive(w: &World) -> bool {
@@ -704,14 +713,16 @@ impl Model for Fleet {
                         })
                     })
             }),
-            Property::<Self>::sometimes("upload_replicates", |_, w| {
+        ];
+        if self.expect_upload_replicates {
+            properties.push(Property::<Self>::sometimes("upload_replicates", |_, w| {
                 w.acked.iter().any(|&(file, byte)| {
                     w.buckets
                         .iter()
                         .all(|b| b.files[file as usize].artifact == Some(byte))
                 })
-            }),
-        ];
+            }));
+        }
         if self.expect_freeze {
             properties.push(Property::<Self>::sometimes("freeze_reachable", |_, w| {
                 w.buckets.iter().any(|b| b.files.iter().any(|r| r.frozen))
@@ -757,6 +768,24 @@ impl Model for Fleet {
                             b.files[file as usize]
                                 .sidecar
                                 .is_some_and(|sc| sc.yanked && sc.yank_epoch > 0)
+                        })
+                    })
+                },
+            ));
+        }
+        if self.expect_mirror_replicates {
+            properties.push(Property::<Self>::sometimes(
+                "mirror_cache_replicates_to_peer",
+                |_, w| {
+                    // A mirror byte a single bucket filled is now live on BOTH
+                    // buckets — the totality claim for the last state class.
+                    (0..FILES.len() as u8).any(|file| {
+                        w.buckets.iter().all(|b| {
+                            let rec = b.files[file as usize];
+                            rec.artifact.is_some()
+                                && rec.sidecar.is_some_and(|sc| sc.origin == MOrigin::Mirror)
+                                && !rec.tombstoned
+                                && !rec.frozen
                         })
                     })
                 },
@@ -816,6 +845,8 @@ fn partition_conflict_first_uploaded_wins() {
             expect_supersede: false,
             expect_yank_propagation: false,
             expect_delete_propagation: false,
+            expect_upload_replicates: true,
+            expect_mirror_replicates: false,
         },
     );
 }
@@ -834,6 +865,8 @@ fn partition_conflict_within_skew_freezes() {
             expect_supersede: false,
             expect_yank_propagation: false,
             expect_delete_propagation: false,
+            expect_upload_replicates: true,
+            expect_mirror_replicates: false,
         },
     );
 }
@@ -859,6 +892,8 @@ fn private_beats_mirror_across_buckets() {
             expect_supersede: true,
             expect_yank_propagation: false,
             expect_delete_propagation: false,
+            expect_upload_replicates: true,
+            expect_mirror_replicates: false,
         },
     );
 }
@@ -891,6 +926,67 @@ fn yank_and_delete_propagate() {
             expect_supersede: false,
             expect_yank_propagation: true,
             expect_delete_propagation: true,
+            expect_upload_replicates: true,
+            expect_mirror_replicates: false,
+        },
+    );
+}
+
+/// The last state class: a proxy-cache fill on ONE bucket must converge to the
+/// peer. A single mirror writer lands `cache(0)` on bucket 0; the merge (the
+/// async note's drain path, same read → decide → execute) copies it, so both
+/// buckets end live-mirror. Under the extended `truth_projection`, the
+/// always-converge property now proves it, and `mirror_cache_replicates` proves
+/// the interesting state is actually reached.
+#[test]
+fn mirror_cache_replicates_to_peer() {
+    check(
+        "mirror_cache_replicates",
+        Fleet {
+            writers: vec![Writer {
+                bucket: 0,
+                kind: WriterKind::Mirror { file: 0, byte: 0 },
+                pc: WriterPc::Ready,
+            }],
+            expect_freeze: false,
+            expect_quarantine_loser: false,
+            expect_supersede: false,
+            expect_yank_propagation: false,
+            expect_delete_propagation: false,
+            expect_upload_replicates: false,
+            expect_mirror_replicates: true,
+        },
+    );
+}
+
+/// Two proxy caches of one immutable filename that disagree on bytes — the
+/// upstream-compromise signal. It used to be a silent per-bucket Noop; now the
+/// merge freezes both, exactly like two divergent snapshots, and the buckets
+/// still converge (both frozen).
+#[test]
+fn mirror_cache_byte_conflict_freezes() {
+    check(
+        "mirror_cache_conflict",
+        Fleet {
+            writers: vec![
+                Writer {
+                    bucket: 0,
+                    kind: WriterKind::Mirror { file: 0, byte: 0 },
+                    pc: WriterPc::Ready,
+                },
+                Writer {
+                    bucket: 1,
+                    kind: WriterKind::Mirror { file: 0, byte: 1 },
+                    pc: WriterPc::Ready,
+                },
+            ],
+            expect_freeze: true,
+            expect_quarantine_loser: false,
+            expect_supersede: false,
+            expect_yank_propagation: false,
+            expect_delete_propagation: false,
+            expect_upload_replicates: false,
+            expect_mirror_replicates: false,
         },
     );
 }
@@ -929,6 +1025,8 @@ fn model_replication_deep() {
             expect_supersede: true,
             expect_yank_propagation: false,
             expect_delete_propagation: true,
+            expect_upload_replicates: true,
+            expect_mirror_replicates: false,
         },
     );
 }
@@ -952,8 +1050,8 @@ mod conformance {
             yanked,
             yank_epoch,
             epoch_ms,
-            // `snap` below builds the replicating-snapshot variants.
-            replicate: false,
+            // `snap` below builds the snapshot-provenance variants.
+            snapshot: false,
         };
         let snap = |sha_of: u8, yanked: bool, yank_epoch: u8| AbsSidecar {
             sha_of,
@@ -961,7 +1059,7 @@ mod conformance {
             yanked,
             yank_epoch,
             epoch_ms: None,
-            replicate: true,
+            snapshot: true,
         };
         vec![
             // Absent.
@@ -993,7 +1091,7 @@ mod conformance {
                 sidecar: Some(sc(0, MOrigin::Private, true, 2, Some(0))),
                 ..FileRec::default()
             },
-            // Live mirror caches (two different cached bodies, bucket-local).
+            // Live mirror caches (two different cached bodies): both replicate now.
             FileRec {
                 artifact: Some(0),
                 sidecar: Some(sc(0, MOrigin::Mirror, false, 0, None)),
@@ -1004,7 +1102,7 @@ mod conformance {
                 sidecar: Some(sc(1, MOrigin::Mirror, false, 0, None)),
                 ..FileRec::default()
             },
-            // Live mirror SNAPSHOTS (replicate=true): two byte variants and a
+            // Live mirror SNAPSHOTS (snapshot=true): two byte variants and a
             // yanked one, so the conformance pass exercises the snapshot Copy,
             // the two-snapshot divergent Freeze, and the mirror yank merge.
             FileRec {
@@ -1157,7 +1255,7 @@ mod conformance {
             sha_of,
             origin,
             yanked: !matches!(sc.yanked.normalized(), Yanked::Flag(false)),
-            replicate: sc.replicate,
+            snapshot: sc.snapshot,
             yank_epoch: u8::try_from(sc.yank_epoch).expect("small epochs"),
             epoch_ms: sc
                 .upload_epoch_ms

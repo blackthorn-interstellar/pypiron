@@ -80,11 +80,6 @@ pub enum RecordState {
     Live {
         sha: String,
         origin: Origin,
-        /// The sidecar's `replicate` bit. Meaningful only for [`Origin::Mirror`]
-        /// records: `true` is a `sync --to` snapshot that replicates as truth,
-        /// `false` is a bucket-local proxy cache. Always `false`-ish for private
-        /// (private replicates from its origin regardless).
-        replicate: bool,
     },
     /// An artifact with no readable/typed sidecar — never replicated as-is (that
     /// would fabricate truth, §4); the bucket's own audit backfills a sidecar
@@ -127,7 +122,6 @@ impl Record {
             (Some(sc), Some(origin)) => RecordState::Live {
                 sha: sc.sha256.clone(),
                 origin,
-                replicate: sc.replicate,
             },
             _ => RecordState::Orphan,
         }
@@ -213,27 +207,13 @@ pub fn decide(a: &Record, b: &Record) -> Verdict {
         // never fabricate cross-bucket truth from a bare artifact (§4).
         (Orphan, _) | (_, Orphan) => Verdict::Noop,
         (Absent, Absent) => Verdict::Noop,
-        (
-            Live {
-                origin, replicate, ..
-            },
-            Absent,
-        ) => match origin {
-            Origin::Private => Verdict::Copy(Side::A),
-            // A snapshot replicates as truth; a proxy cache stays bucket-local.
-            Origin::Mirror if replicate => Verdict::Copy(Side::A),
-            Origin::Mirror => Verdict::Noop,
-        },
-        (
-            Absent,
-            Live {
-                origin, replicate, ..
-            },
-        ) => match origin {
-            Origin::Private => Verdict::Copy(Side::B),
-            Origin::Mirror if replicate => Verdict::Copy(Side::B),
-            Origin::Mirror => Verdict::Noop,
-        },
+        // Every live record copies to an absent peer: private truth, a `sync --to`
+        // snapshot, and a proxy-cache fill alike. The snapshot/cache distinction is
+        // write-time provenance (it picks the *propagation mechanism* — pre-ack
+        // fan-out vs an async `_repl/` note — not *whether* a mirror record
+        // replicates). The merge no longer branches on it.
+        (Live { .. }, Absent) => Verdict::Copy(Side::A),
+        (Absent, Live { .. }) => Verdict::Copy(Side::B),
         (
             Live {
                 origin: Origin::Private,
@@ -253,12 +233,10 @@ pub fn decide(a: &Record, b: &Record) -> Verdict {
             Live {
                 sha: sa,
                 origin: oa,
-                replicate: ra,
             },
             Live {
                 sha: sb,
                 origin: ob,
-                replicate: rb,
             },
         ) => {
             if sa == sb {
@@ -270,17 +248,15 @@ pub fn decide(a: &Record, b: &Record) -> Verdict {
                         .unwrap_or(Verdict::Freeze),
                     (Origin::Private, Origin::Mirror) => Verdict::Supersede(Side::A),
                     (Origin::Mirror, Origin::Private) => Verdict::Supersede(Side::B),
-                    // Two replicated snapshots disagree on bytes under one
-                    // immutable name — fail closed. Mirror sidecars carry no
-                    // upload-epoch, so `conflict_winner` finds no trustworthy
-                    // order and both are frozen (a supply-chain product must
-                    // never auto-pick between two byte-sets of one filename). A
-                    // snapshot-vs-cache or cache-vs-cache pair is never
-                    // converged: each proxy manages its own upstream cache.
-                    (Origin::Mirror, Origin::Mirror) if ra && rb => conflict_winner(a, b)
-                        .map(Verdict::QuarantineLoser)
-                        .unwrap_or(Verdict::Freeze),
-                    (Origin::Mirror, Origin::Mirror) => Verdict::Noop,
+                    // Two mirror bodies disagree on bytes under one immutable
+                    // PyPI filename — an upstream-compromise signal regardless of
+                    // whether either side is a snapshot or a lazy cache (both are
+                    // sha-verified against upstream before commit, so this is not
+                    // transit corruption). Mirror sidecars carry no upload-epoch,
+                    // so there is no trustworthy order: fail closed and freeze
+                    // both. A supply-chain product must never auto-pick between
+                    // two byte-sets of one filename.
+                    (Origin::Mirror, Origin::Mirror) => Verdict::Freeze,
                 }
             }
         }
@@ -305,18 +281,13 @@ pub fn same_bytes(a: &Record, b: &Record, oa: Origin, ob: Origin) -> Verdict {
     match (oa, ob) {
         (Origin::Private, Origin::Mirror) => return Verdict::AdoptSidecar(Side::A),
         (Origin::Mirror, Origin::Private) => return Verdict::AdoptSidecar(Side::B),
-        (Origin::Mirror, Origin::Mirror) => {
-            // Two replicated snapshots of the same bytes converge their yank
-            // metadata through the merge below (§6.5). Two proxy caches (or a
-            // snapshot paired with a lazy cache) stay bucket-local — none of a
-            // cache's yank state is truth to propagate.
-            let both_replicate = a.sidecar.as_ref().is_some_and(|s| s.replicate)
-                && b.sidecar.as_ref().is_some_and(|s| s.replicate);
-            if !both_replicate {
-                return Verdict::Noop;
-            }
-        }
-        (Origin::Private, Origin::Private) => {}
+        // Two mirror records of the same bytes converge their yank metadata
+        // through the merge below (§6.5) — snapshot, cache, or a mixed pair
+        // alike. The snapshot/cache bit is write-time provenance, not truth the
+        // merge arbitrates; it rides the yank_merge winner's sidecar. Using
+        // yank_merge (not a snapshot-wins pick) keeps the yank state fail-closed:
+        // a yanked side is never silently un-yanked by the peer's provenance.
+        (Origin::Mirror, Origin::Mirror) | (Origin::Private, Origin::Private) => {}
     }
     let (sca, scb) = match (a.sidecar.as_ref(), b.sidecar.as_ref()) {
         (Some(sca), Some(scb)) => (sca, scb),
@@ -383,7 +354,7 @@ pub(crate) mod tests {
             origin: Some(origin.to_string()),
             yank_epoch: epoch,
             upload_epoch_ms: None,
-            replicate: false,
+            snapshot: false,
         }
     }
 
@@ -400,15 +371,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// A mirror **snapshot** record: `sync --to` content, `replicate=true`,
-    /// which replicates as truth. (`live(_, MIRROR)` is a proxy cache.)
+    /// A mirror **snapshot** record: `sync --to` content, `snapshot=true`. Both
+    /// this and a proxy cache (`live(_, MIRROR)`, `snapshot=false`) replicate as
+    /// truth now; the bit only records provenance.
     pub(crate) fn snapshot(sha: &str) -> Record {
         let mut record = live(sha, MIRROR);
         record
             .sidecar
             .as_mut()
             .expect("test record has a sidecar")
-            .replicate = true;
+            .snapshot = true;
         record
     }
 
@@ -448,34 +420,67 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn mirror_never_replicates() {
-        assert_eq!(decide(&live("x", MIRROR), &absent()), Verdict::Noop);
-        assert_eq!(decide(&absent(), &live("x", MIRROR)), Verdict::Noop);
-        // Two mirror caches of the same name, different bytes: nothing to do.
+    fn mirror_cache_replicates() {
+        // A proxy-cache fill (`snapshot=false`) now replicates as truth like a
+        // snapshot: it copies to an empty peer instead of staying bucket-local.
+        assert_eq!(
+            decide(&live("x", MIRROR), &absent()),
+            Verdict::Copy(Side::A)
+        );
+        assert_eq!(
+            decide(&absent(), &live("x", MIRROR)),
+            Verdict::Copy(Side::B)
+        );
+        // Two mirror caches of the same name, DIFFERENT bytes under one immutable
+        // filename: fail closed — an upstream-compromise signal (was a silent
+        // Noop when caches were bucket-local).
         assert_eq!(
             decide(&live("x", MIRROR), &live("y", MIRROR)),
-            Verdict::Noop
+            Verdict::Freeze
         );
+        // Same bytes, one cache yanked at a higher epoch: the yank converges.
         let mut yanked = live("x", MIRROR);
         yanked.sidecar = Some(sc("x", MIRROR, Yanked::Flag(true), 2));
-        assert_eq!(decide(&yanked, &live("x", MIRROR)), Verdict::Noop);
+        assert_eq!(
+            decide(&yanked, &live("x", MIRROR)),
+            Verdict::AdoptSidecar(Side::A)
+        );
     }
 
     #[test]
     fn mirror_snapshot_copies_to_an_empty_peer() {
-        // A `sync --to` snapshot (replicate=true) replicates as truth, unlike a
-        // proxy cache. This is the archetype the whole PR closes.
+        // A `sync --to` snapshot (snapshot=true) copies to an empty peer, exactly
+        // like a cache — the merge does not distinguish them.
         assert_eq!(decide(&snapshot("x"), &absent()), Verdict::Copy(Side::A));
         assert_eq!(decide(&absent(), &snapshot("x")), Verdict::Copy(Side::B));
     }
 
     #[test]
+    fn same_bytes_never_un_yanks_across_provenance() {
+        // The fail-open trap: a snapshot (unyanked, epoch 0) meets a cache
+        // (yanked, epoch 0) of the same bytes. A "snapshot wins" pick would adopt
+        // the snapshot's sidecar verbatim and silently un-yank. `yank_merge`
+        // instead keeps the equal-epoch yanked side, so the withdrawal survives
+        // regardless of which side is the operator snapshot.
+        let mut snap = snapshot("x"); // unyanked, epoch 0, snapshot=true
+        let mut cache = live("x", MIRROR); // epoch 0, snapshot=false
+        cache.sidecar = Some(sc("x", MIRROR, Yanked::Flag(true), 0));
+        assert_eq!(decide(&snap, &cache), Verdict::AdoptSidecar(Side::B));
+        assert_eq!(decide(&cache, &snap), Verdict::AdoptSidecar(Side::A));
+        // And the symmetric arrangement: snapshot yanked, cache clear.
+        snap.sidecar = Some(sc("x", MIRROR, Yanked::Flag(true), 0));
+        snap.sidecar.as_mut().expect("snapshot sidecar").snapshot = true;
+        cache.sidecar = Some(sc("x", MIRROR, Yanked::Flag(false), 0));
+        assert_eq!(decide(&snap, &cache), Verdict::AdoptSidecar(Side::A));
+    }
+
+    #[test]
     fn two_snapshots_same_bytes_converge_yank_state() {
-        // Both replicate: the higher yank epoch wins, exactly like private —
-        // this is what makes a mirror yank converge across buckets (gap 6).
+        // The higher yank epoch wins, exactly like private — this is what makes a
+        // mirror yank converge across buckets (gap 6).
         let mut yanked = snapshot("x");
         yanked.sidecar = Some(sc("x", MIRROR, Yanked::Flag(true), 2));
-        yanked.sidecar.as_mut().expect("snapshot sidecar").replicate = true;
+        yanked.sidecar.as_mut().expect("snapshot sidecar").snapshot = true;
         assert_eq!(
             decide(&yanked, &snapshot("x")),
             Verdict::AdoptSidecar(Side::A)
@@ -487,19 +492,42 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn two_snapshots_diverging_bytes_freeze() {
+    fn two_mirror_bodies_diverging_bytes_freeze() {
         // Two byte-sets under one immutable name, no trustworthy order (mirror
-        // sidecars carry no upload-epoch): fail closed, freeze both.
+        // sidecars carry no upload-epoch): fail closed, freeze both. Holds for
+        // any mix of snapshot and cache — the merge does not distinguish them.
         assert_eq!(decide(&snapshot("x"), &snapshot("y")), Verdict::Freeze);
+        assert_eq!(
+            decide(&live("x", MIRROR), &live("y", MIRROR)),
+            Verdict::Freeze
+        );
+        assert_eq!(decide(&snapshot("x"), &live("y", MIRROR)), Verdict::Freeze);
     }
 
     #[test]
-    fn snapshot_paired_with_cache_never_converges() {
-        // A snapshot must never converge against a lazy per-bucket cache, same
-        // bytes or different — the cache is re-derivable, not truth.
-        assert_eq!(decide(&snapshot("x"), &live("x", MIRROR)), Verdict::Noop);
-        assert_eq!(decide(&snapshot("x"), &live("y", MIRROR)), Verdict::Noop);
-        assert_eq!(decide(&live("y", MIRROR), &snapshot("x")), Verdict::Noop);
+    fn snapshot_paired_with_cache_converges() {
+        // The previously-Noop mixed pair now converges coherently. Same bytes
+        // differing only in the provenance bit: a deterministic, symmetric adopt
+        // (never a Noop-forever divergent fixpoint). The two calls pick opposite
+        // sides — the same physical outcome with the side swapped.
+        let ab = decide(&snapshot("x"), &live("x", MIRROR));
+        let ba = decide(&live("x", MIRROR), &snapshot("x"));
+        assert!(matches!(ab, Verdict::AdoptSidecar(_)), "{ab:?}");
+        assert_eq!(
+            ba,
+            match ab {
+                Verdict::AdoptSidecar(Side::A) => Verdict::AdoptSidecar(Side::B),
+                Verdict::AdoptSidecar(Side::B) => Verdict::AdoptSidecar(Side::A),
+                other => panic!("expected an AdoptSidecar, got {other:?}"),
+            }
+        );
+        // Different bytes freeze (covered by two_mirror_bodies_diverging_bytes_freeze);
+        // an absent peer just gets a copy from whichever side is live.
+        assert_eq!(decide(&snapshot("x"), &absent()), Verdict::Copy(Side::A));
+        assert_eq!(
+            decide(&absent(), &live("x", MIRROR)),
+            Verdict::Copy(Side::B)
+        );
     }
 
     #[test]

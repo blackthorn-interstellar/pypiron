@@ -1,10 +1,12 @@
 //! Multi-bucket replication and reconciliation.
 //!
-//! Only **private truth** replicates — a private file's sidecar, artifact,
-//! `.metadata`/`.provenance` companions, its package origin claim, and its
-//! tombstone. Mirror content never does: it is re-derivable per bucket from
-//! upstream (§4). Three tiers keep the buckets converged, fastest first, each
-//! backstopping the one above:
+//! All durable package truth replicates — a private file's record, a `sync --to`
+//! mirror snapshot, and a proxy-cache fill alike (artifact, sidecar,
+//! `.metadata`/`.provenance` companions, origin claim, tombstone). A cache is no
+//! longer treated as bucket-local re-derivable state: it converges too, just
+//! asynchronously (a post-serve `_repl/` note, never pre-ack fan-out — the fill
+//! path gains zero latency). Three tiers keep the buckets converged, fastest
+//! first, each backstopping the one above:
 //!
 //! 1. **Synchronous fan-out** ([`fanout_sync`]): before an upload/delete/yank
 //!    is acked, push the changed record to every other healthy bucket. A
@@ -416,13 +418,13 @@ async fn adopt_sidecar_cas(
         let choice = match (left_origin, right_origin) {
             (Origin::Private, Origin::Mirror) => MergeChoice::A,
             (Origin::Mirror, Origin::Private) => MergeChoice::B,
-            // Two replicated snapshots converge their yank state (§6.5); two
-            // proxy caches (or a snapshot vs a cache) stay bucket-local.
-            (Origin::Mirror, Origin::Mirror) if left.replicate && right.replicate => {
+            // Any two mirror records of the same bytes converge their yank state
+            // (§6.5) — snapshot, cache, or a mixed pair. yank_merge is fail-closed
+            // (a yanked side is never un-yanked by the peer's provenance); the
+            // snapshot bit rides the winner's sidecar, matching `same_bytes`.
+            (Origin::Mirror, Origin::Mirror) | (Origin::Private, Origin::Private) => {
                 yank_merge(&left, &right)
             }
-            (Origin::Mirror, Origin::Mirror) => MergeChoice::Equal,
-            (Origin::Private, Origin::Private) => yank_merge(&left, &right),
         };
         match choice {
             MergeChoice::Equal => return Ok((false, false)),
@@ -451,10 +453,10 @@ fn json() -> Option<&'static str> {
     Some("application/json")
 }
 
-/// Fill missing companions for two records that already agree on private
-/// artifact bytes. Private/private is a union; private/mirror only flows from
-/// the private side. Mirror/mirror remains bucket-local. Returns which bucket's
-/// index needs rebuilding.
+/// Fill missing companions for two records that already agree on artifact bytes.
+/// Private/private and mirror/mirror both union (a replicated cache's companions
+/// converge too); private/mirror only flows from the private side. Returns which
+/// bucket's index needs rebuilding.
 async fn repair_same_sha_companions(
     stores: (&dyn Storage, &dyn Storage),
     pkg: &str,
@@ -492,7 +494,11 @@ async fn repair_same_sha_companions(
             copy_missing_companions(b, a, pkg, filename, rb, ra).await?,
             false,
         )),
-        (Origin::Mirror, Origin::Mirror) => Ok((false, false)),
+        (Origin::Mirror, Origin::Mirror) => {
+            let dirty_b = copy_missing_companions(a, b, pkg, filename, ra, rb).await?;
+            let dirty_a = copy_missing_companions(b, a, pkg, filename, rb, ra).await?;
+            Ok((dirty_a, dirty_b))
+        }
     }
 }
 
@@ -1244,19 +1250,21 @@ async fn ensure_mirror_origin(dst: &dyn Storage, pkg: &str) -> Result<()> {
     bail!("could not make '{pkg}' mirror on the destination after {ORIGIN_ATTEMPTS} attempts")
 }
 
-/// Install a replicated mirror snapshot's sidecar under CAS. A `replicate=true`
-/// mirror sidecar is accepted (unlike [`install_or_verify_sidecar`], which is
-/// private-only), but private truth on the destination is NEVER overwritten —
-/// private outranks mirror everywhere. Same-sha crash debris is repaired in
-/// place; a different-sha mirror body is a split-brain resolved by the freeze
-/// path, not here. Returns whether the destination sidecar changed.
+/// Install a mirror record's sidecar under CAS. Any mirror sidecar is accepted —
+/// a `sync --to` snapshot and a proxy-cache fill alike (unlike
+/// [`install_or_verify_sidecar`], which is private-only) — because both replicate
+/// now; the snapshot bit is provenance the copy carries verbatim, not a gate.
+/// Private truth on the destination is NEVER overwritten — private outranks
+/// mirror everywhere. Same-sha crash debris is repaired in place; a different-sha
+/// mirror body is a split-brain resolved by the freeze path, not here. Returns
+/// whether the destination sidecar changed.
 async fn install_or_verify_mirror_sidecar(
     dst: &dyn Storage,
     key: &str,
     sidecar: &Sidecar,
 ) -> Result<bool> {
-    if sidecar.origin.as_deref() != Some(MIRROR) || !sidecar.replicate {
-        bail!("mirror replication source sidecar at {key} is not a replicated snapshot");
+    if sidecar.origin.as_deref() != Some(MIRROR) {
+        bail!("mirror replication source sidecar at {key} is not mirror truth");
     }
     let bytes = serde_json::to_vec(sidecar)?;
     let artifact = key
@@ -1636,6 +1644,74 @@ pub async fn fanout_sync(
         if let Err(e) = write_marker(src, idx, pkg, filename).await {
             error!(dest=idx, package=%pkg, filename=%filename, error=?e, "could not write replication repair note before ack");
         }
+    }
+}
+
+/// Async proxy-cache replication (deliberately NOT tier 1: no pre-ack fan-out).
+/// A proxy fill is served off the write bucket the instant it commits, so its
+/// peer copies must never sit on the request's critical path. Instead, once the
+/// fill has committed the artifact + sidecar, the serve handler spawns this
+/// **after** the response, and it drops one durable `_repl/<peer>/…` note per
+/// peer in the write bucket. The ordinary marker sweep then drains each note over
+/// the same copy path as any other repair note (read both records → `decide` →
+/// `Copy` → `copy_live`, which now installs a mirror-cache sidecar). A fill is
+/// one-time per file, so one small PUT per peer is acceptable.
+///
+/// Best-effort by design: the note is a latency optimization, not the durability
+/// guarantee. If this task is lost — a crash between the commit and the spawn, a
+/// shutdown mid-write — the periodic reconcile full diff heals it, because
+/// `decide` now copies a mirror cache to an absent peer. The note is written only
+/// after the fill's artifact + sidecar are durable, so a sweep never chases a
+/// half-written record.
+pub fn spawn_proxy_fill_notes(
+    state: Arc<AppState>,
+    src_index: usize,
+    pkg: String,
+    filename: String,
+) {
+    if !state.buckets.is_multi() {
+        return;
+    }
+    tokio::spawn(async move {
+        if let Err(error) = note_proxy_fill(&state, src_index, &pkg, &filename).await {
+            warn!(package=%pkg, filename=%filename, error=?error, "proxy fill: could not note peer replication; reconcile will heal");
+        }
+    });
+}
+
+async fn note_proxy_fill(
+    state: &AppState,
+    src_index: usize,
+    pkg: &str,
+    filename: &str,
+) -> Result<()> {
+    // A fenced topology, or a write bucket that just left eligibility, cannot be
+    // a trustworthy copy source; drop the notes and let the reconcile diff heal
+    // once the fleet settles. (Health probes/topology verification are the only
+    // writers allowed past this gate.)
+    if require_replication_unfenced(state).is_err() || !bucket_eligible(state, src_index) {
+        return Ok(());
+    }
+    let handles = state.buckets.handles();
+    let Some(src) = handles.get(src_index) else {
+        return Ok(());
+    };
+    let mut failures = Vec::new();
+    for idx in 0..handles.len() {
+        if idx == src_index {
+            continue;
+        }
+        // Note every peer, even a currently-ineligible one: the marker is the
+        // durable record that `idx` still owes this fill, drained on its heal —
+        // exactly the failure-path role notes play for a synchronous fan-out.
+        if let Err(error) = write_marker(src.storage.as_ref(), idx, pkg, filename).await {
+            failures.push(format!("peer {idx}: {error:#}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("proxy-fill notes failed: {}", failures.join("; "))
     }
 }
 
@@ -2563,8 +2639,9 @@ async fn converge_package(
             // finish after package demotion. Package-private +
             // artifact-mirror is therefore an invalid late record,
             // including when the filename is absent from the true
-            // private source. Quarantine it here; ordinary `decide`
-            // deliberately treats mirror-only cache entries as local.
+            // private source. Quarantine it here: a mirror body under a
+            // private claim is a demotion loser, never truth to replicate,
+            // whatever `decide` would do for two mirror-claimed peers.
             let late_a = a_origin == Some(Origin::Private)
                 && matches!(
                     ra.state(),
@@ -3822,31 +3899,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_mirror_sidecar_accepts_snapshot_but_yields_to_private() {
-        let s = InMemStorage::default();
+    async fn install_mirror_sidecar_accepts_snapshot_and_cache_but_yields_to_private() {
         let akey = artifact_key("pkg", "pkg-1.0-py3-none-any.whl");
         let key = sidecar_key(&akey);
         let mut snapshot = decide::tests::sc("abc", MIRROR, crate::sidecar::Yanked::Flag(false), 0);
-        snapshot.replicate = true;
+        snapshot.snapshot = true;
+        let cache = decide::tests::sc("abc", MIRROR, crate::sidecar::Yanked::Flag(false), 0);
 
-        // Fresh install of a replicating snapshot sidecar.
-        assert!(install_or_verify_mirror_sidecar(&s, &key, &snapshot)
-            .await
-            .unwrap());
-        // Idempotent second pass.
-        assert!(!install_or_verify_mirror_sidecar(&s, &key, &snapshot)
-            .await
-            .unwrap());
+        // Both a snapshot and a proxy-cache sidecar install on this path now —
+        // both are mirror truth that replicates.
+        for source in [&snapshot, &cache] {
+            let s = InMemStorage::default();
+            assert!(install_or_verify_mirror_sidecar(&s, &key, source)
+                .await
+                .unwrap());
+            // Idempotent second pass.
+            assert!(!install_or_verify_mirror_sidecar(&s, &key, source)
+                .await
+                .unwrap());
+        }
 
-        // A non-replicating (cache) or private-origin source is rejected: only a
-        // replicating snapshot sidecar takes this path.
-        let mut cache = snapshot.clone();
-        cache.replicate = false;
-        assert!(install_or_verify_mirror_sidecar(&s, &key, &cache)
+        // A private-origin source is still rejected: this path is mirror-only.
+        let s = InMemStorage::default();
+        let private_src = decide::tests::sc("abc", PRIVATE, crate::sidecar::Yanked::Flag(false), 0);
+        assert!(install_or_verify_mirror_sidecar(&s, &key, &private_src)
             .await
             .is_err());
 
-        // Private truth on the destination is never overwritten by a snapshot.
+        // Private truth on the destination is never overwritten by a mirror record.
         let s2 = InMemStorage::default();
         let private = decide::tests::sc("abc", PRIVATE, crate::sidecar::Yanked::Flag(false), 0);
         s2.insert(&key, serde_json::to_vec(&private).unwrap());

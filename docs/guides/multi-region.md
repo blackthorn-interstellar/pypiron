@@ -49,8 +49,10 @@ region a client reaches.
   success. If one bucket was down, pypiron copies the file over when it returns.
 - **Your mirrored corpus.** Packages you pulled in with `sync --to` replicate
   as truth just like your own uploads, so every bucket holds the whole mirror.
-  Only the lazy proxy cache (packages fetched on demand from public PyPI) stays
-  bucket-local — it is re-fetchable from upstream, so there is nothing to lose.
+  Packages fetched on demand from public PyPI (the proxy cache) converge too:
+  the fetch is served immediately from the bucket that got it, and the copy to
+  the other buckets happens in the background, within minutes. Nothing you serve
+  stays pinned to a single bucket.
 - **Deletes.** A deleted filename never comes back, even if a bucket was
   unreachable when you deleted it.
 
@@ -203,11 +205,14 @@ proxy-upstream = "https://pypi.org"
 from public PyPI. If your private names share no prefix, deny each exact name in
 the `[mirror]` rules instead.
 
-Public packages fetched **on demand through the proxy** are the one thing not
-copied between buckets — each bucket re-fetches that replaceable cache from
-upstream. Anything you deliberately mirror with `sync --to` is not a cache: it
-replicates to every bucket like your own uploads. Deleting a proxy-cached file
-by hand is refused when you run more than one bucket.
+Public packages fetched **on demand through the proxy** converge across buckets
+too, in the background — the fetch is served the instant it lands, and the copy
+to the other buckets follows within minutes (a lag you never see on the download
+path). Once converged, the zero-cross-region-egress promise covers everything: a
+surviving bucket serves proxied packages, mirrored packages, and your own uploads
+alike. Deleting a proxy-cached file by hand is refused when you run more than one
+bucket — the entry is replicated truth now, and it stays re-fillable from upstream
+rather than being tombstoned fleet-wide.
 
 ## Limits
 

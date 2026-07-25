@@ -584,9 +584,9 @@ pub async fn publish_record(
         upload_epoch_ms: (!is_mirror).then(now_epoch_millis),
         yank_epoch: 0,
         // A `sync --to` upload is a snapshot: mirror content the operator chose,
-        // which replicates as truth. (Private replicates from its origin; the
-        // bit only steers mirror-origin records, so private stays false.)
-        replicate: is_mirror,
+        // tagged so its origin reads honestly (a proxy cache carries this false).
+        // Provenance only — both snapshot and cache replicate; private stays false.
+        snapshot: is_mirror,
     };
     let sc_bytes = serde_json::to_vec(&sc).map_err(|_| {
         (
@@ -973,13 +973,17 @@ pub async fn delete_record(
         )
     })?);
 
-    // A mirror cache eviction cannot be made atomic with a concurrent
-    // mirror->private package demotion: the claim and artifact are separate S3
-    // objects. Manufacturing a private tombstone after any uncertain claim
-    // movement would propagate a cache eviction over real private truth.
-    // Refuse this unnecessary admin operation instead of pretending a
-    // cross-object transaction exists. Broad lifecycle expiry is not a safe
-    // substitute because private and mirror records share `packages/`.
+    // Multi-bucket mirror-cache eviction stays refused, now doubly so. It never
+    // could be made atomic with a concurrent mirror->private demotion (claim and
+    // artifact are separate objects, and manufacturing a private tombstone after
+    // an uncertain claim movement would propagate an eviction over real private
+    // truth). And now that a cache replicates, evicting it on one bucket would
+    // resurrect from a peer copy on the next reconcile, while a fleet-wide mirror
+    // tombstone would permanently bar a re-fillable filename — the opposite of a
+    // cache's contract. So a cache leaves the fleet only by demotion-quarantine (a
+    // private upload of the same name) or by `origin release` (every bucket
+    // reachable and empty). Single-bucket mode still allows the local delete: the
+    // file is simply re-fillable from upstream. See dev/DESIGN.md.
     let origin_before = match origin::read_origin_observation(storage, pkg).await {
         Ok(Some(observed))
             if matches!(
@@ -1155,7 +1159,6 @@ pub(crate) async fn set_yank(
     };
     let mut wrote = false;
     let mut record_origin = None;
-    let mut record_replicate = false;
     for _ in 0..8 {
         let Some((bytes, etag)) = storage.get_with_etag(&sc_key).await.map_err(|e| {
             (
@@ -1186,7 +1189,6 @@ pub(crate) async fn set_yank(
         sc.yank_epoch = sc.yank_epoch.saturating_add(1);
         sc.yanked = desired.clone();
         record_origin = sc.origin.clone();
-        record_replicate = sc.replicate;
         if intent_nonce.is_none() {
             intent_nonce = markers::mark_intent(storage, pkg).await.ok();
         }
@@ -1212,19 +1214,18 @@ pub(crate) async fn set_yank(
     if let Err(e) = markers::commit_marker(state, storage, pkg, intent_nonce).await {
         warn!(error=?e, "yank: failed to write commit marker");
     }
-    // A yank replicates when it rides truth: private always, and a mirror
-    // snapshot (replicate=true) — closing the "mirror yank never converges"
-    // gap. A proxy cache's yank stays bucket-local. The sidecar just written
-    // carries both the origin and the replicate bit, so no extra read on the
-    // common path; only a legacy sidecar with no typed origin falls back to the
-    // package claim (where a mirror is a cache, so only private replicates).
+    // A yank rides truth, and all package truth replicates now: private always,
+    // and every mirror record — a `sync --to` snapshot and a proxy cache alike,
+    // closing the "mirror yank never converges" gap for caches too. The sidecar
+    // just written carries the origin, so no extra read on the common path; only
+    // a legacy sidecar with no typed origin falls back to the package claim (any
+    // claimed origin replicates).
     let replicate_this = if !state.buckets.is_multi() {
         false
     } else {
         match record_origin.as_deref() {
-            Some(origin::PRIVATE) => true,
-            Some(origin::MIRROR) => record_replicate,
-            _ => {
+            Some(origin::PRIVATE) | Some(origin::MIRROR) => true,
+            _ => matches!(
                 origin::read_origin(storage, pkg)
                     .await
                     .map_err(|e| {
@@ -1233,9 +1234,9 @@ pub(crate) async fn set_yank(
                             format!("storage error reading origin for replication: {e}"),
                         )
                     })?
-                    .as_deref()
-                    == Some(origin::PRIVATE)
-            }
+                    .as_deref(),
+                Some(origin::PRIVATE) | Some(origin::MIRROR)
+            ),
         }
     };
     if replicate_this {

@@ -83,7 +83,7 @@ pub const MANIFEST: &[PrefixClass] = &[
     PrefixClass {
         prefix: crate::app::PACKAGES_PREFIX,
         class: Class::TruthReplicated,
-        why: "package artifacts + sidecars: the operator's truth, replicated to every bucket",
+        why: "package artifacts + sidecars — private truth, `sync --to` snapshots, AND proxy-cache fills — all replicated to every bucket; private/snapshot via pre-ack fan-out, cache via an async post-serve `_repl/` note, so any bucket serves the whole corpus",
     },
     PrefixClass {
         prefix: crate::app::SIMPLE_PREFIX,

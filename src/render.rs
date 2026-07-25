@@ -497,7 +497,7 @@ mod tests {
             yanked: Yanked::Flag(false),
             origin: None,
             yank_epoch: 0,
-            replicate: false,
+            snapshot: false,
         }
     }
 

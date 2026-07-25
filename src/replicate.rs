@@ -22,6 +22,7 @@
 //! conflict; the executor applies the decision with both handles.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -1791,6 +1792,213 @@ pub async fn has_undrained_repl_notes_for(storage: &dyn Storage, dest: usize) ->
     Ok(!storage.list_page(&prefix, None, 1).await?.is_empty())
 }
 
+/// Whether region bucket `region` is owed no undrained note by any peer — no real
+/// repair marker and no backfill sentinel under any peer's `_repl/<region>/`.
+/// Conservative: an unreachable peer or any error reports `false`, so reads never
+/// return to a bucket that might still be missing corpus. Startup uses it before
+/// seeding a region read pin; the worker's own caught-up check applies the same
+/// gate to *return* reads after a recovery.
+pub async fn region_owed_no_notes(handles: &[crate::buckets::BucketHandle], region: usize) -> bool {
+    for (index, handle) in handles.iter().enumerate() {
+        if index == region {
+            continue;
+        }
+        match has_undrained_repl_notes_for(handle.storage.as_ref(), region).await {
+            Ok(false) => {}
+            Ok(true) => return false,
+            Err(error) => {
+                warn!(bucket=%handle.name, target=region, error=?error, "could not confirm region bucket caught up at startup; reads follow the write pin");
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Backfill sentinel — a freshly-added bucket owes reads nothing until converged.
+// ---------------------------------------------------------------------------
+
+/// Filename component of the backfill sentinel a freshly-added bucket seeds under
+/// `_repl/<dest>/`. It names no package, so [`parse_repl_marker`] returns `None`
+/// and the marker sweep never tries to "deliver" it — only a clean full reconcile
+/// pass clears it. It rides the very `_repl/<dest>/` prefix that
+/// [`has_undrained_repl_notes_for`] (read affinity) and [`has_undrained_repl_notes`]
+/// (`buckets migrate`) already check, so a new region bucket serves no region
+/// reads until the corpus has converged onto it — no per-file read-through.
+const BACKFILL_SENTINEL: &str = "_backfill!";
+
+fn backfill_sentinel_prefix(dest: usize) -> String {
+    format!("{REPL_PREFIX}{dest}/{BACKFILL_SENTINEL}")
+}
+
+/// Seed the backfill sentinel for newly-added bucket `dest` on a surviving peer.
+/// O(1): one empty create, never a corpus walk. `buckets migrate` calls this once
+/// per bucket the new topology adds, on every other reachable bucket, so the
+/// read-affinity gate holds whichever peer a node happens to consult.
+pub async fn seed_backfill_sentinel(storage: &dyn Storage, dest: usize) -> Result<()> {
+    let key = format!(
+        "{}{}",
+        backfill_sentinel_prefix(dest),
+        markers::marker_nonce()
+    );
+    storage.put_bytes(&key, Vec::new(), None).await
+}
+
+/// Remove every backfill sentinel across the fleet. Called only after a fully
+/// clean reconcile pass — which proves every reachable bucket now holds the whole
+/// corpus — so a freshly-added bucket may finally serve region reads. Bounded:
+/// one narrow LIST plus at most one delete per (bucket, dest).
+async fn drain_backfill_sentinels(state: &AppState) -> Result<()> {
+    let handles = state.buckets.handles();
+    let mut failures = Vec::new();
+    for handle in handles {
+        for dest in 0..handles.len() {
+            let prefix = backfill_sentinel_prefix(dest);
+            match handle
+                .storage
+                .list_page(&prefix, None, REPL_SWEEP_PAGE)
+                .await
+            {
+                Ok(page) if page.is_empty() => {}
+                Ok(page) => {
+                    let keys: Vec<String> = page.into_iter().map(|obj| obj.key).collect();
+                    if let Err(e) = handle.storage.delete_keys(&keys).await {
+                        failures.push(format!("{}: {e:#}", handle.name));
+                    }
+                }
+                Err(e) => failures.push(format!("{}: {e:#}", handle.name)),
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("backfill sentinel drain failed: {}", failures.join("; "))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Migrate removal gate — a bucket holding the fleet's only copies never drops.
+// ---------------------------------------------------------------------------
+
+/// Page size for the migrate removal diff: one S3 LIST page, the same bound as
+/// the reconcile scan so no whole `packages/` tree is ever resident.
+const REMOVAL_DIFF_PAGE: usize = 1_000;
+
+/// One bucket's `packages/` keys streamed in ascending order, one bounded page
+/// resident at a time. Forward-only: [`Self::contains`] advances past every key
+/// strictly less than its target, so feeding it the removed bucket's own
+/// ascending artifact keys walks each survivor's listing exactly once overall —
+/// the removal diff is a linear multi-way merge (one LIST per page per bucket),
+/// never a HEAD per artifact.
+struct PagedKeys<'a> {
+    storage: &'a dyn Storage,
+    after: Option<String>,
+    buf: std::collections::VecDeque<String>,
+    done: bool,
+}
+
+impl<'a> PagedKeys<'a> {
+    fn new(storage: &'a dyn Storage) -> Self {
+        Self {
+            storage,
+            after: None,
+            buf: std::collections::VecDeque::new(),
+            done: false,
+        }
+    }
+
+    async fn fill(&mut self) -> Result<()> {
+        if self.buf.is_empty() && !self.done {
+            let page = self
+                .storage
+                .list_page(PACKAGES_PREFIX, self.after.as_deref(), REMOVAL_DIFF_PAGE)
+                .await?;
+            if page.len() < REMOVAL_DIFF_PAGE {
+                self.done = true;
+            }
+            self.after = page.last().map(|obj| obj.key.clone());
+            for obj in page {
+                self.buf.push_back(obj.key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Advance past every buffered key `< target`, then report whether `target`
+    /// is present on this bucket. Targets must arrive in ascending order.
+    async fn contains(&mut self, target: &str) -> Result<bool> {
+        loop {
+            self.fill().await?;
+            match self.buf.front() {
+                None => return Ok(false),
+                Some(front) if front.as_str() < target => {
+                    self.buf.pop_front();
+                }
+                Some(front) => return Ok(front.as_str() == target),
+            }
+        }
+    }
+}
+
+/// Up to `sample_cap` `packages/` artifact keys that live on `removed` but on no
+/// surviving bucket. An empty result means every artifact `removed` holds is safe
+/// elsewhere, so the bucket can be dropped without losing content. Short-circuits
+/// once the sample fills, so a badly-diverged bucket is rejected cheaply. A
+/// survivor that errors mid-diff propagates: the caller must treat an
+/// unverifiable survivor as a refusal, never a silent drop.
+pub async fn artifacts_unique_to_removed(
+    removed: &dyn Storage,
+    survivors: &[Arc<dyn Storage>],
+    sample_cap: usize,
+) -> Result<Vec<String>> {
+    let mut survivor_keys: Vec<PagedKeys> = survivors
+        .iter()
+        .map(|s| PagedKeys::new(s.as_ref()))
+        .collect();
+    let mut samples = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = removed
+            .list_page(PACKAGES_PREFIX, after.as_deref(), REMOVAL_DIFF_PAGE)
+            .await
+            .context("list the removed bucket's packages/ tree")?;
+        if page.is_empty() {
+            break;
+        }
+        let full = page.len() >= REMOVAL_DIFF_PAGE;
+        after = page.last().map(|obj| obj.key.clone());
+        for obj in &page {
+            let filename = obj.key.rsplit('/').next().unwrap_or("");
+            if !crate::sidecar::is_artifact(filename) {
+                continue;
+            }
+            let mut present = false;
+            for survivor in &mut survivor_keys {
+                if survivor
+                    .contains(&obj.key)
+                    .await
+                    .context("check a surviving bucket for the removed bucket's artifact")?
+                {
+                    present = true;
+                    break;
+                }
+            }
+            if !present {
+                samples.push(obj.key.clone());
+                if samples.len() >= sample_cap {
+                    return Ok(samples);
+                }
+            }
+        }
+        if !full {
+            break;
+        }
+    }
+    Ok(samples)
+}
+
 fn publish_marker_backlog(state: &AppState, total: &HashMap<usize, u64>) {
     for (idx, handle) in state.buckets.handles().iter().enumerate() {
         state
@@ -1961,9 +2169,18 @@ pub async fn reconcile(state: &AppState, pinned: &Pinned) -> Result<()> {
     // passes must be sequential. Concurrent peers can read the hub before a
     // later peer freezes it and leave the early peer live until tomorrow.
     let handles = state.buckets.handles();
+    // A pass is "clean" only if every peer was diffed and every diff succeeded.
+    // A skipped (ineligible) peer or a failed diff leaves a bucket unproven, so
+    // the backfill sentinels must not drain: a freshly-added bucket might still
+    // be missing that peer's unique content.
+    let mut clean = true;
     for _ in 0..2 {
         for (index, handle) in handles.iter().enumerate() {
-            if index == pinned.index || !bucket_eligible(state, index) {
+            if index == pinned.index {
+                continue;
+            }
+            if !bucket_eligible(state, index) {
+                clean = false;
                 continue;
             }
             let result = tokio::select! {
@@ -1978,7 +2195,17 @@ pub async fn reconcile(state: &AppState, pinned: &Pinned) -> Result<()> {
             };
             if let Err(e) = result {
                 error!(left=%handles[pinned.index].name, right=%handles[index].name, error=?e, "reconcile: pairwise diff failed");
+                clean = false;
             }
+        }
+    }
+    // A fully clean pass proves every reachable bucket now holds the whole
+    // corpus (two passes converge the pinned star both directions), so any
+    // freshly-added bucket has caught up: drop its backfill sentinel and let
+    // read affinity return region reads to it.
+    if clean {
+        if let Err(e) = drain_backfill_sentinels(state).await {
+            warn!(error=?e, "reconcile: fleet converged but backfill sentinel drain failed; retrying next pass");
         }
     }
     state
@@ -3632,5 +3859,140 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    fn art(pkg: &str, ver: &str) -> String {
+        format!("packages/{pkg}/{pkg}-{ver}-py3-none-any.whl")
+    }
+
+    #[tokio::test]
+    async fn removal_diff_flags_only_sole_copy_artifacts() {
+        let removed = Arc::new(InMemStorage::default());
+        let survivor = Arc::new(InMemStorage::default());
+        // Shared artifact lives on both buckets.
+        removed.insert(&art("pkga", "1.0"), b"a".to_vec());
+        survivor.insert(&art("pkga", "1.0"), b"a".to_vec());
+        // This one lives only on the bucket being removed.
+        removed.insert(&art("pkgb", "2.0"), b"b".to_vec());
+        // Non-artifact keys (sidecar, origin claim) must be ignored by the diff.
+        removed.insert("packages/pkgb/.origin", b"{}".to_vec());
+        removed.insert(&format!("{}.meta.json", art("pkgb", "2.0")), b"{}".to_vec());
+
+        let survivors: Vec<Arc<dyn Storage>> = vec![survivor.clone()];
+        let unique = artifacts_unique_to_removed(removed.as_ref(), &survivors, 5)
+            .await
+            .unwrap();
+        assert_eq!(unique, vec![art("pkgb", "2.0")]);
+
+        // Once the survivor also holds it, nothing is sole-copy.
+        survivor.insert(&art("pkgb", "2.0"), b"b".to_vec());
+        let unique = artifacts_unique_to_removed(removed.as_ref(), &survivors, 5)
+            .await
+            .unwrap();
+        assert!(unique.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removal_diff_accepts_presence_on_any_survivor() {
+        let removed = Arc::new(InMemStorage::default());
+        let s1 = Arc::new(InMemStorage::default());
+        let s2 = Arc::new(InMemStorage::default());
+        removed.insert(&art("pkga", "1.0"), b"a".to_vec());
+        removed.insert(&art("pkgb", "1.0"), b"b".to_vec());
+        // Each artifact survives on a different peer; neither is sole-copy.
+        s1.insert(&art("pkga", "1.0"), b"a".to_vec());
+        s2.insert(&art("pkgb", "1.0"), b"b".to_vec());
+
+        let survivors: Vec<Arc<dyn Storage>> = vec![s1, s2];
+        let unique = artifacts_unique_to_removed(removed.as_ref(), &survivors, 5)
+            .await
+            .unwrap();
+        assert!(unique.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removal_diff_short_circuits_at_the_sample_cap() {
+        let removed = Arc::new(InMemStorage::default());
+        let survivor = Arc::new(InMemStorage::default());
+        for i in 0..10 {
+            removed.insert(&art(&format!("pkg{i:02}"), "1.0"), vec![i as u8]);
+        }
+        let survivors: Vec<Arc<dyn Storage>> = vec![survivor];
+        let unique = artifacts_unique_to_removed(removed.as_ref(), &survivors, 3)
+            .await
+            .unwrap();
+        assert_eq!(unique.len(), 3, "capped, not the full ten");
+    }
+
+    #[tokio::test]
+    async fn removal_diff_propagates_survivor_error() {
+        let removed = Arc::new(InMemStorage::default());
+        removed.insert(&art("pkga", "1.0"), b"a".to_vec());
+        // A survivor whose listing always fails must surface as an error, so the
+        // caller refuses the drop rather than silently treating it as absent.
+        let survivor = Arc::new(FailingList);
+        let survivors: Vec<Arc<dyn Storage>> = vec![survivor];
+        assert!(artifacts_unique_to_removed(removed.as_ref(), &survivors, 5)
+            .await
+            .is_err());
+    }
+
+    struct FailingList;
+
+    #[async_trait::async_trait]
+    impl Storage for FailingList {
+        async fn head_exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn serve_artifact(
+            &self,
+            _key: &str,
+            _range: Option<&str>,
+        ) -> Result<axum::response::Response<axum::body::Body>> {
+            bail!("unused")
+        }
+        async fn presign_get(
+            &self,
+            _key: &str,
+            _expires: std::time::Duration,
+        ) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn put_bytes(
+            &self,
+            _key: &str,
+            _bytes: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn put_if_absent(
+            &self,
+            _key: &str,
+            _bytes: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn put_file_if_absent(
+            &self,
+            _key: &str,
+            _path: &std::path::Path,
+            _content_type: Option<&str>,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+        async fn get_bytes(&self, _key: &str) -> Result<Vec<u8>> {
+            bail!("unused")
+        }
+        async fn list_dir_entries(&self, _dir_prefix: &str) -> Result<Vec<FileEntry>> {
+            Ok(Vec::new())
+        }
+        async fn list_all(&self, _prefix: &str) -> Result<Vec<ObjectMeta>> {
+            bail!("injected list failure")
+        }
+        async fn delete_keys(&self, _keys: &[String]) -> Result<()> {
+            Ok(())
+        }
     }
 }

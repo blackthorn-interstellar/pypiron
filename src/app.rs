@@ -24,8 +24,8 @@ use tracing::{debug, info, warn};
 // its life as the crate root) keep resolving.
 use crate::{
     advisories, bucket_health, buckets, cache, config, counted_storage, counters, html, metrics,
-    names, node_region, observed_storage, origin, project_cache, proxy, render, storage, sync,
-    token, transparency, verify, worker,
+    names, node_region, observed_storage, origin, project_cache, proxy, render, replicate, storage,
+    sync, token, transparency, verify, worker,
 };
 
 use bucket_health::{HealthController, HealthPolicy};
@@ -1050,18 +1050,30 @@ async fn run_serve(
         {
             Some(region) => {
                 // A read pin is only worth seeding to a bucket that startup could
-                // reach; otherwise reads follow the write pin until the worker
-                // confirms the region bucket recovered and caught up.
+                // reach AND that holds the whole corpus. A freshly-added region
+                // bucket seeds a backfill sentinel under its peers'
+                // `_repl/<region>/`, and a lagging one carries real repair notes
+                // there; until they drain the region bucket is missing content,
+                // so reads follow the write pin and the worker returns them once
+                // it confirms the region caught up.
                 let write_index = buckets.pin().index;
                 let reachable = !topology.unreachable_indices.contains(&region);
-                let read_index = if reachable { region } else { write_index };
+                let converged =
+                    reachable && replicate::region_owed_no_notes(buckets.handles(), region).await;
+                let read_index = if converged { region } else { write_index };
                 health.configure_read_affinity(region, read_index)?;
-                if reachable {
+                if converged {
                     buckets.seed_read_pin(region);
                     info!(
                         region = %node.region,
                         bucket = %buckets.handles()[region].name,
                         "read affinity: serving reads from region bucket"
+                    );
+                } else if reachable {
+                    info!(
+                        region = %node.region,
+                        bucket = %buckets.handles()[region].name,
+                        "read affinity: region bucket still converging (backfill or repair notes outstanding); reads follow the write bucket until it catches up"
                     );
                 } else {
                     warn!(

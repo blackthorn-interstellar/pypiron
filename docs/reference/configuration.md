@@ -471,10 +471,20 @@ nested commands.
 
 `buckets migrate` requires a multi-bucket target and **refuses while any bucket
 still has pending cross-bucket repairs**, so shrinking or reordering the list
-cannot strand a file's only copy on a bucket you are about to remove. If it
-refuses, let the fleet drain (or bring the lagging bucket back) and retry. To
-shrink to one bucket, stop the fleet and restart it with that bucket; topology
-stamps are dormant in single-bucket mode.
+cannot strand a file's only copy on a bucket you are about to remove. It also
+**refuses to drop a bucket that holds the fleet's only copy of a file** — it
+names examples and stops. Add the replacement and let replication converge (so
+that content lives on a surviving bucket), then remove the old one. To drop it
+anyway and *permanently discard* that content, pass `--force`
+(`PYPIRON_MIGRATE_FORCE=true`). If it refuses for pending repairs, let the fleet
+drain (or bring the lagging bucket back) and retry. Adding a bucket seeds a
+one-time backfill marker so the new bucket serves no region reads until the
+corpus has copied onto it. To shrink to one bucket, stop the fleet and restart it
+with that bucket; topology stamps are dormant in single-bucket mode.
+
+| Flag | Env | Default | Use |
+| --- | --- | --- | --- |
+| `--force` | `PYPIRON_MIGRATE_FORCE` | `false` | On `buckets migrate`, drop a bucket even when it holds the fleet's only copy of some content. **Permanent data loss** — back the corpus up onto a surviving bucket first. |
 
 Stop writes before `origin release`. It refuses a package with any package truth
 except `.origin`, or with pending write/replication work, and conditionally

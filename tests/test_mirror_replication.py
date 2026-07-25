@@ -98,6 +98,27 @@ def _seed_mirror_cache_record(minio, bucket, pkg, filename, body: str) -> None:
     minio_put_key_in(minio, bucket, key, body)
 
 
+def _seed_mirror_snapshot_record(minio, bucket, pkg, filename, body: str) -> None:
+    """Seed a `sync --to` snapshot record — a mirror sidecar carrying
+    ``replicate=true`` — directly into one bucket, the way an existing
+    single-bucket mirror corpus already holds it. Unlike a proxy-cache record it
+    MUST ride the replicator, so a bucket added later backfills it."""
+    key = f"packages/{pkg}/{filename}"
+    sidecar = {
+        "sha256": hashlib.sha256(body.encode()).hexdigest(),
+        "size": len(body.encode()),
+        "version": "1.0",
+        "upload-time": "2021-06-01T00:00:00Z",
+        "yanked": False,
+        "origin": "mirror",
+        "replicate": True,
+    }
+    claim = {"origin": "mirror", "nonce": hashlib.sha256(pkg.encode()).hexdigest()[:32]}
+    minio_put_key_in(minio, bucket, f"packages/{pkg}/.origin", json.dumps(claim))
+    minio_put_key_in(minio, bucket, f"{key}.meta.json", json.dumps(sidecar))
+    minio_put_key_in(minio, bucket, key, body)
+
+
 def _seed_private_record(minio, bucket, pkg, filename, body: str) -> None:
     key = f"packages/{pkg}/{filename}"
     sidecar = {
@@ -228,6 +249,67 @@ def test_mirror_snapshot_yank_converges_across_buckets(minio_two, s3_server_mult
         sidecar = json.loads(minio_get_key_in(minio, bucket, f"{akey}.meta.json"))
         assert sidecar["yank-epoch"] == 1, bucket
         assert sidecar["origin"] == "mirror", bucket
+
+
+def test_existing_mirror_corpus_backfills_onto_an_added_bucket(
+    minio_two, s3_server_multi, tmp_path
+):
+    """single -> multi migration of an existing mirror corpus. Two snapshot
+    packages already live on bucket a (a single-bucket mirror's corpus); one of
+    them is also pre-seeded onto bucket b out-of-band (the `aws s3 sync` seed of
+    a huge corpus). Bringing up the two-bucket fleet must:
+
+      * backfill the un-seeded package onto b (reconcile converges it), and
+      * leave the pre-seeded package intact (reconcile degrades to a verify pass,
+        never a duplicate or a corruption),
+
+    then a fresh `sync --to` upload of a new package stamps ``replicate=true`` and
+    fans out to both buckets — the re-sync path the migration guide points at.
+    """
+    server = s3_server_multi
+    minio = minio_two
+    a, b = minio["buckets"]
+
+    # The existing single-bucket corpus: two snapshot packages on a.
+    backfill = ("corpusbackfill", "corpusbackfill-1.0-py3-none-any.whl", "backfill bytes")
+    preseeded = ("corpuspreseed", "corpuspreseed-1.0-py3-none-any.whl", "preseed bytes")
+    for pkg, filename, bytes_ in (backfill, preseeded):
+        _seed_mirror_snapshot_record(minio, a, pkg, filename, bytes_)
+    # The huge-corpus seed: b already holds one of the two packages.
+    _seed_mirror_snapshot_record(minio, b, *preseeded)
+
+    bf_key = f"packages/{backfill[0]}/{backfill[1]}"
+    ps_key = f"packages/{preseeded[0]}/{preseeded[1]}"
+
+    # reconcile converges the un-seeded package onto b, byte-for-byte.
+    _eventually(
+        lambda: minio_key_exists_in(minio, b, bf_key),
+        timeout=30,
+        what="existing corpus backfilled onto the added bucket",
+    )
+    assert minio_object_sha256(minio, b, bf_key) == minio_object_sha256(minio, a, bf_key)
+    assert json.loads(minio_get_key_in(minio, b, f"{bf_key}.meta.json"))["replicate"] is True
+
+    # The pre-seeded package is untouched and still matches a.
+    assert minio_object_sha256(minio, b, ps_key) == minio_object_sha256(minio, a, ps_key)
+
+    # Re-run `sync --to`: a fresh mirror upload on the fleet stamps replicate=true
+    # and fans out to both buckets.
+    fresh = make_wheel("corpusfresh", "2.0", tmp_path)
+    _mirror_upload(server, fresh)
+    wait_for_file_in_index(server["simple"], "corpusfresh", fresh.name)
+    fresh_key = f"packages/corpusfresh/{fresh.name}"
+    fresh_sha = hashlib.sha256(fresh.read_bytes()).hexdigest()
+    for bucket in (a, b):
+        _eventually(
+            lambda bucket=bucket: minio_key_exists_in(minio, bucket, fresh_key),
+            what=f"fresh re-sync upload fanned out to {bucket}",
+        )
+        assert minio_object_sha256(minio, bucket, fresh_key) == fresh_sha, bucket
+        assert (
+            json.loads(minio_get_key_in(minio, bucket, f"{fresh_key}.meta.json"))["replicate"]
+            is True
+        ), bucket
 
 
 def test_divergent_snapshot_bytes_freeze_both_buckets(s3_servers_multi, tmp_path):

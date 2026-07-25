@@ -156,10 +156,23 @@ bucket, and a node refuses a different one. To add, remove, replace, or reorder:
 
 3. Start every node with that same list.
 
-Migration refuses while any bucket has pending repairs, and a bucket you remove
-must be reachable and drained — a stranded repair there could be a file's only
-copy. Bring it back, let it drain, retry. Shrinking to a single bucket needs no
-migration: stop the fleet and restart with that one bucket.
+**Adding a bucket backfills itself before it serves.** A fresh bucket starts
+empty, so its region's reads keep coming from the write bucket until the corpus
+has copied over — you never serve a half-filled index. Once every file has
+replicated, that region's reads move to the local bucket automatically. Seed a
+very large corpus out of band first (`aws s3 sync`, `rclone`) and the copy step
+becomes a quick verify.
+
+**Removing a bucket refuses to lose data.** Migration will not drop a bucket that
+holds the fleet's only copy of a file — it names examples and stops. Add the
+replacement, let replication converge (so the content lives elsewhere), then
+remove the old bucket. To drop it anyway and *discard that content*, pass
+`--force`.
+
+Migration also refuses while any bucket has pending repairs, and a bucket you
+remove must be reachable — one it cannot inspect it will not drop. Bring it back,
+let it drain, retry. Shrinking to a single bucket needs no migration: stop the
+fleet and restart with that one bucket.
 
 Never run two nodes with different lists.
 

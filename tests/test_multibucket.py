@@ -1767,6 +1767,131 @@ def test_migrate_refuses_to_drop_a_removed_bucket_holding_notes_then_succeeds(
         assert stamp["buckets"] == [f"s3://{a}", f"s3://{b}"]
 
 
+def test_migrate_refuses_to_drop_a_bucket_holding_unique_content_unless_forced(
+    minio_three, pypiron_bin
+):
+    """The removal gate blind spot: `_repl/` notes prove nothing about content
+    the fleet never fanned out (an out-of-band seed, an unconverged backfill).
+    Migrate must diff the departing bucket's `packages/` against the survivors
+    and refuse to drop the sole copy of any artifact — `--force` accepts the
+    loss."""
+    minio = minio_three
+    a, b, c = minio["buckets"]
+    env = _s3_env(minio, "127.0.0.1:0")
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b, c)
+    rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
+    assert rc == 0, f"initial migration failed:\n{out}\n{err}"
+
+    # An artifact only bucket c holds — its sole copy in the fleet.
+    unique_key = "packages/onlyonc/onlyonc-1.0-py3-none-any.whl"
+    minio_put_key_in(minio, c, unique_key, "sole copy bytes")
+    # A second artifact that IS replicated onto a survivor: it must not be named.
+    shared_key = "packages/shared/shared-1.0-py3-none-any.whl"
+    minio_put_key_in(minio, c, shared_key, "shared bytes")
+    minio_put_key_in(minio, b, shared_key, "shared bytes")
+
+    shrink_env = _s3_env(minio, "127.0.0.1:0")
+    shrink_env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b)
+    rc, out, err = run_returncode(
+        [str(pypiron_bin), "buckets", "migrate"], env=shrink_env, timeout=60
+    )
+    assert rc != 0, f"migrate dropped a bucket holding the only copy:\n{out}\n{err}"
+    blob = out + err
+    assert c in blob and "only copy" in blob, f"unexpected error:\n{blob}"
+    assert unique_key in blob and "--force" in blob, f"error must name the artifact:\n{blob}"
+    assert shared_key not in blob, f"a replicated artifact must not be named:\n{blob}"
+    # Refused: the three-bucket stamp still stands.
+    for bucket in (a, b):
+        stamp = json.loads(minio_get_key_in(minio, bucket, "_topology/stamp.json"))
+        assert stamp["buckets"] == [f"s3://{x}" for x in (a, b, c)]
+
+    # --force accepts the data loss and drops c.
+    rc, out, err = run_returncode(
+        [str(pypiron_bin), "buckets", "migrate", "--force"], env=shrink_env, timeout=60
+    )
+    assert rc == 0, f"--force did not override the content gate:\n{out}\n{err}"
+    for bucket in (a, b):
+        stamp = json.loads(minio_get_key_in(minio, bucket, "_topology/stamp.json"))
+        assert stamp["buckets"] == [f"s3://{a}", f"s3://{b}"]
+
+
+def test_migrate_allows_dropping_a_fully_replicated_bucket(minio_three, pypiron_bin):
+    """When every artifact the departing bucket holds also lives on a surviving
+    bucket, the content diff is clean and the shrink needs no `--force`."""
+    minio = minio_three
+    a, b, c = minio["buckets"]
+    env = _s3_env(minio, "127.0.0.1:0")
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b, c)
+    rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
+    assert rc == 0, f"initial migration failed:\n{out}\n{err}"
+
+    # Everything c holds is also on a survivor.
+    key = "packages/replicated/replicated-1.0-py3-none-any.whl"
+    minio_put_key_in(minio, c, key, "replicated bytes")
+    minio_put_key_in(minio, a, key, "replicated bytes")
+
+    shrink_env = _s3_env(minio, "127.0.0.1:0")
+    shrink_env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b)
+    rc, out, err = run_returncode(
+        [str(pypiron_bin), "buckets", "migrate"], env=shrink_env, timeout=60
+    )
+    assert rc == 0, f"migrate refused a safe shrink:\n{out}\n{err}"
+    for bucket in (a, b):
+        stamp = json.loads(minio_get_key_in(minio, bucket, "_topology/stamp.json"))
+        assert stamp["buckets"] == [f"s3://{a}", f"s3://{b}"]
+
+
+def test_migrate_seeds_backfill_sentinel_and_reconcile_drains_it(
+    minio_three, pypiron_bin, tmp_path_factory
+):
+    """Adding a bucket seeds an O(1) `_repl/<dest>/_backfill!<nonce>` sentinel on
+    every existing peer, so the fresh bucket serves no region reads until the
+    corpus converges. A clean reconcile pass — every bucket proven caught up —
+    drains it."""
+    minio = minio_three
+    a, b, c = minio["buckets"]
+    env = _s3_env(minio, "127.0.0.1:0")
+
+    # Establish a two-bucket fleet [a, b].
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b)
+    rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
+    assert rc == 0, f"initial migration failed:\n{out}\n{err}"
+
+    # Add c (new index 2): the sentinel lands on both peers, none on c itself.
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b, c)
+    rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
+    assert rc == 0, f"adding a bucket failed:\n{out}\n{err}"
+
+    def _sentinels(bucket) -> list[str]:
+        return [k for k in minio_list_keys_in(minio, bucket) if k.startswith("_repl/2/_backfill!")]
+
+    for peer in (a, b):
+        assert _sentinels(peer), f"no backfill sentinel seeded on peer {peer}"
+    assert not [k for k in minio_list_keys_in(minio, c) if k.startswith("_repl/")], (
+        "the added bucket owes itself no note"
+    )
+
+    # Bring up the three-bucket fleet; the first clean reconcile drains it.
+    server_gen = _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        extra_env={
+            "PYPIRON_RECONCILE_INTERVAL_SECS": "2",
+            "PYPIRON_AUDIT_ON_BOOT": "false",
+        },
+    )
+    next(server_gen)
+    try:
+        _eventually(
+            lambda: not _sentinels(a) and not _sentinels(b),
+            timeout=30,
+            what="reconcile drains the backfill sentinel once the fleet converges",
+        )
+    finally:
+        server_gen.close()
+
+
 def test_fresh_startup_repairs_member_that_missed_topology_migration(
     minio_three_proxy, pypiron_bin, tmp_path_factory
 ):

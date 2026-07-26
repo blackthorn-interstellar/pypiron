@@ -62,6 +62,14 @@ stateright = "0.31"
 # Feature unification scopes this to test/example builds only.
 tokio = { version = "1", features = ["test-util"] }
 
+# The simulator's own gate logic — which oracles executed, on how many seeds,
+# and whether that is enough to call the run a pass — is pure and belongs under
+# `cargo test`. Examples default to `test = false`, so without this the reach
+# meter's unit tests would compile and never run.
+[[example]]
+name = "vopr"
+test = true
+
 [target.'cfg(not(any(target_arch = "s390x", target_arch = "powerpc64")))'.dependencies]
 mimalloc = "0.1.52"
 

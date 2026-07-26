@@ -557,11 +557,12 @@ either. Both times, establishing the truth cost a human hand-running six figures
 of seeds across five lanes. It is now a number the binary prints on every run:
 
 ```
-vopr: oracle reach over 14690 seeds — executions on NON-TRIVIAL input (a zero means that oracle verified nothing):
-  DURABILITY                               76257  acked upload compared against a bucket's bytes
-  VISIBILITY                               76257  stored artifact checked against that bucket's view
+vopr: oracle reach over 13122 seeds — executions on NON-TRIVIAL input, and the seeds that got any (a zero, or a thin share, means that oracle verified nothing on the rest):
+  DURABILITY                              134530  on   13069/13122 seeds  acked upload compared against a bucket's bytes
+  VISIBILITY                              134530  on   13069/13122 seeds  stored artifact checked against that bucket's view
   ...
-  classifier/pkg TEST 3 race                   0  older view write by another op tested for being fresher  [zero, expected: harness-unreachable: tick_lock serializes rebuilds (dev/TESTING.md)]
+  DETERMINISM                               1313  on     1313/1313 rechecked  seed re-executed, trace + final world compared
+  classifier/pkg TEST 3 race                   0  on       0/13122 seeds  older view write by another op tested for being fresher  [zero, expected: harness-unreachable: tick_lock serializes rebuilds (dev/TESTING.md)]
   quiesce headroom: worst seed used 3/12 heal rounds (9 spare) and 2/20 drain passes in a round (18 spare)
 ```
 
@@ -624,12 +625,44 @@ sits. `tests/simulation_matrix.rs` fails if a row drops below it; the rotating
 row is exempt because its small seed-drawn corpora are deliberate coverage of
 the dense, high-contention end.
 
-`--require-reach` makes a zero a **failing run** (exit 4), so CI can assert that
-every oracle ran rather than merely that none complained. It is off by default —
-a small sample legitimately misses oracles, and a gate that cries wolf gets
-ignored — and wired only into the nightly matrix, where each profile draws
-50,000 seeds. The gate itself is falsifiable: `--ops 0 --require-reach` reds with
-all nine invariants listed.
+**So the meter counts seeds, not just executions.** Widening the corpus fixed
+the rows; it did nothing about the gate that let them ship. `--require-reach`
+originally failed on an exact zero *over the whole run*, which is the same
+unfalsifiable pass one level up: a run where 4 seeds in 5 verified nothing and
+the fifth verified a lot reports five figures and passes. Every slot now carries
+a second number — the seeds on which it executed at least once — printed as
+`on 13069/13122 seeds`, and `--require-reach` fails a slot that ran on under
+`REACH_FLOOR_PERCENT` (**25%**) of them. Run the pre-fix nightly corpus back
+through it and it reds where it used to pass:
+
+```
+DURABILITY   4010  on 1754/8698 seeds  [STARVED — executed on 20% of seeds, floor 25%: widen the workload]
+```
+
+25% is a floor, not a target. Measured over the five nightly rows, every
+non-excused oracle reaches 97–100% of seeds on the four fixed rows; the thinnest
+reading anywhere is ACK_TOTALITY at **64%** on the rotating row, where a third of
+the seed-drawn topologies are single-bucket and it correctly has nothing to
+weigh. A floor near those numbers would red on sampling noise. Holding a row *at*
+its measured corpus is `tests/simulation_matrix.rs`'s job; the floor catches the
+collapse. Two rules the zero gate had are unchanged, and both are pinned by unit
+test: a slot with a standing excuse (`EXPECTED_ZERO`, or the single-bucket
+topology excuse) is silent on thin reach exactly as it is on zero, and no floor
+fires under `--break`, whose workload is a deliberate defect rather than anyone's
+coverage regression. DETERMINISM is scored out of the seeds `--recheck-every`
+actually re-executed (`on 1313/1313 rechecked`) — out of every seed it would read
+as 5% starvation on a healthy run.
+
+`--require-reach` makes both readings a **failing run** (exit 4), so CI can
+assert that every oracle ran rather than merely that none complained. It is off
+by default — a small sample legitimately misses oracles, and a gate that cries
+wolf gets ignored — and wired only into the nightly matrix, where each profile
+draws 50,000 seeds. Expressing the floor as a share rather than a count is what
+keeps it meaningful at 50,000 seeds and harmless at six. The gate itself is
+falsifiable both ways: `--ops 0 --require-reach` reds with the eight invariants a
+workload-free run starves (DETERMINISM survives — an empty run still re-executes
+identically), and `--packages 2 --files 2 --ops 160 --require-reach` reds with
+DURABILITY, VISIBILITY and CONSERVATION `[STARVED]` at 20%.
 
 Zeros that are a known property rather than a hole live in `EXPECTED_ZERO`, and
 each is a claim someone has to defend here:

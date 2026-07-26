@@ -66,9 +66,10 @@
 //!
 //! Every oracle above is also *metered*: the run prints how many times each one
 //! actually evaluated something — and each arm of the repair classifier
-//! separately — because an oracle reading zero over a whole soak is a defect
-//! report, not a pass (see `Reach`). `--require-reach` turns that into a failing
-//! run. The same line reports the worst rounds-to-quiesce any seed needed
+//! separately — plus how many seeds got any of it, because an oracle reading
+//! zero over a whole soak, or reading five figures on a fifth of the seeds, is a
+//! defect report, not a pass (see `Reach`). `--require-reach` turns both into a
+//! failing run. The same line reports the worst rounds-to-quiesce any seed needed
 //! against the heal budget, so an over-generous budget cannot quietly turn a
 //! livelock into a green LIVENESS.
 //!
@@ -683,8 +684,31 @@ const EXPECTED_ZERO: [(usize, &str); 10] = [
     ),
 ];
 
+/// The share of seeds an oracle must execute on. A run-total hit count cannot
+/// tell "checked a lot, on every seed" from "checked a lot on a fifth of the
+/// seeds and nothing on the rest" — and the second is the same unfalsifiable
+/// pass the meter exists to close, one level down. It is not hypothetical: the
+/// nightly's two crash-only rows ran a 2x2 corpus their own deletes tombstoned,
+/// so DURABILITY/VISIBILITY/CONSERVATION iterated an empty ledger on 4 seeds in
+/// 5 while the run printed five figures and `--require-reach` passed (75fd6b2,
+/// dev/TESTING.md). The floor sits between what those rows read (20%) and what
+/// every green profile reads, so it fails that run and no green one.
+///
+/// 25% is the floor, not the target: measured over the five nightly rows, every
+/// non-excused oracle reaches 97-100% of seeds on the four fixed rows, and the
+/// thinnest reading anywhere is ACK_TOTALITY at 64% on the rotating row — where
+/// a third of the seed-drawn topologies are single-bucket and the oracle
+/// correctly has nothing to weigh. A floor near those numbers would red on
+/// sampling noise; this one catches the collapse. Holding a row *at* its
+/// measured corpus is `tests/simulation_matrix.rs`'s job, not the floor's.
+const REACH_FLOOR_PERCENT: u64 = 25;
+
 struct Reach {
     slots: [AtomicU64; REACH_SLOTS],
+    /// Seeds on which the slot executed at least once, and its total as of the
+    /// last seed boundary — the pair that turns hits into a per-seed reach.
+    seed_hits: [AtomicU64; REACH_SLOTS],
+    seed_mark: [AtomicU64; REACH_SLOTS],
     /// Worst heal rounds, and worst drain passes inside one round, any seed used.
     peak_rounds: AtomicU64,
     peak_drains: AtomicU64,
@@ -692,16 +716,34 @@ struct Reach {
     multi_bucket: AtomicBool,
 }
 
-static REACH: Reach = Reach {
-    slots: [const { AtomicU64::new(0) }; REACH_SLOTS],
-    peak_rounds: AtomicU64::new(0),
-    peak_drains: AtomicU64::new(0),
-    multi_bucket: AtomicBool::new(false),
-};
+static REACH: Reach = Reach::new();
 
 impl Reach {
+    const fn new() -> Self {
+        Reach {
+            slots: [const { AtomicU64::new(0) }; REACH_SLOTS],
+            seed_hits: [const { AtomicU64::new(0) }; REACH_SLOTS],
+            seed_mark: [const { AtomicU64::new(0) }; REACH_SLOTS],
+            peak_rounds: AtomicU64::new(0),
+            peak_drains: AtomicU64::new(0),
+            multi_bucket: AtomicBool::new(false),
+        }
+    }
     fn hit(&self, slot: R) {
         self.slots[slot as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    /// Close a seed: every slot whose total moved since the last boundary
+    /// executed on it. Called once per seed by the driver, after the optional
+    /// determinism rerun, so a rerun's hits belong to the seed that caused
+    /// them. Same non-perturbing rule as `hit`: relaxed loads over data the
+    /// run already computed, outside any simulated node.
+    fn end_of_seed(&self) {
+        for ((total, mark), seeds) in self.slots.iter().zip(&self.seed_mark).zip(&self.seed_hits) {
+            let now = total.load(Ordering::Relaxed);
+            if now > mark.swap(now, Ordering::Relaxed) {
+                seeds.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
     fn peak(cell: &AtomicU64, observed: u64) {
         cell.fetch_max(observed, Ordering::Relaxed);
@@ -721,30 +763,82 @@ fn expected_zero(slot: usize, multi_bucket: bool) -> Option<&'static str> {
         .map(|(_, why)| *why)
 }
 
-/// Print the table and return the oracles that never executed and had no
-/// standing excuse — what `--require-reach` fails on.
-fn report_reach(explored: u64, brk: Break) -> Vec<&'static str> {
+/// One slot's verdict: the note to print beside it, and whether
+/// `--require-reach` fails on it. Pure, because the gate that proves the
+/// oracles ran should not itself be an unexercised claim.
+///
+/// `seeds_reached / seeds` is the reading a run total cannot give. Both zeros
+/// and thin reach are the same defect — an oracle that verified nothing on a
+/// seed — so both fail, and an excused slot is silent on both counts: the
+/// standing excuses (`EXPECTED_ZERO`, single-bucket topology) say the oracle
+/// has no subject here, and a `--break` run is a deliberate defect whose
+/// altered workload is nobody's coverage regression.
+fn reach_verdict(
+    hits: u64,
+    seeds_reached: u64,
+    seeds: u64,
+    excuse: Option<&'static str>,
+    broken: bool,
+) -> (String, bool) {
+    match (hits, excuse) {
+        (0, Some(why)) => (format!("  [zero, expected: {why}]"), false),
+        (0, None) => ("  [ZERO — NEVER EXECUTED]".to_string(), true),
+        // A break exists to reach an oracle, so say so rather than demand
+        // the list be edited on the strength of a deliberate defect.
+        (_, Some(_)) if broken => ("  [reached under --break]".to_string(), false),
+        (_, Some(_)) => (
+            "  [now reached — drop it from EXPECTED_ZERO]".to_string(),
+            false,
+        ),
+        (_, None) => {
+            let percent = seeds_reached * 100 / seeds.max(1);
+            if percent < REACH_FLOOR_PERCENT && !broken {
+                (
+                    format!(
+                        "  [STARVED — executed on {percent}% of seeds, floor \
+                         {REACH_FLOOR_PERCENT}%: widen the workload]"
+                    ),
+                    true,
+                )
+            } else {
+                (String::new(), false)
+            }
+        }
+    }
+}
+
+/// Print the table and return the oracles that never executed, or executed on
+/// too few seeds, with no standing excuse — what `--require-reach` fails on.
+fn report_reach(explored: u64, rechecked: u64, brk: Break) -> Vec<&'static str> {
     let multi = REACH.multi_bucket.load(Ordering::Relaxed);
     let mut unreached = Vec::new();
     println!(
-        "vopr: oracle reach over {explored} seeds — executions on NON-TRIVIAL input \
-         (a zero means that oracle verified nothing):"
+        "vopr: oracle reach over {explored} seeds — executions on NON-TRIVIAL input, and the \
+         seeds that got any (a zero, or a thin share, means that oracle verified nothing on the \
+         rest):"
     );
     for (slot, (label, unit)) in REACH_METER.iter().enumerate() {
         let hits = REACH.slots[slot].load(Ordering::Relaxed);
-        let note = match (hits, expected_zero(slot, multi)) {
-            (0, Some(why)) => format!("  [zero, expected: {why}]"),
-            (0, None) => {
-                unreached.push(*label);
-                "  [ZERO — NEVER EXECUTED]".to_string()
-            }
-            // A break exists to reach an oracle, so say so rather than demand
-            // the list be edited on the strength of a deliberate defect.
-            (_, Some(_)) if brk != Break::None => "  [reached under --break]".to_string(),
-            (_, Some(_)) => "  [now reached — drop it from EXPECTED_ZERO]".to_string(),
-            (_, None) => String::new(),
+        let seeds_reached = REACH.seed_hits[slot].load(Ordering::Relaxed);
+        // DETERMINISM is sampled by `--recheck-every` on purpose, so its
+        // denominator is the seeds actually re-executed; scoring it out of
+        // every seed would read as 5% starvation on a healthy run.
+        let (seeds, denom) = if slot == R::Determinism as usize {
+            (rechecked, "rechecked")
+        } else {
+            (explored, "seeds")
         };
-        println!("  {label:<35} {hits:>10}  {unit}{note}");
+        let (note, failed) = reach_verdict(
+            hits,
+            seeds_reached,
+            seeds,
+            expected_zero(slot, multi),
+            brk != Break::None,
+        );
+        if failed {
+            unreached.push(*label);
+        }
+        println!("  {label:<35} {hits:>10}  on {seeds_reached:>7}/{seeds} {denom}  {unit}{note}");
     }
     let rounds = REACH.peak_rounds.load(Ordering::Relaxed);
     let drains = REACH.peak_drains.load(Ordering::Relaxed);
@@ -2996,10 +3090,11 @@ struct Args {
     /// Deliberate defect to inject (`--break`), for mutation-testing the
     /// oracles. `Break::None` in every ordinary run.
     brk: Break,
-    /// Fail the run when an oracle recorded zero executions over the sample
-    /// (see `EXPECTED_ZERO`). Off by default — a small sample legitimately
-    /// misses oracles, and a gate that cries wolf gets ignored. Wire it only
-    /// where the sample is big enough to mean something.
+    /// Fail the run when an oracle recorded zero executions over the sample, or
+    /// executed on under `REACH_FLOOR_PERCENT` of its seeds (see
+    /// `EXPECTED_ZERO`). Off by default — a small sample legitimately misses
+    /// oracles, and a gate that cries wolf gets ignored. Wire it only where the
+    /// sample is big enough to mean something.
     require_reach: bool,
 }
 
@@ -3218,6 +3313,7 @@ fn main() {
     let mut failed_seeds: Vec<u64> = Vec::new();
     let mut determinism_violations: Vec<u64> = Vec::new();
     let mut explored: u64 = 0;
+    let mut rechecked: u64 = 0;
     let mut last_report = std::time::Instant::now();
     loop {
         if let Some(budget) = args.max_secs {
@@ -3246,6 +3342,7 @@ fn main() {
             *total += add;
         }
         if args.recheck_every > 0 && seed.is_multiple_of(args.recheck_every) {
+            rechecked += 1;
             let again = run_once(seed, &profile, true);
             if outcome.trace_events > 0 {
                 REACH.hit(R::Determinism); // an empty trace compares nothing
@@ -3302,6 +3399,9 @@ fn main() {
                 outcome.violations = again.violations;
             }
         }
+        // Every hit this seed could produce is in, rerun included: close it so
+        // the meter knows how many seeds each oracle actually ran on.
+        REACH.end_of_seed();
         if !outcome.violations.is_empty() {
             eprintln!(
                 "vopr: seed {seed} FAILED ({} violations):",
@@ -3358,7 +3458,7 @@ fn main() {
             )
         }
     );
-    let unreached = report_reach(explored, args.brk);
+    let unreached = report_reach(explored, rechecked, args.brk);
     if !determinism_violations.is_empty() {
         std::process::exit(3);
     }
@@ -3367,12 +3467,103 @@ fn main() {
     }
     if args.require_reach && !unreached.is_empty() {
         eprintln!(
-            "vopr: --require-reach FAILED — {} oracle(s) never executed over {explored} seeds: \
-             {unreached:?}. An oracle that verified nothing is a defect report, not a pass: \
-             either the workload cannot reach it (widen it), or it is unreachable and belongs \
-             in EXPECTED_ZERO with a reason.",
+            "vopr: --require-reach FAILED — {} oracle(s) never executed over {explored} seeds, \
+             or executed on under {REACH_FLOOR_PERCENT}% of them: {unreached:?}. An oracle that \
+             verified nothing is a defect report, not a pass — and a run total hides that just \
+             as well as a zero does: either the workload cannot reach it (widen it), or it is \
+             unreachable and belongs in EXPECTED_ZERO with a reason.",
             unreached.len()
         );
         std::process::exit(4);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The gate's own logic. `--break` proves an oracle can go red and the reach
+// meter proves it ran; these prove the meter's verdict is not itself a rubber
+// stamp — the failure this file keeps re-learning is a green gate nobody has
+// watched go red.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One seed's executions, then the boundary the driver closes it with.
+    fn seed(reach: &Reach, executions: &[R]) {
+        for slot in executions {
+            reach.hit(*slot);
+        }
+        reach.end_of_seed();
+    }
+
+    fn seeds_reached(reach: &Reach, slot: R) -> u64 {
+        reach.seed_hits[slot as usize].load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn the_meter_counts_seeds_that_executed_not_executions() {
+        let reach = Reach::new();
+        seed(&reach, &[R::Durability, R::Durability, R::Durability]);
+        seed(&reach, &[R::Durability]);
+        seed(&reach, &[R::Tombstone]); // durability verified nothing here
+        assert_eq!(
+            reach.slots[R::Durability as usize].load(Ordering::Relaxed),
+            4,
+            "the run total must keep counting every execution"
+        );
+        assert_eq!(
+            seeds_reached(&reach, R::Durability),
+            2,
+            "four executions on two seeds is two seeds, however they clumped"
+        );
+        assert_eq!(seeds_reached(&reach, R::Tombstone), 1);
+        assert_eq!(seeds_reached(&reach, R::Liveness), 0);
+    }
+
+    #[test]
+    fn a_run_total_no_longer_covers_for_seeds_that_verified_nothing() {
+        // The nightly multi-bucket-crash-only row as it shipped: 4,010
+        // DURABILITY executions over 8,698 seeds reads healthy, and 4 seeds in
+        // 5 evaluated an empty ledger (75fd6b2).
+        let (note, failed) = reach_verdict(4010, 1754, 8698, None, false);
+        assert!(failed, "20% per-seed reach passed the gate: {note:?}");
+        assert!(note.contains("STARVED"), "{note}");
+        // Same row with the corpus its oracles need: silent.
+        let (note, failed) = reach_verdict(134_530, 13_069, 13_122, None, false);
+        assert!(!failed && note.is_empty(), "{note}");
+    }
+
+    #[test]
+    fn the_floor_is_a_share_of_seeds_not_a_count() {
+        // Exactly at the floor is reached, one seed short of it is not.
+        assert!(!reach_verdict(100, 25, 100, None, false).1);
+        assert!(reach_verdict(100, 24, 100, None, false).1);
+        // The kill-proof step runs six seeds (ci.yml); an absolute floor would
+        // red every small sample that is doing nothing wrong.
+        assert!(!reach_verdict(2, 2, 6, None, false).1);
+    }
+
+    #[test]
+    fn the_floor_is_silent_wherever_a_standing_excuse_already_is() {
+        let excuse = expected_zero(R::Convergence as usize, false);
+        assert!(
+            excuse.is_some(),
+            "single-bucket topology excuse went missing"
+        );
+        assert!(!reach_verdict(0, 0, 1000, excuse, false).1);
+        assert!(
+            !reach_verdict(9, 3, 1000, excuse, false).1,
+            "an excused oracle must not be gated on how often it runs"
+        );
+        assert!(
+            !reach_verdict(9, 3, 1000, None, true).1,
+            "a deliberate defect's workload is nobody's coverage regression"
+        );
+    }
+
+    #[test]
+    fn a_zero_still_fails_on_its_own() {
+        let (note, failed) = reach_verdict(0, 0, 50_000, None, false);
+        assert!(failed && note.contains("NEVER EXECUTED"), "{note}");
     }
 }

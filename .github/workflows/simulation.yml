@@ -39,11 +39,21 @@ jobs:
           # safety net there, and its repair count is published below. The
           # crash-only profiles permit ZERO audit repairs: markers alone must
           # converge every crash schedule.
-          - { name: single-bucket, nodes: 2, buckets: 1, ops: 160, extra: '' }
-          - { name: multi-bucket, nodes: 3, buckets: 2, ops: 160, extra: '' }
-          - { name: single-bucket-crash-only, nodes: 3, buckets: 1, ops: 160, extra: '--fail-percent 0' }
-          - { name: multi-bucket-crash-only, nodes: 3, buckets: 2, ops: 160, extra: '--fail-percent 0' }
-          # The four above pin a topology AND the fixed workload (2 packages x 2
+          #
+          # `--packages 6 --files 2` is a durability floor, not a taste: the
+          # three oracles that check acked bytes survive (DURABILITY,
+          # VISIBILITY, CONSERVATION) skip any filename an authorized delete,
+          # tombstone or conflict freeze removed, so their whole universe is
+          # `packages x files` names. At 160 ops with a 10% delete weight the
+          # harness default of 2x2 is fully tombstoned by quiesce on four seeds
+          # in five — measured per seed, only 20% of this row's seeds evaluated
+          # durability AT ALL, while the run still printed a five-figure hit
+          # count. 12 names puts it at ~100% (dev/TESTING.md).
+          - { name: single-bucket, nodes: 2, buckets: 1, ops: 160, extra: '--packages 6 --files 2' }
+          - { name: multi-bucket, nodes: 3, buckets: 2, ops: 160, extra: '--packages 6 --files 2' }
+          - { name: single-bucket-crash-only, nodes: 3, buckets: 1, ops: 160, extra: '--packages 6 --files 2 --fail-percent 0' }
+          - { name: multi-bucket-crash-only, nodes: 3, buckets: 2, ops: 160, extra: '--packages 6 --files 2 --fail-percent 0' }
+          # The four above pin a topology AND the fixed workload (6 packages x 2
           # files, one hardcoded op mix), so between them they re-explore one
           # shape however many seeds they burn. This one rotates everything the
           # seed can vary — topology, entity counts, and the op-class weights

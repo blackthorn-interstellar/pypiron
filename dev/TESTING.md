@@ -602,6 +602,28 @@ event, not a routinely-exercised gate. Every arm now has a kill proof
 (`ordering`, `globalindex`, `poison`, `blind`, `race`, `fallback`), which
 settles soundness and settles nothing about frequency.
 
+**A run-total hit count hides a per-seed zero.** DURABILITY, VISIBILITY and
+CONSERVATION skip any filename an authorized delete, tombstone or conflict
+freeze removed — correctly; the bytes are legitimately gone — so their whole
+universe is the `--packages x --files` corpus. Run enough deletes against a
+small enough corpus and every name is tombstoned by quiescence: the three
+oracles iterate an empty set, and the run still prints five figures because the
+counter sums over 50,000 seeds. The nightly's four fixed profiles did exactly
+that. At 160 ops with a 10% delete weight against the harness default 2x2
+corpus, measured one seed at a time over 400 seeds per row, **20%** of the two
+crash-only rows' seeds evaluated durability at all and 39–40% of the two fault
+rows' — the rest proved only that deleted bytes stayed deleted
+(TOMBSTONE_MONOTONICITY, 7.2 hits/seed). The corpus is the only knob that lifts
+both at once: fewer ops starves resurrection checking instead. The rows now pin
+`--packages 6 --files 2` (12 names → 99–100% of seeds reach durability, ~10
+hits/seed, TOMBSTONE_MONOTONICITY *up* to 10.4) at a cost of ~40% of the seed
+rate — 50,000 seeds of the heaviest row in 267s locally, against a 60-minute job
+budget. 24 names buys 27 durability hits/seed for another 25% of the rate, which
+is more hits on the same schedules rather than more schedules, so 12 is where it
+sits. `tests/simulation_matrix.rs` fails if a row drops below it; the rotating
+row is exempt because its small seed-drawn corpora are deliberate coverage of
+the dense, high-contention end.
+
 `--require-reach` makes a zero a **failing run** (exit 4), so CI can assert that
 every oracle ran rather than merely that none complained. It is off by default —
 a small sample legitimately misses oracles, and a gate that cries wolf gets

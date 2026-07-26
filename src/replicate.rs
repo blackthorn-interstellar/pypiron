@@ -1204,6 +1204,15 @@ async fn supersede_record(
         Err(error) => return Err(error),
     };
 
+    // Artifact leg first, for the reason [`copy_live`] spells out: the
+    // destination's immutable create is a strictly stronger gate than its
+    // sidecar. Demotion's ordinary shape reaches here with the artifact key
+    // EMPTY — `quarantine_mirror_artifacts` has already moved the mirror body
+    // aside, which is what makes the destination read `QuarantinedMirror` — so
+    // a sidecar published first would stand over a key a concurrent publish can
+    // still take, and a leg that then dies leaves this bucket asserting sha A
+    // over body B forever: `decide` compares sidecar shas and nothing
+    // re-hashes a stored body.
     let mut artifact_present = false;
     if let Some((current, etag)) = dst.get_with_etag(&akey).await? {
         if sha256_hex(&current) == sidecar.sha256 {
@@ -1227,24 +1236,6 @@ async fn supersede_record(
         }
     }
 
-    install_or_verify_sidecar(dst, &sidecar_key(&akey), sidecar).await?;
-    replace_companion(
-        dst,
-        &metadata_key(&akey),
-        verified.metadata,
-        Some("text/plain; charset=utf-8"),
-        replace_companions,
-    )
-    .await?;
-    replace_companion(
-        dst,
-        &provenance_key(&akey),
-        verified.provenance,
-        Some("application/json"),
-        replace_companions,
-    )
-    .await?;
-
     if !artifact_present {
         let len = verified.artifact.len() as u64;
         if create_artifact_verified(
@@ -1263,6 +1254,8 @@ async fn supersede_record(
                 .await
                 .with_context(|| format!("verify raced destination artifact {akey}"))?;
             let raced_sha = sha256_hex(&raced);
+            // Nothing this call published can describe the competing body: the
+            // sidecar goes in below, and the freeze fences the filename first.
             if raced_sha != sidecar.sha256 {
                 freeze_copy_race(state, src, dst, pkg, filename, &sidecar.sha256, &raced_sha)
                     .await?;
@@ -1270,6 +1263,24 @@ async fn supersede_record(
             }
         }
     }
+
+    install_or_verify_sidecar(dst, &sidecar_key(&akey), sidecar).await?;
+    replace_companion(
+        dst,
+        &metadata_key(&akey),
+        verified.metadata,
+        Some("text/plain; charset=utf-8"),
+        replace_companions,
+    )
+    .await?;
+    replace_companion(
+        dst,
+        &provenance_key(&akey),
+        verified.provenance,
+        Some("application/json"),
+        replace_companions,
+    )
+    .await?;
 
     // A delete/freeze can race the publish. Reassert precedence after the
     // complete record lands, then clear obsolete mirror quarantine state only
@@ -3893,6 +3904,78 @@ mod tests {
             b"late mirror bytes"
         );
         assert!(!late_mirror.head_exists(&mirror_marker).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn supersede_takes_the_destination_key_before_publishing_truth_about_it() {
+        // Demotion's ordinary shape, and the sibling of
+        // `the_copy_takes_the_destination_key_before_publishing_truth_about_it`:
+        // `quarantine_mirror_artifacts` has already moved the mirror body under
+        // `_quarantine/`, which is exactly what makes this destination read
+        // `QuarantinedMirror`, so the artifact key is EMPTY when the private
+        // record supersedes it. A sidecar published first stands over a key a
+        // concurrent publish can still take; if this leg then dies the bucket
+        // asserts sha A over body B permanently, and no oracle re-hashes a body
+        // to notice.
+        let bytes = b"private bytes";
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let private = Arc::new(InMemStorage::default());
+        seed_live(private.as_ref(), "pkg", filename, bytes, PRIVATE);
+
+        let dst = Arc::new(InMemStorage::default());
+        dst.insert(
+            &sidecar_key(&key),
+            serde_json::to_vec(&sc(
+                &sha256_hex(b"quarantined mirror bytes"),
+                MIRROR,
+                Yanked::Flag(false),
+                0,
+            ))
+            .unwrap(),
+        );
+        dst.insert(&mirror_quarantined_key(&key), b"{}".to_vec());
+        dst.insert(
+            &crate::origin::origin_key("pkg"),
+            MIRROR.as_bytes().to_vec(),
+        );
+        let seeded = dst.write_log().len();
+        let state = two_bucket_state(private.clone(), dst.clone());
+
+        let source = read_record(private.as_ref(), "pkg", filename)
+            .await
+            .unwrap();
+        let destination = read_record(dst.as_ref(), "pkg", filename).await.unwrap();
+        let verdict = decide(&source, &destination);
+        assert_eq!(verdict, Verdict::Supersede(Side::A));
+
+        let _: Convergence = execute(
+            &state,
+            (private.as_ref(), dst.as_ref()),
+            "pkg",
+            filename,
+            (&source, &destination),
+            verdict,
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap();
+
+        // Only what the supersede itself wrote; the seeded record is not it.
+        let log = dst.write_log().split_off(seeded);
+        let artifact_at = log
+            .iter()
+            .position(|written| written == &key)
+            .expect("the supersede landed the artifact");
+        let sidecar_at = log
+            .iter()
+            .position(|written| written == &sidecar_key(&key))
+            .expect("the supersede installed the sidecar");
+        assert!(
+            artifact_at < sidecar_at,
+            "the destination sidecar was published before the bytes it names: {log:?}"
+        );
+        assert_eq!(dst.get_bytes(&key).await.unwrap(), bytes);
     }
 
     #[tokio::test]

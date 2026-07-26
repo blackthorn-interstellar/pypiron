@@ -298,7 +298,10 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
         }
     };
     match verdict {
-        Verdict::Noop => {}
+        // Converged, or declined pending the orphan side's own backfill: the
+        // model applies nothing either way. The two are distinguished by the
+        // caller — a deferral leaves the destination owed (see `Convergence`).
+        Verdict::Noop | Verdict::Defer => {}
         Verdict::Copy(side) => {
             let (src, dst) = match side {
                 Side::A => (&*a, &mut *b),
@@ -1454,7 +1457,7 @@ mod conformance {
                     "materialized records decide differently than abstract records\n a={rec_a:?}\n b={rec_b:?}",
                 );
 
-                pypiron::replicate::execute(
+                let _: pypiron::replicate::Convergence = pypiron::replicate::execute(
                     &state,
                     (bucket_a.as_ref(), bucket_b.as_ref()),
                     PKG,
@@ -1574,7 +1577,7 @@ mod conformance {
                 .await
                 .expect("read record b");
             let verdict = decide(&ra, &rb);
-            execute(
+            let _: pypiron::replicate::Convergence = execute(
                 &state,
                 (bucket_a.as_ref(), bucket_b.as_ref()),
                 PKG,

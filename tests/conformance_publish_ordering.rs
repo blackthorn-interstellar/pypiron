@@ -405,7 +405,7 @@ async fn a_mirror_copy_lands_its_bytes_before_the_sidecar_that_names_them() {
         matches!(verdict, pypiron::replicate::Verdict::Copy(_)),
         "an empty destination must take the copy path, got {verdict:?}"
     );
-    execute(
+    let _: pypiron::replicate::Convergence = execute(
         &state,
         (source.as_ref(), recorder.as_ref()),
         PKG,

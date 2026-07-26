@@ -139,7 +139,16 @@ pub enum Side {
 /// bidirectional diff cannot double-apply.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Verdict {
+    /// The two sides agree. Nothing is owed to either bucket.
     Noop,
+    /// The merge *declined to act this pass* — it is not a convergence. Only
+    /// state the other bucket's own audit can produce (a sidecar for a bare
+    /// artifact, §4) would let a decision be made, so acting now would have to
+    /// fabricate truth. Distinct from [`Verdict::Noop`] because a caller that
+    /// reads a deferral as "converged" acks a durability the fleet does not
+    /// have: it is the pre-ack fan-out's cue to leave a `_repl/` note, and the
+    /// marker sweep's cue to retain the note it is draining.
+    Defer,
     /// The `Side`'s live private record is copied to the other (absent) side.
     Copy(Side),
     /// Same bytes; the `Side`'s sidecar wins the yank/origin merge — overwrite
@@ -204,8 +213,10 @@ pub fn decide(a: &Record, b: &Record) -> Verdict {
     use RecordState::*;
     match (a.state(), b.state()) {
         // Wait for the local audit to backfill a sidecar before comparing —
-        // never fabricate cross-bucket truth from a bare artifact (§4).
-        (Orphan, _) | (_, Orphan) => Verdict::Noop,
+        // never fabricate cross-bucket truth from a bare artifact (§4). A
+        // deferral, never a convergence: the bucket holding the bare artifact
+        // holds no record, so whoever asked is still owed one.
+        (Orphan, _) | (_, Orphan) => Verdict::Defer,
         (Absent, Absent) => Verdict::Noop,
         // Every live record copies to an absent peer: private truth, a `sync --to`
         // snapshot, and a proxy-cache fill alike. The snapshot/cache distinction is
@@ -710,7 +721,10 @@ pub(crate) mod tests {
             mirror_quarantined: false,
             pkg_origin: None,
         };
-        assert_eq!(decide(&orphan, &live("x", PRIVATE)), Verdict::Noop);
-        assert_eq!(decide(&orphan, &absent()), Verdict::Noop);
+        // A deferral, not a `Noop`: the orphan side holds no record, so the
+        // pair is not converged and the caller still owes it one.
+        assert_eq!(decide(&orphan, &live("x", PRIVATE)), Verdict::Defer);
+        assert_eq!(decide(&live("x", PRIVATE), &orphan), Verdict::Defer);
+        assert_eq!(decide(&orphan, &absent()), Verdict::Defer);
     }
 }

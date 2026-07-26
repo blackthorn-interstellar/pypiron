@@ -1106,7 +1106,7 @@ fn report_reach(explored: u64, rechecked: u64, brk: Break) -> Vec<&'static str> 
 // atomics. No `FaultView`, no rng, no await.
 // ---------------------------------------------------------------------------
 
-const VERDICT_SLOTS: usize = 9;
+const VERDICT_SLOTS: usize = 10;
 const VERDICT_LABELS: [&str; VERDICT_SLOTS] = [
     "Noop",
     "Copy",
@@ -1117,6 +1117,7 @@ const VERDICT_LABELS: [&str; VERDICT_SLOTS] = [
     "PropagateFreeze",
     "FinishFreeze",
     "Tombstone",
+    "Defer",
 ];
 
 const EVIDENCE_SLOTS: usize = 3;
@@ -1191,6 +1192,7 @@ fn verdict_slot(verdict: &Verdict) -> usize {
         Verdict::PropagateFreeze(_) => 6,
         Verdict::FinishFreeze => 7,
         Verdict::Tombstone => 8,
+        Verdict::Defer => 9,
     }
 }
 

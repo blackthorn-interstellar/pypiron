@@ -183,6 +183,24 @@ pub async fn read_record(storage: &dyn Storage, pkg: &str, filename: &str) -> Re
 // Executor — applies a Verdict with both handles.
 // ---------------------------------------------------------------------------
 
+/// Whether one merge pass left the two buckets agreed, or declined to act.
+///
+/// `Ok(())` used to mean both, and every caller had to remember that
+/// [`Verdict::Defer`] hid inside the success. It did not: a pre-ack fan-out read
+/// the deferral as convergence and acked an upload the peer did not hold, with
+/// no `_repl/` note owing it (dev/DESIGN.md's totality principle). The
+/// distinction lives in the type now, and `#[must_use]` keeps it from being
+/// dropped on the floor again.
+#[must_use]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Convergence {
+    /// Both buckets agree: nothing is owed, a repair note may be consumed.
+    Converged,
+    /// The merge declined this pass ([`Verdict::Defer`]). The destination is
+    /// still owed the record — leave (or write) its `_repl/` note.
+    Deferred,
+}
+
 /// Apply the merge decision for one filename. `a`/`b` are the two storage
 /// handles the records were read against; the executor writes to whichever the
 /// verdict names and marks that bucket dirty so its own leader rebuilds it.
@@ -194,7 +212,7 @@ pub async fn execute(
     recs: (&Record, &Record),
     verdict: Verdict,
     source: ArtifactSource<'_>,
-) -> Result<()> {
+) -> Result<Convergence> {
     require_replication_unfenced(state)?;
     let (a, b) = stores;
     let (ra, rb) = recs;
@@ -210,7 +228,7 @@ pub async fn execute(
     // fan-out runs the Copy path on every multi-bucket upload, and a pair of
     // no-op markers on the untouched source would be pure ack-latency.
     let (bracket_a, bracket_b) = match &verdict {
-        Verdict::Noop => (false, false),
+        Verdict::Noop | Verdict::Defer => (false, false),
         Verdict::Copy(side) | Verdict::Supersede(side) | Verdict::QuarantineLoser(side) => {
             match side {
                 Side::A => (false, true), // the named side is the source
@@ -264,6 +282,9 @@ pub async fn execute(
                 markers::mark_dirty(b, pkg).await?;
             }
         }
+        // No I/O: only the orphan side's own audit can produce the sidecar this
+        // decision needs, and acting without one would fabricate truth (§4).
+        Verdict::Defer => {}
         Verdict::Copy(side) => {
             let (src, dst, rec) = pick(side);
             if copy_live(state, src, dst, pkg, filename, rec, source).await? {
@@ -364,7 +385,11 @@ pub async fn execute(
             }
         }
         }
-        Ok(())
+        Ok(if verdict == Verdict::Defer {
+            Convergence::Deferred
+        } else {
+            Convergence::Converged
+        })
     }
     .await;
     // Pair the intents even on error: the mutation may be partial, and an
@@ -1709,10 +1734,12 @@ pub async fn quarantine_mirror_artifacts(storage: &dyn Storage, pkg: &str) -> Re
 /// shared grace deadline measured from the selected write's completion.
 ///
 /// A secondary that fails, exceeds the grace deadline, becomes topology-
-/// ineligible mid-copy, or is already ineligible (so no copy is attempted) gets
-/// a durable `_repl/<dest>/…` note in the selected bucket before this returns.
-/// Notes are the failure path only: a healthy fleet acks with every bucket
-/// holding the record and no note written. A single-bucket node does no I/O.
+/// ineligible mid-copy, is already ineligible (so no copy is attempted), or
+/// whose merge *defers* ([`Convergence::Deferred`] — it holds a bare artifact
+/// only its own audit can resolve) gets a durable `_repl/<dest>/…` note in the
+/// selected bucket before this returns. Notes are the failure path only: a
+/// healthy fleet acks with every bucket holding the record and no note written.
+/// A single-bucket node does no I/O.
 pub async fn fanout_sync(
     state: &AppState,
     pinned: &Pinned,
@@ -1757,7 +1784,14 @@ pub async fn fanout_sync(
                     }
                 };
                 match result {
-                    Ok(()) => (idx, true),
+                    Ok(Convergence::Converged) => (idx, true),
+                    // The merge declined (the peer holds a bare artifact of its
+                    // own only its audit can resolve). Nothing was copied, so
+                    // this is a failed fan-out for totality purposes: note it.
+                    Ok(Convergence::Deferred) => {
+                        warn!(dest=%handle.name, package=%pkg, filename=%filename, "synchronous fan-out deferred by the merge; leaving a repair note");
+                        (idx, false)
+                    }
                     Err(e) => {
                         warn!(dest=%handle.name, package=%pkg, filename=%filename, error=?e, "synchronous fan-out failed; leaving a repair note");
                         (idx, false)
@@ -1934,7 +1968,7 @@ async fn replicate_record(
     pkg: &str,
     filename: &str,
     source: ArtifactSource<'_>,
-) -> Result<()> {
+) -> Result<Convergence> {
     require_replication_unfenced(state)?;
     let src_origin = read_pkg_origin(src, pkg).await?;
     let dst_origin = read_pkg_origin(dst, pkg).await?;
@@ -1948,13 +1982,13 @@ async fn replicate_record(
         // The claim itself is the whole record, and `reconcile_split_origin`
         // above already reserved it on the peer — private or mirror alike —
         // ahead of any bytes. Nothing left to copy.
-        return Ok(());
+        return Ok(Convergence::Converged);
     }
     if filename == PROJECT_STATUS_MARKER {
         if src_origin == Some(Origin::Private) || dst_origin == Some(Origin::Private) {
             reconcile_project_status(src, dst, pkg).await?;
         }
-        return Ok(());
+        return Ok(Convergence::Converged);
     }
     let a = read_record(src, pkg, filename).await?;
     let b = read_record(dst, pkg, filename).await?;
@@ -2465,7 +2499,22 @@ async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<Hash
                                     }
                                 };
                                 match result {
-                                    Ok(()) => {
+                                    // The merge declined: the destination holds
+                                    // a bare artifact only its own audit can
+                                    // resolve into a record. It is still owed
+                                    // this one, so the note must survive — and
+                                    // the rebuild that backfills the sidecar is
+                                    // exactly what unblocks the next retry.
+                                    Ok(Convergence::Deferred) => {
+                                        if let Err(e) =
+                                            markers::mark_dirty(dst.storage.as_ref(), &marker.pkg)
+                                                .await
+                                        {
+                                            warn!(dest=%dst.name, package=%marker.pkg, filename=%marker.filename, error=?e, "replication deferred and the destination rebuild signal failed; marker retained");
+                                        }
+                                        true
+                                    }
+                                    Ok(Convergence::Converged) => {
                                         // The note's existence proves a fan-out went wrong
                                         // mid-flight, and the destination's "rebuild your
                                         // view" dirty marker may have been the write that
@@ -2817,7 +2866,11 @@ async fn converge_package(
                 break;
             }
             let verdict = decide(&ra, &rb);
-            execute(
+            // Tier 3 holds no ack open and has no note to consume, so a
+            // deferral needs no repair record of its own: the next cadence
+            // re-diffs, by which time the orphan side's own audit has
+            // backfilled the sidecar the decision was waiting on.
+            let _: Convergence = execute(
                 state,
                 (a, b),
                 pkg,
@@ -3103,7 +3156,7 @@ mod tests {
         let verdict = decide(&left, &right);
         assert_eq!(verdict, Verdict::AdoptSidecar(Side::A));
 
-        execute(
+        let _: Convergence = execute(
             &state,
             (a.as_ref(), b.as_ref()),
             "pkg",
@@ -3142,7 +3195,7 @@ mod tests {
         );
         let state = two_bucket_state(a.clone(), b.clone());
 
-        replicate_record(
+        let _: Convergence = replicate_record(
             &state,
             a.as_ref(),
             b.as_ref(),
@@ -3288,7 +3341,7 @@ mod tests {
         src.insert(&metadata, b"Metadata-Version: 2.4\n".to_vec());
         let state = test_state(src.clone());
 
-        replicate_record(
+        let _: Convergence = replicate_record(
             &state,
             src.as_ref(),
             dst.as_ref(),
@@ -3646,7 +3699,7 @@ mod tests {
         b.insert(&frozen_key(&key), b"{}".to_vec());
         let state = test_state(a.clone());
 
-        replicate_record(
+        let _: Convergence = replicate_record(
             &state,
             a.as_ref(),
             b.as_ref(),
@@ -3666,7 +3719,7 @@ mod tests {
         assert_eq!(decide(&settled_a, &settled_b), Verdict::Noop);
         let before_a = a.list_all("").await.unwrap();
         let before_b = b.list_all("").await.unwrap();
-        execute(
+        let _: Convergence = execute(
             &state,
             (a.as_ref(), b.as_ref()),
             "pkg",
@@ -3800,7 +3853,7 @@ mod tests {
         assert!(late_mirror.head_exists(&mirror_marker).await.unwrap());
         let state = two_bucket_state(private.clone(), late_mirror.clone());
 
-        replicate_record(
+        let _: Convergence = replicate_record(
             &state,
             private.as_ref(),
             late_mirror.as_ref(),
@@ -3861,7 +3914,7 @@ mod tests {
         tombstone::write(mirror.as_ref(), &key, filename)
             .await
             .unwrap();
-        execute(
+        let _: Convergence = execute(
             &state,
             (private.as_ref(), mirror.as_ref()),
             "pkg",
@@ -4027,6 +4080,62 @@ mod tests {
             .unwrap()
             .iter()
             .any(|m| m.key.contains("/pkg/")));
+    }
+
+    /// A peer holding a bare artifact of its own — a publish or copy that died
+    /// between its bytes and its sidecar — makes the merge defer: only that
+    /// bucket's audit can backfill the sidecar, and copying over it would
+    /// fabricate cross-bucket truth (§4). The deferral is not a convergence, so
+    /// the ack may not fire without a durable note owing the peer the record
+    /// (dev/DESIGN.md's totality principle).
+    #[tokio::test]
+    async fn fanout_sync_notes_a_peer_whose_orphan_artifact_defers_the_merge() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        seed_live(a.as_ref(), "pkg", filename, b"wheel", PRIVATE);
+        // B's own crashed writer: bytes, no sidecar.
+        b.insert(&artifact_key("pkg", filename), b"half-written".to_vec());
+        b.insert(
+            &crate::origin::origin_key("pkg"),
+            PRIVATE.as_bytes().to_vec(),
+        );
+        let state = two_bucket_state(a.clone(), b.clone());
+        let pinned = state.pin();
+
+        fanout_sync(&state, &pinned, "pkg", filename, None).await;
+        assert!(
+            a.list_all(&format!("{REPL_PREFIX}1/"))
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.key.contains("/pkg/")),
+            "a deferred fan-out must leave the peer a repair note before the ack",
+        );
+    }
+
+    /// The same deferral on the note-draining path: the marker sweep may only
+    /// consume a note the copy actually delivered. Consuming one the merge
+    /// merely declined drops the fleet's last record that the peer is owed.
+    #[tokio::test]
+    async fn marker_sweep_retains_a_note_the_merge_deferred() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        seed_live(b.as_ref(), "pkg", filename, b"straggler", PRIVATE);
+        a.insert(&artifact_key("pkg", filename), b"half-written".to_vec());
+        a.insert(
+            &crate::origin::origin_key("pkg"),
+            PRIVATE.as_bytes().to_vec(),
+        );
+        let state = two_bucket_state(a.clone(), b.clone());
+        write_marker(b.as_ref(), 0, "pkg", filename).await.unwrap();
+
+        sweep_all_markers(&state).await.unwrap();
+        assert!(
+            !b.list_all(REPL_PREFIX).await.unwrap().is_empty(),
+            "a note the merge deferred must survive the sweep that could not deliver it",
+        );
     }
 
     #[tokio::test]
@@ -4320,7 +4429,7 @@ mod tests {
         a.insert(&crate::origin::origin_key("pkg"), b"mirror".to_vec());
         let state = two_bucket_state(a.clone(), b.clone());
 
-        replicate_record(
+        let _: Convergence = replicate_record(
             &state,
             a.as_ref(),
             b.as_ref(),
@@ -4347,7 +4456,7 @@ mod tests {
         b.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
         let state = two_bucket_state(a.clone(), b.clone());
 
-        replicate_record(
+        let _: Convergence = replicate_record(
             &state,
             a.as_ref(),
             b.as_ref(),
@@ -4385,7 +4494,7 @@ mod tests {
             .unwrap();
         let state = two_bucket_state(a.clone(), b.clone());
 
-        replicate_record(
+        let _: Convergence = replicate_record(
             &state,
             a.as_ref(),
             b.as_ref(),
@@ -4421,7 +4530,7 @@ mod tests {
             .unwrap();
         let state = two_bucket_state(a.clone(), b.clone());
 
-        replicate_record(
+        let _: Convergence = replicate_record(
             &state,
             a.as_ref(),
             b.as_ref(),

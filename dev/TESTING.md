@@ -347,23 +347,25 @@ production reaches when a node switches, writes, and dies before its own worker
 ticks. It is not a full `BucketSet::switch`, and a finding that depends on the
 node's caches following its writes is out of this harness's reach.
 
-**Every merge verdict now executes.** Measured over a 74,033-seed rotating soak
-and a 43,843-seed fixed multi-bucket soak, all at `--partition 100` (verdicts are
-sampled by running the real `replicate::decide` over every bucket pair × filename
-at the end of the chaos phase and at each heal round, so this under-counts arms
-the executors resolve between snapshots):
+**Every merge verdict now executes.** Re-measured on a **disjoint seed range**
+(`--start-seed 9000001`) from the one the partition work was developed against,
+all at `--partition 100`. Verdicts are sampled by running the real
+`replicate::decide` over every bucket pair × filename at the end of the chaos
+phase and at each heal round, so the verdict rows *under*-count arms the
+executors resolve between snapshots; the three evidence rows are exact object
+counts at quiescence.
 
-| `decide` → | rotating (74,033 seeds) | multi-bucket (43,843 seeds) |
-|---|---|---|
-| `AdoptSidecar` | 5,804 on 1,838 seeds | 4,262 on 2,028 seeds |
-| `Supersede` | 114 on 47 seeds | 130 on 65 seeds |
-| `QuarantineLoser` | 4,242 on 1,302 seeds | 2,096 on 1,005 seeds |
-| `Freeze` | 2,842 on 1,034 seeds | 3,008 on 1,447 seeds |
-| `PropagateFreeze` | 656 on 247 seeds | 484 on 238 seeds |
-| `FinishFreeze` | 50 on 25 seeds | 62 on 31 seeds |
-| `.frozen` objects at quiescence | 36,942 on 11,467 seeds | 45,534 on 16,631 seeds |
-| `_quarantine/` bodies | 51,570 on 14,577 seeds | 63,550 on 20,712 seeds |
-| `.mirror-quarantined` | 365 on 303 seeds | 583 on 466 seeds |
+| | rotating (86,010 seeds) | multi-bucket (50,884 seeds) | multi-bucket crash-only (52,354 seeds) |
+|---|---|---|---|
+| `decide` → `AdoptSidecar` | 7,128 on 2,087 seeds | 5,352 on 2,341 | 1,454 on 646 |
+| `decide` → `Supersede` | 152 on 58 | 131 on 63 | 52 on 24 |
+| `decide` → `QuarantineLoser` | 5,388 on 1,540 | 2,580 on 1,136 | 1,066 on 475 |
+| `decide` → `Freeze` | 3,425 on 1,155 | 3,696 on 1,642 | 1,032 on 467 |
+| `decide` → `PropagateFreeze` | 906 on 299 | 634 on 288 | 158 on 69 |
+| `decide` → `FinishFreeze` | 50 on 22 | 70 on 32 | 8 on 4 |
+| `.frozen` objects at quiescence | 46,394 on 13,103 | 58,118 on 19,331 | 47,078 on 16,662 |
+| `_quarantine/` bodies | 64,897 on 16,814 | 81,066 on 23,943 | 70,040 on 20,394 |
+| `.mirror-quarantined` | 478 on 348 | 708 on 525 | 238 on 203 |
 
 All nine read **zero** on every aligned seed ever run, which is the gap this
 closed. The two per-seed readings the gate holds — `MERGE_DIVERGENCE` and
@@ -371,6 +373,30 @@ closed. The two per-seed readings the gate holds — `MERGE_DIVERGENCE` and
 (measured 48%/39% on a fixed multi-bucket profile, 19%/15% under rotation where
 a third of drawn topologies are single-bucket) but still fail on a flat zero, so
 a partitioned run that stops producing conflicts is still caught.
+
+**The oracle branches that were dead code now evaluate — with one exception,
+stated.** Counted by a throwaway instrumented build of `examples/vopr.rs` (probe
+counters on each branch, never committed), aligned vs partitioned:
+
+| branch | aligned, 20,000 seeds | `--partition 100`, 130,331 seeds |
+|---|---|---|
+| DURABILITY exempts a `.frozen` filename | 0 | 132,586 |
+| …and `.frozen` was the **only** reason (no tombstone, no acked delete) | 0 | **0** |
+| VISIBILITY exempts what the renderer omits (`renderer_omits`) | 0 | 571 |
+| …of which the reason is a `.mirror-quarantined` marker | 0 | 571 |
+| CONSERVATION finds an acked body only because a `_quarantine/` copy holds it | 0 | 99,630 |
+| DURABILITY sees bytes no ack carried | 0 | 14,039 |
+| …and the `_quarantine/` preservation clause excuses it | 0 | 13,150 |
+
+The exception is worth naming rather than rounding off: `.frozen` has **never**
+been the sole reason DURABILITY skipped a filename. `freeze_side` writes the
+marker, quarantines, tombstones, then drops — so every frozen record the fleet
+produced also carried a `.tombstone`, and the tombstone check upstream of it
+already granted the pass. The `.frozen` disjunct is exercised 132,586 times and
+load-bearing zero of them. It stays because FREEZE_JUSTIFIED's argument (a freeze
+waives durability, so it had better be a real conflict) is about the *rule*, not
+about which disjunct happens to fire first, and a crash between the marker and
+the tombstone is exactly the window where it would become load-bearing.
 
 **The partitioned profiles are currently red**, which is the point — see the
 findings recorded against the commit that landed this. That is why `--partition`
@@ -397,6 +423,22 @@ whatever the fixes turn out to be:
 | `FREEZE_UNJUSTIFIED` | 91 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | frozen on every bucket with only **one** byte-set attested anywhere (acks ∪ every `_quarantine/` copy) — a freeze that suppresses a filename and waives its durability check without a real conflict behind it |
 | `CONVERGENCE` | 208 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | `packages/<pkg>/.origin` reads `mirror` on bucket 0 and is **absent** on bucket 1 at quiescence — an orphan claim that never replicated and never got released, so one bucket reserves a name the other would let a proxy fill |
 | `ACK_TOTALITY` | 19 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | a publish acked while a peer held neither the record, nor a `_repl/` note owing it, nor any merge marker explaining its absence. Crash-only, where a missed note is the hard gate |
+
+How often, on a disjoint seed range (`--start-seed 9000001`, `--packages 6
+--files 2 --ops 160 --partition 100`) — the share of seeds each oracle reds on,
+so a triage can be ordered by frequency rather than by which repro was found
+first:
+
+| | rotating, 86,010 seeds | multi-bucket, 50,884 seeds | crash-only, 52,354 seeds |
+|---|---|---|---|
+| **any** violation | 16.1% | 41.2% | 50.9% |
+| `AUDIT_PREMATURE_CONSUMPTION` / `AUDIT_REPAIRED_VIEWS` | 6.1% / 6.9% | 38.9% / — | — / 43.4% |
+| `ACK_TOTALITY` | 2.3% | — | 14.0% |
+| `CONVERGENCE` | 0.91% | 1.67% | 0.69% |
+| `AUDIT_ORDERING` (class 1) | 0.68% | 0.03% | — |
+| `CONSERVATION` | 0.57% | 2.09% | 2.07% |
+| `FREEZE_UNJUSTIFIED` | 0.27% | 0.51% | 0.57% |
+| `DURABILITY` | 0.12% | 0.56% | 0.20% |
 
 Determinism itself is verified, not assumed: recurring seeds (`--recheck-every`)
 run twice and must produce an identical storage-op trace hash *and* an identical
@@ -532,7 +574,7 @@ storage and never the schedule.
 | `fanout` | peer bucket 1 blackholes the chaos phase *and* the `_repl/1/` note owing it is dropped | `ACK_TOTALITY:` (needs `--fail-percent 0`, where it is the hard gate) | 1 |
 | `rerun` | a seed's second execution ends in a different world off an identical op trace | `DETERMINISM VIOLATION … same calls, different bytes` (needs `--recheck-every 1`) | 1 |
 | `resurrect` | an acked-deleted artifact's bytes come back with its tombstone gone | `TOMBSTONE_MONOTONICITY:` | 3 |
-| `durability` | an acked artifact serves corrupt bytes on every bucket, the real bytes parked outside `packages/` | `DURABILITY: acked … byte-corrupt` | 4 |
+| `durability` | an acked artifact serves corrupt bytes on every bucket, the real bytes parked outside `packages/` *and* outside `_quarantine/` | `DURABILITY: acked … serves bytes no ack carried` | 4 |
 | `visibility` | one acked filename edited out of `simple/<pkg>/index.json` on every bucket | `VISIBILITY: acked … not listed` | 4 |
 | `conserve` | an acked body and sidecar destroyed fleet-wide with no tombstone, no freeze and no acked delete | `CONSERVATION: acked bytes … vanished from every bucket` | 4 |
 | `diverge` | one bucket keeps an object the other never got | `CONVERGENCE: bucket 0 and bucket N differ` (needs ≥2 buckets) | 1 |
@@ -543,15 +585,34 @@ storage and never the schedule.
 | `blind` | the only op that retired the marker covering the mutation had listed truth before it | `… were all consumed blind` (class 2b) | 3 |
 | `race` | two unleased rebuilds: the one that listed *earlier* wrote *last* | `… unleased concurrent rebuild` (class 3; needs `--fail-percent 0`, where any audit repair is a violation) | 5 |
 | `fallback` | an audit repair the effect history cannot explain at all | `… unexplained drift` (fallback arm) | 3 |
-| `freeze-unjustified` | a `.frozen` marker over an acked-**deleted** filename — nothing ever conflicted about it, and the body and view entry are already gone, so no other oracle can see it | `FREEZE_UNJUSTIFIED:` | 1 |
-| `origin-demoted` | a privately-claimed package's `.origin` walked back to `mirror` on every bucket (sidecars untouched, so the buckets stay converged and the views stay correct) | `ORIGIN_TERMINALITY:` | 1 |
+| `freeze-unjustified` | a `.frozen` marker over an acked-**deleted** filename — nothing ever conflicted about it, and the body and view entry are already gone, so no other oracle can see it | `FREEZE_UNJUSTIFIED:` | 3 |
+| `freeze-lossy` | a freeze that dropped a body it never quarantined: `.frozen` fleet-wide, one byte-set preserved under `_quarantine/`, the *acked* one overwritten everywhere | `CONSERVATION: … a frozen filename may not lose one` | 4 |
+| `origin-demoted` | a privately-claimed package's `.origin` walked back to `mirror` on every bucket (sidecars untouched, so the buckets stay converged and the views stay correct) | `ORIGIN_TERMINALITY: … claims … .origin = mirror` | 1 |
+| `mirror-served` | the claim stays private but a **live mirror record** stands under it — a new filename cloned from a live record with its sidecar origin rewritten | `ORIGIN_TERMINALITY: … still serves … as live mirror truth` | 3 |
+| `split` | a byte conflict the merge never resolved: bucket 1 acks and keeps a second byte-set under a filename bucket 0 still serves its own for | `DURABILITY: … never left split` (needs ≥2 buckets) | 4 |
 
-The K column is **re-measured against the current build**, not inherited: it is
-the smallest `--seeds K` (from seed 1, on the leg's own flags) at which the break
-reds with the expected text. Every one currently reds at K=1 — the schedule has
-moved since the 3/4/5 values that used to sit here, which is exactly why the CI
-step draws 6 rather than the measured minimum. Re-measure whenever the schedule
-changes; a stale K is a gate nobody has checked is still a gate.
+**Freeze and origin get two legs each, on purpose.** Freeze *justification* (a
+`.frozen` marker must be a real byte conflict) and freeze *totality* (a freeze
+preserves both bodies before it drops either) are two claims about the same
+marker, and origin exclusivity is asserted once on the package `.origin` claim
+and once on the sidecar of the record under it. A branch that shares a leg with
+its neighbour is a branch nobody has watched fire — which is the whole argument
+for this table.
+
+Three of these reds land on a second oracle too, unavoidably, and the leg's
+expected text is what pins which one it is for: `split` also reds CONVERGENCE (a
+filename two buckets serve different bytes for *is* a diverged key — which is why
+DURABILITY names it instead of leaving it as one line of a key diff),
+`freeze-lossy` also reds VERIFY (a `.frozen` marker takes the record out of the
+renderable set while the view still lists it, exactly as `--break conserve`
+does), and `mirror-served` reds ORIGIN_TERMINALITY and nothing else.
+
+K is how many fresh seeds the break needs to red with **≥99.8% confidence** —
+`ceil(ln 0.002 / ln(1-p))` on the measured per-seed red rate p, on that leg's own
+flags. It is not "the first seed that happens to red": every break in this table
+reds on seed 1 today, and a table of 1s would say nothing about what happens when
+the schedule moves. Re-measure whenever it does; a stale K is a gate nobody has
+checked is still a gate.
 
 `globalindex` exists because `ordering` cannot reach the global analysis: it
 grows a package that already exists, so the global name set never changes and
@@ -580,45 +641,48 @@ interleaving; the reachability table below is where that question is answered.
 `fallback` plants nothing at all, which is the whole point of it — an audit
 repair with no history behind it is exactly the shape that arm exists to report.
 
-K is how many fresh seeds the break needs to red with ≥99.8% confidence, and the
-table's K is for the **pinned CI flags**, which are non-rotating. Measured at
-this commit over 20-second timeboxed samples (19,750–25,132 seeds each): `view`,
-`fanout`, `rerun`, `diverge` and `wedge` red on every seed; `poison`, `blind`,
-`fallback`, `ordering` and `globalindex` 89.6–89.8%; `durability`, `visibility`
-and `conserve` 85.6%; `race` 76.5%. Nothing below 100% is a weaker oracle — each
-of those breaks needs a run that actually produced the state it corrupts (a live
-artifact+sidecar pair to clone, an unexcused acked upload to destroy), and a
-schedule that ended with every file tombstoned leaves them inert. `race` is lower
-again because class 3 is a *statistic* under fault injection by design, so only
-the crash-only profile can red it. CI samples nothing: the seed range is pinned
-and the simulator is deterministic, and it draws 6 seeds — one more than the
-largest K in the table — so a future change that shifts which seed a break first
-bites on cannot quietly turn a gate into a coin flip.
+The table's K is for the **pinned CI flags**, which are non-rotating. Re-measured
+at this commit over 20-second timeboxed samples (4,418–23,022 seeds each):
+`view`, `fanout`, `rerun`, `diverge`, `wedge` and `origin-demoted` red on every
+seed (K=1); `resurrect` and `freeze-unjustified` 93.2% (K=3); `ordering`,
+`globalindex`, `poison`, `blind` and `fallback` 89.7% (K=3); `mirror-served`
+88.1% (K=3); `durability`, `visibility`, `conserve` and `freeze-lossy` 85.7%
+(K=4); `split` 79.3% (K=4); `race` 76.2% (K=5). Nothing below 100% is a weaker
+oracle — each of those breaks needs a run that actually produced the state it
+corrupts (a live artifact+sidecar pair to clone, an unexcused acked upload to
+destroy, a privately-claimed package with a live record left), and a schedule
+that ended with every file tombstoned leaves them inert. `race` is lower again
+because class 3 is a *statistic* under fault injection by design, so only the
+crash-only profile can red it. CI samples nothing: the seed range is pinned and
+the simulator is deterministic, and it draws 6 seeds — one more than the largest
+K in the table — so a future change that shifts which seed a break first bites on
+cannot quietly turn a gate into a coin flip.
 
 Under `--rotate` the same breaks red at different rates, because the rotating
 profile varies the *topology* and the fault mode each break needs. Over
-12,873–15,652-seed samples at this commit: `wedge` 100% (K=1); `poison`, `blind`
-and `fallback` 70.6% (K=6); `diverge` 66.4% and the three durability-family
-breaks 65.5% (K=6); `globalindex` 37.5% (K=14) and `race` 33.1% (K=16) — both
-gated on the roughly half of rotating seeds that draw `--fail-percent 0`, since
-class 1's `AUDIT_ORDERING:` text and class 3's finding dump only appear there.
-Earlier ranges for the original five: over seeds 1–50,000 (`view` and `rerun`
-over the first 12,000) `view` and `rerun` red on every seed (K=1), `resurrect`
-43,796/50,000 (K=3), `ordering` 35,160/50,000 (K=6), `fanout` 16,165/50,000
-(K=16). Take a rotating K to the digit only off a five-figure sample: several of
-these rates land within a percentage point of a K boundary, so an earlier
-300-seed measurement read `ordering` as 5 and `fanout` as 18. Keep the gate on
-the pinned non-rotating flags; that is what makes it a gate rather than a sample.
+1,724–7,041-seed samples at this commit: `view` and `wedge` 100% (K=1);
+`origin-demoted` 97.4% (K=2); `resurrect` and `freeze-unjustified` 88.0% (K=3);
+`poison`, `blind` and `fallback` 71.9% (K=5); `mirror-served` 68.2%, `diverge`
+66.7%, the three durability-family breaks 66.3% and `freeze-lossy` 66.4% (K=6);
+`split` 43.1% (K=12) — it needs a rotating draw with ≥2 buckets, the same gate
+`diverge` sits behind; `globalindex` 39.1% (K=13), `race` 32.8% (K=16) and
+`fanout` 32.0% (K=17) — all three gated on the roughly half of rotating seeds
+that draw `--fail-percent 0`, since class 1's `AUDIT_ORDERING:` text, class 3's
+finding dump and ACK_TOTALITY's hard gate only appear there. Take a rotating K to
+the digit only off a five-figure sample: several of these rates land within a
+percentage point of a K boundary, so an earlier 300-seed measurement read
+`ordering` as 5 and `fanout` as 18. Keep the gate on the pinned non-rotating
+flags; that is what makes it a gate rather than a sample.
 
 Off by default and provably free: every injection point is a comparison against
 `Break::None` that draws no rng, consumes no op-sequence number and records no
 trace event. Verified the way this document demands, not asserted — re-measured
-when the nine breaks above landed, against a binary built from the previous
-commit's tree: five profiles × 5,000 seeds reproduce storage-op interleavings,
-acked uploads, ack-totality misses and audit repairs **identical to the digit**
-(4,788,522 / 7,974,955 / 4,917,004 / 8,345,647 / 8,455,918 interleavings;
-18,388 / 15,660 / 19,368 / 16,727 / 26,388 acked), and `VOPR_TRACE` dumps for 24
-(seed, profile) pairs are byte-identical.
+when the partition-branch breaks landed, against a binary built from the previous
+commit's tree: five profiles × 5,000 seeds produce **byte-identical whole-run
+output** — every storage-op interleaving count, acked upload, ack-totality miss,
+audit repair, oracle-reach row and merge-meter row to the digit (6,077,236 /
+12,897,971 / 6,105,308 / 13,019,557 / 8,455,918 interleavings; 53,697 / 45,690 /
+57,384 / 49,393 / 26,388 acked).
 
 #### Workload-reachable, harness-unreachable, product-unreachable
 
@@ -639,9 +703,14 @@ anything but a break can ever red it, and the answer differs per oracle:
 | oracle | status | why | kill proof |
 |---|---|---|---|
 | VERIFY | workload-reachable | every convergence regression pinned in ci.yml's seed corpus red it | `view` |
-| DURABILITY | workload-reachable | no rule forbids a bucket losing an acked record | `durability` |
+| DURABILITY (acked bytes stand) | workload-reachable | no rule forbids a bucket losing an acked record | `durability` |
+| DURABILITY (never left split) | workload-reachable **only partitioned** — and *observed* there | needs one filename acked with different bytes on two buckets, which only `--partition` produces | `split` |
 | VISIBILITY | workload-reachable | ditto, for the listing | `visibility` |
-| CONSERVATION | workload-reachable | ditto, fleet-wide | `conserve` |
+| CONSERVATION (acked bytes survive) | workload-reachable | ditto, fleet-wide | `conserve` |
+| CONSERVATION (a freeze loses neither body) | workload-reachable **only partitioned** — and *observed* there | a freeze needs a real byte conflict to fire at all | `freeze-lossy` |
+| FREEZE_JUSTIFIED | workload-reachable **only partitioned** — and *observed* there | ditto | `freeze-unjustified` |
+| ORIGIN_TERMINALITY (the `.origin` claim) | workload-reachable, never witnessed | needs a mirror claim to win over a private one on some bucket after the private ack | `origin-demoted` |
+| ORIGIN_TERMINALITY (the record under it) | workload-reachable, never witnessed | needs a live mirror sidecar left renderable under a private claim | `mirror-served` |
 | CONVERGENCE | workload-reachable | needs ≥2 buckets; the replication paths that could break it run on every multi-bucket seed | `diverge` |
 | LIVENESS | workload-reachable | any undrainable breadcrumb reds it; the fast path has simply always drained | `wedge` |
 | ACK_TOTALITY | workload-reachable, and *observed* | 166 misses per 5,000 seeds on 3n/2b under fault injection, where it is a reported statistic; crash-only, where it is fatal, has never produced one | `fanout` |

@@ -192,9 +192,18 @@ enum Break {
     Fallback,
     /// Freeze a filename nothing ever conflicted over → FREEZE_JUSTIFIED.
     FreezeUnjustified,
+    /// Leave the fleet standing on BOTH acked byte-sets of one live filename →
+    /// DURABILITY's never-left-split clause.
+    Split,
+    /// Freeze a filename and drop an acked body the freeze never quarantined →
+    /// CONSERVATION's freeze-totality clause.
+    FreezeLossy,
     /// Walk a privately-claimed package's `.origin` back to mirror →
-    /// ORIGIN_TERMINALITY.
+    /// ORIGIN_TERMINALITY, claim arm.
     OriginDemoted,
+    /// Serve a live mirror record under a private claim → ORIGIN_TERMINALITY,
+    /// record arm.
+    MirrorServed,
 }
 
 /// The package name every phantom-clone break materializes. Not in
@@ -206,7 +215,7 @@ const BREAK_PKG: &str = "vopr-phantom";
 /// reproduce line all read this table: a second list that quietly fails to
 /// track the first is exactly how the reproduce line came to describe a
 /// different run than the one that failed.
-const BREAKS: [(&str, Break); 17] = [
+const BREAKS: [(&str, Break); 20] = [
     ("view", Break::View),
     ("fanout", Break::Fanout),
     ("rerun", Break::Rerun),
@@ -223,7 +232,10 @@ const BREAKS: [(&str, Break); 17] = [
     ("race", Break::Race),
     ("fallback", Break::Fallback),
     ("freeze-unjustified", Break::FreezeUnjustified),
+    ("split", Break::Split),
+    ("freeze-lossy", Break::FreezeLossy),
     ("origin-demoted", Break::OriginDemoted),
+    ("mirror-served", Break::MirrorServed),
 ];
 
 impl Break {
@@ -536,6 +548,58 @@ async fn apply_break(
                 }
             }
         }
+        // A byte conflict the merge never resolved: bucket 1 keeps a second
+        // acked byte-set under a live filename bucket 0 still serves its own
+        // for. The ack is planted with the bytes, because that pair IS the
+        // defect — a 200 on bucket 1 for bytes the fleet then failed to merge —
+        // and the oracle's subject (`acked_bodies(acks).len() >= 2`) does not
+        // exist without it. CONVERGENCE reds alongside, unavoidably: a split
+        // filename is a diverged key by definition, which is exactly why the
+        // DURABILITY clause names it rather than leaving it as one line of a
+        // key diff.
+        (Break::Split, false) => {
+            let Some(peer) = buckets.get(1) else { return };
+            let Some((pkg, fname, _)) = unexcused_ack(buckets, ledger) else {
+                return;
+            };
+            let akey = format!("packages/{pkg}/{fname}");
+            // Only where the peer already serves the record: inserting a body
+            // onto a bucket that never held one is a different defect (a
+            // sidecar-less artifact) and DURABILITY would red for that instead.
+            if !peer.keys().contains(&akey) {
+                return;
+            }
+            let other = b"vopr: the side the merge never resolved".to_vec();
+            peer.insert(&akey, other.clone());
+            ledger
+                .lock()
+                .expect("ledger lock")
+                .record_ack(&pkg, &fname, 1, other);
+        }
+        // Freeze totality: `freeze_side` copies the losing body to
+        // `_quarantine/` BEFORE it drops it, so a frozen filename still owes the
+        // fleet every byte-set it acked. Here the freeze quarantines one body
+        // and overwrites the acked one with it — the shape of a `freeze_side`
+        // that dropped before it preserved.
+        //
+        // Two byte-sets are attested (the ack plus the quarantine copy), so
+        // FREEZE_JUSTIFIED is satisfied and stays silent, and `.frozen` exempts
+        // DURABILITY by design — so CONSERVATION is the only oracle holding the
+        // totality claim. VERIFY reds alongside it and cannot not: a `.frozen`
+        // marker takes the record out of the renderable set while the view still
+        // lists it, the same second finding `--break conserve` produces.
+        (Break::FreezeLossy, false) => {
+            let Some((pkg, fname, _)) = unexcused_ack(buckets, ledger) else {
+                return;
+            };
+            let akey = format!("packages/{pkg}/{fname}");
+            let kept = b"vopr: the side the freeze kept".to_vec();
+            for bucket in buckets {
+                bucket.insert(&format!("{akey}.frozen"), b"{}".to_vec());
+                bucket.insert(&format!("_quarantine/{pkg}/{fname}@vopr"), kept.clone());
+                bucket.insert(&akey, kept.clone());
+            }
+        }
         // The origin lattice walked backwards: a package a private upload
         // claimed reads `mirror` again. Applied fleet-wide so the buckets stay
         // converged and the sidecars stay private — nothing else can catch it.
@@ -551,6 +615,52 @@ async fn apply_break(
                         &format!("packages/{pkg}/.origin"),
                         claim.clone().into_bytes(),
                     );
+                }
+            }
+        }
+        // The other half of origin exclusivity, one level down: the *claim* is
+        // still private, but a live mirror record stands under it — the exact
+        // artifact a dependency-confusion attack wants served. Injected as a new
+        // filename cloned from a live private record with its sidecar origin
+        // rewritten, so nothing already rendered changes: the renderer omits a
+        // mirror record under a private claim, so `pypiron verify` agrees the
+        // view is correct without it and VISIBILITY never weighs it (it is not
+        // in the ledger). Fleet-wide, so CONVERGENCE stays quiet too.
+        (Break::MirrorServed, false) => {
+            let claimed: Vec<String> = {
+                let ledger = ledger.lock().expect("ledger lock");
+                ledger.private_claimed.iter().cloned().collect()
+            };
+            let dump = buckets[0].dump();
+            // Every claimed package, not just the first: a schedule that
+            // tombstoned one package's whole corpus leaves it with nothing to
+            // clone, and stopping there would make the break inert on a run
+            // that has a perfectly good subject one name over.
+            let found = claimed.iter().find_map(|pkg| {
+                let prefix = format!("packages/{pkg}/");
+                dump.iter().find_map(|(key, sidecar)| {
+                    let akey = key.strip_suffix(".meta.json")?;
+                    let fname = akey.strip_prefix(&prefix)?;
+                    // A NEW filename, so no record anyone already rendered
+                    // changes shape underneath the view.
+                    let clone = fname.replace("py3-none", "py2-none");
+                    if clone == fname || dump.contains_key(&format!("{prefix}{clone}")) {
+                        return None;
+                    }
+                    let mut doc: serde_json::Value = serde_json::from_slice(sidecar).ok()?;
+                    doc.as_object_mut()?
+                        .insert("origin".into(), serde_json::Value::String("mirror".into()));
+                    Some((
+                        format!("{prefix}{clone}"),
+                        dump.get(akey)?.clone(),
+                        serde_json::to_vec(&doc).ok()?,
+                    ))
+                })
+            });
+            if let Some((akey, body, sidecar)) = found {
+                for bucket in buckets {
+                    bucket.insert(&akey, body.clone());
+                    bucket.insert(&format!("{akey}.meta.json"), sidecar.clone());
                 }
             }
         }

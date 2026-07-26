@@ -166,6 +166,10 @@ jobs:
           check blind     "were all consumed blind"    --nodes 2 --buckets 1 --ops 80
           check race      "unleased concurrent rebuild" --nodes 2 --buckets 1 --ops 80 --fail-percent 0
           check fallback  "unexplained drift"          --nodes 2 --buckets 1 --ops 80
+          # The partition oracles. Both breaks plant storage damage that no
+          # other oracle can see, so each names exactly one invariant.
+          check freeze-unjustified "FREEZE_UNJUSTIFIED:" --nodes 2 --buckets 1 --ops 80
+          check origin-demoted     "ORIGIN_TERMINALITY:" --nodes 2 --buckets 1 --ops 80
           exit $fail
 
   integration:

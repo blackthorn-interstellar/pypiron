@@ -86,7 +86,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
-use pypiron::buckets::{BucketHandle, BucketSet};
+use pypiron::buckets::{BucketHandle, BucketSet, Pinned};
+use pypiron::replicate::{Record, Verdict};
 use pypiron::sim::{SimClock, SimStorage};
 use pypiron::storage::{FileEntry, ObjectMeta, Storage};
 use pypiron::{replicate, worker, AppState};
@@ -189,6 +190,11 @@ enum Break {
     Blind,
     Race,
     Fallback,
+    /// Freeze a filename nothing ever conflicted over → FREEZE_JUSTIFIED.
+    FreezeUnjustified,
+    /// Walk a privately-claimed package's `.origin` back to mirror →
+    /// ORIGIN_TERMINALITY.
+    OriginDemoted,
 }
 
 /// The package name every phantom-clone break materializes. Not in
@@ -200,7 +206,7 @@ const BREAK_PKG: &str = "vopr-phantom";
 /// reproduce line all read this table: a second list that quietly fails to
 /// track the first is exactly how the reproduce line came to describe a
 /// different run than the one that failed.
-const BREAKS: [(&str, Break); 15] = [
+const BREAKS: [(&str, Break); 17] = [
     ("view", Break::View),
     ("fanout", Break::Fanout),
     ("rerun", Break::Rerun),
@@ -216,6 +222,8 @@ const BREAKS: [(&str, Break); 15] = [
     ("blind", Break::Blind),
     ("race", Break::Race),
     ("fallback", Break::Fallback),
+    ("freeze-unjustified", Break::FreezeUnjustified),
+    ("origin-demoted", Break::OriginDemoted),
 ];
 
 impl Break {
@@ -244,12 +252,22 @@ impl Break {
 /// An acknowledged upload no authorized removal excuses — the subject the
 /// durability family of oracles is actually about. Returns `(pkg, filename,
 /// bytes)`. Raw `dump()` reads only: no op-sequence number, no rng, no trace.
+///
+/// Only a filename with ONE acked byte-set qualifies. Three `--break` kill
+/// proofs corrupt/hide/destroy the bytes this returns and expect exactly one
+/// oracle to red; a filename two buckets acked different bytes for is a subject
+/// whose legal outcomes include the merge having kept the other side, so a
+/// break planted on it would be arguing with the oracle instead of killing it.
 fn unexcused_ack(
     buckets: &[Arc<SimStorage>],
     ledger: &Mutex<Ledger>,
 ) -> Option<(String, String, Vec<u8>)> {
     let ledger = ledger.lock().expect("ledger lock");
-    ledger.acked.iter().find_map(|((pkg, fname), body)| {
+    ledger.acked.iter().find_map(|((pkg, fname), acks)| {
+        let bodies = acked_bodies(acks);
+        if bodies.len() != 1 {
+            return None;
+        }
         let akey = format!("packages/{pkg}/{fname}");
         let excused = ledger.deleted.contains(&(pkg.clone(), fname.clone()))
             || buckets.iter().any(|b| {
@@ -257,7 +275,7 @@ fn unexcused_ack(
                 keys.contains(&format!("{akey}.tombstone"))
                     || keys.contains(&format!("{akey}.frozen"))
             });
-        (!excused).then(|| (pkg.clone(), fname.clone(), body.clone()))
+        (!excused).then(|| (pkg.clone(), fname.clone(), acks[0].body.clone()))
     })
 }
 
@@ -498,6 +516,44 @@ async fn apply_break(
                 buckets[0].insert(&akey, b"resurrected".to_vec());
             }
         }
+        // A freeze over a filename nothing ever conflicted about. Planted on an
+        // acked-DELETED name so the marker is the only thing wrong: the body
+        // and its view entry are already gone, so DURABILITY, VISIBILITY,
+        // CONSERVATION and `pypiron verify` all stay silent and the only claim
+        // left standing is that a freeze must be a real byte conflict.
+        (Break::FreezeUnjustified, false) => {
+            let victim = {
+                let ledger = ledger.lock().expect("ledger lock");
+                ledger
+                    .last_ack_deleted
+                    .iter()
+                    .find(|(_, deleted)| **deleted)
+                    .map(|((pkg, fname), _)| format!("packages/{pkg}/{fname}"))
+            };
+            if let Some(akey) = victim {
+                for bucket in buckets {
+                    bucket.insert(&format!("{akey}.frozen"), b"{}".to_vec());
+                }
+            }
+        }
+        // The origin lattice walked backwards: a package a private upload
+        // claimed reads `mirror` again. Applied fleet-wide so the buckets stay
+        // converged and the sidecars stay private — nothing else can catch it.
+        (Break::OriginDemoted, false) => {
+            let victim = {
+                let ledger = ledger.lock().expect("ledger lock");
+                ledger.private_claimed.iter().next().cloned()
+            };
+            if let Some(pkg) = victim {
+                let claim = format!(r#"{{"origin":"mirror","nonce":"{}"}}"#, "0".repeat(32));
+                for bucket in buckets {
+                    bucket.insert(
+                        &format!("packages/{pkg}/.origin"),
+                        claim.clone().into_bytes(),
+                    );
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -583,9 +639,12 @@ enum R {
     GlobalBlind,
     GlobalRace,
     GlobalFallback,
+    MergeDivergence,
+    FreezeJustified,
+    OriginTerminality,
 }
 
-const REACH_SLOTS: usize = 19;
+const REACH_SLOTS: usize = 22;
 
 /// `(label, what exactly one execution counts)` — in `R`'s declaration order.
 const REACH_METER: [(&str, &str); REACH_SLOTS] = [
@@ -653,6 +712,15 @@ const REACH_METER: [(&str, &str); REACH_SLOTS] = [
         "older global write by another op tested for being fresher",
     ),
     ("classifier/global FALLBACK", "flip no test above explained"),
+    (
+        "MERGE_DIVERGENCE",
+        "merge-resolution object the fleet had to produce",
+    ),
+    ("FREEZE_JUSTIFIED", ".frozen marker traced to its evidence"),
+    (
+        "ORIGIN_TERMINALITY",
+        "privately-claimed package checked on a bucket",
+    ),
 ];
 
 /// Zeros that are a known property of the harness or the product, not a hole.
@@ -702,6 +770,17 @@ const EXPECTED_ZERO: [(usize, &str); 10] = [
     ),
 ];
 
+/// Slots whose subject is a *tail* event, where thin per-seed reach is the
+/// honest reading rather than a starved workload — but a flat zero is still a
+/// defect. A cross-bucket byte conflict needs two overlapping publishes of one
+/// filename with different bytes on two buckets; measured on a fully
+/// partitioned soak it lands on 48% of seeds on a fixed multi-bucket profile
+/// and 19% under rotation, where a third of the drawn topologies are
+/// single-bucket and cannot conflict at all. A floor no healthy run can meet is
+/// a gate people learn to ignore, so these two are exempt from the *share*
+/// check only: `reach_verdict` still fails them on zero.
+const FLOOR_EXEMPT: [usize; 2] = [R::MergeDivergence as usize, R::FreezeJustified as usize];
+
 /// The share of seeds an oracle must execute on. A run-total hit count cannot
 /// tell "checked a lot, on every seed" from "checked a lot on a fifth of the
 /// seeds and nothing on the rest" — and the second is the same unfalsifiable
@@ -732,6 +811,8 @@ struct Reach {
     peak_drains: AtomicU64,
     /// True once any explored profile had more than one bucket.
     multi_bucket: AtomicBool,
+    /// True once any explored seed actually drew a split partition plan.
+    partitioned: AtomicBool,
 }
 
 static REACH: Reach = Reach::new();
@@ -745,6 +826,7 @@ impl Reach {
             peak_rounds: AtomicU64::new(0),
             peak_drains: AtomicU64::new(0),
             multi_bucket: AtomicBool::new(false),
+            partitioned: AtomicBool::new(false),
         }
     }
     fn hit(&self, slot: R) {
@@ -771,9 +853,17 @@ impl Reach {
 /// Why a zero reading on `slot` is expected. Topology first: a single-bucket
 /// sample cannot reach the two replication oracles, and calling that a hole
 /// would train everyone to ignore the gate.
-fn expected_zero(slot: usize, multi_bucket: bool) -> Option<&'static str> {
+fn expected_zero(slot: usize, multi_bucket: bool, partitioned: bool) -> Option<&'static str> {
     if !multi_bucket && (slot == R::Convergence as usize || slot == R::AckTotality as usize) {
         return Some("single-bucket sample — the oracle needs >1 bucket");
+    }
+    // The merge algebra's conflict arms need two buckets that disagree, which
+    // only a partitioned fleet produces. An aligned sample fans every byte out
+    // from one writer, so these have no subject — say so rather than train
+    // everyone to ignore the gate.
+    if !partitioned && (slot == R::MergeDivergence as usize || slot == R::FreezeJustified as usize)
+    {
+        return Some("aligned sample — the oracle needs a partitioned fleet (--partition)");
     }
     EXPECTED_ZERO
         .iter()
@@ -797,6 +887,7 @@ fn reach_verdict(
     seeds: u64,
     excuse: Option<&'static str>,
     broken: bool,
+    floor_exempt: bool,
 ) -> (String, bool) {
     match (hits, excuse) {
         (0, Some(why)) => (format!("  [zero, expected: {why}]"), false),
@@ -810,6 +901,12 @@ fn reach_verdict(
         ),
         (_, None) => {
             let percent = seeds_reached * 100 / seeds.max(1);
+            if floor_exempt {
+                return (
+                    format!("  [tail event, floor waived: {percent}% of seeds]"),
+                    false,
+                );
+            }
             if percent < REACH_FLOOR_PERCENT && !broken {
                 (
                     format!(
@@ -829,6 +926,7 @@ fn reach_verdict(
 /// too few seeds, with no standing excuse — what `--require-reach` fails on.
 fn report_reach(explored: u64, rechecked: u64, brk: Break) -> Vec<&'static str> {
     let multi = REACH.multi_bucket.load(Ordering::Relaxed);
+    let partitioned = REACH.partitioned.load(Ordering::Relaxed);
     let mut unreached = Vec::new();
     println!(
         "vopr: oracle reach over {explored} seeds — executions on NON-TRIVIAL input, and the \
@@ -850,8 +948,9 @@ fn report_reach(explored: u64, rechecked: u64, brk: Break) -> Vec<&'static str> 
             hits,
             seeds_reached,
             seeds,
-            expected_zero(slot, multi),
+            expected_zero(slot, multi, partitioned),
             brk != Break::None,
+            FLOOR_EXEMPT.contains(&slot),
         );
         if failed {
             unreached.push(*label);
@@ -868,6 +967,253 @@ fn report_reach(explored: u64, rechecked: u64, brk: Break) -> Vec<&'static str> 
         DRAIN_PASSES.saturating_sub(drains),
     );
     unreached
+}
+
+// ---------------------------------------------------------------------------
+// The merge meter: which arms of `replicate::decide` the workload actually
+// presented, and what the executors left behind.
+//
+// The reach meter answers "did the ORACLE run". This answers the same question
+// of the PRODUCT's merge algebra, and it exists because the answer used to be
+// "only Copy and Noop, ever" — a whole subsystem carried by unit tests and
+// nothing else. Two independent readings, because either alone is arguable:
+//
+//   * verdicts — every bucket pair x filename run through the real
+//     `replicate::decide` on raw dumps, at the end of the chaos phase and at
+//     each heal round. It proves the *situations* were produced. It is a
+//     sample, so it under-counts arms the executors resolve between snapshots.
+//   * evidence — objects at quiescence only a merge executor can create:
+//     `.frozen` markers, `_quarantine/` bodies, `.mirror-quarantined` markers.
+//     Durable and exact, but coarser: `Freeze`, `QuarantineLoser` and
+//     `Supersede` all quarantine.
+//
+// Printed, never gated: conflicts are far rarer than the 25%-of-seeds reach
+// floor, so one `R::` slot per verdict would red a healthy run. `R::MergeDivergence`
+// is the single gated slot, and it measures the *workload* (an acked filename
+// two buckets committed different bytes under), not any one verdict.
+//
+// Non-perturbing by construction: raw `dump()` reads, a pure function, relaxed
+// atomics. No `FaultView`, no rng, no await.
+// ---------------------------------------------------------------------------
+
+const VERDICT_SLOTS: usize = 9;
+const VERDICT_LABELS: [&str; VERDICT_SLOTS] = [
+    "Noop",
+    "Copy",
+    "AdoptSidecar",
+    "Supersede",
+    "QuarantineLoser",
+    "Freeze",
+    "PropagateFreeze",
+    "FinishFreeze",
+    "Tombstone",
+];
+
+const EVIDENCE_SLOTS: usize = 3;
+const EVIDENCE_LABELS: [(&str, &str); EVIDENCE_SLOTS] = [
+    (
+        "<file>.frozen",
+        "Freeze / PropagateFreeze / FinishFreeze froze a side",
+    ),
+    (
+        "_quarantine/<pkg>/<file>@sha",
+        "a losing body preserved (Freeze, QuarantineLoser, Supersede)",
+    ),
+    (
+        "<file>.mirror-quarantined",
+        "a mirror body made inert under a private claim",
+    ),
+];
+
+struct Merge {
+    verdicts: [AtomicU64; VERDICT_SLOTS],
+    verdict_seeds: [AtomicU64; VERDICT_SLOTS],
+    verdict_mark: [AtomicU64; VERDICT_SLOTS],
+    evidence: [AtomicU64; EVIDENCE_SLOTS],
+    evidence_seeds: [AtomicU64; EVIDENCE_SLOTS],
+    evidence_mark: [AtomicU64; EVIDENCE_SLOTS],
+}
+
+static MERGE: Merge = Merge::new();
+
+impl Merge {
+    const fn new() -> Self {
+        Merge {
+            verdicts: [const { AtomicU64::new(0) }; VERDICT_SLOTS],
+            verdict_seeds: [const { AtomicU64::new(0) }; VERDICT_SLOTS],
+            verdict_mark: [const { AtomicU64::new(0) }; VERDICT_SLOTS],
+            evidence: [const { AtomicU64::new(0) }; EVIDENCE_SLOTS],
+            evidence_seeds: [const { AtomicU64::new(0) }; EVIDENCE_SLOTS],
+            evidence_mark: [const { AtomicU64::new(0) }; EVIDENCE_SLOTS],
+        }
+    }
+    /// Same seed-boundary bookkeeping the reach meter uses, so both tables read
+    /// "hits, and the seeds that got any" on one denominator.
+    fn end_of_seed(&self) {
+        for (totals, (marks, seeds)) in [
+            (
+                &self.verdicts[..],
+                (&self.verdict_mark[..], &self.verdict_seeds[..]),
+            ),
+            (
+                &self.evidence[..],
+                (&self.evidence_mark[..], &self.evidence_seeds[..]),
+            ),
+        ] {
+            for ((total, mark), seed) in totals.iter().zip(marks).zip(seeds) {
+                let now = total.load(Ordering::Relaxed);
+                if now > mark.swap(now, Ordering::Relaxed) {
+                    seed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+fn verdict_slot(verdict: &Verdict) -> usize {
+    match verdict {
+        Verdict::Noop => 0,
+        Verdict::Copy(_) => 1,
+        Verdict::AdoptSidecar(_) => 2,
+        Verdict::Supersede(_) => 3,
+        Verdict::QuarantineLoser(_) => 4,
+        Verdict::Freeze => 5,
+        Verdict::PropagateFreeze(_) => 6,
+        Verdict::FinishFreeze => 7,
+        Verdict::Tombstone => 8,
+    }
+}
+
+/// Companion suffixes a record name can wear; stripping one yields the
+/// filename the merge reasons about.
+const RECORD_SUFFIXES: [&str; 6] = [
+    ".meta.json",
+    ".tombstone",
+    ".frozen",
+    ".mirror-quarantined",
+    ".metadata",
+    ".provenance",
+];
+
+/// Every (package, filename) any bucket holds a record object for.
+fn record_names(
+    dumps: &[BTreeMap<String, Vec<u8>>],
+) -> std::collections::BTreeSet<(String, String)> {
+    let mut names = std::collections::BTreeSet::new();
+    for dump in dumps {
+        for key in dump.keys() {
+            let Some((pkg, name)) = key
+                .strip_prefix("packages/")
+                .and_then(|rest| rest.split_once('/'))
+            else {
+                continue;
+            };
+            if name.contains('/') {
+                continue;
+            }
+            let base = RECORD_SUFFIXES
+                .iter()
+                .find_map(|suffix| name.strip_suffix(suffix))
+                .unwrap_or(name);
+            if pypiron::sidecar::is_artifact(base) {
+                names.insert((pkg.to_string(), base.to_string()));
+            }
+        }
+    }
+    names
+}
+
+/// One bucket's view of one filename, rebuilt from raw bytes exactly as
+/// `replicate`'s reader assembles it.
+fn record_from_dump(dump: &BTreeMap<String, Vec<u8>>, pkg: &str, fname: &str) -> Record {
+    let akey = format!("packages/{pkg}/{fname}");
+    let has = |suffix: &str| dump.contains_key(&format!("{akey}{suffix}"));
+    Record {
+        sidecar: dump
+            .get(&format!("{akey}.meta.json"))
+            .and_then(|bytes| serde_json::from_slice(bytes).ok()),
+        has_artifact: dump.contains_key(&akey),
+        has_metadata: has(".metadata"),
+        has_provenance: has(".provenance"),
+        tombstoned: has(".tombstone"),
+        frozen: has(".frozen"),
+        mirror_quarantined: has(".mirror-quarantined"),
+        pkg_origin: dump
+            .get(&format!("packages/{pkg}/.origin"))
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            .and_then(|doc| {
+                doc.get("origin")
+                    .and_then(|o| o.as_str())
+                    .and_then(pypiron::replicate::Origin::parse)
+            }),
+    }
+}
+
+/// Run every bucket pair x filename through the real merge decision and tally
+/// the verdicts this world would produce.
+fn sample_verdicts(dumps: &[BTreeMap<String, Vec<u8>>]) {
+    if dumps.len() < 2 {
+        return;
+    }
+    for (pkg, fname) in record_names(dumps) {
+        for (i, a) in dumps.iter().enumerate() {
+            for b in dumps.iter().skip(i + 1) {
+                let verdict = pypiron::replicate::decide(
+                    &record_from_dump(a, &pkg, &fname),
+                    &record_from_dump(b, &pkg, &fname),
+                );
+                MERGE.verdicts[verdict_slot(&verdict)].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Count the durable objects only a merge executor writes.
+fn count_merge_evidence(dumps: &[BTreeMap<String, Vec<u8>>]) {
+    for dump in dumps {
+        for key in dump.keys() {
+            let slot = if key.ends_with(".frozen") {
+                0
+            } else if key.starts_with("_quarantine/") {
+                1
+            } else if key.ends_with(".mirror-quarantined") {
+                2
+            } else {
+                continue;
+            };
+            MERGE.evidence[slot].fetch_add(1, Ordering::Relaxed);
+            // The one gated reading of the merge algebra. Its unit is a
+            // resolution the fleet actually had to perform, not any single
+            // verdict: an acked filename two buckets committed different bytes
+            // under is far too rare to hold a 25%-of-seeds floor (measured at
+            // 1-6%), and a floor no healthy run can meet is a gate people
+            // learn to ignore. This one reads 33-47% of seeds on a partitioned
+            // soak and drops to zero the moment conflicts stop being produced,
+            // which is the regression it exists to catch.
+            REACH.hit(R::MergeDivergence);
+        }
+    }
+}
+
+fn report_merge(explored: u64) {
+    println!(
+        "vopr: merge algebra over {explored} seeds — every bucket pair x filename run through the \
+         real `replicate::decide` at the end of the chaos phase and at each heal round (a sample: \
+         verdicts the executors resolve between snapshots are missed):"
+    );
+    for (slot, label) in VERDICT_LABELS.iter().enumerate() {
+        let hits = MERGE.verdicts[slot].load(Ordering::Relaxed);
+        let seeds = MERGE.verdict_seeds[slot].load(Ordering::Relaxed);
+        let note = if hits == 0 { "  [never presented]" } else { "" };
+        println!("  decide -> {label:<26} {hits:>10}  on {seeds:>7}/{explored} seeds{note}");
+    }
+    println!("vopr: merge evidence at quiescence — objects only a merge executor creates:");
+    for (slot, (label, what)) in EVIDENCE_LABELS.iter().enumerate() {
+        let hits = MERGE.evidence[slot].load(Ordering::Relaxed);
+        let seeds = MERGE.evidence_seeds[slot].load(Ordering::Relaxed);
+        let note = if hits == 0 { "  [never created]" } else { "" };
+        println!("  {label:<32} {hits:>10}  on {seeds:>7}/{explored} seeds  {what}{note}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1559,10 +1905,30 @@ struct Fleet {
     next_op: std::cell::Cell<u64>,
 }
 
+/// One acknowledged upload. Recorded per ack, never per filename: a
+/// partitioned fleet can ack two *different* byte-sets under one name (two
+/// nodes writing to two buckets), and an overwrite-on-ack map would keep only
+/// the last — then demand exactly those bytes on every bucket, red-flagging a
+/// merge that legitimately kept the other side.
+struct Ack {
+    /// `pinned.index` at the moment `publish_record` returned Ok — where these
+    /// bytes were authored. CONSERVATION and FREEZE_JUSTIFIED both need it: a
+    /// conflict loser survives under `_quarantine/` on the bucket that lost.
+    bucket: usize,
+    body: Vec<u8>,
+    /// Monotonic under the ledger mutex — the total order the harness observed.
+    /// Diagnostics only: `last_ack_deleted` still owns resurrection ordering.
+    seq: u64,
+}
+
 #[derive(Default)]
 struct Ledger {
-    /// Acknowledged uploads: (pkg, filename) -> body bytes.
-    acked: BTreeMap<(String, String), Vec<u8>>,
+    /// EVERY acknowledged upload, in ack order: (pkg, filename) -> acks.
+    acked: BTreeMap<(String, String), Vec<Ack>>,
+    /// Packages for which a PRIVATE publish acked. Origin exclusivity is
+    /// monotone — private is terminal — so the fleet may never afterwards
+    /// settle on a mirror claim for one of these (ORIGIN_TERMINALITY).
+    private_claimed: std::collections::BTreeSet<String>,
     /// Filenames an acknowledged (204) delete removed.
     deleted: std::collections::BTreeSet<(String, String)>,
     /// Per filename, whether the most recent *acknowledged* operation was the
@@ -1585,6 +1951,97 @@ struct Ledger {
     ack_totality: Vec<String>,
     published_attempts: u64,
     delete_attempts: u64,
+    next_ack_seq: u64,
+}
+
+impl Ledger {
+    fn record_ack(&mut self, pkg: &str, fname: &str, bucket: usize, body: Vec<u8>) {
+        self.next_ack_seq += 1;
+        let seq = self.next_ack_seq;
+        self.acked
+            .entry((pkg.to_string(), fname.to_string()))
+            .or_default()
+            .push(Ack { bucket, body, seq });
+    }
+}
+
+/// The distinct byte-sets acknowledged under one filename. One is the ordinary
+/// case; two is a cross-bucket byte conflict the merge is entitled to resolve
+/// either way — but never to satisfy with bytes nobody acked, and never to
+/// leave the fleet split over.
+fn acked_bodies(acks: &[Ack]) -> std::collections::BTreeSet<&[u8]> {
+    acks.iter().map(|a| a.body.as_slice()).collect()
+}
+
+/// Every `_quarantine/<pkg>/<file>@<sha12>` body the fleet preserved for one
+/// filename. This is the *evidence* an authorized merge left behind when it
+/// stopped serving a byte-set: `QuarantineLoser`, `Supersede` and `Freeze` all
+/// copy the losing body here before touching it, and the operator is alarmed.
+/// Nothing in the product ever deletes from `_quarantine/`.
+fn quarantined_bodies<'a>(
+    dumps: &'a [BTreeMap<String, Vec<u8>>],
+    pkg: &str,
+    fname: &str,
+) -> std::collections::BTreeSet<&'a [u8]> {
+    let prefix = format!("_quarantine/{pkg}/{fname}@");
+    dumps
+        .iter()
+        .flat_map(|dump| dump.iter())
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .map(|(_, bytes)| bytes.as_slice())
+        .collect()
+}
+
+/// Per-bucket record shape, for a failure message somebody has to triage: what
+/// each bucket holds under one filename, and what the fleet quarantined.
+fn marker_census(dumps: &[BTreeMap<String, Vec<u8>>], pkg: &str, fname: &str) -> String {
+    let akey = format!("packages/{pkg}/{fname}");
+    let per_bucket: Vec<String> = dumps
+        .iter()
+        .enumerate()
+        .map(|(idx, dump)| {
+            let mut shape: Vec<&str> = Vec::new();
+            if dump.contains_key(&akey) {
+                shape.push("body");
+            }
+            for suffix in RECORD_SUFFIXES {
+                if dump.contains_key(&format!("{akey}{suffix}")) {
+                    shape.push(suffix);
+                }
+            }
+            format!("b{idx}[{}]", shape.join(" "))
+        })
+        .collect();
+    let quarantine: Vec<String> = quarantined_bodies(dumps, pkg, fname)
+        .iter()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .collect();
+    format!("{} quarantine={quarantine:?}", per_bucket.join(" "))
+}
+
+/// Whether the renderer deliberately leaves this record out of the package
+/// view (`worker::load_file_metadata`, mirrored by `verify::suppressed_mirror`):
+/// a mirror record under a private claim, or a quarantined mirror body a
+/// private upload has not superseded. Invisible-by-design, not a lost record —
+/// the dependency-confusion boundary, and the one thing VISIBILITY must not
+/// mistake for a dropped index entry.
+fn renderer_omits(dump: &BTreeMap<String, Vec<u8>>, pkg: &str, fname: &str) -> bool {
+    let akey = format!("packages/{pkg}/{fname}");
+    let origin = dump
+        .get(&format!("{akey}.meta.json"))
+        .and_then(|bytes| serde_json::from_slice::<pypiron::sidecar::Sidecar>(bytes).ok())
+        .and_then(|sc| sc.origin);
+    let quarantined = dump.contains_key(&format!("{akey}.mirror-quarantined"));
+    let claim = dump
+        .get(&format!("packages/{pkg}/.origin"))
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .and_then(|doc| {
+            doc.get("origin")
+                .and_then(|o| o.as_str())
+                .map(str::to_string)
+        });
+    (claim.as_deref() == Some("private") && origin.as_deref() == Some("mirror"))
+        || (quarantined && origin.as_deref() != Some("private"))
 }
 
 fn build_node_state(
@@ -1678,6 +2135,110 @@ impl Fleet {
 }
 
 // ---------------------------------------------------------------------------
+// The partitioned fleet: writers that do not all pin bucket 0.
+//
+// Every writer in this harness used to pin the *selected* bucket, which
+// `BucketSet::new` fixes at index 0 and nothing here ever switches. So every
+// byte on buckets 1..N arrived as a COPY of bucket 0's — two buckets could
+// never disagree about the bytes under one live filename, and
+// `replicate::decide`'s merge algebra was dead code in simulation: only `Copy`
+// and `Noop` ever fired. dev/DESIGN.md says outright that correctness must not
+// depend on every node selecting the same bucket, and calls the private
+// byte-conflict the partition case. This is that case.
+//
+// A partitioned seed gives each node a HOME bucket and authors its uploads and
+// deletes there. The home is a per-seed property, not a per-write coin flip:
+// `BucketSet::switch` is health-driven and sticky, a pin is captured once per
+// operation and never torn (design §3), so a per-write flip would manufacture
+// an interleaving the product cannot produce — and any bug found there would be
+// unactionable. Ticks, sweeps, reconciles and audits keep the *selected* pin:
+// `state.global_names` and `state.inventory` describe the selected bucket and
+// carry no bucket key, so pointing a rebuild at a peer through this seam would
+// produce harness-invented stale-index failures, not findings.
+// ---------------------------------------------------------------------------
+
+/// Share of publishes that arrive as a mirror record on a partitioned seed.
+/// Mirror uploads are the other half of the gap: `Supersede`, the
+/// `QuarantinedMirror` record state and every `.mirror-quarantined` path need a
+/// package claimed `mirror` on one bucket and `private` on another, which is
+/// what two concurrent first-writes racing the pre-artifact `.origin` fan-out
+/// produce. Kept a minority — a mirror-dominated corpus starves the private
+/// conflict arms, and `delete_record` refuses mirror eviction in multi-bucket
+/// mode, so those deletes 409 and never enter the ledger.
+const MIRROR_PERCENT: u64 = 12;
+
+/// A seed's partition plan: which bucket each node authors truth on.
+#[derive(Clone)]
+struct Partition {
+    /// `homes[node]` — the bucket that node's publishes and deletes write to.
+    /// All zeros on an aligned seed, which is byte-identical to the pre-
+    /// partition harness: `write_pin` short-circuits to `state.pin()`.
+    homes: Vec<usize>,
+    /// Percent of publishes drawn as mirror fills; 0 on an aligned seed.
+    mirror_percent: u64,
+    split: bool,
+}
+
+/// Draw the plan. Pure in the seed and from a DEDICATED rng — never the chaos
+/// stream — so arming partitioning cannot shift which op a chaos draw picks on
+/// an aligned seed, and `restart_node` can re-read a node's home without
+/// consuming entropy (`--seed N` must reproduce exactly).
+fn partition_for(seed: u64, nodes: usize, buckets: usize, percent: u64) -> Partition {
+    let mut homes = vec![0usize; nodes];
+    if percent == 0 || buckets < 2 {
+        // A partition needs two buckets to be partitioned across.
+        return Partition {
+            homes,
+            mirror_percent: 0,
+            split: false,
+        };
+    }
+    let mut rng = Rng::new(seed ^ 0x9A17_1710_D1FF_0000);
+    if !rng.chance(percent) {
+        return Partition {
+            homes,
+            mirror_percent: 0,
+            split: false,
+        };
+    }
+    // Node 0 stays home to bucket 0, so the fleet always has a bucket-0 writer
+    // and a split seed is a partition rather than a wholesale relocation.
+    for home in homes.iter_mut().skip(1) {
+        *home = rng.below(buckets as u64) as usize;
+    }
+    Partition {
+        homes,
+        mirror_percent: MIRROR_PERCENT,
+        split: true,
+    }
+}
+
+/// The storage context a node's write authors truth through: its home bucket's
+/// handle, at that bucket's own cache generation.
+///
+/// Built here rather than through `BucketSet::switch` (crate-private, and a
+/// switch would also move this node's tick/audit selection — see the module
+/// note above). Every field of `Pinned` is public precisely so a harness can
+/// say "this write landed on a bucket this node did not select"; `publish_record`
+/// and `delete_record` do all their I/O through `pinned.storage` and address
+/// every other bucket from `pinned.index`, so both are correct for any pin.
+fn write_pin(state: &AppState, home: usize) -> Arc<Pinned> {
+    let selected = state.pin();
+    if home == selected.index {
+        return selected;
+    }
+    Arc::new(Pinned {
+        storage: state.buckets.handles()[home].storage.clone(),
+        // A distinct generation per bucket. `generation` is the ONLY key the
+        // index and presign caches namespace on (src/cache.rs), so two pins
+        // over two buckets at generation 0 would share one cache — which is
+        // exactly why `switch` bumps it.
+        generation: home as u64,
+        index: home,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Workload ops.
 // ---------------------------------------------------------------------------
 
@@ -1707,6 +2268,7 @@ fn ack_totality_failures(
     REACH.hit(R::AckTotality);
     let akey = format!("packages/{pkg}/{fname}");
     let mkey = format!("{akey}.meta.json");
+    let quarantine = format!("_quarantine/{pkg}/{fname}@");
     let selected_keys = buckets[selected].keys();
     buckets
         .iter()
@@ -1716,7 +2278,19 @@ fn ack_totality_failures(
             let keys = peer.keys();
             let has_record = keys.contains(&akey) && keys.contains(&mkey);
             let owed = format!("_repl/{i}/{pkg}/{fname}!");
-            !has_record && !selected_keys.iter().any(|k| k.starts_with(&owed))
+            // A partitioned fan-out can find the peer holding a CONFLICTING
+            // record, in which case `replicate_record` runs the merge instead
+            // of a copy: the peer legitimately ends up frozen, tombstoned, or
+            // holding the superseding side, and is owed nothing. Storage
+            // evidence of that decision exempts — the peer carrying no record,
+            // no note and no merge marker is still a broken promise.
+            let merged = keys.iter().any(|k| {
+                k.starts_with(&quarantine)
+                    || *k == format!("{akey}.frozen")
+                    || *k == format!("{akey}.tombstone")
+                    || *k == format!("{akey}.mirror-quarantined")
+            });
+            !has_record && !merged && !selected_keys.iter().any(|k| k.starts_with(&owed))
         })
         .map(|(i, _)| {
             format!(
@@ -1728,6 +2302,7 @@ fn ack_totality_failures(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn op_publish(
     state: Arc<AppState>,
     ledger: Arc<Mutex<Ledger>>,
@@ -1736,6 +2311,8 @@ async fn op_publish(
     pkg: String,
     file: u8,
     variant: u8,
+    home: usize,
+    is_mirror: bool,
 ) {
     use sha2::digest::Digest;
     let body = body_bytes(&pkg, file, variant);
@@ -1753,7 +2330,7 @@ async fn op_publish(
         size: body.len() as u64,
         version: format!("{}.0", file + 1),
         requires_python: None,
-        is_mirror: false,
+        is_mirror,
         upload_time: clock.now_rfc3339(),
         yanked: pypiron::sidecar::Yanked::Flag(false),
         wheel_metadata: None,
@@ -1761,20 +2338,31 @@ async fn op_publish(
         provenance: None,
         body: pypiron::PublishBody::Bytes(body.clone()),
     };
-    let pinned = state.pin();
+    let pinned = write_pin(&state, home);
     if pypiron::publish_record(&state, &pinned, req).await.is_ok() {
         let mut failures = ack_totality_failures(&buckets, pinned.index, &pkg, &fname);
         let mut ledger = ledger.lock().expect("ledger lock");
         ledger.ack_totality.append(&mut failures);
-        ledger.acked.insert((pkg.clone(), fname.clone()), body);
+        ledger.record_ack(&pkg, &fname, pinned.index, body);
+        if !is_mirror {
+            // Private is terminal in the origin lattice; the fleet may never
+            // settle back on `mirror` for this name (ORIGIN_TERMINALITY).
+            ledger.private_claimed.insert(pkg.clone());
+        }
         ledger.last_ack_deleted.insert((pkg, fname), false);
     }
 }
 
-async fn op_delete(state: Arc<AppState>, ledger: Arc<Mutex<Ledger>>, pkg: String, file: u8) {
+async fn op_delete(
+    state: Arc<AppState>,
+    ledger: Arc<Mutex<Ledger>>,
+    pkg: String,
+    file: u8,
+    home: usize,
+) {
     let fname = filename(&pkg, file);
     ledger.lock().expect("ledger lock").delete_attempts += 1;
-    let pinned = state.pin();
+    let pinned = write_pin(&state, home);
     if pypiron::delete_record(&state, &pinned, &pkg, &fname)
         .await
         .is_ok()
@@ -1829,7 +2417,12 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
         fail_percent,
         weights,
         brk,
+        partition_percent,
     } = profile;
+    let plan = partition_for(seed, nodes, buckets, partition_percent);
+    if plan.split {
+        REACH.partitioned.store(true, Ordering::Relaxed);
+    }
     let weight_total: u64 = weights.iter().map(|w| u64::from(*w)).sum();
     let start =
         time::OffsetDateTime::parse(SIM_START, &time::format_description::well_known::Rfc3339)
@@ -1857,20 +2450,32 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                 let pkg = PACKAGE_NAMES[rng.below(packages as u64) as usize].to_string();
                 let file = rng.below(u64::from(files)) as u8;
                 let variant = rng.below(2) as u8;
+                // Short-circuits on an aligned seed, so the entropy budget of a
+                // publish is unchanged there and every pinned seed still means
+                // what its comment says.
+                let is_mirror = plan.mirror_percent > 0 && rng.chance(plan.mirror_percent);
                 let clock = fleet.clock.clone();
                 let buckets = fleet.buckets.clone();
+                let home = plan.homes[node];
                 fleet.spawn_on(
                     node,
-                    op_publish(state, ledger, clock, buckets, pkg, file, variant),
+                    op_publish(
+                        state, ledger, clock, buckets, pkg, file, variant, home, is_mirror,
+                    ),
                 );
             }
             1 => {
                 let pkg = PACKAGE_NAMES[rng.below(packages as u64) as usize].to_string();
                 let file = rng.below(u64::from(files)) as u8;
-                fleet.spawn_on(node, op_delete(state, ledger, pkg, file));
+                let home = plan.homes[node];
+                fleet.spawn_on(node, op_delete(state, ledger, pkg, file, home));
             }
             2 => {
-                let lease = fleet.tick_lock[0].clone(); // every pin selects bucket 0
+                // The *selected* bucket is still 0 on every node — a
+                // partitioned node diverges only its writes, never its
+                // rebuilds — so one lease still serializes every tick, and the
+                // `PkgRace`/`GlobalRace` EXPECTED_ZERO excuses still hold.
+                let lease = fleet.tick_lock[0].clone();
                 fleet.spawn_on(node, op_tick(state, lease));
             }
             3 => {
@@ -1903,6 +2508,9 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
         // Let the paused runtime interleave whatever is in flight.
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
+    // The most divergent moment there is: the partition still in force and the
+    // faults still on. Raw dumps, so the sample cannot move the schedule.
+    sample_verdicts(&fleet.buckets.iter().map(|b| b.dump()).collect::<Vec<_>>());
 
     // ---- Heal phase: stop faults, restart everyone, then drive the fleet
     // the way production does — worker ticks, note sweeps, warm drains, the
@@ -1934,6 +2542,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
             .any(|k| k.starts_with("_dirty/") || k.starts_with("_repl/"))
     });
     for round in 0..HEAL_ROUNDS {
+        sample_verdicts(&fleet.buckets.iter().map(|b| b.dump()).collect::<Vec<_>>());
         // Drain markers across every node until none remain (bounded).
         for pass in 0..DRAIN_PASSES {
             for node in 0..nodes {
@@ -2277,6 +2886,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
     }
     let dumps: Vec<BTreeMap<String, Vec<u8>>> =
         fleet.buckets.iter().map(|bucket| bucket.dump()).collect();
+    count_merge_evidence(&dumps);
 
     // VIEWS == TRUTH, byte-strict: the product's own oracle (`pypiron verify`)
     // re-renders every view from that bucket's truth and diffs the bytes. Run
@@ -2393,7 +3003,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
 
     for (bucket_idx, dump) in dumps.iter().enumerate() {
         // Durability of acknowledged uploads.
-        for ((pkg, fname), body) in &ledger.acked {
+        for ((pkg, fname), acks) in &ledger.acked {
             let akey = format!("packages/{pkg}/{fname}");
             let tomb = dump.contains_key(&format!("{akey}.tombstone"));
             let frozen = dump.contains_key(&format!("{akey}.frozen"));
@@ -2401,28 +3011,60 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                 continue; // authorized removal or conflict freeze
             }
             REACH.hit(R::Durability);
+            // One acked byte-set is the ordinary case and stays byte-strict.
+            // Two is a cross-bucket byte conflict: the merge is entitled to
+            // keep EITHER side (`conflict_winner` orders by the server-stamped
+            // receive time, which the harness cannot reproduce — a clock jump
+            // can land between the stamp and the ack), so the claim narrows to
+            // "the bytes standing here are bytes somebody acked". It does NOT
+            // narrow further than that: the fleet may not settle on two of them
+            // at once (checked once, below) and it may not lose either (that is
+            // CONSERVATION's clause, which a freeze no longer escapes).
+            let bodies = acked_bodies(acks);
             match dump.get(&akey) {
                 None => violations.push(format!(
                     "DURABILITY: acked {akey} missing on bucket {bucket_idx}"
                 )),
-                Some(stored) if stored != body => violations.push(format!(
-                    "DURABILITY: acked {akey} byte-corrupt on bucket {bucket_idx}"
-                )),
+                // Bytes nobody acked stand here. Legal only when the merge
+                // superseded the acked bytes and PRESERVED them: a
+                // `_quarantine/` copy is the authorized-removal evidence, and
+                // the operator was alarmed. Without it, an acknowledged upload
+                // was silently replaced.
+                Some(stored)
+                    if !bodies.contains(stored.as_slice())
+                        && !bodies
+                            .iter()
+                            .all(|b| quarantined_bodies(&dumps, pkg, fname).contains(b)) =>
+                {
+                    violations.push(format!(
+                        "DURABILITY: acked {akey} on bucket {bucket_idx} serves bytes no ack \
+                         carried, and the acked bytes are not preserved under _quarantine/ \
+                         either ({} acked byte-set(s), acks (seq,bucket) {:?})",
+                        bodies.len(),
+                        acks.iter().map(|a| (a.seq, a.bucket)).collect::<Vec<_>>(),
+                    ));
+                }
                 Some(_) => {
                     if !dump.contains_key(&format!("{akey}.meta.json")) {
                         violations.push(format!(
                             "DURABILITY: acked {akey} lost its sidecar on bucket {bucket_idx}"
                         ));
                     }
-                    REACH.hit(R::Visibility);
-                    let view = dump
-                        .get(&format!("simple/{pkg}/index.json"))
-                        .map(|b| String::from_utf8_lossy(b).into_owned())
-                        .unwrap_or_default();
-                    if !view.contains(fname.as_str()) {
-                        violations.push(format!(
-                            "VISIBILITY: acked {akey} not listed in bucket {bucket_idx}'s view"
-                        ));
+                    // A mirror record under a private claim is invisible by
+                    // design — that IS the dependency-confusion boundary — so
+                    // the renderer's own omission rules exempt, and nothing
+                    // else does.
+                    if !renderer_omits(dump, pkg, fname) {
+                        REACH.hit(R::Visibility);
+                        let view = dump
+                            .get(&format!("simple/{pkg}/index.json"))
+                            .map(|b| String::from_utf8_lossy(b).into_owned())
+                            .unwrap_or_default();
+                        if !view.contains(fname.as_str()) {
+                            violations.push(format!(
+                                "VISIBILITY: acked {akey} not listed in bucket {bucket_idx}'s view"
+                            ));
+                        }
                     }
                 }
             }
@@ -2446,35 +3088,168 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                 ));
             }
         }
+    }
 
-        // Conservation: acked bytes must exist somewhere unless an authorized
-        // delete or freeze removed them. The tombstone is the point of no
-        // return, so storage evidence (a tombstone/freeze marker on any
-        // bucket) exempts — an interrupted delete that crashed after its
-        // tombstone but before its 204 has still legitimately destroyed.
-        for ((pkg, fname), body) in &ledger.acked {
-            let akey = format!("packages/{pkg}/{fname}");
-            let removal_authorized = ledger.deleted.contains(&(pkg.clone(), fname.clone()))
-                || dumps.iter().any(|d| {
-                    d.contains_key(&format!("{akey}.tombstone"))
-                        || d.contains_key(&format!("{akey}.frozen"))
-                });
-            if removal_authorized {
-                continue;
-            }
-            if bucket_idx == 0 {
-                REACH.hit(R::Conservation); // the fleet-wide scan below runs once
-            }
-            let survives = dump.values().any(|stored| stored == body);
-            if !survives && bucket_idx == 0 {
-                // Checked once (bucket 0): quarantine may hold it on either
-                // bucket, so scan them all before declaring loss.
-                let anywhere = dumps
+    // Conservation: acked bytes must exist somewhere unless an authorized
+    // delete removed them. The tombstone is the point of no return, so storage
+    // evidence (a tombstone on any bucket) exempts — an interrupted delete that
+    // crashed after its tombstone but before its 204 has still legitimately
+    // destroyed. A freeze does NOT exempt any more: `.frozen` used to buy a
+    // blanket pass, and a freeze is precisely where both byte-sets most need to
+    // survive. `freeze_side` orders marker -> quarantine -> tombstone -> drop,
+    // so the bytes are preserved before the destructive move and a crash
+    // anywhere leaves either the body or its `_quarantine/` copy. So a frozen
+    // filename owes the fleet EVERY byte-set it acked, findable somewhere.
+    // The scan is fleet-wide and runs once: each bucket preserves the body IT
+    // personally lost, so the sets legitimately differ per bucket.
+    for ((pkg, fname), acks) in &ledger.acked {
+        let akey = format!("packages/{pkg}/{fname}");
+        let frozen_anywhere = dumps
+            .iter()
+            .any(|d| d.contains_key(&format!("{akey}.frozen")));
+        let deleted = ledger.deleted.contains(&(pkg.clone(), fname.clone()))
+            || (!frozen_anywhere
+                && dumps
                     .iter()
-                    .any(|d| d.values().any(|stored| stored == body));
-                if !anywhere {
+                    .any(|d| d.contains_key(&format!("{akey}.tombstone"))));
+        if deleted {
+            continue;
+        }
+        REACH.hit(R::Conservation);
+        for body in acked_bodies(acks) {
+            if !dumps
+                .iter()
+                .any(|d| d.values().any(|stored| stored == body))
+            {
+                violations.push(format!(
+                    "CONSERVATION: acked bytes {:?} of {akey} vanished from every bucket{} \
+                     | acks (seq,bucket) {:?} | markers: {}",
+                    String::from_utf8_lossy(body),
+                    if frozen_anywhere {
+                        " — a freeze quarantines both bodies before it drops either, so a \
+                         frozen filename may not lose one"
+                    } else {
+                        ""
+                    },
+                    acks.iter().map(|a| (a.seq, a.bucket)).collect::<Vec<_>>(),
+                    marker_census(&dumps, pkg, fname),
+                ));
+            }
+        }
+    }
+
+    // Durability, the fleet-wide half: a byte conflict may be resolved either
+    // way, never left split. Two buckets standing on two different acked
+    // byte-sets under one live filename is permanent divergence — the state the
+    // merge exists to remove — and it is worth naming here rather than leaving
+    // to CONVERGENCE, which reports it as one key among a diff.
+    for ((pkg, fname), acks) in &ledger.acked {
+        if acked_bodies(acks).len() < 2 {
+            continue;
+        }
+        let akey = format!("packages/{pkg}/{fname}");
+        let kept: std::collections::BTreeSet<&Vec<u8>> = dumps
+            .iter()
+            .filter(|d| {
+                !d.contains_key(&format!("{akey}.tombstone"))
+                    && !d.contains_key(&format!("{akey}.frozen"))
+            })
+            .filter_map(|d| d.get(&akey))
+            .collect();
+        if kept.len() > 1 {
+            violations.push(format!(
+                "DURABILITY: {akey} was acked with different bytes on different buckets and the \
+                 fleet settled on {} of them at once — a byte conflict is resolved to one \
+                 survivor or frozen, never left split",
+                kept.len()
+            ));
+        }
+    }
+
+    // FREEZE JUSTIFIED. A `.frozen` marker buys a blanket DURABILITY exemption
+    // — the file may be absent everywhere — so a freeze that fires without a
+    // real conflict is a self-granted licence to lose data, and nothing checked
+    // that it was deserved. Evidence is the union of what the harness saw acked
+    // and what the fleet preserved under `_quarantine/`: a publish can crash
+    // after `store_artifact_verified` succeeds and before the 200, leaving real
+    // conflicting bytes with no ack recorded, so an ack-count-only form would
+    // false-fail on every crashed publisher.
+    for (pkg, fname) in record_names(&dumps) {
+        let akey = format!("packages/{pkg}/{fname}");
+        if !dumps
+            .iter()
+            .any(|d| d.contains_key(&format!("{akey}.frozen")))
+        {
+            continue;
+        }
+        REACH.hit(R::FreezeJustified);
+        let mut attested = quarantined_bodies(&dumps, &pkg, &fname);
+        if let Some(acks) = ledger.acked.get(&(pkg.clone(), fname.clone())) {
+            attested.extend(acked_bodies(acks));
+        }
+        if attested.len() < 2 {
+            violations.push(format!(
+                "FREEZE_UNJUSTIFIED: {akey} is frozen fleet-wide but only {} byte-set(s) are \
+                 attested for it (acks + every _quarantine/ copy) — a freeze suppresses the \
+                 filename and exempts it from DURABILITY, so it must be a real byte conflict \
+                 | attested {:?} | markers: {}",
+                attested.len(),
+                attested
+                    .iter()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .collect::<Vec<_>>(),
+                marker_census(&dumps, &pkg, &fname),
+            ));
+        }
+    }
+
+    // ORIGIN TERMINALITY. Origin exclusivity is the dependency-confusion
+    // defense and its lattice is monotone: mirror may be demoted to private,
+    // private is terminal. CONVERGENCE only asks that the buckets AGREE — it
+    // would happily pass a fleet that agreed on `mirror` for a name a private
+    // upload had already claimed. So: once a private publish acks for a
+    // package, no bucket may end claiming `mirror` for it, and no live,
+    // unquarantined artifact of it may still carry a mirror sidecar.
+    for pkg in &ledger.private_claimed {
+        for (bucket_idx, dump) in dumps.iter().enumerate() {
+            REACH.hit(R::OriginTerminality);
+            let claim = dump
+                .get(&format!("packages/{pkg}/.origin"))
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                .and_then(|doc| {
+                    doc.get("origin")
+                        .and_then(|o| o.as_str())
+                        .map(str::to_string)
+                });
+            if claim.as_deref() == Some("mirror") {
+                violations.push(format!(
+                    "ORIGIN_TERMINALITY: bucket {bucket_idx} claims packages/{pkg}/.origin = \
+                     mirror after a private upload acked for it — private is terminal, and a \
+                     name that falls back to mirror is a dependency-confusion window"
+                ));
+            }
+            for (_, fname) in record_names(std::slice::from_ref(dump))
+                .into_iter()
+                .filter(|(p, _)| p == pkg)
+            {
+                let akey = format!("packages/{pkg}/{fname}");
+                let inert = ["tombstone", "frozen", "mirror-quarantined"]
+                    .iter()
+                    .any(|suffix| dump.contains_key(&format!("{akey}.{suffix}")));
+                if inert || !dump.contains_key(&akey) {
+                    continue;
+                }
+                let origin = dump
+                    .get(&format!("{akey}.meta.json"))
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<pypiron::sidecar::Sidecar>(bytes).ok()
+                    })
+                    .and_then(|sc| sc.origin);
+                if origin.as_deref() == Some("mirror") {
                     violations.push(format!(
-                        "CONSERVATION: acked bytes of packages/{pkg}/{fname} vanished from every bucket"
+                        "ORIGIN_TERMINALITY: bucket {bucket_idx} still serves {akey} as live \
+                         mirror truth under a privately-claimed package — it must be superseded \
+                         or quarantined, never left renderable"
                     ));
                 }
             }
@@ -2526,10 +3301,13 @@ fn state_hash(dumps: &[BTreeMap<String, Vec<u8>>], ledger: &Ledger) -> u64 {
             mix(&mut hash, bytes);
         }
     }
-    for ((pkg, fname), body) in &ledger.acked {
+    for ((pkg, fname), acks) in &ledger.acked {
         mix(&mut hash, pkg.as_bytes());
         mix(&mut hash, fname.as_bytes());
-        mix(&mut hash, body);
+        for ack in acks {
+            mix(&mut hash, &ack.bucket.to_le_bytes());
+            mix(&mut hash, &ack.body);
+        }
     }
     for (pkg, fname) in &ledger.deleted {
         mix(&mut hash, pkg.as_bytes());
@@ -3115,6 +3893,14 @@ struct Args {
     /// oracles, and a gate that cries wolf gets ignored. Wire it only where the
     /// sample is big enough to mean something.
     require_reach: bool,
+    /// Share of seeds (0-100) whose fleet is partitioned: nodes home to
+    /// different buckets and a minority of uploads arrive as mirror fills, so
+    /// two buckets can commit different bytes under one filename and
+    /// `replicate::decide`'s merge algebra actually runs. Zero by default —
+    /// arming it perturbs the schedule, and the pinned regression seeds, the
+    /// `--break` kill proofs and the measured baselines were all mined on the
+    /// aligned one. Needs >1 bucket to mean anything.
+    partition_percent: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -3130,6 +3916,11 @@ struct Profile {
     /// Op-class mix for the chaos loop — see `OP_WEIGHT_BOUNDS`.
     weights: [u16; OP_CLASSES],
     brk: Break,
+    /// Share of seeds that run a partitioned fleet (see `partition_for`). Zero
+    /// unless asked for, so every pinned regression seed, every `--break` kill
+    /// proof and every measured baseline keeps the exact schedule it was mined
+    /// under; `--rotate` draws it, and the nightly's multi-bucket rows pass it.
+    partition_percent: u64,
 }
 
 impl Profile {
@@ -3142,13 +3933,15 @@ impl Profile {
             .map(|(label, weight)| format!("{label} {weight}"))
             .collect();
         format!(
-            "nodes={} buckets={} packages={} files={} ops={} fail-percent={} weights=[{}]",
+            "nodes={} buckets={} packages={} files={} ops={} fail-percent={} partition={} \
+             weights=[{}]",
             self.nodes,
             self.buckets,
             self.packages,
             self.files,
             self.ops,
             self.fail_percent,
+            self.partition_percent,
             mix.join(", ")
         )
     }
@@ -3165,6 +3958,7 @@ fn profile_for(seed: u64, args: &Args) -> Profile {
             fail_percent: args.fail_percent,
             weights: DEFAULT_OP_WEIGHTS,
             brk: args.brk,
+            partition_percent: args.partition_percent,
         };
     }
     let mut rng = Rng::new(seed ^ 0x0507_A7E5);
@@ -3187,6 +3981,11 @@ fn profile_for(seed: u64, args: &Args) -> Profile {
         fail_percent: if rng.chance(50) { 0 } else { 3 },
         weights,
         brk: args.brk,
+        // NOT drawn from the seed. Partitioning is a chaos dimension like
+        // `--break`, not a workload shape: arming it perturbs every schedule,
+        // and the rotating row is the one every pinned soak baseline was
+        // measured on. `--rotate --partition N` is the partitioned soak.
+        partition_percent: args.partition_percent,
     }
 }
 
@@ -3202,12 +4001,20 @@ fn reproduce_command(seed: u64, rotate: bool, profile: &Profile) -> String {
         Some(spelling) => format!(" --break {spelling}"),
         None => String::new(),
     };
+    // `--partition` is part of the world too: leave it off and the line reruns
+    // an aligned fleet, which is a different simulation.
+    let partition = match profile.partition_percent {
+        0 => String::new(),
+        percent => format!(" --partition {percent}"),
+    };
     if rotate {
-        return format!("cargo run --release --example vopr -- --seed {seed} --rotate{brk}");
+        return format!(
+            "cargo run --release --example vopr -- --seed {seed} --rotate{partition}{brk}"
+        );
     }
     format!(
         "cargo run --release --example vopr -- --seed {seed} --nodes {} --buckets {} \
-         --packages {} --files {} --ops {} --fail-percent {}{brk}",
+         --packages {} --files {} --ops {} --fail-percent {}{partition}{brk}",
         profile.nodes,
         profile.buckets,
         profile.packages,
@@ -3240,8 +4047,10 @@ fn pick_op(weights: &[u16; OP_CLASSES], total: u64, rng: &mut Rng) -> usize {
 /// widened coverage. A simulator that reports a workload it did not run is
 /// worse than one that refuses to start, so `parse_args_from` rejects the pair.
 /// Everything else stays legal under rotation — `--seed/--seeds/--start-seed/
-/// --recheck-every/--forever/--max-secs/--break/--require-reach` are the real
-/// levers there, and `--seed N --rotate` must keep reproducing on its own.
+/// --recheck-every/--forever/--max-secs/--break/--require-reach/--partition` are
+/// the real levers there (`--partition` is a chaos dimension like `--break`, not
+/// a workload shape rotation derives), and `--seed N --rotate` must keep
+/// reproducing on its own.
 const ROTATE_OVERRIDES: [&str; 6] = [
     "--nodes",
     "--buckets",
@@ -3271,6 +4080,7 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         rotate: false,
         brk: Break::None,
         require_reach: false,
+        partition_percent: 0,
     };
     let mut it = argv;
     // Collected as they are seen, checked after the whole line parses, so the
@@ -3321,6 +4131,11 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
             "--ops" => args.ops = grab(),
             "--recheck-every" => args.recheck_every = grab(),
             "--fail-percent" => args.fail_percent = grab(),
+            "--partition" => {
+                let n = grab();
+                assert!(n <= 100, "--partition is a percentage of seeds (0..=100)");
+                args.partition_percent = n;
+            }
             "--forever" => args.forever = true,
             "--max-secs" => args.max_secs = Some(grab()),
             "--rotate" => args.rotate = true,
@@ -3333,7 +4148,7 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         !args.rotate || overridden.is_empty(),
         "--rotate derives the whole workload from the seed, so {} would be discarded — \
          drop them, or drop --rotate. Legal with --rotate: --seed --seeds --start-seed \
-         --recheck-every --forever --max-secs --break --require-reach.",
+         --recheck-every --forever --max-secs --break --require-reach --partition.",
         overridden.join(" ")
     );
     args
@@ -3463,6 +4278,7 @@ fn main() {
         // Every hit this seed could produce is in, rerun included: close it so
         // the meter knows how many seeds each oracle actually ran on.
         REACH.end_of_seed();
+        MERGE.end_of_seed();
         if !outcome.violations.is_empty() {
             eprintln!(
                 "vopr: seed {seed} FAILED ({} violations):",
@@ -3497,9 +4313,11 @@ fn main() {
         }
     }
     let profile_desc = if args.rotate {
-        "rotating(nodes 2-3, buckets 1-3, packages 1-6, files 1-4, ops 80-200, \
-         swarmed op mix, fault+crash-only)"
-            .to_string()
+        format!(
+            "rotating(nodes 2-3, buckets 1-3, packages 1-6, files 1-4, ops 80-200, \
+             swarmed op mix, fault+crash-only, partition {}%)",
+            args.partition_percent
+        )
     } else {
         format!(
             "nodes={} buckets={} packages={} files={} ops/run={} fail-percent={}",
@@ -3523,6 +4341,7 @@ fn main() {
         }
     );
     let unreached = report_reach(explored, rechecked, args.brk);
+    report_merge(explored);
     if !determinism_violations.is_empty() {
         std::process::exit(3);
     }
@@ -3589,45 +4408,59 @@ mod tests {
         // The nightly multi-bucket-crash-only row as it shipped: 4,010
         // DURABILITY executions over 8,698 seeds reads healthy, and 4 seeds in
         // 5 evaluated an empty ledger (75fd6b2).
-        let (note, failed) = reach_verdict(4010, 1754, 8698, None, false);
+        let (note, failed) = reach_verdict(4010, 1754, 8698, None, false, false);
         assert!(failed, "20% per-seed reach passed the gate: {note:?}");
         assert!(note.contains("STARVED"), "{note}");
         // Same row with the corpus its oracles need: silent.
-        let (note, failed) = reach_verdict(134_530, 13_069, 13_122, None, false);
+        let (note, failed) = reach_verdict(134_530, 13_069, 13_122, None, false, false);
         assert!(!failed && note.is_empty(), "{note}");
     }
 
     #[test]
     fn the_floor_is_a_share_of_seeds_not_a_count() {
         // Exactly at the floor is reached, one seed short of it is not.
-        assert!(!reach_verdict(100, 25, 100, None, false).1);
-        assert!(reach_verdict(100, 24, 100, None, false).1);
+        assert!(!reach_verdict(100, 25, 100, None, false, false).1);
+        assert!(reach_verdict(100, 24, 100, None, false, false).1);
         // The kill-proof step runs six seeds (ci.yml); an absolute floor would
         // red every small sample that is doing nothing wrong.
-        assert!(!reach_verdict(2, 2, 6, None, false).1);
+        assert!(!reach_verdict(2, 2, 6, None, false, false).1);
     }
 
     #[test]
     fn the_floor_is_silent_wherever_a_standing_excuse_already_is() {
-        let excuse = expected_zero(R::Convergence as usize, false);
+        let excuse = expected_zero(R::Convergence as usize, false, false);
         assert!(
             excuse.is_some(),
             "single-bucket topology excuse went missing"
         );
-        assert!(!reach_verdict(0, 0, 1000, excuse, false).1);
+        assert!(!reach_verdict(0, 0, 1000, excuse, false, false).1);
         assert!(
-            !reach_verdict(9, 3, 1000, excuse, false).1,
+            !reach_verdict(9, 3, 1000, excuse, false, false).1,
             "an excused oracle must not be gated on how often it runs"
         );
         assert!(
-            !reach_verdict(9, 3, 1000, None, true).1,
+            !reach_verdict(9, 3, 1000, None, true, false).1,
             "a deliberate defect's workload is nobody's coverage regression"
+        );
+    }
+
+    /// A conflict oracle is allowed to read thin — conflicts are a tail event —
+    /// but not to read nothing. Waiving the floor without keeping the zero gate
+    /// is how an oracle nobody has watched execute survives a review.
+    #[test]
+    fn a_tail_event_waives_the_floor_but_not_the_zero() {
+        let (note, failed) = reach_verdict(44_243, 7_214, 36_571, None, false, true);
+        assert!(!failed, "19% of seeds is the honest reading for a conflict");
+        assert!(note.contains("tail event"), "{note}");
+        assert!(
+            reach_verdict(0, 0, 36_571, None, false, true).1,
+            "a partitioned run that produced no conflict at all is a defect"
         );
     }
 
     #[test]
     fn a_zero_still_fails_on_its_own() {
-        let (note, failed) = reach_verdict(0, 0, 50_000, None, false);
+        let (note, failed) = reach_verdict(0, 0, 50_000, None, false, false);
         assert!(failed && note.contains("NEVER EXECUTED"), "{note}");
     }
 
@@ -3641,6 +4474,7 @@ mod tests {
             fail_percent: 3,
             weights: DEFAULT_OP_WEIGHTS,
             brk,
+            partition_percent: 0,
         }
     }
 
@@ -3725,12 +4559,31 @@ mod tests {
             "--break",
             "view",
             "--require-reach",
+            "--partition",
+            "50",
             "--verbose",
         ]));
         assert!(args.rotate && args.forever && args.require_reach);
         assert_eq!((args.start_seed, args.seeds), (7, 30));
         assert_eq!((args.recheck_every, args.max_secs), (500, Some(60)));
         assert!(args.brk == Break::View);
+        assert_eq!(args.partition_percent, 50);
+    }
+
+    /// A partitioned world is not reproducible from the seed — `--partition` is
+    /// a chaos dimension, like `--break`. Drop it from the line and the rerun is
+    /// an aligned fleet: a different simulation that comes back green.
+    #[test]
+    fn the_reproduce_line_carries_the_partition() {
+        let mut partitioned = a_profile(Break::None);
+        partitioned.partition_percent = 100;
+        assert!(reproduce_command(42, false, &partitioned).ends_with("--partition 100"));
+        assert_eq!(
+            reproduce_command(42, true, &partitioned),
+            "cargo run --release --example vopr -- --seed 42 --rotate --partition 100"
+        );
+        // ...and not one token more on the aligned default.
+        assert!(!reproduce_command(42, true, &a_profile(Break::None)).contains("--partition"));
     }
 
     /// ...and without `--rotate` those same flags are the whole profile, which
@@ -3759,7 +4612,7 @@ mod tests {
         let profile = profile_for(1, &args);
         assert_eq!(
             profile.describe(),
-            "nodes=3 buckets=2 packages=6 files=2 ops=160 fail-percent=0 \
+            "nodes=3 buckets=2 packages=6 files=2 ops=160 fail-percent=0 partition=0 \
              weights=[publish 40, delete 10, tick 25, sweep 7, reconcile 4, jump 5, crash 5, nudge 4]"
         );
     }

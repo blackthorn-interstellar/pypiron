@@ -243,7 +243,21 @@ also exercises that handoff. It stays a pure function of the seed, so
 The invariants:
 
 - **durability** — every acknowledged upload is byte-correct, sidecar-backed and
-  index-listed on every bucket;
+  index-listed on every bucket. Under a partition (below) one filename can carry
+  two acknowledged byte-sets; the merge may keep either, so the claim there is
+  "the bytes standing on this bucket are bytes somebody acked, or the ones that
+  lost are preserved under `_quarantine/`" — plus a fleet-wide clause: a
+  conflict is resolved to one survivor or frozen, never left split;
+- **freeze justified** — a `.frozen` marker buys a blanket durability exemption,
+  so every one must be traceable to at least two distinct byte-sets across the
+  fleet's evidence (the acks, plus every `_quarantine/<pkg>/<file>@*` copy).
+  Not "≥2 acks": a publish can crash after the bytes commit and before the
+  `200`, so an ack-count-only form false-fails every crashed publisher;
+- **origin terminality** — once a private upload acks for a package, no bucket
+  may end claiming `mirror` for it and no live, unquarantined artifact of it may
+  still carry a mirror sidecar. Convergence only asks the buckets to *agree*: it
+  would pass a fleet that agreed on `mirror` for a privately-claimed name, which
+  is the dependency-confusion window the origin lattice exists to close;
 - **ack totality** — dev/DESIGN.md's totality principle, checked at the moment
   the `200` is returned rather than at quiescence, because the heal phase's
   `reconcile` would otherwise repair the defect before any invariant looks: each
@@ -263,8 +277,126 @@ The invariants:
   legal resurrection, so the rule is last-writer, not set-membership;
 - **no leaks** — no `_dirty/` or `_repl/` debris remains;
 - **conservation** — acknowledged bytes are never lost without an authorized
-  delete or freeze;
+  delete. A freeze is *not* an exemption: `freeze_side` writes its marker,
+  copies the body to `_quarantine/` and tombstones before it drops anything, so
+  a frozen filename owes the fleet every byte-set it acked, findable somewhere;
 - **liveness** — the fleet quiesces within the drain budget.
+
+### The partitioned fleet (`--partition`)
+
+Until this landed, **every writer in the VOPR pinned bucket 0**. `BucketSet::new`
+selects index 0, nothing in the harness ever switched it, and every workload op
+called `state.pin()`. So every byte on buckets 1..N arrived as a *copy* of bucket
+0's, two buckets could never disagree about the bytes under one live filename,
+and `replicate::decide`'s merge algebra was **dead code in simulation**: over
+3,000 rotated seeds, only `Copy` and `Noop` ever fired and not one `.frozen`,
+`_quarantine/` or `.mirror-quarantined` object was ever created. dev/DESIGN.md
+says outright that correctness must not depend on every node selecting the same
+bucket, and calls the private byte-conflict the partition case — a designed-for
+production state the simulator had never produced, in the subsystem the product
+is marketed on.
+
+`--partition <percent>` is the share of seeds whose fleet is **partitioned**: each
+node gets a *home* bucket and authors its uploads and deletes there (node 0 stays
+on bucket 0, so the fleet always has a bucket-0 writer), and ~12% of publishes
+arrive as mirror fills so two concurrent first-writes can race the pre-artifact
+`.origin` fan-out and split a package's claim across buckets. It is a **chaos
+dimension like `--break`, not a workload shape**: rotation does *not* derive it,
+`--rotate --partition N` is legal and is how the partitioned soak runs, and the
+reproduce line carries it because dropping it reruns an aligned fleet — a
+different simulation that comes back green. It defaults to **0** and an aligned
+seed is byte-identical to the pre-partition harness, verified by diffing five
+whole-profile runs (every counter and every reach reading to the digit), not
+assumed. That default is load-bearing: the pinned regression seeds, the
+`--break` kill proofs and every measured baseline were mined aligned. Below two
+buckets it is a no-op — a partition needs something to be partitioned across.
+
+The home is a per-seed property drawn from a **dedicated** rng (`seed ^ const`),
+never the chaos stream, so arming partitioning cannot shift which op a chaos draw
+picks and `restart_node` can re-read a home without consuming entropy. It is not
+a per-write coin flip: `BucketSet::switch` is health-driven and sticky and a pin
+is captured once per operation and never torn (design §3), so a per-write flip
+would manufacture an interleaving the product cannot produce and any bug found
+there would be unactionable. A percentage below 100 is the useful setting for a
+long soak, for two reasons: a freeze is *terminal* for a filename
+(`publish_record`'s fence bars it forever), so an always-split fleet freezes its
+own corpus and starves the durability family; and the aligned seeds are the
+regression guard for everything the 931,115-seed soak established. If you want
+*more* conflicts, do not add a per-write divergence knob — raise the publish
+weight, since a byte conflict needs two overlapping publishes of one
+`(package, file)` with different bytes.
+
+**How it is built, and the one thing not to change.** `Pinned`'s fields are all
+public, so a workload op constructs the home bucket's pin directly and hands it
+to `publish_record`/`delete_record` — both do all their I/O through
+`pinned.storage` and address every peer from `pinned.index`, so both are correct
+for any pin. The pin carries a distinct `generation` per bucket, because
+`generation` is the only key the index and presign caches namespace on
+(src/cache.rs); two pins over two buckets at generation 0 would share one cache,
+which is exactly why `switch` bumps it.
+
+Ticks, sweeps, reconciles and audits keep the **selected** pin. That is
+deliberate and must stay: `state.global_names` and `state.inventory` describe the
+selected bucket and carry no bucket key (`worker::drain_dirty_uncached` exists
+solely for that reason), and `require_generation` compares against
+`state.pin().generation`, so handing a foreign pin to `worker::audit` makes the
+product correctly refuse a switch that did not happen. The consequence is worth
+stating plainly: a partitioned seed models a bucket that is *written to* but
+whose markers are only ever consumed by the destination drain — the state
+production reaches when a node switches, writes, and dies before its own worker
+ticks. It is not a full `BucketSet::switch`, and a finding that depends on the
+node's caches following its writes is out of this harness's reach.
+
+**Every merge verdict now executes.** Measured over a 74,033-seed rotating soak
+and a 43,843-seed fixed multi-bucket soak, all at `--partition 100` (verdicts are
+sampled by running the real `replicate::decide` over every bucket pair × filename
+at the end of the chaos phase and at each heal round, so this under-counts arms
+the executors resolve between snapshots):
+
+| `decide` → | rotating (74,033 seeds) | multi-bucket (43,843 seeds) |
+|---|---|---|
+| `AdoptSidecar` | 5,804 on 1,838 seeds | 4,262 on 2,028 seeds |
+| `Supersede` | 114 on 47 seeds | 130 on 65 seeds |
+| `QuarantineLoser` | 4,242 on 1,302 seeds | 2,096 on 1,005 seeds |
+| `Freeze` | 2,842 on 1,034 seeds | 3,008 on 1,447 seeds |
+| `PropagateFreeze` | 656 on 247 seeds | 484 on 238 seeds |
+| `FinishFreeze` | 50 on 25 seeds | 62 on 31 seeds |
+| `.frozen` objects at quiescence | 36,942 on 11,467 seeds | 45,534 on 16,631 seeds |
+| `_quarantine/` bodies | 51,570 on 14,577 seeds | 63,550 on 20,712 seeds |
+| `.mirror-quarantined` | 365 on 303 seeds | 583 on 466 seeds |
+
+All nine read **zero** on every aligned seed ever run, which is the gap this
+closed. The two per-seed readings the gate holds — `MERGE_DIVERGENCE` and
+`FREEZE_JUSTIFIED` — are *tail-event* slots: they waive the 25% share floor
+(measured 48%/39% on a fixed multi-bucket profile, 19%/15% under rotation where
+a third of drawn topologies are single-bucket) but still fail on a flat zero, so
+a partitioned run that stops producing conflicts is still caught.
+
+**The partitioned profiles are currently red**, which is the point — see the
+findings recorded against the commit that landed this. That is why `--partition`
+defaults to 0 and no CI invocation passes it: the nightly matrix and the pinned
+regression seeds stay on the aligned schedule, byte-identical (verified by
+diffing five whole-profile runs, every counter to the digit), until the findings
+are triaged. The partitioned soak is run by hand:
+
+```
+cargo run --release --example vopr -- --rotate --partition 100 --max-secs 600
+```
+
+The findings, one repro each, all from the first soak (append `cargo run
+--release --example vopr --` to each line). They are recorded here rather than
+fixed alongside the harness change, so the harness lands separately from
+whatever the fixes turn out to be:
+
+| oracle | seed | flags | what it says |
+|---|---|---|---|
+| `AUDIT_PREMATURE_CONSUMPTION` (global membership) | 1 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100` | a drain of a peer bucket re-derived a package past every truth mutation, wrote the global index claiming it absent, and the tier-3 audit had to flip the membership back. The dominant finding by volume (~50% of partitioned seeds); `AUDIT_REPAIRED_VIEWS` at `--fail-percent 0` is the same shape under the crash-only blanket gate |
+| `AUDIT_ORDERING` (class 1) | 268 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100` | a `packages/<pkg>/.origin` write on a home bucket had **no covering breadcrumb** — no `_dirty/` marker there, no `_repl/` note aimed at it — so nothing durable could tell a tick to re-derive the name. The first class-1 the product has ever produced; the `EXPECTED_ZERO` entry saying otherwise is now scoped to the aligned schedule |
+| `DURABILITY` + `CONSERVATION` | 267 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | an acknowledged upload's bytes are gone from every bucket and from `_quarantine/`, with both buckets serving a *different* body under that filename and no tombstone or freeze. The strongest one: a `200` was retracted with no evidence |
+| `CONSERVATION` (frozen) | 165 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | two byte-sets acked, the fleet froze the filename, and only *one* survived in `_quarantine/` — the freeze lost a body it is supposed to preserve before it drops anything |
+| `FREEZE_UNJUSTIFIED` | 91 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | frozen on every bucket with only **one** byte-set attested anywhere (acks ∪ every `_quarantine/` copy) — a freeze that suppresses a filename and waives its durability check without a real conflict behind it |
+| `CONVERGENCE` | 208 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | `packages/<pkg>/.origin` reads `mirror` on bucket 0 and is **absent** on bucket 1 at quiescence — an orphan claim that never replicated and never got released, so one bucket reserves a name the other would let a proxy fill |
+| `ACK_TOTALITY` | 19 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | a publish acked while a peer held neither the record, nor a `_repl/` note owing it, nor any merge marker explaining its absence. Crash-only, where a missed note is the hard gate |
 
 Determinism itself is verified, not assumed: recurring seeds (`--recheck-every`)
 run twice and must produce an identical storage-op trace hash *and* an identical
@@ -411,6 +543,15 @@ storage and never the schedule.
 | `blind` | the only op that retired the marker covering the mutation had listed truth before it | `… were all consumed blind` (class 2b) | 3 |
 | `race` | two unleased rebuilds: the one that listed *earlier* wrote *last* | `… unleased concurrent rebuild` (class 3; needs `--fail-percent 0`, where any audit repair is a violation) | 5 |
 | `fallback` | an audit repair the effect history cannot explain at all | `… unexplained drift` (fallback arm) | 3 |
+| `freeze-unjustified` | a `.frozen` marker over an acked-**deleted** filename — nothing ever conflicted about it, and the body and view entry are already gone, so no other oracle can see it | `FREEZE_UNJUSTIFIED:` | 1 |
+| `origin-demoted` | a privately-claimed package's `.origin` walked back to `mirror` on every bucket (sidecars untouched, so the buckets stay converged and the views stay correct) | `ORIGIN_TERMINALITY:` | 1 |
+
+The K column is **re-measured against the current build**, not inherited: it is
+the smallest `--seeds K` (from seed 1, on the leg's own flags) at which the break
+reds with the expected text. Every one currently reds at K=1 — the schedule has
+moved since the 3/4/5 values that used to sit here, which is exactly why the CI
+step draws 6 rather than the measured minimum. Re-measure whenever the schedule
+changes; a stale K is a gate nobody has checked is still a gate.
 
 `globalindex` exists because `ordering` cannot reach the global analysis: it
 grows a package that already exists, so the global name set never changes and
@@ -672,9 +813,10 @@ each is a claim someone has to defend here:
 | reads zero | why | reached by |
 |---|---|---|
 | CONVERGENCE, ACK_TOTALITY | need more than one bucket; excused automatically, and only, when every profile in the sample was single-bucket | any multi-bucket profile |
-| classifier/pkg TEST 1 | the product has never produced a class-1 ORDERING repair | `--break ordering`, `--break globalindex` |
+| MERGE_DIVERGENCE, FREEZE_JUSTIFIED | need two buckets that disagree about one filename's bytes, which only a partitioned fleet produces; excused automatically, and only, when no seed in the sample drew a split plan | any `--partition` run |
+| classifier/pkg TEST 1 | the product has never produced a class-1 ORDERING repair **on the aligned schedule** — `--partition` reaches it (a `.origin` write on a home bucket with no covering breadcrumb), which is a finding, not coverage | `--break ordering`, `--break globalindex` |
 | classifier/global TEST 1 | same, on global membership | `--break globalindex` |
-| classifier/{pkg,global} TEST 3 | *harness*-unreachable: `tick_lock` serializes rebuilds, so two never overlap (see the reachability table above) | `--break race` |
+| classifier/{pkg,global} TEST 3 | *harness*-unreachable: `tick_lock` serializes rebuilds, so two never overlap (see the reachability table above). Still true under `--partition`: a partitioned node diverges only its **writes**, never its rebuilds, so every tick still takes the one bucket-0 lease | `--break race` |
 | classifier/{pkg,global} TEST 2a | needs an audit repair whose final writer had listed truth past every mutation | `--break poison` |
 | classifier/{pkg,global} TEST 2b | needs an audit repair TEST 1 declined — a covered mutation whose breadcrumbs were all consumed blind | `--break blind` |
 | classifier/{pkg,global} FALLBACK | reached only by drift no test explains — which would itself be a classifier bug | `--break fallback` |

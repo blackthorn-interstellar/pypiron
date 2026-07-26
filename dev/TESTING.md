@@ -215,12 +215,30 @@ vector, which have no useful flag form. Every failure prints that command and,
 beside it, a `profile:` line with the resolved dimensions so you can read the
 shape without rerunning. A *non*-rotating run (explicit `--nodes/--buckets/…`)
 keeps the historical fixed workload — the first two package names, two files,
-the pre-swarm op mix — so every pinned seed below still means exactly what its
-comment says; that was verified with byte-identical `VOPR_TRACE_FILE` dumps
-across the change, not assumed.
+the pre-swarm op mix — so the **chaos phase** of every pinned seed below is
+byte-identical to the one its comment was written against, verified with
+`VOPR_TRACE_FILE` dumps rather than assumed. Its **heal phase** is not: leader
+rotation (below) moved it for every seed with more than one node, so a pinned
+seed's annotation now records the schedule that once found the bug, not one
+still proven to reproduce it. Re-mine them against a reverted fix before
+trusting those annotations again; they all still pass.
 
 After the chaos phase the harness heals the fleet, drains it to quiescence,
-and asserts:
+and asserts the invariants below. Each heal round picks a **leader** — the node
+that runs `reconcile` and the tier-3 audit — as `(seed + round) % nodes`, and
+which node that is decides what a bug *looks like*, which is exactly why it
+must not be a constant. A crashed node restarts with a cold `AppState`, so its
+audit reloads the global name set from storage and repairs the drift; the node
+that won the CAS still holds the stale set in cache and leaves the drift
+standing. Pinned to node 0 — disproportionately the crashed one — the harness
+kept reporting defects as a SOFT `AUDIT_*` repair when the identical schedule
+under a different leader would have failed the HARD `VERIFY: … stale-global-index`
+oracle, understating severity and detection rate together. Production elects
+its leader by bucket lease and re-elects on every crash, so rotating per round
+also exercises that handoff. It stays a pure function of the seed, so
+`--seed N` reproduces exactly.
+
+The invariants:
 
 - **durability** — every acknowledged upload is byte-correct, sidecar-backed and
   index-listed on every bucket;
@@ -287,6 +305,30 @@ from the run's recorded effect history — no replays — into one of three caus
    (`concurrent_rebuild_without_lease_diverges`, tests/model_event_protocol.rs),
    the one case for which the audit is the *documented* backstop.
 
+The taxonomy is applied by **two** analyses, because a repaired view key can
+belong to either of two subsystems. A `simple/<pkg>/index.*` diff is explained
+from that package's own `ViewWrite`s — `rebuild_package`'s renders — against the
+truth listings they derived from. A `simple/index.{json,html}` diff is a
+*membership* change, and membership is decided by
+`update_global_index_locked`'s delta-plus-CAS over the tick's cached name set,
+never by a per-package render — the per-package view can be byte-perfect while
+the global name set is wrong. So a global diff expands to the names whose
+membership flipped, and each is explained from that bucket's `GlobalWrite`
+effects and the name set every write claimed. Same three classes, same
+severities; only the writes they interrogate differ. This is not cosmetic
+bookkeeping: handing global-index findings to the per-package analysis (which is
+what used to happen) blamed a rebuild session that was byte-perfect and sent
+whoever read the message to `rebuild_package` instead of
+`update_global_index_locked`.
+
+A global write only reconsiders a name its own tick rebuilt and carries every
+other name forward from cache, so the global analysis first asks *which* writes
+actually re-derived the name. The rebuild's `packages/<name>/` listing runs in a
+task the tick spawned, which does not inherit the tick's op id, so it is matched
+positionally inside that tick's window — after its `_dirty/` listing, before its
+index write. A write with no such listing could not have corrected the name and
+is never blamed for failing to.
+
 Classes 1 and 2 are hard violations in **every** profile and fail the seed with
 a reproduce command: both mean the fast path destroyed the only signal that
 should have converged the view — the exact bug family this simulator exists to
@@ -322,12 +364,16 @@ workload produced its first execution on real product behavior within 150k
 seeds: seed 1067836 (`--seed 1067836 --rotate`), a crash-only 3-node/3-bucket
 run whose swarmed mix drew **delete 20 against publish 7**, left the global
 `simple/index.html` listing a package the truth no longer had and missing one it
-did, and only the tier-3 audit converged it. `analyze()` classified both drifted
-views as class 2 with the causal detail — *op N listed truth@245 and wrote the
+did, and only the tier-3 audit converged it. The classifier called both drifted
+views class 2 with the causal detail — *op N listed truth@245 and wrote the
 final view@276, yet the view disagrees with that truth: a poisoned derivation
-consumed the signal*. It is the same family as the fix in commit 1bc3ce9
-(global `simple/index.html` staleness after a crash) and is open, not fixed
-here. Note which knob found it: both drifted packages were `vopr-alpha` and
+consumed the signal*. That message is the **per-package** analysis talking, and
+it named the wrong subsystem: the drift was in the global name set, so the same
+finding today comes out of the global path above, pointing at
+`update_global_index_locked`. It is the same family as the fix in commit 1bc3ce9
+(global `simple/index.html` staleness after a crash); the seed is green today,
+that fix and f30036a having landed. Note which knob found it: both drifted
+packages were `vopr-alpha` and
 `vopr-beta`, the two the old workload already had, so it was the **op-weight
 swarm**, not the extra entities. Under the fixed 40-publish/10-delete mix a
 delete-dominant stretch that long is exponentially unlikely — not impossible,
@@ -350,17 +396,28 @@ storage and never the schedule.
 | `fanout`    | peer bucket 1 blackholes the chaos phase *and* the `_repl/1/` note owing it is dropped | `ACK_TOTALITY:` (needs `--fail-percent 0`, where it is the hard gate) | 1 |
 | `rerun`     | a seed's second execution ends in a different world off an identical op trace | `DETERMINISM VIOLATION … same calls, different bytes` (needs `--recheck-every 1`) | 1 |
 | `resurrect` | an acked-deleted artifact's bytes come back with its tombstone gone | `TOMBSTONE_MONOTONICITY:` | 3 |
-| `ordering`  | truth grows a file with no `_dirty/` marker and no `_repl/` note ever covering it | `AUDIT_ORDERING:` (repair class 1) | 3 |
+| `ordering`  | truth grows a file with no `_dirty/` marker and no `_repl/` note ever covering it | `AUDIT_ORDERING:` (repair class 1, per-package path) | 3 |
+| `globalindex` | truth grows a whole *new package* with no `_dirty/` marker and no `_repl/` note ever covering it | `AUDIT_ORDERING: … simple/index.* membership` (repair class 1, global path) | 3 |
+
+`globalindex` exists because `ordering` cannot reach the global analysis: it
+grows a package that already exists, so the global name set never changes and
+only `rebuild_package`'s view is repaired. Landing the same unbreadcrumbed
+mutation under a name nobody has published makes membership the thing the audit
+has to fix, which is the only input that exercises the `GlobalWrite` path — and
+it reds with *both* findings, one per subsystem, which is the split working.
 
 K is how many fresh seeds the break needs to red with ≥99.8% confidence, and the
-table's K is for the **pinned CI flags**, which are non-rotating — so widening
-the workload left every one of them unchanged, re-measured at exactly the old
-numbers (300/300, 300/300, 272/300, 266/300 over 300 fresh seeds). `view`,
-`fanout` and `rerun` red on every seed; `resurrect` and `ordering` need a run
-that actually produced the state they corrupt — an acked `204`, and a live
-artifact+sidecar pair, respectively — so a schedule that ended with every file
-tombstoned leaves them inert. CI samples nothing: the seed range is pinned and
-the simulator is deterministic.
+table's K is for the **pinned CI flags**, which are non-rotating. Measured over
+seeds 1–300 at the leader-rotation commit: `view` 300/300, `fanout` 300/300,
+`rerun` 300/300, `resurrect` 281/300, `ordering` 264/300, `globalindex` 264/300.
+`view`, `fanout` and `rerun` red on every seed; `resurrect`, `ordering` and
+`globalindex` need a run that actually produced the state they corrupt — an
+acked `204`, and a live artifact+sidecar pair — so a schedule that ended with
+every file tombstoned leaves them inert. CI samples nothing: the seed range is
+pinned and the simulator is deterministic. Quote the seed range with any future
+re-measurement; leader rotation moved the heal-phase schedule, so counts taken
+over an unstated range are not comparable across commits (K, which is what the
+gate depends on, did not move).
 
 Under `--rotate` the same breaks red at different rates, because the rotating
 profile varies the *topology* the break needs: `view` 300/300 and `rerun`

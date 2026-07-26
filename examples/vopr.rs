@@ -154,6 +154,11 @@ enum Break {
     Resurrect,
     /// Mutate truth with no breadcrumb over it → audit-repair class 1 ORDERING.
     Ordering,
+    /// Materialize a whole package in truth with no breadcrumb over it → the
+    /// same class 1, but on the *global* index — the kill proof for
+    /// `analyze_global`, which `ordering` cannot give because it grows an
+    /// existing package and never flips global membership.
+    GlobalIndex,
 }
 
 impl Break {
@@ -165,7 +170,10 @@ impl Break {
             "rerun" => Break::Rerun,
             "resurrect" => Break::Resurrect,
             "ordering" => Break::Ordering,
-            other => panic!("unknown --break {other} (view|fanout|rerun|resurrect|ordering)"),
+            "globalindex" => Break::GlobalIndex,
+            other => {
+                panic!("unknown --break {other} (view|fanout|rerun|resurrect|ordering|globalindex)")
+            }
         }
     }
 }
@@ -192,14 +200,26 @@ async fn apply_break(
         // diff can converge the view. The clone reuses a live record's sidecar
         // (same version, different wheel tag) so the added file renders like any
         // other and the repaired view is byte-clean.
-        (Break::Ordering, true) => {
+        //
+        // `globalindex` is the same defect one level up: the clone lands under a
+        // package name that does not exist yet, so the membership of
+        // `simple/index.{json,html}` is what the audit has to repair. Only the
+        // global classifier can explain that one, which is exactly why it is a
+        // separate break — `ordering` grows an existing package and leaves the
+        // name set alone, so it can never exercise that path.
+        (Break::Ordering | Break::GlobalIndex, true) => {
             let dump = buckets[0].dump();
             let live = dump.iter().find_map(|(key, sidecar)| {
                 let akey = key.strip_suffix(".meta.json")?;
                 Some((akey.to_string(), dump.get(akey)?.clone(), sidecar.clone()))
             });
             if let Some((akey, body, sidecar)) = live {
-                let clone = akey.replace("py3-none", "py2-none");
+                let clone = if brk == Break::GlobalIndex {
+                    let fname = akey.rsplit('/').next().unwrap_or("phantom.whl");
+                    format!("packages/vopr-phantom/{fname}")
+                } else {
+                    akey.replace("py3-none", "py2-none")
+                };
                 buckets[0].insert(&clone, body);
                 buckets[0].insert(&format!("{clone}.meta.json"), sidecar);
                 obs.observe_mutation(0, 0, &clone, None);
@@ -1373,9 +1393,23 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
             }
             clock.advance(std::time::Duration::from_secs(90));
         }
+        // Which node plays leader this round. Production elects the reconcile
+        // and audit leader by bucket lease and re-elects it the moment the
+        // holder dies, so the audit is not a property of node 0 — and pinning
+        // it there understated both severity and detection rate. Node 0 is
+        // disproportionately the crashed node, whose restart dropped its
+        // in-memory global-name cache; a cold cache reloads that set from
+        // storage, so drift a warm CAS winner would have left standing (a HARD
+        // `VERIFY: ... stale-global-index`) healed at the audit and reported as
+        // a SOFT `AUDIT_*` repair instead. Rotating by (seed, round) is one
+        // line, keeps the run a pure function of the seed — `--seed N` still
+        // reproduces exactly — and exercises the leadership handoff a crash
+        // forces in production. Auditing every node in turn each round would
+        // N-times the heal cost for coverage a soak already gets from rotation.
+        let leader_idx = (seed.wrapping_add(round as u64) % nodes as u64) as usize;
         // The lost-copy backstop first: the tree diff converges truth a
         // crashed fan-out left behind and brackets its work in markers...
-        let leader = fleet.nodes[0].state.clone();
+        let leader = fleet.nodes[leader_idx].state.clone();
         let pinned = leader.pin();
         if buckets > 1 {
             OP_ID
@@ -1445,7 +1479,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
             .await
         {
             violations_pre.push(format!(
-                "AUDIT: leader audit failed on round {round}: {e:?}"
+                "AUDIT: leader audit (node {leader_idx}) failed on round {round}: {e:?}"
             ));
         }
         // Every warm bucket gets the audit it receives in production before it
@@ -1957,14 +1991,48 @@ fn l_of(live: &[&Effect], bucket: usize, pkg: &str, att: u64, before: u64) -> Op
         .max()
 }
 
+/// The op's own `_dirty/` listing before `before`, if it made one — the start
+/// of the window the rebuilds it spawned ran in. `None` means the op is not a
+/// tick and spawned no rebuild at all.
+fn marker_list_seq(live: &[&Effect], att: u64, before: u64) -> Option<u64> {
+    live.iter()
+        .filter(|e| e.kind == EffectKind::MarkerList && e.att == att && e.seq < before)
+        .map(|e| e.seq)
+        .max()
+}
+
+/// The last `packages/<pkg>/` listing on (bucket, pkg, node) strictly inside
+/// `(after, before)` — a tick's spawned rebuild, which does not inherit the
+/// tick's op id and so has to be matched positionally. The fleet-wide tick lock
+/// bounds this to one live rebuild per key, so the inference is exact.
+fn spawned_list_seq(
+    live: &[&Effect],
+    bucket: usize,
+    pkg: &str,
+    node: usize,
+    after: u64,
+    before: u64,
+) -> Option<u64> {
+    live.iter()
+        .filter(|e| {
+            e.kind == EffectKind::TruthList
+                && e.bucket == bucket
+                && e.pkg == pkg
+                && e.node == node
+                && e.seq > after
+                && e.seq < before
+        })
+        .map(|e| e.seq)
+        .max()
+}
+
 /// The seq at which the op that consumed a `_dirty/` marker actually listed
 /// this package's truth. Exact for an op that listed truth itself (`direct`);
 /// for a tick — whose batch marker-delete runs on the main task but whose
-/// per-package rebuild listing lives in a `tokio::spawn`ed child that does not
-/// inherit the op id — infer the child's listing: the last TruthList on this
-/// (bucket, pkg, node) between the tick's own `_dirty/` listing and the delete.
-/// The fleet-wide tick lock bounds this to one live rebuild per key, so the
-/// inference is exact too.
+/// per-package rebuild listing lives in a spawned child — infer the child's
+/// listing from the tick's window. A consumer always listed `_dirty/` first, so
+/// a missing window start is an unattributed consumer, not a carried-forward
+/// one: scan from the beginning rather than declare the listing unknown.
 fn consumer_list_seq(
     live: &[&Effect],
     bucket: usize,
@@ -1976,23 +2044,108 @@ fn consumer_list_seq(
     if let Some(direct) = l_of(live, bucket, pkg, att, del_seq) {
         return Some(direct);
     }
-    let window_start = live
+    let window_start = marker_list_seq(live, att, del_seq).unwrap_or(0);
+    spawned_list_seq(live, bucket, pkg, node, window_start, del_seq)
+}
+
+/// The seq at which the op behind a global-index write actually re-derived
+/// `pkg`'s membership, or `None` if it never did. `update_global_index` applies
+/// a *delta*: it only reconsiders a name its own tick rebuilt, and carries
+/// every other name forward from the cached set — so a write with no derivation
+/// could not have corrected this name and is not a candidate for having failed
+/// to. Unlike [`consumer_list_seq`] the window start is required: an op that
+/// never listed `_dirty/` ran no rebuild, so an earlier unrelated listing by
+/// the same node must not be mistaken for its derivation.
+fn global_derivation_seq(
+    live: &[&Effect],
+    bucket: usize,
+    pkg: &str,
+    att: u64,
+    node: usize,
+    write_seq: u64,
+) -> Option<u64> {
+    if let Some(direct) = l_of(live, bucket, pkg, att, write_seq) {
+        return Some(direct);
+    }
+    let window_start = marker_list_seq(live, att, write_seq)?;
+    spawned_list_seq(live, bucket, pkg, node, window_start, write_seq)
+}
+
+/// Every breadcrumb lifetime touching (bucket, pkg): `_dirty/` markers on this
+/// bucket and `_repl/` notes aimed at it. Put and del pair by identical full
+/// key (unique per creation; the i-th put with the i-th del if a key is reused).
+fn breadcrumb_intervals(live: &[&Effect], bucket: usize, pkg: &str) -> Vec<Interval> {
+    let mut out = Vec::new();
+    for (put_kind, del_kind, is_note) in [
+        (EffectKind::MarkerPut, EffectKind::MarkerDel, false),
+        (EffectKind::NotePut, EffectKind::NoteDel, true),
+    ] {
+        let mut by_key: BTreeMap<&str, KeyEvents> = BTreeMap::new();
+        for e in live.iter() {
+            if e.bucket != bucket || e.pkg != pkg {
+                continue;
+            }
+            if e.kind == put_kind {
+                by_key.entry(e.key.as_str()).or_default().0.push(e.seq);
+            } else if e.kind == del_kind {
+                by_key
+                    .entry(e.key.as_str())
+                    .or_default()
+                    .1
+                    .push((e.seq, e.att, e.node));
+            }
+        }
+        for (_key, (mut puts, mut dels)) in by_key {
+            puts.sort_unstable();
+            dels.sort_unstable();
+            for (i, put_seq) in puts.into_iter().enumerate() {
+                let (del_seq, del_att, del_node) = dels.get(i).copied().unwrap_or((u64::MAX, 0, 0));
+                out.push(Interval {
+                    put_seq,
+                    del_seq,
+                    del_att,
+                    del_node,
+                    is_note,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The breadcrumbs alive across `m_seq` — the ones that could have told the
+/// system to rebuild after that mutation.
+fn covering(intervals: &[Interval], m_seq: u64) -> Vec<&Interval> {
+    intervals
         .iter()
-        .filter(|e| e.kind == EffectKind::MarkerList && e.att == att && e.seq < del_seq)
-        .map(|e| e.seq)
-        .max()
-        .unwrap_or(0);
-    live.iter()
-        .filter(|e| {
-            e.kind == EffectKind::TruthList
-                && e.bucket == bucket
-                && e.pkg == pkg
-                && e.node == node
-                && e.seq > window_start
-                && e.seq < del_seq
-        })
-        .map(|e| e.seq)
-        .max()
+        .filter(|iv| iv.put_seq < m_seq && m_seq < iv.del_seq)
+        .collect()
+}
+
+/// True when every breadcrumb in `cov` was retired without acting on the
+/// mutation at `m_seq` — the signal was destroyed rather than consumed.
+fn all_blind(live: &[&Effect], bucket: usize, pkg: &str, cov: &[&Interval], m_seq: u64) -> bool {
+    cov.iter().all(|iv| {
+        if iv.del_seq == u64::MAX {
+            return false; // still live at the boundary — signal not lost
+        }
+        if iv.is_note {
+            // A sweep may retire a note only after re-arming the destination's
+            // own dirty marker (att == the sweep's op); doing so hands the
+            // mutation to the dirty path rather than dropping it.
+            let re_armed = live.iter().any(|e| {
+                e.kind == EffectKind::MarkerPut
+                    && e.bucket == bucket
+                    && e.pkg == pkg
+                    && e.att == iv.del_att
+                    && e.seq < iv.del_seq
+            });
+            !re_armed
+        } else {
+            consumer_list_seq(live, bucket, pkg, iv.del_att, iv.del_node, iv.del_seq)
+                .is_none_or(|cl| cl < m_seq)
+        }
+    })
 }
 
 /// Explain one repaired (bucket, pkg) view: which taxonomy class, and why.
@@ -2016,43 +2169,7 @@ fn analyze(live: &[&Effect], boundary: u64, bucket: usize, pkg: &str) -> RepairF
         .copied()
         .collect();
 
-    // Breadcrumb lifetimes: pair put/del by identical full key (unique per
-    // creation; the i-th put with the i-th del if a key is ever reused).
-    let intervals = |put_kind: EffectKind, del_kind: EffectKind, is_note: bool| -> Vec<Interval> {
-        let mut by_key: BTreeMap<&str, KeyEvents> = BTreeMap::new();
-        for e in live.iter() {
-            if e.bucket != bucket || e.pkg != pkg {
-                continue;
-            }
-            if e.kind == put_kind {
-                by_key.entry(e.key.as_str()).or_default().0.push(e.seq);
-            } else if e.kind == del_kind {
-                by_key
-                    .entry(e.key.as_str())
-                    .or_default()
-                    .1
-                    .push((e.seq, e.att, e.node));
-            }
-        }
-        let mut out = Vec::new();
-        for (_key, (mut puts, mut dels)) in by_key {
-            puts.sort_unstable();
-            dels.sort_unstable();
-            for (i, put_seq) in puts.into_iter().enumerate() {
-                let (del_seq, del_att, del_node) = dels.get(i).copied().unwrap_or((u64::MAX, 0, 0));
-                out.push(Interval {
-                    put_seq,
-                    del_seq,
-                    del_att,
-                    del_node,
-                    is_note,
-                });
-            }
-        }
-        out
-    };
-    let dirty_intervals = intervals(EffectKind::MarkerPut, EffectKind::MarkerDel, false);
-    let note_intervals = intervals(EffectKind::NotePut, EffectKind::NoteDel, true);
+    let intervals = breadcrumb_intervals(live, bucket, pkg);
 
     // O_f: the final view the fast path left in place (or the boundary, if the
     // fast path never wrote a view for this package).
@@ -2067,18 +2184,11 @@ fn analyze(live: &[&Effect], boundary: u64, bucket: usize, pkg: &str) -> RepairF
         .filter(|m| l_f.is_none_or(|l| m.seq > l))
         .copied()
         .collect();
-    let covering = |m_seq: u64| -> Vec<&Interval> {
-        dirty_intervals
-            .iter()
-            .chain(note_intervals.iter())
-            .filter(|iv| iv.put_seq < m_seq && m_seq < iv.del_seq)
-            .collect()
-    };
 
     // TEST 1 — ORDERING: an unreflected mutation with no live breadcrumb over
     // it. Nothing durable could have told the system to rebuild.
     for m in &unseen {
-        if covering(m.seq).is_empty() {
+        if covering(&intervals, m.seq).is_empty() {
             return finding(
                 1,
                 format!(
@@ -2105,32 +2215,11 @@ fn analyze(live: &[&Effect], boundary: u64, bucket: usize, pkg: &str) -> RepairF
     // mutation was retired by a consumer that had already listed truth (or
     // never listed it), destroying the signal without acting on it.
     for m in &unseen {
-        let cov = covering(m.seq);
+        let cov = covering(&intervals, m.seq);
         if cov.is_empty() {
             continue;
         }
-        let all_blind = cov.iter().all(|iv| {
-            if iv.del_seq == u64::MAX {
-                return false; // still live at the boundary — signal not lost
-            }
-            if iv.is_note {
-                // A sweep may retire a note only after re-arming the
-                // destination's own dirty marker (att == the sweep's op); doing
-                // so hands the mutation to the dirty path rather than dropping it.
-                let re_armed = live.iter().any(|e| {
-                    e.kind == EffectKind::MarkerPut
-                        && e.bucket == bucket
-                        && e.pkg == pkg
-                        && e.att == iv.del_att
-                        && e.seq < iv.del_seq
-                });
-                !re_armed
-            } else {
-                consumer_list_seq(live, bucket, pkg, iv.del_att, iv.del_node, iv.del_seq)
-                    .is_none_or(|cl| cl < m.seq)
-            }
-        });
-        if all_blind {
+        if all_blind(live, bucket, pkg, &cov, m.seq) {
             return finding(
                 2,
                 format!(
@@ -2175,9 +2264,151 @@ fn analyze(live: &[&Effect], boundary: u64, bucket: usize, pkg: &str) -> RepairF
     )
 }
 
+/// Explain one repaired global-index membership: the audit had to add or drop
+/// `name` from `simple/index.{json,html}` on `bucket`.
+///
+/// This is a different subsystem from [`analyze`] and needs its own history.
+/// Membership is decided by `update_global_index_locked`'s delta-plus-CAS over
+/// the tick's cached name set — never by `rebuild_package`'s render — so the
+/// per-package view can be byte-perfect while the global set is wrong. Walking
+/// the package's `ViewWrite`s (what this used to do) therefore blamed a session
+/// that had nothing to do with the flip and sent triage to the wrong function.
+/// The three questions and their severities are unchanged; only the writes they
+/// are asked about are: `GlobalWrite` effects, which carry the name set the
+/// write claimed.
+fn analyze_global(live: &[&Effect], boundary: u64, bucket: usize, name: &str) -> RepairFinding {
+    let finding = |class: u8, detail: String| RepairFinding {
+        bucket,
+        subject: format!("simple/index.* membership of {name}"),
+        class,
+        detail,
+    };
+
+    // Global writes on this bucket that actually re-derived this name, each
+    // with the seq at which they did. A write with no derivation carried the
+    // name forward from the cached set and could not have corrected it, so it
+    // is not a candidate for having failed to.
+    let mut derivations: Vec<(&Effect, u64)> = live
+        .iter()
+        .filter(|e| e.kind == EffectKind::GlobalWrite && e.bucket == bucket)
+        .filter_map(|e| {
+            global_derivation_seq(live, bucket, name, e.att, e.node, e.seq).map(|l| (*e, l))
+        })
+        .collect();
+    derivations.sort_by_key(|(e, _)| e.seq);
+    let mutations: Vec<&Effect> = live
+        .iter()
+        .filter(|e| e.kind == EffectKind::TruthWrite && e.bucket == bucket && e.pkg == name)
+        .copied()
+        .collect();
+    let intervals = breadcrumb_intervals(live, bucket, name);
+
+    // The last global write that looked at this name's truth, and what it then
+    // claimed about it (or the boundary, if none ever did).
+    let (v_f, att_f, l_f, claimed) = match derivations.last() {
+        Some((e, l)) => (
+            e.seq,
+            e.att,
+            Some(*l),
+            if e.names.iter().any(|n| n == name) {
+                "present"
+            } else {
+                "absent"
+            },
+        ),
+        None => (boundary, 0, None, "never derived"),
+    };
+    let unseen: Vec<&Effect> = mutations
+        .iter()
+        .filter(|m| l_f.is_none_or(|l| m.seq > l))
+        .copied()
+        .collect();
+
+    // TEST 1 — ORDERING: a truth mutation no global write reflected, with no
+    // live breadcrumb over it. Nothing durable could have told a tick to
+    // rebuild this package, so nothing could have computed the name delta.
+    for m in &unseen {
+        if covering(&intervals, m.seq).is_empty() {
+            return finding(
+                1,
+                format!(
+                    "truth mutation {}@{} had no live breadcrumb (no _dirty/ marker on this bucket, no _repl/ note aimed at it), so no tick ever re-derived {name} and update_global_index computed no delta for it",
+                    m.key, m.seq
+                ),
+            );
+        }
+    }
+    // TEST 2a — poisoned derivation: a global write did re-derive this name
+    // past every mutation, called it `claimed`, and was still wrong.
+    if !derivations.is_empty() && unseen.is_empty() && !mutations.is_empty() {
+        return finding(
+            2,
+            format!(
+                "op {att_f} rebuilt {name} from truth@{} and wrote the global index@{v_f} claiming it {claimed}, yet the audit had to flip that membership — update_global_index consumed the signal without applying it",
+                opt(l_f)
+            ),
+        );
+    }
+    // TEST 2b — blind consumption: every breadcrumb covering an unreflected
+    // mutation was retired without acting on it, so no delta was ever computed.
+    for m in &unseen {
+        let cov = covering(&intervals, m.seq);
+        if cov.is_empty() {
+            continue;
+        }
+        if all_blind(live, bucket, name, &cov, m.seq) {
+            return finding(
+                2,
+                format!(
+                    "breadcrumbs covering truth mutation {}@{} were all consumed blind (every consumer listed truth before the mutation, or never), so no global-index delta was ever computed for {name}",
+                    m.key, m.seq
+                ),
+            );
+        }
+    }
+    // TEST 3 — CONCURRENT-RACE: the surviving global write derived this name
+    // from strictly older truth than an earlier write it overwrote — the same
+    // unleased-rebuild clobber the audit backs up, one level up in the tree.
+    for (g, l_g) in &derivations {
+        if g.seq < v_f && g.att != att_f && l_f.is_none_or(|lf| *l_g > lf) {
+            return finding(
+                3,
+                format!(
+                    "unleased concurrent rebuild: global write@{v_f} (op {att_f}, derived {name} from truth@{}, claimed {claimed}) overwrote fresher global write@{} (op {}, derived @{l_g})",
+                    opt(l_f),
+                    g.seq,
+                    g.att
+                ),
+            );
+        }
+    }
+    // FALLBACK — unexplained drift is conservatively premature-consumption, as
+    // in `analyze`. Dump this name's truth history *and* the bucket's global
+    // writes with the sets they claimed, since either side can be the bug.
+    let dump: Vec<String> = live
+        .iter()
+        .filter(|e| e.bucket == bucket && (e.pkg == name || e.kind == EffectKind::GlobalWrite))
+        .map(|e| match e.kind {
+            EffectKind::GlobalWrite => format!(
+                "GlobalWrite@{} att={} {} names={:?}",
+                e.seq, e.att, e.key, e.names
+            ),
+            _ => format!("{:?}@{} att={} {}", e.kind, e.seq, e.att, e.key),
+        })
+        .collect();
+    finding(
+        2,
+        format!(
+            "unexplained global-index drift for {name} — conservatively premature-consumption; effects: [{}]",
+            dump.join("; ")
+        ),
+    )
+}
+
 /// Classify every view key a round's audit changed. Global-index diffs expand
-/// to the package names whose membership flipped; per-package diffs collapse
-/// the html+json pair to a single finding.
+/// to the package names whose membership flipped and are analysed against the
+/// writes that decide membership; per-package diffs collapse the html+json pair
+/// to a single finding.
 fn classify_round(effects: &[Effect], boundary: u64, diffs: &[ViewDiff]) -> Vec<RepairFinding> {
     let live: Vec<&Effect> = effects.iter().filter(|e| e.seq < boundary).collect();
     let mut findings = Vec::new();
@@ -2210,8 +2441,12 @@ fn classify_round(effects: &[Effect], boundary: u64, diffs: &[ViewDiff]) -> Vec<
                 continue;
             }
             for name in flipped {
-                if seen.insert((*bucket, name.clone())) {
-                    findings.push(analyze(&live, boundary, *bucket, name));
+                // Namespaced separately from the per-package key: a global
+                // membership flip and a per-package view repair for the same
+                // name are two different defects in two different functions,
+                // and collapsing them hid one of the two.
+                if seen.insert((*bucket, format!("simple/index.*:{name}"))) {
+                    findings.push(analyze_global(&live, boundary, *bucket, name));
                 }
             }
         } else if let Some(pkg) = view_key_package(key) {

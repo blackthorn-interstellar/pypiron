@@ -20,12 +20,13 @@ use clap::Args as ClapArgs;
 
 use crate::app::{DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 use crate::names::normalize_pkg_name;
+use crate::origin::OriginState;
 use crate::render::{
     pep503_global_html, pep503_project_html, pep691_global_json, pep691_project_json, FileMetadata,
 };
 use crate::sidecar::{
-    is_artifact, Sidecar, FROZEN_SUFFIX, METADATA_SUFFIX, PROVENANCE_SUFFIX, SIDECAR_SUFFIX,
-    TOMBSTONE_SUFFIX,
+    is_artifact, Sidecar, FROZEN_SUFFIX, METADATA_SUFFIX, MIRROR_QUARANTINED_SUFFIX,
+    PROVENANCE_SUFFIX, SIDECAR_SUFFIX, TOMBSTONE_SUFFIX,
 };
 use crate::storage::{is_not_found, ObjectMeta, Storage, StorageArgs, SHARD_CHARS};
 
@@ -163,6 +164,21 @@ async fn enumerate_grouped(
     Ok(grouped)
 }
 
+/// The renderer's mirror omission rules, as a pure predicate so the oracle and
+/// the thing it audits cannot drift ([`crate::worker`]'s `load_file_metadata`).
+/// A mirror record never renders under a private claim — that is the
+/// dependency-confusion boundary — and a quarantined mirror body only renders
+/// once a private upload has actually superseded it.
+fn suppressed_mirror(
+    pkg_origin: Option<OriginState>,
+    sc: &Sidecar,
+    mirror_quarantined: bool,
+) -> bool {
+    let origin = sc.origin.as_deref();
+    (pkg_origin == Some(OriginState::Private) && origin == Some(crate::origin::MIRROR))
+        || (mirror_quarantined && origin != Some(crate::origin::PRIVATE))
+}
+
 /// Recompute one package's views from its truth objects and diff them
 /// against storage. Returns (pkg, has_artifacts, divergences).
 async fn check_package(
@@ -196,15 +212,30 @@ async fn check_package(
         .iter()
         .filter_map(|f| f.strip_suffix(FROZEN_SUFFIX))
         .collect();
+    // A mirror body preserved after its package became private is truth the
+    // renderer deliberately omits; so is a mirror record that finished after the
+    // claim went private. Both are ordinary states on any fleet that ever
+    // demoted a claim, so the oracle has to model them or it reports a
+    // correctly-rendered view as stale forever.
+    let mirror_quarantined: std::collections::HashSet<&str> = names
+        .iter()
+        .filter_map(|f| f.strip_suffix(MIRROR_QUARANTINED_SUFFIX))
+        .collect();
+    let pkg_origin = crate::origin::read_origin_claim(storage, pkg).await?;
     let artifacts: Vec<(&ObjectMeta, &str)> = objects
         .iter()
         .filter_map(|o| {
             let filename = o.key.strip_prefix(&prefix)?;
+            // Omission rule 1: quarantined with no sidecar at all. Decided from
+            // the listing, like the worker does — it never reads that sidecar.
+            let untyped_quarantine = mirror_quarantined.contains(filename)
+                && !names.contains(format!("{filename}{SIDECAR_SUFFIX}").as_str());
             (!filename.contains('/')
                 && is_artifact(filename)
                 && !tombstoned.contains(filename)
-                && !frozen.contains(filename))
-            .then_some((o, filename))
+                && !frozen.contains(filename)
+                && !untyped_quarantine)
+                .then_some((o, filename))
         })
         .collect();
 
@@ -212,6 +243,10 @@ async fn check_package(
     // (worker::load_file_metadata), minus the backfill write.
     let mut files: Vec<FileMetadata> = Vec::with_capacity(artifacts.len());
     let mut comparable = true;
+    // Artifacts the renderer omits for one of the mirror rules. They are not a
+    // divergence and they do not keep the package alive: `still_live` (and so
+    // global-index membership) follows the *renderable* set.
+    let mut suppressed = 0usize;
     for chunk in artifacts.chunks(SIDECAR_READ_CONCURRENCY) {
         let reads = chunk.iter().map(|(_, filename)| {
             let key = format!("{prefix}{filename}{SIDECAR_SUFFIX}");
@@ -245,6 +280,10 @@ async fn check_package(
                     continue;
                 }
             };
+            if suppressed_mirror(pkg_origin, &sc, mirror_quarantined.contains(filename)) {
+                suppressed += 1;
+                continue;
+            }
             let core_metadata = names.contains(format!("{filename}{METADATA_SUFFIX}").as_str());
             let provenance = names.contains(format!("{filename}{PROVENANCE_SUFFIX}").as_str());
             files.push(FileMetadata::from_sidecar(
@@ -256,7 +295,7 @@ async fn check_package(
         }
     }
 
-    let has_artifacts = !artifacts.is_empty();
+    let has_artifacts = artifacts.len() > suppressed;
     let base = format!("{SIMPLE_PREFIX}{pkg}/");
     if has_artifacts && comparable {
         // Render exactly as the worker does (worker::write_pkg_indexes): same
@@ -335,5 +374,141 @@ async fn check_global(storage: &dyn Storage, live: &[String], divs: &mut Vec<Div
                 detail: suffix.to_string(),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::{SimClock, SimStorage};
+    use std::sync::Arc;
+
+    fn sidecar(origin: &str) -> Sidecar {
+        Sidecar {
+            sha256: "0".repeat(64),
+            size: 1,
+            version: "1.0".to_string(),
+            upload_time: "2026-01-01T00:00:00Z".to_string(),
+            upload_epoch_ms: None,
+            requires_python: None,
+            yanked: crate::sidecar::Yanked::Flag(false),
+            origin: Some(origin.to_string()),
+            yank_epoch: 0,
+            snapshot: false,
+        }
+    }
+
+    /// The three shapes `worker::load_file_metadata` omits, and the two it
+    /// keeps. An oracle that renders any of the three reports a
+    /// correctly-rendered view as stale on every fleet that demoted a claim.
+    #[test]
+    fn the_oracle_omits_exactly_what_the_renderer_omits() {
+        let private = Some(OriginState::Private);
+        let mirror = Some(OriginState::Mirror);
+        // Mirror bytes under a private claim: never rendered.
+        assert!(suppressed_mirror(private, &sidecar("mirror"), false));
+        // Quarantined and still non-private: not rendered until superseded.
+        assert!(suppressed_mirror(mirror, &sidecar("mirror"), true));
+        assert!(suppressed_mirror(None, &sidecar("mirror"), true));
+        // Private truth under a private claim, and an ordinary mirror record
+        // under a mirror claim, both render.
+        assert!(!suppressed_mirror(private, &sidecar("private"), false));
+        assert!(!suppressed_mirror(mirror, &sidecar("mirror"), false));
+        // A quarantine marker over a record a private upload already superseded
+        // renders again — that is what the supersede was for.
+        assert!(!suppressed_mirror(private, &sidecar("private"), true));
+    }
+
+    fn write(storage: &SimStorage, key: &str, bytes: Vec<u8>) {
+        storage.insert(key, bytes);
+    }
+
+    /// End to end over an in-memory bucket: a demoted package whose mirror
+    /// bodies the worker suppressed must read as converged, not as a stale view.
+    #[tokio::test]
+    async fn a_demoted_package_verifies_clean() {
+        let storage = SimStorage::new(SimClock::new(
+            time::OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap(),
+        ));
+        write(
+            &storage,
+            "packages/demo/.origin",
+            format!(r#"{{"origin":"private","nonce":"{}"}}"#, "a".repeat(32)).into_bytes(),
+        );
+        for (file, origin, quarantined) in [
+            ("demo-1.0-py3-none-any.whl", "private", false),
+            ("demo-2.0-py3-none-any.whl", "mirror", false),
+            ("demo-3.0-py3-none-any.whl", "mirror", true),
+        ] {
+            let akey = format!("packages/demo/{file}");
+            write(&storage, &akey, b"body".to_vec());
+            write(
+                &storage,
+                &format!("{akey}{SIDECAR_SUFFIX}"),
+                serde_json::to_vec(&sidecar(origin)).unwrap(),
+            );
+            if quarantined {
+                write(
+                    &storage,
+                    &format!("{akey}{MIRROR_QUARANTINED_SUFFIX}"),
+                    b"{}".to_vec(),
+                );
+            }
+        }
+        // Render the views the way the server does, then ask the oracle.
+        let bucket: Arc<dyn Storage> = storage.clone();
+        let state = crate::sim::single_bucket_state(bucket.clone());
+        crate::worker::rebuild_package_excluding(&state, bucket.as_ref(), "demo", None)
+            .await
+            .unwrap();
+        let report = verify_storage(bucket.as_ref()).await.unwrap();
+        let view_divergences: Vec<&str> = report
+            .divergences
+            .iter()
+            .filter(|d| d.kind != "missing-global-index")
+            .map(|d| d.kind)
+            .collect();
+        assert!(
+            view_divergences.is_empty(),
+            "a correctly rendered demoted package read as diverged: {view_divergences:?}"
+        );
+        // ...and the one private file is what got rendered.
+        let index = bucket.get_bytes("simple/demo/index.json").await.unwrap();
+        let index = String::from_utf8(index).unwrap();
+        assert!(index.contains("demo-1.0-py3-none-any.whl"), "{index}");
+        assert!(!index.contains("demo-2.0-py3-none-any.whl"), "{index}");
+        assert!(!index.contains("demo-3.0-py3-none-any.whl"), "{index}");
+    }
+
+    /// Every artifact suppressed means the package renders nothing, so a
+    /// materialized view left behind is an orphan — the same verdict the worker
+    /// reaches when it deletes those views.
+    #[tokio::test]
+    async fn a_fully_suppressed_package_has_no_live_view() {
+        let storage = SimStorage::new(SimClock::new(
+            time::OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap(),
+        ));
+        write(
+            &storage,
+            "packages/ghost/.origin",
+            format!(r#"{{"origin":"private","nonce":"{}"}}"#, "b".repeat(32)).into_bytes(),
+        );
+        let akey = "packages/ghost/ghost-1.0-py3-none-any.whl";
+        write(&storage, akey, b"body".to_vec());
+        write(
+            &storage,
+            &format!("{akey}{SIDECAR_SUFFIX}"),
+            serde_json::to_vec(&sidecar("mirror")).unwrap(),
+        );
+        write(&storage, "simple/ghost/index.json", b"{}".to_vec());
+        let bucket: Arc<dyn Storage> = storage.clone();
+        let report = verify_storage(bucket.as_ref()).await.unwrap();
+        assert!(
+            report
+                .divergences
+                .iter()
+                .any(|d| d.kind == "orphan-view" && d.package == "ghost"),
+            "a view over a package with nothing renderable must read as an orphan"
+        );
     }
 }

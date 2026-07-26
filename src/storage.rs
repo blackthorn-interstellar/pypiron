@@ -3540,6 +3540,11 @@ pub mod test_support {
     #[derive(Default)]
     pub struct InMemStorage {
         objects: Mutex<HashMap<String, Vec<u8>>>,
+        /// Every key this store accepted bytes for, in order. Ordering between
+        /// two objects is a correctness property whenever one is truth *about*
+        /// the other, so a test can assert it happened rather than infer it
+        /// from the final map.
+        writes: Mutex<Vec<String>>,
         gets: AtomicUsize,
         fail_next_get: AtomicBool,
         /// Artificial `get_bytes` latency in milliseconds (0 = none). Lets a
@@ -3551,6 +3556,11 @@ pub mod test_support {
     impl InMemStorage {
         pub fn insert(&self, key: &str, bytes: Vec<u8>) {
             self.objects.lock().unwrap().insert(key.to_string(), bytes);
+            self.writes.lock().unwrap().push(key.to_string());
+        }
+        /// Keys written so far, in order (duplicates kept).
+        pub fn write_log(&self) -> Vec<String> {
+            self.writes.lock().unwrap().clone()
         }
         pub fn get_count(&self) -> usize {
             self.gets.load(Ordering::SeqCst)
@@ -3603,6 +3613,7 @@ pub mod test_support {
                 return Ok(false);
             }
             map.insert(key.to_string(), bytes);
+            self.writes.lock().unwrap().push(key.to_string());
             Ok(true)
         }
         async fn put_file_if_absent(
@@ -3699,6 +3710,7 @@ pub mod test_support {
                 Some(current) if test_etag(current) == etag => {
                     let new_etag = test_etag(&bytes);
                     map.insert(key.to_string(), bytes);
+                    self.writes.lock().unwrap().push(key.to_string());
                     Ok(Some(new_etag))
                 }
                 _ => Ok(None),

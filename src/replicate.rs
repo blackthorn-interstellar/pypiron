@@ -835,7 +835,7 @@ async fn copy_live(
     // transport cannot pre-verify (the bytes never touch this node); it trusts
     // the provider's byte-exact copy and the post-copy size check, and the
     // reconcile sha-diff is the backstop.
-    let streamed = match &copy_origin {
+    let mut streamed = match &copy_origin {
         None => Some(verify_source_artifact(src, pkg, filename, record, source).await?),
         Some(_) => None,
     };
@@ -853,11 +853,41 @@ async fn copy_live(
     } else {
         ensure_private_origin(dst, pkg).await?;
     }
-    // Sidecar first: an orphan sidecar is inert, but an orphan artifact would be
-    // fabricated into truth by the destination's backfill (§4). A destination
+    // Artifact leg first whenever this node already holds the sha-verified bytes
+    // and the record is private truth. The destination's immutable create is a
+    // strictly stronger gate than its sidecar: nothing can land a body under a
+    // key we already own, so the sidecar installed after it can only ever
+    // describe bytes this bucket holds.
+    //
+    // Published the other way round, the sidecar stands over a key a concurrent
+    // writer can still take — a publish on that bucket during a partition wins
+    // the create — and a leg that then dies (crash, cancelled `select!` leg)
+    // leaves the bucket asserting sha A over body B. `decide` compares sidecar
+    // shas, so both buckets then read as agreed and the merge returns `Noop`
+    // forever; nothing re-hashes a stored body, so no sweep, note, full diff,
+    // audit, or `verify-chain` ever looks again and that bucket serves bytes
+    // that do not match their own published sha256.
+    //
+    // The cost is a one-op window where the destination holds a bare artifact
+    // its own backfill may fabricate a sidecar for (§4). Those are the source's
+    // verified bytes under the claim made above, so the fabrication names the
+    // same sha and the same-sha sidecar merge settles the metadata — the same
+    // window the upload path has always had between its artifact and sidecar.
+    if let (false, Some(bytes)) = (is_mirror, streamed.take()) {
+        let changed =
+            match artifact_leg(state, src, dst, pkg, filename, sc, &akey, bytes, false).await? {
+                // The filename is fenced on both buckets and its bodies preserved.
+                // Publishing a sidecar over a frozen record would re-list it.
+                ArtifactLeg::Frozen => return Ok(false),
+                ArtifactLeg::Landed { changed } => changed,
+            };
+        return copy_truth(dst, &akey, sc, companions, changed).await;
+    }
+
+    // Sidecar first for the server-side copy transport, whose copy verb has no
+    // create-if-absent: a pre-check is the only gate it can have. A destination
     // that already holds a different-sha private body is caught here and bails
-    // before any artifact write — the divergence gate the copy transport relies
-    // on to overwrite safely.
+    // before any artifact write. The mirror path keeps the same order.
     let mut changed = if is_mirror {
         install_or_verify_mirror_sidecar(dst, &sidecar_key(&akey), sc).await?
     } else {
@@ -892,13 +922,46 @@ async fn copy_live(
         }
     }
 
-    // Stream the artifact: use the pre-verified bytes on the pure-stream path, or
-    // read + verify them now if a copy was attempted and missed.
+    // Stream the artifact: the pre-verified bytes are gone on this path (only a
+    // mirror record or a missed server-side copy reaches here), so read and
+    // verify them now.
     let artifact = match streamed {
         Some(bytes) => bytes,
         None => verify_source_artifact(src, pkg, filename, record, source).await?,
     };
-    finish_stream_leg(state, src, dst, pkg, filename, sc, &akey, artifact, changed).await
+    Ok(
+        match artifact_leg(state, src, dst, pkg, filename, sc, &akey, artifact, true).await? {
+            ArtifactLeg::Frozen => false,
+            ArtifactLeg::Landed { changed: landed } => changed || landed,
+        },
+    )
+}
+
+/// Publish the destination's truth for a record whose bytes are already down:
+/// the sidecar that names them, then the companions.
+async fn copy_truth(
+    dst: &dyn Storage,
+    akey: &str,
+    sc: &Sidecar,
+    companions: Companions,
+    mut changed: bool,
+) -> Result<bool> {
+    changed |= install_or_verify_sidecar(dst, &sidecar_key(akey), sc).await?;
+    if let Some(bytes) = companions.metadata {
+        changed |= put_if_absent_or_verify(
+            dst,
+            &metadata_key(akey),
+            bytes,
+            Some("text/plain; charset=utf-8"),
+        )
+        .await?;
+    }
+    if let Some(bytes) = companions.provenance {
+        changed |=
+            put_if_absent_or_verify(dst, &provenance_key(akey), bytes, Some("application/json"))
+                .await?;
+    }
+    Ok(changed)
 }
 
 /// Whether the destination's own sidecar still names `sha` — the divergence
@@ -918,12 +981,25 @@ async fn sidecar_still_names(dst: &dyn Storage, key: &str, sha: &str) -> Result<
     }
 }
 
+/// How the destination's artifact key ended up after [`artifact_leg`].
+#[derive(Debug, PartialEq, Eq)]
+enum ArtifactLeg {
+    /// The key holds the bytes the source sidecar names. `changed` is whether
+    /// this leg wrote them (a dedup against identical bytes changes nothing).
+    Landed { changed: bool },
+    /// A competing body could not be reconciled, so the filename is frozen on
+    /// both buckets and both bodies are preserved. No truth may be published
+    /// over it.
+    Frozen,
+}
+
 /// Land the (already verified) artifact bytes on the destination: repair a
-/// stale-debris body in place, then publish the artifact last under a
-/// conditional create, freezing a raced competing body. Shared by the pure
-/// stream path and the copy transport's fallback.
+/// stale-debris body in place, then publish the artifact under a conditional
+/// create, freezing a raced competing body. Shared by the private stream path
+/// (which runs it *before* publishing the sidecar) and by the mirror path and
+/// the copy transport's fallback (which run it after their sidecar gate).
 #[allow(clippy::too_many_arguments)]
-async fn finish_stream_leg(
+async fn artifact_leg(
     state: &AppState,
     src: &dyn Storage,
     dst: &dyn Storage,
@@ -932,15 +1008,20 @@ async fn finish_stream_leg(
     sc: &Sidecar,
     akey: &str,
     artifact: Vec<u8>,
-    mut changed: bool,
-) -> Result<bool> {
+    // Whether this leg has already published the destination's sidecar: the
+    // gated paths have, the private stream path has not, and that decides what
+    // a raced competing body means.
+    sidecar_published: bool,
+) -> Result<ArtifactLeg> {
+    let mut changed = false;
     // A destination body already under this immutable key with the wrong sha is
     // stale crash debris (e.g. a zero-byte object a 200-acked-but-failed write
     // left behind, D2); repair it in place, then the conditional create dedups.
     //
-    // "Debris" holds only while the destination sidecar still names OUR sha —
-    // the divergence gate the sidecar install established. A local publish on
-    // this bucket invalidates that gate inside this window: it wins the
+    // "Debris" holds only while the destination sidecar names OUR sha — a gate
+    // some earlier leg installed ahead of its bytes (the copy transport's
+    // pre-check, the mirror path, or a pre-artifact-first leg). A local publish
+    // on this bucket invalidates that gate inside the window: it wins the
     // immutable create and then overwrites the sidecar, leaving a live body its
     // own truth correctly describes. So re-read the gate. A described body is a
     // byte conflict, not debris, and falls through to the conditional create's
@@ -968,15 +1049,15 @@ async fn finish_stream_leg(
             }
         }
     }
-    // Artifact last. Losing this conditional create must never be reported as
-    // a copy: verify the winner. Same bytes converged; different bytes freeze
-    // immediately so the source sidecar we installed cannot describe the
-    // competing body even briefly after this operation returns. The create is
-    // verified (D1) and bounded (D3) by the shared primitive.
+    // Losing this conditional create must never be reported as a copy: verify
+    // the winner. Same bytes converged; different bytes freeze immediately, so
+    // no sidecar this copy publishes can describe the competing body — the
+    // private path has not written one yet, and the gated paths already have.
+    // The create is verified (D1) and bounded (D3) by the shared primitive.
     let len = artifact.len() as u64;
     if create_artifact_verified(dst, akey, artifact, len, Some("application/octet-stream")).await? {
         state.metrics.record_replicated(len);
-        return Ok(true);
+        return Ok(ArtifactLeg::Landed { changed: true });
     }
     let raced = dst
         .get_bytes(akey)
@@ -984,10 +1065,25 @@ async fn finish_stream_leg(
         .with_context(|| format!("verify raced destination artifact {akey}"))?;
     let raced_sha = sha256_hex(&raced);
     if raced_sha == sc.sha256 {
-        return Ok(changed);
+        return Ok(ArtifactLeg::Landed { changed });
+    }
+    // A raced body the destination's own sidecar describes means that bucket
+    // holds live private truth for this filename with different bytes. Ordering
+    // it is the merge's call, not this leg's — `upload-epoch-ms` resolves it
+    // first-uploaded-wins and only a skew-tied or epoch-less pair degrades to a
+    // freeze — and a leg that has published nothing yet can still leave it
+    // alone. Refuse exactly as the sidecar gate does, so the caller's `_repl/`
+    // note brings the next `decide` to it. Once the sidecar *is* published this
+    // leg owns the record and must freeze on the spot instead, so nothing it
+    // wrote ever describes the competing body (§6.3).
+    if !sidecar_published && sidecar_still_names(dst, &sidecar_key(akey), &raced_sha).await? {
+        bail!(
+            "destination artifact at {akey} holds different private bytes named by its own sidecar ({raced_sha}); expected {}",
+            sc.sha256
+        );
     }
     freeze_copy_race(state, src, dst, pkg, filename, &sc.sha256, &raced_sha).await?;
-    Ok(false)
+    Ok(ArtifactLeg::Frozen)
 }
 
 /// The source's [`CopyOrigin`] when the boot matrix has verified that `dst` can
@@ -3283,6 +3379,8 @@ mod tests {
         // own sidecar now names the local bytes, not ours. Overwriting that as
         // "stale crash debris" destroys acked bytes and leaves a sidecar over a
         // body it does not describe. It is a byte conflict: freeze, preserve.
+        // A gated leg (`sidecar_published`) has published truth of its own here,
+        // so it must settle the record rather than hand it back.
         let filename = "pkg-1.whl";
         let key = artifact_key("pkg", filename);
         let source_bytes = b"source wheel";
@@ -3294,7 +3392,53 @@ mod tests {
         let state = test_state(src.clone());
         let sidecar = sc(&sha256_hex(source_bytes), PRIVATE, Yanked::Flag(false), 0);
 
-        assert!(!finish_stream_leg(
+        assert_eq!(
+            artifact_leg(
+                &state,
+                src.as_ref(),
+                dst.as_ref(),
+                "pkg",
+                filename,
+                &sidecar,
+                &key,
+                source_bytes.to_vec(),
+                true,
+            )
+            .await
+            .unwrap(),
+            ArtifactLeg::Frozen
+        );
+
+        let quarantined = dst.list_all(QUARANTINE_PREFIX).await.unwrap();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(
+            dst.get_bytes(&quarantined[0].key).await.unwrap(),
+            local_bytes
+        );
+        assert!(dst.head_exists(&frozen_key(&key)).await.unwrap());
+        assert!(src.head_exists(&frozen_key(&key)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_ungated_leg_hands_a_live_competing_record_back_to_the_merge() {
+        // Same destination state, reached by a leg that has published nothing
+        // of its own — the private stream path, which takes the artifact key
+        // first. Ordering two live private bodies is `decide`'s job: it has both
+        // `upload-epoch-ms` values and resolves first-uploaded-wins, degrading
+        // to a freeze only inside the skew. So refuse, exactly as the sidecar
+        // gate does, and let the caller's repair note bring the merge to it.
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let source_bytes = b"source wheel";
+        let local_bytes = b"locally published wheel";
+        let src = Arc::new(InMemStorage::default());
+        seed_live(src.as_ref(), "pkg", filename, source_bytes, PRIVATE);
+        let dst = Arc::new(InMemStorage::default());
+        seed_live(dst.as_ref(), "pkg", filename, local_bytes, PRIVATE);
+        let state = test_state(src.clone());
+        let sidecar = sc(&sha256_hex(source_bytes), PRIVATE, Yanked::Flag(false), 0);
+
+        let err = artifact_leg(
             &state,
             src.as_ref(),
             dst.as_ref(),
@@ -3306,16 +3450,15 @@ mod tests {
             false,
         )
         .await
-        .unwrap());
+        .unwrap_err();
 
-        let quarantined = dst.list_all(QUARANTINE_PREFIX).await.unwrap();
-        assert_eq!(quarantined.len(), 1);
-        assert_eq!(
-            dst.get_bytes(&quarantined[0].key).await.unwrap(),
-            local_bytes
+        assert!(
+            err.to_string().contains("different private bytes"),
+            "unexpected error: {err}"
         );
-        assert!(dst.head_exists(&frozen_key(&key)).await.unwrap());
-        assert!(src.head_exists(&frozen_key(&key)).await.unwrap());
+        assert_eq!(dst.get_bytes(&key).await.unwrap(), local_bytes);
+        assert!(!dst.head_exists(&frozen_key(&key)).await.unwrap());
+        assert!(dst.list_all(QUARANTINE_PREFIX).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3334,22 +3477,71 @@ mod tests {
         let state = test_state(src.clone());
         let sidecar = sc(&sha256_hex(source_bytes), PRIVATE, Yanked::Flag(false), 0);
 
-        assert!(finish_stream_leg(
+        assert_eq!(
+            artifact_leg(
+                &state,
+                src.as_ref(),
+                dst.as_ref(),
+                "pkg",
+                filename,
+                &sidecar,
+                &key,
+                source_bytes.to_vec(),
+                true,
+            )
+            .await
+            .unwrap(),
+            ArtifactLeg::Landed { changed: true }
+        );
+
+        assert_eq!(dst.get_bytes(&key).await.unwrap(), source_bytes);
+        assert!(!dst.head_exists(&frozen_key(&key)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_copy_takes_the_destination_key_before_publishing_truth_about_it() {
+        // A destination sidecar is that bucket's assertion that the filename is
+        // truth with those bytes. Published ahead of the artifact it stands over
+        // a key any concurrent writer can still take: a publish on that bucket
+        // during a partition wins the immutable create, and a leg that then dies
+        // leaves sidecar(A) over body(B) — which `decide` cannot see, because it
+        // compares sidecar shas and nothing ever re-hashes a stored body. The
+        // create is the stronger gate, so it goes first: nothing can land a body
+        // under a key we already own.
+        let bytes = b"replicated wheel bytes";
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let src = Arc::new(InMemStorage::default());
+        seed_live(src.as_ref(), "pkg", filename, bytes, PRIVATE);
+        let dst = Arc::new(InMemStorage::default());
+        let state = test_state(src.clone());
+
+        assert!(copy_live(
             &state,
             src.as_ref(),
             dst.as_ref(),
             "pkg",
             filename,
-            &sidecar,
-            &key,
-            source_bytes.to_vec(),
-            false,
+            &live(&sha256_hex(bytes), PRIVATE),
+            ArtifactSource::Bucket,
         )
         .await
         .unwrap());
 
-        assert_eq!(dst.get_bytes(&key).await.unwrap(), source_bytes);
-        assert!(!dst.head_exists(&frozen_key(&key)).await.unwrap());
+        let log = dst.write_log();
+        let artifact_at = log
+            .iter()
+            .position(|written| written == &key)
+            .expect("the copy landed the artifact");
+        let sidecar_at = log
+            .iter()
+            .position(|written| written == &sidecar_key(&key))
+            .expect("the copy installed the sidecar");
+        assert!(
+            artifact_at < sidecar_at,
+            "the destination sidecar was published before the bytes it names: {log:?}"
+        );
+        assert_eq!(dst.get_bytes(&key).await.unwrap(), bytes);
     }
 
     #[tokio::test]

@@ -7,6 +7,10 @@
 //!   - Every merge transition calls the real `pypiron::replicate::decide` on
 //!     real `Record`s built from the abstract bucket state. The model cannot
 //!     encode a different precedence algebra than production.
+//!   - A merge transition is the whole diff pass, in the real order: the
+//!     package-claim reconciliation (`reconcile_split_origin`) runs first and
+//!     the records are read from its result, exactly as `converge_package` and
+//!     `replicate_record` both do.
 //!   - The model's verdict *executor* (`apply_verdict`) mirrors the storage
 //!     effects of the real `pypiron::replicate::execute`. That mirror is kept
 //!     honest by `conformance_execute_matches_model` below, which enumerates
@@ -304,11 +308,19 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
             let (Some(byte), Some(sc)) = (rec.artifact, rec.sidecar) else {
                 unreachable!("Copy verdict from a non-live record");
             };
-            // A private copy claims the destination private; a mirror copy
-            // (snapshot OR proxy cache — both replicate now) claims it mirror
-            // (ensure_mirror_origin never demotes a private peer — but a Copy
-            // destination is Absent, so unclaimed).
-            dst.pkg_origin = Some(sc.origin);
+            // copy_live claims the destination ahead of the bytes: a private
+            // copy runs ensure_private_origin (private is terminal, and it DOES
+            // demote a mirror claim); a mirror copy — snapshot or proxy cache —
+            // runs ensure_mirror_origin, which claims an absent name but never
+            // demotes a destination that already holds private truth.
+            match sc.origin {
+                MOrigin::Private => dst.pkg_origin = Some(MOrigin::Private),
+                MOrigin::Mirror => {
+                    if dst.pkg_origin.is_none() {
+                        dst.pkg_origin = Some(MOrigin::Mirror);
+                    }
+                }
+            }
             let drec = &mut dst.files[file as usize];
             drec.artifact = Some(byte);
             drec.sidecar = Some(sc);
@@ -377,11 +389,60 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
     }
 }
 
+/// quarantine_mirror_artifacts: under a private package claim every live
+/// mirror-sidecar body is a demotion loser — preserve it under its content hash
+/// and mark the canonical record inert. Package-wide, like the real scan: it
+/// walks every member, and a tombstone or freeze marker does not exempt one.
+fn quarantine_mirror_artifacts_abs(bucket: &mut BucketAbs) {
+    if bucket.pkg_origin != Some(MOrigin::Private) {
+        return;
+    }
+    for file in 0..FILES.len() as u8 {
+        let rec = bucket.files[file as usize];
+        let (Some(byte), Some(sc)) = (rec.artifact, rec.sidecar) else {
+            continue;
+        };
+        if sc.origin != MOrigin::Mirror || rec.mirror_q {
+            continue;
+        }
+        bucket.quarantine.insert((file, byte));
+        bucket.files[file as usize].mirror_q = true;
+    }
+}
+
+/// reconcile_split_origin: every diff path — the whole-package
+/// `converge_package` and the single-file `replicate_record` — runs this on the
+/// two package claims BEFORE it reads any record. A lone private claim is
+/// terminal, so it promotes the peer; without this the fleet can sit forever on
+/// a (private, mirror) split that no per-file verdict can resolve.
+fn reconcile_split_origin_abs(w: &mut World) {
+    match (w.buckets[0].pkg_origin, w.buckets[1].pkg_origin) {
+        // Demoting the peer's mirror claim strands its mirror bodies; the
+        // promoted side quarantines them in the same pass.
+        (Some(MOrigin::Private), Some(MOrigin::Mirror)) => {
+            w.buckets[1].pkg_origin = Some(MOrigin::Private);
+            quarantine_mirror_artifacts_abs(&mut w.buckets[1]);
+        }
+        (Some(MOrigin::Mirror), Some(MOrigin::Private)) => {
+            w.buckets[0].pkg_origin = Some(MOrigin::Private);
+            quarantine_mirror_artifacts_abs(&mut w.buckets[0]);
+        }
+        // An unclaimed peer holds no mirror record to strand (a mirror writer
+        // claims the name before it writes anything), so no scan follows.
+        (Some(MOrigin::Private), None) => w.buckets[1].pkg_origin = Some(MOrigin::Private),
+        (None, Some(MOrigin::Private)) => w.buckets[0].pkg_origin = Some(MOrigin::Private),
+        _ => {}
+    }
+}
+
 fn merge_once(w: &World, file: u8) -> Option<World> {
-    let ra = to_record(&w.buckets[0], file);
-    let rb = to_record(&w.buckets[1], file);
-    let verdict = decide(&ra, &rb);
     let mut next = w.clone();
+    reconcile_split_origin_abs(&mut next);
+    // Records are read after the reconciliation, on the reconciled claims —
+    // the origin fallback a bare artifact inherits moves with them.
+    let ra = to_record(&next.buckets[0], file);
+    let rb = to_record(&next.buckets[1], file);
+    let verdict = decide(&ra, &rb);
     apply_verdict(&mut next, file, &verdict);
     (next != *w).then_some(next)
 }
@@ -415,19 +476,16 @@ fn late_mirror_quarantine_once(w: &World, bucket: u8, file: u8) -> Option<World>
     if babs.pkg_origin != Some(MOrigin::Private) {
         return None;
     }
-    let (Some(byte), Some(sc)) = (rec.artifact, rec.sidecar) else {
+    let (Some(_), Some(sc)) = (rec.artifact, rec.sidecar) else {
         return None;
     };
     if sc.origin != MOrigin::Mirror || rec.mirror_q || rec.tombstoned || rec.frozen {
         return None;
     }
-    // quarantine_mirror_record: preserve the body under its content hash and
-    // mark the canonical record inert; the artifact key stays occupied.
+    // The trigger is per-file (a *live* mirror record under a private claim),
+    // but the repair it fires is the package-wide scan.
     let mut next = w.clone();
-    next.buckets[bucket as usize]
-        .quarantine
-        .insert((file, byte));
-    next.buckets[bucket as usize].files[file as usize].mirror_q = true;
+    quarantine_mirror_artifacts_abs(&mut next.buckets[bucket as usize]);
     Some(next)
 }
 

@@ -2541,8 +2541,9 @@ async fn update_global_index_locked(
 /// what keeps a warm copy's indexes fresh. Cache-free on purpose: it must
 /// not disturb the node-local name/inventory caches, which describe the
 /// *selected* bucket. A package that fails to rebuild keeps its markers for the
-/// next pass; a package whose global membership flips (first file in, or last
-/// file out) is threaded into the destination's own global index.
+/// next pass; every package that does rebuild asserts its membership into the
+/// destination's own global index, which dedups the assertion against the name
+/// set it loads.
 pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Result<()> {
     let entries = storage.list_dir_entries(DIRTY_PREFIX).await?;
     if entries.is_empty() {
@@ -2559,22 +2560,6 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
         stale_intents,
     } in work
     {
-        // A cheap HEAD decides whether global membership can flip, so the common
-        // "another file added to a package already listed" case never pays the
-        // full global-index read below. An availability error here is not proof
-        // the view is absent: swallowing it to `false` would skip a dead
-        // package's `removes` delta and leave it listed until the audit. Treat it
-        // like a rebuild failure — retain the markers and retry next pass.
-        let existed = match storage
-            .head_exists(&format!("{SIMPLE_PREFIX}{package}/index.json"))
-            .await
-        {
-            Ok(existed) => existed,
-            Err(e) => {
-                error!(package=%package, error=?e, "replicate: could not probe global membership; markers retained");
-                continue;
-            }
-        };
         match rebuild_package_indexes(state, storage, &package, None).await {
             Ok(RebuiltPackage {
                 still_live: live, ..
@@ -2588,9 +2573,20 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
                         continue;
                     }
                 }
-                if live && !existed {
+                // State what this rebuild found — member or not — and let
+                // `update_global_index_uncached` dedup it against the global
+                // name set it loads, exactly as the selected-bucket tick does.
+                // Never diff it here against a probe of the package's *own*
+                // index view: that view is this function's own output, so a
+                // pass whose global write failed left the next pass reading its
+                // own leftovers, concluding the membership already matched, and
+                // dropping the delta for good — while consuming the markers
+                // that were the only remaining signal. An assertion has no such
+                // history: repeat it as often as you like and the first pass
+                // that reaches the global index converges it.
+                if live {
                     adds.push(package);
-                } else if !live && existed {
+                } else {
                     removes.push(package);
                 }
                 healed += stale_intents;
@@ -2611,11 +2607,12 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
 
 /// Apply a package-name delta to a bucket's own global index, reading and
 /// writing that bucket's `simple/index.{json,html}` directly — never through the
-/// node-local name cache, which is pinned to the *selected* bucket. The
-/// replicator uses this for destination buckets on a genuine membership flip
-/// only. Single-writer in P3 (one node rebuilds every warm copy), so a plain
-/// read-modify-write is safe; P4's per-bucket leaders drive each bucket's own
-/// cached CAS path instead.
+/// node-local name cache, which is pinned to the *selected* bucket. `adds` and
+/// `removes` are assertions, not a pre-computed diff — the loaded name set is
+/// the only thing that decides whether one is a change, and dedupping here is
+/// what makes a repeated pass idempotent. Single-writer in P3 (one node
+/// rebuilds every warm copy), so a plain read-modify-write is safe; P4's
+/// per-bucket leaders drive each bucket's own cached CAS path instead.
 pub(crate) async fn update_global_index_uncached(
     state: &AppState,
     storage: &dyn Storage,
@@ -2627,6 +2624,7 @@ pub(crate) async fn update_global_index_uncached(
     }
     let loaded = load_global_names(storage).await?;
     let loaded_html_etag = loaded.html_etag;
+    let stranded = loaded.stranded;
     let mut names = loaded.names;
     let mut changed = false;
     for pkg in adds {
@@ -2637,7 +2635,11 @@ pub(crate) async fn update_global_index_uncached(
     }
     let mut packages: Vec<String> = names.into_iter().collect();
     packages.sort();
-    if !changed {
+    // A stranded load (HTML published, canonical JSON absent) derived its names
+    // from the per-package views, so a delta that dedups against them is not a
+    // no-op: the JSON still has to be materialized. Same rule the cached path
+    // states — without it the HTML serves a set no canonical index backs.
+    if !changed && !stranded {
         // Every call here loads fresh, so it knows the JSON and nothing about
         // the HTML — same hazard as the cached path (a crash between the two
         // writes strands the HTML ahead of the JSON). Prove currency from the
@@ -4107,6 +4109,80 @@ mod tests {
                 .await
                 .unwrap(),
             "a no-op delta must not materialize a global index into a bucket that has none"
+        );
+    }
+
+    /// A destination drain's membership delta must be an *assertion*, never a
+    /// diff against the package's own index view — the view this same function
+    /// writes and deletes. Pass one here rebuilds `alpha` to nothing (its views
+    /// go) and then fails on the global index, so the markers are retained for
+    /// the retry the protocol promises. Pass two used to HEAD the view its own
+    /// predecessor had just deleted, read "already absent" as "already not a
+    /// member", compute no delta — and consume the markers anyway, leaving a
+    /// dead package listed in that bucket's global index with no signal left to
+    /// heal it. That is the partitioned lane's dominant finding
+    /// (AUDIT_PREMATURE_CONSUMPTION), reached whenever a fault lands between the
+    /// per-package rebuild and the global write.
+    #[tokio::test]
+    async fn a_destination_drain_reasserts_membership_a_failed_pass_left_unapplied() {
+        let storage = Arc::new(InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+        // A warm copy that published `alpha`, whose last artifact has since been
+        // replicated away: no truth under `packages/alpha/`, both views still
+        // listing it, and a `_dirty/` marker announcing the change.
+        let listed = vec!["alpha".to_string()];
+        storage.insert(
+            &format!("{SIMPLE_PREFIX}index.json"),
+            pep691_global_json(&listed).into_bytes(),
+        );
+        storage.insert(
+            &format!("{SIMPLE_PREFIX}index.html"),
+            pep503_global_html(&listed).into_bytes(),
+        );
+        storage.insert(&format!("{SIMPLE_PREFIX}alpha/index.json"), b"{}".to_vec());
+        storage.insert(&format!("{SIMPLE_PREFIX}alpha/index.html"), b"<!>".to_vec());
+        mark_dirty(storage.as_ref(), "alpha").await.unwrap();
+
+        // Pass one: the per-package views go, then the global index is
+        // unreachable. The error must reach the caller with the markers intact.
+        storage.fail_reads_of(&format!("{SIMPLE_PREFIX}index.json"));
+        drain_dirty_uncached(&state, storage.as_ref())
+            .await
+            .unwrap_err();
+        storage.heal_reads();
+        assert!(
+            !storage
+                .head_exists(&format!("{SIMPLE_PREFIX}alpha/index.json"))
+                .await
+                .unwrap(),
+            "the rebuild must have removed the dead package's own view before failing"
+        );
+        assert!(
+            !storage
+                .list_dir_entries(DIRTY_PREFIX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a global write that failed must retain the markers it never applied"
+        );
+
+        // Pass two, with storage healthy again.
+        drain_dirty_uncached(&state, storage.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            global_html(&storage).await,
+            pep503_global_html(&[]),
+            "the retry must still drop the dead package from the global index"
+        );
+        let json = storage
+            .get_bytes(&format!("{SIMPLE_PREFIX}index.json"))
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8(json).unwrap().contains("alpha"),
+            "the canonical global JSON must not keep listing a package with no artifacts"
         );
     }
 }

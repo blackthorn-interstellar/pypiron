@@ -3547,6 +3547,10 @@ pub mod test_support {
         writes: Mutex<Vec<String>>,
         gets: AtomicUsize,
         fail_next_get: AtomicBool,
+        /// One key whose reads fail until [`InMemStorage::heal_reads`]. The
+        /// positional `fail_next_get` cannot express "this object is
+        /// unreachable" when the read under test is not the next one.
+        unreadable: Mutex<Option<String>>,
         /// Artificial `get_bytes` latency in milliseconds (0 = none). Lets a
         /// test hold one loader in flight long enough for concurrent readers to
         /// observe the single-flight refill claim.
@@ -3567,6 +3571,16 @@ pub mod test_support {
         }
         pub fn fail_next_get(&self) {
             self.fail_next_get.store(true, Ordering::SeqCst);
+        }
+        /// Make every read of `key` fail until [`InMemStorage::heal_reads`].
+        pub fn fail_reads_of(&self, key: &str) {
+            *self.unreadable.lock().unwrap() = Some(key.to_string());
+        }
+        pub fn heal_reads(&self) {
+            *self.unreadable.lock().unwrap() = None;
+        }
+        fn unreadable(&self, key: &str) -> bool {
+            self.unreadable.lock().unwrap().as_deref() == Some(key)
         }
         pub fn set_get_delay(&self, delay: std::time::Duration) {
             self.get_delay_ms
@@ -3627,7 +3641,7 @@ pub mod test_support {
         }
         async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
             self.gets.fetch_add(1, Ordering::SeqCst);
-            if self.fail_next_get.swap(false, Ordering::SeqCst) {
+            if self.fail_next_get.swap(false, Ordering::SeqCst) || self.unreadable(key) {
                 anyhow::bail!("injected storage failure");
             }
             let delay = self.get_delay_ms.load(Ordering::SeqCst);
@@ -3680,7 +3694,7 @@ pub mod test_support {
             true
         }
         async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
-            if self.fail_next_get.swap(false, Ordering::SeqCst) {
+            if self.fail_next_get.swap(false, Ordering::SeqCst) || self.unreadable(key) {
                 anyhow::bail!("injected storage failure");
             }
             Ok(self

@@ -2275,15 +2275,84 @@ impl InventoryMap {
 pub struct GlobalNames {
     etag: Option<String>,
     names: HashSet<String>,
-    /// Whether `simple/index.html` is known to render exactly `names`.
-    /// `changed` detection reads only the canonical JSON, so a freshly loaded
-    /// cache knows nothing about the HTML: it is written *first* and
-    /// unconditionally, which leaves it ahead of the JSON when a write crashes
-    /// between the two, and behind it when the crash lands on the reconcile
-    /// after a lost CAS. Either way the next delta may dedup and return, and
-    /// nothing else revisits the HTML — the audit reaches the same gate. So a
-    /// load starts `false` and the first no-op delta reconciles once.
+    /// The stored `simple/index.html`'s ETag as of this load. Every HTML write
+    /// is conditional on it, so a node holding a stale view of the HTML cannot
+    /// clobber a fresher one — its write fails and it reloads. `None` when no
+    /// HTML has been published yet, or on a single-writer backend with no
+    /// conditional writes (disk), where there are no peers to race.
+    html_etag: Option<String>,
+    /// Whether this cache has already *proved* `simple/index.html` renders
+    /// exactly `names`. The proof comes from storage — the durable stamp at
+    /// [`global_html_stamp_key`] — never from optimism: a node's belief that it
+    /// left the HTML current is only ever true of its own last write, and a
+    /// peer's write invalidates it silently. This flag is just a per-cache memo
+    /// so the proof costs two small reads per load rather than per delta.
     html_current: bool,
+    /// An HTML view exists but the canonical JSON does not — a crash landed
+    /// between the two writes. The name set below was derived from the
+    /// per-package views rather than read from the JSON, so a delta that dedups
+    /// against it proves nothing: the JSON is still missing and no `changed`
+    /// will ever be computed to create it. Such a cache must write once
+    /// regardless, which materializes the authority and clears this.
+    stranded: bool,
+}
+
+/// Where the durable proof of global-HTML currency lives. Deliberately in the
+/// per-bucket coordination area rather than under `simple/`: it describes one
+/// bucket's derived view, is never served, and must never replicate.
+fn global_html_stamp_key() -> String {
+    format!("{STATE_PREFIX}global-html.json")
+}
+
+/// The proof that a specific stored `simple/index.html` renders a specific name
+/// set. `html_etag` is what makes it trustworthy: HTML writes are conditional,
+/// so any later write moves the ETag and this stamp stops matching — a stamp can
+/// never speak for an HTML object it did not itself produce.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GlobalHtmlStamp {
+    html_etag: String,
+    names: String,
+}
+
+/// Identity of a rendered global index: a digest over the sorted name list.
+/// Content-addressed rather than ETag-addressed so it means the same thing in
+/// every bucket and on every backend.
+fn global_names_digest(packages: &[String]) -> String {
+    crate::hash::sha256_hex(packages.join("\n").as_bytes())
+}
+
+/// Read the currency stamp, if one was ever written. A missing or unparsable
+/// stamp is simply "unproven" — it forces the full reconcile, never an error:
+/// the stamp is an optimization over reading the HTML body, not an authority.
+async fn read_global_html_stamp(storage: &dyn Storage) -> Option<GlobalHtmlStamp> {
+    match storage.get_bytes(&global_html_stamp_key()).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).ok(),
+        Err(_) => None,
+    }
+}
+
+/// Record that the HTML at `html_etag` renders `packages`. Written *after* the
+/// HTML it describes, so a crash in between leaves the stamp stale — which
+/// costs one redundant reconcile and never a false claim of currency.
+async fn write_global_html_stamp(
+    storage: &dyn Storage,
+    html_etag: &Option<String>,
+    packages: &[String],
+) -> Result<()> {
+    let Some(html_etag) = html_etag else {
+        return Ok(()); // No conditional writes: no peers, nothing to prove.
+    };
+    let stamp = GlobalHtmlStamp {
+        html_etag: html_etag.clone(),
+        names: global_names_digest(packages),
+    };
+    storage
+        .put_bytes(
+            &global_html_stamp_key(),
+            serde_json::to_vec(&stamp)?,
+            Some("application/json"),
+        )
+        .await
 }
 
 /// All hosted package names, sorted — the human package browser's listing.
@@ -2361,7 +2430,7 @@ async fn update_global_index_locked(
         for pkg in removes {
             changed |= cached.names.remove(pkg);
         }
-        if !changed {
+        if !changed && !cached.stranded {
             // The delta landed entirely inside the cached set. On a backend
             // with peer writers that is NOT yet proof of a no-op: a peer may
             // have changed the stored set since this cache was pinned (add a
@@ -2384,42 +2453,74 @@ async fn update_global_index_locked(
                     continue;
                 }
             }
-            // Currency of the *JSON* is not currency of the HTML: it is written
-            // first and unconditionally, so a lost CAS or a crash can leave it
-            // either ahead of or behind the set this cache was loaded from, and
-            // returning here would make that the final word — a drift nothing
-            // heals, since the audit reaches this same gate. Reconcile once per
-            // cache load, then never again for that cache: steady state is a
-            // pure hash lookup, and a real change writes both views anyway.
+            // Currency of the *JSON* is not currency of the HTML: a crash
+            // between the two writes leaves the HTML ahead, and returning here
+            // would make that the final word — a drift nothing heals, since the
+            // audit reaches this same gate. Prove currency from the durable
+            // stamp rather than assuming it: two metadata-sized reads, no body,
+            // so the check costs the same whether the index holds four names or
+            // 780,000. Only an unproven pair pays the byte compare, and only
+            // once per cache load.
             if !cached.html_current {
                 let mut packages: Vec<String> = cached.names.iter().cloned().collect();
                 packages.sort();
-                reconcile_global_html(state, storage, &packages).await?;
-                cached.html_current = true;
+                if !global_html_proved_current(storage, &cached.html_etag, &packages).await {
+                    match reconcile_global_html(state, storage, &packages, &cached.html_etag)
+                        .await?
+                    {
+                        HtmlReconcile::Current => {}
+                        HtmlReconcile::Rewrote(html_etag) => {
+                            write_global_html_stamp(storage, &html_etag, &packages).await?;
+                            cached.html_etag = html_etag;
+                        }
+                        HtmlReconcile::Lost => {
+                            // A peer moved the HTML under us, so this cache's
+                            // name set may be stale too. Reload and re-evaluate
+                            // rather than fight over the object.
+                            *guard = None;
+                            continue;
+                        }
+                    }
+                }
+                if let Some(cached) = guard.as_mut() {
+                    cached.html_current = true;
+                }
             }
             return Ok(());
         }
         let mut packages: Vec<String> = cached.names.iter().cloned().collect();
         packages.sort();
-        match write_global_indexes_cas(state, storage, &packages, &cached.etag.clone()).await? {
-            CasOutcome::Won(new_etag) => {
+        let expected_json = cached.etag.clone();
+        let expected_html = cached.html_etag.clone();
+        match write_global_indexes_cas(state, storage, &packages, &expected_json, &expected_html)
+            .await?
+        {
+            CasOutcome::Won {
+                json_etag,
+                html_etag,
+            } => {
                 if let Some(cached) = guard.as_mut() {
-                    // Pin the ETag the conditional write itself returned, not one
-                    // from a follow-up GET — a peer could land a write between the
-                    // two and we'd pin its ETag against our stale name set.
-                    cached.etag = new_etag;
+                    // Pin the ETags the conditional writes themselves returned,
+                    // not ones from a follow-up GET — a peer could land a write
+                    // between the two and we'd pin its ETag against our stale
+                    // name set.
+                    cached.etag = json_etag;
+                    cached.html_etag = html_etag;
                     cached.html_current = true;
+                    cached.stranded = false;
                 }
                 return Ok(());
             }
             CasOutcome::Lost => {}
         }
-        // Lost the CAS to a peer: another node updated the name set under us,
-        // and the optimistic HTML we wrote this iteration is now for a set that
-        // lost. Dropping the cache is what heals it — the reload clears
-        // `html_current`, so a reload whose delta turns into a no-op still
-        // reconciles the HTML above. Count the conflict first (operators watch
-        // this to confirm dual leadership converges rather than corrupts).
+        // Lost a CAS to a peer: another node updated the global index under us.
+        // If the HTML write lost, nothing was published at all. If the JSON
+        // write lost, we did move the HTML to a set that then lost — but no
+        // stamp was written for it, so the next load cannot prove currency and
+        // reconciles. Either way dropping the cache is what heals it: the reload
+        // clears `html_current`, so even a delta that turns into a no-op
+        // re-establishes the pair above. Count the conflict first (operators
+        // watch this to confirm dual leadership converges rather than corrupts).
         state
             .metrics
             .global_cas_conflicts
@@ -2525,6 +2626,7 @@ pub(crate) async fn update_global_index_uncached(
         return Ok(());
     }
     let loaded = load_global_names(storage).await?;
+    let loaded_html_etag = loaded.html_etag;
     let mut names = loaded.names;
     let mut changed = false;
     for pkg in adds {
@@ -2537,60 +2639,116 @@ pub(crate) async fn update_global_index_uncached(
     packages.sort();
     if !changed {
         // Every call here loads fresh, so it knows the JSON and nothing about
-        // the HTML — same hazard as the cached path (HTML is written first, so a
-        // crash strands it ahead of or behind the JSON). Reconcile instead of
-        // returning blind.
-        return reconcile_global_html(state, storage, &packages).await;
+        // the HTML — same hazard as the cached path (a crash between the two
+        // writes strands the HTML ahead of the JSON). Prove currency from the
+        // stamp first; only an unproven pair reads the body back.
+        if global_html_proved_current(storage, &loaded_html_etag, &packages).await {
+            return Ok(());
+        }
+        if let HtmlReconcile::Rewrote(html_etag) =
+            reconcile_global_html(state, storage, &packages, &loaded_html_etag).await?
+        {
+            write_global_html_stamp(storage, &html_etag, &packages).await?;
+        }
+        // A `Lost` here means a peer published a fresher HTML while we looked:
+        // its own stamp covers it, and the next pass reloads. Nothing to do.
+        return Ok(());
     }
-    write_global_indexes(state, storage, &packages).await
+    write_global_indexes(state, storage, &packages).await?;
+    // `write_global_indexes` is the unconditional disk-shaped path, so it has no
+    // ETag to stamp; re-probe and record so a cloud destination can still prove
+    // currency without a body read next pass.
+    let html_etag = current_global_html_etag(storage).await?;
+    write_global_html_stamp(storage, &html_etag, &packages).await
 }
 
-/// Rewrite `simple/index.html` when it disagrees with `packages`. Unlike
-/// [`put_if_changed`] this never *creates* the view: the HTML is always written
-/// before the canonical JSON, so an absent one means the bucket has published no
-/// global index at all and the set is necessarily empty. Materializing one here
-/// would be pure churn — and a view whose bytes move at quiescence is exactly
-/// what the simulator flags as a premature marker consumption.
+/// What a reconcile had to do to `simple/index.html`.
+enum HtmlReconcile {
+    /// Already renders `packages`, or was never published — nothing to do.
+    Current,
+    /// Rewritten; carries the ETag the write returned.
+    Rewrote(Option<String>),
+    /// A peer moved it since `expected_etag` was observed; the caller's view of
+    /// the name set is stale too and it must reload.
+    Lost,
+}
+
+/// Rewrite `simple/index.html` when it disagrees with `packages`. This is the
+/// slow path — it reads the body — and runs only when the stamp could not prove
+/// currency. Unlike [`put_if_changed`] it never *creates* the view: the HTML is
+/// always written before the canonical JSON, so an absent one means the bucket
+/// has published no global index at all. Materializing one here would be pure
+/// churn — and a view whose bytes move at quiescence is exactly what the
+/// simulator flags as a premature marker consumption.
 async fn reconcile_global_html(
     state: &AppState,
     storage: &dyn Storage,
     packages: &[String],
-) -> Result<()> {
+    expected_etag: &Option<String>,
+) -> Result<HtmlReconcile> {
     let key = format!("{SIMPLE_PREFIX}index.html");
     let current = match storage.get_bytes(&key).await {
         Ok(bytes) => bytes,
-        Err(e) if is_not_found(&e) => return Ok(()),
+        Err(e) if is_not_found(&e) => return Ok(HtmlReconcile::Current),
         Err(e) => return Err(e),
     };
-    let expected = pep503_global_html(packages).into_bytes();
-    if current == expected {
-        return Ok(());
+    if current == pep503_global_html(packages).into_bytes() {
+        return Ok(HtmlReconcile::Current);
     }
-    storage
-        .put_bytes(&key, expected, Some(SIMPLE_HTML_CONTENT_TYPE))
-        .await?;
-    state.index_cache.invalidate(&key);
-    Ok(())
+    // Conditional for the same reason the publish path is: a node reconciling
+    // from a stale view must lose rather than clobber a fresher render.
+    match write_global_html_cas(state, storage, packages, expected_etag).await? {
+        HtmlWrite::Wrote(etag) => Ok(HtmlReconcile::Rewrote(etag)),
+        HtmlWrite::Lost => Ok(HtmlReconcile::Lost),
+    }
 }
 
 /// Load the global name set (and its ETag) from the materialized JSON.
 async fn load_global_names(storage: &dyn Storage) -> Result<GlobalNames> {
     let key = format!("{SIMPLE_PREFIX}index.json");
-    let (bytes, etag) = if storage.supports_leases() {
+    let (body, etag) = if storage.supports_leases() {
         match storage.get_with_etag(&key).await? {
-            Some((bytes, etag)) => (bytes, Some(etag)),
-            None => (Vec::new(), None),
+            Some((bytes, etag)) => (Some(bytes), Some(etag)),
+            None => (None, None),
         }
     } else {
-        // A missing index is an empty set (no packages yet); any other read
-        // error must propagate. Swallowing a transient I/O error to empty here
-        // would let the caller write back a near-empty global index, truncating
-        // the package list off a phantom "zero packages" observation.
+        // A missing index means "never published"; any other read error must
+        // propagate. Swallowing a transient I/O error would let the caller write
+        // back a near-empty global index, truncating the package list off a
+        // phantom "zero packages" observation.
         match storage.get_bytes(&key).await {
-            Ok(bytes) => (bytes, None),
-            Err(e) if is_not_found(&e) => (Vec::new(), None),
+            Ok(bytes) => (Some(bytes), None),
+            Err(e) if is_not_found(&e) => (None, None),
             Err(e) => return Err(e),
         }
+    };
+    let html_etag = current_global_html_etag(storage).await?;
+    // An ABSENT canonical JSON is not necessarily an empty name set. Reading it
+    // as one is how a crash between the two global writes turns into a wrong
+    // answer: the next delta dedups against nothing, `changed` is false, and the
+    // empty set becomes the authority that rewrites a live HTML down to nothing.
+    //
+    // That only matters when an HTML survives to be wrongly shrunk. With no
+    // global view published at all — the cold start every fresh bucket begins
+    // in — empty is simply the truth, and deriving it would buy nothing while
+    // spending a sharded listing (dozens of ops) on the busiest path there is.
+    // So spend one HEAD to tell the two apart, and derive only for the genuinely
+    // stranded case, from the same per-package views the audit trusts.
+    let Some(bytes) = body else {
+        let html_key = format!("{SIMPLE_PREFIX}index.html");
+        let stranded = storage.head_exists(&html_key).await?;
+        let names = if stranded {
+            derive_global_names(storage).await?
+        } else {
+            HashSet::new()
+        };
+        return Ok(GlobalNames {
+            etag,
+            names,
+            html_etag,
+            html_current: false,
+            stranded,
+        });
     };
     #[derive(serde::Deserialize)]
     struct Global {
@@ -2607,49 +2765,102 @@ async fn load_global_names(storage: &dyn Storage) -> Result<GlobalNames> {
     Ok(GlobalNames {
         etag,
         names,
+        html_etag,
         html_current: false,
+        stranded: false,
     })
+}
+
+/// The ETag of the stored global HTML, or `None` when it has never been written
+/// (or the backend has no conditional writes). A metadata-only probe: it never
+/// reads the body, so it costs the same against a four-name index and a
+/// 780k-name one. Reuses the bounded-LIST idiom the JSON currency probe uses.
+async fn current_global_html_etag(storage: &dyn Storage) -> Result<Option<String>> {
+    if !storage.supports_leases() {
+        return Ok(None);
+    }
+    let key = format!("{SIMPLE_PREFIX}index.html");
+    Ok(storage
+        .list_page(&key, None, 1)
+        .await?
+        .into_iter()
+        .find(|meta| meta.key == key)
+        .map(|meta| meta.etag))
+}
+
+/// Rebuild the global name set from this bucket's materialized per-package
+/// views: a package is globally listed exactly when `simple/<pkg>/index.json`
+/// exists, which is the rule the audit applies. Used only when the canonical
+/// global JSON is absent and there is therefore nothing authoritative to read.
+async fn derive_global_names(storage: &dyn Storage) -> Result<HashSet<String>> {
+    const SHARD_CONCURRENCY: usize = 6;
+    let mut names = HashSet::new();
+    let shards: Vec<String> = crate::storage::SHARD_CHARS
+        .iter()
+        .map(|c| format!("{SIMPLE_PREFIX}{c}"))
+        .collect();
+    for chunk in shards.chunks(SHARD_CONCURRENCY) {
+        let lists = chunk.iter().map(|shard| storage.list_all(shard));
+        for listed in futures::future::join_all(lists).await {
+            for obj in listed? {
+                if obj.key.ends_with("/index.json") {
+                    if let Some(pkg) = key_package(&obj.key, SIMPLE_PREFIX) {
+                        names.insert(pkg.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(names)
 }
 
 /// Outcome of a global-index conditional write.
 enum CasOutcome {
-    /// Won; carries the authoritative new ETag (`None` on non-CAS disk backends).
-    Won(Option<String>),
-    /// Lost the conditional write to a concurrent leader; caller should reload.
+    /// Won; carries the authoritative new ETags the writes themselves returned
+    /// (`None` on non-CAS disk backends).
+    Won {
+        json_etag: Option<String>,
+        html_etag: Option<String>,
+    },
+    /// Lost a conditional write to a concurrent leader; caller should reload.
     Lost,
 }
 
-/// Write both global views. The canonical JSON — the one `changed` detection
-/// reloads from — is written LAST, under CAS where supported, so that a crash
-/// between the two writes leaves the *derived* view wrong rather than the
-/// authority. It is not self-healing: replay only rewrites both when the name
-/// set moves again, which a shrinking mirror may never do, so the HTML a crash
-/// strands (ahead of the JSON here, behind it when the crash lands on a
-/// post-CAS-loss reconcile) is healed by `GlobalNames::html_current` instead —
-/// see [`update_global_index_locked`]. HTML is last-writer-wins; a racing loser
-/// rewrites it on its retry, so the iteration whose JSON CAS finally wins
-/// always left a matching HTML.
-/// Returns `CasOutcome::Lost` when the conditional write lost the race, else
-/// `CasOutcome::Won` with the ETag the put itself returned.
+/// Write both global views. BOTH are conditional. The canonical JSON is written
+/// last, under CAS, because its success is the serialization point that consumes
+/// markers — but the derived HTML is written under a conditional write too, and
+/// that is what keeps the pair honest. Writing it blind (as this did until the
+/// stale-global-index fix) meant a node that went on to *lose* the JSON CAS had
+/// already published HTML for a name set that lost, and since op completion order
+/// is not issue order, that loser's HTML could land after the winner's. The
+/// winner had no way to notice: it only knew what it had written itself.
+/// Conditioning the HTML on the ETag this cache loaded removes the case
+/// entirely — a stale writer's HTML write fails, and it reloads instead.
+///
+/// A crash between the two writes still strands the HTML ahead of the JSON;
+/// that is what the durable stamp at [`global_html_stamp_key`] is for, and
+/// [`update_global_index_locked`] proves currency from it once per cache load.
+///
+/// Returns `CasOutcome::Lost` when either conditional write lost its race, else
+/// `CasOutcome::Won` with the ETags the puts themselves returned.
 async fn write_global_indexes_cas(
     state: &AppState,
     storage: &dyn Storage,
     packages: &[String],
     expected_etag: &Option<String>,
+    expected_html_etag: &Option<String>,
 ) -> Result<CasOutcome> {
     let json_key = format!("{SIMPLE_PREFIX}index.json");
     let json = pep691_global_json(packages).into_bytes();
     if storage.supports_leases() {
-        // HTML first: derived from the same list, unconditional, idempotent.
-        let html_key = format!("{SIMPLE_PREFIX}index.html");
-        storage
-            .put_bytes(
-                &html_key,
-                pep503_global_html(packages).into_bytes(),
-                Some(SIMPLE_HTML_CONTENT_TYPE),
-            )
-            .await?;
-        state.index_cache.invalidate(&html_key);
+        // HTML first so that a crash strands the derived view rather than the
+        // authority — but conditionally, so a stale writer loses instead of
+        // clobbering. Losing here means a peer moved the HTML under us: reload.
+        let html_etag =
+            match write_global_html_cas(state, storage, packages, expected_html_etag).await? {
+                HtmlWrite::Wrote(etag) => etag,
+                HtmlWrite::Lost => return Ok(CasOutcome::Lost),
+            };
         // Canonical JSON last, under CAS: its success is what consumes markers.
         let outcome = match expected_etag {
             Some(etag) => storage.put_if_match(&json_key, etag, json).await?,
@@ -2659,14 +2870,83 @@ async fn write_global_indexes_cas(
             return Ok(CasOutcome::Lost);
         };
         state.index_cache.invalidate(&json_key);
+        // Both views now agree: record the proof so a later cache load can
+        // establish currency without reading the HTML body back.
+        write_global_html_stamp(storage, &html_etag, packages).await?;
         // The `/projects/` browser is another render of this same name set, so
         // drop its cached page alongside the global simple index.
         state.invalidate_projects_page();
-        return Ok(CasOutcome::Won(Some(new_etag)));
+        return Ok(CasOutcome::Won {
+            json_etag: Some(new_etag),
+            html_etag,
+        });
     }
     write_global_indexes(state, storage, packages).await?;
     state.invalidate_projects_page();
-    Ok(CasOutcome::Won(None))
+    Ok(CasOutcome::Won {
+        json_etag: None,
+        html_etag: None,
+    })
+}
+
+/// Conditionally publish the global HTML for `packages`. `Ok(None)` means a peer
+/// moved it since `expected_etag` was observed — the caller must reload rather
+/// than overwrite, since its own name set is by definition stale.
+async fn write_global_html_cas(
+    state: &AppState,
+    storage: &dyn Storage,
+    packages: &[String],
+    expected_etag: &Option<String>,
+) -> Result<HtmlWrite> {
+    let key = format!("{SIMPLE_PREFIX}index.html");
+    let bytes = pep503_global_html(packages).into_bytes();
+    if !storage.supports_leases() {
+        // Single-writer backend: no peers to lose to, and no ETag space to
+        // condition on. A plain write is the whole protocol here.
+        storage
+            .put_bytes(&key, bytes, Some(SIMPLE_HTML_CONTENT_TYPE))
+            .await?;
+        state.index_cache.invalidate(&key);
+        return Ok(HtmlWrite::Wrote(None));
+    }
+    let outcome = match expected_etag {
+        Some(etag) => storage.put_if_match(&key, etag, bytes).await?,
+        None => storage.put_if_none_match(&key, bytes).await?,
+    };
+    match outcome {
+        Some(etag) => {
+            state.index_cache.invalidate(&key);
+            Ok(HtmlWrite::Wrote(Some(etag)))
+        }
+        None => Ok(HtmlWrite::Lost),
+    }
+}
+
+/// Outcome of a conditional global-HTML publish.
+enum HtmlWrite {
+    /// Published; carries the ETag the write returned (`None` on disk).
+    Wrote(Option<String>),
+    /// A peer moved the object since `expected_etag` was observed.
+    Lost,
+}
+
+/// Prove the stored HTML renders exactly `packages`, using only metadata-sized
+/// reads: the stamp names both the name set it rendered and the exact HTML
+/// object it wrote, and HTML writes are conditional, so an ETag match means the
+/// bytes are the ones that stamp describes. "Unproven" is not "wrong" — it only
+/// means the caller must fall back to comparing bytes.
+async fn global_html_proved_current(
+    storage: &dyn Storage,
+    html_etag: &Option<String>,
+    packages: &[String],
+) -> bool {
+    let Some(html_etag) = html_etag.as_deref() else {
+        return false;
+    };
+    let Some(stamp) = read_global_html_stamp(storage).await else {
+        return false;
+    };
+    stamp.html_etag == html_etag && stamp.names == global_names_digest(packages)
 }
 
 /// List a package's artifacts with metadata from sidecars — O(files), no hashing.
@@ -3684,6 +3964,89 @@ mod tests {
             global_html(&storage).await,
             pep503_global_html(&[]),
             "a dedupping delta must still reconcile an HTML that a crashed write stranded"
+        );
+    }
+
+    /// The sibling of the stranded-HTML bug, and the reason the HTML write is
+    /// conditional (vopr seeds 96078376 / 230058708, crash-only, one bucket).
+    /// Two nodes update the global index at once; the one that loses the JSON CAS
+    /// has *already* published HTML for the set that lost. Completion order is
+    /// not issue order, so that loser's HTML can land after the winner's — and
+    /// the winner can never notice, because its only evidence is what it wrote
+    /// itself. Conditioning the HTML write on the ETag the writer loaded removes
+    /// the case: a stale writer loses instead of clobbering.
+    #[tokio::test]
+    async fn a_stale_writer_cannot_clobber_the_global_html() {
+        let storage = Arc::new(InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+
+        update_global_index(&state, storage.as_ref(), &["alpha".to_string()], &[])
+            .await
+            .unwrap();
+        // What a node that loaded here — and then stalled — would hold.
+        let stale = current_global_html_etag(storage.as_ref()).await.unwrap();
+        assert!(
+            stale.is_some(),
+            "the publish must leave an ETag to go stale"
+        );
+
+        // A peer moves the global index on.
+        update_global_index(&state, storage.as_ref(), &["beta".to_string()], &[])
+            .await
+            .unwrap();
+        let fresher = global_html(&storage).await;
+
+        // The stalled node finally issues its write. It must lose.
+        let outcome =
+            write_global_html_cas(&state, storage.as_ref(), &["alpha".to_string()], &stale)
+                .await
+                .unwrap();
+        assert!(
+            matches!(outcome, HtmlWrite::Lost),
+            "a writer holding a stale ETag must lose the conditional write"
+        );
+        assert_eq!(
+            global_html(&storage).await,
+            fresher,
+            "the fresher render must survive a stale writer's late write"
+        );
+    }
+
+    /// A crash between the two global writes leaves an HTML with no canonical
+    /// JSON. Reading that absent JSON as the *empty set* is how a reconcile came
+    /// to wipe a live listing to nothing — the empty set became the authority.
+    /// With no authority to read, the name set is derived from the per-package
+    /// views instead (the source the audit trusts), and the stranded cache must
+    /// write once so the missing JSON is materialized rather than left to 404
+    /// while the HTML happily serves.
+    #[tokio::test]
+    async fn a_stranded_global_html_reconciles_from_the_views_instead_of_wiping() {
+        let storage = Arc::new(InMemStorage::default());
+        // `alpha` is genuinely live: it has a materialized per-package view.
+        storage.insert(&format!("{SIMPLE_PREFIX}alpha/index.json"), b"{}".to_vec());
+        // The crash residue: an HTML listing a live name and a dead one, and no
+        // canonical JSON at all.
+        storage.insert(
+            &format!("{SIMPLE_PREFIX}index.html"),
+            pep503_global_html(&["alpha".to_string(), "ghost".to_string()]).into_bytes(),
+        );
+        let state = AppState::headless(storage.clone());
+
+        update_global_index(&state, storage.as_ref(), &[], &["ghost".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            global_html(&storage).await,
+            pep503_global_html(&["alpha".to_string()]),
+            "the dead name goes and the live one stays — an absent JSON is not an empty index"
+        );
+        assert!(
+            storage
+                .head_exists(&format!("{SIMPLE_PREFIX}index.json"))
+                .await
+                .unwrap(),
+            "the absent canonical JSON must be materialized, not left 404ing while the HTML serves"
         );
     }
 

@@ -272,6 +272,15 @@ The invariants:
   behind `pypiron verify`, re-renders every view from each bucket's truth and
   diffs the bytes. The product's own checker, not a harness-local approximation;
 - **convergence** — all buckets hold identical truth and views;
+- **self-consistency** — every stored body is re-hashed and must equal the
+  sha256 its own bucket's sidecar publishes. This is the only oracle anywhere
+  that re-hashes a body: every other one here, and `pypiron verify` itself,
+  reads sidecars and compares them. So a body swapped under a sidecar that
+  still names the old sha was invisible to all of them — the two buckets'
+  sidecars stay byte-identical, the pair never enters the diverged-key set, and
+  `decide` reads them as agreed forever. That blind spot is how the crossed-body
+  class survived four fixes aimed at it; it needs no ledger and holds in a
+  single-bucket fleet, where nothing else could have seen it at all;
 - **tombstone monotonicity** — a filename whose most recent *ack* was a `204`
   never stands in a bucket without its tombstone. A re-publish after a delete is
   legal resurrection, so the rule is last-writer, not set-membership;

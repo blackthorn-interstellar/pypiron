@@ -35,6 +35,12 @@
 //!     `pypiron verify` oracle — re-renders every view from each bucket's truth
 //!     and diffs the bytes;
 //!   - CONVERGENCE: all buckets hold identical truth and views;
+//!   - SELF_CONSISTENCY: every stored body is re-hashed and must equal the
+//!     sha256 its own bucket's sidecar publishes. This is the only oracle that
+//!     ever re-hashes a body: every other one here (and `pypiron verify`) reads
+//!     sidecars and compares them, so a body swapped under a sidecar still
+//!     naming the old sha is invisible to all of them — two buckets whose
+//!     sidecars are byte-identical never enter the diverged-key set at all;
 //!   - TOMBSTONE MONOTONICITY: a filename whose most recent ack was a 204 delete
 //!     never stands in a bucket without its tombstone — no silent resurrection
 //!     of a removed (compromised) artifact;
@@ -752,9 +758,10 @@ enum R {
     MergeDivergence,
     FreezeJustified,
     OriginTerminality,
+    SelfConsistency,
 }
 
-const REACH_SLOTS: usize = 22;
+const REACH_SLOTS: usize = 23;
 
 /// `(label, what exactly one execution counts)` — in `R`'s declaration order.
 const REACH_METER: [(&str, &str); REACH_SLOTS] = [
@@ -830,6 +837,10 @@ const REACH_METER: [(&str, &str); REACH_SLOTS] = [
     (
         "ORIGIN_TERMINALITY",
         "privately-claimed package checked on a bucket",
+    ),
+    (
+        "SELF_CONSISTENCY",
+        "stored body re-hashed against its own sidecar",
     ),
 ];
 
@@ -3220,6 +3231,44 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                         }
                     }
                 }
+            }
+        }
+
+        // Self-consistency: a bucket may not serve bytes its own sidecar
+        // contradicts. Every other oracle here reads sidecars and compares
+        // them — across buckets (CONVERGENCE), against the ledger (DURABILITY),
+        // or re-rendered into views (`pypiron verify`) — and none re-hashes a
+        // body. So a body swapped under a sidecar that still names the old sha
+        // is invisible to all of them: the two buckets' sidecars stay
+        // byte-identical, the pair never enters the diverged-key set, and the
+        // merge's `decide` reads them as agreed forever. That is exactly how
+        // the crossed-body class survived four fixes aimed at it.
+        //
+        // Scoped to the bucket's own published truth, so it needs no ledger and
+        // holds in a single-bucket fleet too. A `.frozen` filename is exempt:
+        // an adjudicated byte conflict deliberately preserves both bodies and
+        // suppresses the name, and CONSERVATION owns that case.
+        for (key, body) in dump {
+            let Some(sidecar) = dump.get(&format!("{key}.meta.json")) else {
+                continue; // sidecars, markers and origins name no bytes
+            };
+            if !key.starts_with("packages/") || dump.contains_key(&format!("{key}.frozen")) {
+                continue;
+            }
+            let Ok(sidecar) = serde_json::from_slice::<pypiron::sidecar::Sidecar>(sidecar) else {
+                continue; // an unparseable sidecar is VERIFY's business
+            };
+            REACH.hit(R::SelfConsistency);
+            let stored = pypiron::hash::sha256_hex(body);
+            if stored != sidecar.sha256 {
+                violations.push(format!(
+                    "SELF_CONSISTENCY: bucket {bucket_idx} serves {} under {key} while its own \
+                     sidecar publishes sha256 {} — a client checking the download it was handed \
+                     against the index it read would reject it, and no other oracle here \
+                     re-hashes a body",
+                    String::from_utf8_lossy(body),
+                    sidecar.sha256,
+                ));
             }
         }
 

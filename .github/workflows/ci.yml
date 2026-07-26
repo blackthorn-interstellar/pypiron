@@ -264,9 +264,11 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - name: Sync dev dependencies
         run: uv sync
+      # dev/ops is deployed infrastructure: linted, never formatted. Keep the
+      # two path lists in step with the Makefile's PY_LINT / PY_FMT.
       - name: Ruff lint and format check
         run: |
-          uv run -- ruff check tests dev/bench dev/scripts
+          uv run -- ruff check tests dev/bench dev/scripts dev/ops
           uv run -- ruff format --check tests dev/bench dev/scripts
 
   fuzz-build:

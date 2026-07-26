@@ -59,15 +59,21 @@ check: af cargo-check lint test-rust  ## Format, lint, and unit-test
 cargo-check:  ## Check the project for compilation errors
 	cargo check
 
+# dev/ops is linted but deliberately NOT formatted: it is deployed
+# infrastructure whose layout is hand-tuned, and `ruff format` would rewrite it
+# wholesale for no benefit. `ruff check` finds real errors there with no churn.
+PY_LINT := tests dev/bench dev/scripts dev/ops
+PY_FMT  := tests dev/bench dev/scripts
+
 af: fmt
 fmt:  ## Format Rust (rustfmt) and Python (ruff: sort imports, then format)
 	cargo fmt --all
-	uv run -- ruff check --fix tests dev/bench dev/scripts
-	uv run -- ruff format tests dev/bench dev/scripts
+	uv run -- ruff check --fix $(PY_LINT)
+	uv run -- ruff format $(PY_FMT)
 
 lint:  ## Run clippy and ruff lints
 	cargo clippy --all-targets -- -D warnings
-	uv run -- ruff check tests dev/bench dev/scripts
+	uv run -- ruff check $(PY_LINT)
 
 audit:  ## Scan Cargo.lock for security advisories (needs cargo-audit: cargo install cargo-audit)
 	cargo audit

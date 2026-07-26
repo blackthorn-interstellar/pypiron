@@ -420,12 +420,18 @@ over an unstated range are not comparable across commits (K, which is what the
 gate depends on, did not move).
 
 Under `--rotate` the same breaks red at different rates, because the rotating
-profile varies the *topology* the break needs: `view` 300/300 and `rerun`
-300/300 (K=1), `resurrect` 265/300 (K=3), `ordering` 219/300 (K=5), `fanout`
-91/300 (K=18). `fanout`'s drop is not a weaker oracle — it is arithmetic: the
-break needs ≥2 buckets *and* `--fail-percent 0`, and rotation supplies both on
-about a third of seeds. Keep the gate on the pinned non-rotating flags; that is
-what makes it a gate rather than a sample.
+profile varies the *topology* the break needs. Over seeds 1–50,000 (`view` and
+`rerun` over the first 12,000): `view` and `rerun` red on every seed (K=1),
+`resurrect` 43,796/50,000 (K=3), `ordering` 35,160/50,000 (K=6), `fanout`
+16,165/50,000 (K=16). `fanout`'s drop is not a weaker oracle — it is arithmetic:
+the break needs ≥2 buckets *and* `--fail-percent 0`, and rotation supplies both
+on about a third of seeds. Take a rotating K to the digit only off a five-figure
+sample: three of these rates land within a percentage point of a K boundary, so
+the earlier 300-seed measurement read `ordering` as 5 and `fanout` as 18, and
+`resurrect` (0.876 against a 0.874 boundary) and `fanout` are still inside
+sampling noise of the next K up — provision 4 and 17 if you re-pin a rotating
+range. Keep the gate on the pinned non-rotating flags; that is what makes it a
+gate rather than a sample.
 
 `--break ordering` is still the only class-**1** input the classifier has ever
 been handed; the product has never produced one. Class 2 is no longer synthetic
@@ -450,16 +456,23 @@ filenames are re-fillable by design, so the day a legal resurrection path lands
 it is already watched. An unreachable-but-sound guard is legitimate; an unproven
 one is not.
 
-Class 3 (concurrent-race) is unreachable for a different and more interesting
-reason, worth writing down so nobody re-derives it: the harness's own
-`tick_lock` serializes rebuilds to model the production bucket lease, so two
-unleased rebuilds never race. Removing that lease *still* produced zero repairs
-over 26k wide seeds, and so did truncating the heal phase's drain budget until
-two thirds of seeds failed on other oracles — the marker/tick/sweep/reconcile
-fast path simply converges views without the audit on essentially every schedule
-this simulator can build. The audit is a backstop for a hazard the product does
-not exhibit here; that is a result, not a gap, and it is why the class-2 hit
-above matters so much.
+Class 3 (concurrent-race) is unreachable too, but on a **much weaker claim**, and
+conflating the two is the mistake this paragraph exists to prevent. TOMBSTONE
+MONOTONICITY is *product*-unreachable: a product rule forbids the state, so it is
+unreachable in production as well, and the guard is a standing watch on a rule
+that could one day be relaxed. Class 3 is only *harness*-unreachable: the
+simulator's `tick_lock` serializes every rebuild (each pin takes bucket 0's lock)
+to stand in for the bucket lease, so two rebuilds never overlap by construction.
+Production's lease is sloppy on purpose — `src/lease.rs` is a TTL + heartbeat
+with no fencing, because rebuilds are idempotent — so dual leadership, and with
+it the race, *is* reachable there; it is covered by
+`concurrent_rebuild_without_lease_diverges` in `tests/model_event_protocol.rs`,
+not by this simulator. Removing `tick_lock` still produced zero repairs over 26k
+wide seeds, and so did truncating the heal phase's drain budget until two thirds
+of seeds failed on other oracles — the marker/tick/sweep/reconcile fast path
+converges views without the audit on essentially every schedule this simulator
+can build. So the honest status is "this harness cannot stage the race", not "the
+product does not have it", which is why the class-2 hit above matters so much.
 
 ## Real cloud backends
 

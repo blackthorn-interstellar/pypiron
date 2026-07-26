@@ -63,7 +63,61 @@ fn nightly_profiles_pin_a_durability_corpus() {
         );
     }
     assert!(
-        WORKFLOW.contains("${{ matrix.profile.extra }}"),
+        WORKFLOW.contains("${{ matrix.profile.args }}"),
         "the profile rows' flags no longer reach the vopr command line"
     );
+}
+
+/// `--rotate` derives the whole workload from the seed, so the harness rejects a
+/// workload flag beside it rather than parsing and discarding one. The nightly
+/// used to paste `--nodes/--buckets/--ops` onto *every* row from a shared
+/// template, including the rotating one — where they were documented as
+/// "ignored". Under that rejection the job no longer starts, so the shape of
+/// this matrix is now load-bearing: each row must carry its own flags.
+#[test]
+fn no_nightly_row_mixes_rotation_with_a_workload_flag() {
+    const WORKLOAD: [&str; 6] = [
+        "--nodes",
+        "--buckets",
+        "--packages",
+        "--files",
+        "--ops",
+        "--fail-percent",
+    ];
+    for row in WORKFLOW
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("- { name:"))
+        .filter(|line| line.contains("--rotate"))
+    {
+        for flag in WORKLOAD {
+            assert!(
+                !row.contains(flag),
+                "a rotating profile carries {flag}, which the harness refuses — \
+                 the nightly would panic before its first seed:\n  {row}"
+            );
+        }
+    }
+    // The per-row check alone would have missed the original defect: the
+    // rotating row never spelled `--nodes`, it inherited one from the shared
+    // invocation that pasted a topology onto every profile. So the invocation
+    // itself must pass no workload flag — every one has to come from the row it
+    // belongs to, or a future template edit reintroduces the same silent paste.
+    let invocation: String = WORKFLOW
+        .lines()
+        .skip_while(|line| !line.contains("example vopr --"))
+        .take_while(|line| !line.contains("tee vopr.out"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !invocation.is_empty(),
+        "could not find the nightly's vopr invocation — has the workflow moved?"
+    );
+    for flag in WORKLOAD {
+        assert!(
+            !invocation.contains(flag),
+            "the shared nightly invocation passes {flag} to every profile, including the \
+             rotating one, which the harness refuses — it must come from `args` instead:\n{invocation}"
+        );
+    }
 }

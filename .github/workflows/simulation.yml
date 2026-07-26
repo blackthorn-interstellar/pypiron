@@ -49,19 +49,28 @@ jobs:
           # in five — measured per seed, only 20% of this row's seeds evaluated
           # durability AT ALL, while the run still printed a five-figure hit
           # count. 12 names puts it at ~100% (dev/TESTING.md).
-          - { name: single-bucket, nodes: 2, buckets: 1, ops: 160, extra: '--packages 6 --files 2' }
-          - { name: multi-bucket, nodes: 3, buckets: 2, ops: 160, extra: '--packages 6 --files 2' }
-          - { name: single-bucket-crash-only, nodes: 3, buckets: 1, ops: 160, extra: '--packages 6 --files 2 --fail-percent 0' }
-          - { name: multi-bucket-crash-only, nodes: 3, buckets: 2, ops: 160, extra: '--packages 6 --files 2 --fail-percent 0' }
+          #
+          # Every flag a row runs lives in its own `args`. The step below adds
+          # only --seeds/--start-seed/--require-reach, which are legal in both
+          # modes — because the workload flags and --rotate are mutually
+          # exclusive: --rotate derives the whole profile from the seed, so a
+          # --ops beside it used to be parsed and silently discarded (the
+          # rotating row below carried nodes/buckets/ops for exactly that long,
+          # documented as "ignored"). The harness now refuses the pair outright,
+          # so a shared template that pastes a topology onto every row cannot
+          # start at all.
+          - { name: single-bucket, args: '--nodes 2 --buckets 1 --ops 160 --packages 6 --files 2' }
+          - { name: multi-bucket, args: '--nodes 3 --buckets 2 --ops 160 --packages 6 --files 2' }
+          - { name: single-bucket-crash-only, args: '--nodes 3 --buckets 1 --ops 160 --packages 6 --files 2 --fail-percent 0' }
+          - { name: multi-bucket-crash-only, args: '--nodes 3 --buckets 2 --ops 160 --packages 6 --files 2 --fail-percent 0' }
           # The four above pin a topology AND the fixed workload (6 packages x 2
           # files, one hardcoded op mix), so between them they re-explore one
           # shape however many seeds they burn. This one rotates everything the
           # seed can vary — topology, entity counts, and the op-class weights
           # (swarm testing) — which is what found the class-2 global-index
-          # divergence at seed 1067836. Its nodes/buckets/ops below are ignored:
-          # --rotate derives the whole profile from the seed, and a failure
-          # reproduces with `--seed N --rotate`.
-          - { name: rotating-swarm, nodes: 2, buckets: 2, ops: 160, extra: '--rotate' }
+          # divergence at seed 1067836. A failure reproduces with
+          # `--seed N --rotate`.
+          - { name: rotating-swarm, args: '--rotate' }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -84,9 +93,7 @@ jobs:
           START=$(( ( $(date +%s) / 86400 ) * ${SEEDS} ))
           cargo run --release --example vopr -- \
             --seeds "${SEEDS}" --start-seed "${START}" \
-            --nodes ${{ matrix.profile.nodes }} \
-            --buckets ${{ matrix.profile.buckets }} \
-            --ops ${{ matrix.profile.ops }} ${{ matrix.profile.extra }} \
+            ${{ matrix.profile.args }} \
             --require-reach | tee vopr.out
       - name: Publish counters
         if: always()

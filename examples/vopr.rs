@@ -3103,7 +3103,8 @@ struct Args {
     /// It is a pure function of the seed alone, which is what makes
     /// `--seed N --rotate` an exact reproduction; failures print the resolved
     /// dimensions beside that command so you can read the shape without
-    /// rerunning it.
+    /// rerunning it. Passing a workload flag alongside it is rejected — see
+    /// `ROTATE_OVERRIDES`.
     rotate: bool,
     /// Deliberate defect to inject (`--break`), for mutation-testing the
     /// oracles. `Break::None` in every ordinary run.
@@ -3232,7 +3233,29 @@ fn pick_op(weights: &[u16; OP_CLASSES], total: u64, rng: &mut Rng) -> usize {
     OP_CLASSES - 1
 }
 
+/// Flags whose value `--rotate` draws from the seed instead. Passing both is a
+/// contradiction, not a refinement, and it used to be a silent one: these
+/// parsed fine, `profile_for` never read them under rotation, and
+/// `--rotate --ops 200` ran 120 ops while the operator believed they had
+/// widened coverage. A simulator that reports a workload it did not run is
+/// worse than one that refuses to start, so `parse_args_from` rejects the pair.
+/// Everything else stays legal under rotation — `--seed/--seeds/--start-seed/
+/// --recheck-every/--forever/--max-secs/--break/--require-reach` are the real
+/// levers there, and `--seed N --rotate` must keep reproducing on its own.
+const ROTATE_OVERRIDES: [&str; 6] = [
+    "--nodes",
+    "--buckets",
+    "--packages",
+    "--files",
+    "--ops",
+    "--fail-percent",
+];
+
 fn parse_args() -> Args {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
     let mut args = Args {
         seeds: 25,
         start_seed: 1,
@@ -3249,8 +3272,14 @@ fn parse_args() -> Args {
         brk: Break::None,
         require_reach: false,
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = argv;
+    // Collected as they are seen, checked after the whole line parses, so the
+    // rejection does not depend on `--rotate` coming first.
+    let mut overridden: Vec<&'static str> = Vec::new();
     while let Some(flag) = it.next() {
+        if let Some(name) = ROTATE_OVERRIDES.iter().find(|known| **known == flag) {
+            overridden.push(name);
+        }
         if flag == "--break" {
             let name = it
                 .next()
@@ -3300,6 +3329,13 @@ fn parse_args() -> Args {
             other => panic!("unknown flag {other} (see examples/vopr.rs)"),
         }
     }
+    assert!(
+        !args.rotate || overridden.is_empty(),
+        "--rotate derives the whole workload from the seed, so {} would be discarded — \
+         drop them, or drop --rotate. Legal with --rotate: --seed --seeds --start-seed \
+         --recheck-every --forever --max-secs --break --require-reach.",
+        overridden.join(" ")
+    );
     args
 }
 
@@ -3640,6 +3676,91 @@ mod tests {
         assert_eq!(
             reproduce_command(7384, true, &clean),
             "cargo run --release --example vopr -- --seed 7384 --rotate"
+        );
+    }
+
+    fn argv(line: &[&str]) -> std::vec::IntoIter<String> {
+        line.iter()
+            .map(|word| (*word).to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    /// `--rotate` draws the workload from the seed, so a workload flag beside
+    /// it was parsed and then thrown away: `--rotate --ops 200` ran 120 ops and
+    /// said nothing. Flags on both sides of `--rotate` here — the verdict is
+    /// order-independent.
+    #[test]
+    #[should_panic(expected = "--ops --packages would be discarded")]
+    fn rotate_refuses_the_workload_flags_it_would_discard() {
+        parse_args_from(argv(&[
+            "--ops",
+            "200",
+            "--rotate",
+            "--packages",
+            "6",
+            "--seeds",
+            "30",
+        ]));
+    }
+
+    /// The levers that still mean something under rotation. Rejecting these
+    /// would break the nightly rotating row, `make vopr-soak` and the soak
+    /// fleet's unit file.
+    #[test]
+    fn rotation_keeps_its_real_levers() {
+        let args = parse_args_from(argv(&[
+            "--rotate",
+            "--seed",
+            "21000000",
+            "--start-seed",
+            "7",
+            "--seeds",
+            "30",
+            "--recheck-every",
+            "500",
+            "--forever",
+            "--max-secs",
+            "60",
+            "--break",
+            "view",
+            "--require-reach",
+            "--verbose",
+        ]));
+        assert!(args.rotate && args.forever && args.require_reach);
+        assert_eq!((args.start_seed, args.seeds), (7, 30));
+        assert_eq!((args.recheck_every, args.max_secs), (500, Some(60)));
+        assert!(args.brk == Break::View);
+    }
+
+    /// ...and without `--rotate` those same flags are the whole profile, which
+    /// is what the four pinned nightly rows and every `reproduce:` line depend
+    /// on. The weights are asserted too, and are not incidental: a non-rotating
+    /// run must use `DEFAULT_OP_WEIGHTS`, the mix that reproduces the
+    /// pre-swarm `rng.below(100)` arms exactly. That equality is the only
+    /// reason the pinned CI regression seeds survived the workload widening
+    /// byte-for-byte, so a change here silently retires their coverage.
+    #[test]
+    fn without_rotation_the_workload_flags_still_win() {
+        let args = parse_args_from(argv(&[
+            "--nodes",
+            "3",
+            "--buckets",
+            "2",
+            "--packages",
+            "6",
+            "--files",
+            "2",
+            "--ops",
+            "160",
+            "--fail-percent",
+            "0",
+        ]));
+        let profile = profile_for(1, &args);
+        assert_eq!(
+            profile.describe(),
+            "nodes=3 buckets=2 packages=6 files=2 ops=160 fail-percent=0 \
+             weights=[publish 40, delete 10, tick 25, sweep 7, reconcile 4, jump 5, crash 5, nudge 4]"
         );
     }
 

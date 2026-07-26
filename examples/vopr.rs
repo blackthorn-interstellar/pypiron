@@ -167,7 +167,33 @@ enum Break {
     /// `analyze_global`, which `ordering` cannot give because it grows an
     /// existing package and never flips global membership.
     GlobalIndex,
+    /// Serve corrupt bytes for an acked artifact while the real bytes survive
+    /// in quarantine → DURABILITY, and nothing else (see `apply_break`).
+    Durability,
+    /// Drop one acked filename from its package view → VISIBILITY.
+    Visibility,
+    /// Destroy an acked body fleet-wide with no tombstone and no freeze →
+    /// CONSERVATION.
+    Conserve,
+    /// Leave an object on bucket 1 that bucket 0 never got → CONVERGENCE.
+    Diverge,
+    /// Park an object under `_repl/` that no sweep recognizes → LIVENESS.
+    Wedge,
+    /// A phantom package the audit must materialize, plus the effect history
+    /// of the rebuild that caused it. One break per classifier arm; each kills
+    /// the per-package *and* the global analyzer at once (`analyze`'s and
+    /// `analyze_global`'s tests are the same three questions asked of
+    /// `ViewWrite`s and `GlobalWrite`s respectively).
+    Poison,
+    Blind,
+    Race,
+    Fallback,
 }
+
+/// The package name every phantom-clone break materializes. Not in
+/// `PACKAGE_NAMES`, so no real effect in the run can ever mention it — the
+/// planted history is the only history the classifier sees for it.
+const BREAK_PKG: &str = "vopr-phantom";
 
 impl Break {
     fn parse(name: &str) -> Break {
@@ -179,11 +205,72 @@ impl Break {
             "resurrect" => Break::Resurrect,
             "ordering" => Break::Ordering,
             "globalindex" => Break::GlobalIndex,
-            other => {
-                panic!("unknown --break {other} (view|fanout|rerun|resurrect|ordering|globalindex)")
-            }
+            "durability" => Break::Durability,
+            "visibility" => Break::Visibility,
+            "conserve" => Break::Conserve,
+            "diverge" => Break::Diverge,
+            "wedge" => Break::Wedge,
+            "poison" => Break::Poison,
+            "blind" => Break::Blind,
+            "race" => Break::Race,
+            "fallback" => Break::Fallback,
+            other => panic!(
+                "unknown --break {other} (view|fanout|rerun|resurrect|ordering|globalindex|\
+                 durability|visibility|conserve|diverge|wedge|poison|blind|race|fallback)"
+            ),
         }
     }
+}
+
+/// An acknowledged upload no authorized removal excuses — the subject the
+/// durability family of oracles is actually about. Returns `(pkg, filename,
+/// bytes)`. Raw `dump()` reads only: no op-sequence number, no rng, no trace.
+fn unexcused_ack(
+    buckets: &[Arc<SimStorage>],
+    ledger: &Mutex<Ledger>,
+) -> Option<(String, String, Vec<u8>)> {
+    let ledger = ledger.lock().expect("ledger lock");
+    ledger.acked.iter().find_map(|((pkg, fname), body)| {
+        let akey = format!("packages/{pkg}/{fname}");
+        let excused = ledger.deleted.contains(&(pkg.clone(), fname.clone()))
+            || buckets.iter().any(|b| {
+                let keys = b.keys();
+                keys.contains(&format!("{akey}.tombstone"))
+                    || keys.contains(&format!("{akey}.frozen"))
+            });
+        (!excused).then(|| (pkg.clone(), fname.clone(), body.clone()))
+    })
+}
+
+/// Clone a live record (body + sidecar) into a package the audit must then
+/// reconcile, and return `(pkg, added key)`. The clone reuses a live record's
+/// sidecar (same version, different wheel tag) so the added file renders like
+/// any other and the repaired view is byte-clean. `phantom` puts it under a
+/// name that does not exist yet — which flips `simple/index.*` membership and
+/// so brings `analyze_global` into play alongside `analyze`.
+fn clone_live_record(bucket: &SimStorage, phantom: bool) -> Option<(String, String)> {
+    let dump = bucket.dump();
+    let (akey, body, sidecar) = dump.iter().find_map(|(key, sidecar)| {
+        let akey = key.strip_suffix(".meta.json")?;
+        Some((akey.to_string(), dump.get(akey)?.clone(), sidecar.clone()))
+    })?;
+    let (pkg, clone) = if phantom {
+        let fname = akey.rsplit('/').next().unwrap_or("phantom.whl");
+        (
+            BREAK_PKG.to_string(),
+            format!("packages/{BREAK_PKG}/{fname}"),
+        )
+    } else {
+        let pkg = akey
+            .strip_prefix("packages/")?
+            .split('/')
+            .next()?
+            .to_string();
+        (pkg, akey.replace("py3-none", "py2-none"))
+    };
+    bucket.insert(&clone, body);
+    bucket.insert(&format!("{clone}.meta.json"), sidecar);
+    Some((pkg, clone))
 }
 
 /// Inject the selected defect. Called at two points, and only when a break is
@@ -216,21 +303,144 @@ async fn apply_break(
         // separate break — `ordering` grows an existing package and leaves the
         // name set alone, so it can never exercise that path.
         (Break::Ordering | Break::GlobalIndex, true) => {
-            let dump = buckets[0].dump();
-            let live = dump.iter().find_map(|(key, sidecar)| {
-                let akey = key.strip_suffix(".meta.json")?;
-                Some((akey.to_string(), dump.get(akey)?.clone(), sidecar.clone()))
-            });
-            if let Some((akey, body, sidecar)) = live {
-                let clone = if brk == Break::GlobalIndex {
-                    let fname = akey.rsplit('/').next().unwrap_or("phantom.whl");
-                    format!("packages/vopr-phantom/{fname}")
-                } else {
-                    akey.replace("py3-none", "py2-none")
-                };
-                buckets[0].insert(&clone, body);
-                buckets[0].insert(&format!("{clone}.meta.json"), sidecar);
+            if let Some((_, clone)) = clone_live_record(&buckets[0], brk == Break::GlobalIndex) {
                 obs.observe_mutation(0, 0, &clone, None);
+            }
+        }
+        // The other three classifier arms, and the fallback. Same phantom clone
+        // — a package the audit has to materialize, so `analyze` (its view) and
+        // `analyze_global` (its membership) both run — with the effect history
+        // of the rebuild that would have caused it planted alongside.
+        //
+        // Planted, because a concurrent-rebuild clobber leaves NO storage
+        // residue that distinguishes it from a lone stale writer: the loser's
+        // bytes are gone by definition. The history is where the shape lives,
+        // which is why the classifier reads history and not storage — and why a
+        // history is the only thing a kill proof for these arms can inject.
+        // Attribution planting is not new here: `synth_view_write` already does
+        // it for warm-bucket audit writes. Read these as mutation tests of the
+        // classifier's predicates, NOT as evidence the product can produce the
+        // interleaving (dev/TESTING.md draws that line).
+        (Break::Poison | Break::Blind | Break::Race | Break::Fallback, true) => {
+            let Some((pkg, clone)) = clone_live_record(&buckets[0], true) else {
+                return;
+            };
+            // `fallback` plants nothing at all: the audit repairs a view the
+            // effect history cannot explain, which is exactly the shape the
+            // fallback arm exists to report.
+            if brk == Break::Fallback {
+                return;
+            }
+            // Two racing rebuild sessions, F and G, and the two markers they
+            // consume. Every planted effect is pure observation: no rng, no
+            // storage op, no trace event.
+            let (f, g) = (obs.fresh_synth_att(), obs.fresh_synth_att());
+            let list = format!("packages/{pkg}/");
+            let view = format!("simple/{pkg}/index.json");
+            let (mark_a, mark_b) = (format!("_dirty/{pkg}!a"), format!("_dirty/{pkg}!b"));
+            let plant = |kind, att, key: &str| {
+                obs.push_effect(kind, 0, 0, &pkg, key, Vec::new(), att);
+            };
+            // A global-index write claiming `names` — production records these
+            // against the empty package, so mirror that.
+            let global = |att, names: Vec<String>| {
+                let key = "simple/index.json";
+                obs.push_effect(EffectKind::GlobalWrite, 0, 0, "", key, names, att);
+            };
+            match brk {
+                // TEST 2a — the rebuild listed truth PAST the mutation and
+                // still wrote a view (and a name set) that disagrees with it.
+                Break::Poison => {
+                    plant(EffectKind::TruthWrite, f, &clone);
+                    plant(EffectKind::TruthList, f, &list);
+                    plant(EffectKind::ViewWrite, f, &view);
+                    global(f, Vec::new());
+                }
+                // TEST 2b — a marker covered the mutation, and the only op that
+                // retired it had listed truth before the mutation: the signal
+                // was destroyed, not consumed. No view write at all, so 2a's
+                // guard cannot fire first.
+                Break::Blind => {
+                    plant(EffectKind::MarkerPut, g, &mark_a);
+                    plant(EffectKind::TruthList, f, &list);
+                    plant(EffectKind::TruthWrite, f, &clone);
+                    plant(EffectKind::MarkerDel, f, &mark_a);
+                }
+                // TEST 3 — two unleased rebuilds. F listed truth before the
+                // mutation, G after; G published first, F clobbered it last.
+                // Marker a is consumed blind by F and marker b sighted by G, so
+                // TEST 1 (a breadcrumb existed) and TEST 2b (not every consumer
+                // was blind) both decline it first.
+                Break::Race => {
+                    plant(EffectKind::MarkerPut, f, &mark_a);
+                    plant(EffectKind::MarkerPut, g, &mark_b);
+                    plant(EffectKind::TruthList, f, &list);
+                    plant(EffectKind::TruthWrite, f, &clone);
+                    plant(EffectKind::TruthList, g, &list);
+                    plant(EffectKind::MarkerDel, f, &mark_a);
+                    plant(EffectKind::ViewWrite, g, &view);
+                    global(g, vec![pkg.clone()]);
+                    plant(EffectKind::MarkerDel, g, &mark_b);
+                    plant(EffectKind::ViewWrite, f, &view);
+                    global(f, Vec::new());
+                }
+                _ => {}
+            }
+        }
+        // An object under `_repl/` that no sweep recognizes as a marker
+        // (`parse_repl_marker` wants `<dest>/<pkg>/<file>!<nonce>`): nothing
+        // consumes it, so the fixpoint the heal phase is bounded to reach does
+        // not exist. Planted pre-audit so the drain budget is really spent.
+        (Break::Wedge, true) => {
+            buckets[0].insert("_repl/vopr-wedge", b"nothing drains this".to_vec());
+        }
+        // Corrupt the bytes an acked artifact serves, fleet-wide, while parking
+        // the real bytes outside `packages/` — so CONSERVATION still finds them
+        // alive, CONVERGENCE still sees identical buckets, and `pypiron verify`
+        // (which reads sidecars and views, never bodies) still passes. What is
+        // left is exactly one claim: the 200 said these bytes were durable.
+        (Break::Durability, false) => {
+            if let Some((pkg, fname, body)) = unexcused_ack(buckets, ledger) {
+                let akey = format!("packages/{pkg}/{fname}");
+                for bucket in buckets {
+                    bucket.insert(&format!("_vopr/quarantine/{akey}"), body.clone());
+                    bucket.insert(&akey, b"vopr: corrupt".to_vec());
+                }
+            }
+        }
+        // The record is intact and the bytes are safe; only the listing forgot
+        // it. Applied to every bucket so the buckets stay converged.
+        (Break::Visibility, false) => {
+            if let Some((pkg, fname, _)) = unexcused_ack(buckets, ledger) {
+                let key = format!("simple/{pkg}/index.json");
+                for bucket in buckets {
+                    if let Some(bytes) = bucket.dump().get(&key) {
+                        let doctored = String::from_utf8_lossy(bytes)
+                            .replace(&fname, "vopr-unlisted-1.0-py3-none-any.whl");
+                        bucket.insert(&key, doctored.into_bytes());
+                    }
+                }
+            }
+        }
+        // Acked bytes destroyed everywhere with nothing authorizing it: no
+        // tombstone, no freeze, no acked delete.
+        (Break::Conserve, false) => {
+            if let Some((pkg, fname, _)) = unexcused_ack(buckets, ledger) {
+                let akey = format!("packages/{pkg}/{fname}");
+                for bucket in buckets {
+                    let _ = bucket
+                        .delete_keys(&[akey.clone(), format!("{akey}.meta.json")])
+                        .await;
+                }
+            }
+        }
+        // One bucket keeps an object the other never got — a half-finished
+        // replication write nobody cleaned up. A dotfile is not an artifact
+        // (`sidecar::is_artifact`), so `pypiron verify` ignores it on both
+        // buckets and the only oracle left holding the claim is CONVERGENCE.
+        (Break::Diverge, false) => {
+            if let Some(bucket) = buckets.get(1) {
+                bucket.insert("packages/vopr-drift/.vopr-stray", b"unreplicated".to_vec());
             }
         }
         // A torn view write: the last byte never landed. Truth is untouched, so
@@ -433,43 +643,43 @@ const REACH_METER: [(&str, &str); REACH_SLOTS] = [
 const EXPECTED_ZERO: [(usize, &str); 10] = [
     (
         R::PkgOrdering as usize,
-        "product has never produced a class-1; `--break ordering` reaches it",
+        "product-unreachable: no class-1 has ever been produced; `--break ordering` kills it",
     ),
     (
         R::PkgPoisoned as usize,
-        "needs an audit-repaired package view; the fast path converges them all",
+        "product-unreachable: the fast path converges every package view; `--break poison` kills it",
     ),
     (
         R::PkgBlind as usize,
-        "needs an audit-repaired package view TEST 1 did not explain",
+        "product-unreachable: no repair TEST 1 declined has been seen; `--break blind` kills it",
     ),
     (
         R::PkgRace as usize,
-        "harness-unreachable: tick_lock serializes rebuilds (dev/TESTING.md)",
+        "harness-unreachable: tick_lock serializes rebuilds; `--break race` kills it (dev/TESTING.md)",
     ),
     (
         R::PkgFallback as usize,
-        "reached only by a repair no test explains — that is a classifier bug",
+        "a repair no test explains is a classifier bug; `--break fallback` kills it",
     ),
     (
         R::GlobalOrdering as usize,
-        "product has never produced a class-1; `--break globalindex` reaches it",
+        "product-unreachable: no class-1 has ever been produced; `--break globalindex` kills it",
     ),
     (
         R::GlobalPoisoned as usize,
-        "needs an audit-repaired global membership flip; none observed",
+        "product-unreachable: no audit-repaired membership flip seen; `--break poison` kills it",
     ),
     (
         R::GlobalBlind as usize,
-        "needs a global flip TEST 1 did not explain",
+        "product-unreachable: no flip TEST 1 declined has been seen; `--break blind` kills it",
     ),
     (
         R::GlobalRace as usize,
-        "harness-unreachable: tick_lock serializes rebuilds (dev/TESTING.md)",
+        "harness-unreachable: tick_lock serializes rebuilds; `--break race` kills it (dev/TESTING.md)",
     ),
     (
         R::GlobalFallback as usize,
-        "reached only by a flip no test explains — that is a classifier bug",
+        "a flip no test explains is a classifier bug; `--break fallback` kills it",
     ),
 ];
 

@@ -122,14 +122,15 @@ jobs:
       # defect the named invariant exists to catch, so the run MUST fail with
       # that invariant's text — an invariant nobody has watched go red is an
       # assertion of faith, not a test. The seed range is pinned and the
-      # simulator is deterministic, so this is a gate, not a sample; the number
-      # of fresh seeds each break needs (K) is recorded in dev/TESTING.md.
+      # simulator is deterministic, so this is a gate, not a sample; 6 seeds is
+      # >= every measured K (dev/TESTING.md), so it stays a gate even if a
+      # future change shifts which seed a break first bites on.
       - name: Oracle kill proofs (--break)
         run: |
           fail=0
           check() { # name expected-text flags...
             local name="$1" expect="$2"; shift 2
-            if out=$(cargo run --example vopr -- --seeds 3 "$@" --break "$name" 2>&1); then
+            if out=$(cargo run --example vopr -- --seeds 6 "$@" --break "$name" 2>&1); then
               echo "::error::--break $name passed — the oracle behind '$expect' is dead"
               fail=1
             elif ! grep -qF "$expect" <<<"$out"; then
@@ -140,12 +141,31 @@ jobs:
               echo "ok: --break $name red '$expect'"
             fi
           }
+          # One leg per oracle. Every invariant the simulator asserts is here,
+          # and so is every arm of the audit-repair classifier: an arm with no
+          # leg below is an arm nobody has watched fire.
           check view      "VERIFY: bucket 0 diverged"  --nodes 2 --buckets 1 --ops 80
           check fanout    "ACK_TOTALITY:"              --nodes 2 --buckets 2 --ops 80 --fail-percent 0
           check rerun     "op traces matched but the final world differs" \
                                                        --nodes 2 --buckets 2 --ops 80 --recheck-every 1
           check resurrect "TOMBSTONE_MONOTONICITY:"    --nodes 2 --buckets 1 --ops 80
-          check ordering  "AUDIT_ORDERING:"            --nodes 2 --buckets 1 --ops 80
+          check durability "DURABILITY: acked"         --nodes 2 --buckets 1 --ops 80
+          check visibility "VISIBILITY: acked"         --nodes 2 --buckets 1 --ops 80
+          check conserve  "CONSERVATION: acked bytes"  --nodes 2 --buckets 1 --ops 80
+          check diverge   "CONVERGENCE: bucket 0"      --nodes 2 --buckets 2 --ops 80
+          check wedge     "LIVENESS: fleet did not quiesce" --nodes 2 --buckets 1 --ops 80
+          # Classifier arms. `ordering`/`globalindex` are the two class-1 inputs
+          # (per-package and global membership); the rest each red BOTH analyzers
+          # at once, so the expected text names the arm, not the subsystem.
+          # class 3 is a statistic under fault injection by design, so its leg is
+          # the crash-only profile, where any audit repair is a violation.
+          check ordering  "AUDIT_ORDERING: bucket0"    --nodes 2 --buckets 1 --ops 80
+          check globalindex "AUDIT_ORDERING: bucket0 simple/index.* membership of" \
+                                                       --nodes 2 --buckets 1 --ops 80
+          check poison    "a poisoned derivation consumed the signal" --nodes 2 --buckets 1 --ops 80
+          check blind     "were all consumed blind"    --nodes 2 --buckets 1 --ops 80
+          check race      "unleased concurrent rebuild" --nodes 2 --buckets 1 --ops 80 --fail-percent 0
+          check fallback  "unexplained drift"          --nodes 2 --buckets 1 --ops 80
           exit $fail
 
   integration:

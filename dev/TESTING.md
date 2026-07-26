@@ -386,93 +386,164 @@ An invariant nobody has watched fail is not a test — it is an assertion of fai
 that costs runtime forever and reports reassurance. `--break <name>` injects ONE
 deliberate defect that a named oracle is supposed to catch; the run must then
 FAIL with that oracle's text, and ci.yml's **Oracle kill proofs** step gates on
-exactly that. Every break lives in the harness — no product-code hook ships in
+exactly that. Every invariant the simulator asserts has a leg there, and so does
+every arm of the audit-repair classifier: an arm with no leg is an arm nobody has
+watched fire. Every break lives in the harness — no product-code hook ships in
 the binary — and writes raw `SimStorage`, never a `FaultView`, so it perturbs
 storage and never the schedule.
 
-| `--break`   | the injected defect | must red | K |
+| `--break` | the injected defect | must red | K |
 |---|---|---|---|
-| `view`      | a torn view write (the last byte never landed), truth untouched | `VERIFY: … stale-view` | 1 |
-| `fanout`    | peer bucket 1 blackholes the chaos phase *and* the `_repl/1/` note owing it is dropped | `ACK_TOTALITY:` (needs `--fail-percent 0`, where it is the hard gate) | 1 |
-| `rerun`     | a seed's second execution ends in a different world off an identical op trace | `DETERMINISM VIOLATION … same calls, different bytes` (needs `--recheck-every 1`) | 1 |
+| `view` | a torn view write (the last byte never landed), truth untouched | `VERIFY: … stale-view` | 1 |
+| `fanout` | peer bucket 1 blackholes the chaos phase *and* the `_repl/1/` note owing it is dropped | `ACK_TOTALITY:` (needs `--fail-percent 0`, where it is the hard gate) | 1 |
+| `rerun` | a seed's second execution ends in a different world off an identical op trace | `DETERMINISM VIOLATION … same calls, different bytes` (needs `--recheck-every 1`) | 1 |
 | `resurrect` | an acked-deleted artifact's bytes come back with its tombstone gone | `TOMBSTONE_MONOTONICITY:` | 3 |
-| `ordering`  | truth grows a file with no `_dirty/` marker and no `_repl/` note ever covering it | `AUDIT_ORDERING:` (repair class 1, per-package path) | 3 |
-| `globalindex` | truth grows a whole *new package* with no `_dirty/` marker and no `_repl/` note ever covering it | `AUDIT_ORDERING: … simple/index.* membership` (repair class 1, global path) | 3 |
+| `durability` | an acked artifact serves corrupt bytes on every bucket, the real bytes parked outside `packages/` | `DURABILITY: acked … byte-corrupt` | 4 |
+| `visibility` | one acked filename edited out of `simple/<pkg>/index.json` on every bucket | `VISIBILITY: acked … not listed` | 4 |
+| `conserve` | an acked body and sidecar destroyed fleet-wide with no tombstone, no freeze and no acked delete | `CONSERVATION: acked bytes … vanished from every bucket` | 4 |
+| `diverge` | one bucket keeps an object the other never got | `CONVERGENCE: bucket 0 and bucket N differ` (needs ≥2 buckets) | 1 |
+| `wedge` | an object under `_repl/` no sweep recognizes, so the fixpoint the heal phase is bounded to reach does not exist | `LIVENESS: fleet did not quiesce` | 1 |
+| `ordering` | truth grows a file with no `_dirty/` marker and no `_repl/` note ever covering it | `AUDIT_ORDERING:` (repair class 1, per-package path) | 3 |
+| `globalindex` | the same unbreadcrumbed mutation, under a package name nobody has published | `AUDIT_ORDERING: … simple/index.* membership` (class 1, global path) | 3 |
+| `poison` | a rebuild listed truth *past* the mutation and still wrote a view — and a name set — contradicting it | `… a poisoned derivation consumed the signal` (class 2a) | 3 |
+| `blind` | the only op that retired the marker covering the mutation had listed truth before it | `… were all consumed blind` (class 2b) | 3 |
+| `race` | two unleased rebuilds: the one that listed *earlier* wrote *last* | `… unleased concurrent rebuild` (class 3; needs `--fail-percent 0`, where any audit repair is a violation) | 5 |
+| `fallback` | an audit repair the effect history cannot explain at all | `… unexplained drift` (fallback arm) | 3 |
 
 `globalindex` exists because `ordering` cannot reach the global analysis: it
 grows a package that already exists, so the global name set never changes and
 only `rebuild_package`'s view is repaired. Landing the same unbreadcrumbed
 mutation under a name nobody has published makes membership the thing the audit
 has to fix, which is the only input that exercises the `GlobalWrite` path — and
-it reds with *both* findings, one per subsystem, which is the split working.
+it reds with *both* findings, one per subsystem, which is the split working. The
+last four breaks reuse that phantom clone for the same reason, so each of them
+reds `analyze` **and** `analyze_global` at once: the two analyses ask the same
+three questions of `ViewWrite`s and of `GlobalWrite`s, and one input answers
+both. Four breaks, eight arms.
+
+**The classifier breaks plant effect history, and that is not a shortcut.** The
+storage damage is real — a package the audit genuinely has to materialize — but
+`poison`, `blind` and `race` also push the `ViewWrite`/`TruthList`/`MarkerDel`
+sequence the offending rebuild would have left. They have to: a concurrent-rebuild
+clobber leaves **no storage residue** that distinguishes it from a lone stale
+writer, because the loser's bytes are gone by definition. That is precisely why
+the classifier reads effect history and not storage, and it means a planted
+history is the only thing a kill proof for these arms *can* inject. Attribution
+planting is not new here either — `synth_view_write` already does it for
+warm-bucket audit writes. Read these four as mutation tests of the classifier's
+predicates: they prove the arm evaluates, matches, and prints the finding it
+claims to. They are **not** evidence that the product can produce the
+interleaving; the reachability table below is where that question is answered.
+`fallback` plants nothing at all, which is the whole point of it — an audit
+repair with no history behind it is exactly the shape that arm exists to report.
 
 K is how many fresh seeds the break needs to red with ≥99.8% confidence, and the
-table's K is for the **pinned CI flags**, which are non-rotating. Measured over
-seeds 1–300 at the leader-rotation commit: `view` 300/300, `fanout` 300/300,
-`rerun` 300/300, `resurrect` 281/300, `ordering` 264/300, `globalindex` 264/300.
-`view`, `fanout` and `rerun` red on every seed; `resurrect`, `ordering` and
-`globalindex` need a run that actually produced the state they corrupt — an
-acked `204`, and a live artifact+sidecar pair — so a schedule that ended with
-every file tombstoned leaves them inert. CI samples nothing: the seed range is
-pinned and the simulator is deterministic. Quote the seed range with any future
-re-measurement; leader rotation moved the heal-phase schedule, so counts taken
-over an unstated range are not comparable across commits (K, which is what the
-gate depends on, did not move).
+table's K is for the **pinned CI flags**, which are non-rotating. Measured at
+this commit over 20-second timeboxed samples (19,750–25,132 seeds each): `view`,
+`fanout`, `rerun`, `diverge` and `wedge` red on every seed; `poison`, `blind`,
+`fallback`, `ordering` and `globalindex` 89.6–89.8%; `durability`, `visibility`
+and `conserve` 85.6%; `race` 76.5%. Nothing below 100% is a weaker oracle — each
+of those breaks needs a run that actually produced the state it corrupts (a live
+artifact+sidecar pair to clone, an unexcused acked upload to destroy), and a
+schedule that ended with every file tombstoned leaves them inert. `race` is lower
+again because class 3 is a *statistic* under fault injection by design, so only
+the crash-only profile can red it. CI samples nothing: the seed range is pinned
+and the simulator is deterministic, and it draws 6 seeds — one more than the
+largest K in the table — so a future change that shifts which seed a break first
+bites on cannot quietly turn a gate into a coin flip.
 
 Under `--rotate` the same breaks red at different rates, because the rotating
-profile varies the *topology* the break needs. Over seeds 1–50,000 (`view` and
-`rerun` over the first 12,000): `view` and `rerun` red on every seed (K=1),
-`resurrect` 43,796/50,000 (K=3), `ordering` 35,160/50,000 (K=6), `fanout`
-16,165/50,000 (K=16). `fanout`'s drop is not a weaker oracle — it is arithmetic:
-the break needs ≥2 buckets *and* `--fail-percent 0`, and rotation supplies both
-on about a third of seeds. Take a rotating K to the digit only off a five-figure
-sample: three of these rates land within a percentage point of a K boundary, so
-the earlier 300-seed measurement read `ordering` as 5 and `fanout` as 18, and
-`resurrect` (0.876 against a 0.874 boundary) and `fanout` are still inside
-sampling noise of the next K up — provision 4 and 17 if you re-pin a rotating
-range. Keep the gate on the pinned non-rotating flags; that is what makes it a
-gate rather than a sample.
+profile varies the *topology* and the fault mode each break needs. Over
+12,873–15,652-seed samples at this commit: `wedge` 100% (K=1); `poison`, `blind`
+and `fallback` 70.6% (K=6); `diverge` 66.4% and the three durability-family
+breaks 65.5% (K=6); `globalindex` 37.5% (K=14) and `race` 33.1% (K=16) — both
+gated on the roughly half of rotating seeds that draw `--fail-percent 0`, since
+class 1's `AUDIT_ORDERING:` text and class 3's finding dump only appear there.
+Earlier ranges for the original five: over seeds 1–50,000 (`view` and `rerun`
+over the first 12,000) `view` and `rerun` red on every seed (K=1), `resurrect`
+43,796/50,000 (K=3), `ordering` 35,160/50,000 (K=6), `fanout` 16,165/50,000
+(K=16). Take a rotating K to the digit only off a five-figure sample: several of
+these rates land within a percentage point of a K boundary, so an earlier
+300-seed measurement read `ordering` as 5 and `fanout` as 18. Keep the gate on
+the pinned non-rotating flags; that is what makes it a gate rather than a sample.
+
+Off by default and provably free: every injection point is a comparison against
+`Break::None` that draws no rng, consumes no op-sequence number and records no
+trace event. Verified the way this document demands, not asserted — re-measured
+when the nine breaks above landed, against a binary built from the previous
+commit's tree: five profiles × 5,000 seeds reproduce storage-op interleavings,
+acked uploads, ack-totality misses and audit repairs **identical to the digit**
+(4,788,522 / 7,974,955 / 4,917,004 / 8,345,647 / 8,455,918 interleavings;
+18,388 / 15,660 / 19,368 / 16,727 / 26,388 acked), and `VOPR_TRACE` dumps for 24
+(seed, profile) pairs are byte-identical.
+
+#### Workload-reachable, harness-unreachable, product-unreachable
+
+Three different things, and conflating them is how an unfalsifiable gate survives
+a review. A kill proof says the oracle is *sound*. It says nothing about whether
+anything but a break can ever red it, and the answer differs per oracle:
+
+- **workload-reachable** — nothing forbids the red state. The oracle reads green
+  because the product is correct on the schedules sampled, and a real regression
+  would red it. This is the ordinary, healthy status.
+- **harness-unreachable** — the *simulator* cannot stage the state, though
+  production can. The oracle is a standing watch that this harness will never
+  trip; something else has to cover it.
+- **product-unreachable** — a *product rule* forbids the state, so it cannot
+  occur in production either. The guard is a watch on a rule that could one day
+  be relaxed.
+
+| oracle | status | why | kill proof |
+|---|---|---|---|
+| VERIFY | workload-reachable | every convergence regression pinned in ci.yml's seed corpus red it | `view` |
+| DURABILITY | workload-reachable | no rule forbids a bucket losing an acked record | `durability` |
+| VISIBILITY | workload-reachable | ditto, for the listing | `visibility` |
+| CONSERVATION | workload-reachable | ditto, fleet-wide | `conserve` |
+| CONVERGENCE | workload-reachable | needs ≥2 buckets; the replication paths that could break it run on every multi-bucket seed | `diverge` |
+| LIVENESS | workload-reachable | any undrainable breadcrumb reds it; the fast path has simply always drained | `wedge` |
+| ACK_TOTALITY | workload-reachable, and *observed* | 166 misses per 5,000 seeds on 3n/2b under fault injection, where it is a reported statistic; crash-only, where it is fatal, has never produced one | `fanout` |
+| DETERMINISM | workload-reachable | any nondeterminism downstream of the op sequence reds it | `rerun` |
+| TOMBSTONE_MONOTONICITY | **product-unreachable** | `publish_record`'s tombstone fence rejects re-publishing a deleted filename, so no ack can follow a `204` — 150k wide seeds (795k acked uploads, 251M interleavings) produced zero, and could not have produced one | `resurrect` |
+| classifier TEST 1 / 2a / 2b / FALLBACK (both analyses) | workload-reachable, never witnessed | each needs the tier-3 audit to have repaired a view; the marker/tick/sweep/reconcile fast path converged every schedule in the 140k-seed sample (0 audit repairs) | `ordering`, `globalindex`, `poison`, `blind`, `fallback` |
+| classifier TEST 3 (both analyses) | **harness-unreachable** | the simulator's `tick_lock` serializes every rebuild to stand in for the bucket lease, so two never overlap | `race` (planted history) |
+
+`resurrect` proves the *oracle* is sound even though the *product* cannot reach
+the state, which is the honest status of that guard: mirror filenames are
+re-fillable by design, so the day a legal resurrection path lands it is already
+watched. An unreachable-but-sound guard is legitimate; an unproven one is not.
+
+Class 3 is unreachable on a **much weaker claim**, and this is the distinction
+the table exists to keep. Production's lease is sloppy on purpose — `src/lease.rs`
+is a TTL + heartbeat with no fencing, because rebuilds are idempotent — so dual
+leadership, and with it the race, *is* reachable there; it is covered
+exhaustively by `concurrent_rebuild_without_lease_diverges` in
+`tests/model_event_protocol.rs`, not by this simulator. Removing `tick_lock`
+still produced zero repairs over 26k wide seeds, and so did truncating the heal
+phase's drain budget until two thirds of seeds failed on other oracles. `--break
+race` closes the *soundness* question — the arm evaluates and prints its finding,
+on both analyses — and leaves the *reachability* question exactly where it was:
+this harness cannot stage the race, and the model checker is what covers it.
+
+**Two oracles cannot red alone, by construction.** Worth knowing before anyone
+reads a lone `CONSERVATION:` or `VISIBILITY:` line as an independent signal:
+
+- CONSERVATION ⊆ DURABILITY. Both exempt the same states (an acked delete, a
+  tombstone, a freeze); CONSERVATION's exemption is fleet-wide and DURABILITY's
+  is per-bucket, so any key CONSERVATION reds on is a key some bucket also reds
+  DURABILITY on. Its only independent contribution — bytes surviving under
+  another key still count — makes it *weaker*, not stronger. `--break conserve`
+  reds both, and always will.
+- VISIBILITY ⊆ VERIFY ∨ DURABILITY. If the record is intact (DURABILITY green)
+  and the view byte-matches a re-render of truth (VERIFY green), the view lists
+  it. `--break visibility` reds VERIFY's `stale-view` alongside it.
+
+Both are cheap and both name a claim in the language a reader cares about, so
+they stay — but they are restatements, and a change that weakens DURABILITY or
+VERIFY silently weakens them too.
 
 `--break ordering` is still the only class-**1** input the classifier has ever
 been handed; the product has never produced one. Class 2 is no longer synthetic
 — seed 1067836 above is the real thing.
-
-Off by default and provably free: every injection point is a comparison against
-`Break::None` that draws no rng, consumes no op-sequence number and records no
-trace event. Prove it the way this document already demands of a new oracle —
-`VOPR_TRACE_FILE` captured before and after must be byte-identical, and the
-pinned baselines must reproduce to the digit.
-
-**Reachable by the workload, or sound but unreachable?** Four of the five are
-reachable: the workload produces the states that red them. TOMBSTONE
-MONOTONICITY does not — `publish_record`'s tombstone fence rejects a re-publish
-of a deleted filename, so no ack can follow a `204` and the invariant cannot
-fire on today's workload at any seed count. Widening the workload did not change
-that and could not have: the fence is a product rule, not a shortage of
-filenames, and 150k wide seeds (795k acked uploads, 251M interleavings) produced
-zero. `--break resurrect` proves the *oracle* is sound even though the *product*
-cannot reach the state, which is the honest status of that guard: mirror
-filenames are re-fillable by design, so the day a legal resurrection path lands
-it is already watched. An unreachable-but-sound guard is legitimate; an unproven
-one is not.
-
-Class 3 (concurrent-race) is unreachable too, but on a **much weaker claim**, and
-conflating the two is the mistake this paragraph exists to prevent. TOMBSTONE
-MONOTONICITY is *product*-unreachable: a product rule forbids the state, so it is
-unreachable in production as well, and the guard is a standing watch on a rule
-that could one day be relaxed. Class 3 is only *harness*-unreachable: the
-simulator's `tick_lock` serializes every rebuild (each pin takes bucket 0's lock)
-to stand in for the bucket lease, so two rebuilds never overlap by construction.
-Production's lease is sloppy on purpose — `src/lease.rs` is a TTL + heartbeat
-with no fencing, because rebuilds are idempotent — so dual leadership, and with
-it the race, *is* reachable there; it is covered by
-`concurrent_rebuild_without_lease_diverges` in `tests/model_event_protocol.rs`,
-not by this simulator. Removing `tick_lock` still produced zero repairs over 26k
-wide seeds, and so did truncating the heal phase's drain budget until two thirds
-of seeds failed on other oracles — the marker/tick/sweep/reconcile fast path
-converges views without the audit on essentially every schedule this simulator
-can build. So the honest status is "this harness cannot stage the race", not "the
-product does not have it", which is why the class-2 hit above matters so much.
 
 ### Proving the oracles ran at all (the reach meter)
 
@@ -524,11 +595,12 @@ profile alone, TOMBSTONE_MONOTONICITY 88,405, VERIFY 32,443, ACK_TOTALITY
 not new breakage; it is the same fact the class-3 investigation established, now
 printed rather than excavated. The classifier only runs when the tier-3 audit had
 to repair a view, and the fast path converged every schedule in the sample (0
-audit repairs in 140k seeds). `--break ordering` reaches per-package TEST 1;
-`--break globalindex` reaches both TEST 1s. Nothing reaches TEST 2a, TEST 2b,
-TEST 3 or the FALLBACK on either analysis — so ~310 lines of classifier are
-carried on the strength of two arms, and the honest read is that the taxonomy is
-a diagnosis tool for a rare event, not a routinely-exercised gate.
+audit repairs in 140k seeds). Nothing in the workload reaches any of the ten
+— so ~310 lines of classifier are carried entirely by inputs a `--break` has to
+supply, and the honest read is that the taxonomy is a diagnosis tool for a rare
+event, not a routinely-exercised gate. Every arm now has a kill proof
+(`ordering`, `globalindex`, `poison`, `blind`, `race`, `fallback`), which
+settles soundness and settles nothing about frequency.
 
 `--require-reach` makes a zero a **failing run** (exit 4), so CI can assert that
 every oracle ran rather than merely that none complained. It is off by default —
@@ -545,9 +617,10 @@ each is a claim someone has to defend here:
 | CONVERGENCE, ACK_TOTALITY | need more than one bucket; excused automatically, and only, when every profile in the sample was single-bucket | any multi-bucket profile |
 | classifier/pkg TEST 1 | the product has never produced a class-1 ORDERING repair | `--break ordering`, `--break globalindex` |
 | classifier/global TEST 1 | same, on global membership | `--break globalindex` |
-| classifier/{pkg,global} TEST 3 | *harness*-unreachable: `tick_lock` serializes rebuilds, so two never overlap (see the class-3 paragraph above) | nothing today |
-| classifier/{pkg,global} TEST 2a, TEST 2b | need an audit repair the earlier test did not explain; the fast path converged every schedule sampled | nothing today |
-| classifier/{pkg,global} FALLBACK | reached only by drift no test explains — which would itself be a classifier bug | nothing today |
+| classifier/{pkg,global} TEST 3 | *harness*-unreachable: `tick_lock` serializes rebuilds, so two never overlap (see the reachability table above) | `--break race` |
+| classifier/{pkg,global} TEST 2a | needs an audit repair whose final writer had listed truth past every mutation | `--break poison` |
+| classifier/{pkg,global} TEST 2b | needs an audit repair TEST 1 declined — a covered mutation whose breadcrumbs were all consumed blind | `--break blind` |
+| classifier/{pkg,global} FALLBACK | reached only by drift no test explains — which would itself be a classifier bug | `--break fallback` |
 
 An entry earning its first execution is *news*, not a failure: the run prints
 `[now reached — drop it from EXPECTED_ZERO]` beside it, and the entry comes out.

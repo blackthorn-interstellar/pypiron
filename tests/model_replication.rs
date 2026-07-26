@@ -416,6 +416,15 @@ fn quarantine_mirror_artifacts_abs(bucket: &mut BucketAbs) {
 /// terminal, so it promotes the peer; without this the fleet can sit forever on
 /// a (private, mirror) split that no per-file verdict can resolve.
 fn reconcile_split_origin_abs(w: &mut World) {
+    // A lone mirror claim is reserved on the unclaimed peer, ahead of any bytes.
+    // Mirror never demotes private, so this only ever fills in a missing claim;
+    // an empty claim has no record for the copy path to ride along with, so
+    // without it a claim whose fan-out lost its peer never converges.
+    match (w.buckets[0].pkg_origin, w.buckets[1].pkg_origin) {
+        (Some(MOrigin::Mirror), None) => w.buckets[1].pkg_origin = Some(MOrigin::Mirror),
+        (None, Some(MOrigin::Mirror)) => w.buckets[0].pkg_origin = Some(MOrigin::Mirror),
+        _ => {}
+    }
     match (w.buckets[0].pkg_origin, w.buckets[1].pkg_origin) {
         // Demoting the peer's mirror claim strands its mirror bodies; the
         // promoted side quarantines them in the same pass.

@@ -1347,33 +1347,31 @@ async fn ensure_private_origin(dst: &dyn Storage, pkg: &str) -> Result<()> {
 /// is left untouched — private is terminal and outranks mirror everywhere, so a
 /// replicated snapshot NEVER demotes it (the mirror analogue of
 /// [`ensure_private_origin`], which does demote). A claim already `mirror` is a
-/// no-op. Any real claim a racer installed (private or mirror) is accepted.
-async fn ensure_mirror_origin(dst: &dyn Storage, pkg: &str) -> Result<()> {
+/// no-op. Any real claim a racer installed (private or mirror) is accepted, and
+/// returned: the caller cannot assume `mirror` the way it can assume `private`
+/// after [`ensure_private_origin`], because this call yields to a racer.
+async fn ensure_mirror_origin(dst: &dyn Storage, pkg: &str) -> Result<Origin> {
     for _ in 0..ORIGIN_ATTEMPTS {
-        match read_origin_observation(dst, pkg).await? {
-            None => {
-                // Absent: create-if-absent. A racer may beat us to a real claim;
-                // either private (which we must not demote) or mirror is fine.
-                let owner = claim_origin(dst, pkg, MIRROR).await?.owner;
-                if owner == MIRROR || owner == PRIVATE {
-                    return Ok(());
-                }
-            }
-            Some(observed) if observed.state == OriginState::Mirror => return Ok(()),
+        let observed = read_origin_observation(dst, pkg).await?;
+        match observed.as_ref().map(|observed| observed.state) {
+            Some(OriginState::Mirror) => return Ok(Origin::Mirror),
             // Private outranks a replicated mirror snapshot; leave it terminal.
-            Some(observed) if observed.state == OriginState::Private => return Ok(()),
-            Some(observed) if observed.state == OriginState::Unclaimed => {
-                let request = ClaimRequest::new(MIRROR, Some(&observed));
-                let owner = claim_origin(dst, pkg, request).await?.owner;
-                if owner == MIRROR || owner == PRIVATE {
-                    return Ok(());
+            Some(OriginState::Private) => return Ok(Origin::Private),
+            // Absent: create-if-absent. Unclaimed: CAS the sentinel. Either way a
+            // racer may beat us to a real claim; private (which we must not
+            // demote) or mirror is fine.
+            None | Some(OriginState::Unclaimed) => {
+                let request = ClaimRequest::new(
+                    MIRROR,
+                    observed
+                        .as_ref()
+                        .filter(|observed| observed.state == OriginState::Unclaimed),
+                );
+                match claim_origin(dst, pkg, request).await?.owner.as_str() {
+                    MIRROR => return Ok(Origin::Mirror),
+                    PRIVATE => return Ok(Origin::Private),
+                    _ => {}
                 }
-            }
-            Some(observed) => {
-                bail!(
-                    "origin claim for '{pkg}' holds unsupported state '{}'",
-                    observed.state.as_str()
-                )
             }
         }
     }
@@ -1862,8 +1860,8 @@ struct SplitOriginReconciled {
 /// Reconcile a cross-bucket origin split before a package is diffed. When
 /// exactly one side holds the private claim, promote the peer's claim to private
 /// and quarantine any mirror bodies stranded on it (marking that side dirty so
-/// its own leader rebuilds). Any other pairing (already agreeing, or neither
-/// private) is left untouched.
+/// its own leader rebuilds). A lone mirror claim is reserved on the peer. A
+/// pairing that already agrees is left untouched.
 async fn reconcile_split_origin(
     a: &dyn Storage,
     b: &dyn Storage,
@@ -1872,6 +1870,25 @@ async fn reconcile_split_origin(
     mut b_origin: Option<Origin>,
 ) -> Result<SplitOriginReconciled> {
     let (mut scanned_a, mut scanned_b) = (false, false);
+    // A claim is reserved fleet-wide ahead of its bytes — `publish::store_upload`
+    // fans `.origin` out to every bucket before the artifact lands — so a claim
+    // on one side and none on the other is a fan-out a partition cut short, not
+    // a steady state. Private is repaired by the arms below; mirror is repaired
+    // here, and nowhere else: an *empty* claim has no record for the copy path's
+    // own `ensure_mirror_origin` to ride along with, so without this the
+    // reservation stays bucket-local forever. `.origin` lives under `packages/`,
+    // which `src/layout.rs` classes truth-replicated, and truth that never
+    // converges is a bug, not a trade-off (dev/DESIGN.md, the totality
+    // principle). Until it converges the two nodes disagree about who owns the
+    // name: one answers a private upload with 403 mirror-owned while its peer
+    // accepts the same upload, and a bucket loss silently unclaims the name.
+    // The reserve never demotes private, so it returns `mirror` or a racer's
+    // `private`; the latter falls straight into the split arms below.
+    if a_origin == Some(Origin::Mirror) && b_origin.is_none() {
+        b_origin = Some(ensure_mirror_origin(b, pkg).await?);
+    } else if b_origin == Some(Origin::Mirror) && a_origin.is_none() {
+        a_origin = Some(ensure_mirror_origin(a, pkg).await?);
+    }
     match (a_origin, b_origin) {
         (Some(Origin::Private), Some(Origin::Mirror)) => {
             ensure_private_origin(b, pkg).await?;
@@ -1928,18 +1945,9 @@ async fn replicate_record(
     } = reconcile_split_origin(src, dst, pkg, src_origin, dst_origin).await?;
 
     if filename == ORIGIN_MARKER {
-        // The `.origin` marker fans out (and is swept) only for a first-write
-        // claim from `store_upload` — never a proxy fill — so a mirror claim
-        // here is always a `sync --to` snapshot reservation, not a bucket-local
-        // cache. Reserve it on the peer ahead of the artifact, the same
-        // pre-bytes dependency-confusion boundary `reconcile_split_origin` gives
-        // a private claim above; the later artifact fan-out re-claims
-        // idempotently. A mirror claim never demotes private truth on the peer.
-        // (Left out of `reconcile_split_origin` on purpose: the full diff shares
-        // it and must keep a proxy cache's origin bucket-local.)
-        if src_origin == Some(Origin::Mirror) {
-            ensure_mirror_origin(dst, pkg).await?;
-        }
+        // The claim itself is the whole record, and `reconcile_split_origin`
+        // above already reserved it on the peer — private or mirror alike —
+        // ahead of any bytes. Nothing left to copy.
         return Ok(());
     }
     if filename == PROJECT_STATUS_MARKER {
@@ -4263,6 +4271,42 @@ mod tests {
                 .as_deref(),
             Some(PRIVATE)
         );
+    }
+
+    #[tokio::test]
+    async fn full_diff_replicates_an_origin_only_mirror_claim_over_unclaimed() {
+        // A mirror claim whose pre-artifact fan-out never reached the peer. The
+        // package holds nothing but the claim, so there is no record for the
+        // copy path's own `ensure_mirror_origin` to ride along with — the diff's
+        // split reconciliation is the only repair path there is. Without it the
+        // pair never converges (VOPR seed 42, four ops and no injected faults:
+        // `packages/vopr-alpha/.origin: b0=Some("mirror") b1=None`).
+        for claimed_side in [0, 1] {
+            for peer_claim in [None, Some(&b"unclaimed"[..])] {
+                let a = Arc::new(InMemStorage::default());
+                let b = Arc::new(InMemStorage::default());
+                let key = crate::origin::origin_key("reserved");
+                let (claimant, peer): (&Arc<InMemStorage>, &Arc<InMemStorage>) =
+                    if claimed_side == 0 {
+                        (&a, &b)
+                    } else {
+                        (&b, &a)
+                    };
+                claimant.insert(&key, b"mirror".to_vec());
+                if let Some(sentinel) = peer_claim {
+                    peer.insert(&key, sentinel.to_vec());
+                }
+                let state = two_bucket_state(a.clone(), b.clone());
+
+                diff_pair(&state, a.as_ref(), b.as_ref()).await.unwrap();
+
+                assert_eq!(
+                    read_origin(peer.as_ref(), "reserved").await.unwrap(),
+                    Some(MIRROR.to_string()),
+                    "claimed_side={claimed_side} peer_claim={peer_claim:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

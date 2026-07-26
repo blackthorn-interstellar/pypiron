@@ -901,6 +901,23 @@ async fn copy_live(
     finish_stream_leg(state, src, dst, pkg, filename, sc, &akey, artifact, changed).await
 }
 
+/// Whether the destination's own sidecar still names `sha` — the divergence
+/// gate [`install_or_verify_sidecar`] established, re-read at the moment a
+/// destructive write to the artifact key is about to trust it. An absent or
+/// different-sha sidecar means this bucket's truth no longer describes the
+/// bytes we are holding, so the body under that key is not ours to replace.
+async fn sidecar_still_names(dst: &dyn Storage, key: &str, sha: &str) -> Result<bool> {
+    match dst.get_bytes(key).await {
+        Ok(bytes) => {
+            let current: Sidecar = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse destination sidecar {key}"))?;
+            Ok(current.sha256 == sha)
+        }
+        Err(error) if is_not_found(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Land the (already verified) artifact bytes on the destination: repair a
 /// stale-debris body in place, then publish the artifact last under a
 /// conditional create, freezing a raced competing body. Shared by the pure
@@ -920,22 +937,35 @@ async fn finish_stream_leg(
     // A destination body already under this immutable key with the wrong sha is
     // stale crash debris (e.g. a zero-byte object a 200-acked-but-failed write
     // left behind, D2); repair it in place, then the conditional create dedups.
-    if dst.head_exists(akey).await? {
-        let current = dst
-            .get_bytes(akey)
-            .await
-            .with_context(|| format!("verify destination artifact {akey}"))?;
-        if sha256_hex(&current) != sc.sha256 {
-            store_artifact_verified(
-                dst,
-                akey,
-                ArtifactBody::Bytes(artifact.clone()),
-                artifact.len() as u64,
-                Some("application/octet-stream"),
-                Existing::Repair(&sc.sha256),
-            )
-            .await?;
-            changed = true;
+    //
+    // "Debris" holds only while the destination sidecar still names OUR sha —
+    // the divergence gate the sidecar install established. A local publish on
+    // this bucket invalidates that gate inside this window: it wins the
+    // immutable create and then overwrites the sidecar, leaving a live body its
+    // own truth correctly describes. So re-read the gate. A described body is a
+    // byte conflict, not debris, and falls through to the conditional create's
+    // freeze arm below — the loser is quarantined, never overwritten (§6.3).
+    // Between the two states nothing on this bucket can tell an in-flight
+    // publisher's body from debris, so preserve the bytes before replacing
+    // them, and replace conditionally on the etag we read: an immutable key is
+    // never a HEAD-then-PUT.
+    if let Some((current, etag)) = dst
+        .get_with_etag(akey)
+        .await
+        .with_context(|| format!("verify destination artifact {akey}"))?
+    {
+        if sha256_hex(&current) != sc.sha256
+            && sidecar_still_names(dst, &sidecar_key(akey), &sc.sha256).await?
+        {
+            quarantine_bytes(dst, pkg, filename, &current).await?;
+            let len = artifact.len() as u64;
+            if bounded_artifact_write(akey, len, dst.put_if_match(akey, &etag, artifact.clone()))
+                .await?
+                .is_some()
+            {
+                verify_stored_size(dst, akey, len).await?;
+                changed = true;
+            }
         }
     }
     // Artifact last. Losing this conditional create must never be reported as
@@ -3243,6 +3273,82 @@ mod tests {
         let sidecar: Sidecar =
             serde_json::from_slice(&dst.get_bytes(&sidecar_key(&key)).await.unwrap()).unwrap();
         assert_eq!(sidecar.sha256, sha256_hex(bytes));
+        assert!(!dst.head_exists(&frozen_key(&key)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn destination_body_its_own_sidecar_describes_is_a_conflict_not_debris() {
+        // The state a local publish leaves behind after it wins the immutable
+        // create in the window the replication gate opened: the destination's
+        // own sidecar now names the local bytes, not ours. Overwriting that as
+        // "stale crash debris" destroys acked bytes and leaves a sidecar over a
+        // body it does not describe. It is a byte conflict: freeze, preserve.
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let source_bytes = b"source wheel";
+        let local_bytes = b"locally published wheel";
+        let src = Arc::new(InMemStorage::default());
+        seed_live(src.as_ref(), "pkg", filename, source_bytes, PRIVATE);
+        let dst = Arc::new(InMemStorage::default());
+        seed_live(dst.as_ref(), "pkg", filename, local_bytes, PRIVATE);
+        let state = test_state(src.clone());
+        let sidecar = sc(&sha256_hex(source_bytes), PRIVATE, Yanked::Flag(false), 0);
+
+        assert!(!finish_stream_leg(
+            &state,
+            src.as_ref(),
+            dst.as_ref(),
+            "pkg",
+            filename,
+            &sidecar,
+            &key,
+            source_bytes.to_vec(),
+            false,
+        )
+        .await
+        .unwrap());
+
+        let quarantined = dst.list_all(QUARANTINE_PREFIX).await.unwrap();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(
+            dst.get_bytes(&quarantined[0].key).await.unwrap(),
+            local_bytes
+        );
+        assert!(dst.head_exists(&frozen_key(&key)).await.unwrap());
+        assert!(src.head_exists(&frozen_key(&key)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn zero_byte_debris_under_our_own_sidecar_is_still_repaired() {
+        // D2: a 200-acked-but-failed write leaves a body no sidecar describes.
+        // The gate's own sidecar still names our sha, so this really is debris
+        // — repair it, or heal bails on it forever.
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let source_bytes = b"source wheel";
+        let src = Arc::new(InMemStorage::default());
+        seed_live(src.as_ref(), "pkg", filename, source_bytes, PRIVATE);
+        let dst = Arc::new(InMemStorage::default());
+        seed_live(dst.as_ref(), "pkg", filename, source_bytes, PRIVATE);
+        dst.insert(&key, Vec::new());
+        let state = test_state(src.clone());
+        let sidecar = sc(&sha256_hex(source_bytes), PRIVATE, Yanked::Flag(false), 0);
+
+        assert!(finish_stream_leg(
+            &state,
+            src.as_ref(),
+            dst.as_ref(),
+            "pkg",
+            filename,
+            &sidecar,
+            &key,
+            source_bytes.to_vec(),
+            false,
+        )
+        .await
+        .unwrap());
+
+        assert_eq!(dst.get_bytes(&key).await.unwrap(), source_bytes);
         assert!(!dst.head_exists(&frozen_key(&key)).await.unwrap());
     }
 

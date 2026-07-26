@@ -61,6 +61,12 @@ jobs:
       # Seeds rotate nightly (day number scales the start), so every night
       # explores fresh schedules while any night's failure still reproduces
       # from its printed seed.
+      # `--require-reach` fails the run when any oracle recorded ZERO
+      # executions over the sample: an oracle that verified nothing is a defect
+      # report, not a pass, and this harness has twice shipped a gate whose
+      # arm had never run. It lives here and not on the PR smoke because it
+      # only means something at volume — 50,000 seeds per profile. Known-zero
+      # oracles are excused by name in `EXPECTED_ZERO` (dev/TESTING.md).
       - name: Run seeded simulation
         run: |
           START=$(( ( $(date +%s) / 86400 ) * ${SEEDS} ))
@@ -68,13 +74,15 @@ jobs:
             --seeds "${SEEDS}" --start-seed "${START}" \
             --nodes ${{ matrix.profile.nodes }} \
             --buckets ${{ matrix.profile.buckets }} \
-            --ops ${{ matrix.profile.ops }} ${{ matrix.profile.extra }} | tee vopr.out
+            --ops ${{ matrix.profile.ops }} ${{ matrix.profile.extra }} \
+            --require-reach | tee vopr.out
       - name: Publish counters
         if: always()
         run: |
           echo '### VOPR — ${{ matrix.profile.name }}' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tail -20 vopr.out >> "$GITHUB_STEP_SUMMARY"
+          # 22 lines of reach table + the summary above it.
+          tail -30 vopr.out >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   model-deep:

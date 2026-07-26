@@ -64,6 +64,14 @@
 //! floor, so no seed can silently stop publishing and report green on a run
 //! that verified nothing.
 //!
+//! Every oracle above is also *metered*: the run prints how many times each one
+//! actually evaluated something — and each arm of the repair classifier
+//! separately — because an oracle reading zero over a whole soak is a defect
+//! report, not a pass (see `Reach`). `--require-reach` turns that into a failing
+//! run. The same line reports the worst rounds-to-quiesce any seed needed
+//! against the heal budget, so an over-generous budget cannot quietly turn a
+//! livelock into a green LIVENESS.
+//!
 //! Determinism is self-checked, not assumed: every run whose seed is a multiple
 //! of `--recheck-every` executes twice and must produce an identical storage-op
 //! trace hash *and* an identical final world (bucket bytes + ledger), because a
@@ -298,6 +306,246 @@ impl Rng {
     fn chance(&mut self, percent: u64) -> bool {
         self.below(100) < percent
     }
+}
+
+// ---------------------------------------------------------------------------
+// The reach meter: did each oracle actually EXECUTE, on input worth checking?
+//
+// An oracle reading zero executions over a whole soak is a defect report, not a
+// pass. This harness has shipped an unfalsifiable gate twice — a three-class
+// audit-repair taxonomy documented as CI-enforced while one class's loop body
+// had never run, and two oracles added with no evidence they could fire — and
+// establishing that took a human hand-running 241,530 seeds. It should be a
+// number the binary prints.
+//
+// "Executed" is deliberately not "its code was reached": DURABILITY looping over
+// an empty ledger is not an execution; DURABILITY comparing one acknowledged
+// upload against a bucket's bytes is. Each counter's unit is spelled out in
+// `REACH_METER` and printed beside it, because that definition IS the meter.
+//
+// Non-perturbing by construction: every hit is a relaxed atomic increment over
+// data the run already computed. No rng draw, no await, no storage op, nothing
+// through `FaultView` — so the meter cannot move the schedule it measures.
+// ---------------------------------------------------------------------------
+
+/// Heal-phase budgets. The margin printed by the meter is measured against
+/// these, so the budget and its headroom can never drift apart.
+const HEAL_ROUNDS: u64 = 12;
+const DRAIN_PASSES: u64 = 20;
+
+#[derive(Clone, Copy)]
+enum R {
+    Durability,
+    Visibility,
+    Conservation,
+    Convergence,
+    Liveness,
+    Verify,
+    AckTotality,
+    Tombstone,
+    Determinism,
+    PkgOrdering,
+    PkgPoisoned,
+    PkgBlind,
+    PkgRace,
+    PkgFallback,
+    GlobalOrdering,
+    GlobalPoisoned,
+    GlobalBlind,
+    GlobalRace,
+    GlobalFallback,
+}
+
+const REACH_SLOTS: usize = 19;
+
+/// `(label, what exactly one execution counts)` — in `R`'s declaration order.
+const REACH_METER: [(&str, &str); REACH_SLOTS] = [
+    (
+        "DURABILITY",
+        "acked upload compared against a bucket's bytes",
+    ),
+    (
+        "VISIBILITY",
+        "stored artifact checked against that bucket's view",
+    ),
+    (
+        "CONSERVATION",
+        "acked file with no authorized removal traced",
+    ),
+    (
+        "CONVERGENCE",
+        "bucket pair compared with real truth/views present",
+    ),
+    ("LIVENESS", "heal phase that had protocol debris to drain"),
+    (
+        "VERIFY",
+        "bucket with non-empty truth re-rendered by verify_storage",
+    ),
+    (
+        "ACK_TOTALITY",
+        "ack weighed against >=1 peer bucket at the 200",
+    ),
+    ("TOMBSTONE_MONOTONICITY", "acked-deleted filename checked"),
+    (
+        "DETERMINISM",
+        "seed re-executed, trace + final world compared",
+    ),
+    (
+        "classifier/pkg TEST 1 ordering",
+        "unreflected mutation tested for a covering breadcrumb",
+    ),
+    (
+        "classifier/pkg TEST 2a poisoned",
+        "repair whose final view writer had both truth and mutations",
+    ),
+    (
+        "classifier/pkg TEST 2b blind",
+        "covered mutation tested for all-blind consumption",
+    ),
+    (
+        "classifier/pkg TEST 3 race",
+        "older view write by another op tested for being fresher",
+    ),
+    ("classifier/pkg FALLBACK", "repair no test above explained"),
+    (
+        "classifier/global TEST 1 ordering",
+        "unreflected mutation tested for a covering breadcrumb",
+    ),
+    (
+        "classifier/global TEST 2a poisoned",
+        "flip whose final global writer had derived the name",
+    ),
+    (
+        "classifier/global TEST 2b blind",
+        "covered mutation tested for all-blind consumption",
+    ),
+    (
+        "classifier/global TEST 3 race",
+        "older global write by another op tested for being fresher",
+    ),
+    ("classifier/global FALLBACK", "flip no test above explained"),
+];
+
+/// Zeros that are a known property of the harness or the product, not a hole.
+/// `--require-reach` skips exactly these; every other oracle must execute. An
+/// entry here is a claim someone has to defend in dev/TESTING.md — and if one
+/// starts executing, the meter says so and the entry comes out.
+const EXPECTED_ZERO: [(usize, &str); 10] = [
+    (
+        R::PkgOrdering as usize,
+        "product has never produced a class-1; `--break ordering` reaches it",
+    ),
+    (
+        R::PkgPoisoned as usize,
+        "needs an audit-repaired package view; the fast path converges them all",
+    ),
+    (
+        R::PkgBlind as usize,
+        "needs an audit-repaired package view TEST 1 did not explain",
+    ),
+    (
+        R::PkgRace as usize,
+        "harness-unreachable: tick_lock serializes rebuilds (dev/TESTING.md)",
+    ),
+    (
+        R::PkgFallback as usize,
+        "reached only by a repair no test explains — that is a classifier bug",
+    ),
+    (
+        R::GlobalOrdering as usize,
+        "product has never produced a class-1; `--break globalindex` reaches it",
+    ),
+    (
+        R::GlobalPoisoned as usize,
+        "needs an audit-repaired global membership flip; none observed",
+    ),
+    (
+        R::GlobalBlind as usize,
+        "needs a global flip TEST 1 did not explain",
+    ),
+    (
+        R::GlobalRace as usize,
+        "harness-unreachable: tick_lock serializes rebuilds (dev/TESTING.md)",
+    ),
+    (
+        R::GlobalFallback as usize,
+        "reached only by a flip no test explains — that is a classifier bug",
+    ),
+];
+
+struct Reach {
+    slots: [AtomicU64; REACH_SLOTS],
+    /// Worst heal rounds, and worst drain passes inside one round, any seed used.
+    peak_rounds: AtomicU64,
+    peak_drains: AtomicU64,
+    /// True once any explored profile had more than one bucket.
+    multi_bucket: AtomicBool,
+}
+
+static REACH: Reach = Reach {
+    slots: [const { AtomicU64::new(0) }; REACH_SLOTS],
+    peak_rounds: AtomicU64::new(0),
+    peak_drains: AtomicU64::new(0),
+    multi_bucket: AtomicBool::new(false),
+};
+
+impl Reach {
+    fn hit(&self, slot: R) {
+        self.slots[slot as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    fn peak(cell: &AtomicU64, observed: u64) {
+        cell.fetch_max(observed, Ordering::Relaxed);
+    }
+}
+
+/// Why a zero reading on `slot` is expected. Topology first: a single-bucket
+/// sample cannot reach the two replication oracles, and calling that a hole
+/// would train everyone to ignore the gate.
+fn expected_zero(slot: usize, multi_bucket: bool) -> Option<&'static str> {
+    if !multi_bucket && (slot == R::Convergence as usize || slot == R::AckTotality as usize) {
+        return Some("single-bucket sample — the oracle needs >1 bucket");
+    }
+    EXPECTED_ZERO
+        .iter()
+        .find(|(s, _)| *s == slot)
+        .map(|(_, why)| *why)
+}
+
+/// Print the table and return the oracles that never executed and had no
+/// standing excuse — what `--require-reach` fails on.
+fn report_reach(explored: u64, brk: Break) -> Vec<&'static str> {
+    let multi = REACH.multi_bucket.load(Ordering::Relaxed);
+    let mut unreached = Vec::new();
+    println!(
+        "vopr: oracle reach over {explored} seeds — executions on NON-TRIVIAL input \
+         (a zero means that oracle verified nothing):"
+    );
+    for (slot, (label, unit)) in REACH_METER.iter().enumerate() {
+        let hits = REACH.slots[slot].load(Ordering::Relaxed);
+        let note = match (hits, expected_zero(slot, multi)) {
+            (0, Some(why)) => format!("  [zero, expected: {why}]"),
+            (0, None) => {
+                unreached.push(*label);
+                "  [ZERO — NEVER EXECUTED]".to_string()
+            }
+            // A break exists to reach an oracle, so say so rather than demand
+            // the list be edited on the strength of a deliberate defect.
+            (_, Some(_)) if brk != Break::None => "  [reached under --break]".to_string(),
+            (_, Some(_)) => "  [now reached — drop it from EXPECTED_ZERO]".to_string(),
+            (_, None) => String::new(),
+        };
+        println!("  {label:<35} {hits:>10}  {unit}{note}");
+    }
+    let rounds = REACH.peak_rounds.load(Ordering::Relaxed);
+    let drains = REACH.peak_drains.load(Ordering::Relaxed);
+    println!(
+        "  quiesce headroom: worst seed used {rounds}/{HEAL_ROUNDS} heal rounds ({} spare) and \
+         {drains}/{DRAIN_PASSES} drain passes in a round ({} spare) — LIVENESS is a boolean, so \
+         a budget with no margin left silently passes a livelock",
+        HEAL_ROUNDS.saturating_sub(rounds),
+        DRAIN_PASSES.saturating_sub(drains),
+    );
+    unreached
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,6 +1382,7 @@ fn ack_totality_failures(
     if buckets.len() < 2 {
         return Vec::new();
     }
+    REACH.hit(R::AckTotality);
     let akey = format!("packages/{pkg}/{fname}");
     let mkey = format!("{akey}.meta.json");
     let selected_keys = buckets[selected].keys();
@@ -1350,9 +1599,21 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
     let mut audit_view_repairs: u64 = 0;
     let mut repairs_by_class: [u64; 3] = [0; 3]; // [ordering, premature, race]
     let mut last_fingerprint: Option<Vec<BTreeMap<String, Vec<u8>>>> = None;
-    for round in 0..12 {
+    // LIVENESS is a boolean, so a run with nothing to drain would "pass" it
+    // having checked nothing; it counts as executed only when quiescence had
+    // real work to do. Sampled here, before the first drain pass — the loop's
+    // own `markers_left` runs *after* a full pass across every node and so can
+    // never see the debris that pass just cleared. Raw `dump()`, never a
+    // `FaultView`: no op-sequence number, no rng draw, no trace event.
+    let mut saw_debris = fleet.buckets.iter().any(|bucket| {
+        bucket
+            .dump()
+            .keys()
+            .any(|k| k.starts_with("_dirty/") || k.starts_with("_repl/"))
+    });
+    for round in 0..HEAL_ROUNDS {
         // Drain markers across every node until none remain (bounded).
-        for _ in 0..20 {
+        for pass in 0..DRAIN_PASSES {
             for node in 0..nodes {
                 let state = fleet.nodes[node].state.clone();
                 let pinned = state.pin();
@@ -1388,6 +1649,8 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                     .keys()
                     .any(|k| k.starts_with("_dirty/") || k.starts_with("_repl/"))
             });
+            saw_debris |= markers_left;
+            Reach::peak(&REACH.peak_drains, pass + 1);
             if !markers_left {
                 break;
             }
@@ -1406,7 +1669,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
         // reproduces exactly — and exercises the leadership handoff a crash
         // forces in production. Auditing every node in turn each round would
         // N-times the heal cost for coverage a soak already gets from rotation.
-        let leader_idx = (seed.wrapping_add(round as u64) % nodes as u64) as usize;
+        let leader_idx = (seed.wrapping_add(round) % nodes as u64) as usize;
         // The lost-copy backstop first: the tree diff converges truth a
         // crashed fan-out left behind and brackets its work in markers...
         let leader = fleet.nodes[leader_idx].state.clone();
@@ -1647,11 +1910,16 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
             dump.keys()
                 .any(|k| k.starts_with("_dirty/") || k.starts_with("_repl/"))
         });
+        saw_debris |= markers_left;
+        Reach::peak(&REACH.peak_rounds, round + 1);
         if !markers_left && last_fingerprint.as_ref() == Some(&snapshot) {
             quiesced = true;
             break;
         }
         last_fingerprint = Some(snapshot);
+    }
+    if saw_debris {
+        REACH.hit(R::Liveness);
     }
 
     // ---- Invariants. The ledger stays unlocked until the last await is behind
@@ -1693,6 +1961,9 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
     // against the raw `SimStorage` — never the traced `FaultView` — so it
     // consumes no op-sequence numbers and cannot shift the fault schedule.
     for (idx, bucket) in fleet.buckets.iter().enumerate() {
+        if dumps[idx].keys().any(|k| k.starts_with("packages/")) {
+            REACH.hit(R::Verify); // an empty bucket re-renders nothing to diff
+        }
         match pypiron::verify::verify_storage(bucket.as_ref()).await {
             Ok(report) => violations.extend(report.divergences.into_iter().map(|d| {
                 format!(
@@ -1761,6 +2032,11 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
         let first = project(&dumps[0]);
         for (idx, dump) in dumps.iter().enumerate().skip(1) {
             let other = project(dump);
+            // `project` always inserts the synthetic name-set key, so a pair of
+            // empty buckets compares equal having compared nothing.
+            if first.len() > 1 || other.len() > 1 {
+                REACH.hit(R::Convergence);
+            }
             if other != first {
                 let diff: Vec<&String> = first
                     .keys()
@@ -1802,6 +2078,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
             if ledger.deleted.contains(&(pkg.clone(), fname.clone())) || tomb || frozen {
                 continue; // authorized removal or conflict freeze
             }
+            REACH.hit(R::Durability);
             match dump.get(&akey) {
                 None => violations.push(format!(
                     "DURABILITY: acked {akey} missing on bucket {bucket_idx}"
@@ -1815,6 +2092,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                             "DURABILITY: acked {akey} lost its sidecar on bucket {bucket_idx}"
                         ));
                     }
+                    REACH.hit(R::Visibility);
                     let view = dump
                         .get(&format!("simple/{pkg}/index.json"))
                         .map(|b| String::from_utf8_lossy(b).into_owned())
@@ -1833,11 +2111,12 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
         // compromised-artifact removal path — a silent resurrection passes every
         // other oracle here, since `ledger.deleted` is only ever an exemption.
         for ((pkg, fname), deleted_last) in &ledger.last_ack_deleted {
+            if !*deleted_last {
+                continue; // a live filename says nothing about resurrection
+            }
+            REACH.hit(R::Tombstone);
             let akey = format!("packages/{pkg}/{fname}");
-            if *deleted_last
-                && dump.contains_key(&akey)
-                && !dump.contains_key(&format!("{akey}.tombstone"))
-            {
+            if dump.contains_key(&akey) && !dump.contains_key(&format!("{akey}.tombstone")) {
                 violations.push(format!(
                     "TOMBSTONE_MONOTONICITY: {akey} was acked-deleted (204) but bucket \
                      {bucket_idx} holds the artifact with no .tombstone — a deleted filename \
@@ -1860,6 +2139,9 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                 });
             if removal_authorized {
                 continue;
+            }
+            if bucket_idx == 0 {
+                REACH.hit(R::Conservation); // the fleet-wide scan below runs once
             }
             let survives = dump.values().any(|stored| stored == body);
             if !survives && bucket_idx == 0 {
@@ -2188,6 +2470,7 @@ fn analyze(live: &[&Effect], boundary: u64, bucket: usize, pkg: &str) -> RepairF
     // TEST 1 — ORDERING: an unreflected mutation with no live breadcrumb over
     // it. Nothing durable could have told the system to rebuild.
     for m in &unseen {
+        REACH.hit(R::PkgOrdering);
         if covering(&intervals, m.seq).is_empty() {
             return finding(
                 1,
@@ -2200,16 +2483,19 @@ fn analyze(live: &[&Effect], boundary: u64, bucket: usize, pkg: &str) -> RepairF
     }
     // TEST 2a — poisoned derivation: the final view op listed truth past every
     // mutation, yet the view it wrote still disagrees with that truth.
-    if !view_writes.is_empty() && unseen.is_empty() && !mutations.is_empty() {
-        return finding(
-            2,
-            format!(
-                "op {} listed truth@{} and wrote the final view@{}, yet the view disagrees with that truth — a poisoned derivation consumed the signal",
-                att_f,
-                opt(l_f),
-                v_f
-            ),
-        );
+    if !view_writes.is_empty() && !mutations.is_empty() {
+        REACH.hit(R::PkgPoisoned);
+        if unseen.is_empty() {
+            return finding(
+                2,
+                format!(
+                    "op {} listed truth@{} and wrote the final view@{}, yet the view disagrees with that truth — a poisoned derivation consumed the signal",
+                    att_f,
+                    opt(l_f),
+                    v_f
+                ),
+            );
+        }
     }
     // TEST 2b — blind consumption: every breadcrumb covering an unreflected
     // mutation was retired by a consumer that had already listed truth (or
@@ -2219,6 +2505,7 @@ fn analyze(live: &[&Effect], boundary: u64, bucket: usize, pkg: &str) -> RepairF
         if cov.is_empty() {
             continue;
         }
+        REACH.hit(R::PkgBlind);
         if all_blind(live, bucket, pkg, &cov, m.seq) {
             return finding(
                 2,
@@ -2235,6 +2522,7 @@ fn analyze(live: &[&Effect], boundary: u64, bucket: usize, pkg: &str) -> RepairF
     for g in &view_writes {
         if g.seq < v_f && g.att != att_f {
             if let Some(l_g) = l_of(live, bucket, pkg, g.att, g.seq) {
+                REACH.hit(R::PkgRace);
                 if l_f.is_none_or(|lf| l_g > lf) {
                     return finding(
                         3,
@@ -2250,6 +2538,7 @@ fn analyze(live: &[&Effect], boundary: u64, bucket: usize, pkg: &str) -> RepairF
     // FALLBACK — unexplained drift is conservatively premature-consumption: an
     // unexplained repair is a protocol or classifier bug, and either must fail
     // the seed rather than hide. Dump this view's effects to make it diagnosable.
+    REACH.hit(R::PkgFallback);
     let dump: Vec<String> = live
         .iter()
         .filter(|e| e.bucket == bucket && e.pkg == pkg)
@@ -2328,6 +2617,7 @@ fn analyze_global(live: &[&Effect], boundary: u64, bucket: usize, name: &str) ->
     // live breadcrumb over it. Nothing durable could have told a tick to
     // rebuild this package, so nothing could have computed the name delta.
     for m in &unseen {
+        REACH.hit(R::GlobalOrdering);
         if covering(&intervals, m.seq).is_empty() {
             return finding(
                 1,
@@ -2340,14 +2630,17 @@ fn analyze_global(live: &[&Effect], boundary: u64, bucket: usize, name: &str) ->
     }
     // TEST 2a — poisoned derivation: a global write did re-derive this name
     // past every mutation, called it `claimed`, and was still wrong.
-    if !derivations.is_empty() && unseen.is_empty() && !mutations.is_empty() {
-        return finding(
-            2,
-            format!(
-                "op {att_f} rebuilt {name} from truth@{} and wrote the global index@{v_f} claiming it {claimed}, yet the audit had to flip that membership — update_global_index consumed the signal without applying it",
-                opt(l_f)
-            ),
-        );
+    if !derivations.is_empty() && !mutations.is_empty() {
+        REACH.hit(R::GlobalPoisoned);
+        if unseen.is_empty() {
+            return finding(
+                2,
+                format!(
+                    "op {att_f} rebuilt {name} from truth@{} and wrote the global index@{v_f} claiming it {claimed}, yet the audit had to flip that membership — update_global_index consumed the signal without applying it",
+                    opt(l_f)
+                ),
+            );
+        }
     }
     // TEST 2b — blind consumption: every breadcrumb covering an unreflected
     // mutation was retired without acting on it, so no delta was ever computed.
@@ -2356,6 +2649,7 @@ fn analyze_global(live: &[&Effect], boundary: u64, bucket: usize, name: &str) ->
         if cov.is_empty() {
             continue;
         }
+        REACH.hit(R::GlobalBlind);
         if all_blind(live, bucket, name, &cov, m.seq) {
             return finding(
                 2,
@@ -2370,21 +2664,25 @@ fn analyze_global(live: &[&Effect], boundary: u64, bucket: usize, name: &str) ->
     // from strictly older truth than an earlier write it overwrote — the same
     // unleased-rebuild clobber the audit backs up, one level up in the tree.
     for (g, l_g) in &derivations {
-        if g.seq < v_f && g.att != att_f && l_f.is_none_or(|lf| *l_g > lf) {
-            return finding(
-                3,
-                format!(
-                    "unleased concurrent rebuild: global write@{v_f} (op {att_f}, derived {name} from truth@{}, claimed {claimed}) overwrote fresher global write@{} (op {}, derived @{l_g})",
-                    opt(l_f),
-                    g.seq,
-                    g.att
-                ),
-            );
+        if g.seq < v_f && g.att != att_f {
+            REACH.hit(R::GlobalRace);
+            if l_f.is_none_or(|lf| *l_g > lf) {
+                return finding(
+                    3,
+                    format!(
+                        "unleased concurrent rebuild: global write@{v_f} (op {att_f}, derived {name} from truth@{}, claimed {claimed}) overwrote fresher global write@{} (op {}, derived @{l_g})",
+                        opt(l_f),
+                        g.seq,
+                        g.att
+                    ),
+                );
+            }
         }
     }
     // FALLBACK — unexplained drift is conservatively premature-consumption, as
     // in `analyze`. Dump this name's truth history *and* the bucket's global
     // writes with the sets they claimed, since either side can be the bug.
+    REACH.hit(R::GlobalFallback);
     let dump: Vec<String> = live
         .iter()
         .filter(|e| e.bucket == bucket && (e.pkg == name || e.kind == EffectKind::GlobalWrite))
@@ -2488,6 +2786,11 @@ struct Args {
     /// Deliberate defect to inject (`--break`), for mutation-testing the
     /// oracles. `Break::None` in every ordinary run.
     brk: Break,
+    /// Fail the run when an oracle recorded zero executions over the sample
+    /// (see `EXPECTED_ZERO`). Off by default — a small sample legitimately
+    /// misses oracles, and a gate that cries wolf gets ignored. Wire it only
+    /// where the sample is big enough to mean something.
+    require_reach: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2614,6 +2917,7 @@ fn parse_args() -> Args {
         max_secs: None,
         rotate: false,
         brk: Break::None,
+        require_reach: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -2661,6 +2965,7 @@ fn parse_args() -> Args {
             "--forever" => args.forever = true,
             "--max-secs" => args.max_secs = Some(grab()),
             "--rotate" => args.rotate = true,
+            "--require-reach" => args.require_reach = true,
             "--verbose" => {}
             other => panic!("unknown flag {other} (see examples/vopr.rs)"),
         }
@@ -2715,6 +3020,9 @@ fn main() {
         let seed = args.start_seed + explored;
         explored += 1;
         let profile = profile_for(seed, &args);
+        if profile.buckets > 1 {
+            REACH.multi_bucket.store(true, Ordering::Relaxed);
+        }
         let mut outcome = run_once(seed, &profile, false);
         dump_trace(&outcome);
         total_events += outcome.trace_events;
@@ -2729,6 +3037,9 @@ fn main() {
         }
         if args.recheck_every > 0 && seed.is_multiple_of(args.recheck_every) {
             let again = run_once(seed, &profile, true);
+            if outcome.trace_events > 0 {
+                REACH.hit(R::Determinism); // an empty trace compares nothing
+            }
             if again.trace_hash != outcome.trace_hash {
                 eprintln!(
                     "vopr: DETERMINISM VIOLATION seed={seed}: trace {:#x} vs {:#x}",
@@ -2837,10 +3148,21 @@ fn main() {
             )
         }
     );
+    let unreached = report_reach(explored, args.brk);
     if !determinism_violations.is_empty() {
         std::process::exit(3);
     }
     if !failed_seeds.is_empty() {
         std::process::exit(2);
+    }
+    if args.require_reach && !unreached.is_empty() {
+        eprintln!(
+            "vopr: --require-reach FAILED — {} oracle(s) never executed over {explored} seeds: \
+             {unreached:?}. An oracle that verified nothing is a defect report, not a pass: \
+             either the workload cannot reach it (widen it), or it is unreachable and belongs \
+             in EXPECTED_ZERO with a reason.",
+            unreached.len()
+        );
+        std::process::exit(4);
     }
 }

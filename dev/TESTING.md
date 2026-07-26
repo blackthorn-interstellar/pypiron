@@ -474,6 +474,99 @@ converges views without the audit on essentially every schedule this simulator
 can build. So the honest status is "this harness cannot stage the race", not "the
 product does not have it", which is why the class-2 hit above matters so much.
 
+### Proving the oracles ran at all (the reach meter)
+
+`--break` proves an oracle *can* go red. It says nothing about whether that
+oracle evaluates anything on an ordinary night — and from the outside, an oracle
+that checked nothing is indistinguishable from one that held. This harness
+shipped that failure twice: the audit-repair classifier was documented right
+here as a CI-enforced three-class taxonomy while its class-3 arm had never
+executed once, and a later batch added oracles with no evidence they could fire
+either. Both times, establishing the truth cost a human hand-running six figures
+of seeds across five lanes. It is now a number the binary prints on every run:
+
+```
+vopr: oracle reach over 14690 seeds — executions on NON-TRIVIAL input (a zero means that oracle verified nothing):
+  DURABILITY                               76257  acked upload compared against a bucket's bytes
+  VISIBILITY                               76257  stored artifact checked against that bucket's view
+  ...
+  classifier/pkg TEST 3 race                   0  older view write by another op tested for being fresher  [zero, expected: harness-unreachable: tick_lock serializes rebuilds (dev/TESTING.md)]
+  quiesce headroom: worst seed used 3/12 heal rounds (9 spare) and 2/20 drain passes in a round (18 spare)
+```
+
+**"Executed" deliberately does not mean "its code was reached."** DURABILITY
+looping over an empty ledger is not an execution; DURABILITY comparing one
+acknowledged upload against a bucket's bytes is. A counter that ticked once per
+invariant block would read healthy on a run that verified nothing — the exact
+failure being closed — so every counter's unit is spelled out in `REACH_METER`
+and printed beside its number. That definition *is* the meter; change a unit and
+you have changed what the gate means.
+
+The classifier is counted **per arm** — TEST 1 / TEST 2a / TEST 2b / TEST 3 /
+FALLBACK, separately for the per-package and the global analysis. Per-arm
+granularity is the whole point: a single "classifier ran" counter would have read
+healthy for the entire life of the class-3 hole.
+
+Same perturbation rule as any oracle, and for the same reason: every hit is a
+relaxed atomic increment over data the run already computed — no rng draw, no
+await, no storage op, nothing through `FaultView`. Verified the way this document
+demands, not asserted: over five profiles × 5,000 seeds with `src/` pinned at
+`fae38a2` and only `examples/vopr.rs` differing, storage-op interleavings, acked
+uploads, ack-totality misses and audit repairs are identical to the digit, and
+`VOPR_TRACE_FILE` dumps for 24 (seed, profile) pairs are byte-identical.
+
+**What it says today.** Over 330 seconds across all five profiles — 140,334
+seeds — every one of the nine invariant oracles executes, on every profile whose
+topology admits it: DURABILITY and VISIBILITY 76,257 times on the rotating
+profile alone, TOMBSTONE_MONOTONICITY 88,405, VERIFY 32,443, ACK_TOTALITY
+51,845, CONVERGENCE 16,284, LIVENESS 16,060, CONSERVATION 39,944, DETERMINISM
+1,469. **All ten classifier arms read zero** — both analyses, every test. That is
+not new breakage; it is the same fact the class-3 investigation established, now
+printed rather than excavated. The classifier only runs when the tier-3 audit had
+to repair a view, and the fast path converged every schedule in the sample (0
+audit repairs in 140k seeds). `--break ordering` reaches per-package TEST 1;
+`--break globalindex` reaches both TEST 1s. Nothing reaches TEST 2a, TEST 2b,
+TEST 3 or the FALLBACK on either analysis — so ~310 lines of classifier are
+carried on the strength of two arms, and the honest read is that the taxonomy is
+a diagnosis tool for a rare event, not a routinely-exercised gate.
+
+`--require-reach` makes a zero a **failing run** (exit 4), so CI can assert that
+every oracle ran rather than merely that none complained. It is off by default —
+a small sample legitimately misses oracles, and a gate that cries wolf gets
+ignored — and wired only into the nightly matrix, where each profile draws
+50,000 seeds. The gate itself is falsifiable: `--ops 0 --require-reach` reds with
+all nine invariants listed.
+
+Zeros that are a known property rather than a hole live in `EXPECTED_ZERO`, and
+each is a claim someone has to defend here:
+
+| reads zero | why | reached by |
+|---|---|---|
+| CONVERGENCE, ACK_TOTALITY | need more than one bucket; excused automatically, and only, when every profile in the sample was single-bucket | any multi-bucket profile |
+| classifier/pkg TEST 1 | the product has never produced a class-1 ORDERING repair | `--break ordering`, `--break globalindex` |
+| classifier/global TEST 1 | same, on global membership | `--break globalindex` |
+| classifier/{pkg,global} TEST 3 | *harness*-unreachable: `tick_lock` serializes rebuilds, so two never overlap (see the class-3 paragraph above) | nothing today |
+| classifier/{pkg,global} TEST 2a, TEST 2b | need an audit repair the earlier test did not explain; the fast path converged every schedule sampled | nothing today |
+| classifier/{pkg,global} FALLBACK | reached only by drift no test explains — which would itself be a classifier bug | nothing today |
+
+An entry earning its first execution is *news*, not a failure: the run prints
+`[now reached — drop it from EXPECTED_ZERO]` beside it, and the entry comes out.
+Under `--break` the note reads `[reached under --break]` instead, because
+reaching an oracle is what a break is for.
+
+The last line is **quiesce headroom**. LIVENESS is a boolean, so an over-generous
+drain budget converts a livelock bug into a pass with nothing to show for it. The
+run therefore reports the worst rounds-to-quiesce any seed actually needed
+against the `HEAL_ROUNDS` budget, and the worst drain passes inside one round
+against `DRAIN_PASSES`. Over 330 seconds across all five profiles — 140,334
+seeds, 174M storage-op interleavings — the worst seed used **3 of 12** heal
+rounds and **2 of 20** drain passes. Two is the floor for rounds (the fixpoint
+test needs a repeat round to confirm), so the observed spread is 2–3 against a
+budget of 12: a 4x margin, and drain passes barely touched because the first pass
+sweeps every node before the loop re-checks. That is a lot of slack for a boolean
+to hide in, and it is now visible — if a change pushes the peak toward the budget,
+the number moves rounds before the oracle does.
+
 ## Real cloud backends
 
 The emulators (MinIO, Azurite) are fast and hermetic but not the real thing, and
@@ -543,7 +636,7 @@ execution, working `-s`, and pdb.
 |---|---|
 | Every PR (CI) | fmt, clippy `-D warnings`, Rust unit, model checking (bounded configs) + conformance suites, VOPR smoke (fault + crash-only + rotating profiles), blackbox on disk + S3 (MinIO) + Azure (Azurite), `cargo-audit`, fuzz-target build smoke |
 | Push to `master` (CI) | all of the above, plus the real-GCS blackbox (when the bucket secret is configured) |
-| Nightly | coverage-guided fuzzing (all six targets); deterministic simulation at volume + deep model configs (simulation.yml, counters published per run) |
+| Nightly | coverage-guided fuzzing (all six targets); deterministic simulation at volume + deep model configs (simulation.yml, counters and the oracle-reach gate published per run) |
 | Weekly | client compat matrix, full-PyPI corpus check, unit-test coverage, real-S3 blackbox (when the bucket secret is configured) |
 | Local / opt-in | `perf` and `stress` (release binary, excluded from default runs) |
 

@@ -217,8 +217,8 @@ def _project_status(minio, bucket: str, pkg: str) -> dict:
     return json.loads(minio_get_key_in(minio, bucket, f"packages/{pkg}/.project-status.json"))
 
 
-def _assert_mirror_publish_order(faults, bucket: str, artifact_key: str) -> None:
-    """Sidecar must be durable, then origin fenced, before artifact publish."""
+def _publish_order(faults, bucket: str, artifact_key: str):
+    """(artifact PUT index, sidecar PUT indices, pre-artifact origin GET indices)."""
     requests = faults.requests()
 
     def indices(method: str, key: str) -> list[int]:
@@ -233,16 +233,48 @@ def _assert_mirror_publish_order(faults, bucket: str, artifact_key: str) -> None
     artifact_puts = indices("PUT", artifact_key)
     assert artifact_puts, f"no artifact PUT recorded for {bucket}/{artifact_key}"
     artifact_put = artifact_puts[0]
-    sidecar_puts = [
-        index for index in indices("PUT", f"{artifact_key}.meta.json") if index < artifact_put
-    ]
     pkg = artifact_key.split("/", 2)[1]
     origin_gets = [
         index for index in indices("GET", f"packages/{pkg}/.origin") if index < artifact_put
     ]
-    assert sidecar_puts, "mirror sidecar was not written before the artifact"
     assert origin_gets, "origin was not re-read before the artifact"
-    assert max(sidecar_puts) < max(origin_gets) < artifact_put
+    return artifact_put, indices("PUT", f"{artifact_key}.meta.json"), origin_gets
+
+
+def _assert_mirror_upload_publish_order(faults, bucket: str, artifact_key: str) -> None:
+    """A `sync --to` upload: origin fenced, then bytes, then the sidecar.
+
+    `src/publish.rs`: "Ordering invariant: artifact, then sidecars, then index
+    job." A sidecar is this bucket's assertion that the filename IS truth with
+    that sha256, and nothing downstream re-hashes a stored body to check it —
+    the merge compares sidecar shas. Published ahead of its bytes it stands over
+    a key any concurrent writer can still take, so an upload that then aborts (a
+    fenced 409, a crash) leaves the bucket asserting one sha over another's
+    bytes, permanently and invisibly.
+
+    The sidecar still lands ahead of the post-artifact fences, so an upload
+    refused after its bytes are down leaves a *typed* mirror loser that private
+    precedence can quarantine — never bare bytes a later private claim would
+    launder (the hazard `proxy.rs` types its cache fills up front to avoid).
+    """
+    artifact_put, sidecar_puts, origin_gets = _publish_order(faults, bucket, artifact_key)
+    after = [index for index in sidecar_puts if index > artifact_put]
+    assert after, "mirror sidecar was not written after the artifact"
+    assert max(origin_gets) < artifact_put < min(after)
+
+
+def _assert_proxy_fill_publish_order(faults, bucket: str, artifact_key: str) -> None:
+    """A proxy cache fill: sidecar durable, then origin fenced, then the artifact.
+
+    The opposite order from an upload, and deliberately so (`src/proxy.rs`): a
+    fill has no immutable create it can lose to itself, and "an orphan sidecar
+    is inert; an orphan artifact would be backfilled from a later private
+    package claim and launder public bytes into private truth".
+    """
+    artifact_put, sidecar_puts, origin_gets = _publish_order(faults, bucket, artifact_key)
+    before = [index for index in sidecar_puts if index < artifact_put]
+    assert before, "mirror-cache sidecar was not written before the artifact"
+    assert max(before) < max(origin_gets) < artifact_put
 
 
 def _seed_private_record(minio, bucket: str, pkg: str, filename: str, body: str) -> None:
@@ -1444,7 +1476,7 @@ def test_partitioned_project_status_converges_and_clear_advances_epoch(s3_server
         )
 
 
-def test_legacy_mirror_upload_publishes_sidecar_before_artifact(s3_servers_multi, tmp_path):
+def test_legacy_mirror_upload_publishes_its_bytes_before_the_sidecar(s3_servers_multi, tmp_path):
     cluster = s3_servers_multi
     server = cluster["left"]
     bucket = cluster["minio"]["buckets"][0]
@@ -1463,7 +1495,7 @@ def test_legacy_mirror_upload_publishes_sidecar_before_artifact(s3_servers_multi
         fields={"mirror": "true", "upload_time": "2020-01-01T00:00:00Z"},
     )
 
-    _assert_mirror_publish_order(
+    _assert_mirror_upload_publish_order(
         server["faults"],
         bucket,
         f"packages/{pkg}/{wheel.name}",
@@ -1504,7 +1536,7 @@ def test_proxy_fill_vs_private_upload_demotes_and_quarantines(s3_servers_multi_p
         private_fill.result(timeout=40)
     assert code == 200
     assert hashlib.sha256(body).hexdigest() == hashlib.sha256(mirror_wheel.read_bytes()).hexdigest()
-    _assert_mirror_publish_order(
+    _assert_proxy_fill_publish_order(
         cluster["right"]["faults"],
         b,
         f"packages/{pkg}/{mirror_wheel.name}",

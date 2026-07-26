@@ -827,8 +827,9 @@ async fn copy_live(
     let companions = read_source_companions(src, &akey, record).await?;
     // When the boot matrix says this destination can pull this source
     // server-side, that is the artifact transport; on any miss the ladder falls
-    // through to streaming. The sidecar installed below — before the artifact —
-    // is the divergence gate in both cases, so a competing body is caught there.
+    // through to streaming. Only that transport publishes the sidecar as its
+    // divergence gate — its copy verb has no create-if-absent, so a pre-check is
+    // the only gate it can have. Every streamed record lands its bytes first.
     let copy_origin = copy_transport(state, src, dst);
     // Stream transport reads + sha-verifies the source bytes *before* the first
     // destination mutation, so a bad source never publishes a sidecar. The copy
@@ -853,11 +854,12 @@ async fn copy_live(
     } else {
         ensure_private_origin(dst, pkg).await?;
     }
-    // Artifact leg first whenever this node already holds the sha-verified bytes
-    // and the record is private truth. The destination's immutable create is a
-    // strictly stronger gate than its sidecar: nothing can land a body under a
-    // key we already own, so the sidecar installed after it can only ever
-    // describe bytes this bucket holds.
+    // Artifact leg first whenever this node already holds the sha-verified
+    // bytes — private truth and a `sync --to` snapshot alike, since the stream
+    // transport verifies both before the first destination mutation. The
+    // destination's immutable create is a strictly stronger gate than its
+    // sidecar: nothing can land a body under a key we already own, so the
+    // sidecar installed after it can only ever describe bytes this bucket holds.
     //
     // Published the other way round, the sidecar stands over a key a concurrent
     // writer can still take — a publish on that bucket during a partition wins
@@ -873,7 +875,7 @@ async fn copy_live(
     // verified bytes under the claim made above, so the fabrication names the
     // same sha and the same-sha sidecar merge settles the metadata — the same
     // window the upload path has always had between its artifact and sidecar.
-    if let (false, Some(bytes)) = (is_mirror, streamed.take()) {
+    if let Some(bytes) = streamed.take() {
         let changed =
             match artifact_leg(state, src, dst, pkg, filename, sc, &akey, bytes, false).await? {
                 // The filename is fenced on both buckets and its bodies preserved.
@@ -881,13 +883,14 @@ async fn copy_live(
                 ArtifactLeg::Frozen => return Ok(false),
                 ArtifactLeg::Landed { changed } => changed,
             };
-        return copy_truth(dst, &akey, sc, companions, changed).await;
+        return copy_truth(dst, &akey, sc, companions, changed, is_mirror).await;
     }
 
     // Sidecar first for the server-side copy transport, whose copy verb has no
     // create-if-absent: a pre-check is the only gate it can have. A destination
     // that already holds a different-sha private body is caught here and bails
-    // before any artifact write. The mirror path keeps the same order.
+    // before any artifact write. This is the only leg that publishes its gate
+    // ahead of the bytes it names, and only because it cannot do otherwise.
     let mut changed = if is_mirror {
         install_or_verify_mirror_sidecar(dst, &sidecar_key(&akey), sc).await?
     } else {
@@ -922,13 +925,9 @@ async fn copy_live(
         }
     }
 
-    // Stream the artifact: the pre-verified bytes are gone on this path (only a
-    // mirror record or a missed server-side copy reaches here), so read and
-    // verify them now.
-    let artifact = match streamed {
-        Some(bytes) => bytes,
-        None => verify_source_artifact(src, pkg, filename, record, source).await?,
-    };
+    // Stream the artifact: only a missed server-side copy reaches here, and that
+    // transport never pre-verified the bytes, so read and verify them now.
+    let artifact = verify_source_artifact(src, pkg, filename, record, source).await?;
     Ok(
         match artifact_leg(state, src, dst, pkg, filename, sc, &akey, artifact, true).await? {
             ArtifactLeg::Frozen => false,
@@ -945,8 +944,13 @@ async fn copy_truth(
     sc: &Sidecar,
     companions: Companions,
     mut changed: bool,
+    is_mirror: bool,
 ) -> Result<bool> {
-    changed |= install_or_verify_sidecar(dst, &sidecar_key(akey), sc).await?;
+    changed |= if is_mirror {
+        install_or_verify_mirror_sidecar(dst, &sidecar_key(akey), sc).await?
+    } else {
+        install_or_verify_sidecar(dst, &sidecar_key(akey), sc).await?
+    };
     if let Some(bytes) = companions.metadata {
         changed |= put_if_absent_or_verify(
             dst,
@@ -1384,7 +1388,11 @@ async fn ensure_mirror_origin(dst: &dyn Storage, pkg: &str) -> Result<()> {
 /// mirror everywhere. Same-sha crash debris is repaired in place; a different-sha
 /// mirror body is a split-brain resolved by the freeze path, not here. Returns
 /// whether the destination sidecar changed.
-async fn install_or_verify_mirror_sidecar(
+///
+/// Shared with the `sync --to` write path (`publish::publish_record`), which
+/// faces the identical question once it has won an artifact's conditional
+/// create: a sidecar already in the slot names bytes this bucket does not have.
+pub(crate) async fn install_or_verify_mirror_sidecar(
     dst: &dyn Storage,
     key: &str,
     sidecar: &Sidecar,

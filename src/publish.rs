@@ -389,9 +389,9 @@ pub(crate) async fn legacy_upload(
 
 /// The storage-protocol core of an upload: origin observation → private-prefix
 /// and cross-origin rejects → intent marker → origin claim (with the early
-/// package-level fan-out) → mirror sidecar create → write fence → verified
-/// artifact store → mirror post-publish claim re-check → tombstone/frozen
-/// filename fence → PEP 658 metadata, PEP 740 provenance, sidecar → commit
+/// package-level fan-out) → write fence → verified artifact store → mirror
+/// sidecar → mirror post-publish claim re-check → tombstone/frozen filename
+/// fence → PEP 658 metadata, PEP 740 provenance, private sidecar → commit
 /// marker → replication fan-out → read-your-writes index wait → ack. Split out
 /// of [`legacy_upload`] so a deterministic simulator can exercise this state
 /// machine directly; the handler owns every HTTP concern above it.
@@ -594,33 +594,6 @@ pub async fn publish_record(
             "Failed to encode sidecar".to_string(),
         )
     })?;
-    if is_mirror {
-        let sc_key = sidecar_key(&key);
-        let created = storage
-            .put_if_absent(&sc_key, sc_bytes.clone(), Some("application/json"))
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to store mirror sidecar: {e}"),
-                )
-            })?;
-        if !created {
-            let existing = storage.get_bytes(&sc_key).await.map_err(|e| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to verify mirror sidecar: {e}"),
-                )
-            })?;
-            if existing != sc_bytes {
-                let _ = markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await;
-                return Err((
-                    StatusCode::CONFLICT,
-                    format!("File metadata already exists: {filename}"),
-                ));
-            }
-        }
-    }
 
     // Every multi-bucket writer consumes the exact origin observation it began
     // under, closing concurrent origin changes around its artifact write.
@@ -684,8 +657,54 @@ pub async fn publish_record(
         }
     }
 
-    // The mirror sidecar already exists. In multi-bucket mode, if demotion won
-    // after the final fence, leave the typed loser in place for private-precedence
+    // The mirror sidecar lands here: one op after the bytes it names, and ahead
+    // of every fence that can still refuse this upload. Both halves are
+    // load-bearing.
+    //
+    // After the bytes, because a sidecar is this bucket's assertion that the
+    // filename IS truth with that sha256 and nothing downstream re-hashes a body
+    // to check it — the merge compares sidecar shas. Published over a still-free
+    // immutable key it stands on an assertion the next writer silently
+    // invalidates: that writer wins the create with other bytes, and the bucket
+    // serves bytes contradicting their own published sha256, permanently.
+    //
+    // Ahead of the fences, because a mirror upload refused *after* its bytes are
+    // down must leave a typed loser, not bare bytes: private precedence
+    // quarantines and suppresses a mirror-typed record, while an untyped one
+    // would be backfilled from whatever the package claim says later (§4) and
+    // launder upstream bytes into private truth — the hazard `proxy.rs` types
+    // its cache fills up front to avoid.
+    if is_mirror {
+        // Winning the create means the key was free, so an occupied sidecar slot
+        // holds a sidecar naming bytes this bucket does not have, left by an
+        // interrupted peer. Converge it rather than refuse: refusing would ack
+        // the very lie this ordering exists to prevent. The helper is the same
+        // rule a replicated copy applies — repair debris the body contradicts,
+        // never touch private truth — so the two writers cannot disagree.
+        let sc_key = sidecar_key(&key);
+        let created = storage
+            .put_if_absent(&sc_key, sc_bytes.clone(), Some("application/json"))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to store mirror sidecar: {e}"),
+                )
+            })?;
+        if !created {
+            replicate::install_or_verify_mirror_sidecar(storage, &sc_key, &sc)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Failed to converge mirror sidecar: {e}"),
+                    )
+                })?;
+        }
+    }
+
+    // The mirror record is typed. In multi-bucket mode, if demotion won after the
+    // final fence, leave that typed loser in place for private-precedence
     // quarantine; deleting here would race a newer private body under the same
     // immutable key. Single-bucket mode cannot demote behind this writer, so the
     // shared helper returns without another storage read.
@@ -804,6 +823,9 @@ pub async fn publish_record(
         }
     }
 
+    // The private sidecar, last as it has always been — after the bytes it names
+    // and after the companions. The mirror one landed above, right behind its
+    // own bytes, for the reasons recorded there.
     if !is_mirror {
         storage
             .put_bytes(&sidecar_key(&key), sc_bytes, Some("application/json"))

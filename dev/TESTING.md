@@ -213,7 +213,9 @@ Rotation is a pure function of the seed alone, so `--seed N --rotate`
 reproduces a failure exactly — including the entity counts and the weight
 vector, which have no useful flag form. Every failure prints that command and,
 beside it, a `profile:` line with the resolved dimensions so you can read the
-shape without rerunning. A *non*-rotating run (explicit `--nodes/--buckets/…`)
+shape without rerunning. An armed `--break` rides along on that command: paste
+a line missing it and you rerun a *defect-free* world, get green, and file a
+dead oracle as flaky. A *non*-rotating run (explicit `--nodes/--buckets/…`)
 keeps the historical fixed workload — the first two package names, two files,
 the pre-swarm op mix — so the **chaos phase** of every pinned seed below is
 byte-identical to the one its comment was written against, verified with

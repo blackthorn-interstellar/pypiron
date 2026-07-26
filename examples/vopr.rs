@@ -196,30 +196,48 @@ enum Break {
 /// planted history is the only history the classifier sees for it.
 const BREAK_PKG: &str = "vopr-phantom";
 
+/// Every `--break`, spelled once. The flag parser, the usage text and the
+/// reproduce line all read this table: a second list that quietly fails to
+/// track the first is exactly how the reproduce line came to describe a
+/// different run than the one that failed.
+const BREAKS: [(&str, Break); 15] = [
+    ("view", Break::View),
+    ("fanout", Break::Fanout),
+    ("rerun", Break::Rerun),
+    ("resurrect", Break::Resurrect),
+    ("ordering", Break::Ordering),
+    ("globalindex", Break::GlobalIndex),
+    ("durability", Break::Durability),
+    ("visibility", Break::Visibility),
+    ("conserve", Break::Conserve),
+    ("diverge", Break::Diverge),
+    ("wedge", Break::Wedge),
+    ("poison", Break::Poison),
+    ("blind", Break::Blind),
+    ("race", Break::Race),
+    ("fallback", Break::Fallback),
+];
+
 impl Break {
     fn parse(name: &str) -> Break {
-        match name {
-            "none" => Break::None,
-            "view" => Break::View,
-            "fanout" => Break::Fanout,
-            "rerun" => Break::Rerun,
-            "resurrect" => Break::Resurrect,
-            "ordering" => Break::Ordering,
-            "globalindex" => Break::GlobalIndex,
-            "durability" => Break::Durability,
-            "visibility" => Break::Visibility,
-            "conserve" => Break::Conserve,
-            "diverge" => Break::Diverge,
-            "wedge" => Break::Wedge,
-            "poison" => Break::Poison,
-            "blind" => Break::Blind,
-            "race" => Break::Race,
-            "fallback" => Break::Fallback,
-            other => panic!(
-                "unknown --break {other} (view|fanout|rerun|resurrect|ordering|globalindex|\
-                 durability|visibility|conserve|diverge|wedge|poison|blind|race|fallback)"
-            ),
+        if name == "none" {
+            return Break::None;
         }
+        match BREAKS.iter().find(|(spelling, _)| *spelling == name) {
+            Some((_, brk)) => *brk,
+            None => {
+                let known: Vec<&str> = BREAKS.iter().map(|(spelling, _)| *spelling).collect();
+                panic!("unknown --break {name} ({})", known.join("|"))
+            }
+        }
+    }
+
+    /// How this break is spelled on the command line; `None` for no break.
+    fn flag(self) -> Option<&'static str> {
+        BREAKS
+            .iter()
+            .find(|(_, brk)| *brk == self)
+            .map(|(spelling, _)| *spelling)
     }
 }
 
@@ -3174,14 +3192,21 @@ fn profile_for(seed: u64, args: &Args) -> Profile {
 /// The one command that re-runs exactly this seed. A rotating profile is a
 /// pure function of the seed, so `--seed N --rotate` is complete on its own —
 /// including the entity counts and the op-weight vector, which have no useful
-/// flag form. A fixed profile has to carry its flags.
-fn reproduce_command(seed: u64, args: &Args, profile: &Profile) -> String {
-    if args.rotate {
-        return format!("cargo run --release --example vopr -- --seed {seed} --rotate");
+/// flag form. A fixed profile has to carry its flags. Either way an armed
+/// `--break` is part of the world: leave it off and the line reruns a
+/// *different*, defect-free simulation, comes back green, and the failure it
+/// was printed under gets filed as flaky.
+fn reproduce_command(seed: u64, rotate: bool, profile: &Profile) -> String {
+    let brk = match profile.brk.flag() {
+        Some(spelling) => format!(" --break {spelling}"),
+        None => String::new(),
+    };
+    if rotate {
+        return format!("cargo run --release --example vopr -- --seed {seed} --rotate{brk}");
     }
     format!(
         "cargo run --release --example vopr -- --seed {seed} --nodes {} --buckets {} \
-         --packages {} --files {} --ops {} --fail-percent {}",
+         --packages {} --files {} --ops {} --fail-percent {}{brk}",
         profile.nodes,
         profile.buckets,
         profile.packages,
@@ -3367,7 +3392,7 @@ fn main() {
                 }
                 eprintln!(
                     "reproduce: {} --recheck-every 1\nprofile: {}",
-                    reproduce_command(seed, &args, &profile),
+                    reproduce_command(seed, args.rotate, &profile),
                     profile.describe()
                 );
                 if !keep_going {
@@ -3383,7 +3408,7 @@ fn main() {
                 );
                 eprintln!(
                     "reproduce: {} --recheck-every 1\nprofile: {}",
-                    reproduce_command(seed, &args, &profile),
+                    reproduce_command(seed, args.rotate, &profile),
                     profile.describe()
                 );
                 if !keep_going {
@@ -3410,7 +3435,10 @@ fn main() {
             for violation in &outcome.violations {
                 eprintln!("  {violation}");
             }
-            eprintln!("reproduce: {}", reproduce_command(seed, &args, &profile));
+            eprintln!(
+                "reproduce: {}",
+                reproduce_command(seed, args.rotate, &profile)
+            );
             eprintln!("profile: {}", profile.describe());
             if !keep_going {
                 std::process::exit(2);
@@ -3565,5 +3593,69 @@ mod tests {
     fn a_zero_still_fails_on_its_own() {
         let (note, failed) = reach_verdict(0, 0, 50_000, None, false);
         assert!(failed && note.contains("NEVER EXECUTED"), "{note}");
+    }
+
+    fn a_profile(brk: Break) -> Profile {
+        Profile {
+            nodes: 3,
+            buckets: 3,
+            packages: 6,
+            files: 4,
+            ops: 200,
+            fail_percent: 3,
+            weights: DEFAULT_OP_WEIGHTS,
+            brk,
+        }
+    }
+
+    /// The line printed under a failing seed has to rerun the world that
+    /// failed. Drop the armed break and it reruns a defect-free simulation,
+    /// comes back green, and whoever is triaging a red kill-proof step files
+    /// the dead oracle as flaky.
+    #[test]
+    fn the_reproduce_line_carries_the_armed_break() {
+        let armed = a_profile(Break::View);
+        assert_eq!(
+            reproduce_command(60_000_000, false, &armed),
+            "cargo run --release --example vopr -- --seed 60000000 --nodes 3 --buckets 3 \
+             --packages 6 --files 4 --ops 200 --fail-percent 3 --break view"
+        );
+        // Under --rotate the seed is the whole profile — but not the break.
+        assert_eq!(
+            reproduce_command(21_000_000, true, &armed),
+            "cargo run --release --example vopr -- --seed 21000000 --rotate --break view"
+        );
+    }
+
+    /// ...and not one token more when nothing is armed: the pinned seeds in
+    /// ci.yml are pasted from this line.
+    #[test]
+    fn an_ordinary_failure_gets_an_ordinary_command() {
+        let clean = a_profile(Break::None);
+        assert_eq!(
+            reproduce_command(7384, false, &clean),
+            "cargo run --release --example vopr -- --seed 7384 --nodes 3 --buckets 3 \
+             --packages 6 --files 4 --ops 200 --fail-percent 3"
+        );
+        assert_eq!(
+            reproduce_command(7384, true, &clean),
+            "cargo run --release --example vopr -- --seed 7384 --rotate"
+        );
+    }
+
+    /// One table, so a break added to the parser cannot go missing from the
+    /// reproduce line.
+    #[test]
+    fn every_break_spells_itself_back() {
+        for (spelling, brk) in BREAKS {
+            assert!(
+                Break::parse(spelling) == brk,
+                "--break {spelling} misparsed"
+            );
+            assert_eq!(brk.flag(), Some(spelling));
+            assert!(reproduce_command(1, false, &a_profile(brk))
+                .ends_with(&format!("--break {spelling}")));
+        }
+        assert_eq!(Break::None.flag(), None);
     }
 }

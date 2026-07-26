@@ -2041,6 +2041,14 @@ struct Ledger {
     private_claimed: std::collections::BTreeSet<String>,
     /// Filenames an acknowledged (204) delete removed.
     deleted: std::collections::BTreeSet<(String, String)>,
+    /// Deletes that were AUTHORIZED per filename: issued and not refused. A
+    /// superset of `deleted` — a delete that crashed between its tombstone and
+    /// its 204 destroyed just as legitimately, and the two freeze oracles below
+    /// have to know that, because `freeze_side` can only preserve a body the
+    /// delete left standing. Counted rather than a set: a filename can be
+    /// deleted, republished and deleted again, and a later refusal (404 on a
+    /// filename already gone) must not withdraw an earlier destruction.
+    authorized_deletes: BTreeMap<(String, String), u32>,
     /// Per filename, whether the most recent *acknowledged* operation was the
     /// delete. `acked` and `deleted` are unordered sets, but resurrection is a
     /// last-writer question: re-publishing a filename after deleting it is
@@ -2065,6 +2073,15 @@ struct Ledger {
 }
 
 impl Ledger {
+    /// Whether an unrefused delete was issued for this filename — the workload
+    /// fact the freeze oracles need: bytes a delete destroyed are not bytes a
+    /// racing `freeze_side` failed to preserve.
+    fn authorized_delete(&self, pkg: &str, fname: &str) -> bool {
+        self.authorized_deletes
+            .get(&(pkg.to_string(), fname.to_string()))
+            .is_some_and(|count| *count > 0)
+    }
+
     fn record_ack(&mut self, pkg: &str, fname: &str, bucket: usize, body: Vec<u8>) {
         self.next_ack_seq += 1;
         let seq = self.next_ack_seq;
@@ -2471,15 +2488,39 @@ async fn op_delete(
     home: usize,
 ) {
     let fname = filename(&pkg, file);
-    ledger.lock().expect("ledger lock").delete_attempts += 1;
-    let pinned = write_pin(&state, home);
-    if pypiron::delete_record(&state, &pinned, &pkg, &fname)
-        .await
-        .is_ok()
     {
+        // Counted BEFORE the call and withdrawn only on a refusal: a delete
+        // that dies mid-flight (crash-only faults abort the task, so nothing
+        // after the await runs) still tombstoned and destroyed, and that is
+        // exactly the case `authorized_deletes` has to cover.
         let mut ledger = ledger.lock().expect("ledger lock");
-        ledger.deleted.insert((pkg.clone(), fname.clone()));
-        ledger.last_ack_deleted.insert((pkg, fname), true);
+        ledger.delete_attempts += 1;
+        *ledger
+            .authorized_deletes
+            .entry((pkg.clone(), fname.clone()))
+            .or_default() += 1;
+    }
+    let pinned = write_pin(&state, home);
+    match pypiron::delete_record(&state, &pinned, &pkg, &fname).await {
+        Ok(_) => {
+            let mut ledger = ledger.lock().expect("ledger lock");
+            ledger.deleted.insert((pkg.clone(), fname.clone()));
+            ledger.last_ack_deleted.insert((pkg, fname), true);
+        }
+        // A refused delete (no such file, wrong origin, a read outage before
+        // the tombstone) destroyed nothing — every error return in
+        // `delete_record` precedes the tombstone or leaves the body standing —
+        // so it authorizes nothing either.
+        Err(_) => {
+            if let Some(count) = ledger
+                .lock()
+                .expect("ledger lock")
+                .authorized_deletes
+                .get_mut(&(pkg, fname))
+            {
+                *count -= 1;
+            }
+        }
     }
 }
 
@@ -3204,7 +3245,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
     // delete removed them. The tombstone is the point of no return, so storage
     // evidence (a tombstone on any bucket) exempts — an interrupted delete that
     // crashed after its tombstone but before its 204 has still legitimately
-    // destroyed. A freeze does NOT exempt any more: `.frozen` used to buy a
+    // destroyed. A freeze does NOT exempt on its own: `.frozen` used to buy a
     // blanket pass, and a freeze is precisely where both byte-sets most need to
     // survive. `freeze_side` orders marker -> quarantine -> tombstone -> drop,
     // so the bytes are preserved before the destructive move and a crash
@@ -3212,13 +3253,23 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
     // filename owes the fleet EVERY byte-set it acked, findable somewhere.
     // The scan is fleet-wide and runs once: each bucket preserves the body IT
     // personally lost, so the sets legitimately differ per bucket.
+    //
+    // That argument covers the tombstone `freeze_side` writes — not a delete's.
+    // A delete and a merge freeze can race on one filename, and a delete that
+    // gets there first drops the body under its OWN tombstone while the freeze
+    // is between its marker and its quarantine read: `freeze_side`'s
+    // `get_bytes` then 404s and there is nothing left to preserve. The bytes
+    // were destroyed by the authorized delete, not lost by the freeze, so a
+    // tombstone still exempts when the workload authorized a delete for that
+    // filename. Nothing at quiescence distinguishes the two tombstones, so
+    // the harness's own record of what it asked for is the evidence.
     for ((pkg, fname), acks) in &ledger.acked {
         let akey = format!("packages/{pkg}/{fname}");
         let frozen_anywhere = dumps
             .iter()
             .any(|d| d.contains_key(&format!("{akey}.frozen")));
         let deleted = ledger.deleted.contains(&(pkg.clone(), fname.clone()))
-            || (!frozen_anywhere
+            || ((!frozen_anywhere || ledger.authorized_delete(pkg, fname))
                 && dumps
                     .iter()
                     .any(|d| d.contains_key(&format!("{akey}.tombstone"))));
@@ -3284,6 +3335,17 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
     // after `store_artifact_verified` succeeds and before the 200, leaving real
     // conflicting bytes with no ack recorded, so an ack-count-only form would
     // false-fail on every crashed publisher.
+    //
+    // One byte-set the fleet cannot be asked to attest: the one an authorized
+    // delete destroyed before the freeze reached it. `freeze_side` preserves
+    // the body it FINDS, and a delete racing the same filename drops that body
+    // under its own tombstone in the window between the freeze's marker and its
+    // `get_bytes` — measured, that is every occurrence of this shape, always
+    // with two distinct bodies really stored under the filename. So a deleted
+    // filename is excused, but only once the freeze has shown it preserved what
+    // it did find: a freeze that quarantined NOTHING is never excused, which is
+    // also what keeps `--break freeze-unjustified` (a bare `.frozen` planted on
+    // an acked-deleted filename, no quarantine copy anywhere) red.
     for (pkg, fname) in record_names(&dumps) {
         let akey = format!("packages/{pkg}/{fname}");
         if !dumps
@@ -3292,8 +3354,12 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
         {
             continue;
         }
+        let preserved = quarantined_bodies(&dumps, &pkg, &fname);
+        if !preserved.is_empty() && ledger.authorized_delete(&pkg, &fname) {
+            continue;
+        }
         REACH.hit(R::FreezeJustified);
-        let mut attested = quarantined_bodies(&dumps, &pkg, &fname);
+        let mut attested = preserved;
         if let Some(acks) = ledger.acked.get(&(pkg.clone(), fname.clone())) {
             attested.extend(acked_bodies(acks));
         }

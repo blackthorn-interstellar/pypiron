@@ -424,6 +424,29 @@ whatever the fixes turn out to be:
 | `CONVERGENCE` | 208 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | `packages/<pkg>/.origin` reads `mirror` on bucket 0 and is **absent** on bucket 1 at quiescence — an orphan claim that never replicated and never got released, so one bucket reserves a name the other would let a proxy fill |
 | `ACK_TOTALITY` | 19 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | a publish acked while a peer held neither the record, nor a `_repl/` note owing it, nor any merge marker explaining its absence. Crash-only, where a missed note is the hard gate |
 
+**Closed: the two freeze rows (165, 91), plus the freeze arm of 267.** Two
+`copy_live` fixes took most of that class (5589ee5, b91e06c). What was left
+behind them is not a product defect: a delete and a merge freeze racing on one
+filename. The delete tombstones and drops the body while `freeze_side` sits
+between its `.frozen` marker and its `get_bytes`, so the freeze finds nothing
+left to quarantine and the loser body is gone — destroyed by the delete, not
+lost by the freeze. Over 16,671 crash-only partitioned seeds every one of the
+40 `FREEZE_UNJUSTIFIED` and 6 `CONSERVATION` reds had two distinct bodies
+really stored under that filename (a real conflict, correctly frozen) and an
+authorized delete for it; not one had a freeze that preserved nothing. Nothing
+at quiescence distinguishes a delete's tombstone from the freeze's own, so the
+ledger now records the deletes the workload authorized — acked, or dead in
+flight; a refused 404 withdraws its own — and both oracles read it:
+CONSERVATION's tombstone exemption survives a freeze on such a filename, and
+FREEZE_JUSTIFIED excuses a short attestation there *provided the freeze
+preserved something*. A freeze that quarantined nothing is never excused, which
+is what keeps `--break freeze-unjustified` red — dropping that clause makes the
+kill proof pass, which is how it was checked. Repros, all `--nodes 3 --buckets
+2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100`: seeds
+6000, 9024, 12144, 14623 (freeze justification) and 8226, 9714, 25704
+(conservation), red before the change and green after. `FREEZE_JUSTIFIED` still
+executes on 23% of seeds there, down from 30%.
+
 How often, on a disjoint seed range (`--start-seed 9000001`, `--packages 6
 --files 2 --ops 160 --partition 100`) — the share of seeds each oracle reds on,
 so a triage can be ordered by frequency rather than by which repro was found

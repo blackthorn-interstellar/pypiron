@@ -84,7 +84,8 @@ pub async fn complete_interrupted_deletes(
 /// Drop sidecar/companion objects stranded beside an artifact that no longer
 /// exists and carries no deliberate marker. Two crash-safe writers can leave
 /// this debris: a failed upload whose `store_artifact_verified` rollback deletes
-/// its own just-written body *after* the background audit read that body and
+/// its own just-written body (only when a HEAD proved it corrupt — an
+/// unverifiable write leaves the bytes standing) *after* the background audit read that body and
 /// fabricated a sidecar for it (worker::backfill_sidecar's confirm/retract has a
 /// race window and a non-durable retract), and an interrupted sidecar-first
 /// replication copy (replicate::copy_live) that never reaches its artifact

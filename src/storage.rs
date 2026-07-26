@@ -1231,6 +1231,44 @@ pub async fn bounded_artifact_write<T>(
     }
 }
 
+/// D1's verdict on one object, with the *evidence* kept: a caller about to
+/// destroy its own write has to know whether the HEAD came back and condemned
+/// the object, or never came back at all. Both are errors; only one is proof.
+enum SizeCheck {
+    Ok,
+    /// The HEAD came back and the object is not the bytes we wrote.
+    Wrong(anyhow::Error),
+    /// The HEAD did not answer, or the object is already gone. Nothing is known
+    /// about what stands under the key — including whether it is ours.
+    Unknown(anyhow::Error),
+}
+
+async fn check_stored_size(storage: &dyn Storage, key: &str, expected_size: u64) -> SizeCheck {
+    let stored = match storage.stored_size(key).await {
+        Ok(Some(stored)) => stored,
+        // Already absent: there is nothing here to condemn, and by the time a
+        // delete landed the key could hold a *successor* object some other
+        // writer created in the gap.
+        Ok(None) => {
+            return SizeCheck::Unknown(anyhow!(
+                "artifact {key} vanished immediately after a create success"
+            ))
+        }
+        Err(error) => {
+            return SizeCheck::Unknown(
+                error.context(format!("HEAD {key} to verify the stored artifact")),
+            )
+        }
+    };
+    if stored == expected_size {
+        SizeCheck::Ok
+    } else {
+        SizeCheck::Wrong(anyhow!(
+            "artifact {key} stored {stored} bytes, expected {expected_size} (write landed corrupt)"
+        ))
+    }
+}
+
 /// D1: HEAD `key` and require the stored object is exactly `expected_size`
 /// bytes. A conditional create that 200-acked but landed truncated or zero
 /// bytes (observed only behind CI's fault proxy) is caught here instead of
@@ -1240,17 +1278,10 @@ pub async fn verify_stored_size(
     key: &str,
     expected_size: u64,
 ) -> Result<()> {
-    let stored = storage
-        .stored_size(key)
-        .await
-        .with_context(|| format!("HEAD {key} to verify the stored artifact"))?
-        .ok_or_else(|| anyhow!("artifact {key} vanished immediately after a create success"))?;
-    if stored != expected_size {
-        bail!(
-            "artifact {key} stored {stored} bytes, expected {expected_size} (write landed corrupt)"
-        );
+    match check_stored_size(storage, key, expected_size).await {
+        SizeCheck::Ok => Ok(()),
+        SizeCheck::Wrong(error) | SizeCheck::Unknown(error) => Err(error),
     }
-    Ok(())
 }
 
 /// How an already-present body under an immutable artifact key is resolved by
@@ -1326,16 +1357,30 @@ pub async fn store_artifact_verified(
         }
     };
     if created {
-        if let Err(error) = verify_stored_size(storage, key, expected_size).await {
-            if matches!(existing, Existing::Reject) {
-                // Our own just-created object is corrupt; drop it so an
-                // immutable retry is not permanently blocked by a 409 against
-                // debris only this writer could have left.
-                let _ = storage.delete_keys(&[key.to_string()]).await;
+        return match check_stored_size(storage, key, expected_size).await {
+            SizeCheck::Ok => Ok(true),
+            // The HEAD condemned it: our own just-created object is corrupt, so
+            // drop it and an immutable retry is not permanently blocked by a
+            // 409 against debris only this writer could have left. Safe only
+            // because the HEAD proved these are bytes no reader may adopt — a
+            // concurrent replication copy that deduped against this key
+            // compares the sha and refuses them too.
+            SizeCheck::Wrong(error) => {
+                if matches!(existing, Existing::Reject) {
+                    let _ = storage.delete_keys(&[key.to_string()]).await;
+                }
+                Err(error)
             }
-            return Err(error);
-        }
-        return Ok(true);
+            // The HEAD never answered, so "corrupt" is a guess, and deleting on
+            // a guess destroys acked bytes: the key is immutable and
+            // content-addressed, so a concurrent replication copy of the *same*
+            // bytes deduped against this very object, called it landed, and is
+            // on its way to publish the sidecar that names it. Fail the write
+            // loudly and leave the object standing — a wrong-sha body is
+            // repairable later (`Existing::Repair`, `artifact_leg`); a deleted
+            // one under a published sidecar is silent corruption.
+            SizeCheck::Unknown(error) => Err(error),
+        };
     }
     let expected_sha = match existing {
         Existing::Reject => return Ok(false),
@@ -3438,6 +3483,69 @@ mod tests {
         assert_eq!(pfx.unkey("other/x"), None);
     }
 
+    /// A create whose verifying HEAD never answers must fail loudly and leave
+    /// the object standing. Deleting it destroys acked bytes: the artifact key
+    /// is immutable and content-addressed, so a concurrent replication copy of
+    /// the same bytes deduped against this very object, called it landed, and
+    /// went on to publish the sidecar naming it — leaving that bucket serving a
+    /// later, unrelated body under a sidecar no reader can reconcile it with.
+    #[tokio::test]
+    async fn an_unverifiable_create_leaves_its_bytes_for_the_writer_that_adopted_them() {
+        let storage = test_support::InMemStorage::default();
+        let key = "packages/demo/demo-1.0-py3-none-any.whl";
+        storage.fail_stored_size();
+
+        let error = store_artifact_verified(
+            &storage,
+            key,
+            ArtifactBody::Bytes(b"body".to_vec()),
+            4,
+            None,
+            Existing::Reject,
+        )
+        .await
+        .expect_err("an unverifiable write must not report success");
+
+        assert!(
+            format!("{error:#}").contains("HEAD"),
+            "the failure must name the unanswered verification, got: {error:#}"
+        );
+        assert_eq!(
+            storage.get_bytes(key).await.unwrap(),
+            b"body",
+            "the bytes a concurrent copy already adopted were destroyed on a guess"
+        );
+    }
+
+    /// The other half: when the HEAD *does* answer and condemns the object, the
+    /// rollback still runs, so an immutable retry is not locked out by a 409
+    /// against this writer's own zero-byte debris.
+    #[tokio::test]
+    async fn a_create_the_head_proves_corrupt_is_still_rolled_back() {
+        let storage = test_support::InMemStorage::default();
+        let key = "packages/demo/demo-1.0-py3-none-any.whl";
+
+        let error = store_artifact_verified(
+            &storage,
+            key,
+            ArtifactBody::Bytes(b"body".to_vec()),
+            999,
+            None,
+            Existing::Reject,
+        )
+        .await
+        .expect_err("a wrong-sized write must not report success");
+
+        assert!(
+            format!("{error:#}").contains("write landed corrupt"),
+            "expected the corrupt-write diagnosis, got: {error:#}"
+        );
+        assert!(
+            !storage.head_exists(key).await.unwrap(),
+            "proven-corrupt debris must be dropped so the retry is not 409'd forever"
+        );
+    }
+
     #[tokio::test]
     async fn disk_list_all_walks_filters_and_detects_change() {
         let dir = std::env::temp_dir().join(format!("pypiron-listall-{}", std::process::id()));
@@ -3555,6 +3663,9 @@ pub mod test_support {
         /// test hold one loader in flight long enough for concurrent readers to
         /// observe the single-flight refill claim.
         get_delay_ms: AtomicU64,
+        /// Make every `stored_size` HEAD fail. Distinct from `unreadable`: the
+        /// object is fine, the verifying HEAD is what does not come back.
+        fail_stored_size: AtomicBool,
     }
 
     impl InMemStorage {
@@ -3582,6 +3693,9 @@ pub mod test_support {
         fn unreadable(&self, key: &str) -> bool {
             self.unreadable.lock().unwrap().as_deref() == Some(key)
         }
+        pub fn fail_stored_size(&self) {
+            self.fail_stored_size.store(true, Ordering::SeqCst);
+        }
         pub fn set_get_delay(&self, delay: std::time::Duration) {
             self.get_delay_ms
                 .store(delay.as_millis() as u64, Ordering::SeqCst);
@@ -3592,6 +3706,17 @@ pub mod test_support {
     impl Storage for InMemStorage {
         async fn head_exists(&self, key: &str) -> Result<bool> {
             Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+        async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+            if self.fail_stored_size.load(Ordering::SeqCst) {
+                anyhow::bail!("injected storage failure");
+            }
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|b| b.len() as u64))
         }
         async fn serve_artifact(
             &self,

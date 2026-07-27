@@ -14,6 +14,15 @@ file), the accepted lag window for a yank the region bucket missed, failover off
 a sustained outage with a drain-gated return, the fail-closed floor for a
 private name whose claim the region bucket has not yet seen, and the no-region
 fail-safe default.
+
+The two pins fail over independently, so both directions are covered: the node's
+own region bucket dying (reads move, writes do not) and the *preferred* bucket —
+the first in config order, the fleet-wide write home — dying while this node
+reads elsewhere (writes move, reads do not). The write-home case runs a
+three-region topology on purpose, so "the read pin stayed home" and "the read pin
+followed the write pin" are distinguishable outcomes. A node whose region bucket
+is already dark when it boots is covered too: startup succeeds, reads follow the
+write bucket, and they move home once it recovers.
 """
 
 from __future__ import annotations
@@ -26,6 +35,9 @@ import time
 import pytest
 
 from .conftest import (
+    READ_AFFINITY_NODE_REGION,
+    READ_AFFINITY_WRITE_REGION,
+    _start_read_affinity_server,
     minio_delete_key_in,
     minio_get_key_in,
     minio_key_exists_in,
@@ -455,6 +467,192 @@ def test_region_bucket_failover_and_drain_gated_return(
         lambda: _artifact_gets(faults, b, out_key) > before,
         what="post-return reads hit B",
     )
+
+
+#: Region label on the third bucket of the write-failover topology — a region no
+#: node in these tests claims, so it is only ever reached as the write fallback.
+THIRD_REGION = "middle"
+
+
+def _three_region_buckets_uri(minio) -> str:
+    """`PYPIRON_BUCKETS` for a three-region topology whose node region sits LAST:
+    the preferred bucket A (`@left`, the fleet-wide write home), an unrelated
+    region C (`@middle`), then the node's own region B (`@right`). The order is
+    the whole point — when A dies the write selection takes the most-preferred
+    healthy bucket, which is C and NOT the node's region bucket, so "reads stayed
+    home" and "reads followed the write pin" are different observations. A
+    two-bucket topology cannot tell them apart."""
+    a, c, b = minio["buckets"][:3]
+    return (
+        f"s3://{a}@{READ_AFFINITY_WRITE_REGION},"
+        f"s3://{c}@{THIRD_REGION},"
+        f"s3://{b}@{READ_AFFINITY_NODE_REGION}"
+    )
+
+
+def test_preferred_bucket_failover_leaves_the_region_read_pin_alone(
+    tmp_path_factory, pypiron_bin, minio_three_proxy, tmp_path, uv_path, uv_venv
+):
+    """The other direction of failover: the *preferred* bucket — first in config
+    order, the fleet-wide write home — dies while this node reads from a different
+    region. Writes move to the next healthy bucket in preference order; the read
+    pin never budges, and no `read bucket changed` is ever logged. A publish during
+    the outage lands on the new write home, still fans out to the region bucket
+    pre-ack, and owes the dead preferred bucket a repair note — and the client
+    reading that brand-new file is still served in-region."""
+    minio = minio_three_proxy
+    a, c, b = minio["buckets"][:3]
+    faults = minio["faults"]
+    server_gen = _start_read_affinity_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        node_region=READ_AFFINITY_NODE_REGION,
+        leave_failures=1,
+        return_healthy_secs=2,
+        extra_env={"PYPIRON_BUCKETS": _three_region_buckets_uri(minio)},
+    )
+    try:
+        server = next(server_gen)
+        _eventually(lambda: _read_bucket(server) == b, what="reads pin to the region bucket B")
+        _eventually(
+            lambda: _write_bucket(server) == a, what="writes home to the preferred bucket A"
+        )
+
+        base_pkg = "writehomebase"
+        base_wheel = make_wheel(base_pkg, "1.0", tmp_path)
+        base_key = f"packages/{base_pkg}/{base_wheel.name}"
+        _upload(server, base_wheel)
+        wait_for_file_in_index(server["simple"], base_pkg, base_wheel.name)
+        _eventually(
+            lambda: minio_key_exists_in(minio, b, base_key), what="baseline fanned out to B"
+        )
+
+        # Kill the preferred bucket. This is the fleet's write home, not this
+        # node's read region.
+        faults.fail(a)
+        _eventually(
+            lambda: _write_bucket(server) == c,
+            what="writes move to the next healthy bucket in preference order",
+        )
+        assert _bucket_health(server, a) == -1, "the preferred bucket is known unhealthy"
+        assert _read_bucket(server) == b, "the read pin left its own healthy region bucket"
+        assert "read bucket changed" not in server["log_path"].read_text(), (
+            "a write-side failover perturbed the read pin"
+        )
+
+        # A publish during the outage: the new write home takes it, the region
+        # bucket still gets its pre-ack copy, and the dark preferred bucket (index
+        # 0) is owed a repair note.
+        out_pkg = "writehomeoutage"
+        out_wheel = make_wheel(out_pkg, "1.0", tmp_path)
+        out_key = f"packages/{out_pkg}/{out_wheel.name}"
+        _upload(server, out_wheel)
+        wait_for_file_in_index(server["simple"], out_pkg, out_wheel.name)
+        assert minio_key_exists_in(minio, c, out_key), "the new write home holds the record"
+        _eventually(
+            lambda: minio_key_exists_in(minio, b, out_key),
+            what="the outage publish still fanned out to the region bucket B",
+        )
+        _eventually(
+            lambda: any(k.startswith(f"_repl/0/{out_pkg}/") for k in minio_list_keys_in(minio, c)),
+            what="the dead preferred bucket is owed a repair note",
+        )
+
+        # The pins are still where they belong, and the client read of the
+        # brand-new file is served in-region.
+        assert _write_bucket(server) == c
+        assert _read_bucket(server) == b
+        before = _artifact_gets(faults, b, out_key)
+        code, body, _ = http_get(
+            f"{server['base_url']}/files/{out_pkg}/{out_wheel.name}", timeout=30
+        )
+        assert code == 200
+        assert body == out_wheel.read_bytes()
+        _eventually(
+            lambda: _artifact_gets(faults, b, out_key) > before,
+            what="reads are still served from the node's own region bucket",
+        )
+        # And a real client resolves and installs through the node throughout.
+        _install(server, uv_path, uv_venv, out_pkg)
+    finally:
+        server_gen.close()
+
+
+def test_boot_with_the_region_bucket_unreachable_reads_from_the_write_bucket(
+    tmp_path_factory, pypiron_bin, minio_two_proxy, tmp_path, uv_path, uv_venv
+):
+    """The outage read affinity exists for, present before the node ever starts:
+    the region bucket is already dark at boot. Startup must succeed anyway, warn
+    that reads follow the write bucket until it recovers, and serve every read —
+    including a real install — from the write home. Once the region bucket is back
+    and owes nothing, reads move home on their own."""
+    minio = minio_two_proxy
+    a, b = minio["buckets"]
+    faults = minio["faults"]
+    faults.fail(b)
+    server_gen = _start_read_affinity_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        node_region=READ_AFFINITY_NODE_REGION,
+        leave_failures=1,
+        return_healthy_secs=2,
+    )
+    try:
+        # Startup completes and serves (the fixture waits on a real HTTP 200) even
+        # though the node's region bucket answered nothing.
+        server = next(server_gen)
+        assert "read affinity: region bucket unreachable at startup" in (
+            server["log_path"].read_text()
+        ), "the startup warn line for an unreachable region bucket is missing"
+        _eventually(lambda: _write_bucket(server) == a, what="writes home to A")
+        _eventually(lambda: _read_bucket(server) == a, what="reads follow the write bucket A")
+        assert _read_bucket(server) == _write_bucket(server), "no distinct read pin was seeded"
+
+        # Publishing and serving work on the write home while B is dark; B is owed
+        # the fan-out it missed.
+        pkg = "bootdark"
+        wheel = make_wheel(pkg, "1.0", tmp_path)
+        akey = f"packages/{pkg}/{wheel.name}"
+        _upload(server, wheel)
+        wait_for_file_in_index(server["simple"], pkg, wheel.name)
+        assert minio_key_exists_in(minio, a, akey)
+        assert not minio_key_exists_in(minio, b, akey), "B was dark for the fan-out"
+        _eventually(
+            lambda: any(k.startswith(f"_repl/1/{pkg}/") for k in minio_list_keys_in(minio, a)),
+            what="A carries the note owed to the dark region bucket",
+        )
+
+        before = _artifact_gets(faults, a, akey)
+        code, body, _ = http_get(f"{server['base_url']}/files/{pkg}/{wheel.name}", timeout=30)
+        assert code == 200
+        assert body == wheel.read_bytes()
+        _eventually(
+            lambda: _artifact_gets(faults, a, akey) > before,
+            what="the download is served from the write bucket A",
+        )
+        _install(server, uv_path, uv_venv, pkg)
+
+        # "until it recovers": B comes back, the note drains, and reads move home.
+        faults.recover(b)
+        _eventually(
+            lambda: _bucket_health(server, b) == 1, timeout=15, what="B observed healthy again"
+        )
+        _eventually(
+            lambda: _read_bucket(server) == b,
+            timeout=30,
+            what="reads move to the region bucket once it recovers and owes nothing",
+        )
+        assert minio_key_exists_in(minio, b, akey), "B caught up before it served a read"
+        assert _write_bucket(server) == a, "the write pin never moved"
+        # The positive form of the signal the write-home failover test asserts is
+        # absent: a read pin that actually moves says so in the log.
+        assert "read bucket changed" in server["log_path"].read_text(), (
+            "moving the read pin home is logged"
+        )
+    finally:
+        server_gen.close()
 
 
 def test_private_name_never_falls_through_on_a_region_bucket_absence(

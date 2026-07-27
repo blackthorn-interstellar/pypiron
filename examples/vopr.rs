@@ -973,10 +973,11 @@ const REACH_METER: [(&str, &str); REACH_SLOTS] = [
 /// The violation prefix each reach slot's oracle pushes, in `R`'s declaration
 /// order — the only join between "this oracle ran" and "this oracle went red",
 /// because violations are plain strings that name themselves and nothing else.
-/// Empty where a slot owns no violation string: DETERMINISM is decided in
-/// `main`, MERGE_DIVERGENCE is a statistic, and the ten classifier slots are
-/// tests inside one oracle whose verdicts surface as `AUDIT_*` strings that name
-/// a class, not a test. Read by `--trace-jsonl` only.
+/// Empty where a slot owns no violation string: MERGE_DIVERGENCE is a statistic,
+/// and the ten classifier slots are tests inside one oracle whose verdicts
+/// surface as `AUDIT_*` strings that name a class, not a test. DETERMINISM is
+/// decided in `main` and pushes its string there, on the traced seed only, on
+/// its way out. Read by `--trace-jsonl` only.
 const REACH_VIOLATION_PREFIX: [&str; REACH_SLOTS] = [
     "DURABILITY",
     "VISIBILITY",
@@ -986,7 +987,7 @@ const REACH_VIOLATION_PREFIX: [&str; REACH_SLOTS] = [
     "VERIFY",
     "ACK_TOTALITY",
     "TOMBSTONE_MONOTONICITY",
-    "",
+    "DETERMINISM",
     "",
     "",
     "",
@@ -3376,13 +3377,21 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                     }
                 }
             }
-            let markers_left = fleet.buckets.iter().any(|bucket| {
-                bucket
-                    .dump()
-                    .keys()
-                    .any(|k| k.starts_with("_dirty/") || k.starts_with("_repl/"))
-            });
-            saw_debris |= markers_left;
+            // The real count, not a flag: the `pass` event publishes it and a
+            // reader watching debris shrink pass over pass needs the number.
+            // Same raw `dump()` read either way.
+            let markers_left: usize = fleet
+                .buckets
+                .iter()
+                .map(|bucket| {
+                    bucket
+                        .dump()
+                        .keys()
+                        .filter(|k| k.starts_with("_dirty/") || k.starts_with("_repl/"))
+                        .count()
+                })
+                .sum();
+            saw_debris |= markers_left > 0;
             Reach::peak(&REACH.peak_drains, pass + 1);
             if let Some(viz) = &viz {
                 viz.emit(
@@ -3395,7 +3404,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                 );
             }
             viz_world(&viz, &fleet.buckets, false);
-            if !markers_left {
+            if markers_left == 0 {
                 break;
             }
             advance_clock(&clock, 90, "drain", &viz);
@@ -5147,16 +5156,26 @@ fn reach_snapshot() -> Vec<u64> {
 }
 
 /// One `oracle` line per reach slot, plus one `violation` line per raw violation
-/// string. `executed` is this run's count; `verdict` is `violated` when a
-/// violation string carries this oracle's prefix (see `REACH_VIOLATION_PREFIX`),
-/// `not-executed` when the oracle never ran on this world, `held` otherwise.
+/// string. `executed` is THIS RUN's count — the terminal's reach table is
+/// process-cumulative and also counts the determinism rerun, so its totals can
+/// be larger; `summary.oracle_scope` says so on the page. `verdict` is
+/// `violated` when a violation string carries this oracle's prefix (see
+/// `REACH_VIOLATION_PREFIX`), `not-executed` when the oracle never ran on this
+/// world, `held` otherwise.
 fn emit_oracles(viz: &Arc<Trace>, before: &[u64], after: &[u64], violations: &[String]) {
     for (slot, (label, unit)) in REACH_METER.iter().enumerate() {
-        let executed = after
-            .get(slot)
-            .copied()
-            .unwrap_or_default()
-            .saturating_sub(before.get(slot).copied().unwrap_or_default());
+        let reached = if slot == R::Determinism as usize {
+            // DETERMINISM is the one oracle the traced run cannot bracket: the
+            // rerun that executes it happens after `run_once` returns, so the
+            // before/after pair always differs by 0 and the page called a check
+            // the terminal had just printed "not executed". It fires at most
+            // once per seed, so reading its slot live at trace-close time is
+            // exactly this seed's count.
+            REACH.slots[slot].load(Ordering::Relaxed)
+        } else {
+            after.get(slot).copied().unwrap_or_default()
+        };
+        let executed = reached.saturating_sub(before.get(slot).copied().unwrap_or_default());
         let prefix = REACH_VIOLATION_PREFIX[slot];
         let detail = if prefix.is_empty() {
             None
@@ -5185,18 +5204,27 @@ fn emit_oracles(viz: &Arc<Trace>, before: &[u64], after: &[u64], violations: &[S
     }
 }
 
-/// Close the trace: the `summary` line, then the file. Called at every point
-/// `main` can leave a traced seed, because `main` exits through
-/// `std::process::exit` and no `Drop` runs. `exit_code` is what this seed's own
-/// verdict implies; `--require-reach` is a whole-run gate and cannot be known
-/// from one seed.
+/// Close the trace: the `oracle` lines, the `summary` line, then the file.
+/// Called at every point `main` can leave a traced seed, because `main` exits
+/// through `std::process::exit` and no `Drop` runs — which is also why the
+/// oracles are emitted from here and not beside `run_once`: the determinism
+/// recheck that executes one of them runs in between.
+///
+/// `reach` is the before/after counter pair bracketing the ONE traced execution.
+/// `seed_exit_code` is what this seed's own verdict implies, and is not the
+/// process exit code: `--require-reach` is a whole-run gate that cannot be known
+/// from one seed, so a run can exit 4 with a seed that reported 0 here.
 fn finish_trace(
     viz: Option<&Arc<Trace>>,
     outcome: &RunOutcome,
+    reach: Option<(&[u64], &[u64])>,
     elapsed: std::time::Duration,
-    exit_code: i32,
+    seed_exit_code: i32,
 ) {
     let Some(viz) = viz else { return };
+    if let Some((before, after)) = reach {
+        emit_oracles(viz, before, after, &outcome.violations);
+    }
     let (events_emitted, truncated) = viz.stats();
     viz.emit(
         "summary",
@@ -5213,7 +5241,10 @@ fn finish_trace(
             "events_emitted": events_emitted + 1,
             "truncated": truncated,
             "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-            "exit_code": exit_code,
+            "seed_exit_code": seed_exit_code,
+            "oracle_scope": "Each oracle's `executed` counts this one traced run of this seed. \
+                             The terminal's reach table is process-cumulative and also counts \
+                             the determinism rerun, so its totals can be larger.",
         }),
     );
     viz.flush();
@@ -5262,11 +5293,13 @@ fn main() {
         }
         // Bracketing `run_once` is the whole per-oracle instrumentation: two
         // relaxed reads of the 23 counters, no touch points inside the run.
+        // The pair is per-RUN on purpose — it excludes the determinism rerun
+        // below, which the terminal's cumulative meter includes. The lines
+        // themselves are written by `finish_trace`, after that rerun.
         let reach_before = viz.as_ref().map(|_| reach_snapshot());
         let mut outcome = run_once(seed, &profile, false, viz.clone());
-        if let (Some(viz), Some(before)) = (&viz, &reach_before) {
-            emit_oracles(viz, before, &reach_snapshot(), &outcome.violations);
-        }
+        let reach_after = viz.as_ref().map(|_| reach_snapshot());
+        let reach = || reach_before.as_deref().zip(reach_after.as_deref());
         dump_trace(&outcome);
         total_events += outcome.trace_events;
         total_acked += outcome.acked;
@@ -5310,7 +5343,16 @@ fn main() {
                     profile.describe()
                 );
                 if !keep_going {
-                    finish_trace(viz.as_ref(), &outcome, started.elapsed(), 3);
+                    // We exit on the next line, so this string reaches nothing
+                    // but the trace — and without it the page would render
+                    // "DETERMINISM held" on the run that caught it red.
+                    let red = format!(
+                        "DETERMINISM: seed {seed} re-executed to a different op trace ({:#x} vs \
+                         {:#x})",
+                        outcome.trace_hash, again.trace_hash
+                    );
+                    outcome.violations.push(red);
+                    finish_trace(viz.as_ref(), &outcome, reach(), started.elapsed(), 3);
                     std::process::exit(3);
                 }
                 determinism_violations.push(seed);
@@ -5327,7 +5369,13 @@ fn main() {
                     profile.describe()
                 );
                 if !keep_going {
-                    finish_trace(viz.as_ref(), &outcome, started.elapsed(), 3);
+                    let red = format!(
+                        "DETERMINISM: seed {seed} re-executed to the same op trace but a \
+                         different final world ({:#x} vs {:#x})",
+                        outcome.state_hash, again.state_hash
+                    );
+                    outcome.violations.push(red);
+                    finish_trace(viz.as_ref(), &outcome, reach(), started.elapsed(), 3);
                     std::process::exit(3);
                 }
                 determinism_violations.push(seed);
@@ -5349,6 +5397,7 @@ fn main() {
         finish_trace(
             viz.as_ref(),
             &outcome,
+            reach(),
             started.elapsed(),
             if outcome.violations.is_empty() { 0 } else { 2 },
         );

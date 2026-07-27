@@ -1,0 +1,2357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>pypiron run visualizer</title>
+<!--
+  The player: one self-contained file that plays back a recorded pypiron run.
+
+  It consumes the JSONL/JSON trace contract documented in dev/scripts/viz/README.md
+  ("kind": "trace" | "graph" | "scale"). Three ways in:
+
+    1. ?src=a.jsonl              fetch one payload
+       ?src=a.jsonl,b.jsonl      fetch two and stack them side by side
+    2. drag-and-drop / file picker
+    3. an inlined <script type="application/json" id="payload"> block, which
+       dev/scripts/viz/build.py writes to produce a standalone page.
+
+  Recording mode: ?chrome=off&autoplay=1&speed=4&loop=1 hides the controls and
+  loops forever, for a screen recorder. The Record button (when the browser has
+  MediaRecorder + canvas.captureStream) downloads a .webm of the stage canvas.
+
+  Also honored: ?theme=light|dark pins the theme (otherwise the OS decides), and
+  ?at=N opens on event N — a poster frame for a screenshot.
+
+  No framework, no bundler, no CDN, no webfonts, no npm. The colors are the
+  server's own tokens, copied verbatim from PAGE_CSS in src/html.rs. Nothing in
+  here reaches the network except an explicit ?src= fetch.
+
+  Three rules this file will not bend:
+    * an oracle that did not execute renders as "not executed" and nothing else,
+    * meta.caveats renders in a band that cannot be collapsed or scrolled away,
+    * the simulator has no regions, so a bucket header says bucket-0. Never a
+      region name that the payload did not measure.
+-->
+<style>
+/* pypiron color scheme — iron & rust, after the logo: warm rust-orange accent
+   on warm steel/charcoal neutrals. The next two rules are copied verbatim from
+   PAGE_CSS in src/html.rs so this page cannot drift from the server's pages. */
+:root{color-scheme:light dark;--bg:#faf7f4;--header:#efe7df;--fg:#211b17;--muted:#7c7269;--card:#fff;--border:#e7ddd3;--accent:#bf5a2e;--accent-ink:#a04a24;--code:#f3ece4;--bar:#bf5a2e;--track:#ece2d8}
+@media(prefers-color-scheme:dark){:root{--bg:#15110e;--header:#1f1813;--fg:#ece5dd;--muted:#a59a8f;--card:#1c1713;--border:#352c24;--accent:#e07b45;--accent-ink:#ef9460;--code:#1f1813;--bar:#e07b45;--track:#2c241d}}
+/* An explicit ?theme= (or the toggle) wins over the OS in both directions. */
+:root[data-theme=light]{color-scheme:light;--bg:#faf7f4;--header:#efe7df;--fg:#211b17;--muted:#7c7269;--card:#fff;--border:#e7ddd3;--accent:#bf5a2e;--accent-ink:#a04a24;--code:#f3ece4;--bar:#bf5a2e;--track:#ece2d8}
+:root[data-theme=dark]{color-scheme:dark;--bg:#15110e;--header:#1f1813;--fg:#ece5dd;--muted:#a59a8f;--card:#1c1713;--border:#352c24;--accent:#e07b45;--accent-ink:#ef9460;--code:#1f1813;--bar:#e07b45;--track:#2c241d}
+
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column;align-items:center}
+main{width:100%;max-width:1280px;padding:20px 24px 40px}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+h1{margin:0;font-size:30px;letter-spacing:-.02em}
+h2{margin:0;font-size:12px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--muted)}
+pre{margin:0;background:var(--code);border:1px solid var(--border);border-radius:8px;padding:10px 12px;overflow-x:auto}
+code,.mono{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.num{font-variant-numeric:tabular-nums}
+
+/* Header band: full-bleed, inner column aligned with main. */
+.band{width:100%;background:var(--header);border-bottom:1px solid var(--border)}
+.band-in{max-width:1280px;margin:0 auto;padding:20px 24px 22px}
+.hrow{display:flex;align-items:baseline;justify-content:space-between;gap:12px 24px;flex-wrap:wrap}
+.narr{margin:6px 0 0;max-width:88ch;font-size:16px}
+.band pre{margin-top:12px;max-width:100%}
+.chips{display:flex;flex-wrap:wrap;gap:6px 8px;margin-top:10px}
+.chip{border:1px solid var(--border);background:var(--card);border-radius:5px;padding:1px 8px;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.chip b{color:var(--fg);font-weight:600}
+.chip.hot{border-color:var(--accent);color:var(--accent-ink)}
+.pill{display:inline-block;border-radius:5px;padding:2px 9px;font-size:12px;font-weight:600;white-space:nowrap}
+.pill.ok{background:#16a34a;color:#fff}
+.pill.bad{background:#b91c1c;color:#fff}
+.pill.attn{background:var(--accent);color:#fff}
+.pill.none{border:1px solid var(--border);background:var(--card);color:var(--muted);font-weight:400}
+
+/* Panels: one trace = one column; two traces = two columns on a wide screen. */
+.panels{display:grid;gap:18px}
+@media(min-width:1080px){.panels.dual{grid-template-columns:1fr 1fr}}
+.panel{min-width:0}
+.phead{display:flex;align-items:baseline;justify-content:space-between;gap:8px 16px;margin:0 0 6px}
+.psub{margin:0 0 8px;color:var(--muted);font-size:13px}
+canvas.stage{display:block;width:100%;height:auto;background:var(--card);border:1px solid var(--border);border-radius:10px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;margin:8px 0 0;color:var(--muted);font-size:12px}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;flex:none;border:1px solid var(--border)}
+.cols{display:grid;gap:14px;margin-top:14px}
+@media(min-width:640px){.cols{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}
+.panels.dual .cols{grid-template-columns:minmax(0,1fr)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 14px;min-width:0}
+.card>h2{margin-bottom:8px}
+.foot{margin:8px 0 0;color:var(--muted);font-size:12px}
+
+/* Oracles */
+table.orc{width:100%;border-collapse:collapse;font-size:13px}
+table.orc th{text-align:left;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);padding:5px 8px}
+table.orc td{border-bottom:1px solid var(--border);padding:5px 8px;vertical-align:top}
+table.orc td.n{text-align:right;width:4.5em;font-variant-numeric:tabular-nums;color:var(--muted)}
+table.orc td.v{white-space:nowrap;width:9em}
+table.orc td.detail{padding:6px 8px 10px}
+table.orc td.detail pre{font-size:12px;white-space:pre-wrap;word-break:break-word;border-color:#b91c1c}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+.dot.held{background:#16a34a}
+.dot.violated{background:#b91c1c}
+.dot.none{border:1.5px solid var(--muted)}
+.vio{color:#b91c1c;font-weight:600}
+
+/* Event log */
+.log{margin:0;padding:0;list-style:none;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;min-height:15em}
+.log li{white-space:pre;overflow:hidden;text-overflow:ellipsis;color:var(--muted)}
+.log li b{color:var(--fg);font-weight:600}
+.log li.hit{color:var(--accent-ink)}
+.log li.bad{color:#b91c1c}
+
+/* Timeline */
+.tl{margin-top:14px}
+svg.tlsvg{display:block;width:100%;height:78px;cursor:pointer;touch-action:none}
+svg.tlsvg text{font:10px ui-sans-serif,system-ui,sans-serif}
+
+/* Controls */
+.controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)}
+.grp{display:flex;align-items:center;gap:6px}
+button{font:inherit;font-size:13px;cursor:pointer;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:4px 11px}
+button:hover{border-color:var(--accent);color:var(--accent-ink)}
+button[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
+button.rec[aria-pressed=true]{background:#b91c1c;border-color:#b91c1c}
+.pos{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums;margin-left:auto}
+.keys{margin:10px 0 0;color:var(--muted);font-size:12px}
+
+/* Caveats: always visible, never collapsible. */
+.caveats{margin-top:20px;border-top:1px solid var(--border);padding-top:12px;color:var(--muted);font-size:13px}
+.caveats ul{margin:6px 0 0;padding-left:20px}
+.caveats li{margin:3px 0}
+/* Recording mode (?chrome=off) is the documented way to capture video, and a
+   caveat that sits below the fold is a caveat the recording does not contain.
+   So it becomes a band fixed to the foot of the viewport: in frame at every
+   scroll position, sized to read at 1080p. JS pads the body to match it. */
+body.recmode .caveats{position:fixed;left:0;right:0;bottom:0;z-index:30;margin:0;
+  padding:9px 24px 11px;border-top:1px solid var(--border);background:var(--header);
+  color:var(--fg);font-size:16px;line-height:1.35;box-shadow:0 -6px 18px rgba(0,0,0,.18)}
+body.recmode .caveats h2{display:inline-block;margin:0 12px 0 0;font-size:14px;vertical-align:top}
+body.recmode .caveats ul{display:inline;margin:0;padding:0;list-style:none}
+body.recmode .caveats li{display:inline;margin:0}
+body.recmode .caveats li+li::before{content:" · ";color:var(--muted)}
+
+/* Loader */
+.loader{margin-top:20px}
+.loader.over{border-color:var(--accent);border-style:dashed}
+
+/* Graph mode */
+.gwrap{display:grid;gap:16px;margin-top:4px}
+@media(min-width:1000px){.gwrap{grid-template-columns:minmax(0,1fr) 340px}}
+svg.graph{display:block;width:100%;height:auto;background:var(--card);border:1px solid var(--border);border-radius:10px}
+.gstats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.gstat{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:8px 10px}
+.gstat .v{font-size:20px;font-weight:650;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
+.gstat .l{color:var(--muted);font-size:11px}
+.insp{margin-top:12px;font-size:13px}
+.insp table{width:100%;border-collapse:collapse;font-size:12px}
+.insp th{text-align:left;color:var(--muted);font-weight:600;padding:3px 6px;border-bottom:1px solid var(--border)}
+.insp td{padding:3px 6px;border-bottom:1px solid var(--border);vertical-align:top;word-break:break-word}
+.insp pre{margin-top:8px;max-height:260px;overflow:auto;font-size:11px}
+.badge{display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom;border:1px solid var(--border);border-radius:5px;padding:0 6px;font-size:11px;color:var(--muted);margin:1px 3px 1px 0;white-space:nowrap}
+.badge.on{border-color:var(--accent);color:var(--accent-ink)}
+.badge.dead{border-color:#b91c1c;color:#b91c1c}
+.badge.ok{border-color:#16a34a;color:#16a34a}
+/* Nothing was settled here — a dashed outline, the badge form of the hollow
+   "not executed" dot the oracle table uses. */
+.badge.unreached{border-style:dashed}
+
+/* Scale mode */
+.odo{display:grid;gap:18px;align-items:center}
+@media(min-width:900px){.odo{grid-template-columns:minmax(0,1.1fr) minmax(0,1fr)}}
+.odo .big{font-size:clamp(44px,8vw,104px);font-weight:650;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1}
+.odo .lbl{margin:6px 0 0;font-size:17px}
+.src{margin:6px 0 0;color:var(--muted);font-size:12px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin-top:26px}
+.tile{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px}
+.tile .v{font-size:26px;font-weight:650;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
+.tile .l{margin-top:2px;font-size:13px}
+.bars{margin-top:26px}
+.bar{margin:12px 0}
+.bar .bl{display:flex;justify-content:space-between;gap:12px;font-size:13px}
+.bar .bl span:last-child{font-variant-numeric:tabular-nums;color:var(--muted)}
+.bar .rail{height:12px;border-radius:6px;background:var(--track);margin-top:4px;overflow:hidden}
+.bar .fill{height:100%;background:#e07b45;border-radius:6px}
+
+/* CSS tooltips — the same data-tip/::after trick the server pages use. */
+.tip{position:relative;cursor:help;border-bottom:1px dotted var(--muted)}
+.tip:hover::after{content:attr(data-tip);position:absolute;left:0;bottom:calc(100% + 9px);width:max-content;max-width:300px;padding:8px 11px;border-radius:7px;background:var(--card);color:var(--fg);border:1px solid var(--border);box-shadow:0 8px 24px rgba(0,0,0,.18);font:400 12px/1.45 ui-sans-serif,system-ui,sans-serif;letter-spacing:normal;text-transform:none;text-align:left;white-space:normal;z-index:20;pointer-events:none}
+</style>
+</head>
+<body>
+
+<header class="band">
+  <div class="band-in">
+    <div class="hrow">
+      <h1 id="title">pypiron run visualizer</h1>
+      <span id="verdict" class="pill none" hidden></span>
+    </div>
+    <p class="narr" id="narr">Drop a <code>.jsonl</code> trace or a <code>.json</code> graph/scale payload below, or load one with <code>?src=</code>.</p>
+    <pre id="cmd" hidden><code></code></pre>
+    <div class="chips" id="chips"></div>
+  </div>
+</header>
+
+<main>
+  <div class="panels" id="panels"></div>
+  <div id="graph" hidden></div>
+  <div id="scale" hidden></div>
+
+  <section class="controls chrome" id="controls" hidden>
+    <div class="grp">
+      <button type="button" id="restart" title="restart (0)">&#9198;</button>
+      <button type="button" id="play" title="play / pause (space)">&#9199;</button>
+      <button type="button" id="step" title="single step (&rarr;)">&#9197;</button>
+    </div>
+    <div class="grp" id="speeds"></div>
+    <div class="grp">
+      <button type="button" id="nextcrash" title="jump to the next crash (c)">next crash</button>
+      <button type="button" id="nextvio" title="jump to the next violation (v)">next violation</button>
+    </div>
+    <div class="grp">
+      <button type="button" class="rec" id="rec" hidden>Record .webm</button>
+      <button type="button" id="theme" title="light / dark / follow the OS">theme</button>
+    </div>
+    <span class="pos num" id="pos"></span>
+  </section>
+  <p class="keys chrome" id="keys" hidden>space play/pause &middot; &larr;/&rarr; step &middot; [ / ] previous/next phase &middot; c next crash &middot; v next violation &middot; 0 restart</p>
+
+  <section class="caveats" id="caveats" hidden></section>
+
+  <section class="card loader chrome" id="loader">
+    <h2>Load a run</h2>
+    <p class="foot" style="margin-top:6px">Drop a file anywhere on this page, or pick one:
+      <input type="file" id="file" multiple accept=".jsonl,.json,application/json">
+    </p>
+    <p class="foot" id="loaderr"></p>
+  </section>
+
+  <noscript>
+    <section class="card" style="margin-top:20px">
+      <h2>JavaScript is off</h2>
+      <p>This page is a player: it animates a run that was already recorded elsewhere,
+      so with scripting off there is nothing to animate. The payload itself is plain
+      text and is readable without this page:</p>
+      <table class="orc">
+        <thead><tr><th>payload</th><th>shape</th><th>read it with</th></tr></thead>
+        <tbody>
+          <tr><td>trace</td><td>JSONL, one event per line, first line <code>meta</code>, last line <code>summary</code></td><td><code>head -1 run.jsonl | python3 -m json.tool</code></td></tr>
+          <tr><td>graph</td><td>one JSON object: <code>counts</code>, <code>nodes</code>, <code>edges</code>, <code>paths</code></td><td><code>python3 -m json.tool graph.json</code></td></tr>
+          <tr><td>scale</td><td>one JSON object: <code>stats</code>, <code>bars</code>, each with a <code>source</code></td><td><code>python3 -m json.tool scale.json</code></td></tr>
+        </tbody>
+      </table>
+      <p class="foot">In a standalone page built by <code>dev/scripts/viz/build.py</code> the payload is
+      inlined in the page source in the <code>&lt;script type="application/json" id="payload"&gt;</code>
+      block, so &ldquo;view source&rdquo; is enough to read every event.</p>
+    </section>
+  </noscript>
+</main>
+
+<!-- build.py inlines the payload here. Left empty, the page waits for ?src= or a dropped file. -->
+<script type="application/json" id="payload"></script>
+
+<script>
+(function () {
+  'use strict';
+
+  var doc = document;
+  var root = doc.documentElement;
+
+  /* ------------------------------------------------------------------ *
+   * 0. helpers
+   * ------------------------------------------------------------------ */
+
+  function el(tag, cls, text) {
+    var n = doc.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  }
+  function svgEl(tag, attrs) {
+    var n = doc.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (var k in attrs) if (attrs[k] !== null && attrs[k] !== undefined) n.setAttribute(k, attrs[k]);
+    return n;
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function fmt(n) {
+    if (typeof n !== 'number' || !isFinite(n)) return String(n);
+    var s = (Math.round(n * 100) / 100).toString();
+    var parts = s.split('.');
+    parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return parts.join('.');
+  }
+  function hexRgba(hex, a) {
+    var h = (hex || '').trim().replace('#', '');
+    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    if (h.length !== 6) return 'rgba(128,128,128,' + a + ')';
+    return 'rgba(' + parseInt(h.slice(0, 2), 16) + ',' + parseInt(h.slice(2, 4), 16) + ',' +
+      parseInt(h.slice(4, 6), 16) + ',' + a + ')';
+  }
+  function roundRect(c, x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    c.beginPath();
+    c.moveTo(x + r, y);
+    c.arcTo(x + w, y, x + w, y + h, r);
+    c.arcTo(x + w, y + h, x, y + h, r);
+    c.arcTo(x, y + h, x, y, r);
+    c.arcTo(x, y, x + w, y, r);
+    c.closePath();
+  }
+  /* Middle-ellipsis a string to fit `w` px in the canvas's current font. */
+  function fit(c, s, w) {
+    if (c.measureText(s).width <= w) return s;
+    var lo = 1, hi = s.length;
+    while (lo < hi) {
+      var mid = (lo + hi + 1) >> 1;
+      var head = Math.ceil(mid / 2), tail = mid - head;
+      var cand = s.slice(0, head) + '…' + (tail ? s.slice(s.length - tail) : '');
+      if (c.measureText(cand).width <= w) lo = mid; else hi = mid - 1;
+    }
+    var head2 = Math.ceil(lo / 2), tail2 = lo - head2;
+    return s.slice(0, head2) + '…' + (tail2 ? s.slice(s.length - tail2) : '');
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 1. URL parameters
+   * ------------------------------------------------------------------ */
+
+  var P = {};
+  location.search.replace(/^\?/, '').split('&').forEach(function (kv) {
+    if (!kv) return;
+    var i = kv.indexOf('=');
+    var k = decodeURIComponent(i < 0 ? kv : kv.slice(0, i));
+    P[k] = i < 0 ? '1' : decodeURIComponent(kv.slice(i + 1).replace(/\+/g, ' '));
+  });
+  var CHROME = P.chrome !== 'off';
+  if (!CHROME && doc.body) doc.body.className = 'recmode';
+  var AUTOPLAY = P.autoplay === '1';
+  var LOOP = P.loop === '1';
+  if (P.theme === 'light' || P.theme === 'dark') root.setAttribute('data-theme', P.theme);
+
+  /* ------------------------------------------------------------------ *
+   * 2. brand tokens, read out of the stylesheet so the canvas and the DOM
+   *    can never disagree about a color
+   * ------------------------------------------------------------------ */
+
+  var T = {};
+  var TOKENS = ['bg', 'header', 'fg', 'muted', 'card', 'border', 'accent', 'accent-ink', 'code', 'bar', 'track'];
+  function readTokens() {
+    var s = getComputedStyle(root);
+    TOKENS.forEach(function (k) { T[k] = s.getPropertyValue('--' + k).trim() || '#888'; });
+    T.ok = '#16a34a';
+    T.bad = '#b91c1c';
+    /* The 6-swatch byte-identity ladder, assigned in first-seen order. */
+    T.ladder = [T.code, T.track, hexRgba(T.accent, 0.18), hexRgba(T.accent, 0.34),
+      hexRgba(T.ok, 0.20), hexRgba(T.bad, 0.20)];
+  }
+  readTokens();
+
+  /* ------------------------------------------------------------------ *
+   * 3. the trace model
+   * ------------------------------------------------------------------ */
+
+  /* Every event type this player understands. Anything else is counted and
+     skipped so the Rust emitter can add an event without a new player. */
+  var KNOWN = {
+    meta: 1, phase: 1, step: 1, round: 1, pass: 1, op: 1, drop: 1, crash: 1, crash_sched: 1,
+    restart: 1, clock: 1, ack: 1, world: 1, pin: 1, probe: 1, ready: 1, note: 1, oracle: 1,
+    decide: 1, repair: 1, violation: 1, summary: 1
+  };
+
+  /* Key classes. This is the one place the player mirrors src/layout.rs's key
+     shapes; keep it in step with that file. Order matters: a fence stamp like
+     `<artifact>.frozen` also starts with `packages/`. */
+  var CLASSES = ['truth', 'views', 'markers', 'fences', 'quarantine', 'other', 'chain'];
+  var CLASS_LABEL = {
+    truth: 'TRUTH', views: 'VIEWS', markers: 'MARKERS', fences: 'FENCES',
+    quarantine: 'QUARANTINE', other: 'OTHER', chain: 'TRANSPARENCY CHAIN'
+  };
+  /* Classes whose keys collapse to a one-line summary while every region agrees
+     on all of them. The `_state/` chain is dozens of uniform fingerprint objects
+     that would otherwise fill the panel and bury the fences and quarantine rows
+     the run is actually about. A collapsed class states its own key count, and
+     any key that diverges is always drawn — nothing is hidden silently. */
+  var COLLAPSIBLE = { chain: 1 };
+  function classify(k) {
+    if (k.indexOf('_quarantine/') === 0) return 'quarantine';
+    if (/(\.tombstone|\.frozen|\.mirror-quarantined|\.origin)$/.test(k)) return 'fences';
+    if (k.indexOf('_dirty/') === 0 || k.indexOf('_repl/') === 0) return 'markers';
+    if (k.indexOf('simple/') === 0) return 'views';
+    if (k.indexOf('packages/') === 0) return 'truth';
+    if (k.indexOf('_state/') === 0) return 'chain';
+    return 'other';
+  }
+
+  function buildTrace(rows) {
+    var m = {
+      kind: 'trace', rows: rows, meta: null, summary: null,
+      phases: [], worlds: [], oracles: [], crashes: [], acksOk: [], acksNo: [],
+      clocks: [], violations: [], decides: [], repairs: [],
+      unknown: {}, unknownCount: 0, opCount: 0
+    };
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      var t = r && r.t;
+      if (typeof t !== 'string') { m.unknown['(no t)'] = (m.unknown['(no t)'] || 0) + 1; m.unknownCount++; continue; }
+      if (!KNOWN[t]) { m.unknown[t] = (m.unknown[t] || 0) + 1; m.unknownCount++; continue; }
+      if (t === 'meta') { m.meta = r; continue; }
+      if (t === 'summary') { m.summary = r; continue; }
+      if (t === 'world') m.worlds.push(r);
+      else if (t === 'phase') m.phases.push(r);
+      else if (t === 'op') m.opCount++;
+      else if (t === 'crash') m.crashes.push(r);
+      /* `ok:false` is an ERROR the client saw — a refused delete (no such file,
+         wrong origin, a read outage before the tombstone) is real protocol
+         behavior, and it is not an ack. Only `ok:true` counts as one. */
+      else if (t === 'ack') (r.ok === true ? m.acksOk : m.acksNo).push(r);
+      else if (t === 'clock') m.clocks.push(r);
+      else if (t === 'oracle') { m.oracles.push(r); if (r.verdict === 'violated') m.violations.push(r); }
+      else if (t === 'decide') m.decides.push(r);
+      else if (t === 'repair') m.repairs.push(r);
+      /* A raw violation string shares the timeline mark and the jump-to-next
+         key with a violated oracle: both are "an oracle caught a defect here". */
+      else if (t === 'violation') m.violations.push(r);
+    }
+    /* A missing optional field is a null, not an error. Fill only what the
+       renderer needs a shape for, and never invent a name. */
+    var d = m.meta || {};
+    var nodes = typeof d.nodes === 'number' ? d.nodes : 0;
+    var buckets = typeof d.buckets === 'number' ? d.buckets : 0;
+    if (!nodes || !buckets) {
+      for (var j = 0; j < rows.length; j++) {
+        var e = rows[j];
+        if (e && e.t === 'op') { nodes = Math.max(nodes, (e.node | 0) + 1); buckets = Math.max(buckets, (e.bucket | 0) + 1); }
+        if (e && e.t === 'world') buckets = Math.max(buckets, (e.b | 0) + 1);
+      }
+    }
+    m.nodes = Math.max(1, nodes);
+    m.buckets = Math.max(1, buckets);
+    m.bucketNames = [];
+    for (var b = 0; b < m.buckets; b++) {
+      var nm = d.bucket_names && d.bucket_names[b];
+      m.bucketNames.push(typeof nm === 'string' && nm ? nm : 'bucket-' + b);
+    }
+    m.regions = [];
+    m.homes = [];
+    for (var n = 0; n < m.nodes; n++) {
+      var rg = d.node_regions && d.node_regions[n];
+      m.regions.push(typeof rg === 'string' && rg ? rg : null);
+      var h = d.homes && d.homes[n];
+      m.homes.push(typeof h === 'number' ? h : null);
+    }
+    m.hasRegions = m.regions.some(function (x) { return x !== null; });
+    m.hasHomes = m.homes.some(function (x) { return x !== null; });
+    m.caveats = (d.caveats && d.caveats.length) ? d.caveats.slice() : [];
+    m.title = typeof d.title === 'string' ? d.title : 'trace';
+    m.narration = typeof d.narration === 'string' ? d.narration : '';
+    m.cmd = typeof d.cmd === 'string' ? d.cmd : '';
+    m.producer = typeof d.producer === 'string' ? d.producer : '';
+    m.total = Math.max(0, rows.length - 1);
+    return m;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 4. a trace panel: the stage canvas + oracles + log + timeline
+   * ------------------------------------------------------------------ */
+
+  var OP_WINDOW = 260;      /* events of history visible in a lane strip */
+  var OK_FADE_MS = 400;     /* an ok tick fades over 400ms, then ghosts */
+  var FAIL_FADE_MS = 1200;  /* an injected failure stays legible longer */
+  var LOG_LINES = 12;
+  var RING = 1024;
+
+  function TracePanel(m, dual) {
+    var self = {};
+    var wrap = el('div', 'panel');
+
+    if (dual) {
+      var ph = el('div', 'phead');
+      ph.appendChild(el('h2', null, m.title));
+      var pv = verdictPill(m);
+      var pp = el('span', pv.className, pv.textContent);
+      if (pv.title) pp.title = pv.title;
+      ph.appendChild(pp);
+      wrap.appendChild(ph);
+      if (m.cmd) {
+        var sub = el('p', 'psub mono');
+        sub.textContent = m.cmd;
+        sub.style.whiteSpace = 'nowrap';
+        sub.style.overflow = 'hidden';
+        sub.style.textOverflow = 'ellipsis';
+        wrap.appendChild(sub);
+      }
+      var pc = el('div', 'chips');
+      pc.style.margin = '0 0 10px';
+      chipsFor(m).forEach(function (c) { pc.appendChild(c); });
+      wrap.appendChild(pc);
+    }
+
+    var canvas = el('canvas', 'stage');
+    wrap.appendChild(canvas);
+    var ctx = canvas.getContext('2d');
+
+    var legend = el('div', 'legend');
+    [['op ok', T.border], ['injected failure', T.accent], ['crash', T.bad],
+      ['acked request', T.ok], ['refused request', T.muted]].forEach(function (p) {
+      var item = el('span');
+      var sw = el('i');
+      sw.style.background = p[1];
+      item.appendChild(sw);
+      item.appendChild(doc.createTextNode(p[0]));
+      legend.appendChild(item);
+    });
+    /* Only claimed when this run actually produced one. */
+    if (m.decides.length) {
+      var mv = el('span');
+      var mvsw = el('i');
+      mvsw.style.background = T.accent;
+      mv.appendChild(mvsw);
+      mv.appendChild(doc.createTextNode('merge verdict'));
+      legend.appendChild(mv);
+    }
+    var cov = el('span', 'tip', 'trace coverage');
+    cov.setAttribute('data-tip',
+      'Two known gaps, stated rather than papered over: presign_get never passes through the ' +
+      'fault gate, so it emits no op event; and a batch delete records only its first key in ' +
+      'the op event (the world delta still shows every removal).');
+    legend.appendChild(cov);
+    if (m.unknownCount) {
+      var names = Object.keys(m.unknown).sort();
+      var u = el('span', 'tip', m.unknownCount + ' event' + (m.unknownCount === 1 ? '' : 's') +
+        ' of ' + names.length + ' unknown type' + (names.length === 1 ? '' : 's') + ' skipped');
+      u.setAttribute('data-tip', 'Unknown event types are counted and skipped, never fatal: ' +
+        names.join(', '));
+      legend.appendChild(u);
+    }
+    wrap.appendChild(legend);
+
+    var cols = el('div', 'cols');
+    var oCard = el('div', 'card');
+    oCard.appendChild(el('h2', null, 'Oracles'));
+    var oTable = el('table', 'orc');
+    var oHead = el('thead');
+    var oHr = el('tr');
+    ['oracle', 'ran', 'verdict'].forEach(function (h) {
+      oHr.appendChild(el('th', h === 'ran' ? 'n' : null, h));
+    });
+    oHead.appendChild(oHr);
+    oTable.appendChild(oHead);
+    var oBody = el('tbody');
+    oTable.appendChild(oBody);
+    oCard.appendChild(oTable);
+    var oFoot = el('p', 'foot',
+      'A verdict of "not executed" means this run never reached that oracle. Nothing more is claimed about it.');
+    oCard.appendChild(oFoot);
+    /* The producer's own sentence about what the "ran" column counts. Rendered
+       verbatim when present, so the page never restates the scope itself. */
+    if (m.summary && typeof m.summary.oracle_scope === 'string' && m.summary.oracle_scope) {
+      oCard.appendChild(el('p', 'foot', m.summary.oracle_scope));
+    }
+    cols.appendChild(oCard);
+
+    var lCard = el('div', 'card');
+    lCard.appendChild(el('h2', null, 'Event log'));
+    var logUl = el('ul', 'log');
+    lCard.appendChild(logUl);
+    cols.appendChild(lCard);
+    wrap.appendChild(cols);
+
+    var tl = el('div', 'tl');
+    var tlsvg = svgEl('svg', { class: 'tlsvg', preserveAspectRatio: 'none' });
+    tl.appendChild(tlsvg);
+    wrap.appendChild(tl);
+
+    /* ---- playback state. There is exactly one place it is defined, because a
+            backward seek rebuilds it from i=0 and a field missed here would
+            leak state across a scrub. ---- */
+    var st = {};
+    function reset() {
+      st.i = -1;                       /* last applied event index */
+      st.state = [];                   /* per bucket: key -> "<len>:<sha8>" */
+      for (var b = 0; b < m.buckets; b++) st.state.push({});
+      st.ring = [];                    /* recent op events, for the lane ticks */
+      st.ringAt = 0;
+      st.down = {};                    /* node -> crashed */
+      st.seen = [];                    /* oracle events reached so far */
+      st.log = [];
+      st.swatch = {};                  /* sha8 -> byte-identity swatch index */
+      st.nextSwatch = 0;
+      st.phase = '';
+      st.sim = null;
+      st.ts = null;
+      st.leader = null;
+      st.pins = {};                    /* node -> {read, write, gen} (region traces) */
+      st.diverged = {};
+      st.divCount = 0;
+      st.acked = st.refused = st.dropped = st.blackholed = st.failed = 0;
+      st.verdicts = {};                /* Verdict name -> times decide applied it */
+      st.verdictOrder = [];            /* first-seen order, so the tally is stable */
+      st.repaired = 0;
+      st.worldDirty = st.oracleDirty = st.logDirty = true;
+    }
+    reset();
+
+    function pushLog(cls, text) {
+      st.log.push({ cls: cls, text: text });
+      if (st.log.length > LOG_LINES) st.log.shift();
+      st.logDirty = true;
+    }
+
+    function apply(r) {
+      var t = r.t;
+      if (!KNOWN[t] || t === 'meta') return;
+      if (typeof r.sim === 'string') st.sim = r.sim;
+      if (typeof r.ts === 'number') st.ts = r.ts;
+      switch (t) {
+        case 'phase':
+          st.phase = String(r.name === undefined ? '' : r.name);
+          pushLog('hit', 'phase  ' + st.phase);
+          break;
+        case 'step':
+          pushLog('', 'step ' + pad(r.n, 4) + '  n' + r.node + '  ' + r.op);
+          break;
+        case 'round':
+          pushLog('hit', 'round ' + r.n + '  leader n' + r.leader);
+          st.leader = r.leader;
+          break;
+        case 'pass':
+          pushLog('', 'pass  r' + r.round + '.' + r.n + '  markers left ' + r.markers_left);
+          break;
+        case 'op':
+          var kind = r.fate === 'crash' ? 'crash' : (r.blackholed ? 'black' : (r.fate === 'fail' ? 'fail' : 'ok'));
+          if (kind === 'fail') st.failed++;
+          if (kind === 'black') st.blackholed++;
+          st.ring[st.ringAt % RING] = { i: r.i, node: r.node | 0, bucket: r.bucket | 0, kind: kind, born: 0 };
+          st.ringAt++;
+          break;
+        case 'drop':
+          st.dropped++;
+          pushLog('bad', 'drop  n' + r.node + 'b' + r.bucket + '  ' + r.key);
+          break;
+        case 'crash':
+          st.down[r.node] = true;
+          pushLog('bad', 'crash n' + r.node + '  (' + r.reason + ')');
+          break;
+        case 'crash_sched':
+          pushLog('hit', 'crash scheduled n' + r.node + ' at seq ' + r.at_seq + ' (within ' + r.within + ')');
+          break;
+        case 'restart':
+          delete st.down[r.node];
+          pushLog('hit', 'restart n' + r.node + '  (' + r.phase + ')');
+          break;
+        case 'clock':
+          pushLog('', 'clock +' + r.by_secs + 's  ' + r.why);
+          break;
+        case 'ack':
+          /* An ack is a 2xx the client saw. Anything else is a refusal. */
+          if (r.ok === true) st.acked++; else st.refused++;
+          pushLog(r.ok === true ? 'hit' : 'bad',
+            (r.ok === true ? 'ack     ' : 'refused ') + r.kind + '  ' + r.pkg + '  ' + r.file +
+            '  b' + r.bucket + (r.sha8 ? '  ' + r.sha8 : ''));
+          break;
+        case 'pin':
+          st.pins[r.node] = { read: r.read, write: r.write, gen: r.gen };
+          pushLog('hit', 'pin   n' + r.node + '  read b' + r.read + '  write b' + r.write + '  gen ' + r.gen);
+          break;
+        case 'probe':
+          pushLog(r.status >= 400 ? 'bad' : '', 'probe b' + r.bucket + '  ' + r.status +
+            (r.injected ? '  (injected)' : '') + '  ' + r.path);
+          break;
+        case 'ready':
+          pushLog(r.status >= 400 ? 'bad' : '', 'ready n' + r.node + '  ' + r.status + '  ' + r.body);
+          break;
+        case 'note':
+          pushLog('', 'note  b' + r.bucket + '  ' + (r.present ? 'owed' : 'cleared') + '  ' + r.key);
+          break;
+        case 'world':
+          var map = st.state[r.b | 0];
+          if (!map) break;
+          if (r.full) { map = st.state[r.b | 0] = {}; }
+          if (r.put) for (var k in r.put) map[k] = r.put[k];
+          if (r.del) for (var d = 0; d < r.del.length; d++) delete map[r.del[d]];
+          st.worldDirty = true;
+          break;
+        case 'oracle':
+          st.seen.push(r);
+          st.oracleDirty = true;
+          if (r.verdict === 'violated') pushLog('bad', 'ORACLE VIOLATED  ' + r.name);
+          break;
+        /* The merge verdict `pypiron::replicate::decide` returned for one bucket
+           pair and filename. `Noop` is never emitted, so every one of these is a
+           merge the executor would actually apply. */
+        case 'decide':
+          var vd = r.verdict === undefined ? '?' : String(r.verdict);
+          if (!st.verdicts[vd]) { st.verdicts[vd] = 0; st.verdictOrder.push(vd); }
+          st.verdicts[vd]++;
+          pushLog('hit', 'decide  ' + bktName(r.a) + ' ~ ' + bktName(r.b) + '  ' + vd +
+            '  ' + (r.pkg === undefined ? '' : r.pkg) + '  ' + (r.file === undefined ? '' : r.file));
+          break;
+        case 'repair':
+          st.repaired++;
+          pushLog('hit', 'repair  r' + r.round + '  ' + bktName(r.bucket) + '  class ' + r['class'] +
+            '  ' + (r.subject === undefined ? '' : r.subject) +
+            (r.detail ? '  ' + r.detail : ''));
+          break;
+        case 'violation':
+          pushLog('bad', 'VIOLATION  ' + (r.text === undefined ? '(no text)' : String(r.text)));
+          break;
+        default:
+          break;
+      }
+    }
+    function pad(v, w) {
+      var s = String(v);
+      while (s.length < w) s = ' ' + s;
+      return s;
+    }
+    /* The payload's own bucket name when it has one; never an invented one. */
+    function bktName(b) {
+      var nm = typeof b === 'number' && m.bucketNames[b];
+      return nm ? nm : 'b' + b;
+    }
+
+    self.seek = function (i) {
+      i = clamp(i | 0, 0, m.total);
+      if (i === st.i) return;
+      if (i < st.i) reset();
+      var now = performance.now();
+      for (var k = st.i + 1; k <= i; k++) apply(m.rows[k]);
+      /* Ticks admitted by this seek are born now, so they fade from now. */
+      for (var j = 0; j < st.ring.length; j++) if (st.ring[j] && !st.ring[j].born) st.ring[j].born = now;
+      st.i = i;
+    };
+    self.total = m.total;
+    self.canvas = canvas;
+    self.node = wrap;
+    self.model = m;
+
+    /* ---- divergence: a key whose value differs across buckets ---- */
+    function recomputeDivergence() {
+      st.diverged = {};
+      st.divCount = 0;
+      if (m.buckets < 2) return;
+      var keys = {};
+      for (var b = 0; b < m.buckets; b++) for (var k in st.state[b]) keys[k] = 1;
+      for (var key in keys) {
+        var first = null, differs = false, missing = false;
+        for (var c = 0; c < m.buckets; c++) {
+          var v = st.state[c][key];
+          if (v === undefined) { missing = true; continue; }
+          if (first === null) first = v;
+          else if (v !== first) differs = true;
+        }
+        if (differs) { st.diverged[key] = 'differs'; st.divCount++; }
+        else if (missing) st.diverged[key] = 'partial';
+      }
+    }
+
+    function swatchFor(value) {
+      var sha = String(value).split(':').pop();
+      if (st.swatch[sha] === undefined) {
+        st.swatch[sha] = st.nextSwatch % T.ladder.length;
+        st.nextSwatch++;
+      }
+      return T.ladder[st.swatch[sha]];
+    }
+
+    /* ---- the stage: fleet lanes on the left, the world table on the right.
+            One canvas so a MediaRecorder can film it, and so tens of
+            thousands of events never touch the DOM. ---- */
+    var rows = [];     /* cached world row list, rebuilt when the world changes */
+
+    /* union of live keys, grouped by class, diverged keys first */
+    function groupKeys() {
+      var byClass = {};
+      for (var b = 0; b < m.buckets; b++) {
+        for (var k in st.state[b]) (byClass[classify(k)] = byClass[classify(k)] || {})[k] = 1;
+      }
+      return byClass;
+    }
+
+    function buildRows(avail, rowH) {
+      rows = [];
+      var byClass = groupKeys();
+      var budget = Math.max(2, Math.floor(avail / rowH));
+      var hidden = 0;
+      for (var ci = 0; ci < CLASSES.length; ci++) {
+        var cls = CLASSES[ci];
+        if (!byClass[cls]) continue;
+        var keys = Object.keys(byClass[cls]).sort(function (x, y) {
+          var dx = st.diverged[x] === 'differs' ? 0 : 1, dy = st.diverged[y] === 'differs' ? 0 : 1;
+          return dx - dy || (x < y ? -1 : (x > y ? 1 : 0));
+        });
+        if (budget - rows.length < 2) { hidden += keys.length; continue; }
+        /* In a collapsible class, every diverged key is still drawn; only the
+           keys every region agrees on fold into one counted summary line. */
+        if (COLLAPSIBLE[cls]) {
+          var same = keys.filter(function (k) { return st.diverged[k] !== 'differs'; });
+          if (same.length > 2) {
+            rows.push({ head: CLASS_LABEL[cls] });
+            keys.filter(function (k) { return st.diverged[k] === 'differs'; })
+              .forEach(function (k) { rows.push({ key: k }); });
+            rows.push({ note: same.length + ' more keys, identical in every region' });
+            continue;
+          }
+        }
+        rows.push({ head: CLASS_LABEL[cls] });
+        for (var i = 0; i < keys.length; i++) {
+          if (rows.length >= budget - (i < keys.length - 1 ? 1 : 0)) { hidden += keys.length - i; break; }
+          rows.push({ key: keys[i] });
+        }
+      }
+      if (hidden) rows.push({ more: hidden });
+    }
+
+    var lastW = 0, lastH = 0, wantH = 0;
+    var LANE_H = 16, NODE_GAP = 5, NODE_TAG_H = 12, ROW_H = 14, TOP_H = 20;
+
+    /* The stage sizes itself to its content — a fleet of 9 lanes and a world of
+       8 keys should not leave half a screen of empty card. */
+    function contentHeight(PAD) {
+      var fleet = TOP_H + 12 + m.nodes * (NODE_TAG_H + m.buckets * LANE_H + NODE_GAP);
+      var world = TOP_H + 23 + (st.divCount > 0 ? 21 : 0);
+      var byClass = groupKeys();
+      for (var c = 0; c < CLASSES.length; c++) {
+        var ck = byClass[CLASSES[c]];
+        if (!ck) continue;
+        var cks = Object.keys(ck);
+        /* mirror buildRows: a collapsed class costs its diverged keys plus one line */
+        var drawn = cks.length;
+        if (COLLAPSIBLE[CLASSES[c]]) {
+          var uniform = cks.filter(function (k) { return st.diverged[k] !== 'differs'; }).length;
+          if (uniform > 2) drawn = cks.length - uniform + 1;
+        }
+        world += ROW_H * (1 + drawn);
+      }
+      return clamp(Math.round(Math.max(fleet, world, 140)) + 2 * PAD, 170, 620);
+    }
+
+    self.draw = function (now) {
+      var cssW = canvas.clientWidth || 900;
+      if (st.worldDirty) { recomputeDivergence(); wantH = contentHeight(14); }
+      var cssH = wantH || 320;
+      var dpr = window.devicePixelRatio || 1;
+      if (cssW !== lastW || cssH !== lastH) {
+        lastW = cssW; lastH = cssH;
+        canvas.width = Math.round(cssW * dpr);
+        canvas.height = Math.round(cssH * dpr);
+        canvas.style.height = cssH + 'px';
+        st.worldDirty = true;
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      var W = cssW, H = cssH, PAD = 14, GAP = 26;
+
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = T.card;
+      ctx.fillRect(0, 0, W, H);
+
+      var fleetX = PAD;
+      var fleetW = Math.round((W - 2 * PAD - GAP) * 0.40);
+      var worldX = fleetX + fleetW + GAP;
+      var worldW = W - PAD - worldX;
+      var keyW = Math.round(worldW * 0.40);
+      var cellW = (worldW - keyW) / m.buckets;
+      var headY = PAD + TOP_H + 20;  /* baseline of the bucket-name header row */
+
+      /* --- header row inside the stage: phase, clock, position --- */
+      ctx.textBaseline = 'alphabetic';
+      var stamp = (st.phase ? st.phase.toUpperCase() + '   ' : '') +
+        (st.leader !== null && st.phase === 'heal' ? 'leader n' + st.leader + '   ' : '') +
+        (st.sim !== null ? st.sim : (st.ts !== null ? (st.ts / 1000).toFixed(1) + 's' : '')) +
+        '   ' + Math.max(0, st.i) + '/' + m.total;
+      ctx.font = '600 10px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace';
+      var stampW = ctx.measureText(stamp).width;
+      ctx.fillStyle = T.fg;
+      ctx.textAlign = 'right';
+      ctx.fillText(stamp, W - PAD, PAD + 8);
+      ctx.textAlign = 'left';
+      ctx.font = '600 10px ui-sans-serif,system-ui,sans-serif';
+      ctx.fillStyle = T.muted;
+      ctx.fillText('FLEET', fleetX, PAD + 8);
+      /* on a narrow stage the clock wins the top row and WORLD is dropped */
+      if (worldX + 46 < W - PAD - stampW - 10) ctx.fillText('WORLD', worldX, PAD + 8);
+
+      var top = PAD + TOP_H;
+
+      /* --- fleet lanes: one row per n{node}b{bucket}, grouped under the node --- */
+      var rowH = LANE_H;
+      var labelW = 34;
+      var trackX = fleetX + labelW + 4;
+      var trackW = fleetX + fleetW - trackX - 2;
+      var laneY = {};
+      var y = top;
+      var n, b;
+      for (n = 0; n < m.nodes; n++) {
+        var down = !!st.down[n];
+        ctx.globalAlpha = down ? 0.45 : 1;
+        /* the node's own label carries its region, because a region is a
+           property of a node in this product — never of a bucket */
+        ctx.font = '600 10px ui-sans-serif,system-ui,sans-serif';
+        ctx.fillStyle = down ? T.bad : T.fg;
+        var tag = 'n' + n + (m.regions[n] ? '  ' + m.regions[n] : '') + (down ? '  DOWN' : '');
+        var pin = st.pins[n];
+        if (pin) tag += '  read b' + pin.read + ' · write b' + pin.write;
+        if (m.homes[n] !== null) tag += '  write home b' + m.homes[n];
+        ctx.fillText(fit(ctx, tag, fleetW), fleetX, y + 9);
+        y += NODE_TAG_H;
+        for (b = 0; b < m.buckets; b++) {
+          var cy = y + rowH / 2;
+          laneY[n + ':' + b] = cy;
+          ctx.font = '10px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace';
+          ctx.fillStyle = m.homes[n] === b ? T.accent : T.muted;
+          ctx.fillText('b' + b, fleetX + 12, cy + 3);
+          ctx.fillStyle = T.track;
+          ctx.fillRect(trackX, cy - 0.5, trackW, 1);
+          if (down) {
+            /* crashed lanes get a hatch so a dimmed row is never ambiguous */
+            ctx.strokeStyle = T.border;
+            ctx.lineWidth = 1;
+            for (var hx = trackX; hx < trackX + trackW; hx += 7) {
+              ctx.beginPath();
+              ctx.moveTo(hx, cy + 3.5);
+              ctx.lineTo(hx + 4, cy - 3.5);
+              ctx.stroke();
+            }
+          }
+          y += rowH;
+        }
+        y += NODE_GAP;
+        ctx.globalAlpha = 1;
+      }
+
+      /* --- partition write homes. The lane a node writes to gets a solid
+             accent link pointing at the world; every other lane gets a dotted
+             muted stub. The bucket column then names its writers, which is the
+             honest way to say "this column is n1's write home" without dragging
+             a line across the key names. Only drawn when homes are declared. --- */
+      var homeWriters = {};
+      if (m.hasHomes) {
+        for (n = 0; n < m.nodes; n++) {
+          var home = m.homes[n];
+          if (home === null) continue;
+          (homeWriters[home] = homeWriters[home] || []).push('n' + n);
+          ctx.globalAlpha = st.down[n] ? 0.35 : 1;
+          for (b = 0; b < m.buckets; b++) {
+            var ly = laneY[n + ':' + b];
+            if (ly === undefined) continue;
+            ctx.beginPath();
+            if (b === home) {
+              ctx.setLineDash([]);
+              ctx.strokeStyle = T.accent;
+              ctx.lineWidth = 1.4;
+              ctx.moveTo(trackX + trackW + 1, ly);
+              ctx.lineTo(worldX - 8, ly);
+              ctx.stroke();
+              ctx.fillStyle = T.accent;
+              ctx.beginPath();
+              ctx.moveTo(worldX - 8, ly - 3);
+              ctx.lineTo(worldX - 2, ly);
+              ctx.lineTo(worldX - 8, ly + 3);
+              ctx.fill();
+            } else {
+              ctx.setLineDash([1, 3]);
+              ctx.strokeStyle = T.muted;
+              ctx.lineWidth = 1;
+              ctx.moveTo(trackX + trackW + 1, ly);
+              ctx.lineTo(worldX - 10, ly);
+              ctx.stroke();
+              ctx.setLineDash([]);
+            }
+          }
+          ctx.globalAlpha = 1;
+        }
+      }
+
+      /* --- op ticks: a scrolling window of recent events. A trace shorter than
+             the window is shown whole, so a 50-event run is not crammed left. --- */
+      var win = Math.min(OP_WINDOW, Math.max(40, m.total));
+      var from = Math.max(0, st.i - win);
+      for (var ri = 0; ri < st.ring.length; ri++) {
+        var op = st.ring[ri];
+        if (!op || op.i < from || op.i > st.i) continue;
+        var cy2 = laneY[op.node + ':' + op.bucket];
+        if (cy2 === undefined) continue;
+        var x = trackX + (op.i - from) / win * trackW;
+        var age = now - (op.born || now);
+        var alpha, col, h = rowH >= 11 ? 7 : 5;
+        if (op.kind === 'ok') {
+          /* fresh ops read as muted and settle into the --border hairline */
+          var fresh = age < OK_FADE_MS;
+          alpha = fresh ? 1 - 0.5 * (age / OK_FADE_MS) : 0.9;
+          col = fresh ? T.muted : T.border;
+        } else if (op.kind === 'crash') {
+          alpha = 1; col = T.bad; h += 3;
+        } else {
+          alpha = age < FAIL_FADE_MS ? 1 - 0.6 * (age / FAIL_FADE_MS) : 0.4;
+          col = T.accent; h += 1;
+        }
+        ctx.globalAlpha = alpha;
+        if (op.kind === 'black') {
+          /* blackholed: an accent tick with a hollow center */
+          ctx.strokeStyle = col;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(x + 0.5, cy2 - h / 2);
+          ctx.lineTo(x + 0.5, cy2 - 1);
+          ctx.moveTo(x + 0.5, cy2 + 1);
+          ctx.lineTo(x + 0.5, cy2 + h / 2);
+          ctx.stroke();
+        } else {
+          ctx.fillStyle = col;
+          ctx.fillRect(x, cy2 - h / 2, op.kind === 'ok' ? 1 : 1.6, h);
+        }
+        ctx.globalAlpha = 1;
+      }
+      /* the now-edge */
+      ctx.fillStyle = hexRgba(T.muted, 0.35);
+      ctx.fillRect(trackX + trackW, top, 1, y - top - NODE_GAP);
+
+      /* a running tally, so the counts are readable in a still frame */
+      var tally = [];
+      /* "acked requests", not "acked": the header pill counts distinct acked
+         filenames out of the summary line, which is a different number. */
+      if (st.acked) tally.push(fmt(st.acked) + ' acked request' + (st.acked === 1 ? '' : 's'));
+      if (st.refused) tally.push(fmt(st.refused) + ' refused');
+      if (st.failed) tally.push(fmt(st.failed) + ' injected failure' + (st.failed === 1 ? '' : 's'));
+      if (st.blackholed) tally.push(fmt(st.blackholed) + ' blackholed');
+      if (st.dropped) tally.push(fmt(st.dropped) + ' note' + (st.dropped === 1 ? '' : 's') + ' dropped');
+      if (st.repaired) tally.push(fmt(st.repaired) + ' audit repair' + (st.repaired === 1 ? '' : 's'));
+      if (tally.length) {
+        ctx.font = '10px ui-sans-serif,system-ui,sans-serif';
+        ctx.fillStyle = T.muted;
+        ctx.fillText(fit(ctx, tally.join('  ·  '), fleetW), fleetX, Math.min(y + 9, H - 6));
+      }
+      /* Which merge verdicts this run has exercised so far. `decide` is the real
+         `pypiron::replicate::decide`, so this line is the payoff of a
+         partitioned run — it gets its own row, in the accent ink. */
+      if (st.verdictOrder.length) {
+        var vparts = st.verdictOrder.map(function (nm) { return nm + ' ×' + st.verdicts[nm]; });
+        ctx.font = '600 10px ui-sans-serif,system-ui,sans-serif';
+        ctx.fillStyle = T.accent;
+        ctx.fillText(fit(ctx, 'merge verdicts  ' + vparts.join('   '), fleetW),
+          fleetX, Math.min(y + (tally.length ? 22 : 9), H - 6));
+      }
+
+      /* --- world table: keys down, buckets across. Bucket headers are the
+             payload's own bucket_names; a region name is never invented. --- */
+      ctx.font = '600 10px ui-sans-serif,system-ui,sans-serif';
+      for (var bb = 0; bb < m.buckets; bb++) {
+        var bx = worldX + keyW + bb * cellW;
+        ctx.fillStyle = T.fg;
+        ctx.font = '600 10px ui-sans-serif,system-ui,sans-serif';
+        ctx.fillText(fit(ctx, m.bucketNames[bb], cellW - 6), bx, headY);
+        if (homeWriters[bb]) {
+          ctx.fillStyle = T.accent;
+          ctx.font = '9px ui-sans-serif,system-ui,sans-serif';
+          ctx.fillText(fit(ctx, 'write home: ' + homeWriters[bb].join(' '), cellW - 6), bx, headY - 11);
+        }
+      }
+      ctx.strokeStyle = T.border;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(worldX, headY + 5.5);
+      ctx.lineTo(worldX + worldW, headY + 5.5);
+      ctx.stroke();
+      var wy = headY + 8;
+
+      /* the divergence banner: the one thing that must be impossible to miss */
+      if (st.divCount > 0) {
+        ctx.fillStyle = T.accent;
+        roundRect(ctx, worldX, wy, worldW, 16, 4);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.font = '600 10px ui-sans-serif,system-ui,sans-serif';
+        ctx.fillText(st.divCount + ' KEY' + (st.divCount === 1 ? '' : 'S') + ' DIFFER ACROSS BUCKETS',
+          worldX + 6, wy + 11);
+        wy += 21;
+      }
+
+      var rowH2 = ROW_H;
+      if (st.worldDirty) { buildRows(H - PAD - wy, rowH2); st.worldDirty = false; }
+      for (var rr = 0; rr < rows.length; rr++) {
+        var row = rows[rr];
+        if (wy + rowH2 > H - PAD + 2) break;
+        if (row.head) {
+          ctx.font = '600 9px ui-sans-serif,system-ui,sans-serif';
+          ctx.fillStyle = T.muted;
+          ctx.fillText(row.head, worldX, wy + 9);
+          wy += rowH2;
+          continue;
+        }
+        if (row.more) {
+          ctx.font = 'italic 10px ui-sans-serif,system-ui,sans-serif';
+          ctx.fillStyle = T.muted;
+          ctx.fillText('+' + row.more + ' more keys (window too small to draw them)', worldX, wy + 9);
+          wy += rowH2;
+          continue;
+        }
+        if (row.note) {
+          ctx.font = 'italic 10px ui-sans-serif,system-ui,sans-serif';
+          ctx.fillStyle = T.muted;
+          ctx.fillText(row.note, worldX, wy + 9);
+          wy += rowH2;
+          continue;
+        }
+        var key = row.key;
+        var diverged = st.diverged[key] === 'differs';
+        ctx.font = '10px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace';
+        ctx.fillStyle = diverged ? T.accent : T.fg;
+        ctx.fillText(fit(ctx, shortKey(key), keyW - 6), worldX, wy + 9);
+        for (var b2 = 0; b2 < m.buckets; b2++) {
+          var vx = worldX + keyW + b2 * cellW;
+          var val = st.state[b2][key];
+          if (val === undefined) {
+            ctx.fillStyle = T.muted;
+            ctx.fillText('—', vx + 2, wy + 9);
+            continue;
+          }
+          var tw = cellW - 6;
+          var label = ctx.measureText(val).width <= tw ? val : String(val).split(':').pop();
+          ctx.fillStyle = swatchFor(val);
+          roundRect(ctx, vx, wy, Math.min(tw, ctx.measureText(label).width + 8), rowH2 - 2, 3);
+          ctx.fill();
+          if (diverged) {
+            ctx.strokeStyle = T.accent;
+            ctx.lineWidth = 2;
+            ctx.stroke();
+          }
+          ctx.fillStyle = T.fg;
+          ctx.fillText(fit(ctx, label, tw), vx + 4, wy + 9);
+        }
+        wy += rowH2;
+      }
+
+    };
+
+    function shortKey(k) {
+      return k.replace(/^packages\//, '').replace(/^simple\//, 'simple/');
+    }
+
+    /* ---- DOM panels, rebuilt only when their data changed ---- */
+    self.sync = function () {
+      if (st.oracleDirty) {
+        oBody.textContent = '';
+        for (var i = 0; i < st.seen.length; i++) {
+          var o = st.seen[i];
+          var verdict = o.verdict === 'held' || o.verdict === 'violated' ? o.verdict : 'not-executed';
+          var tr = el('tr');
+          tr.appendChild(el('td', null, o.name === undefined ? '(unnamed)' : String(o.name)));
+          tr.appendChild(el('td', 'n', typeof o.executed === 'number' ? fmt(o.executed) : '—'));
+          var td = el('td', 'v');
+          var dot = el('span', 'dot ' + (verdict === 'held' ? 'held' : verdict === 'violated' ? 'violated' : 'none'));
+          td.appendChild(dot);
+          /* A non-executed oracle renders as "not executed" and nothing else.
+             The trace may carry an excuse string; the player does not repeat it. */
+          td.appendChild(el('span', verdict === 'violated' ? 'vio' : null,
+            verdict === 'held' ? 'held' : verdict === 'violated' ? 'violated' : 'not executed'));
+          tr.appendChild(td);
+          oBody.appendChild(tr);
+          if (verdict === 'violated' && typeof o.detail === 'string' && o.detail) {
+            var dr = el('tr');
+            var dtd = el('td', 'detail');
+            dtd.setAttribute('colspan', '3');
+            var pre = el('pre');
+            pre.appendChild(el('code', null, o.detail));
+            dtd.appendChild(pre);
+            dr.appendChild(dtd);
+            oBody.appendChild(dr);
+          }
+        }
+        if (!st.seen.length) {
+          var tr0 = el('tr');
+          var td0 = el('td', null, 'no oracle events yet');
+          td0.setAttribute('colspan', '3');
+          td0.style.color = T.muted;
+          tr0.appendChild(td0);
+          oBody.appendChild(tr0);
+        }
+        st.oracleDirty = false;
+      }
+      if (st.logDirty) {
+        logUl.textContent = '';
+        for (var j = 0; j < st.log.length; j++) {
+          var li = el('li', st.log[j].cls, st.log[j].text);
+          /* A log line clips at the card's width. The full text — which for a
+             violation is the whole invariant string — stays reachable on hover
+             instead of being lost to the ellipsis. */
+          li.title = st.log[j].text;
+          logUl.appendChild(li);
+        }
+        st.logDirty = false;
+      }
+    };
+
+    /* ---- timeline: SVG, marks bucketed per pixel column ---- */
+    var playhead = null, tlW = 0;
+    function buildTimeline() {
+      var w = Math.max(240, Math.round(tlsvg.clientWidth || 900));
+      tlW = w;
+      var h = 78;
+      tlsvg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+      tlsvg.textContent = '';
+      var total = Math.max(1, m.total);
+      var x = function (i) { return i / total * w; };
+
+      /* phase bands */
+      var bandY = 0, bandH = 15;
+      for (var p = 0; p < m.phases.length; p++) {
+        var from = m.phases[p].i;
+        var to = p + 1 < m.phases.length ? m.phases[p + 1].i : m.total;
+        var bw = Math.max(1, x(to) - x(from));
+        tlsvg.appendChild(svgEl('rect', {
+          x: x(from), y: bandY, width: bw, height: bandH, fill: T.track,
+          stroke: T.card, 'stroke-width': 1
+        }));
+        if (bw > 34) {
+          var t = svgEl('text', { x: x(from) + 4, y: bandY + 11, fill: T.muted });
+          t.textContent = String(m.phases[p].name === undefined ? '' : m.phases[p].name);
+          tlsvg.appendChild(t);
+        }
+      }
+
+      /* marks, bucketed to one column per pixel so a 40k-event trace still
+         produces a bounded number of SVG nodes */
+      var marksTop = bandH + 5, marksH = 40;
+      var cols = {};
+      function put(i, cls, v) {
+        var c = Math.round(x(i));
+        var e = cols[c] || (cols[c] = {});
+        e[cls] = Math.max(e[cls] || 0, v === undefined ? 1 : v);
+      }
+      var k;
+      for (k = 0; k < m.acksOk.length; k++) put(m.acksOk[k].i, 'ack');
+      for (k = 0; k < m.acksNo.length; k++) put(m.acksNo[k].i, 'nack');
+      for (k = 0; k < m.crashes.length; k++) put(m.crashes[k].i, 'crash');
+      for (k = 0; k < m.clocks.length; k++) {
+        put(m.clocks[k].i, 'clock', clamp(Math.log(Math.max(1, m.clocks[k].by_secs || 1)) / Math.log(86400), 0.15, 1));
+      }
+      for (k = 0; k < m.violations.length; k++) put(m.violations[k].i, 'vio');
+      for (k = 0; k < m.decides.length; k++) put(m.decides[k].i, 'decide');
+      for (k = 0; k < m.repairs.length; k++) put(m.repairs[k].i, 'repair');
+      var order = Object.keys(cols).sort(function (a, b) { return a - b; });
+      for (k = 0; k < order.length; k++) {
+        var c = +order[k], e = cols[c];
+        if (e.clock) {
+          var ch = 6 + e.clock * (marksH - 12);
+          var g = svgEl('path', {
+            d: 'M' + (c - 3) + ' ' + (marksTop + marksH - ch) + ' L' + c + ' ' + (marksTop + marksH - ch - 5) +
+              ' L' + (c + 3) + ' ' + (marksTop + marksH - ch),
+            fill: 'none', stroke: T.muted, 'stroke-width': 1
+          });
+          tlsvg.appendChild(g);
+        }
+        /* A refused request gets its own muted mark, on its own row just above
+           the ack baseline so a column carrying both still shows both. It is
+           never the green success tick, and it is never invisible either. */
+        if (e.nack) {
+          tlsvg.appendChild(svgEl('rect', {
+            x: c, y: marksTop + marksH - 12, width: 1.4, height: 4, fill: T.muted
+          }));
+        }
+        if (e.ack) {
+          tlsvg.appendChild(svgEl('rect', {
+            x: c, y: marksTop + marksH - 7, width: 1.4, height: 7, fill: T.ok
+          }));
+        }
+        if (e.crash) {
+          tlsvg.appendChild(svgEl('rect', { x: c, y: marksTop, width: 1.4, height: marksH, fill: T.bad }));
+        }
+        /* A merge verdict: a filled accent diamond on its own row. It is the
+           output of the real decide(), and the whole point of a partitioned
+           run, so it is drawn above the ack baseline where nothing hides it. */
+        if (e.decide) {
+          tlsvg.appendChild(svgEl('path', {
+            d: 'M' + c + ' ' + (marksTop + 11) + ' L' + (c + 4) + ' ' + (marksTop + 16) +
+              ' L' + c + ' ' + (marksTop + 21) + ' L' + (c - 4) + ' ' + (marksTop + 16) + ' Z',
+            fill: T.accent
+          }));
+        }
+        if (e.repair) {
+          tlsvg.appendChild(svgEl('rect', {
+            x: c - 1, y: marksTop + 13, width: 2.4, height: 6, fill: T.ok
+          }));
+        }
+        if (e.vio) {
+          tlsvg.appendChild(svgEl('path', {
+            d: 'M' + (c - 5) + ' ' + marksTop + ' L' + (c + 5) + ' ' + marksTop + ' L' + c + ' ' + (marksTop + 9) + ' Z',
+            fill: T.bad
+          }));
+        }
+      }
+
+      /* axis */
+      tlsvg.appendChild(svgEl('rect', { x: 0, y: marksTop + marksH, width: w, height: 1, fill: T.border }));
+      var lab = svgEl('text', { x: 0, y: h - 4, fill: T.muted });
+      lab.textContent = '0';
+      tlsvg.appendChild(lab);
+      var lab2 = svgEl('text', { x: w, y: h - 4, fill: T.muted, 'text-anchor': 'end' });
+      lab2.textContent = fmt(m.total) + ' events' + (m.opCount ? '  ·  ' + fmt(m.opCount) + ' storage ops' : '');
+      tlsvg.appendChild(lab2);
+
+      playhead = svgEl('g', {});
+      playhead.appendChild(svgEl('rect', { x: 0, y: 0, width: 1.5, height: marksTop + marksH, fill: T.accent }));
+      playhead.appendChild(svgEl('path', { d: 'M-4 0 L4 0 L0 6 Z', fill: T.accent }));
+      tlsvg.appendChild(playhead);
+    }
+    self.buildTimeline = buildTimeline;
+    self.movePlayhead = function () {
+      if (!playhead) return;
+      var px = Math.max(0, st.i) / Math.max(1, m.total) * tlW;
+      playhead.setAttribute('transform', 'translate(' + px + ',0)');
+    };
+    tlsvg.addEventListener('pointerdown', function (ev) {
+      var r = tlsvg.getBoundingClientRect();
+      var frac = clamp((ev.clientX - r.left) / r.width, 0, 1);
+      PL.pause();
+      PL.goto(Math.round(frac * m.total));
+      tlsvg.setPointerCapture(ev.pointerId);
+    });
+    tlsvg.addEventListener('pointermove', function (ev) {
+      if (!tlsvg.hasPointerCapture || !tlsvg.hasPointerCapture(ev.pointerId)) return;
+      var r = tlsvg.getBoundingClientRect();
+      PL.goto(Math.round(clamp((ev.clientX - r.left) / r.width, 0, 1) * m.total));
+    });
+
+    self.phaseIndices = function () { return m.phases.map(function (p) { return p.i; }); };
+    self.crashIndices = function () { return m.crashes.map(function (p) { return p.i; }); };
+    self.violationIndices = function () { return m.violations.map(function (p) { return p.i; }); };
+    return self;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 5. the player clock — one clock drives every panel, which is what
+   *    makes the two-trace comparison legible
+   * ------------------------------------------------------------------ */
+
+  var SPEEDS = [0.25, 1, 4, 'max'];
+  var BASE_EPS = 45;
+
+  var PL = {
+    i: 0, total: 0, playing: false, speed: 1, panels: [], graph: null, last: 0, raf: 0,
+    goto: function (i) {
+      PL.i = clamp(i, 0, PL.total);
+      PL.apply();
+    },
+    apply: function () {
+      for (var k = 0; k < PL.panels.length; k++) PL.panels[k].seek(PL.i);
+      if (PL.graph) PL.graph.seek(PL.i);
+      updatePos();
+    },
+    play: function () {
+      if (PL.playing || !PL.total) return;
+      PL.playing = true;
+      PL.last = performance.now();
+      setPressed(qs('#play'), true);
+    },
+    pause: function () {
+      PL.playing = false;
+      setPressed(qs('#play'), false);
+    },
+    toggle: function () { PL.playing ? PL.pause() : PL.play(); }
+  };
+
+  function qs(sel) { return doc.querySelector(sel); }
+  function setPressed(btn, on) { if (btn) btn.setAttribute('aria-pressed', on ? 'true' : 'false'); }
+
+  function eps() { return PL.speed === 'max' ? 1500 : BASE_EPS * PL.speed; }
+
+  function frame(now) {
+    PL.raf = requestAnimationFrame(frame);
+    if (PL.playing) {
+      var dt = Math.min(250, now - PL.last);
+      PL.last = now;
+      var adv = dt / 1000 * eps();
+      if (adv >= 1) {
+        PL.i += Math.floor(adv);
+        PL.last = now - (adv - Math.floor(adv)) / eps() * 1000;
+        if (PL.i >= PL.total) {
+          PL.i = PL.total;
+          PL.apply();
+          if (LOOP) { PL.i = 0; PL.apply(); } else { PL.pause(); if (REC.active) REC.stop(); }
+        } else {
+          PL.apply();
+        }
+      }
+    }
+    for (var k = 0; k < PL.panels.length; k++) {
+      PL.panels[k].draw(now);
+      PL.panels[k].sync();
+      PL.panels[k].movePlayhead();
+    }
+  }
+
+  function updatePos() {
+    var p = qs('#pos');
+    if (p) p.textContent = fmt(PL.i) + ' / ' + fmt(PL.total) + ' events';
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 6. graph mode — a layered DAG, tree edges solid, joins dashed
+   * ------------------------------------------------------------------ */
+
+  /* What the checker settled for the drawn config, per property. A `sometimes`
+     property that no state in this space reached is a coverage gap, not a pass:
+     it renders the way the trace mode renders an oracle that never ran —
+     stated, dashed, never green. A property with no status claims nothing. */
+  var PROP_STATUS = {
+    held: ['badge ok', 'held', 'No state in this space violated it.'],
+    reached: ['badge ok', 'reached', 'Some state in this space satisfied it.'],
+    'not-reached': ['badge unreached', 'not reached',
+      'No state in this drawn config reached it. Nothing more is claimed about it.'],
+    violated: ['badge dead', 'violated', 'The checker found a counterexample in this space.']
+  };
+
+  function renderGraph(g, host) {
+    host.hidden = false;
+    var counts = g.counts || {};
+    var nodes = g.nodes || [];
+    var edges = g.edges || [];
+    var byId = {};
+    nodes.forEach(function (n) { byId[n.id] = n; });
+
+    var wrap = el('div', 'gwrap');
+    var left = el('div');
+    var svg = svgEl('svg', { class: 'graph', preserveAspectRatio: 'xMidYMid meet' });
+    left.appendChild(svg);
+    var leg = el('div', 'legend');
+    [['tree edge (first time this world was reached)', T.border],
+      ['join edge (independent orders reconverge)', T.muted],
+      ['selected path', T.accent]].forEach(function (p) {
+      var s = el('span');
+      var i = el('i');
+      i.style.background = p[1];
+      s.appendChild(i);
+      s.appendChild(doc.createTextNode(p[0]));
+      leg.appendChild(s);
+    });
+    left.appendChild(leg);
+    wrap.appendChild(left);
+
+    var side = el('div');
+    var cCard = el('div', 'card');
+    cCard.appendChild(el('h2', null, 'Counts'));
+    var gs = el('div', 'gstats');
+    var joins = (counts.edges || edges.length) - (counts.tree_edges || 0);
+    [[fmt(counts.nodes !== undefined ? counts.nodes : nodes.length), 'states drawn'],
+      [fmt(counts.edges !== undefined ? counts.edges : edges.length), 'transitions'],
+      [fmt(joins), 'joins (non-tree)'],
+      [fmt(counts.depth !== undefined ? counts.depth : 0), 'BFS depth'],
+      [fmt(counts.ci_states !== undefined ? counts.ci_states : 0), 'states CI checks']
+    ].forEach(function (p, ix) {
+      var d = el('div', 'gstat');
+      d.appendChild(el('div', 'v', p[0]));
+      var l = el('div', 'l', p[1]);
+      if (ix === 3 && counts.ci_depth_note) {
+        l.className = 'l tip';
+        l.setAttribute('data-tip', counts.ci_depth_note);
+      }
+      d.appendChild(l);
+      gs.appendChild(d);
+    });
+    cCard.appendChild(gs);
+    if (g.model) cCard.appendChild(el('p', 'foot', 'model: ' + g.model));
+    if (g.props && g.props.length) {
+      var pl = el('p', 'foot');
+      pl.appendChild(doc.createTextNode('properties checked: '));
+      g.props.forEach(function (pr) {
+        var ps = PROP_STATUS[pr.status];
+        var b = el('span', ps ? ps[0] : 'badge',
+          (pr.kind ? pr.kind + ' ' : '') + pr.name + (ps ? ' — ' + ps[1] : ''));
+        if (ps) b.title = ps[2];
+        pl.appendChild(b);
+      });
+      cCard.appendChild(pl);
+    }
+    side.appendChild(cCard);
+
+    var pathCard = el('div', 'card');
+    pathCard.style.marginTop = '14px';
+    pathCard.appendChild(el('h2', null, 'Named paths'));
+    var sel = el('select');
+    sel.style.cssText = 'font:inherit;font-size:13px;width:100%;margin-top:6px;padding:5px 8px;' +
+      'background:var(--card);color:var(--fg);border:1px solid var(--border);border-radius:6px';
+    var none = el('option', null, '(none - show the whole space)');
+    none.value = '-1';
+    sel.appendChild(none);
+    (g.paths || []).forEach(function (p, ix) {
+      var o = el('option', null, (p.kind ? p.kind + ': ' : '') + p.name + '  (' +
+        Math.max(0, (p.steps || []).length - 1) + ' actions)');
+      o.value = String(ix);
+      sel.appendChild(o);
+    });
+    pathCard.appendChild(sel);
+    var stepOut = el('p', 'foot');
+    pathCard.appendChild(stepOut);
+    if ((g.paths || []).length) {
+      pathCard.appendChild(el('p', 'foot', 'Pick a path to step through it with the playback controls.'));
+    }
+    side.appendChild(pathCard);
+
+    var iCard = el('div', 'card insp');
+    iCard.style.marginTop = '14px';
+    iCard.appendChild(el('h2', null, 'State inspector'));
+    var iBody = el('div');
+    iCard.appendChild(iBody);
+    side.appendChild(iCard);
+    wrap.appendChild(side);
+    host.textContent = '';
+    host.appendChild(wrap);
+
+    /* layout: y = depth, x = index within depth */
+    var byDepth = {}, maxDepth = 0;
+    nodes.forEach(function (n) {
+      var d = n.depth | 0;
+      (byDepth[d] = byDepth[d] || []).push(n);
+      if (d > maxDepth) maxDepth = d;
+    });
+    var widest = 1;
+    for (var d0 in byDepth) widest = Math.max(widest, byDepth[d0].length);
+    var VW = Math.max(900, Math.min(2400, widest * 22));
+    var rowH = clamp(Math.round(1100 / (maxDepth + 1)), 34, 96);
+    var VH = (maxDepth + 1) * rowH + 40;
+    svg.setAttribute('viewBox', '0 0 ' + VW + ' ' + VH);
+    svg.setAttribute('height', Math.round(VH * (900 / VW)));
+    var pos = {};
+    for (var dd = 0; dd <= maxDepth; dd++) {
+      var list = byDepth[dd] || [];
+      list.sort(function (a, b) { return a.id - b.id; });
+      for (var ix = 0; ix < list.length; ix++) {
+        pos[list[ix].id] = { x: (ix + 1) / (list.length + 1) * VW, y: 24 + dd * rowH };
+      }
+    }
+
+    var edgeEls = [];
+    edges.forEach(function (e) {
+      var a = pos[e.from], b = pos[e.to];
+      if (!a || !b) return;
+      var line = svgEl('path', {
+        d: 'M' + a.x + ' ' + a.y + ' C' + a.x + ' ' + (a.y + rowH * 0.45) + ' ' + b.x + ' ' + (b.y - rowH * 0.45) + ' ' + b.x + ' ' + b.y,
+        fill: 'none',
+        stroke: e.tree ? T.border : T.muted,
+        'stroke-width': e.tree ? 1.2 : 0.9,
+        'stroke-dasharray': e.tree ? null : '3 3',
+        opacity: e.tree ? 1 : 0.75
+      });
+      svg.appendChild(line);
+      edgeEls.push({ e: e, node: line });
+    });
+
+    var nodeEls = {};
+    nodes.forEach(function (n) {
+      var p = pos[n.id];
+      if (!p) return;
+      var flags = n.flags || {};
+      var r = svgEl('rect', {
+        x: p.x - 5, y: p.y - 5, width: 10, height: 10, rx: 2.5,
+        fill: flags.quiescent ? T.accent : T.card,
+        stroke: flags.converged ? T.ok : T.border,
+        'stroke-width': flags.converged ? 1.6 : 1,
+        cursor: 'pointer'
+      });
+      var title = svgEl('title', {});
+      title.textContent = 'state ' + n.id + '  depth ' + n.depth +
+        (flags.quiescent ? '  quiescent' : '') + (flags.converged ? '  converged' : '');
+      r.appendChild(title);
+      r.addEventListener('click', function () { inspect(n.id); });
+      svg.appendChild(r);
+      nodeEls[n.id] = r;
+    });
+    var legend2 = el('p', 'foot');
+    legend2.appendChild(el('span', 'badge on', 'filled = quiescent'));
+    legend2.appendChild(el('span', 'badge ok', 'green outline = buckets converged'));
+    left.appendChild(legend2);
+
+    /* --- the inspector renders the model's own projection, plus the raw
+           dump when the producer included it (the anti-rot guard) --- */
+    function kvTable(obj) {
+      var tb = el('table');
+      Object.keys(obj).forEach(function (k) {
+        var tr = el('tr');
+        tr.appendChild(el('th', null, k));
+        var td = el('td');
+        var v = obj[k];
+        if (v === null || v === undefined) td.appendChild(el('span', 'badge', 'null'));
+        else if (typeof v === 'object') td.appendChild(el('span', 'mono', JSON.stringify(v)));
+        else td.textContent = String(v);
+        tr.appendChild(td);
+        tb.appendChild(tr);
+      });
+      return tb;
+    }
+    /* One inspector section. A throw while drawing one section must not blank
+       the others, and the raw JS error never becomes page copy: it goes to the
+       console, where a contributor can read it, and the page says only that
+       this section did not render. */
+    function section(fn) {
+      try { fn(); } catch (err) {
+        if (window.console && console.error) console.error('state inspector section failed:', err);
+        var p = el('p', 'foot');
+        p.appendChild(el('span', 'badge dead', 'this section did not render — see the browser console'));
+        iBody.appendChild(p);
+      }
+    }
+    function inspect(id) {
+      var n = byId[id];
+      iBody.textContent = '';
+      if (!n) { iBody.appendChild(el('p', 'foot', 'no such state')); return; }
+      var head = el('p');
+      head.appendChild(el('span', 'badge on', 'state ' + n.id));
+      head.appendChild(el('span', 'badge', 'depth ' + n.depth));
+      var f = n.flags || {};
+      head.appendChild(el('span', f.quiescent ? 'badge on' : 'badge', f.quiescent ? 'quiescent' : 'not quiescent'));
+      head.appendChild(el('span', f.converged ? 'badge ok' : 'badge dead', f.converged ? 'converged' : 'not converged'));
+      iBody.appendChild(head);
+      var s = n.state || {};
+      section(function () {
+        if (!s.buckets) return;
+        s.buckets.forEach(function (b, bi) {
+          var h = el('p', 'foot');
+          h.style.marginTop = '8px';
+          h.textContent = 'bucket-' + bi + (b.pkg_origin ? '  origin ' + b.pkg_origin : '');
+          iBody.appendChild(h);
+          (b.files || []).forEach(function (fr) {
+            var line = el('div');
+            line.appendChild(el('span', 'mono', fr.file || '?'));
+            line.appendChild(doc.createTextNode(' '));
+            line.appendChild(el('span', fr.artifact ? 'badge ok' : 'badge', 'artifact ' + (fr.artifact === null || fr.artifact === undefined ? 'absent' : fr.artifact)));
+            if (!fr.sidecar) {
+              line.appendChild(el('span', 'badge', 'sidecar absent'));
+            } else if (typeof fr.sidecar === 'object') {
+              /* one badge per sidecar field, so a long dump cannot overflow */
+              line.appendChild(el('span', 'badge on', 'sidecar'));
+              Object.keys(fr.sidecar).forEach(function (sk) {
+                var sv = fr.sidecar[sk];
+                if (sv === false || sv === null || sv === undefined) return;
+                line.appendChild(el('span', 'badge', sk + (sv === true ? '' : ' ' + sv)));
+              });
+            } else {
+              line.appendChild(el('span', 'badge on', 'sidecar ' + fr.sidecar));
+            }
+            if (fr.tombstoned) line.appendChild(el('span', 'badge dead', 'tombstoned'));
+            if (fr.frozen) line.appendChild(el('span', 'badge on', 'frozen'));
+            if (fr.mirror_quarantined) line.appendChild(el('span', 'badge on', 'mirror-quarantined'));
+            iBody.appendChild(line);
+          });
+          if (b.quarantine && b.quarantine.length) {
+            var q = el('div');
+            q.appendChild(el('span', 'badge', 'quarantine: ' + b.quarantine.length));
+            b.quarantine.forEach(function (qq) {
+              q.appendChild(el('span', 'badge', typeof qq === 'object' ? JSON.stringify(qq) : String(qq)));
+            });
+            iBody.appendChild(q);
+          }
+        });
+      });
+      /* Two models, two shapes: the replication model's `writers` is an array
+         of writer records, the event-protocol model's is an object keyed by
+         writer name whose values are program counters. Render either. */
+      section(function () {
+        if (!s.writers) return;
+        var list = Array.isArray(s.writers)
+          ? s.writers.map(function (w, wi) { return ['w' + wi, w]; })
+          : Object.keys(s.writers).map(function (k) { return [k, s.writers[k]]; });
+        if (!list.length) return;
+        var wh = el('p', 'foot');
+        wh.style.marginTop = '8px';
+        wh.textContent = 'writers';
+        iBody.appendChild(wh);
+        list.forEach(function (pair) {
+          var name = pair[0], w = pair[1];
+          var line = el('div');
+          if (w && typeof w === 'object') {
+            line.appendChild(el('span', 'badge on', name + (w.pc === undefined ? '' : '  pc ' + w.pc)));
+            if (w.bucket !== undefined && w.bucket !== null) {
+              line.appendChild(el('span', 'badge', 'bucket-' + w.bucket));
+            }
+            if (w.kind !== undefined && w.kind !== null) line.appendChild(el('span', 'mono', ' ' + w.kind));
+          } else {
+            line.appendChild(el('span', 'badge on', name));
+            line.appendChild(el('span', 'mono', ' ' + (w === null ? 'null' : String(w))));
+          }
+          iBody.appendChild(line);
+        });
+      });
+      section(function () {
+        var rest = {};
+        Object.keys(s).forEach(function (k) { if (k !== 'buckets' && k !== 'writers') rest[k] = s[k]; });
+        if (!Object.keys(rest).length) return;
+        var rh = el('p', 'foot');
+        rh.style.marginTop = '8px';
+        rh.textContent = 'projection';
+        iBody.appendChild(rh);
+        iBody.appendChild(kvTable(rest));
+      });
+      section(function () {
+        if (!n.props || !n.props.length) return;
+        var pp = el('p', 'foot');
+        n.props.forEach(function (x) { pp.appendChild(el('span', 'badge ok', x)); });
+        iBody.appendChild(pp);
+      });
+      section(function () {
+        if (typeof n.raw !== 'string' || !n.raw) return;
+        var pre = el('pre');
+        pre.appendChild(el('code', null, n.raw));
+        iBody.appendChild(pre);
+      });
+      /* outgoing transitions, with the real Verdict on merge edges */
+      section(function () {
+        var outs = edges.filter(function (e) { return e.from === id; });
+        if (!outs.length) return;
+        var oh = el('p', 'foot');
+        oh.style.marginTop = '8px';
+        oh.textContent = outs.length + ' outgoing transition' + (outs.length === 1 ? '' : 's');
+        iBody.appendChild(oh);
+        outs.forEach(function (e) {
+          var line = el('div');
+          line.appendChild(el('span', 'mono', e.action === undefined || e.action === null ? '(end)' : e.action));
+          line.appendChild(doc.createTextNode(' → ' + e.to + ' '));
+          if (e.verdict) line.appendChild(el('span', 'badge on', e.verdict));
+          if (!e.tree) line.appendChild(el('span', 'badge', 'join'));
+          iBody.appendChild(line);
+        });
+      });
+    }
+    if (nodes.length) inspect(nodes[0].id);
+
+    /* --- path selection + playback --- */
+    var cur = -1;
+    function highlight() {
+      var path = cur >= 0 ? (g.paths || [])[cur] : null;
+      var onEdge = {};
+      var onNode = {};
+      if (path) {
+        var steps = path.steps || [];
+        for (var i = 0; i + 1 < steps.length; i++) {
+          onEdge[steps[i].id + '>' + steps[i + 1].id] = steps[i].action;
+          onNode[steps[i].id] = 1;
+        }
+        if (steps.length) onNode[steps[steps.length - 1].id] = 1;
+      }
+      edgeEls.forEach(function (x) {
+        var on = path && onEdge[x.e.from + '>' + x.e.to] !== undefined;
+        x.node.setAttribute('stroke', on ? T.accent : (x.e.tree ? T.border : T.muted));
+        x.node.setAttribute('stroke-width', on ? 2.4 : (x.e.tree ? 1.2 : 0.9));
+        x.node.setAttribute('opacity', path ? (on ? 1 : 0.25) : (x.e.tree ? 1 : 0.75));
+      });
+      Object.keys(nodeEls).forEach(function (id) {
+        var on = !path || onNode[id];
+        nodeEls[id].setAttribute('opacity', on ? 1 : 0.3);
+      });
+    }
+    sel.addEventListener('change', function () {
+      cur = parseInt(sel.value, 10);
+      var path = cur >= 0 ? (g.paths || [])[cur] : null;
+      PL.total = path ? Math.max(0, (path.steps || []).length - 1) : 0;
+      PL.i = 0;
+      highlight();
+      view.seek(0);
+      updatePos();
+      qs('#controls').hidden = !CHROME || !PL.total;
+      qs('#keys').hidden = !CHROME || !PL.total;
+    });
+
+    var view = {
+      seek: function (i) {
+        var path = cur >= 0 ? (g.paths || [])[cur] : null;
+        if (!path) { stepOut.textContent = ''; return; }
+        var steps = path.steps || [];
+        var s = steps[clamp(i, 0, steps.length - 1)];
+        if (!s) return;
+        stepOut.textContent = '';
+        stepOut.appendChild(el('span', 'badge on', 'step ' + (i + 1) + '/' + steps.length));
+        stepOut.appendChild(el('span', 'mono', ' ' + (s.action === null || s.action === undefined ? '(end of path)' : s.action) + ' '));
+        if (s.verdict) stepOut.appendChild(el('span', 'badge on', s.verdict));
+        Object.keys(nodeEls).forEach(function (id) {
+          nodeEls[id].setAttribute('stroke', (+id === s.id) ? T.accent : ((byId[id].flags || {}).converged ? T.ok : T.border));
+          nodeEls[id].setAttribute('stroke-width', (+id === s.id) ? 3 : ((byId[id].flags || {}).converged ? 1.6 : 1));
+        });
+        inspect(s.id);
+      }
+    };
+    highlight();
+    return view;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 7. scale mode — every number carries its source, visibly
+   * ------------------------------------------------------------------ */
+
+  function renderScale(s, host, loopPanel) {
+    host.hidden = false;
+    host.textContent = '';
+    var stats = (s.stats || []).slice();
+    var head = null;
+    for (var i = 0; i < stats.length; i++) {
+      if (stats[i].headline) { head = stats.splice(i, 1)[0]; break; }
+    }
+    if (!head && stats.length) head = stats.shift();
+
+    var band1 = el('div', 'odo');
+    var col = el('div');
+    if (head) {
+      var big = el('div', 'big num', '0');
+      col.appendChild(big);
+      col.appendChild(el('p', 'lbl', head.label || ''));
+      col.appendChild(el('p', 'src', head.source || 'NO SOURCE'));
+      band1.appendChild(col);
+      /* the odometer: 0 -> the headline figure over ~6 seconds */
+      var target = typeof head.value === 'number' ? head.value : null;
+      if (target === null) { big.textContent = String(head.value); }
+      else {
+        var t0 = performance.now();
+        (function tick(now) {
+          var p = clamp((now - t0) / 6000, 0, 1);
+          var e = 1 - Math.pow(1 - p, 3);
+          big.textContent = fmt(Math.round(target * e));
+          if (p < 1) requestAnimationFrame(tick);
+        })(t0);
+      }
+    }
+    if (loopPanel) {
+      var lw = el('div');
+      lw.appendChild(loopPanel.canvas);
+      var cap = el('p', 'src', 'one seeded run, looping at full speed: ' +
+        (loopPanel.model.cmd || loopPanel.model.title));
+      lw.appendChild(cap);
+      band1.appendChild(lw);
+    }
+    host.appendChild(band1);
+
+    var tiles = el('div', 'tiles');
+    stats.forEach(function (st) {
+      var t = el('div', 'tile');
+      t.appendChild(el('div', 'v', typeof st.value === 'number' ? fmt(st.value) + (st.unit || '') : String(st.value)));
+      t.appendChild(el('div', 'l', st.label || ''));
+      var src = el('p', 'src', st.source || 'NO SOURCE');
+      if (!st.source) src.style.color = T.bad;
+      t.appendChild(src);
+      if (st.live) {
+        var p = el('p', 'src');
+        p.appendChild(el('span', 'badge on', 'live: this machine, this commit'));
+        t.appendChild(p);
+      }
+      tiles.appendChild(t);
+    });
+    host.appendChild(tiles);
+
+    if (s.bars && s.bars.length) {
+      var bars = el('div', 'bars');
+      bars.appendChild(el('h2', null, 'Relative scale'));
+      var max = 0;
+      s.bars.forEach(function (b) { max = Math.max(max, +b.value || 0); });
+      s.bars.forEach(function (b) {
+        var d = el('div', 'bar');
+        var lab = el('div', 'bl');
+        lab.appendChild(el('span', null, b.label || ''));
+        lab.appendChild(el('span', null, fmt(b.value)));
+        d.appendChild(lab);
+        var rail = el('div', 'rail');
+        var fill = el('div', 'fill');
+        fill.style.width = (max ? (+b.value || 0) / max * 100 : 0) + '%';
+        rail.appendChild(fill);
+        d.appendChild(rail);
+        d.appendChild(el('p', 'src', b.source || 'NO SOURCE'));
+        bars.appendChild(d);
+      });
+      host.appendChild(bars);
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 8. recorder — built-in canvas.captureStream + MediaRecorder, guarded
+   * ------------------------------------------------------------------ */
+
+  var REC = { active: false, mr: null, chunks: [] };
+  function initRecorder(canvas) {
+    var btn = qs('#rec');
+    if (!btn) return;
+    var mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].filter(function (m) {
+      return typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported &&
+        MediaRecorder.isTypeSupported(m);
+    })[0];
+    if (!canvas || !canvas.captureStream || typeof MediaRecorder === 'undefined' || !mime) return;
+    btn.hidden = false;
+    btn.title = 'Record the stage canvas to a .webm file (the lanes and the world table). ' +
+      'For the whole page use ?chrome=off&autoplay=1&loop=1 with a screen recorder.';
+    btn.addEventListener('click', function () {
+      if (REC.active) { REC.stop(); return; }
+      var stream = canvas.captureStream(30);
+      REC.chunks = [];
+      try {
+        REC.mr = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 6000000 });
+      } catch (err) {
+        btn.textContent = 'recording unavailable';
+        return;
+      }
+      REC.mr.addEventListener('dataavailable', function (ev) { if (ev.data && ev.data.size) REC.chunks.push(ev.data); });
+      REC.mr.addEventListener('stop', function () { });
+      REC.mr.onstop = function () {
+        var blob = new Blob(REC.chunks, { type: 'video/webm' });
+        var a = el('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'pypiron-viz.webm';
+        doc.body.appendChild(a);
+        a.click();
+        setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+      };
+      REC.mr.start(250);
+      REC.active = true;
+      btn.textContent = 'Stop recording';
+      setPressed(btn, true);
+      PL.goto(0);
+      PL.play();
+    });
+    REC.stop = function () {
+      if (!REC.active) return;
+      REC.active = false;
+      setPressed(btn, false);
+      btn.textContent = 'Record .webm';
+      try { REC.mr.stop(); } catch (err) { /* already stopped */ }
+    };
+  }
+  REC.stop = function () { };
+
+  /* ------------------------------------------------------------------ *
+   * 9. payload loading: inline block, ?src=, or a dropped file
+   * ------------------------------------------------------------------ */
+
+  /* An error whose text this file wrote, and so may appear on the page. Every
+     other throw is an unexpected one: it goes to the console, never into page
+     copy, because a raw JS error string is not something to show a reader. */
+  function loadError(msg) {
+    var e = new Error(msg);
+    e.shown = true;
+    return e;
+  }
+
+  function parsePayload(text, name) {
+    text = String(text).replace(/^﻿/, '').trim();
+    if (!text) return null;
+    /* A JSONL trace is many objects, one per line; a graph/scale payload is one
+       object (pretty-printed or not). Try the single object first. */
+    if (text.charAt(0) === '{' && /\n/.test(text) === false) {
+      return finish(JSON.parse(text), name);
+    }
+    try {
+      return finish(JSON.parse(text), name);
+    } catch (err) {
+      var rows = [];
+      var lines = text.split('\n');
+      for (var i = 0; i < lines.length; i++) {
+        var l = lines[i].trim();
+        if (!l) continue;
+        try { rows.push(JSON.parse(l)); } catch (e2) { /* a torn last line: stop here */ }
+      }
+      if (!rows.length) throw err;
+      return { kind: 'trace', rows: rows, name: name };
+    }
+  }
+  function finish(obj, name) {
+    if (obj && obj.kind === 'trace' && obj.lines) return { kind: 'trace', rows: obj.lines, name: name };
+    if (obj && Array.isArray(obj)) return { kind: 'trace', rows: obj, name: name };
+    if (obj && obj.kind === 'graph') { obj.name = name; return obj; }
+    if (obj && obj.kind === 'scale') { obj.name = name; return obj; }
+    if (obj && obj.t === 'meta') return { kind: 'trace', rows: [obj], name: name };
+    throw loadError('payload has no recognizable "kind" (expected trace, graph or scale)');
+  }
+
+  function loadInline() {
+    var tag = qs('#payload');
+    if (!tag) return null;
+    var txt = tag.textContent || '';
+    if (!txt.trim()) return null;
+    try { return [parsePayload(txt, 'inline payload')]; } catch (err) { fail(err); return null; }
+  }
+
+  /* A scale payload can name a trace to loop beside its odometer. Fetch it
+     relative to the payload itself; a build-inlined page carries the events in
+     `loop_trace_lines` instead. A failure here is not fatal — the numbers stand
+     on their own. */
+  function expand(payloads) {
+    var s = payloads.filter(function (p) { return p.kind === 'scale'; })[0];
+    if (!s || payloads.filter(function (p) { return p.kind === 'trace'; }).length) {
+      return Promise.resolve(payloads);
+    }
+    if (s.loop_trace_lines && s.loop_trace_lines.length) {
+      payloads.push({ kind: 'trace', rows: s.loop_trace_lines, name: 'loop trace' });
+      return Promise.resolve(payloads);
+    }
+    if (typeof s.loop_trace !== 'string' || !s.loop_trace) return Promise.resolve(payloads);
+    var url;
+    try { url = new URL(s.loop_trace, new URL(s.name || '', location.href)).href; }
+    catch (err) { return Promise.resolve(payloads); }
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw loadError(url + ': HTTP ' + r.status);
+      return r.text();
+    }).then(function (t) {
+      payloads.push(parsePayload(t, url));
+      return payloads;
+    })['catch'](function () { return payloads; });
+  }
+
+  function loadSrc(list) {
+    return Promise.all(list.map(function (u) {
+      return fetch(u).then(function (r) {
+        if (!r.ok) throw loadError(u + ': HTTP ' + r.status);
+        return r.text();
+      }).then(function (t) { return parsePayload(t, u); });
+    }));
+  }
+
+  function fail(err) {
+    var ours = !!(err && err.shown);
+    if (!ours && window.console && console.error) console.error('payload failed to render:', err);
+    var box = qs('#loaderr');
+    if (box) {
+      box.textContent = ours ? err.message :
+        'This payload could not be rendered. The error is in the browser console.';
+    }
+    var loader = qs('#loader');
+    if (loader) loader.hidden = false;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 10. mount
+   * ------------------------------------------------------------------ */
+
+  /* The run's own facts as chips. Built per trace, because on a two-trace page
+     one shared chip row would silently describe only one of the runs. */
+  function chipsFor(m) {
+    var d = m.meta || {};
+    var out = [];
+    function add(k, v, hot) {
+      if (v === null || v === undefined || v === '') return;
+      var c = el('span', 'chip' + (hot ? ' hot' : ''));
+      c.appendChild(el('b', null, v));
+      c.appendChild(doc.createTextNode(' ' + k));
+      out.push(c);
+    }
+    add('producer', m.producer);
+    add('commit', d.commit);
+    if (typeof d.seed === 'number') add('seed', d.seed);
+    add('nodes', m.nodes);
+    add('buckets', m.buckets);
+    if (typeof d.ops === 'number') add('ops', fmt(d.ops));
+    if (typeof d.packages === 'number') add('packages', d.packages);
+    if (typeof d.fail_percent === 'number') add('% injected failure', d.fail_percent, d.fail_percent > 0);
+    if (typeof d.partition_percent === 'number') add('% partitioned', d.partition_percent, d.partition_percent > 0);
+    if (d.brk && d.brk !== 'none') add('break', d.brk, true);
+    if (m.opCount) add('storage ops traced', fmt(m.opCount));
+    var s = m.summary;
+    if (s) {
+      if (typeof s.trace_events === 'number' && s.trace_events) add('hashed trace events', fmt(s.trace_events));
+      if (s.trace_hash) add('trace hash', s.trace_hash);
+      if (typeof s.elapsed_ms === 'number') add('ms elapsed', fmt(s.elapsed_ms));
+    }
+    return out;
+  }
+
+  /* The verdict pill, straight from the summary line — never inferred. */
+  function verdictPill(m) {
+    var s = m.summary;
+    if (!s) return { className: 'pill none', textContent: 'no summary line in this trace', title: '' };
+    var vio = s.violations | 0;
+    /* The recorded run's OWN verdict code. The simulator calls it
+       `seed_exit_code` precisely because it is not the process exit code — a
+       whole-run gate like `--require-reach` can fail a process whose traced
+       seed reported 0 — and the region recorder still calls it `exit_code`.
+       Read both, and never label either one "exit". */
+    var code = typeof s.seed_exit_code === 'number' ? s.seed_exit_code :
+      (typeof s.exit_code === 'number' ? s.exit_code : null);
+    return {
+      className: 'pill ' + (vio ? 'bad' : 'ok'),
+      textContent: vio ? vio + ' violation' + (vio === 1 ? '' : 's') +
+        (code === null ? '' : '  ·  run verdict ' + code) :
+        'no violations' + (typeof s.acked === 'number' ?
+          '  ·  ' + fmt(s.acked) + ' filename' + (s.acked === 1 ? '' : 's') + ' acked' : ''),
+      /* `summary.acked` is the ledger's count of DISTINCT filenames whose
+         publish acked. The stage tally counts individual acked requests. Two
+         quantities, two labels, on purpose. */
+      title: vio ? (code === null ? '' :
+        'The verdict this recorded run reported for itself, from its summary line. ' +
+        'It is not the process exit code: a whole-run gate can fail a process whose ' +
+        'traced run reported a clean verdict.') :
+        (typeof s.acked === 'number' ?
+          'Distinct filenames whose publish acked, from this run’s summary line. ' +
+          'The tally on the stage counts individual acked requests — a different number.' : '')
+    };
+  }
+
+  function setHeader(payloads) {
+    var titles = [], narr = [], cmds = [], caveats = [], chips = [];
+    var summary = null, model = null;
+    /* On a scale page the loop trace is a background visual, not the subject:
+       its title and chips would drown the headline. Its caveats still show. */
+    var scaleMode = payloads.some(function (p) { return p.kind === 'scale'; });
+    var dualMode = payloads.filter(function (p) { return p.kind === 'trace'; }).length > 1;
+    payloads.forEach(function (p) {
+      if (p.kind === 'trace') {
+        if (scaleMode) {
+          p.model.caveats.forEach(function (c) { if (caveats.indexOf(c) < 0) caveats.push(c); });
+          return;
+        }
+        titles.push(p.model.title);
+        if (p.model.narration) narr.push(p.model.narration);
+        if (p.model.cmd) cmds.push(p.model.cmd);
+        p.model.caveats.forEach(function (c) { if (caveats.indexOf(c) < 0) caveats.push(c); });
+        if (!summary && p.model.summary) summary = p.model.summary;
+        if (!dualMode) model = p.model;   /* stacked panels carry their own */
+      } else {
+        if (p.title) titles.push(p.title);
+        if (p.narration) narr.push(p.narration);
+        if (p.generated_by) cmds.push(p.generated_by);
+        (p.caveats || []).forEach(function (c) { if (caveats.indexOf(c) < 0) caveats.push(c); });
+      }
+    });
+    var uniq = titles.filter(function (t, i) { return titles.indexOf(t) === i; });
+    qs('#title').textContent = uniq.join('  ·  ') || 'pypiron run visualizer';
+    var np = qs('#narr');
+    np.textContent = '';
+    var un = narr.filter(function (t, i) { return narr.indexOf(t) === i; });
+    np.textContent = un.join('  ');
+    np.hidden = !un.length;
+
+    var pre = qs('#cmd');
+    if (dualMode) cmds = [];
+    if (cmds.length) {
+      pre.hidden = false;
+      pre.textContent = '';
+      cmds.forEach(function (c, ix) {
+        pre.appendChild(el('code', null, (ix ? '\n' : '') + c));
+      });
+    }
+
+    if (model) chips = chipsFor(model);
+    var chipBox = qs('#chips');
+    chipBox.textContent = '';
+    chips.forEach(function (c) { chipBox.appendChild(c); });
+
+    var pill = qs('#verdict');
+    var built = model ? verdictPill(model) : null;
+    if (built) {
+      pill.hidden = false;
+      pill.className = built.className;
+      pill.textContent = built.textContent;
+      pill.title = built.title || '';
+    }
+
+    /* Caveats: always visible, never collapsible. */
+    var cav = qs('#caveats');
+    if (caveats.length) {
+      cav.hidden = false;
+      cav.textContent = '';
+      cav.appendChild(el('h2', null, 'Caveats'));
+      var ul = el('ul');
+      caveats.forEach(function (c) { ul.appendChild(el('li', null, c)); });
+      cav.appendChild(ul);
+      padForCaveats();
+    }
+  }
+
+  /* In recording mode the caveat band is fixed to the foot of the viewport —
+     the only way a screen recording contains it — so the page needs room
+     underneath for the end of its own content. */
+  function padForCaveats() {
+    var cav = qs('#caveats');
+    doc.body.style.paddingBottom =
+      (!CHROME && cav && !cav.hidden) ? (cav.offsetHeight + 18) + 'px' : '';
+  }
+
+  function mount(payloads) {
+    payloads = payloads.filter(Boolean);
+    if (!payloads.length) return;
+    var loader = qs('#loader');
+
+    /* trace payloads become panels; a graph or scale payload takes the page */
+    var traces = [];
+    payloads.forEach(function (p) {
+      if (p.kind === 'trace') {
+        p.model = buildTrace(p.rows || []);
+        traces.push(p);
+      }
+    });
+    var graph = payloads.filter(function (p) { return p.kind === 'graph'; })[0];
+    var scale = payloads.filter(function (p) { return p.kind === 'scale'; })[0];
+
+    var panelHost = qs('#panels');
+    panelHost.textContent = '';
+    PL.panels = [];
+    PL.total = 0;
+    var dual = traces.length > 1;
+    if (dual) panelHost.classList.add('dual');
+    traces.forEach(function (p) {
+      var panel = TracePanel(p.model, dual);
+      PL.panels.push(panel);
+      PL.total = Math.max(PL.total, panel.total);
+      if (!scale) panelHost.appendChild(panel.node);
+    });
+
+    setHeader(payloads);
+
+    if (graph) {
+      PL.graph = renderGraph(graph, qs('#graph'));
+      PL.total = 0;
+    }
+    if (scale) {
+      renderScale(scale, qs('#scale'), PL.panels[0] || null);
+      if (PL.panels.length) {
+        /* the scale page's loop trace runs itself: fastest speed, forever */
+        PL.speed = 'max';
+        LOOP = true;
+        PL.play();
+      }
+    }
+
+    if (loader) loader.hidden = true;
+    var showChrome = CHROME && PL.total > 0;
+    qs('#controls').hidden = !showChrome;
+    qs('#keys').hidden = !showChrome;
+    if (!CHROME) {
+      doc.querySelectorAll('.chrome').forEach(function (n) { n.hidden = true; });
+    }
+
+    PL.panels.forEach(function (p) { p.buildTimeline(); });
+    initRecorder(PL.panels.length ? PL.panels[0].canvas : null);
+    /* ?at=N opens on a chosen event — a poster frame for a screenshot. */
+    var at = parseInt(P.at, 10);
+    if (at > 0) PL.i = clamp(at, 0, PL.total);
+    PL.apply();
+    if (AUTOPLAY && PL.total) PL.play();
+    if (!PL.raf) PL.raf = requestAnimationFrame(frame);
+  }
+
+  /* ---- controls ---- */
+  function nextIn(list, from) {
+    for (var i = 0; i < list.length; i++) if (list[i] > from) return list[i];
+    return list.length ? list[0] : null;
+  }
+  function jump(kind) {
+    var best = null;
+    PL.panels.forEach(function (p) {
+      var list = kind === 'crash' ? p.crashIndices() : kind === 'vio' ? p.violationIndices() : p.phaseIndices();
+      var n = nextIn(list, PL.i);
+      if (n !== null && (best === null || n < best)) best = n;
+    });
+    if (best !== null) { PL.pause(); PL.goto(best); }
+  }
+  function prevPhase() {
+    var best = null;
+    PL.panels.forEach(function (p) {
+      p.phaseIndices().forEach(function (i) { if (i < PL.i && (best === null || i > best)) best = i; });
+    });
+    PL.pause();
+    PL.goto(best === null ? 0 : best);
+  }
+
+  function wireControls() {
+    var sp = qs('#speeds');
+    sp.appendChild(el('span', 'chip', 'speed'));
+    SPEEDS.forEach(function (s) {
+      var b = el('button', null, s === 'max' ? 'max' : s + '×');
+      setPressed(b, s === PL.speed);
+      b.addEventListener('click', function () {
+        PL.speed = s;
+        sp.querySelectorAll('button').forEach(function (x) { setPressed(x, x === b); });
+      });
+      sp.appendChild(b);
+    });
+    qs('#play').addEventListener('click', PL.toggle);
+    qs('#step').addEventListener('click', function () { PL.pause(); PL.goto(PL.i + 1); });
+    qs('#restart').addEventListener('click', function () { PL.goto(0); });
+    qs('#nextcrash').addEventListener('click', function () { jump('crash'); });
+    qs('#nextvio').addEventListener('click', function () { jump('vio'); });
+    qs('#theme').addEventListener('click', function () {
+      var cur = root.getAttribute('data-theme');
+      var next = cur === 'light' ? 'dark' : cur === 'dark' ? '' : 'light';
+      if (next) root.setAttribute('data-theme', next); else root.removeAttribute('data-theme');
+      readTokens();
+      PL.panels.forEach(function (p) { p.buildTimeline(); });
+    });
+
+    doc.addEventListener('keydown', function (ev) {
+      if (ev.target && /^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
+      var k = ev.key;
+      if (k === ' ') { ev.preventDefault(); PL.toggle(); }
+      else if (k === 'ArrowRight') { PL.pause(); PL.goto(PL.i + 1); }
+      else if (k === 'ArrowLeft') { PL.pause(); PL.goto(PL.i - 1); }
+      else if (k === ']') jump('phase');
+      else if (k === '[') prevPhase();
+      else if (k === 'c') jump('crash');
+      else if (k === 'v') jump('vio');
+      else if (k === '0') PL.goto(0);
+    });
+  }
+
+  /* ---- drag & drop / file picker ---- */
+  function readFiles(files) {
+    var list = Array.prototype.slice.call(files).slice(0, 2);
+    Promise.all(list.map(function (f) {
+      return (f.text ? f.text() : new Promise(function (res, rej) {
+        var fr = new FileReader();
+        fr.onload = function () { res(fr.result); };
+        fr.onerror = rej;
+        fr.readAsText(f);
+      })).then(function (t) { return parsePayload(t, f.name); });
+    })).then(expand).then(mount)['catch'](fail);
+  }
+  function wireDrop() {
+    var loader = qs('#loader');
+    ['dragover', 'dragenter'].forEach(function (t) {
+      doc.addEventListener(t, function (ev) { ev.preventDefault(); if (loader) loader.classList.add('over'); });
+    });
+    doc.addEventListener('dragleave', function () { if (loader) loader.classList.remove('over'); });
+    doc.addEventListener('drop', function (ev) {
+      ev.preventDefault();
+      if (loader) loader.classList.remove('over');
+      if (ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files.length) readFiles(ev.dataTransfer.files);
+    });
+    var input = qs('#file');
+    if (input) input.addEventListener('change', function () { readFiles(input.files); });
+  }
+
+  /* ---- theme + resize ---- */
+  var mq = window.matchMedia ? window.matchMedia('(prefers-color-scheme:dark)') : null;
+  if (mq && mq.addEventListener) {
+    mq.addEventListener('change', function () {
+      readTokens();
+      PL.panels.forEach(function (p) { p.buildTimeline(); });
+    });
+  }
+  var rt = 0;
+  window.addEventListener('resize', function () {
+    clearTimeout(rt);
+    rt = setTimeout(function () {
+      PL.panels.forEach(function (p) { p.buildTimeline(); });
+      padForCaveats();
+    }, 120);
+  });
+
+  /* ---- go ---- */
+  wireControls();
+  wireDrop();
+  var speed0 = parseFloat(P.speed);
+  if (P.speed === 'max') PL.speed = 'max';
+  else if (speed0 > 0) PL.speed = speed0;
+  qs('#speeds').querySelectorAll('button').forEach(function (b) {
+    setPressed(b, b.textContent === (PL.speed === 'max' ? 'max' : PL.speed + '×'));
+  });
+
+  var inline = loadInline();
+  if (inline) expand(inline).then(mount)['catch'](fail);
+  else if (P.src) {
+    loadSrc(P.src.split(',').map(function (s) { return s.trim(); }).filter(Boolean))
+      .then(expand).then(mount)['catch'](fail);
+  }
+})();
+</script>
+</body>
+</html>

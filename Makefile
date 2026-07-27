@@ -1,4 +1,4 @@
-.PHONY: init init-rust init-python build dev run test test-rust test-python test-s3-real test-gcs-real perf microbench compat check cargo-check af fmt lint audit coverage clean doc docs docs-serve docs-truth build-wheel release-notes fuzz fuzz-build vopr-soak dr-drill help
+.PHONY: init init-rust init-python build dev run test test-rust test-python test-s3-real test-gcs-real perf microbench compat check cargo-check af fmt lint audit coverage clean doc docs docs-serve docs-truth build-wheel release-notes fuzz fuzz-build vopr-soak dr-drill viz help
 
 SHELL := /bin/bash
 
@@ -144,6 +144,17 @@ vopr-soak:  ## Run the deterministic simulator continuously across rotating topo
 dr-drill:  ## Disaster-recovery drill: back up, wipe, restore truth only, reinstall byte-identical (prints N/N + wall-clock)
 	# -s: surface the "N/N restored byte-identical" line and the wall-clock numbers.
 	uv run -- pytest tests/test_dr_drill.py -s -n 0
+
+# Run visualizer (dev/scripts/viz/README.md). Replays the scenario pack through
+# the real simulator and the real model checkers, checks that every claim each
+# page makes still reproduces, and writes one standalone HTML file per scenario
+# into .local/viz. Advisory like docs-truth, deliberately out of `check`: a
+# scenario that stops reproducing fails this target, and that is a finding to
+# adjudicate, not a broken build. VIZ_LIVE=0 skips the live measurement.
+VIZ_LIVE ?= 20
+viz:  ## Advisory: rebuild the run-visualizer pages into .local/viz (not in `check`)
+	@mkdir -p .local/viz
+	uv run -- python dev/scripts/viz/build.py --out .local/viz --live-secs $(VIZ_LIVE)
 
 help:  ## Display this help message
 	@grep -h -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'

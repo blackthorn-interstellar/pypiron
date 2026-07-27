@@ -871,3 +871,483 @@ fn concurrent_rebuild_without_lease_diverges() {
         actions
     );
 }
+
+// ---- visualizer state-graph dump --------------------------------------------
+//
+// Writes this model's state graph as one JSON object for the run visualizer
+// (`dev/scripts/viz/player.html`). Output goes wherever `PYPIRON_VIZ_GRAPH`
+// points; with the variable unset the test returns immediately.
+//
+// The env gate is load-bearing, not decorative: `.github/workflows/
+// simulation.yml`'s `model-deep` job runs this test target with `-- --ignored`,
+// so `#[ignore]` alone would run this in the nightly.
+//
+// It draws a REDUCED config. The configs CI checks are 1,497,544 states (merge
+// gate, `model_event_protocol`) and 3,354,376 (nightly, `..._deep`); at the
+// ~1.5 KB/node this dump produces those are gigabytes of JSON and cannot be
+// graphed. They are reported as counts, and the reduction is stated in the
+// output so the picture cannot overclaim.
+mod viz_graph {
+    use std::collections::{HashMap, VecDeque};
+
+    use serde_json::{json, Value};
+    use stateright::{Checker, Expectation, HasDiscoveries, Model, Property};
+
+    use super::{consumable_p0, live_set, quiescent, EventModel, State, WorkerState};
+
+    /// States checked exhaustively by `model_event_protocol` (the merge gate).
+    const CI_STATES: u64 = 1_497_544;
+    /// States checked exhaustively by `model_event_protocol_deep` (the nightly).
+    const CI_STATES_NIGHTLY: u64 = 3_354_376;
+    /// Above this many nodes the per-node `raw` debug rendering is dropped; the
+    /// drawn config is far below it, the constant is the guard for anyone who
+    /// widens the config later.
+    const RAW_LIMIT: usize = 2_000;
+
+    /// The config drawn in full: one worker, one filename, no clock advance.
+    /// Deliberately the smallest real `EventModel` — see `caveats` in the output.
+    fn drawn_model() -> EventModel {
+        EventModel {
+            num_workers: 1,
+            enable_f1: false,
+            advance_limit: 0,
+            allow_concurrent_rebuild: false,
+        }
+    }
+
+    /// The config `concurrent_rebuild_without_lease_diverges` checks. Its
+    /// counterexample is exported as a path, and it is NOT the drawn config.
+    fn diverging_model() -> EventModel {
+        EventModel {
+            num_workers: 2,
+            enable_f1: false,
+            advance_limit: 0,
+            allow_concurrent_rebuild: true,
+        }
+    }
+
+    fn config_json(m: &EventModel) -> Value {
+        json!({
+            "num_workers": m.num_workers,
+            "enable_f1": m.enable_f1,
+            "advance_limit": m.advance_limit,
+            "allow_concurrent_rebuild": m.allow_concurrent_rebuild,
+        })
+    }
+
+    fn expectation_str(e: &Expectation) -> &'static str {
+        match e {
+            Expectation::Always => "always",
+            Expectation::Eventually => "eventually",
+            Expectation::Sometimes => "sometimes",
+        }
+    }
+
+    /// Thousands separators, for the human-facing strings only.
+    fn commas(n: u64) -> String {
+        let digits = n.to_string();
+        let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    fn marker_list<'a>(keys: impl Iterator<Item = &'a super::MarkerKey>) -> Vec<Value> {
+        keys.map(|&(nonce, kind)| json!({ "nonce": nonce, "kind": format!("{kind:?}") }))
+            .collect()
+    }
+
+    /// Views agree with truth right now, ignoring quiescence. This is the
+    /// unconditional core of `prop_quiescent_views_equal_truth`; the property
+    /// itself is vacuously true mid-flight, which is useless as a per-node badge.
+    fn views_match_truth(s: &State) -> bool {
+        let live = live_set(s);
+        let expect_present = !live.is_empty();
+        s.view_present == expect_present && s.view == live && s.global == expect_present
+    }
+
+    /// Hand-written projection of `State` for the player. Every node also carries
+    /// `raw` (`{state:#?}`) precisely because this is a hand projection: if a
+    /// field is added to `State` or `WorkerState` and this misses it, the raw
+    /// rendering still carries it instead of the picture silently going stale.
+    fn project(s: &State) -> Value {
+        let markers: Vec<Value> = s
+            .markers
+            .iter()
+            .map(|(&(nonce, kind), &born)| {
+                json!({ "nonce": nonce, "kind": format!("{kind:?}"), "born": born })
+            })
+            .collect();
+        let workers: Vec<Value> = s
+            .workers
+            .iter()
+            .zip(&s.worker_crashed)
+            .map(|(w, &crash_spent)| match w {
+                WorkerState::Idle => json!({
+                    "state": "idle",
+                    "phase": Value::Null,
+                    "keys": [],
+                    "stale": false,
+                    "snapshot": Value::Null,
+                    "observed_global": Value::Null,
+                    "crash_spent": crash_spent,
+                }),
+                WorkerState::Working {
+                    phase,
+                    keys,
+                    stale,
+                    snapshot,
+                    observed_global,
+                } => json!({
+                    "state": "working",
+                    "phase": format!("{phase:?}"),
+                    "keys": marker_list(keys.iter()),
+                    "stale": stale,
+                    "snapshot": snapshot.as_ref().map(|v| v.iter().copied().collect::<Vec<u8>>()),
+                    "observed_global": observed_global,
+                    "crash_spent": crash_spent,
+                }),
+            })
+            .collect();
+        json!({
+            "truth": {
+                "artifact": s.artifact.iter().copied().collect::<Vec<u8>>(),
+                "tombstone": s.tombstone.iter().copied().collect::<Vec<u8>>(),
+            },
+            "views": {
+                "view_present": s.view_present,
+                "view": s.view.iter().copied().collect::<Vec<u8>>(),
+                "global": s.global,
+            },
+            "markers": markers,
+            "writers": {
+                "up0": format!("{:?}", s.up0),
+                "del0": format!("{:?}", s.del0),
+                "up1": format!("{:?}", s.up1),
+            },
+            "workers": workers,
+            "clock": { "now": s.now, "advances": s.advances },
+            "latches": {
+                "healed": s.healed,
+                "recovered": s.recovered,
+                "orphaned": marker_list(s.orphaned.iter()),
+            },
+        })
+    }
+
+    /// Own breadth-first enumeration over the `Model` trait only. `next_steps`
+    /// hands back `(action, state)` pairs, so every edge is observed — including
+    /// the joins where independent interleavings reconverge, which a stateright
+    /// `StateRecorder` visitor would miss (it only sees a spanning tree).
+    /// Single-threaded, so `depth` is a true shortest-path depth.
+    struct Dump<'m> {
+        model: &'m EventModel,
+        props: &'m [Property<EventModel>],
+        ids: HashMap<State, usize>,
+        nodes: Vec<Value>,
+        edges: Vec<Value>,
+        tree_edges: usize,
+        depth: usize,
+    }
+
+    impl<'m> Dump<'m> {
+        fn new(model: &'m EventModel, props: &'m [Property<EventModel>]) -> Self {
+            Self {
+                model,
+                props,
+                ids: HashMap::new(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                tree_edges: 0,
+                depth: 0,
+            }
+        }
+
+        /// Returns `(id, first_seen)`.
+        fn intern(&mut self, s: &State, depth: usize) -> (usize, bool) {
+            if let Some(&id) = self.ids.get(s) {
+                return (id, false);
+            }
+            let id = self.nodes.len();
+            let model = self.model;
+            let truthy: Vec<&'static str> = self
+                .props
+                .iter()
+                .filter(|p| (p.condition)(model, s))
+                .map(|p| p.name)
+                .collect();
+            self.ids.insert(s.clone(), id);
+            self.nodes.push(json!({
+                "id": id,
+                "depth": depth,
+                "state": project(s),
+                "raw": format!("{s:#?}"),
+                "props": truthy,
+                "flags": {
+                    "quiescent": quiescent(s),
+                    "views_match_truth": views_match_truth(s),
+                    "work_available": consumable_p0(s).is_some(),
+                },
+            }));
+            self.depth = self.depth.max(depth);
+            (id, true)
+        }
+
+        fn run(&mut self) {
+            let model = self.model;
+            let mut queue: VecDeque<(State, usize, usize)> = VecDeque::new();
+            for init in model.init_states() {
+                let (id, fresh) = self.intern(&init, 0);
+                if fresh {
+                    queue.push_back((init, id, 0));
+                }
+            }
+            while let Some((state, from, depth)) = queue.pop_front() {
+                for (action, next) in model.next_steps(&state) {
+                    let (to, fresh) = self.intern(&next, depth + 1);
+                    self.edges.push(json!({
+                        "from": from,
+                        "to": to,
+                        "action": model.format_action(&action),
+                        "verdict": Value::Null,
+                        "tree": fresh,
+                    }));
+                    if fresh {
+                        self.tree_edges += 1;
+                        queue.push_back((next, to, depth + 1));
+                    }
+                }
+            }
+        }
+    }
+
+    fn short_commit() -> String {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    #[test]
+    #[ignore = "visualizer: writes a state-graph JSON when PYPIRON_VIZ_GRAPH=<path>"]
+    fn dump_state_graph() {
+        let Ok(out) = std::env::var("PYPIRON_VIZ_GRAPH") else {
+            return;
+        };
+
+        // 1. Enumerate the drawn config ourselves.
+        let model = drawn_model();
+        let props = model.properties();
+        let mut dump = Dump::new(&model, &props);
+        dump.run();
+
+        // 2. The same config through the real checker: it supplies the named
+        //    paths, and its unique-state count is what proves the picture is the
+        //    space the checker verified.
+        let checker = drawn_model().checker().threads(1).spawn_bfs().join();
+        assert_eq!(
+            dump.nodes.len(),
+            checker.unique_state_count(),
+            "the dumped graph is not the state space the checker verifies"
+        );
+        let discoveries = checker.discoveries();
+
+        // Which properties the drawn config actually settles. `always` with a
+        // discovery = violated; `sometimes` without one = never reached here.
+        let prop_json: Vec<Value> = props
+            .iter()
+            .map(|p| {
+                let found = discoveries.contains_key(p.name);
+                let status = match &p.expectation {
+                    Expectation::Sometimes if found => "reached",
+                    Expectation::Sometimes => "not-reached",
+                    // An `always`/`eventually` discovery is a counterexample.
+                    _ if found => "violated",
+                    _ => "held",
+                };
+                json!({ "name": p.name, "kind": expectation_str(&p.expectation), "status": status })
+            })
+            .collect();
+
+        // 3. Named paths that walk THIS graph.
+        let mut found: Vec<_> = discoveries.into_iter().collect();
+        found.sort_unstable_by_key(|(name, _)| *name);
+        let mut paths: Vec<Value> = found
+            .into_iter()
+            .map(|(name, path)| {
+                let kind = props
+                    .iter()
+                    .find(|p| p.name == name)
+                    .map_or("discovery", |p| match p.expectation {
+                        Expectation::Sometimes => "discovery",
+                        _ => "counterexample",
+                    });
+                let steps: Vec<Value> = path
+                    .into_vec()
+                    .into_iter()
+                    .map(|(s, a)| {
+                        json!({
+                            "id": dump.ids.get(&s).copied(),
+                            "action": a.map(|a| model.format_action(&a)),
+                            "verdict": Value::Null,
+                        })
+                    })
+                    .collect();
+                json!({ "name": name, "kind": kind, "in_graph": true, "steps": steps })
+            })
+            .collect();
+
+        // 4. The best story this model has, and it belongs to a DIFFERENT config:
+        //    without the leader lease, two staggered rebuilds diverge. Its states
+        //    are not nodes of the drawn graph, so every step's `id` is null and
+        //    the step carries its own projection instead. `in_graph:false` and the
+        //    caveat below say so.
+        let diverging = diverging_model()
+            .checker()
+            .threads(1)
+            .finish_when(HasDiscoveries::AnyFailures)
+            .spawn_bfs()
+            .join();
+        let cx_len = if let Some(path) = diverging.discovery("quiescent_views_equal_truth") {
+            let steps = path.into_vec();
+            let last_raw = steps.last().map(|(s, _)| format!("{s:#?}"));
+            let n = steps.len();
+            let steps: Vec<Value> = steps
+                .into_iter()
+                .map(|(s, a)| {
+                    json!({
+                        "id": Value::Null,
+                        "action": a.map(|a| diverging.model().format_action(&a)),
+                        "verdict": Value::Null,
+                        "state": project(&s),
+                    })
+                })
+                .collect();
+            paths.push(json!({
+                "name": "concurrent_rebuild_without_lease_diverges",
+                "kind": "counterexample",
+                "in_graph": false,
+                "config": config_json(diverging.model()),
+                "note": "A counterexample from a different, larger config (2 workers, \
+                         no leader lease). It is not a walk through the drawn graph, so \
+                         each step carries its own state instead of a node id.",
+                "violates": "quiescent_views_equal_truth",
+                "final_raw": last_raw,
+                "steps": steps,
+            }));
+            n
+        } else {
+            0
+        };
+
+        // 5. Drop `raw` if a future widening pushes the graph past the budget.
+        if dump.nodes.len() > RAW_LIMIT {
+            for node in &mut dump.nodes {
+                if let Some(obj) = node.as_object_mut() {
+                    obj.remove("raw");
+                }
+            }
+        }
+
+        let nodes = dump.nodes.len();
+        let edges = dump.edges.len();
+        let joins = edges - dump.tree_edges;
+        let tree_edges = dump.tree_edges;
+        let depth = dump.depth;
+        let path_count = paths.len();
+        let ci = commas(CI_STATES);
+        let ci_nightly = commas(CI_STATES_NIGHTLY);
+        let doc = json!({
+            "kind": "graph",
+            "model": "event-protocol",
+            "config": config_json(&model),
+            "generated_by": format!(
+                "PYPIRON_VIZ_GRAPH={out} cargo test --release --test model_event_protocol \
+                 -- --ignored --nocapture dump_state_graph"
+            ),
+            "commit": short_commit(),
+            "title": "The _dirty/ marker protocol, drawn in full at a reduced size",
+            "narration": format!(
+                "Every interleaving of one upload, one delete and one worker tick over the \
+                 _dirty/ intent-and-commit markers — {nodes} states, {edges} transitions, \
+                 {joins} of them joins where independent orders reconverge — beside the \
+                 {ci}-state configuration CI checks on every merge."
+            ),
+            "counts": {
+                "nodes": nodes,
+                "edges": edges,
+                "tree_edges": tree_edges,
+                "join_edges": joins,
+                "depth": depth,
+                "checker_unique_states": checker.unique_state_count(),
+                "ci_states": CI_STATES,
+                "ci_states_nightly": CI_STATES_NIGHTLY,
+                "ci_depth_note": "depth is this dump's own single-threaded BFS shortest-path \
+                                  depth; checker.max_depth() is not the diameter, and the \
+                                  CI configs run .threads(available_parallelism()) so their \
+                                  reported depths are machine-dependent",
+                "counterexample_steps": cx_len,
+            },
+            "reduction": {
+                "drawn": config_json(&model),
+                "ci_merge_gate": config_json(&EventModel {
+                    num_workers: 2,
+                    enable_f1: true,
+                    advance_limit: 2,
+                    allow_concurrent_rebuild: false,
+                }),
+                "ci_nightly": config_json(&EventModel {
+                    num_workers: 2,
+                    enable_f1: true,
+                    advance_limit: 3,
+                    allow_concurrent_rebuild: false,
+                }),
+                "drops": [
+                    "the stale_intent_healed reachability probe (it needs advance_limit >= 1, \
+                     so no marker here ever crosses the grace threshold)",
+                    "the f1 upload writer, and with it the global-index arm that keeps the \
+                     package alive across a delete of f0",
+                    "the second worker, which is what models leader failover mid-tick",
+                ],
+            },
+            "props": prop_json,
+            "nodes": dump.nodes,
+            "edges": dump.edges,
+            "paths": paths,
+            "caveats": [
+                format!(
+                    "Drawn: a reduced config (1 worker, one filename, no clock advance) \
+                     rendered in full at {nodes} states. The configs CI checks exhaustively \
+                     are {ci} and {ci_nightly} states — too large to draw (gigabytes of \
+                     JSON, millions of edges), so they are reported as counts."
+                ),
+                "The reduction drops the stale_intent_healed reachability probe, the f1 \
+                 upload writer, and the second (failover) worker. Every property's real \
+                 status in the drawn config is in props[].status.".to_string(),
+                "The concurrent_rebuild_without_lease_diverges path is a counterexample from \
+                 a different config (2 workers, no leader lease) and is not a walk through \
+                 this graph: in_graph is false and its step ids are null.".to_string(),
+                "Depth comes from this dump's single-threaded BFS, not from \
+                 checker.max_depth(); the CI configs' published depths are machine-dependent \
+                 because they run one BFS thread per core.".to_string(),
+            ],
+        });
+
+        let bytes = serde_json::to_vec(&doc).expect("graph dump serializes");
+        eprintln!(
+            "[viz_graph] {nodes} nodes, {edges} edges ({tree_edges} tree / {joins} join), \
+             depth {depth}, {path_count} paths (counterexample {cx_len} steps), {} bytes -> {out}",
+            bytes.len(),
+        );
+        std::fs::write(&out, &bytes).expect("graph dump is writable");
+    }
+}

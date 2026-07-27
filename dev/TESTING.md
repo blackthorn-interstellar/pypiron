@@ -1455,6 +1455,77 @@ sweeps every node before the loop re-checks. That is a lot of slack for a boolea
 to hide in, and it is now visible — if a change pushes the peak toward the budget,
 the number moves rounds before the oracle does.
 
+### Recording a run for the visualizer (`--trace-jsonl`, `PYPIRON_VIZ_GRAPH`)
+
+Every producer in this document can now write down what it did, in one JSONL
+schema, for `dev/scripts/viz` to play back. Three recorders, all off by default:
+
+| producer | switch | writes |
+|---|---|---|
+| `examples/vopr.rs` | `--trace-jsonl <path>` | one seed's timeline: `meta phase step round pass op drop crash crash_sched restart clock ack world oracle violation summary` |
+| `tests/model_replication.rs`, `tests/model_event_protocol.rs` | `PYPIRON_VIZ_GRAPH=<path>` | one JSON object: the model's whole state space, nodes + edges + named paths |
+| `tests/test_viz_region_trace.py` | `PYPIRON_VIZ_OUT=<dir>` | the region failover arc, sampled from `/metrics` and `/ready` on a fixed tick |
+
+`--trace-jsonl` records **one seed's first execution** and asserts it: a single
+bounded seed, never `--forever`, never `--max-secs`, and never the determinism
+rerun, whose world may legitimately differ under `--break rerun`. Bucket state
+comes only from `world` deltas — an `op` is emitted at admission, before the call
+executes, so its byte effect is unknown when it is written down and the player
+must not guess it.
+
+The two model dumps are `#[ignore]`d **and** env-gated, and the guard is
+load-bearing rather than decorative: `.github/workflows/simulation.yml`'s
+`model-deep` job runs `cargo test --release --test model_replication --test
+model_event_protocol -- --ignored`, so `#[ignore]` alone would have that job
+write a state graph to disk on every nightly. With the guard it returns in 0.00 s.
+Each dump asserts `nodes.len() == checker.unique_state_count()` for its config,
+which is what proves the picture is the space the checker verified.
+
+**The recorder is inert, proven the way this document demands.** A trace flag
+that perturbs the schedule records a run that never happened, so it is held to
+the same rule as the reach meter: buffered in memory, no rng draw, no
+op-sequence consumption, no `TraceHasher::record` call, no `.await`, and every
+world snapshot reads the raw `SimStorage::dump()` rather than a `FaultView`.
+Measured across the seven traced profiles in the scenario pack, each run twice
+under `VOPR_TRACE` with and without the flag, at `238a437`:
+
+| profile | op-interleaving dump | with vs without `--trace-jsonl` |
+|---|---|---|
+| `--seed 3 --nodes 3 --buckets 3 --ops 40 --partition 100` | 40,027 B | byte-identical |
+| `--seed 4 --nodes 2 --buckets 2 --ops 16 --partition 100` | 21,855 B | byte-identical |
+| `--seed 20 --nodes 3 --buckets 2 --ops 60` | 43,673 B | byte-identical |
+| `--seed 20 --nodes 3 --buckets 2 --ops 60 --partition 100` | 55,102 B | byte-identical |
+| `--seed 9000210 --nodes 3 --buckets 2 --ops 160 --fail-percent 3 --partition 100` | 121,011 B | byte-identical |
+| `--seeds 1 --nodes 2 --buckets 1 --ops 80 --break attest` | 26,598 B | byte-identical |
+| `--seeds 1 --nodes 2 --buckets 1 --ops 80 --break wedge` | 78,497 B | byte-identical |
+
+The printed run summary matches to the character once the wall clock is
+normalized away. Reproduce one by hand:
+
+```
+VOPR_TRACE=1 VOPR_TRACE_FILE=/tmp/a cargo run --release --example vopr -- \
+  --seed 3 --nodes 3 --buckets 3 --packages 1 --files 1 --ops 40 --fail-percent 0 --partition 100
+VOPR_TRACE=1 VOPR_TRACE_FILE=/tmp/b cargo run --release --example vopr -- \
+  --seed 3 --nodes 3 --buckets 3 --packages 1 --files 1 --ops 40 --fail-percent 0 --partition 100 \
+  --trace-jsonl /tmp/t.jsonl
+cmp /tmp/a /tmp/b                        # silent: 921 events, byte-identical
+```
+
+`make viz` runs all of it — the pack, the inertness gate above, and the standalone
+pages — into the gitignored `.local/viz/`. It is advisory and out of `check`, like
+`docs-truth`. It is also the pack's own staleness gate: every number a page says
+out loud is pinned in `dev/scripts/viz/scenarios.json` and re-checked on every
+build, so a scenario that stops reproducing fails the build instead of shipping a
+stale claim. That is how seed 1327's FREEZE_UNJUSTIFIED repro came to be marked
+retired at `439b839` rather than quietly rendering as green. See
+[scripts/viz/README.md](scripts/viz/README.md).
+
+```
+make viz                 # everything, ~2.5 min including a 20 s live measurement
+make viz VIZ_LIVE=0      # skip the live measurement
+python dev/scripts/viz/build.py --only wedge --skip-inertness --live-secs 0
+```
+
 ## Real cloud backends
 
 The emulators (MinIO, Azurite) are fast and hermetic but not the real thing, and

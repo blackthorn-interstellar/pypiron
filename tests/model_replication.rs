@@ -264,12 +264,23 @@ fn tombstone_side_abs(bucket: &mut BucketAbs, file: u8) {
     rec.mirror_q = false;
 }
 
-/// settle_mirror_quarantine: claim private, write the fence FIRST, move the
-/// losing body to this bucket's own `_quarantine/`, then drop the canonical
-/// record. The fence stays — it is the only part of a demoted record that
-/// replicates, and it is what keeps `origin release` refusing the name.
+/// settle_mirror_quarantine: claim private, re-read, write the fence FIRST,
+/// move the losing body to this bucket's own `_quarantine/`, then drop the
+/// canonical record. The fence stays — it is the only part of a demoted record
+/// that replicates, and it is what keeps `origin release` refusing the name.
+///
+/// The re-read is why this refuses a filename that already holds live PRIVATE
+/// truth: that record IS the demotion's resolution, and the merge reaches this
+/// primitive with a listing-era verdict that may predate it. The merge pass is
+/// atomic at this abstraction, so the guard never fires here — it is modelled
+/// because the audit scan and the merge share this one primitive, and the two
+/// drifted once already.
 fn settle_mirror_quarantine_abs(bucket: &mut BucketAbs, file: u8) {
     bucket.pkg_origin = Some(MOrigin::Private);
+    let rec = bucket.files[file as usize];
+    if rec.artifact.is_some() && rec.sidecar.map(|sc| sc.origin) == Some(MOrigin::Private) {
+        return;
+    }
     if let Some(byte) = bucket.files[file as usize].artifact {
         bucket.quarantine.insert((file, byte));
     }
@@ -495,7 +506,11 @@ fn reconcile_split_origin_abs(w: &mut World) {
     }
 }
 
-fn merge_once(w: &World, file: u8) -> Option<World> {
+/// Returns the merged world and the verdict that produced it, or `None` when the
+/// pass changed nothing. The verdict rides along so a caller can report *which*
+/// protocol decision a merge applied without a second copy of the rules; the
+/// model itself ignores it.
+fn merge_once(w: &World, file: u8) -> Option<(World, Verdict)> {
     let mut next = w.clone();
     reconcile_split_origin_abs(&mut next);
     // Records are read after the reconciliation, on the reconciled claims —
@@ -504,7 +519,7 @@ fn merge_once(w: &World, file: u8) -> Option<World> {
     let rb = to_record(&next.buckets[1], file);
     let verdict = decide(&ra, &rb);
     apply_verdict(&mut next, file, &verdict);
-    (next != *w).then_some(next)
+    (next != *w).then_some((next, verdict))
 }
 
 fn backfill_once(w: &World, bucket: u8, file: u8) -> Option<World> {
@@ -802,7 +817,7 @@ impl Model for Fleet {
                 next.writers[idx].pc = WriterPc::Crashed;
                 Some(next)
             }
-            Act::Merge(file) => merge_once(state, file),
+            Act::Merge(file) => merge_once(state, file).map(|(next, _verdict)| next),
             Act::AuditBackfill { bucket, file } => backfill_once(state, bucket, file),
             Act::LateMirrorQuarantine { bucket, file } => {
                 late_mirror_quarantine_once(state, bucket, file)
@@ -952,21 +967,26 @@ fn private_writer(bucket: u8, file: u8, byte: u8, epoch: u16) -> Writer {
 /// with different bytes land on different buckets (the serialization point
 /// moved). Receive stamps are >2s apart, so first-uploaded-wins orders them:
 /// the loser is quarantined, never deleted, and the fleet converges.
+///
+/// A constructor rather than a literal because the visualizer dump at the bottom
+/// of this file draws this exact fleet: sharing it is what makes "the drawn
+/// graph is the space the merge gate checks" a fact instead of a promise.
+fn conflict_fleet() -> Fleet {
+    Fleet {
+        writers: vec![private_writer(0, 0, 0, 0), private_writer(1, 0, 1, 5000)],
+        expect_freeze: false,
+        expect_quarantine_loser: true,
+        expect_supersede: false,
+        expect_yank_propagation: false,
+        expect_delete_propagation: false,
+        expect_upload_replicates: true,
+        expect_mirror_replicates: false,
+    }
+}
+
 #[test]
 fn partition_conflict_first_uploaded_wins() {
-    check(
-        "first_uploaded_wins",
-        Fleet {
-            writers: vec![private_writer(0, 0, 0, 0), private_writer(1, 0, 1, 5000)],
-            expect_freeze: false,
-            expect_quarantine_loser: true,
-            expect_supersede: false,
-            expect_yank_propagation: false,
-            expect_delete_propagation: false,
-            expect_upload_replicates: true,
-            expect_mirror_replicates: false,
-        },
-    );
+    check("first_uploaded_wins", conflict_fleet());
 }
 
 /// Same double publish, but the receive stamps sit inside the 2 s clock-skew
@@ -1712,6 +1732,439 @@ mod conformance {
         assert!(
             copy_scenarios > 10,
             "expected many copy scenarios, got {copy_scenarios}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Visualizer export (dev/scripts/viz): this model's reachable state graph as one
+// JSON document — nodes, edges, and a few named paths.
+//
+// Enumeration is the `Model` trait itself (`init_states` + `next_steps`), so no
+// part of the protocol is restated here. The checker cannot hand over the graph:
+// its `generated` map is a private child->parent spanning tree keyed by an opaque
+// fingerprint, and a `StateRecorder`/`PathRecorder` visitor sees only that tree —
+// in this fleet most edges are joins into already-discovered states, and those
+// joins are precisely the exhaustiveness argument. So the edges are re-derived.
+//
+// The BFS below is single-threaded, which makes `counts.depth` a real
+// shortest-path depth. `Checker::max_depth()` is a different, thread-count
+// dependent number, is not the graph diameter, and is deliberately not published.
+// ---------------------------------------------------------------------------
+
+mod viz {
+    use super::*;
+    use std::collections::{BTreeMap, HashMap, VecDeque};
+
+    use serde_json::{json, Value};
+
+    /// The discovering edge into a node, for walking a shortest path back to init.
+    struct TreeEdge {
+        from: usize,
+        action: String,
+        verdict: Option<String>,
+    }
+
+    struct GraphDump<'f> {
+        fleet: &'f Fleet,
+        props: Vec<Property<Fleet>>,
+        ids: HashMap<World, usize>,
+        depth: Vec<usize>,
+        parent: Vec<Option<TreeEdge>>,
+        /// No enabled transition leaves this state.
+        terminal: Vec<bool>,
+        nodes: Vec<Value>,
+        edges: Vec<Value>,
+        tree_edges: usize,
+        quiescent_nodes: usize,
+        converged_nodes: usize,
+        action_counts: BTreeMap<String, usize>,
+    }
+
+    impl<'f> GraphDump<'f> {
+        fn new(fleet: &'f Fleet) -> Self {
+            Self {
+                fleet,
+                props: fleet.properties(),
+                ids: HashMap::new(),
+                depth: Vec::new(),
+                parent: Vec::new(),
+                terminal: Vec::new(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                tree_edges: 0,
+                quiescent_nodes: 0,
+                converged_nodes: 0,
+                action_counts: BTreeMap::new(),
+            }
+        }
+
+        /// Returns `(id, first_seen)`.
+        fn intern(&mut self, w: &World, d: usize) -> (usize, bool) {
+            if let Some(&id) = self.ids.get(w) {
+                return (id, false);
+            }
+            let id = self.nodes.len();
+            let fleet = self.fleet;
+            let holds: Vec<&str> = self
+                .props
+                .iter()
+                .filter(|p| (p.condition)(fleet, w))
+                .map(|p| p.name)
+                .collect();
+            let is_quiescent = quiescent(w);
+            let is_converged = converged(w);
+            let node = json!({
+                "id": id,
+                "depth": d,
+                "state": render_world(w),
+                // The anti-rot guard: the projection above is hand-maintained, so
+                // a new `World`/`FileRec` field can silently vanish from it. It
+                // cannot vanish from here.
+                "raw": format!("{w:#?}"),
+                "props": holds,
+                "flags": { "quiescent": is_quiescent, "converged": is_converged },
+            });
+            self.ids.insert(w.clone(), id);
+            self.depth.push(d);
+            self.parent.push(None);
+            self.terminal.push(false);
+            self.quiescent_nodes += usize::from(is_quiescent);
+            self.converged_nodes += usize::from(is_converged);
+            self.nodes.push(node);
+            (id, true)
+        }
+
+        fn explore(&mut self) {
+            let fleet = self.fleet;
+            let mut queue: VecDeque<(World, usize)> = VecDeque::new();
+            for init in fleet.init_states() {
+                let (id, fresh) = self.intern(&init, 0);
+                if fresh {
+                    queue.push_back((init, id));
+                }
+            }
+            while let Some((state, from)) = queue.pop_front() {
+                let d = self.depth[from];
+                let steps = fleet.next_steps(&state);
+                if steps.is_empty() {
+                    self.terminal[from] = true;
+                }
+                for (action, next) in steps {
+                    let label = format!("{action:?}");
+                    // The verdict the merge actually applied. It comes out of the
+                    // same `merge_once` that produced `next` — never a second
+                    // copy of the precedence rules.
+                    let verdict = merge_verdict(&state, action);
+                    let (to, fresh) = self.intern(&next, d + 1);
+                    *self.action_counts.entry(label.clone()).or_default() += 1;
+                    if fresh {
+                        self.tree_edges += 1;
+                        self.parent[to] = Some(TreeEdge {
+                            from,
+                            action: label.clone(),
+                            verdict: verdict.clone(),
+                        });
+                        queue.push_back((next, to));
+                    }
+                    self.edges.push(json!({
+                        "from": from,
+                        "to": to,
+                        "action": label,
+                        "verdict": verdict,
+                        "tree": fresh,
+                    }));
+                }
+            }
+        }
+
+        fn deepest_terminal(&self) -> Option<usize> {
+            (0..self.nodes.len())
+                .filter(|&id| self.terminal[id])
+                .max_by_key(|&id| self.depth[id])
+        }
+
+        /// A shortest path from init to `id`. Each step carries the state and the
+        /// action leaving it; the last step's action is null.
+        fn path_to(&self, id: usize) -> Vec<Value> {
+            let mut chain: Vec<(usize, Option<&TreeEdge>)> = Vec::new();
+            let mut cursor = Some(id);
+            while let Some(node) = cursor {
+                let edge = self.parent[node].as_ref();
+                chain.push((node, edge));
+                cursor = edge.map(|e| e.from);
+            }
+            chain.reverse();
+            (0..chain.len())
+                .map(|i| {
+                    let leaving = chain.get(i + 1).and_then(|&(_, edge)| edge);
+                    json!({
+                        "id": chain[i].0,
+                        "action": leaving.map(|e| e.action.clone()),
+                        "verdict": leaving.and_then(|e| e.verdict.clone()),
+                    })
+                })
+                .collect()
+        }
+
+        fn depth_histogram(&self) -> BTreeMap<usize, usize> {
+            let mut histogram = BTreeMap::new();
+            for &d in &self.depth {
+                *histogram.entry(d).or_default() += 1;
+            }
+            histogram
+        }
+    }
+
+    /// The `Verdict` a `Merge` transition applied, `None` for every other action.
+    fn merge_verdict(state: &World, action: Act) -> Option<String> {
+        match action {
+            Act::Merge(file) => merge_once(state, file).map(|(_, v)| format!("{v:?}")),
+            _ => None,
+        }
+    }
+
+    fn render_sidecar(sc: &AbsSidecar) -> Value {
+        json!({
+            "sha_of": sc.sha_of,
+            "origin": format!("{:?}", sc.origin),
+            "yanked": sc.yanked,
+            "yank_epoch": sc.yank_epoch,
+            "epoch_ms": sc.epoch_ms,
+            "snapshot": sc.snapshot,
+        })
+    }
+
+    fn render_bucket(bucket: &BucketAbs) -> Value {
+        use pypiron::replicate::RecordState;
+        let files: Vec<Value> = (0..FILES.len() as u8)
+            .map(|file| {
+                let rec = bucket.files[file as usize];
+                // The real resolver's own classifier for this cell, so the cell a
+                // reader sees cannot disagree with what the merge reads.
+                let resolved = match to_record(bucket, file).state() {
+                    RecordState::Live { sha, origin } => {
+                        format!("Live({origin:?},{})", sha.get(..8).unwrap_or(sha.as_str()))
+                    }
+                    other => format!("{other:?}"),
+                };
+                json!({
+                    "file": FILES[file as usize],
+                    "artifact": rec.artifact,
+                    "sidecar": rec.sidecar.as_ref().map(render_sidecar),
+                    "tombstoned": rec.tombstoned,
+                    "frozen": rec.frozen,
+                    "mirror_quarantined": rec.mirror_q,
+                    "resolved": resolved,
+                })
+            })
+            .collect();
+        json!({
+            "pkg_origin": bucket.pkg_origin.map(|o| format!("{o:?}")),
+            "files": files,
+            "quarantine": bucket.quarantine.iter().map(|&(f, b)| json!([f, b]))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    fn render_world(w: &World) -> Value {
+        json!({
+            "buckets": [render_bucket(&w.buckets[0]), render_bucket(&w.buckets[1])],
+            "writers": w.writers.iter().map(|wr| json!({
+                "bucket": wr.bucket,
+                "kind": format!("{:?}", wr.kind),
+                "pc": format!("{:?}", wr.pc),
+            })).collect::<Vec<_>>(),
+            "acked": w.acked.iter().map(|&(f, b)| json!([f, b])).collect::<Vec<_>>(),
+            "delete_started": w.delete_started.iter().copied().collect::<Vec<u8>>(),
+        })
+    }
+
+    /// A checker `Path` mapped through the dump's own id table.
+    fn discovery_steps(ids: &HashMap<World, usize>, path: Vec<(World, Option<Act>)>) -> Vec<Value> {
+        path.into_iter()
+            .map(|(state, action)| {
+                let verdict = action.and_then(|a| merge_verdict(&state, a));
+                let id = ids
+                    .get(&state)
+                    .copied()
+                    .expect("a discovery state is in the enumerated space");
+                json!({
+                    "id": id,
+                    "action": action.map(|a| format!("{a:?}")),
+                    "verdict": verdict,
+                })
+            })
+            .collect()
+    }
+
+    fn git_short_head() -> String {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|sha| sha.trim().to_string())
+            .filter(|sha| !sha.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// Writes the state graph of `conflict_fleet()` to `$PYPIRON_VIZ_GRAPH`.
+    ///
+    /// The env guard is load-bearing, not decoration: the nightly `model-deep`
+    /// job runs `cargo test --release ... -- --ignored`, so `#[ignore]` alone
+    /// would run this in CI. Without the variable the test does nothing at all.
+    #[test]
+    #[ignore = "visualizer: writes a state-graph JSON when PYPIRON_VIZ_GRAPH=<path>"]
+    fn dump_state_graph() {
+        let Ok(out) = std::env::var("PYPIRON_VIZ_GRAPH") else {
+            return;
+        };
+        let start = std::time::Instant::now();
+
+        let fleet = conflict_fleet();
+        let mut dump = GraphDump::new(&fleet);
+        dump.explore();
+
+        // The drawn graph must be the space the checker verifies, or the picture
+        // is fiction. Same fleet, independently enumerated, counts compared.
+        let checker = conflict_fleet().checker().spawn_bfs().join();
+        checker.assert_properties();
+        assert_eq!(
+            dump.nodes.len(),
+            checker.unique_state_count(),
+            "the dumped graph must be exactly the state space the checker verified",
+        );
+
+        // Backs caveat 1 below. A fleet that grows a mirror writer must not keep
+        // publishing the claim that this action never fires.
+        assert!(
+            !dump
+                .action_counts
+                .keys()
+                .any(|a| a.starts_with("LateMirrorQuarantine")),
+            "the LateMirrorQuarantine caveat is stale: this fleet now takes that action",
+        );
+
+        let node_count = dump.nodes.len();
+        let edge_count = dump.edges.len();
+        let joins = edge_count - dump.tree_edges;
+        let depth = dump.depth.iter().copied().max().unwrap_or(0);
+
+        let mut paths: Vec<Value> = Vec::new();
+        let mut discoveries: Vec<_> = checker.discoveries().into_iter().collect();
+        discoveries.sort_by_key(|(name, _)| *name);
+        for (name, path) in discoveries {
+            paths.push(json!({
+                "name": name,
+                "kind": "discovery",
+                "note": "the shortest interleaving the checker found for this reachability probe",
+                "steps": discovery_steps(&dump.ids, path.into_vec()),
+            }));
+        }
+        if let Some(id) = dump.deepest_terminal() {
+            paths.push(json!({
+                "name": "deepest_settled_world",
+                "kind": "terminal",
+                "note": "shortest interleaving from init to the deepest state with no enabled transition",
+                "steps": dump.path_to(id),
+            }));
+        }
+
+        let caveats = vec![
+            "`LateMirrorQuarantine` is an enabled action in every state but fires on 0 \
+             transitions here — this fleet has no mirror writer, so an all-actions legend \
+             would mislead."
+                .to_string(),
+            "Only `Merge` edges carry a verdict: it is the real `pypiron::replicate::decide` \
+             result the transition applied. Every other action has none."
+                .to_string(),
+            format!(
+                "Depth {depth} is a shortest-path depth from this dump's own single-threaded \
+                 BFS. `Checker::max_depth()` reports a different, thread-count dependent \
+                 number that is not the graph diameter, and is not published here."
+            ),
+            format!(
+                "All {node_count} states are drawn: the count is asserted equal to \
+                 `Checker::unique_state_count()` for the same fleet. This is the \
+                 configuration `partition_conflict_first_uploaded_wins` checks on every \
+                 merge-gate run — nothing is reduced."
+            ),
+            "This model abstracts views/indexes and `_dirty/` markers (the event-protocol \
+             model owns those) and reduces file bodies to two distinct byte strings."
+                .to_string(),
+            "`model_replication_deep` — the largest configuration in this file, run nightly \
+             with `--ignored` — is far too large to draw and is not shown."
+                .to_string(),
+        ];
+
+        let doc = json!({
+            "kind": "graph",
+            "model": "replication",
+            "config": {
+                "test": "partition_conflict_first_uploaded_wins",
+                "buckets": 2,
+                "files": FILES,
+                "writers": fleet.writers.iter().map(|wr| json!({
+                    "bucket": wr.bucket,
+                    "kind": format!("{:?}", wr.kind),
+                    "pc": format!("{:?}", wr.pc),
+                })).collect::<Vec<_>>(),
+                "expect_freeze": fleet.expect_freeze,
+                "expect_quarantine_loser": fleet.expect_quarantine_loser,
+                "expect_supersede": fleet.expect_supersede,
+                "expect_yank_propagation": fleet.expect_yank_propagation,
+                "expect_delete_propagation": fleet.expect_delete_propagation,
+                "expect_upload_replicates": fleet.expect_upload_replicates,
+                "expect_mirror_replicates": fleet.expect_mirror_replicates,
+            },
+            "generated_by": format!(
+                "PYPIRON_VIZ_GRAPH={out} cargo test --release --test model_replication \
+                 -- --ignored dump_state_graph"
+            ),
+            "commit": git_short_head(),
+            "title": "Two writers race one filename across two regions",
+            "narration": format!(
+                "Every interleaving of two private uploads of the same immutable filename \
+                 into different regions — {node_count} states, {edge_count} transitions, \
+                 {joins} of them joins where independent orders reconverge on the same world."
+            ),
+            "caveats": caveats,
+            "counts": {
+                "nodes": node_count,
+                "edges": edge_count,
+                "tree_edges": dump.tree_edges,
+                "joins": joins,
+                "depth": depth,
+                "depth_histogram": dump.depth_histogram(),
+                "quiescent_nodes": dump.quiescent_nodes,
+                "converged_nodes": dump.converged_nodes,
+                "terminal_nodes": dump.terminal.iter().filter(|&&t| t).count(),
+                "action_counts": dump.action_counts,
+                "ci_states": checker.unique_state_count(),
+                "ci_depth_note": "depth is a shortest-path depth from this dump's own \
+                                  single-threaded BFS; Checker::max_depth() is thread-count \
+                                  dependent and is not the graph diameter",
+            },
+            "props": dump.props.iter().map(|p| json!({
+                "name": p.name,
+                "kind": format!("{:?}", p.expectation).to_lowercase(),
+            })).collect::<Vec<_>>(),
+            "nodes": dump.nodes,
+            "edges": dump.edges,
+            "paths": paths,
+        });
+
+        let bytes = serde_json::to_vec(&doc).expect("the graph document serializes");
+        let size = bytes.len();
+        std::fs::write(&out, bytes).expect("write the graph document");
+        eprintln!(
+            "dump_state_graph: {node_count} nodes, {edge_count} edges ({} tree, {joins} joins), \
+             depth {depth}, {} paths, {size} bytes in {:?} -> {out}",
+            dump.tree_edges,
+            paths.len(),
+            start.elapsed(),
         );
     }
 }

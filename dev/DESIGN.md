@@ -531,6 +531,15 @@ Three consequences, each the fail-closed direction:
   which is exactly the door this consequence exists to keep shut. The audit's
   scan had always skipped a private sidecar under a fence; the merge had not,
   and audit and merge share one primitive precisely so they cannot drift.
+  Re-reading is necessary and not sufficient, which is the other half: object
+  deletes are unconditional, so a key that reads empty is not a key that stays
+  empty — and this fence, alone among the three, leaves it writable throughout.
+  What authorizes the drop is the `_quarantine/` copy, not any reading of the
+  key: the settle removes the body only when it holds a verified copy of exactly
+  the bytes standing there, and leaves the body alone otherwise. The same delete
+  is why a replication copy re-reads the body under a key before publishing a
+  sidecar naming it — the copy's immutable create makes the key its own, and a
+  settle is the one pass entitled to take it back.
 - **The marker names a filename, never a hash.** Two partitioned buckets can
   demote two different mirror bodies of one filename; a marker carrying its local
   sha would then differ per bucket and never converge. It carries only the

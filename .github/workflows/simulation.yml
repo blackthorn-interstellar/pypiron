@@ -148,7 +148,9 @@ jobs:
   # CLOSED and pinned in ci.yml — `f37e391` (DURABILITY, the stale settle),
   # `4eaa015` (CONSERVATION, the settle that destroyed a racing publish's body)
   # and `bb885ef` (SELF_CONSISTENCY, the non-crash-atomic supersede). The three
-  # below are new.
+  # below were new at that census; two of them are CLOSED since, so the 6-seed
+  # count above is the rate BEFORE those fixes and the next census is what moves
+  # it. Do not re-quote it as current.
   #
   # Read the pooled number with its caveat. The 4.1M-seed narrow lane in that
   # pool starves four oracles — at 1 package x 1 file the corpus is fully
@@ -234,19 +236,30 @@ jobs:
   #      fan-out and `_repl/` debt paths at three buckets but not the merge
   #      algebra; a partitioned three-bucket lane is the coverage still missing.
   #
-  #   3. CONVERGENCE + SELF_CONSISTENCY + DURABILITY — a symmetric partitioned
-  #      byte conflict settles on TWO survivors at once, with a crossed body.
-  #      Bucket 0 ends serving one byte-set and bucket 1 the other under a single
-  #      immutable filename, each holding a DIFFERENT `_quarantine/` hash, with
-  #      no `.frozen` and no `.superseding` on either — and bucket 0's sidecar
-  #      publishes the sha256 of the body sitting in its own `_quarantine/`, not
-  #      the one under its canonical key. SELF_CONSISTENCY again, but a SECOND
-  #      producer: `bb885ef` closed the mid-supersede crash, and no `.superseding`
-  #      fence is ever written here — the crossed body arrives through the
-  #      quarantine/adopt path. Rarest of the three and the hardest: a genuine
-  #      symmetry hole in the merge algebra, not a torn write.
+  #   3. CONVERGENCE + SELF_CONSISTENCY + DURABILITY — CLOSED, and it was not a
+  #      symmetry hole in the merge algebra. Bucket 0 ended serving one byte-set
+  #      under the OTHER's published sha256, with no `.frozen` and no
+  #      `.superseding` — so a second SELF_CONSISTENCY producer beside the
+  #      mid-supersede crash `bb885ef` closed, but a torn write after all, and
+  #      the tear was not in the copy. `copy_live` lands the artifact before the
+  #      sidecar precisely so the sidecar can only ever describe bytes the bucket
+  #      holds; `settle_mirror_quarantine`'s delete landed between the two legs
+  #      and retracted that ownership, the sidecar published over an emptied key,
+  #      and a racing create took it with different bytes. Permanent from there:
+  #      `decide` compares sidecar shas, both buckets read as agreed, and nothing
+  #      re-hashes a stored body. Fixed by re-checking the body under the key
+  #      before publishing truth about it. Pinned by
+  #      `replicate::tests::a_copy_never_publishes_truth_over_a_body_the_bucket_lost`
+  #      and by the seed in ci.yml.
   #        --seed 62000150551 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100
   #      (PASSES at `--partition 0`.)
+  #      Same delete, one more victim, closed in the same commit: with nothing
+  #      preserved the settle read the key empty and deleted it anyway, so a
+  #      publish creating it in that gap was acked 200 and its bytes then existed
+  #      nowhere (`--seed 86001009016 --nodes 3 --buckets 2 --packages 1 --files 1
+  #      --ops 26 --fail-percent 1 --partition 100`). A re-read cannot close
+  #      either window — `delete_keys` is unconditional — so the authorization is
+  #      now the `_quarantine/` copy, not a reading of the key.
   #
   # This lane's profile is the wrong instrument for two of the three, in opposite
   # directions. Root cause 1's `AUDIT_PREMATURE_CONSUMPTION` arm and all three of

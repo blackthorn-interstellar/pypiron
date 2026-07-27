@@ -905,6 +905,8 @@ async fn copy_live(
     // destination's immutable create is a strictly stronger gate than its
     // sidecar: nothing can land a body under a key we already own, so the
     // sidecar installed after it can only ever describe bytes this bucket holds.
+    // Owning it is not forever, though — a demotion settle may empty the key
+    // between the two legs — so [`copy_truth`] re-checks before it publishes.
     //
     // Published the other way round, the sidecar stands over a key a concurrent
     // writer can still take — a publish on that bucket during a partition wins
@@ -921,6 +923,7 @@ async fn copy_live(
     // same sha and the same-sha sidecar merge settles the metadata — the same
     // window the upload path has always had between its artifact and sidecar.
     if let Some(bytes) = streamed.take() {
+        let landed = bytes.len() as u64;
         let changed =
             match artifact_leg(state, src, dst, pkg, filename, sc, &akey, bytes, false).await? {
                 // The filename is fenced on both buckets and its bodies preserved.
@@ -928,7 +931,7 @@ async fn copy_live(
                 ArtifactLeg::Frozen => return Ok(false),
                 ArtifactLeg::Landed { changed } => changed,
             };
-        return copy_truth(dst, &akey, sc, companions, changed, is_mirror).await;
+        return copy_truth(dst, &akey, sc, companions, changed, is_mirror, landed).await;
     }
 
     // Sidecar first for the server-side copy transport, whose copy verb has no
@@ -983,6 +986,25 @@ async fn copy_live(
 
 /// Publish the destination's truth for a record whose bytes are already down:
 /// the sidecar that names them, then the companions.
+///
+/// `landed` is the size of the body the artifact leg left under `akey`, and it
+/// is re-checked here. The leg's claim — "nothing can land a body under a key we
+/// already own" — holds only for as long as we still own it, and one pass in the
+/// system is entitled to empty a live canonical key: a demotion settle, whose
+/// fence deliberately does not bar the writers racing it. A settle landing
+/// between the two legs leaves this sidecar standing over an empty key, the next
+/// create takes that key with different bytes, and the bucket publishes sha A
+/// over body B permanently — `decide` compares sidecar shas, so both buckets
+/// read as agreed and nothing re-hashes a stored body. Traced on vopr seed
+/// 62000150551, where bucket 0 ended up serving one byte-set under the other's
+/// sha256 and every later merge returned `Noop`.
+///
+/// One HEAD, not a re-read of the body: this is the same shape as
+/// [`sidecar_still_names`] and it narrows rather than closes — a settle can
+/// still land in the op between this check and the create. It cannot be closed
+/// from here, because `delete_keys` is unconditional; what it takes away is the
+/// wide window, the one an unrelated pass walks into. Refusing leaves the
+/// caller's `_repl/` note to bring the next `decide` back to the record.
 async fn copy_truth(
     dst: &dyn Storage,
     akey: &str,
@@ -990,7 +1012,17 @@ async fn copy_truth(
     companions: Companions,
     mut changed: bool,
     is_mirror: bool,
+    landed: u64,
 ) -> Result<bool> {
+    match dst.stored_size(akey).await? {
+        Some(size) if size == landed => {}
+        Some(size) => bail!(
+            "destination artifact at {akey} holds {size} bytes, not the {landed} this copy landed"
+        ),
+        None => {
+            bail!("destination artifact at {akey} was removed before its sidecar was published")
+        }
+    }
     changed |= if is_mirror {
         install_or_verify_mirror_sidecar(dst, &sidecar_key(akey), sc).await?
     } else {
@@ -1693,26 +1725,57 @@ async fn settle_mirror_quarantine(
     // canonical key stays writable for the whole settle. A blind
     // `delete_keys` then destroys whatever a racing publish created there,
     // bytes no `_quarantine/` copy holds and no other pass can recover.
-    // Measured: a private upload acked on the same bucket whose body a sibling
-    // settle, holding a read from three ops earlier, had already deleted.
+    // Measured twice, on the two arms below: a private upload acked on the same
+    // bucket whose body a sibling settle, holding a read from three ops earlier,
+    // had already deleted (vopr seed 40000042940).
     //
-    // Nothing preserved is not the same as nothing to destroy — the key can be
-    // empty at the read above and occupied by the time the delete lands — so
-    // the re-read is unconditional and is the last thing before the delete.
-    // Abandoning is safe and terminal: the private record standing there reads
-    // `Live { Private }` under a spent fence, which `decide` resolves and
-    // `clear_spent_demotion_fence` finishes.
-    match storage.get_bytes(&akey).await {
-        Ok(standing) if preserved.as_deref() != Some(sha256_hex(&standing).as_str()) => {
-            return Ok(marker_created || preserved.is_some());
+    // A re-read cannot make that safe, and this used to try: the key can be
+    // empty at the read above and occupied by the time the delete lands, and
+    // `delete_keys` is unconditional, so no reading of the key authorizes
+    // removing it. Only the `_quarantine/` copy does. So the body key is in the
+    // delete list only when this settle holds a verified copy of exactly the
+    // bytes standing there — the move completing — and is left out entirely
+    // otherwise. Measured: a private upload acked 200 on vopr seed 86001009016,
+    // created under a key a sibling settle had just read as empty and then
+    // deleted blind; the bytes were in no `_quarantine/` copy, under no
+    // tombstone and no `.frozen`, so nothing ever looked for them again.
+    //
+    // Different bytes standing there abandons the whole settle instead, which
+    // is safe and terminal: the private record reads `Live { Private }` under a
+    // spent fence, which `decide` resolves and `clear_spent_demotion_fence`
+    // finishes.
+    let body_is_ours = match storage.get_bytes(&akey).await {
+        Ok(standing) => {
+            if preserved.as_deref() != Some(sha256_hex(&standing).as_str()) {
+                return Ok(marker_created || preserved.is_some());
+            }
+            true
         }
-        Ok(_) => {}
-        Err(e) if is_not_found(&e) => {}
+        Err(e) if is_not_found(&e) => false,
         Err(e) => return Err(e),
-    }
+    };
+    // The sidecar and companions go either way. A mirror sidecar with no body
+    // under it is a torn record, and settling it is the only thing that clears
+    // the verdict — skipping the drop would leave `decide` re-issuing it
+    // forever. The worst a publish racing this same gap loses is its sidecar,
+    // leaving a bare artifact its own backfill re-derives at the same sha: the
+    // window the upload path has always had between its bytes and its truth.
+    //
     // The fence itself is deliberately NOT in this list — it is the whole point
     // of the demotion, and the only part of the record that replicates.
-    storage.delete_keys(&record_object_keys(&akey)).await?;
+    //
+    // The body still leads when it is in the list: `delete_keys` is one key at a
+    // time on every backend, and a crash after the sidecar would leave a BARE
+    // mirror body under a private package claim, which `load_file_metadata`
+    // backfills into a private sidecar — laundering upstream bytes into private
+    // truth (§4). Body first leaves a bare sidecar instead, which serves nothing.
+    let keys = if body_is_ours {
+        record_object_keys(&akey).to_vec()
+    } else {
+        let [_body, sidecar, metadata, provenance] = record_object_keys(&akey);
+        vec![sidecar, metadata, provenance]
+    };
+    storage.delete_keys(&keys).await?;
     Ok(marker_created || preserved.is_some() || sidecar_left)
 }
 
@@ -3214,13 +3277,16 @@ mod tests {
     /// code under test is most exposed: by default when it tries to CREATE the
     /// key (so its create loses), or — with [`racing_a_read`] — the instant it
     /// has READ the key, so whatever it decided from those bytes is already
-    /// stale by the time it acts.
+    /// stale by the time it acts, or — with [`racing_a_delete`] — inside the
+    /// DELETE itself, the gap no re-read can close because `delete_keys` is
+    /// unconditional.
     struct RacingWriterStorage {
         inner: InMemStorage,
         key: String,
         bytes: Vec<u8>,
         required_prior_key: Option<String>,
         on_read: bool,
+        on_delete: bool,
         raced: AtomicBool,
     }
 
@@ -3232,6 +3298,7 @@ mod tests {
                 bytes,
                 required_prior_key: None,
                 on_read: false,
+                on_delete: false,
                 raced: AtomicBool::new(false),
             }
         }
@@ -3243,6 +3310,11 @@ mod tests {
 
         fn racing_a_read(mut self) -> Self {
             self.on_read = true;
+            self
+        }
+
+        fn racing_a_delete(mut self) -> Self {
+            self.on_delete = true;
             self
         }
     }
@@ -3284,7 +3356,11 @@ mod tests {
             bytes: Vec<u8>,
             content_type: Option<&str>,
         ) -> Result<bool> {
-            if !self.on_read && key == self.key && !self.raced.swap(true, Ordering::SeqCst) {
+            if !self.on_read
+                && !self.on_delete
+                && key == self.key
+                && !self.raced.swap(true, Ordering::SeqCst)
+            {
                 if let Some(required) = &self.required_prior_key {
                     if !self.inner.head_exists(required).await? {
                         bail!("{required} must exist before creating {key}");
@@ -3322,6 +3398,9 @@ mod tests {
         }
 
         async fn delete_keys(&self, keys: &[String]) -> Result<()> {
+            if self.on_delete && !self.raced.swap(true, Ordering::SeqCst) {
+                self.inner.insert(&self.key, self.bytes.clone());
+            }
             self.inner.delete_keys(keys).await
         }
 
@@ -3497,6 +3576,65 @@ mod tests {
                 .len(),
             1
         );
+        assert!(storage
+            .inner
+            .head_exists(&mirror_quarantined_key(&key))
+            .await
+            .unwrap());
+    }
+
+    /// The settle preserved NOTHING — the canonical key read empty, which is
+    /// the torn mirror record it is the right cleanup for — and a publish then
+    /// created that key while the delete was landing. Nothing preserved is not
+    /// the same as nothing to destroy, and no re-read can tell the difference:
+    /// `delete_keys` is unconditional, so the only thing that authorizes
+    /// removing a body is holding a `_quarantine/` copy of it. Traced on vopr
+    /// seed 86001009016 (`--nodes 3 --buckets 2 --packages 1 --files 1 --ops 26
+    /// --fail-percent 1 --partition 100`), where a `twine upload` got its 200
+    /// and the bytes then existed nowhere — no tombstone, no `.frozen`, no
+    /// `_quarantine/` copy — so no sweep, reconcile, audit or `verify-chain`
+    /// ever looked for them again.
+    #[tokio::test]
+    async fn a_demotion_settle_never_drops_a_body_it_never_preserved() {
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let storage = Arc::new(
+            RacingWriterStorage::new(key.clone(), b"acked private upload".to_vec())
+                .racing_a_delete(),
+        );
+        // A torn mirror record: sidecar, no body. The settle preserves nothing.
+        storage.inner.insert(
+            &sidecar_key(&key),
+            serde_json::to_vec(&sc(
+                &sha256_hex(b"mirror bytes"),
+                MIRROR,
+                Yanked::Flag(false),
+                0,
+            ))
+            .unwrap(),
+        );
+        storage
+            .inner
+            .insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
+
+        settle_mirror_quarantine(storage.as_ref(), "pkg", filename)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.inner.get_bytes(&key).await.unwrap(),
+            b"acked private upload",
+            "the settle destroyed acked bytes it held no _quarantine/ copy of"
+        );
+        assert!(storage
+            .inner
+            .list_all(QUARANTINE_PREFIX)
+            .await
+            .unwrap()
+            .is_empty());
+        // The torn sidecar it *was* the right cleanup for still goes, or the
+        // verdict re-fires forever; the fence stays, as it always does.
+        assert!(!storage.inner.head_exists(&sidecar_key(&key)).await.unwrap());
         assert!(storage
             .inner
             .head_exists(&mirror_quarantined_key(&key))
@@ -3964,6 +4102,52 @@ mod tests {
             serde_json::from_slice(&dst.get_bytes(&sidecar_key(&key)).await.unwrap()).unwrap();
         assert_eq!(sidecar.sha256, sha256_hex(bytes));
         assert!(!dst.head_exists(&frozen_key(&key)).await.unwrap());
+    }
+
+    /// The artifact leg publishes bytes first so the sidecar after it can only
+    /// describe bytes this bucket holds — but that claim expires. A demotion
+    /// settle is entitled to empty a live canonical key, and its fence
+    /// deliberately does not bar the writers racing it. Landing between the two
+    /// legs, it leaves the sidecar standing over nothing, the next create takes
+    /// the free key with different bytes, and the bucket publishes sha A over
+    /// body B forever: `decide` compares sidecar shas, so both buckets read as
+    /// agreed and nothing re-hashes a stored body. `pip` then fails its hash
+    /// check against the index's own sha256 — from one region only. Traced on
+    /// vopr seed 62000150551 (`--nodes 3 --buckets 2 --packages 6 --files 2
+    /// --ops 80 --fail-percent 3 --partition 100`).
+    #[tokio::test]
+    async fn a_copy_never_publishes_truth_over_a_body_the_bucket_lost() {
+        let dst = Arc::new(InMemStorage::default());
+        let bytes = b"private wheel";
+        let key = artifact_key("pkg", "pkg-1.whl");
+        let sidecar = sc(&sha256_hex(bytes), PRIVATE, Yanked::Flag(false), 0);
+        let companions = Companions {
+            metadata: None,
+            provenance: None,
+        };
+
+        // The artifact leg landed these bytes; a settle on this bucket dropped
+        // the record before the sidecar leg reached it.
+        let err = copy_truth(
+            dst.as_ref(),
+            &key,
+            &sidecar,
+            companions,
+            false,
+            false,
+            bytes.len() as u64,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("removed before its sidecar"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dst.head_exists(&sidecar_key(&key)).await.unwrap(),
+            "the copy published a sha256 for bytes this bucket does not hold"
+        );
     }
 
     #[tokio::test]

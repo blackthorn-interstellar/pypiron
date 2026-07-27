@@ -172,6 +172,25 @@ jobs:
           # impossible. Pinned because it is the only reproducer that separates
           # a refused delete from a failed one.
           cargo run --example vopr -- --seed 18200013677 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
+          # The same settle, the OTHER arm. `40000042940` above pinned the case
+          # where a racing publish's body was already standing at the settle's
+          # re-read; this one is the case where it was not yet — the key read
+          # empty, the create landed while the delete was in flight, and the
+          # delete was unconditional. A `twine upload` got its 200 and the bytes
+          # then existed nowhere: no `_quarantine/` copy, no `.tombstone`, no
+          # `.frozen`. Pinned because a re-read cannot separate the two arms and
+          # the fix is what does — the body is deleted only when a verified
+          # `_quarantine/` copy of exactly those bytes exists.
+          cargo run --example vopr -- --seed 86001009016 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 26 --fail-percent 1 --partition 100
+          # A settle emptying a canonical key out from under a replication copy,
+          # between the copy's artifact leg and its sidecar. The leg publishes
+          # bytes first exactly so the sidecar after it can only describe bytes
+          # the bucket holds — but the settle's delete retracts that ownership,
+          # the sidecar lands over an empty key, the next create takes it with
+          # different bytes, and bucket 0 serves one byte-set under the other's
+          # published sha256 forever. Pinned because it needs 6 packages to
+          # reach: the victim is the sixth name.
+          cargo run --example vopr -- --seed 62000150551 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 80 --fail-percent 3 --partition 100
       # Mutation-testing the oracles themselves. Each `--break` is ONE deliberate
       # defect the named invariant exists to catch, so the run MUST fail with
       # that invariant's text — an invariant nobody has watched go red is an

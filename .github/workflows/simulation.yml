@@ -104,120 +104,140 @@ jobs:
           tail -30 vopr.out >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-  # NON-BLOCKING. No known bug reds it any more, but a green check here is still
-  # not a pass: the draw is too small for the failure rate this lane can resolve
-  # (arithmetic below), so read it as coverage, not as a gate. Do not remove
-  # `continue-on-error` until a census carries the number that earns it.
+  # NON-BLOCKING, and the reason is now stronger than the draw size: THREE LIVE
+  # CORRECTNESS DEFECTS are open below. Gating this job would not raise the bar,
+  # it would paint the nightly permanently red — and a job nobody can fix is a
+  # job nobody reads. `tests/simulation_matrix.rs` guards that in both
+  # directions. Remove `continue-on-error` with the failures, not before.
   #
   # `--partition N` is the share of SEEDS whose fleet is partitioned: on those,
   # each node homes to its own bucket and authors truth there instead of every
   # writer pinning bucket 0. It is what finally makes `replicate::decide`'s merge
-  # algebra execute at all: at `--partition 0` every merge verdict beyond the
-  # trivial ones reads `[never presented]` over thousands of seeds, and no
-  # `.frozen`/`_quarantine/`/`.mirror-quarantined` object is ever created. So
-  # everything the aligned matrix above proves, it proves about a fleet whose
-  # buckets never disagree.
+  # algebra execute at all, and that is measured, not asserted — the same binary
+  # over the same five profiles at `--partition 0`, 1,235,949 control seeds:
+  # seven of the eleven merge verdicts read `[never presented]` in EVERY lane
+  # (AdoptSidecar, Supersede, QuarantineLoser, Freeze, PropagateFreeze,
+  # FinishFreeze, SettleMirrorQuarantine) and all three evidence objects
+  # (`.frozen`, `_quarantine/<pkg>/<file>@sha`, `.mirror-quarantined`) read
+  # `[never created]`. Only Noop/Copy/Tombstone/Defer survive. So everything the
+  # aligned matrix above proves, it proves about a fleet whose buckets never
+  # disagree.
   #
-  # RATE, measured 2026-07-27 at HEAD f37e391 + the fixes below, over 1,473,767
-  # fresh seeds across four profiles (this one 124,090; the narrow 2-node lane
-  # 671,983; `--rotate` 291,180; a 3-bucket one 386,514): ZERO failing seeds,
-  # down from 3 in 404,247 at 238a437 and 781 in 488,363 before `4bb9cb8`.
-  # Compare ranges, not time budgets — the seed rate swings with machine load,
-  # so two `--max-secs` runs explore different ranges.
+  # RATE, censused 2026-07-27 at HEAD `08d94f2` over 5,417,063 fresh partitioned
+  # seeds and 5.88e9 storage-op interleavings across five profiles: 6 failing
+  # seeds = 1.11e-6 per seed, from 4 in 680,714 at the last census and 781 in
+  # 488,363 (0.160%) at the one before. Every root cause the last census filed is
+  # CLOSED and pinned in ci.yml — `f37e391` (DURABILITY, the stale settle),
+  # `4eaa015` (CONSERVATION, the settle that destroyed a racing publish's body)
+  # and `bb885ef` (SELF_CONSISTENCY, the non-crash-atomic supersede). The three
+  # below are new.
   #
-  # ZERO IS NOT YET GATEABLE, and the arithmetic is the whole argument. A draw of
-  # N seeds reds with probability 1-(1-p)^N, so holding the nightly to one red
-  # night in twenty over THIS job's draw (90,000-100,000 seeds, from the 91,560 a
-  # 900-second run explores on a CI runner) needs p <= 5.7e-7. Zero failures in
-  # 1.47M seeds bounds p only to 2.0e-6 (rule of three, 95%) — the right order of
-  # magnitude, still 3.6x short. Reaching the bound needs ~5.3M clean seeds. So
-  # `continue-on-error` stays until a census carries that number; a lane that has
-  # merely stopped producing known bugs is not the same as a gate.
+  # Read the pooled number with its caveat. The 4.1M-seed narrow lane in that
+  # pool starves four oracles — at 1 package x 1 file the corpus is fully
+  # tombstoned by quiescence on ~80% of its seeds, so DURABILITY, VISIBILITY,
+  # CONSERVATION and SELF_CONSISTENCY iterate an empty set there (the exact
+  # effect `tests/simulation_matrix.rs` pins the 12-filename corpus to prevent).
+  # Only ~2.1M of the 5.4M seeds are durability-effective. The rest is real
+  # merge-algebra coverage, not real durability coverage.
+  #
+  # THE ARITHMETIC, which is the whole gating argument. A draw of N seeds reds
+  # with probability 1-(1-p)^N, and this job's N is 91,560 — what `--max-secs
+  # 900` explores on a CI runner. Re-confirmed by running the exact invocation
+  # below for its exact 900-second budget on a 10-core laptop: 186,398 seeds,
+  # clean, so a CI runner is roughly half that and 91,560 stands.
+  #   * pooled over every partitioned seed measured, 6 in 5,603,461:
+  #     p = 1.07e-6  ->  9.3% of nights red.
+  #   * this job's own profile alone, 1 in 577,903: p = 1.73e-6  ->  14.7%.
+  #   * one red night in twenty needs p <= 5.6e-7: one failure per 1,785,029
+  #     seeds. The best estimate is 1.9x that; its own profile is 3.1x.
+  # The pooled rate is now a MEASURED NON-ZERO, 95% interval [4.7e-7, 2.1e-6].
+  # When the count was zero, more soaking could earn the gate; it cannot now.
+  # Only fixes can.
   #
   # Do NOT try to reach green by lowering `--partition`. `partition_for` draws
   # `rng.chance(percent)` once per SEED, so N is a share of seeds, not of writes:
   # halving it halves the partitioned seeds and the failure count together,
   # buying a quieter lane by testing proportionally less.
   #
-  # Root causes, all three closed. Every repro below is green at HEAD and the
-  # minimum reproducer for each is a pinned gate in ci.yml, so a regression reds
-  # a merge rather than a nightly:
+  # THE FIRST ONE IS NOT A PARTITIONED-LANE BUG AT ALL. Root cause 1 reproduces
+  # at `--partition 0`, on ONE bucket, with fault injection off — which is the
+  # GATED `rotating-swarm` row above, the row with no `continue-on-error`. Rate
+  # over 2,525,228 `--rotate` seeds (1,866,968 of them at `--partition 0`,
+  # all clean): 2 failures = 7.9e-7 per seed, so that row's 50,000-seed nightly
+  # draw reds 3.9% of nights — one red night in 26, and one in 9 at the 95%
+  # upper bound. That is small, and it is not zero: the gated matrix's clean
+  # record so far is the draw, not proof. Fix this one first.
   #
-  #   1. DURABILITY — CLOSED (`f37e391`). A settle decided from a listing-era
-  #      read re-fenced a filename that private truth had already resolved,
-  #      while a concurrent pass holding the same record called that fence spent
-  #      and deleted it. The filename ended with no body and nothing authorizing
-  #      its absence. `settle_mirror_quarantine` now re-reads through
-  #      `demotion_resolved_by_private_truth` instead of trusting the verdict.
-  #        --seed 16200065974 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100
-  #        --seed 16200021087  (same flags)
+  #   1. AUDIT_REPAIRED_VIEWS — the global index publishes HTML and JSON
+  #      non-atomically, and nothing heals the tear. 4 of the 6 failing seeds.
+  #      `write_global_indexes_cas` (`src/worker.rs:2848`) writes
+  #      `simple/index.html` first and `simple/index.json` second, so a crash or
+  #      a storage failure between them leaves the HTML ahead and the bucket
+  #      serves a PEP 503 index listing a package its own PEP 691 index does not.
+  #      Traced on three seeds as `put_im simple/index.html fate=ok` followed by
+  #      `put_im simple/index.json fate=crash`.
+  #      The code ANTICIPATES this — the comment at `src/worker.rs:2456` says
+  #      currency of the JSON is not currency of the HTML — but the reconcile it
+  #      installs is unreachable from steady state, for two independent reasons.
+  #      `update_global_index` returns early when the delta is empty
+  #      (`src/worker.rs:2390`), so once the package's `_dirty/` markers are
+  #      consumed the pair check is never entered again. And the check is gated
+  #      on `!cached.html_current` (`src/worker.rs:2464`), which every
+  #      `CasOutcome::Won` pins true (`:2509`) and only a fresh
+  #      `load_global_names` clears — and the one thing that forces that reload
+  #      on the no-delta path is a JSON ETag move, which the crash by
+  #      construction did not cause. So the tear stands until the tier-3 audit
+  #      stumbles on it, which is what the oracle reds on.
+  #        --seed 60000037578 --rotate --partition 0   # nodes=3 buckets=1 packages=4 files=1 ops=200 fail-percent=0
+  #        --seed 61000075134 --rotate --partition 0   # nodes=2 buckets=1 packages=3 files=2 ops=120 fail-percent=0
+  #        --seed 61000246528 --rotate --partition 100                                                    # POISONED arm
+  #        --seed 66000074673 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100  # AUDIT_PREMATURE_CONSUMPTION x2
   #
-  #   2. CONSERVATION — CLOSED. Two producers, not the three arms the last
-  #      census counted; the "bare" arm was the demotion arm with its fence
-  #      cleared by the heal phase.
+  #   2. DURABILITY — a demotion fence is cleared while a THIRD bucket is still
+  #      owed it. `execute` applies `clear_spent_demotion_fence` to both sides of
+  #      a PAIR before the verdict runs (`src/replicate.rs:279-281`). With three
+  #      buckets the pairs are (0,1), (0,2) and (1,2), so (0,1) and (0,2) each
+  #      clear bucket 0's fence while the `SettleMirrorQuarantine` fan-out still
+  #      owes bucket 2 its copy: fence installed on b0, `_quarantine/` copy
+  #      taken, canonical key emptied, fence deleted TWICE on b0 (once per pair),
+  #      then the put of the fence on b2 crashes. End state is no fence anywhere,
+  #      the canonical key empty on all three buckets, and acked bytes gone with
+  #      nothing authorizing their absence. This is the shape `f37e391` closed at
+  #      two buckets; the window only exists when there is more than one peer to
+  #      fan out to, which is why every 2-bucket census missed it. THREE BUCKETS
+  #      IS THE MARKETED MULTI-REGION TOPOLOGY — weigh this one accordingly, and
+  #      note that no lane in this workflow runs it.
+  #        --seed 65000024708 --nodes 3 --buckets 3 --packages 6 --files 4 --ops 200 --fail-percent 3 --partition 100
+  #      The same seed at `--buckets 2` PASSES.
   #
-  #      (a) PRODUCT. `settle_mirror_quarantine` copied the body it READ to
-  #      `_quarantine/` and then deleted the canonical key BLIND.
-  #      `freeze_side` runs the identical marker-preserve-drop order and is safe
-  #      doing it, because `.frozen` and `.tombstone` are upload fences —
-  #      `publish_record` refuses over them, so the body it preserved is still
-  #      the body it deletes. `.mirror-quarantined` is the one fence that
-  #      deliberately does NOT bar an upload (handing the filename to private
-  #      truth IS the demotion's resolution), so the key stays writable for the
-  #      whole settle: a sibling settle holding a three-ops-stale read deleted
-  #      the body a private publish had just created and would ack, and no
-  #      `_quarantine/` copy anywhere held those bytes. The settle now drops
-  #      only the body it personally preserved and abandons otherwise — the
-  #      private record left standing reads `Live { Private }` under a spent
-  #      fence, which `decide` and `clear_spent_demotion_fence` finish.
-  #        --seed 40000042940 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
+  #   3. CONVERGENCE + SELF_CONSISTENCY + DURABILITY — a symmetric partitioned
+  #      byte conflict settles on TWO survivors at once, with a crossed body.
+  #      Bucket 0 ends serving one byte-set and bucket 1 the other under a single
+  #      immutable filename, each holding a DIFFERENT `_quarantine/` hash, with
+  #      no `.frozen` and no `.superseding` on either — and bucket 0's sidecar
+  #      publishes the sha256 of the body sitting in its own `_quarantine/`, not
+  #      the one under its canonical key. SELF_CONSISTENCY again, but a SECOND
+  #      producer: `bb885ef` closed the mid-supersede crash, and no `.superseding`
+  #      fence is ever written here — the crossed body arrives through the
+  #      quarantine/adopt path. Rarest of the three and the hardest: a genuine
+  #      symmetry hole in the merge algebra, not a torn write.
+  #        --seed 62000150551 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100
+  #      (PASSES at `--partition 0`.)
   #
-  #      (b) ORACLE. `delete_record` writes its tombstone BEFORE it removes the
-  #      body, so the 500 an injected outage produces at "artifact delete
-  #      failed" still leaves the filename permanently barred; the fleet
-  #      propagates that tombstone and `tombstone_side` destroys the body on
-  #      every peer. The harness read any `Err` as a REFUSAL and withdrew the
-  #      `authorized_deletes` entry it had recorded, so CONSERVATION held the
-  #      freeze racing that delete to a totality the delete had already made
-  #      impossible. It now withdraws only when no tombstone stands on the
-  #      bucket the delete wrote to — storage evidence, like every other
-  #      exemption this oracle takes.
-  #        --seed 18200013677 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
-  #        --seed 18800106222 --nodes 3 --buckets 2 --packages 2 --files 1 --ops 80 --fail-percent 3 --partition 100   # closed by 1, kept as coverage
-  #        --seed 16200059870 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100  # closed by 1, kept as coverage
+  # This lane's profile is the wrong instrument for two of the three, in opposite
+  # directions. Root cause 1's `AUDIT_PREMATURE_CONSUMPTION` arm and all three of
+  # the last census's bugs were found on NARROW lanes (1-2 packages, 1 file,
+  # 40-80 ops), where contention concentrates on a single filename; the
+  # 12-filename corpus here spreads the workload too thin to reach them. That
+  # corpus is load-bearing for the durability oracles
+  # (`tests/simulation_matrix.rs` enforces it), so add a narrow lane when hunting
+  # the next one — do not widen or shrink this one. Root cause 2 is the mirror
+  # image and needs a THIRD bucket.
   #
-  #   3. SELF_CONSISTENCY — CLOSED. `supersede_record` was not crash-atomic and
-  #      a crash inside it left a CROSSED BODY: a bucket serving bytes that
-  #      contradict its own published sha256, permanently, because nothing ever
-  #      re-hashes a stored body and the two buckets' sidecars stayed identical
-  #      so `decide` read the record as agreed forever. The ordering it was
-  #      blamed on is correct and stays — a sidecar published over a still-old
-  #      body advertises the SUPERSEDED bytes as current, which on a demotion
-  #      are exactly the ones the operator withdrew. What was missing is that
-  #      the window left nothing behind that said so. It now writes a
-  #      `.superseding` fence carrying the sidecar it is installing before it
-  #      touches the body and deletes it once the sidecar names those bytes, so
-  #      a crash leaves a RECOGNIZABLE torn record; the next index rebuild
-  #      re-hashes that one body and finishes the operation. Gated in ci.yml at
-  #      the minimum reproducer below.
-  #        --seed 18300018803 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
-  #
-  # This lane's profile was the wrong instrument for 2 and 3. Both were found on
-  # NARROW lanes (1-2 packages, 1 file, 40-80 ops), where they ran about 1 seed
-  # in 200,000-500,000, while the 12-filename corpus here spreads the workload
-  # too thin to concentrate contention on a single name. That corpus is
-  # load-bearing for the durability oracles (see `tests/simulation_matrix.rs`),
-  # so add a narrow lane when hunting the next one — do not widen this one.
-  #
-  # The coverage behind the zero is intact rather than suppressed: over the
-  # 124,090 seeds this profile contributed, all 11 `decide` verdicts execute,
-  # `.frozen` stands at quiescence on 40.3% of seeds and `_quarantine/` on
-  # 47.5%, `.mirror-quarantined` on 0.09%, and the same profile at
-  # `--partition 0` zeroes seven verdicts and all three evidence objects.
-  #
-  # The remaining step to gating is a census, not a fix: soak ~5.3M clean seeds
-  # (see the arithmetic above), then delete `continue-on-error` and fold this
-  # into the matrix above as an ordinary row.
+  # Coverage is intact rather than suppressed: over the 5,417,063 census seeds
+  # all 11 `decide` verdicts execute and none reads `[never presented]` in any of
+  # the five lanes, `.frozen` stands at quiescence on 19.4% of seeds,
+  # `_quarantine/` on 22.2% and `.mirror-quarantined` on 0.02%.
   vopr-partitioned:
     name: vopr (partitioned authorship — NON-BLOCKING, coverage lane)
     runs-on: ubuntu-latest

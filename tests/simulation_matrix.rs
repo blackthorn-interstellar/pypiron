@@ -148,18 +148,18 @@ fn no_nightly_row_mixes_rotation_with_a_workload_flag() {
     }
 }
 
-/// The partitioned lane is real coverage that does not pass yet. Measured
-/// 2026-07-26 over 404,247 fresh seeds: 3 failing = 0.00074% per seed, a 215x
-/// improvement on the 0.160% of the previous census. Two distinct root causes
-/// remain — a DURABILITY drop that outlives the fence exempting it, and a
-/// CONSERVATION arm that destroys an acked byte-set instead of moving it. (The
-/// third, a non-crash-atomic `supersede_record` leaving a bucket serving bytes
-/// contradicting its own published sha256, is closed: the supersede now fences
-/// its torn window with `.superseding` and the next rebuild finishes it.) It is
-/// in the nightly because at
-/// `--partition 0` the merge algebra never executes — every verdict beyond the
-/// trivial ones reads `[never presented]` — so without it the aligned rows
-/// prove their invariants only about a fleet whose buckets never disagree.
+/// The partitioned lane is real coverage that does not pass yet. Censused
+/// 2026-07-27 over 5,603,461 fresh seeds across five profiles: 6 failing =
+/// 1.07e-6 per seed. Every root cause the previous census filed is closed; three
+/// NEW ones remain, all live correctness defects — a global index whose HTML and
+/// JSON tear apart with no reachable reconcile, a demotion fence cleared while a
+/// third bucket is still owed it, and a symmetric byte conflict that settles on
+/// two survivors at once. It is in the nightly because at `--partition 0` the
+/// merge algebra never executes — seven of eleven verdicts read
+/// `[never presented]` over 1,235,949 control seeds, and no
+/// `.frozen`/`_quarantine/`/`.mirror-quarantined` object is ever created — so
+/// without it the aligned rows prove their invariants only about a fleet whose
+/// buckets never disagree.
 ///
 /// That makes two opposite mistakes possible, and this test exists for both.
 /// Dropping `continue-on-error` from the partitioned job turns the nightly
@@ -177,14 +177,17 @@ fn the_partitioned_lane_is_non_blocking_and_the_gated_matrix_is_not() {
     assert!(
         job_lines("vopr-partitioned:").any(|line| line.trim() == "continue-on-error: true"),
         "the partitioned lane lost continue-on-error. A small rate is not a \
-         green gate: at the measured 0.00074% per seed (3 of 404,247) a draw of \
-         N seeds reds with probability 1-(1-p)^N, so this job's ~90,000-100,000 \
-         seeds red 49-52% of nights and even a 50,000-seed draw reds 31%. One \
-         red night in twenty would need 1 failure per 1.75M seeds. Two root \
-         causes are still open and both are live correctness defects, so gating \
-         only makes the nightly permanently red. Remove this assertion with the \
-         failures, not before — and never by lowering --partition, which is a \
-         share of seeds and buys a quieter lane by testing less."
+         green gate: a draw of N seeds reds with probability 1-(1-p)^N, and at \
+         the censused rate — 6 failing seeds in 5,603,461, p = 1.07e-6 — this \
+         job's N of 91,560 reds 9.3% of nights; on its own profile alone (1 in \
+         577,903, p = 1.73e-6) 14.7%. One red night in twenty needs 1 failure \
+         per 1.79M seeds. That rate is now a MEASURED \
+         non-zero rather than a bound short of one, so soaking cannot close it \
+         — only fixes can, and three root causes are open, every one a live \
+         correctness defect. Gating only makes the nightly permanently red. \
+         Remove this assertion with the failures, not before — and never by \
+         lowering --partition, which is a share of seeds and buys a quieter \
+         lane by testing less."
     );
 }
 
@@ -194,11 +197,13 @@ fn the_partitioned_lane_is_non_blocking_and_the_gated_matrix_is_not() {
 /// supersedes `--seeds`, so passing both would discard one silently, which is
 /// the exact defect the matrix rows above are shaped to prevent.
 ///
-/// The corpus floor cuts against finding the CONSERVATION root cause still open
-/// here, which needs contention concentrated on ONE filename and was found on a
-/// narrow profile (1-2 packages, 1 file). That is not a reason to
-/// shrink this row — 12 names is what keeps its durability oracles from
-/// evaluating an empty set. Narrow coverage belongs in a lane of its own.
+/// The corpus floor cuts against finding the root causes that need contention
+/// concentrated on ONE filename — every bug the last two censuses closed was
+/// found on a narrow profile (1-2 packages, 1 file), and so was one arm of the
+/// global-index tear still open. That is not a reason to shrink this row: 12
+/// names is what keeps its durability oracles from evaluating an empty set, and
+/// the census's own 1-package lane starved four of them on ~80% of its seeds.
+/// Narrow coverage belongs in a lane of its own.
 #[test]
 fn the_partitioned_lane_keeps_its_corpus_and_partitions_something() {
     let invocation = job_invocation("vopr-partitioned:");

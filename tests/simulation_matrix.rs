@@ -148,14 +148,13 @@ fn no_nightly_row_mixes_rotation_with_a_workload_flag() {
     }
 }
 
-/// The partitioned lane is real coverage that does not pass yet — but it is
-/// close now: at `--partition 100` it fails 0.006% of seeds (4 of 63,581,
-/// measured 2026-07-26), down from 0.32% once the `.mirror-quarantined` fence
-/// started replicating and from 0.013% once freeze justification stopped
-/// false-faulting. The survivors are CONSERVATION — an acked byte-set gone from
-/// every bucket under a fence that preserved the other one — plus one
-/// DURABILITY in a wider 183,230-seed draw; both pre-existing classes with
-/// nothing to do with partitioning. It is in the nightly because at
+/// The partitioned lane is real coverage that does not pass yet. Measured
+/// 2026-07-26 over 404,247 fresh seeds: 3 failing = 0.00074% per seed, a 215x
+/// improvement on the 0.160% of the previous census, but three distinct root
+/// causes remain — a DURABILITY drop that outlives the fence exempting it, a
+/// CONSERVATION arm that destroys an acked byte-set instead of moving it, and a
+/// non-crash-atomic `supersede_record` that leaves a bucket serving bytes
+/// contradicting its own published sha256. It is in the nightly because at
 /// `--partition 0` the merge algebra never executes — every verdict beyond the
 /// trivial ones reads `[never presented]` — so without it the aligned rows
 /// prove their invariants only about a fleet whose buckets never disagree.
@@ -175,10 +174,15 @@ fn the_partitioned_lane_is_non_blocking_and_the_gated_matrix_is_not() {
     );
     assert!(
         job_lines("vopr-partitioned:").any(|line| line.trim() == "continue-on-error: true"),
-        "the partitioned lane lost continue-on-error. It still fails ~0.006% of \
-         seeds (CONSERVATION and DURABILITY, both pre-existing and neither \
-         partition-specific); gating it makes the nightly red on a rate nobody \
-         has driven to zero yet. Remove this assertion only with the failures."
+        "the partitioned lane lost continue-on-error. A small rate is not a \
+         green gate: at the measured 0.00074% per seed (3 of 404,247) a draw of \
+         N seeds reds with probability 1-(1-p)^N, so this job's ~90,000-100,000 \
+         seeds red 49-52% of nights and even a 50,000-seed draw reds 31%. One \
+         red night in twenty would need 1 failure per 1.75M seeds. Three root \
+         causes are still open and two are live correctness defects, so gating \
+         only makes the nightly permanently red. Remove this assertion with the \
+         failures, not before — and never by lowering --partition, which is a \
+         share of seeds and buys a quieter lane by testing less."
     );
 }
 
@@ -187,6 +191,12 @@ fn the_partitioned_lane_is_non_blocking_and_the_gated_matrix_is_not() {
 /// percentage, and a time budget rather than a seed count — `--max-secs`
 /// supersedes `--seeds`, so passing both would discard one silently, which is
 /// the exact defect the matrix rows above are shaped to prevent.
+///
+/// The corpus floor cuts against finding two of this lane's three open root
+/// causes, which need contention concentrated on ONE filename and were both
+/// found on narrow profiles (1-2 packages, 1 file). That is not a reason to
+/// shrink this row — 12 names is what keeps its durability oracles from
+/// evaluating an empty set. Narrow coverage belongs in a lane of its own.
 #[test]
 fn the_partitioned_lane_keeps_its_corpus_and_partitions_something() {
     let invocation = job_invocation("vopr-partitioned:");

@@ -117,61 +117,88 @@ jobs:
   # everything the aligned matrix above proves, it proves about a fleet whose
   # buckets never disagree.
   #
-  # Measured 2026-07-26, BEFORE the demotion fence replicated (91,560 seeds,
-  # 230M interleavings): 291 failing seeds = 0.318% per seed, 98.6% of them one
-  # unconverged `.mirror-quarantined` marker. Re-measured on the same profile
-  # after that fix: 8 of 63,581 = 0.013%, zero CONVERGENCE, zero DURABILITY —
-  # 4 FREEZE_UNJUSTIFIED and 4 CONSERVATION. The freeze-justification half is
-  # closed (the oracle could not see the evidence; see below): the SAME 63,581
-  # seeds now red 4 = 0.006%, and the four that went are exactly the four
-  # FREEZE_UNJUSTIFIED. Widened to 183,230 partitioned seeds: zero
-  # FREEZE_UNJUSTIFIED, 6 CONSERVATION, 1 DURABILITY. Compare ranges, not time
-  # budgets — the seed rate swings with machine load, so two `--max-secs` runs
-  # explore different ranges. The lane stays non-blocking until that reaches
-  # zero: the rate is low enough that a 50,000-seed draw still reds about one
-  # night in four, which is a nightly nobody would read.
+  # RATE, measured 2026-07-26 at HEAD 238a437 over 404,247 fresh seeds across
+  # four profiles (this one, `--rotate`, a crash-only variant, a 3-bucket one):
+  # 3 failing seeds = 0.00074% per seed, down 215x from 781 in 488,363 (0.160%)
+  # before `4bb9cb8` and `439b839` landed. Compare ranges, not time budgets —
+  # the seed rate swings with machine load, so two `--max-secs` runs explore
+  # different ranges.
+  #
+  # THAT IS STILL NOT GATEABLE, and the arithmetic is the whole argument. A draw
+  # of N seeds reds with probability 1-(1-p)^N; at p=7.42e-6 a 50,000-seed draw
+  # reds 31.0%, and THIS job's actual draw — 90,000-100,000 seeds, from the
+  # 91,560 a 900-second run explored on a CI runner — reds 49-52%. A gate that
+  # reds one night in two is a gate nobody reads. Holding the nightly to one red
+  # night in twenty needs p <= 5.7e-7, one failure per 1.75M seeds: 13x better
+  # than measured.
+  #
+  # Do NOT try to reach green by lowering `--partition`. `partition_for` draws
+  # `rng.chance(percent)` once per SEED, so N is a share of seeds, not of writes:
+  # halving it halves the partitioned seeds and the failure count together,
+  # buying a quieter lane by testing proportionally less.
+  #
+  # Gateability is not the binding constraint anyway — two of the three
+  # survivors are live correctness defects, so gating would only make the
+  # nightly permanently red. Every repro below was re-verified red at 238a437.
   #
   # Open root causes:
   #
-  #   1. CONSERVATION residue (6 of 183,230): an acked byte-set gone from every
-  #      bucket under a fleet-wide `.frozen` or `.mirror-quarantined` fence,
-  #      where the fence preserved the OTHER byte-set under `_quarantine/`. Both
-  #      fences promise totality — the loser is moved, never destroyed — so this
-  #      is the same question freeze justification just answered, asked about the
-  #      bytes rather than the conflict. Note the ledger's existing tombstone
-  #      exemption did NOT excuse these: the workload issued no delete for those
-  #      filenames, so the tombstone is the freeze's own. Unadjudicated.
-  #        --seed 5100010907 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100  # freeze arm
-  #        --seed 5100005308 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100  # demotion arm
-  #      Plus 1 DURABILITY in the same 183,230 — an acked record missing on one
-  #      bucket at quiescence, the pre-existing "missing on bucket N" shape.
-  #        --seed 5100065969 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100
+  #   1. DURABILITY — the demotion settle drops the canonical body AFTER the
+  #      fence that exempts it was cleared. End state: the key empty on every
+  #      bucket with no `.mirror-quarantined`, no `.frozen`, no tombstone and no
+  #      authorized delete, but both bodies still under `_quarantine/` — so
+  #      CONSERVATION passes and only DURABILITY reds, because its exemption WAS
+  #      the fence. Two paths clear the fence off a record snapshot read before
+  #      the settle's drop: `clear_spent_demotion_fence` (src/replicate.rs) and
+  #      `supersede_record`'s trailing `delete_keys([mirror_quarantined_key])`.
+  #      This violates the adjudication `49801fb` landed — a settled demotion
+  #      leaves the SAME one-line fence on both buckets. Not minimizable below
+  #      the census profile; 1.0M narrow-profile seeds never produced it.
+  #        --seed 16200065974 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100
+  #        --seed 16200021087  (same flags)
   #
-  # CLOSED — FREEZE_UNJUSTIFIED, an ORACLE defect, not a product one. Every one
-  # of these was a REAL byte conflict: two partitioned nodes committed different
-  # bytes under one immutable filename and `decide` correctly froze it. The
-  # oracle attested from acks plus `_quarantine/` copies, and a delete racing
-  # `freeze_side` between its marker and its `get_bytes` erases both — on both
-  # sides, which leaves a correct fleet-wide freeze with no body-shaped evidence
-  # anywhere. `SimStorage` now remembers the sha256 of every body ever committed
-  # under a canonical artifact key, which a delete cannot erase, and the two
-  # minimized reproducers are pinned as a gate in ci.yml:
-  #     --seed 9800020745 ... --partition 100  # both byte-sets erased
-  #     --seed 9800002480 ... --partition 100  # one erased
+  #   2. CONSERVATION — a merge resolution destroys an acked byte-set instead of
+  #      moving it. Both fences promise totality (the loser is moved, never
+  #      destroyed); this is that promise broken in three arms. Demotion arm: a
+  #      settle takes its `_quarantine/` copy, a peer's publish stores its body,
+  #      and the settle's UNCONDITIONAL canonical `delete` destroys it. Freeze
+  #      arm: now minimized to two nodes and one filename. Bare arm: no fence of
+  #      any kind — both buckets hold a live body and sidecar, `_quarantine/`
+  #      holds one loser, and a third acked byte-set is simply gone.
+  #        --seed 18200013677 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100   # freeze arm, minimized
+  #        --seed 18800106222 --nodes 3 --buckets 2 --packages 2 --files 1 --ops 80 --fail-percent 3 --partition 100   # bare arm, no fence
+  #        --seed 16200059870 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100  # demotion arm
   #
-  # CLOSED — ACK_TOTALITY, and it was never a second producer. The residue that
-  # survived `fd14f01` was the SAME defect in a second arm of `decide`: the
-  # demotion fence's `(QuarantinedMirror, _) => Noop`, which claimed "the two
-  # sides agree" over a pair where one bucket held a fence and the other had
-  # never heard of the demotion. `execute` mapped it to `Convergence::Converged`
-  # and the pre-ack fan-out wrote no `_repl/` note. `4bb9cb8` replaced that arm
-  # to make the fence replicate, and closed this with it — the ack was never
-  # separately diagnosed at the time. Every recorded repro (9300024588,
-  # 9300035976, 9300061064, 9504440, 14700042703) is green, and reverting that
-  # one arm reds all five again. Measured after: 450,182 seeds of this lane's
-  # profile and 1,017,007 rotating seeds, zero ACK_TOTALITY. Minimized to two
-  # nodes and 40 ops and pinned as a gate in ci.yml:
-  #     --seed 9900094440 --nodes 2 --buckets 2 --packages 2 --files 1 --ops 40 --fail-percent 0 --partition 100
+  #   3. SELF_CONSISTENCY — `supersede_record` is not crash-atomic, and a crash
+  #      inside it leaves a CROSSED BODY: a bucket serving bytes that contradict
+  #      its own published sha256. It orders quarantine -> `put_if_match(body)`
+  #      -> `verify_stored_size` -> `install_or_verify_sidecar`, and a death
+  #      between the body and the sidecar is PERMANENT, because nothing ever
+  #      re-hashes a stored body. The source comment above that ordering argues
+  #      for it to avoid the mirror-image tear (sidecar first, body never) — it
+  #      trades one torn window for the other, and neither has a repair path. A
+  #      client checking its download against the index it read rejects the file,
+  #      while `pypiron verify` without `--deep` calls the tree healthy. This is
+  #      the class the previous census called unreachable in 488,363 seeds: it is
+  #      invisible at 12 filenames and appears once the workload concentrates on
+  #      ONE.
+  #        --seed 18300018803 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
+  #
+  # This lane's profile is the wrong instrument for 2 and 3. Both were found on
+  # NARROW lanes (1-2 packages, 1 file, 40-80 ops), where they run about 1 seed
+  # in 200,000-340,000, while the 12-filename corpus here spreads the workload
+  # too thin to concentrate contention on a single name. That corpus is load-
+  # bearing for the durability oracles (see `tests/simulation_matrix.rs`), so
+  # when adding coverage for these two, add a narrow lane — do not widen this
+  # one.
+  #
+  # CLOSED since the previous census, over those 404,247 seeds: CONVERGENCE
+  # 750 -> 0, ACK_TOTALITY 17 -> 0, FREEZE_UNJUSTIFIED 14 -> 0, and DURABILITY's
+  # old "missing on bucket N" bulk 121 -> 2 (both now root cause 1 above). The
+  # coverage behind that is intact rather than suppressed: all 11 `decide`
+  # verdicts execute, `.frozen` stands at quiescence on 30.0% of seeds and
+  # `_quarantine/` on 35.9%, and the same profile at `--partition 0` zeroes seven
+  # verdicts and all three evidence objects.
   #
   # When the failing-seed count reaches zero, delete `continue-on-error` and
   # fold this into the matrix above as an ordinary row.

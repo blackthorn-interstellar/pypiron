@@ -180,6 +180,13 @@ jobs:
           check origin-demoted "ORIGIN_TERMINALITY: bucket 0 claims" --nodes 2 --buckets 1 --ops 80
           check mirror-served "ORIGIN_TERMINALITY: bucket 0 still serves" --nodes 2 --buckets 1 --ops 80
           check split     "never left split"           --nodes 2 --buckets 2 --ops 80
+          # The only oracle anywhere that re-hashes a body. The break pulls the
+          # bytes and the published sha256 apart from the *sidecar* side and
+          # re-points the views at the new digest, so every other oracle — and
+          # `pypiron verify`, which runs here as the VERIFY leg — reads a
+          # perfectly healthy fleet. If this leg ever passes, a bucket can serve
+          # bytes contradicting its own index and nothing will say so.
+          check attest    "SELF_CONSISTENCY: bucket"   --nodes 2 --buckets 1 --ops 80
           exit $fail
 
   integration:

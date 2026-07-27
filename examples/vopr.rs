@@ -210,6 +210,10 @@ enum Break {
     /// Serve a live mirror record under a private claim → ORIGIN_TERMINALITY,
     /// record arm.
     MirrorServed,
+    /// Pull a bucket's bytes and the sha256 its own sidecar publishes apart,
+    /// fleet-wide, with every view re-pointed at the published digest →
+    /// SELF_CONSISTENCY, and nothing else (see `apply_break`).
+    Attest,
 }
 
 /// The package name every phantom-clone break materializes. Not in
@@ -221,7 +225,7 @@ const BREAK_PKG: &str = "vopr-phantom";
 /// reproduce line all read this table: a second list that quietly fails to
 /// track the first is exactly how the reproduce line came to describe a
 /// different run than the one that failed.
-const BREAKS: [(&str, Break); 20] = [
+const BREAKS: [(&str, Break); 21] = [
     ("view", Break::View),
     ("fanout", Break::Fanout),
     ("rerun", Break::Rerun),
@@ -242,6 +246,7 @@ const BREAKS: [(&str, Break); 20] = [
     ("freeze-lossy", Break::FreezeLossy),
     ("origin-demoted", Break::OriginDemoted),
     ("mirror-served", Break::MirrorServed),
+    ("attest", Break::Attest),
 ];
 
 impl Break {
@@ -295,6 +300,26 @@ fn unexcused_ack(
             });
         (!excused).then(|| (pkg.clone(), fname.clone(), acks[0].body.clone()))
     })
+}
+
+/// Bytes that are not `body` and are exactly as long as it. A kill proof
+/// injects ONE defect, and a corruption that also changed the object's length
+/// would inject a second: `verify_storage` cross-checks every object's listed
+/// size against the size its own sidecar publishes, so a shorter body reds
+/// VERIFY as well — a different oracle's claim. Same length keeps the break
+/// minimal and makes its leg the stricter test of the oracle it names.
+fn same_length_corruption(body: &[u8]) -> Vec<u8> {
+    let corrupt: Vec<u8> = b"vopr: corrupt"
+        .iter()
+        .copied()
+        .cycle()
+        .take(body.len())
+        .collect();
+    // Only a body that already spells the marker, which nothing here writes.
+    if corrupt == body {
+        return body.iter().map(|b| b ^ 0xFF).collect();
+    }
+    corrupt
 }
 
 /// Clone a live record (body + sidecar) into a package the audit must then
@@ -452,14 +477,19 @@ async fn apply_break(
         // Corrupt the bytes an acked artifact serves, fleet-wide, while parking
         // the real bytes outside `packages/` — so CONSERVATION still finds them
         // alive, CONVERGENCE still sees identical buckets, and `pypiron verify`
-        // (which reads sidecars and views, never bodies) still passes. What is
-        // left is exactly one claim: the 200 said these bytes were durable.
+        // still agrees the views render truth. Same length on purpose: a
+        // shorter body would also red VERIFY's size cross-check, which is a
+        // different claim (`same_length_corruption`). SELF_CONSISTENCY reds
+        // alongside and cannot not — corrupting a body IS contradicting the
+        // sidecar over it — so the leg's expected text is what pins which
+        // oracle it is for: the 200 said these bytes were durable.
         (Break::Durability, false) => {
             if let Some((pkg, fname, body)) = unexcused_ack(buckets, ledger) {
                 let akey = format!("packages/{pkg}/{fname}");
+                let corrupt = same_length_corruption(&body);
                 for bucket in buckets {
                     bucket.insert(&format!("_vopr/quarantine/{akey}"), body.clone());
-                    bucket.insert(&akey, b"vopr: corrupt".to_vec());
+                    bucket.insert(&akey, corrupt.clone());
                 }
             }
         }
@@ -565,7 +595,7 @@ async fn apply_break(
         // key diff.
         (Break::Split, false) => {
             let Some(peer) = buckets.get(1) else { return };
-            let Some((pkg, fname, _)) = unexcused_ack(buckets, ledger) else {
+            let Some((pkg, fname, acked)) = unexcused_ack(buckets, ledger) else {
                 return;
             };
             let akey = format!("packages/{pkg}/{fname}");
@@ -575,7 +605,9 @@ async fn apply_break(
             if !peer.keys().contains(&akey) {
                 return;
             }
-            let other = b"vopr: the side the merge never resolved".to_vec();
+            // Same length as the side bucket 0 keeps, so the only new claim is
+            // the unresolved split — see `same_length_corruption`.
+            let other = same_length_corruption(&acked);
             peer.insert(&akey, other.clone());
             ledger
                 .lock()
@@ -667,6 +699,61 @@ async fn apply_break(
                 for bucket in buckets {
                     bucket.insert(&akey, body.clone());
                     bucket.insert(&format!("{akey}.meta.json"), sidecar.clone());
+                }
+            }
+        }
+        // The bytes a bucket serves and the sha256 its own sidecar publishes,
+        // pulled apart — the shape a crossed body leaves behind. Planted from
+        // the *sidecar* side, because that is the only side no other oracle
+        // watches: the body stays exactly the bytes the ack carried, so
+        // DURABILITY and CONSERVATION see a healthy artifact; the edit is
+        // fleet-wide, so CONVERGENCE sees identical buckets; and every view is
+        // re-pointed at the new digest, so `pypiron verify`'s byte-strict
+        // re-render from the doctored sidecar still matches what storage
+        // serves. Editing the body instead would red DURABILITY first and
+        // prove nothing about this oracle.
+        //
+        // What is left is exactly one claim, and it is the one no oracle
+        // anywhere else in the fleet holds: a client that checks the download
+        // it was handed against the hash the index published must not have to
+        // reject it.
+        (Break::Attest, false) => {
+            let Some((pkg, fname, _)) = unexcused_ack(buckets, ledger) else {
+                return;
+            };
+            let skey = format!("packages/{pkg}/{fname}.meta.json");
+            let fake = pypiron::hash::sha256_hex(b"vopr: a digest no body has");
+            for bucket in buckets {
+                let dump = bucket.dump();
+                let Some(mut doc) = dump
+                    .get(&skey)
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+                else {
+                    continue;
+                };
+                let Some(published) = doc
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                if published == fake {
+                    continue; // vanishingly unlikely, but a no-op break is a lie
+                }
+                match doc.as_object_mut() {
+                    Some(obj) => obj.insert("sha256".into(), fake.clone().into()),
+                    None => continue,
+                };
+                let Ok(doctored) = serde_json::to_vec(&doc) else {
+                    continue;
+                };
+                bucket.insert(&skey, doctored);
+                // Every view that quoted the old digest now quotes the new one,
+                // so truth and views still agree byte for byte.
+                for (key, view) in dump.iter().filter(|(k, _)| k.starts_with("simple/")) {
+                    let repointed = String::from_utf8_lossy(view).replace(&published, &fake);
+                    bucket.insert(key, repointed.into_bytes());
                 }
             }
         }
@@ -3060,7 +3147,12 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
         if dumps[idx].keys().any(|k| k.starts_with("packages/")) {
             REACH.hit(R::Verify); // an empty bucket re-renders nothing to diff
         }
-        match pypiron::verify::verify_storage(bucket.as_ref()).await {
+        // `deep: false` on purpose. VERIFY's claim here is views == truth, and
+        // SELF_CONSISTENCY below already re-hashes every body — running the
+        // product's `--deep` pass too would make two oracles hold one claim and
+        // cost the whole corpus on every seed. The blackbox suite drives
+        // `verify-index --deep` instead.
+        match pypiron::verify::verify_storage(bucket.as_ref(), false).await {
             Ok(report) => violations.extend(report.divergences.into_iter().map(|d| {
                 format!(
                     "VERIFY: bucket {idx} diverged from its own truth: {} {} — {}",

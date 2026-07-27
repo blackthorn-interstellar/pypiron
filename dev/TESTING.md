@@ -606,7 +606,7 @@ storage and never the schedule.
 | `fanout` | peer bucket 1 blackholes the chaos phase *and* the `_repl/1/` note owing it is dropped | `ACK_TOTALITY:` (needs `--fail-percent 0`, where it is the hard gate) | 1 |
 | `rerun` | a seed's second execution ends in a different world off an identical op trace | `DETERMINISM VIOLATION … same calls, different bytes` (needs `--recheck-every 1`) | 1 |
 | `resurrect` | an acked-deleted artifact's bytes come back with its tombstone gone | `TOMBSTONE_MONOTONICITY:` | 3 |
-| `durability` | an acked artifact serves corrupt bytes on every bucket, the real bytes parked outside `packages/` *and* outside `_quarantine/` | `DURABILITY: acked … serves bytes no ack carried` | 4 |
+| `durability` | an acked artifact serves corrupt bytes of the **same length** on every bucket, the real bytes parked outside `packages/` *and* outside `_quarantine/` | `DURABILITY: acked … serves bytes no ack carried` | 4 |
 | `visibility` | one acked filename edited out of `simple/<pkg>/index.json` on every bucket | `VISIBILITY: acked … not listed` | 4 |
 | `conserve` | an acked body and sidecar destroyed fleet-wide with no tombstone, no freeze and no acked delete | `CONSERVATION: acked bytes … vanished from every bucket` | 4 |
 | `diverge` | one bucket keeps an object the other never got | `CONVERGENCE: bucket 0 and bucket N differ` (needs ≥2 buckets) | 1 |
@@ -621,7 +621,8 @@ storage and never the schedule.
 | `freeze-lossy` | a freeze that dropped a body it never quarantined: `.frozen` fleet-wide, one byte-set preserved under `_quarantine/`, the *acked* one overwritten everywhere | `CONSERVATION: … a frozen filename may not lose one` | 4 |
 | `origin-demoted` | a privately-claimed package's `.origin` walked back to `mirror` on every bucket (sidecars untouched, so the buckets stay converged and the views stay correct) | `ORIGIN_TERMINALITY: … claims … .origin = mirror` | 1 |
 | `mirror-served` | the claim stays private but a **live mirror record** stands under it — a new filename cloned from a live record with its sidecar origin rewritten | `ORIGIN_TERMINALITY: … still serves … as live mirror truth` | 3 |
-| `split` | a byte conflict the merge never resolved: bucket 1 acks and keeps a second byte-set under a filename bucket 0 still serves its own for | `DURABILITY: … never left split` (needs ≥2 buckets) | 4 |
+| `split` | a byte conflict the merge never resolved: bucket 1 acks and keeps a second, same-length byte-set under a filename bucket 0 still serves its own for | `DURABILITY: … never left split` (needs ≥2 buckets) | 4 |
+| `attest` | an acked artifact's sidecar re-points at a digest no body has, fleet-wide, with every view re-pointed to match — the bytes, the buckets and the re-render all stay healthy | `SELF_CONSISTENCY: bucket … serves … while its own sidecar publishes` | 4 |
 
 **Freeze and origin get two legs each, on purpose.** Freeze *justification* (a
 `.frozen` marker must be a real byte conflict) and freeze *totality* (a freeze
@@ -631,13 +632,37 @@ and once on the sidecar of the record under it. A branch that shares a leg with
 its neighbour is a branch nobody has watched fire — which is the whole argument
 for this table.
 
-Three of these reds land on a second oracle too, unavoidably, and the leg's
+Some of these reds land on a second oracle too, unavoidably, and the leg's
 expected text is what pins which one it is for: `split` also reds CONVERGENCE (a
 filename two buckets serve different bytes for *is* a diverged key — which is why
 DURABILITY names it instead of leaving it as one line of a key diff),
 `freeze-lossy` also reds VERIFY (a `.frozen` marker takes the record out of the
 renderable set while the view still lists it, exactly as `--break conserve`
 does), and `mirror-served` reds ORIGIN_TERMINALITY and nothing else.
+
+`durability` and `split` also red SELF_CONSISTENCY, and there is no version of
+them that does not: both corrupt a body, and a corrupted body *is* a body its own
+sidecar contradicts. What they no longer red is VERIFY — the corruption is
+injected at the **same length** as the bytes it replaces (`same_length_corruption`),
+because `verify_storage` cross-checks every object's listed size against the size
+its sidecar publishes and a shorter body would inject a second defect belonging
+to a different oracle. Minimality is the point of a kill proof: a leg that reds
+four oracles is a weaker test of the one it names.
+
+**`attest` is planted from the sidecar side, and that is the whole point.**
+Corrupting the *body* would red DURABILITY first and prove nothing about the
+oracle under test, so the break leaves the bytes exactly as the ack carried them
+and moves the published digest instead: DURABILITY and CONSERVATION see a healthy
+artifact, the edit is fleet-wide so CONVERGENCE sees identical buckets, and every
+view is re-pointed at the new digest so VERIFY's byte-strict re-render from the
+doctored sidecar still matches what storage serves. Over the two 20-25s samples
+below, 19,880 pinned and 5,587 rotating red seeds produced 19,880 and 11,071
+violations respectively — every one of them SELF_CONSISTENCY, not a single line
+from any other oracle. That number is also the measurement that answers a
+separate question: `pypiron verify` runs inside the simulator as the VERIFY
+oracle, and it passes this fleet. The product's own integrity command gives a
+clean bill of health to a bucket serving bytes that contradict its own index
+(see "Should `verify-index` re-hash?" below).
 
 K is how many fresh seeds the break needs to red with **≥99.8% confidence** —
 `ceil(ln 0.002 / ln(1-p))` on the measured per-seed red rate p, on that leg's own
@@ -679,7 +704,8 @@ at this commit over 20-second timeboxed samples (4,418–23,022 seeds each):
 seed (K=1); `resurrect` and `freeze-unjustified` 93.2% (K=3); `ordering`,
 `globalindex`, `poison`, `blind` and `fallback` 89.7% (K=3); `mirror-served`
 88.1% (K=3); `durability`, `visibility`, `conserve` and `freeze-lossy` 85.7%
-(K=4); `split` 79.3% (K=4); `race` 76.2% (K=5). Nothing below 100% is a weaker
+(K=4); `attest` 84.4% (K=4, over 23,561 seeds); `split` 79.3% (K=4); `race` 76.2%
+(K=5). Nothing below 100% is a weaker
 oracle — each of those breaks needs a run that actually produced the state it
 corrupts (a live artifact+sidecar pair to clone, an unexcused acked upload to
 destroy, a privately-claimed package with a live record left), and a schedule
@@ -695,7 +721,8 @@ profile varies the *topology* and the fault mode each break needs. Over
 1,724–7,041-seed samples at this commit: `view` and `wedge` 100% (K=1);
 `origin-demoted` 97.4% (K=2); `resurrect` and `freeze-unjustified` 88.0% (K=3);
 `poison`, `blind` and `fallback` 71.9% (K=5); `mirror-served` 68.2%, `diverge`
-66.7%, the three durability-family breaks 66.3% and `freeze-lossy` 66.4% (K=6);
+66.7%, the three durability-family breaks 66.3%, `freeze-lossy` 66.4% and
+`attest` 64.9% (K=6);
 `split` 43.1% (K=12) — it needs a rotating draw with ≥2 buckets, the same gate
 `diverge` sits behind; `globalindex` 39.1% (K=13), `race` 32.8% (K=16) and
 `fanout` 32.0% (K=17) — all three gated on the roughly half of rotating seeds
@@ -716,6 +743,55 @@ audit repair, oracle-reach row and merge-meter row to the digit (6,077,236 /
 12,897,971 / 6,105,308 / 13,019,557 / 8,455,918 interleavings; 53,697 / 45,690 /
 57,384 / 49,393 / 26,388 acked).
 
+#### Should `verify-index` re-hash? Yes, in two halves at two prices
+
+The simulator's blind spot was the product's blind spot. `pypiron verify-index`
+is the integrity command an operator reaches for, and until now it could hand a
+clean bill of health to a bucket serving bytes that contradict its own published
+sha256 — `--break attest` is the proof, since it reds SELF_CONSISTENCY and leaves
+VERIFY (which *is* `verify_storage`) silent. But re-hashing is O(total bytes),
+and verify's whole design is O(objects): it must stay runnable on a mirror with
+a million files. The answer is not one decision, it is two.
+
+**The length check is free, so it is always on.** Verify already lists every
+object — `ObjectMeta.size` is in hand — and already reads every sidecar, which
+already publishes `size`. Comparing them is an integer compare and zero extra
+I/O, and it catches every crossing that changed the object's length. It reports
+`size-mismatch`. This was pure oversight: the data was on both sides of the
+function the whole time.
+
+**The hash check reads the corpus, so it is `--deep`.** Cost is one full pass
+over every artifact: seconds on a private index of forty packages, hours on a
+full-PyPI mirror. Request cost is negligible (~$0.40 per million S3 GETs,
+same-region transfer free); wall time is the binding constraint. That is
+affordable when an operator chooses it — after a restore, after out-of-band
+surgery, on a budgeted schedule — and unaffordable as a default, so it is a flag
+and not a default. Fan-out is bounded by **bytes** in flight rather than by a
+count (`DEEP_BYTES_IN_FLIGHT`), because a fixed 64-way fan-out over 300 MB wheels
+is 19 GB resident. It reports `body-mismatch`.
+
+The length check does not make the hash check optional. A crossing between two
+builds of the same wheel filename — the exact shape the partitioned fleet
+produces — is very often the same length, and reproducible-build variance makes
+same-length-different-bytes the *central* case rather than a corner one.
+
+**Rejected: reading the cloud's own stored checksum instead.** S3 will return a
+whole-object sha256 from `HeadObject` if the object was written with
+`x-amz-checksum-sha256`, which would make the deep check O(objects) HEADs instead
+of O(bytes). It does not survive contact: it needs a write-path change so it says
+nothing about any object already stored, multipart uploads return a composite
+digest and not the object's sha256, and GCS (crc32c/md5) and Azure (content-md5)
+publish different algorithms — so the "cheap" version is one backend's partial
+answer wearing three backends' complexity. `--deep` reads bytes on every backend
+and is the same code everywhere.
+
+The VOPR still calls `verify_storage(bucket, deep: false)`. VERIFY's claim there
+is views == truth; SELF_CONSISTENCY already re-hashes every body on every seed,
+and passing `deep: true` would put two oracles on one claim and destroy
+`--break attest`'s isolation. `verify-index --deep` is driven by the blackbox
+suite instead (`tests/test_verify_deep.py`), where a same-length body swap is
+shown to pass the default verify and red `--deep`.
+
 #### Workload-reachable, harness-unreachable, product-unreachable
 
 Three different things, and conflating them is how an unfalsifiable gate survives
@@ -735,6 +811,7 @@ anything but a break can ever red it, and the answer differs per oracle:
 | oracle | status | why | kill proof |
 |---|---|---|---|
 | VERIFY | workload-reachable | every convergence regression pinned in ci.yml's seed corpus red it | `view` |
+| SELF_CONSISTENCY | workload-reachable, and *observed* | it red seed 7100005242 (`--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100`) against the tree before `25d1d28`, where the rollback of an unverifiable write deleted bytes a copy had already adopted; 0 in 223,718 seeds since | `attest` |
 | DURABILITY (acked bytes stand) | workload-reachable | no rule forbids a bucket losing an acked record | `durability` |
 | DURABILITY (never left split) | workload-reachable **only partitioned** — and *observed* there | needs one filename acked with different bytes on two buckets, which only `--partition` produces | `split` |
 | VISIBILITY | workload-reachable | ditto, for the listing | `visibility` |

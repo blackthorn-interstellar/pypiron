@@ -3,9 +3,10 @@
 //! A sidecar is a bucket's assertion that a filename IS truth with that
 //! sha256, and nothing downstream re-derives it: `replicate::decide` compares
 //! sidecar shas to pick a merge verdict, the index renderer copies the sha into
-//! `simple/`, and neither `verify-index` nor the audit ever re-hashes a stored
-//! body. So a sidecar standing over a key whose body is not (yet) the one it
-//! names is a lie with no reader that can catch it.
+//! `simple/`, and the audit never re-hashes a stored body. So a sidecar standing
+//! over a key whose body is not (yet) the one it names is a lie no reader on any
+//! hot path can catch — `verify-index --deep` is the one thing that re-derives
+//! it, and it is an operator running a full pass over the corpus, not a reader.
 //!
 //! The `packages/` write protocol therefore lands the artifact first and the
 //! sidecar last, private and `sync --to` mirror uploads alike. The reverse

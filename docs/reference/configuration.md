@@ -472,7 +472,7 @@ Tokens live for 5 minutes and cannot outrank the credential that minted them.
 | Command | Use |
 | --- | --- |
 | `pypiron healthcheck` | Probe `/health`; `--url` / `PYPIRON_HEALTHCHECK_URL` overrides the target. |
-| `pypiron verify-index` | Read-only full index check against the selected storage backend. |
+| `pypiron verify-index` | Read-only full index check against the selected storage backend. `--deep` re-hashes every stored file too. |
 | `pypiron rebuild-index` | Rebuild every index from stored files. |
 | `pypiron buckets migrate` | Increment the multi-bucket topology generation and re-stamp every reachable configured bucket. |
 | `pypiron origin release PACKAGE` | Release an empty package name for deliberate private/public repurposing. Every configured bucket must be reachable and empty for that package. |
@@ -481,6 +481,18 @@ Tokens live for 5 minutes and cannot outrank the credential that minted them.
 also read `[serve]` from `pypiron.toml`. `buckets migrate` and `origin release`
 do too. Storage flags and their environment variables may also follow those
 nested commands.
+
+`verify-index` does not open your package files. It compares what the indexes
+say against what the store holds, which keeps it fast on a mirror with a million
+files, and it does check every file's *length* against the size its own record
+publishes — that arrives with the listing and costs nothing. Add `--deep` and it
+also re-hashes every file and compares it to the SHA-256 your clients check their
+downloads against. That is the only check that catches a file replaced by a
+different one of the same length, and it reads your whole corpus once: seconds on
+a private index, hours on a full mirror. Run it after a restore, after
+out-of-band surgery on the store, or on a schedule you have budgeted for.
+Mismatches print as `body-mismatch` (or `size-mismatch` for the free check) and
+exit `1`.
 
 `buckets migrate` requires a multi-bucket target and **refuses while any bucket
 still has pending cross-bucket repairs**, so shrinking or reordering the list
@@ -498,6 +510,7 @@ with that bucket; topology stamps are dormant in single-bucket mode.
 | Flag | Env | Default | Use |
 | --- | --- | --- | --- |
 | `--force` | `PYPIRON_MIGRATE_FORCE` | `false` | On `buckets migrate`, drop a bucket even when it holds the fleet's only copy of some content. **Permanent data loss** — back the corpus up onto a surviving bucket first. |
+| `--deep` | `PYPIRON_VERIFY_DEEP` | `false` | On `verify-index`, re-hash every stored file against the SHA-256 its record publishes. Reads the whole corpus once. |
 
 Stop writes before `origin release`. It refuses a package with any package truth
 except `.origin`, or with pending write/replication work, and conditionally

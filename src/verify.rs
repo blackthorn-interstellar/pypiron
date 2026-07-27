@@ -12,6 +12,13 @@
 //!
 //! Strictly read-only: where the worker would backfill a missing sidecar,
 //! verify reports it instead.
+//!
+//! Bodies are the one thing the default pass does not read: it is an O(objects)
+//! check, not an O(bytes) one, so it stays runnable on a mirror with a million
+//! files. Two claims about the bytes are still checked, at two very different
+//! prices. The object's **length** against the sidecar's published `size` is
+//! free — the listing already returned it — and always on. Its **sha256** costs
+//! a full read of the corpus and is behind `--deep`.
 
 use std::collections::BTreeMap;
 
@@ -34,10 +41,25 @@ const SHARD_CONCURRENCY: usize = 8;
 const PACKAGE_CONCURRENCY: usize = 16;
 const SIDECAR_READ_CONCURRENCY: usize = 64;
 
+/// `--deep` reads whole bodies, so its fan-out is bounded by *bytes* in flight
+/// and not by a count: a fixed 64-way fan-out over a store of 300 MB wheels is
+/// 19 GB of resident memory. The batch is packed from the sizes the listing
+/// already returned, so one oversized artifact goes alone instead of
+/// multiplying a fan-out by its length.
+const DEEP_BYTES_IN_FLIGHT: u64 = 256 * 1024 * 1024;
+const DEEP_CONCURRENCY: usize = 16;
+
 #[derive(ClapArgs, Debug)]
 pub struct VerifyArgs {
     #[command(flatten)]
     pub storage: StorageArgs,
+
+    /// Also re-hash every stored artifact and compare it against the sha256 its
+    /// own sidecar publishes — the hash clients check their downloads with.
+    /// Reads the whole corpus once, so budget one full pass over your bytes;
+    /// without it verify reads no artifact bodies at all.
+    #[arg(long, env = "PYPIRON_VERIFY_DEEP")]
+    pub deep: bool,
 }
 
 /// One observed divergence, printed as `kind\tpackage\tdetail`.
@@ -61,7 +83,7 @@ pub struct VerifyReport {
 /// The truth counts come back with the diff because enumerating `packages/` is
 /// the expensive part on a real mirror — a caller that wants totals must not
 /// pay for a second listing pass.
-pub async fn verify_storage(storage: &dyn Storage) -> Result<VerifyReport> {
+pub async fn verify_storage(storage: &dyn Storage, deep: bool) -> Result<VerifyReport> {
     let truth = enumerate_grouped(storage, PACKAGES_PREFIX).await?;
     let views = enumerate_grouped(storage, SIMPLE_PREFIX).await?;
     let package_count = truth.len();
@@ -74,7 +96,7 @@ pub async fn verify_storage(storage: &dyn Storage) -> Result<VerifyReport> {
     for chunk in packages.chunks(PACKAGE_CONCURRENCY) {
         let checks = chunk
             .iter()
-            .map(|(pkg, objects)| check_package(storage, pkg, objects));
+            .map(|(pkg, objects)| check_package(storage, pkg, objects, deep));
         for result in futures::future::join_all(checks).await {
             let (pkg, has_artifacts, mut divs) = result?;
             if has_artifacts {
@@ -121,7 +143,7 @@ pub async fn run_verify(args: VerifyArgs) -> Result<bool> {
     // One pass: the diff counts the truth it already enumerated, so the summary
     // totals cost nothing extra and no second copy of the truth map (a full
     // mirror is ~10^6 objects) is ever alive.
-    let report = verify_storage(storage.as_ref()).await?;
+    let report = verify_storage(storage.as_ref(), args.deep).await?;
 
     for d in &report.divergences {
         println!("{}\t{}\t{}", d.kind, d.package, d.detail);
@@ -185,6 +207,7 @@ async fn check_package(
     storage: &dyn Storage,
     pkg: &str,
     objects: &[ObjectMeta],
+    deep: bool,
 ) -> Result<(String, bool, Vec<Divergence>)> {
     let mut divs = Vec::new();
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
@@ -247,13 +270,17 @@ async fn check_package(
     // divergence and they do not keep the package alive: `still_live` (and so
     // global-index membership) follows the *renderable* set.
     let mut suppressed = 0usize;
+    // What `--deep` will re-hash: (filename, the sha256 the sidecar publishes,
+    // the size storage listed). Collected here because the sidecar read has
+    // already happened — a second pass would read every sidecar twice.
+    let mut attested: Vec<(&str, String, u64)> = Vec::new();
     for chunk in artifacts.chunks(SIDECAR_READ_CONCURRENCY) {
         let reads = chunk.iter().map(|(_, filename)| {
             let key = format!("{prefix}{filename}{SIDECAR_SUFFIX}");
             async move { storage.get_bytes(&key).await }
         });
         let loaded = futures::future::join_all(reads).await;
-        for ((_, filename), bytes) in chunk.iter().zip(loaded) {
+        for ((meta, filename), bytes) in chunk.iter().zip(loaded) {
             let bytes = match bytes {
                 Ok(b) => b,
                 Err(e) if is_not_found(&e) => {
@@ -280,6 +307,29 @@ async fn check_package(
                     continue;
                 }
             };
+            // Truth's own self-check, and the only half of it that costs
+            // nothing: the listing already carried this object's real length
+            // and the sidecar already publishes what that length should be. A
+            // sidecar is a bucket's assertion that a filename IS truth with
+            // that sha256 and nothing downstream re-derives it
+            // (tests/conformance_publish_ordering.rs), so a body swapped for
+            // one of a different length used to be invisible to every reader
+            // pypiron has. Checked before the mirror-omission rules, because a
+            // record the renderer omits is still stored bytes somebody may one
+            // day promote.
+            if meta.size != sc.size {
+                divs.push(Divergence {
+                    kind: "size-mismatch",
+                    package: pkg.to_string(),
+                    detail: format!(
+                        "{filename}: storage holds {} bytes, its sidecar publishes {} — \
+                         the body and the hash clients check it against cannot both be right",
+                        meta.size, sc.size
+                    ),
+                });
+            } else if deep {
+                attested.push((*filename, sc.sha256.clone(), meta.size));
+            }
             if suppressed_mirror(pkg_origin, &sc, mirror_quarantined.contains(filename)) {
                 suppressed += 1;
                 continue;
@@ -294,6 +344,8 @@ async fn check_package(
             ));
         }
     }
+
+    divs.append(&mut rehash_bodies(storage, pkg, &prefix, &attested).await?);
 
     let has_artifacts = artifacts.len() > suppressed;
     let base = format!("{SIMPLE_PREFIX}{pkg}/");
@@ -348,6 +400,78 @@ async fn check_package(
     Ok((pkg.to_string(), has_artifacts, divs))
 }
 
+/// `--deep`: read each body and compare its sha256 against the one its own
+/// sidecar publishes. Empty (and free) unless `--deep` was asked for.
+///
+/// This is the check every other reader assumes somebody else did. The renderer
+/// copies the sidecar's sha into `simple/`, the cross-bucket merge compares
+/// sidecar shas to pick a verdict, and the audit re-renders views from
+/// sidecars — so a body that stops matching its sidecar is a lie the whole
+/// system agrees with. It is deliberately opt-in: it reads every byte in the
+/// store, which on a full-PyPI mirror is the corpus and on a private index is
+/// seconds.
+async fn rehash_bodies(
+    storage: &dyn Storage,
+    pkg: &str,
+    prefix: &str,
+    attested: &[(&str, String, u64)],
+) -> Result<Vec<Divergence>> {
+    // Pack batches by bytes, not by count — see DEEP_BYTES_IN_FLIGHT.
+    let mut batches: Vec<Vec<&(&str, String, u64)>> = Vec::new();
+    let mut batch: Vec<&(&str, String, u64)> = Vec::new();
+    let mut in_flight = 0u64;
+    for item in attested {
+        if !batch.is_empty()
+            && (batch.len() >= DEEP_CONCURRENCY || in_flight + item.2 > DEEP_BYTES_IN_FLIGHT)
+        {
+            batches.push(std::mem::take(&mut batch));
+            in_flight = 0;
+        }
+        in_flight += item.2;
+        batch.push(item);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+
+    let mut divs = Vec::new();
+    for batch in batches {
+        let reads = batch.iter().map(|(filename, _, _)| {
+            let key = format!("{prefix}{filename}");
+            async move { storage.get_bytes(&key).await }
+        });
+        let bodies = futures::future::join_all(reads).await;
+        for ((filename, published, _), body) in batch.iter().zip(bodies) {
+            match body {
+                Ok(body) => {
+                    let stored = crate::hash::sha256_hex(&body);
+                    if &stored != published {
+                        divs.push(Divergence {
+                            kind: "body-mismatch",
+                            package: pkg.to_string(),
+                            detail: format!(
+                                "{filename}: stored bytes hash to {stored}, its sidecar \
+                                 publishes {published} — a client checking this download \
+                                 against the index would reject it"
+                            ),
+                        });
+                    }
+                }
+                // The listing found this key a moment ago. Gone now means a
+                // concurrent delete, or a sidecar standing over an empty key —
+                // the second is exactly the shape a rolled-back write leaves.
+                Err(e) if is_not_found(&e) => divs.push(Divergence {
+                    kind: "missing-body",
+                    package: pkg.to_string(),
+                    detail: format!("{filename}: sidecar published, bytes not there"),
+                }),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(divs)
+}
+
 /// The global index must list exactly the packages that have artifacts.
 async fn check_global(storage: &dyn Storage, live: &[String], divs: &mut Vec<Divergence>) {
     let live_owned: Vec<String> = live.to_vec();
@@ -383,10 +507,14 @@ mod tests {
     use crate::sim::{SimClock, SimStorage};
     use std::sync::Arc;
 
+    const BODY: &[u8] = b"body";
+
+    /// Describes [`BODY`] truthfully: the size cross-check is always on, so a
+    /// fixture whose sidecar lies about its own body is a diverged store.
     fn sidecar(origin: &str) -> Sidecar {
         Sidecar {
-            sha256: "0".repeat(64),
-            size: 1,
+            sha256: crate::hash::sha256_hex(BODY),
+            size: BODY.len() as u64,
             version: "1.0".to_string(),
             upload_time: "2026-01-01T00:00:00Z".to_string(),
             upload_epoch_ms: None,
@@ -441,7 +569,7 @@ mod tests {
             ("demo-3.0-py3-none-any.whl", "mirror", true),
         ] {
             let akey = format!("packages/demo/{file}");
-            write(&storage, &akey, b"body".to_vec());
+            write(&storage, &akey, BODY.to_vec());
             write(
                 &storage,
                 &format!("{akey}{SIDECAR_SUFFIX}"),
@@ -461,7 +589,7 @@ mod tests {
         crate::worker::rebuild_package_excluding(&state, bucket.as_ref(), "demo", None)
             .await
             .unwrap();
-        let report = verify_storage(bucket.as_ref()).await.unwrap();
+        let report = verify_storage(bucket.as_ref(), true).await.unwrap();
         let view_divergences: Vec<&str> = report
             .divergences
             .iter()
@@ -494,7 +622,7 @@ mod tests {
             format!(r#"{{"origin":"private","nonce":"{}"}}"#, "b".repeat(32)).into_bytes(),
         );
         let akey = "packages/ghost/ghost-1.0-py3-none-any.whl";
-        write(&storage, akey, b"body".to_vec());
+        write(&storage, akey, BODY.to_vec());
         write(
             &storage,
             &format!("{akey}{SIDECAR_SUFFIX}"),
@@ -502,13 +630,71 @@ mod tests {
         );
         write(&storage, "simple/ghost/index.json", b"{}".to_vec());
         let bucket: Arc<dyn Storage> = storage.clone();
-        let report = verify_storage(bucket.as_ref()).await.unwrap();
+        let report = verify_storage(bucket.as_ref(), true).await.unwrap();
         assert!(
             report
                 .divergences
                 .iter()
                 .any(|d| d.kind == "orphan-view" && d.package == "ghost"),
             "a view over a package with nothing renderable must read as an orphan"
+        );
+    }
+
+    /// The two claims about the bytes, at their two prices. A record the
+    /// renderer *omits* is the subject on purpose: suppressed truth is still
+    /// stored bytes somebody may one day promote, so the integrity check must
+    /// not skip it the way the view diff does.
+    #[tokio::test]
+    async fn a_body_that_contradicts_its_own_sidecar_is_a_divergence() {
+        let kinds = |report: &VerifyReport| -> Vec<&'static str> {
+            report.divergences.iter().map(|d| d.kind).collect()
+        };
+        let store = |body: &'static [u8]| {
+            let storage = SimStorage::new(SimClock::new(
+                time::OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap(),
+            ));
+            let akey = "packages/crossed/crossed-1.0-py3-none-any.whl";
+            write(&storage, akey, body.to_vec());
+            write(
+                &storage,
+                &format!("{akey}{SIDECAR_SUFFIX}"),
+                serde_json::to_vec(&sidecar("private")).unwrap(),
+            );
+            storage
+        };
+
+        // Same length, different bytes: only the re-hash can see it, which is
+        // the whole argument for `--deep` existing at all.
+        let swapped: Arc<dyn Storage> = store(b"BODY");
+        let shallow = verify_storage(swapped.as_ref(), false).await.unwrap();
+        assert!(
+            !kinds(&shallow).contains(&"body-mismatch"),
+            "the default pass must not read bodies: {:?}",
+            kinds(&shallow)
+        );
+        let deep = verify_storage(swapped.as_ref(), true).await.unwrap();
+        assert!(
+            kinds(&deep).contains(&"body-mismatch"),
+            "--deep missed a same-length body swap: {:?}",
+            kinds(&deep)
+        );
+
+        // Different length: the listing already told us, so no read is needed
+        // and no flag either.
+        let truncated: Arc<dyn Storage> = store(b"bod");
+        let report = verify_storage(truncated.as_ref(), false).await.unwrap();
+        assert!(
+            kinds(&report).contains(&"size-mismatch"),
+            "a length the sidecar contradicts is free to catch: {:?}",
+            kinds(&report)
+        );
+        // ...and having caught it, `--deep` does not also spend a read to say
+        // the same thing twice.
+        let report = verify_storage(truncated.as_ref(), true).await.unwrap();
+        assert!(
+            !kinds(&report).contains(&"body-mismatch"),
+            "a proven size mismatch should not also be re-hashed: {:?}",
+            kinds(&report)
         );
     }
 }

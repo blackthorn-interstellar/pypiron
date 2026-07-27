@@ -226,7 +226,7 @@ Skip crawling page by page. This site publishes the docs in the llms.txt format:
 | Storage | disk by default; `--buckets s3://…,gs://…,az://…` for object storage, one entry or a multi-cloud list; `--storage-prefix` roots all keys |
 | Logs | `--log-format json`, one object per line |
 | Version | `pypiron --version` → `X.Y.Z (git-hash)` |
-| Integrity | `pypiron verify-index` — exit 0 converged / 1 diverged / 2 error; `pypiron verify-chain` for the audit history |
+| Integrity | `pypiron verify-index` — exit 0 converged / 1 diverged / 2 error, `--deep` also re-hashes every file; `pypiron verify-chain` for the audit history |
 
 ## Bottom line
 

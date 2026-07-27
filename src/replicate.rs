@@ -1592,6 +1592,18 @@ async fn quarantine_bytes(
 /// on the *source* side of a supersede — and `decide` reads both sides as
 /// `Live { Private }` and calls them converged, so the leftover key survives
 /// every future diff. Measured: 174 of 176 partitioned-lane failures.
+///
+/// `record` is listing-era, so it decides only whether this is worth a read.
+/// The delete itself is authorized by a fresh one, through the same primitive
+/// [`settle_mirror_quarantine`] uses, because the two race over the same two
+/// keys: a settle that started before the private upload landed moves that body
+/// to `_quarantine/` and drops the canonical key, leaving the fence as the ONLY
+/// record that the emptiness was authorized. Clearing it on the stale reading
+/// then leaves the filename empty with nothing standing for it — no tombstone,
+/// no `.frozen`, and no fence on any bucket the settle's fan-out had not yet
+/// reached — which is exactly the state `origin release` hands back to a proxy
+/// to re-fetch the artifact just suppressed. The simulator sees it as acked
+/// bytes missing fleet-wide with no authorized removal.
 async fn clear_spent_demotion_fence(
     storage: &dyn Storage,
     pkg: &str,
@@ -1607,6 +1619,9 @@ async fn clear_spent_demotion_fence(
             }
         )
     {
+        return Ok(());
+    }
+    if !demotion_resolved_by_private_truth(storage, pkg, filename).await? {
         return Ok(());
     }
     storage
@@ -1719,7 +1734,10 @@ async fn settle_mirror_quarantine(
 /// either order and the filename ends with no body and nothing authorizing its
 /// absence — the state `origin release` will hand back to a proxy to re-fetch
 /// clean. Re-reading here is what keeps the audit and the merge from drifting,
-/// which was always the point of sharing one primitive.
+/// which was always the point of sharing one primitive — so
+/// [`clear_spent_demotion_fence`] reads through it too. Both sides of that race
+/// now answer the same question against the same two keys at the moment they
+/// act, which is the only reason either is entitled to move.
 ///
 /// A private sidecar with no body is a torn record, not private truth: the
 /// settle's own fence-then-drop is the right cleanup for it.
@@ -3515,6 +3533,57 @@ mod tests {
         assert_eq!(a.get_bytes(&key).await.unwrap(), b"private bytes");
         assert_eq!(b.get_bytes(&key).await.unwrap(), b"private bytes");
         assert!(a.list_all(QUARANTINE_PREFIX).await.unwrap().is_empty());
+    }
+
+    /// The spent-fence clear reads listing-era records, and a settle racing it
+    /// on the same bucket empties the canonical key under them. Clearing on the
+    /// stale reading leaves acked bytes in `_quarantine/` with NOTHING marking
+    /// their removal as authorized — no tombstone, no `.frozen`, and no fence on
+    /// any bucket the settle's fan-out had not reached yet. Traced at three
+    /// buckets on vopr seed 65000024708, where both pair merges cleared bucket
+    /// 0's fence after that bucket's own settle had already dropped the body,
+    /// and the fan-out's fence write to bucket 2 then crashed: end state, an
+    /// acknowledged upload missing on all three buckets.
+    #[tokio::test]
+    async fn a_stale_spent_fence_clear_never_unauthorizes_a_settled_demotion() {
+        let storage = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        seed_live(storage.as_ref(), "pkg", filename, b"private bytes", PRIVATE);
+        storage.insert(
+            &mirror_quarantined_key(&key),
+            br#"{"filename":"pkg-1.whl"}"#.to_vec(),
+        );
+
+        // What the merge carries: private truth under a fence it may call spent.
+        let stale = read_record(storage.as_ref(), "pkg", filename)
+            .await
+            .unwrap();
+        assert!(stale.mirror_quarantined);
+
+        // ...and what a settle that started before that upload landed does to
+        // the same bucket in the meantime: preserve the body, drop the record,
+        // leave the fence standing as the authorization.
+        assert!(quarantine(storage.as_ref(), "pkg", filename)
+            .await
+            .unwrap()
+            .is_some());
+        storage
+            .delete_keys(&record_object_keys(&key))
+            .await
+            .unwrap();
+
+        clear_spent_demotion_fence(storage.as_ref(), "pkg", filename, &stale)
+            .await
+            .unwrap();
+
+        assert!(
+            storage
+                .head_exists(&mirror_quarantined_key(&key))
+                .await
+                .unwrap(),
+            "a stale clear erased the only record authorizing an empty canonical key"
+        );
     }
 
     /// A tombstone is the stronger, permanent fence, so it subsumes a demotion

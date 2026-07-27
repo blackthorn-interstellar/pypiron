@@ -99,6 +99,37 @@ fn nightly_profiles_pin_a_durability_corpus() {
     );
 }
 
+/// The gated matrix has to run the topology the product is marketed on.
+///
+/// Every fixed row topped out at two buckets until 2026-07-27, and two is not
+/// three with a smaller number in it: at two buckets a write has exactly one
+/// peer, so the pre-ack fan-out, the `_repl/` debt it leaves and `execute`'s
+/// per-PAIR work each ran once per pass and could not be half-applied. At three
+/// they run twice, and a crash between the halves reaches states two buckets
+/// cannot. A DURABILITY defect that lost acknowledged bytes fleet-wide with
+/// nothing authorizing their absence lived in exactly that gap: `--seed
+/// 65000024708 --nodes 3 --buckets 3 --packages 6 --files 4 --ops 200
+/// --fail-percent 3 --partition 100`, green on the same seed at `--buckets 2`.
+/// A topology nothing runs is a topology nothing defends.
+#[test]
+fn the_gated_matrix_runs_the_marketed_multi_region_topology() {
+    let widest = job_lines("vopr:")
+        .map(str::trim)
+        .filter(|line| line.starts_with("- { name:"))
+        .filter_map(|row| flag_value(row, "--buckets"))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        widest >= 3,
+        "the gated nightly matrix's widest fixed row runs {widest} bucket(s). \
+         Multi-region is the deployment pypiron is marketed on and three buckets \
+         is its smallest honest instance — the second peer is what makes the \
+         pre-ack fan-out, its `_repl/` debt and `execute`'s per-pair work \
+         partially applicable at all. Seed 65000024708 lost an acknowledged \
+         upload on all three buckets there and passed at two."
+    );
+}
+
 /// `--rotate` derives the whole workload from the seed, so the harness rejects a
 /// workload flag beside it rather than parsing and discarding one. The nightly
 /// used to paste `--nodes/--buckets/--ops` onto *every* row from a shared
@@ -150,11 +181,12 @@ fn no_nightly_row_mixes_rotation_with_a_workload_flag() {
 
 /// The partitioned lane is real coverage that does not pass yet. Censused
 /// 2026-07-27 over 5,603,461 fresh seeds across five profiles: 6 failing =
-/// 1.07e-6 per seed. Every root cause the previous census filed is closed; three
-/// NEW ones remain, all live correctness defects — a global index whose HTML and
-/// JSON tear apart with no reachable reconcile, a demotion fence cleared while a
-/// third bucket is still owed it, and a symmetric byte conflict that settles on
-/// two survivors at once. It is in the nightly because at `--partition 0` the
+/// 1.07e-6 per seed. Every root cause the previous census filed is closed; the
+/// ones that remain are live correctness defects — a global index whose HTML and
+/// JSON tear apart with no reachable reconcile, and a symmetric byte conflict
+/// that settles on two survivors at once. (The third, a demotion fence cleared
+/// on a listing-era reading after the same bucket's settle had emptied the
+/// canonical key, is closed.) It is in the nightly because at `--partition 0` the
 /// merge algebra never executes — seven of eleven verdicts read
 /// `[never presented]` over 1,235,949 control seeds, and no
 /// `.frozen`/`_quarantine/`/`.mirror-quarantined` object is ever created — so

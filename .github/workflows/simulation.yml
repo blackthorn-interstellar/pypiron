@@ -63,7 +63,24 @@ jobs:
           - { name: multi-bucket, args: '--nodes 3 --buckets 2 --ops 160 --packages 6 --files 2' }
           - { name: single-bucket-crash-only, args: '--nodes 3 --buckets 1 --ops 160 --packages 6 --files 2 --fail-percent 0' }
           - { name: multi-bucket-crash-only, args: '--nodes 3 --buckets 2 --ops 160 --packages 6 --files 2 --fail-percent 0' }
-          # The four above pin a topology AND the fixed workload (6 packages x 2
+          # THREE buckets — the multi-region topology the product is marketed
+          # on, and until 2026-07-27 the one no lane in this workflow ran. Every
+          # row above tops out at two, which is not the same shape with a
+          # smaller number in it: at two buckets a write has exactly one peer,
+          # so the pre-ack fan-out, the `_repl/` debt it leaves behind and
+          # `execute`'s per-PAIR work each ran once per pass and could not be
+          # partially applied. At three they run twice, and a crash between the
+          # two halves leaves a state two buckets cannot reach. That gap is not
+          # theoretical: a DURABILITY defect that lost acknowledged bytes
+          # fleet-wide with nothing authorizing their absence went unseen through
+          # two multi-million-seed censuses and was only ever reproduced at
+          # `--seed 65000024708 --nodes 3 --buckets 3 --packages 6 --files 4
+          # --ops 200 --fail-percent 3 --partition 100` — GREEN on the same seed
+          # at `--buckets 2`. It is `--packages 6 --files 2` like its
+          # siblings, so the durability corpus stays at 12 filenames and the row
+          # differs from `multi-bucket` in exactly one flag.
+          - { name: three-bucket, args: '--nodes 3 --buckets 3 --ops 160 --packages 6 --files 2' }
+          # The five above pin a topology AND the fixed workload (6 packages x 2
           # files, one hardcoded op mix), so between them they re-explore one
           # shape however many seeds they burn. This one rotates everything the
           # seed can vary — topology, entity counts, and the op-class weights
@@ -104,8 +121,9 @@ jobs:
           tail -30 vopr.out >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-  # NON-BLOCKING, and the reason is now stronger than the draw size: THREE LIVE
-  # CORRECTNESS DEFECTS are open below. Gating this job would not raise the bar,
+  # NON-BLOCKING, and the reason is now stronger than the draw size: LIVE
+  # CORRECTNESS DEFECTS are open below — the roster is kept entry by entry, and
+  # closing one does not reopen the gate. Gating this job would not raise the bar,
   # it would paint the nightly permanently red — and a job nobody can fix is a
   # job nobody reads. `tests/simulation_matrix.rs` guards that in both
   # directions. Remove `continue-on-error` with the failures, not before.
@@ -193,22 +211,28 @@ jobs:
   #        --seed 61000246528 --rotate --partition 100                                                    # POISONED arm
   #        --seed 66000074673 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100  # AUDIT_PREMATURE_CONSUMPTION x2
   #
-  #   2. DURABILITY — a demotion fence is cleared while a THIRD bucket is still
-  #      owed it. `execute` applies `clear_spent_demotion_fence` to both sides of
-  #      a PAIR before the verdict runs (`src/replicate.rs:279-281`). With three
-  #      buckets the pairs are (0,1), (0,2) and (1,2), so (0,1) and (0,2) each
-  #      clear bucket 0's fence while the `SettleMirrorQuarantine` fan-out still
-  #      owes bucket 2 its copy: fence installed on b0, `_quarantine/` copy
-  #      taken, canonical key emptied, fence deleted TWICE on b0 (once per pair),
-  #      then the put of the fence on b2 crashes. End state is no fence anywhere,
-  #      the canonical key empty on all three buckets, and acked bytes gone with
-  #      nothing authorizing their absence. This is the shape `f37e391` closed at
-  #      two buckets; the window only exists when there is more than one peer to
-  #      fan out to, which is why every 2-bucket census missed it. THREE BUCKETS
-  #      IS THE MARKETED MULTI-REGION TOPOLOGY — weigh this one accordingly, and
-  #      note that no lane in this workflow runs it.
+  #   2. DURABILITY — CLOSED. A demotion fence was cleared on a listing-era
+  #      reading of the record, and the trace says the mechanism plainly: both
+  #      pair merges ran `clear_spent_demotion_fence` on bucket 0 with the
+  #      canonical key ALREADY EMPTY, because that bucket's own
+  #      `settle_mirror_quarantine` had moved the body to `_quarantine/` between
+  #      the listing and the executor. The fence was the only record that the
+  #      emptiness was authorized; deleting it left the filename empty on all
+  #      three buckets with no tombstone and no `.frozen` — the state
+  #      `origin release` hands back to a proxy to re-fetch the artifact just
+  #      suppressed. Not a per-pair arithmetic bug: at two buckets the same stale
+  #      clear loses the same fence, and three buckets is what made the seed
+  #      land there (the fan-out's fence write to bucket 2 crashed, so no peer
+  #      held a copy). Fixed by reading live truth through the primitive
+  #      `settle_mirror_quarantine` already uses, so both sides of the race
+  #      answer the same question against the same keys at the moment they act.
+  #      Pinned by `replicate::tests::a_stale_spent_fence_clear_never_unauthorizes_a_settled_demotion`.
   #        --seed 65000024708 --nodes 3 --buckets 3 --packages 6 --files 4 --ops 200 --fail-percent 3 --partition 100
-  #      The same seed at `--buckets 2` PASSES.
+  #      THREE BUCKETS IS THE MARKETED MULTI-REGION TOPOLOGY and no lane ran it,
+  #      which is how this survived — the gated matrix now carries a
+  #      `three-bucket` row. That row is `--partition 0`, so it covers the
+  #      fan-out and `_repl/` debt paths at three buckets but not the merge
+  #      algebra; a partitioned three-bucket lane is the coverage still missing.
   #
   #   3. CONVERGENCE + SELF_CONSISTENCY + DURABILITY — a symmetric partitioned
   #      byte conflict settles on TWO survivors at once, with a crossed body.
@@ -231,8 +255,8 @@ jobs:
   # 12-filename corpus here spreads the workload too thin to reach them. That
   # corpus is load-bearing for the durability oracles
   # (`tests/simulation_matrix.rs` enforces it), so add a narrow lane when hunting
-  # the next one — do not widen or shrink this one. Root cause 2 is the mirror
-  # image and needs a THIRD bucket.
+  # the next one — do not widen or shrink this one. Root cause 2 was the mirror
+  # image: it needed a THIRD bucket, which nothing here provides.
   #
   # Coverage is intact rather than suppressed: over the 5,417,063 census seeds
   # all 11 `decide` verdicts execute and none reads `[never presented]` in any of

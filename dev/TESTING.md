@@ -381,7 +381,11 @@ closed. The two per-seed readings the gate holds — `MERGE_DIVERGENCE` and
 `FREEZE_JUSTIFIED` — are *tail-event* slots: they waive the 25% share floor
 (measured 48%/39% on a fixed multi-bucket profile, 19%/15% under rotation where
 a third of drawn topologies are single-bucket) but still fail on a flat zero, so
-a partitioned run that stops producing conflicts is still caught.
+a partitioned run that stops producing conflicts is still caught. Re-measured on
+the rotating lane at `783d423`: `MERGE_DIVERGENCE` holds at 19% of seeds,
+`FREEZE_JUSTIFIED` has fallen 15% → **9%** — the freeze fixes above legitimately
+made freezes rarer, which is exactly the drift a fixed floor would have
+misreported as a coverage regression.
 
 **The oracle branches that were dead code now evaluate — with one exception,
 stated.** Counted by a throwaway instrumented build of `examples/vopr.rs` (probe
@@ -407,33 +411,85 @@ waives durability, so it had better be a real conflict) is about the *rule*, not
 about which disjunct happens to fire first, and a crash between the marker and
 the tombstone is exactly the window where it would become load-bearing.
 
-**The partitioned profiles are currently red**, which is the point — see the
-findings recorded against the commit that landed this. That is why `--partition`
-defaults to 0 and no CI invocation passes it: the nightly matrix and the pinned
-regression seeds stay on the aligned schedule, byte-identical (verified by
-diffing five whole-profile runs, every counter to the digit), until the findings
-are triaged. The partitioned soak is run by hand:
+#### Where the two lanes stand
+
+Three statements, all true at `783d423` and all measured rather than inferred:
+**the aligned nightly is green, the partitioned lane is still red, and
+`--partition` is still not in CI.**
+
+- **Aligned** — the five nightly profiles at their own 50,000 seeds each with
+  `--require-reach` (`--start-seed 9600001`): 250,000 seeds, 467,219,607
+  storage-op interleavings, 2,295,157 acked uploads, **zero violations**, no
+  starved oracle, 0 audit view repairs of any class.
+- **Partitioned** — three lanes at `--partition 100`, 240 s each on a disjoint
+  range (`--start-seed 9500001`): 166,409 seeds, 352,586,168 interleavings,
+  1,255,628 acked uploads, **282 failing seeds (0.17%)** across five oracles.
+  Down from 16–51% of seeds when the lane opened, but not zero.
+
+So `--partition` still defaults to 0 and no CI invocation passes it (grep
+`ci.yml` and `simulation.yml`: the flag appears in neither). The nightly matrix
+and the pinned regression seeds stay on the aligned schedule, byte-identical
+(verified by diffing five whole-profile runs, every counter to the digit), until
+the lane is green. The partitioned soak is run by hand:
 
 ```
 cargo run --release --example vopr -- --rotate --partition 100 --max-secs 600
 ```
 
-The findings, one repro each, all from the first soak (append `cargo run
---release --example vopr --` to each line). They are recorded here rather than
-fixed alongside the harness change, so the harness lands separately from
-whatever the fixes turn out to be:
+#### What the partitioned lane caught, and what closed each one
 
-| oracle | seed | flags | what it says |
-|---|---|---|---|
-| `AUDIT_PREMATURE_CONSUMPTION` (global membership) | 1 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100` | a drain of a peer bucket re-derived a package past every truth mutation, wrote the global index claiming it absent, and the tier-3 audit had to flip the membership back. The dominant finding by volume (~50% of partitioned seeds); `AUDIT_REPAIRED_VIEWS` at `--fail-percent 0` is the same shape under the crash-only blanket gate |
-| `AUDIT_ORDERING` (class 1) | 268 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100` | a `packages/<pkg>/.origin` write on a home bucket had **no covering breadcrumb** — no `_dirty/` marker there, no `_repl/` note aimed at it — so nothing durable could tell a tick to re-derive the name. The first class-1 the product has ever produced; the `EXPECTED_ZERO` entry saying otherwise is now scoped to the aligned schedule |
-| `DURABILITY` + `CONSERVATION` | 267 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | an acknowledged upload's bytes are gone from every bucket and from `_quarantine/`, with both buckets serving a *different* body under that filename and no tombstone or freeze. The strongest one: a `200` was retracted with no evidence |
-| `CONSERVATION` (frozen) | 165 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | two byte-sets acked, the fleet froze the filename, and only *one* survived in `_quarantine/` — the freeze lost a body it is supposed to preserve before it drops anything |
-| `FREEZE_UNJUSTIFIED` | 91 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | frozen on every bucket with only **one** byte-set attested anywhere (acks ∪ every `_quarantine/` copy) — a freeze that suppresses a filename and waives its durability check without a real conflict behind it |
-| `CONVERGENCE` | 208 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | `packages/<pkg>/.origin` reads `mirror` on bucket 0 and is **absent** on bucket 1 at quiescence — an orphan claim that never replicated and never got released, so one bucket reserves a name the other would let a proxy fill |
-| `ACK_TOTALITY` | 19 | `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100` | a publish acked while a peer held neither the record, nor a `_repl/` note owing it, nor any merge marker explaining its absence. Crash-only, where a missed note is the hard gate |
+Every row was mined from the first partitioned soak at `--nodes 3 --buckets 2
+--packages 6 --files 2 --ops 160 --partition 100`; the `fail` column is that
+run's `--fail-percent`. **All eight are green at `783d423`** — each was re-run
+one seed at a time at exactly those flags, not inferred from a soak summary.
+The rows stay after the fix: a table of what the simulator caught is the whole
+argument that it earns its runtime.
 
-**Closed: the two freeze rows (165, 91), plus the freeze arm of 267.** Two
+| oracle | seed | fail | what it caught | closed by |
+|---|---|---|---|---|
+| `AUDIT_PREMATURE_CONSUMPTION` (global membership) | 1 | 3 | a drain of a peer bucket decided its global-index delta by HEADing `simple/<pkg>/index.json` — the view that same function writes and deletes — so a retry after a failed pass read its own leftovers, computed an empty delta, consumed the markers anyway, and left the bucket publishing a global index contradicting its own truth until the tier-3 audit stumbled on it. Was the dominant finding by volume, ~50% of partitioned seeds | `df3db2d` — states membership instead of diffing it, and deletes the per-package HEAD. 11,898 → 0 over comparable 21k-seed ranges |
+| `AUDIT_ORDERING` (class 1) | 268 | 3 | a truth mutation with **no covering breadcrumb** — no `_dirty/` marker on that bucket, no `_repl/` note aimed at it — so nothing durable could tell a tick to re-derive the name. The only class-1 the product has ever produced | `df3db2d`, same fix: 16 → 0 |
+| `DURABILITY` + `CONSERVATION` | 267 | 0 | an acknowledged upload's bytes gone from every bucket and from `_quarantine/`, both buckets serving a *different* body under that filename, no tombstone and no freeze. The strongest one: a `200` retracted with no evidence | two arms. The freeze arm: `5589ee5`, `b91e06c`, `a7f5f26`. The crossed-body arm: `a24236d` → `25d1d28` → `9e8baa1`, three separate sidecar-before-bytes orderings |
+| `SELF_CONSISTENCY` | 7100005242 | 3 | two buckets serving different bodies for one filename while their sidecars stayed **byte-identical**, so the pair never entered the diverged-key set and no other oracle could see it | `25d1d28` — an unverifiable size HEAD no longer deletes bytes a concurrent copy had adopted. Crossed bodies 3 → 0 over 115,689 identical seeds |
+| `CONSERVATION` (frozen) | 165 | 0 | two byte-sets acked, the fleet froze the filename, only *one* survived in `_quarantine/` — the freeze lost a body it is supposed to preserve before it drops anything | `5589ee5`, `b91e06c`, then `a7f5f26`'s delete ledger (below) |
+| `FREEZE_UNJUSTIFIED` | 91 | 0 | frozen on every bucket with only **one** byte-set attested anywhere (acks ∪ every `_quarantine/` copy) — a freeze that suppresses a filename and waives its durability check without a real conflict behind it | the same three |
+| `CONVERGENCE` (`.origin` split) | 208 | 0 | `packages/<pkg>/.origin` reads `mirror` on bucket 0 and is **absent** on bucket 1 at quiescence — an orphan claim that never replicated and never got released, so one bucket reserves a name the other would let a proxy fill. Needed no faults at all: four ops, two nodes, one file | `701b813` — `reconcile_split_origin` grew the missing `(mirror, no claim)` arm. The 2n/2b/1pkg/1file/4-op profile went from 9,123 failing seeds in 194,074 to 0 in 197,314 |
+| `ACK_TOTALITY` | 19 | 0 | a publish acked while a peer held neither the record, nor a `_repl/` note owing it, nor any merge marker explaining its absence. Crash-only, where a missed note is the hard gate | `fd14f01` — `decide`'s `(Orphan, _)` deferral is now `Verdict::Defer`, not a `Noop` the fan-out read as convergence. Crash-only 3,109 failing seeds in 20,963 → 2 in 20,703 |
+
+**Re-run a seed before you quote its row.** This table went stale silently and
+was cited as evidence for a full commit's worth of work after it stopped being
+true. Audited two commits back at `a24236d`, 267 and 165 had already gone green,
+91 red as `ACK_TOTALITY` rather than `FREEZE_UNJUSTIFIED`, and 268 red as
+`AUDIT_PREMATURE_CONSUMPTION` rather than the class-1 `AUDIT_ORDERING` that a
+claim two sections down was built on — only 1, 208 and 19 still reproduced as
+written. A stale row is worse than a deleted one: it reads as measurement.
+
+#### Still red at `783d423`
+
+Measured over the three partitioned lanes above (166,409 seeds). Rates are the
+share of that lane's seeds the oracle reds on; `—` means it produced none there.
+Every repro is `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160
+--partition 100` at the stated `--fail-percent`, verified to red standing alone.
+
+| oracle | repro | fault | rotating | crash-only | what it says |
+|---|---|---|---|---|---|
+| `CONVERGENCE` | seed 9500054, fail 3 | 0.345% | 0.144% | 0.015% | dominant, and one shape: a `<file>.mirror-quarantined` marker standing on one bucket and absent on the other. 110 of the fault lane's 160 failing seeds diverge on **that key alone**. The marker is what a merge writes to make a mirror body inert under a private claim, and it does not replicate — so the peer still renders the record the marker exists to suppress. The remaining 50 add the record it covers (bare artifact + `.meta.json`) present on one bucket only |
+| `DURABILITY` | seed 9500926, fail 3 | 0.034% | 0.019% | 0.004% | `acked … missing on bucket 0` — an acked record absent from one bucket at quiescence with no tombstone and no freeze. Always paired with a `CONVERGENCE` red on the same key; never the *split* clause (0 `never left split` in all 166,409 seeds) |
+| `ACK_TOTALITY` | seed 9504440, fail 0 | — | 0.004% | 0.017% | the residue `fd14f01` did not take: 8 misses in 46,660 crash-only seeds, where a miss is fatal. Under fault injection it stays a reported statistic (4,691 misses, 0 failing seeds), because the note write can itself fail |
+| `FREEZE_UNJUSTIFIED` | seed 9539662, fail 0 | 0.011% | 0.003% | 0.002% | the residue `a7f5f26`'s delete ledger did not cover: frozen fleet-wide, one byte-set attested, both buckets tombstoned, `_quarantine/` empty. A freeze that fires without a real byte conflict buys a blanket DURABILITY+CONSERVATION exemption for free, so this matters more than 0.01% suggests |
+| `CONSERVATION` | seed 9522193, fail 3 | 0.002% | — | — | a freeze that dropped an acked body it never quarantined: one byte-set preserved under `_quarantine/`, the acked one gone from every bucket |
+
+The whole audit-repair family is **gone**, not merely rarer.
+`AUDIT_PREMATURE_CONSUMPTION`, `AUDIT_REPAIRED_VIEWS` and `AUDIT_ORDERING` were
+the dominant volume when this lane opened — tens of thousands of findings in a
+133,260-seed soak, better than 40% of seeds on some rows. At `783d423` every one
+of the 489,901 seeds measured here (166,409 partitioned + 323,492 aligned)
+reports **0 audit view repairs of any class**, so none of the three can fire at
+all. `SELF_CONSISTENCY` reds on none of them either. That is `df3db2d` and the
+crossed-body chain, and it is also why the classifier's meter rows now read zero
+everywhere: they were reachable only through the repair path.
+
+**How the freeze rows (165, 91, and the freeze arm of 267) closed.** Two
 `copy_live` fixes took most of that class (5589ee5, b91e06c). What was left
 behind them is not a product defect: a delete and a merge freeze racing on one
 filename. The delete tombstones and drops the body while `freeze_side` sits
@@ -453,24 +509,11 @@ is what keeps `--break freeze-unjustified` red — dropping that clause makes th
 kill proof pass, which is how it was checked. Repros, all `--nodes 3 --buckets
 2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100`: seeds
 6000, 9024, 12144, 14623 (freeze justification) and 8226, 9714, 25704
-(conservation), red before the change and green after. `FREEZE_JUSTIFIED` still
-executes on 23% of seeds there, down from 30%.
-
-How often, on a disjoint seed range (`--start-seed 9000001`, `--packages 6
---files 2 --ops 160 --partition 100`) — the share of seeds each oracle reds on,
-so a triage can be ordered by frequency rather than by which repro was found
-first:
-
-| | rotating, 86,010 seeds | multi-bucket, 50,884 seeds | crash-only, 52,354 seeds |
-|---|---|---|---|
-| **any** violation | 16.1% | 41.2% | 50.9% |
-| `AUDIT_PREMATURE_CONSUMPTION` / `AUDIT_REPAIRED_VIEWS` | 6.1% / 6.9% | 38.9% / — | — / 43.4% |
-| `ACK_TOTALITY` | 2.3% | — | 14.0% |
-| `CONVERGENCE` | 0.91% | 1.67% | 0.69% |
-| `AUDIT_ORDERING` (class 1) | 0.68% | 0.03% | — |
-| `CONSERVATION` | 0.57% | 2.09% | 2.07% |
-| `FREEZE_UNJUSTIFIED` | 0.27% | 0.51% | 0.57% |
-| `DURABILITY` | 0.12% | 0.56% | 0.20% |
+(conservation), red before the change and green after — all seven re-verified
+green at `783d423`. `FREEZE_JUSTIFIED` still executes on 23% of seeds there,
+down from 30%. It did **not** take the whole class: the residue row above
+(seed 9539662) is a freeze with an empty `_quarantine/` that the ledger does not
+excuse, which is the shape that was always meant to stay fatal.
 
 Determinism itself is verified, not assumed: recurring seeds (`--recheck-every`)
 run twice and must produce an identical storage-op trace hash *and* an identical
@@ -792,40 +835,68 @@ and passing `deep: true` would put two oracles on one claim and destroy
 suite instead (`tests/test_verify_deep.py`), where a same-length body swap is
 shown to pass the default verify and red `--deep`.
 
-#### Workload-reachable, harness-unreachable, product-unreachable
+#### Workload-unreachable, harness-unreachable, product-unreachable
 
-Three different things, and conflating them is how an unfalsifiable gate survives
-a review. A kill proof says the oracle is *sound*. It says nothing about whether
-anything but a break can ever red it, and the answer differs per oracle:
+A kill proof says an oracle is *sound*. It says nothing about whether anything
+but a break can ever red it — and "nothing has ever red it" has **three**
+completely different explanations at three completely different severities.
+Conflating them is how an unfalsifiable gate survives a review, and this doc has
+done it in both directions: it recorded class-1 `AUDIT_ORDERING` as a standing
+zero the product could not produce, then, when `--partition` produced one,
+recorded that as proof the state was product-reachable. Neither was the honest
+statement. The zero was a workload that had never been run, and the finding was
+that workload being run.
 
-- **workload-reachable** — nothing forbids the red state. The oracle reads green
-  because the product is correct on the schedules sampled, and a real regression
-  would red it. This is the ordinary, healthy status.
+The healthy case first, then the three zeros:
+
+- **workload-reachable** — nothing forbids the red state and the sampled
+  schedules produce it, or would if the product regressed. The ordinary, healthy
+  status, and not a zero at all.
+- **workload-unreachable** — the state is reachable by both the product and this
+  harness, but *this workload never draws it*. The weakest of the three claims,
+  and the only one a knob can overturn without touching a line of product code:
+  every finding in the tables above was workload-unreachable until `--partition`
+  existed. A zero here is a coverage gap wearing a green check, and it expires
+  the moment the workload widens.
 - **harness-unreachable** — the *simulator* cannot stage the state, though
-  production can. The oracle is a standing watch that this harness will never
-  trip; something else has to cover it.
+  production can. No workload knob fixes it; something outside this harness has
+  to cover the claim. Class 3 is the example, and the model checker is what
+  covers it.
 - **product-unreachable** — a *product rule* forbids the state, so it cannot
   occur in production either. The guard is a watch on a rule that could one day
-  be relaxed.
+  be relaxed. This is the only one of the three that licenses "cannot happen",
+  and it needs a named rule, not a run of zeros.
+
+The distinction is load-bearing in both directions. `TOMBSTONE_MONOTONICITY` is
+product-unreachable and names its rule (`publish_record`'s tombstone fence), so
+its zero is an argument. The classifier's class-1/2a/2b arms are **workload-**
+unreachable — no rule forbids them, and one of them (class 1, seed 268) was
+briefly workload-*reachable* under `--partition` before `df3db2d` closed it. The
+reach meter's `EXPECTED_ZERO` strings in `examples/vopr.rs` currently label those
+three arms `product-unreachable` while justifying them with "no class-1 has ever
+been produced" — which is an observation, not a rule, and therefore the
+workload-unreachable case. Those strings should be corrected; the statuses in the
+table below are the accurate ones.
 
 | oracle | status | why | kill proof |
 |---|---|---|---|
 | VERIFY | workload-reachable | every convergence regression pinned in ci.yml's seed corpus red it | `view` |
-| SELF_CONSISTENCY | workload-reachable, and *observed* | it red seed 7100005242 (`--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100`) against the tree before `25d1d28`, where the rollback of an unverifiable write deleted bytes a copy had already adopted; 0 in 223,718 seeds since | `attest` |
+| SELF_CONSISTENCY | workload-reachable, and *observed* | it red seed 7100005242 (`--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100`) against the tree before `25d1d28`, where the rollback of an unverifiable write deleted bytes a copy had already adopted; that seed is green at `783d423`, and 0 in 223,718 seeds then plus 489,901 more here (166,409 of them partitioned) | `attest` |
 | DURABILITY (acked bytes stand) | workload-reachable | no rule forbids a bucket losing an acked record | `durability` |
-| DURABILITY (never left split) | workload-reachable **only partitioned** — and *observed* there | needs one filename acked with different bytes on two buckets, which only `--partition` produces | `split` |
+| DURABILITY (never left split) | workload-reachable **only partitioned** — *observed* there, none since the crossed-body fixes | needs one filename acked with different bytes on two buckets, which only `--partition` produces; 0 in the 166,409 partitioned seeds measured at `783d423`, so treat it as workload-unreachable again until something reds it | `split` |
 | VISIBILITY | workload-reachable | ditto, for the listing | `visibility` |
 | CONSERVATION (acked bytes survive) | workload-reachable | ditto, fleet-wide | `conserve` |
-| CONSERVATION (a freeze loses neither body) | workload-reachable **only partitioned** — and *observed* there | a freeze needs a real byte conflict to fire at all | `freeze-lossy` |
-| FREEZE_JUSTIFIED | workload-reachable **only partitioned** — and *observed* there | ditto | `freeze-unjustified` |
+| CONSERVATION (a freeze loses neither body) | workload-reachable **only partitioned** — and *observed* there, still red today | a freeze needs a real byte conflict to fire at all; live at `783d423`, `--seed 9522193 --fail-percent 3` | `freeze-lossy` |
+| FREEZE_JUSTIFIED | workload-reachable **only partitioned** — and *observed* there, still red today | ditto; live at `783d423`, `--seed 9539662 --fail-percent 0` | `freeze-unjustified` |
 | ORIGIN_TERMINALITY (the `.origin` claim) | workload-reachable, never witnessed | needs a mirror claim to win over a private one on some bucket after the private ack | `origin-demoted` |
 | ORIGIN_TERMINALITY (the record under it) | workload-reachable, never witnessed | needs a live mirror sidecar left renderable under a private claim | `mirror-served` |
 | CONVERGENCE | workload-reachable | needs ≥2 buckets; the replication paths that could break it run on every multi-bucket seed | `diverge` |
 | LIVENESS | workload-reachable | any undrainable breadcrumb reds it; the fast path has simply always drained | `wedge` |
-| ACK_TOTALITY | workload-reachable, and *observed* | 166 misses per 5,000 seeds on 3n/2b under fault injection, where it is a reported statistic; crash-only, where it is fatal, has never produced one | `fanout` |
+| ACK_TOTALITY | workload-reachable, and *observed* — including where it is fatal | a reported statistic under fault injection (4,691 misses in 44,648 partitioned seeds); crash-only, where it *is* fatal, has produced one — 8 failing seeds in 46,660 partitioned, first `--seed 9504440`. That row used to read "has never produced one", which was true only of the aligned schedule | `fanout` |
 | DETERMINISM | workload-reachable | any nondeterminism downstream of the op sequence reds it | `rerun` |
 | TOMBSTONE_MONOTONICITY | **product-unreachable** | `publish_record`'s tombstone fence rejects re-publishing a deleted filename, so no ack can follow a `204` — 150k wide seeds (795k acked uploads, 251M interleavings) produced zero, and could not have produced one | `resurrect` |
-| classifier TEST 1 / 2a / 2b / FALLBACK (both analyses) | workload-reachable, never witnessed | each needs the tier-3 audit to have repaired a view; the marker/tick/sweep/reconcile fast path converged every schedule in the 140k-seed sample (0 audit repairs) | `ordering`, `globalindex`, `poison`, `blind`, `fallback` |
+| classifier TEST 1 (both analyses) | **workload-unreachable** — but *witnessed once*, under `--partition` | seed 268 produced a real class-1 (a truth mutation no breadcrumb covered) before `df3db2d`; it is green now and 0 audit repairs of any class appear in the 489,901 seeds measured at `783d423`. Nothing forbids another, so this is a coverage statement, not a rule | `ordering`, `globalindex` |
+| classifier TEST 2a / 2b / FALLBACK (both analyses) | **workload-unreachable**, never witnessed | each needs the tier-3 audit to have repaired a view; the marker/tick/sweep/reconcile fast path converged every schedule in 489,901 seeds — 166,409 of them partitioned — with 0 audit repairs. Class 2 *has* been witnessed historically (seed 1067836, since fixed) | `poison`, `blind`, `fallback` |
 | classifier TEST 3 (both analyses) | **harness-unreachable** | the simulator's `tick_lock` serializes every rebuild to stand in for the bucket lease, so two never overlap | `race` (planted history) |
 
 `resurrect` proves the *oracle* is sound even though the *product* cannot reach
@@ -862,9 +933,16 @@ Both are cheap and both name a claim in the language a reader cares about, so
 they stay — but they are restatements, and a change that weakens DURABILITY or
 VERIFY silently weakens them too.
 
-`--break ordering` is still the only class-**1** input the classifier has ever
-been handed; the product has never produced one. Class 2 is no longer synthetic
-— seed 1067836 above is the real thing.
+Neither class-**1** nor class-**2** is synthetic any more, and both have since
+been fixed out of the workload — which is the correct order of events, not a
+reason to downgrade the arms. Class 2 came first, from the aligned rotating
+profile (seed 1067836, closed by 1bc3ce9 + f30036a). Class 1 came from the
+partitioned lane (seed 268, closed by `df3db2d`) — the product produced one, and
+the sentence that used to stand here saying it never had was written before
+`--partition` existed. Both seeds are green at `783d423` and neither class
+appears in the 489,901 seeds measured there, so today the arms are fed only by
+`--break` again. Read that as workload-unreachable, not product-unreachable: the
+gap between those two words is exactly one knob, and this lane is the proof.
 
 ### Proving the oracles ran at all (the reach meter)
 
@@ -992,7 +1070,7 @@ each is a claim someone has to defend here:
 |---|---|---|
 | CONVERGENCE, ACK_TOTALITY | need more than one bucket; excused automatically, and only, when every profile in the sample was single-bucket | any multi-bucket profile |
 | MERGE_DIVERGENCE, FREEZE_JUSTIFIED | need two buckets that disagree about one filename's bytes, which only a partitioned fleet produces; excused automatically, and only, when no seed in the sample drew a split plan | any `--partition` run |
-| classifier/pkg TEST 1 | the product has never produced a class-1 ORDERING repair **on the aligned schedule** — `--partition` reaches it (a `.origin` write on a home bucket with no covering breadcrumb), which is a finding, not coverage | `--break ordering`, `--break globalindex` |
+| classifier/pkg TEST 1 | **workload**-unreachable, not product-unreachable: `--partition` reached it once (seed 268, a truth mutation no breadcrumb covered), `df3db2d` closed it, and 0 audit repairs of any class appear in the 489,901 seeds measured at `783d423`. No rule forbids the next one. The excuse string in `examples/vopr.rs` still says `product-unreachable`; that word is wrong and should be `workload-unreachable` | `--break ordering`, `--break globalindex` |
 | classifier/global TEST 1 | same, on global membership | `--break globalindex` |
 | classifier/{pkg,global} TEST 3 | *harness*-unreachable: `tick_lock` serializes rebuilds, so two never overlap (see the reachability table above). Still true under `--partition`: a partitioned node diverges only its **writes**, never its rebuilds, so every tick still takes the one bucket-0 lease | `--break race` |
 | classifier/{pkg,global} TEST 2a | needs an audit repair whose final writer had listed truth past every mutation | `--break poison` |

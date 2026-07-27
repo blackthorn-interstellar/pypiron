@@ -130,7 +130,9 @@ project status, and metadata companions are deliberately *not* committed: they
 change legitimately and are not the supply-chain surface. That keeps the
 violation definition sharp. A violation is exactly one of two things: a
 committed filename's sha256 changed, or a committed filename vanished with no
-tombstone. A tombstoned disappearance is a legitimate private delete, not tamper.
+marker authorizing it. Two markers authorize a disappearance: a tombstone (a
+legitimate private delete) and `.mirror-quarantined` (an operator's own
+mirror→private supersede). Neither is tamper.
 
 `pypiron verify-chain` walks the chain (checking the hash links), replays it,
 re-lists storage, and reports violations, exiting nonzero. Anyone with bucket
@@ -355,8 +357,10 @@ a test: *derived* state (indexes, audit reports) converges by recomputation from
 converged truth — losing it loses nothing; *coordination scratch* (leases,
 `_repl/` notes, topology stamps) is per-bucket by definition — losing it may cost
 work, never data. Narrow, explicitly-annotated loss windows are permitted where
-totality would be absurd (e.g. the current day's live download tallies before
-rollup), and each must be declared in `src/layout.rs` with its loss bound. The
+totality would be absurd (the current day's live download tallies before rollup;
+the losing byte-set of a conflict or demotion the bucket itself resolved, whose
+*fence* replicates even though the preserved body does not), and each must be
+declared in `src/layout.rs` with its loss bound. The
 acceptance test for all of it: **any single surviving bucket rebuilds the whole
 service** — enforced by the layout-manifest test and the single-survivor blackbox
 test, which every new feature's state must pass through.
@@ -470,6 +474,82 @@ per-artifact operation on the ordinary copy path: drive `.origin` to private,
 move the mirror body to `_quarantine/` behind a `.mirror-quarantined` marker,
 copy the private record over. There is no staged package-promotion protocol.
 
+**Demotion quarantine: the fence replicates, the evidence stays local.** A
+mirror→private demotion leaves a loser — the mirror body the private claim
+supersedes — and where that loser lives decides whether the storage manifest is
+telling the truth. `.mirror-quarantined` sits *under* `packages/`, which the
+manifest classes truth-replicated, and the merge never replicated it: one bucket
+held an artifact, a sidecar and a marker its peers had never heard of, and no
+verdict ever closed the gap. That is the state class that never converges by
+design, which the totality principle forbids. The manifest wins — but not by
+copying dead bytes to every bucket.
+
+The rule the freeze path already follows, now stated once and applied to both:
+**a suppression fence is truth and replicates; the body it suppresses is
+evidence and stays on the bucket that resolved it.** A freeze writes `.frozen`
+plus a tombstone (both replicate, both permanent), moves the losing body to
+`_quarantine/<pkg>/<file>@<sha12>` (bucket-local, never copied), and leaves the
+canonical key empty. A demotion does the same thing one artifact at a time:
+`.mirror-quarantined` is the fence, the `_quarantine/` copy is the evidence, and
+the canonical key ends **empty on every bucket**. Making the quarantine a real
+*move* — marker first, verified `_quarantine/` copy, then drop artifact, sidecar
+and companions — converges the record with no artifact bytes on the wire and no
+new exemption anywhere. Every bucket ends holding the same one small marker, and
+`packages/` is finally the 100% truth-replicated tree the manifest always claimed
+it was.
+
+Three consequences, each the fail-closed direction:
+
+- **Nothing is owed to a peer that holds no body.** The suppression is a fence,
+  not a body; a bucket with the marker and nothing else serves nothing, and a
+  failover to it cannot resurrect what the operator withdrew. Replicating the
+  suppressed bytes would have been the fail-*open* answer — N copies of a
+  withdrawn artifact, each relying on a marker to stay hidden, instead of none.
+- **The marker, not the body, is what keeps the name closed.** `origin release`
+  refuses while any key besides `.origin` remains under `packages/<pkg>/`, so the
+  surviving marker is what stops a demoted name being released back to
+  `unclaimed` — the one state that authorizes a proxy to re-fetch, clean, the
+  artifact just suppressed. Drop the marker along with the body and that door
+  opens. It is equally why the marker must never fence a *private* upload:
+  handing the filename to private truth is the entire point of a demotion, so
+  `Supersede` clears the marker once the complete private record lands.
+- **The marker names a filename, never a hash.** Two partitioned buckets can
+  demote two different mirror bodies of one filename; a marker carrying its local
+  sha would then differ per bucket and never converge. It carries only the
+  filename, exactly as `.frozen` does. The hash lives in the `_quarantine/` key,
+  which is where the bytes are. Nothing reads the marker body — every consumer
+  tests for existence — so this is not a storage-format reinterpretation.
+
+`Verdict::Noop` was the wrong shape for all of it, in precisely the way
+`Verdict::Defer` was added to fix elsewhere. The catch-all
+`(QuarantinedMirror, _) | (_, QuarantinedMirror) => Noop` asserted "the two sides
+agree" over a pair where one side held a demotion the other had never heard of —
+including the live case, where the peer was still *serving* the withdrawn
+artifact under its own stale `mirror` claim. One symmetric verdict replaces it:
+**settle the demotion on both sides** — drive each side's claim private (private
+is terminal, so this is always the legal direction), create the marker, and move
+any canonical body still standing into that bucket's own `_quarantine/`. `Noop`
+survives for exactly one pair: both marked, both canonical keys empty. That is
+also the strongest form of origin terminality — no bucket can be left holding a
+live mirror record under a privately-claimed name, whichever bucket noticed
+first.
+
+**A tombstone subsumes the demotion fence.** The settled-delete test asks whether
+a tombstoned record has anything left to clean, and it never asked about
+`.mirror-quarantined` — so a tombstone landing over a demoted filename left the
+marker standing on one bucket, the merge called the pair settled, and the two
+buckets stayed one key apart forever. Tombstone ≻ everything, and a tombstone is
+the stronger fence: it bars the filename permanently, where the demotion marker
+deliberately does not. So the delete path *removes* the marker rather than
+preserving it — unlike `.frozen`, which a tombstone keeps as the richer
+diagnostic — and a surviving marker counts as debris, the same rule that already
+keeps an orphaned sidecar re-firing until it is gone.
+
+The withdrawal is legitimate history, not tamper: `verify-chain` treats a
+`.mirror-quarantined` marker like a tombstone when a committed filename's sidecar
+is gone. Otherwise every demotion of a checkpointed mirror snapshot would raise a
+fleet-wide `vanished` fault — a tamper alarm for an operator's own supersede.
+
 Every reachable bucket carries `_topology/stamp.json`, a hash of the ordered
 bucket names plus an operator generation. Startup rejects disagreement. A
 runtime mismatch leaves reads available and fences mutations. Changing the list
@@ -525,9 +605,15 @@ packages/<pkg>/<filename>.frozen         # freeze marker (multi-bucket): two buc
                                          #   never deleted. Indexes and direct reads reject the name. Written
                                          #   FIRST so a quarantine crash remains a freeze; resolve by
                                          #   publishing a new filename.
-packages/<pkg>/<filename>.mirror-quarantined # inert mirror loser under a private claim. Its canonical
-                                         #   body stays occupied to avoid delete/recreate ABA. It is hidden
-                                         #   unless a later private sidecar proves the marker stale.
+packages/<pkg>/<filename>.mirror-quarantined # the fleet-wide fence for a mirror->private demotion, and
+                                         #   the ONLY part of a demoted record that replicates. Names the
+                                         #   filename, never a hash (two buckets may have demoted two
+                                         #   bodies; the hash lives in the _quarantine/ key). Once settled
+                                         #   the canonical key is EMPTY on every bucket and the body sits
+                                         #   in _quarantine/ on whichever bucket held it. Suppresses the
+                                         #   name from indexes and direct reads; NEVER fences a private
+                                         #   upload of the same filename — that is the intended
+                                         #   resolution, and it clears the marker. A tombstone removes it.
 packages/<pkg>/.origin                   # nonce-bearing {origin, nonce} NEVER-DELETED claim
                                          #   (private|mirror|unclaimed); legacy plaintext still reads
 packages/<pkg>/.project-status.json      # PEP 792 {status, reason?}; multi-bucket events also carry
@@ -619,11 +705,11 @@ declared class fails CI. Six classes:
 
 | Prefix | Class | Replicates? |
 | --- | --- | --- |
-| `packages/` | truth-replicated | yes, per record — three-tier fan-out → `_repl/` notes → reconcile. Private truth and `sync --to` snapshots (sidecar `snapshot=true`) fan out pre-ack; proxy-cache fills (sidecar `snapshot` absent/false) replicate too but **asynchronously** — a post-serve `_repl/` note the sweep drains, healed by the reconcile diff — so any bucket serves the whole corpus, cached bytes included |
+| `packages/` | truth-replicated | yes, per record — three-tier fan-out → `_repl/` notes → reconcile. Private truth and `sync --to` snapshots (sidecar `snapshot=true`) fan out pre-ack; proxy-cache fills (sidecar `snapshot` absent/false) replicate too but **asynchronously** — a post-serve `_repl/` note the sweep drains, healed by the reconcile diff — so any bucket serves the whole corpus, cached bytes included. No exceptions: a demotion loser *leaves* this tree rather than sitting in it unreplicated — its `.mirror-quarantined` fence replicates, its body moves to `_quarantine/`, and the canonical key ends empty everywhere |
 | `_advisories/osv-pypi.zip`, `_advisories/quarantined.json`, `_transparency/chain/` | singleton-replicated | yes — leader-authored control records written write-through to every healthy bucket + reseed-if-absent; the chain is written through so a failover continues the seq rather than restarting genesis, and `verify-chain` walks every bucket |
 | `_counters/day/` | replicated-rollup | yes — leader-authored, immutable day-rollups reseeded copy-if-absent to every bucket, so a failover keeps the /audit ranking and /stats history |
-| `_counters/seg/` | declared-loss | no — the current day's un-rolled-up live tallies; a failover loses at most one day, the one totality exemption, annotated with its bound |
-| `simple/`, `_advisories/report.json`, `_state/`, `_sync/cursors.json`, `_quarantine/` | derived-per-bucket | no — each bucket rebuilds/re-derives its own from the truth it holds |
+| `_counters/seg/`, `_quarantine/` | declared-loss | no — two bounded, annotated losses. `_counters/seg/`: the current day's un-rolled-up live tallies, at most one day. `_quarantine/`: the losing byte-sets of freezes and demotions resolved on that bucket — never a byte the fleet serves, never the winner, and always announced by a fence (`.frozen` + tombstone, or `.mirror-quarantined`) that *does* replicate. Calling the quarantine tree "derived" was the comfortable lie: a preserved loser is not recomputable from anything |
+| `simple/`, `_advisories/report.json`, `_state/`, `_sync/cursors.json` | derived-per-bucket | no — each bucket rebuilds/re-derives its own from the truth it holds |
 | `_leader/lease.json`, `_repl/`, `_topology/stamp.json`, `_staging/`, `_dirty/` | coordination-per-bucket | no — bucket-local by design; replicating it would be wrong |
 
 `_format/stamp.json` is the one top-level prefix deliberately not yet in the
@@ -643,9 +729,10 @@ the current day's live segments are the one declared-loss window.
 artifact files — metadata companions, tombstones, freeze markers, and dotfiles
 are excluded by suffix/prefix. A tombstone or freeze marker suppresses its base
 filename from indexes and direct server reads even while the canonical record
-remains occupied. A mirror-quarantine marker does the same until an adjacent
-private sidecar proves the demotion replaced the mirror loser, at which point the
-stale marker is inert.
+remains occupied. A mirror-quarantine marker suppresses the same way; once its
+demotion settles the canonical key is empty, so the only time it stands beside a
+live record is the moment a private supersede is landing one — and that supersede
+clears the marker as its last step.
 
 **Storage-format bump policy (`_format/stamp.json`).** The whole tree is at a
 single format number; today that number is 1 and no stamp is written (absent ==
@@ -758,10 +845,16 @@ The nonce prevents an etag ABA when disk etags are content hashes. Legacy
 plaintext claims still parse. The mirror→private demotion is a direct per-artifact
 CAS on the copy path — no staged manifest, no promotion barrier: drive `.origin`
 to private, move each mirror body to `_quarantine/` behind a `.mirror-quarantined`
-marker, then copy the private record over. Mirror writers put their create-only
+marker, then copy the private record over. The demotion settles on its own when no
+private record follows: the marker is the terminal state, not a step toward one.
+Mirror writers put their create-only
 sidecar before the artifact and re-check that exact claim immediately before
 publish, so a slow download that straddles demotion either aborts or leaves a
-typed mirror loser for later quarantine.
+typed mirror loser for later quarantine — which the next audit pass moves aside
+idempotently, under its own content hash, without disturbing the first loser.
+The claim, not the occupancy of the canonical key, is what fences that writer:
+private is terminal and never-deleted, and a mirror upload cannot survive the
+post-publish claim re-check under it.
 
 Request failures never release a claim. The leader audit may reclaim an empty
 mirror claim only after two identical observations separated by the intent
@@ -780,7 +873,10 @@ just resurrect from a peer copy on the next reconcile, while a fleet-wide *mirro
 tombstone would permanently bar a re-fillable filename — the opposite of a cache's
 contract. So a cache leaves the fleet only by demotion-quarantine (a private
 upload of the same name supersedes it, the existing per-artifact path) or by
-`origin release` (every bucket reachable and empty). There is deliberately no
+`origin release` (every bucket reachable and empty). Demotion-quarantine really is
+fleet-wide now: the settle verdict drives *every* bucket to drop the canonical
+record, so there is no peer copy left to resurrect from — and the marker it
+leaves behind is what makes `origin release` refuse the demoted name. There is deliberately no
 per-file multi-bucket cache purge; a fail-closed "purge across all reachable
 buckets" operation, the same shape as `origin release`, is a parked follow-up
 (`private/ROADMAP.md`).

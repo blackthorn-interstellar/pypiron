@@ -120,24 +120,49 @@ jobs:
   # Measured 2026-07-26, BEFORE the demotion fence replicated (91,560 seeds,
   # 230M interleavings): 291 failing seeds = 0.318% per seed, 98.6% of them one
   # unconverged `.mirror-quarantined` marker. Re-measured on the same profile
-  # after that fix: 2 of 65,473 = 0.003%, zero CONVERGENCE, zero DURABILITY,
-  # both survivors FREEZE_UNJUSTIFIED. The lane stays non-blocking until that
-  # reaches zero — the rate is now low enough that a 50,000-seed draw reds
-  # roughly four times in five, which is still a nightly nobody would read.
+  # after that fix: 8 of 63,581 = 0.013%, zero CONVERGENCE, zero DURABILITY —
+  # 4 FREEZE_UNJUSTIFIED and 4 CONSERVATION. The freeze-justification half is
+  # closed (the oracle could not see the evidence; see below): the SAME 63,581
+  # seeds now red 4 = 0.006%, and the four that went are exactly the four
+  # FREEZE_UNJUSTIFIED. Widened to 183,230 partitioned seeds: zero
+  # FREEZE_UNJUSTIFIED, 6 CONSERVATION, 1 DURABILITY. Compare ranges, not time
+  # budgets — the seed rate swings with machine load, so two `--max-secs` runs
+  # explore different ranges. The lane stays non-blocking until that reaches
+  # zero: the rate is low enough that a 50,000-seed draw still reds about one
+  # night in four, which is a nightly nobody would read.
   #
-  # Open root causes, most to least of the volume:
+  # Open root causes:
   #
-  #   1. FREEZE_UNJUSTIFIED residue: a fleet-wide freeze that attested one byte
-  #      set, or none at all. Unadjudicated — product or oracle. It matters more
-  #      than its count: a freeze grants a blanket DURABILITY+CONSERVATION
-  #      exemption, so an unjustified one buys silence for free.
-  #        --seed 9800002480 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100  # 1 byte set
-  #        --seed 9800020745 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100  # 0 byte sets
+  #   1. CONSERVATION residue (6 of 183,230): an acked byte-set gone from every
+  #      bucket under a fleet-wide `.frozen` or `.mirror-quarantined` fence,
+  #      where the fence preserved the OTHER byte-set under `_quarantine/`. Both
+  #      fences promise totality — the loser is moved, never destroyed — so this
+  #      is the same question freeze justification just answered, asked about the
+  #      bytes rather than the conflict. Note the ledger's existing tombstone
+  #      exemption did NOT excuse these: the workload issued no delete for those
+  #      filenames, so the tombstone is the freeze's own. Unadjudicated.
+  #        --seed 5100010907 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100  # freeze arm
+  #        --seed 5100005308 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100  # demotion arm
+  #      Plus 1 DURABILITY in the same 183,230 — an acked record missing on one
+  #      bucket at quiescence, the pre-existing "missing on bucket N" shape.
+  #        --seed 5100065969 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100
   #   2. ACK_TOTALITY residue: a publish acks while a peer holds neither the
   #      record nor a `_repl/` note covering it (dev/DESIGN.md totality
   #      principle). Needs the wide profile; it does not reproduce below
   #      6 packages / 200 ops.
   #        --seed 9300024588 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 200 --fail-percent 0 --partition 100
+  #
+  # CLOSED — FREEZE_UNJUSTIFIED, an ORACLE defect, not a product one. Every one
+  # of these was a REAL byte conflict: two partitioned nodes committed different
+  # bytes under one immutable filename and `decide` correctly froze it. The
+  # oracle attested from acks plus `_quarantine/` copies, and a delete racing
+  # `freeze_side` between its marker and its `get_bytes` erases both — on both
+  # sides, which leaves a correct fleet-wide freeze with no body-shaped evidence
+  # anywhere. `SimStorage` now remembers the sha256 of every body ever committed
+  # under a canonical artifact key, which a delete cannot erase, and the two
+  # minimized reproducers are pinned as a gate in ci.yml:
+  #     --seed 9800020745 ... --partition 100  # both byte-sets erased
+  #     --seed 9800002480 ... --partition 100  # one erased
   #
   # When the failing-seed count reaches zero, delete `continue-on-error` and
   # fold this into the matrix above as an ordinary row.

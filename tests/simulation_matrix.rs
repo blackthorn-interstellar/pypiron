@@ -149,10 +149,13 @@ fn no_nightly_row_mixes_rotation_with_a_workload_flag() {
 }
 
 /// The partitioned lane is real coverage that does not pass yet — but it is
-/// close now: at `--partition 100` it fails 0.003% of seeds (2 of 65,473,
+/// close now: at `--partition 100` it fails 0.006% of seeds (4 of 63,581,
 /// measured 2026-07-26), down from 0.32% once the `.mirror-quarantined` fence
-/// started replicating. Both survivors are FREEZE_UNJUSTIFIED, a pre-existing
-/// class with nothing to do with partitioning. It is in the nightly because at
+/// started replicating and from 0.013% once freeze justification stopped
+/// false-faulting. The survivors are CONSERVATION — an acked byte-set gone from
+/// every bucket under a fence that preserved the other one — plus one
+/// DURABILITY in a wider 183,230-seed draw; both pre-existing classes with
+/// nothing to do with partitioning. It is in the nightly because at
 /// `--partition 0` the merge algebra never executes — every verdict beyond the
 /// trivial ones reads `[never presented]` — so without it the aligned rows
 /// prove their invariants only about a fleet whose buckets never disagree.
@@ -172,10 +175,10 @@ fn the_partitioned_lane_is_non_blocking_and_the_gated_matrix_is_not() {
     );
     assert!(
         job_lines("vopr-partitioned:").any(|line| line.trim() == "continue-on-error: true"),
-        "the partitioned lane lost continue-on-error. It still fails ~0.003% of \
-         seeds (FREEZE_UNJUSTIFIED, pre-existing and not partition-specific); \
-         gating it makes the nightly red on a rate nobody has driven to zero \
-         yet. Remove this assertion only together with the failures."
+        "the partitioned lane lost continue-on-error. It still fails ~0.006% of \
+         seeds (CONSERVATION and DURABILITY, both pre-existing and neither \
+         partition-specific); gating it makes the nightly red on a rate nobody \
+         has driven to zero yet. Remove this assertion only with the failures."
     );
 }
 

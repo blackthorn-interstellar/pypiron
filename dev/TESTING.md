@@ -490,6 +490,12 @@ written. A stale row is worse than a deleted one: it reads as measurement.
 > unconverged `.mirror-quarantined` marker, and both read zero over 65,473 fresh
 > partitioned seeds after the fix. The rows are kept as the measurement that
 > motivated the adjudication in dev/DESIGN.md, not as a live defect list.
+>
+> `FREEZE_UNJUSTIFIED` is **closed too**, and it was the oracle, not the
+> product: 4 of 63,581 seeds, every one a real byte conflict correctly frozen
+> whose evidence a racing delete had erased. See *Attesting a freeze* below.
+> What is left on this lane is `CONSERVATION` — the same 4 — plus one
+> `DURABILITY` that only a wider 183,230-seed draw reaches.
 
 
 Measured over the three partitioned lanes above (166,409 seeds). Rates are the
@@ -527,19 +533,59 @@ really stored under that filename (a real conflict, correctly frozen) and an
 authorized delete for it; not one had a freeze that preserved nothing. Nothing
 at quiescence distinguishes a delete's tombstone from the freeze's own, so the
 ledger now records the deletes the workload authorized — acked, or dead in
-flight; a refused 404 withdraws its own — and both oracles read it:
-CONSERVATION's tombstone exemption survives a freeze on such a filename, and
-FREEZE_JUSTIFIED excuses a short attestation there *provided the freeze
-preserved something*. A freeze that quarantined nothing is never excused, which
-is what keeps `--break freeze-unjustified` red — dropping that clause makes the
-kill proof pass, which is how it was checked. Repros, all `--nodes 3 --buckets
-2 --packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100`: seeds
-6000, 9024, 12144, 14623 (freeze justification) and 8226, 9714, 25704
-(conservation), red before the change and green after — all seven re-verified
-green at `783d423`. `FREEZE_JUSTIFIED` still executes on 23% of seeds there,
-down from 30%. It did **not** take the whole class: the residue row above
-(seed 9539662) is a freeze with an empty `_quarantine/` that the ledger does not
-excuse, which is the shape that was always meant to stay fatal.
+flight; a refused 404 withdraws its own — and CONSERVATION's tombstone exemption
+survives a freeze on such a filename. Repros, all `--nodes 3 --buckets 2
+--packages 6 --files 2 --ops 160 --fail-percent 0 --partition 100`: seeds 6000,
+9024, 12144, 14623 (freeze justification) and 8226, 9714, 25704 (conservation),
+red before the change and green after — all seven re-verified green at
+`783d423`. FREEZE_JUSTIFIED took the same ledger and got a second clause,
+"excused only if the freeze preserved *something*", which was wrong; the next
+section is how that was settled.
+
+**Attesting a freeze.** The clause above left a residue nobody could adjudicate
+— fleet-wide `.frozen`, one byte-set attested or none at all — and it was the
+oracle. Instrumenting the two minimized reproducers settles it outright: in both,
+`decide` returned `Verdict::Freeze` from two genuinely different sidecar
+sha256 (`f549487e…` vs `7c8c26f3…`) under one immutable filename, and every
+`freeze_side` call that followed found the canonical key already empty. That is
+a real byte conflict, correctly frozen. What went missing was the *evidence*,
+and both of the things the oracle attested from are erasable:
+
+- an ack — a publish can crash after `store_artifact_verified` succeeds and
+  before its `200`, so real conflicting bytes exist that nothing acked;
+- a `_quarantine/` copy — an authorized delete racing `freeze_side` between its
+  marker and its `get_bytes` destroys the body first. When the delete wins that
+  race on *both* sides, a correct fleet-wide freeze has no body-shaped evidence
+  anywhere, which is exactly the "0 byte-sets" shape.
+
+The product is right and must not change. `.frozen` deliberately names a
+filename and never a hash (dev/DESIGN.md): it replicates as truth, so a marker
+carrying per-bucket digests would diverge and never converge — and a symmetric
+*pair* is no better, since three buckets can freeze two different pairs
+concurrently under `put_if_absent` and stay split forever. Declining to write
+the marker over an already-tombstoned filename is worse still: it starves
+`decide`'s `a.frozen == b.frozen` convergence condition.
+
+So the simulator remembers instead. `SimStorage` records the sha256 of every
+body ever committed under a canonical `packages/<pkg>/<artifact>` key —
+insert-only, so a delete cannot erase it — and FREEZE_JUSTIFIED attests from
+acks ∪ every `_quarantine/` copy ∪ that history, all reduced to digests. It is
+not a loosening: the product cannot manufacture a digest it never wrote, and
+`--break freeze-unjustified` (a bare `.frozen` planted over a filename that only
+ever held one byte-set, single-bucket, where a byte conflict cannot occur at
+all) stays red. Measured over one identical partitioned range — 63,581 seeds
+from 5100000000, the same profile the nightly lane runs: 8 failing seeds before,
+4 after, and the 4 that went are exactly the FREEZE_UNJUSTIFIED ones (the other
+4 are `CONSERVATION`, untouched by this and red the same way both times).
+Widened to 183,230 partitioned seeds it produces **zero** FREEZE_UNJUSTIFIED;
+the residue there is 6 `CONSERVATION` and 1 `DURABILITY`.
+Compare ranges, never time budgets: this box's seed rate swings better than 1.5x
+with load, so a `--max-secs` draw explores a different range each run and its
+failing-seed *count* is not comparable to another run's. The two reproducers are
+pinned as a gate in
+`ci.yml` — `--seed 9800020745` (both byte-sets erased) and `--seed 9800002480`
+(one erased), both `--nodes 2 --buckets 2 --packages 1 --files 1 --ops 16
+--fail-percent 0 --partition 100`.
 
 Determinism itself is verified, not assumed: recurring seeds (`--recheck-every`)
 run twice and must produce an identical storage-op trace hash *and* an identical
@@ -913,7 +959,7 @@ table below are the accurate ones.
 | VISIBILITY | workload-reachable | ditto, for the listing | `visibility` |
 | CONSERVATION (acked bytes survive) | workload-reachable | ditto, fleet-wide | `conserve` |
 | CONSERVATION (a freeze loses neither body) | workload-reachable **only partitioned** — and *observed* there, still red today | a freeze needs a real byte conflict to fire at all; live at `783d423`, `--seed 9522193 --fail-percent 3` | `freeze-lossy` |
-| FREEZE_JUSTIFIED | workload-reachable **only partitioned** — and *observed* there, still red today | ditto; live at `783d423`, `--seed 9539662 --fail-percent 0` | `freeze-unjustified` |
+| FREEZE_JUSTIFIED | workload-reachable **only partitioned** — and *observed* there; green now | ditto. It red on 4 of 63,581 partitioned seeds and every one was a correct freeze whose evidence a racing delete had erased (see *Attesting a freeze*); 0 of the same 63,581 — and 0 of 183,230 — once the attestation could see the bodies the buckets actually committed | `freeze-unjustified` |
 | ORIGIN_TERMINALITY (the `.origin` claim) | workload-reachable, never witnessed | needs a mirror claim to win over a private one on some bucket after the private ack | `origin-demoted` |
 | ORIGIN_TERMINALITY (the record under it) | workload-reachable, never witnessed | needs a live mirror sidecar left renderable under a private claim | `mirror-served` |
 | CONVERGENCE | workload-reachable | needs ≥2 buckets; the replication paths that could break it run on every multi-bucket seed | `diverge` |

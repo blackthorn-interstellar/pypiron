@@ -118,6 +118,18 @@ jobs:
           cargo run --example vopr -- --seed 19900 --nodes 3 --buckets 1 --ops 80 --fail-percent 3
           cargo run --example vopr -- --seed 19026 --nodes 2 --buckets 1 --ops 160 --fail-percent 3
           cargo run --example vopr -- --seed 47843 --nodes 2 --buckets 2 --ops 120 --fail-percent 3
+          # Freeze justification, both shapes. Two partitioned nodes commit
+          # different bytes under one filename, the merge correctly freezes it,
+          # and a delete racing `freeze_side` destroys the bodies before either
+          # `_quarantine/` copy is taken — so the freeze is real and every
+          # body-shaped trace of it is gone. 9800020745 loses both byte-sets
+          # (nothing attested at all); 9800002480 loses one. These are the only
+          # partitioned seeds pinned as a gate: they are the minimum reproducers
+          # for the whole class, they run in milliseconds, and the simulator is
+          # deterministic, so a re-broken oracle reds here rather than waiting
+          # for a nightly.
+          cargo run --example vopr -- --seed 9800020745 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100
+          cargo run --example vopr -- --seed 9800002480 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100
       # Mutation-testing the oracles themselves. Each `--break` is ONE deliberate
       # defect the named invariant exists to catch, so the run MUST fail with
       # that invariant's text — an invariant nobody has watched go red is an

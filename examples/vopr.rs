@@ -93,6 +93,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use pypiron::buckets::{BucketHandle, BucketSet, Pinned};
+use pypiron::hash::sha256_hex;
 use pypiron::replicate::{Record, Verdict};
 use pypiron::sim::{SimClock, SimStorage};
 use pypiron::storage::{FileEntry, ObjectMeta, Storage};
@@ -969,6 +970,40 @@ const REACH_METER: [(&str, &str); REACH_SLOTS] = [
     ),
 ];
 
+/// The violation prefix each reach slot's oracle pushes, in `R`'s declaration
+/// order — the only join between "this oracle ran" and "this oracle went red",
+/// because violations are plain strings that name themselves and nothing else.
+/// Empty where a slot owns no violation string: DETERMINISM is decided in
+/// `main`, MERGE_DIVERGENCE is a statistic, and the ten classifier slots are
+/// tests inside one oracle whose verdicts surface as `AUDIT_*` strings that name
+/// a class, not a test. Read by `--trace-jsonl` only.
+const REACH_VIOLATION_PREFIX: [&str; REACH_SLOTS] = [
+    "DURABILITY",
+    "VISIBILITY",
+    "CONSERVATION",
+    "CONVERGENCE",
+    "LIVENESS",
+    "VERIFY",
+    "ACK_TOTALITY",
+    "TOMBSTONE_MONOTONICITY",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    // The oracle is FREEZE_JUSTIFIED; the string it pushes is the negation.
+    "FREEZE_UNJUSTIFIED",
+    "ORIGIN_TERMINALITY",
+    "SELF_CONSISTENCY",
+];
+
 /// Zeros that are a known property of the harness or the product, not a hole.
 /// `--require-reach` skips exactly these; every other oracle must execute. An
 /// entry here is a claim someone has to defend in dev/TESTING.md — and if one
@@ -1401,18 +1436,33 @@ fn record_from_dump(dump: &BTreeMap<String, Vec<u8>>, pkg: &str, fname: &str) ->
 
 /// Run every bucket pair x filename through the real merge decision and tally
 /// the verdicts this world would produce.
-fn sample_verdicts(dumps: &[BTreeMap<String, Vec<u8>>]) {
+fn sample_verdicts(dumps: &[BTreeMap<String, Vec<u8>>], viz: Option<&Arc<Trace>>) {
     if dumps.len() < 2 {
         return;
     }
     for (pkg, fname) in record_names(dumps) {
         for (i, a) in dumps.iter().enumerate() {
-            for b in dumps.iter().skip(i + 1) {
+            for (j, b) in dumps.iter().enumerate().skip(i + 1) {
                 let verdict = pypiron::replicate::decide(
                     &record_from_dump(a, &pkg, &fname),
                     &record_from_dump(b, &pkg, &fname),
                 );
-                MERGE.verdicts[verdict_slot(&verdict)].fetch_add(1, Ordering::Relaxed);
+                let slot = verdict_slot(&verdict);
+                MERGE.verdicts[slot].fetch_add(1, Ordering::Relaxed);
+                // `Noop` is most of the sample and says nothing; the timeline
+                // shows only the verdicts a merge would actually apply.
+                if let (Some(viz), true) = (viz, slot != 0) {
+                    viz.emit(
+                        "decide",
+                        serde_json::json!({
+                            "pkg": pkg,
+                            "file": fname,
+                            "a": i,
+                            "b": j,
+                            "verdict": VERDICT_LABELS.get(slot).copied().unwrap_or("?"),
+                        }),
+                    );
+                }
             }
         }
     }
@@ -1794,6 +1844,9 @@ struct FaultPlan {
     obs: Observer,
     /// The selected deliberate defect, `Break::None` in every ordinary run.
     brk: Break,
+    /// Visualizer side channel, `None` unless `--trace-jsonl` was passed. Pure
+    /// observation — see [`Trace`].
+    viz: Option<Arc<Trace>>,
 }
 
 struct TraceHasher {
@@ -1821,8 +1874,265 @@ impl TraceHasher {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The visualizer side channel (`--trace-jsonl`, dev/scripts/viz).
+// ---------------------------------------------------------------------------
+
+/// Ceiling on buffered events. A traced profile is ONE seed of 8-200 ops, which
+/// is a few thousand events; this exists only so a mistake cannot eat the
+/// machine. Past it events are dropped and `summary.truncated` says so.
+const VIZ_CAP: u64 = 2_000_000;
+
+/// JSONL timeline of one seed's run, for the run visualizer.
+///
+/// Non-perturbing by construction, on the same terms as the reach meter and the
+/// `Observer`: every field is data the run already computed, buffered in memory
+/// and written once at the end. No rng draw, no op-sequence number consumed, no
+/// `TraceHasher::record` call, no `.await`, no `FaultView` — every world
+/// snapshot reads the raw `SimStorage::dump()`. `main` flushes it explicitly,
+/// because `main` leaves through `std::process::exit` and no `Drop` runs.
+///
+/// One mutex holds everything mutable. It is a leaf lock: taken and released
+/// inside one method, never held across the rng stream, the trace hasher, the
+/// crash map, the observer, the ledger — or an await.
+struct Trace {
+    path: String,
+    /// The exact command line that produced this file.
+    cmd: String,
+    commit: String,
+    inner: Mutex<TraceInner>,
+}
+
+struct TraceInner {
+    lines: Vec<String>,
+    /// Next event index. Strictly sequential, no gaps — the player's contract.
+    next: u64,
+    truncated: bool,
+    /// Set once at the top of `run_seed`; the source of every `sim` stamp. The
+    /// `Arc` outlives the run, so events `main` emits afterwards carry the sim
+    /// time the run ended at rather than a wall clock nobody asked for.
+    clock: Option<Arc<SimClock>>,
+    /// Last emitted `"<len>:<sha8>"` map per bucket, so a `world` event carries
+    /// only the keys that moved.
+    world: Vec<BTreeMap<String, String>>,
+    /// Nodes already reported down, so only the FIRST op to admit with
+    /// `OpFate::Crash` — the one that flipped the flag — gets a `crash` tick.
+    down: std::collections::BTreeSet<usize>,
+}
+
+impl Trace {
+    fn new(path: String) -> Arc<Trace> {
+        // Recorded once, in `main`, before any run: a subprocess here cannot
+        // reach the simulated world.
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        let commit = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|sha| !sha.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        Arc::new(Trace {
+            path,
+            cmd: format!("cargo run --release --example vopr -- {}", argv.join(" ")),
+            commit,
+            inner: Mutex::new(TraceInner {
+                lines: Vec::new(),
+                next: 0,
+                truncated: false,
+                clock: None,
+                world: Vec::new(),
+                down: std::collections::BTreeSet::new(),
+            }),
+        })
+    }
+
+    /// Adopt the run's virtual clock. Called once, at the top of `run_seed`.
+    fn attach(&self, clock: &Arc<SimClock>) {
+        self.inner.lock().expect("viz lock").clock = Some(clock.clone());
+    }
+
+    fn emit(&self, t: &str, body: serde_json::Value) {
+        let mut inner = self.inner.lock().expect("viz lock");
+        Self::push(&mut inner, t, body);
+    }
+
+    /// Stamp the universal envelope (`t`/`i`/`sim`/`ts`) onto one event body.
+    /// `ts` is always null: this producer has virtual time only.
+    fn push(inner: &mut TraceInner, t: &str, body: serde_json::Value) {
+        if inner.next >= VIZ_CAP {
+            inner.truncated = true;
+            return;
+        }
+        let sim = inner.clock.as_ref().map(|c| c.now_rfc3339());
+        let mut obj = serde_json::Map::new();
+        obj.insert("t".into(), serde_json::Value::from(t));
+        obj.insert("i".into(), serde_json::Value::from(inner.next));
+        obj.insert(
+            "sim".into(),
+            sim.map_or(serde_json::Value::Null, serde_json::Value::from),
+        );
+        obj.insert("ts".into(), serde_json::Value::Null);
+        if let serde_json::Value::Object(fields) = body {
+            obj.extend(fields);
+        }
+        if let Ok(line) = serde_json::to_string(&serde_json::Value::Object(obj)) {
+            inner.lines.push(line);
+            inner.next += 1;
+        }
+    }
+
+    /// One storage op admitted through `FaultView::gate`. A `Crash` fate is also
+    /// the node's death when this is the first op to see it down — `admit`
+    /// short-circuits every later op on a crashed node to the same fate — so the
+    /// transition gets its own `crash` tick for the timeline.
+    #[allow(clippy::too_many_arguments)]
+    fn op(
+        &self,
+        node: usize,
+        bucket: usize,
+        verb: &str,
+        key: &str,
+        seq: u64,
+        fate: OpFate,
+        delay: std::time::Duration,
+        blackholed: bool,
+    ) {
+        let mut inner = self.inner.lock().expect("viz lock");
+        Self::push(
+            &mut inner,
+            "op",
+            serde_json::json!({
+                "node": node,
+                "bucket": bucket,
+                "verb": verb,
+                "key": key,
+                "seq": seq,
+                "fate": match fate {
+                    OpFate::Ok => "ok",
+                    OpFate::Fail => "fail",
+                    OpFate::Crash => "crash",
+                },
+                "delay_ns": u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX),
+                "blackholed": blackholed,
+            }),
+        );
+        if matches!(fate, OpFate::Crash) && inner.down.insert(node) {
+            Self::push(
+                &mut inner,
+                "crash",
+                serde_json::json!({ "node": node, "reason": "scheduled" }),
+            );
+        }
+    }
+
+    /// A node came back: the next `OpFate::Crash` on it is a new death.
+    fn restart(&self, node: usize, phase: &'static str) {
+        let mut inner = self.inner.lock().expect("viz lock");
+        inner.down.remove(&node);
+        Self::push(
+            &mut inner,
+            "restart",
+            serde_json::json!({ "node": node, "phase": phase }),
+        );
+    }
+
+    /// The only source of bucket state: one event per bucket whose contents
+    /// moved since the last snapshot. `full` replaces the reader's map outright
+    /// (the empty baseline); otherwise the event carries a delta. Values are
+    /// `"<len>:<sha8>"` — the length alone cannot tell the byte-identity story
+    /// that same-length corruption and cross-bucket convergence both turn on.
+    fn world(&self, dumps: &[BTreeMap<String, Vec<u8>>], full: bool) {
+        let mut inner = self.inner.lock().expect("viz lock");
+        if inner.world.len() < dumps.len() {
+            inner.world.resize(dumps.len(), BTreeMap::new());
+        }
+        for (b, dump) in dumps.iter().enumerate() {
+            let now: BTreeMap<String, String> = dump
+                .iter()
+                .map(|(key, bytes)| {
+                    let sha = sha256_hex(bytes);
+                    (
+                        key.clone(),
+                        format!("{}:{}", bytes.len(), sha.get(..8).unwrap_or(&sha)),
+                    )
+                })
+                .collect();
+            let mut put = serde_json::Map::new();
+            for (key, value) in &now {
+                if inner.world[b].get(key) != Some(value) {
+                    put.insert(key.clone(), serde_json::Value::from(value.clone()));
+                }
+            }
+            let del: Vec<String> = inner.world[b]
+                .keys()
+                .filter(|key| !now.contains_key(*key))
+                .cloned()
+                .collect();
+            if !full && put.is_empty() && del.is_empty() {
+                continue;
+            }
+            Self::push(
+                &mut inner,
+                "world",
+                serde_json::json!({
+                    "b": b,
+                    "full": full,
+                    "put": serde_json::Value::Object(put),
+                    "del": del,
+                }),
+            );
+            inner.world[b] = now;
+        }
+    }
+
+    /// `(events_emitted, truncated)` for the `summary` line.
+    fn stats(&self) -> (u64, bool) {
+        let inner = self.inner.lock().expect("viz lock");
+        (inner.next, inner.truncated)
+    }
+
+    fn flush(&self) {
+        let inner = self.inner.lock().expect("viz lock");
+        let mut out = inner.lines.join("\n");
+        out.push('\n');
+        if let Err(e) = std::fs::write(&self.path, out) {
+            eprintln!("vopr: could not write --trace-jsonl {}: {e}", self.path);
+        }
+    }
+}
+
+/// Advance virtual time and label the jump for the visualizer. One call per
+/// reason the driver has to move the clock.
+fn advance_clock(clock: &SimClock, secs: u64, why: &'static str, viz: &Option<Arc<Trace>>) {
+    clock.advance(std::time::Duration::from_secs(secs));
+    if let Some(viz) = viz {
+        viz.emit(
+            "clock",
+            serde_json::json!({ "by_secs": secs, "to": clock.now_rfc3339(), "why": why }),
+        );
+    }
+}
+
+/// Snapshot the raw buckets into a `world` event. Dumps nothing when the flag
+/// is off, so the default path is untouched.
+fn viz_world(viz: &Option<Arc<Trace>>, buckets: &[Arc<SimStorage>], full: bool) {
+    if let Some(viz) = viz {
+        let dumps: Vec<BTreeMap<String, Vec<u8>>> =
+            buckets.iter().map(|bucket| bucket.dump()).collect();
+        viz.world(&dumps, full);
+    }
+}
+
 impl FaultPlan {
-    fn new(seed: u64, nodes: usize, fail_percent: u64, brk: Break) -> Arc<Self> {
+    fn new(
+        seed: u64,
+        nodes: usize,
+        fail_percent: u64,
+        brk: Break,
+        viz: Option<Arc<Trace>>,
+    ) -> Arc<Self> {
         Arc::new(FaultPlan {
             op_seq: AtomicU64::new(0),
             fail_percent,
@@ -1837,6 +2147,7 @@ impl FaultPlan {
             }),
             obs: Observer::default(),
             brk,
+            viz,
         })
     }
 
@@ -1852,6 +2163,13 @@ impl FaultPlan {
             .lock()
             .expect("crash lock")
             .insert(at | ((node as u64) << 56), ());
+        // The crash map's guard is already dropped: no two locks held at once.
+        if let Some(viz) = &self.viz {
+            viz.emit(
+                "crash_sched",
+                serde_json::json!({ "node": node, "at_seq": at, "within": within_ops }),
+            );
+        }
     }
 
     fn restart(&self, node: usize) {
@@ -1864,14 +2182,20 @@ impl FaultPlan {
         self.crashed[node].load(Ordering::SeqCst)
     }
 
-    /// Decide this op's fate and unique virtual latency.
+    /// Decide this op's fate, unique virtual latency, and op-sequence number.
+    ///
+    /// The `seq` in the tuple is the value already hashed below; it is returned
+    /// only so `gate` can label the visualizer's event without a second read of
+    /// `op_seq`. Nothing else in this function may change: what it feeds
+    /// `TraceHasher::record`, in what order, and how much entropy it draws are
+    /// what every pinned seed in the corpus means.
     fn admit(
         &self,
         node: usize,
         bucket: usize,
         op: &str,
         key: &str,
-    ) -> (OpFate, std::time::Duration) {
+    ) -> (OpFate, std::time::Duration, u64) {
         let seq = self.op_seq.fetch_add(1, Ordering::SeqCst);
         let jitter = {
             let mut rng = self.rng_stream.lock().expect("rng lock");
@@ -1886,10 +2210,10 @@ impl FaultPlan {
             &seq.to_string(),
         ]);
         if self.node_crashed(node) {
-            return (OpFate::Crash, delay);
+            return (OpFate::Crash, delay, seq);
         }
         if self.healing.load(Ordering::SeqCst) {
-            return (OpFate::Ok, delay);
+            return (OpFate::Ok, delay, seq);
         }
         let crash_due = {
             let mut pending = self.crash_at.lock().expect("crash lock");
@@ -1905,16 +2229,16 @@ impl FaultPlan {
         };
         if crash_due {
             self.crashed[node].store(true, Ordering::SeqCst);
-            return (OpFate::Crash, delay);
+            return (OpFate::Crash, delay, seq);
         }
         let fail = {
             let mut rng = self.rng_stream.lock().expect("rng lock");
             rng.chance(self.fail_percent)
         };
         if fail {
-            (OpFate::Fail, delay)
+            (OpFate::Fail, delay, seq)
         } else {
-            (OpFate::Ok, delay)
+            (OpFate::Ok, delay, seq)
         }
     }
 
@@ -1952,7 +2276,24 @@ impl FaultView {
     }
 
     async fn gate(&self, op: &'static str, key: &str) -> Result<()> {
-        let (fate, delay) = self.plan.admit(self.node, self.bucket, op, key);
+        let (fate, delay, seq) = self.plan.admit(self.node, self.bucket, op, key);
+        // Recorded here rather than in `admit`: this is where the fate, the
+        // latency and the blackhole decision below all coexist, synchronously,
+        // before the first await. Pure observation — no rng, no op-sequence
+        // number, no `TraceHasher::record`.
+        if let Some(viz) = &self.plan.viz {
+            let blackholed = matches!(fate, OpFate::Ok) && self.bucket == 1 && self.fanout_break();
+            viz.op(
+                self.node,
+                self.bucket,
+                op,
+                key,
+                seq,
+                fate,
+                delay,
+                blackholed,
+            );
+        }
         tokio::time::sleep(delay).await;
         match fate {
             OpFate::Ok if self.bucket == 1 && self.fanout_break() => Err(anyhow!(
@@ -1999,6 +2340,12 @@ impl Storage for FaultView {
             self.gate("put", key).await?;
         }
         if key.starts_with("_repl/1/") && self.fanout_break() {
+            if let Some(viz) = &self.plan.viz {
+                viz.emit(
+                    "drop",
+                    serde_json::json!({ "node": self.node, "bucket": self.bucket, "key": key }),
+                );
+            }
             return Ok(()); // the note owing the blackholed peer is dropped
         }
         let body = self.global_body(key, &bytes);
@@ -2347,8 +2694,9 @@ impl Fleet {
         fail_percent: u64,
         brk: Break,
         clock: Arc<SimClock>,
+        viz: Option<Arc<Trace>>,
     ) -> Fleet {
-        let plan = FaultPlan::new(seed, nodes, fail_percent, brk);
+        let plan = FaultPlan::new(seed, nodes, fail_percent, brk, viz);
         let buckets: Vec<Arc<SimStorage>> = (0..bucket_count)
             .map(|_| SimStorage::new(clock.clone()))
             .collect();
@@ -2385,6 +2733,12 @@ impl Fleet {
     }
 
     fn crash_node(&mut self, node: usize) {
+        if let Some(viz) = &self.plan.viz {
+            viz.emit(
+                "crash",
+                serde_json::json!({ "node": node, "reason": "driver" }),
+            );
+        }
         // The plan already (or will) park the node's ops; abort everything it
         // had in flight — in-memory state dies with the process.
         for task in self.nodes[node].tasks.drain(..) {
@@ -2392,12 +2746,15 @@ impl Fleet {
         }
     }
 
-    fn restart_node(&mut self, node: usize) {
+    fn restart_node(&mut self, node: usize, phase: &'static str) {
         self.crash_node(node);
         self.plan.restart(node);
         // Cold caches: a fresh AppState over the same buckets.
         let plan = self.plan.clone();
         self.nodes[node].state = build_node_state(&self.buckets, node, &plan);
+        if let Some(viz) = &self.plan.viz {
+            viz.restart(node, phase);
+        }
     }
 }
 
@@ -2580,6 +2937,7 @@ async fn op_publish(
     variant: u8,
     home: usize,
     is_mirror: bool,
+    viz: Option<Arc<Trace>>,
 ) {
     use sha2::digest::Digest;
     let body = body_bytes(&pkg, file, variant);
@@ -2590,6 +2948,7 @@ async fn op_publish(
         hasher.update(&body);
         format!("{:x}", hasher.finalize())
     };
+    let sha8 = sha256.get(..8).unwrap_or_default().to_string();
     let req = pypiron::PublishRequest {
         pkg: pkg.clone(),
         filename: fname.clone(),
@@ -2607,6 +2966,23 @@ async fn op_publish(
     };
     let pinned = write_pin(&state, home);
     if pypiron::publish_record(&state, &pinned, req).await.is_ok() {
+        // Before the ledger lock: the visualizer's lock is never held across
+        // another of the run's locks.
+        if let Some(viz) = &viz {
+            viz.emit(
+                "ack",
+                serde_json::json!({
+                    "kind": "publish",
+                    "pkg": pkg,
+                    "file": fname,
+                    "bucket": pinned.index,
+                    "sha8": sha8,
+                    "variant": variant.to_string(),
+                    "mirror": is_mirror,
+                    "ok": true,
+                }),
+            );
+        }
         let mut failures = ack_totality_failures(&buckets, pinned.index, &pkg, &fname);
         let mut ledger = ledger.lock().expect("ledger lock");
         ledger.ack_totality.append(&mut failures);
@@ -2626,6 +3002,7 @@ async fn op_delete(
     pkg: String,
     file: u8,
     home: usize,
+    viz: Option<Arc<Trace>>,
 ) {
     let fname = filename(&pkg, file);
     {
@@ -2641,7 +3018,23 @@ async fn op_delete(
             .or_default() += 1;
     }
     let pinned = write_pin(&state, home);
-    match pypiron::delete_record(&state, &pinned, &pkg, &fname).await {
+    let outcome = pypiron::delete_record(&state, &pinned, &pkg, &fname).await;
+    if let Some(viz) = &viz {
+        viz.emit(
+            "ack",
+            serde_json::json!({
+                "kind": "delete",
+                "pkg": pkg,
+                "file": fname,
+                "bucket": pinned.index,
+                "sha8": serde_json::Value::Null,
+                "variant": serde_json::Value::Null,
+                "mirror": serde_json::Value::Null,
+                "ok": outcome.is_ok(),
+            }),
+        );
+    }
+    match outcome {
         Ok(_) => {
             let mut ledger = ledger.lock().expect("ledger lock");
             ledger.deleted.insert((pkg.clone(), fname.clone()));
@@ -2698,7 +3091,61 @@ struct RunOutcome {
     violations: Vec<String>,
 }
 
-async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
+/// The visualizer's `meta` line: everything about this world that is fixed
+/// before the first op. Emitted from `run_seed` because `partition_for`'s homes
+/// exist nowhere else.
+///
+/// `scenario`/`title`/`narration`/`caveats` are the scenario pack's job
+/// (dev/scripts/viz): the emitter ships the two producer-level caveats it can
+/// prove and invents no narration. `node_regions` is all-null on purpose — the
+/// VOPR has no region concept and a reader must not draw one.
+fn emit_meta(viz: &Arc<Trace>, seed: u64, profile: &Profile, part: &Partition) {
+    let homes: Vec<serde_json::Value> = part
+        .homes
+        .iter()
+        .map(|home| {
+            if profile.partition_percent == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::from(*home)
+            }
+        })
+        .collect();
+    viz.emit(
+        "meta",
+        serde_json::json!({
+            "kind": "trace",
+            "producer": "vopr",
+            "scenario": "",
+            "title": "",
+            "narration": "",
+            "cmd": viz.cmd,
+            "commit": viz.commit,
+            "seed": seed,
+            "nodes": profile.nodes,
+            "buckets": profile.buckets,
+            "packages": profile.packages,
+            "files": profile.files,
+            "ops": profile.ops,
+            "fail_percent": profile.fail_percent,
+            "partition_percent": profile.partition_percent,
+            "partitioned": part.split,
+            "brk": profile.brk.flag().unwrap_or("none"),
+            "bucket_names": (0..profile.buckets)
+                .map(|idx| format!("bucket-{idx}"))
+                .collect::<Vec<_>>(),
+            "node_regions": vec![serde_json::Value::Null; profile.nodes],
+            "homes": homes,
+            "caveats": [
+                "presign_get does not pass through the fault gate, so that op never appears.",
+                "A batch delete records only its first key in the `op` event; the `world` \
+                 delta shows every removal.",
+            ],
+        }),
+    );
+}
+
+async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trace>>) -> RunOutcome {
     let Profile {
         nodes,
         buckets,
@@ -2720,23 +3167,54 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
             .expect("valid sim start");
     let clock = SimClock::new(start);
     let _guard = clock.install_global();
-    let mut fleet = Fleet::new(seed, nodes, buckets, fail_percent, brk, clock.clone());
+    if let Some(viz) = &viz {
+        viz.attach(&clock);
+        emit_meta(viz, seed, &profile, &plan);
+    }
+    let mut fleet = Fleet::new(
+        seed,
+        nodes,
+        buckets,
+        fail_percent,
+        brk,
+        clock.clone(),
+        viz.clone(),
+    );
     let mut rng = Rng::new(seed);
+    // The empty baseline every later `world` delta is applied on top of.
+    viz_world(&viz, &fleet.buckets, true);
+    if let Some(viz) = &viz {
+        viz.emit("phase", serde_json::json!({ "name": "chaos" }));
+    }
 
     // ---- Chaos phase: seed-driven interleaving of ops, faults, and time.
-    for _ in 0..ops {
+    for step in 0..ops {
         let node = rng.below(nodes as u64) as usize;
         if fleet.plan.node_crashed(node) && !rng.chance(30) {
             // A crashed node mostly stays down this step; sometimes restarts.
             continue;
         }
         if fleet.plan.node_crashed(node) {
-            fleet.restart_node(node);
+            fleet.restart_node(node, "chaos");
             continue;
         }
         let state = fleet.nodes[node].state.clone();
         let ledger = fleet.ledger.clone();
-        match pick_op(&weights, weight_total, &mut rng) {
+        // Exactly one `pick_op` call, as before — the draw is the schedule.
+        // A step the two `continue`s above skipped ran no op and emits nothing,
+        // so `step.n` has gaps where the fleet was down. Only `i` is gapless.
+        let class = pick_op(&weights, weight_total, &mut rng);
+        if let Some(viz) = &viz {
+            viz.emit(
+                "step",
+                serde_json::json!({
+                    "n": step,
+                    "op": OP_LABELS.get(class).copied().unwrap_or("?"),
+                    "node": node,
+                }),
+            );
+        }
+        match class {
             0 => {
                 let pkg = PACKAGE_NAMES[rng.below(packages as u64) as usize].to_string();
                 let file = rng.below(u64::from(files)) as u8;
@@ -2748,10 +3226,11 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                 let clock = fleet.clock.clone();
                 let buckets = fleet.buckets.clone();
                 let home = plan.homes[node];
+                let seen = viz.clone();
                 fleet.spawn_on(
                     node,
                     op_publish(
-                        state, ledger, clock, buckets, pkg, file, variant, home, is_mirror,
+                        state, ledger, clock, buckets, pkg, file, variant, home, is_mirror, seen,
                     ),
                 );
             }
@@ -2759,7 +3238,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                 let pkg = PACKAGE_NAMES[rng.below(packages as u64) as usize].to_string();
                 let file = rng.below(u64::from(files)) as u8;
                 let home = plan.homes[node];
-                fleet.spawn_on(node, op_delete(state, ledger, pkg, file, home));
+                fleet.spawn_on(node, op_delete(state, ledger, pkg, file, home, viz.clone()));
             }
             2 => {
                 // The *selected* bucket is still 0 on every node — a
@@ -2781,7 +3260,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
             }
             5 => {
                 // Jump past the intent grace: crashed writers become healable.
-                clock.advance(std::time::Duration::from_secs(90));
+                advance_clock(&clock, 90, "jump", &viz);
             }
             6 => {
                 fleet.plan.schedule_crash_soon(node, 12);
@@ -2793,15 +3272,19 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                 }
             }
             _ => {
-                clock.advance(std::time::Duration::from_secs(1));
+                advance_clock(&clock, 1, "nudge", &viz);
             }
         }
         // Let the paused runtime interleave whatever is in flight.
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        viz_world(&viz, &fleet.buckets, false);
     }
     // The most divergent moment there is: the partition still in force and the
     // faults still on. Raw dumps, so the sample cannot move the schedule.
-    sample_verdicts(&fleet.buckets.iter().map(|b| b.dump()).collect::<Vec<_>>());
+    sample_verdicts(
+        &fleet.buckets.iter().map(|b| b.dump()).collect::<Vec<_>>(),
+        viz.as_ref(),
+    );
 
     // ---- Heal phase: stop faults, restart everyone, then drive the fleet
     // the way production does — worker ticks, note sweeps, warm drains, the
@@ -2811,11 +3294,15 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
     // the audit's fingerprint diff repairs it, so the system-level claim the
     // VOPR checks is "ticks + sweeps + reconcile + audit converge".
     let mut violations_pre: Vec<String> = Vec::new();
+    if let Some(viz) = &viz {
+        viz.emit("phase", serde_json::json!({ "name": "heal" }));
+    }
     fleet.plan.heal();
     for node in 0..nodes {
-        fleet.restart_node(node);
+        fleet.restart_node(node, "heal");
     }
-    clock.advance(std::time::Duration::from_secs(120)); // all intents stale
+    advance_clock(&clock, 120, "heal-start", &viz); // all intents stale
+    viz_world(&viz, &fleet.buckets, false);
     let mut quiesced = false;
     let mut audit_view_repairs: u64 = 0;
     let mut repairs_by_class: [u64; 3] = [0; 3]; // [ordering, premature, race]
@@ -2833,7 +3320,10 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
             .any(|k| k.starts_with("_dirty/") || k.starts_with("_repl/"))
     });
     for round in 0..HEAL_ROUNDS {
-        sample_verdicts(&fleet.buckets.iter().map(|b| b.dump()).collect::<Vec<_>>());
+        sample_verdicts(
+            &fleet.buckets.iter().map(|b| b.dump()).collect::<Vec<_>>(),
+            viz.as_ref(),
+        );
         // Drain markers across every node until none remain (bounded).
         for pass in 0..DRAIN_PASSES {
             for node in 0..nodes {
@@ -2873,10 +3363,21 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
             });
             saw_debris |= markers_left;
             Reach::peak(&REACH.peak_drains, pass + 1);
+            if let Some(viz) = &viz {
+                viz.emit(
+                    "pass",
+                    serde_json::json!({
+                        "round": round,
+                        "n": pass,
+                        "markers_left": markers_left,
+                    }),
+                );
+            }
+            viz_world(&viz, &fleet.buckets, false);
             if !markers_left {
                 break;
             }
-            clock.advance(std::time::Duration::from_secs(90));
+            advance_clock(&clock, 90, "drain", &viz);
         }
         // Which node plays leader this round. Production elects the reconcile
         // and audit leader by bucket lease and re-elects it the moment the
@@ -2892,6 +3393,12 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
         // forces in production. Auditing every node in turn each round would
         // N-times the heal cost for coverage a soak already gets from rotation.
         let leader_idx = (seed.wrapping_add(round) % nodes as u64) as usize;
+        if let Some(viz) = &viz {
+            viz.emit(
+                "round",
+                serde_json::json!({ "n": round, "leader": leader_idx }),
+            );
+        }
         // The lost-copy backstop first: the tree diff converges truth a
         // crashed fan-out left behind and brackets its work in markers...
         let leader = fleet.nodes[leader_idx].state.clone();
@@ -2926,7 +3433,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                             .await;
                     }
                 }
-                clock.advance(std::time::Duration::from_secs(90));
+                advance_clock(&clock, 90, "leader-drain", &viz);
             }
         }
         if brk != Break::None && round == 0 {
@@ -2988,7 +3495,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                 ));
             }
         }
-        clock.advance(std::time::Duration::from_secs(90));
+        advance_clock(&clock, 90, "post-audit", &viz);
         let views_after_audit: Vec<BTreeMap<String, Vec<u8>>> = fleet
             .buckets
             .iter()
@@ -3035,6 +3542,18 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
             let findings = classify_round(&fleet.plan.obs.snapshot(), boundary, &diffs);
             for f in &findings {
                 repairs_by_class[(f.class - 1) as usize] += 1;
+                if let Some(viz) = &viz {
+                    viz.emit(
+                        "repair",
+                        serde_json::json!({
+                            "round": round,
+                            "bucket": f.bucket,
+                            "subject": f.subject,
+                            "class": f.class,
+                            "detail": f.detail,
+                        }),
+                    );
+                }
             }
             // Per-bucket "key before=.. after=.." dump for message context.
             let bucket_dump = |b: usize| -> Vec<String> {
@@ -3134,6 +3653,9 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
         });
         saw_debris |= markers_left;
         Reach::peak(&REACH.peak_rounds, round + 1);
+        if let Some(viz) = &viz {
+            viz.world(&snapshot, false);
+        }
         if !markers_left && last_fingerprint.as_ref() == Some(&snapshot) {
             quiesced = true;
             break;
@@ -3147,6 +3669,9 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
     // ---- Invariants. The ledger stays unlocked until the last await is behind
     // us: `verify_storage` is async, and a std guard may not cross an await.
     let mut violations = violations_pre;
+    if let Some(viz) = &viz {
+        viz.emit("phase", serde_json::json!({ "name": "oracle" }));
+    }
     if !quiesced {
         let leftovers: Vec<String> = fleet
             .buckets
@@ -3178,6 +3703,10 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
     let dumps: Vec<BTreeMap<String, Vec<u8>>> =
         fleet.buckets.iter().map(|bucket| bucket.dump()).collect();
     count_merge_evidence(&dumps);
+    // The exact world every oracle below reads — `apply_break`'s damage included.
+    if let Some(viz) = &viz {
+        viz.world(&dumps, false);
+    }
 
     // VIEWS == TRUTH, byte-strict: the product's own oracle (`pypiron verify`)
     // re-renders every view from that bucket's truth and diffs the bytes. Run
@@ -3531,22 +4060,31 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
     // FREEZE JUSTIFIED. A `.frozen` marker buys a blanket DURABILITY exemption
     // — the file may be absent everywhere — so a freeze that fires without a
     // real conflict is a self-granted licence to lose data, and nothing checked
-    // that it was deserved. Evidence is the union of what the harness saw acked
-    // and what the fleet preserved under `_quarantine/`: a publish can crash
-    // after `store_artifact_verified` succeeds and before the 200, leaving real
-    // conflicting bytes with no ack recorded, so an ack-count-only form would
-    // false-fail on every crashed publisher.
+    // that it was deserved. `decide` reaches `Verdict::Freeze` only from two
+    // live records whose sidecars name DIFFERENT sha256 under one immutable
+    // filename, so the claim to check is exactly that: two byte-sets really
+    // existed under this name.
     //
-    // One byte-set the fleet cannot be asked to attest: the one an authorized
-    // delete destroyed before the freeze reached it. `freeze_side` preserves
-    // the body it FINDS, and a delete racing the same filename drops that body
-    // under its own tombstone in the window between the freeze's marker and its
-    // `get_bytes` — measured, that is every occurrence of this shape, always
-    // with two distinct bodies really stored under the filename. So a deleted
-    // filename is excused, but only once the freeze has shown it preserved what
-    // it did find: a freeze that quarantined NOTHING is never excused, which is
-    // also what keeps `--break freeze-unjustified` (a bare `.frozen` planted on
-    // an acked-deleted filename, no quarantine copy anywhere) red.
+    // Attested in one currency, sha256, from every source that can carry the
+    // fact: what the harness saw acked, every `_quarantine/` copy the fleet
+    // preserved, and every body the buckets actually committed under the
+    // canonical key. The third is not redundant — it is the only one that
+    // cannot be erased, and the other two measurably do get erased. A publish
+    // can crash after `store_artifact_verified` succeeds and before its 200,
+    // leaving real conflicting bytes with no ack recorded. An authorized delete
+    // racing `freeze_side` between its `.frozen` marker and its `get_bytes`
+    // destroys the body before the quarantine copy is taken — and when the
+    // delete wins that race on BOTH sides, a correct fleet-wide freeze is left
+    // with no body-shaped evidence anywhere at all. `SimStorage` sees every
+    // write, so it just remembers the digests it committed.
+    //
+    // This is not a loosening. The product cannot manufacture a digest it never
+    // wrote, and `--break freeze-unjustified` — a bare `.frozen` planted over a
+    // filename that only ever held ONE byte-set — still has nothing to show;
+    // its kill proof runs single-bucket, where a byte conflict cannot occur at
+    // all. What went away with it is the old "excused if the freeze preserved
+    // something" clause, which was a proxy for this question and answered it
+    // wrong in both directions.
     for (pkg, fname) in record_names(&dumps) {
         let akey = format!("packages/{pkg}/{fname}");
         if !dumps
@@ -3555,25 +4093,29 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
         {
             continue;
         }
-        let preserved = quarantined_bodies(&dumps, &pkg, &fname);
-        if !preserved.is_empty() && ledger.authorized_delete(&pkg, &fname) {
-            continue;
-        }
         REACH.hit(R::FreezeJustified);
-        let mut attested = preserved;
+        let mut attested: std::collections::BTreeSet<String> =
+            quarantined_bodies(&dumps, &pkg, &fname)
+                .into_iter()
+                .map(sha256_hex)
+                .collect();
         if let Some(acks) = ledger.acked.get(&(pkg.clone(), fname.clone())) {
-            attested.extend(acked_bodies(acks));
+            attested.extend(acked_bodies(acks).into_iter().map(sha256_hex));
+        }
+        for bucket in &fleet.buckets {
+            attested.extend(bucket.committed_digests(&akey));
         }
         if attested.len() < 2 {
             violations.push(format!(
                 "FREEZE_UNJUSTIFIED: {akey} is frozen fleet-wide but only {} byte-set(s) are \
-                 attested for it (acks + every _quarantine/ copy) — a freeze suppresses the \
-                 filename and exempts it from DURABILITY, so it must be a real byte conflict \
-                 | attested {:?} | markers: {}",
+                 attested for it (acks + every _quarantine/ copy + every body a bucket ever \
+                 committed under the key) — a freeze suppresses the filename and exempts it \
+                 from DURABILITY, so it must be a real byte conflict | attested {:?} | \
+                 markers: {}",
                 attested.len(),
                 attested
                     .iter()
-                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .map(|sha| &sha[..sha.len().min(12)])
                     .collect::<Vec<_>>(),
                 marker_census(&dumps, &pkg, &fname),
             ));
@@ -4278,6 +4820,14 @@ struct Args {
     /// `--break` kill proofs and the measured baselines were all mined on the
     /// aligned one. Needs >1 bucket to mean anything.
     partition_percent: u64,
+    /// `--trace-jsonl <path>`: record ONE seed's timeline as JSONL for the run
+    /// visualizer (dev/scripts/viz). Pure observation — see [`Trace`] — and off
+    /// by default, so it is not part of any world: it stays out of
+    /// `reproduce_command` and out of `ROTATE_OVERRIDES`. One seed only, and
+    /// only its FIRST execution: the determinism recheck reruns the same seed
+    /// and would otherwise overwrite the file with a world that may legitimately
+    /// differ (`--break rerun`).
+    trace_jsonl: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -4458,6 +5008,7 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         brk: Break::None,
         require_reach: false,
         partition_percent: 0,
+        trace_jsonl: None,
     };
     let mut it = argv;
     // Collected as they are seen, checked after the whole line parses, so the
@@ -4472,6 +5023,14 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
                 .next()
                 .unwrap_or_else(|| panic!("missing value for --break"));
             args.brk = Break::parse(&name);
+            continue;
+        }
+        // Both string-valued flags are handled before `grab`, which parses u64.
+        if flag == "--trace-jsonl" {
+            args.trace_jsonl = Some(
+                it.next()
+                    .unwrap_or_else(|| panic!("missing value for --trace-jsonl")),
+            );
             continue;
         }
         let mut grab = || {
@@ -4528,6 +5087,13 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
          --recheck-every --forever --max-secs --break --require-reach --partition.",
         overridden.join(" ")
     );
+    // One file is one seed's timeline. A multi-seed run would interleave worlds
+    // into one stream, and an unbounded one would never write the file at all.
+    assert!(
+        args.trace_jsonl.is_none() || (args.seeds == 1 && !args.forever && args.max_secs.is_none()),
+        "--trace-jsonl records ONE seed: pass --seed N (or --seeds 1), and not \
+         --forever/--max-secs."
+    );
     args
 }
 
@@ -4537,14 +5103,99 @@ fn dump_trace(outcome: &RunOutcome) {
     }
 }
 
-fn run_once(seed: u64, profile: &Profile, rerun: bool) -> RunOutcome {
+fn run_once(seed: u64, profile: &Profile, rerun: bool, viz: Option<Arc<Trace>>) -> RunOutcome {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .start_paused(true)
         .build()
         .expect("build paused runtime");
     let local = tokio::task::LocalSet::new();
-    runtime.block_on(local.run_until(run_seed(seed, *profile, rerun)))
+    runtime.block_on(local.run_until(run_seed(seed, *profile, rerun, viz)))
+}
+
+/// The 23 reach counters, as a relaxed-atomic snapshot. Diffed around one
+/// `run_once` this is that run's per-oracle execution count — the meter itself
+/// is process-wide and cumulative, and `--trace-jsonl` traces one seed's first
+/// execution, which is exactly the interval between two of these.
+fn reach_snapshot() -> Vec<u64> {
+    REACH
+        .slots
+        .iter()
+        .map(|slot| slot.load(Ordering::Relaxed))
+        .collect()
+}
+
+/// One `oracle` line per reach slot, plus one `violation` line per raw violation
+/// string. `executed` is this run's count; `verdict` is `violated` when a
+/// violation string carries this oracle's prefix (see `REACH_VIOLATION_PREFIX`),
+/// `not-executed` when the oracle never ran on this world, `held` otherwise.
+fn emit_oracles(viz: &Arc<Trace>, before: &[u64], after: &[u64], violations: &[String]) {
+    for (slot, (label, unit)) in REACH_METER.iter().enumerate() {
+        let executed = after
+            .get(slot)
+            .copied()
+            .unwrap_or_default()
+            .saturating_sub(before.get(slot).copied().unwrap_or_default());
+        let prefix = REACH_VIOLATION_PREFIX[slot];
+        let detail = if prefix.is_empty() {
+            None
+        } else {
+            let needle = format!("{prefix}:");
+            violations.iter().find(|v| v.starts_with(&needle))
+        };
+        let verdict = match (detail.is_some(), executed) {
+            (true, _) => "violated",
+            (false, 0) => "not-executed",
+            (false, _) => "held",
+        };
+        viz.emit(
+            "oracle",
+            serde_json::json!({
+                "name": label,
+                "unit": unit,
+                "executed": executed,
+                "verdict": verdict,
+                "detail": detail,
+            }),
+        );
+    }
+    for (n, text) in violations.iter().enumerate() {
+        viz.emit("violation", serde_json::json!({ "n": n, "text": text }));
+    }
+}
+
+/// Close the trace: the `summary` line, then the file. Called at every point
+/// `main` can leave a traced seed, because `main` exits through
+/// `std::process::exit` and no `Drop` runs. `exit_code` is what this seed's own
+/// verdict implies; `--require-reach` is a whole-run gate and cannot be known
+/// from one seed.
+fn finish_trace(
+    viz: Option<&Arc<Trace>>,
+    outcome: &RunOutcome,
+    elapsed: std::time::Duration,
+    exit_code: i32,
+) {
+    let Some(viz) = viz else { return };
+    let (events_emitted, truncated) = viz.stats();
+    viz.emit(
+        "summary",
+        serde_json::json!({
+            "violations": outcome.violations.len(),
+            "acked": outcome.acked,
+            "trace_hash": format!("{:#x}", outcome.trace_hash),
+            "trace_events": outcome.trace_events,
+            "state_hash": format!("{:#x}", outcome.state_hash),
+            "audit_view_repairs": outcome.audit_view_repairs,
+            "repairs_by_class": outcome.repairs_by_class,
+            "ack_totality": outcome.ack_totality,
+            // Counting this line: the number of JSONL lines in the file.
+            "events_emitted": events_emitted + 1,
+            "truncated": truncated,
+            "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            "exit_code": exit_code,
+        }),
+    );
+    viz.flush();
 }
 
 fn main() {
@@ -4556,6 +5207,12 @@ fn main() {
             .init();
     }
     let args = parse_args();
+    // Built before the first run: the git subprocess and the argv read cannot
+    // reach the simulated world.
+    let viz = args
+        .trace_jsonl
+        .as_ref()
+        .map(|path| Trace::new(path.clone()));
     let started = std::time::Instant::now();
     let keep_going = args.forever || args.max_secs.is_some();
     let mut total_events: u64 = 0;
@@ -4582,7 +5239,13 @@ fn main() {
         if profile.buckets > 1 {
             REACH.multi_bucket.store(true, Ordering::Relaxed);
         }
-        let mut outcome = run_once(seed, &profile, false);
+        // Bracketing `run_once` is the whole per-oracle instrumentation: two
+        // relaxed reads of the 23 counters, no touch points inside the run.
+        let reach_before = viz.as_ref().map(|_| reach_snapshot());
+        let mut outcome = run_once(seed, &profile, false, viz.clone());
+        if let (Some(viz), Some(before)) = (&viz, &reach_before) {
+            emit_oracles(viz, before, &reach_snapshot(), &outcome.violations);
+        }
         dump_trace(&outcome);
         total_events += outcome.trace_events;
         total_acked += outcome.acked;
@@ -4596,7 +5259,9 @@ fn main() {
         }
         if args.recheck_every > 0 && seed.is_multiple_of(args.recheck_every) {
             rechecked += 1;
-            let again = run_once(seed, &profile, true);
+            // `None`: the rerun is the same seed re-executed and must neither
+            // append to nor truncate the first execution's file.
+            let again = run_once(seed, &profile, true, None);
             if outcome.trace_events > 0 {
                 REACH.hit(R::Determinism); // an empty trace compares nothing
             }
@@ -4624,6 +5289,7 @@ fn main() {
                     profile.describe()
                 );
                 if !keep_going {
+                    finish_trace(viz.as_ref(), &outcome, started.elapsed(), 3);
                     std::process::exit(3);
                 }
                 determinism_violations.push(seed);
@@ -4640,6 +5306,7 @@ fn main() {
                     profile.describe()
                 );
                 if !keep_going {
+                    finish_trace(viz.as_ref(), &outcome, started.elapsed(), 3);
                     std::process::exit(3);
                 }
                 determinism_violations.push(seed);
@@ -4656,6 +5323,14 @@ fn main() {
         // the meter knows how many seeds each oracle actually ran on.
         REACH.end_of_seed();
         MERGE.end_of_seed();
+        // `--trace-jsonl` asserts a single bounded seed, so this runs exactly
+        // once and every path that leaves the loop early has already flushed.
+        finish_trace(
+            viz.as_ref(),
+            &outcome,
+            started.elapsed(),
+            if outcome.violations.is_empty() { 0 } else { 2 },
+        );
         if !outcome.violations.is_empty() {
             eprintln!(
                 "vopr: seed {seed} FAILED ({} violations):",
@@ -4945,6 +5620,33 @@ mod tests {
         assert_eq!((args.recheck_every, args.max_secs), (500, Some(60)));
         assert!(args.brk == Break::View);
         assert_eq!(args.partition_percent, 50);
+    }
+
+    /// `--trace-jsonl` is a recorder, not a workload lever: it takes a path (so
+    /// it cannot go through the u64 `grab`), stays out of `reproduce_command`,
+    /// and is legal beside `--rotate`.
+    #[test]
+    fn the_trace_recorder_parses_beside_rotate() {
+        let args = parse_args_from(argv(&[
+            "--rotate",
+            "--seed",
+            "21000000",
+            "--trace-jsonl",
+            "/tmp/vopr.jsonl",
+        ]));
+        assert!(args.rotate);
+        assert_eq!(args.trace_jsonl.as_deref(), Some("/tmp/vopr.jsonl"));
+        // ...and it is not part of the world the reproduce line rebuilds.
+        assert!(!reproduce_command(21_000_000, true, &a_profile(Break::None)).contains("--trace"));
+    }
+
+    /// One file is one seed's timeline. A 25-seed default would interleave 25
+    /// worlds into one stream and the reader would render a world that never
+    /// existed.
+    #[test]
+    #[should_panic(expected = "--trace-jsonl records ONE seed")]
+    fn the_trace_recorder_refuses_a_multi_seed_run() {
+        parse_args_from(argv(&["--trace-jsonl", "/tmp/vopr.jsonl"]));
     }
 
     /// A partitioned world is not reproducible from the seed — `--partition` is

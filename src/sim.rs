@@ -92,6 +92,14 @@ impl SimClock {
     }
 }
 
+/// Whether `key` addresses an artifact body rather than one of its companions:
+/// exactly `packages/<pkg>/<filename>` with `<filename>` an artifact name.
+fn is_canonical_artifact(key: &str) -> bool {
+    key.strip_prefix("packages/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, name)| !name.contains('/') && crate::sidecar::is_artifact(name))
+}
+
 /// Clamp an `OffsetDateTime` to the representable Unix-nanos range as `u64`.
 fn to_unix_nanos(t: OffsetDateTime) -> u64 {
     t.unix_timestamp_nanos().clamp(0, u64::MAX as i128) as u64
@@ -105,8 +113,23 @@ struct Obj {
     last_modified: OffsetDateTime,
 }
 
+#[derive(Default)]
 struct Inner {
     objects: BTreeMap<String, Obj>,
+    /// Every distinct body ever committed under each canonical
+    /// `packages/<pkg>/<artifact>` key, as a sha256 hex digest — insert-only,
+    /// so a delete does not erase it.
+    ///
+    /// A verification harness needs this because the final state cannot supply
+    /// it and both proxies for it are erasable. An upload that crashed after
+    /// its bytes landed and before its `200` never acked; a delete racing a
+    /// merge freeze destroys the body before `freeze_side` can copy it to
+    /// `_quarantine/`. The bytes were really there either way, under one
+    /// immutable filename — which is the entire subject of a byte conflict —
+    /// so the store simply remembers that they were. Artifact bodies only:
+    /// sidecars, markers and views are rewritten constantly and nothing asks
+    /// about their history.
+    committed: BTreeMap<String, std::collections::BTreeSet<String>>,
     /// Per-storage version counter. Every successful write stamps `v{n}` and
     /// increments, so etags model an object store's opaque generation — one
     /// etag space shared by every conditional operation — rather than a content
@@ -158,10 +181,7 @@ impl SimStorage {
     pub fn new(clock: Arc<SimClock>) -> Arc<SimStorage> {
         Arc::new(SimStorage {
             clock,
-            inner: Mutex::new(Inner {
-                objects: BTreeMap::new(),
-                next_version: 0,
-            }),
+            inner: Mutex::new(Inner::default()),
             copy_id: None,
             copy_fault: Mutex::new(None),
         })
@@ -172,10 +192,7 @@ impl SimStorage {
     pub fn new_copy_source(clock: Arc<SimClock>, copy_id: &str) -> Arc<SimStorage> {
         let this = Arc::new(SimStorage {
             clock,
-            inner: Mutex::new(Inner {
-                objects: BTreeMap::new(),
-                next_version: 0,
-            }),
+            inner: Mutex::new(Inner::default()),
             copy_id: Some(copy_id.to_string()),
             copy_fault: Mutex::new(None),
         });
@@ -200,6 +217,13 @@ impl SimStorage {
 
     /// Write `bytes` at `key` with a fresh version and the current clock time.
     fn store(inner: &mut Inner, key: &str, bytes: Vec<u8>, now: OffsetDateTime) -> String {
+        if is_canonical_artifact(key) {
+            inner
+                .committed
+                .entry(key.to_string())
+                .or_default()
+                .insert(crate::hash::sha256_hex(&bytes));
+        }
         let etag = format!("v{}", inner.next_version);
         inner.next_version += 1;
         inner.objects.insert(
@@ -218,6 +242,12 @@ impl SimStorage {
         let now = self.clock.now_utc();
         let mut inner = self.lock();
         Self::store(&mut inner, key, bytes, now);
+    }
+
+    /// The distinct byte-sets this bucket ever committed under one canonical
+    /// artifact key, as sha256 hex digests. See [`Inner::committed`].
+    pub fn committed_digests(&self, key: &str) -> std::collections::BTreeSet<String> {
+        self.lock().committed.get(key).cloned().unwrap_or_default()
     }
 
     /// Snapshot of key -> bytes, for invariant checks and abstraction functions.
@@ -489,6 +519,55 @@ mod tests {
     fn start() -> OffsetDateTime {
         // 2026-01-01T00:00:00Z
         OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap()
+    }
+
+    #[test]
+    fn only_artifact_bodies_are_history_tracked() {
+        assert!(is_canonical_artifact("packages/p/p-1.0-py3-none-any.whl"));
+        for companion in [
+            ".meta.json",
+            ".metadata",
+            ".provenance",
+            ".tombstone",
+            ".frozen",
+            ".mirror-quarantined",
+        ] {
+            let key = format!("packages/p/p-1.0-py3-none-any.whl{companion}");
+            assert!(!is_canonical_artifact(&key), "{key} is not a body");
+        }
+        assert!(!is_canonical_artifact("packages/p/.origin"));
+        assert!(!is_canonical_artifact("_quarantine/p/p-1.0.whl@abc"));
+        assert!(!is_canonical_artifact("simple/p/index.html"));
+    }
+
+    #[tokio::test]
+    async fn committed_digests_outlive_the_bytes() {
+        // The whole point: a delete erases the object but not the fact that
+        // those bytes were once committed under that name. Two byte-sets under
+        // one filename is a byte conflict, and a merge freeze that races a
+        // delete has no other way to prove it happened.
+        let s = SimStorage::new(SimClock::new(start()));
+        let key = "packages/p/p-1.0-py3-none-any.whl";
+        s.put_bytes(key, b"one".to_vec(), None).await.unwrap();
+        s.put_bytes(key, b"two".to_vec(), None).await.unwrap();
+        s.put_bytes(&format!("{key}.meta.json"), b"{}".to_vec(), None)
+            .await
+            .unwrap();
+        s.delete_keys(&[key.to_string()]).await.unwrap();
+
+        assert!(s.get_bytes(key).await.is_err());
+        assert_eq!(
+            s.committed_digests(key),
+            [
+                crate::hash::sha256_hex(b"one"),
+                crate::hash::sha256_hex(b"two")
+            ]
+            .into_iter()
+            .collect()
+        );
+        // Companions keep no history, and neither does a key never written.
+        assert!(s.committed_digests(&format!("{key}.meta.json")).is_empty());
+        assert!(s.committed_digests("packages/p/other.whl").is_empty());
     }
 
     #[tokio::test]

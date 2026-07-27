@@ -1552,6 +1552,133 @@ make viz VIZ_LIVE=0      # skip the live measurement
 python dev/scripts/viz/build.py --only wedge --skip-inertness --live-secs 0
 ```
 
+### Shrinking a failing seed (`--shrink`)
+
+Detection stopped being the bottleneck when the soak fleet went always-on;
+reading the failure is. The same defect is unreadable at 200 ops and obvious at
+4, and that reduction used to be a human editing flags by hand, one rerun at a
+time. `--shrink` does it: on the first failing seed it searches for the smallest
+configuration that still fails **the same way** and prints it as one pasteable
+command.
+
+```
+cargo run --release --example vopr -- --seed 1 --nodes 2 --buckets 1 --ops 80 --break durability --shrink
+...
+vopr: --shrink ran 34 simulations in 10.8ms — smallest configuration still failing ["DURABILITY", "SELF_CONSISTENCY"]:
+shrunk: cargo run --release --example vopr -- --seed 1 --nodes 1 --buckets 1 --packages 1 \
+        --files 1 --ops 5 --fail-percent 0 --weights 40,0,0,0,0,0,0,0 --break durability
+ops the failure needs: publish
+```
+
+**"The same way" is the set of violation KINDS** — the token each violation
+string names itself with, before its first colon. A non-zero exit is not enough:
+a smaller world happily fails for an unrelated reason, and a minimum reported
+under the wrong bug sends the reader after a defect that was never there. The
+rest of each message carries bucket numbers, filenames and whole dumps, which
+differ on every candidate, so the kind is as fine as a stable signature can get
+— two different bugs that share a kind (`DURABILITY` has four producers) can
+still be confused, which is why the shrunk command is a starting point for
+reading, not a verdict.
+
+It descends `--ops`, `--buckets`, `--nodes`, `--packages`, `--files`,
+`--fail-percent`, `--partition` and the op-class mix, repeating to a fixpoint.
+Each axis is scanned smallest-first, so the first value that still fails IS that
+axis's minimum given the rest: failure is not monotone in any of these — a
+bigger world is not a superset of a smaller one, it is a *different schedule* —
+so a binary search would report whichever floor it happened to land on.
+`--partition` is tried as a boolean, because for one seed it is a threshold on a
+single draw from a dedicated stream: every percent above that draw is the same
+world, every percent below is the aligned one. The op mix descends by zeroing
+whole classes, which answers the question a reader actually asks — *which
+operations does this bug need?* — and `--weights a,b,…` exists so that answer
+pastes back. Everything it searches is a dimension the harness already had, so
+the result is a command anyone can run and there is no shrink-only replay format
+to maintain.
+
+**It does not reduce the op sequence, on purpose.** Skipping an individual op
+mid-run cannot be expressed as a profile, and the fault stream is drawn per
+storage op from one shared rng (`FaultPlan::admit`), so removing an op shifts
+every fault after it — a skip-mask reducer needs its own world dimension, its own
+replay flag, and a guard in the chaos loop. The measurements below say what that
+would buy: on the mutation corpus the profile axes already reach 1–10 ops, and on
+the two real product bugs *nothing but the op count moved at all*, because a rare
+schedule is exactly the kind that any perturbation destroys. A sequence reducer
+faces the same fragility, at ten times the code.
+
+Two more rules, both about not lying: a determinism violation is decided by the
+recheck in `main`, not by an oracle, so `--shrink` refuses to search one (it says
+so and shrinks nothing). And it stops the run at the first failing seed — the
+search pushes hundreds of extra simulations through the process-wide reach and
+merge meters, and a soak that kept going would print a coverage table those
+probes wrote.
+
+**Measured, on the oracle kill proofs.** Every `--break` leg in ci.yml, started
+from the flags that step reds it with (`--seeds 6`, so seed 1 is the one shrunk),
+at `5c2395e`:
+
+| start | `--break` | shrunk to | probes | wall |
+|---|---|---|---|---|
+| `--nodes 2 --buckets 1 --ops 80` | `view`, `wedge` | 1 node, 1 pkg, 1 file, **1 op**, nudge only | 12 | 2.5–19 ms |
+| `--nodes 2 --buckets 2 --ops 80` | `diverge` | 1 node, 2 buckets, **1 op**, nudge only | 14 | 4.7 ms |
+| `--nodes 2 --buckets 1 --ops 80` | `ordering`, `globalindex`, `poison`, `blind`, `fallback` | 1 node, 1 pkg, 1 file, **3 ops**, publish only | 26 | 8.6–11 ms |
+| `--nodes 2 --buckets 1 --ops 80 --fail-percent 0` | `race` | 1 node, 1 pkg, 1 file, **3 ops**, publish only | 22 | 7.7 ms |
+| `--nodes 2 --buckets 1 --ops 80` | `durability`, `visibility`, `conserve`, `freeze-lossy`, `demote-lossy`, `origin-demoted`, `mirror-served`, `attest` | 1 node, 1 pkg, 1 file, **5 ops**, publish only | 34 | 11–32 ms |
+| `--nodes 2 --buckets 2 --ops 80 --fail-percent 0` | `fanout` | 1 node, 2 buckets, **7 ops**, publish only | 41 | 24 ms |
+| `--nodes 2 --buckets 1 --ops 80` | `resurrect`, `freeze-unjustified` | 1 node, 1 pkg, 1 file, **10 ops**, no tick | 58 | 24–36 ms |
+| `--nodes 2 --buckets 2 --ops 80` | `split` | 1 node, 2 buckets, **10 ops**, publish only | 81 | 71 ms |
+
+Every one of those commands was pasted back and reds with the same kinds.
+
+**And on real product bugs, where it is honest about its limits.** With
+`c9b2e32`'s fix reverted, the two `--rotate` seeds its commit message names go
+red again; `--shrink` cut the op count and could not move a single other axis:
+
+| seed | as found | shrunk to | probes | wall |
+|---|---|---|---|---|
+| 60000037578 (`--rotate`) | 3 nodes, 1 bucket, 4 pkgs, 1 file, 200 ops, crash-only | same, **140 ops** | 305 | 218 ms |
+| 61000075134 (`--rotate`) | 2 nodes, 1 bucket, 3 pkgs, 2 files, 120 ops, crash-only | same, **114 ops** | 251 | 214 ms |
+
+That is the shape of the tool's value: it is worth hundreds of reruns on any
+failure, it converts a `--rotate` failure into an explicit command (rotation
+derives the mix from the seed; a shrunk mix is not one rotation would draw, so
+the result always prints in fixed-flag form), and on a knife-edge schedule it
+tells you *that* the world is already minimal instead of leaving you to find out
+by hand. Seed 86001009016 with `8e5916f` reverted is the extreme case: the
+hand-shrunk profile in ci.yml (`--packages 1 --files 1 --ops 26 --fail-percent
+1`) survives 38 probes with nothing to give — the tool matched the human's answer
+and proved it minimal on every axis in 34 ms.
+
+A shrink needs a *failing* world, and a seed is a recipe rather than an ordering
+(see `5c2395e`): of the three seeds open at the start of this campaign,
+86001009016 still reproduces against its own pre-fix product code, while
+62000150551 and 86001076473 no longer red anywhere — 864 and 2,592 profiles
+respectively at HEAD, plus 256 each against `8e5916f` reverted, plus 92,000
+seeds of pre-fix soak on the narrow lanes that class of bug is found on. Their
+bugs are closed and their schedules have moved; there is nothing left to shrink.
+
+**Zero cost when unused, proven the way this document demands.** A search flag
+that perturbed the schedule would shrink a world that never happened. Nine
+canonical profiles — the five gated rows, `--rotate`, `--rotate --partition 100`,
+the partitioned multi-bucket row and the harness default — ran 500 seeds each
+against the binary immediately before and after the feature, at `5c2395e`:
+
+| checked | result |
+|---|---|
+| 9 × 500 seeds: interleavings, acked uploads, ack-totality misses, audit repairs by class, the whole 23-row reach table and 11-row merge table | identical to the character, once the wall clock is normalized away |
+| 9 × `VOPR_TRACE=1` op-interleaving dumps (1,149–3,822 ops each) | byte-identical |
+
+```
+VOPR_TRACE=1 VOPR_TRACE_FILE=/tmp/a cargo run --release --example vopr -- \
+  --seed 7774 --nodes 3 --buckets 2 --ops 160 --packages 6 --files 2 --fail-percent 0
+# ...against a binary built before the feature: cmp is silent, 2,301 ops.
+```
+
+The reason it is inert is structural, not measured: nothing in the search runs
+until a seed has already failed and been reported, every probe is `run_once` on
+the same seed, and the only edits to existing code are a flag, an `if` in the
+failure branch, and a `--weights` suffix that appears solely when the mix is not
+`DEFAULT_OP_WEIGHTS` — which no command outside a shrink result has.
+
 ## Real cloud backends
 
 The emulators (MinIO, Azurite) are fast and hermetic but not the real thing, and

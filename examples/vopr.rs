@@ -86,7 +86,7 @@
 //! say — issues the same calls with different bytes. The rerun's own invariant
 //! verdict counts too: a seed that passes once and fails once is a red seed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -4858,6 +4858,17 @@ struct Args {
     /// and would otherwise overwrite the file with a world that may legitimately
     /// differ (`--break rerun`).
     trace_jsonl: Option<String>,
+    /// The chaos loop's op-class mix (`--weights`), out of whatever they sum to.
+    /// `DEFAULT_OP_WEIGHTS` unless asked for, so every existing command means
+    /// exactly what it always did. It exists mostly so a `--shrink` result that
+    /// found a class the failure never needed can be pasted back — see
+    /// [`shrink_search`].
+    weights: [u16; OP_CLASSES],
+    /// `--shrink`: on the first failing seed, search for the smallest profile
+    /// that still fails THE SAME WAY and print it as a ready-to-paste command
+    /// (see the `--shrink` section). Off by default and inert until a seed
+    /// fails, so it cannot move any schedule.
+    shrink: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -4913,7 +4924,7 @@ fn profile_for(seed: u64, args: &Args) -> Profile {
             files: args.files,
             ops: args.ops,
             fail_percent: args.fail_percent,
-            weights: DEFAULT_OP_WEIGHTS,
+            weights: args.weights,
             brk: args.brk,
             partition_percent: args.partition_percent,
         };
@@ -4969,9 +4980,21 @@ fn reproduce_command(seed: u64, rotate: bool, profile: &Profile) -> String {
             "cargo run --release --example vopr -- --seed {seed} --rotate{partition}{brk}"
         );
     }
+    // The op mix is implicit at `DEFAULT_OP_WEIGHTS` and drawn from the seed
+    // under `--rotate`, so it appears only where it is load-bearing: a
+    // `--shrink` result that zeroed a class, which is a different world from
+    // the default mix and has to say so.
+    let weights = if profile.weights == DEFAULT_OP_WEIGHTS {
+        String::new()
+    } else {
+        format!(
+            " --weights {}",
+            profile.weights.map(|weight| weight.to_string()).join(",")
+        )
+    };
     format!(
         "cargo run --release --example vopr -- --seed {seed} --nodes {} --buckets {} \
-         --packages {} --files {} --ops {} --fail-percent {}{partition}{brk}",
+         --packages {} --files {} --ops {} --fail-percent {}{partition}{weights}{brk}",
         profile.nodes,
         profile.buckets,
         profile.packages,
@@ -5004,17 +5027,19 @@ fn pick_op(weights: &[u16; OP_CLASSES], total: u64, rng: &mut Rng) -> usize {
 /// widened coverage. A simulator that reports a workload it did not run is
 /// worse than one that refuses to start, so `parse_args_from` rejects the pair.
 /// Everything else stays legal under rotation — `--seed/--seeds/--start-seed/
-/// --recheck-every/--forever/--max-secs/--break/--require-reach/--partition` are
-/// the real levers there (`--partition` is a chaos dimension like `--break`, not
-/// a workload shape rotation derives), and `--seed N --rotate` must keep
-/// reproducing on its own.
-const ROTATE_OVERRIDES: [&str; 6] = [
+/// --recheck-every/--forever/--max-secs/--break/--require-reach/--partition/
+/// --shrink` are the real levers there (`--partition` is a chaos dimension like
+/// `--break`, not a workload shape rotation derives; `--shrink` reads the
+/// resolved profile and never supplies one), and `--seed N --rotate` must keep
+/// reproducing on its own. `--weights` is the op mix, which rotation swarms.
+const ROTATE_OVERRIDES: [&str; 7] = [
     "--nodes",
     "--buckets",
     "--packages",
     "--files",
     "--ops",
     "--fail-percent",
+    "--weights",
 ];
 
 fn parse_args() -> Args {
@@ -5039,6 +5064,8 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         require_reach: false,
         partition_percent: 0,
         trace_jsonl: None,
+        weights: DEFAULT_OP_WEIGHTS,
+        shrink: false,
     };
     let mut it = argv;
     // Collected as they are seen, checked after the whole line parses, so the
@@ -5055,12 +5082,38 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
             args.brk = Break::parse(&name);
             continue;
         }
-        // Both string-valued flags are handled before `grab`, which parses u64.
+        // The string-valued flags are handled before `grab`, which parses u64.
         if flag == "--trace-jsonl" {
             args.trace_jsonl = Some(
                 it.next()
                     .unwrap_or_else(|| panic!("missing value for --trace-jsonl")),
             );
+            continue;
+        }
+        if flag == "--weights" {
+            let raw = it
+                .next()
+                .unwrap_or_else(|| panic!("missing value for --weights"));
+            let mix: Vec<u16> = raw
+                .split(',')
+                .map(|part| {
+                    part.trim()
+                        .parse::<u16>()
+                        .unwrap_or_else(|e| panic!("bad value for --weights: {e}"))
+                })
+                .collect();
+            assert_eq!(
+                mix.len(),
+                OP_CLASSES,
+                "--weights takes {OP_CLASSES} comma-separated weights, one per op class: {}",
+                OP_LABELS.join(",")
+            );
+            // `pick_op` draws `rng.below(total)`: an all-zero mix divides by zero.
+            assert!(
+                mix.iter().any(|weight| *weight > 0),
+                "--weights must leave at least one op class above zero"
+            );
+            args.weights.copy_from_slice(&mix);
             continue;
         }
         let mut grab = || {
@@ -5106,6 +5159,7 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
             "--max-secs" => args.max_secs = Some(grab()),
             "--rotate" => args.rotate = true,
             "--require-reach" => args.require_reach = true,
+            "--shrink" => args.shrink = true,
             "--verbose" => {}
             other => panic!("unknown flag {other} (see examples/vopr.rs)"),
         }
@@ -5114,7 +5168,7 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         !args.rotate || overridden.is_empty(),
         "--rotate derives the whole workload from the seed, so {} would be discarded — \
          drop them, or drop --rotate. Legal with --rotate: --seed --seeds --start-seed \
-         --recheck-every --forever --max-secs --break --require-reach --partition.",
+         --recheck-every --forever --max-secs --break --require-reach --partition --shrink.",
         overridden.join(" ")
     );
     // One file is one seed's timeline. A multi-seed run would interleave worlds
@@ -5248,6 +5302,158 @@ fn finish_trace(
         }),
     );
     viz.flush();
+}
+
+// ---------------------------------------------------------------------------
+// `--shrink`: the smallest configuration that still fails the same way.
+//
+// Detection is not the bottleneck any more — the soak fleet explores millions
+// of seeds unattended — reading the failure is. The same defect that is
+// unreadable at 200 ops is obvious at 4, and until now that reduction was a
+// human editing flags by hand, one rerun at a time.
+//
+// The search is greedy descent over the profile dimensions the harness already
+// has flags for, repeated to a fixpoint. That constraint is the design: a
+// shrunk configuration is a command anyone can paste, no shrink-only replay
+// format exists, and nothing new lives inside the simulated world — every probe
+// is `run_once` on the SAME seed, so the whole search stays a pure function of
+// (seed, profile) like everything else here.
+//
+// What it does NOT do is reduce the op SEQUENCE. Skipping an individual op
+// mid-run cannot be expressed as a profile, and the fault stream is drawn per
+// storage op from one shared rng (`FaultPlan::admit`), so removing an op shifts
+// every fault after it — a skip-mask reducer would need its own world dimension
+// and its own replay flag to reproduce what it found. The op MIX is the cheap
+// 90%: zeroing a whole class is a dimension that already exists, costs one
+// probe per class, and answers the question a reader actually asks — "which
+// operations does this bug need?" — which op-count truncation alone cannot,
+// since it only ever removes the tail.
+// ---------------------------------------------------------------------------
+
+/// The kind each violation names itself with: the token before its first colon.
+/// This is the whole notion of "the same failure" the search keeps fixed.
+/// Exit status alone is not enough — a smaller world happily fails for an
+/// unrelated reason, and a minimum reported under the wrong bug sends the
+/// reader after a defect that was never there.
+fn violation_kinds(violations: &[String]) -> BTreeSet<String> {
+    violations
+        .iter()
+        .map(|text| text.split(':').next().unwrap_or(text).trim().to_string())
+        .collect()
+}
+
+type AxisGet = fn(&Profile) -> u64;
+type AxisSet = fn(&mut Profile, u64);
+
+/// The dimensions `--shrink` descends, and the floor each may not cross.
+///
+/// `--partition` is deliberately absent: for one seed it is a threshold on a
+/// single draw from a dedicated stream (`partition_for`), so every percent above
+/// that draw yields the identical world and every percent below yields the
+/// aligned one. It is binary here, and the search tries it as such rather than
+/// reporting whichever arbitrary percent happens to sit on the boundary.
+const SHRINK_AXES: [(AxisGet, AxisSet, u64); 6] = [
+    (|p| p.ops, |p, v| p.ops = v, 1),
+    (|p| p.buckets as u64, |p, v| p.buckets = v as usize, 1),
+    (|p| p.nodes as u64, |p, v| p.nodes = v as usize, 1),
+    (|p| p.packages as u64, |p, v| p.packages = v as usize, 1),
+    (|p| u64::from(p.files), |p, v| p.files = v as u8, 1),
+    (|p| p.fail_percent, |p, v| p.fail_percent = v, 0),
+];
+
+/// One probe: does this profile still fail the same way on this seed?
+fn same_failure(seed: u64, profile: &Profile, target: &BTreeSet<String>) -> bool {
+    violation_kinds(&run_once(seed, profile, false, None).violations) == *target
+}
+
+/// Greedy descent to a fixpoint: the smallest profile that still failed the
+/// same way, and how many simulations it took.
+fn shrink_search(seed: u64, base: &Profile, target: &BTreeSet<String>) -> (Profile, u64) {
+    let mut best = *base;
+    let mut probes = 0u64;
+    loop {
+        let mut shrank = false;
+        // Smallest-first, so the first value that still fails IS that axis's
+        // minimum given the rest of the profile. Failure is not monotone in any
+        // of these — a bigger world is not a superset of a smaller one, it is a
+        // different schedule — so a binary search would report a floor that is
+        // only the first one it happened to land on. The scan is cheap where it
+        // matters: every probe it runs is smaller than the value in hand.
+        for (get, set, floor) in SHRINK_AXES {
+            for value in floor..get(&best) {
+                let mut trial = best;
+                set(&mut trial, value);
+                probes += 1;
+                if same_failure(seed, &trial, target) {
+                    best = trial;
+                    shrank = true;
+                    break;
+                }
+            }
+        }
+        if best.partition_percent > 0 {
+            let mut trial = best;
+            trial.partition_percent = 0;
+            probes += 1;
+            if same_failure(seed, &trial, target) {
+                best = trial;
+                shrank = true;
+            }
+        }
+        for class in 0..OP_CLASSES {
+            let mut trial = best;
+            trial.weights[class] = 0;
+            // `pick_op` draws `rng.below(total)`: an all-zero mix divides by zero.
+            if best.weights[class] == 0 || trial.weights.iter().all(|weight| *weight == 0) {
+                continue;
+            }
+            probes += 1;
+            if same_failure(seed, &trial, target) {
+                best = trial;
+                shrank = true;
+            }
+        }
+        if !shrank {
+            return (best, probes);
+        }
+    }
+}
+
+/// Run the search under a failing seed and print the result as the one command
+/// that reproduces it. Always the explicit fixed-profile form, never
+/// `--rotate`: a shrunk mix is not a mix rotation would draw, and the two are
+/// mutually exclusive on the command line anyway.
+fn shrink_report(seed: u64, base: &Profile, violations: &[String]) {
+    let target = violation_kinds(violations);
+    let kinds: Vec<&str> = target.iter().map(String::as_str).collect();
+    // The target has to be reproducible before it can be searched for. The
+    // determinism recheck can adopt the RERUN's violations, and those are not
+    // what a plain rerun of this profile produces — searching for them would
+    // reject every candidate and report the base profile as its own minimum.
+    if !same_failure(seed, base, &target) {
+        eprintln!(
+            "vopr: --shrink: a plain rerun of this profile does not reproduce {kinds:?} \
+             (the failure came from the determinism recheck, which --shrink cannot search) \
+             — nothing shrunk."
+        );
+        return;
+    }
+    let started = std::time::Instant::now();
+    let (best, probes) = shrink_search(seed, base, &target);
+    let mix: Vec<&str> = OP_LABELS
+        .iter()
+        .zip(best.weights)
+        .filter(|(_, weight)| *weight > 0)
+        .map(|(label, _)| *label)
+        .collect();
+    eprintln!(
+        "vopr: --shrink ran {probes} simulations in {:?} — smallest configuration still failing \
+         {kinds:?}:\nshrunk: {}\nprofile: {}\nops the failure needs: {}",
+        started.elapsed(),
+        reproduce_command(seed, false, &best),
+        best.describe(),
+        mix.join(" ")
+    );
 }
 
 fn main() {
@@ -5414,6 +5620,14 @@ fn main() {
                 reproduce_command(seed, args.rotate, &profile)
             );
             eprintln!("profile: {}", profile.describe());
+            // The search runs hundreds of extra simulations through the same
+            // process-wide reach and merge meters, so it stops the run: a soak
+            // that kept going would report a coverage table those probes wrote.
+            // A shrink is a diagnosis session, not a sample.
+            if args.shrink {
+                shrink_report(seed, &profile, &outcome.violations);
+                std::process::exit(2);
+            }
             if !keep_going {
                 std::process::exit(2);
             }
@@ -5464,6 +5678,9 @@ fn main() {
     );
     let unreached = report_reach(explored, rechecked, args.brk);
     report_merge(explored);
+    if args.shrink && failed_seeds.is_empty() {
+        eprintln!("vopr: --shrink had nothing to shrink — no seed in this run violated an oracle.");
+    }
     if !determinism_violations.is_empty() {
         std::process::exit(3);
     }
@@ -5690,6 +5907,88 @@ mod tests {
         assert_eq!((args.recheck_every, args.max_secs), (500, Some(60)));
         assert!(args.brk == Break::View);
         assert_eq!(args.partition_percent, 50);
+    }
+
+    /// `--shrink` reads the profile a failing seed resolved to and never
+    /// supplies one, so it is a lever under rotation like `--break` — and a
+    /// rotating soak is exactly where an unreadable failure comes from.
+    #[test]
+    fn shrinking_is_legal_under_rotation() {
+        let args = parse_args_from(argv(&["--rotate", "--seed", "21000000", "--shrink"]));
+        assert!(args.rotate && args.shrink);
+        assert_eq!(args.weights, DEFAULT_OP_WEIGHTS);
+    }
+
+    /// The op mix IS a workload shape, so `--rotate` draws it and a flag beside
+    /// it would be discarded — the same silent contradiction `--ops` used to be.
+    #[test]
+    #[should_panic(expected = "--weights would be discarded")]
+    fn rotation_refuses_a_hand_written_op_mix() {
+        parse_args_from(argv(&["--rotate", "--weights", "40,10,25,7,4,5,5,4"]));
+    }
+
+    /// A mix `--shrink` zeroed down to one class has to parse back, and an
+    /// all-zero mix has to be refused: `pick_op` draws `rng.below(total)`.
+    #[test]
+    fn an_op_mix_round_trips_through_its_flag() {
+        let args = parse_args_from(argv(&["--weights", "40,0,25,0,0,0,0,0"]));
+        assert_eq!(args.weights, [40, 0, 25, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one op class above zero")]
+    fn an_op_mix_of_all_zeros_is_refused() {
+        parse_args_from(argv(&["--weights", "0,0,0,0,0,0,0,0"]));
+    }
+
+    #[test]
+    #[should_panic(expected = "--weights takes 8 comma-separated weights")]
+    fn a_short_op_mix_is_refused() {
+        parse_args_from(argv(&["--weights", "40,10,25"]));
+    }
+
+    /// A failure is "the same failure" when it names the same kinds. The kind is
+    /// the token before the first colon: the rest of the string carries bucket
+    /// numbers, filenames and whole dumps, which differ on every configuration
+    /// the search tries and would make every candidate look like a new bug.
+    #[test]
+    fn a_failure_is_identified_by_the_kinds_it_names() {
+        let violations = vec![
+            "DURABILITY: acked vopr-alpha/1.0 lost on bucket 1".to_string(),
+            "DURABILITY: acked vopr-beta/2.0 lost on bucket 0".to_string(),
+            "CONVERGENCE: bucket 0 vs bucket 1 differ on simple/index.json".to_string(),
+        ];
+        let kinds = violation_kinds(&violations);
+        assert_eq!(
+            kinds.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["CONVERGENCE", "DURABILITY"]
+        );
+        // Same kinds, different detail — still the same failure.
+        assert_eq!(
+            kinds,
+            violation_kinds(&[
+                "CONVERGENCE: bucket 0 vs bucket 1 differ on simple/vopr-zeta/index.html"
+                    .to_string(),
+                "DURABILITY: acked vopr-zeta/4.0 lost on bucket 2".to_string(),
+            ])
+        );
+        // A different kind is a different bug, however tempting the minimum.
+        assert_ne!(kinds, violation_kinds(&["DURABILITY: acked".to_string()]));
+    }
+
+    /// A shrunk mix is not a mix `--rotate` would draw, so the result prints as
+    /// an explicit command — and `--weights` appears ONLY there. Every pinned
+    /// seed in ci.yml is pasted from this line and none of them carries one.
+    #[test]
+    fn a_shrunk_op_mix_is_the_only_thing_that_prints_weights() {
+        let mut shrunk = a_profile(Break::None);
+        shrunk.weights = [40, 0, 25, 0, 0, 0, 0, 4];
+        assert_eq!(
+            reproduce_command(7384, false, &shrunk),
+            "cargo run --release --example vopr -- --seed 7384 --nodes 3 --buckets 3 \
+             --packages 6 --files 4 --ops 200 --fail-percent 3 --weights 40,0,25,0,0,0,0,4"
+        );
+        assert!(!reproduce_command(7384, false, &a_profile(Break::None)).contains("--weights"));
     }
 
     /// `--trace-jsonl` is a recorder, not a workload lever: it takes a path (so

@@ -413,38 +413,71 @@ the tombstone is exactly the window where it would become load-bearing.
 
 #### Where the two lanes stand
 
-Three statements, all measured rather than inferred: **both lanes are green, the
-partitioned lane still runs non-blocking, and what keeps it that way is now a
-census rather than a bug.**
+**Every statement in this section is as of a named commit, and the naming is not
+pedantry.** The sentence that used to stand here — "both lanes are green" — went
+stale twice, both times because it was written in the present tense on the day a
+lane happened to be clean. A lane is green *at a commit over a range*; write it
+that way or it becomes a lie the next time someone lands a bug. If you are
+reading this more than a few commits after the hash below, the honest assumption
+is that you do not know where the lanes stand and have to soak them yourself.
 
-- **Aligned** — the five nightly profiles at their own 50,000 seeds each with
-  `--require-reach` (`--start-seed 12000000001`): 250,000 seeds, 466,908,487
-  storage-op interleavings, 2,293,880 acked uploads, **zero violations**, no
-  starved oracle, 0 audit view repairs of any class.
-- **Partitioned** — the `multi-bucket` profile plus one flag. Re-measured at
-  `4eaa015` over two 900-second lanes on disjoint fresh ranges
-  (`--start-seed 50000000001` and `51000000001`), both `--partition 100
-  --require-reach`: **344,839 seeds, 869,932,702 storage-op interleavings,
-  3,112,571 acked uploads, zero failing seeds**, zero audit view repairs of any
-  class, no starved oracle. The coverage behind that zero is intact rather than
-  suppressed — `MERGE_DIVERGENCE` executes on 47% of seeds and
-  `FREEZE_JUSTIFIED` on 40%, both of which read a flat zero on every aligned
-  seed ever run.
+**Measured at `8e5916f`**, four 900-second lanes on disjoint fresh ranges, each
+one built from a pristine `git archive` rather than the shared `target/`:
+
+| lane | flags (plus `--partition 100` except the first) | start-seed | seeds | interleavings | acked | failing |
+|---|---|---|---|---|---|---|
+| `rotating-swarm` (**gated**) | `--rotate --require-reach` | 95000000001 | 289,934 | 500,651,992 | 1,510,651 | **0** |
+| partitioned `multi-bucket` | `--nodes 3 --buckets 2 --ops 160 --packages 6 --files 2 --require-reach` | 96000000001 | 175,353 | 446,060,585 | 1,575,238 | **0** |
+| partitioned `three-bucket` | `--nodes 3 --buckets 3 --ops 160 --packages 6 --files 2 --require-reach` | 98000000001 | 119,947 | 425,337,801 | 1,083,091 | **0** |
+| partitioned **narrow** | `--nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3` | 97000000001 | 926,399 | 651,139,506 | 802,056 | **0** |
+
+Zero audit view repairs of any class on all four. The first three passed
+`--require-reach` with no starved oracle; **the fourth is starved by
+construction and its seed count must never be pooled with the others** — see
+*The starved-denominator trap* below, which is the whole reason it is listed
+separately rather than added in.
+
+The coverage behind those zeros is intact rather than suppressed. On the
+partitioned `multi-bucket` lane `MERGE_DIVERGENCE` executes on 47% of seeds and
+`FREEZE_JUSTIFIED` on 40%; at three buckets they rise to **62% and 53%** — more
+bucket pairs per seed means more chances for one to disagree. Both read a flat
+zero on every aligned seed ever run.
+
+The `three-bucket` lane is new here and the row it shadows is newer still. Three
+buckets is the multi-region topology the product is *marketed* on, and until
+2026-07-27 no lane in `simulation.yml` ran it: every row topped out at two, where
+a write has exactly one peer, so the pre-ack fan-out and `execute`'s per-pair work
+each ran once per pass and could not be partially applied. At three they run
+twice, and a crash between the two halves reaches a state two buckets cannot. A
+`DURABILITY` defect that lost acknowledged bytes fleet-wide survived two
+multi-million-seed censuses in exactly that blind spot (`1732633`). The gated
+matrix now carries a `three-bucket` row at `--partition 0`; the partitioned
+three-bucket lane measured above is not yet a workflow row, and adding one is the
+open follow-up.
 
 Compare ranges, never time budgets: this box's seed rate swings better than 1.5x
 with load, so two `--max-secs` runs explore different ranges and their failing
 counts are not comparable.
 
-Zero is not yet gateable, and the arithmetic is the argument rather than the
-mood. A draw of N seeds reds with probability 1-(1-p)^N, so holding the nightly
-to one red night in twenty over this job's draw (90,000–100,000 seeds) needs
-p ≤ 5.7e-7. The census in the `vopr-partitioned` job comment — 1,473,767 seeds
-across four profiles, plus the 344,839 here — bounds p only to about 1.6e-6
-(rule of three, 95%): the right order of magnitude, still short. Reaching the
-bound needs roughly 5.3M clean seeds. So `vopr-partitioned` in `simulation.yml`
-stays `continue-on-error: true`, with a 15-minute `--max-secs` budget instead of
-a seed count, because the lane's output is a *rate* you watch: given a seed
-count it would stop at its first failing seed and report nothing.
+**Four clean lanes are not a gate, and the reason changed.** It used to be that
+the draw was too small: a rule-of-three bound on a run of zeros could not get p
+low enough, and more soaking would eventually have earned the gate. That argument
+is dead. The census in the `vopr-partitioned` job comment — 5,417,063 fresh
+partitioned seeds at `08d94f2` — found **6 failing seeds**, so p is a measured
+non-zero of 1.07e-6 with a 95% interval of [4.7e-7, 2.1e-6]. A draw of N seeds
+reds with probability 1-(1-p)^N and this job's N is ~91,560, which puts it at 9.3%
+of nights red; one red night in twenty needs p ≤ 5.6e-7, and the best estimate is
+1.9x that. **When the count was zero, more soaking could earn the gate. It cannot
+now — only fixes can.** So `vopr-partitioned` stays `continue-on-error: true`,
+with a 15-minute `--max-secs` budget instead of a seed count, because the lane's
+output is a *rate* you watch: given a seed count it would stop at its first
+failing seed and report nothing.
+
+Read that 5.4M-seed census with its own caveat, which is the next section: 4.1M of
+those seeds are the narrow 1-package/1-file profile, which starves four oracles,
+so only ~2.1M of the 5.4M are durability-effective. The pooled count is real
+merge-algebra coverage and *not* real durability coverage, and the rate quoted
+against the full 5.4M is correspondingly optimistic for the durability family.
 
 Do **not** try to reach green by lowering `--partition`. `partition_for` draws
 `rng.chance(percent)` once per *seed*, so the flag is a share of seeds and not
@@ -477,11 +510,26 @@ green with it. The lesson is the same one `fd14f01` taught in the `(Orphan, _)`
 arm and is now written into `Verdict::Noop`'s own doc comment: a `Noop` that is
 really a deferral is a durability claim, not a shrug.
 
-Nothing is left. The three root causes that outlived the demotion-fence fix are
-all closed, each with its minimum reproducer promoted from the nightly to a
-pinned `ci.yml` gate so a regression reds a merge rather than a nightly. The
-full diagnosis of each is in the job comment above `vopr-partitioned` in
-`.github/workflows/simulation.yml`; in one line apiece:
+**Do not write "nothing is left" here again.** That sentence has stood in this
+document twice and been false both times within days — the roster empties,
+someone records the empty roster in the present tense, and the next census
+refills it while the sentence sits there reading as measurement. What is true is
+narrower and keeps its shape as the tree moves: *the root causes filed by the
+census at `08d94f2` are closed as of `8e5916f`*, each with its minimum reproducer
+promoted from the nightly to a pinned `ci.yml` gate so a regression reds a merge
+rather than a nightly. Whether new ones are open is a question about the *next*
+census, and this paragraph cannot answer it.
+
+The roster the census at `08d94f2` filed, and where each stands at `8e5916f`:
+
+| root cause | closed by | one line |
+|---|---|---|
+| `AUDIT_REPAIRED_VIEWS` — the global index published HTML and JSON non-atomically and nothing healed the tear | `c9b2e32` | `write_global_indexes_cas` wrote `simple/index.html` then `simple/index.json`, so a crash between them left the bucket serving a PEP 503 index listing a package its own PEP 691 index did not. The reconcile the code installs was unreachable from steady state — `update_global_index` returns early on an empty delta, and the pair check is gated on `!cached.html_current`, which every CAS win pins true. **This one was never a partitioned-lane bug**: it reproduced at `--partition 0`, one bucket, faults off — the *gated* `rotating-swarm` row |
+| `DURABILITY` — a spent-fence clear erased the record authorizing a settled demotion | `1732633` | Both pair merges ran `clear_spent_demotion_fence` on bucket 0 with the canonical key already emptied by that bucket's own `settle_mirror_quarantine`. The fence was the only record that the emptiness was authorized. Only ever reproduced at **three** buckets |
+| `CONVERGENCE` + `SELF_CONSISTENCY` + `DURABILITY` — a copy published truth over a body the bucket had lost | `8e5916f` | `copy_live` lands the artifact before the sidecar so the sidecar can only describe bytes the bucket holds; `settle_mirror_quarantine`'s delete landed between the two legs, the sidecar published over an emptied key, and a racing create took it with different bytes. Permanent from there: `decide` compares sidecar shas, both buckets read as agreed, and nothing re-hashes a stored body |
+| `CONSERVATION` — acked bytes existed nowhere | `8e5916f` | Same delete, one more victim: with nothing preserved the settle read the key empty and deleted it anyway, so a publish creating it in that gap was acked `200` and its bytes then existed nowhere. A re-read cannot close either window — `delete_keys` is unconditional — so the authorization is now the `_quarantine/` copy, not a reading of the key |
+
+The older three, closed before that census and kept for the shape of the class:
 
 - `DURABILITY` (`f37e391`) — a settle decided from a listing-era read re-fenced
   a filename private truth had already resolved, while a concurrent pass holding
@@ -509,6 +557,78 @@ To reproduce a lane by hand:
 ```
 cargo run --release --example vopr -- --rotate --partition 100 --max-secs 600
 ```
+
+#### The starved-denominator trap
+
+**A failure rate is only meaningful against the seeds whose oracles were actually
+reached.** Quote the starved and the unstarved denominators separately; never
+pool them into one rate. This nearly produced a wrong gating decision, so it gets
+its own section rather than a footnote.
+
+This has now happened on two successive censuses, which is why it is a rule and
+not an anecdote. The current one pools **5,417,063** partitioned seeds and quotes
+one headline rate; **4.1M of them — 76% — are a narrow 1-package × 1-file
+profile**, and that profile starves four of the oracles the rate is quoted
+against. Only ~2.1M of the 5.4M are durability-effective. The census before it
+made the same move at a different size (2.2M pooled, 61% narrow).
+
+The starvation is not an estimate. Re-measured at `8e5916f` on a fresh range
+(`--start-seed 97000000001`, 926,399 seeds, `--nodes 3 --buckets 2 --packages 1
+--files 1 --ops 40 --fail-percent 3 --partition 100`), the reach meter says it
+outright:
+
+```
+DURABILITY        395856  on 179829/926399 seeds  [STARVED — executed on 19% of seeds, floor 25%]
+VISIBILITY        395856  on 179829/926399 seeds  [STARVED — executed on 19% of seeds, floor 25%]
+CONSERVATION      218311  on 198403/926399 seeds  [STARVED — executed on 21% of seeds, floor 25%]
+SELF_CONSISTENCY  495442  on 225077/926399 seeds  [STARVED — executed on 24% of seeds, floor 25%]
+```
+
+All four sit **below the 25% `--require-reach` floor**. The mechanism is the one
+`tests/simulation_matrix.rs` pins the 12-filename corpus to prevent: DURABILITY,
+VISIBILITY and CONSERVATION skip any filename an authorized delete, tombstone or
+freeze removed, so their whole universe is `packages × files` names — and at one
+name, 40 ops with a 10% delete weight tombstone the entire corpus by quiescence
+on ~80% of seeds. Those seeds iterate an empty set. **They could not have found
+the failures being counted against them.** Dividing by them does not measure a
+safer product; it measures a bigger number under the bar.
+
+The trap is worse than a diluted denominator, because the starved profile is also
+the *cheap* one. Over the identical 900-second budget at `8e5916f`:
+
+| lane | seeds | acked uploads | durability-effective seeds |
+|---|---|---|---|
+| narrow 1×1 (starved) | 926,399 | 802,056 | 179,829 (19%) |
+| `multi-bucket` 6×2 (unstarved) | 175,353 | 1,575,238 | 175,233 (99.9%) |
+
+The narrow lane draws **5.3× the seeds while verifying half the acked uploads**.
+Pool them and the starved profile contributes 84% of the seed count and 51% of
+the durability-effective denominator — it dominates the headline precisely
+because each of its seeds does less work. A pooled rate is therefore biased
+toward whichever lane is cheapest to run, which is exactly backwards.
+
+Three rules, in the order they bite:
+
+1. **Report `failures / durability-effective seeds`, not `failures / seeds`** —
+   the second number is on every summary line and is the wrong one whenever a
+   starved profile is in the pool. The reach meter's `on X/Y seeds` column is the
+   right denominator and the binary already prints it.
+2. **Never pool lanes with different reach profiles into one rate.** One row per
+   lane, each with its own denominator. If a single number is genuinely needed,
+   it belongs to the oracle family it was measured for, and the starved lanes are
+   excluded from that family — not averaged into it.
+3. **Run the pooled lanes under `--require-reach`** wherever the rate will be
+   quoted. A lane that would fail the floor cannot back a claim about the oracles
+   it starves. The narrow lane above is deliberately run *without* it, because its
+   job is merge-algebra coverage — which it delivers, reaching `MERGE_DIVERGENCE`
+   on 18% of seeds and `FREEZE_JUSTIFIED` on 16%, both tail-event slots that waive
+   the floor by design.
+
+None of this makes the narrow lane a bad lane. It is where three of the last four
+root causes were found: one filename concentrates contention in a way twelve
+filenames cannot, which is the whole point of running it. It is a *durability*
+denominator it must never contribute to. Add a narrow lane when hunting the next
+bug; keep its seeds out of the rate you gate on.
 
 #### What the partitioned lane caught, and what closed each one
 
@@ -1092,7 +1212,9 @@ table below are the accurate ones.
 | DETERMINISM | workload-reachable | any nondeterminism downstream of the op sequence reds it | `rerun` |
 | TOMBSTONE_MONOTONICITY | **product-unreachable** | `publish_record`'s tombstone fence rejects re-publishing a deleted filename, so no ack can follow a `204` — 150k wide seeds (795k acked uploads, 251M interleavings) produced zero, and could not have produced one | `resurrect` |
 | classifier TEST 1 (both analyses) | **workload-unreachable** — but *witnessed once*, under `--partition` | seed 268 produced a real class-1 (a truth mutation no breadcrumb covered) before `df3db2d`; it is green now and 0 audit repairs of any class appear in the 489,901 seeds measured at `783d423`. Nothing forbids another, so this is a coverage statement, not a rule | `ordering`, `globalindex` |
-| classifier TEST 2a / 2b / FALLBACK (both analyses) | **workload-unreachable**, never witnessed | each needs the tier-3 audit to have repaired a view; the marker/tick/sweep/reconcile fast path converged every schedule in 489,901 seeds — 166,409 of them partitioned — with 0 audit repairs. Class 2 *has* been witnessed historically (seed 1067836, since fixed) | `poison`, `blind`, `fallback` |
+| classifier/**global** FALLBACK | **workload-unreachable** — but *witnessed*, and recently | `--seed 60000037578 --rotate` reds `[class 2] … unexplained global-index drift for vopr-delta — conservatively premature-consumption` against the tree at `c1b66df`; so does `--seed 66000074673 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100`. Both are the non-atomic global-index pair (`AUDIT_REPAIRED_VIEWS`), and both are green at `8e5916f` once `c9b2e32` landed. Verified one seed at a time on both trees, not inferred | `fallback` |
+| classifier/**global** TEST 2a poisoned | **workload-unreachable** — but *witnessed* | `--seed 61000246528 --rotate --partition 100` reds `[class 2] … op 87 rebuilt vopr-gamma from truth@598 and wrote the global index@607 claiming it present, yet the audit had to flip that membership — update_global_index consumed the signal without applying it` at `c1b66df`; green at `8e5916f`. That is `R::GlobalPoisoned`, the 2a arm of `analyze_global` | `poison` |
+| classifier/pkg TEST 2a / 2b / FALLBACK, classifier/global TEST 2b | **workload-unreachable**, never witnessed | each needs the tier-3 audit to have repaired a view, and the three witnesses above are all the *global* analysis — a membership flip, not a per-package render. No product schedule has yet driven the per-package arms, nor global 2b. Class 2 on the per-package path *has* been witnessed historically (seed 1067836, since fixed) | `poison`, `blind`, `fallback` |
 | classifier TEST 3 (both analyses) | **harness-unreachable** | the simulator's `tick_lock` serializes every rebuild to stand in for the bucket lease, so two never overlap | `race` (planted history) |
 
 `resurrect` proves the *oracle* is sound even though the *product* cannot reach
@@ -1135,10 +1257,18 @@ reason to downgrade the arms. Class 2 came first, from the aligned rotating
 profile (seed 1067836, closed by 1bc3ce9 + f30036a). Class 1 came from the
 partitioned lane (seed 268, closed by `df3db2d`) — the product produced one, and
 the sentence that used to stand here saying it never had was written before
-`--partition` existed. Both seeds are green at `783d423` and neither class
-appears in the 489,901 seeds measured there, so today the arms are fed only by
-`--break` again. Read that as workload-unreachable, not product-unreachable: the
-gap between those two words is exactly one knob, and this lane is the proof.
+`--partition` existed.
+
+**And class 2 came back.** The `AUDIT_REPAIRED_VIEWS` root cause the `08d94f2`
+census filed — the global index publishing HTML and JSON non-atomically — drove
+the *global* analysis's 2a and FALLBACK arms on real product behavior at
+`c1b66df`: seeds 60000037578 and 66000074673 on FALLBACK, 61000246528 on 2a, each
+verified one seed at a time against both trees. `c9b2e32` closed it and all three
+are green at `8e5916f`. So the honest reading is not "fed only by `--break`" — it
+is that these arms go quiet between defects and light up when one lands, which is
+what an arm is *for*. Read every zero here as workload-unreachable, never
+product-unreachable: the gap between those two words is exactly one knob or one
+regression, and this lane has now proved it twice.
 
 ### Proving the oracles ran at all (the reach meter)
 
@@ -1191,10 +1321,15 @@ profile alone, TOMBSTONE_MONOTONICITY 88,405, VERIFY 32,443, ACK_TOTALITY
 not new breakage; it is the same fact the class-3 investigation established, now
 printed rather than excavated. The classifier only runs when the tier-3 audit had
 to repair a view, and the fast path converged every schedule in the sample (0
-audit repairs in 140k seeds). Nothing in the workload reaches any of the ten
-— so ~310 lines of classifier are carried entirely by inputs a `--break` has to
-supply, and the honest read is that the taxonomy is a diagnosis tool for a rare
-event, not a routinely-exercised gate. Every arm now has a kill proof
+audit repairs in 140k seeds). Nothing in *that* sample reached any of the ten —
+which is a statement about a defect-free tree, not about the arms. Three of them
+(global 2a and global FALLBACK) have since been driven by real product behavior
+at `c1b66df` and went quiet again at `8e5916f` when `c9b2e32` closed the defect
+feeding them, so the correct reading is that a zero here tracks the absence of a
+bug rather than the unreachability of an arm. Between defects, ~310 lines of
+classifier are carried entirely by inputs a `--break` has to supply, and the
+taxonomy is a diagnosis tool for a rare event rather than a routinely-exercised
+gate. Every arm now has a kill proof
 (`ordering`, `globalindex`, `poison`, `blind`, `race`, `fallback`), which
 settles soundness and settles nothing about frequency.
 
@@ -1269,9 +1404,11 @@ each is a claim someone has to defend here:
 | classifier/pkg TEST 1 | **workload**-unreachable, not product-unreachable: `--partition` reached it once (seed 268, a truth mutation no breadcrumb covered), `df3db2d` closed it, and 0 audit repairs of any class appear in the 489,901 seeds measured at `783d423`. No rule forbids the next one. The excuse string in `examples/vopr.rs` still says `product-unreachable`; that word is wrong and should be `workload-unreachable` | `--break ordering`, `--break globalindex` |
 | classifier/global TEST 1 | same, on global membership | `--break globalindex` |
 | classifier/{pkg,global} TEST 3 | *harness*-unreachable: `tick_lock` serializes rebuilds, so two never overlap (see the reachability table above). Still true under `--partition`: a partitioned node diverges only its **writes**, never its rebuilds, so every tick still takes the one bucket-0 lease | `--break race` |
-| classifier/{pkg,global} TEST 2a | needs an audit repair whose final writer had listed truth past every mutation | `--break poison` |
+| classifier/pkg TEST 2a | needs an audit repair whose final writer had listed truth past every mutation | `--break poison` |
+| classifier/global TEST 2a | **workload**-unreachable, and it has been *reached*: `--seed 61000246528 --rotate --partition 100` drove it at `c1b66df` off the non-atomic global-index pair; `c9b2e32` closed that and it reads zero again at `8e5916f`. The excuse string in `examples/vopr.rs` says `product-unreachable: no audit-repaired membership flip seen` — both halves are now false and the row should say `workload-unreachable` | `--break poison` |
 | classifier/{pkg,global} TEST 2b | needs an audit repair TEST 1 declined — a covered mutation whose breadcrumbs were all consumed blind | `--break blind` |
-| classifier/{pkg,global} FALLBACK | reached only by drift no test explains — which would itself be a classifier bug | `--break fallback` |
+| classifier/pkg FALLBACK | reached only by drift no test explains — which would itself be a classifier bug | `--break fallback` |
+| classifier/global FALLBACK | same in principle, but *reached twice* at `c1b66df` (seeds 60000037578, 66000074673) by the same non-atomic global-index pair, and zero again at `8e5916f`. Its excuse string carries no unreachability claim, so nothing there needs correcting — but do not read its zero as one | `--break fallback` |
 
 An entry earning its first execution is *news*, not a failure: the run prints
 `[now reached — drop it from EXPECTED_ZERO]` beside it, and the entry comes out.

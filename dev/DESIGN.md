@@ -365,6 +365,44 @@ acceptance test for all of it: **any single surviving bucket rebuilds the whole
 service** — enforced by the layout-manifest test and the single-survivor blackbox
 test, which every new feature's state must pass through.
 
+**And it converges on a clock.** "Eventually" is not something anyone can
+operate against, so the number is **five minutes**: after the last write lands
+and the faults clear, every bucket agrees within five minutes of healthy
+operation. That is the cadence the fast path already runs on —
+`--worker-interval-secs` polls markers every second and
+`--repl-sweep-interval-secs` sweeps `_repl/` notes every 300 — so it is a
+statement about the loop that exists, not an aspiration bolted onto it.
+
+A fleet holding exceptional debt is forgiven **proportionally, and only
+proportionally**. Twenty thousand records queued behind a healed partition
+cannot move in the same five minutes as three. So the deadline is affine in the
+work outstanding at the moment the storm ended:
+
+```
+deadline = 5 min
+         + 1 fast cycle     per REPL_SWEEP_PAGE of queued `_repl/` notes and `_dirty/` markers
+         + 1 backstop cycle per REPL_SWEEP_PAGE of divergence no marker covers
+```
+
+Two terms because two loops do the work, on deliberately different cadences:
+breadcrumbed debt drains on the sweep, and divergence nothing wrote down is
+found only by `reconcile`'s pairwise tree diff, which runs on
+`--reconcile-interval-secs` — a day, by default. A page is a page because the
+sweep works what it lists (`REPL_SWEEP_PAGE`, `src/replicate.rs`), so a backlog
+deeper than one is a backlog that needs another cycle.
+
+Affine and no faster, for a reason: a deadline that grew superlinearly in the
+backlog would excuse precisely the failure it exists to catch — a fleet whose
+per-record cost rises with its own queue depth. And the debt is measured **once,
+before the first repair**. An allowance recomputed from live debt would grow
+every time the fleet re-created a marker it had failed to consume, which is what
+a livelock looks like from the inside, so the bound would chase the bug instead
+of firing on it.
+
+`examples/vopr.rs` asserts this as the `STALENESS` oracle against simulated
+time and prints the tightest margin any seed left on every run; dev/TESTING.md
+carries the census the constants were measured from.
+
 An ordered list of two or more bucket URIs — any mix of S3, GCS, and Azure —
 turns every non-selected bucket into a warm writable copy. Each node
 independently selects the first bucket its health view calls healthy. A request

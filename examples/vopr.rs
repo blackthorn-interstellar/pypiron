@@ -47,8 +47,15 @@
 //!   - NO LEAKS: no unconsumed `_dirty/` markers, no undrained `_repl/` notes;
 //!   - CONSERVATION: acknowledged bytes are never silently lost — a file is
 //!     live, or its filename was deleted/frozen by an authorized operation;
-//!   - LIVENESS (bounded): the fleet reaches quiescence within the drain
-//!     budget — no livelock;
+//!   - STALENESS (bounded agreement, on a clock): after the last write and once
+//!     the faults clear, every bucket must agree within a DEADLINE measured in
+//!     simulated minutes — five for a healthy fleet, plus one convergence cycle
+//!     per page of outstanding replication debt at the moment the storm ended.
+//!     It replaced a budget of heal rounds, which was a made-up number with no
+//!     relationship to time: "converges, but would have taken an hour" passed
+//!     silently under it. The fleet must also stop working — reaching the
+//!     deadline and then churning markers forever is the other half of the same
+//!     oracle;
 //!   - REPAIR TAXONOMY: every view the tier-3 audit had to repair is
 //!     classified from the run's effect history (see `Observer` below).
 //!     ORDERING (truth changed with no durable breadcrumb ever covering it)
@@ -75,9 +82,9 @@
 //! separately — plus how many seeds got any of it, because an oracle reading
 //! zero over a whole soak, or reading five figures on a fifth of the seeds, is a
 //! defect report, not a pass (see `Reach`). `--require-reach` turns both into a
-//! failing run. The same line reports the worst rounds-to-quiesce any seed needed
-//! against the heal budget, so an over-generous budget cannot quietly turn a
-//! livelock into a green LIVENESS.
+//! failing run. The same line reports the tightest STALENESS margin any seed
+//! left — how much of its own deadline the slowest convergence spent — because a
+//! bound with no observed margin is a bound about to break.
 //!
 //! Determinism is self-checked, not assumed: every run whose seed is a multiple
 //! of `--recheck-every` executes twice and must produce an identical storage-op
@@ -186,8 +193,14 @@ enum Break {
     Conserve,
     /// Leave an object on bucket 1 that bucket 0 never got → CONVERGENCE.
     Diverge,
-    /// Park an object under `_repl/` that no sweep recognizes → LIVENESS.
+    /// Park an object under `_repl/` that no sweep recognizes → STALENESS, the
+    /// never-settles arm.
     Wedge,
+    /// Steal a peer's copy of a live record the moment the fleet has finished
+    /// converging, leaving no breadcrumb over the loss → STALENESS, the
+    /// past-its-deadline arm. The fleet repairs it, correctly and completely —
+    /// one whole tree-diff cycle later than the debt it was holding paid for.
+    SlowRepair,
     /// A phantom package the audit must materialize, plus the effect history
     /// of the rebuild that caused it. One break per classifier arm; each kills
     /// the per-package *and* the global analyzer at once (`analyze`'s and
@@ -229,7 +242,7 @@ const BREAK_PKG: &str = "vopr-phantom";
 /// reproduce line all read this table: a second list that quietly fails to
 /// track the first is exactly how the reproduce line came to describe a
 /// different run than the one that failed.
-const BREAKS: [(&str, Break); 22] = [
+const BREAKS: [(&str, Break); 23] = [
     ("view", Break::View),
     ("fanout", Break::Fanout),
     ("rerun", Break::Rerun),
@@ -241,6 +254,7 @@ const BREAKS: [(&str, Break); 22] = [
     ("conserve", Break::Conserve),
     ("diverge", Break::Diverge),
     ("wedge", Break::Wedge),
+    ("slow-repair", Break::SlowRepair),
     ("poison", Break::Poison),
     ("blind", Break::Blind),
     ("race", Break::Race),
@@ -266,6 +280,16 @@ impl Break {
                 panic!("unknown --break {name} ({})", known.join("|"))
             }
         }
+    }
+
+    /// Whether this break plants AFTER the heal round's audits rather than
+    /// before them. Exactly one does, and it has to: `slow-repair` models a
+    /// peer's copy vanishing once the fleet believes it is finished, and a
+    /// theft planted before the audit merely makes the audit re-render the
+    /// losing bucket's views — which reports a classifier finding about the
+    /// harness's own damage instead of the late repair the break is for.
+    fn plants_after_audit(self) -> bool {
+        self == Break::SlowRepair
     }
 
     /// How this break is spelled on the command line; `None` for no break.
@@ -479,6 +503,37 @@ async fn apply_break(
         // not exist. Planted pre-audit so the drain budget is really spent.
         (Break::Wedge, true) => {
             buckets[0].insert("_repl/vopr-wedge", b"nothing drains this".to_vec());
+        }
+        // Converges, but late — the failure a fixpoint-counting budget cannot
+        // see and a deadline can. The last bucket loses its copy of one live
+        // record, body and sidecar together, with NOTHING durable pointing at
+        // the loss: no `_dirty/` marker, no `_repl/` note. So the fast path is
+        // blind to it and only `reconcile`'s pairwise tree diff can find it,
+        // which costs a whole backstop cycle the run's `t0` debt never bought.
+        //
+        // Planted pre-audit on the first heal round, i.e. AFTER that round's
+        // reconcile has already run: the repair lands on the next round's, so
+        // the delay is exactly one cycle and every other oracle still reads a
+        // healthy fleet at quiescence — the record is back, byte-identical,
+        // before anything looks. Views are left alone on both counts: the losing
+        // bucket's views still list a record its truth lacks, which is a state
+        // the tree diff resolves by restoring the record rather than by
+        // re-rendering, so no audit repair fires and the classifier stays quiet.
+        (Break::SlowRepair, true) => {
+            // Needs a peer to repair from, exactly like `diverge` and `split`.
+            let Some(victim) = buckets.get(1..).and_then(<[_]>::last) else {
+                return;
+            };
+            let dump = victim.dump();
+            let stolen = dump.iter().find_map(|(key, _)| {
+                let akey = key.strip_suffix(".meta.json")?;
+                dump.contains_key(akey).then(|| akey.to_string())
+            });
+            if let Some(akey) = stolen {
+                let _ = victim
+                    .delete_keys(&[akey.clone(), format!("{akey}.meta.json")])
+                    .await;
+            }
         }
         // Corrupt the bytes an acked artifact serves, fleet-wide, while parking
         // the real bytes outside `packages/` — so CONSERVATION still finds them
@@ -855,10 +910,220 @@ impl Rng {
 // through `FaultView` — so the meter cannot move the schedule it measures.
 // ---------------------------------------------------------------------------
 
-/// Heal-phase budgets. The margin printed by the meter is measured against
-/// these, so the budget and its headroom can never drift apart.
+/// Heal-phase loop bounds. These terminate the driver's loop; they are NOT the
+/// convergence claim. What the fleet promises is a *time* — see `STALENESS`
+/// below — and these are only sized so a run that is going to converge has room
+/// to. A run that hits either bound has already blown the time bound.
 const HEAL_ROUNDS: u64 = 12;
 const DRAIN_PASSES: u64 = 20;
+
+// ---------------------------------------------------------------------------
+// STALENESS: the bounded-agreement invariant.
+//
+// The product promise, from the owner: after the writes stop, the buckets agree
+// "like a few minutes" — with explicit forgiveness when the fleet is holding
+// exceptional debt ("20k packages uploaded during a network partition to one
+// bucket"). That is a statement about TIME, and this simulator runs on virtual
+// time, so measuring it costs nothing.
+//
+// What replaced what: this used to be `LIVENESS`, which asserted only that the
+// fleet reached a fixpoint inside `HEAL_ROUNDS` x `DRAIN_PASSES`. Those are made
+// up. A fleet that converged on round 11 and one that converged on round 1 were
+// the same green, and "converges, but would have taken an hour" passed silently.
+//
+//   deadline(debt) = base + STALENESS_PER_ITEM_SECS * debt
+//
+// `base` is `--staleness-secs` (default `STALENESS_HEALTHY_SECS`), the healthy
+// promise. `debt` is the outstanding replication debt at the moment the storm
+// ends — see `replication_debt`.
+//
+// WHY LINEAR. A queue drained at a bounded rate empties in time proportional to
+// its depth; that is the only shape a real convergence engine has. Anything
+// superlinear is exactly the failure this invariant exists to catch: a fleet
+// whose per-item cost grows with the backlog is livelocking, and a deadline that
+// grew the same way would excuse it forever. Anything constant contradicts the
+// promise in the other direction — it would red a fleet that is working fine and
+// merely has 20,000 records to move.
+//
+// WHY THE DEBT IS SAMPLED ONCE, AT t0. The allowance must not be a function of
+// the defect it is measuring. Recomputed from live debt it would grow every time
+// the fleet re-created a marker it had failed to consume — which IS the livelock
+// shape — so the bound would chase the bug and never fire. Sampled before the
+// first heal action, `debt` is a constant of the run: nothing the heal phase
+// does, correct or broken, can buy itself more time.
+// ---------------------------------------------------------------------------
+
+/// The healthy-operation promise in seconds: a fleet whose outstanding work
+/// fits in one cycle of each loop agrees within five minutes of simulated time.
+/// Overridable per run with `--staleness-secs`.
+const STALENESS_HEALTHY_SECS: u64 = 300;
+
+/// Records one convergence cycle moves. This is `REPL_SWEEP_PAGE`
+/// (`src/replicate.rs`): the sweep lists a page of notes and works what it
+/// listed, so a backlog deeper than a page is a backlog that needs another
+/// cycle. The same page size bounds the `_dirty/` drain and the tree diff.
+const STALENESS_CYCLE_RECORDS: u64 = 1_000;
+
+/// One convergence cycle of simulated time. Every wait the driver makes the
+/// fleet sit through in the heal phase is 90 s — the drain pass that left debris
+/// behind, each leader drain, the post-audit settle — because each is one intent
+/// grace, and that is what a cycle costs here. Production's equivalents are
+/// `worker_interval` (1 s) and `repl_sweep_interval` (300 s); the work inside a
+/// cycle is free in both, so what a deadline measures is how many waits the
+/// fleet needed, which is exactly the question.
+const STALENESS_CYCLE_SECS: u64 = 90;
+
+/// The view of a bucket two buckets must agree ON. Truth plus per-package views,
+/// byte-strict, with two documented normalizations: `.origin` claims compare by
+/// state (the nonce is a fresh ABA guard on every write), and the global index
+/// compares as its parsed name set (an absent index and an empty one both derive
+/// "no packages", and the HTML is a pure function of that set).
+///
+/// One definition, two readers: the CONVERGENCE oracle at quiescence, and the
+/// staleness clock during the heal phase. They were one closure inside the
+/// oracle; a second, drifting copy of "agreed" is how a bound comes to be
+/// measured against something other than the thing it gates.
+fn agreement_projection(dump: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, Vec<u8>> {
+    let mut projected: BTreeMap<String, Vec<u8>> = dump
+        .iter()
+        .filter(|(k, _)| k.starts_with("packages/") || k.starts_with("simple/"))
+        .filter(|(k, _)| *k != "simple/index.json" && *k != "simple/index.html")
+        .map(|(k, v)| {
+            if k.ends_with("/.origin") {
+                let state = serde_json::from_slice::<serde_json::Value>(v)
+                    .ok()
+                    .and_then(|doc| {
+                        doc.get("origin")
+                            .and_then(|o| o.as_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| String::from_utf8_lossy(v).into_owned());
+                (k.clone(), state.into_bytes())
+            } else {
+                (k.clone(), v.clone())
+            }
+        })
+        .collect();
+    let names: Vec<String> = dump
+        .get("simple/index.json")
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .and_then(|doc| {
+            doc.get("projects").and_then(|p| p.as_array()).map(|arr| {
+                let mut names: Vec<String> = arr
+                    .iter()
+                    .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+                    .map(str::to_string)
+                    .collect();
+                names.sort();
+                names
+            })
+        })
+        .unwrap_or_default();
+    projected.insert(
+        "simple/index.json#names".to_string(),
+        names.join(",").into_bytes(),
+    );
+    projected
+}
+
+/// Protocol debris on one bucket: work the fleet has durably written down and
+/// not yet done.
+fn marker_count(dump: &BTreeMap<String, Vec<u8>>) -> usize {
+    dump.keys()
+        .filter(|k| k.starts_with("_dirty/") || k.starts_with("_repl/"))
+        .count()
+}
+
+/// Records the fleet still owes somebody, in the units the convergence loops
+/// move one at a time. Two sources, because a marker is not the only debt there
+/// is:
+///
+///   * every `_repl/` note and `_dirty/` marker, fleet-wide — work with a
+///     durable breadcrumb over it, which the sweep and the `_dirty/` drain
+///     consume a page at a time;
+///   * every key some bucket disagrees with bucket 0 on — the lost-copy debt a
+///     crashed fan-out left with no note behind it, which only `reconcile`'s
+///     pairwise tree diff will find. Counted per (bucket, key), because each is
+///     a separate copy an executor has to make.
+///
+/// Both are one record of work, so both are counted the same. They were charged
+/// at different rates for one revision of this oracle, on the strength of a
+/// measurement that turned out to be the harness's sampling rate rather than the
+/// product's cadence; with the clock read where the work actually lands, no
+/// profile separates them (dev/TESTING.md).
+///
+/// Raw `dump()` reads only: no `FaultView`, no op-sequence number, no rng draw —
+/// measuring the debt must not perturb the schedule that drains it.
+fn replication_debt(dumps: &[BTreeMap<String, Vec<u8>>]) -> u64 {
+    let markers: usize = dumps.iter().map(marker_count).sum();
+    let mut uncovered = 0usize;
+    if let Some((first, rest)) = dumps.split_first() {
+        let first = agreement_projection(first);
+        for dump in rest {
+            let other = agreement_projection(dump);
+            uncovered += first
+                .keys()
+                .chain(other.keys())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|k| first.get(*k) != other.get(*k))
+                .count();
+        }
+    }
+    (markers + uncovered) as u64
+}
+
+/// Has the fleet arrived? Every bucket agrees and it owes nothing.
+fn fleet_agreed(dumps: &[BTreeMap<String, Vec<u8>>]) -> bool {
+    replication_debt(dumps) == 0
+}
+
+/// Simulated seconds since `from`. The clock only ever moves forward, so the
+/// clamp is defensive, not arithmetic.
+fn elapsed_secs(clock: &SimClock, from: time::OffsetDateTime) -> u64 {
+    (clock.now_utc() - from).whole_seconds().max(0) as u64
+}
+
+/// Cycles a loop that moves `STALENESS_CYCLE_RECORDS` per turn needs for `n`.
+fn cycles_for(n: u64) -> u64 {
+    n.div_ceil(STALENESS_CYCLE_RECORDS)
+}
+
+/// The deadline a run carrying this much debt at `t0` has to agree by:
+///
+/// ```text
+/// base + 90s x ceil(debt / 1000)
+/// ```
+///
+/// Affine in the work. The ceiling is not a rounding convenience: waiting for a
+/// periodic sweep costs a whole cycle whether it has one record to move or a
+/// thousand, so the first record buys the first cycle and the thousand-and-first
+/// buys the second.
+fn staleness_deadline(base_secs: u64, debt: u64) -> u64 {
+    base_secs.saturating_add(STALENESS_CYCLE_SECS.saturating_mul(cycles_for(debt)))
+}
+
+/// One seed's convergence measurement, kept so the run can print its tightest.
+#[derive(Clone, Copy)]
+struct Staleness {
+    seed: u64,
+    /// Simulated seconds from the end of the storm to the first sample where
+    /// every bucket agreed and owed nothing; `None` when it never happened.
+    secs: Option<u64>,
+    deadline: u64,
+    debt: u64,
+}
+
+impl Staleness {
+    /// Share of the deadline spent. A run that never agreed is past it by
+    /// construction, so it sorts above every finite measurement.
+    fn spent_pct(&self) -> u64 {
+        match self.secs {
+            None => u64::MAX,
+            Some(secs) => secs.saturating_mul(100) / self.deadline.max(1),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum R {
@@ -866,7 +1131,7 @@ enum R {
     Visibility,
     Conservation,
     Convergence,
-    Liveness,
+    Staleness,
     Verify,
     AckTotality,
     Tombstone,
@@ -907,7 +1172,10 @@ const REACH_METER: [(&str, &str); REACH_SLOTS] = [
         "CONVERGENCE",
         "bucket pair compared with real truth/views present",
     ),
-    ("LIVENESS", "heal phase that had protocol debris to drain"),
+    (
+        "STALENESS",
+        "heal phase whose fleet had convergence work to do",
+    ),
     (
         "VERIFY",
         "bucket with non-empty truth re-rendered by verify_storage",
@@ -983,7 +1251,7 @@ const REACH_VIOLATION_PREFIX: [&str; REACH_SLOTS] = [
     "VISIBILITY",
     "CONSERVATION",
     "CONVERGENCE",
-    "LIVENESS",
+    "STALENESS",
     "VERIFY",
     "ACK_TOTALITY",
     "TOMBSTONE_MONOTONICITY",
@@ -1091,6 +1359,10 @@ struct Reach {
     /// Worst heal rounds, and worst drain passes inside one round, any seed used.
     peak_rounds: AtomicU64,
     peak_drains: AtomicU64,
+    /// The seed that came closest to the staleness deadline, and what it spent.
+    /// A bound with no observed margin is a bound about to break, so the run
+    /// prints the tightest one it saw whether or not anything failed.
+    worst_staleness: Mutex<Option<Staleness>>,
     /// True once any explored profile had more than one bucket.
     multi_bucket: AtomicBool,
     /// True once any explored seed actually drew a split partition plan.
@@ -1107,6 +1379,7 @@ impl Reach {
             seed_mark: [const { AtomicU64::new(0) }; REACH_SLOTS],
             peak_rounds: AtomicU64::new(0),
             peak_drains: AtomicU64::new(0),
+            worst_staleness: Mutex::new(None),
             multi_bucket: AtomicBool::new(false),
             partitioned: AtomicBool::new(false),
         }
@@ -1129,6 +1402,17 @@ impl Reach {
     }
     fn peak(cell: &AtomicU64, observed: u64) {
         cell.fetch_max(observed, Ordering::Relaxed);
+    }
+    /// Keep the seed that spent the largest SHARE of its deadline — not the
+    /// largest absolute time. The deadline is per-seed, so the absolute worst
+    /// is routinely the seed that was owed the most allowance and used it
+    /// comfortably; the share is the number that tells you how close the bound
+    /// is to breaking.
+    fn record_staleness(&self, observed: Staleness) {
+        let mut worst = self.worst_staleness.lock().expect("staleness lock");
+        if worst.is_none_or(|w| observed.spent_pct() > w.spent_pct()) {
+            *worst = Some(observed);
+        }
     }
 }
 
@@ -1241,13 +1525,34 @@ fn report_reach(explored: u64, rechecked: u64, brk: Break) -> Vec<&'static str> 
     }
     let rounds = REACH.peak_rounds.load(Ordering::Relaxed);
     let drains = REACH.peak_drains.load(Ordering::Relaxed);
-    println!(
-        "  quiesce headroom: worst seed used {rounds}/{HEAL_ROUNDS} heal rounds ({} spare) and \
-         {drains}/{DRAIN_PASSES} drain passes in a round ({} spare) — LIVENESS is a boolean, so \
-         a budget with no margin left silently passes a livelock",
-        HEAL_ROUNDS.saturating_sub(rounds),
-        DRAIN_PASSES.saturating_sub(drains),
+    let loop_use = format!(
+        "heal loop peaked at {rounds}/{HEAL_ROUNDS} rounds, {drains}/{DRAIN_PASSES} drain passes"
     );
+    // A bound with no observed margin is a bound about to break, so the margin
+    // is printed on every run, red or green.
+    match *REACH.worst_staleness.lock().expect("staleness lock") {
+        None => println!("  staleness margin: no seed had convergence work to time — {loop_use}"),
+        Some(worst) => {
+            let spent = worst.spent_pct();
+            match worst.secs {
+                Some(secs) => println!(
+                    "  staleness margin: tightest seed agreed {secs}s after its last write against \
+                     a {}s deadline ({} record(s) of debt = {} cycle(s)) — {spent}% spent, {}% \
+                     spare, at --seed {}; {loop_use}",
+                    worst.deadline,
+                    worst.debt,
+                    cycles_for(worst.debt),
+                    100u64.saturating_sub(spent),
+                    worst.seed,
+                ),
+                None => println!(
+                    "  staleness margin: --seed {} NEVER agreed against a {}s deadline ({} \
+                     record(s) of debt) — {loop_use}",
+                    worst.seed, worst.deadline, worst.debt,
+                ),
+            }
+        }
+    }
     unreached
 }
 
@@ -3174,6 +3479,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         weights,
         brk,
         partition_percent,
+        staleness_secs,
     } = profile;
     let plan = partition_for(seed, nodes, buckets, partition_percent);
     if plan.split {
@@ -3323,24 +3629,41 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
     for node in 0..nodes {
         fleet.restart_node(node, "heal");
     }
+    // t0 for the STALENESS clock: the storm is over. Faults are off, every node
+    // has restarted (which aborted its in-flight tasks), and no further client
+    // op will be issued — so this is exactly "after the last write and after
+    // faults clear". Everything the fleet does from here is convergence, and it
+    // is on a deadline.
+    //
+    // The debt is read here and never again. It is what the fleet owes at the
+    // moment it is handed the problem, so the allowance it buys is a constant of
+    // the run: no amount of thrashing during the heal phase can extend it.
+    // Raw `dump()`, never a `FaultView` — no op-sequence number, no rng draw,
+    // no trace event, so measuring cannot move the schedule it measures.
+    let storm_end = clock.now_utc();
+    let debt = replication_debt(
+        &fleet
+            .buckets
+            .iter()
+            .map(|bucket| bucket.dump())
+            .collect::<Vec<_>>(),
+    );
+    let deadline = staleness_deadline(staleness_secs, debt);
+    // A fleet that is already agreed and owes nothing converged in zero seconds;
+    // sampling before the heal-start jump is what lets it say so.
+    let mut agreed_at: Option<u64> = (debt == 0).then_some(0);
     advance_clock(&clock, 120, "heal-start", &viz); // all intents stale
     viz_world(&viz, &fleet.buckets, false);
     let mut quiesced = false;
     let mut audit_view_repairs: u64 = 0;
     let mut repairs_by_class: [u64; 3] = [0; 3]; // [ordering, premature, race]
     let mut last_fingerprint: Option<Vec<BTreeMap<String, Vec<u8>>>> = None;
-    // LIVENESS is a boolean, so a run with nothing to drain would "pass" it
-    // having checked nothing; it counts as executed only when quiescence had
-    // real work to do. Sampled here, before the first drain pass — the loop's
-    // own `markers_left` runs *after* a full pass across every node and so can
-    // never see the debris that pass just cleared. Raw `dump()`, never a
-    // `FaultView`: no op-sequence number, no rng draw, no trace event.
-    let mut saw_debris = fleet.buckets.iter().any(|bucket| {
-        bucket
-            .dump()
-            .keys()
-            .any(|k| k.starts_with("_dirty/") || k.starts_with("_repl/"))
-    });
+    // STALENESS is a comparison against a deadline, so a run with nothing to
+    // converge would "pass" it having measured nothing; it counts as executed
+    // only when the heal phase had real work — debt at t0, or debris that
+    // appeared during a drain pass. `debt` already covers the first, including
+    // the cross-bucket disagreements the old marker-only sample could not see.
+    let mut saw_work = debt > 0;
     for round in 0..HEAL_ROUNDS {
         sample_verdicts(
             &fleet.buckets.iter().map(|b| b.dump()).collect::<Vec<_>>(),
@@ -3380,18 +3703,17 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
             // The real count, not a flag: the `pass` event publishes it and a
             // reader watching debris shrink pass over pass needs the number.
             // Same raw `dump()` read either way.
-            let markers_left: usize = fleet
-                .buckets
-                .iter()
-                .map(|bucket| {
-                    bucket
-                        .dump()
-                        .keys()
-                        .filter(|k| k.starts_with("_dirty/") || k.starts_with("_repl/"))
-                        .count()
-                })
-                .sum();
-            saw_debris |= markers_left > 0;
+            let pass_dumps: Vec<BTreeMap<String, Vec<u8>>> =
+                fleet.buckets.iter().map(|bucket| bucket.dump()).collect();
+            let markers_left: usize = pass_dumps.iter().map(marker_count).sum();
+            saw_work |= markers_left > 0;
+            // Stop the staleness clock the first moment the fleet has arrived.
+            // Guarded on `markers_left == 0` so the projection only runs when it
+            // can possibly say yes — outstanding debris IS debt, so the answer
+            // is already no, and this loop runs up to 20 times a round.
+            if agreed_at.is_none() && markers_left == 0 && fleet_agreed(&pass_dumps) {
+                agreed_at = Some(elapsed_secs(&clock, storm_end));
+            }
             Reach::peak(&REACH.peak_drains, pass + 1);
             if let Some(viz) = &viz {
                 viz.emit(
@@ -3463,10 +3785,23 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                             .await;
                     }
                 }
+                // Sampled INSIDE the leader drain, not just at the round
+                // boundary. The tree diff's copies land here, and a clock that
+                // only reads at the boundary charges the fleet the whole
+                // remaining round for work it had already finished — which is a
+                // deadline failing on the harness's sampling rate rather than on
+                // the product.
+                if agreed_at.is_none() {
+                    let mid: Vec<BTreeMap<String, Vec<u8>>> =
+                        fleet.buckets.iter().map(|bucket| bucket.dump()).collect();
+                    if fleet_agreed(&mid) {
+                        agreed_at = Some(elapsed_secs(&clock, storm_end));
+                    }
+                }
                 advance_clock(&clock, 90, "leader-drain", &viz);
             }
         }
-        if brk != Break::None && round == 0 {
+        if brk != Break::None && round == 0 && !brk.plants_after_audit() {
             apply_break(
                 brk,
                 true,
@@ -3523,6 +3858,16 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                 violations_pre.push(format!(
                     "AUDIT: warm-bucket audit failed on round {round}: {e:?}"
                 ));
+            }
+        }
+        // Same reason as the leader-drain sample above: an audit that converged
+        // the fleet did so here, and charging it the post-audit jump on top
+        // measures the driver, not the product.
+        if agreed_at.is_none() {
+            let audited: Vec<BTreeMap<String, Vec<u8>>> =
+                fleet.buckets.iter().map(|bucket| bucket.dump()).collect();
+            if fleet_agreed(&audited) {
+                agreed_at = Some(elapsed_secs(&clock, storm_end));
             }
         }
         advance_clock(&clock, 90, "post-audit", &viz);
@@ -3674,14 +4019,30 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                 }
             }
         }
+        // The audits are behind us and the round's damage report is filed, so a
+        // break landing here is one the fleet has to notice on its OWN next
+        // cycle — see `Break::plants_after_audit`.
+        if brk.plants_after_audit() && round == 0 {
+            apply_break(
+                brk,
+                true,
+                rerun,
+                &fleet.buckets,
+                &fleet.plan.obs,
+                &fleet.ledger,
+            )
+            .await;
+        }
         // Fixpoint: no markers and no storage change over a full round.
         let snapshot: Vec<BTreeMap<String, Vec<u8>>> =
             fleet.buckets.iter().map(|bucket| bucket.dump()).collect();
-        let markers_left = snapshot.iter().any(|dump| {
-            dump.keys()
-                .any(|k| k.starts_with("_dirty/") || k.starts_with("_repl/"))
-        });
-        saw_debris |= markers_left;
+        let markers_left = snapshot.iter().any(|dump| marker_count(dump) > 0);
+        saw_work |= markers_left;
+        // The round's reconcile and audits are convergence work too, so the
+        // fleet can arrive here having been behind at the last drain pass.
+        if agreed_at.is_none() && !markers_left && fleet_agreed(&snapshot) {
+            agreed_at = Some(elapsed_secs(&clock, storm_end));
+        }
         Reach::peak(&REACH.peak_rounds, round + 1);
         if let Some(viz) = &viz {
             viz.world(&snapshot, false);
@@ -3692,8 +4053,21 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         }
         last_fingerprint = Some(snapshot);
     }
-    if saw_debris {
-        REACH.hit(R::Liveness);
+    if saw_work {
+        REACH.hit(R::Staleness);
+    }
+    REACH.record_staleness(Staleness {
+        seed,
+        secs: agreed_at,
+        deadline,
+        debt,
+    });
+    if std::env::var_os("VOPR_STALENESS_CSV").is_some() {
+        println!(
+            "STALECSV,{seed},{},{},0",
+            agreed_at.map(|s| s as i64).unwrap_or(-1),
+            debt
+        );
     }
 
     // ---- Invariants. The ledger stays unlocked until the last await is behind
@@ -3701,6 +4075,34 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
     let mut violations = violations_pre;
     if let Some(viz) = &viz {
         viz.emit("phase", serde_json::json!({ "name": "oracle" }));
+    }
+    // STALENESS: bounded agreement, in simulated minutes. See the header block
+    // over `STALENESS_HEALTHY_SECS` for the deadline and why it has the shape it
+    // has. Two failures, because they are two different defects: agreeing late,
+    // and never settling down at all.
+    let spent = elapsed_secs(&clock, storm_end);
+    let allowance = format!(
+        "{staleness_secs}s healthy + {} cycle(s) x {STALENESS_CYCLE_SECS}s for the {debt} \
+         record(s) of replication debt it held when the storm ended",
+        cycles_for(debt)
+    );
+    match agreed_at {
+        Some(secs) if secs > deadline => violations.push(format!(
+            "STALENESS: the fleet took {secs}s of simulated time to agree after the last write, \
+             past its {deadline}s deadline ({allowance})"
+        )),
+        Some(_) => {}
+        None => violations.push(format!(
+            "STALENESS: the fleet never agreed — {spent}s of simulated time after the last write \
+             and {} record(s) still outstanding, against a {deadline}s deadline ({allowance})",
+            replication_debt(
+                &fleet
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.dump())
+                    .collect::<Vec<_>>()
+            ),
+        )),
     }
     if !quiesced {
         let leftovers: Vec<String> = fleet
@@ -3716,7 +4118,9 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
             })
             .collect();
         violations.push(format!(
-            "LIVENESS: fleet did not quiesce within the drain budget; leftover markers: {leftovers:?}"
+            "STALENESS: the fleet never stopped working — no fixpoint in {HEAL_ROUNDS} heal \
+             rounds x {DRAIN_PASSES} drain passes ({spent}s of simulated time); leftover \
+             markers: {leftovers:?}"
         ));
     }
     if brk != Break::None {
@@ -3766,56 +4170,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
 
     // Convergence: identical truth + views across buckets.
     if buckets > 1 {
-        let project = |dump: &BTreeMap<String, Vec<u8>>| -> BTreeMap<String, Vec<u8>> {
-            let mut projected: BTreeMap<String, Vec<u8>> = dump
-                .iter()
-                .filter(|(k, _)| k.starts_with("packages/") || k.starts_with("simple/"))
-                .filter(|(k, _)| {
-                    // The global views are compared as a parsed name set below:
-                    // an absent global index and an empty one both derive "no
-                    // packages" from truth (the HTML is the same pure function
-                    // of that set). Per-package views stay byte-strict.
-                    *k != "simple/index.json" && *k != "simple/index.html"
-                })
-                .map(|(k, v)| {
-                    if k.ends_with("/.origin") {
-                        // Claims are equal when their *state* is equal; the
-                        // nonce is a fresh ABA guard on every write by design.
-                        let state = serde_json::from_slice::<serde_json::Value>(v)
-                            .ok()
-                            .and_then(|doc| {
-                                doc.get("origin")
-                                    .and_then(|o| o.as_str())
-                                    .map(str::to_string)
-                            })
-                            .unwrap_or_else(|| String::from_utf8_lossy(v).into_owned());
-                        (k.clone(), state.into_bytes())
-                    } else {
-                        (k.clone(), v.clone())
-                    }
-                })
-                .collect();
-            let names: Vec<String> = dump
-                .get("simple/index.json")
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-                .and_then(|doc| {
-                    doc.get("projects").and_then(|p| p.as_array()).map(|arr| {
-                        let mut names: Vec<String> = arr
-                            .iter()
-                            .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
-                            .map(str::to_string)
-                            .collect();
-                        names.sort();
-                        names
-                    })
-                })
-                .unwrap_or_default();
-            projected.insert(
-                "simple/index.json#names".to_string(),
-                names.join(",").into_bytes(),
-            );
-            projected
-        };
+        let project = agreement_projection;
         let first = project(&dumps[0]);
         for (idx, dump) in dumps.iter().enumerate().skip(1) {
             let other = project(dump);
@@ -4869,6 +5224,11 @@ struct Args {
     /// (see the `--shrink` section). Off by default and inert until a seed
     /// fails, so it cannot move any schedule.
     shrink: bool,
+    /// `--staleness-secs`: the healthy-operation half of the STALENESS
+    /// deadline, before the per-debt allowance. Pure oracle parameter — it
+    /// moves no schedule — but it moves the verdict, so a non-default value is
+    /// part of the reproduce command.
+    staleness_secs: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -4889,6 +5249,8 @@ struct Profile {
     /// proof and every measured baseline keeps the exact schedule it was mined
     /// under; `--rotate` draws it, and the nightly's multi-bucket rows pass it.
     partition_percent: u64,
+    /// Healthy-operation base of the STALENESS deadline (`--staleness-secs`).
+    staleness_secs: u64,
 }
 
 impl Profile {
@@ -4927,6 +5289,7 @@ fn profile_for(seed: u64, args: &Args) -> Profile {
             weights: args.weights,
             brk: args.brk,
             partition_percent: args.partition_percent,
+            staleness_secs: args.staleness_secs,
         };
     }
     let mut rng = Rng::new(seed ^ 0x0507_A7E5);
@@ -4954,6 +5317,7 @@ fn profile_for(seed: u64, args: &Args) -> Profile {
         // and the rotating row is the one every pinned soak baseline was
         // measured on. `--rotate --partition N` is the partitioned soak.
         partition_percent: args.partition_percent,
+        staleness_secs: args.staleness_secs,
     }
 }
 
@@ -4975,9 +5339,17 @@ fn reproduce_command(seed: u64, rotate: bool, profile: &Profile) -> String {
         0 => String::new(),
         percent => format!(" --partition {percent}"),
     };
+    // A relaxed or tightened staleness base changes the VERDICT without
+    // changing the world, which is the easier way to lose a repro: the run
+    // comes back green under the default deadline and gets filed as flaky.
+    let staleness = if profile.staleness_secs == STALENESS_HEALTHY_SECS {
+        String::new()
+    } else {
+        format!(" --staleness-secs {}", profile.staleness_secs)
+    };
     if rotate {
         return format!(
-            "cargo run --release --example vopr -- --seed {seed} --rotate{partition}{brk}"
+            "cargo run --release --example vopr -- --seed {seed} --rotate{partition}{staleness}{brk}"
         );
     }
     // The op mix is implicit at `DEFAULT_OP_WEIGHTS` and drawn from the seed
@@ -4994,7 +5366,7 @@ fn reproduce_command(seed: u64, rotate: bool, profile: &Profile) -> String {
     };
     format!(
         "cargo run --release --example vopr -- --seed {seed} --nodes {} --buckets {} \
-         --packages {} --files {} --ops {} --fail-percent {}{partition}{weights}{brk}",
+         --packages {} --files {} --ops {} --fail-percent {}{partition}{staleness}{weights}{brk}",
         profile.nodes,
         profile.buckets,
         profile.packages,
@@ -5066,6 +5438,7 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         trace_jsonl: None,
         weights: DEFAULT_OP_WEIGHTS,
         shrink: false,
+        staleness_secs: STALENESS_HEALTHY_SECS,
     };
     let mut it = argv;
     // Collected as they are seen, checked after the whole line parses, so the
@@ -5160,6 +5533,7 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
             "--rotate" => args.rotate = true,
             "--require-reach" => args.require_reach = true,
             "--shrink" => args.shrink = true,
+            "--staleness-secs" => args.staleness_secs = grab(),
             "--verbose" => {}
             other => panic!("unknown flag {other} (see examples/vopr.rs)"),
         }
@@ -5168,7 +5542,8 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         !args.rotate || overridden.is_empty(),
         "--rotate derives the whole workload from the seed, so {} would be discarded — \
          drop them, or drop --rotate. Legal with --rotate: --seed --seeds --start-seed \
-         --recheck-every --forever --max-secs --break --require-reach --partition --shrink.",
+         --recheck-every --forever --max-secs --break --require-reach --partition --shrink \
+         --staleness-secs.",
         overridden.join(" ")
     );
     // One file is one seed's timeline. A multi-seed run would interleave worlds
@@ -5739,7 +6114,7 @@ mod tests {
             "four executions on two seeds is two seeds, however they clumped"
         );
         assert_eq!(seeds_reached(&reach, R::Tombstone), 1);
-        assert_eq!(seeds_reached(&reach, R::Liveness), 0);
+        assert_eq!(seeds_reached(&reach, R::Staleness), 0);
     }
 
     #[test]
@@ -5797,6 +6172,105 @@ mod tests {
         );
     }
 
+    /// The debt the deadline is bought with has to be *work*, not noise: a
+    /// marker is work a breadcrumb points at, a key two buckets disagree on is
+    /// work only the tree diff will find, and an agreed fleet owes nothing.
+    /// The debt the deadline is bought with has to be *work*: a marker is work a
+    /// breadcrumb points at, a key two buckets disagree on is work only the tree
+    /// diff will find, and an agreed fleet owes nothing. Both are one record.
+    #[test]
+    fn debt_counts_breadcrumbed_work_and_the_lost_copies_alike() {
+        let dump = |pairs: &[(&str, &str)]| -> BTreeMap<String, Vec<u8>> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+                .collect()
+        };
+        let agreed = dump(&[("packages/p/a.whl", "bytes")]);
+        assert_eq!(replication_debt(&[agreed.clone(), agreed.clone()]), 0);
+        assert!(fleet_agreed(&[agreed.clone(), agreed.clone()]));
+
+        let mut owing = agreed.clone();
+        owing.insert("_repl/1/p/a.whl!7".into(), b"note".to_vec());
+        owing.insert("_dirty/p".into(), b"marker".to_vec());
+        assert_eq!(
+            replication_debt(&[owing, agreed.clone()]),
+            2,
+            "a queued note and an undrained marker are two records of work"
+        );
+
+        assert_eq!(
+            replication_debt(&[agreed.clone(), dump(&[])]),
+            1,
+            "a copy one bucket never got is debt nothing on the fast path can see"
+        );
+        assert!(!fleet_agreed(&[agreed, dump(&[])]));
+    }
+
+    /// The deadline is affine in the work and no faster. A bound that grew
+    /// superlinearly would excuse the fleet whose per-record cost rises with its
+    /// own backlog — which is the livelock this oracle exists to catch.
+    #[test]
+    fn the_deadline_grows_one_cycle_per_page_of_debt() {
+        assert_eq!(
+            staleness_deadline(300, 0),
+            300,
+            "a fleet owing nothing gets the healthy promise and nothing else"
+        );
+
+        // One record and one page cost the same cycle: waiting for a periodic
+        // sweep does not get cheaper because the queue behind it is short.
+        assert_eq!(staleness_deadline(300, 1), 300 + STALENESS_CYCLE_SECS);
+        assert_eq!(
+            staleness_deadline(300, STALENESS_CYCLE_RECORDS),
+            300 + STALENESS_CYCLE_SECS
+        );
+        assert_eq!(
+            staleness_deadline(300, STALENESS_CYCLE_RECORDS + 1),
+            300 + 2 * STALENESS_CYCLE_SECS,
+            "a page and one more is two cycles"
+        );
+
+        // Linear, checked as linear: doubling the pages doubles the allowance
+        // over the base, so the owner's 20,000 queued records buy 20 cycles —
+        // half an hour of forgiveness — and not 400.
+        let ten = staleness_deadline(300, 10 * STALENESS_CYCLE_RECORDS);
+        let twenty = staleness_deadline(300, 20 * STALENESS_CYCLE_RECORDS);
+        assert_eq!(twenty - 300, 2 * (ten - 300));
+        assert_eq!(twenty, 300 + 20 * STALENESS_CYCLE_SECS);
+    }
+
+    /// The margin the run prints is a SHARE of each seed's own deadline. Ranking
+    /// by absolute seconds would report whichever seed was owed the most
+    /// allowance and used it comfortably, and never the seed about to breach.
+    #[test]
+    fn the_tightest_margin_is_the_largest_share_not_the_longest_wait() {
+        let debt = 0;
+        let comfortable = Staleness {
+            seed: 1,
+            secs: Some(600),
+            deadline: 1200,
+            debt,
+        };
+        let tight = Staleness {
+            seed: 2,
+            secs: Some(280),
+            deadline: 300,
+            debt,
+        };
+        assert!(tight.spent_pct() > comfortable.spent_pct());
+        let never = Staleness {
+            seed: 3,
+            secs: None,
+            deadline: 300,
+            debt,
+        };
+        assert!(
+            never.spent_pct() > tight.spent_pct(),
+            "a fleet that never agreed is past every deadline there is"
+        );
+    }
+
     #[test]
     fn a_zero_still_fails_on_its_own() {
         let (note, failed) = reach_verdict(0, 0, 50_000, None, false, false);
@@ -5814,6 +6288,7 @@ mod tests {
             weights: DEFAULT_OP_WEIGHTS,
             brk,
             partition_percent: 0,
+            staleness_secs: STALENESS_HEALTHY_SECS,
         }
     }
 

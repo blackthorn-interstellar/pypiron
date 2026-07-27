@@ -56,6 +56,16 @@ fn job_invocation(job: &'static str) -> String {
         .join(" ")
 }
 
+/// The matrix rows declared inside `job` — the `- { name: ..., args: '...' }`
+/// entries. Every row carries its own flags now (the shared invocation may pass
+/// none), so a per-job assertion has to read them here and not from the command
+/// line the job runs.
+fn job_rows(job: &'static str) -> impl Iterator<Item = &'static str> {
+    job_lines(job)
+        .map(str::trim)
+        .filter(|line| line.starts_with("- { name:"))
+}
+
 /// The integer argument following `flag` on a matrix row. Words carry the YAML
 /// quoting around them (`extra: '--packages 6 ...'`), so both sides are stripped
 /// of everything that is not the flag or the number.
@@ -113,9 +123,7 @@ fn nightly_profiles_pin_a_durability_corpus() {
 /// A topology nothing runs is a topology nothing defends.
 #[test]
 fn the_gated_matrix_runs_the_marketed_multi_region_topology() {
-    let widest = job_lines("vopr:")
-        .map(str::trim)
-        .filter(|line| line.starts_with("- { name:"))
+    let widest = job_rows("vopr:")
         .filter_map(|row| flag_value(row, "--buckets"))
         .max()
         .unwrap_or(0);
@@ -238,39 +246,74 @@ fn the_partitioned_lane_is_non_blocking_and_the_gated_matrix_is_not() {
 /// Narrow coverage belongs in a lane of its own.
 #[test]
 fn the_partitioned_lane_keeps_its_corpus_and_partitions_something() {
+    let rows: Vec<&str> = job_rows("vopr-partitioned:").collect();
+    assert!(
+        !rows.is_empty(),
+        "could not find the partitioned job's lane rows — has it moved?"
+    );
+    for row in &rows {
+        let partition = flag_value(row, "--partition").unwrap_or(0);
+        assert!(
+            partition > 0,
+            "a partitioned lane passes --partition {partition}: at 0% no seed \
+             draws a split fleet, every writer pins bucket 0, the merge algebra \
+             never runs, and the lane is a duplicate of a gated row:\n  {row}"
+        );
+        let packages = flag_value(row, "--packages");
+        let files = flag_value(row, "--files");
+        let corpus = packages.zip(files).map(|(p, f)| p * f).unwrap_or(0);
+        assert!(
+            corpus >= MIN_CORPUS,
+            "a partitioned lane has a {corpus}-filename corpus (packages={packages:?} \
+             files={files:?}); below {MIN_CORPUS} the deletes tombstone it and the \
+             durability oracles verify nothing on most seeds — and DURABILITY was \
+             live on this lane, 45 of the 291 failures measured before the \
+             `.mirror-quarantined` fence replicated:\n  {row}"
+        );
+    }
     let invocation = job_invocation("vopr-partitioned:");
     assert!(
-        !invocation.is_empty(),
-        "could not find the partitioned lane's vopr invocation — has it moved?"
-    );
-    let partition = flag_value(&invocation, "--partition").unwrap_or(0);
-    assert!(
-        partition > 0,
-        "the partitioned lane passes --partition {partition}: at 0% no seed \
-         draws a split fleet, every writer pins bucket 0, the merge algebra \
-         never runs, and the lane is a duplicate of the `multi-bucket` \
-         row:\n{invocation}"
-    );
-    let packages = flag_value(&invocation, "--packages");
-    let files = flag_value(&invocation, "--files");
-    let corpus = packages.zip(files).map(|(p, f)| p * f).unwrap_or(0);
-    assert!(
-        corpus >= MIN_CORPUS,
-        "the partitioned lane has a {corpus}-filename corpus (packages={packages:?} \
-         files={files:?}); below {MIN_CORPUS} the deletes tombstone it and the \
-         durability oracles verify nothing on most seeds — and DURABILITY was \
-         live on this lane, 45 of the 291 failures measured before the \
-         `.mirror-quarantined` fence replicated:\n{invocation}"
+        invocation.contains("matrix.lane.args"),
+        "the partitioned job's rows no longer reach its vopr command line:\n{invocation}"
     );
     assert!(
         invocation.contains("--max-secs"),
-        "the partitioned lane must run to a time budget: without one it stops at \
-         its first failing seed (~300 seeds in) and reports no rate to watch \
+        "the partitioned lanes must run to a time budget: without one a lane stops \
+         at its first failing seed (~300 seeds in) and reports no rate to watch \
          trend to zero:\n{invocation}"
     );
     assert!(
         !invocation.contains("--seeds"),
-        "the partitioned lane passes both --seeds and --max-secs; --max-secs \
+        "the partitioned lanes pass both --seeds and --max-secs; --max-secs \
          supersedes it, so --seeds is parsed and discarded:\n{invocation}"
+    );
+}
+
+/// The gated `three-bucket` row and the partitioned lane cover two DIFFERENT
+/// halves of the same topology, and a durability defect has already lived in
+/// their intersection.
+///
+/// At `--partition 0` the merge algebra never executes — seven of eleven
+/// `decide` verdicts read `[never presented]` over 1,235,949 control seeds — so
+/// the gated `three-bucket` row proves its invariants about a three-bucket fleet
+/// whose buckets never disagree. The partitioned lane runs the algebra, but ran
+/// it at two buckets only, where a write has exactly one peer and `execute`'s
+/// per-pair work cannot be half-applied. `--seed 65000024708` lost an
+/// acknowledged upload on all three buckets and needed BOTH: green at
+/// `--buckets 2`, green at `--partition 0`. A cross product nothing runs is a
+/// cross product nothing defends.
+#[test]
+fn the_partitioned_lanes_cover_the_marketed_multi_region_topology() {
+    let widest = job_rows("vopr-partitioned:")
+        .filter_map(|row| flag_value(row, "--buckets"))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        widest >= 3,
+        "the partitioned coverage job's widest lane runs {widest} bucket(s). \
+         Partitioned authorship is what makes `replicate::decide`'s merge \
+         algebra execute at all, and three buckets is the smallest honest \
+         instance of the multi-region deployment pypiron is marketed on. Seed \
+         65000024708 needed both at once and passed under either alone."
     );
 }

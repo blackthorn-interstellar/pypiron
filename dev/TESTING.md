@@ -315,7 +315,105 @@ The invariants:
   delete. A freeze is *not* an exemption: `freeze_side` writes its marker,
   copies the body to `_quarantine/` and tombstones before it drops anything, so
   a frozen filename owes the fleet every byte-set it acked, findable somewhere;
-- **liveness** — the fleet quiesces within the drain budget.
+- **staleness** — bounded agreement, on a clock. See below.
+
+### Bounded staleness: how long "converged" is allowed to take
+
+The oracle above used to be **liveness**, and liveness was a boolean over a
+made-up number: the fleet had to reach a fixpoint inside 12 heal rounds x 20
+drain passes. Nothing in that is time. A seed that converged on round 1 and one
+that converged on round 11 were the same green, and *converges, but would have
+taken an hour* passed silently — which is the failure operators actually
+experience, and the one nothing was watching for.
+
+The product promise (dev/DESIGN.md) is a time: **after the last write lands and
+the faults clear, every bucket agrees within five minutes**, with proportional
+forgiveness when the fleet is holding exceptional debt. The simulator runs on
+virtual time, so measuring that costs nothing.
+
+**What is measured.** `t0` is the instant the storm ends — faults off, every
+node restarted (which aborted its in-flight tasks), no further client op coming.
+From there the driver samples the raw buckets at every point where it already
+dumps them: before the first drain pass, after each drain pass, inside the
+leader drain, after the audits, and at each round boundary. The clock stops at
+the **first** sample where every bucket agrees *and* the fleet owes nothing —
+one definition of "agreed", `agreement_projection`, shared with the CONVERGENCE
+oracle so the bound cannot come to be measured against something other than the
+thing it gates.
+
+Sampling *inside* the round is not a detail. With samples only at round
+boundaries the harness charges a fleet that converged during the tree diff the
+whole remaining round — 360 s of driver clock it did not spend. That was
+measured, not theorized: one seed in 362,000 (`--seed 900016048 --rotate
+--partition 100`) read 480 s that way and breached its deadline; sampled
+properly it reads 120 s and spends 30% of its budget. A deadline that fires on
+the harness's sampling rate is worse than no deadline.
+
+**The deadline.**
+
+```
+deadline = --staleness-secs (default 300)
+         + 90 s  per page of `_repl/` notes and `_dirty/` markers
+         + 360 s per page of cross-bucket divergence no marker covers
+```
+
+A *page* is `REPL_SWEEP_PAGE` = 1,000 (`src/replicate.rs`): the sweep works what
+it listed, so a backlog deeper than a page needs another cycle. The two rates
+are the two loops that do the work. 90 s is the driver's marker-drain pass — the
+harness's model of the loop production runs on `--worker-interval-secs` (1 s) and
+`--repl-sweep-interval-secs` (300 s). 360 s is one tree-diff cycle: `reconcile`,
+the three drains that consume the markers it brackets its copies in, and the
+audit that follows. Production runs *that* loop on `--reconcile-interval-secs`,
+a day by default — so this harness holds the backstop to 4x its fast path where
+the shipped configuration holds it to 288x. The bound here is far tighter than
+the product's own scheduling, which is the right direction for a simulator.
+
+**Why affine, and why the debt is read exactly once.** A queue drained at a
+bounded rate empties in time proportional to its depth; that is the only shape a
+real convergence engine has. A deadline that grew *faster* than the work would
+excuse precisely the failure this exists to catch — a fleet whose per-record
+cost rises with its own backlog. A constant deadline would be wrong in the other
+direction, and the owner said so explicitly: 20,000 records queued behind a
+healed partition cannot move in the same five minutes as three. And the debt is
+sampled at `t0` and never again, because **the allowance must not be a function
+of the defect it is measuring**. Recomputed from live debt it would grow every
+time the fleet re-created a marker it had failed to consume, so the bound would
+chase the bug forever instead of firing on it.
+
+**The census.** Measured at this commit over 361,987 seeds across eight
+profiles, with the deadline lifted out of the way (`--staleness-secs 100000`) so
+every seed reported its convergence time instead of stopping at the first
+breach:
+
+| profile | seeds | convergence times seen | tightest margin |
+|---|---|---|---|
+| single-bucket | 55,000 | 0 s, 120 s | 30% spent |
+| single-bucket-crash-only | 55,000 | 0 s, 120 s | 30% spent |
+| multi-bucket | 51,893 | 120 s, 480 s | 64% spent |
+| multi-bucket-crash-only | 53,727 | 120 s, 480 s | 64% spent |
+| three-bucket | 36,367 | 120 s, 480 s | 64% spent |
+| three-bucket partitioned | 27,500 | 120 s, 480 s | 64% spent |
+| rotating-swarm | 55,000 | 0, 120, 210, 480, 570 s | 76% spent |
+| rotating-swarm partitioned | 27,500 | 0, 120, 210, 480, 570 s | 76% spent |
+
+Zero seeds anywhere ran past the deadline, and none failed to converge at all.
+The two facts that shape the constants: **every** seed whose `t0` debt was
+breadcrumb-only converged in ≤210 s — five minutes covers the fast path with
+30% to spare, exactly as the promise says — and **every** seed that needed the
+tree diff had uncovered divergence at `t0`, so the backstop cycle is bought by
+the work that requires it and by nothing else. The worst case anywhere is 570 s
+against a 750 s deadline.
+
+**The margin is printed on every run**, red or green, and it is a *share* of
+each seed's own deadline rather than the longest absolute wait — ranking by
+seconds would report whichever seed was owed the most allowance and used it
+comfortably, and never the seed about to breach.
+
+The old rounds/passes budget is still there, because the driver's loop has to
+terminate somewhere, but it is no longer the claim: a run that exhausts it has
+already blown the deadline, and both halves of the failure are reported under
+`STALENESS` — *took Ns, past its Ms deadline* and *never stopped working*. Each
+half has its own kill proof (`--break slow-repair`, `--break wedge`).
 
 ### The partitioned fleet (`--partition`)
 
@@ -1022,7 +1120,8 @@ storage and never the schedule.
 | `visibility` | one acked filename edited out of `simple/<pkg>/index.json` on every bucket | `VISIBILITY: acked … not listed` | 4 |
 | `conserve` | an acked body and sidecar destroyed fleet-wide with no tombstone, no freeze and no acked delete | `CONSERVATION: acked bytes … vanished from every bucket` | 4 |
 | `diverge` | one bucket keeps an object the other never got | `CONVERGENCE: bucket 0 and bucket N differ` (needs ≥2 buckets) | 1 |
-| `wedge` | an object under `_repl/` no sweep recognizes, so the fixpoint the heal phase is bounded to reach does not exist | `LIVENESS: fleet did not quiesce` | 1 |
+| `wedge` | an object under `_repl/` no sweep recognizes, so the fixpoint the heal phase is bounded to reach does not exist | `STALENESS: the fleet never stopped working` | 1 |
+| `slow-repair` | a peer's copy of one live record stolen *after* the heal round's audits, body and sidecar together, with no `_dirty/` marker and no `_repl/` note over the loss — so only the tree diff can find it, one whole backstop cycle later than the run's `t0` debt paid for | `STALENESS: … past its … deadline` (needs ≥2 buckets) | 2 |
 | `ordering` | truth grows a file with no `_dirty/` marker and no `_repl/` note ever covering it | `AUDIT_ORDERING:` (repair class 1, per-package path) | 3 |
 | `globalindex` | the same unbreadcrumbed mutation, under a package name nobody has published | `AUDIT_ORDERING: … simple/index.* membership` (class 1, global path) | 3 |
 | `poison` | a rebuild listed truth *past* the mutation and still wrote a view — and a name set — contradicting it | `… a poisoned derivation consumed the signal` (class 2a) | 3 |
@@ -1260,7 +1359,7 @@ table below are the accurate ones.
 | ORIGIN_TERMINALITY (the `.origin` claim) | workload-reachable, never witnessed | needs a mirror claim to win over a private one on some bucket after the private ack | `origin-demoted` |
 | ORIGIN_TERMINALITY (the record under it) | workload-reachable, never witnessed | needs a live mirror sidecar left renderable under a private claim | `mirror-served` |
 | CONVERGENCE | workload-reachable | needs ≥2 buckets; the replication paths that could break it run on every multi-bucket seed | `diverge` |
-| LIVENESS | workload-reachable | any undrainable breadcrumb reds it; the fast path has simply always drained | `wedge` |
+| STALENESS | workload-reachable | both arms: any undrainable breadcrumb stops the fleet settling, and any divergence the fast path cannot see costs a backstop cycle. The fast path has simply always drained inside the deadline | `wedge` (never settles), `slow-repair` (past the deadline) |
 | ACK_TOTALITY | workload-reachable, and *observed* — including where it is fatal; green now | a reported statistic under fault injection (4,691 misses in 44,648 partitioned seeds); crash-only, where it *is* fatal, it produced 8 failing seeds in 46,660 partitioned, first `--seed 9504440`, and 0 in 276,998 once `4bb9cb8` stopped `decide` calling a demotion fence a peer had never seen an agreement. That row used to read "has never produced one", which was true only of the aligned schedule | `fanout` |
 | DETERMINISM | workload-reachable | any nondeterminism downstream of the op sequence reds it | `rerun` |
 | TOMBSTONE_MONOTONICITY | **product-unreachable** | `publish_record`'s tombstone fence rejects re-publishing a deleted filename, so no ack can follow a `204` — 150k wide seeds (795k acked uploads, 251M interleavings) produced zero, and could not have produced one | `resurrect` |
@@ -1341,7 +1440,7 @@ vopr: oracle reach over 13122 seeds — executions on NON-TRIVIAL input, and the
   ...
   DETERMINISM                               1313  on     1313/1313 rechecked  seed re-executed, trace + final world compared
   classifier/pkg TEST 3 race                   0  on       0/13122 seeds  older view write by another op tested for being fresher  [zero, expected: harness-unreachable: tick_lock serializes rebuilds (dev/TESTING.md)]
-  quiesce headroom: worst seed used 3/12 heal rounds (9 spare) and 2/20 drain passes in a round (18 spare)
+  staleness margin: tightest seed agreed 480s after its last write against a 750s deadline (57 marker(s) = 1 fast cycle(s), 13 uncovered = 1 backstop cycle(s)) — 64% spent, 36% spare, at --seed 4522; heal loop peaked at 2/12 rounds, 1/20 drain passes
 ```
 
 **"Executed" deliberately does not mean "its code was reached."** DURABILITY
@@ -1369,7 +1468,7 @@ uploads, ack-totality misses and audit repairs are identical to the digit, and
 seeds — every one of the nine invariant oracles executes, on every profile whose
 topology admits it: DURABILITY and VISIBILITY 76,257 times on the rotating
 profile alone, TOMBSTONE_MONOTONICITY 88,405, VERIFY 32,443, ACK_TOTALITY
-51,845, CONVERGENCE 16,284, LIVENESS 16,060, CONSERVATION 39,944, DETERMINISM
+51,845, CONVERGENCE 16,284, STALENESS 16,060, CONSERVATION 39,944, DETERMINISM
 1,469. **All ten classifier arms read zero** — both analyses, every test. That is
 not new breakage; it is the same fact the class-3 investigation established, now
 printed rather than excavated. The classifier only runs when the tier-3 audit had
@@ -1468,18 +1567,18 @@ An entry earning its first execution is *news*, not a failure: the run prints
 Under `--break` the note reads `[reached under --break]` instead, because
 reaching an oracle is what a break is for.
 
-The last line is **quiesce headroom**. LIVENESS is a boolean, so an over-generous
-drain budget converts a livelock bug into a pass with nothing to show for it. The
-run therefore reports the worst rounds-to-quiesce any seed actually needed
-against the `HEAL_ROUNDS` budget, and the worst drain passes inside one round
-against `DRAIN_PASSES`. Over 330 seconds across all five profiles — 140,334
-seeds, 174M storage-op interleavings — the worst seed used **3 of 12** heal
-rounds and **2 of 20** drain passes. Two is the floor for rounds (the fixpoint
-test needs a repeat round to confirm), so the observed spread is 2–3 against a
-budget of 12: a 4x margin, and drain passes barely touched because the first pass
-sweeps every node before the loop re-checks. That is a lot of slack for a boolean
-to hide in, and it is now visible — if a change pushes the peak toward the budget,
-the number moves rounds before the oracle does.
+The last line is the **staleness margin**: the seed that spent the largest share
+of its own deadline, what it spent it on, and the seed number to reproduce it. A
+bound with no observed margin is a bound about to break, so it prints on every
+run whether or not anything failed — and it is a share rather than a longest
+wait, because the deadline is per-seed and the longest absolute wait is routinely
+the seed that was owed the most allowance and used it comfortably. Over 361,987
+seeds across eight profiles the tightest anywhere spends **76%** (570 s into a
+750 s deadline), and the fast-path-only seeds top out at 210 s inside 300. See
+*Bounded staleness* above for the deadline and the census it was measured from.
+The same line still carries the heal loop's own peaks against `HEAL_ROUNDS` and
+`DRAIN_PASSES` — they only bound the driver's loop now, but a peak creeping
+toward either is the earliest sign the deadline is next.
 
 ### Recording a run for the visualizer (`--trace-jsonl`, `PYPIRON_VIZ_GRAPH`)
 

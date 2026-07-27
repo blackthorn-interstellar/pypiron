@@ -242,10 +242,11 @@ jobs:
   #      Pinned by `replicate::tests::a_stale_spent_fence_clear_never_unauthorizes_a_settled_demotion`.
   #        --seed 65000024708 --nodes 3 --buckets 3 --packages 6 --files 4 --ops 200 --fail-percent 3 --partition 100
   #      THREE BUCKETS IS THE MARKETED MULTI-REGION TOPOLOGY and no lane ran it,
-  #      which is how this survived — the gated matrix now carries a
-  #      `three-bucket` row. That row is `--partition 0`, so it covers the
-  #      fan-out and `_repl/` debt paths at three buckets but not the merge
-  #      algebra; a partitioned three-bucket lane is the coverage still missing.
+  #      which is how this survived. Both halves are covered now: the gated
+  #      matrix carries a `three-bucket` row at `--partition 0` for the fan-out
+  #      and `_repl/` debt paths, and this job carries a partitioned
+  #      `three-bucket` lane for the merge algebra — the exact cross product the
+  #      seed above needed, and which neither half alone reproduces.
   #
   #   3. CONVERGENCE + SELF_CONSISTENCY + DURABILITY — CLOSED, and it was not a
   #      symmetry hole in the merge algebra. Bucket 0 ended serving one byte-set
@@ -287,20 +288,36 @@ jobs:
   # the five lanes, `.frozen` stands at quiescence on 19.4% of seeds,
   # `_quarantine/` on 22.2% and `.mirror-quarantined` on 0.02%.
   vopr-partitioned:
-    name: vopr (partitioned authorship — NON-BLOCKING, coverage lane)
+    name: vopr (partitioned ${{ matrix.lane.name }} — NON-BLOCKING, coverage lane)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        lane:
+          # The `multi-bucket` row above plus one flag, so the two are directly
+          # comparable — same topology, same 12-filename durability corpus,
+          # same op mix; the only difference is who authored the writes.
+          - { name: two-bucket, offset: 4000000000, args: '--nodes 3 --buckets 2 --ops 160 --packages 6 --files 2 --partition 100' }
+          # THE MISSING CROSS PRODUCT. The gated matrix gained a `three-bucket`
+          # row on 2026-07-27, but at `--partition 0` — so it covers the
+          # pre-ack fan-out and the `_repl/` repair debt at three buckets and
+          # NOT the merge algebra, which at `--partition 0` never executes at
+          # all (seven of eleven `decide` verdicts read `[never presented]` over
+          # 1,235,949 control seeds). Three buckets is the marketed multi-region
+          # topology and the two gaps compose: the DURABILITY defect at `--seed
+          # 65000024708` needed a third bucket AND partitioned authorship
+          # together, and was green under either one alone. This row is the
+          # `three-bucket` row and the `two-bucket` row above crossed, which is
+          # the only lane that runs the shape that bug lived in.
+          - { name: three-bucket, offset: 5000000000, args: '--nodes 3 --buckets 3 --ops 160 --packages 6 --files 2 --partition 100' }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # The `multi-bucket` row above plus one flag, so the two are directly
-      # comparable — same topology, same 12-filename durability corpus, same op
-      # mix; the only difference is who authored the writes.
-      #
       # `--max-secs` instead of `--seeds`, because this lane's output is a RATE,
       # not a verdict: without it the run stops at its first failing seed (~300
       # seeds in) and reports nothing you can watch trend. It also bounds the
@@ -308,21 +325,20 @@ jobs:
       # slow the runner is, well inside the 60-minute job timeout. `--seeds` is
       # deliberately absent: `--max-secs` supersedes it, and a flag that is
       # parsed and discarded is the defect the matrix above is shaped to avoid.
-      # The start seed strides 1,000,000/night — far more than the lane can
-      # explore in 15 minutes — so no two nights share a schedule, and the
-      # 4e9 offset keeps it clear of the aligned rows' ranges.
+      # The start seed strides 1,000,000/night — far more than a lane can
+      # explore in 15 minutes — so no two nights share a schedule, and each
+      # lane's own offset keeps it clear of the aligned rows and of its sibling.
       - name: Run partitioned simulation
         run: |
-          START=$(( 4000000000 + ( $(date +%s) / 86400 ) * 1000000 ))
+          START=$(( ${{ matrix.lane.offset }} + ( $(date +%s) / 86400 ) * 1000000 ))
           cargo run --release --example vopr -- \
             --start-seed "$START" --max-secs 900 \
-            --nodes 3 --buckets 2 --ops 160 --packages 6 --files 2 \
-            --partition 100 \
+            ${{ matrix.lane.args }} \
             --require-reach | tee vopr.out
       - name: Publish counters
         if: always()
         run: |
-          echo '### VOPR — partitioned authorship (NON-BLOCKING, coverage lane)' >> "$GITHUB_STEP_SUMMARY"
+          echo '### VOPR — partitioned ${{ matrix.lane.name }} (NON-BLOCKING, coverage lane)' >> "$GITHUB_STEP_SUMMARY"
           echo '' >> "$GITHUB_STEP_SUMMARY"
           echo 'Watch the failing-seed count trend to zero; the open root causes and their' >> "$GITHUB_STEP_SUMMARY"
           echo 'minimized repros are in the job comment in `.github/workflows/simulation.yml`.' >> "$GITHUB_STEP_SUMMARY"

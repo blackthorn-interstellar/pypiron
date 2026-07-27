@@ -275,7 +275,15 @@ jobs:
           check visibility "VISIBILITY: acked"         --nodes 2 --buckets 1 --ops 80
           check conserve  "CONSERVATION: acked bytes"  --nodes 2 --buckets 1 --ops 80
           check diverge   "CONVERGENCE: bucket 0"      --nodes 2 --buckets 2 --ops 80
-          check wedge     "LIVENESS: fleet did not quiesce" --nodes 2 --buckets 1 --ops 80
+          # STALENESS has two arms and they are two different defects, so each
+          # gets its own leg: `wedge` parks debris nothing consumes, so the
+          # fleet never settles at all; `slow-repair` steals a peer's copy once
+          # the fleet believes it is done, so the fleet converges — correctly,
+          # completely, and one whole tree-diff cycle past the deadline its
+          # outstanding debt bought it. A budget that counts heal rounds cannot
+          # see the second one, which is why it is no longer the budget.
+          check wedge     "the fleet never stopped working" --nodes 2 --buckets 1 --ops 80
+          check slow-repair "past its" --nodes 2 --buckets 2 --ops 80 --packages 6 --files 2
           # Classifier arms. `ordering`/`globalindex` are the two class-1 inputs
           # (per-package and global membership); the rest each red BOTH analyzers
           # at once, so the expected text names the arm, not the subsystem.

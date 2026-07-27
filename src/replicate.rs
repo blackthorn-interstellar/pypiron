@@ -1658,6 +1658,9 @@ async fn settle_mirror_quarantine(
     filename: &str,
 ) -> Result<bool> {
     ensure_private_origin(storage, pkg).await?;
+    if demotion_resolved_by_private_truth(storage, pkg, filename).await? {
+        return Ok(false);
+    }
     let marker_created = write_mirror_quarantine_marker(storage, pkg, filename).await?;
     let preserved = quarantine(storage, pkg, filename).await?.is_some();
     let akey = artifact_key(pkg, filename);
@@ -1666,6 +1669,47 @@ async fn settle_mirror_quarantine(
     // of the demotion, and the only part of the record that replicates.
     storage.delete_keys(&record_object_keys(&akey)).await?;
     Ok(marker_created || preserved || sidecar_left)
+}
+
+/// Is private truth standing under the canonical key *right now*?
+///
+/// [`Verdict::SettleMirrorQuarantine`] is decided from a listing-era read, and
+/// a private upload can land under the fence between that listing and this
+/// executor — handing the filename to private truth IS the demotion's intended
+/// resolution, so `decide` answers `Supersede` the moment it sees one and the
+/// audit's own scan skips a private sidecar under a fence. The merge executor
+/// did not re-check, and a stale settle suppressed the record that resolved the
+/// demotion: it moved acknowledged private bytes to `_quarantine/` and dropped
+/// the canonical key.
+///
+/// That alone is data loss the fence still excuses. The unexcused half is what
+/// the simulator caught: the settle re-establishes a fence that a concurrent
+/// pass, holding the same listing-era `Live { Private }` record, is entitled to
+/// call spent and delete ([`clear_spent_demotion_fence`]). The two land in
+/// either order and the filename ends with no body and nothing authorizing its
+/// absence — the state `origin release` will hand back to a proxy to re-fetch
+/// clean. Re-reading here is what keeps the audit and the merge from drifting,
+/// which was always the point of sharing one primitive.
+///
+/// A private sidecar with no body is a torn record, not private truth: the
+/// settle's own fence-then-drop is the right cleanup for it.
+async fn demotion_resolved_by_private_truth(
+    storage: &dyn Storage,
+    pkg: &str,
+    filename: &str,
+) -> Result<bool> {
+    let akey = artifact_key(pkg, filename);
+    let sidecar: Sidecar = match storage.get_bytes(&sidecar_key(&akey)).await {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).with_context(|| format!("parse sidecar for {akey}"))?
+        }
+        Err(e) if is_not_found(&e) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if sidecar.origin.as_deref() != Some(PRIVATE) {
+        return Ok(false);
+    }
+    storage.head_exists(&akey).await
 }
 
 /// Freeze one bucket's copy of a filename. The richer
@@ -1818,7 +1862,10 @@ async fn drop_record_objects(storage: &dyn Storage, pkg: &str, filename: &str) -
 /// A record already fenced is not skipped: an interrupted settle leaves the
 /// fence over a body that still needs moving, and the settle is idempotent. A
 /// *private* sidecar under the fence is left alone — that is a supersede
-/// landing private truth, which is the demotion's intended resolution.
+/// landing private truth, which is the demotion's intended resolution. The
+/// selection below is only the cheap half of that: the primitive itself now
+/// re-reads ([`demotion_resolved_by_private_truth`]), because the merge reaches
+/// it with a listing-era verdict this scan's fresh read cannot stand in for.
 pub async fn quarantine_mirror_artifacts(storage: &dyn Storage, pkg: &str) -> Result<usize> {
     let Some(claim) = read_origin_observation(storage, pkg).await? else {
         return Ok(0);
@@ -4529,6 +4576,68 @@ mod tests {
                 .await
                 .unwrap(),
             b"private bytes"
+        );
+    }
+
+    /// A demotion the operator already resolved by republishing privately, and
+    /// a `SettleMirrorQuarantine` verdict still in flight from the listing that
+    /// preceded it. The stale settle used to suppress the record that resolved
+    /// the demotion — and then a second pass, holding the same listing-era
+    /// `Live { Private }` read, called the fence it re-wrote spent and deleted
+    /// it. The filename ended with no body and nothing authorizing its absence:
+    /// the acknowledged upload simply gone on every bucket, and `origin
+    /// release` free to reopen the name for a proxy to re-fetch clean.
+    ///
+    /// Both passes are replayed here in the order the simulator found them
+    /// (`vopr --seed 16200065974 --nodes 3 --buckets 2 --packages 6 --files 2
+    /// --ops 160 --fail-percent 3 --partition 100`), against the real executor
+    /// with the real stale inputs.
+    #[tokio::test]
+    async fn a_stale_settle_never_suppresses_the_private_truth_that_resolved_the_demotion() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        // A: the private republish landed under a fence still standing from the
+        // demotion it resolves. B: that demotion, settled.
+        seed_live(a.as_ref(), "pkg", filename, b"acked private bytes", PRIVATE);
+        a.insert(&mirror_quarantined_key(&key), b"{}".to_vec());
+        b.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
+        b.insert(&mirror_quarantined_key(&key), b"{}".to_vec());
+
+        let ra = read_record(a.as_ref(), "pkg", filename).await.unwrap();
+        let rb = read_record(b.as_ref(), "pkg", filename).await.unwrap();
+        // The fence over private truth is spent, so this pair is a supersede —
+        // the settle below is only reachable from an older listing.
+        assert_eq!(decide(&ra, &rb), Verdict::Supersede(Side::A));
+
+        let state = two_bucket_state(a.clone(), b.clone());
+        for verdict in [Verdict::SettleMirrorQuarantine, Verdict::Noop] {
+            let _: Convergence = execute(
+                &state,
+                (a.as_ref(), b.as_ref()),
+                "pkg",
+                filename,
+                (&ra, &rb),
+                verdict,
+                ArtifactSource::Bucket,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            a.get_bytes(&key).await.unwrap(),
+            b"acked private bytes",
+            "the settle suppressed the private record that resolved the demotion",
+        );
+        assert!(
+            !a.head_exists(&mirror_quarantined_key(&key)).await.unwrap(),
+            "the fence over live private truth is spent and must not survive",
+        );
+        assert!(
+            a.list_all(QUARANTINE_PREFIX).await.unwrap().is_empty(),
+            "nothing was demoted, so nothing belongs in _quarantine/",
         );
     }
 

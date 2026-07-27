@@ -498,6 +498,13 @@ new exemption anywhere. Every bucket ends holding the same one small marker, and
 `packages/` is finally the 100% truth-replicated tree the manifest always claimed
 it was.
 
+That is where a demotion ends *as a demotion*. It has a second terminal state,
+and reading the sentence above as the only one is what cost a durability bug:
+republish the filename privately and the fleet converges on private truth with
+**no marker anywhere**, because the fence's entire job is finished the moment
+private truth holds the name (below). Both ends are settled; what may never
+happen is a filename left with neither.
+
 Three consequences, each the fail-closed direction:
 
 - **Nothing is owed to a peer that holds no body.** The suppression is a fence,
@@ -512,7 +519,18 @@ Three consequences, each the fail-closed direction:
   artifact just suppressed. Drop the marker along with the body and that door
   opens. It is equally why the marker must never fence a *private* upload:
   handing the filename to private truth is the entire point of a demotion, so
-  `Supersede` clears the marker once the complete private record lands.
+  `Supersede` clears the marker once the complete private record lands — and
+  `execute` clears a spent fence on either side of *any* verdict, since every
+  reader already looks past a fence with a private sidecar beside it. The rule
+  cuts both ways, which is the half that was missing. A settle is decided from a
+  listing and applied later, so it must re-read before it suppresses anything:
+  firing blind, it quarantined the very private record that resolved the
+  demotion, and re-wrote a fence that a concurrent pass — holding the same
+  listing-era read — was entitled to call spent and delete. Whichever landed
+  second, the filename ended with no body and nothing authorizing its absence,
+  which is exactly the door this consequence exists to keep shut. The audit's
+  scan had always skipped a private sidecar under a fence; the merge had not,
+  and audit and merge share one primitive precisely so they cannot drift.
 - **The marker names a filename, never a hash.** Two partitioned buckets can
   demote two different mirror bodies of one filename; a marker carrying its local
   sha would then differ per bucket and never converge. It carries only the

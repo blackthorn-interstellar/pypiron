@@ -562,6 +562,26 @@ enum Presence {
     /// Sidecar present, sha matches the commitment.
     Match,
     /// Sidecar present but its sha contradicts the commitment — a tamper.
+    ///
+    /// Faulted unconditionally, including over the one legitimate in-place byte
+    /// change: a mirror→private supersede. Deliberate, and the bar to soften it
+    /// is not met. Nothing durable in storage tells the two apart — the demotion
+    /// fence is deleted the moment private truth stands under it
+    /// (`replicate::clear_spent_demotion_fence`), and every other candidate
+    /// witness (that fence, the `_quarantine/` copy of the committed bytes) is an
+    /// object the attacker this whole module exists for — one holding storage
+    /// credentials — writes as cheaply as the rewrite itself. Honouring one would
+    /// sell a two-line bypass of the only signal in the system that catches a
+    /// silent byte rewrite. Absence is a different question, which is why
+    /// [`Presence::Covered`] exists: a marker authorizes a *disappearance*, and a
+    /// disappearance serves nobody the attacker's bytes.
+    ///
+    /// Both rows a real supersede can produce are worth printing. Before the next
+    /// audit re-commits the package the row names the operator's own change, and
+    /// it clears on that audit (which reports the change once more, as an
+    /// in-chain sha move — [`warn_in_chain_sha_changes`]). After it, a row means
+    /// some bucket is still serving the *withdrawn* body — the exact fail-open
+    /// the demotion exists to close, and never noise.
     WrongSha(String),
     /// Sidecar present but unparseable.
     Corrupt(String),
@@ -609,6 +629,87 @@ async fn probe_presence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidecar::{mirror_quarantined_key, sidecar_key, Yanked};
+    use crate::storage::test_support::InMemStorage;
+
+    const PKG: &str = "six";
+    const FILE: &str = "six-1.16.0-py2.py3-none-any.whl";
+    /// The sha the chain committed for `FILE`.
+    const COMMITTED: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn akey() -> String {
+        format!("{PACKAGES_PREFIX}{PKG}/{FILE}")
+    }
+
+    fn sidecar_bytes(sha: &str, origin: &str) -> Vec<u8> {
+        serde_json::to_vec(&Sidecar {
+            sha256: sha.to_string(),
+            size: 42,
+            version: "1.16.0".to_string(),
+            upload_time: "2026-07-17T00:00:00Z".to_string(),
+            upload_epoch_ms: None,
+            requires_python: None,
+            yanked: Yanked::default(),
+            origin: Some(origin.to_string()),
+            yank_epoch: 0,
+            snapshot: false,
+        })
+        .expect("serializing a test sidecar")
+    }
+
+    async fn probe(storage: &InMemStorage) -> Presence {
+        probe_presence(storage, PKG, FILE, COMMITTED)
+            .await
+            .expect("probing an in-memory bucket cannot fail")
+    }
+
+    /// The demotion fence authorizes the disappearance it caused. A settled
+    /// mirror→private supersede drops the demoted record and leaves only
+    /// `.mirror-quarantined` standing (`replicate::settle_mirror_quarantine`),
+    /// while the chain goes on committing the withdrawn filename until the next
+    /// audit. Reading that gap as `vanished` turns every operator supersede into
+    /// a fleet-wide tamper alarm.
+    #[tokio::test]
+    async fn a_demotion_fence_authorizes_the_committed_record_it_withdrew() {
+        let storage = InMemStorage::default();
+        storage.insert(&mirror_quarantined_key(&akey()), b"{}".to_vec());
+        assert!(
+            matches!(probe(&storage).await, Presence::Covered),
+            "a demoted record must read as covered, not vanished"
+        );
+    }
+
+    /// The other direction: nothing authorizing the absence is still a vanish.
+    /// Without this the arm above could be widened to "absent is fine" and the
+    /// out-of-band-delete signal would go quiet.
+    #[tokio::test]
+    async fn a_committed_record_gone_with_nothing_authorizing_it_is_absent() {
+        let storage = InMemStorage::default();
+        assert!(
+            matches!(probe(&storage).await, Presence::Absent),
+            "an unauthorized disappearance must stay a vanish"
+        );
+    }
+
+    /// A completed supersede is NOT excused. The private body that replaced the
+    /// committed one reports `hash-changed` even with the demotion fence still
+    /// beside it — see [`Presence::WrongSha`]. Every witness a suppression could
+    /// key on is an object the credential-holding attacker writes just as easily,
+    /// and this is the only check that catches a silent byte rewrite.
+    #[tokio::test]
+    async fn a_superseded_body_still_faults_under_its_own_demotion_fence() {
+        let storage = InMemStorage::default();
+        let replacement = "2".repeat(64);
+        storage.insert(
+            &sidecar_key(&akey()),
+            sidecar_bytes(&replacement, crate::origin::PRIVATE),
+        );
+        storage.insert(&mirror_quarantined_key(&akey()), b"{}".to_vec());
+        match probe(&storage).await {
+            Presence::WrongSha(actual) => assert_eq!(actual, replacement),
+            _ => panic!("a rewritten body must fault regardless of the markers beside it"),
+        }
+    }
 
     fn link(seq: u64, prev: &str, packages: Delta) -> ChainLink {
         ChainLink {

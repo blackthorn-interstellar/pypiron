@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -214,6 +215,50 @@ def test_vanished_artifact_is_caught_but_a_real_delete_is_not(disk_server, pypir
     # the deleted file is NOT among the violations named.
     cp = _verify_chain(pypiron_bin, server["data_dir"])
     assert keep.name not in cp.stdout, f"a tombstoned delete must not be a violation:\n{cp.stdout}"
+
+
+def test_a_demoted_mirror_record_is_not_a_vanish(disk_server, pypiron_bin, tmp_path):
+    """A settled mirror→private supersede drops the demoted record and leaves only
+    its `.mirror-quarantined` fence standing. The chain keeps committing the
+    withdrawn filename until the next audit, so verify-chain must read that fence
+    as the operator's own authorization — otherwise every supersede raises a
+    fleet-wide tamper alarm.
+
+    Both halves run against one frozen copy of the store (no server, no audit can
+    slip in): the same disappearance faults without the fence and is clean with
+    it, so the fence is provably what is doing the work.
+
+    The settle itself is multi-bucket only and is driven end to end over MinIO in
+    test_multibucket.py; what is pinned here is verify-chain's verdict on the
+    state it leaves behind.
+    """
+    server = disk_server
+    wheel = make_wheel("transdemota", "5.0.0", tmp_path)
+    _upload(server, wheel)
+    assert _rebuild_index(pypiron_bin, server["data_dir"]).returncode == 0
+
+    # Snapshot the audited store: everything below is offline, so the chain
+    # cannot silently re-commit the package and pass the test vacuously.
+    store = tmp_path / "demoted-store"
+    shutil.copytree(server["data_dir"], store)
+    assert _verify_chain(pypiron_bin, store).returncode == 0
+
+    artifact, sidecar = _artifact_and_sidecar(store, _pkg_from_wheel(wheel))
+    artifact.unlink()
+    sidecar.unlink()
+
+    # Control: the identical disappearance with nothing authorizing it faults.
+    cp = _verify_chain(pypiron_bin, store)
+    assert cp.returncode == 1, f"an unauthorized disappearance must fault:\n{cp.stdout}{cp.stderr}"
+    assert "vanished" in cp.stdout, cp.stdout
+
+    # The fence a demotion leaves behind (`replicate::write_mirror_quarantine_marker`).
+    fence = artifact.with_name(f"{artifact.name}.mirror-quarantined")
+    fence.write_text(json.dumps({"filename": artifact.name}))
+
+    cp = _verify_chain(pypiron_bin, store)
+    assert cp.returncode == 0, f"a demotion fence must not fault:\n{cp.stdout}{cp.stderr}"
+    assert "vanished" not in cp.stdout, cp.stdout
 
 
 def test_chain_appends_on_churn(disk_server_fast_reconcile, pypiron_bin, tmp_path):

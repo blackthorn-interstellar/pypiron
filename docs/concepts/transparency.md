@@ -42,6 +42,14 @@ live truth by at most one audit cycle, and a not-yet-recorded file is simply not
 yet under watch. A file you deleted through pypiron is clean too: the deletion is
 recorded, so verify-chain expects it gone.
 
+Replacing a mirrored file with your own build is the one ordinary operation that
+does report a change. The withdrawn file's disappearance is clean — pypiron
+recorded that you pulled it — but the build now standing under that name holds
+different bytes than the last checkpoint, and verify-chain says so until the next
+audit records the swap. Read the row rather than dismissing it: once the swap is
+recorded, the same row means some bucket is still serving the version you
+withdrew.
+
 ## Every bucket, not just one
 
 If you run across multiple buckets or regions, the checkpoint log rides along to

@@ -100,6 +100,27 @@ fn is_canonical_artifact(key: &str) -> bool {
         .is_some_and(|(_, name)| !name.contains('/') && crate::sidecar::is_artifact(name))
 }
 
+/// Whether this bucket bars an upload of `key`'s filename right now: a
+/// `.tombstone` or `.frozen` beside it, the two fences `publish_record` refuses
+/// over. `.mirror-quarantined` is deliberately not one — handing the filename
+/// to private truth *is* a demotion's intended resolution, so it leaves the
+/// canonical key writable (see `settle_mirror_quarantine`).
+fn upload_barred(inner: &Inner, key: &str) -> bool {
+    inner
+        .objects
+        .contains_key(&crate::sidecar::tombstone_key(key))
+        || inner.objects.contains_key(&crate::sidecar::frozen_key(key))
+}
+
+/// Whether any durable fence stands beside `key` — the three markers a delete
+/// or a merge resolution plants *before* it drops the body it is retiring.
+fn fence_stands(inner: &Inner, key: &str) -> bool {
+    upload_barred(inner, key)
+        || inner
+            .objects
+            .contains_key(&crate::sidecar::mirror_quarantined_key(key))
+}
+
 /// Clamp an `OffsetDateTime` to the representable Unix-nanos range as `u64`.
 fn to_unix_nanos(t: OffsetDateTime) -> u64 {
     t.unix_timestamp_nanos().clamp(0, u64::MAX as i128) as u64
@@ -116,9 +137,9 @@ struct Obj {
 #[derive(Default)]
 struct Inner {
     objects: BTreeMap<String, Obj>,
-    /// Every distinct body ever committed under each canonical
-    /// `packages/<pkg>/<artifact>` key, as a sha256 hex digest — insert-only,
-    /// so a delete does not erase it.
+    /// The distinct bodies that stood at each canonical
+    /// `packages/<pkg>/<artifact>` key during the filename's CURRENT
+    /// incarnation, as sha256 hex digests.
     ///
     /// A verification harness needs this because the final state cannot supply
     /// it and both proxies for it are erasable. An upload that crashed after
@@ -129,6 +150,29 @@ struct Inner {
     /// so the store simply remembers that they were. Artifact bodies only:
     /// sidecars, markers and views are rewritten constantly and nothing asks
     /// about their history.
+    ///
+    /// *Incarnation*, not lifetime, and the distinction is the whole currency.
+    /// The only question this set exists to answer is whether two byte-sets
+    /// COEXISTED under one immutable filename — `decide` reaches
+    /// `Verdict::Freeze` from two live records at the same instant, never from
+    /// two that took the key in turn. So two rules bound it, each drawn from
+    /// the product's own:
+    ///
+    /// - a body written while [`upload_barred`] never joins. `publish_record`
+    ///   refuses over a `.tombstone`/`.frozen` and (single-bucket) deletes the
+    ///   bytes it had already stored, so those bytes were never a record the
+    ///   fleet served — they are a refused writer's debris.
+    /// - deleting the body with NO fence beside it clears the set. That is a
+    ///   mirror cache eviction (never tombstoned, re-fillable by design) or a
+    ///   rollback; either way the name is retired with nothing preserved, and
+    ///   the next body starts a new incarnation.
+    ///
+    /// A delete UNDER a fence deliberately keeps the history: `freeze_side`,
+    /// `settle_mirror_quarantine` and `delete_record` all plant their marker
+    /// before they drop the body, so a fenced delete is a resolution, and the
+    /// bodies it destroys are exactly the evidence a racing delete would
+    /// otherwise erase. Clearing there would put back the false FREEZE_
+    /// UNJUSTIFIED reds this set was added to remove.
     committed: BTreeMap<String, std::collections::BTreeSet<String>>,
     /// Per-storage version counter. Every successful write stamps `v{n}` and
     /// increments, so etags model an object store's opaque generation — one
@@ -217,7 +261,7 @@ impl SimStorage {
 
     /// Write `bytes` at `key` with a fresh version and the current clock time.
     fn store(inner: &mut Inner, key: &str, bytes: Vec<u8>, now: OffsetDateTime) -> String {
-        if is_canonical_artifact(key) {
+        if is_canonical_artifact(key) && !upload_barred(inner, key) {
             inner
                 .committed
                 .entry(key.to_string())
@@ -244,8 +288,9 @@ impl SimStorage {
         Self::store(&mut inner, key, bytes, now);
     }
 
-    /// The distinct byte-sets this bucket ever committed under one canonical
-    /// artifact key, as sha256 hex digests. See [`Inner::committed`].
+    /// The distinct byte-sets that stood at one canonical artifact key during
+    /// the filename's current incarnation, as sha256 hex digests. See
+    /// [`Inner::committed`].
     pub fn committed_digests(&self, key: &str) -> std::collections::BTreeSet<String> {
         self.lock().committed.get(key).cloned().unwrap_or_default()
     }
@@ -404,7 +449,13 @@ impl Storage for SimStorage {
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
         let mut inner = self.lock();
         for k in keys {
-            inner.objects.remove(k);
+            let removed = inner.objects.remove(k).is_some();
+            // An unfenced body delete retires the filename with nothing
+            // preserved, so the next body under it is a new incarnation and
+            // cannot have conflicted with this one. See `Inner::committed`.
+            if removed && is_canonical_artifact(k) && !fence_stands(&inner, k) {
+                inner.committed.remove(k);
+            }
         }
         Ok(())
     }
@@ -540,34 +591,99 @@ mod tests {
         assert!(!is_canonical_artifact("simple/p/index.html"));
     }
 
+    const BODY_KEY: &str = "packages/p/p-1.0-py3-none-any.whl";
+
+    fn digests(bodies: &[&[u8]]) -> std::collections::BTreeSet<String> {
+        bodies.iter().map(|b| crate::hash::sha256_hex(b)).collect()
+    }
+
     #[tokio::test]
-    async fn committed_digests_outlive_the_bytes() {
-        // The whole point: a delete erases the object but not the fact that
-        // those bytes were once committed under that name. Two byte-sets under
-        // one filename is a byte conflict, and a merge freeze that races a
-        // delete has no other way to prove it happened.
+    async fn a_fenced_delete_keeps_the_bodies_it_destroys() {
+        // The whole point: a fence is a *resolution* — `freeze_side` plants
+        // `.frozen` before it drops the losing body — so the delete erases the
+        // object but not the fact that both byte-sets stood under that name.
+        // Two coexisting byte-sets under one immutable filename IS the byte
+        // conflict, and a merge freeze that races a delete has no other way to
+        // prove it happened. Same for a tombstone and for a demotion fence.
+        for fence in [".frozen", ".tombstone", ".mirror-quarantined"] {
+            let s = SimStorage::new(SimClock::new(start()));
+            s.put_bytes(BODY_KEY, b"one".to_vec(), None).await.unwrap();
+            s.put_bytes(BODY_KEY, b"two".to_vec(), None).await.unwrap();
+            s.put_bytes(&format!("{BODY_KEY}.meta.json"), b"{}".to_vec(), None)
+                .await
+                .unwrap();
+            s.insert(&format!("{BODY_KEY}{fence}"), b"{}".to_vec());
+            s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
+
+            assert!(s.get_bytes(BODY_KEY).await.is_err());
+            assert_eq!(
+                s.committed_digests(BODY_KEY),
+                digests(&[b"one", b"two"]),
+                "{fence} is a resolution, not a retirement"
+            );
+        }
+        // Companions keep no history, and neither does a key never written.
         let s = SimStorage::new(SimClock::new(start()));
-        let key = "packages/p/p-1.0-py3-none-any.whl";
-        s.put_bytes(key, b"one".to_vec(), None).await.unwrap();
-        s.put_bytes(key, b"two".to_vec(), None).await.unwrap();
-        s.put_bytes(&format!("{key}.meta.json"), b"{}".to_vec(), None)
+        s.put_bytes(BODY_KEY, b"one".to_vec(), None).await.unwrap();
+        assert!(s
+            .committed_digests(&format!("{BODY_KEY}.meta.json"))
+            .is_empty());
+        assert!(s.committed_digests("packages/p/other.whl").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unfenced_delete_ends_the_incarnation() {
+        // A mirror cache eviction is never tombstoned — the filename stays
+        // re-fillable by design (`delete_record`) — so a name can hold body A,
+        // be evicted, and later hold body B with nothing ever having
+        // conflicted. Counting that succession as two coexisting byte-sets is
+        // what let a spurious `.frozen` excuse itself.
+        let s = SimStorage::new(SimClock::new(start()));
+        s.put_bytes(BODY_KEY, b"one".to_vec(), None).await.unwrap();
+        s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
+        assert!(s.committed_digests(BODY_KEY).is_empty());
+
+        s.put_bytes(BODY_KEY, b"two".to_vec(), None).await.unwrap();
+        assert_eq!(s.committed_digests(BODY_KEY), digests(&[b"two"]));
+    }
+
+    #[tokio::test]
+    async fn a_refused_writers_debris_never_attests() {
+        // `publish_record` stores the bytes and only then reads the filename
+        // fence; over a `.tombstone` or `.frozen` it refuses and (single-bucket)
+        // deletes what it wrote. Those bytes were never a record the fleet
+        // served, so they are not half of a byte conflict.
+        for fence in [".tombstone", ".frozen"] {
+            let s = SimStorage::new(SimClock::new(start()));
+            s.put_bytes(BODY_KEY, b"one".to_vec(), None).await.unwrap();
+            s.insert(&format!("{BODY_KEY}{fence}"), b"{}".to_vec());
+            s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
+
+            s.put_bytes(BODY_KEY, b"debris".to_vec(), None)
+                .await
+                .unwrap();
+            s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
+            assert_eq!(
+                s.committed_digests(BODY_KEY),
+                digests(&[b"one"]),
+                "a write refused over {fence} is not evidence"
+            );
+        }
+        // The demotion fence is the exception in the other direction: it
+        // deliberately does not bar an upload, because handing the filename to
+        // private truth is the settle's intended outcome. That body is real.
+        let s = SimStorage::new(SimClock::new(start()));
+        s.put_bytes(BODY_KEY, b"mirror".to_vec(), None)
             .await
             .unwrap();
-        s.delete_keys(&[key.to_string()]).await.unwrap();
-
-        assert!(s.get_bytes(key).await.is_err());
+        s.insert(&format!("{BODY_KEY}.mirror-quarantined"), b"{}".to_vec());
+        s.put_bytes(BODY_KEY, b"private".to_vec(), None)
+            .await
+            .unwrap();
         assert_eq!(
-            s.committed_digests(key),
-            [
-                crate::hash::sha256_hex(b"one"),
-                crate::hash::sha256_hex(b"two")
-            ]
-            .into_iter()
-            .collect()
+            s.committed_digests(BODY_KEY),
+            digests(&[b"mirror", b"private"])
         );
-        // Companions keep no history, and neither does a key never written.
-        assert!(s.committed_digests(&format!("{key}.meta.json")).is_empty());
-        assert!(s.committed_digests("packages/p/other.whl").is_empty());
     }
 
     #[tokio::test]

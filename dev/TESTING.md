@@ -741,15 +741,17 @@ the marker over an already-tombstoned filename is worse still: it starves
 `decide`'s `a.frozen == b.frozen` convergence condition.
 
 So the simulator remembers instead. `SimStorage` records the sha256 of every
-body ever committed under a canonical `packages/<pkg>/<artifact>` key —
-insert-only, so a delete cannot erase it — and FREEZE_JUSTIFIED attests from
+body that stood at a canonical `packages/<pkg>/<artifact>` key during the
+filename's current *incarnation* — a fenced delete cannot erase it — and
+FREEZE_JUSTIFIED attests from
 acks ∪ every `_quarantine/` copy ∪ that history, all reduced to digests. The
 product cannot manufacture a digest it never wrote, and `--break
 freeze-unjustified` (a bare `.frozen` planted over a filename that only ever
 held one byte-set, single-bucket, where a byte conflict cannot occur at all)
-stays red. It **is** a loosening all the same, and a larger one than this
-paragraph used to claim — see *The history term counts succession as conflict*
-below, which measures it. Measured over one identical partitioned range — 63,581 seeds
+stays red. It shipped scoped to the whole *lifetime* instead, which was a
+loosening large enough to gut that kill proof — see *The history term counted
+succession as conflict* below, which measures it and closes it.
+Measured over one identical partitioned range — 63,581 seeds
 from 5100000000, the same profile the nightly lane runs: 8 failing seeds before,
 4 after, and the 4 that went are exactly the FREEZE_UNJUSTIFIED ones (the other
 4 are `CONSERVATION`, untouched by this and red the same way both times).
@@ -763,22 +765,24 @@ pinned as a gate in
 (one erased), both `--nodes 2 --buckets 2 --packages 1 --files 1 --ops 16
 --fail-percent 0 --partition 100`.
 
-**The history term counts succession as conflict.** `Verdict::Freeze` fires only
+**The history term counted succession as conflict.** `Verdict::Freeze` fires only
 from two live records whose sidecars name different sha256 *at the same time* —
-coexistence under one immutable filename. The history term attests from
+coexistence under one immutable filename. The history term attested from
 something strictly weaker: every body ever committed under the canonical key,
 insert-only over the filename's entire lifetime. Those are different sets. A
 filename that held body A, was retired by an authorized delete, and later held
 body B carries two digests without anything ever having conflicted, and a
 `.frozen` marker over it is excused for free.
 
-It is reachable, and not marginally. Measured at `4eaa015` on the CI kill
+It was reachable, and not marginally. Measured at `4eaa015` on the CI kill
 proof's own pinned flags (`--nodes 2 --buckets 1 --ops 80`), seeds 1–1000, one
 seed at a time: `--break freeze-unjustified` plants its bare fleet-wide marker
 on **934** seeds (the other 66 have no acked-deleted victim, so nothing is
 planted) and FREEZE_UNJUSTIFIED reds on only **334** of them. On the other
 **600 — 64% of every planted spurious freeze — the oracle examines the marker
-and stays silent.** Silence is unambiguous here: the reach meter counts
+and stays silent.** Re-measured at `8e5916f`, seeds 1–500 one at a time: 470 of
+the 500 plant a marker and **183 red — 39% of the planted ones**.
+Silence is unambiguous here: the reach meter counts
 `FREEZE_JUSTIFIED` once per frozen filename it attests, and the oracle has no
 exit between that counter and its violation, so *examined and silent* means
 `attested.len() >= 2` and nothing else. At `--buckets 1` `decide` never runs, no
@@ -807,29 +811,52 @@ them — but that is a partitioned-only path, and the measurement above reaches
 the same excuse at `--partition 0`, single-bucket, with no mirror fill and no
 demotion anywhere in the run.
 
-**What the currency should be: digests that coexisted, not digests that
-accreted.** The fix is to scope the recorded set to the filename's current
-*incarnation* — reset it when an authorized delete or tombstone retires the
-canonical key, so a body committed afterwards starts a new one and is never
-attested against a freeze of the previous. That keeps every case the history
-term was added for, because both of them live inside a single incarnation: a
-publisher that crashes after `store_artifact_verified` and before its `200`
-commits its body alongside the conflicting one, and a delete racing
-`freeze_side` between the marker and the `get_bytes` destroys bodies that were
-committed *before* it. What it stops attesting is exactly the succession case,
-which no `Verdict::Freeze` can be built from. Nothing here is a product defect —
-the freeze path is right and `.frozen` must keep naming a filename and never a
-hash — and nothing here weakens the zero-FREEZE_UNJUSTIFIED results above, which
-are real. What it weakens is the *power* of that zero over any long-lived
-filename with a prior delete, and the `--break freeze-unjustified` kill proof
-that is supposed to guard it. Triaged only; not implemented.
+**The currency is now digests that coexisted, not digests that accreted.**
+`Inner::committed` is scoped to the filename's current *incarnation*, and the
+two rules that bound it are both the product's own, not the harness's opinion:
 
-While measuring it: the same 1000 seeds put this leg's per-seed red rate at
-**33.4%**, so its K (the fresh seeds needed to red with ≥99.8% confidence) is
-**16**, not the 3 recorded in the `--break` table below. CI draws 6 seeds, which
-reds ~91% of the time — the gate holds on today's pinned range and would be a
-coin flip on a shifted one. Re-measure that row against the table's own rules
-before trusting it.
+- a body written while a `.tombstone` or `.frozen` stands beside the key never
+  joins. Those are `publish_record`'s upload fences: it stores the bytes, reads
+  the fence, refuses, and single-bucket deletes what it wrote. Debris a refused
+  writer left is not half of a byte conflict.
+- deleting the body with **no** fence beside it clears the set. That is a mirror
+  cache eviction — never tombstoned, re-fillable by design (`delete_record`) —
+  or a rollback; either way the name is retired with nothing preserved, and the
+  next body starts a new incarnation.
+
+The asymmetry is load-bearing and is why "reset on the tombstone" would have
+been wrong. `freeze_side`, `settle_mirror_quarantine` and `delete_record` all
+plant their marker *before* they drop the body, so a delete under a fence is a
+resolution and the bodies it destroys are exactly the evidence this set exists
+to hold — resetting there would put back the false FREEZE_UNJUSTIFIED reds the
+section above removed. Both cases the history term was added for survive
+untouched: a publisher that crashes after `store_artifact_verified` and before
+its `200` commits its body inside the same incarnation as the conflicting one,
+and a delete racing `freeze_side` destroys bodies committed before the marker
+went down. What stopped being attested is exactly the succession case, which no
+`Verdict::Freeze` can be built from. No product code moved: the freeze path is
+right and `.frozen` still names a filename and never a hash.
+
+Measured at `8e5916f`, one seed at a time on the CI kill proof's pinned flags,
+seeds 1–2000 — **688 red before, 1864 after**. Denominators, separately, because
+30 seeds in 500 never plant anything (no acked-deleted victim) and cannot red:
+per *seed* 34.4% → **93.2%**; per *planted marker* 39% → **100%** (470/470 over
+seeds 1–500 — every planted spurious freeze now reds). K goes 15 → **3**, which
+is the value the `--break` table below already carried; the table was right and
+the oracle had quietly stopped matching it. Under `--rotate`, seeds 1–1500:
+36.2% → **89.3%**, K 14 → **3**, likewise the table's existing figure.
+
+The false-positive direction is measured too, since narrowing an attestation is
+how a kill proof gets traded for a spurious red. Both pinned reproducers from
+*Attesting a freeze* stay green — on `--seed 9800020745` every digest comes from
+this set and none from an ack — and 88,262 partitioned seeds from 5100000000
+(`--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 0
+--partition 100`)
+attest 38,011 `.frozen` markers across 27,270 seeds with **zero**
+FREEZE_UNJUSTIFIED, against 38,135 across 27,358 on the same range before. Three
+`SimStorage` unit tests pin the three directions (fenced delete keeps, unfenced
+delete clears, barred write never joins); the middle two fail on the old
+currency.
 
 Determinism itself is verified, not assumed: recurring seeds (`--recheck-every`)
 run twice and must produce an identical storage-op trace hash *and* an identical

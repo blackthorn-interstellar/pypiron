@@ -248,13 +248,33 @@ fn freeze_side_abs(bucket: &mut BucketAbs, file: u8) {
     rec.tombstoned = true;
     rec.artifact = None;
     rec.sidecar = None;
+    // The tombstone a freeze writes subsumes a demotion fence standing here.
+    rec.mirror_q = false;
 }
 
 /// tombstone_side: tombstone before dropping the body. Deletes destroy — no
-/// quarantine copy (an authorized delete is not data loss).
+/// quarantine copy (an authorized delete is not data loss). A tombstone is the
+/// stronger, permanent fence, so it also removes a `.mirror-quarantined` it
+/// lands over.
 fn tombstone_side_abs(bucket: &mut BucketAbs, file: u8) {
     let rec = &mut bucket.files[file as usize];
     rec.tombstoned = true;
+    rec.artifact = None;
+    rec.sidecar = None;
+    rec.mirror_q = false;
+}
+
+/// settle_mirror_quarantine: claim private, write the fence FIRST, move the
+/// losing body to this bucket's own `_quarantine/`, then drop the canonical
+/// record. The fence stays — it is the only part of a demoted record that
+/// replicates, and it is what keeps `origin release` refusing the name.
+fn settle_mirror_quarantine_abs(bucket: &mut BucketAbs, file: u8) {
+    bucket.pkg_origin = Some(MOrigin::Private);
+    if let Some(byte) = bucket.files[file as usize].artifact {
+        bucket.quarantine.insert((file, byte));
+    }
+    let rec = &mut bucket.files[file as usize];
+    rec.mirror_q = true;
     rec.artifact = None;
     rec.sidecar = None;
 }
@@ -285,6 +305,24 @@ fn supersede_abs(dst: &mut BucketAbs, file: u8, winner_artifact: u8, winner_side
     rec.mirror_q = false;
 }
 
+/// clear_spent_demotion_fence: a demotion fence beside a live PRIVATE record
+/// is spent — private truth taking the filename IS the demotion's intended
+/// resolution — and every renderer already reads past it, so dropping it is
+/// view-neutral. `execute` does this on both sides before it applies any
+/// verdict, because otherwise the leftover key survives every future diff:
+/// `decide` reads both sides as `Live { Private }` and calls them converged.
+fn clear_spent_demotion_fence_abs(bucket: &mut BucketAbs, file: u8) {
+    let rec = &mut bucket.files[file as usize];
+    if rec.mirror_q
+        && !rec.tombstoned
+        && !rec.frozen
+        && rec.artifact.is_some()
+        && rec.sidecar.map(|sc| sc.origin) == Some(MOrigin::Private)
+    {
+        rec.mirror_q = false;
+    }
+}
+
 /// Mirror of `replicate::execute` for one verdict at the abstraction. Both
 /// records were just computed from `w`, so the CAS re-read arms of the real
 /// executor see exactly the decide-time state (the merge pass is atomic here;
@@ -297,6 +335,8 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
             Side::B => 1,
         }
     };
+    clear_spent_demotion_fence_abs(a, file);
+    clear_spent_demotion_fence_abs(b, file);
     match verdict {
         // Converged, or declined pending the orphan side's own backfill: the
         // model applies nothing either way. The two are distinguished by the
@@ -379,6 +419,10 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
             let target = 1 - side_bucket(side);
             freeze_side_abs(&mut w.buckets[target], file);
         }
+        Verdict::SettleMirrorQuarantine => {
+            settle_mirror_quarantine_abs(a, file);
+            settle_mirror_quarantine_abs(b, file);
+        }
         Verdict::Tombstone => {
             let (ra, rb) = (a.files[file as usize], b.files[file as usize]);
             if ra.frozen || rb.frozen {
@@ -392,24 +436,28 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
     }
 }
 
-/// quarantine_mirror_artifacts: under a private package claim every live
-/// mirror-sidecar body is a demotion loser — preserve it under its content hash
-/// and mark the canonical record inert. Package-wide, like the real scan: it
-/// walks every member, and a tombstone or freeze marker does not exempt one.
+/// quarantine_mirror_artifacts: under a private package claim every
+/// mirror-sidecar record is a demotion loser — settle it through the same
+/// primitive the merge runs. Package-wide, like the real scan: it walks every
+/// member, and a tombstone or freeze marker does not exempt one.
 fn quarantine_mirror_artifacts_abs(bucket: &mut BucketAbs) {
     if bucket.pkg_origin != Some(MOrigin::Private) {
         return;
     }
     for file in 0..FILES.len() as u8 {
+        // The real scan walks LISTED artifacts, so a filename with no body is
+        // never visited — its sidecar alone cannot trigger the repair.
         let rec = bucket.files[file as usize];
-        let (Some(byte), Some(sc)) = (rec.artifact, rec.sidecar) else {
+        let (Some(_), Some(sc)) = (rec.artifact, rec.sidecar) else {
             continue;
         };
-        if sc.origin != MOrigin::Mirror || rec.mirror_q {
+        // A mirror sidecar under a private claim is a demotion loser whether or
+        // not the fence already stands (an interrupted settle keeps the body).
+        // A private sidecar under a fence is a supersede landing truth: skipped.
+        if sc.origin != MOrigin::Mirror {
             continue;
         }
-        bucket.quarantine.insert((file, byte));
-        bucket.files[file as usize].mirror_q = true;
+        settle_mirror_quarantine_abs(bucket, file);
     }
 }
 
@@ -491,7 +539,7 @@ fn late_mirror_quarantine_once(w: &World, bucket: u8, file: u8) -> Option<World>
     let (Some(_), Some(sc)) = (rec.artifact, rec.sidecar) else {
         return None;
     };
-    if sc.origin != MOrigin::Mirror || rec.mirror_q || rec.tombstoned || rec.frozen {
+    if sc.origin != MOrigin::Mirror || rec.tombstoned || rec.frozen {
         return None;
     }
     // The trigger is per-file (a *live* mirror record under a private claim),
@@ -1231,10 +1279,34 @@ mod conformance {
                 frozen: true,
                 ..FileRec::default()
             },
-            // Quarantined mirror loser under a private claim.
+            // Interrupted demotion: the fence landed, the mirror body it
+            // suppresses has not moved yet.
             FileRec {
                 artifact: Some(0),
                 sidecar: Some(sc(0, MOrigin::Mirror, false, 0, None)),
+                mirror_q: true,
+                ..FileRec::default()
+            },
+            // Settled demotion: the fence alone, canonical key empty. This is
+            // the state every bucket converges to, and the one a peer that
+            // never heard of the demotion has to be driven into.
+            FileRec {
+                mirror_q: true,
+                ..FileRec::default()
+            },
+            // A tombstone landing over a demoted filename: the fence is
+            // subsumed debris the delete path has not cleared yet.
+            FileRec {
+                tombstoned: true,
+                mirror_q: true,
+                ..FileRec::default()
+            },
+            // A SPENT fence: private truth took the filename — the demotion's
+            // intended resolution — and the marker beside it is inert debris
+            // every renderer already reads past.
+            FileRec {
+                artifact: Some(0),
+                sidecar: Some(sc(0, MOrigin::Private, false, 0, Some(0))),
                 mirror_q: true,
                 ..FileRec::default()
             },
@@ -1244,12 +1316,13 @@ mod conformance {
     /// A record's package claim must be consistent with its contents.
     fn implied_pkg_origin(rec: &FileRec) -> Option<MOrigin> {
         match rec.sidecar {
-            Some(sc) if rec.mirror_q => {
-                debug_assert_eq!(sc.origin, MOrigin::Mirror);
-                Some(MOrigin::Private) // quarantined mirror implies demotion
-            }
+            // A fence implies the claim already went private, whichever way
+            // the record under it resolved.
+            Some(_) if rec.mirror_q => Some(MOrigin::Private),
             Some(sc) => Some(sc.origin),
             None if rec.artifact.is_some() => Some(MOrigin::Private), // orphan under a claim
+            // A bare fence is a settled demotion: private is terminal.
+            None if rec.mirror_q => Some(MOrigin::Private),
             None => None,
         }
     }

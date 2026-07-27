@@ -117,35 +117,23 @@ jobs:
   # everything the aligned matrix above proves, it proves about a fleet whose
   # buckets never disagree.
   #
-  # Measured 2026-07-26 at this profile (91,560 seeds, 230M interleavings):
-  # 291 failing seeds = 0.318% per seed. At `--partition 10`, 27 in 89,460 =
-  # 0.030% — linear in the percentage, as the seed-share semantics predict.
-  # That is what rules out gating at a LOWER rate rather than not at all:
-  # lowering it buys proportionally fewer partitioned seeds, not a greener lane.
-  # A 50,000-seed draw reds with probability ~1 at both, and even the 6-seed PR
-  # smoke reds ~2% of runs at 100%; green would need a rate near 1e-6, i.e.
-  # ~0.03%, which is no partitioning at all. Only the three fixes below help.
+  # Measured 2026-07-26, BEFORE the demotion fence replicated (91,560 seeds,
+  # 230M interleavings): 291 failing seeds = 0.318% per seed, 98.6% of them one
+  # unconverged `.mirror-quarantined` marker. Re-measured on the same profile
+  # after that fix: 2 of 65,473 = 0.003%, zero CONVERGENCE, zero DURABILITY,
+  # both survivors FREEZE_UNJUSTIFIED. The lane stays non-blocking until that
+  # reaches zero — the rate is now low enough that a 50,000-seed draw reds
+  # roughly four times in five, which is still a nightly nobody would read.
   #
   # Open root causes, most to least of the volume:
   #
-  #   1. `.mirror-quarantined` is not replicable state (98.6% of failing seeds).
-  #      Two arms in src/replicate/decide.rs assert convergence over pairs that
-  #      have not converged: the `(QuarantinedMirror, _)` catch-all returns
-  #      `Noop` — documented as "the two sides agree" — over the residual
-  #      `(QuarantinedMirror, Absent)` and `(QuarantinedMirror, Live{Mirror})`,
-  #      and `settled_delete` checks every companion EXCEPT `mirror_quarantined`,
-  #      so a marker orphaned beside a tombstone reads settled on both sides and
-  #      the tombstone fast path leaves it as permanent single-bucket debris.
-  #      Every DURABILITY hit on this lane is downstream of one of these.
-  #        --seed 9600003069 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 8  --fail-percent 0 --partition 100
-  #        --seed 9700012998 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100
-  #   2. FREEZE_UNJUSTIFIED residue: a fleet-wide freeze that attested one byte
+  #   1. FREEZE_UNJUSTIFIED residue: a fleet-wide freeze that attested one byte
   #      set, or none at all. Unadjudicated — product or oracle. It matters more
   #      than its count: a freeze grants a blanket DURABILITY+CONSERVATION
   #      exemption, so an unjustified one buys silence for free.
   #        --seed 9800002480 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100  # 1 byte set
   #        --seed 9800020745 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100  # 0 byte sets
-  #   3. ACK_TOTALITY residue: a publish acks while a peer holds neither the
+  #   2. ACK_TOTALITY residue: a publish acks while a peer holds neither the
   #      record nor a `_repl/` note covering it (dev/DESIGN.md totality
   #      principle). Needs the wide profile; it does not reproduce below
   #      6 packages / 200 ops.

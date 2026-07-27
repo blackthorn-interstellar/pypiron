@@ -439,14 +439,16 @@ acquire it. The aligned matrix and the pinned `ci.yml` regression seeds stay on
 `--partition 0`, byte-identical (verified by diffing five whole-profile runs,
 every counter to the digit).
 
-98.6% of the failures are one bug — a `.mirror-quarantined` marker that never
-converges, because two arms of `src/replicate/decide.rs` (the
-`(QuarantinedMirror, _)` catch-all and `settled_delete`, both `b0cb67f`) return
-`Noop`, which means "the two sides agree", over pairs that do not. Every
-DURABILITY violation on the lane is downstream of it. The rest is
-`FREEZE_UNJUSTIFIED` residue (~4 per 100k) and `ACK_TOTALITY` residue (~3 per
-100k). All three, with minimized repros, are written up in the job comment above
-`vopr-partitioned` in `.github/workflows/simulation.yml`.
+98.6% of those failures were one bug — a `.mirror-quarantined` marker that never
+converged, because `src/replicate/decide.rs` returned `Noop`, which means "the
+two sides agree", over pairs that did not. **Fixed**: the demotion fence is truth
+and replicates, the body it suppresses moves to `_quarantine/` on the bucket that
+resolved it, and the canonical key ends empty everywhere (dev/DESIGN.md). The
+same profile re-measured after the fix reds **2 of 65,473 seeds (0.003%)** —
+zero CONVERGENCE, zero DURABILITY. What is left is `FREEZE_UNJUSTIFIED` residue
+(~3 per 100k) and `ACK_TOTALITY` residue (~3 per 100k), both with minimized
+repros in the job comment above `vopr-partitioned` in
+`.github/workflows/simulation.yml`.
 
 To reproduce a lane by hand:
 
@@ -482,7 +484,13 @@ true. Audited two commits back at `a24236d`, 267 and 165 had already gone green,
 claim two sections down was built on — only 1, 208 and 19 still reproduced as
 written. A stale row is worse than a deleted one: it reads as measurement.
 
-#### Still red at `783d423`
+#### Still red at `783d423` — before the demotion fence replicated
+
+> The `CONVERGENCE` and `DURABILITY` rows below are **closed**: both were the
+> unconverged `.mirror-quarantined` marker, and both read zero over 65,473 fresh
+> partitioned seeds after the fix. The rows are kept as the measurement that
+> motivated the adjudication in dev/DESIGN.md, not as a live defect list.
+
 
 Measured over the three partitioned lanes above (166,409 seeds). Rates are the
 share of that lane's seeds the oracle reds on; `—` means it produced none there.

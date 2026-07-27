@@ -73,9 +73,11 @@ pub struct Record {
 pub enum RecordState {
     Tombstoned,
     Frozen,
-    /// Canonical mirror bytes deliberately retained behind a quarantine
-    /// marker. They are absent for ordinary union, but a private peer may
-    /// supersede them directly per artifact.
+    /// A mirror→private demotion: the `.mirror-quarantined` fence stands over
+    /// this filename. Once settled the canonical key is empty and the losing
+    /// body sits in this bucket's own `_quarantine/`; until then a body and its
+    /// mirror sidecar may still be standing. Absent for ordinary union, but a
+    /// private peer may supersede the name directly per artifact.
     QuarantinedMirror,
     Live {
         sha: String,
@@ -170,6 +172,18 @@ pub enum Verdict {
     /// Both markers exist but at least one retained canonical body still needs
     /// its idempotent quarantine copy verified after an interrupted freeze.
     FinishFreeze,
+    /// At least one bucket demoted this filename mirror→private, and the pair
+    /// is not settled: a peer has never heard of the demotion, or a canonical
+    /// body is still standing under the fence somewhere. Drive both sides to
+    /// the settled state — claim private, fence created, losing body moved to
+    /// that bucket's own `_quarantine/`, canonical key empty.
+    ///
+    /// Symmetric and side-free on purpose: the settle is idempotent and both
+    /// buckets run it, so there is no winner to name. It is emphatically not a
+    /// [`Verdict::Noop`] — the sides do not agree — and not a
+    /// [`Verdict::Defer`] either: nothing is being waited on, the merge can
+    /// decide and act now.
+    SettleMirrorQuarantine,
 }
 
 /// The core merge decision. No I/O, no clocks; every
@@ -188,11 +202,17 @@ fn settled_delete(record: &Record) -> bool {
 
 pub fn decide(a: &Record, b: &Record) -> Verdict {
     // Tombstone ≻ everything. Converged (both tombstoned, nothing left to
-    // clean) is a no-op so a settled delete never re-fires each diff.
+    // clean) is a no-op so a settled delete never re-fires each diff. A
+    // surviving `.mirror-quarantined` is debris here exactly as an orphaned
+    // sidecar is: a tombstone bars the filename permanently, which strictly
+    // subsumes the demotion fence, so the delete path removes it — and until it
+    // is gone the two buckets are one key apart.
     if a.tombstoned || b.tombstoned {
         if a.tombstoned
             && b.tombstoned
             && a.frozen == b.frozen
+            && !a.mirror_quarantined
+            && !b.mirror_quarantined
             && settled_delete(a)
             && settled_delete(b)
         {
@@ -239,7 +259,14 @@ pub fn decide(a: &Record, b: &Record) -> Verdict {
                 ..
             },
         ) => Verdict::Supersede(Side::B),
-        (QuarantinedMirror, _) | (_, QuarantinedMirror) => Verdict::Noop,
+        // A demotion settles when both buckets carry the fence and neither
+        // still holds a canonical record under it. Anything else — a peer that
+        // never heard of the demotion, or a body still standing behind the
+        // fence — is an unconverged suppression, not an agreement.
+        (QuarantinedMirror, QuarantinedMirror) if settled_delete(a) && settled_delete(b) => {
+            Verdict::Noop
+        }
+        (QuarantinedMirror, _) | (_, QuarantinedMirror) => Verdict::SettleMirrorQuarantine,
         (
             Live {
                 sha: sa,
@@ -706,6 +733,115 @@ pub(crate) mod tests {
                 MergeChoice::Equal => unreachable!(),
             }
         );
+    }
+
+    /// A settled mirror→private demotion: the fence stands alone, the canonical
+    /// key is empty, and the losing body sits in this bucket's `_quarantine/`.
+    fn demoted() -> Record {
+        Record {
+            mirror_quarantined: true,
+            ..absent()
+        }
+    }
+
+    /// A demotion caught mid-settle: the fence is written but the mirror body
+    /// and its sidecar are still standing under it.
+    fn demoting(sha: &str) -> Record {
+        Record {
+            mirror_quarantined: true,
+            ..live(sha, MIRROR)
+        }
+    }
+
+    #[test]
+    fn a_demotion_replicates_its_fence_to_a_peer_that_never_heard_of_it() {
+        // The whole partitioned-lane failure: one bucket demoted a mirror
+        // record and the peer holds nothing at all. This used to be `Noop` —
+        // "the two sides agree" over a pair one key apart forever.
+        assert_eq!(
+            decide(&demoted(), &absent()),
+            Verdict::SettleMirrorQuarantine
+        );
+        assert_eq!(
+            decide(&absent(), &demoted()),
+            Verdict::SettleMirrorQuarantine
+        );
+    }
+
+    #[test]
+    fn a_demotion_settles_a_peer_still_serving_the_withdrawn_mirror() {
+        // The fail-open shape: the peer never saw the demotion and is still
+        // serving the artifact the operator withdrew.
+        assert_eq!(
+            decide(&demoted(), &live("x", MIRROR)),
+            Verdict::SettleMirrorQuarantine
+        );
+        assert_eq!(
+            decide(&live("x", MIRROR), &demoted()),
+            Verdict::SettleMirrorQuarantine
+        );
+        assert_eq!(
+            decide(&demoted(), &snapshot("x")),
+            Verdict::SettleMirrorQuarantine
+        );
+    }
+
+    #[test]
+    fn an_unsettled_demotion_keeps_firing_until_the_body_is_gone() {
+        // Both fenced, but a canonical body still stands behind the fence: not
+        // converged. Two buckets may even have demoted two different bodies —
+        // the fence carries no hash, so they still settle to the same state.
+        assert_eq!(
+            decide(&demoting("x"), &demoting("x")),
+            Verdict::SettleMirrorQuarantine
+        );
+        assert_eq!(
+            decide(&demoting("x"), &demoting("y")),
+            Verdict::SettleMirrorQuarantine
+        );
+        assert_eq!(
+            decide(&demoted(), &demoting("x")),
+            Verdict::SettleMirrorQuarantine
+        );
+    }
+
+    #[test]
+    fn a_settled_demotion_is_converged() {
+        // Fence on both, canonical key empty on both: nothing owed, and the
+        // verdict must not re-fire the executor on every diff.
+        assert_eq!(decide(&demoted(), &demoted()), Verdict::Noop);
+    }
+
+    #[test]
+    fn private_truth_still_supersedes_a_demotion_fence() {
+        // Handing the filename to private truth is the entire point of a
+        // demotion; the fence never blocks it.
+        assert_eq!(
+            decide(&live("x", PRIVATE), &demoted()),
+            Verdict::Supersede(Side::A)
+        );
+        assert_eq!(
+            decide(&demoted(), &live("x", PRIVATE)),
+            Verdict::Supersede(Side::B)
+        );
+    }
+
+    #[test]
+    fn a_tombstone_subsumes_a_surviving_demotion_fence() {
+        // Tombstone ≻ everything, and it is the stronger fence — so a marker
+        // left standing beside one is debris, exactly like an orphaned sidecar.
+        let mut settled = absent();
+        settled.tombstoned = true;
+        let mut with_marker = settled.clone();
+        with_marker.mirror_quarantined = true;
+        assert_eq!(decide(&settled, &with_marker), Verdict::Tombstone);
+        assert_eq!(decide(&with_marker, &settled), Verdict::Tombstone);
+        assert_eq!(
+            decide(&with_marker, &with_marker.clone()),
+            Verdict::Tombstone
+        );
+        // And the ordinary settled delete is still a no-op.
+        assert_eq!(decide(&settled, &settled.clone()), Verdict::Noop);
     }
 
     #[test]

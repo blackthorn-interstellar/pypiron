@@ -239,9 +239,11 @@ pub async fn execute(
             Side::A => (false, true), // the named side already carries the marker
             Side::B => (true, false),
         },
-        Verdict::AdoptSidecar(_) | Verdict::Freeze | Verdict::FinishFreeze | Verdict::Tombstone => {
-            (true, true)
-        }
+        Verdict::AdoptSidecar(_)
+        | Verdict::Freeze
+        | Verdict::FinishFreeze
+        | Verdict::Tombstone
+        | Verdict::SettleMirrorQuarantine => (true, true),
     };
     let intent_a = if bracket_a {
         Some(markers::mark_intent(a, pkg).await?)
@@ -271,6 +273,11 @@ pub async fn execute(
         }
     };
     let result = async {
+        // Independent of the verdict, on both sides: a demotion fence standing
+        // beside a live PRIVATE record is spent, and it is the one key two
+        // buckets can otherwise never agree on.
+        clear_spent_demotion_fence(a, pkg, filename, ra).await?;
+        clear_spent_demotion_fence(b, pkg, filename, rb).await?;
         match verdict {
         Verdict::Noop => {
             let (dirty_a, dirty_b) =
@@ -361,6 +368,18 @@ pub async fn execute(
             freeze_side(b, pkg, filename).await?;
             markers::mark_dirty(a, pkg).await?;
             markers::mark_dirty(b, pkg).await?;
+        }
+        // A mirror→private demotion one side has not heard of, or has not
+        // finished. Symmetric and idempotent: both buckets end fenced with an
+        // empty canonical key, each holding in its own `_quarantine/` whatever
+        // body it personally lost.
+        Verdict::SettleMirrorQuarantine => {
+            if settle_mirror_quarantine(a, pkg, filename).await? {
+                markers::mark_dirty(a, pkg).await?;
+            }
+            if settle_mirror_quarantine(b, pkg, filename).await? {
+                markers::mark_dirty(b, pkg).await?;
+            }
         }
         Verdict::Tombstone => {
             // A freeze carries a tombstone solely as its permanent upload
@@ -1532,32 +1551,94 @@ async fn quarantine_bytes(
     Ok(sha)
 }
 
-/// Preserve a mirror loser and mark its canonical record inert without
-/// deleting the artifact key. Keeping the old body in place avoids the
-/// delete/recreate ABA that an ETag cannot distinguish when the bytes match.
-async fn quarantine_mirror_record(
+/// Drop a demotion fence that private truth has already resolved.
+///
+/// Handing the filename to private truth IS the intended resolution of a
+/// demotion, so the fence never blocks a private upload — and once one lands,
+/// the fence is spent. `Record::state()`, the index renderer
+/// (`worker::load_file_metadata`), the file route (`serve::artifact_visible`)
+/// and `verify`'s oracle all already read straight past a fence with a private
+/// sidecar beside it, so this changes nothing renderable: no dirty marker, no
+/// intent bracket. What it changes is convergence. `supersede_record` clears
+/// the fence on the destination it writes, and nothing clears it on the bucket
+/// that took the private upload directly over its own fenced (empty) key, nor
+/// on the *source* side of a supersede — and `decide` reads both sides as
+/// `Live { Private }` and calls them converged, so the leftover key survives
+/// every future diff. Measured: 174 of 176 partitioned-lane failures.
+async fn clear_spent_demotion_fence(
     storage: &dyn Storage,
     pkg: &str,
     filename: &str,
-    bytes: &[u8],
+    record: &Record,
+) -> Result<()> {
+    if !record.mirror_quarantined
+        || !matches!(
+            record.state(),
+            RecordState::Live {
+                origin: Origin::Private,
+                ..
+            }
+        )
+    {
+        return Ok(());
+    }
+    storage
+        .delete_keys(&[mirror_quarantined_key(&artifact_key(pkg, filename))])
+        .await
+}
+
+/// Write the mirror→private demotion fence. It names the filename and NOTHING
+/// else: two partitioned buckets can demote two different bodies of one
+/// immutable filename, and a marker carrying its local sha would then differ
+/// per bucket and never converge. The hash lives in the `_quarantine/` key,
+/// which is where the bytes are. Every consumer tests for existence.
+async fn write_mirror_quarantine_marker(
+    storage: &dyn Storage,
+    pkg: &str,
+    filename: &str,
 ) -> Result<bool> {
-    let sha256 = quarantine_bytes(storage, pkg, filename, bytes).await?;
     #[derive(serde::Serialize)]
     struct Marker<'a> {
         filename: &'a str,
-        sha256: &'a str,
     }
-    let key = mirror_quarantined_key(&artifact_key(pkg, filename));
     put_if_absent_or_verify(
         storage,
-        &key,
-        serde_json::to_vec(&Marker {
-            filename,
-            sha256: &sha256,
-        })?,
+        &mirror_quarantined_key(&artifact_key(pkg, filename)),
+        serde_json::to_vec(&Marker { filename })?,
         json(),
     )
     .await
+}
+
+/// Settle a mirror→private demotion for one filename on one bucket. The fence
+/// is truth and replicates; the body it suppresses is evidence and stays here
+/// (dev/DESIGN.md). So this is a *move*, in the same order [`freeze_side`]
+/// uses: claim private, fence FIRST (a crash then leaves a recognizable,
+/// already-inert demotion rather than a bare delete), verified `_quarantine/`
+/// copy, then drop the canonical record — artifact, sidecar and companions —
+/// leaving the fence standing.
+///
+/// The fence is what keeps the name closed: `origin release` refuses while any
+/// key besides `.origin` remains under `packages/<pkg>/`, so dropping the
+/// marker with the body would open the one state that authorizes a proxy to
+/// re-fetch the artifact just suppressed.
+///
+/// Idempotent, and returns whether anything changed so a settled side is not
+/// re-marked dirty.
+async fn settle_mirror_quarantine(
+    storage: &dyn Storage,
+    pkg: &str,
+    filename: &str,
+) -> Result<bool> {
+    ensure_private_origin(storage, pkg).await?;
+    let marker_created = write_mirror_quarantine_marker(storage, pkg, filename).await?;
+    let preserved = quarantine(storage, pkg, filename).await?.is_some();
+    let akey = artifact_key(pkg, filename);
+    let sidecar_left = storage.head_exists(&sidecar_key(&akey)).await?;
+    // The fence itself is deliberately NOT in this list — it is the whole point
+    // of the demotion, and the only part of the record that replicates.
+    storage.delete_keys(&record_object_keys(&akey)).await?;
+    Ok(marker_created || preserved || sidecar_left)
 }
 
 /// Freeze one bucket's copy of a filename. The richer
@@ -1641,16 +1722,20 @@ async fn tombstone_side(storage: &dyn Storage, pkg: &str, filename: &str) -> Res
     if already && !had_body {
         // The body is gone, but a delete that crashed between its artifact
         // removal and its companion removals leaves a sidecar/companion
-        // orphaned beside the tombstone. Finish the job — otherwise `decide`
-        // re-fires Tombstone on every diff and this early return would starve
-        // the cleanup forever. Report change only when debris existed.
-        let (sidecar_left, metadata_left, provenance_left) = futures::future::try_join3(
-            storage.head_exists(&sidecar_key(&akey)),
-            storage.head_exists(&metadata_key(&akey)),
-            storage.head_exists(&provenance_key(&akey)),
-        )
-        .await?;
-        if !sidecar_left && !metadata_left && !provenance_left {
+        // orphaned beside the tombstone — and a delete landing over a demoted
+        // filename leaves its now-subsumed `.mirror-quarantined` fence. Finish
+        // the job — otherwise `decide` re-fires Tombstone on every diff and
+        // this early return would starve the cleanup forever. Report change
+        // only when debris existed.
+        let (sidecar_left, metadata_left, provenance_left, demotion_fence_left) =
+            futures::future::try_join4(
+                storage.head_exists(&sidecar_key(&akey)),
+                storage.head_exists(&metadata_key(&akey)),
+                storage.head_exists(&provenance_key(&akey)),
+                storage.head_exists(&mirror_quarantined_key(&akey)),
+            )
+            .await?;
+        if !sidecar_left && !metadata_left && !provenance_left && !demotion_fence_left {
             return Ok(false);
         }
         storage
@@ -1658,6 +1743,7 @@ async fn tombstone_side(storage: &dyn Storage, pkg: &str, filename: &str) -> Res
                 sidecar_key(&akey),
                 metadata_key(&akey),
                 provenance_key(&akey),
+                mirror_quarantined_key(&akey),
             ])
             .await?;
         return Ok(true);
@@ -1667,25 +1753,42 @@ async fn tombstone_side(storage: &dyn Storage, pkg: &str, filename: &str) -> Res
     Ok(true)
 }
 
+/// The canonical record objects for one filename: the body and everything that
+/// describes it. Never the durable fences (`.tombstone`, `.frozen`,
+/// `.mirror-quarantined`) — those outlive the record by design.
+fn record_object_keys(akey: &str) -> [String; 4] {
+    [
+        akey.to_string(),
+        sidecar_key(akey),
+        metadata_key(akey),
+        provenance_key(akey),
+    ]
+}
+
 /// Remove a filename's artifact + sidecar + companions after its durable
-/// tombstone/freeze/quarantine record is in place. Errors propagate so the
-/// marker remains and the next sweep retries cleanup.
+/// tombstone/freeze record is in place — and the mirror-quarantine fence with
+/// them. A tombstone bars the filename permanently, which strictly subsumes a
+/// demotion fence that deliberately does not, so leaving the marker behind
+/// would strand this bucket one key apart from a peer that never demoted.
+/// (`.frozen` is kept instead: it is the richer diagnostic, and it replicates.)
+/// Errors propagate so the marker remains and the next sweep retries cleanup.
 async fn drop_record_objects(storage: &dyn Storage, pkg: &str, filename: &str) -> Result<()> {
     let akey = artifact_key(pkg, filename);
-    storage
-        .delete_keys(&[
-            akey.clone(),
-            sidecar_key(&akey),
-            metadata_key(&akey),
-            provenance_key(&akey),
-        ])
-        .await
+    let mut keys = record_object_keys(&akey).to_vec();
+    keys.push(mirror_quarantined_key(&akey));
+    storage.delete_keys(&keys).await
 }
 
 /// Audit repair for an impossible within-bucket state: a package claim is
-/// private, yet one or more live artifacts still carry mirror sidecars. Preserve
-/// each body under its actual content hash, then remove the live record without
-/// tombstoning it. The caller rebuilds the package index after a non-zero count.
+/// private, yet one or more live artifacts still carry mirror sidecars. Each is
+/// a demotion loser — settle it through the one shared primitive the merge's
+/// [`Verdict::SettleMirrorQuarantine`] also runs, so audit and merge cannot
+/// drift. The caller rebuilds the package index after a non-zero count.
+///
+/// A record already fenced is not skipped: an interrupted settle leaves the
+/// fence over a body that still needs moving, and the settle is idempotent. A
+/// *private* sidecar under the fence is left alone — that is a supersede
+/// landing private truth, which is the demotion's intended resolution.
 pub async fn quarantine_mirror_artifacts(storage: &dyn Storage, pkg: &str) -> Result<usize> {
     let Some(claim) = read_origin_observation(storage, pkg).await? else {
         return Ok(0);
@@ -1695,16 +1798,12 @@ pub async fn quarantine_mirror_artifacts(storage: &dyn Storage, pkg: &str) -> Re
     }
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
     let entries = storage.list_dir_entries(&prefix).await?;
-    let names: HashSet<String> = entries.iter().map(|entry| entry.key.clone()).collect();
     let mut quarantined = 0;
     for entry in entries {
         let Some(filename) = entry.key.strip_prefix(&prefix) else {
             continue;
         };
         if !crate::sidecar::is_artifact(filename) {
-            continue;
-        }
-        if names.contains(&mirror_quarantined_key(&entry.key)) {
             continue;
         }
         let sidecar_bytes = match storage.get_bytes(&sidecar_key(&entry.key)).await {
@@ -1721,12 +1820,7 @@ pub async fn quarantine_mirror_artifacts(storage: &dyn Storage, pkg: &str) -> Re
                 bail!("sidecar for {pkg}/{filename} holds an unexpected origin '{raw}'")
             }
         }
-        let bytes = match storage.get_bytes(&entry.key).await {
-            Ok(bytes) => bytes,
-            Err(e) if is_not_found(&e) => continue,
-            Err(e) => return Err(e),
-        };
-        if quarantine_mirror_record(storage, pkg, filename, &bytes).await? {
+        if settle_mirror_quarantine(storage, pkg, filename).await? {
             quarantined += 1;
         }
     }
@@ -2723,6 +2817,11 @@ fn candidate_filenames(names: &HashSet<String>) -> HashSet<String> {
             out.insert(base.to_string());
         } else if let Some(base) = name.strip_suffix(FROZEN_SUFFIX) {
             out.insert(base.to_string());
+        } else if let Some(base) = name.strip_suffix(MIRROR_QUARANTINED_SUFFIX) {
+            // A settled demotion is a bare fence — no body, no sidecar. Without
+            // this it is not a diff candidate at all and the fence, which is
+            // truth and must replicate, can never reach a peer.
+            out.insert(base.to_string());
         } else if crate::sidecar::is_artifact(name) {
             out.insert(name.clone());
         }
@@ -3102,6 +3201,108 @@ mod tests {
         sidecar.upload_epoch_ms = Some(upload_epoch_ms);
         storage.insert(&sidecar_key(&key), serde_json::to_vec(&sidecar).unwrap());
         storage.insert(&crate::origin::origin_key(pkg), b"private".to_vec());
+    }
+
+    /// A settled demotion converges the fence to a peer that never held the
+    /// loser, and nothing but the fence crosses the wire: the suppressed body
+    /// stays on the bucket that resolved it, and the canonical key ends empty
+    /// on both.
+    #[tokio::test]
+    async fn a_settled_demotion_replicates_its_fence_and_not_its_body() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        seed_live(a.as_ref(), "pkg", filename, b"mirror bytes", MIRROR);
+        a.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
+        assert_eq!(
+            quarantine_mirror_artifacts(a.as_ref(), "pkg")
+                .await
+                .unwrap(),
+            1
+        );
+        let state = two_bucket_state(a.clone(), b.clone());
+
+        diff_pair(&state, a.as_ref(), b.as_ref()).await.unwrap();
+
+        let key = artifact_key("pkg", filename);
+        for bucket in [a.as_ref(), b.as_ref()] {
+            assert!(bucket
+                .head_exists(&mirror_quarantined_key(&key))
+                .await
+                .unwrap());
+            assert!(!bucket.head_exists(&key).await.unwrap());
+            assert!(!bucket.head_exists(&sidecar_key(&key)).await.unwrap());
+        }
+        // Evidence is bucket-local: only the side that resolved it holds bytes.
+        assert_eq!(a.list_all(QUARANTINE_PREFIX).await.unwrap().len(), 1);
+        assert!(b.list_all(QUARANTINE_PREFIX).await.unwrap().is_empty());
+        // Settled: a second pass is a no-op, not a re-fire.
+        let ra = read_record(a.as_ref(), "pkg", filename).await.unwrap();
+        let rb = read_record(b.as_ref(), "pkg", filename).await.unwrap();
+        assert_eq!(decide(&ra, &rb), Verdict::Noop);
+    }
+
+    /// Private truth taking a demoted filename is the demotion's intended
+    /// resolution, so the fence beside it is spent. Only `supersede_record`
+    /// used to clear it, and only on the side it wrote — a bucket that took the
+    /// private upload directly over its own fenced key kept the marker forever,
+    /// and `decide` read both sides as live private and called them converged.
+    #[tokio::test]
+    async fn a_spent_demotion_fence_beside_private_truth_is_dropped() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        seed_live(a.as_ref(), "pkg", filename, b"private bytes", PRIVATE);
+        seed_live(b.as_ref(), "pkg", filename, b"private bytes", PRIVATE);
+        let key = artifact_key("pkg", filename);
+        // The private publish landed over a key this bucket had fenced; nothing
+        // on the publish path clears the fence.
+        a.insert(
+            &mirror_quarantined_key(&key),
+            br#"{"filename":"pkg-1.whl"}"#.to_vec(),
+        );
+        let state = two_bucket_state(a.clone(), b.clone());
+
+        diff_pair(&state, a.as_ref(), b.as_ref()).await.unwrap();
+
+        assert!(!a.head_exists(&mirror_quarantined_key(&key)).await.unwrap());
+        assert!(!b.head_exists(&mirror_quarantined_key(&key)).await.unwrap());
+        // The record itself is untouched — the fence was inert, not a fence.
+        assert_eq!(a.get_bytes(&key).await.unwrap(), b"private bytes");
+        assert_eq!(b.get_bytes(&key).await.unwrap(), b"private bytes");
+        assert!(a.list_all(QUARANTINE_PREFIX).await.unwrap().is_empty());
+    }
+
+    /// A tombstone is the stronger, permanent fence, so it subsumes a demotion
+    /// fence it lands over — and the pair is not settled until it is gone.
+    #[tokio::test]
+    async fn a_tombstone_removes_a_demotion_fence_it_lands_over() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        for bucket in [a.as_ref(), b.as_ref()] {
+            bucket.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
+            bucket.insert(
+                &mirror_quarantined_key(&key),
+                br#"{"filename":"pkg-1.whl"}"#.to_vec(),
+            );
+        }
+        tombstone::write(a.as_ref(), &key, filename).await.unwrap();
+        let state = two_bucket_state(a.clone(), b.clone());
+
+        diff_pair(&state, a.as_ref(), b.as_ref()).await.unwrap();
+
+        for bucket in [a.as_ref(), b.as_ref()] {
+            assert!(bucket.head_exists(&tombstone_key(&key)).await.unwrap());
+            assert!(!bucket
+                .head_exists(&mirror_quarantined_key(&key))
+                .await
+                .unwrap());
+        }
+        let ra = read_record(a.as_ref(), "pkg", filename).await.unwrap();
+        let rb = read_record(b.as_ref(), "pkg", filename).await.unwrap();
+        assert_eq!(decide(&ra, &rb), Verdict::Noop);
     }
 
     #[tokio::test]
@@ -3833,17 +4034,33 @@ mod tests {
             quarantine_mirror_artifacts(&storage, "pkg").await.unwrap(),
             1
         );
+        // The loser LEAVES `packages/`: the fence replicates, the body it
+        // suppresses moves to this bucket's own `_quarantine/`, and the
+        // canonical key ends empty.
+        let key = artifact_key("pkg", filename);
+        assert!(!storage.head_exists(&key).await.unwrap());
+        assert!(!storage.head_exists(&sidecar_key(&key)).await.unwrap());
         assert!(storage
-            .head_exists(&artifact_key("pkg", filename))
+            .head_exists(&mirror_quarantined_key(&key))
             .await
             .unwrap());
-        assert!(storage
-            .head_exists(&mirror_quarantined_key(&artifact_key("pkg", filename)))
-            .await
-            .unwrap());
+        // The fence names the filename and no hash — two buckets may have
+        // demoted two bodies, so a per-bucket sha would never converge.
+        assert_eq!(
+            storage
+                .get_bytes(&mirror_quarantined_key(&key))
+                .await
+                .unwrap(),
+            format!(r#"{{"filename":"{filename}"}}"#).into_bytes()
+        );
         assert_eq!(storage.list_all(QUARANTINE_PREFIX).await.unwrap().len(), 1);
         let (rendered, _) = worker::list_artifacts(&storage, "pkg").await.unwrap();
         assert!(rendered.is_empty());
+        // Idempotent: a second pass has nothing left to settle.
+        assert_eq!(
+            quarantine_mirror_artifacts(&storage, "pkg").await.unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -4043,11 +4260,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(destination
+        assert!(!destination
             .head_exists(&artifact_key("pkg", late_mirror_filename))
             .await
             .unwrap());
         assert!(destination
+            .head_exists(&mirror_quarantined_key(&artifact_key(
+                "pkg",
+                late_mirror_filename
+            )))
+            .await
+            .unwrap());
+        // The fence replicated to the peer that never held the loser.
+        assert!(private
             .head_exists(&mirror_quarantined_key(&artifact_key(
                 "pkg",
                 late_mirror_filename

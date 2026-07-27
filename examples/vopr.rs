@@ -204,6 +204,9 @@ enum Break {
     /// Freeze a filename and drop an acked body the freeze never quarantined →
     /// CONSERVATION's freeze-totality clause.
     FreezeLossy,
+    /// Demote-quarantine a filename and drop the acked body the demotion never
+    /// moved to `_quarantine/` → CONSERVATION's demotion-totality clause.
+    DemoteLossy,
     /// Walk a privately-claimed package's `.origin` back to mirror →
     /// ORIGIN_TERMINALITY, claim arm.
     OriginDemoted,
@@ -225,7 +228,7 @@ const BREAK_PKG: &str = "vopr-phantom";
 /// reproduce line all read this table: a second list that quietly fails to
 /// track the first is exactly how the reproduce line came to describe a
 /// different run than the one that failed.
-const BREAKS: [(&str, Break); 21] = [
+const BREAKS: [(&str, Break); 22] = [
     ("view", Break::View),
     ("fanout", Break::Fanout),
     ("rerun", Break::Rerun),
@@ -244,6 +247,7 @@ const BREAKS: [(&str, Break); 21] = [
     ("freeze-unjustified", Break::FreezeUnjustified),
     ("split", Break::Split),
     ("freeze-lossy", Break::FreezeLossy),
+    ("demote-lossy", Break::DemoteLossy),
     ("origin-demoted", Break::OriginDemoted),
     ("mirror-served", Break::MirrorServed),
     ("attest", Break::Attest),
@@ -297,6 +301,7 @@ fn unexcused_ack(
                 let keys = b.keys();
                 keys.contains(&format!("{akey}.tombstone"))
                     || keys.contains(&format!("{akey}.frozen"))
+                    || keys.contains(&format!("{akey}.mirror-quarantined"))
             });
         (!excused).then(|| (pkg.clone(), fname.clone(), acks[0].body.clone()))
     })
@@ -636,6 +641,39 @@ async fn apply_break(
                 bucket.insert(&format!("{akey}.frozen"), b"{}".to_vec());
                 bucket.insert(&format!("_quarantine/{pkg}/{fname}@vopr"), kept.clone());
                 bucket.insert(&akey, kept.clone());
+            }
+        }
+        // Demotion totality, the sibling claim: `settle_mirror_quarantine`
+        // copies the losing body to `_quarantine/` BEFORE it drops the
+        // canonical record, so a demoted filename still owes the fleet the
+        // byte-set it acked. Here the demotion fences the name and DESTROYS
+        // the body — the shape of a settle that dropped before it preserved.
+        //
+        // The fence exempts DURABILITY by design (once a demotion settles the
+        // canonical key is empty on every bucket), which is exactly why that
+        // exemption may not go unguarded: CONSERVATION is the only oracle left
+        // holding the totality claim. VERIFY reds alongside it and cannot not —
+        // the fence takes the record out of the renderable set while the view
+        // still lists it, the same second finding `--break freeze-lossy`
+        // produces. Applied fleet-wide, so CONVERGENCE stays quiet.
+        (Break::DemoteLossy, false) => {
+            let Some((pkg, fname, _)) = unexcused_ack(buckets, ledger) else {
+                return;
+            };
+            let akey = format!("packages/{pkg}/{fname}");
+            let preserved = format!("_quarantine/{pkg}/{fname}@");
+            for bucket in buckets {
+                bucket.insert(
+                    &format!("{akey}.mirror-quarantined"),
+                    format!(r#"{{"filename":"{fname}"}}"#).into_bytes(),
+                );
+                let doomed: Vec<String> = bucket
+                    .dump()
+                    .into_keys()
+                    .filter(|key| key.starts_with(&preserved))
+                    .chain([akey.clone(), format!("{akey}.meta.json")])
+                    .collect();
+                let _ = bucket.delete_keys(&doomed).await;
             }
         }
         // The origin lattice walked backwards: a package a private upload
@@ -1204,7 +1242,7 @@ fn report_reach(explored: u64, rechecked: u64, brk: Break) -> Vec<&'static str> 
 // atomics. No `FaultView`, no rng, no await.
 // ---------------------------------------------------------------------------
 
-const VERDICT_SLOTS: usize = 10;
+const VERDICT_SLOTS: usize = 11;
 const VERDICT_LABELS: [&str; VERDICT_SLOTS] = [
     "Noop",
     "Copy",
@@ -1216,6 +1254,7 @@ const VERDICT_LABELS: [&str; VERDICT_SLOTS] = [
     "FinishFreeze",
     "Tombstone",
     "Defer",
+    "SettleMirrorQuarantine",
 ];
 
 const EVIDENCE_SLOTS: usize = 3;
@@ -1230,7 +1269,7 @@ const EVIDENCE_LABELS: [(&str, &str); EVIDENCE_SLOTS] = [
     ),
     (
         "<file>.mirror-quarantined",
-        "a mirror body made inert under a private claim",
+        "a mirror->private demotion fenced (replicates; the body moves to _quarantine/)",
     ),
 ];
 
@@ -1291,6 +1330,7 @@ fn verdict_slot(verdict: &Verdict) -> usize {
         Verdict::FinishFreeze => 7,
         Verdict::Tombstone => 8,
         Verdict::Defer => 9,
+        Verdict::SettleMirrorQuarantine => 10,
     }
 }
 
@@ -3263,8 +3303,16 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
             let akey = format!("packages/{pkg}/{fname}");
             let tomb = dump.contains_key(&format!("{akey}.tombstone"));
             let frozen = dump.contains_key(&format!("{akey}.frozen"));
-            if ledger.deleted.contains(&(pkg.clone(), fname.clone())) || tomb || frozen {
-                continue; // authorized removal or conflict freeze
+            // A mirror->private demotion is an authorized removal too: the fence
+            // replicates, the body it suppresses moves to `_quarantine/` on
+            // whichever bucket held it, and the canonical key ends empty
+            // everywhere (dev/DESIGN.md). CONSERVATION is what keeps this
+            // exemption honest — it counts `_quarantine/` copies fleet-wide, so
+            // a demotion that dropped bytes instead of moving them still reds
+            // (`--break demote-lossy`).
+            let demoted = dump.contains_key(&format!("{akey}.mirror-quarantined"));
+            if ledger.deleted.contains(&(pkg.clone(), fname.clone())) || tomb || frozen || demoted {
+                continue; // authorized removal, conflict freeze, or demotion
             }
             REACH.hit(R::Durability);
             // One acked byte-set is the ordinary case and stays byte-strict.
@@ -3411,6 +3459,13 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
         let frozen_anywhere = dumps
             .iter()
             .any(|d| d.contains_key(&format!("{akey}.frozen")));
+        // A demotion is the other authorized removal that keeps its evidence: it
+        // moves the loser to `_quarantine/` before it drops the record, and
+        // writes no tombstone, so nothing exempts it here — which is what keeps
+        // DURABILITY's `.mirror-quarantined` exemption honest.
+        let demoted_anywhere = dumps
+            .iter()
+            .any(|d| d.contains_key(&format!("{akey}.mirror-quarantined")));
         let deleted = ledger.deleted.contains(&(pkg.clone(), fname.clone()))
             || ((!frozen_anywhere || ledger.authorized_delete(pkg, fname))
                 && dumps
@@ -3432,6 +3487,9 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool) -> RunOutcome {
                     if frozen_anywhere {
                         " — a freeze quarantines both bodies before it drops either, so a \
                          frozen filename may not lose one"
+                    } else if demoted_anywhere {
+                        " — a demotion moves the loser to `_quarantine/` before it drops the \
+                         record, so a demoted filename may not lose it"
                     } else {
                         ""
                     },

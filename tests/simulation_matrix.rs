@@ -148,13 +148,14 @@ fn no_nightly_row_mixes_rotation_with_a_workload_flag() {
     }
 }
 
-/// The partitioned lane is real coverage that does not pass yet: at
-/// `--partition 100` it fails 0.32% of seeds (291 of 91,560, measured
-/// 2026-07-26), essentially all of them one unconverged `.mirror-quarantined`
-/// marker. It is in the nightly anyway, because at `--partition 0` the merge
-/// algebra never executes — every verdict beyond the trivial ones reads
-/// `[never presented]` — so without it the aligned rows prove their invariants
-/// only about a fleet whose buckets never disagree.
+/// The partitioned lane is real coverage that does not pass yet — but it is
+/// close now: at `--partition 100` it fails 0.003% of seeds (2 of 65,473,
+/// measured 2026-07-26), down from 0.32% once the `.mirror-quarantined` fence
+/// started replicating. Both survivors are FREEZE_UNJUSTIFIED, a pre-existing
+/// class with nothing to do with partitioning. It is in the nightly because at
+/// `--partition 0` the merge algebra never executes — every verdict beyond the
+/// trivial ones reads `[never presented]` — so without it the aligned rows
+/// prove their invariants only about a fleet whose buckets never disagree.
 ///
 /// That makes two opposite mistakes possible, and this test exists for both.
 /// Dropping `continue-on-error` from the partitioned job turns the nightly
@@ -171,10 +172,10 @@ fn the_partitioned_lane_is_non_blocking_and_the_gated_matrix_is_not() {
     );
     assert!(
         job_lines("vopr-partitioned:").any(|line| line.trim() == "continue-on-error: true"),
-        "the partitioned lane lost continue-on-error. It still fails ~0.3% of \
-         seeds (see the job comment for the three open root causes and their \
-         minimized repros); gating it makes the nightly permanently red. Remove \
-         this assertion only together with the failures."
+        "the partitioned lane lost continue-on-error. It still fails ~0.003% of \
+         seeds (FREEZE_UNJUSTIFIED, pre-existing and not partition-specific); \
+         gating it makes the nightly red on a rate nobody has driven to zero \
+         yet. Remove this assertion only together with the failures."
     );
 }
 
@@ -205,8 +206,9 @@ fn the_partitioned_lane_keeps_its_corpus_and_partitions_something() {
         corpus >= MIN_CORPUS,
         "the partitioned lane has a {corpus}-filename corpus (packages={packages:?} \
          files={files:?}); below {MIN_CORPUS} the deletes tombstone it and the \
-         durability oracles verify nothing on most seeds — and DURABILITY is live \
-         on this lane, 45 of its 291 measured failures:\n{invocation}"
+         durability oracles verify nothing on most seeds — and DURABILITY was \
+         live on this lane, 45 of the 291 failures measured before the \
+         `.mirror-quarantined` fence replicated:\n{invocation}"
     );
     assert!(
         invocation.contains("--max-secs"),

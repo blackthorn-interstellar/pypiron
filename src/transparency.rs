@@ -34,7 +34,7 @@ use tracing::warn;
 
 use crate::app::PACKAGES_PREFIX;
 use crate::hash::sha256_hex;
-use crate::sidecar::{Sidecar, SIDECAR_SUFFIX, TOMBSTONE_SUFFIX};
+use crate::sidecar::{Sidecar, MIRROR_QUARANTINED_SUFFIX, SIDECAR_SUFFIX, TOMBSTONE_SUFFIX};
 use crate::storage::{is_not_found, Storage, StorageArgs};
 
 /// Namespace for the chain. Classified [`SingletonReplicated`] in the storage
@@ -477,8 +477,8 @@ pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
                 let fi = ci * DIFF_CONCURRENCY + j;
                 let (pkg, filename, expected_sha) = checks[fi];
                 match presence? {
-                    // Present truth or a legitimate delete: the file survives here.
-                    Presence::Match | Presence::Tombstone => covered[fi] = true,
+                    // Present truth, or a disappearance the operator authorized.
+                    Presence::Match | Presence::Covered => covered[fi] = true,
                     // Present but unparseable: still not a vanish, but flag it.
                     Presence::Corrupt(e) => {
                         covered[fi] = true;
@@ -565,10 +565,12 @@ enum Presence {
     WrongSha(String),
     /// Sidecar present but unparseable.
     Corrupt(String),
-    /// No sidecar, but a tombstone marks a legitimate delete the chain hasn't
-    /// caught up to yet.
-    Tombstone,
-    /// No sidecar and no tombstone.
+    /// No sidecar, but a marker authorizes the disappearance: a tombstone (a
+    /// legitimate delete) or `.mirror-quarantined` (the operator's own
+    /// mirror→private supersede, which drops the demoted record and keeps only
+    /// its fence). Either way the chain simply has not caught up yet.
+    Covered,
+    /// No sidecar and no marker authorizing its absence.
     Absent,
 }
 
@@ -589,9 +591,13 @@ async fn probe_presence(
             Err(e) => Ok(Presence::Corrupt(e.to_string())),
         },
         Err(e) if is_not_found(&e) => {
-            let tombstone = format!("{base}{TOMBSTONE_SUFFIX}");
-            if storage.head_exists(&tombstone).await? {
-                Ok(Presence::Tombstone)
+            let (tombstoned, demoted) = futures::future::try_join(
+                storage.head_exists(&format!("{base}{TOMBSTONE_SUFFIX}")),
+                storage.head_exists(&format!("{base}{MIRROR_QUARANTINED_SUFFIX}")),
+            )
+            .await?;
+            if tombstoned || demoted {
+                Ok(Presence::Covered)
             } else {
                 Ok(Presence::Absent)
             }

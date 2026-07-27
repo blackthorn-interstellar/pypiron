@@ -171,12 +171,17 @@ jobs:
           # claims about `.frozen`, and origin exclusivity is asserted once on
           # the package claim and once on the record under it. A branch sharing
           # a leg with its neighbour is a branch nobody has watched fire.
-          # `freeze-lossy` also reds VERIFY (a frozen record leaves the
-          # renderable set while the view still lists it) and `split` also reds
-          # CONVERGENCE (a split filename IS a diverged key); the expected text
-          # below names the one invariant each leg is for.
+          # `freeze-lossy`/`demote-lossy` also red VERIFY (a fenced record
+          # leaves the renderable set while the view still lists it) and `split`
+          # also reds CONVERGENCE (a split filename IS a diverged key); the
+          # expected text below names the one invariant each leg is for.
+          # `demote-lossy` is what keeps DURABILITY's `.mirror-quarantined`
+          # exemption honest: a settled demotion empties the canonical key on
+          # every bucket, so CONSERVATION is the only oracle left asserting the
+          # loser was MOVED to `_quarantine/` rather than destroyed.
           check freeze-unjustified "FREEZE_UNJUSTIFIED:" --nodes 2 --buckets 1 --ops 80
           check freeze-lossy  "a frozen filename may not lose one" --nodes 2 --buckets 1 --ops 80
+          check demote-lossy  "a demoted filename may not lose it" --nodes 2 --buckets 1 --ops 80
           check origin-demoted "ORIGIN_TERMINALITY: bucket 0 claims" --nodes 2 --buckets 1 --ops 80
           check mirror-served "ORIGIN_TERMINALITY: bucket 0 still serves" --nodes 2 --buckets 1 --ops 80
           check split     "never left split"           --nodes 2 --buckets 2 --ops 80

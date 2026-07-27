@@ -28,8 +28,8 @@ pub enum Class {
     /// reseed-if-absent.
     SingletonReplicated,
     /// Regenerable per-bucket views (indexes, audit report, sync cursors,
-    /// fingerprint state, frozen-conflict bodies). Never copied — each bucket
-    /// rebuilds or re-derives its own from the truth it holds.
+    /// fingerprint state). Never copied — each bucket rebuilds or re-derives
+    /// its own from the truth it holds.
     DerivedPerBucket,
     /// Per-bucket coordination state (leases, `_repl/` notes, topology stamps,
     /// staging, dirty worklist). Bucket-local by design; replicating it would be
@@ -43,12 +43,14 @@ pub enum Class {
     /// failover would zero the audit's download ranking during the incident it
     /// exists for. See [`crate::counters::Counters::reseed_rollups`].
     ReplicatedRollup,
-    /// A narrow, explicitly-bounded acceptable-loss window — the one totality
+    /// A narrow, explicitly-bounded acceptable-loss window — the totality
     /// exemption for state that is neither derived (not re-computable) nor
     /// coordination scratch. Not replicated by design; the `why` states the loss
-    /// bound. The counter live tallies are the exhibit: the current day's
-    /// un-rolled-up segments, at most one day, per the DESIGN.md totality
-    /// principle.
+    /// bound. Two exhibits, per the DESIGN.md totality principle: the counter
+    /// live tallies (the current day's un-rolled-up segments, at most one day),
+    /// and `_quarantine/` (byte-sets a freeze or demotion resolved *on that
+    /// bucket* — never a byte the fleet serves, never the winner, and always
+    /// announced by a fence that does replicate).
     DeclaredLoss,
 }
 
@@ -127,8 +129,8 @@ pub const MANIFEST: &[PrefixClass] = &[
     },
     PrefixClass {
         prefix: crate::replicate::QUARANTINE_PREFIX,
-        class: Class::DerivedPerBucket,
-        why: "byte-conflict losers preserved as moves; local to the bucket that resolved it",
+        class: Class::DeclaredLoss,
+        why: "losing byte-sets of freezes and demotions resolved on this bucket — never a byte the fleet serves, never the winner; the fence that announces each (`.frozen` + tombstone, or `.mirror-quarantined`) does replicate",
     },
     PrefixClass {
         prefix: crate::replicate::REPL_PREFIX,
@@ -301,6 +303,12 @@ mod tests {
         );
         assert_eq!(
             classify("_counters/seg/downloads/2026-01-01/r/inc-0.json"),
+            Some(Class::DeclaredLoss)
+        );
+        // A demotion/freeze loser is preserved evidence, not a derived view:
+        // nothing recomputes it, and it is declared lost on a bucket failure.
+        assert_eq!(
+            classify("_quarantine/requests/requests-2.0.0.tar.gz@0123456789ab"),
             Some(Class::DeclaredLoss)
         );
         assert_eq!(

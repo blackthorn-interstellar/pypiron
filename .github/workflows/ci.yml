@@ -240,6 +240,25 @@ jobs:
           # pinned by
           # `replicate::tests::a_copy_never_publishes_truth_over_a_body_the_bucket_lost`.
           cargo run --example vopr -- --seed 62000150551 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 80 --fail-percent 3 --partition 100
+          # Two false FREEZE_UNJUSTIFIED reds, both HARNESS defects: the freeze
+          # was right and the attestation could not see its evidence.
+          # `publish_record` refuses an upload over a `.tombstone`/`.frozen` and
+          # deletes what it wrote — but only single-bucket. With peers it leaves
+          # the body standing ("occupied and inert"), a replication copy then
+          # loses its create to it, reads it back and freezes both sides
+          # (`replicate::freeze_copy_race`), and those bytes are the only
+          # evidence there is: no sidecar was published, so no ack names them
+          # and no `_quarantine/` copy is taken. The harness had written off
+          # every fence-refused body as debris, unconditionally. Both
+          # `--shrink`-minimized (80 -> 63 ops, 160 -> 94). The durable cover is
+          # the evidence model:
+          # `sim::tests::a_refused_writers_debris_attests_only_once_something_loses_to_it`
+          # asserts all three directions at once — a refused body nobody went
+          # for stays out, one a create lost to becomes attestable, and an
+          # ordinary 409 against a published record (the legitimate
+          # mirror->private succession next door) adds nothing.
+          cargo run --example vopr -- --seed 97800043727 --nodes 3 --buckets 3 --packages 6 --files 4 --ops 63 --fail-percent 3 --partition 100
+          cargo run --example vopr -- --seed 121000059774 --nodes 3 --buckets 3 --packages 6 --files 2 --ops 94 --fail-percent 3 --partition 100
       # Mutation-testing the oracles themselves. Each `--break` is ONE deliberate
       # defect the named invariant exists to catch, so the run MUST fail with
       # that invariant's text — an invariant nobody has watched go red is an

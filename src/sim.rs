@@ -159,9 +159,9 @@ struct Inner {
     /// the product's own:
     ///
     /// - a body written while [`upload_barred`] never joins. `publish_record`
-    ///   refuses over a `.tombstone`/`.frozen` and (single-bucket) deletes the
-    ///   bytes it had already stored, so those bytes were never a record the
-    ///   fleet served — they are a refused writer's debris.
+    ///   refuses over a `.tombstone`/`.frozen`, so those bytes were never a
+    ///   record this bucket published — they are a refused writer's debris,
+    ///   until something contests them ([`Inner::contested`]).
     /// - deleting the body with NO fence beside it clears the set. That is a
     ///   mirror cache eviction (never tombstoned, re-fillable by design) or a
     ///   rollback; either way the name is retired with nothing preserved, and
@@ -174,6 +174,26 @@ struct Inner {
     /// otherwise erase. Clearing there would put back the false FREEZE_
     /// UNJUSTIFIED reds this set was added to remove.
     committed: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// The debris that stopped being debris: bodies a filename fence refused
+    /// which another writer then LOST the immutable filename to, over the same
+    /// incarnation. Recorded apart from [`Inner::committed`] because whether
+    /// they are evidence is the CALLER's question, and only the caller knows
+    /// its fleet:
+    ///
+    /// - single-bucket, `publish_record` deletes what it wrote the moment the
+    ///   fence refuses it (`src/publish.rs`), and no merge runs at all, so the
+    ///   loser's 409 is the end of it.
+    /// - multi-bucket, that same call deliberately leaves the refused body: "a
+    ///   fenced multi-bucket loser stays occupied and inert", because deleting
+    ///   by key could erase a private replacement that landed after the
+    ///   writer's cross-object read. The writer that loses the create there is
+    ///   a replication copy leg: it reads the standing body back, finds bytes
+    ///   its own sidecar does not name, and freezes both sides
+    ///   (`replicate::freeze_copy_race`). Two byte-sets under one immutable
+    ///   filename — and routinely the only trace of them, since the refused
+    ///   publish never published a sidecar, so no ack names those bytes and
+    ///   `freeze_side` quarantines the body it kept, not the one it lost.
+    contested: BTreeMap<String, std::collections::BTreeSet<String>>,
     /// Per-storage version counter. Every successful write stamps `v{n}` and
     /// increments, so etags model an object store's opaque generation — one
     /// etag space shared by every conditional operation — rather than a content
@@ -281,6 +301,35 @@ impl SimStorage {
         etag
     }
 
+    /// A conditional create that LOST: another writer went for this immutable
+    /// filename and the body standing at `key` held it. A standing body no
+    /// [`Inner::committed`] entry names is one a filename fence refused, and
+    /// losing to it is exactly the moment it stops being debris — see
+    /// [`Inner::contested`].
+    fn create_lost(inner: &mut Inner, key: &str) {
+        if !is_canonical_artifact(key) {
+            return;
+        }
+        let Some(standing) = inner
+            .objects
+            .get(key)
+            .map(|o| crate::hash::sha256_hex(&o.bytes))
+        else {
+            return;
+        };
+        if !inner
+            .committed
+            .get(key)
+            .is_some_and(|published| published.contains(&standing))
+        {
+            inner
+                .contested
+                .entry(key.to_string())
+                .or_default()
+                .insert(standing);
+        }
+    }
+
     /// Seed an object, stamping the clock time and a fresh version.
     pub fn insert(&self, key: &str, bytes: Vec<u8>) {
         let now = self.clock.now_utc();
@@ -293,6 +342,13 @@ impl SimStorage {
     /// [`Inner::committed`].
     pub fn committed_digests(&self, key: &str) -> std::collections::BTreeSet<String> {
         self.lock().committed.get(key).cloned().unwrap_or_default()
+    }
+
+    /// The fence-refused byte-sets another writer lost this filename to, over
+    /// the same incarnation. Evidence only for a caller whose fleet has peers —
+    /// see [`Inner::contested`].
+    pub fn contested_digests(&self, key: &str) -> std::collections::BTreeSet<String> {
+        self.lock().contested.get(key).cloned().unwrap_or_default()
     }
 
     /// Snapshot of key -> bytes, for invariant checks and abstraction functions.
@@ -364,6 +420,7 @@ impl Storage for SimStorage {
         let now = self.clock.now_utc();
         let mut inner = self.lock();
         if inner.objects.contains_key(key) {
+            Self::create_lost(&mut inner, key);
             return Ok(false);
         }
         Self::store(&mut inner, key, bytes, now);
@@ -455,6 +512,7 @@ impl Storage for SimStorage {
             // cannot have conflicted with this one. See `Inner::committed`.
             if removed && is_canonical_artifact(k) && !fence_stands(&inner, k) {
                 inner.committed.remove(k);
+                inner.contested.remove(k);
             }
         }
         Ok(())
@@ -476,6 +534,7 @@ impl Storage for SimStorage {
         let now = self.clock.now_utc();
         let mut inner = self.lock();
         if inner.objects.contains_key(key) {
+            Self::create_lost(&mut inner, key);
             return Ok(None);
         }
         Ok(Some(Self::store(&mut inner, key, bytes, now)))
@@ -645,33 +704,81 @@ mod tests {
 
         s.put_bytes(BODY_KEY, b"two".to_vec(), None).await.unwrap();
         assert_eq!(s.committed_digests(BODY_KEY), digests(&[b"two"]));
+
+        // Both halves of the history describe ONE incarnation, so they end
+        // together: a retired name may not still be carrying a contested body
+        // from the life before it. (Truth never drops a tombstone, but
+        // `--break resurrect` does, and an invariant that holds only while
+        // nothing unusual happens is not one.)
+        s.insert(&format!("{BODY_KEY}.tombstone"), b"{}".to_vec());
+        s.put_bytes(BODY_KEY, b"three".to_vec(), None)
+            .await
+            .unwrap();
+        assert!(!s
+            .put_if_absent(BODY_KEY, b"four".to_vec(), None)
+            .await
+            .unwrap());
+        assert_eq!(s.contested_digests(BODY_KEY), digests(&[b"three"]));
+        s.delete_keys(&[format!("{BODY_KEY}.tombstone")])
+            .await
+            .unwrap();
+        s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
+        assert!(s.contested_digests(BODY_KEY).is_empty());
+        assert!(s.committed_digests(BODY_KEY).is_empty());
     }
 
     #[tokio::test]
-    async fn a_refused_writers_debris_never_attests() {
+    async fn a_refused_writers_debris_attests_only_once_something_loses_to_it() {
         // `publish_record` stores the bytes and only then reads the filename
-        // fence; over a `.tombstone` or `.frozen` it refuses and (single-bucket)
-        // deletes what it wrote. Those bytes were never a record the fleet
-        // served, so they are not half of a byte conflict.
+        // fence. Over a `.tombstone` or `.frozen` it refuses — and single-bucket
+        // it deletes what it wrote, so those bytes were never a record the fleet
+        // served. MULTI-bucket it deliberately leaves them ("a fenced
+        // multi-bucket loser stays occupied and inert"), and the writer that
+        // then loses the immutable filename to them is a replication copy leg,
+        // which reads them back and freezes both sides on the difference
+        // (`replicate::freeze_copy_race`). So the losing create is the event
+        // that separates debris from evidence — not the fence, and not the
+        // write.
         for fence in [".tombstone", ".frozen"] {
             let s = SimStorage::new(SimClock::new(start()));
             s.put_bytes(BODY_KEY, b"one".to_vec(), None).await.unwrap();
             s.insert(&format!("{BODY_KEY}{fence}"), b"{}".to_vec());
             s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
 
-            s.put_bytes(BODY_KEY, b"debris".to_vec(), None)
+            s.put_bytes(BODY_KEY, b"refused".to_vec(), None)
                 .await
                 .unwrap();
-            s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
             assert_eq!(
                 s.committed_digests(BODY_KEY),
                 digests(&[b"one"]),
-                "a write refused over {fence} is not evidence"
+                "a write {fence} refused is not a record the fleet served"
             );
+            assert!(
+                s.contested_digests(BODY_KEY).is_empty(),
+                "and nothing has collided with it yet"
+            );
+
+            // Now a peer's copy leg goes for the same filename and loses.
+            assert!(!s
+                .put_if_absent(BODY_KEY, b"peer".to_vec(), None)
+                .await
+                .unwrap());
+            assert_eq!(
+                s.contested_digests(BODY_KEY),
+                digests(&[b"refused"]),
+                "the body it lost to is what it will read back and freeze on"
+            );
+            // Still not a published record: the two answers stay separate, and
+            // a fenced delete may not erase either.
+            s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
+            assert_eq!(s.committed_digests(BODY_KEY), digests(&[b"one"]));
+            assert_eq!(s.contested_digests(BODY_KEY), digests(&[b"refused"]));
         }
         // The demotion fence is the exception in the other direction: it
         // deliberately does not bar an upload, because handing the filename to
-        // private truth is the settle's intended outcome. That body is real.
+        // private truth is the settle's intended outcome. That body is real —
+        // a completed mirror->private supersede is a succession, not a refusal,
+        // and it must land in the plain history with nothing held back.
         let s = SimStorage::new(SimClock::new(start()));
         s.put_bytes(BODY_KEY, b"mirror".to_vec(), None)
             .await
@@ -684,6 +791,15 @@ mod tests {
             s.committed_digests(BODY_KEY),
             digests(&[b"mirror", b"private"])
         );
+        // ...and a later create losing to it adds nothing: a published record
+        // is already attested, so the losing-create rule can only ever promote
+        // a body a fence refused. Otherwise every ordinary 409 on an immutable
+        // filename would read as a byte conflict.
+        assert!(!s
+            .put_if_absent(BODY_KEY, b"another".to_vec(), None)
+            .await
+            .unwrap());
+        assert!(s.contested_digests(BODY_KEY).is_empty());
     }
 
     #[tokio::test]

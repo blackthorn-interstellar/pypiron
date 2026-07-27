@@ -4470,6 +4470,9 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
     // all. What went away with it is the old "excused if the freeze preserved
     // something" clause, which was a proxy for this question and answered it
     // wrong in both directions.
+    //
+    // A `.frozen` is fleet state, and so is one term of the attestation — see
+    // the `peers` branch below.
     for (pkg, fname) in record_names(&dumps) {
         let akey = format!("packages/{pkg}/{fname}");
         if !dumps
@@ -4487,8 +4490,21 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         if let Some(acks) = ledger.acked.get(&(pkg.clone(), fname.clone())) {
             attested.extend(acked_bodies(acks).into_iter().map(sha256_hex));
         }
+        // The fence-refused bodies another writer lost this filename to. Debris
+        // only where `publish_record` deletes it, and that is single-bucket
+        // alone: with peers "a fenced multi-bucket loser stays occupied and
+        // inert" (src/publish.rs), the writer that loses to it is a replication
+        // copy leg, and that leg reads it back and freezes both sides on the
+        // difference (`replicate::freeze_copy_race`). Those are the freezes the
+        // attestation could not see: the refused publish never wrote a sidecar,
+        // so no ack names its bytes and `freeze_side` quarantines the body each
+        // bucket kept rather than the one it lost.
+        let peers = fleet.buckets.len() > 1;
         for bucket in &fleet.buckets {
             attested.extend(bucket.committed_digests(&akey));
+            if peers {
+                attested.extend(bucket.contested_digests(&akey));
+            }
         }
         if attested.len() < 2 {
             violations.push(format!(
@@ -5848,6 +5864,11 @@ fn main() {
         .map(|path| Trace::new(path.clone()));
     let started = std::time::Instant::now();
     let keep_going = args.forever || args.max_secs.is_some();
+    // A `--break` run is a MEASUREMENT, not a search: it finishes its whole draw
+    // so the kill rate it prints at the end is a number this run produced.
+    // Everything else stops at its first counterexample — one is enough, and the
+    // rest of the draw would only delay the report.
+    let census = keep_going || args.brk != Break::None;
     let mut total_events: u64 = 0;
     let mut total_acked: usize = 0;
     let mut total_ack_totality: u64 = 0;
@@ -5923,7 +5944,7 @@ fn main() {
                     reproduce_command(seed, args.rotate, &profile),
                     profile.describe()
                 );
-                if !keep_going {
+                if !census {
                     // We exit on the next line, so this string reaches nothing
                     // but the trace — and without it the page would render
                     // "DETERMINISM held" on the run that caught it red.
@@ -5949,7 +5970,7 @@ fn main() {
                     reproduce_command(seed, args.rotate, &profile),
                     profile.describe()
                 );
-                if !keep_going {
+                if !census {
                     let red = format!(
                         "DETERMINISM: seed {seed} re-executed to the same op trace but a \
                          different final world ({:#x} vs {:#x})",
@@ -6003,10 +6024,10 @@ fn main() {
                 shrink_report(seed, &profile, &outcome.violations);
                 std::process::exit(2);
             }
-            if !keep_going {
+            failed_seeds.push(seed);
+            if !census {
                 std::process::exit(2);
             }
-            failed_seeds.push(seed);
         }
         // Soak-log heartbeat: one line a minute proves liveness and carries
         // the running counters without flooding the log.
@@ -6051,6 +6072,29 @@ fn main() {
             )
         }
     );
+    if let Some(flag) = args.brk.flag() {
+        // The kill rate as a re-measured artifact. dev/TESTING.md used to carry
+        // it by hand, and a hand-carried number drifts silently in exactly one
+        // direction: an oracle quietly stops catching its own break and the doc
+        // still says it does. Print it on every `--break` run, so the CI kill
+        // proof's own log is the record and a drop is visible the day it lands
+        // instead of the day someone re-measures.
+        //
+        // A determinism divergence is a kill too — it is the whole of what
+        // `--break rerun` plants — and it is booked in its own list, so count
+        // the union rather than one column of it.
+        let killed = (failed_seeds.len()
+            + determinism_violations
+                .iter()
+                .filter(|seed| !failed_seeds.contains(seed))
+                .count()) as u64;
+        println!(
+            "vopr: --break {flag} killed {killed}/{explored} seeds ({}%) — measured by this run; \
+             a draw is a gate only while it stays several times the seeds-to-first-kill this \
+             implies (dev/TESTING.md)",
+            killed * 100 / explored.max(1),
+        );
+    }
     let unreached = report_reach(explored, rechecked, args.brk);
     report_merge(explored);
     if args.shrink && failed_seeds.is_empty() {

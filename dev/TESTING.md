@@ -941,8 +941,9 @@ two rules that bound it are both the product's own, not the harness's opinion:
 
 - a body written while a `.tombstone` or `.frozen` stands beside the key never
   joins. Those are `publish_record`'s upload fences: it stores the bytes, reads
-  the fence, refuses, and single-bucket deletes what it wrote. Debris a refused
-  writer left is not half of a byte conflict.
+  the fence, and refuses. Debris a refused writer left is not half of a byte
+  conflict — until something loses the filename to it, which is the narrowing in
+  *Debris stops being debris when a writer loses to it* below.
 - deleting the body with **no** fence beside it clears the set. That is a mirror
   cache eviction — never tombstoned, re-fillable by design (`delete_record`) —
   or a rollback; either way the name is retired with nothing preserved, and the
@@ -979,8 +980,83 @@ this set and none from an ack — and 88,262 partitioned seeds from 5100000000
 attest 38,011 `.frozen` markers across 27,270 seeds with **zero**
 FREEZE_UNJUSTIFIED, against 38,135 across 27,358 on the same range before. Three
 `SimStorage` unit tests pin the three directions (fenced delete keeps, unfenced
-delete clears, barred write never joins); the middle two fail on the old
-currency.
+delete clears, a fence-refused write attests only once contested); the middle two
+fail on the old currency.
+
+**Debris stops being debris when a writer loses to it.** The rule above shipped
+as "a body written under a fence never joins", full stop, and that is
+single-bucket reasoning stated fleet-wide. `publish_record` stores the bytes,
+reads the filename fence, and refuses — then deletes what it wrote **only when
+`state.buckets.is_multi()` is false**. With peers it deliberately leaves them:
+*"a fenced multi-bucket loser stays occupied and inert"*, because deleting by
+key could erase a private replacement that landed after the writer's
+cross-object read. Those bytes go on standing at the canonical key, and the next
+replication copy of that filename loses its `create_artifact_verified` to them,
+reads them back, finds bytes its own sidecar does not name, and freezes both
+sides on the spot (`replicate::freeze_copy_race` — a real coexistence, and the
+one path `Verdict::Freeze` never sees). Two byte-sets under one immutable
+filename is exactly what FREEZE_JUSTIFIED asks for, and the attestation was
+blind to it: a false red on a correct freeze. It is also the *only* surviving
+evidence, every time — the refused publish never published a sidecar, so no ack
+names those bytes, and `freeze_side` quarantines the body each bucket kept
+rather than the one it lost.
+
+The narrowing is the losing create itself, not the fence and not the fleet. A
+conditional create that finds a body no `committed` entry names has collided
+with a fence-refused one, and `SimStorage` records that digest in
+`Inner::contested`. Everything else is untouched: a refused body nothing ever
+went for stays out, and an ordinary immutability 409 against a published record
+adds nothing, or every second upload of an existing filename would read as a
+byte conflict. The oracle then unions `contested_digests` **only when
+`fleet.buckets.len() > 1`**, because single-bucket the refused body is deleted
+by its own publisher and no merge runs at all — the loser's 409 is the end of
+it.
+
+Two witnesses, both `--nodes 3 --buckets 3 --packages 6 --fail-percent 3
+--partition 100`, red at `76334ff` and green after — `--seed 97800043727
+--files 4 --ops 63` and `--seed 121000059774 --files 2 --ops 94`, both
+`--shrink`-minimized from 80 and 160 ops and both pinned in ci.yml.
+Per-seed kill rate of `--break freeze-unjustified`, re-measured either side of
+the change (`vopr --seeds N --break freeze-unjustified`, and the batched census
+agrees digit-for-digit with N separate `--seed` runs):
+
+| flags | before | after |
+|---|---|---|
+| `--nodes 2 --buckets 1 --ops 80` (the CI gate leg), seeds 1–2000 | 1864 (93.2%) | **1864 (93.2%)** |
+| `--nodes 3 --buckets 3 --packages 6 --files 2 --ops 80 --fail-percent 3 --partition 100`, seeds 1–500 | 240 (48.0%) | 229 (45.8%) |
+| `--rotate`, seeds 1–2000 | 1788 (89.4%) | 1378 (68.9%, K 3 → 6) |
+
+The gate is untouched — single-bucket never reaches the `peers` branch — and the
+multi-bucket give-back is the correct answer rather than a regression: on those
+seeds a fence-refused body really was contested under the frozen filename, so
+two byte-sets really did stand there and the oracle's claim is satisfied. Two
+earlier drafts are on record for why this shape and not another: attesting
+*every* fence-refused body (no losing-create test) costs far more —
+188/500 and 1113/2000 on the two multi-bucket rows — and applying the
+losing-create rule *without* the `peers` gate costs the CI leg itself, 1601/2000
+(80.0%). Verification soaks, one process each: `--max-secs 240` from seed
+200000000000 on `--nodes 3 --buckets 3 --packages 6 --files 2 --ops 160
+--fail-percent 3 --partition 100` is clean before (18,593 seeds) and after
+(15,460), and `--max-secs 60` from 97800043000 on witness 1's profile goes 1
+failure (5,491 seeds) → 0 (4,418). Seed *counts* differ between the two because
+a time budget explores whatever the box's rate allows; compare the verdicts, and
+compare ranges when the count has to mean something.
+
+**Kill rates are measured artifacts now, not remembered ones.** Every `--break`
+run finishes its whole draw and prints what it killed:
+
+```
+vopr: --break freeze-unjustified killed 6/6 seeds (100%) — measured by this run
+```
+
+so the CI kill-proof log carries the rate for all 23 legs on every run, and a
+break that starts escaping shows up the day it lands instead of the day someone
+re-measures. (Only `--break` runs finish the draw; every other run still stops
+at its first counterexample.) The table below stays for the K derivation and
+the profile each rate was taken on — but it is a snapshot of that output, and
+the output wins. Batched and one-seed-at-a-time censuses agree exactly:
+`--seeds 500 --break freeze-unjustified` on the CI leg's flags reports 470/500,
+the same 470 that 500 separate `--seed N` invocations produce.
 
 Determinism itself is verified, not assumed: recurring seeds (`--recheck-every`)
 run twice and must produce an identical storage-op trace hash *and* an identical
@@ -1180,7 +1256,11 @@ K is how many fresh seeds the break needs to red with **≥99.8% confidence** �
 flags. It is not "the first seed that happens to red": every break in this table
 reds on seed 1 today, and a table of 1s would say nothing about what happens when
 the schedule moves. Re-measure whenever it does; a stale K is a gate nobody has
-checked is still a gate.
+checked is still a gate — which is why p is no longer carried by this table
+alone. Every `--break` run prints the rate it just measured (`vopr: --break
+<name> killed N/M seeds`), so the CI kill-proof log is the live record and this
+table is its snapshot. To refresh a row, widen the draw and read the same line:
+`vopr --seeds 2000 --break <name> <that row's flags>`.
 
 `globalindex` exists because `ordering` cannot reach the global analysis: it
 grows a package that already exists, so the global name set never changes and
@@ -1230,7 +1310,11 @@ cannot quietly turn a gate into a coin flip.
 Under `--rotate` the same breaks red at different rates, because the rotating
 profile varies the *topology* and the fault mode each break needs. Over
 1,724–7,041-seed samples at this commit: `view` and `wedge` 100% (K=1);
-`origin-demoted` 97.4% (K=2); `resurrect` and `freeze-unjustified` 88.0% (K=3);
+`origin-demoted` 97.4% (K=2); `resurrect` 88.0% (K=3);
+`freeze-unjustified` 68.9% (K=6, 1378/2000 — down from 89.4% when the
+attestation learned to see a contested fence-refused body, see *Debris stops
+being debris when a writer loses to it*; its own gate leg is single-bucket and
+unchanged);
 `poison`, `blind` and `fallback` 71.9% (K=5); `mirror-served` 68.2%, `diverge`
 66.7%, the three durability-family breaks 66.3%, `freeze-lossy` 66.4% and
 `attest` 64.9% (K=6);

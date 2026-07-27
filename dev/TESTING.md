@@ -413,24 +413,42 @@ the tombstone is exactly the window where it would become load-bearing.
 
 #### Where the two lanes stand
 
-Three statements, all true at `783d423` and all measured rather than inferred:
-**the aligned nightly is green, the partitioned lane is still red, and
-`--partition` is still not in CI.**
+Three statements, all true at `1e80be3` and all measured rather than inferred:
+**the aligned nightly is green, the partitioned lane is still red, and it runs
+nightly anyway — as a non-blocking lane, never as a gate.**
 
 - **Aligned** — the five nightly profiles at their own 50,000 seeds each with
-  `--require-reach` (`--start-seed 9600001`): 250,000 seeds, 467,219,607
-  storage-op interleavings, 2,295,157 acked uploads, **zero violations**, no
+  `--require-reach` (`--start-seed 12000000001`): 250,000 seeds, 466,908,487
+  storage-op interleavings, 2,293,880 acked uploads, **zero violations**, no
   starved oracle, 0 audit view repairs of any class.
-- **Partitioned** — three lanes at `--partition 100`, 240 s each on a disjoint
-  range (`--start-seed 9500001`): 166,409 seeds, 352,586,168 interleavings,
-  1,255,628 acked uploads, **282 failing seeds (0.17%)** across five oracles.
+- **Partitioned** — the `multi-bucket` profile plus one flag, 420 s per rate on
+  disjoint ranges: at `--partition 100`, 91,560 seeds and **291 failing
+  (0.318%)**; at `--partition 10`, 89,460 seeds and **27 failing (0.030%)**.
   Down from 16–51% of seeds when the lane opened, but not zero.
 
-So `--partition` still defaults to 0 and no CI invocation passes it (grep
-`ci.yml` and `simulation.yml`: the flag appears in neither). The nightly matrix
-and the pinned regression seeds stay on the aligned schedule, byte-identical
-(verified by diffing five whole-profile runs, every counter to the digit), until
-the lane is green. The partitioned soak is run by hand:
+That rules out gating at *any* partition percentage, which is the question a
+lower rate invites. A 50,000-seed nightly draw reds with probability ≈1 at both
+rates; even the 6-seed PR smoke reds ~2% of runs at 100%. Only fixing the
+remaining bugs makes it a gate — so `vopr-partitioned` in `simulation.yml` is
+`continue-on-error: true`, with a 15-minute `--max-secs` budget instead of a
+seed count, because the lane's output is a *rate* you watch trend to zero: given
+a seed count it would stop at its first failing seed, ~300 seeds in, and report
+nothing. `tests/simulation_matrix.rs` guards it in both directions — the
+partitioned lane must keep `continue-on-error`, and the gated matrix must never
+acquire it. The aligned matrix and the pinned `ci.yml` regression seeds stay on
+`--partition 0`, byte-identical (verified by diffing five whole-profile runs,
+every counter to the digit).
+
+98.6% of the failures are one bug — a `.mirror-quarantined` marker that never
+converges, because two arms of `src/replicate/decide.rs` (the
+`(QuarantinedMirror, _)` catch-all and `settled_delete`, both `b0cb67f`) return
+`Noop`, which means "the two sides agree", over pairs that do not. Every
+DURABILITY violation on the lane is downstream of it. The rest is
+`FREEZE_UNJUSTIFIED` residue (~4 per 100k) and `ACK_TOTALITY` residue (~3 per
+100k). All three, with minimized repros, are written up in the job comment above
+`vopr-partitioned` in `.github/workflows/simulation.yml`.
+
+To reproduce a lane by hand:
 
 ```
 cargo run --release --example vopr -- --rotate --partition 100 --max-secs 600

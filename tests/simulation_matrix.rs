@@ -25,6 +25,37 @@ const MIN_CORPUS: usize = 12;
 
 const WORKFLOW: &str = include_str!("../.github/workflows/simulation.yml");
 
+/// Lines of the workflow belonging to the job whose key is `job`: everything
+/// under it until the next line at job depth (the next job key, or the comment
+/// block introducing it — job-level commentary sits at that same depth, and it
+/// describes the job it precedes, not the one it follows).
+///
+/// There is more than one vopr job now, so every assertion has to name the one
+/// it means; searching the whole file, or for the first `example vopr --` in
+/// it, silently pins itself to whichever job is declared first.
+fn job_lines(job: &'static str) -> impl Iterator<Item = &'static str> {
+    /// Two spaces of indent and no more — where job keys and the comment blocks
+    /// introducing them sit. Everything inside a job is indented further.
+    fn at_job_depth(line: &str) -> bool {
+        line.starts_with("  ") && !line.starts_with("   ")
+    }
+    WORKFLOW
+        .lines()
+        .skip_while(move |line| line.trim_start() != job)
+        .skip(1)
+        .take_while(|line| !at_job_depth(line))
+}
+
+/// That job's vopr command line, joined into one line: from `example vopr --`
+/// down to the `tee vopr.out` that ends the invocation.
+fn job_invocation(job: &'static str) -> String {
+    job_lines(job)
+        .skip_while(|line| !line.contains("example vopr --"))
+        .take_while(|line| !line.contains("tee vopr.out"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The integer argument following `flag` on a matrix row. Words carry the YAML
 /// quoting around them (`extra: '--packages 6 ...'`), so both sides are stripped
 /// of everything that is not the flag or the number.
@@ -103,15 +134,10 @@ fn no_nightly_row_mixes_rotation_with_a_workload_flag() {
     // invocation that pasted a topology onto every profile. So the invocation
     // itself must pass no workload flag — every one has to come from the row it
     // belongs to, or a future template edit reintroduces the same silent paste.
-    let invocation: String = WORKFLOW
-        .lines()
-        .skip_while(|line| !line.contains("example vopr --"))
-        .take_while(|line| !line.contains("tee vopr.out"))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let invocation = job_invocation("vopr:");
     assert!(
-        !invocation.is_empty(),
-        "could not find the nightly's vopr invocation — has the workflow moved?"
+        invocation.contains("matrix.profile.args"),
+        "the extracted invocation is not the matrix job's — has the workflow moved?\n{invocation}"
     );
     for flag in WORKLOAD {
         assert!(
@@ -120,4 +146,77 @@ fn no_nightly_row_mixes_rotation_with_a_workload_flag() {
              rotating one, which the harness refuses — it must come from `args` instead:\n{invocation}"
         );
     }
+}
+
+/// The partitioned lane is real coverage that does not pass yet: at
+/// `--partition 100` it fails 0.32% of seeds (291 of 91,560, measured
+/// 2026-07-26), essentially all of them one unconverged `.mirror-quarantined`
+/// marker. It is in the nightly anyway, because at `--partition 0` the merge
+/// algebra never executes — every verdict beyond the trivial ones reads
+/// `[never presented]` — so without it the aligned rows prove their invariants
+/// only about a fleet whose buckets never disagree.
+///
+/// That makes two opposite mistakes possible, and this test exists for both.
+/// Dropping `continue-on-error` from the partitioned job turns the nightly
+/// permanently red, and a lane nobody reads is worse than no lane. Adding
+/// `continue-on-error` to the gated matrix job silently converts the one thing
+/// that must never regress into decoration.
+#[test]
+fn the_partitioned_lane_is_non_blocking_and_the_gated_matrix_is_not() {
+    assert!(
+        !job_lines("vopr:").any(|line| line.contains("continue-on-error")),
+        "the gated nightly matrix carries continue-on-error — the five aligned \
+         profiles are the invariant that must never regress, and a soft failure \
+         there is indistinguishable from a pass"
+    );
+    assert!(
+        job_lines("vopr-partitioned:").any(|line| line.trim() == "continue-on-error: true"),
+        "the partitioned lane lost continue-on-error. It still fails ~0.3% of \
+         seeds (see the job comment for the three open root causes and their \
+         minimized repros); gating it makes the nightly permanently red. Remove \
+         this assertion only together with the failures."
+    );
+}
+
+/// Whatever else the partitioned lane changes, it has to stay comparable to the
+/// `multi-bucket` row it shadows: same durability corpus, an actual partition
+/// percentage, and a time budget rather than a seed count — `--max-secs`
+/// supersedes `--seeds`, so passing both would discard one silently, which is
+/// the exact defect the matrix rows above are shaped to prevent.
+#[test]
+fn the_partitioned_lane_keeps_its_corpus_and_partitions_something() {
+    let invocation = job_invocation("vopr-partitioned:");
+    assert!(
+        !invocation.is_empty(),
+        "could not find the partitioned lane's vopr invocation — has it moved?"
+    );
+    let partition = flag_value(&invocation, "--partition").unwrap_or(0);
+    assert!(
+        partition > 0,
+        "the partitioned lane passes --partition {partition}: at 0% no seed \
+         draws a split fleet, every writer pins bucket 0, the merge algebra \
+         never runs, and the lane is a duplicate of the `multi-bucket` \
+         row:\n{invocation}"
+    );
+    let packages = flag_value(&invocation, "--packages");
+    let files = flag_value(&invocation, "--files");
+    let corpus = packages.zip(files).map(|(p, f)| p * f).unwrap_or(0);
+    assert!(
+        corpus >= MIN_CORPUS,
+        "the partitioned lane has a {corpus}-filename corpus (packages={packages:?} \
+         files={files:?}); below {MIN_CORPUS} the deletes tombstone it and the \
+         durability oracles verify nothing on most seeds — and DURABILITY is live \
+         on this lane, 45 of its 291 measured failures:\n{invocation}"
+    );
+    assert!(
+        invocation.contains("--max-secs"),
+        "the partitioned lane must run to a time budget: without one it stops at \
+         its first failing seed (~300 seeds in) and reports no rate to watch \
+         trend to zero:\n{invocation}"
+    );
+    assert!(
+        !invocation.contains("--seeds"),
+        "the partitioned lane passes both --seeds and --max-secs; --max-secs \
+         supersedes it, so --seeds is parsed and discarded:\n{invocation}"
+    );
 }

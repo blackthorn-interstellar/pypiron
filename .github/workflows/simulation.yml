@@ -104,6 +104,105 @@ jobs:
           tail -30 vopr.out >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+  # NON-BLOCKING, AND KNOWN RED. Do not read a green check here as a pass, and
+  # do not remove `continue-on-error` to "fix" it — this lane exists so the
+  # coverage is visible and the open bugs have a home, not as a gate.
+  #
+  # `--partition N` is the share of SEEDS whose fleet is partitioned: on those,
+  # each node homes to its own bucket and authors truth there instead of every
+  # writer pinning bucket 0. It is what finally makes `replicate::decide`'s merge
+  # algebra execute at all: at `--partition 0` every merge verdict beyond the
+  # trivial ones reads `[never presented]` over thousands of seeds, and no
+  # `.frozen`/`_quarantine/`/`.mirror-quarantined` object is ever created. So
+  # everything the aligned matrix above proves, it proves about a fleet whose
+  # buckets never disagree.
+  #
+  # Measured 2026-07-26 at this profile (91,560 seeds, 230M interleavings):
+  # 291 failing seeds = 0.318% per seed. At `--partition 10`, 27 in 89,460 =
+  # 0.030% — linear in the percentage, as the seed-share semantics predict.
+  # That is what rules out gating at a LOWER rate rather than not at all:
+  # lowering it buys proportionally fewer partitioned seeds, not a greener lane.
+  # A 50,000-seed draw reds with probability ~1 at both, and even the 6-seed PR
+  # smoke reds ~2% of runs at 100%; green would need a rate near 1e-6, i.e.
+  # ~0.03%, which is no partitioning at all. Only the three fixes below help.
+  #
+  # Open root causes, most to least of the volume:
+  #
+  #   1. `.mirror-quarantined` is not replicable state (98.6% of failing seeds).
+  #      Two arms in src/replicate/decide.rs assert convergence over pairs that
+  #      have not converged: the `(QuarantinedMirror, _)` catch-all returns
+  #      `Noop` — documented as "the two sides agree" — over the residual
+  #      `(QuarantinedMirror, Absent)` and `(QuarantinedMirror, Live{Mirror})`,
+  #      and `settled_delete` checks every companion EXCEPT `mirror_quarantined`,
+  #      so a marker orphaned beside a tombstone reads settled on both sides and
+  #      the tombstone fast path leaves it as permanent single-bucket debris.
+  #      Every DURABILITY hit on this lane is downstream of one of these.
+  #        --seed 9600003069 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 8  --fail-percent 0 --partition 100
+  #        --seed 9700012998 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100
+  #   2. FREEZE_UNJUSTIFIED residue: a fleet-wide freeze that attested one byte
+  #      set, or none at all. Unadjudicated — product or oracle. It matters more
+  #      than its count: a freeze grants a blanket DURABILITY+CONSERVATION
+  #      exemption, so an unjustified one buys silence for free.
+  #        --seed 9800002480 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100  # 1 byte set
+  #        --seed 9800020745 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100  # 0 byte sets
+  #   3. ACK_TOTALITY residue: a publish acks while a peer holds neither the
+  #      record nor a `_repl/` note covering it (dev/DESIGN.md totality
+  #      principle). Needs the wide profile; it does not reproduce below
+  #      6 packages / 200 ops.
+  #        --seed 9300024588 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 200 --fail-percent 0 --partition 100
+  #
+  # When the failing-seed count reaches zero, delete `continue-on-error` and
+  # fold this into the matrix above as an ordinary row.
+  vopr-partitioned:
+    name: vopr (partitioned authorship — NON-BLOCKING, known red)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The `multi-bucket` row above plus one flag, so the two are directly
+      # comparable — same topology, same 12-filename durability corpus, same op
+      # mix; the only difference is who authored the writes.
+      #
+      # `--max-secs` instead of `--seeds`, because this lane's output is a RATE,
+      # not a verdict: without it the run stops at its first failing seed (~300
+      # seeds in) and reports nothing you can watch trend. It also bounds the
+      # wall clock by construction — 15 minutes of simulation regardless of how
+      # slow the runner is, well inside the 60-minute job timeout. `--seeds` is
+      # deliberately absent: `--max-secs` supersedes it, and a flag that is
+      # parsed and discarded is the defect the matrix above is shaped to avoid.
+      # The start seed strides 1,000,000/night — far more than the lane can
+      # explore in 15 minutes — so no two nights share a schedule, and the
+      # 4e9 offset keeps it clear of the aligned rows' ranges.
+      - name: Run partitioned simulation
+        run: |
+          START=$(( 4000000000 + ( $(date +%s) / 86400 ) * 1000000 ))
+          cargo run --release --example vopr -- \
+            --start-seed "$START" --max-secs 900 \
+            --nodes 3 --buckets 2 --ops 160 --packages 6 --files 2 \
+            --partition 100 \
+            --require-reach | tee vopr.out
+      - name: Publish counters
+        if: always()
+        run: |
+          echo '### VOPR — partitioned authorship (NON-BLOCKING, known red)' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Watch the failing-seed count trend to zero; the open root causes and their' >> "$GITHUB_STEP_SUMMARY"
+          echo 'minimized repros are in the job comment in `.github/workflows/simulation.yml`.' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          # The summary line spells out every failing seed, which runs to
+          # hundreds — keep the counts, drop the two rosters. A green run has no
+          # brackets to strip.
+          grep -a '^vopr: [0-9]* seeds explored' vopr.out \
+            | sed -E 's/ \[[0-9, ]*\]//g' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          grep -a '^reproduce:' vopr.out | head -3 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
   model-deep:
     name: stateright (deep configurations)
     runs-on: ubuntu-latest

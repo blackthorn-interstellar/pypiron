@@ -22,6 +22,17 @@ env:
 permissions:
   contents: read
 
+# Every `run:` step here ends in `| tee`, and a step with no `shell:` gets
+# GitHub's default `bash -e {0}` — no `pipefail`, so the step exits with
+# *tee's* status and a red run reports green. Both nightly jobs were incapable
+# of failing: the VOPR exits 2/3 on a violated oracle and `cargo test` exits
+# 101, and every one of those was being swallowed. `shell: bash` is the one
+# that adds `-o pipefail` (`bash --noprofile --norc -eo pipefail {0}`), so it
+# belongs at the workflow level where a future piped step inherits it too.
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -339,10 +350,24 @@ jobs:
         run: |
           cargo test --release --test model_replication --test model_event_protocol \
             -- --ignored --nocapture 2>&1 | tee model.out
+      # `--ignored` runs ONLY ignored tests, and libtest exits 0 when a filter
+      # matches nothing — so a renamed or un-ignored config leaves this job
+      # running nothing and still reporting success. Name what must run: the
+      # other ignored tests here are visualizer dumps that no-op without
+      # PYPIRON_VIZ_GRAPH, so a result line alone proves nothing.
+      # `model_replication_deep` is deliberately absent — it is cheap enough
+      # (61k states, 265 ms) that it runs on the merge gate now.
+      - name: Assert the deep configuration actually ran
+        run: |
+          grep -qE '^test model_event_protocol_deep \.\.\. ok' model.out || {
+            echo 'model_event_protocol_deep did not run — the nightly deep check is empty' >&2
+            exit 1
+          }
       - name: Publish state counts
         if: always()
         run: |
           echo '### Stateright — deep configurations' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "unique states|test result" model.out >> "$GITHUB_STEP_SUMMARY" || true
+          grep -E "unique states|test result" model.out >> "$GITHUB_STEP_SUMMARY" \
+            || echo '(no state counts — the check did not complete)' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"

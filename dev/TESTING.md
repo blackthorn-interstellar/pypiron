@@ -154,21 +154,47 @@ drill's sub-second numbers anywhere outward-facing.
 
 ## Machine-checked models (stateright)
 
-The chaos suites *sample* failure schedules; the models in `tests/model_*.rs`
-*enumerate* them. Two stateright models cover the two
-protocols everything else rests on:
+The chaos suites and the VOPR sample failure schedules against the real binary;
+the models in `tests/model_*.rs` enumerate every interleaving of a smaller
+hand-written abstraction of the same two protocols. Different evidence, not a
+stronger version of the same evidence — the sampling tier is what found the
+global-index staleness bug (1bc3ce9) and the three convergence bugs in e860792,
+all inside the enumerating tier's nominal scope.
 
 - **Event protocol** (`tests/model_event_protocol.rs`): writers running the
   intent/commit marker dance, workers running list → rebuild → global-index CAS
   → delete-observed-markers, crashes between any two steps, and clock advances
-  past the intent grace. Checked invariants: an acknowledged upload is durable
-  and eventually visible; at quiescence every view equals a fresh derivation
-  from truth; a tombstoned file never resurrects.
+  past the intent grace. Checked invariants: an acknowledged upload is durable;
+  at quiescence every view equals a fresh derivation from truth; a tombstoned
+  file never resurrects. Visibility is checked as *reachable*, not as a liveness
+  guarantee — the model states no fairness assumption.
 - **Replication merge** (`tests/model_replication.rs`): two buckets, partition-
-  shaped double publishes, mirror-vs-private races, yanks, deletes, interrupted
-  freezes. Checked invariants: buckets converge at merge fixpoint; acknowledged
+  shaped double publishes, mirror-vs-private races, yanks, deletes, demotion
+  settles. Checked invariants: buckets converge at merge fixpoint; acknowledged
   bytes are never silently lost (conflict losers land in quarantine, only an
   authorized delete destroys); deletes settle dead everywhere.
+
+### What the bounds actually are
+
+The README links here for them, so they live here rather than in a header
+comment. Replication merge: one package, two filenames, exactly two buckets,
+`.metadata`/`.provenance` companions excluded, and convergence compared as a
+*truth projection* — two buckets agree on what they serve, while their
+`_quarantine/` sets may legitimately differ. Event protocol: one package, two
+files, two lease-serialized workers, and a global name index collapsed to a
+single membership bit.
+
+Not modeled, and covered by sampling instead: counter rollups, the transparency
+chain, project status, read locality, concurrent mergers, and the N-bucket star
+composition. That last one is the load-bearing exclusion — the model enumerates
+*pairwise* confluence, and pairwise implies N-way only if the merge is
+associative. It is not: `conflict_winner`'s `CONFLICT_SKEW_MS` guard
+(`src/replicate/decide.rs`) is non-transitive, so three private uploads of one
+filename at receive stamps 0 / 3000 / 4000 give A ≻ B, A ≻ C, but Freeze(B, C).
+Whether that filename ends live or frozen fleet-wide depends on which pair
+merged first. Both outcomes are safe — every loser is quarantined, and the
+schedule-dependent side is the fail-closed one — but it is availability the
+model cannot see. The VOPR's three-bucket lane samples the star.
 
 The models don't get to invent the semantics they check: transitions call the
 real `worker::consumable_dirty_work` and `replicate::decide`, and two

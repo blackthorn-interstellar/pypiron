@@ -846,6 +846,15 @@ impl Model for Fleet {
                         })
                     })
             }),
+            // Non-vacuity guard for the two properties above, which are both
+            // `!quiescent(w) || ...`. If the merge ever stops settling — a
+            // decide/execute pair that ping-pongs, or a future repair action
+            // added to `merge_fixpoint` that is not quite idempotent — no state
+            // is quiescent, both implications go trivially true, and the
+            // checker reports green on a livelock while still printing an
+            // impressive state count. Unconditional on purpose: every fleet
+            // here is supposed to drain.
+            Property::<Self>::sometimes("reaches_merge_fixpoint", |_, w| quiescent(w)),
         ];
         if self.expect_upload_replicates {
             properties.push(Property::<Self>::sometimes("upload_replicates", |_, w| {
@@ -1129,11 +1138,18 @@ fn mirror_cache_byte_conflict_freezes() {
     );
 }
 
-/// Nightly-depth configuration: byte conflict, mirror-vs-private, yank, and
-/// delete all interleaved in one fleet. Too large for the merge gate; the
-/// nightly simulation workflow runs it with `--ignored`.
+/// The widest configuration: byte conflict, mirror-vs-private, yank, and
+/// delete all interleaved in one fleet — the only one that mixes writer kinds
+/// rather than exercising them apart, so it is where a cross-class merge bug
+/// actually shows up.
+///
+/// It ran nightly-only until it was measured: 61,230 states, 265 ms in release
+/// and 3.4 s for this whole suite in debug. That is merge-gate money, and the
+/// nightly is the wrong place for it — this config sat RED for two days behind
+/// a job that could not report failure (the `| tee` swallowing cargo's exit
+/// status, fixed in `.github/workflows/simulation.yml`). A check every
+/// contributor runs beats a check nobody reads.
 #[test]
-#[ignore = "nightly: large state space (run with --ignored)"]
 fn model_replication_deep() {
     check(
         "deep",
@@ -1178,6 +1194,42 @@ mod conformance {
     use super::*;
     use pypiron::sim::{multi_bucket_state, SimClock, SimStorage};
     use pypiron::storage::Storage;
+
+    /// Every arm of the real `Verdict`. The conformance pass asserts it
+    /// produces all of them, so an arm whose executor effects nobody compares
+    /// is a failing test rather than a quiet hole.
+    const ALL_VERDICTS: [&str; 11] = [
+        "AdoptSidecar",
+        "Copy",
+        "Defer",
+        "FinishFreeze",
+        "Freeze",
+        "Noop",
+        "PropagateFreeze",
+        "QuarantineLoser",
+        "SettleMirrorQuarantine",
+        "Supersede",
+        "Tombstone",
+    ];
+
+    /// Exhaustive on purpose — no wildcard arm. A new `Verdict` variant breaks
+    /// this build, which is the point: it forces a decision about whether the
+    /// vocabulary reaches it.
+    fn verdict_name(verdict: &Verdict) -> &'static str {
+        match verdict {
+            Verdict::Noop => "Noop",
+            Verdict::Defer => "Defer",
+            Verdict::Copy(_) => "Copy",
+            Verdict::AdoptSidecar(_) => "AdoptSidecar",
+            Verdict::Supersede(_) => "Supersede",
+            Verdict::QuarantineLoser(_) => "QuarantineLoser",
+            Verdict::Freeze => "Freeze",
+            Verdict::Tombstone => "Tombstone",
+            Verdict::PropagateFreeze(_) => "PropagateFreeze",
+            Verdict::FinishFreeze => "FinishFreeze",
+            Verdict::SettleMirrorQuarantine => "SettleMirrorQuarantine",
+        }
+    }
 
     /// The per-side record vocabulary. Internally consistent states only —
     /// the same shapes production can persist.
@@ -1285,9 +1337,27 @@ mod conformance {
                 tombstoned: true,
                 ..FileRec::default()
             },
-            // Settled freeze (freeze always carries its tombstone fence).
+            // Settled freeze (a freeze that ran to completion carries its
+            // tombstone fence).
             FileRec {
                 tombstoned: true,
+                frozen: true,
+                ..FileRec::default()
+            },
+            // Frozen, NOT yet tombstoned — the crash window inside
+            // `freeze_side`, which writes the frozen marker, then quarantines,
+            // then tombstones (src/replicate.rs). `decide` short-circuits on
+            // tombstones before it ever reads the freeze markers, so while
+            // every other frozen entry here also sets `tombstoned` this is the
+            // only shape that reaches `PropagateFreeze`/`FinishFreeze` — the
+            // two verdicts that exist for exactly this interrupted state.
+            FileRec {
+                frozen: true,
+                ..FileRec::default()
+            },
+            FileRec {
+                artifact: Some(0),
+                sidecar: Some(sc(0, MOrigin::Private, false, 0, Some(0))),
                 frozen: true,
                 ..FileRec::default()
             },
@@ -1492,6 +1562,7 @@ mod conformance {
     async fn conformance_execute_matches_model() {
         let vocab = vocabulary();
         let mut checked = 0usize;
+        let mut produced: BTreeSet<&'static str> = BTreeSet::new();
         for rec_a in &vocab {
             for rec_b in &vocab {
                 let origin_a = implied_pkg_origin(rec_a);
@@ -1572,10 +1643,29 @@ mod conformance {
                     "real execute diverged from the model executor\n a={rec_a:?}\n b={rec_b:?}\n verdict={verdict:?}",
                 );
                 checked += 1;
+                produced.insert(verdict_name(&verdict));
             }
         }
-        eprintln!("conformance_execute_matches_model: {checked} record pairs verified");
-        assert!(checked > 100, "vocabulary shrank unexpectedly: {checked}");
+        eprintln!(
+            "conformance_execute_matches_model: {checked} record pairs verified, \
+             verdicts produced: {produced:?}"
+        );
+        // A pair count is not coverage: 18 entries make 324 pairs, so an
+        // 11-entry vocabulary still cleared the old `checked > 100` bar while
+        // silently dropping whole verdicts. What has to hold is that every arm
+        // of the real `Verdict` had its executor effects compared against the
+        // model's at least once. `verdict_name` matches exhaustively with no
+        // wildcard, so a new arm fails to compile here rather than slipping
+        // through unexercised.
+        let missing: Vec<_> = ALL_VERDICTS
+            .iter()
+            .filter(|name| !produced.contains(**name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "vocabulary never produces {missing:?} — those verdicts' executor \
+             effects are unverified; add a record pair that reaches them",
+        );
     }
 
     /// The artifact transport (stream vs server-side copy, with or without an

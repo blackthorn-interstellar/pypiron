@@ -75,8 +75,11 @@
 //! Encoding it as an `always` property over the quiescent predicate is exact and
 //! cheap under BFS; stateright's experimental `eventually` (a liveness modality)
 //! would need fairness assumptions the marker protocol does not state, and would
-//! be weaker evidence. The `reaches_quiescence` `sometimes` property proves the
-//! quiescent-always properties are non-vacuous.
+//! be weaker evidence. The three `reaches_quiescence*` `sometimes` properties
+//! prove the quiescent-always properties are non-vacuous — each pinned to
+//! content (a settled view, a completed delete, a healed intent), because a
+//! bare `quiescent(s)` witness is satisfied by the initial state and guards
+//! nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -400,8 +403,28 @@ fn prop_view_leads_truth(_m: &EventModel, s: &State) -> bool {
         .any(|&f| s.view_present && s.view.contains(&f) && !s.artifact.contains(&f))
 }
 
+/// Non-vacuity guard for the three quiescent-`always` properties — and it has
+/// to be pinned to *content*. Bare `quiescent(s)` is satisfied by the INITIAL
+/// state: every phase starts `NotStarted` (neither `upload_mid` nor
+/// `delete_mid`), no markers exist, and every worker is `Idle`. So the witness
+/// fired at depth 0 and proved nothing about the protocol ever draining after
+/// work happened. Requiring a settled view means a writer ran, a worker
+/// rebuilt, and the markers were consumed.
 fn prop_reaches_quiescence(_m: &EventModel, s: &State) -> bool {
-    quiescent(s)
+    quiescent(s) && !s.view.is_empty()
+}
+
+/// Quiescence reached with the delete run to completion: the other end of the
+/// protocol, where truth went back to empty and the views were removed rather
+/// than written.
+fn prop_reaches_quiescence_after_delete(_m: &EventModel, s: &State) -> bool {
+    quiescent(s) && s.tombstone.contains(&F0)
+}
+
+/// Quiescence reached after the worker healed a crashed writer's stale intent —
+/// the marker path that only runs once the clock crosses the grace.
+fn prop_reaches_quiescence_after_heal(_m: &EventModel, s: &State) -> bool {
+    quiescent(s) && s.healed
 }
 
 // ---- the model ---------------------------------------------------------------
@@ -532,8 +555,19 @@ impl Model for EventModel {
                 prop_worker_crash_recovers,
             ),
             Property::<Self>::sometimes("view_briefly_leads_truth", prop_view_leads_truth),
-            // Non-vacuity guard for the three quiescent-always properties.
+            // Non-vacuity guards for the three quiescent-always properties.
+            // Three of them, each pinning quiescence to a different piece of
+            // content, because one bare `quiescent(s)` was true at depth 0 and
+            // so guarded nothing.
             Property::<Self>::sometimes("reaches_quiescence", prop_reaches_quiescence),
+            Property::<Self>::sometimes(
+                "reaches_quiescence_after_delete",
+                prop_reaches_quiescence_after_delete,
+            ),
+            Property::<Self>::sometimes(
+                "reaches_quiescence_after_heal",
+                prop_reaches_quiescence_after_heal,
+            ),
         ]
     }
 }

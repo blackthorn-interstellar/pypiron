@@ -29,9 +29,11 @@ in one of the exception rows below. I have audited it, watched it get
 `kill -9`'d at every write boundary and converge every time, driven it with
 every packaging client that matters, fed it corrupt bytes and malware from a
 hostile upstream without ever making it serve one, and measured it against
-PyPI's real download stream. Its convergence behavior is not tested by
-sampling — it is *proven by exhaustive model checking*, and the proof is
-chained to the shipped code so it cannot silently rot. A deterministic fault
+PyPI's real download stream. Its convergence behavior is checked two ways that
+do not share a blind spot: a model checker enumerates every interleaving of the
+write protocol inside its bounds, and a deterministic simulator samples millions
+of crash schedules against the real binary. The checker runs the shipped
+decision functions, so it cannot drift from the code. A deterministic fault
 simulator has been grinding through seeded crash schedules in the cloud around
 the clock — **22,985,591 seeds at the time of writing, zero outstanding
 findings** — and the number goes up every second.
@@ -108,9 +110,9 @@ This is the part that moved me from "well-built" to "excited." Give pypiron a
 - **Reads stay in your region.** Label buckets with `@region` and each node
   reads locally; writes keep one home, so there is no coordination protocol
   to page you at 3 a.m.
-- **Failover is automatic and tested by the model checker** — down to
-  adversarial cases like a rejected topology candidate being unable to strand
-  a later failover (`src/bucket_health.rs`). A region outage, or an entire
+- **Failover is automatic and adversarially tested** — down to a rejected
+  topology candidate being unable to strand a later failover
+  (`src/bucket_health.rs`). A region outage, or an entire
   cloud provider outage, costs you nothing but latency.
 
 The same "files are truth" contract holds across all of it: any number of

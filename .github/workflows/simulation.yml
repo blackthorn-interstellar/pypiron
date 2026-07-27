@@ -169,28 +169,29 @@ jobs:
   #        --seed 18800106222 --nodes 3 --buckets 2 --packages 2 --files 1 --ops 80 --fail-percent 3 --partition 100   # bare arm, no fence
   #        --seed 16200059870 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100  # demotion arm
   #
-  #   3. SELF_CONSISTENCY — `supersede_record` is not crash-atomic, and a crash
-  #      inside it leaves a CROSSED BODY: a bucket serving bytes that contradict
-  #      its own published sha256. It orders quarantine -> `put_if_match(body)`
-  #      -> `verify_stored_size` -> `install_or_verify_sidecar`, and a death
-  #      between the body and the sidecar is PERMANENT, because nothing ever
-  #      re-hashes a stored body. The source comment above that ordering argues
-  #      for it to avoid the mirror-image tear (sidecar first, body never) — it
-  #      trades one torn window for the other, and neither has a repair path. A
-  #      client checking its download against the index it read rejects the file,
-  #      while `pypiron verify` without `--deep` calls the tree healthy. This is
-  #      the class the previous census called unreachable in 488,363 seeds: it is
-  #      invisible at 12 filenames and appears once the workload concentrates on
-  #      ONE.
+  #   3. SELF_CONSISTENCY — CLOSED. `supersede_record` was not crash-atomic and
+  #      a crash inside it left a CROSSED BODY: a bucket serving bytes that
+  #      contradict its own published sha256, permanently, because nothing ever
+  #      re-hashes a stored body and the two buckets' sidecars stayed identical
+  #      so `decide` read the record as agreed forever. The ordering it was
+  #      blamed on is correct and stays — a sidecar published over a still-old
+  #      body advertises the SUPERSEDED bytes as current, which on a demotion
+  #      are exactly the ones the operator withdrew. What was missing is that
+  #      the window left nothing behind that said so. It now writes a
+  #      `.superseding` fence carrying the sidecar it is installing before it
+  #      touches the body and deletes it once the sidecar names those bytes, so
+  #      a crash leaves a RECOGNIZABLE torn record; the next index rebuild
+  #      re-hashes that one body and finishes the operation. Gated in ci.yml at
+  #      the minimum reproducer below.
   #        --seed 18300018803 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
   #
-  # This lane's profile is the wrong instrument for 2 and 3. Both were found on
-  # NARROW lanes (1-2 packages, 1 file, 40-80 ops), where they run about 1 seed
-  # in 200,000-340,000, while the 12-filename corpus here spreads the workload
-  # too thin to concentrate contention on a single name. That corpus is load-
-  # bearing for the durability oracles (see `tests/simulation_matrix.rs`), so
-  # when adding coverage for these two, add a narrow lane — do not widen this
-  # one.
+  # This lane's profile is the wrong instrument for 2. It and the (now closed) 3
+  # were found on NARROW lanes (1-2 packages, 1 file, 40-80 ops), where they run
+  # about 1 seed in 200,000-340,000, while the 12-filename corpus here spreads
+  # the workload too thin to concentrate contention on a single name. That
+  # corpus is load-bearing for the durability oracles (see
+  # `tests/simulation_matrix.rs`), so when adding coverage for 2, add a narrow
+  # lane — do not widen this one.
   #
   # CLOSED since the previous census, over those 404,247 seeds: CONVERGENCE
   # 750 -> 0, ACK_TOTALITY 17 -> 0, FREEZE_UNJUSTIFIED 14 -> 0, and DURABILITY's

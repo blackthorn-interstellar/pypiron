@@ -25,6 +25,20 @@ pub const FROZEN_SUFFIX: &str = ".frozen";
 /// deliberately left in place (and omitted from indexes) so cleanup never
 /// opens an artifact-key ABA window for a concurrent private writer.
 pub const MIRROR_QUARANTINED_SUFFIX: &str = ".mirror-quarantined";
+/// Torn-supersede marker: `<filename>.superseding`, holding the sidecar a
+/// replication supersede is in the middle of installing. Replacing an
+/// adjudicated record touches two objects — the body, then the sidecar that
+/// names it — and no object store makes that one write. The body has to go
+/// first (a sidecar published over a still-old body advertises the *superseded*
+/// bytes as current, and on a demotion those are exactly the bytes the operator
+/// withdrew), so the crash window leaves the body ahead of its sidecar. Nothing
+/// re-hashes a stored body in the normal course, both buckets' sidecars stay
+/// byte-identical, and the merge reads them as agreed forever — so without this
+/// marker the tear is permanent and silent. It is written before the body and
+/// deleted once the sidecar names it; anything left behind is a crash, and
+/// `replicate::finish_interrupted_supersedes` re-hashes that one body to finish
+/// or discard the operation.
+pub const SUPERSEDING_SUFFIX: &str = ".superseding";
 
 /// PEP 592 yank state: `false`, `true`, or a reason string.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -162,6 +176,11 @@ pub fn mirror_quarantined_key(artifact_key: &str) -> String {
     companion_key(artifact_key, MIRROR_QUARANTINED_SUFFIX)
 }
 
+/// Storage key of the in-flight supersede marker for an artifact key.
+pub fn superseding_key(artifact_key: &str) -> String {
+    companion_key(artifact_key, SUPERSEDING_SUFFIX)
+}
+
 /// True if `filename` (no directory part) is an artifact, not a sidecar,
 /// tombstone, freeze marker, or dotfile.
 pub fn is_artifact(filename: &str) -> bool {
@@ -173,6 +192,7 @@ pub fn is_artifact(filename: &str) -> bool {
         && !filename.ends_with(TOMBSTONE_SUFFIX)
         && !filename.ends_with(FROZEN_SUFFIX)
         && !filename.ends_with(MIRROR_QUARANTINED_SUFFIX)
+        && !filename.ends_with(SUPERSEDING_SUFFIX)
 }
 
 #[cfg(test)]

@@ -41,8 +41,9 @@ use crate::origin::{
     claim_origin, read_origin_observation, ClaimRequest, OriginState, MIRROR, PRIVATE,
 };
 use crate::sidecar::{
-    frozen_key, metadata_key, mirror_quarantined_key, provenance_key, sidecar_key, tombstone_key,
-    Sidecar, FROZEN_SUFFIX, MIRROR_QUARANTINED_SUFFIX, SIDECAR_SUFFIX, TOMBSTONE_SUFFIX,
+    frozen_key, metadata_key, mirror_quarantined_key, provenance_key, sidecar_key, superseding_key,
+    tombstone_key, Sidecar, FROZEN_SUFFIX, MIRROR_QUARANTINED_SUFFIX, SIDECAR_SUFFIX,
+    TOMBSTONE_SUFFIX,
 };
 use crate::status::{self, StatusConvergence};
 use crate::storage::{
@@ -1229,9 +1230,27 @@ async fn supersede_record(
     // EMPTY — `quarantine_mirror_artifacts` has already moved the mirror body
     // aside, which is what makes the destination read `QuarantinedMirror` — so
     // a sidecar published first would stand over a key a concurrent publish can
-    // still take, and a leg that then dies leaves this bucket asserting sha A
-    // over body B forever: `decide` compares sidecar shas and nothing
-    // re-hashes a stored body.
+    // still take, and it would also publish the *superseded* bytes as current:
+    // on a demotion those are the ones the operator withdrew, which is the
+    // fail-OPEN direction.
+    //
+    // That ordering is right and it is not free: between the body write and the
+    // sidecar below, this bucket serves bytes its own published sha256
+    // contradicts, and a death in the window used to make that permanent —
+    // nothing re-hashes a stored body, both buckets' sidecars stay identical,
+    // and `decide` reads them as agreed forever. So declare the intent first,
+    // the same shape as the `_dirty/` bracket around this whole verdict: the
+    // marker carries the sidecar being installed, and whatever remains after a
+    // crash is a *recognizable* torn record that
+    // [`finish_interrupted_supersedes`] can complete from the marker alone.
+    // Cheap enough to be unconditional — a supersede is a merge-conflict or
+    // demotion path, never the upload hot path — and unconditional is what
+    // makes it a fence rather than a guess about which leg will tear.
+    let superseding = superseding_key(&akey);
+    dst.put_bytes(&superseding, serde_json::to_vec(sidecar)?, json())
+        .await
+        .with_context(|| format!("declare supersede intent at {superseding}"))?;
+
     let mut artifact_present = false;
     if let Some((current, etag)) = dst.get_with_etag(&akey).await? {
         if sha256_hex(&current) == sidecar.sha256 {
@@ -1278,12 +1297,20 @@ async fn supersede_record(
             if raced_sha != sidecar.sha256 {
                 freeze_copy_race(state, src, dst, pkg, filename, &sidecar.sha256, &raced_sha)
                     .await?;
+                // The freeze adjudicated the filename and moved both bodies
+                // aside: there is no record left for the heal to finish, and a
+                // marker outliving it would re-publish a sidecar over the fence.
+                dst.delete_keys(&[superseding]).await?;
                 return Ok(());
             }
         }
     }
 
     install_or_verify_sidecar(dst, &sidecar_key(&akey), sidecar).await?;
+    // Body and sidecar agree as of this instant: the window is shut. Everything
+    // below is companions and marker precedence, none of which can tear the
+    // record's own attestation.
+    dst.delete_keys(&[superseding]).await?;
     replace_companion(
         dst,
         &metadata_key(&akey),
@@ -1776,6 +1803,9 @@ async fn drop_record_objects(storage: &dyn Storage, pkg: &str, filename: &str) -
     let akey = artifact_key(pkg, filename);
     let mut keys = record_object_keys(&akey).to_vec();
     keys.push(mirror_quarantined_key(&akey));
+    // A supersede intent over a filename that just became tombstoned or frozen
+    // has nothing left to finish; the same one-key-apart argument applies.
+    keys.push(superseding_key(&akey));
     storage.delete_keys(&keys).await
 }
 
@@ -1825,6 +1855,77 @@ pub async fn quarantine_mirror_artifacts(storage: &dyn Storage, pkg: &str) -> Re
         }
     }
     Ok(quarantined)
+}
+
+/// Finish a [`supersede_record`] that died between writing a body and
+/// publishing the sidecar that names it. `filenames` is the set the caller's
+/// package listing already flagged with a `.superseding` marker — the rare set,
+/// so a fleet that never crashed mid-supersede does no work here at all. That
+/// gating is the whole design: the repair itself has to re-hash a body, which
+/// is affordable for a handful of flagged records and is not affordable as a
+/// blanket sweep over a 770k-package mirror.
+///
+/// Called from the index rebuild rather than the periodic audit, and the
+/// simulator's repair classifier is what settles that: the executor already
+/// brackets every supersede in the `_dirty/` intent pair, so the crashed
+/// package is guaranteed a rebuild, and healing anywhere later means the views
+/// stay pointed at the stale digest until the audit happens to come round.
+///
+/// One shot per marker, whatever it finds. The marker's only job is to say "the
+/// body under this key may be ahead of its sidecar"; once this has read the
+/// body, that question is answered for good and re-asking it on every audit
+/// would turn an O(1) listing check into an O(bytes) one.
+///
+/// Returns the number of records whose sidecar this call published — the
+/// caller's signal to rebuild the package's views over the repaired truth.
+pub async fn finish_interrupted_supersedes(
+    storage: &dyn Storage,
+    pkg: &str,
+    filenames: &[String],
+) -> Result<usize> {
+    let mut finished = 0;
+    for filename in filenames {
+        let akey = artifact_key(pkg, filename);
+        let marker = superseding_key(&akey);
+        let intended: Sidecar = match storage.get_bytes(&marker).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse supersede intent at {marker}"))?,
+            // Another node finished it between the listing and now.
+            Err(e) if is_not_found(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        // A tombstone or freeze landed over the filename after the intent: the
+        // record is adjudicated gone and publishing its sidecar would resurrect
+        // suppressed truth. `drop_record_objects` normally takes the marker with
+        // it; this covers the interleaving where the intent outlived it. Checked
+        // before the body read, which is the expensive part.
+        let (tombstoned, frozen) = futures::future::try_join(
+            storage.head_exists(&tombstone_key(&akey)),
+            storage.head_exists(&frozen_key(&akey)),
+        )
+        .await?;
+        if !tombstoned && !frozen {
+            let body = match storage.get_bytes(&akey).await {
+                Ok(body) => Some(body),
+                Err(e) if is_not_found(&e) => None,
+                Err(e) => return Err(e),
+            };
+            // The body is what the interrupted supersede meant to install, so
+            // the sidecar naming it is the completion — and only that. A body
+            // still holding the *old* bytes means the crash landed before the
+            // replacement and the record already describes itself correctly; a
+            // body that is neither was written by something this intent knows
+            // nothing about. Both are left exactly as found: this finishes a
+            // torn write, it never adjudicates one.
+            if body.is_some_and(|body| sha256_hex(&body) == intended.sha256)
+                && install_or_verify_sidecar(storage, &sidecar_key(&akey), &intended).await?
+            {
+                finished += 1;
+            }
+        }
+        storage.delete_keys(&[marker]).await?;
+    }
+    Ok(finished)
 }
 
 // ---------------------------------------------------------------------------
@@ -4193,6 +4294,139 @@ mod tests {
             "the destination sidecar was published before the bytes it names: {log:?}"
         );
         assert_eq!(dst.get_bytes(&key).await.unwrap(), bytes);
+        // The ordering above is right and it is not free: between those two
+        // writes the bucket serves bytes its own published sha contradicts. The
+        // `.superseding` fence has to be declared before the body, or a death in
+        // that window is unrecoverable — see the two tests below.
+        let fence_at = log
+            .iter()
+            .position(|written| written == &superseding_key(&key))
+            .expect("the supersede declared its intent");
+        assert!(
+            fence_at < artifact_at,
+            "the body was written before the fence that makes a torn write recoverable: {log:?}"
+        );
+        assert!(
+            !dst.head_exists(&superseding_key(&key)).await.unwrap(),
+            "a completed supersede left its intent fence behind"
+        );
+    }
+
+    /// The window `supersede_record` cannot make atomic: the body is replaced,
+    /// then the process dies before the sidecar naming it is published. Nothing
+    /// re-hashes a stored body in the normal course and both buckets' sidecars
+    /// stay byte-identical, so `decide` reads the record as agreed forever —
+    /// this is permanent, silent corruption unless the crashed writer left
+    /// something behind that says so. Seed the exact wreckage and require the
+    /// ordinary index rebuild (the `_dirty/` marker path the executor's intent
+    /// bracket guarantees will visit this package) to finish the operation.
+    ///
+    /// Found by the simulator's SELF_CONSISTENCY oracle at
+    /// `vopr --seed 18300018803 --nodes 3 --buckets 2 --packages 1 --files 1
+    /// --ops 40 --fail-percent 3 --partition 100`.
+    #[tokio::test]
+    async fn a_rebuild_finishes_a_supersede_that_died_before_publishing_its_sidecar() {
+        let superseded = b"the mirror bytes being replaced";
+        let winner = b"the private bytes that won";
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let intended = sc(&sha256_hex(winner), PRIVATE, Yanked::Flag(false), 0);
+
+        let torn = Arc::new(InMemStorage::default());
+        // The body is already the winner's; the published sidecar still names
+        // the bytes it replaced. A client checking its download against the
+        // index it read would reject the file.
+        torn.insert(&key, winner.to_vec());
+        torn.insert(
+            &sidecar_key(&key),
+            serde_json::to_vec(&sc(
+                &sha256_hex(superseded),
+                PRIVATE,
+                Yanked::Flag(false),
+                0,
+            ))
+            .unwrap(),
+        );
+        torn.insert(
+            &superseding_key(&key),
+            serde_json::to_vec(&intended).unwrap(),
+        );
+        torn.insert(
+            &crate::origin::origin_key("pkg"),
+            PRIVATE.as_bytes().to_vec(),
+        );
+
+        let state = test_state(torn.clone());
+        worker::rebuild_package(&state, torn.as_ref(), "pkg")
+            .await
+            .unwrap();
+
+        let published: Sidecar =
+            serde_json::from_slice(&torn.get_bytes(&sidecar_key(&key)).await.unwrap()).unwrap();
+        assert_eq!(
+            published.sha256,
+            sha256_hex(winner),
+            "the rebuild left the bucket publishing a sha256 its own body contradicts"
+        );
+        assert_eq!(torn.get_bytes(&key).await.unwrap(), winner);
+        assert!(
+            !torn.head_exists(&superseding_key(&key)).await.unwrap(),
+            "the intent fence outlived the repair, so every later rebuild re-hashes the body"
+        );
+        // And the view the rebuild rendered names the healed digest, not the
+        // stale one — the repair has to land before anything derives from truth.
+        let index = String::from_utf8(
+            torn.get_bytes("simple/pkg/index.json")
+                .await
+                .unwrap_or_default(),
+        )
+        .unwrap();
+        assert!(
+            index.contains(&sha256_hex(winner)),
+            "the package view still advertises the superseded digest: {index}"
+        );
+    }
+
+    /// The repair finishes a torn write; it never adjudicates one. A crash on
+    /// the *other* side of the window leaves the body still holding the bytes
+    /// its own sidecar names — a self-consistent record that simply lost a race
+    /// — and republishing the intent over it would install a sidecar for bytes
+    /// this bucket does not have.
+    #[tokio::test]
+    async fn the_repair_leaves_a_supersede_that_died_before_touching_the_body() {
+        let standing = b"the bytes this bucket actually holds";
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+
+        let storage = Arc::new(InMemStorage::default());
+        seed_live(storage.as_ref(), "pkg", filename, standing, PRIVATE);
+        storage.insert(
+            &superseding_key(&key),
+            serde_json::to_vec(&sc(
+                &sha256_hex(b"bytes the supersede never got to write"),
+                PRIVATE,
+                Yanked::Flag(false),
+                0,
+            ))
+            .unwrap(),
+        );
+
+        let state = test_state(storage.clone());
+        worker::rebuild_package(&state, storage.as_ref(), "pkg")
+            .await
+            .unwrap();
+
+        let published: Sidecar =
+            serde_json::from_slice(&storage.get_bytes(&sidecar_key(&key)).await.unwrap()).unwrap();
+        assert_eq!(
+            published.sha256,
+            sha256_hex(standing),
+            "the repair published a sidecar for bytes this bucket never held"
+        );
+        assert!(
+            !storage.head_exists(&superseding_key(&key)).await.unwrap(),
+            "an answered intent fence must not survive to be re-answered"
+        );
     }
 
     #[tokio::test]

@@ -140,6 +140,19 @@ jobs:
           # the ONLY violation — so this reds for its own reason, not as a
           # passenger on a convergence failure.
           cargo run --example vopr -- --seed 9900094440 --nodes 2 --buckets 2 --packages 2 --files 1 --ops 40 --fail-percent 0 --partition 100
+          # Crossed body: a supersede died between replacing the artifact and
+          # publishing the sidecar naming it, so bucket 0 served one byte-set
+          # while its own index advertised the other's sha256. Both violations
+          # this seed raised are that one tear — SELF_CONSISTENCY reads it
+          # within a bucket, CONVERGENCE reads the same crossed pair across the
+          # two. Permanent before the `.superseding` fence, because nothing
+          # re-hashes a stored body and the two buckets' sidecars stayed
+          # byte-identical, so `decide` called the record agreed forever. Pinned
+          # because it is the minimum reproducer for the class and the only one
+          # that catches a repair moved off the rebuild path onto the audit: at
+          # 12 filenames the workload never concentrates on one name and this is
+          # invisible.
+          cargo run --example vopr -- --seed 18300018803 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
       # Mutation-testing the oracles themselves. Each `--break` is ONE deliberate
       # defect the named invariant exists to catch, so the run MUST fail with
       # that invariant's text — an invariant nobody has watched go red is an

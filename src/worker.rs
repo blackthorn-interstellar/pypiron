@@ -47,7 +47,7 @@ use crate::render::{
 };
 use crate::sidecar::{
     is_artifact, sidecar_key, Sidecar, Yanked, FROZEN_SUFFIX, METADATA_SUFFIX, PROVENANCE_SUFFIX,
-    SIDECAR_SUFFIX, TOMBSTONE_SUFFIX,
+    SIDECAR_SUFFIX, SUPERSEDING_SUFFIX, TOMBSTONE_SUFFIX,
 };
 use crate::storage::{is_not_found, FileEntry, ObjectMeta, Storage};
 use crate::transparency::FileShas;
@@ -2985,7 +2985,38 @@ async fn list_artifacts_for_claim(
         Some(crate::origin::OriginState::Unclaimed) | None => None,
     };
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
-    let entries = storage.list_dir_entries(&prefix).await?;
+    let mut entries = storage.list_dir_entries(&prefix).await?;
+    // A `.superseding` marker is a replication supersede that wrote a body and
+    // died before publishing the sidecar naming it, so this bucket is serving
+    // bytes its own index contradicts — and nothing else here would ever notice,
+    // because every other reader compares sidecars and none re-hashes a body.
+    // Finish it before deriving anything, or this rebuild renders the stale
+    // digest and calls the package converged.
+    //
+    // Detected from the listing already in hand, so a package with no torn
+    // record pays one `strip_suffix` per name; the repair's O(bytes) re-hash and
+    // its single re-listing are reached only by the rare package that has one.
+    // Gated on `backfill_missing` for the same reason the sidecar backfill is:
+    // that flag is what separates the truth-authoring rebuild from the
+    // request-path render, which must never mutate.
+    if backfill_missing {
+        let mut torn: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .key
+                    .strip_prefix(&prefix)?
+                    .strip_suffix(SUPERSEDING_SUFFIX)
+            })
+            .filter(|filename| is_artifact(filename))
+            .map(str::to_string)
+            .collect();
+        if !torn.is_empty() {
+            torn.sort();
+            crate::replicate::finish_interrupted_supersedes(storage, pkg, &torn).await?;
+            entries = storage.list_dir_entries(&prefix).await?;
+        }
+    }
     let names: HashSet<&str> = entries
         .iter()
         .filter_map(|e| e.key.strip_prefix(&prefix))

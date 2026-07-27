@@ -614,6 +614,20 @@ packages/<pkg>/<filename>.mirror-quarantined # the fleet-wide fence for a mirror
                                          #   name from indexes and direct reads; NEVER fences a private
                                          #   upload of the same filename — that is the intended
                                          #   resolution, and it clears the marker. A tombstone removes it.
+packages/<pkg>/<filename>.superseding    # a replication supersede is mid-flight over this record; holds
+                                         #   the sidecar it is installing. Replacing an adjudicated record
+                                         #   touches the body and then the sidecar naming it, and no object
+                                         #   store makes that one write; the body must go first (a sidecar
+                                         #   published over a still-old body advertises the SUPERSEDED
+                                         #   bytes as current, which on a demotion are the ones the
+                                         #   operator withdrew — the fail-open direction), so
+                                         #   the crash window leaves the body AHEAD of its sidecar. Nothing
+                                         #   re-hashes a stored body in the normal course and both buckets'
+                                         #   sidecars stay identical, so `decide` would read the torn record
+                                         #   as agreed forever. Written before the body, deleted once the
+                                         #   sidecar names it — so anything left is a crash, and the next
+                                         #   index rebuild finishes it from this marker alone. Never
+                                         #   suppresses the name; the record is live throughout.
 packages/<pkg>/.origin                   # nonce-bearing {origin, nonce} NEVER-DELETED claim
                                          #   (private|mirror|unclaimed); legacy plaintext still reads
 packages/<pkg>/.project-status.json      # PEP 792 {status, reason?}; multi-bucket events also carry

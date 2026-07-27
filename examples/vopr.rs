@@ -2528,13 +2528,13 @@ struct Ledger {
     private_claimed: std::collections::BTreeSet<String>,
     /// Filenames an acknowledged (204) delete removed.
     deleted: std::collections::BTreeSet<(String, String)>,
-    /// Deletes that were AUTHORIZED per filename: issued and not refused. A
-    /// superset of `deleted` — a delete that crashed between its tombstone and
-    /// its 204 destroyed just as legitimately, and the two freeze oracles below
-    /// have to know that, because `freeze_side` can only preserve a body the
-    /// delete left standing. Counted rather than a set: a filename can be
-    /// deleted, republished and deleted again, and a later refusal (404 on a
-    /// filename already gone) must not withdraw an earlier destruction.
+    /// Deletes that were AUTHORIZED per filename: issued and observed to have
+    /// tombstoned. A superset of `deleted` — a delete that crashed between its
+    /// tombstone and its 204 destroyed just as legitimately, and the two freeze
+    /// oracles below have to know that, because `freeze_side` can only preserve
+    /// a body the delete left standing. Counted rather than a set: a filename
+    /// can be deleted, republished and deleted again, and a later refusal (404
+    /// on a filename already gone) must not withdraw an earlier destruction.
     authorized_deletes: BTreeMap<(String, String), u32>,
     /// Per filename, whether the most recent *acknowledged* operation was the
     /// delete. `acked` and `deleted` are unordered sets, but resurrection is a
@@ -2999,6 +2999,7 @@ async fn op_publish(
 async fn op_delete(
     state: Arc<AppState>,
     ledger: Arc<Mutex<Ledger>>,
+    buckets: Vec<Arc<SimStorage>>,
     pkg: String,
     file: u8,
     home: usize,
@@ -3040,18 +3041,34 @@ async fn op_delete(
             ledger.deleted.insert((pkg.clone(), fname.clone()));
             ledger.last_ack_deleted.insert((pkg, fname), true);
         }
-        // A refused delete (no such file, wrong origin, a read outage before
-        // the tombstone) destroyed nothing — every error return in
-        // `delete_record` precedes the tombstone or leaves the body standing —
-        // so it authorizes nothing either.
+        // Withdrawn only when the delete provably destroyed nothing, and the
+        // evidence for that is storage, not the status code. `delete_record`
+        // writes the tombstone BEFORE it removes the body, so every error
+        // return from there on — starting with "artifact delete failed", the
+        // one an injected outage produces — leaves the filename permanently
+        // barred. The fleet then propagates that tombstone and `tombstone_side`
+        // destroys the body on every peer, which is exactly the destruction
+        // this counter exists to record. Reading any `Err` as a refusal
+        // credited the workload with "nothing was destroyed" over a delete that
+        // had already passed its point of no return, and CONSERVATION then held
+        // the freeze racing it to a totality the delete had made impossible.
+        //
+        // Raw `SimStorage`, never the traced view: an extra gated op here would
+        // consume a sequence number and run a different schedule than the one
+        // being judged.
         Err(_) => {
-            if let Some(count) = ledger
-                .lock()
-                .expect("ledger lock")
-                .authorized_deletes
-                .get_mut(&(pkg, fname))
-            {
-                *count -= 1;
+            let tombstoned = buckets[pinned.index]
+                .keys()
+                .contains(&format!("packages/{pkg}/{fname}.tombstone"));
+            if !tombstoned {
+                if let Some(count) = ledger
+                    .lock()
+                    .expect("ledger lock")
+                    .authorized_deletes
+                    .get_mut(&(pkg, fname))
+                {
+                    *count -= 1;
+                }
             }
         }
     }
@@ -3238,7 +3255,11 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                 let pkg = PACKAGE_NAMES[rng.below(packages as u64) as usize].to_string();
                 let file = rng.below(u64::from(files)) as u8;
                 let home = plan.homes[node];
-                fleet.spawn_on(node, op_delete(state, ledger, pkg, file, home, viz.clone()));
+                let buckets = fleet.buckets.clone();
+                fleet.spawn_on(
+                    node,
+                    op_delete(state, ledger, buckets, pkg, file, home, viz.clone()),
+                );
             }
             2 => {
                 // The *selected* bucket is still 0 on every node — a

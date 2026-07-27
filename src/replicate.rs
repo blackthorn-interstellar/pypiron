@@ -1643,7 +1643,9 @@ async fn write_mirror_quarantine_marker(
 /// uses: claim private, fence FIRST (a crash then leaves a recognizable,
 /// already-inert demotion rather than a bare delete), verified `_quarantine/`
 /// copy, then drop the canonical record — artifact, sidecar and companions —
-/// leaving the fence standing.
+/// leaving the fence standing. A *move*, so the drop is guarded: it removes
+/// only the body the `_quarantine/` copy holds, and abandons the whole settle
+/// when a racing publish put something else there.
 ///
 /// The fence is what keeps the name closed: `origin release` refuses while any
 /// key besides `.origin` remains under `packages/<pkg>/`, so dropping the
@@ -1662,13 +1664,41 @@ async fn settle_mirror_quarantine(
         return Ok(false);
     }
     let marker_created = write_mirror_quarantine_marker(storage, pkg, filename).await?;
-    let preserved = quarantine(storage, pkg, filename).await?.is_some();
+    let preserved = quarantine(storage, pkg, filename).await?;
     let akey = artifact_key(pkg, filename);
     let sidecar_left = storage.head_exists(&sidecar_key(&akey)).await?;
+    // Drop only the body this settle personally preserved.
+    //
+    // `freeze_side` runs the same marker-then-preserve-then-drop order and is
+    // safe doing it blind, because its marker is an UPLOAD fence: `.frozen` and
+    // `.tombstone` both make `publish_record` refuse, so the body it copied to
+    // `_quarantine/` is still the body it deletes. This marker is the one fence
+    // in the system that deliberately does not bar an upload — handing the
+    // filename to private truth IS the demotion's intended resolution — so the
+    // canonical key stays writable for the whole settle. A blind
+    // `delete_keys` then destroys whatever a racing publish created there,
+    // bytes no `_quarantine/` copy holds and no other pass can recover.
+    // Measured: a private upload acked on the same bucket whose body a sibling
+    // settle, holding a read from three ops earlier, had already deleted.
+    //
+    // Nothing preserved is not the same as nothing to destroy — the key can be
+    // empty at the read above and occupied by the time the delete lands — so
+    // the re-read is unconditional and is the last thing before the delete.
+    // Abandoning is safe and terminal: the private record standing there reads
+    // `Live { Private }` under a spent fence, which `decide` resolves and
+    // `clear_spent_demotion_fence` finishes.
+    match storage.get_bytes(&akey).await {
+        Ok(standing) if preserved.as_deref() != Some(sha256_hex(&standing).as_str()) => {
+            return Ok(marker_created || preserved.is_some());
+        }
+        Ok(_) => {}
+        Err(e) if is_not_found(&e) => {}
+        Err(e) => return Err(e),
+    }
     // The fence itself is deliberately NOT in this list — it is the whole point
     // of the demotion, and the only part of the record that replicates.
     storage.delete_keys(&record_object_keys(&akey)).await?;
-    Ok(marker_created || preserved || sidecar_left)
+    Ok(marker_created || preserved.is_some() || sidecar_left)
 }
 
 /// Is private truth standing under the canonical key *right now*?
@@ -3162,21 +3192,28 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    struct RaceOnCreateStorage {
+    /// Another writer landing `bytes` at `key` exactly once, at the moment the
+    /// code under test is most exposed: by default when it tries to CREATE the
+    /// key (so its create loses), or — with [`racing_a_read`] — the instant it
+    /// has READ the key, so whatever it decided from those bytes is already
+    /// stale by the time it acts.
+    struct RacingWriterStorage {
         inner: InMemStorage,
         key: String,
         bytes: Vec<u8>,
         required_prior_key: Option<String>,
+        on_read: bool,
         raced: AtomicBool,
     }
 
-    impl RaceOnCreateStorage {
+    impl RacingWriterStorage {
         fn new(key: String, bytes: Vec<u8>) -> Self {
             Self {
                 inner: InMemStorage::default(),
                 key,
                 bytes,
                 required_prior_key: None,
+                on_read: false,
                 raced: AtomicBool::new(false),
             }
         }
@@ -3185,10 +3222,15 @@ mod tests {
             self.required_prior_key = Some(key);
             self
         }
+
+        fn racing_a_read(mut self) -> Self {
+            self.on_read = true;
+            self
+        }
     }
 
     #[async_trait::async_trait]
-    impl Storage for RaceOnCreateStorage {
+    impl Storage for RacingWriterStorage {
         async fn head_exists(&self, key: &str) -> Result<bool> {
             self.inner.head_exists(key).await
         }
@@ -3224,7 +3266,7 @@ mod tests {
             bytes: Vec<u8>,
             content_type: Option<&str>,
         ) -> Result<bool> {
-            if key == self.key && !self.raced.swap(true, Ordering::SeqCst) {
+            if !self.on_read && key == self.key && !self.raced.swap(true, Ordering::SeqCst) {
                 if let Some(required) = &self.required_prior_key {
                     if !self.inner.head_exists(required).await? {
                         bail!("{required} must exist before creating {key}");
@@ -3246,7 +3288,11 @@ mod tests {
         }
 
         async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
-            self.inner.get_bytes(key).await
+            let read = self.inner.get_bytes(key).await?;
+            if self.on_read && key == self.key && !self.raced.swap(true, Ordering::SeqCst) {
+                self.inner.insert(key, self.bytes.clone());
+            }
+            Ok(read)
         }
 
         async fn list_dir_entries(&self, prefix: &str) -> Result<Vec<FileEntry>> {
@@ -3388,6 +3434,56 @@ mod tests {
         let ra = read_record(a.as_ref(), "pkg", filename).await.unwrap();
         let rb = read_record(b.as_ref(), "pkg", filename).await.unwrap();
         assert_eq!(decide(&ra, &rb), Verdict::Noop);
+    }
+
+    /// A demotion settle drops only the body it personally preserved.
+    ///
+    /// `freeze_side` runs the identical marker-preserve-drop order and is safe
+    /// dropping blind, because `.frozen` and `.tombstone` are UPLOAD fences:
+    /// `publish_record` refuses over them, so the body a freeze copied aside is
+    /// still the body it deletes. `.mirror-quarantined` deliberately is not —
+    /// handing the filename to private truth IS the demotion's intended
+    /// resolution — so the canonical key stays writable for the whole settle.
+    /// The double lands private bytes the instant the settle has read the
+    /// mirror body it is copying aside, which is what a racing publish does; a
+    /// blind `delete_keys` then destroys bytes no `_quarantine/` copy holds.
+    #[tokio::test]
+    async fn a_demotion_settle_drops_only_the_body_it_preserved() {
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let storage = Arc::new(
+            RacingWriterStorage::new(key.clone(), b"private truth".to_vec()).racing_a_read(),
+        );
+        seed_live(&storage.inner, "pkg", filename, b"mirror bytes", MIRROR);
+        storage
+            .inner
+            .insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
+
+        settle_mirror_quarantine(storage.as_ref(), "pkg", filename)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.inner.get_bytes(&key).await.unwrap(),
+            b"private truth",
+            "the settle destroyed a body it never copied to _quarantine/"
+        );
+        // The body it did read is preserved, and the fence stands: the settle
+        // is abandoned, not half-applied.
+        assert_eq!(
+            storage
+                .inner
+                .list_all(QUARANTINE_PREFIX)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(storage
+            .inner
+            .head_exists(&mirror_quarantined_key(&key))
+            .await
+            .unwrap());
     }
 
     /// Private truth taking a demoted filename is the demotion's intended
@@ -3738,7 +3834,7 @@ mod tests {
         let raced_bytes = b"different destination wheel";
         let src = Arc::new(InMemStorage::default());
         seed_live(src.as_ref(), "pkg", filename, source_bytes, PRIVATE);
-        let dst = Arc::new(RaceOnCreateStorage::new(key.clone(), raced_bytes.to_vec()));
+        let dst = Arc::new(RacingWriterStorage::new(key.clone(), raced_bytes.to_vec()));
         let state = test_state(src.clone());
         let record = live(&sha256_hex(source_bytes), PRIVATE);
 
@@ -3779,7 +3875,7 @@ mod tests {
         let bytes = b"identical wheel";
         let src = Arc::new(InMemStorage::default());
         seed_live(src.as_ref(), "pkg", filename, bytes, PRIVATE);
-        let dst = Arc::new(RaceOnCreateStorage::new(key.clone(), bytes.to_vec()));
+        let dst = Arc::new(RacingWriterStorage::new(key.clone(), bytes.to_vec()));
         let state = test_state(src.clone());
         let record = live(&sha256_hex(bytes), PRIVATE);
 
@@ -4098,7 +4194,7 @@ mod tests {
     async fn freeze_writes_the_diagnostic_marker_before_the_tombstone() {
         let filename = "pkg-1.whl";
         let key = artifact_key("pkg", filename);
-        let storage = RaceOnCreateStorage::new(tombstone_key(&key), b"raced fence".to_vec())
+        let storage = RacingWriterStorage::new(tombstone_key(&key), b"raced fence".to_vec())
             .requiring_prior_key(frozen_key(&key));
         storage.inner.insert(&key, b"conflicting bytes".to_vec());
 
@@ -4117,7 +4213,7 @@ mod tests {
         let sha = sha256_hex(bytes);
         let qkey = format!("{QUARANTINE_PREFIX}pkg/{filename}@{}", &sha[..12]);
         let storage =
-            RaceOnCreateStorage::new(qkey, bytes.to_vec()).requiring_prior_key(frozen_key(&key));
+            RacingWriterStorage::new(qkey, bytes.to_vec()).requiring_prior_key(frozen_key(&key));
         storage.inner.insert(&key, bytes.to_vec());
 
         freeze_side(&storage, "pkg", filename).await.unwrap();
@@ -4134,7 +4230,7 @@ mod tests {
         let bytes = b"conflicting bytes";
         let sha = sha256_hex(bytes);
         let qkey = format!("{QUARANTINE_PREFIX}pkg/{filename}@{}", &sha[..12]);
-        let storage = RaceOnCreateStorage::new(qkey.clone(), b"collision".to_vec())
+        let storage = RacingWriterStorage::new(qkey.clone(), b"collision".to_vec())
             .requiring_prior_key(frozen_key(&key));
         storage.inner.insert(&key, bytes.to_vec());
 

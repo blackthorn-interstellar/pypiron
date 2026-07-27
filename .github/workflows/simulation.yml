@@ -104,9 +104,10 @@ jobs:
           tail -30 vopr.out >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-  # NON-BLOCKING, AND KNOWN RED. Do not read a green check here as a pass, and
-  # do not remove `continue-on-error` to "fix" it — this lane exists so the
-  # coverage is visible and the open bugs have a home, not as a gate.
+  # NON-BLOCKING. No known bug reds it any more, but a green check here is still
+  # not a pass: the draw is too small for the failure rate this lane can resolve
+  # (arithmetic below), so read it as coverage, not as a gate. Do not remove
+  # `continue-on-error` until a census carries the number that earns it.
   #
   # `--partition N` is the share of SEEDS whose fleet is partitioned: on those,
   # each node homes to its own bucket and authors truth there instead of every
@@ -117,57 +118,73 @@ jobs:
   # everything the aligned matrix above proves, it proves about a fleet whose
   # buckets never disagree.
   #
-  # RATE, measured 2026-07-26 at HEAD 238a437 over 404,247 fresh seeds across
-  # four profiles (this one, `--rotate`, a crash-only variant, a 3-bucket one):
-  # 3 failing seeds = 0.00074% per seed, down 215x from 781 in 488,363 (0.160%)
-  # before `4bb9cb8` and `439b839` landed. Compare ranges, not time budgets —
-  # the seed rate swings with machine load, so two `--max-secs` runs explore
-  # different ranges.
+  # RATE, measured 2026-07-27 at HEAD f37e391 + the fixes below, over 1,473,767
+  # fresh seeds across four profiles (this one 124,090; the narrow 2-node lane
+  # 671,983; `--rotate` 291,180; a 3-bucket one 386,514): ZERO failing seeds,
+  # down from 3 in 404,247 at 238a437 and 781 in 488,363 before `4bb9cb8`.
+  # Compare ranges, not time budgets — the seed rate swings with machine load,
+  # so two `--max-secs` runs explore different ranges.
   #
-  # THAT IS STILL NOT GATEABLE, and the arithmetic is the whole argument. A draw
-  # of N seeds reds with probability 1-(1-p)^N; at p=7.42e-6 a 50,000-seed draw
-  # reds 31.0%, and THIS job's actual draw — 90,000-100,000 seeds, from the
-  # 91,560 a 900-second run explored on a CI runner — reds 49-52%. A gate that
-  # reds one night in two is a gate nobody reads. Holding the nightly to one red
-  # night in twenty needs p <= 5.7e-7, one failure per 1.75M seeds: 13x better
-  # than measured.
+  # ZERO IS NOT YET GATEABLE, and the arithmetic is the whole argument. A draw of
+  # N seeds reds with probability 1-(1-p)^N, so holding the nightly to one red
+  # night in twenty over THIS job's draw (90,000-100,000 seeds, from the 91,560 a
+  # 900-second run explores on a CI runner) needs p <= 5.7e-7. Zero failures in
+  # 1.47M seeds bounds p only to 2.0e-6 (rule of three, 95%) — the right order of
+  # magnitude, still 3.6x short. Reaching the bound needs ~5.3M clean seeds. So
+  # `continue-on-error` stays until a census carries that number; a lane that has
+  # merely stopped producing known bugs is not the same as a gate.
   #
   # Do NOT try to reach green by lowering `--partition`. `partition_for` draws
   # `rng.chance(percent)` once per SEED, so N is a share of seeds, not of writes:
   # halving it halves the partitioned seeds and the failure count together,
   # buying a quieter lane by testing proportionally less.
   #
-  # Gateability is not the binding constraint anyway — two of the three
-  # survivors are live correctness defects, so gating would only make the
-  # nightly permanently red. Every repro below was re-verified red at 238a437.
+  # Root causes, all three closed. Every repro below is green at HEAD and the
+  # minimum reproducer for each is a pinned gate in ci.yml, so a regression reds
+  # a merge rather than a nightly:
   #
-  # Open root causes:
-  #
-  #   1. DURABILITY — the demotion settle drops the canonical body AFTER the
-  #      fence that exempts it was cleared. End state: the key empty on every
-  #      bucket with no `.mirror-quarantined`, no `.frozen`, no tombstone and no
-  #      authorized delete, but both bodies still under `_quarantine/` — so
-  #      CONSERVATION passes and only DURABILITY reds, because its exemption WAS
-  #      the fence. Two paths clear the fence off a record snapshot read before
-  #      the settle's drop: `clear_spent_demotion_fence` (src/replicate.rs) and
-  #      `supersede_record`'s trailing `delete_keys([mirror_quarantined_key])`.
-  #      This violates the adjudication `49801fb` landed — a settled demotion
-  #      leaves the SAME one-line fence on both buckets. Not minimizable below
-  #      the census profile; 1.0M narrow-profile seeds never produced it.
+  #   1. DURABILITY — CLOSED (`f37e391`). A settle decided from a listing-era
+  #      read re-fenced a filename that private truth had already resolved,
+  #      while a concurrent pass holding the same record called that fence spent
+  #      and deleted it. The filename ended with no body and nothing authorizing
+  #      its absence. `settle_mirror_quarantine` now re-reads through
+  #      `demotion_resolved_by_private_truth` instead of trusting the verdict.
   #        --seed 16200065974 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100
   #        --seed 16200021087  (same flags)
   #
-  #   2. CONSERVATION — a merge resolution destroys an acked byte-set instead of
-  #      moving it. Both fences promise totality (the loser is moved, never
-  #      destroyed); this is that promise broken in three arms. Demotion arm: a
-  #      settle takes its `_quarantine/` copy, a peer's publish stores its body,
-  #      and the settle's UNCONDITIONAL canonical `delete` destroys it. Freeze
-  #      arm: now minimized to two nodes and one filename. Bare arm: no fence of
-  #      any kind — both buckets hold a live body and sidecar, `_quarantine/`
-  #      holds one loser, and a third acked byte-set is simply gone.
-  #        --seed 18200013677 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100   # freeze arm, minimized
-  #        --seed 18800106222 --nodes 3 --buckets 2 --packages 2 --files 1 --ops 80 --fail-percent 3 --partition 100   # bare arm, no fence
-  #        --seed 16200059870 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100  # demotion arm
+  #   2. CONSERVATION — CLOSED. Two producers, not the three arms the last
+  #      census counted; the "bare" arm was the demotion arm with its fence
+  #      cleared by the heal phase.
+  #
+  #      (a) PRODUCT. `settle_mirror_quarantine` copied the body it READ to
+  #      `_quarantine/` and then deleted the canonical key BLIND.
+  #      `freeze_side` runs the identical marker-preserve-drop order and is safe
+  #      doing it, because `.frozen` and `.tombstone` are upload fences —
+  #      `publish_record` refuses over them, so the body it preserved is still
+  #      the body it deletes. `.mirror-quarantined` is the one fence that
+  #      deliberately does NOT bar an upload (handing the filename to private
+  #      truth IS the demotion's resolution), so the key stays writable for the
+  #      whole settle: a sibling settle holding a three-ops-stale read deleted
+  #      the body a private publish had just created and would ack, and no
+  #      `_quarantine/` copy anywhere held those bytes. The settle now drops
+  #      only the body it personally preserved and abandons otherwise — the
+  #      private record left standing reads `Live { Private }` under a spent
+  #      fence, which `decide` and `clear_spent_demotion_fence` finish.
+  #        --seed 40000042940 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
+  #
+  #      (b) ORACLE. `delete_record` writes its tombstone BEFORE it removes the
+  #      body, so the 500 an injected outage produces at "artifact delete
+  #      failed" still leaves the filename permanently barred; the fleet
+  #      propagates that tombstone and `tombstone_side` destroys the body on
+  #      every peer. The harness read any `Err` as a REFUSAL and withdrew the
+  #      `authorized_deletes` entry it had recorded, so CONSERVATION held the
+  #      freeze racing that delete to a totality the delete had already made
+  #      impossible. It now withdraws only when no tombstone stands on the
+  #      bucket the delete wrote to — storage evidence, like every other
+  #      exemption this oracle takes.
+  #        --seed 18200013677 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
+  #        --seed 18800106222 --nodes 3 --buckets 2 --packages 2 --files 1 --ops 80 --fail-percent 3 --partition 100   # closed by 1, kept as coverage
+  #        --seed 16200059870 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100  # closed by 1, kept as coverage
   #
   #   3. SELF_CONSISTENCY — CLOSED. `supersede_record` was not crash-atomic and
   #      a crash inside it left a CROSSED BODY: a bucket serving bytes that
@@ -185,26 +202,24 @@ jobs:
   #      the minimum reproducer below.
   #        --seed 18300018803 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
   #
-  # This lane's profile is the wrong instrument for 2. It and the (now closed) 3
-  # were found on NARROW lanes (1-2 packages, 1 file, 40-80 ops), where they run
-  # about 1 seed in 200,000-340,000, while the 12-filename corpus here spreads
-  # the workload too thin to concentrate contention on a single name. That
-  # corpus is load-bearing for the durability oracles (see
-  # `tests/simulation_matrix.rs`), so when adding coverage for 2, add a narrow
-  # lane — do not widen this one.
+  # This lane's profile was the wrong instrument for 2 and 3. Both were found on
+  # NARROW lanes (1-2 packages, 1 file, 40-80 ops), where they ran about 1 seed
+  # in 200,000-500,000, while the 12-filename corpus here spreads the workload
+  # too thin to concentrate contention on a single name. That corpus is
+  # load-bearing for the durability oracles (see `tests/simulation_matrix.rs`),
+  # so add a narrow lane when hunting the next one — do not widen this one.
   #
-  # CLOSED since the previous census, over those 404,247 seeds: CONVERGENCE
-  # 750 -> 0, ACK_TOTALITY 17 -> 0, FREEZE_UNJUSTIFIED 14 -> 0, and DURABILITY's
-  # old "missing on bucket N" bulk 121 -> 2 (both now root cause 1 above). The
-  # coverage behind that is intact rather than suppressed: all 11 `decide`
-  # verdicts execute, `.frozen` stands at quiescence on 30.0% of seeds and
-  # `_quarantine/` on 35.9%, and the same profile at `--partition 0` zeroes seven
-  # verdicts and all three evidence objects.
+  # The coverage behind the zero is intact rather than suppressed: over the
+  # 124,090 seeds this profile contributed, all 11 `decide` verdicts execute,
+  # `.frozen` stands at quiescence on 40.3% of seeds and `_quarantine/` on
+  # 47.5%, `.mirror-quarantined` on 0.09%, and the same profile at
+  # `--partition 0` zeroes seven verdicts and all three evidence objects.
   #
-  # When the failing-seed count reaches zero, delete `continue-on-error` and
-  # fold this into the matrix above as an ordinary row.
+  # The remaining step to gating is a census, not a fix: soak ~5.3M clean seeds
+  # (see the arithmetic above), then delete `continue-on-error` and fold this
+  # into the matrix above as an ordinary row.
   vopr-partitioned:
-    name: vopr (partitioned authorship — NON-BLOCKING, known red)
+    name: vopr (partitioned authorship — NON-BLOCKING, coverage lane)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     continue-on-error: true
@@ -239,7 +254,7 @@ jobs:
       - name: Publish counters
         if: always()
         run: |
-          echo '### VOPR — partitioned authorship (NON-BLOCKING, known red)' >> "$GITHUB_STEP_SUMMARY"
+          echo '### VOPR — partitioned authorship (NON-BLOCKING, coverage lane)' >> "$GITHUB_STEP_SUMMARY"
           echo '' >> "$GITHUB_STEP_SUMMARY"
           echo 'Watch the failing-seed count trend to zero; the open root causes and their' >> "$GITHUB_STEP_SUMMARY"
           echo 'minimized repros are in the job comment in `.github/workflows/simulation.yml`.' >> "$GITHUB_STEP_SUMMARY"

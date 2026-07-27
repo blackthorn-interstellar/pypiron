@@ -153,6 +153,25 @@ jobs:
           # 12 filenames the workload never concentrates on one name and this is
           # invisible.
           cargo run --example vopr -- --seed 18300018803 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
+          # Demotion settle vs a racing publish. `.mirror-quarantined` is the
+          # one fence that deliberately does NOT bar an upload — handing the
+          # filename to private truth IS the demotion's resolution — so the
+          # canonical key stays writable while a settle runs. A sibling settle
+          # holding a three-ops-stale read then deleted the body a private
+          # publish had just created and would ack, and no `_quarantine/` copy
+          # anywhere held those bytes. The settle now drops only the body it
+          # personally preserved.
+          cargo run --example vopr -- --seed 40000042940 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
+          # A delete that tombstoned and THEN failed. `delete_record` writes the
+          # tombstone before it removes the body, so the 500 from a storage
+          # outage on the delete still leaves the filename permanently barred;
+          # the fleet propagates that tombstone and `tombstone_side` destroys
+          # the body on every peer. The harness read any `Err` as a refusal and
+          # withdrew the destruction it had recorded, so CONSERVATION held the
+          # freeze racing that delete to a totality the delete had made
+          # impossible. Pinned because it is the only reproducer that separates
+          # a refused delete from a failed one.
+          cargo run --example vopr -- --seed 18200013677 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
       # Mutation-testing the oracles themselves. Each `--break` is ONE deliberate
       # defect the named invariant exists to catch, so the run MUST fail with
       # that invariant's text — an invariant nobody has watched go red is an

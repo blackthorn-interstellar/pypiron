@@ -445,10 +445,22 @@ two sides agree", over pairs that did not. **Fixed**: the demotion fence is trut
 and replicates, the body it suppresses moves to `_quarantine/` on the bucket that
 resolved it, and the canonical key ends empty everywhere (dev/DESIGN.md). The
 same profile re-measured after the fix reds **2 of 65,473 seeds (0.003%)** —
-zero CONVERGENCE, zero DURABILITY. What is left is `FREEZE_UNJUSTIFIED` residue
-(~3 per 100k) and `ACK_TOTALITY` residue (~3 per 100k), both with minimized
-repros in the job comment above `vopr-partitioned` in
-`.github/workflows/simulation.yml`.
+zero CONVERGENCE, zero DURABILITY.
+
+That one fix closed `ACK_TOTALITY` too, which nobody noticed at the time: the
+residue was filed as a second, undiagnosed producer, and it was the *same* arm.
+`Noop` is the fan-out's convergence signal, so an arm that answers it over a pair
+one bucket has never heard of does not merely leave the fleet diverged — it acks
+a `200` with the peer holding nothing and owed no `_repl/` note. Measured on
+identical fresh seed ranges with only that arm reverted: **25 hard-gate hits in
+344,003 crash-only seeds before, 0 in 276,998 after**, and all five recorded
+repros (9300024588, 9300035976, 9300061064, 9504440, 14700042703) flip red and
+green with it. The lesson is the same one `fd14f01` taught in the `(Orphan, _)`
+arm and is now written into `Verdict::Noop`'s own doc comment: a `Noop` that is
+really a deferral is a durability claim, not a shrug.
+
+What is left is `CONSERVATION` residue, with minimized repros in the job comment
+above `vopr-partitioned` in `.github/workflows/simulation.yml`.
 
 To reproduce a lane by hand:
 
@@ -474,7 +486,7 @@ argument that it earns its runtime.
 | `CONSERVATION` (frozen) | 165 | 0 | two byte-sets acked, the fleet froze the filename, only *one* survived in `_quarantine/` — the freeze lost a body it is supposed to preserve before it drops anything | `5589ee5`, `b91e06c`, then `a7f5f26`'s delete ledger (below) |
 | `FREEZE_UNJUSTIFIED` | 91 | 0 | frozen on every bucket with only **one** byte-set attested anywhere (acks ∪ every `_quarantine/` copy) — a freeze that suppresses a filename and waives its durability check without a real conflict behind it | the same three |
 | `CONVERGENCE` (`.origin` split) | 208 | 0 | `packages/<pkg>/.origin` reads `mirror` on bucket 0 and is **absent** on bucket 1 at quiescence — an orphan claim that never replicated and never got released, so one bucket reserves a name the other would let a proxy fill. Needed no faults at all: four ops, two nodes, one file | `701b813` — `reconcile_split_origin` grew the missing `(mirror, no claim)` arm. The 2n/2b/1pkg/1file/4-op profile went from 9,123 failing seeds in 194,074 to 0 in 197,314 |
-| `ACK_TOTALITY` | 19 | 0 | a publish acked while a peer held neither the record, nor a `_repl/` note owing it, nor any merge marker explaining its absence. Crash-only, where a missed note is the hard gate | `fd14f01` — `decide`'s `(Orphan, _)` deferral is now `Verdict::Defer`, not a `Noop` the fan-out read as convergence. Crash-only 3,109 failing seeds in 20,963 → 2 in 20,703 |
+| `ACK_TOTALITY` | 19 | 0 | a publish acked while a peer held neither the record, nor a `_repl/` note owing it, nor any merge marker explaining its absence. Crash-only, where a missed note is the hard gate | two arms, same defect. `fd14f01` — `decide`'s `(Orphan, _)` deferral is now `Verdict::Defer`, not a `Noop` the fan-out read as convergence: crash-only 3,109 failing seeds in 20,963 → 2 in 20,703. The remainder was the demotion fence's `(QuarantinedMirror, _) => Noop`, closed by `4bb9cb8` → 0 |
 
 **Re-run a seed before you quote its row.** This table went stale silently and
 was cited as evidence for a full commit's worth of work after it stopped being
@@ -507,7 +519,7 @@ Every repro is `--nodes 3 --buckets 2 --packages 6 --files 2 --ops 160
 |---|---|---|---|---|---|
 | `CONVERGENCE` | seed 9500054, fail 3 | 0.345% | 0.144% | 0.015% | dominant, and one shape: a `<file>.mirror-quarantined` marker standing on one bucket and absent on the other. 110 of the fault lane's 160 failing seeds diverge on **that key alone**. The marker is what a merge writes to make a mirror body inert under a private claim, and it does not replicate — so the peer still renders the record the marker exists to suppress. The remaining 50 add the record it covers (bare artifact + `.meta.json`) present on one bucket only |
 | `DURABILITY` | seed 9500926, fail 3 | 0.034% | 0.019% | 0.004% | `acked … missing on bucket 0` — an acked record absent from one bucket at quiescence with no tombstone and no freeze. Always paired with a `CONVERGENCE` red on the same key; never the *split* clause (0 `never left split` in all 166,409 seeds) |
-| `ACK_TOTALITY` | seed 9504440, fail 0 | — | 0.004% | 0.017% | the residue `fd14f01` did not take: 8 misses in 46,660 crash-only seeds, where a miss is fatal. Under fault injection it stays a reported statistic (4,691 misses, 0 failing seeds), because the note write can itself fail |
+| `ACK_TOTALITY` | seed 9504440, fail 0 | — | 0.004% | 0.017% | **closed by `4bb9cb8`**, and it was never the second producer this row implies: the residue `fd14f01` did not take was the same `Noop`-as-agreement defect in `decide`'s demotion-fence arm. 8 misses in 46,660 crash-only seeds then; 0 in 276,998 now. Under fault injection it stays a reported statistic (4,691 misses, 0 failing seeds), because the note write can itself fail |
 | `FREEZE_UNJUSTIFIED` | seed 9539662, fail 0 | 0.011% | 0.003% | 0.002% | the residue `a7f5f26`'s delete ledger did not cover: frozen fleet-wide, one byte-set attested, both buckets tombstoned, `_quarantine/` empty. A freeze that fires without a real byte conflict buys a blanket DURABILITY+CONSERVATION exemption for free, so this matters more than 0.01% suggests |
 | `CONSERVATION` | seed 9522193, fail 3 | 0.002% | — | — | a freeze that dropped an acked body it never quarantined: one byte-set preserved under `_quarantine/`, the acked one gone from every bucket |
 
@@ -964,7 +976,7 @@ table below are the accurate ones.
 | ORIGIN_TERMINALITY (the record under it) | workload-reachable, never witnessed | needs a live mirror sidecar left renderable under a private claim | `mirror-served` |
 | CONVERGENCE | workload-reachable | needs ≥2 buckets; the replication paths that could break it run on every multi-bucket seed | `diverge` |
 | LIVENESS | workload-reachable | any undrainable breadcrumb reds it; the fast path has simply always drained | `wedge` |
-| ACK_TOTALITY | workload-reachable, and *observed* — including where it is fatal | a reported statistic under fault injection (4,691 misses in 44,648 partitioned seeds); crash-only, where it *is* fatal, has produced one — 8 failing seeds in 46,660 partitioned, first `--seed 9504440`. That row used to read "has never produced one", which was true only of the aligned schedule | `fanout` |
+| ACK_TOTALITY | workload-reachable, and *observed* — including where it is fatal; green now | a reported statistic under fault injection (4,691 misses in 44,648 partitioned seeds); crash-only, where it *is* fatal, it produced 8 failing seeds in 46,660 partitioned, first `--seed 9504440`, and 0 in 276,998 once `4bb9cb8` stopped `decide` calling a demotion fence a peer had never seen an agreement. That row used to read "has never produced one", which was true only of the aligned schedule | `fanout` |
 | DETERMINISM | workload-reachable | any nondeterminism downstream of the op sequence reds it | `rerun` |
 | TOMBSTONE_MONOTONICITY | **product-unreachable** | `publish_record`'s tombstone fence rejects re-publishing a deleted filename, so no ack can follow a `204` — 150k wide seeds (795k acked uploads, 251M interleavings) produced zero, and could not have produced one | `resurrect` |
 | classifier TEST 1 (both analyses) | **workload-unreachable** — but *witnessed once*, under `--partition` | seed 268 produced a real class-1 (a truth mutation no breadcrumb covered) before `df3db2d`; it is green now and 0 audit repairs of any class appear in the 489,901 seeds measured at `783d423`. Nothing forbids another, so this is a coverage statement, not a rule | `ordering`, `globalindex` |

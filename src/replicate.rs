@@ -4422,6 +4422,61 @@ mod tests {
         );
     }
 
+    /// The totality principle, asserted as the simulator's `ACK_TOTALITY`
+    /// oracle states it: at the moment a publish acks, every peer must hold the
+    /// record, or a merge marker explaining its absence, or a `_repl/` note
+    /// owing it. A source that resolved a mirror→private demotion is the case
+    /// that broke it — `decide` answered `Noop` ("the two sides agree") over a
+    /// pair where the peer had never heard of the demotion at all, `execute`
+    /// mapped that to `Convergence::Converged`, and the fan-out acked with the
+    /// peer holding nothing and owed nothing.
+    ///
+    /// This is the same defect `fd14f01` fixed for the bare-artifact `(Orphan,
+    /// _)` arm above, in a second arm: a `Noop` that was a deferral, not an
+    /// agreement. It is pinned here and not only in `decide`'s unit tests
+    /// because the algebra is not what was wrong — the *ack* was, and no test
+    /// below `fanout_sync` could see it.
+    #[tokio::test]
+    async fn fanout_sync_never_acks_a_demotion_the_peer_never_heard_of() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        // A resolved the demotion: fence standing, canonical key empty, the
+        // losing body in its own `_quarantine/`. B has never heard of it.
+        seed_live(a.as_ref(), "pkg", filename, b"mirror bytes", MIRROR);
+        a.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
+        assert_eq!(
+            quarantine_mirror_artifacts(a.as_ref(), "pkg")
+                .await
+                .unwrap(),
+            1
+        );
+        let state = two_bucket_state(a.clone(), b.clone());
+        let pinned = state.pin();
+
+        fanout_sync(&state, &pinned, "pkg", filename, None).await;
+
+        let key = artifact_key("pkg", filename);
+        let owed = a
+            .list_all(&format!("{REPL_PREFIX}1/"))
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.key.contains("/pkg/"));
+        let holds_record =
+            b.head_exists(&key).await.unwrap() && b.head_exists(&sidecar_key(&key)).await.unwrap();
+        let fenced = b.head_exists(&mirror_quarantined_key(&key)).await.unwrap();
+        assert!(
+            holds_record || fenced || owed,
+            "ACK_TOTALITY: the ack fired with the peer holding neither the \
+             record, nor a marker explaining its absence, nor a note owing it",
+        );
+        // And the resolution the fan-out is supposed to reach: the fence is
+        // truth and replicates, so no note is owed and no body crosses.
+        assert!(fenced && !owed);
+        assert!(b.list_all(QUARANTINE_PREFIX).await.unwrap().is_empty());
+    }
+
     /// The same deferral on the note-draining path: the marker sweep may only
     /// consume a note the copy actually delivered. Consuming one the merge
     /// merely declined drops the fleet's last record that the peer is owed.

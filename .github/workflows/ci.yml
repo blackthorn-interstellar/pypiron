@@ -123,13 +123,23 @@ jobs:
           # and a delete racing `freeze_side` destroys the bodies before either
           # `_quarantine/` copy is taken — so the freeze is real and every
           # body-shaped trace of it is gone. 9800020745 loses both byte-sets
-          # (nothing attested at all); 9800002480 loses one. These are the only
-          # partitioned seeds pinned as a gate: they are the minimum reproducers
-          # for the whole class, they run in milliseconds, and the simulator is
-          # deterministic, so a re-broken oracle reds here rather than waiting
-          # for a nightly.
+          # (nothing attested at all); 9800002480 loses one. These are pinned as
+          # gates because they are the minimum reproducers for their class, they
+          # run in milliseconds, and the simulator is deterministic, so a
+          # re-broken oracle reds here rather than waiting for a nightly.
           cargo run --example vopr -- --seed 9800020745 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100
           cargo run --example vopr -- --seed 9800002480 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100
+          # Ack totality. One node publishes a mirror record, a partitioned peer
+          # claims the package private, and the bucket that resolved the
+          # demotion acks with the other bucket never told: `decide` answered
+          # `Noop` — "the two sides agree" — over a pair where one side held a
+          # fence and the other held nothing, `execute` mapped that to
+          # `Converged`, and the fan-out wrote no `_repl/` note. Minimized from
+          # the 200-op census repros (9300024588, 9300035976, 9300061064,
+          # 9504440, 14700042703) to two nodes and 40 ops, where ACK_TOTALITY is
+          # the ONLY violation — so this reds for its own reason, not as a
+          # passenger on a convergence failure.
+          cargo run --example vopr -- --seed 9900094440 --nodes 2 --buckets 2 --packages 2 --files 1 --ops 40 --fail-percent 0 --partition 100
       # Mutation-testing the oracles themselves. Each `--break` is ONE deliberate
       # defect the named invariant exists to catch, so the run MUST fail with
       # that invariant's text — an invariant nobody has watched go red is an

@@ -142,6 +142,22 @@ pub enum Side {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Verdict {
     /// The two sides agree. Nothing is owed to either bucket.
+    ///
+    /// This is a **durability claim**, not a shrug — the strongest thing this
+    /// enum says. `execute` maps it to [`Convergence::Converged`][c], which is
+    /// what the pre-ack fan-out reads as "the peer holds it", so it returns a
+    /// `200` and writes no `_repl/` note. Answer `Noop` over a pair that does
+    /// not agree and the ack claims a durability the fleet does not have
+    /// (dev/DESIGN.md's totality principle).
+    ///
+    /// Both bugs this cost were the same mistake: `(Orphan, _)` (`fd14f01`) and
+    /// `(QuarantinedMirror, _)` (`4bb9cb8`), each a pair where one bucket held a
+    /// record or a fence and the other had never heard of it. Both read as
+    /// harmless no-ops and both acked uploads no peer held. If a new arm cannot
+    /// state what the two sides *agree on*, it wants [`Verdict::Defer`] or a
+    /// verdict that acts — never this.
+    ///
+    /// [c]: crate::replicate::Convergence::Converged
     Noop,
     /// The merge *declined to act this pass* — it is not a convergence. Only
     /// state the other bucket's own audit can produce (a sidecar for a bare

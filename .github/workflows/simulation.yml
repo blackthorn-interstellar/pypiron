@@ -146,11 +146,6 @@ jobs:
   #      Plus 1 DURABILITY in the same 183,230 — an acked record missing on one
   #      bucket at quiescence, the pre-existing "missing on bucket N" shape.
   #        --seed 5100065969 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100
-  #   2. ACK_TOTALITY residue: a publish acks while a peer holds neither the
-  #      record nor a `_repl/` note covering it (dev/DESIGN.md totality
-  #      principle). Needs the wide profile; it does not reproduce below
-  #      6 packages / 200 ops.
-  #        --seed 9300024588 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 200 --fail-percent 0 --partition 100
   #
   # CLOSED — FREEZE_UNJUSTIFIED, an ORACLE defect, not a product one. Every one
   # of these was a REAL byte conflict: two partitioned nodes committed different
@@ -163,6 +158,20 @@ jobs:
   # minimized reproducers are pinned as a gate in ci.yml:
   #     --seed 9800020745 ... --partition 100  # both byte-sets erased
   #     --seed 9800002480 ... --partition 100  # one erased
+  #
+  # CLOSED — ACK_TOTALITY, and it was never a second producer. The residue that
+  # survived `fd14f01` was the SAME defect in a second arm of `decide`: the
+  # demotion fence's `(QuarantinedMirror, _) => Noop`, which claimed "the two
+  # sides agree" over a pair where one bucket held a fence and the other had
+  # never heard of the demotion. `execute` mapped it to `Convergence::Converged`
+  # and the pre-ack fan-out wrote no `_repl/` note. `4bb9cb8` replaced that arm
+  # to make the fence replicate, and closed this with it — the ack was never
+  # separately diagnosed at the time. Every recorded repro (9300024588,
+  # 9300035976, 9300061064, 9504440, 14700042703) is green, and reverting that
+  # one arm reds all five again. Measured after: 450,182 seeds of this lane's
+  # profile and 1,017,007 rotating seeds, zero ACK_TOTALITY. Minimized to two
+  # nodes and 40 ops and pinned as a gate in ci.yml:
+  #     --seed 9900094440 --nodes 2 --buckets 2 --packages 2 --files 1 --ops 40 --fail-percent 0 --partition 100
   #
   # When the failing-seed count reaches zero, delete `continue-on-error` and
   # fold this into the matrix above as an ordinary row.

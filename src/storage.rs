@@ -3662,6 +3662,13 @@ pub mod test_support {
         /// positional `fail_next_get` cannot express "this object is
         /// unreachable" when the read under test is not the next one.
         unreadable: Mutex<Option<String>>,
+        /// One key whose *mutations* fail until [`InMemStorage::heal_writes`].
+        /// The mirror of `unreadable`, and its own hazard class: a write that
+        /// errors AFTER the caller has already moved in-memory state or other
+        /// truth is what leaves a node believing something landed that did not.
+        /// Deletes count — a delete is a write, and "the tombstone stood but the
+        /// body delete 500'd" is exactly such a case.
+        unwritable: Mutex<Option<String>>,
         /// Artificial `get_bytes` latency in milliseconds (0 = none). Lets a
         /// test hold one loader in flight long enough for concurrent readers to
         /// observe the single-flight refill claim.
@@ -3698,6 +3705,17 @@ pub mod test_support {
         }
         fn unreadable(&self, key: &str) -> bool {
             self.unreadable.lock().unwrap().as_deref() == Some(key)
+        }
+        /// Make every write (and delete) of `key` fail until
+        /// [`InMemStorage::heal_writes`].
+        pub fn fail_writes_of(&self, key: &str) {
+            *self.unwritable.lock().unwrap() = Some(key.to_string());
+        }
+        pub fn heal_writes(&self) {
+            *self.unwritable.lock().unwrap() = None;
+        }
+        fn unwritable(&self, key: &str) -> bool {
+            self.unwritable.lock().unwrap().as_deref() == Some(key)
         }
         pub fn fail_stored_size(&self) {
             self.fail_stored_size.store(true, Ordering::SeqCst);
@@ -3744,6 +3762,9 @@ pub mod test_support {
             bytes: Vec<u8>,
             _content_type: Option<&str>,
         ) -> Result<()> {
+            if self.unwritable(key) {
+                anyhow::bail!("injected storage failure");
+            }
             self.insert(key, bytes);
             Ok(())
         }
@@ -3753,6 +3774,9 @@ pub mod test_support {
             bytes: Vec<u8>,
             _content_type: Option<&str>,
         ) -> Result<bool> {
+            if self.unwritable(key) {
+                anyhow::bail!("injected storage failure");
+            }
             let mut map = self.objects.lock().unwrap();
             if map.contains_key(key) {
                 return Ok(false);
@@ -3801,6 +3825,9 @@ pub mod test_support {
             Ok(out)
         }
         async fn delete_keys(&self, keys: &[String]) -> Result<()> {
+            if keys.iter().any(|k| self.unwritable(k)) {
+                anyhow::bail!("injected storage failure");
+            }
             let mut map = self.objects.lock().unwrap();
             for k in keys {
                 map.remove(k);
@@ -3837,6 +3864,9 @@ pub mod test_support {
                 .map(|b| (b.clone(), test_etag(b))))
         }
         async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
+            if self.unwritable(key) {
+                anyhow::bail!("injected storage failure");
+            }
             let mut map = self.objects.lock().unwrap();
             if map.contains_key(key) {
                 return Ok(None);
@@ -3851,6 +3881,9 @@ pub mod test_support {
             etag: &str,
             bytes: Vec<u8>,
         ) -> Result<Option<String>> {
+            if self.unwritable(key) {
+                anyhow::bail!("injected storage failure");
+            }
             let mut map = self.objects.lock().unwrap();
             match map.get(key) {
                 Some(current) if test_etag(current) == etag => {

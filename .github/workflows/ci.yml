@@ -96,10 +96,32 @@ jobs:
           # a wide-entity or delete-heavy schedule. Reproduce with
           # `--seed N --rotate`; the volume runs nightly.
           cargo run --example vopr -- --seeds 30 --rotate
-          # Regression seeds: schedules that once produced a torn record (live
-          # body + stale backfilled sidecar) reconcile refused to heal, and a
-          # paused delete whose stale intent a concurrent tick consumed with a
-          # pre-mutation rebuild (lost signal, crash-only audit repair).
+          # --- Regression seeds ------------------------------------------------
+          # READ THIS BEFORE CHANGING ANY SEED OR PROFILE BELOW. A seed is a
+          # RECIPE, not an ordering: it regenerates one schedule from (seed x
+          # harness x product code), and several of the fixes below reorder
+          # storage ops by design. So a pinned seed generally stops reproducing
+          # its own bug the moment the fix lands, then keeps passing while
+          # exercising something else. Measured, not feared: `VOPR_TRACE=1` on
+          # seed 19026 today shows exactly one conditional write of
+          # `simple/index.json`, and its one `cas-outcome` is `won` — the lost
+          # CAS it is named for no longer occurs in its schedule at all.
+          # They stay because they are deterministic, cost milliseconds, and
+          # re-walk real fleet code. But NONE of them is the guard. Every shape
+          # below names the durable test that pins it — one that pins the bad
+          # STATE or the detector rather than a schedule — and those are what may
+          # not be deleted. Changing this list deletes no coverage.
+          #
+          # A torn record (live body + stale backfilled sidecar) that reconcile
+          # refused to heal, and a paused delete whose stale intent a concurrent
+          # tick consumed with a pre-mutation rebuild (lost signal, crash-only
+          # audit repair). Originally found by these seeds; the shapes are pinned
+          # by `replicate::tests::torn_source_record_drops_stale_sidecar_for_rebuild`
+          # (the heal), `worker::tests::a_backfill_retracts_the_sidecar_it_fabricated_over_vanished_bytes`
+          # (the tear's creation — the fabrication is retracted, so no later
+          # upload inherits it) and
+          # `conformance_tick::stale_unpaired_intent_heals_the_crashed_writer`
+          # (the re-arm before a healed stale intent is consumed).
           cargo run --example vopr -- --seed 1784486481 --nodes 3 --buckets 3 --ops 120 --fail-percent 3
           cargo run --example vopr -- --seed 1784817003 --nodes 2 --buckets 3 --ops 80 --fail-percent 3
           cargo run --example vopr -- --seed 1784521773 --nodes 3 --buckets 1 --ops 80 --fail-percent 0
@@ -111,9 +133,15 @@ jobs:
           # own dirty markers (two topologies). 19026: a failed global-index CAS
           # left the name delta absorbed into the cache with the old ETag pinned,
           # so every retry saw changed=false and left a dead package listed.
-          # 47843: the empty-view poisoning under two buckets. One seed per
-          # failure shape; the rotating soak (nightly simulation.yml) re-explores
-          # the wider space (14402, 23921, 41013, ...).
+          # 47843: the empty-view poisoning under two buckets. Originally found
+          # by these seeds; the shapes are pinned by
+          # `worker::tests::a_transient_sidecar_read_error_fails_the_rebuild_instead_of_burying_the_package`
+          # (a live package's view survives a sidecar read blip and its markers
+          # are retained) and
+          # `worker::tests::a_failed_global_index_write_does_not_leave_the_delta_absorbed_in_the_cache`
+          # (the retry of a delta whose write errored is still a change). The
+          # rotating soak (nightly simulation.yml) re-explores the wider space
+          # (14402, 23921, 41013, ...).
           cargo run --example vopr -- --seed 7384 --nodes 2 --buckets 1 --ops 80 --fail-percent 3
           cargo run --example vopr -- --seed 19900 --nodes 3 --buckets 1 --ops 80 --fail-percent 3
           cargo run --example vopr -- --seed 19026 --nodes 2 --buckets 1 --ops 160 --fail-percent 3
@@ -123,10 +151,15 @@ jobs:
           # and a delete racing `freeze_side` destroys the bodies before either
           # `_quarantine/` copy is taken — so the freeze is real and every
           # body-shaped trace of it is gone. 9800020745 loses both byte-sets
-          # (nothing attested at all); 9800002480 loses one. These are pinned as
-          # gates because they are the minimum reproducers for their class, they
-          # run in milliseconds, and the simulator is deterministic, so a
-          # re-broken oracle reds here rather than waiting for a nightly.
+          # (nothing attested at all); 9800002480 loses one. Both are oracle
+          # false-faults, so the durable cover is the oracle's evidence model,
+          # not the product: `sim::tests::a_fenced_delete_keeps_the_bodies_it_destroys`
+          # (a delete under a fence may not erase the proof that two byte-sets
+          # stood under one filename), plus `an_unfenced_delete_ends_the_incarnation`
+          # and `a_refused_writers_debris_never_attests` for the other direction —
+          # the history may not invent a conflict out of a cache eviction or a
+          # refused writer's debris. The detection direction stays honest via the
+          # `--break freeze-unjustified` leg below.
           cargo run --example vopr -- --seed 9800020745 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100
           cargo run --example vopr -- --seed 9800002480 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 16 --fail-percent 0 --partition 100
           # Ack totality. One node publishes a mirror record, a partitioned peer
@@ -138,7 +171,10 @@ jobs:
           # the 200-op census repros (9300024588, 9300035976, 9300061064,
           # 9504440, 14700042703) to two nodes and 40 ops, where ACK_TOTALITY is
           # the ONLY violation — so this reds for its own reason, not as a
-          # passenger on a convergence failure.
+          # passenger on a convergence failure. Originally found by these seeds;
+          # the shape is pinned by
+          # `replicate::tests::fanout_sync_never_acks_a_demotion_the_peer_never_heard_of`,
+          # which asserts the oracle's own predicate over that pair.
           cargo run --example vopr -- --seed 9900094440 --nodes 2 --buckets 2 --packages 2 --files 1 --ops 40 --fail-percent 0 --partition 100
           # Crossed body: a supersede died between replacing the artifact and
           # publishing the sidecar naming it, so bucket 0 served one byte-set
@@ -147,11 +183,14 @@ jobs:
           # within a bucket, CONVERGENCE reads the same crossed pair across the
           # two. Permanent before the `.superseding` fence, because nothing
           # re-hashes a stored body and the two buckets' sidecars stayed
-          # byte-identical, so `decide` called the record agreed forever. Pinned
-          # because it is the minimum reproducer for the class and the only one
-          # that catches a repair moved off the rebuild path onto the audit: at
-          # 12 filenames the workload never concentrates on one name and this is
-          # invisible.
+          # byte-identical, so `decide` called the record agreed forever.
+          # Originally found by this seed; the shape is pinned by
+          # `replicate::tests::a_rebuild_finishes_a_supersede_that_died_before_publishing_its_sidecar`
+          # and `replicate::tests::the_repair_leaves_a_supersede_that_died_before_touching_the_body`
+          # (the `.superseding` intent is finished or discarded, never left to
+          # rot), and the detector that sees the class by the `--break attest`
+          # leg below. What only the seed adds is the placement of the repair: it
+          # reds if the fix moves off the rebuild path onto the periodic audit.
           cargo run --example vopr -- --seed 18300018803 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
           # Demotion settle vs a racing publish. `.mirror-quarantined` is the
           # one fence that deliberately does NOT bar an upload — handing the
@@ -160,7 +199,9 @@ jobs:
           # holding a three-ops-stale read then deleted the body a private
           # publish had just created and would ack, and no `_quarantine/` copy
           # anywhere held those bytes. The settle now drops only the body it
-          # personally preserved.
+          # personally preserved. Originally found by this seed; the shape is
+          # pinned by
+          # `replicate::tests::a_demotion_settle_drops_only_the_body_it_preserved`.
           cargo run --example vopr -- --seed 40000042940 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
           # A delete that tombstoned and THEN failed. `delete_record` writes the
           # tombstone before it removes the body, so the 500 from a storage
@@ -169,8 +210,12 @@ jobs:
           # the body on every peer. The harness read any `Err` as a refusal and
           # withdrew the destruction it had recorded, so CONSERVATION held the
           # freeze racing that delete to a totality the delete had made
-          # impossible. Pinned because it is the only reproducer that separates
-          # a refused delete from a failed one.
+          # impossible. The fix was the harness's ledger, so what has to stay
+          # true is the PRODUCT fact it now depends on: originally found by this
+          # seed, the ordering is pinned by
+          # `publish::tests::a_failed_artifact_delete_still_leaves_the_filename_barred`.
+          # Reorder the tombstone behind the body and that test reds — which is
+          # the signal that the ledger rule has gone wrong too.
           cargo run --example vopr -- --seed 18200013677 --nodes 2 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100
           # The same settle, the OTHER arm. `40000042940` above pinned the case
           # where a racing publish's body was already standing at the settle's
@@ -178,9 +223,11 @@ jobs:
           # empty, the create landed while the delete was in flight, and the
           # delete was unconditional. A `twine upload` got its 200 and the bytes
           # then existed nowhere: no `_quarantine/` copy, no `.tombstone`, no
-          # `.frozen`. Pinned because a re-read cannot separate the two arms and
-          # the fix is what does — the body is deleted only when a verified
-          # `_quarantine/` copy of exactly those bytes exists.
+          # `.frozen`. A re-read cannot separate the two arms and the fix is what
+          # does — the body is deleted only when a verified `_quarantine/` copy
+          # of exactly those bytes exists. Originally found by this seed; the
+          # shape is pinned by
+          # `replicate::tests::a_demotion_settle_never_drops_a_body_it_never_preserved`.
           cargo run --example vopr -- --seed 86001009016 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 26 --fail-percent 1 --partition 100
           # A settle emptying a canonical key out from under a replication copy,
           # between the copy's artifact leg and its sidecar. The leg publishes
@@ -188,8 +235,10 @@ jobs:
           # the bucket holds — but the settle's delete retracts that ownership,
           # the sidecar lands over an empty key, the next create takes it with
           # different bytes, and bucket 0 serves one byte-set under the other's
-          # published sha256 forever. Pinned because it needs 6 packages to
-          # reach: the victim is the sixth name.
+          # published sha256 forever. Originally found by this seed (which needed
+          # 6 packages to reach it — the victim is the sixth name); the shape is
+          # pinned by
+          # `replicate::tests::a_copy_never_publishes_truth_over_a_body_the_bucket_lost`.
           cargo run --example vopr -- --seed 62000150551 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 80 --fail-percent 3 --partition 100
       # Mutation-testing the oracles themselves. Each `--break` is ONE deliberate
       # defect the named invariant exists to catch, so the run MUST fail with

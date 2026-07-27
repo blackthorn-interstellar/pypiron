@@ -4313,4 +4313,150 @@ mod tests {
             "the canonical global JSON must not keep listing a package with no artifacts"
         );
     }
+
+    /// A sidecar read that fails for *availability* must fail the whole rebuild,
+    /// never omit the file. Omission is only ever right for a parse failure
+    /// (corruption we must not overwrite) or a not-found (a concurrent delete,
+    /// which holds its own marker). A single-file package is where laundering
+    /// the third case into the first two is fatal: "omit the file" and "the
+    /// package is dead" become the same observation, so the rebuild derives an
+    /// empty view, DELETES a live package's index, reports success — and the
+    /// tick consumes the only signal that would have retried. Originally found
+    /// as vopr seeds 7384 / 19900 (one bucket, two topologies) and 47843 (the
+    /// same poisoning under two buckets).
+    #[tokio::test]
+    async fn a_transient_sidecar_read_error_fails_the_rebuild_instead_of_burying_the_package() {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let storage = Arc::new(InMemStorage::default());
+        let state = test_app_state(storage.clone(), Duration::from_secs(3600));
+        let pinned = state.pin();
+        let view = format!("{SIMPLE_PREFIX}alpha/index.json");
+        seed_private_artifact(&storage, "alpha", FILE);
+
+        // A healthy tick first: the package is live and listed everywhere.
+        mark_dirty(storage.as_ref(), "alpha").await.unwrap();
+        tick(&state, &pinned).await.unwrap();
+        assert!(
+            storage.head_exists(&view).await.unwrap(),
+            "test setup broken: the healthy tick never built the package view"
+        );
+
+        // Now one sidecar read blips while a fresh marker is outstanding.
+        mark_dirty(storage.as_ref(), "alpha").await.unwrap();
+        storage.fail_reads_of(&sidecar_key(&format!("{PACKAGES_PREFIX}alpha/{FILE}")));
+        tick(&state, &pinned).await.unwrap_err();
+        storage.heal_reads();
+
+        assert!(
+            storage.head_exists(&view).await.unwrap(),
+            "a live package's index may not be deleted because one sidecar read failed"
+        );
+        assert!(
+            !storage
+                .list_dir_entries(DIRTY_PREFIX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rebuild that failed must retain the markers that are its only retry signal"
+        );
+        let global = storage
+            .get_bytes(&format!("{SIMPLE_PREFIX}index.json"))
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(global).unwrap().contains("alpha"),
+            "a live package must stay in the global index across a transient read error"
+        );
+    }
+
+    /// A global-index write that ERRORS must not leave its delta absorbed in the
+    /// cached name set. The delta is applied in memory before the conditional
+    /// write, so a surviving cache pins the OLD ETag over a MUTATED set: every
+    /// retry then computes `changed = false`, the currency probe agrees (nothing
+    /// moved — nothing was written), and the tick returns Ok and consumes its
+    /// dirty markers. The delta is gone until the audit, with a dead package
+    /// still listed globally. Originally found as vopr seed 19026.
+    #[tokio::test]
+    async fn a_failed_global_index_write_does_not_leave_the_delta_absorbed_in_the_cache() {
+        let storage = Arc::new(InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+        update_global_index(&state, storage.as_ref(), &["alpha".to_string()], &[])
+            .await
+            .unwrap();
+
+        // The removal cannot be published: the conditional HTML write is the
+        // first object the CAS path touches, so nothing lands at all.
+        storage.fail_writes_of(&format!("{SIMPLE_PREFIX}index.html"));
+        update_global_index(&state, storage.as_ref(), &[], &["alpha".to_string()])
+            .await
+            .unwrap_err();
+        storage.heal_writes();
+
+        // The identical delta, retried. It is still a change: nothing landed.
+        update_global_index(&state, storage.as_ref(), &[], &["alpha".to_string()])
+            .await
+            .unwrap();
+
+        let json = storage
+            .get_bytes(&format!("{SIMPLE_PREFIX}index.json"))
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8(json).unwrap().contains("alpha"),
+            "the retry of a delta whose write failed must still remove the name"
+        );
+        assert_eq!(
+            global_html(&storage).await,
+            pep503_global_html(&[]),
+            "and must still publish the HTML for the set it wrote"
+        );
+    }
+
+    /// The backfill's hash read and its create are not atomic, and the immutable
+    /// filename can come free in between — a failed publish clearing its own
+    /// unacked debris. A sidecar fabricated over bytes that are no longer there
+    /// is a torn record (live body, wrong sha256) that the NEXT upload of that
+    /// filename inherits, so the backfill re-reads the body after the create and
+    /// retracts its own fabrication. Staged on a paused clock: the delete lands
+    /// inside the artificial latency of the hash read, before the confirm read
+    /// looks. Originally found by the vopr soak alongside seeds 1784486481 /
+    /// 1784817003 / 1784521773 (commit e860792).
+    #[tokio::test(start_paused = true)]
+    async fn a_backfill_retracts_the_sidecar_it_fabricated_over_vanished_bytes() {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let storage = Arc::new(InMemStorage::default());
+        let key = format!("{PACKAGES_PREFIX}alpha/{FILE}");
+        storage.insert(&key, b"artifact".to_vec());
+        storage.set_get_delay(Duration::from_millis(50));
+
+        let backfill = {
+            let storage = storage.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                let entry = FileEntry {
+                    key,
+                    size: 8,
+                    last_modified: Some("2026-01-01T00:00:00Z".to_string()),
+                };
+                backfill_sidecar(storage.as_ref(), &entry, FILE, Some(crate::origin::PRIVATE)).await
+            })
+        };
+        // The hash read returns at t=50ms and the confirm read looks at t=100ms.
+        // The publisher that never acked clears its debris in between.
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        storage
+            .delete_keys(std::slice::from_ref(&key))
+            .await
+            .unwrap();
+
+        assert!(
+            backfill.await.unwrap().unwrap().is_none(),
+            "a backfill whose body vanished under it indexes nothing"
+        );
+        assert!(
+            !storage.head_exists(&sidecar_key(&key)).await.unwrap(),
+            "the fabricated sidecar must be retracted, not left for the next upload \
+             of this immutable filename to inherit as a torn record"
+        );
+    }
 }

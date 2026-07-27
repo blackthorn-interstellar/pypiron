@@ -1429,4 +1429,42 @@ mod tests {
                 .unwrap()
         );
     }
+
+    /// A private delete tombstones BEFORE it removes the body, so a delete that
+    /// gets its 500 from the artifact delete has still barred the filename
+    /// forever: the tombstone stands, the fleet propagates it, and
+    /// `replicate::tombstone_side` destroys the body on every peer. Nothing may
+    /// reorder these two writes — a body removed ahead of its tombstone can be
+    /// re-uploaded under a name PyPI semantics say is spent, and a failed delete
+    /// would become genuinely undone, which is the read the deterministic
+    /// simulator's conservation ledger relies on being wrong (vopr seed
+    /// 18200013677: a refused delete and a failed one are not the same event).
+    #[tokio::test]
+    async fn a_failed_artifact_delete_still_leaves_the_filename_barred() {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let storage = Arc::new(storage::test_support::InMemStorage::default());
+        let key = format!("{PACKAGES_PREFIX}alpha/{FILE}");
+        storage.insert(&key, b"artifact".to_vec());
+        origin::claim_origin(storage.as_ref(), "alpha", origin::PRIVATE)
+            .await
+            .unwrap();
+        let state = AppState::headless(storage.clone());
+        let pinned = state.pin();
+
+        storage.fail_writes_of(&key);
+        let (code, _) = delete_record(&state, &pinned, "alpha", FILE)
+            .await
+            .expect_err("the artifact delete was made to fail");
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+
+        assert!(
+            storage.head_exists(&tombstone_key(&key)).await.unwrap(),
+            "the tombstone must be written before the body, so a delete that failed \
+             on the body has still spent the filename"
+        );
+        assert!(
+            storage.head_exists(&key).await.unwrap(),
+            "test setup broken: the body delete was supposed to fail"
+        );
+    }
 }

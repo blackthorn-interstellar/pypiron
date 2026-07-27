@@ -413,27 +413,45 @@ the tombstone is exactly the window where it would become load-bearing.
 
 #### Where the two lanes stand
 
-Three statements, all true at `1e80be3` and all measured rather than inferred:
-**the aligned nightly is green, the partitioned lane is still red, and it runs
-nightly anyway — as a non-blocking lane, never as a gate.**
+Three statements, all measured rather than inferred: **both lanes are green, the
+partitioned lane still runs non-blocking, and what keeps it that way is now a
+census rather than a bug.**
 
 - **Aligned** — the five nightly profiles at their own 50,000 seeds each with
   `--require-reach` (`--start-seed 12000000001`): 250,000 seeds, 466,908,487
   storage-op interleavings, 2,293,880 acked uploads, **zero violations**, no
   starved oracle, 0 audit view repairs of any class.
-- **Partitioned** — the `multi-bucket` profile plus one flag, 420 s per rate on
-  disjoint ranges: at `--partition 100`, 91,560 seeds and **291 failing
-  (0.318%)**; at `--partition 10`, 89,460 seeds and **27 failing (0.030%)**.
-  Down from 16–51% of seeds when the lane opened, but not zero.
+- **Partitioned** — the `multi-bucket` profile plus one flag. Re-measured at
+  `4eaa015` over two 900-second lanes on disjoint fresh ranges
+  (`--start-seed 50000000001` and `51000000001`), both `--partition 100
+  --require-reach`: **344,839 seeds, 869,932,702 storage-op interleavings,
+  3,112,571 acked uploads, zero failing seeds**, zero audit view repairs of any
+  class, no starved oracle. The coverage behind that zero is intact rather than
+  suppressed — `MERGE_DIVERGENCE` executes on 47% of seeds and
+  `FREEZE_JUSTIFIED` on 40%, both of which read a flat zero on every aligned
+  seed ever run.
 
-That rules out gating at *any* partition percentage, which is the question a
-lower rate invites. A 50,000-seed nightly draw reds with probability ≈1 at both
-rates; even the 6-seed PR smoke reds ~2% of runs at 100%. Only fixing the
-remaining bugs makes it a gate — so `vopr-partitioned` in `simulation.yml` is
-`continue-on-error: true`, with a 15-minute `--max-secs` budget instead of a
-seed count, because the lane's output is a *rate* you watch trend to zero: given
-a seed count it would stop at its first failing seed, ~300 seeds in, and report
-nothing. `tests/simulation_matrix.rs` guards it in both directions — the
+Compare ranges, never time budgets: this box's seed rate swings better than 1.5x
+with load, so two `--max-secs` runs explore different ranges and their failing
+counts are not comparable.
+
+Zero is not yet gateable, and the arithmetic is the argument rather than the
+mood. A draw of N seeds reds with probability 1-(1-p)^N, so holding the nightly
+to one red night in twenty over this job's draw (90,000–100,000 seeds) needs
+p ≤ 5.7e-7. The census in the `vopr-partitioned` job comment — 1,473,767 seeds
+across four profiles, plus the 344,839 here — bounds p only to about 1.6e-6
+(rule of three, 95%): the right order of magnitude, still short. Reaching the
+bound needs roughly 5.3M clean seeds. So `vopr-partitioned` in `simulation.yml`
+stays `continue-on-error: true`, with a 15-minute `--max-secs` budget instead of
+a seed count, because the lane's output is a *rate* you watch: given a seed
+count it would stop at its first failing seed and report nothing.
+
+Do **not** try to reach green by lowering `--partition`. `partition_for` draws
+`rng.chance(percent)` once per *seed*, so the flag is a share of seeds and not
+of writes: halving it halves the partitioned seeds and any failure count
+together, buying a quieter lane by testing proportionally less.
+
+`tests/simulation_matrix.rs` guards it in both directions — the
 partitioned lane must keep `continue-on-error`, and the gated matrix must never
 acquire it. The aligned matrix and the pinned `ci.yml` regression seeds stay on
 `--partition 0`, byte-identical (verified by diffing five whole-profile runs,
@@ -459,8 +477,32 @@ green with it. The lesson is the same one `fd14f01` taught in the `(Orphan, _)`
 arm and is now written into `Verdict::Noop`'s own doc comment: a `Noop` that is
 really a deferral is a durability claim, not a shrug.
 
-What is left is `CONSERVATION` residue, with minimized repros in the job comment
-above `vopr-partitioned` in `.github/workflows/simulation.yml`.
+Nothing is left. The three root causes that outlived the demotion-fence fix are
+all closed, each with its minimum reproducer promoted from the nightly to a
+pinned `ci.yml` gate so a regression reds a merge rather than a nightly. The
+full diagnosis of each is in the job comment above `vopr-partitioned` in
+`.github/workflows/simulation.yml`; in one line apiece:
+
+- `DURABILITY` (`f37e391`) — a settle decided from a listing-era read re-fenced
+  a filename private truth had already resolved, while a concurrent pass holding
+  the same record called that fence spent and deleted it, leaving the filename
+  with no body and nothing authorizing its absence.
+- `CONSERVATION` (`4eaa015`, plus a harness half) — `settle_mirror_quarantine`
+  deleted the canonical key blind after copying the body it had *read*, so a
+  sibling settle destroyed a private body a racing publish had just created.
+  `.mirror-quarantined` is the one fence that deliberately does not bar an
+  upload, which is exactly why the key stays writable for the whole settle.
+- `SELF_CONSISTENCY` (`bb885ef`) — `supersede_record` was not crash-atomic, so a
+  crash left a bucket serving bytes contradicting its own published sha256,
+  permanently. The ordering was correct and stays; what was missing is that the
+  window left nothing behind saying it had been open, which a `.superseding`
+  intent marker now does.
+
+Two of those were found on **narrow** lanes (1–2 packages, 1 file, 40–80 ops),
+where they ran about 1 seed in 200,000–500,000. This lane's 12-filename corpus
+spreads the workload too thin to concentrate contention on a single name, and
+that corpus is load-bearing for the durability oracles — so when hunting the
+next one, add a narrow lane rather than widening this one.
 
 To reproduce a lane by hand:
 
@@ -581,11 +623,13 @@ the marker over an already-tombstoned filename is worse still: it starves
 So the simulator remembers instead. `SimStorage` records the sha256 of every
 body ever committed under a canonical `packages/<pkg>/<artifact>` key —
 insert-only, so a delete cannot erase it — and FREEZE_JUSTIFIED attests from
-acks ∪ every `_quarantine/` copy ∪ that history, all reduced to digests. It is
-not a loosening: the product cannot manufacture a digest it never wrote, and
-`--break freeze-unjustified` (a bare `.frozen` planted over a filename that only
-ever held one byte-set, single-bucket, where a byte conflict cannot occur at
-all) stays red. Measured over one identical partitioned range — 63,581 seeds
+acks ∪ every `_quarantine/` copy ∪ that history, all reduced to digests. The
+product cannot manufacture a digest it never wrote, and `--break
+freeze-unjustified` (a bare `.frozen` planted over a filename that only ever
+held one byte-set, single-bucket, where a byte conflict cannot occur at all)
+stays red. It **is** a loosening all the same, and a larger one than this
+paragraph used to claim — see *The history term counts succession as conflict*
+below, which measures it. Measured over one identical partitioned range — 63,581 seeds
 from 5100000000, the same profile the nightly lane runs: 8 failing seeds before,
 4 after, and the 4 that went are exactly the FREEZE_UNJUSTIFIED ones (the other
 4 are `CONSERVATION`, untouched by this and red the same way both times).
@@ -598,6 +642,74 @@ pinned as a gate in
 `ci.yml` — `--seed 9800020745` (both byte-sets erased) and `--seed 9800002480`
 (one erased), both `--nodes 2 --buckets 2 --packages 1 --files 1 --ops 16
 --fail-percent 0 --partition 100`.
+
+**The history term counts succession as conflict.** `Verdict::Freeze` fires only
+from two live records whose sidecars name different sha256 *at the same time* —
+coexistence under one immutable filename. The history term attests from
+something strictly weaker: every body ever committed under the canonical key,
+insert-only over the filename's entire lifetime. Those are different sets. A
+filename that held body A, was retired by an authorized delete, and later held
+body B carries two digests without anything ever having conflicted, and a
+`.frozen` marker over it is excused for free.
+
+It is reachable, and not marginally. Measured at `4eaa015` on the CI kill
+proof's own pinned flags (`--nodes 2 --buckets 1 --ops 80`), seeds 1–1000, one
+seed at a time: `--break freeze-unjustified` plants its bare fleet-wide marker
+on **934** seeds (the other 66 have no acked-deleted victim, so nothing is
+planted) and FREEZE_UNJUSTIFIED reds on only **334** of them. On the other
+**600 — 64% of every planted spurious freeze — the oracle examines the marker
+and stays silent.** Silence is unambiguous here: the reach meter counts
+`FREEZE_JUSTIFIED` once per frozen filename it attests, and the oracle has no
+exit between that counter and its violation, so *examined and silent* means
+`attested.len() >= 2` and nothing else. At `--buckets 1` `decide` never runs, no
+`Verdict::Freeze` is reachable, and `_quarantine/` is empty — so every one of
+those second digests came from succession under the key.
+
+The lifetime sweep is what pins the mechanism, 300 seeds per row on the same
+flags — excused share of *planted* markers:
+
+| `--ops` | 8 | 20 | 40 | 80 | 160 |
+|---|---|---|---|---|---|
+| planted markers excused | **0%** | 15% | 33% | 60% | **87%** |
+
+Strictly monotone in how long the filename lived, zero where there is no room
+for a second body, 87% at the op count the nightly lanes actually run. That is
+the signature of an accumulating history, not of a conflict: the longer a name
+survives, the more bodies have occupied its key in turn, and the oracle counts
+turns as conflicts. Note also that the break's victim is *by construction* an
+acked-deleted filename, so the delete separating the two incarnations is always
+there.
+
+A demotion is one instance of this class, not the class. A legitimate
+mirror→private supersede writes a second body under the canonical key, so a
+filename with a completed demotion carries two digests with no conflict behind
+them — but that is a partitioned-only path, and the measurement above reaches
+the same excuse at `--partition 0`, single-bucket, with no mirror fill and no
+demotion anywhere in the run.
+
+**What the currency should be: digests that coexisted, not digests that
+accreted.** The fix is to scope the recorded set to the filename's current
+*incarnation* — reset it when an authorized delete or tombstone retires the
+canonical key, so a body committed afterwards starts a new one and is never
+attested against a freeze of the previous. That keeps every case the history
+term was added for, because both of them live inside a single incarnation: a
+publisher that crashes after `store_artifact_verified` and before its `200`
+commits its body alongside the conflicting one, and a delete racing
+`freeze_side` between the marker and the `get_bytes` destroys bodies that were
+committed *before* it. What it stops attesting is exactly the succession case,
+which no `Verdict::Freeze` can be built from. Nothing here is a product defect —
+the freeze path is right and `.frozen` must keep naming a filename and never a
+hash — and nothing here weakens the zero-FREEZE_UNJUSTIFIED results above, which
+are real. What it weakens is the *power* of that zero over any long-lived
+filename with a prior delete, and the `--break freeze-unjustified` kill proof
+that is supposed to guard it. Triaged only; not implemented.
+
+While measuring it: the same 1000 seeds put this leg's per-seed red rate at
+**33.4%**, so its K (the fresh seeds needed to red with ≥99.8% confidence) is
+**16**, not the 3 recorded in the `--break` table below. CI draws 6 seeds, which
+reds ~91% of the time — the gate holds on today's pinned range and would be a
+coin flip on a shifted one. Re-measure that row against the table's own rules
+before trusting it.
 
 Determinism itself is verified, not assumed: recurring seeds (`--recheck-every`)
 run twice and must produce an identical storage-op trace hash *and* an identical
@@ -970,7 +1082,7 @@ table below are the accurate ones.
 | DURABILITY (never left split) | workload-reachable **only partitioned** — *observed* there, none since the crossed-body fixes | needs one filename acked with different bytes on two buckets, which only `--partition` produces; 0 in the 166,409 partitioned seeds measured at `783d423`, so treat it as workload-unreachable again until something reds it | `split` |
 | VISIBILITY | workload-reachable | ditto, for the listing | `visibility` |
 | CONSERVATION (acked bytes survive) | workload-reachable | ditto, fleet-wide | `conserve` |
-| CONSERVATION (a freeze loses neither body) | workload-reachable **only partitioned** — and *observed* there, still red today | a freeze needs a real byte conflict to fire at all; live at `783d423`, `--seed 9522193 --fail-percent 3` | `freeze-lossy` |
+| CONSERVATION (a freeze loses neither body) | workload-reachable **only partitioned** — *observed* there, green now | a freeze needs a real byte conflict to fire at all. Its last live repro, `--seed 9522193 --fail-percent 3`, was red at `783d423` and is green at `4eaa015`; so are 9539662, 9500054 and 9500926, each re-run one seed at a time on its own flags rather than inferred from a soak summary | `freeze-lossy` |
 | FREEZE_JUSTIFIED | workload-reachable **only partitioned** — and *observed* there; green now | ditto. It red on 4 of 63,581 partitioned seeds and every one was a correct freeze whose evidence a racing delete had erased (see *Attesting a freeze*); 0 of the same 63,581 — and 0 of 183,230 — once the attestation could see the bodies the buckets actually committed | `freeze-unjustified` |
 | ORIGIN_TERMINALITY (the `.origin` claim) | workload-reachable, never witnessed | needs a mirror claim to win over a private one on some bucket after the private ack | `origin-demoted` |
 | ORIGIN_TERMINALITY (the record under it) | workload-reachable, never witnessed | needs a live mirror sidecar left renderable under a private claim | `mirror-served` |

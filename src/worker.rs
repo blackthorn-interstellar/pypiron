@@ -2282,11 +2282,15 @@ pub struct GlobalNames {
     /// conditional writes (disk), where there are no peers to race.
     html_etag: Option<String>,
     /// Whether this cache has already *proved* `simple/index.html` renders
-    /// exactly `names`. The proof comes from storage — the durable stamp at
-    /// [`global_html_stamp_key`] — never from optimism: a node's belief that it
-    /// left the HTML current is only ever true of its own last write, and a
-    /// peer's write invalidates it silently. This flag is just a per-cache memo
-    /// so the proof costs two small reads per load rather than per delta.
+    /// exactly `names` — as of `html_etag`, and no longer than that. The proof
+    /// comes from storage (the durable stamp at [`global_html_stamp_key`]),
+    /// never from optimism: a node's belief that it left the HTML current is
+    /// only ever true of its own last write, and a peer's write invalidates it
+    /// silently. So the memo is scoped to the object it was proved against —
+    /// the no-op gate re-observes the HTML's ETag in the listing it already
+    /// makes, and any movement drops the flag. Without that scoping a CAS
+    /// winner never re-checked the pair, and a peer that crashed between its
+    /// two writes left this node serving an HTML the JSON did not back.
     html_current: bool,
     /// An HTML view exists but the canonical JSON does not — a crash landed
     /// between the two writes. The name set below was derived from the
@@ -2441,26 +2445,35 @@ async fn update_global_index_locked(
             // reapplies. Single-writer backends (disk) skip the probe — no
             // peers, and their listing/CAS etags live in different spaces.
             if storage.supports_leases() {
-                let key = format!("{SIMPLE_PREFIX}index.json");
-                let current = storage
-                    .list_page(&key, None, 1)
-                    .await?
-                    .into_iter()
-                    .find(|meta| meta.key == key)
-                    .map(|meta| meta.etag);
-                if current != cached.etag {
+                let (json_etag, html_etag) = global_index_etags(storage).await?;
+                if json_etag != cached.etag {
                     *guard = None;
                     continue;
+                }
+                // The same listing carries the HTML's ETag, and it has to be
+                // consulted: `html_current` is a claim about a fleet-shared
+                // object, so it stays true only while that object has not
+                // moved. A peer that publishes the HTML and dies before the
+                // canonical JSON moves exactly one of the two, which is
+                // precisely what the JSON check above cannot see — and a memo
+                // pinned by this node's own CAS win would never look again,
+                // making the drift permanent here until the tier-3 audit
+                // (vopr seeds 60000037578 / 61000075134, crash-only, one
+                // bucket). Re-pin the observed ETag and let the stamp below
+                // decide what the moved object now renders.
+                if html_etag != cached.html_etag {
+                    cached.html_etag = html_etag;
+                    cached.html_current = false;
                 }
             }
             // Currency of the *JSON* is not currency of the HTML: a crash
             // between the two writes leaves the HTML ahead, and returning here
             // would make that the final word — a drift nothing heals, since the
             // audit reaches this same gate. Prove currency from the durable
-            // stamp rather than assuming it: two metadata-sized reads, no body,
+            // stamp rather than assuming it: one metadata-sized read, no body,
             // so the check costs the same whether the index holds four names or
             // 780,000. Only an unproven pair pays the byte compare, and only
-            // once per cache load.
+            // once per observed HTML ETag.
             if !cached.html_current {
                 let mut packages: Vec<String> = cached.names.iter().cloned().collect();
                 packages.sort();
@@ -2771,6 +2784,32 @@ async fn load_global_names(storage: &dyn Storage) -> Result<GlobalNames> {
         html_current: false,
         stranded: false,
     })
+}
+
+/// The stored ETags of the global index pair — `(json, html)` — from ONE
+/// bounded listing.
+///
+/// Currency of the JSON is not currency of the HTML, and the drift that matters
+/// moves only one of them: a peer that publishes the HTML and dies before the
+/// canonical JSON. So the no-op gate has to see both — but not for a second op.
+/// The two keys share the `simple/index.` prefix (nothing else can: normalized
+/// package names never contain a dot) and are adjacent in key order, so asking
+/// for the pair stops the listing at exactly the object that asking for the JSON
+/// alone stopped at. `after` then starts it AT the pair instead of at the top of
+/// `simple/`, skipping every package that sorts before it — on a corpus-sized
+/// bucket that is most of the tree.
+async fn global_index_etags(storage: &dyn Storage) -> Result<(Option<String>, Option<String>)> {
+    let prefix = format!("{SIMPLE_PREFIX}index.");
+    let page = storage.list_page(&prefix, Some(&prefix), 2).await?;
+    let etag = |key: &str| {
+        page.iter()
+            .find(|meta| meta.key == key)
+            .map(|meta| meta.etag.clone())
+    };
+    Ok((
+        etag(&format!("{prefix}json")),
+        etag(&format!("{prefix}html")),
+    ))
 }
 
 /// The ETag of the stored global HTML, or `None` when it has never been written
@@ -4119,6 +4158,64 @@ mod tests {
             storage.get_count(),
             reads,
             "the reconcile is once per cache load; a steady-state no-op delta must not read the global HTML"
+        );
+    }
+
+    /// Crash residue on a *peer*, seen from the node that last won the CAS
+    /// (vopr seeds 60000037578 / 61000075134, `--rotate`, crash-only, ONE
+    /// bucket, no faults). `html_current` is a claim about a fleet-shared
+    /// object, so it can only be trusted while that object has not moved. A
+    /// peer that publishes the HTML and dies before the canonical JSON moves
+    /// the HTML's ETag and *not* the JSON's — the one drift the JSON currency
+    /// probe cannot see. Pinning the memo on a CAS win made that permanent on
+    /// this node: every later delta that dedups returned without looking, and
+    /// `simple/index.html` served a package `simple/index.json` did not, until
+    /// the tier-3 audit stumbled on it.
+    #[tokio::test]
+    async fn a_peers_stranded_global_html_is_seen_by_the_node_that_won_the_last_cas() {
+        let storage = Arc::new(InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+        let live = vec!["alpha".to_string()];
+
+        // This node publishes and wins: cache pinned, HTML proved current.
+        update_global_index(&state, storage.as_ref(), &live, &[])
+            .await
+            .unwrap();
+
+        // A peer publishes an HTML for a wider set, then dies before the
+        // canonical JSON. Only the HTML's ETag moves.
+        storage.insert(
+            &format!("{SIMPLE_PREFIX}index.html"),
+            pep503_global_html(&["alpha".to_string(), "beta".to_string()]).into_bytes(),
+        );
+
+        // A delta that dedups entirely against this node's cache.
+        update_global_index(&state, storage.as_ref(), &live, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            global_html(&storage).await,
+            pep503_global_html(&live),
+            "a CAS winner must re-check the pair once the HTML object it proved has moved"
+        );
+
+        // ...and having re-proved it, the steady state must stay free: no
+        // further body read, and the same single bounded LIST per no-op delta.
+        let reads = storage.get_count();
+        let lists = storage.list_count();
+        update_global_index(&state, storage.as_ref(), &live, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_count(),
+            reads,
+            "a steady-state no-op delta must not read the global HTML back"
+        );
+        assert_eq!(
+            storage.list_count(),
+            lists + 1,
+            "the currency probe must stay ONE bounded listing per no-op delta"
         );
     }
 

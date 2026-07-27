@@ -3654,6 +3654,9 @@ pub mod test_support {
         /// from the final map.
         writes: Mutex<Vec<String>>,
         gets: AtomicUsize,
+        /// Listings served. A currency probe's whole point is that it costs one
+        /// bounded listing and no body, so its cost is a property tests pin.
+        lists: AtomicUsize,
         fail_next_get: AtomicBool,
         /// One key whose reads fail until [`InMemStorage::heal_reads`]. The
         /// positional `fail_next_get` cannot express "this object is
@@ -3679,6 +3682,9 @@ pub mod test_support {
         }
         pub fn get_count(&self) -> usize {
             self.gets.load(Ordering::SeqCst)
+        }
+        pub fn list_count(&self) -> usize {
+            self.lists.load(Ordering::SeqCst)
         }
         pub fn fail_next_get(&self) {
             self.fail_next_get.store(true, Ordering::SeqCst);
@@ -3802,6 +3808,7 @@ pub mod test_support {
             Ok(())
         }
         async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
             let map = self.objects.lock().unwrap();
             let mut out: Vec<ObjectMeta> = map
                 .iter()

@@ -2,6 +2,20 @@
 //! heartbeat. Rebuilds are idempotent, so dual leadership for a few seconds
 //! merely duplicates work — this is a cost optimization, never a correctness
 //! requirement. No Raft, no fencing.
+//!
+//! Read "idempotent" precisely: a rebuild is idempotent against *unchanging*
+//! truth. Two rebuilds straddling a mutation are not — the one that listed
+//! first can land last and leave a stale view standing, since the per-package
+//! view PUT is unconditional (only the global index takes an `If-Match`). The
+//! periodic audit is the named backstop for exactly that (dev/DESIGN.md,
+//! "Split-brain is harmless"), which is what makes sloppiness affordable.
+//!
+//! This lease therefore does NOT serialize rebuilds, and nothing should be
+//! built on the assumption that it does. `is_leader()` is a point-in-time
+//! read with no fencing token, so a rebuild outliving the TTL runs beside its
+//! successor's; the leader's own audit task rebuilds concurrently with its
+//! tick; and `delete_record` rebuilds from any node's request handler,
+//! unleased. Serializing is what it is *for*, not what it *guarantees*.
 
 use std::sync::Arc;
 use std::time::Duration;

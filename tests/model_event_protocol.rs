@@ -53,21 +53,34 @@
 //!
 //! In `src/worker.rs` the tick is gated behind `is_leader` (the bucket lease),
 //! and the single-bucket package-view write is a plain list-then-write with NO
-//! compare-and-set on the view (only the *global* index uses `If-Match`). So in
-//! normal operation package rebuilds are serialized to one leader. The
-//! CI-checked models honor that: at most one worker rebuilds at a time (the
-//! second worker models failover — it takes over when the first crashes
-//! mid-tick). Under that serialization the protocol converges, and the
-//! worker-vs-delete-writer transient ("view briefly leads truth") is still
-//! reachable because writers are never lease-gated.
+//! compare-and-set on the view (only the *global* index uses `If-Match`). The
+//! CI-checked models model the *common* case that gate produces: at most one
+//! worker rebuilds at a time (the second worker models failover — it takes over
+//! when the first crashes mid-tick). Under that serialization the protocol
+//! converges, and the worker-vs-delete-writer transient ("view briefly leads
+//! truth") is still reachable because writers are never lease-gated.
 //!
-//! WITHOUT the lease — two workers rebuilding the same package with a staggered
-//! list/write — a stale in-flight rebuild can clobber a newer correct one and
-//! the view permanently disagrees with truth. That is the `sloppy leader`
-//! window the design leans on the periodic audit to heal; the audit is out of
-//! scope for this event-protocol model. The test
-//! `concurrent_rebuild_without_lease_diverges` reproduces and regression-guards
-//! that violation so the finding is documented, not lost.
+//! **The gate is not a serializer, and nothing here should be read as claiming
+//! it is.** `src/lease.rs` is a TTL + heartbeat with no fencing token by
+//! design; `is_leader()` is a point-in-time read that
+//! `rebuild_package_indexes` never revalidates, so a rebuild outliving the TTL
+//! runs beside its successor's. Two further rebuild paths take no lease at all:
+//! the leader's audit task, which `run_worker` spawns off the tick loop and
+//! never mutexes against the tick, and `delete_record`, which rebuilds the
+//! package view straight from any node's request handler. Concurrent rebuilds
+//! of one package are a production state, not a hypothetical.
+//!
+//! `allow_concurrent_rebuild` is therefore the configuration production RUNS,
+//! not one it forbids — it is the second CI-checked config precisely because
+//! the first cannot reach it. Two workers rebuilding the same package with a
+//! staggered list/write let a stale in-flight rebuild clobber a newer correct
+//! one, and the view permanently disagrees with truth. That is the `sloppy
+//! leader` window dev/DESIGN.md budgets for by name and leans on the periodic
+//! audit to heal; the audit is out of scope for this event-protocol model. The
+//! test `concurrent_rebuild_without_lease_diverges` reproduces and
+//! regression-guards that violation so the finding is documented, not lost —
+//! and it is the exhaustive coverage the VOPR's class-3 classifier arm rests
+//! on, since the VOPR's `tick_lock` cannot stage the interleaving.
 //!
 //! # Why quiescent-always, not stateright's `eventually`
 //!
@@ -876,13 +889,19 @@ fn model_event_protocol_deep() {
     checker.assert_properties();
 }
 
-/// Documents (and regression-guards) the finding: WITHOUT the leader lease
-/// serializing package rebuilds, two workers with a staggered list/write can
-/// leave a package view permanently disagreeing with truth — a resurrected,
-/// tombstoned file. The periodic audit heals this in production; the event
-/// protocol alone does not. We assert the violation EXISTS; if serialization is
-/// ever modeled here (or a view compare-and-set is added to the real rebuild),
-/// this test flags that the known gap changed.
+/// Documents (and regression-guards) the finding: with two rebuilds of one
+/// package in flight — which the sloppy lease permits, the leader's own audit
+/// task does unconditionally, and `delete_record` does from any node — a
+/// staggered list/write can leave a package view permanently disagreeing with
+/// truth: a resurrected, tombstoned file. The periodic audit heals this in
+/// production; the event protocol alone does not. We assert the violation
+/// EXISTS; if serialization is ever modeled here (or a view compare-and-set is
+/// added to the real rebuild), this test flags that the known gap changed.
+///
+/// This is the sole exhaustive coverage of the state the VOPR classifies as
+/// class 3 (CONCURRENT-RACE): `examples/vopr.rs` serializes every rebuild
+/// behind a fleet-wide `tick_lock`, so it cannot stage the interleaving and
+/// its `--break race` can only plant the history. See dev/TESTING.md.
 #[test]
 fn concurrent_rebuild_without_lease_diverges() {
     let model = EventModel {

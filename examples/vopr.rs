@@ -1280,19 +1280,19 @@ const REACH_VIOLATION_PREFIX: [&str; REACH_SLOTS] = [
 const EXPECTED_ZERO: [(usize, &str); 10] = [
     (
         R::PkgOrdering as usize,
-        "product-unreachable: no class-1 has ever been produced; `--break ordering` kills it",
+        "workload-unreachable: no rule forbids it; --partition drew one (seed 268); `--break ordering` kills it",
     ),
     (
         R::PkgPoisoned as usize,
-        "product-unreachable: the fast path converges every package view; `--break poison` kills it",
+        "workload-unreachable: this workload has not drawn one since 1067836; `--break poison` kills it",
     ),
     (
         R::PkgBlind as usize,
-        "product-unreachable: no repair TEST 1 declined has been seen; `--break blind` kills it",
+        "workload-unreachable: no repair TEST 1 declined has been drawn; `--break blind` kills it",
     ),
     (
         R::PkgRace as usize,
-        "harness-unreachable: tick_lock serializes rebuilds; `--break race` kills it (dev/TESTING.md)",
+        "harness-unreachable: tick_lock models a lease STRONGER than production ships; `--break race` kills it (dev/TESTING.md)",
     ),
     (
         R::PkgFallback as usize,
@@ -1300,19 +1300,19 @@ const EXPECTED_ZERO: [(usize, &str); 10] = [
     ),
     (
         R::GlobalOrdering as usize,
-        "product-unreachable: no class-1 has ever been produced; `--break globalindex` kills it",
+        "workload-unreachable: no rule forbids it; `--break globalindex` kills it",
     ),
     (
         R::GlobalPoisoned as usize,
-        "product-unreachable: no audit-repaired membership flip seen; `--break poison` kills it",
+        "workload-unreachable: drawn at c1b66df (seed 61000246528), closed by c9b2e32; `--break poison` kills it",
     ),
     (
         R::GlobalBlind as usize,
-        "product-unreachable: no flip TEST 1 declined has been seen; `--break blind` kills it",
+        "workload-unreachable: no flip TEST 1 declined has been drawn; `--break blind` kills it",
     ),
     (
         R::GlobalRace as usize,
-        "harness-unreachable: tick_lock serializes rebuilds; `--break race` kills it (dev/TESTING.md)",
+        "harness-unreachable: tick_lock models a lease STRONGER than production ships; `--break race` kills it (dev/TESTING.md)",
     ),
     (
         R::GlobalFallback as usize,
@@ -1851,6 +1851,20 @@ fn report_merge(explored: u64) {
 //     concurrent-rebuild divergence (tests/model_event_protocol.rs,
 //     `concurrent_rebuild_without_lease_diverges`). The audit is its
 //     designed backstop; reported as a statistic, never a violation.
+//
+//     This is the ONE outcome dev/DESIGN.md budgets for by name ("a brief
+//     dual-leader window costs at worst duplicate work plus an audit-healed
+//     view"), so the taxonomy needs the slot whether or not this harness
+//     draws it. Production has no fencing token: `is_leader()` is a
+//     point-in-time read, `rebuild_package_indexes` never revalidates it, and
+//     the per-package view PUT is `put_if_changed` — an unconditional write,
+//     unlike the global index's CAS. A rebuild that outlives the lease TTL
+//     therefore clobbers its successor's fresher view. Without this arm that
+//     clobber falls through to FALLBACK and fails the seed as class 2, which
+//     sends triage hunting a signal-loss bug in the marker protocol that is
+//     not there. Measured: with the harness's fleet-wide `tick_lock` removed
+//     from the leader audit (production spawns it off the tick loop), the arm
+//     reaches and reports on real product behavior — see dev/TESTING.md.
 // ---------------------------------------------------------------------------
 
 tokio::task_local! {
@@ -3573,6 +3587,15 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                 // partitioned node diverges only its writes, never its
                 // rebuilds — so one lease still serializes every tick, and the
                 // `PkgRace`/`GlobalRace` EXPECTED_ZERO excuses still hold.
+                //
+                // Note what that excuse does NOT say: production does not
+                // serialize rebuilds. This lock is strictly stronger than the
+                // sloppy lease (`src/lease.rs`: TTL + heartbeat, no fencing),
+                // and it also excludes the leader's own audit task, which
+                // `run_worker` spawns off the tick loop and never mutexes
+                // against it. That gap is why class 3 reads zero here and is
+                // still a real production state; dev/TESTING.md carries the
+                // measurement.
                 let lease = fleet.tick_lock[0].clone();
                 fleet.spawn_on(node, op_tick(state, lease));
             }

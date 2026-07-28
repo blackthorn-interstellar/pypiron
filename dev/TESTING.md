@@ -1413,22 +1413,30 @@ The healthy case first, then the three zeros:
 - **harness-unreachable** — the *simulator* cannot stage the state, though
   production can. No workload knob fixes it; something outside this harness has
   to cover the claim. Class 3 is the example, and the model checker is what
-  covers it.
+  covers it. The claim has a specific shape — "*the harness models something
+  stronger than the product ships*" — and it must name what: for class 3, the
+  fleet-wide `tick_lock` versus a lease with no fencing token.
 - **product-unreachable** — a *product rule* forbids the state, so it cannot
   occur in production either. The guard is a watch on a rule that could one day
   be relaxed. This is the only one of the three that licenses "cannot happen",
   and it needs a named rule, not a run of zeros.
 
+The two zeros are not interchangeable, and confusing them in the *other*
+direction is how a live guard gets deleted. A harness-unreachable arm covers a
+state the product can enter; deleting it deletes the diagnosis, not the state.
+A product-unreachable arm covers a state a named rule forbids; deleting it is
+safe exactly until the rule moves. Only the second is ever a candidate for
+removal, and only alongside the rule.
+
 The distinction is load-bearing in both directions. `TOMBSTONE_MONOTONICITY` is
 product-unreachable and names its rule (`publish_record`'s tombstone fence), so
 its zero is an argument. The classifier's class-1/2a/2b arms are **workload-**
 unreachable — no rule forbids them, and one of them (class 1, seed 268) was
-briefly workload-*reachable* under `--partition` before `df3db2d` closed it. The
-reach meter's `EXPECTED_ZERO` strings in `examples/vopr.rs` currently label those
-three arms `product-unreachable` while justifying them with "no class-1 has ever
-been produced" — which is an observation, not a rule, and therefore the
-workload-unreachable case. Those strings should be corrected; the statuses in the
-table below are the accurate ones.
+briefly workload-*reachable* under `--partition` before `df3db2d` closed it.
+Those arms' `EXPECTED_ZERO` strings in `examples/vopr.rs` used to read
+`product-unreachable` while justifying themselves with "no class-1 has ever been
+produced" — an observation, not a rule. They now read `workload-unreachable`,
+matching the table below.
 
 | oracle | status | why | kill proof |
 |---|---|---|---|
@@ -1451,24 +1459,84 @@ table below are the accurate ones.
 | classifier/**global** FALLBACK | **workload-unreachable** — but *witnessed*, and recently | `--seed 60000037578 --rotate` reds `[class 2] … unexplained global-index drift for vopr-delta — conservatively premature-consumption` against the tree at `c1b66df`; so does `--seed 66000074673 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100`. Both are the non-atomic global-index pair (`AUDIT_REPAIRED_VIEWS`), and both are green at `8e5916f` once `c9b2e32` landed. Verified one seed at a time on both trees, not inferred | `fallback` |
 | classifier/**global** TEST 2a poisoned | **workload-unreachable** — but *witnessed* | `--seed 61000246528 --rotate --partition 100` reds `[class 2] … op 87 rebuilt vopr-gamma from truth@598 and wrote the global index@607 claiming it present, yet the audit had to flip that membership — update_global_index consumed the signal without applying it` at `c1b66df`; green at `8e5916f`. That is `R::GlobalPoisoned`, the 2a arm of `analyze_global` | `poison` |
 | classifier/pkg TEST 2a / 2b / FALLBACK, classifier/global TEST 2b | **workload-unreachable**, never witnessed | each needs the tier-3 audit to have repaired a view, and the three witnesses above are all the *global* analysis — a membership flip, not a per-package render. No product schedule has yet driven the per-package arms, nor global 2b. Class 2 on the per-package path *has* been witnessed historically (seed 1067836, since fixed) | `poison`, `blind`, `fallback` |
-| classifier TEST 3 (both analyses) | **harness-unreachable** | the simulator's `tick_lock` serializes every rebuild to stand in for the bucket lease, so two never overlap | `race` (planted history) |
+| classifier TEST 3 (both analyses) | **harness-unreachable** — and *measured* to be exactly that | the simulator's `tick_lock` serializes every rebuild, which is **stronger than the lease production ships**; remove it from the leader audit and the arm reaches on real product behavior (see the next section) | `race` (planted history) |
 
 `resurrect` proves the *oracle* is sound even though the *product* cannot reach
 the state, which is the honest status of that guard: mirror filenames are
 re-fillable by design, so the day a legal resurrection path lands it is already
 watched. An unreachable-but-sound guard is legitimate; an unproven one is not.
 
-Class 3 is unreachable on a **much weaker claim**, and this is the distinction
-the table exists to keep. Production's lease is sloppy on purpose — `src/lease.rs`
-is a TTL + heartbeat with no fencing, because rebuilds are idempotent — so dual
-leadership, and with it the race, *is* reachable there; it is covered
-exhaustively by `concurrent_rebuild_without_lease_diverges` in
-`tests/model_event_protocol.rs`, not by this simulator. Removing `tick_lock`
-still produced zero repairs over 26k wide seeds, and so did truncating the heal
-phase's drain budget until two thirds of seeds failed on other oracles. `--break
-race` closes the *soundness* question — the arm evaluates and prints its finding,
-on both analyses — and leaves the *reachability* question exactly where it was:
-this harness cannot stage the race, and the model checker is what covers it.
+##### Class 3 is harness-unreachable, not dead — the measurement
+
+Class 3 is unreachable on a **much weaker claim** than `resurrect`'s, and this
+is the distinction the table exists to keep. It has been proposed twice that a
+repair arm which never fires under the production lease, whose kill proof plants
+a fabricated history, is dead code wearing a test. **The premise is false: the
+production lease does not serialize rebuilds.** Three facts, all in the source:
+
+- `src/lease.rs` is a TTL + heartbeat with **no fencing token**, by design and
+  in its own module doc. `is_leader()` is a point-in-time read;
+  `rebuild_package_indexes` never revalidates it and the view PUT carries no
+  term. A rebuild that outlives the TTL runs beside its successor's.
+- The **leader's own audit** is a second concurrent rebuilder on one node:
+  `run_worker` spawns `audit(...)` on a task and runs `tick(...)` inline in the
+  same loop iteration, with nothing mutexing the two. No lease, sloppy or
+  otherwise, has any bearing on this one.
+- `delete_record` (`src/publish.rs`) calls `rebuild_package_excluding` straight
+  from **any node's request handler**, ungated.
+
+And the per-package view write is `put_if_changed` — an unconditional PUT. Only
+the *global* index takes an `If-Match`, so a losing per-package writer clobbers
+rather than losing. dev/DESIGN.md budgets for the result by name: "a brief
+dual-leader window costs at worst duplicate work plus an audit-healed view."
+Class 3 *is* that audit-healed view. Delete the arm and the clobber falls
+through to FALLBACK, failing the seed as class 2 PREMATURE-CONSUMPTION — a
+misdiagnosis that sends triage hunting a signal-loss bug in the marker protocol
+that is not there.
+
+The reachability question was then measured, one process, same seed range,
+`--rotate --require-reach --start-seed 770000000`:
+
+| harness config | seeds | repairs (ordering / premature / **race**) | failing seeds |
+|---|---|---|---|
+| baseline (this tree) | 16,937 | 0 / 0 / **0** | 0 |
+| leader audit spawned per tick op, **outside** `tick_lock` | 20,838 | 0 / 59 / **1** | 57 |
+| leader audit `join!`ed with the tick **inside** `tick_lock` | 29,770 | 0 / 27 / **0** | 27 |
+
+Row 2 is the honest reach: `classifier/global TEST 3 race` executed 107 times on
+12 of 20,838 seeds and produced a real class-3 finding from product behavior,
+with nothing planted. Row 3 isolates *why* — co-locating both rebuilds under one
+lease holder does **not** produce the class-3 shape, so what the arm is really
+about is dual leadership, which is precisely what a fencing-token-free lease
+permits and what `concurrent_rebuild_without_lease_diverges` covers
+exhaustively. Row 1 is the control: the same seeds, unmodified, produce zero
+repairs of any class, so rows 2 and 3 are attributable to the added concurrency
+and not to the seed range. Earlier notes that "removing `tick_lock` produced zero
+repairs over 26k wide seeds" removed the wrong lock: `op_tick`'s lock does not
+gate the audit, which is the rebuilder production never serializes.
+
+**Is the row-2 change worth landing? Not as it stands, and not in this change.**
+It costs 57 failing seeds per ~21k, it adds a storm-phase op that shifts every
+pinned seed's schedule, and 27 of those failures survive into row 3 — a
+configuration production runs *unconditionally* on every leader. Those 27 are
+class-2 global-index membership repairs, not class-3, which makes them a
+candidate **product** defect rather than a harness artifact and a separate
+investigation with its own seed census. Reproduce with `--seed 770000370
+--rotate` against a tree whose `op_tick` runs `tokio::join!(tick, audit)` inside
+the lease. Landing the harness change before that is understood would turn the
+nightly lane red for a reason nobody has finished diagnosing.
+
+So class 3 **stays**, and stays honestly labelled: `--break race` closes the
+*soundness* question — the arm evaluates and prints its finding, on both
+analyses — and the model checker closes the *reachability* question. Its only
+exercise in this simulator is a synthetic history, and that is acceptable for
+the same reason it is acceptable for `ordering`, `globalindex`, `poison` and
+`blind`, which plant too: a planted history is a **mutation test of the
+classifier's predicates**, and the classifier reads history, not storage,
+precisely because a concurrent-rebuild clobber leaves no storage residue — the
+loser's bytes are gone by definition. An argument that the plant disqualifies
+class 3 disqualifies four of the five arms with it. Only `fallback` plants
+nothing, and only because its subject is the absence of an explanation.
 
 **Two oracles cannot red alone, by construction.** Worth knowing before anyone
 reads a lone `CONSERVATION:` or `VISIBILITY:` line as an independent signal:
@@ -1637,11 +1705,11 @@ each is a claim someone has to defend here:
 |---|---|---|
 | CONVERGENCE, ACK_TOTALITY | need more than one bucket; excused automatically, and only, when every profile in the sample was single-bucket | any multi-bucket profile |
 | MERGE_DIVERGENCE, FREEZE_JUSTIFIED | need two buckets that disagree about one filename's bytes, which only a partitioned fleet produces; excused automatically, and only, when no seed in the sample drew a split plan | any `--partition` run |
-| classifier/pkg TEST 1 | **workload**-unreachable, not product-unreachable: `--partition` reached it once (seed 268, a truth mutation no breadcrumb covered), `df3db2d` closed it, and 0 audit repairs of any class appear in the 489,901 seeds measured at `783d423`. No rule forbids the next one. The excuse string in `examples/vopr.rs` still says `product-unreachable`; that word is wrong and should be `workload-unreachable` | `--break ordering`, `--break globalindex` |
+| classifier/pkg TEST 1 | **workload**-unreachable, not product-unreachable: `--partition` reached it once (seed 268, a truth mutation no breadcrumb covered), `df3db2d` closed it, and 0 audit repairs of any class appear in the 489,901 seeds measured at `783d423`. No rule forbids the next one | `--break ordering`, `--break globalindex` |
 | classifier/global TEST 1 | same, on global membership | `--break globalindex` |
-| classifier/{pkg,global} TEST 3 | *harness*-unreachable: `tick_lock` serializes rebuilds, so two never overlap (see the reachability table above). Still true under `--partition`: a partitioned node diverges only its **writes**, never its rebuilds, so every tick still takes the one bucket-0 lease | `--break race` |
+| classifier/{pkg,global} TEST 3 | *harness*-unreachable: `tick_lock` serializes rebuilds, so two never overlap — a lock **stronger than the lease production ships**, and one that also excludes the leader's own audit task (see the reachability section above, which measures the arm reaching once that gap is closed). Still true under `--partition`: a partitioned node diverges only its **writes**, never its rebuilds, so every tick still takes the one bucket-0 lease | `--break race` |
 | classifier/pkg TEST 2a | needs an audit repair whose final writer had listed truth past every mutation | `--break poison` |
-| classifier/global TEST 2a | **workload**-unreachable, and it has been *reached*: `--seed 61000246528 --rotate --partition 100` drove it at `c1b66df` off the non-atomic global-index pair; `c9b2e32` closed that and it reads zero again at `8e5916f`. The excuse string in `examples/vopr.rs` says `product-unreachable: no audit-repaired membership flip seen` — both halves are now false and the row should say `workload-unreachable` | `--break poison` |
+| classifier/global TEST 2a | **workload**-unreachable, and it has been *reached*: `--seed 61000246528 --rotate --partition 100` drove it at `c1b66df` off the non-atomic global-index pair; `c9b2e32` closed that and it reads zero again at `8e5916f` | `--break poison` |
 | classifier/{pkg,global} TEST 2b | needs an audit repair TEST 1 declined — a covered mutation whose breadcrumbs were all consumed blind | `--break blind` |
 | classifier/pkg FALLBACK | reached only by drift no test explains — which would itself be a classifier bug | `--break fallback` |
 | classifier/global FALLBACK | same in principle, but *reached twice* at `c1b66df` (seeds 60000037578, 66000074673) by the same non-atomic global-index pair, and zero again at `8e5916f`. Its excuse string carries no unreachability claim, so nothing there needs correcting — but do not read its zero as one | `--break fallback` |

@@ -595,7 +595,11 @@ pub async fn run_worker_until(
     // pass over a large corpus takes minutes of storage round-trips, and
     // running it inline starved dirty-marker processing for its whole
     // duration. Concurrent audit + tick rebuilds of the same package are
-    // safe — rebuilds are idempotent.
+    // safe — rebuilds are idempotent, and where they straddle a mutation and
+    // the staler one lands last, the next audit repairs the view it left
+    // (dev/DESIGN.md, "Split-brain is harmless"; the VOPR classifies that
+    // outcome as class 3). Note that no lease separates these two: this
+    // concurrency exists on a single, undisputed leader.
     let mut last_audit: Option<Instant> = if state.audit_on_boot {
         None
     } else {

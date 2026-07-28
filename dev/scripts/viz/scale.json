@@ -7,7 +7,11 @@
     "build.py refuses to emit a number without one, and refuses two sources it is",
     "never honest to quote outward: `make dr-drill` (sub-second at N=10 —",
     "dev/TESTING.md:149-153) and `make perf` (the Python client harness is the",
-    "bottleneck — dev/TESTING.md:1336-1339).",
+    "bottleneck — dev/TESTING.md:2017).",
+    "",
+    "Every `source` anchor here is `path:line` and was re-read at the cited line.",
+    "Anchors rot on the next refactor of the file they point into: re-derive them,",
+    "do not carry them forward.",
     "",
     "`live: true` rows are re-measured on the building machine at build time and are",
     "labelled as such by the player; they are never merged with the committed",
@@ -20,39 +24,39 @@
   "stats": [
     {
       "headline": true,
-      "value": 466908487,
+      "value": 500651992,
       "label": "storage-op interleavings executed with zero invariant violations — aligned lane",
-      "source": "dev/TESTING.md:420-423 · measured at commit 1e80be3. Aligned lane only: the partitioned lane is NOT green — the same profile at --partition 100 reds 2 of 65,473 seeds (0.003%) after the last fix and runs nightly non-blocking (dev/TESTING.md:447)"
+      "source": "dev/TESTING.md:553 · a 900-second lane measured at commit 8e5916f. Aligned lane only (`--rotate --require-reach`, the one row in that table without --partition 100). The three partitioned lanes beside it also read zero failing, but the narrow one is starved by construction and its seeds must never be pooled with the rest (dev/TESTING.md:556-563)"
     },
     {
-      "value": 250000,
+      "value": 289934,
       "label": "seeded fault schedules in that one run",
-      "source": "dev/TESTING.md:420-423 · aligned lane, commit 1e80be3"
+      "source": "dev/TESTING.md:553 · aligned lane, commit 8e5916f"
     },
     {
-      "value": 2293880,
+      "value": 1510651,
       "label": "acked uploads verified byte-for-byte in that run",
-      "source": "dev/TESTING.md:420-423 · aligned lane, commit 1e80be3"
+      "source": "dev/TESTING.md:553 · aligned lane, commit 8e5916f"
     },
     {
       "value": 1497544,
       "label": "protocol states checked exhaustively on every merge",
-      "source": "tests/model_event_protocol.rs:899 CI_STATES · hand-recorded from the `[event_protocol] unique states` line `model_event_protocol` prints (:818-822); the state count is printed, never asserted"
+      "source": "tests/model_event_protocol.rs:952 CI_STATES · hand-recorded from the `[event_protocol] unique states` line `model_event_protocol` prints (:866); the state count is printed, never asserted"
     },
     {
       "value": 3354376,
       "label": "protocol states checked exhaustively, nightly",
-      "source": "tests/model_event_protocol.rs:901 CI_STATES_NIGHTLY · hand-recorded the same way from the nightly `model_event_protocol_deep` job (:837-841); printed, never asserted"
+      "source": "tests/model_event_protocol.rs:954 CI_STATES_NIGHTLY · hand-recorded the same way from the nightly `model_event_protocol_deep` job (:876); printed, never asserted"
     },
     {
-      "value": "22 / 22",
+      "value": "23 / 23",
       "label": "deliberate defects, each red for the right reason",
-      "source": ".github/workflows/ci.yml:182-229 · 22 `check` legs in the “Oracle kill proofs (--break)” step, on every merge"
+      "source": ".github/workflows/ci.yml:305-360 · 23 `check` legs in the “Oracle kill proofs (--break)” step (:269), on every merge"
     },
     {
       "value": 23,
-      "label": "oracle and classifier slots · 22 with a proven --break kill. The 23rd, MERGE_DIVERGENCE, is a coverage statistic and not a gate: it owns no violation string, so nothing can red it and no mutation can kill it",
-      "source": "examples/vopr.rs:890 REACH_SLOTS (reach panel printed on every run) for the 23; examples/vopr.rs:232 `const BREAKS: [...; 22]` and the 22 `check` legs at .github/workflows/ci.yml:182-229 for the 22. The empty slot is examples/vopr.rs:981 REACH_VIOLATION_PREFIX index 19"
+      "label": "oracle and classifier slots · 22 with a proven --break kill. The 23rd, MERGE_DIVERGENCE, is a coverage statistic and not a gate: it owns no violation string, so nothing can red it and no mutation can kill it. The 23 legs cover 22 slots because STALENESS has two arms — `wedge` (never agrees) and `slow-repair` (agrees, too late)",
+      "source": "examples/vopr.rs:1179 REACH_SLOTS (reach panel printed on every run) for the 23 slots; examples/vopr.rs:245 `const BREAKS: [...; 23]` and the 23 `check` legs at .github/workflows/ci.yml:305-360 for the 23 legs. The slot no break can kill is MERGE_DIVERGENCE, index 19 of examples/vopr.rs:1273 REACH_VIOLATION_PREFIX, where it is the empty string; the ten classifier slots are empty there too but are killable through the `AUDIT_*` strings their oracle pushes (:1268)"
     },
     {
       "value": "1-2 billion",
@@ -65,27 +69,27 @@
     {
       "label": "DURABILITY exempts a `.frozen` filename — 0 times in 20,000 aligned seeds",
       "value": 132586,
-      "source": "dev/TESTING.md:396 · 130,331 seeds at --partition 100"
+      "source": "dev/TESTING.md:520 · 130,331 seeds at --partition 100"
     },
     {
       "label": "CONSERVATION finds an acked body only in a `_quarantine/` copy — 0 aligned",
       "value": 99630,
-      "source": "dev/TESTING.md:400 · 130,331 seeds at --partition 100"
+      "source": "dev/TESTING.md:524 · 130,331 seeds at --partition 100"
     },
     {
       "label": "DURABILITY sees bytes no ack carried — 0 aligned",
       "value": 14039,
-      "source": "dev/TESTING.md:401 · 130,331 seeds at --partition 100"
+      "source": "dev/TESTING.md:525 · 130,331 seeds at --partition 100"
     },
     {
       "label": "…and the `_quarantine/` preservation clause excuses it — 0 aligned",
       "value": 13150,
-      "source": "dev/TESTING.md:402 · 130,331 seeds at --partition 100"
+      "source": "dev/TESTING.md:526 · 130,331 seeds at --partition 100"
     },
     {
       "label": "VISIBILITY exempts what the renderer omits — 0 aligned",
       "value": 571,
-      "source": "dev/TESTING.md:398 · 130,331 seeds at --partition 100"
+      "source": "dev/TESTING.md:522 · 130,331 seeds at --partition 100"
     }
   ]
 }

@@ -9,17 +9,28 @@ one self-contained file per scenario, plus an index that links them.
 
 Two gates, and they are the reason this script exists rather than a shell loop:
 
-  * The staleness gate. Every claim a narration makes out loud is pinned in
-    scenarios.json — the exit code, the violation text, the storage-op count,
-    the objects left at quiescence, the node and edge counts of a state graph —
-    and a scenario that stops reproducing FAILS THE BUILD. A page that quietly
-    goes green is exactly the stale-evidence failure commit 1e80be3 fixed once.
-    A seed alone means nothing, so each one is stored with the commit that
+  * The staleness gate. Every STRUCTURAL claim a narration makes out loud is
+    pinned in scenarios.json — the exit code, which oracle fired and with what
+    text, which oracles held and which never executed, the ack split, the
+    objects left at quiescence, the node and edge counts of a state graph — and
+    a scenario that stops reproducing FAILS THE BUILD. A page that quietly goes
+    green is exactly the stale-evidence failure commit 1e80be3 fixed once. A
+    seed alone means nothing, so each one is stored with the commit that
     verified it and the flags it needs.
+
+    What it deliberately does NOT pin: storage-op and trace-event totals. They
+    move by a handful on any product commit that touches the replication path,
+    nobody's reading of a page changes when 1,166 becomes 1,165, and pinning
+    them meant every such commit reddened this target for a reason that was not
+    a finding. They are printed as an observation below and rendered on the page
+    live from the trace, so they are always true and never rot.
 
   * The number-source gate. Every figure in scale.json must name the file and
     line it was measured at. No source, no number; and two sources are refused
-    outright because dev/TESTING.md says never to quote them outward.
+    outright because dev/TESTING.md says never to quote them outward. The cited
+    line is opened, not taken on trust: it must exist, and a numeric figure must
+    appear at it. A citation that has quietly drifted onto some other line is
+    worse than no citation, because it reads as checked.
 
 It also runs the inertness gate: each traced profile runs twice, with and
 without `--trace-jsonl`, and the recorder must not perturb the simulation by one
@@ -47,8 +58,11 @@ PLAYER = HERE / "player.html"
 SCENARIOS = HERE / "scenarios.json"
 SCALE = HERE / "scale.json"
 
-# dev/TESTING.md:149-153 and :1336-1339 both say never to quote these outward.
+# dev/TESTING.md:149-153 and :2017 both say never to quote these outward.
 SOURCE_DENYLIST = ("dr-drill", "make perf")
+
+# `path:line`, `path:lo-hi`, or a bare `:line` continuing the last-named file.
+ANCHOR = re.compile(r"([\w./-]+\.(?:md|rs|yml|py|json))?:(\d+)(?:-(\d+))?")
 
 VOPR = ["cargo", "run", "--release", "--example", "vopr", "--"]
 # Two things legitimately differ between two runs of the same seed: the wall
@@ -242,32 +256,58 @@ def build_trace(
     if summary.get("truncated"):
         raise Problem("the recorder hit its event cap and truncated the trace")
 
-    want_violation = sc.get("expect_violation")
+    # A run may red on more than one violation (the wedge reds twice, on both
+    # arms of STALENESS), so this is a SET: every violation the run printed has
+    # to match one pinned substring, and every pinned substring has to appear.
+    # A run that grew a second violation nobody wrote down fails, which is the
+    # whole point.
+    want = sc.get("expect_violation")
+    wants = [want] if isinstance(want, str) else list(want or [])
     lines = [r["text"] for r in rows if r.get("t") == "violation"]
-    if want_violation is None:
+    if want is None:
         expect("violations", summary["violations"], 0, sc)
         if lines:
             raise Problem(f"expected a clean run, got: {lines[0]}")
     else:
         if not lines:
             raise Problem(
-                f"expected a violation containing {want_violation!r} and got none —\n"
+                f"expected a violation containing {wants!r} and got none —\n"
                 f"    if this finding was adjudicated away, mark the scenario retired"
             )
         for text in lines:
-            if want_violation not in text:
-                raise Problem(f"violation does not contain {want_violation!r}: {text}")
+            if not any(w in text for w in wants):
+                raise Problem(f"violation matches nothing this scenario pins: {text}")
+        for w in wants:
+            if not any(w in text for text in lines):
+                raise Problem(f"no violation contains {w!r}; the run printed: {lines}")
 
-    if "expect_trace_events" in sc:
-        # NOT the storage-op count: `trace_events` is the TraceHasher's record
-        # count, which is the admitted ops PLUS one tuple per CAS outcome. It is
-        # pinned because it is what the determinism hash covers; the number a
-        # narration means by "storage ops" is `expect_event_counts.op`.
-        expect(
-            "summary.trace_events (ops + CAS records)",
-            summary["trace_events"],
-            sc["expect_trace_events"],
-            sc,
+    # A claim the recording cannot carry, because the producer prints it and does
+    # not record it: `--shrink` reports its result to the terminal. Pinned as a
+    # substring of the run's own output so the page cannot outlive it either.
+    for needle in sc.get("expect_log") or []:
+        if needle not in log:
+            raise Problem(
+                f"the run no longer prints {needle!r}\n"
+                f"    pinned at commit {sc.get('verified_at')}, built at {git_commit()}\n"
+                f"    re-measure the scenario and update scenarios.json deliberately"
+            )
+
+    # Incidental totals are an observation, never a pin: see the module docstring.
+    # The guard is here so the next hand that reaches for a convenient integer
+    # has to read that paragraph first.
+    if "expect_trace_events" in sc or "op" in (sc.get("expect_event_counts") or {}):
+        raise Problem(
+            "storage-op and trace-event totals are deliberately not pinned — they move on "
+            "any replication-path commit and the page renders them live from the trace. "
+            "Pin the structural fact the narration actually leans on instead."
+        )
+    # The region producer records a real binary over HTTP: no gated storage ops,
+    # no determinism hash, nothing to observe here.
+    ops, hashed = sum(1 for r in rows if r.get("t") == "op"), summary.get("trace_events")
+    if isinstance(hashed, int):
+        print(
+            f"  observed {sc['id']:<24} {ops:>6,} storage ops, "
+            f"{hashed:>6,} hashed trace events (not pinned)"
         )
     for kind, n in (sc.get("expect_event_counts") or {}).items():
         expect(f"`{kind}` events", sum(1 for r in rows if r.get("t") == kind), n, sc)
@@ -364,6 +404,41 @@ def measure_live(secs: int, commit: str) -> list[dict[str, Any]]:
     ]
 
 
+def check_anchors(group: str, entry: dict[str, Any]) -> None:
+    """A source that names a line must still be right about it.
+
+    Anchors rot the moment someone refactors the file they point into, and a
+    figure whose citation has drifted is worse than one with no citation: it
+    reads as checked. So every `path:line` must be in range, and a numeric
+    figure must literally appear at the first line it cites."""
+    label = entry.get("label")
+    last: Path | None = None
+    first: tuple[Path, int, int] | None = None
+    for name, lo, hi in ANCHOR.findall(entry["source"]):
+        path = ROOT / name if name else last
+        if path is None:
+            raise Problem(f"{group}: {label!r} cites :{lo} before naming a file")
+        if not path.is_file():
+            raise Problem(f"{group}: {label!r} cites {name}, which does not exist")
+        last = path
+        span = f"{path.name}:{lo}" + (f"-{hi}" if hi else "")
+        count = len(path.read_text().splitlines())
+        if int(hi or lo) > count:
+            raise Problem(f"{group}: {label!r} cites {span}, past the file's {count} lines")
+        first = first or (path, int(lo), int(hi or lo))
+
+    value = entry["value"]
+    if first is None or not isinstance(value, int):
+        return
+    path, lo_i, hi_i = first
+    window = "\n".join(path.read_text().splitlines()[lo_i - 1 : hi_i])
+    if not any(form in window for form in (f"{value:,}", f"{value:_}", str(value))):
+        raise Problem(
+            f"{group}: {label!r} publishes {value:,}, which is not at "
+            f"{path.name}:{lo_i} — re-derive the anchor, don't carry it forward"
+        )
+
+
 def build_scale(sc: dict[str, Any], built: dict[str, Any], live_secs: int) -> dict[str, Any]:
     payload = json.loads(SCALE.read_text())
     payload.pop("_note", None)
@@ -385,6 +460,7 @@ def build_scale(sc: dict[str, Any], built: dict[str, Any], live_secs: int) -> di
                         f"{group}: {entry.get('label')!r} cites {banned!r}, which "
                         f"dev/TESTING.md says never to quote outward"
                     )
+            check_anchors(group, entry)
 
     loop = built.get(sc.get("loop_trace"))
     if loop:

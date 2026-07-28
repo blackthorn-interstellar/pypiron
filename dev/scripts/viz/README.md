@@ -22,7 +22,8 @@ finding to adjudicate — not a broken build.
 |---|---|---|
 | `converge`, `ladder`, `dead-code-*`, `all-oracles` | `examples/vopr.rs --trace-jsonl` | the deterministic simulator: every storage op, every injected failure, every crash, every clock jump, and the bucket contents at each boundary |
 | `determinism` | same, under `--recheck-every 1` | one seed executed twice, compared op-for-op and world-for-world |
-| `catch-it`, `wedge` | same, under `--break` | one deliberate defect and the one oracle that catches it |
+| `catch-it`, `wedge`, `too-slow` | same, under `--break` | one deliberate defect and the oracle that catches it. `wedge` and `too-slow` are the two arms of STALENESS: a fleet that never agrees, and one that agrees correctly and ninety simulated seconds late |
+| `shrink` | same, under `--break attest --shrink` | the smallest world that still fails the same way, plus the proof it is a fixpoint |
 | `model-conflict`, `model-events` | `tests/model_*.rs` under `PYPIRON_VIZ_GRAPH` | the exhaustive state spaces stateright checks, as a layered graph with the real merge `Verdict` on each edge |
 | `region-*` | `tests/test_viz_region_trace.py` under `PYPIRON_VIZ_OUT` | the real binary against MinIO behind a fault proxy: region read failover, sampled from `/metrics` and `/ready` on a fixed tick |
 | `scale` | `dev/scripts/viz/scale.json` | the numbers, each with the file and line it was measured at |
@@ -78,8 +79,9 @@ present and pins it against the scenario's `expect_exit`.
 
 `summary.trace_events` is likewise **not** the storage-op count: it is the
 determinism hasher's record count, which is the admitted ops plus one tuple per
-CAS outcome. Count `op` events for storage ops (`expect_event_counts.op`); the
-two differ by a handful on any run with contended writes.
+CAS outcome. Count `op` events for storage ops; the two differ by a handful on
+any run with contended writes, and the player's chip row shows both, labelled,
+straight off the trace. Neither is pinned — see the gates below.
 
 **Bucket state comes from `world` events and nothing else.** The normative fold:
 
@@ -118,11 +120,14 @@ drag-dropped file.
 
 They are why this is a Python driver and not a shell loop.
 
-- **Staleness.** Every number a narration says out loud is pinned in
+- **Staleness.** Every claim a narration makes out loud is pinned in
   `scenarios.json` and re-checked on every build: the exit code, the violation
-  text, the storage-op count, the ack split, the objects left at quiescence, a
-  named oracle's rendered verdict (`expect_oracles`), the node and edge counts
-  of a graph. A number the narration says and the pack does
+  text (a list when a run reds twice, and then every line must match a pin and
+  every pin must be matched), which oracles held / were violated / never
+  executed (`expect_oracles`), the ack split, the objects left at quiescence, the
+  node and edge counts of a graph, and — for `--shrink`, whose answer the
+  recording cannot carry — a substring of the run's own output (`expect_log`).
+  A claim the narration makes and the pack does
   not pin is the bug — that is how "22 client-visible acks" survived next to a
   verdict pill reading "10 acked", when the run answered 22 requests, accepted
   12 of them, and left 10 distinct filenames acked in the ledger. Every one of
@@ -131,6 +136,17 @@ They are why this is a Python driver and not a shell loop.
   that quietly goes green is the stale-evidence failure commit `1e80be3` already
   fixed once. Seeds are not stable across product commits, so every one is
   stored as `(commit, seed, flags)`.
+- **What the gate deliberately does not defend.** Storage-op and trace-event
+  totals. They move by a handful on any commit that touches the replication
+  path, no reader's conclusion changes when 1,166 becomes 1,165, and pinning
+  them meant every such commit reddened `make viz` for something that was never
+  a finding — noise that trains you to ignore a red. `build.py` refuses a
+  scenario that tries to pin them (`expect_trace_events`, or `op` in
+  `expect_event_counts`) and prints them as an `observed` line instead; the
+  player renders both live off the trace it is playing, so the page is always
+  right and no narration has to quote a number that rots. Narrations carry the
+  story and the structural counts: which oracle fired, what it said, what was
+  left on disk.
 - **Page/terminal agreement.** Every vopr `argv` in the pack carries
   `--recheck-every 0`. The determinism recheck re-executes a seed when
   `seed % --recheck-every == 0` (default 10) and the two executions are not
@@ -141,10 +157,16 @@ They are why this is a Python driver and not a shell loop.
   run the only run, so every number a page shows is a number the command prints. `determinism` is the deliberate
   exception — `--recheck-every 1`, the double execution as the subject — and it
   spends a caveat saying which of its numbers are one execution and which are
-  two.
+  two. `shrink` is the other exception, in the other direction: `--shrink`
+  prints its report instead of the reach and merge-evidence tables, so there is
+  nothing in that terminal to compare against, and its caveats say so.
 - **Number sources.** A `stats`/`bars` entry with an empty `source` fails, and
   so does one citing `dr-drill` or `make perf` — `dev/TESTING.md:149-153` and
-  `:1336-1339` both say never to quote those outward.
+  `:2017` both say never to quote those outward. Every `path:line` in a `source`
+  is opened rather than trusted: it must be in range, and a numeric figure must
+  appear at the first line it cites. Anchors rot silently on the next refactor
+  of the file they point into, and a drifted citation is worse than none — it
+  reads as checked. Re-derive them; never carry one forward.
 - **Inertness.** Every traced profile runs twice, with and without
   `--trace-jsonl`, and the recorder must produce a byte-identical op
   interleaving and an identical printed summary. Same rule the repo applies to

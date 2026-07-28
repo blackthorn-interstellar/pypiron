@@ -269,9 +269,26 @@ jobs:
       - name: Oracle kill proofs (--break)
         run: |
           fail=0
+          # K comes from dev/TESTING.md's table, not from a constant here, so the
+          # documented number is the seed budget the gate actually draws. An
+          # understated K stops being a stale doc row and becomes a red build —
+          # which is the only thing that kept the previous hand-maintained column
+          # honest for about a week (it shipped `slow-repair | 2` for a break
+          # that kills at 1, next to a break that killed nothing at all).
+          k_for() {
+            local k
+            k=$(sed -n "s/^| \`$1\` |.*| *\([0-9][0-9]*\) *|$/\1/p" dev/TESTING.md | head -1)
+            if [ -z "$k" ]; then
+              echo "::error::--break $1 has no K row in dev/TESTING.md — every leg must be documented" >&2
+              echo 6
+            else
+              echo "$k"
+            fi
+          }
           check() { # name expected-text flags...
             local name="$1" expect="$2"; shift 2
-            if out=$(cargo run --example vopr -- --seeds 6 "$@" --break "$name" 2>&1); then
+            local k; k=$(k_for "$name")
+            if out=$(cargo run --example vopr -- --seeds "$k" "$@" --break "$name" 2>&1); then
               echo "::error::--break $name passed — the oracle behind '$expect' is dead"
               fail=1
             elif ! grep -qF "$expect" <<<"$out"; then

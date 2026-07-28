@@ -1206,6 +1206,7 @@ storage and never the schedule.
 | `fallback` | an audit repair the effect history cannot explain at all | `… unexplained drift` (fallback arm) | 3 |
 | `freeze-unjustified` | a `.frozen` marker over an acked-**deleted** filename — nothing ever conflicted about it, and the body and view entry are already gone, so no other oracle can see it | `FREEZE_UNJUSTIFIED:` | 3 |
 | `freeze-lossy` | a freeze that dropped a body it never quarantined: `.frozen` fleet-wide, one byte-set preserved under `_quarantine/`, the *acked* one overwritten everywhere | `CONSERVATION: … a frozen filename may not lose one` | 4 |
+| `demote-lossy` | a mirror→private demotion that dropped the body it fenced instead of moving it under `_quarantine/`, leaving the view still rendering the record its truth no longer holds | `DURABILITY: … a demoted filename may not lose it` | 1 |
 | `origin-demoted` | a privately-claimed package's `.origin` walked back to `mirror` on every bucket (sidecars untouched, so the buckets stay converged and the views stay correct) | `ORIGIN_TERMINALITY: … claims … .origin = mirror` | 1 |
 | `mirror-served` | the claim stays private but a **live mirror record** stands under it — a new filename cloned from a live record with its sidecar origin rewritten | `ORIGIN_TERMINALITY: … still serves … as live mirror truth` | 3 |
 | `split` | a byte conflict the merge never resolved: bucket 1 acks and keeps a second, same-length byte-set under a filename bucket 0 still serves its own for | `DURABILITY: … never left split` (needs ≥2 buckets) | 4 |

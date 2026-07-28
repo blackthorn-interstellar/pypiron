@@ -1197,7 +1197,7 @@ storage and never the schedule.
 | `conserve` | an acked body and sidecar destroyed fleet-wide with no tombstone, no freeze and no acked delete | `CONSERVATION: acked bytes … vanished from every bucket` | 4 |
 | `diverge` | one bucket keeps an object the other never got | `CONVERGENCE: bucket 0 and bucket N differ` (needs ≥2 buckets) | 1 |
 | `wedge` | an object under `_repl/` no sweep recognizes, so the fixpoint the heal phase is bounded to reach does not exist | `STALENESS: the fleet never stopped working` | 1 |
-| `slow-repair` | a peer's copy of one live record stolen *after* the heal round's audits, body and sidecar together, with no `_dirty/` marker and no `_repl/` note over the loss — so only the tree diff can find it, one whole backstop cycle later than the run's `t0` debt paid for | `STALENESS: … past its … deadline` (needs ≥2 buckets) | 2 |
+| `slow-repair` | a peer's copy of one live record stolen *after* the heal round's audits, body and sidecar together, with no `_dirty/` marker and no `_repl/` note over the loss — so only the tree diff can find it, one whole backstop cycle later than the run's `t0` debt paid for | `STALENESS: … past its … deadline` (needs ≥2 buckets) | 1 |
 | `ordering` | truth grows a file with no `_dirty/` marker and no `_repl/` note ever covering it | `AUDIT_ORDERING:` (repair class 1, per-package path) | 3 |
 | `globalindex` | the same unbreadcrumbed mutation, under a package name nobody has published | `AUDIT_ORDERING: … simple/index.* membership` (class 1, global path) | 3 |
 | `poison` | a rebuild listed truth *past* the mutation and still wrote a view — and a name set — contradicting it | `… a poisoned derivation consumed the signal` (class 2a) | 3 |

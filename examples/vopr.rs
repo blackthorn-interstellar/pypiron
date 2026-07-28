@@ -1099,6 +1099,30 @@ fn cycles_for(n: u64) -> u64 {
 /// periodic sweep costs a whole cycle whether it has one record to move or a
 /// thousand, so the first record buys the first cycle and the thousand-and-first
 /// buys the second.
+/// Hold the staleness clock at the LAST moment the fleet entered agreement, not
+/// the first.
+///
+/// A fleet can agree and then be pulled apart again — a peer's copy stolen after
+/// the audit, debris arriving late — and converge a second time. Latching on
+/// first arrival reports a convergence the fleet did not keep, and it makes any
+/// divergence planted after that moment UNKILLABLE: the clock has already
+/// stopped and nothing re-opens it. `--break slow-repair` shipped dead for
+/// exactly this reason, killing 0 of 500 seeds while doing real extra repair
+/// work the clock could not see (its heal loop peaked a round higher than the
+/// control's while reporting a byte-identical convergence time).
+///
+/// The two callers that pass a *current* agreement verdict use this; the
+/// mid-drain and post-audit samples keep their `is_none()` guard, because they
+/// only refine an open clock downward and materializing a dump to re-confirm an
+/// answer already known would cost a full bucket walk per pass.
+fn note_agreement(agreed_at: &mut Option<u64>, agreed: bool, now: impl FnOnce() -> u64) {
+    match (agreed, agreed_at.is_some()) {
+        (true, false) => *agreed_at = Some(now()),
+        (false, true) => *agreed_at = None,
+        _ => {}
+    }
+}
+
 fn staleness_deadline(base_secs: u64, debt: u64) -> u64 {
     base_secs.saturating_add(STALENESS_CYCLE_SECS.saturating_mul(cycles_for(debt)))
 }
@@ -3730,13 +3754,16 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                 fleet.buckets.iter().map(|bucket| bucket.dump()).collect();
             let markers_left: usize = pass_dumps.iter().map(marker_count).sum();
             saw_work |= markers_left > 0;
-            // Stop the staleness clock the first moment the fleet has arrived.
-            // Guarded on `markers_left == 0` so the projection only runs when it
-            // can possibly say yes — outstanding debris IS debt, so the answer
-            // is already no, and this loop runs up to 20 times a round.
-            if agreed_at.is_none() && markers_left == 0 && fleet_agreed(&pass_dumps) {
-                agreed_at = Some(elapsed_secs(&clock, storm_end));
-            }
+            // Read the staleness clock against the fleet's CURRENT agreement,
+            // not its first. Guarded on `markers_left == 0` so the projection
+            // only runs when it can possibly say yes — outstanding debris IS
+            // debt, so the answer is already no, and this loop runs up to 20
+            // times a round.
+            note_agreement(
+                &mut agreed_at,
+                markers_left == 0 && fleet_agreed(&pass_dumps),
+                || elapsed_secs(&clock, storm_end),
+            );
             Reach::peak(&REACH.peak_drains, pass + 1);
             if let Some(viz) = &viz {
                 viz.emit(
@@ -4063,9 +4090,11 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         saw_work |= markers_left;
         // The round's reconcile and audits are convergence work too, so the
         // fleet can arrive here having been behind at the last drain pass.
-        if agreed_at.is_none() && !markers_left && fleet_agreed(&snapshot) {
-            agreed_at = Some(elapsed_secs(&clock, storm_end));
-        }
+        note_agreement(
+            &mut agreed_at,
+            !markers_left && fleet_agreed(&snapshot),
+            || elapsed_secs(&clock, storm_end),
+        );
         Reach::peak(&REACH.peak_rounds, round + 1);
         if let Some(viz) = &viz {
             viz.world(&snapshot, false);

@@ -1066,13 +1066,21 @@ pub trait Storage: Send + Sync {
 
     /// Whether this backend supports conditional writes for leader leases.
     /// Disk is explicitly single-node: no lease, always leader.
+    ///
+    /// The four methods below are the conditional-write family this answer
+    /// gates, and each default names itself when it fires. A backend that says
+    /// `true` here owes all four: a wrapper that forwards three and inherits
+    /// the fourth's default compiles clean and then contradicts itself at
+    /// runtime, so the message has to say which one is missing.
     fn supports_leases(&self) -> bool {
         false
     }
 
     /// Read object bytes plus ETag; `None` if the object is missing.
     async fn get_with_etag(&self, _key: &str) -> Result<Option<(Vec<u8>, String)>> {
-        Err(anyhow!("leases are not supported by this backend"))
+        Err(anyhow!(
+            "get_with_etag: no conditional writes on this backend"
+        ))
     }
 
     /// The conditional-write token for `key` from one metadata round-trip, or
@@ -1087,13 +1095,15 @@ pub trait Storage: Send + Sync {
     /// [`Storage::put_if_match`], or for comparison against one, comes from
     /// here. See [`ObjectMeta::etag`].
     async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
-        Err(anyhow!("leases are not supported by this backend"))
+        Err(anyhow!("head_etag: no conditional writes on this backend"))
     }
 
     /// Create-if-absent (`If-None-Match: *`). `Some(etag)` on success,
     /// `None` if the object already exists or we lost the race.
     async fn put_if_none_match(&self, _key: &str, _bytes: Vec<u8>) -> Result<Option<String>> {
-        Err(anyhow!("leases are not supported by this backend"))
+        Err(anyhow!(
+            "put_if_none_match: no conditional writes on this backend"
+        ))
     }
 
     /// Replace-if-unchanged (`If-Match`). `Some(new_etag)` on success,
@@ -1104,7 +1114,9 @@ pub trait Storage: Send + Sync {
         _etag: &str,
         _bytes: Vec<u8>,
     ) -> Result<Option<String>> {
-        Err(anyhow!("leases are not supported by this backend"))
+        Err(anyhow!(
+            "put_if_match: no conditional writes on this backend"
+        ))
     }
 
     /// This backend's identity as a server-side-copy *source*, or `None` when it

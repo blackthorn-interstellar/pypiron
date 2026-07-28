@@ -2779,6 +2779,15 @@ impl Storage for FaultView {
         self.gate("get_etag", key).await?;
         self.inner.get_with_etag(key).await
     }
+    /// Gated like every other op, and for the same reason: this is the
+    /// global-index currency probe, so an ungated one would be a storage read
+    /// on the fleet's hottest write path that no schedule can ever fail. It
+    /// replaced a `list_all` that was gated; leaving it open would have
+    /// quietly narrowed the fault space exactly where it was last needed.
+    async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        self.gate("head_etag", key).await?;
+        self.inner.head_etag(key).await
+    }
     async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
         self.gate("put_inm", key).await?;
         let body = self.global_body(key, &bytes);
@@ -6650,5 +6659,58 @@ mod tests {
                 .ends_with(&format!("--break {spelling}")));
         }
         assert_eq!(Break::None.flag(), None);
+    }
+
+    /// `supports_leases` is a promise about four methods, not one, and each has
+    /// a defaulted trait impl that errors. So a forwarder that claims the
+    /// promise and then inherits one default compiles clean, passes every unit
+    /// test, and only speaks up as a fleet that cannot write its global index —
+    /// which is how `head_etag` reached master with the sim answering "no
+    /// conditional writes on this backend" for a backend it had just said had
+    /// them. Every violation the smoke reported was downstream of that one
+    /// unforwarded method; none of them named it.
+    #[tokio::test]
+    async fn the_fault_view_forwards_every_conditional_write_it_claims() {
+        let start =
+            time::OffsetDateTime::parse(SIM_START, &time::format_description::well_known::Rfc3339)
+                .expect("valid sim start");
+        let view = FaultView {
+            inner: SimStorage::new(SimClock::new(start)),
+            node: 0,
+            bucket: 0,
+            plan: FaultPlan::new(0, 1, 0, Break::None, None),
+        };
+        assert!(view.supports_leases(), "the claim under test");
+
+        let key = "simple/index.json";
+        assert_eq!(
+            view.head_etag(key).await.expect("head_etag forwards"),
+            None,
+            "absent is None, not an error"
+        );
+        let first = view
+            .put_if_none_match(key, b"{}".to_vec())
+            .await
+            .expect("put_if_none_match forwards")
+            .expect("created");
+        assert_eq!(
+            view.head_etag(key).await.expect("head_etag forwards"),
+            Some(first.clone()),
+            "the token a HEAD reports is the one the write handed back — the \
+             whole point of the method, and what a listed ETag cannot promise"
+        );
+        assert_eq!(
+            view.get_with_etag(key)
+                .await
+                .expect("get_with_etag forwards"),
+            Some((b"{}".to_vec(), first.clone())),
+        );
+        assert!(
+            view.put_if_match(key, &first, b"[]".to_vec())
+                .await
+                .expect("put_if_match forwards")
+                .is_some(),
+            "a CAS on the freshly-read token wins"
+        );
     }
 }

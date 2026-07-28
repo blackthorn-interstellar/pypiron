@@ -28,21 +28,31 @@ failing at once can't interleave into one garbled block. Design rules:
 Status: each reporter process is one *segment* with a fresh uuid. It follows
 the soak's once-a-minute progress lines, accumulates per-unit seed counts
 (reset-safe: the vopr counter restarts at zero when a soak process restarts),
-and every STATUS_INTERVAL puts one JSON object to
-`<status prefix><commit>-<uuid>.json`. One writer per key + S3's atomic
-whole-object PUT = safe concurrent writes with zero coordination; the client
-lists the prefix and aggregates. On SIGTERM/SIGINT (systemd stop, bundle
-refresh, spot reclaim's shutdown) a final snapshot is flushed with
-`final: true`, so a segment's last write is its total. Segment totals never
-overlap — a new segment baselines on the current journal gauges and counts
-only deltas it observes — so summing every object undercounts slightly
-(restart gaps), never overcounts.
+keeps the last few non-progress log lines as a tail, and every STATUS_INTERVAL
+puts one JSON object to `<status prefix><commit>-<uuid>.json`. One writer per
+key + S3's atomic whole-object PUT = safe concurrent writes with zero
+coordination; the client lists the prefix and aggregates. On SIGTERM/SIGINT
+(systemd stop, bundle refresh, spot reclaim's shutdown) a final snapshot is
+flushed with `final: true`, so a segment's last write is its total. Segment
+totals never overlap — a new segment baselines on the current journal gauges
+and counts only deltas it observes — so summing every object undercounts
+slightly (restart gaps), never overcounts.
+
+The tail is the remote console. A soak that cannot start prints nothing a
+finding parser recognises, so a broken box reads exactly like an idle one:
+zero seeds, no findings, still "LIVE". Carrying the last few raw lines —
+including systemd's own restart/exit messages, which the unit journal already
+merges in — makes `fleet.sh status` say *why* it is quiet, over the same S3
+reads and with no shell on the box. (Earned: a bundle built against a newer
+glibc than the AMI's exit-1'd 3,900 times over 15 hours while status happily
+reported a live worker.)
 
 stdlib only; shells out to the `aws` CLI already on the box.
 """
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import os
@@ -74,6 +84,8 @@ FALLBACK = os.environ.get("PYPIRON_SOAK_FALLBACK", "/var/tmp/pypiron-soak-findin
 # push-bundle and by CI); env override for local testing.
 COMMIT_FILE = os.environ.get("PYPIRON_SOAK_COMMIT_FILE", "commit")
 TITLE_MAX = 120
+TAIL_LINES = 5  # raw log lines carried in each status object
+TAIL_CHARS = 240  # per line: fits a whole heartbeat, clips a violation dump
 
 # A FAILED block:
 #   vopr: seed 1784515453 FAILED (1 violations):
@@ -139,6 +151,11 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def stamp(unit: str, line: str) -> str:
+    """One log line as `fleet.sh status` prints it: time, unit, text."""
+    return f"{now_iso()[11:19]} {unit.removesuffix('.service')}: {line.strip()[:TAIL_CHARS]}"
+
+
 def read_commit() -> str:
     try:
         with open(COMMIT_FILE, encoding="utf-8") as f:
@@ -189,13 +206,18 @@ class StatusTracker:
     )
     instance_id: str | None = None
     instance_type: str | None = None
+    tail: collections.deque[str] = field(
+        default_factory=lambda: collections.deque(maxlen=TAIL_LINES)
+    )
+    last_progress_at: str | None = None
+    last_progress_line: str | None = None
 
     def baseline(self, unit: str, gauges: tuple[int, int, int]) -> None:
         """Set a unit's starting gauges without counting them (startup pre-pass)."""
         with self.lock:
             self.units[unit] = {"gauges": gauges, "seeds": 0, "last_seen": None}
 
-    def observe(self, unit: str, gauges: tuple[int, int, int]) -> None:
+    def observe(self, unit: str, gauges: tuple[int, int, int], line: str) -> None:
         with self.lock:
             u = self.units.setdefault(unit, {"gauges": (0, 0, 0), "seeds": 0, "last_seen": None})
             for key, prev, cur in zip(("seeds", "interleavings", "acked_uploads"), u["gauges"], gauges):
@@ -205,6 +227,16 @@ class StatusTracker:
                     u["seeds"] += delta
             u["gauges"] = gauges
             u["last_seen"] = now_iso()
+            self.last_progress_at = u["last_seen"]
+            # Kept out of the tail (a heartbeat a minute would evict everything
+            # worth reading within five) but kept: on a healthy fleet it is the
+            # only line there is, and it carries the failure counters.
+            self.last_progress_line = stamp(unit, line)
+
+    def note(self, unit: str, line: str) -> None:
+        """Record one raw log line in the tail (everything but the heartbeat)."""
+        with self.lock:
+            self.tail.append(stamp(unit, line))
 
     def snapshot(self, findings: int, final: bool, exit_reason: str | None) -> dict:
         with self.lock:
@@ -216,8 +248,11 @@ class StatusTracker:
                 "cores": os.cpu_count() or 1,
                 "started_at": self.started_at,
                 "updated_at": now_iso(),
+                "last_progress_at": self.last_progress_at,
                 **self.totals,
                 "findings": findings,
+                "tail": list(self.tail),
+                "last_progress_line": self.last_progress_line,
                 "units": {
                     unit: {"seeds": u["seeds"], "gauge": u["gauges"][0], "last_seen": u["last_seen"]}
                     for unit, u in sorted(self.units.items())
@@ -368,7 +403,14 @@ def journal_events():
                 continue
         if not isinstance(msg, str):
             continue
-        yield ev.get("_SYSTEMD_UNIT", "?"), msg
+        unit = ev.get("_SYSTEMD_UNIT", "?")
+        # systemd's own messages about a unit ("Main process exited...") are
+        # emitted by PID 1, so _SYSTEMD_UNIT is init.scope and only UNIT names
+        # the soak. Attribute them to the soak: they are the whole story when a
+        # box is crash-looping, and they can never look like a violation line.
+        if unit == "init.scope":
+            unit = ev.get("UNIT", unit)
+        yield unit, msg
 
 
 def main() -> int:
@@ -403,8 +445,10 @@ def main() -> int:
         for unit, line in journal_events():
             prog = PROGRESS_RE.match(line)
             if prog:
-                tracker.observe(unit, (int(prog.group(1)), int(prog.group(2)), int(prog.group(3))))
+                gauges = (int(prog.group(1)), int(prog.group(2)), int(prog.group(3)))
+                tracker.observe(unit, gauges, line)
                 continue
+            tracker.note(unit, line)  # everything else is tail material
 
             det = DETERMINISM_RE.match(line)
             if det:

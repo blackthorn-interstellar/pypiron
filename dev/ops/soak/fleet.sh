@@ -21,7 +21,7 @@ REGION=${REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}
 STACK_NAME=${STACK_NAME:-pypiron-soak}
 # One dedicated bucket per account, reused by every run (push-bundle/apply/…).
 # Deriving it from the account id means you never accidentally spin up a second.
-S3_BUCKET=${S3_BUCKET:-pypiron-soak-$(command aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}
+S3_BUCKET=${S3_BUCKET:-pypiron-soak-$(command aws --no-cli-pager sts get-caller-identity --query Account --output text 2>/dev/null || true)}
 BUNDLE_KEY=${BUNDLE_KEY:-soak/bundle.tar.gz}
 FINDINGS_PREFIX=${FINDINGS_PREFIX:-soak/findings/}
 STATUS_PREFIX=${STATUS_PREFIX:-soak/status/}
@@ -30,9 +30,13 @@ DESIRED=${DESIRED:-1}
 MAX=${MAX:-2}
 EMAIL=${EMAIL:-}
 BUDGET=${BUDGET:-25}
-RUST_IMAGE=${RUST_IMAGE:-rust:1-bookworm}
+# The AMI the fleet boots. Building in it is what keeps the binary runnable
+# there — see build-vopr.sh.
+BUILD_IMAGE=${BUILD_IMAGE:-public.ecr.aws/amazonlinux/amazonlinux:2023}
 
-aws() { command aws --region "$REGION" "$@"; }
+# --no-cli-pager: AWS CLI v2 pipes multi-line output into `less`, which steals
+# the terminal and waits on `q` — hostile in a status command, fatal in a script.
+aws() { command aws --region "$REGION" --no-cli-pager "$@"; }
 
 ensure_bucket() {
     : "${S3_BUCKET:?set S3_BUCKET}"
@@ -66,18 +70,18 @@ push_bundle() {
     # Self-clearing: a RETURN trap stays armed for the caller's return too,
     # where the local is gone (set -u would abort).
     trap 'rm -rf "$stage"; trap - RETURN' RETURN
-    echo "building aarch64 vopr in a linux/arm64 container (no host target/ touched)..."
+    echo "building aarch64 vopr in a linux/arm64 $BUILD_IMAGE container (no host target/ touched)..."
     # Stamp the git hash from the host (the container has the repo read-only and
-    # would trip git's dubious-ownership guard). Repo mounted read-only; build
-    # into the container's own target dir; copy the binary out. --locked keeps
-    # the build reproducible and the lockfile untouched.
+    # would trip git's dubious-ownership guard). The build itself — toolchain,
+    # flags, and the smoke test that it runs on this userland — is build-vopr.sh,
+    # the same recipe CI uses.
     local githash
     githash=$(git -C "$REPO_ROOT" describe --always --dirty --exclude='*' 2>/dev/null || echo unknown)
     docker run --rm --platform linux/arm64 \
         -e PYPIRON_GIT_HASH="$githash" \
         -v "$REPO_ROOT":/src:ro -v "$stage":/out \
-        -w /src "$RUST_IMAGE" \
-        bash -c "CARGO_TARGET_DIR=/tmp/t cargo build --release --example vopr --locked && cp /tmp/t/release/examples/vopr /out/vopr"
+        -w /src "$BUILD_IMAGE" \
+        bash dev/ops/soak/build-vopr.sh
     for f in "${BUNDLE_FILES[@]}"; do cp "$HERE/$f" "$stage/$f"; done
     printf '%s' "$githash" >"$stage/commit" # the reporter keys status objects by this
     tar czf "$stage/bundle.tar.gz" -C "$stage" vopr commit "${BUNDLE_FILES[@]}"
@@ -128,23 +132,46 @@ status() {
         --filters "Name=tag:Name,Values=${STACK_NAME}" "Name=instance-state-name,Values=running,pending" \
         --query 'Reservations[].Instances[].[InstanceId,InstanceType,InstanceLifecycle,State.Name]' \
         --output text || true
-    # `s3 ls` exits 1 on an empty prefix; under pipefail that would fail status.
-    echo "== findings ==" && { aws s3 ls "s3://${S3_BUCKET}/${FINDINGS_PREFIX}" 2>/dev/null || true; } \
-        | wc -l | sed 's/^/  distinct findings in S3: /'
+    echo "== findings ==" && findings 5
     echo "== seeds ==" && seeds
 }
 
+# findings [N] — the deduped findings, newest first, with the commit that found
+# them: a repro's `--seed` is only meaningful against the binary that produced
+# it. N>0 prints the compact list `status` shows; no argument prints every
+# finding with its repro command.
 findings() {
     : "${S3_BUCKET:?set S3_BUCKET}"
-    local keys
-    keys=$(aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$FINDINGS_PREFIX" \
-        --query 'Contents[].Key' --output text 2>/dev/null || true)
-    # `--output text` prints the literal "None" when Contents is null (no keys).
-    case "$keys" in "" | None) echo "(no findings yet)"; return ;; esac
-    for k in $keys; do
-        aws s3 cp "s3://$S3_BUCKET/$k" - 2>/dev/null \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); print("-", d["title"]); print("   ", d["repro"])'
-    done
+    local tmp
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"; trap - RETURN' RETURN
+    aws s3 sync "s3://${S3_BUCKET}/${FINDINGS_PREFIX}" "$tmp" --quiet 2>/dev/null || true
+    python3 - "$tmp" "${1:-0}" <<'PY'
+import datetime, json, pathlib, sys
+
+limit = int(sys.argv[2])
+found = []
+for p in sorted(pathlib.Path(sys.argv[1]).glob("*.json")):
+    try:
+        found.append(json.loads(p.read_text()))
+    except (ValueError, OSError):
+        print(f"  (unreadable finding: {p.name})")
+if not found:
+    print("  no findings yet")
+    raise SystemExit
+
+found.sort(key=lambda f: f.get("ts", 0), reverse=True)
+print(f"  {len(found)} distinct finding(s) in S3:")
+for f in found[: limit or len(found)]:
+    ts = f.get("ts")
+    when = (datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+            if ts else "?")
+    print(f"  - {when}  {f.get('commit', '?'):9} {f.get('title', '?')}")
+    if not limit:
+        print(f"      {f.get('repro', '?')}")
+if limit and len(found) > limit:
+    print(f"  (+{len(found) - limit} older — ./fleet.sh findings)")
+PY
 }
 
 # seeds: aggregate the per-segment status objects the reporters put to S3
@@ -172,18 +199,36 @@ if not segments:
     print("  no status objects yet — the fleet writes one within ~1 min of soaking")
     raise SystemExit
 
-def age(seg):
+def age(iso):
     try:
-        ts = datetime.datetime.fromisoformat(seg["updated_at"])
-    except (KeyError, ValueError):
+        return (now - datetime.datetime.fromisoformat(iso)).total_seconds()
+    except (TypeError, ValueError):
         return None
-    return (now - ts).total_seconds()
 
-live = [s for s in segments if not s.get("final") and (age(s) or 1e9) < 900]
+def ago(seconds):
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+
+live = [s for s in segments if not s.get("final") and (age(s.get("updated_at")) or 1e9) < 900]
 for s in live:
     print(f"  LIVE {s.get('commit', '?')} {s.get('uuid', '?')[:8]} "
           f"{s.get('instance_id') or '?'} {s.get('instance_type') or '?'} "
-          f"{s.get('cores', '?')}c  {s.get('seeds', 0):,} seeds  ({int(age(s) or 0)}s ago)")
+          f"{s.get('cores', '?')}c  {s.get('seeds', 0):,} seeds  "
+          f"({int(age(s.get('updated_at')) or 0)}s ago)")
+    # The reporter is alive whenever the box is; only a progress line proves the
+    # *soak* is. vopr heartbeats once a minute, so silence past a few of them
+    # means the binary isn't running — and the tail below says why.
+    quiet = age(s.get("last_progress_at") or s.get("started_at"))
+    if quiet is not None and quiet > 300:
+        since = "last progress" if s.get("last_progress_at") else "segment start"
+        print(f"    STALLED: no soak progress line in {ago(quiet)} (since {since}) "
+              f"— the soak is not running")
+    # The tail holds everything but the heartbeat; the heartbeat is appended
+    # because it is the newest line and, on a healthy box, the only one.
+    for line in [*s.get("tail", []), s.get("last_progress_line")]:
+        if line:
+            print(f"      | {line}")
 if not live:
     print("  no live workers reporting (last update > 15 min ago)")
 

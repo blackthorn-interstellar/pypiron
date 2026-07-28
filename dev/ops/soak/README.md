@@ -70,9 +70,14 @@ cd dev/ops/soak
 export S3_BUCKET=your-bucket
 ./fleet.sh push-bundle                 # build aarch64 vopr + upload the bundle
 EMAIL=you@example.com ./fleet.sh apply # default VPC/subnets; budget alarm to EMAIL
-./fleet.sh status                      # stack, instances, finding count
-./fleet.sh findings                    # list the deduped findings
+./fleet.sh status                      # stack, instances, recent findings, seeds + health
+./fleet.sh findings                    # every deduped finding, newest first, with its repro
 ```
+
+The bundle is built inside the fleet's own AMI image
+([build-vopr.sh](build-vopr.sh)) and smoke-run there before it ships: a binary
+linked against a newer glibc than the box's cannot start, and a fleet that
+cannot start its soak still looks alive.
 
 Instances take ~1-2 min to fetch the bundle and start soaking. Shell in with no
 open port via SSM: `aws ssm start-session --target <instance-id>`.
@@ -103,11 +108,17 @@ with `final: true`, so a segment's object is its total; a hard kill just loses
 the final ≤60s. One writer per key + S3's atomic whole-object PUT = safe
 concurrent writes with zero coordination.
 
+Each object also carries the last five non-heartbeat log lines plus the latest
+heartbeat. That is the remote console: a soak that cannot start prints
+nothing a finding parser recognises, so without it a broken box reads exactly
+like an idle one — live, zero seeds, no findings.
+
 `fleet.sh seeds` (also part of `status`) lists the prefix and aggregates: live
-segments (updated <15 min ago) individually, plus the lifetime sum over every
-segment ever. Segments never overlap, so the sum can only undercount slightly
-(restart gaps) — never inflate. No SSM, so it works mid-reclaim and needs only
-S3 read access.
+segments (updated <15 min ago) individually — with their log tail, and a
+`STALLED` line if no heartbeat has landed in 5 minutes — plus the lifetime sum
+over every segment ever. Segments never overlap, so the sum can only undercount
+slightly (restart gaps) — never inflate. No SSM, so it works mid-reclaim and
+needs only S3 read access.
 
 ## Run the finder on any box (no AWS)
 
@@ -126,7 +137,8 @@ Without a bucket the reporter still records findings to a local fallback file.
 | File | Role |
 |------|------|
 | `fleet.cfn.yaml` | CloudFormation: IAM (S3 get bundle / put findings), SG, launch template (+ bootstrap), spot ASG, budget |
-| `fleet.sh` | `push-bundle` / `apply` / `status` / `findings` / `destroy` |
+| `fleet.sh` | `push-bundle` / `apply` / `status` / `findings` / `seeds` / `destroy` |
+| `build-vopr.sh` | the one build recipe, run inside the fleet's AMI image by both `push-bundle` and CI |
 | `pypiron-soak@.service` | one soak process per core (`vopr --forever --rotate`, random start-seed) |
 | `report.py` | journal → deduped S3 findings (seed-agnostic signatures, rate-capped, fail-open) + per-segment status objects (seed totals, final-flush on shutdown) |
 | `pypiron-soak-reporter.service` | one reporter per box, follows the merged soak journal |

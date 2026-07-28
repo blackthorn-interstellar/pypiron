@@ -26,14 +26,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build vopr
-        run: cargo build --release --example vopr --locked
-      - name: Stage bundle
+      # In the fleet's own AMI image, not the runner's userland: this runner is
+      # glibc 2.39, Amazon Linux 2023 is 2.34, and a binary linked against the
+      # newer one cannot start on the box — it exits 1 silently and the fleet
+      # soaks nothing. build-vopr.sh is the same recipe `fleet.sh push-bundle`
+      # runs, and it refuses to emit a binary that will not exec there.
+      - name: Build vopr in the fleet's userland
         run: |
           mkdir -p stage
-          cp target/release/examples/vopr stage/vopr
+          docker run --rm -v "$PWD":/src:ro -v "$PWD/stage":/out -w /src \
+            public.ecr.aws/amazonlinux/amazonlinux:2023 \
+            bash dev/ops/soak/build-vopr.sh
+      - name: Stage bundle
+        run: |
           git rev-parse --short HEAD > stage/commit
           cp dev/ops/soak/report.py dev/ops/soak/install.sh dev/ops/soak/fetch-bundle.sh \
              dev/ops/soak/pypiron-soak@.service dev/ops/soak/pypiron-soak-reporter.service \

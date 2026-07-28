@@ -23,7 +23,7 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
     time::Instant,
 };
@@ -612,6 +612,7 @@ pub async fn run_worker_until(
     let reconcile_running = Arc::new(AtomicBool::new(false));
     let replication_running = Arc::new(AtomicBool::new(false));
     let warm_running = Arc::new(AtomicBool::new(false));
+    let counter_compact_running = Arc::new(AtomicBool::new(false));
     // Clears the in-flight flag on drop — including a panic unwind inside the
     // spawned audit. Without it, a panicking sweep leaves the flag stuck `true`
     // and no further sweep is ever scheduled, silently disabling self-healing.
@@ -942,39 +943,53 @@ pub async fn run_worker_until(
                     duration_out.store(started.elapsed().as_secs(), Ordering::Relaxed);
                 });
             }
-            // tick + compact can run many seconds on S3 with a backlog. Race
-            // them against the shutdown signal: a graceful SIGTERM must never be
-            // stuck behind a slow batch, or the worker is aborted before it
-            // releases the lease — and a skipped release is a lease-TTL write
-            // outage on the successor (the very thing release() exists to avoid).
-            // Abandoning a rebuild mid-flight is safe: rebuilds are idempotent
-            // and the next leader redoes the work.
-            let leader_work = async {
-                if let Err(e) = tick(&state, &selected).await {
-                    error!(error=?e, "worker tick failed");
-                }
-                // Counter compaction (LEADER only): freeze finished days into one
-                // file per shard, write summaries, prune past retention. Cheap most
-                // ticks (a list with nothing closeable); gated to the rollup cadence.
-                // Inline is fine at the hourly default; spawn it like the audit if a
-                // very large corpus ever makes it head-of-line-block the tick.
-                if last_counter_compact
-                    .is_none_or(|t| t.elapsed() >= state.counters.rollup_interval())
-                {
-                    last_counter_compact = Some(Instant::now());
-                    state.counters.compact().await;
-                    // Mirror the freshly-frozen day-rollups to every healthy peer
-                    // (and heal a peer that was down when it froze), so a bucket
-                    // failover keeps the /audit ranking and /stats history — the
-                    // current day's un-rolled-up live tallies are the declared,
-                    // bounded loss. Both write-through and backstop, once a cycle;
-                    // a no-op on a single-bucket node.
-                    let peers = state.counter_rollup_peers(selected.index);
-                    state.counters.reseed_rollups(&peers).await;
-                }
-            };
+            // Counter compaction (LEADER only): freeze finished days into one file
+            // per shard, write summaries, prune past retention, then converge every
+            // bucket on the union of the frozen rollups. Every healthy bucket is
+            // compacted from its own segments: a node's tallies land on whichever
+            // bucket it had pinned, so freezing only the write pin would sweep the
+            // others' share of the day uncounted. A bucket that is unreachable now
+            // is left entirely alone and frozen by a later pass.
+            //
+            // Spawned off the loop like the audit sweep, never inline. The pass
+            // costs one LIST per configured bucket, and a bucket that has gone dark
+            // holds that LIST for the object-store client's whole request budget —
+            // an hour, deliberately, so a slow cloud is never mistaken for a dead
+            // one (see storage::FAILOVER_REQUEST_TIMEOUT). Inline, that single round
+            // trip froze the entire worker loop, and with it every job the loop
+            // schedules — the `_repl/` marker sweep first, which is exactly the work
+            // that routes around the dark bucket. Health drops an unreachable bucket
+            // from the peer list within a cycle, so this only bites in the window
+            // before it notices; spawning removes the window instead of guessing how
+            // long a legitimate pass may take. The in-flight flag serializes passes,
+            // and abandoning one at shutdown is safe: compaction recomputes from
+            // immutable segments and is idempotent.
+            let compact_due = last_counter_compact
+                .is_none_or(|t| t.elapsed() >= state.counters.rollup_interval());
+            if compact_due && !counter_compact_running.swap(true, Ordering::SeqCst) {
+                last_counter_compact = Some(Instant::now());
+                let job_state = state.clone();
+                let primary_index = selected.index;
+                let guard = SweepGuard(counter_compact_running.clone());
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    let peers = job_state.counter_rollup_peers(primary_index);
+                    job_state.counters.compact(&peers).await;
+                });
+            }
+            // The tick can run many seconds on S3 with a backlog. Race it against
+            // the shutdown signal: a graceful SIGTERM must never be stuck behind a
+            // slow batch, or the worker is aborted before it releases the lease —
+            // and a skipped release is a lease-TTL write outage on the successor
+            // (the very thing release() exists to avoid). Abandoning a rebuild
+            // mid-flight is safe: rebuilds are idempotent and the next leader
+            // redoes the work.
             tokio::select! {
-                _ = leader_work => {}
+                result = tick(&state, &selected) => {
+                    if let Err(e) = result {
+                        error!(error=?e, "worker tick failed");
+                    }
+                }
                 _ = wait_until_generation_changes(&state, selected.generation) => {}
                 _ = shutdown.changed() => break,
             }
@@ -1269,61 +1284,186 @@ async fn current_package_shas(storage: &dyn Storage, pkg: &str) -> Result<FileSh
     Ok(files.into_iter().map(|f| (f.filename, f.sha256)).collect())
 }
 
+/// Deltas an append could not land, held against the bucket handle they were
+/// observed on and merged into that bucket's next checkpoint.
+///
+/// Leader memory on purpose. A package's audit fingerprint is written with its
+/// shard, long before the checkpoint is appended, so a delta dropped here is never
+/// re-derived: the chain would go on committing the old sha while storage holds
+/// the new bytes, and `verify-chain` would report a tamper that clears only if
+/// that package happens to churn again. Holding it costs a few keys and makes the
+/// next pass whole. A crash loses it — the accepted residual (see
+/// `crate::transparency`).
+///
+/// Keyed by the handle itself, as a `Weak`: a carried delta rejoins the chain it
+/// was observed against (surviving a pin switch away and back), a dropped bucket
+/// takes its carry with it, and nothing is handed to whatever later allocation
+/// reuses the address — the deterministic simulator runs many fleets, under the
+/// same bucket names, in one process.
+type Unlanded = Vec<(std::sync::Weak<dyn Storage>, crate::transparency::Delta)>;
+static UNLANDED_DELTAS: OnceLock<Mutex<Unlanded>> = OnceLock::new();
+
+fn unlanded_deltas() -> &'static Mutex<Unlanded> {
+    UNLANDED_DELTAS.get_or_init(Mutex::default)
+}
+
+/// Is `held` the very handle `pin` points at? Address only: the vtable half of a
+/// trait-object pointer is not reliably unique.
+fn same_handle(held: &std::sync::Weak<dyn Storage>, pin: &Arc<dyn Storage>) -> bool {
+    held.upgrade()
+        .is_some_and(|storage| std::ptr::addr_eq(Arc::as_ptr(&storage), Arc::as_ptr(pin)))
+}
+
+/// Take back whatever this bucket could not land last pass, under `delta`; this
+/// pass's observation of a package is the fresher one and wins. Carries whose
+/// bucket is gone are dropped in the same sweep.
+fn merge_unlanded(pin: &Arc<dyn Storage>, delta: &mut crate::transparency::Delta) {
+    let mut carried = unlanded_deltas()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    carried.retain(|(held, _)| held.strong_count() > 0);
+    if let Some(position) = carried.iter().position(|(held, _)| same_handle(held, pin)) {
+        let (_, previous) = carried.swap_remove(position);
+        for (pkg, files) in previous {
+            delta.entry(pkg).or_insert(files);
+        }
+    }
+}
+
+/// Hold a delta no bucket accepted, for this bucket's next pass.
+fn carry_unlanded(pin: &Arc<dyn Storage>, delta: crate::transparency::Delta) {
+    let mut carried = unlanded_deltas()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match carried.iter_mut().find(|(held, _)| same_handle(held, pin)) {
+        Some((_, kept)) => kept.extend(delta),
+        None => carried.push((Arc::downgrade(pin), delta)),
+    }
+}
+
 /// Append a hash-chained transparency checkpoint committing this pass's changed
 /// packages. Best-effort: any failure logs and alarms but never fails the audit
 /// (the next audit re-attempts). Leader-gated by construction — called only from
 /// `audit`, after the fingerprint and global-index writes, on the same pin and
 /// generation.
+///
+/// Reconcile first, append second. Catching the fleet up before writing is what
+/// keeps a failover leader from spending a seq a peer already used under different
+/// bytes: once the peers agree, this bucket's head *is* the fleet head. The
+/// reconcile runs every audit regardless of churn, so an idle fleet still
+/// converges, and it doubles as the write-through backstop for a bucket that
+/// missed a link or was added later.
 async fn write_chain_link(
     state: &AppState,
     pinned: &crate::buckets::Pinned,
     generation: u64,
-    delta: crate::transparency::Delta,
+    mut delta: crate::transparency::Delta,
 ) {
-    let storage = pinned.storage.as_ref();
-    // Append a link only on churn, then always mirror the chain head to lagging
-    // peers. The reseed is both the write-through for the link we just appended
-    // and the backstop for a peer that missed writes or was added later, so a
-    // failover to any bucket continues the chain even when the fleet is idle.
-    if !delta.is_empty() {
-        append_chain_link(state, storage, generation, delta).await;
+    let handles = state.buckets.handles();
+    if handles.get(pinned.index).is_none() {
+        error!(
+            bucket = pinned.index,
+            "transparency: pinned bucket has no handle; checkpoint skipped"
+        );
+        return;
     }
-    let replicas = state.singleton_replicas(pinned.index);
-    crate::transparency::reseed_chain_to_peers(storage, &replicas).await;
+    // The chain fleet in config order: the write pin plus every eligible peer.
+    // Config order is what makes the append arbiter below the same bucket on every
+    // node, which is what a CAS can arbitrate.
+    let peers = state.singleton_replicas(pinned.index);
+    let mut fleet: Vec<crate::layout::ReplicaTarget<'_>> = Vec::with_capacity(peers.len() + 1);
+    let mut primary = 0usize;
+    for (index, handle) in handles.iter().enumerate() {
+        if index == pinned.index {
+            primary = fleet.len();
+            fleet.push(crate::layout::ReplicaTarget {
+                storage: pinned.storage.as_ref(),
+                name: handle.name.as_str(),
+            });
+        } else if let Some(peer) = peers.iter().find(|peer| peer.name == handle.name) {
+            fleet.push(crate::layout::ReplicaTarget {
+                storage: peer.storage,
+                name: peer.name,
+            });
+        }
+    }
+    let synced = crate::transparency::catch_up_fleet(&fleet, primary).await;
+    // Append only on churn — but a delta a previous pass could not land is churn
+    // that has not been committed yet, so it rides along on the next pass even if
+    // this one is idle.
+    merge_unlanded(&pinned.storage, &mut delta);
+    if delta.is_empty() {
+        return;
+    }
+    if synced.in_sync.is_empty() {
+        warn!(
+            "transparency: no bucket could arbitrate the checkpoint; carrying it to the next audit"
+        );
+        carry_unlanded(&pinned.storage, delta);
+        return;
+    }
+    if let Some(unlanded) =
+        append_chain_link(state, &fleet, primary, synced, generation, delta).await
+    {
+        carry_unlanded(&pinned.storage, unlanded);
+    }
 }
 
-/// Append one hash-chained link committing `delta` to the primary bucket. Two
-/// attempts: a racing dual leader can win the create-CAS at our seq, so re-read
-/// the head and re-chain once; a second loss means a peer is keeping the chain
-/// current, so defer to the next audit rather than spin or overwrite.
+/// Append one hash-chained link committing `delta` and mirror it across the
+/// fleet. Returns the delta when it landed nowhere, so the caller can carry it
+/// into the next pass.
+///
+/// The seq is decided by one create-if-absent CAS on the **arbiter**: the first
+/// bucket, in config order, whose chain this pass read cleanly (`synced`). Every
+/// leader picks the same bucket, so two of them racing the same seq are resolved
+/// by the store instead of by whoever wrote last. The link itself chains onto this
+/// bucket's head, which the catch-up just made the fleet head — an arbiter that is
+/// behind therefore receives a link it can still be backfilled under, never a
+/// second branch.
+///
+/// Losing the CAS does **not** abandon the link. The loser adopts the winner —
+/// pulling it onto this bucket — and appends at the next seq in the same pass;
+/// dropping the delta instead would leave the chain committing an old sha over
+/// bytes storage has already replaced, which `verify-chain` reports as a tamper
+/// that never clears. Two attempts, then carry: a racing leader can only take the
+/// seq we just read, so a second loss means to stop spinning, not to give up.
 async fn append_chain_link(
     state: &AppState,
-    storage: &dyn Storage,
+    fleet: &[crate::layout::ReplicaTarget<'_>],
+    primary: usize,
+    synced: crate::transparency::FleetChain,
     generation: u64,
     delta: crate::transparency::Delta,
-) {
-    // Two attempts: a racing dual leader can win the create-CAS at our seq, so
-    // re-read the head and re-chain once. A second loss means a peer is keeping
-    // the chain current — defer to the next audit rather than spin or overwrite.
+) -> Option<crate::transparency::Delta> {
+    let mut synced = synced;
+    let Some(pin) = fleet.get(primary) else {
+        return Some(delta);
+    };
     for attempt in 0..2 {
+        let Some(&decider) = synced.in_sync.first() else {
+            break;
+        };
+        let Some(arbiter) = fleet.get(decider) else {
+            break;
+        };
         if let Err(e) = require_generation(state, generation) {
-            warn!(error=?e, "transparency: generation changed; checkpoint skipped");
-            return;
+            warn!(error=?e, "transparency: generation changed; checkpoint carried to the next audit");
+            return Some(delta);
         }
-        let (seq, prev_sha256) = match crate::transparency::read_head(storage).await {
+        let (seq, prev_sha256) = match crate::transparency::read_head(pin.storage).await {
             Ok(Some((head_seq, bytes))) => (head_seq + 1, sha256_hex(&bytes)),
             Ok(None) => (0, String::new()),
             Err(e) => {
-                error!(error=?e, "transparency: could not read chain head; checkpoint skipped");
-                return;
+                error!(error=?e, "transparency: could not read chain head; checkpoint carried");
+                return Some(delta);
             }
         };
         let created =
             match crate::clock::now_utc().format(&time::format_description::well_known::Rfc3339) {
                 Ok(created) => created,
                 Err(e) => {
-                    error!(error=?e, "transparency: timestamp format failed; checkpoint skipped");
-                    return;
+                    error!(error=?e, "transparency: timestamp format failed; checkpoint carried");
+                    return Some(delta);
                 }
             };
         let link = crate::transparency::ChainLink {
@@ -1335,39 +1475,58 @@ async fn append_chain_link(
         let bytes = match crate::transparency::link_bytes(&link) {
             Ok(bytes) => bytes,
             Err(e) => {
-                error!(error=?e, "transparency: serialize failed; checkpoint skipped");
-                return;
+                error!(error=?e, "transparency: serialize failed; checkpoint carried");
+                return Some(delta);
             }
         };
-        match storage
-            .put_if_none_match(&crate::transparency::chain_key(seq), bytes)
+        match arbiter
+            .storage
+            .put_if_none_match(&crate::transparency::chain_key(seq), bytes.clone())
             .await
         {
             Ok(Some(_)) => {
                 info!(
                     seq,
                     packages = link.packages.len(),
+                    bucket = %arbiter.name,
                     "transparency: checkpoint written"
                 );
-                // The write-through to peers is the caller's always-run reseed,
-                // which mirrors this new head to every lagging bucket.
-                return;
+                // Mirror the immutable link to every bucket the catch-up found
+                // consistent with this chain. A forked or unreadable bucket is not
+                // in that set and is deliberately left untouched.
+                for position in &synced.in_sync {
+                    if *position == decider {
+                        continue;
+                    }
+                    let Some(bucket) = fleet.get(*position) else {
+                        continue;
+                    };
+                    if let Err(e) = crate::transparency::copy_link(bucket, seq, &bytes).await {
+                        warn!(bucket = %bucket.name, seq, error = ?e, "transparency: mirroring the checkpoint to a peer failed; retries next audit");
+                    }
+                }
+                return None;
             }
             Ok(None) => {
                 if attempt == 1 {
                     warn!(
                         seq,
-                        "transparency: lost checkpoint CAS twice; deferring to next audit"
+                        "transparency: lost the checkpoint CAS twice; carrying it to the next audit"
                     );
+                    break;
                 }
-                // Otherwise loop: re-read the head and re-chain onto it.
+                // Adopt the winner instead of dropping our delta: the catch-up
+                // pulls its link onto this bucket, and the next attempt chains
+                // onto it at the following seq.
+                synced = crate::transparency::catch_up_fleet(fleet, primary).await;
             }
             Err(e) => {
-                error!(error=?e, seq, "transparency: checkpoint write failed");
-                return;
+                error!(error=?e, seq, bucket = %arbiter.name, "transparency: checkpoint write failed; carried to the next audit");
+                return Some(delta);
             }
         }
     }
+    Some(delta)
 }
 
 struct ShardAudit {

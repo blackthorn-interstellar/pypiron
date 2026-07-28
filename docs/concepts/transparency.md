@@ -27,14 +27,16 @@ pypiron verify-chain --config pypiron.toml
 
 - **Exit 0** — every recorded file still matches its checkpoint. Nothing was
   touched.
-- **Exit 1** — one or more files were altered or deleted out-of-band. Each is
-  printed, one per line:
+- **Exit 1** — the record no longer holds. Each finding prints on its own line:
 
   ```
   hash-changed   acme-tools   acme_tools-2.1.0-py3-none-any.whl: committed abc… but the sidecar now holds def…
   vanished       acme-tools   acme_tools-1.0.0-py3-none-any.whl: committed sidecar is gone with no tombstone
   ```
 
+  Most findings name a file that was altered or deleted out-of-band. One
+  doesn't: `chain-diverged` names two buckets whose histories part company
+  ([below](#when-two-buckets-disagree)).
 - **Exit 2** — the check couldn't run (storage unreachable, bad config).
 
 Files you uploaded since the last checkpoint aren't flagged — the log trails
@@ -59,6 +61,24 @@ in one region is caught, not just the one your server happens to prefer. A bucke
 that hasn't caught up yet is reported as lagging, not flagged as tampered. And
 because the log travels with your data, losing a bucket and failing over to
 another keeps the same unbroken history instead of quietly starting fresh.
+
+## When two buckets disagree
+
+`chain-diverged` means two buckets hold different entries at the same point, and
+from there on they record two different histories. No file is named, because
+none is implicated: each history is internally sound.
+
+It takes a real split to get here — buckets that couldn't reach each other for
+long enough that both kept recording. Both histories are evidence, so pypiron
+does not pick one. Read the row: it names each bucket and where the two part.
+
+Decide which bucket's history is yours — normally the one your writers were on.
+Without a lock on `_transparency/`, copy that bucket's log over the other's and
+the split is gone. Under Object Lock the losing entries can't be removed at all:
+run verify-chain against the bucket you chose (`--buckets s3://…`) for a clean
+check, and leave the split standing. Keeping it is what the lock is for.
+
+Serving is unaffected either way — nothing reads the log to answer a request.
 
 ## Close the rollback gap
 

@@ -116,8 +116,15 @@ edit.
 
 Each leader audit (daily plus one on boot) additionally writes
 `_transparency/chain/<seq>.json` — create-only, CAS-allocated (`If-None-Match`
-on the next `seq`; a racing dual leader loses the CAS, re-reads, and re-chains,
-so no new coordination is introduced). A checkpoint carries `seq`, the sha256 of
+on the next `seq`, against the **arbiter**: the first bucket in config order
+whose chain that pass could read. Every node picks the same one, so two leaders
+racing a seq are separated by the store, not by whoever wrote last. The loser
+adopts the winner's link and appends at the following seq *in the same pass* —
+dropping its delta would leave the chain committing an old sha over bytes
+storage has already replaced, a false `hash-changed` that clears only when that
+package next churns. No new coordination is introduced). A delta that lands
+nowhere is held in leader memory for the next pass; a crash there loses it, and
+the next audit that sees the package change re-commits it. A checkpoint carries `seq`, the sha256 of
 the previous checkpoint, and a churn-sized delta: for each package whose
 fingerprint changed since the last checkpoint, the per-file map filename →
 artifact sha256, taken from the sidecar. Genesis commits the whole corpus.
@@ -163,14 +170,27 @@ not truth, not a regenerable view, but an append-only **witness**. Deleting the
 whole tree never breaks the server — the chain simply restarts at a new genesis
 and the tamper-evidence history resets — and it is never lifecycle-expired.
 Across a fleet it is a **singleton-replicated** control record (the storage-layout
-manifest, `src/layout.rs`): each immutable, leader-authored link is written
-through to every healthy bucket right after the audit commits it (create-if-absent
-per seq, with a backfill for a bucket that missed writes). That closes the
-failover hole — a new leader reads the latest seq from its own bucket and
-*continues* the chain instead of restarting at a fresh genesis that would launder
-the very history the chain exists to protect. It is on by default, and the audit's
+manifest, `src/layout.rs`), and the fleet is reconciled **before** the audit
+appends, not after. Every pass compares each bucket's link set with the write
+pin's and copies the difference in whichever direction lacks it — pushing what a
+lagging peer never received and *pulling* what a peer that led while this bucket
+lagged already holds. Only then is a link appended. That ordering is what closes
+the failover hole: the pin's head is the fleet head by the time anything is
+written, so a leader that just failed over onto a lagging bucket continues the one
+chain instead of restarting at genesis *or* spending a seq a peer already used
+under different bytes. Either would launder the very history the chain exists to
+protect. Copies are set differences, so a hole below a bucket's head is backfilled
+rather than skipped forever.
+
+Two buckets holding different links at the same seq are a **fork**, and pypiron
+never resolves one: nothing is copied in either direction, that bucket cannot
+arbitrate an append, and `verify-chain` reports `chain-diverged` naming both
+branch heads for an out-of-band operator decision. Splicing across a divergence
+would graft one branch's suffix onto the other's prefix — a recoverable split
+turned into a permanently broken chain — and picking a winner is exactly the
+laundering a tamper witness must refuse. It is on by default, and the audit's
 cost philosophy carries over intact: checkpoint size scales with churn, not corpus
-size, and the write-through is one small PUT per peer per link.
+size, and the reconcile is one LIST per bucket plus a couple of GETs.
 
 ## Write-time metadata capture: never compute at read or rebuild time
 
@@ -761,14 +781,25 @@ _counters/seg/<metric>/<day>/<shard>/<id>.json   # download counters: node-flush
                                          #   (write path; <id> is a unique per-incarnation id). LIVE
                                          #   TALLIES — bucket-local, never replicated; a failover
                                          #   loses at most the current day (the declared loss window).
-_counters/day/<metric>/<day>/<shard>.json        # frozen per-shard day total (leader compaction);
-                                         #   a frozen file wins over the seg dir, so a crash mid-
-                                         #   compaction can't double-count or shrink a total.
-_counters/day/<metric>/<day>/_summary.json       # per-day total + busiest keys (dashboard reads).
+_counters/day/<metric>/<day>/<shard>@<bucket>.json  # frozen per-shard day total for ONE bucket's
+                                         #   segments (leader compaction). <bucket> is that bucket's
+                                         #   sanitized configured identity ([A-Za-z0-9._-], never its
+                                         #   index): segments live only on the bucket their node had
+                                         #   pinned, so each bucket is frozen from its own in isolation
+                                         #   and a read SUMS the variants. A frozen file wins over that
+                                         #   bucket's seg dir, so a crash mid-compaction can't double-
+                                         #   count or shrink a total; and since the sentinel names its
+                                         #   bucket, a bucket unreachable during a pass is skipped whole
+                                         #   and frozen by a later one.
+_counters/day/<metric>/<day>/_summary@<bucket>.json # that bucket's day total + busiest keys
+                                         #   (dashboard reads; the day is the sum of the variants).
                                          #   The _counters/day/ ROLLUP is leader-authored, immutable
-                                         #   truth: reseeded to every bucket so a failover keeps the
-                                         #   /audit ranking and /stats history. The seg/day split sits
-                                         #   above <metric> so a static prefix classifies each half.
+                                         #   truth: every bucket converges on the UNION of the variants
+                                         #   so a failover keeps the /audit ranking and /stats history.
+                                         #   Identity rides in the FILENAME, not a new path component,
+                                         #   so every key keeps its arity for classification and
+                                         #   retention. The seg/day split sits above <metric> so a
+                                         #   static prefix classifies each half.
                                          #   Sharded by package first char (0-9a-z, _).
 _staging/<ts>-<pid>-<filename>           # cloud only: a >64 MB upload streams here, then
                                          #   copy-if-not-exists publishes it to its final key.
@@ -786,7 +817,7 @@ declared class fails CI. Six classes:
 | --- | --- | --- |
 | `packages/` | truth-replicated | yes, per record — three-tier fan-out → `_repl/` notes → reconcile. Private truth and `sync --to` snapshots (sidecar `snapshot=true`) fan out pre-ack; proxy-cache fills (sidecar `snapshot` absent/false) replicate too but **asynchronously** — a post-serve `_repl/` note the sweep drains, healed by the reconcile diff — so any bucket serves the whole corpus, cached bytes included. No standing exceptions: a demotion loser *leaves* this tree rather than sitting in it unreplicated — its `.mirror-quarantined` fence replicates, its body moves to `_quarantine/`, and the canonical key ends empty everywhere. The one key under this prefix that is deliberately bucket-local is `<filename>.superseding`, and it is transient rather than an exception: it is not in the replicated record set, it is written and deleted inside one `supersede_record`, and a crash that strands one is cleared unconditionally by the next index rebuild's `finish_interrupted_supersedes` (or by `drop_record_objects`, if a tombstone or freeze lands over the filename first). So the tree converges because the marker always goes, not because it replicates — which is why a bucket-local key can live under a truth-replicated prefix without contradicting the class |
 | `_advisories/osv-pypi.zip`, `_advisories/quarantined.json`, `_transparency/chain/` | singleton-replicated | yes — leader-authored control records written write-through to every healthy bucket + reseed-if-absent; the chain is written through so a failover continues the seq rather than restarting genesis, and `verify-chain` walks every bucket |
-| `_counters/day/` | replicated-rollup | yes — leader-authored, immutable day-rollups reseeded copy-if-absent to every bucket, so a failover keeps the /audit ranking and /stats history |
+| `_counters/day/` | replicated-rollup | yes — leader-authored, immutable day-rollups, each naming the bucket whose segments it summed (`<shard>@<bucket>.json`), reseeded copy-if-absent until every bucket holds the union, so a failover keeps the /audit ranking and /stats history. The reseed is a union mesh, not a push from the write pin: each bucket authors its own variants, so a peer's rollup has to reach the pin too or a read there would report a short day |
 | `_counters/seg/`, `_quarantine/` | declared-loss | no — two bounded, annotated losses. `_counters/seg/`: the current day's un-rolled-up live tallies, at most one day. `_quarantine/`: the losing byte-sets of freezes and demotions resolved on that bucket — never a byte the fleet serves, never the winner, and always announced by a fence (`.frozen` + tombstone, or `.mirror-quarantined`) that *does* replicate. Calling the quarantine tree "derived" was the comfortable lie: a preserved loser is not recomputable from anything |
 | `simple/`, `_advisories/report.json`, `_state/`, `_sync/cursors.json` | derived-per-bucket | no — each bucket rebuilds/re-derives its own from the truth it holds |
 | `_leader/lease.json`, `_repl/`, `_topology/stamp.json`, `_staging/`, `_dirty/` | coordination-per-bucket | no — bucket-local by design; replicating it would be wrong |
@@ -802,7 +833,16 @@ The transparency chain is singleton-replicated: leader-authored links are writte
 through to every bucket so a failover continues the chain instead of restarting at
 genesis, and `verify-chain` walks every bucket's chain and diffs it against every
 bucket's sidecars. Counters split by half — the immutable day-rollups replicate,
-the current day's live segments are the one declared-loss window.
+the current day's live segments are the one declared-loss window. That split is
+also why a rollup names its bucket: because segments are bucket-local, a finished
+day can have segments on several buckets at once, and a single shared
+`<shard>.json` would let the first bucket to freeze claim the whole day — it
+reseeds everywhere as truth, and the next leader elsewhere reads it as "already
+frozen" and sweeps that bucket's segments without ever summing them. A completed
+day is therefore exact once every bucket has been reachable for one rollup pass;
+a bucket unreachable until retention expires loses its share, which is a wider
+window than the ≤1-day live-tally loss and the reason the freeze is per-bucket
+rather than fleet-wide.
 
 `<pkg>` is always the PEP 503 normalized name. Index rebuilds include only
 artifact files — metadata companions, tombstones, freeze markers, and dotfiles

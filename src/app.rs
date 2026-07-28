@@ -384,12 +384,14 @@ impl AppState {
             .collect()
     }
 
-    /// The eligible peer buckets a leader mirrors counter day-rollups onto
-    /// ([`crate::counters::Counters::reseed_rollups`]), excluding the write pin at
+    /// The eligible peer buckets a leader compacts and mirrors counter day-rollups
+    /// onto ([`crate::counters::Counters::compact`],
+    /// [`crate::counters::Counters::reseed_rollups`]), excluding the write pin at
     /// `primary_index`. Same eligibility as [`AppState::singleton_replicas`] — a
     /// leader-authored write fan-out, so it is gated on the topology write-fence —
     /// but wrapped as the counter engine's own store so it never sees pypiron's
-    /// `Storage`. Empty for a single-bucket or fenced node.
+    /// `Storage`. Empty for a single-bucket or fenced node; each bucket's segments
+    /// are then simply frozen by a later pass.
     pub(crate) fn counter_rollup_peers(
         &self,
         primary_index: usize,
@@ -408,8 +410,7 @@ impl AppState {
                     .is_none_or(|health| health.bucket_eligible(*index).unwrap_or(false))
             })
             .map(|(_, handle)| {
-                Box::new(PinnedCounterStore(handle.storage.clone()))
-                    as Box<dyn counters::ObjectStore>
+                Box::new(PinnedCounterStore::new(handle)) as Box<dyn counters::ObjectStore>
             })
             .collect()
     }
@@ -670,7 +671,23 @@ struct CounterStore {
 
 impl counters::ObjectStoreSelector for CounterStore {
     fn pin(&self) -> Box<dyn counters::ObjectStore> {
-        Box::new(PinnedCounterStore(self.buckets.pin().storage.clone()))
+        let pinned = self.buckets.pin();
+        let handle = self.buckets.handles().get(pinned.index);
+        Box::new(PinnedCounterStore {
+            storage: pinned.storage.clone(),
+            bucket: counters::bucket_tag(handle.map_or("", |handle| handle.name.as_str())),
+        })
+    }
+
+    /// Every configured bucket's tag, healthy or not: a finished day's rollups are
+    /// replicated, so the pin holds a down bucket's variant and a read that
+    /// dropped it would report a short day.
+    fn bucket_tags(&self) -> Vec<String> {
+        self.buckets
+            .handles()
+            .iter()
+            .map(|handle| counters::bucket_tag(&handle.name))
+            .collect()
     }
 
     /// The eligible peer buckets (excluding the write pin) a current-day read
@@ -694,34 +711,52 @@ impl counters::ObjectStoreSelector for CounterStore {
                     .is_none_or(|h| h.bucket_eligible(*index).unwrap_or(false))
             })
             .map(|(_, handle)| {
-                Box::new(PinnedCounterStore(handle.storage.clone()))
-                    as Box<dyn counters::ObjectStore>
+                Box::new(PinnedCounterStore::new(handle)) as Box<dyn counters::ObjectStore>
             })
             .collect()
     }
 }
 
-struct PinnedCounterStore(Arc<dyn Storage>);
+/// One bucket as the counter engine sees it: its storage handle plus the stable
+/// tag the engine stamps into the rollups it authors there.
+struct PinnedCounterStore {
+    storage: Arc<dyn Storage>,
+    bucket: String,
+}
+
+impl PinnedCounterStore {
+    fn new(handle: &crate::buckets::BucketHandle) -> Self {
+        Self {
+            storage: handle.storage.clone(),
+            bucket: counters::bucket_tag(&handle.name),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl counters::ObjectStore for PinnedCounterStore {
+    fn bucket(&self) -> &str {
+        &self.bucket
+    }
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        if self.0.supports_leases() {
+        if self.storage.supports_leases() {
             // Cloud: distinguishes a genuine miss (Ok(None)) from a transient
             // error (Err) — the engine must never freeze a day from a failed read.
-            Ok(self.0.get_with_etag(key).await?.map(|(b, _)| b))
+            Ok(self.storage.get_with_etag(key).await?.map(|(b, _)| b))
         } else {
             // Disk: get_bytes errors on a miss; a single-node disk store has no
             // compaction-safety stakes, so treat any error as absent.
-            Ok(self.0.get_bytes(key).await.ok())
+            Ok(self.storage.get_bytes(key).await.ok())
         }
     }
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
-        self.0.put_bytes(key, bytes, Some("application/json")).await
+        self.storage
+            .put_bytes(key, bytes, Some("application/json"))
+            .await
     }
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         Ok(self
-            .0
+            .storage
             .list_all(prefix)
             .await?
             .into_iter()
@@ -729,7 +764,7 @@ impl counters::ObjectStore for PinnedCounterStore {
             .collect())
     }
     async fn delete(&self, keys: &[String]) -> Result<()> {
-        self.0.delete_keys(keys).await
+        self.storage.delete_keys(keys).await
     }
 }
 

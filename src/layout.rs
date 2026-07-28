@@ -41,7 +41,8 @@ pub enum Class {
     /// mechanism as [`Class::SingletonReplicated`], but many keys rather than one
     /// fixed key). The counter day-rollups are the exhibit: losing them on a
     /// failover would zero the audit's download ranking during the incident it
-    /// exists for. See [`crate::counters::Counters::reseed_rollups`].
+    /// exists for. See [`crate::counters::Counters::compact`], whose pass both
+    /// freezes each bucket's rollups and converges every bucket on their union.
     ReplicatedRollup,
     /// A narrow, explicitly-bounded acceptable-loss window — the totality
     /// exemption for state that is neither derived (not re-computable) nor
@@ -293,12 +294,14 @@ mod tests {
             Some(Class::DerivedPerBucket)
         );
         // Counter day-rollups replicate; the current day's live segments do not.
+        // A rollup names the bucket whose segments it summed, in the filename —
+        // the path arity, and so this classification, is unchanged by that.
         assert_eq!(
-            classify("_counters/day/downloads/2026-01-01/r.json"),
+            classify("_counters/day/downloads/2026-01-01/r@s3---east.json"),
             Some(Class::ReplicatedRollup)
         );
         assert_eq!(
-            classify("_counters/day/downloads/2026-01-01/_summary.json"),
+            classify("_counters/day/downloads/2026-01-01/_summary@s3---east.json"),
             Some(Class::ReplicatedRollup)
         );
         assert_eq!(

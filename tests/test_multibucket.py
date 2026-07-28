@@ -2709,6 +2709,147 @@ def test_verify_chain_tolerates_a_chain_current_bucket_missing_sidecars(
     assert wheel.name in out, out
 
 
+def _chain_commits(minio, bucket: str, pkg: str) -> bool:
+    """Does any link in `bucket`'s chain commit `pkg`?"""
+    for seq in _chain_seqs_in(minio, bucket):
+        link = json.loads(minio_get_key_in(minio, bucket, _chain_key(seq)))
+        if pkg in link.get("packages", {}):
+            return True
+    return False
+
+
+def test_a_failover_onto_a_lagging_bucket_does_not_fork_the_chain(
+    minio_two_proxy, pypiron_bin, tmp_path_factory, tmp_path
+):
+    """The fleet forks its own chain with nobody tampering: a reseed is
+    best-effort, so a peer that missed a link lags; failover then pins the leader
+    onto that lagging bucket, which continues from ITS head and writes a different
+    link at a seq the other bucket already spent. Both branches are internally
+    valid, so `verify-chain` fails forever on an untampered fleet and the one
+    alarm meaning "someone edited history" becomes background noise.
+
+    Both branches must COEXIST for this to be the real bug — unlike
+    `test_failover_continues_the_chain_instead_of_restarting_genesis`, which
+    removes bucket A before B appends, so there is never a second branch to fork
+    against. Here A keeps its links and comes back healthy.
+
+    The fix is ordering: catch the fleet up BEFORE appending. The leader on the
+    lagging bucket pulls the links its peer holds first, so its head is the fleet
+    head and the next link extends the one history instead of splitting it."""
+    minio = minio_two_proxy
+    a, b = minio["buckets"]
+    # Reads for the verdict go straight to MinIO, never through the fault proxy.
+    direct = {key: value for key, value in minio.items() if key != "server_endpoint"}
+    server_gen = _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        extra_env={"PYPIRON_RECONCILE_INTERVAL_SECS": "2"},
+        extra_args=[
+            "--bucket-leave-failures",
+            "1",
+            # The pin must stay on B once it fails over: this test is about the
+            # leader that runs there, not about coming home.
+            "--bucket-return-healthy-secs",
+            "3600",
+        ],
+    )
+    server = next(server_gen)
+    try:
+        _eventually(
+            lambda: _selected_bucket(server) == a,
+            timeout=15,
+            what="preferred write bucket selected",
+        )
+        # Two links, replicated to both buckets, so A can end up genuinely ahead.
+        _upload(server, make_wheel("chainforka", "1.0", tmp_path))
+        _eventually(
+            lambda: _chain_seqs_in(minio, a) == _chain_seqs_in(minio, b) == [0],
+            timeout=60,
+            what="first chain link replicated to both buckets",
+        )
+        _upload(server, make_wheel("chainforkb", "1.0", tmp_path))
+        _eventually(
+            lambda: _chain_seqs_in(minio, a) == _chain_seqs_in(minio, b) == [0, 1],
+            timeout=60,
+            what="second chain link replicated to both buckets",
+        )
+
+        # A blips: the pin moves to B, whose leader audits its own (un-fingerprinted)
+        # copy and appends a link of its own while A is unreachable.
+        minio["faults"].fail(a)
+        _eventually(
+            lambda: _selected_bucket(server) == b,
+            timeout=60,
+            what="node fails over to bucket B",
+        )
+        _eventually(
+            lambda: len(_chain_seqs_in(minio, b)) > 2,
+            timeout=90,
+            what="the failover leader appends on B while A is unreachable",
+        )
+
+        # Now make B the lagging bucket the reseed never repaired: it keeps only
+        # genesis while A still holds seq 1. This is bug step 1 — a link the peer
+        # never received — reached by hand because a dropped reseed is a transient
+        # error we cannot schedule.
+        for seq in _chain_seqs_in(minio, b):
+            if seq > 0:
+                minio_delete_key_in(minio, b, _chain_key(seq))
+        assert _chain_seqs_in(minio, b) == [0], _chain_seqs_in(minio, b)
+        assert _chain_seqs_in(minio, a) == [0, 1], _chain_seqs_in(minio, a)
+
+        # A comes back healthy — reachable, and a legal peer again. The pin stays
+        # on B (long return window), so the next audit's leader runs on the bucket
+        # that is behind: exactly the state that used to fork.
+        minio["faults"].recover(a)
+        _eventually(
+            lambda: _bucket_health(server, a) == 1,
+            timeout=60,
+            what="bucket A is healthy again",
+        )
+        assert _selected_bucket(server) == b, "the pin must stay on the lagging bucket"
+
+        # Churn: the leader on B must commit this upload somewhere in the chain.
+        _retry_upload(server, make_wheel("chainforkc", "1.0", tmp_path))
+        _eventually(
+            lambda: (
+                _chain_commits(minio, b, "chainforkc") or _chain_commits(minio, a, "chainforkc")
+            ),
+            timeout=90,
+            what="the leader on the lagging bucket commits the new upload",
+        )
+    finally:
+        minio["faults"].recover(a)
+        server_gen.close()
+
+    # Nothing was tampered with, so the fleet-wide walk must pass.
+    rc, out, err = _verify_chain_s3(pypiron_bin, direct)
+    assert "chain-diverged" not in out, f"an untampered fleet must not fork:\n{out}{err}"
+    assert rc == 0, f"a failover onto a lagging bucket must not fault verify-chain:\n{out}{err}"
+
+
+def _counter_bucket_tag(bucket: str) -> str:
+    """The identifier pypiron stamps into a counter rollup's filename for the
+    bucket whose segments it summed — the configured `s3://<name>` identity with
+    everything outside `[A-Za-z0-9._-]` folded to `-` (see `counters::bucket_tag`)."""
+    return re.sub(r"[^A-Za-z0-9._-]", "-", f"s3://{bucket}")
+
+
+def _counter_rollup_keys(day: str, shard: str, bucket: str) -> tuple:
+    """`(frozen shard rollup, day summary)` for one bucket's share of `day`."""
+    tag = _counter_bucket_tag(bucket)
+    return (
+        f"_counters/day/downloads/{day}/{shard}@{tag}.json",
+        f"_counters/day/downloads/{day}/_summary@{tag}.json",
+    )
+
+
+def _counter_seg(key: str, count: int) -> str:
+    """One injected delta segment: `count` events against `key` at bucket 00:00."""
+    return json.dumps({"resolution_secs": 86400, "buckets": {"00:00": {key: count}}})
+
+
 def test_counter_day_rollups_replicate_and_survive_failover(
     s3_server_multi_counters_failover,
 ):
@@ -2729,12 +2870,7 @@ def test_counter_day_rollups_replicate_and_survive_failover(
     today = datetime.datetime.now(datetime.timezone.utc).date()
     past = (today - datetime.timedelta(days=3)).isoformat()
     today_s = today.isoformat()
-    seg = json.dumps(
-        {
-            "resolution_secs": 86400,
-            "buckets": {"00:00": {"requests/requests-9.9.9-py3-none-any.whl": 7}},
-        }
-    )
+    seg = _counter_seg("requests/requests-9.9.9-py3-none-any.whl", 7)
     past_seg = f"_counters/seg/downloads/{past}/r/injected-0.json"
     today_seg = f"_counters/seg/downloads/{today_s}/r/injected-0.json"
     # Inject a finished past day AND a current-day live tally straight into the
@@ -2742,8 +2878,7 @@ def test_counter_day_rollups_replicate_and_survive_failover(
     minio_put_key_in(minio, a, past_seg, seg)
     minio_put_key_in(minio, a, today_seg, seg)
 
-    frozen = f"_counters/day/downloads/{past}/r.json"
-    summary = f"_counters/day/downloads/{past}/_summary.json"
+    frozen, summary = _counter_rollup_keys(past, "r", a)
 
     # Leader compaction freezes the finished day; the rollup reseed mirrors it and
     # its summary to the peer bucket.
@@ -2786,6 +2921,74 @@ def test_counter_day_rollups_replicate_and_survive_failover(
     # The server, now serving from the peer, stays up.
     code, _, _ = http_get(server["base_url"] + "/ready")
     assert code == 200
+
+
+def test_counter_day_rollups_sum_both_buckets_shares(
+    s3_server_multi_counters_failover,
+):
+    """A node's download tallies land on whichever bucket it had pinned, so one
+    finished day can have segments on BOTH buckets. Each bucket must be frozen
+    from its own segments and the day reported as the sum — not whichever half
+    the leader happened to be pinned to when it rolled the day up."""
+    server = s3_server_multi_counters_failover
+    minio = server["minio"]
+    a, b = minio["buckets"][:2]
+
+    _eventually(
+        lambda: _selected_bucket(server) == a,
+        timeout=15,
+        what="preferred write bucket selected",
+    )
+
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    past = (today - datetime.timedelta(days=3)).isoformat()
+    seg_key = f"_counters/seg/downloads/{past}/r/injected-0.json"
+    # DISJOINT shares of the same metric/day/shard, one per bucket — exactly what
+    # a mid-day selection change leaves behind.
+    minio_put_key_in(minio, a, seg_key, _counter_seg("rollupsplit/rollupsplit-1.0.whl", 4))
+    minio_put_key_in(minio, b, seg_key, _counter_seg("rollupsplit/rollupsplit-2.0.whl", 9))
+
+    frozen_a, summary_a = _counter_rollup_keys(past, "r", a)
+    frozen_b, summary_b = _counter_rollup_keys(past, "r", b)
+
+    # Each bucket freezes its own share into its own rollup, and the reseed then
+    # converges both buckets on the union, so a failover to either reads the day
+    # whole. That the peer's rollup reaches the write bucket is the point: reads
+    # go to the pin.
+    _eventually(
+        lambda: all(
+            minio_key_exists_in(minio, bucket, key)
+            for bucket in (a, b)
+            for key in (frozen_a, frozen_b, summary_a, summary_b)
+        ),
+        timeout=45,
+        what="both buckets' rollups frozen and converged onto both buckets",
+    )
+    assert json.loads(minio_get_key_in(minio, a, summary_a))["total"] == 4
+    assert json.loads(minio_get_key_in(minio, a, summary_b))["total"] == 9
+
+    # Neither bucket's segments were swept before they were counted.
+    for bucket in (a, b):
+        assert not minio_key_exists_in(minio, bucket, seg_key)
+
+    # /stats reports the SUM of both injections for the finished day (polled: the
+    # summary view is briefly cached).
+    def _stats():
+        code, body, _ = http_request_auth(
+            "GET",
+            server["base_url"] + "/stats/downloads",
+            username="admin",
+            password="secret",
+        )
+        assert code == 200, body
+        return json.loads(body)
+
+    _eventually(
+        lambda: _stats()["days"].get(past) == 13,
+        timeout=30,
+        what=f"/stats sums both buckets' shares of {past}",
+    )
+    assert _stats()["top"].get("rollupsplit") == 13, _stats()
 
 
 # ---------------------------------------------------------------------------
@@ -2880,11 +3083,9 @@ def test_single_survivor_every_state_class_serves_from_one_bucket(
     #    bucket; the leader freezes it and reseeds the rollup + summary to B.
     today = datetime.datetime.now(datetime.timezone.utc).date()
     past = (today - datetime.timedelta(days=3)).isoformat()
-    seg = json.dumps(
-        {"resolution_secs": 86400, "buckets": {"00:00": {f"survivorpriv/{priv.name}": 5}}}
-    )
+    seg = _counter_seg(f"survivorpriv/{priv.name}", 5)
     minio_put_key_in(minio, a, f"_counters/seg/downloads/{past}/r/injected-0.json", seg)
-    frozen = f"_counters/day/downloads/{past}/r.json"
+    frozen, _ = _counter_rollup_keys(past, "r", a)
 
     # --- Force convergence: every class must land on bucket B ---
     for key, what in (

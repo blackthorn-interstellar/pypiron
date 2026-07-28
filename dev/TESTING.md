@@ -184,9 +184,11 @@ comment. Replication merge: one package, two filenames, exactly two buckets,
 files, two lease-serialized workers, and a global name index collapsed to a
 single membership bit.
 
-Not modeled, and covered by sampling instead: counter rollups, the transparency
-chain, project status, read locality, concurrent mergers, and the N-bucket star
-composition. That last one is the load-bearing exclusion — the model enumerates
+Not modeled: counter rollups, the transparency chain, project status, read
+locality, concurrent mergers, and the N-bucket star composition. What backs up
+each exclusion is not the same, and the difference is the point of this section.
+
+The N-bucket star is the load-bearing exclusion — the model enumerates
 *pairwise* confluence, and pairwise implies N-way only if the merge is
 associative. It is not: `conflict_winner`'s `CONFLICT_SKEW_MS` guard
 (`src/replicate/decide.rs`) is non-transitive, so three private uploads of one
@@ -195,6 +197,18 @@ Whether that filename ends live or frozen fleet-wide depends on which pair
 merged first. Both outcomes are safe — every loser is quarantined, and the
 schedule-dependent side is the fail-closed one — but it is availability the
 model cannot see. The VOPR's three-bucket lane samples the star.
+
+Counter rollups and the transparency chain have no mechanized adversary at all.
+The VOPR does not touch either — `examples/vopr.rs` contains no reference to
+`src/counters.rs` or `src/transparency.rs` — so their only coverage is
+hand-written: the unit tests in each module, plus `tests/test_counters.py`,
+`tests/test_transparency.py`, and the counter and chain cases in
+`tests/test_multibucket.py`. This paragraph previously said these were "covered
+by sampling instead." That was false, and it is how two production bugs reached
+a shipped feature and were found by audit rather than by a gate: a day-rollup
+key carrying no bucket identity, and a chain fork that could never heal. Until a
+VOPR op exists for a subsystem on this list, treat it as uncovered — a stated
+compensating control that nothing executes is worse than a blank.
 
 The models don't get to invent the semantics they check: transitions call the
 real `worker::consumable_dirty_work` and `replicate::decide`, and two
@@ -639,10 +653,13 @@ document twice and been false both times within days — the roster empties,
 someone records the empty roster in the present tense, and the next census
 refills it while the sentence sits there reading as measurement. What is true is
 narrower and keeps its shape as the tree moves: *the root causes filed by the
-census at `08d94f2` are closed as of `8e5916f`*, each with its minimum reproducer
-promoted from the nightly to a pinned `ci.yml` gate so a regression reds a merge
-rather than a nightly. Whether new ones are open is a question about the *next*
-census, and this paragraph cannot answer it.
+census at `08d94f2` are closed as of `8e5916f`*, each with durable cover that reds
+a merge rather than a nightly — one as a pinned `ci.yml` seed (`62000150551`), the
+other two as unit tests
+(`a_peers_stranded_global_html_is_seen_by_the_node_that_won_the_last_cas`,
+`a_stale_spent_fence_clear_never_unauthorizes_a_settled_demotion`). Whether new
+ones are open is a question about the *next* census, and this paragraph cannot
+answer it.
 
 The roster the census at `08d94f2` filed, and where each stands at `8e5916f`:
 

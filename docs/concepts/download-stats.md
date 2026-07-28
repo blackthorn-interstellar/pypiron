@@ -60,7 +60,11 @@ The homepage and `/downloads/` render the same cached ranking.
 
 ## Accuracy and freshness
 
-- **Completed days are exact** — every node's counts are merged in.
+- **Completed days are exact** — every node's counts are merged in. With one
+  bucket that is immediate. With more than one, a finished day is exact once
+  every bucket has been reachable for a rollup pass (hourly by default): a
+  bucket that is down when the day is rolled up is left untouched and totalled
+  on a later pass, and the day's figure grows to its final value then.
 - **Today lags one flush interval.** A download shows up after the next flush
   (300 s by default), on both the per-package and global endpoints — never days
   behind.
@@ -69,7 +73,9 @@ The homepage and `/downloads/` render the same cached ranking.
 - **History survives a bucket failover.** With more than one bucket, each
   finished day's totals are copied to every bucket, so failing over to another
   bucket keeps your full history — you lose at most the current day's in-progress
-  counts.
+  counts. A bucket that stays unreachable until your retention window
+  (`--counters-retention-days`, 90 days) expires does lose its share of the days
+  it never got to total.
 - Changing `--counters-resolution` is safe: existing days keep the resolution
   they were written with.
 

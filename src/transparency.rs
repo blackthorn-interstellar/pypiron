@@ -20,12 +20,27 @@
 //! the timestamp, no randomness) so the deterministic simulator (`examples/vopr`)
 //! can exercise the write without diverging.
 //!
+//! Across buckets the chain is one chain, not one per bucket. Every audit
+//! reconciles the fleet *before* it appends ([`catch_up_fleet`]): links are copied
+//! in whichever direction lacks them, so the write pin's head is the fleet head by
+//! the time a link is written and a leader that just failed over cannot re-use a
+//! seq a peer already spent. The append itself is a create-if-absent CAS on a
+//! deterministic arbiter (the first reachable bucket in config order), and a
+//! leader that loses that CAS adopts the winner and appends again at the next seq
+//! rather than dropping its delta — a dropped delta leaves the chain committing an
+//! old sha over new bytes, which `verify-chain` then reports as a tamper that
+//! never clears. A delta that no bucket would accept is held in the leader's
+//! memory and merged into the next pass; a crash there loses it, and that is the
+//! accepted residual (the next audit that sees the package change re-commits it).
+//!
 //! Exit codes mirror `verify-index`: **0** chain valid and storage matches,
 //! **1** a violation (rows on stdout, an expected scriptable outcome), **2** the
 //! check could not run. A chain that lags truth (files in storage not yet
-//! committed) is fine — verify never faults uncommitted files.
+//! committed) is fine — verify never faults uncommitted files. A fork — two
+//! buckets holding different links at the same seq — exits 1 and names both
+//! branches; nothing here resolves it automatically.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
@@ -39,13 +54,13 @@ use crate::storage::{is_not_found, Storage, StorageArgs};
 
 /// Namespace for the chain. Classified [`SingletonReplicated`] in the storage
 /// layout manifest (`crate::layout`): each immutable, leader-authored link is
-/// written through to every healthy bucket after the audit commits it (see
-/// [`reseed_chain_to_peers`]), so a failover leader reads the latest seq from its
-/// own bucket and *continues* the chain instead of restarting at a fresh genesis
-/// that would launder the tamper history. The truth fan-out (`replicate.rs`) only
-/// touches `packages/`; the chain rides this dedicated create-if-absent
-/// write-through instead — links are immutable per seq, so a peer that already
-/// holds a seq is never overwritten.
+/// mirrored to every healthy bucket, and the fleet is reconciled *before* the
+/// audit appends (see [`catch_up_fleet`]), so a failover leader continues the one
+/// chain instead of restarting at a fresh genesis — or spending a seq a peer
+/// already used — either of which would launder the tamper history. The truth
+/// fan-out (`replicate.rs`) only touches `packages/`; the chain rides this
+/// dedicated create-if-absent write-through instead — links are immutable per seq,
+/// so a peer that already holds a seq is never overwritten.
 ///
 /// [`SingletonReplicated`]: crate::layout::Class::SingletonReplicated
 pub(crate) const CHAIN_PREFIX: &str = "_transparency/chain/";
@@ -106,74 +121,226 @@ pub async fn read_head(storage: &dyn Storage) -> Result<Option<(u64, Vec<u8>)>> 
     Ok(Some((max, bytes)))
 }
 
-/// Mirror the primary's current chain head to every healthy peer that lags it,
-/// so a failover to any bucket continues this chain rather than starting a fresh
-/// genesis that would launder tamper history. Each immutable link is written
-/// create-if-absent (`put_if_none_match`): a peer already holding a seq is left
-/// untouched, and a peer holding a *divergent* seq (a forked chain) is never
-/// overwritten — `verify-chain` adjudicates that divergence rather than laundering
-/// it here.
-///
-/// This is both the write-through (the leader just appended a link) and the
-/// backstop (a peer that missed writes, or a freshly added bucket, is backfilled).
-/// It runs every audit regardless of churn, so an idle fleet still converges.
-/// Best-effort and a no-op in single-bucket mode (empty `replicas`) or on an empty
-/// chain.
-pub async fn reseed_chain_to_peers(
-    primary: &dyn Storage,
-    replicas: &[crate::layout::ReplicaTarget<'_>],
-) {
-    if replicas.is_empty() {
-        return;
-    }
-    let (seq, bytes) = match read_head(primary).await {
-        Ok(Some(head)) => head,
-        Ok(None) => return, // no chain yet — nothing to mirror
-        Err(e) => {
-            warn!(error = ?e, "transparency: reading chain head for peer reseed failed; retries next audit");
-            return;
-        }
-    };
-    for replica in replicas {
-        if let Err(e) = catch_up_replica(primary, replica, seq, &bytes).await {
-            warn!(
-                bucket = %replica.name,
-                seq,
-                error = ?e,
-                "transparency: chain reseed to a peer failed; retries next audit"
-            );
-        }
-    }
+/// Every seq a bucket currently holds a link for.
+async fn chain_seqs(storage: &dyn Storage) -> Result<BTreeSet<u64>> {
+    Ok(storage
+        .list_all(CHAIN_PREFIX)
+        .await?
+        .iter()
+        .filter_map(|o| seq_from_key(&o.key))
+        .collect())
 }
 
-/// Copy every chain link a single peer is missing, from its head up to `seq`
-/// (whose bytes are `head_bytes`), oldest first so the peer's chain stays a
-/// gapless prefix. A peer already current with (or ahead of) `seq` is a no-op;
-/// an empty peer (a freshly added bucket) is seeded the whole chain.
-async fn catch_up_replica(
-    primary: &dyn Storage,
-    replica: &crate::layout::ReplicaTarget<'_>,
-    seq: u64,
-    head_bytes: &[u8],
-) -> Result<()> {
-    let start = match read_head(replica.storage).await? {
-        // Current or ahead: a longer/equal peer chain is either identical (done)
-        // or a divergence for verify-chain to catch — never overwrite it.
-        Some((peer_head, _)) if peer_head >= seq => return Ok(()),
-        Some((peer_head, _)) => peer_head + 1,
-        None => 0,
+/// Where the fleet's chain stands after [`catch_up_fleet`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FleetChain {
+    /// Positions in the fleet, config order, of every bucket whose chain this pass
+    /// could read and found consistent with the write pin's — the buckets the next
+    /// link may be created on. The first is the append arbiter. Empty when even the
+    /// pin's own chain could not be listed.
+    pub in_sync: Vec<usize>,
+}
+
+/// Reconcile the chain across the fleet, and report which buckets a new link may
+/// be created on.
+///
+/// This runs *before* the leader appends, and that ordering is the point: once
+/// every reachable bucket agrees, the write pin's head is the fleet head, so a
+/// leader that just failed over onto a lagging bucket continues the chain instead
+/// of spending a seq a peer already used under different bytes. (That fork needed
+/// no attacker: a reseed is best-effort, so an ordinary transient error leaves a
+/// peer behind, and the next failover forks the chain there.)
+///
+/// `buckets` is the eligible fleet in config order and `primary` the write pin's
+/// position in it. Each peer is compared against the pin and the links either side
+/// lacks are copied to it — the pin pushes what a lagging peer never received, and
+/// *pulls* what a peer holding a longer chain has. Missing links are a genuine set
+/// difference, so a hole below a peer's head is backfilled rather than skipped
+/// forever. Every copy is create-if-absent (`put_if_none_match`) and no link is
+/// ever renumbered, rewritten, or deleted: `_transparency/` stays append-only under
+/// an S3 Object Lock.
+///
+/// A bucket holding different bytes at a seq the pin also holds is a **fork**.
+/// Nothing is written to it in either direction and it can never arbitrate the
+/// append: splicing across a divergence would graft one branch's suffix onto the
+/// other's prefix and turn a recoverable split into a permanently broken chain.
+/// `verify-chain` reports the fork and an operator decides which branch stands —
+/// a tamper witness that picked a winner and re-chained the loser would be
+/// laundering exactly what it exists to catch.
+///
+/// Best-effort throughout: a peer that cannot be read or written is simply left
+/// for the next audit. It runs every audit regardless of churn, so an idle fleet
+/// still converges, and in single-bucket mode it is one listing.
+pub async fn catch_up_fleet(
+    buckets: &[crate::layout::ReplicaTarget<'_>],
+    primary: usize,
+) -> FleetChain {
+    let Some(pin) = buckets.get(primary) else {
+        return FleetChain::default();
     };
-    for s in start..=seq {
-        let bytes = if s == seq {
-            head_bytes.to_vec()
-        } else {
-            primary.get_bytes(&chain_key(s)).await?
+    let mut ours = match chain_seqs(pin.storage).await {
+        Ok(seqs) => seqs,
+        Err(e) => {
+            warn!(bucket = %pin.name, error = ?e, "transparency: listing the chain failed; checkpoint deferred this pass");
+            return FleetChain::default();
+        }
+    };
+    let mut in_sync = vec![primary];
+    for (position, peer) in buckets.iter().enumerate() {
+        if position == primary {
+            continue;
+        }
+        // Reachability is the head read, deliberately: a peer we could read but
+        // then failed to copy to stays an arbiter candidate, so one transient
+        // write error cannot silently move the arbiter out from under the fleet.
+        let theirs = match chain_seqs(peer.storage).await {
+            Ok(seqs) => seqs,
+            Err(e) => {
+                warn!(bucket = %peer.name, error = ?e, "transparency: listing a peer's chain failed; retries next audit");
+                continue;
+            }
         };
-        replica
+        match catch_up_replica(pin, peer, &mut ours, &theirs).await {
+            Ok(CatchUp::Synced) => in_sync.push(position),
+            // Forked: warned inside, written to by nobody, arbitrates nothing.
+            Ok(CatchUp::Forked) => {}
+            Err(e) => {
+                warn!(bucket = %peer.name, error = ?e, "transparency: chain catch-up to a peer failed; retries next audit");
+                in_sync.push(position);
+            }
+        }
+    }
+    in_sync.sort_unstable();
+    FleetChain { in_sync }
+}
+
+/// One peer's outcome in [`catch_up_fleet`].
+#[derive(Debug, PartialEq, Eq)]
+enum CatchUp {
+    /// The peer holds this chain (after any copying) — a valid append target.
+    Synced,
+    /// The peer holds a different link at a seq the primary also holds.
+    Forked,
+}
+
+/// Reconcile one peer with the primary's chain: refuse a fork, then copy each
+/// side's missing links to the other, oldest first so neither chain grows a hole
+/// it did not already have. `ours` is the primary's seq set and gains whatever is
+/// pulled, so a later peer in the same pass is compared against the full chain.
+async fn catch_up_replica(
+    primary: &crate::layout::ReplicaTarget<'_>,
+    replica: &crate::layout::ReplicaTarget<'_>,
+    ours: &mut BTreeSet<u64>,
+    theirs: &BTreeSet<u64>,
+) -> Result<CatchUp> {
+    if let Some(seq) = first_contradiction(primary, replica, ours, theirs).await? {
+        warn!(
+            seq,
+            branch = %primary.name,
+            branch_head = ?ours.iter().next_back(),
+            other = %replica.name,
+            other_head = ?theirs.iter().next_back(),
+            "transparency: chain fork — two buckets hold different links at the same seq; \
+             nothing copied either way. verify-chain reports it; resolving it is an \
+             out-of-band operator decision"
+        );
+        return Ok(CatchUp::Forked);
+    }
+    // A genuine set difference, not `peer_head + 1`: a peer whose chain has a hole
+    // below its head gets that hole backfilled instead of faulting forever.
+    let pull: Vec<u64> = theirs.difference(ours).copied().collect();
+    let push: Vec<u64> = ours.difference(theirs).copied().collect();
+    // Pull first: a peer that ran ahead (it led while this bucket was the lagging
+    // one) is the half of catch-up that was missing, and the reason a failover
+    // leader could re-use a spent seq.
+    for seq in pull {
+        let bytes = replica
             .storage
-            .put_if_none_match(&chain_key(s), bytes)
+            .get_bytes(&chain_key(seq))
             .await
-            .with_context(|| format!("writing chain link {s} to peer {}", replica.name))?;
+            .with_context(|| format!("reading chain link {seq} from bucket {}", replica.name))?;
+        copy_link(primary, seq, &bytes).await?;
+        ours.insert(seq);
+    }
+    for seq in push {
+        let bytes = primary
+            .storage
+            .get_bytes(&chain_key(seq))
+            .await
+            .with_context(|| format!("reading chain link {seq} from bucket {}", primary.name))?;
+        copy_link(replica, seq, &bytes).await?;
+    }
+    Ok(CatchUp::Synced)
+}
+
+/// The lowest and highest seq both buckets hold, compared byte for byte; `None`
+/// when they agree everywhere compared. Two probes rather than the whole overlap:
+/// each link commits the previous link's exact bytes, so agreement at one seq
+/// carries down the prefix of any chain that passes its own integrity check — and
+/// auditing that is [`check_integrity`]'s job, not this write path's.
+async fn first_contradiction(
+    primary: &crate::layout::ReplicaTarget<'_>,
+    replica: &crate::layout::ReplicaTarget<'_>,
+    ours: &BTreeSet<u64>,
+    theirs: &BTreeSet<u64>,
+) -> Result<Option<u64>> {
+    let shared: Vec<u64> = ours.intersection(theirs).copied().collect();
+    let probes: BTreeSet<u64> = shared
+        .first()
+        .into_iter()
+        .chain(shared.last())
+        .copied()
+        .collect();
+    for seq in probes {
+        let (mine, theirs) = futures::future::try_join(
+            primary.storage.get_bytes(&chain_key(seq)),
+            replica.storage.get_bytes(&chain_key(seq)),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "comparing chain link {seq} across buckets {} and {}",
+                primary.name, replica.name
+            )
+        })?;
+        if mine != theirs {
+            return Ok(Some(seq));
+        }
+    }
+    Ok(None)
+}
+
+/// Create-if-absent copy of one link into `dst`. A seq already taken is left
+/// standing — links are immutable — but the CAS result is not thrown away: bytes
+/// that differ from ours at that seq are a fork someone else created while we
+/// worked, and saying so is free here.
+pub(crate) async fn copy_link(
+    dst: &crate::layout::ReplicaTarget<'_>,
+    seq: u64,
+    bytes: &[u8],
+) -> Result<()> {
+    let key = chain_key(seq);
+    let taken = dst
+        .storage
+        .put_if_none_match(&key, bytes.to_vec())
+        .await
+        .with_context(|| format!("writing chain link {seq} to bucket {}", dst.name))?
+        .is_none();
+    if taken {
+        let held = dst
+            .storage
+            .get_bytes(&key)
+            .await
+            .with_context(|| format!("reading back chain link {seq} on bucket {}", dst.name))?;
+        if held != bytes {
+            warn!(
+                seq,
+                bucket = %dst.name,
+                "transparency: chain fork — this bucket already holds different bytes at that \
+                 seq; left as it stands. verify-chain reports it; resolving it is an \
+                 out-of-band operator decision"
+            );
+        }
     }
     Ok(())
 }
@@ -411,26 +578,32 @@ pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
         if i == ref_idx || integrity_broken.contains(&i) {
             continue;
         }
-        let mut diverged = false;
-        for (s, b, _) in &chain.links {
-            let matches = ref_shas.get(s).is_some_and(|rs| rs == &sha256_hex(b));
-            if !matches {
-                diverged = true;
-                violations.push((
-                    chain.name.to_string(),
-                    Violation {
-                        kind: "chain-diverged",
-                        package: String::new(),
-                        detail: format!(
-                            "link seq {s} differs from the longest chain (bucket {}); \
-                             a restarted or tampered chain, not a prefix",
-                            ref_chain.name
-                        ),
-                    },
-                ));
-            }
+        // One row per bucket, at the first seq that contradicts the reference:
+        // every later seq on a forked branch differs too, and printing each one
+        // buries the fact that matters — where the two histories parted.
+        let diverged = chain
+            .links
+            .iter()
+            .find(|(s, b, _)| ref_shas.get(s).is_none_or(|rs| rs != &sha256_hex(b)));
+        if let Some((s, _, _)) = diverged {
+            violations.push((
+                chain.name.to_string(),
+                Violation {
+                    kind: "chain-diverged",
+                    package: String::new(),
+                    detail: format!(
+                        "histories part at link seq {s}: bucket {} holds one branch (head seq \
+                         {}), bucket {} another (head seq {ref_head}). No file is implicated. \
+                         Decide out of band which branch is your history — nothing merges them \
+                         automatically",
+                        chain.name,
+                        chain.head().unwrap_or(0),
+                        ref_chain.name,
+                    ),
+                },
+            ));
         }
-        if !diverged && chain.head() != Some(ref_head) {
+        if diverged.is_none() && chain.head() != Some(ref_head) {
             lagging.push((chain.name.to_string(), chain.head()));
         }
     }
@@ -444,8 +617,8 @@ pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
     //     tamper on *that* bucket, always faulted — the core silent-rewrite signal.
     //   - vanished: a committed file gone with no tombstone. This is a *fleet*
     //     property — it faults only when the truth is absent from EVERY bucket,
-    //     never for one bucket's missing sidecar. The chain (write-through, whole
-    //     chain in a single audit — `reseed_chain_to_peers`) and sidecars (fan-out
+    //     never for one bucket's missing sidecar. The chain (reconciled whole in a
+    //     single audit — `catch_up_fleet`) and sidecars (fan-out
     //     at upload + reconcile backstop) replicate on independently paced paths, so
     //     a bucket is routinely chain-current while its sidecars still trickle in;
     //     faulting per-bucket absence would fire a tamper alarm during exactly the
@@ -815,6 +988,146 @@ mod tests {
         let violations = check_integrity(&broken);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].kind, "broken-link");
+    }
+
+    /// A correctly chained run of `count` links whose deltas name `tag`, so two
+    /// runs built under different tags differ byte for byte at every seq.
+    fn chain_of(count: u64, tag: &str) -> Vec<Vec<u8>> {
+        let mut prev = String::new();
+        let mut out = Vec::new();
+        for seq in 0..count {
+            let mut packages = Delta::new();
+            packages.insert(tag.to_string(), pkg(&[("a-1.whl", &format!("{tag}{seq}"))]));
+            let bytes = link_bytes(&link(seq, &prev, packages)).expect("serializing a test link");
+            prev = sha256_hex(&bytes);
+            out.push(bytes);
+        }
+        out
+    }
+
+    /// A branch sharing `base`'s links below `seq` and holding a different — but
+    /// internally valid — link at `seq`. This is what a failover leader produced:
+    /// same history, then two futures.
+    fn fork_of(base: &[Vec<u8>], seq: u64, tag: &str) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = base[..seq as usize].to_vec();
+        let prev = out.last().map(|b| sha256_hex(b)).unwrap_or_default();
+        let mut packages = Delta::new();
+        packages.insert(tag.to_string(), pkg(&[("a-1.whl", tag)]));
+        out.push(link_bytes(&link(seq, &prev, packages)).expect("serializing a test link"));
+        out
+    }
+
+    fn seed_chain(storage: &InMemStorage, links: &[Vec<u8>], seqs: &[u64]) {
+        for &seq in seqs {
+            storage.insert(&chain_key(seq), links[seq as usize].clone());
+        }
+    }
+
+    async fn held_seqs(storage: &InMemStorage) -> Vec<u64> {
+        chain_seqs(storage)
+            .await
+            .expect("listing an in-memory chain")
+            .into_iter()
+            .collect()
+    }
+
+    /// Drive one peer's catch-up exactly as [`catch_up_fleet`] does.
+    async fn catch_up(primary: &InMemStorage, peer: &InMemStorage) -> CatchUp {
+        let mut ours = chain_seqs(primary)
+            .await
+            .expect("listing the primary chain");
+        let theirs = chain_seqs(peer).await.expect("listing the peer chain");
+        let pin = crate::layout::ReplicaTarget {
+            storage: primary,
+            name: "bucket-a",
+        };
+        let replica = crate::layout::ReplicaTarget {
+            storage: peer,
+            name: "bucket-b",
+        };
+        catch_up_replica(&pin, &replica, &mut ours, &theirs)
+            .await
+            .expect("catch-up across in-memory buckets")
+    }
+
+    /// The missing half of catch-up, and the reported bug: a peer holding links
+    /// this bucket lacks used to be waved through as "identical or a divergence
+    /// for verify-chain", so the pin stayed behind forever and the next append
+    /// re-used a seq the peer had already spent. Pull them instead.
+    #[tokio::test]
+    async fn a_peer_holding_more_of_the_same_chain_is_pulled_back() {
+        let links = chain_of(4, "same");
+        let primary = InMemStorage::default();
+        let peer = InMemStorage::default();
+        seed_chain(&primary, &links, &[0, 1]);
+        seed_chain(&peer, &links, &[0, 1, 2, 3]);
+
+        assert_eq!(catch_up(&primary, &peer).await, CatchUp::Synced);
+        assert_eq!(
+            held_seqs(&primary).await,
+            vec![0, 1, 2, 3],
+            "the peer's extra links must be pulled onto the pin"
+        );
+        assert_eq!(held_seqs(&peer).await, vec![0, 1, 2, 3]);
+    }
+
+    /// Two branches of the same history must not be spliced together in either
+    /// direction. Grafting one branch's suffix onto the other's prefix turns a
+    /// recoverable split into a permanently broken chain; picking a winner would
+    /// launder the tamper evidence this module exists to keep.
+    #[tokio::test]
+    async fn a_fork_is_never_spliced_in_either_direction() {
+        let ours = chain_of(3, "left");
+        let theirs = fork_of(&ours, 1, "right");
+        let primary = InMemStorage::default();
+        let peer = InMemStorage::default();
+        seed_chain(&primary, &ours, &[0, 1, 2]);
+        seed_chain(&peer, &theirs, &[0, 1]);
+
+        assert_eq!(catch_up(&primary, &peer).await, CatchUp::Forked);
+        assert_eq!(held_seqs(&primary).await, vec![0, 1, 2]);
+        assert_eq!(held_seqs(&peer).await, vec![0, 1], "no link may be added");
+        for (storage, links) in [(&primary, &ours), (&peer, &theirs)] {
+            for (seq, bytes) in links.iter().enumerate().take(2) {
+                assert_eq!(
+                    storage.get_bytes(&chain_key(seq as u64)).await.unwrap(),
+                    *bytes,
+                    "seq {seq} must be left exactly as its own branch wrote it"
+                );
+            }
+        }
+    }
+
+    /// Catch-up is a set difference, not `head + 1`: a peer that lost a link below
+    /// its head used to be judged current and kept its hole forever, faulting
+    /// `verify-chain` on a gap nobody could repair.
+    #[tokio::test]
+    async fn a_hole_below_the_peers_head_is_backfilled() {
+        let links = chain_of(3, "same");
+        let primary = InMemStorage::default();
+        let peer = InMemStorage::default();
+        seed_chain(&primary, &links, &[0, 1, 2]);
+        seed_chain(&peer, &links, &[0, 2]);
+
+        assert_eq!(catch_up(&primary, &peer).await, CatchUp::Synced);
+        assert_eq!(
+            held_seqs(&peer).await,
+            vec![0, 1, 2],
+            "the hole below the peer's head must be backfilled"
+        );
+    }
+
+    /// The ordinary reseed still works: an empty (freshly added) bucket is seeded
+    /// the whole chain, oldest first.
+    #[tokio::test]
+    async fn an_empty_peer_is_seeded_the_whole_chain() {
+        let links = chain_of(3, "same");
+        let primary = InMemStorage::default();
+        let peer = InMemStorage::default();
+        seed_chain(&primary, &links, &[0, 1, 2]);
+
+        assert_eq!(catch_up(&primary, &peer).await, CatchUp::Synced);
+        assert_eq!(held_seqs(&peer).await, vec![0, 1, 2]);
     }
 
     #[test]

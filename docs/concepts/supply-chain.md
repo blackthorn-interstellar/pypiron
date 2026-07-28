@@ -200,7 +200,9 @@ rides the strongest credential.
 Running more than one bucket, that ranking survives a bucket failover: the
 download history it ranks by is copied to every bucket, so switching to another
 bucket keeps the list intact — at most the current day's in-progress counts go
-missing, during the very outage the report is for.
+missing, during the very outage the report is for. A finished day reaches its
+final total once every bucket has been reachable for a rollup pass; see
+[Download stats](download-stats.md#accuracy-and-freshness).
 
 ## The air-gapped endgame
 

@@ -949,9 +949,15 @@ pub struct FileEntry {
 pub struct ObjectMeta {
     pub key: String,
     pub size: u64,
-    /// Opaque change detector, compared for equality only: the S3 ETag, or
-    /// mtime+size on disk. Two listings agree on (key, size, etag) iff the
-    /// object hasn't been rewritten between them.
+    /// Opaque change detector, compared **against another listing only**: the
+    /// S3 ETag, or mtime+size on disk. Two listings agree on (key, size, etag)
+    /// iff the object hasn't been rewritten between them.
+    ///
+    /// It is not a conditional-write token and not comparable with one. A
+    /// listing carries no object version (GCS's generation, S3's version id),
+    /// so on a versioned backend this string differs from what a HEAD/GET/PUT
+    /// reports for the very same bytes, and GCS rejects it as a precondition
+    /// outright. Use [`Storage::head_etag`] when the answer feeds a CAS.
     pub etag: String,
 }
 
@@ -1066,6 +1072,21 @@ pub trait Storage: Send + Sync {
 
     /// Read object bytes plus ETag; `None` if the object is missing.
     async fn get_with_etag(&self, _key: &str) -> Result<Option<(Vec<u8>, String)>> {
+        Err(anyhow!("leases are not supported by this backend"))
+    }
+
+    /// The conditional-write token for `key` from one metadata round-trip, or
+    /// `None` if the object is absent. Never reads the body, so it costs the
+    /// same against a four-name index and a 780k-name one.
+    ///
+    /// This is NOT interchangeable with the ETag on a listed [`ObjectMeta`],
+    /// and the difference is not cosmetic: on GCS the precondition is the
+    /// object *generation*, which only a HEAD/GET/PUT reports — the XML list
+    /// response omits it entirely (and its ETag is a content digest, which GCS
+    /// will not accept as a precondition at all). A token bound for
+    /// [`Storage::put_if_match`], or for comparison against one, comes from
+    /// here. See [`ObjectMeta::etag`].
+    async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
         Err(anyhow!("leases are not supported by this backend"))
     }
 
@@ -2765,6 +2786,16 @@ impl Storage for ObjectStorage {
         }
     }
 
+    async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        match self.store.head(&self.oskey(key)).await {
+            Ok(meta) => Ok(Some(pack_version(&meta.e_tag, &meta.version))),
+            Err(e) => match self.classify_get(e, "head_etag", key) {
+                None => Ok(None),
+                Some(err) => Err(err),
+            },
+        }
+    }
+
     async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
         match self
             .store
@@ -2996,6 +3027,9 @@ impl Storage for FaultInjectStorage {
     }
     async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
         self.inner.get_with_etag(key).await
+    }
+    async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        self.inner.head_etag(key).await
     }
 
     async fn put_bytes(&self, key: &str, bytes: Vec<u8>, content_type: Option<&str>) -> Result<()> {
@@ -3654,9 +3688,13 @@ pub mod test_support {
         /// from the final map.
         writes: Mutex<Vec<String>>,
         gets: AtomicUsize,
-        /// Listings served. A currency probe's whole point is that it costs one
-        /// bounded listing and no body, so its cost is a property tests pin.
+        /// Listings served. A currency probe's whole point is that it costs no
+        /// body, so its cost is a property tests pin.
         lists: AtomicUsize,
+        /// Metadata reads served ([`Storage::head_etag`]). Counted apart from
+        /// `gets` for the same reason: what a probe may spend is pinned, and a
+        /// HEAD and a body read are not the same spend.
+        heads: AtomicUsize,
         fail_next_get: AtomicBool,
         /// One key whose reads fail until [`InMemStorage::heal_reads`]. The
         /// positional `fail_next_get` cannot express "this object is
@@ -3692,6 +3730,9 @@ pub mod test_support {
         }
         pub fn list_count(&self) -> usize {
             self.lists.load(Ordering::SeqCst)
+        }
+        pub fn head_count(&self) -> usize {
+            self.heads.load(Ordering::SeqCst)
         }
         pub fn fail_next_get(&self) {
             self.fail_next_get.store(true, Ordering::SeqCst);
@@ -3843,7 +3884,7 @@ pub mod test_support {
                 .map(|(k, v)| ObjectMeta {
                     key: k.clone(),
                     size: v.len() as u64,
-                    etag: test_etag(v),
+                    etag: listed_etag(v),
                 })
                 .collect();
             out.sort_by(|a, b| a.key.cmp(&b.key));
@@ -3861,7 +3902,14 @@ pub mod test_support {
                 .lock()
                 .unwrap()
                 .get(key)
-                .map(|b| (b.clone(), test_etag(b))))
+                .map(|b| (b.clone(), cas_token(b))))
+        }
+        async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+            if self.unreadable(key) {
+                anyhow::bail!("injected storage failure");
+            }
+            self.heads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.objects.lock().unwrap().get(key).map(|b| cas_token(b)))
         }
         async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
             if self.unwritable(key) {
@@ -3871,9 +3919,9 @@ pub mod test_support {
             if map.contains_key(key) {
                 return Ok(None);
             }
-            let etag = test_etag(&bytes);
+            let token = cas_token(&bytes);
             map.insert(key.to_string(), bytes);
-            Ok(Some(etag))
+            Ok(Some(token))
         }
         async fn put_if_match(
             &self,
@@ -3884,17 +3932,42 @@ pub mod test_support {
             if self.unwritable(key) {
                 anyhow::bail!("injected storage failure");
             }
+            // GCS's contract, and the reason this double models versions at
+            // all: the precondition there is the object generation, so a token
+            // carrying only an ETag is not a lost race — it is a request GCS
+            // refuses to answer. Erroring (rather than returning `Ok(None)`)
+            // is what turns a caller that reached for a *listed* ETag into a
+            // red test instead of a silent retry loop against real GCS.
+            if unpack_version(etag).version.is_none() {
+                anyhow::bail!("version required for conditional update: {key}");
+            }
             let mut map = self.objects.lock().unwrap();
             match map.get(key) {
-                Some(current) if test_etag(current) == etag => {
-                    let new_etag = test_etag(&bytes);
+                Some(current) if cas_token(current) == etag => {
+                    let new_token = cas_token(&bytes);
                     map.insert(key.to_string(), bytes);
                     self.writes.lock().unwrap().push(key.to_string());
-                    Ok(Some(new_etag))
+                    Ok(Some(new_token))
                 }
                 _ => Ok(None),
             }
         }
+    }
+
+    /// What a HEAD/GET/PUT reports: ETag *and* version, the only form a
+    /// conditional write accepts. See [`Storage::head_etag`].
+    fn cas_token(bytes: &[u8]) -> String {
+        let digest = test_etag(bytes);
+        pack_version(&Some(digest.clone()), &Some(digest))
+    }
+
+    /// What a *listing* reports: an ETag and no version, mirroring the XML list
+    /// responses object_store parses for S3 and GCS alike. Deliberately not
+    /// equal to [`cas_token`] for the same bytes — a test that compares the two,
+    /// or feeds this to a CAS, is reproducing a bug that only real GCS would
+    /// otherwise show. See [`ObjectMeta::etag`].
+    fn listed_etag(bytes: &[u8]) -> String {
+        pack_version(&Some(test_etag(bytes)), &None)
     }
 
     fn test_etag(bytes: &[u8]) -> String {

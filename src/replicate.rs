@@ -3412,6 +3412,10 @@ mod tests {
             self.inner.get_with_etag(key).await
         }
 
+        async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+            self.inner.head_etag(key).await
+        }
+
         async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
             self.inner.put_if_none_match(key, bytes).await
         }

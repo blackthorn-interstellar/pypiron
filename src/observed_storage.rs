@@ -429,6 +429,12 @@ impl Storage for ObservedStorage {
         result
     }
 
+    async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        let result = self.inner.head_etag(key).await;
+        self.record(&result);
+        result
+    }
+
     async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
         let result = self.inner.put_if_none_match(key, bytes).await;
         self.record(&result);

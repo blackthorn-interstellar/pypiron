@@ -2954,42 +2954,37 @@ async fn load_global_names(storage: &dyn Storage) -> Result<GlobalNames> {
 ///
 /// Currency of the JSON is not currency of the HTML, and the drift that matters
 /// moves only one of them: a peer that publishes the HTML and dies before the
-/// canonical JSON. So the no-op gate has to see both — but not for a second op.
-/// The two keys share the `simple/index.` prefix (nothing else can: normalized
-/// package names never contain a dot) and are adjacent in key order, so asking
-/// for the pair stops the listing at exactly the object that asking for the JSON
-/// alone stopped at. `after` then starts it AT the pair instead of at the top of
-/// `simple/`, skipping every package that sorts before it — on a corpus-sized
-/// bucket that is most of the tree.
+/// canonical JSON. So the no-op gate has to see both.
+///
+/// Both come from HEADs, concurrently, not from the one bounded LIST over the
+/// shared `simple/index.` prefix that would answer for the pair at once. A
+/// listing reports no object version, so on GCS its ETag is neither equal to
+/// what the cache pinned from its own write nor usable as the precondition of
+/// the next one ([`Storage::head_etag`]). Nothing is lost by the trade: a
+/// listing is the dearer request class on S3 and GCS both, so two HEADs are
+/// cheaper than the one LIST they replace, and issuing them together keeps the
+/// probe at a single round-trip.
 async fn global_index_etags(storage: &dyn Storage) -> Result<(Option<String>, Option<String>)> {
     let prefix = format!("{SIMPLE_PREFIX}index.");
-    let page = storage.list_page(&prefix, Some(&prefix), 2).await?;
-    let etag = |key: &str| {
-        page.iter()
-            .find(|meta| meta.key == key)
-            .map(|meta| meta.etag.clone())
-    };
-    Ok((
-        etag(&format!("{prefix}json")),
-        etag(&format!("{prefix}html")),
-    ))
+    let (json, html) = futures::future::join(
+        storage.head_etag(&format!("{prefix}json")),
+        storage.head_etag(&format!("{prefix}html")),
+    )
+    .await;
+    Ok((json?, html?))
 }
 
-/// The ETag of the stored global HTML, or `None` when it has never been written
-/// (or the backend has no conditional writes). A metadata-only probe: it never
-/// reads the body, so it costs the same against a four-name index and a
-/// 780k-name one. Reuses the bounded-LIST idiom the JSON currency probe uses.
+/// The conditional-write token of the stored global HTML, or `None` when it has
+/// never been written (or the backend has no conditional writes). A
+/// metadata-only probe: it never reads the body, so it costs the same against a
+/// four-name index and a 780k-name one.
 async fn current_global_html_etag(storage: &dyn Storage) -> Result<Option<String>> {
     if !storage.supports_leases() {
         return Ok(None);
     }
-    let key = format!("{SIMPLE_PREFIX}index.html");
-    Ok(storage
-        .list_page(&key, None, 1)
-        .await?
-        .into_iter()
-        .find(|meta| meta.key == key)
-        .map(|meta| meta.etag))
+    storage
+        .head_etag(&format!("{SIMPLE_PREFIX}index.html"))
+        .await
 }
 
 /// Rebuild the global name set from this bucket's materialized per-package
@@ -4364,9 +4359,10 @@ mod tests {
         );
 
         // ...and having re-proved it, the steady state must stay free: no
-        // further body read, and the same single bounded LIST per no-op delta.
+        // further body read, and a fixed metadata cost per no-op delta.
         let reads = storage.get_count();
         let lists = storage.list_count();
+        let heads = storage.head_count();
         update_global_index(&state, storage.as_ref(), &live, &[])
             .await
             .unwrap();
@@ -4376,9 +4372,14 @@ mod tests {
             "a steady-state no-op delta must not read the global HTML back"
         );
         assert_eq!(
+            storage.head_count(),
+            heads + 2,
+            "the currency probe must stay ONE metadata read per global view per no-op delta"
+        );
+        assert_eq!(
             storage.list_count(),
-            lists + 1,
-            "the currency probe must stay ONE bounded listing per no-op delta"
+            lists,
+            "a listed ETag carries no version, so the probe must never reach for one"
         );
     }
 

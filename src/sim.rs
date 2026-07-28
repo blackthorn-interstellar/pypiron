@@ -530,6 +530,10 @@ impl Storage for SimStorage {
             .map(|o| (o.bytes.clone(), o.etag.clone())))
     }
 
+    async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.lock().objects.get(key).map(|o| o.etag.clone()))
+    }
+
     async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
         let now = self.clock.now_utc();
         let mut inner = self.lock();

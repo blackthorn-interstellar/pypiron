@@ -90,6 +90,12 @@ corpus-sized GET), batches changes per tick, and writes back under S3
 conditional writes (`If-Match`) so racing nodes reload-and-retry instead of
 clobbering each other.
 
+The precondition for such a write comes from a HEAD, GET, or the previous PUT —
+never from a listing. On GCS the precondition is the object *generation*, and
+the list response omits it (its ETag is a content digest GCS will not accept as
+a precondition at all), so a listed ETag is a change detector only: comparable
+with another listing, and with nothing else.
+
 ## Events are the backbone; the audit is the safety net
 
 Markers carry all day-to-day freshness. What they cannot see is change pypiron

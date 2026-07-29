@@ -5,9 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-pypiron-bf5a2e.svg)](https://pypiron.com/)
 
-An ultra-fast Python package server, written in Rust.
-
-pypiron is the fastest, most reliable PyPI server (and mirror) available.
+An ultra-fast, rock-solid PyPI server.
 
 <p align="center">
   <picture>
@@ -16,64 +14,29 @@ pypiron is the fastest, most reliable PyPI server (and mirror) available.
   </picture>
 </p>
 
-- **100× faster than any PyPI server.** 8,288 verified installs/s on 2 vCPU. ([benchmarks](docs/reference/benchmarks.md))
-- **Secure by default.** New releases wait 7 days, known malware never installs, no dependency confusion, air-gap ready. Measured on 2024+ compromises of established PyPI packages: 34% blocked on day 0, 86% with a 30-day cooldown. ([defense](docs/concepts/supply-chain.md))
-- **Absurdly well-tested.** [Fuzzing](dev/TESTING.md#fuzzing), [chaos](dev/TESTING.md#chaos-and-crash-consistency), [deterministic simulation](dev/TESTING.md#deterministic-simulation-the-vopr), [model checking](dev/TESTING.md#machine-checked-models-stateright), [real clouds](dev/TESTING.md#real-cloud-backends), [perf](dev/TESTING.md#performance-testing), and [all 17 million files on PyPI](src/corpus_check.rs).
-- **Infinite scale.** One 8-vCPU box: PyPI's real index traffic at 200,000 requests/s, p99 under 3 ms. Or any number of nodes on one bucket. ([replay](dev/bench/replay/))
-- **Works through outages.** Cross-region, cross-cloud (S3 + GCS + Azure), automatic failover, zero data loss. ([multi-region](docs/guides/multi-region.md))
-- **Works with everything.** uv, pip, poetry, pdm, pipenv, hatch, flit, twine.
+- **[100× faster than any other PyPI server](docs/reference/benchmarks.md).**
+- **72% of malware attacks blocked immediately.**
+- **Effortlessly scales via cloud storage — no database!**
+- **Supports [cross-region](docs/guides/multi-region.md) and cross-cloud high availability.**
+- **Works with local disk, AWS S3, GCP, and Azure.**
+- **Comprehensively tested via [fuzzing](dev/TESTING.md#fuzzing), [chaos testing](dev/TESTING.md#chaos-and-crash-consistency), [deterministic simulation](dev/TESTING.md#deterministic-simulation-the-vopr), [model checking](dev/TESTING.md#machine-checked-models-stateright), [real clouds](dev/TESTING.md#real-cloud-backends), [perf](dev/TESTING.md#performance-testing), and [all 17 million files on PyPI](src/corpus_check.rs).**
 
-**Status: beta.** Young project, tested like an old one — run it, break it,
-[file issues](https://github.com/blackthorn-interstellar/pypiron/issues).
 
-## Quickstart
+## Getting started
 
-<p align="center">
-  <img src="docs/assets/demo.gif" alt="Demo: uvx pypiron serve, uv publish, uv pip install — a working private index in seconds" width="900">
-</p>
+Run pypiron with uvx to get started quickly:
 
 ```bash
-# 1. Start a server (serves http://localhost:8080) — native binary…
 uvx pypiron serve --admin-pass "$ADMIN"
-
-# …or in a container (storage at /data, built-in healthcheck):
-docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" \
-  ghcr.io/blackthorn-interstellar/pypiron:latest
-
-# 2. Publish
-uv publish --publish-url http://localhost:8080/legacy/ \
-  --username admin --password "$ADMIN" dist/*
-
-# 3. Install
-uv add --default-index http://localhost:8080/simple/ acme-widgets
 ```
 
-Only `--admin-pass` set: writes need the admin credential, reads stay public.
-pip, twine, and poetry equivalents: <https://pypiron.com/#quickstart>.
+Or with Docker:
 
-## Going further
+```bash
+docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-interstellar/pypiron:latest
+```
 
-- [Setup](docs/guides/setup.md) — private packages, public proxy, sync mirror, S3
-- [Configuration](docs/reference/configuration.md) — every flag and its `PYPIRON_*` env var
-- [Benchmarks](docs/reference/benchmarks.md) — how the numbers above were measured
-- [For AI agents](docs/for-agents.md) — a decision guide, written agent to agent
-
-## Tested like your supply chain depends on it
-
-Anyone can post a benchmark chart. pypiron is validated end-to-end, adversarially, and continuously — and every claim below links to a check you can run yourself.
-
-- **The whole ecosystem, for real.** Every test run drives the real server over HTTP with eight real clients — uv, pip, poetry, pdm, pipenv, hatch, flit, twine. Not mocks: the [actual tools your team uses](dev/TESTING.md#client-compatibility-matrix).
-- **All of PyPI. All of it.** The parsers chew through [every file ever uploaded to PyPI — all 17 million](src/corpus_check.rs) — and match ground truth on each one.
-- **Kill -9'd until it's boring.** We kill the server at every step of every write, kill fleet nodes mid-upload, and feed it truncated, corrupted, and hash-mismatched upstream responses. It converges to a consistent, installable state every time ([crash sweep](tests/test_crash_consistency.py), [fleet chaos](tests/test_chaos_fleet.py), [upstream faults](tests/test_chaos_upstream.py)).
-- **Convergence is enumerated, not just sampled.** A model checker walks *every* interleaving of writers, workers, crashes, and partition-shaped byte conflicts inside its bounds — two buckets, two filenames, a lease-serialized worker pair — running the same decision functions the server ships, so the model can't encode semantics the binary doesn't have ([the models](tests/model_replication.rs), [the bounds](dev/TESTING.md#machine-checked-models-stateright)).
-- **A fleet in a bottle, every night.** Deterministic simulation runs a whole multi-node fleet single-threaded on virtual time — on the order of a hundred thousand seeded crash/fault/restart schedules per night, every failure [reproducible from an 8-byte seed](dev/TESTING.md#deterministic-simulation-the-vopr) ([the simulator](examples/vopr.rs)).
-- **Fuzzed nightly, audited on every PR.** Coverage-guided fuzzers hammer the parsers that eat attacker-controlled bytes [every night](.github/workflows/fuzz.yml); a new advisory anywhere in the dependency tree [fails the build](.github/workflows/ci.yml).
-- **Audited until the findings ran dry.** Fable 5 — Anthropic's frontier model — ran security audit pass after security audit pass until they came back clean. All told, over $7,000 of frontier-model compute (at API list prices) went into building and hardening pypiron.
-- **Benchmarks with nothing to hide.** The chart above comes from [published docker-compose rigs](dev/bench/install/) for all five competitors. Re-run it. We'll wait.
-
-## Comparison
-
-Hover a checkmark for the caveat where your Markdown renderer supports it.
+## Feature comparison
 
 | Feature | pypiron | bandersnatch | pypiserver | pypicloud | devpi | proxpi |
 | --- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -93,8 +56,25 @@ Hover a checkmark for the caveat where your Markdown renderer supports it.
 | Disk-backed | <abbr title="Default local disk backend.">✅</abbr> | <abbr title="Writes a static mirror tree to disk.">✅</abbr> | <abbr title="Serves packages from local directories.">✅</abbr> | <abbr title="Supports filesystem package storage.">✅</abbr> | <abbr title="Default serverdir storage on local disk.">✅</abbr> | <abbr title="Disk-backed package cache.">✅</abbr> |
 | Cloud-storage-backed | <abbr title="S3, S3-compatible, GCS, and Azure Blob.">✅</abbr> | <abbr title="S3-compatible mirror storage.">✅</abbr> | — | <abbr title="S3, GCS, and Azure Blob package storage.">✅</abbr> | — | — |
 
-Full write-ups — pypiron vs devpi, pypiserver, and Artifactory, plus which tool
-fits which job: <https://pypiron.com/compare/>.
+[Full comparison](https://pypiron.com/compare/)
+
+
+## Testing
+
+- **[Client compatibility testing](dev/TESTING.md#client-compatibility-matrix):** uv, pip, poetry, pdm, pipenv, hatch, flit, twine.
+- **Tested against all of PyPI.** The parsers process [all 17 million files ever uploaded to PyPI](src/corpus_check.rs) and match ground truth on each one.
+- **Chaos testing.** We kill the server at every step of every write, kill fleet nodes mid-upload, and feed it truncated, corrupted, and hash-mismatched upstream responses. It converges to a consistent, installable state every time ([crash sweep](tests/test_crash_consistency.py), [fleet chaos](tests/test_chaos_fleet.py), [upstream faults](tests/test_chaos_upstream.py)).
+- **Exhaustive model checker.** A [model checker](dev/TESTING.md#machine-checked-models-stateright) enumerates every interleaving of writers, workers, crashes, and byte conflicts within its bounds, running the same decision functions the server ships.
+- **Continuous deterministic simulation testing.** Deterministic simulation runs a whole multi-node fleet single-threaded on virtual time — on the order of a hundred thousand seeded crash/fault/restart schedules per night, every failure [reproducible from an 8-byte seed](dev/TESTING.md#deterministic-simulation-the-vopr) ([the simulator](examples/vopr.rs)).
+- **Fuzzed nightly.** Coverage-guided fuzzers hammer the parsers.
+- **Passed security audits by LLMs.** Fable 5 ran numerous security audits before it got nerfed. All issues fixed.
+
+## Going further
+
+- [Setup](docs/guides/setup.md) — private packages, public proxy, sync mirror, S3
+- [Configuration](docs/reference/configuration.md) — every flag and its `PYPIRON_*` env var
+- [Benchmarks](docs/reference/benchmarks.md) — how the numbers above were measured
+- [For AI agents](docs/for-agents.md) — a decision guide, written for agents, by an agent
 
 ## License
 

@@ -30,6 +30,28 @@ reason about pypiron belongs in `dev/` instead.
 - Run `make test` for the full suite (Rust unit + Python blackbox) when you touch
   HTTP, storage, the worker, sync, or the proxy. `make help` lists every target.
 
+## Builds stay in one target dir
+Build into the repo's `target/`. Never point `--target-dir` / `CARGO_TARGET_DIR`
+at `/tmp` or your session scratchpad. A fresh tree shares nothing with the
+existing cache, costs ~600 MB for a bare debug build and grows past 10 GB once
+incremental artifacts land, and it outlives the session that made it. Agents
+spinning up a throwaway tree per attempt is how a dev machine's disk fills
+overnight — it has happened here, 26 trees deep.
+
+- Need to compare two commits (bisect, before/after benchmarks)? Use a git
+  worktree, but keep the build in one reusable place:
+  `CARGO_TARGET_DIR=$PWD/.local/target-alt cargo build`. `.local/` is gitignored
+  and is where regenerable state belongs.
+- Several agents sharing `target/` will serialize on cargo's lock. That is the
+  cheap outcome — one wait beats a second full rebuild.
+- Delete any scratch target dir when you're done with it. Don't leave it for
+  whoever notices the disk is full.
+- `target/` itself grows without bound; run `cargo clean` when it gets silly.
+  Take its reported size with salt: `cargo clean --dry-run` and `du` both sum
+  apparent file sizes, and on APFS cargo's uplifted artifacts are clones that
+  share blocks — measured here, both cried 97 GiB where only 37 GB was real.
+  You will reclaim less than the headline number says.
+
 ## Testing (see [dev/TESTING.md](dev/TESTING.md))
 - Blackbox-first: the real binary, driven over HTTP by real `uv`/`pip`/`twine`.
   Add a blackbox test (`tests/*.py`) for any changed user-visible behavior.

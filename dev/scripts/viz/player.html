@@ -1103,6 +1103,10 @@ svg.graph{display:block;width:100%;height:auto;background:var(--card);border:1px
         }
         var key = row.key;
         var diverged = st.diverged[key] === 'differs';
+        /* `partial` is a key some region has and another does not — mid-flight
+           replication, not a byte conflict. Drawn dashed so "not here yet" reads
+           as a state, without borrowing the accent that means two bytes differ. */
+        var partial = st.diverged[key] === 'partial';
         ctx.font = '10px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace';
         ctx.fillStyle = diverged ? T.accent : T.fg;
         ctx.fillText(fit(ctx, shortKey(key), keyW - 6), worldX, wy + 9);
@@ -1123,6 +1127,12 @@ svg.graph{display:block;width:100%;height:auto;background:var(--card);border:1px
             ctx.strokeStyle = T.accent;
             ctx.lineWidth = 2;
             ctx.stroke();
+          } else if (partial) {
+            ctx.strokeStyle = T.muted;
+            ctx.lineWidth = 1;
+            ctx.setLineDash([2, 2]);
+            ctx.stroke();
+            ctx.setLineDash([]);
           }
           ctx.fillStyle = T.fg;
           ctx.fillText(fit(ctx, label, tw), vx + 4, wy + 9);

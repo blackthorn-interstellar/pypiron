@@ -159,7 +159,7 @@ jobs:
   # CLOSED and pinned in ci.yml — `f37e391` (DURABILITY, the stale settle),
   # `4eaa015` (CONSERVATION, the settle that destroyed a racing publish's body)
   # and `bb885ef` (SELF_CONSISTENCY, the non-crash-atomic supersede). The three
-  # below were new at that census; two of them are CLOSED since, so the 6-seed
+  # below were new at that census; all three are CLOSED since, so the 6-seed
   # count above is the rate BEFORE those fixes and the next census is what moves
   # it. Do not re-quote it as current.
   #
@@ -190,39 +190,44 @@ jobs:
   # halving it halves the partitioned seeds and the failure count together,
   # buying a quieter lane by testing proportionally less.
   #
-  # THE FIRST ONE IS NOT A PARTITIONED-LANE BUG AT ALL. Root cause 1 reproduces
-  # at `--partition 0`, on ONE bucket, with fault injection off — which is the
-  # GATED `rotating-swarm` row above, the row with no `continue-on-error`. Rate
-  # over 2,525,228 `--rotate` seeds (1,866,968 of them at `--partition 0`,
+  # THE FIRST ONE WAS NOT A PARTITIONED-LANE BUG AT ALL, which is why it was the
+  # one that gated. Root cause 1 reproduced at `--partition 0`, on ONE bucket —
+  # the GATED `rotating-swarm` row above, the row with no `continue-on-error`.
+  # Rate over 2,525,228 `--rotate` seeds (1,866,968 of them at `--partition 0`,
   # all clean): 2 failures = 7.9e-7 per seed, so that row's 50,000-seed nightly
-  # draw reds 3.9% of nights — one red night in 26, and one in 9 at the 95%
-  # upper bound. That is small, and it is not zero: the gated matrix's clean
-  # record so far is the draw, not proof. Fix this one first.
+  # draw redded 3.9% of nights — one in 26, one in 9 at the 95% upper bound.
+  # Small, never zero, and now closed; quote the figure only as the pre-fix rate.
   #
-  #   1. AUDIT_REPAIRED_VIEWS — the global index publishes HTML and JSON
-  #      non-atomically, and nothing heals the tear. 4 of the 6 failing seeds.
-  #      `write_global_indexes_cas` (`src/worker.rs:2848`) writes
-  #      `simple/index.html` first and `simple/index.json` second, so a crash or
-  #      a storage failure between them leaves the HTML ahead and the bucket
-  #      serves a PEP 503 index listing a package its own PEP 691 index does not.
-  #      Traced on three seeds as `put_im simple/index.html fate=ok` followed by
-  #      `put_im simple/index.json fate=crash`.
-  #      The code ANTICIPATES this — the comment at `src/worker.rs:2456` says
-  #      currency of the JSON is not currency of the HTML — but the reconcile it
-  #      installs is unreachable from steady state, for two independent reasons.
-  #      `update_global_index` returns early when the delta is empty
-  #      (`src/worker.rs:2390`), so once the package's `_dirty/` markers are
-  #      consumed the pair check is never entered again. And the check is gated
-  #      on `!cached.html_current` (`src/worker.rs:2464`), which every
-  #      `CasOutcome::Won` pins true (`:2509`) and only a fresh
-  #      `load_global_names` clears — and the one thing that forces that reload
-  #      on the no-delta path is a JSON ETag move, which the crash by
-  #      construction did not cause. So the tear stands until the tier-3 audit
-  #      stumbles on it, which is what the oracle reds on.
-  #        --seed 60000037578 --rotate --partition 0   # nodes=3 buckets=1 packages=4 files=1 ops=200 fail-percent=0
-  #        --seed 61000075134 --rotate --partition 0   # nodes=2 buckets=1 packages=3 files=2 ops=120 fail-percent=0
-  #        --seed 61000246528 --rotate --partition 100                                                    # POISONED arm
-  #        --seed 66000074673 --nodes 3 --buckets 2 --packages 1 --files 1 --ops 40 --fail-percent 3 --partition 100  # AUDIT_PREMATURE_CONSUMPTION x2
+  #   1. AUDIT_REPAIRED_VIEWS / AUDIT_PREMATURE_CONSUMPTION — CLOSED. The global
+  #      index publishes HTML and JSON non-atomically and always will:
+  #      `write_global_indexes_cas` writes `simple/index.html` first and
+  #      `simple/index.json` second, so a crash or a storage failure between them
+  #      strands the HTML ahead and the bucket serves a PEP 503 index listing a
+  #      package its own PEP 691 index does not. The defect was never the tear —
+  #      it was that only the tier-3 audit healed it, and an audit that has to
+  #      repair a view is what the oracle reds on. Two fixes to the no-op gate in
+  #      `update_global_index_locked` made the marker path heal it instead:
+  #        * the HTML's ETag joined the currency probe, so a pair a peer moved
+  #          clears `html_current` and reconciles. Closed the crash-only arm —
+  #          seeds 60000037578 and 61000075134, both since PASSING at `a53b7e9`.
+  #        * an ABSENT canonical JSON now forces a reload. Its ETag is `None`,
+  #          and `None` compares EQUAL to the `None` a cache pinned at cold
+  #          start, so the probe read "JSON unchanged" and skipped the fresh
+  #          `load_global_names` that is the only thing that sets `stranded` and
+  #          writes the JSON back. The reconcile below then rewrote the live HTML
+  #          down to that same stale (empty) cached name set and consumed the
+  #          markers, so the tear outlived the only signal that covered it. A
+  #          published HTML standing over an absent JSON is now read as the torn
+  #          pair it is.
+  #      The delta-empty early return in `update_global_index` is NOT a second
+  #      hole. Markers are consumed LAST, and every path that can strand the pair
+  #      — the tick, `drain_dirty_uncached`, a crash — returns before consuming
+  #      them, so a tear always leaves behind the marker that brings the update
+  #      path back to it.
+  #        --seed 13792606396100784374 --rotate   # AUDIT_PREMATURE_CONSUMPTION; reds at `a53b7e9`, green since
+  #      The other seeds this entry used to list (60000037578, 61000075134,
+  #      61000246528, 66000074673) all PASS at `a53b7e9`: the first fix closed
+  #      them and the list was never trimmed. Re-run before citing any of them.
   #
   #   2. DURABILITY — CLOSED. A demotion fence was cleared on a listing-era
   #      reading of the record, and the trace says the mechanism plainly: both

@@ -2609,7 +2609,21 @@ async fn update_global_index_locked(
             // peers, and their listing/CAS etags live in different spaces.
             if storage.supports_leases() {
                 let (json_etag, html_etag) = global_index_etags(storage).await?;
-                if json_etag != cached.etag {
+                // Two absent JSONs are not the same state. `None` reads
+                // identically whether nothing was ever published — the cold
+                // start this cache may have been pinned in, names legitimately
+                // empty — or a peer published the HTML and died before the
+                // canonical JSON. Only [`load_global_names`] tells them apart,
+                // and an equal-ETag probe never takes one, so the second case
+                // survived every tick: the reconcile below rewrote the live
+                // HTML down to this cache's stale (empty) name set, declared the
+                // pair current, and consumed the markers, leaving the canonical
+                // JSON absent until the tier-3 audit (vopr seed
+                // 13792606396100784374). A published HTML standing over an
+                // absent JSON is exactly that stranded pair — drop the cache so
+                // the reload derives the real set from the per-package views and
+                // its `stranded` flag forces the JSON to be materialized.
+                if json_etag != cached.etag || (json_etag.is_none() && html_etag.is_some()) {
                     *guard = None;
                     continue;
                 }

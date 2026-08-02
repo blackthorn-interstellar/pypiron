@@ -766,10 +766,20 @@ pub async fn publish_record(
                 format!("File '{filename}' is frozen or deleted and cannot be reused"),
             ));
         }
+        // The HEAD never answered, so "fenced" is a guess — and freeing an
+        // immutable key on a guess is the one thing this path must not do. A
+        // rebuild racing this upload may already have read these bytes and be
+        // one op away from publishing the sidecar that names them (§4 backfill).
+        // Delete here and that fabrication lands over an empty key; the next
+        // upload of the same filename wins the create with *other* bytes and the
+        // bucket serves them under the published sha256 of bytes it no longer
+        // has. Nothing re-hashes a stored body, so that record never converges
+        // again. So leave the body standing, exactly as `store_artifact_verified`
+        // leaves one its own size check could not condemn: an unacked bare
+        // artifact is inert (a fenced filename is suppressed from every index,
+        // and a live one is typed by the same backfill), while a freed name is
+        // permanent corruption. Traced on vopr seed 2519159830454370605.
         Err(e) => {
-            if !state.buckets.is_multi() {
-                let _ = storage.delete_keys(std::slice::from_ref(&key)).await;
-            }
             if let Err(commit_error) =
                 markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await
             {

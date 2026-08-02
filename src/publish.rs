@@ -775,10 +775,19 @@ pub async fn publish_record(
         // bucket serves them under the published sha256 of bytes it no longer
         // has. Nothing re-hashes a stored body, so that record never converges
         // again. So leave the body standing, exactly as `store_artifact_verified`
-        // leaves one its own size check could not condemn: an unacked bare
-        // artifact is inert (a fenced filename is suppressed from every index,
-        // and a live one is typed by the same backfill), while a freed name is
-        // permanent corruption. Traced on vopr seed 2519159830454370605.
+        // leaves one its own size check could not condemn. What survives is
+        // bounded either way, and neither outcome is silent corruption:
+        //   * the filename was NOT fenced (the usual case — the HEAD was the
+        //     outage, not the answer). The body outlives the client's 503: the
+        //     next rebuild backfills a sidecar for it and publishes the record,
+        //     the same shape `SizeCheck::Unknown` already leaves behind, and a
+        //     retry of that filename gets a 409 off the immutable create.
+        //   * the filename WAS fenced. The body stands under its tombstone,
+        //     suppressed from every index but fetchable by direct URL, until the
+        //     audit's `tombstone::complete_interrupted_deletes` reaps it — the
+        //     same residue a delete that crashed after its tombstone leaves.
+        // A freed name, by contrast, is permanent. Traced on vopr seed
+        // 2519159830454370605.
         Err(e) => {
             if let Err(commit_error) =
                 markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await

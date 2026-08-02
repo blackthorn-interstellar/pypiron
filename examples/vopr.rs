@@ -119,7 +119,10 @@ const PACKAGE_NAMES: [&str; 6] = [
     "vopr-zeta",
 ];
 
-/// Chaos-loop op classes, in the order `pick_op` indexes them.
+/// Chaos-loop op classes, in the order `pick_op` indexes them. The pinned
+/// `--rotate` seeds in `.github/workflows/ci.yml` derive their entire profile
+/// from this order, so reordering or resizing it re-rolls each of them into a
+/// different simulation — silently, because a re-rolled seed still passes.
 const OP_CLASSES: usize = 8;
 const OP_LABELS: [&str; OP_CLASSES] = [
     "publish",
@@ -139,7 +142,10 @@ const DEFAULT_OP_WEIGHTS: [u16; OP_CLASSES] = [40, 10, 25, 7, 4, 5, 5, 4];
 /// Per-class swarm bounds `(floor, span)`: a rotating seed's weight is
 /// `floor + rng.below(span)`. The floors are the honesty constraint — a class
 /// that could reach zero would hand some seeds a run that never publishes,
-/// verifies nothing, and still reports green.
+/// verifies nothing, and still reports green. Editing any pair re-rolls the
+/// pinned `--rotate` seeds in `.github/workflows/ci.yml`, which draw their
+/// weights from these values in this order: the shape each seed was pinned for
+/// is gone, and nothing reds to say so.
 const OP_WEIGHT_BOUNDS: [(u16, u16); OP_CLASSES] = [
     (6, 45), // publish — the only op that creates work to verify
     (2, 20), // delete

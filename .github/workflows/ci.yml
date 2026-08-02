@@ -107,10 +107,12 @@ jobs:
           # `simple/index.json`, and its one `cas-outcome` is `won` — the lost
           # CAS it is named for no longer occurs in its schedule at all.
           # They stay because they are deterministic, cost milliseconds, and
-          # re-walk real fleet code. But NONE of them is the guard. Every shape
-          # below names the durable test that pins it — one that pins the bad
-          # STATE or the detector rather than a schedule — and those are what may
-          # not be deleted. Changing this list deletes no coverage.
+          # re-walk real fleet code. But almost none of them is the guard. Every
+          # shape below names the durable test that pins it — one that pins the
+          # bad STATE or the detector rather than a schedule — and those are what
+          # may not be deleted. Changing this list deletes no coverage, EXCEPT
+          # for the last two legs, which are explicitly marked as their own only
+          # cover: deleting either does delete coverage until a unit test lands.
           #
           # A torn record (live body + stale backfilled sidecar) that reconcile
           # refused to heal, and a paused delete whose stale intent a concurrent
@@ -259,6 +261,50 @@ jobs:
           # mirror->private succession next door) adds nothing.
           cargo run --example vopr -- --seed 97800043727 --nodes 3 --buckets 3 --packages 6 --files 4 --ops 63 --fail-percent 3 --partition 100
           cargo run --example vopr -- --seed 121000059774 --nodes 3 --buckets 3 --packages 6 --files 2 --ops 94 --fail-percent 3 --partition 100
+          # --- Seed-only regressions -------------------------------------------
+          # The two legs below are the EXCEPTION to the rule above: each is the
+          # only cover its shape has. Both fixes reverted together leave the
+          # whole Rust unit suite green, and red only these seeds. Neither may be
+          # deleted until a unit test pins its bad STATE; when one lands, name it
+          # here and move the leg up into the list above.
+          #
+          # A stranded global-index pair whose JSON was ABSENT, not merely stale.
+          # `write_global_indexes_cas` writes `simple/index.html` before the
+          # canonical `simple/index.json`, so a crash between the legs strands
+          # them, and `load_global_names` is what tells that apart from a cold
+          # start. But the no-op gate in `update_global_index_locked` decided
+          # whether to reload by comparing ETags, and an absent JSON's ETag is
+          # `None` — equal to the `None` a cache pinned at cold start. A peer's
+          # tear therefore read as "JSON unchanged" on every later tick: no
+          # reload, no `stranded`, no JSON, while the HTML reconcile below still
+          # rewrote the live HTML down to that cache's stale empty name set,
+          # declared the pair current and consumed the dirty markers — retiring
+          # the only signal covering the tear, until the tier-3 audit had to
+          # materialize the JSON. That is what AUDIT_PREMATURE_CONSUMPTION reds
+          # on. The sibling unit tests pin the other arm only —
+          # `worker::tests::a_peers_stranded_global_html_is_seen_by_the_node_that_won_the_last_cas`
+          # moves the HTML's ETag with the JSON present — so none of them reaches
+          # an absent JSON.
+          cargo run --example vopr -- --seed 13792606396100784374 --rotate
+          # A publish that could not READ the filename fence freed the key it had
+          # just won. `publish_record` wins the artifact key with an immutable
+          # create, then HEADs `<file>.tombstone` to see whether the filename is
+          # fenced; when that HEAD ERRORED — an outage, not an answer — the
+          # single-bucket arm deleted the body it had just created and returned
+          # 503. That frees an immutable name under a rebuild that may already
+          # have read those bytes and be one op from publishing the §4 backfill
+          # sidecar naming them: the fabrication lands over an empty key, the
+          # next upload of the same filename wins the create with different
+          # bytes, and the bucket serves body B under the published sha256 of
+          # body A permanently — nothing re-hashes a stored body, so every
+          # sidecar-comparing reader calls the record healthy forever. The fix
+          # leaves the body standing on an unreadable fence (inert: a fenced
+          # filename is suppressed from every index, a live one is typed by the
+          # same backfill); the proven-fenced arm still clears it. Two nodes and
+          # one bucket, so no replication leg is involved and SELF_CONSISTENCY is
+          # the only oracle that sees it. `publish::tests::a_failed_artifact_delete_still_leaves_the_filename_barred`
+          # is the delete path next door, not this one.
+          cargo run --example vopr -- --seed 2519159830454370605 --rotate
       # Mutation-testing the oracles themselves. Each `--break` is ONE deliberate
       # defect the named invariant exists to catch, so the run MUST fail with
       # that invariant's text — an invariant nobody has watched go red is an

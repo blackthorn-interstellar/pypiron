@@ -110,9 +110,7 @@ jobs:
           # re-walk real fleet code. But almost none of them is the guard. Every
           # shape below names the durable test that pins it — one that pins the
           # bad STATE or the detector rather than a schedule — and those are what
-          # may not be deleted. Changing this list deletes no coverage, EXCEPT
-          # for the last two legs, which are explicitly marked as their own only
-          # cover: deleting either does delete coverage until a unit test lands.
+          # may not be deleted. Changing this list deletes no coverage.
           #
           # A torn record (live body + stale backfilled sidecar) that reconcile
           # refused to heal, and a paused delete whose stale intent a concurrent
@@ -261,13 +259,6 @@ jobs:
           # mirror->private succession next door) adds nothing.
           cargo run --example vopr -- --seed 97800043727 --nodes 3 --buckets 3 --packages 6 --files 4 --ops 63 --fail-percent 3 --partition 100
           cargo run --example vopr -- --seed 121000059774 --nodes 3 --buckets 3 --packages 6 --files 2 --ops 94 --fail-percent 3 --partition 100
-          # --- Seed-only regressions -------------------------------------------
-          # The two legs below are the EXCEPTION to the rule above: each is the
-          # only cover its shape has. Both fixes reverted together leave the
-          # whole Rust unit suite green, and red only these seeds. Neither may be
-          # deleted until a unit test pins its bad STATE; when one lands, name it
-          # here and move the leg up into the list above.
-          #
           # A stranded global-index pair whose JSON was ABSENT, not merely stale.
           # `write_global_indexes_cas` writes `simple/index.html` before the
           # canonical `simple/index.json`, so a crash between the legs strands
@@ -281,10 +272,14 @@ jobs:
           # declared the pair current and consumed the dirty markers — retiring
           # the only signal covering the tear, until the tier-3 audit had to
           # materialize the JSON. That is what AUDIT_PREMATURE_CONSUMPTION reds
-          # on. The sibling unit tests pin the other arm only —
+          # on. Originally found by this seed; the shape is pinned by
+          # `worker::tests::an_absent_json_under_a_published_html_is_not_read_as_a_cold_start`
+          # (a cold-pinned cache meets a peer's tear: the JSON is materialized
+          # and the live HTML is not wiped down to the cached empty set). Its
+          # sibling
           # `worker::tests::a_peers_stranded_global_html_is_seen_by_the_node_that_won_the_last_cas`
-          # moves the HTML's ETag with the JSON present — so none of them reaches
-          # an absent JSON.
+          # is the other arm — the HTML's ETag moving with the JSON present —
+          # and reaches no absent JSON.
           cargo run --example vopr -- --seed 13792606396100784374 --rotate
           # A publish that could not READ the filename fence freed the key it had
           # just won. `publish_record` wins the artifact key with an immutable
@@ -302,7 +297,14 @@ jobs:
           # filename is suppressed from every index, a live one is typed by the
           # same backfill); the proven-fenced arm still clears it. Two nodes and
           # one bucket, so no replication leg is involved and SELF_CONSISTENCY is
-          # the only oracle that sees it. `publish::tests::a_failed_artifact_delete_still_leaves_the_filename_barred`
+          # the only oracle that sees it. Originally found by this seed; the
+          # shape is pinned by
+          # `publish::tests::an_unreadable_filename_fence_leaves_the_created_body_standing`
+          # (an errored fence HEAD leaves the created body) and
+          # `publish::tests::a_proven_filename_fence_still_frees_the_body_it_created`
+          # (the answered arm still clears it, so the fix cannot be over-applied
+          # into leaving live bodies under spent filenames).
+          # `publish::tests::a_failed_artifact_delete_still_leaves_the_filename_barred`
           # is the delete path next door, not this one.
           cargo run --example vopr -- --seed 2519159830454370605 --rotate
       # Mutation-testing the oracles themselves. Each `--break` is ONE deliberate

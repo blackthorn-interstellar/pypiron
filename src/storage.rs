@@ -3710,7 +3710,10 @@ pub mod test_support {
         fail_next_get: AtomicBool,
         /// One key whose reads fail until [`InMemStorage::heal_reads`]. The
         /// positional `fail_next_get` cannot express "this object is
-        /// unreachable" when the read under test is not the next one.
+        /// unreachable" when the read under test is not the next one. A HEAD is
+        /// a read: an existence probe that ERRORS is not the same answer as one
+        /// that returns `false`, and callers that confuse the two free things
+        /// they should have left alone.
         unreadable: Mutex<Option<String>>,
         /// One key whose *mutations* fail until [`InMemStorage::heal_writes`].
         /// The mirror of `unreadable`, and its own hazard class: a write that
@@ -3782,6 +3785,9 @@ pub mod test_support {
     #[async_trait::async_trait]
     impl Storage for InMemStorage {
         async fn head_exists(&self, key: &str) -> Result<bool> {
+            if self.unreadable(key) {
+                anyhow::bail!("injected storage failure");
+            }
             Ok(self.objects.lock().unwrap().contains_key(key))
         }
         async fn stored_size(&self, key: &str) -> Result<Option<u64>> {

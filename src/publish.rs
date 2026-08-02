@@ -1477,4 +1477,90 @@ mod tests {
             "test setup broken: the body delete was supposed to fail"
         );
     }
+
+    fn fresh_upload(pkg: &str, filename: &str, body: Vec<u8>) -> PublishRequest {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&body);
+        PublishRequest {
+            pkg: pkg.to_string(),
+            filename: filename.to_string(),
+            sha256: format!("{:x}", hasher.finalize()),
+            size: body.len() as u64,
+            version: "1.0".to_string(),
+            requires_python: None,
+            is_mirror: false,
+            upload_time: "2026-01-01T00:00:00Z".to_string(),
+            yanked: Yanked::Flag(false),
+            wheel_metadata: None,
+            is_wheel: false,
+            provenance: None,
+            body: PublishBody::Bytes(body),
+        }
+    }
+
+    /// An upload wins the artifact key with an immutable create and only then
+    /// HEADs the filename fence. When that HEAD *errors* — an outage, not an
+    /// answer — the single-bucket arm used to delete the body it had just
+    /// created, freeing an immutable name on a guess. A rebuild racing this
+    /// upload may already have read those bytes and be one op away from
+    /// publishing the §4 backfill sidecar that names them: the fabrication then
+    /// lands over an empty key, the next upload of the same filename wins the
+    /// create with *other* bytes, and the bucket serves them under the published
+    /// sha256 of bytes it no longer has — forever, since nothing re-hashes a
+    /// stored body (vopr seed 2519159830454370605, SELF_CONSISTENCY). An unacked
+    /// bare artifact is inert; a freed name is permanent corruption.
+    #[tokio::test]
+    async fn an_unreadable_filename_fence_leaves_the_created_body_standing() {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let storage = Arc::new(storage::test_support::InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+        let pinned = state.pin();
+        let key = format!("{PACKAGES_PREFIX}alpha/{FILE}");
+
+        storage.fail_reads_of(&tombstone_key(&key));
+        let (code, _) = publish_record(
+            &state,
+            &pinned,
+            fresh_upload("alpha", FILE, b"artifact".to_vec()),
+        )
+        .await
+        .expect_err("the filename-fence HEAD was made to fail");
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+
+        storage.heal_reads();
+        assert!(
+            storage.head_exists(&key).await.unwrap(),
+            "an unreadable fence is not a proven one, and freeing an immutable key on \
+             a guess is what lets a racing backfill name bytes that are gone"
+        );
+    }
+
+    /// The other arm, and the one that must not be lost to over-correcting the
+    /// errored one: a fence that HEADs *true* is an answer, so the single-bucket
+    /// path still clears the body it created over a spent filename rather than
+    /// leaving a live artifact under a deleted name.
+    #[tokio::test]
+    async fn a_proven_filename_fence_still_frees_the_body_it_created() {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let storage = Arc::new(storage::test_support::InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+        let pinned = state.pin();
+        let key = format!("{PACKAGES_PREFIX}alpha/{FILE}");
+        storage.insert(&tombstone_key(&key), b"{}".to_vec());
+
+        let (code, _) = publish_record(
+            &state,
+            &pinned,
+            fresh_upload("alpha", FILE, b"artifact".to_vec()),
+        )
+        .await
+        .expect_err("the filename is fenced");
+        assert_eq!(code, StatusCode::CONFLICT);
+
+        assert!(
+            !storage.head_exists(&key).await.unwrap(),
+            "a proven fence must leave no body behind under the spent filename"
+        );
+    }
 }

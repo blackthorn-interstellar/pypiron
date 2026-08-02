@@ -4397,6 +4397,57 @@ mod tests {
         );
     }
 
+    /// The other half of the peer's tear, and the one the JSON currency probe
+    /// is blind to (vopr seed 13792606396100784374, `--rotate`). A cache pinned
+    /// at cold start holds `etag: None`, and an ABSENT canonical JSON also
+    /// probes as `None` — so a peer that published the HTML and died before the
+    /// JSON read as "JSON unchanged" on every later tick. No reload meant no
+    /// `load_global_names`, which is the only thing that sets `stranded` and
+    /// materializes the JSON; worse, the HTML reconcile below then rewrote the
+    /// live HTML down to this cache's stale (empty) set and declared the pair
+    /// current, retiring the only signal that covered the tear. A published
+    /// HTML standing over an absent JSON is that stranded pair, not a cold
+    /// start.
+    #[tokio::test]
+    async fn an_absent_json_under_a_published_html_is_not_read_as_a_cold_start() {
+        let storage = Arc::new(InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+
+        // Pin this node's cache in the cold start it really is: nothing
+        // published, names empty, both ETags `None`.
+        update_global_index(&state, storage.as_ref(), &[], &["ghost".to_string()])
+            .await
+            .unwrap();
+
+        // A peer publishes `alpha` — per-package view, then the global HTML —
+        // and dies before the canonical JSON. Only the HTML's ETag moves, off
+        // `None`; the JSON's stays absent.
+        let live = vec!["alpha".to_string()];
+        storage.insert(&format!("{SIMPLE_PREFIX}alpha/index.json"), b"{}".to_vec());
+        storage.insert(
+            &format!("{SIMPLE_PREFIX}index.html"),
+            pep503_global_html(&live).into_bytes(),
+        );
+
+        // A delta that dedups entirely against this node's cached (empty) set.
+        update_global_index(&state, storage.as_ref(), &[], &["ghost".to_string()])
+            .await
+            .unwrap();
+
+        assert!(
+            storage
+                .head_exists(&format!("{SIMPLE_PREFIX}index.json"))
+                .await
+                .unwrap(),
+            "a dedupping delta must materialize the canonical JSON a peer's tear left absent"
+        );
+        assert_eq!(
+            global_html(&storage).await,
+            pep503_global_html(&live),
+            "the reconcile must reload the peer's set, not wipe the live HTML to this cache's stale empty one"
+        );
+    }
+
     /// The reconcile must not *create* views: a bucket that has never published
     /// a global index is empty by construction, and materializing one on a no-op
     /// delta is churn the audit oracle reads as a premature marker consumption.

@@ -509,8 +509,11 @@ def test_selected_bucket_deletion_switches_and_retry_succeeds(minio_two, s3_serv
     minio_remove_bucket(minio_two, a)
     wheel = make_wheel("missingselected", "1.0", tmp_path)
     _retry_upload(server, wheel, timeout=15)
-    assert _selected_bucket(server) == b
-    assert _bucket_health(server, a) == -1
+    _eventually(
+        lambda: _selected_bucket(server) == b and _bucket_health(server, a) == -1,
+        timeout=15,
+        what="deleted bucket fails out and selection moves to the fallback",
+    )
     key = f"packages/missingselected/{wheel.name}"
     assert minio_key_exists_in(minio_two, b, key)
 

@@ -2206,21 +2206,34 @@ def minio_delete_key_in(minio: Dict, bucket: str, key: str) -> None:
     assert code == 204, f"delete {bucket}/{key} -> {code}: {resp[:200]!r}"
 
 
+def minio_bucket_exists(minio: Dict, bucket: str) -> bool:
+    """Whether a bucket exists at all, bypassing pypiron."""
+    code, _ = _s3_signed(minio, "HEAD", f"/{bucket}")
+    return code == 200
+
+
 def minio_remove_bucket(minio: Dict, bucket: str) -> None:
     """Delete a bucket and everything in it (simulates a destination outage).
 
     Sweep-and-delete retries on BucketNotEmpty: a live pypiron keeps writing
     (markers, index rebuilds) between the key sweep and the bucket DELETE, so
-    one pass is a race it can lose (`mc rb --force` retried the same way)."""
+    one pass is a race it can lose (`mc rb --force` retried the same way).
+
+    A 204 is not proof the outage took hold. A PUT that passed its bucket-exists
+    check before the DELETE committed recreates the bucket microseconds after,
+    and the caller then simulates an outage against a live bucket: writes keep
+    succeeding, the bucket stays healthy, and it is never deselected. Confirm
+    the bucket stayed gone and sweep again if a racing write brought it back —
+    pypiron stops writing once the passes it does observe fail it out."""
     deadline = time.time() + 30.0
     while True:
         for key in minio_list_keys_in(minio, bucket):
             code, resp = _s3_signed(minio, "DELETE", f"/{bucket}/{key}")
             assert code in (204, 404), f"delete {bucket}/{key} -> {code}: {resp[:200]!r}"
         code, resp = _s3_signed(minio, "DELETE", f"/{bucket}")
-        if code == 204:
+        if code == 204 and not minio_bucket_exists(minio, bucket):
             return
-        assert code == 409 and time.time() < deadline, (
+        assert code in (204, 409) and time.time() < deadline, (
             f"remove bucket {bucket} -> {code}: {resp[:200]!r}"
         )
 

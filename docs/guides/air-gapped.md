@@ -117,10 +117,11 @@ your ferry drop a fresh copy there on whatever schedule it runs:
 pypiron serve --advisory-feed /var/lib/pypiron/osv-pypi-all.zip
 ```
 
-However the feed arrives, blocking behaves the same. An unfed box says so
-in its logs until the first feed lands, then arms itself without a restart.
-An enclave usually wants fail-closed instead: set `PYPIRON_MALWARE_BLOCK=true`
-explicitly and the server refuses to start until a feed is loaded.
+However the feed arrives, blocking behaves the same. Before the first
+delivery, the block set baked into the binary at release covers the box; the
+ferried feed supersedes it without a restart. An enclave usually wants
+fail-closed on top: set `PYPIRON_MALWARE_BLOCK=true` explicitly and the
+server refuses to start until a live feed is loaded.
 
 ## Keep it fresh
 

@@ -293,15 +293,18 @@ def test_ac7_explicit_unreachable_source_refuses_start(pypiron_bin, tmp_path):
 def test_ac7_implicit_default_starts_unfed_then_self_arms(pypiron_bin, tmp_path):
     """The always-on default must never brick a box that never asked: with the OSV
     URL unreachable (a dead forward proxy standing in), the server starts, serves,
-    warns that blocking is armed but unfed, and self-arms when a snapshot arrives —
-    no restart. Hand-rolled (clean env) so it exercises the true implicit default,
-    independent of the conftest advisory-disable other tests rely on."""
+    blocks from the embedded floor snapshot, warns that no live snapshot is loaded,
+    and self-arms when one arrives — no restart. Hand-rolled (clean env) so it
+    exercises the true implicit default, independent of the conftest
+    advisory-disable other tests rely on."""
     env = _dead_proxy_env()
     proc, base, log_path = _hand_start(pypiron_bin, tmp_path / "data", [], extra_env=env)
     try:
         # It binds immediately (the implicit obtain is non-blocking) and serves.
         code, _, _ = http_get(f"{base}/simple/index.json")
         assert code == 200
+        # The embedded floor arms blocking at boot, before any feed exists.
+        _wait_log_contains(log_path, "armed from the embedded floor snapshot")
         # The worker's first (background) obtain fails → armed-but-unfed warning.
         _wait_log_contains(log_path, "armed but unfed")
         # No snapshot yet → the gauge is absent (not a misleading zero).

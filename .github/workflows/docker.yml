@@ -77,6 +77,12 @@ jobs:
         shell: bash
         run: ./.github/stamp-version.sh "$GITHUB_REF_NAME"
 
+      # A release ships the freshest malware floor it can fetch; on any failure
+      # the committed floor (at most one release old) ships instead.
+      - name: Refresh embedded malware floor
+        shell: bash
+        run: python3 dev/scripts/compile_malware_floor.py || echo "::warning::floor refresh failed; shipping the committed floor"
+
       # `.git` isn't in the docker context, but build.rs reads this env directly.
       - name: Short commit hash
         shell: bash

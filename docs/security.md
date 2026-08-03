@@ -78,10 +78,12 @@ fresher, and a staleness gauge climbs so you can alert before it drifts. It
 degrades toward stale, never toward down. A blocked download is itself worth an
 alert: it means some machine in your fleet is still asking for malware.
 
-The same choice applies at first boot: a server that has never loaded a feed
-serves packages and says so in its logs until the first snapshot lands, then
-arms itself without a restart. Want fail-closed instead? Set
-`PYPIRON_MALWARE_BLOCK=true` explicitly and an unfed server refuses to start.
+First boot is covered too: the binary ships with a compiled block set baked in
+at release build, so a brand-new server blocks known malware from its first
+request; the first live snapshot supersedes it without a restart. Want
+fail-closed against even that release-old staleness? Set
+`PYPIRON_MALWARE_BLOCK=true` explicitly and a server with no live snapshot
+refuses to start.
 The feed itself is OSV's PyPI export, fetched from a Google-hosted bucket
 (named in the startup log) — the one outbound connection a default install
 makes, and repointable or removable:
@@ -136,8 +138,8 @@ cache miss, so `sync` removes that surface: pre-load an approved package list
 from a connected host, then serve from a node with no egress — the mirror is
 complete on its own, no upstream needed. Malware blocking crosses the same gap:
 a pypiron-to-pypiron `sync` ferries the advisory feed alongside the packages.
-An unfed box says so in its logs until the first feed lands, then arms itself
-without a restart. The full recipe — feed sources, ferry schedules, freshness —
+Until the first delivery, the block set baked into the binary at release
+covers the box; the ferried feed supersedes it without a restart. The full recipe — feed sources, ferry schedules, freshness —
 is in [Air-gapped deploys](guides/air-gapped.md).
 
 ## Vulnerability audit

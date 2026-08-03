@@ -22,7 +22,9 @@ use tracing::{debug, info, warn};
 use crate::clock::unix_now_secs;
 use crate::hash::sha256_hex;
 use crate::metrics::Metrics;
-use crate::osv::{advance_watermark, block_hits, mal_rules, parse_modified, MalRule, OsvAdvisory};
+use crate::osv::{
+    advance_watermark, block_hits, mal_rules, parse_modified, MalRule, OsvAdvisory, VersionScope,
+};
 use crate::ssrf::{guarded_get, guarded_get_with, Guard, SsrfGuardResolver};
 use crate::storage::{self, Storage};
 
@@ -240,6 +242,66 @@ impl AdvisoryState {
     pub fn has_block_data(&self) -> bool {
         self.db.is_some() || !self.overlay.is_empty()
     }
+}
+
+/// On-disk shape of `assets/malware-floor.json.gz` (see
+/// `dev/scripts/compile_malware_floor.py`): per normalized name, a list of
+/// `[advisory id, "*" | [versions]]` rules.
+#[derive(Deserialize)]
+struct FloorFile {
+    built_unix: u64,
+    rules: HashMap<String, Vec<(String, FloorScope)>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FloorScope {
+    Star(String),
+    Versions(Vec<String>),
+}
+
+/// The malware floor baked into the binary at release build: a compiled
+/// `MAL-*` block set seeded into the probe overlay before the first live
+/// snapshot, so a fresh default install blocks known malware from its first
+/// request instead of serving unfed. The first real snapshot load clears the
+/// overlay — the fresh baseline absorbs the floor, same as probe data.
+/// Returns `(overlay, built_unix)`; `None` only if the embedded asset is
+/// unreadable (never a startup failure — the floor is best-effort by design).
+pub fn embedded_floor() -> Option<(HashMap<String, Vec<MalRule>>, u64)> {
+    use std::io::Read as _;
+    let raw: &[u8] = include_bytes!("assets/malware-floor.json.gz");
+    let mut buf = Vec::new();
+    if flate2::read::GzDecoder::new(raw)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        warn!("embedded malware floor: asset failed to decompress; starting without a floor");
+        return None;
+    }
+    let file: FloorFile = match serde_json::from_slice(&buf) {
+        Ok(f) => f,
+        Err(err) => {
+            warn!(%err, "embedded malware floor: asset failed to parse; starting without a floor");
+            return None;
+        }
+    };
+    let mut map: HashMap<String, Vec<MalRule>> = HashMap::new();
+    for (name, rules) in file.rules {
+        let mut out = Vec::new();
+        for (id, scope) in rules {
+            let scope = match scope {
+                FloorScope::Star(s) if s == "*" => VersionScope::AllVersions,
+                // Unknown marker from a future format: skip the rule, never guess.
+                FloorScope::Star(_) => continue,
+                FloorScope::Versions(v) => VersionScope::Exact(v),
+            };
+            out.push(MalRule { id, scope });
+        }
+        if !out.is_empty() {
+            map.insert(name, out);
+        }
+    }
+    (!map.is_empty()).then_some((map, file.built_unix))
 }
 
 fn is_url(feed: &str) -> bool {
@@ -653,10 +715,18 @@ pub async fn refresh(
     // once (this is where the implicit default lands after its first background
     // obtain fails), and re-arm the warning if a later loss ever recurs.
     if !has_snapshot && !memo.unfed_warned {
-        warn!(
-            "malware blocking armed but unfed: no advisory snapshot is available yet, so nothing \
-             is blocked. It self-arms the moment a snapshot arrives (a local-path ferry or a sync push)."
-        );
+        if snap.overlay.is_empty() {
+            warn!(
+                "malware blocking armed but unfed: no advisory snapshot is available yet, so nothing \
+                 is blocked. It self-arms the moment a snapshot arrives (a local-path ferry or a sync push)."
+            );
+        } else {
+            warn!(
+                "malware blocking armed but unfed: no live advisory snapshot yet — the embedded \
+                 floor snapshot is enforcing until one arrives (a URL fetch, a local-path ferry, \
+                 or a sync push)."
+            );
+        }
         memo.unfed_warned = true;
     } else if has_snapshot {
         memo.unfed_warned = false;
@@ -1334,9 +1404,87 @@ pub async fn stored_report(storage: &dyn Storage) -> Result<Option<Report>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::osv::VersionScope;
     use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn embedded_floor_parses_and_is_populated() {
+        let (floor, built_unix) = embedded_floor().expect("embedded floor must parse");
+        assert!(
+            built_unix > 1_700_000_000,
+            "floor carries a real build time"
+        );
+        assert!(
+            floor.len() > 5_000,
+            "floor should hold the OSV MAL corpus, got {} projects",
+            floor.len()
+        );
+        let star = floor
+            .values()
+            .flatten()
+            .any(|r| matches!(r.scope, VersionScope::AllVersions));
+        let exact = floor
+            .values()
+            .flatten()
+            .any(|r| matches!(r.scope, VersionScope::Exact(_)));
+        assert!(
+            star && exact,
+            "floor needs both all-version and exact rules"
+        );
+        for (name, rules) in &floor {
+            assert_eq!(
+                name,
+                &crate::names::normalize_pkg_name(name),
+                "names pre-normalized"
+            );
+            assert!(
+                rules.iter().all(|r| r.id.starts_with("MAL-")),
+                "only MAL ids block"
+            );
+        }
+    }
+
+    #[test]
+    fn floor_seeded_overlay_blocks_before_any_snapshot() {
+        let (floor, _) = embedded_floor().expect("embedded floor must parse");
+        let star_name = floor
+            .iter()
+            .find(|(_, rules)| matches!(rules[0].scope, VersionScope::AllVersions))
+            .map(|(name, _)| name.clone())
+            .expect("a star rule exists");
+        let (exact_name, exact_version) = floor
+            .iter()
+            .find_map(|(name, rules)| {
+                rules.iter().find_map(|r| match &r.scope {
+                    VersionScope::Exact(v) if !v.is_empty() => Some((name.clone(), v[0].clone())),
+                    _ => None,
+                })
+            })
+            .expect("an exact rule exists");
+
+        let state = AdvisoryState {
+            overlay: Arc::new(floor),
+            ..AdvisoryState::default()
+        };
+        assert!(
+            state.has_block_data(),
+            "a floor-seeded node is not unfed for blocking"
+        );
+        assert!(
+            !state.blocking(&star_name, Some("1.0.0")).is_empty(),
+            "star entry blocks any version"
+        );
+        assert!(
+            !state.blocking(&exact_name, Some(&exact_version)).is_empty(),
+            "exact entry blocks its version"
+        );
+        assert!(
+            state
+                .blocking("definitely-clean-package-zz", Some("1.0.0"))
+                .is_empty(),
+            "unlisted names stay clean"
+        );
+    }
 
     /// Build an OSV-shaped zip from `(filename, json)` members.
     fn osv_zip(entries: &[(&str, serde_json::Value)]) -> Vec<u8> {

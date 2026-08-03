@@ -1297,7 +1297,17 @@ async fn run_serve(
         if let Some(url) = &advisory_feed {
             info!(feed = %url, "advisory feed: polling for the malware block set and org audit (loading in background)");
         }
-        (advisories::AdvisoryState::default(), false)
+        let mut st = advisories::AdvisoryState::default();
+        if let Some((floor, built_unix)) = advisories::embedded_floor() {
+            let age_days = crate::clock::unix_now_secs().saturating_sub(built_unix) / 86_400;
+            info!(
+                projects = floor.len(),
+                floor_age_days = age_days,
+                "malware blocking armed from the embedded floor snapshot; the first live feed supersedes it"
+            );
+            st.overlay = Arc::new(floor);
+        }
+        (st, false)
     };
     // Effective blocking is off whenever the feature is off.
     let malware_block = !advisory_off && malware_block_flag;

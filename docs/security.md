@@ -75,6 +75,15 @@ fresher, and a staleness gauge climbs so you can alert before it drifts. It
 degrades toward stale, never toward down. A blocked download is itself worth an
 alert: it means some machine in your fleet is still asking for malware.
 
+The same choice applies at first boot: a server that has never loaded a feed
+serves packages and says so in its logs until the first snapshot lands, then
+arms itself without a restart. Want fail-closed instead? Set
+`PYPIRON_MALWARE_BLOCK=true` explicitly and an unfed server refuses to start.
+The feed itself is OSV's PyPI export, fetched from a Google-hosted bucket
+(named in the startup log) — the one outbound connection a default install
+makes, and repointable or removable:
+[advisory feed options](reference/configuration.md#server).
+
 **Pulled upstream, pulled here.** PyPI sometimes quarantines a project
 outright — a compromised account, a malware finding — freezing it so nothing new
 resolves. pypiron relays that state. A quarantined project lists no files here,

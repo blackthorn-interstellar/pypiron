@@ -107,7 +107,7 @@ names — `acme_foo`, `acme.foo`, and `acme-foo` are the same name.
 
 The other half is client-side: point clients at this one index
 (`--default-index` for uv; `--index-url` for pip, not `--extra-index-url`) and
-let the server decide what exists. [How private and public names coexist](concepts.md#how-packages-get-there).
+let the server decide what exists. [How private and public names coexist](concepts.md#a-name-is-yours-or-pypis-never-both).
 
 ## Approval lists
 

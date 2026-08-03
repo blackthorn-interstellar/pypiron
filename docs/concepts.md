@@ -16,11 +16,7 @@ uv pip install --index-url https://your-server/simple/ acme-utils requests
 difference and doesn't need to. [The quickstart](index.md) has the loop end to
 end.
 
-## How packages get there
-
-Packages reach that URL three ways. Use one, or all three at once.
-
-### You publish them
+## Your private packages
 
 Publish with the tool you already use — twine, uv, poetry, hatch, flit. Nothing
 about your build changes except the URL:
@@ -33,24 +29,28 @@ Filenames are write-once: the server refuses a re-upload even with identical
 bytes, so nobody swaps a build under a version someone already installed. Yank
 hides a file from resolvers while pinned installs keep working.
 
-### Someone installs them
+## Public packages
 
-Public packages arrive as clients ask for them: the first request for a file
-fetches it from PyPI, checks it against upstream's hash, and keeps it. Every
-install after that serves from your own storage.
+Your builds need numpy too. Serve it from the same server — cached on demand
+from PyPI, or synced ahead of time for an air-gapped network.
+
+### Connected: cache on demand
+
+The first request for a file fetches it from PyPI, checks it against upstream's
+hash, and keeps it. Every install after that serves from your own storage, so a
+PyPI outage stops mattering — and a corrupt or truncated upstream response is
+discarded, never cached.
 
 ```bash
 pypiron serve --proxy-upstream https://pypi.org
 ```
 
-Off until you set it. Once a file is cached, PyPI outages stop mattering — a
-corrupt or truncated upstream response is discarded, never cached.
+Off until you set it.
 
-### You pull them in first
+### Air-gapped: sync ahead of time
 
-Sync a slice of an upstream index ahead of time — this is how you run
-air-gapped: sync on a connected machine, carry the storage in, serve with no
-upstream at all.
+Sync on a connected machine, carry the storage in, serve with no upstream at
+all:
 
 ```bash
 pypiron sync --from https://pypi.org/simple/ --to https://your-server/ \
@@ -58,12 +58,13 @@ pypiron sync --from https://pypi.org/simple/ --to https://your-server/ \
   --include-package numpy --include-package "requests>=2.20"
 ```
 
-Choose the slice by name and version range, wheel platform and Python tag,
-format, size, age, or pre-release status. Re-runs skip what you already hold,
-and upstream yanks follow through, so what you serve keeps matching upstream.
+Re-runs skip what you already hold, and upstream yanks follow through, so what
+you serve keeps matching upstream.
 
-Put the list in `pypiron.toml` and it drives both syncing and caching, so the
-two can't drift apart. [Every selector](reference/configuration.md) ·
+One allowlist scopes both modes: name the packages you allow — version ranges
+included — and narrow by wheel platform, Python version, format, size, age, or
+pre-release. Keep it in `pypiron.toml` and caching and syncing can't drift
+apart. [Every selector](reference/configuration.md) ·
 [air-gapped guide](guides/air-gapped.md)
 
 ## A name is yours or PyPI's, never both

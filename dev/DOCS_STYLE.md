@@ -8,6 +8,37 @@ wants to know *what they get* and *what to do*.
 One rule underneath all the others: **write for the user, not the builder.**
 Everything below is that rule, made concrete.
 
+## The buyer's script
+
+Frame before prose. Before writing or restructuring a page, write the reader's
+side of the conversation — the questions they ask, in their words, in the order
+they ask them — and make the page the answers in that order. The evaluator's
+script for pypiron:
+
+1. "I want a PyPI server. Can it host my private packages?"
+2. "How about public packages?" — either cached on demand from PyPI, or
+   air-gapped: the same allowlist syncs them over ahead of time.
+3. "Where does it store things, and what do I back up?"
+4. "Who can publish? How does CI get access?"
+5. "What keeps malware out?"
+6. "How do I know it's healthy?"
+
+Three tests, applied ruthlessly:
+
+- **Heading test.** Every heading must restate as a question from the script,
+  in the customer's words. If the restatement needs our nouns ("package
+  sources", "how packages get there"), the heading is product anatomy —
+  reframe it.
+- **No mechanism menus.** Never organize copy as "N ways / sources / modes" of
+  the product — that's the implementation's ingestion diagram. Enumerate only
+  decisions the customer faces: connected vs air-gapped is one; "upload vs
+  proxy vs sync" is not (they answer different questions in the script).
+- **Fresh-reader monologue.** Review by roleplaying the persona — a platform
+  engineer who has run devpi or Artifactory and never read our docs — and
+  narrating their read; every stall ("what's a 'source'?", "why would I use
+  three at once?") is a defect. The persona brief must contain none of our
+  taxonomy, or the review inherits the writer's frame and confirms it.
+
 ## Voice
 
 Write like a hybrid of Guido, Levelsio, and Linus: plain and correct, short and

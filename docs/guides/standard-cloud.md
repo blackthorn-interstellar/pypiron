@@ -27,7 +27,7 @@ packages on demand: a cache miss comes from PyPI once, then stays local.
 `exclude-newer` is the dependency cooldown: fresh releases wait a week, on by
 default. Spelled out here so it's easy to change.
 To pre-load an approved list instead of proxying, see
-[How packages get there](../concepts.md#how-packages-get-there).
+[air-gapped sync](../concepts.md#air-gapped-sync-ahead-of-time).
 
 Point `buckets` at an existing bucket. On AWS there's usually nothing else to
 set: credentials come from the standard chain — environment, web identity,

@@ -79,7 +79,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="concepts.md#how-packages-get-there">Private packages</a></td>
+      <td colspan="2"><a href="concepts.md#your-private-packages">Private packages</a></td>
       <td align="center"><abbr title="Publish with twine or uv; admin/uploader/reader credentials plus short-lived install tokens.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">✅</td>
@@ -88,7 +88,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="concepts.md#how-packages-get-there">PyPI proxy</a></td>
+      <td colspan="2"><a href="concepts.md#public-packages">PyPI proxy</a></td>
       <td align="center"><abbr title="Caches public packages from PyPI on first install, behind the same URL as your private ones.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">—</td>
@@ -97,7 +97,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">✅</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="concepts.md#how-packages-get-there">Sync mirror</a></td>
+      <td colspan="2"><a href="concepts.md#public-packages">Sync mirror</a></td>
       <td align="center"><abbr title="Mirrors a chosen subset of upstream: include/exclude by name, wheel tags, format, size, minimum Python, and pre-release.">✅</abbr></td>
       <td align="center">✅</td>
       <td align="center">—</td>
@@ -243,7 +243,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
 ## Going further
 
 - [Deploying](guides/standard-cloud.md) — a production server from standard cloud parts
-- [Private packages, PyPI proxy, sync mirror](concepts.md#how-packages-get-there) — how they combine behind one index URL
+- [Private packages, the PyPI cache, air-gapped sync](concepts.md) — how they combine behind one index URL
 - [Configuration](reference/configuration.md) — every flag and its `PYPIRON_*` env var
 - [Comparison & benchmarks](compare/index.md) — every alternative, and how the numbers were measured
 - [For AI agents](for-agents.md) — a decision guide, written for agents, by an agent

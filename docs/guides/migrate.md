@@ -19,8 +19,8 @@ pypiron sync \
   --include-package internal-lib
 ```
 
-Each named package is downloaded from the old index (authenticated) and
-stored in pypiron as private. Install it like anything else:
+pypiron downloads each named package from the old index (authenticated) and
+stores it as private. Install it like anything else:
 
 ```bash
 uv pip install internal-app --index-url http://localhost:8080/simple/
@@ -30,15 +30,15 @@ uv pip install internal-app --index-url http://localhost:8080/simple/
 
 - Packages land **private**: your own packages, served from your index. Not a
   mirror of a public project — pypiron never falls through to PyPI for them.
-- **Timestamps and yank state are not preserved.** Migrated files carry the
+- **Migration drops timestamps and yank state.** Migrated files carry the
   migration date. (Mirroring public PyPI keeps real upload times; a private
   migration doesn't.)
 - **Don't set `--private-prefix` during a migration.** It reserves a namespace
-  for private names, and a package whose name falls outside it is refused.
-  Migrate first, add the prefix after.
+  for private names, and pypiron refuses any package whose name falls outside
+  it. Migrate first, add the prefix after.
 
-Re-running is safe: files already migrated are skipped, so a second pass only
-carries what's new.
+Re-running is safe: pypiron skips files already migrated, so a second pass
+only carries what's new.
 
 ## devpi
 
@@ -73,7 +73,7 @@ pypiron sync \
   --include-package internal-app
 ```
 
-**One prerequisite: the source must serve the JSON simple API (PEP 691).**
+**One requirement: the source must serve the JSON simple API (PEP 691).**
 pypiron reads the modern JSON index; it does not scrape the older HTML index.
 
 - **Artifactory** serves HTML by default. Turn on JSON per repository:
@@ -94,12 +94,11 @@ The same message appears if a wrong credential lands you on a login page — che
 `--source-user`/`--source-pass` before assuming the endpoint is wrong.
 
 devpi is tested end-to-end. The Artifactory and Nexus paths above are their
-standard simple-API endpoints; the JSON-indexing prerequisite is the one thing to
-confirm first.
+standard simple-API endpoints; the JSON index is the one thing to confirm first.
 
 ## Migrating everything
 
-`sync` migrates the packages you name — it won't enumerate the whole source for
+`sync` migrates the packages you name — it won't list the whole source for
 you. Most teams already know their list. If you don't, read it from the source
 index once:
 
@@ -121,6 +120,6 @@ pypiron sync --from https://devpi.example.com/acme/prod/+simple \
 Keep passwords out of the command line — use the environment:
 `PYPIRON_SYNC_SOURCE_USER` / `PYPIRON_SYNC_SOURCE_PASS` for the source,
 `PYPIRON_SYNC_ADMIN_PASS` for pypiron. Source credentials go to the source host
-only; they are never forwarded to a redirect somewhere else.
+only; pypiron never forwards them to a redirect somewhere else.
 
 Full flag list: [Configuration → Sync](../reference/configuration.md#sync).

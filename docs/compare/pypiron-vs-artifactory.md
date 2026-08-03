@@ -15,21 +15,21 @@ one governed platform, that is what Artifactory is for.
 ## What Artifactory gives you that pypiron does not
 
 - **Every artifact type, one platform.** Docker, Maven, npm, NuGet, Go, PyPI,
-  and more under one roof, with virtual repositories that aggregate them. pypiron
+  and more, with virtual repositories that aggregate them. pypiron
   is Python only.
 - **Enterprise governance.** Fine-grained RBAC, SSO/LDAP, audit trails,
   replication topologies, and a vendor support contract. pypiron has two
   credentials (uploader and admin) plus short-lived install tokens — enough for a
   private registry, not a substitute for org-wide identity and policy.
-- **A commercial relationship.** Artifactory is licensed (self-hosted JFrog
+- **A commercial relationship.** You license Artifactory (self-hosted JFrog
   Platform or JFrog Cloud SaaS), with a support SLA behind it. pypiron is MIT and
   self-run; you own the box.
 
 If you need an org-wide, multi-format, governed binary manager, pypiron does not
 replace Artifactory and should not try. (Sonatype Nexus Repository is the other
 incumbent here, with a free self-hosted OSS edition that also does PyPI
-hosted/proxy/group repositories — worth a look if "free and multi-format" is the
-requirement.)
+hosted/proxy/group repositories — worth a look if you need something free
+and multi-format.)
 
 ## What pypiron gives you that Artifactory does not
 
@@ -41,13 +41,13 @@ requirement.)
 - **Fast installs.** pypiron sustains
   [8,288 installs/s on a 2-vCPU box](index.md) by handing the
   download straight to object storage instead of streaming wheel bytes through
-  its own process. A general-purpose platform carries more per request; if raw
+  its own process. A general-purpose platform carries more per request; if
   Python install throughput on small hardware is your bottleneck, a purpose-built
   server wins.
 - **Supply-chain defense on by default.** A 7-day cooldown on new releases so
   most attacks surface first ([how](../security.md)), a private name
   that can never fall through to public PyPI, and refusal of any file the advisory
-  feed flags as malware — all on out of the box, no policy engine to configure.
+  feed flags as malware — all on, no policy engine to configure.
 - **Multi-region resilience without the enterprise tier.** Run nodes across
   regions or clouds (S3 + GCS + Azure) on one bucket list; every upload lands on
   all of them and reads fail over with zero data loss
@@ -71,7 +71,7 @@ requirement.)
 ## The honest line
 
 Artifactory earns its place when one platform must govern every artifact in the
-company. But if what you actually need is a fast, private PyPI with a PyPI cache
+company. But if what you need is a fast, private PyPI with a PyPI cache
 and supply-chain defense — and you would rather run a single binary than license
 and operate a platform for it — pypiron is the Artifactory alternative built for
 exactly that. [Set it up](../guides/standard-cloud.md) in one command and see.

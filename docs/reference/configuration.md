@@ -104,8 +104,8 @@ half-configured refuses to start.
 - **S3** — the standard AWS chain: env vars, web identity, instance role, task
   role.
 - **GCS** — a service-account key (`--gcs-service-account-path`) enables
-  presigned redirects; without one, Application Default Credentials are used and
-  downloads stream through the node.
+  presigned redirects; without one, pypiron uses Application Default Credentials
+  and downloads stream through the node.
 - **Azure** — the account access key (`--azure-access-key`) enables presigned
   (SAS) redirects.
 
@@ -131,8 +131,8 @@ two Azure accounts in one list — override per bucket instead.
 ### Per-bucket overrides
 
 For the rare fleet where buckets need different endpoints or credentials, give a
-bucket its own `[serve.bucket."URI"]` table in `pypiron.toml`. TOML only — there
-is no CLI or env form.
+bucket its own `[serve.bucket."URI"]` table in `pypiron.toml`. TOML only — no
+CLI or env form.
 
 ```toml
 [serve]
@@ -144,9 +144,9 @@ force-path-style = true
 env-prefix = "MINIO_CACHE_"   # reads MINIO_CACHE_AWS_ACCESS_KEY_ID / ..._AWS_SECRET_ACCESS_KEY
 ```
 
-The table is keyed by the bucket's URI, matched on `scheme://name` — any `@region`
-is ignored, so `"s3://minio-cache"` and `"s3://minio-cache@us-west-2"` name the
-same bucket. Fields are scheme-specific:
+The table is keyed by the bucket's URI, matched on `scheme://name` — pypiron
+ignores any `@region`, so `"s3://minio-cache"` and
+`"s3://minio-cache@us-west-2"` name the same bucket. Fields are scheme-specific:
 
 | Field | Schemes | Meaning |
 | --- | --- | --- |
@@ -165,12 +165,12 @@ and pypiron reads them from the environment:
 - **GCS** has no `env-prefix`: its credential is a key file, so use
   `service-account-path` instead.
 
-Everything is validated at startup, before any bucket is touched:
+pypiron validates everything at startup, before touching any bucket:
 
 - An override keyed to a bucket not in `--buckets` fails, listing the valid
   buckets (typo protection).
-- An `env-prefix` with only one credential half set — or neither — fails: scoped
-  credentials were promised and none delivered.
+- An `env-prefix` with only one credential half set — or neither — fails: a
+  scoped credential was promised and isn't fully there.
 - A field used on the wrong scheme fails, naming the field and bucket.
 
 ### What is per-bucket, what is backend-wide
@@ -191,8 +191,8 @@ different prefixes.
 
 On disk the prefix is a subdirectory of `--data-dir`.
 
-Point an existing server at a prefix and it will look empty: the prefix is part
-of every key, so it is chosen once, when the bucket is first populated. To adopt
+Point an existing server at a prefix and it looks empty: the prefix is part of
+every key, so choose it once, when you first populate the bucket. To adopt
 one later, move the objects (`aws s3 mv --recursive`, `gcloud storage mv`) before
 restarting.
 
@@ -214,7 +214,7 @@ pypiron serve --buckets s3://iron-east@us-east-1,s3://iron-west@us-west-2
 PYPIRON_BUCKETS=s3://iron-east@us-east-1,s3://iron-west@us-west-2
 ```
 
-Each entry needs a scheme and may carry an optional `@region` label:
+Each entry needs a scheme and may carry an `@region` label:
 
 - `s3://name` or `s3://name@region` — an S3 bucket.
 - `gs://name` or `gs://name@region` — a GCS bucket.
@@ -225,7 +225,7 @@ region to these labels to pick the bucket it reads from — reads stay in-region
 while writes still fan out everywhere (see
 [Reads stay in their region](../guides/multi-region.md#reads-stay-in-their-region)).
 The label is part of the shared list, so it is identical on every node and does
-not affect a bucket's identity or the fleet's bucket order. On S3 it additionally
+not affect a bucket's identity or the fleet's bucket order. On S3 it also
 selects the client's signing and endpoint region; precedence there is per-bucket
 `@region`, then the ambient `AWS_REGION` / `AWS_DEFAULT_REGION`, then the SDK
 default. GCS and Azure endpoints do not encode a region, so on those backends the
@@ -236,13 +236,13 @@ across two clouds and survives an entire provider outage. Each backend resolves
 its own native credentials (the AWS chain for S3, a service-account key or
 Application Default Credentials for GCS, the account key for Azure); a bucket
 whose backend is half-configured refuses to start. One bad URI fails startup
-before any bucket is contacted.
+before pypiron contacts any bucket.
 
-Replication keeps a full copy of your truth on every bucket: your own uploads,
+Replication keeps a full copy of your files on every bucket: your own uploads,
 the corpus you pulled in with `sync --to`, **and** the on-demand proxy cache
 (packages fetched from public PyPI on first request). The proxy cache converges
 in the background — a fetch is served the instant it lands, and its copy to the
-other buckets follows within minutes, off the download path — so budget for roughly your total stored size times the number of buckets. There are no new knobs: replication is on whenever you run more than
+other buckets follows within minutes, off the download path — so budget for roughly your total stored size times the number of buckets. No new knobs: replication is on whenever you run more than
 one bucket.
 
 When two buckets live on the same cloud under the same credentials, pypiron asks
@@ -254,10 +254,10 @@ qualify; two separate MinIO endpoints or two different clouds do not, and fall
 back to streaming. pypiron works this out once at startup — verifying each pair
 with a throwaway copy — and logs the result one line per bucket pair (a
 `replication copy matrix` entry reading `transport=copy` or `transport=stream`),
-so you can see which pairs take the fast path. There is nothing to configure and
+so you can see which pairs take the fast path. Nothing to configure, and
 nothing changes about what ends up on each bucket; only how the bytes get there.
 
-In multi-bucket mode SDK retries are disabled and one-second topology probes
+In multi-bucket mode pypiron disables SDK retries, and one-second topology probes
 switch new requests and cancel background work on an ineligible bucket, without
 putting a short deadline on real artifact transfers (an in-flight transfer keeps
 the normal one-hour bound). Startup and migration operations also carry a
@@ -290,7 +290,7 @@ recovery behavior, and operator rules.
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | OSV PyPI export | Feed for malware blocking and the org audit: a URL or local path to the [OSV](https://osv.dev) PyPI advisory export. Defaults to `https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip` (named in the startup log); a URL fetch honors `HTTP(S)_PROXY`. `""` disables both features. |
 | `--malware-block true\|false` | `PYPIRON_MALWARE_BLOCK` | `true` | Refuse to serve or cache files an OSV `MAL-*` advisory flags as malicious. Needs a snapshot source — the feed, or one delivered earlier by `sync`. Explicit `true` that can't obtain a snapshot refuses startup; the default warns "armed but unfed" and self-arms when a snapshot arrives. Scoped to OSV advisory blocking only: PEP 792 quarantine refusal (a project PyPI froze) is enforced independently and stays on when this is `false`. |
 | `--malware-probe-secs N` | `PYPIRON_MALWARE_PROBE_SECS` | `120` | How often each node checks OSV for a just-published malware advisory and blocks it within minutes, ahead of the daily feed refresh. Near-zero bandwidth (a conditional check that transfers nothing most polls) and no stored state. `0` disables; inert unless blocking is armed and the feed is the OSV `all.zip` URL. |
-| `--metrics-project-labels` | `PYPIRON_METRICS_PROJECT_LABELS` | `false` | Attach per-client `project` labels to `/metrics`. Off by default: `/metrics` is unauthenticated and the label derives from the auth username subaddress, so exposing it lets any scraper enumerate internal project names. |
+| `--metrics-project-labels` | `PYPIRON_METRICS_PROJECT_LABELS` | `false` | Attach per-client `project` labels to `/metrics`. Off by default: `/metrics` is unauthenticated and the label derives from the username tag, so exposing it lets any scraper list internal project names. |
 | `--spool-dir PATH` | `PYPIRON_SPOOL_DIR` | system temp | Upload/proxy spool directory. |
 | `--artifact-delivery auto\|redirect\|stream` | `PYPIRON_ARTIFACT_DELIVERY` | `auto` | Redirect object-store downloads when the client handles it well; otherwise stream. |
 | `--wait-on-upload` | `PYPIRON_WAIT_ON_UPLOAD` | `false` | Wait for index visibility before upload returns. |
@@ -355,22 +355,22 @@ that terminates TLS with a private root CA. pypiron works through both:
   routes through the proxy; no flag needed. (The cloud instance-metadata probe is
   the deliberate exception — it always goes direct to the link-local address.)
 - **Custom CA.** When the proxy re-signs TLS with a private root, point
-  `--upstream-ca-cert` at that CA's PEM bundle. It is loaded once at startup and
+  `--upstream-ca-cert` at that CA's PEM bundle. It loads once at startup and
   *augments* the built-in roots, so a direct fetch of public PyPI still validates
   while the corporate CA is also trusted. A bundle that can't be read or parsed
   refuses startup (fail-closed).
 
-Enabling a proxy is an explicit operator act, and it shifts where one SSRF check
+Enabling a proxy is a deliberate choice, and it shifts where one SSRF check
 enforces. The IP-literal pre-flight is unaffected: an internal address supplied by
 a listing — `127.0.0.1`, `10.x`, the `169.254.169.254` metadata endpoint, their
 IPv6 and NAT64 (`64:ff9b::`) forms — is still refused on the initial request and
-every redirect hop. But a *name* target is resolved by the proxy, not by pypiron,
-so name-based SSRF enforcement moves to the proxy's own egress ACL — which is the
-intended egress control point once a proxy is in the path.
+every redirect hop. But it is the proxy, not pypiron, that resolves a *name*
+target, so name-based SSRF enforcement moves to the proxy's own egress ACL —
+which is the intended egress control point once a proxy is in the path.
 
 ## Mirror selection
 
-`[mirror]` is shared by `serve --proxy-upstream` and `pypiron sync`.
+`serve --proxy-upstream` and `pypiron sync` share `[mirror]`.
 
 | TOML key | Flag | Env |
 | --- | --- | --- |
@@ -410,7 +410,7 @@ Rules:
   hold. `""` disables it.
 - `WHEN` accepts an RFC 3339 timestamp, bare date, bare day count, friendly
   duration (`"30 days"`), or ISO 8601 duration (`P30D`).
-- Yanked files are excluded unless `include-yanked = true`.
+- Yanked files stay out unless `include-yanked = true`.
 
 ## Sync
 
@@ -484,7 +484,7 @@ also re-hashes every file and compares it to the SHA-256 your clients check thei
 downloads against. That is the only check that catches a file replaced by a
 different one of the same length, and it reads your whole corpus once: seconds on
 a private index, hours on a full mirror. Run it after a restore, after
-out-of-band surgery on the store, or on a schedule you have budgeted for.
+changing the store by hand, or on a schedule you have budgeted for.
 Mismatches print as `body-mismatch` (or `size-mismatch` for the free check) and
 exit `1`.
 
@@ -504,13 +504,13 @@ with that bucket; topology stamps are dormant in single-bucket mode.
 | `--force` | `PYPIRON_MIGRATE_FORCE` | `false` | On `buckets migrate`, drop a bucket even when it holds the fleet's only copy of some content. **Permanent data loss** — back the corpus up onto a surviving bucket first. |
 | `--deep` | `PYPIRON_VERIFY_DEEP` | `false` | On `verify-index`, re-hash every stored file against the SHA-256 its record publishes. Reads the whole corpus once. |
 
-Stop writes before `origin release`. It refuses a package with any package truth
+Stop writes before `origin release`. It refuses a package with any stored file
 except `.origin`, or with pending write/replication work, and conditionally
 releases the claim on each configured bucket.
 
 ## Multi-bucket metrics
 
-These series appear only when two or more buckets are configured:
+These series appear only when you configure two or more buckets:
 
 | Metric | Meaning |
 | --- | --- |

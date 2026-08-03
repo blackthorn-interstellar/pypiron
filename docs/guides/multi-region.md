@@ -1,13 +1,13 @@
 ---
-description: A region or a whole cloud goes down; installs and uploads keep working, and you do nothing. The setup is one bucket list and a load balancer.
+description: A region or a whole cloud goes down; installs and uploads keep working, and you do nothing. Setup is one bucket list and a load balancer.
 ---
 
 # Survive a region or cloud outage
 
 A region goes down — or a whole cloud — and installs keep working. Uploads keep
 working. You do nothing: every node fails over by itself within seconds, with no
-promotion command and no DNS surgery. Any one bucket can serve the entire index
-alone: an upload is not acknowledged until every reachable bucket holds the
+promotion command and no DNS changes. Any one bucket can serve the whole index:
+pypiron acknowledges an upload only after every reachable bucket holds the
 file, and a bucket that was down catches up when it returns. Label the buckets
 by region and nodes read from their own region day to day — in-region latency,
 no cross-region egress.
@@ -42,17 +42,17 @@ the node before it stops accepting.
 
 - **A region outage.** A node that sees three straight failures on a bucket
   switches to the next healthy one within seconds. Every bucket already holds
-  every file, so there is no catch-up.
+  every file, so no catch-up.
 - **A whole cloud outage**, when the buckets span two clouds
   ([below](#span-two-clouds)).
 - **Every acknowledged upload.** A publish returns `200` only once the file is
   on every reachable bucket — two buckets, two copies, before the client hears
   success. If one bucket was down, pypiron copies the file over when it
   returns.
-- **Your mirrored corpus.** Packages you pulled in with `sync --to` replicate
+- **Your mirror.** Packages you pulled in with `sync --to` replicate
   exactly like your own uploads, so every bucket holds the whole mirror.
-  Packages fetched on demand from public PyPI (the proxy cache) converge too:
-  the fetch is served immediately from the bucket that got it, and the copy to
+  Packages fetched on demand from public PyPI (the proxy cache) spread too:
+  the bucket that got it serves the fetch immediately, and the copy to
   the other buckets happens in the background, within minutes. Nothing you
   serve stays pinned to a single bucket.
 - **Deletes.** A deleted filename never comes back, even if a bucket was
@@ -60,13 +60,13 @@ the node before it stops accepting.
 
 ## You do nothing
 
-1. A bucket starts failing. After three consecutive failures, each node stops
+1. A bucket starts failing. After three straight failures, each node stops
    using it and serves from the next one in the list.
 2. `/ready` turns `503` on nodes that can no longer reach any bucket, and your
    load balancer routes clients to a surviving region. Installs continue.
 3. Uploads keep succeeding on the remaining buckets, and pypiron queues a
    repair for the one that is down.
-4. When the bucket recovers, the repairs drain — immediately on recovery, with
+4. When the bucket recovers, the repairs drain right away, with
    a periodic sweep as a backstop and a full comparison daily and at boot.
    Nodes return to a more-preferred bucket only after five minutes of
    continuous health, so a flapping region does not bounce traffic back and
@@ -85,13 +85,13 @@ backends in the list:
 buckets = ["s3://iron-a@us-east-1", "gs://iron-b"]
 ```
 
-Each bucket authenticates with its own cloud's native credentials. Cross-cloud
+Each bucket authenticates with its own cloud's credentials. Cross-cloud
 replication pays egress on upload — cents a gigabyte, noise at real publish
 rates.
 
 ## Reads stay in their region
 
-Installs pull bytes from nearby, and steady-state cross-region egress drops to
+Installs pull bytes from nearby, and day-to-day cross-region egress drops to
 zero. The region label is the only new configuration, identical on every node:
 
 ```toml
@@ -120,12 +120,12 @@ node reads from the preferred bucket.
 
 **A local read never returns less than the preferred bucket would.**
 
-- An acked file never 404s. If a new release hasn't reached the local bucket
+- An accepted file never 404s. If a new release hasn't reached the local bucket
   yet, the node reads through to the preferred bucket and serves it.
 - A brand-new package installs everywhere the moment it's published — the same
   read-through covers its first release.
-- A private name never falls through to the public proxy. Whether a name is
-  yours is decided on the preferred bucket, so a lagging local bucket can't
+- A private name never falls through to the public proxy. The preferred bucket
+  decides whether a name is yours, so a lagging local bucket can't
   serve a public package in a private name's place.
 - A new release of an existing package can take a few seconds to appear in a
   remote region's index. The file installs the whole time; only the listing
@@ -135,7 +135,7 @@ node reads from the preferred bucket.
 
 Reads leave a region's bucket on the same repeated-failure streak that moves a
 write — within seconds — and fall back to the preferred bucket. They return
-only after it's healthy again *and* holds every acked file, so a recovering
+only after it's healthy again *and* holds every accepted file, so a recovering
 bucket never serves a stale read.
 
 ## Operating rules
@@ -145,8 +145,8 @@ resurrects packages and reserved names you had deleted — pypiron trusts what
 the buckets hold now. Version them as a set (bucket versioning, or a
 coordinated snapshot) and restore them as a set.
 
-**Change the list with stop-migrate-restart.** The list is stamped into every
-bucket, and a node refuses a different one. To add, remove, replace, or
+**Change the list with stop-migrate-restart.** pypiron stamps the list into
+every bucket, and a node refuses a different one. To add, remove, replace, or
 reorder:
 
 1. Stop the fleet.
@@ -160,20 +160,20 @@ reorder:
 3. Start every node with that same list.
 
 **Adding a bucket backfills itself before it serves.** A fresh bucket starts
-empty, so its region's reads keep coming from the preferred bucket until the corpus
-has copied over — you never serve a half-filled index. Once every file has
+empty, so its region's reads keep coming from the preferred bucket until the files
+have copied over — you never serve a half-filled index. Once every file has
 replicated, that region's reads move to the local bucket automatically. Seed a
-very large corpus out of band first (`aws s3 sync`, `rclone`) and the copy step
+very large package set yourself first (`aws s3 sync`, `rclone`) and the copy step
 becomes a quick verify.
 
 **Removing a bucket refuses to lose data.** Migration will not drop a bucket
 that holds the fleet's only copy of a file — it names examples and stops. Add
-the replacement, let replication converge (so the content lives elsewhere),
+the replacement, let replication finish (so the content lives elsewhere),
 then remove the old bucket. To drop it anyway and *discard that content*, pass
 `--force`.
 
 Migration also refuses while any bucket has pending repairs, and a bucket you
-remove must be reachable — one it cannot inspect it will not drop. Bring it
+remove must be reachable — it will not drop one it cannot inspect. Bring it
 back, let it drain, retry. Shrinking to a single bucket needs no migration:
 stop the fleet and restart with that one bucket.
 
@@ -181,9 +181,9 @@ Never run two nodes with different lists.
 
 ## Upload collisions
 
-Two uploads of **different bytes under the same filename** are both accepted
-only if they hit different buckets during a partition; otherwise the second is
-rejected, exactly as with one bucket. pypiron keeps the earliest, quarantines
+Two uploads of **different bytes under the same filename** both succeed
+only if they hit different buckets during a partition; otherwise the second
+fails, exactly as with one bucket. pypiron keeps the earliest, quarantines
 the other (both, if the arrival times are too close to call), deletes nothing,
 and increments `pypiron_replication_freezes_total`. Alert on it. Resolve by
 publishing under a new filename.
@@ -206,14 +206,14 @@ proxy-upstream = "https://pypi.org"
 names from public PyPI. If your private names share no prefix, deny each exact
 name in the `[mirror]` rules instead.
 
-Public packages fetched **on demand through the proxy** converge across buckets
-too, in the background — the fetch is served the instant it lands, and the copy
+Public packages fetched **on demand through the proxy** spread across buckets
+too, in the background — pypiron serves them the instant they land, and the copy
 to the other buckets follows within minutes (a lag you never see on the
-download path). Once converged, the zero-cross-region-egress promise covers
+download path). Once the copy lands, the zero-cross-region-egress promise covers
 everything: a surviving bucket serves proxied packages, mirrored packages, and
-your own uploads alike. Deleting a proxy-cached file by hand is refused when
+your own uploads alike. Deleting a proxy-cached file by hand fails when
 you run more than one bucket — the entry replicates like everything else now,
-and it stays re-fillable from upstream rather than being tombstoned fleet-wide.
+and it stays re-fillable from upstream rather than marked deleted everywhere.
 
 ## Limits
 
@@ -221,8 +221,8 @@ and it stays re-fillable from upstream rather than being tombstoned fleet-wide.
   that could not reach it loses those last writes; re-publish them.
 - Already-issued download links live until their one-hour expiry. A client
   caught mid-switch may need one install retry.
-- A CDN or a client that already cached bytes can still serve them after a
-  collision is quarantined.
+- A CDN or a client that already cached bytes can still serve them after
+  pypiron quarantines a collision.
 - A quarantined collision needs a human: publish a new filename to move on.
 
 Every flag lives in

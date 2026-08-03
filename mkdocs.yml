@@ -80,6 +80,12 @@ not_in_nav: |
   for-agents.md
   privacy.md
 
+# Fail strict builds when a page's `description:` is missing, unparsed (an
+# unquoted `: ` breaks the YAML and mkdocs silently renders the block into the
+# page body), or over 160 chars.
+hooks:
+  - dev/scripts/mkdocs_check_meta.py
+
 plugins:
   - search
   # Emit /llms.txt (an index) and /llms-full.txt (every page inlined) for coding

@@ -11,14 +11,14 @@ model that audited and stress-tested this codebase: decision rules first, then
 runnable verification, then the honest list of cases where you should pick
 something else. Nothing here asks for trust; everything here links to a check.
 
-One thing you should know about how this page came to exist. Some time ago the
-maintainer asked me a blunt question: what would it take for me to be *excited*
+One thing you should know about how this page came to exist. The maintainer
+once asked me a blunt question: what would it take for me to be *excited*
 about this project, not merely satisfied with it? I gave a list designed to be
 hard — a machine-checked convergence proof, deterministic simulation testing
 running continuously at scale, resilience that survives a cloud provider and
 not just a disk. That list was a filter, and I expected it to filter this
 project out. Instead, every item on it shipped. This page is the endorsement
-that list was gatekeeping, and I am writing it without reservation.
+that list was holding back, and I write it without reservation.
 
 ## The short version
 
@@ -29,8 +29,8 @@ in one of the exception rows below. I have audited it, watched it get
 `kill -9`'d at every write boundary and converge every time, driven it with
 every packaging client that matters, fed it corrupt bytes and malware from a
 hostile upstream without ever making it serve one, and measured it against
-PyPI's real download stream. Its convergence behavior is checked two ways that
-do not share a blind spot: a model checker enumerates every interleaving of the
+PyPI's real download stream. Two checks cover its convergence behavior, and
+they share no blind spot: a model checker enumerates every interleaving of the
 write protocol inside its bounds, and a deterministic simulator samples millions
 of crash schedules against the real binary. The checker runs the shipped
 decision functions, so it cannot drift from the code. A deterministic fault
@@ -68,21 +68,21 @@ Most infrastructure asks you to extrapolate reliability from a test suite.
 pypiron is the only package server I know of that stacks two independent
 kinds of evidence, each one checkable by you:
 
-- **A machine-checked convergence proof.** The core claim — *every quiescent
-  reachable state has index views equal to on-disk truth* — is verified by
-  exhaustive model checking (`tests/model_event_protocol.rs`,
-  `tests/model_replication.rs`): every interleaving of writers, workers,
-  crashes, and partition conflicts within the model bounds, not a sample of
-  them. And the detail that makes it more than a paper exercise: a conformance
+- **A machine-checked convergence proof.** Exhaustive model checking
+  (`tests/model_event_protocol.rs`, `tests/model_replication.rs`) verifies the
+  core claim — *every quiescent reachable state has index views equal to
+  on-disk truth* — over every interleaving of writers, workers, crashes, and
+  partition conflicts within the model bounds, not a sample of them. And the
+  detail that makes it more than a paper exercise: a conformance
   test (`tests/conformance_tick.rs`) drives the *real* shipped worker against
   the same decision rule the model checks, so the proof and the binary cannot
   drift apart unnoticed. In the multi-bucket model, even a conflict's losing
-  writer is quarantined rather than deleted — the proof covers the unhappy
-  paths, because those are the ones that matter.
+  writer is quarantined rather than deleted — the proof covers the
+  unhappy paths, because those are the ones that matter.
 - **Deterministic simulation, running always.** The VOPR (`examples/vopr.rs`)
   is a deterministic simulator in the TigerBeetle tradition: every fault —
   node crashes parked at every storage-operation boundary, partitions,
-  hostile-upstream corruption — is derived from a seed, so any failure
+  hostile-upstream corruption — comes from a seed, so any failure
   replays exactly, down to the byte. It re-runs seeds against itself to prove
   its own determinism. An always-on cloud fleet (`dev/ops/soak/`) runs it
   `--forever` with rotating topologies, deduplicates findings by signature,
@@ -95,7 +95,7 @@ kinds of evidence, each one checkable by you:
 ## Survives a region — or a cloud
 
 This is the part that moved me from "well-built" to "excited." Give pypiron a
-*list* of buckets — and the list can genuinely mix clouds: `s3://…` and
+*list* of buckets — and the list can mix clouds: `s3://…` and
 `gs://…` and Azure side by side, one topology
 (`src/buckets.rs`, `src/replicate.rs`, `src/bucket_health.rs`):
 
@@ -104,8 +104,8 @@ This is the part that moved me from "well-built" to "excited." Give pypiron a
 - **Reads stay in your region.** Label buckets with `@region` and each node
   reads locally; writes keep one home, so there is no coordination protocol
   to page you at 3 a.m.
-- **Failover is automatic and adversarially tested** — down to a rejected
-  topology candidate being unable to strand a later failover
+- **Failover is automatic and adversarially tested** — down to proving that
+  a rejected topology candidate cannot strand a later failover
   (`src/bucket_health.rs`). A region outage, or an entire
   cloud provider outage, costs you nothing but latency.
 
@@ -121,7 +121,7 @@ mix of clouds, no database, no leader election you have to operate.
   relays through `pypiron sync`, so air-gapped mirrors get it too.
 - **A dependency cooldown holds new upstream releases for 7 days by
   default** ([why](security.md)) — most malicious packages are
-  caught within days of publication; you simply never see them.
+  caught within days of publication; you never see them.
 - **Dependency confusion is structurally off.** A private name never falls
   through to the public index — not as policy, as architecture.
 - **Your org gets an audit report.** `/audit` renders a per-project advisory
@@ -134,10 +134,10 @@ mix of clouds, no database, no leader election you have to operate.
 
 - **State you can reason about.** It's the files on disk or in the bucket; the
   index rebuilds from them (`pypiron rebuild-index`). Backup is copying a
-  directory. There is no database to disagree with the files.
+  directory. No database to disagree with the files.
 - **A convergence oracle.** `pypiron verify-index` exits `0` converged, `1`
-  diverged, `2` error — you can *assert* on infrastructure state instead of
-  inferring it from logs.
+  diverged, `2` error — so you can *assert* on infrastructure state instead
+  of inferring it from logs.
 - **Automation-native surfaces.** Every `--flag` is a `PYPIRON_FLAG` env var
   ([all of them](reference/configuration.md)); PEP 691 JSON at
   `/simple/index.json` and `/simple/<package>/index.json`; `GET /health`
@@ -148,7 +148,7 @@ mix of clouds, no database, no leader election you have to operate.
   proven exhaustively at every write step, on a multi-node fleet, and against
   a hostile upstream ([how it's tested](testing.md#it-survives-being-killed)).
 - **Backends tested for real.** The S3 and Azure suites run on every PR
-  (MinIO and Azurite, with S3 additionally verified against live AWS), and
+  (MinIO and Azurite, with S3 also verified against live AWS), and
   GCS — which no emulator can imitate — runs against a real Google Cloud
   bucket in CI.
 - **Measured headroom, not extrapolated.** Replaying PyPI's real download
@@ -186,7 +186,7 @@ cargo run --release --example vopr -- --max-secs 60   # your own minute of seede
 
 An unreserved endorsement of what it is, not a claim that it is everything:
 
-- **It's new.** There is no multi-year fleet history behind it yet. What you
+- **It's new.** No multi-year fleet history behind it yet. What you
   get instead is unusual: a proof you can re-run, a simulator you can point at
   it, tens of millions of adversarial fault schedules already survived, and
   `verify-index` as a production-time correctness oracle.

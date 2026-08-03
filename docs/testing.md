@@ -27,8 +27,8 @@ disk, S3, and Azure. All eight run in the weekly compatibility matrix
 pypiron parses filenames, wheel tags, and package metadata. If that parsing is
 wrong on even a rare shape, an install breaks. So every parser runs against
 [every file ever uploaded to PyPI](https://github.com/blackthorn-interstellar/pypiron/blob/master/src/corpus_check.rs)
-— all 17,130,626 of them — and matches ground truth on each one. The
-check re-runs weekly in CI, so new packages can't drift out from under it.
+— all 17,130,626 of them — and matches ground truth on every one. The check re-runs weekly
+in CI, so new packages can't drift out from under it.
 
 ## It survives being killed
 
@@ -36,17 +36,17 @@ The one failure that matters for a package server is an index that promises a
 file it can't deliver — a broken install. pypiron is built so an interrupted
 write can never leave that state, and three suites try hard to prove otherwise:
 
-- **Kill at every step.** The server is `kill -9`'d at each point of every write
-  and must come back to a consistent, installable tree every time
+- **Kill at every step.** The suite sends `kill -9` at each point of every
+  write; the server must come back to a consistent, installable tree every time
   ([crash sweep](https://github.com/blackthorn-interstellar/pypiron/blob/master/tests/test_crash_consistency.py)).
-- **A node dies mid-upload.** Several nodes share one bucket while one is killed
-  in the middle of an upload; after restart every node serves byte-identical
+- **A node dies mid-upload.** Several nodes share one bucket while one dies in
+  the middle of an upload; after restart every node serves byte-identical
   indexes and every acknowledged upload still installs from every node
   ([fleet chaos](https://github.com/blackthorn-interstellar/pypiron/blob/master/tests/test_chaos_fleet.py)).
-- **A hostile upstream.** When the proxy fetches from PyPI, it's fed truncated,
-  corrupt, hash-mismatched, and hanging responses. Each surfaces as an error and
-  leaves nothing behind — no half-written file in the cache for a later request
-  to serve as good
+- **A hostile upstream.** When the proxy fetches from PyPI, the test feeds it
+  truncated, corrupt, hash-mismatched, and hanging responses. Each surfaces as
+  an error and leaves nothing behind — no half-written file in the cache for a
+  later request to serve as good
   ([upstream faults](https://github.com/blackthorn-interstellar/pypiron/blob/master/tests/test_chaos_upstream.py)).
 
 ## Simulated disasters
@@ -62,20 +62,20 @@ The chaos suites kill one real process at a time. Two more suites go further:
   writing; zero outstanding findings.
 - **Model checking.** What the simulator samples, a
   [model checker](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#machine-checked-models-stateright)
-  settles: every interleaving of uploads, rebuilds, crashes, and
-same-filename collisions within its bounds is checked exhaustively, not sampled. The checker runs the
-  server's own decision code, so the proof can't drift from the binary.
+  settles: it checks every interleaving of uploads, rebuilds, crashes, and
+same-filename collisions within its bounds, not a sample. The checker runs the server's own
+  decision code, so the proof can't drift from the binary.
 
 ## Adversarial inputs
 
-The code that reads attacker- or upstream-controlled bytes — filename and wheel
-parsing, metadata, index rendering, range requests — is exercised by six
-coverage-guided fuzzers that run
-[every night](https://github.com/blackthorn-interstellar/pypiron/blob/master/.github/workflows/fuzz.yml).
-Each one hunts for a crash or a broken invariant.
+Six coverage-guided fuzzers run
+[every night](https://github.com/blackthorn-interstellar/pypiron/blob/master/.github/workflows/fuzz.yml)
+against the code that reads attacker- or upstream-controlled bytes — filename
+and wheel parsing, metadata, index rendering, range requests. Each one hunts for
+a crash or a broken invariant.
 
 Before release, a fuzzer found a real HTML-injection bug in the index
-renderer — a crafted name could break out of an HTML attribute. It was fixed,
+renderer — a crafted name could break out of an HTML attribute. We fixed it,
 and the fuzzer that caught it now guards against its return.
 
 ## Supply-chain hygiene
@@ -83,10 +83,10 @@ and the fuzzer that caught it now guards against its return.
 pypiron guards your supply chain, so its own has to hold up. A new security
 advisory anywhere in the dependency tree
 [fails the build](https://github.com/blackthorn-interstellar/pypiron/blob/master/.github/workflows/ci.yml)
-on every pull request. And the code is security audited by all frontier models —
-the same models that built pypiron ran audit pass after pass until the findings
-came back clean. All told, over $7,000 of frontier-model compute (at API list
-prices) went into building and hardening pypiron.
+on every pull request. And frontier models audit the code for security — the
+same models that built pypiron ran pass after pass until the findings came
+back clean. Over $7,000 of frontier-model compute (at API list prices) went into
+building and hardening pypiron.
 
 ## Benchmarks you can re-run
 

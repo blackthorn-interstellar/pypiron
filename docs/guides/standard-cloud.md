@@ -1,5 +1,5 @@
 ---
-description: Run pypiron in production on S3, GCS, or Azure: one config file, the cloud's own credentials, Docker Compose or systemd, and nodes behind a load balancer.
+description: "Run pypiron in production on S3, GCS, or Azure: one config file, the cloud's own credentials, Docker Compose or systemd, and nodes behind a load balancer."
 ---
 
 # Deploy on cloud storage
@@ -29,11 +29,10 @@ default. Spelled out here so it's easy to change.
 To pre-load an approved list instead of proxying, see
 [How packages get there](../concepts.md#how-packages-get-there).
 
-Point `buckets` at a bucket that already exists. On AWS there is usually
-nothing else to set: credentials come from the standard chain — environment,
-web identity, instance role, or task role. GCS (`gs://`) and Azure (`az://`)
-are the same shape with their own credentials:
-[Storage](../concepts.md#where-packages-live).
+Point `buckets` at an existing bucket. On AWS there's usually nothing else to
+set: credentials come from the standard chain — environment, web identity,
+instance role, or task role. GCS (`gs://`) and Azure (`az://`) work the same
+way, with their own credentials: [Storage](../concepts.md#where-packages-live).
 
 ## Run it
 
@@ -104,7 +103,7 @@ so it validates without turning verification off. Details:
 
 ## Survive a region outage
 
-One bucket rides out any node dying. To ride out the bucket's region — or a
-whole cloud — give every node the same ordered list of buckets and pypiron
-keeps them in sync and fails over on its own:
+One bucket rides out any node dying. To survive losing the bucket's region —
+or a whole cloud — give every node the same ordered list of buckets and
+pypiron keeps them in sync and fails over on its own:
 [Survive a region or cloud outage](multi-region.md).

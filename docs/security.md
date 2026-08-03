@@ -25,11 +25,14 @@ and been pulled. It's the same practice uv, npm, and Dependabot have
 standardized on. The default is seven days, on a sliding window, re-checked on
 every read. `sync` applies the same window to what a run mirrors.
 
-How much does the wait buy? Measured against the full OSV malware feed, for
-2024+ compromises of established packages: the advisory check alone blocks 34%
-on release day, the 7-day default raises that to 56%, and a 30-day cooldown
-catches 86%. The default catches the fast reports; a 30-day window catches most
-of the rest.
+How much does the wait buy? Across every malicious version OSV has recorded
+for PyPI — 17,043 releases in 11,517 projects, measured 2026-07, most of them
+malicious from birth — 72% had a public advisory inside the default 7-day
+window, so the feed plus the cooldown block them outright. The hard case is a
+compromised **established** package: for 2024+ compromises, the advisory check
+alone blocks 34% on release day, the 7-day default raises that to 56%, and a
+30-day cooldown catches 86%. The default catches the fast reports; a 30-day
+window catches most of the rest.
 
 ```bash
 pypiron serve --admin-pass "$ADMIN" \

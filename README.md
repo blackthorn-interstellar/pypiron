@@ -15,7 +15,7 @@ An ultra-fast, rock-solid PyPI server.
 </p>
 
 - **[100× faster than any other PyPI server](docs/compare/index.md).**
-- **[72% of malware attacks blocked immediately](docs/security.md).**
+- **[72% of malware attacks blocked out of the box](docs/security.md).**
 - **Effortlessly scales via cloud storage — no database!**
 - **Supports [cross-region](docs/guides/multi-region.md) and cross-cloud high availability.**
 - **Works with local disk, AWS S3, GCP, and Azure.**

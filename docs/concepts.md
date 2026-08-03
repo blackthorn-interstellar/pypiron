@@ -138,14 +138,14 @@ yourself.
 
 - **New releases wait 7 days.** Most attacks surface first. Shorten the window
   or turn it off.
-- **Known malware never installs.** [72% of malware attacks blocked
-  outright](security.md) — a flagged version is refused within minutes, never
-  cached. A clean version of the same project still installs.
+- **Known malware never installs.** A flagged version is refused within
+  minutes of its advisory — never cached. A clean version of the same project
+  still installs.
 - **Only what you've approved.** Name the packages you allow — version ranges
   included — and nothing else installs. Off unless you set it.
 
-The first two are on by default. [Security](security.md) has all three in
-depth.
+The first two are on by default; together they block 72% of malware attacks
+outright. [Security](security.md) has the numbers and all three in depth.
 
 ## What it tells you
 

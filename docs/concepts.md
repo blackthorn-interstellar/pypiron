@@ -100,10 +100,10 @@ every package byte-identical.
 Uploads land on any node and show up on every node in a second or two. Disk
 storage is single-node; multi-node means a bucket.
 
-**Survives a dead region.** Name several buckets, mixed clouds included: a
-healthy fleet lands every upload in all of them before it returns, a slow or
-dark bucket catches up on its own, and any one bucket serves the whole catalog
-alone. Reads stay in-region; writes fail over.
+**Survives a dead region.** Name several buckets, mixed clouds included. An
+upload succeeds only once every healthy bucket has the file, a bucket that was
+down backfills itself, and any one bucket is a complete copy. Reads stay
+in-region; writes fail over.
 [Multi-region guide](guides/multi-region.md)
 
 ## Who can do what
@@ -111,8 +111,8 @@ alone. Reads stay in-region; writes fail over.
 With no credentials configured the server is read-only: everyone on the network
 installs, nobody publishes. On a private network that's the whole answer.
 
-Set a password and you get three nested roles. A **reader** installs. An
-**uploader** also publishes. An **admin** also deletes, yanks, and mirrors. One
+Set a password and the roles stack: a **reader** installs, an **uploader**
+also publishes, an **admin** also deletes, yanks, and mirrors. One
 password is enough to start — the username defaults to `admin`. Half a
 credential — a username with no password — refuses to start rather than
 booting wide open. Reads stay public until you set a read credential.
@@ -133,8 +133,8 @@ metrics. The server never reads passwords from `pypiron.toml` — commit it.
 
 ## What it keeps out
 
-Three gates on what arrives from upstream. None of them touch what you publish
-yourself.
+What arrives from upstream gets screened; what you publish yourself never
+does.
 
 - **New releases wait 7 days.** Most attacks surface first. Shorten the window
   or turn it off.

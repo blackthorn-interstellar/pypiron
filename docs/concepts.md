@@ -93,9 +93,8 @@ the bucket needs nothing extra. S3-compatible stores like MinIO work too. The
 bucket has to exist; pypiron won't create it.
 
 **The bucket is everything.** No database beside it to lose, back up, or drift
-out of sync — durability is whatever your bucket already gives you. On disk the
-folder is everything: copy it, and the copy serves every package
-byte-identical.
+out of sync. On disk the folder is everything: copy it, and the copy serves
+every package byte-identical.
 
 **Any number of nodes on one bucket.** No coordination service, no database.
 Uploads land on any node and show up on every node in a second or two. Disk

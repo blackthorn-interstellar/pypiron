@@ -20,9 +20,9 @@ An ultra-fast, rock-solid PyPI server.
   </picture>
 </p>
 
-- **[100× faster than any other PyPI server](compare/index.md).**
-- **[72% of malware attacks blocked out of the box](security.md).**
-- **Effortlessly scales via cloud storage — no database!**
+- **[100× faster than any other self-hosted PyPI server](compare/index.md).**
+- **[72% of malicious releases blocked out of the box](security.md).**
+- **Add nodes against one bucket — no database, no coordinator.**
 - **Supports [cross-region](guides/multi-region.md) and cross-cloud high availability.**
 - **Works with local disk, AWS S3, GCP, and Azure.**
 - **[Web GUI with dashboard, package pages, and search](assets/demo.gif).**
@@ -72,7 +72,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
     </tr>
     <tr>
       <td colspan="2"><a href="compare/index.md">Fast</a></td>
-      <td align="center"><abbr title="8,288 verified installs/s on 2 vCPU in the benchmark.">✅</abbr></td>
+      <td align="center"><abbr title="8,288 installs/s on 2 vCPU in the benchmark.">✅</abbr></td>
       <td align="center"><abbr title="77 installs/s as a static nginx-served mirror — NIC-bound on the same box.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">—</td>

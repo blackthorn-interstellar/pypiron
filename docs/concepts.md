@@ -136,15 +136,15 @@ metrics. The server never reads passwords from `pypiron.toml` — commit it.
 What arrives from upstream gets screened; what you publish yourself never
 does.
 
-- **New releases wait 7 days.** Most attacks surface first. Shorten the window
-  or turn it off.
+- **New releases wait 7 days.** Most malicious releases are reported inside
+  that window. Shorten it or turn it off.
 - **Known malware never installs.** A flagged version is refused within
   minutes of its advisory — never cached. A clean version of the same project
   still installs.
 - **Only what you've approved.** Name the packages you allow — version ranges
   included — and nothing else installs. Off unless you set it.
 
-The first two are on by default; together they block 72% of malware attacks
+The first two are on by default; together they block 72% of malicious releases
 outright. [Security](security.md) has the numbers and all three in depth.
 
 ## What it tells you

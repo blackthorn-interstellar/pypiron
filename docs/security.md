@@ -12,13 +12,13 @@ enforces each one, not the client. How these defenses are verified —
 chaos, fuzzing, and a full-PyPI parser check — is its own page:
 [How it's tested](testing.md).
 
-## Automatic malware blocking with realtime updates
+## Malware blocking and the release cooldown
 
 Known malware never installs. New releases wait long enough for a bad one to
 surface. Both on by default.
 
 **New releases wait.** A compromised maintainer account or a typosquat is most
-dangerous in its first hours, before anyone notices. A **dependency cooldown**
+dangerous in its first hours, before anyone notices. A **dependency cooldown** — `--exclude-newer` —
 puts a window between when a release is published and when pypiron serves
 it, so resolution lands on versions old enough for a bad one to have surfaced
 and been pulled. It's the same practice uv, npm, and Dependabot have
@@ -67,8 +67,8 @@ lockfile alike.
 
 **Blocking starts within minutes.** Every node watches OSV for individual
 just-published malware advisories and starts blocking within minutes of
-publication — no waiting for the next daily refresh, and clients whose own audit
-cache still won't know for up to a day are already covered at the door. The full
+publication — no waiting for the next daily refresh. A client whose own advisory cache is a
+day stale is still covered, because the block is at the server. The full
 advisory snapshot still refreshes daily; a withdrawn advisory un-blocks on that
 same daily schedule.
 

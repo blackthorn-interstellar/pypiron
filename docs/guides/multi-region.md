@@ -58,7 +58,7 @@ the node before it stops accepting.
 - **Deletes.** A deleted filename never comes back, even if a bucket was
   unreachable when you deleted it.
 
-## You do nothing
+## What happens without you
 
 1. A bucket starts failing. After three straight failures, each node stops
    using it and serves from the next one in the list.
@@ -131,7 +131,8 @@ node reads from the preferred bucket.
   remote region's index. The file installs the whole time; only the listing
   lags.
 - A yank or delete can stay visible in a region whose bucket missed it until
-  the repair sweep drains — the same window a failed-over node has today.
+  the repair sweep drains it — the same window as a failed-over node, five
+  minutes by default.
 
 Reads leave a region's bucket on the same repeated-failure streak that moves a
 write — within seconds — and fall back to the preferred bucket. They return

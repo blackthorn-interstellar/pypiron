@@ -27,7 +27,7 @@ exclude-newer = "7 days"
 never renames anything. `proxy-upstream` serves public packages on demand: a
 cache miss comes from PyPI once, then stays local. `exclude-newer` is the
 dependency cooldown: fresh upstream releases wait a week, on by default — your
-own uploads are never delayed. Spelled out here so it's easy to change.
+own uploads are never delayed.
 To pre-load an approved list instead of proxying, see
 [air-gapped sync](../concepts.md#air-gapped-sync-ahead-of-time).
 

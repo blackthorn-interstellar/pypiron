@@ -4,7 +4,7 @@ description: pypiron vs devpi, pypiserver, bandersnatch, pypicloud, proxpi, Arti
 
 # Comparison and benchmarks
 
-pypiron sustains **8,288 verified installs/s on 2 vCPU** — 100×+ every other
+pypiron sustains **8,288 installs/s on 2 vCPU** — 100×+ every other
 self-hosted PyPI server on the same box.
 
 ![Max sustained install throughput](../assets/install-throughput.svg#only-light)

@@ -257,10 +257,9 @@ with a throwaway copy — and logs the result one line per bucket pair (a
 so you can see which pairs take the fast path. Nothing to configure, and
 nothing changes about what ends up on each bucket; only how the bytes get there.
 
-In multi-bucket mode pypiron disables SDK retries, and one-second topology probes
-switch new requests and cancel background work on an ineligible bucket, without
-putting a short deadline on real artifact transfers (an in-flight transfer keeps
-the normal one-hour bound). Startup and migration operations also carry a
+In multi-bucket mode a failing bucket stops taking new requests within a
+second and its background work is cancelled; transfers already in flight keep
+the normal one-hour bound. Startup and migration operations also carry a
 one-second bound per bucket, so an unreachable bucket can slow boot but never
 blocks it while another configured bucket is reachable. Admin DELETE still
 removes private files but returns `409` for proxy-cached entries — cache eviction
@@ -473,8 +472,8 @@ Tokens live for 5 minutes and cannot outrank the credential that minted them.
 
 `verify-index` and `rebuild-index` use the same storage flags as `serve`, and
 also read `[serve]` from `pypiron.toml`. `buckets migrate` and `origin release`
-do too. Storage flags and their environment variables may also follow those
-nested commands.
+do too. Storage flags can also follow the subcommand:
+`pypiron buckets migrate --buckets ...`.
 
 `verify-index` does not open your package files. It compares what the indexes
 say against what the store holds, which keeps it fast on a mirror with a million
@@ -497,7 +496,7 @@ that content lives on a surviving bucket), then remove the old one. To drop it
 anyway and *permanently discard* that content, pass `--force`
 (`PYPIRON_MIGRATE_FORCE=true`). If it refuses for pending repairs, let the fleet
 drain (or bring the lagging bucket back) and retry. A new bucket serves no region reads until your files have copied onto it. To shrink to one bucket, stop the fleet and restart it
-with that bucket; topology stamps are dormant in single-bucket mode.
+with that bucket; single-bucket mode records no bucket list, so there's nothing to migrate.
 
 | Flag | Env | Default | Use |
 | --- | --- | --- | --- |

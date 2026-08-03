@@ -39,7 +39,7 @@ six
 ```
 
 List syntax, version specifiers, and excludes:
-[Approval lists](../concepts/approval-lists.md).
+[Approval lists](../concepts.md#what-it-keeps-out).
 
 `pypiron.toml` on the connected host:
 
@@ -102,7 +102,7 @@ an hourly cron for hourly baselines. One run picks up new versions of approved
 packages and the advisory snapshot together. The
 `pypiron_advisory_snapshot_age_seconds` gauge tracks the loaded feed's age.
 Alert when it climbs past your refresh window:
-[Health and metrics](../concepts/health-metrics.md).
+[Health and metrics](../concepts.md#what-it-tells-you).
 
 ## See also
 

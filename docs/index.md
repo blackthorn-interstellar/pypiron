@@ -27,7 +27,7 @@ An ultra-fast, rock-solid PyPI server.
 - **Works with local disk, AWS S3, GCP, and Azure.**
 - **[Web GUI with dashboard, package pages, and search](assets/demo.gif).**
 - **[Vulnerability audit](security.md) ranked by your org's installs.**
-- **[Health checks](concepts/health-metrics.md) and Prometheus metrics built in.**
+- **[Health checks](concepts.md#what-it-tells-you) and Prometheus metrics built in.**
 - **Comprehensively tested via [fuzzing](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#fuzzing), [chaos testing](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#chaos-and-crash-consistency), [deterministic simulation](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#deterministic-simulation-the-vopr), [model checking](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#machine-checked-models-stateright), [real clouds](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#real-cloud-backends), [perf](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#performance-testing), and [all 17 million files on PyPI](https://github.com/blackthorn-interstellar/pypiron/blob/master/src/corpus_check.rs).**
 
 
@@ -79,7 +79,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/concepts/package-sources.md">Private packages</a></td>
+      <td colspan="2"><a href="concepts.md#three-sources-one-index">Private packages</a></td>
       <td align="center"><abbr title="Publish with twine or uv; admin/uploader/reader credentials plus short-lived install tokens.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">✅</td>
@@ -88,7 +88,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/concepts/package-sources.md">PyPI proxy</a></td>
+      <td colspan="2"><a href="concepts.md#three-sources-one-index">PyPI proxy</a></td>
       <td align="center"><abbr title="Caches public packages from PyPI on first install, behind the same URL as your private ones.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">—</td>
@@ -97,7 +97,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">✅</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/concepts/package-sources.md">Sync mirror</a></td>
+      <td colspan="2"><a href="concepts.md#three-sources-one-index">Sync mirror</a></td>
       <td align="center"><abbr title="Mirrors a chosen subset of upstream: include/exclude by name, wheel tags, format, size, Python floor, and pre-release.">✅</abbr></td>
       <td align="center">✅</td>
       <td align="center">—</td>
@@ -142,7 +142,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/concepts/storage.md">Scales, no database</a></td>
+      <td colspan="2"><a href="concepts.md#where-packages-live">Scales, no database</a></td>
       <td align="center"><abbr title="Multi-node against S3, GCS, or Azure Blob; no database.">✅</abbr></td>
       <td align="center"><abbr title="Static mirror tree served by nginx or object storage; no database.">✅</abbr></td>
       <td align="center">—</td>
@@ -169,7 +169,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/concepts/download-stats.md">Download stats</a></td>
+      <td colspan="2"><a href="concepts.md#what-it-tells-you">Download stats</a></td>
       <td align="center">✅</td>
       <td align="center">—</td>
       <td align="center">—</td>
@@ -178,7 +178,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td rowspan="4"><a href="docs/concepts/storage.md">Storage</a></td>
+      <td rowspan="4"><a href="concepts.md#where-packages-live">Storage</a></td>
       <td>Disk</td>
       <td align="center">✅</td>
       <td align="center">✅</td>
@@ -224,7 +224,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
 
 - **[Known malware never installs](security.md)** — the OSV malware feed is enforced within minutes, and a release cooldown covers the window before an advisory exists.
 - **[Dependency confusion cannot start](security.md)** — a name is yours or PyPI's, never both.
-- **[Only what you've approved installs](concepts/approval-lists.md)** — one approval list controls everything the server will serve.
+- **[Only what you've approved installs](concepts.md#what-it-keeps-out)** — one approval list controls everything the server will serve.
 - **[Air-gapped deploys](guides/air-gapped.md)** — sync outside, carry it in, serve with no upstream at all.
 - **[Vulnerability audit](security.md)** — every affected package you host or proxy, ranked by your org's installs.
 
@@ -243,7 +243,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
 ## Going further
 
 - [Deploying](guides/standard-cloud.md) — a production server from standard cloud parts
-- [Package sources](concepts/package-sources.md) — private hosting, caching proxy, sync mirror, and how they combine
+- [Package sources](concepts.md#three-sources-one-index) — private hosting, caching proxy, sync mirror, and how they combine
 - [Configuration](reference/configuration.md) — every flag and its `PYPIRON_*` env var
 - [Comparison & benchmarks](compare/index.md) — every alternative, and how the numbers were measured
 - [For AI agents](for-agents.md) — a decision guide, written for agents, by an agent

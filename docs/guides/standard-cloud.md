@@ -27,13 +27,13 @@ packages on demand: a cache miss comes from PyPI once, then stays local.
 `exclude-newer` is the dependency cooldown: fresh releases wait a week, on by
 default. Keeping it in the file makes the one useful mirror policy visible.
 To pre-load an approved list instead of proxying, see
-[Package sources](../concepts/package-sources.md).
+[Package sources](../concepts.md#three-sources-one-index).
 
 Point `buckets` at a bucket that already exists. On AWS there is usually
 nothing else to set: credentials come from the standard chain — environment,
 web identity, instance role, or task role. GCS (`gs://`) and Azure (`az://`)
 are the same shape with their own credentials:
-[Storage](../concepts/storage.md).
+[Storage](../concepts.md#where-packages-live).
 
 ## Run it
 

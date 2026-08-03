@@ -108,7 +108,7 @@ names — `acme_foo`, `acme.foo`, and `acme-foo` are the same name.
 The other half is client-side: point clients at this one index
 (`--default-index` for uv; `--index-url` for pip, not `--extra-index-url`) and
 let the server decide what exists. The full mental model of how private and
-public names coexist is at [Package sources](concepts/package-sources.md).
+public names coexist is at [Package sources](concepts.md#three-sources-one-index).
 
 ## Approval lists
 
@@ -116,7 +116,7 @@ Narrow the server to packages somebody chose to allow. Give `sync` a file of
 approved names and it pre-loads exactly those; give the proxy the same include
 list and on-demand fetching is constrained to it too. The cooldown and the
 advisory gate still apply on top — approval is a floor, not a bypass. Writing,
-updating, and enforcing a list: [Approval lists](concepts/approval-lists.md).
+updating, and enforcing a list: [Approval lists](concepts.md#what-it-keeps-out).
 
 ## Air-gapped deploys
 

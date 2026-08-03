@@ -92,12 +92,7 @@ plugins:
         Overview:
           - index.md
         Core concepts:
-          - concepts/package-sources.md
-          - concepts/storage.md
-          - concepts/how-it-works.md
-          - concepts/approval-lists.md
-          - concepts/health-metrics.md
-          - concepts/download-stats.md
+          - concepts.md
         Deploy guides:
           - guides/standard-cloud.md
           - guides/air-gapped.md
@@ -119,13 +114,7 @@ plugins:
 
 nav:
   - Overview: index.md
-  - Core concepts:
-      - Package sources: concepts/package-sources.md
-      - Storage backends: concepts/storage.md
-      - Serving from object storage: concepts/how-it-works.md
-      - Approval lists: concepts/approval-lists.md
-      - Health & metrics: concepts/health-metrics.md
-      - Download statistics: concepts/download-stats.md
+  - Core concepts: concepts.md
   - Deploy guides:
       - Standard cloud deploy: guides/standard-cloud.md
       - Air-gapped deploy: guides/air-gapped.md

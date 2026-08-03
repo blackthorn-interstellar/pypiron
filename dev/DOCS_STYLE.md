@@ -18,7 +18,8 @@ script for pypiron:
 1. "I want a PyPI server. Can it host my private packages?"
 2. "How about public packages?" — either cached on demand from PyPI, or
    air-gapped: the same allowlist syncs them over ahead of time.
-3. "Where does it store things, and what do I back up?"
+3. "Where does it store things — is the bucket all there is?" (backup talk is
+   disk-only; on object storage durability is the bucket's job)
 4. "Who can publish? How does CI get access?"
 5. "What keeps malware out?"
 6. "How do I know it's healthy?"

@@ -92,10 +92,10 @@ Credentials come from your cloud's own chain, so a machine that already reaches
 the bucket needs nothing extra. S3-compatible stores like MinIO work too. The
 bucket has to exist; pypiron won't create it.
 
-**Backups are a file copy.** The package files are the only thing worth
-keeping; the index is rebuilt from them. Restore the directory anywhere, run
-`pypiron rebuild-index`, and every package installs byte-identical. Worst-case
-loss is your backup interval.
+**The bucket is everything.** No database beside it to lose, back up, or drift
+out of sync — durability is whatever your bucket already gives you. On disk the
+folder is everything: copy it, and the copy serves every package
+byte-identical.
 
 **Any number of nodes on one bucket.** No coordination service, no database.
 Uploads land on any node and show up on every node in a second or two. Disk

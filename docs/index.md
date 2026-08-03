@@ -61,7 +61,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
   </thead>
   <tbody>
     <tr>
-      <td colspan="2"><a href="docs/guides/standard-cloud.md">Easy setup</a></td>
+      <td colspan="2"><a href="guides/standard-cloud.md">Easy setup</a></td>
       <td align="center"><abbr title="Single binary, uvx, or Docker; hosts private packages, mirror sync, and proxy from one server.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">✅</td>
@@ -70,7 +70,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">✅</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/compare/index.md">Fast</a></td>
+      <td colspan="2"><a href="compare/index.md">Fast</a></td>
       <td align="center"><abbr title="8,288 verified installs/s on 2 vCPU in the benchmark.">✅</abbr></td>
       <td align="center"><abbr title="77 installs/s as a static nginx-served mirror — NIC-bound on the same box.">✅</abbr></td>
       <td align="center">—</td>
@@ -79,7 +79,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="concepts.md#three-sources-one-index">Private packages</a></td>
+      <td colspan="2"><a href="concepts.md#how-packages-get-there">Private packages</a></td>
       <td align="center"><abbr title="Publish with twine or uv; admin/uploader/reader credentials plus short-lived install tokens.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">✅</td>
@@ -88,7 +88,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="concepts.md#three-sources-one-index">PyPI proxy</a></td>
+      <td colspan="2"><a href="concepts.md#how-packages-get-there">PyPI proxy</a></td>
       <td align="center"><abbr title="Caches public packages from PyPI on first install, behind the same URL as your private ones.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">—</td>
@@ -97,8 +97,8 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">✅</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="concepts.md#three-sources-one-index">Sync mirror</a></td>
-      <td align="center"><abbr title="Mirrors a chosen subset of upstream: include/exclude by name, wheel tags, format, size, Python floor, and pre-release.">✅</abbr></td>
+      <td colspan="2"><a href="concepts.md#how-packages-get-there">Sync mirror</a></td>
+      <td align="center"><abbr title="Mirrors a chosen subset of upstream: include/exclude by name, wheel tags, format, size, minimum Python, and pre-release.">✅</abbr></td>
       <td align="center">✅</td>
       <td align="center">—</td>
       <td align="center">—</td>
@@ -106,7 +106,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/security.md">Cooldown</a></td>
+      <td colspan="2"><a href="security.md">Cooldown</a></td>
       <td align="center"><abbr title="New releases wait 7 days by default, enforced at the server for every client; upload times are preserved for client-side exclude-newer.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">—</td>
@@ -115,7 +115,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/security.md">Malware blocking</a></td>
+      <td colspan="2"><a href="security.md">Malware blocking</a></td>
       <td align="center"><abbr title="Refuses any file the OSV advisory feed flags as malware — at upload, on proxy fill, and in listings; on by default.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">—</td>
@@ -124,7 +124,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/security.md">No dependency confusion</a></td>
+      <td colspan="2"><a href="security.md">No dependency confusion</a></td>
       <td align="center"><abbr title="A name is yours or PyPI's, never both; a private name never falls through to upstream.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">—</td>
@@ -133,7 +133,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/security.md">Vulnerability audit</a></td>
+      <td colspan="2"><a href="security.md">Vulnerability audit</a></td>
       <td align="center"><abbr title="/audit lists every hosted or proxied package a known advisory affects, ranked by your install counts.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">—</td>
@@ -151,8 +151,8 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/guides/multi-region.md">Multi-region failover</a></td>
-      <td align="center"><abbr title="One bucket list spanning regions and clouds (S3 + GCS + Azure); every upload lands on all of them before the ack, and reads fail over with zero data loss.">✅</abbr></td>
+      <td colspan="2"><a href="guides/multi-region.md">Multi-region failover</a></td>
+      <td align="center"><abbr title="One bucket list spanning regions and clouds (S3 + GCS + Azure); every upload lands on all of them before it succeeds, and reads fail over with zero data loss.">✅</abbr></td>
       <td align="center">—</td>
       <td align="center">—</td>
       <td align="center">—</td>
@@ -160,7 +160,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/assets/demo.gif">Web GUI</a></td>
+      <td colspan="2"><a href="assets/demo.gif">Web GUI</a></td>
       <td align="center">✅</td>
       <td align="center">—</td>
       <td align="center">—</td>
@@ -233,7 +233,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
 - **[Client compatibility testing](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#client-compatibility-matrix):** uv, pip, poetry, pdm, pipenv, hatch, flit, twine.
 - **Tested against all of PyPI.** The parsers process [all 17 million files ever uploaded to PyPI](https://github.com/blackthorn-interstellar/pypiron/blob/master/src/corpus_check.rs) and match ground truth on each one.
 - **Chaos testing.** We kill the server at every step of every write, kill fleet nodes mid-upload, and feed it truncated, corrupted, and hash-mismatched upstream responses. It converges to a consistent, installable state every time ([crash sweep](https://github.com/blackthorn-interstellar/pypiron/blob/master/tests/test_crash_consistency.py), [fleet chaos](https://github.com/blackthorn-interstellar/pypiron/blob/master/tests/test_chaos_fleet.py), [upstream faults](https://github.com/blackthorn-interstellar/pypiron/blob/master/tests/test_chaos_upstream.py)).
-- **Exhaustive model checker.** A [model checker](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#machine-checked-models-stateright) enumerates every interleaving of writers, workers, crashes, and byte conflicts within its bounds, running the same decision functions the server ships.
+- **Exhaustive model checker.** A [model checker](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#machine-checked-models-stateright) enumerates every interleaving of uploads, rebuilds, crashes, and same-filename collisions within its bounds, running the same decision functions the server ships.
 - **Continuous deterministic simulation testing.** Deterministic simulation runs a whole multi-node fleet single-threaded on virtual time — on the order of a hundred thousand seeded crash/fault/restart schedules per night, every failure [reproducible from an 8-byte seed](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#deterministic-simulation-the-vopr) ([the simulator](https://github.com/blackthorn-interstellar/pypiron/blob/master/examples/vopr.rs)).
 - **Fuzzed nightly.** Coverage-guided fuzzers hammer the parsers.
 - **Security audited by all frontier models** — the same models that built it. All issues fixed.
@@ -243,7 +243,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
 ## Going further
 
 - [Deploying](guides/standard-cloud.md) — a production server from standard cloud parts
-- [Package sources](concepts.md#three-sources-one-index) — private hosting, caching proxy, sync mirror, and how they combine
+- [Private packages, PyPI proxy, sync mirror](concepts.md#how-packages-get-there) — how they combine behind one index URL
 - [Configuration](reference/configuration.md) — every flag and its `PYPIRON_*` env var
 - [Comparison & benchmarks](compare/index.md) — every alternative, and how the numbers were measured
 - [For AI agents](for-agents.md) — a decision guide, written for agents, by an agent

@@ -62,8 +62,8 @@ The chaos suites kill one real process at a time. Two more suites go further:
   writing; zero outstanding findings.
 - **Model checking.** What the simulator samples, a
   [model checker](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#machine-checked-models-stateright)
-  settles: every interleaving of writers, workers, crashes, and byte conflicts
-  within its bounds is checked exhaustively, not sampled. The checker runs the
+  settles: every interleaving of uploads, rebuilds, crashes, and
+same-filename collisions within its bounds is checked exhaustively, not sampled. The checker runs the
   server's own decision code, so the proof can't drift from the binary.
 
 ## Adversarial inputs

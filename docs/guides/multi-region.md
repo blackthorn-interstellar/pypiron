@@ -160,7 +160,7 @@ reorder:
 3. Start every node with that same list.
 
 **Adding a bucket backfills itself before it serves.** A fresh bucket starts
-empty, so its region's reads keep coming from the write bucket until the corpus
+empty, so its region's reads keep coming from the preferred bucket until the corpus
 has copied over — you never serve a half-filled index. Once every file has
 replicated, that region's reads move to the local bucket automatically. Seed a
 very large corpus out of band first (`aws s3 sync`, `rclone`) and the copy step

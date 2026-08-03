@@ -1,6 +1,6 @@
 ---
 title: Core concepts
-description: One index URL, three package sources, a folder or a bucket, and the defaults that keep bad packages out — the whole pypiron model on one page.
+description: One URL for your packages and PyPI's, a folder or a bucket underneath, and the defaults that keep bad packages out — pypiron on one page.
 ---
 
 # Core concepts
@@ -16,7 +16,7 @@ uv pip install --index-url https://your-server/simple/ acme-utils requests
 difference and doesn't need to. [The quickstart](index.md) has the loop end to
 end.
 
-## Three sources, one index
+## How packages get there
 
 Packages reach that URL three ways. Use one, or all three at once.
 
@@ -62,8 +62,8 @@ Choose the slice by name and version range, wheel platform and Python tag,
 format, size, age, or pre-release status. Re-runs skip what you already hold,
 and upstream yanks follow through, so what you serve keeps matching upstream.
 
-Put the list in `pypiron.toml` and it drives both the mirror and the cache, so
-the two can't drift apart. [Every selector](reference/configuration.md) ·
+Put the list in `pypiron.toml` and it drives both syncing and caching, so the
+two can't drift apart. [Every selector](reference/configuration.md) ·
 [air-gapped guide](guides/air-gapped.md)
 
 ## A name is yours or PyPI's, never both

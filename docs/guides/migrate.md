@@ -20,7 +20,7 @@ pypiron sync \
 ```
 
 Each named package is downloaded from the old index (authenticated) and
-re-uploaded to pypiron as private. Install it like anything else:
+stored in pypiron as private. Install it like anything else:
 
 ```bash
 uv pip install internal-app --index-url http://localhost:8080/simple/
@@ -82,8 +82,7 @@ pypiron reads the modern JSON index; it does not scrape the older HTML index.
 - **Nexus** serves the JSON simple API from **3.93** onward (3.94 adds file
   sizes and upload times). Older Nexus is HTML-only — upgrade before migrating.
 
-If the source is still HTML-only, the migration stops with a clear message
-instead of a cryptic parse error:
+If the source is still HTML-only, the migration stops with:
 
 ```
 source returned an HTML page (Content-Type: text/html), not the PEP 691 JSON

@@ -107,15 +107,14 @@ names — `acme_foo`, `acme.foo`, and `acme-foo` are the same name.
 
 The other half is client-side: point clients at this one index
 (`--default-index` for uv; `--index-url` for pip, not `--extra-index-url`) and
-let the server decide what exists. The full mental model of how private and
-public names coexist is at [Package sources](concepts.md#three-sources-one-index).
+let the server decide what exists. [How private and public names coexist](concepts.md#how-packages-get-there).
 
 ## Approval lists
 
 Narrow the server to packages somebody chose to allow. Give `sync` a file of
 approved names and it pre-loads exactly those; give the proxy the same include
-list and on-demand fetching is constrained to it too. The cooldown and the
-advisory gate still apply on top — approval is a floor, not a bypass. Writing,
+list and on-demand fetching is constrained to it too. The cooldown and malware
+blocking still apply on top — approval is a floor, not a bypass. Writing,
 updating, and enforcing a list: [Approval lists](concepts.md#what-it-keeps-out).
 
 ## Air-gapped deploys
@@ -168,7 +167,7 @@ logged address.
 **Trusted — your storage backend.** The S3, GCS, Azure, or disk backend you
 configure is your data behind your keys, and pypiron treats its responses as
 trusted input. That trust has exactly one sharp edge — see
-[Dependency advisories](#dependency-advisories).
+[pypiron's own dependencies](#pypirons-own-dependencies).
 
 **Trusted — PyPI, for public packages.** For anything mirrored, pypiron is a
 relay: it carries PyPI's files and provenance across unchanged and does not
@@ -190,7 +189,7 @@ provenance attestation you can check yourself — see
 
 A client hammering login with candidate secrets is bounded, not just logged.
 Five failed logins from one address and that address is locked out of logging in
-for five minutes; even a correct guess during the cooldown is refused, so a hit
+for five minutes; even a correct guess during the lockout is refused, so a hit
 can't be confirmed. Successful logins are never counted and anonymous traffic is
 never throttled, so the lockout can't be turned against clients that aren't
 guessing. A fleet of N replicas bounds a guesser at N× one instance's rate —
@@ -219,7 +218,7 @@ These are out of scope by design; know them before you lean on the rest.
   `--trusted-proxy`, since otherwise an attacker sets that `X-Forwarded-For`
   themselves.
 
-## Dependency advisories
+## pypiron's own dependencies
 
 Every change runs `cargo audit` with no ignore flags. The audit is clean.
 
@@ -231,7 +230,7 @@ and Azure. The vulnerable code parsed only XML from the storage endpoint you
 configured and authenticated to, never anything from a package client, and the
 default disk backend never invoked it at all. No released `object_store`
 permitted the fixed `quick-xml`, so the advisories were documented here instead
-of hidden behind audit exceptions, with the gate set to turn red the day a fix
+of hidden behind audit exceptions, with CI set to fail the day a fix
 shipped.
 
 That day came: `object_store` 0.14.1 allows the fixed `quick-xml` 0.41, pypiron

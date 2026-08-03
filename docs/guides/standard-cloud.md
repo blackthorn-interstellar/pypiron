@@ -25,9 +25,9 @@ exclude-newer = "7 days"
 `private-prefix` reserves your package names. `proxy-upstream` serves public
 packages on demand: a cache miss comes from PyPI once, then stays local.
 `exclude-newer` is the dependency cooldown: fresh releases wait a week, on by
-default. Keeping it in the file makes the one useful mirror policy visible.
+default. Spelled out here so it's easy to change.
 To pre-load an approved list instead of proxying, see
-[Package sources](../concepts.md#three-sources-one-index).
+[How packages get there](../concepts.md#how-packages-get-there).
 
 Point `buckets` at a bucket that already exists. On AWS there is usually
 nothing else to set: credentials come from the standard chain — environment,
@@ -91,7 +91,7 @@ uv add --default-index http://HOST:8080/simple/ requests acme-widgets
 ```
 
 With the proxy on, do not point clients at PyPI as an extra index. pypiron
-owns resolution and keeps private names private.
+serves both and keeps private names private.
 
 ## Behind a corporate proxy
 

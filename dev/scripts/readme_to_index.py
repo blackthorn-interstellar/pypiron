@@ -29,6 +29,8 @@ def convert(text: str) -> str:
     # HTML img/source attributes into docs/assets become site-relative.
     text = text.replace('src="docs/assets/', 'src="assets/')
     text = text.replace('srcset="docs/assets/', 'srcset="assets/')
+    # HTML link hrefs into docs/ become site-relative.
+    text = text.replace('href="docs/', 'href="')
     # Repo-tree links become absolute GitHub URLs.
     text = re.sub(r"\]\((dev|src|tests|examples|bench)/", rf"]({GITHUB}\1/", text)
     text = text.replace("](LICENSE)", f"]({GITHUB}LICENSE)")

@@ -8,7 +8,8 @@ Both host private Python packages and cache PyPI. They are built around
 different jobs. devpi is a **publishing workflow**: inheritable indexes you
 promote packages between, test-then-release, a web UI, and master-replica
 replication. pypiron is a **fast package server**: one binary, cloud storage,
-no database, and a read path that scales to CPU instead of your network card.
+no database, and
+installs that scale with CPU instead of your network card.
 
 ## Pick devpi when
 
@@ -31,9 +32,8 @@ no database, and a read path that scales to CPU instead of your network card.
   backend.
 - **Install throughput matters.** In the [six-way benchmark](index.md),
   devpi behind nginx peaked at **78 installs/s** on a 2-vCPU box; pypiron hit
-  **8,288 installs/s** on the same hardware — 100×+ faster. Every byte-serving
-  server clusters near devpi's number because it is the box's network card, not
-  the code. pypiron hands the download straight to object storage, so its
+  **8,288 installs/s** on the same hardware — 100×+ faster. Any server that streams the wheel itself lands near devpi's number: the limit
+is the box's network card, not the code. pypiron hands the download straight to object storage, so its
   ceiling is CPU.
 - **You want supply-chain defense on by default.** New releases wait 7 days
   before pypiron serves them, so most attacks surface first

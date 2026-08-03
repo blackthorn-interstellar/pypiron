@@ -21,9 +21,7 @@ self-hosted PyPI server on the same box.
 
 The gap is architecture, not tuning: the other servers stream every wheel
 through their own network card; pypiron hands the download to object storage
-and scales to CPU. That index-serving path holds up against pypi.org itself —
-replaying PyPI's real request stream, one 8-vCPU box served the package index
-at **202,069 requests/s** with a p99 of **2.62 ms**, about 4× the request rate
+and scales to CPU. The index holds up against pypi.org itself — replaying PyPI's real request stream, one 8-vCPU box served it at **202,069 requests/s** with a p99 of **2.62 ms**, about 4× the request rate
 of all of PyPI.
 
 Each server ran its own documented production topology on the same 2-vCPU AWS

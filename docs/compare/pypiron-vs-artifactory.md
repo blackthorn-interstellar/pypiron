@@ -38,7 +38,7 @@ requirement.)
   no database to run or back up — the packages *are* the state
   ([setup](../guides/standard-cloud.md)). Artifactory is a JVM platform with a database
   and a license behind it.
-- **Speed at the install path.** pypiron sustains
+- **Fast installs.** pypiron sustains
   [8,288 installs/s on a 2-vCPU box](index.md) by handing the
   download straight to object storage instead of streaming wheel bytes through
   its own process. A general-purpose platform carries more per request; if raw

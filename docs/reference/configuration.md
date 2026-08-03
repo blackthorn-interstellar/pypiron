@@ -84,8 +84,7 @@ form are equivalent:
 buckets = ["s3://acme-pypiron"]
 ```
 
-A single-entry list behaves exactly like a directly configured backend: no
-topology, health, or replication machinery runs.
+A single-entry list behaves exactly like a directly configured backend: no replication or failover work runs.
 
 Every URI carries a scheme, and may carry an `@region`:
 
@@ -239,16 +238,11 @@ Application Default Credentials for GCS, the account key for Azure); a bucket
 whose backend is half-configured refuses to start. One bad URI fails startup
 before any bucket is contacted.
 
-A single-entry `--buckets` list behaves exactly like configuring that one backend
-directly — no topology, health, replication, or read-fence work runs.
-
 Replication keeps a full copy of your truth on every bucket: your own uploads,
 the corpus you pulled in with `sync --to`, **and** the on-demand proxy cache
 (packages fetched from public PyPI on first request). The proxy cache converges
 in the background — a fetch is served the instant it lands, and its copy to the
-other buckets follows within minutes, off the download path — so budget for
-roughly your private-plus-mirrored-plus-proxied footprint times the number of
-buckets. There are no new knobs: replication is on whenever you run more than
+other buckets follows within minutes, off the download path — so budget for roughly your total stored size times the number of buckets. There are no new knobs: replication is on whenever you run more than
 one bucket.
 
 When two buckets live on the same cloud under the same credentials, pypiron asks
@@ -305,15 +299,15 @@ recovery behavior, and operator rules.
 | `--access-log-format structured\|clf` | `PYPIRON_ACCESS_LOG_FORMAT` | `structured` | Structured logs or Combined Log Format. |
 | `--trusted-proxy` | `PYPIRON_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For`/`X-Real-IP` for the logged client IP. Off by default: those headers are client-settable, so ignoring them keeps a direct caller from spoofing its audit-logged address, and the direct peer address is logged instead. Enable only behind a reverse proxy that sets them. |
 | `--login-cooldown-secs N` | `PYPIRON_LOGIN_COOLDOWN_SECS` | `300` | Failed-login cooldown. Five failed logins from one address, each within this window of the last, and that address is refused further credential-bearing requests (`429` with `Retry-After`) until the window passes — even with the correct password, so a lucky guess can't be confirmed. Successes are never counted, anonymous requests are never throttled, and IPv6 counts per /64. Enforced per instance. `0` disables. |
-| `--worker-interval-secs N` | `PYPIRON_WORKER_INTERVAL_SECS` | `1` | Dirty/replication poll and bucket-health probe cadence. |
+| `--worker-interval-secs N` | `PYPIRON_WORKER_INTERVAL_SECS` | `1` | Index, replication, and bucket-health poll cadence. |
 | `--bucket-leave-failures N` | `PYPIRON_BUCKET_LEAVE_FAILURES` | `3` | Consecutive timeout (including 408), connection, or 5xx failures before selecting the next bucket. |
 | `--bucket-return-healthy-secs N` | `PYPIRON_BUCKET_RETURN_HEALTHY_SECS` | `300` | Continuous health required before returning to a more-preferred bucket. |
 | `--node-region LABEL` | `PYPIRON_NODE_REGION` | detected | This node's region, matched against bucket `@region` labels to choose the bucket it reads from. Cloud nodes detect it automatically (AWS/GCP/Azure); set it for on-prem or MinIO. Steers reads only, never writes. Multi-bucket only. |
 | `--fanout-grace-secs N` | `PYPIRON_FANOUT_GRACE_SECS` | `30` | Grace a lagging secondary bucket gets on upload before pypiron records a repair and returns. One slow bucket adds at most this to a publish. Multi-bucket only. |
 | `--repl-sweep-interval-secs N` | `PYPIRON_REPL_SWEEP_INTERVAL_SECS` | `300` | Backstop interval for draining pending cross-bucket repairs. Repairs also drain the moment a bucket recovers. Multi-bucket only. |
 | `--intent-grace-secs N` | `PYPIRON_INTENT_GRACE_SECS` | `900` | Grace for an upload or cross-bucket package operation. Minimum `3`; maximum `9223372036854775807`. |
-| `--audit-on-boot true\|false` | `PYPIRON_AUDIT_ON_BOOT` | `true` | Run the selected-bucket audit and multi-bucket full diff on boot. |
-| `--reconcile-interval-secs N` | `PYPIRON_RECONCILE_INTERVAL_SECS` | `86400` | Selected-bucket audit and multi-bucket full-diff interval. |
+| `--audit-on-boot true\|false` | `PYPIRON_AUDIT_ON_BOOT` | `true` | Run the consistency check on boot: indexes against stored files, buckets against each other. |
+| `--reconcile-interval-secs N` | `PYPIRON_RECONCILE_INTERVAL_SECS` | `86400` | How often that check repeats. |
 | `--transparency true\|false` | `PYPIRON_TRANSPARENCY` | `true` | Record each audit's file hashes under `_transparency/`; `pypiron verify-chain` reads the records. Off stops new records only. |
 | `--lease-ttl-secs N` | `PYPIRON_LEASE_TTL_SECS` | `30` | Multi-node leader lease TTL. |
 | `--download-stats true\|false` | `PYPIRON_DOWNLOAD_STATS` | `true` | Count package downloads. |
@@ -433,7 +427,7 @@ directly.
 | `--admin-user USER` | `PYPIRON_SYNC_ADMIN_USER` | none | Destination admin user. |
 | `--admin-pass PASS` | `PYPIRON_SYNC_ADMIN_PASS` | none | Destination admin password. |
 | `--private-prefix PREFIX` | `PYPIRON_PRIVATE_PREFIX` | none | Refuse to mirror private names. |
-| `--as-private` | `PYPIRON_SYNC_AS_PRIVATE` | `false` | Migrate the source into pypiron's private namespace (`origin = private`) instead of mirroring it. Timestamps and yank state are not preserved — migrated files carry the migration date. See [Migrate off another index](../guides/migrate.md). |
+| `--as-private` | `PYPIRON_SYNC_AS_PRIVATE` | `false` | Migrate the source index into pypiron's private namespace instead of mirroring it. Timestamps and yank state are not preserved — migrated files carry the migration date. See [Migrate off another index](../guides/migrate.md). |
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | relay from `--from` | Ferry the advisory snapshot to `--to` alongside the packages. Unset relays the source server's feed (`GET <from>/advisories/feed`); a URL or path fetches that instead; `""` disables. Best-effort: a feed-less source or a destination without the endpoint warns and the package sync proceeds. Also `[sync].advisory-feed`. |
 | `--concurrency N` | `PYPIRON_SYNC_CONCURRENCY` | `4` | Transfers within one package. |
 | `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8` | Packages in parallel. |
@@ -474,7 +468,7 @@ Tokens live for 5 minutes and cannot outrank the credential that minted them.
 | `pypiron healthcheck` | Probe `/health`; `--url` / `PYPIRON_HEALTHCHECK_URL` overrides the target. |
 | `pypiron verify-index` | Read-only full index check against the selected storage backend. `--deep` re-hashes every stored file too. |
 | `pypiron rebuild-index` | Rebuild every index from stored files. |
-| `pypiron buckets migrate` | Increment the multi-bucket topology generation and re-stamp every reachable configured bucket. |
+| `pypiron buckets migrate` | Apply a changed `--buckets` list across every reachable bucket. |
 | `pypiron origin release PACKAGE` | Release an empty package name for deliberate private/public repurposing. Every configured bucket must be reachable and empty for that package. |
 
 `verify-index` and `rebuild-index` use the same storage flags as `serve`, and
@@ -502,9 +496,7 @@ names examples and stops. Add the replacement and let replication converge (so
 that content lives on a surviving bucket), then remove the old one. To drop it
 anyway and *permanently discard* that content, pass `--force`
 (`PYPIRON_MIGRATE_FORCE=true`). If it refuses for pending repairs, let the fleet
-drain (or bring the lagging bucket back) and retry. Adding a bucket seeds a
-one-time backfill marker so the new bucket serves no region reads until the
-corpus has copied onto it. To shrink to one bucket, stop the fleet and restart it
+drain (or bring the lagging bucket back) and retry. A new bucket serves no region reads until your files have copied onto it. To shrink to one bucket, stop the fleet and restart it
 with that bucket; topology stamps are dormant in single-bucket mode.
 
 | Flag | Env | Default | Use |

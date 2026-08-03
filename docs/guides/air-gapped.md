@@ -102,7 +102,7 @@ an hourly cron for hourly baselines. One run picks up new versions of approved
 packages and the advisory snapshot together. The
 `pypiron_advisory_snapshot_age_seconds` gauge tracks the loaded feed's age.
 Alert when it climbs past your refresh window:
-[Health and metrics](../concepts.md#what-it-tells-you).
+[Monitoring](../concepts.md#what-it-tells-you).
 
 ## See also
 

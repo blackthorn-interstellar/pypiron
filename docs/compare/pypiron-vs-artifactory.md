@@ -36,16 +36,16 @@ requirement.)
 - **No license, no database, one binary.** `uvx pypiron serve`, or one Docker
   container, pointed at a folder or an S3/GCS/Azure bucket. Nothing to license,
   no database to run or back up — the packages *are* the state
-  ([setup](../guides/setup.md)). Artifactory is a JVM platform with a database
+  ([setup](../guides/standard-cloud.md)). Artifactory is a JVM platform with a database
   and a license behind it.
 - **Speed at the install path.** pypiron sustains
-  [8,288 installs/s on a 2-vCPU box](../reference/benchmarks.md) by handing the
+  [8,288 installs/s on a 2-vCPU box](index.md) by handing the
   download straight to object storage instead of streaming wheel bytes through
   its own process. A general-purpose platform carries more per request; if raw
   Python install throughput on small hardware is your bottleneck, a purpose-built
   server wins.
 - **Supply-chain defense on by default.** A 7-day cooldown on new releases so
-  most attacks surface first ([how](../concepts/supply-chain.md)), a private name
+  most attacks surface first ([how](../security.md)), a private name
   that can never fall through to public PyPI, and refusal of any file the advisory
   feed flags as malware — all on out of the box, no policy engine to configure.
 - **Multi-region resilience without the enterprise tier.** Run nodes across
@@ -66,7 +66,7 @@ requirement.)
 | Enterprise RBAC / SSO | uploader + admin creds | ✅ |
 | Dependency cooldown | ✅ default | via policy config |
 | Multi-region failover | one bucket list | HA / replication tiers |
-| Peak installs/s (2 vCPU) | [8,288](../reference/benchmarks.md) | — |
+| Peak installs/s (2 vCPU) | [8,288](index.md) | — |
 
 ## The honest line
 
@@ -74,4 +74,4 @@ Artifactory earns its place when one platform must govern every artifact in the
 company. But if what you actually need is a fast, private PyPI with a PyPI cache
 and supply-chain defense — and you would rather run a single binary than license
 and operate a platform for it — pypiron is the Artifactory alternative built for
-exactly that. [Set it up](../guides/setup.md) in one command and see.
+exactly that. [Set it up](../guides/standard-cloud.md) in one command and see.

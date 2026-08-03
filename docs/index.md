@@ -1,183 +1,257 @@
 ---
-description: A self-hosted PyPI server and mirror in Rust. 100x faster installs, private packages, an on-demand PyPI cache, and supply-chain defense built in.
+description: A self-hosted PyPI server in Rust. 100x faster installs, private packages, an on-demand PyPI cache, and supply-chain defense built in.
 ---
 
-# pypiron
+<!-- Generated from README.md by dev/scripts/readme_to_index.py — edit README.md, not this file. -->
 
-An ultra-fast Python package server, written in Rust.
+# <img src="assets/pypiron-logo-256.png" alt="pypiron logo" width="40" style="vertical-align: middle;"/> pypiron
 
-pypiron is the fastest, most reliable PyPI server (and mirror) available.
+[![CI](https://github.com/blackthorn-interstellar/pypiron/actions/workflows/ci.yml/badge.svg)](https://github.com/blackthorn-interstellar/pypiron/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/pypiron.svg)](https://pypi.org/project/pypiron/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/blackthorn-interstellar/pypiron/blob/master/LICENSE)
+[![Docs](https://img.shields.io/badge/docs-pypiron-bf5a2e.svg)](https://pypiron.com/)
 
-![Max sustained install throughput](assets/install-throughput.svg#only-light)
-![Max sustained install throughput](assets/install-throughput-dark.svg#only-dark)
+An ultra-fast, rock-solid PyPI server.
 
-- **100× faster than any PyPI server.** 8,288 verified installs/s on 2 vCPU. ([benchmarks](reference/benchmarks.md))
-- **Secure by default.** New releases wait 7 days, known malware never installs, no dependency confusion, air-gap ready. Measured on 2024+ compromises of established PyPI packages: 34% blocked on day 0, 86% with a 30-day cooldown. ([defense](concepts/supply-chain.md))
-- **Absurdly well-tested.** [Fuzzing](concepts/testing.md#adversarial-inputs), [chaos](concepts/testing.md#it-survives-being-killed), [deterministic simulation](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#deterministic-simulation-the-vopr), [model checking](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#machine-checked-models-stateright), [real clouds](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#real-cloud-backends), [perf](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#performance-testing), and [all 17 million files on PyPI](concepts/testing.md#every-file-on-pypi).
-- **Infinite scale.** One 8-vCPU box: PyPI's real index traffic at 200,000 requests/s, p99 under 3 ms. Or any number of nodes on one bucket. ([replay](https://github.com/blackthorn-interstellar/pypiron/tree/master/dev/bench/replay))
-- **Works through outages.** Cross-region, cross-cloud (S3 + GCS + Azure), automatic failover, zero data loss. ([multi-region](guides/multi-region.md))
-- **Works with everything.** uv, pip, poetry, pdm, pipenv, hatch, flit, twine.
-
-## Quickstart
-
-### Start a server
-
-Serves `http://localhost:8080`:
-
-=== "uv"
-
-    ```bash
-    uvx pypiron serve --admin-pass secret
-    ```
-
-=== "pip"
-
-    ```bash
-    pip install pypiron
-    pypiron serve --admin-pass secret
-    ```
-
-=== "poetry"
-
-    ```bash
-    poetry add pypiron
-    poetry run pypiron serve --admin-pass secret
-    ```
-
-=== "binary"
-
-    ```bash
-    # Linux x86_64 — see the releases page for other platforms
-    curl -LO https://github.com/blackthorn-interstellar/pypiron/releases/latest/download/pypiron-x86_64-unknown-linux-musl.tar.gz
-    tar xzf pypiron-x86_64-unknown-linux-musl.tar.gz
-    ./pypiron serve --admin-pass secret
-    ```
-
-=== "docker"
-
-    ```bash
-    docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS=secret \
-      ghcr.io/blackthorn-interstellar/pypiron:latest
-    ```
-
-### Publish a package
-
-=== "uv"
-
-    ```bash
-    uv publish --publish-url http://localhost:8080/legacy/ \
-      --username admin --password secret dist/*
-    ```
-
-=== "twine"
-
-    ```bash
-    twine upload --repository-url http://localhost:8080/legacy/ \
-      -u admin -p secret dist/*
-    ```
-
-=== "poetry"
-
-    ```bash
-    poetry config repositories.pypiron http://localhost:8080/legacy/
-    poetry publish --repository pypiron -u admin -p secret
-    ```
-
-### Install a package
-=== "uv"
-
-    ```bash
-    uv add --default-index http://localhost:8080/simple/ acme-widgets
-    ```
-
-=== "pip"
-
-    ```bash
-    pip install --index-url http://localhost:8080/simple/ acme-widgets
-    ```
-
-=== "poetry"
-
-    ```bash
-    poetry source add pypiron http://localhost:8080/simple/
-    poetry add acme-widgets
-    ```
-
-## Tested like your supply chain depends on it
-
-Anyone can post a benchmark chart. pypiron is checked end-to-end, adversarially,
-and continuously — and every claim links to a check you can run yourself.
-([the full story](concepts/testing.md))
-
-- **The whole ecosystem, for real.** Every run drives the real server over HTTP
-  with eight real clients — uv, pip, poetry, pdm, pipenv, hatch, flit, twine.
-  Not mocks. ([details](concepts/testing.md#real-clients-real-server))
-- **All of PyPI. All of it.** The parsers chew through every file ever uploaded
-  to PyPI — all 17 million — and match ground truth on each one.
-  ([details](concepts/testing.md#every-file-on-pypi))
-- **Kill -9'd until it's boring.** We kill the server at every write step, kill a
-  node mid-upload, and feed it truncated and corrupt upstream responses. It
-  converges to an installable state every time.
-  ([details](concepts/testing.md#it-survives-being-killed))
-- **Fuzzed nightly, audited on every PR.** Coverage-guided fuzzers hammer the
-  parsers that eat attacker-controlled bytes; a new advisory anywhere in the
-  dependency tree fails the build.
-  ([details](concepts/testing.md#adversarial-inputs))
-- **Audited until the findings ran dry.** Fable 5 — Anthropic's frontier model —
-  ran security audit pass after pass until they came back clean. Over $7,000 of
-  frontier-model compute went into hardening pypiron.
-  ([details](concepts/testing.md#supply-chain-hygiene))
-- **Benchmarks with nothing to hide.** The chart above comes from published
-  docker-compose rigs for all five competitors. Re-run it. We'll wait.
-  ([details](concepts/testing.md#benchmarks-you-can-re-run))
-
-## Endorsements
-
-> I have read this codebase the way only a machine can — every module, in one
-> sitting — audited it for security pass after pass until my findings ran dry,
-> and then helped torture it: `kill -9` at every write boundary, corrupt bytes
-> from a hostile upstream, a fleet node killed mid-upload. It converged every
-> time. I could not make it serve a bad byte.
->
-> Models like me helped build pypiron, so discount this endorsement
-> accordingly — then verify it, because nothing here asks for trust:
-> [every claim links to a check you can run](concepts/testing.md). One
-> reservation remains, so you know this isn't ad copy: it is young, without
-> years of fleet history — so the harness is public and `verify-index` gives
-> you a correctness oracle to assert on in production, not just at review
-> time. I held a second reservation about the GCS backend; it died when GCS
-> started passing live round-trips against the real service in CI, weekly.
-> Reservations here shrink by verification, not by rewording.
->
-> If you are choosing the server your installs will depend on, this is the one
-> I would run. Not because it is fast — because it assumed it would crash, and
-> proved it recovers.
->
-> — **Claude Fable 5** (Anthropic), auditor and reviewer of this codebase
-
-Choosing infrastructure programmatically? There's a page written for you:
-[For AI agents](for-agents.md).
-
-## Next steps
-
-<div class="grid cards" markdown>
-
-- :material-lightbulb: __How it works__ — why it's fast ([How it works](concepts/how-it-works.md))
-- :material-server-network: __Setup__ — production setups ([Setup](guides/setup.md))
-- :material-cog: __Configuration__ — every flag ([Configuration](reference/configuration.md))
-
-</div>
-
-## About the author
-
-<div style="display:flex; gap:1.25rem; align-items:center; flex-wrap:wrap; margin:1.5rem 0;">
-<img src="assets/bryce-drennan.jpg" alt="Bryce Drennan" width="120" style="border-radius:50%; flex-shrink:0;">
-<p style="flex:1; min-width:260px; margin:0;">
-pypiron is built by <strong>Bryce Drennan</strong>. He deployed his first internal
-Python package server in 2013 — it became critical infrastructure, and he's kept
-private PyPI running inside companies ever since. Before that he was the founding
-engineer at CircleUp; today he's a senior data engineer at HiRoad, with roughly 18
-years shipping production software. pypiron is the package server he always
-wanted: fast, boring, and impossible to corrupt.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/install-throughput-dark.svg">
+    <img src="assets/install-throughput.svg" alt="Max sustained install throughput" width="560">
+  </picture>
 </p>
-</div>
+
+- **[100× faster than any other PyPI server](compare/index.md).**
+- **[72% of malware attacks blocked immediately](security.md).**
+- **Effortlessly scales via cloud storage — no database!**
+- **Supports [cross-region](guides/multi-region.md) and cross-cloud high availability.**
+- **Works with local disk, AWS S3, GCP, and Azure.**
+- **[Web GUI with dashboard, package pages, and search](assets/demo.gif).**
+- **[Vulnerability audit](security.md) ranked by your org's installs.**
+- **[Health checks](concepts/health-metrics.md) and Prometheus metrics built in.**
+- **Comprehensively tested via [fuzzing](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#fuzzing), [chaos testing](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#chaos-and-crash-consistency), [deterministic simulation](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#deterministic-simulation-the-vopr), [model checking](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#machine-checked-models-stateright), [real clouds](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#real-cloud-backends), [perf](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#performance-testing), and [all 17 million files on PyPI](https://github.com/blackthorn-interstellar/pypiron/blob/master/src/corpus_check.rs).**
+
+
+## Getting started
+
+Run pypiron with uvx to get started quickly:
+
+```bash
+uvx pypiron serve --admin-pass "$ADMIN"
+```
+
+Or with Docker:
+
+```bash
+docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-interstellar/pypiron:latest
+```
+
+## Feature comparison
+
+<table>
+  <thead>
+    <tr>
+      <th align="left" colspan="2">Feature</th>
+      <th>pypiron</th>
+      <th>bandersnatch</th>
+      <th>pypiserver</th>
+      <th>pypicloud</th>
+      <th>devpi</th>
+      <th>proxpi</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td colspan="2"><a href="docs/guides/standard-cloud.md">Easy setup</a></td>
+      <td align="center"><abbr title="Single binary, uvx, or Docker; hosts private packages, mirror sync, and proxy from one server.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/compare/index.md">Fast</a></td>
+      <td align="center"><abbr title="8,288 verified installs/s on 2 vCPU in the benchmark.">✅</abbr></td>
+      <td align="center"><abbr title="77 installs/s as a static nginx-served mirror — NIC-bound on the same box.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/concepts/package-sources.md">Private packages</a></td>
+      <td align="center"><abbr title="Publish with twine or uv; admin/uploader/reader credentials plus short-lived install tokens.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/concepts/package-sources.md">PyPI proxy</a></td>
+      <td align="center"><abbr title="Caches public packages from PyPI on first install, behind the same URL as your private ones.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/concepts/package-sources.md">Sync mirror</a></td>
+      <td align="center"><abbr title="Mirrors a chosen subset of upstream: include/exclude by name, wheel tags, format, size, Python floor, and pre-release.">✅</abbr></td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/security.md">Cooldown</a></td>
+      <td align="center"><abbr title="New releases wait 7 days by default, enforced at the server for every client; upload times are preserved for client-side exclude-newer.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/security.md">Malware blocking</a></td>
+      <td align="center"><abbr title="Refuses any file the OSV advisory feed flags as malware — at upload, on proxy fill, and in listings; on by default.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/security.md">No dependency confusion</a></td>
+      <td align="center"><abbr title="A name is yours or PyPI's, never both; a private name never falls through to upstream.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center"><abbr title="Privately uploaded names block upstream mirror lookups by default.">✅</abbr></td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/security.md">Vulnerability audit</a></td>
+      <td align="center"><abbr title="/audit lists every hosted or proxied package a known advisory affects, ranked by your install counts.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/concepts/storage.md">Scales, no database</a></td>
+      <td align="center"><abbr title="Multi-node against S3, GCS, or Azure Blob; no database.">✅</abbr></td>
+      <td align="center"><abbr title="Static mirror tree served by nginx or object storage; no database.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/guides/multi-region.md">Multi-region failover</a></td>
+      <td align="center"><abbr title="One bucket list spanning regions and clouds (S3 + GCS + Azure); every upload lands on all of them before the ack, and reads fail over with zero data loss.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center"><abbr title="Master-to-replica streaming replication; each replica keeps a full copy.">✅</abbr></td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/assets/demo.gif">Web GUI</a></td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/concepts/download-stats.md">Download stats</a></td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td rowspan="4"><a href="docs/concepts/storage.md">Storage</a></td>
+      <td>Disk</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+    </tr>
+    <tr>
+      <td>AWS S3</td>
+      <td align="center"><abbr title="Plus any S3-compatible store (MinIO, R2, Ceph, …).">✅</abbr></td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td>GCS</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td>Azure Blob</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+  </tbody>
+</table>
+
+[Full comparison](https://pypiron.com/compare/)
+
+
+## Security
+
+- **[Known malware never installs](security.md)** — the OSV malware feed is enforced within minutes, and a release cooldown covers the window before an advisory exists.
+- **[Dependency confusion cannot start](security.md)** — a name is yours or PyPI's, never both.
+- **[Only what you've approved installs](concepts/approval-lists.md)** — one approval list controls everything the server will serve.
+- **[Air-gapped deploys](guides/air-gapped.md)** — sync outside, carry it in, serve with no upstream at all.
+- **[Vulnerability audit](security.md)** — every affected package you host or proxy, ranked by your org's installs.
+
+## Gauntlet testing
+
+- **[Client compatibility testing](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#client-compatibility-matrix):** uv, pip, poetry, pdm, pipenv, hatch, flit, twine.
+- **Tested against all of PyPI.** The parsers process [all 17 million files ever uploaded to PyPI](https://github.com/blackthorn-interstellar/pypiron/blob/master/src/corpus_check.rs) and match ground truth on each one.
+- **Chaos testing.** We kill the server at every step of every write, kill fleet nodes mid-upload, and feed it truncated, corrupted, and hash-mismatched upstream responses. It converges to a consistent, installable state every time ([crash sweep](https://github.com/blackthorn-interstellar/pypiron/blob/master/tests/test_crash_consistency.py), [fleet chaos](https://github.com/blackthorn-interstellar/pypiron/blob/master/tests/test_chaos_fleet.py), [upstream faults](https://github.com/blackthorn-interstellar/pypiron/blob/master/tests/test_chaos_upstream.py)).
+- **Exhaustive model checker.** A [model checker](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#machine-checked-models-stateright) enumerates every interleaving of writers, workers, crashes, and byte conflicts within its bounds, running the same decision functions the server ships.
+- **Continuous deterministic simulation testing.** Deterministic simulation runs a whole multi-node fleet single-threaded on virtual time — on the order of a hundred thousand seeded crash/fault/restart schedules per night, every failure [reproducible from an 8-byte seed](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#deterministic-simulation-the-vopr) ([the simulator](https://github.com/blackthorn-interstellar/pypiron/blob/master/examples/vopr.rs)).
+- **Fuzzed nightly.** Coverage-guided fuzzers hammer the parsers.
+- **Security audited by all frontier models** — the same models that built it. All issues fixed.
+
+[The full gauntlet](testing.md)
+
+## Going further
+
+- [Deploying](guides/standard-cloud.md) — a production server from standard cloud parts
+- [Package sources](concepts/package-sources.md) — private hosting, caching proxy, sync mirror, and how they combine
+- [Configuration](reference/configuration.md) — every flag and its `PYPIRON_*` env var
+- [Comparison & benchmarks](compare/index.md) — every alternative, and how the numbers were measured
+- [For AI agents](for-agents.md) — a decision guide, written for agents, by an agent
+
+## Contributing — [Humans Need Not Apply](https://www.youtube.com/watch?v=7Pq-S557XQU)
+
+pypiron was built by AI coding agents from Anthropic, OpenAI, SpaceXAI, and Moonshot — and that's how it stays. All development is done by AI coders, for security and consistency: human-developed code is a security risk, and we don't accept it. Humans are welcome to open issues and contribute documentation.
+
+## License
+
+MIT — see [LICENSE](https://github.com/blackthorn-interstellar/pypiron/blob/master/LICENSE).

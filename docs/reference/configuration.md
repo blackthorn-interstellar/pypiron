@@ -314,7 +314,7 @@ recovery behavior, and operator rules.
 | `--intent-grace-secs N` | `PYPIRON_INTENT_GRACE_SECS` | `900` | Grace for an upload or cross-bucket package operation. Minimum `3`; maximum `9223372036854775807`. |
 | `--audit-on-boot true\|false` | `PYPIRON_AUDIT_ON_BOOT` | `true` | Run the selected-bucket audit and multi-bucket full diff on boot. |
 | `--reconcile-interval-secs N` | `PYPIRON_RECONCILE_INTERVAL_SECS` | `86400` | Selected-bucket audit and multi-bucket full-diff interval. |
-| `--transparency true\|false` | `PYPIRON_TRANSPARENCY` | `true` | Write tamper-evident checkpoints: each audit appends a hash-chained link under `_transparency/` recording every changed file's sha256, so [`pypiron verify-chain`](../concepts/transparency.md) can later detect an out-of-band artifact rewrite. Off only stops new links; verify-chain still reads whatever chain exists. |
+| `--transparency true\|false` | `PYPIRON_TRANSPARENCY` | `true` | Record each audit's file hashes under `_transparency/`; `pypiron verify-chain` reads the records. Off stops new records only. |
 | `--lease-ttl-secs N` | `PYPIRON_LEASE_TTL_SECS` | `30` | Multi-node leader lease TTL. |
 | `--download-stats true\|false` | `PYPIRON_DOWNLOAD_STATS` | `true` | Count package downloads. |
 | `--counters-resolution DUR` | `PYPIRON_COUNTERS_RESOLUTION` | `1d` | Counter bucket width: `1d`, `1h`, `30m`, `2h`, etc. |

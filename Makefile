@@ -87,10 +87,13 @@ clean:  ## Clean build artifacts
 doc:  ## Generate Rust API documentation
 	cargo doc --no-deps
 
-docs:  ## Build the user-facing docs site (mkdocs, strict)
+docs: docs-index  ## Build the user-facing docs site (mkdocs, strict)
 	uv run --group docs -- mkdocs build --strict
 
-docs-serve:  ## Live-preview the docs site at http://127.0.0.1:8000
+docs-index:  ## Regenerate docs/index.md from README.md (the landing page's single source)
+	uv run -- python dev/scripts/readme_to_index.py
+
+docs-serve: docs-index  ## Live-preview the docs site at http://127.0.0.1:8000
 	uv run --group docs -- mkdocs serve
 
 docs-truth: dev  ## Advisory: flag/env/default drift between the CLI and configuration.md/config_template.toml (not in `check`)

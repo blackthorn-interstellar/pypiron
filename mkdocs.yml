@@ -2,7 +2,7 @@ site_name: pypiron
 site_description: An ultra-fast Python package server, written in Rust.
 site_author: Blackthorn Interstellar
 site_url: https://pypiron.com/
-copyright: Copyright &copy; 2025 Blackthorn Interstellar
+copyright: 'Copyright &copy; 2025 Blackthorn Interstellar &middot; <a href="/privacy/">Privacy</a> &middot; <a href="/for-agents/">For LLMs</a>'
 
 # Build output lands under .local/ with the rest of the regenerable local state.
 site_dir: .local/site
@@ -19,7 +19,8 @@ theme:
   logo: assets/pypiron-logo-256.png
   favicon: assets/pypiron-logo-256.png
   features:
-    - navigation.sections
+    # navigation.sections is deliberately absent: groups render collapsed, so
+    # the sidebar shows seven items, not the whole sitemap.
     - navigation.tracking
     - navigation.top
     - navigation.footer
@@ -70,53 +71,67 @@ markdown_extensions:
       emoji_index: !!python/name:material.extensions.emoji.twemoji
       emoji_generator: !!python/name:material.extensions.emoji.to_svg
 
+# Published but deliberately outside the nav: the per-competitor pages keep
+# their search-landing URLs, and the footer links carry privacy + for-agents.
+not_in_nav: |
+  compare/pypiron-vs-devpi.md
+  compare/pypiron-vs-pypiserver.md
+  compare/pypiron-vs-artifactory.md
+  for-agents.md
+  privacy.md
+
 plugins:
   - search
   # Emit /llms.txt (an index) and /llms-full.txt (every page inlined) for coding
-  # agents that fetch them when pointed at docs. Sections mirror the nav.
+  # agents that fetch them when pointed at docs. This list does NOT track nav —
+  # every published page must be listed here by hand or it silently vanishes
+  # from llms.txt (including the off-nav pages above).
   - llmstxt:
       full_output: llms-full.txt
       sections:
-        Start here:
+        Overview:
           - index.md
-          - guides/setup.md
+        Core concepts:
+          - concepts/package-sources.md
+          - concepts/storage.md
+          - concepts/how-it-works.md
+          - concepts/approval-lists.md
+          - concepts/health-metrics.md
+          - concepts/download-stats.md
+        Deploy guides:
+          - guides/standard-cloud.md
+          - guides/air-gapped.md
+          - guides/multi-region.md
           - guides/migrate.md
+        Security and testing:
+          - security.md
+          - testing.md
+        Reference:
+          - reference/configuration.md
         Compare:
           - compare/index.md
           - compare/pypiron-vs-devpi.md
           - compare/pypiron-vs-pypiserver.md
           - compare/pypiron-vs-artifactory.md
-        How it works:
-          - concepts/how-it-works.md
-          - concepts/supply-chain.md
-          - concepts/transparency.md
-          - concepts/security-model.md
-          - concepts/testing.md
-          - guides/multi-region.md
-          - concepts/download-stats.md
+        For agents:
           - for-agents.md
-        Reference:
-          - reference/configuration.md
-          - reference/benchmarks.md
           - privacy.md
 
 nav:
-  - Home: index.md
-  - Setup: guides/setup.md
-  - Migrate off another index: guides/migrate.md
-  - Compare:
-      - compare/index.md
-      - pypiron vs devpi: compare/pypiron-vs-devpi.md
-      - pypiron vs pypiserver: compare/pypiron-vs-pypiserver.md
-      - pypiron vs Artifactory: compare/pypiron-vs-artifactory.md
-  - How it works: concepts/how-it-works.md
-  - Supply-chain defense: concepts/supply-chain.md
-  - Tamper-evident checkpoints: concepts/transparency.md
-  - Security model: concepts/security-model.md
-  - How it's tested: concepts/testing.md
-  - Multi-region resilience: guides/multi-region.md
-  - For AI agents: for-agents.md
-  - Download statistics: concepts/download-stats.md
+  - Overview: index.md
+  - Core concepts:
+      - Package sources: concepts/package-sources.md
+      - Storage backends: concepts/storage.md
+      - Serving from object storage: concepts/how-it-works.md
+      - Approval lists: concepts/approval-lists.md
+      - Health & metrics: concepts/health-metrics.md
+      - Download statistics: concepts/download-stats.md
+  - Deploy guides:
+      - Standard cloud deploy: guides/standard-cloud.md
+      - Air-gapped deploy: guides/air-gapped.md
+      - Multi-region & multi-cloud: guides/multi-region.md
+      - Migrate from another server: guides/migrate.md
+  - Security features: security.md
+  - Gauntlet testing: testing.md
   - Configuration: reference/configuration.md
-  - Benchmarks: reference/benchmarks.md
-  - Privacy: privacy.md
+  - Comparison & benchmarks: compare/index.md

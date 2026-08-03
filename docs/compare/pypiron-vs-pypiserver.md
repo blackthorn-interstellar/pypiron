@@ -32,14 +32,14 @@ either, you are already past what it does.
   to pypi.org.
 - **Cloud storage, no database.** Point pypiron at an S3, GCS, or Azure bucket
   and run as many nodes as you like against it — no database either way
-  ([setup](../guides/setup.md)). pypiserver serves from local directories only.
-- **It is roughly 100× faster.** In the [six-way benchmark](../reference/benchmarks.md),
+  ([setup](../guides/standard-cloud.md)). pypiserver serves from local directories only.
+- **It is roughly 100× faster.** In the [six-way benchmark](index.md),
   pypiserver on gunicorn peaked at **69 installs/s** on a 2-vCPU box; pypiron hit
   **8,288 installs/s** on the same hardware. pypiserver pushes every wheel
   through its own network card, which is where it tops out; pypiron hands the
   download to object storage and scales to CPU.
 - **Supply-chain defense on by default.** New releases wait 7 days before
-  pypiron serves them ([how](../concepts/supply-chain.md)), a private name can
+  pypiron serves them ([how](../security.md)), a private name can
   never fall through to PyPI (no dependency confusion), and pypiron refuses any
   file the advisory feed flags as malware. pypiserver has none of these.
 - **It survives an outage.** Run nodes across regions or clouds on one bucket
@@ -59,7 +59,7 @@ either, you are already past what it does.
 | Malware / advisory blocking | ✅ default | — |
 | No dependency confusion | ✅ | — |
 | Multi-node resilience | one bucket, multi-region failover | single box |
-| Peak installs/s (2 vCPU) | [8,288](../reference/benchmarks.md) | 69 |
+| Peak installs/s (2 vCPU) | [8,288](index.md) | 69 |
 
 ## The honest line
 
@@ -67,4 +67,4 @@ For a single-box private index with no caching, pypiserver is a perfectly good,
 long-lived choice and there is no reason to switch for its own sake. The moment
 you want a PyPI cache, cloud storage, more than one node, supply-chain defense,
 or real throughput, pypiron gives you all of them from one binary.
-[Try it](../guides/setup.md) — the private-index setup is a single command.
+[Try it](../guides/standard-cloud.md) — the private-index setup is a single command.

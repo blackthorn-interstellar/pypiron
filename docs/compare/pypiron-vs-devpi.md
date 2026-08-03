@@ -29,7 +29,7 @@ no database, and a read path that scales to CPU instead of your network card.
   run or back up. devpi keeps its state in sqlite by default, or PostgreSQL via
   a plugin for a bigger deployment; there is no first-class object-storage
   backend.
-- **Install throughput matters.** In the [six-way benchmark](../reference/benchmarks.md),
+- **Install throughput matters.** In the [six-way benchmark](index.md),
   devpi behind nginx peaked at **78 installs/s** on a 2-vCPU box; pypiron hit
   **8,288 installs/s** on the same hardware — 100×+ faster. Every byte-serving
   server clusters near devpi's number because it is the box's network card, not
@@ -37,7 +37,7 @@ no database, and a read path that scales to CPU instead of your network card.
   ceiling is CPU.
 - **You want supply-chain defense on by default.** New releases wait 7 days
   before pypiron serves them, so most attacks surface first
-  ([how](../concepts/supply-chain.md)). A private name is yours or PyPI's, never
+  ([how](../security.md)). A private name is yours or PyPI's, never
   both, which closes dependency confusion. devpi blocks upstream lookups for
   privately uploaded names, but the cooldown and the malware-advisory block are
   pypiron's.
@@ -61,7 +61,7 @@ no database, and a read path that scales to CPU instead of your network card.
 | Malware / advisory blocking | ✅ default | — |
 | No dependency confusion | ✅ | ✅ |
 | Multi-node resilience | one bucket, multi-region failover | master → read replicas |
-| Peak installs/s (2 vCPU) | [8,288](../reference/benchmarks.md) | 78 |
+| Peak installs/s (2 vCPU) | [8,288](index.md) | 78 |
 
 ## The honest line
 
@@ -69,5 +69,5 @@ If your team's release process is "push to a test index, run the suite, promote
 to release," that pipeline *is* devpi and pypiron will not replace it. If you
 want the private index and PyPI cache to be a single fast binary on cloud
 storage with supply-chain defense built in — and you do not need the staging
-workflow — pypiron is the lighter, faster fit. [Set it up](../guides/setup.md)
+workflow — pypiron is the lighter, faster fit. [Set it up](../guides/standard-cloud.md)
 in one command.

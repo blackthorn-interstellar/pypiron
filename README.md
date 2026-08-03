@@ -10,15 +10,18 @@ An ultra-fast, rock-solid PyPI server.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/install-throughput-dark.svg">
-    <img src="docs/assets/install-throughput.svg" alt="Max sustained install throughput: pypiron vs bandersnatch, pypiserver, pypicloud, devpi, proxpi" width="760">
+    <img src="docs/assets/install-throughput.svg" alt="Max sustained install throughput" width="560">
   </picture>
 </p>
 
-- **[100× faster than any other PyPI server](docs/reference/benchmarks.md).**
-- **[72% of malware attacks blocked immediately](docs/concepts/supply-chain.md).**
+- **[100× faster than any other PyPI server](docs/compare/index.md).**
+- **[72% of malware attacks blocked immediately](docs/security.md).**
 - **Effortlessly scales via cloud storage — no database!**
 - **Supports [cross-region](docs/guides/multi-region.md) and cross-cloud high availability.**
 - **Works with local disk, AWS S3, GCP, and Azure.**
+- **[Web GUI with dashboard, package pages, and search](docs/assets/demo.gif).**
+- **[Vulnerability audit](docs/security.md) ranked by your org's installs.**
+- **[Health checks](docs/concepts/health-metrics.md) and Prometheus metrics built in.**
 - **Comprehensively tested via [fuzzing](dev/TESTING.md#fuzzing), [chaos testing](dev/TESTING.md#chaos-and-crash-consistency), [deterministic simulation](dev/TESTING.md#deterministic-simulation-the-vopr), [model checking](dev/TESTING.md#machine-checked-models-stateright), [real clouds](dev/TESTING.md#real-cloud-backends), [perf](dev/TESTING.md#performance-testing), and [all 17 million files on PyPI](src/corpus_check.rs).**
 
 
@@ -38,28 +41,188 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
 
 ## Feature comparison
 
-| Feature | pypiron | bandersnatch | pypiserver | pypicloud | devpi | proxpi |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: |
-| Easy setup | <abbr title="Single binary, uvx, or Docker; hosts private packages, mirror sync, and proxy from one server.">✅</abbr> | — | <abbr title="Simple private package host over a local directory.">✅</abbr> | — | — | <abbr title="Simple caching proxy; no private uploads.">✅</abbr> |
-| Fast | <abbr title="8,288 verified installs/s on 2 vCPU in the benchmark.">✅</abbr> | <abbr title="77 installs/s as a static nginx-served mirror — NIC-bound on the same box.">✅</abbr> | — | — | — | — |
-| Private package hosting | <abbr title="Publish with twine or uv; admin/uploader/reader credentials plus short-lived install tokens.">✅</abbr> | — | <abbr title="Upload endpoint with htpasswd auth.">✅</abbr> | <abbr title="Upload endpoint with access-control lists.">✅</abbr> | <abbr title="Private indexes with per-index access control.">✅</abbr> | — |
-| Caching PyPI proxy | <abbr title="Caches public packages from PyPI on first install, behind the same URL as your private ones.">✅</abbr> | — | — | <abbr title="Its fallback = cache mode stores and re-serves upstream packages.">✅</abbr> | <abbr title="Caches PyPI through its root/pypi mirror index.">✅</abbr> | <abbr title="A caching PyPI proxy is its core purpose.">✅</abbr> |
-| Sync mirror | <abbr title="Mirrors a chosen subset of upstream: include/exclude by name, wheel tags, format, size, Python floor, and pre-release.">✅</abbr> | <abbr title="A full or filtered PyPI mirror is its core purpose.">✅</abbr> | — | — | — | — |
-| Dependency cooldown | <abbr title="New releases wait 7 days by default, enforced at the server for every client; upload times are preserved for client-side exclude-newer.">✅</abbr> | — | — | — | — | — |
-| Malware blocking | <abbr title="Refuses any file the OSV advisory feed flags as malware — at upload, on proxy fill, and in listings; on by default.">✅</abbr> | — | — | — | — | — |
-| No dependency confusion | <abbr title="A name is yours or PyPI's, never both; a private name never falls through to upstream.">✅</abbr> | — | — | — | <abbr title="Privately uploaded names block upstream mirror lookups by default.">✅</abbr> | — |
-| Vulnerability audit | <abbr title="/audit lists every hosted or proxied package a known advisory affects, ranked by your install counts.">✅</abbr> | — | — | — | — | — |
-| Scalable without database | <abbr title="Multi-node against S3, GCS, or Azure Blob; no database.">✅</abbr> | <abbr title="Static mirror tree served by nginx or object storage; no database.">✅</abbr> | — | — | — | — |
-| Multi-region / multi-cloud failover | <abbr title="One bucket list spanning regions and clouds (S3 + GCS + Azure); every upload lands on all of them before the ack, and reads fail over with zero data loss.">✅</abbr> | — | — | — | <abbr title="Master-to-replica streaming replication; each replica keeps a full copy.">✅</abbr> | — |
-| Human-readable package pages | <abbr title="Dashboard, package search, download pages, project pages, and README rendering.">✅</abbr> | — | — | <abbr title="Has a web UI.">✅</abbr> | <abbr title="Web UI and README rendering via devpi-web.">✅</abbr> | — |
-| Download stats | <abbr title="Built-in global and per-package download counters.">✅</abbr> | — | — | — | — | — |
-| Disk-backed | <abbr title="Default local disk backend.">✅</abbr> | <abbr title="Writes a static mirror tree to disk.">✅</abbr> | <abbr title="Serves packages from local directories.">✅</abbr> | <abbr title="Supports filesystem package storage.">✅</abbr> | <abbr title="Default serverdir storage on local disk.">✅</abbr> | <abbr title="Disk-backed package cache.">✅</abbr> |
-| Cloud-storage-backed | <abbr title="S3, S3-compatible, GCS, and Azure Blob.">✅</abbr> | <abbr title="S3-compatible mirror storage.">✅</abbr> | — | <abbr title="S3, GCS, and Azure Blob package storage.">✅</abbr> | — | — |
+<table>
+  <thead>
+    <tr>
+      <th align="left" colspan="2">Feature</th>
+      <th>pypiron</th>
+      <th>bandersnatch</th>
+      <th>pypiserver</th>
+      <th>pypicloud</th>
+      <th>devpi</th>
+      <th>proxpi</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td colspan="2"><a href="docs/guides/standard-cloud.md">Easy setup</a></td>
+      <td align="center"><abbr title="Single binary, uvx, or Docker; hosts private packages, mirror sync, and proxy from one server.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/compare/index.md">Fast</a></td>
+      <td align="center"><abbr title="8,288 verified installs/s on 2 vCPU in the benchmark.">✅</abbr></td>
+      <td align="center"><abbr title="77 installs/s as a static nginx-served mirror — NIC-bound on the same box.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/concepts/package-sources.md">Private packages</a></td>
+      <td align="center"><abbr title="Publish with twine or uv; admin/uploader/reader credentials plus short-lived install tokens.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/concepts/package-sources.md">PyPI proxy</a></td>
+      <td align="center"><abbr title="Caches public packages from PyPI on first install, behind the same URL as your private ones.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/concepts/package-sources.md">Sync mirror</a></td>
+      <td align="center"><abbr title="Mirrors a chosen subset of upstream: include/exclude by name, wheel tags, format, size, Python floor, and pre-release.">✅</abbr></td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/security.md">Cooldown</a></td>
+      <td align="center"><abbr title="New releases wait 7 days by default, enforced at the server for every client; upload times are preserved for client-side exclude-newer.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/security.md">Malware blocking</a></td>
+      <td align="center"><abbr title="Refuses any file the OSV advisory feed flags as malware — at upload, on proxy fill, and in listings; on by default.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/security.md">No dependency confusion</a></td>
+      <td align="center"><abbr title="A name is yours or PyPI's, never both; a private name never falls through to upstream.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center"><abbr title="Privately uploaded names block upstream mirror lookups by default.">✅</abbr></td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/security.md">Vulnerability audit</a></td>
+      <td align="center"><abbr title="/audit lists every hosted or proxied package a known advisory affects, ranked by your install counts.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/concepts/storage.md">Scales, no database</a></td>
+      <td align="center"><abbr title="Multi-node against S3, GCS, or Azure Blob; no database.">✅</abbr></td>
+      <td align="center"><abbr title="Static mirror tree served by nginx or object storage; no database.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/guides/multi-region.md">Multi-region failover</a></td>
+      <td align="center"><abbr title="One bucket list spanning regions and clouds (S3 + GCS + Azure); every upload lands on all of them before the ack, and reads fail over with zero data loss.">✅</abbr></td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center"><abbr title="Master-to-replica streaming replication; each replica keeps a full copy.">✅</abbr></td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/assets/demo.gif">Web GUI</a></td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td colspan="2"><a href="docs/concepts/download-stats.md">Download stats</a></td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td rowspan="4"><a href="docs/concepts/storage.md">Storage</a></td>
+      <td>Disk</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+      <td align="center">✅</td>
+    </tr>
+    <tr>
+      <td>AWS S3</td>
+      <td align="center"><abbr title="Plus any S3-compatible store (MinIO, R2, Ceph, …).">✅</abbr></td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td>GCS</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+    <tr>
+      <td>Azure Blob</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+      <td align="center">✅</td>
+      <td align="center">—</td>
+      <td align="center">—</td>
+    </tr>
+  </tbody>
+</table>
 
 [Full comparison](https://pypiron.com/compare/)
 
 
-## Testing
+## Security
+
+- **[Known malware never installs](docs/security.md)** — the OSV malware feed is enforced within minutes, and a release cooldown covers the window before an advisory exists.
+- **[Dependency confusion cannot start](docs/security.md)** — a name is yours or PyPI's, never both.
+- **[Only what you've approved installs](docs/concepts/approval-lists.md)** — one approval list controls everything the server will serve.
+- **[Air-gapped deploys](docs/guides/air-gapped.md)** — sync outside, carry it in, serve with no upstream at all.
+- **[Vulnerability audit](docs/security.md)** — every affected package you host or proxy, ranked by your org's installs.
+
+## Gauntlet testing
 
 - **[Client compatibility testing](dev/TESTING.md#client-compatibility-matrix):** uv, pip, poetry, pdm, pipenv, hatch, flit, twine.
 - **Tested against all of PyPI.** The parsers process [all 17 million files ever uploaded to PyPI](src/corpus_check.rs) and match ground truth on each one.
@@ -67,14 +230,21 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
 - **Exhaustive model checker.** A [model checker](dev/TESTING.md#machine-checked-models-stateright) enumerates every interleaving of writers, workers, crashes, and byte conflicts within its bounds, running the same decision functions the server ships.
 - **Continuous deterministic simulation testing.** Deterministic simulation runs a whole multi-node fleet single-threaded on virtual time — on the order of a hundred thousand seeded crash/fault/restart schedules per night, every failure [reproducible from an 8-byte seed](dev/TESTING.md#deterministic-simulation-the-vopr) ([the simulator](examples/vopr.rs)).
 - **Fuzzed nightly.** Coverage-guided fuzzers hammer the parsers.
-- **Passed security audits by LLMs.** Fable 5 ran numerous security audits before it got nerfed. All issues fixed.
+- **Security audited by all frontier models** — the same models that built it. All issues fixed.
+
+[The full gauntlet](docs/testing.md)
 
 ## Going further
 
-- [Setup](docs/guides/setup.md) — private packages, public proxy, sync mirror, S3
+- [Deploying](docs/guides/standard-cloud.md) — a production server from standard cloud parts
+- [Package sources](docs/concepts/package-sources.md) — private hosting, caching proxy, sync mirror, and how they combine
 - [Configuration](docs/reference/configuration.md) — every flag and its `PYPIRON_*` env var
-- [Benchmarks](docs/reference/benchmarks.md) — how the numbers above were measured
+- [Comparison & benchmarks](docs/compare/index.md) — every alternative, and how the numbers were measured
 - [For AI agents](docs/for-agents.md) — a decision guide, written for agents, by an agent
+
+## Contributing — [Humans Need Not Apply](https://www.youtube.com/watch?v=7Pq-S557XQU)
+
+pypiron was built by AI coding agents from Anthropic, OpenAI, SpaceXAI, and Moonshot — and that's how it stays. All development is done by AI coders, for security and consistency: human-developed code is a security risk, and we don't accept it. Humans are welcome to open issues and contribute documentation.
 
 ## License
 

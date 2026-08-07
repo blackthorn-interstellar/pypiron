@@ -2047,7 +2047,11 @@ Half a second for the entire single-fault space of that schedule. The loop is
 in-process — a process per run would cost 190 s for the same sweep — and
 `--seeds`/`--start-seed`/`--forever`/`--max-secs` mean what they mean everywhere
 else, so a timeboxed depth-1 soak is `--rotate --max-secs 120 --sweep-faults`
-(17 rotating schedules, 38,793 runs, measured).
+(17 rotating schedules, 38,793 runs, measured). The flags its own loop *cannot*
+honour are refused rather than swallowed — `--recheck-every`, `--require-reach`,
+`--shrink`, a nonzero `--fail-percent`, and `--break rerun`, whose oracle is the
+determinism recheck the sweep never runs. A `--require-reach` lane copied off
+`simulation.yml` onto a sweep would otherwise be a gate that cannot fail.
 
 `fired` is the honest denominator: a fault cannot be forced onto an op whose node
 is already down, and a sweep that forced nothing verified nothing. Every profile
@@ -2057,7 +2061,11 @@ measured so far reports 100%.
 `--fail-percent` to 0 *and* stops the driver from scheduling crashes, so the
 forced op is the run's only fault and the reported `(seed, k, fate)` is the whole
 counterexample. The baseline runs first and is checked on its own: a schedule
-that reds without any fault is reported as that, not as a sweep finding. Faults
+that reds without any fault is reported as that, not as a sweep finding — and its
+reproduce line ends in `--sweep-faults`, because depth-1-with-nothing-forced has
+no other spelling and a line without it reruns a world where the driver schedules
+its own crashes again (measured on seed 7384: 709 storage-op interleavings
+against 604). Faults
 are confined to the chaos phase — `admit` stops overriding once the heal phase
 starts — because a fault during heal is a fleet that was never given the chance
 to converge, and the convergence oracles would red for the harness's reason

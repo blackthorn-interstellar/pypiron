@@ -5566,14 +5566,26 @@ fn reproduce_command(seed: u64, rotate: bool, profile: &Profile) -> String {
     // A swept run is one op of a schedule nothing else reproduces: the flag
     // carries both the position and the fate, and it implies the depth-1 world
     // (no random failures, no scheduled crashes) that the sweep ran it in.
-    let forced = match profile.forced {
-        Some((at, fate)) => format!(" --force-fault {at}:{}", fate.spelling()),
-        None => String::new(),
+    //
+    // The sweep's own BASELINE run is that same depth-1 world with nothing
+    // forced, and no flag spells it — so the line points back at
+    // `--sweep-faults`, which runs and re-reports that exact baseline before it
+    // forces anything. Omitting it is not cosmetic: without a depth-1 marker
+    // `profile_for` leaves `depth1` false on the rerun, the driver's own
+    // scheduled crashes come back, and the schedule diverges (measured on seed
+    // 7384 at `--nodes 2 --buckets 1 --ops 80`: 709 storage-op interleavings
+    // against 604). A red baseline — the one case this branch exists to
+    // report — would hand the operator a command for a different world, which
+    // comes back green and gets filed as flaky.
+    let depth1 = match (profile.forced, profile.depth1) {
+        (Some((at, fate)), _) => format!(" --force-fault {at}:{}", fate.spelling()),
+        (None, true) => " --sweep-faults".to_string(),
+        (None, false) => String::new(),
     };
     if rotate {
         return format!(
             "cargo run --release --example vopr -- --seed {seed} \
-             --rotate{partition}{staleness}{forced}{brk}"
+             --rotate{partition}{staleness}{depth1}{brk}"
         );
     }
     // The op mix is implicit at `DEFAULT_OP_WEIGHTS` and drawn from the seed
@@ -5591,7 +5603,7 @@ fn reproduce_command(seed: u64, rotate: bool, profile: &Profile) -> String {
     format!(
         "cargo run --release --example vopr -- --seed {seed} --nodes {} --buckets {} \
          --packages {} --files {} --ops {} \
-         --fail-percent {}{partition}{staleness}{weights}{forced}{brk}",
+         --fail-percent {}{partition}{staleness}{weights}{depth1}{brk}",
         profile.nodes,
         profile.buckets,
         profile.packages,
@@ -5639,6 +5651,25 @@ const ROTATE_OVERRIDES: [&str; 7] = [
     "--weights",
 ];
 
+/// Flags `--sweep-faults` cannot honour. The sweep is its own loop and owns the
+/// exit before `main`'s seed loop starts, so nothing here ever reaches a run:
+/// no seed is re-executed, no reach gate is evaluated, no shrink is attempted.
+/// Accepting them silently is the `ROTATE_OVERRIDES` defect in a second place —
+/// a CI lane copied off the seed loop (`simulation.yml` passes `--require-reach`)
+/// would be a gate that cannot fail, and `--shrink` would report nothing to
+/// shrink on a sweep that never populated the failing-seed list.
+///
+/// `--fail-percent` is here only above zero: the sweep zeroes it by design
+/// (a swept op is the run's ONLY fault), so a nonzero rate is a depth-1+n run
+/// the operator would not get — while `--fail-percent 0` is exactly what the
+/// sweep's own baseline reproduce line carries and has to keep parsing.
+const SWEEP_IGNORES: [&str; 4] = [
+    "--recheck-every",
+    "--require-reach",
+    "--shrink",
+    "--fail-percent",
+];
+
 fn parse_args() -> Args {
     parse_args_from(std::env::args().skip(1))
 }
@@ -5671,9 +5702,13 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
     // Collected as they are seen, checked after the whole line parses, so the
     // rejection does not depend on `--rotate` coming first.
     let mut overridden: Vec<&'static str> = Vec::new();
+    let mut swept_away: Vec<&'static str> = Vec::new();
     while let Some(flag) = it.next() {
         if let Some(name) = ROTATE_OVERRIDES.iter().find(|known| **known == flag) {
             overridden.push(name);
+        }
+        if let Some(name) = SWEEP_IGNORES.iter().find(|known| **known == flag) {
+            swept_away.push(name);
         }
         if flag == "--break" {
             let name = it
@@ -5802,6 +5837,25 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         !(args.sweep_faults && args.forced.is_some()),
         "--sweep-faults forces a fault at every op in turn: --force-fault is what you pass \
          to rerun ONE of its results, not something to combine with it."
+    );
+    // `--fail-percent 0` says exactly what the sweep already does, and the
+    // baseline's own reproduce line carries it, so it is not a discarded ask.
+    swept_away.retain(|flag| *flag != "--fail-percent" || args.fail_percent > 0);
+    assert!(
+        !args.sweep_faults || swept_away.is_empty(),
+        "--sweep-faults would discard {} — it runs its own loop and exits before the seed \
+         loop those belong to. Drop them, or drop --sweep-faults. Legal with it: --seed \
+         --seeds --start-seed --forever --max-secs --rotate --break --partition \
+         --staleness-secs and the workload flags.",
+        swept_away.join(" ")
+    );
+    // `--break rerun` plants its defect in the determinism recheck, which only
+    // the seed loop runs — under a sweep it is an armed break that cannot go
+    // red. Refuse the pair rather than print a 0% kill rate for it.
+    assert!(
+        !(args.sweep_faults && args.brk == Break::Rerun),
+        "--break rerun is killed by the determinism recheck, which --sweep-faults does not \
+         run: the pair is a gate that cannot fail. Run it on the seed loop instead."
     );
     // One file is one seed's timeline. A multi-seed run would interleave worlds
     // into one stream, and an unbounded one would never write the file at all.
@@ -6877,6 +6931,84 @@ mod tests {
     #[should_panic(expected = "--force-fault is what you pass")]
     fn a_sweep_refuses_a_hand_picked_fault_beside_it() {
         parse_args_from(argv(&["--sweep-faults", "--force-fault", "3:fail"]));
+    }
+
+    /// The sweep's BASELINE is the depth-1 world with nothing forced. Nothing
+    /// else spells that, so the line has to name the sweep — and pasted back it
+    /// has to resolve to the same world, or a red baseline reruns green.
+    #[test]
+    fn the_sweep_baseline_reproduces_as_a_sweep() {
+        let args = parse_args_from(argv(&[
+            "--seed",
+            "7384",
+            "--nodes",
+            "2",
+            "--buckets",
+            "1",
+            "--ops",
+            "80",
+            "--sweep-faults",
+        ]));
+        let mut profile = profile_for(7384, &args);
+        profile.forced = None; // what `sweep_faults` runs the baseline with
+        let line = reproduce_command(7384, false, &profile);
+        assert!(line.ends_with("--sweep-faults"), "{line}");
+        // And it round-trips: the pasted line resolves to the same depth-1
+        // world, which is the whole point of printing it.
+        let pasted = parse_args_from(
+            line.split_whitespace()
+                .skip_while(|word| *word != "--seed")
+                .map(str::to_string),
+        );
+        let reparsed = profile_for(7384, &pasted);
+        assert!(reparsed.depth1 && reparsed.forced.is_none() && reparsed.fail_percent == 0);
+        // Under rotation the workload comes from the seed, so the marker is all
+        // the line can carry.
+        let mut rotating = a_profile(Break::None);
+        rotating.depth1 = true;
+        rotating.forced = None;
+        assert!(
+            reproduce_command(7384, true, &rotating).ends_with("--rotate --sweep-faults"),
+            "{}",
+            reproduce_command(7384, true, &rotating)
+        );
+        // An ordinary run is untouched.
+        assert!(!reproduce_command(7384, false, &a_profile(Break::None)).contains("--sweep"));
+    }
+
+    /// Flags the sweep's own loop cannot honour are refused, not swallowed. All
+    /// four used to parse fine and do nothing: a `--require-reach` lane copied
+    /// off `simulation.yml` onto a sweep exited 0 without evaluating the gate.
+    /// Flags on both sides of `--sweep-faults` — the verdict is order-independent.
+    #[test]
+    #[should_panic(
+        expected = "would discard --recheck-every --require-reach --shrink --fail-percent"
+    )]
+    fn a_sweep_refuses_the_flags_its_own_loop_cannot_honour() {
+        parse_args_from(argv(&[
+            "--recheck-every",
+            "1",
+            "--sweep-faults",
+            "--require-reach",
+            "--shrink",
+            "--fail-percent",
+            "3",
+        ]));
+    }
+
+    /// `--fail-percent 0` says what the sweep already does, and the sweep's own
+    /// baseline reproduce line carries it — refusing that would make the line it
+    /// prints unpasteable.
+    #[test]
+    fn a_sweep_accepts_the_zero_failure_rate_its_own_repro_line_carries() {
+        let args = parse_args_from(argv(&["--sweep-faults", "--fail-percent", "0"]));
+        assert_eq!(profile_for(1, &args).fail_percent, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "a gate that cannot fail")]
+    fn a_sweep_refuses_the_one_break_it_cannot_kill() {
+        parse_args_from(argv(&["--sweep-faults", "--break", "rerun"]));
     }
 
     /// The trap the sweep is built on. `fail_percent == 0` used to mean

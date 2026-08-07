@@ -4,9 +4,9 @@ description: "Run pypiron in production on S3, GCS, or Azure: one config file, t
 
 # Deploy on cloud storage
 
-Private packages and cached public PyPI from one URL, on one config file and
-one bucket. A node carries no state — the bucket holds the packages — so you
-add or replace nodes freely.
+Serve your private packages and a cached PyPI from one URL. The whole
+deployment is a config file and a bucket; a node carries no state — the
+bucket holds the packages — so you add or replace nodes freely.
 
 ## The config
 
@@ -22,27 +22,29 @@ proxy-upstream = "https://pypi.org"
 exclude-newer = "7 days"
 ```
 
-`private-prefix` reserves a namespace: new private names must match `acme` or
-`acme-*`, and names already claimed are untouched — adopting a prefix later
-never renames anything. `proxy-upstream` serves public packages on demand: a
-cache miss comes from PyPI once, then stays local. `exclude-newer` is the
-dependency cooldown: fresh upstream releases wait a week, on by default — your
-own uploads are never delayed.
+`private-prefix` claims `acme` and `acme-*` for you: those names are never
+fetched from upstream, and adopting the prefix on an existing install renames
+nothing. `proxy-upstream` turns on the public cache: the first request for a
+public package fetches it from PyPI and writes it to the bucket, so every
+node serves it from then on. `exclude-newer` is the dependency cooldown — it
+covers everything fetched from upstream, proxied installs and `sync` alike,
+and never your own uploads. It's on by default at 7 days; the config line
+just makes the window easy to change (`""` disables it).
 To pre-load an approved list instead of proxying, see
 [air-gapped sync](../concepts.md#air-gapped-sync-ahead-of-time).
 
-Point `buckets` at an existing bucket. On AWS there's usually nothing else to
-set: credentials come from the standard chain — environment, web identity,
-instance role, or task role. GCS (`gs://`) and Azure (`az://`) work the same
-way, with their own credentials: [Storage](../concepts.md#where-packages-live).
-The node reads, writes, lists, and deletes objects and uses multipart uploads
-for large files — on AWS that's `s3:GetObject`, `s3:PutObject`,
-`s3:DeleteObject`, `s3:ListBucket`, and `s3:AbortMultipartUpload` on the
-bucket.
+Point `buckets` at an existing bucket. On AWS there's nothing else to set
+unless you use a named profile or an S3-compatible endpoint: credentials come
+from the standard chain — environment, web identity, instance role, or task
+role. GCS (`gs://`) and Azure (`az://`) work the same way, with their own
+credentials: [Storage](../concepts.md#where-packages-live). Bucket policy:
+`s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`, and
+`s3:AbortMultipartUpload`. That's the whole set.
 
 ## Run it
 
-`PYPIRON_ADMIN_PASS` enables publishing.
+`PYPIRON_ADMIN_PASS` enables publishing; without it the server runs
+read-only — installs work, uploads are refused.
 
 ### Docker Compose
 
@@ -80,13 +82,14 @@ WantedBy=multi-user.target
 ```
 
 Put `PYPIRON_ADMIN_PASS=...` in `/etc/pypiron/env`, mode 600 — unit files are
-world-readable. `DynamicUser` runs the server without a fixed account.
+world-readable.
 
 ## More nodes
 
-Run more containers with the same config behind a load balancer. Nodes
-coordinate through the bucket itself; concurrent publishes and cache fills
-converge without a coordinator ([how that's tested](../testing.md)).
+Run more containers with the same config behind a load balancer. Nothing
+extra to run: nodes settle concurrent work through the bucket — a second
+upload of the same filename gets a clean 409, never a silent drop, and no
+client reads a partial file ([how that's tested](../testing.md)).
 
 Point the load balancer's health check at `/ready`: it turns 503 when a node
 starts draining or can't reach storage, so traffic leaves it before requests
@@ -111,17 +114,20 @@ uv add --default-index http://HOST:8080/simple/ requests acme-widgets
 pip works the same: `pip install --index-url http://HOST:8080/simple/
 acme-widgets` (plain-http hosts need pip's `--trusted-host HOST`). The admin
 password is for bootstrap; day to day, publish with an uploader credential and
-hand CI five-minute install tokens instead of secrets:
+hand CI a five-minute install token instead of a long-lived password:
 [Who can do what](../concepts.md#who-can-do-what).
 
-With the proxy on, do not point clients at PyPI as an extra index. pypiron
-serves both and keeps private names private.
+With the proxy on, do not add PyPI as an extra index: with two indexes, a
+public package published under one of your names can win the resolve —
+dependency confusion. pypiron already serves both, so there is nothing to
+add.
 
 ## Behind a corporate proxy
 
 If the server only reaches the internet through a corporate forward proxy, set
-the standard `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` environment variables — the
-proxy upstream, `sync`, and the advisory feed all honor them. If that proxy
+the standard `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` environment variables —
+everything the server fetches from the internet honors them: proxied
+packages, `sync`, and the [security advisory feed](../security.md). If that proxy
 intercepts TLS with a private CA, add `--upstream-ca-cert /path/to/corp-ca.pem`
 so it validates without turning verification off. Details:
 [Behind a forward proxy](../reference/configuration.md#behind-a-forward-proxy-or-tls-interception).
@@ -129,6 +135,7 @@ so it validates without turning verification off. Details:
 ## Survive a region outage
 
 One bucket rides out any node dying. To survive losing the bucket's region —
-or a whole cloud — give every node the same ordered list of buckets and
-pypiron keeps them in sync and fails over on its own:
+or a whole cloud — give every node the same bucket list in the same order:
+the first is where writes land, the rest replicate, and pypiron fails over
+automatically:
 [Survive a region or cloud outage](multi-region.md).

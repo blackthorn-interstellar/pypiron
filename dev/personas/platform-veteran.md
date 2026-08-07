@@ -36,6 +36,13 @@ patterns that always trip the test:
 - **The product's chair, not yours.** Sentences organized around what the
   software does internally ("packages reach", "the server ingests") rather
   than what you get or decide. You restate; the leftover words are the tell.
+- **The residue test.** Meaning surviving is not the sentence passing. After
+  each restatement, look at what your words refused to carry: a preposition
+  you had to repair to sound like a person, a drumbeat of stacked counts you
+  flattened into plain facts, a rhythm that exists to sell. Whatever your
+  restatement silently fixed IS a margin note — quote the original and name
+  the repair. One natural count is a fact; a stack of them is the product
+  reciting its own minimalism.
 
 ## Mistrusts
 Nothing reflexively — you verify claims later. Your allergy is to *prose*,

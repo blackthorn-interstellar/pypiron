@@ -2176,6 +2176,21 @@ enum OpFate {
     Crash,
 }
 
+impl OpFate {
+    /// The `--force-fault` spelling, and what a sweep prints. `Ok` is the
+    /// absence of a fault, so it is not a forceable fate.
+    fn spelling(self) -> &'static str {
+        match self {
+            OpFate::Ok => "ok",
+            OpFate::Fail => "fail",
+            OpFate::Crash => "crash",
+        }
+    }
+}
+
+/// The two fates a depth-1 sweep forces, in the order it sweeps them.
+const SWEPT_FATES: [OpFate; 2] = [OpFate::Fail, OpFate::Crash];
+
 /// Seed-derived fault schedule plus the shared trace. One per run.
 struct FaultPlan {
     /// Per-op randomness, pre-derived from the seed so fate depends only on
@@ -2188,6 +2203,19 @@ struct FaultPlan {
     crashed: Vec<AtomicBool>,
     /// While true, no faults fire (the heal/drain phase).
     healing: AtomicBool,
+    /// `--sweep-faults`/`--force-fault`: the one op-sequence number whose fate
+    /// this run overrides, and what to override it to. `None` in every ordinary
+    /// run — and the check costs one `Option` test on the normal path, drawing
+    /// nothing, so no pinned seed moves.
+    forced: Option<(u64, OpFate)>,
+    /// Whether that override actually fired. It cannot when the issuing node is
+    /// already down or the heal phase has begun, and a sweep that forced
+    /// nothing verified nothing.
+    forced_fired: AtomicBool,
+    /// `op_seq` when the heal phase began: the number of ops a fault can be
+    /// forced at, since `admit` stops overriding once `healing` is set.
+    /// `u64::MAX` until `heal`.
+    heal_seq: AtomicU64,
     rng_stream: Mutex<Rng>,
     trace: Mutex<TraceHasher>,
     /// Effect history for the audit-repair classifier. Pure observation.
@@ -2480,6 +2508,7 @@ impl FaultPlan {
         seed: u64,
         nodes: usize,
         fail_percent: u64,
+        forced: Option<(u64, OpFate)>,
         brk: Break,
         viz: Option<Arc<Trace>>,
     ) -> Arc<Self> {
@@ -2489,6 +2518,9 @@ impl FaultPlan {
             crash_at: Mutex::new(BTreeMap::new()),
             crashed: (0..nodes).map(|_| AtomicBool::new(false)).collect(),
             healing: AtomicBool::new(false),
+            forced,
+            forced_fired: AtomicBool::new(false),
+            heal_seq: AtomicU64::new(u64::MAX),
             rng_stream: Mutex::new(Rng::new(seed ^ 0xFA_11_7E_57)),
             trace: Mutex::new(TraceHasher {
                 hash: 0xcbf29ce484222325,
@@ -2502,7 +2534,16 @@ impl FaultPlan {
     }
 
     fn heal(&self) {
+        self.heal_seq
+            .store(self.op_seq.load(Ordering::SeqCst), Ordering::SeqCst);
         self.healing.store(true, Ordering::SeqCst);
+    }
+
+    /// How many ops ran before the heal phase — the sweepable range.
+    fn chaos_ops(&self) -> u64 {
+        self.heal_seq
+            .load(Ordering::SeqCst)
+            .min(self.op_seq.load(Ordering::SeqCst))
     }
 
     fn schedule_crash_soon(&self, node: usize, within_ops: u64) {
@@ -2585,6 +2626,22 @@ impl FaultPlan {
             let mut rng = self.rng_stream.lock().expect("rng lock");
             rng.chance(self.fail_percent)
         };
+        // Depth-1 sweep: this one op's fate is overridden. The draw above still
+        // happened — `chance` consumes entropy even at 0% — so every op before
+        // this one is bit-identical to the sweep's clean baseline, which is what
+        // makes "op k" name the same op across all of a seed's swept runs.
+        // Deliberately below the crashed/healing/crash_at arms: a dead node
+        // stays dead, and the heal phase stays fault-free so the convergence
+        // oracles still mean something.
+        if let Some((at, fate)) = self.forced {
+            if seq == at {
+                self.forced_fired.store(true, Ordering::SeqCst);
+                if matches!(fate, OpFate::Crash) {
+                    self.crashed[node].store(true, Ordering::SeqCst);
+                }
+                return (fate, delay, seq);
+            }
+        }
         if fail {
             (OpFate::Fail, delay, seq)
         } else {
@@ -3051,11 +3108,12 @@ impl Fleet {
         nodes: usize,
         bucket_count: usize,
         fail_percent: u64,
+        forced: Option<(u64, OpFate)>,
         brk: Break,
         clock: Arc<SimClock>,
         viz: Option<Arc<Trace>>,
     ) -> Fleet {
-        let plan = FaultPlan::new(seed, nodes, fail_percent, brk, viz);
+        let plan = FaultPlan::new(seed, nodes, fail_percent, forced, brk, viz);
         let buckets: Vec<Arc<SimStorage>> = (0..bucket_count)
             .map(|_| SimStorage::new(clock.clone()))
             .collect();
@@ -3453,6 +3511,13 @@ async fn op_reconcile(state: Arc<AppState>) {
 // ---------------------------------------------------------------------------
 
 struct RunOutcome {
+    /// Storage ops the chaos phase issued — the range `--sweep-faults` walks,
+    /// since `admit` forces nothing once the heal phase starts.
+    chaos_ops: u64,
+    /// Whether a `--force-fault` override actually fired. It cannot when the
+    /// issuing node was already down, and a run that forced nothing is a run
+    /// that verified nothing new.
+    forced_fired: bool,
     trace_hash: u64,
     trace_events: u64,
     /// Fingerprint of the final world (bucket bytes + ledger) — see [`state_hash`].
@@ -3521,6 +3586,23 @@ fn emit_meta(viz: &Arc<Trace>, seed: u64, profile: &Profile, part: &Partition) {
     );
 }
 
+/// Could a storage op in this run have returned an availability error?
+///
+/// Two oracles hold a crash-only world to a stricter contract — an ack-totality
+/// miss is a hard violation, and any audit view repair is one. Both used to read
+/// "crash-only" off `fail_percent == 0`, which stopped being the same question
+/// the moment `--sweep-faults` arrived: a swept run has `fail_percent == 0` and
+/// still injects one failure when the forced fate is `Fail`, so the percent
+/// alone would report the sweep's own injected failure as a bug on every
+/// forced-`Fail` run.
+///
+/// A forced `Crash` relaxes nothing. Crashes are exactly what the crash-only
+/// contract contemplates, so the crash lane keeps the strict gate — which is
+/// what makes it the more valuable half of the sweep.
+fn availability_faults(fail_percent: u64, forced: Option<(u64, OpFate)>) -> bool {
+    fail_percent > 0 || matches!(forced, Some((_, OpFate::Fail)))
+}
+
 async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trace>>) -> RunOutcome {
     let Profile {
         nodes,
@@ -3533,7 +3615,10 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         brk,
         partition_percent,
         staleness_secs,
+        depth1,
+        forced,
     } = profile;
+    let availability_faults = availability_faults(fail_percent, forced);
     let plan = partition_for(seed, nodes, buckets, partition_percent);
     if plan.split {
         REACH.partitioned.store(true, Ordering::Relaxed);
@@ -3553,6 +3638,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         nodes,
         buckets,
         fail_percent,
+        forced,
         brk,
         clock.clone(),
         viz.clone(),
@@ -3653,12 +3739,18 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                 advance_clock(&clock, 90, "jump", &viz);
             }
             6 => {
-                fleet.plan.schedule_crash_soon(node, 12);
-                // Give the doomed node's in-flight work a chance to hit the
-                // crash point before the driver aborts it.
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                if fleet.plan.node_crashed(node) {
-                    fleet.crash_node(node);
+                // Depth-1: the forced op is the run's only fault, so the driver
+                // schedules none of its own. A forced `Crash` still kills a node
+                // and the loop head still restarts it, so the crash dynamics the
+                // oracles need are intact — they are just attributable now.
+                if !depth1 {
+                    fleet.plan.schedule_crash_soon(node, 12);
+                    // Give the doomed node's in-flight work a chance to hit the
+                    // crash point before the driver aborts it.
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    if fleet.plan.node_crashed(node) {
+                        fleet.crash_node(node);
+                    }
                 }
             }
             _ => {
@@ -4014,7 +4106,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                     .collect()
             };
             let changed: Vec<String> = (0..fleet.buckets.len()).flat_map(&bucket_dump).collect();
-            if fail_percent == 0 {
+            if !availability_faults {
                 // Crash-only: keep the blanket AUDIT_REPAIRED_VIEWS gate exactly
                 // as strict as before; append the findings for diagnosability.
                 let findings_desc: Vec<String> = findings
@@ -4647,12 +4739,14 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
     // so a totality miss is a hard violation. Under injected storage failures a
     // note write can itself fail, so there it is a reported statistic — the same
     // split the audit-repair taxonomy uses.
-    if fail_percent == 0 {
+    if !availability_faults {
         violations.extend(ledger.ack_totality.iter().cloned());
     }
 
     let (trace_hash, trace_events) = fleet.plan.trace_hash();
     RunOutcome {
+        chaos_ops: fleet.plan.chaos_ops(),
+        forced_fired: fleet.plan.forced_fired.load(Ordering::SeqCst),
         trace_hash,
         trace_events,
         state_hash: state_hash(&dumps, &ledger),
@@ -5312,6 +5406,17 @@ struct Args {
     /// moves no schedule — but it moves the verdict, so a non-default value is
     /// part of the reproduce command.
     staleness_secs: u64,
+    /// `--sweep-faults`: exhaustive fault depth 1. Hold the schedule fixed and
+    /// force every one of its chaos-phase storage ops, one at a time, to fail
+    /// and then to crash the node that issued it — every other op clean. Random
+    /// injection is a 3%-per-op coin flip compounded over the whole schedule, so
+    /// the single-fault position that actually breaks something is a lottery
+    /// (one recent bug cost ~60M soak seeds). This buys the whole depth-1 space
+    /// of one schedule for a couple of seconds.
+    sweep_faults: bool,
+    /// `--force-fault <op>:<fail|crash>`: one run of what the sweep does, so a
+    /// violation it reports has a repro line that is a single simulation.
+    forced: Option<(u64, OpFate)>,
 }
 
 #[derive(Clone, Copy)]
@@ -5334,6 +5439,16 @@ struct Profile {
     partition_percent: u64,
     /// Healthy-operation base of the STALENESS deadline (`--staleness-secs`).
     staleness_secs: u64,
+    /// Depth-1 mode (`--sweep-faults`/`--force-fault`): the only fault in this
+    /// run is `forced`, so random failures are off (`fail_percent` is zeroed)
+    /// and the driver schedules no crashes of its own. Without that, a
+    /// violation the sweep reports is "some crash schedule plus one forced
+    /// op", which is not a depth-1 counterexample and not what the repro line
+    /// would claim.
+    depth1: bool,
+    /// The single op-sequence number whose fate this run forces, and to what.
+    /// `None` under `depth1` is the sweep's clean baseline.
+    forced: Option<(u64, OpFate)>,
 }
 
 impl Profile {
@@ -5345,9 +5460,15 @@ impl Profile {
             .zip(self.weights)
             .map(|(label, weight)| format!("{label} {weight}"))
             .collect();
+        // Absent unless a fault is forced, so every existing line reads exactly
+        // as it always did.
+        let forced = match self.forced {
+            Some((at, fate)) => format!(" forced={at}:{}", fate.spelling()),
+            None => String::new(),
+        };
         format!(
             "nodes={} buckets={} packages={} files={} ops={} fail-percent={} partition={} \
-             weights=[{}]",
+             weights=[{}]{forced}",
             self.nodes,
             self.buckets,
             self.packages,
@@ -5360,7 +5481,22 @@ impl Profile {
     }
 }
 
+/// The profile this seed runs, with depth-1 mode applied last: a run that
+/// forces one fault admits no others, whatever the flags or the rotation drew.
+/// Zeroing `fail_percent` here rather than at the flag is what lets
+/// `--rotate --force-fault k:crash` reproduce a swept run exactly — `--rotate`
+/// rejects `--fail-percent`, so the repro line has no other way to say it.
 fn profile_for(seed: u64, args: &Args) -> Profile {
+    let mut profile = workload_for(seed, args);
+    if args.sweep_faults || args.forced.is_some() {
+        profile.depth1 = true;
+        profile.fail_percent = 0;
+        profile.forced = args.forced;
+    }
+    profile
+}
+
+fn workload_for(seed: u64, args: &Args) -> Profile {
     if !args.rotate {
         return Profile {
             nodes: args.nodes,
@@ -5373,6 +5509,8 @@ fn profile_for(seed: u64, args: &Args) -> Profile {
             brk: args.brk,
             partition_percent: args.partition_percent,
             staleness_secs: args.staleness_secs,
+            depth1: false,
+            forced: None,
         };
     }
     let mut rng = Rng::new(seed ^ 0x0507_A7E5);
@@ -5401,6 +5539,8 @@ fn profile_for(seed: u64, args: &Args) -> Profile {
         // measured on. `--rotate --partition N` is the partitioned soak.
         partition_percent: args.partition_percent,
         staleness_secs: args.staleness_secs,
+        depth1: false,
+        forced: None,
     }
 }
 
@@ -5430,9 +5570,17 @@ fn reproduce_command(seed: u64, rotate: bool, profile: &Profile) -> String {
     } else {
         format!(" --staleness-secs {}", profile.staleness_secs)
     };
+    // A swept run is one op of a schedule nothing else reproduces: the flag
+    // carries both the position and the fate, and it implies the depth-1 world
+    // (no random failures, no scheduled crashes) that the sweep ran it in.
+    let forced = match profile.forced {
+        Some((at, fate)) => format!(" --force-fault {at}:{}", fate.spelling()),
+        None => String::new(),
+    };
     if rotate {
         return format!(
-            "cargo run --release --example vopr -- --seed {seed} --rotate{partition}{staleness}{brk}"
+            "cargo run --release --example vopr -- --seed {seed} \
+             --rotate{partition}{staleness}{forced}{brk}"
         );
     }
     // The op mix is implicit at `DEFAULT_OP_WEIGHTS` and drawn from the seed
@@ -5449,7 +5597,8 @@ fn reproduce_command(seed: u64, rotate: bool, profile: &Profile) -> String {
     };
     format!(
         "cargo run --release --example vopr -- --seed {seed} --nodes {} --buckets {} \
-         --packages {} --files {} --ops {} --fail-percent {}{partition}{staleness}{weights}{brk}",
+         --packages {} --files {} --ops {} \
+         --fail-percent {}{partition}{staleness}{weights}{forced}{brk}",
         profile.nodes,
         profile.buckets,
         profile.packages,
@@ -5522,6 +5671,8 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         weights: DEFAULT_OP_WEIGHTS,
         shrink: false,
         staleness_secs: STALENESS_HEALTHY_SECS,
+        sweep_faults: false,
+        forced: None,
     };
     let mut it = argv;
     // Collected as they are seen, checked after the whole line parses, so the
@@ -5544,6 +5695,27 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
                 it.next()
                     .unwrap_or_else(|| panic!("missing value for --trace-jsonl")),
             );
+            continue;
+        }
+        // `<op-sequence>:<fate>`, one string rather than a pair of flags: the
+        // two halves are meaningless apart, and a repro line that can drop one
+        // of them reruns a different world.
+        if flag == "--force-fault" {
+            let raw = it
+                .next()
+                .unwrap_or_else(|| panic!("missing value for --force-fault"));
+            let (at, fate) = raw
+                .split_once(':')
+                .unwrap_or_else(|| panic!("--force-fault takes <op>:<fail|crash>, got {raw}"));
+            let at = at
+                .parse::<u64>()
+                .unwrap_or_else(|e| panic!("bad op sequence in --force-fault: {e}"));
+            let fate = match fate {
+                "fail" => OpFate::Fail,
+                "crash" => OpFate::Crash,
+                other => panic!("--force-fault fate is fail or crash, got {other}"),
+            };
+            args.forced = Some((at, fate));
             continue;
         }
         if flag == "--weights" {
@@ -5616,6 +5788,7 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
             "--rotate" => args.rotate = true,
             "--require-reach" => args.require_reach = true,
             "--shrink" => args.shrink = true,
+            "--sweep-faults" => args.sweep_faults = true,
             "--staleness-secs" => args.staleness_secs = grab(),
             "--verbose" => {}
             other => panic!("unknown flag {other} (see examples/vopr.rs)"),
@@ -5626,15 +5799,25 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         "--rotate derives the whole workload from the seed, so {} would be discarded — \
          drop them, or drop --rotate. Legal with --rotate: --seed --seeds --start-seed \
          --recheck-every --forever --max-secs --break --require-reach --partition --shrink \
-         --staleness-secs.",
+         --staleness-secs --sweep-faults --force-fault.",
         overridden.join(" ")
+    );
+    // The sweep already forces the fault at every position; a hand-picked one
+    // beside it would silently win or silently lose, and either way the operator
+    // does not get the run they asked for.
+    assert!(
+        !(args.sweep_faults && args.forced.is_some()),
+        "--sweep-faults forces a fault at every op in turn: --force-fault is what you pass \
+         to rerun ONE of its results, not something to combine with it."
     );
     // One file is one seed's timeline. A multi-seed run would interleave worlds
     // into one stream, and an unbounded one would never write the file at all.
     assert!(
-        args.trace_jsonl.is_none() || (args.seeds == 1 && !args.forever && args.max_secs.is_none()),
+        args.trace_jsonl.is_none()
+            || (args.seeds == 1 && !args.forever && args.max_secs.is_none() && !args.sweep_faults),
         "--trace-jsonl records ONE seed: pass --seed N (or --seeds 1), and not \
-         --forever/--max-secs."
+         --forever/--max-secs/--sweep-faults. To trace a swept run, rerun it with the \
+         --force-fault line the sweep printed."
     );
     args
 }
@@ -5653,6 +5836,94 @@ fn run_once(seed: u64, profile: &Profile, rerun: bool, viz: Option<Arc<Trace>>) 
         .expect("build paused runtime");
     let local = tokio::task::LocalSet::new();
     runtime.block_on(local.run_until(run_seed(seed, *profile, rerun, viz)))
+}
+
+/// One violating swept run, printed the way a failing seed is: what broke, and
+/// the single command that reruns exactly it.
+fn report_sweep(seed: u64, rotate: bool, profile: &Profile, violations: &[String]) {
+    match profile.forced {
+        Some((at, fate)) => eprintln!(
+            "vopr: SWEEP seed {seed} op {at} fate {} FAILED ({} violations):",
+            fate.spelling(),
+            violations.len()
+        ),
+        // The clean baseline is red on its own, so nothing the sweep goes on to
+        // find would be attributable to a forced fault.
+        None => eprintln!(
+            "vopr: SWEEP seed {seed} baseline FAILED with no fault forced ({} violations) — \
+             fix this schedule before reading anything into the sweep:",
+            violations.len()
+        ),
+    }
+    for violation in violations {
+        eprintln!("  {violation}");
+    }
+    eprintln!("reproduce: {}", reproduce_command(seed, rotate, profile));
+    eprintln!("profile: {}", profile.describe());
+}
+
+/// `--sweep-faults`: exhaustive fault depth 1 over a fixed schedule.
+///
+/// Run the schedule once clean to learn how many storage ops its chaos phase
+/// issues, then run it once more per (op, fate) pair, forcing that one op to
+/// that fate and leaving every other op alone. Every oracle runs on every such
+/// run. Random injection reaches the same states only by lottery — a 3% coin
+/// flip per op, compounded — and the two most recent depth-1 bugs cost ~16M and
+/// ~60M soak seeds to hit. Here the whole space is a couple of seconds.
+///
+/// Stops at the first counterexample, like every non-census run: one is enough,
+/// and the rest of the sweep only delays the report.
+fn sweep_faults(args: &Args, started: std::time::Instant) -> i32 {
+    let mut total_runs: u64 = 0;
+    let mut total_swept: u64 = 0;
+    let mut seeds_done: u64 = 0;
+    for offset in 0..args.seeds {
+        let seed = args.start_seed + offset;
+        let mut profile = profile_for(seed, args);
+        profile.forced = None;
+        let seed_started = std::time::Instant::now();
+        let baseline = run_once(seed, &profile, false, None);
+        total_runs += 1;
+        if !baseline.violations.is_empty() {
+            report_sweep(seed, args.rotate, &profile, &baseline.violations);
+            return 2;
+        }
+        let ops = baseline.chaos_ops;
+        let mut fired: u64 = 0;
+        for fate in SWEPT_FATES {
+            for at in 0..ops {
+                profile.forced = Some((at, fate));
+                let outcome = run_once(seed, &profile, false, None);
+                total_runs += 1;
+                if outcome.forced_fired {
+                    fired += 1;
+                }
+                if !outcome.violations.is_empty() {
+                    report_sweep(seed, args.rotate, &profile, &outcome.violations);
+                    return 2;
+                }
+            }
+        }
+        total_swept += ops;
+        seeds_done += 1;
+        // A sweep whose faults mostly did not fire covered mostly nothing: the
+        // op's node was already down at that point. Print the ratio rather than
+        // the run count alone, so a schedule that cannot be perturbed says so.
+        println!(
+            "vopr: sweep seed {seed} — {ops} chaos ops x {} fates, {} runs, {fired}/{} forced \
+             faults fired, no violations, {:?}",
+            SWEPT_FATES.len(),
+            ops * SWEPT_FATES.len() as u64 + 1,
+            ops * SWEPT_FATES.len() as u64,
+            seed_started.elapsed()
+        );
+    }
+    println!(
+        "vopr: {seeds_done} seeds swept at fault depth 1, {total_swept} ops swept, \
+         {total_runs} runs, 0 violations, in {:?} — every single-fault position held",
+        started.elapsed()
+    );
+    0
 }
 
 /// The 23 reach counters, as a relaxed-atomic snapshot. Diffed around one
@@ -5930,6 +6201,12 @@ fn main() {
         .as_ref()
         .map(|path| Trace::new(path.clone()));
     let started = std::time::Instant::now();
+    // Its own mode: hundreds of runs of ONE schedule, so the seed loop below —
+    // and the process-wide reach and merge meters it reports — would describe a
+    // sample nobody drew. Like `--shrink`, it owns the exit.
+    if args.sweep_faults {
+        std::process::exit(sweep_faults(&args, started));
+    }
     let keep_going = args.forever || args.max_secs.is_some();
     // A `--break` run is a MEASUREMENT, not a search: it finishes its whole draw
     // so the kill rate it prints at the end is a number this run produced.
@@ -6400,6 +6677,8 @@ mod tests {
             brk,
             partition_percent: 0,
             staleness_secs: STALENESS_HEALTHY_SECS,
+            depth1: false,
+            forced: None,
         }
     }
 
@@ -6525,6 +6804,81 @@ mod tests {
     #[should_panic(expected = "at least one op class above zero")]
     fn an_op_mix_of_all_zeros_is_refused() {
         parse_args_from(argv(&["--weights", "0,0,0,0,0,0,0,0"]));
+    }
+
+    /// The sweep prints this line under a violation; pasted back it has to be
+    /// the same single simulation — the forced op, its fate, and the depth-1
+    /// world (no random failures) the sweep ran it in.
+    #[test]
+    fn a_forced_fault_round_trips_through_its_flag() {
+        let args = parse_args_from(argv(&[
+            "--seed",
+            "7384",
+            "--nodes",
+            "2",
+            "--buckets",
+            "1",
+            "--ops",
+            "80",
+            "--fail-percent",
+            "3",
+            "--force-fault",
+            "137:crash",
+        ]));
+        assert!(matches!(args.forced, Some((137, OpFate::Crash))));
+        let profile = profile_for(7384, &args);
+        assert!(profile.depth1, "a forced fault is the run's only fault");
+        assert_eq!(
+            profile.fail_percent, 0,
+            "--fail-percent 3 beside a forced fault would make the run depth 1+n"
+        );
+        let line = reproduce_command(7384, false, &profile);
+        assert!(line.ends_with("--force-fault 137:crash"), "{line}");
+        assert!(line.contains("--fail-percent 0"), "{line}");
+    }
+
+    /// Under `--rotate` the workload comes from the seed and `--fail-percent` is
+    /// refused, so the forced fault is the only thing the line can carry — and
+    /// it has to imply the zeroed failure rate on its own, or the rerun is a
+    /// different world.
+    #[test]
+    fn a_forced_fault_reproduces_under_rotation_too() {
+        let args = parse_args_from(argv(&[
+            "--rotate",
+            "--seed",
+            "13792606396100784374",
+            "--force-fault",
+            "12:fail",
+        ]));
+        let profile = profile_for(13_792_606_396_100_784_374, &args);
+        assert_eq!(profile.fail_percent, 0);
+        assert!(reproduce_command(13_792_606_396_100_784_374, true, &profile)
+            .ends_with("--rotate --force-fault 12:fail"));
+    }
+
+    #[test]
+    #[should_panic(expected = "--force-fault is what you pass")]
+    fn a_sweep_refuses_a_hand_picked_fault_beside_it() {
+        parse_args_from(argv(&["--sweep-faults", "--force-fault", "3:fail"]));
+    }
+
+    /// The trap the sweep is built on. `fail_percent == 0` used to mean
+    /// "crash-only", and two oracles tighten on it; a swept run is at zero
+    /// percent and still injects one failure. Key them on the percent and every
+    /// forced-`Fail` run reports the sweep's own fault as a bug — the whole tool
+    /// becomes noise. The crash lane must NOT relax: that is the strict half.
+    #[test]
+    fn a_forced_failure_relaxes_the_crash_only_oracles_and_a_forced_crash_does_not() {
+        assert!(!availability_faults(0, None), "crash-only, as before");
+        assert!(availability_faults(3, None), "injected failures, as before");
+        assert!(
+            availability_faults(0, Some((7, OpFate::Fail))),
+            "a swept Fail IS an injected storage failure, whatever the percent says"
+        );
+        assert!(
+            !availability_faults(0, Some((7, OpFate::Crash))),
+            "a swept Crash is crash-only: the strict contract stands"
+        );
     }
 
     #[test]
@@ -6684,7 +7038,7 @@ mod tests {
             inner: SimStorage::new(SimClock::new(start)),
             node: 0,
             bucket: 0,
-            plan: FaultPlan::new(0, 1, 0, Break::None, None),
+            plan: FaultPlan::new(0, 1, 0, None, Break::None, None),
         };
         assert!(view.supports_leases(), "the claim under test");
 

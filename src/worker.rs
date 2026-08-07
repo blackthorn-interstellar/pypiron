@@ -2656,7 +2656,7 @@ async fn update_global_index_locked(
                 // therefore never draws — this still reads as a cold start, and
                 // the next delta writes the truncated view back until the tier-3
                 // audit rebuilds it.
-                if json_etag != cached.etag || (json_etag.is_none() && html_etag.is_some()) {
+                if json_etag != cached.etag {
                     *guard = None;
                     continue;
                 }

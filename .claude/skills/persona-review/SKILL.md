@@ -64,6 +64,15 @@ positioning calls go to the user, each self-contained, not into edits.
 Update `dev/personas/REVIEWS.md`: page, actors, date, fix commit. This
 ledger is the answer to "has X been reviewed" — keep it true.
 
+## The order instrument
+
+Whole-page actors cannot feel ordering defects — they have already seen every
+forward reference resolved. For new or rewritten ledes/openers (especially
+copy authored while fixing another finding), run the blank-slate incremental
+reader: protocol and audit steps in `dev/personas/blank-slate-reader.md`.
+One increment per file, react-before-next-read, and verify the transcript
+alternates READ → reaction — a batch-read run is void.
+
 ## Fleet health
 
 Re-run the planted-defect benchmark (`dev/personas/bench/`, scored against

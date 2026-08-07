@@ -4,12 +4,12 @@ description: "Serve packages on a host with no internet access: sync an approved
 
 # Run without internet access
 
-Two shapes, one rule: the serving host never touches the internet. With a
-locked-down network path between a connected host and the serving host,
-`pypiron sync` delivers over it. With nothing crossing the boundary but
+With a locked-down network path between a connected host and the serving
+host, `pypiron sync` pushes over it. With nothing crossing the boundary but
 scanned media, sync into a staging server on the connected side and carry the
-storage tree. Either way the serving host answers installs from what sync
-delivered — no upstream, and none needed.
+storage tree. Either way the serving host never touches the internet: it
+answers installs from what sync delivered, and anything it doesn't hold is an
+immediate 404 — nothing waits on a network that isn't there.
 
 ## The serving host
 

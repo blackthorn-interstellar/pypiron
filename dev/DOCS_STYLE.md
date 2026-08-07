@@ -209,3 +209,5 @@ their home. They're noise everywhere else.
 - The simplest working command comes first; auth/advanced is a later turn.
 - Nothing here is already owned by another page (check the map).
 - `make docs` builds clean (no broken cross-links).
+- A materially changed user-facing page got a persona pass (`/persona-review`;
+  routing and ledger in `dev/personas/`).

@@ -3103,27 +3103,29 @@ fn build_node_state(
 }
 
 impl Fleet {
-    fn new(
-        seed: u64,
-        nodes: usize,
-        bucket_count: usize,
-        fail_percent: u64,
-        forced: Option<(u64, OpFate)>,
-        brk: Break,
-        clock: Arc<SimClock>,
-        viz: Option<Arc<Trace>>,
-    ) -> Fleet {
-        let plan = FaultPlan::new(seed, nodes, fail_percent, forced, brk, viz);
-        let buckets: Vec<Arc<SimStorage>> = (0..bucket_count)
+    /// The fleet a profile describes. It takes the whole `Profile` rather than
+    /// five of its fields: every fault dimension the plan needs already lives
+    /// there together, and the loose-field form had grown past the point where
+    /// a caller could get the order right by reading it.
+    fn new(seed: u64, profile: &Profile, clock: Arc<SimClock>, viz: Option<Arc<Trace>>) -> Fleet {
+        let plan = FaultPlan::new(
+            seed,
+            profile.nodes,
+            profile.fail_percent,
+            profile.forced,
+            profile.brk,
+            viz,
+        );
+        let buckets: Vec<Arc<SimStorage>> = (0..profile.buckets)
             .map(|_| SimStorage::new(clock.clone()))
             .collect();
-        let nodes = (0..nodes)
+        let nodes = (0..profile.nodes)
             .map(|node| Node {
                 state: build_node_state(&buckets, node, &plan),
                 tasks: Vec::new(),
             })
             .collect();
-        let tick_lock = (0..bucket_count)
+        let tick_lock = (0..profile.buckets)
             .map(|_| Arc::new(tokio::sync::Mutex::new(())))
             .collect();
         Fleet {
@@ -3633,16 +3635,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         viz.attach(&clock);
         emit_meta(viz, seed, &profile, &plan);
     }
-    let mut fleet = Fleet::new(
-        seed,
-        nodes,
-        buckets,
-        fail_percent,
-        forced,
-        brk,
-        clock.clone(),
-        viz.clone(),
-    );
+    let mut fleet = Fleet::new(seed, &profile, clock.clone(), viz.clone());
     let mut rng = Rng::new(seed);
     // The empty baseline every later `world` delta is applied on top of.
     viz_world(&viz, &fleet.buckets, true);
@@ -5877,7 +5870,18 @@ fn sweep_faults(args: &Args, started: std::time::Instant) -> i32 {
     let mut total_runs: u64 = 0;
     let mut total_swept: u64 = 0;
     let mut seeds_done: u64 = 0;
-    for offset in 0..args.seeds {
+    for offset in 0.. {
+        // `--forever`/`--max-secs` mean here what they mean in the seed loop, so
+        // a depth-1 sweep can be a timeboxed lane. Silently ignoring them was
+        // the same defect `ROTATE_OVERRIDES` exists to prevent: a run that
+        // reports a budget it did not honour.
+        if let Some(budget) = args.max_secs {
+            if started.elapsed().as_secs() >= budget {
+                break;
+            }
+        } else if !args.forever && offset >= args.seeds {
+            break;
+        }
         let seed = args.start_seed + offset;
         let mut profile = profile_for(seed, args);
         profile.forced = None;
@@ -6395,9 +6399,20 @@ fn main() {
             args.partition_percent
         )
     } else {
+        // The RESOLVED profile, not the flags: `--force-fault` zeroes the
+        // failure rate (its one fault is the run's only fault), and a summary
+        // that echoed `--fail-percent 3` back would report a workload this run
+        // did not run. A fixed profile is the same for every seed, so the first
+        // one describes them all.
+        let resolved = profile_for(args.start_seed, &args);
         format!(
             "nodes={} buckets={} packages={} files={} ops/run={} fail-percent={}",
-            args.nodes, args.buckets, args.packages, args.files, args.ops, args.fail_percent
+            resolved.nodes,
+            resolved.buckets,
+            resolved.packages,
+            resolved.files,
+            resolved.ops,
+            resolved.fail_percent
         )
     };
     println!(
@@ -6852,8 +6867,10 @@ mod tests {
         ]));
         let profile = profile_for(13_792_606_396_100_784_374, &args);
         assert_eq!(profile.fail_percent, 0);
-        assert!(reproduce_command(13_792_606_396_100_784_374, true, &profile)
-            .ends_with("--rotate --force-fault 12:fail"));
+        assert!(
+            reproduce_command(13_792_606_396_100_784_374, true, &profile)
+                .ends_with("--rotate --force-fault 12:fail")
+        );
     }
 
     #[test]

@@ -73,6 +73,17 @@ reader: protocol and audit steps in `dev/personas/blank-slate-reader.md`.
 One increment per file, react-before-next-read, and verify the transcript
 alternates READ → reaction — a batch-read run is void.
 
+## When the owner catches what the fleet missed
+
+Do NOT fix the line — not even on direct instruction, unless the owner
+explicitly waives the loop. The catch is a regression case: add it to
+`dev/personas/bench/owner-catches.md`, strengthen the instrument generally,
+and run a FRESH blind actor until one flags the line unaided. Only then fix,
+citing the flag, preferring the reviewer's own rewrite to fresh authorship.
+CI enforces the paper trail: docs pages cannot change on master without
+`dev/personas/REVIEWS.md` moving in the same push (the docs-review-ledger
+job).
+
 ## Fleet health
 
 Re-run the planted-defect benchmark (`dev/personas/bench/`, scored against

@@ -2026,6 +2026,90 @@ the same seed, and the only edits to existing code are a flag, an `if` in the
 failure branch, and a `--weights` suffix that appears solely when the mix is not
 `DEFAULT_OP_WEIGHTS` — which no command outside a shrink result has.
 
+### Exhaustive fault depth 1 (`--sweep-faults`)
+
+Random injection is a 3%-per-op coin flip compounded over a whole schedule, so
+hitting *the* op with *the* fate while the rest of the interleaving lines up is a
+lottery. It is a lottery the soak fleet keeps winning eventually and expensively:
+one recent depth-1 bug cost ~16 million seeds, another ~60 million. `--sweep-faults`
+stops buying tickets. Hold one schedule fixed, then run it once per (op, fate)
+pair — every chaos-phase storage op forced to fail, then every one forced to
+crash the node that issued it, every other op clean. Every oracle runs on every
+such run.
+
+```
+cargo run --release --example vopr -- --seed 7384 --nodes 2 --buckets 1 --ops 80 --sweep-faults
+vopr: sweep seed 7384 — 310 chaos ops x 2 fates, 621 runs, 620/620 forced faults fired, no violations, 541ms
+vopr: 1 seeds swept at fault depth 1, 310 ops swept, 621 runs, 0 violations, in 541ms — every single-fault position held
+```
+
+Half a second for the entire single-fault space of that schedule. The loop is
+in-process — a process per run would cost 190 s for the same sweep — and
+`--seeds`/`--start-seed`/`--forever`/`--max-secs` mean what they mean everywhere
+else, so a timeboxed depth-1 soak is `--rotate --max-secs 120 --sweep-faults`
+(17 rotating schedules, 38,793 runs, measured).
+
+`fired` is the honest denominator: a fault cannot be forced onto an op whose node
+is already down, and a sweep that forced nothing verified nothing. Every profile
+measured so far reports 100%.
+
+**A swept run is depth 1 absolutely, not relatively.** The baseline drops
+`--fail-percent` to 0 *and* stops the driver from scheduling crashes, so the
+forced op is the run's only fault and the reported `(seed, k, fate)` is the whole
+counterexample. The baseline runs first and is checked on its own: a schedule
+that reds without any fault is reported as that, not as a sweep finding. Faults
+are confined to the chaos phase — `admit` stops overriding once the heal phase
+starts — because a fault during heal is a fleet that was never given the chance
+to converge, and the convergence oracles would red for the harness's reason
+rather than the product's.
+
+**The alarm has been watched going red.** `81b62a3` (a torn global index survived
+every tick when its JSON was absent) was reverted in the working tree and the
+sweep run against ordinary small schedules:
+
+| | |
+|---|---|
+| the bug's known random-search repro | `--seed 13792606396100784374 --rotate`, found after millions of seeds |
+| what the sweep needed | 230 swept schedules of `--nodes 3 --buckets 1 --packages 1 --files 2 --ops 120 --weights 7,21,18,10,4,8,4,8`, ~60 s on one core |
+| what it printed | `SWEEP seed 329 op 144 fate fail FAILED` — `AUDIT_PREMATURE_CONSUMPTION: bucket0:simple/index.json before=None after=Some({"projects":[]})` |
+| the same 500 seeds, run ordinarily at `--fail-percent 3` and `0` | all green |
+| the same 250-seed range with the fix restored | 113,770 runs, 0 violations, 61.6 s |
+
+The reproduce line it prints (`… --fail-percent 0 … --force-fault 144:fail`) is
+one simulation, not a re-sweep: `--force-fault <op>:<fail|crash>` reruns exactly
+that world, and it implies the depth-1 world (no random failures, no scheduled
+crashes) on its own, which is what lets a rotating repro carry it — `--rotate`
+refuses `--fail-percent`, so the line has no other way to say it.
+
+**The trap this mode had to disarm.** `fail_percent == 0` used to be read as
+"crash-only", and two oracles tighten on it: an ack-totality miss becomes a hard
+violation, and *any* audit view repair does. A swept run is at zero percent and
+still injects one failure, so keying those gates on the percent would report the
+sweep's own fault as a bug on every forced-`Fail` run. They are keyed on
+`availability_faults` instead — `fail_percent > 0 || forcing a Fail` — pinned by
+`a_forced_failure_relaxes_the_crash_only_oracles_and_a_forced_crash_does_not`. A
+forced `Crash` relaxes nothing: crashes are exactly what the crash-only contract
+contemplates, which makes the crash lane the stricter half of the sweep.
+
+Name the price rather than assume it away. On the `Fail` lane an ack-totality
+miss and a class-3 (concurrent-race) audit repair become statistics instead of
+violations — the same two things the ordinary `--fail-percent 3` lane has always
+given up, for the same reason: under an injected storage failure a note write can
+itself fail. `AUDIT_ORDERING` and `AUDIT_PREMATURE_CONSUMPTION` still red, which
+is how the `81b62a3` revert was caught. The Crash lane gives up nothing. The
+false-positive direction was hunted and came back empty: 1,894 sampled
+forced-`Fail` positions across four profiles produced zero runs that trip either
+relaxed counter, so on today's product the relaxation costs no detection — it is
+insurance against the day one of those counters fires under a swept fault.
+
+**What depth 1 cannot reach.** A bug whose *precondition* is itself a fault is
+depth 2 in this mode's terms and will not appear. `81b62a3` sits right at the
+edge: its victim is a bystander node holding a cold global-index cache and a
+delta that dedups to nothing, which a clean schedule produces only sometimes —
+hence 230 schedules rather than one. Five clean profiles (7384, 19026, 47843,
+1784486481, 9900094440, plus `--rotate`) sweep to zero violations, so the
+relaxation above is not papering over anything.
+
 ## Real cloud backends
 
 The emulators (MinIO, Azurite) are fast and hermetic but not the real thing, and

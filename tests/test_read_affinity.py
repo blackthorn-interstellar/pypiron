@@ -11,9 +11,10 @@ reports. Ground truth is read through `mc`, bypassing the proxy.
 Covered: read locality (bytes from the region bucket, fan-out to both), the
 polarity rule's read-through on an absent artifact (no client 404 for an acked
 file), the accepted lag window for a yank the region bucket missed, failover off
-a sustained outage with a drain-gated return, the fail-closed floor for a
-private name whose claim the region bucket has not yet seen, and the no-region
-fail-safe default.
+a sustained outage with a drain-gated return, the read pin a dead write home
+borrows and gets back when it returns, the fail-closed floor for a private name
+whose claim the region bucket has not yet seen, and the no-region fail-safe
+default.
 
 The two pins fail over independently, so both directions are covered: the node's
 own region bucket dying (reads move, writes do not) and the *preferred* bucket —
@@ -153,6 +154,28 @@ def _claim_owner(minio, bucket: str, pkg: str) -> str:
 
 def _sidecar(minio, bucket: str, akey: str) -> dict:
     return json.loads(minio_get_key_in(minio, bucket, f"{akey}.meta.json"))
+
+
+def _owe_the_region_bucket_forever(minio, write_bucket: str, pkg: str, filename: str) -> list[str]:
+    """Seed a `_repl/` note owed to the region bucket that the sweep can never
+    drain, so the drain gate is provably what holds reads — isolated from the
+    healthy-return window, and for as long as a test wants. The source record's
+    sidecar is unreadable, which nothing may fabricate over (an operator problem
+    by doctrine — a sha mismatch no longer qualifies, since reconcile heals
+    those), so the copy fails and the sweep retains the note. Returns the keys to
+    delete when the test wants nothing owed."""
+    akey = f"packages/{pkg}/{filename}"
+    minio_put_key_in(
+        minio,
+        write_bucket,
+        f"packages/{pkg}/.origin",
+        json.dumps({"origin": "private", "nonce": "b" * 32}),
+    )
+    minio_put_key_in(minio, write_bucket, f"{akey}.meta.json", "not json")
+    minio_put_key_in(minio, write_bucket, akey, "bytes")
+    note = f"_repl/1/{pkg}/{filename}!hold"
+    minio_put_key_in(minio, write_bucket, note, "")
+    return [note, akey, f"{akey}.meta.json", f"packages/{pkg}/.origin"]
 
 
 def _artifact_gets(faults, bucket: str, akey: str) -> int:
@@ -411,24 +434,10 @@ def test_region_bucket_failover_and_drain_gated_return(
 
     # The real note above drains in a blink once B is back — too fast to observe
     # the gate holding reads off B. Seed a second note B can never satisfy on its
-    # own so the drain gate is provably what keeps reads on A, isolated from the
-    # healthy-return window. Its source record's sidecar is unreadable, which
-    # nothing may fabricate over (an operator problem by doctrine — a sha
-    # mismatch no longer qualifies, since reconcile heals those), so the copy
-    # fails and the sweep retains the note.
-    hold_pkg = "holdopen"
-    hold_file = "holdopen-1.0-py3-none-any.whl"
-    hold_akey = f"packages/{hold_pkg}/{hold_file}"
-    hold_note = f"_repl/1/{hold_pkg}/{hold_file}!hold"
-    minio_put_key_in(
-        minio,
-        a,
-        f"packages/{hold_pkg}/.origin",
-        json.dumps({"origin": "private", "nonce": "b" * 32}),
+    # own, so what keeps reads on A is provably the drain gate.
+    hold_keys = _owe_the_region_bucket_forever(
+        minio, a, "holdopen", "holdopen-1.0-py3-none-any.whl"
     )
-    minio_put_key_in(minio, a, f"{hold_akey}.meta.json", "not json")
-    minio_put_key_in(minio, a, hold_akey, "bytes")
-    minio_put_key_in(minio, a, hold_note, "")
 
     # Recover B. The healthy window elapses and the real note drains — B ends up
     # holding the outage record — yet reads must stay on A because a note is still
@@ -449,7 +458,7 @@ def test_region_bucket_failover_and_drain_gated_return(
 
     # Remove the held note (and its unresolvable source): now nothing is owed to
     # B, so reads return to it.
-    for key in (hold_note, hold_akey, f"{hold_akey}.meta.json", f"packages/{hold_pkg}/.origin"):
+    for key in hold_keys:
         minio_delete_key_in(minio, a, key)
     _eventually(
         lambda: _read_bucket(server) == b,
@@ -466,6 +475,83 @@ def test_region_bucket_failover_and_drain_gated_return(
     _eventually(
         lambda: _artifact_gets(faults, b, out_key) > before,
         what="post-return reads hit B",
+    )
+
+
+def test_the_read_pin_is_lent_to_the_region_bucket_and_taken_back(
+    s3_server_read_affinity, tmp_path, uv_path, uv_venv
+):
+    """The loan: while the write home is dead, reads are served from the region
+    bucket even though the drain gate has not opened — a reachable bucket beats a
+    dead one, and installs keep working. That grant is only borrowed from the
+    write pin: when the write home returns, reads leave the region bucket again
+    until the gate lets them back, because it still owes a repair note.
+
+    Reads must first be off the region bucket for the loan to exist at all: a
+    node whose region bucket was converged at startup already serves reads from
+    it, and that pin is earned, not borrowed. So the test first moves reads to
+    the write home with a sustained region outage and keeps them there with a
+    note the region bucket can never satisfy."""
+    server = s3_server_read_affinity
+    minio = server["minio"]
+    a, b = minio["buckets"]
+    faults = server["faults"]
+
+    _eventually(lambda: _read_bucket(server) == b, what="reads pin to B")
+    _eventually(lambda: _write_bucket(server) == a, what="writes home to A")
+
+    # A record both buckets hold, so a client can install while either is dark.
+    pkg = "loanpkg"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    akey = f"packages/{pkg}/{wheel.name}"
+    _upload(server, wheel)
+    wait_for_file_in_index(server["simple"], pkg, wheel.name)
+    _eventually(lambda: minio_key_exists_in(minio, b, akey), what="record fanned out to B")
+
+    # Owe B a note it can never satisfy, then move reads off B with a sustained
+    # outage. B heals, but the owed note keeps reads on A: reads now have no
+    # earned claim on B, which is the precondition for a loan.
+    hold_keys = _owe_the_region_bucket_forever(
+        minio, a, "loanhold", "loanhold-1.0-py3-none-any.whl"
+    )
+    faults.fail(b)
+    _eventually(lambda: _read_bucket(server) == a, what="reads leave the dead region bucket")
+    faults.recover(b)
+    _eventually(lambda: _bucket_health(server, b) == 1, timeout=15, what="B healthy again")
+    settle = time.monotonic() + 3.0
+    while time.monotonic() < settle:
+        assert _read_bucket(server) == a, "reads returned to B while a repair note was owed"
+        time.sleep(0.2)
+
+    # Kill the write home. Writes fail over onto the region bucket, and reads are
+    # lent to it: pinning reads to a dead A would serve nothing.
+    faults.fail(a)
+    _eventually(lambda: _write_bucket(server) == b, what="writes fail over to the region bucket")
+    _eventually(lambda: _read_bucket(server) == b, what="reads are lent to the new write home")
+    _install(server, uv_path, uv_venv, pkg)
+
+    # The write home returns: the loan ends with it. B still owes the note, so
+    # reads go back to A instead of latching on a bucket that never passed the
+    # gate — and they stay there.
+    faults.recover(a)
+    _eventually(lambda: _write_bucket(server) == a, what="writes return home")
+    _eventually(
+        lambda: _read_bucket(server) == a,
+        timeout=20,
+        what="the read loan is surrendered when the write pin goes home",
+    )
+    settle = time.monotonic() + 3.0
+    while time.monotonic() < settle:
+        assert _read_bucket(server) == a, "reads stayed on B while a repair note was still owed"
+        time.sleep(0.2)
+
+    # Nothing owed: reads earn their way back through the gate.
+    for key in hold_keys:
+        minio_delete_key_in(minio, a, key)
+    _eventually(
+        lambda: _read_bucket(server) == b,
+        timeout=20,
+        what="reads return to B once it is caught up",
     )
 
 

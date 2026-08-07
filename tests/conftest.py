@@ -1841,15 +1841,17 @@ def _start_read_affinity_server(
 def s3_server_read_affinity(
     tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
 ) -> Iterator[Dict]:
-    """Reads pinned to the region bucket (B); writes home to A. Low leave
-    threshold and short return window so a sustained outage moves the read pin in
-    seconds and a recovery returns it under the drain gate."""
+    """Reads pinned to the region bucket (B); writes home to A. A small leave
+    threshold and short return window so a sustained outage (a failure every
+    1 s probe) moves the read pin in seconds and a recovery returns it under the
+    drain gate — but above one, so a single probe that overruns its 1 s budget
+    under parallel test load cannot fail a bucket over on its own."""
     yield from _start_read_affinity_server(
         tmp_path_factory,
         pypiron_bin,
         minio_two_proxy,
         node_region=READ_AFFINITY_NODE_REGION,
-        leave_failures=1,
+        leave_failures=3,
         return_healthy_secs=2,
     )
 

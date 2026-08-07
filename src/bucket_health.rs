@@ -211,6 +211,10 @@ pub(crate) struct BucketHealth {
     /// value can only keep reads on the write bucket, never send them to a
     /// lagging one. The request path never sets this.
     region_caught_up: bool,
+    /// Whether the read pin sits on the region bucket only because the write
+    /// selection failed over onto it, rather than by passing the health and
+    /// caught-up gate. Such a grant lasts exactly as long as the write pin does.
+    read_granted_by_failover: bool,
 }
 
 /// One worker-cycle view of health observed by request and worker threads.
@@ -512,6 +516,7 @@ impl BucketHealth {
             read_preference: None,
             read_selected: 0,
             region_caught_up: false,
+            read_granted_by_failover: false,
         })
     }
 
@@ -635,17 +640,31 @@ impl BucketHealth {
     /// the instant it fails its availability streak (the same rule the write pin
     /// uses to leave), and reads fall back to the write selection. Returning to
     /// it is deliberately slow: it must prove continuous health for the full
-    /// return window *and* the worker must have confirmed it is caught up. When
+    /// return window *and* the worker must have confirmed it is caught up. While
     /// the region bucket is also the write selection the caught-up gate is moot —
-    /// the write home is truth by definition.
+    /// the write home is truth by definition — but that grant is a loan, not a
+    /// return: it is surrendered when the write pin goes home, and those reads
+    /// re-enter the drain gate. Only a pin earned through the gate survives a
+    /// write failover round trip.
     fn evaluate_read(&mut self, now: Instant) {
         let Some(region) = self.read_preference else {
             self.read_selected = self.selected;
             return;
         };
         if self.read_selected == region {
-            if self.buckets[region].state == HealthState::Unhealthy {
+            // A failover grant is a loan from the write pin: it ends when the
+            // write pin goes home, because the region bucket may owe repair notes
+            // from before the outage. An earned pin is not a loan.
+            let loan_expired = self.read_granted_by_failover && region != self.selected;
+            if self.buckets[region].state == HealthState::Unhealthy || loan_expired {
                 self.read_selected = self.selected;
+                // A dead region bucket that is also the write selection has
+                // nowhere to demote to: reads stay on it, so the loan does too.
+                self.read_granted_by_failover = self.read_selected == region;
+                // The worker only refreshes its caught-up verdict while a return
+                // is pending, so the pre-demotion value is stale by construction.
+                // Drop it, or the gate could pass before the first fresh probe.
+                self.region_caught_up = false;
             }
             return;
         }
@@ -654,12 +673,15 @@ impl BucketHealth {
             && status.healthy_since.is_some_and(|since| {
                 now.saturating_duration_since(since) >= self.policy.return_after_healthy
             });
-        self.read_selected =
-            if region == self.selected || (healthy_for_window && self.region_caught_up) {
-                region
-            } else {
-                self.selected
-            };
+        if healthy_for_window && self.region_caught_up {
+            self.read_selected = region;
+            self.read_granted_by_failover = false;
+        } else if region == self.selected {
+            self.read_selected = region;
+            self.read_granted_by_failover = true;
+        } else {
+            self.read_selected = self.selected;
+        }
     }
 }
 
@@ -1104,6 +1126,115 @@ mod tests {
         );
         assert_eq!(update.selected_index, 0);
         assert_eq!(health.selected_index(), 0);
+    }
+
+    #[test]
+    fn a_failover_read_grant_is_surrendered_when_the_write_pin_goes_home() {
+        let base = Instant::now();
+        // Region is bucket 1; reads follow the write selection (bucket 0) and
+        // have never passed the drain gate.
+        let mut health = BucketHealth::new(2, policy(1, 10)).unwrap();
+        health.set_read_affinity(1, 0);
+        health.observe(1, BucketSignal::Success, base).unwrap();
+
+        // The write home dies: writes fail over to the region bucket and reads
+        // follow, gate or no gate — a dead bucket serves nothing.
+        let failover = health
+            .observe(0, BucketSignal::Timeout, at(base, 1))
+            .unwrap();
+        assert_eq!(failover.selected_index, 1);
+        assert_eq!(failover.read_selected_index, 1);
+
+        // The write home recovers and the write pin returns. The read grant was
+        // only ever the write pin's; bucket 1 may still owe repair notes, so
+        // reads go back to bucket 0 rather than staying latched.
+        health
+            .observe(0, BucketSignal::Success, at(base, 2))
+            .unwrap();
+        let returned = health.tick(at(base, 13));
+        assert_eq!(returned.selected_index, 0);
+        assert_eq!(returned.read_selected_index, 0);
+        assert_eq!(
+            returned.read_selection_change,
+            Some(SelectionChange { from: 1, to: 0 })
+        );
+
+        // The ordinary gate governs the return: window plus caught up earns it.
+        health.region_caught_up = true;
+        let earned = health.tick(at(base, 14));
+        assert_eq!(earned.read_selected_index, 1);
+        assert_eq!(earned.selected_index, 0);
+    }
+
+    #[test]
+    fn a_loan_outlives_the_region_bucket_dying_with_nowhere_to_demote_to() {
+        let base = Instant::now();
+        let mut health = BucketHealth::new(2, policy(1, 10)).unwrap();
+        health.set_read_affinity(1, 0);
+        health.observe(1, BucketSignal::Success, base).unwrap();
+
+        // The write home dies: reads are lent to the region bucket.
+        let failover = health
+            .observe(0, BucketSignal::Timeout, at(base, 1))
+            .unwrap();
+        assert_eq!(failover.selected_index, 1);
+        assert_eq!(failover.read_selected_index, 1);
+
+        // Now the region bucket dies too. No bucket is healthy, so the write
+        // selection cannot move and reads have nowhere to go: the demotion is a
+        // no-op, and must not be mistaken for reads having earned this pin.
+        let both_dead = health
+            .observe(1, BucketSignal::Timeout, at(base, 2))
+            .unwrap();
+        assert_eq!(both_dead.selected_index, 1, "nowhere to fail over to");
+        assert_eq!(both_dead.read_selected_index, 1);
+
+        // Both heal and the write pin goes home. The loan was never repaid, so
+        // reads leave the region bucket and re-enter the drain gate.
+        health
+            .observe(1, BucketSignal::Success, at(base, 3))
+            .unwrap();
+        health
+            .observe(0, BucketSignal::Success, at(base, 4))
+            .unwrap();
+        let returned = health.tick(at(base, 15));
+        assert_eq!(returned.selected_index, 0);
+        assert_eq!(returned.read_selected_index, 0);
+        assert_eq!(
+            returned.read_selection_change,
+            Some(SelectionChange { from: 1, to: 0 })
+        );
+    }
+
+    #[test]
+    fn an_earned_read_pin_survives_a_write_failover_round_trip() {
+        let base = Instant::now();
+        let mut health = BucketHealth::new(2, policy(1, 10)).unwrap();
+        health.set_read_affinity(1, 0);
+        health.observe(1, BucketSignal::Success, base).unwrap();
+
+        // Reads earn the region pin through the gate before anything fails.
+        health.region_caught_up = true;
+        assert_eq!(health.tick(at(base, 11)).read_selected_index, 1);
+
+        let failover = health
+            .observe(0, BucketSignal::Timeout, at(base, 12))
+            .unwrap();
+        assert_eq!(failover.selected_index, 1);
+        assert_eq!(failover.read_selected_index, 1);
+
+        // The write pin goes home. The region bucket was the write home through
+        // the outage, so it missed nothing: the earned pin does not move, even
+        // with the gate closed (the worker clears caught-up while reads sit on
+        // the region bucket).
+        health
+            .observe(0, BucketSignal::Success, at(base, 13))
+            .unwrap();
+        health.region_caught_up = false;
+        let returned = health.tick(at(base, 24));
+        assert_eq!(returned.selected_index, 0);
+        assert_eq!(returned.read_selected_index, 1);
+        assert_eq!(returned.read_selection_change, None);
     }
 
     #[test]

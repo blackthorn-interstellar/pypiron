@@ -118,7 +118,12 @@ of preference: **reword it as a benefit**, **delete it**, or **move it to
 ## The seven rules
 
 1. **Lead with the outcome, never the architecture.** The first sentence of
-   every page is a benefit or a task. Banned openers: "one binary, no database",
+   every page is a benefit or a task. Genre decides which: the landing and
+   concepts pages sell; a guide or reference page **orients** — name what the
+   page covers and the platforms it applies to, in plain speech ("pypiron
+   runs in production against AWS S3, GCS, or Azure Blob storage"). The
+   benefit was sold on the page that linked here; re-pitching it is noise,
+   and a guide teaches only what its task needs — everything else is a link. Banned openers: "one binary, no database",
    "the files are truth", "indexes are regenerable views", "static site
    generator wearing a PyPI costume". If a reader of a *competitor* would care
    ("nothing to back up but a directory"), say *that* — not the implementation.

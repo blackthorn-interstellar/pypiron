@@ -4,15 +4,13 @@ description: "Run pypiron in production on S3, GCS, or Azure: one config file, t
 
 # Deploy on cloud storage
 
-Serve your private packages and a cached PyPI from one URL. The whole
-deployment is a config file and a bucket; a node carries no state — the
-bucket holds the packages — so you add or replace nodes freely.
+pypiron runs in production against AWS S3, GCS, or Azure Blob storage. This
+page covers the config, running it under Docker Compose or systemd, scaling
+out behind a load balancer, and pointing clients at it.
 
 ## The config
 
 ```toml
-private-prefix = "acme"
-
 [serve]
 bind-addr = "0.0.0.0:8080"
 buckets = ["s3://acme-pypiron@us-east-1"]
@@ -22,9 +20,7 @@ proxy-upstream = "https://pypi.org"
 exclude-newer = "7 days"
 ```
 
-`private-prefix` claims `acme` and `acme-*` for you: those names are never
-fetched from upstream, and adopting the prefix on an existing install renames
-nothing. `proxy-upstream` turns on the public cache: the first request for a
+`proxy-upstream` turns on the public cache: the first request for a
 public package fetches it from PyPI and writes it to the bucket, so every
 node serves it from then on. `exclude-newer` is the dependency cooldown — it
 covers everything fetched from upstream, proxied installs and `sync` alike,
@@ -86,7 +82,8 @@ world-readable.
 
 ## More nodes
 
-Run more containers with the same config behind a load balancer. Nothing
+A node carries no state — the bucket holds everything — so scaling out is
+more containers with the same config behind a load balancer. Nothing
 extra to run: nodes settle concurrent work through the bucket — a second
 upload of the same filename gets a clean 409, never a silent drop, and no
 client reads a partial file ([how that's tested](../testing.md)).
@@ -134,8 +131,6 @@ so it validates without turning verification off. Details:
 
 ## Survive a region outage
 
-One bucket rides out any node dying. To survive losing the bucket's region —
-or a whole cloud — give every node the same bucket list in the same order:
-the first is where writes land, the rest replicate, and pypiron fails over
-automatically:
+To survive losing the bucket's region — or the whole cloud — run the same
+config against an ordered list of buckets:
 [Survive a region or cloud outage](multi-region.md).

@@ -3,7 +3,8 @@
 #
 #   ./fleet.sh push-bundle          # build the aarch64 binary + upload the bundle to S3
 #   ./fleet.sh apply                # create/update the fleet (default VPC if unset)
-#   ./fleet.sh status               # stack + instances + finding count + seeds
+#   ./fleet.sh status               # stack + instances + bundle drift + findings + seeds
+#   ./fleet.sh bundle               # is the fleet soaking current code?
 #   ./fleet.sh findings             # list the deduped findings in S3
 #   ./fleet.sh seeds                # seed totals from the fleet's S3 status objects
 #   ./fleet.sh destroy [--all]      # tear down the fleet; --all also deletes the bucket
@@ -132,8 +133,115 @@ status() {
         --filters "Name=tag:Name,Values=${STACK_NAME}" "Name=instance-state-name,Values=running,pending" \
         --query 'Reservations[].Instances[].[InstanceId,InstanceType,InstanceLifecycle,State.Name]' \
         --output text || true
+    echo "== bundle ==" && bundle_status
     echo "== findings ==" && findings 5
     echo "== seeds ==" && seeds
+}
+
+# Paths whose contents decide what the fleet soaks — the same set
+# .github/workflows/soak-bundle.yml watches. A commit touching none of them
+# never needs to reach the box.
+SOAK_PATHS=(src examples/vopr.rs Cargo.toml Cargo.lock dev/ops/soak)
+
+# bundle: is the fleet soaking current code?
+#
+# The box is not the thing that lags. It re-heads the bundle every ~10 min
+# (pypiron-soak-refresh.timer) and restarts onto new bytes, and CI republishes
+# the bundle on every master push touching SOAK_PATHS. So a stale soak is always
+# a fix that never reached the *bucket*: still sitting unpushed in a checkout, or
+# pushed without touching a watched path. Neither is visible from the box, from
+# the seed counts, or from a finding — and a soak on old code spends its seeds
+# rediscovering bugs you already fixed. Measured once: a finding arrived stamped
+# with a commit whose bug had been fixed locally 12 hours earlier and stayed
+# unpushed for 19, and nothing in `status` said so.
+bundle_status() {
+    : "${S3_BUCKET:?set S3_BUCKET}"
+    local pushed tmp
+    pushed=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$BUNDLE_KEY" \
+        --query LastModified --output text 2>/dev/null || true)
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"; trap - RETURN' RETURN
+    aws s3 sync "s3://${S3_BUCKET}/${STATUS_PREFIX}" "$tmp" --quiet 2>/dev/null || true
+    python3 - "$tmp" "$REPO_ROOT" "${pushed:-}" "${SOAK_PATHS[@]}" <<'PY'
+import datetime, json, pathlib, subprocess, sys
+
+statusdir, repo, pushed = sys.argv[1], sys.argv[2], sys.argv[3]
+soak_paths = sys.argv[4:]
+now = datetime.datetime.now(datetime.timezone.utc)
+
+
+def git(*args):
+    """Read-only git in the checkout, or None if it failed. Never raises: a
+    status command must survive a detached HEAD, a missing upstream, or no git."""
+    try:
+        r = subprocess.run(["git", "-C", repo, *args],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def age(iso):
+    try:
+        return (now - datetime.datetime.fromisoformat(iso)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
+def ago(seconds):
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    d, h = divmod(h, 24)
+    return f"{d}d{h:02d}h" if d else (f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s")
+
+
+def count(*args):
+    out = git("rev-list", "--count", *args, "--", *soak_paths)
+    return int(out) if out and out.isdigit() else 0
+
+
+if not pushed or pushed == "None":
+    print("  s3 bundle: MISSING — run ./fleet.sh push-bundle")
+else:
+    secs = age(pushed)
+    print(f"  s3 bundle: pushed {ago(secs)} ago" if secs is not None
+          else f"  s3 bundle: pushed {pushed}")
+
+# What the fleet is *running* (the bundle it already fetched), not what is in the
+# bucket: the two differ for up to one refresh interval.
+live = []
+for p in sorted(pathlib.Path(statusdir).glob("*.json")):
+    try:
+        seg = json.loads(p.read_text())
+    except (ValueError, OSError):
+        continue
+    secs = age(seg.get("updated_at"))
+    if not seg.get("final") and secs is not None and secs < 900:
+        live.append(seg)
+
+commits = sorted({seg.get("commit", "?") for seg in live})
+if not commits:
+    print("  fleet runs: nothing reporting — see == seeds ==")
+for commit in commits:
+    base = commit.split("-")[0]  # strip `git describe --dirty`'s suffix
+    if base in ("", "?", "unknown") or git("cat-file", "-e", base + "^{commit}") is None:
+        print(f"  fleet runs: {commit} — not a commit in this checkout, cannot measure drift")
+        continue
+    when = git("log", "-1", "--format=%cr", base) or "?"
+    behind = count(f"{base}..HEAD")
+    if behind == 0:
+        print(f"  fleet runs: {commit} ({when}) — current")
+        continue
+    print(f"  fleet runs: {commit} ({when}) — {behind} soak-relevant commit(s) behind here")
+    upstream = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    unpushed = count(f"{upstream}..HEAD") if upstream else 0
+    if unpushed:
+        print(f"    {unpushed} of them UNPUSHED. CI publishes the bundle on push to master,")
+        print("    so the fleet cannot reach them — push to close the gap.")
+    else:
+        print("    all pushed. The bundle republishes on push and the box refreshes within")
+        print("    ~10 min; if this persists, check the Soak bundle workflow run.")
+PY
 }
 
 # findings [N] — the deduped findings, newest first, with the commit that found
@@ -275,11 +383,12 @@ case "${1:-}" in
     push-bundle) push_bundle ;;
     apply) apply ;;
     status) status ;;
+    bundle) bundle_status ;;
     findings) findings ;;
     seeds) seeds ;;
     destroy) shift; destroy "$@" ;;
     *)
-        echo "usage: $0 {push-bundle|apply|status|findings|seeds|destroy [--all]}" >&2
+        echo "usage: $0 {push-bundle|apply|status|bundle|findings|seeds|destroy [--all]}" >&2
         exit 2
         ;;
 esac

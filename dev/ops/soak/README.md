@@ -70,7 +70,8 @@ cd dev/ops/soak
 export S3_BUCKET=your-bucket
 ./fleet.sh push-bundle                 # build aarch64 vopr + upload the bundle
 EMAIL=you@example.com ./fleet.sh apply # default VPC/subnets; budget alarm to EMAIL
-./fleet.sh status                      # stack, instances, recent findings, seeds + health
+./fleet.sh status                      # stack, instances, bundle drift, findings, seeds
+./fleet.sh bundle                      # is the fleet soaking current code?
 ./fleet.sh findings                    # every deduped finding, newest first, with its repro
 ```
 
@@ -87,6 +88,15 @@ by setting the repo variables `SOAK_S3_BUCKET`, `SOAK_AWS_ROLE` (an OIDC role
 with `s3:PutObject` on the bundle key), and optionally `SOAK_BUNDLE_KEY` /
 `SOAK_AWS_REGION`. Every master push then rebuilds the bundle and the fleet
 refreshes within ~10 min. Until then, re-run `./fleet.sh push-bundle` after a fix.
+
+That leaves one gap the box cannot see. It refreshes from the bucket on a timer,
+so it never lags the bucket — but a fix that never *reaches* the bucket (still
+unpushed, or pushed without touching a path `soak-bundle.yml` watches) leaves the
+soak grinding on old code, and nothing in the seed counts or a finding says so.
+`fleet.sh bundle` (folded into `status`) measures exactly that: what the fleet is
+running, how many soak-relevant commits this checkout has moved past it, and how
+many of those are unpushed. It has been worth measuring — a finding once arrived
+stamped with a commit whose bug had been fixed locally 12 hours earlier.
 
 Turn on the autonomous fixer once you trust it — see
 [fixer-routine.md](fixer-routine.md).
@@ -137,7 +147,7 @@ Without a bucket the reporter still records findings to a local fallback file.
 | File | Role |
 |------|------|
 | `fleet.cfn.yaml` | CloudFormation: IAM (S3 get bundle / put findings), SG, launch template (+ bootstrap), spot ASG, budget |
-| `fleet.sh` | `push-bundle` / `apply` / `status` / `findings` / `seeds` / `destroy` |
+| `fleet.sh` | `push-bundle` / `apply` / `status` / `bundle` / `findings` / `seeds` / `destroy` |
 | `build-vopr.sh` | the one build recipe, run inside the fleet's AMI image by both `push-bundle` and CI |
 | `pypiron-soak@.service` | one soak process per core (`vopr --forever --rotate`, random start-seed) |
 | `report.py` | journal → deduped S3 findings (seed-agnostic signatures, rate-capped, fail-open) + per-segment status objects (seed totals, final-flush on shutdown) |

@@ -1597,8 +1597,18 @@ impl DiskStorage {
 #[async_trait]
 impl Storage for DiskStorage {
     async fn head_exists(&self, key: &str) -> Result<bool> {
-        let p = self.resolve(key)?;
-        Ok(fs::metadata(p).await.is_ok())
+        // Only ENOENT is an answer. Folding EIO/EACCES/ESTALE/EMFILE into
+        // `false` would report "not there" for a key nobody could read, and
+        // every fence probe in the tree — tombstone, frozen, mirror-quarantine
+        // — is a `head_exists` whose caller destroys something when told "no".
+        // That is the 115b9ca shape at its root: on disk no caller could reach
+        // its `Err` arm, so the careful handlers upstream were unreachable.
+        // `stored_size` below and `get_bytes` already discriminate this way.
+        match fs::metadata(self.resolve(key)?).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("stat {key}"))),
+        }
     }
 
     async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
@@ -3589,6 +3599,39 @@ mod tests {
         assert!(
             !storage.head_exists(key).await.unwrap(),
             "proven-corrupt debris must be dropped so the retry is not 409'd forever"
+        );
+    }
+
+    /// A stat that fails for a reason other than ENOENT is not the answer
+    /// "absent". Every fence probe in the tree is a `head_exists` whose caller
+    /// destroys something when told "no" — freeing an immutable filename,
+    /// dropping a body — so a confident `false` off an unreadable path is the
+    /// corrupting direction. ENOTDIR is the portable way to provoke one: stat a
+    /// key whose parent component is a regular file.
+    #[tokio::test]
+    async fn disk_head_exists_reports_an_unreadable_path_rather_than_absent() {
+        let dir = std::env::temp_dir().join(format!("pypiron-headerr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = DiskStorage::new(&dir);
+        s.put_bytes("packages/alpha/a-1.0.tar.gz", b"x".to_vec(), None)
+            .await
+            .unwrap();
+
+        // A genuine miss is still `false` — the fix must not turn absence into
+        // an error, or every cold start and every fence probe would fail.
+        assert!(!s
+            .head_exists("packages/alpha/missing.tar.gz")
+            .await
+            .unwrap());
+
+        // `a-1.0.tar.gz` is a file, so stat'ing through it yields ENOTDIR.
+        let err = s
+            .head_exists("packages/alpha/a-1.0.tar.gz/child")
+            .await
+            .expect_err("an unreadable path must not answer `false`");
+        assert!(
+            !is_not_found(&err),
+            "ENOTDIR must not be laundered into NotFound: {err:#}"
         );
     }
 

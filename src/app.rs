@@ -744,9 +744,18 @@ impl counters::ObjectStore for PinnedCounterStore {
             // error (Err) — the engine must never freeze a day from a failed read.
             Ok(self.storage.get_with_etag(key).await?.map(|(b, _)| b))
         } else {
-            // Disk: get_bytes errors on a miss; a single-node disk store has no
-            // compaction-safety stakes, so treat any error as absent.
-            Ok(self.storage.get_bytes(key).await.ok())
+            // Disk: `get_bytes` returns a typed NotFound for a genuine miss and
+            // propagates everything else. The stake is the same as the cloud
+            // arm's, not smaller: `sum_segments` aborts a freeze on `Err` so a
+            // day is never frozen from a partial read, and `compact_bucket`
+            // DELETES the segments it summed. Collapsing a read error to
+            // "absent" made that abort arm dead code here, freezing a short
+            // total and destroying the segment it could not read.
+            match self.storage.get_bytes(key).await {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if crate::storage::is_not_found(&e) => Ok(None),
+                Err(e) => Err(e),
+            }
         }
     }
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
@@ -2088,9 +2097,14 @@ async fn initialize_indexes(state: &AppState) -> Result<()> {
     let html_key = format!("{SIMPLE_PREFIX}index.html");
     let json_key = format!("{SIMPLE_PREFIX}index.json");
 
-    // Check if global indexes exist
-    let html_exists = storage.head_exists(&html_key).await.unwrap_or(false);
-    let json_exists = storage.head_exists(&json_key).await.unwrap_or(false);
+    // An errored HEAD is not an answer, and the branch below acts on "absent"
+    // by overwriting the live global index with an empty one. A probe that
+    // fails while the write path still works — a throttle, a 503 past
+    // object_store's retries, a reset — would publish a zero-package index over
+    // a real corpus, and peers would then reload that empty set as authority.
+    // Refuse to boot instead; a cold start answers NotFound, not an error.
+    let html_exists = storage.head_exists(&html_key).await?;
+    let json_exists = storage.head_exists(&json_key).await?;
 
     if !html_exists || !json_exists {
         info!("Initializing empty global indexes");

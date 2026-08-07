@@ -1586,6 +1586,20 @@ async fn quarantine(storage: &dyn Storage, pkg: &str, filename: &str) -> Result<
     ))
 }
 
+/// Where a preserved body lives: `_quarantine/<pkg>/<file>@<sha12>`. The hash
+/// is IN the key, so the two byte-sets of a conflicted filename each get their
+/// own object instead of one overwriting the other.
+///
+/// Shared with `sim`, which asks the inverse question — given a body about to
+/// be deleted, is there a copy of exactly these bytes standing? — and must ask
+/// it against the same layout the product writes.
+pub(crate) fn quarantine_key(pkg: &str, filename: &str, sha: &str) -> String {
+    format!(
+        "{QUARANTINE_PREFIX}{pkg}/{filename}@{}",
+        &sha[..sha.len().min(12)]
+    )
+}
+
 async fn quarantine_bytes(
     storage: &dyn Storage,
     pkg: &str,
@@ -1593,8 +1607,7 @@ async fn quarantine_bytes(
     bytes: &[u8],
 ) -> Result<String> {
     let sha = sha256_hex(bytes);
-    let short = &sha[..sha.len().min(12)];
-    let qkey = format!("{QUARANTINE_PREFIX}{pkg}/{filename}@{short}");
+    let qkey = quarantine_key(pkg, filename, &sha);
     if !storage
         .put_if_absent(&qkey, bytes.to_vec(), Some("application/octet-stream"))
         .await?

@@ -92,12 +92,17 @@ impl SimClock {
     }
 }
 
-/// Whether `key` addresses an artifact body rather than one of its companions:
-/// exactly `packages/<pkg>/<filename>` with `<filename>` an artifact name.
+/// `(pkg, filename)` when `key` addresses an artifact body rather than one of
+/// its companions: exactly `packages/<pkg>/<filename>` with `<filename>` an
+/// artifact name.
+fn split_artifact_key(key: &str) -> Option<(&str, &str)> {
+    let (pkg, name) = key.strip_prefix("packages/")?.split_once('/')?;
+    (!name.contains('/') && crate::sidecar::is_artifact(name)).then_some((pkg, name))
+}
+
+/// Whether `key` addresses an artifact body rather than one of its companions.
 fn is_canonical_artifact(key: &str) -> bool {
-    key.strip_prefix("packages/")
-        .and_then(|rest| rest.split_once('/'))
-        .is_some_and(|(_, name)| !name.contains('/') && crate::sidecar::is_artifact(name))
+    split_artifact_key(key).is_some()
 }
 
 /// Whether this bucket bars an upload of `key`'s filename right now: a
@@ -119,6 +124,40 @@ fn fence_stands(inner: &Inner, key: &str) -> bool {
         || inner
             .objects
             .contains_key(&crate::sidecar::mirror_quarantined_key(key))
+}
+
+/// Whether anything durable authorizes removing `key`'s body, given the bytes
+/// being removed — the predicate behind UNTYPED_DISAPPEARANCE.
+///
+/// Exactly two things authorize it, and the presence of a marker is only one of
+/// them:
+///
+/// * the FILENAME is durably closed. `.tombstone` and `.frozen` both make
+///   `publish_record` refuse ([`upload_barred`]), so no writer can have swapped
+///   the bytes under the marker between the adjudication and this delete: what
+///   is going away is what the fence judged.
+/// * the BYTES are durably kept. `_quarantine/<pkg>/<file>@<sha12>` holds a
+///   copy of exactly these bytes, so a later pass can still find them.
+///
+/// `.mirror-quarantined` is deliberately NOT sufficient, even though
+/// [`fence_stands`] counts it: handing the filename to private truth IS a
+/// demotion's intended resolution, so that marker is the one fence in the
+/// system that leaves the canonical key writable (`settle_mirror_quarantine`,
+/// src/replicate.rs). It can therefore stand over bytes it never adjudicated —
+/// a private publish landing in the window — and a settle that then deleted
+/// blind destroyed acked bytes held in no `_quarantine/` copy, under no
+/// tombstone and no `.frozen`. Measured twice, on pinned seeds 86001009016 and
+/// 40000042940. The product earns that delete by holding a verified copy of the
+/// bytes actually standing there, so this asks for the copy, not the marker.
+fn removal_authorized(inner: &Inner, key: &str, removed: &[u8]) -> bool {
+    if upload_barred(inner, key) {
+        return true;
+    }
+    split_artifact_key(key).is_some_and(|(pkg, filename)| {
+        let qkey =
+            crate::replicate::quarantine_key(pkg, filename, &crate::hash::sha256_hex(removed));
+        inner.objects.contains_key(&qkey)
+    })
 }
 
 /// Clamp an `OffsetDateTime` to the representable Unix-nanos range as `u64`.
@@ -194,6 +233,12 @@ struct Inner {
     ///   publish never published a sidecar, so no ack names those bytes and
     ///   `freeze_side` quarantines the body it kept, not the one it lost.
     contested: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Canonical artifact bodies this bucket has removed, and the ones it freed
+    /// with NOTHING standing to authorize the removal. See
+    /// [`SimStorage::body_removals`] — the pair is one oracle's numerator and
+    /// denominator, recorded here because the final state cannot supply either.
+    body_removals: u64,
+    untyped_disappearances: Vec<String>,
     /// Per-storage version counter. Every successful write stamps `v{n}` and
     /// increments, so etags model an object store's opaque generation — one
     /// etag space shared by every conditional operation — rather than a content
@@ -351,6 +396,23 @@ impl SimStorage {
         self.lock().contested.get(key).cloned().unwrap_or_default()
     }
 
+    /// How many canonical artifact bodies this bucket removed, and which of
+    /// them it freed with nothing standing to authorize it — the filename not
+    /// closed by a `.tombstone` or a `.frozen`, and the bytes in no
+    /// `_quarantine/` copy. See [`removal_authorized`].
+    ///
+    /// The predicate is evaluated at the instant of the delete, not at the end,
+    /// which is the whole point: an immutable filename freed in the middle of a
+    /// run is corrupt *then*, and the final state cannot show it. A racing
+    /// rebuild publishes a sidecar over the empty key, the next upload wins the
+    /// create with different bytes, and the bucket serves body B under body A's
+    /// published sha256 — permanently, because nothing re-hashes a stored body.
+    /// Watching the free itself is what turns that into a depth-1 defect.
+    pub fn body_removals(&self) -> (u64, Vec<String>) {
+        let inner = self.lock();
+        (inner.body_removals, inner.untyped_disappearances.clone())
+    }
+
     /// Snapshot of key -> bytes, for invariant checks and abstraction functions.
     pub fn dump(&self) -> BTreeMap<String, Vec<u8>> {
         self.lock()
@@ -506,14 +568,29 @@ impl Storage for SimStorage {
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
         let mut inner = self.lock();
         for k in keys {
-            let removed = inner.objects.remove(k).is_some();
+            let Some(removed) = inner.objects.remove(k) else {
+                continue;
+            };
+            if !is_canonical_artifact(k) {
+                continue;
+            }
+            // Every body removal is a question the harness gets to ask, whether
+            // or not the answer turns out to be wrong: the reach denominator.
+            inner.body_removals += 1;
+            if !removal_authorized(&inner, k, &removed.bytes) {
+                // Nothing closed the filename and nothing kept the bytes, so
+                // an immutable name was freed with no record that those bytes
+                // ever stood there.
+                inner.untyped_disappearances.push(k.clone());
+            }
+            if fence_stands(&inner, k) {
+                continue;
+            }
             // An unfenced body delete retires the filename with nothing
             // preserved, so the next body under it is a new incarnation and
             // cannot have conflicted with this one. See `Inner::committed`.
-            if removed && is_canonical_artifact(k) && !fence_stands(&inner, k) {
-                inner.committed.remove(k);
-                inner.contested.remove(k);
-            }
+            inner.committed.remove(k);
+            inner.contested.remove(k);
         }
         Ok(())
     }
@@ -804,6 +881,118 @@ mod tests {
             .await
             .unwrap());
         assert!(s.contested_digests(BODY_KEY).is_empty());
+    }
+
+    /// Where `quarantine_bytes` would have preserved `bytes` from `BODY_KEY`.
+    fn quarantine_copy_key(bytes: &[u8]) -> String {
+        let (pkg, filename) = split_artifact_key(BODY_KEY).expect("BODY_KEY is an artifact");
+        crate::replicate::quarantine_key(pkg, filename, &crate::hash::sha256_hex(bytes))
+    }
+
+    #[tokio::test]
+    async fn a_body_freed_with_nothing_beside_it_is_recorded() {
+        // The predicate the UNTYPED_DISAPPEARANCE oracle reads. A fence that
+        // CLOSES the filename authorizes the removal; a bare delete does not.
+        for fence in [".tombstone", ".frozen"] {
+            let s = SimStorage::new(SimClock::new(start()));
+            s.put_bytes(BODY_KEY, b"one".to_vec(), None).await.unwrap();
+            s.insert(&format!("{BODY_KEY}{fence}"), b"{}".to_vec());
+            s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
+            assert_eq!(
+                s.body_removals(),
+                (1, Vec::new()),
+                "{fence} bars the upload, so it authorizes the removal"
+            );
+        }
+        let s = SimStorage::new(SimClock::new(start()));
+        s.put_bytes(BODY_KEY, b"one".to_vec(), None).await.unwrap();
+        s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
+        assert_eq!(s.body_removals(), (1, vec![BODY_KEY.to_string()]));
+
+        // Companions, views and claims are not bodies, and a key that was
+        // already absent was not removed by this call — neither is even asked
+        // about, so neither moves the denominator.
+        let s = SimStorage::new(SimClock::new(start()));
+        s.insert(&format!("{BODY_KEY}.meta.json"), b"{}".to_vec());
+        s.insert("packages/p/.origin", b"mirror".to_vec());
+        s.insert("simple/p/index.json", b"{}".to_vec());
+        s.delete_keys(&[
+            format!("{BODY_KEY}.meta.json"),
+            "packages/p/.origin".to_string(),
+            "simple/p/index.json".to_string(),
+            BODY_KEY.to_string(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(s.body_removals(), (0, Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn a_demotion_fence_excuses_only_the_bytes_it_preserved() {
+        // `.mirror-quarantined` is the one fence in the system that
+        // deliberately does not bar an upload — handing the filename to private
+        // truth IS the demotion's intended resolution — so it can stand over
+        // bytes it never adjudicated. Reading it as authorization is how a
+        // settle destroyed acked bytes on seeds 86001009016 and 40000042940.
+        // What earns the delete is the `_quarantine/` copy, and only for the
+        // bytes actually going away.
+        let marker = format!("{BODY_KEY}.mirror-quarantined");
+
+        let s = SimStorage::new(SimClock::new(start()));
+        s.put_bytes(BODY_KEY, b"one".to_vec(), None).await.unwrap();
+        s.insert(&marker, b"{}".to_vec());
+        s.insert(&quarantine_copy_key(b"one"), b"one".to_vec());
+        s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
+        assert_eq!(s.body_removals(), (1, Vec::new()));
+
+        // The marker alone is not authorization: this is the settle that
+        // dropped before it preserved, and `--break demote-lossy` is its kill.
+        let s = SimStorage::new(SimClock::new(start()));
+        s.put_bytes(BODY_KEY, b"one".to_vec(), None).await.unwrap();
+        s.insert(&marker, b"{}".to_vec());
+        s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
+        assert_eq!(s.body_removals(), (1, vec![BODY_KEY.to_string()]));
+
+        // Nor is a copy of somebody ELSE's bytes: a private publish landing
+        // under the standing marker replaces the body the settle read, and
+        // deleting on the strength of the old copy destroys bytes no
+        // `_quarantine/` object holds.
+        let s = SimStorage::new(SimClock::new(start()));
+        s.put_bytes(BODY_KEY, b"raced".to_vec(), None)
+            .await
+            .unwrap();
+        s.insert(&marker, b"{}".to_vec());
+        s.insert(&quarantine_copy_key(b"one"), b"one".to_vec());
+        s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
+        assert_eq!(s.body_removals(), (1, vec![BODY_KEY.to_string()]));
+    }
+
+    #[tokio::test]
+    async fn a_standing_sidecar_excuses_nothing() {
+        // There is no sidecar carve-out. A mirror upload publishes its sidecar
+        // BEFORE the fence check that can still refuse it (`src/publish.rs`),
+        // so excusing a delete because a mirror sidecar stands would waive the
+        // invariant over exactly the 115b9ca shape this oracle exists for — a
+        // publish freeing the immutable key it had just won. Mirror cache
+        // eviction, the product's one unfenced body delete, is single-bucket
+        // only (`delete_record` 409s it with more than one bucket) and this
+        // workload draws mirror records only on partitioned seeds, so no
+        // legitimate execution here needs the excuse.
+        for origin in ["mirror", "private"] {
+            let s = SimStorage::new(SimClock::new(start()));
+            s.put_bytes(BODY_KEY, b"one".to_vec(), None).await.unwrap();
+            s.insert(
+                &format!("{BODY_KEY}.meta.json"),
+                format!(r#"{{"sha256":"x","size":3,"origin":"{origin}"}}"#).into_bytes(),
+            );
+            s.insert("packages/p/.origin", br#"{"origin":"mirror"}"#.to_vec());
+            s.delete_keys(&[BODY_KEY.to_string()]).await.unwrap();
+            assert_eq!(
+                s.body_removals(),
+                (1, vec![BODY_KEY.to_string()]),
+                "a {origin} sidecar is not authorization to destroy the body"
+            );
+        }
     }
 
     #[tokio::test]

@@ -407,6 +407,32 @@ The invariants:
   delete. A freeze is *not* an exemption: `freeze_side` writes its marker,
   copies the body to `_quarantine/` and tombstones before it drops anything, so
   a frozen filename owes the fleet every byte-set it acked, findable somewhere;
+- **untyped disappearance** — an artifact body never leaves a bucket unless the
+  *filename* is durably closed (a `.tombstone` or a `.frozen`, the two markers
+  `publish_record` refuses over) or the *bytes* are durably kept (a
+  `_quarantine/` copy of exactly them). The only *continuous* oracle here —
+  every other one reads the final world, so the corruption they catch has to
+  have been made permanent first. Freeing an immutable filename is already
+  broken at the instant it happens: a rebuild that read those bytes publishes a
+  sidecar over the empty key, the next upload wins the create with different
+  bytes, and the bucket serves body B under body A's published sha256 forever.
+  Getting SELF_CONSISTENCY to see that took two *more* faults on the
+  compensation path, which is why `115b9ca` cost ~16M seeds; watched at the
+  delete itself the same bug is depth 1, and `--sweep-faults` reds it at op 8 of
+  seed 7384. Recorded in `SimStorage::body_removals` rather than in the
+  `Observer`, which collapses put and delete into one `EffectKind` and never
+  sees the warm-bucket audits at all. Note what is *not* on the authorized list.
+  `.mirror-quarantined` is the one fence that deliberately does not bar an
+  upload, so it can stand over bytes it never adjudicated — the loss measured on
+  seeds `86001009016` and `40000042940` — and only the `_quarantine/` copy
+  excuses that delete. A mirror *sidecar* is not an excuse either: a mirror
+  upload publishes its sidecar before the fence check that can still refuse it,
+  so a sidecar carve-out would waive the invariant over the very shape this
+  oracle exists for. (Mirror cache eviction, the product's one unfenced body
+  delete, needs no carve-out: it is single-bucket only, and this workload draws
+  mirror records only on partitioned seeds.) `--break demote-lossy` is the kill
+  — a demotion fence standing over a body in no `_quarantine/` copy — and
+  `conserve` and `slow-repair` red it alongside their own oracle;
 - **staleness** — bounded agreement, on a clock. See below.
 
 ### Bounded staleness: how long "converged" is allowed to take

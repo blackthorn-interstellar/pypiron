@@ -1180,9 +1180,10 @@ enum R {
     FreezeJustified,
     OriginTerminality,
     SelfConsistency,
+    UntypedDisappearance,
 }
 
-const REACH_SLOTS: usize = 23;
+const REACH_SLOTS: usize = 24;
 
 /// `(label, what exactly one execution counts)` — in `R`'s declaration order.
 const REACH_METER: [(&str, &str); REACH_SLOTS] = [
@@ -1266,6 +1267,10 @@ const REACH_METER: [(&str, &str); REACH_SLOTS] = [
         "SELF_CONSISTENCY",
         "stored body re-hashed against its own sidecar",
     ),
+    (
+        "UNTYPED_DISAPPEARANCE",
+        "artifact body removal weighed against what stood beside it",
+    ),
 ];
 
 /// The violation prefix each reach slot's oracle pushes, in `R`'s declaration
@@ -1301,6 +1306,7 @@ const REACH_VIOLATION_PREFIX: [&str; REACH_SLOTS] = [
     "FREEZE_UNJUSTIFIED",
     "ORIGIN_TERMINALITY",
     "SELF_CONSISTENCY",
+    "UNTYPED_DISAPPEARANCE",
 ];
 
 /// Zeros that are a known property of the harness or the product, not a hole.
@@ -1416,6 +1422,11 @@ impl Reach {
     }
     fn hit(&self, slot: R) {
         self.slots[slot as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    /// `n` executions at once, for an oracle whose subject is a count the run
+    /// already tallied rather than a loop the oracle walks.
+    fn hits(&self, slot: R, n: u64) {
+        self.slots[slot as usize].fetch_add(n, Ordering::Relaxed);
     }
     /// Close a seed: every slot whose total moved since the last boundary
     /// executed on it. Called once per seed by the driver, after the optional
@@ -4318,6 +4329,47 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         }
     }
 
+    // UNTYPED_DISAPPEARANCE: an artifact body may not leave a bucket unless the
+    // FILENAME is durably closed (`.tombstone`/`.frozen`, the two markers
+    // `publish_record` refuses over) or the BYTES are durably kept (a
+    // `_quarantine/` copy of exactly them). Nothing else authorizes it — least
+    // of all `.mirror-quarantined`, the one fence that deliberately leaves the
+    // canonical key writable, so it can stand over bytes it never adjudicated.
+    //
+    // Every other oracle here reads the FINAL world, so the corruption they
+    // catch has to have been made permanent before they can see it. Freeing an
+    // immutable filename is already broken at the instant it happens: a rebuild
+    // that read those bytes publishes a sidecar over the empty key, the next
+    // upload wins the create with different bytes, and the bucket serves body B
+    // under body A's published sha256 forever. Getting SELF_CONSISTENCY to see
+    // that took two MORE faults on the compensation path — the size verify had
+    // to fault so it never overwrote the fabricated sidecar, and the backfill's
+    // retracting delete had to fault too. Depth 3, and 115b9ca cost ~16M seeds
+    // of lottery. Watched continuously it is depth 1, which is what makes it
+    // reachable by `--sweep-faults`.
+    //
+    // Recorded by `SimStorage` because that is where the predicate already
+    // lives and where every writer is visible. The `Observer` effect log is
+    // not: `EffectKind::TruthWrite` collapses put and delete into one kind, and
+    // the warm-bucket audits build their state over the raw bucket, so every
+    // body `tombstone::complete_interrupted_deletes` drops is invisible to it.
+    for (idx, bucket) in fleet.buckets.iter().enumerate() {
+        let (weighed, freed) = bucket.body_removals();
+        // One execution per removal weighed, fenced or not: the question is
+        // asked at every body delete, and these are the ones answered wrong.
+        REACH.hits(R::UntypedDisappearance, weighed);
+        for key in freed {
+            violations.push(format!(
+                "UNTYPED_DISAPPEARANCE: bucket {idx} freed the immutable filename {key} — the \
+                 body was removed with no .tombstone and no .frozen closing the name, and no \
+                 _quarantine/ copy of those exact bytes keeping them, so nothing authorized the \
+                 removal and nothing records that they ever stood there. The name is re-creatable \
+                 by any writer now, and a sidecar already naming the old bytes will publish them \
+                 over whatever lands next"
+            ));
+        }
+    }
+
     let ledger = fleet.ledger.lock().expect("ledger lock");
 
     // Convergence: identical truth + views across buckets.
@@ -5984,7 +6036,7 @@ fn sweep_faults(args: &Args, started: std::time::Instant) -> i32 {
     0
 }
 
-/// The 23 reach counters, as a relaxed-atomic snapshot. Diffed around one
+/// The 24 reach counters, as a relaxed-atomic snapshot. Diffed around one
 /// `run_once` this is that run's per-oracle execution count — the meter itself
 /// is process-wide and cumulative, and `--trace-jsonl` traces one seed's first
 /// execution, which is exactly the interval between two of these.

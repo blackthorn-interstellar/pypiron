@@ -187,6 +187,84 @@ single membership bit.
 Not modeled: counter rollups, the transparency chain, project status, read
 locality, concurrent mergers, and the N-bucket star composition. What backs up
 each exclusion is not the same, and the difference is the point of this section.
+Read locality is the one exclusion with a mechanized adversary of its own — the
+conformance walk below — rather than nothing.
+
+### The read-pin conformance walk
+
+Both models stop at the write pin and `examples/vopr.rs` has no read-affinity
+op, so the read pin had no mechanized adversary at all until `cc9627d` shipped
+two defects in `evaluate_read` and both tiers missed them. The walk
+(`src/bucket_health.rs`, `mod conformance_walk`) covers that class: seeded
+random fault, upload and drain schedules driven against the **real**
+`HealthController`, not a transcription of it — a transcribed model is exactly
+how the gap opened, so a transcription gap cannot re-open it. It owns the ground
+truth the controller cannot see (which buckets are actually reachable, how many
+`_repl/` repair notes the region bucket is owed) and mirrors the two contracts
+that decide the pin: the startup sequence in `src/app.rs` and the worker cycle in
+`src/worker.rs`, every mirrored behavior citing the lines it copies.
+
+Two fidelity rules are what make a violation mean anything, and both are
+load-bearing — an earlier revision had neither and reported two "defects" the
+real code cannot reach.
+
+- **Reachable start states.** Every run boots the way `app::serve` does:
+  storages are observed before any pin exists, so a reachable bucket is already
+  `Healthy` with its topology stamp acknowledged (app.rs:1088-1130); an
+  unreachable one is collapsed through the leave threshold (app.rs:1132-1137);
+  and only then is the read pin seeded, onto the region bucket if and only if it
+  was reachable *and* owed nothing (app.rs:1191-1200). A fresh controller with a
+  pin on a never-observed bucket is not a state this system has, and starting
+  there manufactures a stamp-raise that looks like a defect.
+- **Bounded intra-cycle time.** Simulated time inside one worker cycle is capped
+  at what a real cycle can span — one `BUCKET_HEALTH_IO_TIMEOUT` per probe, per
+  caught-up LIST and per topology verification, so `(2N+1) s` for N buckets. The
+  walk's return window is set *longer* than that worst case, which is the real
+  ratio (300 s default against a few seconds) at its most adversarial. Without
+  that bound the walk can let a bucket fail, recover and re-earn a full return
+  window inside a single cycle, which no shipped configuration permits.
+
+Three oracles: the loan flag may never outlive the pin (every step); at
+quiescence, reads may not be served from the region bucket while it still owes
+the debt it owed when they were admitted; and, also at quiescence, a healthy
+region bucket that owes nothing must actually be serving the reads — which is
+what stops a fix from simply demoting harder. "Served" means the pin the request
+path really uses: `BucketSet::read_pin` aliases the write pin until read
+affinity is activated (buckets.rs:247-256), so the controller's belief is not
+automatically the answer.
+
+The fast tier (256 seeds x 400 steps, ~0.13 s) runs in `cargo test`; the deep
+tier is `#[ignore]`d and runs nightly in `.github/workflows/simulation.yml`,
+sized by `PYPIRON_WALK_SEEDS` / `PYPIRON_WALK_START` / `PYPIRON_WALK_STEPS`. A
+failure prints the seed, the boot outcome, the violated oracle and the full step
+trace; the seed alone reproduces it:
+
+```sh
+PYPIRON_WALK_SEEDS=1 PYPIRON_WALK_START=<seed> \
+  cargo test --lib read_pin_conformance_walk_deep -- --ignored --nocapture
+```
+
+It is proven to fire, not assumed to: five mutations each fail the suite — losing
+the loan expiry, clearing the loan flag on a demotion that moved nothing,
+expiring loans that were never loans, dropping the caught-up clear, and undoing
+the boot loan marking below. Four die inside the fast tier's own seed set; the
+caught-up clear is pinned by a directed unit test instead. There are no oracle
+allowances: every violation the walk reports is one to fix.
+
+**What it found.** A node that boots while its write home is down fails the write
+pin over onto its region bucket, and `region_owed_no_notes` cannot call that
+bucket converged — it LISTs every peer and an unreachable one alone forces a no.
+Startup therefore recorded reads on the region bucket while `seed_read_pin` was
+skipped, and recorded them as *earned*. When the home healed and the write pin
+went back, `evaluate_read` found no loan to expire, so the read pin never moved
+again — which meant the worker never proposed a read switch, `BucketSet` never
+activated read affinity, and every read was served from the write bucket for the
+life of the process. Correct bytes throughout, which is why nothing else caught
+it. The pin is now marked as the loan it is, and the `cc9627d` machinery takes it
+from there. A sibling shape — a region bucket whose stamp is under
+re-verification retaining the pin ungated — is closed by demoting on
+`topology_blocked` in the same retention branch, fail-closed: an ineligible
+bucket may be accruing repair notes, so it re-earns through the gate on ack.
 
 The N-bucket star is the load-bearing exclusion — the model enumerates
 *pairwise* confluence, and pairwise implies N-way only if the merge is

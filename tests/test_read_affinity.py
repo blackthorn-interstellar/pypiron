@@ -23,7 +23,10 @@ reads elsewhere (writes move, reads do not). The write-home case runs a
 three-region topology on purpose, so "the read pin stayed home" and "the read pin
 followed the write pin" are distinguishable outcomes. A node whose region bucket
 is already dark when it boots is covered too: startup succeeds, reads follow the
-write bucket, and they move home once it recovers.
+write bucket, and they move home once it recovers. So is the reverse boot — the
+write home already dark: both pins land on the region bucket as a loan, and when
+the home returns, writes go back to it while reads re-earn the region bucket
+through the drain gate instead of following the write pin forever.
 """
 
 from __future__ import annotations
@@ -553,6 +556,58 @@ def test_the_read_pin_is_lent_to_the_region_bucket_and_taken_back(
         timeout=20,
         what="reads return to B once it is caught up",
     )
+
+
+def test_read_affinity_survives_a_boot_with_the_write_home_down(
+    s3_server_read_affinity_home_down, tmp_path, uv_path, uv_venv
+):
+    """A node that boots while its write home is dark must not lose region read
+    affinity for the rest of its life.
+
+    Startup fails the write pin over onto the region bucket B, and cannot call B
+    converged — an unreachable peer alone forces that verdict — so reads sit on B
+    only because the write pin does. Recording that as a pin B *earned* is fatal
+    in a quiet way: when A returns and the write pin goes home there is no loan to
+    expire, so the read pin never moves again, the worker never proposes a read
+    switch, the distinct read pin is never activated, and every read is served
+    from A forever. Reads being correct the whole time is exactly why nothing
+    else catches it. The end state asserted here is the point: writes home on A,
+    reads back on B."""
+    server = s3_server_read_affinity_home_down
+    minio = server["minio"]
+    a, b = minio["buckets"]
+    faults = server["faults"]
+
+    # Boot landed on the region bucket for both pins: A is dark, B is all there is.
+    _eventually(lambda: _write_bucket(server) == b, what="writes fail over to B at boot")
+    _eventually(lambda: _read_bucket(server) == b, what="reads follow the write pin to B")
+
+    # A record published during the outage, so there is something to serve.
+    pkg = "bootloan"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    _upload(server, wheel)
+    wait_for_file_in_index(server["simple"], pkg, wheel.name)
+
+    # The write home comes back and the write pin returns to it.
+    faults.recover(a)
+    _eventually(lambda: _bucket_health(server, a) == 1, timeout=20, what="A healthy again")
+    _eventually(lambda: _write_bucket(server) == a, timeout=30, what="writes return home to A")
+
+    # The loan is surrendered with the write pin, and B then earns the read pin
+    # back through the ordinary drain gate. Before the fix reads stayed on A for
+    # the life of the process, so this is the assertion that fails pre-fix.
+    _eventually(
+        lambda: _read_bucket(server) == b,
+        timeout=30,
+        what="region read affinity is alive after the write pin goes home",
+    )
+    settle = time.monotonic() + 3.0
+    while time.monotonic() < settle:
+        assert _write_bucket(server) == a, "writes drifted off the home bucket"
+        assert _read_bucket(server) == b, "reads drifted off the region bucket"
+        time.sleep(0.2)
+
+    _install(server, uv_path, uv_venv, pkg)
 
 
 #: Region label on the third bucket of the write-failover topology — a region no

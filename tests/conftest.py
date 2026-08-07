@@ -1838,6 +1838,29 @@ def _start_read_affinity_server(
 
 
 @pytest.fixture()
+def s3_server_read_affinity_home_down(
+    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
+) -> Iterator[Dict]:
+    """Same topology, but the write-home bucket (A) is already failing when the
+    node boots. Startup then fails the write pin over onto the region bucket (B)
+    and cannot confirm B converged — `region_owed_no_notes` LISTs every peer and
+    an unreachable one alone makes it answer no — so reads are recorded on B as
+    the write pin's loan rather than a pin B earned. The fault is armed on the
+    proxy before the server fixture starts, which is the only way to exercise a
+    boot-time outage."""
+    a, _b = minio_two_proxy["buckets"]
+    minio_two_proxy["faults"].fail(a)
+    yield from _start_read_affinity_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        node_region=READ_AFFINITY_NODE_REGION,
+        leave_failures=3,
+        return_healthy_secs=2,
+    )
+
+
+@pytest.fixture()
 def s3_server_read_affinity(
     tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
 ) -> Iterator[Dict]:

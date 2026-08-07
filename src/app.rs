@@ -1195,7 +1195,7 @@ async fn run_serve(
                 let converged =
                     reachable && replicate::region_owed_no_notes(buckets.handles(), region).await;
                 let read_index = if converged { region } else { write_index };
-                health.configure_read_affinity(region, read_index)?;
+                health.configure_read_affinity(region, read_index, converged)?;
                 if converged {
                     buckets.seed_read_pin(region);
                     info!(
@@ -1204,10 +1204,16 @@ async fn run_serve(
                         "read affinity: serving reads from region bucket"
                     );
                 } else if reachable {
+                    // `read_index` is the write pin here, which may itself BE the
+                    // region bucket when the write home was down at boot. Reads
+                    // are on it either way only as the write pin's loan, so the
+                    // sentence holds in both shapes: nothing is pinned to the
+                    // region bucket on its own account until the gate says so.
                     info!(
                         region = %node.region,
                         bucket = %buckets.handles()[region].name,
-                        "read affinity: region bucket still converging (backfill or repair notes outstanding); reads follow the write bucket until it catches up"
+                        write_bucket = %buckets.handles()[buckets.pin().index].name,
+                        "read affinity: region bucket still converging (peer unreachable, backfill, or repair notes outstanding); reads follow the write bucket until it catches up"
                     );
                 } else {
                     warn!(

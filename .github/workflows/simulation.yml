@@ -357,6 +357,52 @@ jobs:
           grep -a '^reproduce:' vopr.out | head -3 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+  # The read pin is the one selection surface neither tier above touches: the
+  # VOPR has no read-affinity op and both stateright models stop at the write
+  # pin, which is why the two defects `cc9627d` fixed shipped. This lane closes
+  # that class in-crate — a randomized conformance walk driving the REAL
+  # `HealthController` (not a transcription, so a transcription gap cannot hide a
+  # bug) through fault/upload/drain schedules. dev/TESTING.md has the details;
+  # the fast tier runs on every merge inside `cargo test`.
+  read-pin-walk:
+    name: read-pin conformance walk (deep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Seeds stride by day like the VOPR rows: every night explores fresh
+      # schedules, and any night's failure still reproduces from its printed
+      # seed alone. 5M seeds is ~10 minutes on a runner, and the timeout above
+      # leaves room for a cold release build on top.
+      - name: Walk the read pin through randomized fault schedules
+        env:
+          PYPIRON_WALK_SEEDS: '5000000'
+        run: |
+          PYPIRON_WALK_START=$(( ( $(date +%s) / 86400 ) * 5000000 )) \
+            cargo test --release --lib read_pin_conformance_walk_deep \
+            -- --ignored --nocapture 2>&1 | tee walk.out
+      # `--ignored` runs ONLY ignored tests and libtest exits 0 when a filter
+      # matches nothing, so a rename or an un-ignore would leave this job running
+      # nothing and reporting success. Name what must run.
+      - name: Assert the deep walk actually ran
+        run: |
+          grep -qE '^test bucket_health::conformance_walk::read_pin_conformance_walk_deep \.\.\. ok' walk.out || {
+            echo 'read_pin_conformance_walk_deep did not run — the nightly walk is empty' >&2
+            exit 1
+          }
+      - name: Publish the sample size
+        if: always()
+        run: |
+          echo '### Read-pin conformance walk' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -aE '^read-pin conformance walk:|^  (reproduce|seed|topology|boot|step|detail):' walk.out \
+            >> "$GITHUB_STEP_SUMMARY" || echo '(no result line — the walk did not complete)' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
   model-deep:
     name: stateright (deep configurations)
     runs-on: ubuntu-latest

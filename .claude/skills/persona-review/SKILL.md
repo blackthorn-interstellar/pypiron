@@ -26,7 +26,9 @@ do: by stalling, eye-rolling, and leaving. Protocol and iron rules live in
 | docs/reference/configuration.md | grumpy-sre, platform-veteran (prose only — tables are tables) |
 
 platform-veteran (the taste probe) is cheap and catches frame defects on any
-page; include it whenever in doubt. Opus is the primary actor model; Grok is
+page; include it whenever in doubt. Known blind spot, learned the hard way:
+realistic actors skim ledes, so skimmed regions get zero scrutiny — the
+veteran's brief forbids it from skimming openers; hold it to that. Opus is the primary actor model; Grok is
 a second opinion only (benchmarked thinner).
 
 ## 2. Run actors, then one analyst

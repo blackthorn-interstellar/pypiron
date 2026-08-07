@@ -10,7 +10,7 @@ edited materially since its row is due for a fresh pass.
 | docs/concepts.md | all six + platform-veteran ×2 | 2026-08-03 | 59ebcac, 971bfbe, 44efb95 |
 | docs/security.md | security-lead, platform-veteran | 2026-08-03 | 59ebcac, f6d4f45, ee07273, 44efb95 |
 | docs/testing.md | platform-veteran (security-lead skimmed) | 2026-08-03 | 44efb95 (notes 13–14 open with owner) |
-| docs/guides/standard-cloud.md | artifactory-refugee, junior-dev, grumpy-sre, platform-veteran ×3 — two blind rounds calibrated the residue test (round 2 missed the lede, round 3 flagged it) | 2026-08-07 | 59ebcac, 44efb95, ca0ec1a |
+| docs/guides/standard-cloud.md | artifactory-refugee, junior-dev, grumpy-sre, platform-veteran ×3 — two blind rounds calibrated the residue test (round 2 missed the lede, round 3 flagged it) | 2026-08-07 | 59ebcac, 44efb95, e66774a |
 | docs/guides/air-gapped.md | airgapped-ops, platform-veteran | 2026-08-03 | 59ebcac, ee07273, 44efb95 |
 | docs/guides/multi-region.md | platform-veteran | 2026-08-03 | 44efb95 |
 | docs/guides/migrate.md | platform-veteran | 2026-08-03 | clean — no notes |

@@ -64,6 +64,33 @@ const PACKAGE_SWEEP_CONCURRENCY: usize = 8;
 /// cycle, not one failure after minutes of SDK retries.
 const BUCKET_HEALTH_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The longest wall clock one worker cycle can span, and therefore the oldest a
+/// "the region bucket caught up" verdict can be by the time the read-return gate
+/// consumes it. A cycle serially awaits one health probe per bucket
+/// ([`probe_buckets`]), the caught-up LIST against each peer
+/// ([`region_bucket_caught_up`]), and topology verification for a recovered
+/// bucket ([`maintain_bucket_selection`]) — each bounded by
+/// [`BUCKET_HEALTH_IO_TIMEOUT`].
+fn worst_case_cycle_span(bucket_count: usize) -> std::time::Duration {
+    BUCKET_HEALTH_IO_TIMEOUT * (2 * bucket_count as u32 + 1)
+}
+
+/// The cycle span a read-return window fails to clear, or `None` when it clears
+/// it. A window at or below one worst-case cycle lets a region bucket fail,
+/// recover, and mature the whole window inside a single cycle, so reads can be
+/// admitted back to it on a caught-up verdict up to a cycle stale. The cost is
+/// bounded: a read that beats a just-missed file to the region bucket is served
+/// from the write home by read-through — latency, never a 404 — so startup warns
+/// (`src/app.rs`) and boots. Single-bucket nodes have no read affinity and no
+/// gate, so they never qualify.
+pub(crate) fn read_return_window_under_floor(
+    bucket_count: usize,
+    return_healthy: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let floor = worst_case_cycle_span(bucket_count);
+    (bucket_count > 1 && return_healthy <= floor).then_some(floor)
+}
+
 /// The per-project PEP 792 status sidecar as it appears in a `packages/<pkg>/`
 /// listing (prefix stripped). Presence in the listing is the cheap gate before
 /// the sweep pays a status read to derive the quarantined-project set (rung 5).
@@ -3749,6 +3776,40 @@ mod tests {
             time::Duration::ZERO,
         )
         .is_empty());
+    }
+
+    /// The floor is one worst-case cycle — probe every bucket, LIST every peer,
+    /// verify one topology — so it grows with the topology, and the boundary is
+    /// inclusive: a window exactly one cycle long can still mature inside one.
+    #[test]
+    fn a_read_return_window_clears_the_floor_only_above_a_worst_case_cycle() {
+        // Two buckets: 2*2+1 = 5 s.
+        assert_eq!(
+            read_return_window_under_floor(2, Duration::from_secs(5)),
+            Some(Duration::from_secs(5)),
+            "a window equal to the cycle span is still short enough to mature inside one"
+        );
+        assert_eq!(
+            read_return_window_under_floor(2, Duration::from_secs(6)),
+            None
+        );
+        // Three buckets: 2*3+1 = 7 s, so a window that cleared two buckets does
+        // not clear three.
+        assert_eq!(
+            read_return_window_under_floor(3, Duration::from_secs(6)),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            read_return_window_under_floor(3, Duration::from_secs(8)),
+            None
+        );
+        // The shipped default clears every plausible topology.
+        assert_eq!(
+            read_return_window_under_floor(9, Duration::from_secs(300)),
+            None
+        );
+        // One bucket has no read affinity and no return gate at all.
+        assert_eq!(read_return_window_under_floor(1, Duration::ZERO), None);
     }
 
     fn seed_private_artifact(storage: &InMemStorage, pkg: &str, filename: &str) {

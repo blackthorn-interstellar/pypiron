@@ -860,6 +860,53 @@ def test_private_name_never_falls_through_on_a_region_bucket_absence(
     assert pkg not in new_upstream, f"upstream was consulted for a private name:\n{new_upstream}"
 
 
+def test_a_short_read_return_window_is_warned_about_at_startup(
+    tmp_path_factory, pypiron_bin, minio_two_proxy
+):
+    """A return window no longer than one health cycle lets a recovered region
+    bucket take reads back on a check that is already a cycle old. The cost is
+    bounded — a missed file is read through from the write bucket — so startup
+    says so and boots. Both sides: 2 s over two buckets is under the 5 s floor and
+    warns; 600 s clears it and says nothing, with the read-affinity lines proving
+    the node really did configure region reads. Servers run one at a time so the
+    two nodes never share the topology."""
+    short_gen = _start_read_affinity_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        node_region=READ_AFFINITY_NODE_REGION,
+        leave_failures=3,
+        return_healthy_secs=2,
+    )
+    try:
+        log = next(short_gen)["log_path"].read_text()
+        assert "read affinity: --bucket-return-healthy-secs 2 is at or below the 5s" in log, (
+            f"no startup warning for a below-floor return window:\n{log}"
+        )
+        assert "Raise --bucket-return-healthy-secs above 5" in log, "the warning states no remedy"
+    finally:
+        short_gen.close()
+
+    long_gen = _start_read_affinity_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        node_region=READ_AFFINITY_NODE_REGION,
+        leave_failures=3,
+        return_healthy_secs=600,
+    )
+    try:
+        log = next(long_gen)["log_path"].read_text()
+        assert "region bucket" in log, (
+            "read affinity was never configured, so absence proves nothing"
+        )
+        assert "--bucket-return-healthy-secs" not in log, (
+            f"a window well above the floor was warned about anyway:\n{log}"
+        )
+    finally:
+        long_gen.close()
+
+
 def test_no_region_node_reads_from_the_write_bucket(s3_server_read_affinity_no_region, tmp_path):
     """Fail-safe default: a node that matches no region bucket keeps its read pin
     equal to its write pin (A). The fan-out still copies to B, but reads never

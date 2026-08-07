@@ -1183,6 +1183,20 @@ async fn run_serve(
             .position(|spec| node_region::matches(node, spec))
         {
             Some(region) => {
+                // The gate that returns reads to a recovered region bucket runs
+                // on a caught-up verdict refreshed once per worker cycle. A
+                // return window no longer than one cycle can therefore mature
+                // entirely inside one, on a verdict that is already stale.
+                let count = buckets.handles().len();
+                if let Some(floor) = worker::read_return_window_under_floor(
+                    count,
+                    Duration::from_secs(cli.bucket_return_healthy_secs),
+                ) {
+                    let (configured, floor) = (cli.bucket_return_healthy_secs, floor.as_secs());
+                    warn!(
+                        "read affinity: --bucket-return-healthy-secs {configured} is at or below the {floor}s a health check can take over {count} buckets, so a recovered region bucket can take reads back on a check up to one cycle old; a file it missed in the meantime is served from the write bucket instead — slower, never a 404. Raise --bucket-return-healthy-secs above {floor} to close the window."
+                    );
+                }
                 // A read pin is only worth seeding to a bucket that startup could
                 // reach AND that holds the whole corpus. A freshly-added region
                 // bucket seeds a backfill sentinel under its peers'

@@ -1599,6 +1599,14 @@ mod conformance_walk {
     /// re-earn the full window inside a single cycle. 10 s clears the widest
     /// topology here (3 buckets, 7 s) by the narrowest margin that still does —
     /// far more adversarial than the shipped 40x ratio, and still sound.
+    ///
+    /// An operator can configure a window the walk therefore does not model: one
+    /// at or below a worst-case cycle, where reads may return to the region
+    /// bucket on a caught-up verdict up to a cycle stale. The consequence is
+    /// bounded (a missed file is read through from the write home, never a 404),
+    /// so startup warns rather than refuses — `read_return_window_under_floor`
+    /// (src/worker.rs) computes the floor from the same constants this walk
+    /// mirrors, and `src/app.rs` logs it beside the read-affinity decision.
     const RETURN_WINDOW: Duration = Duration::from_secs(10);
 
     /// Consecutive quiet worker cycles that define quiescence: the return window

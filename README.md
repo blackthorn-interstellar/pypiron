@@ -19,10 +19,16 @@ An ultra-fast, rock-solid PyPI server.
 - **Add nodes against one bucket — no database, no coordinator.**
 - **Supports [cross-region](docs/guides/multi-region.md) and cross-cloud high availability.**
 - **Works with local disk, AWS S3, GCP, and Azure.**
-- **[Web GUI with dashboard, package pages, and search](docs/assets/demo.gif).**
+- **[Web GUI with dashboard, package pages, and search](docs/assets/server-gui.png).**
 - **[Vulnerability audit](docs/security.md) ranked by your org's installs.**
 - **[Health checks](docs/concepts.md#what-it-tells-you) and Prometheus metrics built in.**
 - **Comprehensively tested via [fuzzing](dev/TESTING.md#fuzzing), [chaos testing](dev/TESTING.md#chaos-and-crash-consistency), [deterministic simulation](dev/TESTING.md#deterministic-simulation-the-vopr), [model checking](dev/TESTING.md#machine-checked-models-stateright), [real clouds](dev/TESTING.md#real-cloud-backends), [perf](dev/TESTING.md#performance-testing), and [all 17 million files on PyPI](src/corpus_check.rs).**
+
+<p align="center">
+  <a href="docs/assets/server-gui.png">
+    <img src="docs/assets/server-gui.png" alt="pypiron web dashboard" width="900">
+  </a>
+</p>
 
 
 ## Getting started
@@ -155,7 +161,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="docs/assets/demo.gif">Web GUI</a></td>
+      <td colspan="2"><a href="docs/assets/server-gui.png">Web GUI</a></td>
       <td align="center">✅</td>
       <td align="center">—</td>
       <td align="center">—</td>

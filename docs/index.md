@@ -25,10 +25,16 @@ An ultra-fast, rock-solid PyPI server.
 - **Add nodes against one bucket — no database, no coordinator.**
 - **Supports [cross-region](guides/multi-region.md) and cross-cloud high availability.**
 - **Works with local disk, AWS S3, GCP, and Azure.**
-- **[Web GUI with dashboard, package pages, and search](assets/demo.gif).**
+- **[Web GUI with dashboard, package pages, and search](assets/server-gui.png).**
 - **[Vulnerability audit](security.md) ranked by your org's installs.**
 - **[Health checks](concepts.md#what-it-tells-you) and Prometheus metrics built in.**
 - **Comprehensively tested via [fuzzing](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#fuzzing), [chaos testing](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#chaos-and-crash-consistency), [deterministic simulation](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#deterministic-simulation-the-vopr), [model checking](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#machine-checked-models-stateright), [real clouds](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#real-cloud-backends), [perf](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#performance-testing), and [all 17 million files on PyPI](https://github.com/blackthorn-interstellar/pypiron/blob/master/src/corpus_check.rs).**
+
+<p align="center">
+  <a href="assets/server-gui.png">
+    <img src="assets/server-gui.png" alt="pypiron web dashboard" width="900">
+  </a>
+</p>
 
 
 ## Getting started
@@ -161,7 +167,7 @@ docker run -p 8080:8080 -e PYPIRON_ADMIN_PASS="$ADMIN" ghcr.io/blackthorn-inters
       <td align="center">—</td>
     </tr>
     <tr>
-      <td colspan="2"><a href="assets/demo.gif">Web GUI</a></td>
+      <td colspan="2"><a href="assets/server-gui.png">Web GUI</a></td>
       <td align="center">✅</td>
       <td align="center">—</td>
       <td align="center">—</td>

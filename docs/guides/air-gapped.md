@@ -40,8 +40,10 @@ urllib3
 six
 ```
 
-List syntax, version specifiers, and excludes:
-[Approval lists](../concepts.md#what-it-keeps-out).
+The list is literal — nothing resolves dependencies for you. Generate it from
+a lockfile (`uv export` emits the full closure) so a transitive dependency
+doesn't 404 on the inside. List syntax, version specifiers, and excludes:
+[Mirror selection](../reference/configuration.md#mirror-selection).
 
 `pypiron.toml` on the connected host:
 
@@ -65,7 +67,7 @@ pypiron sync --config pypiron.toml
 ```
 
 `PYPIRON_SYNC_ADMIN_PASS` is the serving host's admin password: sync delivers
-over HTTP like any other publisher, so this shape needs a network path from
+over HTTP like any other publisher, so this setup needs a network path from
 the connected host to the serving host — put TLS in front or keep it on a
 locked-down transfer network. Re-running sync is normal — existing files stay.
 Yanks, removals, and project status follow upstream.
@@ -79,24 +81,35 @@ server on the connected side and carry the storage itself:
 # connected side: a throwaway staging server on local disk
 PYPIRON_DATA_DIR=/srv/staging PYPIRON_ADMIN_PASS="$ADMIN" pypiron serve &
 pypiron sync --config pypiron.toml --to http://localhost:8080
+kill %1 && wait          # stop the staging server: tar a tree at rest
 
 tar -C /srv/staging -cf mirror.tar . && sha256sum mirror.tar > mirror.tar.sha256
 ```
 
-Carry both files across. On the serving host:
+Carry both files across. On the serving host, with the server stopped,
+replace the tree — never untar over the old one, or upstream removals and
+yanks can't follow through on this path:
 
 ```bash
 sha256sum -c mirror.tar.sha256
-tar -C /var/lib/pypiron -xf mirror.tar
-PYPIRON_DATA_DIR=/var/lib/pypiron pypiron verify-index
+mkdir /var/lib/pypiron.new && tar -C /var/lib/pypiron.new -xf mirror.tar
+PYPIRON_DATA_DIR=/var/lib/pypiron.new pypiron verify-index --deep
+mv /var/lib/pypiron /var/lib/pypiron.old && mv /var/lib/pypiron.new /var/lib/pypiron
 ```
 
-`verify-index` exits 0 when every stored file matches its metadata; the
-serving host then points `--data-dir` at the restored tree. Deliver the
-advisory feed the same way — the local-file option below needs no network.
+`sha256sum -c` proves the media crossed intact; `verify-index --deep`
+re-hashes every file against what clients will verify and exits 0 on a clean
+tree. On this path the serving host publishes nothing — leave
+`PYPIRON_ADMIN_PASS` unset and it runs read-only, one less open write path
+inside the fence. Clients inside point at it like any index:
+`pip install --index-url http://airgapped:8080/simple/ …` (plain HTTP needs
+pip's `--trusted-host`). Deliver the advisory feed the same way — the
+local-file option below needs no network.
 
 For a full offline copy — no cooldown, yanked files included — set
-`exclude-newer = ""` and `include-yanked = true` in `[mirror]`.
+`exclude-newer = ""` and `include-yanked = true` in `[mirror]`. That switches
+both safety gates off — a deliberate trade for byte-complete mirrors; keep
+them on unless completeness is the requirement.
 
 ## Ferry the advisory feed
 
@@ -118,6 +131,10 @@ your ferry drop a fresh copy there on whatever schedule it runs:
 ```bash
 pypiron serve --advisory-feed /var/lib/pypiron/osv-pypi-all.zip
 ```
+
+The file is re-read on the daily refresh cycle
+(`--reconcile-interval-secs`) — time the ferry and the staleness alarm to
+that.
 
 However the feed arrives, blocking behaves the same. Before the first
 delivery, the block set baked into the binary at release covers the box; the

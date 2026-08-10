@@ -11,6 +11,8 @@ out behind a load balancer, and pointing clients at it.
 ## The config
 
 ```toml
+private-prefix = "acme"
+
 [serve]
 bind-addr = "0.0.0.0:8080"
 buckets = ["s3://acme-pypiron@us-east-1"]
@@ -20,6 +22,10 @@ proxy-upstream = "https://pypi.org"
 exclude-newer = "7 days"
 ```
 
+`private-prefix` claims `acme` and `acme-*` for you: with the proxy on, an
+internal name nobody has published yet would otherwise be filled from public
+PyPI — the prefix closes that
+([a name is yours or PyPI's](../concepts.md#a-name-is-yours-or-pypis-never-both)).
 `proxy-upstream` turns on the public cache: the first request for a
 public package fetches it from PyPI and writes it to the bucket, so every
 node serves it from then on. `exclude-newer` is the dependency cooldown — it
@@ -32,7 +38,9 @@ To pre-load an approved list instead of proxying, see
 Point `buckets` at an existing bucket. On AWS there's nothing else to set
 unless you use a named profile or an S3-compatible endpoint: credentials come
 from the standard chain — environment, web identity, instance role, or task
-role. GCS (`gs://`) and Azure (`az://`) work the same way, with their own
+role. On EC2 or ECS with a role attached there is nothing to configure; on a
+box without one, export `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` and it's
+the same. GCS (`gs://`) and Azure (`az://`) work the same way, with their own
 credentials: [Storage](../concepts.md#where-packages-live). Bucket policy:
 `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`, and
 `s3:AbortMultipartUpload`. That's the whole set.
@@ -78,7 +86,9 @@ WantedBy=multi-user.target
 ```
 
 Put `PYPIRON_ADMIN_PASS=...` in `/etc/pypiron/env`, mode 600 — unit files are
-world-readable.
+world-readable. On SIGTERM the server drains: `/ready` goes 503, three
+seconds pass so the balancer notices, in-flight requests finish, then it
+exits.
 
 ## More nodes
 

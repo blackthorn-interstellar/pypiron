@@ -733,7 +733,16 @@ impl Counters {
         let mut frozen: std::collections::HashSet<(char, String)> =
             std::collections::HashSet::new();
         let day_prefix = format!("{DAY_PREFIX}{metric}/{day}/");
-        for k in primary.list(&day_prefix).await.unwrap_or_default() {
+        // A transient failure listing the frozen prefix must not be read as "no
+        // frozen shards": treating it as empty would then sum the open segments
+        // of shards that were already retired into a frozen rollup, undercounting
+        // the day. Bail to `None` so the next poll retries with a full picture —
+        // the same discipline `sum_segments` uses on a transient read.
+        let frozen_keys = match primary.list(&day_prefix).await {
+            Ok(keys) => keys,
+            Err(_) => return None,
+        };
+        for k in frozen_keys {
             let Some((shard, bucket)) = frozen_shard_of(&k) else {
                 continue; // a _summary variant or a stray key
             };

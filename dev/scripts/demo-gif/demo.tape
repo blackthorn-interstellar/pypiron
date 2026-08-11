@@ -11,12 +11,12 @@ Set Shell zsh
 Set TypingSpeed 40ms
 
 Hide
-Type `cd "$PYPIRON_DEMO_DIR" && pkill -f "pypiron serve" ; export PYPIRON_DATA_DIR=data RUST_LOG=warn UV_PUBLISH_USERNAME=admin UV_PUBLISH_PASSWORD=demo && source .venv/bin/activate && clear`
+Type `cd "$PYPIRON_DEMO_DIR" && pkill -f "pypiron serve" ; export PYPIRON_DATA_DIR=data RUST_LOG=warn && source .venv/bin/activate && clear`
 Enter
 Sleep 2s
 Show
 
-Type "uvx pypiron serve --admin-pass demo &"
+Type "uvx pypiron serve --bind-addr 127.0.0.1:8080 &"
 Sleep 500ms
 Enter
 Sleep 4s

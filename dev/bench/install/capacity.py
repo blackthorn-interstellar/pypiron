@@ -95,7 +95,13 @@ def find_wheel_href(page_url: str, body: bytes, target: str) -> Optional[str]:
         urls = re.findall(r'href="([^"]+\.whl[^"]*)"', text)
     for u in (x.split("#", 1)[0] for x in urls if ".whl" in x):
         if u.rsplit("/", 1)[-1] == target:
-            return urljoin(page_url, u)
+            resolved = urljoin(page_url, u)
+            # This href is embedded single-quoted into a bash-run oha regex
+            # (mn_ramp.push_runner). A real wheel URL is percent-encoded ASCII, so
+            # reject anything shell-dangerous rather than let it break the quoting.
+            if any(c in resolved for c in "'\"`$;|&<>()\\ \t\n"):
+                return None
+            return resolved
     return None
 
 
@@ -166,6 +172,10 @@ def build_install_mix(index_url: str, arch: str, tier: str) -> dict:
             total_wheel_bytes += size_by_file[canonical[nm]]
         else:
             dropped += 1
+    if not index_urls:
+        # Every package was absent (or no closure/pin yielded a canonical set):
+        # paths_regex would index urls[0] on an empty list. Fail loudly instead.
+        raise SystemExit(f"install-mix empty: no manifest package servable on {index_url}")
     n_i, n_w = len(index_urls), len(wheel_urls)
     return {
         "regex": paths_regex(index_urls + wheel_urls),  # combined — for capacity.main only

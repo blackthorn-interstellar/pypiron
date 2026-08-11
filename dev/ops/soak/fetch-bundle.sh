@@ -24,9 +24,10 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 aws s3 cp "s3://$PYPIRON_SOAK_S3_BUCKET/$PYPIRON_SOAK_BUNDLE_KEY" "$tmp/bundle.tar.gz"
 # Extract over the live tree (overwriting a running binary is safe — the running
-# process keeps the old inode until it restarts).
-tar xzf "$tmp/bundle.tar.gz" -C "$DEST"
-chown -R soak:soak "$DEST"
+# process keeps the old inode until it restarts). --no-same-owner keeps the tree
+# root-owned: this runs as root (via pypiron-soak-refresh.service) and the tree
+# holds the very scripts it re-executes, so it must never become soak-writable.
+tar --no-same-owner -xzf "$tmp/bundle.tar.gz" -C "$DEST"
 echo "$remote_etag" >"$ETAG_FILE"
 
 "$DEST/install.sh" # idempotent: refresh unit files + enablement

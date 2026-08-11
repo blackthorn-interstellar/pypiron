@@ -155,7 +155,9 @@ Resources:
             ENV
 
             aws s3 cp "s3://${S3Bucket}/${BundleKey}" /tmp/bundle.tar.gz --region ${AWS::Region}
-            tar xzf /tmp/bundle.tar.gz -C /opt/pypiron-soak
+            # --no-same-owner: extract as root -> root-owned tree. install.sh no
+            # longer chowns to soak, so the archive's builder uid must not leak in.
+            tar --no-same-owner -xzf /tmp/bundle.tar.gz -C /opt/pypiron-soak
             aws s3api head-object --bucket "${S3Bucket}" --key "${BundleKey}" \
               --region ${AWS::Region} --query ETag --output text >/opt/pypiron-soak/.bundle.etag
             /opt/pypiron-soak/install.sh

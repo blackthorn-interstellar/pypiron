@@ -19,7 +19,12 @@ fi
 if ! id "$SOAK_USER" >/dev/null 2>&1; then
     useradd --system --home-dir "$DEST" --shell /usr/sbin/nologin "$SOAK_USER"
 fi
-chown -R "$SOAK_USER":"$SOAK_USER" "$DEST"
+# The bundle tree stays root-owned. pypiron-soak-refresh.service runs as root
+# (it installs units into /etc and restarts services) and re-executes
+# fetch-bundle.sh and this script from $DEST; a soak-writable tree would let a
+# compromised soak account rewrite those and win root on the next refresh timer.
+# The soak-run units (vopr, reporter) only need read+exec here — their sole local
+# write is report.py's /var/tmp fallback — so nothing under $DEST is soak-owned.
 chmod +x "$DEST"/vopr "$DEST"/*.sh "$DEST"/report.py
 usermod -aG systemd-journal "$SOAK_USER" # the reporter reads the soak journal
 

@@ -770,7 +770,7 @@ jobs:
           key: armv6
       - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
         with:
-          tool: cargo-zigbuild
+          tool: cargo-zigbuild@0.22.3
       # Pin+hash ziglang so a hijacked or yanked PyPI release can't poison the
       # ARMv6 release binary. 0.16.0 is what the unpinned install already
       # resolved to; the hash is the x86_64-linux host wheel — the only platform

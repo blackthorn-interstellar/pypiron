@@ -49,7 +49,7 @@ impl CoreMetadata {
 /// Parse core-metadata bytes. Invalid UTF-8 is lossily decoded rather than
 /// rejected — display is best-effort and must never fail the page.
 pub fn parse(bytes: &[u8]) -> CoreMetadata {
-    let text = String::from_utf8_lossy(bytes);
+    let text = strip_control_chars(&String::from_utf8_lossy(bytes));
     let (headers, body) = split_headers_body(&text);
 
     let mut m = CoreMetadata::default();
@@ -100,6 +100,22 @@ pub fn parse(bytes: &[u8]) -> CoreMetadata {
     };
 
     m
+}
+
+/// Strip ASCII control characters other than tab, newline, and carriage return
+/// (which the header parser and the header/body split rely on) from decoded
+/// metadata text. The human project page is cached with a base-URL sentinel
+/// (`\u{1}pypiron-base-url\u{1}`, U+0001) that the serve path re-expands with the
+/// request's `Host` on every hit; without this, an uploader could plant thousands
+/// of U+0001 bytes in the description or summary and turn each page serve into a
+/// memory-amplifying rewrite outside the page cache's size cap. Removing the
+/// control bytes at parse time means no uploader-supplied field can carry the
+/// sentinel into cached content. Display is best-effort, so dropping junk control
+/// bytes is strictly an improvement.
+fn strip_control_chars(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !c.is_ascii_control() || matches!(c, '\t' | '\n' | '\r'))
+        .collect()
 }
 
 /// Split a metadata document at the first blank line: header block before,
@@ -220,6 +236,24 @@ Requires-Dist: click; extra == \"cli\"\n\
         let m = parse(b"\njust a body\n");
         assert!(m.version.is_none());
         assert_eq!(m.description.as_deref(), Some("just a body"));
+    }
+
+    #[test]
+    fn control_bytes_are_stripped_so_the_base_url_sentinel_cannot_survive() {
+        // An uploader plants the project-cache base-URL sentinel (\u{1}…\u{1}) in
+        // both a header value and the description body. Parsing must strip the
+        // control bytes so the sentinel can never reach the per-request-expanded
+        // cached page (amplification DoS).
+        let md = b"Name: d\nSummary: a\x01b\n\nhello \x01pypiron-base-url\x01 world\n";
+        let m = parse(md);
+        assert_eq!(m.summary.as_deref(), Some("ab"));
+        let desc = m.description.expect("body description");
+        assert!(!desc.contains('\u{1}'), "control byte survived: {desc:?}");
+        assert_eq!(desc, "hello pypiron-base-url world");
+        // Tab/newline/CR are preserved — header folding and the body split need
+        // them (this folded legacy description would otherwise collapse).
+        let folded = parse(b"Name: d\nDescription: one\n\ttwo\n");
+        assert_eq!(folded.description.as_deref(), Some("one\ntwo"));
     }
 
     #[test]

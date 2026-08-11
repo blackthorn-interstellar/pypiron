@@ -767,11 +767,11 @@ impl Resolved {
         let sync = cfg.sync;
 
         // Sync mirrors over HTTP; a destination is mandatory.
-        let dst_base = ensure_http_scheme(args.dst_base.clone().or(sync.to).ok_or_else(|| {
+        let dst_base = require_url_scheme(args.dst_base.clone().or(sync.to).ok_or_else(|| {
             anyhow!(
                 "no destination: pass --to <server> (or set [sync].to) — sync mirrors over HTTP"
             )
-        })?);
+        })?)?;
 
         // The mirror selection — package scope included — is resolved through the one
         // shared path (CLI/env over the `[mirror]` table), so a sync run and
@@ -1358,6 +1358,10 @@ async fn load_cursors(client: &Client, resolved: &Resolved) -> Cursors {
 /// just means the next run re-fetches, so it must never fail an otherwise-good
 /// sync.
 async fn save_cursors(client: &Client, resolved: &Resolved, cursors: &Cursors) {
+    if resolved.dry_run {
+        info!("[dry-run] would persist the sync cursor memo to the destination (no write)");
+        return;
+    }
     let body = match serde_json::to_vec(cursors) {
         Ok(b) => b,
         Err(e) => {
@@ -1391,6 +1395,10 @@ async fn save_cursors(client: &Client, resolved: &Resolved, cursors: &Cursors) {
 /// the run — the packages are the job; the feed is supply-chain metadata riding
 /// along. `""` (the opt-out) skips it entirely, issuing no requests.
 async fn push_advisory_feed(client: &Client, resolved: &Resolved) {
+    if resolved.dry_run {
+        info!("[dry-run] would push the advisory snapshot to the destination (no source fetch, no write)");
+        return;
+    }
     let bytes = match resolved.advisory_feed.as_deref().map(str::trim) {
         // Explicit opt-out: no fetch, no push, no requests.
         Some("") => return,
@@ -2824,15 +2832,19 @@ fn wheel_reaches_python_floor(tags: &WheelTags, floor: (u32, u32)) -> bool {
     })
 }
 
-/// A schemeless `--to` (e.g. `127.0.0.1:8000/simple/`) is a relative URL, which
-/// makes every request `reqwest` builds fail with "relative URL without a base".
-/// Default a missing scheme to `http://` — sync destinations are typically a
-/// local/internal pypiron, not a public TLS host.
-fn ensure_http_scheme(dst_base: String) -> String {
+/// A schemeless `--to` (e.g. `registry.example.com` or `127.0.0.1:8000/simple/`)
+/// is a relative URL, which makes every request `reqwest` builds fail with
+/// "relative URL without a base". Silently prepending `http://` is worse: it
+/// ships the admin credential base64-encoded in the clear to whatever host a
+/// typo named. Reject it — the operator writes the scheme, so a plaintext
+/// internal mirror stays a deliberate `http://` choice, not a downgrade.
+fn require_url_scheme(dst_base: String) -> Result<String> {
     if dst_base.contains("://") {
-        dst_base
+        Ok(dst_base)
     } else {
-        format!("http://{dst_base}")
+        bail!(
+            "no scheme in --to '{dst_base}': write the full URL, e.g. https://dest.example (or http://dest.example for a plaintext internal mirror)"
+        )
     }
 }
 
@@ -2894,17 +2906,18 @@ mod tests {
     }
 
     #[test]
-    fn ensure_http_scheme_defaults_and_preserves() {
+    fn require_url_scheme_rejects_schemeless_and_preserves() {
+        // A schemeless destination is a hard error: silently prepending
+        // `http://` would ship the admin credential in the clear to a typo.
+        let err = require_url_scheme("127.0.0.1:8000/simple/".into()).unwrap_err();
+        assert!(err.to_string().contains("no scheme in --to"));
+        // A full URL passes through untouched, either scheme.
         assert_eq!(
-            ensure_http_scheme("127.0.0.1:8000/simple/".into()),
-            "http://127.0.0.1:8000/simple/"
-        );
-        assert_eq!(
-            ensure_http_scheme("https://dest.example".into()),
+            require_url_scheme("https://dest.example".into()).unwrap(),
             "https://dest.example"
         );
         assert_eq!(
-            ensure_http_scheme("http://dest.example".into()),
+            require_url_scheme("http://dest.example".into()).unwrap(),
             "http://dest.example"
         );
     }

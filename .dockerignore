@@ -7,6 +7,12 @@ docs/
 tests/
 dev/
 fuzz/
+# A local `docker build .` uses this file to prune the context, and the
+# Dockerfile does `COPY data /data`. Excluding data/ makes that COPY fail loudly
+# on a checkout with a populated ./data instead of silently baking a private
+# registry into the image. CI is unaffected — it builds from a purpose-built
+# ctx/ context with its own empty ctx/data.
+data/
 .local/
 .venv/
 .claude/

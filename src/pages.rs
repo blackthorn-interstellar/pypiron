@@ -272,6 +272,18 @@ async fn render_project(
         return not_found("no such project");
     }
 
+    // PEP 792 quarantine: a project whose status blocks downloads keeps its page
+    // but exposes no artifacts — the same scrub `/simple/` applies in
+    // `worker::write_pkg_indexes`. Read the marker *after* the empty-list 404
+    // above so a quarantined package (which has real files) still renders, with an
+    // empty Files tab and no download links, rather than 404ing like a truly
+    // absent one. Versions and the advisory panel stay derived from the real files
+    // so the page still reflects — and badges — what is hosted.
+    let blocks_downloads = match crate::status::read_status(storage.as_ref(), &pkg).await {
+        Ok(doc) => doc.status.blocks_downloads(),
+        Err(e) => return read_error(e),
+    };
+
     // Pick the version to display: the requested one (must be hosted), else the
     // latest by PEP 440 order.
     let mut versions: Vec<String> = files
@@ -324,10 +336,13 @@ async fn render_project(
     // every host and safe to share.
     let mut ctx = page_context(state, headers);
     ctx.base_url = project_cache::BASE_URL_SENTINEL.to_string();
+    // Quarantine omits the download links — the same parity `/simple/` keeps; the
+    // byte gate is the guarantee, a link-free page is hygiene alongside it.
+    let render_files: &[render::FileMetadata] = if blocks_downloads { &[] } else { &files };
     let html = html::project_html(
         &ctx,
         &pkg,
-        &files,
+        render_files,
         &selected,
         pinned,
         meta.as_ref(),

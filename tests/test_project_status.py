@@ -169,6 +169,36 @@ def test_admin_status_endpoint_sets_and_clears(disk_server, tmp_path):
     assert any(f["filename"] == wheel.name for f in doc["files"]), "files return after un-freeze"
 
 
+def test_quarantine_empties_the_human_project_page_files_tab(disk_server, tmp_path):
+    """PEP 792 quarantine empties the human `/project/<pkg>/` Files tab the same
+    way it empties the `/simple/` listing: the page still renders (metadata and the
+    advisory panel are informational), but no artifact download link is exposed.
+    Regression guard for a project page that leaked `/files/` links `/simple/` hid.
+
+    The marker is dropped before the upload materializes, so the first — and
+    cached — render already reflects quarantine; no worker-sweep or cache-TTL race.
+    """
+    pkg = "quarantinedpage"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    _set_status(disk_server, pkg, {"status": "quarantined"})
+    _mirror_upload(disk_server, wheel)
+
+    page = f"{disk_server['base_url']}/project/{pkg}/"
+    link = f'href="/files/{pkg}/{wheel.name}"'
+    html = ""
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        code, body, _ = http_get(page)
+        if code == 200:
+            html = body.decode()
+            break
+        time.sleep(0.2)
+    assert code == 200, code
+    assert pkg in html, "the quarantined project page did not render"
+    assert link not in html, "quarantined project page exposed a download link"
+    assert "No files for this release." in html
+
+
 def test_proxy_relays_upstream_project_status(proxy_pair, tmp_path):
     upstream, proxy = proxy_pair["upstream"], proxy_pair["proxy"]
     pkg = "proxystatusdemo"

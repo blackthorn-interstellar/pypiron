@@ -938,10 +938,17 @@ pub(crate) async fn files_get(
             state.metrics.record_download();
         }
     }
-    resp.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static(ARTIFACT_CACHE_CONTROL),
-    );
+    // Only a delivered body (2xx: 200 or a 206 range) is immutable and safe to
+    // pin for a year. A 416 (unsatisfiable range) — which both backends return as
+    // an `Ok` response — or any other non-2xx must never inherit the immutable
+    // cache-control, or a shared cache would pin that error against the artifact
+    // URL and serve it to every later reader (cache poisoning).
+    if resp.status().is_success() {
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(ARTIFACT_CACHE_CONTROL),
+        );
+    }
     resp
 }
 

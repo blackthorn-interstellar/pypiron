@@ -43,6 +43,13 @@ def parse_version(filename: str) -> str:
 
 def write_artifact(root: Path, art: dict, cap_bytes: int) -> int:
     project, filename = art["project"], art["filename"]
+    # Filenames come from raw ClickHouse rows (trace_build.py). pathlib honors an
+    # absolute path or `..` in the right-hand operand, so `pkg_dir / filename`
+    # could escape the data dir — enforce a bare basename before writing.
+    name = Path(filename).name
+    if name != filename or name in ("", ".", ".."):
+        raise ValueError(f"unsafe filename {filename!r}")
+    filename = name
     size = min(art["size"], cap_bytes) if cap_bytes else art["size"]
     pkg_dir = root / "packages" / project
     pkg_dir.mkdir(parents=True, exist_ok=True)

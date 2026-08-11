@@ -113,6 +113,8 @@ def fetch_bucket(date: str, lo: str | None, hi: str | None, per_bucket: int) -> 
     groups = []
     for line in clickhouse(sql).splitlines():
         project, filename, installer, ptype, count = line.split("\t")
+        if Path(filename).name != filename:
+            continue  # drop path-bearing filenames so seed.py can't be made to escape the data dir
         groups.append(
             {
                 "project": project,

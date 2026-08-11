@@ -115,12 +115,11 @@ jobs:
     #   secret AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY — credentials with
     #                                        list/get/put/delete on that bucket.
     #   var    PYPIRON_TEST_S3_REGION       — the bucket's region.
+    # Only the bucket name (the gate's on/off switch) is job-wide. The AWS
+    # credentials are scoped to the one pytest step that needs them, so no other
+    # step — a compromised third-party setup action, say — inherits them.
     env:
       PYPIRON_TEST_S3_REAL_BUCKET: ${{ secrets.PYPIRON_TEST_S3_REAL_BUCKET }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_REGION: ${{ vars.PYPIRON_TEST_S3_REGION }}
-      AWS_DEFAULT_REGION: ${{ vars.PYPIRON_TEST_S3_REGION }}
     steps:
       - name: Gate on configured bucket secret
         id: gate
@@ -148,4 +147,9 @@ jobs:
       # ambient AWS_* credentials to empty the bucket around each test.
       - name: Blackbox S3 suite against real S3
         if: steps.gate.outputs.enabled == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.PYPIRON_TEST_S3_REGION }}
+          AWS_DEFAULT_REGION: ${{ vars.PYPIRON_TEST_S3_REGION }}
         run: make test-s3-real

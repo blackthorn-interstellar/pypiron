@@ -163,6 +163,15 @@ cmd_deploy() {
   [[ -f "$SERVER_IMG" ]] || { echo "prebuilt image ${SERVER_IMG} missing — build off-box: docker build --platform linux/${SERVER_ARCH/aarch64/arm64} -t pypiron:bench-${SERVER_ARCH} . && docker save pypiron:bench-${SERVER_ARCH} | gzip > ${SERVER_IMG}" >&2; exit 1; }
   ship "$RIG2_SERVER_IP"
   echo "== loading ${SERVER_IMG} onto server"
+  # The image is a /tmp tarball piped straight into `docker load` on the server, so
+  # verify a pinned digest first when one is provided. Unset keeps existing runs
+  # working but warns — set RIG2_SERVER_IMG_SHA256 to make the load trustworthy.
+  if [[ -n "${RIG2_SERVER_IMG_SHA256:-}" ]]; then
+    printf '%s  %s\n' "$RIG2_SERVER_IMG_SHA256" "$SERVER_IMG" | sha256sum -c - \
+      || { echo "server image digest mismatch — refusing to load $SERVER_IMG" >&2; exit 1; }
+  else
+    echo "WARNING: RIG2_SERVER_IMG_SHA256 unset — loading $SERVER_IMG without integrity check" >&2
+  fi
   gzip -dc "$SERVER_IMG" | ssh_to "$RIG2_SERVER_IP" "sudo docker load"
   ssh_to "$RIG2_SERVER_IP" "cd pypiron/bench/install && sudo docker run --rm -v \$(pwd)/../..:/repo \
     -w /repo/bench/install ghcr.io/astral-sh/uv:0.9.30-python3.11-bookworm-slim \

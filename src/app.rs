@@ -1117,7 +1117,7 @@ async fn run_serve(
         bucket_health::classify(observed_storage::signal_for_error(error))
             == bucket_health::SignalClass::AvailabilityFailure
     };
-    crate::format::verify_format(buckets.handles(), |index, error| {
+    let format_skipped = crate::format::verify_format(buckets.handles(), |index, error| {
         crate::buckets::topology_error_is_availability(index, error, &format_availability)
     })
     .await?;
@@ -1141,6 +1141,16 @@ async fn run_serve(
         // a confirmed-unreachable preferred bucket through the leave threshold
         // immediately; runtime observations retain normal hysteresis.
         for index in &topology.unreachable_indices {
+            for _ in 0..cli.bucket_leave_failures {
+                health.observe(*index, bucket_health::BucketSignal::ConnectionFailure)?;
+            }
+        }
+        // A bucket the format gate skipped is unverified for the same reason —
+        // it was unreachable — and must not be selected until it re-clears the
+        // gate. Mark it unhealthy through the same threshold so the worker's
+        // recovery path re-gates it (verify_format on recovery) before it can be
+        // picked. Idempotent with the topology loop above when a bucket is in both.
+        for index in &format_skipped {
             for _ in 0..cli.bucket_leave_failures {
                 health.observe(*index, bucket_health::BucketSignal::ConnectionFailure)?;
             }
@@ -2059,9 +2069,11 @@ async fn track_metrics(
     state.metrics.record_request(group, status);
     // Attribute traffic to the client's project tag — except on auth failures
     // and login-throttled refusals, where the tag never validated against
-    // anything.
+    // anything, and except on /health and /metrics (groups 3 and 4), which
+    // bypass read-auth and return 200: a spoofed project header there would
+    // otherwise poison the tag set. Mirrors the note_request guard above.
     if let Some(tag) = project {
-        if !matches!(status, 401 | 403 | 429) {
+        if group != 3 && group != 4 && !matches!(status, 401 | 403 | 429) {
             state.metrics.record_project(&tag, group);
         }
     }

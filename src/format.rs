@@ -55,11 +55,18 @@ pub struct FormatStamp {
 /// If every bucket was skipped and none cleared, refuse: a startup that verified
 /// no bucket must not bind, mirroring the topology check's no-reachable-bucket
 /// bail (src/buckets.rs).
-pub async fn verify_format<F>(handles: &[BucketHandle], is_availability: F) -> Result<()>
+///
+/// Returns the indices of the buckets that were availability-skipped (the same
+/// shape [`verify_topology_with`](crate::buckets::BucketSet::verify_topology_with)
+/// reports its unreachable indices), so the caller can mark them unhealthy and
+/// re-gate them when they recover — a skipped bucket has NOT cleared the format
+/// gate and must not be selected until it does.
+pub async fn verify_format<F>(handles: &[BucketHandle], is_availability: F) -> Result<Vec<usize>>
 where
     F: Fn(usize, &anyhow::Error) -> bool,
 {
     let mut cleared = 0usize;
+    let mut skipped: Vec<usize> = Vec::new();
     for (index, handle) in handles.iter().enumerate() {
         let bytes = match read_stamp(handle.storage.as_ref()).await {
             Ok(Some(bytes)) => bytes,
@@ -69,6 +76,7 @@ where
             }
             Err(error) if is_availability(index, &error) => {
                 warn!(bucket=%handle.name, error=%error, "bucket unavailable during storage-format check; skipping");
+                skipped.push(index);
                 continue;
             }
             Err(error) => {
@@ -108,7 +116,7 @@ where
     if !handles.is_empty() && cleared == 0 {
         bail!("cannot verify storage format: no configured bucket is reachable at startup");
     }
-    Ok(())
+    Ok(skipped)
 }
 
 /// One bounded GET of the format stamp: `Some(bytes)` when present, `None` when
@@ -144,8 +152,10 @@ mod tests {
 
     async fn gate(handles: &[BucketHandle]) -> Result<()> {
         // The strict classifier rebuild-index uses: any bucket that cannot be
-        // verified — a GET error or a control-I/O timeout — refuses.
-        verify_format(handles, |_, _| false).await
+        // verified — a GET error or a control-I/O timeout — refuses. (The strict
+        // classifier never skips, so the returned skipped-index list is always
+        // empty here; drop it.)
+        verify_format(handles, |_, _| false).await.map(drop)
     }
 
     #[test]
@@ -231,7 +241,9 @@ mod tests {
     #[tokio::test]
     async fn availability_skip_survives_with_a_reachable_sibling() {
         // The warn-skip arm: a GET failure the classifier calls availability is
-        // skipped, and a reachable sibling (absent stamp) clears startup.
+        // skipped, and a reachable sibling (absent stamp) clears startup. The
+        // skipped bucket's index is reported so the caller can re-gate it on
+        // recovery.
         let hung = Arc::new(InMemStorage::default());
         hung.fail_next_get();
         let healthy = Arc::new(InMemStorage::default());
@@ -245,7 +257,8 @@ mod tests {
                 name: "tin".to_string(),
             },
         ];
-        verify_format(&handles, |_, _| true).await.unwrap();
+        let skipped = verify_format(&handles, |_, _| true).await.unwrap();
+        assert_eq!(skipped, vec![0]);
     }
 
     #[tokio::test]

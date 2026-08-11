@@ -36,7 +36,7 @@ An ultra-fast, rock-solid PyPI server.
 Run pypiron with uvx to get started quickly:
 
 ```bash
-uvx pypiron serve --admin-pass "$ADMIN"
+PYPIRON_ADMIN_PASS="$ADMIN" uvx pypiron serve
 # serves http://localhost:8080/simple/ — point uv, pip, or poetry at it
 ```
 

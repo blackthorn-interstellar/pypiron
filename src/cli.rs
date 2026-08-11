@@ -725,7 +725,7 @@ pub struct ServeArgs {
     pub(crate) uploader_user: Option<String>,
 
     /// Uploader credential password (see --uploader-user).
-    #[arg(long, env = "PYPIRON_UPLOADER_PASS")]
+    #[arg(long, env = "PYPIRON_UPLOADER_PASS", hide_env_values = true)]
     pub(crate) uploader_pass: Option<String>,
 
     /// Admin credential username — may do everything an uploader can, plus the
@@ -737,7 +737,7 @@ pub struct ServeArgs {
     pub(crate) admin_user: Option<String>,
 
     /// Admin credential password (see --admin-user).
-    #[arg(long, env = "PYPIRON_ADMIN_PASS")]
+    #[arg(long, env = "PYPIRON_ADMIN_PASS", hide_env_values = true)]
     pub(crate) admin_pass: Option<String>,
 
     /// Reserve this namespace for private uploads: new private packages must

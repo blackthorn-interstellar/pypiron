@@ -12,6 +12,7 @@ stacks run locally (validation) and on the AWS rig (citable numbers).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -21,6 +22,13 @@ import urllib.request
 from benchlib import COMPOSE, HERE, RESULTS, manifest_path, wheelhouse_dir
 
 OHA_VERSION = "v1.4.7"
+# sha256 of the pinned oha release assets (github.com/hatoo/oha), keyed by linux arch
+# suffix. This executable is later run under sudo with the repo bind-mounted, so the
+# download is verified against these digests — a URL alone is not trust.
+OHA_SHA256 = {
+    "amd64": "abdb3a2aabd60905112b5d4dc2b73e12779b2f47520e52ba8237516a88b6fdf3",
+    "arm64": "938fb081ff07dedcc916e527e2b07355e48ba3bf1136545238869a6821c4e2c6",
+}
 
 
 def ensure_oha(arch: str) -> None:
@@ -34,6 +42,10 @@ def ensure_oha(arch: str) -> None:
     url = f"https://github.com/hatoo/oha/releases/download/{OHA_VERSION}/oha-linux-{suffix}"
     print(f"-- fetching oha {OHA_VERSION} ({suffix})")
     urllib.request.urlretrieve(url, binary)
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    if digest != OHA_SHA256[suffix]:
+        binary.unlink()
+        raise SystemExit(f"oha digest mismatch ({suffix}): got {digest}")
     binary.chmod(0o755)
 
 

@@ -287,11 +287,23 @@ pub(crate) async fn sync_cursors_get(
 /// the next sync's reads, but the contents are otherwise opaque to the server.
 pub(crate) async fn sync_cursors_put(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: String,
+    request: axum::extract::Request,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
-    if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&body).is_err() {
+    // Authenticate on headers alone before touching the body. A body extractor
+    // (`body: String`) runs before the handler, so an unauthenticated caller could
+    // otherwise force axum to buffer up to the global 1 GiB limit before this
+    // check ever runs. A cursor doc is a few KiB of JSON — read it under a tight
+    // cap only once the admin credential is proven.
+    require_admin(&state, request.headers())?;
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "cursors body too large".to_string(),
+            )
+        })?;
+    if serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&body).is_err() {
         return Err((
             StatusCode::BAD_REQUEST,
             "cursors body must be a JSON object".into(),
@@ -300,11 +312,7 @@ pub(crate) async fn sync_cursors_put(
     state
         .pin()
         .storage
-        .put_bytes(
-            sync::CURSORS_KEY,
-            body.into_bytes(),
-            Some("application/json"),
-        )
+        .put_bytes(sync::CURSORS_KEY, body.to_vec(), Some("application/json"))
         .await
         .map_err(|e| internal("write", e))?;
     Ok(StatusCode::NO_CONTENT)
@@ -383,10 +391,21 @@ fn serve_advisory_bytes(
 /// restart.
 pub(crate) async fn advisories_feed_put(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
+    request: axum::extract::Request,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_admin(&state, &headers)?;
+    // Authenticate on headers before buffering the (large) feed body: the body
+    // extractor runs ahead of the handler, so an unauthenticated caller must not
+    // be able to make axum buffer up to the global 1 GiB limit before the admin
+    // check. Cap the read at the same ceiling the URL/file feed fetch enforces.
+    require_admin(&state, request.headers())?;
+    let body = axum::body::to_bytes(request.into_body(), advisories::MAX_FEED_BYTES as usize)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("advisory feed exceeds {} bytes", advisories::MAX_FEED_BYTES),
+            )
+        })?;
     // Validate before persisting — the stored copy is what every node loads, so
     // a garbage PUT must never overwrite a good snapshot. Parse off the runtime.
     let bytes = body.to_vec();
@@ -584,9 +603,14 @@ struct MintResponse {
 /// credential, since reader access is already public.
 pub(crate) async fn mint_token(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: String,
+    request: axum::extract::Request,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Gate on headers before buffering the body (the extractor runs ahead of the
+    // handler): reject a missing signing key or a token-presenting caller first,
+    // then read the small JSON body under a tight cap. Otherwise an unauthorized
+    // caller could force axum to buffer up to the global 1 GiB limit before any of
+    // these checks. A mint request is a few fields of JSON.
+    let headers = request.headers().clone();
     let key = nonempty(state.token_signing_key.as_deref()).ok_or((
         StatusCode::FORBIDDEN,
         "token minting is disabled (no --token-signing-key configured)".to_string(),
@@ -602,6 +626,20 @@ pub(crate) async fn mint_token(
             "a token cannot mint tokens; authenticate with a configured credential".to_string(),
         ));
     }
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "token request body too large".to_string(),
+            )
+        })?;
+    let body = String::from_utf8(body.to_vec()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "body must be valid UTF-8".to_string(),
+        )
+    })?;
     let req: MintRequest = if body.trim().is_empty() {
         MintRequest::default()
     } else {

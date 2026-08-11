@@ -332,7 +332,31 @@ async fn maintain_bucket_selection(state: &AppState) -> bool {
                 selection_blocked.insert(*index);
             }
             Ok(Ok(_)) => {
-                if let Err(error) = health.topology_revalidated(*index) {
+                // Topology revalidated — but a bucket that healed at a newer
+                // storage format must not be selected and written blind (latent
+                // at CURRENT_FORMAT=1, catastrophic after a bump). Re-gate the
+                // format on the single healed handle: verify_format returns Ok
+                // only when it is reachable and at a supported format; a mismatch
+                // or a still-unreachable read blocks selection this tick, and the
+                // next tick retries.
+                let format_ok = match state.buckets.handles().get(*index) {
+                    Some(handle) => matches!(
+                        timeout(
+                            BUCKET_HEALTH_IO_TIMEOUT,
+                            crate::format::verify_format(
+                                std::slice::from_ref(handle),
+                                topology_availability_error,
+                            ),
+                        )
+                        .await,
+                        Ok(Ok(_))
+                    ),
+                    None => false,
+                };
+                if !format_ok {
+                    selection_blocked.insert(*index);
+                    warn!(bucket=*index, "bucket storage-format not verified on recovery; selection blocked this tick");
+                } else if let Err(error) = health.topology_revalidated(*index) {
                     error!(bucket=*index, error=%error, "could not acknowledge topology validation");
                 } else {
                     // A bucket just crossed unhealthy→healthy. Fire the `_repl/`
@@ -1275,6 +1299,18 @@ pub async fn audit(
             delta.retain(|_, files| !files.is_empty());
         }
         write_chain_link(state, pinned, generation, delta).await;
+    } else {
+        // The chain head was unreadable this pass, so the checkpoint is deferred
+        // above — but the per-package fingerprint shards were already written
+        // unconditionally, so a dropped delta is never re-derived: the chain would
+        // keep committing the old sha over bytes storage has already replaced.
+        // Carry it against this bucket so the next pass (whose head read succeeds)
+        // merges it, exactly as the CAS-loss path does. A false `genesis_state`
+        // (transparency off) collects no deltas, so this no-ops.
+        let delta: crate::transparency::Delta = deltas.into_iter().collect();
+        if !delta.is_empty() {
+            carry_unlanded(&pinned.storage, delta);
+        }
     }
     // Publish completion metrics only after the sweep's last storage write:
     // the bench harness's `wait_swept` treats `audit_last_duration_seconds` as

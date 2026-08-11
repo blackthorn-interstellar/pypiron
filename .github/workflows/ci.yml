@@ -498,14 +498,19 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         with:
           persist-credentials: false
-      # Writes the SA key to a file and exports GOOGLE_APPLICATION_CREDENTIALS;
-      # the fixture passes that on to pypiron as the GCS service-account path
-      # (which also enables presigned-URL signing) and to gcloud for cleanup.
+      # Writes the SA key to a file and exposes its path as an output. We do NOT
+      # export GOOGLE_APPLICATION_CREDENTIALS job-wide (export_environment_variables:
+      # false) — that would hand the SA key to every later step, including any
+      # third-party setup action. Instead the pytest step alone sets it from this
+      # step's credentials_file_path output; the fixture passes it to pypiron as
+      # the GCS service-account path (which also enables presigned-URL signing)
+      # and gcloud picks it up as ADC for cleanup.
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        id: gcp-auth
         if: steps.gate.outputs.enabled == 'true'
         with:
           credentials_json: ${{ secrets.PYPIRON_TEST_GCS_SERVICE_ACCOUNT }}
-          export_environment_variables: true
+          export_environment_variables: false
       - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
         if: steps.gate.outputs.enabled == 'true'
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -519,6 +524,8 @@ jobs:
         run: uv sync
       - name: Blackbox GCS round-trip against real GCS
         if: steps.gate.outputs.enabled == 'true'
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.gcp-auth.outputs.credentials_file_path }}
         run: make test-gcs-real
 
   python-lint:
@@ -764,8 +771,14 @@ jobs:
       - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
         with:
           tool: cargo-zigbuild
+      # Pin+hash ziglang so a hijacked or yanked PyPI release can't poison the
+      # ARMv6 release binary. 0.16.0 is what the unpinned install already
+      # resolved to; the hash is the x86_64-linux host wheel — the only platform
+      # this runner fetches. Bump the version and hash together.
       - name: Install zig
-        run: python3 -m pip install --user --break-system-packages ziglang
+        run: |
+          echo 'ziglang==0.16.0 --hash=sha256:9fcda73f62b851dd72a54b710ad40a209896db14cfb13649e62191243556342b' > "$RUNNER_TEMP/zig-requirements.txt"
+          python3 -m pip install --user --break-system-packages --require-hashes -r "$RUNNER_TEMP/zig-requirements.txt"
       - name: Cross-compile (static musl, ARMv6 hard-float)
         run: cargo zigbuild --release --locked --target "$TRIPLE"
       - name: Archive standalone binary

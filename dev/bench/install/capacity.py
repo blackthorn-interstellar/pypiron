@@ -172,9 +172,10 @@ def build_install_mix(index_url: str, arch: str, tier: str) -> dict:
             total_wheel_bytes += size_by_file[canonical[nm]]
         else:
             dropped += 1
-    if not index_urls:
-        # Every package was absent (or no closure/pin yielded a canonical set):
-        # paths_regex would index urls[0] on an empty list. Fail loudly instead.
+    if not index_urls or not wheel_urls:
+        # No servable index (every package absent / no canonical set), or indexes
+        # exist but no wheel is servable (all hrefs 404 or shell-rejected). Either
+        # leaves paths_regex indexing urls[0] on an empty list — fail loudly.
         raise SystemExit(f"install-mix empty: no manifest package servable on {index_url}")
     n_i, n_w = len(index_urls), len(wheel_urls)
     return {

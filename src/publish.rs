@@ -1293,13 +1293,24 @@ pub(crate) async fn set_yank(
 pub(crate) async fn project_status_set(
     State(state): State<Arc<AppState>>,
     Path(package): Path<String>,
-    headers: HeaderMap,
-    body: String,
+    request: axum::extract::Request,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // Authenticate before parsing the body — an unauthenticated caller must not
-    // be able to probe well-formed vs malformed JSON (400 vs 401/403).
-    require_admin(&state, &headers)?;
-    let doc: status::ProjectStatusDoc = serde_json::from_str(&body)
+    // Authenticate on headers alone before touching the body. A body extractor
+    // (`body: String`) runs before the handler, so an unauthenticated caller could
+    // otherwise force axum to buffer up to the global 1 GiB limit before this check
+    // ever runs — and could probe well-formed vs malformed JSON (400 vs 401/403).
+    // A status doc is a few fields of JSON; read it under a tight cap only once the
+    // admin credential is proven.
+    require_admin(&state, request.headers())?;
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "status body too large".to_string(),
+            )
+        })?;
+    let doc: status::ProjectStatusDoc = serde_json::from_slice(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid status doc: {e}")))?;
     write_project_status(&state, &package, doc).await
 }

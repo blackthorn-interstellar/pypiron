@@ -165,6 +165,17 @@ Without a bucket the reporter still records findings to a local fallback file.
   nothing else (plus optional `sns:Publish` to one topic).
 - **No inbound ports** — egress-only SG; shell is SSM Session Manager.
 - **IMDSv2 required** on every instance.
+- **The bundle tree is root-owned; the soak account cannot rewrite it.**
+  `pypiron-soak-refresh.service` runs as root (it installs units and restarts
+  services) and re-executes `fetch-bundle.sh`/`install.sh` from
+  `/opt/pypiron-soak`, so that tree is never `chown`ed to the unprivileged `soak`
+  user — otherwise a soak-account compromise could overwrite those scripts and
+  win root on the next refresh. The soak-run units only read+exec the tree; their
+  one local write is `report.py`'s `/var/tmp` fallback. Rollout caveat: a box
+  already running from before this change keeps its old soak-owned tree until the
+  refresh timer pulls the new bundle (whose now-no-op install stops re-applying
+  the old `chown`); a fresh `./fleet.sh apply` or instance replacement normalizes
+  ownership immediately.
 - The autonomous fixer **cannot weaken an invariant**: the verify gate rejects
   any diff that loosens the checker and commits only a src/ fix that three
   independent checks agree is a genuine cure. Doubt escalates to a human.

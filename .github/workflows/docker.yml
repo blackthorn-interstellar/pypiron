@@ -96,13 +96,19 @@ jobs:
           key: docker-${{ matrix.id }}
       - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
         with:
-          tool: cargo-zigbuild
+          tool: cargo-zigbuild@0.22.3
 
       # zig is the C cross-compiler cargo-zigbuild drives (ring builds a little C).
       # Install the version-matched ziglang into the same python3 cargo-zigbuild
       # probes (`python3 -m ziglang`) — NOT pipx, which isolates it out of reach.
+      # Pin+hash it so a hijacked or yanked PyPI release can't poison the GHCR
+      # image; 0.16.0 is what the unpinned install already resolved to and the
+      # hash is the x86_64-linux host wheel (the only platform this runner
+      # fetches). Bump the version and hash together.
       - name: Install zig
-        run: python3 -m pip install --user --break-system-packages ziglang
+        run: |
+          echo 'ziglang==0.16.0 --hash=sha256:9fcda73f62b851dd72a54b710ad40a209896db14cfb13649e62191243556342b' > "$RUNNER_TEMP/zig-requirements.txt"
+          python3 -m pip install --user --break-system-packages --require-hashes -r "$RUNNER_TEMP/zig-requirements.txt"
 
       - name: Cross-compile ${{ matrix.triple }}
         run: cargo zigbuild --release --locked --target ${{ matrix.triple }}

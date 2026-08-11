@@ -482,6 +482,38 @@ pub async fn feed_storage_etag(storage: &dyn Storage) -> Result<Option<String>> 
     key_storage_etag(storage, FEED_KEY).await
 }
 
+/// Load the persisted quarantined set at startup so the byte gate is armed on the
+/// first request, not only after the worker's first `reload_quarantined` tick
+/// (the window in which a compromised project frozen by PEP 792 would otherwise
+/// download). A missing key is the empty set. An unreadable or corrupt one
+/// degrades to the empty set with no etag, so the worker's next reload — which
+/// compares that `None` against the real etag — retries and heals it.
+async fn load_quarantined_at_startup(storage: &dyn Storage) -> (HashSet<String>, Option<String>) {
+    let etag = match quarantined_storage_etag(storage).await {
+        Ok(etag) => etag,
+        Err(e) => {
+            warn!(error = %e, "advisory feed: reading the quarantined set etag at startup failed; the worker will retry");
+            return (HashSet::new(), None);
+        }
+    };
+    if etag.is_none() {
+        return (HashSet::new(), None); // never published — the empty set
+    }
+    match storage.get_bytes(QUARANTINED_KEY).await {
+        Ok(bytes) => match parse_quarantined(&bytes) {
+            Ok(set) => (set, etag),
+            Err(e) => {
+                warn!(error = %e, "advisory feed: quarantined set did not parse at startup; the worker will retry");
+                (HashSet::new(), None)
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "advisory feed: reading the quarantined set at startup failed; the worker will retry");
+            (HashSet::new(), None)
+        }
+    }
+}
+
 /// Load the persisted snapshot from storage, or `None` when the key is absent.
 async fn load_from_storage(storage: &dyn Storage) -> Result<Option<AdvisoryState>> {
     let Some(etag) = feed_storage_etag(storage).await? else {
@@ -489,14 +521,15 @@ async fn load_from_storage(storage: &dyn Storage) -> Result<Option<AdvisoryState
     };
     let zip = Arc::new(storage.get_bytes(FEED_KEY).await?);
     let (db, sha) = parse_off_thread(zip.clone()).await?;
+    let (quarantined, quarantined_etag) = load_quarantined_at_startup(storage).await;
     Ok(Some(AdvisoryState {
         db: Some(Arc::new(db)),
         zip_sha256: Some(sha),
         zip: Some(zip),
         storage_etag: Some(etag),
         overlay: Arc::default(),
-        quarantined: HashSet::new(),
-        quarantined_etag: None,
+        quarantined,
+        quarantined_etag,
         loaded_unix: unix_now_secs(),
     }))
 }
@@ -556,14 +589,15 @@ async fn obtain_from_source(storage: &dyn Storage, feed: &str) -> Option<Advisor
     {
         warn!(error = %e, "advisory feed: persisting snapshot failed; loading in-memory");
     }
+    let (quarantined, quarantined_etag) = load_quarantined_at_startup(storage).await;
     Some(AdvisoryState {
         db: Some(Arc::new(db)),
         zip_sha256: Some(sha),
         zip: Some(zip),
         storage_etag: feed_storage_etag(storage).await.unwrap_or(None),
         overlay: Arc::default(),
-        quarantined: HashSet::new(),
-        quarantined_etag: None,
+        quarantined,
+        quarantined_etag,
         loaded_unix: unix_now_secs(),
     })
 }
@@ -1119,12 +1153,23 @@ fn merge_overlay(
 /// Swap the probe overlay in the shared slot: upsert `added`, remove `withdrawn`,
 /// carrying the baseline/quarantine forward under the write lock (refcount bumps,
 /// no await, no deep clone of the db). Shared byte-gate reads stay lock-cheap.
+///
+/// `aligned_sha` is the baseline snapshot sha this cycle's overlay was computed
+/// against. A daily-baseline reload can swap the snapshot mid-cycle (its fresher
+/// watermark may already drop a block this overlay would re-add); if the live
+/// snapshot no longer matches, skip the merge entirely rather than reapply a
+/// stale overlay onto a new baseline. Nothing is lost — the next cycle
+/// re-baselines against the fresh snapshot.
 fn apply_probe_overlay(
     slot: &RwLock<Arc<AdvisoryState>>,
+    aligned_sha: Option<&str>,
     added: Vec<(String, MalRule)>,
     withdrawn: &HashSet<String>,
 ) {
     let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
+    if guard.zip_sha256.as_deref() != aligned_sha {
+        return; // baseline swapped under us; the next cycle re-baselines
+    }
     let mut overlay = (*guard.overlay).clone();
     merge_overlay(&mut overlay, added, withdrawn);
     *guard = Arc::new(AdvisoryState {
@@ -1332,7 +1377,7 @@ async fn probe_once(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut ProbeMemo) -> R
     }
 
     if !added.is_empty() || !withdrawn.is_empty() {
-        apply_probe_overlay(ctx.slot, added, &withdrawn);
+        apply_probe_overlay(ctx.slot, snap.zip_sha256.as_deref(), added, &withdrawn);
         if !applied_ids.is_empty() {
             info!(advisories = ?applied_ids, "malware advisory applied ahead of the daily baseline");
         }

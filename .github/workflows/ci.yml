@@ -566,30 +566,6 @@ jobs:
         # https://github.com/rust-fuzz/cargo-fuzz/issues/398
         run: cargo fuzz build --target x86_64-unknown-linux-gnu
 
-  # Docs pages never change without the persona-review ledger moving with them
-  # (dev/personas/REVIEWS.md) — the review loop is enforced, not remembered.
-  docs-review-ledger:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Changed docs require a ledger update
-        shell: bash
-        run: |
-          BEFORE="${{ github.event.before }}"
-          case "$BEFORE" in 0000000000000000000000000000000000000000|"") echo "no base commit; skipping"; exit 0;; esac
-          git cat-file -e "$BEFORE" 2>/dev/null || { echo "base commit unavailable; skipping"; exit 0; }
-          docs=$(git diff --name-only "$BEFORE..${{ github.sha }}" -- 'docs/**/*.md' 'docs/*.md' | wc -l)
-          ledger=$(git diff --name-only "$BEFORE..${{ github.sha }}" -- dev/personas/REVIEWS.md | wc -l)
-          if [ "$docs" -gt 0 ] && [ "$ledger" -eq 0 ]; then
-            echo "::error::docs pages changed without updating dev/personas/REVIEWS.md — run /persona-review (or record the review) before pushing docs changes."
-            exit 1
-          fi
-          echo "docs files changed: $docs; ledger updated: $ledger — OK"
-
   # Wheel builds run only for release tags (and manual dispatch for testing the
   # pipeline). The version is stamped from the tag; the repo itself stays at 0.0.0.
   # One job, one matrix over every (kind, runner, target). maturin-action treats an

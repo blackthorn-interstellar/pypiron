@@ -53,7 +53,12 @@ Configure once at https://pypi.org/manage/project/pypiron/settings/publishing/:
 - Owner: `blackthorn-interstellar`
 - Repository: `pypiron`
 - Workflow: `ci.yml`
-- Environment: (leave blank)
+- Environment: `pypi`
+
+Create the `pypi` GitHub environment with the deployment protections required
+for a production release (for example, required reviewers and release-tag
+restrictions). The release job cannot request a PyPI publishing credential
+until those protections pass.
 
 ## Local build
 

@@ -122,9 +122,8 @@ impl AdvisoryDb {
 /// The `MAL-*` ids that condemn `name_norm` at `version` (empty = not blocked).
 /// `name_norm` must already be [`normalize_pkg_name`]-normalized. `version` is
 /// `None` when the filename yielded no parseable version (a legacy binary
-/// format): fail-closed, only an all-versions rule (the "this package is
-/// malware" case) still condemns it — an exact/range rule is a claim about a
-/// specific version we can't read, so it can't be proven and doesn't fire.
+/// format): fail closed by treating every blocking rule for the package as a
+/// match. An unreadable filename must not bypass an exact or ranged MAL rule.
 pub fn blocking_advisories<'a>(
     db: &'a AdvisoryDb,
     name_norm: &str,
@@ -135,7 +134,8 @@ pub fn blocking_advisories<'a>(
 
 /// The `MAL-*` ids in a `name → rules` block map that condemn `name_norm` at
 /// `version` — the shared core of both the baseline block set and the probe
-/// overlay. `version = None` (unreadable filename) matches only all-versions rules.
+/// overlay. `version = None` (unreadable filename) matches every rule for the
+/// package so enforcement fails closed.
 pub(crate) fn block_hits<'a>(
     block: &'a HashMap<String, Vec<MalRule>>,
     name_norm: &str,
@@ -148,7 +148,7 @@ pub(crate) fn block_hits<'a>(
                 .iter()
                 .filter(|rule| match version {
                     Some(v) => rule.scope.matches(v),
-                    None => matches!(rule.scope, VersionScope::AllVersions),
+                    None => true,
                 })
                 .map(|rule| rule.id.as_str())
                 .collect()
@@ -525,8 +525,12 @@ mod tests {
         assert!(blocking_advisories(&db, "evil-pkg", Some("1.0.1")).is_empty());
         // Name normalization applies on the query side too.
         assert!(blocking_advisories(&db, "notevil", Some("1.0.0")).is_empty());
-        // An exact-version rule can't be proven against an unknown version.
-        assert!(blocking_advisories(&db, "evil-pkg", None).is_empty());
+        // An unknown filename version cannot prove this is a different, safe
+        // release, so the byte gate fails closed.
+        assert_eq!(
+            blocking_advisories(&db, "evil-pkg", None),
+            ["MAL-2024-0001"]
+        );
     }
 
     #[test]

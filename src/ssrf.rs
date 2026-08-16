@@ -18,25 +18,9 @@
 //!     the only thing that catches it. It also re-validates every redirect
 //!     `Location` in the manual redirect loop below.
 //!
-//! ## Under a forward proxy
-//!
-//! `sync` and the proxy honor the standard `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/
-//! `NO_PROXY` env vars (corporate egress), and the advisory feed always has.
-//! Enabling a proxy is an explicit operator act, and it shifts *where* one of the
-//! two layers enforces:
-//!
-//!   * The [`SsrfGuardResolver`] resolves the **proxy** host, not the target — an
-//!     `https` target goes to the proxy via `CONNECT` and the proxy resolves the
-//!     name. So for a *name* target the resolver is bypassed: **name-based SSRF
-//!     enforcement moves to the proxy's own egress ACL**, which is the deliberate
-//!     egress control point once a proxy is in the path.
-//!   * The pre-flight [`Guard::check_target`] is **unaffected** — it runs on the
-//!     original URL and every redirect `Location` regardless of proxying. So an
-//!     **IP-literal internal target stays blocked on every hop**, including the
-//!     NAT64 well-known-prefix forms folded to their embedded IPv4 in
-//!     [`is_forbidden_ip`] (e.g. `[64:ff9b::169.254.169.254]`) and IMDS reached by
-//!     listing a literal address. The literal pre-flight is the backstop the proxy
-//!     cannot weaken.
+//! The clients using this guard disable ambient forward proxies. A forward proxy
+//! resolves the target hostname itself, which would bypass [`SsrfGuardResolver`]
+//! and delegate the security boundary to an external egress ACL.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

@@ -348,24 +348,19 @@ file).
 In a locked-down network the only way out is a corporate forward proxy, often one
 that terminates TLS with a private root CA. pypiron works through both:
 
-- **Forward proxy.** `pypiron sync`, the on-demand proxy's upstream fetch, and the
-  advisory feed poll all honor the standard `HTTPS_PROXY`, `HTTP_PROXY`,
-  `ALL_PROXY`, and `NO_PROXY` environment variables. Set them and outbound traffic
-  routes through the proxy; no flag needed. (The cloud instance-metadata probe is
-  the deliberate exception — it always goes direct to the link-local address.)
+- **Forward proxy.** The advisory feed poll honors the standard `HTTPS_PROXY`,
+  `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY` environment variables. `pypiron sync`
+  and on-demand package fetches deliberately connect directly: their destinations
+  can come from an upstream listing, and sending those names through a forward
+  proxy would bypass pypiron's DNS-based SSRF protection. The cloud
+  instance-metadata probe also always connects directly.
 - **Custom CA.** When the proxy re-signs TLS with a private root, point
   `--upstream-ca-cert` at that CA's PEM bundle. It loads once at startup and
   *augments* the built-in roots, so a direct fetch of public PyPI still validates
   while the corporate CA is also trusted. A bundle that can't be read or parsed
   refuses startup (fail-closed).
 
-Enabling a proxy is a deliberate choice, and it shifts where one SSRF check
-enforces. The IP-literal pre-flight is unaffected: an internal address supplied by
-a listing — `127.0.0.1`, `10.x`, the `169.254.169.254` metadata endpoint, their
-IPv6 and NAT64 (`64:ff9b::`) forms — is still refused on the initial request and
-every redirect hop. But it is the proxy, not pypiron, that resolves a *name*
-target, so name-based SSRF enforcement moves to the proxy's own egress ACL —
-which is the intended egress control point once a proxy is in the path.
+Package and sync traffic must therefore have a direct route to its upstreams.
 
 ## Mirror selection
 

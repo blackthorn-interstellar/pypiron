@@ -380,13 +380,10 @@ impl Proxy {
                     // the pre-flight in guarded_get, which is why redirects are
                     // followed manually below.
                     .dns_resolver(Arc::new(SsrfGuardResolver::new(guard.clone())))
-                    // Honor ambient HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY so
-                    // the proxy works behind a corporate forward proxy. With a
-                    // proxy the resolver no longer sees name targets (the proxy
-                    // resolves them), so name-based SSRF enforcement moves to the
-                    // proxy egress ACL; the IP-literal pre-flight in guarded_get
-                    // still blocks every internal literal on every hop. See the
-                    // `ssrf` module docs.
+                    // A forward proxy resolves target names itself, bypassing the
+                    // SSRF-filtering resolver above. Keep listing-derived fetches
+                    // direct so hostname checks cannot be delegated or bypassed.
+                    .no_proxy()
                     .redirect(reqwest::redirect::Policy::none()),
             )
             .build()?,

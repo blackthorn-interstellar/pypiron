@@ -121,12 +121,12 @@ add.
 
 ## Behind a corporate proxy
 
-If the server only reaches the internet through a corporate forward proxy, set
-the standard `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` environment variables —
-everything the server fetches from the internet honors them: proxied
-packages, `sync`, and the [security advisory feed](../security.md). If that proxy
-intercepts TLS with a private CA, add `--upstream-ca-cert /path/to/corp-ca.pem`
-so it validates without turning verification off. Details:
+The [security advisory feed](../security.md) honors the standard
+`HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` environment variables. Proxied package and
+`sync` traffic connects directly so pypiron can enforce hostname SSRF checks; it
+must have a direct route to its upstreams. If TLS is signed by a private CA, add
+`--upstream-ca-cert /path/to/corp-ca.pem` so it validates without turning
+verification off. Details:
 [Behind a forward proxy](../reference/configuration.md#behind-a-forward-proxy-or-tls-interception).
 
 ## Survive a region outage

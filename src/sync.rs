@@ -1760,12 +1760,10 @@ pub async fn run_sync(args: SyncArgs, config_path: Option<PathBuf>) -> Result<()
                 resolved.guard.clone(),
             )))
             .redirect(reqwest::redirect::Policy::none())
-            // Honor ambient HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY so sync
-            // works behind a corporate forward proxy. With a proxy the resolver
-            // no longer sees name targets (the proxy resolves them), so
-            // name-based SSRF enforcement moves to the proxy egress ACL; the
-            // IP-literal pre-flight in guarded_get still blocks every internal
-            // literal on every hop. See the `ssrf` module docs.
+            // A forward proxy resolves target names itself, bypassing the SSRF
+            // resolver above. Keep listing-derived fetches direct so hostname
+            // checks cannot be delegated or bypassed.
+            .no_proxy()
             //
             // Bound the handshake and any mid-stream stall so a dead/dribbling
             // upstream fails a sync task cleanly (the retry loop absorbs it)
@@ -2294,7 +2292,7 @@ fn select_from_index(
         }
         if matches_mirror(&file, &resolved.mirror) {
             file.url = resolve(&file.url);
-            file.provenance = file.provenance.as_deref().map(&resolve);
+            file.provenance = file.provenance.as_deref().map(resolve);
             selected.push(Selected { version, file });
         } else if let Some(t) = held_back_by_newer(&file, &resolved.mirror) {
             let secs = t.unix_timestamp();

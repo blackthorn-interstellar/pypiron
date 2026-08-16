@@ -1,14 +1,8 @@
-"""Enterprise egress: sync, the proxy upstream, and the advisory feed work behind
-a corporate forward proxy and a custom-CA (MITM) TLS interception — without
-weakening the SSRF or IMDS guards.
+"""Enterprise egress and custom-CA (MITM) TLS interception.
 
-T1  A logging forward proxy sees a full disk->disk sync *and* an advisory feed
-    poll, proving the standard HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY env vars
-    are honored now that the sync and proxy-upstream clients dropped
-    `.no_proxy()`. The hermetic pypiron/feed servers are plain HTTP, so reqwest
-    forwards them to the proxy in absolute-form (an https target would CONNECT
-    instead); either way the proxy logs every target it is asked to reach, which
-    is the routed-through-the-proxy proof.
+T1  A full disk->disk sync bypasses an ambient forward proxy so its SSRF resolver
+    always resolves listing-derived hostnames itself. The advisory feed, whose
+    URL is operator-configured, continues to honor the proxy variables.
 
 T2  A private "corporate" CA signs the advisory feed's TLS leaf. Without
     --upstream-ca-cert the feed is untrusted and the explicit-feed server fails
@@ -175,10 +169,8 @@ def _proxy_env(proxy_url: str) -> dict:
     }
 
 
-def test_sync_routes_through_forward_proxy(forward_proxy, tmp_path_factory, pypiron_bin, tmp_path):
-    """A full disk->disk sync, with proxy env set, routes both the source fetch
-    and the destination upload through the forward proxy — and still lands the
-    package. Proves the sync client honors HTTP(S)_PROXY (no more `.no_proxy()`)."""
+def test_sync_bypasses_forward_proxy(forward_proxy, tmp_path_factory, pypiron_bin, tmp_path):
+    """A full sync ignores ambient proxies so hostname SSRF checks stay local."""
     with ExitStack() as stack:
         src_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
         source = next(src_gen)
@@ -225,9 +217,7 @@ def test_sync_routes_through_forward_proxy(forward_proxy, tmp_path_factory, pypi
         assert (dest["data_dir"] / "packages" / "egresspkg").exists(), (
             "package never landed in the destination"
         )
-        # Both endpoints were reached through the proxy, not directly.
-        assert source["bind"] in forward_proxy.targets, forward_proxy.targets
-        assert dest["bind"] in forward_proxy.targets, forward_proxy.targets
+        assert forward_proxy.targets == []
 
 
 def test_advisory_poll_routes_through_forward_proxy(

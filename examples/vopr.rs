@@ -1,3 +1,5 @@
+#![allow(clippy::exit)] // The simulator intentionally reports distinct process statuses.
+
 //! The VOPR: deterministic simulation testing for the pypiron event protocol
 //! (dev/MOONSHOT.md rung 1, FoundationDB/TigerBeetle lineage).
 //!

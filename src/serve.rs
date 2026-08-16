@@ -462,6 +462,17 @@ async fn proxy_package_index(
     headers: &HeaderMap,
 ) -> Option<Response<Body>> {
     let proxy = state.proxy.as_ref()?;
+    // A deny is also a serving fence for materialized mirror content. Treating
+    // it as ordinary proxy ineligibility would fall through to a stale local
+    // index cached before the rule was configured. Same-named private packages
+    // remain local and are deliberately outside mirror selection policy.
+    if proxy.name_fully_denied(pkg) {
+        match origin::read_origin_claim(storage, pkg).await {
+            Ok(Some(origin::OriginState::Private)) => return None,
+            Ok(_) => return Some(not_found("package excluded by mirror policy")),
+            Err(error) => return Some(read_error(error)),
+        }
+    }
     // Coherence baseline on this (write) pin, taken before the eligibility read so
     // the fence covers the whole eligible→render span: serving an upstream index
     // for a name that gains a local claim mid-serve would be a dependency-confusion
@@ -752,6 +763,24 @@ pub(crate) async fn files_get(
     let read_pinned = state.read_pin();
     let write_pinned = state.pin();
     let pins = Pins::new(&read_pinned, &write_pinned);
+
+    // Mirror exclusions gate delivery as well as upstream fills. This check is
+    // before every companion/artifact exit, so bytes cached under an older
+    // configuration cannot bypass a newly configured deny rule. Only consult
+    // origin on a rule hit; private packages with the same name are unaffected.
+    let policy_filename = filename
+        .strip_suffix(METADATA_SUFFIX)
+        .or_else(|| filename.strip_suffix(PROVENANCE_SUFFIX))
+        .unwrap_or(&filename);
+    if let Some(proxy) = &state.proxy {
+        if proxy.artifact_denied(&pkg, policy_filename) {
+            match origin::read_origin_claim(write_pinned.storage.as_ref(), &pkg).await {
+                Ok(Some(origin::OriginState::Private)) => {}
+                Ok(_) => return not_found("artifact excluded by mirror policy"),
+                Err(error) => return read_error(error),
+            }
+        }
+    }
 
     // Download attribution key, computed once: a real artifact only (companions
     // and the ranged-companion fall-through below parse to None), keyed

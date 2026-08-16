@@ -252,6 +252,19 @@ def test_proxy_denylist_subtracts_from_open_proxy(proxy_pair_denylist, tmp_path)
     _upload(upstream, pinned_old, "pinned")
     _upload(upstream, pinned_new, "pinned")
 
+    # Simulate mirror content retained across a restart that added these deny
+    # rules. Selection policy must fence already-materialized indexes and bytes,
+    # not merely prevent a new upstream fill.
+    blocked_dir = proxy["data_dir"] / "packages" / "blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / ".origin").write_text("mirror\n")
+    (blocked_dir / blocked.name).write_bytes(blocked.read_bytes())
+    blocked_index = proxy["data_dir"] / "simple" / "blocked"
+    blocked_index.mkdir(parents=True, exist_ok=True)
+    (blocked_index / "index.json").write_text(
+        json.dumps({"meta": {"api-version": "1.0"}, "files": [{"filename": blocked.name}]})
+    )
+
     data = get_index_json(proxy["simple"], "allowedopen")
     assert [f["filename"] for f in data["files"]] == [allowed.name]
     assert http_get(f"{proxy['base_url']}/files/allowedopen/{allowed.name}")[0] == 200
@@ -264,6 +277,11 @@ def test_proxy_denylist_subtracts_from_open_proxy(proxy_pair_denylist, tmp_path)
     filenames = [f["filename"] for f in data["files"]]
     assert pinned_new.name in filenames
     assert pinned_old.name not in filenames
+    pinned_dir = proxy["data_dir"] / "packages" / "pinned"
+    pinned_dir.mkdir(parents=True, exist_ok=True)
+    (pinned_dir / ".origin").write_text("mirror\n")
+    pinned_cache = pinned_dir / pinned_old.name
+    pinned_cache.write_bytes(pinned_old.read_bytes())
     assert http_get(f"{proxy['base_url']}/files/pinned/{pinned_new.name}")[0] == 200
     assert http_get(f"{proxy['base_url']}/files/pinned/{pinned_old.name}")[0] == 404
 

@@ -430,6 +430,14 @@ impl Proxy {
             .is_some_and(|constraints| constraints.iter().any(Option::is_none))
     }
 
+    /// Is this particular artifact excluded by a configured package deny rule?
+    pub(crate) fn artifact_denied(&self, pkg: &str, filename: &str) -> bool {
+        self.deny
+            .as_ref()
+            .and_then(|m| m.get(pkg))
+            .is_some_and(|constraints| version_allowed(constraints, filename))
+    }
+
     /// Does this file satisfy the name's version constraints? Allowed when no
     /// scope is configured; otherwise the name's constraints gate the version.
     /// A name in scope is reached here only after [`name_in_scope`], so a miss
@@ -444,10 +452,8 @@ impl Proxy {
         if !allowed {
             return false;
         }
-        if let Some(constraints) = self.deny.as_ref().and_then(|m| m.get(pkg)) {
-            if version_allowed(constraints, filename) {
-                return false;
-            }
+        if self.artifact_denied(pkg, filename) {
+            return false;
         }
         true
     }

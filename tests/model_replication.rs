@@ -1824,6 +1824,171 @@ mod conformance {
             "expected many copy scenarios, got {copy_scenarios}"
         );
     }
+
+    /// The copy transport's artifact leg is an unconditional `CopyObject` — no
+    /// create-if-absent, and nothing below it that could stop mirror bytes
+    /// landing on a destination a private publish claimed *after* the
+    /// listing-era read this verdict was computed from. Two destination reads
+    /// stand in the way and both used to be discarded: the origin claim
+    /// (`ensure_mirror_origin` yields to private rather than failing) and the
+    /// sidecar (`install_or_verify_mirror_sidecar` reports the yield as
+    /// `Ok(false)`, the same value it returns for a dedup). Drive each signal
+    /// through the real executor over a real boot copy matrix and require a
+    /// loud failure with the destination's private truth untouched.
+    #[tokio::test]
+    async fn a_copy_never_lands_mirror_bytes_on_a_destination_gone_private() {
+        use pypiron::buckets::TOPOLOGY_STAMP_KEY;
+        use pypiron::origin::{origin_key, MIRROR, PRIVATE};
+        use pypiron::replicate::{execute, read_record, ArtifactSource};
+
+        // Seed a live mirror record on the source and an empty destination,
+        // decide the copy against that pair, then let `race` privatize the
+        // destination the way a concurrent upload would — after the verdict,
+        // before the transport runs. Returns the destination and the error.
+        async fn run(tag: &str, race: impl FnOnce(&SimStorage)) -> (Arc<SimStorage>, String) {
+            let clock = SimClock::new(
+                time::OffsetDateTime::parse(
+                    "2026-01-01T00:00:00Z",
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .expect("valid timestamp"),
+            );
+            let src = SimStorage::new_copy_source(clock.clone(), &format!("{tag}-src"));
+            let dst = SimStorage::new_copy_source(clock.clone(), &format!("{tag}-dst"));
+            materialize(
+                &BucketAbs {
+                    pkg_origin: Some(MOrigin::Mirror),
+                    files: [
+                        FileRec {
+                            artifact: Some(0),
+                            sidecar: Some(AbsSidecar {
+                                sha_of: 0,
+                                origin: MOrigin::Mirror,
+                                yanked: false,
+                                yank_epoch: 0,
+                                epoch_ms: None,
+                                snapshot: false,
+                            }),
+                            ..FileRec::default()
+                        },
+                        FileRec::default(),
+                    ],
+                    quarantine: BTreeSet::new(),
+                },
+                &src,
+            )
+            .await;
+            let state = multi_bucket_state(vec![
+                ("src".to_string(), src.clone() as Arc<dyn Storage>),
+                ("dst".to_string(), dst.clone() as Arc<dyn Storage>),
+            ]);
+            // The boot probe copies each bucket's topology stamp; seed it, build
+            // the matrix, then clear it so only the record remains.
+            src.insert(TOPOLOGY_STAMP_KEY, b"stamp".to_vec());
+            dst.insert(TOPOLOGY_STAMP_KEY, b"stamp".to_vec());
+            let matrix =
+                pypiron::buckets::build_copy_matrix(state.buckets.handles(), &[0, 1]).await;
+            assert_eq!(
+                matrix.copyable_pairs(),
+                2,
+                "the server-side copy transport must be the one under test"
+            );
+            state.buckets.install_copy_matrix(matrix);
+            for bucket in [&src, &dst] {
+                bucket
+                    .delete_keys(std::slice::from_ref(&TOPOLOGY_STAMP_KEY.to_string()))
+                    .await
+                    .expect("clear the boot stamp");
+            }
+
+            let ra = read_record(src.as_ref(), PKG, FILES[0])
+                .await
+                .expect("read source record");
+            let rb = read_record(dst.as_ref(), PKG, FILES[0])
+                .await
+                .expect("read destination record");
+            let verdict = decide(&ra, &rb);
+            assert!(
+                matches!(verdict, Verdict::Copy(Side::A)),
+                "an empty destination must decide as a copy, got {verdict:?}"
+            );
+
+            race(&dst);
+
+            let err = execute(
+                &state,
+                (src.as_ref(), dst.as_ref()),
+                PKG,
+                FILES[0],
+                (&ra, &rb),
+                verdict,
+                ArtifactSource::Bucket,
+            )
+            .await
+            .expect_err("the copy must fail loudly, not overwrite private truth");
+            (dst, err.to_string())
+        }
+
+        let akey = format!("packages/{PKG}/{}", FILES[0]);
+
+        // (a) The racing upload claimed the package. Nothing of the mirror
+        // record may land — not even the origin-claim-first sidecar.
+        let (dst, err) = run("gone-private-claim", |dst| {
+            dst.insert(&origin_key(PKG), PRIVATE.as_bytes().to_vec());
+        })
+        .await;
+        assert!(
+            err.contains("claims 'p0' private"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dst.head_exists(&akey).await.expect("head artifact"),
+            "the copy landed mirror bytes under a private claim"
+        );
+        assert!(
+            !dst.head_exists(&sidecar_key(&akey))
+                .await
+                .expect("head sidecar"),
+            "the copy published a mirror sidecar under a private claim"
+        );
+
+        // (b) The upload's sidecar landed ahead of its claim upgrade, so the
+        // origin read passes and the sidecar is the only signal left.
+        let private = AbsSidecar {
+            sha_of: 1,
+            origin: MOrigin::Private,
+            yanked: false,
+            yank_epoch: 0,
+            epoch_ms: Some(0),
+            snapshot: false,
+        };
+        let (dst, err) = run("gone-private-sidecar", |dst| {
+            dst.insert(&origin_key(PKG), MIRROR.as_bytes().to_vec());
+            dst.insert(&akey, real_bytes(1));
+            dst.insert(
+                &sidecar_key(&akey),
+                serde_json::to_vec(&to_sidecar(&private)).expect("sidecar serializes"),
+            );
+        })
+        .await;
+        assert!(
+            err.contains("holds private truth"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            dst.get_bytes(&akey).await.expect("read artifact"),
+            real_bytes(1),
+            "the copy replaced the destination's private body"
+        );
+        let stored: Sidecar = serde_json::from_slice(
+            &dst.get_bytes(&sidecar_key(&akey))
+                .await
+                .expect("read sidecar"),
+        )
+        .expect("sidecar parses");
+        assert_eq!(stored.origin.as_deref(), Some(PRIVATE));
+        assert_eq!(stored.sha256, real_sha(1));
+    }
 }
 
 // ---------------------------------------------------------------------------

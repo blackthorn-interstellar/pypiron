@@ -879,8 +879,16 @@ async fn copy_live(
     // Stream transport reads + sha-verifies the source bytes *before* the first
     // destination mutation, so a bad source never publishes a sidecar. The copy
     // transport cannot pre-verify (the bytes never touch this node); it trusts
-    // the provider's byte-exact copy and the post-copy size check, and the
-    // reconcile sha-diff is the backstop.
+    // the provider's byte-exact copy and the post-copy size check. Nothing
+    // downstream re-checks that trust — the reconcile sha-diff compares the two
+    // *sidecars*, so a body contradicting its own sidecar is invisible to it.
+    // What guards this leg is the two pre-copy bails below: the destination's
+    // origin claim and its sidecar are each read for private truth, and either
+    // stops the copy before `CopyObject` (which has no create-if-absent) can put
+    // mirror bytes under a private claim. The residual race is the milliseconds
+    // between those reads and the copy verb, against the listing-era window this
+    // replaced; closing it outright needs a destination-conditional copy, which
+    // no provider's copy verb offers.
     let mut streamed = match &copy_origin {
         None => Some(verify_source_artifact(src, pkg, filename, record, source).await?),
         Some(_) => None,
@@ -895,7 +903,18 @@ async fn copy_live(
     // Origin claim first, ahead of the artifact — shrinks the dependency-
     // confusion window (§4): the name is claimed before its bytes land.
     if is_mirror {
-        ensure_mirror_origin(dst, pkg).await?;
+        // A destination that went private since the listing-era read owns this
+        // name outright — private is terminal and outranks mirror everywhere.
+        // `ensure_mirror_origin` yields to that claim instead of failing, so the
+        // yield has to be read here: continuing would replicate a public name
+        // onto a bucket where it is somebody's private package (§4).
+        if ensure_mirror_origin(dst, pkg).await? == Origin::Private {
+            bail!(
+                "destination bucket {} claims '{pkg}' private; refusing to replicate mirror record {filename} from {}",
+                bucket_name(dst),
+                bucket_name(src)
+            );
+        }
     } else {
         ensure_private_origin(dst, pkg).await?;
     }
@@ -939,10 +958,27 @@ async fn copy_live(
     // that already holds a different-sha private body is caught here and bails
     // before any artifact write. This is the only leg that publishes its gate
     // ahead of the bytes it names, and only because it cannot do otherwise.
+    let skey = sidecar_key(&akey);
     let mut changed = if is_mirror {
-        install_or_verify_mirror_sidecar(dst, &sidecar_key(&akey), sc).await?
+        let installed = install_or_verify_mirror_sidecar(dst, &skey, sc).await?;
+        // `Ok(false)` is "the destination sidecar stands as it is", and that
+        // covers two very different states: our own bytes already there, or the
+        // yield to private truth (the installer never overwrites it). The upload
+        // path is free to read both as "carry on"; this leg is not, because the
+        // artifact leg below is an unconditional `CopyObject` that would land
+        // mirror bytes under that private sidecar. Distinguish them here rather
+        // than in the shared installer, whose `Ok(false)` the upload path
+        // (`publish::publish_record`) relies on meaning "yield, continue".
+        if !installed && sidecar_holds_private(dst, &skey).await? {
+            bail!(
+                "destination bucket {} holds private truth for {pkg}/{filename}; refusing to copy the mirror record from {}",
+                bucket_name(dst),
+                bucket_name(src)
+            );
+        }
+        installed
     } else {
-        install_or_verify_sidecar(dst, &sidecar_key(&akey), sc).await?
+        install_or_verify_sidecar(dst, &skey, sc).await?
     };
     if let Some(bytes) = companions.metadata {
         changed |= put_if_absent_or_verify(
@@ -1060,6 +1096,30 @@ async fn sidecar_still_names(dst: &dyn Storage, key: &str, sha: &str) -> Result<
         Err(error) if is_not_found(&error) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+/// Whether the sidecar at `key` is private truth. Read only when a mirror
+/// install declined to write, to tell "already our bytes" from "yielded to a
+/// private claim" — [`install_or_verify_mirror_sidecar`] collapses both into
+/// `Ok(false)` and its other caller needs it to keep doing so.
+async fn sidecar_holds_private(dst: &dyn Storage, key: &str) -> Result<bool> {
+    match dst.get_bytes(key).await {
+        Ok(bytes) => {
+            let current: Sidecar = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse destination sidecar {key}"))?;
+            Ok(current.origin.as_deref() == Some(PRIVATE))
+        }
+        Err(error) if is_not_found(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Name a bucket for an operator-facing error. Only backends that can be a
+/// server-side copy peer carry a name; disk and the test fakes report `local`.
+fn bucket_name(storage: &dyn Storage) -> String {
+    storage
+        .copy_origin()
+        .map_or_else(|| "local".to_string(), |origin| origin.location)
 }
 
 /// How the destination's artifact key ended up after [`artifact_leg`].

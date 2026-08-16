@@ -433,6 +433,52 @@ def test_ac1_byte_gate_blocks_mal_version_by_default(
         run_checked([str(uv_venv), "-c", f"import {_import_name(MAL_EXACT_PKG)}"])
 
 
+def test_unreadable_filename_version_blocks_against_every_mal_rule(
+    tmp_path_factory, pypiron_bin, tmp_path
+):
+    """An artifact whose filename yields no version — a legacy `.egg`, or an sdist
+    an attacker names freely — is refused whenever its project carries any MAL
+    advisory. An exact-version rule can't be checked against a version nobody can
+    read, so the gate fails closed instead of guessing: the 403 reports a null
+    version and names the rule it could not rule out. Real PyPI history holds 9
+    such malware files (e.g. anticheatservice-0.0.13.win-amd64.zip, MAL-2024-4768)
+    that a version-scoped read serves."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    with advisory_server(tmp_path_factory, pypiron_bin, feed) as server:
+        base = server["base_url"]
+        assert _poll_metric(base, "pypiron_advisory_snapshot_age_seconds") is not None
+
+        # The sidecar carries the true version; the filename doesn't (names.rs
+        # infers no version from a legacy binary format, by construction).
+        egg = tmp_path / f"{MAL_EXACT_PKG}-{MAL_EXACT_VERSION}-py3.11.egg"
+        egg.write_bytes(make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path).read_bytes())
+        upload_legacy(
+            server["legacy"],
+            egg,
+            username=server["admin_user"],
+            password=server["admin_password"],
+            fields={"mirror": "true", "name": MAL_EXACT_PKG, "version": MAL_EXACT_VERSION},
+        )
+
+        before = _metric_value(_metrics_text(base), "pypiron_blocked_downloads_total")
+        assert before is not None
+
+        code, body, _ = http_get(f"{base}/files/{MAL_EXACT_PKG}/{egg.name}")
+        assert code == 403, (code, body)
+        doc = json.loads(body)
+        assert doc["error"] == "blocked by malware advisory", doc
+        assert doc["version"] is None, doc
+        assert doc["advisories"] == [MAL_EXACT_ID], doc
+        assert _poll_blocked_at_least(base, before + 1), "tripwire metric never incremented"
+
+        # Fail-closed on the unreadable name only — a readable clean version of the
+        # same project still serves, so this is not a name-wide block.
+        clean = make_wheel(MAL_EXACT_PKG, "1.4.0", tmp_path)
+        _mirror_upload(server, clean)
+        code, _, _ = http_get(f"{base}/files/{MAL_EXACT_PKG}/{clean.name}")
+        assert code in (200, 302), code
+
+
 def test_ac2_private_package_sharing_mal_name_installs(
     tmp_path_factory, pypiron_bin, tmp_path, uv_path, uv_venv
 ):

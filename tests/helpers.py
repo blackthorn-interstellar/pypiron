@@ -650,7 +650,13 @@ def upload_legacy(
     """
     filename = wheel_path.name
     file_bytes = wheel_path.read_bytes()
-    name, version = parse_dist_filename(filename)
+    # Legacy binary formats (.egg/.exe/.msi) carry no parseable name/version; a
+    # caller publishing one supplies both in `fields`, which would override the
+    # derived pair anyway.
+    if fields and "name" in fields and "version" in fields:
+        name, version = fields["name"], fields["version"]
+    else:
+        name, version = parse_dist_filename(filename)
 
     form: Dict[str, str] = {
         ":action": "file_upload",

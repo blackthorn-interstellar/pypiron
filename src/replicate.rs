@@ -875,7 +875,15 @@ async fn copy_live(
     // through to streaming. Only that transport publishes the sidecar as its
     // divergence gate — its copy verb has no create-if-absent, so a pre-check is
     // the only gate it can have. Every streamed record lands its bytes first.
-    let copy_origin = copy_transport(state, src, dst);
+    let is_mirror = matches!(record.origin(), Some(Origin::Mirror));
+    // A provider-side copy can overwrite an object that a concurrent private
+    // publish has claimed since the merge decision. Mirror truth must use the
+    // conditional-create stream path so it can never replace private bytes.
+    let copy_origin = if is_mirror {
+        None
+    } else {
+        copy_transport(state, src, dst)
+    };
     // Stream transport reads + sha-verifies the source bytes *before* the first
     // destination mutation, so a bad source never publishes a sidecar. The copy
     // transport cannot pre-verify (the bytes never touch this node); it trusts
@@ -891,11 +899,12 @@ async fn copy_live(
     // truth on the mirror-safe path: it claims MIRROR create-if-absent (never
     // demoting a private claim) and installs a mirror sidecar (never overwriting
     // private truth). Private records take the private path unchanged.
-    let is_mirror = matches!(record.origin(), Some(Origin::Mirror));
     // Origin claim first, ahead of the artifact — shrinks the dependency-
     // confusion window (§4): the name is claimed before its bytes land.
     if is_mirror {
-        ensure_mirror_origin(dst, pkg).await?;
+        if ensure_mirror_origin(dst, pkg).await? == Origin::Private {
+            bail!("mirror replication yielded to private package '{pkg}'");
+        }
     } else {
         ensure_private_origin(dst, pkg).await?;
     }
@@ -1533,9 +1542,10 @@ pub(crate) async fn install_or_verify_mirror_sidecar(
                 bail!("sidecar at {key} holds an unexpected origin '{raw}'");
             }
         }
-        // Private truth outranks a replicated mirror snapshot; leave it in place.
+        // Returning success here would let the caller continue to the artifact
+        // leg and replace bytes belonging to this private sidecar.
         if current.origin.as_deref() == Some(PRIVATE) {
-            return Ok(false);
+            bail!("mirror replication yielded to private sidecar at {key}");
         }
         let replace = if current.sha256 != sidecar.sha256 {
             // A different-sha mirror sidecar is replaceable only as stale crash
@@ -5421,15 +5431,49 @@ mod tests {
             .await
             .is_err());
 
-        // Private truth on the destination is never overwritten by a mirror record.
+        // Private truth on the destination aborts the mirror copy rather than
+        // letting its caller continue on to the artifact leg.
         let s2 = InMemStorage::default();
         let private = decide::tests::sc("abc", PRIVATE, crate::sidecar::Yanked::Flag(false), 0);
         s2.insert(&key, serde_json::to_vec(&private).unwrap());
-        assert!(!install_or_verify_mirror_sidecar(&s2, &key, &snapshot)
+        assert!(install_or_verify_mirror_sidecar(&s2, &key, &snapshot)
             .await
-            .unwrap());
+            .is_err());
         let stored: Sidecar = serde_json::from_slice(&s2.get_bytes(&key).await.unwrap()).unwrap();
         assert_eq!(stored.origin.as_deref(), Some(PRIVATE));
+    }
+
+    #[tokio::test]
+    async fn mirror_copy_yields_to_private_destination_without_touching_bytes() {
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let mirror_bytes = b"public mirror wheel";
+        let private_bytes = b"private wheel";
+        let src = Arc::new(InMemStorage::default());
+        let dst = Arc::new(InMemStorage::default());
+        seed_live(src.as_ref(), "pkg", filename, mirror_bytes, MIRROR);
+        seed_live(dst.as_ref(), "pkg", filename, private_bytes, PRIVATE);
+        claim_origin(dst.as_ref(), "pkg", PRIVATE).await.unwrap();
+        let state = test_state(src.clone());
+
+        let err = copy_live(
+            &state,
+            src.as_ref(),
+            dst.as_ref(),
+            "pkg",
+            filename,
+            &live(&sha256_hex(mirror_bytes), MIRROR),
+            ArtifactSource::Bucket,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("yielded to private package"));
+        assert_eq!(dst.get_bytes(&key).await.unwrap(), private_bytes);
+        let stored: Sidecar =
+            serde_json::from_slice(&dst.get_bytes(&sidecar_key(&key)).await.unwrap()).unwrap();
+        assert_eq!(stored.origin.as_deref(), Some(PRIVATE));
+        assert_eq!(stored.sha256, sha256_hex(private_bytes));
     }
 
     #[tokio::test]

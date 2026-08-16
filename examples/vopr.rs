@@ -1,3 +1,5 @@
+#![allow(clippy::exit)]
+
 //! The VOPR: deterministic simulation testing for the pypiron event protocol
 //! (dev/MOONSHOT.md rung 1, FoundationDB/TigerBeetle lineage).
 //!

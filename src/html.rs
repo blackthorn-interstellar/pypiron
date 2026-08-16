@@ -656,7 +656,7 @@ pub fn project_html(
 
     // Install command: `uv add` only, pinned to the version on a version page.
     let target = if pinned && !selected.is_empty() {
-        format!("{pkg}=={selected}")
+        shell_single_quote(&format!("{pkg}=={selected}"))
     } else {
         pkg.to_string()
     };
@@ -737,6 +737,13 @@ pub fn project_html(
         footer = version_footer(ctx.version),
     );
     shell(&format!("{pkg} · pypiron"), &banner, &body, true, true)
+}
+
+/// Quote one argument for the POSIX shells users paste install snippets into.
+/// Versions normally parse as PEP 440, but legacy sidecars may contain arbitrary
+/// upload metadata and must never be allowed to add shell syntax to a command.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 /// A file's version: the sidecar value, else inferred from the filename. Shared
@@ -1411,7 +1418,9 @@ mod tests {
         );
         // The banner and install snippet pin the selected version.
         assert!(html.contains("<span class=\"pver\">14.3.0</span>"));
-        assert!(html.contains("uv add --index https://pkgs.example.com/simple/ imaginairy==14.3.0"));
+        assert!(
+            html.contains("uv add --index https://pkgs.example.com/simple/ 'imaginairy==14.3.0'")
+        );
         // Release history marks 14.3.0 as the current one.
         assert!(html.contains("class=\"release current\""));
         assert!(html.contains("This version"));
@@ -1419,6 +1428,28 @@ mod tests {
         let dl = &html[html.find("id=\"files\"").unwrap()..];
         assert!(dl.contains("imaginAIry-14.3.0-py3-none-any.whl"));
         assert!(!dl.contains("imaginAIry-15.0.0-py3-none-any.whl"));
+    }
+
+    #[test]
+    fn version_page_shell_quotes_untrusted_version() {
+        assert_eq!(
+            shell_single_quote("demo==1.0; touch /tmp/pwned'"),
+            "'demo==1.0; touch /tmp/pwned'\"'\"''"
+        );
+        let html = project_html(
+            &ctx(),
+            "demo",
+            &imaginairy_files(),
+            "1.0; touch /tmp/pwned'",
+            true,
+            None,
+            None,
+            &[],
+            &[],
+        );
+
+        assert!(html.contains("demo==1.0; touch /tmp/pwned"));
+        assert!(!html.contains("uv add --index https://pkgs.example.com/simple/ demo==1.0;"));
     }
 
     #[test]

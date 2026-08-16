@@ -175,13 +175,43 @@ async fn file_visible_read_through(
     pkg: &str,
     artifact_key: &str,
 ) -> Result<bool> {
-    if multi_bucket_file_visible(state, pins.read.storage.as_ref(), pkg, artifact_key).await? {
+    // A positive regional observation is not authoritative. In particular, a
+    // lagging region may still describe a public mirror package after the write
+    // home has claimed that normalized name privately. Only trust regional
+    // presence while both pins agree on the complete origin observation.
+    let read_claim = require_settled_package_read(state, pins.read.storage.as_ref(), pkg).await?;
+    let write_claim = if pins.same_pin {
+        read_claim.clone()
+    } else {
+        require_settled_package_read(state, pins.write.storage.as_ref(), pkg).await?
+    };
+    if read_claim == write_claim
+        && multi_bucket_file_visible(state, pins.read.storage.as_ref(), pkg, artifact_key).await?
+    {
         return Ok(true);
     }
     if pins.same_pin {
         return Ok(false);
     }
     multi_bucket_file_visible(state, pins.write.storage.as_ref(), pkg, artifact_key).await
+}
+
+async fn read_copy_is_authoritative(
+    state: &AppState,
+    pins: &Pins<'_>,
+    pkg: &str,
+    artifact_key: &str,
+) -> Result<bool> {
+    if pins.same_pin {
+        return Ok(true);
+    }
+    let (read, write) = futures::future::try_join(
+        require_settled_package_read(state, pins.read.storage.as_ref(), pkg),
+        require_settled_package_read(state, pins.write.storage.as_ref(), pkg),
+    )
+    .await?;
+    Ok(read == write
+        && multi_bucket_file_visible(state, pins.read.storage.as_ref(), pkg, artifact_key).await?)
 }
 
 pub(crate) async fn simple_root(
@@ -348,6 +378,44 @@ async fn serve_local_index_fenced(
     headers: &HeaderMap,
     read_baseline: Option<origin::OriginObservation>,
 ) -> Response<Body> {
+    // Presence is useful for locality, but the write home owns origin. Refuse
+    // to serve a regional index when its claim is stale in either direction;
+    // reading through also covers the normal replication-lag case.
+    if !pins.same_pin {
+        let write_baseline =
+            match require_settled_package_read(state, pins.write.storage.as_ref(), pkg).await {
+                Ok(claim) => claim,
+                Err(error) => return read_error(error),
+            };
+        if read_baseline != write_baseline {
+            if write_baseline
+                .as_ref()
+                .is_none_or(|claim| claim.state == origin::OriginState::Unclaimed)
+            {
+                return not_found("no such package");
+            }
+            let resp = serve_index_uncached(
+                pins.write.storage.as_ref(),
+                &key,
+                content_type,
+                INDEX_CACHE_CONTROL,
+                headers,
+            )
+            .await;
+            if let Some(resp) = recheck_settled(
+                state,
+                pins.write.storage.as_ref(),
+                pkg,
+                &write_baseline,
+                "serving its index",
+            )
+            .await
+            {
+                return resp;
+            }
+            return resp;
+        }
+    }
     let resp = serve_index(
         state,
         pins.read,
@@ -370,6 +438,19 @@ async fn serve_local_index_fenced(
             .await
             {
                 return resp;
+            }
+            if !pins.same_pin {
+                if let Some(resp) = recheck_settled(
+                    state,
+                    pins.write.storage.as_ref(),
+                    pkg,
+                    &read_baseline,
+                    "serving its regional index",
+                )
+                .await
+                {
+                    return resp;
+                }
             }
         }
         return resp;
@@ -846,6 +927,10 @@ pub(crate) async fn files_get(
         Ok(false) => return not_found("artifact is fenced"),
         Err(error) => return read_error(error),
     }
+    let use_read_pin = match read_copy_is_authoritative(&state, &pins, &pkg, &artifact_key).await {
+        Ok(matches) => matches,
+        Err(error) => return read_error(error),
+    };
 
     // S3 serves the megabytes, this node serves kilobytes of index: redirect
     // artifact downloads to a presigned URL — but only for clients whose
@@ -869,18 +954,22 @@ pub(crate) async fn files_get(
         // a cached one while it has plenty of validity left (see cache.rs).
         // The presign cache is keyed by the (shared) read-pin generation and
         // populated only from this read-pin-routed path.
-        if let Some(url) = state.presign_cache.fresh(&key, read_pinned.generation) {
-            if let Some(k) = &dl_key {
-                state.counters.record("downloads", k);
-                state.metrics.record_download();
+        if use_read_pin {
+            if let Some(url) = state.presign_cache.fresh(&key, read_pinned.generation) {
+                if let Some(k) = &dl_key {
+                    state.counters.record("downloads", k);
+                    state.metrics.record_download();
+                }
+                return found_redirect(&url);
             }
-            return found_redirect(&url);
         }
         // Presign the bucket that actually holds the bytes: the read pin when the
         // object is present there, otherwise the write pin — never hand out a URL
         // that will 404. The HEAD is skipped when the two pins are one bucket, so
         // single-region and no-affinity nodes add no round trip here.
-        let presign_storage = if pins.same_pin {
+        let presign_storage = if !use_read_pin {
+            write_pinned.storage.clone()
+        } else if pins.same_pin {
             read_pinned.storage.clone()
         } else {
             match read_pinned.storage.head_exists(&key).await {
@@ -898,9 +987,11 @@ pub(crate) async fn files_get(
         {
             Ok(Some(url)) => {
                 let url: Arc<str> = url.into();
-                state
-                    .presign_cache
-                    .put(&key, url.clone(), read_pinned.generation);
+                if use_read_pin {
+                    state
+                        .presign_cache
+                        .put(&key, url.clone(), read_pinned.generation);
+                }
                 if let Some(k) = &dl_key {
                     state.counters.record("downloads", k);
                     state.metrics.record_download();
@@ -916,10 +1007,15 @@ pub(crate) async fn files_get(
     // Stream from the read pin; on any failure (a not-found on a lagging region
     // bucket, or an error) read through to the write pin once before mapping to
     // 404/503.
-    let mut resp = match read_pinned.storage.serve_artifact(&key, range).await {
+    let primary = if use_read_pin {
+        &read_pinned.storage
+    } else {
+        &write_pinned.storage
+    };
+    let mut resp = match primary.serve_artifact(&key, range).await {
         Ok(resp) => resp,
         Err(read_err) => {
-            if pins.same_pin {
+            if pins.same_pin || !use_read_pin {
                 return read_error(read_err);
             }
             match write_pinned.storage.serve_artifact(&key, range).await {

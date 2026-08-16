@@ -796,14 +796,12 @@ def test_boot_with_the_region_bucket_unreachable_reads_from_the_write_bucket(
         server_gen.close()
 
 
-def test_private_name_never_falls_through_on_a_region_bucket_absence(
+def test_stale_region_mirror_never_shadows_write_home_private_name(
     s3_server_read_affinity_proxy, tmp_path
 ):
-    """Fail-closed floor: a private name whose origin claim the region bucket has
-    not yet seen is served from local truth on the write home — never proxied
-    upstream. A public build of the same name sits upstream to make a
-    fall-through visible; the node serves the private bytes and the upstream
-    access log shows it was never asked."""
+    """A stale positive mirror claim cannot override the write home's private
+    claim. Both the index and direct download read through to private truth,
+    without consulting upstream."""
     server = s3_server_read_affinity_proxy
     minio = server["minio"]
     upstream = server["upstream"]
@@ -835,14 +833,43 @@ def test_private_name_never_falls_through_on_a_region_bucket_absence(
     assert not minio_key_exists_in(minio, b, f"packages/{pkg}/.origin"), "B never saw the claim"
     assert not minio_key_exists_in(minio, b, akey), "B never saw the bytes"
 
+    # Replace the absence with the more dangerous stale-positive state: B still
+    # describes and stores the public artifact while A owns the name privately.
+    stale_sidecar = _sidecar(minio, a, akey)
+    stale_sidecar["origin"] = "mirror"
+    stale_sidecar["sha256"] = hashlib.sha256(public_wheel.read_bytes()).hexdigest()
+    minio_put_key_in(
+        minio,
+        b,
+        f"packages/{pkg}/.origin",
+        json.dumps({"origin": "mirror", "nonce": "a" * 32}),
+    )
+    minio_put_key_in(minio, b, akey, public_wheel.read_bytes())
+    minio_put_key_in(minio, b, f"{akey}.meta.json", json.dumps(stale_sidecar))
+    minio_put_key_in(
+        minio,
+        b,
+        f"simple/{pkg}/index.json",
+        json.dumps(
+            {
+                "meta": {"api-version": "1.0"},
+                "name": pkg,
+                "files": [
+                    {
+                        "filename": public_wheel.name,
+                        "url": f"../../files/{pkg}/{public_wheel.name}",
+                    }
+                ],
+            }
+        ),
+    )
+
     # Snapshot the upstream log AFTER the seeding upload, so anything new is a
     # fall-through.
     upstream_before = upstream["log_path"].read_text()
 
-    # Request the name through the node. B lacks the claim (the dangerous absence
-    # that could permit upstream), but the decision is settled on the write home,
-    # which owns it privately: the node serves the PRIVATE bytes, read through
-    # from A, and never consults upstream.
+    # Request the name through the node. The decision is settled on the write
+    # home, so the stale positive mirror record cannot shadow the private bytes.
     code, body, _ = http_get(f"{server['base_url']}/files/{pkg}/{private_wheel.name}", timeout=15)
     assert code == 200
     assert body == private_wheel.read_bytes()

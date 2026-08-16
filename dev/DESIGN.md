@@ -504,14 +504,12 @@ indexes, counters, and leases never copy. The sidecar `snapshot` bit is thus
 provenance — snapshot vs cache, which picks the *mechanism* (pre-ack fan-out vs
 async note) — not a statement of *whether* a mirror record replicates.
 
-The artifact leg of every copy (fan-out, sweep, reconcile) runs a stateless
-transport ladder: a boot-computed matrix says whether the destination can pull
-the source server-side (same provider, same credential identity, matching custom
-endpoint — real AWS cross-region qualifies, two MinIO endpoints do not), and if
-so it issues a signed CopyObject/rewrite/Copy Blob (zero bytes through the node)
-before falling back to streaming and then the `_repl/` note. The matrix is
-verified once at boot by copying the topology stamp per pair; `decide` and the
-merge algebra never see the transport, so convergence is transport-invariant.
+The artifact leg of every copy (fan-out, sweep, reconcile) streams through the
+node. It verifies the source bytes against the sidecar before any destination
+mutation, then uses the destination's conditional create and verifies any raced
+winner. Provider-side copy operations cannot supply portable create-if-absent
+semantics, so using them for this leg could overwrite a concurrent upload and
+would violate the immutable-filename contract.
 
 Correctness does not depend on every node selecting the same bucket. The merge
 (`replicate::decide`, pure and unit-tested) has precedence

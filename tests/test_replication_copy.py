@@ -1,20 +1,18 @@
-"""Server-side-copy replication transport (real binary, real MinIO).
+"""Replication transport checks (real binary, real MinIO).
 
-The replication ladder asks the provider to copy an artifact between two buckets
-of the same cloud (S3 CopyObject) instead of streaming GET+PUT through the node,
-and falls back to streaming on any ineligibility or failure. These tests drive
-the REAL path against MinIO:
+The startup topology probe checks whether two buckets support provider-side
+copies, but artifact replication always streams through the node to retain
+hash verification and conditional-create semantics. These tests drive the real
+path against MinIO:
 
-- two buckets on ONE MinIO endpoint (same credentials) are copy-eligible, so an
-  upload fans out via a genuine CopyObject — proven by
-  `pypiron_replication_server_side_copies_total` and the boot transport matrix;
+- two buckets on ONE MinIO endpoint (same credentials) are copy-eligible at the
+  topology level, but artifact replication still streams so it can preserve
+  conditional-create semantics;
 - two buckets on DISTINCT MinIO endpoints are not copyable, so the same upload
   fans out by streaming — the copy counter stays zero and the matrix logs it.
 
-The GCS/Azure request construction and signing are covered by Rust unit tests
-(`src/reqsign.rs`, `src/storage.rs`), and the copy->stream fallback under injected
-faults (denied / timeout / phantom-200) by the deterministic simulator
-(`tests/model_replication.rs::convergence_is_transport_invariant`).
+The GCS/Azure topology-probe request construction and signing are covered by
+Rust unit tests (`src/reqsign.rs`, `src/storage.rs`).
 """
 
 from __future__ import annotations
@@ -74,12 +72,10 @@ def _eventually(check, *, timeout: float = 20.0, what: str = "condition") -> Non
     raise AssertionError(f"timed out waiting for {what}")
 
 
-def test_same_endpoint_two_buckets_replicate_via_server_side_copy(
+def test_same_endpoint_two_buckets_replicate_without_overwriting_copy(
     minio_two, s3_server_multi, tmp_path
 ):
-    """Two buckets on one MinIO endpoint are copy-eligible: an upload's fan-out
-    is a real S3 CopyObject (zero artifact bytes through the node), and both
-    buckets end byte-identical."""
+    """Copy-eligible buckets still stream artifacts to preserve immutability."""
     server = s3_server_multi
     a, b = minio_two["buckets"]
 
@@ -107,14 +103,12 @@ def test_same_endpoint_two_buckets_replicate_via_server_side_copy(
         lambda: minio_key_exists_in(minio_two, b, key),
         what="artifact fanned out to the peer bucket",
     )
-    # Byte-identical on the peer — the server-side copy landed correct bytes.
+    # Byte-identical on the peer after the verified stream landed.
     assert minio_object_sha256(minio_two, b, key) == wheel_sha
 
-    # And it moved provider-side: the copy counter incremented.
-    _eventually(
-        lambda: _server_side_copies(server["base_url"]) >= 1,
-        what="a server-side copy was recorded",
-    )
+    # The topology probe may use CopyObject, but live artifact replication must
+    # not: provider copies overwrite and cannot preserve conditional creation.
+    assert _server_side_copies(server["base_url"]) == 0
 
 
 def test_distinct_endpoints_fall_back_to_streaming(minio, minio_alt, pypiron_bin, tmp_path):

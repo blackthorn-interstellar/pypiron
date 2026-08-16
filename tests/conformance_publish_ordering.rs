@@ -18,9 +18,8 @@
 //! Every writer that owns the artifact key's conditional create is covered:
 //! both upload origins (`publish::publish_record`) and the replication copy
 //! (`replicate::execute`), driven for real against deterministic in-memory
-//! buckets. The server-side copy transport is the one exemption and stays
-//! sidecar-first — its copy verb has no create-if-absent, so a pre-check is the
-//! only gate it can have.
+//! buckets. Provider-side copy verbs are not used for artifacts because they
+//! cannot provide this conditional-create ordering.
 //!
 //! The rule is a property of the write *sequence*, so it is asserted on the
 //! sequence (via a recording `Storage`) rather than on state a completed run
@@ -369,10 +368,8 @@ async fn a_private_upload_lands_its_bytes_before_the_sidecar_that_names_them() {
     assert_artifact_precedes_sidecar(&recorder, "private upload").await;
 }
 
-/// The replication copy obeys the same rule on the stream transport, where it
-/// already holds sha-verified bytes before it touches the destination. (The
-/// server-side copy transport is exempt and stays sidecar-first: its copy verb
-/// has no create-if-absent, so a pre-check is the only gate it can have.)
+/// The replication copy obeys the same rule: it holds sha-verified bytes before
+/// it touches the destination.
 #[tokio::test]
 async fn a_mirror_copy_lands_its_bytes_before_the_sidecar_that_names_them() {
     let clk = clock();

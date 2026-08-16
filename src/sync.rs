@@ -2294,7 +2294,7 @@ fn select_from_index(
         }
         if matches_mirror(&file, &resolved.mirror) {
             file.url = resolve(&file.url);
-            file.provenance = file.provenance.as_deref().map(&resolve);
+            file.provenance = file.provenance.as_deref().map(resolve);
             selected.push(Selected { version, file });
         } else if let Some(t) = held_back_by_newer(&file, &resolved.mirror) {
             let secs = t.unix_timestamp();

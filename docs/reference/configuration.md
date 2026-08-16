@@ -245,17 +245,10 @@ in the background — a fetch is served the instant it lands, and its copy to th
 other buckets follows within minutes, off the download path — so budget for roughly your total stored size times the number of buckets. No new knobs: replication is on whenever you run more than
 one bucket.
 
-When two buckets live on the same cloud under the same credentials, pypiron asks
-that cloud to copy an artifact directly between them (S3 CopyObject, GCS rewrite,
-Azure Copy Blob) instead of pulling every byte through the node and pushing it
-back — same-region copies cost a request instead of transfer, and cross-region
-ones skip the node's network entirely. Two real AWS regions in one account
-qualify; two separate MinIO endpoints or two different clouds do not, and fall
-back to streaming. pypiron works this out once at startup — verifying each pair
-with a throwaway copy — and logs the result one line per bucket pair (a
-`replication copy matrix` entry reading `transport=copy` or `transport=stream`),
-so you can see which pairs take the fast path. Nothing to configure, and
-nothing changes about what ends up on each bucket; only how the bytes get there.
+Replication streams each artifact through pypiron. This lets pypiron verify the
+source hash before changing another bucket and use a conditional create at the
+destination, so a concurrent upload cannot be overwritten by a cloud-provider
+copy operation. Budget node network capacity for both the read and the write.
 
 In multi-bucket mode a failing bucket stops taking new requests within a
 second and its background work is cancelled; transfers already in flight keep

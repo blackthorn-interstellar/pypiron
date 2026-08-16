@@ -1,3 +1,5 @@
+#![allow(clippy::exit)] // CLI exit codes are part of the simulator's interface.
+
 //! The VOPR: deterministic simulation testing for the pypiron event protocol
 //! (dev/MOONSHOT.md rung 1, FoundationDB/TigerBeetle lineage).
 //!

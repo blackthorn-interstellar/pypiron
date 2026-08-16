@@ -45,6 +45,7 @@ use crate::names::{
     checked_pkg_name, infer_version_from_filename, matches_prefix, normalize_pkg_name,
     parse_wheel_tags, WheelTags,
 };
+use crate::origin;
 use crate::render::SIMPLE_JSON_CONTENT_TYPE;
 use crate::sidecar::Yanked;
 use crate::simple::{self, IndexFetch, SimpleFile, SimpleIndex};
@@ -1207,6 +1208,7 @@ fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
     let mut h = Sha256::new();
     h.update(resolved.src_base.as_bytes());
     h.update([0]);
+    h.update([u8::from(resolved.as_private)]);
     for format in &m.include_format {
         h.update(format.as_str().as_bytes());
         h.update([0]);
@@ -1961,18 +1963,27 @@ async fn sync_one_package(
         }
     };
 
-    // Skip files the destination already holds: re-uploading one only earns a
-    // 409 after a wasted download. The server keys that 409 on the filename (the
-    // storage key), so a filename match is exactly "already present".
+    // Skip only identical files. Private migrations additionally require a
+    // private destination claim: a mirror-owned filename must reach the upload
+    // path so the server's origin boundary rejects the migration loudly.
     let (selected, already_present) = {
-        let present: HashSet<&str> = local
+        let present: HashSet<(&str, &str)> = local
             .as_ref()
-            .map(|l| l.files.iter().map(|f| f.filename.as_str()).collect())
+            .filter(|(_, owner)| !resolved.as_private || owner == origin::PRIVATE)
+            .map(|(l, _)| {
+                l.files
+                    .iter()
+                    .filter_map(|f| Some((f.filename.as_str(), f.sha256()?)))
+                    .collect()
+            })
             .unwrap_or_default();
         let total = selected.len();
         let to_upload: Vec<Selected> = selected
             .into_iter()
-            .filter(|s| !present.contains(s.file.filename.as_str()))
+            .filter(|s| {
+                let digest = s.file.sha256().unwrap_or_default();
+                !present.contains(&(s.file.filename.as_str(), digest))
+            })
             .collect();
         let already_present = total - to_upload.len();
         (to_upload, already_present)
@@ -2032,7 +2043,7 @@ async fn sync_one_package(
     // above, so a re-run stays cheap.
     if !resolved.as_private {
         match &local {
-            Some(local) => {
+            Some((local, _)) => {
                 // Reconcile mutable metadata of files already mirrored: yank
                 // set/cleared to match upstream, and files gone upstream flagged
                 // removed.
@@ -2115,7 +2126,7 @@ async fn fetch_local_index(
     client: &Client,
     resolved: &Resolved,
     pkg: &str,
-) -> Result<Option<SimpleIndex>> {
+) -> Result<Option<(SimpleIndex, String)>> {
     let url = format!(
         "{}/sync/local-index/{pkg}",
         resolved.dst_base.trim_end_matches('/')
@@ -2130,7 +2141,14 @@ async fn fetch_local_index(
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    Ok(Some(resp.error_for_status()?.json().await?))
+    let resp = resp.error_for_status()?;
+    let owner = resp
+        .headers()
+        .get("x-pypiron-origin")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(origin::UNCLAIMED)
+        .to_string();
+    Ok(Some((resp.json().await?, owner)))
 }
 
 /// For each already-mirrored file whose yank state has drifted from upstream,
@@ -3553,6 +3571,10 @@ mod tests {
             config_key(&resolved_with(wheels, "https://pypi.org"), &s)
         );
         assert_ne!(k, config_key(&r, &spec("requests", Some(">=2"))));
+
+        let mut private = resolved_with(time_filter(None, None), "https://pypi.org");
+        private.as_private = true;
+        assert_ne!(k, config_key(&private, &s));
 
         // Each new filter axis invalidates the cursor key too.
         let with = |mutate: fn(&mut ResolvedMirror)| {

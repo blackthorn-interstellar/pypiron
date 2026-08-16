@@ -512,7 +512,13 @@ pub(crate) async fn sync_local_index(
             .is_none_or(|claim| claim.state == origin::OriginState::Unclaimed)
     {
         return Ok((
-            [(header::CONTENT_TYPE, "application/json")],
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (
+                    header::HeaderName::from_static("x-pypiron-origin"),
+                    origin::UNCLAIMED,
+                ),
+            ],
             br#"{"files":[]}"#.to_vec(),
         ));
     }
@@ -533,7 +539,16 @@ pub(crate) async fn sync_local_index(
             ));
         }
     }
-    Ok(([(header::CONTENT_TYPE, "application/json")], bytes))
+    let owner = before
+        .as_ref()
+        .map_or(origin::UNCLAIMED, |claim| claim.state.as_str());
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::HeaderName::from_static("x-pypiron-origin"), owner),
+        ],
+        bytes,
+    ))
 }
 /// How long a minted install token is valid. Deliberately short: tokens are
 /// single-session, basically single-use, so a leaked one is dead within

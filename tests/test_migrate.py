@@ -118,3 +118,33 @@ def test_migrate_devpi_as_private(
         [str(uv_venv), "-c", f"import {PACKAGE}; print({PACKAGE}.__version__)"]
     ).stdout.strip()
     assert installed == VERSION
+
+
+def test_migrate_rejects_existing_mirror_origin(devpi_server, disk_server, pypiron_bin, tmp_path):
+    wheel = make_wheel(PACKAGE, VERSION, tmp_path)
+    _twine_upload(wheel, devpi_server)
+    common = (
+        "--include-package",
+        PACKAGE,
+        "--include-format",
+        "wheel",
+        "--source-user",
+        devpi_server["user"],
+        "--source-pass",
+        devpi_server["password"],
+    )
+
+    rc, out, err = sync_to(pypiron_bin, disk_server, *common, source=devpi_server["source"])
+    assert rc == 0, f"mirror setup failed:\n{out}\n{err}"
+
+    rc, out, err = sync_to(
+        pypiron_bin,
+        disk_server,
+        *common,
+        "--as-private",
+        source=devpi_server["source"],
+    )
+    assert rc != 0, "private migration must not accept a mirror-owned package"
+    assert "mirror-owned; private uploads are rejected" in err
+    origin_file = disk_server["data_dir"] / "packages" / PACKAGE / ".origin"
+    assert origin_owner(origin_file.read_text()) == "mirror"

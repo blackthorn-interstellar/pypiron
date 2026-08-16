@@ -126,8 +126,8 @@ ENDPOINTS: list = [
         path="/sync/local-index/{pkg}",
         routes=(("GET", "/sync/local-index/:package"),),
         auth=ADMIN,
-        cold_ops={"read": 1},
-        warm_ops={"read": 1},
+        cold_ops={"read": 2},
+        warm_ops={"read": 2},
         bytes_range=(2, 100000),
     ),
     # --- read paths, global ---

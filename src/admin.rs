@@ -508,6 +508,11 @@ pub(crate) async fn audit_page(
     ))
 }
 
+/// Response header on [`sync_local_index`]: which claim holds the package here
+/// (`private`, `mirror`, or `unclaimed`). A sync client reads it to refuse an
+/// `--as-private` migration onto a mirror-owned name before it moves a byte.
+pub(crate) const ORIGIN_HEADER: &str = "x-pypiron-origin";
+
 /// The locally-materialized PEP 691 index for a package, read straight from
 /// storage so the on-demand proxy never shadows it. Admin-gated; a package with
 /// no local index yet is an empty listing, not a 404 (so the caller treats it
@@ -522,6 +527,15 @@ pub(crate) async fn sync_local_index(
         return Err((StatusCode::NOT_FOUND, "no such package".to_string()));
     };
     let pinned = state.pin();
+    // Read the claim directly rather than reusing the settled observation below:
+    // that one is `None` on a single-bucket server, which would report every
+    // package unclaimed. A storage error propagates instead of degrading to
+    // "unclaimed" — the caller must not learn a weaker origin than the truth.
+    let owner = origin::read_origin_claim(pinned.storage.as_ref(), &pkg)
+        .await
+        .map_err(|e| internal("read", e))?
+        .map_or(origin::UNCLAIMED, origin::OriginState::as_str);
+    let origin_header = (header::HeaderName::from_static(ORIGIN_HEADER), owner);
     let before = require_settled_package_read(&state, pinned.storage.as_ref(), &pkg)
         .await
         .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
@@ -531,7 +545,7 @@ pub(crate) async fn sync_local_index(
             .is_none_or(|claim| claim.state == origin::OriginState::Unclaimed)
     {
         return Ok((
-            [(header::CONTENT_TYPE, "application/json")],
+            [(header::CONTENT_TYPE, "application/json"), origin_header],
             br#"{"files":[]}"#.to_vec(),
         ));
     }
@@ -552,7 +566,10 @@ pub(crate) async fn sync_local_index(
             ));
         }
     }
-    Ok(([(header::CONTENT_TYPE, "application/json")], bytes))
+    Ok((
+        [(header::CONTENT_TYPE, "application/json"), origin_header],
+        bytes,
+    ))
 }
 /// How long a minted install token is valid. Deliberately short: tokens are
 /// single-session, basically single-use, so a leaked one is dead within

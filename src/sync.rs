@@ -45,6 +45,7 @@ use crate::names::{
     checked_pkg_name, infer_version_from_filename, matches_prefix, normalize_pkg_name,
     parse_wheel_tags, WheelTags,
 };
+use crate::origin;
 use crate::render::SIMPLE_JSON_CONTENT_TYPE;
 use crate::sidecar::Yanked;
 use crate::simple::{self, IndexFetch, SimpleFile, SimpleIndex};
@@ -1207,6 +1208,11 @@ fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
     let mut h = Sha256::new();
     h.update(resolved.src_base.as_bytes());
     h.update([0]);
+    // `--as-private` doesn't change *which* files are selected, but it does change
+    // what the run has to do with them — and its ownership check runs only after
+    // a 200. Without it in the key, a prior mirror-mode cursor for the same
+    // source and filters replays its ETag and the migration 304-skips entirely.
+    h.update([u8::from(resolved.as_private)]);
     for format in &m.include_format {
         h.update(format.as_str().as_bytes());
         h.update([0]);
@@ -1960,14 +1966,35 @@ async fn sync_one_package(
     // A fetch error fails the package so the cursor doesn't advance over an
     // un-reconciled state, and forgoes the skip — we fall back to uploading
     // everything, which the server 409s for the duplicates.
-    let local = match fetch_local_index(client, resolved, pkg).await {
-        Ok(local) => local,
+    // That same response reports which claim holds the name at the destination.
+    // A peer too old to send it, or a fetch we couldn't make, reads as unclaimed
+    // — which fails closed for the check below: the upload happens and the
+    // server adjudicates the origin.
+    let (local, dest_origin) = match fetch_local_index(client, resolved, pkg).await {
+        Ok(Some((local, dest_origin))) => (Some(local), dest_origin),
+        Ok(None) => (None, origin::UNCLAIMED.to_string()),
         Err(e) => {
             error!(package=%pkg, error=?e, "local-index fetch failed");
             errors += 1;
-            None
+            (None, origin::UNCLAIMED.to_string())
         }
     };
+
+    // `--as-private` drains a name into the private namespace, so a destination
+    // that already holds it as a *mirror* package is an ownership conflict the
+    // operator has to settle. Refuse here, before a byte moves, because the
+    // filename-keyed skip below would otherwise swallow the whole migration:
+    // every selected file matches a mirror-owned filename, nothing uploads, no
+    // POST ever reaches the server's private-vs-mirror rejection, and the run
+    // reports success while the mirror's bytes keep serving under the name.
+    if resolved.as_private && dest_origin == origin::MIRROR {
+        bail!(
+            "the destination holds '{pkg}' as a mirror package; --as-private will not \
+             migrate onto it. Settle the ownership conflict on the destination first — \
+             remove its mirrored files and run `pypiron origin release {pkg}` there — \
+             or migrate under a different name."
+        );
+    }
 
     // Skip files the destination already holds: re-uploading one only earns a
     // 409 after a wasted download. The server keys that 409 on the filename (the
@@ -2115,15 +2142,16 @@ async fn sync_one_package(
 }
 
 /// Fetch the destination's locally-materialized PEP 691 index (its own truth:
-/// which files it holds, their yank state, and project status). `Ok(None)` means
-/// an older dest without the `/sync/local-index` endpoint; reconcile and status
-/// relay are then skipped rather than run against a proxied upstream view that
-/// would hide a removed file.
+/// which files it holds, their yank state, and project status) together with the
+/// origin claim it reports for the package. `Ok(None)` means an older dest
+/// without the `/sync/local-index` endpoint; reconcile and status relay are then
+/// skipped rather than run against a proxied upstream view that would hide a
+/// removed file. A dest too old to send the origin header reads as unclaimed.
 async fn fetch_local_index(
     client: &Client,
     resolved: &Resolved,
     pkg: &str,
-) -> Result<Option<SimpleIndex>> {
+) -> Result<Option<(SimpleIndex, String)>> {
     let url = format!(
         "{}/sync/local-index/{pkg}",
         resolved.dst_base.trim_end_matches('/')
@@ -2138,7 +2166,14 @@ async fn fetch_local_index(
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    Ok(Some(resp.error_for_status()?.json().await?))
+    let resp = resp.error_for_status()?;
+    let dest_origin = resp
+        .headers()
+        .get(crate::admin::ORIGIN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(origin::UNCLAIMED)
+        .to_string();
+    Ok(Some((resp.json().await?, dest_origin)))
 }
 
 /// For each already-mirrored file whose yank state has drifted from upstream,
@@ -3566,6 +3601,11 @@ mod tests {
             config_key(&resolved_with(wheels, "https://pypi.org"), &s)
         );
         assert_ne!(k, config_key(&r, &spec("requests", Some(">=2"))));
+
+        // A mirror-mode cursor must never let an --as-private run 304-skip.
+        let mut as_private = resolved_with(time_filter(None, None), "https://pypi.org");
+        as_private.as_private = true;
+        assert_ne!(k, config_key(&as_private, &s));
 
         // Each new filter axis invalidates the cursor key too.
         let with = |mutate: fn(&mut ResolvedMirror)| {

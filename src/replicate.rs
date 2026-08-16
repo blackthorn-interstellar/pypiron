@@ -20,8 +20,8 @@
 //! Every function here takes explicit `(source, destination)` storage handles:
 //! this is the one sanctioned two-handle operation (§3 invariant 2). The merge
 //! decision ([`decide`]) is a pure, symmetric function over durable record
-//! state. Upload timestamps are only used for the rare private/private byte
-//! conflict; the executor applies the decision with both handles.
+//! state. Different private bytes under one immutable filename freeze both
+//! records; the executor applies the decision with both handles.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -230,7 +230,7 @@ pub async fn execute(
     // no-op markers on the untouched source would be pure ack-latency.
     let (bracket_a, bracket_b) = match &verdict {
         Verdict::Noop | Verdict::Defer => (false, false),
-        Verdict::Copy(side) | Verdict::Supersede(side) | Verdict::QuarantineLoser(side) => {
+        Verdict::Copy(side) | Verdict::Supersede(side) => {
             match side {
                 Side::A => (false, true), // the named side is the source
                 Side::B => (true, false),
@@ -317,26 +317,6 @@ pub async fn execute(
         Verdict::Supersede(side) => {
             let (src, dst, record) = pick(side);
             supersede_record(state, src, dst, pkg, filename, record, source).await?;
-        }
-        Verdict::QuarantineLoser(winner) => {
-            let (src, dst, record) = pick(winner);
-            let loser = match winner {
-                Side::A => rb,
-                Side::B => ra,
-            };
-            error!(
-                package = %pkg,
-                filename = %filename,
-                winner = ?winner,
-                winner_sha = record.sidecar.as_ref().map(|s| s.sha256.as_str()).unwrap_or("?"),
-                loser_sha = loser.sidecar.as_ref().map(|s| s.sha256.as_str()).unwrap_or("?"),
-                "byte conflict: first-uploaded kept, loser quarantined; operator review required"
-            );
-            supersede_record(state, src, dst, pkg, filename, record, source).await?;
-            state
-                .metrics
-                .replication_conflict_quarantines
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Verdict::Freeze => {
             error!(
@@ -1149,11 +1129,9 @@ async fn artifact_leg(
         return Ok(ArtifactLeg::Landed { changed });
     }
     // A raced body the destination's own sidecar describes means that bucket
-    // holds live private truth for this filename with different bytes. Ordering
-    // it is the merge's call, not this leg's — `upload-epoch-ms` resolves it
-    // first-uploaded-wins and only a skew-tied or epoch-less pair degrades to a
-    // freeze — and a leg that has published nothing yet can still leave it
-    // alone. Refuse exactly as the sidecar gate does, so the caller's `_repl/`
+    // holds live private truth for this filename with different bytes. Freezing
+    // it is the merge's call, and a leg that has published nothing yet can still
+    // leave it alone. Refuse exactly as the sidecar gate does, so the caller's `_repl/`
     // note brings the next `decide` to it. Once the sidecar *is* published this
     // leg owns the record and must freeze on the spot instead, so nothing it
     // wrote ever describes the competing body (§6.3).
@@ -1203,7 +1181,7 @@ async fn server_side_copy_artifact(
 }
 
 /// Replace one destination record with verified private truth. This is shared
-/// by mirror supersede and the timestamp-ordered private/private conflict path.
+/// by mirror supersede.
 /// The losing body is preserved before its conditional replacement; sidecar
 /// and companions then converge, and an absent artifact is published last.
 async fn supersede_record(
@@ -3774,7 +3752,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_conflict_quarantines_loser_and_is_stable_on_second_pass() {
+    async fn private_conflict_freezes_both_without_replacing_canonical_bytes() {
         let a = Arc::new(InMemStorage::default());
         let b = Arc::new(InMemStorage::default());
         let filename = "pkg-1.whl";
@@ -3784,23 +3762,25 @@ mod tests {
 
         let ra = read_record(a.as_ref(), "pkg", filename).await.unwrap();
         let rb = read_record(b.as_ref(), "pkg", filename).await.unwrap();
-        assert_eq!(decide(&ra, &rb), Verdict::QuarantineLoser(Side::A));
+        assert_eq!(decide(&ra, &rb), Verdict::Freeze);
         diff_pair(&state, a.as_ref(), b.as_ref()).await.unwrap();
 
-        assert_eq!(
-            b.get_bytes(&artifact_key("pkg", filename)).await.unwrap(),
-            b"first"
-        );
-        let loser_sha = sha256_hex(b"second");
-        let loser_key = format!("{QUARANTINE_PREFIX}pkg/{filename}@{}", &loser_sha[..12]);
-        assert_eq!(b.get_bytes(&loser_key).await.unwrap(), b"second");
-        assert_eq!(
-            state
-                .metrics
-                .replication_conflict_quarantines
-                .load(Ordering::Relaxed),
-            1
-        );
+        assert!(!a.head_exists(&artifact_key("pkg", filename)).await.unwrap());
+        assert!(!b.head_exists(&artifact_key("pkg", filename)).await.unwrap());
+        let first_sha = sha256_hex(b"first");
+        let second_sha = sha256_hex(b"second");
+        let first_key = format!("{QUARANTINE_PREFIX}pkg/{filename}@{}", &first_sha[..12]);
+        let second_key = format!("{QUARANTINE_PREFIX}pkg/{filename}@{}", &second_sha[..12]);
+        assert_eq!(a.get_bytes(&first_key).await.unwrap(), b"first");
+        assert_eq!(b.get_bytes(&second_key).await.unwrap(), b"second");
+        assert!(a
+            .head_exists(&frozen_key(&artifact_key("pkg", filename)))
+            .await
+            .unwrap());
+        assert!(b
+            .head_exists(&frozen_key(&artifact_key("pkg", filename)))
+            .await
+            .unwrap());
 
         let settled_a = read_record(a.as_ref(), "pkg", filename).await.unwrap();
         let settled_b = read_record(b.as_ref(), "pkg", filename).await.unwrap();
@@ -4218,10 +4198,9 @@ mod tests {
     async fn an_ungated_leg_hands_a_live_competing_record_back_to_the_merge() {
         // Same destination state, reached by a leg that has published nothing
         // of its own — the private stream path, which takes the artifact key
-        // first. Ordering two live private bodies is `decide`'s job: it has both
-        // `upload-epoch-ms` values and resolves first-uploaded-wins, degrading
-        // to a freeze only inside the skew. So refuse, exactly as the sidecar
-        // gate does, and let the caller's repair note bring the merge to it.
+        // first. Freezing two live private bodies is `decide`'s job. Refuse,
+        // exactly as the sidecar gate does, and let the caller's repair note
+        // bring the merge to it.
         let filename = "pkg-1.whl";
         let key = artifact_key("pkg", filename);
         let source_bytes = b"source wheel";

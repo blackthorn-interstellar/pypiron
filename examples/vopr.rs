@@ -1,3 +1,5 @@
+#![allow(clippy::exit)]
+
 //! The VOPR: deterministic simulation testing for the pypiron event protocol
 //! (dev/MOONSHOT.md rung 1, FoundationDB/TigerBeetle lineage).
 //!
@@ -1612,8 +1614,7 @@ fn report_reach(explored: u64, rechecked: u64, brk: Break) -> Vec<&'static str> 
 //     sample, so it under-counts arms the executors resolve between snapshots.
 //   * evidence — objects at quiescence only a merge executor can create:
 //     `.frozen` markers, `_quarantine/` bodies, `.mirror-quarantined` markers.
-//     Durable and exact, but coarser: `Freeze`, `QuarantineLoser` and
-//     `Supersede` all quarantine.
+//     Durable and exact, but coarser: `Freeze` and `Supersede` both quarantine.
 //
 // Printed, never gated: conflicts are far rarer than the 25%-of-seeds reach
 // floor, so one `R::` slot per verdict would red a healthy run. `R::MergeDivergence`
@@ -1624,13 +1625,12 @@ fn report_reach(explored: u64, rechecked: u64, brk: Break) -> Vec<&'static str> 
 // atomics. No `FaultView`, no rng, no await.
 // ---------------------------------------------------------------------------
 
-const VERDICT_SLOTS: usize = 11;
+const VERDICT_SLOTS: usize = 10;
 const VERDICT_LABELS: [&str; VERDICT_SLOTS] = [
     "Noop",
     "Copy",
     "AdoptSidecar",
     "Supersede",
-    "QuarantineLoser",
     "Freeze",
     "PropagateFreeze",
     "FinishFreeze",
@@ -1647,7 +1647,7 @@ const EVIDENCE_LABELS: [(&str, &str); EVIDENCE_SLOTS] = [
     ),
     (
         "_quarantine/<pkg>/<file>@sha",
-        "a losing body preserved (Freeze, QuarantineLoser, Supersede)",
+        "a losing body preserved (Freeze, Supersede)",
     ),
     (
         "<file>.mirror-quarantined",
@@ -1706,13 +1706,12 @@ fn verdict_slot(verdict: &Verdict) -> usize {
         Verdict::Copy(_) => 1,
         Verdict::AdoptSidecar(_) => 2,
         Verdict::Supersede(_) => 3,
-        Verdict::QuarantineLoser(_) => 4,
-        Verdict::Freeze => 5,
-        Verdict::PropagateFreeze(_) => 6,
-        Verdict::FinishFreeze => 7,
-        Verdict::Tombstone => 8,
-        Verdict::Defer => 9,
-        Verdict::SettleMirrorQuarantine => 10,
+        Verdict::Freeze => 4,
+        Verdict::PropagateFreeze(_) => 5,
+        Verdict::FinishFreeze => 6,
+        Verdict::Tombstone => 7,
+        Verdict::Defer => 8,
+        Verdict::SettleMirrorQuarantine => 9,
     }
 }
 
@@ -3016,7 +3015,7 @@ fn acked_bodies(acks: &[Ack]) -> std::collections::BTreeSet<&[u8]> {
 
 /// Every `_quarantine/<pkg>/<file>@<sha12>` body the fleet preserved for one
 /// filename. This is the *evidence* an authorized merge left behind when it
-/// stopped serving a byte-set: `QuarantineLoser`, `Supersede` and `Freeze` all
+/// stopped serving a byte-set: `Supersede` and `Freeze` both
 /// copy the losing body here before touching it, and the operator is alarmed.
 /// Nothing in the product ever deletes from `_quarantine/`.
 fn quarantined_bodies<'a>(
@@ -4434,14 +4433,10 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
             }
             REACH.hit(R::Durability);
             // One acked byte-set is the ordinary case and stays byte-strict.
-            // Two is a cross-bucket byte conflict: the merge is entitled to
-            // keep EITHER side (`conflict_winner` orders by the server-stamped
-            // receive time, which the harness cannot reproduce — a clock jump
-            // can land between the stamp and the ack), so the claim narrows to
-            // "the bytes standing here are bytes somebody acked". It does NOT
-            // narrow further than that: the fleet may not settle on two of them
-            // at once (checked once, below) and it may not lose either (that is
-            // CONSERVATION's clause, which a freeze no longer escapes).
+            // Two is a cross-bucket byte conflict. Reconciliation freezes it;
+            // until that merge runs, any standing bytes must still be a set
+            // some writer actually acknowledged. CONSERVATION separately
+            // requires the eventual freeze to preserve both sets.
             let bodies = acked_bodies(acks);
             match dump.get(&akey) {
                 None => violations.push(format!(

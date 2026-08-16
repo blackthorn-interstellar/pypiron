@@ -526,14 +526,12 @@ the only safe path. Two same-byte mirror records converge their yank/metadata
 through the same merge private uses; the `snapshot` bit is provenance the merge
 does not arbitrate (it rides the yank-merge winner), so a cache and a snapshot of
 the same bytes converge deterministically rather than sitting divergent.
-Different **private** bytes under one filename — possible only
-when a partition moved the serialization point — resolve **first-uploaded-wins**:
-each private sidecar carries `upload-epoch-ms` (server-stamped receive time), the
-older wins, and the loser is quarantined, never deleted. When the two epochs are
-within a 2 s skew or either is missing (legacy/mirror sidecar), the tiebreak is
-untrustworthy and the conflict degrades to **quarantine-both + alarm** behind
-`.frozen`. Either way `pypiron_replication_freezes_total` fires and a human
-resolves by publishing a new filename. Private-over-mirror demotion is a
+Different **private** bytes under one filename — possible only when a partition
+moved the serialization point — always freeze both records. Both uploads may
+already have been acknowledged and served, so choosing either one would change
+the bytes at an immutable artifact URL. Both bodies are quarantined behind
+`.frozen`, `pypiron_replication_freezes_total` fires, and a human resolves the
+conflict by publishing a new filename. Private-over-mirror demotion is a
 per-artifact operation on the ordinary copy path: drive `.origin` to private,
 move the mirror body to `_quarantine/` behind a `.mirror-quarantined` marker,
 copy the private record over. There is no staged package-promotion protocol.
@@ -919,10 +917,9 @@ Sidecar schema (`<filename>.meta.json`), all captured at write time:
 "replicate private truth only" from bucket state alone, not history; it is
 absent on legacy sidecars, where the worker backfills it from the package-level
 `.origin` claim. `upload-epoch-ms` is the server-stamped receive time (epoch
-milliseconds), the **first-uploaded-wins** tiebreak for the rare cross-partition
-byte conflict: the older epoch wins, the loser is quarantined. It is absent on
-legacy sidecars and on mirror artifacts; a conflict with either side missing it,
-or with the two within a 2 s skew, degrades to quarantine-both + alarm.
+milliseconds). It is absent on legacy sidecars and on mirror artifacts, and is
+retained as upload provenance; conflict repair never uses it to replace
+immutable artifact bytes.
 `yank-epoch` is a monotonic counter bumped on every yank/unyank flip — the
 cross-bucket merge takes the max epoch (no wall clocks, which two buckets cannot
 agree on); absent means 0. `snapshot` records a mirror record's provenance: a

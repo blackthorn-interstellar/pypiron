@@ -411,7 +411,7 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
                 }
             }
         }
-        Verdict::Supersede(side) | Verdict::QuarantineLoser(side) => {
+        Verdict::Supersede(side) => {
             let (src, dst) = match side {
                 Side::A => (&*a, &mut *b),
                 Side::B => (&*b, &mut *a),
@@ -974,8 +974,8 @@ fn private_writer(bucket: u8, file: u8, byte: u8, epoch: u16) -> Writer {
 
 /// Partition-shaped double publish: two private uploads of the same filename
 /// with different bytes land on different buckets (the serialization point
-/// moved). Receive stamps are >2s apart, so first-uploaded-wins orders them:
-/// the loser is quarantined, never deleted, and the fleet converges.
+/// moved). Reconciliation must freeze and preserve both byte sets rather than
+/// replacing either already-acknowledged immutable artifact.
 ///
 /// A constructor rather than a literal because the visualizer dump at the bottom
 /// of this file draws this exact fleet: sharing it is what makes "the drawn
@@ -983,8 +983,8 @@ fn private_writer(bucket: u8, file: u8, byte: u8, epoch: u16) -> Writer {
 fn conflict_fleet() -> Fleet {
     Fleet {
         writers: vec![private_writer(0, 0, 0, 0), private_writer(1, 0, 1, 5000)],
-        expect_freeze: false,
-        expect_quarantine_loser: true,
+        expect_freeze: true,
+        expect_quarantine_loser: false,
         expect_supersede: false,
         expect_yank_propagation: false,
         expect_delete_propagation: false,
@@ -994,13 +994,11 @@ fn conflict_fleet() -> Fleet {
 }
 
 #[test]
-fn partition_conflict_first_uploaded_wins() {
-    check("first_uploaded_wins", conflict_fleet());
+fn partition_conflict_freezes() {
+    check("partition_conflict_freezes", conflict_fleet());
 }
 
-/// Same double publish, but the receive stamps sit inside the 2 s clock-skew
-/// guard: the tiebreak is untrustworthy, so the conflict degrades to
-/// quarantine-both + freeze behind the permanent filename fence.
+/// Receive-time proximity does not change the fail-closed result.
 #[test]
 fn partition_conflict_within_skew_freezes() {
     check(
@@ -1198,7 +1196,7 @@ mod conformance {
     /// Every arm of the real `Verdict`. The conformance pass asserts it
     /// produces all of them, so an arm whose executor effects nobody compares
     /// is a failing test rather than a quiet hole.
-    const ALL_VERDICTS: [&str; 11] = [
+    const ALL_VERDICTS: [&str; 10] = [
         "AdoptSidecar",
         "Copy",
         "Defer",
@@ -1206,7 +1204,6 @@ mod conformance {
         "Freeze",
         "Noop",
         "PropagateFreeze",
-        "QuarantineLoser",
         "SettleMirrorQuarantine",
         "Supersede",
         "Tombstone",
@@ -1222,7 +1219,6 @@ mod conformance {
             Verdict::Copy(_) => "Copy",
             Verdict::AdoptSidecar(_) => "AdoptSidecar",
             Verdict::Supersede(_) => "Supersede",
-            Verdict::QuarantineLoser(_) => "QuarantineLoser",
             Verdict::Freeze => "Freeze",
             Verdict::Tombstone => "Tombstone",
             Verdict::PropagateFreeze(_) => "PropagateFreeze",

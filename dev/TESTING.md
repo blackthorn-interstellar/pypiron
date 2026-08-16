@@ -266,15 +266,10 @@ re-verification retaining the pin ungated — is closed by demoting on
 `topology_blocked` in the same retention branch, fail-closed: an ineligible
 bucket may be accruing repair notes, so it re-earns through the gate on ack.
 
-The N-bucket star is the load-bearing exclusion — the model enumerates
-*pairwise* confluence, and pairwise implies N-way only if the merge is
-associative. It is not: `conflict_winner`'s `CONFLICT_SKEW_MS` guard
-(`src/replicate/decide.rs`) is non-transitive, so three private uploads of one
-filename at receive stamps 0 / 3000 / 4000 give A ≻ B, A ≻ C, but Freeze(B, C).
-Whether that filename ends live or frozen fleet-wide depends on which pair
-merged first. Both outcomes are safe — every loser is quarantined, and the
-schedule-dependent side is the fail-closed one — but it is availability the
-model cannot see. The VOPR's three-bucket lane samples the star.
+The N-bucket star remains a load-bearing check. The model enumerates pairwise
+confluence, while the VOPR's three-bucket lane samples whole-fleet schedules and
+checks that a different-byte private conflict freezes every copy regardless of
+pair order.
 
 Counter rollups and the transparency chain have no mechanized adversary at all.
 The VOPR does not touch either — `examples/vopr.rs` contains no reference to
@@ -610,7 +605,6 @@ counts at quiescence.
 |---|---|---|---|
 | `decide` → `AdoptSidecar` | 7,128 on 2,087 seeds | 5,352 on 2,341 | 1,454 on 646 |
 | `decide` → `Supersede` | 152 on 58 | 131 on 63 | 52 on 24 |
-| `decide` → `QuarantineLoser` | 5,388 on 1,540 | 2,580 on 1,136 | 1,066 on 475 |
 | `decide` → `Freeze` | 3,425 on 1,155 | 3,696 on 1,642 | 1,032 on 467 |
 | `decide` → `PropagateFreeze` | 906 on 299 | 634 on 288 | 158 on 69 |
 | `decide` → `FinishFreeze` | 50 on 22 | 70 on 32 | 8 on 4 |

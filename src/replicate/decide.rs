@@ -10,10 +10,6 @@ use crate::sidecar::{Sidecar, Yanked};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Upload timestamps closer than this are not trustworthy enough to order a
-/// cross-partition byte conflict. Preserve both sides behind a freeze instead.
-const CONFLICT_SKEW_MS: u64 = 2_000;
-
 /// A live record's origin: the two [`OriginState`] variants a *claimed* package
 /// can hold. `Unclaimed` is unrepresentable here — a record is only ever read for
 /// a package that already holds a private or mirror claim — so the narrowing from
@@ -175,9 +171,6 @@ pub enum Verdict {
     /// The `Side` is private, the other is a *different-byte* mirror: private
     /// wins — quarantine the mirror body and copy the private record over it.
     Supersede(Side),
-    /// Different private bytes were ordered by their server-stamped receive
-    /// times. The `Side` is the older winner; preserve and replace the loser.
-    QuarantineLoser(Side),
     /// Both sides committed different bytes under one filename: freeze both.
     Freeze,
     /// At least one side is tombstoned and the sides disagree: delete the file
@@ -297,9 +290,11 @@ pub fn decide(a: &Record, b: &Record) -> Verdict {
                 same_bytes(a, b, oa, ob)
             } else {
                 match (oa, ob) {
-                    (Origin::Private, Origin::Private) => conflict_winner(a, b)
-                        .map(Verdict::QuarantineLoser)
-                        .unwrap_or(Verdict::Freeze),
+                    // Both records may already have been acknowledged and
+                    // served from their respective buckets. Artifact URLs are
+                    // immutable, so receive-time ordering cannot make
+                    // replacing either canonical body safe.
+                    (Origin::Private, Origin::Private) => Verdict::Freeze,
                     (Origin::Private, Origin::Mirror) => Verdict::Supersede(Side::A),
                     (Origin::Mirror, Origin::Private) => Verdict::Supersede(Side::B),
                     // Two mirror bodies disagree on bytes under one immutable
@@ -318,15 +313,6 @@ pub fn decide(a: &Record, b: &Record) -> Verdict {
         // exists to keep the match total.
         (Tombstoned | Frozen, _) | (_, Tombstoned | Frozen) => Verdict::Noop,
     }
-}
-
-pub(crate) fn conflict_winner(a: &Record, b: &Record) -> Option<Side> {
-    let ta = a.sidecar.as_ref()?.upload_epoch_ms?;
-    let tb = b.sidecar.as_ref()?.upload_epoch_ms?;
-    if ta.abs_diff(tb) <= CONFLICT_SKEW_MS {
-        return None;
-    }
-    Some(if ta < tb { Side::A } else { Side::B })
 }
 
 /// Both sides hold the same bytes. Origin precedence (private ≻ mirror) first,
@@ -606,14 +592,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn private_byte_conflict_uses_the_older_upload_epoch() {
+    fn private_byte_conflict_freezes_regardless_of_upload_epoch() {
         assert_eq!(
             decide(&live_at("x", 1_000), &live_at("y", 4_000)),
-            Verdict::QuarantineLoser(Side::A)
+            Verdict::Freeze
         );
         assert_eq!(
             decide(&live_at("y", 4_000), &live_at("x", 1_000)),
-            Verdict::QuarantineLoser(Side::B)
+            Verdict::Freeze
         );
     }
 

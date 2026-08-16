@@ -86,7 +86,7 @@ pub struct Sidecar {
     #[serde(rename = "upload-time")]
     pub upload_time: String,
     /// Server-stamped receive time (epoch milliseconds) used only as the
-    /// first-uploaded-wins tiebreak for the rare cross-partition byte conflict
+    /// Server-stamped receive time retained as upload provenance.
     ///. Absent on legacy sidecars
     /// and on mirror artifacts; a conflict with either side missing this field,
     /// or with the two within a small skew window, degrades to quarantine-both

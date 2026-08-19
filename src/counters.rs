@@ -53,6 +53,11 @@
 //!   its share of the current day (the declared, bounded loss window). To keep an
 //!   open day whole across a mid-day selection change, a query sums its segments
 //!   across every bucket [`ObjectStoreSelector::reachable_peers`] adds, best-effort.
+//!
+//! The role used to sit *below* the metric (`_counters/<metric>/seg|day/…`).
+//! History under that layout is abandoned outright, not migrated: the split
+//! predates any deployment outside this repo, so there was nothing anywhere to
+//! carry forward and no reader is owed the old keys.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

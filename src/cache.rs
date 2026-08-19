@@ -57,7 +57,9 @@ enum Cached {
         identity: Variant,
         /// Precompressed at fill time when it actually shrinks the body —
         /// the hot path serves gzip with zero per-request CPU. None for
-        /// bodies too small or too incompressible to bother.
+        /// bodies too small or too incompressible to bother. The cost isn't
+        /// zero everywhere: "fill time" is itself a request, so the one that
+        /// misses pays the compression inline before anyone gets the variant.
         gzip: Option<Variant>,
     },
     Missing,

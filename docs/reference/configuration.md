@@ -216,7 +216,7 @@ PYPIRON_BUCKETS=s3://iron-east@us-east-1,s3://iron-west@us-west-2
 
 Each entry needs a scheme and may carry an `@region` label:
 
-- Scheme rules are as under [Storage](#storage): `s3://`, `gs://`, `az://`, `@region` optional.
+- `s3://name` or `s3://name@region` — an S3 bucket.
 - `gs://name` or `gs://name@region` — a GCS bucket.
 - `az://container` or `az://container@region` — an Azure blob container.
 
@@ -402,7 +402,8 @@ Rules:
 - Leaving an include or exclude list out is how you say "no list". Setting one
   to empty — `include-packages = []`, `PYPIRON_INCLUDE_PACKAGE=""` — is refused
   at startup, because it would erase a list set elsewhere and serve more than
-  you meant to.
+  you meant to. The same goes for every list here, formats and tags included:
+  `PYPIRON_INCLUDE_FORMAT=""` is a startup error, not "no format filter".
 - Excludes win.
 - `include-format` accepts `wheel`, `sdist`, and `other`.
 - Tag filters match wheel tags and support `*`.

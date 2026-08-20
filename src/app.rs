@@ -1270,10 +1270,19 @@ async fn run_serve(
             // security posture of the proxy, and it is otherwise invisible.
             info!(
                 %upstream,
-                scope = %if mirror.include_packages.is_empty() {
-                    "open (any non-private package)".to_owned()
-                } else {
-                    format!("{} package(s)", mirror.include_packages.len())
+                scope = %{
+                    let mut scope = if mirror.include_packages.is_empty() {
+                        "open (any non-private package)".to_owned()
+                    } else {
+                        format!("{} package(s)", mirror.include_packages.len())
+                    };
+                    // A denylist-only proxy is still "open", so say how many
+                    // names are carved out of it — otherwise an erased or
+                    // mistyped exclude set looks exactly like a correct one.
+                    if !mirror.exclude_packages.is_empty() {
+                        scope.push_str(&format!(", {} excluded", mirror.exclude_packages.len()));
+                    }
+                    scope
                 },
                 "proxy enabled"
             );

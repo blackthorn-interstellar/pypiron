@@ -406,31 +406,38 @@ impl MirrorArgs {
             include_format: parse_formats(&pick_vec(
                 &self.include_format,
                 file.and_then(|f| f.include_format.clone()),
-            ))?,
+                "include-format",
+            )?)?,
             include_python_tag: pick_vec(
                 &self.include_python_tag,
                 file.and_then(|f| f.include_python_tag.clone()),
-            ),
+                "include-python-tag",
+            )?,
             include_abi_tag: pick_vec(
                 &self.include_abi_tag,
                 file.and_then(|f| f.include_abi_tag.clone()),
-            ),
+                "include-abi-tag",
+            )?,
             include_platform_tag: pick_vec(
                 &self.include_platform_tag,
                 file.and_then(|f| f.include_platform_tag.clone()),
-            ),
+                "include-platform-tag",
+            )?,
             exclude_python_tag: pick_vec(
                 &self.exclude_python_tag,
                 file.and_then(|f| f.exclude_python_tag.clone()),
-            ),
+                "exclude-python-tag",
+            )?,
             exclude_abi_tag: pick_vec(
                 &self.exclude_abi_tag,
                 file.and_then(|f| f.exclude_abi_tag.clone()),
-            ),
+                "exclude-abi-tag",
+            )?,
             exclude_platform_tag: pick_vec(
                 &self.exclude_platform_tag,
                 file.and_then(|f| f.exclude_platform_tag.clone()),
-            ),
+                "exclude-platform-tag",
+            )?,
             // Default cooldown: with nothing set, hold files back until they are
             // a week old (a sliding 7-day quarantine that blunts install-then-yank
             // supply-chain attacks). An explicit empty value opts out — `""` parses
@@ -883,11 +890,42 @@ impl Resolved {
 }
 
 /// CLI tags win when any were passed; otherwise the config file's.
-fn pick_vec(cli: &[String], cfg: Option<Vec<String>>) -> Vec<String> {
-    if cli.is_empty() {
-        cfg.unwrap_or_default()
-    } else {
-        cli.to_vec()
+///
+/// `axis` is the knob's kebab-case name — the `--flag`, the `PYPIRON_FLAG` env
+/// var and the `[mirror]` key all spell it the same way, so one string names
+/// every source in the error.
+///
+/// A source that was *provided but lists nothing* is refused, the same rule
+/// [`resolve_packages`] enforces on the package axes and for the same reason:
+/// `PYPIRON_INCLUDE_FORMAT=""` arrives as one empty string, which is a non-empty
+/// `Vec`, so the CLI branch wins and replaces the config file's list. What the
+/// erasure then does depends on the axis — a wiped `include-format` turns the
+/// format gate off entirely (it only applies when non-empty), a wiped exclude
+/// tag list denies nothing, a wiped include tag list matches nothing — but none
+/// of them is what the operator asked for, and all of them are silent. Only the
+/// *absence* of both sources means "no filter", which still returns the default
+/// empty list.
+fn pick_vec(cli: &[String], cfg: Option<Vec<String>>, axis: &str) -> Result<Vec<String>> {
+    let lists_nothing = |v: &[String]| v.iter().all(|s| s.trim().is_empty());
+    if !cli.is_empty() {
+        if lists_nothing(cli) {
+            bail!(
+                "--{axis}/PYPIRON_{env} was given but lists no values; an empty {axis} list \
+                 does not turn the filter off — it erases it (and any pypiron.toml [mirror] \
+                 {axis} set), changing what the mirror keeps. Omit the flag and its env var \
+                 entirely to leave the filter unset.",
+                env = axis.to_uppercase().replace('-', "_"),
+            );
+        }
+        return Ok(cli.to_vec());
+    }
+    match cfg {
+        Some(list) if lists_nothing(&list) => bail!(
+            "[mirror] {axis} is set but lists no values; an empty {axis} list does not turn \
+             the filter off — it erases it, changing what the mirror keeps. Omit the key \
+             entirely to leave the filter unset."
+        ),
+        other => Ok(other.unwrap_or_default()),
     }
 }
 
@@ -2929,6 +2967,37 @@ fn normalize_legacy_endpoint(dst_base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_vec_refuses_a_provided_but_empty_list() {
+        // Unset on both sides is the only "no filter": still the empty default.
+        assert!(pick_vec(&[], None, "include-format").unwrap().is_empty());
+        // Normal precedence is unchanged.
+        let cli = vec!["wheel".to_string()];
+        let cfg = Some(vec!["sdist".to_string()]);
+        assert_eq!(pick_vec(&cli, cfg.clone(), "include-format").unwrap(), cli);
+        assert_eq!(
+            pick_vec(&[], cfg.clone(), "include-format").unwrap(),
+            vec!["sdist".to_string()]
+        );
+        // `PYPIRON_INCLUDE_FORMAT=""` — one blank entry, which used to outrank
+        // and erase the file's list.
+        let err = pick_vec(&["".to_string()], cfg, "include-format").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--include-format/PYPIRON_INCLUDE_FORMAT"),
+            "{msg}"
+        );
+        assert!(msg.contains("Omit the flag"), "{msg}");
+        // `include-format = []` and `= [" "]` in pypiron.toml, same rule.
+        for cfg in [Some(vec![]), Some(vec![" ".to_string()])] {
+            let msg = pick_vec(&[], cfg, "exclude-platform-tag")
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("[mirror] exclude-platform-tag"), "{msg}");
+            assert!(msg.contains("Omit the key"), "{msg}");
+        }
+    }
 
     #[test]
     fn source_auth_resolves_and_fails_closed() {

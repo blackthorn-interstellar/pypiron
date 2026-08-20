@@ -390,7 +390,10 @@ def test_proxy_persists_upstream_quarantine_status(proxy_pair, tmp_path):
 
 
 def _serve(pypiron_bin, *args, env=None):
-    proc_env = dict(os.environ)
+    # Drop every ambient PYPIRON_* key: these cases turn on the *absence* of a
+    # setting, so a developer's or CI runner's exported knob would decide the
+    # result instead of the case.
+    proc_env = {k: v for k, v in os.environ.items() if not k.startswith("PYPIRON_")}
     if env:
         proc_env.update(env)
     return subprocess.run(
@@ -444,6 +447,30 @@ def test_empty_env_exclude_package_does_not_erase_config_denylist(pypiron_bin, t
     out = cp.stdout + cp.stderr
     assert cp.returncode != 0, f"empty exclude scope must refuse startup:\n{out}"
     assert "exclude-package" in out, out
+    assert "Omit the flag" in out, out
+
+
+def test_empty_env_include_format_does_not_erase_config_filter(pypiron_bin, tmp_path):
+    """The same erasure on a non-package axis: an empty PYPIRON_INCLUDE_FORMAT
+    outranks `[mirror].include-format`, and the format gate only applies when
+    the list is non-empty — so a wheels-only mirror silently started serving
+    sdists again."""
+    cfg = tmp_path / "pypiron.toml"
+    cfg.write_text('[mirror]\ninclude-format = ["wheel"]\n')
+    cp = _serve(
+        pypiron_bin,
+        "--data-dir",
+        str(tmp_path / "data"),
+        "--config",
+        str(cfg),
+        "--proxy-upstream",
+        "https://pypi.org",
+        env={"PYPIRON_INCLUDE_FORMAT": ""},
+    )
+    out = cp.stdout + cp.stderr
+    assert cp.returncode != 0, f"empty include-format must refuse startup:\n{out}"
+    assert "include-format" in out, out
+    assert "Omit the flag" in out, out
 
 
 def test_empty_config_package_list_refuses_startup(pypiron_bin, tmp_path):

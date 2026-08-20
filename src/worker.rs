@@ -479,7 +479,11 @@ async fn region_bucket_caught_up(state: &AppState, region: usize) -> bool {
 /// Whether `pkg` has an unpaired intent still inside the storage-clock grace
 /// window. A missing/malformed storage timestamp is conservatively live. The
 /// key prefix keeps this O(markers-for-one-package), not O(all markers).
-async fn has_live_intent(state: &AppState, storage: &dyn Storage, pkg: &str) -> Result<bool> {
+pub(crate) async fn has_live_intent(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+) -> Result<bool> {
     Ok(stale_unpaired_intents(state, storage, pkg).await?.is_none())
 }
 
@@ -1877,6 +1881,7 @@ async fn audit_shard(
                 // Same rare-package gating as the interrupted-delete sweep.
                 if !orphan_companions.is_empty() {
                     match crate::tombstone::drop_orphan_companions(
+                        state,
                         storage,
                         &pkg,
                         &orphan_companions,

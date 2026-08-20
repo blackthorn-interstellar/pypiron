@@ -11,13 +11,18 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::app::{AppState, PACKAGES_PREFIX};
 use crate::sidecar::{
     frozen_key, metadata_key, mirror_quarantined_key, provenance_key, sidecar_key, tombstone_key,
 };
 use crate::storage::Storage;
+
+/// Floor for [`drop_orphan_companions`]' age gate, independent of
+/// `--intent-grace-secs`: long enough that no sidecar-first writer can still be
+/// mid-flight, short enough that real debris is swept the same day.
+const AGE_FLOOR: time::Duration = time::Duration::seconds(300);
 
 /// Minimal tombstone body. The filename is informational — the key already
 /// carries it — and there is deliberately no wall clock: a tombstone's meaning
@@ -109,12 +114,16 @@ pub async fn complete_interrupted_deletes(
 /// - one fresh `packages/<pkg>/` listing re-checks all four anchors (body,
 ///   `.tombstone`, `.frozen`, `.mirror-quarantined`) — a stale audit listing
 ///   never authorizes a delete on its own;
-/// - no companion younger than `state.intent_grace` is ever dropped. Debris is
-///   old by definition; no writer sits a whole grace window between its sidecar
-///   and its body, so the age gate is what actually closes the window (the
-///   sidecar-first paths keep it open for an entire artifact download or copy,
-///   which no re-check can shrink). An absent or unparseable storage timestamp
-///   counts as young;
+/// - no companion younger than [`AGE_FLOOR`] (or `state.intent_grace`, whichever
+///   is longer) is ever dropped. Debris is old by definition; no writer sits a
+///   whole grace window between its sidecar and its body, so the age gate is
+///   what actually closes the window — no re-check can shrink it. The window it
+///   has to cover differs by writer: `replicate::copy_live` publishes its
+///   sidecar as the divergence gate and then copies or streams the *entire*
+///   artifact, so its window is a whole transfer; the proxy fill has already
+///   spooled and verified the bytes before it writes anything, so its window is
+///   one origin re-read plus the spooled-bytes PUT. The long one sets the bar.
+///   An absent or unparseable storage timestamp counts as young;
 /// - the package must have no live (unpaired, in-grace) intent marker, since
 ///   all three writer paths declare intent before touching truth.
 ///
@@ -139,8 +148,17 @@ pub async fn drop_orphan_companions(
         })
         .collect();
     let now = crate::clock::now_utc();
+    // The sweep's two gates both key off `state.intent_grace`, so lowering it
+    // weakens them together — and `--intent-grace-secs` validates all the way
+    // down to 3s, which would let this delete a replication copy's sidecar while
+    // the copy is still streaming. The age gate therefore never goes below
+    // AGE_FLOOR whatever the operator sets. `has_live_intent` keeps the
+    // configured grace: that one must stay tunable to heal crashed writers.
+    let age_gate = state.intent_grace.max(AGE_FLOOR);
 
     let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
+    let mut kept_young = 0usize;
+    let mut kept_untimed = false;
     for filename in filenames {
         let akey = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
         // Any anchor re-observed under a fresh read means the companions still
@@ -165,21 +183,36 @@ pub async fn drop_orphan_companions(
             continue;
         }
         let aged = companions.iter().all(|key| {
-            listed
-                .get(key)
-                .and_then(|modified| *modified)
-                .is_some_and(|written| now - written >= state.intent_grace)
+            let modified = listed.get(key).and_then(|modified| *modified);
+            if modified.is_none() {
+                kept_untimed = true;
+            }
+            modified.is_some_and(|written| now - written >= age_gate)
         });
         if !aged {
+            kept_young += 1;
             continue;
         }
         candidates.push((akey, companions));
     }
+    if kept_young > 0 {
+        // Otherwise a backend that stopped reporting `last_modified` would keep
+        // every candidate young forever and pile up debris behind a clean audit
+        // log — the failure is invisible from the outside.
+        debug!(
+            package = %pkg,
+            kept_young,
+            untimed = kept_untimed,
+            "audit: orphan companions held back by the age gate"
+        );
+    }
     if candidates.is_empty() {
         return Ok(0);
     }
-    // One listing of the package's markers, paid only when a package really has
-    // aged anchor-less companions.
+    // Paid only when a package really has aged anchor-less companions — and it
+    // is not cheap: `has_live_intent` lists the whole `_dirty/` prefix and
+    // filters in memory, so it costs O(all packages' markers), not O(this
+    // package's).
     if crate::worker::has_live_intent(state, storage, pkg).await? {
         return Ok(0);
     }

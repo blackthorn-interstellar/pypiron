@@ -86,6 +86,23 @@ def test_aged_stranded_companions_are_cleaned(disk_server, pypiron_bin, tmp_path
     assert left == [], f"aged anchor-less companions must be dropped, found {left}"
 
 
+def test_one_fresh_companion_saves_the_whole_base(disk_server, pypiron_bin, tmp_path):
+    """The age gate is all-or-nothing per artifact: a writer that has published
+    some of its companions and is still writing the rest must not be half-swept,
+    so one fresh companion protects every companion of that base."""
+    _, companions = _strand_companions(disk_server, tmp_path, "orphanmixed")
+    assert len(companions) > 1, f"need more than one companion to mix ages: {companions}"
+    _age(companions[1:], INTENT_GRACE_SECS * 2)
+
+    _rebuild_index(pypiron_bin, disk_server["data_dir"])
+
+    left = {p.name for p in companions if p.exists()}
+    assert left == {p.name for p in companions}, (
+        f"one in-grace companion must hold back its aged siblings, missing "
+        f"{set(p.name for p in companions) - left}"
+    )
+
+
 def test_aged_companions_kept_while_an_intent_is_live(disk_server, pypiron_bin, tmp_path):
     """A slow writer holds an unpaired intent marker for its package. Aged
     companions plus a live intent means "still writing", not "debris"."""

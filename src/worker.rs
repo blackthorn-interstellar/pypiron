@@ -477,8 +477,10 @@ async fn region_bucket_caught_up(state: &AppState, region: usize) -> bool {
 }
 
 /// Whether `pkg` has an unpaired intent still inside the storage-clock grace
-/// window. A missing/malformed storage timestamp is conservatively live. The
-/// key prefix keeps this O(markers-for-one-package), not O(all markers).
+/// window. A missing/malformed storage timestamp is conservatively live. Not
+/// cheap: the listing underneath reads the whole `_dirty/` prefix and filters
+/// to `pkg` in memory, so this is O(all markers) — call it once a package, past
+/// the gates that can answer without it.
 pub(crate) async fn has_live_intent(
     state: &AppState,
     storage: &dyn Storage,

@@ -1265,6 +1265,18 @@ async fn run_serve(
     let proxy = match cli.proxy_upstream.as_deref() {
         Some(upstream) => {
             let mirror = cli.mirror.resolve(Some(&file.mirror))?;
+            // State the served scope out loud at startup: the difference between
+            // "open to all of upstream" and "these N packages" is the whole
+            // security posture of the proxy, and it is otherwise invisible.
+            info!(
+                %upstream,
+                scope = %if mirror.include_packages.is_empty() {
+                    "open (any non-private package)".to_owned()
+                } else {
+                    format!("{} package(s)", mirror.include_packages.len())
+                },
+                "proxy enabled"
+            );
             Some(Arc::new(proxy::Proxy::new(
                 upstream,
                 mirror,

@@ -508,9 +508,11 @@ struct PackageSourceNames {
 
 /// Resolve one package-spec axis: CLI over file, parsed into specs. A CLI
 /// source replaces the matching file source entirely; with no CLI source the
-/// file's list file and inline array combine. Empty is allowed here — `serve`
-/// reads an empty include set as "any name" and `sync` enforces non-empty
-/// includes itself. The list files are read with `std::fs` so this stays
+/// file's list file and inline array combine. An empty result is only allowed
+/// when *no* source was provided — `serve` reads an unset include set as "any
+/// name" (the documented open proxy) and `sync` enforces non-empty includes
+/// itself. A source that was provided but resolves to nothing is refused; see
+/// the bail below. The list files are read with `std::fs` so this stays
 /// synchronous and serves both the async `sync` startup and the `serve` startup
 /// through one path.
 fn resolve_packages(
@@ -521,7 +523,8 @@ fn resolve_packages(
     names: PackageSourceNames,
 ) -> Result<Vec<PackageSpec>> {
     let mut lines: Vec<String> = Vec::new();
-    if cli_from_file.is_some() || !cli_inline.is_empty() {
+    let from_cli = cli_from_file.is_some() || !cli_inline.is_empty();
+    if from_cli {
         if let Some(path) = cli_from_file {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
@@ -566,6 +569,37 @@ fn resolve_packages(
             parse_spec_line(line)
                 .with_context(|| format!("package entry {} ('{line}')", lineno + 1))?,
         );
+    }
+    // A source that was provided but carries no spec used to resolve to an empty
+    // set, and an empty include set means "no scope" — which the proxy serves as
+    // "any name". So `PYPIRON_INCLUDE_PACKAGE=""` (or `include-packages = []`)
+    // silently erased a curated scope and reopened the proxy to all of upstream;
+    // the exclude twin silently dropped a denylist. Only the *absence* of every
+    // source may mean unscoped.
+    if specs.is_empty() {
+        if from_cli {
+            bail!(
+                "{}/{} was given but lists no packages; an empty {} list does not turn the \
+                 scope off — it erases it (and any pypiron.toml {} {} set), serving more than \
+                 intended. Omit the flag and its env var entirely to leave the scope unset.",
+                names.cli_inline,
+                names.cli_from_file,
+                names.label,
+                names.table,
+                names.label,
+            );
+        }
+        if file_inline.is_some() || file_from_file.is_some() {
+            bail!(
+                "{} {}/{} is set but lists no packages; an empty {} list does not turn the \
+                 scope off — it erases it, serving more than intended. Omit the key entirely \
+                 to leave the scope unset.",
+                names.table,
+                names.file_inline,
+                names.file_from_file,
+                names.label,
+            );
+        }
     }
     Ok(specs)
 }
@@ -3294,6 +3328,49 @@ mod tests {
             &f
         ));
         assert!(matches_mirror(&with_yank(Yanked::Flag(false)), &f));
+    }
+
+    #[test]
+    fn an_empty_package_list_is_refused_not_read_as_unscoped() {
+        let scoped = UpstreamConfig {
+            include_packages: Some(vec!["requests".into()]),
+            ..Default::default()
+        };
+        // Nothing provided: unscoped, the documented open-proxy default.
+        assert!(MirrorArgs::default()
+            .resolve(None)
+            .unwrap()
+            .include_packages
+            .is_empty());
+        // `PYPIRON_INCLUDE_PACKAGE=""` arrives as one empty entry, outranks the
+        // config file, and used to leave the proxy scopeless.
+        let erased = MirrorArgs {
+            include_package: vec![String::new()],
+            ..Default::default()
+        };
+        let err = erased.resolve(Some(&scoped)).unwrap_err().to_string();
+        assert!(err.contains("--include-package"), "{err}");
+        // The exclude twin: an empty value would drop a configured denylist.
+        let denied = UpstreamConfig {
+            exclude_packages: Some(vec!["blocked".into()]),
+            ..Default::default()
+        };
+        let erased = MirrorArgs {
+            exclude_package: vec!["  ".into()],
+            ..Default::default()
+        };
+        let err = erased.resolve(Some(&denied)).unwrap_err().to_string();
+        assert!(err.contains("--exclude-package"), "{err}");
+        // An explicitly empty TOML array is the same mistake, spelled in the file.
+        let empty = UpstreamConfig {
+            include_packages: Some(vec![]),
+            ..Default::default()
+        };
+        let err = MirrorArgs::default()
+            .resolve(Some(&empty))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("include-packages"), "{err}");
     }
 
     #[test]

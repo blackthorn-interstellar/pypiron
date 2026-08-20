@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import time
 
 import pytest
@@ -14,6 +16,7 @@ import pytest
 from .conftest import _start_proxy_pair
 from .helpers import (
     ACCEPT_PEP691,
+    find_free_port,
     get_index_json,
     http_get,
     http_request_auth,
@@ -374,3 +377,99 @@ def test_proxy_persists_upstream_quarantine_status(proxy_pair, tmp_path):
     doc = json.loads(status_path.read_text())
     assert doc["status"] == "quarantined"
     assert doc.get("pypiron-origin") == "mirror", "persisted proxy status must be mirror-origin"
+
+
+# ---------------------- empty package scope is a startup error ----------------
+#
+# An explicitly-provided-but-empty package list used to resolve to zero specs,
+# and zero specs reads as "no scope configured" — i.e. an open proxy. So
+# `PYPIRON_INCLUDE_PACKAGE=""` in the environment silently erased a curated
+# `[mirror].include-packages` and reopened the proxy to all of PyPI. The empty
+# value is now refused at startup, before the listener binds; the short timeout
+# below doubles as the "it never started serving" assertion.
+
+
+def _serve(pypiron_bin, *args, env=None):
+    proc_env = dict(os.environ)
+    if env:
+        proc_env.update(env)
+    return subprocess.run(
+        [str(pypiron_bin), "serve", "--bind-addr", f"127.0.0.1:{find_free_port()}", *args],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=proc_env,
+    )
+
+
+def _scoped_config(tmp_path, key: str = "include-packages") -> str:
+    cfg = tmp_path / "pypiron.toml"
+    cfg.write_text(f'[mirror]\n{key} = ["requests"]\n')
+    return str(cfg)
+
+
+def test_empty_env_include_package_does_not_erase_config_scope(pypiron_bin, tmp_path):
+    """An empty PYPIRON_INCLUDE_PACKAGE outranks the config file's package
+    scope (CLI/env replaces the file's list), so before the fix it left the
+    proxy scopeless and open to every name on PyPI."""
+    cp = _serve(
+        pypiron_bin,
+        "--data-dir",
+        str(tmp_path / "data"),
+        "--config",
+        _scoped_config(tmp_path),
+        "--proxy-upstream",
+        "https://pypi.org",
+        env={"PYPIRON_INCLUDE_PACKAGE": ""},
+    )
+    out = cp.stdout + cp.stderr
+    assert cp.returncode != 0, f"empty include scope must refuse startup:\n{out}"
+    assert "include-package" in out, out
+    assert "Omit the flag" in out, out
+
+
+def test_empty_env_exclude_package_does_not_erase_config_denylist(pypiron_bin, tmp_path):
+    """Same erasure on the deny axis: an empty PYPIRON_EXCLUDE_PACKAGE would
+    wipe a configured denylist and widen what the proxy serves."""
+    cp = _serve(
+        pypiron_bin,
+        "--data-dir",
+        str(tmp_path / "data"),
+        "--config",
+        _scoped_config(tmp_path, "exclude-packages"),
+        "--proxy-upstream",
+        "https://pypi.org",
+        env={"PYPIRON_EXCLUDE_PACKAGE": ""},
+    )
+    out = cp.stdout + cp.stderr
+    assert cp.returncode != 0, f"empty exclude scope must refuse startup:\n{out}"
+    assert "exclude-package" in out, out
+
+
+def test_empty_config_package_list_refuses_startup(pypiron_bin, tmp_path):
+    """`include-packages = []` in pypiron.toml reads like "scope it to nothing"
+    but used to mean "serve everything"; it is a startup error instead."""
+    cfg = tmp_path / "pypiron.toml"
+    cfg.write_text("[mirror]\ninclude-packages = []\n")
+    cp = _serve(
+        pypiron_bin,
+        "--data-dir",
+        str(tmp_path / "data"),
+        "--config",
+        str(cfg),
+        "--proxy-upstream",
+        "https://pypi.org",
+    )
+    out = cp.stdout + cp.stderr
+    assert cp.returncode != 0, f"empty include-packages must refuse startup:\n{out}"
+    assert "include-packages" in out, out
+
+
+def test_no_package_scope_still_starts_open(proxy_pair, tmp_path):
+    """The documented default is unchanged: with no package scope configured at
+    all, the proxy serves any non-private name."""
+    upstream, proxy = proxy_pair["upstream"], proxy_pair["proxy"]
+    wheel = make_wheel("openscope", "1.0", tmp_path)
+    _upload(upstream, wheel, "openscope")
+    data = get_index_json(proxy["simple"], "openscope")
+    assert [f["filename"] for f in data["files"]] == [wheel.name]

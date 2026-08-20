@@ -216,7 +216,7 @@ PYPIRON_BUCKETS=s3://iron-east@us-east-1,s3://iron-west@us-west-2
 
 Each entry needs a scheme and may carry an `@region` label:
 
-- `s3://name` or `s3://name@region` — an S3 bucket.
+- Scheme rules are as under [Storage](#storage): `s3://`, `gs://`, `az://`, `@region` optional.
 - `gs://name` or `gs://name@region` — a GCS bucket.
 - `az://container` or `az://container@region` — an Azure blob container.
 
@@ -287,7 +287,7 @@ recovery behavior, and operator rules.
 | `--proxy-allow-cidr CIDR` | `PYPIRON_PROXY_ALLOW_CIDR` | none | Like `--proxy-allow-host`, but permits any target IP inside `CIDR` (e.g. `10.0.0.0/8`). Repeatable; comma-separated in the env var. |
 | `--upstream-ca-cert PEM` | `PYPIRON_UPSTREAM_CA_CERT` | none | PEM bundle of extra CA certificates to trust for **upstream** TLS — the private root a corporate forwarding TLS proxy (a MITM appliance) presents. Augments the built-in roots (a direct fetch of public PyPI keeps working); it does not replace them. Applied to the proxy upstream fetch and the advisory feed/probe. Loaded fail-closed at startup: a missing or unparseable bundle refuses to start. See [Behind a forward proxy](#behind-a-forward-proxy-or-tls-interception). |
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | OSV PyPI export | Feed for malware blocking and the org audit: a URL or local path to the [OSV](https://osv.dev) PyPI advisory export. Defaults to `https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip` (named in the startup log); a URL fetch honors `HTTP(S)_PROXY`. `""` disables both features. |
-| `--malware-block true\|false` | `PYPIRON_MALWARE_BLOCK` | `true` | Refuse to serve or cache files an OSV `MAL-*` advisory flags as malicious. Needs a snapshot source — the feed, or one delivered earlier by `sync`. Explicit `true` that can't obtain a snapshot refuses startup; the default warns "armed but unfed" and self-arms when a snapshot arrives. Scoped to OSV advisory blocking only: PEP 792 quarantine refusal (a project PyPI froze) is enforced independently and stays on when this is `false`. |
+| `--malware-block true\|false` | `PYPIRON_MALWARE_BLOCK` | `true` | Refuse to serve or cache files an OSV `MAL-*` advisory flags as malicious. The binary ships a compiled block-set floor that arms blocking from first boot; a live snapshot — the feed, or one delivered by `sync` — supersedes it. Explicit `true` that can't obtain a live snapshot refuses startup (a stricter contract than the defaulted `true`); the default serves from the floor, warns that no live snapshot is loaded, and self-arms when one arrives. Scoped to OSV advisory blocking only: PEP 792 quarantine refusal (a project PyPI froze) is enforced independently and stays on when this is `false`. |
 | `--malware-probe-secs N` | `PYPIRON_MALWARE_PROBE_SECS` | `120` | How often each node checks OSV for a just-published malware advisory and blocks it within minutes, ahead of the daily feed refresh. Near-zero bandwidth (a conditional check that transfers nothing most polls) and no stored state. `0` disables; inert unless blocking is armed and the feed is the OSV `all.zip` URL. |
 | `--metrics-project-labels` | `PYPIRON_METRICS_PROJECT_LABELS` | `false` | Attach per-client `project` labels to `/metrics`. Off by default: `/metrics` is unauthenticated and the label derives from the username tag, so exposing it lets any scraper list internal project names. |
 | `--spool-dir PATH` | `PYPIRON_SPOOL_DIR` | system temp | Upload/proxy spool directory. |
@@ -330,7 +330,7 @@ these are your billable S3/GCS/Azure requests — a climbing per-request ratio
 against `pypiron_http_requests_total` is read amplification worth
 investigating before the bill notices it.
 
-With the advisory feed enabled, `/metrics` carries four series:
+With the advisory feed enabled, `/metrics` carries these series:
 `pypiron_advisory_snapshot_age_seconds` (**content** age — seconds since the
 newest advisory in the loaded feed was modified; alert when it climbs past your
 refresh window. Because it tracks the feed's own timestamps, a ferry that keeps
@@ -399,6 +399,10 @@ Rules:
   `requests`, `six==1.16.0`, `requests>=2.20,<3`.
 - `sync` requires an include list. Proxy without an include list is open for
   any non-private package.
+- Leaving an include or exclude list out is how you say "no list". Setting one
+  to empty — `include-packages = []`, `PYPIRON_INCLUDE_PACKAGE=""` — is refused
+  at startup, because it would erase a list set elsewhere and serve more than
+  you meant to.
 - Excludes win.
 - `include-format` accepts `wheel`, `sdist`, and `other`.
 - Tag filters match wheel tags and support `*`.

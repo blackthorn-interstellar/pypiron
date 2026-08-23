@@ -94,9 +94,13 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: docker-${{ matrix.id }}
-      - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+      # 0.23.0 or newer: Rust 1.98 passes `-Wl,--fix-cortex-a53-843419` on every
+      # aarch64-linux target (rust-lang/rust#155453) and zig's cc driver rejects
+      # it, so the arm64 link died until cargo-zigbuild learned to filter the
+      # flag (rust-cross/cargo-zigbuild#452, first released in 0.23.0).
+      - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
         with:
-          tool: cargo-zigbuild@0.22.3
+          tool: cargo-zigbuild@0.23.0
 
       # zig is the C cross-compiler cargo-zigbuild drives (ring builds a little C).
       # Install the version-matched ziglang into the same python3 cargo-zigbuild

@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+      - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
         with:
           tool: cargo-audit
       # `make audit` carries the acknowledged-advisory ignore list and its
@@ -555,7 +555,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+      - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
         with:
           tool: cargo-fuzz
       # Keep the fuzz targets compiling. Coverage-guided runs stay manual
@@ -744,9 +744,12 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: armv6
-      - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+      # Kept in step with docker.yml: 0.23.0 filters the
+      # `-Wl,--fix-cortex-a53-843419` that Rust 1.98 emits for aarch64-linux and
+      # zig rejects (rust-cross/cargo-zigbuild#452).
+      - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
         with:
-          tool: cargo-zigbuild@0.22.3
+          tool: cargo-zigbuild@0.23.0
       # Pin+hash ziglang so a hijacked or yanked PyPI release can't poison the
       # ARMv6 release binary. 0.16.0 is what the unpinned install already
       # resolved to; the hash is the x86_64-linux host wheel — the only platform

@@ -2039,10 +2039,12 @@ async fn sync_one_package(
     // un-reconciled state, and forgoes the skip — we fall back to uploading
     // everything, which the server 409s for the duplicates.
     // That same response reports which claim holds the name at the destination,
-    // as `Some(claim)`. `None` is "the destination didn't say": no index at all
-    // (an older dest, or a fetch that failed), or a response whose origin header
-    // is missing or unreadable — a peer too old to send it, or a proxy that
-    // stripped it. That case is *not* the same as `Some(unclaimed)`, and the
+    // as `Some(state)` — parsed strictly, so only one of the three known states
+    // gets here. `None` is "the destination didn't say": no index at all (an
+    // older dest, or a fetch that failed), or a response with no origin header
+    // we could read as a claim — a peer too old to send it, a proxy that
+    // stripped or blanked it, or a newer pypiron naming a state this build
+    // doesn't know. That case is *not* the same as `Some(Unclaimed)`, and the
     // skip below is what makes the difference matter.
     let (local, dest_origin) = match fetch_local_index(client, resolved, pkg).await {
         Ok(Some((local, dest_origin))) => (Some(local), dest_origin),
@@ -2061,7 +2063,7 @@ async fn sync_one_package(
     // every selected file matches a mirror-owned filename, nothing uploads, no
     // POST ever reaches the server's private-vs-mirror rejection, and the run
     // reports success while the mirror's bytes keep serving under the name.
-    if resolved.as_private && dest_origin.as_deref() == Some(origin::MIRROR) {
+    if resolved.as_private && dest_origin == Some(origin::OriginState::Mirror) {
         bail!(
             "the destination holds '{pkg}' as a mirror package; --as-private will not \
              migrate onto it. Settle the ownership conflict on the destination first — \
@@ -2070,18 +2072,19 @@ async fn sync_one_package(
         );
     }
 
-    // The check above can only refuse a claim the destination actually reported.
-    // When it reported none, `--as-private` gives up the skip instead: every
-    // selected file is re-offered so the POST reaches the server's
-    // private-vs-mirror adjudication, which is the real backstop. Skipping on
-    // filenames here would hide a mirror-owned name behind "already present" and
-    // exit 0 without a single upload. Plain mirror mode keeps the skip — there
-    // the filename match is a pure optimization the server's 409 would repeat.
+    // The check above can only refuse a claim the destination stated in terms
+    // this build understands. Short of that, `--as-private` gives up the skip
+    // instead — a claim we can't read is as good as none — and re-offers every
+    // selected file, so the POST reaches the server's private-vs-mirror
+    // adjudication — the real backstop. Skipping on filenames here would hide a
+    // mirror-owned name behind "already present" and exit 0 without a single
+    // upload. Plain mirror mode keeps the skip — there the filename match is a
+    // pure optimization the server's 409 would repeat.
     let skip_against = if resolved.as_private && dest_origin.is_none() {
         if local.is_some() {
             warn!(
-                "{pkg}: destination reported no origin claim — re-offering every file so the \
-                 server adjudicates private-vs-mirror ownership"
+                "{pkg}: destination reported no origin claim we could read — re-offering every \
+                 file so the server adjudicates private-vs-mirror ownership"
             );
         }
         None
@@ -2238,15 +2241,16 @@ async fn sync_one_package(
 /// origin claim it reports for the package. `Ok(None)` means an older dest
 /// without the `/sync/local-index` endpoint; reconcile and status relay are then
 /// skipped rather than run against a proxied upstream view that would hide a
-/// removed file. The claim is `None` when the response carried no readable
-/// origin header — an older dest, or a proxy that stripped it. That is
-/// deliberately distinct from `Some(unclaimed)`: the caller must not mistake
-/// silence for a claim it can act on.
+/// removed file. The claim is `None` unless the response carried an origin
+/// header naming one of the three known states: absent, blanked, non-UTF-8, or
+/// a label this build doesn't know all read as "the destination didn't say".
+/// That is deliberately distinct from `Some(Unclaimed)` — the caller must not
+/// mistake silence, or a claim it can't interpret, for one it can act on.
 async fn fetch_local_index(
     client: &Client,
     resolved: &Resolved,
     pkg: &str,
-) -> Result<Option<(SimpleIndex, Option<String>)>> {
+) -> Result<Option<(SimpleIndex, Option<origin::OriginState>)>> {
     let url = format!(
         "{}/sync/local-index/{pkg}",
         resolved.dst_base.trim_end_matches('/')
@@ -2266,7 +2270,7 @@ async fn fetch_local_index(
         .headers()
         .get(crate::admin::ORIGIN_HEADER)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+        .and_then(|v| origin::OriginState::parse(v).ok());
     Ok(Some((resp.json().await?, dest_origin)))
 }
 

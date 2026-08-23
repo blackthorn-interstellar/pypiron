@@ -286,6 +286,58 @@ def test_forwarded_for_ignored_without_trusted_proxy(disk_server_access_log_json
     assert "203.0.113.9" not in str(fields["client"])
 
 
+@pytest.fixture()
+def disk_server_clf_trusted_proxy(tmp_path_factory, pypiron_bin):
+    """Access log in Combined Log Format behind a reverse proxy: the forwarding
+    headers are honored, so their contents reach the log."""
+    from .conftest import _start_disk_server
+
+    yield from _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=["--access-log", "--access-log-format", "clf", "--trusted-proxy"],
+    )
+
+
+def test_forwarded_for_junk_cannot_forge_clf_fields(disk_server_clf_trusted_proxy):
+    """--trusted-proxy honors X-Forwarded-For, but only as an address: the host
+    field is unquoted and space-delimited, so a value carrying spaces, quotes
+    and brackets would forge whole CLF fields for fail2ban/GoAccess. Junk is
+    discarded and the real peer is logged."""
+    server = disk_server_clf_trusted_proxy
+    # host - user [time] "METHOD target proto" status bytes "referer" "ua"
+    clf = re.compile(
+        r"^(?P<host>\S+) - (?P<user>\S+) \[(?P<time>[^\]]+)\] "
+        r'"(?P<method>\S+) (?P<target>\S+) (?P<proto>HTTP/\S+)" '
+        r'(?P<status>\d{3}) (?P<bytes>\S+) "(?P<referer>[^"]*)" "(?P<ua>[^"]*)"$'
+    )
+
+    def logged_host(ua: str) -> str:
+        line = _wait_for_line(
+            server["log_path"],
+            lambda ln: ua in ln and clf.match(ln) is not None,
+        )
+        assert line, f"no Combined Log Format line was logged for {ua}"
+        return clf.match(line).group("host")
+
+    # The header is genuinely trusted here, so the test can't pass vacuously.
+    code, _, _ = http_get(
+        f"{server['simple']}index.json",
+        headers={"User-Agent": "pytest-xff-ok/1.0", "X-Forwarded-For": "203.0.113.9, 10.0.0.1"},
+    )
+    assert code == 200
+    assert logged_host("pytest-xff-ok/1.0") == "203.0.113.9"
+
+    junk = '1.2.3.4 - evil [junk] "GET / HTTP/1.1" 200'
+    code, _, _ = http_get(
+        f"{server['simple']}index.json",
+        headers={"User-Agent": "pytest-xff-junk/1.0", "X-Forwarded-For": junk},
+    )
+    assert code == 200
+    assert logged_host("pytest-xff-junk/1.0") == "127.0.0.1"
+    assert "evil" not in server["log_path"].read_text()
+
+
 def test_responses_carry_nosniff(disk_server):
     """Defense-in-depth: every response sets X-Content-Type-Options: nosniff."""
     for path in ("/health", "/simple/index.json"):

@@ -1907,23 +1907,38 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
         .map(str::to_string)
 }
 
+/// One forwarded-header value as a canonical bare IP, or `None` if it isn't one.
+/// The value has to be a real address because it lands unquoted in the
+/// space-delimited CLF `host` field, where a client-supplied `1.2.3.4 - x [y]`
+/// would forge whole log fields; a trailing port (`1.2.3.4:5678`, `[::1]:80`)
+/// that some proxies append is dropped.
+fn forwarded_ip(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string());
+    }
+    value
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|addr| addr.ip().to_string())
+}
+
 /// The client's address for logging. Only behind a reverse proxy
 /// (`--trusted-proxy`) do the proxy-set `X-Forwarded-For` (leftmost) or
 /// `X-Real-IP` win; otherwise those headers are ignored — they are
 /// client-settable, so an ungated direct caller could forge its audit-logged
-/// address — and the direct peer is used, else `-`.
+/// address — and the direct peer is used, else `-`. A header that doesn't hold
+/// an IP counts as absent, so the next fallback takes over.
 fn client_ip(headers: &HeaderMap, peer: Option<std::net::IpAddr>, trusted_proxy: bool) -> String {
     if trusted_proxy {
         if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            let first = xff.split(',').next().unwrap_or("").trim();
-            if !first.is_empty() {
-                return first.to_string();
+            if let Some(ip) = forwarded_ip(xff.split(',').next().unwrap_or("")) {
+                return ip;
             }
         }
         if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-            let real = real.trim();
-            if !real.is_empty() {
-                return real.to_string();
+            if let Some(ip) = forwarded_ip(real) {
+                return ip;
             }
         }
     }
@@ -2323,6 +2338,36 @@ mod tests {
 
         // No headers and no peer → "-".
         assert_eq!(client_ip(&HeaderMap::new(), None, true), "-");
+    }
+
+    #[test]
+    fn client_ip_rejects_forwarded_values_that_are_not_addresses() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let peer = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+
+        // The logged host lands unquoted in a CLF line, so junk that would forge
+        // extra fields is treated as absent and the peer is logged instead.
+        let mut junk = HeaderMap::new();
+        junk.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("1.2.3.4 - evil [junk] \"GET / HTTP/1.1\" 200"),
+        );
+        assert_eq!(client_ip(&junk, peer, true), "127.0.0.1");
+
+        // A proxy that appends a port is still a real address; the port is dropped.
+        let mut ported = HeaderMap::new();
+        ported.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4:5678"));
+        assert_eq!(client_ip(&ported, peer, true), "1.2.3.4");
+        ported.insert("x-forwarded-for", HeaderValue::from_static("[::1]:80"));
+        assert_eq!(client_ip(&ported, peer, true), "::1");
+
+        // Junk X-Forwarded-For falls through to a valid X-Real-IP.
+        junk.insert("x-real-ip", HeaderValue::from_static("198.51.100.7"));
+        assert_eq!(client_ip(&junk, peer, true), "198.51.100.7");
+
+        // Junk in both, and no peer → "-", never the attacker's string.
+        junk.insert("x-real-ip", HeaderValue::from_static("not an ip"));
+        assert_eq!(client_ip(&junk, None, true), "-");
     }
 
     #[test]

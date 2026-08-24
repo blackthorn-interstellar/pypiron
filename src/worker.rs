@@ -2804,9 +2804,13 @@ async fn update_global_index_locked(
 /// Consume the `_dirty/` markers the replicator dropped in a *destination*
 /// bucket and rebuild that bucket's own indexes from its own truth (design §4:
 /// indexes are per-bucket derived views, never written cross-bucket). This is
-/// what keeps a warm copy's indexes fresh. Cache-free on purpose: it must
-/// not disturb the node-local name/inventory caches, which describe the
-/// *selected* bucket. A package that fails to rebuild keeps its markers for the
+/// what keeps a warm copy's indexes fresh. It never reads or mutates the
+/// node-local name and inventory caches — those describe the *selected* bucket
+/// and a destination's name set would corrupt them. The two by-key caches on the
+/// shared publish path (the served index bodies, the rendered `/projects/` page)
+/// are dropped, not written: each re-derives from the selected bucket on the next
+/// read, so a spurious drop costs one re-render and can never serve a
+/// destination's view. A package that fails to rebuild keeps its markers for the
 /// next pass; every package that does rebuild asserts its membership into the
 /// destination's own global index, which dedups the assertion against the name
 /// set it loads.
@@ -2876,9 +2880,13 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
 /// node-local name cache, which is pinned to the *selected* bucket. `adds` and
 /// `removes` are assertions, not a pre-computed diff — the loaded name set is
 /// the only thing that decides whether one is a change, and dedupping here is
-/// what makes a repeated pass idempotent. Single-writer in P3 (one node
-/// rebuilds every warm copy), so a plain read-modify-write is safe; P4's
-/// per-bucket leaders drive each bucket's own cached CAS path instead.
+/// what makes a repeated pass idempotent.
+///
+/// Not a single-writer path, whatever the comment here used to claim: every node
+/// that can reach a destination drains it, and the bucket-local lease only makes
+/// the duplicate work cheap — it expires under a slow drain like any other. So
+/// the publish goes through the same conditional writer the selected-bucket path
+/// uses, and a stale view loses instead of clobbering.
 pub(crate) async fn update_global_index_uncached(
     state: &AppState,
     storage: &dyn Storage,
@@ -2888,46 +2896,77 @@ pub(crate) async fn update_global_index_uncached(
     if adds.is_empty() && removes.is_empty() {
         return Ok(());
     }
-    let loaded = load_global_names(storage).await?;
-    let loaded_html_etag = loaded.html_etag;
-    let stranded = loaded.stranded;
-    let mut names = loaded.names;
-    let mut changed = false;
-    for pkg in adds {
-        changed |= names.insert(pkg.clone());
-    }
-    for pkg in removes {
-        changed |= names.remove(pkg);
-    }
-    let mut packages: Vec<String> = names.into_iter().collect();
-    packages.sort();
-    // A stranded load (HTML published, canonical JSON absent) derived its names
-    // from the per-package views, so a delta that dedups against them is not a
-    // no-op: the JSON still has to be materialized. Same rule the cached path
-    // states — without it the HTML serves a set no canonical index backs.
-    if !changed && !stranded {
-        // Every call here loads fresh, so it knows the JSON and nothing about
-        // the HTML — same hazard as the cached path (a crash between the two
-        // writes strands the HTML ahead of the JSON). Prove currency from the
-        // stamp first; only an unproven pair reads the body back.
-        if global_html_proved_current(storage, &loaded_html_etag, &packages).await {
+    for _attempt in 0..4 {
+        let loaded = load_global_names(storage).await?;
+        let loaded_json_etag = loaded.etag;
+        let loaded_html_etag = loaded.html_etag;
+        let stranded = loaded.stranded;
+        let mut names = loaded.names;
+        let mut changed = false;
+        for pkg in adds {
+            changed |= names.insert(pkg.clone());
+        }
+        for pkg in removes {
+            changed |= names.remove(pkg);
+        }
+        let mut packages: Vec<String> = names.into_iter().collect();
+        packages.sort();
+        // A stranded load (HTML published, canonical JSON absent) derived its names
+        // from the per-package views, so a delta that dedups against them is not a
+        // no-op: the JSON still has to be materialized. Same rule the cached path
+        // states — without it the HTML serves a set no canonical index backs.
+        if !changed && !stranded {
+            // Every call here loads fresh, so it knows the JSON and nothing about
+            // the HTML — same hazard as the cached path (a crash between the two
+            // writes strands the HTML ahead of the JSON). Prove currency from the
+            // stamp first; only an unproven pair reads the body back.
+            if global_html_proved_current(storage, &loaded_html_etag, &packages).await {
+                return Ok(());
+            }
+            match reconcile_global_html(state, storage, &packages, &loaded_html_etag).await? {
+                HtmlReconcile::Current => {}
+                HtmlReconcile::Rewrote(html_etag) => {
+                    write_global_html_stamp(storage, &html_etag, &packages).await?;
+                }
+                // A peer published a fresher HTML while we looked, so this
+                // load's name set is suspect too: reload and re-evaluate rather
+                // than let the caller consume its markers against a view we
+                // never re-checked. The sibling cached path does the same.
+                HtmlReconcile::Lost => continue,
+            }
             return Ok(());
         }
-        if let HtmlReconcile::Rewrote(html_etag) =
-            reconcile_global_html(state, storage, &packages, &loaded_html_etag).await?
+        // Conditional, and the stamp comes from the ETag the write itself returned.
+        // Writing blind and then re-probing the ETag to stamp it — what this did —
+        // meant a peer's page that landed in between was stamped as this node's own
+        // render: a durable false proof that the stored HTML shows this name set,
+        // which nothing re-examines while the object sits still. The browsable
+        // `/simple/` root then stayed wrong indefinitely (per-package pages, and so
+        // installs, are never involved).
+        match write_global_indexes_cas(
+            state,
+            storage,
+            &packages,
+            &loaded_json_etag,
+            &loaded_html_etag,
+        )
+        .await?
         {
-            write_global_html_stamp(storage, &html_etag, &packages).await?;
+            CasOutcome::Won { .. } => return Ok(()),
+            CasOutcome::Lost => {
+                state
+                    .metrics
+                    .global_cas_conflicts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    adds = adds.len(),
+                    removes = removes.len(),
+                    "destination global index CAS lost to a peer; reloading and retrying"
+                );
+            }
         }
-        // A `Lost` here means a peer published a fresher HTML while we looked:
-        // its own stamp covers it, and the next pass reloads. Nothing to do.
-        return Ok(());
     }
-    write_global_indexes(state, storage, &packages).await?;
-    // `write_global_indexes` is the unconditional disk-shaped path, so it has no
-    // ETag to stamp; re-probe and record so a cloud destination can still prove
-    // currency without a body read next pass.
-    let html_etag = current_global_html_etag(storage).await?;
-    write_global_html_stamp(storage, &html_etag, &packages).await
+    bail!("destination global index CAS retries exhausted")
 }
 
 /// What a reconcile had to do to `simple/index.html`.
@@ -4556,6 +4595,56 @@ mod tests {
             pep503_global_html(&live),
             "the reconcile must reload the peer's set, not wipe the live HTML to this cache's stale empty one"
         );
+    }
+
+    /// A destination's global index is published conditionally, like the
+    /// selected bucket's — and so without reading either global body back. That
+    /// read-back is what the old blind write needed: it re-probed the HTML's
+    /// ETag afterwards to stamp it, and that ETag is exactly what a peer's
+    /// concurrent publish moves. The stamp then certified the peer's page as
+    /// this node's render — a durable false proof of currency that left the
+    /// browsable root wrong for as long as the object sat still. Every node that
+    /// can reach a destination drains it, so the window is real.
+    #[tokio::test]
+    async fn a_destination_publish_is_conditional_and_reads_no_global_body() {
+        let storage = Arc::new(InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+        let listed = vec!["alpha".to_string()];
+        storage.insert(
+            &format!("{SIMPLE_PREFIX}index.json"),
+            pep691_global_json(&listed).into_bytes(),
+        );
+        storage.insert(
+            &format!("{SIMPLE_PREFIX}index.html"),
+            pep503_global_html(&listed).into_bytes(),
+        );
+
+        let bodies_before = storage.get_count();
+        update_global_index_uncached(&state, storage.as_ref(), &["beta".to_string()], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_count(),
+            bodies_before,
+            "a conditional publish knows its own ETag; reading the global body back is the \
+             misattribution window"
+        );
+
+        let published = vec!["alpha".to_string(), "beta".to_string()];
+        assert_eq!(global_html(&storage).await, pep503_global_html(&published));
+        let stamp = read_global_html_stamp(storage.as_ref())
+            .await
+            .expect("a publish records its own proof of currency");
+        let stored = storage
+            .head_etag(&format!("{SIMPLE_PREFIX}index.html"))
+            .await
+            .unwrap()
+            .expect("the HTML this call published");
+        assert_eq!(
+            stamp.html_etag, stored,
+            "the stamp must name the page this call itself wrote"
+        );
+        assert_eq!(stamp.names, global_names_digest(&published));
     }
 
     /// The reconcile must not *create* views: a bucket that has never published

@@ -115,9 +115,14 @@ pub struct Metrics {
     /// Total bytes of artifact files (sidecars excluded), summed off the same
     /// shard listings as the file count — the `size` already in each listing.
     inventory_bytes: AtomicU64,
-    /// Global-index CAS write-backs lost to a peer (reload-and-retry fired).
-    /// A nonzero value is two nodes legitimately racing the name set — the
-    /// proof that dual leadership is converging, not corrupting.
+    /// Global-index CAS write-backs lost to a peer (reload-and-retry fired),
+    /// counted for the selected bucket and for every destination a node drains.
+    /// A nonzero value is two nodes legitimately racing a name set and losing
+    /// cleanly — convergence, not corruption. Ordinary on a healthy multi-node
+    /// fleet: destination drains are deliberately unelected (every node that can
+    /// reach a bucket rebuilds it), so contention there is the design, and only
+    /// a rate high enough to exhaust the retries — which logs and retains the
+    /// markers — is worth chasing.
     pub global_cas_conflicts: AtomicU64,
     /// Unpaired intents consumed after the grace period: a writer dropped an
     /// intent and died before committing. A rising rate means writers crash.

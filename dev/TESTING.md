@@ -1483,9 +1483,11 @@ full-PyPI mirror. Request cost is negligible (~$0.40 per million S3 GETs,
 same-region transfer free); wall time is the binding constraint. That is
 affordable when an operator chooses it — after a restore, after out-of-band
 surgery, on a budgeted schedule — and unaffordable as a default, so it is a flag
-and not a default. Fan-out is bounded by **bytes** in flight rather than by a
-count (`DEEP_BYTES_IN_FLIGHT`), because a fixed 64-way fan-out over 300 MB wheels
-is 19 GB resident. It reports `body-mismatch`.
+and not a default. Each body is hashed **as it streams** (`stored_sha256`), so
+memory is a read buffer per artifact in flight and the fan-out (`DEEP_CONCURRENCY`
+files × `PACKAGE_CONCURRENCY` packages) never multiplies by object size — loading
+bodies whole would put the ceiling at 16 × 16 × the largest wheel in a store whose
+contents pypiron does not choose. It reports `body-mismatch`.
 
 The length check does not make the hash check optional. A crossing between two
 builds of the same wheel filename — the exact shape the partitioned fleet

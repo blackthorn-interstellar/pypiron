@@ -22,8 +22,10 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
+use futures::StreamExt as _;
+use sha2::{Digest, Sha256};
 
 use crate::app::{DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 use crate::names::normalize_pkg_name;
@@ -41,12 +43,11 @@ const SHARD_CONCURRENCY: usize = 8;
 const PACKAGE_CONCURRENCY: usize = 16;
 const SIDECAR_READ_CONCURRENCY: usize = 64;
 
-/// `--deep` reads whole bodies, so its fan-out is bounded by *bytes* in flight
-/// and not by a count: a fixed 64-way fan-out over a store of 300 MB wheels is
-/// 19 GB of resident memory. The batch is packed from the sizes the listing
-/// already returned, so one oversized artifact goes alone instead of
-/// multiplying a fan-out by its length.
-const DEEP_BYTES_IN_FLIGHT: u64 = 256 * 1024 * 1024;
+/// `--deep` hashes bodies as they stream, so a count is a safe bound again:
+/// resident memory is a read buffer per artifact in flight, not an artifact.
+/// Without streaming this fan-out would multiply by object size — 16 packages
+/// × 16 files × a 300 MB wheel is 76 GB — which is why the hasher never sees
+/// a whole body ([`stored_sha256`]).
 const DEEP_CONCURRENCY: usize = 16;
 
 #[derive(ClapArgs, Debug)]
@@ -63,6 +64,7 @@ pub struct VerifyArgs {
 }
 
 /// One observed divergence, printed as `kind\tpackage\tdetail`.
+#[derive(Debug)]
 pub struct Divergence {
     pub kind: &'static str,
     pub package: String,
@@ -271,8 +273,10 @@ async fn check_package(
     // global-index membership) follows the *renderable* set.
     let mut suppressed = 0usize;
     // What `--deep` will re-hash: (filename, the sha256 the sidecar publishes,
-    // the size storage listed). Collected here because the sidecar read has
-    // already happened — a second pass would read every sidecar twice.
+    // the length storage and that sidecar agree on — a short stream must read
+    // as a truncated transfer, not as a body that contradicts its hash).
+    // Collected here because the sidecar read has already happened — a second
+    // pass would read every sidecar twice.
     let mut attested: Vec<(&str, String, u64)> = Vec::new();
     for chunk in artifacts.chunks(SIDECAR_READ_CONCURRENCY) {
         let reads = chunk.iter().map(|(_, filename)| {
@@ -328,7 +332,7 @@ async fn check_package(
                     ),
                 });
             } else if deep {
-                attested.push((*filename, sc.sha256.clone(), meta.size));
+                attested.push((*filename, sc.sha256.clone(), sc.size));
             }
             if suppressed_mirror(pkg_origin, &sc, mirror_quarantined.contains(filename)) {
                 suppressed += 1;
@@ -416,35 +420,16 @@ async fn rehash_bodies(
     prefix: &str,
     attested: &[(&str, String, u64)],
 ) -> Result<Vec<Divergence>> {
-    // Pack batches by bytes, not by count — see DEEP_BYTES_IN_FLIGHT.
-    let mut batches: Vec<Vec<&(&str, String, u64)>> = Vec::new();
-    let mut batch: Vec<&(&str, String, u64)> = Vec::new();
-    let mut in_flight = 0u64;
-    for item in attested {
-        if !batch.is_empty()
-            && (batch.len() >= DEEP_CONCURRENCY || in_flight + item.2 > DEEP_BYTES_IN_FLIGHT)
-        {
-            batches.push(std::mem::take(&mut batch));
-            in_flight = 0;
-        }
-        in_flight += item.2;
-        batch.push(item);
-    }
-    if !batch.is_empty() {
-        batches.push(batch);
-    }
-
     let mut divs = Vec::new();
-    for batch in batches {
-        let reads = batch.iter().map(|(filename, _, _)| {
+    for batch in attested.chunks(DEEP_CONCURRENCY) {
+        let hashes = batch.iter().map(|(filename, _, size)| {
             let key = format!("{prefix}{filename}");
-            async move { storage.get_bytes(&key).await }
+            async move { stored_sha256(storage, &key, *size).await }
         });
-        let bodies = futures::future::join_all(reads).await;
-        for ((filename, published, _), body) in batch.iter().zip(bodies) {
-            match body {
-                Ok(body) => {
-                    let stored = crate::hash::sha256_hex(&body);
+        let hashed = futures::future::join_all(hashes).await;
+        for ((filename, published, _), stored) in batch.iter().zip(hashed) {
+            match stored {
+                Ok(stored) => {
                     if &stored != published {
                         divs.push(Divergence {
                             kind: "body-mismatch",
@@ -470,6 +455,45 @@ async fn rehash_bodies(
         }
     }
     Ok(divs)
+}
+
+/// The sha256 of what `key` actually holds, hashed as the bytes arrive.
+///
+/// [`Storage::serve_artifact`] is the trait's streaming read — a seek-and-read
+/// on disk, the GET response body on the object stores — so the digest costs a
+/// read buffer regardless of the object's size. Loading the body first would
+/// make an admin command's memory ceiling the largest object in the store times
+/// the fan-out, which on a mirror of other people's wheels is not a number
+/// pypiron gets to choose. A missing object comes back as [`is_not_found`],
+/// which the caller reports rather than raises.
+///
+/// `expected` is what both storage and the sidecar say this object weighs (the
+/// caller only re-hashes the two after they agree). A stream that ends anywhere
+/// short of it is a truncated *transfer*, not a divergence, and the difference
+/// matters: the digest of a partial body never matches, so hashing whatever
+/// arrived would accuse the store of serving bytes that contradict their own
+/// sidecar on the strength of a dropped connection. That is an error (exit 2),
+/// which says "the check could not run" — the honest verdict.
+async fn stored_sha256(storage: &dyn Storage, key: &str, expected: u64) -> Result<String> {
+    // This error travels with its type intact: the caller tells a missing body
+    // from a real I/O failure by downcasting to NotFound, which survives a
+    // context layer but not a rebuild into a fresh error (`anyhow!("{e}")`).
+    let mut body = storage
+        .serve_artifact(key, None)
+        .await?
+        .into_body()
+        .into_data_stream();
+    let mut hasher = Sha256::new();
+    let mut read = 0u64;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.with_context(|| format!("read {key}"))?;
+        read += chunk.len() as u64;
+        hasher.update(&chunk);
+    }
+    if read != expected {
+        anyhow::bail!("read {key}: body ended after {read} of {expected} bytes");
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// The global index must list exactly the packages that have artifacts.
@@ -696,5 +720,47 @@ mod tests {
             "a proven size mismatch should not also be re-hashed: {:?}",
             kinds(&report)
         );
+    }
+
+    /// The two ways a `--deep` read comes back wrong without the store lying
+    /// about its own bytes, and the two different verdicts they earn. Driven
+    /// through [`rehash_bodies`] directly because both need a key that the
+    /// listing produced and the read cannot satisfy — a state no store reaches
+    /// by standing still: delete an artifact out of band and it simply leaves
+    /// truth, taking its index entry's `orphan-view` with it.
+    #[tokio::test]
+    async fn a_body_that_never_arrives_is_not_a_body_that_disagrees() {
+        let storage = SimStorage::new(SimClock::new(
+            time::OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap(),
+        ));
+        write(
+            &storage,
+            "packages/raced/raced-1.0-py3-none-any.whl",
+            BODY.to_vec(),
+        );
+        let bucket: Arc<dyn Storage> = storage.clone();
+        let sha = crate::hash::sha256_hex(BODY);
+        let size = BODY.len() as u64;
+
+        // Listed a moment ago, gone by the time the hasher asked for it. That
+        // is a row the operator reads, not a failed run — and it stays one only
+        // while the store's NotFound reaches the caller as a NotFound. Rebuild
+        // it as a fresh error anywhere in `stored_sha256` and this goes red.
+        let vanished = [("raced-2.0-py3-none-any.whl", sha.clone(), size)];
+        let divs = rehash_bodies(bucket.as_ref(), "raced", "packages/raced/", &vanished)
+            .await
+            .expect("a missing body is a reported divergence, not a failed run");
+        let kinds: Vec<&str> = divs.iter().map(|d| d.kind).collect();
+        assert_eq!(kinds, ["missing-body"], "{kinds:?}");
+
+        // A body that ends short of the length storage and its sidecar already
+        // agreed on: the digest of what arrived cannot match, but blaming the
+        // bytes for a truncated transfer is a false accusation. The run fails
+        // (exit 2) instead of reporting a divergence it cannot stand behind.
+        let short = [("raced-1.0-py3-none-any.whl", sha, size + 1)];
+        let err = rehash_bodies(bucket.as_ref(), "raced", "packages/raced/", &short)
+            .await
+            .expect_err("a body that ends short must fail the run, not accuse the store");
+        assert!(err.to_string().contains("body ended after"), "{err}");
     }
 }

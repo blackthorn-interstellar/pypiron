@@ -2292,6 +2292,21 @@ def s3_server_presigned(tmp_path_factory, pypiron_bin: Path, minio: Dict) -> Ite
     )
 
 
+@pytest.fixture()
+def s3_server_presigned_fast_counters(
+    tmp_path_factory, pypiron_bin: Path, minio: Dict
+) -> Iterator[Dict]:
+    """Redirect delivery with a one-second counter flush, so a test can watch
+    what a download actually writes to the counter store."""
+    yield from _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        extra_env={"PYPIRON_ARTIFACT_DELIVERY": "redirect"},
+        extra_args=["--counters-flush-interval-secs", "1"],
+    )
+
+
 # ------------------- Shared cloud-backed server launcher ----------------------
 
 

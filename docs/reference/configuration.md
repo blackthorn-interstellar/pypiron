@@ -317,6 +317,14 @@ recovery behavior, and operator rules.
 | `--index-cache-ttl-secs N` | `PYPIRON_INDEX_CACHE_TTL_SECS` | `1` | Staleness bound on the in-memory index/page caches. Only matters multi-node — a node's own writes invalidate its caches exactly; the TTL bounds how long another node's write can go unseen. Single-node deployments can raise it freely. |
 | `--token-signing-key KEY` | `PYPIRON_TOKEN_SIGNING_KEY` | none | Enables 5-minute install tokens. |
 
+Download counts only ever name files that are really in storage, so a client
+asking for a filename that was never published cannot put it in your stats. On
+object-store deployments the node remembers which filenames it has confirmed —
+budget roughly 70 MB of memory at full-PyPI mirror scale, and nothing at all on
+disk-backed or `--artifact-delivery stream` deployments. `/metrics` is the
+exception by design: `pypiron_downloads_total` counts download *requests*, so it
+can sit above the total in `/stats`.
+
 No write credential means read-only. No read credential means installs are open
 to the network. Half-configured credentials refuse startup.
 

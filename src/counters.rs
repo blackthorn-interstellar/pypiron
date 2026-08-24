@@ -1,12 +1,15 @@
 //! Distributed, S3-backed counter store. **Self-contained on purpose**: it
-//! depends only on the two tiny store traits below, `time`, and `serde` — never
-//! on `AppState`, `html`, or `crate::storage`. Lift it into its own crate by
+//! depends only on the tiny traits below, `time`, and `serde` — never on
+//! `AppState`, `html`, or `crate::storage`. Lift it into its own crate by
 //! copying this one file and providing store implementations for your backend.
 //!
 //! ## Model (truth = immutable files, views = recomputations — the repo's bias)
 //! - **Record** (every node, hot path): bump a bounded in-memory map keyed by
 //!   `(metric, UTC day, shard, intra-day bucket, key)`. No I/O.
-//! - **Flush** (every node): write the buffered *deltas* as one immutable,
+//! - **Flush** (every node): drop any key an optional [`KeyVerifier`] cannot
+//!   prove names a real object — the one place forgery is cheap to stop, since
+//!   a redirecting delivery path counts a download without ever asking storage
+//!   whether the file is there — then write the buffered *deltas* as one immutable,
 //!   uniquely-named segment per `(metric, day, shard)`, then clear. Plain PUT,
 //!   no read-before-write, no CAS — segments never collide (unique incarnation
 //!   id + sequence), so summing all of a `(day, shard)`'s segments is the total.
@@ -60,11 +63,12 @@
 //! carry forward and no reader is owed the old keys.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 use tracing::warn;
@@ -85,6 +89,25 @@ pub const SEG_PREFIX: &str = "_counters/seg/";
 /// In-memory keys past the cap fold into this catch-all so a flood of distinct
 /// (or hostile) keys can never grow a node's memory without bound.
 pub(crate) const OVERFLOW_KEY: &str = "_overflow";
+
+/// Storage *operations* one [`Counters::flush`] may spend verifying keys. The
+/// in-memory cap bounds a node's memory; this bounds the I/O the gate below it
+/// can be made to do, so a flood of distinct keys costs a constant number of
+/// round trips per flush window whatever a single check costs
+/// ([`KeyVerifier::ops_per_check`]). Keys past the budget are folded into
+/// [`OVERFLOW_KEY`] rather than written unverified — the same fail-closed
+/// aggregation the memory cap uses.
+const VERIFY_OPS_PER_FLUSH: usize = 4_096;
+
+/// Existence checks in flight at once. The budget above is the bound that
+/// matters; this is only what keeps paying it from stalling a flush for minutes
+/// of serial round trips.
+const VERIFY_CONCURRENCY: usize = 16;
+
+/// Keys remembered as *absent*, so re-minting the same fake costs one check
+/// rather than one per flush window. Deliberately small: honest traffic never
+/// populates it, and the positive cache below is the one that has to be large.
+const NEGATIVE_VERDICT_KEYS: usize = 16_384;
 
 /// Filename stem of a day's summary, distinguishing it from the `_` catch-all
 /// shard's own rollup (`_@<bucket>.json`).
@@ -159,6 +182,44 @@ pub trait ObjectStore: Send + Sync {
     async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>>;
     /// Best-effort delete; missing keys are not an error.
     async fn delete(&self, keys: &[String]) -> anyhow::Result<()>;
+}
+
+/// Answers whether a `(metric, key)` names something that actually exists.
+///
+/// A delivery path that can hand out bytes without proving the object is there
+/// will happily count a download for a file nobody ever uploaded: presigning is
+/// local HMAC math, so a redirect costs no storage round trip and observes no
+/// 404. Anyone who can issue that request can therefore mint counter keys, and
+/// while the in-memory map is capped, the segments and frozen day shards it
+/// flushes are not — sustained forgery is durable storage bloat, a compaction
+/// that has to hold a fabricated day in RAM, and poisoned statistics.
+///
+/// Checking at *flush* keeps that defense off the request path entirely: one
+/// check per never-before-seen key, amortized over a whole flush window and
+/// bounded by [`VERIFY_OPS_PER_FLUSH`]. The embedder installs a verifier only
+/// where forgery is actually reachable ([`Counters::with_verifier`]); without
+/// one, a flush writes exactly what was recorded and costs exactly what it
+/// always did.
+#[async_trait]
+pub trait KeyVerifier: Send + Sync {
+    /// `Some(true)` it exists, `Some(false)` it genuinely does not, `None` the
+    /// check could not be made (a transient storage failure).
+    ///
+    /// `None` counts as existing, and is cached neither way. Availability of
+    /// real counts beats forgery defense: a storage blip must never silently
+    /// delete a window of honest downloads, and the next flush re-checks.
+    async fn exists(&self, metric: &str, key: &str) -> Option<bool>;
+
+    /// Worst-case storage operations one [`exists`](Self::exists) call can cost.
+    /// The flush budget is denominated in operations, not keys, so a verifier
+    /// that may have to consult several places declares it here and the engine
+    /// checks proportionally fewer keys per window — otherwise the bound it
+    /// advertises is off by however many places a *miss* has to look, which is
+    /// precisely the case an attacker controls. Charged worst-case for every
+    /// key: honest traffic usually answers on the first operation.
+    fn ops_per_check(&self) -> usize {
+        1
+    }
 }
 
 /// Tunables. `resolution_secs` is the intra-day bucket width; it must be a
@@ -252,11 +313,92 @@ struct Pending {
     n_keys: usize,
 }
 
+/// A set of at most `cap` ids that evicts the oldest insertion when full — the
+/// bound that keeps a verdict cache from becoming the very unbounded growth it
+/// exists to prevent. `Arc<str>` so the set and the eviction queue share one
+/// allocation per id.
+struct BoundedSet {
+    ids: std::collections::HashSet<std::sync::Arc<str>>,
+    order: std::collections::VecDeque<std::sync::Arc<str>>,
+    cap: usize,
+}
+
+impl BoundedSet {
+    fn new(cap: usize) -> Self {
+        Self {
+            ids: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+    fn insert(&mut self, id: &str) {
+        let id: std::sync::Arc<str> = std::sync::Arc::from(id);
+        if !self.ids.insert(id.clone()) {
+            return;
+        }
+        self.order.push_back(id);
+        while self.order.len() > self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.ids.remove(&evicted);
+            }
+        }
+    }
+}
+
+/// Existence verdicts already paid for, so a key costs at most one storage
+/// check per process — artifacts are immutable, so "it was there once" cannot
+/// turn false in a way worth re-checking (over-counting a later-deleted file is
+/// harmless; refusing to count a real one is not). An eviction from `real`
+/// costs one more check later, never a wrong answer.
+///
+/// Sized like the in-memory key map, and never below one flush's budget: a
+/// `real` cache smaller than the keys a single pass can confirm would evict
+/// this pass's own positives before the rewrite reads them back, and re-buffered
+/// deltas would then have to re-earn a verdict they already paid for.
+struct Verdicts {
+    real: BoundedSet,
+    fake: BoundedSet,
+}
+
+impl Verdicts {
+    fn new(real_cap: usize) -> Self {
+        Self {
+            real: BoundedSet::new(real_cap),
+            fake: BoundedSet::new(NEGATIVE_VERDICT_KEYS),
+        }
+    }
+}
+
+/// Write the cache identity of a `(metric, key)` pair into a reusable buffer.
+/// `\u{1}` appears in neither half — a metric is an ASCII identifier and a key
+/// is a package/filename — so the join needs no escaping, and a collision would
+/// at worst re-check a key. Buffered rather than returned because both passes
+/// below build one per key, and at the memory cap that is a million throwaway
+/// allocations per flush.
+fn write_verdict_id(buf: &mut String, metric: &str, key: &str) {
+    buf.clear();
+    buf.push_str(metric);
+    buf.push('\u{1}');
+    buf.push_str(key);
+}
+
 /// The store. Construct enabled with [`Counters::new`], or [`Counters::disabled`]
 /// for a no-op instance (single-node tests, `--download-stats=false`).
 pub struct Counters {
     store: Option<Box<dyn ObjectStoreSelector>>,
     cfg: Config,
+    /// Installed only where a delivery path can count a download it never proved
+    /// (see [`KeyVerifier`]); `None` everywhere else, and then flush behaves and
+    /// costs exactly as it did before the gate existed.
+    verifier: Option<Box<dyn KeyVerifier>>,
+    verdicts: Mutex<Verdicts>,
+    /// Where the next flush's verification budget starts in the buffered
+    /// day-shards. Round-robin, so a shard that floods the budget every window
+    /// cannot hold it: the next flush resumes past whichever shard spent it.
+    verify_cursor: AtomicUsize,
     /// Unique per process incarnation (`pid-nanos`), so two nodes — even two
     /// sharing a hostname — never write the same segment key.
     incarnation: String,
@@ -271,6 +413,9 @@ impl Counters {
         Self {
             store: Some(store),
             cfg,
+            verifier: None,
+            verdicts: Mutex::new(Verdicts::new(cfg.max_keys.max(VERIFY_OPS_PER_FLUSH))),
+            verify_cursor: AtomicUsize::new(0),
             incarnation: incarnation_id(),
             seq: AtomicU64::new(0),
             pending: Mutex::new(Pending::default()),
@@ -281,15 +426,28 @@ impl Counters {
 
     /// A no-op store: `record`/`flush`/`compact` do nothing and `query` is empty.
     pub fn disabled() -> Self {
+        let cfg = Config::default();
         Self {
             store: None,
-            cfg: Config::default(),
+            cfg,
+            verifier: None,
+            verdicts: Mutex::new(Verdicts::new(cfg.max_keys.max(VERIFY_OPS_PER_FLUSH))),
+            verify_cursor: AtomicUsize::new(0),
             incarnation: incarnation_id(),
             seq: AtomicU64::new(0),
             pending: Mutex::new(Pending::default()),
             flush_wake: tokio::sync::Notify::new(),
             flush_due: AtomicBool::new(false),
         }
+    }
+
+    /// Gate every flush on `verifier`: a key it has never confirmed is checked
+    /// once against storage, and one it reports genuinely absent is dropped
+    /// instead of written. Install it only where a request path can count a
+    /// download without having proved the bytes exist — see [`KeyVerifier`].
+    pub fn with_verifier(mut self, verifier: Box<dyn KeyVerifier>) -> Self {
+        self.verifier = Some(verifier);
+        self
     }
 
     pub fn enabled(&self) -> bool {
@@ -348,18 +506,22 @@ impl Counters {
         }
     }
 
-    /// Write the buffered deltas as immutable segments, then clear the buffer.
-    /// Best-effort: a failed segment is re-buffered for the next flush.
+    /// Drop anything a [`KeyVerifier`] cannot vouch for, write the surviving
+    /// deltas as immutable segments, then clear the buffer. Best-effort: a
+    /// failed segment is re-buffered for the next flush.
     pub async fn flush(&self) {
         let Some(selector) = self.store.as_deref() else {
             return;
         };
         let store = selector.pin();
-        let taken = {
+        let mut taken = {
             let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             self.flush_due.store(false, Ordering::Relaxed);
             std::mem::take(&mut *guard)
         };
+        // Nothing forged reaches durable storage: the buffer is filtered before
+        // a single segment is written. A no-op without a verifier installed.
+        self.drop_unprovable_keys(&mut taken.segs).await;
         for ((metric, day, shard), buckets) in taken.segs {
             if buckets.is_empty() {
                 continue;
@@ -378,6 +540,151 @@ impl Counters {
                 warn!(error=?e, %key, "counter flush failed; re-buffering deltas");
                 self.rebuffer(&metric, &day, shard, seg.buckets);
             }
+        }
+    }
+
+    /// Drop every buffered key this node cannot prove names a real object, so
+    /// forged attribution dies in memory instead of becoming an immutable
+    /// segment, a frozen day shard, and 90 days of storage. A no-op — not one
+    /// extra byte of work — when no [`KeyVerifier`] is installed.
+    ///
+    /// Three outcomes per never-before-verified key:
+    /// - **exists** → kept, and remembered for the process lifetime.
+    /// - **genuinely absent** → dropped, and remembered so re-minting the same
+    ///   fake costs no second check.
+    /// - **unknown** — the check failed transiently, or the flush's budget was
+    ///   already spent → kept when the storage said nothing (honest counts win
+    ///   over forgery defense), folded into [`OVERFLOW_KEY`] when the budget ran
+    ///   out (the events survive as an aggregate; only the names are refused).
+    async fn drop_unprovable_keys(&self, segs: &mut BTreeMap<(String, String, char), BucketMap>) {
+        let Some(verifier) = self.verifier.as_deref() else {
+            return;
+        };
+
+        // Keys this pass can afford: the operation budget divided by what one
+        // check costs worst-case, so the bound holds however many places a miss
+        // has to look. At least one, so a pathological cost still makes progress.
+        let key_budget = (VERIFY_OPS_PER_FLUSH / verifier.ops_per_check().max(1)).max(1);
+
+        // Distinct pairs with no verdict yet, up to that budget. The scan stops
+        // the moment it is full: everything it did not reach has no verdict
+        // either, which the rewrite below already treats as "fold into the
+        // overflow bucket".
+        //
+        // It starts where the last one stopped and wraps, because the buffer is
+        // a `BTreeMap` and a fixed scan order is a starvation bug: a flood of
+        // fresh keys under a low-sorting name would take the whole budget every
+        // window, forever, and honestly-published files in later shards would
+        // fold into the overflow bucket indefinitely. Round-robin bounds it
+        // instead — a benign cold start of D distinct keys converges in
+        // ceil(D / key_budget) windows, and under a sustained flood attribution
+        // degrades but *rotates*: every day-shard gets the budget within one
+        // lap of the buffer.
+        let mut unknown: Vec<(String, String)> = Vec::new();
+        let mut queued: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let verdicts = self.verdicts.lock().unwrap_or_else(|e| e.into_inner());
+            let start = match segs.len() {
+                0 => 0,
+                n => self.verify_cursor.load(Ordering::Relaxed) % n,
+            };
+            let mut id = String::new();
+            let mut lapped = 0usize;
+            let mut spent = false;
+            'scan: for ((metric, _day, _shard), buckets) in
+                segs.iter().skip(start).chain(segs.iter().take(start))
+            {
+                for leaf in buckets.values() {
+                    for key in leaf.keys() {
+                        if key == OVERFLOW_KEY {
+                            continue; // the aggregate itself names no object
+                        }
+                        write_verdict_id(&mut id, metric, key);
+                        if verdicts.real.contains(&id) || verdicts.fake.contains(&id) {
+                            continue;
+                        }
+                        if !queued.insert(id.clone()) {
+                            continue;
+                        }
+                        unknown.push((metric.clone(), key.clone()));
+                        if unknown.len() >= key_budget {
+                            spent = true;
+                            break 'scan;
+                        }
+                    }
+                }
+                lapped += 1;
+            }
+            // Resume *past* the entry that spent the budget, never on it: parking
+            // the cursor on a flooded shard would hand it the budget forever,
+            // which is the starvation this rotation exists to prevent.
+            self.verify_cursor
+                .store(start + lapped + usize::from(spent), Ordering::Relaxed);
+        }
+
+        // The checks themselves: off the lock, a few at a time. Serially, a
+        // flush that spent its whole budget would stall the worker tick for
+        // minutes of round trips.
+        let checked: Vec<((String, String), Option<bool>)> = futures::stream::iter(unknown)
+            .map(|(metric, key)| async move {
+                let verdict = verifier.exists(&metric, &key).await;
+                ((metric, key), verdict)
+            })
+            .buffer_unordered(VERIFY_CONCURRENCY)
+            .collect()
+            .await;
+
+        // A transient failure is cached neither way — it gets a fresh check next
+        // flush — but it must survive this one.
+        let mut unreachable: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut dropped = 0u64;
+        let mut folded = 0u64;
+        {
+            let mut verdicts = self.verdicts.lock().unwrap_or_else(|e| e.into_inner());
+            let mut id = String::new();
+            for ((metric, key), verdict) in checked {
+                write_verdict_id(&mut id, &metric, &key);
+                match verdict {
+                    Some(true) => verdicts.real.insert(&id),
+                    Some(false) => verdicts.fake.insert(&id),
+                    None => {
+                        unreachable.insert(id.clone());
+                    }
+                }
+            }
+            segs.retain(|(metric, _day, _shard), buckets| {
+                buckets.retain(|_at, leaf| {
+                    let mut overflow = 0u64;
+                    leaf.retain(|key, count| {
+                        if key == OVERFLOW_KEY {
+                            return true;
+                        }
+                        write_verdict_id(&mut id, metric, key);
+                        if verdicts.real.contains(&id) || unreachable.contains(&id) {
+                            return true;
+                        }
+                        if verdicts.fake.contains(&id) {
+                            dropped += *count;
+                            return false;
+                        }
+                        overflow += *count; // never checked: over budget
+                        false
+                    });
+                    if overflow > 0 {
+                        folded += overflow;
+                        *leaf.entry(OVERFLOW_KEY.to_string()).or_insert(0) += overflow;
+                    }
+                    !leaf.is_empty()
+                });
+                !buckets.is_empty()
+            });
+        }
+        if dropped > 0 || folded > 0 {
+            warn!(
+                dropped,
+                folded,
+                "counter flush refused keys naming no stored artifact (dropped) or past this flush's check budget (folded into the overflow bucket)"
+            );
         }
     }
 
@@ -2026,5 +2333,283 @@ mod tests {
         assert_eq!(sums[&today_s].total, 4, "same bucket twice is not doubled");
         let series = c.query_package("downloads", "requests", today, today).await;
         assert_eq!(series[&today_s]["r-1.0.whl"], 4);
+    }
+
+    // --- flush-time key verification ---------------------------------------
+
+    /// A verifier over a fixed set of "stored" names, counting its calls so a
+    /// test can prove a verdict was cached rather than re-paid.
+    struct FakeVerifier {
+        stored: std::collections::HashSet<String>,
+        calls: Arc<AtomicU64>,
+        reachable: Arc<AtomicBool>,
+    }
+    impl FakeVerifier {
+        fn new(stored: &[&str]) -> Self {
+            Self {
+                stored: stored.iter().map(|s| s.to_string()).collect(),
+                calls: Arc::new(AtomicU64::new(0)),
+                reachable: Arc::new(AtomicBool::new(true)),
+            }
+        }
+        fn handle(&self) -> (Arc<AtomicU64>, Arc<AtomicBool>) {
+            (self.calls.clone(), self.reachable.clone())
+        }
+    }
+    #[async_trait]
+    impl KeyVerifier for FakeVerifier {
+        async fn exists(&self, _metric: &str, key: &str) -> Option<bool> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.reachable
+                .load(Ordering::SeqCst)
+                .then(|| self.stored.contains(key))
+        }
+    }
+
+    fn gated(store: MemStore, cfg: Config, verifier: FakeVerifier) -> Counters {
+        Counters::new(Box::new(store), cfg).with_verifier(Box::new(verifier))
+    }
+
+    #[tokio::test]
+    async fn flush_drops_keys_naming_no_stored_artifact() {
+        let store = MemStore::default();
+        let verifier = FakeVerifier::new(&["requests/r-1.0.whl"]);
+        let (calls, _) = verifier.handle();
+        let c = gated(store, Config::default(), verifier);
+
+        c.record("downloads", "requests/r-1.0.whl");
+        c.record("downloads", "requests/r-1.0.whl");
+        // Forged: a redirect counts these without storage ever seeing them.
+        c.record("downloads", "requests/forged-9.9.9.whl");
+        c.record("downloads", "evil/not-a-real-package-1.0.whl");
+        c.flush().await;
+
+        let today = OffsetDateTime::now_utc().date();
+        let day = day_str(today);
+        let series = c.query_package("downloads", "requests", today, today).await;
+        assert_eq!(series[&day]["r-1.0.whl"], 2, "the real download survives");
+        assert!(
+            !series[&day].contains_key("forged-9.9.9.whl"),
+            "a forged filename never reaches storage"
+        );
+        assert!(
+            c.query_package("downloads", "evil", today, today)
+                .await
+                .is_empty(),
+            "a shard holding only forged keys writes no segment at all"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "one check per distinct key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verdict_is_paid_for_once_per_key() {
+        let store = MemStore::default();
+        let verifier = FakeVerifier::new(&["requests/r-1.0.whl"]);
+        let (calls, _) = verifier.handle();
+        let c = gated(store, Config::default(), verifier);
+
+        for _ in 0..3 {
+            c.record("downloads", "requests/r-1.0.whl");
+            c.record("downloads", "requests/forged-9.9.9.whl"); // re-minted every window
+            c.flush().await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both the positive and the negative verdict are cached across flushes"
+        );
+
+        let today = OffsetDateTime::now_utc().date();
+        let series = c.query_package("downloads", "requests", today, today).await;
+        assert_eq!(series[&day_str(today)]["r-1.0.whl"], 3);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_store_keeps_the_count_and_re_checks() {
+        let store = MemStore::default();
+        let verifier = FakeVerifier::new(&["requests/r-1.0.whl"]);
+        let (calls, reachable) = verifier.handle();
+        let c = gated(store, Config::default(), verifier);
+
+        // Storage can't answer: counting availability beats forgery defense, so
+        // the event survives — and the verdict is not cached either way.
+        reachable.store(false, Ordering::SeqCst);
+        c.record("downloads", "requests/r-1.0.whl");
+        c.flush().await;
+        let today = OffsetDateTime::now_utc().date();
+        let day = day_str(today);
+        let series = c.query_package("downloads", "requests", today, today).await;
+        assert_eq!(series[&day]["r-1.0.whl"], 1, "an outage deletes no counts");
+
+        reachable.store(true, Ordering::SeqCst);
+        c.record("downloads", "requests/r-1.0.whl");
+        c.flush().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the unknown key is checked again once storage answers"
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_past_the_check_budget_fold_into_overflow() {
+        let store = MemStore::default();
+        let verifier = FakeVerifier::new(&[]); // every name is a forgery
+        let (calls, _) = verifier.handle();
+        let c = gated(store.clone(), Config::default(), verifier);
+
+        let flood = VERIFY_OPS_PER_FLUSH + 500;
+        for i in 0..flood {
+            c.record("downloads", &format!("a/forged-{i}.whl"));
+        }
+        c.flush().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst) as usize,
+            VERIFY_OPS_PER_FLUSH,
+            "one flush spends a constant number of storage round trips"
+        );
+
+        // Nothing unverified is written under its own name; the events past the
+        // budget survive only as the aggregate.
+        let today = OffsetDateTime::now_utc().date();
+        let series = c.query_package("downloads", "a", today, today).await;
+        assert!(series.is_empty(), "no forged filename reaches storage");
+        let raw: Vec<String> = store
+            .objects
+            .lock()
+            .unwrap()
+            .values()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect();
+        let blob = raw.join("");
+        assert!(
+            blob.contains(OVERFLOW_KEY),
+            "over-budget keys fold into the overflow bucket"
+        );
+        assert!(
+            !blob.contains("forged-"),
+            "a segment holds no fabricated name, checked or not"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_overflow_aggregate_is_never_checked() {
+        let store = MemStore::default();
+        let verifier = FakeVerifier::new(&[]);
+        let (calls, _) = verifier.handle();
+        // `Config::checked` floors max_keys at 1_000, so recording more than
+        // that pushes the surplus into `_overflow` in memory — the case that
+        // matters here: the aggregate reaches the flush as a key like any other.
+        let cfg = Config {
+            max_keys: 1,
+            ..Default::default()
+        }
+        .checked()
+        .unwrap();
+        let c = gated(store.clone(), cfg, verifier);
+        for i in 0..2_000 {
+            c.record("downloads", &format!("a/pkg-{i}.whl"));
+        }
+        c.flush().await;
+        // Only the keys actually buffered are checked, and `_overflow` — which
+        // names no object — is never one of them, so the checks stay at or below
+        // the number of real keys the buffer held.
+        assert!(
+            calls.load(Ordering::SeqCst) <= cfg.max_keys as u64,
+            "the aggregate key costs no storage round trip"
+        );
+        let stored = store.objects.lock().unwrap();
+        let blob: String = stored
+            .values()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect();
+        assert!(blob.contains(OVERFLOW_KEY), "the aggregate still flushes");
+    }
+
+    #[tokio::test]
+    async fn a_flooded_shard_cannot_hold_the_budget_forever() {
+        // A fixed scan order would be a starvation bug: the buffer is a BTreeMap,
+        // so a flood of fresh keys under a low-sorting shard would take the whole
+        // budget every window and honest publishes in later shards would fold
+        // into the overflow bucket indefinitely. The cursor must rotate past the
+        // shard that spent the budget.
+        let store = MemStore::default();
+        let real = "zeta/zeta-1.0.whl";
+        let verifier = FakeVerifier::new(&[real]);
+        let c = gated(store, Config::default(), verifier);
+        let today = OffsetDateTime::now_utc().date();
+        let day = day_str(today);
+
+        // Window 1: shard 'a' floods, so shard 'z' never gets a check.
+        for i in 0..VERIFY_OPS_PER_FLUSH + 500 {
+            c.record("downloads", &format!("a/forged-{i}.whl"));
+        }
+        c.record("downloads", real);
+        c.flush().await;
+        assert!(
+            c.query_package("downloads", "zeta", today, today)
+                .await
+                .is_empty(),
+            "the flooded window folds the honest key (its events survive as the aggregate)"
+        );
+
+        // Window 2: the flood continues with *fresh* names, so the cached
+        // negatives buy nothing — only the rotation can get shard 'z' a check.
+        for i in 0..VERIFY_OPS_PER_FLUSH + 500 {
+            c.record("downloads", &format!("a/forged-b{i}.whl"));
+        }
+        c.record("downloads", real);
+        c.flush().await;
+        let series = c.query_package("downloads", "zeta", today, today).await;
+        assert_eq!(
+            series[&day]["zeta-1.0.whl"], 1,
+            "the next window's budget rotates to the shard that was starved"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expensive_check_buys_proportionally_fewer_keys() {
+        // The budget is denominated in storage operations, so a verifier that
+        // costs several per key must check fewer of them — otherwise the bound
+        // is off by exactly the factor a miss controls.
+        struct Costly(Arc<AtomicU64>);
+        #[async_trait]
+        impl KeyVerifier for Costly {
+            async fn exists(&self, _metric: &str, _key: &str) -> Option<bool> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Some(false)
+            }
+            fn ops_per_check(&self) -> usize {
+                4
+            }
+        }
+        let calls = Arc::new(AtomicU64::new(0));
+        let c = Counters::new(Box::new(MemStore::default()), Config::default())
+            .with_verifier(Box::new(Costly(calls.clone())));
+        for i in 0..VERIFY_OPS_PER_FLUSH {
+            c.record("downloads", &format!("a/forged-{i}.whl"));
+        }
+        c.flush().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst) as usize * 4,
+            VERIFY_OPS_PER_FLUSH,
+            "keys checked times cost per check equals the operation budget"
+        );
+    }
+
+    #[test]
+    fn a_bounded_set_evicts_oldest_first() {
+        let mut set = BoundedSet::new(2);
+        set.insert("a");
+        set.insert("b");
+        set.insert("a"); // a repeat is not a new entry
+        assert!(set.contains("a") && set.contains("b"));
+        set.insert("c");
+        assert!(!set.contains("a"), "oldest insertion evicted");
+        assert!(set.contains("b") && set.contains("c"));
     }
 }

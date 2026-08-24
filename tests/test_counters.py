@@ -16,6 +16,7 @@ from .helpers import (
     http_get,
     http_get_bytes,
     http_get_json,
+    http_get_no_redirect,
     http_head,
     make_wheel,
     run_checked,
@@ -314,3 +315,45 @@ def test_mirrored_package_download_counts(proxy_pair_fast_counters, tmp_path):
     assert http_get_bytes(f"{proxy['base_url']}/files/{pkg}/{wheel.name}")
     stats = _wait_for_total(proxy["base_url"], pkg, 1)
     assert stats["total"] == 1, stats
+
+
+@pytest.mark.s3
+def test_redirected_download_of_a_missing_file_counts_nothing(
+    s3_server_presigned_fast_counters, tmp_path
+):
+    """A presigned redirect is signed without asking S3 whether the object is
+    there, so anyone who can GET could otherwise mint a download for a filename
+    that was never uploaded — unbounded, durable counter-store growth. The
+    redirect still goes out unchanged; the fabricated name just never reaches
+    the store, while the real download's count is untouched."""
+    server = s3_server_presigned_fast_counters
+    base = server["base_url"]
+    pkg, version = "forgeme", "1.0.0"
+    wheel = make_wheel(pkg, version, tmp_path)
+    upload_legacy(server["legacy"], wheel, username=server["user"], password=server["password"])
+    wait_for_file_in_index(server["simple"], pkg, wheel.name)
+
+    # A real download, and a flood of artifact-shaped names that do not exist.
+    code, _, _ = http_get_no_redirect(f"{base}/files/{pkg}/{wheel.name}")
+    assert code == 302
+    fakes = [f"{pkg}-9.9.{i}-py3-none-any.whl" for i in range(5)]
+    for fake in fakes:
+        code, _, _ = http_get_no_redirect(f"{base}/files/{pkg}/{fake}")
+        assert code == 302, f"redirect delivery is unchanged for {fake}"
+
+    # Wait for the real download to land, then let a WHOLE further flush window
+    # pass: polling for total >= 1 can return before the window that carried the
+    # forged names was ever written, which would pass with the gate removed.
+    _wait_for_total(base, pkg, 1)
+    time.sleep(2.5)  # > the 1s flush interval
+    stats = _stats(base, pkg)
+    assert stats["total"] == 1, stats
+    counted = {v for day in stats["days"].values() for v in day}
+    assert counted == {version}, f"only the real download is counted: {stats}"
+
+    # Re-minting the same fakes hits the cached negative verdict, not the store.
+    for fake in fakes:
+        assert http_get_no_redirect(f"{base}/files/{pkg}/{fake}")[0] == 302
+    time.sleep(2.5)
+    stats = _stats(base, pkg)
+    assert stats["total"] == 1, f"a re-minted fake stays out of the store: {stats}"

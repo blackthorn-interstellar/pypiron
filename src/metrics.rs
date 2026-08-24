@@ -423,7 +423,13 @@ impl Metrics {
         for (name, help, value) in [
             (
                 "pypiron_downloads_total",
-                "Artifact downloads served (real artifacts; streamed 200s and presigned 302s).",
+                // Deliberately requests, not verified downloads: a presigned 302
+                // is signed without asking storage whether the object is there,
+                // so this counts one even for a filename that was never
+                // uploaded. /stats is the attributed view and drops those at
+                // flush (src/counters.rs); this stays a cheap, unlabeled traffic
+                // signal and the two can differ under a forged-name flood.
+                "Artifact download requests served (streamed 200s and presigned 302s); see /stats for verified per-package counts.",
                 &self.downloads,
             ),
             (

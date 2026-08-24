@@ -1058,17 +1058,24 @@ pub async fn run_worker_until(
             _ = shutdown.changed() => break,
         }
     }
-    // Flush any buffered counts before exit so a graceful restart loses at most
-    // the events of the final partial interval.
-    state.counters.flush().await;
-    // Graceful exit: hand leadership over instead of leaving successors to
-    // wait out the lease TTL (a restart used to be a TTL-long write outage).
+    // Graceful exit: hand leadership over FIRST, then flush. The hand-off is
+    // the availability-critical half — without it a successor waits out the
+    // lease TTL before it can write at all — and the caller only waits
+    // WORKER_STOP_GRACE for this whole tail (src/app.rs). Counters are
+    // best-effort by construction, so they must never be what spends that
+    // budget: a restart used to be a TTL-long write outage, and a flush that
+    // pays its key-verification round trips is long enough to bring that back.
     if let Some(lm) = &lease {
         lm.release().await;
     }
     for lease in warm_leases.into_iter().flatten() {
         lease.release().await;
     }
+    // Flush any buffered counts before exit so a graceful restart loses at most
+    // the events of the final partial interval — but bounded, since the flush
+    // may verify keys against storage. Losing the last window's counts is the
+    // declared, acceptable loss; a slow exit is not.
+    let _ = tokio::time::timeout(FINAL_FLUSH_BUDGET, state.counters.flush()).await;
     if let Some(task) = health_task {
         task.abort();
         let _ = task.await;
@@ -1085,6 +1092,18 @@ pub(crate) const STATE_PREFIX: &str = "_state/";
 /// view. Followers never rebuild, so this is how the leader's value reaches
 /// them; a few seconds of homepage lag is fine for a glanceable stat.
 const INVENTORY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a shutting-down process waits for the worker's exit tail — the
+/// lease hand-off and the final counter flush. Past it the process exits
+/// anyway and the successor waits out the lease TTL instead, so everything in
+/// that tail is ordered most-important-first and individually bounded.
+pub(crate) const WORKER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The slice of [`WORKER_STOP_GRACE`] the last counter flush may use. It runs
+/// after the leases are handed over and can pay storage round trips to verify
+/// keys, so it gets a small budget and the loss if it overruns is one partial
+/// flush window of download counts — already the declared loss on any crash.
+const FINAL_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Storage key for the registry-inventory view (option 4): a tiny regenerable
 /// aggregate every node reads, so followers stay current without a sweep.

@@ -910,6 +910,64 @@ pub async fn cli_main() -> Result<()> {
     }
 }
 
+/// The counter metric downloads are recorded under (see `serve.rs`), and the
+/// only one [`ArtifactVerifier`] knows how to check.
+const DOWNLOADS_METRIC: &str = "downloads";
+
+/// Proves a download-counter key names an artifact that is really in storage.
+///
+/// A presigned redirect is local HMAC math: it hands back a URL without asking
+/// storage anything, so the download it counts may name a file nobody ever
+/// uploaded — and on a public-read index any unauthenticated client can mint
+/// those keys as fast as it can issue GETs. The counter engine calls this once
+/// per never-before-seen key at flush time, so the check costs nothing on the
+/// request path. See [`counters::KeyVerifier`].
+struct ArtifactVerifier {
+    buckets: Arc<BucketSet>,
+}
+
+#[async_trait::async_trait]
+impl counters::KeyVerifier for ArtifactVerifier {
+    async fn exists(&self, metric: &str, key: &str) -> Option<bool> {
+        if metric != DOWNLOADS_METRIC {
+            return Some(true); // not a key this gate knows how to check
+        }
+        let object = format!("{PACKAGES_PREFIX}{key}");
+        let handles = self.buckets.handles();
+        let pinned = self.buckets.pin().index;
+        // The write pin first — where an upload or a proxy fill lands — then
+        // every other configured bucket, because a node with read affinity
+        // counts downloads it served from its region bucket, and a fresh
+        // artifact may not have replicated everywhere yet. Only a key absent
+        // from *all* of them is a forgery; honest traffic hits the first check
+        // and never reaches the rest.
+        let mut unreachable = false;
+        for index in std::iter::once(pinned).chain((0..handles.len()).filter(|i| *i != pinned)) {
+            let Some(handle) = handles.get(index) else {
+                continue;
+            };
+            match handle.storage.head_exists(&object).await {
+                Ok(true) => return Some(true),
+                Ok(false) => {}
+                Err(e) => {
+                    debug!(error=?e, %object, bucket=%handle.name, "download-counter key check failed; retried at the next flush");
+                    unreachable = true;
+                }
+            }
+        }
+        // A bucket we could not reach is not evidence of forgery: report
+        // "unknown" so the count survives this flush and is re-checked later.
+        (!unreachable).then_some(false)
+    }
+
+    /// One HEAD per configured bucket — what a *miss* costs, which is the case
+    /// an attacker picks. Declaring the worst case is what keeps the engine's
+    /// per-flush bound denominated in real storage operations.
+    fn ops_per_check(&self) -> usize {
+        self.buckets.handles().len().max(1)
+    }
+}
+
 /// Build the download-counter engine from CLI config, failing closed on a bad
 /// resolution. Disabled (`--download-stats=false`) yields a no-op store.
 fn build_counters(
@@ -930,10 +988,31 @@ fn build_counters(
     }
     .checked()
     .map_err(|e| anyhow::anyhow!("counter config: {e}"))?;
-    Ok(counters::Counters::new(
-        Box::new(CounterStore { buckets, health }),
+    let engine = counters::Counters::new(
+        Box::new(CounterStore {
+            buckets: buckets.clone(),
+            health,
+        }),
         cfg,
-    ))
+    );
+    // Gate the flush only where a download can be counted without the bytes
+    // ever being proved to exist — a redirecting delivery mode on a backend
+    // that actually presigns. Streaming 404s before it counts, and a disk
+    // backend never presigns (it falls through to streaming even when redirect
+    // is configured), so both keep exactly the I/O they had. `supports_leases`
+    // is the object-store backends' marker and stands in for "can presign"; the
+    // one deployment it over-reads — a cloud bucket with no signer configured —
+    // pays checks it did not strictly need, which is the harmless direction.
+    let can_redirect = cli.artifact_delivery != ArtifactDelivery::Stream
+        && buckets
+            .handles()
+            .iter()
+            .any(|h| h.storage.supports_leases());
+    Ok(if can_redirect {
+        engine.with_verifier(Box::new(ArtifactVerifier { buckets }))
+    } else {
+        engine
+    })
 }
 
 /// Parse `1d` / `1h` / `30m` / `2h` into seconds. Minutes/hours/days only — the
@@ -1644,12 +1723,17 @@ async fn run_serve(
     }
 
     // Give the worker a moment to release the leader lease — that hand-off is
-    // what keeps a restart from being a lease-TTL write outage on the successor.
-    if tokio::time::timeout(Duration::from_secs(5), worker_handle)
+    // what keeps a restart from being a lease-TTL write outage on the successor,
+    // so it runs first in the worker's exit tail and the best-effort counter
+    // flush behind it carries its own smaller budget.
+    if tokio::time::timeout(worker::WORKER_STOP_GRACE, worker_handle)
         .await
         .is_err()
     {
-        warn!("worker did not stop within 5s; exiting without lease release");
+        warn!(
+            "worker did not stop within {}s; exiting without lease release",
+            worker::WORKER_STOP_GRACE.as_secs()
+        );
     }
     Ok(())
 }

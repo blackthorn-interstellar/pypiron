@@ -5,6 +5,7 @@ pypiron instance — it speaks the same PEP 691 + PEP 700 the proxy consumes."""
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -13,7 +14,7 @@ import time
 
 import pytest
 
-from .conftest import _start_proxy_pair
+from .conftest import _DISK_SERVER_CREDS, _start_proxy_pair
 from .helpers import (
     ACCEPT_PEP691,
     find_free_port,
@@ -27,6 +28,7 @@ from .helpers import (
     sha256_file,
     upload_legacy,
     wait_for_file_in_index,
+    wait_http_responding,
 )
 
 pytestmark = pytest.mark.integration
@@ -84,6 +86,184 @@ def test_proxy_serves_and_caches_upstream_package(proxy_pair, tmp_path):
     code, body2, _ = http_get(f"{proxy['base_url']}/files/proxydemo/{wheel.name}")
     assert code == 200
     assert body2 == body
+
+
+@contextlib.contextmanager
+def _relaunched_proxy(pypiron_bin, data_dir, upstream_base_url):
+    """Start a proxy over an existing data dir. Only a restart clears the 60s
+    in-memory upstream-listing cache, so this is how a test observes an upstream
+    change the same request would otherwise not see for a minute."""
+    port = find_free_port()
+    bind = f"127.0.0.1:{port}"
+    args = [
+        str(pypiron_bin),
+        "serve",
+        "--bind-addr",
+        bind,
+        "--data-dir",
+        str(data_dir),
+        *_DISK_SERVER_CREDS["full"]["args"],
+        "--worker-interval-secs",
+        "1",
+        "--proxy-upstream",
+        upstream_base_url,
+        "--allow-insecure-upstream",
+        "--exclude-newer",
+        "",
+    ]
+    env = os.environ.copy()
+    env.setdefault("RUST_LOG", "info,pypiron=debug")
+    env.setdefault("PYPIRON_ADVISORY_FEED", "")
+    # Logs go to a file: an undrained PIPE fills up and deadlocks the server.
+    with open(data_dir.parent / f"{data_dir.name}-relaunch.log", "w") as log_file:
+        proc = subprocess.Popen(args, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+        try:
+            wait_http_responding(f"http://{bind}/simple/index.json", timeout=20.0)
+            yield {
+                "proc": proc,
+                "base_url": f"http://{bind}",
+                "simple": f"http://{bind}/simple/",
+                **_DISK_SERVER_CREDS["full"]["extra"],
+            }
+        finally:
+            kill_process_tree(proc)
+
+
+def _wait_yanked_upstream(server, package, filename, reason, timeout=15.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        doc = get_index_json(server["simple"], package)
+        if any(f["filename"] == filename and f["yanked"] == reason for f in doc["files"]):
+            return
+        time.sleep(0.2)
+    raise TimeoutError(f"upstream never flagged {filename} yanked")
+
+
+def test_yanked_upstream_file_stays_listed_and_serves_a_pin(
+    tmp_path_factory, pypiron_bin, tmp_path
+):
+    """PEP 592: a file yanked upstream stays *listed*, flagged `data-yanked`, so
+    an exact pin still resolves — exactly what PyPI does and what our own sync
+    reconcile already did. Only the fill is withheld: the yank filter gates
+    fetching new bytes, never the rendering of bytes already cached."""
+    gen = _start_proxy_pair(tmp_path_factory, pypiron_bin)
+    pair = next(gen)
+    try:
+        upstream, proxy = pair["upstream"], pair["proxy"]
+        wheel = make_wheel("yankedpin", "1.0", tmp_path)
+        _upload(upstream, wheel, "yankedpin")
+
+        # Cache it through the proxy while upstream still lists it healthy.
+        code, _, _ = http_get(f"{proxy['base_url']}/files/yankedpin/{wheel.name}")
+        assert code == 200
+        assert (proxy["data_dir"] / "packages" / "yankedpin" / wheel.name).exists()
+
+        # Upstream yanks it. Restart the proxy so it re-reads the listing now
+        # rather than after the cache TTL.
+        kill_process_tree(proxy["proc"])
+        code, _, _ = http_request_auth(
+            "POST",
+            f"{upstream['base_url']}/files/yankedpin/{wheel.name}/yank",
+            data=b"broken release",
+            username=upstream["admin_user"],
+            password=upstream["admin_password"],
+        )
+        assert code == 200
+        _wait_yanked_upstream(upstream, "yankedpin", wheel.name, "broken release")
+
+        with _relaunched_proxy(pypiron_bin, proxy["data_dir"], upstream["base_url"]) as relaunched:
+            # The file is still listed in both renderings, with the yank reason.
+            doc = get_index_json(relaunched["simple"], "yankedpin")
+            entry = next((f for f in doc["files"] if f["filename"] == wheel.name), None)
+            assert entry is not None, f"yanked file must stay listed: {doc['files']}"
+            assert entry["yanked"] == "broken release"
+            code, html, _ = http_get(f"{relaunched['simple']}yankedpin/")
+            assert code == 200
+            assert b'data-yanked="broken release"' in html
+
+            # So `pip install yankedpin==1.0` resolves: the pin downloads the
+            # bytes already cached, instead of "no matching distribution".
+            code, served, _ = http_get(f"{relaunched['base_url']}/files/yankedpin/{wheel.name}")
+            assert code == 200
+            assert hashlib.sha256(served).hexdigest() == sha256_file(wheel)
+
+            # The cached file's companion still serves — from local bytes the
+            # fill already wrote, never a fresh upstream fetch.
+            code, md, _ = http_get(
+                f"{relaunched['base_url']}/files/yankedpin/{wheel.name}.metadata"
+            )
+            assert code == 200
+            assert b"Metadata-Version" in md
+    finally:
+        gen.close()
+
+
+def test_yanked_upstream_file_is_not_newly_cached(tmp_path_factory, pypiron_bin, tmp_path):
+    """The other half of the split: listing a yanked file does not mirror it.
+    A file yanked before anyone asked for it is advertised but never fetched —
+    pulling yanked bytes stays opt-in via `--include-yanked`."""
+    gen = _start_proxy_pair(tmp_path_factory, pypiron_bin)
+    pair = next(gen)
+    try:
+        upstream, proxy = pair["upstream"], pair["proxy"]
+        wheel = make_wheel("yankedcold", "1.0", tmp_path)
+        _upload(upstream, wheel, "yankedcold")
+        code, _, _ = http_request_auth(
+            "POST",
+            f"{upstream['base_url']}/files/yankedcold/{wheel.name}/yank",
+            data=b"withdrawn",
+            username=upstream["admin_user"],
+            password=upstream["admin_password"],
+        )
+        assert code == 200
+        _wait_yanked_upstream(upstream, "yankedcold", wheel.name, "withdrawn")
+
+        doc = get_index_json(proxy["simple"], "yankedcold")
+        entry = next((f for f in doc["files"] if f["filename"] == wheel.name), None)
+        assert entry is not None, f"yanked file must stay listed: {doc['files']}"
+        assert entry["yanked"] == "withdrawn"
+
+        code, _, _ = http_get(f"{proxy['base_url']}/files/yankedcold/{wheel.name}")
+        assert code == 404
+        assert not (proxy["data_dir"] / "packages" / "yankedcold" / wheel.name).exists()
+    finally:
+        gen.close()
+
+
+def test_yanked_upstream_companion_is_not_fetched(tmp_path_factory, pypiron_bin, tmp_path):
+    """The withheld fill covers the PEP 658 companion too. A resolver asking for
+    `<wheel>.metadata` of a yanked file we don't hold must not pull it from
+    upstream — the listing advertises the companion, but nothing about a yanked
+    file gets fetched until `--include-yanked` says so."""
+    gen = _start_proxy_pair(tmp_path_factory, pypiron_bin)
+    pair = next(gen)
+    try:
+        upstream, proxy = pair["upstream"], pair["proxy"]
+        wheel = make_wheel("yankedmeta", "1.0", tmp_path)
+        _upload(upstream, wheel, "yankedmeta")
+        code, _, _ = http_request_auth(
+            "POST",
+            f"{upstream['base_url']}/files/yankedmeta/{wheel.name}/yank",
+            data=b"withdrawn",
+            username=upstream["admin_user"],
+            password=upstream["admin_password"],
+        )
+        assert code == 200
+        _wait_yanked_upstream(upstream, "yankedmeta", wheel.name, "withdrawn")
+
+        # The page advertises the companion, so a 404 below is the yank gate
+        # refusing the fetch — not a wheel that never had metadata.
+        doc = get_index_json(proxy["simple"], "yankedmeta")
+        entry = next(f for f in doc["files"] if f["filename"] == wheel.name)
+        assert entry.get("core-metadata")
+
+        code, _, _ = http_get(f"{proxy['base_url']}/files/yankedmeta/{wheel.name}.metadata")
+        assert code == 404, "an uncached yanked file's companion must not be fetched upstream"
+        pkg_dir = proxy["data_dir"] / "packages" / "yankedmeta"
+        assert not (pkg_dir / wheel.name).exists()
+        assert not (pkg_dir / f"{wheel.name}.metadata").exists()
+    finally:
+        gen.close()
 
 
 def test_metadata_passthrough_does_not_cache_the_wheel(proxy_pair, tmp_path):

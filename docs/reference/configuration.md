@@ -296,7 +296,7 @@ recovery behavior, and operator rules.
 | `--wait-on-upload-secs N` | `PYPIRON_WAIT_ON_UPLOAD_SECS` | `10` | Bound for that wait. |
 | `--access-log` | `PYPIRON_ACCESS_LOG` | `false` | Log reads too, not only mutations. |
 | `--access-log-format structured\|clf` | `PYPIRON_ACCESS_LOG_FORMAT` | `structured` | Structured logs or Combined Log Format. |
-| `--trusted-proxy` | `PYPIRON_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For`/`X-Real-IP` for the logged client IP. Off by default: those headers are client-settable, so ignoring them keeps a direct caller from spoofing its audit-logged address, and the direct peer address is logged instead. Enable only behind a reverse proxy that sets them. |
+| `--trusted-proxy` | `PYPIRON_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For`/`X-Real-IP` for the logged client IP. Off by default: those headers are client-settable, so ignoring them keeps a direct caller from spoofing its audit-logged address, and the direct peer address is logged instead. Enable only behind a reverse proxy that sets them — and behind one, do enable it: otherwise every client shares the proxy's address and five failed logins from anyone lock out every authenticated client behind that proxy. See [Login throttling](../security.md#login-throttling). |
 | `--login-cooldown-secs N` | `PYPIRON_LOGIN_COOLDOWN_SECS` | `300` | Failed-login cooldown. Five failed logins from one address, each within this window of the last, and that address is refused further credential-bearing requests (`429` with `Retry-After`) until the window passes — even with the correct password, so a lucky guess can't be confirmed. Successes are never counted, anonymous requests are never throttled, and IPv6 counts per /64. Enforced per instance. `0` disables. |
 | `--worker-interval-secs N` | `PYPIRON_WORKER_INTERVAL_SECS` | `1` | Index, replication, and bucket-health poll cadence. |
 | `--bucket-leave-failures N` | `PYPIRON_BUCKET_LEAVE_FAILURES` | `3` | Consecutive timeout (including 408), connection, or 5xx failures before selecting the next bucket. |
@@ -414,7 +414,22 @@ Rules:
   hold. `""` disables it.
 - `WHEN` accepts an RFC 3339 timestamp, bare date, bare day count, friendly
   duration (`"30 days"`), or ISO 8601 duration (`P30D`).
-- Yanked files stay out unless `include-yanked = true`.
+- Yanked files aren't fetched unless `include-yanked = true`. A version that
+  gets yanked after you cached it keeps listing, flagged yanked the way PyPI
+  flags it, so a pin on it still installs.
+- On the proxy the package page is upstream's, so it also lists upstream's
+  yanked files you never cached. A pin on one of those resolves and then fails
+  the download — set `include-yanked = true` if you need those fetchable.
+
+**Excludes are a pull gate, not a purge.** They stop future fetches; they don't
+remove what's already stored. A package cached before you excluded it keeps
+listing and keeps downloading, and a version-pinned exclude drops the denied
+versions from new listings while an already-cached file of that version still
+downloads. To be rid of one, delete its files — `DELETE
+/files/<package>/<filename>`, admin credential — and with the exclude in place
+the proxy won't refill them. On multiple buckets that delete is refused for
+anything mirrored from an upstream, cached on demand or pulled by `sync`; see
+[Multiple regions and clouds](#multiple-regions-and-clouds).
 
 ## Sync
 
@@ -551,5 +566,5 @@ pending repairs, not bytes.
 | `/advisories/feed` | read (GET), admin (PUT) | Advisory snapshot: readers pull it (etag-conditioned); an admin pushes a delivered one. |
 | `/tokens` | read/uploader/admin, or open reader token | Mint install tokens. |
 | `/files/.../yank` | admin | Yank a file. |
-| `/files/.../delete` | admin | Delete a file. |
+| `DELETE /files/<pkg>/<file>` | admin | Delete a file. Refused for mirrored files — anything that came from an upstream, cached on demand or pulled by `sync` — when you run more than one bucket. |
 | `/project/<pkg>/status` | admin | Set project status. |

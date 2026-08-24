@@ -30,7 +30,7 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use futures::StreamExt;
 use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::Client;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::app::{AppState, PACKAGES_PREFIX};
 use crate::hash::sha256_hex;
@@ -44,7 +44,7 @@ use crate::sidecar::{
 use crate::simple::{self, SimpleFile};
 use crate::ssrf::{self, Guard, SsrfGuardResolver};
 use crate::storage::Storage;
-use crate::sync::{matches_mirror, ResolvedMirror};
+use crate::sync::{is_yanked, matches_mirror_listing, ResolvedMirror};
 use crate::upload::{FinishedSpool, UploadSpool};
 
 /// How long an upstream package listing (or its absence) is reused before
@@ -555,6 +555,17 @@ impl Proxy {
         Ok(false)
     }
 
+    /// Would `exclude-yanked` refuse to pull this file from upstream? The gate
+    /// is on the *fill*, not the listing: a file yanked upstream stays listed
+    /// (PEP 592) so an exact pin resolves against bytes already cached, while
+    /// nothing new is fetched for it — not the artifact, and not its PEP 658 /
+    /// PEP 740 companions, which would otherwise pass through even though the
+    /// artifact they annotate is refused. Callers return their "nothing here"
+    /// value, which falls through to the local 404.
+    fn fill_refused_by_yank(&self, file: &SimpleFile) -> bool {
+        self.mirror.exclude_yanked && is_yanked(&file.yanked)
+    }
+
     /// Download-verify-commit one artifact on a local miss. `Ok(false)` falls
     /// through to normal serving with nothing newly written — the file was
     /// already cached, isn't upstream (the local 404 is the right answer), or the
@@ -593,6 +604,11 @@ impl Proxy {
         let Some(file) = found.files.iter().find(|f| f.filename == filename) else {
             return Ok(false); // not upstream, or filtered out
         };
+
+        if self.fill_refused_by_yank(file) {
+            debug!(%pkg, %filename, "proxy: refusing to cache a file yanked upstream");
+            return Ok(false);
+        }
 
         // Malware fill refusal: never download-and-cache a version OSV condemns —
         // the server-side twin of uv's pre-sync check, so malware in the feed
@@ -811,6 +827,10 @@ impl Proxy {
         let base = metadata_filename.strip_suffix(METADATA_SUFFIX)?;
         let found = self.listing(state, pkg).await?;
         let file = found.files.iter().find(|f| f.filename == base)?;
+        if self.fill_refused_by_yank(file) {
+            debug!(%pkg, %base, "proxy: refusing the companion of a file yanked upstream");
+            return None;
+        }
         if !file.has_core_metadata() {
             return None;
         }
@@ -872,6 +892,10 @@ impl Proxy {
         let base = provenance_filename.strip_suffix(PROVENANCE_SUFFIX)?;
         let found = self.listing(state, pkg).await?;
         let file = found.files.iter().find(|f| f.filename == base)?;
+        if self.fill_refused_by_yank(file) {
+            debug!(%pkg, %base, "proxy: refusing the companion of a file yanked upstream");
+            return None;
+        }
         let prov_url = file.provenance.as_ref()?;
         self.fetch_provenance_url(pkg, prov_url).await
     }
@@ -1010,7 +1034,11 @@ impl Proxy {
             .into_iter()
             // No digest, no service: every artifact we hand out is verifiable.
             .filter(|f| f.sha256().is_some())
-            .filter(|f| matches_mirror(f, &self.mirror))
+            // Every mirror gate except the yank one: a file yanked upstream stays
+            // listed (with `data-yanked`, PEP 592) so an exact pin against bytes
+            // we already cached still resolves. `exclude-yanked` gates the fill
+            // instead — see `fill_refused_by_yank`.
+            .filter(|f| matches_mirror_listing(f, &self.mirror))
             // The scope's version axis: a pinned/ranged allowlist entry serves
             // only matching versions, exactly as `sync` mirrors only matching
             // versions. No scope → kept.

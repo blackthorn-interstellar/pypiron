@@ -153,7 +153,9 @@
 # exclude-prereleases = false               # drop alpha/beta/rc/dev releases
 # exclude-windows = false                   # drop .exe/.msi and Windows wheels
 # exclude-larger = "250MB"                  # drop artifacts larger than this
-# include-yanked = false                    # yanked files are dropped by default
+# include-yanked = false                    # yanked files aren't fetched by default
+                                            # (a version yanked after you cached it still installs;
+                                            # proxying, an uncached one lists but won't download)
 
 # Dependency cooldown: keep only files first seen upstream before this cutoff,
 # so a freshly published (and quickly yanked) release is held back until it's

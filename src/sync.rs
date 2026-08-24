@@ -2694,16 +2694,44 @@ async fn upload_via_http(
     Ok(true)
 }
 
-pub(crate) fn matches_mirror(file: &SimpleFile, m: &ResolvedMirror) -> bool {
-    matches_mirror_inner(file, m, false)
+/// Gates one caller lifts from the mirror predicate. Everything is enforced by
+/// default; each field exists for exactly one caller, documented there.
+#[derive(Clone, Copy, Default)]
+struct Lift {
+    /// Lift the `--exclude-newer` upper bound — the sync watermark asks "would
+    /// this file be selected once it ages past the cooldown?".
+    newer: bool,
+    /// Lift the yank gate — the proxy's *listing* render keeps yanked files
+    /// listed (PEP 592) while `exclude-yanked` still gates the fill.
+    yanked: bool,
 }
 
-/// The real mirror predicate. `ignore_newer` lifts the `--exclude-newer` bound
-/// only — the sync watermark uses it to ask "would this file be selected once it
-/// ages past the cooldown?" without re-deriving (and risking drift from) every
-/// other gate. Public callers go through [`matches_mirror`] (`ignore_newer =
-/// false`), which is byte-identical to the old behaviour.
-fn matches_mirror_inner(file: &SimpleFile, m: &ResolvedMirror, ignore_newer: bool) -> bool {
+pub(crate) fn matches_mirror(file: &SimpleFile, m: &ResolvedMirror) -> bool {
+    matches_mirror_inner(file, m, Lift::default())
+}
+
+/// The mirror predicate as the proxy's *listing* render needs it: every gate
+/// except the yank one. PEP 592 keeps a yanked file listed (with `data-yanked`)
+/// so an exact pin still resolves — PyPI does this, and so does our own sync
+/// reconcile. `exclude-yanked` still gates the fill (see
+/// `Proxy::fill_refused_by_yank`), so listing a yanked file never pulls its
+/// bytes — artifact or companion — from upstream.
+pub(crate) fn matches_mirror_listing(file: &SimpleFile, m: &ResolvedMirror) -> bool {
+    matches_mirror_inner(
+        file,
+        m,
+        Lift {
+            yanked: true,
+            ..Lift::default()
+        },
+    )
+}
+
+/// The real mirror predicate; `lift` relaxes individual gates for the callers
+/// documented on [`Lift`], so neither re-derives (and risks drifting from) the
+/// rest of them. Public callers go through [`matches_mirror`] (nothing lifted),
+/// which is byte-identical to the old behaviour.
+fn matches_mirror_inner(file: &SimpleFile, m: &ResolvedMirror, lift: Lift) -> bool {
     let fname = file.filename.to_ascii_lowercase();
     let format = file_format(&fname);
     let is_wheel = format == Format::Wheel;
@@ -2712,10 +2740,11 @@ fn matches_mirror_inner(file: &SimpleFile, m: &ResolvedMirror, ignore_newer: boo
         return false;
     }
 
-    // Yank and size gate every file. A file yanked upstream (PEP 592) is dropped;
-    // a file larger than the ceiling is dropped, but one whose size is missing
-    // from the listing is kept (we can't prove it exceeds).
-    if m.exclude_yanked && is_yanked(&file.yanked) {
+    // Yank and size gate every file. A file yanked upstream (PEP 592) is dropped
+    // unless the caller lifted the gate to keep it listed; a file larger than the
+    // ceiling is dropped, but one whose size is missing from the listing is kept
+    // (we can't prove it exceeds).
+    if m.exclude_yanked && !lift.yanked && is_yanked(&file.yanked) {
         return false;
     }
     if let Some(max) = m.exclude_larger {
@@ -2743,9 +2772,9 @@ fn matches_mirror_inner(file: &SimpleFile, m: &ResolvedMirror, ignore_newer: boo
     // don't drop a release just because upstream omitted the timestamp (a mirror
     // favours completeness, and it sidesteps a sticky empty-mirror trap against
     // upstreams that don't carry PEP 700 `upload-time`). The gates only ever act
-    // on files we can place in time. `ignore_newer` lifts the upper bound for the
+    // on files we can place in time. `lift.newer` drops the upper bound for the
     // watermark probe.
-    let newer = if ignore_newer { None } else { m.exclude_newer };
+    let newer = if lift.newer { None } else { m.exclude_newer };
     if newer.is_some() || m.exclude_older.is_some() {
         if let Some(uploaded) = file
             .upload_time
@@ -2839,7 +2868,15 @@ fn held_back_by_newer(file: &SimpleFile, m: &ResolvedMirror) -> Option<OffsetDat
     if uploaded < cutoff.instant() {
         return None; // already past the cooldown w.r.t. the newer bound
     }
-    matches_mirror_inner(file, m, true).then_some(uploaded)
+    matches_mirror_inner(
+        file,
+        m,
+        Lift {
+            newer: true,
+            ..Lift::default()
+        },
+    )
+    .then_some(uploaded)
 }
 
 fn tokens_match_any(tokens: &[String], filters: &[String]) -> bool {
@@ -2931,7 +2968,7 @@ fn is_prerelease_version(version: &str) -> bool {
 
 /// True if a file is yanked upstream (PEP 592): anything but an explicit
 /// `false`. A bare `true` or any reason string counts as yanked.
-fn is_yanked(yanked: &Yanked) -> bool {
+pub(crate) fn is_yanked(yanked: &Yanked) -> bool {
     !matches!(yanked, Yanked::Flag(false))
 }
 
@@ -3427,6 +3464,26 @@ mod tests {
             &f
         ));
         assert!(matches_mirror(&with_yank(Yanked::Flag(false)), &f));
+
+        // The proxy's listing render lifts only this gate: yanked files stay
+        // listed (PEP 592), every other gate still applies.
+        assert!(matches_mirror_listing(&with_yank(Yanked::Flag(true)), &f));
+        assert!(matches_mirror_listing(
+            &with_yank(Yanked::Reason("CVE-2024-1".into())),
+            &f
+        ));
+        let wheels_only = ResolvedMirror {
+            exclude_yanked: true,
+            include_format: vec![Format::Wheel],
+            ..base_filter()
+        };
+        assert!(!matches_mirror_listing(
+            &SimpleFile {
+                yanked: Yanked::Flag(true),
+                ..named_file("foo-1.0.tar.gz")
+            },
+            &wheels_only
+        ));
     }
 
     #[test]

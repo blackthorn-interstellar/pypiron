@@ -21,14 +21,15 @@
 //! under steady load an index rarely changes second-to-second, so the herd's
 //! dominant cost — re-gzip + re-SHA of identical bytes, every TTL — disappears.
 //! Invalidation stays a hard drop: no stale-while-revalidate shortcut survives
-//! it, so a same-process rebuild is visible the instant it lands.
+//! it, so a same-process rebuild is visible the instant it lands — bar a fill
+//! already in flight, which can re-insert once (see [`IndexCache::invalidate`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::storage::{is_not_found, Storage};
@@ -59,7 +60,9 @@ enum Cached {
         /// the hot path serves gzip with zero per-request CPU. None for
         /// bodies too small or too incompressible to bother. The cost isn't
         /// zero everywhere: "fill time" is itself a request, so the one that
-        /// misses pays the compression inline before anyone gets the variant.
+        /// misses waits out the compression before anyone gets the variant.
+        /// It waits off the cache lock, and for a body past
+        /// [`GZIP_OFFLOAD_MIN_BYTES`] off the runtime's request threads too.
         gzip: Option<Variant>,
     },
     Missing,
@@ -97,6 +100,14 @@ impl Cached {
 
 /// Below this, gzip headers cost more than they save.
 const GZIP_MIN_BYTES: usize = 1024;
+/// At or above this, hashing + gzipping a fill runs on the blocking pool
+/// instead of inline. A full-PyPI root index is tens of MB and takes ~1s to
+/// compress; a burn that long on a request-serving thread stalls every other
+/// future queued behind it (tokio doesn't preempt a running task), which on a
+/// small box is a visible fraction of the whole runtime. Ordinary package
+/// indexes are kilobytes and stay inline — a hop to another thread would cost
+/// more than the work.
+const GZIP_OFFLOAD_MIN_BYTES: usize = 1024 * 1024;
 /// Keep the variant only if it actually pays: ≤90% of the original.
 const GZIP_KEEP_RATIO_PCT: usize = 90;
 
@@ -365,19 +376,30 @@ impl IndexCache {
         // error, or unwind — so a failed load never strands the key as forever
         // refilling (which would pin every later read to the stale entry). A
         // cold miss claimed nothing, so it arms no guard. Declared before the
-        // lock below so, on the error return, the lock drops first and the
-        // guard re-locks a free mutex.
+        // lock below so it never re-locks a mutex this scope still holds.
         let _guard = claimed.then(|| RefillGuard::new(&self.entries, key));
 
         let loaded = storage.get_bytes(key).await;
 
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.reconcile_generation(generation);
+        // Hash and gzip *before* taking the lock. `stale` was already cloned out
+        // under the earlier lock, so the build needs nothing the mutex protects,
+        // and on a full-PyPI mirror the root index is tens of MB — a second of
+        // compression here would block every other index read on the node.
+        // Bodies big enough to be that second go to the blocking pool too, so
+        // they don't hold a request-serving thread either.
         let cached = match loaded {
+            Ok(bytes) if bytes.len() >= GZIP_OFFLOAD_MIN_BYTES => {
+                tokio::task::spawn_blocking(move || reuse_or_build(stale.as_ref(), bytes))
+                    .await
+                    .context("compressing a fetched index")?
+            }
             Ok(bytes) => reuse_or_build(stale.as_ref(), bytes),
             Err(e) if is_not_found(&e) => Cached::Missing,
             Err(e) => return Err(e),
         };
+
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.reconcile_generation(generation);
         entries.insert(
             key.to_string(),
             Entry {
@@ -390,10 +412,18 @@ impl IndexCache {
         Ok(cached.into_pair())
     }
 
-    /// Drop a key after writing or deleting its index — same-process reads
-    /// are fresh immediately, without waiting out the TTL. A hard drop: the
-    /// entry is gone, so the next read reloads it; there is no stale-while-
-    /// revalidate path that could keep serving the old bytes past this point.
+    /// Drop a key after writing or deleting its index — same-process reads are
+    /// fresh immediately, without waiting out the TTL. A hard drop: the entry is
+    /// gone, so the next read reloads it, and no stale-while-revalidate path
+    /// keeps serving the old bytes.
+    ///
+    /// The honest bound: a fill already in flight fetched its bytes *before*
+    /// this drop and still inserts them when it finishes, so the dropped
+    /// content can reappear once — for as long as that fill has left to run,
+    /// which is its remaining storage read plus its hash+gzip (for a multi-MB
+    /// index the compression is the larger half). It self-heals rather than
+    /// sticking: the re-inserted entry expires one TTL later and the read after
+    /// that reloads the current bytes.
     pub fn invalidate(&self, key: &str) {
         self.entries
             .lock()
@@ -924,6 +954,56 @@ mod tests {
             id1.body.as_ptr(),
             id2.body.as_ptr(),
             "identity buffer must be the same allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn above_threshold_fills_behave_identically() {
+        // At or above GZIP_OFFLOAD_MIN_BYTES the hash+gzip runs on the blocking
+        // pool rather than inline, so a full-PyPI root index can't burn a second
+        // of a request-serving thread. The hop must be invisible: same variants
+        // on the cold fill, same reuse on an unchanged refill.
+        //
+        // What this pins is that equivalence at an above-threshold size — it
+        // passes whether or not the offload arm exists, and earns its keep by
+        // being the only test that runs a fill through it at all.
+        let storage = InMemStorage::default();
+        let body = b"{\"name\": \"pkg\", \"files\": []}\n".repeat(50_000);
+        assert!(
+            body.len() >= GZIP_OFFLOAD_MIN_BYTES,
+            "test body must cross the offload threshold"
+        );
+        storage.insert("simple/index.json", body.clone());
+        let cache = IndexCache::new(Duration::from_millis(10));
+
+        let (id1, gz1) = cache
+            .get(&storage, "simple/index.json", 0)
+            .await
+            .unwrap()
+            .unwrap();
+        let gz1 = gz1.expect("a compressible multi-MB index must get a gzip variant");
+        assert_eq!(id1.body, body, "identity body must round-trip unchanged");
+        assert_eq!(
+            id1.etag,
+            quoted_sha256(&body),
+            "ETag is the SHA-256 of the bytes, offloaded or not"
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await; // lapse the TTL
+        let (id2, gz2) = cache
+            .get(&storage, "simple/index.json", 0)
+            .await
+            .unwrap()
+            .unwrap();
+        let gz2 = gz2.expect("gzip variant must survive an unchanged refill");
+        assert!(
+            Arc::ptr_eq(&id1.etag, &id2.etag),
+            "an unchanged refill must reuse the ETag across the blocking hop"
+        );
+        assert_eq!(
+            gz1.body.as_ptr(),
+            gz2.body.as_ptr(),
+            "an unchanged refill must reuse the gzip buffer, offloaded or not"
         );
     }
 

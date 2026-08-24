@@ -87,7 +87,11 @@ pub struct SyncArgs {
 
     /// Password for an authenticated source index. Prefer the
     /// `PYPIRON_SYNC_SOURCE_PASS` env var over the CLI. Requires `--source-user`.
-    #[arg(long = "source-pass", env = "PYPIRON_SYNC_SOURCE_PASS")]
+    #[arg(
+        long = "source-pass",
+        env = "PYPIRON_SYNC_SOURCE_PASS",
+        hide_env_values = true
+    )]
     pub source_pass: Option<String>,
 
     /// Destination pypiron base URL. Sync mirrors over HTTP: each file is POSTed
@@ -101,7 +105,7 @@ pub struct SyncArgs {
     pub admin_user: Option<String>,
 
     /// Admin password for the destination (mirroring is admin-only).
-    #[arg(long, env = "PYPIRON_SYNC_ADMIN_PASS")]
+    #[arg(long, env = "PYPIRON_SYNC_ADMIN_PASS", hide_env_values = true)]
     pub admin_pass: Option<String>,
 
     /// Refuse to mirror names inside this private namespace (PEP 503-normalized)

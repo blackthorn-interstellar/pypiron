@@ -158,7 +158,7 @@ pub struct StorageArgs {
     pub azure_account: Option<String>,
 
     /// Azure storage account access key. Enables presigned (SAS) URLs.
-    #[arg(long, env = "PYPIRON_AZURE_ACCESS_KEY")]
+    #[arg(long, env = "PYPIRON_AZURE_ACCESS_KEY", hide_env_values = true)]
     pub azure_access_key: Option<String>,
 
     /// Azure endpoint URL (for a local emulator such as Azurite)

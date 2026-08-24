@@ -4,6 +4,7 @@ global flags only. Serve-specific flags live under `pypiron serve --help`."""
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -178,3 +179,98 @@ def test_healthcheck_unreachable_exits_nonzero(pypiron_bin: Path):
     cp = _run(pypiron_bin, "healthcheck", "--url", f"http://127.0.0.1:{dead_port}/health")
     assert cp.returncode != 0, "expected nonzero exit for an unreachable server"
     assert "health probe" in cp.stderr.lower(), cp.stderr
+
+
+# `--help` renders every flag's env var. For a credential that means the running
+# secret gets printed to whatever captured the help — a CI log, a screen share, a
+# bug report. clap hides the value (not the name) with `hide_env_values`; this
+# pins that every credential env var has it.
+
+# env var -> the value exported while the help is rendered. Each is unique so a
+# failure names the exact leaking var.
+CREDENTIAL_ENV = {
+    "PYPIRON_ADMIN_PASS": "leaked-admin-pass",
+    "PYPIRON_UPLOADER_PASS": "leaked-uploader-pass",
+    "PYPIRON_READ_PASS": "leaked-read-pass",
+    "PYPIRON_TOKEN_SIGNING_KEY": "leaked-signing-key",
+    "PYPIRON_AUTH": "leaked-user:leaked-auth-pass",
+    "PYPIRON_SYNC_SOURCE_PASS": "leaked-source-pass",
+    "PYPIRON_SYNC_ADMIN_PASS": "leaked-sync-admin-pass",
+    "PYPIRON_AZURE_ACCESS_KEY": "leaked-azure-key",
+}
+
+# A clap `Commands:` entry: exactly two spaces of indent, then the verb.
+# Wrapped description lines are indented further, so they don't match.
+_SUBCOMMAND_RE = re.compile(r"^  ([a-z][a-z0-9-]*)(?:\s|$)")
+
+
+def _help_paths(bin_path: Path, path: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
+    """Every `--help` reachable from `path`, walking nested subcommands.
+
+    Discovered rather than listed so a subcommand added later is covered without
+    anyone remembering to extend this test.
+    """
+    cp = _run(bin_path, *path, "--help")
+    out = cp.stdout + cp.stderr
+    found = [(*path, name) for name in _subcommand_names(out) if name != "help"]
+    return [path, *(p for child in found for p in _help_paths(bin_path, child))]
+
+
+def _subcommand_names(help_text: str) -> list[str]:
+    names: list[str] = []
+    in_commands = False
+    for line in help_text.splitlines():
+        if line.startswith("Commands:"):
+            in_commands = True
+            continue
+        if in_commands:
+            if not line.strip():
+                break
+            m = _SUBCOMMAND_RE.match(line)
+            if m:
+                names.append(m.group(1))
+    return names
+
+
+def test_help_never_prints_credential_env_values(pypiron_bin: Path, monkeypatch):
+    """No `--help` anywhere in the CLI echoes a credential's current value."""
+    for var, value in CREDENTIAL_ENV.items():
+        monkeypatch.setenv(var, value)
+
+    paths = _help_paths(pypiron_bin)
+    # The walk found the real tree, not an empty list that vacuously passes.
+    assert ("serve",) in paths, paths
+    assert ("create-token",) in paths, paths
+    assert ("sync",) in paths, paths
+
+    for path in paths:
+        cp = _run(pypiron_bin, *path, "--help")
+        out = cp.stdout + cp.stderr
+        for var, value in CREDENTIAL_ENV.items():
+            assert value not in out, (
+                f"`pypiron {' '.join((*path, '--help'))}` printed the value of {var}:\n{out}"
+            )
+
+
+def test_help_still_names_credential_env_vars(pypiron_bin: Path, monkeypatch):
+    """Hiding the value must not hide the var — operators need to know the knob
+    exists and what to export."""
+    for var, value in CREDENTIAL_ENV.items():
+        monkeypatch.setenv(var, value)
+
+    expected = {
+        ("serve",): (
+            "PYPIRON_ADMIN_PASS",
+            "PYPIRON_UPLOADER_PASS",
+            "PYPIRON_READ_PASS",
+            "PYPIRON_TOKEN_SIGNING_KEY",
+            "PYPIRON_AZURE_ACCESS_KEY",
+        ),
+        ("create-token",): ("PYPIRON_AUTH",),
+        ("sync",): ("PYPIRON_SYNC_SOURCE_PASS", "PYPIRON_SYNC_ADMIN_PASS"),
+    }
+    for path, variables in expected.items():
+        cp = _run(pypiron_bin, *path, "--help")
+        out = cp.stdout + cp.stderr
+        for var in variables:
+            assert var in out, f"`pypiron {' '.join(path)} --help` lost {var}:\n{out}"

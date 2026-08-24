@@ -188,7 +188,7 @@ pub struct CreateTokenArgs {
 
     /// Credential to authenticate the mint request, as `user:pass`. Omit on an
     /// open (public-read) server when requesting a reader token.
-    #[arg(long, env = "PYPIRON_AUTH")]
+    #[arg(long, env = "PYPIRON_AUTH", hide_env_values = true)]
     auth: Option<String>,
 
     /// Override the auto-detected repository URL (`git remote get-url origin`).
@@ -946,7 +946,7 @@ pub struct ServeArgs {
     pub(crate) read_user: Option<String>,
 
     /// Read credential password (see --read-user).
-    #[arg(long, env = "PYPIRON_READ_PASS")]
+    #[arg(long, env = "PYPIRON_READ_PASS", hide_env_values = true)]
     pub(crate) read_pass: Option<String>,
 
     /// Secret key for signing short-lived install tokens. When set, clients may
@@ -954,7 +954,7 @@ pub struct ServeArgs {
     /// username `__token__`); when unset, token minting and verification are
     /// disabled. Tokens are stateless — the key must be identical across nodes,
     /// like the other credentials. Generate with e.g. `openssl rand -hex 32`.
-    #[arg(long, env = "PYPIRON_TOKEN_SIGNING_KEY")]
+    #[arg(long, env = "PYPIRON_TOKEN_SIGNING_KEY", hide_env_values = true)]
     pub(crate) token_signing_key: Option<String>,
 
     /// Serve unknown (non-private) packages on demand from this upstream

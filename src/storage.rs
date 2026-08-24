@@ -3758,6 +3758,11 @@ pub mod test_support {
         /// that returns `false`, and callers that confuse the two free things
         /// they should have left alone.
         unreadable: Mutex<Option<String>>,
+        /// One prefix whose *listings* fail until [`InMemStorage::heal_lists`].
+        /// Its own hazard class again: a listing that errors is not an empty
+        /// listing, and code that reads "I saw nothing there" out of "I could
+        /// not look" decides on a set it never observed.
+        unlistable: Mutex<Option<String>>,
         /// One key whose *mutations* fail until [`InMemStorage::heal_writes`].
         /// The mirror of `unreadable`, and its own hazard class: a write that
         /// errors AFTER the caller has already moved in-memory state or other
@@ -3804,6 +3809,21 @@ pub mod test_support {
         }
         fn unreadable(&self, key: &str) -> bool {
             self.unreadable.lock().unwrap().as_deref() == Some(key)
+        }
+        /// Make every listing at or under `prefix` fail until
+        /// [`InMemStorage::heal_lists`].
+        pub fn fail_lists_of(&self, prefix: &str) {
+            *self.unlistable.lock().unwrap() = Some(prefix.to_string());
+        }
+        pub fn heal_lists(&self) {
+            *self.unlistable.lock().unwrap() = None;
+        }
+        fn unlistable(&self, prefix: &str) -> bool {
+            self.unlistable
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|failing| prefix.starts_with(failing))
         }
         /// Make every write (and delete) of `key` fail until
         /// [`InMemStorage::heal_writes`].
@@ -3937,6 +3957,9 @@ pub mod test_support {
             Ok(())
         }
         async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+            if self.unlistable(prefix) {
+                anyhow::bail!("injected storage failure");
+            }
             self.lists.fetch_add(1, Ordering::SeqCst);
             let map = self.objects.lock().unwrap();
             let mut out: Vec<ObjectMeta> = map

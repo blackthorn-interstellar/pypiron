@@ -24,7 +24,12 @@
 //! reconciles the fleet *before* it appends ([`catch_up_fleet`]): links are copied
 //! in whichever direction lacks them, so the write pin's head is the fleet head by
 //! the time a link is written and a leader that just failed over cannot re-use a
-//! seq a peer already spent. The append itself is a create-if-absent CAS on a
+//! seq a peer already spent. When a pass cannot establish that — a chain it could
+//! not list, or a copy onto the pin that did not finish — it appends nothing and
+//! carries the delta to the next audit: a checkpoint that waits is repairable, and
+//! a fork written on a head nobody could vouch for is not.
+//!
+//! The append itself is a create-if-absent CAS on a
 //! deterministic arbiter (the first reachable bucket in config order), and a
 //! leader that loses that CAS adopts the winner and appends again at the next seq
 //! rather than dropping its delta — a dropped delta leaves the chain committing an
@@ -42,7 +47,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -136,8 +141,14 @@ async fn chain_seqs(storage: &dyn Storage) -> Result<BTreeSet<u64>> {
 pub struct FleetChain {
     /// Positions in the fleet, config order, of every bucket whose chain this pass
     /// could read and found consistent with the write pin's — the buckets the next
-    /// link may be created on. The first is the append arbiter. Empty when even the
-    /// pin's own chain could not be listed.
+    /// link may be created on. The first is the append arbiter.
+    ///
+    /// Empty means *append nothing this pass*. That is the verdict whenever this
+    /// pass could not establish that the pin's head is the fleet head: a chain it
+    /// could not list (the pin's or any peer's), or a pull onto the pin that did
+    /// not finish. A head nobody vouched for is exactly how a second link gets
+    /// written at a seq a peer already spent, and that fork is permanent —
+    /// deferring the checkpoint is not.
     pub in_sync: Vec<usize>,
 }
 
@@ -168,9 +179,31 @@ pub struct FleetChain {
 /// a tamper witness that picked a winner and re-chained the loser would be
 /// laundering exactly what it exists to catch.
 ///
-/// Best-effort throughout: a peer that cannot be read or written is simply left
-/// for the next audit. It runs every audit regardless of churn, so an idle fleet
-/// still converges, and in single-bucket mode it is one listing.
+/// Best-effort in one direction only, and the asymmetry is the whole point. A
+/// *push* that fails leaves the peer behind, which the append already tolerates
+/// — it receives the new link and the hole backfills next pass — so the peer is
+/// warned about and kept an arbiter candidate, and one transient write error
+/// cannot move the arbiter out from under the fleet. Everything else fails
+/// closed, reporting no in-sync buckets at all: a peer whose chain cannot be
+/// listed (its head is then unknown, so the pin's cannot be called the fleet
+/// head), and a *pull* that did not finish (this bucket is then knowingly short
+/// of links a peer already spent). Both used to be waved through, and both wrote
+/// the next link at a spent seq — a permanent `chain-diverged` that no later
+/// pass repairs, traded for a checkpoint that merely waits.
+///
+/// "The fleet" is the *eligible* fleet and no more: `buckets` is what
+/// [`AppState::singleton_replicas`] handed over, which already drops buckets the
+/// health tracker evicted and is empty on a topology-fenced node. So the fail-closed
+/// rule binds only to buckets this node still counts — an evicted one is not
+/// waited for, and the append proceeds without it. That bounds the stall (a
+/// bucket that stays broken stops blocking once it is evicted) and it is also
+/// the hole: the chain such a bucket holds is not consulted, so a leader here can
+/// spend a seq it already used. See the transparency entry in `private/ROADMAP.md`.
+///
+/// It runs every audit regardless of churn, so an idle fleet still converges,
+/// and in single-bucket mode it is one listing.
+///
+/// [`AppState::singleton_replicas`]: crate::app::AppState::singleton_replicas
 pub async fn catch_up_fleet(
     buckets: &[crate::layout::ReplicaTarget<'_>],
     primary: usize,
@@ -186,17 +219,26 @@ pub async fn catch_up_fleet(
         }
     };
     let mut in_sync = vec![primary];
+    // Deferring the append is decided at the end, not on the spot: reconciling
+    // the rest of the fleet is still worth doing (every copy is create-if-absent
+    // and none of them can fork), and a peer that only this node can reach must
+    // not be starved of links because an earlier one in config order went quiet.
+    let mut defer = false;
     for (position, peer) in buckets.iter().enumerate() {
         if position == primary {
             continue;
         }
-        // Reachability is the head read, deliberately: a peer we could read but
-        // then failed to copy to stays an arbiter candidate, so one transient
-        // write error cannot silently move the arbiter out from under the fleet.
+        // A peer we cannot list is a peer whose head we do not know, and this
+        // pass's one claim — that the pin's head is the fleet head — is exactly
+        // what an unknown head denies. Skipping it here (it arbitrates nothing,
+        // it is copied nothing) still left the append free to spend a seq the
+        // silent peer had already used under different bytes, discovered only
+        // when it came back. Defer instead.
         let theirs = match chain_seqs(peer.storage).await {
             Ok(seqs) => seqs,
             Err(e) => {
-                warn!(bucket = %peer.name, error = ?e, "transparency: listing a peer's chain failed; retries next audit");
+                warn!(bucket = %peer.name, error = ?e, "transparency: listing a peer's chain failed; its head is unknown, so the checkpoint is deferred this pass");
+                defer = true;
                 continue;
             }
         };
@@ -204,11 +246,17 @@ pub async fn catch_up_fleet(
             Ok(CatchUp::Synced) => in_sync.push(position),
             // Forked: warned inside, written to by nobody, arbitrates nothing.
             Ok(CatchUp::Forked) => {}
+            // Only a failure that leaves THIS bucket short reaches here (a copy
+            // toward the peer is swallowed inside). Its head is therefore not
+            // the fleet head, and appending on it would fork the chain.
             Err(e) => {
-                warn!(bucket = %peer.name, error = ?e, "transparency: chain catch-up to a peer failed; retries next audit");
-                in_sync.push(position);
+                warn!(bucket = %peer.name, error = ?e, "transparency: this bucket's own chain catch-up did not complete; checkpoint deferred this pass");
+                defer = true;
             }
         }
+    }
+    if defer {
+        return FleetChain::default();
     }
     in_sync.sort_unstable();
     FleetChain { in_sync }
@@ -218,6 +266,8 @@ pub async fn catch_up_fleet(
 #[derive(Debug, PartialEq, Eq)]
 enum CatchUp {
     /// The peer holds this chain (after any copying) — a valid append target.
+    /// Also the verdict for a peer left *behind* by a copy that failed: it holds
+    /// a prefix of this chain and nothing else, which the append tolerates.
     Synced,
     /// The peer holds a different link at a seq the primary also holds.
     Forked,
@@ -227,6 +277,12 @@ enum CatchUp {
 /// side's missing links to the other, oldest first so neither chain grows a hole
 /// it did not already have. `ours` is the primary's seq set and gains whatever is
 /// pulled, so a later peer in the same pass is compared against the full chain.
+///
+/// `Err` is reserved for a failure that leaves the *primary* unable to claim the
+/// fleet head — an unfinished pull, or a fork probe that could not be read — and
+/// the caller turns it into "append nothing this pass". A failure copying toward
+/// the peer is not that: it is warned about here and reported `Synced`, leaving
+/// the peer an arbiter candidate exactly as before.
 async fn catch_up_replica(
     primary: &crate::layout::ReplicaTarget<'_>,
     replica: &crate::layout::ReplicaTarget<'_>,
@@ -259,16 +315,45 @@ async fn catch_up_replica(
             .get_bytes(&chain_key(seq))
             .await
             .with_context(|| format!("reading chain link {seq} from bucket {}", replica.name))?;
-        copy_link(primary, seq, &bytes).await?;
+        // A divergence here is this bucket's own chain contradicting the link we
+        // just pulled — a rival leader wrote our missing seq while we worked.
+        // Counting it as ours (what a swallowed fork did) would claim a head we
+        // do not hold, so the whole pass defers rather than append on it.
+        if copy_link(primary, seq, &bytes).await? == Copied::Diverged {
+            bail!(
+                "chain link {seq} from bucket {} contradicts the link bucket {} already holds \
+                 at that seq",
+                replica.name,
+                primary.name
+            );
+        }
         ours.insert(seq);
     }
+    // Pushing is the direction that can fail without costing this pass anything:
+    // the peer stays on a prefix of our chain, which is a state the append
+    // already handles (it takes the new link and the hole backfills next pass).
+    // Stopping at the first failure keeps the copies oldest-first — the rest of
+    // the run would only widen the gap it already left.
     for seq in push {
-        let bytes = primary
-            .storage
-            .get_bytes(&chain_key(seq))
-            .await
-            .with_context(|| format!("reading chain link {seq} from bucket {}", primary.name))?;
-        copy_link(replica, seq, &bytes).await?;
+        let bytes = match primary.storage.get_bytes(&chain_key(seq)).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(seq, bucket = %primary.name, error = ?e, "transparency: could not read our own chain link to copy it out; the peer stays behind and retries next audit");
+                break;
+            }
+        };
+        match copy_link(replica, seq, &bytes).await {
+            Ok(Copied::Landed) => {}
+            // The peer gained a rival link at this seq since we listed it. It is
+            // a branch, not a lagging copy: nothing more goes to it, and it must
+            // not arbitrate — an append there would splice our suffix onto its
+            // prefix, which is the one thing catch-up may never do.
+            Ok(Copied::Diverged) => return Ok(CatchUp::Forked),
+            Err(e) => {
+                warn!(seq, bucket = %replica.name, error = ?e, "transparency: copying a chain link to a peer failed; the peer stays behind and retries next audit");
+                break;
+            }
+        }
     }
     Ok(CatchUp::Synced)
 }
@@ -318,7 +403,7 @@ pub(crate) async fn copy_link(
     dst: &crate::layout::ReplicaTarget<'_>,
     seq: u64,
     bytes: &[u8],
-) -> Result<()> {
+) -> Result<Copied> {
     let key = chain_key(seq);
     let taken = dst
         .storage
@@ -340,9 +425,24 @@ pub(crate) async fn copy_link(
                  seq; left as it stands. verify-chain reports it; resolving it is an \
                  out-of-band operator decision"
             );
+            return Ok(Copied::Diverged);
         }
     }
-    Ok(())
+    Ok(Copied::Landed)
+}
+
+/// What a create-if-absent copy found at the destination's seq.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Copied {
+    /// The link is on the destination — written by this copy, or already there
+    /// byte for byte.
+    Landed,
+    /// The destination already holds *different* bytes at that seq: two branches
+    /// of one history, and nothing was written. Reporting it is the point — a
+    /// swallowed divergence let the peer stay an append target (so the next link
+    /// grafted this branch's suffix onto that one's prefix) and let a pull count
+    /// a seq as ours that we hold under other bytes.
+    Diverged,
 }
 
 /// Apply deltas in order to reconstruct the expected `(package → file→sha)`
@@ -1114,6 +1214,182 @@ mod tests {
             held_seqs(&peer).await,
             vec![0, 1, 2],
             "the hole below the peer's head must be backfilled"
+        );
+    }
+
+    /// [`catch_up_replica`] driven with the seq sets a pass *listed*, which is
+    /// not always what the buckets hold by the time it copies — that window is
+    /// the whole reason the copies are create-if-absent.
+    async fn catch_up_as_listed(
+        primary: &InMemStorage,
+        peer: &InMemStorage,
+        ours: &[u64],
+        theirs: &[u64],
+    ) -> Result<CatchUp> {
+        let mut ours: BTreeSet<u64> = ours.iter().copied().collect();
+        let theirs: BTreeSet<u64> = theirs.iter().copied().collect();
+        let pin = crate::layout::ReplicaTarget {
+            storage: primary,
+            name: "bucket-a",
+        };
+        let replica = crate::layout::ReplicaTarget {
+            storage: peer,
+            name: "bucket-b",
+        };
+        catch_up_replica(&pin, &replica, &mut ours, &theirs).await
+    }
+
+    /// A peer that gained a rival link at a seq we were about to push is a
+    /// branch, not a lagging copy. The copy itself always refused to overwrite
+    /// it — but reporting that refusal as "synced" left the peer an append
+    /// target, and the next link grafted this branch's suffix onto that one's
+    /// prefix: a fork built by the very path that exists to refuse splicing.
+    #[tokio::test]
+    async fn a_peer_that_gained_a_rival_link_since_the_listing_is_forked_not_synced() {
+        let ours = chain_of(3, "left");
+        let theirs = fork_of(&ours, 2, "right");
+        let primary = InMemStorage::default();
+        let peer = InMemStorage::default();
+        seed_chain(&primary, &ours, &[0, 1, 2]);
+        seed_chain(&peer, &theirs, &[0, 1, 2]);
+
+        // What this pass listed: the peer had not written its own seq 2 yet.
+        let outcome = catch_up_as_listed(&primary, &peer, &[0, 1, 2], &[0, 1])
+            .await
+            .expect("a refused copy is a verdict, not a failure");
+
+        assert_eq!(
+            outcome,
+            CatchUp::Forked,
+            "a rival link at a seq we tried to push must disqualify the peer, not pass as synced"
+        );
+        assert_eq!(
+            peer.get_bytes(&chain_key(2)).await.unwrap(),
+            theirs[2],
+            "the peer's own link must stand exactly as its branch wrote it"
+        );
+    }
+
+    /// The mirror image, and the worse one: a link pulled from a peer lands on a
+    /// seq this bucket already holds under other bytes. Counting it as ours (the
+    /// old swallow) claimed a head we do not hold, and the append numbered off
+    /// it. There is no head to vouch for here, so the pass defers.
+    #[tokio::test]
+    async fn a_pull_onto_a_seq_we_hold_under_other_bytes_defers_the_checkpoint() {
+        let ours = chain_of(3, "left");
+        let theirs = fork_of(&ours, 2, "right");
+        let primary = InMemStorage::default();
+        let peer = InMemStorage::default();
+        seed_chain(&primary, &ours, &[0, 1, 2]);
+        seed_chain(&peer, &theirs, &[0, 1, 2]);
+
+        // What this pass listed: our own seq 2 had not landed yet.
+        let outcome = catch_up_as_listed(&primary, &peer, &[0, 1], &[0, 1, 2]).await;
+
+        assert!(
+            outcome.is_err(),
+            "a pulled link contradicting our own must defer the pass, not be counted as ours"
+        );
+        assert_eq!(
+            primary.get_bytes(&chain_key(2)).await.unwrap(),
+            ours[2],
+            "our own link must stand exactly as this branch wrote it"
+        );
+    }
+
+    /// Two buckets in config order, the first being the write pin.
+    fn fleet<'a>(
+        primary: &'a InMemStorage,
+        peer: &'a InMemStorage,
+    ) -> Vec<crate::layout::ReplicaTarget<'a>> {
+        vec![
+            crate::layout::ReplicaTarget {
+                storage: primary,
+                name: "bucket-a",
+            },
+            crate::layout::ReplicaTarget {
+                storage: peer,
+                name: "bucket-b",
+            },
+        ]
+    }
+
+    /// The reported bug, at the level that produced it: one failed read while
+    /// pulling an ahead peer's links left this bucket short, and the peer was
+    /// reported in-sync anyway. The append then numbered off this bucket's stale
+    /// head and spent a seq the peer already held under different bytes — a
+    /// `chain-diverged` that every later pass refuses to touch. Nothing to
+    /// append on is the only safe answer.
+    #[tokio::test]
+    async fn a_pull_that_could_not_finish_defers_the_checkpoint() {
+        let links = chain_of(4, "same");
+        let primary = InMemStorage::default();
+        let peer = InMemStorage::default();
+        seed_chain(&primary, &links, &[0, 1]);
+        seed_chain(&peer, &links, &[0, 1, 2, 3]);
+        peer.fail_reads_of(&chain_key(2));
+
+        let synced = catch_up_fleet(&fleet(&primary, &peer), 0).await;
+
+        assert!(
+            synced.in_sync.is_empty(),
+            "a bucket that knows it is short of a peer's links must arbitrate nothing: {:?}",
+            synced.in_sync
+        );
+        assert_eq!(
+            held_seqs(&primary).await,
+            vec![0, 1],
+            "the failed pull must not have half-applied"
+        );
+    }
+
+    /// A peer whose chain cannot be listed has an unknown head, and this pass's
+    /// only claim is that the pin's head IS the fleet head. Skipping the peer
+    /// used to leave the append free to spend a seq the silent bucket had
+    /// already used — a fork discovered when it came back, and never repaired.
+    #[tokio::test]
+    async fn a_peer_whose_chain_cannot_be_listed_defers_the_checkpoint() {
+        let links = chain_of(2, "same");
+        let primary = InMemStorage::default();
+        let peer = InMemStorage::default();
+        seed_chain(&primary, &links, &[0, 1]);
+        seed_chain(&peer, &links, &[0, 1]);
+        peer.fail_lists_of(CHAIN_PREFIX);
+
+        let synced = catch_up_fleet(&fleet(&primary, &peer), 0).await;
+
+        assert!(
+            synced.in_sync.is_empty(),
+            "an unknown peer head must defer the append, not license one on the pin's own head: {:?}",
+            synced.in_sync
+        );
+    }
+
+    /// The half that must NOT fail closed, and the reason the two directions are
+    /// split at all: a copy toward the peer that fails leaves the peer on a
+    /// prefix of this chain — a state the append already handles — so it stays
+    /// an arbiter candidate. Failing closed here would let one transient write
+    /// error move the arbiter out from under the fleet every pass.
+    #[tokio::test]
+    async fn a_push_that_failed_still_leaves_the_peer_an_append_target() {
+        let links = chain_of(3, "same");
+        let primary = InMemStorage::default();
+        let peer = InMemStorage::default();
+        seed_chain(&primary, &links, &[0, 1, 2]);
+        seed_chain(&peer, &links, &[0, 1]);
+        peer.fail_writes_of(&chain_key(2));
+
+        let synced = catch_up_fleet(&fleet(&primary, &peer), 0).await;
+
+        assert_eq!(
+            synced.in_sync,
+            vec![0, 1],
+            "a peer left behind by a failed copy is still a valid append target"
+        );
+        assert_eq!(
+            held_seqs(&peer).await,
+            vec![0, 1],
+            "and it is left exactly where the failed copy left it"
         );
     }
 

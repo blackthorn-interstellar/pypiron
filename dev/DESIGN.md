@@ -122,13 +122,33 @@ edit.
 
 Each leader audit (daily plus one on boot) additionally writes
 `_transparency/chain/<seq>.json` — create-only, CAS-allocated (`If-None-Match`
-on the next `seq`, against the **arbiter**: the first bucket in config order
-whose chain that pass could read. Every node picks the same one, so two leaders
-racing a seq are separated by the store, not by whoever wrote last. The loser
-adopts the winner's link and appends at the following seq *in the same pass* —
-dropping its delta would leave the chain committing an old sha over bytes
-storage has already replaced, a false `hash-changed` that clears only when that
-package next churns. No new coordination is introduced). A delta that lands
+on the next `seq`, against the **arbiter**: the first bucket in config order of
+those the pass reconciled. Every node picks the same one, so two leaders racing a
+seq are separated by the store, not by whoever wrote last. No new coordination is
+introduced).
+
+That candidate set exists at all only if **every eligible bucket** was listed and
+reconciled this pass. A bucket whose chain could not be listed, or one whose
+links could not be copied onto the write pin, means this node cannot say its own
+head is the fleet head — and appending on a head nobody vouched for is how the
+same seq gets spent twice under different bytes, which is permanent (`verify-chain`
+reports `chain-diverged`, and no later pass merges the branches). So the pass
+appends nothing, holds its delta for the next audit, and counts
+`pypiron_chain_checkpoint_deferrals_total`. **Deferral is the normal failure
+mode of this path**; a count that climbs every audit means the chain has stopped
+advancing and some bucket needs attention. Eligibility is the bound: buckets the
+health tracker evicted are not in the fleet, so a permanently broken one stops
+blocking once it is evicted — and, being unconsulted, is also the one way a fork
+can still be written (see `private/ROADMAP.md`).
+
+Immediately before the CAS the leader re-reads the arbiter's own head: at or past
+the seq it was about to write, or holding different bytes at seq-1, means that
+bucket moved since the reconcile, and the pass carries rather than races. Losing
+the CAS is therefore the uncommon path now, not the ordinary way two leaders
+meet — but the loser still adopts the winner's link and appends at the following
+seq *in the same pass*, because dropping its delta would leave the chain
+committing an old sha over bytes storage has already replaced, a false
+`hash-changed` that clears only when that package next churns. A delta that lands
 nowhere is held in leader memory for the next pass; a crash there loses it, and
 the next audit that sees the package change re-commits it. A checkpoint carries `seq`, the sha256 of
 the previous checkpoint, and a churn-sized delta: for each package whose

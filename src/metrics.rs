@@ -124,6 +124,14 @@ pub struct Metrics {
     /// a rate high enough to exhaust the retries — which logs and retains the
     /// markers — is worth chasing.
     pub global_cas_conflicts: AtomicU64,
+    /// Audits that ended without appending their transparency checkpoint, so the
+    /// delta rides to the next one. The chain fails closed: a bucket whose chain
+    /// could not be listed, a reconcile that left this bucket short, or an
+    /// arbiter that moved, all defer rather than risk a second link at a spent
+    /// seq (which is permanent). Occasional counts are the design absorbing a
+    /// blip; a value that climbs every audit means the chain has stopped
+    /// advancing and some bucket needs looking at.
+    pub chain_checkpoint_deferrals: AtomicU64,
     /// Unpaired intents consumed after the grace period: a writer dropped an
     /// intent and died before committing. A rising rate means writers crash.
     pub stale_intents_healed: AtomicU64,
@@ -447,6 +455,11 @@ impl Metrics {
                 "pypiron_global_cas_conflicts_total",
                 "Global-index CAS write-backs lost to a peer (reload-and-retry).",
                 &self.global_cas_conflicts,
+            ),
+            (
+                "pypiron_chain_checkpoint_deferrals_total",
+                "Transparency checkpoints deferred to a later audit (chain not appended).",
+                &self.chain_checkpoint_deferrals,
             ),
             (
                 "pypiron_stale_intents_healed_total",

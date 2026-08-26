@@ -1077,6 +1077,16 @@ pub trait Storage: Send + Sync {
         false
     }
 
+    /// Whether an artifact write buffers the whole body in RAM before it lands.
+    /// Object stores read the spooled artifact fully into memory for a single
+    /// conditional PUT (a body at or under [`MULTIPART_THRESHOLD`]); disk
+    /// hardlinks/streams the spool, so it stays `false`. The publish path caps
+    /// how many such in-RAM writes run at once, gated on this so the disk
+    /// backend is never needlessly serialized (a wrapper owes the delegate).
+    fn buffers_uploads_in_ram(&self) -> bool {
+        false
+    }
+
     /// Read object bytes plus ETag; `None` if the object is missing.
     async fn get_with_etag(&self, _key: &str) -> Result<Option<(Vec<u8>, String)>> {
         Err(anyhow!(
@@ -3071,6 +3081,10 @@ impl Storage for ObjectStorage {
         true
     }
 
+    fn buffers_uploads_in_ram(&self) -> bool {
+        true
+    }
+
     async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
         match self.store.get(&self.oskey(key)).await {
             Ok(res) => {
@@ -3380,6 +3394,9 @@ impl Storage for FaultInjectStorage {
     }
     fn supports_leases(&self) -> bool {
         self.inner.supports_leases()
+    }
+    fn buffers_uploads_in_ram(&self) -> bool {
+        self.inner.buffers_uploads_in_ram()
     }
     async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
         self.inner.get_with_etag(key).await
@@ -4309,6 +4326,9 @@ pub mod test_support {
         /// Make every `stored_size` HEAD fail. Distinct from `unreadable`: the
         /// object is fine, the verifying HEAD is what does not come back.
         fail_stored_size: AtomicBool,
+        /// Impersonate an object-store backend for [`Storage::buffers_uploads_in_ram`]
+        /// so a test can exercise the publish path's in-RAM-write concurrency cap.
+        buffers_uploads_in_ram: AtomicBool,
     }
 
     impl InMemStorage {
@@ -4370,6 +4390,11 @@ pub mod test_support {
         }
         pub fn fail_stored_size(&self) {
             self.fail_stored_size.store(true, Ordering::SeqCst);
+        }
+        /// Report the given answer from [`Storage::buffers_uploads_in_ram`], so a
+        /// test can drive the object-store branch of the publish concurrency cap.
+        pub fn set_buffers_uploads_in_ram(&self, buffers: bool) {
+            self.buffers_uploads_in_ram.store(buffers, Ordering::SeqCst);
         }
         pub fn set_get_delay(&self, delay: std::time::Duration) {
             self.get_delay_ms
@@ -4508,6 +4533,9 @@ pub mod test_support {
         }
         fn supports_leases(&self) -> bool {
             true
+        }
+        fn buffers_uploads_in_ram(&self) -> bool {
+            self.buffers_uploads_in_ram.load(Ordering::SeqCst)
         }
         async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
             if self.fail_next_get.swap(false, Ordering::SeqCst) || self.unreadable(key) {

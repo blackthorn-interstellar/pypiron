@@ -102,6 +102,9 @@ pub struct ServeConfig {
     pub spool_dir: Option<PathBuf>,
     pub wait_on_upload: Option<bool>,
     pub wait_on_upload_secs: Option<u64>,
+    /// Cap on concurrent in-RAM artifact writes; `0` means unbounded. Only
+    /// object-store backends are gated.
+    pub max_concurrent_artifact_writes: Option<u64>,
     /// Accept uploads whose version isn't valid PEP 440. Off by default (reject).
     pub allow_legacy_versions: Option<bool>,
     pub worker_interval_secs: Option<u64>,
@@ -284,6 +287,7 @@ mod tests {
             buckets = ["s3://acme-mirror"]
             reconcile-interval-secs = 3600
             repl-sweep-interval-secs = 120
+            max-concurrent-artifact-writes = 8
             "#,
         )
         .unwrap();
@@ -295,6 +299,7 @@ mod tests {
         assert_eq!(cfg.serve.buckets.unwrap(), ["s3://acme-mirror"]);
         assert_eq!(cfg.serve.reconcile_interval_secs, Some(3600));
         assert_eq!(cfg.serve.repl_sweep_interval_secs, Some(120));
+        assert_eq!(cfg.serve.max_concurrent_artifact_writes, Some(8));
     }
 
     #[test]

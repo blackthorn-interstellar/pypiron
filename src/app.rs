@@ -207,6 +207,24 @@ type ProjectsPageCache = Arc<std::sync::Mutex<Option<(std::time::Instant, u64, b
 type EmptyOriginObservations =
     Arc<tokio::sync::Mutex<std::collections::HashMap<(u64, String), (String, std::time::Instant)>>>;
 
+/// Default cap on concurrent in-RAM artifact writes (see
+/// [`AppState::artifact_write_semaphore`]). Four × the 64 MiB single-PUT ceiling
+/// is a ~256 MiB worst case — headroom for a small node, room to raise on a big
+/// one. `0` on the flag means unbounded.
+pub const DEFAULT_MAX_CONCURRENT_ARTIFACT_WRITES: u64 = 4;
+
+/// Build the artifact-write semaphore from the configured cap. `0` means
+/// unbounded ([`tokio::sync::Semaphore::MAX_PERMITS`]); any other value is the
+/// permit count, clamped so an absurd config can't exceed the permit ceiling.
+pub fn artifact_write_semaphore(max_concurrent: u64) -> Arc<tokio::sync::Semaphore> {
+    let permits = if max_concurrent == 0 {
+        tokio::sync::Semaphore::MAX_PERMITS
+    } else {
+        (max_concurrent as usize).min(tokio::sync::Semaphore::MAX_PERMITS)
+    };
+    Arc::new(tokio::sync::Semaphore::new(permits))
+}
+
 #[derive(Clone)]
 pub struct AppState {
     /// All configured buckets and the currently-selected one. There is no
@@ -295,6 +313,15 @@ pub struct AppState {
     pub project_cache: Arc<project_cache::ProjectCache>,
     /// Where upload spools live (must be real disk, not tmpfs).
     pub spool_dir: std::path::PathBuf,
+    /// Caps how many artifact writes may buffer their whole body in RAM at once.
+    /// Object stores read a spooled upload fully into memory for a single
+    /// conditional PUT, so N unbounded concurrent uploads allocate ~N×64 MiB and
+    /// can OOM; a permit is held across the store call (publish.rs), gated to
+    /// object-store backends only — disk hardlinks the spool (~0 RAM) and is
+    /// never gated. Scoped to the direct-upload path; the replication-leg and
+    /// sync-ingestion writes buffer unbounded still (separate F47 vectors, see
+    /// the roadmap). See `--max-concurrent-artifact-writes`.
+    pub artifact_write_semaphore: Arc<tokio::sync::Semaphore>,
     /// In-memory global-index name set + the lock serializing its writes.
     pub global_names: Arc<tokio::sync::Mutex<Option<worker::GlobalNames>>>,
     /// In-memory per-package inventory: the working set behind the storage view
@@ -578,6 +605,9 @@ impl AppState {
             project_cache: Arc::new(project_cache::ProjectCache::new(cache::INDEX_CACHE_TTL)),
             presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
             spool_dir: std::env::temp_dir(),
+            artifact_write_semaphore: artifact_write_semaphore(
+                DEFAULT_MAX_CONCURRENT_ARTIFACT_WRITES,
+            ),
             global_names: Arc::new(tokio::sync::Mutex::new(None)),
             inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
@@ -1575,6 +1605,7 @@ async fn run_serve(
         ))),
         presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
         spool_dir: cli.spool_dir.unwrap_or_else(std::env::temp_dir),
+        artifact_write_semaphore: artifact_write_semaphore(cli.max_concurrent_artifact_writes),
         global_names: Arc::new(tokio::sync::Mutex::new(None)),
         inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
         worker_nudge: Arc::new(tokio::sync::Notify::new()),
@@ -2484,6 +2515,24 @@ pub(crate) fn internal(label: &'static str, e: impl std::fmt::Display) -> (Statu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_write_semaphore_maps_zero_to_unbounded_and_n_to_n() {
+        // A concrete cap becomes exactly that many permits.
+        assert_eq!(artifact_write_semaphore(4).available_permits(), 4);
+        assert_eq!(artifact_write_semaphore(1).available_permits(), 1);
+        // `0` means unbounded — the full permit ceiling, so an acquire never
+        // meaningfully waits.
+        assert_eq!(
+            artifact_write_semaphore(0).available_permits(),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+        // An absurd config is clamped to the ceiling rather than overflowing.
+        assert_eq!(
+            artifact_write_semaphore(u64::MAX).available_permits(),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+    }
 
     #[test]
     fn stream_threshold_parses_sizes_and_the_off_switch() {

@@ -423,6 +423,11 @@ impl Storage for ObservedStorage {
         self.inner.supports_leases()
     }
 
+    fn buffers_uploads_in_ram(&self) -> bool {
+        // A capability query performs no remote I/O.
+        self.inner.buffers_uploads_in_ram()
+    }
+
     async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
         let result = self.inner.get_with_etag(key).await;
         self.record(&result);

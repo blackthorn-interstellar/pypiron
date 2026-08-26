@@ -117,6 +117,10 @@ impl Storage for CountedStorage {
         self.inner.supports_leases()
     }
 
+    fn buffers_uploads_in_ram(&self) -> bool {
+        self.inner.buffers_uploads_in_ram()
+    }
+
     async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
         self.count(StorageOp::Read);
         self.inner.get_with_etag(key).await

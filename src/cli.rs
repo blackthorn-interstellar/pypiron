@@ -928,6 +928,19 @@ pub struct ServeArgs {
     #[arg(long, env = "PYPIRON_WAIT_ON_UPLOAD_SECS", default_value = "10")]
     pub(crate) wait_on_upload_secs: u64,
 
+    /// Cap on how many uploads may buffer their whole body in RAM at once. On an
+    /// object-store backend an artifact at or under the 64 MiB single-PUT ceiling
+    /// is read fully into memory before the conditional PUT, so unbounded
+    /// concurrent uploads can OOM a small node; the default of 4 bounds that to a
+    /// ~256 MiB worst case. Only object-store backends are gated — disk hardlinks
+    /// the spool and is never serialized. `0` means unbounded.
+    #[arg(
+        long,
+        env = "PYPIRON_MAX_CONCURRENT_ARTIFACT_WRITES",
+        default_value_t = crate::app::DEFAULT_MAX_CONCURRENT_ARTIFACT_WRITES
+    )]
+    pub(crate) max_concurrent_artifact_writes: u64,
+
     /// Accept uploads whose version string is not valid PEP 440 (legacy
     /// versions). Off by default: an unparseable version is refused at upload
     /// with a clear error, keeping malformed versions out of the store. It keys
@@ -1138,6 +1151,11 @@ pub fn merge_serve_file(
         f.wait_on_upload_secs
     );
     fill!(
+        cli.max_concurrent_artifact_writes,
+        "max_concurrent_artifact_writes",
+        f.max_concurrent_artifact_writes
+    );
+    fill!(
         cli.allow_legacy_versions,
         "allow_legacy_versions",
         f.allow_legacy_versions
@@ -1314,6 +1332,32 @@ mod tests {
         assert_eq!(
             loopback_health_url(Some("not-an-addr")),
             "http://127.0.0.1:8080/health"
+        );
+    }
+
+    fn parse_serve(args: &[&str]) -> ServeArgs {
+        let mut full = vec!["pypiron", "serve"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full).expect("serve args parse").command {
+            Some(Commands::Serve(serve)) => *serve,
+            other => panic!("expected serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_concurrent_artifact_writes_defaults_to_four_and_takes_an_override() {
+        assert_eq!(
+            parse_serve(&[]).max_concurrent_artifact_writes,
+            crate::app::DEFAULT_MAX_CONCURRENT_ARTIFACT_WRITES
+        );
+        assert_eq!(
+            parse_serve(&["--max-concurrent-artifact-writes", "16"]).max_concurrent_artifact_writes,
+            16
+        );
+        // `0` is accepted and means unbounded (resolved in app::artifact_write_semaphore).
+        assert_eq!(
+            parse_serve(&["--max-concurrent-artifact-writes", "0"]).max_concurrent_artifact_writes,
+            0
         );
     }
 }

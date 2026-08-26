@@ -106,6 +106,11 @@
 # Upload spool directory. Point at real disk where /tmp is a RAM-backed tmpfs,
 # or multi-GB wheels spool into memory.
 # spool-dir = "/var/spool/pypiron"
+# Cap on how many uploads may buffer their whole body in RAM at once. On an
+# object-store backend a file up to 64 MiB is read fully into memory for one
+# conditional PUT, so unbounded concurrency can OOM a small node; 4 bounds the
+# worst case to ~256 MiB. Disk hardlinks the spool and is never gated. 0 = off.
+# max-concurrent-artifact-writes = 4
 
 # Logging. By default only mutations (uploads, deletes, yanks) are logged; turn
 # this on to log every request — the full access log.

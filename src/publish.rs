@@ -415,6 +415,29 @@ pub(crate) async fn legacy_upload(
     publish_record(&state, &pinned, req).await
 }
 
+/// Acquire a permit iff this backend buffers the whole artifact body in RAM to
+/// write it. Object stores read the spooled body fully into memory for a single
+/// conditional PUT (a body at or under the 64 MiB multipart threshold), so
+/// unbounded concurrent uploads allocate ~N×64 MiB and can OOM a small node; the
+/// permit caps that. Disk hardlinks the spool (~0 RAM) and reports `false`, so it
+/// returns `None` and is never serialized. Called immediately before — and
+/// outside — `store_artifact_verified`, so queue time never burns that call's
+/// payload-scaled write timeout; the returned permit is held across the store and
+/// released on drop.
+async fn acquire_artifact_write_permit<'a>(
+    sem: &'a tokio::sync::Semaphore,
+    storage: &dyn Storage,
+) -> Option<tokio::sync::SemaphorePermit<'a>> {
+    if storage.buffers_uploads_in_ram() {
+        // `acquire` errors only if the semaphore is closed, which never happens
+        // (it lives as long as the process). On that impossible error, proceed
+        // unbounded rather than fail an upload — fail-open on a memory guard.
+        sem.acquire().await.ok()
+    } else {
+        None
+    }
+}
+
 /// The storage-protocol core of an upload: origin observation → private-prefix
 /// and cross-origin rejects → intent marker → origin claim (with the early
 /// package-level fan-out) → write fence → verified artifact store → mirror
@@ -637,7 +660,11 @@ pub async fn publish_record(
         PublishBody::Spool(temp) => storage::ArtifactBody::Spool(temp.path()),
         PublishBody::Bytes(bytes) => storage::ArtifactBody::Bytes(bytes.clone()),
     };
-    match storage::store_artifact_verified(
+    // Bound peak RAM across concurrent uploads on backends that buffer the body
+    // to write it (object stores). Held across the store call, released on drop.
+    let write_permit =
+        acquire_artifact_write_permit(&state.artifact_write_semaphore, storage).await;
+    let store_result = storage::store_artifact_verified(
         storage,
         &key,
         artifact_body,
@@ -645,8 +672,11 @@ pub async fn publish_record(
         Some("application/octet-stream"),
         storage::Existing::Reject,
     )
-    .await
-    {
+    .await;
+    // Release the permit as soon as the RAM-buffering store is done; the sidecar
+    // and index work below is cheap and must not hold a scarce write slot.
+    drop(write_permit);
+    match store_result {
         Ok(true) => {}
         Ok(false) => {
             return Err((
@@ -1484,6 +1514,81 @@ mod tests {
     use crate::buckets::{BucketHandle, BucketSet};
 
     use super::*;
+
+    #[tokio::test]
+    async fn object_store_uploads_serialize_under_the_cap() {
+        // Cap of 1: the second in-RAM write must wait for the first to release
+        // its permit. The object-store predicate is what arms the gate — this is
+        // the OOM guard for F47 (an object store buffers the whole body in RAM).
+        let storage = Arc::new(storage::test_support::InMemStorage::default());
+        storage.set_buffers_uploads_in_ram(true);
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let first = acquire_artifact_write_permit(&sem, storage.as_ref()).await;
+        assert!(first.is_some(), "an object-store write takes a permit");
+        assert_eq!(sem.available_permits(), 0, "the only permit is held");
+
+        // A second acquirer cannot make progress while the first holds it.
+        let sem2 = sem.clone();
+        let storage2 = storage.clone();
+        let second = tokio::spawn(async move {
+            let _permit = acquire_artifact_write_permit(&sem2, storage2.as_ref()).await;
+            // Reached only once `first` is released.
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !second.is_finished(),
+            "the second write waits for a permit rather than buffering at once"
+        );
+        assert_eq!(sem.available_permits(), 0);
+
+        // Release the first; the queued write then acquires and completes.
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the queued write acquires once a permit frees")
+            .expect("spawned write task panicked");
+    }
+
+    #[tokio::test]
+    async fn disk_uploads_are_never_serialized() {
+        // Disk hardlinks the spool (~0 RAM), so even at a cap of 1 two writes
+        // proceed at once: the predicate is false, so no permit is taken.
+        let storage = Arc::new(storage::test_support::InMemStorage::default());
+        // buffers_uploads_in_ram defaults false — the disk-backend shape.
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let a = acquire_artifact_write_permit(&sem, storage.as_ref()).await;
+        let b = acquire_artifact_write_permit(&sem, storage.as_ref()).await;
+        assert!(
+            a.is_none() && b.is_none(),
+            "a disk-shaped backend takes no permit"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the semaphore is untouched for a disk backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncontended_object_store_upload_takes_a_permit_immediately() {
+        // The uncontended single-upload path adds no latency: a fresh
+        // default-sized semaphore hands out the permit without ever pending.
+        let storage = Arc::new(storage::test_support::InMemStorage::default());
+        storage.set_buffers_uploads_in_ram(true);
+        let cap = crate::app::DEFAULT_MAX_CONCURRENT_ARTIFACT_WRITES as usize;
+        let sem = Arc::new(tokio::sync::Semaphore::new(cap));
+
+        let permit = tokio::time::timeout(
+            Duration::from_millis(50),
+            acquire_artifact_write_permit(&sem, storage.as_ref()),
+        )
+        .await
+        .expect("an uncontended acquire never waits");
+        assert!(permit.is_some());
+        assert_eq!(sem.available_permits(), cap - 1);
+    }
 
     #[tokio::test]
     async fn single_bucket_post_publish_mirror_check_is_storage_io_free() {

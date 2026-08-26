@@ -4109,6 +4109,9 @@ mod tests {
                 crate::cache::PRESIGN_CACHE_TTL,
             )),
             spool_dir: std::env::temp_dir(),
+            artifact_write_semaphore: crate::app::artifact_write_semaphore(
+                crate::app::DEFAULT_MAX_CONCURRENT_ARTIFACT_WRITES,
+            ),
             global_names: Arc::new(tokio::sync::Mutex::new(None)),
             inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),

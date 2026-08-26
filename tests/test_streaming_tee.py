@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import math
 import re
 import threading
 import time
@@ -53,6 +54,19 @@ FILL_GIVEUP_SECS = 45.0
 # push the feed, wait for the worker to load it, and still have the fill running.
 MID_DOWNLOAD_PACE = 20.0
 MAL_MID_ID = "MAL-2026-90001"
+
+# --- the balanced-legs overlap measurement (see the test at the bottom) --------
+# A wheel well over the threshold, so the streamed path is in play and the two
+# legs are long enough to time apart from startup noise.
+BALANCED_PAYLOAD = 24 * 1024 * 1024
+# How long the upstream leg (pypiron <- PyPI) takes. Both legs run at this pace.
+BALANCED_LEG_SECS = 3.0
+# The client reads this much per pause. Coarse on purpose: ~200 sleeps of ~15ms
+# each, not thousands of micro-sleeps a loaded box cannot honor.
+CLIENT_CHUNK = 128 * 1024
+# Overlapping the legs is ideally 2x — assert well short of that, so the test
+# reports a real regression rather than the scheduler's mood.
+OVERLAP_RATIO = 0.75
 
 
 @pytest.fixture()
@@ -177,6 +191,66 @@ def _read_incrementally(url: str, *, timeout: float, headers=None) -> Tuple[_Rea
         return _Read(resp.status, declared, marks), bytes(body)
     finally:
         conn.close()
+
+
+def _client_pause(size: int) -> float:
+    """The sleep per `CLIENT_CHUNK` that makes a client swallow `size` bytes in
+    about `BALANCED_LEG_SECS` — the client leg throttled to the upstream's pace."""
+    chunks = max(1, math.ceil(size / CLIENT_CHUNK))
+    pause = BALANCED_LEG_SECS / chunks
+    assert pause >= 0.010, f"client pacing is too fine-grained to be honored ({pause * 1e3:.1f}ms)"
+    return pause
+
+
+def _read_at_client_pace(url: str, *, pause: float, timeout: float) -> Tuple[float, bytes]:
+    """GET `url` over a link that carries `CLIENT_CHUNK` bytes per `pause`, and
+    return the wall-clock time to last byte. Reads block until the chunk is full,
+    so this consumes at a fixed rate and never races ahead to catch up — a slow
+    link, not a fast client that stalled."""
+    parsed = urlparse(url)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    body = bytearray()
+    started = time.monotonic()
+    try:
+        conn.request("GET", parsed.path)
+        resp = conn.getresponse()
+        assert resp.status == 200, f"cold miss answered {resp.status}"
+        while True:
+            time.sleep(pause)
+            piece = resp.read(CLIENT_CHUNK)
+            if not piece:
+                break
+            body += piece
+        return time.monotonic() - started, bytes(body)
+    finally:
+        conn.close()
+
+
+def _timed_cold_miss(
+    tmp_path_factory,
+    pypiron_bin: Path,
+    run_dir: Path,
+    pkg: str,
+    wheel: Path,
+    *,
+    pause: float,
+    extra_env: Optional[Dict[str, str]] = None,
+) -> Tuple[float, bytes]:
+    """Time to last byte for one cold-miss download of `wheel` through a
+    throttled upstream, on a server of its own."""
+    run_dir.mkdir()
+    gen = _proxy_over_fault(tmp_path_factory, pypiron_bin, run_dir, extra_env=extra_env)
+    proxy, upstream = next(gen)
+    try:
+        filename = upstream.register(pkg, wheel)
+        upstream.set_fault(pkg, "slow", pace=BALANCED_LEG_SECS)
+        return _read_at_client_pace(
+            f"{proxy['base_url']}/files/{pkg}/{filename}",
+            pause=pause,
+            timeout=FAULT_GET_TIMEOUT,
+        )
+    finally:
+        gen.close()
 
 
 def _wait_for_clean_storage(proxy: Dict, pkg: str, filename: str) -> None:
@@ -383,6 +457,53 @@ def test_threshold_off_buffers_the_whole_download(proxy_over_fault_no_tee, tmp_p
     assert read.first_byte > read.last_byte / 2, (
         f"first byte at {read.first_byte:.1f}s of a {read.last_byte:.1f}s transfer — "
         "bytes were streamed early with streaming switched off"
+    )
+
+
+def test_balanced_legs_overlap_instead_of_adding_up(tmp_path_factory, pypiron_bin, tmp_path):
+    """The point of teeing, timed: when the upstream leg and the client leg run
+    at the same speed — the VPN user pulling from a distant PyPI — the download
+    costs about one leg, not two. Buffering pays them in series (fetch it all,
+    then send it all); streaming overlaps them, because the fill writes to the
+    spool at upstream speed no matter how slowly the client drains it.
+
+    Both measurements are made the same way against the same throttles, so the
+    assertion is the ratio between them and not a clock. Both throttles are
+    load-bearing for a pass: kill either one and the two runs converge."""
+    pkg = "teebalance"
+    wheel = make_wheel(pkg, "1.0", tmp_path, payload_bytes=BALANCED_PAYLOAD)
+    size = wheel.stat().st_size
+    assert size > 16 * 1024 * 1024, "test wheel is under the streaming threshold"
+    pause = _client_pause(size)
+    digest = sha256_file(wheel)
+
+    buffered_secs, buffered_body = _timed_cold_miss(
+        tmp_path_factory,
+        pypiron_bin,
+        tmp_path / "buffered",
+        pkg,
+        wheel,
+        pause=pause,
+        extra_env={"PYPIRON_PROXY_STREAM_THRESHOLD": "off"},
+    )
+    streamed_secs, streamed_body = _timed_cold_miss(
+        tmp_path_factory,
+        pypiron_bin,
+        tmp_path / "streamed",
+        pkg,
+        wheel,
+        pause=pause,
+    )
+
+    # Faster is only worth having if it is the same artifact.
+    for label, body in (("buffered", buffered_body), ("streamed", streamed_body)):
+        assert len(body) == size, f"{label} body was {len(body)} of {size} bytes"
+        assert hashlib.sha256(body).hexdigest() == digest, f"{label} body did not match the wheel"
+
+    assert streamed_secs < buffered_secs * OVERLAP_RATIO, (
+        f"streamed cold miss took {streamed_secs:.1f}s against {buffered_secs:.1f}s buffered "
+        f"({streamed_secs / buffered_secs:.0%} of it): the client transfer is not overlapping "
+        "the upstream fetch"
     )
 
 

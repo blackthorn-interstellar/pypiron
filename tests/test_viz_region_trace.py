@@ -48,6 +48,7 @@ from .conftest import (
     minio_key_exists_in,
     minio_list_keys_in,
     minio_put_key_in,
+    s3_repl_tag,
 )
 from .helpers import http_get, make_wheel, wait_for_file_in_index
 from .test_read_affinity import (
@@ -603,7 +604,11 @@ def _read_side_story(recorder, server, minio, buckets, tmp_path, uv_path, uv_ven
     _upload(server, out_wheel)
     recorder.ack(pkg=out_pkg, file=out_wheel.name, bucket=0, body=out_wheel.read_bytes())
     owed = _eventually(
-        lambda: [k for k in minio_list_keys_in(minio, a) if k.startswith(f"_repl/1/{out_pkg}/")],
+        lambda: [
+            k
+            for k in minio_list_keys_in(minio, a)
+            if k.startswith(f"_repl/{s3_repl_tag(b)}/{out_pkg}/")
+        ],
         what="outage publish owes B a note",
     )
     for key in owed:
@@ -623,7 +628,7 @@ def _read_side_story(recorder, server, minio, buckets, tmp_path, uv_path, uv_ven
     hold_pkg = "holdopen"
     hold_file = "holdopen-1.0-py3-none-any.whl"
     hold_akey = f"packages/{hold_pkg}/{hold_file}"
-    hold_note = f"_repl/1/{hold_pkg}/{hold_file}!hold"
+    hold_note = f"_repl/{s3_repl_tag(b)}/{hold_pkg}/{hold_file}!hold"
     minio_put_key_in(
         minio,
         a,
@@ -815,7 +820,11 @@ def _write_side_story(recorder, server, minio, buckets, tmp_path, uv_path, uv_ve
     )
     recorder.held("the_outage_publish_still_reaches_this_nodes_region", f"{b} holds {out_key}")
     owed = _eventually(
-        lambda: [k for k in minio_list_keys_in(minio, c) if k.startswith(f"_repl/0/{out_pkg}/")],
+        lambda: [
+            k
+            for k in minio_list_keys_in(minio, c)
+            if k.startswith(f"_repl/{s3_repl_tag(a)}/{out_pkg}/")
+        ],
         what="the dead preferred bucket is owed a repair note",
     )
     for key in owed:

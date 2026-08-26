@@ -786,13 +786,25 @@ _format/stamp.json                       # storage-format fence — a single int
                                          #   an older binary reads it at startup and REFUSES rather than
                                          #   writing an older layout into a newer tree. Read-only gate
                                          #   today — nothing here writes it.
-_repl/<dest-index>/<pkg>/<file>!<nonce>  # multi-bucket repair note, FAILURE-PATH ONLY. Written in the
+_repl/<dest-tag>/<pkg>/<file>!<nonce>    # multi-bucket repair note, FAILURE-PATH ONLY. Written in the
                                          #   selected bucket before ack when a synchronous fan-out to a
                                          #   destination fails/times out; drained by the sweep (on that
                                          #   bucket's heal and a slow periodic backstop), deleted on
                                          #   convergence. A healthy fan-out writes none. <file> may be
                                          #   .origin or .project-status.json for package-level truth.
-                                         #   One bucket: never written.
+                                         #   <dest-tag> is the destination bucket's stable identity tag
+                                         #   (counters::bucket_tag of its configured name), NOT its list
+                                         #   position — so a topology reorder/removal can neither orphan
+                                         #   the note nor point it at the wrong bucket. One bucket: never
+                                         #   written.
+_repl/<dest-tag>/_backfill!<nonce>       # backfill sentinel: an empty read-affinity fence a freshly-
+                                         #   added bucket seeds on every peer at `buckets migrate`, so the
+                                         #   new bucket serves no region reads until a clean reconcile
+                                         #   proves the corpus converged onto it. Same <dest-tag> keying
+                                         #   as the repair note: the fence follows its bucket across a
+                                         #   reorder. Not a repair note (names no package), so the marker
+                                         #   sweep never tries to deliver it — only a clean reconcile
+                                         #   drains it. One bucket: never written.
 _transparency/chain/<seq>.json           # append-only hash-chained audit checkpoint; create-only,
                                          #   CAS-allocated seq (If-None-Match). Commits per-file artifact
                                          #   sha256 deltas, churn-sized like the audit. A WITNESS — never

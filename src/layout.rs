@@ -329,7 +329,7 @@ mod tests {
             Some(Class::DerivedPerBucket)
         );
         assert_eq!(
-            classify("_repl/1/pkg/file!nonce"),
+            classify("_repl/s3---east/pkg/file!nonce"),
             Some(Class::CoordinationPerBucket)
         );
         assert_eq!(

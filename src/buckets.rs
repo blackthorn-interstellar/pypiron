@@ -316,6 +316,26 @@ impl BucketSet {
                 "duplicate bucket identity '{duplicate}' in multi-bucket topology; each configured bucket must be unique"
             );
         }
+        // Two distinct identities that fold to the same `counters::bucket_tag`
+        // would silently share one keyspace — the `_repl/` replication fences AND
+        // the counter rollups both key by the tag, not the list position. On disk
+        // that is fail-safe, not fail-open (cross-fencing keeps reads on the write
+        // bucket; a misrouted note self-heals via the tier-3 reconcile diff), but
+        // silent and surprising, so refuse startup and name both. Ordinary
+        // `[A-Za-z0-9._-]` names never collide; only fold-away punctuation can.
+        let mut tags: std::collections::HashMap<String, &str> =
+            std::collections::HashMap::with_capacity(self.handles.len());
+        for handle in &self.handles {
+            let tag = crate::counters::bucket_tag(&handle.name);
+            if let Some(prior) = tags.insert(tag.clone(), &handle.name) {
+                bail!(
+                    "bucket identities '{prior}' and '{}' both reduce to storage tag '{tag}', \
+                     which would merge their replication and counter keyspaces; rename one so the \
+                     two differ in more than punctuation",
+                    handle.name
+                );
+            }
+        }
         for handle in &self.handles {
             if !handle.storage.supports_leases() {
                 bail!(
@@ -1652,6 +1672,36 @@ mod tests {
         ]);
         let err = dup.validate_topology_config().unwrap_err();
         assert!(err.to_string().contains("duplicate bucket identity"));
+    }
+
+    #[test]
+    fn identities_colliding_only_in_fold_away_chars_are_refused() {
+        let x = Arc::new(InMemStorage::default());
+        let y = Arc::new(InMemStorage::default());
+        // Two DISTINCT identities (duplicate-name detection accepts them) that both
+        // fold to the same `bucket_tag` `s3---foo-bar`: they would silently share
+        // one `_repl/` fence keyspace and one counters rollup keyspace. Refuse.
+        let collide = BucketSet::new(vec![
+            memory_handle("s3://foo:bar", &x),
+            memory_handle("s3://foo-bar", &y),
+        ]);
+        let err = collide.validate_topology_config().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reduce to storage tag"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("s3://foo:bar") && msg.contains("s3://foo-bar"),
+            "the error must name both colliding identities: {msg}"
+        );
+
+        // A punctuation-free multi-bucket list can never collide.
+        let ok = BucketSet::new(vec![
+            memory_handle("s3://foo-bar", &x),
+            memory_handle("s3://foo-baz", &y),
+        ]);
+        assert!(ok.validate_topology_config().is_ok());
     }
 
     #[test]

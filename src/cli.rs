@@ -642,11 +642,12 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
         // clean reconcile drains them.
         for &dest in &added_indices {
             let mut seeded_any = false;
+            let dest_tag = crate::counters::bucket_tag(&buckets.handles()[dest].name);
             for (peer, handle) in buckets.handles().iter().enumerate() {
                 if peer == dest {
                     continue;
                 }
-                match replicate::seed_backfill_sentinel(handle.storage.as_ref(), dest).await {
+                match replicate::seed_backfill_sentinel(handle.storage.as_ref(), &dest_tag).await {
                     Ok(()) => seeded_any = true,
                     Err(error) if is_availability(&error) => {
                         eprintln!(

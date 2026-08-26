@@ -817,7 +817,7 @@ mod tests {
     async fn operator_release_rejects_committed_replication_work() {
         let s = store();
         claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
-        s.insert("_repl/1/pkg/pkg-1.whl!nonce", b"{}".to_vec());
+        s.insert("_repl/s3---peer/pkg/pkg-1.whl!nonce", b"{}".to_vec());
         let error = releasable_for_repurpose(s.as_ref(), "pkg")
             .await
             .unwrap_err();

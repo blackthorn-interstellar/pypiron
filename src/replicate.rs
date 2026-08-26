@@ -58,9 +58,12 @@ use crate::worker;
 mod decide;
 pub use decide::*;
 
-/// Todo-marker prefix: `_repl/<dest-index>/<pkg>/<file>!<nonce>`, an empty
+/// Todo-marker prefix: `_repl/<dest-tag>/<pkg>/<file>!<nonce>`, an empty
 /// object in the bucket that took the write (the `_dirty/` idiom pointed at a
-/// second bucket). O(1) at commit, consumed and deleted on a successful push.
+/// second bucket). `<dest-tag>` is the destination bucket's stable
+/// [`crate::counters::bucket_tag`], never its list position, so a topology
+/// reorder/removal cannot orphan or misroute the note. O(1) at commit, consumed
+/// and deleted on a successful push.
 pub(crate) const REPL_PREFIX: &str = "_repl/";
 /// Frozen bodies land here, content-hash-suffixed, so both sides of a byte
 /// conflict are preserved as moves (never deletes): `_quarantine/<pkg>/<file>@<sha12>`.
@@ -2264,11 +2267,13 @@ pub async fn fanout_sync(
     // middle bucket cannot delay a healthy later one (both are still bounded by
     // the shared deadline). Then write one durable note per bucket that did not
     // converge, before the caller acks.
+    let handles = state.buckets.handles();
     for (idx, converged) in futures::future::join_all(jobs).await {
         if converged {
             continue;
         }
-        if let Err(e) = write_marker(src, idx, pkg, filename).await {
+        let dest_tag = crate::counters::bucket_tag(&handles[idx].name);
+        if let Err(e) = write_marker(src, &dest_tag, pkg, filename).await {
             error!(dest=idx, package=%pkg, filename=%filename, error=?e, "could not write replication repair note before ack");
         }
     }
@@ -2324,14 +2329,15 @@ async fn note_proxy_fill(
         return Ok(());
     };
     let mut failures = Vec::new();
-    for idx in 0..handles.len() {
+    for (idx, dst) in handles.iter().enumerate() {
         if idx == src_index {
             continue;
         }
         // Note every peer, even a currently-ineligible one: the marker is the
         // durable record that `idx` still owes this fill, drained on its heal —
         // exactly the failure-path role notes play for a synchronous fan-out.
-        if let Err(error) = write_marker(src.storage.as_ref(), idx, pkg, filename).await {
+        let dest_tag = crate::counters::bucket_tag(&dst.name);
+        if let Err(error) = write_marker(src.storage.as_ref(), &dest_tag, pkg, filename).await {
             failures.push(format!("peer {idx}: {error:#}"));
         }
     }
@@ -2536,12 +2542,12 @@ async fn reconcile_project_status(a: &dyn Storage, b: &dyn Storage, pkg: &str) -
 
 async fn write_marker(
     storage: &dyn Storage,
-    dest: usize,
+    dest_tag: &str,
     pkg: &str,
     filename: &str,
 ) -> Result<String> {
     let key = format!(
-        "{REPL_PREFIX}{dest}/{pkg}/{filename}!{}",
+        "{REPL_PREFIX}{dest_tag}/{pkg}/{filename}!{}",
         markers::marker_nonce()
     );
     storage.put_bytes(&key, Vec::new(), None).await?;
@@ -2549,26 +2555,42 @@ async fn write_marker(
 }
 
 struct ReplMarker {
-    dest: usize,
+    /// The stable [`crate::counters::bucket_tag`] of the destination bucket this
+    /// note is owed to — never its position in the list, so a topology reorder or
+    /// removal can neither orphan the note nor point it at the wrong bucket.
+    dest_tag: String,
     pkg: String,
     filename: String,
     key: String,
 }
 
-/// Parse `_repl/<dest>/<pkg>/<file>!<nonce>`. Package names and filenames carry
-/// no `!`, and the nonce carries no `/`, so the split is unambiguous.
+/// Parse `_repl/<dest-tag>/<pkg>/<file>!<nonce>`. The tag is
+/// [`crate::counters::bucket_tag`] output (charset `[A-Za-z0-9._-]`, never `/`),
+/// package names and filenames carry no `!`, and the nonce carries no `/`, so the
+/// split is unambiguous. Backfill sentinels (`_repl/<tag>/_backfill!<nonce>`) have
+/// only one path segment after the tag and so return `None` here — they are gate
+/// markers, not repair notes.
 fn parse_repl_marker(key: &str) -> Option<ReplMarker> {
     let rest = key.strip_prefix(REPL_PREFIX)?;
-    let (dest, rest) = rest.split_once('/')?;
-    let dest = dest.parse::<usize>().ok()?;
+    let (dest_tag, rest) = rest.split_once('/')?;
     let (pkg, file_nonce) = rest.split_once('/')?;
     let (filename, _nonce) = file_nonce.rsplit_once('!')?;
     Some(ReplMarker {
-        dest,
+        dest_tag: dest_tag.to_string(),
         pkg: pkg.to_string(),
         filename: filename.to_string(),
         key: key.to_string(),
     })
+}
+
+/// Resolve a destination [`crate::counters::bucket_tag`] back to its current
+/// position in the configured list. `None` means no configured bucket carries that
+/// tag any more — the destination was removed, so a note addressed to it can never
+/// be delivered.
+fn dest_index_for_tag(handles: &[crate::buckets::BucketHandle], dest_tag: &str) -> Option<usize> {
+    handles
+        .iter()
+        .position(|handle| crate::counters::bucket_tag(&handle.name) == dest_tag)
 }
 
 /// Sweep markers from every configured source bucket on the fast worker tick.
@@ -2646,29 +2668,37 @@ pub async fn bucket_is_corpus_empty(storage: &dyn Storage) -> Result<bool> {
         .is_empty())
 }
 
-/// Whether this bucket holds any undrained `_repl/<dest>/` note — a repair still
-/// owed *to* bucket `dest`. The read-affinity worker checks every other bucket
-/// with this before it lets reads return to `dest` (its region bucket): an
-/// outstanding note means `dest` is missing an acked file, so reads stay on the
-/// write bucket until it drains. Same bounded
+/// Whether this bucket holds any undrained `_repl/<dest-tag>/` note — a repair
+/// still owed *to* the bucket whose stable [`crate::counters::bucket_tag`] is
+/// `dest_tag`. The read-affinity worker checks every other bucket with this before
+/// it lets reads return to that bucket (its region bucket): an outstanding note
+/// means the destination is missing an acked file, so reads stay on the write
+/// bucket until it drains. Keying on the tag (not the list position) means the
+/// fence follows its bucket across any topology reorder or removal. Same bounded
 /// single-key LIST as [`has_undrained_repl_notes`].
-pub async fn has_undrained_repl_notes_for(storage: &dyn Storage, dest: usize) -> Result<bool> {
-    let prefix = format!("{REPL_PREFIX}{dest}/");
+pub async fn has_undrained_repl_notes_for(storage: &dyn Storage, dest_tag: &str) -> Result<bool> {
+    let prefix = format!("{REPL_PREFIX}{dest_tag}/");
     Ok(!storage.list_page(&prefix, None, 1).await?.is_empty())
 }
 
 /// Whether region bucket `region` is owed no undrained note by any peer — no real
-/// repair marker and no backfill sentinel under any peer's `_repl/<region>/`.
+/// repair marker and no backfill sentinel under any peer's `_repl/<region-tag>/`.
+/// The destination is addressed by its stable [`crate::counters::bucket_tag`], so
+/// the fence a peer holds still points at this bucket after any topology reorder.
 /// Conservative: an unreachable peer or any error reports `false`, so reads never
 /// return to a bucket that might still be missing corpus. Startup uses it before
 /// seeding a region read pin; the worker's own caught-up check applies the same
 /// gate to *return* reads after a recovery.
 pub async fn region_owed_no_notes(handles: &[crate::buckets::BucketHandle], region: usize) -> bool {
+    let Some(region_handle) = handles.get(region) else {
+        return true;
+    };
+    let region_tag = crate::counters::bucket_tag(&region_handle.name);
     for (index, handle) in handles.iter().enumerate() {
         if index == region {
             continue;
         }
-        match has_undrained_repl_notes_for(handle.storage.as_ref(), region).await {
+        match has_undrained_repl_notes_for(handle.storage.as_ref(), &region_tag).await {
             Ok(false) => {}
             Ok(true) => return false,
             Err(error) => {
@@ -2693,18 +2723,22 @@ pub async fn region_owed_no_notes(handles: &[crate::buckets::BucketHandle], regi
 /// reads until the corpus has converged onto it — no per-file read-through.
 const BACKFILL_SENTINEL: &str = "_backfill!";
 
-fn backfill_sentinel_prefix(dest: usize) -> String {
-    format!("{REPL_PREFIX}{dest}/{BACKFILL_SENTINEL}")
+fn backfill_sentinel_prefix(dest_tag: &str) -> String {
+    format!("{REPL_PREFIX}{dest_tag}/{BACKFILL_SENTINEL}")
 }
 
-/// Seed the backfill sentinel for newly-added bucket `dest` on a surviving peer.
-/// O(1): one empty create, never a corpus walk. `buckets migrate` calls this once
-/// per bucket the new topology adds, on every other reachable bucket, so the
-/// read-affinity gate holds whichever peer a node happens to consult.
-pub async fn seed_backfill_sentinel(storage: &dyn Storage, dest: usize) -> Result<()> {
+/// Seed the backfill sentinel for a newly-added bucket on a surviving peer, keyed
+/// by the new bucket's stable [`crate::counters::bucket_tag`]. O(1): one empty
+/// create, never a corpus walk. `buckets migrate` calls this once per bucket the
+/// new topology adds, on every other reachable bucket, so the read-affinity gate
+/// holds whichever peer a node happens to consult. Keying on the tag rather than
+/// the list position is what lets the fence survive a later reorder or removal
+/// without orphaning the sentinel (or false-fencing a bucket that lands on a
+/// recycled position).
+pub async fn seed_backfill_sentinel(storage: &dyn Storage, dest_tag: &str) -> Result<()> {
     let key = format!(
         "{}{}",
-        backfill_sentinel_prefix(dest),
+        backfill_sentinel_prefix(dest_tag),
         markers::marker_nonce()
     );
     storage.put_bytes(&key, Vec::new(), None).await
@@ -2718,8 +2752,11 @@ async fn drain_backfill_sentinels(state: &AppState) -> Result<()> {
     let handles = state.buckets.handles();
     let mut failures = Vec::new();
     for handle in handles {
-        for dest in 0..handles.len() {
-            let prefix = backfill_sentinel_prefix(dest);
+        // Only currently-configured tags are drained; a removed bucket's sentinel
+        // lingers as harmless dead bytes (never queried again — its tag names no
+        // handle, so no gate ever LISTs it), not worth a self-cleaning sweep.
+        for dest in handles {
+            let prefix = backfill_sentinel_prefix(&crate::counters::bucket_tag(&dest.name));
             match handle
                 .storage
                 .list_page(&prefix, None, REPL_SWEEP_PAGE)
@@ -2924,13 +2961,13 @@ async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<Hash
             let Some(marker) = parse_repl_marker(&meta.key) else {
                 continue;
             };
-            if handles.get(marker.dest).is_none() {
-                // Destination no longer configured — the marker cannot be
-                // delivered; drop it rather than retry forever.
+            let Some(dest_index) = dest_index_for_tag(handles, &marker.dest_tag) else {
+                // Destination tag no longer names any configured bucket — the
+                // marker cannot be delivered; drop it rather than retry forever.
                 let _ = src.delete_keys(&[marker.key]).await;
                 continue;
-            }
-            by_destination.entry(marker.dest).or_default().push(marker);
+            };
+            by_destination.entry(dest_index).or_default().push(marker);
         }
         // Each destination owns its own 16-wide lane. A large blackholed-B prefix
         // cannot consume every slot and prevent a later healthy-C marker starting.
@@ -5176,7 +5213,10 @@ mod tests {
         // the record reaches B when it heals.
         assert!(!b.head_exists(&artifact_key("pkg", filename)).await.unwrap());
         assert!(a
-            .list_all(&format!("{REPL_PREFIX}1/"))
+            .list_all(&format!(
+                "{REPL_PREFIX}{}/",
+                crate::counters::bucket_tag("b")
+            ))
             .await
             .unwrap()
             .iter()
@@ -5206,11 +5246,14 @@ mod tests {
 
         fanout_sync(&state, &pinned, "pkg", filename, None).await;
         assert!(
-            a.list_all(&format!("{REPL_PREFIX}1/"))
-                .await
-                .unwrap()
-                .iter()
-                .any(|m| m.key.contains("/pkg/")),
+            a.list_all(&format!(
+                "{REPL_PREFIX}{}/",
+                crate::counters::bucket_tag("b")
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.key.contains("/pkg/")),
             "a deferred fan-out must leave the peer a repair note before the ack",
         );
     }
@@ -5251,7 +5294,10 @@ mod tests {
 
         let key = artifact_key("pkg", filename);
         let owed = a
-            .list_all(&format!("{REPL_PREFIX}1/"))
+            .list_all(&format!(
+                "{REPL_PREFIX}{}/",
+                crate::counters::bucket_tag("b")
+            ))
             .await
             .unwrap()
             .iter()
@@ -5285,7 +5331,9 @@ mod tests {
             PRIVATE.as_bytes().to_vec(),
         );
         let state = two_bucket_state(a.clone(), b.clone());
-        write_marker(b.as_ref(), 0, "pkg", filename).await.unwrap();
+        write_marker(b.as_ref(), "a", "pkg", filename)
+            .await
+            .unwrap();
 
         sweep_all_markers(&state).await.unwrap();
         assert!(
@@ -5301,11 +5349,119 @@ mod tests {
         let filename = "pkg-1.whl";
         seed_live(b.as_ref(), "pkg", filename, b"straggler", PRIVATE);
         let state = two_bucket_state(a.clone(), b.clone());
-        write_marker(b.as_ref(), 0, "pkg", filename).await.unwrap();
+        write_marker(b.as_ref(), "a", "pkg", filename)
+            .await
+            .unwrap();
 
         sweep_all_markers(&state).await.unwrap();
         assert!(a.head_exists(&artifact_key("pkg", filename)).await.unwrap());
         assert!(b.list_all(REPL_PREFIX).await.unwrap().is_empty());
+    }
+
+    fn repl_handle(storage: Arc<InMemStorage>, name: &str) -> BucketHandle {
+        BucketHandle {
+            storage: storage as Arc<dyn Storage>,
+            name: name.to_string(),
+        }
+    }
+
+    /// F25: a backfill sentinel is keyed by the new bucket's stable
+    /// [`crate::counters::bucket_tag`], so the read-affinity fence follows that
+    /// bucket across a topology reorder. The position-keyed predecessor seeded
+    /// `_repl/<pos>/_backfill!` and orphaned the fence the moment a reorder shifted
+    /// the bucket's index — fail-open, the dangerous direction: an un-caught-up
+    /// bucket would silently start serving stale/incomplete reads. Revert the key
+    /// change (position-keyed seed + gate) and the reordered assertion below flips
+    /// to "caught up" and this test fails.
+    #[tokio::test]
+    async fn a_backfill_sentinel_follows_its_bucket_across_a_reorder() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let c = Arc::new(InMemStorage::default());
+        // `c` is freshly added and empty; migrate fences it by seeding its
+        // sentinel — keyed by c's tag — on every reachable peer.
+        let c_tag = crate::counters::bucket_tag("c");
+        seed_backfill_sentinel(a.as_ref(), &c_tag).await.unwrap();
+        seed_backfill_sentinel(b.as_ref(), &c_tag).await.unwrap();
+
+        // Original topology [a, b, c]: c (index 2) is un-caught-up and fenced.
+        let original = vec![
+            repl_handle(a.clone(), "a"),
+            repl_handle(b.clone(), "b"),
+            repl_handle(c.clone(), "c"),
+        ];
+        assert!(
+            !region_owed_no_notes(&original, 2).await,
+            "c is un-caught-up and must be fenced in its original position",
+        );
+
+        // Operator reorders the topology to [c, a, b]: c is now index 0. No data
+        // moved; only positions did. The sentinel, keyed by the stable tag `c`,
+        // still fences c. A position-keyed sentinel (`_repl/2/`) would now be
+        // looked up under `_repl/0/`, find nothing, and wrongly report c caught up.
+        let reordered = vec![
+            repl_handle(c.clone(), "c"),
+            repl_handle(a.clone(), "a"),
+            repl_handle(b.clone(), "b"),
+        ];
+        assert!(
+            !region_owed_no_notes(&reordered, 0).await,
+            "a name-keyed sentinel follows its bucket across a reorder; c stays fenced",
+        );
+    }
+
+    /// F25, the second failure mode: a bucket that lands where a since-departed
+    /// bucket used to sit must not inherit that bucket's stale sentinel. Name
+    /// keying closes it — the fresh bucket is looked up under its own tag, which is
+    /// clean. The position-keyed predecessor would have found the recycled
+    /// `_repl/<pos>/` marker and false-fenced a fully-converged bucket.
+    #[tokio::test]
+    async fn a_recycled_position_does_not_inherit_a_departed_buckets_sentinel() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let fresh = Arc::new(InMemStorage::default());
+        // A since-removed bucket left its sentinel behind on the peers, keyed by
+        // ITS tag.
+        let gone_tag = crate::counters::bucket_tag("gone");
+        seed_backfill_sentinel(a.as_ref(), &gone_tag).await.unwrap();
+        seed_backfill_sentinel(b.as_ref(), &gone_tag).await.unwrap();
+
+        // `fresh` is fully converged and carries no sentinel of its own; it now
+        // occupies index 2 — the slot the removed bucket used to hold.
+        let handles = vec![
+            repl_handle(a.clone(), "a"),
+            repl_handle(b.clone(), "b"),
+            repl_handle(fresh.clone(), "fresh"),
+        ];
+        assert!(
+            region_owed_no_notes(&handles, 2).await,
+            "a name-keyed gate never inherits a departed bucket's sentinel",
+        );
+    }
+
+    /// The repair-note half of the `_repl/` family is keyed the same way: a note
+    /// names its destination by tag, so the sweep resolves it to that bucket's
+    /// CURRENT position after a reorder and drops it (never misroutes it onto a
+    /// survivor) once the destination is gone.
+    #[test]
+    fn a_repair_note_routes_by_destination_tag_not_position() {
+        let key = format!(
+            "{REPL_PREFIX}{}/pkg/pkg-1.whl!nonce",
+            crate::counters::bucket_tag("c")
+        );
+        let marker = parse_repl_marker(&key).expect("a repair note key parses");
+        assert_eq!(marker.dest_tag, crate::counters::bucket_tag("c"));
+
+        let fresh = |name: &str| repl_handle(Arc::new(InMemStorage::default()), name);
+        let original = vec![fresh("a"), fresh("b"), fresh("c")];
+        assert_eq!(dest_index_for_tag(&original, &marker.dest_tag), Some(2));
+
+        let reordered = vec![fresh("c"), fresh("a"), fresh("b")];
+        assert_eq!(dest_index_for_tag(&reordered, &marker.dest_tag), Some(0));
+
+        // Destination removed entirely: undeliverable, resolves to no bucket.
+        let without_c = vec![fresh("a"), fresh("b")];
+        assert_eq!(dest_index_for_tag(&without_c, &marker.dest_tag), None);
     }
 
     #[tokio::test]
@@ -5329,8 +5485,12 @@ mod tests {
             .observe(1, crate::bucket_health::BucketSignal::Success)
             .unwrap();
         state.bucket_health = Some(health.clone());
-        write_marker(a.as_ref(), 1, "from-a", from_a).await.unwrap();
-        write_marker(b.as_ref(), 0, "from-b", from_b).await.unwrap();
+        write_marker(a.as_ref(), "b", "from-a", from_a)
+            .await
+            .unwrap();
+        write_marker(b.as_ref(), "a", "from-b", from_b)
+            .await
+            .unwrap();
 
         // Every background path with an index-aware entry point skips B. The
         // B-only private record would copy to A if the full diff touched it.

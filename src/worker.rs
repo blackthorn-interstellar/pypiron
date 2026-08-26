@@ -446,18 +446,25 @@ async fn maintain_bucket_selection(state: &AppState) -> bool {
 }
 
 /// Whether the region bucket `region` has no repair still owed to it: every
-/// other bucket's `_repl/<region>/` tree is empty. Conservative — an unreachable
+/// other bucket's `_repl/<region-tag>/` tree is empty. The region bucket is
+/// addressed by its stable [`crate::counters::bucket_tag`], so a fence a peer holds
+/// still points at it after any topology reorder. Conservative — an unreachable
 /// peer or any error defers the return, keeping reads on the write bucket
 /// (slower, never wrong). Bounded single-key LISTs; only called when a read
 /// return is pending, never on the request path.
 async fn region_bucket_caught_up(state: &AppState, region: usize) -> bool {
-    for (index, handle) in state.buckets.handles().iter().enumerate() {
+    let handles = state.buckets.handles();
+    let Some(region_handle) = handles.get(region) else {
+        return true;
+    };
+    let region_tag = crate::counters::bucket_tag(&region_handle.name);
+    for (index, handle) in handles.iter().enumerate() {
         if index == region {
             continue;
         }
         match timeout(
             BUCKET_HEALTH_IO_TIMEOUT,
-            crate::replicate::has_undrained_repl_notes_for(handle.storage.as_ref(), region),
+            crate::replicate::has_undrained_repl_notes_for(handle.storage.as_ref(), &region_tag),
         )
         .await
         {

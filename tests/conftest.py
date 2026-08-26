@@ -2180,6 +2180,23 @@ def minio_list_keys_in(minio: Dict, bucket: str) -> List[str]:
     return sorted(_s3_list(minio, bucket))
 
 
+def bucket_repl_tag(identity: str) -> str:
+    """The `_repl/<tag>/` key segment pypiron writes for the bucket whose
+    configured identity is `identity` (`s3://name`, `az://container`, …). The
+    replication keyspace — backfill sentinels and repair notes alike — is keyed by
+    a bucket's stable identity, not its position in the list, so a topology reorder
+    or removal can neither orphan a fence nor point a note at the wrong bucket.
+    Mirrors `counters::bucket_tag`: everything outside `[A-Za-z0-9._-]` folds to
+    `-`, and an empty identity (the single-bucket default) becomes `local`."""
+    tag = re.sub(r"[^A-Za-z0-9._-]", "-", identity)
+    return tag or "local"
+
+
+def s3_repl_tag(bucket: str) -> str:
+    """`bucket_repl_tag` for an `s3://<bucket>` identity — the common case."""
+    return bucket_repl_tag(f"s3://{bucket}")
+
+
 def minio_get_key_in(minio: Dict, bucket: str, key: str) -> str:
     """Read an object's body from a named bucket, bypassing pypiron."""
     return minio_get_key_bytes_in(minio, bucket, key).decode()

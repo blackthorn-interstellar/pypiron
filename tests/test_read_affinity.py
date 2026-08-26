@@ -48,6 +48,7 @@ from .conftest import (
     minio_list_keys_in,
     minio_object_sha256,
     minio_put_key_in,
+    s3_repl_tag,
 )
 from .helpers import (
     ACCEPT_PEP691,
@@ -159,7 +160,9 @@ def _sidecar(minio, bucket: str, akey: str) -> dict:
     return json.loads(minio_get_key_in(minio, bucket, f"{akey}.meta.json"))
 
 
-def _owe_the_region_bucket_forever(minio, write_bucket: str, pkg: str, filename: str) -> list[str]:
+def _owe_the_region_bucket_forever(
+    minio, write_bucket: str, region_bucket: str, pkg: str, filename: str
+) -> list[str]:
     """Seed a `_repl/` note owed to the region bucket that the sweep can never
     drain, so the drain gate is provably what holds reads — isolated from the
     healthy-return window, and for as long as a test wants. The source record's
@@ -176,7 +179,7 @@ def _owe_the_region_bucket_forever(minio, write_bucket: str, pkg: str, filename:
     )
     minio_put_key_in(minio, write_bucket, f"{akey}.meta.json", "not json")
     minio_put_key_in(minio, write_bucket, akey, "bytes")
-    note = f"_repl/1/{pkg}/{filename}!hold"
+    note = f"_repl/{s3_repl_tag(region_bucket)}/{pkg}/{filename}!hold"
     minio_put_key_in(minio, write_bucket, note, "")
     return [note, akey, f"{akey}.meta.json", f"packages/{pkg}/.origin"]
 
@@ -284,9 +287,9 @@ def test_absent_artifact_reads_through_without_a_client_404(
     # Ground truth: A holds the record, B does not, and A owes B a repair note.
     assert minio_key_exists_in(minio, a, akey)
     assert not minio_key_exists_in(minio, b, akey), "B missed the fan-out"
-    assert any(k.startswith(f"_repl/1/{pkg}/") for k in minio_list_keys_in(minio, a)), (
-        "A carries the _repl note owed to B"
-    )
+    assert any(
+        k.startswith(f"_repl/{s3_repl_tag(b)}/{pkg}/") for k in minio_list_keys_in(minio, a)
+    ), "A carries the _repl note owed to B"
     assert _read_bucket(server) == b, "the read pin stayed on the lagging region bucket"
 
     # The contract: no client-visible 404 for an acked file while B lags. Hold it
@@ -430,7 +433,9 @@ def test_region_bucket_failover_and_drain_gated_return(
     out_key = f"packages/{out_pkg}/{out_wheel.name}"
     _upload(server, out_wheel)
     _eventually(
-        lambda: any(k.startswith(f"_repl/1/{out_pkg}/") for k in minio_list_keys_in(minio, a)),
+        lambda: any(
+            k.startswith(f"_repl/{s3_repl_tag(b)}/{out_pkg}/") for k in minio_list_keys_in(minio, a)
+        ),
         what="outage publish owes B a note",
     )
     assert not minio_key_exists_in(minio, b, out_key)
@@ -439,7 +444,7 @@ def test_region_bucket_failover_and_drain_gated_return(
     # the gate holding reads off B. Seed a second note B can never satisfy on its
     # own, so what keeps reads on A is provably the drain gate.
     hold_keys = _owe_the_region_bucket_forever(
-        minio, a, "holdopen", "holdopen-1.0-py3-none-any.whl"
+        minio, a, b, "holdopen", "holdopen-1.0-py3-none-any.whl"
     )
 
     # Recover B. The healthy window elapses and the real note drains — B ends up
@@ -515,7 +520,7 @@ def test_the_read_pin_is_lent_to_the_region_bucket_and_taken_back(
     # outage. B heals, but the owed note keeps reads on A: reads now have no
     # earned claim on B, which is the precondition for a loan.
     hold_keys = _owe_the_region_bucket_forever(
-        minio, a, "loanhold", "loanhold-1.0-py3-none-any.whl"
+        minio, a, b, "loanhold", "loanhold-1.0-py3-none-any.whl"
     )
     faults.fail(b)
     _eventually(lambda: _read_bucket(server) == a, what="reads leave the dead region bucket")
@@ -696,7 +701,10 @@ def test_preferred_bucket_failover_leaves_the_region_read_pin_alone(
             what="the outage publish still fanned out to the region bucket B",
         )
         _eventually(
-            lambda: any(k.startswith(f"_repl/0/{out_pkg}/") for k in minio_list_keys_in(minio, c)),
+            lambda: any(
+                k.startswith(f"_repl/{s3_repl_tag(a)}/{out_pkg}/")
+                for k in minio_list_keys_in(minio, c)
+            ),
             what="the dead preferred bucket is owed a repair note",
         )
 
@@ -761,7 +769,9 @@ def test_boot_with_the_region_bucket_unreachable_reads_from_the_write_bucket(
         assert minio_key_exists_in(minio, a, akey)
         assert not minio_key_exists_in(minio, b, akey), "B was dark for the fan-out"
         _eventually(
-            lambda: any(k.startswith(f"_repl/1/{pkg}/") for k in minio_list_keys_in(minio, a)),
+            lambda: any(
+                k.startswith(f"_repl/{s3_repl_tag(b)}/{pkg}/") for k in minio_list_keys_in(minio, a)
+            ),
             what="A carries the note owed to the dark region bucket",
         )
 

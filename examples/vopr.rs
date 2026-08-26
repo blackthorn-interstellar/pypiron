@@ -2685,7 +2685,7 @@ impl FaultView {
     }
 
     /// `--break fanout` is armed: peer bucket 1 blackholes every chaos-phase op
-    /// (below) *and* the `_repl/1/` note that is supposed to owe it never lands
+    /// (below) *and* the `_repl/bucket-1/` note that is supposed to owe it never lands
     /// (`put_bytes`), so a publish acks with neither the copy nor the promise —
     /// a totality violation and nothing else. It heals with the fault plan, so
     /// the heal phase still converges every other oracle.
@@ -2757,7 +2757,7 @@ impl Storage for FaultView {
         } else {
             self.gate("put", key).await?;
         }
-        if key.starts_with("_repl/1/") && self.fanout_break() {
+        if key.starts_with("_repl/bucket-1/") && self.fanout_break() {
             if let Some(viz) = &self.plan.viz {
                 viz.emit(
                     "drop",
@@ -6709,7 +6709,7 @@ mod tests {
         assert!(fleet_agreed(&[agreed.clone(), agreed.clone()]));
 
         let mut owing = agreed.clone();
-        owing.insert("_repl/1/p/a.whl!7".into(), b"note".to_vec());
+        owing.insert("_repl/bucket-1/p/a.whl!7".into(), b"note".to_vec());
         owing.insert("_dirty/p".into(), b"marker".to_vec());
         assert_eq!(
             replication_debt(&[owing, agreed.clone()]),

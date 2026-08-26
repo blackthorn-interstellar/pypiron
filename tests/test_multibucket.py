@@ -43,6 +43,7 @@ from .conftest import (
     minio_put_key_in,
     minio_remove_bucket,
     s3_buckets_uri,
+    s3_repl_tag,
 )
 from .helpers import (
     ACCEPT_PEP691,
@@ -557,7 +558,7 @@ def test_upload_storm_retries_through_selection_switch(s3_server_multi_failover,
                 [
                     key
                     for key in minio_list_keys_in(minio, b)
-                    if key.startswith("_repl/0/switchstorm")
+                    if key.startswith(f"_repl/{s3_repl_tag(a)}/switchstorm")
                 ]
             )
             >= len(wheels)
@@ -757,16 +758,16 @@ def test_three_bucket_marker_bypasses_blackholed_middle(s3_server_three_failover
         minio_put_key_in(
             minio,
             a,
-            f"_repl/1/{blocked_pkg}/{blocked_filename}!blackholed",
+            f"_repl/{s3_repl_tag(b)}/{blocked_pkg}/{blocked_filename}!blackholed",
             "",
         )
     _seed_private_record(minio, a, pkg, filename, "durable marker bytes")
-    minio_put_key_in(minio, a, f"_repl/2/{pkg}/{filename}!lost-eager", "")
+    minio_put_key_in(minio, a, f"_repl/{s3_repl_tag(c)}/{pkg}/{filename}!lost-eager", "")
     _seed_private_record(minio, c, reverse_pkg, reverse_filename, "later source bytes")
     minio_put_key_in(
         minio,
         c,
-        f"_repl/0/{reverse_pkg}/{reverse_filename}!later-source",
+        f"_repl/{s3_repl_tag(a)}/{reverse_pkg}/{reverse_filename}!later-source",
         "",
     )
 
@@ -783,7 +784,7 @@ def test_three_bucket_marker_bypasses_blackholed_middle(s3_server_three_failover
     _eventually(
         lambda: (
             not any(
-                marker.startswith(f"_repl/2/{pkg}/{filename}!")
+                marker.startswith(f"_repl/{s3_repl_tag(c)}/{pkg}/{filename}!")
                 for marker in minio_list_keys_in(minio, a)
             )
         ),
@@ -899,7 +900,9 @@ def test_repl_marker_accumulates_then_drains_when_destination_returns(
 
     # A todo marker for destination index 1 (bucket B) accumulates in bucket A.
     def _marker_present():
-        return any(k.startswith(f"_repl/1/{pkg}/") for k in minio_list_keys_in(minio, a))
+        return any(
+            k.startswith(f"_repl/{s3_repl_tag(b)}/{pkg}/") for k in minio_list_keys_in(minio, a)
+        )
 
     _eventually(_marker_present, what="_repl/ marker for the down bucket")
     _eventually(
@@ -1104,7 +1107,7 @@ def test_follower_with_working_path_drains_leaders_marker(s3_servers_multi, tmp_
     _eventually(
         lambda: (
             not any(
-                marker.startswith(f"_repl/1/followerdrain/{wheel.name}!")
+                marker.startswith(f"_repl/{s3_repl_tag(b)}/followerdrain/{wheel.name}!")
                 for marker in minio_list_keys_in(minio, a)
             )
         ),
@@ -1153,7 +1156,10 @@ def test_follower_with_working_path_runs_full_diff_and_warms_index(
     filename = f"{pkg}-1.0-py3-none-any.whl"
     key = f"packages/{pkg}/{filename}"
     _seed_private_record(minio, a, pkg, filename, "truth with no marker")
-    assert not any(marker.startswith(f"_repl/1/{pkg}/") for marker in minio_list_keys_in(minio, a))
+    assert not any(
+        marker.startswith(f"_repl/{s3_repl_tag(b)}/{pkg}/")
+        for marker in minio_list_keys_in(minio, a)
+    )
 
     _eventually(
         lambda: minio_key_exists_in(minio, b, key),
@@ -1199,14 +1205,16 @@ def test_partitioned_nodes_accept_writes_and_heal_both_directions(s3_servers_mul
     assert not minio_key_exists_in(minio, a, right_key)
     _eventually(
         lambda: any(
-            key.startswith("_repl/1/partitionleft/") for key in minio_list_keys_in(minio, a)
+            key.startswith(f"_repl/{s3_repl_tag(b)}/partitionleft/")
+            for key in minio_list_keys_in(minio, a)
         ),
         timeout=15,
         what="A retains its marker for unreachable B",
     )
     _eventually(
         lambda: any(
-            key.startswith("_repl/0/partitionright/") for key in minio_list_keys_in(minio, b)
+            key.startswith(f"_repl/{s3_repl_tag(a)}/partitionright/")
+            for key in minio_list_keys_in(minio, b)
         ),
         timeout=15,
         what="B retains its marker for unreachable A",
@@ -1377,11 +1385,11 @@ def test_partitioned_delete_beats_concurrent_yank(s3_servers_multi, tmp_path):
     _eventually(
         lambda: (
             any(
-                marker.startswith(f"_repl/1/{pkg}/{wheel.name}!")
+                marker.startswith(f"_repl/{s3_repl_tag(b)}/{pkg}/{wheel.name}!")
                 for marker in minio_list_keys_in(minio, a)
             )
             and any(
-                marker.startswith(f"_repl/0/{pkg}/{wheel.name}!")
+                marker.startswith(f"_repl/{s3_repl_tag(a)}/{pkg}/{wheel.name}!")
                 for marker in minio_list_keys_in(minio, b)
             )
         ),
@@ -1779,7 +1787,7 @@ def test_migrate_refuses_to_drop_a_removed_bucket_holding_notes_then_succeeds(
 
     # A fan-out note that only bucket c (the one we are about to drop) holds:
     # `_repl/<dest>/<pkg>/<file>!<nonce>`.
-    note_key = "_repl/0/lonelypkg/lonelypkg-1.0-py3-none-any.whl!stranded"
+    note_key = f"_repl/{s3_repl_tag(a)}/lonelypkg/lonelypkg-1.0-py3-none-any.whl!stranded"
     minio_put_key_in(minio, c, note_key, "")
 
     # Shrinking to [a, b] must be refused: c is being removed but still holds a note.
@@ -1902,7 +1910,11 @@ def test_migrate_seeds_backfill_sentinel_and_reconcile_drains_it(
     assert rc == 0, f"adding a bucket failed:\n{out}\n{err}"
 
     def _sentinels(bucket) -> list[str]:
-        return [k for k in minio_list_keys_in(minio, bucket) if k.startswith("_repl/2/_backfill!")]
+        return [
+            k
+            for k in minio_list_keys_in(minio, bucket)
+            if k.startswith(f"_repl/{s3_repl_tag(c)}/_backfill!")
+        ]
 
     for peer in (a, b):
         assert _sentinels(peer), f"no backfill sentinel seeded on peer {peer}"
@@ -1951,14 +1963,16 @@ def test_migrate_single_to_multi_fences_the_new_empty_bucket(minio_two, pypiron_
     assert rc == 0, f"single->multi migration failed:\n{out}\n{err}"
 
     # The new empty bucket b (index 1) is fenced by a sentinel on its peer a.
-    assert [k for k in minio_list_keys_in(minio, a) if k.startswith("_repl/1/_backfill!")], (
-        f"single->multi seeded no backfill sentinel for the new empty bucket:\n{out}\n{err}"
-    )
+    assert [
+        k
+        for k in minio_list_keys_in(minio, a)
+        if k.startswith(f"_repl/{s3_repl_tag(b)}/_backfill!")
+    ], f"single->multi seeded no backfill sentinel for the new empty bucket:\n{out}\n{err}"
     # The established corpus bucket a (index 0) is fenced nowhere: it keeps serving.
     for bucket in (a, b):
-        assert not [k for k in minio_list_keys_in(minio, bucket) if k.startswith("_repl/0/")], (
-            "the bucket that already holds the corpus must keep serving region reads"
-        )
+        assert not [
+            k for k in minio_list_keys_in(minio, bucket) if k.startswith(f"_repl/{s3_repl_tag(a)}/")
+        ], "the bucket that already holds the corpus must keep serving region reads"
     # The new bucket owes itself no note.
     assert not [k for k in minio_list_keys_in(minio, b) if k.startswith("_repl/")]
 
@@ -1977,7 +1991,11 @@ def test_backfill_sentinel_does_not_wedge_a_later_migrate(minio_three, pypiron_b
     env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b)
     rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
     assert rc == 0, f"establishing [a, b] failed:\n{out}\n{err}"
-    assert [k for k in minio_list_keys_in(minio, a) if k.startswith("_repl/1/_backfill!")]
+    assert [
+        k
+        for k in minio_list_keys_in(minio, a)
+        if k.startswith(f"_repl/{s3_repl_tag(b)}/_backfill!")
+    ]
 
     # Add c while b's sentinel is still undrained.
     env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b, c)
@@ -1986,11 +2004,15 @@ def test_backfill_sentinel_does_not_wedge_a_later_migrate(minio_three, pypiron_b
     # c (index 2) is now fenced on both its peers, and b's earlier fence survives.
     for bucket in (a, b):
         assert [
-            k for k in minio_list_keys_in(minio, bucket) if k.startswith("_repl/2/_backfill!")
+            k
+            for k in minio_list_keys_in(minio, bucket)
+            if k.startswith(f"_repl/{s3_repl_tag(c)}/_backfill!")
         ], f"no sentinel for the newly-added bucket c on peer {bucket}"
-    assert [k for k in minio_list_keys_in(minio, a) if k.startswith("_repl/1/_backfill!")], (
-        "the earlier sentinel for b was lost across the second migrate"
-    )
+    assert [
+        k
+        for k in minio_list_keys_in(minio, a)
+        if k.startswith(f"_repl/{s3_repl_tag(b)}/_backfill!")
+    ], "the earlier sentinel for b was lost across the second migrate"
 
 
 def test_fresh_startup_repairs_member_that_missed_topology_migration(

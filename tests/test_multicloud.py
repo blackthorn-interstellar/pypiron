@@ -30,6 +30,7 @@ from .conftest import (
     minio_get_key_in,
     minio_key_exists_in,
     minio_object_sha256,
+    s3_repl_tag,
 )
 from .helpers import (
     find_free_port,
@@ -311,7 +312,11 @@ def test_failover_to_azure_serves_reads_and_repair_note_drains_after_heal(
     # The durable ground truth: a repair note aimed at the down S3 bucket
     # (dest index 0) sits on the working Azure bucket, written before the ack.
     note = _eventually(
-        lambda: [k for k in azurite_list_keys(azure, "_repl/") if k.startswith("_repl/0/")],
+        lambda: [
+            k
+            for k in azurite_list_keys(azure, "_repl/")
+            if k.startswith(f"_repl/{s3_repl_tag(s3_bucket)}/")
+        ],
         what="a repair note aimed at the down S3 bucket is durable on Azure",
     )
     assert any("healmixed" in k for k in note), f"note should reference the missed record: {note}"

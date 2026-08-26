@@ -60,6 +60,15 @@ const MAX_LISTINGS: usize = 8192;
 const SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Same retry budget as `sync`: at CDN scale, transient errors are routine.
 const DOWNLOAD_ATTEMPTS: u32 = 3;
+/// Fixed head start every artifact download gets before its size-derived budget
+/// begins: connect, TLS, upstream think-time, and the whole of a small wheel.
+const DOWNLOAD_GRACE: Duration = Duration::from_secs(60);
+/// The slowest sustained transfer worth waiting on, 64 KiB/s. Below it an
+/// upstream is not delivering a file, it is occupying a single-flight slot.
+const DOWNLOAD_FLOOR_BYTES_PER_SEC: u64 = 64 * 1024;
+/// Ceiling on one download attempt whatever the declared size — an hour is well
+/// past any wheel PyPI serves, and it is what an unsized body gets.
+const DOWNLOAD_MAX: Duration = Duration::from_secs(3600);
 /// How long a positive "already cached locally" observation is trusted before a
 /// re-verifying HEAD. Artifacts are immutable, so present→absent only happens on
 /// a delete/prune (rare) or a bucket switch (handled by the generation key), and
@@ -400,19 +409,41 @@ impl Proxy {
     /// Acquire the single-flight slot for an artifact key, waiting if another
     /// task is already downloading it. Held until the returned guard drops.
     async fn acquire_download_slot(&self, key: &str) -> DownloadSlot {
-        let lock = self
-            .inflight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key.to_string())
-            .or_default()
-            .clone();
+        let lock = self.slot_lock(key);
         let guard = lock.lock_owned().await;
         DownloadSlot {
             inflight: self.inflight.clone(),
             key: key.to_string(),
             _guard: guard,
         }
+    }
+
+    /// Take the single-flight slot only if it is free. `None` means another task
+    /// is already filling this key, so the caller is a waiter and must block on
+    /// [`acquire_download_slot`] instead. Splitting the two lets the *leader*
+    /// hand its slot to a spawned fill (which outlives the request) while a
+    /// waiter keeps waiting on the request's own task, where its wait costs
+    /// nothing if the client goes away.
+    fn try_acquire_download_slot(&self, key: &str) -> Option<DownloadSlot> {
+        let lock = self.slot_lock(key);
+        let guard = lock.try_lock_owned().ok()?;
+        Some(DownloadSlot {
+            inflight: self.inflight.clone(),
+            key: key.to_string(),
+            _guard: guard,
+        })
+    }
+
+    /// The per-key mutex, created on first use. Taken under the map lock, which
+    /// [`DownloadSlot::drop`] also holds while it decides whether to prune, so a
+    /// clone taken here is never an entry that is about to be dropped.
+    fn slot_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+            .or_default()
+            .clone()
     }
 
     /// Is this (PEP 503-normalized) name allowed to fall through to upstream?
@@ -430,6 +461,43 @@ impl Proxy {
             .is_some_and(|constraints| constraints.iter().any(Option::is_none))
     }
 
+    /// Would the denylist drop this file from what installers see? True for a
+    /// bare (whole-name) exclude, or a version-pinned one the file's inferred
+    /// version matches. This is the delisting primitive the index rebuild and the
+    /// human `/project/` page share; the separate [`Proxy::name_fully_denied`]
+    /// pull gate keeps a fully-denied name from ever being fetched upstream.
+    pub(crate) fn file_denied(&self, pkg: &str, filename: &str) -> bool {
+        self.deny
+            .as_ref()
+            .and_then(|m| m.get(pkg))
+            .is_some_and(|constraints| version_allowed(constraints, filename))
+    }
+
+    /// The denylist as a stable, comparable map: normalized name → sorted
+    /// specifier strings, with `"*"` marking a bare whole-name exclude. Empty
+    /// when no excludes are configured. The startup reconcile diffs this against
+    /// the set the stored indexes were last built against, so an exclude change
+    /// made across a restart delists (or relists) exactly the affected names.
+    pub(crate) fn denylist_canonical(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        let mut out = std::collections::BTreeMap::new();
+        let Some(deny) = self.deny.as_ref() else {
+            return out;
+        };
+        for (name, constraints) in deny {
+            let mut specs: Vec<String> = constraints
+                .iter()
+                .map(|c| match c {
+                    Some(s) => s.to_string(),
+                    None => "*".to_string(),
+                })
+                .collect();
+            specs.sort();
+            specs.dedup();
+            out.insert(name.clone(), specs);
+        }
+        out
+    }
+
     /// Does this file satisfy the name's version constraints? Allowed when no
     /// scope is configured; otherwise the name's constraints gate the version.
     /// A name in scope is reached here only after [`name_in_scope`], so a miss
@@ -441,15 +509,7 @@ impl Proxy {
                 .get(pkg)
                 .is_some_and(|constraints| version_allowed(constraints, filename)),
         };
-        if !allowed {
-            return false;
-        }
-        if let Some(constraints) = self.deny.as_ref().and_then(|m| m.get(pkg)) {
-            if version_allowed(constraints, filename) {
-                return false;
-            }
-        }
-        true
+        allowed && !self.file_denied(pkg, filename)
     }
 
     pub fn upstream(&self) -> &str {
@@ -573,9 +633,9 @@ impl Proxy {
     /// so the caller schedules the off-request-path peer replication notes. `Err`
     /// is a hard failure (storage outage, exhausted verification retries).
     pub async fn ensure_artifact_cached(
-        &self,
-        state: &AppState,
-        storage: &dyn Storage,
+        self: &Arc<Self>,
+        state: &Arc<AppState>,
+        storage: &Arc<dyn Storage>,
         pkg: &str,
         filename: &str,
     ) -> Result<bool> {
@@ -591,10 +651,60 @@ impl Proxy {
             return Ok(false);
         }
         // Serialize concurrent fetches of the *same* artifact (distinct files
-        // still download in parallel). The slot is held until this function
-        // returns; a racer that loses the race re-checks below and finds the
-        // file already cached instead of downloading its own copy.
-        let _slot = self.acquire_download_slot(&key).await;
+        // still download in parallel). A racer that loses the race waits for the
+        // slot on this task, re-checks, and finds the file already cached instead
+        // of downloading its own copy. If the leader's fill failed there is
+        // nothing cached to find, so the waiter inherits the slot and fills it
+        // itself — exactly what it did when the fill ran inline.
+        let slot = match self.try_acquire_download_slot(&key) {
+            Some(slot) => slot,
+            None => {
+                let slot = self.acquire_download_slot(&key).await;
+                if storage.head_exists(&key).await? {
+                    return Ok(false);
+                }
+                slot
+            }
+        };
+        // The fill itself runs in its own task, holding the slot for its whole
+        // life. A client disconnect (pip's default timeout is ~15s; a large wheel
+        // from a slow upstream is not) drops this handle, which detaches the task
+        // rather than cancelling it — so the download finishes and the retry that
+        // pip issues finds the artifact cached. Cancelling it was a livelock:
+        // every retry restarted from byte zero and none ever completed.
+        //
+        // Awaiting the handle keeps a connected client's semantics identical: the
+        // same `Ok(bool)`, the same errors, in the same order.
+        let fill = tokio::spawn(Arc::clone(self).fill_artifact(
+            Arc::clone(state),
+            Arc::clone(storage),
+            pkg.to_string(),
+            filename.to_string(),
+            key,
+            slot,
+        ));
+        match fill.await {
+            Ok(filled) => filled,
+            Err(join) => Err(anyhow::Error::new(join))
+                .with_context(|| format!("proxy cache fill for '{pkg}/{filename}' did not finish")),
+        }
+    }
+
+    /// The cold-miss fill: download → verify → commit, holding the single-flight
+    /// `slot` until it returns. Spawned by [`ensure_artifact_cached`], never
+    /// awaited on its own, so every early return here is one the request sees.
+    async fn fill_artifact(
+        self: Arc<Self>,
+        state: Arc<AppState>,
+        storage: Arc<dyn Storage>,
+        pkg: String,
+        filename: String,
+        key: String,
+        _slot: DownloadSlot,
+    ) -> Result<bool> {
+        let state = state.as_ref();
+        let storage = storage.as_ref();
+        let (pkg, filename) = (pkg.as_str(), filename.as_str());
         if storage.head_exists(&key).await? {
             return Ok(false);
         }
@@ -1109,7 +1219,11 @@ impl Proxy {
         url: &reqwest::Url,
         file: &SimpleFile,
     ) -> Result<FinishedSpool> {
-        let resp = ssrf::guarded_get(&self.client, &self.guard, url.clone(), None)
+        // Total budget for this attempt. The client's 30s inactivity timeout only
+        // catches an upstream that stops; one that trickles resets it forever and
+        // would hold this artifact's single-flight slot for hours.
+        let deadline = download_deadline(file.size, download_grace());
+        let resp = ssrf::guarded_get(&self.client, &self.guard, url.clone(), Some(deadline))
             .await?
             .error_for_status()?;
         let mut spool = UploadSpool::new(&state.spool_dir).await?;
@@ -1205,6 +1319,35 @@ async fn read_capped(resp: reqwest::Response, max: u64, url: &str) -> Option<byt
     Some(bytes::Bytes::from(buf))
 }
 
+/// How long one attempt at an artifact of `expected_size` bytes may take in
+/// total: `grace`, plus the time that many bytes need at
+/// [`DOWNLOAD_FLOOR_BYTES_PER_SEC`], capped at [`DOWNLOAD_MAX`]. An unknown size
+/// gets the cap — nothing to derive a budget from, and the mid-flight overrun
+/// check has nothing to bite on either.
+///
+/// This is a *liveness* bound, not a bandwidth policy: the size term is sized so
+/// that any upstream a real client could install from finishes far inside it,
+/// while one that trickles is cut off instead of holding the artifact's
+/// single-flight slot indefinitely.
+fn download_deadline(expected_size: Option<u64>, grace: Duration) -> Duration {
+    let Some(size) = expected_size else {
+        return DOWNLOAD_MAX;
+    };
+    let transfer = Duration::from_secs(size.div_ceil(DOWNLOAD_FLOOR_BYTES_PER_SEC));
+    grace.saturating_add(transfer).min(DOWNLOAD_MAX)
+}
+
+/// [`DOWNLOAD_GRACE`], unless the chaos suite shrank it. Test-only fault
+/// injection in the style of `PYPIRON_FAULT_ABORT_AFTER_WRITES` (see
+/// storage.rs): a blackbox test cannot afford to wait out a real 60s grace, and
+/// the deadline is worth proving *fires*, not just proving it computes.
+fn download_grace() -> Duration {
+    std::env::var("PYPIRON_FAULT_DOWNLOAD_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(DOWNLOAD_GRACE, Duration::from_secs)
+}
+
 /// Keep the listings cache bounded: first drop everything past its TTL (those
 /// would be re-fetched anyway), and if that didn't free a slot, evict the
 /// oldest entries down to half the cap so this stays amortized O(1) per insert.
@@ -1244,6 +1387,36 @@ mod tests {
         assert_eq!(host_rel.as_str(), "https://pypi.org/files/six/six.whl");
         let page_rel = proxy.resolve_url("six", "six.whl").unwrap();
         assert_eq!(page_rel.as_str(), "https://pypi.org/simple/six/six.whl");
+    }
+
+    #[test]
+    fn download_deadline_scales_with_the_declared_size() {
+        // A small wheel is all grace: 3 KiB needs a second at the floor rate.
+        assert_eq!(
+            download_deadline(Some(3 * 1024), DOWNLOAD_GRACE),
+            Duration::from_secs(61)
+        );
+        // 64 MiB at 64 KiB/s is 1024s of transfer on top of the grace.
+        assert_eq!(
+            download_deadline(Some(64 * 1024 * 1024), DOWNLOAD_GRACE),
+            Duration::from_secs(60 + 1024)
+        );
+        // A zero-byte body still gets the grace, and the grace alone.
+        assert_eq!(download_deadline(Some(0), DOWNLOAD_GRACE), DOWNLOAD_GRACE);
+        // No declared size: nothing to derive a budget from, so the cap.
+        assert_eq!(download_deadline(None, DOWNLOAD_GRACE), DOWNLOAD_MAX);
+        // The cap holds against an absurd (or hostile) declared size, and against
+        // a grace that would overflow the addition on its own.
+        assert_eq!(
+            download_deadline(Some(u64::MAX), DOWNLOAD_GRACE),
+            DOWNLOAD_MAX
+        );
+        assert_eq!(download_deadline(Some(1), Duration::MAX), DOWNLOAD_MAX);
+        // The chaos suite's shrunken grace still bounds a tiny file tightly.
+        assert_eq!(
+            download_deadline(Some(3 * 1024), Duration::from_secs(3)),
+            Duration::from_secs(4)
+        );
     }
 
     #[test]
@@ -1385,6 +1558,54 @@ mod tests {
         assert!(!proxy.version_in_scope("demo", "demo-3.0-py3-none-any.whl"));
         assert!(!proxy.version_in_scope("pinned", "pinned-1.5-py3-none-any.whl"));
         assert!(proxy.version_in_scope("pinned", "pinned-2.0-py3-none-any.whl"));
+    }
+
+    #[test]
+    fn file_denied_matches_the_delisting_the_index_rebuild_applies() {
+        let mirror = ResolvedMirror {
+            exclude_packages: vec![spec("blocked", None), spec("pinned", Some("<2"))],
+            ..Default::default()
+        };
+        let proxy = Proxy::new("https://pypi.org", mirror, false, &[], &[]).unwrap();
+        // A bare exclude denies every file of the name — the index rebuild empties
+        // the package, so it delists entirely.
+        assert!(proxy.file_denied("blocked", "blocked-1.0-py3-none-any.whl"));
+        assert!(proxy.file_denied("blocked", "blocked-anything.tar.gz"));
+        // A version pin denies only the matching releases; the rest survive.
+        assert!(proxy.file_denied("pinned", "pinned-1.9-py3-none-any.whl"));
+        assert!(!proxy.file_denied("pinned", "pinned-2.0-py3-none-any.whl"));
+        // A name with no exclude entry is never denied.
+        assert!(!proxy.file_denied("free", "free-1.0-py3-none-any.whl"));
+    }
+
+    #[test]
+    fn denylist_canonical_is_a_stable_comparable_stamp() {
+        let mirror = ResolvedMirror {
+            exclude_packages: vec![
+                spec("blocked", None),
+                spec("pinned", Some("<2")),
+                spec("pinned", Some(">=3")),
+            ],
+            ..Default::default()
+        };
+        let proxy = Proxy::new("https://pypi.org", mirror, false, &[], &[]).unwrap();
+        let canonical = proxy.denylist_canonical();
+        assert_eq!(canonical.get("blocked"), Some(&vec!["*".to_string()]));
+        // Specifier strings are sorted, so the same config always stamps equal.
+        assert_eq!(
+            canonical.get("pinned"),
+            Some(&vec!["<2".to_string(), ">=3".to_string()])
+        );
+        // No excludes → empty stamp (the "nothing enforced" baseline).
+        let open = Proxy::new(
+            "https://pypi.org",
+            ResolvedMirror::default(),
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(open.denylist_canonical().is_empty());
     }
 
     #[test]

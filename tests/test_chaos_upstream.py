@@ -14,12 +14,14 @@ mode injected on the artifact endpoint.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import http.server
 import json
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Iterator, Tuple
+from typing import Dict, Iterator, Optional, Tuple
+from urllib.parse import urlparse
 
 import pytest
 
@@ -49,6 +51,24 @@ HANG_SECS = 1.5
 # the boundedness assertion uses a much larger ceiling than the real ~10s.
 FAULT_GET_TIMEOUT = 60.0
 FAULT_BOUND_SECS = 45.0
+# The "slow" upstream dribbles a complete body out over this long. Longer than
+# SLOW_CLIENT_TIMEOUT by a wide margin, so the client is always gone before the
+# fill can finish; short enough that waiting the fill out costs seconds.
+SLOW_TRANSFER_SECS = 4.0
+SLOW_CHUNKS = 8
+SLOW_CLIENT_TIMEOUT = 1.0
+# The "trickle" upstream stays alive by sending one byte every interval — inside
+# the proxy's 30s between-chunks read timeout, which it therefore resets forever.
+# Only a *total* download deadline can end such a fetch. Bounded so a stray
+# handler thread can't outlive the test.
+TRICKLE_INTERVAL_SECS = 0.5
+TRICKLE_MAX_SECS = 90.0
+# What the deadline test shrinks the proxy's download grace to. The shipped 60s
+# grace is deliberately too long for a blackbox test to wait out (3 attempts plus
+# backoff is over three minutes); the arithmetic itself is pinned by the Rust
+# unit test `download_deadline_scales_with_the_declared_size`. Test-only fault
+# injection, same family as PYPIRON_FAULT_ABORT_AFTER_WRITES.
+SHORT_GRACE_SECS = 3
 
 
 class _FaultHandler(http.server.BaseHTTPRequestHandler):
@@ -148,6 +168,18 @@ class _FaultHandler(http.server.BaseHTTPRequestHandler):
             self._send_partial(len(full), full[: max(1, len(full) // 4)], stall=HANG_SECS)
             return
 
+        if mode == "slow":
+            # Correct bytes, just throttled: the fill takes seconds, so a client
+            # with a short timeout hangs up in the middle of it.
+            self._send_throttled(full)
+            return
+
+        if mode == "trickle":
+            # Never finishes, never goes quiet: defeats the between-chunks read
+            # timeout, so only the total download deadline can stop it.
+            self._send_trickle(full)
+            return
+
         raise AssertionError(f"unknown fault mode {mode!r}")
 
     def _send_bytes(self, body: bytes) -> None:
@@ -156,6 +188,50 @@ class _FaultHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_throttled(self, body: bytes) -> None:
+        """The whole body, paced over SLOW_TRANSFER_SECS."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        step = max(1, len(body) // SLOW_CHUNKS)
+        starts = range(0, len(body), step)
+        pause = SLOW_TRANSFER_SECS / max(1, len(starts))
+        for start in starts:
+            time.sleep(pause)
+            if not self._write(body[start : start + step]):
+                return
+
+    def _send_trickle(self, body: bytes) -> None:
+        """Advertise the full length, then send one byte per interval and never
+        arrive. Every byte resets the proxy's inactivity timeout, so a fetch that
+        ends at all ended on its total deadline."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        deadline = time.monotonic() + TRICKLE_MAX_SECS
+        sent = 0
+        while sent < len(body) and time.monotonic() < deadline:
+            time.sleep(TRICKLE_INTERVAL_SECS)
+            if not self._write(body[sent : sent + 1]):
+                return
+            sent += 1
+        self.close_connection = True
+
+    def _write(self, chunk: bytes) -> bool:
+        """Write one chunk; False once the peer has hung up. A proxy that drops a
+        body mid-stream (its deadline fired, or its client vanished) is what these
+        modes are for, not an error."""
+        try:
+            self.wfile.write(chunk)
+            self.wfile.flush()
+        except OSError:
+            self.close_connection = True
+            return False
+        return True
 
     def _send_partial(self, declared_len: int, partial: bytes, *, stall: float = 0.0) -> None:
         self.send_response(200)
@@ -204,6 +280,11 @@ class _FaultServer:
     def heal(self, pkg: str) -> None:
         self.httpd.faults[pkg] = "healthy"  # type: ignore[attr-defined]
 
+    def hits(self, pkg: str) -> int:
+        """Artifact GETs this upstream has served for `pkg` — the proof of how
+        many times the proxy actually went out for the bytes."""
+        return self.httpd.hits.get(pkg, 0)  # type: ignore[attr-defined]
+
     def stop(self) -> None:
         self.httpd.shutdown()
         self.httpd.server_close()
@@ -215,6 +296,7 @@ def _proxy_over_fault(
     tmp_path: Path,
     *,
     worker_args: tuple[str, ...] = (),
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> Iterator[Tuple[Dict, _FaultServer]]:
     """A real pypiron proxy pointed at a controllable fake upstream. The spool
     dir is isolated so a test can prove it drains after a failed download."""
@@ -224,6 +306,7 @@ def _proxy_over_fault(
     gen = _start_disk_server(
         tmp_path_factory,
         pypiron_bin,
+        extra_env=extra_env,
         extra_args=[
             "--proxy-upstream",
             upstream.base,
@@ -250,6 +333,20 @@ def proxy_over_fault(
     tmp_path_factory, pypiron_bin: Path, tmp_path: Path
 ) -> Iterator[Tuple[Dict, _FaultServer]]:
     yield from _proxy_over_fault(tmp_path_factory, pypiron_bin, tmp_path)
+
+
+@pytest.fixture()
+def proxy_over_fault_short_deadline(
+    tmp_path_factory, pypiron_bin: Path, tmp_path: Path
+) -> Iterator[Tuple[Dict, _FaultServer]]:
+    """A proxy whose per-download grace is seconds instead of a minute, so the
+    total-deadline behavior is testable inside a suite's time budget."""
+    yield from _proxy_over_fault(
+        tmp_path_factory,
+        pypiron_bin,
+        tmp_path,
+        extra_env={"PYPIRON_FAULT_DOWNLOAD_GRACE_SECS": str(SHORT_GRACE_SECS)},
+    )
 
 
 @pytest.fixture()
@@ -312,6 +409,29 @@ def _healthy_fetch_matches(proxy: Dict, pkg: str, filename: str, expected_sha: s
     # And it committed cleanly this time.
     assert (_pkg_dir(proxy, pkg) / filename).exists()
     assert origin_owner((_pkg_dir(proxy, pkg) / ".origin").read_text()) == "mirror"
+
+
+def _get_then_hang_up(url: str, *, timeout: float) -> None:
+    """Start a GET and drop the connection when it hasn't answered in `timeout` —
+    what pip does when its own (~15s by default) timeout fires mid-download."""
+    parsed = urlparse(url)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    try:
+        conn.request("GET", parsed.path)
+        conn.getresponse().read()
+    except OSError:
+        return  # the client gave up first, which is the point
+    finally:
+        conn.close()
+    raise AssertionError("the throttled fill answered before the client timed out")
+
+
+def _wait_for_artifact(proxy: Dict, pkg: str, filename: str, *, timeout: float) -> Path:
+    artifact = _pkg_dir(proxy, pkg) / filename
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not artifact.exists():
+        time.sleep(0.1)
+    return artifact
 
 
 # --------------------------------- tests --------------------------------------
@@ -427,6 +547,63 @@ def test_worker_reclaims_failed_proxy_claim_for_private_upload(proxy_over_fault_
     )
     wait_for_file_in_index(proxy["simple"], pkg, private_wheel.name)
     assert origin_owner(origin_file.read_text()) == "private"
+
+
+def test_client_disconnect_leaves_a_completed_fill(proxy_over_fault, tmp_path):
+    """A client that hangs up mid-fill must not cancel the fill. Otherwise every
+    retry restarts from byte zero and, against an upstream slower than the
+    client's timeout, no request ever completes — the download livelocks."""
+    proxy, upstream = proxy_over_fault
+    pkg = "disconnectpkg"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    filename = upstream.register(pkg, wheel)
+    upstream.set_fault(pkg, "slow")
+    url = f"{proxy['base_url']}/files/{pkg}/{filename}"
+
+    _get_then_hang_up(url, timeout=SLOW_CLIENT_TIMEOUT)
+
+    artifact = _wait_for_artifact(proxy, pkg, filename, timeout=FAULT_BOUND_SECS)
+    assert artifact.exists(), "the fill died with the client that started it"
+    assert sha256_file(artifact) == sha256_file(wheel)
+    assert origin_owner((_pkg_dir(proxy, pkg) / ".origin").read_text()) == "mirror"
+
+    # The retry the client would issue is served from that fill: one upstream
+    # fetch total, no restart from byte zero.
+    fetches = upstream.hits(pkg)
+    t0 = time.time()
+    code, body, _ = http_get(url, timeout=FAULT_GET_TIMEOUT)
+    elapsed = time.time() - t0
+    assert code == 200
+    assert hashlib.sha256(body).hexdigest() == sha256_file(wheel)
+    assert upstream.hits(pkg) == fetches, "the second request re-downloaded a cached artifact"
+    assert elapsed < FAULT_BOUND_SECS, f"serving the cached artifact took {elapsed:.1f}s"
+
+
+def test_trickling_upstream_hits_the_download_deadline(proxy_over_fault_short_deadline, tmp_path):
+    """An upstream that never stops sending and never finishes is bounded by the
+    total download deadline. The inactivity timeout cannot be what fires: a byte
+    every TRICKLE_INTERVAL_SECS resets it, and it is 30s while the whole request
+    here is over in seconds. Storage stays clean and a healed fetch still works,
+    so the abandoned attempt neither poisoned the cache nor kept its
+    single-flight slot."""
+    proxy, upstream = proxy_over_fault_short_deadline
+    pkg = "tricklepkg"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    filename = upstream.register(pkg, wheel)
+    upstream.set_fault(pkg, "trickle")
+
+    t0 = time.time()
+    code, _, _ = http_get(f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT)
+    elapsed = time.time() - t0
+    assert code != 200, "an upstream body that never arrived must never be served as a 200"
+    # 3 attempts of ~SHORT_GRACE_SECS plus 2s+4s backoff is ~15s. The ceiling is
+    # generous for a loaded box but far under the ~96s the inactivity timeout
+    # alone would take, and under the 270s the shipped 60s grace would.
+    assert elapsed < FAULT_BOUND_SECS, f"trickling upstream ran past its deadline ({elapsed:.1f}s)"
+    _assert_storage_clean(proxy, pkg, filename)
+
+    upstream.heal(pkg)
+    _healthy_fetch_matches(proxy, pkg, filename, sha256_file(wheel))
 
 
 def test_hanging_upstream_is_bounded_and_clean(proxy_over_fault, tmp_path):

@@ -806,7 +806,7 @@ pub(crate) async fn files_get(
     // write pin — origin claims and the 409-serialized PUT stay on the write home.
     match proxy_ensure_artifact(
         &state,
-        write_pinned.storage.as_ref(),
+        &write_pinned.storage,
         &pkg,
         &filename,
         write_pinned.generation,
@@ -1040,8 +1040,8 @@ enum ProxyEnsure {
 
 /// Proxy hook for artifact downloads: fetch-and-commit on a local miss.
 async fn proxy_ensure_artifact(
-    state: &AppState,
-    storage: &dyn Storage,
+    state: &Arc<AppState>,
+    storage: &Arc<dyn Storage>,
     pkg: &str,
     filename: &str,
     generation: u64,
@@ -1057,7 +1057,7 @@ async fn proxy_ensure_artifact(
     // whole optimization: a warm proxied download drops from three storage ops
     // (origin read + existence HEAD + serve) to one (serve).
     match proxy
-        .artifact_cached_locally(storage, &key, generation)
+        .artifact_cached_locally(storage.as_ref(), &key, generation)
         .await
     {
         Ok(true) => return ProxyEnsure::Serve { filled: false },
@@ -1068,7 +1068,7 @@ async fn proxy_ensure_artifact(
     // out-of-scope name stops here and never reaches upstream. `eligible` has no
     // side effects, so gating it behind the existence check changes nothing for a
     // name that does fall through — it just no longer pays on the warm path.
-    match proxy::eligible(state, storage, pkg).await {
+    match proxy::eligible(state, storage.as_ref(), pkg).await {
         Ok(true) => {}
         Ok(false) => return ProxyEnsure::Serve { filled: false },
         Err(e) => return ProxyEnsure::Fail(read_error(e)),

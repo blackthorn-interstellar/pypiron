@@ -12,6 +12,7 @@ asserts the served bytes match its integrity API.
 
 from __future__ import annotations
 
+import base64
 import json
 
 import pytest
@@ -22,6 +23,7 @@ from .helpers import (
     http_request_auth,
     make_wheel,
     pypi_provenance,
+    sha256_file,
     sync_to,
     upload_legacy,
     wait_for_file_in_index,
@@ -84,6 +86,78 @@ def test_mirror_upload_stores_serves_and_advertises_provenance(disk_server, tmp_
     assert (pkg_dir / f"{wheel.name}.provenance").exists()
     code, _, _ = http_get(f"{disk_server['base_url']}/files/{pkg}/{wheel.name}.meta.json")
     assert code == 404
+
+
+def _provenance_binding(subject_sha256: str) -> str:
+    """A real-shaped PEP 740 object whose DSSE in-toto subject names
+    `subject_sha256` — the exact structure PyPI's integrity API serves."""
+    statement = {
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [{"name": "artifact", "digest": {"sha256": subject_sha256}}],
+        "predicateType": "https://docs.pypi.org/attestations/publish/v1",
+        "predicate": None,
+    }
+    stmt_b64 = base64.b64encode(json.dumps(statement).encode()).decode()
+    return json.dumps(
+        {
+            "version": 1,
+            "attestation_bundles": [
+                {
+                    "publisher": {
+                        "kind": "GitHub",
+                        "repository": "pypa/sampleproject",
+                        "workflow": "release.yml",
+                    },
+                    "attestations": [
+                        {
+                            "version": 1,
+                            "verification_material": {
+                                "certificate": "x",
+                                "transparency_entries": [],
+                            },
+                            "envelope": {"statement": stmt_b64, "signature": "sig"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+
+def test_project_page_shows_digest_binding_when_subject_matches(disk_server, tmp_path):
+    # A relayed attestation whose in-toto subject sha256 equals the served wheel's
+    # own sha256: the human page attributes it honestly AND shows the free
+    # checksum-match cue (the relayed attestation is about these exact bytes).
+    pkg = "boundprov"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    sha = sha256_file(wheel)
+    _mirror_upload(disk_server, wheel, pkg, provenance=_provenance_binding(sha))
+
+    _, body, _ = http_get(f"{disk_server['base_url']}/project/{pkg}/")
+    page = body.decode()
+    # Attributed, never the bare "Verified details" overclaim (F55).
+    assert "Publisher attestation" in page
+    assert "not re-verified by this server" in page
+    assert "Verified details" not in page
+    # The digest binding is claimed only because the subject matched the bytes.
+    assert "names this file's checksum" in page
+
+
+def test_project_page_omits_binding_when_subject_mismatches(disk_server, tmp_path):
+    # A swapped/mismatched provenance companion: the subject digest names other
+    # bytes. The page still attributes the publisher, but must NOT claim binding.
+    pkg = "unboundprov"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    wrong = "de" * 32  # 64 hex chars, not this wheel's sha256
+    _mirror_upload(disk_server, wheel, pkg, provenance=_provenance_binding(wrong))
+
+    _, body, _ = http_get(f"{disk_server['base_url']}/project/{pkg}/")
+    page = body.decode()
+    assert "Publisher attestation" in page  # still attributed
+    assert "not re-verified by this server" in page
+    assert "Verified details" not in page
+    # No checksum-match cue — binding was not demonstrated.
+    assert "names this file's checksum" not in page
 
 
 def test_mirror_upload_without_provenance_advertises_nothing(disk_server, tmp_path):

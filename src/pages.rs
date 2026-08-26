@@ -321,7 +321,7 @@ async fn render_project(
         Some(f) => load_core_metadata(storage.as_ref(), &pkg, f).await,
         None => None,
     };
-    let publisher = match representative(&files, &selected, |f| f.provenance) {
+    let provenance = match representative(&files, &selected, |f| f.provenance) {
         Some(f) => load_provenance(storage.as_ref(), &pkg, f).await,
         None => None,
     };
@@ -354,7 +354,7 @@ async fn render_project(
         &selected,
         pinned,
         meta.as_ref(),
-        publisher.as_ref(),
+        provenance.as_ref(),
         &downloads,
         &advisory_panel,
     );
@@ -595,16 +595,18 @@ async fn load_core_metadata(
 }
 
 /// Parse a representative file's relayed `.provenance` companion into its
-/// publisher. Best-effort: a miss or malformed bundle returns `None` and the
-/// page renders without a "Verified details" section.
+/// attested publisher, and check whether that attestation's in-toto subject
+/// digest binds to `rep`'s own sha256 (the bytes we serve). Best-effort: a miss
+/// or malformed bundle returns `None` and the page renders without a publisher-
+/// attestation section; an unbindable digest simply renders no checksum-match cue.
 async fn load_provenance(
     storage: &dyn Storage,
     pkg: &str,
     rep: &render::FileMetadata,
-) -> Option<provenance::Publisher> {
+) -> Option<provenance::Provenance> {
     let key = sidecar::provenance_key(&format!("{PACKAGES_PREFIX}{pkg}/{}", rep.filename));
     let bytes = storage.get_bytes(&key).await.ok()?;
-    provenance::parse_publisher(&bytes)
+    provenance::parse(&bytes, &rep.sha256)
 }
 
 /// Build the request-derived context both pages share. The base URL honors a

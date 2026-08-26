@@ -22,7 +22,7 @@ use crate::coremeta::CoreMetadata;
 use crate::markdown;
 use crate::metrics::{Inventory, MetricsSnapshot};
 use crate::names::{infer_version_from_filename, version_cmp_desc};
-use crate::provenance::Publisher;
+use crate::provenance::Provenance;
 use crate::render::FileMetadata;
 use crate::sidecar::Yanked;
 
@@ -221,7 +221,10 @@ main.wide{max-width:1000px}\
 .sb-dl{margin:0}\
 .sb-dl dt{font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);margin-top:9px}\
 .sb-dl dd{margin:1px 0 0;font-size:13px;word-break:break-word}\
-.sb-verified h2::before{content:'✓ ';color:#16a34a}\
+.sb-note{margin:8px 0 0;font-size:11px;line-height:1.45;color:var(--muted)}\
+.sb-bound{margin:8px 0 0;font-size:12px;line-height:1.45;color:#16a34a}\
+.sb-authored{border-left:2px solid var(--border);padding-left:13px;margin-left:1px}\
+.sb-authored-head{margin-bottom:14px}\
 .tabpanel{margin:0 0 26px}\
 .tabpanel>h2{margin:0 0 12px}\
 .js-tabs .tabpanel{display:none}\
@@ -650,10 +653,11 @@ fn version_is_shell_safe(version: &str) -> bool {
 /// `pinned` marks that it came from a `/project/<pkg>/<version>/` request (it
 /// pins the `uv add` snippet). `meta` is the selected version's representative
 /// core metadata (the README is rendered when it declares Markdown, else shown
-/// verbatim). `publisher` is the PEP 740 publisher of the selected version,
-/// present only for files that carry relayed attestations. The content area has
-/// three tab panels — description, release history, download files — switched by
-/// the sidebar.
+/// verbatim). `prov` is the selected version's relayed PEP 740 provenance —
+/// the upstream-attested publisher plus whether that attestation is digest-bound
+/// to the served bytes — present only for files that carry attestations. The
+/// content area has three tab panels — description, release history, download
+/// files — switched by the sidebar.
 #[allow(clippy::too_many_arguments)]
 pub fn project_html(
     ctx: &PageContext,
@@ -662,7 +666,7 @@ pub fn project_html(
     selected: &str,
     pinned: bool,
     meta: Option<&CoreMetadata>,
-    publisher: Option<&Publisher>,
+    prov: Option<&Provenance>,
     downloads: &[(String, u64)],
     advisories: &[AdvisoryPanelRow],
 ) -> String {
@@ -754,7 +758,7 @@ pub fn project_html(
         nav = nav_section(),
         advisories = advisory_panel_section(advisories),
         downloads = downloads_section(downloads),
-        verified = verified_section(publisher),
+        verified = provenance_section(prov),
         details = meta_sections(meta),
         desc = description_panel(meta),
         history = release_history_panel(pkg, files, selected),
@@ -975,13 +979,21 @@ fn downloads_section(downloads: &[(String, u64)]) -> String {
     )
 }
 
-/// The "Verified details" sidebar section: the publishing identity recorded in
-/// the selected version's relayed PEP 740 attestation. Shown only when one is
+/// The publisher-attestation sidebar section: the publishing identity recorded
+/// in the selected version's relayed PEP 740 attestation. Shown only when one is
 /// present (mirror-origin files only).
-fn verified_section(publisher: Option<&Publisher>) -> String {
-    let Some(p) = publisher else {
+///
+/// This is relayed truth, not something pypiron verified, so it is labelled
+/// honestly: the publisher "as attested to the publishing index (PyPI)", with a
+/// visible caption that it was recorded there and not re-verified here. The one
+/// claim pypiron *can* make itself — that the attestation's in-toto subject
+/// digest matches the bytes it serves — is shown as a checksum-match cue only
+/// when [`Provenance::digest_bound`] holds; otherwise no binding is implied.
+fn provenance_section(prov: Option<&Provenance>) -> String {
+    let Some(pv) = prov else {
         return String::new();
     };
+    let p = &pv.publisher;
     let mut rows = String::new();
     rows.push_str(&kv_row("Publisher", &p.kind));
     if let Some(repo) = &p.repository {
@@ -1000,12 +1012,29 @@ fn verified_section(publisher: Option<&Publisher>) -> String {
     if let Some(e) = &p.environment {
         rows.push_str(&kv_row("Environment", e));
     }
-    format!("<section class=\"sb sb-verified\"><h2>Verified details</h2><dl class=\"sb-dl\">{rows}</dl></section>")
+    // The checksum-match cue: shown only when the relayed attestation's subject
+    // digest binds to the bytes we serve. This is an integrity match, not a
+    // signature check, and says exactly that.
+    let bound = if pv.digest_bound {
+        "<p class=\"sb-bound\">✓ The attestation names this file's checksum, \
+so it describes the exact bytes served here.</p>"
+    } else {
+        ""
+    };
+    // The honest attribution: relayed from the publishing index, not re-verified.
+    format!(
+        "<section class=\"sb sb-prov\"><h2>Publisher attestation</h2>\
+<dl class=\"sb-dl\">{rows}</dl>{bound}\
+<p class=\"sb-note\">Publisher as attested to the publishing index (PyPI). \
+Recorded there, not re-verified by this server.</p></section>"
+    )
 }
 
-/// The package's self-declared metadata, as plain sidebar sections — project
-/// links, meta (license/python/author/keywords), dependencies, classifiers. Each
-/// is shown only when present.
+/// The package's author-declared metadata — project links, meta
+/// (license/python/author/keywords), dependencies, classifiers — each shown only
+/// when present. Unlike the publisher attestation above it, this is self-declared
+/// by the uploader and unverified, so it is grouped under an explicit
+/// author-provided header and visually set apart, and the two can't be confused.
 fn meta_sections(meta: Option<&CoreMetadata>) -> String {
     let Some(m) = meta else {
         return "<section class=\"sb\"><h2>Details</h2>\
@@ -1062,7 +1091,15 @@ fn meta_sections(meta: Option<&CoreMetadata>) -> String {
 <p class=\"muted-s\">No details provided.</p></section>"
             .to_string();
     }
-    out
+    // Wrap the author-declared sections in a labelled, visually-set-apart group so
+    // a reader never mistakes self-declared metadata for the attested publisher
+    // details above it.
+    format!(
+        "<div class=\"sb-authored\">\
+<section class=\"sb sb-authored-head\"><h2>Author-provided details</h2>\
+<p class=\"sb-note\">Self-declared by the uploader; not verified by this server.</p></section>\
+{out}</div>"
+    )
 }
 
 /// A `<dt>/<dd>` row, omitting nothing — caller filters absent values.
@@ -1258,6 +1295,7 @@ fn group_thousands(n: u64) -> String {
 mod tests {
     use super::*;
     use crate::metrics::Metrics;
+    use crate::provenance::Publisher;
 
     fn ctx() -> PageContext {
         PageContext {
@@ -1408,11 +1446,18 @@ mod tests {
         // Release history links every version to its per-version page.
         assert!(html.contains("href=\"/project/imaginairy/14.3.0/\""));
         assert!(html.contains("href=\"/project/imaginairy/15.0.0/\""));
-        // Self-reported metadata as plain sections — no "Unverified details"
-        // framing, no attestation section.
+        // Author-declared metadata is grouped under an explicit, set-apart header
+        // so it can't be read as verified (F56). No attestation section here (no
+        // provenance passed), and never the bare "Verified details" overclaim.
         assert!(html.contains("<h2>Project links</h2>"));
+        assert!(html.contains("<h2>Author-provided details</h2>"));
+        assert!(html.contains("Self-declared by the uploader; not verified"));
+        assert!(html.contains("class=\"sb-authored\""));
+        // The author group's header renders before the author sections it labels.
+        assert!(
+            html.find("Author-provided details").unwrap() < html.find("Project links").unwrap()
+        );
         assert!(!html.contains("Unverified details"));
-        assert!(!html.contains("Self-reported"));
         assert!(!html.contains("Verified details"));
         // Footer wordmark links to pypiron's PyPI project page.
         assert!(html.contains("href=\"https://pypi.org/project/pypiron/\""));
@@ -1489,15 +1534,26 @@ mod tests {
         assert!(ok.contains("uv add --index https://pkgs.example.com/simple/ x==1.0.0"));
     }
 
-    #[test]
-    fn verified_details_render_from_relayed_attestation() {
-        let m = imaginairy_meta();
-        let files = imaginairy_files();
-        let pubr = Publisher {
+    fn imaginairy_publisher() -> Publisher {
+        Publisher {
             kind: "GitHub".into(),
             repository: Some("brycedrennan/imaginAIry".into()),
             workflow: Some("release.yml".into()),
             environment: Some("pypi".into()),
+        }
+    }
+
+    #[test]
+    fn relayed_provenance_is_attributed_not_claimed_as_verified() {
+        // A relayed attestation whose digest could NOT be bound to the served
+        // bytes (digest_bound false) must never read as "verified" — it is
+        // attributed to the publishing index with a visible not-re-verified
+        // caption, and shows no checksum-match cue (F55).
+        let m = imaginairy_meta();
+        let files = imaginairy_files();
+        let prov = Provenance {
+            publisher: imaginairy_publisher(),
+            digest_bound: false,
         };
         let html = project_html(
             &ctx(),
@@ -1506,19 +1562,53 @@ mod tests {
             "15.0.0",
             false,
             Some(&m),
-            Some(&pubr),
+            Some(&prov),
             &[],
             &[],
         );
-        assert!(html.contains("<h2>Verified details</h2>"));
+        // The bare "Verified details" overclaim is gone; the section is attributed.
+        assert!(!html.contains("Verified details"));
+        assert!(html.contains("<h2>Publisher attestation</h2>"));
         // The publisher rows render; the GitHub repo becomes a link.
         assert!(html.contains("<dt>Publisher</dt><dd>GitHub</dd>"));
         assert!(html.contains("href=\"https://github.com/brycedrennan/imaginAIry\""));
         assert!(html.contains("<dt>Workflow</dt><dd>release.yml</dd>"));
-        // The relayed/re-verify caption is gone.
-        assert!(!html.contains("not re-verified by this server"));
-        assert!(!html.contains("Re-verify"));
-        assert!(!html.contains(".provenance"));
+        // The honest caption is restored to the rendered page.
+        assert!(html.contains("as attested to the publishing index (PyPI)"));
+        assert!(html.contains("not re-verified by this server"));
+        // With no digest binding, no checksum-match cue is shown.
+        assert!(!html.contains("names this file's checksum"));
+        assert!(!html.contains("class=\"sb-bound\""));
+    }
+
+    #[test]
+    fn digest_bound_provenance_shows_checksum_match_cue() {
+        // When the relayed attestation is bound to the served bytes, the page may
+        // honestly say the attestation names this file's checksum — still not a
+        // signature check, and still under the attributed heading.
+        let m = imaginairy_meta();
+        let files = imaginairy_files();
+        let prov = Provenance {
+            publisher: imaginairy_publisher(),
+            digest_bound: true,
+        };
+        let html = project_html(
+            &ctx(),
+            "imaginairy",
+            &files,
+            "15.0.0",
+            false,
+            Some(&m),
+            Some(&prov),
+            &[],
+            &[],
+        );
+        assert!(html.contains("<h2>Publisher attestation</h2>"));
+        assert!(html.contains("class=\"sb-bound\""));
+        assert!(html.contains("names this file's checksum"));
+        // Even bound, it is never labelled a bare "Verified" claim.
+        assert!(!html.contains("Verified details"));
+        assert!(html.contains("not re-verified by this server"));
     }
 
     #[test]

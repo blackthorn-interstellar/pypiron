@@ -1155,15 +1155,33 @@ pub trait Storage: Send + Sync {
 
     /// Bind our own MD5 (`md5_hex`, computed over the just-written,
     /// SHA-256-verified bytes) to the provider-native content checksum to
-    /// persist in the sidecar for the server-side-copy integrity check. `Some`
-    /// only when the provider confirms it is a content digest of these exact
-    /// bytes — S3 when the stored object's ETag equals the MD5 (which rules out
-    /// SSE-KMS/SSE-C and multipart, whose ETags are not the plaintext MD5, so
-    /// those fleets keep the size-only check with no per-copy streaming
-    /// penalty), GCS unconditionally (its `md5Hash` is always the content MD5).
-    /// `None` on disk/Azure and everything unconfirmed. At most one HEAD (S3
-    /// only); never a body read. Only called on the multi-bucket upload path,
-    /// where a server-side copy can actually follow. The default has none.
+    /// persist in the sidecar for the server-side-copy integrity check, AND
+    /// gate the home-bucket write on it where the provider proves the stored
+    /// bytes. `Some` only when the provider confirms it is a content digest of
+    /// these exact bytes — S3 when the stored object's ETag equals our MD5, GCS
+    /// unconditionally (its `md5Hash` is always the content MD5). `None` on
+    /// disk/Azure and everything unconfirmed.
+    ///
+    /// On S3 the ETag drives a three-way probe ([`probe_s3_home_write`]):
+    /// - Composite multipart or absent ETag (not 32 hex) → size-only, no re-read.
+    /// - 32-hex ETag equal to ours → bind the MD5. One HEAD, no re-read.
+    /// - 32-hex ETag that DISAGREES → either a same-size corrupt home write or a
+    ///   store whose 32-hex ETag is not the plaintext MD5 (**SSE-KMS/SSE-C**, or
+    ///   a non-MD5-ETag S3-compatible store). These are indistinguishable from
+    ///   the HEAD alone, so — when the object is at or below the single-PUT
+    ///   ceiling ([`MULTIPART_THRESHOLD`]) — one confirming re-read disambiguates:
+    ///   matching bytes bind nothing (no false alarm; an SSE-KMS single-part
+    ///   upload pays this bounded re-read), divergent bytes return a typed
+    ///   [`HomeWriteCorrupt`] so the upload fails closed instead of publishing a
+    ///   body the home bucket cannot serve to match its own sha256. A divergent
+    ///   ETag ABOVE the ceiling stays size-only — never re-read a large artifact
+    ///   into memory on every publish.
+    ///
+    /// So a small SSE-KMS single-part upload pays one HEAD + one bounded re-read;
+    /// a large one (multipart ETag) keeps the size-only check. Only called on the
+    /// multi-bucket upload path, where a server-side copy can actually follow and
+    /// a healthy peer would otherwise silently diverge from a corrupt home. The
+    /// default has none.
     async fn store_content_checksum(
         &self,
         _key: &str,
@@ -1263,6 +1281,136 @@ pub fn check_copy_checksum(
             }
         }
         _ => ChecksumCheck::Inconclusive,
+    }
+}
+
+/// A same-size corrupt home-bucket store: the provider's own content digest of
+/// the just-written artifact disagrees with the SHA-256-verified upload bytes.
+/// Carried as a typed error so the upload path can fail closed — never acking a
+/// body the home bucket cannot serve to match its own published sha256 — while
+/// an ordinary probe transport failure stays best-effort (size-only, no
+/// rejection). Reserved for a *proven* divergence: the bytes were re-read and
+/// hashed, so this is never a false alarm on a store that simply does not expose
+/// an MD5 ETag.
+#[derive(Debug)]
+pub struct HomeWriteCorrupt {
+    pub key: String,
+    pub detail: String,
+}
+
+impl std::fmt::Display for HomeWriteCorrupt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "home-bucket artifact {} failed content verification: {}",
+            self.key, self.detail
+        )
+    }
+}
+
+impl std::error::Error for HomeWriteCorrupt {}
+
+/// How an S3 home-bucket ETag read back after a write compares to the MD5 we
+/// computed over the SHA-256-verified upload bytes.
+#[derive(Debug, PartialEq, Eq)]
+enum S3EtagCheck {
+    /// The ETag is a single-part unencrypted MD5 and equals our upload's MD5 —
+    /// the stored bytes are provably ours, and the digest may be bound.
+    Match,
+    /// The ETag is a single-part MD5 form but disagrees with ours. That is
+    /// either a same-size corrupt store or a store that does not use MD5 ETags;
+    /// the two are indistinguishable from the HEAD alone, so the caller confirms
+    /// with one re-read before condemning a legitimate upload.
+    Divergent,
+    /// The ETag is not a single-part MD5 (composite multipart, SSE-KMS/SSE-C, or
+    /// absent): it is not a plaintext content digest and proves nothing.
+    Unprovable,
+}
+
+/// Resolve a [`S3EtagCheck::Divergent`] ETag once the stored bytes have been
+/// re-read and hashed: `stored_md5` matching our upload MD5 means the store
+/// simply does not expose an MD5 ETag (bind nothing, no corruption), while a
+/// genuine disagreement is a proven same-size corrupt home write the upload
+/// must not ack. Pure so the corrupt-detection decision is unit-tested without a
+/// live provider (a real same-size home corruption cannot be injected through
+/// the object_store client, which writes back exactly the bytes it is handed).
+fn resolve_home_write(
+    key: &str,
+    stored_md5: &str,
+    upload_md5: &str,
+) -> Result<Option<StoreChecksum>> {
+    if stored_md5.eq_ignore_ascii_case(upload_md5) {
+        Ok(None)
+    } else {
+        Err(HomeWriteCorrupt {
+            key: key.to_string(),
+            detail: format!("stored MD5 {stored_md5} != verified upload MD5 {upload_md5}"),
+        }
+        .into())
+    }
+}
+
+/// Classify an S3/MinIO ETag against our upload MD5. A single-part **SSE-S3 or
+/// unencrypted** object's ETag IS its content MD5 (32 hex chars, optionally
+/// quoted). A composite multipart ETag (`"<hex>-<n>"`) is not 32 hex and yields
+/// [`S3EtagCheck::Unprovable`]. An SSE-KMS / SSE-C single-part ETag is *also*
+/// 32 hex but is NOT the plaintext MD5 (per the S3 API `ETag` docs: "For objects
+/// created by the ... SSE-KMS ... the ETag is not an MD5 digest of the object
+/// data"), so it lands in [`S3EtagCheck::Divergent`] — indistinguishable from a
+/// genuine corrupt store on the ETag alone. The caller disambiguates the
+/// divergent case with a bounded re-read (see [`probe_s3_home_write`]).
+fn classify_s3_etag(etag: Option<&str>, md5_hex: &str) -> S3EtagCheck {
+    let Some(raw) = etag else {
+        return S3EtagCheck::Unprovable;
+    };
+    let hex = raw.trim().trim_matches('"').to_ascii_lowercase();
+    if !is_hex32(&hex) {
+        return S3EtagCheck::Unprovable;
+    }
+    if hex == md5_hex.to_ascii_lowercase() {
+        S3EtagCheck::Match
+    } else {
+        S3EtagCheck::Divergent
+    }
+}
+
+/// The action a multi-bucket S3 home-write integrity probe takes once the
+/// read-back ETag and object size are known.
+#[derive(Debug, PartialEq, Eq)]
+enum HomeWriteProbe {
+    /// The ETag is a single-part MD5 equal to ours: bind the digest.
+    Bind,
+    /// Not provable from the ETag alone (multipart/absent), or a divergent ETag
+    /// on an object too large to re-read cheaply: keep the size-only check.
+    SizeOnly,
+    /// A single-part-form ETag that disagrees, on an object small enough to
+    /// re-read and confirm: pull the bytes back and hash them.
+    Confirm,
+}
+
+/// Decide the home-write probe action. `confirm_cap` bounds the confirming
+/// re-read so a divergent ETag on a large object never pulls a whole artifact
+/// into memory on every publish. This matters on an SSE-KMS / bucket-default-KMS
+/// fleet: its single-part ETag is 32 hex but not the plaintext MD5, so EVERY
+/// small upload hits the divergent branch (the re-read then re-hashes to our MD5
+/// → no false alarm, just cost). Capping at the single-PUT ceiling
+/// ([`MULTIPART_THRESHOLD`]) means the confirming read only ever loads what a
+/// single PUT already buffered — a larger object is multipart, whose composite
+/// ETag is `Unprovable` anyway — and keeps the re-read off the unbounded-RAM
+/// path the upload-memory cap (F47) is closing.
+fn probe_s3_home_write(
+    etag: Option<&str>,
+    md5_hex: &str,
+    size: u64,
+    confirm_cap: u64,
+) -> HomeWriteProbe {
+    match classify_s3_etag(etag, md5_hex) {
+        S3EtagCheck::Match => HomeWriteProbe::Bind,
+        S3EtagCheck::Unprovable => HomeWriteProbe::SizeOnly,
+        S3EtagCheck::Divergent if size <= confirm_cap => HomeWriteProbe::Confirm,
+        // A divergent ETag on an object above the single-PUT ceiling: do not
+        // re-read a large artifact into RAM on every publish. Size-only.
+        S3EtagCheck::Divergent => HomeWriteProbe::SizeOnly,
     }
 }
 
@@ -3064,22 +3212,43 @@ impl Storage for ObjectStorage {
         md5_hex: &str,
     ) -> Result<Option<StoreChecksum>> {
         match self.backend {
-            // The unencrypted single-part ETag is the content MD5. Confirm it
-            // equals ours before persisting: an SSE-KMS/SSE-C or multipart ETag
-            // is not the plaintext MD5, so binding one would make every later
-            // copy of this object mismatch and needlessly stream. One HEAD.
+            // The SSE-S3/unencrypted single-part ETag is the content MD5: bind it
+            // and gate the write on it. An SSE-KMS/SSE-C single-part ETag is also
+            // 32 hex but NOT the plaintext MD5, and a corrupt store looks the same
+            // — [`probe_s3_home_write`] disambiguates with a size-bounded re-read;
+            // a multipart/absent ETag is not a plaintext digest and stays
+            // size-only. One HEAD on the happy path.
             "s3" => {
-                let etag = match self.store.head(&self.oskey(key)).await {
-                    Ok(meta) => meta.e_tag,
+                let meta = match self.store.head(&self.oskey(key)).await {
+                    Ok(meta) => meta,
                     Err(e) => match self.classify_get(e, "head", key) {
                         None => return Ok(None),
                         Some(err) => return Err(err),
                     },
                 };
-                let confirmed = etag
-                    .map(|e| e.trim().trim_matches('"').eq_ignore_ascii_case(md5_hex))
-                    .unwrap_or(false);
-                Ok(confirmed.then(|| StoreChecksum::md5(md5_hex)))
+                match probe_s3_home_write(
+                    meta.e_tag.as_deref(),
+                    md5_hex,
+                    meta.size,
+                    MULTIPART_THRESHOLD,
+                ) {
+                    HomeWriteProbe::Bind => Ok(Some(StoreChecksum::md5(md5_hex))),
+                    // Multipart/absent ETag, or a divergent ETag on an object too
+                    // large to re-read cheaply: keep the size-only check.
+                    HomeWriteProbe::SizeOnly => Ok(None),
+                    // A single-part-form ETag that disagrees, small enough to
+                    // confirm: re-read once and hash. Matching bytes prove a store
+                    // that just does not expose an MD5 ETag (SSE-KMS/SSE-C, or a
+                    // non-MD5-ETag S3-compatible store) — bind nothing, no false
+                    // alarm; divergent bytes are a proven corrupt home write the
+                    // upload must not ack.
+                    HomeWriteProbe::Confirm => {
+                        let stored = self.get_bytes(key).await.with_context(|| {
+                            format!("re-read {key} to confirm a suspected corrupt home write")
+                        })?;
+                        resolve_home_write(key, &crate::hash::md5_hex(&stored), md5_hex)
+                    }
+                }
             }
             // GCS `md5Hash` is always the content MD5 for a single-part object;
             // trust our own computed digest without a metadata round-trip.
@@ -3218,6 +3387,16 @@ impl Storage for FaultInjectStorage {
     async fn head_etag(&self, key: &str) -> Result<Option<String>> {
         self.inner.head_etag(key).await
     }
+    // Delegate (not the trait default of `None`) so the chaos suite exercises the
+    // home-write content check instead of silently skipping it. A read probe, not
+    // a mutation — no crash-point counter.
+    async fn store_content_checksum(
+        &self,
+        key: &str,
+        md5_hex: &str,
+    ) -> Result<Option<StoreChecksum>> {
+        self.inner.store_content_checksum(key, md5_hex).await
+    }
 
     async fn put_bytes(&self, key: &str, bytes: Vec<u8>, content_type: Option<&str>) -> Result<()> {
         self.count_mutation("put_bytes", key);
@@ -3289,6 +3468,108 @@ mod tests {
         // A non-hex value never passes for a content MD5.
         let weird = r#"<CopyObjectResult><ETag>"not-a-hex-digest-here-000000000000"</ETag></CopyObjectResult>"#;
         assert_eq!(s3_copy_checksum(weird), None);
+    }
+
+    #[test]
+    fn classify_s3_etag_matches_a_single_part_md5() {
+        let md5 = "9e107d9d372bb6826bd81d3542a419d6";
+        // Real S3 quotes the header value; MinIO may not. Case folds.
+        assert_eq!(
+            classify_s3_etag(Some(&format!("\"{md5}\"")), md5),
+            S3EtagCheck::Match
+        );
+        assert_eq!(classify_s3_etag(Some(md5), md5), S3EtagCheck::Match);
+        assert_eq!(
+            classify_s3_etag(Some("9E107D9D372BB6826BD81D3542A419D6"), md5),
+            S3EtagCheck::Match
+        );
+    }
+
+    #[test]
+    fn classify_s3_etag_flags_a_same_form_disagreement_as_divergent() {
+        let md5 = "9e107d9d372bb6826bd81d3542a419d6";
+        // An SSE-KMS / SSE-C single-part ETag is a real 32-hex string that is NOT
+        // the plaintext MD5 — the exact shape that must reach the Divergent
+        // branch (a corrupt store looks identical here). A non-MD5-ETag
+        // S3-compatible store presents the same way.
+        let sse_kms_etag = "\"7b0c4e2a9d1f8e6c3a5b0d2f4e6a8c10\"";
+        assert_eq!(
+            classify_s3_etag(Some(sse_kms_etag), md5),
+            S3EtagCheck::Divergent
+        );
+    }
+
+    #[test]
+    fn classify_s3_etag_treats_multipart_and_nonhex_and_absent_as_unprovable() {
+        let md5 = "9e107d9d372bb6826bd81d3542a419d6";
+        // Composite multipart ETag (`-<n>`): not a plaintext content MD5, and not
+        // 32 hex. This is where a LARGE artifact (multipart-uploaded) lands, so it
+        // never triggers a confirming re-read regardless of encryption.
+        assert_eq!(
+            classify_s3_etag(Some("\"9e107d9d372bb6826bd81d3542a419d6-4\""), md5),
+            S3EtagCheck::Unprovable
+        );
+        // An opaque ETag that is not 32 hex chars.
+        assert_eq!(
+            classify_s3_etag(Some("\"not-a-hex-digest-here\""), md5),
+            S3EtagCheck::Unprovable
+        );
+        // No ETag returned at all.
+        assert_eq!(classify_s3_etag(None, md5), S3EtagCheck::Unprovable);
+    }
+
+    #[test]
+    fn probe_s3_home_write_confirms_a_small_divergence_and_skips_a_large_one() {
+        let md5 = "9e107d9d372bb6826bd81d3542a419d6";
+        let cap = MULTIPART_THRESHOLD;
+        // Matching single-part ETag: bind, whatever the size.
+        assert_eq!(
+            probe_s3_home_write(Some(&format!("\"{md5}\"")), md5, cap + 1, cap),
+            HomeWriteProbe::Bind
+        );
+        // SSE-KMS-shaped 32-hex divergence, small object (≤ cap): re-read to
+        // confirm. This is the KMS-fleet path — bounded to a single-PUT's worth.
+        let sse_kms_etag = "\"7b0c4e2a9d1f8e6c3a5b0d2f4e6a8c10\"";
+        assert_eq!(
+            probe_s3_home_write(Some(sse_kms_etag), md5, cap, cap),
+            HomeWriteProbe::Confirm
+        );
+        // Same divergent shape but ABOVE the cap: stay size-only, never pull a
+        // large artifact into RAM on every publish.
+        assert_eq!(
+            probe_s3_home_write(Some(sse_kms_etag), md5, cap + 1, cap),
+            HomeWriteProbe::SizeOnly
+        );
+        // Multipart / absent ETag: size-only regardless of size.
+        assert_eq!(
+            probe_s3_home_write(Some("\"9e107d9d372bb6826bd81d3542a419d6-4\""), md5, 10, cap),
+            HomeWriteProbe::SizeOnly
+        );
+        assert_eq!(
+            probe_s3_home_write(None, md5, 10, cap),
+            HomeWriteProbe::SizeOnly
+        );
+    }
+
+    #[test]
+    fn resolve_home_write_errors_only_on_a_proven_mismatch() {
+        let upload = "9e107d9d372bb6826bd81d3542a419d6";
+        // RED: the re-read bytes hash to something else → a proven corrupt
+        // same-size home write. The typed error must survive the anyhow
+        // conversion so the upload path can downcast it and fail closed.
+        let err = resolve_home_write(
+            "packages/foo/foo-1.0.tar.gz",
+            "00000000000000000000000000000000",
+            upload,
+        )
+        .expect_err("a divergent stored MD5 must be rejected");
+        assert!(err.downcast_ref::<HomeWriteCorrupt>().is_some());
+        // False-positive guard: the store just uses a non-MD5 ETag but holds our
+        // exact bytes → bind nothing, never condemn a legitimate upload. Case folds.
+        assert_eq!(
+            resolve_home_write("k", "9E107D9D372BB6826BD81D3542A419D6", upload).unwrap(),
+            None
+        );
     }
 
     #[test]

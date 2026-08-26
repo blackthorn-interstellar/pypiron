@@ -14,7 +14,7 @@ use axum::{
     response::IntoResponse,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::app::{internal, AppState, PACKAGES_PREFIX, SIMPLE_PREFIX};
 use crate::auth::require_admin;
@@ -674,6 +674,37 @@ pub async fn publish_record(
         match storage.store_content_checksum(&key, &md5).await {
             Ok(checksum) => checksum,
             Err(e) => {
+                if let Some(corrupt) = e.downcast_ref::<storage::HomeWriteCorrupt>() {
+                    // Fail closed: the home bucket landed same-size corrupt bytes
+                    // (proven by a re-read hash). No sidecar names them yet and no
+                    // peer has copied them, so delete our own just-written object —
+                    // an immutable retry then starts from a clean key — and refuse
+                    // the upload rather than ack a body the home region cannot
+                    // serve to match its published sha256 while healthy peers hold
+                    // the correct bytes.
+                    error!(
+                        %filename,
+                        key = %key,
+                        detail = %corrupt.detail,
+                        "home-bucket artifact failed content verification; rejecting upload"
+                    );
+                    // Best-effort cleanup so an immutable retry starts from a clean
+                    // key. If the delete ALSO fails the corrupt object lingers and
+                    // the retry hits `Existing::Reject` → a permanent 409, so make
+                    // that stuck state diagnosable rather than silent.
+                    if let Err(del_err) = storage.delete_keys(std::slice::from_ref(&key)).await {
+                        error!(
+                            %filename,
+                            key = %key,
+                            error = ?del_err,
+                            "could not delete the corrupt artifact after a failed content check; the immutable key may block retries until it is removed manually"
+                        );
+                    }
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Stored artifact failed content verification: {filename}"),
+                    ));
+                }
                 warn!(
                     error = ?e,
                     %filename,

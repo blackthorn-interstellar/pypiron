@@ -478,7 +478,7 @@ directly.
 | `--admin-user USER` | `PYPIRON_SYNC_ADMIN_USER` | none | Destination admin user. |
 | `--admin-pass PASS` | `PYPIRON_SYNC_ADMIN_PASS` | none | Destination admin password. |
 | `--private-prefix PREFIX` | `PYPIRON_PRIVATE_PREFIX` | none | Refuse to mirror private names. |
-| `--as-private` | `PYPIRON_SYNC_AS_PRIVATE` | `false` | Migrate the source index into pypiron's private namespace instead of mirroring it. Timestamps and yank state are not preserved — migrated files carry the migration date. See [Migrate off another index](../guides/migrate.md). |
+| `--as-private` | `PYPIRON_SYNC_AS_PRIVATE` | `false` | Migrate the source index into pypiron's private namespace instead of mirroring it. Timestamps and yank state are not preserved — migrated files carry the migration date. Won't convert a name the destination already holds as public — that needs an explicit empty-then-`origin release` ([Dependency confusion](../security.md#dependency-confusion)). See [Migrate off another index](../guides/migrate.md). |
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | relay from `--from` | Ferry the advisory snapshot to `--to` alongside the packages. Unset relays the source server's feed (`GET <from>/advisories/feed`); a URL or path fetches that instead; `""` disables. Best-effort: a feed-less source or a destination without the endpoint warns and the package sync proceeds. Also `[sync].advisory-feed`. |
 | `--concurrency N` | `PYPIRON_SYNC_CONCURRENCY` | `4` | Transfers within one package. |
 | `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8` | Packages in parallel. |
@@ -521,7 +521,7 @@ Tokens live for 5 minutes and cannot outrank the credential that minted them.
 | `pypiron verify-index` | Read-only full index check against the selected storage backend. `--deep` re-hashes every stored file too. |
 | `pypiron rebuild-index` | Rebuild every index from stored files. |
 | `pypiron buckets migrate` | Apply a changed `--buckets` list across every reachable bucket. |
-| `pypiron origin release PACKAGE` | Release an empty package name for deliberate private/public repurposing. Every configured bucket must be reachable and empty for that package. |
+| `pypiron origin release PACKAGE` | Release an empty package name for deliberate private/public repurposing — the only way to flip a mirror-owned name to private; there is no in-place reclaim. Every configured bucket must be reachable and empty for that package. |
 
 `verify-index` and `rebuild-index` use the same storage flags as `serve`, and
 also read `[serve]` from `pypiron.toml`. `buckets migrate` and `origin release`

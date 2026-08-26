@@ -77,7 +77,9 @@ can't drift apart. [Every selector](reference/configuration.md) ·
 The first upload of a name reserves it — private or public — and it stays
 reserved. A name you publish privately never resolves upstream, so registering
 `acme-utils` on PyPI buys an attacker nothing inside your company. Deleting
-files never reopens a reserved name.
+files never reopens a reserved name. A name pypiron cached from PyPI is reserved
+to public the same way — repurposing it as private is a deliberate
+empty-then-release, never an in-place reclaim.
 
 Claim a whole namespace on day one: everything under `acme-` is yours whether
 you've published it yet or not, and new private names must live inside it. Migrating

@@ -19,8 +19,8 @@ surface. Both on by default.
 
 **New releases wait.** A compromised maintainer account or a typosquat is most
 dangerous in its first hours, before anyone notices. A **dependency cooldown** — `--exclude-newer` —
-puts a window between when a release is published and when pypiron serves
-it, so resolution lands on versions old enough for a bad one to have surfaced
+means pypiron doesn't serve a release until it has aged, so your resolver
+picks versions that have been out long enough for a bad one to have surfaced
 and been pulled. It's the same practice uv, npm, and Dependabot have
 standardized on. The default is seven days, on a sliding window, re-checked on
 every read. `sync` applies the same window to what a run mirrors.
@@ -57,6 +57,14 @@ pypiron refuses to serve those files. Ask for a flagged version and the server
 refuses it, naming the advisory that condemned it; the on-demand proxy won't
 fetch and cache one in the first place.
 
+A filename that doesn't say which version it is — a legacy `.egg`, or an sdist
+an attacker named freely — gets no benefit of the doubt: if its package carries
+any malware advisory, the file is refused. Across every file PyPI has ever
+published, that refusal blocks 68 files, 9 of them real malware that used to get
+through;
+the one still-downloadable casualty is an `.egg` whose wheel and sdist siblings
+install normally.
+
 This closes a gap every caching mirror has. When a resolver locks a dependency
 through pypiron, it pins a download URL to *this* server. Later PyPI pulls a
 compromised release: it vanishes from pypi.org, but every lockfile in your org
@@ -68,7 +76,9 @@ lockfile alike.
 **Blocking starts within minutes.** Every node watches OSV for individual
 just-published malware advisories and starts blocking within minutes of
 publication — no waiting for the next daily refresh. A client whose own advisory cache is a
-day stale is still covered, because the block is at the server. The full
+day stale is still covered, because the block is at the server. "Within
+minutes" assumes the node can reach the feed; a ferried, air-gapped deploy
+blocks at its delivery cadence instead ([air-gapped](guides/air-gapped.md)). The full
 advisory snapshot still refreshes daily; a withdrawn advisory un-blocks on that
 same daily schedule.
 
@@ -83,7 +93,11 @@ at release build, so a brand-new server blocks known malware from its first
 request; the first live snapshot supersedes it without a restart. Want
 fail-closed against even that release-old staleness? Set
 `PYPIRON_MALWARE_BLOCK=true` explicitly and a server with no live snapshot
-refuses to start.
+refuses to start — note the contract change: an explicitly set `true` behaves
+differently from the defaulted `true`, so config-as-code that sets it out of
+hygiene is choosing startup-blocking. Until the first snapshot loads, the
+staleness gauge doesn't exist yet — catch a floor-only fleet by alerting on
+the gauge's absence, not its value.
 The feed itself is OSV's PyPI export, fetched from a Google-hosted bucket
 (named in the startup log) — the one outbound connection a default install
 makes, and repointable or removable:
@@ -112,7 +126,11 @@ pulling from both indexes chooses the public copy. pypiron's rule closes it:
 push or a mirror sync — reserves the name for that world, and it stays
 reserved. pypiron rejects a private upload to a mirror-owned name, `sync`
 refuses a name you own privately, and collisions are hard errors, never merges.
-Deleting every file of a package does not release the name.
+Deleting every file of a package does not release the name. A name pypiron
+proxy-cached from upstream is mirror-owned the same way, and can't be reclaimed
+as private in place — a private upload or `sync --as-private` onto it is refused,
+not converted. Repurposing one is deliberate: empty its files, run
+`origin release`, then claim it.
 
 `--private-prefix` reserves a whole namespace (like `acme-*`) for private
 uploads and forbids `sync` from touching it, so nobody can publish an internal
@@ -129,15 +147,17 @@ Narrow the server to packages somebody chose to allow. Give `sync` a file of
 approved names and it pre-loads exactly those; give the proxy the same include
 list and it fetches nothing else. The cooldown and malware
 blocking still apply on top — approval is a floor, not a bypass. Writing,
-updating, and enforcing a list: [Approval lists](concepts.md#what-it-keeps-out).
+updating, and enforcing a list:
+[Mirror selection](reference/configuration.md#mirror-selection).
 
 ## Air-gapped deploys
 
 Serve where nothing reaches the internet. The proxy talks to live PyPI on a
 cache miss, so `sync` removes that surface: pre-load an approved package list
 from a connected host, then serve from a node with no egress — the mirror is
-complete on its own, no upstream needed. Malware blocking crosses the same gap:
-a pypiron-to-pypiron `sync` ferries the advisory feed alongside the packages.
+complete on its own, no upstream needed. Malware blocking crosses the same gap — at the ferry's cadence, not within
+minutes: a pypiron-to-pypiron `sync` carries the advisory feed alongside the
+packages.
 Until the first delivery, the block set baked into the binary at release
 covers the box; the ferried feed supersedes it without a restart. The full recipe — feed sources, ferry schedules, freshness —
 is in [Air-gapped deploys](guides/air-gapped.md).
@@ -163,20 +183,23 @@ want, so it rides the strongest credential.
 ## Trust boundaries
 
 **Untrusted — every client request.** Anything a client sends is hostile until
-proven otherwise. Credentials compare in constant time, so a wrong guess leaks
-no timing — and repeated wrong guesses earn a lockout (see
-[Login throttling](#login-throttling)). A half-configured credential disables
-its role instead of enabling a bypassable one. Private names never fall through
-to upstream, so nobody can shadow one with a public package of the same name. A
-filename, once uploaded, is never replaced (PyPI's own rule): pypiron rejects a
-re-upload of an existing filename, so nobody can swap bytes under a version
-already in someone's lockfile. A browser can't be turned against you: pypiron
-rejects cross-site state-changing requests, so another site can't ride cached
-Basic credentials to forge an upload or a yank. Every response carries
-`X-Content-Type-Options: nosniff`. pypiron ignores
-client-set `X-Forwarded-For`/`X-Real-IP` for the access log and the login
-throttle unless you enable `--trusted-proxy`, so a direct caller can't forge its
-logged address.
+proven otherwise:
+
+- Credentials compare in constant time — a wrong guess leaks no timing — and
+  repeated wrong guesses earn a lockout (see
+  [Login throttling](#login-throttling)).
+- A half-configured credential disables its role instead of enabling a
+  bypassable one.
+- Private names never fall through to upstream, so nobody can shadow one with
+  a public package of the same name.
+- A filename, once uploaded, is never replaced (PyPI's own rule) — nobody can
+  swap bytes under a version already in someone's lockfile.
+- Cross-site state-changing requests are rejected, so another site can't ride
+  cached Basic credentials to forge an upload or a yank.
+- Every response carries `X-Content-Type-Options: nosniff`.
+- Client-set `X-Forwarded-For`/`X-Real-IP` are ignored for the access log and
+  the login throttle unless you enable `--trusted-proxy`, so a direct caller
+  can't forge its logged address.
 
 **Trusted — your storage backend.** The S3, GCS, Azure, or disk backend you
 configure is your data behind your keys, and pypiron treats its responses as
@@ -193,22 +216,51 @@ no egress — so even an air-gapped build confirms the original publisher. pypir
 never runs Sigstore or mints provenance itself, so it refuses a direct upload
 carrying first-party attestations.
 
+**A poisoned listing can't reach your internal network.** When the proxy or
+`sync` pulls an upstream file, a malicious or tampered listing can point that
+file's URL — or its `.metadata`/`.provenance` companion, or a redirect — at an
+internal address. pypiron refuses to connect any listing-derived fetch to a
+private, loopback, or link-local target: the cloud metadata endpoint
+(`169.254.169.254`), internal services, and a DNS rebind across a redirect are
+blocked before the connection opens. Only the upstream you configured is exempt;
+widen that with `--proxy-allow-host`/`--proxy-allow-cidr` if your files live on
+another internal host. Route these fetches through a forward proxy and pypiron
+no longer resolves the hostname — the proxy does — so filtering a *name* target
+moves to the proxy's own egress ACL (an internal IP-literal target stays blocked
+either way). See
+[Behind a forward proxy](reference/configuration.md#behind-a-forward-proxy-or-tls-interception).
+
 **Trusted — the release pipeline.** GitHub Actions builds every release, with
 every action pinned to a full commit SHA and every build run `--locked` against
 a committed lockfile. Each wheel, sdist, binary, and image ships a signed
 provenance attestation you can check yourself — see
 [Verify a release](#verify-a-release).
 
+**A stale page can't hand over bytes.** Every download re-checks on the spot
+whether that file is still yours to serve; no cache sits in front of it.
+Listings and the browsable `/project/` page are cached — one second by default,
+`--index-cache-ttl-secs` — so either can name a package for that long after it
+stops being served. On multiple buckets, `/simple/` settles who owns the name
+per request, ahead of the cached bytes.
+
 ## Login throttling
 
 A client hammering login with candidate secrets is bounded, not just logged.
-Five failed logins from one address and that address can't log in for five
-minutes; the server refuses even a correct guess during the lockout, so a
-guesser can't confirm a hit. pypiron never counts successful logins and never
+Five failed logins from one address (IPv6 counts a /64 as one address) and
+that address can't log in for five minutes; the server refuses even a correct
+guess during the lockout, so a guesser can't confirm a hit. pypiron never counts successful logins and never
 throttles anonymous traffic, so the lockout can't be turned against clients
 that aren't guessing. A fleet of N replicas bounds a guesser at N× one instance's rate —
 each instance enforces its own budget. Tune or disable with
 `--login-cooldown-secs` — [configuration](reference/configuration.md).
+
+**Behind a reverse proxy, set `--trusted-proxy`.** Without it every request
+carries the proxy's address, so pypiron sees one client: five failed logins
+from anyone lock out every authenticated client behind that proxy, for as long
+as whoever is guessing keeps at it. It's off by default because
+`X-Forwarded-For` is client-settable — honoring it ungated lets a direct caller
+rotate fake addresses past the throttle and forge its logged address. Turn it
+on when a proxy you control sets that header, not before.
 
 ## What pypiron does not defend
 
@@ -234,7 +286,7 @@ These are out of scope by design; know them before you lean on the rest.
 
 ## pypiron's own dependencies
 
-Every change runs `cargo audit` with no ignore flags. The audit is clean.
+Every change runs `cargo audit` with no ignore flags. The audit is clean as of 2026-08.
 
 It was not always. Through v0.0.14 pypiron carried two denial-of-service
 advisories in `quick-xml` (RUSTSEC-2026-0194, quadratic parsing on duplicate
@@ -275,7 +327,7 @@ gh attestation verify oci://ghcr.io/blackthorn-interstellar/pypiron:latest \
 issued by this repo's GitHub Actions. A non-zero exit means it didn't; treat the
 artifact as unverified.
 
-Three things it needs:
+It needs:
 
 - **GitHub CLI 2.49 or newer.** Older builds (2.21, for one) have no `attestation`
   command at all.

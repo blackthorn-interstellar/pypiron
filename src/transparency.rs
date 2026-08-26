@@ -516,6 +516,15 @@ pub(crate) fn check_integrity(links: &[(u64, Vec<u8>, ChainLink)]) -> Vec<Violat
 pub struct VerifyChainArgs {
     #[command(flatten)]
     pub storage: StorageArgs,
+
+    /// Fail (exit 1) on an in-chain fingerprint change too — an already-committed
+    /// filename re-committed under a different sha. Off by default: such a change
+    /// is EITHER a legitimate mirror→private supersede OR a forged re-commit of
+    /// tampered bytes, indistinguishable in storage, so it is reported for review
+    /// and does not by itself fail the check. Turn it on for a hard CI gate once
+    /// every expected supersede has been reconciled.
+    #[arg(long, env = "PYPIRON_VERIFY_CHAIN_STRICT")]
+    pub strict: bool,
 }
 
 /// One bucket's loaded chain, for the cross-bucket verification.
@@ -553,31 +562,76 @@ async fn load_chain(storage: &dyn Storage) -> Result<Vec<(u64, Vec<u8>, ChainLin
     Ok(links)
 }
 
-/// Warn (not fault) on an in-place sha change of an already-committed filename
-/// across a chain — legitimate only for the rare mirror→private demotion. A
-/// running replay-so-far gives the "already committed" view.
-fn warn_in_chain_sha_changes(links: &[(u64, Vec<u8>, ChainLink)]) {
+/// One already-committed filename re-committed under a *different* sha later in
+/// the chain. Legitimate only for the rare mirror→private supersede; otherwise it
+/// is the signature of a forged append that re-blesses tampered bytes — and the
+/// two are indistinguishable in durable storage (any marker a suppression could
+/// key on is an object the credential-holding attacker writes as cheaply as the
+/// re-commit itself). So `verify-chain` surfaces every one as a reviewable finding
+/// for the operator to check against the supersedes they expect, rather than
+/// auto-deciding which it is.
+pub(crate) struct FingerprintChange {
+    pub package: String,
+    pub filename: String,
+    pub old_sha: String,
+    pub new_sha: String,
+    /// Seq the superseded (old) sha was committed at.
+    pub from_seq: u64,
+    /// Seq the new sha was committed at.
+    pub to_seq: u64,
+}
+
+/// Every in-chain fingerprint change across `links`, oldest first (a running
+/// replay-so-far gives the "already committed" view). This is F37's signal: a
+/// forged append that re-commits `(pkg, filename)` under new bytes leaves the
+/// final replayed state and the rewritten sidecar in agreement — so
+/// [`Presence::WrongSha`] stays silent — and the *only* durable trace is the chain
+/// holding two different shas for one filename at two seqs, which this returns.
+/// Returning the changes (rather than the old buried `eprintln!`) is what lets
+/// [`run_verify_chain`] report and count them as first-class findings.
+fn in_chain_sha_changes(links: &[(u64, Vec<u8>, ChainLink)]) -> Vec<FingerprintChange> {
     let mut so_far: Delta = BTreeMap::new();
-    for (_, _, link) in links {
+    // pkg → filename → the seq its current sha was committed at, for `from_seq`.
+    let mut committed_at: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut changes = Vec::new();
+    for (seq, _, link) in links {
         for (pkg, files) in &link.packages {
             if let Some(prev) = so_far.get(pkg) {
                 for (filename, sha) in files {
-                    if prev.get(filename).is_some_and(|old| old != sha) {
-                        let old = &prev[filename];
-                        eprintln!(
-                            "WARNING: {pkg}/{filename} sha changed in-chain {old} -> {sha} \
-                             (legitimate only for a mirror->private demotion)"
-                        );
+                    if let Some(old) = prev.get(filename) {
+                        if old != sha {
+                            let from_seq = committed_at
+                                .get(pkg)
+                                .and_then(|m| m.get(filename))
+                                .copied()
+                                .unwrap_or(*seq);
+                            changes.push(FingerprintChange {
+                                package: pkg.clone(),
+                                filename: filename.clone(),
+                                old_sha: old.clone(),
+                                new_sha: sha.clone(),
+                                from_seq,
+                                to_seq: *seq,
+                            });
+                        }
                     }
                 }
             }
+            // Replay is last-write-wins over the package's whole file map, so its
+            // seq map is rebuilt to this seq in lockstep with `so_far`.
             if files.is_empty() {
                 so_far.remove(pkg);
+                committed_at.remove(pkg);
             } else {
                 so_far.insert(pkg.clone(), files.clone());
+                committed_at.insert(
+                    pkg.clone(),
+                    files.keys().map(|f| (f.clone(), *seq)).collect(),
+                );
             }
         }
     }
+    changes
 }
 
 /// Run the read-only chain verification across every configured bucket. `Ok(true)`
@@ -708,8 +762,13 @@ pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
         }
     }
 
-    // 4. Warn on a legitimate-looking in-place sha change across the reference.
-    warn_in_chain_sha_changes(&ref_chain.links);
+    // 4. In-chain fingerprint changes across the reference: an already-committed
+    // filename re-committed under a different sha. EITHER a legitimate
+    // mirror→private supersede OR the signature of a forged append that re-blesses
+    // tampered bytes (F37) — indistinguishable in durable storage, so these are
+    // surfaced as first-class reviewable findings and counted, never auto-decided.
+    // Non-fatal by default; `--strict` makes them a violation for a hard CI gate.
+    let sha_changes = in_chain_sha_changes(&ref_chain.links);
 
     // 5. Replay the reference and diff its expected state against every bucket's
     // sidecars. Two independent verdicts per committed file:
@@ -808,18 +867,54 @@ pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
             ),
         }
     }
+    print_fingerprint_changes(&sha_changes, args.strict);
     print_violations(&violations);
     println!(
         "verify-chain: {} bucket(s), reference bucket {} ({} link(s), {} committed file(s)), \
-         {} lagging, {} violation(s)",
+         {} lagging, {} fingerprint-change(s), {} violation(s)",
         chains.len(),
         ref_chain.name,
         ref_chain.links.len(),
         checks.len(),
         lagging.len(),
+        sha_changes.len(),
         violations.len()
     );
-    Ok(violations.is_empty())
+    // Fingerprint changes are non-fatal by default (they are reviewable, not
+    // proven tampers); `--strict` promotes them to a hard failure. The genuinely
+    // fatal categories (broken-link, fork, hash-changed, vanished, …) fault
+    // regardless.
+    let fatal = !violations.is_empty() || (args.strict && !sha_changes.is_empty());
+    Ok(!fatal)
+}
+
+/// Print the in-chain fingerprint changes as a clearly-labeled, first-class
+/// section on stdout — never the old buried stderr line. Each row names one
+/// already-committed filename re-committed under a different sha; the header says
+/// plainly that each is EITHER a legitimate mirror→private supersede OR a forged
+/// re-commit, to be reviewed against the reconciliations the operator expects.
+/// `strict` only changes the header's verdict wording — the rows are identical.
+fn print_fingerprint_changes(changes: &[FingerprintChange], strict: bool) {
+    if changes.is_empty() {
+        return;
+    }
+    let verdict = if strict {
+        "a violation under --strict"
+    } else {
+        "NOT a violation by default — review each"
+    };
+    println!(
+        "fingerprint-changes: {} in-chain sha change(s), {verdict}. Each is EITHER a legitimate \
+         mirror->private supersede OR a forged re-commit of tampered bytes; check every one \
+         against the supersedes you expect.",
+        changes.len()
+    );
+    for c in changes {
+        println!(
+            "fingerprint-changed\t{}\t{}\t{} -> {} (seq {} -> {})",
+            c.package, c.filename, c.old_sha, c.new_sha, c.from_seq, c.to_seq
+        );
+    }
 }
 
 /// Print bucket-tagged violation rows as `bucket\tkind\tpackage\tdetail`.
@@ -852,7 +947,7 @@ enum Presence {
     /// Both rows a real supersede can produce are worth printing. Before the next
     /// audit re-commits the package the row names the operator's own change, and
     /// it clears on that audit (which reports the change once more, as an
-    /// in-chain sha move — [`warn_in_chain_sha_changes`]). After it, a row means
+    /// in-chain sha move — [`in_chain_sha_changes`]). After it, a row means
     /// some bucket is still serving the *withdrawn* body — the exact fail-open
     /// the demotion exists to close, and never noise.
     WrongSha(String),
@@ -1405,6 +1500,70 @@ mod tests {
 
         assert_eq!(catch_up(&primary, &peer).await, CatchUp::Synced);
         assert_eq!(held_seqs(&peer).await, vec![0, 1, 2]);
+    }
+
+    /// F37 at the unit level: a chain that commits `(pkg, filename)` under one sha
+    /// and later re-commits the same filename under another (the shape a
+    /// mirror→private supersede AND a forged re-commit both produce) surfaces as a
+    /// first-class `FingerprintChange` — the old code only `eprintln!`d it and
+    /// returned nothing. The change records both shas and both seqs so the report
+    /// can name exactly what to review.
+    #[test]
+    fn in_chain_sha_change_is_a_returned_finding_with_both_shas_and_seqs() {
+        // seq 0 commits six/one.whl @ "mmmm" (a mirror snapshot); seq 1 re-commits
+        // the same filename @ "pppp" (the private supersede / forged re-commit).
+        let l0 = link(0, "", {
+            let mut d = Delta::new();
+            d.insert("six".to_string(), pkg(&[("six-1.whl", "mmmm")]));
+            d
+        });
+        let b0 = link_bytes(&l0).unwrap();
+        let l1 = link(1, &sha256_hex(&b0), {
+            let mut d = Delta::new();
+            d.insert("six".to_string(), pkg(&[("six-1.whl", "pppp")]));
+            d
+        });
+        let b1 = link_bytes(&l1).unwrap();
+
+        let changes = in_chain_sha_changes(&[(0, b0, l0), (1, b1, l1)]);
+        assert_eq!(changes.len(), 1, "the re-commit must be reported once");
+        let c = &changes[0];
+        assert_eq!(c.package, "six");
+        assert_eq!(c.filename, "six-1.whl");
+        assert_eq!(c.old_sha, "mmmm");
+        assert_eq!(c.new_sha, "pppp");
+        assert_eq!(c.from_seq, 0, "old sha was committed at seq 0");
+        assert_eq!(c.to_seq, 1, "new sha lands at seq 1");
+    }
+
+    /// A chain that only ever *adds* files (never re-commits an existing filename
+    /// under a new sha) has no fingerprint change — so the finding is the tamper
+    /// signal, not noise on ordinary churn.
+    #[test]
+    fn ordinary_churn_produces_no_fingerprint_change() {
+        let l0 = link(0, "", {
+            let mut d = Delta::new();
+            d.insert("six".to_string(), pkg(&[("six-1.whl", "aa")]));
+            d
+        });
+        let b0 = link_bytes(&l0).unwrap();
+        // seq 1 re-states six-1.whl at the SAME sha and adds a new file — the
+        // last-write-wins whole-map replace must not read the unchanged file as a
+        // change.
+        let l1 = link(1, &sha256_hex(&b0), {
+            let mut d = Delta::new();
+            d.insert(
+                "six".to_string(),
+                pkg(&[("six-1.whl", "aa"), ("six-2.whl", "bb")]),
+            );
+            d
+        });
+        let b1 = link_bytes(&l1).unwrap();
+
+        assert!(
+            in_chain_sha_changes(&[(0, b0, l0), (1, b1, l1)]).is_empty(),
+            "adding a file and re-stating an unchanged one is not a fingerprint change"
+        );
     }
 
     #[test]

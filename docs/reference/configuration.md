@@ -548,6 +548,23 @@ changing the store by hand, or on a schedule you have budgeted for.
 Mismatches print as `body-mismatch` (or `size-mismatch` for the free check) and
 exit `1`.
 
+`pypiron verify-chain` replays the tamper-evident checkpoint log under
+`_transparency/` against storage. A file whose stored hash no longer matches what
+the chain committed, or a committed file gone with no tombstone, is a violation
+(`hash-changed` / `vanished`) and exits `1`. Separately, it reports every **in-chain
+fingerprint change** — a filename the chain committed under one hash and later
+re-committed under another. That is EITHER a legitimate mirror→private supersede
+OR a forged re-commit of tampered bytes, and nothing in storage tells the two
+apart, so each is printed as a `fingerprint-changed` row for you to review against
+the supersedes you expect, and the summary carries an `N fingerprint-change(s)`
+count. These are **non-fatal by default** — verify-chain still exits `0` unless a
+real violation is present — so a continuous, legitimate log is not permanently
+red. Pass `--strict` (`PYPIRON_VERIFY_CHAIN_STRICT`) to treat any fingerprint
+change as a failure for a hard CI gate, or gate your own pipeline on the count.
+Truncation or rollback of the chain itself is stopped only by Object Lock in
+**COMPLIANCE** mode on `_transparency/` — GOVERNANCE mode is removable with the
+same storage credentials.
+
 `buckets migrate` requires a multi-bucket target and **refuses while any bucket
 still has pending cross-bucket repairs**, so shrinking or reordering the list
 cannot strand a file's only copy on a bucket you are about to remove. It also
@@ -563,6 +580,7 @@ with that bucket; single-bucket mode records no bucket list, so there's nothing 
 | --- | --- | --- | --- |
 | `--force` | `PYPIRON_MIGRATE_FORCE` | `false` | On `buckets migrate`, drop a bucket even when it holds the fleet's only copy of some content. **Permanent data loss** — back the corpus up onto a surviving bucket first. |
 | `--deep` | `PYPIRON_VERIFY_DEEP` | `false` | On `verify-index`, re-hash every stored file against the SHA-256 its record publishes. Reads the whole corpus once. |
+| `--strict` | `PYPIRON_VERIFY_CHAIN_STRICT` | `false` | On `verify-chain`, treat an in-chain fingerprint change (a filename re-committed under a different hash — a legitimate mirror→private supersede or a forged re-commit) as a failure and exit `1`. Off by default: those changes are reported and counted but non-fatal, so a legitimate supersede does not permanently red the audit. |
 
 Stop writes before `origin release`. It refuses a package with any stored file
 except `.origin`, or with pending write/replication work, and conditionally

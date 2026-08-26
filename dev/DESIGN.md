@@ -179,17 +179,39 @@ bucket is caught, not just the preferred one. The walk stays metadata-only: chai
 links and sidecar reads, never artifact bytes.
 
 The trust anchor, stated honestly: the chain is only as append-only as the
-storage is. In-bucket and unsigned, it already defeats the content-rewrite
-attack — the historical checkpoint committing the original hash cannot be
-*consistently* rewritten without leaving a contradiction, and a forged append
-can only stack new claims on top of the sealed history, never erase the
-contradiction below it. What in-bucket storage alone does not close is rollback
-or truncation of the chain itself; that case is closed by enabling Object Lock
-or a retention policy on `_transparency/`. Server-assigned timestamps plus WORM
-are the anchor — the same mechanism enterprises already accept for SEC 17a-4
-record-keeping — and it is one bucket setting, no key ceremony. No lock, no
-rollback guarantee; the manual says so plainly. Operator signing for
-auditor-portable evidence is a deferred additive layer.
+storage is. In-bucket and unsigned, it catches the *naive* content-rewrite — an
+attacker who rewrites an artifact's bytes and its sidecar sha but leaves the
+sealed checkpoint alone is caught by the replay-vs-storage diff (`hash-changed`),
+because the historical checkpoint still commits the original hash and cannot be
+*consistently* rewritten without breaking a link below it.
+
+What it does **not** auto-defeat is a forged *append*. An attacker holding
+storage credentials can add a new link that re-commits an already-committed
+filename under the new bytes, matching sidecar and all. Replay then reconstructs
+the new sha, storage agrees, and `hash-changed` stays silent — the only durable
+trace is that the chain now holds two shas for one filename at two seqs. And that
+is exactly what a legitimate mirror→private supersede also produces (`M` at one
+seq, `P` at a later one, storage serving `P`): the two are the same chain shape,
+and nothing durable in storage tells them apart — every candidate witness (the
+demotion fence, the `_quarantine/` copy) is an object the credential-holding
+attacker writes as cheaply as the re-commit. So `verify-chain` does not try to
+auto-decide. It **surfaces every in-chain fingerprint change as a first-class,
+counted finding** — reviewable, non-fatal by default (`--strict` /
+`PYPIRON_VERIFY_CHAIN_STRICT` promotes it to a hard failure), summarized as a
+`N fingerprint-change(s)` count a CI can gate on — for the operator to reconcile
+against the supersedes they expect. Reported, never silently blessed and never
+silently faulted.
+
+Rollback or truncation of the chain itself is the other case in-bucket storage
+alone does not close, and it is closed by object-store retention on
+`_transparency/` — specifically **Object Lock in COMPLIANCE mode**. GOVERNANCE
+mode is removable by anyone holding the same storage credentials (the very
+attacker this module models), so only COMPLIANCE-mode retention actually stops a
+truncation. Server-assigned timestamps plus COMPLIANCE WORM are the anchor — the
+same mechanism enterprises already accept for SEC 17a-4 record-keeping — and it
+is one bucket setting, no key ceremony. No lock, no rollback guarantee; the
+manual says so plainly. Operator signing for auditor-portable evidence is a
+deferred additive layer.
 
 The chain is a third kind of state, and the taxonomy should be honest about it:
 not truth, not a regenerable view, but an append-only **witness**. Deleting the
@@ -810,8 +832,12 @@ _transparency/chain/<seq>.json           # append-only hash-chained audit checkp
                                          #   sha256 deltas, churn-sized like the audit. A WITNESS — never
                                          #   truth, never a view; delete resets tamper-evidence history,
                                          #   never breaks the server. Never replicated, never lifecycle-
-                                         #   expired. Recommended hardening: Object Lock / retention on
-                                         #   this prefix.
+                                         #   expired. Truncation/rollback hardening: Object Lock in
+                                         #   COMPLIANCE mode on this prefix (GOVERNANCE is removable with
+                                         #   the same creds, so it does not stop a credential-holding
+                                         #   attacker). A forged append that re-commits a file under new
+                                         #   bytes is NOT auto-defeated — verify-chain surfaces it as a
+                                         #   reviewable fingerprint-change finding.
 _quarantine/<pkg>/<file>@<sha12>         # multi-bucket: a frozen conflict loser or demoted mirror loser,
                                          #   preserved under its own content hash. Quarantine is per
                                          #   artifact, never deleted; there is no staging tree.

@@ -177,6 +177,66 @@ def test_consistent_artifact_rewrite_is_caught(disk_server, pypiron_bin, tmp_pat
     assert artifact.name in cp.stdout, cp.stdout
 
 
+def test_in_chain_fingerprint_change_is_a_reviewable_finding_not_a_default_fault(
+    disk_server, pypiron_bin, tmp_path
+):
+    """F37: a filename re-committed under new bytes — the shape a legitimate
+    mirror->private supersede AND a forged re-commit both produce — must surface as
+    a first-class, counted finding on stdout, non-fatal by default, and fatal only
+    under --strict.
+
+    Driven through the real audit: upload (chain seq 0 commits filename@shaM,
+    sidecar shaM), consistently rewrite the artifact + sidecar to shaP, re-audit
+    (chain seq 1 commits filename@shaP). Storage is now internally consistent, so
+    the replay-vs-storage `hash-changed` check stays silent — the ONLY trace is the
+    chain holding two shas for one filename, which verify-chain now reports.
+
+    The RED this locks down: the old code emitted the change as a buried stderr
+    line and exited 0 with nothing on stdout and no count. GREEN: a
+    `fingerprint-changed` row and a `fingerprint-change(s)` count on stdout.
+    """
+    server = disk_server
+    wheel = make_wheel("transfingera", "1.0.0", tmp_path)
+    _upload(server, wheel)
+    assert _rebuild_index(pypiron_bin, server["data_dir"]).returncode == 0
+
+    artifact, sidecar = _artifact_and_sidecar(server["data_dir"], _pkg_from_wheel(wheel))
+    old_sha = json.loads(sidecar.read_text())["sha256"]
+
+    # A consistent rewrite: new bytes + a sidecar sha that matches them, so nothing
+    # replay-vs-storage disagrees on.
+    tampered = artifact.read_bytes() + b"superseded-or-forged-payload"
+    artifact.write_bytes(tampered)
+    meta = json.loads(sidecar.read_text())
+    new_sha = sha256_file(artifact)
+    meta["sha256"] = new_sha
+    meta["size"] = len(tampered)
+    sidecar.write_text(json.dumps(meta))
+
+    # Re-audit: the chain now commits the same filename under the new sha at a later
+    # seq, so both shas live in the chain.
+    assert _rebuild_index(pypiron_bin, server["data_dir"]).returncode == 0
+    assert len(_chain_links(server["data_dir"])) >= 2, "the re-audit must append a link"
+
+    # Default: reported + counted on stdout, but non-fatal (exit 0).
+    cp = _verify_chain(pypiron_bin, server["data_dir"])
+    assert cp.returncode == 0, (
+        f"a fingerprint change must be non-fatal by default:\n{cp.stdout}{cp.stderr}"
+    )
+    assert "fingerprint-changed" in cp.stdout, f"the finding must be on stdout:\n{cp.stdout}"
+    assert artifact.name in cp.stdout, cp.stdout
+    assert old_sha in cp.stdout and new_sha in cp.stdout, cp.stdout
+    assert "1 fingerprint-change(s)" in cp.stdout, f"the count must be in the summary:\n{cp.stdout}"
+    # It must NOT be counted as a violation.
+    assert "hash-changed" not in cp.stdout, cp.stdout
+    assert "0 violation(s)" in cp.stdout, f"no genuine violation here:\n{cp.stdout}"
+
+    # --strict promotes it to a hard failure for operators who want a CI gate.
+    cp_strict = _cli(pypiron_bin, "verify-chain", "--data-dir", str(server["data_dir"]), "--strict")
+    assert cp_strict.returncode == 1, f"--strict must fault:\n{cp_strict.stdout}{cp_strict.stderr}"
+    assert "fingerprint-changed" in cp_strict.stdout, cp_strict.stdout
+
+
 def test_vanished_artifact_is_caught_but_a_real_delete_is_not(disk_server, pypiron_bin, tmp_path):
     """An artifact + sidecar deleted straight off disk (no tombstone) is a
     violation; a delete through the API leaves a tombstone and, after the next

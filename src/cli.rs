@@ -973,6 +973,14 @@ pub struct ServeArgs {
     #[arg(long, env = "PYPIRON_ALLOW_INSECURE_UPSTREAM")]
     pub(crate) allow_insecure_upstream: bool,
 
+    /// Start sending an uncached artifact this size or larger to the client
+    /// while it is still downloading from upstream, instead of waiting for the
+    /// whole file. The last bytes are held back until the sha256 check passes,
+    /// so a complete download is always a verified one. Accepts sizes like
+    /// `64MB` or `1GiB`; `off` waits for every file.
+    #[arg(long, env = "PYPIRON_PROXY_STREAM_THRESHOLD", default_value = "16MiB")]
+    pub(crate) proxy_stream_threshold: String,
+
     /// PEM bundle of extra CA certificates to trust for **upstream** TLS — the
     /// private root a corporate forwarding TLS proxy (a MITM appliance) presents.
     /// Augments the built-in roots (a direct fetch of public PyPI keeps working);
@@ -1147,6 +1155,11 @@ pub fn merge_serve_file(
         cli.allow_insecure_upstream,
         "allow_insecure_upstream",
         f.allow_insecure_upstream
+    );
+    fill!(
+        cli.proxy_stream_threshold,
+        "proxy_stream_threshold",
+        f.proxy_stream_threshold.clone()
     );
     fill!(
         cli.metrics_project_labels,

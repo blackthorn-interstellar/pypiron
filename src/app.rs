@@ -23,9 +23,9 @@ use tracing::{debug, info, warn};
 // name so the bare `worker::`, `storage::`, … paths throughout this file (from
 // its life as the crate root) keep resolving.
 use crate::{
-    advisories, bucket_health, buckets, cache, config, counted_storage, counters, html, metrics,
-    names, node_region, observed_storage, origin, project_cache, proxy, render, replicate, storage,
-    sync, token, transparency, verify, worker,
+    advisories, bucket_health, buckets, cache, config, counted_storage, counters, denylist, html,
+    metrics, names, node_region, observed_storage, origin, project_cache, proxy, render, replicate,
+    storage, sync, token, transparency, verify, worker,
 };
 
 use bucket_health::{HealthController, HealthPolicy};
@@ -71,12 +71,43 @@ pub(crate) const VERSION: &str = concat!(
     ")"
 );
 
-/// One-shot deep audit against a storage backend, no server attached.
-async fn run_rebuild_index(args: RebuildIndexArgs) -> Result<()> {
+/// One-shot deep audit against a storage backend, no server attached. The
+/// enforced `--exclude-package` denylist rides along on the headless state so the
+/// rebuild delists excluded packages exactly as the live worker does — without
+/// it, `rebuild-index` would re-materialize every excluded name from truth and
+/// durably un-delist it. The denylist is read from the persisted stamp (what
+/// `serve` last enforced, via whatever channel), with `fallback` — this command's
+/// own config — used only when no stamp exists yet.
+async fn run_rebuild_index(args: RebuildIndexArgs, fallback: denylist::Denylist) -> Result<()> {
     let storage = args.storage.build_for_write().await?;
-    let state = AppState::headless(storage);
+    let denylist = worker::enforced_denylist(storage.as_ref(), &fallback).await?;
+    let mut state = AppState::headless(storage);
+    state.denylist = Some(Arc::new(denylist));
     let pinned = state.pin();
-    worker::audit(&state, &pinned, true).await
+    worker::audit(&state, &pinned, true).await?;
+    // Leave the enforced-denylist stamp consistent with what this pass applied.
+    // The audit above rebuilt every package with the denylist in force; recording
+    // it here stops a later `serve` boot's reconcile from concluding the config
+    // changed and re-materializing the listings this pass just delisted.
+    let canonical = state
+        .denylist
+        .as_ref()
+        .map(|d| d.canonical())
+        .unwrap_or_default();
+    worker::write_enforced_excludes(&state, pinned.storage.as_ref(), &canonical).await
+}
+
+/// The config-file `--exclude-package` denylist for an offline maintenance
+/// command — the *fallback* used only when the store carries no enforced-excludes
+/// stamp yet. Maintenance commands take no mirror flags of their own, so
+/// `pypiron.toml`'s `[mirror]` is the source; the stamp (what `serve` last
+/// enforced through any channel) is the real authority, resolved from storage.
+fn resolve_maintenance_denylist(
+    config_path: Option<&std::path::Path>,
+) -> Result<denylist::Denylist> {
+    let file = config::load(config_path)?;
+    let mirror = sync::MirrorArgs::default().resolve(Some(&file.mirror))?;
+    Ok(denylist::Denylist::from_specs(&mirror.exclude_packages))
 }
 
 /// How artifact bytes reach clients. The tension: redirects move the
@@ -307,6 +338,17 @@ pub struct AppState {
     pub projects_page_cache: ProjectsPageCache,
     /// On-demand upstream mirroring (None unless --proxy-upstream is set).
     pub proxy: Option<Arc<proxy::Proxy>>,
+    /// Size at or above which a cold-miss proxy download is streamed to the
+    /// client while it is still arriving from upstream, with the tail withheld
+    /// until the sha256 check passes. `None` (`--proxy-stream-threshold off`)
+    /// keeps every fill buffered: download, verify, commit, then serve.
+    pub proxy_stream_threshold: Option<u64>,
+    /// The `--exclude-package` denylist that delists names from the materialized
+    /// indexes. `Some` whenever a mirror is configured (shared with `proxy`, or
+    /// resolved from config for the offline `rebuild-index` audit); an empty
+    /// denylist is still `Some`, so the reconcile can relist what a prior config
+    /// delisted. `None` only when no mirror/exclude config applies at all.
+    pub denylist: Option<Arc<denylist::Denylist>>,
     /// Process start, for the homepage uptime readout.
     pub started: std::time::Instant,
     /// Set on graceful shutdown so `/health` reports 503 *before* the listener
@@ -545,6 +587,8 @@ impl AppState {
             package_stats_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
+            proxy_stream_threshold: None,
+            denylist: None,
             started: std::time::Instant::now(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advisory_feed: None,
@@ -821,8 +865,9 @@ pub async fn cli_main() -> Result<()> {
             // Keep diverged off the error channel so CI can branch the three.
             // (clippy exempts `process::exit` only inside `fn main`; this
             // dispatcher moved to the library, so the exemption is explicit.)
+            let denylist = resolve_maintenance_denylist(config_path.as_deref())?;
             #[allow(clippy::exit)]
-            match verify::run_verify(*args).await {
+            match verify::run_verify(*args, &denylist).await {
                 Ok(true) => Ok(()),
                 Ok(false) => std::process::exit(1),
                 Err(e) => {
@@ -838,7 +883,8 @@ pub async fn cli_main() -> Result<()> {
                 &matches,
                 "rebuild-index",
             )?;
-            run_rebuild_index(*args).await
+            let denylist = resolve_maintenance_denylist(config_path.as_deref())?;
+            run_rebuild_index(*args, denylist).await
         }
         Some(Commands::VerifyChain(mut args)) => {
             apply_maintenance_config(
@@ -966,6 +1012,19 @@ impl counters::KeyVerifier for ArtifactVerifier {
     fn ops_per_check(&self) -> usize {
         self.buckets.handles().len().max(1)
     }
+}
+
+/// The size at or above which a cold-miss proxy download is streamed to the
+/// client while it is still arriving (`--proxy-stream-threshold`). `off` — or an
+/// empty value — is `None`: every fill downloads, verifies, and commits before
+/// the first byte goes out. Parsed at startup so a typo refuses to boot instead
+/// of silently disabling itself at the first large download.
+fn parse_stream_threshold(raw: &str) -> Result<Option<u64>> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    sync::parse_size("--proxy-stream-threshold", Some(raw))
 }
 
 /// Build the download-counter engine from CLI config, failing closed on a bad
@@ -1341,6 +1400,7 @@ async fn run_serve(
             ),
         }
     }
+    let proxy_stream_threshold = parse_stream_threshold(&cli.proxy_stream_threshold)?;
     let proxy = match cli.proxy_upstream.as_deref() {
         Some(upstream) => {
             let mirror = cli.mirror.resolve(Some(&file.mirror))?;
@@ -1363,6 +1423,7 @@ async fn run_serve(
                     }
                     scope
                 },
+                stream_from = %cli.proxy_stream_threshold,
                 "proxy enabled"
             );
             Some(Arc::new(proxy::Proxy::new(
@@ -1375,6 +1436,11 @@ async fn run_serve(
         }
         None => None,
     };
+    // Share the proxy's exclude denylist with the serving state, so the index
+    // rebuild, the `/project/` page, and the reconcile all rule through the same
+    // predicate — `Some` (possibly empty) whenever a proxy is configured, so the
+    // reconcile can relist what a prior config's excludes delisted.
+    let denylist = proxy.as_ref().map(|p| p.denylist());
 
     // The private prefix is the dependency-confusion control; a value that PEP
     // 503 normalization reduces to empty (e.g. `.`, `_`, `..`) would match no
@@ -1502,6 +1568,8 @@ async fn run_serve(
         package_stats_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
         proxy,
+        proxy_stream_threshold,
+        denylist,
         started: std::time::Instant::now(),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         advisory_feed,
@@ -2396,6 +2464,22 @@ pub(crate) fn internal(label: &'static str, e: impl std::fmt::Display) -> (Statu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_threshold_parses_sizes_and_the_off_switch() {
+        let ok = |s: &str| parse_stream_threshold(s).unwrap();
+        assert_eq!(ok("16MiB"), Some(16 * 1024 * 1024));
+        assert_eq!(ok(" 64MB "), Some(64 * 1024 * 1024));
+        assert_eq!(ok("1048576"), Some(1024 * 1024));
+        // The disable switch, however it's typed, and the empty value a
+        // `[serve]` table or an unset env var can produce.
+        assert_eq!(ok("off"), None);
+        assert_eq!(ok("OFF"), None);
+        assert_eq!(ok(""), None);
+        // A typo refuses to boot rather than silently streaming nothing.
+        assert!(parse_stream_threshold("sixteen").is_err());
+        assert!(parse_stream_threshold("-1MB").is_err());
+    }
 
     #[test]
     fn client_ip_honors_forwarded_headers_only_behind_trusted_proxy() {

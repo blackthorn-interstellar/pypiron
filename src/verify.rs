@@ -28,6 +28,7 @@ use futures::StreamExt as _;
 use sha2::{Digest, Sha256};
 
 use crate::app::{DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
+use crate::denylist::Denylist;
 use crate::names::normalize_pkg_name;
 use crate::origin::OriginState;
 use crate::render::{
@@ -85,7 +86,11 @@ pub struct VerifyReport {
 /// The truth counts come back with the diff because enumerating `packages/` is
 /// the expensive part on a real mirror — a caller that wants totals must not
 /// pay for a second listing pass.
-pub async fn verify_storage(storage: &dyn Storage, deep: bool) -> Result<VerifyReport> {
+pub async fn verify_storage(
+    storage: &dyn Storage,
+    deep: bool,
+    denylist: &Denylist,
+) -> Result<VerifyReport> {
     let truth = enumerate_grouped(storage, PACKAGES_PREFIX).await?;
     let views = enumerate_grouped(storage, SIMPLE_PREFIX).await?;
     let package_count = truth.len();
@@ -98,7 +103,7 @@ pub async fn verify_storage(storage: &dyn Storage, deep: bool) -> Result<VerifyR
     for chunk in packages.chunks(PACKAGE_CONCURRENCY) {
         let checks = chunk
             .iter()
-            .map(|(pkg, objects)| check_package(storage, pkg, objects, deep));
+            .map(|(pkg, objects)| check_package(storage, pkg, objects, deep, denylist));
         for result in futures::future::join_all(checks).await {
             let (pkg, has_artifacts, mut divs) = result?;
             if has_artifacts {
@@ -130,9 +135,13 @@ pub async fn verify_storage(storage: &dyn Storage, deep: bool) -> Result<VerifyR
 
 /// Run the read-only diff. `Ok(true)` = converged, `Ok(false)` = diverged
 /// (rows + summary already printed to stdout), `Err` = the check could not run.
-/// The caller maps these to exit codes 0 / 1 / 2.
-pub async fn run_verify(args: VerifyArgs) -> Result<bool> {
+/// The caller maps these to exit codes 0 / 1 / 2. `fallback` is the config-file
+/// denylist, used only when the store carries no enforced-excludes stamp yet; the
+/// stamp (what `serve` last enforced, via any channel) is the authority so the
+/// oracle models the same delisting the running server applied.
+pub async fn run_verify(args: VerifyArgs, fallback: &Denylist) -> Result<bool> {
     let storage = args.storage.build().await?;
+    let denylist = crate::worker::enforced_denylist(storage.as_ref(), fallback).await?;
 
     let pending = storage.list_dir_entries(DIRTY_PREFIX).await?;
     if !pending.is_empty() {
@@ -145,7 +154,7 @@ pub async fn run_verify(args: VerifyArgs) -> Result<bool> {
     // One pass: the diff counts the truth it already enumerated, so the summary
     // totals cost nothing extra and no second copy of the truth map (a full
     // mirror is ~10^6 objects) is ever alive.
-    let report = verify_storage(storage.as_ref(), args.deep).await?;
+    let report = verify_storage(storage.as_ref(), args.deep, &denylist).await?;
 
     for d in &report.divergences {
         println!("{}\t{}\t{}", d.kind, d.package, d.detail);
@@ -210,6 +219,7 @@ async fn check_package(
     pkg: &str,
     objects: &[ObjectMeta],
     deep: bool,
+    denylist: &Denylist,
 ) -> Result<(String, bool, Vec<Divergence>)> {
     let mut divs = Vec::new();
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
@@ -334,7 +344,16 @@ async fn check_package(
             } else if deep {
                 attested.push((*filename, sc.sha256.clone(), sc.size));
             }
-            if suppressed_mirror(pkg_origin, &sc, mirror_quarantined.contains(filename)) {
+            // The `--exclude-package` denylist delists like a mirror suppression:
+            // the renderer drops the file, `still_live` (and global-list
+            // membership) follows the renderable set, and the bytes stay stored —
+            // still integrity-checked above, since the size/deep checks precede
+            // this, as they do for mirror-suppressed truth. A fully-denied package
+            // ends up with nothing renderable, so its view is expected absent and
+            // its name absent from the global list — exactly what the worker does.
+            if denylist.file_denied(pkg, filename)
+                || suppressed_mirror(pkg_origin, &sc, mirror_quarantined.contains(filename))
+            {
                 suppressed += 1;
                 continue;
             }
@@ -614,7 +633,9 @@ mod tests {
         crate::worker::rebuild_package_excluding(&state, bucket.as_ref(), "demo", None)
             .await
             .unwrap();
-        let report = verify_storage(bucket.as_ref(), true).await.unwrap();
+        let report = verify_storage(bucket.as_ref(), true, &Denylist::default())
+            .await
+            .unwrap();
         let view_divergences: Vec<&str> = report
             .divergences
             .iter()
@@ -655,7 +676,9 @@ mod tests {
         );
         write(&storage, "simple/ghost/index.json", b"{}".to_vec());
         let bucket: Arc<dyn Storage> = storage.clone();
-        let report = verify_storage(bucket.as_ref(), true).await.unwrap();
+        let report = verify_storage(bucket.as_ref(), true, &Denylist::default())
+            .await
+            .unwrap();
         assert!(
             report
                 .divergences
@@ -691,13 +714,17 @@ mod tests {
         // Same length, different bytes: only the re-hash can see it, which is
         // the whole argument for `--deep` existing at all.
         let swapped: Arc<dyn Storage> = store(b"BODY");
-        let shallow = verify_storage(swapped.as_ref(), false).await.unwrap();
+        let shallow = verify_storage(swapped.as_ref(), false, &Denylist::default())
+            .await
+            .unwrap();
         assert!(
             !kinds(&shallow).contains(&"body-mismatch"),
             "the default pass must not read bodies: {:?}",
             kinds(&shallow)
         );
-        let deep = verify_storage(swapped.as_ref(), true).await.unwrap();
+        let deep = verify_storage(swapped.as_ref(), true, &Denylist::default())
+            .await
+            .unwrap();
         assert!(
             kinds(&deep).contains(&"body-mismatch"),
             "--deep missed a same-length body swap: {:?}",
@@ -707,7 +734,9 @@ mod tests {
         // Different length: the listing already told us, so no read is needed
         // and no flag either.
         let truncated: Arc<dyn Storage> = store(b"bod");
-        let report = verify_storage(truncated.as_ref(), false).await.unwrap();
+        let report = verify_storage(truncated.as_ref(), false, &Denylist::default())
+            .await
+            .unwrap();
         assert!(
             kinds(&report).contains(&"size-mismatch"),
             "a length the sidecar contradicts is free to catch: {:?}",
@@ -715,7 +744,9 @@ mod tests {
         );
         // ...and having caught it, `--deep` does not also spend a read to say
         // the same thing twice.
-        let report = verify_storage(truncated.as_ref(), true).await.unwrap();
+        let report = verify_storage(truncated.as_ref(), true, &Denylist::default())
+            .await
+            .unwrap();
         assert!(
             !kinds(&report).contains(&"body-mismatch"),
             "a proven size mismatch should not also be re-hashed: {:?}",

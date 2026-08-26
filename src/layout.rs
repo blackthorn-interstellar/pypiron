@@ -146,7 +146,7 @@ pub const MANIFEST: &[PrefixClass] = &[
     PrefixClass {
         prefix: crate::worker::STATE_PREFIX,
         class: Class::DerivedPerBucket,
-        why: "per-bucket fingerprint shards: views of views, regenerable",
+        why: "per-bucket derived state: fingerprint shards and the enforced-denylist stamp — views of config/truth, regenerable",
     },
     PrefixClass {
         prefix: crate::sync::CURSORS_KEY,

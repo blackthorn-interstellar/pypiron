@@ -117,6 +117,21 @@ impl UploadSpool {
         self.size
     }
 
+    /// The spool file itself, for a reader that wants to follow the bytes as
+    /// they land (the proxy's streaming tee opens its own handle on this path).
+    pub fn path(&self) -> &Path {
+        self.path.path()
+    }
+
+    /// Hand every buffered byte to the OS so a second open handle can read them.
+    /// `write_chunk` returns as soon as tokio has queued the write, so a reader
+    /// following [`size`](Self::size) would otherwise race ahead of the file.
+    /// Not an fsync — durability across a crash is still the rename's job.
+    pub async fn flush(&mut self) -> Result<()> {
+        self.file.flush().await?;
+        Ok(())
+    }
+
     pub async fn finish(mut self) -> Result<FinishedSpool> {
         self.file.flush().await?;
         self.file.sync_data().await?;

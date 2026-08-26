@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import platform
+import random
 import re
 import shutil
 import socket
@@ -543,7 +544,11 @@ def make_wheel(
     *,
     metadata_extra: str = "",
     description: str = "",
+    payload_bytes: int = 0,
 ) -> Path:
+    """A minimal valid wheel. `payload_bytes` pads it with that many bytes of
+    incompressible data, for tests that need a wheel of a realistic size (the
+    proxy's streaming threshold, for one) without downloading a real one."""
     safe_name = re.sub(r"[^A-Za-z0-9.]+", "_", name).strip("_")
     module_name = re.sub(r"\W+", "_", name).strip("_").lower()
     dist_info = f"{safe_name}-{version}.dist-info"
@@ -559,6 +564,11 @@ def make_wheel(
         metadata += "\n" + description
     files = {
         f"{module_name}.py": f'__version__ = "{version}"\n'.encode(),
+        # Deflate is applied below, so the padding has to be random or the wheel
+        # would compress back down to nothing.
+        **(
+            {f"{module_name}_payload.bin": random.randbytes(payload_bytes)} if payload_bytes else {}
+        ),
         f"{dist_info}/METADATA": metadata.encode(),
         f"{dist_info}/WHEEL": (
             "Wheel-Version: 1.0\n"

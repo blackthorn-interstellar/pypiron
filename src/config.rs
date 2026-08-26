@@ -94,6 +94,7 @@ pub struct ServeConfig {
     pub login_cooldown_secs: Option<u64>,
     pub proxy_upstream: Option<String>,
     pub allow_insecure_upstream: Option<bool>,
+    pub proxy_stream_threshold: Option<String>,
     pub advisory_feed: Option<String>,
     pub malware_block: Option<bool>,
     pub malware_probe_secs: Option<u64>,

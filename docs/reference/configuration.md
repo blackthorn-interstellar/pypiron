@@ -289,6 +289,7 @@ recovery behavior, and operator rules.
 | `--private-prefix PREFIX` | `PYPIRON_PRIVATE_PREFIX` | none | Reserve `PREFIX` and `PREFIX-*` for private packages. |
 | `--proxy-upstream URL` | `PYPIRON_PROXY_UPSTREAM` | none | On-demand mirror source, usually `https://pypi.org`. |
 | `--allow-insecure-upstream` | `PYPIRON_ALLOW_INSECURE_UPSTREAM` | `false` | Permit a plaintext `http://` proxy upstream. Off by default: over http a network MITM controls both the artifact bytes and the sha256 they are verified against, so the hash check stops being a control. |
+| `--proxy-stream-threshold SIZE` | `PYPIRON_PROXY_STREAM_THRESHOLD` | `16MiB` | Start sending an uncached file this size or larger to the client while it is still downloading from upstream, instead of waiting for the whole thing. The last bytes are withheld until the sha256 check passes, so a download that completes is always a verified one and a bad upstream shows up as a failed transfer. Accepts sizes like `64MB` or `1GiB`; `off` waits for every file. |
 | `--proxy-allow-host HOST` | `PYPIRON_PROXY_ALLOW_HOST` | none | Permit the proxy to fetch listing-derived URLs (artifact, `.metadata`, `.provenance`, redirect targets) whose host matches `HOST` exactly, even if it resolves to a private address. Repeatable; comma-separated in the env var. Only the configured upstream host is exempt otherwise. |
 | `--proxy-allow-cidr CIDR` | `PYPIRON_PROXY_ALLOW_CIDR` | none | Like `--proxy-allow-host`, but permits any target IP inside `CIDR` (e.g. `10.0.0.0/8`). Repeatable; comma-separated in the env var. |
 | `--upstream-ca-cert PEM` | `PYPIRON_UPSTREAM_CA_CERT` | none | PEM bundle of extra CA certificates to trust for **upstream** TLS — the private root a corporate forwarding TLS proxy (a MITM appliance) presents. Augments the built-in roots (a direct fetch of public PyPI keeps working); it does not replace them. Applied to the proxy upstream fetch and the advisory feed/probe. Loaded fail-closed at startup: a missing or unparseable bundle refuses to start. See [Behind a forward proxy](#behind-a-forward-proxy-or-tls-interception). |
@@ -435,15 +436,30 @@ Rules:
   yanked files you never cached. A pin on one of those resolves and then fails
   the download — set `include-yanked = true` if you need those fetchable.
 
-**Excludes are a pull gate, not a purge.** They stop future fetches; they don't
-remove what's already stored. A package cached before you excluded it keeps
-listing and keeps downloading, and a version-pinned exclude drops the denied
-versions from new listings while an already-cached file of that version still
-downloads. To be rid of one, delete its files — `DELETE
-/files/<package>/<filename>`, admin credential — and with the exclude in place
-the proxy won't refill them. On multiple buckets that delete is refused for
-anything mirrored from an upstream, cached on demand or pulled by `sync`; see
+**`exclude-packages` delists a name — even one already cached.** Add a package
+to `exclude-packages` and it disappears from the listings installers resolve
+against: `/simple/<name>/` answers as if pypiron never held it, the name drops
+off the `/simple/` root, and its `/project/` page 404s — so the normal install
+path can't find it, whether or not it was cached first. A version-pinned exclude
+(`django<4`) drops just the matching releases and keeps the rest. Removing the
+exclude relists the package instantly, rebuilt from the bytes already on disk —
+no re-download. Because it's startup config, a denylist change takes effect on
+the next restart, which rebuilds the affected listings.
+
+Delisting is not deletion. The stored bytes stay on disk and stay fetchable by
+their direct file URL (`GET /files/<package>/<filename>`) until you remove them
+— a delisted name is unresolvable through pip/uv but still reachable by exact
+URL. To reclaim the bytes too, delete the files (`DELETE
+/files/<package>/<filename>`, admin credential); with the exclude in place the
+proxy won't refill them. On multiple buckets that delete is refused for anything
+mirrored from an upstream, cached on demand or pulled by `sync`; see
 [Multiple regions and clouds](#multiple-regions-and-clouds).
+
+**The content filters are a pull gate, not a purge.** `include-format`, the tag
+and Python-version filters, `exclude-larger`, `exclude-newer`, and the rest stop
+future fetches but don't remove what's already stored: a file cached before you
+added the filter keeps listing and downloading. To be rid of one, delete its
+files the same way.
 
 ## Sync
 
@@ -508,6 +524,14 @@ Tokens live for 5 minutes and cannot outrank the credential that minted them.
 also read `[serve]` from `pypiron.toml`. `buckets migrate` and `origin release`
 do too. Storage flags can also follow the subcommand:
 `pypiron buckets migrate --buckets ...`.
+
+For delisting, `verify-index` and `rebuild-index` honor whatever excludes the
+running `serve` last enforced — recorded in the store — so they agree with it no
+matter which channel (`--exclude-package`, `PYPIRON_EXCLUDE_PACKAGE`, or the
+config file) set them; you need not repeat the excludes to the maintenance
+command. Change what is excluded through `serve`'s config and restart it. On a
+store no `serve` has ever run against, they fall back to `[mirror].exclude-packages`
+from the `--config` you pass.
 
 `verify-index` does not open your package files. It compares what the indexes
 say against what the store holds, which keeps it fast on a mirror with a million

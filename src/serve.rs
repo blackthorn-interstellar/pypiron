@@ -804,12 +804,20 @@ pub(crate) async fn files_get(
     // presign/stream logic runs (a presigned redirect never observes a 404,
     // so the fetch can't be triggered by one). The fill runs entirely on the
     // write pin — origin claims and the 409-serialized PUT stay on the write home.
-    match proxy_ensure_artifact(
+    //
+    // A large cold miss is the exception: waiting for the whole download before
+    // the first byte is a minutes-long silence on a big wheel, so the fill hands
+    // back a live handle and the client is served from it as the bytes land.
+    // Only a plain whole-file GET qualifies — a ranged read needs the committed
+    // artifact, and a companion is never big enough to matter.
+    let tee_allowed = dl_key.is_some() && headers.get(header::RANGE).is_none();
+    let streaming = match proxy_ensure_artifact(
         &state,
         &write_pinned.storage,
         &pkg,
         &filename,
         write_pinned.generation,
+        tee_allowed,
     )
     .await
     {
@@ -826,11 +834,14 @@ pub(crate) async fn files_get(
                     filename.clone(),
                 );
             }
+            None
         }
-    }
-    // Malware byte gate: the single enforcement chokepoint, before the
-    // presign/stream split so a cached signed URL is gated too. Origin is judged
-    // on the write home. A no-op unless blocking is armed and a snapshot is fed.
+        ProxyEnsure::Stream(fill) => Some(fill),
+    };
+    // Malware byte gate: the enforcement chokepoint, before the presign/stream
+    // split so a cached signed URL is gated too — and, for a teed fill, before
+    // the first byte of the body leaves. Origin is judged on the write home. A
+    // no-op unless blocking is armed and a snapshot is fed.
     if let Some(resp) = advisory_byte_gate(
         &state,
         write_pinned.storage.as_ref(),
@@ -845,6 +856,12 @@ pub(crate) async fn files_get(
         Ok(true) => {}
         Ok(false) => return not_found("artifact is fenced"),
         Err(error) => return read_error(error),
+    }
+    // Past both gates: hand the client the fill's bytes as they land. Dropping
+    // the tee instead (either gate refusing above) leaves the fill running for
+    // the cache, exactly as a client disconnect does.
+    if let Some(fill) = streaming {
+        return tee_response(&state, &write_pinned, &pkg, &filename, dl_key, *fill);
     }
 
     // S3 serves the megabytes, this node serves kilobytes of index: redirect
@@ -960,8 +977,10 @@ fn blocked_response(value: serde_json::Value) -> Response<Body> {
 }
 
 /// The malware byte gate: the single enforcement chokepoint where advisory-blocked
-/// bytes are refused. Runs once in [`files_get`] before the presign/stream split,
-/// so a cached signed URL is gated too. `Some(403)` refuses; `None` allows.
+/// bytes are refused. Runs once in [`files_get`], ahead of every way bytes can
+/// leave — the presigned redirect, the storage stream, and the teed cold-miss
+/// fill, whose first byte is emitted after this returns. `Some(403)` refuses;
+/// `None` allows.
 ///
 /// The common path is a pure hash probe with zero I/O: disabled, unfed, or no hit
 /// all return `None` before any storage read. Only a genuine advisory/quarantine
@@ -1032,10 +1051,55 @@ async fn advisory_byte_gate(
 /// Outcome of the proxy artifact hook. `Fail` is a hard failure response
 /// (storage outage, upstream verification failure). `Serve` falls through to
 /// normal serving; `filled` says THIS request committed a fresh cache fill, so
-/// the caller schedules the off-request-path peer replication notes.
+/// the caller schedules the off-request-path peer replication notes. `Stream` is
+/// a large cold-miss fill still running, to be served from as it lands.
 enum ProxyEnsure {
     Serve { filled: bool },
+    Stream(Box<proxy::StreamingFill>),
     Fail(Response<Body>),
+}
+
+/// Serve a still-running cold-miss fill: 200 with upstream's declared length and
+/// the headers the storage streaming path emits, and a body that follows the
+/// fill's spool — withholding the last bytes until verification passes and
+/// aborting the connection if it doesn't. The download counter is bumped where
+/// the buffered path bumps it, at the delivery exit: here, when the verified
+/// tail goes out.
+fn tee_response(
+    state: &Arc<AppState>,
+    write_pinned: &Pinned,
+    pkg: &str,
+    filename: &str,
+    dl_key: Option<String>,
+    mut fill: proxy::StreamingFill,
+) -> Response<Body> {
+    let size = fill.size();
+    // The fill outlives this response by design, so the peer replication notes
+    // are scheduled from a task of their own rather than from the request.
+    if let Some(handle) = fill.take_fill() {
+        let (state, pkg, filename) = (state.clone(), pkg.to_string(), filename.to_string());
+        let index = write_pinned.index;
+        tokio::spawn(async move {
+            if matches!(handle.await, Ok(Ok(true))) {
+                crate::replicate::spawn_proxy_fill_notes(state, index, pkg, filename);
+            }
+        });
+    }
+    let counted: Option<Box<dyn FnOnce() + Send>> = dl_key.map(|key| {
+        let state = state.clone();
+        Box::new(move || {
+            state.counters.record("downloads", &key);
+            state.metrics.record_download();
+        }) as Box<dyn FnOnce() + Send>
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_LENGTH, size)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, ARTIFACT_CACHE_CONTROL)
+        .body(fill.into_body(counted))
+        .unwrap_or_else(not_found)
 }
 
 /// Proxy hook for artifact downloads: fetch-and-commit on a local miss.
@@ -1045,6 +1109,7 @@ async fn proxy_ensure_artifact(
     pkg: &str,
     filename: &str,
     generation: u64,
+    tee_allowed: bool,
 ) -> ProxyEnsure {
     let Some(proxy) = state.proxy.as_ref() else {
         return ProxyEnsure::Serve { filled: false };
@@ -1074,10 +1139,11 @@ async fn proxy_ensure_artifact(
         Err(e) => return ProxyEnsure::Fail(read_error(e)),
     }
     match proxy
-        .ensure_artifact_cached(state, storage, pkg, filename)
+        .ensure_artifact_cached(state, storage, pkg, filename, tee_allowed)
         .await
     {
-        Ok(filled) => ProxyEnsure::Serve { filled },
+        Ok(proxy::FillOutcome::Done { filled }) => ProxyEnsure::Serve { filled },
+        Ok(proxy::FillOutcome::Streaming(fill)) => ProxyEnsure::Stream(fill),
         Err(e) => ProxyEnsure::Fail(read_error(e)),
     }
 }

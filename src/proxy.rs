@@ -21,14 +21,13 @@
 //! materialized index: already-cached packages keep installing.
 
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use futures::StreamExt;
-use pep440_rs::{Version, VersionSpecifiers};
+use pep440_rs::VersionSpecifiers;
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
@@ -80,6 +79,23 @@ const PRESENCE_TTL: Duration = Duration::from_secs(60);
 /// distinct proxied download inserts one entry, so without a cap a stream of
 /// distinct downloads grows the map until OOM.
 const MAX_PRESENCE: usize = 65_536;
+/// How much of a teed artifact is withheld until the sha256 check passes. The
+/// client gets byte one at upstream speed, but the last [`TEE_HOLDBACK`] bytes
+/// only exist after verification — so a corrupt or truncated upstream can never
+/// produce a *complete* body, only a short read on an aborted connection.
+const TEE_HOLDBACK: u64 = 64 * 1024;
+/// Read size for one poll of a teed body: the same 64 KiB the disk artifact
+/// streamer uses (see `range::read_capacity`).
+const TEE_CHUNK: u64 = 64 * 1024;
+
+/// Distinguishes one fill's progress publications from the next fill's on the
+/// same inflight entry — the entry outlives a fill whenever a waiter is queued
+/// behind it. Never zero, so a never-published entry can't be mistaken for one.
+static FILL_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_fill_epoch() -> u64 {
+    FILL_EPOCH.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 /// A package page rendered from the upstream listing, ETag precomputed.
 #[derive(Clone)]
@@ -127,10 +143,10 @@ pub struct Proxy {
     /// several constraints (duplicate list entries); a version passes if any
     /// allows it, matching `sync`'s union semantics.
     scope: Option<HashMap<String, Vec<Option<VersionSpecifiers>>>>,
-    /// Package denylist as a fast name -> version-constraints lookup. `None`
-    /// means no denylist. A bare entry (`None`) denies the whole project; a
-    /// constrained entry denies only matching versions.
-    deny: Option<HashMap<String, Vec<Option<VersionSpecifiers>>>>,
+    /// The `--exclude-package` denylist, shared (via `Arc`) with `AppState` so the
+    /// index rebuild, the `/project/` page, and the reconcile all rule through the
+    /// same predicate the proxy's own scope check does — no drift.
+    denylist: Arc<crate::denylist::Denylist>,
     client: Client,
     /// The SSRF allow-list shared by the client's DNS resolver and the pre-flight
     /// literal check in [`ssrf::guarded_get`].
@@ -143,32 +159,396 @@ pub struct Proxy {
     /// (disk-fill + upstream bandwidth). The map self-prunes (see
     /// [`DownloadSlot`]), so it stays bounded by live concurrency, not by the
     /// number of distinct artifacts ever proxied.
-    inflight: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    inflight: InflightMap,
     /// Warm-hit accelerator: artifact keys proven present in local storage, so a
     /// repeat proxied download skips its existence HEAD. See [`PresenceCache`].
     presence: PresenceCache,
+}
+
+type InflightMap = Arc<Mutex<HashMap<String, Inflight>>>;
+
+/// One artifact key's single-flight state: the slot mutex, and the channel the
+/// fill holding that slot publishes its progress on. A streaming tee reads the
+/// channel; nothing else does, so a fill with no tee attached only ever writes
+/// into a watch nobody reads.
+#[derive(Clone, Default)]
+struct Inflight {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    progress: Arc<tokio::sync::watch::Sender<FillProgress>>,
 }
 
 /// Held for the whole download-verify-commit of one artifact key. Dropping it
 /// removes the map entry once no other task is waiting on that key, keeping
 /// [`Proxy::inflight`] bounded.
 struct DownloadSlot {
-    inflight: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    inflight: InflightMap,
     key: String,
+    /// The progress channel of the entry this slot owns. Handed to the fill so
+    /// it can publish, and cloned by the leader so it can subscribe a tee.
+    progress: Arc<tokio::sync::watch::Sender<FillProgress>>,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl Drop for DownloadSlot {
     fn drop(&mut self) {
         let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(lock) = map.get(&self.key) {
+        if let Some(entry) = map.get(&self.key) {
             // We still hold `_guard` (one strong ref) and the map holds one.
             // Any count beyond that is a task already waiting on this key, so
-            // only collapse the entry when we are its last user.
-            if Arc::strong_count(lock) <= 2 {
+            // only collapse the entry when we are its last user. The progress
+            // channel rides on the same entry and is never counted: a tee holds
+            // a `Receiver`, which is not a strong ref to anything here.
+            if Arc::strong_count(&entry.lock) <= 2 {
                 map.remove(&self.key);
             }
         }
+    }
+}
+
+/// What a running fill publishes for whoever is teeing its bytes to a client.
+///
+/// One value, overwritten in place — a tee only ever needs the latest position,
+/// never a history. `epoch` and `attempt` are what make that safe: a tee binds
+/// to the (epoch, attempt) pair it attached on, and treats any other pair as a
+/// failure rather than splicing bytes from a different download into its body.
+#[derive(Clone)]
+struct FillProgress {
+    /// Which fill published this (see [`next_fill_epoch`]). Zero = none ever did.
+    epoch: u64,
+    /// Which of that fill's up-to-[`DOWNLOAD_ATTEMPTS`] attempts.
+    attempt: u32,
+    /// The attempt's spool file, published once it exists — which is also once
+    /// upstream has answered 200, since the spool is opened after the response.
+    spool: Option<Arc<std::path::PathBuf>>,
+    /// Bytes flushed to that spool. Safe to read: the fill flushes before it
+    /// publishes, so every counted byte is readable through a second handle.
+    written: u64,
+    state: FillState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FillState {
+    Running,
+    /// sha256 matched and the origin fence still holds — the tail may be released.
+    Verified,
+    /// This attempt is dead. The fill may retry for the cache's sake; the tee
+    /// bound to the attempt must abort its connection.
+    Failed,
+}
+
+impl Default for FillProgress {
+    fn default() -> Self {
+        // A fresh entry has no fill behind it, so it is nobody's live download.
+        Self {
+            epoch: 0,
+            attempt: 0,
+            spool: None,
+            written: 0,
+            state: FillState::Failed,
+        }
+    }
+}
+
+/// The publishing half of [`FillProgress`], owned by a fill that has a tee
+/// attached. Absent (`None` at the call sites) when nothing is streaming, so the
+/// buffered path pays nothing.
+struct Progress {
+    tx: Arc<tokio::sync::watch::Sender<FillProgress>>,
+    epoch: u64,
+}
+
+impl Progress {
+    /// A new attempt has an open spool: republish from byte zero under the new
+    /// attempt number. A tee bound to the previous attempt sees the change and
+    /// aborts rather than splicing.
+    fn started(&self, attempt: u32, spool: &std::path::Path) {
+        let spool = Arc::new(spool.to_path_buf());
+        self.tx.send_modify(|p| {
+            p.epoch = self.epoch;
+            p.attempt = attempt;
+            p.spool = Some(spool);
+            p.written = 0;
+            p.state = FillState::Running;
+        });
+    }
+
+    fn wrote(&self, written: u64) {
+        self.tx.send_modify(|p| p.written = written);
+    }
+
+    /// Release the tail: the bytes on the spool hash to what upstream declared
+    /// and the name is still ours. Published before the storage commit, so a
+    /// client never waits on an S3 upload for the last 64 KiB.
+    fn verified(&self, written: u64) {
+        self.tx.send_modify(|p| {
+            p.written = written;
+            p.state = FillState::Verified;
+        });
+    }
+
+    fn failed(&self) {
+        self.tx.send_modify(|p| p.state = FillState::Failed);
+    }
+
+    fn is_verified(&self) -> bool {
+        self.tx.borrow().state == FillState::Verified
+    }
+}
+
+/// What [`Proxy::ensure_artifact_cached`] left its caller to do.
+pub enum FillOutcome {
+    /// Nothing is in flight any more; serve the artifact from storage as usual.
+    /// `filled` says THIS call committed a fresh cache fill, so the caller
+    /// schedules the off-request-path peer replication notes.
+    Done { filled: bool },
+    /// A cold-miss fill past the streaming threshold is running: serve its bytes
+    /// to the client as they land, instead of waiting for the commit.
+    Streaming(Box<StreamingFill>),
+}
+
+/// A cold-miss fill big enough to serve while it downloads.
+///
+/// The promise this keeps is narrow and absolute: a *complete* body is only ever
+/// delivered for bytes pypiron verified. The last [`TEE_HOLDBACK`] bytes do not
+/// leave until the fill's sha256 check and origin fence have both passed, so a
+/// corrupt, truncated, or hung upstream can only ever produce a short read on an
+/// aborted connection — never a whole file the client would trust.
+pub struct StreamingFill {
+    size: u64,
+    epoch: u64,
+    attempt: u32,
+    /// This tee's own handle on the spool, opened while the fill still owns the
+    /// file. It stays valid across the commit's rename and the spool's unlink.
+    file: tokio::fs::File,
+    rx: tokio::sync::watch::Receiver<FillProgress>,
+    fill: Option<tokio::task::JoinHandle<Result<bool>>>,
+}
+
+impl StreamingFill {
+    /// Upstream's declared size — this response's `Content-Length`.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The fill task, so the caller can react to the commit (peer replication
+    /// notes) off the request path. The tee never touches it: a client that
+    /// disconnects drops the response, and the fill must survive that.
+    pub fn take_fill(&mut self) -> Option<tokio::task::JoinHandle<Result<bool>>> {
+        self.fill.take()
+    }
+
+    /// The response body. `on_delivered` runs once, when the verified tail has
+    /// been handed to the client — the teed path's delivery exit, where the
+    /// buffered path bumps its download counter.
+    pub fn into_body(self, on_delivered: Option<Box<dyn FnOnce() + Send>>) -> axum::body::Body {
+        let tee = Tee {
+            size: self.size,
+            epoch: self.epoch,
+            attempt: self.attempt,
+            file: self.file,
+            rx: self.rx,
+            sent: 0,
+            available: 0,
+            verified: false,
+            done: false,
+            on_delivered,
+        };
+        axum::body::Body::from_stream(futures::stream::unfold(tee, |mut tee| async move {
+            tee.next().await.map(|chunk| (chunk, tee))
+        }))
+    }
+}
+
+/// The live position of the fill a tee is bound to.
+enum Observed {
+    /// Still downloading; this many bytes are readable from the spool.
+    Live(u64),
+    /// Verified, with the spool's final length — the tail may go out.
+    Verified(u64),
+    /// This attempt is dead, or a different fill now owns the entry.
+    Lost,
+}
+
+struct Tee {
+    size: u64,
+    epoch: u64,
+    attempt: u32,
+    file: tokio::fs::File,
+    rx: tokio::sync::watch::Receiver<FillProgress>,
+    sent: u64,
+    available: u64,
+    verified: bool,
+    done: bool,
+    on_delivered: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Tee {
+    /// The next chunk, `None` at a clean end of body, `Some(Err)` to abort the
+    /// connection mid-body. Never `None` before `size` bytes have gone out: a
+    /// short body under a declared `Content-Length` would be a silent truncation
+    /// on some clients, where an aborted connection is one nobody mistakes.
+    async fn next(&mut self) -> Option<Result<bytes::Bytes>> {
+        if self.done {
+            return None;
+        }
+        loop {
+            if !self.verified {
+                match observe(&mut self.rx, self.epoch, self.attempt) {
+                    Observed::Live(written) => self.available = written,
+                    Observed::Verified(written) => {
+                        self.verified = true;
+                        self.available = written;
+                    }
+                    Observed::Lost => return Some(Err(self.abort("upstream fill failed"))),
+                }
+            }
+            // Verified against a body shorter than the listing declared: the
+            // Content-Length is already promised, so abort rather than pad.
+            if self.verified && self.available < self.size {
+                return Some(Err(self.abort("upstream body was shorter than it declared")));
+            }
+            let limit = if self.verified {
+                self.size
+            } else {
+                self.available.min(self.size.saturating_sub(TEE_HOLDBACK))
+            };
+            if self.sent >= limit {
+                if self.verified {
+                    self.done = true;
+                    return None; // the tail went out on the previous poll
+                }
+                if let Some(err) = self.wait().await {
+                    return Some(Err(err));
+                }
+                continue;
+            }
+            let want = usize::try_from((limit - self.sent).min(TEE_CHUNK)).unwrap_or(0);
+            let mut buf = vec![0u8; want];
+            match tokio::io::AsyncReadExt::read(&mut self.file, &mut buf).await {
+                Ok(0) if self.verified => {
+                    return Some(Err(self.abort("verified spool ended early")))
+                }
+                Ok(0) => {
+                    // The published count ran ahead of what this handle can see;
+                    // wait for the fill to move rather than spin on EOF.
+                    if let Some(err) = self.wait().await {
+                        return Some(Err(err));
+                    }
+                }
+                Ok(n) => {
+                    buf.truncate(n);
+                    self.sent += n as u64;
+                    if self.verified && self.sent >= self.size {
+                        self.deliver();
+                    }
+                    return Some(Ok(bytes::Bytes::from(buf)));
+                }
+                Err(e) => {
+                    return Some(Err(
+                        anyhow::Error::from(e).context("read the proxy fill spool")
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Block until the fill publishes again. `Some(err)` when it published its
+    /// last: a fill that exited without verifying can never complete this body.
+    async fn wait(&mut self) -> Option<anyhow::Error> {
+        if self.rx.changed().await.is_ok() {
+            return None;
+        }
+        // The fill task is gone, but its final value is still readable — a tail
+        // released just before it exited still counts.
+        match observe(&mut self.rx, self.epoch, self.attempt) {
+            Observed::Verified(written) => {
+                self.verified = true;
+                self.available = written;
+                None
+            }
+            _ => Some(self.abort("upstream fill ended without verifying")),
+        }
+    }
+
+    fn abort(&mut self, why: &str) -> anyhow::Error {
+        self.done = true;
+        warn!(
+            sent = self.sent,
+            size = self.size,
+            "proxy: aborting a partially streamed artifact — {why}"
+        );
+        anyhow!("proxy stream aborted after {} bytes: {why}", self.sent)
+    }
+
+    fn deliver(&mut self) {
+        if let Some(on_delivered) = self.on_delivered.take() {
+            on_delivered();
+        }
+    }
+}
+
+fn observe(
+    rx: &mut tokio::sync::watch::Receiver<FillProgress>,
+    epoch: u64,
+    attempt: u32,
+) -> Observed {
+    let progress = rx.borrow_and_update();
+    if progress.epoch != epoch || progress.attempt != attempt {
+        return Observed::Lost;
+    }
+    match progress.state {
+        FillState::Failed => Observed::Lost,
+        FillState::Verified => Observed::Verified(progress.written),
+        FillState::Running => Observed::Live(progress.written),
+    }
+}
+
+/// Where a tee attaches: the attempt it binds to, and that attempt's spool.
+struct TeeAnchor {
+    attempt: u32,
+    spool: Arc<std::path::PathBuf>,
+}
+
+enum Peek {
+    Anchor(TeeAnchor),
+    Wait,
+    Gone,
+}
+
+fn peek(rx: &mut tokio::sync::watch::Receiver<FillProgress>, epoch: u64) -> Peek {
+    let progress = rx.borrow_and_update();
+    if progress.epoch != epoch {
+        return Peek::Wait; // not ours yet: the fill hasn't published
+    }
+    match progress.state {
+        // Ended before it ever opened a spool — an upstream 404/500, a yank or
+        // malware refusal, a name gone private. There is nothing to stream, and
+        // the buffered path gives the client the right answer.
+        FillState::Failed | FillState::Verified => Peek::Gone,
+        FillState::Running => match progress.spool.clone() {
+            Some(spool) => Peek::Anchor(TeeAnchor {
+                attempt: progress.attempt,
+                spool,
+            }),
+            None => Peek::Wait,
+        },
+    }
+}
+
+/// Wait for the fill to open a spool, which is also the moment upstream has
+/// answered 200 and every pre-download refusal has had its say. `None` means the
+/// fill ended first, or died — either way, no tee.
+async fn tee_anchor(
+    rx: &mut tokio::sync::watch::Receiver<FillProgress>,
+    epoch: u64,
+) -> Option<TeeAnchor> {
+    loop {
+        match peek(rx, epoch) {
+            Peek::Anchor(anchor) => return Some(anchor),
+            Peek::Gone => return None,
+            Peek::Wait => {}
+        }
+        rx.changed().await.ok()?;
     }
 }
 
@@ -296,26 +676,6 @@ pub async fn eligible(state: &AppState, storage: &dyn Storage, pkg: &str) -> Res
     }
 }
 
-/// Whether a file's inferred version satisfies a name's scope constraints. A
-/// bare entry (no specifiers) allows every version; otherwise the version must
-/// parse and match at least one specifier — a file whose version can't be
-/// parsed can't be proven to match, so it's dropped (the same conservative rule
-/// `sync` applies).
-fn version_allowed(constraints: &[Option<VersionSpecifiers>], filename: &str) -> bool {
-    if constraints.iter().any(Option::is_none) {
-        return true;
-    }
-    let Some(version) =
-        infer_version_from_filename(filename).and_then(|v| Version::from_str(&v).ok())
-    else {
-        return false;
-    };
-    constraints
-        .iter()
-        .flatten()
-        .any(|specifiers| specifiers.contains(&version))
-}
-
 impl Proxy {
     pub fn new(
         upstream: &str,
@@ -354,20 +714,14 @@ impl Proxy {
             }
             map
         });
-        let deny = (!mirror.exclude_packages.is_empty()).then(|| {
-            let mut map: HashMap<String, Vec<Option<VersionSpecifiers>>> = HashMap::new();
-            for spec in &mirror.exclude_packages {
-                map.entry(spec.name.clone())
-                    .or_default()
-                    .push(spec.specifiers.clone());
-            }
-            map
-        });
+        let denylist = Arc::new(crate::denylist::Denylist::from_specs(
+            &mirror.exclude_packages,
+        ));
         Ok(Self {
             upstream,
             mirror,
             scope,
-            deny,
+            denylist,
             client: crate::upstream_tls::apply(
                 Client::builder()
                     .user_agent(
@@ -409,11 +763,12 @@ impl Proxy {
     /// Acquire the single-flight slot for an artifact key, waiting if another
     /// task is already downloading it. Held until the returned guard drops.
     async fn acquire_download_slot(&self, key: &str) -> DownloadSlot {
-        let lock = self.slot_lock(key);
-        let guard = lock.lock_owned().await;
+        let entry = self.slot_entry(key);
+        let guard = entry.lock.lock_owned().await;
         DownloadSlot {
             inflight: self.inflight.clone(),
             key: key.to_string(),
+            progress: entry.progress,
             _guard: guard,
         }
     }
@@ -425,19 +780,21 @@ impl Proxy {
     /// waiter keeps waiting on the request's own task, where its wait costs
     /// nothing if the client goes away.
     fn try_acquire_download_slot(&self, key: &str) -> Option<DownloadSlot> {
-        let lock = self.slot_lock(key);
-        let guard = lock.try_lock_owned().ok()?;
+        let entry = self.slot_entry(key);
+        let guard = entry.lock.try_lock_owned().ok()?;
         Some(DownloadSlot {
             inflight: self.inflight.clone(),
             key: key.to_string(),
+            progress: entry.progress,
             _guard: guard,
         })
     }
 
-    /// The per-key mutex, created on first use. Taken under the map lock, which
-    /// [`DownloadSlot::drop`] also holds while it decides whether to prune, so a
-    /// clone taken here is never an entry that is about to be dropped.
-    fn slot_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    /// The per-key mutex and progress channel, created on first use. Taken under
+    /// the map lock, which [`DownloadSlot::drop`] also holds while it decides
+    /// whether to prune, so a clone taken here is never an entry that is about
+    /// to be dropped.
+    fn slot_entry(&self, key: &str) -> Inflight {
         self.inflight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -454,62 +811,32 @@ impl Proxy {
         self.scope.as_ref().is_none_or(|m| m.contains_key(pkg))
     }
 
+    /// True only for a bare (whole-name) exclude — what the pull gate
+    /// ([`Proxy::eligible`]) keys on to keep a fully-denied name from ever being
+    /// fetched upstream.
     pub(crate) fn name_fully_denied(&self, pkg: &str) -> bool {
-        self.deny
-            .as_ref()
-            .and_then(|m| m.get(pkg))
-            .is_some_and(|constraints| constraints.iter().any(Option::is_none))
+        self.denylist.name_fully_denied(pkg)
     }
 
-    /// Would the denylist drop this file from what installers see? True for a
-    /// bare (whole-name) exclude, or a version-pinned one the file's inferred
-    /// version matches. This is the delisting primitive the index rebuild and the
-    /// human `/project/` page share; the separate [`Proxy::name_fully_denied`]
-    /// pull gate keeps a fully-denied name from ever being fetched upstream.
-    pub(crate) fn file_denied(&self, pkg: &str, filename: &str) -> bool {
-        self.deny
-            .as_ref()
-            .and_then(|m| m.get(pkg))
-            .is_some_and(|constraints| version_allowed(constraints, filename))
-    }
-
-    /// The denylist as a stable, comparable map: normalized name → sorted
-    /// specifier strings, with `"*"` marking a bare whole-name exclude. Empty
-    /// when no excludes are configured. The startup reconcile diffs this against
-    /// the set the stored indexes were last built against, so an exclude change
-    /// made across a restart delists (or relists) exactly the affected names.
-    pub(crate) fn denylist_canonical(&self) -> std::collections::BTreeMap<String, Vec<String>> {
-        let mut out = std::collections::BTreeMap::new();
-        let Some(deny) = self.deny.as_ref() else {
-            return out;
-        };
-        for (name, constraints) in deny {
-            let mut specs: Vec<String> = constraints
-                .iter()
-                .map(|c| match c {
-                    Some(s) => s.to_string(),
-                    None => "*".to_string(),
-                })
-                .collect();
-            specs.sort();
-            specs.dedup();
-            out.insert(name.clone(), specs);
-        }
-        out
+    /// The shared exclude denylist, so `AppState` (and thence the index rebuild,
+    /// the `/project/` page, and the reconcile) rules through the same predicate.
+    pub(crate) fn denylist(&self) -> Arc<crate::denylist::Denylist> {
+        self.denylist.clone()
     }
 
     /// Does this file satisfy the name's version constraints? Allowed when no
     /// scope is configured; otherwise the name's constraints gate the version.
     /// A name in scope is reached here only after [`name_in_scope`], so a miss
-    /// in the map can't normally happen — treated fail-closed if it does.
+    /// in the map can't normally happen — treated fail-closed if it does. The
+    /// denylist subtracts on top: an excluded file never serves even if in scope.
     fn version_in_scope(&self, pkg: &str, filename: &str) -> bool {
         let allowed = match self.scope.as_ref() {
             None => true,
             Some(map) => map
                 .get(pkg)
-                .is_some_and(|constraints| version_allowed(constraints, filename)),
+                .is_some_and(|constraints| crate::denylist::version_allowed(constraints, filename)),
         };
-        allowed && !self.file_denied(pkg, filename)
+        allowed && !self.denylist.file_denied(pkg, filename)
     }
 
     pub fn upstream(&self) -> &str {
@@ -626,19 +953,27 @@ impl Proxy {
         self.mirror.exclude_yanked && is_yanked(&file.yanked)
     }
 
-    /// Download-verify-commit one artifact on a local miss. `Ok(false)` falls
-    /// through to normal serving with nothing newly written — the file was
-    /// already cached, isn't upstream (the local 404 is the right answer), or the
-    /// fill lost a race. `Ok(true)` means THIS call committed a fresh cache fill,
-    /// so the caller schedules the off-request-path peer replication notes. `Err`
-    /// is a hard failure (storage outage, exhausted verification retries).
+    /// Download-verify-commit one artifact on a local miss.
+    ///
+    /// [`FillOutcome::Done`] with `filled: false` falls through to normal
+    /// serving with nothing newly written — the file was already cached, isn't
+    /// upstream (the local 404 is the right answer), or the fill lost a race.
+    /// `filled: true` means THIS call committed a fresh cache fill, so the caller
+    /// schedules the off-request-path peer replication notes. `Err` is a hard
+    /// failure (storage outage, exhausted verification retries).
+    ///
+    /// [`FillOutcome::Streaming`] means the fill is big enough to tee: it is
+    /// still running, and the caller should stream its spool to the client
+    /// instead of waiting for the commit. `tee_allowed` is the caller's half of
+    /// that decision (a plain whole-file GET); the size threshold is this side's.
     pub async fn ensure_artifact_cached(
         self: &Arc<Self>,
         state: &Arc<AppState>,
         storage: &Arc<dyn Storage>,
         pkg: &str,
         filename: &str,
-    ) -> Result<bool> {
+        tee_allowed: bool,
+    ) -> Result<FillOutcome> {
         if state.mutations_fenced() {
             bail!("bucket topology mismatch; proxy cache writes are fenced");
         }
@@ -648,7 +983,7 @@ impl Proxy {
         // only costs on the rare miss, and keeping it lets this function be called
         // on its own and stay correct (the slot racer below re-checks here too).
         if storage.head_exists(&key).await? {
-            return Ok(false);
+            return Ok(FillOutcome::Done { filled: false });
         }
         // Serialize concurrent fetches of the *same* artifact (distinct files
         // still download in parallel). A racer that loses the race waits for the
@@ -656,16 +991,27 @@ impl Proxy {
         // of downloading its own copy. If the leader's fill failed there is
         // nothing cached to find, so the waiter inherits the slot and fills it
         // itself — exactly what it did when the fill ran inline.
-        let slot = match self.try_acquire_download_slot(&key) {
-            Some(slot) => slot,
+        let (slot, leader) = match self.try_acquire_download_slot(&key) {
+            Some(slot) => (slot, true),
             None => {
                 let slot = self.acquire_download_slot(&key).await;
                 if storage.head_exists(&key).await? {
-                    return Ok(false);
+                    return Ok(FillOutcome::Done { filled: false });
                 }
-                slot
+                // A waiter that inherits the slot after a failed leader takes the
+                // buffered path: teeing is the uncontended leader's privilege, so
+                // there is exactly one tee per fill and never a second one racing
+                // onto an attempt already in flight.
+                (slot, false)
             }
         };
+        let tee_size = if tee_allowed && leader {
+            self.tee_size(state, pkg, filename).await
+        } else {
+            None
+        };
+        let progress = slot.progress.clone();
+        let epoch = tee_size.map(|_| next_fill_epoch());
         // The fill itself runs in its own task, holding the slot for its whole
         // life. A client disconnect (pip's default timeout is ~15s; a large wheel
         // from a slow upstream is not) drops this handle, which detaches the task
@@ -675,19 +1021,62 @@ impl Proxy {
         //
         // Awaiting the handle keeps a connected client's semantics identical: the
         // same `Ok(bool)`, the same errors, in the same order.
+        //
+        // Subscribe before spawning, so no publication can be missed. `subscribe`
+        // starts at the current version, so a stale value left by an earlier fill
+        // on this entry is never mistaken for a change either.
+        let mut rx = progress.subscribe();
         let fill = tokio::spawn(Arc::clone(self).fill_artifact(
             Arc::clone(state),
             Arc::clone(storage),
             pkg.to_string(),
             filename.to_string(),
-            key,
             slot,
+            epoch,
         ));
+        if let (Some(size), Some(epoch)) = (tee_size, epoch) {
+            // Hold the response until the fill has an open spool — which is also
+            // the moment upstream has answered 200, the origin is claimed mirror,
+            // and every pre-download refusal (yank, malware, out of scope, name
+            // gone private) has already had its say. Only then is a 200 with a
+            // Content-Length honest. Anything else falls back to the buffered
+            // path below, which is byte-for-byte today's behavior.
+            if let Some(anchor) = tee_anchor(&mut rx, epoch).await {
+                match tokio::fs::File::open(anchor.spool.as_path()).await {
+                    Ok(file) => {
+                        return Ok(FillOutcome::Streaming(Box::new(StreamingFill {
+                            size,
+                            epoch,
+                            attempt: anchor.attempt,
+                            file,
+                            rx,
+                            fill: Some(fill),
+                        })))
+                    }
+                    Err(e) => {
+                        warn!(%pkg, %filename, error=?e, "proxy: could not follow the fill spool; buffering instead")
+                    }
+                }
+            }
+        }
         match fill.await {
-            Ok(filled) => filled,
+            Ok(filled) => filled.map(|filled| FillOutcome::Done { filled }),
             Err(join) => Err(anyhow::Error::new(join))
                 .with_context(|| format!("proxy cache fill for '{pkg}/{filename}' did not finish")),
         }
+    }
+
+    /// The expected size of a cold-miss artifact when it is big enough to stream
+    /// while it downloads, or `None` to serve it the buffered way. The listing
+    /// was just fetched to render this package's page, so this is a map lookup on
+    /// every path a real client takes.
+    async fn tee_size(&self, state: &AppState, pkg: &str, filename: &str) -> Option<u64> {
+        let threshold = state.proxy_stream_threshold?;
+        let found = self.listing(state, pkg).await?;
+        let file = found.files.iter().find(|f| f.filename == filename)?;
+        // No declared size, no Content-Length, no tee: a body of unknown length
+        // cannot be promised to the client up front.
+        file.size.filter(|size| *size >= threshold)
     }
 
     /// The cold-miss fill: download → verify → commit, holding the single-flight
@@ -699,13 +1088,53 @@ impl Proxy {
         storage: Arc<dyn Storage>,
         pkg: String,
         filename: String,
-        key: String,
-        _slot: DownloadSlot,
+        slot: DownloadSlot,
+        epoch: Option<u64>,
     ) -> Result<bool> {
-        let state = state.as_ref();
-        let storage = storage.as_ref();
-        let (pkg, filename) = (pkg.as_str(), filename.as_str());
-        if storage.head_exists(&key).await? {
+        let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
+        let progress = epoch.map(|epoch| Progress {
+            tx: slot.progress.clone(),
+            epoch,
+        });
+        let out = self
+            .fill_and_commit(
+                &state,
+                storage.as_ref(),
+                &pkg,
+                &filename,
+                &key,
+                progress.as_ref(),
+            )
+            .await;
+        // Anything that ended this fill short of releasing the tail is a failure
+        // for whoever is teeing: an early `Ok(false)` served no bytes at all, and
+        // an `Err` died mid-body. A tee that already saw `Verified` has its tail
+        // and has stopped listening, so a post-verification `Ok(false)` (a
+        // demotion race losing the commit) leaves its finished body alone.
+        if let Some(progress) = &progress {
+            if !progress.is_verified() {
+                progress.failed();
+            }
+        }
+        // Explicit: the slot — and with it this key's single-flight exclusion —
+        // is held until the commit is done, not until the download is.
+        drop(slot);
+        out
+    }
+
+    /// The fill proper. Split from [`fill_artifact`] only so every one of its
+    /// early returns publishes a terminal state to an attached tee without each
+    /// one having to remember to.
+    async fn fill_and_commit(
+        &self,
+        state: &AppState,
+        storage: &dyn Storage,
+        pkg: &str,
+        filename: &str,
+        key: &str,
+        progress: Option<&Progress>,
+    ) -> Result<bool> {
+        if storage.head_exists(key).await? {
             return Ok(false);
         }
         let Some(found) = self.listing(state, pkg).await else {
@@ -773,7 +1202,7 @@ impl Proxy {
         };
 
         info!(%pkg, %filename, upstream = %self.upstream, "proxy: caching artifact");
-        let spool = match self.download_verified(state, pkg, file).await {
+        let spool = match self.download_verified(state, pkg, file, progress).await {
             Ok(spool) => spool,
             Err(e) => {
                 state
@@ -821,7 +1250,7 @@ impl Proxy {
         // Type the record before its artifact can exist. An orphan sidecar is
         // inert; an orphan artifact would be backfilled from a later private
         // package claim and launder public bytes into private truth.
-        let sidecar_key = sidecar_key(&key);
+        let sidecar_key = sidecar_key(key);
         let sidecar_bytes = serde_json::to_vec(&sidecar)?;
         if !storage
             .put_if_absent(
@@ -857,10 +1286,20 @@ impl Proxy {
             }
         }
 
+        // Release a teed client's withheld tail here, and only here: the bytes
+        // hash to what upstream declared AND the name is still the mirror claim
+        // this fill started against. Deliberately before the storage commit —
+        // the last 64 KiB must not wait on an S3 upload — so a commit that later
+        // loses a race leaves the cache cold while the client keeps a body that
+        // was verified before its first withheld byte moved.
+        if let Some(progress) = progress {
+            progress.verified(spool.size);
+        }
+
         // Sidecar is durable and the exact package claim is still ours. Publish
         // the artifact last; this read-to-PUT edge is the origin fence.
         let created = storage
-            .put_file_if_absent(&key, spool.path.path(), Some("application/octet-stream"))
+            .put_file_if_absent(key, spool.path.path(), Some("application/octet-stream"))
             .await?;
         if !created {
             // Another mirror writer won the immutable filename. Its own
@@ -886,7 +1325,7 @@ impl Proxy {
             info!(%pkg, %filename, "proxy: origin changed after artifact publish; leaving typed mirror loser");
             return Ok(false);
         }
-        if state.buckets.is_multi() && storage.head_exists(&frozen_key(&key)).await? {
+        if state.buckets.is_multi() && storage.head_exists(&frozen_key(key)).await? {
             // The marker suppresses the filename immediately. Leave the typed
             // body for freeze recovery; deleting here would create another
             // cross-object race with staged private promotion.
@@ -899,7 +1338,7 @@ impl Proxy {
             if let Some(md) = self.fetch_metadata_url(pkg, file).await {
                 let _ = storage
                     .put_if_absent(
-                        &metadata_key(&key),
+                        &metadata_key(key),
                         md.to_vec(),
                         Some("text/plain; charset=utf-8"),
                     )
@@ -913,7 +1352,7 @@ impl Proxy {
             if let Some(prov) = self.fetch_provenance_url(pkg, prov_url).await {
                 let _ = storage
                     .put_if_absent(
-                        &provenance_key(&key),
+                        &provenance_key(key),
                         prov.to_vec(),
                         Some("application/json"),
                     )
@@ -1184,6 +1623,7 @@ impl Proxy {
         state: &AppState,
         pkg: &str,
         file: &SimpleFile,
+        progress: Option<&Progress>,
     ) -> Result<FinishedSpool> {
         let expected = file
             .sha256()
@@ -1191,7 +1631,10 @@ impl Proxy {
         let url = self.resolve_url(pkg, &file.url)?;
         let mut last_err = None;
         for attempt in 1..=DOWNLOAD_ATTEMPTS {
-            match self.download_once(state, &url, file).await {
+            match self
+                .download_once(state, &url, file, progress, attempt)
+                .await
+            {
                 Ok(spool) if spool.sha256.eq_ignore_ascii_case(expected) => return Ok(spool),
                 Ok(spool) => {
                     last_err = Some(anyhow!(
@@ -1202,8 +1645,20 @@ impl Proxy {
                 }
                 // A guard refusal is deterministic — the target is forbidden and
                 // no retry changes that, so fail fast instead of backing off 6s.
-                Err(e) if e.downcast_ref::<ssrf::Blocked>().is_some() => return Err(e),
+                Err(e) if e.downcast_ref::<ssrf::Blocked>().is_some() => {
+                    if let Some(progress) = progress {
+                        progress.failed();
+                    }
+                    return Err(e);
+                }
                 Err(e) => last_err = Some(e),
+            }
+            // This attempt's bytes are dead. A tee bound to it aborts its
+            // connection now — the retry below is for the cache, and its bytes
+            // start again at zero, so they can never be spliced onto a body that
+            // already carries a prefix of this attempt.
+            if let Some(progress) = progress {
+                progress.failed();
             }
             if attempt < DOWNLOAD_ATTEMPTS {
                 warn!(file=%file.filename, attempt, "proxy: download failed; retrying");
@@ -1218,6 +1673,8 @@ impl Proxy {
         state: &AppState,
         url: &reqwest::Url,
         file: &SimpleFile,
+        progress: Option<&Progress>,
+        attempt: u32,
     ) -> Result<FinishedSpool> {
         // Total budget for this attempt. The client's 30s inactivity timeout only
         // catches an upstream that stops; one that trickles resets it forever and
@@ -1227,6 +1684,11 @@ impl Proxy {
             .await?
             .error_for_status()?;
         let mut spool = UploadSpool::new(&state.spool_dir).await?;
+        // Upstream answered 200 and there is a file to follow: this is where a
+        // waiting tee attaches, which is why nothing before it can 200 a client.
+        if let Some(progress) = progress {
+            progress.started(attempt, spool.path());
+        }
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             spool.write_chunk(&chunk?).await?;
@@ -1242,6 +1704,13 @@ impl Proxy {
                         spool.size()
                     );
                 }
+            }
+            if let Some(progress) = progress {
+                // Flush first: `write_chunk` returns once tokio has *queued* the
+                // write, and a tee reading a second handle must never be told
+                // about bytes the OS has not seen yet.
+                spool.flush().await?;
+                progress.wrote(spool.size());
             }
         }
         spool.finish().await
@@ -1367,6 +1836,7 @@ fn evict_listings(map: &mut HashMap<String, CacheEntry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn relative_and_absolute_upstream_urls_resolve() {
@@ -1558,54 +2028,6 @@ mod tests {
         assert!(!proxy.version_in_scope("demo", "demo-3.0-py3-none-any.whl"));
         assert!(!proxy.version_in_scope("pinned", "pinned-1.5-py3-none-any.whl"));
         assert!(proxy.version_in_scope("pinned", "pinned-2.0-py3-none-any.whl"));
-    }
-
-    #[test]
-    fn file_denied_matches_the_delisting_the_index_rebuild_applies() {
-        let mirror = ResolvedMirror {
-            exclude_packages: vec![spec("blocked", None), spec("pinned", Some("<2"))],
-            ..Default::default()
-        };
-        let proxy = Proxy::new("https://pypi.org", mirror, false, &[], &[]).unwrap();
-        // A bare exclude denies every file of the name — the index rebuild empties
-        // the package, so it delists entirely.
-        assert!(proxy.file_denied("blocked", "blocked-1.0-py3-none-any.whl"));
-        assert!(proxy.file_denied("blocked", "blocked-anything.tar.gz"));
-        // A version pin denies only the matching releases; the rest survive.
-        assert!(proxy.file_denied("pinned", "pinned-1.9-py3-none-any.whl"));
-        assert!(!proxy.file_denied("pinned", "pinned-2.0-py3-none-any.whl"));
-        // A name with no exclude entry is never denied.
-        assert!(!proxy.file_denied("free", "free-1.0-py3-none-any.whl"));
-    }
-
-    #[test]
-    fn denylist_canonical_is_a_stable_comparable_stamp() {
-        let mirror = ResolvedMirror {
-            exclude_packages: vec![
-                spec("blocked", None),
-                spec("pinned", Some("<2")),
-                spec("pinned", Some(">=3")),
-            ],
-            ..Default::default()
-        };
-        let proxy = Proxy::new("https://pypi.org", mirror, false, &[], &[]).unwrap();
-        let canonical = proxy.denylist_canonical();
-        assert_eq!(canonical.get("blocked"), Some(&vec!["*".to_string()]));
-        // Specifier strings are sorted, so the same config always stamps equal.
-        assert_eq!(
-            canonical.get("pinned"),
-            Some(&vec!["<2".to_string(), ">=3".to_string()])
-        );
-        // No excludes → empty stamp (the "nothing enforced" baseline).
-        let open = Proxy::new(
-            "https://pypi.org",
-            ResolvedMirror::default(),
-            false,
-            &[],
-            &[],
-        )
-        .unwrap();
-        assert!(open.denylist_canonical().is_empty());
     }
 
     #[test]

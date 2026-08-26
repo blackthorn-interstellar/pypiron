@@ -4319,7 +4319,15 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         // product's `--deep` pass too would make two oracles hold one claim and
         // cost the whole corpus on every seed. The blackbox suite drives
         // `verify-index --deep` instead.
-        match pypiron::verify::verify_storage(bucket.as_ref(), false).await {
+        // No excludes are configured in the sim, so the oracle models an empty
+        // denylist (nothing delisted) — views must equal truth in full.
+        match pypiron::verify::verify_storage(
+            bucket.as_ref(),
+            false,
+            &pypiron::denylist::Denylist::default(),
+        )
+        .await
+        {
             Ok(report) => violations.extend(report.divergences.into_iter().map(|d| {
                 format!(
                     "VERIFY: bucket {idx} diverged from its own truth: {} {} — {}",

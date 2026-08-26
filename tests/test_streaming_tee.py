@@ -1,0 +1,317 @@
+"""Streaming a large cold-miss proxy download while it is still arriving.
+
+A file at or above `--proxy-stream-threshold` (16 MiB by default) starts reaching
+the client at upstream speed instead of after the whole download, so a 300 MB
+wheel is not minutes of silence. The safety property survives that: the last
+64 KiB are withheld until pypiron's sha256 check passes, so a *complete* body is
+always a verified one, and a corrupt, truncated, or hung upstream shows up as a
+transfer cut short mid-body — never a whole artifact nobody checked.
+
+These tests reuse the chaos suite's fake upstream (`_FaultServer`), which can be
+made to throttle, corrupt, or truncate an artifact on demand.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import http.client
+import time
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional, Tuple
+from urllib.parse import urlparse
+
+import pytest
+
+from .helpers import http_get, make_wheel, origin_owner, run_checked, sha256_file
+from .test_chaos_upstream import (
+    FAULT_GET_TIMEOUT,
+    SLOW_TRANSFER_SECS,
+    _FaultServer,
+    _proxy_over_fault,
+)
+
+pytestmark = [pytest.mark.integration, pytest.mark.chaos]
+
+# Padding that puts the built wheel comfortably over the shipped 16 MiB
+# threshold without making the suite pay for a 100 MB transfer.
+LARGE_PAYLOAD = 18 * 1024 * 1024
+# The `corrupt`/`truncate` modes make the fill burn its full retry budget
+# (3 attempts, 2s + 4s backoff) after the client has already been cut off, so
+# "storage is clean" can only be asserted once that has run its course.
+FILL_GIVEUP_SECS = 45.0
+
+
+@pytest.fixture()
+def proxy_over_fault_tee(
+    tmp_path_factory, pypiron_bin: Path, tmp_path: Path
+) -> Iterator[Tuple[Dict, _FaultServer]]:
+    """The chaos harness with the shipped streaming threshold in force."""
+    yield from _proxy_over_fault(tmp_path_factory, pypiron_bin, tmp_path)
+
+
+@pytest.fixture()
+def proxy_over_fault_no_tee(
+    tmp_path_factory, pypiron_bin: Path, tmp_path: Path
+) -> Iterator[Tuple[Dict, _FaultServer]]:
+    """The same, with streaming switched off — every fill buffers."""
+    yield from _proxy_over_fault(
+        tmp_path_factory,
+        pypiron_bin,
+        tmp_path,
+        extra_env={"PYPIRON_PROXY_STREAM_THRESHOLD": "off"},
+    )
+
+
+def _big_wheel(pkg: str, tmp_path: Path) -> Path:
+    wheel = make_wheel(pkg, "1.0", tmp_path, payload_bytes=LARGE_PAYLOAD)
+    assert wheel.stat().st_size > 16 * 1024 * 1024, "test wheel is under the streaming threshold"
+    return wheel
+
+
+class _Read:
+    """One incremental GET: what arrived, when, and whether it was complete."""
+
+    def __init__(self, status: int, declared: Optional[int], marks: List[Tuple[float, int]]):
+        self.status = status
+        self.declared = declared
+        self.marks = marks
+
+    @property
+    def received(self) -> int:
+        return self.marks[-1][1] if self.marks else 0
+
+    @property
+    def complete(self) -> bool:
+        return self.declared is not None and self.received == self.declared
+
+    @property
+    def first_byte(self) -> float:
+        return self.marks[0][0] if self.marks else float("inf")
+
+    @property
+    def last_byte(self) -> float:
+        return self.marks[-1][0] if self.marks else float("inf")
+
+
+def _read_incrementally(url: str, *, timeout: float, headers=None) -> Tuple[_Read, bytes]:
+    """GET `url`, recording when each chunk of body arrives. A body cut short of
+    its Content-Length is not an error here — it is the thing under test — so the
+    caller inspects `.complete` rather than catching an exception."""
+    parsed = urlparse(url)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    body = bytearray()
+    marks: List[Tuple[float, int]] = []
+    started = time.monotonic()
+    try:
+        conn.request("GET", parsed.path, headers=headers or {})
+        resp = conn.getresponse()
+        raw = resp.getheader("Content-Length")
+        declared = int(raw) if raw is not None else None
+        try:
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                body += chunk
+                marks.append((time.monotonic() - started, len(body)))
+        except (http.client.HTTPException, OSError):
+            # A mid-body abort can surface either way depending on where the
+            # connection dies; both mean the same short read.
+            pass
+        return _Read(resp.status, declared, marks), bytes(body)
+    finally:
+        conn.close()
+
+
+def _wait_for_clean_storage(proxy: Dict, pkg: str, filename: str) -> None:
+    """No artifact committed, no orphaned temp sibling, spool drained — after the
+    fill has exhausted its retries, which outlives the aborted client."""
+    pkg_dir = proxy["data_dir"] / "packages" / pkg
+    deadline = time.monotonic() + FILL_GIVEUP_SECS
+    while time.monotonic() < deadline and list(proxy["spool_dir"].iterdir()):
+        time.sleep(0.2)
+    assert not list(proxy["spool_dir"].iterdir()), (
+        f"spool not drained after a failed streamed download: {list(proxy['spool_dir'].iterdir())}"
+    )
+    if pkg_dir.exists():
+        assert not (pkg_dir / filename).exists(), (
+            f"a failed upstream fetch left an artifact in storage: {filename}"
+        )
+        stray = [p.name for p in pkg_dir.iterdir() if p.name.startswith(".tmp")]
+        assert not stray, f"orphaned temp files in {pkg_dir}: {stray}"
+        # Reclamation belongs to the leader audit, so the mirror claim stays.
+        assert origin_owner((pkg_dir / ".origin").read_text()) == "mirror"
+
+
+# --------------------------------- tests --------------------------------------
+
+
+def test_large_cold_miss_streams_while_it_downloads(proxy_over_fault_tee, tmp_path):
+    """Bytes reach the client while the upstream transfer is still running, the
+    complete body still verifies, and the artifact lands in the cache."""
+    proxy, upstream = proxy_over_fault_tee
+    pkg = "teestream"
+    wheel = _big_wheel(pkg, tmp_path)
+    filename = upstream.register(pkg, wheel)
+    upstream.set_fault(pkg, "slow")  # the full body, paced over SLOW_TRANSFER_SECS
+
+    read, body = _read_incrementally(
+        f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT
+    )
+    assert read.status == 200
+    assert read.complete, f"streamed body was short: {read.received} of {read.declared}"
+    assert hashlib.sha256(body).hexdigest() == sha256_file(wheel)
+    # The discriminating assertion, and the one that survives a loaded box: with
+    # a buffered fill every byte lands in one burst at the very end, so the first
+    # byte's arrival is ~100% of the total. Teed, it is a small fraction of it.
+    # Both terms scale together under xdist load, so this is a ratio, not a clock.
+    assert read.last_byte > SLOW_TRANSFER_SECS / 2, (
+        f"the throttled upstream did not actually throttle ({read.last_byte:.1f}s total)"
+    )
+    assert read.first_byte < read.last_byte / 2, (
+        f"first byte at {read.first_byte:.1f}s of a {read.last_byte:.1f}s transfer — "
+        "the response was buffered, not streamed"
+    )
+
+    # It was a cache fill, not just a passthrough: the artifact is committed and
+    # the second request is served from storage without touching upstream.
+    artifact = proxy["data_dir"] / "packages" / pkg / filename
+    deadline = time.monotonic() + FILL_GIVEUP_SECS
+    while time.monotonic() < deadline and not artifact.exists():
+        time.sleep(0.1)
+    assert artifact.exists(), "the streamed fill never committed to storage"
+    assert sha256_file(artifact) == sha256_file(wheel)
+    assert origin_owner((artifact.parent / ".origin").read_text()) == "mirror"
+
+    fetches = upstream.hits(pkg)
+    warm, warm_body = _read_incrementally(
+        f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT
+    )
+    assert warm.status == 200 and warm.complete
+    assert hashlib.sha256(warm_body).hexdigest() == sha256_file(wheel)
+    assert upstream.hits(pkg) == fetches, "the warm request re-downloaded a cached artifact"
+    assert warm.last_byte < SLOW_TRANSFER_SECS, (
+        f"the cached artifact took {warm.last_byte:.1f}s to serve"
+    )
+
+
+def test_hash_mismatch_never_completes_a_streamed_body(proxy_over_fault_tee, tmp_path):
+    """Full-length but corrupt bytes: the client's connection is cut before the
+    withheld tail, so it never holds a complete artifact, and nothing is cached."""
+    proxy, upstream = proxy_over_fault_tee
+    pkg = "teecorrupt"
+    wheel = _big_wheel(pkg, tmp_path)
+    filename = upstream.register(pkg, wheel)
+    upstream.set_fault(pkg, "corrupt")
+
+    read, body = _read_incrementally(
+        f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT
+    )
+    assert not read.complete, (
+        "a body that failed verification was delivered whole "
+        f"({read.received} of {read.declared} bytes)"
+    )
+    assert hashlib.sha256(body).hexdigest() != sha256_file(wheel)
+    _wait_for_clean_storage(proxy, pkg, filename)
+
+    # And the failure is not sticky: a healed upstream still caches and serves.
+    upstream.heal(pkg)
+    code, healed, _ = http_get(
+        f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT
+    )
+    assert code == 200
+    assert hashlib.sha256(healed).hexdigest() == sha256_file(wheel)
+
+
+def test_truncated_upstream_never_completes_a_streamed_body(proxy_over_fault_tee, tmp_path):
+    """An upstream that stops mid-body: same shape — short read, clean storage."""
+    proxy, upstream = proxy_over_fault_tee
+    pkg = "teetrunc"
+    wheel = _big_wheel(pkg, tmp_path)
+    filename = upstream.register(pkg, wheel)
+    upstream.set_fault(pkg, "truncate")
+
+    read, body = _read_incrementally(
+        f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT
+    )
+    assert not read.complete, (
+        f"a truncated upstream produced a complete body ({read.received} of {read.declared})"
+    )
+    assert hashlib.sha256(body).hexdigest() != sha256_file(wheel)
+    _wait_for_clean_storage(proxy, pkg, filename)
+
+    upstream.heal(pkg)
+    code, healed, _ = http_get(
+        f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT
+    )
+    assert code == 200
+    assert hashlib.sha256(healed).hexdigest() == sha256_file(wheel)
+
+
+def test_threshold_off_buffers_the_whole_download(proxy_over_fault_no_tee, tmp_path):
+    """`--proxy-stream-threshold off` restores the download-then-serve path: no
+    early bytes, and the body still arrives whole and correct."""
+    proxy, upstream = proxy_over_fault_no_tee
+    pkg = "teeoff"
+    wheel = _big_wheel(pkg, tmp_path)
+    filename = upstream.register(pkg, wheel)
+    upstream.set_fault(pkg, "slow")
+
+    read, body = _read_incrementally(
+        f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT
+    )
+    assert read.status == 200 and read.complete
+    assert hashlib.sha256(body).hexdigest() == sha256_file(wheel)
+    assert read.last_byte > SLOW_TRANSFER_SECS / 2, "the throttled upstream did not throttle"
+    assert read.first_byte > read.last_byte / 2, (
+        f"first byte at {read.first_byte:.1f}s of a {read.last_byte:.1f}s transfer — "
+        "bytes were streamed early with streaming switched off"
+    )
+
+
+def test_ranged_request_on_a_large_cold_miss_uses_the_buffered_path(proxy_over_fault_tee, tmp_path):
+    """A range read needs the committed artifact, so it never tees — and still
+    answers with the right bytes."""
+    proxy, upstream = proxy_over_fault_tee
+    pkg = "teerange"
+    wheel = _big_wheel(pkg, tmp_path)
+    filename = upstream.register(pkg, wheel)
+
+    read, body = _read_incrementally(
+        f"{proxy['base_url']}/files/{pkg}/{filename}",
+        timeout=FAULT_GET_TIMEOUT,
+        headers={"Range": "bytes=0-99"},
+    )
+    assert read.status == 206, f"ranged cold miss returned {read.status}"
+    assert body == wheel.read_bytes()[:100]
+    assert (proxy["data_dir"] / "packages" / pkg / filename).exists(), (
+        "the ranged request did not cache the artifact"
+    )
+
+
+def test_real_client_installs_through_a_streamed_fill(
+    proxy_over_fault_tee, tmp_path, uv_path, uv_venv
+):
+    """End to end: uv installs a large wheel served from a still-running fill."""
+    proxy, upstream = proxy_over_fault_tee
+    pkg = "teeinstall"
+    wheel = _big_wheel(pkg, tmp_path)
+    upstream.register(pkg, wheel)
+    upstream.set_fault(pkg, "slow")
+
+    run_checked(
+        [
+            uv_path,
+            "pip",
+            "install",
+            "--python",
+            str(uv_venv),
+            "--index-url",
+            proxy["simple"],
+            "--no-cache-dir",
+            f"{pkg}==1.0",
+        ],
+        timeout=300,
+    )
+    run_checked([str(uv_venv), "-c", f"import {pkg}"])
+    assert (proxy["data_dir"] / "packages" / pkg / wheel.name).exists()

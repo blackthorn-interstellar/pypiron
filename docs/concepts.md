@@ -37,9 +37,14 @@ from PyPI, or synced ahead of time for an air-gapped network.
 ### Connected: cache on demand
 
 The first request for a file fetches it from PyPI, checks it against upstream's
-hash, and keeps it. Every install after that serves from your own storage, so a
-PyPI outage stops mattering — and a corrupt or truncated upstream response is
-discarded, never cached.
+hash, and keeps it. Every install after that serves from your own storage —
+once a package has been pulled, a PyPI outage can't break it — and a corrupt
+or truncated upstream response is discarded, never cached.
+
+A large file starts reaching the client while it is still downloading, so a
+300 MB wheel doesn't mean a long silence. Its last bytes are held until the hash
+check passes: a download that finishes is one pypiron verified, and a bad
+upstream shows up as a failed transfer rather than a corrupt file.
 
 ```bash
 pypiron serve --proxy-upstream https://pypi.org
@@ -61,10 +66,10 @@ pypiron sync --from https://pypi.org/simple/ --to https://your-server/ \
 Re-runs skip what you already hold, and upstream yanks follow through, so what
 you serve keeps matching upstream.
 
-One allowlist scopes both modes: name the packages you allow — version ranges
-included — and narrow by wheel platform, Python version, format, size, age, or
-pre-release. Keep it in `pypiron.toml` and caching and syncing can't drift
-apart. [Every selector](reference/configuration.md) ·
+One list drives both the cache and the sync: name the packages you allow —
+version ranges included — and narrow by wheel platform, Python version,
+format, size, age, or pre-release. Keep it in `pypiron.toml` and the two
+can't drift apart. [Every selector](reference/configuration.md) ·
 [air-gapped guide](guides/air-gapped.md)
 
 ## A name is yours or PyPI's, never both
@@ -74,8 +79,8 @@ reserved. A name you publish privately never resolves upstream, so registering
 `acme-utils` on PyPI buys an attacker nothing inside your company. Deleting
 files never reopens a reserved name.
 
-Claim a whole namespace on day one: everything under `acme-` is yours,
-published yet or not, and new private names must live inside it. Migrating
+Claim a whole namespace on day one: everything under `acme-` is yours whether
+you've published it yet or not, and new private names must live inside it. Migrating
 from another server? Pull its packages in as yours, not as a mirror.
 [Dependency confusion](security.md) · [migration guide](guides/migrate.md)
 
@@ -92,11 +97,11 @@ Credentials come from your cloud's own chain, so a machine that already reaches
 the bucket needs nothing extra. S3-compatible stores like MinIO work too. The
 bucket has to exist; pypiron won't create it.
 
-**The bucket is everything.** No database beside it to lose, back up, or drift
+**The bucket is everything.** Nothing beside it to lose, back up, or drift
 out of sync. On disk the folder is everything: copy it, and the copy serves
 every package byte-identical.
 
-**Any number of nodes on one bucket.** No coordination service, no database.
+**Any number of nodes on one bucket.** No coordination service to run.
 Uploads land on any node and show up on every node in a second or two. Disk
 storage is single-node; multi-node means a bucket.
 
@@ -144,8 +149,9 @@ does.
 - **Only what you've approved.** Name the packages you allow — version ranges
   included — and nothing else installs. Off unless you set it.
 
-The first two are on by default; together they block 72% of malicious releases
-outright. [Security](security.md) has the numbers and all three in depth.
+The cooldown and the malware block are on by default; together they stop 72%
+of malicious releases outright. [Security](security.md) has the numbers and
+the depth.
 
 ## What it tells you
 

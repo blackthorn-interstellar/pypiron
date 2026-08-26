@@ -3,7 +3,15 @@
 The proxy's whole promise is that an unreliable upstream never poisons the local
 cache: a truncated, corrupt, 500ing, or hanging upstream response must leave the
 storage tree clean (no partial artifact, no orphaned temp file), never hand a
-client a corrupt or partial artifact, and never block a later healthy fetch.
+client a COMPLETE unverified body, and never block a later healthy fetch.
+
+"Complete" is the load-bearing word for large files. A file under
+`--proxy-stream-threshold` (16 MiB by default) is downloaded, verified, and only
+then served, so a bad upstream produces no 200 at all — the stronger property the
+tests below pin. A file at or above it streams while it downloads, with its last
+64 KiB withheld until the hash check passes, so a bad upstream produces a 200
+whose body is cut short mid-transfer. Either way the client never ends up holding
+a whole artifact pypiron did not verify. See tests/test_streaming_tee.py.
 
 These tests run a real pypiron in proxy mode against a fake upstream we can make
 misbehave on demand (`_FaultServer`). The upstream speaks just enough PEP 691 to

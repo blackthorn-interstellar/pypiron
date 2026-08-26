@@ -71,6 +71,10 @@
 # Allow a plaintext http:// upstream. Off by default: over http a MITM controls
 # both the bytes and the sha256 they're checked against, defeating verification.
 # allow-insecure-upstream = false
+# Start sending a large uncached file to the client while it is still downloading
+# from upstream. The last bytes wait for the hash check, so a download that
+# finishes is a verified one. "off" waits for every file.
+# proxy-stream-threshold = "16MiB"
 
 # Supply-chain security — malware blocking plus the org audit, from one OSV feed
 # (the same database uv audit uses). On by default: protection nobody configured

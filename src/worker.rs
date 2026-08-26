@@ -643,6 +643,11 @@ pub async fn run_worker_until(
     let mut warm_leases: Vec<Option<LeaseManager>> =
         (0..state.buckets.len()).map(|_| None).collect();
     let mut authority_generation = None;
+    // Which selection generation the selected-bucket denylist reconcile last ran
+    // for. Runs once per leadership acquisition (a restart with a changed
+    // `--exclude-package` set delists/relists the affected names on boot); a
+    // selection change re-runs it against the newly selected bucket.
+    let mut excludes_reconciled_generation: Option<u64> = None;
 
     // Markers are the primary freshness mechanism; the audit is the safety
     // net for what events cannot see (restores, out-of-band storage changes,
@@ -934,6 +939,18 @@ pub async fn run_worker_until(
                                     return;
                                 }
                             }
+                            // Reconcile this warm copy's own indexes with the live
+                            // denylist before draining: a config-only change reaches
+                            // a warm bucket no other way (no artifact moved, so
+                            // nothing replicates or re-fingerprints it). Marks the
+                            // affected names dirty on this bucket; the drain below
+                            // rebuilds them the same pass. Its own bucket-local
+                            // stamp makes it a one-GET no-op when unchanged.
+                            if let Err(e) =
+                                reconcile_excludes(&job_state, handle.storage.as_ref()).await
+                            {
+                                error!(bucket=%handle.name, error=?e, "replicate: destination denylist reconcile failed");
+                            }
                             let result = tokio::select! {
                                 result = drain_dirty_uncached(&job_state, handle.storage.as_ref()) => result,
                                 _ = crate::replicate::wait_until_bucket_ineligible(&job_state, idx) => {
@@ -967,6 +984,19 @@ pub async fn run_worker_until(
             });
         }
         if is_leader {
+            // Once per leadership: reconcile the selected bucket's stored indexes
+            // with the live denylist before the tick runs, so an exclude change
+            // made across this restart is delisted (or relisted) on boot. Marks
+            // only affected names dirty; the tick below rebuilds them the same
+            // pass. Cheap no-op (one GET) when the config is unchanged.
+            if excludes_reconciled_generation != Some(selected.generation) {
+                match reconcile_excludes(&state, selected.storage.as_ref()).await {
+                    Ok(()) => excludes_reconciled_generation = Some(selected.generation),
+                    Err(e) => {
+                        error!(error=?e, "worker: denylist reconcile failed; will retry next tick")
+                    }
+                }
+            }
             let spacing = state.reconcile_interval.max(std::time::Duration::from_secs(
                 last_audit_secs.load(Ordering::Relaxed) * 10,
             ));
@@ -2477,6 +2507,16 @@ async fn rebuild_package_indexes_inner(
         files.retain(|f| f.filename != omit);
         raw.retain(|(filename, _)| filename != omit);
     }
+    // Denylist scrub: drop `--exclude-package` matches from the *renderable* view
+    // so installers can't resolve them, exactly as the malware scrub does — a
+    // fully-denied name empties `files`, so the index is deleted and the name
+    // leaves the global list below. `raw` (the inventory input) is left intact:
+    // the bytes are only delisted, not deleted, so they still count as stored and
+    // stay fetchable by direct `/files/` URL. Unblocking (removing the exclude)
+    // relists the package on its next rebuild with no re-download.
+    if let Some(denylist) = state.denylist.as_ref() {
+        files.retain(|f| !denylist.file_denied(pkg, &f.filename));
+    }
     // The renderable files carry the sha256 each one's sidecar just yielded —
     // the transparency chain's commitment, captured here at no extra reads.
     let shas: FileShas = files
@@ -2510,6 +2550,163 @@ async fn rebuild_package_indexes_inner(
         raw_artifacts: raw,
         file_shas: shas,
     })
+}
+
+/// The denylist state a bucket's stored indexes were last built against: a small
+/// bucket-local `_state/` sidecar (like the fingerprint shards) the startup
+/// reconcile diffs the live `--exclude-package` config against. A lost stamp only
+/// costs one extra reconcile pass.
+fn enforced_excludes_key() -> String {
+    format!("{STATE_PREFIX}enforced-excludes.json")
+}
+
+/// The denylist a bucket's stored indexes were last built against, or `None` when
+/// no stamp exists yet (first run). A *not-found* is the ordinary first-run case;
+/// any other read error propagates rather than masquerading as "nothing enforced"
+/// — collapsing a transient (or persistent) read fault to empty would spin a full
+/// re-delist every pass instead of surfacing, the way [`invalidate_fingerprints`]
+/// already distinguishes the two. A present-but-unparsable body reads as empty (a
+/// harmless full re-delist), only truly missing bytes are `None`.
+pub(crate) async fn read_enforced_excludes(
+    storage: &dyn Storage,
+) -> Result<Option<std::collections::BTreeMap<String, Vec<String>>>> {
+    match storage.get_bytes(&enforced_excludes_key()).await {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).unwrap_or_default())),
+        Err(e) if is_not_found(&e) => Ok(None),
+        Err(e) => Err(e).context("reading the enforced-denylist stamp"),
+    }
+}
+
+/// The denylist the offline maintenance commands (`verify-index`, `rebuild-index`)
+/// must rule through: whatever `serve` last enforced, read from the persisted
+/// stamp so they agree with the running server regardless of which channel
+/// (flag / `PYPIRON_EXCLUDE_PACKAGE` / config) set the excludes. With no stamp yet
+/// — a store `serve` never enforced against — fall back to the config the command
+/// resolved, so a first-ever offline pass still honors `pypiron.toml`.
+pub(crate) async fn enforced_denylist(
+    storage: &dyn Storage,
+    fallback: &crate::denylist::Denylist,
+) -> Result<crate::denylist::Denylist> {
+    match read_enforced_excludes(storage).await? {
+        Some(canonical) => crate::denylist::Denylist::from_canonical(&canonical),
+        None => Ok(fallback.clone()),
+    }
+}
+
+/// Drop the given packages from their audit fingerprint shards so the next audit
+/// rebuilds them instead of skipping on a fingerprint that a denylist change left
+/// stale. Grouped by shard (a normalized name's first character) so each shard
+/// file is rewritten at most once. An absent shard file needs no work.
+async fn invalidate_fingerprints(storage: &dyn Storage, packages: &[&str]) -> Result<()> {
+    let mut by_shard: std::collections::BTreeMap<char, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for pkg in packages {
+        if let Some(c) = pkg.chars().next() {
+            by_shard.entry(c).or_default().push(pkg);
+        }
+    }
+    for (shard, names) in by_shard {
+        let key = format!("{STATE_PREFIX}fp-{shard}.json");
+        let mut stored: std::collections::BTreeMap<String, String> =
+            match storage.get_bytes(&key).await {
+                Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+                Err(e) if is_not_found(&e) => continue,
+                Err(e) => return Err(e),
+            };
+        let mut changed = false;
+        for name in names {
+            changed |= stored.remove(name).is_some();
+        }
+        if changed {
+            let bytes = serde_json::to_vec(&stored)?;
+            storage
+                .put_bytes(&key, bytes, Some("application/json"))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Reconcile one bucket's stored indexes with the live `--exclude-package`
+/// denylist. The denylist is startup config, so a change only lands across a
+/// restart; the audit can't catch it (a config-only change moves no artifact, so
+/// the package fingerprint is unchanged and the audit skips the rebuild). This
+/// bridges the gap: it diffs the live denylist against the stamp the stored
+/// indexes were last built against and marks only the names whose entry changed —
+/// added (delist), removed (relist), or a moved version pin (re-filter) — dirty,
+/// so the ordinary tick rebuilds their per-package index and the global name list.
+/// Never a whole-corpus rebuild, and relisting rebuilds from the artifacts already
+/// on disk (no re-download). A no-op — one small GET — when the config is
+/// unchanged. Runs per bucket; each keeps its own bucket-local stamp and worklist.
+pub(crate) async fn reconcile_excludes(state: &AppState, storage: &dyn Storage) -> Result<()> {
+    let Some(denylist) = state.denylist.as_ref() else {
+        return Ok(());
+    };
+    let current = denylist.canonical();
+    // Not-found → first run (empty); a real read fault propagates so a persistent
+    // stamp error surfaces instead of silently re-delisting the whole set forever.
+    let previous = read_enforced_excludes(storage).await?.unwrap_or_default();
+    if current == previous {
+        return Ok(());
+    }
+    // A name whose entry differs between the two sets has stale visibility in the
+    // stored indexes and must be rebuilt; a name identical in both is untouched.
+    let mut changed: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
+    for (name, specs) in &current {
+        if previous.get(name) != Some(specs) {
+            changed.insert(name);
+        }
+    }
+    for (name, specs) in &previous {
+        if current.get(name) != Some(specs) {
+            changed.insert(name);
+        }
+    }
+    let names: Vec<&str> = changed.iter().map(|s| s.as_str()).collect();
+    let count = names.len();
+    // Invalidate the affected packages' audit fingerprints first. A denylist
+    // change moves no artifact, so a package's cached fingerprint still matches
+    // truth — and the leader's boot audit, which trusts that fingerprint to skip
+    // an "unchanged" package, would then reassert the *pre-change* visibility
+    // from the stored view and clobber the rebuild the markers below trigger.
+    // Dropping the fingerprint forces the audit to rebuild these names too, so it
+    // agrees with the tick (both apply the live denylist). This runs before the
+    // audit is spawned (the leader loop awaits the reconcile), so it is race-free.
+    invalidate_fingerprints(storage, &names).await?;
+    for name in &names {
+        mark_dirty(storage, name).await?;
+    }
+    // Persist the newly enforced set only after every marker is down: a crash
+    // between the two re-runs the reconcile (the diff still fires) rather than
+    // recording enforcement that never happened.
+    write_enforced_excludes(state, storage, &current).await?;
+    if count > 0 {
+        info!(
+            packages = count,
+            "worker: denylist changed since last run; marked affected packages for reindex"
+        );
+    }
+    Ok(())
+}
+
+/// Persist the enforced-denylist stamp for a bucket. `rebuild-index` calls this
+/// after its audit (which already applied the live denylist to every package),
+/// so a later `serve` boot's reconcile sees the stamp already agrees with the
+/// config and doesn't re-flag work the offline pass already did.
+pub(crate) async fn write_enforced_excludes(
+    state: &AppState,
+    storage: &dyn Storage,
+    canonical: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(canonical)?;
+    put_if_changed(
+        state,
+        storage,
+        &enforced_excludes_key(),
+        bytes,
+        "application/json",
+    )
+    .await
 }
 
 /// One package's contribution to the registry inventory: artifact files in
@@ -3917,6 +4114,8 @@ mod tests {
             package_stats_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             projects_page_cache: Arc::new(std::sync::Mutex::new(None)),
             proxy: None,
+            denylist: None,
+            proxy_stream_threshold: None,
             started: std::time::Instant::now(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             advisory_feed: None,

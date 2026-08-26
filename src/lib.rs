@@ -21,6 +21,7 @@ pub mod coremeta;
 mod corpus_check;
 pub mod counted_storage;
 pub mod counters;
+pub mod denylist;
 pub mod format;
 pub mod hash;
 pub mod html;

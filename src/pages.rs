@@ -257,10 +257,18 @@ async fn render_project(
     } else {
         worker::list_artifacts(storage.as_ref(), &pkg).await
     };
-    let files = match listed {
+    let mut files = match listed {
         Ok((files, _raw)) => files,
         Err(e) => return read_error(e),
     };
+    // Denylist scrub, the same one `/simple/` applies at rebuild time: drop
+    // `--exclude-package` matches so the page reflects only what installers can
+    // resolve. A fully-denied name empties the list and 404s below (no such
+    // project); a version-pinned one keeps the surviving releases. The bytes are
+    // only delisted, not deleted — still reachable by direct `/files/` URL.
+    if let Some(denylist) = state.denylist.as_ref() {
+        files.retain(|f| !denylist.file_denied(&pkg, &f.filename));
+    }
     if state.buckets.is_multi() {
         if let Some(resp) =
             recheck_settled(state, storage.as_ref(), &pkg, &before, "rendering").await

@@ -283,6 +283,9 @@ pub struct AppState {
     pub lease_ttl: Duration,
     pub wait_on_upload: bool,
     pub wait_on_upload_timeout: Duration,
+    /// Reject uploads whose version isn't valid PEP 440 when false (the default);
+    /// see publish.rs. `true` stores legacy versions as before.
+    pub allow_legacy_versions: bool,
     /// RAM-served indexes with precomputed ETags; see cache.rs.
     pub index_cache: Arc<cache::IndexCache>,
     /// Reused presigned GET URLs for immutable artifacts; see cache.rs.
@@ -570,6 +573,7 @@ impl AppState {
             lease_ttl: Duration::from_secs(30),
             wait_on_upload: false,
             wait_on_upload_timeout: Duration::from_secs(10),
+            allow_legacy_versions: false,
             index_cache: Arc::new(cache::IndexCache::new(cache::INDEX_CACHE_TTL)),
             project_cache: Arc::new(project_cache::ProjectCache::new(cache::INDEX_CACHE_TTL)),
             presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
@@ -1562,6 +1566,7 @@ async fn run_serve(
         lease_ttl: Duration::from_secs(cli.lease_ttl_secs),
         wait_on_upload: cli.wait_on_upload,
         wait_on_upload_timeout: Duration::from_secs(cli.wait_on_upload_secs),
+        allow_legacy_versions: cli.allow_legacy_versions,
         index_cache: Arc::new(cache::IndexCache::new(Duration::from_secs(
             cli.index_cache_ttl_secs,
         ))),

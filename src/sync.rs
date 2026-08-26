@@ -172,6 +172,17 @@ pub struct SyncArgs {
     #[arg(long = "no-progress", env = "PYPIRON_SYNC_NO_PROGRESS")]
     pub no_progress: bool,
 
+    /// Mirror files whose version string is not valid PEP 440 (legacy versions).
+    /// Off by default: a file whose version pypiron can't parse as PEP 440 is
+    /// skipped (logged and left out of selection), so one ancient upstream
+    /// release can't break a mirror run. It keys on the version string, not the
+    /// file type — an .egg/.exe/.msi (or any wheel/sdist) with a valid PEP 440
+    /// version still mirrors. This is decided entirely on the syncing side: the
+    /// destination does not re-check mirror uploads, so it stores whatever `sync`
+    /// sends. Set this to mirror legacy versions. Also `[sync].allow-legacy-versions`.
+    #[arg(long = "allow-legacy-versions", env = "PYPIRON_ALLOW_LEGACY_VERSIONS")]
+    pub allow_legacy_versions: bool,
+
     /// PEM bundle of extra CA certificates to trust for the **source** TLS — the
     /// private root a corporate forwarding TLS proxy (a MITM appliance) presents.
     /// Augments the built-in roots (a direct fetch of public PyPI keeps working);
@@ -757,6 +768,9 @@ struct Resolved {
     spool_dir: PathBuf,
     dry_run: bool,
     full: bool,
+    /// Mirror files whose version isn't valid PEP 440. When false (the default),
+    /// [`select_from_index`] skips them; see the flag on [`SyncArgs`].
+    allow_legacy_versions: bool,
     mirror: ResolvedMirror,
     /// The raw `--exclude-older` input (e.g. `"800 days"`), kept verbatim for
     /// [`config_key`]: a relative duration must hash to a value that is *stable*
@@ -886,6 +900,11 @@ impl Resolved {
             spool_dir: args.spool_dir.clone().unwrap_or_else(std::env::temp_dir),
             dry_run: args.dry_run,
             full: args.full,
+            // Same precedence shape as the other opt-in bools: CLI/env can only
+            // turn it on, so a file that opted in isn't force-disabled by a bare
+            // run without the flag.
+            allow_legacy_versions: args.allow_legacy_versions
+                || sync.allow_legacy_versions.unwrap_or(false),
             mirror,
             exclude_older_raw,
             exclude_newer_raw,
@@ -2421,6 +2440,25 @@ fn select_from_index(
         }
         file.yanked = file.yanked.normalized();
         let version = infer_version_from_filename(&file.filename);
+        // Legacy-version gate: unless the operator opted in, a file whose version
+        // isn't valid PEP 440 is skipped — never downloaded, never pushed to the
+        // destination store — so an ancient upstream release (or a legacy binary
+        // format like .egg/.exe/.msi, which infers no version at all) can't break
+        // a mirror run. This mirrors the upload endpoint's default reject; a
+        // genuinely legacy version is the only thing it drops, and it runs before
+        // the cooldown watermark so such a file never counts as merely held back.
+        if !resolved.allow_legacy_versions
+            && version
+                .as_deref()
+                .is_none_or(|v| Version::from_str(v).is_err())
+        {
+            warn!(
+                package = %spec.name,
+                filename = %file.filename,
+                "sync: skipping non-PEP-440 (legacy) version; pass --allow-legacy-versions to mirror it"
+            );
+            continue;
+        }
         if let Some(specifiers) = &spec.specifiers {
             // A specifier gates by version, which the Simple API doesn't carry —
             // we infer it from the filename. A file whose version can't be
@@ -3769,6 +3807,7 @@ mod tests {
             spool_dir: std::env::temp_dir(),
             dry_run: false,
             full: false,
+            allow_legacy_versions: false,
             mirror: filter,
             exclude_older_raw: None,
             exclude_newer_raw: None,

@@ -343,6 +343,28 @@ pub(crate) async fn legacy_upload(
         ));
     }
 
+    // Keep non-PEP-440 (legacy) versions out of the store by default. A direct
+    // upload names a specific package, so refuse it outright with an actionable
+    // error rather than storing a malformed version. `pep440_rs` accepts and
+    // normalizes every legal-but-noncanonical spelling (v-prefix, `RC1`, `1.0.0.0`,
+    // local `+…`), so this only fires on genuinely unparseable versions —
+    // legacy releases and legacy binary formats (.egg/.exe/.msi) whose version
+    // grammar predates PEP 440. Mirror uploads bypass: their legacy policy is
+    // enforced by the syncing client's selection filter (it skips such files),
+    // so a mirror run never hard-fails here. `--allow-legacy-versions` re-enables
+    // storing them.
+    if !is_mirror && !state.allow_legacy_versions && version.parse::<pep440_rs::Version>().is_err()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "version '{version}' for '{filename}' is not a valid PEP 440 version; \
+                 pypiron rejects legacy versions by default. Re-tag the release, or pass \
+                 --allow-legacy-versions (PYPIRON_ALLOW_LEGACY_VERSIONS=1) to accept it."
+            ),
+        ));
+    }
+
     let upload_time = match fields.get("upload_time") {
         Some(ts) => {
             if OffsetDateTime::parse(ts, &Rfc3339).is_err() {

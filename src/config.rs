@@ -102,6 +102,8 @@ pub struct ServeConfig {
     pub spool_dir: Option<PathBuf>,
     pub wait_on_upload: Option<bool>,
     pub wait_on_upload_secs: Option<u64>,
+    /// Accept uploads whose version isn't valid PEP 440. Off by default (reject).
+    pub allow_legacy_versions: Option<bool>,
     pub worker_interval_secs: Option<u64>,
     pub bucket_leave_failures: Option<u32>,
     pub bucket_return_healthy_secs: Option<u64>,
@@ -182,6 +184,8 @@ pub struct SyncConfig {
     pub source_pass: Option<String>,
     pub concurrency: Option<usize>,
     pub package_concurrency: Option<usize>,
+    /// Mirror files whose version isn't valid PEP 440. Off by default (skip them).
+    pub allow_legacy_versions: Option<bool>,
     /// Advisory snapshot to ferry to the destination. Unset relays the source
     /// server's snapshot (on by default); a URL/path fetches that feed; `""`
     /// disables the relay. Shares the `PYPIRON_ADVISORY_FEED` concept with serve.

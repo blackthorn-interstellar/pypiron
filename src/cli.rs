@@ -927,6 +927,18 @@ pub struct ServeArgs {
     #[arg(long, env = "PYPIRON_WAIT_ON_UPLOAD_SECS", default_value = "10")]
     pub(crate) wait_on_upload_secs: u64,
 
+    /// Accept uploads whose version string is not valid PEP 440 (legacy
+    /// versions). Off by default: an unparseable version is refused at upload
+    /// with a clear error, keeping malformed versions out of the store. It keys
+    /// on the version string, not the file type — an .egg/.exe/.msi (or any
+    /// wheel/sdist) with a valid PEP 440 version is still accepted; only a
+    /// non-PEP-440 version is refused, and every modern build tool emits PEP 440.
+    /// Turn this on to store legacy versions as before. Mirror uploads bypass
+    /// this gate; they are governed by the syncing client's own
+    /// `--allow-legacy-versions`.
+    #[arg(long, env = "PYPIRON_ALLOW_LEGACY_VERSIONS")]
+    pub(crate) allow_legacy_versions: bool,
+
     /// Address to bind the server to
     #[arg(long, env = "PYPIRON_BIND_ADDR", default_value = "0.0.0.0:8080")]
     pub(crate) bind_addr: String,
@@ -1123,6 +1135,11 @@ pub fn merge_serve_file(
         cli.wait_on_upload_secs,
         "wait_on_upload_secs",
         f.wait_on_upload_secs
+    );
+    fill!(
+        cli.allow_legacy_versions,
+        "allow_legacy_versions",
+        f.allow_legacy_versions
     );
     fill!(
         cli.worker_interval_secs,

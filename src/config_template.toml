@@ -97,6 +97,12 @@
 # 200, so a publish-then-install pipeline is deterministic.
 # wait-on-upload = false
 # wait-on-upload-secs = 10
+# Reject uploads whose version string isn't valid PEP 440 (the default). Keys on
+# the version, not the file type: a legacy version is refused; an .egg/.exe/.msi
+# with a valid PEP 440 version is still accepted. Direct uploads only — mirror
+# uploads bypass it, so sync's own allow-legacy-versions governs mirrored files.
+# Set true to accept legacy versions as before.
+# allow-legacy-versions = false
 # Upload spool directory. Point at real disk where /tmp is a RAM-backed tmpfs,
 # or multi-GB wheels spool into memory.
 # spool-dir = "/var/spool/pypiron"
@@ -186,6 +192,11 @@
 # admin-pass = "secret"                     # better: set PYPIRON_SYNC_ADMIN_PASS
 # concurrency = 4                           # parallel transfers within one package
 # package-concurrency = 8                   # packages synced in parallel
+# Skip upstream files whose version string isn't valid PEP 440 (the default), so
+# a single ancient release can't break a mirror run. Decided entirely here: the
+# destination doesn't re-check mirror uploads and stores whatever sync sends. Set
+# true to mirror legacy versions.
+# allow-legacy-versions = false
 
 # Ferry the advisory snapshot (OSV malware/vuln feed) across the air gap to the
 # destination's PUT /advisories/feed, etag-conditioned so an unchanged feed

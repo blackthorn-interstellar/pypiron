@@ -4092,6 +4092,7 @@ mod tests {
             transparency: true,
             wait_on_upload: false,
             wait_on_upload_timeout: Duration::from_secs(1),
+            allow_legacy_versions: false,
             lease_ttl: Duration::from_secs(30),
             index_cache: Arc::new(crate::cache::IndexCache::new(crate::cache::INDEX_CACHE_TTL)),
             project_cache: Arc::new(crate::project_cache::ProjectCache::new(

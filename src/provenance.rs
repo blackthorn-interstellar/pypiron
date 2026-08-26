@@ -31,6 +31,14 @@ pub struct Provenance {
     /// artifact's own sha256 — the relayed attestation is about *this* file.
     /// Never implies signature verification.
     pub digest_bound: bool,
+    /// `Some` when at least one relayed attestation *fully verifies* offline
+    /// against the trust root embedded in the binary — DSSE signature, Fulcio
+    /// cert chain, SCT, Rekor transparency (bound to this entry), and subject-
+    /// digest binding all pass (see [`crate::attest`]). The value is the signer
+    /// identity drawn from the *verified certificate* — never the unsigned
+    /// `publisher` field above. This is a genuine cryptographic verification
+    /// pypiron performed itself, not a relayed claim; it implies `digest_bound`.
+    pub verified_signer: Option<crate::attest::VerifiedSigner>,
 }
 
 /// The verified publishing identity drawn from a provenance attestation bundle.
@@ -54,9 +62,14 @@ pub fn parse(bytes: &[u8], artifact_sha256: &str) -> Option<Provenance> {
     let v: Value = serde_json::from_slice(bytes).ok()?;
     let publisher = publisher_from_value(&v)?;
     let digest_bound = digest_binds(&v, artifact_sha256);
+    // Independent, offline cryptographic verification against the embedded
+    // Sigstore trust root. Fail-closed: any doubt yields `None` and the page
+    // falls back to the relayed + digest-bound labeling.
+    let verified_signer = crate::attest::verify(bytes, artifact_sha256);
     Some(Provenance {
         publisher,
         digest_bound,
+        verified_signer,
     })
 }
 

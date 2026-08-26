@@ -37,6 +37,17 @@ html-escape = "0.2"
 async-trait = "0.1"
 sha2 = "0.10"
 md-5 = "0.11"
+# Offline PEP 740 (Sigstore bundle) verification — all pure-Rust RustCrypto, no
+# network, no unsafe. p256: DSSE leaf signature, Rekor v1 SET, and CT SCT (all
+# ECDSA-P256/SHA-256). p384: the Fulcio cert chain (ECDSA-P384/SHA-384).
+# ed25519-dalek: the Rekor "Log2025" SET. x509-cert: parse/re-encode Fulcio
+# certs. See src/attest.rs; the trust root is embedded (src/assets/).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
+ed25519-dalek = { version = "2", default-features = false }
+ecdsa = { version = "0.16", default-features = false, features = ["der"] }
+signature = { version = "2", default-features = false }
+x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # gzip handles upstream Simple-index/JSON responses; wheels are already
 # compressed, so brotli/zstd buy nothing but two C/Rust codec dependency trees.

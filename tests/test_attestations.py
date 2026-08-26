@@ -281,3 +281,21 @@ def test_sync_relays_provenance_from_pypi(disk_server, pypiron_bin):
     assert served == upstream_provenance
     assert served["version"] == 1
     assert served["attestation_bundles"]
+
+    # pypiron re-verifies the real Sigstore bundle itself, offline, against the
+    # trust root embedded in the binary — so the human page earns the strong
+    # "cryptographically verified by this server" cue (the leaf cert is long
+    # expired by wall clock; verification passes because it is evaluated at the
+    # Rekor integrated time).
+    _, page, _ = http_get(f"{disk_server['base_url']}/project/{PYPI_ATTESTED_PKG}/", timeout=30.0)
+    page = page.decode()
+    assert "Cryptographically verified by this server" in page
+    assert "transparency log" in page
+    # The identity shown is drawn from the verified certificate (its SAN + Fulcio
+    # OIDs), not the unsigned publisher JSON: sampleproject's own repo and issuer.
+    assert "https://github.com/pypa/sampleproject" in page
+    assert "token.actions.githubusercontent.com" in page
+    # The claim is scoped honestly: who signed, not that they own the package.
+    assert "not that the signer is the package's rightful owner" in page
+    # The earned state drops the weaker relayed caption.
+    assert "not re-verified by this server" not in page

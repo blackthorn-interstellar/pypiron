@@ -206,15 +206,24 @@ configure is your data behind your keys, and pypiron treats its responses as
 trusted input. That trust has exactly one sharp edge — see
 [pypiron's own dependencies](#pypirons-own-dependencies).
 
-**Trusted — PyPI, for public packages.** For anything mirrored, pypiron is a
-relay: it carries PyPI's files and provenance across unchanged and does not
-re-verify them. Trusting a mirrored package is trusting PyPI. The provenance
-travels as a `<filename>.provenance` companion (advertised by a `provenance`
-URL in JSON and a `data-provenance` attribute in HTML). Consumers verify it
-end-to-end and offline — Sigstore bundles check against a cached trust root with
-no egress — so even an air-gapped build confirms the original publisher. pypiron
-never runs Sigstore or mints provenance itself, so it refuses a direct upload
-carrying first-party attestations.
+**Trusted — PyPI, for public packages.** For anything mirrored, pypiron carries
+PyPI's files and provenance across unchanged. Trusting a mirrored package is
+trusting PyPI. The provenance travels as a `<filename>.provenance` companion
+(advertised by a `provenance` URL in JSON and a `data-provenance` attribute in
+HTML), so a consumer can verify it end-to-end and offline. pypiron also verifies
+it *itself*: it independently re-checks each mirrored Sigstore bundle offline
+against a trust root built into the binary — the signature, its Fulcio
+certificate chain, the Signed Certificate Timestamp, the Rekor transparency-log
+entry (bound to that exact signature), and that the attestation names the exact
+bytes served. When all of that passes, the project page says so —
+"cryptographically verified by this server" — and shows the signing identity
+read from the *certificate* (the signing workflow, its source repository, its
+OIDC issuer), never the unsigned `publisher` field a bundle can carry alongside
+the signature. That identity is *who signed the file*, proven; it is not a claim
+that the signer is the package's rightful owner — pypiron has no per-package
+expected-publisher policy, so the page asks you to check the signer looks right.
+What pypiron does *not* do is mint or sign attestations, so it still refuses a
+direct upload carrying first-party attestations.
 
 **A poisoned listing can't reach your internal network.** When the proxy or
 `sync` pulls an upstream file, a malicious or tampered listing can point that
@@ -269,10 +278,13 @@ These are out of scope by design; know them before you lean on the rest.
 - **A stolen storage credential.** Whoever holds your object-storage keys can
   rewrite an artifact and its recorded hash in one motion. Guard that credential
   like the root secret it is.
-- **The trustworthiness of upstream PyPI.** For mirrored public packages, pypiron
-  relays PyPI's provenance; it never mints or re-verifies attestations itself. A
-  malicious upload that PyPI accepted and signed is one pypiron will carry across.
-  Your own private uploads are a separate world you control.
+- **The trustworthiness of upstream PyPI.** pypiron independently re-verifies a
+  mirrored Sigstore bundle offline (proving it is authentic and names these
+  bytes), but it does not mint or sign attestations, and verification says
+  nothing about whether the publisher is benign. A malicious upload that PyPI
+  accepted and that carries a valid attestation is one pypiron will carry across,
+  and verifying its bundle does not make it safe. Your own private uploads are a
+  separate world you control.
 - **Request floods.** pypiron throttles failed logins itself (see above), but
   volumetric floods — hammering the index, download, or metadata endpoints —
   are the edge's job: put a request-rate limit on your reverse proxy or load

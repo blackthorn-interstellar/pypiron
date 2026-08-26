@@ -223,6 +223,7 @@ main.wide{max-width:1000px}\
 .sb-dl dd{margin:1px 0 0;font-size:13px;word-break:break-word}\
 .sb-note{margin:8px 0 0;font-size:11px;line-height:1.45;color:var(--muted)}\
 .sb-bound{margin:8px 0 0;font-size:12px;line-height:1.45;color:#16a34a}\
+.sb-verified{margin:8px 0 0;font-size:12px;line-height:1.45;color:#16a34a;font-weight:600}\
 .sb-authored{border-left:2px solid var(--border);padding-left:13px;margin-left:1px}\
 .sb-authored-head{margin-bottom:14px}\
 .tabpanel{margin:0 0 26px}\
@@ -993,6 +994,17 @@ fn provenance_section(prov: Option<&Provenance>) -> String {
     let Some(pv) = prov else {
         return String::new();
     };
+
+    // When pypiron itself verified the Sigstore bundle offline, the identity we
+    // show is drawn from the VERIFIED certificate — never the unsigned `publisher`
+    // JSON, which an attacker can set to any project while signing with a
+    // throwaway identity. The relayed publisher does not appear in this state.
+    if let Some(signer) = &pv.verified_signer {
+        return verified_provenance_section(signer);
+    }
+
+    // Not independently verified: attribute the relayed (unsigned) publisher, and
+    // say plainly it was recorded upstream, not re-verified here.
     let p = &pv.publisher;
     let mut rows = String::new();
     rows.push_str(&kv_row("Publisher", &p.kind));
@@ -1012,21 +1024,57 @@ fn provenance_section(prov: Option<&Provenance>) -> String {
     if let Some(e) = &p.environment {
         rows.push_str(&kv_row("Environment", e));
     }
-    // The checksum-match cue: shown only when the relayed attestation's subject
-    // digest binds to the bytes we serve. This is an integrity match, not a
-    // signature check, and says exactly that.
+    // The one claim pypiron can make without crypto: the relayed attestation's
+    // subject digest matches the bytes served (an integrity match, not a
+    // signature check). Shown only when it holds.
     let bound = if pv.digest_bound {
         "<p class=\"sb-bound\">✓ The attestation names this file's checksum, \
 so it describes the exact bytes served here.</p>"
     } else {
         ""
     };
-    // The honest attribution: relayed from the publishing index, not re-verified.
     format!(
         "<section class=\"sb sb-prov\"><h2>Publisher attestation</h2>\
 <dl class=\"sb-dl\">{rows}</dl>{bound}\
 <p class=\"sb-note\">Publisher as attested to the publishing index (PyPI). \
 Recorded there, not re-verified by this server.</p></section>"
+    )
+}
+
+/// Render the attestation section for a bundle pypiron verified itself. Every
+/// value here comes from the verified certificate ([`VerifiedSigner`]); the
+/// unsigned `publisher` JSON is deliberately not shown. The cue claims exactly
+/// what was proven — a valid, transparency-logged signature over these bytes by
+/// this identity — and the caption is explicit that this is *who signed*, not a
+/// judgement that the signer is the package's rightful owner.
+fn verified_provenance_section(signer: &crate::attest::VerifiedSigner) -> String {
+    let link_row = |label: &str, value: &str| -> String {
+        match markdown::safe_href(value) {
+            Some(href) => format!(
+                "<dt>{label}</dt><dd><a href=\"{h}\" rel=\"nofollow noopener noreferrer\">{t}</a></dd>",
+                h = encode_double_quoted_attribute(href),
+                t = encode_text(value),
+            ),
+            None => kv_row(label, value),
+        }
+    };
+    let mut rows = String::new();
+    if let Some(repo) = &signer.source_repo {
+        rows.push_str(&link_row("Source repository", repo));
+    }
+    rows.push_str(&link_row("Signed by", &signer.identity));
+    if let Some(issuer) = &signer.issuer {
+        rows.push_str(&kv_row("Issuer", issuer));
+    }
+    format!(
+        "<section class=\"sb sb-prov\"><h2>Publisher attestation</h2>\
+<p class=\"sb-verified\">✓ Cryptographically verified by this server — this file has a valid \
+Sigstore attestation, recorded in the transparency log, signed over the exact bytes served \
+here by the identity below. Checked offline against a trust root built into this server.</p>\
+<dl class=\"sb-dl\">{rows}</dl>\
+<p class=\"sb-note\">This confirms who signed the file, verified from the signing \
+certificate — not that the signer is the package's rightful owner. Check that the signer \
+looks right for this package.</p></section>"
     )
 }
 
@@ -1554,6 +1602,7 @@ mod tests {
         let prov = Provenance {
             publisher: imaginairy_publisher(),
             digest_bound: false,
+            verified_signer: None,
         };
         let html = project_html(
             &ctx(),
@@ -1591,6 +1640,7 @@ mod tests {
         let prov = Provenance {
             publisher: imaginairy_publisher(),
             digest_bound: true,
+            verified_signer: None,
         };
         let html = project_html(
             &ctx(),
@@ -1609,6 +1659,64 @@ mod tests {
         // Even bound, it is never labelled a bare "Verified" claim.
         assert!(!html.contains("Verified details"));
         assert!(html.contains("not re-verified by this server"));
+    }
+
+    #[test]
+    fn cryptographically_verified_provenance_shows_cert_identity_not_spoofed_publisher() {
+        // The bundle verified, but its UNSIGNED publisher JSON claims a different,
+        // spoofed project (brycedrennan/imaginAIry) than the verified certificate
+        // (pypa/sampleproject). The page MUST present the cert-derived identity and
+        // never the spoofed publisher — the earlier code rendered the publisher
+        // field here, which is exactly the fail-open this guards against.
+        let m = imaginairy_meta();
+        let files = imaginairy_files();
+        let prov = Provenance {
+            // The unsigned publisher JSON claims an unrelated, attacker-chosen repo.
+            publisher: crate::provenance::Publisher {
+                kind: "GitHub".into(),
+                repository: Some("evilcorp/spoofed-pip".into()),
+                workflow: Some("evil.yml".into()),
+                environment: None,
+            },
+            digest_bound: true,
+            verified_signer: Some(crate::attest::VerifiedSigner {
+                identity:
+                    "https://github.com/pypa/sampleproject/.github/workflows/release.yml@refs/heads/main"
+                        .into(),
+                issuer: Some("https://token.actions.githubusercontent.com".into()),
+                source_repo: Some("https://github.com/pypa/sampleproject".into()),
+            }),
+        };
+        let html = project_html(
+            &ctx(),
+            "imaginairy",
+            &files,
+            "15.0.0",
+            false,
+            Some(&m),
+            Some(&prov),
+            &[],
+            &[],
+        );
+        // Isolate the attestation section — the author metadata section is separate.
+        let start = html.find("<section class=\"sb sb-prov\">").unwrap();
+        let sec = &html[start..html[start..].find("</section>").unwrap() + start];
+        assert!(sec.contains("class=\"sb-verified\""));
+        assert!(sec.contains("Cryptographically verified by this server"));
+        assert!(sec.contains("transparency log"));
+        // The verified identity shown is the certificate's, not the publisher JSON.
+        assert!(sec.contains("https://github.com/pypa/sampleproject"));
+        assert!(sec.contains("token.actions.githubusercontent.com"));
+        // The spoofed publisher identity appears nowhere — not the repo, not the
+        // workflow, not the "Publisher" row the old code rendered from it.
+        assert!(!html.contains("evilcorp"));
+        assert!(!html.contains("spoofed-pip"));
+        assert!(!html.contains("evil.yml"));
+        // The claim is scoped: who signed, not that they own the package.
+        assert!(sec.contains("not that the signer is the package's rightful owner"));
+        // And the weaker relayed cue/caption are gone in this state.
+        assert!(!html.contains("not re-verified by this server"));
+        assert!(!html.contains("Publisher as attested to the publishing index"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use md5::{Digest as _, Md5};
 use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
@@ -34,14 +35,20 @@ pub struct UploadSpool {
     file: File,
     path: TempPath,
     hasher: Sha256,
+    /// Content MD5, computed in the same streaming pass. Not a security digest —
+    /// it is the checksum S3 reports as a single-part ETag and GCS as `md5Hash`,
+    /// captured so a later server-side copy can be verified against the
+    /// provider's own reported digest (see [`crate::sidecar::StoreChecksum`]).
+    md5: Md5,
     size: u64,
 }
 
-/// A fully spooled upload: temp file on disk (removed on drop), its SHA-256,
-/// and its size.
+/// A fully spooled upload: temp file on disk (removed on drop), its SHA-256, its
+/// content MD5 (for the server-side-copy checksum), and its size.
 pub struct FinishedSpool {
     pub path: TempPath,
     pub sha256: String,
+    pub md5: String,
     pub size: u64,
 }
 
@@ -79,6 +86,7 @@ impl UploadSpool {
                         file,
                         path: TempPath(path),
                         hasher: Sha256::new(),
+                        md5: Md5::new(),
                         size: 0,
                     })
                 }
@@ -97,6 +105,7 @@ impl UploadSpool {
 
     pub async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
         self.hasher.update(chunk);
+        self.md5.update(chunk);
         self.file.write_all(chunk).await?;
         self.size += chunk.len() as u64;
         Ok(())
@@ -114,6 +123,7 @@ impl UploadSpool {
         Ok(FinishedSpool {
             path: self.path,
             sha256: format!("{:x}", self.hasher.finalize()),
+            md5: crate::hash::hex(self.md5.finalize().as_slice()),
             size: self.size,
         })
     }
@@ -129,6 +139,7 @@ mod tests {
         let mut expected = Sha256::new();
         expected.update(&payload);
         let expected = format!("{:x}", expected.finalize());
+        let expected_md5 = crate::hash::hex(Md5::digest(&payload).as_slice());
 
         let mut spool = UploadSpool::new(&std::env::temp_dir()).await.unwrap();
         // Uneven chunk sizes: hash and size must not depend on chunking.
@@ -138,6 +149,7 @@ mod tests {
         let done = spool.finish().await.unwrap();
 
         assert_eq!(done.sha256, expected);
+        assert_eq!(done.md5, expected_md5);
         assert_eq!(done.size, payload.len() as u64);
         assert_eq!(std::fs::read(done.path.path()).unwrap(), payload);
     }

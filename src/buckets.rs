@@ -896,7 +896,7 @@ async fn verify_copy_cell(dst: &dyn Storage, src: &CopyOrigin) -> Result<()> {
     let outcome = dst
         .server_side_copy(src, TOPOLOGY_STAMP_KEY, &scratch, 0)
         .await;
-    if !matches!(outcome, Ok(CopyOutcome::Copied)) {
+    if !matches!(outcome, Ok(CopyOutcome::Copied { .. })) {
         // Best-effort cleanup even on a non-copy (nothing likely landed).
         let _ = dst.delete_keys(std::slice::from_ref(&scratch)).await;
         match outcome {

@@ -36,6 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi",
 html-escape = "0.2"
 async-trait = "0.1"
 sha2 = "0.10"
+md-5 = "0.11"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # gzip handles upstream Simple-index/JSON responses; wheels are already
 # compressed, so brotli/zstd buy nothing but two C/Rust codec dependency trees.
@@ -90,3 +91,10 @@ exit = "warn"
 strip = true
 lto = "thin"
 codegen-units = 1
+
+# Panic backtraces keep file/line; type and variable DWARF go. macOS defaults
+# split-debuginfo to "unpacked", so full debuginfo lands as loose .o files beside
+# every dep — 497k of them, 97% of a 51 GB target/ before this. Set debug = 2
+# when you actually need to step through a debugger.
+[profile.dev]
+debug = "line-tables-only"

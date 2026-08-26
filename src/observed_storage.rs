@@ -470,6 +470,14 @@ impl Storage for ObservedStorage {
             .server_side_copy(src, src_key, dst_key, expected_size)
             .await
     }
+
+    async fn store_content_checksum(
+        &self,
+        key: &str,
+        md5_hex: &str,
+    ) -> Result<Option<crate::sidecar::StoreChecksum>> {
+        self.inner.store_content_checksum(key, md5_hex).await
+    }
 }
 
 #[cfg(test)]

@@ -1,10 +1,31 @@
 //! One-shot content hashing shared across modules.
 
+use md5::Digest as _;
 use sha2::{Digest, Sha256};
 
 /// Lowercase hex sha256 of arbitrary bytes.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Lowercase hex MD5 of arbitrary bytes. Not a security digest — it is the
+/// content checksum S3 reports as an unencrypted single-part ETag and GCS as
+/// `md5Hash`, so it lets a server-side copy be verified against the provider's
+/// own reported digest of the destination object (see [`crate::sidecar::StoreChecksum`]).
+/// (`md-5` uses `digest 0.11`, whose output array is not `LowerHex`, so hex it
+/// ourselves rather than through `{:x}`.)
+pub fn md5_hex(bytes: &[u8]) -> String {
+    hex(md5::Md5::digest(bytes).as_slice())
+}
+
+/// Lowercase hex of a byte slice.
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// HMAC-SHA256 (RFC 2104). Block size 64 bytes; keys longer than the block are

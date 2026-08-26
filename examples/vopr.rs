@@ -3382,6 +3382,7 @@ async fn op_publish(
     let req = pypiron::PublishRequest {
         pkg: pkg.clone(),
         filename: fname.clone(),
+        md5: pypiron::hash::md5_hex(&body),
         sha256,
         size: body.len() as u64,
         version: format!("{}.0", file + 1),

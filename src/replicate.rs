@@ -47,8 +47,9 @@ use crate::sidecar::{
 };
 use crate::status::{self, StatusConvergence};
 use crate::storage::{
-    bounded_artifact_write, create_artifact_verified, is_not_found, store_artifact_verified,
-    verify_stored_size, ArtifactBody, CopyOrigin, CopyOutcome, Existing, Storage,
+    bounded_artifact_write, check_copy_checksum, create_artifact_verified, is_not_found,
+    store_artifact_verified, verify_stored_size, ArtifactBody, ChecksumCheck, CopyOrigin,
+    CopyOutcome, Existing, Storage,
 };
 use crate::tombstone;
 #[cfg(test)]
@@ -1240,11 +1241,23 @@ fn copy_transport(state: &AppState, src: &dyn Storage, dst: &dyn Storage) -> Opt
         .then_some(src_o)
 }
 
-/// Attempt the server-side artifact copy. `Ok(true)` = copied and size-verified;
+/// Attempt the server-side artifact copy. `Ok(true)` = copied and verified;
 /// `Ok(false)` = the backend declined (e.g. oversize) so the caller streams;
-/// `Err` = a copy was attempted and failed. The destination sidecar (installed
-/// before this leg) already gates divergence, so overwriting adjudicated truth
-/// here is safe — the copy verb has no create-if-absent on S3 by design.
+/// `Err` = a copy was attempted and failed, so the caller streams (which
+/// re-reads and sha-verifies the source) and then leaves its repair note. The
+/// destination sidecar (installed before this leg) already gates divergence, so
+/// overwriting adjudicated truth here is safe — the copy verb has no
+/// create-if-absent on S3 by design.
+///
+/// The copy transport never pulls the bytes through this node, so it cannot
+/// sha-verify them. It confirms the destination with (1) the size HEAD it has
+/// always done and (2) — when both the source sidecar and the provider's copy
+/// response carry an algorithm-matched content checksum — a comparison against
+/// the checksum captured when the bytes were first SHA-256-verified. A checksum
+/// contradiction is a corrupt copy or a same-size-wrong source; it fails the
+/// copy so the caller streams and the sha check catches it, instead of serving
+/// bytes that silently disagree with their own sidecar. When either checksum is
+/// missing or the algorithms differ, the size-only check stands (no regression).
 async fn server_side_copy_artifact(
     state: &AppState,
     dst: &dyn Storage,
@@ -1254,8 +1267,19 @@ async fn server_side_copy_artifact(
 ) -> Result<bool> {
     match dst.server_side_copy(src_o, akey, akey, sc.size).await? {
         CopyOutcome::NotCopyable => Ok(false),
-        CopyOutcome::Copied => {
+        CopyOutcome::Copied { checksum } => {
             verify_stored_size(dst, akey, sc.size).await?;
+            if matches!(
+                check_copy_checksum(sc.store_checksum.as_ref(), checksum.as_ref()),
+                ChecksumCheck::Mismatch
+            ) {
+                bail!(
+                    "server-side copy of {akey} landed a body whose content checksum \
+                     contradicts the source sidecar ({:?} != copy {:?}); refusing to trust it",
+                    sc.store_checksum,
+                    checksum
+                );
+            }
             state.metrics.record_server_side_copy(sc.size);
             Ok(true)
         }

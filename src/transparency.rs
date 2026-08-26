@@ -926,6 +926,7 @@ mod tests {
             origin: Some(origin.to_string()),
             yank_epoch: 0,
             snapshot: false,
+            store_checksum: None,
         })
         .expect("serializing a test sidecar")
     }

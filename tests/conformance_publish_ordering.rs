@@ -53,6 +53,7 @@ fn request(body: Vec<u8>, is_mirror: bool) -> PublishRequest {
     PublishRequest {
         pkg: PKG.to_string(),
         filename: FILENAME.to_string(),
+        md5: pypiron::hash::md5_hex(&body),
         sha256: sha256_hex(&body),
         size: body.len() as u64,
         version: "1.0".to_string(),

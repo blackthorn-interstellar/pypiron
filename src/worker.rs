@@ -3627,6 +3627,9 @@ async fn backfill_sidecar(
         // provenance stays "cache" until a real sync re-stamps snapshot=true.
         // (Both replicate; the bit is provenance only.)
         snapshot: false,
+        // Backfill re-reads the body to recover its sha256; a provider checksum
+        // would need a native metadata read, so it stays size-only for now.
+        store_checksum: None,
     };
     let fabricated = serde_json::to_vec(&sc)?;
     let created = storage
@@ -3855,6 +3858,7 @@ mod tests {
             upload_epoch_ms: None,
             yank_epoch: 0,
             snapshot: false,
+            store_checksum: None,
         }
     }
 

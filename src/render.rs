@@ -498,6 +498,7 @@ mod tests {
             origin: None,
             yank_epoch: 0,
             snapshot: false,
+            store_checksum: None,
         }
     }
 

@@ -409,6 +409,7 @@ pub(crate) mod tests {
             yank_epoch: epoch,
             upload_epoch_ms: None,
             snapshot: false,
+            store_checksum: None,
         }
     }
 

@@ -663,7 +663,7 @@ impl Storage for SimStorage {
             Some(CopyFault::Denied) => bail!("sim server-side copy denied"),
             Some(CopyFault::Timeout) => bail!("sim server-side copy timed out"),
             // Report success but write nothing — the phantom 200-with-error-body.
-            Some(CopyFault::Phantom) => return Ok(CopyOutcome::Copied),
+            Some(CopyFault::Phantom) => return Ok(CopyOutcome::Copied { checksum: None }),
             None => {}
         }
         let source = sim_copy_registry()
@@ -674,7 +674,7 @@ impl Storage for SimStorage {
             .ok_or_else(|| anyhow!("sim copy source '{}' is not registered", src.location))?;
         let bytes = source.get_bytes(src_key).await?;
         self.put_bytes(dst_key, bytes, None).await?;
-        Ok(CopyOutcome::Copied)
+        Ok(CopyOutcome::Copied { checksum: None })
     }
 }
 

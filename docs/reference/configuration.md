@@ -257,6 +257,12 @@ with a throwaway copy — and logs the result one line per bucket pair (a
 so you can see which pairs take the fast path. Nothing to configure, and
 nothing changes about what ends up on each bucket; only how the bytes get there.
 
+Keep bucket encryption consistent to hold this fast path. Mix it — one bucket
+unencrypted or SSE-S3, another SSE-KMS or SSE-C — and pypiron re-streams each
+copy through the node to re-verify the bytes: correct, but without the zero-copy
+saving. All buckets unencrypted, or all on one SSE mode, stay server-side.
+Homogeneous fleets need nothing here.
+
 In multi-bucket mode a failing bucket stops taking new requests within a
 second and its background work is cancelled; transfers already in flight keep
 the normal one-hour bound. Startup and migration operations also carry a

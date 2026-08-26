@@ -703,6 +703,10 @@ impl Proxy {
             // handler schedules them once this fill commits). The bit is only
             // provenance now, not a replication carve-out.
             snapshot: false,
+            // A proxy cache fill replicates asynchronously (a `_repl/` note),
+            // whose copy leg keeps its size-only check; capturing the provider
+            // checksum here is a later refinement.
+            store_checksum: None,
         };
         // Type the record before its artifact can exist. An orphan sidecar is
         // inert; an orphan artifact would be backfilled from a later private

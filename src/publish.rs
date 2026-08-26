@@ -71,6 +71,11 @@ pub struct PublishRequest {
     pub body: PublishBody,
     /// SHA-256 of `body`, already verified against any client-supplied digest.
     pub sha256: String,
+    /// Content MD5 of `body`, computed in the same spooling pass. Bound to the
+    /// SHA-256-verified bytes as the sidecar's `store_checksum` on the
+    /// multi-bucket path, so a later server-side copy can be verified against
+    /// the provider's own reported digest without re-reading the artifact.
+    pub md5: String,
     /// Byte length of `body`.
     pub size: u64,
     /// Version string as the handler derived it (form field or filename).
@@ -369,6 +374,7 @@ pub(crate) async fn legacy_upload(
     let req = PublishRequest {
         pkg: pkg_norm,
         filename,
+        md5: spooled.md5,
         body: PublishBody::Spool(spooled.path),
         sha256,
         size: spooled.size,
@@ -405,6 +411,7 @@ pub async fn publish_record(
         filename,
         body,
         sha256,
+        md5,
         size,
         version,
         requires_python,
@@ -571,30 +578,6 @@ pub async fn publish_record(
         }
     }
 
-    let sc = Sidecar {
-        sha256,
-        size,
-        version,
-        upload_time,
-        requires_python,
-        yanked,
-        // Per-artifact origin (§4/§6.2): the replicator decides "private only"
-        // from state, never from history.
-        origin: Some(desired_origin.to_string()),
-        upload_epoch_ms: (!is_mirror).then(now_epoch_millis),
-        yank_epoch: 0,
-        // A `sync --to` upload is a snapshot: mirror content the operator chose,
-        // tagged so its origin reads honestly (a proxy cache carries this false).
-        // Provenance only — both snapshot and cache replicate; private stays false.
-        snapshot: is_mirror,
-    };
-    let sc_bytes = serde_json::to_vec(&sc).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to encode sidecar".to_string(),
-        )
-    })?;
-
     // Every multi-bucket writer consumes the exact origin observation it began
     // under, closing concurrent origin changes around its artifact write.
     if let Some(ref expected) = write_fence {
@@ -656,6 +639,54 @@ pub async fn publish_record(
             ));
         }
     }
+
+    // Bind the provider's content checksum to these now-durable, SHA-256-verified
+    // bytes so a later server-side bucket→bucket copy can be verified against the
+    // destination's own reported digest without re-reading the artifact. Only on
+    // a multi-bucket fleet, where a copy can follow; and best-effort — a probe
+    // that fails just leaves the copy path on today's size-only check, never
+    // fails the upload. The sidecar is built here, after the bytes, so it can
+    // carry the checksum (its other fields do not change between here and the
+    // pre-write point it used to be built at).
+    let store_checksum = if state.buckets.is_multi() {
+        match storage.store_content_checksum(&key, &md5).await {
+            Ok(checksum) => checksum,
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    %filename,
+                    "could not capture the store checksum; server-side copies of this artifact fall back to the size-only check"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let sc = Sidecar {
+        sha256,
+        size,
+        version,
+        upload_time,
+        requires_python,
+        yanked,
+        // Per-artifact origin (§4/§6.2): the replicator decides "private only"
+        // from state, never from history.
+        origin: Some(desired_origin.to_string()),
+        upload_epoch_ms: (!is_mirror).then(now_epoch_millis),
+        yank_epoch: 0,
+        // A `sync --to` upload is a snapshot: mirror content the operator chose,
+        // tagged so its origin reads honestly (a proxy cache carries this false).
+        // Provenance only — both snapshot and cache replicate; private stays false.
+        snapshot: is_mirror,
+        store_checksum,
+    };
+    let sc_bytes = serde_json::to_vec(&sc).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to encode sidecar".to_string(),
+        )
+    })?;
 
     // The mirror sidecar lands here: one op after the bytes it names, and ahead
     // of every fence that can still refuse this upload. Both halves are
@@ -1505,6 +1536,7 @@ mod tests {
         PublishRequest {
             pkg: pkg.to_string(),
             filename: filename.to_string(),
+            md5: crate::hash::md5_hex(&body),
             sha256: format!("{:x}", hasher.finalize()),
             size: body.len() as u64,
             version: "1.0".to_string(),

@@ -20,6 +20,7 @@ faults (denied / timeout / phantom-200) by the deterministic simulator
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import time
@@ -27,8 +28,11 @@ import time
 import pytest
 
 from .conftest import (
+    minio_delete_key_in,
+    minio_get_key_in,
     minio_key_exists_in,
     minio_object_sha256,
+    minio_put_key_in,
 )
 from .helpers import (
     find_free_port,
@@ -114,6 +118,99 @@ def test_same_endpoint_two_buckets_replicate_via_server_side_copy(
     _eventually(
         lambda: _server_side_copies(server["base_url"]) >= 1,
         what="a server-side copy was recorded",
+    )
+
+
+def test_server_side_copy_rejects_a_same_size_corrupt_source(minio_two, s3_server_multi, tmp_path):
+    """A server-side CopyObject moves bytes provider-side, so this node never
+    sees them and cannot re-hash them. It used to trust the copy on size alone:
+    a source object silently replaced by same-size, wrong bytes (its sidecar's
+    sha256 unchanged) copied through and the peer served bytes its own sidecar
+    contradicted — the Codex finding 'server-side replication copy bypasses
+    artifact integrity checks'.
+
+    The copy now also compares the destination's provider-reported content
+    checksum (MinIO's single-part ETag is the content MD5) against the checksum
+    captured when the source bytes were first SHA-256-verified. A same-size-wrong
+    source no longer matches, so the copy is refused and falls back to streaming,
+    whose SHA-256 check also rejects it: the corrupt body never lands on the peer.
+    """
+    server = s3_server_multi
+    a, b = minio_two["buckets"]
+
+    wheel = make_wheel("corruptcopy", "1.0", tmp_path)
+    wheel_bytes = wheel.read_bytes()
+    wheel_sha = hashlib.sha256(wheel_bytes).hexdigest()
+    upload_legacy(
+        server["legacy"],
+        wheel,
+        username=server["user"],
+        password=server["password"],
+        timeout=20,
+    )
+    wait_for_file_in_index(server["simple"], "corruptcopy", wheel.name)
+
+    key = f"packages/corruptcopy/{wheel.name}"
+    sc_key = f"{key}.meta.json"
+    # The original upload fanned out correctly — both buckets are byte-identical.
+    _eventually(
+        lambda: minio_key_exists_in(minio_two, b, key),
+        what="artifact fanned out to the peer bucket",
+    )
+    assert minio_object_sha256(minio_two, b, key) == wheel_sha
+
+    # Replace the SOURCE body with same-size, wrong bytes, leaving its sidecar
+    # (and the captured checksum) intact; wipe the peer's record so reconcile
+    # re-copies the now-corrupt source server-side (a and b share one MinIO
+    # endpoint, so the transport is a real CopyObject).
+    corrupt = "C" * len(wheel_bytes)
+    assert len(corrupt.encode()) == len(wheel_bytes)
+    minio_put_key_in(minio_two, a, key, corrupt)
+    minio_delete_key_in(minio_two, b, key)
+    minio_delete_key_in(minio_two, b, sc_key)
+    assert minio_object_sha256(minio_two, a, key) != wheel_sha, "source must be corrupt now"
+
+    # The invariant the finding protects: a peer must never end up SERVING bytes
+    # that contradict their own sidecar's sha256. Size-only server-side copy
+    # breaks it silently — the corrupt body lands under the ORIGINAL sidecar and,
+    # because nothing re-hashes a stored body on the copy path, that contradiction
+    # is served forever. With the content-checksum check the copy is caught and
+    # routed to the streaming/verify path, and the record settles safe: either a
+    # self-consistent rebuild, or a freeze/tombstone that suppresses it from
+    # serving. Both are "safe"; a live artifact+sidecar that disagree is not.
+    def peer_state() -> str:
+        if minio_key_exists_in(minio_two, b, f"{key}.frozen") or minio_key_exists_in(
+            minio_two, b, f"{key}.tombstone"
+        ):
+            return "safe"  # suppressed from every index — never served
+        has_art = minio_key_exists_in(minio_two, b, key)
+        has_sc = minio_key_exists_in(minio_two, b, sc_key)
+        if has_art and has_sc:
+            sidecar = json.loads(minio_get_key_in(minio_two, b, sc_key))
+            if minio_object_sha256(minio_two, b, key) == sidecar["sha256"]:
+                return "safe"  # bytes match their sidecar
+            return "contradiction"  # served bytes disagree with the sidecar — the bug
+        return "unsettled"  # torn or absent mid-heal
+
+    _eventually(
+        lambda: peer_state() == "safe",
+        timeout=30.0,
+        what="peer settled to a safe record (self-consistent, or suppressed by freeze/tombstone)",
+    )
+    # ...and stays safe: the silent contradiction must never (re)appear.
+    for _ in range(15):
+        assert peer_state() != "contradiction", (
+            "server-side copy left the peer serving bytes its own sidecar "
+            "contradicts (same-size-corrupt source accepted on size alone)"
+        )
+        time.sleep(0.3)
+
+    # And it was the content-checksum check that caught it — the size-only path
+    # would have accepted the same-size body without a word.
+    log_text = server["log_path"].read_text(errors="replace")
+    assert "content checksum contradicts the source sidecar" in log_text, (
+        "expected the server-side-copy integrity check to catch and refuse the "
+        "same-size-corrupt source"
     )
 
 

@@ -128,6 +128,42 @@ pub struct Sidecar {
     /// records, which replicate from their origin regardless.
     #[serde(default, skip_serializing_if = "is_false")]
     pub snapshot: bool,
+    /// A provider-native content checksum of the stored artifact, captured when
+    /// the bytes were first durably written and SHA-256-verified, and tagged
+    /// with its algorithm. It binds a cheap provider-dialect digest (an S3
+    /// content-MD5 ETag, a GCS `md5Hash`) to bytes already proven correct, so a
+    /// server-side bucket→bucket copy can be verified against the destination's
+    /// own reported checksum without ever re-reading the artifact body. Absent
+    /// on legacy sidecars, on disk/Azure backends, and wherever the provider's
+    /// checksum could not be confirmed to be a content digest (SSE-KMS/SSE-C or
+    /// multipart ETags); the copy path then falls back to its size-only check.
+    #[serde(
+        rename = "store-checksum",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub store_checksum: Option<StoreChecksum>,
+}
+
+/// A provider-native content checksum bound to known-good, SHA-256-verified
+/// bytes. `algo` names the provider dialect (`"md5"` today — the digest S3
+/// reports as an unencrypted single-part ETag and GCS as `md5Hash`); `value`
+/// is its canonical lowercase-hex form. Compared only when two sidecars/copies
+/// agree on `algo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreChecksum {
+    pub algo: String,
+    pub value: String,
+}
+
+impl StoreChecksum {
+    /// A content-MD5 checksum from a lowercase-hex digest.
+    pub fn md5(value_hex: impl Into<String>) -> Self {
+        Self {
+            algo: "md5".to_string(),
+            value: value_hex.into(),
+        }
+    }
 }
 
 /// Serde predicate: keep the common (never-yanked) sidecar free of epoch noise
@@ -312,6 +348,37 @@ mod tests {
         assert!(snapshot.snapshot);
         let out = serde_json::to_string(&snapshot).unwrap();
         assert!(out.contains(r#""snapshot":true"#));
+    }
+
+    #[test]
+    fn store_checksum_defaults_for_legacy_sidecars_and_round_trips() {
+        // A legacy sidecar carries no store-checksum: it must default to None
+        // (copy verification falls back to size-only) and never serialize the
+        // key, so the common on-disk bytes stay identical.
+        let legacy: Sidecar =
+            serde_json::from_str(r#"{"sha256":"a","size":1,"version":"1","upload-time":"t"}"#)
+                .unwrap();
+        assert_eq!(legacy.store_checksum, None);
+        let out = serde_json::to_string(&legacy).unwrap();
+        assert!(
+            !out.contains("store-checksum"),
+            "absent store checksum must not serialize"
+        );
+
+        // A captured sidecar round-trips the tagged checksum.
+        let stamped: Sidecar = serde_json::from_str(
+            r#"{"sha256":"a","size":1,"version":"1","upload-time":"t",
+                "store-checksum":{"algo":"md5","value":"0123456789abcdef0123456789abcdef"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stamped.store_checksum,
+            Some(StoreChecksum::md5("0123456789abcdef0123456789abcdef"))
+        );
+        let out = serde_json::to_string(&stamped).unwrap();
+        assert!(out.contains(
+            r#""store-checksum":{"algo":"md5","value":"0123456789abcdef0123456789abcdef"}"#
+        ));
     }
 
     #[test]

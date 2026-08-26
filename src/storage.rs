@@ -36,6 +36,7 @@ use object_store::{
 use crate::config::BucketOverride;
 use crate::hash::sha256_hex;
 use crate::range::{parse_range, read_capacity, RangeSpec};
+use crate::sidecar::StoreChecksum;
 
 /// In a failover topology one blackholed request must return in bounded time so
 /// its availability observation can move selection; object_store's defaults (10
@@ -1151,6 +1152,25 @@ pub trait Storage: Send + Sync {
         let _ = (src, src_key, dst_key, expected_size);
         Ok(CopyOutcome::NotCopyable)
     }
+
+    /// Bind our own MD5 (`md5_hex`, computed over the just-written,
+    /// SHA-256-verified bytes) to the provider-native content checksum to
+    /// persist in the sidecar for the server-side-copy integrity check. `Some`
+    /// only when the provider confirms it is a content digest of these exact
+    /// bytes — S3 when the stored object's ETag equals the MD5 (which rules out
+    /// SSE-KMS/SSE-C and multipart, whose ETags are not the plaintext MD5, so
+    /// those fleets keep the size-only check with no per-copy streaming
+    /// penalty), GCS unconditionally (its `md5Hash` is always the content MD5).
+    /// `None` on disk/Azure and everything unconfirmed. At most one HEAD (S3
+    /// only); never a body read. Only called on the multi-bucket upload path,
+    /// where a server-side copy can actually follow. The default has none.
+    async fn store_content_checksum(
+        &self,
+        _key: &str,
+        _md5_hex: &str,
+    ) -> Result<Option<StoreChecksum>> {
+        Ok(None)
+    }
 }
 
 /// Which cloud a [`CopyOrigin`] belongs to. A server-side copy is always
@@ -1195,13 +1215,101 @@ impl CopyOrigin {
 }
 
 /// Outcome of a [`Storage::server_side_copy`] attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyOutcome {
-    /// Copied server-side; the object now exists on the destination.
-    Copied,
+    /// Copied server-side; the object now exists on the destination. `checksum`
+    /// is the provider's own content digest of the freshly written destination
+    /// object, parsed from the copy response when it carries one that is a
+    /// confirmed content digest (an unencrypted single-part S3 ETag, a GCS
+    /// `md5Hash`); `None` when the provider returned none we can trust
+    /// (Azure, SSE-KMS/SSE-C or multipart ETags), so the caller keeps its
+    /// size-only check.
+    Copied { checksum: Option<StoreChecksum> },
     /// This backend cannot serve the copy (cross-provider, oversize, or no
     /// signing material). The caller streams; not an error.
     NotCopyable,
+}
+
+/// The result of comparing a captured content checksum against the one a
+/// server-side copy's destination reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumCheck {
+    /// Same algorithm, same value: the destination holds the known-good bytes.
+    Match,
+    /// One side carries no checksum, or the algorithms differ — nothing to
+    /// compare, so the size-only check stands (no regression).
+    Inconclusive,
+    /// Same algorithm, different value: the destination is NOT the known-good
+    /// bytes (a corrupt copy or a same-size-wrong source). Must not be trusted.
+    Mismatch,
+}
+
+/// Compare the checksum captured when the artifact was first SHA-256-verified
+/// (`expected`, from its sidecar) against the one the provider reported for the
+/// server-side-copy destination (`actual`). Only an algorithm-matched value
+/// difference is a [`ChecksumCheck::Mismatch`]; anything uncomparable is
+/// [`ChecksumCheck::Inconclusive`] and leaves today's size-only trust in place
+/// (legacy sidecars, disk/Azure, encrypted/multipart ETags).
+pub fn check_copy_checksum(
+    expected: Option<&StoreChecksum>,
+    actual: Option<&StoreChecksum>,
+) -> ChecksumCheck {
+    match (expected, actual) {
+        (Some(e), Some(a)) if e.algo == a.algo => {
+            if e.value.eq_ignore_ascii_case(&a.value) {
+                ChecksumCheck::Match
+            } else {
+                ChecksumCheck::Mismatch
+            }
+        }
+        _ => ChecksumCheck::Inconclusive,
+    }
+}
+
+/// Parse the content checksum from an S3 `CopyObjectResult` body. S3 and MinIO
+/// answer a single-part CopyObject with the destination object's ETag, which
+/// for an unencrypted single-part object IS its content MD5. A composite
+/// multipart ETag (`"<hex>-<n>"`) or an SSE-KMS/SSE-C ETag is not a plaintext
+/// content digest, so anything that is not exactly 32 hex characters yields
+/// `None` and the copy keeps its size-only check.
+pub fn s3_copy_checksum(body: &str) -> Option<StoreChecksum> {
+    let etag = extract_xml_tag(body, "ETag")?;
+    // MinIO returns the ETag with its quotes XML-entity-escaped
+    // (`<ETag>&#34;<hex>&#34;</ETag>`); real S3 uses literal `"`. Strip both
+    // before the hex check.
+    let hex = etag
+        .replace("&#34;", "")
+        .replace("&#x22;", "")
+        .replace("&quot;", "")
+        .trim()
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    is_hex32(&hex).then(|| StoreChecksum::md5(hex))
+}
+
+/// Decode a GCS `md5Hash` (standard base64 of the raw 16-byte MD5) into a
+/// lowercase-hex content checksum. `None` when absent or not a 16-byte MD5
+/// (e.g. a composite object exposes only `crc32c`).
+pub fn gcs_md5_checksum(md5_base64: &str) -> Option<StoreChecksum> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(md5_base64.trim())
+        .ok()?;
+    (raw.len() == 16).then(|| StoreChecksum::md5(crate::hash::hex(&raw)))
+}
+
+/// The text between the first `<tag>` and its `</tag>` in `body`, if both are
+/// present. Sufficient for the small, flat provider copy responses.
+fn extract_xml_tag(body: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    Some(body[start..end].to_string())
+}
+
+fn is_hex32(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Whether `dst` may server-side-copy from `src`: same provider, compatible
@@ -2080,6 +2188,16 @@ struct GcsRewriteResponse {
     done: bool,
     #[serde(rename = "rewriteToken", default)]
     rewrite_token: Option<String>,
+    /// The destination object's metadata, present once `done`. Its `md5Hash`
+    /// (base64 MD5) is the content checksum the copy is verified against.
+    #[serde(default)]
+    resource: Option<GcsResource>,
+}
+
+#[derive(serde::Deserialize)]
+struct GcsResource {
+    #[serde(rename = "md5Hash", default)]
+    md5_hash: Option<String>,
 }
 
 /// At or below this size an upload is a single conditional PUT; above it the
@@ -2220,7 +2338,13 @@ impl ObjectStorage {
                 clip(&body, 400)
             );
         }
-        Ok(CopyOutcome::Copied)
+        // The CopyObjectResult carries the destination's ETag — its content MD5
+        // for an unencrypted single-part object. `s3_copy_checksum` keeps it only
+        // when it is a plain 32-hex digest, so an encrypted or multipart ETag
+        // leaves the copy on its size-only check.
+        Ok(CopyOutcome::Copied {
+            checksum: s3_copy_checksum(&body),
+        })
     }
 
     /// GCS rewrite: a bearer-authorized `POST` that copies within GCS. A large
@@ -2277,7 +2401,14 @@ impl ObjectStorage {
             let parsed: GcsRewriteResponse = serde_json::from_str(&body)
                 .with_context(|| format!("parse GCS rewrite response: {}", clip(&body, 400)))?;
             if parsed.done {
-                return Ok(CopyOutcome::Copied);
+                // The rewrite response carries the destination object's md5Hash
+                // (always the content MD5 for a single-part object); verify
+                // against it without re-reading the body.
+                let checksum = parsed
+                    .resource
+                    .and_then(|r| r.md5_hash)
+                    .and_then(|h| gcs_md5_checksum(&h));
+                return Ok(CopyOutcome::Copied { checksum });
             }
             match parsed.rewrite_token {
                 Some(t) => token = Some(t),
@@ -2372,7 +2503,9 @@ impl ObjectStorage {
             .get("x-ms-copy-status")
             .and_then(|v| v.to_str().ok())
         {
-            Some("success") => Ok(CopyOutcome::Copied),
+            // Azure Copy Blob returns no content digest of the destination, so
+            // the copy keeps its size-only check.
+            Some("success") => Ok(CopyOutcome::Copied { checksum: None }),
             other => bail!(
                 "Azure Copy Blob to {dst_key} did not complete synchronously (x-ms-copy-status: {})",
                 other.unwrap_or("<none>")
@@ -2924,6 +3057,38 @@ impl Storage for ObjectStorage {
             _ => Ok(CopyOutcome::NotCopyable),
         }
     }
+
+    async fn store_content_checksum(
+        &self,
+        key: &str,
+        md5_hex: &str,
+    ) -> Result<Option<StoreChecksum>> {
+        match self.backend {
+            // The unencrypted single-part ETag is the content MD5. Confirm it
+            // equals ours before persisting: an SSE-KMS/SSE-C or multipart ETag
+            // is not the plaintext MD5, so binding one would make every later
+            // copy of this object mismatch and needlessly stream. One HEAD.
+            "s3" => {
+                let etag = match self.store.head(&self.oskey(key)).await {
+                    Ok(meta) => meta.e_tag,
+                    Err(e) => match self.classify_get(e, "head", key) {
+                        None => return Ok(None),
+                        Some(err) => return Err(err),
+                    },
+                };
+                let confirmed = etag
+                    .map(|e| e.trim().trim_matches('"').eq_ignore_ascii_case(md5_hex))
+                    .unwrap_or(false);
+                Ok(confirmed.then(|| StoreChecksum::md5(md5_hex)))
+            }
+            // GCS `md5Hash` is always the content MD5 for a single-part object;
+            // trust our own computed digest without a metadata round-trip.
+            "gcs" => Ok(Some(StoreChecksum::md5(md5_hex))),
+            // Azure Copy Blob returns no content digest to compare against, and
+            // disk has none: keep the size-only check.
+            _ => Ok(None),
+        }
+    }
 }
 
 /// Normalize a user-supplied storage prefix into a bare key prefix carrying no
@@ -3093,6 +3258,92 @@ impl Storage for FaultInjectStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_copy_checksum_reads_a_plain_etag_as_content_md5() {
+        // A single-part CopyObjectResult's ETag is the destination's content MD5.
+        // Real S3 quotes it with literal `"`.
+        let body = r#"<?xml version="1.0"?><CopyObjectResult><LastModified>2026-08-23T00:00:00.000Z</LastModified><ETag>"9e107d9d372bb6826bd81d3542a419d6"</ETag></CopyObjectResult>"#;
+        assert_eq!(
+            s3_copy_checksum(body),
+            Some(StoreChecksum::md5("9e107d9d372bb6826bd81d3542a419d6"))
+        );
+        // MinIO namespaces the element and XML-entity-escapes the quotes.
+        let minio = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>2026-08-26T00:00:00.000Z</LastModified><ETag>&#34;9e107d9d372bb6826bd81d3542a419d6&#34;</ETag></CopyObjectResult>";
+        assert_eq!(
+            s3_copy_checksum(minio),
+            Some(StoreChecksum::md5("9e107d9d372bb6826bd81d3542a419d6"))
+        );
+    }
+
+    #[test]
+    fn s3_copy_checksum_rejects_multipart_and_encrypted_etags() {
+        // A composite multipart ETag (`-<n>`) is not the plaintext content MD5.
+        let multipart = r#"<CopyObjectResult><ETag>"9e107d9d372bb6826bd81d3542a419d6-4"</ETag></CopyObjectResult>"#;
+        assert_eq!(s3_copy_checksum(multipart), None);
+        // No ETag at all: nothing to bind.
+        assert_eq!(
+            s3_copy_checksum("<CopyObjectResult></CopyObjectResult>"),
+            None
+        );
+        // A non-hex value never passes for a content MD5.
+        let weird = r#"<CopyObjectResult><ETag>"not-a-hex-digest-here-000000000000"</ETag></CopyObjectResult>"#;
+        assert_eq!(s3_copy_checksum(weird), None);
+    }
+
+    #[test]
+    fn gcs_md5_checksum_decodes_base64_to_hex() {
+        // GCS `md5Hash` is standard base64 of the raw 16-byte MD5.
+        // MD5("The quick brown fox jumps over the lazy dog") base64 =
+        // "nhB9nTcrtoJr2B01QqQZ1g==".
+        assert_eq!(
+            gcs_md5_checksum("nhB9nTcrtoJr2B01QqQZ1g=="),
+            Some(StoreChecksum::md5("9e107d9d372bb6826bd81d3542a419d6"))
+        );
+        // Not a 16-byte digest (e.g. a crc32c-only response) → nothing to bind.
+        assert_eq!(gcs_md5_checksum("AAAA"), None);
+        assert_eq!(gcs_md5_checksum("!!! not base64 !!!"), None);
+    }
+
+    #[test]
+    fn check_copy_checksum_only_a_matched_value_diff_is_a_mismatch() {
+        let a = StoreChecksum::md5("9e107d9d372bb6826bd81d3542a419d6");
+        let b = StoreChecksum::md5("00000000000000000000000000000000");
+        // Same algorithm, same value: verified.
+        assert_eq!(
+            check_copy_checksum(Some(&a), Some(&a)),
+            ChecksumCheck::Match
+        );
+        // Case folds — providers quote/lowercase differently.
+        let upper = StoreChecksum::md5("9E107D9D372BB6826BD81D3542A419D6");
+        assert_eq!(
+            check_copy_checksum(Some(&a), Some(&upper)),
+            ChecksumCheck::Match
+        );
+        // Same algorithm, different value: the copy is not the known-good bytes.
+        assert_eq!(
+            check_copy_checksum(Some(&a), Some(&b)),
+            ChecksumCheck::Mismatch
+        );
+        // Either side missing → size-only fallback, never a false alarm.
+        assert_eq!(
+            check_copy_checksum(None, Some(&a)),
+            ChecksumCheck::Inconclusive
+        );
+        assert_eq!(
+            check_copy_checksum(Some(&a), None),
+            ChecksumCheck::Inconclusive
+        );
+        // Differing algorithms are not comparable.
+        let crc = StoreChecksum {
+            algo: "crc32c".to_string(),
+            value: "9e107d9d".to_string(),
+        };
+        assert_eq!(
+            check_copy_checksum(Some(&a), Some(&crc)),
+            ChecksumCheck::Inconclusive
+        );
+    }
 
     fn s3_origin(bucket: &str, endpoint: Option<&str>) -> CopyOrigin {
         CopyOrigin {

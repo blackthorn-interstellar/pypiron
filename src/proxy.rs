@@ -83,19 +83,24 @@ const MAX_PRESENCE: usize = 65_536;
 /// client gets byte one at upstream speed, but the last [`TEE_HOLDBACK`] bytes
 /// only exist after verification — so a corrupt or truncated upstream can never
 /// produce a *complete* body, only a short read on an aborted connection.
-const TEE_HOLDBACK: u64 = 64 * 1024;
+pub(crate) const TEE_HOLDBACK: u64 = 64 * 1024;
 /// Read size for one poll of a teed body: the same 64 KiB the disk artifact
 /// streamer uses (see `range::read_capacity`).
 const TEE_CHUNK: u64 = 64 * 1024;
 
-/// Distinguishes one fill's progress publications from the next fill's on the
-/// same inflight entry — the entry outlives a fill whenever a waiter is queued
-/// behind it. Never zero, so a never-published entry can't be mistaken for one.
-static FILL_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn next_fill_epoch() -> u64 {
-    FILL_EPOCH.fetch_add(1, Ordering::Relaxed) + 1
-}
+/// Ceiling on cold-miss fills running detached from the request that started
+/// them. A detached fill deliberately outlives its client — that is what stops
+/// pip's retries from livelocking on a big wheel — so a client disconnect no
+/// longer bounds anything. Without a ceiling, one anonymous caller can GET a
+/// hundred distinct large wheels, hang up on every one, and leave the node
+/// committed to a hundred concurrent multi-hour downloads spooling into the
+/// spool dir (often a tmpfs). Past the ceiling the fill runs INLINE on the
+/// request task instead, where a disconnect cancels it exactly as it did before
+/// fills were detached: the overflow case degrades to the old behavior rather
+/// than to no behavior.
+const MAX_DETACHED_FILLS: usize = 32;
+static DETACHED_FILLS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_DETACHED_FILLS);
 
 /// A package page rendered from the upstream listing, ETag precomputed.
 #[derive(Clone)]
@@ -157,25 +162,20 @@ pub struct Proxy {
     /// full copy into N separate spool files — an anonymous client could
     /// amplify one request for a large wheel into N full-size downloads
     /// (disk-fill + upstream bandwidth). The map self-prunes (see
-    /// [`DownloadSlot`]), so it stays bounded by live concurrency, not by the
-    /// number of distinct artifacts ever proxied.
+    /// [`DownloadSlot`]), so it stays bounded by the fills actually in flight —
+    /// detached ones included, and [`MAX_DETACHED_FILLS`] bounds those — not by
+    /// the number of distinct artifacts ever proxied.
     inflight: InflightMap,
     /// Warm-hit accelerator: artifact keys proven present in local storage, so a
     /// repeat proxied download skips its existence HEAD. See [`PresenceCache`].
     presence: PresenceCache,
 }
 
-type InflightMap = Arc<Mutex<HashMap<String, Inflight>>>;
-
-/// One artifact key's single-flight state: the slot mutex, and the channel the
-/// fill holding that slot publishes its progress on. A streaming tee reads the
-/// channel; nothing else does, so a fill with no tee attached only ever writes
-/// into a watch nobody reads.
-#[derive(Clone, Default)]
-struct Inflight {
-    lock: Arc<tokio::sync::Mutex<()>>,
-    progress: Arc<tokio::sync::watch::Sender<FillProgress>>,
-}
+/// One artifact key's single-flight state: nothing but the slot mutex. Fill
+/// progress does not live here — the leader owns a fresh channel per fill (see
+/// [`Proxy::ensure_artifact_cached`]), which is why one fill can never be
+/// mistaken for the next on the same key.
+type InflightMap = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
 /// Held for the whole download-verify-commit of one artifact key. Dropping it
 /// removes the map entry once no other task is waiting on that key, keeping
@@ -183,9 +183,6 @@ struct Inflight {
 struct DownloadSlot {
     inflight: InflightMap,
     key: String,
-    /// The progress channel of the entry this slot owns. Handed to the fill so
-    /// it can publish, and cloned by the leader so it can subscribe a tee.
-    progress: Arc<tokio::sync::watch::Sender<FillProgress>>,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -195,10 +192,8 @@ impl Drop for DownloadSlot {
         if let Some(entry) = map.get(&self.key) {
             // We still hold `_guard` (one strong ref) and the map holds one.
             // Any count beyond that is a task already waiting on this key, so
-            // only collapse the entry when we are its last user. The progress
-            // channel rides on the same entry and is never counted: a tee holds
-            // a `Receiver`, which is not a strong ref to anything here.
-            if Arc::strong_count(&entry.lock) <= 2 {
+            // only collapse the entry when we are its last user.
+            if Arc::strong_count(entry) <= 2 {
                 map.remove(&self.key);
             }
         }
@@ -208,14 +203,14 @@ impl Drop for DownloadSlot {
 /// What a running fill publishes for whoever is teeing its bytes to a client.
 ///
 /// One value, overwritten in place — a tee only ever needs the latest position,
-/// never a history. `epoch` and `attempt` are what make that safe: a tee binds
-/// to the (epoch, attempt) pair it attached on, and treats any other pair as a
-/// failure rather than splicing bytes from a different download into its body.
+/// never a history. The channel belongs to exactly one fill, so the only
+/// splice hazard left is that fill's own retries, and `attempt` is what makes
+/// that safe: a tee binds to the attempt it attached on and treats any other
+/// attempt as a failure rather than splicing a restarted download onto a body
+/// that already carries a prefix of the dead one.
 #[derive(Clone)]
 struct FillProgress {
-    /// Which fill published this (see [`next_fill_epoch`]). Zero = none ever did.
-    epoch: u64,
-    /// Which of that fill's up-to-[`DOWNLOAD_ATTEMPTS`] attempts.
+    /// Which of the fill's up-to-[`DOWNLOAD_ATTEMPTS`] attempts published this.
     attempt: u32,
     /// The attempt's spool file, published once it exists — which is also once
     /// upstream has answered 200, since the spool is opened after the response.
@@ -238,23 +233,22 @@ enum FillState {
 
 impl Default for FillProgress {
     fn default() -> Self {
-        // A fresh entry has no fill behind it, so it is nobody's live download.
+        // The channel's initial value: the fill exists but has not opened a
+        // spool yet, so there is nothing to attach to and nothing has failed.
         Self {
-            epoch: 0,
             attempt: 0,
             spool: None,
             written: 0,
-            state: FillState::Failed,
+            state: FillState::Running,
         }
     }
 }
 
 /// The publishing half of [`FillProgress`], owned by a fill that has a tee
 /// attached. Absent (`None` at the call sites) when nothing is streaming, so the
-/// buffered path pays nothing.
+/// buffered path pays nothing — it never even allocates the channel.
 struct Progress {
-    tx: Arc<tokio::sync::watch::Sender<FillProgress>>,
-    epoch: u64,
+    tx: tokio::sync::watch::Sender<FillProgress>,
 }
 
 impl Progress {
@@ -264,7 +258,6 @@ impl Progress {
     fn started(&self, attempt: u32, spool: &std::path::Path) {
         let spool = Arc::new(spool.to_path_buf());
         self.tx.send_modify(|p| {
-            p.epoch = self.epoch;
             p.attempt = attempt;
             p.spool = Some(spool);
             p.written = 0;
@@ -315,13 +308,13 @@ pub enum FillOutcome {
 /// aborted connection — never a whole file the client would trust.
 pub struct StreamingFill {
     size: u64,
-    epoch: u64,
     attempt: u32,
     /// This tee's own handle on the spool, opened while the fill still owns the
     /// file. It stays valid across the commit's rename and the spool's unlink.
     file: tokio::fs::File,
     rx: tokio::sync::watch::Receiver<FillProgress>,
     fill: Option<tokio::task::JoinHandle<Result<bool>>>,
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl StreamingFill {
@@ -343,7 +336,6 @@ impl StreamingFill {
     pub fn into_body(self, on_delivered: Option<Box<dyn FnOnce() + Send>>) -> axum::body::Body {
         let tee = Tee {
             size: self.size,
-            epoch: self.epoch,
             attempt: self.attempt,
             file: self.file,
             rx: self.rx,
@@ -352,6 +344,7 @@ impl StreamingFill {
             verified: false,
             done: false,
             on_delivered,
+            metrics: self.metrics,
         };
         axum::body::Body::from_stream(futures::stream::unfold(tee, |mut tee| async move {
             tee.next().await.map(|chunk| (chunk, tee))
@@ -371,7 +364,6 @@ enum Observed {
 
 struct Tee {
     size: u64,
-    epoch: u64,
     attempt: u32,
     file: tokio::fs::File,
     rx: tokio::sync::watch::Receiver<FillProgress>,
@@ -380,6 +372,7 @@ struct Tee {
     verified: bool,
     done: bool,
     on_delivered: Option<Box<dyn FnOnce() + Send>>,
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl Tee {
@@ -393,7 +386,7 @@ impl Tee {
         }
         loop {
             if !self.verified {
-                match observe(&mut self.rx, self.epoch, self.attempt) {
+                match observe(&mut self.rx, self.attempt) {
                     Observed::Live(written) => self.available = written,
                     Observed::Verified(written) => {
                         self.verified = true;
@@ -402,10 +395,15 @@ impl Tee {
                     Observed::Lost => return Some(Err(self.abort("upstream fill failed"))),
                 }
             }
-            // Verified against a body shorter than the listing declared: the
-            // Content-Length is already promised, so abort rather than pad.
-            if self.verified && self.available < self.size {
-                return Some(Err(self.abort("upstream body was shorter than it declared")));
+            // The verified body is not the length this response promised. Short
+            // is an upstream that under-delivered; long means the two listing
+            // lookups behind this download (the tee's size and the fill's) saw
+            // different metadata across a listing refresh. Either way the
+            // Content-Length is already out, so abort rather than pad or truncate.
+            if self.verified && self.available != self.size {
+                return Some(Err(
+                    self.abort("upstream body was not the length it declared")
+                ));
             }
             let limit = if self.verified {
                 self.size
@@ -460,7 +458,7 @@ impl Tee {
         }
         // The fill task is gone, but its final value is still readable — a tail
         // released just before it exited still counts.
-        match observe(&mut self.rx, self.epoch, self.attempt) {
+        match observe(&mut self.rx, self.attempt) {
             Observed::Verified(written) => {
                 self.verified = true;
                 self.available = written;
@@ -472,6 +470,12 @@ impl Tee {
 
     fn abort(&mut self, why: &str) -> anyhow::Error {
         self.done = true;
+        // The middleware logged a 200 the moment the headers went out, so an
+        // abort here is invisible in the status-code metrics. Count it where an
+        // operator will find it, next to the other proxy artifact failures.
+        self.metrics
+            .proxy_stream_aborts
+            .fetch_add(1, Ordering::Relaxed);
         warn!(
             sent = self.sent,
             size = self.size,
@@ -487,13 +491,9 @@ impl Tee {
     }
 }
 
-fn observe(
-    rx: &mut tokio::sync::watch::Receiver<FillProgress>,
-    epoch: u64,
-    attempt: u32,
-) -> Observed {
+fn observe(rx: &mut tokio::sync::watch::Receiver<FillProgress>, attempt: u32) -> Observed {
     let progress = rx.borrow_and_update();
-    if progress.epoch != epoch || progress.attempt != attempt {
+    if progress.attempt != attempt {
         return Observed::Lost;
     }
     match progress.state {
@@ -515,11 +515,8 @@ enum Peek {
     Gone,
 }
 
-fn peek(rx: &mut tokio::sync::watch::Receiver<FillProgress>, epoch: u64) -> Peek {
+fn peek(rx: &mut tokio::sync::watch::Receiver<FillProgress>) -> Peek {
     let progress = rx.borrow_and_update();
-    if progress.epoch != epoch {
-        return Peek::Wait; // not ours yet: the fill hasn't published
-    }
     match progress.state {
         // Ended before it ever opened a spool — an upstream 404/500, a yank or
         // malware refusal, a name gone private. There is nothing to stream, and
@@ -538,12 +535,9 @@ fn peek(rx: &mut tokio::sync::watch::Receiver<FillProgress>, epoch: u64) -> Peek
 /// Wait for the fill to open a spool, which is also the moment upstream has
 /// answered 200 and every pre-download refusal has had its say. `None` means the
 /// fill ended first, or died — either way, no tee.
-async fn tee_anchor(
-    rx: &mut tokio::sync::watch::Receiver<FillProgress>,
-    epoch: u64,
-) -> Option<TeeAnchor> {
+async fn tee_anchor(rx: &mut tokio::sync::watch::Receiver<FillProgress>) -> Option<TeeAnchor> {
     loop {
-        match peek(rx, epoch) {
+        match peek(rx) {
             Peek::Anchor(anchor) => return Some(anchor),
             Peek::Gone => return None,
             Peek::Wait => {}
@@ -763,12 +757,10 @@ impl Proxy {
     /// Acquire the single-flight slot for an artifact key, waiting if another
     /// task is already downloading it. Held until the returned guard drops.
     async fn acquire_download_slot(&self, key: &str) -> DownloadSlot {
-        let entry = self.slot_entry(key);
-        let guard = entry.lock.lock_owned().await;
+        let guard = self.slot_entry(key).lock_owned().await;
         DownloadSlot {
             inflight: self.inflight.clone(),
             key: key.to_string(),
-            progress: entry.progress,
             _guard: guard,
         }
     }
@@ -780,21 +772,18 @@ impl Proxy {
     /// waiter keeps waiting on the request's own task, where its wait costs
     /// nothing if the client goes away.
     fn try_acquire_download_slot(&self, key: &str) -> Option<DownloadSlot> {
-        let entry = self.slot_entry(key);
-        let guard = entry.lock.try_lock_owned().ok()?;
+        let guard = self.slot_entry(key).try_lock_owned().ok()?;
         Some(DownloadSlot {
             inflight: self.inflight.clone(),
             key: key.to_string(),
-            progress: entry.progress,
             _guard: guard,
         })
     }
 
-    /// The per-key mutex and progress channel, created on first use. Taken under
-    /// the map lock, which [`DownloadSlot::drop`] also holds while it decides
-    /// whether to prune, so a clone taken here is never an entry that is about
-    /// to be dropped.
-    fn slot_entry(&self, key: &str) -> Inflight {
+    /// The per-key mutex, created on first use. Taken under the map lock, which
+    /// [`DownloadSlot::drop`] also holds while it decides whether to prune, so a
+    /// clone taken here is never an entry that is about to be dropped.
+    fn slot_entry(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.inflight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1005,52 +994,76 @@ impl Proxy {
                 (slot, false)
             }
         };
-        let tee_size = if tee_allowed && leader {
-            self.tee_size(state, pkg, filename).await
-        } else {
-            None
+        // Detaching the fill is what stops pip's retries from livelocking, but it
+        // also removed the only thing that used to bound concurrent downloads: a
+        // client hanging up. [`MAX_DETACHED_FILLS`] is that bound. At the ceiling
+        // the fill runs inline below, cancelled by a disconnect exactly as it was
+        // before fills were detached.
+        let detached = DETACHED_FILLS.try_acquire();
+        // A tee needs the fill running *beside* the response, so an inline
+        // overflow fill takes the buffered path — degraded, never wrong.
+        let tee = match (&detached, tee_allowed && leader) {
+            (Ok(_), true) => self.tee_size(state, pkg, filename).await,
+            _ => None,
         };
-        let progress = slot.progress.clone();
-        let epoch = tee_size.map(|_| next_fill_epoch());
-        // The fill itself runs in its own task, holding the slot for its whole
-        // life. A client disconnect (pip's default timeout is ~15s; a large wheel
-        // from a slow upstream is not) drops this handle, which detaches the task
-        // rather than cancelling it — so the download finishes and the retry that
-        // pip issues finds the artifact cached. Cancelling it was a livelock:
-        // every retry restarted from byte zero and none ever completed.
-        //
-        // Awaiting the handle keeps a connected client's semantics identical: the
-        // same `Ok(bool)`, the same errors, in the same order.
-        //
-        // Subscribe before spawning, so no publication can be missed. `subscribe`
-        // starts at the current version, so a stale value left by an earlier fill
-        // on this entry is never mistaken for a change either.
-        let mut rx = progress.subscribe();
-        let fill = tokio::spawn(Arc::clone(self).fill_artifact(
+        // One channel per fill, created here and moved into it. Nothing outlives
+        // the fill that publishes on it, so a tee can never observe the previous
+        // fill's position on this key.
+        let (progress, rx) = match tee {
+            Some(_) => {
+                let (tx, rx) = tokio::sync::watch::channel(FillProgress::default());
+                (Some(Progress { tx }), Some(rx))
+            }
+            None => (None, None),
+        };
+        let fill = Arc::clone(self).fill_artifact(
             Arc::clone(state),
             Arc::clone(storage),
             pkg.to_string(),
             filename.to_string(),
             slot,
-            epoch,
-        ));
-        if let (Some(size), Some(epoch)) = (tee_size, epoch) {
+            progress,
+        );
+        let Ok(permit) = detached else {
+            debug!(
+                %pkg, %filename, max = MAX_DETACHED_FILLS,
+                "proxy: detached-fill ceiling reached; filling inline on the request"
+            );
+            return fill.await.map(|filled| FillOutcome::Done { filled });
+        };
+        // The fill runs in its own task, holding the slot for its whole life. A
+        // client disconnect (pip's default timeout is ~15s; a large wheel from a
+        // slow upstream is not) drops this handle, which detaches the task rather
+        // than cancelling it — so the download finishes and the retry that pip
+        // issues finds the artifact cached. Cancelling it was a livelock: every
+        // retry restarted from byte zero and none ever completed.
+        //
+        // The permit rides with the task, so the ceiling counts fills that are
+        // actually running, not requests that are still connected.
+        //
+        // Awaiting the handle keeps a connected client's semantics identical: the
+        // same `Ok(bool)`, the same errors, in the same order.
+        let fill = tokio::spawn(async move {
+            let _permit = permit;
+            fill.await
+        });
+        if let (Some(size), Some(mut rx)) = (tee, rx) {
             // Hold the response until the fill has an open spool — which is also
             // the moment upstream has answered 200, the origin is claimed mirror,
             // and every pre-download refusal (yank, malware, out of scope, name
             // gone private) has already had its say. Only then is a 200 with a
             // Content-Length honest. Anything else falls back to the buffered
             // path below, which is byte-for-byte today's behavior.
-            if let Some(anchor) = tee_anchor(&mut rx, epoch).await {
+            if let Some(anchor) = tee_anchor(&mut rx).await {
                 match tokio::fs::File::open(anchor.spool.as_path()).await {
                     Ok(file) => {
                         return Ok(FillOutcome::Streaming(Box::new(StreamingFill {
                             size,
-                            epoch,
                             attempt: anchor.attempt,
                             file,
                             rx,
                             fill: Some(fill),
+                            metrics: Arc::clone(&state.metrics),
                         })))
                     }
                     Err(e) => {
@@ -1080,8 +1093,10 @@ impl Proxy {
     }
 
     /// The cold-miss fill: download → verify → commit, holding the single-flight
-    /// `slot` until it returns. Spawned by [`ensure_artifact_cached`], never
-    /// awaited on its own, so every early return here is one the request sees.
+    /// `slot` until it returns. Usually spawned by [`ensure_artifact_cached`],
+    /// which awaits the handle, so every early return here is one the request
+    /// sees; past the detached-fill ceiling it is awaited inline instead.
+    /// `progress` is present only when a tee is following this fill.
     async fn fill_artifact(
         self: Arc<Self>,
         state: Arc<AppState>,
@@ -1089,13 +1104,9 @@ impl Proxy {
         pkg: String,
         filename: String,
         slot: DownloadSlot,
-        epoch: Option<u64>,
+        progress: Option<Progress>,
     ) -> Result<bool> {
         let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
-        let progress = epoch.map(|epoch| Progress {
-            tx: slot.progress.clone(),
-            epoch,
-        });
         let out = self
             .fill_and_commit(
                 &state,
@@ -1292,7 +1303,22 @@ impl Proxy {
         // the last 64 KiB must not wait on an S3 upload — so a commit that later
         // loses a race leaves the cache cold while the client keeps a body that
         // was verified before its first withheld byte moved.
+        //
+        // The one thing a download long enough to stream is long enough to
+        // straddle is a *refusal* arriving mid-flight: a MAL advisory landing in
+        // the feed, an upstream quarantine, an operator freeze. The buffered path
+        // re-gates after the fill returns (serve.rs `advisory_byte_gate`); this
+        // is the teed path's copy, and it makes the teed path at least as strict.
+        // Refusing here aborts the tee mid-body (the tail never exists) and
+        // leaves nothing but the inert sidecar behind.
         if let Some(progress) = progress {
+            if self
+                .release_refused(state, storage, pkg, filename, key)
+                .await?
+            {
+                crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
+                return Ok(false);
+            }
             progress.verified(spool.size);
         }
 
@@ -1367,6 +1393,44 @@ impl Proxy {
         // A fresh fill committed: signal the caller to schedule the peer
         // replication notes off the request's critical path.
         Ok(true)
+    }
+
+    /// The last chance to refuse a teed body, run immediately before the withheld
+    /// tail is released. `true` means abort: the download outlived the decision
+    /// that let it start.
+    ///
+    /// Three refusals can land mid-download, and each is judged the way the byte
+    /// gate judges it: an OSV MAL advisory for this version (armed by
+    /// `--malware-block`), an upstream PEP 792 quarantine of the project
+    /// (enforced whatever the malware toggle says), and a freeze marker on the
+    /// filename. Origin is mirror by definition on this path, so none of them
+    /// needs the byte gate's private-origin read.
+    async fn release_refused(
+        &self,
+        state: &AppState,
+        storage: &dyn Storage,
+        pkg: &str,
+        filename: &str,
+        key: &str,
+    ) -> Result<bool> {
+        let snap = state.advisory_snapshot();
+        if snap.quarantined.contains(pkg) {
+            warn!(%pkg, %filename, "proxy: project quarantined mid-download; aborting the streamed body");
+            return Ok(true);
+        }
+        if state.malware_block {
+            let version = infer_version_from_filename(filename);
+            let ids = snap.blocking(pkg, version.as_deref());
+            if !ids.is_empty() {
+                warn!(%pkg, %filename, advisories = ?ids, "proxy: malware advisory landed mid-download; aborting the streamed body");
+                return Ok(true);
+            }
+        }
+        if state.buckets.is_multi() && storage.head_exists(&frozen_key(key)).await? {
+            warn!(%pkg, %filename, "proxy: filename frozen mid-download; aborting the streamed body");
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// PEP 658 companion for a not-yet-cached wheel, fetched from upstream
@@ -1690,6 +1754,7 @@ impl Proxy {
             progress.started(attempt, spool.path());
         }
         let mut stream = resp.bytes_stream();
+        let mut published = 0u64;
         while let Some(chunk) = stream.next().await {
             spool.write_chunk(&chunk?).await?;
             // Mirror sync::download_once: abort a body that overruns its
@@ -1705,13 +1770,25 @@ impl Proxy {
                     );
                 }
             }
+            // Publish per [`TEE_CHUNK`], not per reqwest chunk: upstream hands us
+            // 8-16 KiB at a time, and flushing on each one is tens of thousands of
+            // blocking-pool round trips on a large wheel for no benefit — the tee
+            // reads in TEE_CHUNK units anyway. The tail is published unconditionally
+            // when the body ends, so nothing is left unannounced.
             if let Some(progress) = progress {
-                // Flush first: `write_chunk` returns once tokio has *queued* the
-                // write, and a tee reading a second handle must never be told
-                // about bytes the OS has not seen yet.
-                spool.flush().await?;
-                progress.wrote(spool.size());
+                if spool.size() - published >= TEE_CHUNK {
+                    // Flush first: `write_chunk` returns once tokio has *queued*
+                    // the write, and a tee reading a second handle must never be
+                    // told about bytes the OS has not seen yet.
+                    spool.flush().await?;
+                    published = spool.size();
+                    progress.wrote(published);
+                }
             }
+        }
+        if let Some(progress) = progress {
+            spool.flush().await?;
+            progress.wrote(spool.size());
         }
         spool.finish().await
     }

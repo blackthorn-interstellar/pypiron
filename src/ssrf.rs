@@ -43,7 +43,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use ipnet::IpNet;
 use reqwest::{Client, Response, Url};
 use url::Host;
@@ -265,14 +265,20 @@ const MAX_REDIRECTS: u32 = 10;
 /// this is called on MUST be built with [`SsrfGuardResolver`] and
 /// `redirect(Policy::none())` — this function owns redirect-following so it can
 /// re-validate each target; auto-follow would let a hop reach a forbidden
-/// literal the resolver never sees. `timeout` bounds each hop.
+/// literal the resolver never sees.
+///
+/// `budget` is a TOTAL, not a per-hop allowance: each hop gets what is left of
+/// it, and the last hop's remainder is also what reqwest allows for reading the
+/// response body. A per-hop timeout would multiply by [`MAX_REDIRECTS`] + 1, so
+/// an artifact fetch's size-derived deadline would bound a hop instead of the
+/// download — eleven times the intended ceiling on a redirect-happy CDN.
 pub(crate) async fn guarded_get(
     client: &Client,
     guard: &Guard,
     url: Url,
-    timeout: Option<Duration>,
+    budget: Option<Duration>,
 ) -> Result<Response> {
-    guarded_get_with(client, guard, url, timeout, |req, _hop| req).await
+    guarded_get_with(client, guard, url, budget, |req, _hop| req).await
 }
 
 /// Like [`guarded_get`], but the caller decorates each per-hop request builder —
@@ -286,20 +292,25 @@ pub(crate) async fn guarded_get_with<F>(
     client: &Client,
     guard: &Guard,
     url: Url,
-    timeout: Option<Duration>,
+    budget: Option<Duration>,
     decorate: F,
 ) -> Result<Response>
 where
     F: Fn(reqwest::RequestBuilder, &Url) -> reqwest::RequestBuilder,
 {
+    let deadline = budget.map(|b| std::time::Instant::now() + b);
     let mut current = url;
     for _ in 0..=MAX_REDIRECTS {
         // Re-validate every hop, including the upstream-host re-exemption (see
         // check_target): a redirect Location is as untrusted as the listing URL.
         guard.check_target(&current)?;
         let mut req = decorate(client.get(current.clone()), &current);
-        if let Some(t) = timeout {
-            req = req.timeout(t);
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                bail!("timed out following redirects fetching '{current}'");
+            }
+            req = req.timeout(left);
         }
         let resp = req.send().await?;
         if !resp.status().is_redirection() {

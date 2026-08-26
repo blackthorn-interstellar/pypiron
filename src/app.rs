@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use axum::{
     body::Body,
     extract::{ConnectInfo, Request, State},
@@ -1019,12 +1019,27 @@ impl counters::KeyVerifier for ArtifactVerifier {
 /// empty value — is `None`: every fill downloads, verifies, and commits before
 /// the first byte goes out. Parsed at startup so a typo refuses to boot instead
 /// of silently disabling itself at the first large download.
+///
+/// A threshold below the withheld tail refuses to boot too: at that size the
+/// whole file is holdback, so "stream it early" would send nothing early while
+/// still taking the streaming path. Fail closed rather than pretend.
 fn parse_stream_threshold(raw: &str) -> Result<Option<u64>> {
     let raw = raw.trim();
     if raw.is_empty() || raw.eq_ignore_ascii_case("off") {
         return Ok(None);
     }
-    sync::parse_size("--proxy-stream-threshold", Some(raw))
+    let parsed = sync::parse_size("--proxy-stream-threshold", Some(raw))?;
+    if let Some(size) = parsed {
+        if size < proxy::TEE_HOLDBACK {
+            bail!(
+                "--proxy-stream-threshold must be at least {} bytes — the tail withheld until \
+                 verification passes — but got {size}. Use 'off' to serve every file the \
+                 buffered way.",
+                proxy::TEE_HOLDBACK,
+            );
+        }
+    }
+    Ok(parsed)
 }
 
 /// Build the download-counter engine from CLI config, failing closed on a bad

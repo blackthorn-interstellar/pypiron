@@ -77,6 +77,17 @@ TRICKLE_MAX_SECS = 90.0
 # unit test `download_deadline_scales_with_the_declared_size`. Test-only fault
 # injection, same family as PYPIRON_FAULT_ABORT_AFTER_WRITES.
 SHORT_GRACE_SECS = 3
+# The process-wide ceiling on fills that keep running after their client is gone
+# (`MAX_DETACHED_FILLS` in proxy.rs). The spray test deliberately overshoots it.
+DETACHED_FILL_CEILING = 32
+SPRAY_FILLS = 40
+# Big enough that the fake upstream's writes really do hit a closed socket once
+# pypiron drops a download: a body small enough to sit in the kernel send buffer
+# would "succeed" against a peer that is already gone.
+SPRAY_PAYLOAD = 512 * 1024
+# How long each sprayed request stays connected — enough for the server to fetch
+# the listing and get the fill going, and well inside the throttled transfer.
+SPRAY_HOLD_SECS = 1.5
 
 
 class _FaultHandler(http.server.BaseHTTPRequestHandler):
@@ -178,8 +189,11 @@ class _FaultHandler(http.server.BaseHTTPRequestHandler):
 
         if mode == "slow":
             # Correct bytes, just throttled: the fill takes seconds, so a client
-            # with a short timeout hangs up in the middle of it.
-            self._send_throttled(full)
+            # with a short timeout hangs up in the middle of it. Whether the body
+            # made it out in full is the observable that separates a fill pypiron
+            # kept running from one it cancelled when its client vanished.
+            if self._send_throttled(full, server.pace.get(pkg, SLOW_TRANSFER_SECS)):
+                server.completed[pkg] = server.completed.get(pkg, 0) + 1
             return
 
         if mode == "trickle":
@@ -197,19 +211,21 @@ class _FaultHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_throttled(self, body: bytes) -> None:
-        """The whole body, paced over SLOW_TRANSFER_SECS."""
+    def _send_throttled(self, body: bytes, over: float) -> bool:
+        """The whole body, paced over `over` seconds. False once the peer hung up
+        before the last chunk — i.e. pypiron dropped this download."""
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         step = max(1, len(body) // SLOW_CHUNKS)
         starts = range(0, len(body), step)
-        pause = SLOW_TRANSFER_SECS / max(1, len(starts))
+        pause = over / max(1, len(starts))
         for start in starts:
             time.sleep(pause)
             if not self._write(body[start : start + step]):
-                return
+                return False
+        return True
 
     def _send_trickle(self, body: bytes) -> None:
         """Advertise the full length, then send one byte per interval and never
@@ -265,6 +281,8 @@ class _FaultServer:
         self.httpd.faults = {}  # type: ignore[attr-defined]
         self.httpd.hits = {}  # type: ignore[attr-defined]
         self.httpd.recover_after = {}  # type: ignore[attr-defined]
+        self.httpd.completed = {}  # type: ignore[attr-defined]
+        self.httpd.pace = {}  # type: ignore[attr-defined]
         self.base = f"http://127.0.0.1:{port}"
         self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self._thread.start()
@@ -281,9 +299,15 @@ class _FaultServer:
         }
         return wheel_path.name
 
-    def set_fault(self, pkg: str, mode: str, *, recover_after: int = 1) -> None:
+    def set_fault(
+        self, pkg: str, mode: str, *, recover_after: int = 1, pace: Optional[float] = None
+    ) -> None:
         self.httpd.faults[pkg] = mode  # type: ignore[attr-defined]
         self.httpd.recover_after[pkg] = recover_after  # type: ignore[attr-defined]
+        if pace is not None:
+            # "slow" only: stretch this package's transfer past the default, for
+            # tests that need to land an event in the middle of a download.
+            self.httpd.pace[pkg] = pace  # type: ignore[attr-defined]
 
     def heal(self, pkg: str) -> None:
         self.httpd.faults[pkg] = "healthy"  # type: ignore[attr-defined]
@@ -292,6 +316,12 @@ class _FaultServer:
         """Artifact GETs this upstream has served for `pkg` — the proof of how
         many times the proxy actually went out for the bytes."""
         return self.httpd.hits.get(pkg, 0)  # type: ignore[attr-defined]
+
+    def completed(self, pkg: str) -> int:
+        """Throttled artifact bodies this upstream wrote out in full. A download
+        pypiron abandoned mid-flight (its client went away and nothing kept it
+        alive) shows up as a hit that never completed."""
+        return self.httpd.completed.get(pkg, 0)  # type: ignore[attr-defined]
 
     def stop(self) -> None:
         self.httpd.shutdown()
@@ -432,6 +462,20 @@ def _get_then_hang_up(url: str, *, timeout: float) -> None:
     finally:
         conn.close()
     raise AssertionError("the throttled fill answered before the client timed out")
+
+
+def _get_then_drop_after(url: str, *, hold: float) -> None:
+    """Start a GET, give the server `hold` seconds to get the fill going, then
+    drop the connection without reading a byte."""
+    parsed = urlparse(url)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=hold + 5.0)
+    try:
+        conn.request("GET", parsed.path)
+        time.sleep(hold)
+    except OSError:
+        pass
+    finally:
+        conn.close()
 
 
 def _wait_for_artifact(proxy: Dict, pkg: str, filename: str, *, timeout: float) -> Path:
@@ -585,6 +629,54 @@ def test_client_disconnect_leaves_a_completed_fill(proxy_over_fault, tmp_path):
     assert hashlib.sha256(body).hexdigest() == sha256_file(wheel)
     assert upstream.hits(pkg) == fetches, "the second request re-downloaded a cached artifact"
     assert elapsed < FAULT_BOUND_SECS, f"serving the cached artifact took {elapsed:.1f}s"
+
+
+def test_detached_fills_are_bounded(proxy_over_fault, tmp_path):
+    """The other half of the disconnect story. A fill that survives its client is
+    a download nothing bounds any more, so one caller could spray distinct large
+    wheels, hang up on every one, and leave the node running all of them at once.
+    Past the ceiling a fill stays on its request instead of detaching, and dies
+    with the client — so the upstream never sees more than the ceiling's worth of
+    bodies run to completion."""
+    proxy, upstream = proxy_over_fault
+    seed = make_wheel("sprayseed", "1.0", tmp_path, payload_bytes=SPRAY_PAYLOAD)
+    data = seed.read_bytes()
+    names = [f"spray{i:03d}" for i in range(SPRAY_FILLS)]
+    for name in names:
+        wheel = tmp_path / f"{name}-1.0-py3-none-any.whl"
+        wheel.write_bytes(data)
+        upstream.register(name, wheel)
+        upstream.set_fault(name, "slow")
+
+    threads = [
+        threading.Thread(
+            target=_get_then_drop_after,
+            args=(f"{proxy['base_url']}/files/{n}/{n}-1.0-py3-none-any.whl",),
+            kwargs={"hold": SPRAY_HOLD_SECS},
+        )
+        for n in names
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=SPRAY_HOLD_SECS + 30)
+
+    # Every request reached upstream; now let the surviving fills run out.
+    deadline = time.monotonic() + FAULT_BOUND_SECS
+    while time.monotonic() < deadline and sum(upstream.hits(n) for n in names) < SPRAY_FILLS:
+        time.sleep(0.2)
+    assert sum(upstream.hits(n) for n in names) == SPRAY_FILLS, "not every spray reached upstream"
+    time.sleep(SLOW_TRANSFER_SECS * 2)
+
+    completed = sum(upstream.completed(n) for n in names)
+    assert completed <= DETACHED_FILL_CEILING, (
+        f"{completed} of {SPRAY_FILLS} abandoned downloads ran to completion; "
+        f"at most {DETACHED_FILL_CEILING} may survive their client"
+    )
+    assert completed >= 1, (
+        "no abandoned download survived at all — the fills are being cancelled, "
+        "which is the livelock this ceiling is not supposed to reintroduce"
+    )
 
 
 def test_trickling_upstream_hits_the_download_deadline(proxy_over_fault_short_deadline, tmp_path):

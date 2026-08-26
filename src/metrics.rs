@@ -141,6 +141,11 @@ pub struct Metrics {
     /// Upstream artifacts downloaded and committed to storage (proxy mode).
     pub proxy_artifacts_cached: AtomicU64,
     pub proxy_artifact_errors: AtomicU64,
+    /// Streamed cold-miss downloads cut off mid-body — the client got a 200 and
+    /// then a short read, because verification failed or a refusal landed during
+    /// the download. The request log shows these as 200s (the status went out
+    /// before the body ran), so this counter is the only place they surface.
+    pub proxy_stream_aborts: AtomicU64,
     /// requests by project attribution tag and route group. A mutex, not
     /// atomics: only requests that carry credentials touch it, and the
     /// critical section is one map bump.
@@ -491,6 +496,11 @@ impl Metrics {
                 "pypiron_proxy_artifact_errors_total",
                 "Upstream artifact fetch or verification failures.",
                 &self.proxy_artifact_errors,
+            ),
+            (
+                "pypiron_proxy_stream_aborts_total",
+                "Streamed cold-miss downloads cut off mid-body after the 200.",
+                &self.proxy_stream_aborts,
             ),
         ] {
             emit_counter(&mut out, name, help, value.load(Ordering::Relaxed));

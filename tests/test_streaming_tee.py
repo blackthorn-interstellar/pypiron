@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import re
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -22,7 +24,15 @@ from urllib.parse import urlparse
 
 import pytest
 
-from .helpers import http_get, make_wheel, origin_owner, run_checked, sha256_file
+from .helpers import (
+    http_get,
+    http_request_auth,
+    make_wheel,
+    origin_owner,
+    run_checked,
+    sha256_file,
+)
+from .test_advisories import _wait_log_contains, make_osv_zip
 from .test_chaos_upstream import (
     FAULT_GET_TIMEOUT,
     SLOW_TRANSFER_SECS,
@@ -39,6 +49,10 @@ LARGE_PAYLOAD = 18 * 1024 * 1024
 # (3 attempts, 2s + 4s backoff) after the client has already been cut off, so
 # "storage is clean" can only be asserted once that has run its course.
 FILL_GIVEUP_SECS = 45.0
+# The mid-download tests need a transfer long enough to land an event inside it:
+# push the feed, wait for the worker to load it, and still have the fill running.
+MID_DOWNLOAD_PACE = 20.0
+MAL_MID_ID = "MAL-2026-90001"
 
 
 @pytest.fixture()
@@ -60,6 +74,48 @@ def proxy_over_fault_no_tee(
         tmp_path,
         extra_env={"PYPIRON_PROXY_STREAM_THRESHOLD": "off"},
     )
+
+
+@pytest.fixture()
+def proxy_over_fault_malware(
+    tmp_path_factory, pypiron_bin: Path, tmp_path: Path
+) -> Iterator[Tuple[Dict, _FaultServer]]:
+    """The chaos harness with malware blocking armed off a seed OSV feed the test
+    can replace at runtime by pushing a new one to `/advisories/feed`."""
+    seed = make_osv_zip(
+        tmp_path / "seed-osv.zip",
+        {"MAL-2026-90000": _mal_record("MAL-2026-90000", "someone-elses-package")},
+    )
+    yield from _proxy_over_fault(
+        tmp_path_factory,
+        pypiron_bin,
+        tmp_path,
+        worker_args=("--malware-block", "true", "--advisory-feed", str(seed)),
+    )
+
+
+def _mal_record(adv_id: str, pkg: str) -> dict:
+    """An OSV MAL advisory condemning every version of `pkg`."""
+    return {
+        "id": adv_id,
+        "summary": f"malicious code in {pkg}",
+        "affected": [
+            {
+                "package": {"ecosystem": "PyPI", "name": pkg},
+                "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}]}],
+            }
+        ],
+    }
+
+
+def _downloads_counted(proxy: Dict) -> int:
+    """`pypiron_downloads_total` — bumped at each delivery exit, so it counts a
+    streamed body only once its verified tail has gone out."""
+    code, body, _ = http_get(f"{proxy['base_url']}/metrics")
+    assert code == 200
+    m = re.search(r"^pypiron_downloads_total (\d+)$", body.decode(), re.MULTILINE)
+    assert m, body.decode()
+    return int(m.group(1))
 
 
 def _big_wheel(pkg: str, tmp_path: Path) -> Path:
@@ -155,10 +211,14 @@ def test_large_cold_miss_streams_while_it_downloads(proxy_over_fault_tee, tmp_pa
     filename = upstream.register(pkg, wheel)
     upstream.set_fault(pkg, "slow")  # the full body, paced over SLOW_TRANSFER_SECS
 
+    counted = _downloads_counted(proxy)
     read, body = _read_incrementally(
         f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT
     )
     assert read.status == 200
+    assert _downloads_counted(proxy) == counted + 1, (
+        "a streamed body that completed was not counted exactly once"
+    )
     assert read.complete, f"streamed body was short: {read.received} of {read.declared}"
     assert hashlib.sha256(body).hexdigest() == sha256_file(wheel)
     # The discriminating assertion, and the one that survives a loaded box: with
@@ -204,6 +264,7 @@ def test_hash_mismatch_never_completes_a_streamed_body(proxy_over_fault_tee, tmp
     filename = upstream.register(pkg, wheel)
     upstream.set_fault(pkg, "corrupt")
 
+    counted = _downloads_counted(proxy)
     read, body = _read_incrementally(
         f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT
     )
@@ -212,6 +273,9 @@ def test_hash_mismatch_never_completes_a_streamed_body(proxy_over_fault_tee, tmp
         f"({read.received} of {read.declared} bytes)"
     )
     assert hashlib.sha256(body).hexdigest() != sha256_file(wheel)
+    # An aborted stream is not a download: the counter is bumped where the tail
+    # is handed over, and no tail was.
+    assert _downloads_counted(proxy) == counted, "an aborted stream was counted as a download"
     _wait_for_clean_storage(proxy, pkg, filename)
 
     # And the failure is not sticky: a healed upstream still caches and serves.
@@ -246,6 +310,59 @@ def test_truncated_upstream_never_completes_a_streamed_body(proxy_over_fault_tee
     )
     assert code == 200
     assert hashlib.sha256(healed).hexdigest() == sha256_file(wheel)
+
+
+def test_advisory_landing_mid_download_aborts_the_stream(proxy_over_fault_malware, tmp_path):
+    """A download big enough to stream is big enough to outlive the decision that
+    let it start. Condemn the version while its bytes are still moving and the
+    body is cut off before the withheld tail — nothing lands in the cache, and
+    the client is left holding an artifact it cannot use."""
+    proxy, upstream = proxy_over_fault_malware
+    pkg = "teelatemal"
+    wheel = _big_wheel(pkg, tmp_path)
+    filename = upstream.register(pkg, wheel)
+    upstream.set_fault(pkg, "slow", pace=MID_DOWNLOAD_PACE)
+
+    result: Dict[str, object] = {}
+
+    def _download() -> None:
+        result["read"], result["body"] = _read_incrementally(
+            f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT
+        )
+
+    reader = threading.Thread(target=_download)
+    reader.start()
+    try:
+        # Let the stream get going, then push a feed that condemns this version.
+        time.sleep(2.0)
+        feed = make_osv_zip(tmp_path / "mal-osv.zip", {MAL_MID_ID: _mal_record(MAL_MID_ID, pkg)})
+        code, _, _ = http_request_auth(
+            "PUT",
+            f"{proxy['base_url']}/advisories/feed",
+            username=proxy["admin_user"],
+            password=proxy["admin_password"],
+            data=feed.read_bytes(),
+            timeout=30.0,
+        )
+        assert code == 204, f"pushing the advisory feed returned {code}"
+        _wait_log_contains(Path(proxy["log_path"]), "advisory snapshot loaded")
+    finally:
+        reader.join(timeout=FAULT_GET_TIMEOUT + MID_DOWNLOAD_PACE)
+    assert not reader.is_alive(), "the streamed download never finished"
+
+    read = result["read"]
+    assert read.status == 200, "the advisory landed after the headers, so this is a 200"
+    assert not read.complete, (
+        "a version condemned mid-download was delivered whole "
+        f"({read.received} of {read.declared} bytes)"
+    )
+    assert hashlib.sha256(result["body"]).hexdigest() != sha256_file(wheel)
+    _wait_for_clean_storage(proxy, pkg, filename)
+
+    # And the refusal is durable: the retry a client would issue is a 403, not a
+    # second chance at the same bytes.
+    code, _, _ = http_get(f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT)
+    assert code == 403, f"a blocked artifact answered {code}"
 
 
 def test_threshold_off_buffers_the_whole_download(proxy_over_fault_no_tee, tmp_path):

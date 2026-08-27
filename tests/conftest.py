@@ -21,6 +21,7 @@ from urllib.parse import quote, unquote, urlencode, urlsplit
 import pytest
 
 from .helpers import (
+    CLIENT_EXCLUDE_NEWER,
     _http_request,
     cmd_exists,
     ensure_built,
@@ -67,6 +68,10 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     config._compat_results = []
+    # Every uv client the suite spawns inherits this (see CLIENT_EXCLUDE_NEWER).
+    # It belongs here, inside the test process, and never on an outer `uv run`:
+    # uv re-resolves when the cutoff changes and rewrites uv.lock.
+    os.environ["UV_EXCLUDE_NEWER"] = CLIENT_EXCLUDE_NEWER
 
 
 def pytest_collection_modifyitems(config, items):

@@ -20,6 +20,13 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 ACCEPT_PEP691 = "application/vnd.pypi.simple.v1+json"
+#: Release-age cutoff for the uv clients this suite drives. `[tool.uv]
+#: exclude-newer` in pyproject.toml holds *project dependency* resolution to a
+#: 14-day cooldown, and uv picks that up by config discovery from the repo root —
+#: which is also the cwd of every `uv pip install` the tests run, whose fixture
+#: wheels are seconds old by construction and were all filtered out. Clients get
+#: this cutoff instead; `uv lock` and `uv sync` keep the cooldown.
+CLIENT_EXCLUDE_NEWER = "2999-12-31"
 CLIENT_PINS = {
     "pip": "venv-seeded",
     "uv": "system",

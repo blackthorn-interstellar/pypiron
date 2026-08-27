@@ -1,0 +1,26 @@
+# actionlint runs shellcheck over every `run:` block, at every severity it has.
+# The four codes below are the ones that fire on this repo's workflows and that
+# we accept; anything else fails the actionlint job in
+# .github/workflows/security.yaml. Scoped per file and per code, so a new
+# shellcheck complaint anywhere else still turns the gate red.
+paths:
+  .github/workflows/ci.yml:
+    ignore:
+      # SC2015 — `command -v python3 && python3 script.py || python script.py`,
+      # the README-rewrite step in the wheel and sdist jobs. shellcheck's point
+      # is fair: if python3 exists but the script itself fails, the fallback runs
+      # it a second time under `python`. Harmless for an idempotent rewrite, and
+      # the alternative is restructuring a release-path step for a style note.
+      - 'shellcheck reported issue in this script: SC2015:'
+
+  .github/workflows/simulation.yml:
+    ignore:
+      # SC2004 — `${SEEDS}` inside `$(( ... ))`, where the braces are redundant.
+      - 'shellcheck reported issue in this script: SC2004:'
+      # SC2016 — a single-quoted step-summary line containing backticks, which is
+      # markdown for the summary, not a command substitution to expand.
+      - 'shellcheck reported issue in this script: SC2016:'
+      # SC2129 — consecutive `echo ... >> "$GITHUB_STEP_SUMMARY"` lines that
+      # shellcheck would rather see wrapped in one `{ ... } >> file` group. The
+      # separate lines carry interleaved comments explaining each one.
+      - 'shellcheck reported issue in this script: SC2129:'

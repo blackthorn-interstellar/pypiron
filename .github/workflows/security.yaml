@@ -1,0 +1,354 @@
+# Free multi-scanner security suite — the coverage a corporate AppSec stack
+# (Snyk, Black Duck, Sonar, GitGuardian, Checkmarx, …) buys, assembled from tools
+# that cost nothing to run here:
+#
+#   SCA     cargo-deny, pip-audit, OSV-Scanner, Trivy
+#   SAST    CodeQL (rust + python + actions), Semgrep community
+#   Secrets gitleaks, TruffleHog (verified only), Trivy secret mode
+#   Supply  zizmor (Actions), actionlint
+#
+# Three deliberate absences. cargo-audit is already a per-PR merge gate in
+# ci.yml (`make audit`), and that target owns the acknowledged-advisory ignore
+# list — so deny.toml configures licenses/bans/sources only and this workflow
+# runs `cargo deny check licenses bans sources`. Two ignore lists over the same
+# advisory DB drift apart, and the one nobody edits is the one that goes stale.
+# OpenSSF Scorecard needs a public repo; Snyk needs an account token.
+#
+# The repo is PRIVATE today, and GitHub Code Scanning — every SARIF upload, plus
+# CodeQL itself — is an Advanced Security feature private repos don't get for
+# free. So every SARIF path is gated on `!github.event.repository.private`, the
+# same pattern ci.yml and docker.yml use for build-provenance attestation, and
+# Trivy and Semgrep gate on plain-text output while private. Nothing here stops
+# gating in the meantime; the reports just live in the job log instead of the
+# Security tab, and the SARIF halves switch themselves on the day the repo goes
+# public.
+#
+# gitleaks note: the MIT-licensed binary is free for everyone, but the official
+# gitleaks-action hard-fails on organization-owned repos without a paid
+# GITLEAKS_LICENSE — so the job below downloads and runs the binary directly.
+# Every job in this file hard-fails on a finding. Nothing is advisory.
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  schedule:
+    # Weekly Monday 09:17 UTC. The repo spaces its crons on purpose: fuzz 03:00
+    # daily, simulation 03:30 daily, weekly 06:00 Monday. This lands clear of all
+    # three so a slow scan never contends with them for runner minutes.
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+
+# Keyed on the event too: a master push and the weekly scheduled run share a
+# ref, so without this a routine push would cancel the scheduled full scan.
+concurrency:
+  group: security-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  # ─── Secrets ───────────────────────────────────────────────────────────
+  gitleaks:
+    name: secrets (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # The scan walks every commit, not just the tip.
+          fetch-depth: 0
+          persist-credentials: false
+      # The binary is MIT and unlicensed-free; gitleaks-action is not (it
+      # demands a paid GITLEAKS_LICENSE on org repos). Pin the release and
+      # verify its digest — this runs with the repo checked out.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: '8.30.1'
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar xzf gitleaks.tar.gz gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      # Rules and allowlist come from the repo's .gitleaks.toml. `git` is the
+      # current spelling; `detect` still works but is hidden and deprecated in 8.x.
+      - name: Scan full history
+        shell: bash
+        run: |
+          set -euo pipefail
+          gitleaks git . --redact -v
+
+  trufflehog:
+    name: secrets (trufflehog)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: trufflesecurity/trufflehog@27b0417c16317ca9a472a9a8092acce143b49c55 # v3.95.9
+        with:
+          # Verified findings only — unverified is mostly noise for this purpose.
+          #
+          # The detection engine floats by choice, not by accident: the action
+          # takes a `version:` input defaulting to latest and we deliberately
+          # don't pass it, same rationale as semgrep's --config auto below. This
+          # suite previews what a corporate scanner running today's detectors
+          # would find, so a new-detector red is triage signal. Pass `version:`
+          # if determinism ever needs to win over freshness.
+          #
+          # lob is excluded because its detector regex matches long snake_case
+          # identifiers — this repo's pytest names are full of them — and Lob's
+          # API "verifies" the garbage. pypiron will never hold a Lob (postal
+          # mail API) key.
+          extra_args: --only-verified --exclude-detectors=lob
+
+  # ─── SCA: known CVEs and license/source hygiene in dependencies ────────
+  cargo-deny:
+    name: sca (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          # advisories omitted on purpose — ci.yml's `make audit` owns them.
+          command: check
+          arguments: --all-features
+          command-arguments: licenses bans sources
+
+  pip-audit:
+    name: sca (pip-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          enable-cache: false
+      # The Python side of this repo is the blackbox test suite and dev/scripts —
+      # nothing ships to users — but a compromised test dependency runs with the
+      # same rights as everything else in CI. Audit the resolved env rather than
+      # a requirements file: pip-audit's venv resolver fights uv-managed Pythons
+      # that ship without ensurepip. `uv sync` is what ci.yml runs, so this
+      # audits exactly the closure the suite installs.
+      - name: Sync env + audit installed packages
+        run: |
+          uv sync
+          uv run --with pip-audit pip-audit --local --progress-spinner off
+
+  osv:
+    name: sca (osv-scanner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Scan lockfiles
+        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+        with:
+          # Cargo.lock, fuzz/Cargo.lock, and uv.lock. v2 dropped --skip-git and
+          # already excludes .git by default.
+          scan-args: |-
+            --recursive
+            ./
+      # osv-scanner-action fails the step on vulns; surfacing them is enough
+
+  trivy:
+    name: sca+secrets+misconfig (trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      # Two spellings of one scan. While the repo is private there is nowhere to
+      # upload SARIF, so the table variant gates with the findings printed in the
+      # job log. The SARIF variant takes over automatically once the repo is
+      # public. Either way `exit-code: 1` is what fails the job.
+      - name: Trivy filesystem scan (table)
+        if: ${{ github.event.repository.private }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          # vuln + secret + misconfig covers SCA, secrets, and the Dockerfile
+          scanners: vuln,secret,misconfig
+          format: table
+          exit-code: '1'
+          skip-dirs: target,.git,.local,fuzz/corpus,fuzz/seeds,fuzz/artifacts
+      # One scan, not two: trivy writes the SARIF and then applies exit-code, so
+      # a single invocation both fails the job and leaves a report to upload.
+      - name: Trivy filesystem scan (SARIF)
+        if: ${{ !github.event.repository.private }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy.sarif
+          exit-code: '1'
+          skip-dirs: target,.git,.local,fuzz/corpus,fuzz/seeds,fuzz/artifacts
+      # always(): the scan above fails the job on findings, and those are
+      # exactly the runs whose SARIF Code Scanning needs.
+      - name: Upload Trivy SARIF
+        if: ${{ always() && !github.event.repository.private && hashFiles('trivy.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+  # ─── SAST ──────────────────────────────────────────────────────────────
+  codeql:
+    name: sast (codeql ${{ matrix.language }})
+    # CodeQL is free on public repos and an Advanced Security feature on private
+    # ones. The whole job — not just its upload — waits for the repo to go public.
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # actions catches workflow injection patterns; python covers the
+        # blackbox suite and dev/scripts.
+        language: [rust, python, actions]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          languages: ${{ matrix.language }}
+          # security-extended catches more of what commercial SAST reports
+          queries: security-extended
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+      - name: Analyze
+        uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          category: '/language:${{ matrix.language }}'
+
+  semgrep:
+    name: sast (semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: semgrep/semgrep:1.172.0@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      # --config auto resolves against Semgrep's registry at run time, so this
+      # job is deliberately not hermetic: it previews what a corporate scanner
+      # running today's rules would flag. A new upstream rule turning this red
+      # on an unchanged tree is signal to triage, not flake to retry away.
+      # --error is what fails the job in both variants.
+      - name: Semgrep community rules (text)
+        if: ${{ github.event.repository.private }}
+        run: |
+          semgrep scan \
+            --config auto \
+            --error \
+            --exclude='target/**' \
+            --exclude='.local/**' \
+            --exclude='fuzz/corpus/**' \
+            --exclude='fuzz/seeds/**' \
+            --exclude='fuzz/artifacts/**' \
+            .
+      - name: Semgrep community rules (SARIF)
+        if: ${{ !github.event.repository.private }}
+        run: |
+          semgrep scan \
+            --config auto \
+            --sarif \
+            --output semgrep.sarif \
+            --error \
+            --exclude='target/**' \
+            --exclude='.local/**' \
+            --exclude='fuzz/corpus/**' \
+            --exclude='fuzz/seeds/**' \
+            --exclude='fuzz/artifacts/**' \
+            .
+      - name: Upload Semgrep SARIF
+        if: ${{ always() && !github.event.repository.private && hashFiles('semgrep.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # ─── Supply chain / Actions hygiene ────────────────────────────────────
+  zizmor:
+    name: actions (zizmor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          enable-cache: false
+      # A real gate: zizmor exits non-zero on findings, so no second pass is
+      # needed. Deliberate exceptions live in .github/zizmor.yml. Scan all of
+      # .github/ rather than just workflows/ so dependabot.yml is covered too.
+      # No SARIF here — plain output in the job log gates the same either way,
+      # and it costs nothing while the repo is private.
+      - name: Audit workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          uvx zizmor==1.29.0 --format plain .github/ \
+            | tee "$GITHUB_STEP_SUMMARY"
+
+  actionlint:
+    name: actions (actionlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+        with:
+          args: -color

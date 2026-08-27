@@ -1,0 +1,45 @@
+# Findings we accept deliberately. Everything else fails the zizmor job in
+# .github/workflows/security.yaml, so keep this list short and justified.
+#
+# These are scoped to whole files rather than pinned to a line, which is the
+# looser of the two options zizmor offers. A `file.yml:NNN` pin is worth it when
+# it fails closed — when a NEW step doing the same dangerous thing should still
+# turn the gate red. None of the three entries below is that shape: each is a
+# property of the file as a whole, and ci.yml and docker.yml are the two
+# workflows here that change most, so a line pin would drift off its target
+# within weeks. zizmor does not warn that an ignore went stale; a pin that stops
+# matching just lets the original finding back in unannounced.
+rules:
+  cache-poisoning:
+    # ci.yml and docker.yml both trigger on `push: tags: ['v*']`, and that is
+    # what makes zizmor treat every caching step in them as a cache restored
+    # during a publishing run. The finding is about the trigger, not the step:
+    # every Swatinem/rust-cache and setup-uv in those files is flagged, and any
+    # new one would be too, so a line pin buys nothing.
+    #
+    # zizmor's own auto-fix is `lookup-only: true` on rust-cache, which hardens
+    # nothing and costs plenty: it stops restoring the cache on ordinary PR runs
+    # as well, turning warm jobs into full cold builds across the whole matrix.
+    # Making the cache trigger-aware — cache on PRs, cold-build on tags — is the
+    # real fix and deserves its own change. Deferred, not rejected.
+    ignore:
+      - ci.yml
+      - docker.yml
+
+  template-injection:
+    # Every flagged expansion in docker.yml is a value the workflow itself owns:
+    # `env.REGISTRY` (the literal `ghcr.io`), `env.IMAGE_NAME` (which is
+    # `github.repository`), and docker/metadata-action's own `version` and
+    # `digest` outputs. Nothing a pull-request author can write reaches them.
+    ignore:
+      - docker.yml
+
+  excessive-permissions:
+    # docker.yml carries no workflow-level `permissions:` block, so its `setup`
+    # job — which does nothing but echo a build matrix — inherits the repository
+    # default token instead of no token at all. Correcting that means auditing
+    # the grants of a publish workflow whose other two jobs push to GHCR and sign
+    # provenance attestations, and getting those wrong breaks releases quietly.
+    # It belongs in its own reviewed change. Deferred, not rejected.
+    ignore:
+      - docker.yml

@@ -1,0 +1,21 @@
+# gitleaks config. Auto-loaded from the scan root by the secrets job in
+# .github/workflows/security.yaml, which walks the full git history.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documented placeholder credentials"
+# The manual teaches auth with `curl -u admin:secret` (and once `reader:secret`)
+# against a local dev server — `make run` starts exactly that pair. The default
+# curl-auth-user rule flags every one of those 31 lines across README.md and
+# docs/. Allowlisting the two literals rather than the rule or the docs/ tree is
+# the narrow fix: any OTHER credential that ever appears after `curl -u`, in docs
+# or anywhere else, still fails the scan.
+regexes = [
+  '''^admin:secret$''',
+  '''^reader:secret$''',
+]
+
+# Deliberately NOT allowlisted: generated trees (target/, .local/) and the fuzz
+# corpus. They are gitignored or tracked-on-purpose, and history — which is what
+# this scan walks — never held the generated ones anyway.

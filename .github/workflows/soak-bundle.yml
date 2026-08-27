@@ -24,7 +24,7 @@ jobs:
     if: vars.SOAK_S3_BUCKET != ''
     runs-on: ubuntu-24.04-arm # native arm64 → aarch64 binary, no cross-compile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with: { persist-credentials: false }
       # In the fleet's own AMI image, not the runner's userland: this runner is
       # glibc 2.39, Amazon Linux 2023 is 2.34, and a binary linked against the
@@ -44,11 +44,16 @@ jobs:
              dev/ops/soak/pypiron-soak@.service dev/ops/soak/pypiron-soak-reporter.service \
              dev/ops/soak/pypiron-soak-refresh.service dev/ops/soak/pypiron-soak-refresh.timer stage/
           tar czf bundle.tar.gz -C stage .
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: ${{ vars.SOAK_AWS_ROLE }}
           aws-region: ${{ vars.SOAK_AWS_REGION || 'us-east-1' }}
+      # Through the environment, not through template expansion: a repo variable
+      # interpolated straight into a shell line is a code-injection shape, and
+      # zizmor flags it as one.
       - name: Upload bundle
+        env:
+          BUCKET: ${{ vars.SOAK_S3_BUCKET }}
+          KEY: ${{ vars.SOAK_BUNDLE_KEY || 'soak/bundle.tar.gz' }}
         run: |
-          aws s3 cp bundle.tar.gz \
-            "s3://${{ vars.SOAK_S3_BUCKET }}/${{ vars.SOAK_BUNDLE_KEY || 'soak/bundle.tar.gz' }}"
+          aws s3 cp bundle.tar.gz "s3://${BUCKET}/${KEY}"

@@ -1,0 +1,51 @@
+# cargo-deny: license allowlist, dependency bans, and source hygiene.
+# Run locally: `cargo deny check licenses bans sources`.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+#
+# Advisories are deliberately NOT checked here. `make audit` (cargo-audit) owns
+# them and carries the acknowledged-advisory ignore list with its justification;
+# it runs on every PR via ci.yml. Two ignore lists for the same advisory DB drift
+# apart, and the one nobody edits is the one that goes stale. So
+# .github/workflows/security.yaml invokes `check licenses bans sources` only.
+
+[graph]
+all-features = true
+
+[licenses]
+confidence-threshold = 0.8
+# Permissive-only allowlist. Unused entries stay as future headroom, not noise.
+unused-allowed-license = "allow"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "OpenSSL",
+    "NCSA",
+    "BSL-1.0",
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+# Duplicate versions are a fact of any real dependency tree; surface them
+# without failing the build.
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

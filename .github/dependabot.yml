@@ -1,0 +1,29 @@
+# Python deps are deliberately absent here. They are test-suite-only — pytest,
+# twine, ruff and friends, none of which ship to a user — and they are already
+# watched by pip-audit in .github/workflows/security.yaml. A "uv"/"pip" ecosystem
+# would open PRs against uv.lock for dependencies no released artifact contains.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    # A freshly published crate is where a supply-chain compromise is caught, so
+    # wait a month before proposing it. One grouped PR a month, not a stream.
+    cooldown:
+      default-days: 30
+    groups:
+      all-cargo:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 30
+    groups:
+      all-actions:
+        patterns:
+          - "*"

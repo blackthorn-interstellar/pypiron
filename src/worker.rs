@@ -1213,7 +1213,7 @@ pub async fn audit(
     let generation = pinned.generation;
     let started = Instant::now();
     let mut live: Vec<String> = Vec::new();
-    let mut dead: Vec<String> = Vec::new();
+    let mut dead: Vec<(String, Option<String>)> = Vec::new();
     let mut failures = 0usize;
     let mut rebuilt = 0usize;
     let mut skipped = 0usize;
@@ -1296,10 +1296,17 @@ pub async fn audit(
 
     live.sort();
     live.dedup();
-    // Delta + CAS, not a blind overwrite: a package born mid-audit (its name
-    // added by the tick) must not be clobbered by our older observation.
+    // Delta + CAS protects a package born mid-audit from a blind overwrite, but
+    // not from `dead`: a dead entry is an explicit remove pinned to an
+    // observation that can be minutes old by the time the walk completes. An
+    // upload racing the walk reads as an artifactless dir (its origin claim
+    // lands before its artifact), the tick then lists the finished publish, and
+    // the walk's stale remove would durably delist it until the next audit — a
+    // reconcile interval away. Re-prove every dead observation before acting on
+    // it; dead names are churn-rare, so this costs two listings apiece.
+    let removes = reverify_dead_observations(storage, dead).await;
     require_generation(state, generation)?;
-    update_global_index(state, storage, &live, &dead).await?;
+    update_global_index(state, storage, &live, &removes).await?;
     if failures > 0 {
         return Err(anyhow!("audit finished with {failures} failure(s)"));
     }
@@ -1724,8 +1731,11 @@ async fn append_chain_link(
 
 struct ShardAudit {
     live: Vec<String>,
-    /// Observed with no artifacts: must not be listed globally.
-    dead: Vec<String>,
+    /// Observed with no live view: must not be listed globally. Each name
+    /// carries the fingerprint its observation is pinned to (`None` when it
+    /// could not be derived), so the sweep tail can prove the observation is
+    /// still current before turning it into a remove.
+    dead: Vec<(String, Option<String>)>,
     rebuilt: usize,
     /// Provably unchanged (fingerprint hit): zero reads spent.
     skipped: usize,
@@ -2093,8 +2103,8 @@ async fn audit_shard(
         });
         for (pkg, fp, live_now, was_rebuilt, failed, delta) in futures::future::join_all(jobs).await
         {
-            if let Some(fp) = fp {
-                fresh.insert(pkg.clone(), fp);
+            if let Some(fp) = &fp {
+                fresh.insert(pkg.clone(), fp.clone());
             }
             if let Some(shas) = delta {
                 out.deltas.push((pkg.clone(), shas));
@@ -2102,7 +2112,7 @@ async fn audit_shard(
             if live_now || failed {
                 out.live.push(pkg);
             } else {
-                out.dead.push(pkg);
+                out.dead.push((pkg, fp));
             }
             out.rebuilt += was_rebuilt as usize;
             out.skipped += (!was_rebuilt && !failed) as usize;
@@ -2273,6 +2283,31 @@ async fn package_fingerprint(storage: &dyn Storage, pkg: &str) -> Result<String>
         &truth.iter().collect::<Vec<_>>(),
         &views.iter().collect::<Vec<_>>(),
     ))
+}
+
+/// Re-prove each dead observation the audit walk collected before it becomes a
+/// global-index remove. An observation whose fingerprint still matches truth is
+/// current and removes; one that moved — or cannot be re-read — is handed back
+/// to the marker path instead: the tick re-derives liveness from fresh truth, so
+/// a mid-audit publish stays listed and a genuinely dead package is removed one
+/// tick later. Never removes on an unprovable observation.
+async fn reverify_dead_observations(
+    storage: &dyn Storage,
+    dead: Vec<(String, Option<String>)>,
+) -> Vec<String> {
+    let mut removes = Vec::with_capacity(dead.len());
+    for (pkg, observed) in dead {
+        let current = package_fingerprint(storage, &pkg).await;
+        match (observed, current) {
+            (Some(observed), Ok(current)) if observed == current => removes.push(pkg),
+            _ => {
+                if let Err(e) = mark_dirty(storage, &pkg).await {
+                    error!(package=%pkg, error=?e, "audit: could not re-arm a moved dead observation; left for the next audit");
+                }
+            }
+        }
+    }
+    removes
 }
 
 /// Publish the tally of crashed-writer intents healed during a drain. Shared by
@@ -4293,6 +4328,70 @@ mod tests {
         );
     }
 
+    /// The audit walk observed a package artifactless (an upload's origin claim
+    /// lands before its artifact), the publish finished, and the tick listed it.
+    /// The walk's stale remove must not be applied — the name goes back to the
+    /// marker path instead (the CI scale run lost `scaletest-0002` this way for
+    /// a full reconcile interval).
+    #[tokio::test]
+    async fn a_moved_dead_observation_is_rearmed_not_removed() {
+        let storage = Arc::new(InMemStorage::default());
+        storage.insert(&format!("{PACKAGES_PREFIX}pkg/.origin"), b"{}".to_vec());
+        let observed = package_fingerprint(storage.as_ref(), "pkg").await.unwrap();
+        // The publish completes between the observation and the sweep tail.
+        storage.insert(
+            &format!("{PACKAGES_PREFIX}pkg/pkg-1.0-py3-none-any.whl"),
+            vec![0u8; 4],
+        );
+
+        let removes =
+            reverify_dead_observations(storage.as_ref(), vec![("pkg".to_string(), Some(observed))])
+                .await;
+
+        assert!(
+            removes.is_empty(),
+            "a moved dead observation must not become a global remove"
+        );
+        assert!(
+            !storage
+                .list_dir_entries(DIRTY_PREFIX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the moved name must be handed back to the marker path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_current_dead_observation_still_removes() {
+        let storage = Arc::new(InMemStorage::default());
+        storage.insert(&format!("{PACKAGES_PREFIX}pkg/.origin"), b"{}".to_vec());
+        let observed = package_fingerprint(storage.as_ref(), "pkg").await.unwrap();
+
+        let removes =
+            reverify_dead_observations(storage.as_ref(), vec![("pkg".to_string(), Some(observed))])
+                .await;
+
+        assert_eq!(removes, vec!["pkg".to_string()]);
+        assert!(
+            storage
+                .list_dir_entries(DIRTY_PREFIX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a current observation needs no marker re-arm"
+        );
+    }
+
+    /// No fingerprint means no proof: never remove, re-arm instead.
+    #[tokio::test]
+    async fn an_unprovable_dead_observation_never_removes() {
+        let storage = Arc::new(InMemStorage::default());
+        let removes =
+            reverify_dead_observations(storage.as_ref(), vec![("pkg".to_string(), None)]).await;
+        assert!(removes.is_empty());
+    }
+
     #[tokio::test]
     async fn leader_tick_stays_on_the_lease_matched_pin_after_a_switch() {
         let first = Arc::new(InMemStorage::default());
@@ -4403,7 +4502,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(audit.live, Vec::<String>::new());
-        assert_eq!(audit.dead, vec![pkg.to_string()]);
+        let dead: Vec<&str> = audit.dead.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(dead, vec![pkg]);
         assert_eq!(audit.skipped, 1);
     }
 

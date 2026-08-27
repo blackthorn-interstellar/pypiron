@@ -380,6 +380,12 @@ jobs:
           check poison    "a poisoned derivation consumed the signal" --nodes 2 --buckets 1 --ops 80
           check blind     "were all consumed blind"    --nodes 2 --buckets 1 --ops 80
           check race      "unleased concurrent rebuild" --nodes 2 --buckets 1 --ops 80 --fail-percent 0
+          # Same plant as `race`, judged at the global index: the staler write
+          # DELISTED a name the fresher write listed. The product forbids that
+          # direction (the audit re-proves dead observations inside the locked
+          # CAS attempt), so it is class 2 — a violation under fault injection,
+          # hence no --fail-percent 0 here.
+          check stale-delist "stale delist:"           --nodes 2 --buckets 1 --ops 80
           check fallback  "unexplained drift"          --nodes 2 --buckets 1 --ops 80
           # The partition oracles — one leg per invariant BRANCH, not per
           # oracle: freeze justification and freeze totality are two different

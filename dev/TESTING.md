@@ -1218,7 +1218,17 @@ from the run's recorded effect history — no replays — into one of three caus
    inconsistent with the truth it listed.
 3. **concurrent-race** — an unleased concurrent rebuild overwrote a fresher one
    (`concurrent_rebuild_without_lease_diverges`, tests/model_event_protocol.rs),
-   the one case for which the audit is the *documented* backstop.
+   the one case for which the audit is the *documented* backstop. One direction
+   is carved out and held to class 2: a stale **global-index** write that
+   *delisted* a name the fresher clobbered write listed. The product forbids it —
+   the audit's dead observations are re-proved against fresh truth inside the
+   global update's locked CAS attempt (`update_global_index_verified`,
+   src/worker.rs) — after the CI scale suite caught a boot audit's walk-stale
+   remove delisting a freshly published package for a full reconcile interval
+   (a day at the production default). The add direction (a stale write
+   re-listing a name a fresher write removed) stays class 3: live observations
+   are unverified by design, and its harm is a ghost listing, not a vanished
+   publish.
 
 The taxonomy is applied by **two** analyses, because a repaired view key can
 belong to either of two subsystems. A `simple/<pkg>/index.*` diff is explained
@@ -1324,6 +1334,7 @@ storage and never the schedule.
 | `poison` | a rebuild listed truth *past* the mutation and still wrote a view — and a name set — contradicting it | `… a poisoned derivation consumed the signal` (class 2a) | 3 |
 | `blind` | the only op that retired the marker covering the mutation had listed truth before it | `… were all consumed blind` (class 2b) | 3 |
 | `race` | two unleased rebuilds: the one that listed *earlier* wrote *last* | `… unleased concurrent rebuild` (class 3; needs `--fail-percent 0`, where any audit repair is a violation) | 5 |
+| `stale-delist` | the identical plant, judged at the global index: the staler write *delisted* the name the fresher write listed | `… stale delist:` (class 2, global path — the verified-removes guard makes the product side impossible) | 3 |
 | `fallback` | an audit repair the effect history cannot explain at all | `… unexplained drift` (fallback arm) | 3 |
 | `freeze-unjustified` | a `.frozen` marker over an acked-**deleted** filename — nothing ever conflicted about it, and the body and view entry are already gone, so no other oracle can see it | `FREEZE_UNJUSTIFIED:` | 3 |
 | `freeze-lossy` | a freeze that dropped a body it never quarantined: `.frozen` fleet-wide, one byte-set preserved under `_quarantine/`, the *acked* one overwritten everywhere | `CONSERVATION: … a frozen filename may not lose one` | 4 |

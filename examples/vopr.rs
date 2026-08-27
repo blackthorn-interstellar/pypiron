@@ -215,6 +215,13 @@ enum Break {
     Poison,
     Blind,
     Race,
+    /// The same two racing rebuild sessions as `race`, judged at the global
+    /// index, where the staler write DELISTED a name the fresher write listed.
+    /// The product forbids exactly this direction (`update_global_index_verified`
+    /// re-proves every dead observation inside the locked CAS attempt), so the
+    /// classifier holds it to class 2 — the kill proof for that arm. Plants the
+    /// identical history as `race`; only the expected verdict differs.
+    StaleDelist,
     Fallback,
     /// Freeze a filename nothing ever conflicted over → FREEZE_JUSTIFIED.
     FreezeUnjustified,
@@ -248,7 +255,7 @@ const BREAK_PKG: &str = "vopr-phantom";
 /// reproduce line all read this table: a second list that quietly fails to
 /// track the first is exactly how the reproduce line came to describe a
 /// different run than the one that failed.
-const BREAKS: [(&str, Break); 23] = [
+const BREAKS: [(&str, Break); 24] = [
     ("view", Break::View),
     ("fanout", Break::Fanout),
     ("rerun", Break::Rerun),
@@ -264,6 +271,7 @@ const BREAKS: [(&str, Break); 23] = [
     ("poison", Break::Poison),
     ("blind", Break::Blind),
     ("race", Break::Race),
+    ("stale-delist", Break::StaleDelist),
     ("fallback", Break::Fallback),
     ("freeze-unjustified", Break::FreezeUnjustified),
     ("split", Break::Split),
@@ -437,7 +445,10 @@ async fn apply_break(
         // it for warm-bucket audit writes. Read these as mutation tests of the
         // classifier's predicates, NOT as evidence the product can produce the
         // interleaving (dev/TESTING.md draws that line).
-        (Break::Poison | Break::Blind | Break::Race | Break::Fallback, true) => {
+        (
+            Break::Poison | Break::Blind | Break::Race | Break::StaleDelist | Break::Fallback,
+            true,
+        ) => {
             let Some((pkg, clone)) = clone_live_record(&buckets[0], true) else {
                 return;
             };
@@ -486,8 +497,12 @@ async fn apply_break(
                 // mutation, G after; G published first, F clobbered it last.
                 // Marker a is consumed blind by F and marker b sighted by G, so
                 // TEST 1 (a breadcrumb existed) and TEST 2b (not every consumer
-                // was blind) both decline it first.
-                Break::Race => {
+                // was blind) both decline it first. The identical plant serves
+                // `stale-delist`: F's global write delists the name G's fresher
+                // write listed, which the global analyzer holds to class 2 (the
+                // product's verified removes forbid it) while the per-package
+                // side stays the class-3 race.
+                Break::Race | Break::StaleDelist => {
                     plant(EffectKind::MarkerPut, f, &mark_a);
                     plant(EffectKind::MarkerPut, g, &mark_b);
                     plant(EffectKind::TruthList, f, &list);
@@ -1175,6 +1190,7 @@ enum R {
     GlobalPoisoned,
     GlobalBlind,
     GlobalRace,
+    GlobalStaleDelist,
     GlobalFallback,
     MergeDivergence,
     FreezeJustified,
@@ -1183,7 +1199,7 @@ enum R {
     UntypedDisappearance,
 }
 
-const REACH_SLOTS: usize = 24;
+const REACH_SLOTS: usize = 25;
 
 /// `(label, what exactly one execution counts)` — in `R`'s declaration order.
 const REACH_METER: [(&str, &str); REACH_SLOTS] = [
@@ -1253,6 +1269,10 @@ const REACH_METER: [(&str, &str); REACH_SLOTS] = [
         "classifier/global TEST 3 race",
         "older global write by another op tested for being fresher",
     ),
+    (
+        "classifier/global TEST 3b delist",
+        "stale-clobbering write tested for delisting a fresher-listed name",
+    ),
     ("classifier/global FALLBACK", "flip no test above explained"),
     (
         "MERGE_DIVERGENCE",
@@ -1277,7 +1297,7 @@ const REACH_METER: [(&str, &str); REACH_SLOTS] = [
 /// order — the only join between "this oracle ran" and "this oracle went red",
 /// because violations are plain strings that name themselves and nothing else.
 /// Empty where a slot owns no violation string: MERGE_DIVERGENCE is a statistic,
-/// and the ten classifier slots are tests inside one oracle whose verdicts
+/// and the eleven classifier slots are tests inside one oracle whose verdicts
 /// surface as `AUDIT_*` strings that name a class, not a test. DETERMINISM is
 /// decided in `main` and pushes its string there, on the traced seed only, on
 /// its way out. Read by `--trace-jsonl` only.
@@ -1302,6 +1322,7 @@ const REACH_VIOLATION_PREFIX: [&str; REACH_SLOTS] = [
     "",
     "",
     "",
+    "",
     // The oracle is FREEZE_JUSTIFIED; the string it pushes is the negation.
     "FREEZE_UNJUSTIFIED",
     "ORIGIN_TERMINALITY",
@@ -1313,7 +1334,7 @@ const REACH_VIOLATION_PREFIX: [&str; REACH_SLOTS] = [
 /// `--require-reach` skips exactly these; every other oracle must execute. An
 /// entry here is a claim someone has to defend in dev/TESTING.md — and if one
 /// starts executing, the meter says so and the entry comes out.
-const EXPECTED_ZERO: [(usize, &str); 10] = [
+const EXPECTED_ZERO: [(usize, &str); 11] = [
     (
         R::PkgOrdering as usize,
         "workload-unreachable: no rule forbids it; --partition drew one (seed 268); `--break ordering` kills it",
@@ -1349,6 +1370,10 @@ const EXPECTED_ZERO: [(usize, &str); 10] = [
     (
         R::GlobalRace as usize,
         "harness-unreachable: tick_lock models a lease STRONGER than production ships; `--break race` kills it (dev/TESTING.md)",
+    ),
+    (
+        R::GlobalStaleDelist as usize,
+        "harness-unreachable like GlobalRace, and the product forbids the shape besides (verified removes); `--break stale-delist` kills it",
     ),
     (
         R::GlobalFallback as usize,
@@ -1892,6 +1917,13 @@ fn report_merge(explored: u64) {
 //     concurrent-rebuild divergence (tests/model_event_protocol.rs,
 //     `concurrent_rebuild_without_lease_diverges`). The audit is its
 //     designed backstop; reported as a statistic, never a violation.
+//     EXCEPT one direction at the global index: a stale write that DELISTS a
+//     name the fresher clobbered write listed is class 2, because the product
+//     rules it out — `update_global_index_verified` re-proves every dead
+//     observation inside the locked CAS attempt before applying its remove
+//     (the CI scale run lost a freshly published package for a reconcile
+//     interval — a day — when the boot audit's walk-stale remove landed after
+//     the tick's add).
 //
 //     This is the ONE outcome dev/DESIGN.md budgets for by name ("a brief
 //     dual-leader window costs at worst duplicate work plus an audit-healed
@@ -5319,21 +5351,44 @@ fn analyze_global(live: &[&Effect], boundary: u64, bucket: usize, name: &str) ->
     // TEST 3 — CONCURRENT-RACE: the surviving global write derived this name
     // from strictly older truth than an earlier write it overwrote — the same
     // unleased-rebuild clobber the audit backs up, one level up in the tree.
+    // One direction of it is held to a harder standard: a stale write that
+    // DELISTED a name the fresher clobbered write listed. The product forbids
+    // exactly that (`update_global_index_verified` re-proves every dead
+    // observation inside the locked CAS attempt, and the CAS covers a peer's
+    // concurrent add), so it is class 2 — the CI scale run lost a freshly
+    // published package for a full reconcile interval this way. The add
+    // direction (a stale write re-listing a name a fresher write removed)
+    // stays the class-3 statistic: live observations are unverified by design,
+    // and its harm is a ghost listing, not a vanished publish.
+    let mut race: Option<(u64, u64, u64)> = None;
     for (g, l_g) in &derivations {
         if g.seq < v_f && g.att != att_f {
             REACH.hit(R::GlobalRace);
             if l_f.is_none_or(|lf| *l_g > lf) {
-                return finding(
-                    3,
-                    format!(
-                        "unleased concurrent rebuild: global write@{v_f} (op {att_f}, derived {name} from truth@{}, claimed {claimed}) overwrote fresher global write@{} (op {}, derived @{l_g})",
-                        opt(l_f),
-                        g.seq,
-                        g.att
-                    ),
-                );
+                if claimed == "absent" && g.names.iter().any(|n| n == name) {
+                    REACH.hit(R::GlobalStaleDelist);
+                    return finding(
+                        2,
+                        format!(
+                            "stale delist: global write@{v_f} (op {att_f}, derived {name} from truth@{}, claimed absent) clobbered fresher global write@{} (op {}, derived @{l_g}) that listed it — a dead observation was applied without re-proof, which update_global_index_verified must make impossible",
+                            opt(l_f),
+                            g.seq,
+                            g.att
+                        ),
+                    );
+                }
+                race.get_or_insert((g.seq, g.att, *l_g));
             }
         }
+    }
+    if let Some((g_seq, g_att, l_g)) = race {
+        return finding(
+            3,
+            format!(
+                "unleased concurrent rebuild: global write@{v_f} (op {att_f}, derived {name} from truth@{}, claimed {claimed}) overwrote fresher global write@{g_seq} (op {g_att}, derived @{l_g})",
+                opt(l_f),
+            ),
+        );
     }
     // FALLBACK — unexplained drift is conservatively premature-consumption, as
     // in `analyze`. Dump this name's truth history *and* the bucket's global

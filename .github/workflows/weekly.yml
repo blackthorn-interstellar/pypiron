@@ -109,6 +109,19 @@ jobs:
   # and after every test. Never point these at a bucket holding anything else.
   real-s3:
     name: blackbox (real S3)
+    # The ref check is the security half of the gate, and the step gate below is
+    # not a substitute for it. This is the only job in this file that mounts a
+    # persistent cloud credential: a static, long-lived AWS access key pair with
+    # list/get/put/delete on the test bucket. The schedule always fires on the
+    # default branch, but workflow_dispatch accepts ANY ref, so without this a
+    # dispatch at a branch would run that branch's unmerged code — a bumped
+    # uv.lock, an agent-authored commit — with the keys in the environment, and
+    # one malicious pytest plugin could read them straight back out of it.
+    # Nothing dispatches this workflow automatically today; the gate is what
+    # stops a convenient `gh workflow run weekly.yml --ref <branch>` from being
+    # the exploit. Branch and tag refs deliberately lose the real-S3 leg and get
+    # it back on the next scheduled master run.
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Repo config (Settings → Secrets and variables → Actions):

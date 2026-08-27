@@ -1,0 +1,177 @@
+name: Selfcheck
+
+# Preflight for pypiron's automation: proves in about a minute, for $0, that the
+# preconditions the scheduled and post-merge jobs quietly depend on still hold on
+# a bare runner. Those jobs all gate themselves on a secret or variable and go
+# green while testing nothing when it is missing or stale — exactly the failure
+# this repo refuses to tolerate elsewhere ("verify the alarm can fire").
+#
+# Each probe does one of three things: proves the thing works, reports it as not
+# configured, or fails because it IS configured and broken. Run it after rotating
+# a credential, repointing a bucket, or refreshing the corpus release asset.
+#
+# What it covers:
+#   soak-bundle.yml  vars.SOAK_AWS_ROLE / SOAK_S3_BUCKET (AWS OIDC upload)
+#   weekly.yml       real-S3 leg secrets/vars; the pinned corpus release asset
+#   ci.yml           real-GCS leg secrets
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  selfcheck:
+    name: automation preconditions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write # AWS/GCP OIDC probes
+      contents: read # gh release view, gh api
+    # Nothing here reads the repo, so there is no checkout and no token in
+    # .git/config. Secrets appear as booleans so no probe can print one; the two
+    # steps that need a real value take it as step-scoped env.
+    env:
+      HAS_SOAK_AWS_ROLE: ${{ vars.SOAK_AWS_ROLE != '' }}
+      HAS_SOAK_S3_BUCKET: ${{ vars.SOAK_S3_BUCKET != '' }}
+      HAS_SOAK_BUNDLE_KEY: ${{ vars.SOAK_BUNDLE_KEY != '' }}
+      HAS_SOAK_AWS_REGION: ${{ vars.SOAK_AWS_REGION != '' }}
+      HAS_S3_REAL_BUCKET: ${{ secrets.PYPIRON_TEST_S3_REAL_BUCKET != '' }}
+      HAS_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+      HAS_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
+      HAS_S3_REGION: ${{ vars.PYPIRON_TEST_S3_REGION != '' }}
+      HAS_GCS_REAL_BUCKET: ${{ secrets.PYPIRON_TEST_GCS_REAL_BUCKET != '' }}
+      HAS_GCS_SERVICE_ACCOUNT: ${{ secrets.PYPIRON_TEST_GCS_SERVICE_ACCOUNT != '' }}
+      # Both halves present, so the GCS probe can actually run.
+      GCS_PROBE: ${{ secrets.PYPIRON_TEST_GCS_REAL_BUCKET != '' && secrets.PYPIRON_TEST_GCS_SERVICE_ACCOUNT != '' }}
+    steps:
+      # A gate that is half-configured is the dangerous state: the job runs and
+      # fails, or worse reports green having skipped. Presence only — no values.
+      - name: Gate inventory (set / not set)
+        run: |
+          row() {
+            if [ "$2" = "true" ]; then s='set'; else s='**not set**'; fi
+            printf '| %s | %s | %s |\n' "$1" "$s" "$3" >> "$GITHUB_STEP_SUMMARY"
+          }
+          {
+            echo '### Automation gates'
+            echo
+            echo '| name | state | gates |'
+            echo '| --- | --- | --- |'
+          } >> "$GITHUB_STEP_SUMMARY"
+          row vars.SOAK_AWS_ROLE               "$HAS_SOAK_AWS_ROLE"         'soak-bundle upload'
+          row vars.SOAK_S3_BUCKET              "$HAS_SOAK_S3_BUCKET"        'soak-bundle (on/off)'
+          row vars.SOAK_BUNDLE_KEY             "$HAS_SOAK_BUNDLE_KEY"       'soak-bundle (optional)'
+          row vars.SOAK_AWS_REGION             "$HAS_SOAK_AWS_REGION"       'soak-bundle (optional)'
+          row secrets.PYPIRON_TEST_S3_REAL_BUCKET     "$HAS_S3_REAL_BUCKET"        'weekly real-S3 (on/off)'
+          row secrets.AWS_ACCESS_KEY_ID               "$HAS_AWS_ACCESS_KEY_ID"     'weekly real-S3'
+          row secrets.AWS_SECRET_ACCESS_KEY           "$HAS_AWS_SECRET_ACCESS_KEY" 'weekly real-S3'
+          row vars.PYPIRON_TEST_S3_REGION             "$HAS_S3_REGION"             'weekly real-S3'
+          row secrets.PYPIRON_TEST_GCS_REAL_BUCKET    "$HAS_GCS_REAL_BUCKET"       'ci real-GCS (on/off)'
+          row secrets.PYPIRON_TEST_GCS_SERVICE_ACCOUNT "$HAS_GCS_SERVICE_ACCOUNT"  'ci real-GCS'
+          fail=0
+          if [ "$HAS_SOAK_S3_BUCKET" = "true" ] && [ "$HAS_SOAK_AWS_ROLE" != "true" ]; then
+            echo "::error::SOAK_S3_BUCKET is set but SOAK_AWS_ROLE is not — soak-bundle.yml will run and fail at the upload step"
+            fail=1
+          fi
+          if [ "$HAS_S3_REAL_BUCKET" = "true" ] && { [ "$HAS_AWS_ACCESS_KEY_ID" != "true" ] || [ "$HAS_AWS_SECRET_ACCESS_KEY" != "true" ] || [ "$HAS_S3_REGION" != "true" ]; }; then
+            echo "::error::PYPIRON_TEST_S3_REAL_BUCKET is set but AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / PYPIRON_TEST_S3_REGION are not all set — weekly's real-S3 leg will run and fail"
+            fail=1
+          fi
+          if [ "$HAS_GCS_REAL_BUCKET" = "true" ] && [ "$HAS_GCS_SERVICE_ACCOUNT" != "true" ]; then
+            echo "::error::PYPIRON_TEST_GCS_REAL_BUCKET is set but PYPIRON_TEST_GCS_SERVICE_ACCOUNT is not — ci's real-GCS leg will run and fail"
+            fail=1
+          fi
+          exit "$fail"
+
+      - name: AWS OIDC — assume the soak role
+        if: env.HAS_SOAK_AWS_ROLE == 'true'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ vars.SOAK_AWS_ROLE }}
+          aws-region: ${{ vars.SOAK_AWS_REGION || 'us-east-1' }}
+
+      - name: AWS OIDC — caller identity
+        if: env.HAS_SOAK_AWS_ROLE == 'true'
+        run: |
+          if ! arn=$(aws sts get-caller-identity --query Arn --output text); then
+            echo "::error::Assumed-role credentials do not work — soak-bundle.yml cannot upload. Check the role's trust policy allows this repo's OIDC subject."
+            exit 1
+          fi
+          echo "assumed: $arn" >> "$GITHUB_STEP_SUMMARY"
+
+      # soak-bundle only needs s3:PutObject on one key, so a least-privilege role
+      # may legitimately be unable to list. A denial here is a warning, not a
+      # failure: the capability that gates the upload is the role assumption above.
+      - name: AWS OIDC — soak bucket reachable
+        if: env.HAS_SOAK_AWS_ROLE == 'true' && env.HAS_SOAK_S3_BUCKET == 'true'
+        env:
+          BUCKET: ${{ vars.SOAK_S3_BUCKET }}
+        run: |
+          if aws s3 ls "s3://$BUCKET/" > /dev/null; then
+            echo "soak bucket listable" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Cannot list s3://$BUCKET/ with the soak role. Expected if the role is scoped to s3:PutObject on the bundle key only; otherwise the bucket name or the role policy is wrong."
+          fi
+
+      - name: AWS — not configured
+        if: env.HAS_SOAK_AWS_ROLE != 'true'
+        run: echo "vars.SOAK_AWS_ROLE is unset — AWS OIDC not configured, nothing to prove." >> "$GITHUB_STEP_SUMMARY"
+
+      # setup-gcloud runs before auth so the credential file that auth writes is
+      # never in scope for a third-party action. auth keeps it out of the job
+      # environment (as ci.yml does); the one step that needs it points gcloud at
+      # the file itself.
+      - name: GCS — install gcloud
+        if: env.GCS_PROBE == 'true'
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: GCS — authenticate with the real-GCS service account
+        id: gcp-auth
+        if: env.GCS_PROBE == 'true'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          credentials_json: ${{ secrets.PYPIRON_TEST_GCS_SERVICE_ACCOUNT }}
+          export_environment_variables: false
+
+      - name: GCS — list the test bucket
+        if: env.GCS_PROBE == 'true'
+        env:
+          CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE: ${{ steps.gcp-auth.outputs.credentials_file_path }}
+          BUCKET: ${{ secrets.PYPIRON_TEST_GCS_REAL_BUCKET }}
+          CLOUDSDK_CORE_DISABLE_PROMPTS: '1'
+        run: |
+          if ! gcloud storage ls "gs://$BUCKET" > /dev/null; then
+            echo "::error::The real-GCS service account cannot list its own test bucket — ci.yml's real-GCS leg will fail. Check the key has not expired and still holds object admin on the bucket."
+            exit 1
+          fi
+          echo "real-GCS bucket listable" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: GCS — not configured
+        if: env.GCS_PROBE != 'true'
+        run: echo "PYPIRON_TEST_GCS_REAL_BUCKET / PYPIRON_TEST_GCS_SERVICE_ACCOUNT not both set — real-GCS not configured, nothing to prove." >> "$GITHUB_STEP_SUMMARY"
+
+      # weekly.yml's corpus job downloads this exact asset. The tag is pinned in
+      # that workflow by hand, so a deleted release or a renamed asset only shows
+      # up an hour into a Monday run. Keep the two in step.
+      - name: Corpus release asset exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: corpus-2026-06-12 # keep in sync with weekly.yml's corpus job
+          ASSET: pypi-files.tsv.gz
+        run: |
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[].name' | grep -qxF "$ASSET"; then
+            echo "::error::Release $TAG has no asset named $ASSET — weekly.yml's corpus job will fail at the download step. Re-publish it, or update the tag in both weekly.yml and here."
+            exit 1
+          fi
+          echo "corpus asset $TAG/$ASSET present" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: GITHUB_TOKEN can read the repo API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! name=$(gh api "repos/$GITHUB_REPOSITORY" --jq .full_name); then
+            echo "::error::GITHUB_TOKEN cannot read the repo API — every gh call in weekly.yml and ci.yml is broken"
+            exit 1
+          fi
+          echo "GITHUB_TOKEN reads $name" >> "$GITHUB_STEP_SUMMARY"

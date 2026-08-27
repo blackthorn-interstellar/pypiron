@@ -425,6 +425,18 @@ jobs:
           # perfectly healthy fleet. If this leg ever passes, a bucket can serve
           # bytes contradicting its own index and nothing will say so.
           check attest    "SELF_CONSISTENCY: bucket"   --nodes 2 --buckets 1 --ops 80
+          # The delist lane's two legs (dev/TESTING.md, "The delist lane").
+          # `global-pair` is the only oracle asserted BEFORE the tier-3 audit —
+          # markers drained, every node booted, no audit yet, which is where
+          # `pypiron serve` spends every --audit-interval — so it is the one leg
+          # here whose check-point is not the final world. It needs no denylist:
+          # the two renderings of one name set must agree on every seed.
+          check global-pair "GLOBAL_PAIR: bucket"      --nodes 2 --buckets 1 --ops 80
+          # `relist` needs a denylist to relist from, so it carries --excludes
+          # 100; the harness refuses the pair without it rather than report a 0%
+          # kill rate for a live oracle. The same profile is green at
+          # --excludes 100 without the break over seeds 1-500.
+          check relist    "DELIST: bucket"             --nodes 2 --buckets 1 --ops 80 --excludes 100
           exit $fail
 
   integration:

@@ -100,6 +100,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use pypiron::buckets::{BucketHandle, BucketSet, Pinned};
+use pypiron::denylist::Denylist;
 use pypiron::hash::sha256_hex;
 use pypiron::replicate::{Record, Verdict};
 use pypiron::sim::{SimClock, SimStorage};
@@ -244,6 +245,14 @@ enum Break {
     /// fleet-wide, with every view re-pointed at the published digest →
     /// SELF_CONSISTENCY, and nothing else (see `apply_break`).
     Attest,
+    /// Pull the two halves of the global index apart — `simple/index.html` lists
+    /// a name `simple/index.json` does not — at the pre-audit check-point, where
+    /// the tick path has drained and no audit has run since boot → GLOBAL_PAIR.
+    GlobalPair,
+    /// Put a fully-denied name back into both global halves and re-materialize
+    /// its per-package view → DELIST. Needs `--excludes`, which is what
+    /// configures a denylist at all.
+    Relist,
 }
 
 /// The package name every phantom-clone break materializes. Not in
@@ -255,7 +264,7 @@ const BREAK_PKG: &str = "vopr-phantom";
 /// reproduce line all read this table: a second list that quietly fails to
 /// track the first is exactly how the reproduce line came to describe a
 /// different run than the one that failed.
-const BREAKS: [(&str, Break); 24] = [
+const BREAKS: [(&str, Break); 26] = [
     ("view", Break::View),
     ("fanout", Break::Fanout),
     ("rerun", Break::Rerun),
@@ -280,6 +289,8 @@ const BREAKS: [(&str, Break); 24] = [
     ("origin-demoted", Break::OriginDemoted),
     ("mirror-served", Break::MirrorServed),
     ("attest", Break::Attest),
+    ("global-pair", Break::GlobalPair),
+    ("relist", Break::Relist),
 ];
 
 impl Break {
@@ -411,6 +422,7 @@ async fn apply_break(
     buckets: &[Arc<SimStorage>],
     obs: &Observer,
     ledger: &Mutex<Ledger>,
+    denied: Option<&str>,
 ) {
     match (brk, pre_audit) {
         // Class-1 ORDERING by construction: truth grows a file with no `_dirty/`
@@ -524,6 +536,71 @@ async fn apply_break(
         // not exist. Planted pre-audit so the drain budget is really spent.
         (Break::Wedge, true) => {
             buckets[0].insert("_repl/vopr-wedge", b"nothing drains this".to_vec());
+        }
+        // The two halves of the global index pulled apart: the PEP 503 index
+        // names a package the PEP 691 index does not. Planted pre-audit, because
+        // that is where GLOBAL_PAIR reads — a fleet that has drained its markers
+        // and not yet been audited, which is where `pypiron serve` spends every
+        // `--audit-interval`.
+        //
+        // Fleet-wide, so CONVERGENCE stays quiet, and `agreement_projection`
+        // compares the JSON's name set only, so the doctored HTML moves no
+        // replication debt either. A bucket that has published nothing yet gets
+        // the other shape of the same tear: one half materialized alone.
+        (Break::GlobalPair, true) => {
+            for bucket in buckets {
+                let dump = bucket.dump();
+                let mut names = dump
+                    .get("simple/index.html")
+                    .map(|bytes| global_names_from_html(bytes))
+                    .unwrap_or_default();
+                names.push("vopr-only-in-html".to_string());
+                names.sort();
+                names.dedup();
+                bucket.insert(
+                    "simple/index.html",
+                    pypiron::render::pep503_global_html(&names).into_bytes(),
+                );
+            }
+        }
+        // A delisted name put back where every installer resolves from. Both
+        // halves and the per-package view together, so GLOBAL_PAIR stays quiet
+        // and the only claim left standing is the one `--exclude-package` makes:
+        // this name is hidden. VERIFY reds alongside and cannot not — a view over
+        // a package with no renderable files is an orphan view by its own
+        // reckoning — so the leg's expected text is what pins which oracle it is
+        // for.
+        (Break::Relist, false) => {
+            let Some(denied) = denied else { return };
+            for bucket in buckets {
+                let dump = bucket.dump();
+                let prefix = format!("packages/{denied}/");
+                if !dump.keys().any(|key| {
+                    key.strip_prefix(&prefix)
+                        .is_some_and(pypiron::sidecar::is_artifact)
+                }) {
+                    continue; // nothing stored here, so nothing was delisted
+                }
+                let (html, json) = global_pair_names(&dump);
+                let mut names = html.or(json).unwrap_or_default();
+                if names.iter().any(|name| name == denied) {
+                    continue; // already listed: the run relisted it for us
+                }
+                names.push(denied.to_string());
+                names.sort();
+                bucket.insert(
+                    "simple/index.html",
+                    pypiron::render::pep503_global_html(&names).into_bytes(),
+                );
+                bucket.insert(
+                    "simple/index.json",
+                    pypiron::render::pep691_global_json(&names).into_bytes(),
+                );
+                bucket.insert(
+                    &format!("simple/{denied}/index.json"),
+                    b"{\"vopr\": \"relisted\"}".to_vec(),
+                );
+            }
         }
         // Converges, but late — the failure a fixpoint-counting budget cannot
         // see and a deadline can. The last bucket loses its copy of one live
@@ -887,6 +964,146 @@ fn body_bytes(pkg: &str, file: u8, variant: u8) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// The delist lane (`--excludes`).
+//
+// Every seed before this one ran with NO `--exclude-package` denylist, which is
+// why `verify_storage` was called with `Denylist::default()` and the VIEWS ==
+// TRUTH oracle could assume views equal truth in full. A delisted package
+// violates that by design: the name leaves the indexes, the bytes stay on disk.
+// So the whole boot half of the product was unreachable in simulation —
+// `reconcile_excludes` (only `run_worker` calls it, and VOPR drives
+// `worker::tick`/`worker::audit` directly) and `app::initialize_indexes` (only
+// the HTTP boot calls it, and VOPR never boots a server). Both are where the
+// delist transition lands, and both write the global index pair.
+//
+// The lane is armed per seed by `--excludes <percent>` and is inert at 0 — the
+// default — for the same reason `--partition` is: arming it perturbs every
+// schedule, and the pinned regression seeds, the `--break` kill proofs and every
+// measured baseline were mined without it. Inert means *exactly* inert:
+// `reconcile_excludes` returns on its first line when `state.denylist` is `None`
+// (no storage op, no op-sequence number), and the simulated boot step is skipped
+// outright.
+// ---------------------------------------------------------------------------
+
+/// A seed's denylist schedule: what `--exclude-package` is configured with at
+/// boot, and what it becomes partway through the run.
+///
+/// The transition is the point of the lane. A denylist is startup config — a
+/// change reaches a node only across a restart, and `reconcile_excludes` is the
+/// only thing that then re-delists the stored indexes — so "the operator added an
+/// exclude and rolled the fleet" is a distinct schedule from "the fleet always
+/// had it", and it is the one where the bugs live. Nodes pick the new set up as
+/// they restart, exactly as production does; the heal phase restarts everyone, so
+/// the whole fleet is on `later` before any oracle looks.
+#[derive(Clone)]
+struct ExcludePlan {
+    /// Configured from boot. Empty when the lane is disarmed for this seed.
+    initial: BTreeMap<String, Vec<String>>,
+    /// Configured from `at_step` on — a superset of `initial`.
+    later: BTreeMap<String, Vec<String>>,
+    /// The chaos step the operator's config change lands on.
+    at_step: u64,
+    /// A name `later` denies outright (bare exclude, every version). The subject
+    /// of the DELIST oracle and of `--break relist`; empty when disarmed.
+    fully_denied: String,
+}
+
+impl ExcludePlan {
+    fn armed(&self) -> bool {
+        !self.later.is_empty()
+    }
+
+    /// The live denylist for a canonical set, or `None` for "no `--exclude-package`
+    /// configured at all" — which is a different state from an empty denylist
+    /// (`Some` with nothing in it still lets the reconcile relist what a prior
+    /// config delisted).
+    fn denylist(canonical: &BTreeMap<String, Vec<String>>) -> Option<Arc<Denylist>> {
+        if canonical.is_empty() {
+            return None;
+        }
+        // A stamp this harness built cannot carry an unparsable specifier — the
+        // only inputs are `"*"` and the `==N.0` pins below — so a failure here is
+        // a harness bug, not a run outcome.
+        match Denylist::from_canonical(canonical) {
+            Ok(denylist) => Some(Arc::new(denylist)),
+            Err(e) => panic!("vopr: built an unparsable denylist: {e:?}"),
+        }
+    }
+}
+
+impl ExcludePlan {
+    /// The denylist schedule, in one line beside the reproduce command. An armed
+    /// failure you cannot read the schedule of is a failure you debug twice —
+    /// and the schedule is the load-bearing half: "the exclude was there from
+    /// boot" and "the operator added it mid-run and the fleet rolled" are two
+    /// different worlds, and only the second has a mixed-config window in it.
+    fn describe(&self) -> String {
+        if !self.armed() {
+            return "excludes: none".to_string();
+        }
+        let names = |set: &BTreeMap<String, Vec<String>>| {
+            set.iter()
+                .map(|(name, specs)| format!("{name}{}", specs.join("|")))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        match self.at_step {
+            u64::MAX => format!("excludes: [{}] from boot", names(&self.later)),
+            step => format!(
+                "excludes: [{}] from boot, [{}] added at step {step} (adopted per node at its \
+                 next restart)",
+                names(&self.initial),
+                names(&self.later),
+            ),
+        }
+    }
+}
+
+/// The denylist schedule this seed runs. Drawn from a dedicated rng stream, like
+/// `partition_for`, so arming the lane cannot shift the chaos loop's own draws.
+fn excludes_for(seed: u64, packages: usize, ops: u64, percent: u64) -> ExcludePlan {
+    let disarmed = ExcludePlan {
+        initial: BTreeMap::new(),
+        later: BTreeMap::new(),
+        at_step: u64::MAX,
+        fully_denied: String::new(),
+    };
+    if percent == 0 {
+        return disarmed;
+    }
+    let mut rng = Rng::new(seed ^ 0x0DE1_1157);
+    if !rng.chance(percent) {
+        return disarmed;
+    }
+    // One name is denied outright (bytes kept, name hidden) — the whole-project
+    // delist, and the only shape with a check that does not re-derive the
+    // renderer. A second name may be denied at one version only, so the
+    // version-pinned arm of `Denylist::file_denied` is exercised beside it.
+    let denied = PACKAGE_NAMES[rng.below(packages as u64) as usize].to_string();
+    let pinned = PACKAGE_NAMES[rng.below(packages as u64) as usize].to_string();
+    let pin = format!("=={}.0", 1 + rng.below(2));
+    let mut later = BTreeMap::from([(denied.clone(), vec!["*".to_string()])]);
+    if pinned != denied && rng.chance(50) {
+        later.insert(pinned, vec![pin]);
+    }
+    // Half the armed seeds boot with the exclude already in force; half add it
+    // mid-run, which is the delist TRANSITION — a config change no artifact
+    // movement accompanies, so nothing re-fingerprints the affected names and
+    // only the boot reconcile can re-derive their visibility.
+    let (initial, at_step) = if rng.chance(50) {
+        (later.clone(), u64::MAX)
+    } else {
+        (BTreeMap::new(), rng.below(ops.max(1)))
+    };
+    ExcludePlan {
+        initial,
+        later,
+        at_step,
+        fully_denied: denied,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Seeded PRNG: SplitMix64 — tiny, deterministic, no dependency.
 // ---------------------------------------------------------------------------
 
@@ -1197,9 +1414,11 @@ enum R {
     OriginTerminality,
     SelfConsistency,
     UntypedDisappearance,
+    GlobalPair,
+    Delist,
 }
 
-const REACH_SLOTS: usize = 25;
+const REACH_SLOTS: usize = 27;
 
 /// `(label, what exactly one execution counts)` — in `R`'s declaration order.
 const REACH_METER: [(&str, &str); REACH_SLOTS] = [
@@ -1291,6 +1510,14 @@ const REACH_METER: [(&str, &str); REACH_SLOTS] = [
         "UNTYPED_DISAPPEARANCE",
         "artifact body removal weighed against what stood beside it",
     ),
+    (
+        "GLOBAL_PAIR",
+        "bucket's two global-index halves compared at a quiesced check-point",
+    ),
+    (
+        "DELIST",
+        "delisted name weighed against a bucket's global index",
+    ),
 ];
 
 /// The violation prefix each reach slot's oracle pushes, in `R`'s declaration
@@ -1328,6 +1555,8 @@ const REACH_VIOLATION_PREFIX: [&str; REACH_SLOTS] = [
     "ORIGIN_TERMINALITY",
     "SELF_CONSISTENCY",
     "UNTYPED_DISAPPEARANCE",
+    "GLOBAL_PAIR",
+    "DELIST",
 ];
 
 /// Zeros that are a known property of the harness or the product, not a hole.
@@ -1428,6 +1657,8 @@ struct Reach {
     multi_bucket: AtomicBool,
     /// True once any explored seed actually drew a split partition plan.
     partitioned: AtomicBool,
+    /// True once any explored seed actually configured a denylist (`--excludes`).
+    delisting: AtomicBool,
 }
 
 static REACH: Reach = Reach::new();
@@ -1443,6 +1674,7 @@ impl Reach {
             worst_staleness: Mutex::new(None),
             multi_bucket: AtomicBool::new(false),
             partitioned: AtomicBool::new(false),
+            delisting: AtomicBool::new(false),
         }
     }
     fn hit(&self, slot: R) {
@@ -1485,9 +1717,19 @@ impl Reach {
 /// Why a zero reading on `slot` is expected. Topology first: a single-bucket
 /// sample cannot reach the two replication oracles, and calling that a hole
 /// would train everyone to ignore the gate.
-fn expected_zero(slot: usize, multi_bucket: bool, partitioned: bool) -> Option<&'static str> {
+fn expected_zero(
+    slot: usize,
+    multi_bucket: bool,
+    partitioned: bool,
+    delisting: bool,
+) -> Option<&'static str> {
     if !multi_bucket && (slot == R::Convergence as usize || slot == R::AckTotality as usize) {
         return Some("single-bucket sample — the oracle needs >1 bucket");
+    }
+    // DELIST's subject is a name an `--exclude-package` entry hides. A sample
+    // that configured no denylist has none, which is the default and not a hole.
+    if !delisting && slot == R::Delist as usize {
+        return Some("no denylist configured — the oracle needs --excludes");
     }
     // The merge algebra's conflict arms need two buckets that disagree, which
     // only a partitioned fleet produces. An aligned sample fans every byte out
@@ -1559,6 +1801,7 @@ fn reach_verdict(
 fn report_reach(explored: u64, rechecked: u64, brk: Break) -> Vec<&'static str> {
     let multi = REACH.multi_bucket.load(Ordering::Relaxed);
     let partitioned = REACH.partitioned.load(Ordering::Relaxed);
+    let delisting = REACH.delisting.load(Ordering::Relaxed);
     let mut unreached = Vec::new();
     println!(
         "vopr: oracle reach over {explored} seeds — executions on NON-TRIVIAL input, and the \
@@ -1580,7 +1823,7 @@ fn report_reach(explored: u64, rechecked: u64, brk: Break) -> Vec<&'static str> 
             hits,
             seeds_reached,
             seeds,
-            expected_zero(slot, multi, partitioned),
+            expected_zero(slot, multi, partitioned, delisting),
             brk != Break::None,
             FLOOR_EXEMPT.contains(&slot),
         );
@@ -2188,6 +2431,113 @@ fn global_names_from_json(bytes: &[u8]) -> Vec<String> {
             })
         })
         .unwrap_or_default()
+}
+
+/// One bucket's two global-index halves as comparable name sets. `None` is
+/// "that half was never materialized", which is a different state from an empty
+/// one: a cold start has neither, and a crash between the pair's two writes has
+/// exactly one.
+fn global_pair_names(
+    dump: &BTreeMap<String, Vec<u8>>,
+) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    let sorted = |mut names: Vec<String>| {
+        names.sort();
+        names.dedup();
+        names
+    };
+    (
+        dump.get("simple/index.html")
+            .map(|bytes| sorted(global_names_from_html(bytes))),
+        dump.get("simple/index.json")
+            .map(|bytes| sorted(global_names_from_json(bytes))),
+    )
+}
+
+/// GLOBAL_PAIR: the PEP 503 index and the PEP 691 index are two renderings of
+/// ONE name set, so at a quiesced check-point they must name the same packages —
+/// present together or absent together. This is `verify-index`'s
+/// stale-global-index check reduced to the half that needs no truth listing, and
+/// it is asserted where `verify-index` never runs: BEFORE the tier-3 audit, on a
+/// fleet that has drained its markers and booted since its last crash.
+///
+/// That placement is the whole point. `pypiron serve` audits once at boot and
+/// then every `--audit-interval` (86400s by default), so a pair the tick path
+/// leaves torn is what installers get for a day — while the simulator audits
+/// every heal round and reads a world the audit has already repaired. A tear the
+/// audit fixes is invisible to every oracle that reads the final world.
+///
+/// Reach counts one execution per bucket that has published at least one half;
+/// a fleet that never materialized a global index has nothing to compare.
+fn global_pair_violations(dumps: &[BTreeMap<String, Vec<u8>>], at: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let show = |names: &Option<Vec<String>>| match names {
+        None => "absent".to_string(),
+        Some(names) => format!("[{}]", names.join(", ")),
+    };
+    for (idx, dump) in dumps.iter().enumerate() {
+        let (html, json) = global_pair_names(dump);
+        if html.is_none() && json.is_none() {
+            continue; // nothing published on this bucket yet
+        }
+        REACH.hit(R::GlobalPair);
+        if html != json {
+            out.push(format!(
+                "GLOBAL_PAIR: bucket {idx} at {at} serves a PEP 503 global index and a PEP 691 \
+                 global index that do not name the same packages — simple/index.html {} vs \
+                 simple/index.json {}",
+                show(&html),
+                show(&json),
+            ));
+        }
+    }
+    out
+}
+
+/// DELIST: a bare `--exclude-package` entry hides the NAME and keeps the BYTES.
+/// So on any bucket that still stores artifacts for a fully-denied name, that
+/// name must appear in neither global-index half and have no materialized
+/// per-package view.
+///
+/// Stated this way it needs no re-rendering and has no excuse machinery: the
+/// premise ("the bucket still holds the artifacts") is the retention half of the
+/// contract and the conclusion ("nothing lists it") is the delisting half, and
+/// one execution is counted only where the premise holds — so the oracle cannot
+/// pass by having nothing to look at. The bytes' survival beyond that is already
+/// CONSERVATION's and DURABILITY's claim, and arming a denylist deliberately buys
+/// no exemption from either.
+fn delist_violations(dumps: &[BTreeMap<String, Vec<u8>>], denied: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let prefix = format!("packages/{denied}/");
+    for (idx, dump) in dumps.iter().enumerate() {
+        let stored = dump.keys().any(|key| {
+            key.strip_prefix(&prefix)
+                .is_some_and(pypiron::sidecar::is_artifact)
+        });
+        if !stored {
+            continue; // nothing delisted here, so nothing to say
+        }
+        REACH.hit(R::Delist);
+        let (html, json) = global_pair_names(dump);
+        let listed = [html, json]
+            .into_iter()
+            .flatten()
+            .any(|names| names.iter().any(|name| name == denied));
+        if listed {
+            out.push(format!(
+                "DELIST: bucket {idx} still lists the excluded package {denied} in its global \
+                 index while storing its artifacts — an --exclude-package entry hides the name"
+            ));
+        }
+        for suffix in ["index.html", "index.json"] {
+            if dump.contains_key(&format!("simple/{denied}/{suffix}")) {
+                out.push(format!(
+                    "DELIST: bucket {idx} still serves simple/{denied}/{suffix} for an excluded \
+                     package — every release of it is denied, so the view must be gone"
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// The global HTML lists one `/simple/<name>/` href per package.
@@ -2941,6 +3291,54 @@ struct Node {
     state: Arc<AppState>,
     /// Live op tasks; aborted on crash, drained on restart.
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Has this process finished `app::initialize_indexes`? Cleared on every
+    /// restart, because the boot step belongs to the process, not the bucket. A
+    /// failed probe leaves it false: `initialize_indexes` refuses to boot rather
+    /// than publish an empty index over a real corpus, and the supervisor's
+    /// answer to that is to start the process again.
+    ///
+    /// Shared with the task doing the boot, and REPLACED (not cleared) on
+    /// restart: a task the crash aborted may already be parked inside a storage
+    /// op, and it must not be able to mark the next generation booted.
+    booted: Arc<AtomicBool>,
+    /// Has this process reconciled the live denylist against the stored indexes?
+    /// `run_worker` does it once per leadership generation and a fresh
+    /// `AppState` is a fresh generation, so replaced on restart too.
+    reconciled: Arc<AtomicBool>,
+}
+
+/// The boot sequence, in the order `app::serve` runs it: seed the global index
+/// pair, then reconcile every bucket's stored indexes against the live denylist
+/// (`run_worker` leads with that, once per leadership generation, and a fresh
+/// `AppState` is a fresh generation). Idempotent — the flags make a repeat pass
+/// a no-op — so a boot the fault storm interrupted is simply retried by the next
+/// tick, which is what a supervisor does with a process that would not start.
+///
+/// Never awaited on the driver's own future during the chaos phase. A storage op
+/// belonging to a crashed node parks forever by design, and the driver aborts the
+/// node's TASKS to model the power cut — so a boot awaited inline would park the
+/// simulation itself. It runs as a spawned op like everything else.
+async fn boot_sequence(state: Arc<AppState>, booted: Arc<AtomicBool>, reconciled: Arc<AtomicBool>) {
+    if !booted.load(Ordering::Relaxed) {
+        if pypiron::app::initialize_indexes(&state).await.is_err() {
+            return; // refused to boot; the supervisor gets to try again
+        }
+        booted.store(true, Ordering::Relaxed);
+    }
+    if reconciled.load(Ordering::Relaxed) {
+        return;
+    }
+    // Every bucket keeps its own enforced-denylist stamp, so every bucket needs
+    // its own reconcile — the warm-copy pass `run_worker`'s replication job runs
+    // beside the selected bucket's. One small GET each when nothing moved, and a
+    // straight early return when no denylist is configured at all.
+    let mut all_ok = true;
+    for handle in state.buckets.handles() {
+        all_ok &= worker::reconcile_excludes(&state, handle.storage.as_ref())
+            .await
+            .is_ok();
+    }
+    reconciled.store(all_ok, Ordering::Relaxed);
 }
 
 struct Fleet {
@@ -2955,6 +3353,16 @@ struct Fleet {
     /// event-protocol model covers it exhaustively and documents that only
     /// the audit heals its stale-rebuild clobber.
     tick_lock: Vec<Arc<tokio::sync::Mutex<()>>>,
+    /// The `--exclude-package` denylist the fleet is *configured* with right
+    /// now. `None` is "no excludes configured at all", which is not the same
+    /// state as an empty one — an empty denylist still lets the boot reconcile
+    /// relist what a prior config delisted. A node adopts it when it starts,
+    /// never mid-process: the denylist is startup config (`src/worker.rs`).
+    denylist: Option<Arc<Denylist>>,
+    /// Whether this seed simulates the HTTP boot sequence at all (`--excludes`).
+    /// Off means off: no `initialize_indexes`, no reconcile, not one storage op —
+    /// which is what keeps every seed mined before this lane existed byte-identical.
+    boot_lane: bool,
     /// Monotonic logical-op counter: each spawned workload op and each direct
     /// heal-phase protocol call runs in its own `OP_ID` scope so the observer
     /// can attribute effects. Interior-mutable so `&self` helpers can bump it.
@@ -3094,11 +3502,25 @@ fn marker_census(dumps: &[BTreeMap<String, Vec<u8>>], pkg: &str, fname: &str) ->
 
 /// Whether the renderer deliberately leaves this record out of the package
 /// view (`worker::load_file_metadata`, mirrored by `verify::suppressed_mirror`):
-/// a mirror record under a private claim, or a quarantined mirror body a
-/// private upload has not superseded. Invisible-by-design, not a lost record —
-/// the dependency-confusion boundary, and the one thing VISIBILITY must not
-/// mistake for a dropped index entry.
-fn renderer_omits(dump: &BTreeMap<String, Vec<u8>>, pkg: &str, fname: &str) -> bool {
+/// a mirror record under a private claim, a quarantined mirror body a private
+/// upload has not superseded, or a file the live `--exclude-package` denylist
+/// denies. Invisible-by-design, not a lost record — the dependency-confusion
+/// boundary and the operator's own delisting, and the one thing VISIBILITY must
+/// not mistake for a dropped index entry.
+///
+/// The denylist arm exempts the INDEX ENTRY and nothing else. DURABILITY still
+/// demands the bytes and the sidecar on every bucket, and CONSERVATION still
+/// demands they exist somewhere — which is the delist contract exactly: the name
+/// is hidden, the artifact is kept.
+fn renderer_omits(
+    dump: &BTreeMap<String, Vec<u8>>,
+    pkg: &str,
+    fname: &str,
+    denylist: &Denylist,
+) -> bool {
+    if denylist.file_denied(pkg, fname) {
+        return true;
+    }
     let akey = format!("packages/{pkg}/{fname}");
     let origin = dump
         .get(&format!("{akey}.meta.json"))
@@ -3140,6 +3562,7 @@ fn build_node_state(
     buckets: &[Arc<SimStorage>],
     node: usize,
     plan: &Arc<FaultPlan>,
+    denylist: &Option<Arc<Denylist>>,
 ) -> Arc<AppState> {
     let handles: Vec<BucketHandle> = buckets
         .iter()
@@ -3161,6 +3584,11 @@ fn build_node_state(
     // Tight grace keeps crashed-writer healing inside short simulated runs.
     state.intent_grace = time::Duration::seconds(60);
     state.fanout_grace = std::time::Duration::from_secs(5);
+    // Adopted at process start, exactly like `serve` reading its config. A node
+    // that restarts after the operator changed the excludes comes up with the
+    // new set; one that has not restarted keeps the old one, which is the
+    // rolling-restart window the product actually has.
+    state.denylist = denylist.clone();
     Arc::new(state)
 }
 
@@ -3169,7 +3597,14 @@ impl Fleet {
     /// five of its fields: every fault dimension the plan needs already lives
     /// there together, and the loose-field form had grown past the point where
     /// a caller could get the order right by reading it.
-    fn new(seed: u64, profile: &Profile, clock: Arc<SimClock>, viz: Option<Arc<Trace>>) -> Fleet {
+    fn new(
+        seed: u64,
+        profile: &Profile,
+        clock: Arc<SimClock>,
+        viz: Option<Arc<Trace>>,
+        denylist: Option<Arc<Denylist>>,
+        boot_lane: bool,
+    ) -> Fleet {
         let plan = FaultPlan::new(
             seed,
             profile.nodes,
@@ -3183,8 +3618,10 @@ impl Fleet {
             .collect();
         let nodes = (0..profile.nodes)
             .map(|node| Node {
-                state: build_node_state(&buckets, node, &plan),
+                state: build_node_state(&buckets, node, &plan, &denylist),
                 tasks: Vec::new(),
+                booted: Arc::new(AtomicBool::new(false)),
+                reconciled: Arc::new(AtomicBool::new(false)),
             })
             .collect();
         let tick_lock = (0..profile.buckets)
@@ -3197,6 +3634,8 @@ impl Fleet {
             clock,
             ledger: Arc::new(Mutex::new(Ledger::default())),
             tick_lock,
+            boot_lane: denylist.is_some() || boot_lane,
+            denylist,
             next_op: std::cell::Cell::new(0),
         }
     }
@@ -3230,11 +3669,48 @@ impl Fleet {
     fn restart_node(&mut self, node: usize, phase: &'static str) {
         self.crash_node(node);
         self.plan.restart(node);
-        // Cold caches: a fresh AppState over the same buckets.
+        // Cold caches: a fresh AppState over the same buckets — and the denylist
+        // the fleet is configured with NOW, because that is what a process reads
+        // when it starts.
         let plan = self.plan.clone();
-        self.nodes[node].state = build_node_state(&self.buckets, node, &plan);
+        let denylist = self.denylist.clone();
+        self.nodes[node].state = build_node_state(&self.buckets, node, &plan, &denylist);
+        // Fresh cells, not cleared ones: a task the abort caught mid-boot still
+        // holds the old pair and must not be able to speak for this generation.
+        self.nodes[node].booted = Arc::new(AtomicBool::new(false));
+        self.nodes[node].reconciled = Arc::new(AtomicBool::new(false));
         if let Some(viz) = &self.plan.viz {
             viz.restart(node, phase);
+        }
+    }
+
+    /// The arguments one boot pass needs, or `None` when this seed does not
+    /// simulate booting at all.
+    fn boot_args(&self, node: usize) -> Option<(Arc<AppState>, Arc<AtomicBool>, Arc<AtomicBool>)> {
+        self.boot_lane.then(|| {
+            (
+                self.nodes[node].state.clone(),
+                self.nodes[node].booted.clone(),
+                self.nodes[node].reconciled.clone(),
+            )
+        })
+    }
+
+    /// Boot a node the way the chaos phase must: as a spawned op, so a crash
+    /// parks that task and not the driver.
+    fn spawn_boot(&mut self, node: usize) {
+        if let Some((state, booted, reconciled)) = self.boot_args(node) {
+            self.spawn_on(node, boot_sequence(state, booted, reconciled));
+        }
+    }
+
+    /// Boot a node the way the heal phase can: inline. Faults are off and no node
+    /// is crashed by then, so nothing can park.
+    async fn boot(&mut self, node: usize) {
+        if let Some((state, booted, reconciled)) = self.boot_args(node) {
+            OP_ID
+                .scope(self.fresh_op(), boot_sequence(state, booted, reconciled))
+                .await;
         }
     }
 }
@@ -3560,7 +4036,14 @@ async fn op_delete(
     }
 }
 
-async fn op_tick(state: Arc<AppState>, lease: Arc<tokio::sync::Mutex<()>>) {
+async fn op_tick(
+    state: Arc<AppState>,
+    lease: Arc<tokio::sync::Mutex<()>>,
+    boot: Option<(Arc<AppState>, Arc<AtomicBool>, Arc<AtomicBool>)>,
+) {
+    if let Some((boot_state, booted, reconciled)) = boot {
+        boot_sequence(boot_state, booted, reconciled).await;
+    }
     let pinned = state.pin();
     let _guard = lease.lock().await;
     let _ = worker::tick(&state, &pinned).await;
@@ -3681,6 +4164,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         weights,
         brk,
         partition_percent,
+        excludes_percent,
         staleness_secs,
         depth1,
         forced,
@@ -3690,6 +4174,13 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
     if plan.split {
         REACH.partitioned.store(true, Ordering::Relaxed);
     }
+    let excludes = excludes_for(seed, packages, ops, excludes_percent);
+    if excludes.armed() {
+        REACH.delisting.store(true, Ordering::Relaxed);
+    }
+    // The name `--break relist` puts back. `None` on an unarmed seed, where that
+    // break is refused at the flag (`parse_args_from`) rather than left inert.
+    let break_subject = Some(excludes.fully_denied.as_str()).filter(|name| !name.is_empty());
     let weight_total: u64 = weights.iter().map(|w| u64::from(*w)).sum();
     let start =
         time::OffsetDateTime::parse(SIM_START, &time::format_description::well_known::Rfc3339)
@@ -3700,7 +4191,14 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         viz.attach(&clock);
         emit_meta(viz, seed, &profile, &plan);
     }
-    let mut fleet = Fleet::new(seed, &profile, clock.clone(), viz.clone());
+    let mut fleet = Fleet::new(
+        seed,
+        &profile,
+        clock.clone(),
+        viz.clone(),
+        ExcludePlan::denylist(&excludes.initial),
+        excludes.armed(),
+    );
     let mut rng = Rng::new(seed);
     // The empty baseline every later `world` delta is applied on top of.
     viz_world(&viz, &fleet.buckets, true);
@@ -3710,6 +4208,18 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
 
     // ---- Chaos phase: seed-driven interleaving of ops, faults, and time.
     for step in 0..ops {
+        // The operator's config change. It reaches no running process — a
+        // denylist is startup config — so nothing happens until a node restarts,
+        // which is exactly the rolling-restart window production has.
+        if step == excludes.at_step {
+            fleet.denylist = ExcludePlan::denylist(&excludes.later);
+            if let Some(viz) = &viz {
+                viz.emit(
+                    "excludes",
+                    serde_json::json!({ "step": step, "canonical": excludes.later }),
+                );
+            }
+        }
         let node = rng.below(nodes as u64) as usize;
         if fleet.plan.node_crashed(node) && !rng.chance(30) {
             // A crashed node mostly stays down this step; sometimes restarts.
@@ -3717,6 +4227,10 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         }
         if fleet.plan.node_crashed(node) {
             fleet.restart_node(node, "chaos");
+            // A restarted process runs its boot sequence before it serves.
+            // Spawned, never awaited here: the fault plan may crash the node
+            // again mid-boot, and a crashed node's storage op parks forever.
+            fleet.spawn_boot(node);
             continue;
         }
         let state = fleet.nodes[node].state.clone();
@@ -3779,8 +4293,14 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                 // against it. That gap is why class 3 reads zero here and is
                 // still a real production state; dev/TESTING.md carries the
                 // measurement.
+                // `run_worker` leads with the boot sequence — the global-index
+                // seed and the denylist reconcile — and only then ticks, so the
+                // tick op carries it. Idempotent, so this is a no-op on every
+                // tick after the first of a generation, and it also retries a
+                // boot a crash interrupted.
                 let lease = fleet.tick_lock[0].clone();
-                fleet.spawn_on(node, op_tick(state, lease));
+                let boot = fleet.boot_args(node);
+                fleet.spawn_on(node, op_tick(state, lease, boot));
             }
             3 => {
                 if buckets > 1 {
@@ -3840,6 +4360,12 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
     fleet.plan.heal();
     for node in 0..nodes {
         fleet.restart_node(node, "heal");
+        // Every node comes back the way `serve` comes back: seed the global
+        // index pair, then reconcile the stored indexes against the denylist the
+        // fleet is configured with now. This is where a mid-run exclude change
+        // finally reaches the whole fleet, and where a crash-torn global pair
+        // meets the boot step that seeds only its missing half.
+        fleet.boot(node).await;
     }
     // t0 for the STALENESS clock: the storm is over. Faults are off, every node
     // has restarted (which aborted its in-flight tasks), and no further client
@@ -3884,6 +4410,10 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         // Drain markers across every node until none remain (bounded).
         for pass in 0..DRAIN_PASSES {
             for node in 0..nodes {
+                // A boot the fault storm interrupted gets retried here, before
+                // the node does any work — the supervisor restarting a process
+                // that refused to start.
+                fleet.boot(node).await;
                 let state = fleet.nodes[node].state.clone();
                 let pinned = state.pin();
                 OP_ID
@@ -4024,6 +4554,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                 &fleet.buckets,
                 &fleet.plan.obs,
                 &fleet.ledger,
+                break_subject,
             )
             .await;
         }
@@ -4042,6 +4573,14 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                     .collect()
             })
             .collect();
+        // GLOBAL_PAIR, at the one check-point the product actually lives in: the
+        // markers are drained, every node has booted since its last crash, and
+        // the tier-3 audit has NOT run yet. `pypiron serve` spends a whole
+        // `--audit-interval` here. Raw `dump()`, so the check moves no schedule.
+        violations_pre.extend(global_pair_violations(
+            &views_before_audit,
+            &format!("round {round}, drained and un-audited"),
+        ));
         // Every effect the classifier explains happened before this round's
         // audits; the audits' own repair writes carry seq >= boundary and are
         // excluded from the analysis (they are the repair, not its cause).
@@ -4059,9 +4598,14 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         // a throwaway single-bucket state so the leader's selected-bucket name
         // cache is never polluted with another bucket's namespace.
         for bucket in fleet.buckets.iter().skip(1) {
-            let audit_state = Arc::new(pypiron::sim::single_bucket_state(
-                bucket.clone() as Arc<dyn Storage>
-            ));
+            let mut audit_state =
+                pypiron::sim::single_bucket_state(bucket.clone() as Arc<dyn Storage>);
+            // The throwaway state audits with the SAME denylist the fleet serves
+            // under. Without it a warm-bucket audit re-derives every package
+            // with no excludes in force and relists what the leader delisted —
+            // a harness-invented divergence, not a finding.
+            audit_state.denylist = fleet.denylist.clone();
+            let audit_state = Arc::new(audit_state);
             let audit_pin = audit_state.pin();
             if let Err(e) = OP_ID
                 .scope(
@@ -4245,6 +4789,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                 &fleet.buckets,
                 &fleet.plan.obs,
                 &fleet.ledger,
+                break_subject,
             )
             .await;
         }
@@ -4348,6 +4893,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
             &fleet.buckets,
             &fleet.plan.obs,
             &fleet.ledger,
+            break_subject,
         )
         .await;
     }
@@ -4358,6 +4904,30 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
     if let Some(viz) = &viz {
         viz.world(&dumps, false);
     }
+
+    // GLOBAL_PAIR at quiescence too. VERIFY below re-derives both halves from
+    // truth and so subsumes this reading — except where truth is empty, which is
+    // the one case `check_global` excuses (a data dir no server has booted) and
+    // the exact state a crash between the pair's two writes leaves behind.
+    violations.extend(global_pair_violations(&dumps, "quiescence"));
+
+    // DELIST: what an `--exclude-package` entry promises — the name is hidden,
+    // the artifacts are kept. Silent on an unarmed seed (nothing is denied), and
+    // non-vacuous on an armed one by construction: it only speaks about a bucket
+    // that still stores the denied package's bytes.
+    if !excludes.fully_denied.is_empty() {
+        violations.extend(delist_violations(&dumps, &excludes.fully_denied));
+    }
+
+    // The denylist every view oracle below rules through — the one the fleet is
+    // configured with, which is what `serve` enforced and what the stored
+    // indexes were last built against. `Denylist::default()` on an unarmed seed
+    // is the old behaviour, byte for byte: nothing is denied, so nothing is
+    // exempt and views must equal truth in full.
+    let denylist = fleet
+        .denylist
+        .clone()
+        .unwrap_or_else(|| Arc::new(Denylist::default()));
 
     // VIEWS == TRUTH, byte-strict: the product's own oracle (`pypiron verify`)
     // re-renders every view from that bucket's truth and diffs the bytes. Run
@@ -4372,15 +4942,12 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         // product's `--deep` pass too would make two oracles hold one claim and
         // cost the whole corpus on every seed. The blackbox suite drives
         // `verify-index --deep` instead.
-        // No excludes are configured in the sim, so the oracle models an empty
-        // denylist (nothing delisted) — views must equal truth in full.
-        match pypiron::verify::verify_storage(
-            bucket.as_ref(),
-            false,
-            &pypiron::denylist::Denylist::default(),
-        )
-        .await
-        {
+        // The oracle rules through the denylist the fleet is configured with,
+        // which is what makes VIEWS == TRUTH survive delisting: a denied file's
+        // bytes stay in `packages/` and must NOT appear in any view, so with an
+        // empty denylist passed here every armed seed would red on the product
+        // doing exactly what it was told.
+        match pypiron::verify::verify_storage(bucket.as_ref(), false, denylist.as_ref()).await {
             Ok(report) => violations.extend(report.divergences.into_iter().map(|d| {
                 format!(
                     "VERIFY: bucket {idx} diverged from its own truth: {} {} — {}",
@@ -4538,7 +5105,7 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                     // design — that IS the dependency-confusion boundary — so
                     // the renderer's own omission rules exempt, and nothing
                     // else does.
-                    if !renderer_omits(dump, pkg, fname) {
+                    if !renderer_omits(dump, pkg, fname, denylist.as_ref()) {
                         REACH.hit(R::Visibility);
                         let view = dump
                             .get(&format!("simple/{pkg}/index.json"))
@@ -5512,6 +6079,14 @@ struct Args {
     /// `--break` kill proofs and the measured baselines were all mined on the
     /// aligned one. Needs >1 bucket to mean anything.
     partition_percent: u64,
+    /// Share of seeds (0-100) that configure an `--exclude-package` denylist and
+    /// run the product's boot sequence — `app::initialize_indexes` then
+    /// `worker::reconcile_excludes` — at every node start. Zero by default, for
+    /// the same reason `--partition` is: both halves of that boot write storage,
+    /// so arming the lane shifts every schedule, and the pinned regression seeds,
+    /// the `--break` kill proofs and the measured baselines were all mined
+    /// without it. See `excludes_for`.
+    excludes_percent: u64,
     /// `--trace-jsonl <path>`: record ONE seed's timeline as JSONL for the run
     /// visualizer (dev/scripts/viz). Pure observation — see [`Trace`] — and off
     /// by default, so it is not part of any world: it stays out of
@@ -5567,6 +6142,9 @@ struct Profile {
     /// proof and every measured baseline keeps the exact schedule it was mined
     /// under; `--rotate` draws it, and the nightly's multi-bucket rows pass it.
     partition_percent: u64,
+    /// Share of seeds that configure a denylist and boot the way `serve` does
+    /// (`--excludes`). Zero unless asked for — see the `Args` field.
+    excludes_percent: u64,
     /// Healthy-operation base of the STALENESS deadline (`--staleness-secs`).
     staleness_secs: u64,
     /// Depth-1 mode (`--sweep-faults`/`--force-fault`): the only fault in this
@@ -5598,7 +6176,7 @@ impl Profile {
         };
         format!(
             "nodes={} buckets={} packages={} files={} ops={} fail-percent={} partition={} \
-             weights=[{}]{forced}",
+             excludes={} weights=[{}]{forced}",
             self.nodes,
             self.buckets,
             self.packages,
@@ -5606,6 +6184,7 @@ impl Profile {
             self.ops,
             self.fail_percent,
             self.partition_percent,
+            self.excludes_percent,
             mix.join(", ")
         )
     }
@@ -5638,6 +6217,7 @@ fn workload_for(seed: u64, args: &Args) -> Profile {
             weights: args.weights,
             brk: args.brk,
             partition_percent: args.partition_percent,
+            excludes_percent: args.excludes_percent,
             staleness_secs: args.staleness_secs,
             depth1: false,
             forced: None,
@@ -5668,6 +6248,10 @@ fn workload_for(seed: u64, args: &Args) -> Profile {
         // and the rotating row is the one every pinned soak baseline was
         // measured on. `--rotate --partition N` is the partitioned soak.
         partition_percent: args.partition_percent,
+        // Not drawn from the seed either, and for the same reason: the boot
+        // sequence the lane arms writes storage on every node start, so it
+        // perturbs every schedule. `--rotate --excludes N` is the delist soak.
+        excludes_percent: args.excludes_percent,
         staleness_secs: args.staleness_secs,
         depth1: false,
         forced: None,
@@ -5691,6 +6275,13 @@ fn reproduce_command(seed: u64, rotate: bool, profile: &Profile) -> String {
     let partition = match profile.partition_percent {
         0 => String::new(),
         percent => format!(" --partition {percent}"),
+    };
+    // So is `--excludes`: without it the line reruns a fleet with no denylist
+    // and no simulated boot, which is a different simulation that comes back
+    // green — the classic way a repro gets filed as flaky.
+    let excludes = match profile.excludes_percent {
+        0 => String::new(),
+        percent => format!(" --excludes {percent}"),
     };
     // A relaxed or tightened staleness base changes the VERDICT without
     // changing the world, which is the easier way to lose a repro: the run
@@ -5722,7 +6313,7 @@ fn reproduce_command(seed: u64, rotate: bool, profile: &Profile) -> String {
     if rotate {
         return format!(
             "cargo run --release --example vopr -- --seed {seed} \
-             --rotate{partition}{staleness}{depth1}{brk}"
+             --rotate{partition}{excludes}{staleness}{depth1}{brk}"
         );
     }
     // The op mix is implicit at `DEFAULT_OP_WEIGHTS` and drawn from the seed
@@ -5740,7 +6331,7 @@ fn reproduce_command(seed: u64, rotate: bool, profile: &Profile) -> String {
     format!(
         "cargo run --release --example vopr -- --seed {seed} --nodes {} --buckets {} \
          --packages {} --files {} --ops {} \
-         --fail-percent {}{partition}{staleness}{weights}{depth1}{brk}",
+         --fail-percent {}{partition}{excludes}{staleness}{weights}{depth1}{brk}",
         profile.nodes,
         profile.buckets,
         profile.packages,
@@ -5828,6 +6419,7 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         brk: Break::None,
         require_reach: false,
         partition_percent: 0,
+        excludes_percent: 0,
         trace_jsonl: None,
         weights: DEFAULT_OP_WEIGHTS,
         shrink: false,
@@ -5948,6 +6540,11 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
                 assert!(n <= 100, "--partition is a percentage of seeds (0..=100)");
                 args.partition_percent = n;
             }
+            "--excludes" => {
+                let n = grab();
+                assert!(n <= 100, "--excludes is a percentage of seeds (0..=100)");
+                args.excludes_percent = n;
+            }
             "--forever" => args.forever = true,
             "--max-secs" => args.max_secs = Some(grab()),
             "--rotate" => args.rotate = true,
@@ -5963,8 +6560,8 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         !args.rotate || overridden.is_empty(),
         "--rotate derives the whole workload from the seed, so {} would be discarded — \
          drop them, or drop --rotate. Legal with --rotate: --seed --seeds --start-seed \
-         --recheck-every --forever --max-secs --break --require-reach --partition --shrink \
-         --staleness-secs --sweep-faults --force-fault.",
+         --recheck-every --forever --max-secs --break --require-reach --partition --excludes \
+         --shrink --staleness-secs --sweep-faults --force-fault.",
         overridden.join(" ")
     );
     // The sweep already forces the fault at every position; a hand-picked one
@@ -5982,7 +6579,7 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         !args.sweep_faults || swept_away.is_empty(),
         "--sweep-faults would discard {} — it runs its own loop and exits before the seed \
          loop those belong to. Drop them, or drop --sweep-faults. Legal with it: --seed \
-         --seeds --start-seed --forever --max-secs --rotate --break --partition \
+         --seeds --start-seed --forever --max-secs --rotate --break --partition --excludes \
          --staleness-secs and the workload flags.",
         swept_away.join(" ")
     );
@@ -5993,6 +6590,14 @@ fn parse_args_from(argv: impl Iterator<Item = String>) -> Args {
         !(args.sweep_faults && args.brk == Break::Rerun),
         "--break rerun is killed by the determinism recheck, which --sweep-faults does not \
          run: the pair is a gate that cannot fail. Run it on the seed loop instead."
+    );
+    // `relist` puts a DELISTED name back, and nothing is delisted without a
+    // denylist: unarmed, it plants nothing and reports a 0% kill rate for an
+    // oracle that is perfectly alive. Refuse the pair rather than print that.
+    assert!(
+        !(args.brk == Break::Relist && args.excludes_percent == 0),
+        "--break relist needs a denylist to relist from: pass --excludes 100 (it is a share \
+         of seeds, and a kill proof wants every one of them armed)."
     );
     // One file is one seed's timeline. A multi-seed run would interleave worlds
     // into one stream, and an unbounded one would never write the file at all.
@@ -6044,6 +6649,18 @@ fn report_sweep(seed: u64, rotate: bool, profile: &Profile, violations: &[String
     }
     eprintln!("reproduce: {}", reproduce_command(seed, rotate, profile));
     eprintln!("profile: {}", profile.describe());
+    eprintln!("{}", excludes_of(seed, profile).describe());
+}
+
+/// The denylist schedule behind a failing seed, rebuilt from the same pure
+/// function `run_seed` drew it with.
+fn excludes_of(seed: u64, profile: &Profile) -> ExcludePlan {
+    excludes_for(
+        seed,
+        profile.packages,
+        profile.ops,
+        profile.excludes_percent,
+    )
 }
 
 /// `--sweep-faults`: exhaustive fault depth 1 over a fixed schedule.
@@ -6555,6 +7172,7 @@ fn main() {
                 reproduce_command(seed, args.rotate, &profile)
             );
             eprintln!("profile: {}", profile.describe());
+            eprintln!("{}", excludes_of(seed, &profile).describe());
             // The search runs hundreds of extra simulations through the same
             // process-wide reach and merge meters, so it stops the run: a soak
             // that kept going would report a coverage table those probes wrote.
@@ -6736,7 +7354,7 @@ mod tests {
 
     #[test]
     fn the_floor_is_silent_wherever_a_standing_excuse_already_is() {
-        let excuse = expected_zero(R::Convergence as usize, false, false);
+        let excuse = expected_zero(R::Convergence as usize, false, false, false);
         assert!(
             excuse.is_some(),
             "single-bucket topology excuse went missing"
@@ -6902,6 +7520,7 @@ mod tests {
             weights: DEFAULT_OP_WEIGHTS,
             brk,
             partition_percent: 0,
+            excludes_percent: 0,
             staleness_secs: STALENESS_HEALTHY_SECS,
             depth1: false,
             forced: None,
@@ -7280,6 +7899,150 @@ mod tests {
         assert!(!reproduce_command(42, true, &a_profile(Break::None)).contains("--partition"));
     }
 
+    /// The delist lane is a chaos dimension too, and a heavier one: it changes
+    /// what a node does at BOOT. Drop it from the line and the rerun has no
+    /// denylist and no simulated boot at all, which is a different simulation
+    /// that comes back green.
+    #[test]
+    fn the_reproduce_line_carries_the_delist_lane() {
+        let mut delisting = a_profile(Break::None);
+        delisting.excludes_percent = 100;
+        assert!(reproduce_command(42, false, &delisting).ends_with("--excludes 100"));
+        assert_eq!(
+            reproduce_command(42, true, &delisting),
+            "cargo run --release --example vopr -- --seed 42 --rotate --excludes 100"
+        );
+        assert!(!reproduce_command(42, true, &a_profile(Break::None)).contains("--excludes"));
+    }
+
+    /// Inert means inert. At the default the lane draws no rng, configures no
+    /// denylist and schedules no transition — which is what keeps every seed
+    /// mined before it existed meaning what its comment says.
+    #[test]
+    fn the_delist_lane_is_silent_until_it_is_armed() {
+        let off = excludes_for(7, 6, 200, 0);
+        assert!(!off.armed());
+        assert!(off.fully_denied.is_empty());
+        assert_eq!(off.at_step, u64::MAX);
+        assert!(ExcludePlan::denylist(&off.later).is_none());
+        assert_eq!(off.describe(), "excludes: none");
+        // Armed, it always denies one whole project outright — the subject the
+        // DELIST oracle and `--break relist` both need. A `--exclude-package`
+        // set with only version pins in it would leave both with nothing to say.
+        let on = excludes_for(7, 6, 200, 100);
+        assert!(on.armed());
+        assert!(PACKAGE_NAMES.contains(&on.fully_denied.as_str()));
+        let denylist = ExcludePlan::denylist(&on.later).expect("armed seeds configure a denylist");
+        assert!(denylist.name_fully_denied(&on.fully_denied));
+        assert!(denylist.file_denied(&on.fully_denied, &filename(&on.fully_denied, 0)));
+    }
+
+    /// `--break relist` puts a DELISTED name back, and nothing is delisted
+    /// without a denylist: unarmed it plants nothing and the leg reports a 0%
+    /// kill rate for an oracle that is perfectly alive.
+    #[test]
+    #[should_panic(expected = "--break relist needs a denylist")]
+    fn relist_refuses_to_run_without_a_denylist() {
+        parse_args_from(argv(&["--break", "relist"]));
+    }
+
+    #[test]
+    fn relist_is_accepted_beside_the_lane_it_needs() {
+        let args = parse_args_from(argv(&["--break", "relist", "--excludes", "100"]));
+        assert!(args.brk == Break::Relist);
+        assert_eq!(args.excludes_percent, 100);
+    }
+
+    /// The two halves of the global index are two renderings of ONE name set.
+    /// Both absent is a cold start and says nothing; both present and equal is
+    /// the healthy case; anything else is the tear a crash between the pair's
+    /// two writes leaves, including the one a boot's empty seed makes look whole.
+    #[test]
+    fn the_global_pair_oracle_sees_a_tear_and_only_a_tear() {
+        let html = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            pypiron::render::pep503_global_html(&names).into_bytes()
+        };
+        let json = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            pypiron::render::pep691_global_json(&names).into_bytes()
+        };
+        let bucket = |pairs: Vec<(&str, Vec<u8>)>| -> BTreeMap<String, Vec<u8>> {
+            pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+        };
+        // Nothing published: no execution, no complaint.
+        assert!(global_pair_violations(&[BTreeMap::new()], "t").is_empty());
+        // Agreed.
+        let agreed = bucket(vec![
+            ("simple/index.html", html(&["a", "b"])),
+            ("simple/index.json", json(&["a", "b"])),
+        ]);
+        assert!(global_pair_violations(&[agreed], "t").is_empty());
+        // One half names something the other does not — the shape a boot that
+        // seeds an EMPTY json over a stranded html produces, where both halves
+        // exist and no absent-json check can see it.
+        let torn = bucket(vec![
+            ("simple/index.html", html(&["a", "b"])),
+            ("simple/index.json", json(&[])),
+        ]);
+        let reds = global_pair_violations(&[torn], "t");
+        assert_eq!(reds.len(), 1);
+        assert!(
+            reds[0].starts_with("GLOBAL_PAIR: bucket 0 at t"),
+            "{reds:?}"
+        );
+        // ...and the stranded pair itself: one half published, the other never.
+        let stranded = bucket(vec![("simple/index.html", html(&["a"]))]);
+        assert_eq!(global_pair_violations(&[stranded], "t").len(), 1);
+    }
+
+    /// A bare exclude hides the NAME and keeps the BYTES. The oracle speaks only
+    /// about a bucket that still stores the denied package's artifacts, so it
+    /// cannot pass by having nothing to look at.
+    #[test]
+    fn the_delist_oracle_needs_stored_bytes_before_it_says_anything() {
+        let denied = "vopr-alpha";
+        let artifact = format!("packages/{denied}/{}", filename(denied, 0));
+        let names = vec![denied.to_string()];
+        let listed_html = pypiron::render::pep503_global_html(&names).into_bytes();
+        let listed_json = pypiron::render::pep691_global_json(&names).into_bytes();
+        // Listed, but nothing stored: not this oracle's business (the name has
+        // no artifacts, which is VERIFY's orphan-view claim, not the delist one).
+        let no_bytes: BTreeMap<String, Vec<u8>> = BTreeMap::from([
+            ("simple/index.html".to_string(), listed_html.clone()),
+            ("simple/index.json".to_string(), listed_json.clone()),
+        ]);
+        assert!(delist_violations(&[no_bytes], denied).is_empty());
+        // Stored and delisted: the contract, kept.
+        let kept: BTreeMap<String, Vec<u8>> = BTreeMap::from([
+            (artifact.clone(), b"bytes".to_vec()),
+            (
+                "simple/index.html".to_string(),
+                pypiron::render::pep503_global_html(&[]).into_bytes(),
+            ),
+            (
+                "simple/index.json".to_string(),
+                pypiron::render::pep691_global_json(&[]).into_bytes(),
+            ),
+        ]);
+        assert!(delist_violations(&[kept], denied).is_empty());
+        // Stored and still listed, with its view back: two separate complaints,
+        // because the global list and the per-package view are two places an
+        // installer resolves from.
+        let relisted: BTreeMap<String, Vec<u8>> = BTreeMap::from([
+            (artifact, b"bytes".to_vec()),
+            ("simple/index.html".to_string(), listed_html),
+            ("simple/index.json".to_string(), listed_json),
+            (format!("simple/{denied}/index.json"), b"{}".to_vec()),
+        ]);
+        let reds = delist_violations(&[relisted], denied);
+        assert_eq!(reds.len(), 2, "{reds:?}");
+        assert!(reds
+            .iter()
+            .any(|r| r.contains("still lists the excluded package")));
+        assert!(reds.iter().any(|r| r.contains("still serves simple/")));
+    }
+
     /// ...and without `--rotate` those same flags are the whole profile, which
     /// is what the four pinned nightly rows and every `reproduce:` line depend
     /// on. The weights are asserted too, and are not incidental: a non-rotating
@@ -7307,7 +8070,8 @@ mod tests {
         assert_eq!(
             profile.describe(),
             "nodes=3 buckets=2 packages=6 files=2 ops=160 fail-percent=0 partition=0 \
-             weights=[publish 40, delete 10, tick 25, sweep 7, reconcile 4, jump 5, crash 5, nudge 4]"
+             excludes=0 weights=[publish 40, delete 10, tick 25, sweep 7, reconcile 4, jump 5, \
+             crash 5, nudge 4]"
         );
     }
 

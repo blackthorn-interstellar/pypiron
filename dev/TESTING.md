@@ -1305,6 +1305,137 @@ delete-dominant stretch that long is exponentially unlikely — not impossible,
 which is the point of swarming: sampling the mix itself turns a tail schedule
 into a routine one instead of waiting out its probability.
 
+### The delist lane (`--excludes`)
+
+Until this landed, **no simulated seed ever configured an `--exclude-package`
+denylist**, and the VIEWS == TRUTH oracle said so out loud: it called
+`verify_storage` with `Denylist::default()` and required views to equal truth in
+full. A delisted package violates that by design — the name leaves every index,
+the bytes stay on disk and stay fetchable by direct `/files/` URL — so the whole
+delisting half of the product was outside the simulator's world. Four walls, all
+of them verified before this section was written:
+
+1. **No denylist, ever.** With `state.denylist` permanently `None` the rebuild's
+   scrub (`worker::rebuild_package_indexes_inner`) was dead code in simulation.
+2. **`worker::reconcile_excludes` was unreachable.** Only `run_worker` calls it,
+   and the VOPR drives `worker::tick`/`worker::audit` directly — it has never
+   entered the worker loop. That function is the *only* thing that re-derives a
+   name's visibility after a config-only change, because such a change moves no
+   artifact: the package fingerprint is unchanged and the audit skips it.
+3. **`app::initialize_indexes` was unreachable.** Only the HTTP boot calls it,
+   and the VOPR boots no server. Its "seed only the missing half of the global
+   pair with an empty render" branch — the branch a crash between the pair's two
+   writes hands a live corpus to — could not occur.
+4. **`verify-index`'s cross-half check had no oracle.** "The maintenance CLI
+   disagrees with what serve enforced" was a shape nothing asserted, and the
+   simulator's steady state is not the product's: the VOPR audits every heal
+   round and drains to a fixpoint, while `pypiron serve` audits once at boot and
+   then every `--audit-interval` (**86400s** by default). Anything the audit
+   repairs is invisible to an oracle that reads the final world, and in
+   production it is what installers get for a day.
+
+`--excludes <percent>` is the share of seeds that arm the lane. An armed seed
+configures a seed-derived denylist — always one bare (whole-project) exclude,
+sometimes a second version-pinned one — and runs the product's boot sequence at
+every node start: `app::initialize_indexes`, then `worker::reconcile_excludes`
+against every bucket. Both write storage, so the lane is a **chaos dimension like
+`--partition`, not a workload shape**: rotation does not derive it, `--rotate
+--excludes N` is legal, the reproduce line carries it, and it defaults to **0**,
+where the harness is byte-identical to the pre-lane one (`excludes_for` returns
+before it draws any rng, `boot_args` returns `None`, and not one storage op is
+issued). Verified, not asserted — three whole-profile runs at `--excludes 0`, `src/`
+held identical and only `examples/vopr.rs` differing, match the pre-lane binary
+on **every counter and every existing reach row, to the digit**; the only
+differences in the whole output are the two new reach rows and the wall-clock
+duration string:
+
+| profile | storage-op interleavings | acked uploads | ack-totality misses | audit repairs |
+|---|---|---|---|---|
+| `--seeds 300 --nodes 2 --buckets 1 --ops 80` | 211,648 | 1,028 | 0 | 0 |
+| `--seeds 200 --nodes 3 --buckets 2 --packages 4 --files 3 --ops 120` | 474,372 | 1,737 | 28 | 0 |
+| `--seeds 300 --rotate` | 545,629 | 1,557 | 12 | 0 |
+
+**Half the armed seeds change the config mid-run**, and that half is the point.
+A denylist is startup config: it reaches a running process no other way, so
+"the exclude was there from boot" and "the operator added it and rolled the
+fleet" are two different worlds, and only the second has a mixed-config window in
+it. Nodes adopt the new set when they restart, exactly as production does; the
+heal phase restarts everyone, so the whole fleet is on the final set before any
+oracle looks. A failing armed seed prints its schedule beside the reproduce line
+— an armed failure whose schedule you cannot read is one you debug twice.
+
+Two oracles come with the lane, and the existing view oracles learned the delist
+rule rather than growing an exemption:
+
+- **`GLOBAL_PAIR`** — the PEP 503 index and the PEP 691 index are two renderings
+  of one name set, so they must name the same packages: present together, absent
+  together. Asserted at **the pre-audit check-point of every heal round** — the
+  markers drained, every node booted since its last crash, and the tier-3 audit
+  not yet run — which is exactly where `pypiron serve` spends every
+  `--audit-interval`, and where nothing in the harness looked before. This is
+  `verify-index`'s `stale-global-index` check reduced to the half that needs no
+  truth listing. It runs on every seed, armed or not, off raw `dump()` reads, and
+  reaches 100% of seeds on every profile measured.
+- **`DELIST`** — a bare exclude hides the NAME and keeps the BYTES, so on any
+  bucket that still stores a fully-denied package's artifacts, that name appears
+  in neither global half and has no `simple/<name>/` view. The premise is the
+  retention half of the contract and the conclusion is the delisting half, and
+  one execution is counted only where the premise holds, so the oracle cannot
+  pass by having nothing to look at. It reaches 65% of seeds at `--nodes 2
+  --buckets 1 --ops 80 --excludes 100`.
+- **VIEWS == TRUTH** now rules through the denylist the fleet is configured with
+  (which is what `serve` enforced and what the stored indexes were last built
+  against), and **VISIBILITY** treats a denied file the way it already treats a
+  mirror record under a private claim: `renderer_omits` grew a denylist arm.
+  That exempts the *index entry* and nothing else — DURABILITY still demands the
+  bytes and the sidecar on every bucket, and CONSERVATION still demands they
+  exist somewhere, which is the delist contract exactly.
+
+#### What the lane found on its first night
+
+**A rolling restart can leave an exclude unenforced until the next audit.** Every
+failing armed seed measured is a mid-run transition seed, and the shape is one:
+
+1. Node B restarts with the new config, boots, reconciles. The reconcile stamps
+   `_state/enforced-excludes.json` with the new set, marks the affected names
+   dirty, and a tick delists them.
+2. Node A has not restarted yet, so `state.denylist` is still `None`. Its own
+   rebuild of that package applies no scrub and **puts the name back** — in the
+   per-package view, the global index, or both.
+3. Node A restarts. Its boot reconcile diffs the live denylist against the stamp,
+   finds them **equal**, and does nothing. Nothing is marked dirty, so the tick
+   path never re-derives the name, and the relisting stands until the tier-3
+   audit — up to `--audit-interval`, 86400s by default.
+
+The audit does repair it, which is why the harness sees it as `AUDIT_*` rather
+than as a stale world: `AUDIT_REPAIRED_VIEWS` on crash-only seeds (where any
+audit repair is a violation) and `AUDIT_PREMATURE_CONSUMPTION` on the richer
+fault topologies. Rates and repros, measured at `8d8e639` — *after* that
+commit's two audit/global-index fixes, which this is not — `--max-secs 120
+--excludes 100`, one process each:
+
+| lane | seeds | failing | rate | first repro seeds |
+|---|---|---|---|---|
+| `--nodes 2 --buckets 1 --ops 80 --fail-percent 0` | 131,618 | 101 | 0.077% | 803, 3440, 4802, 5130, 5441, 6200 |
+| `--nodes 3 --buckets 2 --packages 4 --files 3 --ops 120` | 26,653 | 95 | 0.36% | 212, 270, 292, 593 |
+| `--rotate` | 37,292 | 185 | 0.50% | 49, 57, 461, 487 |
+
+Causally attributed, not guessed, and read straight off the runs rather than
+from a control build. Half of every armed seed is configured from boot and half
+transitions mid-run, and each failing seed prints its schedule beside its
+reproduce line: **381 of 381 failures across the three lanes are mid-run
+transitions, and none is a from-boot seed** (101/101, 95/95, 185/185). Roughly
+98,000 from-boot seeds ran in those same three processes and not one of them
+red. And the fixed batch the kill proofs run on (`--seeds 500
+--nodes 2 --buckets 1 --ops 80 --excludes 100`, fault injection on) is **green**:
+382,871 storage-op interleavings, 1,751 acked uploads, `GLOBAL_PAIR` on 500/500
+seeds and `DELIST` on 325/500.
+
+No product change is proposed here — the harness's job is to find it and hand it
+over reproducibly. The finding is filed as measurement and the lane stays
+opt-in until it is adjudicated: at `--excludes 0` — which is every existing lane,
+CI and nightly alike — nothing in this section runs at all.
+
 ### Proving the oracles can go red (`--break`)
 
 An invariant nobody has watched fail is not a test — it is an assertion of faith
@@ -1343,6 +1474,26 @@ storage and never the schedule.
 | `mirror-served` | the claim stays private but a **live mirror record** stands under it — a new filename cloned from a live record with its sidecar origin rewritten | `ORIGIN_TERMINALITY: … still serves … as live mirror truth` | 3 |
 | `split` | a byte conflict the merge never resolved: bucket 1 acks and keeps a second, same-length byte-set under a filename bucket 0 still serves its own for | `DURABILITY: … never left split` (needs ≥2 buckets) | 4 |
 | `attest` | an acked artifact's sidecar re-points at a digest no body has, fleet-wide, with every view re-pointed to match — the bytes, the buckets and the re-render all stay healthy | `SELF_CONSISTENCY: bucket … serves … while its own sidecar publishes` | 4 |
+| `global-pair` | the two halves of the global index pulled apart at the pre-audit check-point: `simple/index.html` names a package `simple/index.json` does not, fleet-wide | `GLOBAL_PAIR: bucket … do not name the same packages` | 1 |
+| `relist` | a fully-denied package put back into both global halves and given a per-package view again, on every bucket that still stores its artifacts (needs `--excludes 100`, which is what configures a denylist at all) | `DELIST: bucket … still lists the excluded package` | 4 |
+
+**`global-pair` and `relist` are the delist lane's legs** (see *The delist lane*
+above). They are two different claims and neither can stand in for the other:
+`global-pair` is about the two renderings of one name set agreeing with *each
+other* at a check-point no audit has reached, and it plants an identical tear on
+every bucket so CONVERGENCE stays quiet and the JSON's name set — the only half
+`agreement_projection` compares — never moves, leaving GLOBAL_PAIR alone holding
+it. `relist` is about the delisting contract itself and moves both halves
+together, so GLOBAL_PAIR stays quiet and DELIST is what reds; VERIFY reds
+alongside it and cannot not, since a view over a package with nothing renderable
+is an orphan view by its own reckoning, which is why the leg's expected text
+names DELIST. `relist` is refused outright without `--excludes` rather than left
+inert: with no denylist there is nothing delisted to put back, and the leg would
+report a 0% kill rate for an oracle that is perfectly alive. `global-pair` kills
+on **every** seed measured (8 windows of 6 from seeds 1, 101, … 701, first red at
+seed 1 in all of them); `relist`'s plant is inert on a seed whose workload left
+the denied package with no stored artifact, so its K is the worst first-red depth
+over those same windows.
 
 **Freeze and origin get two legs each, on purpose.** Freeze *justification* (a
 `.frozen` marker must be a real byte conflict) and freeze *totality* (a freeze
@@ -1750,6 +1901,13 @@ demands, not asserted: over five profiles × 5,000 seeds with `src/` pinned at
 `fae38a2` and only `examples/vopr.rs` differing, storage-op interleavings, acked
 uploads, ack-totality misses and audit repairs are identical to the digit, and
 `VOPR_TRACE_FILE` dumps for 24 (seed, profile) pairs are byte-identical.
+
+The delist lane added two slots (`GLOBAL_PAIR`, `DELIST`). `GLOBAL_PAIR` is
+unconditional and reads 100% of seeds on every profile measured; `DELIST` has no
+subject without a denylist, so it carries the same kind of standing excuse a
+single-bucket sample gives CONVERGENCE — `expected_zero` says *no denylist
+configured — the oracle needs `--excludes`* rather than letting a default run
+report a hole.
 
 **What it says today.** Over 330 seconds across all five profiles — 140,334
 seeds — every one of the nine invariant oracles executes, on every profile whose

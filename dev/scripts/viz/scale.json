@@ -49,14 +49,14 @@
       "source": "tests/model_event_protocol.rs:954 CI_STATES_NIGHTLY · hand-recorded the same way from the nightly `model_event_protocol_deep` job (:876); printed, never asserted"
     },
     {
-      "value": "23 / 23",
+      "value": "27 / 27",
       "label": "deliberate defects, each red for the right reason",
-      "source": ".github/workflows/ci.yml:305-360 · 23 `check` legs in the “Oracle kill proofs (--break)” step (:269), on every merge"
+      "source": ".github/workflows/ci.yml · 27 `check` legs over 26 `--break` names in the “Oracle kill proofs (--break)” step, on every merge"
     },
     {
-      "value": 23,
-      "label": "oracle and classifier slots · 22 with a proven --break kill. The 23rd, MERGE_DIVERGENCE, is a coverage statistic and not a gate: it owns no violation string, so nothing can red it and no mutation can kill it. The 23 legs cover 22 slots because STALENESS has two arms — `wedge` (never agrees) and `slow-repair` (agrees, too late)",
-      "source": "examples/vopr.rs:1179 REACH_SLOTS (reach panel printed on every run) for the 23 slots; examples/vopr.rs:245 `const BREAKS: [...; 23]` and the 23 `check` legs at .github/workflows/ci.yml:305-360 for the 23 legs. The slot no break can kill is MERGE_DIVERGENCE, index 19 of examples/vopr.rs:1273 REACH_VIOLATION_PREFIX, where it is the empty string; the ten classifier slots are empty there too but are killable through the `AUDIT_*` strings their oracle pushes (:1268)"
+      "value": 27,
+      "label": "oracle and classifier slots · 26 with a proven --break kill. The 27th, MERGE_DIVERGENCE, is a coverage statistic and not a gate: it owns no violation string, so nothing can red it and no mutation can kill it. The 27 legs cover 26 slots because STALENESS has two arms — `wedge` (never agrees) and `slow-repair` (agrees, too late)",
+      "source": "examples/vopr.rs REACH_SLOTS (reach panel printed on every run) for the 27 slots; examples/vopr.rs `const BREAKS: [...; 26]` and the 27 `check` legs in .github/workflows/ci.yml for the legs. The slot no break can kill is MERGE_DIVERGENCE, where REACH_VIOLATION_PREFIX is the empty string; the eleven classifier slots are empty there too but are killable through the `AUDIT_*` strings their oracle pushes"
     },
     {
       "value": "1-2 billion",

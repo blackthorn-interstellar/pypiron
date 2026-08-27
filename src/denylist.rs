@@ -65,7 +65,11 @@ impl Denylist {
     /// `serve` last enforced (stored in `_state/enforced-excludes.json`) rather
     /// than re-deriving it from a config channel `serve` may not have used. `"*"`
     /// is a bare whole-name exclude; any other token is a PEP 440 specifier set.
-    pub(crate) fn from_canonical(canonical: &BTreeMap<String, Vec<String>>) -> Result<Self> {
+    ///
+    /// `pub` also so the deterministic simulator can configure a denylist without
+    /// building a whole mirror config: the stamp format is the smallest complete
+    /// description of one, and it is the same shape the reconcile diffs.
+    pub fn from_canonical(canonical: &BTreeMap<String, Vec<String>>) -> Result<Self> {
         let mut deny: HashMap<String, Vec<Option<VersionSpecifiers>>> = HashMap::new();
         for (name, specs) in canonical {
             let mut constraints = Vec::with_capacity(specs.len());

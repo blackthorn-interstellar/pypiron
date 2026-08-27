@@ -2342,8 +2342,13 @@ async fn fallback_handler(req: Request) -> impl IntoResponse {
     )
 }
 
-/// Initialize empty index files if they don't exist
-async fn initialize_indexes(state: &AppState) -> Result<()> {
+/// Initialize empty index files if they don't exist.
+///
+/// `pub` only so the deterministic simulator can run the HTTP boot step after a
+/// simulated crash-restore. VOPR drives `worker::tick`/`worker::audit` directly
+/// and never boots a server, so "seed only the missing half of the global pair
+/// with an empty render" was a branch no simulated schedule could reach.
+pub async fn initialize_indexes(state: &AppState) -> Result<()> {
     let storage = state.pin().storage.clone();
     let html_key = format!("{SIMPLE_PREFIX}index.html");
     let json_key = format!("{SIMPLE_PREFIX}index.json");

@@ -156,7 +156,10 @@ def test_rebuild_index_preserves_delisting(tmp_path_factory, pypiron_bin, tmp_pa
             assert _poll(lambda: _index_filenames(data_dir, "delistme") == {wheel.name})
         with _proxy(pypiron_bin, data_dir, upstream["base_url"], "--exclude-package", "delistme"):
             assert _poll(lambda: _index_filenames(data_dir, "delistme") is None)
-        assert "delistme" not in _global_names_file(data_dir)
+            # The tick deletes the per-package index before its one batched
+            # global-index rewrite, so the global file must be polled too —
+            # asserting it after killing the server races that second write.
+            assert _poll(lambda: "delistme" not in _global_names_file(data_dir))
 
         # rebuild-index over the same store, with the exclude in config, must
         # PRESERVE the delisting — not re-materialize the index from truth.
@@ -349,7 +352,9 @@ def test_maintenance_honors_an_env_set_exclude(tmp_path_factory, pypiron_bin, tm
             env_extra={"PYPIRON_EXCLUDE_PACKAGE": "delistme"},
         ):
             assert _poll(lambda: _index_filenames(data_dir, "delistme") is None)
-        assert "delistme" not in _global_names_file(data_dir)
+            # Poll before killing the server: the global rewrite lands after the
+            # per-package deletion within the tick.
+            assert _poll(lambda: "delistme" not in _global_names_file(data_dir))
 
         # verify-index with NO config and NO env exclude reads the stamp → clean.
         cp = _run_pypiron(pypiron_bin, "verify-index", "--data-dir", str(data_dir))

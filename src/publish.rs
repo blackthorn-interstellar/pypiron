@@ -1506,7 +1506,15 @@ async fn write_project_status(
 /// and not a sidecar/metadata companion. The backslash guard matters on the
 /// upload, delete, and yank paths alike — keep them consistent.
 fn valid_artifact_filename(filename: &str) -> bool {
-    !filename.contains('/') && !filename.contains('\\') && sidecar::is_artifact(filename)
+    // Reject control bytes alongside path separators: a real artifact filename is
+    // never one, and a U+0001 in the name would smuggle the project page's base-URL
+    // sentinel (`project_cache::BASE_URL_SENTINEL`) into the cached page, where it
+    // is re-expanded to the request host on every serve — an amplification the
+    // page-cache size cap does not bound.
+    !filename.contains('/')
+        && !filename.contains('\\')
+        && !filename.contains(|c: char| c.is_control())
+        && sidecar::is_artifact(filename)
 }
 
 #[cfg(test)]

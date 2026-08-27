@@ -2126,16 +2126,24 @@ fn forwarded_ip(value: &str) -> Option<String> {
         .map(|addr| addr.ip().to_string())
 }
 
-/// The client's address for logging. Only behind a reverse proxy
-/// (`--trusted-proxy`) do the proxy-set `X-Forwarded-For` (leftmost) or
+/// The client's address for logging and throttling. Only behind a reverse proxy
+/// (`--trusted-proxy`) do the proxy-set `X-Forwarded-For` (rightmost) or
 /// `X-Real-IP` win; otherwise those headers are ignored — they are
 /// client-settable, so an ungated direct caller could forge its audit-logged
 /// address — and the direct peer is used, else `-`. A header that doesn't hold
 /// an IP counts as absent, so the next fallback takes over.
+///
+/// The *rightmost* `X-Forwarded-For` entry is the one the trusted proxy itself
+/// appended (the address it saw connect); a client can only prepend entries, not
+/// control that last hop. Keying the login throttle and audit log off the
+/// leftmost value let a client rotate a forged entry per request for a fresh
+/// throttle bucket — defeating the brute-force cooldown — and spoof the logged
+/// IP. This assumes a single trusted front proxy (pypiron's model); chained
+/// proxies would need a configured hop count to strip from the right.
 fn client_ip(headers: &HeaderMap, peer: Option<std::net::IpAddr>, trusted_proxy: bool) -> String {
     if trusted_proxy {
         if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(ip) = forwarded_ip(xff.split(',').next().unwrap_or("")) {
+            if let Some(ip) = forwarded_ip(xff.rsplit(',').next().unwrap_or("")) {
                 return ip;
             }
         }
@@ -2190,16 +2198,35 @@ fn format_clf(line: &AccessLogLine<'_>) -> String {
         .unwrap_or_else(|| "-".to_string());
     // `authuser` is the one field decoded from base64 (`basic_credentials`), so —
     // unlike the header/URI-sourced fields, which hyper has already stripped of
-    // control bytes — it can carry raw CR/LF/ESC. Drop control chars (Unicode Cc:
-    // C0, DEL, C1) so a crafted username can't forge log lines, poison fail2ban,
-    // or inject ANSI into an operator's terminal.
-    let authuser = authuser.map(|u| u.chars().filter(|c| !c.is_control()).collect::<String>());
+    // control bytes — it can carry raw CR/LF/ESC. It also sits *unquoted* in the
+    // line, so a space, double-quote, or bracket would terminate the field and
+    // forge counterfeit ones. Drop control chars (Unicode Cc: C0, DEL, C1) and
+    // those CLF delimiters so a crafted username can't forge log lines, poison
+    // fail2ban, or inject ANSI into an operator's terminal (CWE-117).
+    let authuser = authuser.map(|u| {
+        u.chars()
+            .filter(|c| !c.is_control() && !matches!(c, ' ' | '"' | '[' | ']'))
+            .collect::<String>()
+    });
+    // `referer`/`ua` sit inside double quotes and come from request headers (hyper
+    // has already stripped their control bytes), so the only forgery lever left is
+    // an embedded quote closing the field early: backslash-escape `\` and `"` the
+    // way CLF parsers expect, so neither can inject a counterfeit field.
+    let referer = referer.map(clf_quoted);
+    let ua = ua.map(clf_quoted);
     format!(
         "{host} - {authuser} [{time}] \"{method} {target} {proto}\" {status} {bytes} \"{referer}\" \"{ua}\"",
         authuser = dash(authuser.as_deref()),
-        referer = dash(referer),
-        ua = dash(ua),
+        referer = dash(referer.as_deref()),
+        ua = dash(ua.as_deref()),
     )
+}
+
+/// Escape a value for a double-quoted CLF field: backslash-escape `\` then `"` so
+/// neither can close the field and inject a counterfeit one. Control bytes are
+/// already absent (hyper strips them from header values before they reach here).
+fn clf_quoted(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Reject state-changing requests a browser initiated cross-site. pypiron's HTTP
@@ -2568,8 +2595,11 @@ mod tests {
         // Ungated (default): client-set forwarding headers are ignored, so the
         // direct peer is logged and a caller can't forge its audit address.
         assert_eq!(client_ip(&fwd, peer, false), "127.0.0.1");
-        // Behind a trusted proxy: the leftmost X-Forwarded-For entry wins.
-        assert_eq!(client_ip(&fwd, peer, true), "203.0.113.9");
+        // Behind a trusted proxy: the rightmost X-Forwarded-For entry wins — the
+        // hop the proxy appended, not the client-prepended leftmost. Here the
+        // attacker prepended 203.0.113.9; the real observed address (10.0.0.1)
+        // is what the proxy added, so throttling and logging can't be spoofed.
+        assert_eq!(client_ip(&fwd, peer, true), "10.0.0.1");
 
         // X-Real-IP is the fallback when X-Forwarded-For is absent, again only
         // when the proxy is trusted.
@@ -2706,9 +2736,10 @@ mod tests {
     }
 
     #[test]
-    fn clf_authuser_drops_control_chars() {
-        // A base64 username can decode to arbitrary UTF-8, including CR/LF/ESC.
-        // Those must not survive into the line: no forged second record, no ANSI.
+    fn clf_authuser_drops_control_chars_and_field_delimiters() {
+        // A base64 username can decode to arbitrary UTF-8, including CR/LF/ESC and
+        // the CLF field delimiters (space, quote, brackets). None may survive into
+        // the unquoted authuser field: no forged record, no ANSI, no faked fields.
         let line = format_clf(&AccessLogLine {
             host: "10.0.0.5",
             authuser: Some("evil\r\n10.0.0.6 - - [x] \"GET /forged\" 200 0 \"\" \"\"\x1b[31m"),
@@ -2724,10 +2755,33 @@ mod tests {
         assert!(!line.contains('\n'), "no embedded newline: {line:?}");
         assert!(!line.contains('\r'), "no embedded CR: {line:?}");
         assert!(!line.contains('\x1b'), "no ANSI escape: {line:?}");
-        // The non-control text is preserved on the single rendered line.
+        // Control chars and every CLF delimiter are stripped, so the injected
+        // request line / status / quotes collapse into one delimiter-free token.
         assert_eq!(
             line,
-            "10.0.0.5 - evil10.0.0.6 - - [x] \"GET /forged\" 200 0 \"\" \"\"[31m [10/Oct/2000:13:55:36 +0000] \"GET /simple/flask/ HTTP/1.1\" 200 1532 \"-\" \"-\""
+            "10.0.0.5 - evil10.0.0.6--xGET/forged200031m [10/Oct/2000:13:55:36 +0000] \"GET /simple/flask/ HTTP/1.1\" 200 1532 \"-\" \"-\""
+        );
+    }
+
+    #[test]
+    fn clf_quoted_fields_escape_embedded_quotes() {
+        // A User-Agent / Referer with a quote must not close its quoted field and
+        // inject a counterfeit one; the quote is backslash-escaped instead.
+        let line = format_clf(&AccessLogLine {
+            host: "10.0.0.5",
+            authuser: None,
+            time: "10/Oct/2000:13:55:36 +0000",
+            method: &Method::GET,
+            target: "/simple/flask/",
+            proto: "HTTP/1.1",
+            status: 200,
+            bytes: Some(1532),
+            referer: Some("http://ref/\" 200 0 \"evil"),
+            ua: Some("agent\\\"x"),
+        });
+        assert_eq!(
+            line,
+            "10.0.0.5 - - [10/Oct/2000:13:55:36 +0000] \"GET /simple/flask/ HTTP/1.1\" 200 1532 \"http://ref/\\\" 200 0 \\\"evil\" \"agent\\\\\\\"x\""
         );
     }
 }

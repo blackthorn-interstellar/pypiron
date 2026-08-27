@@ -32,6 +32,25 @@ def test_metadata_field_flood_is_rejected(disk_server, tmp_path):
     assert code == 400
 
 
+def test_filename_with_control_byte_is_rejected(disk_server, tmp_path):
+    """A filename carrying a control byte is refused with 400. A U+0001 would
+    otherwise smuggle the project page's base-URL sentinel into the cached page,
+    where it is re-expanded to the request host on every serve (an amplification
+    the page-cache size cap does not bound)."""
+    wheel = make_wheel("sentinelpkg", "1.0", tmp_path)
+    bad_name = "sentinelpkg-1.0-\x01pypiron-base-url\x01-py3-none-any.whl"
+    code, _ = upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+        fields={"name": "sentinelpkg", "version": "1.0"},
+        filename=bad_name,
+        expect_status=400,
+    )
+    assert code == 400
+
+
 def test_normal_upload_with_modest_metadata_succeeds(disk_server, tmp_path):
     """A realistic number of extra fields stays well under the cap and still
     publishes — the limit is headroom, not a functional constraint."""

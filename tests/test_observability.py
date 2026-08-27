@@ -321,12 +321,15 @@ def test_forwarded_for_junk_cannot_forge_clf_fields(disk_server_clf_trusted_prox
         return clf.match(line).group("host")
 
     # The header is genuinely trusted here, so the test can't pass vacuously.
+    # The rightmost entry (the hop the trusted proxy appended) is logged, not the
+    # client-prepended leftmost: 203.0.113.9 is the forgeable value, 10.0.0.1 is
+    # what the proxy actually observed.
     code, _, _ = http_get(
         f"{server['simple']}index.json",
         headers={"User-Agent": "pytest-xff-ok/1.0", "X-Forwarded-For": "203.0.113.9, 10.0.0.1"},
     )
     assert code == 200
-    assert logged_host("pytest-xff-ok/1.0") == "203.0.113.9"
+    assert logged_host("pytest-xff-ok/1.0") == "10.0.0.1"
 
     junk = '1.2.3.4 - evil [junk] "GET / HTTP/1.1" 200'
     code, _, _ = http_get(

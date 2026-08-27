@@ -665,6 +665,7 @@ def upload_legacy(
     username: Optional[str] = None,
     password: Optional[str] = None,
     fields: Optional[Dict[str, str]] = None,
+    filename: Optional[str] = None,
     timeout: float = 30.0,
     expect_status: int = 200,
     follow_redirects: bool = True,
@@ -673,11 +674,13 @@ def upload_legacy(
 
     Sends the standard metadata fields (:action, name, version, sha256_digest)
     plus the file in field "content". `fields` overrides/extends the defaults.
-    Returns (status, body); raises if status != expect_status. Set
-    `follow_redirects=False` to observe the server's raw status (urllib would
-    otherwise transparently chase a 3xx and mask it).
+    `filename` overrides the multipart part's declared filename (defaults to the
+    file's on-disk name) — useful for exercising filename validation without
+    touching the filesystem. Returns (status, body); raises if status !=
+    expect_status. Set `follow_redirects=False` to observe the server's raw
+    status (urllib would otherwise transparently chase a 3xx and mask it).
     """
-    filename = wheel_path.name
+    filename = filename if filename is not None else wheel_path.name
     file_bytes = wheel_path.read_bytes()
     # Legacy binary formats (.egg/.exe/.msi) carry no parseable name/version; a
     # caller publishing one supplies both in `fields`, which would override the

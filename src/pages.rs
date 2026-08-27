@@ -347,10 +347,19 @@ async fn render_project(
     // Quarantine omits the download links — the same parity `/simple/` keeps; the
     // byte gate is the guarantee, a link-free page is hygiene alongside it.
     let render_files: &[render::FileMetadata] = if blocks_downloads { &[] } else { &files };
+    // Strip control bytes from the uploader/mirror-controlled fields before they
+    // are rendered into the cached page. Only `ctx.base_url` (the sentinel set
+    // above) may legitimately carry U+0001; a filename, version, or yank reason
+    // that smuggled the sentinel would otherwise be re-expanded to the request
+    // host on every serve. Display-only — the version/representative-file logic
+    // above already ran against the raw files.
+    let render_files: Vec<render::FileMetadata> =
+        render_files.iter().map(sanitize_for_page).collect();
+    let selected = coremeta::strip_control_chars(&selected);
     let html = html::project_html(
         &ctx,
         &pkg,
-        render_files,
+        &render_files,
         &selected,
         pinned,
         meta.as_ref(),
@@ -361,6 +370,21 @@ async fn render_project(
     let body = bytes::Bytes::from(html);
     state.project_cache.put(cache_key, body.clone(), generation);
     serve_project_page(body, headers)
+}
+
+/// A copy of `f` with control bytes stripped from its uploader/mirror-controlled
+/// display fields (filename, version, yank reason). Guards the cached project
+/// page: the only U+0001 it may hold is [`project_cache::BASE_URL_SENTINEL`],
+/// which the serve path re-expands to the request host — a planted sentinel in a
+/// rendered field would amplify every serve outside the page-cache size cap.
+fn sanitize_for_page(f: &render::FileMetadata) -> render::FileMetadata {
+    let mut f = f.clone();
+    f.filename = coremeta::strip_control_chars(&f.filename);
+    f.version = f.version.as_deref().map(coremeta::strip_control_chars);
+    if let Yanked::Reason(reason) = &f.yanked {
+        f.yanked = Yanked::Reason(coremeta::strip_control_chars(reason));
+    }
+    f
 }
 
 /// Serve a project page whose cached bytes carry [`project_cache::BASE_URL_SENTINEL`]:

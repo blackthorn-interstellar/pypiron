@@ -112,7 +112,7 @@ pub fn parse(bytes: &[u8]) -> CoreMetadata {
 /// control bytes at parse time means no uploader-supplied field can carry the
 /// sentinel into cached content. Display is best-effort, so dropping junk control
 /// bytes is strictly an improvement.
-fn strip_control_chars(text: &str) -> String {
+pub(crate) fn strip_control_chars(text: &str) -> String {
     text.chars()
         .filter(|&c| !c.is_ascii_control() || matches!(c, '\t' | '\n' | '\r'))
         .collect()

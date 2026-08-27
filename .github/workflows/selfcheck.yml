@@ -144,6 +144,19 @@ jobs:
       # is — so the gate would report green having tested nothing, which is the
       # exact failure this workflow exists to catch. Use them.
       #
+      # Authenticating and listing is not enough either: the suite uploads
+      # packages, reads them back, and the minio fixture empties the bucket
+      # around every test (tests/conftest.py `_s3_empty_bucket`, an
+      # `aws s3 rm --recursive`). A list-only IAM user passes an
+      # authenticate-and-list probe and then fails weekly.yml at the first
+      # upload, so exercise the whole set — ListBucket, PutObject, GetObject,
+      # DeleteObject — on one throwaway key under `selfcheck/`.
+      #
+      # The region is checked against the bucket's own, not just used: the aws
+      # CLI silently follows S3's region redirect, so a wrong
+      # PYPIRON_TEST_S3_REGION would pass every call in this step while
+      # pypiron's object_store, which does not redirect, fails all weekly long.
+      #
       # AWS_SESSION_TOKEN is explicitly blanked. The OIDC step above calls
       # configure-aws-credentials, which exports its assumed-role session token
       # job-wide through GITHUB_ENV; leave it set and the SDK pairs that token
@@ -160,15 +173,51 @@ jobs:
           AWS_DEFAULT_REGION: ${{ vars.PYPIRON_TEST_S3_REGION }}
           BUCKET: ${{ secrets.PYPIRON_TEST_S3_REAL_BUCKET }}
         run: |
+          set -u
           if ! aws sts get-caller-identity > /dev/null; then
             echo "::error::secrets.AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY do not authenticate — weekly.yml's real-S3 leg will fail. The key has been rotated, disabled or deleted."
             exit 1
           fi
-          if ! aws s3 ls "s3://$BUCKET/" > /dev/null; then
-            echo "::error::The real-S3 keys authenticate but cannot list their own test bucket — weekly.yml's real-S3 leg will fail. Check the bucket name in PYPIRON_TEST_S3_REAL_BUCKET, the region in vars.PYPIRON_TEST_S3_REGION, and that the IAM user still holds s3:ListBucket on it."
+          # stdout is captured; the CLI's own error text still reaches the log.
+          if ! seen=$(aws s3api head-bucket --bucket "$BUCKET" --query 'BucketRegion' --output text); then
+            echo "::error::The real-S3 keys authenticate but cannot reach s3://$BUCKET — weekly.yml's real-S3 leg will fail. Check the bucket name in secrets.PYPIRON_TEST_S3_REAL_BUCKET still exists and that the IAM user is allowed on it."
             exit 1
           fi
-          echo "real-S3 static keys authenticate and list their bucket: ok" >> "$GITHUB_STEP_SUMMARY"
+          case "$seen" in
+            "$AWS_REGION") ;;
+            ''|None)
+              echo "::warning::This aws CLI did not report the bucket's region, so a wrong vars.PYPIRON_TEST_S3_REGION cannot be ruled out here." ;;
+            *)
+              echo "::error::vars.PYPIRON_TEST_S3_REGION says '$AWS_REGION' but s3://$BUCKET lives in '$seen' — weekly.yml's real-S3 leg signs for the wrong region and fails. Point the variable at the bucket's region."
+              exit 1 ;;
+          esac
+          if ! aws s3 ls "s3://$BUCKET/" > /dev/null; then
+            echo "::error::The real-S3 keys reach their test bucket but cannot list it — weekly.yml's real-S3 leg will fail, because the fixture empties the bucket around every test. Check the IAM user still holds s3:ListBucket on it."
+            exit 1
+          fi
+          key="selfcheck/probe-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          sent="$RUNNER_TEMP/s3-probe.sent"
+          back="$RUNNER_TEMP/s3-probe.back"
+          printf 'pypiron selfcheck %s\n' "$GITHUB_RUN_ID" > "$sent"
+          # However this step ends, the probe key goes away.
+          trap 'aws s3api delete-object --bucket "$BUCKET" --key "$key" > /dev/null 2>&1 || true' EXIT
+          if ! aws s3api put-object --bucket "$BUCKET" --key "$key" --body "$sent" > /dev/null; then
+            echo "::error::The real-S3 keys cannot write to s3://$BUCKET — weekly.yml's real-S3 leg will fail at its first upload. Grant the IAM user s3:PutObject on the bucket."
+            exit 1
+          fi
+          if ! aws s3api get-object --bucket "$BUCKET" --key "$key" "$back" > /dev/null; then
+            echo "::error::The real-S3 keys can write to s3://$BUCKET but not read back — weekly.yml's real-S3 leg will fail on its first download. Grant the IAM user s3:GetObject on the bucket."
+            exit 1
+          fi
+          if ! cmp -s "$sent" "$back"; then
+            echo "::error::s3://$BUCKET returned different bytes than were written — the bucket is not a plain object store (check for a replication, encryption or object-lambda rule that rewrites objects)."
+            exit 1
+          fi
+          if ! aws s3api delete-object --bucket "$BUCKET" --key "$key" > /dev/null; then
+            echo "::error::The real-S3 keys cannot delete from s3://$BUCKET — weekly.yml's real-S3 leg will fail, because the fixture empties the bucket before and after every test. Grant the IAM user s3:DeleteObject on the bucket."
+            exit 1
+          fi
+          echo "real-S3 static keys authenticate; bucket in $AWS_REGION; list/put/get/delete round trip ok" >> "$GITHUB_STEP_SUMMARY"
 
       - name: AWS static keys — not configured
         if: env.S3_STATIC_PROBE != 'true'

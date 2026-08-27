@@ -83,7 +83,7 @@ def _client_env(args: list[str], env: Optional[Dict[str, str]]) -> Optional[Dict
     spawns. Scoped to the child on purpose: exported where an outer `uv run` can
     read it, a changed cutoff makes uv re-resolve the project and rewrite
     uv.lock, silently dropping the cooldown it is meant to leave alone."""
-    if not args or os.path.basename(args[0]) != "uv":
+    if not args or os.path.basename(args[0]).lower() not in {"uv", "uv.exe"}:
         return env
     return {**(os.environ if env is None else env), "UV_EXCLUDE_NEWER": CLIENT_EXCLUDE_NEWER}
 

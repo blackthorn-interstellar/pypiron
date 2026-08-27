@@ -14,8 +14,8 @@ categories = ["development-tools", "web-programming"]
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.7", features = ["macros", "json", "multipart"] }
-base64 = "0.22"
+axum = { version = "0.8", features = ["macros", "json", "multipart"] }
+base64 = "0.23"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 flate2 = "1"
@@ -26,29 +26,29 @@ ipnet = "2"
 percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 time = { version = "0.3", features = ["macros", "formatting", "parsing", "serde", "std"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs"] }
 tokio-util = { version = "0.7", features = ["io"] }
-tower-http = { version = "0.5", features = ["timeout"] }
+tower-http = { version = "0.6", features = ["timeout"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi", "json"] }
 html-escape = "0.2"
 async-trait = "0.1"
-sha2 = "0.10"
+sha2 = "0.11"
 md-5 = "0.11"
 # Offline PEP 740 (Sigstore bundle) verification — all pure-Rust RustCrypto, no
 # network, no unsafe. p256: DSSE leaf signature, Rekor v1 SET, and CT SCT (all
 # ECDSA-P256/SHA-256). p384: the Fulcio cert chain (ECDSA-P384/SHA-384).
 # ed25519-dalek: the Rekor "Log2025" SET. x509-cert: parse/re-encode Fulcio
 # certs. See src/attest.rs; the trust root is embedded (src/assets/).
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
-p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
-ed25519-dalek = { version = "2", default-features = false }
-ecdsa = { version = "0.16", default-features = false, features = ["der"] }
-signature = { version = "2", default-features = false }
-x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8"] }
+ed25519-dalek = { version = "3", default-features = false }
+ecdsa = { version = "0.17", default-features = false, features = ["der"] }
+signature = { version = "3", default-features = false }
+x509-cert = { version = "0.3", default-features = false, features = ["pem"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 # gzip handles upstream Simple-index/JSON responses; wheels are already
 # compressed, so brotli/zstd buy nothing but two C/Rust codec dependency trees.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "gzip", "stream"] }

@@ -1,9 +1,10 @@
 # Nightly Python dependency bump, end to end.
 #
-# `uv lock --upgrade --exclude-newer <now - 14 days>` moves the test-suite
-# lockfile, but only onto releases that have been public for a fortnight: a
-# freshly published wheel is where a supply-chain compromise gets caught, so the
-# lane never installs one. Green -> a lockfile PR that merges itself once the
+# `uv lock --upgrade` moves the test-suite lockfile, but only onto releases that
+# have been public for a fortnight — pyproject.toml's `[tool.uv] exclude-newer`
+# holds every resolve behind that window, this one included. A freshly published
+# wheel is where a supply-chain compromise gets caught, so the lane never
+# installs one. Green -> a lockfile PR that merges itself once the
 # checks pass. Broken -> a Grok agent fixes the fallout and a PR carries the
 # fix. Still red after its one attempt -> the PR is labeled needs-human.
 #
@@ -53,9 +54,9 @@ concurrency:
 permissions: {}
 
 env:
-  # The release-age cooldown, in days. Change it here and the report, the PR
-  # body and the agent prompts follow.
-  COOLDOWN_DAYS: '14'
+  # The release-age cooldown lives in pyproject.toml ([tool.uv] exclude-newer),
+  # where it governs every resolve rather than just this lane's; the bump step
+  # reads it back out for the PR body. Change it there.
   BRANCH: deps/nightly
 
 jobs:
@@ -119,34 +120,32 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/deps"
-          cutoff=$(date -u -d "$COOLDOWN_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
-          echo "cooldown cutoff: $cutoff"
-          uv lock --upgrade --exclude-newer "$cutoff" 2>&1 | tee "$RUNNER_TEMP/deps/uv-lock.log"
-          # `--exclude-newer` stamps the cutoff into uv.lock's `[options]` table.
-          # That stanza is provenance, not a dependency pin, and the next plain
-          # `uv lock` strips it back out — so committing it would hand every
-          # contributor a spurious lockfile diff and would leave a stale cutoff
-          # constraining resolution until someone noticed. Drop it, and drop it
-          # narrowly: the substitution matches only an [options] table whose
-          # single key is exclude-newer, so a future uv that writes more there
-          # leaves the stanza alone rather than losing a real option.
-          python3 - <<'PY'
-          import pathlib, re
-          p = pathlib.Path("uv.lock")
-          p.write_text(re.sub(r'\n\[options\]\nexclude-newer = "[^"\n]*"\n', '\n', p.read_text(), count=1))
-          PY
+          # The cooldown is `exclude-newer` in pyproject.toml's [tool.uv], not a
+          # flag here: uv applies it to `--upgrade` like any other resolver
+          # setting, so a contributor's plain `uv lock` gets the same window this
+          # lane does. It is a relative span, which uv records in uv.lock as
+          # `exclude-newer-span` and re-evaluates against today on every resolve —
+          # so the lockfile carries a rolling window, never a frozen date, and
+          # that line belongs in the commit. (The old flag stamped an absolute
+          # cutoff that had to be scrubbed back out; nothing to scrub now.)
+          cooldown=$(sed -n 's/^exclude-newer = "\([0-9]*\) days"$/\1/p' pyproject.toml)
+          [ -n "$cooldown" ] || { echo "::error::no exclude-newer window in pyproject.toml [tool.uv]"; exit 1; }
+          echo "release-age cooldown: $cooldown days"
+          uv lock --upgrade 2>&1 | tee "$RUNNER_TEMP/deps/uv-lock.log"
           stray=$(git diff --name-only | grep -vE '^uv\.lock$' || true)
           if [ -n "$stray" ]; then
             echo "::error::the bump touched more than uv.lock: $stray"
             exit 1
           fi
           {
-            printf 'Nightly Python dependency bump with a %s-day release-age cooldown, resolved by:\n\n' "$COOLDOWN_DAYS"
+            printf 'Nightly Python dependency bump with a %s-day release-age cooldown, resolved by:\n\n' "$cooldown"
             printf '```\n'
-            printf 'uv lock --upgrade --exclude-newer %s\n' "$cutoff"
+            printf 'uv lock --upgrade\n'
             printf '```\n\n'
-            printf 'Nothing published inside that window is eligible, so a package released in the\n'
-            printf 'last %s days keeps its current pin and gets proposed again once it has aged out.\n' "$COOLDOWN_DAYS"
+            printf 'The window is the exclude-newer setting in pyproject.toml, so it applies to\n'
+            printf 'every resolve, not just this one. Nothing published inside it is eligible: a package\n'
+            printf 'released in the last %s days keeps its current pin and gets proposed again\n' "$cooldown"
+            printf 'once it has aged out.\n'
             printf 'Scope is uv.lock, the Python test suite only: Cargo and the actions pins belong\n'
             printf 'to dependabot.\n\n'
             printf 'What moved:\n\n'

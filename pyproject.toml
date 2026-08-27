@@ -47,6 +47,14 @@ strip = true
 # runs the debug binary itself (tests/helpers.py ensure_built). Release wheels
 # are built by maturin-action in CI, which doesn't go through uv sync.
 package = false
+# Release-age cooldown: nothing published in the last fortnight is eligible to
+# be locked. A freshly published wheel is where a supply-chain compromise gets
+# caught, so no resolution here — nightly bump, contributor `uv lock`, or CI —
+# installs one. This is a rolling window, not a frozen date: uv records it in
+# uv.lock as `exclude-newer-span = "P14D"`, which re-evaluates against today on
+# every resolve. Keep it in sync with COOLDOWN_DAYS in
+# .github/workflows/nightly-deps.yml, which only quotes it in the PR body now.
+exclude-newer = "14 days"
 
 [dependency-groups]
 dev = [

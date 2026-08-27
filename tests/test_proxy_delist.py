@@ -231,6 +231,10 @@ def test_verify_index_clean_after_delist(tmp_path_factory, pypiron_bin, tmp_path
             assert _poll(lambda: _index_filenames(data_dir, "delistme") == {wheel.name})
         with _proxy(pypiron_bin, data_dir, upstream["base_url"], "--exclude-package", "delistme"):
             assert _poll(lambda: _index_filenames(data_dir, "delistme") is None)
+            # The tick deletes the per-package index before its one batched
+            # global-index rewrite, so the global file must be polled too —
+            # asserting it after killing the server races that second write.
+            assert _poll(lambda: "delistme" not in _global_names_file(data_dir))
 
         # The oracle models delisting: the cached-but-delisted package is not a
         # divergence, so the store reads clean (exit 0).

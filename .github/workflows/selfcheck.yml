@@ -10,11 +10,13 @@ name: Selfcheck
 # configured, or fails because it IS configured and broken. Run it after rotating
 # a credential, repointing a bucket, or refreshing the corpus release asset.
 #
-# Dispatch it from master. The AWS OIDC probe assumes a role whose trust policy
-# matches this repo's OIDC subject, and a subject scoped to `ref:refs/heads/master`
-# — the normal way to write one — refuses every other ref. Run this from a branch
-# and the assume-role step fails on the ref, not on the credential, which is a
-# false alarm about the one thing this workflow exists to rule out.
+# Dispatch it from master; on any other ref the job skips outright, because it
+# mounts every persistent credential this repo owns (see the gate on the job).
+# That was always the rule anyway: the AWS OIDC probe assumes a role whose trust
+# policy matches this repo's OIDC subject, and a subject scoped to
+# `ref:refs/heads/master` — the normal way to write one — refuses every other
+# ref, so a branch run failed on the ref rather than on the credential, which is
+# a false alarm about the one thing this workflow exists to rule out.
 #
 # What it covers:
 #   soak-bundle.yml  vars.SOAK_AWS_ROLE / SOAK_S3_BUCKET (AWS OIDC upload)
@@ -29,6 +31,19 @@ permissions: {}
 jobs:
   selfcheck:
     name: automation preconditions
+    # The security half of the header's "dispatch it from master" rule. This job
+    # mounts every persistent credential the repo owns at once — the static AWS
+    # key pair, the GCS service-account key, XAI_API_KEY — and workflow_dispatch
+    # is satisfied at ANY ref, so without this `gh workflow run selfcheck.yml
+    # --ref <branch>` would run that branch's version of THIS FILE with all three
+    # in the environment. Nothing has to be smuggled in through a dependency
+    # here: editing a probe step to print a secret is a one-line commit on a
+    # branch nobody has to approve. Pinning the `environment:` below to master
+    # does the same job, but that is repo config no reader of this file can
+    # verify; with this line the pinning is belt-and-braces rather than the only
+    # defense. Same class as ci.yml's real-GCS job (9445aea) and weekly.yml's
+    # real-S3 job (0b69727).
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -37,8 +52,9 @@ jobs:
       pull-requests: write # the canary pull request below
     # XAI_API_KEY belongs to nightly-deps.yml's repair agent and lives in this
     # environment, so mounting it here also proves the environment itself
-    # resolves. Pin the environment's deployment branches to master and the
-    # header's "dispatch from master" rule enforces itself.
+    # resolves. Pinning the environment's deployment branches to master is worth
+    # doing as a second layer, but the ref gate above is what actually enforces
+    # the header's "dispatch from master" rule.
     environment: nightly-deps
     # Nothing here reads the repo, so there is no checkout and no token in
     # .git/config — the canary below builds its branch through the API rather

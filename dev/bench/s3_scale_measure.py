@@ -42,6 +42,10 @@ TREE = Path("/tmp/scale-tree")
 
 
 def sh(cmd: str, **kw) -> subprocess.CompletedProcess:
+    # Every caller is a literal in this file, parameterized only by the argv the
+    # operator typed to start a manual local benchmark. Nothing untrusted reaches
+    # the shell, and pipelines are the point of the helper.
+    # nosemgrep: python.lang.security.audit.subprocess-shell-true.subprocess-shell-true
     return subprocess.run(cmd, shell=True, text=True, capture_output=True, **kw)
 
 

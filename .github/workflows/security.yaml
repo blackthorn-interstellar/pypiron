@@ -297,33 +297,54 @@ jobs:
       # job is deliberately not hermetic: it previews what a corporate scanner
       # running today's rules would flag. A new upstream rule turning this red
       # on an unchanged tree is signal to triage, not flake to retry away.
-      # --error is what fails the job in both variants.
-      - name: Semgrep community rules (text)
-        if: ${{ github.event.repository.private }}
-        run: |
-          semgrep scan \
-            --config auto \
-            --error \
-            --exclude='target/**' \
-            --exclude='.local/**' \
-            --exclude='fuzz/corpus/**' \
-            --exclude='fuzz/seeds/**' \
-            --exclude='fuzz/artifacts/**' \
-            .
+      #
+      # --exclude-rule drops dynamic-urllib-use-detected wholesale. It fires on
+      # every `urllib.request.urlopen(url)` where the URL is not a literal, and
+      # the only Python here that makes HTTP calls is dev/ tooling a maintainer
+      # runs by hand: benchmark drivers hitting a localhost pypiron they just
+      # started, operator scripts taking the endpoint as argv, the soak
+      # reporter's EC2 metadata lookups. No untrusted input reaches any of them,
+      # and the shipped server is Rust. 23 findings, all of them the same
+      # non-finding — a per-line suppression campaign would just be noise with
+      # more places to rot. Accepted repo-wide, deliberately: if Python ever
+      # serves a request here, this line has to come back out.
+      #
+      # No --error: the scan writes SARIF and exits 0 either way, and the step
+      # below is what fails the job. Semgrep's SARIF output says nothing on
+      # stdout, so a red job used to leave you with no finding in the log at all
+      # — you had to go read the Security tab to learn what broke.
       - name: Semgrep community rules (SARIF)
-        if: ${{ !github.event.repository.private }}
         run: |
           semgrep scan \
             --config auto \
             --sarif \
             --output semgrep.sarif \
-            --error \
+            --exclude-rule=python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected \
             --exclude='target/**' \
             --exclude='.local/**' \
             --exclude='fuzz/corpus/**' \
             --exclude='fuzz/seeds/**' \
             --exclude='fuzz/artifacts/**' \
             .
+      # SARIF carries a `nosemgrep`-suppressed finding through as a result with
+      # `suppressions: [{kind: inSource}]` — that is the point of the format, and
+      # it is how the Security tab shows those rows as dismissed rather than
+      # losing them. So filter on the suppression, not on the results array, or
+      # every accepted risk in the tree fails the job forever.
+      - name: Findings
+        run: |
+          set -euo pipefail
+          count=$(jq '[.runs[].results[] | select((.suppressions // []) | length == 0)] | length' semgrep.sarif)
+          if [ "$count" -eq 0 ]; then
+            echo "semgrep: clean"
+            exit 0
+          fi
+          jq -r '.runs[].results[]
+            | select((.suppressions // []) | length == 0)
+            | .locations[0].physicalLocation as $l
+            | "\(.ruleId) \($l.artifactLocation.uri):\($l.region.startLine) \(.message.text | gsub("\\s+"; " "))"' semgrep.sarif
+          echo "::error::semgrep: $count finding(s) — listed above, and in the Security tab"
+          exit 1
       # Fork PRs skip the upload — read-only token, see the Trivy note above.
       - name: Upload Semgrep SARIF
         if: ${{ always() && !github.event.repository.private && hashFiles('semgrep.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
@@ -486,13 +507,17 @@ jobs:
       #   seeded on 3.12+, so it is pinned here rather than left to float.
       #
       #   the manifest must be marker-free. The plugin honors sys_platform
-      #   markers but not python_version ones, and this project's
-      #   requires-python is >=3.8, so the universal `uv export` carries two pins
-      #   for 18 packages (cffi, pytest, requests, …) — the plugin would demand
-      #   every py<3.9 backport be installed and fail with "Required packages
-      #   missing". Installing the export (uv evaluates the markers) and then
-      #   freezing yields one pin per package: exactly the closure the runner's
-      #   interpreter resolves. --skip-unresolved is deliberately NOT used — it
+      #   markers but not python_version ones. At requires-python >=3.11 the
+      #   universal `uv export` is down to one pin per package, but three lines
+      #   still carry a python_full_version < '3.12' gate (backports-tarfile,
+      #   importlib-metadata, zipp). uv skips those on the runner's interpreter
+      #   (3.12 on ubuntu-latest today); the plugin, blind to the gate, would
+      #   demand them anyway and fail with "Required packages missing".
+      #   Installing the export (uv evaluates the markers) and then freezing
+      #   yields exactly the closure the runner's interpreter resolves — and
+      #   keeps yielding it when a future backport enters the lock, which is why
+      #   the step stays even though the pin count is no longer the reason.
+      #   --skip-unresolved is deliberately NOT used — it
       #   drops unresolved lines silently, so a scan that resolved nothing would
       #   still report green.
       #

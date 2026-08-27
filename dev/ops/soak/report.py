@@ -134,6 +134,11 @@ def signature(violation: str) -> str:
 
 
 def sighash(sig: str) -> str:
+    # A dedup fingerprint, not a security primitive — collisions merge two
+    # findings, they don't forge anything. It is also the S3 key the live soak
+    # fleet already writes its findings under, so changing the algorithm would
+    # orphan every stored finding. Fixed by that, not by preference.
+    # nosemgrep: python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
     return hashlib.sha1(sig.encode("utf-8")).hexdigest()
 
 
@@ -168,6 +173,10 @@ def imds(path: str) -> str | None:
     """One IMDSv2 lookup; fail-open (None off-EC2 or on any hiccup)."""
     base = "http://169.254.169.254/latest"
     try:
+        # EC2's instance metadata service is plaintext HTTP at a link-local
+        # address by design; there is no HTTPS endpoint to prefer. IMDSv2's
+        # token is what makes the hop safe, and that is what this asks for.
+        # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-request-object.insecure-request-object
         req = urllib.request.Request(
             f"{base}/api/token", method="PUT",
             headers={"X-aws-ec2-metadata-token-ttl-seconds": "300"},

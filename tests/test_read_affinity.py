@@ -416,6 +416,13 @@ def test_region_bucket_failover_and_drain_gated_return(
         lambda: minio_key_exists_in(minio, b, f"packages/{base_pkg}/{base_wheel.name}"),
         what="baseline fanned out to B",
     )
+    # Mirror image of the loan test's wait: the outage below leaves reads on A
+    # with no read-through behind them, so A must hold its own package index —
+    # a derived view the worker rebuilds after the upload acks — before B dies.
+    _eventually(
+        lambda: base_wheel.name in minio_get_key_in(minio, a, f"simple/{base_pkg}/index.json"),
+        what="A built its own index for the baseline",
+    )
 
     # Sustained region-bucket outage: reads abandon B for the write home A.
     faults.fail(b)
@@ -515,6 +522,15 @@ def test_the_read_pin_is_lent_to_the_region_bucket_and_taken_back(
     _upload(server, wheel)
     wait_for_file_in_index(server["simple"], pkg, wheel.name)
     _eventually(lambda: minio_key_exists_in(minio, b, akey), what="record fanned out to B")
+    # The bytes are not enough: indexes are per-bucket derived views rebuilt from
+    # the `_dirty/` markers replication drops, so B holds the record well before
+    # it can answer a resolver from its own index. The served index reads through
+    # to the write home meanwhile — which is exactly what killing A below takes
+    # away, so wait for B to stand alone or the install races the rebuild.
+    _eventually(
+        lambda: wheel.name in minio_get_key_in(minio, b, f"simple/{pkg}/index.json"),
+        what="B built its own index for the record",
+    )
 
     # Owe B a note it can never satisfy, then move reads off B with a sustained
     # outage. B heals, but the owed note keeps reads on A: reads now have no

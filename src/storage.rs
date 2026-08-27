@@ -900,16 +900,21 @@ pub(crate) fn is_bucket_unavailable(err: &anyhow::Error) -> bool {
 
 pub(crate) fn message_is_missing_bucket(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    // S3 (and GCS, which shares the "specified bucket does not exist" wording)
-    // report a missing bucket; Azure reports a missing container. Both are the
-    // container-level outage the health controller must fail over on — distinct
-    // from a healthy missing object inside a live bucket.
+    // Match only the provider's structured error *code*, never the free-text
+    // message. object_store surfaces a 404 as a typed NotFound whose Display
+    // includes the whole response body — for a missing *object* that body echoes
+    // the request's object key (`<Key>…</Key>`), which is attacker-controlled. A
+    // whole-message scan for the human phrase "specified bucket does not exist"
+    // therefore fired on a healthy 404 for a file named to contain it, forging a
+    // bucket-outage failover signal (CWE-807). The `<Code>`/`"code"` token can't
+    // be forged through a key: the filename gate rejects '/', so `</code>` can't
+    // be formed, and providers XML/JSON-escape the echoed key regardless. All
+    // three backends emit the code on a real container outage — S3 and GCS (its
+    // XML API) `NoSuchBucket`, Azure `ContainerNotFound` — so nothing is lost.
     message.contains("<code>nosuchbucket</code>")
         || message.contains("\"code\":\"nosuchbucket\"")
-        || message.contains("specified bucket does not exist")
         || message.contains("<code>containernotfound</code>")
         || message.contains("\"code\":\"containernotfound\"")
-        || message.contains("specified container does not exist")
 }
 
 pub(crate) fn object_store_is_missing_bucket(error: &OsError) -> bool {
@@ -4040,6 +4045,7 @@ mod tests {
 
     #[test]
     fn distinguishes_missing_bucket_from_missing_object_text() {
+        // A real missing bucket/container carries the provider's structured code.
         assert!(message_is_missing_bucket(
             "404 <Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message>"
         ));
@@ -4052,6 +4058,14 @@ mod tests {
         ));
         assert!(!message_is_missing_bucket(
             "Object at location packages/NoSuchBucket.whl not found"
+        ));
+        // A healthy missing *object* whose attacker-chosen key echoes the outage
+        // phrase must NOT be read as a bucket outage: the code is NoSuchKey, and
+        // matching stopped keying off the free-text phrase (CWE-807).
+        assert!(!message_is_missing_bucket(
+            "Server returned non-2xx status code: 404 Not Found: <Error><Code>NoSuchKey</Code>\
+<Message>The specified key does not exist.</Message>\
+<Key>packages/pkg/specified bucket does not exist.tar.gz</Key></Error>"
         ));
     }
 

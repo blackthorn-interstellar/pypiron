@@ -2135,11 +2135,11 @@ fn view_key_package(key: &str) -> Option<&str> {
     (file == "index.html" || file == "index.json").then_some(pkg)
 }
 
-/// `_repl/<dest>/<pkg>/<file>!<nonce>` → (dest bucket, pkg).
+/// `_repl/<dest bucket tag>/<pkg>/<file>!<nonce>` → (dest bucket index, pkg).
 fn parse_note_key(key: &str) -> Option<(usize, String)> {
     let rest = key.strip_prefix("_repl/")?;
     let (dest, rest) = rest.split_once('/')?;
-    let dest = dest.parse::<usize>().ok()?;
+    let dest = bucket_index(dest)?;
     let (pkg, _) = rest.split_once('/')?;
     Some((dest, pkg.to_string()))
 }
@@ -3092,7 +3092,16 @@ fn renderer_omits(dump: &BTreeMap<String, Vec<u8>>, pkg: &str, fname: &str) -> b
 /// and a name are the same string here. Oracles that reconstruct such a key
 /// must build it from this, never from the bucket's position.
 fn bucket_name(idx: usize) -> String {
-    format!("bucket-{idx}")
+    format!("{BUCKET_NAME_PREFIX}{idx}")
+}
+
+const BUCKET_NAME_PREFIX: &str = "bucket-";
+
+/// Inverse of [`bucket_name`]: the index a bucket name (equivalently, a bucket
+/// tag) denotes. Oracles that *read back* a bucket-tagged key go through this,
+/// never through a bare integer parse.
+fn bucket_index(name: &str) -> Option<usize> {
+    name.strip_prefix(BUCKET_NAME_PREFIX)?.parse().ok()
 }
 
 fn build_node_state(
@@ -6700,6 +6709,26 @@ mod tests {
             reach_verdict(0, 0, 36_571, None, false, true).1,
             "a partitioned run that produced no conflict at all is a defect"
         );
+    }
+
+    /// Notes are keyed by the destination's bucket *tag*, not its position
+    /// (35bf862). A parser that reads the segment as an integer matches no real
+    /// key, and every note effect the breadcrumb oracles need goes unrecorded.
+    #[test]
+    fn a_note_key_names_its_destination_the_way_the_writer_wrote_it() {
+        assert_eq!(
+            parse_note_key(&format!("_repl/{}/pkg/file!nonce", bucket_name(1))),
+            Some((1, "pkg".to_string())),
+            "the key shape production writes must parse"
+        );
+        assert_eq!(
+            parse_note_key("_repl/bucket-1/pkg/file!nonce"),
+            Some((1, "pkg".to_string()))
+        );
+        // A bare position is the pre-35bf862 shape and no longer a bucket.
+        assert_eq!(parse_note_key("_repl/1/pkg/file!nonce"), None);
+        // The wedge object the STALENESS fault parks under `_repl/` is not a note.
+        assert_eq!(parse_note_key("_repl/vopr-wedge"), None);
     }
 
     /// The debt the deadline is bought with has to be *work*, not noise: a

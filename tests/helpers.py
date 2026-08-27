@@ -20,7 +20,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 ACCEPT_PEP691 = "application/vnd.pypi.simple.v1+json"
-#: Release-age cutoff for the uv clients this suite drives. `[tool.uv]
+#: Release-age cutoff handed to the uv clients this suite drives. `[tool.uv]
 #: exclude-newer` in pyproject.toml holds *project dependency* resolution to a
 #: 14-day cooldown, and uv picks that up by config discovery from the repo root —
 #: which is also the cwd of every `uv pip install` the tests run, whose fixture
@@ -78,6 +78,16 @@ def cmd_exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _client_env(args: list[str], env: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """Give uv subprocesses `CLIENT_EXCLUDE_NEWER`, and nothing else the suite
+    spawns. Scoped to the child on purpose: exported where an outer `uv run` can
+    read it, a changed cutoff makes uv re-resolve the project and rewrite
+    uv.lock, silently dropping the cooldown it is meant to leave alone."""
+    if not args or os.path.basename(args[0]) != "uv":
+        return env
+    return {**(os.environ if env is None else env), "UV_EXCLUDE_NEWER": CLIENT_EXCLUDE_NEWER}
+
+
 def run_checked(
     args: Iterable[str],
     *,
@@ -88,11 +98,12 @@ def run_checked(
     timeout: Optional[float] = None,
 ) -> subprocess.CompletedProcess:
     """Run a subprocess and raise with rich context on failure."""
+    args = list(args)
     try:
         cp = subprocess.run(
-            list(args),
+            args,
             cwd=str(cwd) if cwd else None,
-            env=env,
+            env=_client_env(args, env),
             capture_output=capture_output,
             text=text,
             timeout=timeout,
@@ -117,10 +128,11 @@ def run_returncode(
     timeout: Optional[float] = None,
 ) -> Tuple[int, str, str]:
     """Run a subprocess and return (rc, stdout, stderr)."""
+    args = list(args)
     cp = subprocess.run(
-        list(args),
+        args,
         cwd=str(cwd) if cwd else None,
-        env=env,
+        env=_client_env(args, env),
         capture_output=True,
         text=True,
         timeout=timeout,

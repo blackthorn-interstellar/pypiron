@@ -51,6 +51,7 @@ from .helpers import (
     kill_process_tree,
     make_wheel,
     parse_dist_filename,
+    run_checked,
     sha256_file,
     unique_package,
     upload_legacy,
@@ -259,7 +260,7 @@ def test_dr_drill(pypiron_bin, tmp_path, uv_path, uv_venv):
             )
             # A real client install from the restored index only (default PyPI
             # replaced), into a clean venv — then prove the module imports.
-            subprocess.run(
+            run_checked(
                 [
                     uv_path,
                     "pip",
@@ -272,9 +273,6 @@ def test_dr_drill(pypiron_bin, tmp_path, uv_path, uv_venv):
                     "--no-deps",
                     f"{name}=={VERSION}",
                 ],
-                check=True,
-                capture_output=True,
-                text=True,
                 timeout=180,
             )
             module = name.replace("-", "_").lower()

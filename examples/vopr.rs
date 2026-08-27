@@ -3330,11 +3330,13 @@ async fn boot_sequence(state: Arc<AppState>, booted: Arc<AtomicBool>, reconciled
     }
     // Every bucket keeps its own enforced-denylist stamp, so every bucket needs
     // its own reconcile — the warm-copy pass `run_worker`'s replication job runs
-    // beside the selected bucket's. One small GET each when nothing moved, and a
-    // straight early return when no denylist is configured at all.
+    // beside the selected bucket's. `first_pass` is what a boot passes: this
+    // process has reconciled no bucket yet, so every denied name is re-derived
+    // rather than only the ones the stamp diff names (`src/worker.rs`). A straight
+    // early return when no denylist is configured at all.
     let mut all_ok = true;
     for handle in state.buckets.handles() {
-        all_ok &= worker::reconcile_excludes(&state, handle.storage.as_ref())
+        all_ok &= worker::reconcile_excludes(&state, handle.storage.as_ref(), true)
             .await
             .is_ok();
     }

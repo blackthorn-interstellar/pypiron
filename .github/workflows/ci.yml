@@ -102,6 +102,14 @@ jobs:
           # a wide-entity or delete-heavy schedule. Reproduce with
           # `--seed N --rotate`; the volume runs nightly.
           cargo run --example vopr -- --seeds 30 --rotate
+          # The delist lane, armed on every seed of its own row rather than
+          # sprinkled across the three above: `--excludes` is a share of SEEDS,
+          # and a partial share starves DELIST below the reach floor the nightly
+          # gates on (65-69% of ARMED seeds evaluate it). Crash-only, because
+          # that is where any audit repair is a violation — the enforcement gap
+          # this lane found showed up as `AUDIT_REPAIRED_VIEWS`, an exclude the
+          # markers should have applied and only the daily audit did.
+          cargo run --example vopr -- --seeds 20 --nodes 2 --buckets 1 --ops 80 --fail-percent 0 --excludes 100
           # --- Regression seeds ------------------------------------------------
           # READ THIS BEFORE CHANGING ANY SEED OR PROFILE BELOW. A seed is a
           # RECIPE, not an ordering: it regenerates one schedule from (seed x
@@ -313,6 +321,41 @@ jobs:
           # `publish::tests::a_failed_artifact_delete_still_leaves_the_filename_barred`
           # is the delete path next door, not this one.
           cargo run --example vopr -- --seed 2519159830454370605 --rotate
+          # A rolling restart left an added exclude unenforced for up to a whole
+          # `--audit-interval` (86400s). The denylist is startup config, so a
+          # fleet adopts it one restart at a time: the node that restarts first
+          # stamps `_state/enforced-excludes.json` and delists the name, and the
+          # node still on the old config then rebuilds that package with no
+          # denylist to apply and puts it back. When that node finally restarts,
+          # its boot `reconcile_excludes` diffed the live config against the
+          # stamp, found them EQUAL — the stamp records the set, not who has
+          # rebuilt against it — and marked nothing dirty, so nothing repaired
+          # the relisting until the tier-3 audit. Fixed by re-deriving every
+          # denied name on the first reconcile a process makes against a bucket
+          # instead of only the names the diff turns up; steady-state passes stay
+          # diff-only. All 14 seeds below are mid-run config transitions (381 of
+          # 381 measured failures were, and no from-boot seed ever red). The
+          # shape is pinned durably by
+          # `worker::tests::a_boot_reconcile_repairs_a_denied_name_a_stale_node_re_listed`
+          # (the re-derive fires over a stamp that already names the exclude, and
+          # the steady-state pass still stays diff-only) and by
+          # `tests/test_proxy_delist.py::test_a_rolling_restart_leaves_no_relisted_name_behind`
+          # (two staggered `serve` processes over one store, the audit switched
+          # off so only the boot reconcile can repair the name).
+          cargo run --example vopr -- --seed 803 --nodes 2 --buckets 1 --ops 80 --fail-percent 0 --excludes 100
+          cargo run --example vopr -- --seed 3440 --nodes 2 --buckets 1 --ops 80 --fail-percent 0 --excludes 100
+          cargo run --example vopr -- --seed 4802 --nodes 2 --buckets 1 --ops 80 --fail-percent 0 --excludes 100
+          cargo run --example vopr -- --seed 5130 --nodes 2 --buckets 1 --ops 80 --fail-percent 0 --excludes 100
+          cargo run --example vopr -- --seed 5441 --nodes 2 --buckets 1 --ops 80 --fail-percent 0 --excludes 100
+          cargo run --example vopr -- --seed 6200 --nodes 2 --buckets 1 --ops 80 --fail-percent 0 --excludes 100
+          cargo run --example vopr -- --seed 212 --nodes 3 --buckets 2 --packages 4 --files 3 --ops 120 --excludes 100
+          cargo run --example vopr -- --seed 270 --nodes 3 --buckets 2 --packages 4 --files 3 --ops 120 --excludes 100
+          cargo run --example vopr -- --seed 292 --nodes 3 --buckets 2 --packages 4 --files 3 --ops 120 --excludes 100
+          cargo run --example vopr -- --seed 593 --nodes 3 --buckets 2 --packages 4 --files 3 --ops 120 --excludes 100
+          cargo run --example vopr -- --seed 49 --rotate --excludes 100
+          cargo run --example vopr -- --seed 57 --rotate --excludes 100
+          cargo run --example vopr -- --seed 461 --rotate --excludes 100
+          cargo run --example vopr -- --seed 487 --rotate --excludes 100
       # Mutation-testing the oracles themselves. Each `--break` is ONE deliberate
       # defect the named invariant exists to catch, so the run MUST fail with
       # that invariant's text — an invariant nobody has watched go red is an

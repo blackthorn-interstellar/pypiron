@@ -1391,9 +1391,9 @@ rule rather than growing an exemption:
   bytes and the sidecar on every bucket, and CONSERVATION still demands they
   exist somewhere, which is the delist contract exactly.
 
-#### What the lane found on its first night
+#### What the lane found on its first night — CLOSED by `7292634`
 
-**A rolling restart can leave an exclude unenforced until the next audit.** Every
+**A rolling restart left an exclude unenforced until the next audit.** Every
 failing armed seed measured is a mid-run transition seed, and the shape is one:
 
 1. Node B restarts with the new config, boots, reconciles. The reconcile stamps
@@ -1431,10 +1431,48 @@ red. And the fixed batch the kill proofs run on (`--seeds 500
 382,871 storage-op interleavings, 1,751 acked uploads, `GLOBAL_PAIR` on 500/500
 seeds and `DELIST` on 325/500.
 
-No product change is proposed here — the harness's job is to find it and hand it
-over reproducibly. The finding is filed as measurement and the lane stays
-opt-in until it is adjudicated: at `--excludes 0` — which is every existing lane,
-CI and nightly alike — nothing in this section runs at all.
+**The fix is one word in the reconcile's decision: `first_pass`.** The stamp
+records *what* a bucket's indexes were last built against, and nothing else can
+falsify that claim — but another node can, and does: it rebuilds the package
+under the old config between two reconciles, and the stamp (written by the node
+that already restarted) still reads as enforced. So the first reconcile a
+process makes against a bucket now re-derives EVERY currently denied name
+instead of only the ones the diff turns up; every later pass on that bucket
+stays diff-only, so the per-tick warm-copy reconcile is still one GET. The
+repair is the ordinary rebuild, which computes truth-minus-denylist from
+storage — so a boot cannot delist a live package on the strength of a stale
+index half, and the audit's "a failed per-package audit is a no verdict" rule
+(`8d8e639`) is untouched. Cost is bounded by the size of the denylist: one
+marker and one idempotent rebuild per denied name, per bucket, per process.
+
+Same three lanes, same invocations, at the fix — **0 failures in every one**:
+
+| lane | seeds before | failing before | seeds after | failing after |
+|---|---|---|---|---|
+| `--nodes 2 --buckets 1 --ops 80 --fail-percent 0` | 131,618 | 101 | 126,039 | **0** |
+| `--nodes 3 --buckets 2 --packages 4 --files 3 --ops 120` | 26,653 | 95 | 24,986 | **0** |
+| `--rotate` | 37,292 | 185 | 33,709 | **0** |
+
+All 14 repro seeds above red at `d406422` and pass at the fix; they are pinned
+in ci.yml, and the shape is pinned durably — where a seed cannot be — by
+`worker::tests::a_boot_reconcile_repairs_a_denied_name_a_stale_node_re_listed`
+(the re-derive fires over a stamp that already names the exclude, and the
+steady-state pass still marks nothing) and by
+`tests/test_proxy_delist.py::test_a_rolling_restart_leaves_no_relisted_name_behind`,
+which drives two staggered `serve` processes over one store with the audit
+switched off, so only the boot reconcile can repair the name. Both kill proofs
+still red at their documented K with the lane armed (`global-pair` at 1 seed,
+`relist` at 4).
+
+**The lane is on.** It was opt-in pending adjudication and the adjudication is
+this section: ci.yml's VOPR smoke runs an armed crash-only row on every merge,
+and simulation.yml gains a `delist` row at `--excludes 100`. Both are armed on
+every seed of their own row rather than as a share of the existing rows —
+`--excludes` is a share of SEEDS, so a partial setting starves `DELIST` below
+the 25%-of-seeds floor `--require-reach` gates on (it evaluates 65-69% of armed
+seeds), and an armed seed issues extra boot storage ops, which would perturb
+schedules the aligned rows have explored for months. At `--excludes 0` —
+everywhere else — nothing in this section runs at all.
 
 ### Proving the oracles can go red (`--break`)
 
@@ -2382,7 +2420,7 @@ execution, working `-s`, and pdb.
 
 | When | What |
 |---|---|
-| Every PR (CI) | fmt, clippy `-D warnings`, Rust unit, model checking (bounded configs) + conformance suites, VOPR smoke (fault + crash-only + rotating profiles), blackbox on disk + S3 (MinIO) + Azure (Azurite), `cargo-audit`, fuzz-target build smoke |
+| Every PR (CI) | fmt, clippy `-D warnings`, Rust unit, model checking (bounded configs) + conformance suites, VOPR smoke (fault + crash-only + rotating + delist profiles), blackbox on disk + S3 (MinIO) + Azure (Azurite), `cargo-audit`, fuzz-target build smoke |
 | Push to `master` (CI) | all of the above, plus the real-GCS blackbox (when the bucket secret is configured) |
 | Nightly | coverage-guided fuzzing (all six targets); deterministic simulation at volume + deep model configs (simulation.yml, counters and the oracle-reach gate published per run) |
 | Weekly | client compat matrix, full-PyPI corpus check, unit-test coverage, real-S3 blackbox (when the bucket secret is configured) |

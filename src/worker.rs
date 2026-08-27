@@ -31,7 +31,7 @@ use std::{
 use anyhow::{anyhow, bail, Context as _, Result};
 use sha2::{Digest, Sha256};
 use tokio::time::{sleep, timeout};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::app::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 use crate::hash::sha256_hex;
@@ -655,6 +655,16 @@ pub async fn run_worker_until(
     // `--exclude-package` set delists/relists the affected names on boot); a
     // selection change re-runs it against the newly selected bucket.
     let mut excludes_reconciled_generation: Option<u64> = None;
+    // Which warm buckets this process has already reconciled. The first pass
+    // against a bucket re-derives every denied name (see `reconcile_excludes`);
+    // later passes are diff-only, so the per-tick warm reconcile stays one GET.
+    // Set only on success, so a failed pass retries the full re-derive. Shared
+    // by `Arc` because the warm-copy jobs run on a spawned task.
+    let excludes_verified: Arc<Vec<AtomicBool>> = Arc::new(
+        (0..state.buckets.len())
+            .map(|_| AtomicBool::new(false))
+            .collect(),
+    );
 
     // Markers are the primary freshness mechanism; the audit is the safety
     // net for what events cannot see (restores, out-of-band storage changes,
@@ -921,6 +931,7 @@ pub async fn run_worker_until(
             let leases = warm_leases.clone();
             let selected_index = selected.index;
             let guard = SweepGuard(warm_running.clone());
+            let excludes_verified = excludes_verified.clone();
             tokio::spawn(async move {
                 let _guard = guard;
                 let jobs = state
@@ -937,6 +948,7 @@ pub async fn run_worker_until(
                     .map(|(idx, handle)| {
                         let lease = leases[idx].clone();
                         let job_state = state.clone();
+                        let verified = excludes_verified.clone();
                         async move {
                             if job_state.mutations_fenced() {
                                 return;
@@ -952,11 +964,17 @@ pub async fn run_worker_until(
                             // nothing replicates or re-fingerprints it). Marks the
                             // affected names dirty on this bucket; the drain below
                             // rebuilds them the same pass. Its own bucket-local
-                            // stamp makes it a one-GET no-op when unchanged.
-                            if let Err(e) =
-                                reconcile_excludes(&job_state, handle.storage.as_ref()).await
+                            // stamp makes it a one-GET no-op when unchanged, once
+                            // this process's first pass has re-derived the denied
+                            // names against this bucket.
+                            let first_pass = !verified[idx].load(Ordering::SeqCst);
+                            match reconcile_excludes(&job_state, handle.storage.as_ref(), first_pass)
+                                .await
                             {
-                                error!(bucket=%handle.name, error=?e, "replicate: destination denylist reconcile failed");
+                                Ok(()) => verified[idx].store(true, Ordering::SeqCst),
+                                Err(e) => {
+                                    error!(bucket=%handle.name, error=?e, "replicate: destination denylist reconcile failed");
+                                }
                             }
                             let result = tokio::select! {
                                 result = drain_dirty_uncached(&job_state, handle.storage.as_ref()) => result,
@@ -994,11 +1012,18 @@ pub async fn run_worker_until(
             // Once per leadership: reconcile the selected bucket's stored indexes
             // with the live denylist before the tick runs, so an exclude change
             // made across this restart is delisted (or relisted) on boot. Marks
-            // only affected names dirty; the tick below rebuilds them the same
-            // pass. Cheap no-op (one GET) when the config is unchanged.
+            // the affected names — plus every denied name, since another node's
+            // interim rebuild may have re-listed one under the old config — dirty;
+            // the tick below rebuilds them the same pass.
             if excludes_reconciled_generation != Some(selected.generation) {
-                match reconcile_excludes(&state, selected.storage.as_ref()).await {
-                    Ok(()) => excludes_reconciled_generation = Some(selected.generation),
+                // Always a first pass: it runs once per leadership acquisition, so
+                // the denied names are re-derived against this bucket on boot and
+                // on any selection switch, never on the steady-state tick.
+                match reconcile_excludes(&state, selected.storage.as_ref(), true).await {
+                    Ok(()) => {
+                        excludes_reconciled_generation = Some(selected.generation);
+                        excludes_verified[selected.index].store(true, Ordering::SeqCst);
+                    }
                     Err(e) => {
                         error!(error=?e, "worker: denylist reconcile failed; will retry next tick")
                     }
@@ -2689,10 +2714,26 @@ async fn invalidate_fingerprints(storage: &dyn Storage, packages: &[&str]) -> Re
 /// on disk (no re-download). A no-op — one small GET — when the config is
 /// unchanged. Runs per bucket; each keeps its own bucket-local stamp and worklist.
 ///
+/// `first_pass` is "this process has not reconciled this bucket yet", and it adds
+/// every *currently* denied name to the worklist regardless of the diff. The stamp
+/// records what a bucket's indexes were last built against, but any node still on
+/// the old config can falsify that claim between two reconciles: it rebuilds the
+/// package with no denylist and re-lists the name, and the stamp — written by the
+/// node that already restarted — still reads as enforced. The stale node's own
+/// restart then diffs equal and repairs nothing, so the relisting stood until the
+/// tier-3 audit (up to `--audit-interval`, a day by default). Re-deriving the
+/// denied names once per boot closes that window at a cost bounded by the size of
+/// the denylist: one marker and one (idempotent) rebuild per denied name, per
+/// bucket, per process. Steady-state passes stay diff-only.
+///
 /// `pub` only so the deterministic simulator can drive the boot sequence the way
 /// [`run_worker`] does — VOPR calls `tick`/`audit` directly and never enters the
 /// worker loop, so this was code no simulated schedule could reach.
-pub async fn reconcile_excludes(state: &AppState, storage: &dyn Storage) -> Result<()> {
+pub async fn reconcile_excludes(
+    state: &AppState,
+    storage: &dyn Storage,
+    first_pass: bool,
+) -> Result<()> {
     let Some(denylist) = state.denylist.as_ref() else {
         return Ok(());
     };
@@ -2700,12 +2741,19 @@ pub async fn reconcile_excludes(state: &AppState, storage: &dyn Storage) -> Resu
     // Not-found → first run (empty); a real read fault propagates so a persistent
     // stamp error surfaces instead of silently re-delisting the whole set forever.
     let previous = read_enforced_excludes(storage).await?.unwrap_or_default();
-    if current == previous {
+    if current == previous && (!first_pass || current.is_empty()) {
         return Ok(());
     }
     // A name whose entry differs between the two sets has stale visibility in the
     // stored indexes and must be rebuilt; a name identical in both is untouched.
     let mut changed: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
+    if first_pass {
+        // Boot re-verify: the diff cannot see a repair another node's interim
+        // rebuild made necessary. Rebuilding resolves toward truth-minus-denylist
+        // read from storage, so a name whose indexes are already correct costs an
+        // idempotent pass and nothing else.
+        changed.extend(current.keys());
+    }
     for (name, specs) in &current {
         if previous.get(name) != Some(specs) {
             changed.insert(name);
@@ -2732,12 +2780,18 @@ pub async fn reconcile_excludes(state: &AppState, storage: &dyn Storage) -> Resu
     }
     // Persist the newly enforced set only after every marker is down: a crash
     // between the two re-runs the reconcile (the diff still fires) rather than
-    // recording enforcement that never happened.
-    write_enforced_excludes(state, storage, &current).await?;
-    if count > 0 {
+    // recording enforcement that never happened. Skipped outright when the stamp
+    // already holds this set — a boot re-verify changes nothing to record.
+    if current != previous {
+        write_enforced_excludes(state, storage, &current).await?;
         info!(
             packages = count,
             "worker: denylist changed since last run; marked affected packages for reindex"
+        );
+    } else if count > 0 {
+        debug!(
+            packages = count,
+            "worker: re-deriving denied packages against this bucket on boot"
         );
     }
     Ok(())
@@ -5601,6 +5655,88 @@ mod tests {
             !storage.head_exists(&sidecar_key(&key)).await.unwrap(),
             "the fabricated sidecar must be retracted, not left for the next upload \
              of this immutable filename to inherit as a torn record"
+        );
+    }
+
+    /// A boot reconcile re-derives every denied name, including one the stamp
+    /// already calls enforced — and the steady-state pass still does not.
+    ///
+    /// The stamp records WHAT a bucket's indexes were last built against, and
+    /// that claim is falsifiable by a party that never writes it: a node still
+    /// on the old config rebuilds the package with no denylist and re-lists the
+    /// name, while the stamp — written by the node that already restarted —
+    /// keeps saying the exclude is enforced. Diffing live config against stamp
+    /// then marks nothing, which left an added `--exclude-package` unenforced
+    /// until the tier-3 audit (`--audit-interval`, a day). Originally found by
+    /// the VOPR's delist lane; the repro seeds are pinned in ci.yml.
+    #[tokio::test]
+    async fn a_boot_reconcile_repairs_a_denied_name_a_stale_node_re_listed() {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let storage = Arc::new(InMemStorage::default());
+        let canonical: std::collections::BTreeMap<String, Vec<String>> =
+            [("alpha".to_string(), vec!["*".to_string()])]
+                .into_iter()
+                .collect();
+        let mut base = AppState::headless(storage.clone());
+        base.denylist = Some(Arc::new(
+            crate::denylist::Denylist::from_canonical(&canonical).unwrap(),
+        ));
+        let state = Arc::new(base);
+        let pinned = state.pin();
+        let view = format!("{SIMPLE_PREFIX}alpha/index.json");
+        seed_private_artifact(&storage, "alpha", FILE);
+
+        // The world a stale node leaves behind: the excluded name listed in both
+        // halves and given a view, over a stamp that already names the exclude.
+        update_global_index(&state, storage.as_ref(), &["alpha".to_string()], &[])
+            .await
+            .unwrap();
+        storage.insert(&view, b"{}".to_vec());
+        write_enforced_excludes(&state, storage.as_ref(), &canonical)
+            .await
+            .unwrap();
+
+        // Steady state: the diff is empty and must stay that way, or the warm-copy
+        // reconcile would re-mark the whole denylist on every tick.
+        reconcile_excludes(&state, storage.as_ref(), false)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .list_dir_entries(DIRTY_PREFIX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a steady-state reconcile must stay diff-only"
+        );
+
+        // Boot: re-derived anyway, and the ordinary tick applies the exclude to
+        // what it finds in storage — the view goes and the name leaves both halves.
+        reconcile_excludes(&state, storage.as_ref(), true)
+            .await
+            .unwrap();
+        tick(&state, &pinned).await.unwrap();
+        assert!(
+            !storage.head_exists(&view).await.unwrap(),
+            "the boot reconcile left a delisted package's view standing"
+        );
+        for half in ["index.json", "index.html"] {
+            let global = storage
+                .get_bytes(&format!("{SIMPLE_PREFIX}{half}"))
+                .await
+                .unwrap();
+            assert!(
+                !String::from_utf8(global).unwrap().contains("alpha"),
+                "an excluded package is still named in the global {half}"
+            );
+        }
+        // The bytes are delisted, not deleted.
+        assert!(
+            storage
+                .head_exists(&format!("{PACKAGES_PREFIX}alpha/{FILE}"))
+                .await
+                .unwrap(),
+            "delisting must keep the artifact bytes"
         );
     }
 }

@@ -99,6 +99,21 @@ jobs:
           # divergence at seed 1067836. A failure reproduces with
           # `--seed N --rotate`.
           - { name: rotating-swarm, args: '--rotate' }
+          # The delist lane (dev/TESTING.md, "The delist lane"). Every seed here
+          # configures an `--exclude-package` denylist and runs the product's
+          # boot sequence against every bucket, and half of them change that
+          # config MID-RUN — the rolling-restart window, where the boot-reconcile
+          # enforcement gap this lane found lived and where all 381 of its
+          # measured failures were. Its own row rather than a share of the rows
+          # above for two reasons: `--excludes` is a share of SEEDS, so a partial
+          # setting would starve DELIST below the 25%-of-seeds reach floor
+          # `--require-reach` gates on (it evaluates 65-69% of ARMED seeds), and
+          # an armed seed issues extra boot storage ops, so sprinkling it would
+          # perturb the schedules the five rows above have explored for months.
+          # Crash-only and multi-bucket: crash-only is where ANY audit repair is
+          # a violation, which is exactly how the gap presented, and two buckets
+          # add the warm-copy reconcile the single-bucket shape cannot reach.
+          - { name: delist, args: '--nodes 3 --buckets 2 --ops 160 --packages 6 --files 2 --fail-percent 0 --excludes 100' }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:

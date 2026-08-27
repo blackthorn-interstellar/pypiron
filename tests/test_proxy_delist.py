@@ -114,6 +114,14 @@ def _index_filenames(data_dir, package):
     return {f["filename"] for f in json.loads(path.read_text())["files"]}
 
 
+def _pending_markers(data_dir):
+    """Undrained `_dirty/` event markers. A quiescent store has none — which is
+    what makes "nothing else was left to rebuild it" an assertion rather than a
+    hope."""
+    dirty = data_dir / "_dirty"
+    return sorted(p.name for p in dirty.iterdir()) if dirty.exists() else []
+
+
 def _global_names_file(data_dir):
     """Every name either materialized global index still lists — the PEP 691
     `simple/index.json` and the PEP 503 `simple/index.html`, unioned (read off
@@ -450,5 +458,108 @@ def test_an_audit_error_does_not_relist_a_delisted_package(tmp_path_factory, pyp
         finally:
             for path in sidecars:
                 path.chmod(0o600)
+    finally:
+        upstream_gen.close()
+
+
+def test_a_rolling_restart_leaves_no_relisted_name_behind(tmp_path_factory, pypiron_bin, tmp_path):
+    """A fleet rolled onto a new exclude must not serve the delisted name from
+    the node that rolled FIRST.
+
+    The mixed-config window is the whole point. A denylist is startup config, so
+    the fleet adopts it one restart at a time, and in between one node enforces
+    it while another does not:
+
+      1. the node that restarted stamps `_state/enforced-excludes.json` and
+         delists the name;
+      2. the node still on the old config rebuilds that package for its own
+         reasons (here: a proxy fill) with no denylist to apply, and puts the
+         name back — over a stamp that says the exclude is enforced;
+      3. that node restarts last. Its boot reconcile used to diff the live
+         config against the stamp, find them equal, and mark nothing, so the
+         relisting stood until the tier-3 audit — `--reconcile-interval-secs`,
+         a day by default.
+
+    The audit is switched off at step 3 on purpose: it is the backstop that used
+    to hide this, and with it off the boot reconcile and the tick are the only
+    things left that can repair the name.
+    """
+    upstream_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    upstream = next(upstream_gen)
+    data_dir = tmp_path_factory.mktemp("pypiron-rolling-exclude-proxy")
+    stamp = data_dir / "_state" / "enforced-excludes.json"
+    v1 = make_wheel("delistme", "1.0", tmp_path)
+    v2 = make_wheel("delistme", "2.0", tmp_path)
+    try:
+        _upload(upstream, v1, "delistme")
+        _upload(upstream, v2, "delistme")
+
+        # The node the operator has not restarted yet: no exclude, and it stays
+        # up across the peer's restart below.
+        with _proxy(pypiron_bin, data_dir, upstream["base_url"]) as stale_node:
+            assert http_get(f"{stale_node['base_url']}/files/delistme/{v1.name}")[0] == 200
+            assert _poll(lambda: _index_filenames(data_dir, "delistme") == {v1.name}), (
+                "the proxy never materialized the cached package's local index"
+            )
+
+            # (1) The peer rolls first, with the exclude. Its boot reconcile
+            # stamps the enforced set — the precondition of the bug, and the one
+            # thing here that must be deterministic; whether the delisting
+            # survives this window is the stale node's to fight over.
+            with _proxy(
+                pypiron_bin, data_dir, upstream["base_url"], "--exclude-package", "delistme"
+            ):
+                assert _poll(
+                    lambda: stamp.exists() and "delistme" in json.loads(stamp.read_text())
+                ), "the restarted node never recorded the exclude it enforced"
+
+            # (2) The stale node fills the second file and rebuilds the package
+            # with no denylist to apply: the name is back, and the stamp still
+            # says it is enforced.
+            assert http_get(f"{stale_node['base_url']}/files/delistme/{v2.name}")[0] == 200
+            assert _poll(lambda: _index_filenames(data_dir, "delistme") == {v1.name, v2.name}), (
+                "the stale node did not re-list the delisted package"
+            )
+            # The view is the resolvable surface, and it is back: this node
+            # answers `/simple/delistme/` 200 for a package the fleet's config
+            # says is delisted. (Its global name list does not move here — the
+            # node still holds the pre-delisting set in memory, so its batched
+            # global pass reads the add as already applied. One half is enough
+            # for a resolver.)
+            code, _, _ = http_get(
+                f"{stale_node['simple']}delistme/index.json", headers={"Accept": ACCEPT_PEP691}
+            )
+            assert code == 200, "the stale node should still resolve the package it re-listed"
+            # Quiescent before the last restart: no undrained marker may be left
+            # to repair the name, or the assertion below passes for the wrong
+            # reason.
+            assert _poll(lambda: _pending_markers(data_dir) == []), (
+                f"markers still pending: {_pending_markers(data_dir)}"
+            )
+
+        # (3) The stale node rolls last, onto the same set the stamp already
+        # names. With the audit off, only the boot reconcile can repair this.
+        with _proxy(
+            pypiron_bin,
+            data_dir,
+            upstream["base_url"],
+            "--exclude-package",
+            "delistme",
+            "--audit-on-boot",
+            "false",
+        ) as rolled_node:
+            assert _poll(lambda: _index_filenames(data_dir, "delistme") is None), (
+                "the last node to roll left a peer's relisting standing: the excluded "
+                "package still has a /simple/ view after every node adopted the exclude"
+            )
+            assert _poll(lambda: "delistme" not in _global_names_file(data_dir)), (
+                "the excluded package is still named in a global index half"
+            )
+            code, _, _ = http_get(
+                f"{rolled_node['simple']}delistme/index.json", headers={"Accept": ACCEPT_PEP691}
+            )
+            assert code == 404, "a delisted package must 404 like a name pypiron does not hold"
+            # Delist is not delete: the bytes stay fetchable by direct URL.
+            assert http_get(f"{rolled_node['base_url']}/files/delistme/{v1.name}")[0] == 200
     finally:
         upstream_gen.close()

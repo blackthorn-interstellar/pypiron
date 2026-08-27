@@ -75,6 +75,8 @@ jobs:
   # which therefore ship a fully static musl binary).
   setup:
     runs-on: ubuntu-latest
+    # Echoes a matrix string and nothing else — no checkout, no registry, no API.
+    permissions: {}
     outputs:
       matrix: ${{ steps.m.outputs.matrix }}
     steps:

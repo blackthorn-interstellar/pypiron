@@ -2,18 +2,18 @@
 # (Snyk, Black Duck, Sonar, GitGuardian, Checkmarx, …) buys, assembled from tools
 # that cost nothing to run here:
 #
-#   SCA     cargo-deny, pip-audit, OSV-Scanner, Trivy
-#   SAST    CodeQL (rust + python + actions), Semgrep community
-#   Secrets gitleaks, TruffleHog (verified only), Trivy secret mode
-#   Supply  zizmor (Actions), actionlint
+#   SCA      cargo-deny, pip-audit, OSV-Scanner, Trivy
+#   SAST     CodeQL (rust + python + actions), Semgrep community
+#   Secrets  gitleaks, TruffleHog (verified only), Trivy secret mode
+#   Supply   zizmor (Actions), actionlint
+#   Optional Snyk Open Source + Snyk Code (only when SNYK_TOKEN is a repo secret)
 #
-# Two deliberate absences. cargo-deny does not check advisories: cargo-audit is
+# One deliberate absence: cargo-deny does not check advisories. cargo-audit is
 # already a per-PR merge gate in ci.yml (`make audit`, which is a bare
 # `cargo audit` — no ignore list, nothing acknowledged, everything fails), so
 # deny.toml is licenses/bans/sources policy only and this workflow runs
 # `cargo deny check licenses bans sources`. One tool per question; two tools
 # reading the same advisory DB is two places to argue with about the same CVE.
-# Snyk is the other absence — it needs an account token.
 #
 # The repo is public, so Code Scanning is on and every scanner uploads SARIF to
 # the Security tab. The `!github.event.repository.private` gates stay anyway:
@@ -27,7 +27,9 @@
 # gitleaks note: the MIT-licensed binary is free for everyone, but the official
 # gitleaks-action hard-fails on organization-owned repos without a paid
 # GITLEAKS_LICENSE — so the job below downloads and runs the binary directly.
-# Every job in this file hard-fails on a finding. Nothing is advisory.
+# Every job in this file hard-fails on a finding. Nothing is advisory: Snyk
+# skips green while no SNYK_TOKEN secret exists, but the moment one is set it
+# gates like the rest, on tool errors as well as findings.
 name: Security
 
 on:
@@ -409,3 +411,133 @@ jobs:
         run: |
           set -euo pipefail
           actionlint -color
+
+  # ─── Optional commercial (free tier) ───────────────────────────────────
+  snyk:
+    name: sca+sast (snyk)
+    # No SNYK_TOKEN secret exists on this repo yet, so today this job schedules,
+    # prints one line, and goes green. A job-level `if` cannot read secrets
+    # (GitHub context rule), so the gate is a step-level `env.SNYK_TOKEN != ''`
+    # on every step that would need the token — an unset token skips them all
+    # rather than failing them. Fork PRs get the same treatment for free: secrets
+    # are not exposed to them, so the job self-skips instead of erroring.
+    #
+    # Add the secret and it becomes a hard gate like every other job here: snyk
+    # exits 1 on findings and 2/3 on tool errors, and all of those fail the job.
+    # No continue-on-error anywhere — that is what turns a scanner that is
+    # silently erroring out into a green check.
+    #
+    # Snyk Code needs to be switched on in the Snyk org settings. If it is not,
+    # the SAST step exits 2 with SNYK-CODE-0005 ("Snyk Code is not enabled for
+    # the current Organization") and this job goes red — a real prerequisite to
+    # restore, not flake to retry away.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - name: Skip when unconfigured
+        if: env.SNYK_TOKEN == ''
+        run: echo "SNYK_TOKEN not set — skipping (add the repo secret to enable free-tier Snyk)"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        if: env.SNYK_TOKEN != ''
+        with:
+          persist-credentials: false
+      # Upstream's README still says @master everywhere and its tags lag, but
+      # v1.0.0 is a real tag and the only commits master has on top of it touch
+      # .circleci/config.yml and CODEOWNERS. Pin the tag: it resolves, so zizmor
+      # can verify it. The action installs the latest snyk CLI by choice — the
+      # vulnerability DB it queries is server-side and floats regardless, so
+      # pinning the CLI would buy the look of reproducibility without the thing.
+      - uses: snyk/actions/setup@9adf32b1121593767fc3c057af55b55db032dc04 # v1.0.0
+        if: env.SNYK_TOKEN != ''
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        if: env.SNYK_TOKEN != ''
+        with:
+          enable-cache: false
+      # snyk parses neither Cargo.lock nor uv.lock, so `--all-projects` finds
+      # nothing here and the CLI dies with SNYK-CLI-0008 (exit 3). Hand it the
+      # locked Python closure in a format it does read. The Rust closure is
+      # already covered by cargo-audit (ci.yml), cargo-deny, osv-scanner and
+      # trivy; what snyk adds is its proprietary DB, which occasionally flags
+      # what OSV misses. `--frozen` is load-bearing — an unfrozen export
+      # re-resolves and would scan something other than what the suite installs.
+      #
+      # Two non-obvious requirements, both properties of snyk's own resolver
+      # (snyk-python-plugin/pysrc/pip_resolve.py):
+      #
+      #   pip must be installed in the target interpreter. uv venvs are pip-less
+      #   by design, but the plugin's bundled pkg_resources does `from
+      #   pip._internal.utils._jaraco_text import ...` on Python >= 3.12. Without
+      #   it the resolver dies on import and snyk surfaces only SNYK-CLI-0000
+      #   "Failed to test pip project". `uv venv --seed` supplies pip from uv's
+      #   own vendored wheel with no index resolution at all. setuptools is not
+      #   seeded on 3.12+, so it is pinned here rather than left to float.
+      #
+      #   the manifest must be marker-free. The plugin honors sys_platform
+      #   markers but not python_version ones, and this project's
+      #   requires-python is >=3.8, so the universal `uv export` carries two pins
+      #   for 18 packages (cffi, pytest, requests, …) — the plugin would demand
+      #   every py<3.9 backport be installed and fail with "Required packages
+      #   missing". Installing the export (uv evaluates the markers) and then
+      #   freezing yields one pin per package: exactly the closure the runner's
+      #   interpreter resolves. --skip-unresolved is deliberately NOT used — it
+      #   drops unresolved lines silently, so a scan that resolved nothing would
+      #   still report green.
+      #
+      # The venv lives in RUNNER_TEMP rather than the workspace because `snyk
+      # code test` below scans the working tree: a venv of third-party sources
+      # sitting in it would be analyzed as if it were this repo's code.
+      - name: Build the Python closure for snyk to inspect
+        if: env.SNYK_TOKEN != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv export --frozen --no-hashes --no-emit-project \
+            --format requirements-txt -o requirements-snyk-export.txt
+          uv venv --seed "$RUNNER_TEMP/snyk-venv"
+          uv pip install --python "$RUNNER_TEMP/snyk-venv/bin/python" \
+            setuptools==84.0.0 -r requirements-snyk-export.txt
+          uv pip freeze --python "$RUNNER_TEMP/snyk-venv/bin/python" \
+            > requirements-snyk.txt
+      # One invocation, two audiences: --sarif-file-output writes the report to a
+      # file while the human-readable form still goes to stdout. That is why
+      # these two steps need no table/SARIF twin the way trivy and semgrep do —
+      # while the repo is private and there is nowhere to upload SARIF, the
+      # findings are already in the job log and the exit code already gates.
+      - name: Snyk Open Source (Python closure)
+        if: env.SNYK_TOKEN != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          snyk test --file=requirements-snyk.txt --package-manager=pip \
+            --command="$RUNNER_TEMP/snyk-venv/bin/python" \
+            --severity-threshold=medium --sarif-file-output=snyk-oss.sarif
+      # always(): the OSS scan above fails the job on findings, and a red there
+      # must not silently skip the SAST scan — both report every run. Snyk Code
+      # has no Rust analyzer, so this covers the blackbox suite, dev/scripts and
+      # examples/; CodeQL and semgrep are what read the crate.
+      - name: Snyk Code (SAST)
+        if: always() && env.SNYK_TOKEN != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          snyk code test --severity-threshold=medium --sarif-file-output=snyk-code.sarif
+      # Uploads gate exactly like trivy's and semgrep's: Code Scanning needs the
+      # repo public, and fork PRs carry a read-only token that cannot write
+      # security events. The scans above still gate in both cases.
+      - name: Upload Snyk OSS SARIF
+        if: ${{ always() && env.SNYK_TOKEN != '' && !github.event.repository.private && hashFiles('snyk-oss.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          sarif_file: snyk-oss.sarif
+          category: snyk-oss
+      - name: Upload Snyk Code SARIF
+        if: ${{ always() && env.SNYK_TOKEN != '' && !github.event.repository.private && hashFiles('snyk-code.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code

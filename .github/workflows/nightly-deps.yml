@@ -706,7 +706,15 @@ jobs:
   deps-remedy:
     name: agent repairs the PR
     needs: [deps-watch, deps-agent-key]
+    # !cancelled() is load-bearing: without a status function GitHub wraps the
+    # condition in an implicit success() that judges the TRANSITIVE needs chain,
+    # and deps-watch's ancestors include deps-fix/deps-fix-publish, which skip
+    # on every mechanical-failure night — so this job silently never ran (first
+    # observed on the lane's first red night, 2026-08-27). The explicit result
+    # checks keep the real gate: both needs succeeded and said what they said.
     if: >-
+      !cancelled() && needs['deps-watch'].result == 'success' &&
+      needs['deps-agent-key'].result == 'success' &&
       needs['deps-watch'].outputs.failed == 'true' &&
       needs['deps-watch'].outputs.security_only != 'true' &&
       needs['deps-agent-key'].outputs.has_key == 'true'

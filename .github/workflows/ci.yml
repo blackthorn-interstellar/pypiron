@@ -12,6 +12,11 @@ on:
       - master
       - main
   workflow_dispatch:
+    inputs:
+      build-wheels:
+        description: 'Also dry-run the release build matrix (authorize, wheels, sdist, ARMv6 binary)'
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -588,9 +593,15 @@ jobs:
   # dry-run runs on a branch ref, publishes nothing (both release jobs are
   # tag-gated) and is exempt — enforcing ancestry there would only wrongly block
   # a legit dry-run from an unmerged branch.
+  #
+  # The dry-run is opt-in (`build-wheels`), not automatic: a plain dispatch is
+  # how the repo's own automation gets the test gates onto a branch GitHub will
+  # not fire a `pull_request` for (a GITHUB_TOKEN-authored PR triggers nothing —
+  # see nightly-deps.yml), and dragging a 15-cell cross-platform wheel matrix
+  # along nightly for a lockfile bump buys nothing.
   authorize:
     name: authorize (tag reachable from master)
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.build-wheels)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -617,14 +628,15 @@ jobs:
             exit 1
           fi
 
-  # Wheel builds run only for release tags (and manual dispatch for testing the
-  # pipeline). The version is stamped from the tag; the repo itself stays at 0.0.0.
+  # Wheel builds run only for release tags (and a manual dispatch that ticks
+  # `build-wheels`, for testing the pipeline). The version is stamped from the
+  # tag; the repo itself stays at 0.0.0.
   # One job, one matrix over every (kind, runner, target). maturin-action treats an
   # unset manylinux as auto and ignores it off Linux, and the aarch64-gnu CFLAGS is a
   # no-op elsewhere, so the steps are identical for every platform. fail-fast is off
   # so one platform's failure doesn't cancel the rest (these were independent jobs).
   wheels:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.build-wheels)
     name: wheels (${{ matrix.kind }}, ${{ matrix.target }})
     needs: authorize
     runs-on: ${{ matrix.runner }}
@@ -846,7 +858,7 @@ jobs:
           if-no-files-found: error
 
   sdist:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.build-wheels)
     needs: authorize
     runs-on: ubuntu-latest
     steps:
@@ -976,7 +988,7 @@ jobs:
   # the GitHub Release with everything else.
   binary-armv6:
     name: binary (armv6)
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.build-wheels)
     needs: authorize
     runs-on: ubuntu-latest
     env:

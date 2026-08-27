@@ -597,9 +597,13 @@ jobs:
       - name: Wait for checks
         id: wait
         # ci.yml's release-path jobs (authorize, wheels, sdist, binary-armv6)
-        # also fire on workflow_dispatch, so a dispatched run carries the full
-        # cross-platform wheel matrix as a dry-run. It publishes nothing (both
-        # release jobs are tag-gated) but it is why this wait is long.
+        # also take workflow_dispatch, but only when the run ticks its
+        # `build-wheels` input — the dispatches above do not, so a lockfile bump
+        # no longer drags a 15-cell cross-platform wheel matrix along. They skip,
+        # which is a CONCLUDED check run (`skipped`), so the watch below can
+        # neither hang on them nor read them as red. What this wait is long for
+        # is the merge gates themselves: the blackbox matrix, the VOPR legs and
+        # the fuzz build.
         timeout-minutes: 90
         run: |
           sleep 60 # dispatched runs need a moment to register on the head SHA

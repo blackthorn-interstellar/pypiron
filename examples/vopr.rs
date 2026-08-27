@@ -3085,6 +3085,16 @@ fn renderer_omits(dump: &BTreeMap<String, Vec<u8>>, pkg: &str, fname: &str) -> b
         || (quarantined && origin.as_deref() != Some("private"))
 }
 
+/// The `BucketHandle::name` of the bucket at `idx` — the single source of the
+/// sim's bucket naming. Production keys anything bucket-scoped by
+/// [`pypiron::counters::bucket_tag`] of this name (`_repl/<tag>/…` markers,
+/// counter rollups), and these names survive that mapping unchanged, so a tag
+/// and a name are the same string here. Oracles that reconstruct such a key
+/// must build it from this, never from the bucket's position.
+fn bucket_name(idx: usize) -> String {
+    format!("bucket-{idx}")
+}
+
 fn build_node_state(
     buckets: &[Arc<SimStorage>],
     node: usize,
@@ -3100,7 +3110,7 @@ fn build_node_state(
                 bucket: idx,
                 plan: plan.clone(),
             }) as Arc<dyn Storage>,
-            name: format!("bucket-{idx}"),
+            name: bucket_name(idx),
         })
         .collect();
     let mut state = AppState::headless(handles[0].storage.clone());
@@ -3331,7 +3341,10 @@ fn ack_totality_failures(
         .filter(|(i, peer)| {
             let keys = peer.keys();
             let has_record = keys.contains(&akey) && keys.contains(&mkey);
-            let owed = format!("_repl/{i}/{pkg}/{fname}!");
+            // `replicate::write_marker` keys the note by the destination's
+            // `bucket_tag`, not its position in the bucket list — reconstruct it
+            // the same way or the exemption never matches.
+            let owed = format!("_repl/{}/{pkg}/{fname}!", bucket_name(*i));
             // A partitioned fan-out can find the peer holding a CONFLICTING
             // record, in which case `replicate_record` runs the merge instead
             // of a copy: the peer legitimately ends up frozen, tombstoned, or
@@ -3347,9 +3360,10 @@ fn ack_totality_failures(
             !has_record && !merged && !selected_keys.iter().any(|k| k.starts_with(&owed))
         })
         .map(|(i, _)| {
+            let tag = bucket_name(i);
             format!(
                 "ACK_TOTALITY: publish of {akey} acked while bucket {i} held neither the record \
-                 nor a _repl/{i}/ note — the 200 claimed a durability it did not have (publish \
+                 nor a _repl/{tag}/ note — the 200 claimed a durability it did not have (publish \
                  only; proxy fills are async by design, see bf913b9)"
             )
         })
@@ -3586,9 +3600,7 @@ fn emit_meta(viz: &Arc<Trace>, seed: u64, profile: &Profile, part: &Partition) {
             "partition_percent": profile.partition_percent,
             "partitioned": part.split,
             "brk": profile.brk.flag().unwrap_or("none"),
-            "bucket_names": (0..profile.buckets)
-                .map(|idx| format!("bucket-{idx}"))
-                .collect::<Vec<_>>(),
+            "bucket_names": (0..profile.buckets).map(bucket_name).collect::<Vec<_>>(),
             "node_regions": vec![serde_json::Value::Null; profile.nodes],
             "homes": homes,
             "caveats": [

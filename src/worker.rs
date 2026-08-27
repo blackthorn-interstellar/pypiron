@@ -1302,11 +1302,24 @@ pub async fn audit(
     // upload racing the walk reads as an artifactless dir (its origin claim
     // lands before its artifact), the tick then lists the finished publish, and
     // the walk's stale remove would durably delist it until the next audit — a
-    // reconcile interval away. Re-prove every dead observation before acting on
-    // it; dead names are churn-rare, so this costs two listings apiece.
-    let removes = reverify_dead_observations(storage, dead).await;
+    // reconcile interval away. So every dead observation is re-proved inside
+    // the global update's locked CAS attempt (`update_global_index_verified`);
+    // dead names are churn-rare, so the proof costs two listings apiece. An
+    // observation with no fingerprint cannot be proved and never removes — it
+    // is handed to the marker path instead.
+    let mut verified_dead: Vec<(String, String)> = Vec::new();
+    for (pkg, observed_fp) in dead {
+        match observed_fp {
+            Some(fp) => verified_dead.push((pkg, fp)),
+            None => {
+                if let Err(e) = mark_dirty(storage, &pkg).await {
+                    error!(package=%pkg, error=?e, "audit: unprovable dead observation and the dirty re-arm failed; left for the next audit");
+                }
+            }
+        }
+    }
     require_generation(state, generation)?;
-    update_global_index(state, storage, &live, &removes).await?;
+    update_global_index_verified(state, storage, &live, &verified_dead).await?;
     if failures > 0 {
         return Err(anyhow!("audit finished with {failures} failure(s)"));
     }
@@ -2285,31 +2298,6 @@ async fn package_fingerprint(storage: &dyn Storage, pkg: &str) -> Result<String>
     ))
 }
 
-/// Re-prove each dead observation the audit walk collected before it becomes a
-/// global-index remove. An observation whose fingerprint still matches truth is
-/// current and removes; one that moved — or cannot be re-read — is handed back
-/// to the marker path instead: the tick re-derives liveness from fresh truth, so
-/// a mid-audit publish stays listed and a genuinely dead package is removed one
-/// tick later. Never removes on an unprovable observation.
-async fn reverify_dead_observations(
-    storage: &dyn Storage,
-    dead: Vec<(String, Option<String>)>,
-) -> Vec<String> {
-    let mut removes = Vec::with_capacity(dead.len());
-    for (pkg, observed) in dead {
-        let current = package_fingerprint(storage, &pkg).await;
-        match (observed, current) {
-            (Some(observed), Ok(current)) if observed == current => removes.push(pkg),
-            _ => {
-                if let Err(e) = mark_dirty(storage, &pkg).await {
-                    error!(package=%pkg, error=?e, "audit: could not re-arm a moved dead observation; left for the next audit");
-                }
-            }
-        }
-    }
-    removes
-}
-
 /// Publish the tally of crashed-writer intents healed during a drain. Shared by
 /// the selected-bucket [`tick`] and the destination [`drain_dirty_uncached`] —
 /// the two schedulers are otherwise separate, but both heal a stale intent by
@@ -2950,7 +2938,33 @@ async fn update_global_index(
     adds: &[String],
     removes: &[String],
 ) -> Result<()> {
-    if adds.is_empty() && removes.is_empty() {
+    update_global_index_inner(state, storage, adds, removes, &[]).await
+}
+
+/// [`update_global_index`] for the audit's dead observations: each remove
+/// carries the fingerprint its observation is pinned to, and is re-proved
+/// against fresh truth *inside* the locked CAS attempt before it is applied.
+/// The lock serializes the proof against this node's own tick, and the CAS
+/// covers a peer's concurrent write, so between them a stale observation can
+/// never remove a name a fresher rebuild listed — the remaining failure is a
+/// remove that simply does not happen, which the marker re-arm converges.
+async fn update_global_index_verified(
+    state: &AppState,
+    storage: &dyn Storage,
+    adds: &[String],
+    dead: &[(String, String)],
+) -> Result<()> {
+    update_global_index_inner(state, storage, adds, &[], dead).await
+}
+
+async fn update_global_index_inner(
+    state: &AppState,
+    storage: &dyn Storage,
+    adds: &[String],
+    removes: &[String],
+    dead: &[(String, String)],
+) -> Result<()> {
+    if adds.is_empty() && removes.is_empty() && dead.is_empty() {
         return Ok(());
     }
     let mut guard = state.global_names.lock().await;
@@ -2963,7 +2977,7 @@ async fn update_global_index(
     // dirty markers and dropping the delta until the audit (a dead package left
     // listed globally; the sim caught this as seed 19026). Drop the cache on
     // every error so the retry reloads from storage and re-detects the delta.
-    let result = update_global_index_locked(state, storage, adds, removes, &mut guard).await;
+    let result = update_global_index_locked(state, storage, adds, removes, dead, &mut guard).await;
     if result.is_err() {
         *guard = None;
     }
@@ -2979,18 +2993,47 @@ async fn update_global_index_locked(
     storage: &dyn Storage,
     adds: &[String],
     removes: &[String],
+    dead: &[(String, String)],
     guard: &mut Option<GlobalNames>,
 ) -> Result<()> {
+    // Dead names whose observation has been disproved. Sticky across attempts —
+    // a fingerprint never reverts to an earlier value (every write moves an
+    // ETag) — and each earns its dirty marker exactly once.
+    let mut failed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for _attempt in 0..4 {
         if guard.is_none() {
             *guard = Some(load_global_names(storage).await?);
+        }
+        // Re-prove each dead observation against fresh truth inside the locked
+        // attempt, after the load: any add serialized before us (this node's
+        // tick shares the lock; a peer's write predating our load) implies its
+        // artifact landed before this listing, so the fingerprint has moved and
+        // the remove is dropped. An add landing after the load loses to the CAS
+        // below, and the retry re-proves. Confirmation is per-attempt — a lost
+        // CAS means the world moved.
+        let mut confirmed: Vec<&str> = Vec::new();
+        for (pkg, observed) in dead {
+            if failed.contains(pkg) {
+                continue;
+            }
+            if package_fingerprint(storage, pkg).await? == *observed {
+                confirmed.push(pkg);
+            } else {
+                // The package moved since the audit walked it (an upload's
+                // origin claim lands before its artifact, so a mid-flight
+                // publish reads as artifactless). Hand it to the marker path:
+                // the tick re-derives from truth, and a genuinely dead package
+                // is removed one tick later.
+                failed.insert(pkg.clone());
+                mark_dirty(storage, pkg).await?;
+            }
         }
         let cached = guard.as_mut().expect("just loaded");
         let mut changed = false;
         for pkg in adds {
             changed |= cached.names.insert(pkg.clone());
         }
-        for pkg in removes {
+        for pkg in removes.iter().map(String::as_str).chain(confirmed) {
             changed |= cached.names.remove(pkg);
         }
         if !changed && !cached.stranded {
@@ -4329,28 +4372,39 @@ mod tests {
     }
 
     /// The audit walk observed a package artifactless (an upload's origin claim
-    /// lands before its artifact), the publish finished, and the tick listed it.
-    /// The walk's stale remove must not be applied — the name goes back to the
-    /// marker path instead (the CI scale run lost `scaletest-0002` this way for
-    /// a full reconcile interval).
+    /// lands before its artifact), the publish finished, and the tick listed it
+    /// globally. The stale remove must not be applied — the name stays listed
+    /// and goes back to the marker path (the CI scale run lost `scaletest-0002`
+    /// this way for a full reconcile interval).
     #[tokio::test]
     async fn a_moved_dead_observation_is_rearmed_not_removed() {
         let storage = Arc::new(InMemStorage::default());
+        let state = AppState::headless(storage.clone());
         storage.insert(&format!("{PACKAGES_PREFIX}pkg/.origin"), b"{}".to_vec());
         let observed = package_fingerprint(storage.as_ref(), "pkg").await.unwrap();
-        // The publish completes between the observation and the sweep tail.
+        // The publish completes and the tick lists it, between the audit's
+        // observation and its global update.
         storage.insert(
             &format!("{PACKAGES_PREFIX}pkg/pkg-1.0-py3-none-any.whl"),
             vec![0u8; 4],
         );
+        update_global_index(&state, storage.as_ref(), &["pkg".to_string()], &[])
+            .await
+            .unwrap();
 
-        let removes =
-            reverify_dead_observations(storage.as_ref(), vec![("pkg".to_string(), Some(observed))])
-                .await;
+        update_global_index_verified(
+            &state,
+            storage.as_ref(),
+            &[],
+            &[("pkg".to_string(), observed)],
+        )
+        .await
+        .unwrap();
 
-        assert!(
-            removes.is_empty(),
-            "a moved dead observation must not become a global remove"
+        assert_eq!(
+            global_html(&storage).await,
+            pep503_global_html(&["pkg".to_string()]),
+            "a moved dead observation must not delist a fresher publish"
         );
         assert!(
             !storage
@@ -4365,14 +4419,27 @@ mod tests {
     #[tokio::test]
     async fn a_current_dead_observation_still_removes() {
         let storage = Arc::new(InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+        update_global_index(&state, storage.as_ref(), &["pkg".to_string()], &[])
+            .await
+            .unwrap();
         storage.insert(&format!("{PACKAGES_PREFIX}pkg/.origin"), b"{}".to_vec());
         let observed = package_fingerprint(storage.as_ref(), "pkg").await.unwrap();
 
-        let removes =
-            reverify_dead_observations(storage.as_ref(), vec![("pkg".to_string(), Some(observed))])
-                .await;
+        update_global_index_verified(
+            &state,
+            storage.as_ref(),
+            &[],
+            &[("pkg".to_string(), observed)],
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(removes, vec!["pkg".to_string()]);
+        assert_eq!(
+            global_html(&storage).await,
+            pep503_global_html(&[]),
+            "a proved-current dead observation must delist the package"
+        );
         assert!(
             storage
                 .list_dir_entries(DIRTY_PREFIX)
@@ -4381,15 +4448,6 @@ mod tests {
                 .is_empty(),
             "a current observation needs no marker re-arm"
         );
-    }
-
-    /// No fingerprint means no proof: never remove, re-arm instead.
-    #[tokio::test]
-    async fn an_unprovable_dead_observation_never_removes() {
-        let storage = Arc::new(InMemStorage::default());
-        let removes =
-            reverify_dead_observations(storage.as_ref(), vec![("pkg".to_string(), None)]).await;
-        assert!(removes.is_empty());
     }
 
     #[tokio::test]

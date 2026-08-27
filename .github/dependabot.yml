@@ -1,9 +1,11 @@
 # Python deps are deliberately absent here: the nightly deps lane
-# (.github/workflows/nightly-deps.yml) owns them, running
-# `uv lock --upgrade --exclude-newer` every night with a 14-day release-age
-# cooldown and landing one self-merging lockfile PR instead of a stream of them.
-# A "uv"/"pip" ecosystem below would duplicate that and fight over uv.lock.
-# Cargo and the actions pins stay here.
+# (.github/workflows/nightly-deps.yml) owns them, running `uv lock --upgrade`
+# every night behind pyproject.toml's 14-day release-age cooldown and landing
+# one self-merging lockfile PR instead of a stream of them. A "uv"/"pip"
+# ecosystem below would duplicate that and fight over uv.lock. The same lane
+# bumps Cargo.lock nightly (dev/scripts/bump_deps.py enforces the same window
+# against crates.io publish dates), so the cargo entry below is a monthly
+# backstop; the actions pins are dependabot's alone.
 version: 2
 updates:
   - package-ecosystem: "cargo"

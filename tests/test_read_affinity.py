@@ -654,7 +654,12 @@ def test_preferred_bucket_failover_leaves_the_region_read_pin_alone(
         pypiron_bin,
         minio,
         node_region=READ_AFFINITY_NODE_REGION,
-        leave_failures=1,
+        # 3, not 1: the proxy hard-fails every request to A, so its failover
+        # still lands in a few probes — but the healthy region bucket B must
+        # tolerate an isolated slow request on a loaded CI runner. Strikes are
+        # consecutive and reset on success, so one blip at 1 moved the read pin
+        # off B and the drain-gated return kept it away for the rest of the test.
+        leave_failures=3,
         return_healthy_secs=2,
         extra_env={"PYPIRON_BUCKETS": _three_region_buckets_uri(minio)},
     )

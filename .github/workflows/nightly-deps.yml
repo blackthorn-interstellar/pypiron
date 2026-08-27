@@ -108,6 +108,10 @@ jobs:
       contents: read
     outputs:
       changed: ${{ steps.bump.outputs.changed }}
+      # Mapped from the BANK step's id, and that mapping is the security
+      # property — see the digest comment at the end of that step.
+      uv_lock_sha: ${{ steps.bump.outputs.uv_lock_sha }}
+      cargo_lock_sha: ${{ steps.bump.outputs.cargo_lock_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -155,6 +159,26 @@ jobs:
           # Bank the bumped lockfiles for deps-publish and the fix agent before
           # anything can fail.
           cp uv.lock Cargo.lock "$RUNNER_TEMP/deps/"
+          # Digest them HERE, in the same step that banks them, because the NEXT
+          # step is the first line of just-bumped crate and wheel code to run on
+          # this VM — build scripts, proc macros, package entry points, pytest
+          # plugins. That code can write to $RUNNER_TEMP/deps/ (the artifact is
+          # uploaded `if: always()`), and neither guard downstream would notice:
+          # the stray-file check and the reformat check both read the WORKING
+          # TREE, not the bank, and the cooldown ran before it. A rewritten
+          # Cargo.lock would be copied onto master by deps-publish, auto-merged,
+          # and compiled `--locked` into every attested release artifact.
+          #
+          # A later step's subprocess can only APPEND to its own step's
+          # $GITHUB_OUTPUT file; it cannot reach back and rewrite what this step
+          # already recorded, and the job-level outputs above are mapped from
+          # THIS step's id. So the digests travel to the privileged jobs out of
+          # reach of anything the bump installed, and those jobs re-verify the
+          # artifact against them before touching its lockfiles.
+          {
+            echo "uv_lock_sha=$(sha256sum "$RUNNER_TEMP/deps/uv.lock" | cut -d' ' -f1)"
+            echo "cargo_lock_sha=$(sha256sum "$RUNNER_TEMP/deps/Cargo.lock" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
       - name: Check with the bumped dependencies
         if: steps.bump.outputs.changed == 'true'
         run: |
@@ -227,6 +251,33 @@ jobs:
         with:
           name: nightly-deps-evidence
           path: ${{ runner.temp }}/deps/
+      # The artifact was uploaded AFTER the bumped packages had their run of the
+      # validate VM, so its bytes are not evidence of anything on their own. The
+      # digests are: the bump step recorded them before that code ran and no
+      # later step could rewrite them. Fail closed — an unrecorded digest counts
+      # as a mismatch, so a bump step that never got that far cannot publish a
+      # lockfile either.
+      - name: The banked lockfiles are the ones the bump produced
+        env:
+          UV_LOCK_SHA: ${{ needs.deps.outputs.uv_lock_sha }}
+          CARGO_LOCK_SHA: ${{ needs.deps.outputs.cargo_lock_sha }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in uv.lock Cargo.lock; do
+            case "$f" in
+              uv.lock) want=${UV_LOCK_SHA:-} ;;
+              Cargo.lock) want=${CARGO_LOCK_SHA:-} ;;
+            esac
+            got=$(sha256sum "$RUNNER_TEMP/deps/$f" | cut -d' ' -f1)
+            if [ -z "$want" ] || [ "$got" != "$want" ]; then
+              echo "::error::$f in the deps artifact is not what the bump banked (recorded ${want:-<none>}, got $got) — something rewrote it after the bank, refusing to publish"
+              fail=1
+            else
+              echo "$f verified: $got"
+            fi
+          done
+          exit "$fail"
       - name: Branch, apply the bumped lockfiles, push, pull request
         run: |
           set -euo pipefail
@@ -336,6 +387,31 @@ jobs:
           # .local/ is this repo's gitignored scratch root, so the evidence
           # cannot ride along in the agent's `git add -A` below.
           path: .local/deps/
+      # Same check deps-publish runs, for the same reason: the agent is told to
+      # copy these two files over the checkout and commit them, and its commit
+      # reaches master through deps-fix-publish. Verify before the agent — and
+      # therefore before any bumped code — runs on this VM.
+      - name: The banked lockfiles are the ones the bump produced
+        env:
+          UV_LOCK_SHA: ${{ needs.deps.outputs.uv_lock_sha }}
+          CARGO_LOCK_SHA: ${{ needs.deps.outputs.cargo_lock_sha }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in uv.lock Cargo.lock; do
+            case "$f" in
+              uv.lock) want=${UV_LOCK_SHA:-} ;;
+              Cargo.lock) want=${CARGO_LOCK_SHA:-} ;;
+            esac
+            got=$(sha256sum ".local/deps/$f" | cut -d' ' -f1)
+            if [ -z "$want" ] || [ "$got" != "$want" ]; then
+              echo "::error::$f in the deps artifact is not what the bump banked (recorded ${want:-<none>}, got $got) — something rewrote it after the bank, refusing to hand it to the agent"
+              fail=1
+            else
+              echo "$f verified: $got"
+            fi
+          done
+          exit "$fail"
       - name: Record the base commit
         run: |
           set -euo pipefail

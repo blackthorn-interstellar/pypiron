@@ -21,7 +21,23 @@ permissions:
 
 jobs:
   bundle:
-    if: vars.SOAK_S3_BUCKET != ''
+    # The bucket check is the on/off switch; the ref check is the security half.
+    # This job holds `id-token: write` and assumes a role with write access to
+    # the soak bucket, and workflow_dispatch is satisfied at ANY ref — so
+    # without this line `gh workflow run soak-bundle.yml --ref <branch>` would
+    # build that branch's unreviewed code (build-vopr.sh runs from the checkout)
+    # and hand it the role, with the resulting bundle landing on the key every
+    # box in the running fleet pulls within ~10 min. The push trigger above is
+    # already master-only, so the gate costs nothing a real run wanted. The
+    # role's trust policy is documented (selfcheck.yml's header) as scoped to
+    # the OIDC subject `ref:refs/heads/master`, which should refuse a branch at
+    # assume-role — but that is AWS-side config no reader of this file can
+    # verify, so it is the second layer, not the defense. Same class as ci.yml's
+    # real-GCS job (9445aea), weekly.yml's real-S3 job (0b69727) and
+    # selfcheck.yml (4db942c).
+    if: >-
+      vars.SOAK_S3_BUCKET != '' &&
+      (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04-arm # native arm64 → aarch64 binary, no cross-compile
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -106,7 +106,7 @@ jobs:
     outputs:
       changed: ${{ steps.bump.outputs.changed }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -114,7 +114,7 @@ jobs:
         with:
           components: clippy, rustfmt # `make check` runs both; the action's default profile ships neither
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: Bump inside the cooldown
         id: bump
         run: |
@@ -200,7 +200,7 @@ jobs:
           git status --porcelain > "$RUNNER_TEMP/deps/status.txt" || true
       - name: Evidence artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nightly-deps-evidence
           path: ${{ runner.temp }}/deps/
@@ -225,12 +225,12 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false # the push authenticates through GH_TOKEN below, not a token parked in .git/config
       - name: The bumped lockfile from the validate job
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: nightly-deps-evidence
           path: ${{ runner.temp }}/deps/
@@ -327,7 +327,7 @@ jobs:
     outputs:
       has_changes: ${{ steps.capture.outputs.has_changes }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -335,9 +335,9 @@ jobs:
         with:
           components: clippy, rustfmt # `make check` runs both; the action's default profile ships neither
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: The failed attempt's evidence
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: nightly-deps-evidence
           # .local/ is this repo's gitignored scratch root, so the evidence
@@ -440,14 +440,14 @@ jobs:
           git diff --stat --cached "$BASE" >> "$GITHUB_STEP_SUMMARY" || true
       - name: Bank the fix for the publish job
         if: ${{ !cancelled() && steps.capture.outputs.has_changes == 'true' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nightly-deps-fix-bundle
           path: ${{ runner.temp }}/fix/
           if-no-files-found: error
       - name: Agent transcript artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nightly-deps-fix-transcript
           # The literal path, not steps.agent.outputs.execution_file: a failed
@@ -479,17 +479,17 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: The bump's report
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: nightly-deps-evidence
           path: ${{ runner.temp }}/deps/
       - name: The agent's fix patch
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: nightly-deps-fix-bundle
           # Outside the checkout: the `git add -A` below must not sweep the
@@ -717,7 +717,7 @@ jobs:
     outputs:
       has_changes: ${{ steps.capture.outputs.has_changes }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: deps/nightly
           fetch-depth: 0
@@ -726,7 +726,7 @@ jobs:
         with:
           components: clippy, rustfmt # `make check` runs both; the action's default profile ships neither
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: Record the base commit
         run: |
           set -euo pipefail
@@ -818,14 +818,14 @@ jobs:
           git diff --stat --cached "$BASE" >> "$GITHUB_STEP_SUMMARY" || true
       - name: Bank the fix for the publish job
         if: ${{ !cancelled() && steps.capture.outputs.has_changes == 'true' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nightly-deps-remedy-bundle
           path: ${{ runner.temp }}/remedy/
           if-no-files-found: error
       - name: Agent transcript artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nightly-deps-remedy-transcript
           # The literal path, not steps.agent.outputs.execution_file: a failed
@@ -862,13 +862,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: deps/nightly
           fetch-depth: 0
           persist-credentials: false
       - name: The agent's fix patch
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: nightly-deps-remedy-bundle
           path: ${{ runner.temp }}/remedy/

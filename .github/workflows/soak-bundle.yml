@@ -15,12 +15,16 @@ on:
     paths: [src/**, examples/vopr.rs, Cargo.toml, Cargo.lock, dev/ops/soak/**]
   workflow_dispatch: {}
 
-permissions:
-  id-token: write # for AWS OIDC
-  contents: read
+permissions: {}
 
 jobs:
   bundle:
+    # Granted on the job, not the workflow, so the OIDC token is scoped to the
+    # job the ref gate below covers — a second job added to this file gets
+    # nothing by default rather than inheriting a token without the gate.
+    permissions:
+      id-token: write # for AWS OIDC
+      contents: read # actions/checkout
     # The bucket check is the on/off switch; the ref check is the security half.
     # This job holds `id-token: write` and assumes a role with write access to
     # the soak bucket, and workflow_dispatch is satisfied at ANY ref — so

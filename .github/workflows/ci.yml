@@ -566,6 +566,42 @@ jobs:
         # https://github.com/rust-fuzz/cargo-fuzz/issues/398
         run: cargo fuzz build --target x86_64-unknown-linux-gnu
 
+  # Branch protection does not cover tags: a pushed vX.Y.Z can point at any
+  # commit, and this workflow builds and trusted-publishes from the tagged
+  # commit — so a tag at an arbitrary, unreviewed commit would otherwise ship to
+  # PyPI and the GitHub Release, bypassing code review. Refuse unless the built
+  # commit is reachable from master. Every job on the release path needs this, so
+  # an unauthorized tag never even starts the wheel matrix. A workflow_dispatch
+  # dry-run runs on a branch ref, publishes nothing (both release jobs are
+  # tag-gated) and is exempt — enforcing ancestry there would only wrongly block
+  # a legit dry-run from an unmerged branch.
+  authorize:
+    name: authorize (tag reachable from master)
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # fetch-depth: 0 makes checkout fetch every branch into refs/remotes/origin/*,
+      # so origin/master below is this run's truth, not a stale cache.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Refuse a tag not reachable from master
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "authorized: $GITHUB_SHA is reachable from master"
+          else
+            echo "::error::tag commit $GITHUB_SHA is not on master — refusing to release"
+            exit 1
+          fi
+
   # Wheel builds run only for release tags (and manual dispatch for testing the
   # pipeline). The version is stamped from the tag; the repo itself stays at 0.0.0.
   # One job, one matrix over every (kind, runner, target). maturin-action treats an
@@ -575,6 +611,7 @@ jobs:
   wheels:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     name: wheels (${{ matrix.kind }}, ${{ matrix.target }})
+    needs: authorize
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -582,7 +619,10 @@ jobs:
         include:
           # `triple` is the Rust target the wheel embeds; it names the standalone
           # binary archive pulled from that same wheel (see "Archive ..." below).
-          - { kind: linux,     runner: ubuntu-22.04,   target: x86_64,  triple: x86_64-unknown-linux-gnu }
+          # `smoke`/`container_smoke` mark the rows whose wheel this runner can
+          # actually EXECUTE (see the smoke steps below); every other row is
+          # cross-compiled or libc-mismatched and says so out loud instead.
+          - { kind: linux,     runner: ubuntu-22.04,   target: x86_64,  triple: x86_64-unknown-linux-gnu, smoke: true }
           - { kind: linux,     runner: ubuntu-22.04,   target: x86,     triple: i686-unknown-linux-gnu }
           # aarch64/armv7's manylinux2014 cross-GCC can't compile mimalloc's C, so build
           # them with zig (the toolchain the Docker image cross-compiles all 8 with).
@@ -593,17 +633,21 @@ jobs:
           - { kind: linux,     runner: ubuntu-22.04,   target: s390x,   triple: s390x-unknown-linux-gnu }
           - { kind: linux,     runner: ubuntu-22.04,   target: ppc64le, triple: powerpc64le-unknown-linux-gnu }
           - { kind: linux,     runner: ubuntu-22.04,   target: riscv64, triple: riscv64gc-unknown-linux-gnu }
-          - { kind: musllinux, runner: ubuntu-22.04,   target: x86_64,  triple: x86_64-unknown-linux-musl,  manylinux: musllinux_1_2 }
+          - { kind: musllinux, runner: ubuntu-22.04,   target: x86_64,  triple: x86_64-unknown-linux-musl,  manylinux: musllinux_1_2, container_smoke: true }
           - { kind: musllinux, runner: ubuntu-22.04,   target: x86,     triple: i686-unknown-linux-musl,    manylinux: musllinux_1_2 }
           - { kind: musllinux, runner: ubuntu-22.04,   target: aarch64, triple: aarch64-unknown-linux-musl, manylinux: musllinux_1_2 }
           - { kind: musllinux, runner: ubuntu-22.04,   target: armv7,   triple: armv7-unknown-linux-musleabihf, manylinux: musllinux_1_2 }
-          - { kind: windows,   runner: windows-latest, target: x64,     triple: x86_64-pc-windows-msvc }
-          - { kind: windows,   runner: windows-latest, target: x86,     triple: i686-pc-windows-msvc }
+          # `pyarch` picks the interpreter the smoke step installs the wheel with:
+          # pip refuses a win32 wheel on a 64-bit Python, so the x86 row needs a
+          # 32-bit one (the 32-bit exe itself runs fine on the x64 runner). The
+          # aarch64 wheel can't execute here at all and is build-only.
+          - { kind: windows,   runner: windows-latest, target: x64,     triple: x86_64-pc-windows-msvc, smoke: true, pyarch: x64 }
+          - { kind: windows,   runner: windows-latest, target: x86,     triple: i686-pc-windows-msvc, smoke: true, pyarch: x86 }
           - { kind: windows,   runner: windows-latest, target: aarch64, triple: aarch64-pc-windows-msvc }
           # GitHub retired the macos-13 (Intel) image on 2025-12-04; macos-15-intel
           # is its standard x86_64 replacement (last Intel image, supported to ~2027-08).
-          - { kind: macos,     runner: macos-15-intel, target: x86_64,  triple: x86_64-apple-darwin }
-          - { kind: macos,     runner: macos-14,       target: aarch64, triple: aarch64-apple-darwin }
+          - { kind: macos,     runner: macos-15-intel, target: x86_64,  triple: x86_64-apple-darwin, smoke: true }
+          - { kind: macos,     runner: macos-14,       target: aarch64, triple: aarch64-apple-darwin, smoke: true }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -632,11 +676,108 @@ jobs:
           manylinux: ${{ matrix.manylinux || 'auto' }}
         env:
           CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
+      # Fingerprint dist/ the moment it is built, and stash the digest OUTSIDE
+      # dist/. The smoke steps below run pip and docker with network access; a
+      # compromised action or PyPI dependency could rewrite an already-built
+      # wheel in that window and still pass its own smoke. The verify step just
+      # before upload re-checks these digests, and the `release` job re-checks
+      # them again against what it downloads, so a tampered artifact can never
+      # reach trusted publishing unnoticed.
+      - name: Record dist digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          # shasum fallback: macOS arm64 runners ship no sha256sum (the Intel
+          # image only has one incidentally, via coreutils). Same output format.
+          if command -v sha256sum >/dev/null; then sha256sum dist/*; else shasum -a 256 dist/*; fi \
+            > "$RUNNER_TEMP/digests/${{ matrix.kind }}-${{ matrix.target }}.sha256"
+      # Prove the wheel we just built actually installs and RUNS before it can be
+      # published: `maturin build` succeeding says nothing about whether the
+      # packaged executable starts. Only rows this runner can execute are smoked
+      # (matrix.smoke); the cross-compiled and libc-mismatched wheels are skipped
+      # with a visible note below rather than silently. Windows needs the
+      # arch-matched interpreter (matrix.pyarch) or pip rejects the win32 wheel.
+      - name: Set up Python for smoke
+        if: matrix.smoke
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.pyarch }}
+      - name: Smoke test the built wheel
+        if: matrix.smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A relative venv dir, not $RUNNER_TEMP: on Windows that is a backslash
+          # path and this step runs under git-bash on three OSes.
+          rm -rf smoke-venv
+          if [[ "$RUNNER_OS" == "Windows" ]]; then bin=smoke-venv/Scripts; ext=.exe; else bin=smoke-venv/bin; ext=; fi
+          python -m venv smoke-venv
+          "$bin/python$ext" -m pip install --disable-pip-version-check --no-input dist/*.whl
+          "$bin/pypiron$ext" --version
+          "$bin/pypiron$ext" --help > /dev/null
+          # On a tag, the binary must also report the version we stamped — a
+          # wheel built before the stamp would still start, and still be wrong.
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            expect="${GITHUB_REF_NAME#v}"
+            got=$("$bin/pypiron$ext" --version)
+            if [[ "$got" != "pypiron $expect "* ]]; then
+              echo "::error::--version reported '$got', expected version $expect"
+              exit 1
+            fi
+          fi
+      # musl wheels can't run on the glibc runner, but docker can: run the same
+      # smoke inside Alpine. One row — x86_64, the runner's native docker arch —
+      # covers the class; the other musl arches would need QEMU and stay
+      # build-only. dist is mounted read-only so the container cannot touch it.
+      - name: Smoke test the musllinux wheel in an Alpine container
+        if: matrix.container_smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          expect=""
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then expect="${GITHUB_REF_NAME#v}"; fi
+          docker run --rm -e "PYPIRON_EXPECT_VERSION=$expect" -v "$PWD/dist:/dist:ro" python:3.12-alpine sh -c '
+            set -e
+            python3 -m venv /tmp/smoke
+            /tmp/smoke/bin/pip install --disable-pip-version-check --no-input /dist/*.whl
+            /tmp/smoke/bin/pypiron --version
+            /tmp/smoke/bin/pypiron --help > /dev/null
+            if [ -n "$PYPIRON_EXPECT_VERSION" ]; then
+              /tmp/smoke/bin/pypiron --version | grep -q "^pypiron $PYPIRON_EXPECT_VERSION " || {
+                echo "::error::--version did not report $PYPIRON_EXPECT_VERSION"; exit 1; }
+            fi
+          '
+      - name: Note wheel not smoked (cross-compiled / libc-incompatible)
+        if: ${{ !matrix.smoke && !matrix.container_smoke }}
+        shell: bash
+        run: echo "::notice::${{ matrix.kind }}/${{ matrix.target }} wheel cannot execute on this runner (cross-compiled or libc-incompatible) — built, not smoked"
+      # Fail loudly if dist/ changed since it was built, before it is uploaded
+      # and (on a tag) trusted-published. Re-listing and diffing rather than
+      # `sha256sum -c`: -c only re-checks the files it was given, so a wheel
+      # ADDED to dist/ after the record step would pass it — and upload-artifact
+      # and the PyPI publish take the whole directory. The diff compares the
+      # exact same listing, so additions, edits and deletions all fail.
+      - name: Verify dist unchanged since build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null; then sha256sum dist/*; else shasum -a 256 dist/*; fi \
+            | diff - "$RUNNER_TEMP/digests/${{ matrix.kind }}-${{ matrix.target }}.sha256"
       - name: Upload wheels
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-${{ matrix.kind }}-${{ matrix.target }}
           path: dist
+      # Hand the digests to the `release` job so it can re-verify what it
+      # downloads against what was built here, not just against itself.
+      - name: Upload dist digests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-digests-${{ matrix.kind }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
       # Re-wrap the compiled binary already inside the wheel as a standalone
       # archive — the GitHub-Release download for this target. No second compile.
       - name: Archive standalone binary
@@ -653,6 +794,7 @@ jobs:
 
   sdist:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: authorize
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -678,17 +820,39 @@ jobs:
         with:
           command: sdist
           args: --out dist
+      # Same dist-integrity guard as the wheels job: fingerprint the freshly
+      # built sdist outside dist/, verify it just before upload, and hand the
+      # digest to the `release` job. The sdist is not smoked — installing it
+      # compiles the whole crate from source, which this job has no toolchain
+      # for and the wheel rows already cover the "does the binary run" question.
+      - name: Record dist digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          sha256sum dist/* > "$RUNNER_TEMP/digests/sdist.sha256"
+      - name: Verify dist unchanged since build
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum dist/* | diff - "$RUNNER_TEMP/digests/sdist.sha256"
       - name: Upload sdist
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-sdist
           path: dist
+      - name: Upload dist digests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-digests-sdist
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
 
   release:
     name: Release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [fmt, clippy, test, wheels, sdist]
+    needs: [authorize, fmt, clippy, test, wheels, sdist]
     permissions:
       # Used for PyPI trusted publishing and to sign the release artifacts
       id-token: write
@@ -702,6 +866,13 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
           path: dist
+      # The sha256 each build job recorded of its own dist/ the moment it was
+      # built. One file per matrix row, so merge-multiple can't collide them.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dist-digests-*
+          merge-multiple: true
+          path: dist-digests
       # Build-provenance attestation is a public-repo-only feature; skip it while
       # the repo is private (it reactivates automatically once the repo is public).
       - name: Generate artifact attestation
@@ -709,6 +880,20 @@ jobs:
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: 'dist/*'
+      # Last gate before trusted publishing: re-hash what we are about to upload
+      # and require it to be exactly what the build jobs recorded. This closes the
+      # window the build-side verify can't see — artifact transit, the merged
+      # download, and the attestation step's own network access. Diffing full
+      # listings rather than `sha256sum -c` so an artifact ADDED to dist/ (which
+      # the publish would happily upload) fails too.
+      - name: Verify dist unchanged since build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat dist-digests/*.sha256 | sort > "$RUNNER_TEMP/expected.sha256"
+          sha256sum dist/* | sort > "$RUNNER_TEMP/actual.sha256"
+          diff "$RUNNER_TEMP/expected.sha256" "$RUNNER_TEMP/actual.sha256"
+          echo "verified $(wc -l < "$RUNNER_TEMP/actual.sha256") artifacts against their build-time digests"
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
@@ -722,6 +907,7 @@ jobs:
   binary-armv6:
     name: binary (armv6)
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: authorize
     runs-on: ubuntu-latest
     env:
       TRIPLE: arm-unknown-linux-musleabihf
@@ -780,7 +966,7 @@ jobs:
     name: Release binaries (GitHub)
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [fmt, clippy, test, wheels, binary-armv6]
+    needs: [authorize, fmt, clippy, test, wheels, binary-armv6]
     permissions:
       contents: write       # create the Release and upload assets
       id-token: write       # provenance attestation

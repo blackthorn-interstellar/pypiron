@@ -112,6 +112,7 @@ jobs:
       # property — see the digest comment at the end of that step.
       uv_lock_sha: ${{ steps.bump.outputs.uv_lock_sha }}
       cargo_lock_sha: ${{ steps.bump.outputs.cargo_lock_sha }}
+      report_sha: ${{ steps.bump.outputs.report_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -159,25 +160,36 @@ jobs:
           # Bank the bumped lockfiles for deps-publish and the fix agent before
           # anything can fail.
           cp uv.lock Cargo.lock "$RUNNER_TEMP/deps/"
-          # Digest them HERE, in the same step that banks them, because the NEXT
-          # step is the first line of just-bumped crate and wheel code to run on
-          # this VM — build scripts, proc macros, package entry points, pytest
-          # plugins. That code can write to $RUNNER_TEMP/deps/ (the artifact is
-          # uploaded `if: always()`), and neither guard downstream would notice:
-          # the stray-file check and the reformat check both read the WORKING
-          # TREE, not the bank, and the cooldown ran before it. A rewritten
-          # Cargo.lock would be copied onto master by deps-publish, auto-merged,
-          # and compiled `--locked` into every attested release artifact.
+          # Digest the three files the privileged jobs act on, here in the step
+          # that writes them. The artifact uploads `if: always()`, which is AFTER
+          # the bumped packages have had a whole step of this VM to themselves —
+          # build scripts, proc macros, package entry points, pytest plugins —
+          # and nothing downstream would notice a rewritten bank: the stray-file
+          # and reformat guards read the WORKING TREE, and the cooldown ran
+          # earlier still. A rewritten Cargo.lock gets copied onto master by
+          # deps-publish, auto-merged, and compiled `--locked` into every
+          # attested release artifact; a rewritten report.md is the PR body a
+          # human reads while deciding to trust all of it.
           #
           # A later step's subprocess can only APPEND to its own step's
           # $GITHUB_OUTPUT file; it cannot reach back and rewrite what this step
           # already recorded, and the job-level outputs above are mapped from
           # THIS step's id. So the digests travel to the privileged jobs out of
           # reach of anything the bump installed, and those jobs re-verify the
-          # artifact against them before touching its lockfiles.
+          # artifact against them before they use any of it.
+          #
+          # What this closes is tampering AFTER the digest is taken, not every
+          # hook that ran before it: `uv lock --upgrade` can execute an sdist's
+          # build hooks while resolving, earlier in this same step. Ordering
+          # blunts that much — uv rewrites uv.lock once it has resolved and
+          # `cargo update` rewrites Cargo.lock after that, so a hook's edits to
+          # either are overwritten before the cp above. A process such a hook
+          # left running in the background could still race this window, and
+          # this mechanism does not reach it.
           {
             echo "uv_lock_sha=$(sha256sum "$RUNNER_TEMP/deps/uv.lock" | cut -d' ' -f1)"
             echo "cargo_lock_sha=$(sha256sum "$RUNNER_TEMP/deps/Cargo.lock" | cut -d' ' -f1)"
+            echo "report_sha=$(sha256sum "$RUNNER_TEMP/deps/report.md" | cut -d' ' -f1)"
           } >> "$GITHUB_OUTPUT"
       - name: Check with the bumped dependencies
         if: steps.bump.outputs.changed == 'true'
@@ -254,22 +266,32 @@ jobs:
       # The artifact was uploaded AFTER the bumped packages had their run of the
       # validate VM, so its bytes are not evidence of anything on their own. The
       # digests are: the bump step recorded them before that code ran and no
-      # later step could rewrite them. Fail closed — an unrecorded digest counts
-      # as a mismatch, so a bump step that never got that far cannot publish a
-      # lockfile either.
-      - name: The banked lockfiles are the ones the bump produced
+      # later step could rewrite them. All three files this job goes on to use
+      # are covered — the two lockfiles it commits, and report.md, which becomes
+      # the PR body verbatim. Fail closed on both a mismatch and an unrecorded
+      # digest, so a bump step that never got that far cannot publish either.
+      - name: The banked lockfiles and report are the ones the bump produced
         env:
           UV_LOCK_SHA: ${{ needs.deps.outputs.uv_lock_sha }}
           CARGO_LOCK_SHA: ${{ needs.deps.outputs.cargo_lock_sha }}
+          REPORT_SHA: ${{ needs.deps.outputs.report_sha }}
         run: |
           set -euo pipefail
           fail=0
-          for f in uv.lock Cargo.lock; do
+          for f in uv.lock Cargo.lock report.md; do
             case "$f" in
               uv.lock) want=${UV_LOCK_SHA:-} ;;
               Cargo.lock) want=${CARGO_LOCK_SHA:-} ;;
+              report.md) want=${REPORT_SHA:-} ;;
             esac
-            got=$(sha256sum "$RUNNER_TEMP/deps/$f" | cut -d' ' -f1)
+            # A DELETED file is a mismatch like any other, and it has to be
+            # spelled as one: bare sha256sum would die under `set -e` on a raw
+            # "No such file or directory" that names no step and no reason.
+            if [ -f "$RUNNER_TEMP/deps/$f" ]; then
+              got=$(sha256sum "$RUNNER_TEMP/deps/$f" | cut -d' ' -f1)
+            else
+              got="<missing>"
+            fi
             if [ -z "$want" ] || [ "$got" != "$want" ]; then
               echo "::error::$f in the deps artifact is not what the bump banked (recorded ${want:-<none>}, got $got) — something rewrote it after the bank, refusing to publish"
               fail=1
@@ -388,22 +410,32 @@ jobs:
           # cannot ride along in the agent's `git add -A` below.
           path: .local/deps/
       # Same check deps-publish runs, for the same reason: the agent is told to
-      # copy these two files over the checkout and commit them, and its commit
-      # reaches master through deps-fix-publish. Verify before the agent — and
-      # therefore before any bumped code — runs on this VM.
-      - name: The banked lockfiles are the ones the bump produced
+      # copy the two lockfiles over the checkout and commit them, it reads
+      # report.md as its brief, and its commit reaches master through
+      # deps-fix-publish. Verify before the agent — and therefore before any
+      # bumped code — runs on this VM.
+      - name: The banked lockfiles and report are the ones the bump produced
         env:
           UV_LOCK_SHA: ${{ needs.deps.outputs.uv_lock_sha }}
           CARGO_LOCK_SHA: ${{ needs.deps.outputs.cargo_lock_sha }}
+          REPORT_SHA: ${{ needs.deps.outputs.report_sha }}
         run: |
           set -euo pipefail
           fail=0
-          for f in uv.lock Cargo.lock; do
+          for f in uv.lock Cargo.lock report.md; do
             case "$f" in
               uv.lock) want=${UV_LOCK_SHA:-} ;;
               Cargo.lock) want=${CARGO_LOCK_SHA:-} ;;
+              report.md) want=${REPORT_SHA:-} ;;
             esac
-            got=$(sha256sum ".local/deps/$f" | cut -d' ' -f1)
+            # A DELETED file is a mismatch like any other, and it has to be
+            # spelled as one: bare sha256sum would die under `set -e` on a raw
+            # "No such file or directory" that names no step and no reason.
+            if [ -f ".local/deps/$f" ]; then
+              got=$(sha256sum ".local/deps/$f" | cut -d' ' -f1)
+            else
+              got="<missing>"
+            fi
             if [ -z "$want" ] || [ "$got" != "$want" ]; then
               echo "::error::$f in the deps artifact is not what the bump banked (recorded ${want:-<none>}, got $got) — something rewrote it after the bank, refusing to hand it to the agent"
               fail=1
@@ -533,7 +565,12 @@ jobs:
   # write token lives. Runs only when the agent actually produced a change.
   deps-fix-publish:
     name: open the repaired PR
-    needs: deps-fix
+    # `deps` is named only to read its recorded digests below — deps-fix already
+    # depends on it, so this adds no ordering. It changes no gating either: the
+    # `if` uses a status function, so GitHub wraps nothing in an implicit
+    # success() that a failed `deps` (the only way this lane runs at all) would
+    # then refuse.
+    needs: [deps, deps-fix]
     # !cancelled() rather than the implicit success(): the agent job goes red
     # when it exhausts its turns, but it still banked a patch that must reach a
     # PR. has_changes stays the real gate, so an agent that committed nothing
@@ -558,6 +595,30 @@ jobs:
         with:
           name: nightly-deps-evidence
           path: ${{ runner.temp }}/deps/
+      # This job takes only report.md out of that artifact, and it goes into the
+      # PR body unread by anyone until a human is already looking at the merge —
+      # so it gets the same digest check the lockfiles get in deps-publish. The
+      # lockfiles here arrive inside the agent's patch instead, and deps-fix
+      # verified them before the agent ever saw them.
+      - name: The banked report is the one the bump produced
+        env:
+          REPORT_SHA: ${{ needs.deps.outputs.report_sha }}
+        run: |
+          set -euo pipefail
+          want=${REPORT_SHA:-}
+          # A DELETED file is a mismatch like any other, and it has to be
+          # spelled as one: bare sha256sum would die under `set -e` on a raw
+          # "No such file or directory" that names no step and no reason.
+          if [ -f "$RUNNER_TEMP/deps/report.md" ]; then
+            got=$(sha256sum "$RUNNER_TEMP/deps/report.md" | cut -d' ' -f1)
+          else
+            got="<missing>"
+          fi
+          if [ -z "$want" ] || [ "$got" != "$want" ]; then
+            echo "::error::report.md in the deps artifact is not what the bump banked (recorded ${want:-<none>}, got $got) — something rewrote it after the bank, refusing to publish"
+            exit 1
+          fi
+          echo "report.md verified: $got"
       - name: The agent's fix patch
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

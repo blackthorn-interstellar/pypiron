@@ -172,14 +172,16 @@ pub struct SyncArgs {
     #[arg(long = "no-progress", env = "PYPIRON_SYNC_NO_PROGRESS")]
     pub no_progress: bool,
 
-    /// Mirror files whose version string is not valid PEP 440 (legacy versions).
-    /// Off by default: a file whose version pypiron can't parse as PEP 440 is
-    /// skipped (logged and left out of selection), so one ancient upstream
-    /// release can't break a mirror run. It keys on the version string, not the
-    /// file type — an .egg/.exe/.msi (or any wheel/sdist) with a valid PEP 440
-    /// version still mirrors. This is decided entirely on the syncing side: the
-    /// destination does not re-check mirror uploads, so it stores whatever `sync`
-    /// sends. Set this to mirror legacy versions. Also `[sync].allow-legacy-versions`.
+    /// Mirror files whose version can't be read from the filename as valid
+    /// PEP 440. Off by default: sync infers each file's version from its
+    /// filename, and one it can't parse as PEP 440 is skipped (logged, left out
+    /// of selection) so one ancient upstream release can't break a mirror run.
+    /// This includes every legacy binary format (.egg/.exe/.msi/.rpm/.dmg/.deb),
+    /// whose version can't be inferred from the filename at all — those are
+    /// always skipped by default. This is decided entirely on the syncing side:
+    /// the destination does not re-check mirror uploads, so it stores whatever
+    /// `sync` sends. Set this to mirror those files. Also
+    /// `[sync].allow-legacy-versions`.
     #[arg(long = "allow-legacy-versions", env = "PYPIRON_ALLOW_LEGACY_VERSIONS")]
     pub allow_legacy_versions: bool,
 

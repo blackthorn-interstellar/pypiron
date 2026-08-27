@@ -600,9 +600,13 @@ jobs:
         # `build-wheels` input — the dispatches above do not, so a lockfile bump
         # no longer drags a 15-cell cross-platform wheel matrix along. They skip,
         # which is a CONCLUDED check run (`skipped`), so the watch below can
-        # neither hang on them nor read them as red. What this wait is long for
-        # is the merge gates themselves: the blackbox matrix, the VOPR legs and
-        # the fuzz build.
+        # neither hang on them nor read them as red. ci.yml's real-GCS leg skips
+        # the same way and for the same reason it must: it mounts a persistent
+        # service-account key, and this branch holds unmerged bumped (and, in the
+        # repair lane, agent-authored) code, so ci.yml gates it on the default
+        # branch. The bump loses that one leg here and regains it post-merge.
+        # What this wait is long for is the merge gates themselves: the blackbox
+        # matrix, the VOPR legs and the fuzz build.
         timeout-minutes: 90
         run: |
           sleep 60 # dispatched runs need a moment to register on the head SHA

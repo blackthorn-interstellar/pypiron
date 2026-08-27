@@ -542,13 +542,29 @@ jobs:
     # check having tested nothing — and a GCS outage should not redden a PR.
     # Each test picks its own --storage-prefix, so runs never collide.
     #
+    # The ref check is the security half, and it is why "not a pull_request" is
+    # not enough on its own. This is the only job in this file that mounts a
+    # persistent cloud credential: a service-account JSON key with object admin
+    # on the test bucket, written to a file and handed to pytest. Every ref but
+    # the default branch runs code that has not been merged — nightly-deps.yml
+    # pushes a bumped uv.lock (and, in its repair lane, agent-authored commits)
+    # to `deps/nightly` and dispatches THIS workflow at that ref, so a
+    # workflow_dispatch alone clears an event-name-only gate and a single
+    # malicious pytest plugin in the bump would read the key off disk. The
+    # branch-owned refs deliberately lose real-GCS coverage; the same commits
+    # get it back on the master run after merge. Tag pushes skip it too — the
+    # tagged commit is already required to be reachable from master (see
+    # `authorize`), so master has covered it, and no release job needs it.
+    #
     # Repo config (Settings → Secrets and variables → Actions):
     #   secret PYPIRON_TEST_GCS_REAL_BUCKET     — bucket to test against
     #                                             (also the on/off switch).
     #   secret PYPIRON_TEST_GCS_SERVICE_ACCOUNT — service-account JSON key with
     #                                             object admin on that bucket.
     name: blackbox (real GCS)
-    if: github.event_name != 'pull_request'
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:

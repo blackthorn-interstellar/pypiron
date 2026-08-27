@@ -58,11 +58,12 @@ rules:
     # the SHA is what we run, the comment says which channel it was taken from.
     # The gap widens every time upstream moves, so this can never be resolved by
     # re-pinning — only by dropping the comments, which loses the provenance a
-    # reviewer needs to bump them. 34 findings across the five files below.
+    # reviewer needs to bump them. 40 findings across the six files below.
     ignore:
       - ci.yml
       - docker.yml
       - fuzz.yml
+      - nightly-deps.yml
       - simulation.yml
       - weekly.yml
 
@@ -73,7 +74,7 @@ rules:
     # pushed or re-pointed, so a SHA taken from `stable` or `v2` stops being
     # reachable from any named ref the moment upstream moves — the commit is
     # still genuine and still in the repo, just orphaned from every ref zizmor
-    # enumerates. Verified by hand: the 17 flagged uses are three distinct SHAs
+    # enumerates. Verified by hand: the 20 flagged uses are three distinct SHAs
     # (rust-toolchain stable + nightly, rust-cache v2) and `gh api
     # repos/<owner>/<repo>/commits/<sha>` resolves all three in the repo they
     # name. Re-verify that way on any bump; zizmor cannot do it for these two.
@@ -81,5 +82,6 @@ rules:
       - ci.yml
       - docker.yml
       - fuzz.yml
+      - nightly-deps.yml
       - simulation.yml
       - weekly.yml

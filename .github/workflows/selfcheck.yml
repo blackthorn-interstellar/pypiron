@@ -20,6 +20,7 @@ name: Selfcheck
 #   soak-bundle.yml  vars.SOAK_AWS_ROLE / SOAK_S3_BUCKET (AWS OIDC upload)
 #   weekly.yml       real-S3 leg secrets/vars; the pinned corpus release asset
 #   ci.yml           real-GCS leg secrets
+#   nightly-deps.yml secrets.XAI_API_KEY; that Actions is allowed to open PRs
 on:
   workflow_dispatch:
 
@@ -32,10 +33,17 @@ jobs:
     timeout-minutes: 10
     permissions:
       id-token: write # AWS/GCP OIDC probes
-      contents: read # gh release view, gh api
+      contents: write # gh release view, gh api; the canary branch below
+      pull-requests: write # the canary pull request below
+    # XAI_API_KEY belongs to nightly-deps.yml's repair agent and lives in this
+    # environment, so mounting it here also proves the environment itself
+    # resolves. Pin the environment's deployment branches to master and the
+    # header's "dispatch from master" rule enforces itself.
+    environment: nightly-deps
     # Nothing here reads the repo, so there is no checkout and no token in
-    # .git/config. Secrets appear as booleans so no probe can print one; the two
-    # steps that need a real value take it as step-scoped env.
+    # .git/config — the canary below builds its branch through the API rather
+    # than by cloning and pushing. Secrets appear as booleans so no probe can
+    # print one; the steps that need a real value take it as step-scoped env.
     env:
       HAS_SOAK_AWS_ROLE: ${{ vars.SOAK_AWS_ROLE != '' }}
       HAS_SOAK_S3_BUCKET: ${{ vars.SOAK_S3_BUCKET != '' }}
@@ -52,6 +60,7 @@ jobs:
       HAS_GCS_SERVICE_ACCOUNT: ${{ secrets.PYPIRON_TEST_GCS_SERVICE_ACCOUNT != '' }}
       # Both halves present, so the GCS probe can actually run.
       GCS_PROBE: ${{ secrets.PYPIRON_TEST_GCS_REAL_BUCKET != '' && secrets.PYPIRON_TEST_GCS_SERVICE_ACCOUNT != '' }}
+      HAS_XAI_API_KEY: ${{ secrets.XAI_API_KEY != '' }}
     steps:
       # A gate that is half-configured is the dangerous state: the job runs and
       # fails, or worse reports green having skipped. Presence only — no values.
@@ -77,6 +86,7 @@ jobs:
           row vars.PYPIRON_TEST_S3_REGION             "$HAS_S3_REGION"             'weekly real-S3'
           row secrets.PYPIRON_TEST_GCS_REAL_BUCKET    "$HAS_GCS_REAL_BUCKET"       'ci real-GCS (on/off)'
           row secrets.PYPIRON_TEST_GCS_SERVICE_ACCOUNT "$HAS_GCS_SERVICE_ACCOUNT"  'ci real-GCS'
+          row secrets.XAI_API_KEY                     "$HAS_XAI_API_KEY"           'nightly-deps repair agent (optional)'
           fail=0
           if [ "$HAS_SOAK_S3_BUCKET" = "true" ] && [ "$HAS_SOAK_AWS_ROLE" != "true" ]; then
             echo "::error::SOAK_S3_BUCKET is set but SOAK_AWS_ROLE is not — soak-bundle.yml will run and fail at the upload step"
@@ -222,3 +232,60 @@ jobs:
             exit 1
           fi
           echo "GITHUB_TOKEN reads $name" >> "$GITHUB_STEP_SUMMARY"
+
+      # nightly-deps.yml's repair agent runs on this key. Set-but-dead is the
+      # dangerous state: the lane would open a broken bump's PR, mount a rotated
+      # key, and burn its one repair attempt on an auth error. Spend one free
+      # API call to rule that out.
+      - name: XAI_API_KEY authenticates
+        if: env.HAS_XAI_API_KEY == 'true'
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+            https://api.x.ai/v1/models \
+            -H "Authorization: Bearer $XAI_API_KEY")
+          if [ "$code" != "200" ]; then
+            echo "::error::XAI_API_KEY is set but api.x.ai rejected it (HTTP $code) — nightly-deps.yml's repair agent will fail on every invocation. Rotate the key at console.x.ai."
+            exit 1
+          fi
+          echo "XAI_API_KEY authenticates against api.x.ai" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: XAI_API_KEY — not configured
+        if: env.HAS_XAI_API_KEY != 'true'
+        run: |
+          echo "XAI_API_KEY is unset — nightly-deps.yml runs without its repair rungs: a broken bump ends red with no PR, a red PR ends labeled needs-human. Nothing to prove." >> "$GITHUB_STEP_SUMMARY"
+
+      # The one capability nightly-deps.yml cannot work around. Opening a pull
+      # request with the GITHUB_TOKEN is gated by an org- AND repo-level Actions
+      # setting that job `permissions:` cannot override, and the failure only
+      # shows up at 08:41 UTC as a lane that bumped, checked, and delivered
+      # nothing. Prove it here in seconds, for $0.
+      #
+      # Built through the API rather than by cloning and pushing: this workflow
+      # has no checkout by design, and the setting under test gates `pr create`
+      # regardless of how the head branch got there. Both writes use the
+      # GITHUB_TOKEN, whose events trigger no workflows, so the canary starts no
+      # CI run.
+      - name: Actions can open a pull request (canary, closed immediately)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          br="selfcheck/canary-$GITHUB_RUN_ID"
+          base=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/master" --jq .object.sha)
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$br" -f sha="$base" > /dev/null
+          # Whatever happens next, the branch goes away.
+          trap 'gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$br" > /dev/null 2>&1 || true' EXIT
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/.github/selfcheck-canary" \
+            -f message="selfcheck canary [skip ci]" \
+            -f branch="$br" \
+            -f content="$(date -u | base64 | tr -d '\n')" > /dev/null
+          if url=$(gh pr create --base master --head "$br" --draft \
+              --title "selfcheck canary (auto-closed)" \
+              --body "Proves Actions may open pull requests — the capability nightly-deps.yml needs. Auto-closed."); then
+            gh pr close "$br" > /dev/null
+            echo "Actions can open pull requests (canary $url, closed)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::Actions cannot open pull requests — nightly-deps.yml will bump, check, and deliver nothing. Enable 'Allow GitHub Actions to create and approve pull requests' at BOTH org and repo level (Settings -> Actions -> General -> Workflow permissions)."
+            exit 1
+          fi

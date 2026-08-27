@@ -1,7 +1,9 @@
-# Python deps are deliberately absent here. They are test-suite-only — pytest,
-# twine, ruff and friends, none of which ship to a user — and they are already
-# watched by pip-audit in .github/workflows/security.yaml. A "uv"/"pip" ecosystem
-# would open PRs against uv.lock for dependencies no released artifact contains.
+# Python deps are deliberately absent here: the nightly deps lane
+# (.github/workflows/nightly-deps.yml) owns them, running
+# `uv lock --upgrade --exclude-newer` every night with a 14-day release-age
+# cooldown and landing one self-merging lockfile PR instead of a stream of them.
+# A "uv"/"pip" ecosystem below would duplicate that and fight over uv.lock.
+# Cargo and the actions pins stay here.
 version: 2
 updates:
   - package-ecosystem: "cargo"

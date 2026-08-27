@@ -1,0 +1,178 @@
+# Runs the xAI Grok Build CLI headless, the way the nightly deps lane needs it.
+#
+# Two things about grok 1.0.4 drive this action's shape, both verified against
+# the CLI rather than inferred from an SDK's docs:
+#
+#  1. `--tools` takes INTERNAL tool ids (read_file, run_terminal_command, ...)
+#     and is a hard allowlist: `--tools "read_file,grep,list_dir"` leaves exactly
+#     those plus the always-on MCP meta-tools. `--allow` / `--deny` (whose compat
+#     aliases are spelled --allowedTools / --disallowedTools) are permission
+#     RULES: they gate execution of tools that remain available. Passing a
+#     capitalised `--allowedTools "Read,..."` string would advertise the full
+#     26-tool set and gate nothing, so `allowed_tools` maps to --tools and
+#     nothing maps to the rule flags. A deny list is not offered either: with a
+#     hard allowlist it can only remove tools that are already gone.
+#  2. allowed_tools is the ONLY usable scoping mechanism. Permission rules
+#     (--allow/--deny with a deny-by-default mode) are unusable in 1.0.4: a rule
+#     denial cancels the whole session instead of failing one tool call, so a
+#     scoped session dies on its first unmatched command. Hence no allow_rules
+#     input and bypassPermissions everywhere.
+#
+# The `[toolset.bash]` limits must live in $HOME/.grok/config.toml: a project
+# .grok/config.toml only contributes [mcp_servers], [plugins] and [permission],
+# so a repo-local file would silently drop them.
+#
+# No --json-schema support here. The deps lane's agents deliver by COMMITTING,
+# not by returning a verdict, so the structured-output path (an investigation
+# stage plus a transcription stage, which upstream needs because a schema-armed
+# session tends to satisfy the schema on turn 1 without investigating anything)
+# would be unused machinery. Add it back the day something here needs a verdict.
+name: Grok agent
+description: Run the Grok Build CLI headless with a pinned version, a scoped toolset, and a JSONL transcript.
+
+inputs:
+  prompt:
+    description: The prompt to send. Passed via --prompt-file, never through the shell.
+    required: true
+  xai_api_key:
+    description: xAI API key (console.x.ai) used as XAI_API_KEY.
+    required: true
+  max_turns:
+    description: Maximum agentic turns before the session stops.
+    required: false
+    default: "30"
+  allowed_tools:
+    description: >-
+      Comma-separated INTERNAL tool ids the session may use (e.g.
+      "read_file,grep"). A hard allowlist. Empty means grok's default toolset.
+    required: false
+    default: ""
+  permission_mode:
+    description: >-
+      Permission mode. Keep bypassPermissions: grok 1.0.4 treats a permission
+      RULE denial as a session cancellation rather than a recoverable tool
+      error, so deny-by-default modes (dontAsk) kill a session on its first
+      unmatched command. Scope a session with allowed_tools, which removes
+      tools outright, not with permission rules.
+    required: false
+    default: bypassPermissions
+  model:
+    description: Model id to pin.
+    required: false
+    default: grok-4.6
+  bash_timeout_secs:
+    description: Foreground shell timeout. The 120s default kills this repo's 10-30 minute commands.
+    required: false
+    default: "2400"
+  bash_output_byte_limit:
+    description: Captured shell output cap. The 20000B default truncates a make check log.
+    required: false
+    default: "200000"
+  grok_version:
+    description: Pinned Grok CLI version.
+    required: false
+    default: 1.0.4
+  grok_sha256:
+    description: >-
+      sha256 of the linux-x86_64 artifact for grok_version. Bump both together;
+      get it from `curl -fsSL https://x.ai/cli/grok-<version>-linux-x86_64 | sha256sum`.
+    required: false
+    default: 79f49625f153923db491a5c290e9b04c3444da488b6b9d6aac533ccb5bff2455
+
+outputs:
+  execution_file:
+    description: Path to the session transcript (streaming-json JSONL).
+    value: ${{ steps.run.outputs.execution_file }}
+
+runs:
+  using: composite
+  steps:
+    # The published artifact, verified against a pinned digest — never
+    # `curl https://x.ai/cli/install.sh | bash`, which executes whatever the
+    # endpoint serves today. The artifact is a bare static ELF, so installing it
+    # is a download, a checksum, and a chmod. Runners are ubuntu-latest, hence
+    # the hardcoded linux-x86_64; another platform 404s here rather than
+    # silently installing something unverified.
+    - name: Install the Grok CLI
+      shell: bash
+      env:
+        GROK_VERSION: ${{ inputs.grok_version }}
+        GROK_SHA256: ${{ inputs.grok_sha256 }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.grok/bin"
+        curl -fsSL --retry 3 --max-time 600 \
+          -o "$HOME/.grok/bin/grok" \
+          "https://x.ai/cli/grok-${GROK_VERSION}-linux-x86_64"
+        echo "${GROK_SHA256}  $HOME/.grok/bin/grok" | sha256sum -c -
+        chmod +x "$HOME/.grok/bin/grok"
+        # Invoked by absolute path below rather than exported onto $GITHUB_PATH,
+        # which would be a needless code-execution surface for later steps.
+        "$HOME/.grok/bin/grok" --version
+
+    - name: Configure the toolset limits
+      shell: bash
+      env:
+        BASH_TIMEOUT_SECS: ${{ inputs.bash_timeout_secs }}
+        BASH_OUTPUT_BYTE_LIMIT: ${{ inputs.bash_output_byte_limit }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.grok"
+        # Only [toolset] is read from $HOME; the repo's own .grok/config.toml
+        # could not carry these.
+        cat > "$HOME/.grok/config.toml" <<EOF
+        [cli]
+        auto_update = false
+
+        [toolset.bash]
+        timeout_secs = ${BASH_TIMEOUT_SECS}
+        output_byte_limit = ${BASH_OUTPUT_BYTE_LIMIT}
+        EOF
+        cat "$HOME/.grok/config.toml"
+
+    - name: Run the agent
+      id: run
+      shell: bash
+      env:
+        XAI_API_KEY: ${{ inputs.xai_api_key }}
+        GROK_DISABLE_AUTOUPDATER: "1"
+        PROMPT: ${{ inputs.prompt }}
+        MAX_TURNS: ${{ inputs.max_turns }}
+        ALLOWED_TOOLS: ${{ inputs.allowed_tools }}
+        PERMISSION_MODE: ${{ inputs.permission_mode }}
+        MODEL: ${{ inputs.model }}
+      run: |
+        set -uo pipefail
+        # `shell: bash` runs with -e; turn it off deliberately. Every failure
+        # below is handled explicitly, and aborting on the first one would skip
+        # writing $GITHUB_OUTPUT and swallow the diagnosis.
+        set +e
+        transcript="$RUNNER_TEMP/grok-transcript.jsonl"
+        prompt_file="$RUNNER_TEMP/grok-prompt.txt"
+        printf '%s' "$PROMPT" > "$prompt_file"
+
+        args=(
+          --prompt-file "$prompt_file"
+          --output-format streaming-json
+          --permission-mode "$PERMISSION_MODE"
+          --max-turns "$MAX_TURNS"
+          --model "$MODEL"
+          --no-auto-update
+        )
+        if [ -n "$ALLOWED_TOOLS" ]; then args+=(--tools "$ALLOWED_TOOLS"); fi
+
+        # Tee so a two-hour session is visible live in the job log while the
+        # JSONL lands on disk for the transcript artifact. PIPESTATUS, not $?,
+        # because $? would report tee.
+        "$HOME/.grok/bin/grok" "${args[@]}" | tee "$transcript"
+        rc="${PIPESTATUS[0]}"
+
+        echo "execution_file=$transcript" >> "$GITHUB_OUTPUT"
+
+        case "$rc" in
+          0) ;;
+          130) echo "::error::grok was interrupted (SIGINT)" ;;
+          143) echo "::error::grok was terminated (SIGTERM)" ;;
+          *)   echo "::error::grok exited $rc" ;;
+        esac
+        exit "$rc"

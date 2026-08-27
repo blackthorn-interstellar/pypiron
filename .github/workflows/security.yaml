@@ -271,8 +271,12 @@ jobs:
         uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
         with:
           languages: ${{ matrix.language }}
-          # security-extended catches more of what commercial SAST reports
+          # security-extended catches more of what commercial SAST reports.
+          # Left here rather than in the config file: a workflow `queries:` input
+          # replaces the config file's, so one home for it or the other, never both.
           queries: security-extended
+          # Excludes tests/ — harness noise, not shipped code. See the file.
+          config-file: ./.github/codeql/codeql-config.yml
       - name: Autobuild
         uses: github/codeql-action/autobuild@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
       - name: Analyze
@@ -327,10 +331,15 @@ jobs:
             --exclude='fuzz/artifacts/**' \
             .
       # SARIF carries a `nosemgrep`-suppressed finding through as a result with
-      # `suppressions: [{kind: inSource}]` — that is the point of the format, and
-      # it is how the Security tab shows those rows as dismissed rather than
-      # losing them. So filter on the suppression, not on the results array, or
-      # every accepted risk in the tree fails the job forever.
+      # `suppressions: [{kind: inSource}]` — that is the point of the format:
+      # the accepted risk stays visible instead of vanishing. So filter on the
+      # suppression, not on the results array, or every accepted risk in the tree
+      # fails the job forever.
+      #
+      # What the suppression does NOT do is dismiss the alert upstream: GitHub
+      # ingests those rows and leaves them sitting open in the Security tab. Only
+      # this gate honors the `nosemgrep` — CI stays green, and closing the row is
+      # a manual dismissal in the tab.
       - name: Findings
         run: |
           set -euo pipefail

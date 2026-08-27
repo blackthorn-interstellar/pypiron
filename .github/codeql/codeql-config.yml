@@ -1,0 +1,16 @@
+name: pypiron CodeQL config
+
+# tests/ is the blackbox suite and the stateright model harnesses: throwaway
+# loopback servers, fault-injection proxies in front of local MinIO, u8
+# writer-identity labels, fixture-derived ETags. Every "finding" there is the
+# harness doing what a harness does, and none of it ships to a user — 10 of the
+# 13 alerts this scan opened came from that directory. Semgrep already skips
+# tests by default; this is the same call for CodeQL.
+#
+# dev/ is deliberately NOT excluded: its soak tooling runs live on EC2.
+#
+# Queries stay in the workflow (`queries: security-extended`). A workflow
+# `queries:` input replaces a config file's, so naming them in both is how you
+# silently lose one set — they are specified in exactly one place.
+paths-ignore:
+  - tests

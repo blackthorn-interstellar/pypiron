@@ -7,7 +7,7 @@ name = "pypiron"
 dynamic = ["version"]
 description = "A fast, reliable, and scalable PyPI server"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
     { name = "Blackthorn Interstellar" }
@@ -62,7 +62,7 @@ dev = [
 ]
 # User-facing docs site (mkdocs-material). Build: `make docs`; serve: `make docs-serve`.
 docs = [
-    "mkdocs-llmstxt>=0.4.0 ; python_full_version >= '3.9'",
+    "mkdocs-llmstxt>=0.4.0",
     "mkdocs-material>=9.5",
 ]
 

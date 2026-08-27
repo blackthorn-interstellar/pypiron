@@ -232,9 +232,10 @@ def test_as_private_onto_mirror_fails_when_dest_reports_no_readable_origin(
     forwarder = _ManglingForwarder(
         ("127.0.0.1", find_free_port()), disk_server["base_url"], replacement
     )
-    with _serving(source, "fake-source") as source_url, _serving(
-        forwarder, "origin-header-mangler"
-    ) as forwarder_url:
+    with (
+        _serving(source, "fake-source") as source_url,
+        _serving(forwarder, "origin-header-mangler") as forwarder_url,
+    ):
         common = ("--include-package", package, "--include-format", "wheel")
 
         # Someone mirrored the name first — straight at the destination.

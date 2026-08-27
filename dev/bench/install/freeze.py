@@ -22,11 +22,11 @@ import argparse
 import json
 import subprocess
 import tempfile
+import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import tomllib
 from benchlib import (
     ARCHES,
     LOCK,

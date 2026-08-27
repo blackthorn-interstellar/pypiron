@@ -581,8 +581,10 @@ pub(crate) struct FingerprintChange {
     pub to_seq: u64,
 }
 
-/// Every in-chain fingerprint change across `links`, oldest first (a running
-/// replay-so-far gives the "already committed" view). This is F37's signal: a
+/// Every in-chain fingerprint change across `links`, oldest first (an accumulate-only
+/// per-(package, filename) history gives the "already committed" view — unlike replay,
+/// it never forgets a file, so an intervening omission can't hide a re-commit). This is
+/// F37's signal: a
 /// forged append that re-commits `(pkg, filename)` under new bytes leaves the
 /// final replayed state and the rewritten sidecar in agreement — so
 /// [`Presence::WrongSha`] stays silent — and the *only* durable trace is the chain
@@ -590,44 +592,29 @@ pub(crate) struct FingerprintChange {
 /// Returning the changes (rather than the old buried `eprintln!`) is what lets
 /// [`run_verify_chain`] report and count them as first-class findings.
 fn in_chain_sha_changes(links: &[(u64, Vec<u8>, ChainLink)]) -> Vec<FingerprintChange> {
-    let mut so_far: Delta = BTreeMap::new();
-    // pkg → filename → the seq its current sha was committed at, for `from_seq`.
-    let mut committed_at: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    // pkg → filename → (last committed sha, the seq it was committed at). PERMANENT:
+    // replay forgets a file the moment a checkpoint omits it (or empties the package
+    // map), but change-detection must not — else an omit-then-reintroduce re-blesses
+    // tampered bytes with no finding. History only ever accumulates; nothing removes.
+    let mut history: BTreeMap<String, BTreeMap<String, (String, u64)>> = BTreeMap::new();
     let mut changes = Vec::new();
     for (seq, _, link) in links {
         for (pkg, files) in &link.packages {
-            if let Some(prev) = so_far.get(pkg) {
-                for (filename, sha) in files {
-                    if let Some(old) = prev.get(filename) {
-                        if old != sha {
-                            let from_seq = committed_at
-                                .get(pkg)
-                                .and_then(|m| m.get(filename))
-                                .copied()
-                                .unwrap_or(*seq);
-                            changes.push(FingerprintChange {
-                                package: pkg.clone(),
-                                filename: filename.clone(),
-                                old_sha: old.clone(),
-                                new_sha: sha.clone(),
-                                from_seq,
-                                to_seq: *seq,
-                            });
-                        }
+            let seen = history.entry(pkg.clone()).or_default();
+            for (filename, sha) in files {
+                if let Some((old_sha, from_seq)) = seen.get(filename) {
+                    if old_sha != sha {
+                        changes.push(FingerprintChange {
+                            package: pkg.clone(),
+                            filename: filename.clone(),
+                            old_sha: old_sha.clone(),
+                            new_sha: sha.clone(),
+                            from_seq: *from_seq,
+                            to_seq: *seq,
+                        });
                     }
                 }
-            }
-            // Replay is last-write-wins over the package's whole file map, so its
-            // seq map is rebuilt to this seq in lockstep with `so_far`.
-            if files.is_empty() {
-                so_far.remove(pkg);
-                committed_at.remove(pkg);
-            } else {
-                so_far.insert(pkg.clone(), files.clone());
-                committed_at.insert(
-                    pkg.clone(),
-                    files.keys().map(|f| (f.clone(), *seq)).collect(),
-                );
+                seen.insert(filename.clone(), (sha.clone(), *seq));
             }
         }
     }
@@ -1564,6 +1551,88 @@ mod tests {
             in_chain_sha_changes(&[(0, b0, l0), (1, b1, l1)]).is_empty(),
             "adding a file and re-stating an unchanged one is not a fingerprint change"
         );
+    }
+
+    /// An attacker with storage creds can hide a re-commit behind an intervening
+    /// omission: seq 0 commits F, seq 1 commits the package WITHOUT F (its map is
+    /// non-empty, so replay keeps the package but drops F via last-write-wins), seq
+    /// 2 reintroduces F under the sha of tampered bytes. Change-detection must not
+    /// forget the prior sha just because replay did — the omit-then-reintroduce is
+    /// still a fingerprint change and must be reported.
+    #[test]
+    fn omit_then_reintroduce_under_new_sha_is_still_a_fingerprint_change() {
+        let l0 = link(0, "", {
+            let mut d = Delta::new();
+            d.insert("six".to_string(), pkg(&[("six-1.whl", "aaaa")]));
+            d
+        });
+        let b0 = link_bytes(&l0).unwrap();
+        // seq 1 commits "six" with a DIFFERENT file — F is omitted but the map is
+        // non-empty, so replay drops F via whole-map last-write-wins.
+        let l1 = link(1, &sha256_hex(&b0), {
+            let mut d = Delta::new();
+            d.insert("six".to_string(), pkg(&[("six-2.whl", "bbbb")]));
+            d
+        });
+        let b1 = link_bytes(&l1).unwrap();
+        // seq 2 reintroduces F under tampered bytes.
+        let l2 = link(2, &sha256_hex(&b1), {
+            let mut d = Delta::new();
+            d.insert("six".to_string(), pkg(&[("six-1.whl", "cccc")]));
+            d
+        });
+        let b2 = link_bytes(&l2).unwrap();
+
+        let changes = in_chain_sha_changes(&[(0, b0, l0), (1, b1, l1), (2, b2, l2)]);
+        assert_eq!(
+            changes.len(),
+            1,
+            "the omit-then-reintroduce re-commit must be reported once"
+        );
+        let c = &changes[0];
+        assert_eq!(c.package, "six");
+        assert_eq!(c.filename, "six-1.whl");
+        assert_eq!(c.old_sha, "aaaa");
+        assert_eq!(c.new_sha, "cccc");
+    }
+
+    /// Same bypass via an empty package map: seq 1 commits "six" with no files,
+    /// which replay reads as "drop the package". Change-detection must still
+    /// remember F's prior sha so seq 2's reintroduction under new bytes is caught.
+    #[test]
+    fn empty_map_then_reintroduce_under_new_sha_is_still_a_fingerprint_change() {
+        let l0 = link(0, "", {
+            let mut d = Delta::new();
+            d.insert("six".to_string(), pkg(&[("six-1.whl", "aaaa")]));
+            d
+        });
+        let b0 = link_bytes(&l0).unwrap();
+        // seq 1 commits "six" with an EMPTY file map — replay drops the package.
+        let l1 = link(1, &sha256_hex(&b0), {
+            let mut d = Delta::new();
+            d.insert("six".to_string(), pkg(&[]));
+            d
+        });
+        let b1 = link_bytes(&l1).unwrap();
+        // seq 2 reintroduces F under tampered bytes.
+        let l2 = link(2, &sha256_hex(&b1), {
+            let mut d = Delta::new();
+            d.insert("six".to_string(), pkg(&[("six-1.whl", "cccc")]));
+            d
+        });
+        let b2 = link_bytes(&l2).unwrap();
+
+        let changes = in_chain_sha_changes(&[(0, b0, l0), (1, b1, l1), (2, b2, l2)]);
+        assert_eq!(
+            changes.len(),
+            1,
+            "the empty-map-then-reintroduce re-commit must be reported once"
+        );
+        let c = &changes[0];
+        assert_eq!(c.package, "six");
+        assert_eq!(c.filename, "six-1.whl");
+        assert_eq!(c.old_sha, "aaaa");
+        assert_eq!(c.new_sha, "cccc");
     }
 
     #[test]

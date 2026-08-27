@@ -1987,16 +1987,25 @@ async fn audit_shard(
                 orphan_companions.clone(),
             );
             async move {
+                // Every failure return below reports `live_now = false` beside
+                // `failed = true`, which the collector reads as "no verdict":
+                // neither an add nor a remove. It must NOT report the package's
+                // physical file count instead. That count is a listing, not a
+                // rebuild — it ignores the `--exclude-package` scrub the rebuild
+                // applies, and delisting deliberately keeps the bytes — so a
+                // fully-denied package counts files it may not list. Asserting
+                // it put a delisted name back into the global index, pointing at
+                // a `simple/<pkg>/` view the delisting had deleted.
                 if let Err(e) = require_generation(state, generation) {
                     error!(package=%pkg, error=?e, "audit: selection changed before package batch");
-                    return (pkg, None, has_artifacts, false, true, None);
+                    return (pkg, None, false, false, true, None);
                 }
                 if state.buckets.is_multi() {
                     match crate::origin::read_origin_observation(storage, &pkg).await {
                         Ok(_) => {}
                         Err(e) => {
                             error!(package=%pkg, error=?e, "audit: origin unreadable; deferring maintenance");
-                            return (pkg, None, has_artifacts, false, true, None);
+                            return (pkg, None, false, false, true, None);
                         }
                     }
                 }
@@ -2106,10 +2115,12 @@ async fn audit_shard(
                         (pkg, new_fp, live_now, true, maintenance_failed, delta)
                     }
                     Err(e) => {
-                        // Conservative on failure: keep the package listed and
-                        // its views rather than pruning on a bad observation.
+                        // Conservative on failure: leave this package's global
+                        // membership exactly as it stands rather than prune it
+                        // on a bad observation — and, per the note above,
+                        // without asserting a liveness this pass never proved.
                         error!(package=%pkg, error=?e, "audit: package rebuild failed");
-                        (pkg, None, has_artifacts, false, true, None)
+                        (pkg, None, false, false, true, None)
                     }
                 }
             }
@@ -2122,9 +2133,18 @@ async fn audit_shard(
             if let Some(shas) = delta {
                 out.deltas.push((pkg.clone(), shas));
             }
-            if live_now || failed {
+            // `live` is an assertion the global index applies; `dead` is a
+            // removal it re-proves. A pass that failed has earned neither. It
+            // used to earn an *add* (`live_now || failed`), which is how a
+            // package the operator had delisted walked back into the global
+            // index the moment its rebuild hit an I/O error — the failure
+            // fallback answered from the physical file count, and the `||`
+            // asserted it regardless. Say nothing instead: the name keeps
+            // whatever membership it already has, and the next sweep (or the
+            // dirty marker the failure leaves standing) settles it.
+            if live_now {
                 out.live.push(pkg);
-            } else {
+            } else if !failed {
                 out.dead.push((pkg, fp));
             }
             out.rebuilt += was_rebuilt as usize;
@@ -2668,7 +2688,11 @@ async fn invalidate_fingerprints(storage: &dyn Storage, packages: &[&str]) -> Re
 /// Never a whole-corpus rebuild, and relisting rebuilds from the artifacts already
 /// on disk (no re-download). A no-op — one small GET — when the config is
 /// unchanged. Runs per bucket; each keeps its own bucket-local stamp and worklist.
-pub(crate) async fn reconcile_excludes(state: &AppState, storage: &dyn Storage) -> Result<()> {
+///
+/// `pub` only so the deterministic simulator can drive the boot sequence the way
+/// [`run_worker`] does — VOPR calls `tick`/`audit` directly and never enters the
+/// worker loop, so this was code no simulated schedule could reach.
+pub async fn reconcile_excludes(state: &AppState, storage: &dyn Storage) -> Result<()> {
     let Some(denylist) = state.denylist.as_ref() else {
         return Ok(());
     };
@@ -2964,9 +2988,17 @@ async fn update_global_index_inner(
     removes: &[String],
     dead: &[(String, String)],
 ) -> Result<()> {
-    if adds.is_empty() && removes.is_empty() && dead.is_empty() {
-        return Ok(());
-    }
+    // An empty delta is NOT nothing to do. The global pair is written HTML first
+    // and canonical JSON last, so a crash between the two strands the derived
+    // view ahead of the authority — and every healer for that tear rides a
+    // delta: the tick's marker batch, the audit's live set. A store with nothing
+    // to say produces neither. An emptied corpus is the reachable case: the
+    // audit walks it, finds no live name and no dead observation, and used to
+    // return here, so a `simple/index.html` left listing a package no
+    // `simple/index.json` backs stood forever — `verify-index` red across every
+    // sweep, with no churn left in the store to dislodge it. Fall through
+    // instead: the no-op branch below proves the pair (metadata-only where the
+    // stamp can speak for it, one body compare otherwise) and reconciles it.
     let mut guard = state.global_names.lock().await;
     // Invariant: the cached name set must never outlive a write we could not
     // prove landed. `update_global_index_locked` absorbs the delta into the

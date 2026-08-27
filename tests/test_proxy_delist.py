@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import time
 
@@ -114,12 +115,27 @@ def _index_filenames(data_dir, package):
 
 
 def _global_names_file(data_dir):
-    """Names in the materialized global `simple/index.json` (read off disk, no
-    server needed — how an offline maintenance command's output is inspected)."""
-    path = data_dir / "simple" / "index.json"
-    if not path.exists():
-        return set()
-    return {p["name"] for p in json.loads(path.read_text())["projects"]}
+    """Every name either materialized global index still lists — the PEP 691
+    `simple/index.json` and the PEP 503 `simple/index.html`, unioned (read off
+    disk, no server needed: how an offline maintenance command's output is
+    inspected).
+
+    Both halves, deliberately. They are two separate writes, HTML first, so a
+    name can stand in one after it has left the other. Reading only the JSON
+    makes every "delisted" assertion below go green on a store whose HTML still
+    advertises the package — vacuously satisfied by exactly the failure it is
+    supposed to catch. A resolver that reads either half can still find the
+    name, so absence has to hold for both.
+    """
+    simple = data_dir / "simple"
+    names = set()
+    if (simple / "index.json").exists():
+        names |= {p["name"] for p in json.loads((simple / "index.json").read_text())["projects"]}
+    if (simple / "index.html").exists():
+        names |= set(
+            re.findall(r'<a href="/simple/([^"]+)/">', (simple / "index.html").read_text())
+        )
+    return names
 
 
 def _write_maintenance_config(path, data_dir, excludes):
@@ -253,7 +269,11 @@ def test_excluding_a_cached_package_delists_it(tmp_path_factory, pypiron_bin, tm
                 f"{proxy['simple']}delistme/index.json", headers={"Accept": ACCEPT_PEP691}
             )
             assert code == 404, "a delisted package must 404 like a name pypiron does not hold"
-            assert "delistme" not in _global_names(proxy["simple"]), (
+            # Polled, like its siblings: the tick deletes the per-package index
+            # first and rewrites the global name list once at the end of the
+            # pass, so an un-polled assert here races that second write and
+            # fails intermittently on a loaded runner.
+            assert _poll(lambda: "delistme" not in _global_names(proxy["simple"])), (
                 "a delisted package must drop out of the global /simple/ name list"
             )
             assert http_get(f"{proxy['base_url']}/project/delistme/")[0] == 404, (
@@ -369,5 +389,66 @@ def test_maintenance_honors_an_env_set_exclude(tmp_path_factory, pypiron_bin, tm
             "rebuild-index re-listed a package the env-set exclude delisted"
         )
         assert "delistme" not in _global_names_file(data_dir)
+    finally:
+        upstream_gen.close()
+
+
+def test_an_audit_error_does_not_relist_a_delisted_package(tmp_path_factory, pypiron_bin, tmp_path):
+    """A per-package audit failure must not walk a delisted package back into
+    the global index.
+
+    The audit is deliberately failure-conservative: it would rather leave a name
+    listed than prune it on an observation an I/O error made untrustworthy. But
+    it used to express that by *asserting* the package live, answering from the
+    raw `packages/` file count — which knows nothing of `--exclude-package`,
+    while delisting keeps the bytes on purpose. One unreadable sidecar was
+    enough to re-list an excluded name, pointing at a `simple/<pkg>/` view the
+    delisting had already deleted. The denylist outranks the conservatism.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("the fault is an unreadable file; root reads it anyway")
+    upstream_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    upstream = next(upstream_gen)
+    data_dir = tmp_path_factory.mktemp("pypiron-auditfail-proxy")
+    wheel = make_wheel("delistme", "1.0", tmp_path)
+    try:
+        _upload(upstream, wheel, "delistme")
+
+        with _proxy(pypiron_bin, data_dir, upstream["base_url"]) as proxy:
+            assert http_get(f"{proxy['base_url']}/files/delistme/{wheel.name}")[0] == 200
+            assert _poll(lambda: _index_filenames(data_dir, "delistme") == {wheel.name})
+        with _proxy(pypiron_bin, data_dir, upstream["base_url"], "--exclude-package", "delistme"):
+            assert _poll(lambda: _index_filenames(data_dir, "delistme") is None)
+            assert _poll(lambda: "delistme" not in _global_names_file(data_dir))
+
+        # Fault: one sidecar the rebuild cannot read (a permission error is the
+        # honest local stand-in for the 500 a bucket returns), plus no
+        # fingerprint baseline — the state a node that has never audited this
+        # store is in — so the audit must rebuild the package rather than skip
+        # it as provably unchanged.
+        sidecars = list((data_dir / "packages" / "delistme").glob("*.meta.json"))
+        assert sidecars, "the cached package should have a sidecar to break"
+        for path in sidecars:
+            path.chmod(0)
+        for shard in (data_dir / "_state").glob("fp-*.json"):
+            shard.unlink()
+
+        try:
+            with _proxy(
+                pypiron_bin, data_dir, upstream["base_url"], "--exclude-package", "delistme"
+            ):
+                log = data_dir.parent / f"{data_dir.name}-proxy.log"
+                assert _poll(lambda: "audit: package rebuild failed" in log.read_text()), (
+                    "the audit never hit the injected rebuild failure"
+                )
+                # The failure is in; give the sweep its global-index pass.
+                assert _poll(lambda: "audit finished with" in log.read_text())
+                assert "delistme" not in _global_names_file(data_dir), (
+                    "an audit error re-listed a package the denylist had delisted"
+                )
+                assert _index_filenames(data_dir, "delistme") is None
+        finally:
+            for path in sidecars:
+                path.chmod(0o600)
     finally:
         upstream_gen.close()

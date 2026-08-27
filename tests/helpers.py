@@ -26,7 +26,7 @@ CLIENT_PINS = {
     "poetry": "2.4.1",
     "pdm": "2.27.0",
     "twine": "dev-dependency",
-    "flit": "3.12.0",
+    "flit": "4.0.2",
     "hatch": "1.17.0",
     "pipenv": "2026.5.2",
 }

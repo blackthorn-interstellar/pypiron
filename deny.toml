@@ -2,11 +2,13 @@
 # Run locally: `cargo deny check licenses bans sources`.
 # Docs: https://embarkstudios.github.io/cargo-deny/
 #
-# Advisories are deliberately NOT checked here. `make audit` (cargo-audit) owns
-# them and carries the acknowledged-advisory ignore list with its justification;
-# it runs on every PR via ci.yml. Two ignore lists for the same advisory DB drift
-# apart, and the one nobody edits is the one that goes stale. So
-# .github/workflows/security.yaml invokes `check licenses bans sources` only.
+# Advisories are deliberately NOT checked here. `make audit` (a bare
+# `cargo audit`, no ignore list — every advisory fails it) is the advisory gate
+# and runs on every PR via ci.yml. This file is licenses/bans/sources policy
+# only, and .github/workflows/security.yaml invokes `check licenses bans sources`
+# to match. One tool per question: adding an `[advisories]` section here would
+# create a second place to argue with about the same CVE, and the copy nobody
+# edits is the one that goes stale.
 
 [graph]
 all-features = true
@@ -36,6 +38,12 @@ allow = [
 ignore = true
 
 [bans]
+# Advisory only, and honestly so: every level here is "warn" and there is no
+# `deny` list at all, so this section cannot fail the build today. It exists to
+# print the duplicate-version report and to be where a real ban lands when
+# there is one. `[licenses]` above and `[sources]` below are the two halves of
+# this file that actually gate.
+#
 # Duplicate versions are a fact of any real dependency tree; surface them
 # without failing the build.
 multiple-versions = "warn"

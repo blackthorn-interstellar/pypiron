@@ -62,9 +62,10 @@ jobs:
       - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
         with:
           tool: cargo-audit
-      # `make audit` carries the acknowledged-advisory ignore list and its
-      # justification (a couple of transitive quick-xml DoS advisories reachable
-      # only through trusted cloud-storage XML). Anything else fails the job.
+      # `make audit` is a bare `cargo audit`: no ignore list, nothing
+      # acknowledged. Any advisory against Cargo.lock fails the job, and the fix
+      # is to move the dependency. This is the repo's only advisory gate —
+      # deny.toml deliberately covers licenses/bans/sources and nothing else.
       - name: Audit dependencies for advisories
         run: make audit
 
@@ -583,7 +584,10 @@ jobs:
       contents: read
     steps:
       # fetch-depth: 0 makes checkout fetch every branch into refs/remotes/origin/*,
-      # so origin/master below is this run's truth, not a stale cache.
+      # so origin/master below is this run's truth, not a stale cache. That is the
+      # only fetch this job needs or does: persist-credentials is false, so a
+      # second `git fetch` here would run unauthenticated and start failing the
+      # day the repo is made private.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         if: startsWith(github.ref, 'refs/tags/')
         with:
@@ -594,7 +598,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master
           if git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
             echo "authorized: $GITHUB_SHA is reachable from master"
           else
@@ -731,14 +734,22 @@ jobs:
       # smoke inside Alpine. One row — x86_64, the runner's native docker arch —
       # covers the class; the other musl arches would need QEMU and stay
       # build-only. dist is mounted read-only so the container cannot touch it.
+      #
+      # The image is digest-pinned. It is the only third-party thing this release
+      # path pulls by a moving tag, and it runs with dist/ mounted on a job that
+      # goes on to publish those exact wheels. Bump the digest and the version
+      # comment together.
       - name: Smoke test the musllinux wheel in an Alpine container
         if: matrix.container_smoke
         shell: bash
+        env:
+          # python 3.12.14-alpine3.24
+          ALPINE_PY: python:3.12-alpine@sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31
         run: |
           set -euo pipefail
           expect=""
           if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then expect="${GITHUB_REF_NAME#v}"; fi
-          docker run --rm -e "PYPIRON_EXPECT_VERSION=$expect" -v "$PWD/dist:/dist:ro" python:3.12-alpine sh -c '
+          docker run --rm -e "PYPIRON_EXPECT_VERSION=$expect" -v "$PWD/dist:/dist:ro" "$ALPINE_PY" sh -c '
             set -e
             python3 -m venv /tmp/smoke
             /tmp/smoke/bin/pip install --disable-pip-version-check --no-input /dist/*.whl
@@ -785,11 +796,36 @@ jobs:
         run: |
           command -v python3 >/dev/null 2>&1 && PY=python3 || PY=python
           "$PY" dev/scripts/archive_binary.py --dist dist --triple "${{ matrix.triple }}" --out binaries
+      # Same guard the wheels get, for the same reason. `release-binaries` writes
+      # a SHA256SUMS manifest of whatever it downloads, which records bytes
+      # rather than verifying them — a manifest of a tampered archive is a
+      # perfectly consistent manifest. These are the digests taken here, at build
+      # time, and they are what `release-binaries` diffs against before it
+      # manifests, attests, or publishes anything.
+      - name: Record binary digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin-digests"
+          # shasum fallback: macOS arm64 runners ship no sha256sum. Same format.
+          if command -v sha256sum >/dev/null; then sha256sum binaries/*; else shasum -a 256 binaries/*; fi \
+            > "$RUNNER_TEMP/bin-digests/${{ matrix.kind }}-${{ matrix.target }}.sha256"
       - name: Upload standalone binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binaries-${{ matrix.kind }}-${{ matrix.target }}
           path: binaries
+          if-no-files-found: error
+      # `binary-digests-`, not `binaries-digests-`: `release-binaries` collects
+      # the archives with `pattern: binaries-*`, and a `binaries-digests-…`
+      # artifact would match it and be merged into the directory it is supposed
+      # to be checking — and then published to the Release. Same reason the
+      # wheels' digests are `dist-digests-`, not `wheels-digests-`.
+      - name: Upload binary digests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binary-digests-${{ matrix.kind }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/bin-digests/*
           if-no-files-found: error
 
   sdist:
@@ -873,6 +909,26 @@ jobs:
           pattern: dist-digests-*
           merge-multiple: true
           path: dist-digests
+      # Verify → attest → verify, and the repetition is the point. An attestation
+      # is a signed statement that GitHub built these exact bytes, so attesting
+      # first and checking afterwards would mint a real, publicly verifiable
+      # provenance record for tampered artifacts and only THEN fail the job — the
+      # signature outlives the red build. Check before signing. Then check again
+      # after, because the attestation step itself has network access.
+      #
+      # Re-hash what we are about to sign and require it to be exactly what the
+      # build jobs recorded. This closes the window the build-side verify can't
+      # see: artifact transit and the merged download. Diffing full listings
+      # rather than `sha256sum -c` so an artifact ADDED to dist/ (which the
+      # publish would happily upload) fails too.
+      - name: Verify dist unchanged since build (before attesting)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat dist-digests/*.sha256 | sort > "$RUNNER_TEMP/expected.sha256"
+          sha256sum dist/* | sort > "$RUNNER_TEMP/actual.sha256"
+          diff "$RUNNER_TEMP/expected.sha256" "$RUNNER_TEMP/actual.sha256"
+          echo "verified $(wc -l < "$RUNNER_TEMP/actual.sha256") artifacts against their build-time digests"
       # Build-provenance attestation is a public-repo-only feature; skip it while
       # the repo is private (it reactivates automatically once the repo is public).
       - name: Generate artifact attestation
@@ -880,13 +936,9 @@ jobs:
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: 'dist/*'
-      # Last gate before trusted publishing: re-hash what we are about to upload
-      # and require it to be exactly what the build jobs recorded. This closes the
-      # window the build-side verify can't see — artifact transit, the merged
-      # download, and the attestation step's own network access. Diffing full
-      # listings rather than `sha256sum -c` so an artifact ADDED to dist/ (which
-      # the publish would happily upload) fails too.
-      - name: Verify dist unchanged since build
+      # Last gate before trusted publishing: the same check again, now covering
+      # the attestation step's own network access.
+      - name: Verify dist unchanged since build (before publishing)
         shell: bash
         run: |
           set -euo pipefail
@@ -950,11 +1002,24 @@ jobs:
         run: |
           mkdir -p binaries
           tar -C "target/$TRIPLE/release" -czf "binaries/pypiron-$TRIPLE.tar.gz" pypiron
+      # Build-time digest, same as every wheels-matrix row — see the note there.
+      - name: Record binary digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin-digests"
+          sha256sum binaries/* > "$RUNNER_TEMP/bin-digests/armv6.sha256"
       - name: Upload standalone binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binaries-armv6
           path: binaries
+          if-no-files-found: error
+      - name: Upload binary digests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binary-digests-armv6
+          path: ${{ runner.temp }}/bin-digests/*
           if-no-files-found: error
 
   # Standalone binaries → GitHub Release. The per-target binaries were already
@@ -983,6 +1048,30 @@ jobs:
           pattern: binaries-*
           merge-multiple: true
           path: binaries
+      # The sha256 each build job recorded of its own binaries/ the moment the
+      # archive was written. One file per row, so merge-multiple can't collide
+      # them.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: binary-digests-*
+          merge-multiple: true
+          path: binary-digests
+      # Verify BEFORE the manifest, the attestation and the upload. SHA256SUMS
+      # below hashes whatever arrived — it describes these bytes, it does not
+      # vouch for them — so without this step nothing between the build job and
+      # the Release is checked at all: artifact transit, the merged download, and
+      # an added file would all sail through and get a signed provenance
+      # attestation on the way out. Diffing full sorted listings rather than
+      # `sha256sum -c`, so an archive ADDED to binaries/ (which `gh release
+      # upload binaries/*` would happily publish) fails too.
+      - name: Verify binaries unchanged since build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat binary-digests/*.sha256 | sort > "$RUNNER_TEMP/expected-bin.sha256"
+          sha256sum binaries/* | sort > "$RUNNER_TEMP/actual-bin.sha256"
+          diff "$RUNNER_TEMP/expected-bin.sha256" "$RUNNER_TEMP/actual-bin.sha256"
+          echo "verified $(wc -l < "$RUNNER_TEMP/actual-bin.sha256") binaries against their build-time digests"
       - name: Generate checksums
         working-directory: binaries
         run: sha256sum pypiron-* > SHA256SUMS

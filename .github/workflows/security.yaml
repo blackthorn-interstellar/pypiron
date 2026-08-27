@@ -7,21 +7,22 @@
 #   Secrets gitleaks, TruffleHog (verified only), Trivy secret mode
 #   Supply  zizmor (Actions), actionlint
 #
-# Three deliberate absences. cargo-audit is already a per-PR merge gate in
-# ci.yml (`make audit`), and that target owns the acknowledged-advisory ignore
-# list — so deny.toml configures licenses/bans/sources only and this workflow
-# runs `cargo deny check licenses bans sources`. Two ignore lists over the same
-# advisory DB drift apart, and the one nobody edits is the one that goes stale.
-# OpenSSF Scorecard needs a public repo; Snyk needs an account token.
+# Two deliberate absences. cargo-deny does not check advisories: cargo-audit is
+# already a per-PR merge gate in ci.yml (`make audit`, which is a bare
+# `cargo audit` — no ignore list, nothing acknowledged, everything fails), so
+# deny.toml is licenses/bans/sources policy only and this workflow runs
+# `cargo deny check licenses bans sources`. One tool per question; two tools
+# reading the same advisory DB is two places to argue with about the same CVE.
+# Snyk is the other absence — it needs an account token.
 #
-# The repo is PRIVATE today, and GitHub Code Scanning — every SARIF upload, plus
-# CodeQL itself — is an Advanced Security feature private repos don't get for
-# free. So every SARIF path is gated on `!github.event.repository.private`, the
-# same pattern ci.yml and docker.yml use for build-provenance attestation, and
-# Trivy and Semgrep gate on plain-text output while private. Nothing here stops
-# gating in the meantime; the reports just live in the job log instead of the
-# Security tab, and the SARIF halves switch themselves on the day the repo goes
-# public.
+# The repo is public, so Code Scanning is on and every scanner uploads SARIF to
+# the Security tab. The `!github.event.repository.private` gates stay anyway:
+# Code Scanning — every SARIF upload, plus CodeQL itself — is an Advanced
+# Security feature a private repo does not get for free, so each scanner carries
+# a plain-text/table twin that takes over automatically if this repo is ever
+# made private again. Same pattern ci.yml and docker.yml use for build-provenance
+# attestation. Either half gates identically; only where the findings land
+# differs.
 #
 # gitleaks note: the MIT-licensed binary is free for everyone, but the official
 # gitleaks-action hard-fails on organization-owned repos without a paid
@@ -100,20 +101,22 @@ jobs:
           persist-credentials: false
       - uses: trufflesecurity/trufflehog@27b0417c16317ca9a472a9a8092acce143b49c55 # v3.95.9
         with:
-          # Verified findings only — unverified is mostly noise for this purpose.
-          #
-          # The detection engine floats by choice, not by accident: the action
-          # takes a `version:` input defaulting to latest and we deliberately
-          # don't pass it, same rationale as semgrep's --config auto below. This
-          # suite previews what a corporate scanner running today's detectors
-          # would find, so a new-detector red is triage signal. Pass `version:`
-          # if determinism ever needs to win over freshness.
+          # The action defaults `version:` to `latest`, which means the engine
+          # this job runs changes under it with no commit here. Pin it: a scanner
+          # that rewrites itself between runs cannot be bisected when it reds,
+          # and `latest` is a moving download on a job that walks the full git
+          # history. Bump deliberately. No `v` — the action interpolates this
+          # straight into `ghcr.io/trufflesecurity/trufflehog:<version>`, and
+          # those image tags are bare semver even though the git tags are not.
+          version: 3.97.1
+          # `--results=verified` is the current spelling; `--only-verified` is
+          # deprecated and will be dropped.
           #
           # lob is excluded because its detector regex matches long snake_case
           # identifiers — this repo's pytest names are full of them — and Lob's
           # API "verifies" the garbage. pypiron will never hold a Lob (postal
           # mail API) key.
-          extra_args: --only-verified --exclude-detectors=lob
+          extra_args: --results=verified --exclude-detectors=lob
 
   # ─── SCA: known CVEs and license/source hygiene in dependencies ────────
   cargo-deny:
@@ -128,7 +131,8 @@ jobs:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
-          # advisories omitted on purpose — ci.yml's `make audit` owns them.
+          # advisories omitted on purpose — ci.yml's `make audit` (cargo-audit)
+          # is the advisory gate, and it ignores nothing.
           command: check
           arguments: --all-features
           command-arguments: licenses bans sources
@@ -220,8 +224,14 @@ jobs:
           skip-dirs: target,.git,.local,fuzz/corpus,fuzz/seeds,fuzz/artifacts
       # always(): the scan above fails the job on findings, and those are
       # exactly the runs whose SARIF Code Scanning needs.
+      #
+      # The head-repo test skips the upload on pull requests from forks. A fork
+      # PR's token is read-only no matter what `permissions:` asks for, so
+      # `security-events: write` is not granted and the upload 403s — turning a
+      # clean scan into a red job for a contributor who did nothing wrong. The
+      # scan itself still runs and still gates via `exit-code: 1`.
       - name: Upload Trivy SARIF
-        if: ${{ always() && !github.event.repository.private && hashFiles('trivy.sarif') != '' }}
+        if: ${{ always() && !github.event.repository.private && hashFiles('trivy.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
         with:
           sarif_file: trivy.sarif
@@ -232,7 +242,12 @@ jobs:
     name: sast (codeql ${{ matrix.language }})
     # CodeQL is free on public repos and an Advanced Security feature on private
     # ones. The whole job — not just its upload — waits for the repo to go public.
-    if: ${{ !github.event.repository.private }}
+    #
+    # CodeQL has no non-SARIF variant: `analyze` IS the upload, so the fork-PR
+    # guard goes on the job rather than on a step. A fork PR's token is read-only
+    # and cannot write security events, so without this the job would build the
+    # database for up to 45 minutes and then 403 at the last step.
+    if: ${{ !github.event.repository.private && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -306,8 +321,9 @@ jobs:
             --exclude='fuzz/seeds/**' \
             --exclude='fuzz/artifacts/**' \
             .
+      # Fork PRs skip the upload — read-only token, see the Trivy note above.
       - name: Upload Semgrep SARIF
-        if: ${{ always() && !github.event.repository.private && hashFiles('semgrep.sarif') != '' }}
+        if: ${{ always() && !github.event.repository.private && hashFiles('semgrep.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
         with:
           sarif_file: semgrep.sarif
@@ -330,14 +346,34 @@ jobs:
       # A real gate: zizmor exits non-zero on findings, so no second pass is
       # needed. Deliberate exceptions live in .github/zizmor.yml. Scan all of
       # .github/ rather than just workflows/ so dependabot.yml is covered too.
-      # No SARIF here — plain output in the job log gates the same either way,
-      # and it costs nothing while the repo is private.
+      # No SARIF here — the findings are in the job log and the step summary,
+      # which gates identically and costs nothing to read.
       - name: Audit workflows
         shell: bash
+        # GH_TOKEN is what makes this a real audit. Without it zizmor runs
+        # offline and silently skips every check that needs the GitHub API —
+        # impostor-commit, known-vulnerable-actions, ref-version-mismatch — which
+        # are the pin-integrity checks this job exists for. Read-only repo scope
+        # is all it uses.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Fenced: the summary is a Markdown document, and zizmor's plain output
+          # is column-aligned text that renders as one run-on paragraph without a
+          # code fence.
+          {
+            echo '### zizmor'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # `|| status=$?` rather than a bare pipeline: findings exit non-zero,
+          # and under `set -e` that would abort before the closing fence is
+          # written, leaving the summary an unterminated code block.
+          status=0
           uvx zizmor==1.29.0 --format plain .github/ \
-            | tee "$GITHUB_STEP_SUMMARY"
+            | tee -a "$GITHUB_STEP_SUMMARY" || status=$?
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
   actionlint:
     name: actions (actionlint)
@@ -349,6 +385,27 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
-        with:
-          args: -color
+      # Same shape as the gitleaks job above, and for a sharper reason: the
+      # rhysd/actionlint action has no action.yml at any tagged ref, so `uses:`
+      # falls through to its Dockerfile — which builds actionlint from source in
+      # a `golang:latest` container on every single run. That is ~3 minutes and a
+      # floating base image to run a 2 MB static binary. Pin the release tarball
+      # and check its digest instead.
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar xzf actionlint.tar.gz actionlint
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Lint workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          actionlint -color

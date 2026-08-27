@@ -10,6 +10,12 @@ name: Selfcheck
 # configured, or fails because it IS configured and broken. Run it after rotating
 # a credential, repointing a bucket, or refreshing the corpus release asset.
 #
+# Dispatch it from master. The AWS OIDC probe assumes a role whose trust policy
+# matches this repo's OIDC subject, and a subject scoped to `ref:refs/heads/master`
+# — the normal way to write one — refuses every other ref. Run this from a branch
+# and the assume-role step fails on the ref, not on the credential, which is a
+# false alarm about the one thing this workflow exists to rule out.
+#
 # What it covers:
 #   soak-bundle.yml  vars.SOAK_AWS_ROLE / SOAK_S3_BUCKET (AWS OIDC upload)
 #   weekly.yml       real-S3 leg secrets/vars; the pinned corpus release asset
@@ -39,6 +45,9 @@ jobs:
       HAS_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
       HAS_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
       HAS_S3_REGION: ${{ vars.PYPIRON_TEST_S3_REGION != '' }}
+      # All four halves of weekly.yml's real-S3 leg, so the static-key probe can
+      # actually run.
+      S3_STATIC_PROBE: ${{ secrets.PYPIRON_TEST_S3_REAL_BUCKET != '' && secrets.AWS_ACCESS_KEY_ID != '' && secrets.AWS_SECRET_ACCESS_KEY != '' && vars.PYPIRON_TEST_S3_REGION != '' }}
       HAS_GCS_REAL_BUCKET: ${{ secrets.PYPIRON_TEST_GCS_REAL_BUCKET != '' }}
       HAS_GCS_SERVICE_ACCOUNT: ${{ secrets.PYPIRON_TEST_GCS_SERVICE_ACCOUNT != '' }}
       # Both halves present, so the GCS probe can actually run.
@@ -93,11 +102,14 @@ jobs:
       - name: AWS OIDC — caller identity
         if: env.HAS_SOAK_AWS_ROLE == 'true'
         run: |
-          if ! arn=$(aws sts get-caller-identity --query Arn --output text); then
-            echo "::error::Assumed-role credentials do not work — soak-bundle.yml cannot upload. Check the role's trust policy allows this repo's OIDC subject."
+          # The ARN itself is not printed: it carries the AWS account id and this
+          # repo is public, so the step summary is world-readable. Whether the
+          # call succeeds is the whole signal.
+          if ! aws sts get-caller-identity > /dev/null; then
+            echo "::error::Assumed-role credentials do not work — soak-bundle.yml cannot upload. Check the role's trust policy allows this repo's OIDC subject, and that this run was dispatched from master."
             exit 1
           fi
-          echo "assumed: $arn" >> "$GITHUB_STEP_SUMMARY"
+          echo "soak role assumed: ok" >> "$GITHUB_STEP_SUMMARY"
 
       # soak-bundle only needs s3:PutObject on one key, so a least-privilege role
       # may legitimately be unable to list. A denial here is a warning, not a
@@ -116,6 +128,41 @@ jobs:
       - name: AWS — not configured
         if: env.HAS_SOAK_AWS_ROLE != 'true'
         run: echo "vars.SOAK_AWS_ROLE is unset — AWS OIDC not configured, nothing to prove." >> "$GITHUB_STEP_SUMMARY"
+
+      # The static keys weekly.yml's real-S3 leg runs on. The inventory above
+      # only proves they are SET, which a rotated, disabled or expired key still
+      # is — so the gate would report green having tested nothing, which is the
+      # exact failure this workflow exists to catch. Use them.
+      #
+      # AWS_SESSION_TOKEN is explicitly blanked. The OIDC step above calls
+      # configure-aws-credentials, which exports its assumed-role session token
+      # job-wide through GITHUB_ENV; leave it set and the SDK pairs that token
+      # with these static keys and gets an InvalidClientTokenId that says nothing
+      # about the keys. botocore treats an empty token as absent, so this is the
+      # supported way to say "static keys, no session".
+      - name: AWS static keys — real-S3 credentials work
+        if: env.S3_STATIC_PROBE == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ''
+          AWS_REGION: ${{ vars.PYPIRON_TEST_S3_REGION }}
+          AWS_DEFAULT_REGION: ${{ vars.PYPIRON_TEST_S3_REGION }}
+          BUCKET: ${{ secrets.PYPIRON_TEST_S3_REAL_BUCKET }}
+        run: |
+          if ! aws sts get-caller-identity > /dev/null; then
+            echo "::error::secrets.AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY do not authenticate — weekly.yml's real-S3 leg will fail. The key has been rotated, disabled or deleted."
+            exit 1
+          fi
+          if ! aws s3 ls "s3://$BUCKET/" > /dev/null; then
+            echo "::error::The real-S3 keys authenticate but cannot list their own test bucket — weekly.yml's real-S3 leg will fail. Check the bucket name in PYPIRON_TEST_S3_REAL_BUCKET, the region in vars.PYPIRON_TEST_S3_REGION, and that the IAM user still holds s3:ListBucket on it."
+            exit 1
+          fi
+          echo "real-S3 static keys authenticate and list their bucket: ok" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: AWS static keys — not configured
+        if: env.S3_STATIC_PROBE != 'true'
+        run: echo "real-S3 secrets/vars not all set — static AWS keys not configured, nothing to prove." >> "$GITHUB_STEP_SUMMARY"
 
       # setup-gcloud runs before auth so the credential file that auth writes is
       # never in scope for a third-party action. auth keeps it out of the job

@@ -46,7 +46,10 @@ jobs:
       contents: read
     steps:
       # fetch-depth: 0 makes checkout fetch every branch into refs/remotes/origin/*,
-      # so origin/master below is this run's truth, not a stale cache.
+      # so origin/master below is this run's truth, not a stale cache. That is the
+      # only fetch this job needs or does: persist-credentials is false, so a
+      # second `git fetch` here would run unauthenticated and start failing the
+      # day the repo is made private.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         if: startsWith(github.ref, 'refs/tags/')
         with:
@@ -57,7 +60,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master
           if git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
             echo "authorized: $GITHUB_SHA is reachable from master"
           else

@@ -81,7 +81,12 @@ jobs:
       - id: m
         shell: bash
         run: |
-          cc='gcr.io/distroless/cc-debian13:nonroot'
+          # Digest-pinned to the OCI index, not to one platform's manifest —
+          # the same string is the base for six arches and buildx picks the
+          # right entry out of the index. `:nonroot` is rebuilt continuously, so
+          # unpinned it is a different base on every release; bump this line
+          # deliberately to take base-image CVE fixes.
+          cc='gcr.io/distroless/cc-debian13:nonroot@sha256:a77defd6fedbb3392b175ba8ea3d1c22be963c1597c248c3ba987ddd80bfb512'
           full='[{"id":"amd64","platform":"linux/amd64","triple":"x86_64-unknown-linux-gnu","base":"'$cc'"},{"id":"arm64","platform":"linux/arm64","triple":"aarch64-unknown-linux-gnu","base":"'$cc'"},{"id":"armv7","platform":"linux/arm/v7","triple":"armv7-unknown-linux-gnueabihf","base":"'$cc'"},{"id":"ppc64le","platform":"linux/ppc64le","triple":"powerpc64le-unknown-linux-gnu","base":"'$cc'"},{"id":"s390x","platform":"linux/s390x","triple":"s390x-unknown-linux-gnu","base":"'$cc'"},{"id":"riscv64","platform":"linux/riscv64","triple":"riscv64gc-unknown-linux-gnu","base":"'$cc'"},{"id":"386","platform":"linux/386","triple":"i686-unknown-linux-musl","base":"scratch"},{"id":"armv6","platform":"linux/arm/v6","triple":"arm-unknown-linux-musleabihf","base":"scratch"}]'
           subset='[{"id":"amd64","platform":"linux/amd64","triple":"x86_64-unknown-linux-gnu","base":"'$cc'"},{"id":"arm64","platform":"linux/arm64","triple":"aarch64-unknown-linux-gnu","base":"'$cc'"}]'
           if [[ "$GITHUB_REF" == refs/tags/* || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then

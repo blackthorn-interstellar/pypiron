@@ -61,7 +61,7 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
         with:
-          tool: cargo-audit
+          tool: cargo-audit@0.22.2
       # `make audit` is a bare `cargo audit`: no ignore list, nothing
       # acknowledged. Any advisory against Cargo.lock fails the job, and the fix
       # is to move the dependency. This is the repo's only advisory gate —
@@ -453,6 +453,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: 0.12.6
       - name: Sync dev dependencies
         run: uv sync
       # Pre-build so the xdist workers' ensure_built calls are cheap no-ops
@@ -526,6 +528,8 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         if: steps.gate.outputs.enabled == 'true'
+        with:
+          version: 0.12.6
       - name: Sync dev dependencies
         if: steps.gate.outputs.enabled == 'true'
         run: uv sync
@@ -543,6 +547,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: 0.12.6
       - name: Sync dev dependencies
         run: uv sync
       # dev/ops is deployed infrastructure: linted, never formatted. Keep the
@@ -564,7 +570,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
         with:
-          tool: cargo-fuzz
+          tool: cargo-fuzz@0.13.2
       # Keep the fuzz targets compiling. Coverage-guided runs stay manual
       # (`make fuzz`); this only guards against bitrot in the harness.
       - name: Compile all fuzz targets
@@ -679,6 +685,11 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
+          # Unset, the action resolves `maturin>=1.0,<2.0` from pyproject.toml
+          # against a manifest it reads off its own `main` branch — so the build
+          # backend that produces the published wheels floats on two moving
+          # inputs. Pin the release the resolution lands on today.
+          maturin-version: v1.15.0
           target: ${{ matrix.target }}
           args: --release --locked ${{ matrix.zig }} --out dist
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -860,6 +871,7 @@ jobs:
       - name: Build sdist
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
+          maturin-version: v1.15.0 # same pin as the wheels job
           command: sdist
           args: --out dist
       # Same dist-integrity guard as the wheels job: fingerprint the freshly

@@ -31,6 +31,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: 0.12.6
       - name: Sync dev dependencies
         run: uv sync
       # Exercises poetry/pdm/flit/hatch/pipenv against a real server (fetched on
@@ -82,7 +84,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.9.0
       # `make -s` prints only the summary table (stdout); build noise goes to
       # stderr. Fold it into the run's job summary — no external coverage service.
       - name: Rust unit-test coverage summary
@@ -140,6 +142,8 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         if: steps.gate.outputs.enabled == 'true'
+        with:
+          version: 0.12.6
       - name: Sync dev dependencies
         if: steps.gate.outputs.enabled == 'true'
         run: uv sync

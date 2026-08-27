@@ -34,8 +34,11 @@ jobs:
       - name: Build vopr in the fleet's userland
         run: |
           mkdir -p stage
+          # Digest-pinned (the multi-arch manifest list, not a platform digest —
+          # this job runs on arm64). The tag is a rolling build; a silent glibc
+          # bump inside it is exactly the drift build-vopr.sh guards against.
           docker run --rm -v "$PWD":/src:ro -v "$PWD/stage":/out -w /src \
-            public.ecr.aws/amazonlinux/amazonlinux:2023 \
+            public.ecr.aws/amazonlinux/amazonlinux:2023@sha256:5d271dd33b628252c31c15f5449e50d7c4e9f93badf9342f9b1e2a8d326fbe84 \
             bash dev/ops/soak/build-vopr.sh
       - name: Stage bundle
         run: |

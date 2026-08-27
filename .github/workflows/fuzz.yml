@@ -44,7 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
         with:
-          tool: cargo-fuzz
+          tool: cargo-fuzz@0.13.2
       # Persist the growing corpus: a unique key always saves this run's corpus,
       # and restore-keys pulls the most recent prior corpus to seed it.
       - name: Restore fuzz corpus

@@ -151,6 +151,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
+          version: 0.12.6
           enable-cache: false
       # The Python side of this repo is the blackbox test suite and dev/scripts —
       # nothing ships to users — but a compromised test dependency runs with the
@@ -161,7 +162,7 @@ jobs:
       - name: Sync env + audit installed packages
         run: |
           uv sync
-          uv run --with pip-audit pip-audit --local --progress-spinner off
+          uv run --with pip-audit==2.10.1 pip-audit --local --progress-spinner off
 
   osv:
     name: sca (osv-scanner)
@@ -344,6 +345,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
+          version: 0.12.6
           enable-cache: false
       # A real gate: zizmor exits non-zero on findings, so no second pass is
       # needed. Deliberate exceptions live in .github/zizmor.yml. Scan all of
@@ -449,14 +451,20 @@ jobs:
       # Upstream's README still says @master everywhere and its tags lag, but
       # v1.0.0 is a real tag and the only commits master has on top of it touch
       # .circleci/config.yml and CODEOWNERS. Pin the tag: it resolves, so zizmor
-      # can verify it. The action installs the latest snyk CLI by choice — the
-      # vulnerability DB it queries is server-side and floats regardless, so
-      # pinning the CLI would buy the look of reproducibility without the thing.
+      # can verify it.
       - uses: snyk/actions/setup@9adf32b1121593767fc3c057af55b55db032dc04 # v1.0.0
         if: env.SNYK_TOKEN != ''
+        with:
+          # `latest` (the default) is a different binary downloaded into CI
+          # every run with no commit here. Findings still move on their own —
+          # the vulnerability DB is server-side — but the CLI that runs with
+          # this job's rights should change only when this line does. Leading
+          # `v` required: the action builds the download URL from it verbatim.
+          snyk-version: v1.1307.0
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         if: env.SNYK_TOKEN != ''
         with:
+          version: 0.12.6
           enable-cache: false
       # snyk parses neither Cargo.lock nor uv.lock, so `--all-projects` finds
       # nothing here and the CLI dies with SNYK-CLI-0008 (exit 3). Hand it the

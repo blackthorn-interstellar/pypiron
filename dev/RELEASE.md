@@ -45,8 +45,9 @@ executable out of each wheel (no second compile), and the `release-binaries` job
 attaches them — `pypiron-<triple>.tar.gz`/`.zip` plus a `SHA256SUMS` manifest and
 a provenance attestation — to the tag's **GitHub Release**. So one tag yields
 three channels: PyPI wheels, GitHub Release binaries, and the GHCR image below.
-A `workflow_dispatch` run builds the wheels and binary archives (as artifacts)
-without creating a Release, for dry-running the matrix.
+A `workflow_dispatch` run with the `build-wheels` input ticked builds the wheels
+and binary archives (as artifacts) without creating a Release, for dry-running
+the matrix; without the input, a dispatch runs only the test gates.
 
 In parallel, `docker.yml` builds the multi-arch container image and pushes it to
 GHCR — `ghcr.io/blackthorn-interstellar/pypiron:X.Y.Z`, `:X.Y`, and `:latest` —
@@ -82,6 +83,7 @@ pypiron --help
 
 ## Dry-running the pipeline
 
-Trigger the workflow manually (`workflow_dispatch`) to build the full wheel
-matrix without publishing — untagged builds carry version `0.0.0` and the
-release job only runs for tags.
+Trigger the workflow manually (`workflow_dispatch`) and tick the `build-wheels`
+input to build the full wheel matrix without publishing — untagged builds carry
+version `0.0.0` and the release job only runs for tags. A dispatch without the
+input skips the build matrix entirely.

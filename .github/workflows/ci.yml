@@ -729,7 +729,9 @@ jobs:
           - { kind: linux,     runner: ubuntu-22.04,   target: aarch64, triple: aarch64-unknown-linux-gnu, zig: "--zig" }
           - { kind: linux,     runner: ubuntu-22.04,   target: armv7,   triple: armv7-unknown-linux-gnueabihf, zig: "--zig" }
           - { kind: linux,     runner: ubuntu-22.04,   target: s390x,   triple: s390x-unknown-linux-gnu }
-          - { kind: linux,     runner: ubuntu-22.04,   target: ppc64le, triple: powerpc64le-unknown-linux-gnu }
+          # ppc64le needs manylinux_2_28: aws-lc-sys (via object_store 0.14) reads
+          # AT_HWCAP2, which manylinux2014's glibc 2.17 cross-sysroot lacks.
+          - { kind: linux,     runner: ubuntu-22.04,   target: ppc64le, triple: powerpc64le-unknown-linux-gnu, manylinux: 2_28 }
           - { kind: linux,     runner: ubuntu-22.04,   target: riscv64, triple: riscv64gc-unknown-linux-gnu }
           - { kind: musllinux, runner: ubuntu-22.04,   target: x86_64,  triple: x86_64-unknown-linux-musl,  manylinux: musllinux_1_2, container_smoke: true }
           - { kind: musllinux, runner: ubuntu-22.04,   target: x86,     triple: i686-unknown-linux-musl,    manylinux: musllinux_1_2 }

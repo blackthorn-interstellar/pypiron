@@ -795,7 +795,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/digests"
           # shasum fallback: macOS arm64 runners ship no sha256sum (the Intel
           # image only has one incidentally, via coreutils). Same output format.
+          # The sed drops the `*` binary-mode marker Windows coreutils emits, so
+          # every platform records the two-space format the release jobs diff
+          # against their own Linux sha256sum output.
           if command -v sha256sum >/dev/null; then sha256sum dist/*; else shasum -a 256 dist/*; fi \
+            | sed 's/^\([0-9a-f]*\) \*/\1  /' \
             > "$RUNNER_TEMP/digests/${{ matrix.kind }}-${{ matrix.target }}.sha256"
       # Prove the wheel we just built actually installs and RUNS before it can be
       # published: `maturin build` succeeding says nothing about whether the
@@ -877,6 +881,7 @@ jobs:
         run: |
           set -euo pipefail
           if command -v sha256sum >/dev/null; then sha256sum dist/*; else shasum -a 256 dist/*; fi \
+            | sed 's/^\([0-9a-f]*\) \*/\1  /' \
             | diff - "$RUNNER_TEMP/digests/${{ matrix.kind }}-${{ matrix.target }}.sha256"
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -909,8 +914,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/bin-digests"
-          # shasum fallback: macOS arm64 runners ship no sha256sum. Same format.
+          # shasum fallback: macOS arm64 runners ship no sha256sum. Same format;
+          # the sed drops Windows coreutils' `*` binary-mode marker (see above).
           if command -v sha256sum >/dev/null; then sha256sum binaries/*; else shasum -a 256 binaries/*; fi \
+            | sed 's/^\([0-9a-f]*\) \*/\1  /' \
             > "$RUNNER_TEMP/bin-digests/${{ matrix.kind }}-${{ matrix.target }}.sha256"
       - name: Upload standalone binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

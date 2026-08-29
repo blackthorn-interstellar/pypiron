@@ -2213,6 +2213,20 @@ def minio_get_key_bytes_in(minio: Dict, bucket: str, key: str) -> bytes:
     return body
 
 
+def minio_try_get_key_bytes_in(minio: Dict, bucket: str, key: str) -> bytes | None:
+    """`minio_get_key_bytes_in`, but a key that isn't there reads as None.
+
+    For oracles that sample a record while pypiron is actively healing it: an
+    exists-then-read pair races the healer, which can delete the artifact
+    between the two calls. None means "gone", never b"" — the zero-byte lesson
+    above still holds, and every other status still raises."""
+    code, body = _s3_signed(minio, "GET", f"/{bucket}/{key}")
+    if code == 404:
+        return None
+    assert code == 200, f"get {bucket}/{key} -> {code}: {body[:200]!r}"
+    return body
+
+
 def minio_object_sha256(minio: Dict, bucket: str, key: str) -> str:
     """sha256 hex of an object's bytes in a named bucket — the byte-equality
     oracle. Existence-only checks pass when a copy lands corrupt or truncated;

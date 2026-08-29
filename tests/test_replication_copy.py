@@ -29,10 +29,10 @@ import pytest
 
 from .conftest import (
     minio_delete_key_in,
-    minio_get_key_in,
     minio_key_exists_in,
     minio_object_sha256,
     minio_put_key_in,
+    minio_try_get_key_bytes_in,
 )
 from .helpers import (
     find_free_port,
@@ -183,11 +183,13 @@ def test_server_side_copy_rejects_a_same_size_corrupt_source(minio_two, s3_serve
             minio_two, b, f"{key}.tombstone"
         ):
             return "safe"  # suppressed from every index — never served
-        has_art = minio_key_exists_in(minio_two, b, key)
-        has_sc = minio_key_exists_in(minio_two, b, sc_key)
-        if has_art and has_sc:
-            sidecar = json.loads(minio_get_key_in(minio_two, b, sc_key))
-            if minio_object_sha256(minio_two, b, key) == sidecar["sha256"]:
+        # Read both halves rather than testing existence first: the healer can
+        # delete the artifact between an exists check and the read that follows it.
+        art = minio_try_get_key_bytes_in(minio_two, b, key)
+        sc = minio_try_get_key_bytes_in(minio_two, b, sc_key)
+        if art is not None and sc is not None:
+            sidecar = json.loads(sc.decode())
+            if hashlib.sha256(art).hexdigest() == sidecar["sha256"]:
                 return "safe"  # bytes match their sidecar
             return "contradiction"  # served bytes disagree with the sidecar — the bug
         return "unsettled"  # torn or absent mid-heal

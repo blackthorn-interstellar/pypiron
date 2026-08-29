@@ -1563,6 +1563,32 @@ async fn run_serve(
         }
         (st, false)
     };
+    // PEP 792 quarantine is enforced independently of `--malware-block` (see
+    // `serve::advisory_byte_gate`), so the set has to be armed BEFORE the listener
+    // binds on every path — including the implicit default and `--advisory-feed ""`,
+    // which deliberately skip the feed fetch to avoid delaying startup. Both used to
+    // begin with an empty set and stay that way (a follower forever, a leader until
+    // its next audit sweep), serving quarantined artifacts in the meantime. This
+    // costs one 1-key LIST plus one small GET and fetches no feed. The explicit
+    // path already loaded the set inside `obtain_at_startup`.
+    let advisory_state = if advisory_loaded {
+        advisory_state
+    } else {
+        let pinned = buckets.pin();
+        let (quarantined, quarantined_etag) =
+            advisories::load_quarantined_at_startup(pinned.storage.as_ref()).await;
+        if !quarantined.is_empty() {
+            info!(
+                projects = quarantined.len(),
+                "PEP 792 quarantine armed from the stored set"
+            );
+        }
+        advisories::AdvisoryState {
+            quarantined,
+            quarantined_etag,
+            ..advisory_state
+        }
+    };
     // Effective blocking is off whenever the feature is off.
     let malware_block = !advisory_off && malware_block_flag;
 
@@ -2140,9 +2166,20 @@ fn forwarded_ip(value: &str) -> Option<String> {
 /// throttle bucket — defeating the brute-force cooldown — and spoof the logged
 /// IP. This assumes a single trusted front proxy (pypiron's model); chained
 /// proxies would need a configured hop count to strip from the right.
+///
+/// "Rightmost" means the last element of the *last* `X-Forwarded-For` header
+/// line, not the first: a proxy may append its own line rather than merge into
+/// the client's (HAProxy `option forwardfor` does), and `HeaderMap::get` returns
+/// only the first occurrence — which is then entirely client-controlled. nginx's
+/// merged single-line form is the same value either way.
 fn client_ip(headers: &HeaderMap, peer: Option<std::net::IpAddr>, trusted_proxy: bool) -> String {
     if trusted_proxy {
-        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(xff) = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .next_back()
+        {
             if let Some(ip) = forwarded_ip(xff.rsplit(',').next().unwrap_or("")) {
                 return ip;
             }
@@ -2214,6 +2251,11 @@ fn format_clf(line: &AccessLogLine<'_>) -> String {
     // way CLF parsers expect, so neither can inject a counterfeit field.
     let referer = referer.map(clf_quoted);
     let ua = ua.map(clf_quoted);
+    // The request target sits in the same kind of quoted field and is likewise
+    // request-controlled (a `"` is legal in a URI path), so it needs the same
+    // escaping — without it a quoted path closes the request-line field early and
+    // the remainder is read as counterfeit fields.
+    let target = clf_quoted(target);
     format!(
         "{host} - {authuser} [{time}] \"{method} {target} {proto}\" {status} {bytes} \"{referer}\" \"{ua}\"",
         authuser = dash(authuser.as_deref()),
@@ -2613,6 +2655,37 @@ mod tests {
     }
 
     #[test]
+    fn client_ip_reads_the_last_forwarded_for_line_not_the_first() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let peer = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+
+        // A proxy may append its own X-Forwarded-For *line* instead of merging
+        // into the client's (HAProxy `option forwardfor`). The first line is then
+        // wholly attacker-written, so only the last one is the trusted hop —
+        // otherwise a client rotates a forged address per request and walks out
+        // of its login-throttle bucket.
+        let mut appended = HeaderMap::new();
+        appended.append("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
+        appended.append("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
+        assert_eq!(client_ip(&appended, peer, true), "10.0.0.1");
+
+        // Junk in the trusted (last) line is still absent, not a fallback to the
+        // client's earlier line: X-Real-IP, then the peer, take over.
+        let mut junk_last = HeaderMap::new();
+        junk_last.append("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
+        junk_last.append("x-forwarded-for", HeaderValue::from_static("not an ip"));
+        assert_eq!(client_ip(&junk_last, peer, true), "127.0.0.1");
+
+        // nginx's merged single line is unchanged: rightmost element wins.
+        let mut merged = HeaderMap::new();
+        merged.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.9, 10.0.0.1"),
+        );
+        assert_eq!(client_ip(&merged, peer, true), "10.0.0.1");
+    }
+
+    #[test]
     fn client_ip_rejects_forwarded_values_that_are_not_addresses() {
         use std::net::{IpAddr, Ipv4Addr};
         let peer = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
@@ -2782,6 +2855,29 @@ mod tests {
         assert_eq!(
             line,
             "10.0.0.5 - - [10/Oct/2000:13:55:36 +0000] \"GET /simple/flask/ HTTP/1.1\" 200 1532 \"http://ref/\\\" 200 0 \\\"evil\" \"agent\\\\\\\"x\""
+        );
+    }
+
+    #[test]
+    fn clf_request_target_quotes_are_escaped() {
+        // A `"` is legal in a request path, and the target sits in the quoted
+        // request-line field: unescaped it closes that field early and the rest
+        // of the path is read as counterfeit status/size fields.
+        let line = format_clf(&AccessLogLine {
+            host: "10.0.0.5",
+            authuser: None,
+            time: "10/Oct/2000:13:55:36 +0000",
+            method: &Method::GET,
+            target: "/simple/\"200/",
+            proto: "HTTP/1.1",
+            status: 404,
+            bytes: Some(9),
+            referer: None,
+            ua: None,
+        });
+        assert_eq!(
+            line,
+            "10.0.0.5 - - [10/Oct/2000:13:55:36 +0000] \"GET /simple/\\\"200/ HTTP/1.1\" 404 9 \"-\" \"-\""
         );
     }
 }

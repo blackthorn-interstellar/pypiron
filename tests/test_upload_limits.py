@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from .helpers import make_wheel, upload_legacy, wait_for_file_in_index
+from .helpers import http_get, make_wheel, upload_legacy, wait_for_file_in_index
 
 pytestmark = pytest.mark.integration
 
@@ -64,3 +64,65 @@ def test_normal_upload_with_modest_metadata_succeeds(disk_server, tmp_path):
         fields=fields,
     )
     wait_for_file_in_index(disk_server["simple"], "modestpkg", wheel.name)
+
+
+# The download path refuses any filename over 256 bytes. Upload has to agree, or
+# a longer name is written, listed in /simple/, and then 404s on every GET.
+MAX_ARTIFACT_FILENAME_BYTES = 256
+_SUFFIX = "-1.0-py3-none-any.whl"
+
+
+def test_a_very_long_filename_uploads_and_downloads(disk_server, tmp_path):
+    """A long filename round-trips: upload, index, artifact GET, and the PEP 658
+    companion — which is the name plus a suffix, so the servable cap has to be
+    measured against the artifact name, not the whole URL segment.
+
+    Long, not maximal: a disk backend bounds every path component at NAME_MAX
+    (255 bytes on macOS and Linux alike) and writes each companion through a
+    `.tmp-<nanos>-<pid>-<seq>-<name>` sibling, which spends ~34 of those bytes
+    before the sidecar suffix. The 256-byte cap itself is pinned by the
+    `valid_artifact_filename` unit test, which no filesystem constrains.
+    """
+    pkg = "longname"
+    version = "1" + ".0" * 66  # 133 bytes of PEP 440
+    wheel = make_wheel(pkg, version, tmp_path)
+    assert 150 < len(wheel.name) < 200
+
+    upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+    )
+    wait_for_file_in_index(disk_server["simple"], pkg, wheel.name)
+
+    url = f"{disk_server['base_url']}/files/{pkg}/{wheel.name}"
+    code, body, _ = http_get(url)
+    assert code == 200
+    assert body == wheel.read_bytes()
+
+    code, meta, _ = http_get(f"{url}.metadata")
+    assert code == 200
+    assert b"Metadata-Version" in meta
+
+
+def test_filename_past_the_servable_cap_is_rejected(disk_server, tmp_path):
+    """One byte over what the download path will ever serve, and the upload is
+    refused outright rather than stored as bytes no GET can hand back."""
+    pkg = "capped"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    too_long = "y" * (MAX_ARTIFACT_FILENAME_BYTES + 1 - len(_SUFFIX)) + _SUFFIX
+    assert len(too_long) == MAX_ARTIFACT_FILENAME_BYTES + 1
+
+    code, body = upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+        fields={"name": pkg, "version": "1.0"},
+        filename=too_long,
+        expect_status=400,
+    )
+    assert code == 400
+    # Named reason, so the test can't pass on some unrelated 400.
+    assert b"Invalid filename" in body

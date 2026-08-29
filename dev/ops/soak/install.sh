@@ -25,6 +25,11 @@ fi
 # compromised soak account rewrite those and win root on the next refresh timer.
 # The soak-run units (vopr, reporter) only need read+exec here — their sole local
 # write is report.py's /var/tmp fallback — so nothing under $DEST is soak-owned.
+# Asserted here, not just assumed: this script is the one thing every path into a
+# refreshed bundle runs (cloud-init, and fetch-bundle.sh on every update), so
+# normalizing ownership here closes the window where an older extractor left the
+# tree soak-writable for one refresh cycle.
+chown -R root:root "$DEST"
 chmod +x "$DEST"/vopr "$DEST"/*.sh "$DEST"/report.py
 usermod -aG systemd-journal "$SOAK_USER" # the reporter reads the soak journal
 

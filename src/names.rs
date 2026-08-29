@@ -66,11 +66,27 @@ pub fn infer_package_from_filename(filename: &str) -> String {
     normalize_pkg_name(dist)
 }
 
-/// A well-formed PEP 503 normalized name: nonempty, only `[a-z0-9-]`.
-/// Anything else (slashes, dots that survived, unicode) is hostile input —
-/// normalized names are storage path segments.
+/// Upper bound on a name we will accept. PyPI itself caps project names at 100
+/// characters and PEP 503 sets no limit, so 256 clears anything real while
+/// keeping a request-controlled name from sizing a path segment or a map key.
+const MAX_PKG_NAME_BYTES: usize = 256;
+
+/// Longest artifact `filename` path segment, on the write path and the read
+/// path alike. Real wheel and sdist names run far under this; the cap keeps a
+/// request-controlled string out of the download-counter and presign caches,
+/// which bound entry *count*, not key length — without it a client can pin
+/// memory with 400 KB filenames. Upload and download share the one const on
+/// purpose: a name the reader would refuse must never reach storage, or the
+/// bytes are written, listed in `/simple/`, and permanently unreachable.
+pub const MAX_ARTIFACT_FILENAME_BYTES: usize = 256;
+
+/// A well-formed PEP 503 normalized name: nonempty, at most
+/// [`MAX_PKG_NAME_BYTES`], only `[a-z0-9-]`. Anything else (slashes, dots that
+/// survived, unicode, a name longer than any real project's) is hostile input —
+/// normalized names are storage path segments and in-memory map keys.
 pub fn is_normalized(name: &str) -> bool {
     !name.is_empty()
+        && name.len() <= MAX_PKG_NAME_BYTES
         && !name.starts_with('-')
         && !name.ends_with('-')
         && name
@@ -81,8 +97,8 @@ pub fn is_normalized(name: &str) -> bool {
 /// Normalize `raw` and return it only if the result is a usable PEP 503 name.
 /// Pairs the two halves of the gate — normalize then [`is_normalized`] — so a
 /// caller can't accidentally use a normalized-but-unvalidated name (which could
-/// be empty or otherwise hostile) as a storage path segment. `None` means the
-/// input is not servable.
+/// be empty, over-long, or otherwise hostile) as a storage path segment. `None`
+/// means the input is not servable.
 pub fn checked_pkg_name(raw: &str) -> Option<String> {
     let name = normalize_pkg_name(raw);
     is_normalized(&name).then_some(name)
@@ -361,6 +377,30 @@ mod tests {
         assert_eq!(checked_pkg_name("  six "), None); // spaces aren't separators; caller must trim
         assert_eq!(checked_pkg_name("..."), None); // normalizes to empty
         assert_eq!(checked_pkg_name("foo/bar"), None); // slash survives normalization
+    }
+
+    #[test]
+    fn names_are_length_bounded() {
+        // A request- or upload-supplied name is unbounded until this gate, and it
+        // goes on to be a path segment and an in-memory map key. Real names are
+        // tiny (PyPI caps projects at 100 chars), so the cap only sees hostile input.
+        let at_cap = "a".repeat(MAX_PKG_NAME_BYTES);
+        let over_cap = "a".repeat(MAX_PKG_NAME_BYTES + 1);
+
+        // The predicate the upload path gates on.
+        assert!(is_normalized("six"));
+        assert!(is_normalized(&at_cap));
+        assert!(!is_normalized(&over_cap));
+
+        // …and the normalize-then-validate pairing every request path gates on.
+        assert_eq!(checked_pkg_name("six").as_deref(), Some("six"));
+        assert_eq!(checked_pkg_name(&at_cap).as_deref(), Some(at_cap.as_str()));
+        assert_eq!(checked_pkg_name(&over_cap), None);
+        // The bound is on the normalized result, so trailing separator runs that
+        // normalization strips don't count against it — 1 KB of dots and all.
+        let padded = format!("{at_cap}{}", ".".repeat(1000));
+        assert_eq!(checked_pkg_name(&padded).as_deref(), Some(at_cap.as_str()));
+        assert_eq!(checked_pkg_name(&format!("{over_cap}...")), None);
     }
 
     #[test]

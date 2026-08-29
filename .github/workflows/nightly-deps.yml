@@ -13,14 +13,15 @@
 # Scope is uv.lock and Cargo.lock. The actions pins stay with dependabot (see
 # .github/dependabot.yml, where cargo's monthly entry remains as a backstop);
 # this lane owns the two lockfiles and nothing else, and it refuses to touch
-# .github/** or the Makefile — the machinery is not self-editable.
+# anything that runs in a credentialed job — see GUARDED_PATHS below. The
+# machinery is not self-editable.
 #
 # The invariant this file is built around: NO job both runs untrusted code and
 # holds a write token. Every agent job is keyless — it reads untrusted input
 # (just-bumped packages, their CI logs) and it COMMITS LOCALLY, banking
 # `git diff --binary` as an artifact. A matching *-publish job on a clean VM —
 # no bumped code, no local actions, just git and gh — applies that patch behind
-# the .github/|Makefile guard and does the pushing. Step-scoping a token is not
+# the GUARDED_PATHS guard and does the pushing. Step-scoping a token is not
 # enough: same-VM code can read another process's env.
 #
 # Secrets: XAI_API_KEY (see the nightly-deps environment). Without it the two
@@ -60,6 +61,36 @@ env:
   # where it governs every resolve rather than just this lane's; the bump step
   # reads it back out for the PR body. Change it there.
   BRANCH: deps/nightly
+  # The self-editing boundary, in one place because three jobs enforce it (the
+  # two *-publish jobs before they push an agent's patch, deps-merge before it
+  # squashes) and three copies of a regex drift.
+  #
+  # Everything here either RUNS in a credentialed job or decides whether one
+  # runs, so an agent that could edit it could rewrite what "green" means and
+  # then merge itself:
+  #
+  #   .github/          the workflows and their pinned actions
+  #   .cargo/           config.toml sets rustflags and target runners for every
+  #                     build — including the release and signing jobs
+  #   dev/scripts/      bump_deps.py is this lane's own cooldown enforcement
+  #   dev/ops/          the soak bundle, which every fleet box runs as root
+  #                     under an OIDC role
+  #   GNUmakefile       make PREFERS it over Makefile, so an added GNUmakefile
+  #   [Mm]akefile       silently shadows `make audit`/`make check` — all three
+  #                     spellings are the same gate
+  #   build.rs          arbitrary code in every cargo invocation
+  #   Dockerfile        the image published to GHCR
+  #   deny.toml         the licenses/bans/sources policy cargo-deny gates on
+  #   .gitleaks.toml    the secret-scan allowlist
+  #   .semgrepignore    exempts paths from the SAST gate (absent today; adding
+  #                     one is exactly the move this blocks)
+  #
+  # Two of those do not exist yet. That is deliberate: the guard reads the
+  # branch's diff, and CREATING one of these is the attack, not editing it.
+  #
+  # Widening this list means the lane hands off to a human more often. That is
+  # the trade being made, not a regression to tune back out.
+  GUARDED_PATHS: '^(\.github/|\.cargo/|dev/scripts/|dev/ops/|GNUmakefile$|[Mm]akefile$|build\.rs$|Dockerfile$|deny\.toml$|\.gitleaks\.toml$|\.semgrepignore$)'
 
 jobs:
   # Is the repair agent wired up at all? `secrets` is not available in a
@@ -645,12 +676,19 @@ jobs:
             exit 1
           fi
           git add -A
-          # Enforce the self-editing boundary before this branch is pushed or
-          # any later privileged job checks it out and resolves local actions.
+          # Enforce the self-editing boundary (GUARDED_PATHS, top of file)
+          # before this branch is pushed or any later privileged job checks it
+          # out and resolves local actions.
           # --no-renames: rename detection prints only the destination, so
           # `git mv .github/workflows/x.yml decoy` would otherwise hide the
           # .github/ deletion from this grep.
-          guarded=$(git diff --cached --name-only --no-renames | grep -E '^(\.github/|Makefile$)' || true)
+          # Two statements, not one pipeline. As `git diff ... | grep ... ||
+          # true` the `|| true` — there to let a no-match grep exit 1 — also
+          # swallows a failure of the listing itself, pipefail or not, leaving
+          # $guarded empty. Empty reads as "nothing guarded was touched", so the
+          # guard waves the push through exactly when it could not check.
+          staged=$(git diff --cached --name-only --no-renames)
+          guarded=$(printf '%s\n' "$staged" | grep -E "$GUARDED_PATHS" || true)
           if [ -n "$guarded" ]; then
             echo "::error::agent fix attempted to modify trusted automation: $guarded"
             exit 1
@@ -1032,9 +1070,16 @@ jobs:
           fi
           git apply --binary "$RUNNER_TEMP/remedy/fix.patch"
           git add -A
-          # Enforce the self-editing boundary before this branch is pushed or
-          # any later privileged job checks it out and resolves local actions.
-          guarded=$(git diff --cached --name-only --no-renames | grep -E '^(\.github/|Makefile$)' || true)
+          # Enforce the self-editing boundary (GUARDED_PATHS, top of file)
+          # before this branch is pushed or any later privileged job checks it
+          # out and resolves local actions.
+          # Two statements, not one pipeline. As `git diff ... | grep ... ||
+          # true` the `|| true` — there to let a no-match grep exit 1 — also
+          # swallows a failure of the listing itself, pipefail or not, leaving
+          # $guarded empty. Empty reads as "nothing guarded was touched", so the
+          # guard waves the push through exactly when it could not check.
+          staged=$(git diff --cached --name-only --no-renames)
+          guarded=$(printf '%s\n' "$staged" | grep -E "$GUARDED_PATHS" || true)
           if [ -n "$guarded" ]; then
             echo "::error::agent fix attempted to modify trusted automation: $guarded"
             exit 1
@@ -1204,8 +1249,24 @@ jobs:
         run: |
           # End to end: green checks merge, no human in the path. The one
           # refusal: the machinery may not merge edits to itself — anything
-          # touching .github/ or the Makefile waits for a human.
-          guarded=$(gh pr diff "$BRANCH" --repo "$GITHUB_REPOSITORY" --name-only | grep -E '^(\.github/|Makefile$)' || true)
+          # under GUARDED_PATHS (top of file) waits for a human.
+          pr=$(gh pr view "$BRANCH" --repo "$GITHUB_REPOSITORY" --json number --jq .number)
+          # The files endpoint, not `gh pr diff --name-only`: that reports a
+          # renamed file under its destination only, so `git mv
+          # .github/workflows/x.yml decoy` would hide the .github/ deletion
+          # from this grep. It is what --no-renames buys the publish-side
+          # guards, which `gh pr diff` has no flag for — the REST payload
+          # carries the source path as previous_filename, so match both ends.
+          # --paginate because a page is 30 files.
+          # Two statements, not one pipeline. As `gh api ... | grep ... || true`
+          # the `|| true` — there to let a no-match grep exit 1 — also swallows a
+          # 5xx, a secondary rate limit, or a pagination hiccup, leaving $guarded
+          # empty. Empty reads as "the PR touches no automation", so the PR
+          # auto-merges unreviewed exactly when the guard could not check. On its
+          # own line the API call is a bare assignment, so `-e` kills the step.
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$pr/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)')
+          guarded=$(printf '%s\n' "$files" | grep -E "$GUARDED_PATHS" || true)
           if [ -n "$guarded" ]; then
             echo "::error::$BRANCH edits the automation itself ($guarded) — a human must merge this"
             exit 1
@@ -1219,8 +1280,7 @@ jobs:
           done
           # gh pr merge can refuse client-side on a stale BLOCKED mergeStateStatus
           # even when the merge API's fresh evaluation passes. The API is the
-          # authority — ask it directly.
-          pr=$(gh pr view "$BRANCH" --repo "$GITHUB_REPOSITORY" --json number --jq .number)
+          # authority — ask it directly. $pr is the number the guard above read.
           if gh api -X PUT "repos/$GITHUB_REPOSITORY/pulls/$pr/merge" -f merge_method=squash 2>"$RUNNER_TEMP/merge-err"; then
             gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH" || true
             echo "merged $BRANCH (via merge API; gh CLI saw stale state)" >> "$GITHUB_STEP_SUMMARY"

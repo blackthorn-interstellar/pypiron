@@ -266,6 +266,27 @@ fn run_trimmed(cmd: &str, args: &[&str]) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Drop any `user:password@` from a git remote URL. A token minted from this
+/// carries `repo` in its payload, and that payload is base64url with an HMAC
+/// appended — signed, *not* encrypted, so anyone holding the token can read it
+/// back. A remote cloned with an embedded credential
+/// (`https://user:ghp_…@github.com/o/r`) would otherwise ship that credential
+/// inside every token, and unlike the 300-second token it does not expire.
+/// Input that is not a URL — the scp-style `git@host:org/repo`, or a bare path —
+/// has no userinfo to strip and is returned unchanged.
+fn strip_url_userinfo(remote: &str) -> String {
+    let remote = remote.trim();
+    let Ok(mut url) = url::Url::parse(remote) else {
+        return remote.to_string();
+    };
+    // A cannot-be-a-base URL (`mailto:`, and anything else without an authority)
+    // has no userinfo slot; `set_username` reports that by erroring.
+    if url.set_username("").is_err() || url.set_password(None).is_err() {
+        return remote.to_string();
+    }
+    url.to_string()
+}
+
 /// Best-effort current user: `$USER`/`$LOGNAME`, falling back to `id -un`.
 fn detect_user() -> Option<String> {
     std::env::var("USER")
@@ -281,7 +302,8 @@ fn detect_user() -> Option<String> {
 pub async fn run_create_token(args: CreateTokenArgs) -> Result<()> {
     let repo = args
         .repo
-        .or_else(|| run_trimmed("git", &["remote", "get-url", "origin"]));
+        .or_else(|| run_trimmed("git", &["remote", "get-url", "origin"]))
+        .map(|r| strip_url_userinfo(&r));
     let commit = args
         .commit
         .or_else(|| run_trimmed("git", &["rev-parse", "--short", "HEAD"]));
@@ -1333,6 +1355,36 @@ mod tests {
             loopback_health_url(Some("not-an-addr")),
             "http://127.0.0.1:8080/health"
         );
+    }
+
+    #[test]
+    fn git_remote_userinfo_never_reaches_the_token_payload() {
+        // A credential embedded in the remote outlives the 300s token; the
+        // payload is signed, not encrypted, so it must not be in there.
+        let stripped = strip_url_userinfo("https://someone:ghp_secret@github.com/o/r.git");
+        assert_eq!(stripped, "https://github.com/o/r.git");
+        assert!(!stripped.contains("ghp_secret") && !stripped.contains('@'));
+        assert_eq!(
+            strip_url_userinfo("https://x-access-token:ghs_tok@gitlab.com/g/p"),
+            "https://gitlab.com/g/p"
+        );
+        // A username with no password goes too — it is still an identity leak.
+        assert_eq!(
+            strip_url_userinfo("ssh://git@github.com/o/r.git"),
+            "ssh://github.com/o/r.git"
+        );
+        // Credential-free URLs survive intact.
+        assert_eq!(
+            strip_url_userinfo("  https://github.com/o/r.git  "),
+            "https://github.com/o/r.git"
+        );
+        // scp-style and plain paths are not URLs: returned unchanged, no panic.
+        assert_eq!(
+            strip_url_userinfo("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+        assert_eq!(strip_url_userinfo("/srv/git/r.git"), "/srv/git/r.git");
+        assert_eq!(strip_url_userinfo(""), "");
     }
 
     fn parse_serve(args: &[&str]) -> ServeArgs {

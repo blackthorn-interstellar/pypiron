@@ -68,6 +68,13 @@ const DOWNLOAD_FLOOR_BYTES_PER_SEC: u64 = 64 * 1024;
 /// Ceiling on one download attempt whatever the declared size — an hour is well
 /// past any wheel PyPI serves, and it is what an unsized body gets.
 const DOWNLOAD_MAX: Duration = Duration::from_secs(3600);
+/// Spool ceiling for an artifact whose upstream listing declares no size. The
+/// per-chunk overrun check has nothing to compare against there, and the sha256
+/// gate only runs on a *finished* spool — so without this an unsized body is
+/// bounded only by [`DOWNLOAD_MAX`], an hour of disk at whatever rate upstream
+/// can push. 1 GiB is PyPI's hard per-file limit, so nothing a real index serves
+/// is refused; PEP 700 indexes declare a size and never reach this at all.
+const DOWNLOAD_UNSIZED_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// How long a positive "already cached locally" observation is trusted before a
 /// re-verifying HEAD. Artifacts are immutable, so present→absent only happens on
 /// a delete/prune (rare) or a bucket switch (handled by the generation key), and
@@ -1744,9 +1751,27 @@ impl Proxy {
         // catches an upstream that stops; one that trickles resets it forever and
         // would hold this artifact's single-flight slot for hours.
         let deadline = download_deadline(file.size, download_grace());
+        // Absolute byte ceiling for this attempt: the upstream-declared size when
+        // there is one, else the unsized fallback. Without the fallback an
+        // unsized body has no size gate at all — the read timeout bounds only
+        // inactivity, and the digest check only runs once the spool is finished.
+        let (ceiling, limit) = match file.size {
+            Some(max) => (max, "declared size"),
+            None => (DOWNLOAD_UNSIZED_MAX_BYTES, "unsized-artifact ceiling"),
+        };
         let resp = ssrf::guarded_get(&self.client, &self.guard, url.clone(), Some(deadline))
             .await?
             .error_for_status()?;
+        // Cheapest possible check first: an upstream that admits the body is over
+        // the ceiling is refused before a single byte reaches the spool.
+        if let Some(declared) = resp.content_length() {
+            if declared > ceiling {
+                bail!(
+                    "{} declares Content-Length {declared}, over its {limit} ({ceiling} bytes)",
+                    file.filename
+                );
+            }
+        }
         let mut spool = UploadSpool::new(&state.spool_dir).await?;
         // Upstream answered 200 and there is a file to follow: this is where a
         // waiting tee attaches, which is why nothing before it can 200 a client.
@@ -1757,18 +1782,15 @@ impl Proxy {
         let mut published = 0u64;
         while let Some(chunk) = stream.next().await {
             spool.write_chunk(&chunk?).await?;
-            // Mirror sync::download_once: abort a body that overruns its
-            // upstream-declared size before it can fill the disk (the read
-            // timeout bounds time, not size, and an overrun fails the sha
-            // check anyway). No declared size → no cap, same as sync.
-            if let Some(max) = file.size {
-                if spool.size() > max {
-                    bail!(
-                        "{} overran its declared size ({} > {max} bytes)",
-                        file.filename,
-                        spool.size()
-                    );
-                }
+            // Abort a body that overruns its ceiling before it can fill the disk
+            // (the read timeout bounds time, not size, and an overrun fails the
+            // sha check anyway) — a lying or absent Content-Length is caught here.
+            if spool.size() > ceiling {
+                bail!(
+                    "{} overran its {limit} ({} > {ceiling} bytes)",
+                    file.filename,
+                    spool.size()
+                );
             }
             // Publish per [`TEE_CHUNK`], not per reqwest chunk: upstream hands us
             // 8-16 KiB at a time, and flushing on each one is tens of thousands of

@@ -20,7 +20,7 @@ use crate::app::{
     PACKAGES_PREFIX, SIMPLE_PREFIX,
 };
 use crate::buckets::Pinned;
-use crate::names::{checked_pkg_name, infer_version_from_filename};
+use crate::names::{checked_pkg_name, infer_version_from_filename, MAX_ARTIFACT_FILENAME_BYTES};
 use crate::sidecar::{
     frozen_key, mirror_quarantined_key, sidecar_key, tombstone_key, Sidecar, METADATA_SUFFIX,
     PROVENANCE_SUFFIX,
@@ -51,6 +51,44 @@ const CT_HTML: &str = render::SIMPLE_HTML_CONTENT_TYPE;
 const INDEX_CACHE_CONTROL: &str = "no-cache";
 /// Filenames are immutable, so artifact bytes can be cached forever.
 const ARTIFACT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+/// The same, for a server whose reads are credential-gated: still immutable, but
+/// a shared cache must not store one reader's bytes and hand them to the next
+/// anonymous client.
+const ARTIFACT_CACHE_CONTROL_PRIVATE: &str = "private, max-age=31536000, immutable";
+
+/// Stamp the immutable artifact caching headers on a delivered body. When
+/// `--read-user`/`--read-pass` gate reads, the response carries credentials'
+/// worth of privacy: mark it `private` and vary on `Authorization` so no shared
+/// cache collapses the authenticated and anonymous audiences. With reads public
+/// (the default) this is byte-identical to stamping the plain constant.
+/// Non-delivered statuses (404, a 416 range refusal) are left alone — pinning an
+/// error against an artifact URL for a year is cache poisoning.
+fn stamp_artifact_cache(state: &AppState, resp: &mut Response<Body>) {
+    if !resp.status().is_success() && resp.status() != StatusCode::NOT_MODIFIED {
+        return;
+    }
+    if state.read_credential().is_none() {
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(ARTIFACT_CACHE_CONTROL),
+        );
+        return;
+    }
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(ARTIFACT_CACHE_CONTROL_PRIVATE),
+    );
+    // Merge rather than append: the index renderer already varies on
+    // `Accept-Encoding`, and one comma-joined field is what every cache parses.
+    let vary = resp.headers().get(header::VARY).cloned();
+    let merged = match vary.as_ref().and_then(|v| v.to_str().ok()) {
+        Some(existing) if !existing.is_empty() => format!("{existing}, Authorization"),
+        _ => "Authorization".to_string(),
+    };
+    if let Ok(value) = HeaderValue::from_str(&merged) {
+        resp.headers_mut().insert(header::VARY, value);
+    }
+}
 
 /// Multi-bucket markers are visibility fences, not merely index hints. A
 /// quarantined mirror body deliberately keeps its canonical key occupied, so
@@ -688,7 +726,7 @@ async fn serve_companion(
         }
         Err(error) => return read_error(error),
     }
-    let resp = serve_index_local(
+    let mut resp = serve_index_local(
         state,
         pins,
         key,
@@ -714,6 +752,7 @@ async fn serve_companion(
             return upstream;
         }
     }
+    stamp_artifact_cache(state, &mut resp);
     resp
 }
 
@@ -731,16 +770,21 @@ pub(crate) async fn files_get(
     }
     // A request is for an artifact or one of its served companions
     // (`.metadata`, `.provenance`); the sidecar JSON and dotfiles never serve.
-    let servable = match filename
+    // The length cap belongs to the artifact filename, not to the request's
+    // path segment: a sidecar is the artifact's name plus a suffix, so checking
+    // the whole segment would make the companions of a legal-length upload
+    // permanently unreachable.
+    let artifact_base = filename
         .strip_suffix(METADATA_SUFFIX)
         .or_else(|| filename.strip_suffix(PROVENANCE_SUFFIX))
-    {
-        Some(base) => sidecar::is_artifact(base),
-        None => sidecar::is_artifact(&filename),
-    };
-    let Some(pkg) = checked_pkg_name(&package)
-        .filter(|_| servable && !filename.contains('/') && !filename.contains('\\'))
-    else {
+        .unwrap_or(&filename);
+    let servable = sidecar::is_artifact(artifact_base);
+    let Some(pkg) = checked_pkg_name(&package).filter(|_| {
+        servable
+            && artifact_base.len() <= MAX_ARTIFACT_FILENAME_BYTES
+            && !filename.contains('/')
+            && !filename.contains('\\')
+    }) else {
         return not_found("not an artifact");
     };
 
@@ -761,6 +805,33 @@ pub(crate) async fn files_get(
     // download: gate on GET so a bodiless probe never inflates the count.
     let dl_key = (method == Method::GET && sidecar::is_artifact(&filename))
         .then(|| format!("{pkg}/{filename}"));
+
+    // The artifact these bytes belong to: a companion request annotates the file
+    // its suffix names, a bare artifact request is its own. Computed before the
+    // companion exits because the byte gate below covers all three.
+    let artifact_filename = filename
+        .strip_suffix(METADATA_SUFFIX)
+        .or_else(|| filename.strip_suffix(PROVENANCE_SUFFIX))
+        .unwrap_or(&filename);
+
+    // Malware byte gate: the enforcement chokepoint, above every exit — the two
+    // companion branches below, the presign/stream split (so a cached signed URL
+    // is gated too), and the teed fill, whose first byte is emitted after this
+    // returns. A blocked artifact's `.metadata`/`.provenance` describe the
+    // blocked file and are refused with it; a `Range` request on the same URL
+    // always was. Origin is judged on the write home. A no-op unless blocking is
+    // armed and a snapshot is fed: the common path is a zero-I/O hash probe, so
+    // sitting this high costs the hot path nothing.
+    if let Some(resp) = advisory_byte_gate(
+        &state,
+        write_pinned.storage.as_ref(),
+        &pkg,
+        artifact_filename,
+    )
+    .await
+    {
+        return resp;
+    }
 
     // PEP 658 metadata and PEP 740 provenance companions are immutable, tiny,
     // and hammered by resolvers (uv fetches one per candidate wheel) — served
@@ -790,14 +861,9 @@ pub(crate) async fn files_get(
         .await;
     }
 
-    // Past the companion exits: this is a real artifact request. Its storage key
-    // and the artifact it resolves to (identical here, since a bare artifact has
-    // no companion suffix to strip) are only needed on this path.
+    // Past the companion exits: this is a real artifact request, so its storage
+    // key and the artifact it resolves to are the same key. Only needed here.
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
-    let artifact_filename = filename
-        .strip_suffix(METADATA_SUFFIX)
-        .or_else(|| filename.strip_suffix(PROVENANCE_SUFFIX))
-        .unwrap_or(&filename);
     let artifact_key = format!("{PACKAGES_PREFIX}{pkg}/{artifact_filename}");
 
     // On-demand mirroring: make sure the artifact is in storage before the
@@ -838,20 +904,6 @@ pub(crate) async fn files_get(
         }
         ProxyEnsure::Stream(fill) => Some(fill),
     };
-    // Malware byte gate: the enforcement chokepoint, before the presign/stream
-    // split so a cached signed URL is gated too — and, for a teed fill, before
-    // the first byte of the body leaves. Origin is judged on the write home. A
-    // no-op unless blocking is armed and a snapshot is fed.
-    if let Some(resp) = advisory_byte_gate(
-        &state,
-        write_pinned.storage.as_ref(),
-        &pkg,
-        artifact_filename,
-    )
-    .await
-    {
-        return resp;
-    }
     match file_visible_read_through(&state, &pins, &pkg, &artifact_key).await {
         Ok(true) => {}
         Ok(false) => return not_found("artifact is fenced"),
@@ -960,12 +1012,7 @@ pub(crate) async fn files_get(
     // an `Ok` response — or any other non-2xx must never inherit the immutable
     // cache-control, or a shared cache would pin that error against the artifact
     // URL and serve it to every later reader (cache poisoning).
-    if resp.status().is_success() {
-        resp.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static(ARTIFACT_CACHE_CONTROL),
-        );
-    }
+    stamp_artifact_cache(&state, &mut resp);
     resp
 }
 
@@ -1092,14 +1139,15 @@ fn tee_response(
             state.metrics.record_download();
         }) as Box<dyn FnOnce() + Send>
     });
-    Response::builder()
+    let mut resp = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_LENGTH, size)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CACHE_CONTROL, ARTIFACT_CACHE_CONTROL)
         .body(fill.into_body(counted))
-        .unwrap_or_else(not_found)
+        .unwrap_or_else(not_found);
+    stamp_artifact_cache(state, &mut resp);
+    resp
 }
 
 /// Proxy hook for artifact downloads: fetch-and-commit on a local miss.
@@ -1207,15 +1255,14 @@ async fn proxy_companion_passthrough(
         Ok(false) => return Some(not_found("artifact is fenced")),
         Err(error) => return Some(read_error(error)),
     }
-    Some(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, companion.content_type())
-            .header(header::CACHE_CONTROL, ARTIFACT_CACHE_CONTROL)
-            .header(header::CONTENT_LENGTH, bytes.len())
-            .body(Body::from(bytes))
-            .unwrap_or_else(not_found),
-    )
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, companion.content_type())
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(Body::from(bytes))
+        .unwrap_or_else(not_found);
+    stamp_artifact_cache(state, &mut resp);
+    Some(resp)
 }
 
 fn found_redirect(url: &str) -> Response<Body> {

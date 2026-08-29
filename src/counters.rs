@@ -90,6 +90,30 @@ pub const SEG_PREFIX: &str = "_counters/seg/";
 /// (or hostile) keys can never grow a node's memory without bound.
 pub(crate) const OVERFLOW_KEY: &str = "_overflow";
 
+/// Longest `(metric, key)` pair the buffer keeps verbatim. [`Config::max_keys`]
+/// bounds how *many* keys are held, not how many bytes each one weighs, and a
+/// download key is `<pkg>/<filename>` straight off the request path. Without a
+/// byte bound the caller picks the memory behind the entry count. Past the cap
+/// the event still counts, against [`OVERFLOW_KEY`]; only the name is refused,
+/// the same trade the entry cap makes.
+///
+/// 1024 clears the longest download a request can legally make: package ≤ 256
+/// bytes ([`crate::names::is_normalized`]) + `/` + filename ≤ 256
+/// ([`crate::names::MAX_ARTIFACT_FILENAME_BYTES`]) + the `"downloads"` metric = 522.
+/// At 512 that maximum-length-but-legal download counted as `_overflow`
+/// instead of itself. So this now fires only on input built to be long.
+const MAX_KEY_BYTES: usize = 1024;
+
+/// The key an event is buffered under: `key` itself, or [`OVERFLOW_KEY`] when
+/// the pair is too long to retain verbatim.
+fn bounded_key<'a>(metric: &str, key: &'a str) -> &'a str {
+    if metric.len() + key.len() > MAX_KEY_BYTES {
+        OVERFLOW_KEY
+    } else {
+        key
+    }
+}
+
 /// Storage *operations* one [`Counters::flush`] may spend verifying keys. The
 /// in-memory cap bounds a node's memory; this bounds the I/O the gate below it
 /// can be made to do, so a flood of distinct keys costs a constant number of
@@ -479,6 +503,10 @@ impl Counters {
         if self.store.is_none() || n == 0 {
             return;
         }
+        // Bound the key's length before it is ever allocated, so an over-long
+        // name aggregates instead of being retained. Defense in depth behind the
+        // request path's own length checks.
+        let key = bounded_key(metric, key);
         let now = OffsetDateTime::now_utc();
         let (day, bucket) = day_and_bucket(now, self.cfg.resolution_secs);
         let shard = shard_of(key);
@@ -1667,6 +1695,45 @@ mod tests {
             .values()
             .any(|bm| bm.values().any(|leaf| leaf.contains_key(OVERFLOW_KEY)));
         assert!(has_overflow);
+    }
+
+    #[test]
+    fn bounded_key_folds_only_over_long_names() {
+        let real = "requests/requests-2.31.0-py3-none-any.whl";
+        assert_eq!(bounded_key("downloads", real), real);
+
+        // The longest pair the download path can actually produce — a 256-byte
+        // filename (its cap there) under a long name — must still be kept.
+        let plausible = format!("{}/{}", "a".repeat(64), "b".repeat(256));
+        assert_eq!(bounded_key("downloads", &plausible), plausible);
+
+        let huge = format!("{}/{}", "a".repeat(4096), "b".repeat(256));
+        assert_eq!(
+            bounded_key("downloads", &huge),
+            OVERFLOW_KEY,
+            "an over-long key aggregates instead of being retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_long_keys_never_reach_the_buffer() {
+        let store = MemStore::default();
+        let c = engine(store, Config::default());
+        let huge = format!("{}/x.whl", "a".repeat(8192));
+        c.record("downloads", &huge);
+
+        let guard = c.pending.lock().unwrap();
+        let keys: Vec<&String> = guard
+            .segs
+            .values()
+            .flat_map(|bm| bm.values())
+            .flat_map(|leaf| leaf.keys())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![OVERFLOW_KEY],
+            "the event counts, but the hostile name is never allocated"
+        );
     }
 
     #[tokio::test]

@@ -73,6 +73,19 @@ pub fn parse(bytes: &[u8], artifact_sha256: &str) -> Option<Provenance> {
     })
 }
 
+/// [`parse`] on the blocking pool. Attestation verification is CPU-bound — a
+/// cert chain walk, an SCT check and two ECDSA verifies per attestation — and it
+/// runs on a *cold* project-page request, which has claimed no cache entry yet,
+/// so concurrent first hits would each grind through it on the request future.
+/// Every other CPU-heavy path here (advisory feeds, wheel metadata) is offloaded
+/// the same way. A panicked or cancelled task yields `None`, like any other miss.
+pub async fn parse_offloaded(bytes: Vec<u8>, artifact_sha256: String) -> Option<Provenance> {
+    tokio::task::spawn_blocking(move || parse(&bytes, &artifact_sha256))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Parse provenance JSON bytes, returning the first bundle's publisher if one
 /// with a non-empty `kind` is present.
 pub fn parse_publisher(bytes: &[u8]) -> Option<Publisher> {
@@ -146,12 +159,17 @@ fn attestation_subject_sha256s(att: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A trimmed, non-empty string field of `v` with ASCII control characters
+/// removed. Every [`Publisher`] field flows through here, and each is rendered
+/// into the *cached* project page — which carries a U+0001 base-URL sentinel the
+/// serve path re-expands on every hit. Upstream-controlled provenance text that
+/// smuggled the sentinel would turn each serve into a memory-amplifying rewrite
+/// outside the page cache's size cap, the same hole
+/// [`crate::coremeta::strip_control_chars`] closes for uploaded metadata.
 fn get_str(v: &Value, key: &str) -> Option<String> {
-    v.get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    let s = crate::coremeta::strip_control_chars(v.get(key)?.as_str()?);
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 #[cfg(test)]
@@ -187,6 +205,56 @@ mod tests {
         let p = parse_publisher(json).unwrap();
         assert_eq!(p.kind, "pytest");
         assert_eq!(p.repository, None);
+    }
+
+    #[test]
+    fn publisher_fields_drop_control_characters() {
+        // The cached project page carries a control-character base-URL sentinel
+        // that the serve path re-expands on every hit. Upstream provenance text
+        // must not be able to plant it (or any other control byte) in the page.
+        let sentinel = crate::project_cache::BASE_URL_SENTINEL;
+        let json = serde_json::to_vec(&serde_json::json!({
+            "attestation_bundles": [{"publisher": {
+                "kind": format!("Git{sentinel}Hub"),
+                "repository": format!("o{sentinel}/r"),
+                "claims": {
+                    "workflow": format!("rel{sentinel}.yml"),
+                    "environment": format!("{sentinel}pypi"),
+                },
+            }}],
+        }))
+        .unwrap();
+        let p = parse_publisher(&json).unwrap();
+        for field in [
+            Some(p.kind.clone()),
+            p.repository.clone(),
+            p.workflow.clone(),
+            p.environment.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                !field.contains(char::is_control) && !field.contains(sentinel),
+                "control bytes survived into publisher field {field:?}"
+            );
+        }
+        assert!(p.kind.starts_with("Git") && p.kind.ends_with("Hub"));
+
+        // A field that is nothing but control bytes empties out → absent, and a
+        // `kind` that empties out makes the whole publisher unusable.
+        let only_control = String::from_utf8(vec![1, 2, 3]).unwrap();
+        let blank = serde_json::to_vec(&serde_json::json!({
+            "attestation_bundles": [{"publisher":
+                {"kind": "GitHub", "repository": only_control.clone()}}],
+        }))
+        .unwrap();
+        assert_eq!(parse_publisher(&blank).unwrap().repository, None);
+        let no_kind = serde_json::to_vec(&serde_json::json!({
+            "attestation_bundles": [{"publisher": {"kind": only_control}}],
+        }))
+        .unwrap();
+        assert_eq!(parse_publisher(&no_kind), None);
     }
 
     #[test]

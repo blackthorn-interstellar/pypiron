@@ -342,7 +342,10 @@ pub(crate) async fn advisories_feed_get(
     let snap = state.advisory_snapshot();
     if snap.storage_etag.as_deref() == Some(storage_etag.as_str()) {
         if let (Some(sha), Some(zip)) = (&snap.zip_sha256, &snap.zip) {
-            return serve_advisory_bytes(&method, &headers, &format!("\"{sha}\""), zip);
+            // Refcount bump, not a 32 MB copy: the snapshot's buffer *is* the
+            // response body. See [`ArcZip`].
+            let body = bytes::Bytes::from_owner(ArcZip(zip.clone()));
+            return serve_advisory_bytes(&method, &headers, &format!("\"{sha}\""), body);
         }
     }
     // Slow path: storage moved under us (or this node hasn't loaded it) — read the
@@ -353,17 +356,35 @@ pub(crate) async fn advisories_feed_get(
         Err(e) => return read_error(e),
     };
     let etag = format!("\"{}\"", crate::hash::sha256_hex(&bytes));
-    serve_advisory_bytes(&method, &headers, &etag, &bytes)
+    // This path genuinely produced a fresh `Vec`; hand it over rather than copy it.
+    serve_advisory_bytes(&method, &headers, &etag, bytes::Bytes::from(bytes))
+}
+
+/// Backs a `Bytes` with the snapshot's `Arc<Vec<u8>>` so the two share one
+/// buffer. `Bytes::from_owner` wants `AsRef<[u8]>`, and `Arc<T>`'s only `AsRef`
+/// is to `T` itself — hence the newtype rather than a direct handoff.
+struct ArcZip(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for ArcZip {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 /// Build the advisory-feed response: 304 on a matching `If-None-Match`, headers
 /// only for HEAD, else the full zip body. Shared by the fast (in-memory) and slow
 /// (read-through) paths so both negotiate identically.
+///
+/// Takes `Bytes`, not `&[u8]`: the feed is ~32 MB (ceiling
+/// [`advisories::MAX_FEED_BYTES`]) and this route is reader-gated, which is
+/// open by default. Copying the body per request let one cheap request cost the
+/// server tens of megabytes of heap; a `Bytes` clone off the loaded snapshot
+/// costs an increment.
 fn serve_advisory_bytes(
     method: &Method,
     headers: &HeaderMap,
     etag: &str,
-    bytes: &[u8],
+    bytes: bytes::Bytes,
 ) -> Response<Body> {
     let revalidated = if_none_match(headers, &[etag]);
     let builder = Response::builder().header(header::ETAG, etag);
@@ -378,7 +399,7 @@ fn serve_advisory_bytes(
         if method == Method::HEAD {
             builder.body(Body::empty())
         } else {
-            builder.body(Body::from(bytes.to_vec()))
+            builder.body(Body::from(bytes))
         }
     };
     response.unwrap_or_else(not_found)

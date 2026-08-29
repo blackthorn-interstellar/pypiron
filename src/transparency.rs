@@ -490,6 +490,21 @@ pub(crate) fn check_integrity(links: &[(u64, Vec<u8>, ChainLink)]) -> Vec<Violat
                     detail: format!("lowest link seq {seq} must have an empty prev-sha256"),
                 });
             }
+            // Nothing prunes or compacts the chain prefix, so seq 0 is always
+            // expected to exist. Without this, deleting links 0..N and blanking
+            // link N+1's prev-sha256 forges a shorter history that verifies
+            // clean — the whole deleted prefix disappears unremarked.
+            if *seq != 0 {
+                violations.push(Violation {
+                    kind: "bad-genesis",
+                    package: String::new(),
+                    detail: format!(
+                        "chain starts at seq {seq}, not 0: links 0..{} are missing and the \
+                         chain cannot be replayed from its genesis",
+                        seq - 1
+                    ),
+                });
+            }
         } else {
             let (prev_seq, prev_bytes, _) = &links[i - 1];
             if *seq != prev_seq + 1 {
@@ -1633,6 +1648,28 @@ mod tests {
         assert_eq!(c.filename, "six-1.whl");
         assert_eq!(c.old_sha, "aaaa");
         assert_eq!(c.new_sha, "cccc");
+    }
+
+    #[test]
+    fn integrity_catches_a_front_truncated_chain() {
+        // Forge a shorter history: delete links 0..=1 and blank link 2's
+        // prev-sha256 so it looks like a genesis. Nothing prunes the chain, so
+        // a lowest seq other than 0 is a deletion, not a compaction.
+        let forged = link(2, "", Delta::new());
+        let bytes = link_bytes(&forged).unwrap();
+        let kinds: Vec<&str> = check_integrity(&[(2, bytes, forged)])
+            .iter()
+            .map(|v| v.kind)
+            .collect();
+        assert!(
+            kinds.contains(&"bad-genesis"),
+            "a chain that does not start at seq 0 must fault: {kinds:?}"
+        );
+
+        // A genuine genesis at seq 0 stays clean.
+        let real = link(0, "", Delta::new());
+        let real_bytes = link_bytes(&real).unwrap();
+        assert!(check_integrity(&[(0, real_bytes, real)]).is_empty());
     }
 
     #[test]

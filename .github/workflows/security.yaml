@@ -449,10 +449,20 @@ jobs:
     name: sca+sast (snyk)
     # No SNYK_TOKEN secret exists on this repo yet, so today this job schedules,
     # prints one line, and goes green. A job-level `if` cannot read secrets
-    # (GitHub context rule), so the gate is a step-level `env.SNYK_TOKEN != ''`
-    # on every step that would need the token — an unset token skips them all
-    # rather than failing them. Fork PRs get the same treatment for free: secrets
-    # are not exposed to them, so the job self-skips instead of erroring.
+    # (GitHub context rule), so the gate is SNYK_CONFIGURED — a job-level
+    # boolean probe, never the token itself — that every step reads back out of
+    # `env`; an unset token skips them all rather than failing them. Fork PRs
+    # get the same treatment for free: secrets are not exposed to them, so the
+    # job self-skips instead of erroring. nightly-deps uses the same probe for
+    # XAI_API_KEY.
+    #
+    # The token is step-level `env` on the two steps that invoke `snyk` and
+    # nowhere else. The step that builds the Python closure runs `uv pip
+    # install` over the whole locked transitive closure — build backends and
+    # package entry points from third-party wheels, executing on this VM — and
+    # a job-level token would be sitting in that process's environment. Same
+    # rule the nightly-deps lane is built around: untrusted code and a
+    # credential never share a scope.
     #
     # Add the secret and it becomes a hard gate like every other job here: snyk
     # exits 1 on findings and 2/3 on tool errors, and all of those fail the job.
@@ -469,13 +479,13 @@ jobs:
       contents: read
       security-events: write
     env:
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      SNYK_CONFIGURED: ${{ secrets.SNYK_TOKEN != '' }}
     steps:
       - name: Skip when unconfigured
-        if: env.SNYK_TOKEN == ''
+        if: env.SNYK_CONFIGURED != 'true'
         run: echo "SNYK_TOKEN not set — skipping (add the repo secret to enable free-tier Snyk)"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: env.SNYK_TOKEN != ''
+        if: env.SNYK_CONFIGURED == 'true'
         with:
           persist-credentials: false
       # Upstream's README still says @master everywhere and its tags lag, but
@@ -483,7 +493,7 @@ jobs:
       # .circleci/config.yml and CODEOWNERS. Pin the tag: it resolves, so zizmor
       # can verify it.
       - uses: snyk/actions/setup@9adf32b1121593767fc3c057af55b55db032dc04 # v1.0.0
-        if: env.SNYK_TOKEN != ''
+        if: env.SNYK_CONFIGURED == 'true'
         with:
           # `latest` (the default) is a different binary downloaded into CI
           # every run with no commit here. Findings still move on their own —
@@ -492,7 +502,7 @@ jobs:
           # `v` required: the action builds the download URL from it verbatim.
           snyk-version: v1.1307.0
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-        if: env.SNYK_TOKEN != ''
+        if: env.SNYK_CONFIGURED == 'true'
         with:
           version: 0.12.6
           enable-cache: false
@@ -534,7 +544,7 @@ jobs:
       # code test` below scans the working tree: a venv of third-party sources
       # sitting in it would be analyzed as if it were this repo's code.
       - name: Build the Python closure for snyk to inspect
-        if: env.SNYK_TOKEN != ''
+        if: env.SNYK_CONFIGURED == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -551,7 +561,9 @@ jobs:
       # while the repo is private and there is nowhere to upload SARIF, the
       # findings are already in the job log and the exit code already gates.
       - name: Snyk Open Source (Python closure)
-        if: env.SNYK_TOKEN != ''
+        if: env.SNYK_CONFIGURED == 'true'
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -563,7 +575,9 @@ jobs:
       # has no Rust analyzer, so this covers the blackbox suite, dev/scripts and
       # examples/; CodeQL and semgrep are what read the crate.
       - name: Snyk Code (SAST)
-        if: always() && env.SNYK_TOKEN != ''
+        if: always() && env.SNYK_CONFIGURED == 'true'
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -572,13 +586,13 @@ jobs:
       # repo public, and fork PRs carry a read-only token that cannot write
       # security events. The scans above still gate in both cases.
       - name: Upload Snyk OSS SARIF
-        if: ${{ always() && env.SNYK_TOKEN != '' && !github.event.repository.private && hashFiles('snyk-oss.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        if: ${{ always() && env.SNYK_CONFIGURED == 'true' && !github.event.repository.private && hashFiles('snyk-oss.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         uses: github/codeql-action/upload-sarif@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
         with:
           sarif_file: snyk-oss.sarif
           category: snyk-oss
       - name: Upload Snyk Code SARIF
-        if: ${{ always() && env.SNYK_TOKEN != '' && !github.event.repository.private && hashFiles('snyk-code.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        if: ${{ always() && env.SNYK_CONFIGURED == 'true' && !github.event.repository.private && hashFiles('snyk-code.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         uses: github/codeql-action/upload-sarif@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
         with:
           sarif_file: snyk-code.sarif

@@ -41,6 +41,10 @@ declare -A CFG=(
 CORES="$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$RIG_KEY" \
   "ec2-user@${RIG2_SERVER_IP}" nproc 2>/dev/null | tr -d '[:space:]')"
 CORES="${CORES:-2}"
+# `$(( ))` evaluates what it is given, so remote output reaches the controller as
+# an expression, not a number: whatever the far end (or a MITM'd hop) answered
+# has to be digits before it is arithmetic.
+[[ "$CORES" =~ ^[0-9]+$ ]] || CORES=2
 SAT="$(( CORES * 95 ))"
 
 servers=("$@")

@@ -717,6 +717,10 @@ pub async fn run_worker_until(
     // the loop's critical path (a full 30 MB refetch must not head-of-line-block
     // index/marker work), so the memo is shared and an in-flight flag prevents
     // overlap.
+    //
+    // This flag gates the OSV zip feed half of that tick and nothing else. The
+    // tick itself runs either way: the PEP 792 quarantined-set reload is not the
+    // feed's to gate (see the call site below).
     let advisory_enabled = state.advisory_feed.is_some() || state.malware_block;
     let mut last_advisory_refresh: Option<Instant> = None;
     let advisory_memo = Arc::new(tokio::sync::Mutex::new(
@@ -833,39 +837,45 @@ pub async fn run_worker_until(
         // refetch never stalls the tick; the in-flight flag serializes runs and
         // the asap flag is consumed only once a run actually starts. Never
         // disarmed by a bucket switch — the snapshot is global truth-cache.
-        if advisory_enabled {
-            let forced = state.advisory_reload_asap.load(Ordering::SeqCst);
-            let due = forced
-                || last_advisory_refresh.is_none_or(|t| t.elapsed() >= state.reconcile_interval);
-            if due && !advisory_running.swap(true, Ordering::SeqCst) {
-                last_advisory_refresh = Some(Instant::now());
-                if forced {
-                    state.advisory_reload_asap.store(false, Ordering::SeqCst);
-                }
-                let job_state = state.clone();
-                let pinned = selected.clone();
-                let memo = advisory_memo.clone();
-                let guard = SweepGuard(advisory_running.clone());
-                let leader = is_leader;
-                tokio::spawn(async move {
-                    let _guard = guard;
-                    let mut memo = memo.lock().await;
-                    // Peers the leader-authored control singletons replicate onto.
-                    let replicas = job_state.singleton_replicas(pinned.index);
-                    crate::advisories::refresh(
-                        crate::advisories::RefreshCtx {
-                            storage: pinned.storage.as_ref(),
-                            slot: &job_state.advisories,
-                            metrics: &job_state.metrics,
-                            replicas: &replicas,
-                        },
-                        job_state.advisory_feed.as_deref(),
-                        leader,
-                        &mut memo,
-                    )
-                    .await;
-                });
+        //
+        // The tick itself is UNGATED: `advisory_enabled` gates the OSV zip feed
+        // inside `refresh`, not the PEP 792 quarantined-set reload, which is
+        // enforced independently of `--malware-block`. Gating the whole tick is
+        // what left followers holding an empty quarantine set forever whenever
+        // the feed was off. With the feed off the tick costs one 1-key LIST per
+        // reconcile interval and no fetch.
+        let advisory_forced = state.advisory_reload_asap.load(Ordering::SeqCst);
+        let advisory_due = advisory_forced
+            || last_advisory_refresh.is_none_or(|t| t.elapsed() >= state.reconcile_interval);
+        if advisory_due && !advisory_running.swap(true, Ordering::SeqCst) {
+            last_advisory_refresh = Some(Instant::now());
+            if advisory_forced {
+                state.advisory_reload_asap.store(false, Ordering::SeqCst);
             }
+            let job_state = state.clone();
+            let pinned = selected.clone();
+            let memo = advisory_memo.clone();
+            let guard = SweepGuard(advisory_running.clone());
+            let leader = is_leader;
+            tokio::spawn(async move {
+                let _guard = guard;
+                let mut memo = memo.lock().await;
+                // Peers the leader-authored control singletons replicate onto.
+                let replicas = job_state.singleton_replicas(pinned.index);
+                crate::advisories::refresh(
+                    crate::advisories::RefreshCtx {
+                        storage: pinned.storage.as_ref(),
+                        slot: &job_state.advisories,
+                        metrics: &job_state.metrics,
+                        replicas: &replicas,
+                    },
+                    job_state.advisory_feed.as_deref(),
+                    advisory_enabled,
+                    leader,
+                    &mut memo,
+                )
+                .await;
+            });
         }
 
         // Malware probe tick (EVERY node): poll OSV's per-advisory feed to block a
@@ -2917,11 +2927,12 @@ pub struct GlobalNames {
     /// winner never re-checked the pair, and a peer that crashed between its
     /// two writes left this node serving an HTML the JSON did not back.
     html_current: bool,
-    /// An HTML view exists but the canonical JSON does not — a crash landed
-    /// between the two writes. The name set below was derived from the
+    /// The canonical JSON did not yield a name set: either it is absent while an
+    /// HTML view exists (a crash landed between the two writes), or it is present
+    /// but does not parse. Either way the name set below was derived from the
     /// per-package views rather than read from the JSON, so a delta that dedups
-    /// against it proves nothing: the JSON is still missing and no `changed`
-    /// will ever be computed to create it. Such a cache must write once
+    /// against it proves nothing: the authority is still unwritten and no
+    /// `changed` will ever be computed to create it. Such a cache must write once
     /// regardless, which materializes the authority and clears this.
     stranded: bool,
 }
@@ -3366,10 +3377,11 @@ pub(crate) async fn update_global_index_uncached(
         }
         let mut packages: Vec<String> = names.into_iter().collect();
         packages.sort();
-        // A stranded load (HTML published, canonical JSON absent) derived its names
-        // from the per-package views, so a delta that dedups against them is not a
-        // no-op: the JSON still has to be materialized. Same rule the cached path
-        // states — without it the HTML serves a set no canonical index backs.
+        // A stranded load (canonical JSON absent under a published HTML, or
+        // present but unparseable) derived its names from the per-package views,
+        // so a delta that dedups against them is not a no-op: the JSON still has
+        // to be materialized. Same rule the cached path states — without it the
+        // HTML serves a set no canonical index backs.
         if !changed && !stranded {
             // Every call here loads fresh, so it knows the JSON and nothing about
             // the HTML — same hazard as the cached path (a crash between the two
@@ -3522,7 +3534,28 @@ async fn load_global_names(storage: &dyn Storage) -> Result<GlobalNames> {
     }
     let names = match serde_json::from_slice::<Global>(&bytes) {
         Ok(g) => g.projects.into_iter().map(|p| p.name).collect(),
-        Err(_) => HashSet::new(),
+        // A canonical JSON that does not parse is no more an empty name set than
+        // an absent one is. Returning nothing while keeping the live ETag is
+        // worse than either: the next delta's `put_if_match` WINS and publishes a
+        // global index holding only that delta, silently truncating the package
+        // list. Take the same repair the absent-body branch above takes — derive
+        // from the per-package views the audit trusts — and mark the load
+        // stranded so the pair is republished even when the delta dedups.
+        Err(e) => {
+            warn!(
+                error = %e,
+                key = %key,
+                "global index JSON did not parse; deriving the name set from the per-package views"
+            );
+            let names = derive_global_names(storage).await?;
+            return Ok(GlobalNames {
+                etag,
+                names,
+                html_etag,
+                html_current: false,
+                stranded: true,
+            });
+        }
     };
     Ok(GlobalNames {
         etag,

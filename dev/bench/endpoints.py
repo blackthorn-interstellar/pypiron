@@ -394,8 +394,13 @@ ENDPOINTS: list = [
         expect=(200, 201, 204),
         mutates=True,
         target="global",
-        cold_ops={"write": 1, "list": 1},
-        warm_ops={"write": 1, "list": 1},
+        # Two LISTs, not one: the write nudges the worker's advisory tick, which
+        # checks the feed etag *and* the PEP 792 quarantined-set etag. The
+        # quarantined reload used to be gated behind the feed toggle, which left
+        # followers holding an empty quarantine set forever whenever the feed was
+        # off; it now runs every tick, and this second 1-key LIST is its cost.
+        cold_ops={"write": 1, "list": 2},
+        warm_ops={"write": 1, "list": 2},
         bytes_range=(0, 100),
     ),
     _e(

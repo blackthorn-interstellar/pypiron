@@ -171,15 +171,13 @@ Without a bucket the reporter still records findings to a local fallback file.
   `/opt/pypiron-soak`, so that tree is never `chown`ed to the unprivileged `soak`
   user — otherwise a soak-account compromise could overwrite those scripts and
   win root on the next refresh. The soak-run units only read+exec the tree; their
-  one local write is `report.py`'s `/var/tmp` fallback. Rollout caveat: on a box
-  already running from before this change, the transition pull is still driven by
-  the **old `fetch-bundle.sh` on disk**, which `chown -R soak`s the tree *after*
-  extracting — so that first new-bundle pull re-soak-owns even the freshly
-  extracted files. Ownership normalizes only on the **second** distinct bundle
-  pull (a new ETag, now handled by the new `fetch-bundle.sh` extracting
-  `--no-same-owner` with no chown), or **immediately** via a fresh
-  `./fleet.sh apply` / instance replacement, whose cloud-init also extracts
-  `--no-same-owner`.
+  one local write is `report.py`'s `/var/tmp` fallback. Two things keep it that
+  way, so no rollout leaves a window: `fetch-bundle.sh` extracts
+  `--no-same-owner`, and `install.sh` — the one step every path into a new bundle
+  runs, including a pull still driven by an **old `fetch-bundle.sh` on disk**
+  that chowns the tree to `soak` before calling it — reasserts
+  `chown -R root:root` on the way past. The first pull normalizes ownership; so
+  does a fresh `./fleet.sh apply` or instance replacement.
 - The autonomous fixer **cannot weaken an invariant**: the verify gate rejects
   any diff that loosens the checker and commits only a src/ fix that three
   independent checks agree is a genuine cure. Doubt escalates to a human.

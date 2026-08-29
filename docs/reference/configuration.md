@@ -471,8 +471,9 @@ directly.
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
 | `--from URL` | `PYPIRON_SYNC_FROM` | `https://pypi.org` | Source simple index. Name it in full when it lives off the standard `/simple` path (devpi: `.../<user>/<index>/+simple`). |
-| `--source-user USER` | `PYPIRON_SYNC_SOURCE_USER` | none | Username for an authenticated source (private devpi/Artifactory/Nexus). Sent only to the source host — never on an off-host redirect. Requires `--source-pass`; also `[sync].source-user`. |
+| `--source-user USER` | `PYPIRON_SYNC_SOURCE_USER` | none | Username for an authenticated source (private devpi/Artifactory/Nexus). Sent only to the source itself — same scheme, host and port — never to a redirect that goes anywhere else. Requires `--source-pass`; also `[sync].source-user`. |
 | `--source-pass PASS` | `PYPIRON_SYNC_SOURCE_PASS` | none | Password for an authenticated source. Requires `--source-user`; also `[sync].source-pass`. |
+| `--allow-insecure-source` | `PYPIRON_ALLOW_INSECURE_SOURCE` | `false` | Permit `--source-user`/`--source-pass` against a plaintext `http://` source. Off by default: over http the credential goes out in the clear, and a MITM who takes it controls both the artifact bytes and the sha256 they are verified against. A plaintext source with no credentials needs nothing. |
 | `--upstream-ca-cert PEM` | `PYPIRON_UPSTREAM_CA_CERT` | none | PEM bundle of extra CA certificates to trust for the **source** TLS — the private root a corporate forwarding TLS proxy (a MITM appliance) presents. Augments the built-in roots; loaded fail-closed at startup. See [Behind a forward proxy](#behind-a-forward-proxy-or-tls-interception). |
 | `--to URL` | `PYPIRON_SYNC_TO` | required | Destination pypiron URL. |
 | `--admin-user USER` | `PYPIRON_SYNC_ADMIN_USER` | none | Destination admin user. |

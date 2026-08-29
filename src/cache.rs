@@ -467,10 +467,28 @@ pub const PRESIGN_CACHE_TTL: Duration = Duration::from_secs(300);
 /// TTL (clients receive expiry minus cache age).
 pub const PRESIGN_EXPIRY: Duration = Duration::from_secs(3600);
 const PRESIGN_CACHE_MAX_ENTRIES: usize = 65_536;
+/// Memory ceiling for the cached URLs, enforced alongside the entry cap —
+/// whichever binds first. The entry cap alone bounds nothing measurable: the
+/// key is `<pkg>/<filename>` off the request path and the signed URL re-encodes
+/// it, so both are variable-length, and the read path populates this cache
+/// without proving the artifact exists. 64 MB is above a full cache of real
+/// entries (a signed URL runs well under 1 KB, so 65,536 of them weigh ~60 MB)
+/// and far below what would threaten the process, so it only ever fires on
+/// entries built to be big.
+const PRESIGN_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bytes one presign entry charges against the ceiling: its key, its URL, and
+/// the same fixed per-entry overhead the index cache charges for the map slot.
+fn presign_weight(key: &str, url: &str) -> usize {
+    ENTRY_OVERHEAD_BYTES + key.len() + url.len()
+}
 
 #[derive(Default)]
 struct PresignEntries {
     map: HashMap<String, (Arc<str>, Instant)>,
+    /// What the retained keys and URLs weigh, maintained per mutation the way
+    /// [`Entries::body_bytes`] is, so enforcing the ceiling never walks the map.
+    weight: usize,
     /// Selection generation these URLs were signed against (design §3); see
     /// [`Entries::generation`]. A switch clears them so a URL into the old
     /// bucket is never handed out for the new one.
@@ -481,7 +499,44 @@ impl PresignEntries {
     fn reconcile_generation(&mut self, generation: u64) {
         if self.generation != generation {
             self.map.clear();
+            self.weight = 0;
             self.generation = generation;
+        }
+    }
+
+    fn insert(&mut self, key: &str, url: Arc<str>) {
+        if let Some((old, _)) = self.map.get(key) {
+            self.weight -= presign_weight(key, old);
+        }
+        self.weight += presign_weight(key, &url);
+        self.map.insert(key.to_string(), (url, Instant::now()));
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some((url, _)) = self.map.remove(key) {
+            self.weight -= presign_weight(key, &url);
+        }
+    }
+
+    /// Enforce both ceilings the way the index cache enforces its one: drop
+    /// expired entries first, and if the live set alone still exceeds either
+    /// bound, clear outright. Re-signing is local HMAC math, not a storage trip.
+    fn enforce_caps(&mut self, max_entries: usize, max_bytes: usize, ttl: Duration) {
+        if self.map.len() <= max_entries && self.weight <= max_bytes {
+            return;
+        }
+        let mut freed = 0usize;
+        self.map.retain(|key, (url, signed)| {
+            let keep = signed.elapsed() < ttl;
+            if !keep {
+                freed += presign_weight(key, url);
+            }
+            keep
+        });
+        self.weight -= freed;
+        if self.map.len() > max_entries || self.weight > max_bytes {
+            self.map.clear();
+            self.weight = 0;
         }
     }
 }
@@ -509,14 +564,8 @@ impl PresignCache {
     pub fn put(&self, key: &str, url: Arc<str>, generation: u64) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.reconcile_generation(generation);
-        entries.map.insert(key.to_string(), (url, Instant::now()));
-        if entries.map.len() > PRESIGN_CACHE_MAX_ENTRIES {
-            let ttl = self.ttl;
-            entries.map.retain(|_, (_, signed)| signed.elapsed() < ttl);
-            if entries.map.len() > PRESIGN_CACHE_MAX_ENTRIES {
-                entries.map.clear();
-            }
-        }
+        entries.insert(key, url);
+        entries.enforce_caps(PRESIGN_CACHE_MAX_ENTRIES, PRESIGN_CACHE_MAX_BYTES, self.ttl);
     }
 
     /// Deletes must stop handing out the dead URL immediately (same node).
@@ -524,7 +573,6 @@ impl PresignCache {
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .map
             .remove(key);
     }
 }
@@ -719,6 +767,82 @@ mod tests {
         assert!(
             cache.fresh("packages/p/a.whl", 0).is_none(),
             "expired URLs must not be served"
+        );
+    }
+
+    #[test]
+    fn presign_weight_tracks_inserts_replacements_and_removals() {
+        let mut entries = PresignEntries::default();
+        assert_eq!(entries.weight, 0);
+
+        entries.insert("packages/p/a.whl", "https://signed.example/1".into());
+        let one = presign_weight("packages/p/a.whl", "https://signed.example/1");
+        assert_eq!(entries.weight, one);
+
+        // Re-signing the same key replaces rather than accumulates.
+        entries.insert(
+            "packages/p/a.whl",
+            "https://signed.example/much-longer".into(),
+        );
+        assert_eq!(
+            entries.weight,
+            presign_weight("packages/p/a.whl", "https://signed.example/much-longer"),
+            "a replaced entry must not leave its old weight behind"
+        );
+
+        entries.remove("packages/p/a.whl");
+        assert_eq!(entries.weight, 0, "removal returns the cache to empty");
+    }
+
+    #[test]
+    fn presign_byte_ceiling_evicts_where_the_entry_cap_would_not() {
+        let mut entries = PresignEntries::default();
+        // Ten entries, each carrying a kilobyte of caller-chosen URL.
+        let url: Arc<str> = "u".repeat(1024).into();
+        for i in 0..10 {
+            entries.insert(&format!("packages/p/{i}.whl"), url.clone());
+        }
+        assert_eq!(entries.map.len(), 10);
+        assert!(entries.weight > 10 * 1024);
+
+        // A generous entry cap with a byte budget the live set blows past: the
+        // entry cap alone would keep every one of these.
+        entries.enforce_caps(1_000, 4 * 1024, Duration::from_secs(60));
+        assert!(
+            entries.map.is_empty() && entries.weight == 0,
+            "the byte ceiling must evict what the entry cap would retain"
+        );
+
+        // Under both bounds nothing is touched.
+        entries.insert("packages/p/a.whl", "https://signed.example/1".into());
+        let kept = entries.weight;
+        entries.enforce_caps(1_000, 4 * 1024, Duration::from_secs(60));
+        assert_eq!(
+            entries.map.len(),
+            1,
+            "a cache under both bounds is left alone"
+        );
+        assert_eq!(entries.weight, kept);
+    }
+
+    #[tokio::test]
+    async fn presign_expired_entries_are_dropped_before_the_cache_is_cleared() {
+        let mut entries = PresignEntries::default();
+        entries.insert("packages/p/stale.whl", "u".repeat(4096).as_str().into());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        entries.insert("packages/p/live.whl", "https://signed.example/1".into());
+
+        // Over the byte budget, but pruning the expired entry is enough.
+        entries.enforce_caps(1_000, 2 * 1024, Duration::from_millis(10));
+        assert_eq!(
+            entries.map.keys().collect::<Vec<_>>(),
+            vec!["packages/p/live.whl"],
+            "expiry is the first eviction pass; the fresh entry survives"
+        );
+        assert_eq!(
+            entries.weight,
+            presign_weight("packages/p/live.whl", "https://signed.example/1"),
+            "the freed weight is subtracted, not estimated"
         );
     }
 

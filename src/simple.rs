@@ -85,29 +85,73 @@ impl SimpleFile {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(from = "RawIndex")]
 pub struct SimpleIndex {
-    #[serde(default)]
     pub files: Vec<SimpleFile>,
     /// PEP 792 project status, relayed verbatim. We are CONSUMING someone
-    /// else's index here, so an unknown/foreign marker degrades to `None`
-    /// (== active) rather than failing the whole listing — the opposite of our
-    /// own fail-closed [`crate::status::read_status`].
-    #[serde(
-        rename = "project-status",
-        default,
-        deserialize_with = "lenient_status"
-    )]
+    /// else's index here, so an unknown/foreign marker degrades rather than
+    /// failing the whole listing — the opposite of our own fail-closed
+    /// [`crate::status::read_status`]. It degrades to `None`, which therefore
+    /// covers BOTH "no marker" and "a marker we couldn't parse": any caller that
+    /// would *write* the difference must ask [`SimpleIndex::upstream_status`].
     pub project_status: Option<ProjectStatusDoc>,
+    /// Upstream sent a `project-status` we couldn't parse. See [`UpstreamStatus`].
+    project_status_unparseable: bool,
 }
 
-/// Parse the upstream `project-status` object, swallowing anything we don't
-/// recognize (a future fifth marker must not break mirroring the whole index).
-fn lenient_status<'de, D>(de: D) -> Result<Option<ProjectStatusDoc>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Option::<serde_json::Value>::deserialize(de)?;
-    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
+/// The listing exactly as it arrives, before the status is interpreted. Keeping
+/// the raw value is what lets [`SimpleIndex`] tell an unparseable marker from an
+/// absent one; parsing straight into `Option<ProjectStatusDoc>` cannot.
+#[derive(Deserialize)]
+struct RawIndex {
+    #[serde(default)]
+    files: Vec<SimpleFile>,
+    #[serde(rename = "project-status", default)]
+    project_status: Option<serde_json::Value>,
+}
+
+impl From<RawIndex> for SimpleIndex {
+    fn from(raw: RawIndex) -> Self {
+        // Anything we don't recognize is swallowed (a future fifth marker must
+        // not break mirroring the whole index) — but it is remembered, because
+        // "unparseable" read as "active" is fail-open: it would let a garbled or
+        // hostile source clear a freeze the destination is holding.
+        let parsed = raw
+            .project_status
+            .map(|v| serde_json::from_value::<ProjectStatusDoc>(v).ok());
+        SimpleIndex {
+            files: raw.files,
+            project_status_unparseable: parsed.as_ref().is_some_and(Option::is_none),
+            project_status: parsed.flatten(),
+        }
+    }
+}
+
+/// What an upstream listing says about a project's PEP 792 status. Three states,
+/// not two: a `project-status` we could not parse is NOT the same as no marker
+/// at all, and a mirror that collapses the two clears a destination freeze on the
+/// strength of upstream garbage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamStatus {
+    /// No marker at all. PEP 792 omits it for active, so this means active.
+    Absent,
+    /// A marker we understood.
+    Known(ProjectStatusDoc),
+    /// A marker we could not parse — a future status, or garbage. No verdict:
+    /// we can't tell a freeze from an active project, so nothing may be relayed.
+    Unparseable,
+}
+
+impl SimpleIndex {
+    /// The upstream verdict with "unparseable" kept distinct from "absent", for
+    /// callers that would otherwise act on the difference.
+    pub fn upstream_status(&self) -> UpstreamStatus {
+        match (&self.project_status, self.project_status_unparseable) {
+            (Some(doc), _) => UpstreamStatus::Known(doc.clone()),
+            (None, true) => UpstreamStatus::Unparseable,
+            (None, false) => UpstreamStatus::Absent,
+        }
+    }
 }
 
 /// Outcome of a conditional listing fetch (see [`fetch_index_conditional`]).
@@ -363,22 +407,33 @@ mod tests {
             "project-status": {"status": "archived", "reason": "moved"}
         }))
         .unwrap();
-        let doc = archived.project_status.unwrap();
+        let doc = archived.project_status.clone().unwrap();
         assert_eq!(doc.status, ProjectStatus::Archived);
         assert_eq!(doc.reason.as_deref(), Some("moved"));
+
+        assert_eq!(archived.upstream_status(), UpstreamStatus::Known(doc));
 
         // Absent → None (== active).
         let plain: SimpleIndex =
             serde_json::from_value(serde_json::json!({ "files": [] })).unwrap();
         assert!(plain.project_status.is_none());
+        assert_eq!(plain.upstream_status(), UpstreamStatus::Absent);
 
-        // An unknown/foreign marker must NOT fail the whole listing.
-        let future: SimpleIndex = serde_json::from_value(serde_json::json!({
-            "files": [],
-            "project-status": {"status": "hexed"}
-        }))
-        .unwrap();
-        assert!(future.project_status.is_none());
+        // An unknown/foreign marker must NOT fail the whole listing — but it is
+        // NOT "absent" either, or relaying it would clear a destination freeze.
+        for garbage in [
+            serde_json::json!({"status": "hexed"}),
+            serde_json::json!("archived"),
+            serde_json::json!({}),
+        ] {
+            let future: SimpleIndex = serde_json::from_value(serde_json::json!({
+                "files": [],
+                "project-status": garbage
+            }))
+            .unwrap();
+            assert!(future.project_status.is_none());
+            assert_eq!(future.upstream_status(), UpstreamStatus::Unparseable);
+        }
     }
 
     #[test]

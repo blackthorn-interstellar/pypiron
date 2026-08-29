@@ -55,3 +55,40 @@ def test_render_notes_groups_commits_and_links_compare():
         "**Full Changelog**: "
         "https://github.com/blackthorn-interstellar/pypiron/compare/v0.0.12...v0.0.13"
     ) in notes
+
+
+def test_format_commit_escapes_markdown_in_the_subject():
+    """A commit subject reaches the official release body verbatim: no author
+    gets to plant a link or a tracking-pixel image in it."""
+    commit = release_notes.parse_subject(
+        "deadbee",
+        "fix: oops [click me](https://evil.example) <img src=https://evil.example/x.png>",
+    )
+
+    line = release_notes.format_commit(commit, "blackthorn-interstellar/pypiron")
+
+    assert "[click me](https://evil.example)" not in line
+    assert "<img src" not in line.replace("\\<", "<>")
+    assert "\\[click me\\]\\(https://evil.example\\)" in line
+    assert "\\<img src=https://evil.example/x.png\\>" in line
+    # The commit's own link still renders.
+    assert "([deadbee](https://github.com/blackthorn-interstellar/pypiron/commit/deadbee))" in line
+
+
+def test_format_commit_keeps_backticks_as_code_spans():
+    """Commit subjects quote flags and identifiers in backticks constantly. A
+    backtick can only open an inert code span, so escaping it bought nothing and
+    cost every one of those subjects a pair of visible backslashes."""
+    commit = release_notes.parse_subject("deadbee", "fix: rename `--filter` to `--mirror`")
+
+    line = release_notes.format_commit(commit, None)
+
+    assert line == "- rename `--filter` to `--mirror` (deadbee)"
+
+
+def test_format_commit_escapes_a_hostile_scope():
+    commit = release_notes.parse_subject("deadbee", "fix(a](b): tidy up")
+
+    line = release_notes.format_commit(commit, None)
+
+    assert line == "- [a\\]\\(b] tidy up (deadbee)"

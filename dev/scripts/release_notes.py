@@ -31,6 +31,16 @@ _CATEGORY_BY_KIND = {
     "refactor": "Maintenance",
     "test": "Maintenance",
 }
+# A commit subject is authored text that lands verbatim in the official GitHub
+# release body (`gh release create --notes-file`), where Markdown *and* a subset
+# of HTML render. `%s` is single-line and every entry is prefixed with `- `, so a
+# heading or fence can't be forged — but a link or an `<img>` tracking pixel can.
+# Backslash-escaping these renders them literally and leaves the text reading
+# exactly as it was written. The backtick is deliberately NOT escaped: the worst
+# a stray one does is open an inert code span, and escaping it turned every
+# ordinary `fix: rename `--filter` to `--mirror`` into visible backslashes.
+_MD_ESCAPE_RE = re.compile(r"([\\\[\]()<>])")
+
 _CATEGORY_ORDER = [
     "Security",
     "Features",
@@ -145,9 +155,14 @@ def category(commit: Commit) -> str:
     return _CATEGORY_BY_KIND.get(commit.kind, "Other")
 
 
+def escape_markdown(text: str) -> str:
+    return _MD_ESCAPE_RE.sub(r"\\\1", text)
+
+
 def format_commit(commit: Commit, repo: str | None) -> str:
-    scope = f"[{commit.scope}] " if commit.scope else ""
-    message = f"**Breaking:** {commit.message}" if commit.breaking else commit.message
+    scope = f"[{escape_markdown(commit.scope)}] " if commit.scope else ""
+    body = escape_markdown(commit.message)
+    message = f"**Breaking:** {body}" if commit.breaking else body
     if repo:
         link = f"https://github.com/{repo}/commit/{commit.short_hash}"
         return f"- {scope}{message} ([{commit.short_hash}]({link}))"

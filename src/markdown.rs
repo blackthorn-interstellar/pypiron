@@ -10,14 +10,34 @@
 use html_escape::{encode_double_quoted_attribute, encode_text};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-/// Render Markdown to a constrained, safe HTML fragment.
+/// Ceiling on the rendered HTML fragment. A README is upload-controlled and
+/// bounded only by the 16 MiB metadata cap, and markup amplifies: a file of
+/// nothing but `>` blockquotes or `*` emphasis renders several times its own
+/// size. The result lands in the project-page cache, whose overflow policy
+/// clears the *whole* map — so one hostile description must not be able to
+/// evict every other cached page, nor to have N concurrent cold requests each
+/// hold a multi-megabyte render. 2 MiB is far past any real README.
+const MAX_RENDERED_BYTES: usize = 2 * 1024 * 1024;
+
+/// Shown in place of the rest of the document when the render hits
+/// [`MAX_RENDERED_BYTES`] — silent truncation would read as a broken README.
+const TRUNCATION_NOTICE: &str = "<p><em>… description truncated …</em></p>";
+
+/// Render Markdown to a constrained, safe HTML fragment of at most
+/// [`MAX_RENDERED_BYTES`] plus the truncation notice (and the few bytes of one
+/// fixed-size literal that may straddle the cut).
 pub fn render_limited(md: &str) -> String {
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    let mut out = String::with_capacity(md.len() + md.len() / 2);
+    let mut out = String::with_capacity((md.len() + md.len() / 2).min(MAX_RENDERED_BYTES));
     // Close tags for currently-open whitelisted elements. A dropped element
     // pushes an empty string, so Start/End stay balanced and its text children
     // still flow through unwrapped.
     let mut closes: Vec<&'static str> = Vec::new();
+    // Bytes those pending close tags will cost. Charged against the ceiling as
+    // they are opened, so there is always room to balance the fragment at a cut.
+    let mut closes_len = 0usize;
+    // Set when the ceiling stopped the render, not the end of the document.
+    let mut truncated = false;
     // An image's alt text arrives as events *between* Start(Image)/End(Image);
     // we buffer it into the `alt` attribute rather than the body. `.0` is the
     // safe src (None if the URL was rejected → the whole image is dropped).
@@ -31,6 +51,14 @@ pub fn render_limited(md: &str) -> String {
     let mut in_head = false;
 
     for ev in Parser::new_ext(md, opts) {
+        // Room left for this event, after reserving the pending close tags. At
+        // zero the render stops: every large append below is bounded by `room`,
+        // so the only overshoot possible is one fixed-size literal.
+        let room = MAX_RENDERED_BYTES.saturating_sub(out.len() + closes_len);
+        if room == 0 {
+            truncated = true;
+            break;
+        }
         // While collecting an image's alt span, take only text; ignore markup.
         if image.is_some() {
             match ev {
@@ -40,16 +68,25 @@ pub fn render_limited(md: &str) -> String {
                     // `take()` clears the state regardless; emit only when the
                     // src survived the safe-URL check (else the image is dropped).
                     if let Some((Some(src), alt)) = image.take() {
-                        out.push_str(&format!(
+                        let tag = format!(
                             "<img src=\"{}\" alt=\"{}\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
                             encode_double_quoted_attribute(&src),
                             encode_double_quoted_attribute(&alt),
-                        ));
+                        );
+                        // All-or-nothing: a tag cut in half would leave an
+                        // unterminated attribute. An image too big for the room
+                        // left is simply dropped, like an unsafe-scheme one.
+                        if tag.len() <= room {
+                            out.push_str(&tag);
+                        }
                     }
                 }
                 Event::Text(t) | Event::Code(t) => {
                     if let Some((_, alt)) = image.as_mut() {
-                        alt.push_str(&t);
+                        // The alt buffer never reaches `out`, so the loop's
+                        // ceiling check can't see it growing — bound it here.
+                        let alt_room = MAX_RENDERED_BYTES.saturating_sub(alt.len());
+                        alt.push_str(trim_to(&t, alt_room));
                     }
                 }
                 _ => {}
@@ -59,38 +96,65 @@ pub fn render_limited(md: &str) -> String {
 
         match ev {
             Event::Start(Tag::Image { dest_url, .. }) => {
-                image = Some((safe_href(&dest_url).map(str::to_string), String::new()));
+                image = Some((
+                    safe_href(&dest_url)
+                        .filter(fits_in_render)
+                        .map(str::to_string),
+                    String::new(),
+                ));
             }
             Event::Start(Tag::TableHead) => {
                 in_head = true;
                 out.push_str("<thead><tr>");
                 closes.push("</tr></thead>");
+                closes_len += "</tr></thead>".len();
             }
             Event::Start(Tag::TableCell) => {
                 out.push_str(if in_head { "<th>" } else { "<td>" });
-                closes.push(if in_head { "</th>" } else { "</td>" });
+                let close = if in_head { "</th>" } else { "</td>" };
+                closes.push(close);
+                closes_len += close.len();
             }
             Event::Start(tag) => {
                 let (open, close) = open_close(&tag);
-                out.push_str(&open);
-                closes.push(close);
+                // A tag whose open string no longer fits is dropped whole (a cut
+                // one would leave an unterminated attribute); pushing the empty
+                // close keeps the stack balanced, as for a non-whitelisted tag.
+                if open.len() + close.len() <= room {
+                    out.push_str(&open);
+                    closes.push(close);
+                    closes_len += close.len();
+                } else {
+                    closes.push("");
+                }
             }
             Event::End(TagEnd::TableHead) => {
                 in_head = false;
                 if let Some(c) = closes.pop() {
+                    closes_len -= c.len();
                     out.push_str(c);
                 }
             }
             Event::End(_) => {
                 if let Some(c) = closes.pop() {
+                    closes_len -= c.len();
                     out.push_str(c);
                 }
             }
-            Event::Text(t) => out.push_str(&encode_text(&t)),
+            Event::Text(t) => {
+                if !push_escaped(&mut out, &t, room) {
+                    truncated = true;
+                    break;
+                }
+            }
             Event::Code(t) => {
                 out.push_str("<code>");
-                out.push_str(&encode_text(&t));
+                let whole = push_escaped(&mut out, &t, room.saturating_sub("<code></code>".len()));
                 out.push_str("</code>");
+                if !whole {
+                    truncated = true;
+                    break;
+                }
             }
             Event::SoftBreak => out.push('\n'),
             Event::HardBreak => out.push_str("<br>"),
@@ -100,7 +164,50 @@ pub fn render_limited(md: &str) -> String {
             _ => {}
         }
     }
+    if truncated {
+        // Close what is still open, innermost first, so the cut fragment is
+        // still balanced HTML, then say why it stops. The room reserved above
+        // means this drain was already paid for.
+        while let Some(c) = closes.pop() {
+            out.push_str(c);
+        }
+        out.push_str(TRUNCATION_NOTICE);
+    }
     out
+}
+
+/// HTML-escape `text` into `out`, appending at most `room` bytes. The source is
+/// trimmed *before* escaping so a single huge text node can't transiently
+/// allocate several times the ceiling, and the escaped result is trimmed again
+/// because escaping expands. A cut always lands inside already-escaped text,
+/// which holds no `<`, so it cannot re-open markup. Returns false when the text
+/// did not fit whole — the caller stops there rather than rendering a document
+/// with a silent hole in the middle of it.
+fn push_escaped(out: &mut String, text: &str, room: usize) -> bool {
+    let source = trim_to(text, room);
+    let escaped = encode_text(source);
+    let written = trim_to(&escaped, room);
+    out.push_str(written);
+    source.len() == text.len() && written.len() == escaped.len()
+}
+
+/// Whether a URL is short enough to be worth escaping into a tag at all.
+fn fits_in_render(url: &&str) -> bool {
+    url.len() <= MAX_RENDERED_BYTES
+}
+
+/// The longest prefix of `s` that is at most `max` bytes and ends on a char
+/// boundary — slicing mid-character would panic, and this runs on a request
+/// path over arbitrary UTF-8 from package metadata.
+fn trim_to(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Open/close strings for a whitelisted tag. A non-whitelisted tag returns
@@ -122,7 +229,10 @@ fn open_close(tag: &Tag) -> (String, &'static str) {
         Tag::Strikethrough => ("<del>".into(), "</del>"),
         Tag::Table(_) => ("<table>".into(), "</table>"),
         Tag::TableRow => ("<tr>".into(), "</tr>"),
-        Tag::Link { dest_url, .. } => match safe_href(dest_url) {
+        // A URL past the whole render ceiling is not a URL; treat it like an
+        // unsafe scheme and drop the anchor, so escaping it never allocates a
+        // multiple of the ceiling just to be thrown away.
+        Tag::Link { dest_url, .. } => match safe_href(dest_url).filter(fits_in_render) {
             Some(href) => (
                 format!(
                     "<a href=\"{}\" rel=\"nofollow noopener noreferrer\">",
@@ -270,6 +380,48 @@ mod tests {
         // The standalone image still renders; nothing leaks outside the <p>.
         assert!(h.contains("<img src=\"http://x/c.png\""));
         assert_eq!(h.matches("</p>").count(), 1);
+    }
+
+    #[test]
+    fn a_huge_document_is_truncated_with_a_visible_marker() {
+        // Markup amplification: each `> ` line costs 2 source bytes and renders
+        // a whole blockquote + paragraph. Uncapped this grows without bound.
+        let md = "> x\n\n".repeat(400_000);
+        let h = render_limited(&md);
+        assert!(h.len() <= MAX_RENDERED_BYTES + TRUNCATION_NOTICE.len() + 16);
+        assert!(h.ends_with(TRUNCATION_NOTICE), "no truncation marker");
+        // Balanced: every element opened before the cut is closed at it.
+        assert_eq!(
+            h.matches("<blockquote>").count(),
+            h.matches("</blockquote>").count()
+        );
+        assert_eq!(h.matches("<p>").count(), h.matches("</p>").count());
+    }
+
+    #[test]
+    fn one_huge_text_node_is_capped_too() {
+        // A single event, so the per-event bound does the work, not the loop's.
+        // `<` escapes to 4 bytes, so the naive path would emit 4x the source.
+        let h = render_limited(&"<".repeat(4 * 1024 * 1024));
+        assert!(h.len() <= MAX_RENDERED_BYTES + TRUNCATION_NOTICE.len() + 16);
+        assert!(h.ends_with(TRUNCATION_NOTICE));
+        // The source `<` is escaped, so the cut can only land inside an entity.
+        assert!(h.starts_with("<p>&lt;"));
+    }
+
+    #[test]
+    fn a_document_under_the_cap_is_untouched() {
+        let h = render_limited("# Title\n\nbody\n");
+        assert!(!h.contains("truncated"));
+        assert_eq!(h, "<h1>Title</h1><p>body</p>");
+    }
+
+    #[test]
+    fn multibyte_text_is_cut_on_a_char_boundary() {
+        // A cut landing mid-character would panic the slice; € is 3 bytes.
+        let h = render_limited(&"€".repeat(MAX_RENDERED_BYTES));
+        assert!(h.len() <= MAX_RENDERED_BYTES + TRUNCATION_NOTICE.len() + 16);
+        assert!(h.ends_with(TRUNCATION_NOTICE));
     }
 
     #[test]

@@ -3,8 +3,9 @@
 //! (everything) — plus the request-time version matchers over them.
 //!
 //! A leaf module by design: it depends only on std, `zip`, `serde`/`serde_json`,
-//! `pep440_rs`, `time`, `anyhow`, and [`crate::names`] — no async, no I/O, no
-//! logging — so it is unit-tested here and fuzzed directly (`fuzz_advisories`).
+//! `pep440_rs`, `time`, `anyhow`, [`crate::names`] and the wall-clock read in
+//! [`crate::clock`] — no async, no I/O, no logging — so it is unit-tested here
+//! and fuzzed directly (`fuzz_advisories`, which mirrors that module list).
 //! The fetch/persist/reload plumbing and the org audit report live in
 //! [`crate::advisories`], which re-exports the types callers reference.
 
@@ -18,6 +19,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use zip::ZipArchive;
 
+use crate::clock::now_utc;
 use crate::names::normalize_pkg_name;
 
 /// Per-entry ceiling inside the zip. OSV records are KBs; this only refuses a
@@ -26,6 +28,44 @@ pub(crate) const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
 
 /// OSV's ecosystem string for PyPI (matched case-insensitively for tolerance).
 const PYPI_ECOSYSTEM: &str = "PyPI";
+
+/// How far past our own clock an advisory's `modified` stamp may sit and still
+/// move the watermark. The probe walks the CSV newest-first and stops at the
+/// watermark, so one nonsense far-future stamp would push it past every real
+/// advisory and stall the malware fast path until the next daily baseline. An
+/// hour absorbs ordinary skew between us and the feed publisher.
+const MAX_WATERMARK_SKEW: time::Duration = time::Duration::hours(1);
+
+/// Ceiling on a stored advisory `summary`, which is display-only (the audit
+/// report and project page render it). The advisory-level fields are cloned
+/// once per affected clause, so an unbounded summary in a record with many
+/// clauses multiplies; a couple hundred bytes is more than any real OSV
+/// one-liner and far more than the UI shows.
+const MAX_SUMMARY_BYTES: usize = 512;
+
+/// Ceiling on a stored `severity`. Real values are a word (`HIGH`) or a CVSS
+/// vector (~44 bytes for v3.1, ~250 for a long v4). Anything larger is junk, so
+/// it is dropped rather than truncated — [`AdvisoryRecord::severity`] promises
+/// the feed's bytes verbatim, and an empty severity is already the "absent"
+/// case.
+const MAX_SEVERITY_BYTES: usize = 256;
+
+/// Ceiling on a stored advisory `id`. Real OSV ids are short and shaped
+/// (`MAL-2024-0001`, `GHSA-xxxx-xxxx-xxxx`, `PYSEC-2024-42`); a longer one is
+/// not an OSV id, so the whole record is skipped. Skipping keeps the id
+/// byte-equal to the feed (AC9) where truncation would not.
+const MAX_ID_BYTES: usize = 128;
+
+/// Ceiling on the affected clauses one advisory contributes. Real records name
+/// a handful of packages; the biggest malware campaigns, hundreds. The cap
+/// bounds the per-clause clone amplification of the advisory-level fields.
+///
+/// Dropping the tail is fail-open for a hand-crafted record that buries a
+/// `MAL-*` clause past the cap — but that takes control of the feed, and feed
+/// control already means simply not publishing the advisory. The bounded
+/// failure beats the unbounded one: an OOM takes the node down and stops
+/// enforcing anything at all.
+const MAX_CLAUSES_PER_ADVISORY: usize = 1_000;
 
 // ---------------------------------------------------------------------------
 // Parsed views (pure)
@@ -39,7 +79,7 @@ pub enum VersionScope {
     /// malware can't slip through on a version string pep440 can't read.
     AllVersions,
     /// An explicit affected-version list. Compared as parsed PEP 440 versions,
-    /// falling back to raw string equality when a side won't parse.
+    /// falling back to raw string equality when the feed's side won't parse.
     Exact(Vec<String>),
     /// Half-open `[introduced, fixed)` ranges; `fixed = None` is open-ended.
     Ranges(Vec<(Version, Option<Version>)>),
@@ -47,17 +87,24 @@ pub enum VersionScope {
 
 impl VersionScope {
     /// Does `version` (a raw requested version string) fall in this scope?
+    ///
+    /// Fail-closed on a version pep440 can't read: nothing about such a string
+    /// proves it sits *outside* a scope, so it falls inside every one — the
+    /// same treatment [`block_hits`] gives a filename that yielded no version
+    /// at all. A wheel named `pkg-!!!-py3-none-any.whl` must not walk past an
+    /// exact or ranged `MAL-*` rule the way a numeric comparison would let it.
     pub fn matches(&self, version: &str) -> bool {
         match self {
             VersionScope::AllVersions => true,
-            VersionScope::Exact(versions) => versions.iter().any(|v| version_eq(v, version)),
+            VersionScope::Exact(versions) => match version.parse::<Version>() {
+                Ok(_) => versions.iter().any(|v| version_eq(v, version)),
+                Err(_) => true, // fail closed
+            },
             VersionScope::Ranges(ranges) => match version.parse::<Version>() {
                 Ok(v) => ranges
                     .iter()
                     .any(|(intro, fixed)| v >= *intro && fixed.as_ref().is_none_or(|f| v < *f)),
-                // A requested version pep440 can't read never matches a numeric
-                // range — a range is a claim about ordering it can't satisfy.
-                Err(_) => false,
+                Err(_) => true, // fail closed
             },
         }
     }
@@ -262,6 +309,7 @@ pub fn parse_feed(zip_bytes: &[u8]) -> Result<AdvisoryDb> {
         .collect();
 
     let mut db = AdvisoryDb::default();
+    let horizon = watermark_horizon();
     for name in names {
         let Ok(entry) = zip.by_name(&name) else {
             continue;
@@ -280,7 +328,7 @@ pub fn parse_feed(zip_bytes: &[u8]) -> Result<AdvisoryDb> {
         // bumped `modified`, and the baseline must already cover it so the
         // probe doesn't re-walk it.
         if let Ok(adv) = serde_json::from_slice::<OsvAdvisory>(&buf) {
-            advance_watermark(&mut db.watermark, adv.modified.as_deref());
+            advance_watermark_before(&mut db.watermark, adv.modified.as_deref(), horizon);
             ingest_advisory(&mut db, &adv);
         }
     }
@@ -288,24 +336,29 @@ pub fn parse_feed(zip_bytes: &[u8]) -> Result<AdvisoryDb> {
 }
 
 /// Iterate an advisory's PyPI-ecosystem affected clauses paired with their
-/// normalized package name, skipping non-PyPI ecosystems and unservable names.
+/// normalized package name, skipping non-PyPI ecosystems and unservable names,
+/// and stopping at [`MAX_CLAUSES_PER_ADVISORY`] (see the const for why the tail
+/// is safe to drop).
 fn pypi_clauses(adv: &OsvAdvisory) -> impl Iterator<Item = (String, &OsvAffected)> {
-    adv.affected.iter().filter_map(|affected| {
-        if !affected
-            .package
-            .ecosystem
-            .eq_ignore_ascii_case(PYPI_ECOSYSTEM)
-        {
-            return None;
-        }
-        checked_osv_name(&affected.package.name).map(|name| (name, affected))
-    })
+    adv.affected
+        .iter()
+        .filter_map(|affected| {
+            if !affected
+                .package
+                .ecosystem
+                .eq_ignore_ascii_case(PYPI_ECOSYSTEM)
+            {
+                return None;
+            }
+            checked_osv_name(&affected.package.name).map(|name| (name, affected))
+        })
+        .take(MAX_CLAUSES_PER_ADVISORY)
 }
 
 /// Fold one advisory into the db. Returns false (→ skip count) when the entry is
 /// withdrawn or names no PyPI package. Never rewrites the id (AC9: byte-equal).
 fn ingest_advisory(db: &mut AdvisoryDb, adv: &OsvAdvisory) -> bool {
-    if adv.withdrawn.is_some() || adv.id.is_empty() {
+    if adv.withdrawn.is_some() || !usable_id(&adv.id) {
         return false;
     }
     let is_malware = adv.id.starts_with("MAL-");
@@ -313,15 +366,16 @@ fn ingest_advisory(db: &mut AdvisoryDb, adv: &OsvAdvisory) -> bool {
         .database_specific
         .severity
         .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .filter(|s| usable_severity(s))
         .or_else(|| {
             adv.severity
                 .iter()
-                .map(|s| s.score.clone())
-                .find(|s| !s.is_empty())
+                .map(|s| s.score.as_str())
+                .find(|s| usable_severity(s))
         })
+        .map(str::to_string)
         .unwrap_or_default();
+    let summary = truncated(&adv.summary, MAX_SUMMARY_BYTES);
 
     let mut matched_pypi = false;
     for (name, affected) in pypi_clauses(adv) {
@@ -335,13 +389,39 @@ fn ingest_advisory(db: &mut AdvisoryDb, adv: &OsvAdvisory) -> bool {
         }
         db.audit.entry(name).or_default().push(AdvisoryRecord {
             id: adv.id.clone(),
-            summary: adv.summary.clone(),
+            summary: summary.clone(),
             severity: severity.clone(),
             fixed_in: fixed_versions(affected),
             matcher: scope,
         });
     }
     matched_pypi
+}
+
+/// Whether an id is a plausible OSV id we can store: non-empty and no longer
+/// than [`MAX_ID_BYTES`]. The id is cloned once per affected clause, so an
+/// oversized one is the cheapest half of a memory-amplification record.
+fn usable_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_ID_BYTES
+}
+
+/// Whether a severity string is worth storing verbatim: non-empty and no
+/// longer than [`MAX_SEVERITY_BYTES`].
+fn usable_severity(severity: &str) -> bool {
+    !severity.is_empty() && severity.len() <= MAX_SEVERITY_BYTES
+}
+
+/// `s` clipped to at most `max` bytes, backing up to the nearest char boundary
+/// so the result is still valid UTF-8. Display fields only.
+fn truncated(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// Normalize an OSV package name to a servable PEP 503 name, or `None` if it
@@ -424,10 +504,28 @@ pub(crate) fn parse_modified(raw: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(raw, &Rfc3339).ok()
 }
 
-/// Fold a candidate `modified` into a running max (the snapshot watermark).
+/// Fold a candidate `modified` into a running max (the snapshot watermark),
+/// against a horizon of now + [`MAX_WATERMARK_SKEW`].
 pub(crate) fn advance_watermark(current: &mut Option<OffsetDateTime>, candidate: Option<&str>) {
+    advance_watermark_before(current, candidate, watermark_horizon());
+}
+
+/// The newest `modified` a snapshot will believe: now plus the allowed skew.
+/// Read once per feed rather than once per entry.
+fn watermark_horizon() -> OffsetDateTime {
+    now_utc().saturating_add(MAX_WATERMARK_SKEW)
+}
+
+/// [`advance_watermark`] against an explicit `horizon`: a candidate past it is
+/// ignored outright, so one advisory stamped year 3000 can't carry the
+/// watermark past every real advisory and blind the probe's CSV walk.
+pub(crate) fn advance_watermark_before(
+    current: &mut Option<OffsetDateTime>,
+    candidate: Option<&str>,
+    horizon: OffsetDateTime,
+) {
     if let Some(ts) = candidate.and_then(parse_modified) {
-        if current.is_none_or(|c| ts > c) {
+        if ts <= horizon && current.is_none_or(|c| ts > c) {
             *current = Some(ts);
         }
     }
@@ -439,7 +537,7 @@ pub(crate) fn advance_watermark(current: &mut Option<OffsetDateTime>, candidate:
 /// uses, projected to the block set alone — what the probe overlays ahead of the
 /// daily baseline.
 pub(crate) fn mal_rules(adv: &OsvAdvisory) -> Vec<(String, MalRule)> {
-    if adv.withdrawn.is_some() || adv.id.is_empty() || !adv.id.starts_with("MAL-") {
+    if adv.withdrawn.is_some() || !usable_id(&adv.id) || !adv.id.starts_with("MAL-") {
         return Vec::new();
     }
     pypi_clauses(adv)
@@ -690,5 +788,159 @@ mod tests {
     fn watermark_is_none_when_no_entry_carries_a_timestamp() {
         let db = parse_feed(&osv_zip(&[("m.json", mal_exact("MAL-2024-1", "a", "1.0"))])).unwrap();
         assert_eq!(db.watermark(), None);
+    }
+
+    #[test]
+    fn far_future_modified_never_moves_the_watermark() {
+        // One nonsense year-3000 stamp would otherwise carry the watermark past
+        // every real advisory, and the probe's newest-first CSV walk stops at
+        // the watermark — so the malware fast path would skip real records.
+        let horizon = parse_modified("2024-06-01T01:00:00Z").unwrap();
+        let mut wm = None;
+        advance_watermark_before(&mut wm, Some("3000-01-01T00:00:00Z"), horizon);
+        assert_eq!(wm, None);
+
+        // A real advisory still lands, and the bogus one can't displace it.
+        advance_watermark_before(&mut wm, Some("2024-05-30T00:00:00Z"), horizon);
+        advance_watermark_before(&mut wm, Some("3000-01-01T00:00:00Z"), horizon);
+        assert_eq!(wm, parse_modified("2024-05-30T00:00:00Z"));
+
+        // The skew window itself is inclusive: a stamp at the horizon is fine.
+        advance_watermark_before(&mut wm, Some("2024-06-01T01:00:00Z"), horizon);
+        assert_eq!(wm, Some(horizon));
+    }
+
+    #[test]
+    fn feed_watermark_ignores_a_far_future_entry() {
+        // Same property through `parse_feed`, whose horizon is the wall clock:
+        // the real 2024 stamp wins over an entry dated in the year 3000.
+        let db = parse_feed(&osv_zip(&[
+            ("a.json", dated("MAL-2024-1", "a", "2024-01-01T00:00:00Z")),
+            ("b.json", dated("MAL-2024-2", "b", "3000-01-01T00:00:00Z")),
+        ]))
+        .unwrap();
+        assert_eq!(db.watermark(), parse_modified("2024-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn unparseable_version_matches_ranged_and_exact_rules() {
+        // `pkg-!!!-py3-none-any.whl` yields Some("!!!"), which pep440 can't
+        // read. It must fail closed against BOTH rule shapes, exactly as a
+        // filename yielding no version at all does.
+        let zip = osv_zip(&[
+            ("M1.json", mal_exact("MAL-2024-0100", "exactpkg", "1.0.0")),
+            (
+                "M2.json",
+                serde_json::json!({
+                    "id": "MAL-2024-0101",
+                    "affected": [{
+                        "package": {"ecosystem": "PyPI", "name": "rangepkg"},
+                        "ranges": [{"type": "ECOSYSTEM", "events": [
+                            {"introduced": "1.0"}, {"fixed": "2.0"},
+                        ]}],
+                    }],
+                }),
+            ),
+        ]);
+        let db = parse_feed(&zip).unwrap();
+        assert_eq!(
+            blocking_advisories(&db, "exactpkg", Some("!!!")),
+            ["MAL-2024-0100"]
+        );
+        assert_eq!(
+            blocking_advisories(&db, "rangepkg", Some("!!!")),
+            ["MAL-2024-0101"]
+        );
+        // A readable version outside the rule is still not blocked — the
+        // fail-closed arm must not swallow the ordinary negative case.
+        assert!(blocking_advisories(&db, "rangepkg", Some("2.5")).is_empty());
+        assert!(blocking_advisories(&db, "exactpkg", Some("1.0.1")).is_empty());
+    }
+
+    #[test]
+    fn pep427_escaped_filename_versions_still_read_numerically() {
+        // The byte gate matches on the version pulled out of the *filename*,
+        // which PEP 427 escapes (`-` and `_` separators both become `_`). Those
+        // forms must keep parsing, or fail-closed would blanket-block ordinary
+        // releases of any package that carries an advisory. pep440 accepts `_`
+        // wherever a separator is legal, so every escaped form survives.
+        for v in [
+            "1.0_alpha1",
+            "1.0_a1",
+            "1.0_post1",
+            "1.0_dev1",
+            "1.0_rc1",
+            "1.0+cuda_11",
+        ] {
+            assert!(v.parse::<Version>().is_ok(), "{v} stopped parsing");
+        }
+        // The one exception: PEP 440's *implicit* post release needs a literal
+        // dash (`1.0-1`), so its escaped filename spelling is unreadable and
+        // does fail closed. Narrow and deliberate — an unreadable version is
+        // exactly what must not walk past a MAL rule.
+        assert!("1.0-1".parse::<Version>().is_ok());
+        assert!("1.0_1".parse::<Version>().is_err());
+    }
+
+    #[test]
+    fn oversized_advisory_fields_and_clause_lists_are_capped() {
+        let long_summary = "s".repeat(MAX_SUMMARY_BYTES * 4);
+        let long_severity = "v".repeat(MAX_SEVERITY_BYTES + 1);
+        let clauses: Vec<_> = (0..MAX_CLAUSES_PER_ADVISORY + 50)
+            .map(|i| {
+                serde_json::json!({
+                    "package": {"ecosystem": "PyPI", "name": format!("pkg{i}")},
+                    "versions": ["1.0"],
+                })
+            })
+            .collect();
+        let db = parse_feed(&osv_zip(&[(
+            "big.json",
+            serde_json::json!({
+                "id": "MAL-2024-0200",
+                "summary": long_summary,
+                "database_specific": {"severity": long_severity},
+                "affected": clauses,
+            }),
+        )]))
+        .unwrap();
+
+        assert_eq!(db.audit_records(), MAX_CLAUSES_PER_ADVISORY);
+        assert_eq!(db.block_names(), MAX_CLAUSES_PER_ADVISORY);
+        let rec = advisories_for(&db, "pkg0", "1.0");
+        assert_eq!(rec[0].summary.len(), MAX_SUMMARY_BYTES);
+        // An unusable severity is dropped, not truncated: the field promises
+        // the feed's bytes verbatim, and empty is already the "absent" case.
+        assert_eq!(rec[0].severity, "");
+        // The clause past the cap contributed nothing at all.
+        let over = format!("pkg{}", MAX_CLAUSES_PER_ADVISORY);
+        assert!(blocking_advisories(&db, &over, Some("1.0")).is_empty());
+    }
+
+    #[test]
+    fn summary_truncation_lands_on_a_char_boundary() {
+        // A multibyte char straddling the cap must back up, not split.
+        let s = "é".repeat(MAX_SUMMARY_BYTES); // 2 bytes each
+        let out = truncated(&s, MAX_SUMMARY_BYTES);
+        assert_eq!(out.len(), MAX_SUMMARY_BYTES);
+        assert_eq!(
+            truncated(&s, MAX_SUMMARY_BYTES - 1).len(),
+            MAX_SUMMARY_BYTES - 2
+        );
+        assert_eq!(truncated("short", MAX_SUMMARY_BYTES), "short");
+    }
+
+    #[test]
+    fn oversized_id_skips_the_record_rather_than_rewriting_it() {
+        // Truncating would break the byte-equal id contract (AC9), so an id no
+        // OSV record could have drops the whole entry.
+        let long_id = format!("MAL-{}", "9".repeat(MAX_ID_BYTES));
+        let db = parse_feed(&osv_zip(&[(
+            "x.json",
+            mal_exact(&long_id, "victim", "1.0"),
+        )]))
+        .unwrap();
+        assert!(blocking_advisories(&db, "victim", Some("1.0")).is_empty());
+        assert_eq!(db.audit_records(), 0);
     }
 }

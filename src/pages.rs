@@ -59,6 +59,13 @@ pub struct BrowseQuery {
     q: Option<String>,
 }
 
+/// Single-flight gate for the cold `/projects/` render (see [`projects_page`]).
+/// The cached page is one process-wide slot, so unlike `project_cache`'s
+/// per-package `refilling` set this needs no key — one permit is the whole set.
+/// Held across the render, so concurrent misses queue and serve the winner's
+/// bytes instead of each escaping and concatenating the whole name set.
+static PROJECTS_PAGE_RENDER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// The human package browser (`/projects/`), which doubles as the search results
 /// page: every hosted package (or those matching `?q=`), linked to its project
 /// page. Read-only and gated by read auth like the activity panel, so a `?q=`
@@ -82,11 +89,25 @@ pub async fn projects_page(
     // result set is smaller, and caching per distinct query would be the
     // unbounded-key hazard the other caches explicitly guard against.
     let cacheable = query.trim().is_empty();
-    if cacheable {
+    // A cold slot must cost one render, not one per concurrent miss: the name
+    // sort+clone is partly serialized by the global-names lock, but the multi-MB
+    // escape/concat below runs outside every lock. One reader claims the render
+    // and holds the permit through the `store_projects_page`; the rest re-check
+    // the slot on wake and serve its bytes. Single-flight, the same shape
+    // project_cache.rs gives each package page. A closed semaphore (never — it is
+    // static and nothing closes it) degrades to today's behavior, not a panic.
+    let _render_permit = if cacheable {
         if let Some(body) = state.projects_page_cached(pinned.generation) {
             return html_ok_bytes(body);
         }
-    }
+        let permit = PROJECTS_PAGE_RENDER.acquire().await.ok();
+        if let Some(body) = state.projects_page_cached(pinned.generation) {
+            return html_ok_bytes(body);
+        }
+        permit
+    } else {
+        None
+    };
     let names = match worker::global_package_names(&state, pinned.storage.as_ref()).await {
         Ok(names) => names,
         Err(e) => return read_error(e),
@@ -429,13 +450,7 @@ async fn advisory_panel_rows(
     let mut rows: Vec<html::AdvisoryPanelRow> = Vec::new();
     for version in versions {
         for record in advisories::advisories_for(db, pkg, version) {
-            rows.push(html::AdvisoryPanelRow {
-                version: version.clone(),
-                id: record.id.clone(),
-                severity: record.severity.clone(),
-                fixed_in: record.fixed_in.clone(),
-                blocked: quarantined || record.id.starts_with("MAL-"),
-            });
+            rows.push(advisory_row(version, record, quarantined));
         }
     }
     if rows.is_empty() {
@@ -462,6 +477,33 @@ async fn advisory_panel_rows(
     });
     rows.dedup_by(|a, b| a.version == b.version && a.id == b.id);
     rows
+}
+
+/// One advisory-panel row, control bytes stripped from every field the page
+/// renders — the guard [`sanitize_for_page`] applies to the uploader-controlled
+/// fields, extended to the feed-controlled ones. The ids, severities and
+/// fixed-in versions come verbatim from the OSV feed and the version comes from
+/// an uploaded filename, and all four are rendered into the *cached* page: a
+/// planted [`project_cache::BASE_URL_SENTINEL`] there would be re-expanded to
+/// the request host on every serve, work the page-cache byte cap (charged once,
+/// at `put`) does not bound. `blocked` is decided on the raw id so the badge
+/// keeps parity with the byte gate, which matches the feed's bytes.
+fn advisory_row(
+    version: &str,
+    record: &crate::osv::AdvisoryRecord,
+    quarantined: bool,
+) -> html::AdvisoryPanelRow {
+    html::AdvisoryPanelRow {
+        version: coremeta::strip_control_chars(version),
+        id: coremeta::strip_control_chars(&record.id),
+        severity: coremeta::strip_control_chars(&record.severity),
+        fixed_in: record
+            .fixed_in
+            .iter()
+            .map(|v| coremeta::strip_control_chars(v))
+            .collect(),
+        blocked: quarantined || record.id.starts_with("MAL-"),
+    }
 }
 
 /// Last-30-day download counts for a package, filenames rolled up to versions
@@ -623,6 +665,9 @@ async fn load_core_metadata(
 /// digest binds to `rep`'s own sha256 (the bytes we serve). Best-effort: a miss
 /// or malformed bundle returns `None` and the page renders without a publisher-
 /// attestation section; an unbindable digest simply renders no checksum-match cue.
+/// The verification itself (cert chain, SCT, ECDSA) is CPU-bound, so it runs on
+/// the blocking pool — a cold project page claims no cache entry, so concurrent
+/// first hits would otherwise each burn a runtime worker on it.
 async fn load_provenance(
     storage: &dyn Storage,
     pkg: &str,
@@ -630,7 +675,7 @@ async fn load_provenance(
 ) -> Option<provenance::Provenance> {
     let key = sidecar::provenance_key(&format!("{PACKAGES_PREFIX}{pkg}/{}", rep.filename));
     let bytes = storage.get_bytes(&key).await.ok()?;
-    provenance::parse(&bytes, &rep.sha256)
+    provenance::parse_offloaded(bytes, rep.sha256.clone()).await
 }
 
 /// Build the request-derived context both pages share. The base URL honors a
@@ -717,6 +762,44 @@ mod tests {
             None
         );
         assert_eq!(versions_from_package_index(b"not json"), None);
+    }
+
+    #[test]
+    fn advisory_rows_cannot_plant_the_page_cache_sentinel() {
+        // Every field the panel renders is external: id/severity/fixed_in come
+        // verbatim from the OSV feed, the version from an uploaded filename. A
+        // planted BASE_URL_SENTINEL in any of them would be re-expanded to the
+        // request host on every serve of the cached page, outside its byte cap.
+        let sentinel = project_cache::BASE_URL_SENTINEL;
+        let record = crate::osv::AdvisoryRecord {
+            id: format!("GHSA-{sentinel}x"),
+            summary: String::new(),
+            severity: format!("HIGH{sentinel}"),
+            fixed_in: vec![format!("2.0.0{sentinel}")],
+            matcher: crate::osv::VersionScope::AllVersions,
+        };
+        let row = advisory_row(&format!("1.0.0{sentinel}"), &record, false);
+        for field in [&row.version, &row.id, &row.severity, &row.fixed_in[0]] {
+            assert!(
+                !field.contains(sentinel) && !field.chars().any(char::is_control),
+                "control bytes must not survive into a cached page: {field:?}"
+            );
+        }
+        assert_eq!(
+            row.id, "GHSA-pypiron-base-urlx",
+            "only the control bytes go; the sentinel's inert text may stay"
+        );
+        assert!(!row.blocked, "a GHSA id is informational, not blocked");
+        // The blocked badge keeps byte-gate parity: it reads the raw feed id.
+        let mal = crate::osv::AdvisoryRecord {
+            id: "MAL-2026-1".into(),
+            ..record
+        };
+        assert!(advisory_row("1.0.0", &mal, false).blocked);
+        assert!(
+            advisory_row("1.0.0", &mal, true).blocked,
+            "a quarantined project blocks regardless of advisory kind"
+        );
     }
 
     #[test]

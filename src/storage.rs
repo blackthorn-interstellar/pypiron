@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use axum::body::Body;
 use clap::Args as ClapArgs;
 use http::{header, Response, StatusCode};
+use percent_encoding::percent_decode_str;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
@@ -2210,6 +2212,11 @@ pub struct ObjectStorage {
     /// Root every key under this bare key prefix (no slashes at either end),
     /// letting pypiron share a bucket. `None` means keys sit at the bucket root.
     prefix: Option<String>,
+    /// [`Self::prefix`] as object_store spells it on the wire — the same string
+    /// unless the operator's prefix holds a character object_store escapes. It is
+    /// what a listing's locations actually start with, so it is what
+    /// [`Self::unkey`] strips.
+    os_prefix: Option<String>,
     /// Backend name, for error context.
     backend: &'static str,
     /// Server-side-copy material for the replication transport, when this
@@ -2391,6 +2398,9 @@ impl ObjectStorage {
         Self {
             store,
             signer,
+            os_prefix: prefix
+                .as_deref()
+                .map(|p| OsPath::from(p).as_ref().to_string()),
             prefix,
             backend,
             copy: None,
@@ -2677,8 +2687,12 @@ impl ObjectStorage {
     }
 
     /// A logical key as an object_store path, rooted under the storage prefix.
-    /// Our keys carry no leading/trailing or doubled slashes, so this
-    /// round-trips exactly. The empty key addresses the prefix root itself.
+    /// Our keys carry no leading/trailing or doubled slashes, so the path shape
+    /// survives — but object_store percent-escapes the characters the cloud
+    /// naming guides warn against (`~ % # [ ] { } ^ | < > " * ? \` and backtick,
+    /// plus `.`/`..` segments), so the wire spelling is not always the key.
+    /// [`Self::unkey`] undoes exactly that. The empty key addresses the prefix
+    /// root itself.
     fn oskey(&self, key: &str) -> OsPath {
         match &self.prefix {
             Some(p) => OsPath::from(format!("{p}/{key}")),
@@ -2686,14 +2700,20 @@ impl ObjectStorage {
         }
     }
 
-    /// Inverse of [`Self::oskey`]: a store location back to a logical key.
+    /// Inverse of [`Self::oskey`]: a store location back to a logical key,
+    /// undoing object_store's percent-escaping so `unkey(oskey(k)) == Some(k)`.
+    /// Without the decode a listed artifact whose name holds an escaped byte
+    /// re-encodes to a *different* object: it vanishes from `/simple/` and its
+    /// derived sidecar key collides with another artifact's.
     /// `None` when the location lies outside the prefix — listings are always
-    /// prefix-scoped, so that means a store returned something we never wrote.
-    fn unkey<'a>(&self, loc: &'a str) -> Option<&'a str> {
-        match &self.prefix {
-            Some(p) => loc.strip_prefix(p.as_str())?.strip_prefix('/'),
-            None => Some(loc),
-        }
+    /// prefix-scoped, so that means a store returned something we never wrote —
+    /// or when the escapes do not decode as UTF-8, which our writes never emit.
+    fn unkey<'a>(&self, loc: &'a str) -> Option<Cow<'a, str>> {
+        let rest = match &self.os_prefix {
+            Some(p) => loc.strip_prefix(p.as_str())?.strip_prefix('/')?,
+            None => loc,
+        };
+        percent_decode_str(rest).decode_utf8().ok()
     }
 
     /// Classify a non-typed object_store error into an `anyhow` error: a missing
@@ -3316,9 +3336,18 @@ fn content_type_of(attrs: &Attributes) -> String {
 
 /// A unique staging key for a large upload, namespaced by its final filename.
 fn staging_key(key: &str) -> String {
+    // A per-process atomic counter — not the clock alone — guarantees a distinct
+    // staging key per call. On a coarse-clock host two concurrent writes to the
+    // same key can read identical nanos, share one staging object, and clobber
+    // each other's bytes.
+    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
     let fname = key.rsplit('/').next().unwrap_or(key);
     let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
-    format!("{STAGING_PREFIX}{nanos}-{}-{fname}", std::process::id())
+    let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{STAGING_PREFIX}{nanos}-{}-{seq}-{fname}",
+        std::process::id()
+    )
 }
 
 fn pack_version(e_tag: &Option<String>, version: &Option<String>) -> String {
@@ -4087,19 +4116,83 @@ mod tests {
 
         let plain = keyed(None);
         assert_eq!(plain.oskey("packages/a/x.whl").as_ref(), "packages/a/x.whl");
-        assert_eq!(plain.unkey("packages/a/x.whl"), Some("packages/a/x.whl"));
+        assert_eq!(
+            plain.unkey("packages/a/x.whl").as_deref(),
+            Some("packages/a/x.whl")
+        );
 
         let pfx = keyed(Some("pypi"));
         assert_eq!(
             pfx.oskey("packages/a/x.whl").as_ref(),
             "pypi/packages/a/x.whl"
         );
-        assert_eq!(pfx.unkey("pypi/packages/a/x.whl"), Some("packages/a/x.whl"));
+        assert_eq!(
+            pfx.unkey("pypi/packages/a/x.whl").as_deref(),
+            Some("packages/a/x.whl")
+        );
         // The empty key addresses the prefix root, not the bucket root.
         assert_eq!(pfx.oskey("").as_ref(), "pypi");
         // A sibling that merely shares a name stem is not ours.
         assert_eq!(pfx.unkey("pypi-other/packages/x"), None);
         assert_eq!(pfx.unkey("other/x"), None);
+    }
+
+    /// object_store percent-escapes the characters the cloud naming guides warn
+    /// against, and `valid_artifact_filename` accepts every one of them. A key
+    /// that does not survive the trip to the wire and back is an artifact that
+    /// vanishes from its index, or one whose sidecar key collides with another's
+    /// — so the round trip is tested over the whole escaped set, not just the
+    /// safe names an ordinary wheel happens to use.
+    #[test]
+    fn oskey_and_unkey_round_trip_escaped_names() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let keyed =
+            |p: Option<&str>| ObjectStorage::new(store.clone(), None, p.map(String::from), "mem");
+
+        // Every byte object_store escapes, plus the shapes that tempt a naive
+        // decode: an already-escaped-looking name, a lone `%`, and non-ASCII.
+        let names = [
+            "a~b.whl",
+            "a%b.whl",
+            "a#b.whl",
+            "a[b]c.whl",
+            "a{b}c.whl",
+            "a^b.whl",
+            "a|b.whl",
+            "a<b>c.whl",
+            "a\"b.whl",
+            "a*b.whl",
+            "a?b.whl",
+            "a`b.whl",
+            "a\\b.whl",
+            "a b.whl",
+            "%2Fetc%2Fpasswd",
+            "%",
+            "%%",
+            "%zz",
+            "café-1.0.whl",
+            "日本語-1.0.tar.gz",
+            "..",
+            ".",
+            "plain-1.0-py3-none-any.whl",
+        ];
+
+        for st in [keyed(None), keyed(Some("pypi")), keyed(Some("a/b"))] {
+            for name in names {
+                for key in [
+                    format!("packages/pkg/{name}"),
+                    format!("packages/{name}/x.whl"),
+                    name.to_string(),
+                ] {
+                    let on_wire = st.oskey(&key);
+                    assert_eq!(
+                        st.unkey(on_wire.as_ref()).as_deref(),
+                        Some(key.as_str()),
+                        "round trip lost {key:?} (wire {on_wire:?})"
+                    );
+                }
+            }
+        }
     }
 
     /// A create whose verifying HEAD never answers must fail loudly and leave

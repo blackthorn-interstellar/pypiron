@@ -20,7 +20,7 @@ use crate::app::{internal, AppState, PACKAGES_PREFIX, SIMPLE_PREFIX};
 use crate::auth::require_admin;
 use crate::names::{
     checked_pkg_name, infer_package_from_filename, infer_version_from_filename, is_normalized,
-    normalize_pkg_name,
+    normalize_pkg_name, MAX_ARTIFACT_FILENAME_BYTES,
 };
 use crate::sidecar::{
     frozen_key, metadata_key, provenance_key, sidecar_key, tombstone_key, Sidecar, Yanked,
@@ -1248,10 +1248,32 @@ pub async fn delete_record(
 pub(crate) async fn yank_set(
     State(state): State<Arc<AppState>>,
     Path((package, filename)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: String,
+    request: axum::extract::Request,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let reason = body.trim().to_string();
+    // Authenticate on headers alone before touching the body. A body extractor
+    // (`body: String`) runs before the handler, so an unauthenticated caller could
+    // otherwise force axum to buffer up to the global 1 GiB limit before this check
+    // ever runs. A yank reason is a sentence; read it under a tight cap only once
+    // the admin credential is proven.
+    let headers = request.headers().clone();
+    require_admin(&state, &headers)?;
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "yank reason too large".to_string(),
+            )
+        })?;
+    let reason = std::str::from_utf8(&body)
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "yank reason must be UTF-8".to_string(),
+            )
+        })?
+        .trim()
+        .to_string();
     let yanked = if reason.is_empty() {
         Yanked::Flag(true)
     } else {
@@ -1511,7 +1533,13 @@ fn valid_artifact_filename(filename: &str) -> bool {
     // sentinel (`project_cache::BASE_URL_SENTINEL`) into the cached page, where it
     // is re-expanded to the request host on every serve — an amplification the
     // page-cache size cap does not bound.
-    !filename.contains('/')
+    //
+    // The length cap is the download path's own ([`MAX_ARTIFACT_FILENAME_BYTES`]),
+    // shared rather than restated: a name the reader refuses must never reach
+    // storage, or `twine upload` returns 200, the file is listed in
+    // `/simple/<pkg>/`, and every GET of it 404s forever.
+    filename.len() <= MAX_ARTIFACT_FILENAME_BYTES
+        && !filename.contains('/')
         && !filename.contains('\\')
         && !filename.contains(|c: char| c.is_control())
         && sidecar::is_artifact(filename)
@@ -1522,6 +1550,19 @@ mod tests {
     use crate::buckets::{BucketHandle, BucketSet};
 
     use super::*;
+
+    #[test]
+    fn artifact_filenames_stop_at_the_length_the_download_path_serves() {
+        // A name the reader would refuse must not be writable: accepting it
+        // returns 200 to twine, lists the file in /simple/, and then 404s every
+        // GET of it forever.
+        let ext = "-1.0-py3-none-any.whl";
+        let stem = "a".repeat(MAX_ARTIFACT_FILENAME_BYTES - ext.len());
+        let at_cap = format!("{stem}{ext}");
+        assert_eq!(at_cap.len(), MAX_ARTIFACT_FILENAME_BYTES);
+        assert!(valid_artifact_filename(&at_cap));
+        assert!(!valid_artifact_filename(&format!("a{at_cap}")));
+    }
 
     #[tokio::test]
     async fn object_store_uploads_serialize_under_the_cap() {

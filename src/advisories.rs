@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::clock::unix_now_secs;
 use crate::hash::sha256_hex;
@@ -485,14 +485,25 @@ pub async fn feed_storage_etag(storage: &dyn Storage) -> Result<Option<String>> 
 /// Load the persisted quarantined set at startup so the byte gate is armed on the
 /// first request, not only after the worker's first `reload_quarantined` tick
 /// (the window in which a compromised project frozen by PEP 792 would otherwise
-/// download). A missing key is the empty set. An unreadable or corrupt one
-/// degrades to the empty set with no etag, so the worker's next reload — which
-/// compares that `None` against the real etag — retries and heals it.
-async fn load_quarantined_at_startup(storage: &dyn Storage) -> (HashSet<String>, Option<String>) {
+/// download). Costs one 1-key LIST plus, when the key exists, one small GET —
+/// cheap enough that EVERY startup path runs it, including the ones that
+/// deliberately skip the feed fetch (PEP 792 quarantine is enforced independently
+/// of the malware toggle; see `serve::advisory_byte_gate`).
+///
+/// An ABSENT key is the empty set, authoritatively. An unreadable or corrupt one
+/// is NOT: it is "we do not know", logged at error, and returned with no etag so
+/// the worker's next reload — which compares that `None` against the real etag —
+/// retries and heals it. The caller keeps whatever set it already held. Note that
+/// on a cold start there is nothing to keep, so this window still serves
+/// unquarantined; making it fail closed means refusing startup, which is a
+/// product decision, not a code one.
+pub(crate) async fn load_quarantined_at_startup(
+    storage: &dyn Storage,
+) -> (HashSet<String>, Option<String>) {
     let etag = match quarantined_storage_etag(storage).await {
         Ok(etag) => etag,
         Err(e) => {
-            warn!(error = %e, "advisory feed: reading the quarantined set etag at startup failed; the worker will retry");
+            error!(error = %e, "advisory feed: reading the quarantined set etag at startup failed; the quarantine set is UNKNOWN, not empty — quarantined artifacts are servable until the worker's next reload heals it");
             return (HashSet::new(), None);
         }
     };
@@ -503,12 +514,12 @@ async fn load_quarantined_at_startup(storage: &dyn Storage) -> (HashSet<String>,
         Ok(bytes) => match parse_quarantined(&bytes) {
             Ok(set) => (set, etag),
             Err(e) => {
-                warn!(error = %e, "advisory feed: quarantined set did not parse at startup; the worker will retry");
+                error!(error = %e, key = QUARANTINED_KEY, "advisory feed: the persisted quarantined set did not parse at startup; the quarantine set is UNKNOWN, not empty — quarantined artifacts are servable until the worker's next reload heals it. Repair or delete the key if this persists");
                 (HashSet::new(), None)
             }
         },
         Err(e) => {
-            warn!(error = %e, "advisory feed: reading the quarantined set at startup failed; the worker will retry");
+            error!(error = %e, "advisory feed: reading the quarantined set at startup failed; the quarantine set is UNKNOWN, not empty — quarantined artifacts are servable until the worker's next reload heals it");
             (HashSet::new(), None)
         }
     }
@@ -661,14 +672,21 @@ fn note_source_result<T>(
 /// last snapshot; the staleness gauge resets only on this node's own successful
 /// refresh (source poll for a leader-with-source, storage check otherwise), so a
 /// failing source is visible as rising staleness.
+///
+/// `enabled` gates the OSV zip feed ONLY. The quarantined-set reload and the
+/// control-singleton re-seed run on every tick regardless, because PEP 792
+/// quarantine is enforced independently of `--malware-block` (see
+/// `serve::advisory_byte_gate`) — gating them behind the feed is what left
+/// followers with an empty quarantine set forever whenever the feed was off.
 pub async fn refresh(
     ctx: RefreshCtx<'_>,
     feed: Option<&str>,
+    enabled: bool,
     is_leader: bool,
     memo: &mut RefreshMemo,
 ) {
     let has_source = feed.is_some();
-    let leads_source = is_leader && has_source;
+    let leads_source = enabled && is_leader && has_source;
     let mut refreshed_ok = false;
 
     if leads_source {
@@ -697,7 +715,13 @@ pub async fn refresh(
         }
     }
 
-    match reload(&ctx).await {
+    // The zip half only: with the feature off there is no snapshot to reload.
+    let reloaded = if enabled {
+        reload(&ctx).await
+    } else {
+        Ok(false)
+    };
+    match reloaded {
         Ok(loaded) => {
             if loaded {
                 let snap = AdvisoryState::read(ctx.slot);
@@ -729,6 +753,12 @@ pub async fn refresh(
     // staleness gauge — the quarantined set has its own storage object.
     if let Err(e) = reload_quarantined(&ctx).await {
         debug!(error = %e, "advisory feed: quarantined reload failed; serving last set");
+    }
+
+    // Everything below is about the OSV snapshot: with the feature off there is
+    // no staleness to gauge and nothing is "armed but unfed".
+    if !enabled {
+        return;
     }
 
     // Arm the gauges only once a snapshot is actually loaded — an armed-but-unfed

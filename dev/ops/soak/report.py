@@ -94,6 +94,22 @@ TAIL_CHARS = 240  # per line: fits a whole heartbeat, clips a violation dump
 #   reproduce: cargo run --release --example vopr -- --seed 1784515453 --nodes 3 ...
 FAILED_RE = re.compile(r"^vopr: seed (\d+) FAILED \((\d+) violation")
 REPRODUCE_RE = re.compile(r"^reproduce: (.+)$")
+# …and the repro is an *execution sink*, not a payload field: the fixer routine
+# hands it to a credentialed agent as "run this command and confirm it fails"
+# (verify_fix.workflow.js). Everything on this stream is soak output, so the
+# captured text is only ever trusted to the extent its shape says it came from
+# `reproduce_command` in examples/vopr.rs — the fixed `cargo … vopr -- --seed N`
+# prefix, then `--flag [value]` pairs whose values are alphanumeric plus the
+# separators the real flags use (`--weights 40,0,…`, `--force-fault 12:crash`).
+# No space, quote, `$`, backtick, `;`, `|`, `&` or redirect can survive that, so
+# a line that matches cannot mean anything but a vopr run. Anything else is
+# refused, loudly, and the finding is filed with no repro at all — the workflow
+# requires one, so a refused line escalates to a human instead of executing.
+REPRO_MAX = 500  # the widest real line is ~200 chars
+REPRO_OK_RE = re.compile(
+    r"^cargo run --release --example vopr -- --seed \d+"
+    r"(?: --[a-z][a-z-]*(?: [0-9A-Za-z][0-9A-Za-z,.:_-]*)?)*$"
+)
 DETERMINISM_RE = re.compile(r"^vopr: DETERMINISM VIOLATION seed=(\d+): (.+)$")
 # The soak's once-a-minute heartbeat; counters are cumulative per process.
 PROGRESS_RE = re.compile(
@@ -116,6 +132,12 @@ HEX_RE = re.compile(r"\b0x[0-9a-f]+\b")  # determinism trace/state hashes
 NUM_RE = re.compile(r"\b\d+\b")  # residual indices/counts: `(0 names)`, `_repl/1/`
 TAIL_RE = re.compile(r"\s*(\|\s*changed:|changed:).*$", re.DOTALL)
 WS_RE = re.compile(r"\s+")
+# The signature is quoted into the fixer's agent prompt. `WS_RE` already flattens
+# it to one line; these strip the characters that could still frame text there
+# (a code fence, a `${…}` template hole), and the cap keeps a runaway violation
+# dump from becoming the bulk of the prompt.
+SIG_UNSAFE_RE = re.compile(r"[`{}]")
+SIG_MAX = 300
 
 
 def signature(violation: str) -> str:
@@ -129,8 +151,15 @@ def signature(violation: str) -> str:
     s = BUCKET_RE.sub("bucketN", s)
     s = HEX_RE.sub("0xN", s)
     s = NUM_RE.sub("N", s)
+    s = SIG_UNSAFE_RE.sub("", s)
     s = WS_RE.sub(" ", s).strip().strip("-").strip()
-    return s
+    return s[:SIG_MAX]
+
+
+def safe_repro(line: str) -> str | None:
+    """The repro command if it is a vopr invocation, else None (caller shouts)."""
+    line = line.strip()
+    return line if len(line) <= REPRO_MAX and REPRO_OK_RE.match(line) else None
 
 
 def sighash(sig: str) -> str:
@@ -480,10 +509,14 @@ def main() -> int:
                 seed, violations = pending[unit]
                 repro = REPRODUCE_RE.match(line)
                 if repro:
+                    cmd = safe_repro(repro.group(1))
+                    if cmd is None:
+                        log(f"REFUSED repro line for seed {seed} — not a vopr "
+                            f"invocation; filing without a repro: {repro.group(1)[:200]!r}")
                     for v in violations:
                         sig = signature(v)
                         if sig:
-                            rep.finding(sig, repro.group(1), seed, v, "violation")
+                            rep.finding(sig, cmd or "", seed, v, "violation")
                     del pending[unit]
                 elif re.match(r"^  \S", line):
                     # Start of a violation entry (2-space indent). Keep only this

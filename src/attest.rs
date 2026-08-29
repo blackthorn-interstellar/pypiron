@@ -73,6 +73,11 @@ const DSSE_PAYLOAD_TYPE: &[u8] = b"application/vnd.in-toto+json";
 /// regardless of what is stored.
 const MAX_PROVENANCE_BYTES: usize = 4 * 1024 * 1024;
 
+/// How many attestations one provenance object may have verified. PyPI relays
+/// one or two per file; the cap only ever bites on an object built to make a
+/// project page grind through thousands of cert chains.
+const MAX_ATTESTATIONS: usize = 32;
+
 /// The signer identity a full verification proves — extracted from the *leaf
 /// certificate*, which is signed material, never from the unsigned `publisher`
 /// JSON. This is *who Fulcio issued the signing cert to*, not a claim that the
@@ -118,6 +123,11 @@ pub fn verify(provenance_bytes: &[u8], artifact_sha256: &str) -> Option<Verified
         .flatten()
         .filter_map(|b| b.get("attestations").and_then(Value::as_array))
         .flatten()
+        // Second defensive cap, on *count* rather than bytes: within the 4 MiB
+        // ceiling above a hostile object can still pack thousands of small
+        // attestations, and each one costs a cert parse, a chain walk, an SCT
+        // check and two ECDSA verifies. A real bundle carries one or two.
+        .take(MAX_ATTESTATIONS)
         .find_map(|att| verify_attestation(att, want, root))
 }
 

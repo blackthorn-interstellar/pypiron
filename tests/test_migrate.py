@@ -67,7 +67,9 @@ def test_migrate_devpi_as_private(
 
     # Migrate it into pypiron's private namespace. Source creds authenticate the
     # devpi read; --as-private omits the mirror form field so the server takes the
-    # private path.
+    # private path. The fixture's devpi is plaintext http:// on loopback, so
+    # carrying a credential there needs --allow-insecure-source — the trusted-
+    # network escape hatch; test_sec_sync.py covers the refusal it overrides.
     rc, out, err = sync_to(
         pypiron_bin,
         disk_server,
@@ -79,6 +81,7 @@ def test_migrate_devpi_as_private(
         devpi_server["user"],
         "--source-pass",
         devpi_server["password"],
+        "--allow-insecure-source",
         "--as-private",
         source=devpi_server["source"],
     )
@@ -142,6 +145,8 @@ def test_migrate_as_private_refuses_a_mirror_owned_name(
         devpi_server["user"],
         "--source-pass",
         devpi_server["password"],
+        # Plaintext loopback devpi: see test_migrate_devpi_as_private.
+        "--allow-insecure-source",
     )
 
     # Someone claimed the name as a mirror first.

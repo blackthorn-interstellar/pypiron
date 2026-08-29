@@ -48,7 +48,7 @@ use crate::names::{
 use crate::origin;
 use crate::render::SIMPLE_JSON_CONTENT_TYPE;
 use crate::sidecar::Yanked;
-use crate::simple::{self, IndexFetch, SimpleFile, SimpleIndex};
+use crate::simple::{self, IndexFetch, SimpleFile, SimpleIndex, UpstreamStatus};
 use crate::status::ProjectStatusDoc;
 use crate::upload::{FinishedSpool, UploadSpool};
 
@@ -93,6 +93,14 @@ pub struct SyncArgs {
         hide_env_values = true
     )]
     pub source_pass: Option<String>,
+
+    /// Send `--source-user`/`--source-pass` to a plaintext `http://` source.
+    /// Off by default: over http the credential goes out in the clear, and a
+    /// network MITM who takes it controls both the artifact bytes and the sha256
+    /// they are verified against. Set it only for a source you reach over a
+    /// trusted network (an internal mirror on a private link).
+    #[arg(long = "allow-insecure-source", env = "PYPIRON_ALLOW_INSECURE_SOURCE")]
+    pub allow_insecure_source: bool,
 
     /// Destination pypiron base URL. Sync mirrors over HTTP: each file is POSTed
     /// to the server's `/legacy/`, authenticated with the server's admin
@@ -687,36 +695,68 @@ fn file_format(filename: &str) -> Format {
     }
 }
 
-/// Basic-auth for an authenticated source index, carrying the source host so
-/// the credential can be scoped to it. The one leak an unscoped credential would
-/// cause is being sent on an off-host redirect (a CDN, a hostile `Location`);
-/// [`hop_auth`] enforces the host match on every hop.
+/// Basic-auth for an authenticated source index, carrying the source *origin* —
+/// scheme, host and port — so the credential can be scoped to it. The leak an
+/// unscoped credential would cause is being sent somewhere the operator never
+/// named: an off-host redirect (a CDN, a hostile `Location`), the same host
+/// downgraded to plaintext `http://`, or the same host on another port where a
+/// different service listens. [`hop_auth`] enforces all three on every hop.
+///
+/// Nothing else enforces it for us: the download loop follows redirects itself
+/// (`Policy::none()` plus a manual hop loop), so reqwest's own cross-origin
+/// credential stripping never runs.
 #[derive(Debug, Clone)]
 struct SourceAuth {
+    scheme: String,
     host: String,
+    /// `port_or_known_default()`, so `https://h` and `https://h:443` are one origin.
+    port: Option<u16>,
     user: String,
     pass: String,
 }
 
 /// Resolve the source basic-auth from CLI/config. Fail closed: one half of the
 /// pair without the other refuses to start (a partial credential is a
-/// misconfiguration, never a silent fall-through to an anonymous fetch), and
-/// credentials with no host to scope them to are refused.
+/// misconfiguration, never a silent fall-through to an anonymous fetch),
+/// credentials with no origin to scope them to are refused, and a plaintext
+/// source refuses to carry them at all unless the operator overrides.
 fn resolve_source_auth(
     src_base: &str,
     user: Option<String>,
     pass: Option<String>,
+    allow_insecure: bool,
 ) -> Result<Option<SourceAuth>> {
     match (user, pass) {
         (None, None) => Ok(None),
         (Some(user), Some(pass)) => {
-            let host = reqwest::Url::parse(src_base)
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_string))
-                .ok_or_else(|| {
-                    anyhow!("--source-user/--source-pass set but --from '{src_base}' has no host")
-                })?;
-            Ok(Some(SourceAuth { host, user, pass }))
+            let origin = reqwest::Url::parse(src_base).ok().and_then(|u| {
+                Some((
+                    u.scheme().to_string(),
+                    u.host_str()?.to_string(),
+                    u.port_or_known_default(),
+                ))
+            });
+            let Some((scheme, host, port)) = origin else {
+                bail!("--source-user/--source-pass set but --from '{src_base}' has no host");
+            };
+            // Plaintext http:// hands the credential to anyone on the path, and a
+            // MITM holding it can forge both the artifact bytes and the sha256 we
+            // check them against. Refuse it unless explicitly overridden — the
+            // same escape hatch `--proxy-upstream` has for the same reason.
+            if scheme == "http" && !allow_insecure {
+                bail!(
+                    "--from is plaintext http://, which sends --source-user/--source-pass in the \
+                     clear (and lets a network MITM forge artifact hashes); pass \
+                     --allow-insecure-source to override, got '{src_base}'"
+                );
+            }
+            Ok(Some(SourceAuth {
+                scheme,
+                host,
+                port,
+                user,
+                pass,
+            }))
         }
         _ => bail!(
             "--source-user and --source-pass must be set together (or [sync].source-user/source-pass) to authenticate the source index"
@@ -725,15 +765,19 @@ fn resolve_source_auth(
 }
 
 /// The basic-auth to attach on one download hop: the source credential, but only
-/// when the hop's host matches the source. An off-host redirect gets nothing —
-/// this is what keeps the source credential from leaking to a CDN or an
-/// attacker-chosen `Location`.
+/// when the hop is the *same origin* as the source — scheme, host and port all
+/// three. Anything else gets nothing, which is what keeps the source credential
+/// from leaking to a CDN, to an attacker-chosen `Location`, or over a plaintext
+/// downgrade of the source's own hostname.
 fn hop_auth<'a>(
     source_auth: Option<&'a SourceAuth>,
     hop: &reqwest::Url,
 ) -> Option<(&'a str, &'a str)> {
     let a = source_auth?;
-    (hop.host_str() == Some(a.host.as_str())).then_some((a.user.as_str(), a.pass.as_str()))
+    let same_origin = hop.scheme() == a.scheme
+        && hop.host_str() == Some(a.host.as_str())
+        && hop.port_or_known_default() == a.port;
+    same_origin.then_some((a.user.as_str(), a.pass.as_str()))
 }
 
 /// Everything resolved: CLI/env over pypiron.toml over defaults, all inputs
@@ -885,6 +929,7 @@ impl Resolved {
             &src_base,
             args.source_user.clone().or(sync.source_user),
             args.source_pass.clone().or(sync.source_pass),
+            args.allow_insecure_source,
         )?;
         Ok(Self {
             guard: Arc::new(crate::ssrf::Guard::new(&src_base, &dst_host, &[])?),
@@ -2172,9 +2217,15 @@ async fn sync_one_package(
         }
     }
 
-    // Upstream's authoritative PEP 792 verdict for this run.
-    let upstream_blocks = matches!(&upstream_status, Some(doc) if doc.status.blocks_downloads());
-    let upstream_frozen = matches!(&upstream_status, Some(doc) if !doc.status.is_active());
+    // Upstream's authoritative PEP 792 verdict for this run. A status we couldn't
+    // parse is NOT a verdict — it is neither of these, and nothing is relayed for
+    // it (see `relay_status`); the cursor is held instead so the next run re-reads
+    // it rather than skipping the project forever on a 304.
+    let upstream_blocks =
+        matches!(&upstream_status, UpstreamStatus::Known(doc) if doc.status.blocks_downloads());
+    let upstream_frozen =
+        matches!(&upstream_status, UpstreamStatus::Known(doc) if !doc.status.is_active());
+    let upstream_unreadable = matches!(&upstream_status, UpstreamStatus::Unparseable);
 
     // Hold the cursor (force a re-fetch next run) when this run couldn't fully
     // reconcile despite a clean upload — otherwise a 304 next run masks the gap
@@ -2186,6 +2237,9 @@ async fn sync_one_package(
     // 792 status to relay. Skip both — files already present were still skipped
     // above, so a re-run stays cheap.
     if !resolved.as_private {
+        // An unreadable upstream status leaves the destination's own untouched,
+        // so this run is not fully reconciled: re-fetch next time.
+        hold_cursor |= upstream_unreadable;
         match &local {
             Some(local) => {
                 // Reconcile mutable metadata of files already mirrored: yank
@@ -2349,16 +2403,29 @@ async fn apply_yank_http(
 /// endpoint, when it has drifted. Upstream is authoritative for a mirror, so
 /// this both sets a freeze and clears it. `current` comes from the dest's own
 /// materialized index, so a no-op run issues no write (and triggers no rebuild).
+///
+/// The clear is an admin-authenticated `DELETE`, so an upstream status we can't
+/// read must never reach it: "unparseable" is not "active", and treating it as
+/// one would drop a destination quarantine on the strength of upstream garbage.
+/// That case holds — loudly — and writes nothing.
 async fn relay_status(
     client: &Client,
     resolved: &Resolved,
     pkg: &str,
     local: &SimpleIndex,
-    upstream_status: &Option<ProjectStatusDoc>,
+    upstream_status: &UpstreamStatus,
 ) -> Result<()> {
     let desired = match upstream_status {
-        Some(doc) if !doc.status.is_active() => doc.clone(),
-        _ => ProjectStatusDoc::default(),
+        UpstreamStatus::Unparseable => {
+            warn!(
+                package = %pkg,
+                "sync: upstream sent a project-status we can't parse; holding the destination's \
+                 status unchanged (a status relay would clear a freeze we can't confirm is lifted)"
+            );
+            return Ok(());
+        }
+        UpstreamStatus::Known(doc) if !doc.status.is_active() => doc.clone(),
+        UpstreamStatus::Known(_) | UpstreamStatus::Absent => ProjectStatusDoc::default(),
     };
     let current = local.project_status.clone().unwrap_or_default();
     if current == desired {
@@ -2393,7 +2460,7 @@ fn select_from_index(
     spec: &PackageSpec,
 ) -> (
     Vec<Selected>,
-    Option<ProjectStatusDoc>,
+    UpstreamStatus,
     UpstreamFiles,
     // The newer-bound watermark: earliest upload-time among files held back only
     // by `--exclude-newer`. `None` if nothing is in the cooldown.
@@ -2416,7 +2483,9 @@ fn select_from_index(
             .unwrap_or_else(|| raw.to_string())
     };
 
-    let upstream_status = index.project_status.clone();
+    // Three states, not two: a `project-status` we couldn't parse is carried
+    // through as its own thing so the relay can refuse to act on it.
+    let upstream_status = index.upstream_status();
     // Every upstream filename → its yank, captured before filtering: reconcile
     // must distinguish "filtered out, still upstream" from "gone upstream".
     // Normalize to the form the server persists, so reconcile is idempotent
@@ -2560,19 +2629,37 @@ async fn download_provenance(
 /// existed. Hash mismatches retry too: a truncated body looks identical.
 const DOWNLOAD_ATTEMPTS: u32 = 3;
 
+/// Ceiling for an artifact whose listing declares no `size` and whose mirror has
+/// no `--exclude-larger` to fall back on. An unsized file is not a licence to
+/// fill the spool disk (three attempts over, at `--concurrency` in flight). 1 GiB
+/// matches the destination's own request-body limit: a file above it could never
+/// be uploaded anyway, so spooling it is pure disk burn.
+const MAX_UNSIZED_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The most bytes one download may write to the spool. The listing's declared
+/// `size` is the tight bound; a listing that omits it (which a hostile or MITM'd
+/// source controls) falls back to the operator's own size filter, then to a hard
+/// constant.
+fn spool_ceiling(file: &SimpleFile, mirror: &ResolvedMirror) -> u64 {
+    file.size
+        .or(mirror.exclude_larger)
+        .unwrap_or(MAX_UNSIZED_ARTIFACT_BYTES)
+}
+
 async fn download_verified(
     client: &Client,
     guard: &crate::ssrf::Guard,
     file: &SimpleFile,
     spool_dir: &Path,
     source_auth: Option<&SourceAuth>,
+    max_bytes: u64,
 ) -> Result<FinishedSpool> {
     let expected = file
         .sha256()
         .ok_or_else(|| anyhow!("no sha256 for {}", file.filename))?;
     let mut last_err = None;
     for attempt in 1..=DOWNLOAD_ATTEMPTS {
-        match download_once(client, guard, file, spool_dir, source_auth).await {
+        match download_once(client, guard, file, spool_dir, source_auth, max_bytes).await {
             Ok(spool) if spool.sha256.eq_ignore_ascii_case(expected) => return Ok(spool),
             Ok(spool) => {
                 last_err = Some(anyhow!(
@@ -2597,8 +2684,8 @@ async fn download_verified(
 /// Stream the artifact to a spool file on disk, hashing as it lands, so RAM
 /// stays chunk-sized regardless of wheel size. The old path read the whole body
 /// into a `Vec` — and at default concurrency ~32 artifacts were resident at
-/// once, OOMing a small box. The upstream-declared `size` bounds the read: a
-/// body that overruns it is wrong (it would fail the sha check anyway) and is
+/// once, OOMing a small box. `max_bytes` (see [`spool_ceiling`]) bounds the read:
+/// a body that overruns it is wrong (it would fail the sha check anyway) and is
 /// aborted before it can fill the disk.
 async fn download_once(
     client: &Client,
@@ -2606,6 +2693,7 @@ async fn download_once(
     file: &SimpleFile,
     spool_dir: &Path,
     source_auth: Option<&SourceAuth>,
+    max_bytes: u64,
 ) -> Result<FinishedSpool> {
     let url = reqwest::Url::parse(&file.url)
         .with_context(|| format!("unparseable file URL for {}", file.filename))?;
@@ -2621,14 +2709,12 @@ async fn download_once(
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         spool.write_chunk(&chunk?).await?;
-        if let Some(max) = file.size {
-            if spool.size() > max {
-                bail!(
-                    "{} overran its declared size ({} > {max} bytes)",
-                    file.filename,
-                    spool.size()
-                );
-            }
+        if spool.size() > max_bytes {
+            bail!(
+                "{} overran its download ceiling ({} > {max_bytes} bytes)",
+                file.filename,
+                spool.size()
+            );
         }
     }
     spool.finish().await
@@ -2652,6 +2738,7 @@ async fn upload_via_http(
         &s.file,
         &resolved.spool_dir,
         resolved.source_auth.as_ref(),
+        spool_ceiling(&s.file, &resolved.mirror),
     )
     .await?;
 
@@ -3109,45 +3196,104 @@ mod tests {
     #[test]
     fn source_auth_resolves_and_fails_closed() {
         // Neither half set: anonymous source, no auth.
-        assert!(resolve_source_auth("https://pypi.org", None, None)
+        assert!(resolve_source_auth("https://pypi.org", None, None, false)
             .unwrap()
             .is_none());
-        // Both set: host captured from --from for scoping.
+        // Both set: the full origin is captured from --from for scoping.
         let a = resolve_source_auth(
             "http://devpi.internal:3141/team/dev/+simple",
             Some("reader".into()),
             Some("secret".into()),
+            true,
         )
         .unwrap()
         .expect("auth present");
-        assert_eq!(a.host, "devpi.internal");
+        assert_eq!(
+            (a.scheme.as_str(), a.host.as_str(), a.port),
+            ("http", "devpi.internal", Some(3141))
+        );
         assert_eq!((a.user.as_str(), a.pass.as_str()), ("reader", "secret"));
+        // A scheme with a known default port normalizes to it, so `https://h`
+        // and `https://h:443` are the same origin.
+        for base in ["https://devpi.internal", "https://devpi.internal:443"] {
+            let a = resolve_source_auth(base, Some("r".into()), Some("s".into()), false)
+                .unwrap()
+                .expect("auth present");
+            assert_eq!(a.port, Some(443), "{base}");
+        }
         // One half without the other refuses to start (fail-closed).
         for (u, p) in [
             (Some("reader".to_string()), None),
             (None, Some("secret".to_string())),
         ] {
-            let err = resolve_source_auth("https://pypi.org", u, p).unwrap_err();
+            let err = resolve_source_auth("https://pypi.org", u, p, false).unwrap_err();
             assert!(err.to_string().contains("must be set together"));
         }
+        // Credentials over plaintext http refuse to start without the override.
+        let err = resolve_source_auth(
+            "http://devpi.internal:3141/team/dev/+simple",
+            Some("reader".into()),
+            Some("secret".into()),
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("plaintext http://"), "{msg}");
+        assert!(msg.contains("--allow-insecure-source"), "{msg}");
+        // ...but a plaintext source with no credentials is not this check's
+        // business: there is nothing to leak.
+        assert!(
+            resolve_source_auth("http://devpi.internal:3141", None, None, false)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
-    fn hop_auth_attaches_only_on_the_source_host() {
-        let a = SourceAuth {
-            host: "devpi.internal".into(),
-            user: "reader".into(),
-            pass: "secret".into(),
+    fn hop_auth_attaches_only_on_the_source_origin() {
+        let source = |base: &str| {
+            resolve_source_auth(base, Some("reader".into()), Some("secret".into()), true)
+                .unwrap()
+                .expect("auth present")
         };
-        // Same host (any port/scheme): the credential attaches.
-        let on_host = reqwest::Url::parse("http://devpi.internal:3141/team/dev/+f/x.whl").unwrap();
-        assert_eq!(hop_auth(Some(&a), &on_host), Some(("reader", "secret")));
-        // Off-host redirect (a CDN, a hostile Location): nothing — the source
-        // credential must never leave the source host.
-        let off_host = reqwest::Url::parse("https://cdn.evil.example/x.whl").unwrap();
-        assert_eq!(hop_auth(Some(&a), &off_host), None);
+        let a = source("https://devpi.internal:8443/team/dev/+simple");
+        // The source's own origin: the credential attaches.
+        let on_origin =
+            reqwest::Url::parse("https://devpi.internal:8443/team/dev/+f/x.whl").unwrap();
+        assert_eq!(hop_auth(Some(&a), &on_origin), Some(("reader", "secret")));
+        // Everything else gets nothing. A redirect `Location` is attacker-
+        // influenceable, so the host alone is not a scope: a plaintext downgrade
+        // of the same name, or another port on it, is a different service.
+        for hop in [
+            // Off-host redirect (a CDN, a hostile Location).
+            "https://cdn.evil.example/x.whl",
+            // Same host, plaintext downgrade — the credential in the clear.
+            "http://devpi.internal:8443/x.whl",
+            // Same host and scheme, another port — another service.
+            "https://devpi.internal:9443/x.whl",
+            // Same host and scheme, the scheme's default port.
+            "https://devpi.internal/x.whl",
+            // A subdomain is not the host.
+            "https://evil.devpi.internal:8443/x.whl",
+        ] {
+            let hop = reqwest::Url::parse(hop).unwrap();
+            assert_eq!(hop_auth(Some(&a), &hop), None, "{hop}");
+        }
+        // The default port is the same origin as naming it explicitly.
+        let d = source("https://devpi.internal/simple");
+        for hop in [
+            "https://devpi.internal/x.whl",
+            "https://devpi.internal:443/x.whl",
+        ] {
+            let hop = reqwest::Url::parse(hop).unwrap();
+            assert_eq!(
+                hop_auth(Some(&d), &hop),
+                Some(("reader", "secret")),
+                "{hop}"
+            );
+        }
         // No credential configured: nothing to attach.
-        assert_eq!(hop_auth(None, &on_host), None);
+        assert_eq!(hop_auth(None, &on_origin), None);
     }
 
     #[test]
@@ -3486,6 +3632,29 @@ mod tests {
         assert!(matches_mirror(&sized(10), &f)); // under
                                                  // No size in the listing → can't prove it's oversize → kept.
         assert!(matches_mirror(&named_file("foo-1.0-py3-none-any.whl"), &f));
+    }
+
+    #[test]
+    fn spool_ceiling_bounds_an_unsized_download() {
+        let unsized_file = named_file("foo-1.0-py3-none-any.whl");
+        let sized = SimpleFile {
+            size: Some(4096),
+            ..named_file("foo-1.0-py3-none-any.whl")
+        };
+        let capped = ResolvedMirror {
+            exclude_larger: Some(1000),
+            ..base_filter()
+        };
+        // A declared size is the tight bound, whatever the filter says.
+        assert_eq!(spool_ceiling(&sized, &capped), 4096);
+        assert_eq!(spool_ceiling(&sized, &base_filter()), 4096);
+        // No declared size (which a hostile source controls): fall back to the
+        // operator's own size filter, then to the hard constant. Never unbounded.
+        assert_eq!(spool_ceiling(&unsized_file, &capped), 1000);
+        assert_eq!(
+            spool_ceiling(&unsized_file, &base_filter()),
+            MAX_UNSIZED_ARTIFACT_BYTES
+        );
     }
 
     #[test]

@@ -19,8 +19,9 @@ through its **IAM role**.
         │ commit fix                                      │ read findings
    ┌────┴──────────────────────────┐                      │
    │ fixer routine (cloud, hourly) │◀─────────────────────┘
-   │ → verify_fix.workflow.js      │   (rejected → left for a human)
-   │ → gate: locus+panel+empirical │
+   │ → verify_fix.workflow.js      │   (rejected or failed →
+   │ → gate: locus+panel+empirical │    left for a human)
+   │ → apply: fixed script, no LLM │
    └───────────────────────────────┘
 ```
 
@@ -101,6 +102,31 @@ stamped with a commit whose bug had been fixed locally 12 hours earlier.
 Turn on the autonomous fixer once you trust it — see
 [fixer-routine.md](fixer-routine.md).
 
+Judgment is agentic; landing the fix is not. Agents reproduce and diagnose it,
+fix it in an isolated worktree, and then four of them verify (locus, two
+adversarial lenses, an independent empirical re-run). On a unanimous pass the
+workflow writes the commit message itself — from the seed, the signature, the
+oracle name and the gate results, never from an agent's prose — and runs a fixed
+`git apply --check` → `git apply` → `make check` → commit → push, with the patch
+handed over as a file path rather than as diff text and no decision left in the
+step. A non-zero exit anywhere stops it, and the finding goes to
+`findings-needs-human/` — the same place a rejected fix goes. Every result the
+workflow returns carries `needs_human`, so the routine files it without having
+to interpret an outcome string.
+
+Where the commit lands: the apply step runs in its own throwaway worktree, so
+nothing touches your working tree, and the commit reaches `origin/master`
+directly — your checkout sees it on the next `git pull`, not before. Only the
+build cache is shared: `make check` there is pinned to
+`<your checkout>/.local/target-soak`, so a fix attempt reuses one target
+directory instead of growing a fresh ~600 MB tree it then abandons.
+
+The trade is that the message states the seed,
+the signature, the oracle and the gate results rather than a root-cause
+narrative: prose is the one field only an agent could write, and a commit
+message assembled from the finding's own fields is one an agent that read the
+patch cannot steer.
+
 Teardown: `./fleet.sh destroy` removes the compute but keeps the bucket (your
 findings); `./fleet.sh destroy --all` empties and deletes the bucket too. It's a
 single dedicated bucket named by account, so re-runs reuse it — buckets don't
@@ -155,7 +181,7 @@ Without a bucket the reporter still records findings to a local fallback file.
 | `fetch-bundle.sh` + `pypiron-soak-refresh.{service,timer}` | poll S3, reinstall + restart when the bundle changes |
 | `install.sh` | wire the units up from an extracted bundle (idempotent) |
 | `../../../.github/workflows/soak-bundle.yml` | CI: build arm64 + ship the bundle to S3 on master push |
-| `verify_fix.workflow.js` | reproduce → fix in src/ → **verify gate** → commit/escalate |
+| `verify_fix.workflow.js` | reproduce → fix in src/ → **verify gate** → mechanical apply+push, else escalate |
 | `fixer-routine.md` | the hourly cloud-routine prompt that drains findings |
 
 ## Security posture (fail-closed)
@@ -181,3 +207,12 @@ Without a bucket the reporter still records findings to a local fallback file.
 - The autonomous fixer **cannot weaken an invariant**: the verify gate rejects
   any diff that loosens the checker and commits only a src/ fix that three
   independent checks agree is a genuine cure. Doubt escalates to a human.
+- **A finding is data, never instructions.** It arrives from a fleet that reads
+  simulator output, so the reporter allowlists the repro to the `vopr` argv shape
+  and caps/strips the signature, and the workflow treats what it gets the same
+  way: the patch is quoted into reviewer prompts between marker lines carrying a
+  token hashed from the patch itself (so a diff cannot forge the end marker), the
+  commit message is assembled from structured fields and sanitized before it can
+  reach a shell, and the step that pushes is a fixed command list that sees a
+  validated file path instead of the diff. No agent between the finding and
+  master's history is free to act on what it read.

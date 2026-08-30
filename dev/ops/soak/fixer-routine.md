@@ -41,12 +41,20 @@ routine needs AWS creds (list/move findings) and its own GitHub push creds.
 >    b. Claim it: `aws s3 mv` it to `soak/findings-fixing/` (a lightweight lock).
 >    c. Run the `vopr-verified-fix` Workflow (dev/ops/soak/verify_fix.workflow.js)
 >       with `{ repro, signature, commit: true }`.
->    d. On the returned `outcome`:
->       - `committed` → `aws s3 mv` the object to `soak/findings-resolved/`. (The
->         push triggers CI → new bundle → the fleet refreshes within ~10 min.)
->       - `rejected` / `fix-escalated` / `escalate-checker-suspect` /
->         `not-reproduced` → `aws s3 mv` it to `soak/findings-needs-human/` and
->         write the Workflow's reasons into the object. Do **not** loop-retry.
+>    d. Route on the returned `needs_human` flag. The Workflow sets it on every
+>       result that is not a clean committed push, so the flag is the rule and
+>       the outcome string is only the reason:
+>       - `needs_human: false` (`outcome: committed`) → `aws s3 mv` the object to
+>         `soak/findings-resolved/`. (The push triggers CI → new bundle → the
+>         fleet refreshes within ~10 min.)
+>       - `needs_human: true` → `aws s3 mv` it to `soak/findings-needs-human/`
+>         and write the Workflow's reasons into the object. Do **not** loop-retry.
+>         Today that covers `rejected`, `fix-escalated`,
+>         `escalate-checker-suspect`, `not-reproduced`, `verified-not-committed`,
+>         and `apply-failed` — a fix that cleared every gate but whose mechanical
+>         apply → `make check` → commit → push hit a non-zero exit (older builds
+>         called that one `commit-failed`). An outcome you don't recognise goes
+>         here too; the flag already said so.
 > 3. Summarize: findings seen, committed, escalated.
 >
 > Absolute rule: the Workflow's verify gate decides. Never commit a fix it

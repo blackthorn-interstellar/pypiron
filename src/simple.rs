@@ -143,6 +143,16 @@ pub enum UpstreamStatus {
 }
 
 impl SimpleIndex {
+    /// Build an active-project listing from an adapter whose source protocol
+    /// carries files but has no PEP 792 project-status field.
+    pub(crate) fn active(files: Vec<SimpleFile>) -> Self {
+        Self {
+            files,
+            project_status: None,
+            project_status_unparseable: false,
+        }
+    }
+
     /// The upstream verdict with "unparseable" kept distinct from "absent", for
     /// callers that would otherwise act on the difference.
     pub fn upstream_status(&self) -> UpstreamStatus {

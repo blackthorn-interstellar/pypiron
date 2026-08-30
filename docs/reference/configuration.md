@@ -423,8 +423,9 @@ Rules:
 
 - Package specs are names with optional PEP 440 specifiers:
   `requests`, `six==1.16.0`, `requests>=2.20,<3`.
-- `sync` requires an include list. Proxy without an include list is open for
-  any non-private package.
+- `sync` normally requires an include list. A pypicloud private migration may
+  use `--private-pattern` or `--private-patterns-from` as its work list instead.
+  Proxy without an include list is open for any non-private package.
 - Leaving an include or exclude list out is how you say "no list". Setting one
   to empty — `include-packages = []`, `PYPIRON_INCLUDE_PACKAGE=""` — is refused
   at startup, because it would erase a list set elsewhere and serve more than
@@ -479,8 +480,9 @@ directly.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `--from URL` | `PYPIRON_SYNC_FROM` | `https://pypi.org` | Source simple index. Name it in full when it lives off the standard `/simple` path (devpi: `.../<user>/<index>/+simple`). |
-| `--source-user USER` | `PYPIRON_SYNC_SOURCE_USER` | none | Username for an authenticated source (private devpi/Artifactory/Nexus). Sent only to the source itself — same scheme, host and port — never to a redirect that goes anywhere else. Requires `--source-pass`; also `[sync].source-user`. |
+| `--from URL` | `PYPIRON_SYNC_FROM` | `https://pypi.org` | Source index. Name a Simple endpoint in full when it lives off `/simple` (devpi: `.../<user>/<index>/+simple`). With `--source-kind pypicloud`, use the pypicloud application root instead. |
+| `--source-kind simple\|pypicloud` | `PYPIRON_SOURCE_KIND` | `simple` | Source protocol. `simple` reads the PEP 691 JSON Simple API. `pypicloud` reads `/api/package/`, requires `--as-private`, and accepts private-name patterns; also `[sync].source-kind`. |
+| `--source-user USER` | `PYPIRON_SYNC_SOURCE_USER` | none | Username for an authenticated source (pypicloud, private devpi, Artifactory, or Nexus). Sent only to the source itself — same scheme, host and port — never to a redirect that goes anywhere else. Requires `--source-pass`; also `[sync].source-user`. |
 | `--source-pass PASS` | `PYPIRON_SYNC_SOURCE_PASS` | none | Password for an authenticated source. Requires `--source-user`; also `[sync].source-pass`. |
 | `--allow-insecure-source` | `PYPIRON_ALLOW_INSECURE_SOURCE` | `false` | Permit `--source-user`/`--source-pass` against a plaintext `http://` source. Off by default: over http the credential goes out in the clear, and a MITM who takes it controls both the artifact bytes and the sha256 they are verified against. A plaintext source with no credentials needs nothing. |
 | `--upstream-ca-cert PEM` | `PYPIRON_UPSTREAM_CA_CERT` | none | PEM bundle of extra CA certificates to trust for the **source** TLS — the private root a corporate forwarding TLS proxy (a MITM appliance) presents. Augments the built-in roots; loaded fail-closed at startup. See [Behind a forward proxy](#behind-a-forward-proxy-or-tls-interception). |
@@ -489,6 +491,8 @@ directly.
 | `--admin-pass PASS` | `PYPIRON_SYNC_ADMIN_PASS` | none | Destination admin password. |
 | `--private-prefix PREFIX` | `PYPIRON_PRIVATE_PREFIX` | none | Refuse to mirror private names. |
 | `--as-private` | `PYPIRON_SYNC_AS_PRIVATE` | `false` | Migrate the source index into pypiron's private namespace instead of mirroring it. Timestamps and yank state are not preserved — migrated files carry the migration date. Won't convert a name the destination already holds as public — that needs an explicit empty-then-`origin release` ([Dependency confusion](../security.md#dependency-confusion)). See [Migrate off another index](../guides/migrate.md). |
+| `--private-pattern PATTERN` | `PYPIRON_PRIVATE_PATTERN` | none | Declare pypicloud project names private. Repeatable; matches the entire PEP 503-normalized name and supports only `*`. A bare `*` is refused. Valid only with `--source-kind pypicloud --as-private`; also `[sync].private-patterns`. |
+| `--private-patterns-from FILE` | `PYPIRON_PRIVATE_PATTERNS_FROM` | none | Read pypicloud private-name patterns from a file, one per line. Blank lines and `#` comments are ignored; also `[sync].private-patterns-from`. |
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | relay from `--from` | Ferry the advisory snapshot to `--to` alongside the packages. Unset relays the source server's feed (`GET <from>/advisories/feed`); a URL or path fetches that instead; `""` disables. Best-effort: a feed-less source or a destination without the endpoint warns and the package sync proceeds. Also `[sync].advisory-feed`. |
 | `--concurrency N` | `PYPIRON_SYNC_CONCURRENCY` | `4` | Transfers within one package. |
 | `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8` | Packages in parallel. |

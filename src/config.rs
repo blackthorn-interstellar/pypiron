@@ -178,6 +178,9 @@ pub struct BucketOverride {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SyncConfig {
     pub from: Option<String>,
+    /// Source protocol: the standard PEP 691 Simple API, or pypicloud's
+    /// package API for a private-package migration.
+    pub source_kind: Option<String>,
     pub to: Option<String>,
     pub admin_user: Option<String>,
     pub admin_pass: Option<String>,
@@ -186,6 +189,10 @@ pub struct SyncConfig {
     /// password via `PYPIRON_SYNC_SOURCE_PASS`.
     pub source_user: Option<String>,
     pub source_pass: Option<String>,
+    /// Whole-name patterns that declare which pypicloud projects are private.
+    pub private_patterns: Option<Vec<String>>,
+    /// File of private-name patterns, one per line.
+    pub private_patterns_from: Option<PathBuf>,
     pub concurrency: Option<usize>,
     pub package_concurrency: Option<usize>,
     /// Mirror files whose version isn't valid PEP 440. Off by default (skip them).
@@ -219,6 +226,7 @@ pub fn load(explicit: Option<&Path>) -> Result<ConfigFile> {
 
     rebase_relative(&mut cfg.mirror.include_packages_from, &path);
     rebase_relative(&mut cfg.mirror.exclude_packages_from, &path);
+    rebase_relative(&mut cfg.sync.private_patterns_from, &path);
     // Announce only after a clean parse — silent auto-discovery of
     // ./pypiron.toml is how an unrelated CLI invocation gets quietly rewired,
     // but a malformed file shouldn't claim it "loaded". The read/parse errors
@@ -248,6 +256,8 @@ mod tests {
 
             [sync]
             to = "http://localhost:8080"
+            source-kind = "pypicloud"
+            private-patterns = ["acme-*", "internal-tool"]
             concurrency = 8
             package-concurrency = 16
 
@@ -268,6 +278,8 @@ mod tests {
         assert_eq!(cfg.mirror.exclude_packages.unwrap().len(), 1);
         assert_eq!(cfg.sync.concurrency, Some(8));
         assert_eq!(cfg.sync.package_concurrency, Some(16));
+        assert_eq!(cfg.sync.source_kind.as_deref(), Some("pypicloud"));
+        assert_eq!(cfg.sync.private_patterns.unwrap().len(), 2);
         assert_eq!(cfg.mirror.include_format.unwrap(), ["wheel"]);
         assert_eq!(
             cfg.mirror.exclude_newer.as_deref(),
@@ -417,6 +429,11 @@ mod tests {
             Some(vec!["wheel".to_string(), "sdist".to_string()])
         );
         assert_eq!(cfg.sync.to.as_deref(), Some("http://localhost:8080"));
+        assert_eq!(cfg.sync.source_kind.as_deref(), Some("simple"));
+        assert_eq!(
+            cfg.sync.private_patterns,
+            Some(vec!["acme-*".to_string(), "internal-tool".to_string()])
+        );
         assert_eq!(cfg.sync.concurrency, Some(4));
     }
 

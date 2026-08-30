@@ -793,24 +793,17 @@ fn rfc3339_unix(s: &str) -> Option<i64> {
 
 // ---- embedded trust root ----
 
-/// The Sigstore trust root baked into the binary (gzip-compressed JSON), parsed
-/// once. `None` only if the embedded asset is unreadable — which fails all
-/// verification closed, never a startup error.
+/// The Sigstore trust root baked into the binary, parsed once. `None` only if
+/// the embedded asset is unparseable — which fails all verification closed,
+/// never a startup error.
+///
+/// Stored as plain JSON (7 KB) rather than gzip so a refresh shows up as a
+/// readable `git diff`; `dev/scripts/fetch-trust-root.sh` regenerates it from a
+/// pinned sigstore/root-signing commit.
 fn embedded_trust_root() -> Option<&'static TrustedRoot> {
     static ROOT: OnceLock<Option<TrustedRoot>> = OnceLock::new();
-    ROOT.get_or_init(|| {
-        use std::io::Read as _;
-        let raw: &[u8] = include_bytes!("assets/trusted_root.json.gz");
-        let mut buf = Vec::new();
-        if flate2::read::GzDecoder::new(raw)
-            .read_to_end(&mut buf)
-            .is_err()
-        {
-            return None;
-        }
-        serde_json::from_slice(&buf).ok()
-    })
-    .as_ref()
+    ROOT.get_or_init(|| serde_json::from_slice(include_bytes!("assets/trusted_root.json")).ok())
+        .as_ref()
 }
 
 #[derive(Deserialize)]

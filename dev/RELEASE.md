@@ -9,8 +9,7 @@ version-bump commit.
 ## Make a release
 
 ```bash
-# Refresh the embedded Sigstore trust root used for offline PEP 740 verification.
-# Rotates rarely; review the diff and commit any change before tagging.
+# Refresh the embedded Sigstore trust root (below). Skip unless it moved.
 ./dev/scripts/fetch-trust-root.sh
 
 make release-notes TO=HEAD
@@ -30,15 +29,30 @@ publishing. Nothing is published if the tests fail.
 ### Embedded Sigstore trust root
 
 pypiron verifies mirrored PEP 740 provenance offline against a Sigstore trust
-root baked into the binary (`src/assets/trusted_root.json.gz`) — no TUF updater,
-no runtime fetch. The root (Fulcio CA chain, Rekor and CT log keys, each with
-validity windows) rotates rarely; `dev/scripts/fetch-trust-root.sh` re-embeds
-the current one, and we run it at release time. This is **fail-safe by design**:
+root baked into the binary (`src/assets/trusted_root.json`) — no TUF updater, no
+runtime fetch. The root (Fulcio CA chain, Rekor and CT log keys, each with
+validity windows) rotates rarely, and `dev/scripts/fetch-trust-root.sh` re-embeds
+it. This is **fail-safe by design**:
 a bundle signed under a root *newer* than the one embedded — or in a log whose
 key we don't yet carry — resolves to "not verified" and falls back to the
 relayed + digest-bound labeling. It never fail-opens, so a stale embedded root
 only shrinks verified coverage; it can never mislabel an unverified bundle as
 verified.
+
+Because that root decides which signers we call verified, it is pinned, not
+followed. The script fetches `targets/trusted_root.json` from the exact
+`sigstore/root-signing` commit named by `TRUST_ROOT_COMMIT` at the top of the
+script, and refuses anything that isn't a full 40-char sha — a branch would let
+upstream change what we trust between runs. To take a new root:
+
+1. Find the upstream commit that changed the file and read that commit.
+2. Set `TRUST_ROOT_COMMIT` to its sha.
+3. Run `./dev/scripts/fetch-trust-root.sh`. It prints the sha256 of what it
+   fetched and fails if the commit doesn't resolve.
+4. `git diff -- src/assets/trusted_root.json` — the root is embedded as plain
+   JSON, so the diff is the actual keys and validity windows that changed. Read
+   it. New CAs or log keys are the whole point of the review.
+5. Commit the script and the asset together.
 
 The same per-target builds double as standalone binaries: CI pulls the compiled
 executable out of each wheel (no second compile), and the `release-binaries` job

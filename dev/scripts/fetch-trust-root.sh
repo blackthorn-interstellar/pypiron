@@ -8,12 +8,24 @@
 # under a NEWER root than the one embedded fails safe to "not verified" — never
 # fail-open — so a stale root only shrinks verified coverage, it never mislabels.
 #
+# The root comes from a pinned upstream commit, never a branch: a moving ref
+# plus a shape check is not review. Bumping TRUST_ROOT_COMMIT is the deliberate
+# act, and the JSON is embedded uncompressed so `git diff` shows what changed.
+#
 # Run this before cutting a release (see dev/RELEASE.md), review the diff, and
-# commit the regenerated src/assets/trusted_root.json.gz.
+# commit the regenerated src/assets/trusted_root.json.
 set -euo pipefail
 
-SRC="https://raw.githubusercontent.com/sigstore/root-signing/main/targets/trusted_root.json"
-OUT="src/assets/trusted_root.json.gz"
+# sigstore/root-signing commit to take targets/trusted_root.json from.
+TRUST_ROOT_COMMIT=c9bda74ad2221f938f7d2e0295ca3aad2da710a8
+
+OUT="src/assets/trusted_root.json"
+
+if [[ ! $TRUST_ROOT_COMMIT =~ ^[0-9a-f]{40}$ ]]; then
+    echo "TRUST_ROOT_COMMIT must be a full 40-char commit sha, not a branch or tag" >&2
+    exit 1
+fi
+SRC="https://raw.githubusercontent.com/sigstore/root-signing/$TRUST_ROOT_COMMIT/targets/trusted_root.json"
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$repo_root"
@@ -22,21 +34,26 @@ tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
 echo "Fetching $SRC"
-curl -fsSL --max-time 30 "$SRC" -o "$tmp"
+if ! curl -fsSL --max-time 30 "$SRC" -o "$tmp"; then
+    echo "Fetch failed: does commit $TRUST_ROOT_COMMIT exist upstream?" >&2
+    exit 1
+fi
 
 # Sanity-check it parses and carries the pieces the verifier needs before we
-# embed it — a truncated or reshaped root must not silently ship.
+# embed it — a truncated or reshaped root must not silently ship — and print the
+# digest of exactly what we fetched so it can be quoted in review.
 python3 - "$tmp" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1]))
+import hashlib, json, sys
+raw = open(sys.argv[1], "rb").read()
+d = json.loads(raw)
 for key in ("certificateAuthorities", "tlogs", "ctlogs"):
     if not d.get(key):
         raise SystemExit(f"trusted_root.json missing/empty {key!r}; refusing to embed")
 print(f"OK: {len(d['certificateAuthorities'])} CAs, "
       f"{len(d['tlogs'])} tlogs, {len(d['ctlogs'])} ctlogs")
+print(f"sha256: {hashlib.sha256(raw).hexdigest()}")
 PY
 
-# Deterministic gzip (-n: no name/timestamp) so an unchanged root yields an
-# unchanged blob and a clean git diff.
-gzip -9 -n -c "$tmp" > "$OUT"
-echo "Wrote $OUT ($(wc -c < "$OUT") bytes)"
+# Redirect rather than `cp`, which would carry mktemp's 0600 onto a tracked file.
+cat "$tmp" > "$OUT"
+echo "Wrote $OUT ($(wc -c < "$OUT") bytes) — review with: git diff -- $OUT"

@@ -486,8 +486,13 @@ under one grace deadline (`--fanout-grace-secs`, default 30) measured from the
 selected write's completion. A secondary that fails, times out, or is ineligible
 gets one durable `_repl/` repair note in the selected bucket **before the ack**;
 notes are the failure path only, so a healthy fleet acks with every bucket
-holding the record and no note written. Deletes, yanks, and status changes fan
-out the same way. Because every bucket holds everything at ack time, reads pin
+holding the record and no note written. The note is not best-effort: it is the
+fleet's only record that a peer is owed the file, and nothing else re-derives one
+(`_dirty/` markers drive index rebuilds, not replication). A note write that
+fails is retried once and then **refuses the ack** — 503, with a body saying the
+change is durable here but the gap could not be recorded — rather than returning
+200 over the one state the totality principle forbids. Deletes, yanks, and status
+changes fan out the same way. Because every bucket holds everything at ack time, reads pin
 one bucket and serve with no replication-lag windows.
 
 Beside the fleet-wide write selection, each node holds a per-node **read
@@ -554,6 +559,40 @@ so it issues a signed CopyObject/rewrite/Copy Blob (zero bytes through the node)
 before falling back to streaming and then the `_repl/` note. The matrix is
 verified once at boot by copying the topology stamp per pair; `decide` and the
 merge algebra never see the transport, so convergence is transport-invariant.
+
+Every pair the matrix refuses — multi-cloud, two endpoints of one cloud, two
+credential identities — moves its bytes *through* the node, which is the common
+case, not a fallback. That leg streams: the source body is hashed chunk by chunk
+as it arrives and staged past the multipart threshold (64 MiB) to a temp file
+(the upload spool, reused), and the destination write takes that file. Resident
+memory per in-flight copy is therefore `min(artifact size, that threshold)`:
+anything smaller is held once and PUT in one request, anything larger streams to
+disk and then out in multipart parts. The sweep's sixteen-copies-per-destination
+fan-out peaks at 16 × 64 MiB per destination, which is what makes it safe on a
+corpus with 900 MB wheels in it. The threshold is shared with the upload path on
+purpose — staging earlier would only add a disk round-trip, since a body at or
+under it is read back into memory to issue the one conditional PUT. The sha256 is compared against the source sidecar before the first
+destination write, so a source that cannot be verified never puts a byte on a
+peer — the streaming transport's equivalent of the copy transport's
+content-checksum check, and the reason its ordering can be body-first.
+
+**Ordering within a copy: the body, then the sidecar that names it.** A sidecar
+is a bucket's assertion that a filename is truth with a given sha256, and nothing
+downstream re-derives it — `decide` compares sidecar shas, the renderer copies
+the sha into `simple/`, no audit re-hashes a stored body — so a sidecar standing
+over a key whose body is not (yet) the one it names is a lie no reader on a hot
+path can catch. Published in that order a crash is also *unhealable*: a bare
+artifact gets a real sidecar from `worker::backfill_sidecar`, while a bare
+sidecar has no repairer and simply waits for the next writer to take the still-
+free immutable key with different bytes. So every writer that owns the artifact
+key's conditional create lands the bytes first: both upload origins and the
+streaming replication copy. The server-side copy transport is the one exemption
+and stays sidecar-first, because its copy verb has no create-if-absent and a
+pre-check is the only gate it can have; `supersede_record`, which replaces rather
+than creates, brackets its body-then-sidecar pair in a `.superseding` intent
+marker so a crash between the two is a recognizable torn record the next rebuild
+finishes. Pinned as a property of the write *sequence* in
+`tests/conformance_publish_ordering.rs`.
 
 Correctness does not depend on every node selecting the same bucket. The merge
 (`replicate::decide`, pure and unit-tested) has precedence
@@ -786,12 +825,18 @@ _advisories/osv-pypi.zip                 # the OSV PyPI advisory export, carried
                                          #   and the leader refetches (or a sync/ferry re-delivers).
                                          #   Never per-package truth. Reader GET / admin PUT
                                          #   /advisories/feed.
-_advisories/quarantined.json             # worker-derived set: normalized names whose relayed PEP 792
-                                         #   status is `quarantined`, so the byte gate refuses their
-                                         #   mirror-origin files by a hash probe. A control SINGLETON,
-                                         #   replicated like the zip. Republished only on a clean sweep;
-                                         #   reloaded on the same etag tick as the zip. An ABSENT key on
-                                         #   failover retains the last set (never un-quarantines).
+_advisories/quarantined.json             # normalized names whose relayed PEP 792 status is
+                                         #   `quarantined`, so the byte gate refuses their mirror-origin
+                                         #   files by a hash probe. A DERIVED view of the per-package
+                                         #   .project-status.json sidecars, replicated like the zip
+                                         #   because re-deriving it costs a whole-corpus walk.
+                                         #   {"quarantined":[...],"pypiron-epoch":N}: every writer
+                                         #   read-modify-CASes it — a status write publishes its own
+                                         #   one-name increment, the audit sweep republishes the whole
+                                         #   set as repair — and every node re-polls it every 30 s.
+                                         #   An ABSENT key, an unreadable body (the pre-envelope bare
+                                         #   array parses as unreadable, on purpose) and a LOWER epoch
+                                         #   all retain the last set (never un-quarantines).
 _advisories/report.json                  # the org audit: hosted (name, version) rows a known advisory
                                          #   affects, joined with 30-day counters, ranked by installs.
                                          #   Served admin-gated at /audit + /audit.json. Both this and
@@ -880,7 +925,7 @@ declared class fails CI. Six classes:
 | Prefix | Class | Replicates? |
 | --- | --- | --- |
 | `packages/` | truth-replicated | yes, per record — three-tier fan-out → `_repl/` notes → reconcile. Private truth and `sync --to` snapshots (sidecar `snapshot=true`) fan out pre-ack; proxy-cache fills (sidecar `snapshot` absent/false) replicate too but **asynchronously** — a post-serve `_repl/` note the sweep drains, healed by the reconcile diff — so any bucket serves the whole corpus, cached bytes included. No standing exceptions: a demotion loser *leaves* this tree rather than sitting in it unreplicated — its `.mirror-quarantined` fence replicates, its body moves to `_quarantine/`, and the canonical key ends empty everywhere. The one key under this prefix that is deliberately bucket-local is `<filename>.superseding`, and it is transient rather than an exception: it is not in the replicated record set, it is written and deleted inside one `supersede_record`, and a crash that strands one is cleared unconditionally by the next index rebuild's `finish_interrupted_supersedes` (or by `drop_record_objects`, if a tombstone or freeze lands over the filename first). So the tree converges because the marker always goes, not because it replicates — which is why a bucket-local key can live under a truth-replicated prefix without contradicting the class |
-| `_advisories/osv-pypi.zip`, `_advisories/quarantined.json`, `_transparency/chain/` | singleton-replicated | yes — leader-authored control records written write-through to every healthy bucket + reseed-if-absent; the chain is written through so a failover continues the seq rather than restarting genesis, and `verify-chain` walks every bucket |
+| `_advisories/osv-pypi.zip`, `_advisories/quarantined.json`, `_transparency/chain/` | singleton-replicated | yes — control records written write-through to every healthy bucket + reseed-if-absent; the chain is written through so a failover continues the seq rather than restarting genesis, and `verify-chain` walks every bucket. `quarantined.json` is the one member that is a **derived view**, not authored state: truth is the per-package `.project-status.json` sidecars, and the audit sweep rebuilds the whole set from them, so deleting the key costs one sweep. It is replicated rather than re-derived per bucket because re-deriving costs a walk of the whole corpus, and a node booting onto a bucket that lacks it would come up under-blocked. Nor is it leader-only: every status write publishes its own one-name increment, so a freeze does not wait on a sweep — see below |
 | `_counters/day/` | replicated-rollup | yes — leader-authored, immutable day-rollups, each naming the bucket whose segments it summed (`<shard>@<bucket>.json`), reseeded copy-if-absent until every bucket holds the union, so a failover keeps the /audit ranking and /stats history. The reseed is a union mesh, not a push from the write pin: each bucket authors its own variants, so a peer's rollup has to reach the pin too or a read there would report a short day |
 | `_counters/seg/`, `_quarantine/` | declared-loss | no — two bounded, annotated losses. `_counters/seg/`: the current day's un-rolled-up live tallies, at most one day. `_quarantine/`: the losing byte-sets of freezes and demotions resolved on that bucket — never a byte the fleet serves, never the winner, and always announced by a fence (`.frozen` + tombstone, or `.mirror-quarantined`) that *does* replicate. Calling the quarantine tree "derived" was the comfortable lie: a preserved loser is not recomputable from anything |
 | `simple/`, `_advisories/report.json`, `_state/`, `_sync/cursors.json` | derived-per-bucket | no — each bucket rebuilds/re-derives its own from the truth it holds |
@@ -907,6 +952,30 @@ day is therefore exact once every bucket has been reachable for one rollup pass;
 a bucket unreachable until retention expires loses its share, which is a wider
 window than the ≤1-day live-tally loss and the reason the freeze is per-bucket
 rather than fleet-wide.
+
+**The quarantined set propagates on writes, not on the sweep.** `quarantined.json`
+carries a monotone `pypiron-epoch` (the envelope pattern `.project-status.json`
+already uses), and every writer goes through one read-modify-CAS: read the
+envelope, apply the edit, `epoch+1`, `put_if_match` (or `put_if_none_match` when
+absent), bounded retries, error when they run out. Two kinds of edit:
+
+- an **increment** from a status write — the admin API, or the proxy relaying an
+  upstream freeze — adds or drops exactly that one name, so two nodes freezing two
+  projects at the same moment both land. The writing node also arms its own
+  in-memory set first, so it refuses the bytes on the request that follows;
+- the audit sweep's **repair**, the whole set re-derived from the sidecars,
+  applied only while the stored epoch is still the one the walk read before it
+  started. That is what makes an expired leader harmless: the lease has no fencing
+  token, but a stale sweep's `base_epoch` no longer matches, so it skips rather
+  than un-blocking a project its successor froze.
+
+Every node re-checks the key every 30 s by default (`--quarantine-poll-secs`), on its own
+worker tick — never behind the advisory tick, which runs on `reconcile_interval`
+and serializes behind a 32 MB OSV refetch. Steady state is one 1-key LIST; the
+body is read only when the key moved. Readers never move backwards: an absent key,
+an unreadable body (the pre-envelope bare array now fails to parse on purpose) and
+a lower epoch all keep the live set, so a failover onto a stale bucket cannot
+un-block anything. The reseed heals on epoch too, not presence.
 
 `<pkg>` is always the PEP 503 normalized name. Index rebuilds include only
 artifact files — metadata companions, tombstones, freeze markers, and dotfiles
@@ -1030,8 +1099,8 @@ CAS on the copy path — no staged manifest, no promotion barrier: drive `.origi
 to private, move each mirror body to `_quarantine/` behind a `.mirror-quarantined`
 marker, then copy the private record over. The demotion settles on its own when no
 private record follows: the marker is the terminal state, not a step toward one.
-Mirror writers put their create-only
-sidecar before the artifact and re-check that exact claim immediately before
+Mirror writers land the artifact and then the sidecar that names it, like every
+other writer of a `packages/` record, and re-check the claim immediately before
 publish, so a slow download that straddles demotion either aborts or leaves a
 typed mirror loser for later quarantine — which the next audit pass moves aside
 idempotently, under its own content hash, without disturbing the first loser.

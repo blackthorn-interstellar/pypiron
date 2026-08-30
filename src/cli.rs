@@ -887,6 +887,15 @@ pub struct ServeArgs {
     #[arg(long, env = "PYPIRON_RECONCILE_INTERVAL_SECS", default_value = "86400")]
     pub(crate) reconcile_interval_secs: u64,
 
+    /// Seconds between checks of the shared PEP 792 quarantined set. This is how
+    /// long a project frozen on one node takes to be refused by the rest of the
+    /// fleet; the node that received the freeze refuses immediately. One 1-key
+    /// listing per node per interval, so raising it only matters on very large
+    /// fleets. Kept separate from the audit sweep, which runs on
+    /// `--reconcile-interval-secs` and can sit behind a 32 MB advisory refetch.
+    #[arg(long, env = "PYPIRON_QUARANTINE_POLL_SECS", default_value = "30")]
+    pub(crate) quarantine_poll_secs: u64,
+
     /// Seconds between periodic `_repl/` repair-note sweeps (multi-bucket only).
     /// Decoupled from `--worker-interval-secs`: notes exist only after a fan-out
     /// failure, and the sweep also fires immediately when an unhealthy bucket
@@ -1228,6 +1237,11 @@ pub fn merge_serve_file(
         cli.reconcile_interval_secs,
         "reconcile_interval_secs",
         f.reconcile_interval_secs
+    );
+    fill!(
+        cli.quarantine_poll_secs,
+        "quarantine_poll_secs",
+        f.quarantine_poll_secs
     );
     fill!(
         cli.malware_probe_secs,

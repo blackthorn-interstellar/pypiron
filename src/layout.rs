@@ -101,7 +101,7 @@ pub const MANIFEST: &[PrefixClass] = &[
     PrefixClass {
         prefix: crate::advisories::QUARANTINED_KEY,
         class: Class::SingletonReplicated,
-        why: "PEP 792 quarantined-project set: leader-authored byte-gate input, every bucket",
+        why: "PEP 792 quarantined-project set: a byte-gate input DERIVED from the per-package status sidecars (the audit sweep rebuilds it from truth), but every bucket needs it on failover, so it is written through like a control singleton rather than re-derived per bucket. Epoch-CAS'd on the selected bucket; peers get the same epoch-bearing body best-effort and no reader ever moves backwards",
     },
     PrefixClass {
         prefix: crate::advisories::REPORT_KEY,

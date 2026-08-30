@@ -101,11 +101,34 @@ pub(crate) fn signal_for_error(error: &Error) -> BucketSignal {
         return signal;
     }
 
+    // Scan the innermost error only — the provider/transport error, the one
+    // layer no request-supplied name rides on. Every layer above it is our own
+    // `"{backend}: {op} {key}"` context (`Store::store_err`/`classify_get` in
+    // storage.rs), and object_store's middle layers Display the object path and
+    // the request URL. Joining the whole chain therefore let a filename decide
+    // the verdict: a key holding `status code: 200` (a space is a legal
+    // filename byte) scored an outage healthy, and one holding `status code:
+    // 503` — or just the word `quota` — scored a healthy bucket as failing.
+    //
+    // Selecting those middle frames by TYPE instead would not fix that, checked
+    // against object_store 0.14.1: `Error::Generic`'s own Display is
+    // `"Generic {store} error: {source}"`, and that source is the (crate-private)
+    // `RetryError`, whose Display carries the full request URI — the object key
+    // included. `NotFound`/`Precondition`/`AlreadyExists`/`NotModified` Display
+    // `{path}` directly. A typed scan is therefore either key-bearing or, if the
+    // inherited suffix is stripped, contentless.
+    //
+    // Position is not the load-bearing part either way: a 5xx reaches us as
+    // `Generic → RetryError → RequestError::Status`, and only that innermost
+    // frame spells the status without a URL beside it
+    // (`"Server returned non-2xx status code: 503 …"`). There is no typed status
+    // to read instead — object_store keeps `RetryError` `pub(crate)`, so
+    // `.status()` is unreachable from here.
     let text = error
         .chain()
+        .last()
         .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(" ")
+        .unwrap_or_default()
         .to_ascii_lowercase();
     if let Some(signal) = semantic_alarm(&text) {
         return signal;
@@ -696,6 +719,69 @@ mod tests {
         let signal = signal_for_error(&timeout);
         assert_eq!(signal, BucketSignal::Timeout);
         assert_eq!(classify(signal), SignalClass::AvailabilityFailure);
+    }
+
+    #[test]
+    fn a_key_in_our_own_context_cannot_decide_the_verdict() {
+        // Storage errors are wrapped with `"{backend}: {op} {key}"`, and a
+        // filename may legally hold spaces and colons. Only the provider's
+        // innermost error is scanned, so neither direction is forgeable.
+        let outage = object_error(ObjectStoreError::Generic {
+            store: "S3",
+            source: source("Server returned non-2xx status code: 503"),
+        })
+        .context("s3: get packages/evil/status code: 200 x.whl".to_string());
+        let signal = signal_for_error(&outage);
+        assert_eq!(signal, BucketSignal::HttpStatus(503));
+        assert_eq!(classify(signal), SignalClass::AvailabilityFailure);
+
+        // The same trick the other way: a key must not talk a bucket whose
+        // error proves nothing about availability into a failover.
+        let benign = object_error(ObjectStoreError::Generic {
+            store: "S3",
+            source: source("error decoding response body"),
+        })
+        .context("s3: list packages/evil/status code: 503 x.whl".to_string());
+        let signal = signal_for_error(&benign);
+        assert_eq!(signal, BucketSignal::OtherError);
+        assert_ne!(classify(signal), SignalClass::AvailabilityFailure);
+
+        // Nor may a key's words fire a semantic alarm that swallows an outage.
+        let quota_named = object_error(ObjectStoreError::Generic {
+            store: "S3",
+            source: source("Server returned non-2xx status code: 503"),
+        })
+        .context("s3: get quota/quota-1.0.whl".to_string());
+        assert_eq!(
+            signal_for_error(&quota_named),
+            BucketSignal::HttpStatus(503)
+        );
+
+        // A typed timeout stays a timeout however the key is spelled.
+        let timeout = object_error(ObjectStoreError::Generic {
+            store: "S3",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Timeout,
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "late"),
+            )),
+        })
+        .context("s3: get packages/evil/http status: 200 x.whl".to_string());
+        assert_eq!(signal_for_error(&timeout), BucketSignal::Timeout);
+    }
+
+    #[test]
+    fn a_genuine_innermost_status_still_classifies() {
+        for (message, expected) in [
+            ("http status: 503", BucketSignal::HttpStatus(503)),
+            ("response status: 500", BucketSignal::HttpStatus(500)),
+            ("status code: 502", BucketSignal::HttpStatus(502)),
+        ] {
+            let error = object_error(ObjectStoreError::Generic {
+                store: "S3",
+                source: source(message),
+            });
+            assert_eq!(signal_for_error(&error), expected, "{message}");
+        }
     }
 
     #[test]

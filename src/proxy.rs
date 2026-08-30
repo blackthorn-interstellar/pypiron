@@ -1637,8 +1637,25 @@ impl Proxy {
         observed: &crate::status::ProjectStatusDoc,
     ) {
         let pinned = state.pin();
-        if let Err(e) = reconcile_observed_status(pinned.storage.as_ref(), pkg, observed).await {
-            warn!(%pkg, error=?e, "proxy: failed to persist upstream project status");
+        match reconcile_observed_status(pinned.storage.as_ref(), pkg, observed).await {
+            // Only a real status change touches the shared quarantined set: a poll
+            // that found upstream unchanged must not republish it on every listing
+            // refresh. On a change, arm this node's byte gate and hand the
+            // increment to the rest of the fleet — the audit sweep is repair, not
+            // propagation.
+            Ok(true) => {
+                let replicas = state.singleton_replicas(pinned.index);
+                crate::advisories::arm_quarantine(
+                    pinned.storage.as_ref(),
+                    &replicas,
+                    &state.advisories,
+                    pkg,
+                    observed.status.blocks_downloads(),
+                )
+                .await;
+            }
+            Ok(false) => {}
+            Err(e) => warn!(%pkg, error=?e, "proxy: failed to persist upstream project status"),
         }
     }
 
@@ -1828,22 +1845,23 @@ impl Proxy {
 /// clobbers an operator-authored private-origin status, and skips the write when
 /// upstream is the active default and no marker exists. A change marks the
 /// package dirty so its own leader rebuilds the (now file-less, if quarantined)
-/// index; the audit sweep separately folds a quarantine into the byte gate's set.
+/// index. Returns whether it wrote, so the caller only touches the fleet's
+/// quarantined set on a real change.
 async fn reconcile_observed_status(
     storage: &dyn Storage,
     pkg: &str,
     observed: &crate::status::ProjectStatusDoc,
-) -> Result<()> {
+) -> Result<bool> {
     match crate::status::read_status_versioned(storage, pkg).await? {
         // An operator-authored (private-origin) status is authoritative; the
         // proxy never overwrites it with a relayed upstream observation.
-        Some(cur) if cur.origin == Some(crate::replicate::Origin::Private) => return Ok(()),
+        Some(cur) if cur.origin == Some(crate::replicate::Origin::Private) => return Ok(false),
         // Durable status already reflects upstream: nothing to write.
-        Some(cur) if &cur.doc == observed => return Ok(()),
+        Some(cur) if &cur.doc == observed => return Ok(false),
         Some(_) => {}
         // No marker yet and upstream is the active default: absence already
         // means active, so a write would only add noise.
-        None if observed == &crate::status::ProjectStatusDoc::default() => return Ok(()),
+        None if observed == &crate::status::ProjectStatusDoc::default() => return Ok(false),
         None => {}
     }
     crate::status::advance_status(
@@ -1854,7 +1872,7 @@ async fn reconcile_observed_status(
     )
     .await?;
     crate::markers::mark_dirty(storage, pkg).await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Read an upstream companion body into memory with a hard ceiling. The local

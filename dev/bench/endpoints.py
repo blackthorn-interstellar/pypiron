@@ -107,7 +107,11 @@ ENDPOINTS: list = [
         method="GET",
         path="/files/{pkg}/{filename}",
         routes=(("GET", "/files/:package/:filename"),),
-        cold_ops={"read": 1},
+        # 3 = the body plus the two delete/freeze marker HEADs. Single-bucket
+        # reads those markers once per artifact key per cache::FENCE_CACHE_TTL
+        # (src/serve.rs single_bucket_file_visible), so only the cold hit pays
+        # them; the warm hits stay at the body alone.
+        cold_ops={"read": 3},
         warm_ops={"read": 1},
         bytes_range=(0, 10),
     ),
@@ -353,8 +357,19 @@ ENDPOINTS: list = [
         expect=(200, 201, 204),
         mutates=True,
         target="probe",
-        cold_ops={"read": 5, "write": 5, "list": 2, "delete": 1},
-        warm_ops={"read": 5, "write": 5, "list": 2, "delete": 1},
+        # +1 read, +1 write over the bare status write: every status write now
+        # folds the change into the fleet's quarantined set through
+        # advisories::arm_quarantine (publish.rs write_project_status), so a
+        # freeze propagates in seconds instead of waiting a reconcile interval
+        # for the audit sweep. Each probe iteration targets its own package name
+        # (probe_prefix-i), so every request really does change the set and pays
+        # the whole publish: one get_with_etag of the quarantined key (read) and
+        # one put_if_match/put_if_none_match (write). No third LIST: the publish
+        # deliberately adopts no etag, because the listing it could read back may
+        # already be a peer's newer body — pinning to that would make this node's
+        # poll no-op past a freeze it never saw. The next poll re-reads instead.
+        cold_ops={"read": 6, "write": 6, "list": 2, "delete": 1},
+        warm_ops={"read": 6, "write": 6, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -366,8 +381,13 @@ ENDPOINTS: list = [
         expect=(200, 204),
         mutates=True,
         target="probe",
-        cold_ops={"read": 5, "write": 4, "list": 2, "delete": 2},
-        warm_ops={"read": 5, "write": 4, "list": 2, "delete": 2},
+        # The same arm_quarantine publish as project-status-set above, in the
+        # other direction: clearing writes an active status, which un-blocks the
+        # name that endpoint quarantined at this same iteration index. A real
+        # change again, so the same read/write pair and, for the same reason, no
+        # etag-adopting LIST.
+        cold_ops={"read": 6, "write": 5, "list": 2, "delete": 2},
+        warm_ops={"read": 6, "write": 5, "list": 2, "delete": 2},
         bytes_range=(0, 100),
     ),
     _e(
@@ -399,8 +419,24 @@ ENDPOINTS: list = [
         # quarantined reload used to be gated behind the feed toggle, which left
         # followers holding an empty quarantine set forever whenever the feed was
         # off; it now runs every tick, and this second 1-key LIST is its cost.
-        cold_ops={"write": 1, "list": 2},
-        warm_ops={"write": 1, "list": 2},
+        #
+        # The read is the leader's re-seed check. It heals the quarantined set
+        # on EPOCH rather than presence, so once this node holds a published set
+        # (epoch > 0) every tick calls advisories::seed_quarantined_onto, which
+        # reads the key to compare epochs and writes nothing when the bucket is
+        # already current. The epoch is above zero by the time this endpoint
+        # runs because project-status-set/clear published eight increments
+        # earlier in the walk; before those existed the set was never written,
+        # the epoch stayed zero, and the re-seed skipped the key entirely.
+        #
+        # The cold pass reads twice. project-status-set/clear ran just before it
+        # and their publishes deliberately adopt no listing etag, so the tick's
+        # quarantine poll finds the key moved against this node's `None` and
+        # fetches the body once. That fetch stores the etag, and the warm passes
+        # — which publish nothing new before this endpoint — see it unchanged and
+        # pay the LIST only.
+        cold_ops={"read": 2, "write": 1, "list": 2},
+        warm_ops={"read": 1, "write": 1, "list": 2},
         bytes_range=(0, 100),
     ),
     _e(
@@ -470,6 +506,12 @@ QUIESCE_ARGS = (
     "86400",
     "--worker-interval-secs",
     "86400",
+    # The every-node quarantined-set poll, pinned out like the other cadences.
+    # At its 30 s default the poll's 1-key LIST lands on whichever mutation
+    # happens to nudge the worker first, which makes that endpoint's op pin a
+    # function of how long the walk took to reach it.
+    "--quarantine-poll-secs",
+    "86400",
     # Day-long index-cache TTL: warm hits stay 0-op instead of racing the 1s
     # default's revalidation read (single-node invalidation is exact, so the
     # long TTL never serves stale bytes here).
@@ -484,6 +526,8 @@ SWEEP_ARGS = (
     "--reconcile-interval-secs",
     "86400",
     "--worker-interval-secs",
+    "86400",
+    "--quarantine-poll-secs",
     "86400",
     "--index-cache-ttl-secs",
     "86400",

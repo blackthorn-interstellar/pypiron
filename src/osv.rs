@@ -26,6 +26,15 @@ use crate::names::normalize_pkg_name;
 /// decompression bomb hiding in one member.
 pub(crate) const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Ceiling on the feed's member count. [`crate::advisories::MAX_FEED_BYTES`]
+/// bounds only the *compressed* body, and `ZipArchive::new` materializes every
+/// central-directory record — name string included — before any per-entry cap
+/// applies, so a 256 MiB body of tiny stored members is millions of resident
+/// records. The real PyPI export is a few tens of thousands of `<id>.json`
+/// members: measured 25,105 at 33.9 MB on 2026-08-29. 100k refuses the runaway
+/// case while leaving the export room to keep growing for years.
+const MAX_FEED_MEMBERS: usize = 100_000;
+
 /// OSV's ecosystem string for PyPI (matched case-insensitively for tolerance).
 const PYPI_ECOSYSTEM: &str = "PyPI";
 
@@ -302,18 +311,24 @@ struct OsvSeverity {
 /// not blind the whole fleet.
 pub fn parse_feed(zip_bytes: &[u8]) -> Result<AdvisoryDb> {
     let mut zip = ZipArchive::new(Cursor::new(zip_bytes)).context("advisory feed is not a zip")?;
-    let names: Vec<String> = zip
-        .file_names()
-        .filter(|n| n.ends_with(".json"))
-        .map(str::to_string)
-        .collect();
+    if zip.len() > MAX_FEED_MEMBERS {
+        anyhow::bail!(
+            "advisory feed has {} members, over the {MAX_FEED_MEMBERS} ceiling",
+            zip.len()
+        );
+    }
 
     let mut db = AdvisoryDb::default();
     let horizon = watermark_horizon();
-    for name in names {
-        let Ok(entry) = zip.by_name(&name) else {
+    // Walk by index: collecting `file_names()` would hold a second copy of every
+    // name on top of the one the central directory already owns.
+    for index in 0..zip.len() {
+        let Ok(entry) = zip.by_index(index) else {
             continue;
         };
+        if !entry.name().ends_with(".json") {
+            continue;
+        }
         let mut buf = Vec::new();
         if entry
             .take(MAX_ENTRY_BYTES + 1)
@@ -568,6 +583,37 @@ mod tests {
             zip.write_all(json.to_string().as_bytes()).unwrap();
         }
         zip.finish().unwrap().into_inner()
+    }
+
+    /// A feed with more members than [`MAX_FEED_MEMBERS`] is refused outright:
+    /// an export that large is a runaway or a hostile body, not OSV's (25,105
+    /// members on 2026-08-29), and the cheapest safe answer is to keep the
+    /// previous db rather than ingest it.
+    #[test]
+    fn over_member_cap_feed_is_refused() {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for i in 0..=MAX_FEED_MEMBERS {
+            zip.start_file(format!("MAL-0000-{i}.json"), opts).unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        let err = parse_feed(&bytes).unwrap_err().to_string();
+        assert!(err.contains("over the"), "unexpected error: {err}");
+    }
+
+    /// Non-`.json` members are skipped by the by-index walk exactly as the old
+    /// `file_names()` filter skipped them.
+    #[test]
+    fn non_json_members_are_skipped() {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("README.md", opts).unwrap();
+        zip.write_all(b"not an advisory").unwrap();
+        zip.start_file("MAL-1.json", opts).unwrap();
+        zip.write_all(mal_all("MAL-1", "evil").to_string().as_bytes())
+            .unwrap();
+        let db = parse_feed(&zip.finish().unwrap().into_inner()).unwrap();
+        assert_eq!(db.block_names(), 1);
     }
 
     fn mal_exact(id: &str, name: &str, version: &str) -> serde_json::Value {

@@ -94,9 +94,12 @@ def _seed_quarantined_package(pypiron_bin, data_dir: Path, tmp_path: Path, extra
     finally:
         kill_process_tree(proc)
 
-    # The derived set is persisted, so a restart has something to load.
+    # The derived set is persisted, so a restart has something to load. It is
+    # stored in an epoch-bearing envelope: the epoch is what lets every writer CAS
+    # it forward and every reader refuse an older copy on failover.
     stored = json.loads((data_dir / _QUARANTINED_KEY).read_bytes())
-    assert pkg in stored, stored
+    assert pkg in stored["quarantined"], stored
+    assert stored["pypiron-epoch"] >= 1, stored
     return file_path
 
 

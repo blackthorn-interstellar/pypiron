@@ -24,11 +24,14 @@
 //! conflict; the executor applies the decision with both handles.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use futures::StreamExt as _;
+use sha2::{Digest as _, Sha256};
+use tokio::io::AsyncReadExt as _;
 use tracing::{error, warn};
 
 use crate::app::{AppState, PACKAGES_PREFIX};
@@ -52,6 +55,7 @@ use crate::storage::{
     CopyOutcome, Existing, Storage,
 };
 use crate::tombstone;
+use crate::upload::{TempPath, UploadSpool};
 #[cfg(test)]
 use crate::worker;
 
@@ -76,6 +80,23 @@ const ORIGIN_ATTEMPTS: usize = 8;
 /// full package tree is ever held in one Vec.
 const REPL_SWEEP_PAGE: usize = 1_000;
 const RECONCILE_SCAN_PAGE: usize = 1_000;
+
+/// Read buffer for the streaming source read. One of these is resident per
+/// copy in flight, and 16 copies run per destination.
+const STREAM_CHUNK: usize = 1024 * 1024;
+/// Above this, a copy stages the source artifact to a temp file instead of
+/// holding it. A resident body multiplies by exactly the fan-out the sweep
+/// runs — 16 concurrent copies per destination, destinations in parallel — so
+/// an artifact-sized buffer is the same OOM the upload path removed by
+/// spooling (a 900 MB wheel × 16 is 14 GB).
+///
+/// It is the multipart threshold itself, not a smaller number: at or below it
+/// the destination write reads the whole file back into a `Vec` to issue one
+/// conditional PUT, so staging any earlier buys a disk round-trip and bounds
+/// nothing. Only past it does the write stream in parts, which is the point
+/// where the temp file starts paying for itself. The two constants must move
+/// together — hence the reference rather than a copy of the number.
+const STAGE_TO_DISK_ABOVE: u64 = crate::storage::MULTIPART_THRESHOLD;
 
 /// Package-level marker members share the ordinary durable fan-out queue. They
 /// cannot collide with distribution filenames: valid artifacts never begin
@@ -630,9 +651,190 @@ async fn put_if_absent_or_verify(
 }
 
 struct VerifiedSource {
-    artifact: Vec<u8>,
+    artifact: StagedArtifact,
     metadata: Option<Vec<u8>>,
     provenance: Option<Vec<u8>>,
+}
+
+/// A running sha256 over a body that must not outgrow the length its own
+/// sidecar attests. The cap is what makes the streaming read *bounded* rather
+/// than merely incremental: without it a source whose body no longer matches
+/// its sidecar — the exact case this read exists to catch — still gets to
+/// decide how much this node accumulates before the hash disagrees.
+struct HashingSink {
+    hasher: Sha256,
+    read: u64,
+    limit: u64,
+}
+
+impl HashingSink {
+    fn new(limit: u64) -> Self {
+        Self {
+            hasher: Sha256::new(),
+            read: 0,
+            limit,
+        }
+    }
+
+    /// For a local file this node already owns and is not accumulating: there
+    /// is nothing for a cap to protect, and the sha256 below is the check.
+    fn unbounded() -> Self {
+        Self::new(u64::MAX)
+    }
+
+    fn accept(&mut self, chunk: &[u8]) -> Result<()> {
+        self.read += chunk.len() as u64;
+        if self.read > self.limit {
+            bail!(
+                "source body is longer than the {} bytes its sidecar attests; abandoning the read",
+                self.limit
+            );
+        }
+        self.hasher.update(chunk);
+        Ok(())
+    }
+
+    fn finish(self) -> (String, u64) {
+        (format!("{:x}", self.hasher.finalize()), self.read)
+    }
+}
+
+/// The source artifact, sha-verified against the source sidecar and held where
+/// a destination write can take it without a second full-body read.
+enum StagedArtifact {
+    /// Small enough that the destination's own write would buffer it anyway.
+    Resident(Vec<u8>),
+    /// A large body as a local file: the upload spool the publish fan-out
+    /// already holds (nothing was copied — it is hashed where it lies), or a
+    /// temp file this copy streamed the source into. `_temp` owns the deletion;
+    /// a spool the caller owns has none.
+    File {
+        path: PathBuf,
+        size: u64,
+        _temp: Option<TempPath>,
+    },
+}
+
+impl StagedArtifact {
+    /// How the destination write takes these bytes. `Spool` lands through
+    /// [`Storage::put_file_if_absent`] — a hardlink on disk, multipart-then-
+    /// publish on the object stores — so a large body never becomes a `Vec`.
+    fn body(&self) -> ArtifactBody<'_> {
+        match self {
+            // Cloned, not moved: `artifact_leg` may need these bytes again for
+            // the conditional repair below. Bounded by [`STAGE_TO_DISK_ABOVE`].
+            StagedArtifact::Resident(bytes) => ArtifactBody::Bytes(bytes.clone()),
+            StagedArtifact::File { path, .. } => ArtifactBody::Spool(path),
+        }
+    }
+
+    fn size(&self) -> u64 {
+        match self {
+            StagedArtifact::Resident(bytes) => bytes.len() as u64,
+            StagedArtifact::File { size, .. } => *size,
+        }
+    }
+
+    /// The whole body, resident. Only the two legs that *replace* an existing
+    /// object need it: a conditional replace carries no streaming form —
+    /// `put_multipart` takes no precondition on any backend — and the etag
+    /// condition is what keeps a racing publisher's body from being clobbered,
+    /// so it is not tradeable for the buffer. Both legs run only when the
+    /// destination already holds a body under an immutable key (crash debris,
+    /// or a conflict being quarantined), never on the copy that lands one.
+    async fn read_all(&self) -> Result<Vec<u8>> {
+        match self {
+            StagedArtifact::Resident(bytes) => Ok(bytes.clone()),
+            StagedArtifact::File { path, .. } => tokio::fs::read(path)
+                .await
+                .with_context(|| format!("read staged artifact {}", path.display())),
+        }
+    }
+}
+
+/// sha256 a local file without holding it in memory, returning its length too.
+async fn hash_file(path: &Path) -> Result<(String, u64)> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut sink = HashingSink::unbounded();
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        sink.accept(&buf[..n])?;
+    }
+    Ok(sink.finish())
+}
+
+/// Stream the source artifact out of the bucket, hashing every chunk as it
+/// arrives, and land it wherever the destination write can take it from.
+/// Nothing here ever holds more than [`STAGE_TO_DISK_ABOVE`] of the body.
+async fn stage_from_bucket(
+    state: &AppState,
+    src: &dyn Storage,
+    akey: &str,
+    expected_size: u64,
+) -> Result<(String, StagedArtifact)> {
+    let mut body = src
+        .serve_artifact(akey, None)
+        .await
+        .with_context(|| format!("read source artifact {akey}"))?
+        .into_body()
+        .into_data_stream();
+    if expected_size <= STAGE_TO_DISK_ABOVE {
+        // Capped at the staging threshold, not at the attested size: a body
+        // that outgrew its own sidecar is the torn record the caller repairs
+        // from the real hash, and truncating the read here would deny it that
+        // hash. RAM is still bounded — by the threshold this branch was chosen
+        // under. Past it, the file branch below caps at the attested size and
+        // the copy fails loudly instead: at that scale a torn record is worth
+        // a `_repl/` note and a later pass, not an unbounded read.
+        let mut sink = HashingSink::new(STAGE_TO_DISK_ABOVE);
+        let mut bytes = Vec::with_capacity(expected_size as usize);
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.with_context(|| format!("read source artifact {akey}"))?;
+            sink.accept(&chunk)?;
+            bytes.extend_from_slice(&chunk);
+        }
+        return Ok((sink.finish().0, StagedArtifact::Resident(bytes)));
+    }
+    // The upload spool, reused: it opens O_EXCL 0600, hashes as it writes, and
+    // deletes itself on drop — every property a copy of somebody's private
+    // bytes through this node's filesystem needs, already written once.
+    tracing::debug!(
+        key = %akey,
+        size = expected_size,
+        "staging the replication source to a spool file"
+    );
+    let mut spool = UploadSpool::new(&state.spool_dir)
+        .await
+        .context("open a spool for the replication copy")?;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.with_context(|| format!("read source artifact {akey}"))?;
+        spool.write_chunk(&chunk).await?;
+        if spool.size() > expected_size {
+            bail!(
+                "source artifact {akey} is longer than the {expected_size} bytes its sidecar \
+                 attests; abandoning the copy"
+            );
+        }
+    }
+    let finished = spool.finish().await?;
+    let path = finished.path.path().to_path_buf();
+    Ok((
+        finished.sha256,
+        StagedArtifact::File {
+            path,
+            size: finished.size,
+            _temp: Some(finished.path),
+        },
+    ))
 }
 
 /// Where a copy reads the artifact bytes it verifies against the source
@@ -650,20 +852,38 @@ pub enum ArtifactSource<'a> {
 }
 
 impl ArtifactSource<'_> {
-    async fn read_artifact(&self, src: &dyn Storage, akey: &str) -> Result<Vec<u8>> {
+    /// Produce the source bytes as a staged artifact, plus their sha256. The
+    /// bucket source streams; the spool is already a local file, so it is
+    /// hashed where it lies and handed on by path — no copy, and the fan-out's
+    /// peers no longer each read a whole artifact into memory.
+    async fn stage(
+        &self,
+        state: &AppState,
+        src: &dyn Storage,
+        akey: &str,
+        expected_size: u64,
+    ) -> Result<(String, StagedArtifact)> {
         match self {
-            ArtifactSource::Bucket => src
-                .get_bytes(akey)
-                .await
-                .with_context(|| format!("read source artifact {akey}")),
-            ArtifactSource::Spool(path) => tokio::fs::read(path)
-                .await
-                .with_context(|| format!("read upload spool {} for fan-out", path.display())),
+            ArtifactSource::Bucket => stage_from_bucket(state, src, akey, expected_size).await,
+            ArtifactSource::Spool(path) => {
+                let (sha, size) = hash_file(path)
+                    .await
+                    .with_context(|| format!("hash upload spool {} for fan-out", path.display()))?;
+                Ok((
+                    sha,
+                    StagedArtifact::File {
+                        path: path.to_path_buf(),
+                        size,
+                        _temp: None,
+                    },
+                ))
+            }
         }
     }
 }
 
 async fn verify_source_record(
+    state: &AppState,
     src: &dyn Storage,
     pkg: &str,
     filename: &str,
@@ -671,7 +891,7 @@ async fn verify_source_record(
     source: ArtifactSource<'_>,
 ) -> Result<VerifiedSource> {
     let akey = artifact_key(pkg, filename);
-    let artifact = verify_source_artifact(src, pkg, filename, record, source).await?;
+    let artifact = verify_source_artifact(state, src, pkg, filename, record, source).await?;
     let Companions {
         metadata,
         provenance,
@@ -705,24 +925,29 @@ async fn read_source_companions(
     })
 }
 
-/// Read the source artifact bytes and verify them against the source sidecar's
+/// Read the source artifact and verify it against the source sidecar's
 /// sha256 — the check the server-side copy transport skips (bytes never touch
 /// this node) and the stream transport relies on. A torn record (sidecar names
 /// bytes the body no longer holds) is repaired for a rebuild here.
+///
+/// The bytes are hashed as they stream and staged, never assembled: this is the
+/// one place in the fleet where every cross-provider, cross-endpoint,
+/// cross-credential and disk pair moves an artifact, and it used to hold each
+/// one whole, 16 at a time per destination.
 async fn verify_source_artifact(
+    state: &AppState,
     src: &dyn Storage,
     pkg: &str,
     filename: &str,
     record: &Record,
     source: ArtifactSource<'_>,
-) -> Result<Vec<u8>> {
+) -> Result<StagedArtifact> {
     let sidecar = record
         .sidecar
         .as_ref()
         .ok_or_else(|| anyhow!("copy verdict with no source sidecar"))?;
     let akey = artifact_key(pkg, filename);
-    let artifact = source.read_artifact(src, &akey).await?;
-    let got = sha256_hex(&artifact);
+    let (got, artifact) = source.stage(state, src, &akey, sidecar.size).await?;
     if got != sidecar.sha256 {
         // A spool whose bytes disagree with the sidecar built from the same
         // upload is a caller bug, not crash debris: fail loudly rather than run
@@ -894,7 +1119,7 @@ async fn copy_live(
     // replaced; closing it outright needs a destination-conditional copy, which
     // no provider's copy verb offers.
     let mut streamed = match &copy_origin {
-        None => Some(verify_source_artifact(src, pkg, filename, record, source).await?),
+        None => Some(verify_source_artifact(state, src, pkg, filename, record, source).await?),
         Some(_) => None,
     };
     require_replication_unfenced(state)?;
@@ -945,10 +1170,10 @@ async fn copy_live(
     // verified bytes under the claim made above, so the fabrication names the
     // same sha and the same-sha sidecar merge settles the metadata — the same
     // window the upload path has always had between its artifact and sidecar.
-    if let Some(bytes) = streamed.take() {
-        let landed = bytes.len() as u64;
+    if let Some(staged) = streamed.take() {
+        let landed = staged.size();
         let changed =
-            match artifact_leg(state, src, dst, pkg, filename, sc, &akey, bytes, false).await? {
+            match artifact_leg(state, src, dst, pkg, filename, sc, &akey, staged, false).await? {
                 // The filename is fenced on both buckets and its bodies preserved.
                 // Publishing a sidecar over a frozen record would re-list it.
                 ArtifactLeg::Frozen => return Ok(false),
@@ -1015,7 +1240,7 @@ async fn copy_live(
 
     // Stream the artifact: only a missed server-side copy reaches here, and that
     // transport never pre-verified the bytes, so read and verify them now.
-    let artifact = verify_source_artifact(src, pkg, filename, record, source).await?;
+    let artifact = verify_source_artifact(state, src, pkg, filename, record, source).await?;
     Ok(
         match artifact_leg(state, src, dst, pkg, filename, sc, &akey, artifact, true).await? {
             ArtifactLeg::Frozen => false,
@@ -1152,7 +1377,7 @@ async fn artifact_leg(
     filename: &str,
     sc: &Sidecar,
     akey: &str,
-    artifact: Vec<u8>,
+    artifact: StagedArtifact,
     // Whether this leg has already published the destination's sidecar: the
     // gated paths have, the private stream path has not, and that decides what
     // a raced competing body means.
@@ -1184,8 +1409,15 @@ async fn artifact_leg(
             && sidecar_still_names(dst, &sidecar_key(akey), &sc.sha256).await?
         {
             quarantine_bytes(dst, pkg, filename, &current).await?;
-            let len = artifact.len() as u64;
-            if bounded_artifact_write(akey, len, dst.put_if_match(akey, &etag, artifact.clone()))
+            let len = artifact.size();
+            // The one leg that must hold the body: `put_if_match` has no
+            // streaming form (no backend takes a precondition on a multipart
+            // upload) and the etag condition is what stops this write from
+            // clobbering a publisher that took the key in the window above.
+            // Off the copy path — the destination already holds a body — so the
+            // buffer is the rare repair's, not every copy's.
+            let bytes = artifact.read_all().await?;
+            if bounded_artifact_write(akey, len, dst.put_if_match(akey, &etag, bytes))
                 .await?
                 .is_some()
             {
@@ -1199,8 +1431,16 @@ async fn artifact_leg(
     // no sidecar this copy publishes can describe the competing body — the
     // private path has not written one yet, and the gated paths already have.
     // The create is verified (D1) and bounded (D3) by the shared primitive.
-    let len = artifact.len() as u64;
-    if create_artifact_verified(dst, akey, artifact, len, Some("application/octet-stream")).await? {
+    let len = artifact.size();
+    if create_artifact_verified(
+        dst,
+        akey,
+        artifact.body(),
+        len,
+        Some("application/octet-stream"),
+    )
+    .await?
+    {
         state.metrics.record_replicated(len);
         return Ok(ArtifactLeg::Landed { changed: true });
     }
@@ -1310,14 +1550,14 @@ async fn supersede_record(
     if sidecar.origin.as_deref() != Some(PRIVATE) {
         bail!("supersede source for {pkg}/{filename} is not private truth");
     }
-    let verified = verify_source_record(src, pkg, filename, src_record, source).await?;
+    let verified = verify_source_record(state, src, pkg, filename, src_record, source).await?;
     ensure_private_origin(dst, pkg).await?;
     let akey = artifact_key(pkg, filename);
 
     // A marker that raced the merge read has precedence. Preserve the incoming
     // private evidence, but never resurrect it through the fence.
     if dst.head_exists(&frozen_key(&akey)).await? {
-        quarantine_bytes(dst, pkg, filename, &verified.artifact).await?;
+        quarantine_bytes(dst, pkg, filename, &verified.artifact.read_all().await?).await?;
         freeze_side(dst, pkg, filename).await?;
         markers::mark_dirty(dst, pkg).await?;
         return Ok(());
@@ -1376,14 +1616,16 @@ async fn supersede_record(
             artifact_present = true;
         } else {
             quarantine_bytes(dst, pkg, filename, &current).await?;
-            let len = verified.artifact.len() as u64;
-            if bounded_artifact_write(
-                &akey,
-                len,
-                dst.put_if_match(&akey, &etag, verified.artifact.clone()),
-            )
-            .await?
-            .is_none()
+            let len = verified.artifact.size();
+            // Buffered for the same reason [`artifact_leg`]'s repair is: a
+            // conditional replace has no streaming form, and the etag is what
+            // makes replacing a live body safe. The demotion's ordinary shape
+            // does not come here — it finds the canonical key empty and takes
+            // the streaming create below.
+            let bytes = verified.artifact.read_all().await?;
+            if bounded_artifact_write(&akey, len, dst.put_if_match(&akey, &etag, bytes))
+                .await?
+                .is_none()
             {
                 bail!("destination artifact changed during supersede for {akey}");
             }
@@ -1394,11 +1636,11 @@ async fn supersede_record(
     }
 
     if !artifact_present {
-        let len = verified.artifact.len() as u64;
+        let len = verified.artifact.size();
         if create_artifact_verified(
             dst,
             &akey,
-            verified.artifact.clone(),
+            verified.artifact.body(),
             len,
             Some("application/octet-stream"),
         )
@@ -1451,7 +1693,7 @@ async fn supersede_record(
     // complete record lands, then clear obsolete mirror quarantine state only
     // when private truth remains live.
     if dst.head_exists(&frozen_key(&akey)).await? {
-        quarantine_bytes(dst, pkg, filename, &verified.artifact).await?;
+        quarantine_bytes(dst, pkg, filename, &verified.artifact.read_all().await?).await?;
         freeze_side(dst, pkg, filename).await?;
     } else if dst.head_exists(&tombstone_key(&akey)).await? {
         tombstone_side(dst, pkg, filename).await?;
@@ -2194,8 +2436,8 @@ pub async fn finish_interrupted_supersedes(
 /// other bucket *before* the client ack. Healthy secondaries are copied
 /// concurrently — each via the same
 /// [`replicate_record`] copy protocol as the sweep and full diff (origin claim,
-/// sidecar, companions, then the sha256-verified artifact last) — under one
-/// shared grace deadline measured from the selected write's completion.
+/// then the sha256-verified artifact, then the sidecar that names it) — under
+/// one shared grace deadline measured from the selected write's completion.
 ///
 /// A secondary that fails, exceeds the grace deadline, becomes topology-
 /// ineligible mid-copy, is already ineligible (so no copy is attempted), or
@@ -2204,15 +2446,24 @@ pub async fn finish_interrupted_supersedes(
 /// selected bucket before this returns. Notes are the failure path only: a
 /// healthy fleet acks with every bucket holding the record and no note written.
 /// A single-bucket node does no I/O.
+///
+/// `Err` means the opposite of a failed copy: a gap this call could not write
+/// down. The note IS the durability guarantee behind an ack — it is the fleet's
+/// only record that a peer is owed this file — so a note that will not land
+/// leaves the caller acking a state the ACK_TOTALITY oracle forbids: a peer
+/// holding neither the record, nor a marker explaining its absence, nor a note
+/// owing it. Nothing downstream re-derives it (the `_dirty/` markers drive
+/// index rebuilds, not replication), so the caller must refuse the ack instead.
+/// Every copy failure above is still an `Ok`: those are recorded.
 pub async fn fanout_sync(
     state: &AppState,
     pinned: &Pinned,
     pkg: &str,
     filename: &str,
     spool: Option<&std::path::Path>,
-) {
+) -> Result<()> {
     if !state.buckets.is_multi() {
-        return;
+        return Ok(());
     }
     let src = pinned.storage.as_ref();
     let src_index = pinned.index;
@@ -2268,15 +2519,38 @@ pub async fn fanout_sync(
     // the shared deadline). Then write one durable note per bucket that did not
     // converge, before the caller acks.
     let handles = state.buckets.handles();
+    let mut unrecorded = 0usize;
     for (idx, converged) in futures::future::join_all(jobs).await {
         if converged {
             continue;
         }
         let dest_tag = crate::counters::bucket_tag(&handles[idx].name);
-        if let Err(e) = write_marker(src, &dest_tag, pkg, filename).await {
-            error!(dest=idx, package=%pkg, filename=%filename, error=?e, "could not write replication repair note before ack");
+        // One retry: the note is a single small PUT and a transient 5xx must
+        // not be what decides a publish. A second failure is a bucket that is
+        // not taking writes, and no amount of looping in front of the client
+        // fixes that.
+        let mut wrote = write_marker(src, &dest_tag, pkg, filename).await;
+        if let Err(error) = &wrote {
+            warn!(dest=%handles[idx].name, package=%pkg, filename=%filename, error=?error, "replication repair note failed; retrying once before the ack");
+            wrote = write_marker(src, &dest_tag, pkg, filename).await;
+        }
+        if let Err(error) = wrote {
+            error!(dest=%handles[idx].name, package=%pkg, filename=%filename, error=?error, "could not write replication repair note; refusing to ack the publish");
+            unrecorded += 1;
         }
     }
+    if unrecorded > 0 {
+        // A count, not the names: this string reaches the client in the 503 body,
+        // and the peer buckets' configured URIs (and `@region` labels) are fleet
+        // topology no uploader should learn from a transient outage. Every
+        // failing bucket is named in the `error!` line just above.
+        bail!(
+            "replication gap for {pkg}/{filename} could not be recorded on {} of {} other bucket(s)",
+            unrecorded,
+            handles.len().saturating_sub(1)
+        );
+    }
+    Ok(())
 }
 
 /// Async proxy-cache replication (deliberately NOT tier 1: no pre-ack fan-out).
@@ -4087,6 +4361,15 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("source artifact sha mismatch"));
+        // The bytes are hashed as they stream and checked before the first
+        // destination mutation, so an unverifiable source leaves the
+        // destination untouched — there is no half-landed body to delete.
+        assert!(
+            !dst.head_exists(&artifact_key("pkg", filename))
+                .await
+                .unwrap(),
+            "a source that does not hash to its own sidecar must never put bytes on a peer",
+        );
         assert!(!dst
             .head_exists(&sidecar_key(&artifact_key("pkg", filename)))
             .await
@@ -4317,7 +4600,7 @@ mod tests {
                 filename,
                 &sidecar,
                 &key,
-                source_bytes.to_vec(),
+                StagedArtifact::Resident(source_bytes.to_vec()),
                 true,
             )
             .await
@@ -4362,7 +4645,7 @@ mod tests {
             filename,
             &sidecar,
             &key,
-            source_bytes.to_vec(),
+            StagedArtifact::Resident(source_bytes.to_vec()),
             false,
         )
         .await
@@ -4402,7 +4685,7 @@ mod tests {
                 filename,
                 &sidecar,
                 &key,
-                source_bytes.to_vec(),
+                StagedArtifact::Resident(source_bytes.to_vec()),
                 true,
             )
             .await
@@ -5179,7 +5462,9 @@ mod tests {
         let state = two_bucket_state(a.clone(), b.clone());
         let pinned = state.pin();
 
-        fanout_sync(&state, &pinned, "pkg", filename, None).await;
+        fanout_sync(&state, &pinned, "pkg", filename, None)
+            .await
+            .expect("every gap this fan-out leaves is recorded");
         assert!(b.head_exists(&artifact_key("pkg", filename)).await.unwrap());
         // The happy path leaves no note: the record is durable on every bucket
         // at ack time.
@@ -5208,7 +5493,9 @@ mod tests {
         state.bucket_health = Some(health);
         let pinned = state.pin();
 
-        fanout_sync(&state, &pinned, "pkg", filename, None).await;
+        fanout_sync(&state, &pinned, "pkg", filename, None)
+            .await
+            .expect("every gap this fan-out leaves is recorded");
         // No attempt against an ineligible bucket, but a durable note is left so
         // the record reaches B when it heals.
         assert!(!b.head_exists(&artifact_key("pkg", filename)).await.unwrap());
@@ -5221,6 +5508,210 @@ mod tests {
             .unwrap()
             .iter()
             .any(|m| m.key.contains("/pkg/")));
+    }
+
+    #[test]
+    fn the_hash_sink_hashes_a_chunked_body_exactly_as_one_pass_would() {
+        let body = b"the artifact bytes, arriving in pieces";
+        let mut sink = HashingSink::new(body.len() as u64);
+        for chunk in body.chunks(7) {
+            sink.accept(chunk).unwrap();
+        }
+        assert_eq!(sink.finish(), (sha256_hex(body), body.len() as u64));
+    }
+
+    /// The cap is what makes the streaming read *bounded* rather than merely
+    /// incremental. Remove it and a source whose body no longer matches its
+    /// sidecar — the case this read exists to catch — decides how much this
+    /// node accumulates before the hash disagrees.
+    #[test]
+    fn the_hash_sink_refuses_a_body_longer_than_its_sidecar_attests() {
+        let mut sink = HashingSink::new(8);
+        sink.accept(b"12345678").unwrap();
+        let err = sink.accept(b"9").unwrap_err();
+        assert!(
+            err.to_string().contains("longer than the 8 bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A source bucket that will not take the `_repl/` note. The note is the
+    /// only durable record that a peer is owed the file, so a bucket that
+    /// refuses it is a bucket where no ack is honest — and the nonce in the key
+    /// means the in-memory fake's exact-key failure switch cannot name it.
+    struct NoteRefusingStorage {
+        inner: Arc<InMemStorage>,
+        /// Notes to refuse before letting one through; `usize::MAX` refuses all.
+        refusals: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NoteRefusingStorage {
+        fn new(inner: Arc<InMemStorage>, refusals: usize) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                refusals: std::sync::atomic::AtomicUsize::new(refusals),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for NoteRefusingStorage {
+        async fn put_bytes(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+            content_type: Option<&str>,
+        ) -> Result<()> {
+            if key.starts_with(REPL_PREFIX)
+                && self
+                    .refusals
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| (n > 0).then_some(n.saturating_sub(1)),
+                    )
+                    .is_ok()
+            {
+                bail!("injected note-write failure");
+            }
+            self.inner.put_bytes(key, bytes, content_type).await
+        }
+        async fn head_exists(&self, key: &str) -> Result<bool> {
+            self.inner.head_exists(key).await
+        }
+        async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+            self.inner.stored_size(key).await
+        }
+        async fn serve_artifact(
+            &self,
+            key: &str,
+            range: Option<&str>,
+        ) -> Result<axum::response::Response<axum::body::Body>> {
+            self.inner.serve_artifact(key, range).await
+        }
+        async fn presign_get(
+            &self,
+            key: &str,
+            expires: std::time::Duration,
+        ) -> Result<Option<String>> {
+            self.inner.presign_get(key, expires).await
+        }
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+            content_type: Option<&str>,
+        ) -> Result<bool> {
+            self.inner.put_if_absent(key, bytes, content_type).await
+        }
+        async fn put_file_if_absent(
+            &self,
+            key: &str,
+            path: &std::path::Path,
+            content_type: Option<&str>,
+        ) -> Result<bool> {
+            self.inner.put_file_if_absent(key, path, content_type).await
+        }
+        async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
+            self.inner.get_bytes(key).await
+        }
+        async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
+            self.inner.list_dir_entries(dir_prefix).await
+        }
+        async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+            self.inner.list_all(prefix).await
+        }
+        async fn delete_keys(&self, keys: &[String]) -> Result<()> {
+            self.inner.delete_keys(keys).await
+        }
+        async fn get_with_etag(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            self.inner.get_with_etag(key).await
+        }
+        async fn put_if_none_match(&self, key: &str, bytes: Vec<u8>) -> Result<Option<String>> {
+            self.inner.put_if_none_match(key, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            key: &str,
+            etag: &str,
+            bytes: Vec<u8>,
+        ) -> Result<Option<String>> {
+            self.inner.put_if_match(key, etag, bytes).await
+        }
+    }
+
+    /// A two-bucket fleet whose peer is fenced out (so a note is owed) over a
+    /// source bucket that refuses `refusals` note writes.
+    fn note_refusing_fleet(
+        a: Arc<InMemStorage>,
+        b: Arc<InMemStorage>,
+        refusals: usize,
+    ) -> AppState {
+        let src = NoteRefusingStorage::new(a, refusals);
+        let mut state = two_bucket_state(src as Arc<dyn Storage>, b as Arc<dyn Storage>);
+        let health = Arc::new(
+            crate::bucket_health::HealthController::new(
+                2,
+                crate::bucket_health::HealthPolicy::new(1, std::time::Duration::from_secs(60))
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        health
+            .observe(1, crate::bucket_health::BucketSignal::Timeout)
+            .unwrap();
+        state.bucket_health = Some(health);
+        state
+    }
+
+    /// The ack bug: a note write that fails was logged and swallowed, and the
+    /// publish answered 200 with the peer holding neither the record, nor a
+    /// marker explaining its absence, nor a note owing it — the state
+    /// `ACK_TOTALITY` exists to forbid. Nothing downstream re-derives that gap:
+    /// `_dirty/` markers drive index rebuilds, not replication.
+    #[tokio::test]
+    async fn a_note_that_will_not_land_refuses_the_ack() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        seed_live(a.as_ref(), "pkg", filename, b"wheel", PRIVATE);
+        let state = note_refusing_fleet(a.clone(), b.clone(), usize::MAX);
+        let pinned = state.pin();
+
+        let err = fanout_sync(&state, &pinned, "pkg", filename, None)
+            .await
+            .expect_err("an unrecordable replication gap must not ack");
+        assert!(
+            err.to_string().contains("could not be recorded"),
+            "unexpected error: {err}"
+        );
+        // This string is interpolated into the client-visible 503, so it counts
+        // the peers that missed the note instead of naming them: a bucket's
+        // configured URI (and `@region` label) is fleet topology no authenticated
+        // uploader should learn from a transient outage.
+        assert!(
+            err.to_string()
+                .ends_with("could not be recorded on 1 of 1 other bucket(s)"),
+            "the 503 body must count peer buckets, not name them: {err}"
+        );
+        assert!(a.list_all(REPL_PREFIX).await.unwrap().is_empty());
+    }
+
+    /// The retry is not decoration: a single transient failure on one small PUT
+    /// must not turn into a 503 on an upload that is otherwise fine.
+    #[tokio::test]
+    async fn a_note_that_lands_on_the_retry_still_acks() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        seed_live(a.as_ref(), "pkg", filename, b"wheel", PRIVATE);
+        let state = note_refusing_fleet(a.clone(), b.clone(), 1);
+        let pinned = state.pin();
+
+        fanout_sync(&state, &pinned, "pkg", filename, None)
+            .await
+            .expect("the retry recorded the gap");
+        assert!(!a.list_all(REPL_PREFIX).await.unwrap().is_empty());
     }
 
     /// A peer holding a bare artifact of its own — a publish or copy that died
@@ -5244,7 +5735,9 @@ mod tests {
         let state = two_bucket_state(a.clone(), b.clone());
         let pinned = state.pin();
 
-        fanout_sync(&state, &pinned, "pkg", filename, None).await;
+        fanout_sync(&state, &pinned, "pkg", filename, None)
+            .await
+            .expect("every gap this fan-out leaves is recorded");
         assert!(
             a.list_all(&format!(
                 "{REPL_PREFIX}{}/",
@@ -5290,7 +5783,9 @@ mod tests {
         let state = two_bucket_state(a.clone(), b.clone());
         let pinned = state.pin();
 
-        fanout_sync(&state, &pinned, "pkg", filename, None).await;
+        fanout_sync(&state, &pinned, "pkg", filename, None)
+            .await
+            .expect("every gap this fan-out leaves is recorded");
 
         let key = artifact_key("pkg", filename);
         let owed = a

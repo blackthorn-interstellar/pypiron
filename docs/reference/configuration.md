@@ -245,6 +245,14 @@ in the background — a fetch is served the instant it lands, and its copy to th
 other buckets follows within minutes, off the download path — so budget for roughly your total stored size times the number of buckets. No new knobs: replication is on whenever you run more than
 one bucket.
 
+A bucket that is slow or down doesn't fail an upload — pypiron writes down what
+it owes and catches it up later. The one case that does answer `503` is when
+even that note can't be written: the file itself is safely stored, but nothing
+in the fleet would remember that a bucket still needs it, and pypiron won't
+report success it can't back up. The message says so, and tells you whether
+sending the request again is useful (for an upload it isn't — the bytes are
+already there).
+
 When two buckets live on the same cloud under the same credentials, pypiron asks
 that cloud to copy an artifact directly between them (S3 CopyObject, GCS rewrite,
 Azure Copy Blob) instead of pulling every byte through the node and pushing it
@@ -316,6 +324,7 @@ recovery behavior, and operator rules.
 | `--intent-grace-secs N` | `PYPIRON_INTENT_GRACE_SECS` | `900` | Grace for an upload or cross-bucket package operation. Minimum `3`; maximum `9223372036854775807`. |
 | `--audit-on-boot true\|false` | `PYPIRON_AUDIT_ON_BOOT` | `true` | Run the consistency check on boot: indexes against stored files, buckets against each other. |
 | `--reconcile-interval-secs N` | `PYPIRON_RECONCILE_INTERVAL_SECS` | `86400` | How often that check repeats. |
+| `--quarantine-poll-secs N` | `PYPIRON_QUARANTINE_POLL_SECS` | `30` | How long a project frozen on one server takes to be refused by the rest of the fleet. The server that receives the freeze refuses immediately; the others notice within this interval. It costs one small listing per server per interval, so lower it only if seconds matter, and raise it only if you run enough servers for that listing to show up on your storage bill. See [How fast a freeze takes hold](../security.md#malware-blocking-and-the-release-cooldown). |
 | `--transparency true\|false` | `PYPIRON_TRANSPARENCY` | `true` | Record each audit's file hashes under `_transparency/`; `pypiron verify-chain` reads the records. Off stops new records only. |
 | `--lease-ttl-secs N` | `PYPIRON_LEASE_TTL_SECS` | `30` | Multi-node leader lease TTL. |
 | `--download-stats true\|false` | `PYPIRON_DOWNLOAD_STATS` | `true` | Count package downloads. |

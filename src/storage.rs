@@ -1733,19 +1733,37 @@ pub async fn store_artifact_verified(
 /// existed and the caller must reconcile the winner. Unlike
 /// [`store_artifact_verified`] this never overwrites a byte-divergent winner:
 /// the replication copy freezes that conflict rather than clobbering it.
+///
+/// Takes an [`ArtifactBody`] for the same reason the store primitive does: a
+/// replication copy of a large artifact holds it as a staged file, and the
+/// `Spool` arm lands it with [`Storage::put_file_if_absent`] — a hardlink on
+/// disk, a multipart-then-publish on the object stores — so the bytes are
+/// never pulled through memory to create the object.
 pub async fn create_artifact_verified(
     storage: &dyn Storage,
     key: &str,
-    bytes: Vec<u8>,
+    body: ArtifactBody<'_>,
     expected_size: u64,
     content_type: Option<&str>,
 ) -> Result<bool> {
-    let created = bounded_artifact_write(
-        key,
-        expected_size,
-        storage.put_if_absent(key, bytes, content_type),
-    )
-    .await?;
+    let created = match body {
+        ArtifactBody::Bytes(bytes) => {
+            bounded_artifact_write(
+                key,
+                expected_size,
+                storage.put_if_absent(key, bytes, content_type),
+            )
+            .await?
+        }
+        ArtifactBody::Spool(path) => {
+            bounded_artifact_write(
+                key,
+                expected_size,
+                storage.put_file_if_absent(key, path, content_type),
+            )
+            .await?
+        }
+    };
     if created {
         verify_stored_size(storage, key, expected_size).await?;
     }
@@ -2374,7 +2392,7 @@ struct GcsResource {
 /// body streams to a unique staging key as parallel multipart parts (bounded
 /// RSS) and is then published atomically with `copy_if_not_exists`. The 16 MB
 /// part size keeps a ~900 MB wheel to a handful of in-flight parts.
-const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
+pub(crate) const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
 const MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
 const MULTIPART_CONCURRENCY: usize = 6;
 const READ_CHUNK: usize = 8 * 1024 * 1024;
@@ -2414,14 +2432,19 @@ impl ObjectStorage {
         self
     }
 
-    /// The storage-prefix-rooted object key as a plain string — the form the
-    /// hand-rolled copy verbs sign (they cannot take an [`OsPath`]). The source
-    /// and destination share one process-wide `--storage-prefix`.
-    fn prefixed(&self, key: &str) -> String {
-        match &self.prefix {
-            Some(p) => format!("{p}/{key}"),
-            None => key.to_string(),
-        }
+    /// The stored object's name on the wire, as a plain string — the form the
+    /// hand-rolled copy verbs sign (they cannot take an [`OsPath`]). This is
+    /// [`Self::oskey`]'s rendering, not the raw key: object_store percent-escapes
+    /// `~ % # [ ] { } ^ | < > " * ? \` and backtick and every non-ASCII byte when
+    /// it writes, so `a~b.whl` is really stored as `a%7Eb.whl`. Signing the raw
+    /// key would address an object that does not exist. The source and
+    /// destination share one process-wide `--storage-prefix`.
+    ///
+    /// Callers still URI-encode this for the request line — that second pass is
+    /// transport escaping (`%` → `%25`), not a second naming pass, and is exactly
+    /// what object_store does to the same string.
+    fn wire_key(&self, key: &str) -> String {
+        self.oskey(key).as_ref().to_string()
     }
 
     /// S3 CopyObject: a signed `PUT` whose `x-amz-copy-source` names the source
@@ -3228,8 +3251,8 @@ impl Storage for ObjectStorage {
         let Some(copy) = self.copy.as_ref() else {
             return Ok(CopyOutcome::NotCopyable);
         };
-        let src_key = self.prefixed(src_key);
-        let dst_key = self.prefixed(dst_key);
+        let src_key = self.wire_key(src_key);
+        let dst_key = self.wire_key(dst_key);
         match (copy, src.provider) {
             (CopyBackend::S3 { .. }, CopyProvider::S3) => {
                 self.s3_copy(copy, &src.location, &src_key, &dst_key, expected_size)
@@ -4195,6 +4218,92 @@ mod tests {
         }
     }
 
+    /// The hand-rolled copy verbs build and sign the key themselves. If that key
+    /// is the raw one while object_store wrote the escaped one, a server-side
+    /// copy of `a~b.whl` signs `…/a~b.whl` and misses the `…/a%7Eb.whl` that is
+    /// actually in the bucket. So the signed name is object_store's wire name,
+    /// and every provider's request line must percent-decode back to exactly it
+    /// — decoded once, since the request-line pass is transport escaping over an
+    /// already-escaped name (`%` → `%25`), not a second naming pass.
+    #[test]
+    fn copy_request_lines_address_the_object_that_object_store_wrote() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let st = ObjectStorage::new(store, None, Some("pypi".into()), "mem");
+
+        // The fix, concretely: escaped in the name, doubly escaped on the wire.
+        assert_eq!(
+            st.wire_key("packages/p/a~b-1.0.whl"),
+            "pypi/packages/p/a%7Eb-1.0.whl"
+        );
+        assert_eq!(
+            crate::reqsign::uri_encode(&st.wire_key("packages/p/a~b-1.0.whl"), true),
+            "pypi/packages/p/a%257Eb-1.0.whl"
+        );
+        assert_eq!(
+            st.wire_key("packages/p/café.whl"),
+            "pypi/packages/p/caf%C3%A9.whl"
+        );
+
+        // Every byte object_store escapes, plus space, `+` and non-ASCII.
+        let names = [
+            "a~b.whl",
+            "a%b.whl",
+            "a#b.whl",
+            "a[b]c.whl",
+            "a{b}c.whl",
+            "a^b.whl",
+            "a|b.whl",
+            "a<b>c.whl",
+            "a\"b.whl",
+            "a*b.whl",
+            "a?b.whl",
+            "a`b.whl",
+            "a\\b.whl",
+            "a b.whl",
+            "a+b.whl",
+            "café-1.0.whl",
+            "日本語-1.0.tar.gz",
+            "plain-1.0-py3-none-any.whl",
+        ];
+        let decode = |s: &str| percent_decode_str(s).decode_utf8().unwrap().into_owned();
+
+        for name in names {
+            let key = format!("packages/pkg/{name}");
+            let wire = st.wire_key(&key);
+            assert_eq!(wire, st.oskey(&key).as_ref(), "{name}");
+
+            // S3: the destination rides the request path, which is also the
+            // canonical URI signed; the source rides `x-amz-copy-source`.
+            let enc = crate::reqsign::uri_encode(&wire, true);
+            let (url, _, canonical_uri) =
+                s3_copy_target(true, None, "iron", "us-west-2", &enc).unwrap();
+            assert!(url.ends_with(&enc), "{name}");
+            assert_eq!(decode(&canonical_uri), format!("/{wire}"), "{name}");
+            assert_eq!(
+                decode(&format!("/src/{enc}")),
+                format!("/src/{wire}"),
+                "{name}"
+            );
+
+            // GCS rewrite: source and destination are single URL-encoded path
+            // segments, so their slashes are escaped too.
+            let rewrite = gcs_rewrite_url("https://g/", "src", &wire, "dst", &wire);
+            let (src_seg, dst_seg) = rewrite
+                .strip_prefix("https://g/storage/v1/b/src/o/")
+                .and_then(|r| r.split_once("/rewriteTo/b/dst/o/"))
+                .unwrap_or_else(|| panic!("unexpected rewrite URL for {name}: {rewrite}"));
+            assert_eq!(decode(src_seg), wire, "{name}");
+            assert_eq!(decode(dst_seg), wire, "{name}");
+
+            // Azure: `x-ms-copy-source` is a full blob URL; the name is its tail.
+            let blob_url = format!("{}/c/{enc}", azure_blob_base("iron", None));
+            let tail = blob_url
+                .strip_prefix("https://iron.blob.core.windows.net/c/")
+                .unwrap_or_else(|| panic!("unexpected blob URL for {name}: {blob_url}"));
+            assert_eq!(decode(tail), wire, "{name}");
+        }
+    }
+
     /// A create whose verifying HEAD never answers must fail loudly and leave
     /// the object standing. Deleting it destroys acked bytes: the artifact key
     /// is immutable and content-addressed, so a concurrent replication copy of
@@ -4528,12 +4637,20 @@ pub mod test_support {
                 .get(key)
                 .map(|b| b.len() as u64))
         }
+        /// The streaming read, over the same map and the same injected
+        /// failures [`InMemStorage::get_bytes`] honors. A fake that could not
+        /// serve was a fake that hid the replication copy's read path from
+        /// every unit test the moment that path stopped buffering bodies.
+        /// Ranges are not modelled — no caller under test asks for one.
         async fn serve_artifact(
             &self,
-            _key: &str,
+            key: &str,
             _range: Option<&str>,
         ) -> Result<axum::response::Response<axum::body::Body>> {
-            anyhow::bail!("serve_artifact not supported by InMemStorage")
+            let bytes = self.get_bytes(key).await?;
+            Ok(Response::builder()
+                .status(200)
+                .body(axum::body::Body::from(bytes))?)
         }
         async fn presign_get(
             &self,

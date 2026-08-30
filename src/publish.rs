@@ -251,6 +251,12 @@ pub(crate) async fn legacy_upload(
     let sha256 = spooled.sha256.clone();
     let wheel_metadata = if is_wheel {
         let path = spooled.path.path().to_path_buf();
+        // Bound how many central directories are resident at once (see
+        // wheel::PARSE_SLOTS). Held across the parse, and taken here rather than
+        // inside the closure so waiting parks the task instead of a blocking
+        // thread. A closed semaphore is no reason to refuse a publish: degrade
+        // to the old unbounded behaviour rather than fail the upload.
+        let _permit = wheel::PARSE_SLOTS.acquire().await.ok();
         tokio::task::spawn_blocking(move || wheel::extract_metadata_from_file(&path))
             .await
             .map_err(|_| {
@@ -592,8 +598,17 @@ pub async fn publish_record(
             // the later artifact fan-out re-claims idempotently. A `sync --to`
             // snapshot claim replicates too — it shrinks the same window.
             if claim.etag.is_some() && state.buckets.is_multi() {
-                replicate::fanout_sync(state, pinned, &pkg_norm, replicate::ORIGIN_MARKER, None)
-                    .await;
+                // Logged, not fatal — today's behavior, held unchanged: the
+                // artifact write below has not happened yet, so there is no
+                // acked record for an unrecorded gap to falsify. The claim
+                // fan-out is a window-narrowing optimization and the artifact's
+                // own fan-out re-claims idempotently.
+                if let Err(error) =
+                    replicate::fanout_sync(state, pinned, &pkg_norm, replicate::ORIGIN_MARKER, None)
+                        .await
+                {
+                    warn!(package=%pkg_norm, error=?error, "could not record the origin-claim replication gap");
+                }
             }
             write_fence = Some(match claim.etag {
                 Some(etag) => origin::OriginObservation {
@@ -989,7 +1004,9 @@ pub async fn publish_record(
         PublishBody::Spool(temp) => Some(temp.path()),
         PublishBody::Bytes(_) => None,
     };
-    replicate::fanout_sync(state, pinned, &pkg_norm, &filename, spool).await;
+    replicate::fanout_sync(state, pinned, &pkg_norm, &filename, spool)
+        .await
+        .map_err(unrecorded_replication_gap(Mutation::Upload))?;
 
     // Read-your-writes by waiting: poll our own index until the file shows
     // up, so publish-then-install pipelines never see a missing version.
@@ -999,6 +1016,71 @@ pub async fn publish_record(
 
     // Return a simple OK text body compatible with legacy clients.
     Ok((StatusCode::OK, "OK"))
+}
+
+/// A mutation whose replication gap could not be written down answers 503, not
+/// success. The record is durable on the bucket that took it — this is not a
+/// storage failure — but no peer holds it and nothing in the fleet remembers
+/// that one is owed it, which is precisely the state an ack is supposed to rule
+/// out. Acking anyway is how a bucket ends up permanently one record short with
+/// no evidence anywhere that it ever was.
+///
+/// The body has to say the write survived, and it has to say the right thing
+/// about retrying, which differs by mutation: filenames are immutable, so an
+/// identical re-upload answers `409 File already exists` rather than a second
+/// 200, while a delete, a yank and a status change are idempotent rewrites that
+/// a client is welcome to send again. Telling an operator "re-sending will be
+/// refused" on those three is telling them the opposite of the truth.
+///
+/// Which peer buckets missed the record stays in the `error!` line above and in
+/// `fanout_sync`'s per-bucket logs. It is not in the client body: any
+/// authenticated uploader would otherwise learn the fleet's bucket topology from
+/// a transient outage.
+#[derive(Clone, Copy)]
+enum Mutation {
+    Upload,
+    Delete,
+    Yank,
+    StatusChange,
+}
+
+impl Mutation {
+    fn noun(self) -> &'static str {
+        match self {
+            Mutation::Upload => "upload",
+            Mutation::Delete => "delete",
+            Mutation::Yank => "yank",
+            Mutation::StatusChange => "status change",
+        }
+    }
+
+    fn retry_advice(self) -> &'static str {
+        match self {
+            Mutation::Upload => {
+                "the bytes are already stored, so re-sending the file will be refused as a \
+                 duplicate filename"
+            }
+            Mutation::Delete | Mutation::Yank | Mutation::StatusChange => {
+                "sending the same request again is safe"
+            }
+        }
+    }
+}
+
+fn unrecorded_replication_gap(op: Mutation) -> impl FnOnce(anyhow::Error) -> (StatusCode, String) {
+    move |error| {
+        error!(op = op.noun(), error = ?error, "replication gap could not be recorded; refusing to ack");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "The {} is durable on this bucket, but the fleet could not record that the \
+                 other buckets still owe it ({error}). Nothing was lost — {}. Check the other \
+                 buckets' availability.",
+                op.noun(),
+                op.retry_advice(),
+            ),
+        )
+    }
 }
 
 /// Bounded wait for a freshly uploaded file to appear in the package index.
@@ -1205,14 +1287,22 @@ pub async fn delete_record(
             .map_err(|e| internal("tombstone write failed", e))?;
     }
 
+    // Ordering invariant: invalidate BEFORE the artifact delete, never after.
+    // The entry this drops is both the presigned URL and this node's warm
+    // "not fenced" verdict, and the tombstone above has already fenced the key.
+    // If the delete below fails, the body is still standing but must no longer
+    // be served — an invalidation placed after the `?` would be skipped on
+    // exactly that failure and keep vouching for it for the rest of
+    // FENCE_CACHE_TTL. Invalidating early costs at most a re-read on a delete
+    // that then fails.
+    state.presign_cache.invalidate(&key);
+
     storage
         .delete_keys(std::slice::from_ref(&key))
         .await
         .map_err(|e| internal("artifact delete failed", e))?;
 
-    // Stop handing out the dead URL immediately (same node; peers age out).
-    state.presign_cache.invalidate(&key);
-    // Same for the proxy's warm-hit presence proof: without this, a re-request
+    // The proxy's warm-hit presence proof gets dropped too: without this, a re-request
     // inside PRESENCE_TTL would hit the stale "present" and serve a local 404
     // instead of re-mirroring the file from upstream (peers age out via the TTL).
     if let Some(proxy) = &state.proxy {
@@ -1239,7 +1329,9 @@ pub async fn delete_record(
     // A private delete carries a tombstone. Fan it out to every healthy bucket
     // before the ack; mirror cache eviction remains local and unreplicated.
     if replicate_delete {
-        replicate::fanout_sync(state, pinned, pkg, filename, None).await;
+        replicate::fanout_sync(state, pinned, pkg, filename, None)
+            .await
+            .map_err(unrecorded_replication_gap(Mutation::Delete))?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1417,7 +1509,9 @@ pub(crate) async fn set_yank(
         }
     };
     if replicate_this {
-        replicate::fanout_sync(state, pinned, pkg, filename, None).await;
+        replicate::fanout_sync(state, pinned, pkg, filename, None)
+            .await
+            .map_err(unrecorded_replication_gap(Mutation::Yank))?;
     }
     Ok(StatusCode::OK)
 }
@@ -1515,11 +1609,30 @@ async fn write_project_status(
     };
     result.map_err(|e| internal("write", e))?;
 
+    // Fold the change into the byte gate NOW: arm this node in memory, and publish
+    // the one-name increment so every other node adopts it on its next quarantine
+    // poll (seconds). The audit sweep derives the same set, but it runs on
+    // `reconcile_interval` — a day, by default — and walks the whole corpus, which
+    // is far too slow to be the propagation path for a freeze. Both directions go
+    // through here: an un-quarantine must not wait for a sweep either. Idempotent,
+    // so it is called after every status write rather than diffing membership.
+    let replicas = state.singleton_replicas(pinned.index);
+    crate::advisories::arm_quarantine(
+        storage,
+        &replicas,
+        &state.advisories,
+        &pkg,
+        doc.status.blocks_downloads(),
+    )
+    .await;
+
     if let Err(e) = markers::commit_marker(state, storage, &pkg, intent_nonce).await {
         warn!(error=?e, "status: failed to write commit marker");
     }
     if replicate_private {
-        replicate::fanout_sync(state, &pinned, &pkg, replicate::PROJECT_STATUS_MARKER, None).await;
+        replicate::fanout_sync(state, &pinned, &pkg, replicate::PROJECT_STATUS_MARKER, None)
+            .await
+            .map_err(unrecorded_replication_gap(Mutation::StatusChange))?;
     }
     Ok(StatusCode::OK)
 }

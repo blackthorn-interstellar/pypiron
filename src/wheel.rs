@@ -11,6 +11,27 @@ use zip::ZipArchive;
 /// The proxy reuses this to bound upstream `.metadata`/`.provenance` fetches.
 pub(crate) const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Ceiling on a wheel's central-directory entry count. `ZipArchive::new`
+/// materializes every record — name string included — before any per-entry cap
+/// applies, so an upload spool of minimum-size entries is millions of resident
+/// records for a body well under the upload limit. Measured on 2026-08-29
+/// against the largest wheel of each heavyweight project on PyPI: tensorflow
+/// 24,117 entries (573 MB), torch 12,911 (527 MB), scipy 1,558, numpy 1,049,
+/// pyarrow 814, matplotlib 634 — so 2^18 leaves the worst real wheel ~10.9x
+/// headroom and no honest publisher can reach it.
+pub(crate) const MAX_WHEEL_ENTRIES: usize = 262_144;
+
+/// Concurrent central-directory parses allowed process-wide.
+/// [`MAX_WHEEL_ENTRIES`] bounds what one parse can cost, but it can only reject
+/// *after* `ZipArchive::new` has already built the whole directory — so without
+/// a second bound, N concurrent uploads hold N of those peaks at once on the
+/// blocking pool. Four slots is invisible to real publishing: a real wheel's
+/// directory is a few thousand records and parses in milliseconds, so the
+/// permit is uncontended unless uploads overlap within that window, and every
+/// upload needs a credential to get here at all. A flood of hostile wheels
+/// queues instead of multiplying resident memory.
+pub(crate) static PARSE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 /// Extract `METADATA` from a wheel on disk without loading the wheel into
 /// memory — zip needs only the central directory plus the one entry.
 pub fn extract_metadata_from_file(path: &Path) -> Option<Vec<u8>> {
@@ -19,6 +40,9 @@ pub fn extract_metadata_from_file(path: &Path) -> Option<Vec<u8>> {
 
 pub(crate) fn extract_metadata_from_reader<R: Read + Seek>(reader: R) -> Option<Vec<u8>> {
     let mut zip = ZipArchive::new(reader).ok()?;
+    if zip.len() > MAX_WHEEL_ENTRIES {
+        return None;
+    }
     let name = zip
         .file_names()
         .find(|n| n.ends_with(".dist-info/METADATA") && n.matches('/').count() == 1)
@@ -65,6 +89,24 @@ mod tests {
             extract_metadata_from_reader(Cursor::new(&wheel)).as_deref(),
             Some(md.as_slice())
         );
+    }
+
+    /// A wheel whose central directory is over [`MAX_WHEEL_ENTRIES`] is refused
+    /// before the METADATA search walks it — even though the METADATA is there.
+    /// Built at the cap rather than at a hostile 14M so the test stays fast; the
+    /// blackbox counterpart is `tests/test_zip_bounds.py`.
+    #[test]
+    fn over_entry_cap_is_none() {
+        let md = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("demo-1.0.dist-info/METADATA", opts).unwrap();
+        zip.write_all(md).unwrap();
+        for i in 0..MAX_WHEEL_ENTRIES {
+            zip.start_file(format!("demo/f{i}"), opts).unwrap();
+        }
+        let wheel = zip.finish().unwrap().into_inner();
+        assert_eq!(extract_metadata_from_reader(Cursor::new(&wheel)), None);
     }
 
     #[test]

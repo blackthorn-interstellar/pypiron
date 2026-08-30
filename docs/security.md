@@ -112,6 +112,27 @@ can't route around the empty listing. When a single file disappears upstream,
 pypiron stops serving. This refusal is a distinct guarantee from malware
 blocking: turning blocking off (`--malware-block=false`) leaves it standing.
 
+**How fast a freeze takes hold.** The server that receives it refuses the next
+request — no delay, no restart, no sweep to wait for. Every other server in the
+fleet refuses within 30 seconds by default
+([`--quarantine-poll-secs`](reference/configuration.md#server)). Freezing a
+project yourself works the same way, and so does releasing one:
+
+```bash
+curl -u admin:$PYPIRON_ADMIN_PASS -X POST \
+  -d '{"status":"quarantined","reason":"compromised release"}' \
+  https://pypi.internal/project/acme-widgets/status
+```
+
+One thing outlives the freeze. On object storage, pypiron hands clients a signed
+link and lets them download from the bucket directly — that's what keeps installs
+fast at scale — and a link already handed out keeps working until it expires, up
+to an hour. Nothing new gets one. That window is the price of not proxying every
+byte through the server, and it is accepted deliberately: whoever already holds
+the link already holds the file. Close it if you need to —
+`--artifact-delivery stream` puts every byte back through the server, and
+deleting the file from the bucket kills every outstanding link at once.
+
 A private package that happens to share a malicious public name still installs.
 pypiron blocks only the public package the advisory names — a private name of
 your own is not that package. You can turn blocking off, or disable the

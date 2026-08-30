@@ -483,6 +483,97 @@ fn presign_weight(key: &str, url: &str) -> usize {
     ENTRY_OVERHEAD_BYTES + key.len() + url.len()
 }
 
+/// How long the single-bucket read path may reuse one artifact's delete/freeze
+/// marker verdict (see `serve::single_bucket_file_visible`).
+///
+/// The markers are a visibility fence, so the number trades a bounded window
+/// against the hottest route's op count:
+///  * **Convergence.** A delete on *this* node drops the entry outright
+///    ([`PresignCache::invalidate`]), so it is never the reason a local delete
+///    lags. The TTL only bounds another node's delete — 30 s against the 24 h
+///    (a reconcile interval) that the audit sweep took before this cache.
+///  * **Cost.** Two HEADs per artifact per TTL rather than two per request:
+///    ≤0.07 storage reads/s for an artifact under continuous load, against
+///    thousands of requests/s on the same key.
+///  * **Determinism.** Comfortably longer than the microbench's
+///    cold → warm → warm2 window, so the artifact-GET op pins don't wobble.
+pub const FENCE_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Entry cap for the fence verdicts, mirroring the presign cache's. Verdicts
+/// are populated from the read path without proving the artifact exists, so
+/// they are bounded by bytes as well.
+const FENCE_CACHE_MAX_ENTRIES: usize = 65_536;
+/// Memory ceiling for the fence verdicts. An entry is a key plus a bool, so a
+/// full cache of real ones weighs well under this; like the presign ceiling it
+/// only ever fires on keys built to be big.
+const FENCE_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bytes one fence verdict charges against the ceiling: its key plus the same
+/// fixed per-entry overhead the other caches charge for the map slot. The
+/// value is a `bool`, so the key is the only variable part.
+fn fence_weight(key: &str) -> usize {
+    ENTRY_OVERHEAD_BYTES + key.len()
+}
+
+/// Remembered "is this artifact key fenced?" answers, keyed by artifact key.
+#[derive(Default)]
+struct FenceEntries {
+    /// `true` = no delete/freeze marker was present when checked.
+    map: HashMap<String, (bool, Instant)>,
+    /// What the retained keys weigh, maintained per mutation the way
+    /// [`Entries::body_bytes`] is, so enforcing the ceiling never walks the map.
+    weight: usize,
+    /// Selection generation these verdicts were read under (design §3); see
+    /// [`Entries::generation`]. A switch clears them so one bucket's markers
+    /// never speak for another's.
+    generation: u64,
+}
+
+impl FenceEntries {
+    fn reconcile_generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.map.clear();
+            self.weight = 0;
+            self.generation = generation;
+        }
+    }
+
+    fn insert(&mut self, key: &str, visible: bool) {
+        if self.map.contains_key(key) {
+            self.weight -= fence_weight(key);
+        }
+        self.weight += fence_weight(key);
+        self.map.insert(key.to_string(), (visible, Instant::now()));
+    }
+
+    fn remove(&mut self, key: &str) {
+        if self.map.remove(key).is_some() {
+            self.weight -= fence_weight(key);
+        }
+    }
+
+    /// Both ceilings, enforced the way [`PresignEntries::enforce_caps`] does:
+    /// drop expired entries, and clear outright if the live set alone still
+    /// exceeds either bound. Refilling costs two HEADs, not a rebuild.
+    fn enforce_caps(&mut self, max_entries: usize, max_bytes: usize, ttl: Duration) {
+        if self.map.len() <= max_entries && self.weight <= max_bytes {
+            return;
+        }
+        let mut freed = 0usize;
+        self.map.retain(|key, (_, checked)| {
+            let keep = checked.elapsed() < ttl;
+            if !keep {
+                freed += fence_weight(key);
+            }
+            keep
+        });
+        self.weight -= freed;
+        if self.map.len() > max_entries || self.weight > max_bytes {
+            self.map.clear();
+            self.weight = 0;
+        }
+    }
+}
+
 #[derive(Default)]
 struct PresignEntries {
     map: HashMap<String, (Arc<str>, Instant)>,
@@ -541,17 +632,54 @@ impl PresignEntries {
     }
 }
 
+/// The read path's two per-artifact-key memories: the reusable presigned URL
+/// and, on single-bucket deployments, the delete/freeze marker verdict. They
+/// live in one struct because they are invalidated by exactly the same events —
+/// a delete of that key on this node, and a bucket-selection switch.
 pub struct PresignCache {
     ttl: Duration,
     entries: Mutex<PresignEntries>,
+    fence_ttl: Duration,
+    fences: Mutex<FenceEntries>,
 }
 
 impl PresignCache {
     pub fn new(ttl: Duration) -> Self {
+        Self::with_ttls(ttl, FENCE_CACHE_TTL)
+    }
+
+    pub fn with_ttls(ttl: Duration, fence_ttl: Duration) -> Self {
         Self {
             ttl,
             entries: Mutex::new(PresignEntries::default()),
+            fence_ttl,
+            fences: Mutex::new(FenceEntries::default()),
         }
+    }
+
+    /// The remembered marker verdict for `key`, or `None` when it must be
+    /// re-read from storage. `Some(true)` = not fenced.
+    pub fn fence_verdict(&self, key: &str, generation: u64) -> Option<bool> {
+        let mut fences = self.fences.lock().unwrap_or_else(|e| e.into_inner());
+        fences.reconcile_generation(generation);
+        let (visible, checked) = fences.map.get(key)?;
+        (checked.elapsed() < self.fence_ttl).then_some(*visible)
+    }
+
+    /// Remember what the markers said. Both answers are cached: the negative
+    /// ("not fenced") is the hot path this exists for, and caching the positive
+    /// keeps a client hammering one dead URL from turning every request back
+    /// into two storage HEADs. A fenced key can only become live again through
+    /// a write this node would invalidate, or on another node within the TTL.
+    pub fn record_fence_verdict(&self, key: &str, visible: bool, generation: u64) {
+        let mut fences = self.fences.lock().unwrap_or_else(|e| e.into_inner());
+        fences.reconcile_generation(generation);
+        fences.insert(key, visible);
+        fences.enforce_caps(
+            FENCE_CACHE_MAX_ENTRIES,
+            FENCE_CACHE_MAX_BYTES,
+            self.fence_ttl,
+        );
     }
 
     pub fn fresh(&self, key: &str, generation: u64) -> Option<Arc<str>> {
@@ -568,9 +696,16 @@ impl PresignCache {
         entries.enforce_caps(PRESIGN_CACHE_MAX_ENTRIES, PRESIGN_CACHE_MAX_BYTES, self.ttl);
     }
 
-    /// Deletes must stop handing out the dead URL immediately (same node).
+    /// Deletes must stop handing out the dead URL immediately (same node), and
+    /// must stop vouching for a key whose tombstone was just written — a delete
+    /// that fails after the tombstone leaves the body standing, and a stale
+    /// "not fenced" verdict would keep serving it for the rest of the TTL.
     pub fn invalidate(&self, key: &str) {
         self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+        self.fences
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key);
@@ -768,6 +903,77 @@ mod tests {
             cache.fresh("packages/p/a.whl", 0).is_none(),
             "expired URLs must not be served"
         );
+    }
+
+    #[tokio::test]
+    async fn fence_verdict_round_trip_expiry_and_invalidation() {
+        let cache = PresignCache::with_ttls(Duration::from_secs(300), Duration::from_millis(20));
+        assert!(cache.fence_verdict("packages/p/a.whl", 0).is_none());
+
+        cache.record_fence_verdict("packages/p/a.whl", true, 0);
+        assert_eq!(cache.fence_verdict("packages/p/a.whl", 0), Some(true));
+
+        // A delete on this node must re-read the markers on the next request,
+        // even mid-TTL: the tombstone it just wrote is what fences the body.
+        cache.invalidate("packages/p/a.whl");
+        assert!(cache.fence_verdict("packages/p/a.whl", 0).is_none());
+
+        // The fenced answer is cached too, so a dead URL under load stays one
+        // map lookup rather than two storage HEADs per request.
+        cache.record_fence_verdict("packages/p/a.whl", false, 0);
+        assert_eq!(cache.fence_verdict("packages/p/a.whl", 0), Some(false));
+
+        // Both answers expire: a peer's delete (or un-freeze) converges.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(cache.fence_verdict("packages/p/a.whl", 0).is_none());
+    }
+
+    #[test]
+    fn generation_change_clears_fence_verdicts() {
+        let cache = PresignCache::new(Duration::from_secs(300));
+        cache.record_fence_verdict("packages/p/a.whl", true, 0);
+        assert_eq!(cache.fence_verdict("packages/p/a.whl", 0), Some(true));
+        assert!(
+            cache.fence_verdict("packages/p/a.whl", 1).is_none(),
+            "one bucket's markers must not vouch for another's after a switch"
+        );
+    }
+
+    #[test]
+    fn fence_weight_tracks_inserts_replacements_and_removals() {
+        let mut entries = FenceEntries::default();
+        assert_eq!(entries.weight, 0);
+
+        entries.insert("packages/p/a.whl", true);
+        let one = fence_weight("packages/p/a.whl");
+        assert_eq!(entries.weight, one);
+
+        // Re-checking the same key replaces rather than accumulates.
+        entries.insert("packages/p/a.whl", false);
+        assert_eq!(entries.weight, one);
+
+        entries.insert("packages/p/b.whl", true);
+        assert_eq!(entries.weight, one + fence_weight("packages/p/b.whl"));
+
+        entries.remove("packages/p/a.whl");
+        assert_eq!(entries.weight, fence_weight("packages/p/b.whl"));
+        entries.remove("packages/p/b.whl");
+        assert_eq!(entries.weight, 0);
+        // Removing a key that was never there must not underflow the counter.
+        entries.remove("packages/p/gone.whl");
+        assert_eq!(entries.weight, 0);
+    }
+
+    #[test]
+    fn fence_cache_stays_bounded_under_a_flood_of_distinct_keys() {
+        // Live entries past the ceiling: the cache clears rather than grows.
+        let mut entries = FenceEntries::default();
+        for i in 0..64 {
+            entries.insert(&format!("packages/p{i}/a.whl"), true);
+        }
+        entries.enforce_caps(8, 4 * 1024, Duration::from_secs(60));
+        assert!(entries.map.len() <= 8, "entry cap must bind");
+        assert!(entries.weight <= 4 * 1024, "byte cap must bind");
     }
 
     #[test]

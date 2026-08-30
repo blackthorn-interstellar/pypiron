@@ -273,6 +273,12 @@ pub struct AppState {
     // worker cfg
     pub worker_interval: Duration,
     pub reconcile_interval: Duration,
+    /// How often every node re-checks the shared PEP 792 quarantined set — the
+    /// bound on how long a freeze takes to reach the rest of the fleet. Its own
+    /// cadence, deliberately not the advisory tick's: that one runs on
+    /// `reconcile_interval` and can sit behind a 32 MB OSV refetch, and a freeze
+    /// must not queue behind either. See `--quarantine-poll-secs`.
+    pub quarantine_poll_interval: Duration,
     /// Periodic backstop cadence for the `_repl/` repair-note sweep, decoupled
     /// from `worker_interval` so the 1 s tick never drives `_repl/` LISTs. The
     /// sweep also fires immediately when an unhealthy bucket heals (see
@@ -590,6 +596,7 @@ impl AppState {
             login_throttle: LoginThrottle::default(),
             worker_interval: Duration::from_secs(1),
             reconcile_interval: Duration::from_secs(86400),
+            quarantine_poll_interval: Duration::from_secs(30),
             repl_sweep_interval: Duration::from_secs(300),
             repl_sweep_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_request_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1575,17 +1582,18 @@ async fn run_serve(
         advisory_state
     } else {
         let pinned = buckets.pin();
-        let (quarantined, quarantined_etag) =
-            advisories::load_quarantined_at_startup(pinned.storage.as_ref()).await;
-        if !quarantined.is_empty() {
+        let loaded = advisories::load_quarantined_at_startup(pinned.storage.as_ref()).await;
+        if !loaded.set.is_empty() {
             info!(
-                projects = quarantined.len(),
+                projects = loaded.set.len(),
+                epoch = loaded.epoch,
                 "PEP 792 quarantine armed from the stored set"
             );
         }
         advisories::AdvisoryState {
-            quarantined,
-            quarantined_etag,
+            quarantined: loaded.set,
+            quarantined_epoch: loaded.epoch,
+            quarantined_etag: loaded.etag,
             ..advisory_state
         }
     };
@@ -1612,6 +1620,7 @@ async fn run_serve(
         login_throttle: LoginThrottle::new(Duration::from_secs(cli.login_cooldown_secs)),
         worker_interval: Duration::from_secs(cli.worker_interval_secs),
         reconcile_interval: Duration::from_secs(cli.reconcile_interval_secs),
+        quarantine_poll_interval: Duration::from_secs(cli.quarantine_poll_secs),
         repl_sweep_interval: Duration::from_secs(cli.repl_sweep_interval_secs),
         repl_sweep_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         last_request_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),

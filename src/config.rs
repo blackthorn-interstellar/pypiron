@@ -115,6 +115,7 @@ pub struct ServeConfig {
     pub audit_on_boot: Option<bool>,
     pub transparency: Option<bool>,
     pub reconcile_interval_secs: Option<u64>,
+    pub quarantine_poll_secs: Option<u64>,
     pub repl_sweep_interval_secs: Option<u64>,
     pub lease_ttl_secs: Option<u64>,
     pub download_stats: Option<bool>,

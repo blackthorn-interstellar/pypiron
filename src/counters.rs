@@ -90,6 +90,18 @@ pub const SEG_PREFIX: &str = "_counters/seg/";
 /// (or hostile) keys can never grow a node's memory without bound.
 pub(crate) const OVERFLOW_KEY: &str = "_overflow";
 
+/// Every metric name the server records. The `/stats/:metric` surfaces answer
+/// for these and 404 for anything else: a query walks a 30-day window of day
+/// summaries and open-day segments across shards, so an unrecognized name buys
+/// a caller that whole scan for a metric that can never hold a single count.
+/// A new metric is added here and nowhere else.
+pub(crate) const RECORDED_METRICS: &[&str] = &["downloads"];
+
+/// Is `metric` a name this server records? See [`RECORDED_METRICS`].
+pub(crate) fn is_recorded_metric(metric: &str) -> bool {
+    RECORDED_METRICS.contains(&metric)
+}
+
 /// Longest `(metric, key)` pair the buffer keeps verbatim. [`Config::max_keys`]
 /// bounds how *many* keys are held, not how many bytes each one weighs, and a
 /// download key is `<pkg>/<filename>` straight off the request path. Without a
@@ -1695,6 +1707,20 @@ mod tests {
             .values()
             .any(|bm| bm.values().any(|leaf| leaf.contains_key(OVERFLOW_KEY)));
         assert!(has_overflow);
+    }
+
+    #[test]
+    fn only_recorded_metric_names_are_queryable() {
+        assert!(
+            is_recorded_metric("downloads"),
+            "the one metric `record` is called with must be queryable"
+        );
+        // Anything else is a name no flush ever writes, so a `/stats` query for
+        // it would scan 30 days to prove an empty answer. Match exactly: no
+        // case folding, no prefix, no path games.
+        for name in ["", "Downloads", "downloads/", "download", "../downloads"] {
+            assert!(!is_recorded_metric(name), "{name:?} is not recorded");
+        }
     }
 
     #[test]

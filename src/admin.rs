@@ -102,6 +102,9 @@ pub(crate) async fn stats_get(
     if !state.is_reader(&headers) {
         return unauthorized();
     }
+    if !counters::is_recorded_metric(&metric) {
+        return not_found("not a metric");
+    }
     let Some(pkg) = checked_pkg_name(&package) else {
         return not_found("not a package");
     };
@@ -137,9 +140,10 @@ pub(crate) async fn stats_get(
 const SUMMARY_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Cap on distinct `:metric` keys held in the summary cache. `:metric` is a
-/// read-gated path param, so a caller cycling it must never grow the map
-/// without bound; past the cap it is cleared wholesale (the presign-cache
-/// idiom). In practice only `downloads` is ever recorded, so this is never hit.
+/// path param, so a caller cycling it must never grow the map without bound;
+/// past the cap it is cleared wholesale (the presign-cache idiom). The
+/// [`counters::RECORDED_METRICS`] allowlist already 404s every name but
+/// `downloads` before a query is issued, so this is a second line, not the first.
 const SUMMARY_CACHE_MAX_METRICS: usize = 64;
 
 /// Cap on distinct `(metric, package)` keys held in the per-package stats cache.
@@ -178,7 +182,8 @@ async fn cached_summaries(
     guard.insert(metric.to_string(), (Instant::now(), summaries.clone()));
     // Bound the map: drop expired entries once past the cap, and clear outright
     // if the live set still exceeds it (a caller cycling `:metric` can't grow it
-    // without bound). Only `downloads` is ever recorded, so this never fires.
+    // without bound). Callers only reach here with an allowlisted metric name,
+    // so this never fires today; it survives a second metric being added.
     if guard.len() > SUMMARY_CACHE_MAX_METRICS {
         guard.retain(|_, (at, _)| at.elapsed() < SUMMARY_CACHE_TTL);
         if guard.len() > SUMMARY_CACHE_MAX_METRICS {
@@ -243,6 +248,9 @@ pub(crate) async fn stats_summary_get(
 ) -> Response<Body> {
     if !state.is_reader(&headers) {
         return unauthorized();
+    }
+    if !counters::is_recorded_metric(&metric) {
+        return not_found("not a metric");
     }
     let (from, to) = last_30d_window();
     let summaries = cached_summaries(&state, &metric, from, to).await;

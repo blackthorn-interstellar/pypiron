@@ -16,6 +16,15 @@
 //! successor's; the leader's own audit task rebuilds concurrently with its
 //! tick; and `delete_record` rebuilds from any node's request handler,
 //! unleased. Serializing is what it is *for*, not what it *guarantees*.
+//!
+//! Where an expired leader's late write would be *harmful* rather than merely
+//! duplicated, the fence lives in the record, not here. The quarantined set is
+//! the exhibit: its stored envelope carries a monotone epoch, and the audit
+//! sweep's repair publish is conditioned on the epoch it read when the walk
+//! began (`advisories::QuarantinedEdit::Sweep`), so a sweep that outlives its
+//! lease loses to whatever landed while it ran instead of un-blocking a project
+//! its successor froze. Read that as the pattern: give the record a version, do
+//! not give the lease a token.
 
 use std::sync::Arc;
 use std::time::Duration;

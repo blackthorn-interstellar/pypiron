@@ -727,6 +727,11 @@ pub async fn run_worker_until(
         crate::advisories::RefreshMemo::default(),
     ));
     let advisory_running = Arc::new(AtomicBool::new(false));
+    // Quarantine poll (every node, its own cadence — see the call site). `None`
+    // fires one poll on the first tick, so a node that booted while another was
+    // publishing catches up in a second rather than in a poll interval.
+    let mut last_quarantine_poll: Option<Instant> = None;
+    let quarantine_poll_running = Arc::new(AtomicBool::new(false));
     // Malware probe (every node): block a newly-published MAL-* advisory within
     // minutes, ahead of the daily feed. Inert unless blocking is armed, the
     // interval is nonzero, and the feed is the OSV `all.zip` URL (its CSV and
@@ -875,6 +880,30 @@ pub async fn run_worker_until(
                     &mut memo,
                 )
                 .await;
+            });
+        }
+
+        // Quarantine poll (EVERY node, leader or not): adopt a PEP 792 quarantined
+        // set another node published. This is the propagation path for a freeze,
+        // so it runs on its OWN short cadence and is deliberately not folded into
+        // the advisory tick above — that one runs on `reconcile_interval` (a day,
+        // by default) and serializes behind a 32 MB OSV refetch through
+        // `advisory_running`, either of which would leave a compromised project
+        // downloadable on every node but the one that received the freeze.
+        // Steady state is one 1-key LIST per node per interval; the body is read
+        // only when the key actually moved. Spawned like the other ticks so a slow
+        // storage call never stalls the loop.
+        if last_quarantine_poll.is_none_or(|t| t.elapsed() >= state.quarantine_poll_interval)
+            && !quarantine_poll_running.swap(true, Ordering::SeqCst)
+        {
+            last_quarantine_poll = Some(Instant::now());
+            let job_state = state.clone();
+            let pinned = selected.clone();
+            let guard = SweepGuard(quarantine_poll_running.clone());
+            tokio::spawn(async move {
+                let _guard = guard;
+                crate::advisories::poll_quarantined(pinned.storage.as_ref(), &job_state.advisories)
+                    .await;
             });
         }
 
@@ -1253,9 +1282,16 @@ pub async fn audit(
     let mut rebuilt = 0usize;
     let mut skipped = 0usize;
     let mut pkg_stats: Vec<(String, PkgStat)> = Vec::new();
-    // Accumulated across every shard — the quarantined set is fleet-wide truth, so
-    // it may only be published once the whole corpus has been swept (below).
+    // Accumulated across every shard — the quarantined set is fleet-wide, so it
+    // may only be republished once the whole corpus has been swept (below).
     let mut quarantined_names: Vec<String> = Vec::new();
+    // The stored quarantined set and its epoch as the walk BEGINS. The repair
+    // publish at the end merges against it, so a status write that lands while
+    // this walk is running is not undone by a set derived before it existed (and
+    // an expired leader's late sweep cannot overwrite its successor's edits).
+    // `Err` is a storage failure: skip the repair rather than publish over a set
+    // we could not read.
+    let quarantine_base = crate::advisories::stored_quarantined(storage).await;
     let mut deltas: Vec<(String, FileShas)> = Vec::new();
     // Advisory-report inventory: `(package, filenames)` for advisory-matched names,
     // accumulated across shards and joined against the audit index in the tail.
@@ -1361,19 +1397,34 @@ pub async fn audit(
     // The fleet-wide quarantined set derived this sweep. Shared by the byte-gate
     // publish below and the report's `blocked` flag.
     let quarantined_set: HashSet<String> = quarantined_names.iter().cloned().collect();
-    // A clean full cycle: publish the quarantined set for the byte gate,
+    // A clean full cycle: REPAIR the shared quarantined set for the byte gate,
     // independent of `--malware-block` — PEP 792 quarantine refusal is a separate
     // guarantee from OSV blocking (a compromised project PyPI froze stays refused
-    // even with malware blocking off). `publish_quarantined` persists on change
-    // only, so an empty set (no quarantined project) writes nothing; a non-empty
-    // one is written write-through to every healthy bucket and swaps this leader's
-    // own in-memory set immediately.
+    // even with malware blocking off). This is a repair pass, not the propagation
+    // path: a status write publishes its own increment the moment it lands
+    // (`advisories::arm_quarantine`), and this sweep re-derives the whole set from
+    // the sidecars to heal any drift. The publish merges against
+    // `quarantine_base`, so a set derived before a concurrent increment cannot
+    // undo it; it persists on change only, so an unchanged set writes nothing.
     let set: std::collections::BTreeSet<String> = quarantined_names.into_iter().collect();
     let replicas = state.singleton_replicas(pinned.index);
-    if let Err(e) =
-        crate::advisories::publish_quarantined(storage, &replicas, &state.advisories, set).await
-    {
-        warn!(error=?e, "audit: publishing quarantined set failed; serving last set");
+    match quarantine_base {
+        Ok((base_set, base_epoch)) => {
+            let edit = crate::advisories::QuarantinedEdit::Sweep {
+                set,
+                base_set,
+                base_epoch,
+            };
+            if let Err(e) =
+                crate::advisories::publish_quarantined(storage, &replicas, &state.advisories, &edit)
+                    .await
+            {
+                warn!(error=?e, "audit: repairing the quarantined set failed; serving last set");
+            }
+        }
+        Err(e) => {
+            warn!(error=?e, "audit: could not read the quarantined set when the sweep began; skipping the repair rather than publishing over it")
+        }
     }
     // Materialize the org audit report: the walked inventory joined with the audit
     // index and 30-day counters. Leader-only by construction (the audit runs under
@@ -4287,6 +4338,7 @@ mod tests {
             login_throttle: Default::default(),
             worker_interval,
             reconcile_interval: Duration::from_secs(3600),
+            quarantine_poll_interval: Duration::from_secs(30),
             repl_sweep_interval: Duration::from_secs(300),
             repl_sweep_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_request_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),

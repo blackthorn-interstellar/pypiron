@@ -35,8 +35,12 @@ pub use crate::osv::{advisories_for, blocking_advisories, parse_feed, AdvisoryDb
 /// reserved `_advisories/` prefix — deletable and regenerable, never truth.
 pub const FEED_KEY: &str = "_advisories/osv-pypi.zip";
 
-/// Worker-derived set of PEP 792 `quarantined` projects, persisted for the
-/// byte-gate probe (rung 5). Defined now; unused until then.
+/// The fleet's set of PEP 792 `quarantined` projects, consulted by the byte
+/// gate. A *derived view* of the per-package `.project-status.json` sidecars —
+/// deletable, and rebuilt by the next audit sweep — carried in an epoch-bearing
+/// envelope so every writer CASes it forward and no reader ever moves back.
+/// A status write publishes its own one-name increment ([`arm_quarantine`]);
+/// the sweep republishes the whole set as repair ([`QuarantinedEdit::Sweep`]).
 pub(crate) const QUARANTINED_KEY: &str = "_advisories/quarantined.json";
 
 /// Materialized org audit report: the walked inventory joined with the advisory
@@ -50,9 +54,11 @@ pub(crate) const REPORT_KEY: &str = "_advisories/report.json";
 pub const DEFAULT_FEED_URL: &str =
     "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip";
 
-/// Hard ceiling on a fetched/read feed. The real export is ~32 MB; 256 MB is
-/// generous headroom that still refuses a hostile or runaway body. Public so the
-/// `sync` relay caps a source-server pull with the same bound.
+/// Hard ceiling on a fetched/read feed. Measured 33,958,076 bytes (32.4 MiB) on
+/// 2026-08-29; 256 MiB is ~7.9x headroom and still refuses a hostile or runaway
+/// body. Public so the `sync` relay caps a source-server pull with the same
+/// bound. This bounds only the *compressed* body — what a zip of that size costs
+/// to open is bounded separately by `osv::MAX_FEED_MEMBERS`.
 pub const MAX_FEED_BYTES: u64 = 256 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -201,10 +207,27 @@ pub struct AdvisoryState {
     /// Worker-derived `quarantined` projects (rung 5), consulted by the byte
     /// gate. Carried across feed reloads; swapped by its own etag-gated reload.
     pub quarantined: HashSet<String>,
-    /// The storage `ObjectMeta.etag` [`QUARANTINED_KEY`] was read at, so the
-    /// every-node reload skips the GET when the set hasn't moved. Absent key and
-    /// never-loaded both read as `None` → an empty set that never un-blocks.
+    /// The storage `ObjectMeta.etag` [`QUARANTINED_KEY`] was last *examined* at,
+    /// so the every-node poll skips the GET when the key hasn't moved. Absent key
+    /// and never-loaded both read as `None` → an empty set that never un-blocks.
+    /// This is the listing etag, a change detector only — the conditional-write
+    /// token for a publish comes from `get_with_etag`, which is a different token
+    /// space on some backends (see [`Storage::head_etag`]).
     pub quarantined_etag: Option<String>,
+    /// The envelope epoch of the loaded quarantined set (0 = never loaded, or
+    /// never published). Monotone on this node: a poll, a startup hydration and a
+    /// reseed all refuse a set whose epoch is below this one, so a failover onto a
+    /// bucket holding an older copy can never un-block a live quarantine.
+    pub quarantined_epoch: u64,
+    /// True while `quarantined` carries a local arm that no epoch owns yet —
+    /// `arm_local_quarantine` edits the live set the instant a status write lands
+    /// but deliberately leaves the epoch alone, because nothing was published.
+    /// The re-seed refuses to write in that state: it would put THIS node's set
+    /// on a peer under an epoch some other writer already spent on different
+    /// bytes, leaving two buckets holding different bodies at one epoch with
+    /// nothing in the reader able to order them. Cleared by any swap that lands a
+    /// set together with the epoch it was published or read at.
+    pub quarantined_unpublished: bool,
     /// Unix seconds of the load (0 = never loaded).
     pub loaded_unix: u64,
 }
@@ -497,32 +520,45 @@ pub async fn feed_storage_etag(storage: &dyn Storage) -> Result<Option<String>> 
 /// on a cold start there is nothing to keep, so this window still serves
 /// unquarantined; making it fail closed means refusing startup, which is a
 /// product decision, not a code one.
-pub(crate) async fn load_quarantined_at_startup(
-    storage: &dyn Storage,
-) -> (HashSet<String>, Option<String>) {
+pub(crate) async fn load_quarantined_at_startup(storage: &dyn Storage) -> LoadedQuarantined {
     let etag = match quarantined_storage_etag(storage).await {
         Ok(etag) => etag,
         Err(e) => {
-            error!(error = %e, "advisory feed: reading the quarantined set etag at startup failed; the quarantine set is UNKNOWN, not empty — quarantined artifacts are servable until the worker's next reload heals it");
-            return (HashSet::new(), None);
+            error!(error = %e, "advisory feed: reading the quarantined set etag at startup failed; the quarantine set is UNKNOWN, not empty — quarantined artifacts are servable until the worker's next poll heals it");
+            return LoadedQuarantined::default();
         }
     };
     if etag.is_none() {
-        return (HashSet::new(), None); // never published — the empty set
+        return LoadedQuarantined::default(); // never published — the empty set
     }
     match storage.get_bytes(QUARANTINED_KEY).await {
         Ok(bytes) => match parse_quarantined(&bytes) {
-            Ok(set) => (set, etag),
+            Ok(stored) => LoadedQuarantined {
+                set: stored.quarantined.into_iter().collect(),
+                epoch: stored.epoch,
+                etag,
+            },
             Err(e) => {
-                error!(error = %e, key = QUARANTINED_KEY, "advisory feed: the persisted quarantined set did not parse at startup; the quarantine set is UNKNOWN, not empty — quarantined artifacts are servable until the worker's next reload heals it. Repair or delete the key if this persists");
-                (HashSet::new(), None)
+                error!(error = %e, key = QUARANTINED_KEY, "advisory feed: the persisted quarantined set did not parse at startup; the quarantine set is UNKNOWN, not empty — quarantined artifacts are servable until the worker's next poll heals it. Repair or delete the key if this persists");
+                LoadedQuarantined::default()
             }
         },
         Err(e) => {
-            error!(error = %e, "advisory feed: reading the quarantined set at startup failed; the quarantine set is UNKNOWN, not empty — quarantined artifacts are servable until the worker's next reload heals it");
-            (HashSet::new(), None)
+            error!(error = %e, "advisory feed: reading the quarantined set at startup failed; the quarantine set is UNKNOWN, not empty — quarantined artifacts are servable until the worker's next poll heals it");
+            LoadedQuarantined::default()
         }
     }
+}
+
+/// The quarantined set as one node holds it: the names, the envelope epoch they
+/// came from, and the listing etag the poll compares against. All-default is
+/// "we hold nothing" — an empty set at epoch zero with no etag, which the next
+/// poll replaces with whatever storage has.
+#[derive(Default)]
+pub(crate) struct LoadedQuarantined {
+    pub set: HashSet<String>,
+    pub epoch: u64,
+    pub etag: Option<String>,
 }
 
 /// Load the persisted snapshot from storage, or `None` when the key is absent.
@@ -532,15 +568,18 @@ async fn load_from_storage(storage: &dyn Storage) -> Result<Option<AdvisoryState
     };
     let zip = Arc::new(storage.get_bytes(FEED_KEY).await?);
     let (db, sha) = parse_off_thread(zip.clone()).await?;
-    let (quarantined, quarantined_etag) = load_quarantined_at_startup(storage).await;
+    let loaded = load_quarantined_at_startup(storage).await;
     Ok(Some(AdvisoryState {
         db: Some(Arc::new(db)),
         zip_sha256: Some(sha),
         zip: Some(zip),
         storage_etag: Some(etag),
         overlay: Arc::default(),
-        quarantined,
-        quarantined_etag,
+        quarantined: loaded.set,
+        quarantined_etag: loaded.etag,
+        quarantined_epoch: loaded.epoch,
+        // Read from storage, so the set and the epoch name the same body.
+        quarantined_unpublished: false,
         loaded_unix: unix_now_secs(),
     }))
 }
@@ -600,15 +639,18 @@ async fn obtain_from_source(storage: &dyn Storage, feed: &str) -> Option<Advisor
     {
         warn!(error = %e, "advisory feed: persisting snapshot failed; loading in-memory");
     }
-    let (quarantined, quarantined_etag) = load_quarantined_at_startup(storage).await;
+    let loaded = load_quarantined_at_startup(storage).await;
     Some(AdvisoryState {
         db: Some(Arc::new(db)),
         zip_sha256: Some(sha),
         zip: Some(zip),
         storage_etag: feed_storage_etag(storage).await.unwrap_or(None),
         overlay: Arc::default(),
-        quarantined,
-        quarantined_etag,
+        quarantined: loaded.set,
+        quarantined_etag: loaded.etag,
+        quarantined_epoch: loaded.epoch,
+        // Read from storage, so the set and the epoch name the same body.
+        quarantined_unpublished: false,
         loaded_unix: unix_now_secs(),
     })
 }
@@ -747,13 +789,13 @@ pub async fn refresh(
         Err(e) => debug!(error = %e, "advisory feed: storage reload failed; serving last snapshot"),
     }
 
-    // Every-node quarantined-set reload, on the same tick as the zip. The leader
-    // derives and publishes it from its audit sweep; every node (leader included)
-    // adopts it here when the key's etag moves. Independent of the feed snapshot's
-    // staleness gauge — the quarantined set has its own storage object.
-    if let Err(e) = reload_quarantined(&ctx).await {
-        debug!(error = %e, "advisory feed: quarantined reload failed; serving last set");
-    }
+    // A quarantined-set poll on the same tick as the zip. This is a backstop, not
+    // the propagation path: every node polls the set on its own short cadence
+    // (`--quarantine-poll-secs`) precisely so a freeze never waits on this
+    // tick, which runs on `reconcile_interval` (a day, by default) and serializes
+    // behind the OSV refetch. Independent of the feed snapshot's staleness gauge —
+    // the quarantined set has its own storage object.
+    poll_quarantined(ctx.storage, ctx.slot).await;
 
     // Everything below is about the OSV snapshot: with the feature off there is
     // no staleness to gauge and nothing is "armed but unfed".
@@ -850,14 +892,72 @@ async fn reseed_if_absent(ctx: &RefreshCtx<'_>) -> Result<()> {
     if let Some(zip) = snap.zip.clone() {
         reseed_key_if_absent(ctx, FEED_KEY, &zip, Some("application/zip")).await?;
     }
-    // Only reseed the quarantined set when this node actually holds a published
-    // one (a real etag): an unloaded/absent set has nothing authoritative to seed,
-    // and seeding `[]` would be indistinguishable from a real empty publish.
-    if snap.quarantined_etag.is_some() {
-        let bytes = serialize_quarantined_names(snap.quarantined.iter())?;
-        reseed_key_if_absent(ctx, QUARANTINED_KEY, &bytes, Some("application/json")).await?;
+    // The quarantined set heals on EPOCH, not presence: a bucket can hold a real
+    // but stale copy (a write-through that failed, a bucket added mid-life), and a
+    // node booting onto it would come up under-blocked. Only a node that actually
+    // holds a published set (epoch > 0) seeds — at epoch zero there is nothing
+    // authoritative to write, and an empty set would be indistinguishable from a
+    // real empty publish.
+    // A set carrying an unpublished local arm is NOT ours to write: the epoch in
+    // memory names the last published body, and some other writer may already
+    // have spent that epoch on different bytes. Writing anyway is how two buckets
+    // end up holding different bodies at one epoch, which no reader can order.
+    // The arm's own publish (or the next poll, or the audit sweep) clears the
+    // flag, and the next tick re-seeds from a pair that belongs together.
+    if snap.quarantined_epoch > 0 && !snap.quarantined_unpublished {
+        let bytes = encode_quarantined(snap.quarantined.iter(), snap.quarantined_epoch)?;
+        reseed_quarantined_if_older(ctx, snap.quarantined_epoch, &bytes).await?;
     }
     Ok(())
+}
+
+/// Heal the quarantined set onto the selected bucket and every peer whose copy is
+/// absent, unreadable, or at a lower epoch than `epoch`. Each write is
+/// conditional, so a bucket that moved between the read and the write keeps its
+/// newer copy. The selected-bucket error propagates (the caller logs at debug and
+/// retries next tick); peers are best-effort so one unreachable peer never blocks
+/// healing the others.
+async fn reseed_quarantined_if_older(ctx: &RefreshCtx<'_>, epoch: u64, bytes: &[u8]) -> Result<()> {
+    if seed_quarantined_onto(ctx.storage, epoch, bytes)
+        .await
+        .context("re-seeding the quarantined set onto the selected bucket")?
+    {
+        info!(key = QUARANTINED_KEY, epoch, "quarantine: re-seeded the shared set onto the selected bucket, which held an older copy or none");
+    }
+    for replica in ctx.replicas {
+        match seed_quarantined_onto(replica.storage, epoch, bytes).await {
+            Ok(true) => {
+                info!(bucket = %replica.name, epoch, "quarantine: re-seeded the shared set onto a peer bucket holding an older copy or none")
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(bucket = %replica.name, error = ?error, "quarantine: re-seeding the shared set onto a peer failed; will retry")
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write `bytes` onto one bucket when its copy is absent, unreadable, or older
+/// than `epoch`; returns whether it wrote. An unreadable body heals like an
+/// absent one — nothing can be read out of it, so nothing is lost by replacing it.
+async fn seed_quarantined_onto(storage: &dyn Storage, epoch: u64, bytes: &[u8]) -> Result<bool> {
+    let wrote = match storage.get_with_etag(QUARANTINED_KEY).await? {
+        Some((body, etag)) => {
+            if parse_quarantined(&body).is_ok_and(|stored| stored.epoch >= epoch) {
+                return Ok(false);
+            }
+            storage
+                .put_if_match(QUARANTINED_KEY, &etag, bytes.to_vec())
+                .await?
+        }
+        None => {
+            storage
+                .put_if_none_match(QUARANTINED_KEY, bytes.to_vec())
+                .await?
+        }
+    };
+    Ok(wrote.is_some())
 }
 
 /// Reseed one control singleton onto the selected bucket and every eligible peer
@@ -937,110 +1037,394 @@ async fn quarantined_storage_etag(storage: &dyn Storage) -> Result<Option<String
     key_storage_etag(storage, QUARANTINED_KEY).await
 }
 
-/// Parse the persisted quarantined-set JSON (a sorted string array) into a set.
-fn parse_quarantined(bytes: &[u8]) -> Result<HashSet<String>> {
-    let names: Vec<String> = serde_json::from_slice(bytes).context("parsing quarantined set")?;
-    Ok(names.into_iter().collect())
+/// The stored quarantined-set envelope. Follows [`crate::status`]'s stored-doc
+/// pattern: the payload at the top level, pypiron's clock-free merge token in a
+/// namespaced field. The epoch is REQUIRED, so the pre-envelope shape (a bare
+/// name array) and an epoch-less object both fail to parse — which is the loud
+/// "unreadable, so we do not know" path, never a silent empty set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct StoredQuarantined {
+    /// Sorted and deduped, so an unchanged set serializes byte-identically
+    /// regardless of the iteration order of the in-memory `HashSet` and never
+    /// rewrites the key to stampede followers into a reload.
+    quarantined: Vec<String>,
+    #[serde(rename = "pypiron-epoch")]
+    epoch: u64,
 }
 
-/// Serialize a quarantined-set to the persisted JSON shape (a sorted string
-/// array), so an unchanged set serializes byte-identically regardless of the
-/// iteration order of its in-memory `HashSet`. Shared by the leader publish and
-/// the reseed backstop.
-fn serialize_quarantined_names<'a>(names: impl Iterator<Item = &'a String>) -> Result<Vec<u8>> {
-    let mut sorted: Vec<&String> = names.collect();
+/// Parse the persisted quarantined-set envelope.
+fn parse_quarantined(bytes: &[u8]) -> Result<StoredQuarantined> {
+    serde_json::from_slice(bytes).context("parsing quarantined set")
+}
+
+/// Serialize a quarantined set at `epoch` into the persisted envelope. Shared by
+/// the publish path and the reseed backstop so both write the same bytes.
+fn encode_quarantined<'a>(names: impl Iterator<Item = &'a String>, epoch: u64) -> Result<Vec<u8>> {
+    let mut sorted: Vec<String> = names.cloned().collect();
     sorted.sort();
-    serde_json::to_vec(&sorted).context("serializing quarantined set")
+    sorted.dedup();
+    serde_json::to_vec(&StoredQuarantined {
+        quarantined: sorted,
+        epoch,
+    })
+    .context("serializing quarantined set")
 }
 
-/// Every-node half for the quarantined set: reload it when `QUARANTINED_KEY`'s
-/// storage etag moves, exactly like the zip. A dequarantine is a real publish of
-/// `[]` (the leader writes it, never deletes), so followers see the etag move and
-/// adopt the empty set. But an *absent* key — a failover to a bucket that was
-/// never seeded, or one that lost the singleton — is NOT a dequarantine: retain
-/// the previously loaded set (fail-closed) and warn, exactly as the corrupt-body
-/// branch already does. A reseed heals the missing key; until then the byte gate
-/// keeps refusing quarantined bytes instead of clearing on failover. The db is
-/// carried forward under the lock (see [`reload`]).
-async fn reload_quarantined(ctx: &RefreshCtx<'_>) -> Result<()> {
-    let etag = quarantined_storage_etag(ctx.storage).await?;
-    let loaded_etag = AdvisoryState::read(ctx.slot).quarantined_etag.clone();
-    if etag == loaded_etag {
+/// Bounded CAS attempts for one quarantined-set publish, mirroring
+/// `status::STATUS_CAS_ATTEMPTS`: enough to ride out contention, few enough that
+/// a wedged key errors instead of spinning forever.
+const QUARANTINED_CAS_ATTEMPTS: usize = 8;
+
+/// Every-node poll: adopt a quarantined set another node published, when
+/// `QUARANTINED_KEY`'s listing etag has moved. A dequarantine is a real publish
+/// of a smaller set (never a delete), so it propagates the same way a freeze
+/// does. Three things are NOT a dequarantine and never clear the live set:
+///
+/// * an *absent* key — a failover to a bucket that was never seeded, or one that
+///   lost the singleton (the reseed heals it);
+/// * an unreadable body — including the pre-envelope bare array, which now fails
+///   to parse on purpose;
+/// * a body at a *lower* epoch than the one in memory — an older copy on a bucket
+///   the last publish never reached.
+///
+/// The db and feed identity are carried forward under the lock (see [`reload`]).
+async fn reload_quarantined(
+    storage: &dyn Storage,
+    slot: &RwLock<Arc<AdvisoryState>>,
+) -> Result<()> {
+    let etag = quarantined_storage_etag(storage).await?;
+    let loaded = AdvisoryState::read(slot);
+    if etag == loaded.quarantined_etag {
         return Ok(()); // unchanged (same etag, or still-absent None == None)
     }
     let Some(_) = &etag else {
-        // The key vanished on the selected bucket. Distinguish this from a
-        // present-but-empty publish (which carries an etag): retain the set we
-        // last loaded rather than swap in an empty one that would un-block
-        // quarantined downloads on failover.
-        if loaded_etag.is_some() {
-            warn!("advisory feed: quarantined set absent on the selected bucket; retaining the previously loaded set (reseed will heal)");
+        // Distinguish an absent key from a present-but-empty publish (which
+        // carries an etag): retain the set we last loaded rather than swap in an
+        // empty one that would un-block quarantined downloads on failover.
+        if loaded.quarantined_etag.is_some() {
+            warn!("quarantine: the shared set is absent on the selected bucket; retaining the previously loaded set (reseed will heal)");
         }
         return Ok(());
     };
-    let quarantined = match parse_quarantined(&ctx.storage.get_bytes(QUARANTINED_KEY).await?) {
-        Ok(set) => set,
+    let stored = match parse_quarantined(&storage.get_bytes(QUARANTINED_KEY).await?) {
+        Ok(stored) => stored,
         Err(e) => {
-            warn!(error = %e, "advisory feed: quarantined set did not parse; keeping previous");
+            warn!(error = %e, key = QUARANTINED_KEY, "quarantine: the shared set did not parse; keeping the previous one");
             return Ok(());
         }
     };
-    swap_quarantined(ctx.slot, quarantined, etag);
+    if stored.epoch < loaded.quarantined_epoch {
+        // Keep the newer set — a quarantine must never un-block by moving
+        // backwards — but adopt the etag so this poll stops re-reading the same
+        // stale body every interval. The leader's reseed writes ours back over it.
+        warn!(
+            stored = stored.epoch,
+            loaded = loaded.quarantined_epoch,
+            "quarantine: the stored set is older than the one in memory; keeping the newer one (reseed will heal the bucket)"
+        );
+        swap_quarantined(
+            slot,
+            loaded.quarantined.clone(),
+            loaded.quarantined_epoch,
+            etag,
+        );
+        return Ok(());
+    }
+    swap_quarantined(
+        slot,
+        stored.quarantined.into_iter().collect(),
+        stored.epoch,
+        etag,
+    );
     Ok(())
 }
 
-/// Swap the quarantined set and its etag into the live snapshot, carrying the db
-/// and feed identity forward under the write lock (a refcount bump each, no deep
-/// clone, no await). Shared by the leader's immediate swap and the every-node
-/// reload.
+/// Every-node quarantine poll, on its own short cadence
+/// (`--quarantine-poll-secs`) rather than the advisory tick's. Steady state
+/// is one 1-key LIST; the body is fetched only when the key actually moved, and
+/// a failure keeps serving the last set.
+pub async fn poll_quarantined(storage: &dyn Storage, slot: &RwLock<Arc<AdvisoryState>>) {
+    if let Err(e) = reload_quarantined(storage, slot).await {
+        debug!(error = %e, "quarantine: poll failed; serving the last set");
+    }
+}
+
+/// Swap the quarantined set, its epoch and its etag into the live snapshot,
+/// carrying the db and feed identity forward under the write lock (a refcount
+/// bump each, no deep clone, no await). Callers own the monotonicity check.
 fn swap_quarantined(
     slot: &RwLock<Arc<AdvisoryState>>,
     quarantined: HashSet<String>,
+    quarantined_epoch: u64,
     quarantined_etag: Option<String>,
 ) {
     let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
     *guard = Arc::new(AdvisoryState {
         quarantined,
+        quarantined_epoch,
         quarantined_etag,
+        // This set and this epoch belong together — either we just wrote them or
+        // we just read them — so the re-seed may publish them again.
+        quarantined_unpublished: false,
         ..(**guard).clone()
     });
 }
 
-/// Leader: publish the worker-derived quarantined set. Writes `QUARANTINED_KEY`
-/// only when the set actually changed from what's loaded (including an empty
-/// array on a transition to empty, so a dequarantine propagates to followers),
-/// then swaps the leader's own in-memory set immediately so its byte gate reflects
-/// the change without waiting for the next etag poll. `set` must be the result of
-/// a *complete* sweep — a partial set would flap dequarantines.
+/// Add or drop one name in this node's live set without touching storage or the
+/// epoch. Arms (or disarms) the local byte gate the instant a status write lands,
+/// ahead of the durable publish; the epoch stays put because nothing was
+/// published yet, so the next poll of a genuinely newer set still wins.
+fn arm_local_quarantine(slot: &RwLock<Arc<AdvisoryState>>, pkg: &str, blocked: bool) {
+    let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
+    let mut quarantined = guard.quarantined.clone();
+    let changed = if blocked {
+        quarantined.insert(pkg.to_string())
+    } else {
+        quarantined.remove(pkg)
+    };
+    if !changed {
+        return;
+    }
+    *guard = Arc::new(AdvisoryState {
+        quarantined,
+        // The epoch still names the last *published* body, which this set no
+        // longer matches. Flag it so the re-seed does not hand these bytes to a
+        // peer under that epoch; the publish below (or the next poll) clears it.
+        quarantined_unpublished: true,
+        ..(**guard).clone()
+    });
+}
+
+/// Adopt a set a publish found already stored, without moving this node
+/// backwards: a confirmation is not a reason to drop a newer set.
+fn adopt_quarantined_if_newer(
+    slot: &RwLock<Arc<AdvisoryState>>,
+    set: &std::collections::BTreeSet<String>,
+    epoch: u64,
+) {
+    let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
+    if epoch < guard.quarantined_epoch {
+        return;
+    }
+    *guard = Arc::new(AdvisoryState {
+        quarantined: set.iter().cloned().collect(),
+        quarantined_epoch: epoch,
+        // Adopted from the stored body at its own epoch, so the pair is again
+        // one the re-seed may republish.
+        quarantined_unpublished: false,
+        ..(**guard).clone()
+    });
+}
+
+/// What a publish is trying to change about the shared quarantined set.
+pub enum QuarantinedEdit {
+    /// One project a status write just flipped on this node, merged into whatever
+    /// set is stored. It never touches another name, so two nodes freezing two
+    /// different projects at the same moment both land.
+    One { name: String, blocked: bool },
+    /// A complete audit sweep's set, republished as repair. `base_set`/`base_epoch`
+    /// are the stored body as the walk BEGAN. When the epoch has not moved the
+    /// sweep's set is written as-is. When it has — one status write anywhere in
+    /// the fleet is enough, and the walk takes as long as a whole-corpus listing —
+    /// the publish is a three-way merge rather than a skip: whatever the other
+    /// writer added since the base is unioned in, whatever it removed is taken
+    /// back out, and the rest of the sweep's repair still lands. Skipping instead
+    /// is how a fleet with ordinary status churn never repairs at all.
+    ///
+    /// The merge is also what keeps an expired leader harmless. Its blind
+    /// full-set write can no longer clobber its successor's edits, because every
+    /// edit made since its own base survives the merge (the lease itself has no
+    /// fencing token — see [`crate::lease`]).
+    Sweep {
+        set: std::collections::BTreeSet<String>,
+        base_set: std::collections::BTreeSet<String>,
+        base_epoch: u64,
+    },
+}
+
+/// The stored quarantined set and its epoch as a sweep begins (empty at epoch 0
+/// when it was never published), for the sweep to merge its repair against.
+/// `Err` on a storage failure — a sweep that cannot see the current set must not
+/// publish over it. An unreadable body reads as empty at epoch 0, which is what
+/// lets the sweep replace it.
+pub async fn stored_quarantined(
+    storage: &dyn Storage,
+) -> Result<(std::collections::BTreeSet<String>, u64)> {
+    match storage.get_with_etag(QUARANTINED_KEY).await? {
+        Some((bytes, _)) => Ok(parse_quarantined(&bytes)
+            .map(|stored| (stored.quarantined.into_iter().collect(), stored.epoch))
+            .unwrap_or_default()),
+        None => Ok(Default::default()),
+    }
+}
+
+/// Publish an edit to the shared quarantined set — the one write path. Reads the
+/// current envelope, applies `edit`, bumps the epoch and conditionally writes it
+/// (`put_if_none_match` when absent, `put_if_match` otherwise), retrying a
+/// bounded number of times against a concurrent writer and erroring when they run
+/// out. Then a best-effort epoch-conditional write to every peer bucket, so a
+/// peer that a slower publisher reaches last keeps the newer epoch. On success
+/// this node adopts the set it just wrote — but not an etag it did not read, so
+/// its next poll re-reads and can still see a peer's newer publish.
 pub async fn publish_quarantined(
     storage: &dyn Storage,
     replicas: &[crate::layout::ReplicaTarget<'_>],
     slot: &RwLock<Arc<AdvisoryState>>,
-    set: std::collections::BTreeSet<String>,
+    edit: &QuarantinedEdit,
 ) -> Result<()> {
-    let current = AdvisoryState::read(slot);
-    let unchanged = current.quarantined.len() == set.len()
-        && set.iter().all(|name| current.quarantined.contains(name));
-    if unchanged {
+    for _ in 0..QUARANTINED_CAS_ATTEMPTS {
+        let current = storage.get_with_etag(QUARANTINED_KEY).await?;
+        // Whether `stored` is a body we actually read, as opposed to the empty
+        // stand-in for an absent or unreadable key. A sweep merges against the
+        // former and replaces the latter outright.
+        let mut stored_is_real = true;
+        let (stored, etag) = match &current {
+            Some((bytes, etag)) => match parse_quarantined(bytes) {
+                Ok(stored) => (stored, Some(etag.as_str())),
+                // A sweep holds the whole truth, so it may replace an unreadable
+                // body outright — still under `If-Match`, so a concurrent writer
+                // is not clobbered. An increment cannot merge into a body it
+                // cannot read, so it fails loudly and leaves the repair to the
+                // sweep.
+                Err(e) => match edit {
+                    QuarantinedEdit::Sweep { .. } => {
+                        error!(error = %e, key = QUARANTINED_KEY, "quarantine: the stored set is unreadable; this sweep replaces it");
+                        stored_is_real = false;
+                        (StoredQuarantined::default(), Some(etag.as_str()))
+                    }
+                    QuarantinedEdit::One { .. } => return Err(e),
+                },
+            },
+            None => {
+                stored_is_real = false;
+                (StoredQuarantined::default(), None)
+            }
+        };
+        let have: std::collections::BTreeSet<String> = stored.quarantined.iter().cloned().collect();
+        let next = match edit {
+            QuarantinedEdit::One { name, blocked } => {
+                let mut next = have.clone();
+                if *blocked {
+                    next.insert(name.clone());
+                } else {
+                    next.remove(name);
+                }
+                next
+            }
+            QuarantinedEdit::Sweep {
+                set,
+                base_set,
+                base_epoch,
+            } => {
+                if !stored_is_real || stored.epoch == *base_epoch {
+                    set.clone()
+                } else {
+                    // Somebody published between the walk's first listing and
+                    // now. Replay their edit on top of the repair instead of
+                    // dropping the whole pass: added_since is fail-closed (a
+                    // freeze we must not undo) and removed_since is their
+                    // dequarantine, which is newer information than the sidecar
+                    // the walk read. Everything else the sweep derived stands.
+                    let added_since: Vec<&String> = have.difference(base_set).collect();
+                    let removed_since: Vec<&String> = base_set.difference(&have).collect();
+                    debug!(
+                        stored = stored.epoch,
+                        base = base_epoch,
+                        added = added_since.len(),
+                        removed = removed_since.len(),
+                        "quarantine: a newer set landed during the sweep; merging the repair onto it"
+                    );
+                    let mut merged = set.clone();
+                    merged.extend(added_since.into_iter().cloned());
+                    for name in removed_since {
+                        merged.remove(name);
+                    }
+                    merged
+                }
+            }
+        };
+        if next == have {
+            adopt_quarantined_if_newer(slot, &next, stored.epoch);
+            return Ok(());
+        }
+        // Above the stored epoch AND above anything this node has ever seen, so a
+        // publish onto a bucket that lost ground (or onto an unreadable body) is
+        // still monotone from every reader's point of view.
+        let epoch = stored
+            .epoch
+            .max(AdvisoryState::read(slot).quarantined_epoch)
+            .saturating_add(1);
+        let bytes = encode_quarantined(next.iter(), epoch)?;
+        // The trait's conditional writes carry no content type; this key is
+        // internal control state that is never served, so the label is cosmetic.
+        let wrote = match etag {
+            Some(etag) => {
+                storage
+                    .put_if_match(QUARANTINED_KEY, etag, bytes.clone())
+                    .await?
+            }
+            None => {
+                storage
+                    .put_if_none_match(QUARANTINED_KEY, bytes.clone())
+                    .await?
+            }
+        };
+        if wrote.is_none() {
+            continue; // another writer moved it; re-read and re-derive
+        }
+        // Peers get the same epoch-conditional write the reseed uses, never an
+        // unconditional put: two nodes publishing back to back on the selected
+        // bucket can reach a peer in the opposite order, and a plain put would
+        // let the older epoch land last and un-block a name the newer one froze.
+        // Best-effort — one unreachable peer never fails a publish that is
+        // already durable on the selected bucket; the reseed heals it.
+        for replica in replicas {
+            match seed_quarantined_onto(replica.storage, epoch, &bytes).await {
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(bucket = %replica.name, epoch, error = ?error, "quarantine: writing the shared set through to a peer failed; the re-seed will heal it")
+                }
+            }
+        }
+        // Deliberately no etag here: the listing etag this node could read back
+        // is whatever is stored *now*, which a peer's publish may already have
+        // moved. Adopting it would pin this node's poll to a body it never read
+        // — `reload_quarantined` early-returns on an unchanged etag, so it would
+        // never learn about the newer set. `None` costs one GET on the next poll
+        // and can never hide a freeze.
+        swap_quarantined(slot, next.into_iter().collect(), epoch, None);
         return Ok(());
     }
-    // A sorted array — an unchanged set serializes byte-identically and never
-    // rewrites the key to stampede followers into a reload. Written write-through
-    // to every healthy bucket so the byte gate stays armed after a failover.
-    let bytes = serialize_quarantined_names(set.iter())?;
-    crate::layout::write_singleton(
-        storage,
-        replicas,
-        QUARANTINED_KEY,
-        bytes,
-        Some("application/json"),
-    )
-    .await
-    .context("persisting quarantined set")?;
-    // Adopt the just-written etag so this node's own reload poll no-ops.
-    let etag = quarantined_storage_etag(storage).await.unwrap_or(None);
-    swap_quarantined(slot, set.into_iter().collect(), etag);
-    Ok(())
+    bail!("could not publish the quarantined set after {QUARANTINED_CAS_ATTEMPTS} attempts")
+}
+
+/// Fold one project's just-written status into the quarantined set: arm this
+/// node's own byte gate immediately, then publish the one-name increment so every
+/// other node picks it up on its next `--quarantine-poll-secs` tick. Both
+/// directions go through here — a dequarantine must not wait for a sweep either.
+///
+/// Idempotent: a name already in (or already out of) both sets makes this a local
+/// no-op plus one small GET, so callers may call it after every status write
+/// rather than tracking membership themselves.
+///
+/// Best-effort by design. If the shared publish fails, this node stays armed (the
+/// local edit is never rolled back) and the audit sweep repairs the fleet — which
+/// is why the local arm happens first.
+pub async fn arm_quarantine(
+    storage: &dyn Storage,
+    replicas: &[crate::layout::ReplicaTarget<'_>],
+    slot: &RwLock<Arc<AdvisoryState>>,
+    pkg: &str,
+    blocked: bool,
+) {
+    arm_local_quarantine(slot, pkg, blocked);
+    let edit = QuarantinedEdit::One {
+        name: pkg.to_string(),
+        blocked,
+    };
+    if let Err(error) = publish_quarantined(storage, replicas, slot, &edit).await {
+        error!(package = %pkg, blocked, error = ?error, "quarantine: could not publish the change to the shared set; this node is armed, other nodes stay stale until the audit sweep repairs it");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1796,5 +2180,379 @@ mod tests {
         );
         assert_eq!(probe_base("/local/path/all.zip"), None);
         assert_eq!(probe_base("https://osv.example/PyPI/other.zip"), None);
+    }
+
+    // ------------------------- quarantined set (rung 5) ----------------------
+    // The propagation contract: increments merge, the sweep repairs without
+    // undoing them, and nothing ever moves the live set backwards.
+
+    use crate::storage::test_support::InMemStorage;
+    use std::collections::BTreeSet;
+
+    fn slot_with(set: &[&str], epoch: u64) -> RwLock<Arc<AdvisoryState>> {
+        RwLock::new(Arc::new(AdvisoryState {
+            quarantined: set.iter().map(|name| name.to_string()).collect(),
+            quarantined_epoch: epoch,
+            ..AdvisoryState::default()
+        }))
+    }
+
+    fn live_names(slot: &RwLock<Arc<AdvisoryState>>) -> Vec<String> {
+        let mut names: Vec<String> = AdvisoryState::read(slot)
+            .quarantined
+            .iter()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn one(name: &str, blocked: bool) -> QuarantinedEdit {
+        QuarantinedEdit::One {
+            name: name.to_string(),
+            blocked,
+        }
+    }
+
+    fn sweep(names: &[&str], base: (BTreeSet<String>, u64)) -> QuarantinedEdit {
+        QuarantinedEdit::Sweep {
+            set: names.iter().map(|name| name.to_string()).collect(),
+            base_set: base.0,
+            base_epoch: base.1,
+        }
+    }
+
+    async fn stored_names(storage: &dyn Storage) -> Vec<String> {
+        let (bytes, _) = storage
+            .get_with_etag(QUARANTINED_KEY)
+            .await
+            .unwrap()
+            .expect("the set was published");
+        parse_quarantined(&bytes).unwrap().quarantined
+    }
+
+    async fn put_raw(storage: &dyn Storage, body: Vec<u8>) {
+        storage
+            .put_bytes(QUARANTINED_KEY, body, None)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn the_quarantined_envelope_carries_an_epoch_and_rejects_the_bare_array() {
+        let names = ["zeta".to_string(), "alpha".to_string(), "alpha".to_string()];
+        let bytes = encode_quarantined(names.iter(), 4).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            r#"{"quarantined":["alpha","zeta"],"pypiron-epoch":4}"#,
+            "sorted and deduped, so an unchanged set is byte-identical"
+        );
+        let stored = parse_quarantined(&bytes).unwrap();
+        assert_eq!(stored.epoch, 4);
+        assert_eq!(stored.quarantined, ["alpha", "zeta"]);
+        // The pre-envelope shape and an epoch-less object are unreadable on
+        // purpose: the loud "we do not know" path, never a silent empty set.
+        assert!(parse_quarantined(br#"["alpha"]"#).is_err());
+        assert!(parse_quarantined(br#"{"quarantined":["alpha"]}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn increments_merge_into_the_stored_set_and_bump_the_epoch() {
+        let storage = InMemStorage::default();
+        let node_a = slot_with(&[], 0);
+        publish_quarantined(&storage, &[], &node_a, &one("alpha", true))
+            .await
+            .unwrap();
+        assert_eq!(live_names(&node_a), ["alpha"]);
+        assert_eq!(AdvisoryState::read(&node_a).quarantined_epoch, 1);
+
+        // A second node's increment merges rather than replacing: two nodes
+        // freezing two projects at once must both land.
+        let node_b = slot_with(&[], 0);
+        publish_quarantined(&storage, &[], &node_b, &one("beta", true))
+            .await
+            .unwrap();
+        assert_eq!(live_names(&node_b), ["alpha", "beta"]);
+        assert_eq!(AdvisoryState::read(&node_b).quarantined_epoch, 2);
+
+        // A dequarantine removes exactly one name, down the same path.
+        publish_quarantined(&storage, &[], &node_b, &one("alpha", false))
+            .await
+            .unwrap();
+        assert_eq!(stored_names(&storage).await, ["beta"]);
+        assert_eq!(AdvisoryState::read(&node_b).quarantined_epoch, 3);
+
+        // Re-applying an edit storage already reflects writes nothing.
+        publish_quarantined(&storage, &[], &node_b, &one("beta", true))
+            .await
+            .unwrap();
+        assert_eq!(AdvisoryState::read(&node_b).quarantined_epoch, 3);
+    }
+
+    #[tokio::test]
+    async fn a_sweep_repairs_drift_but_never_undoes_a_newer_increment() {
+        let storage = InMemStorage::default();
+        let node = slot_with(&[], 0);
+        // The set + epoch the walk pinned itself to before it started listing.
+        let base = stored_quarantined(&storage).await.unwrap();
+        assert_eq!(base.1, 0);
+
+        // An admin freeze lands while the walk is still running.
+        publish_quarantined(&storage, &[], &node, &one("frozen", true))
+            .await
+            .unwrap();
+
+        // The sweep's set was derived before that freeze existed. Merged onto the
+        // moved epoch, it must not un-quarantine the project.
+        let sweeper = slot_with(&[], 0);
+        publish_quarantined(&storage, &[], &sweeper, &sweep(&[], base))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_names(&storage).await,
+            ["frozen"],
+            "a sweep from a stale base must not undo an increment"
+        );
+
+        // The next sweep reads the current epoch and repairs real drift — here a
+        // name whose sidecar says quarantined but which the set never got.
+        let base = stored_quarantined(&storage).await.unwrap();
+        publish_quarantined(
+            &storage,
+            &[],
+            &sweeper,
+            &sweep(&["frozen", "drifted"], base),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored_names(&storage).await, ["drifted", "frozen"]);
+        assert_eq!(live_names(&sweeper), ["drifted", "frozen"]);
+    }
+
+    #[tokio::test]
+    async fn a_stale_sweep_merges_a_concurrent_add_and_remove_instead_of_skipping() {
+        // The walk is whole-corpus and any status write anywhere in the fleet
+        // moves the epoch, so "skip on drift" means a busy fleet never repairs.
+        let storage = InMemStorage::default();
+        let node = slot_with(&[], 0);
+        // Base: {keep, dropme} at some epoch, read as the walk begins.
+        publish_quarantined(&storage, &[], &node, &one("keep", true))
+            .await
+            .unwrap();
+        publish_quarantined(&storage, &[], &node, &one("dropme", true))
+            .await
+            .unwrap();
+        let base = stored_quarantined(&storage).await.unwrap();
+        assert_eq!(
+            base.0.iter().cloned().collect::<Vec<_>>(),
+            ["dropme", "keep"]
+        );
+
+        // While the walk runs: one freeze and one release land from elsewhere.
+        publish_quarantined(&storage, &[], &node, &one("added", true))
+            .await
+            .unwrap();
+        publish_quarantined(&storage, &[], &node, &one("dropme", false))
+            .await
+            .unwrap();
+
+        // The sweep's own repair: it found `drifted` quarantined on disk and
+        // still believes `dropme` is (its sidecar was read before the release).
+        let sweeper = slot_with(&[], 0);
+        publish_quarantined(
+            &storage,
+            &[],
+            &sweeper,
+            &sweep(&["keep", "dropme", "drifted"], base),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stored_names(&storage).await,
+            ["added", "drifted", "keep"],
+            "the repair lands, the concurrent freeze survives, the concurrent release is not undone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_write_through_never_regresses_to_an_older_epoch() {
+        // Two nodes publish back to back on the selected bucket; their peer
+        // writes can arrive in the opposite order. An unconditional put would
+        // let the older body land last and un-block a name the newer one froze.
+        let selected = InMemStorage::default();
+        let peer = InMemStorage::default();
+        let peers = [crate::layout::ReplicaTarget {
+            storage: &peer,
+            name: "peer",
+        }];
+
+        let node_a = slot_with(&[], 0);
+        publish_quarantined(&selected, &peers, &node_a, &one("alpha", true))
+            .await
+            .unwrap();
+        let node_b = slot_with(&[], 0);
+        publish_quarantined(&selected, &peers, &node_b, &one("beta", true))
+            .await
+            .unwrap();
+        assert_eq!(stored_names(&peer).await, ["alpha", "beta"]);
+
+        // Now A's slower write-through finally arrives, carrying the older epoch
+        // and the smaller set. The peer must keep what it has.
+        let older = encode_quarantined(["alpha".to_string()].iter(), 1).unwrap();
+        assert!(
+            !seed_quarantined_onto(&peer, 1, &older).await.unwrap(),
+            "a lower epoch must not be written over a higher one"
+        );
+        assert_eq!(stored_names(&peer).await, ["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn a_publish_adopts_no_etag_so_a_peers_newer_set_is_still_seen() {
+        // Adopting the listing etag after a publish is how a node pins itself to
+        // a body it never read: another node's publish can move the key between
+        // the write and the listing, and the poll then no-ops forever.
+        let storage = InMemStorage::default();
+        let slot = slot_with(&[], 0);
+        publish_quarantined(&storage, &[], &slot, &one("alpha", true))
+            .await
+            .unwrap();
+        assert!(AdvisoryState::read(&slot).quarantined_etag.is_none());
+
+        // A peer freezes another name; this node's next poll must see it.
+        put_raw(
+            &storage,
+            encode_quarantined(["alpha".to_string(), "beta".to_string()].iter(), 2).unwrap(),
+        )
+        .await;
+        reload_quarantined(&storage, &slot).await.unwrap();
+        assert_eq!(live_names(&slot), ["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn the_reseed_refuses_to_publish_a_set_holding_an_unpublished_local_arm() {
+        // `arm_local_quarantine` edits the live set without moving the epoch, so
+        // those bytes are not this node's to write under it — another writer may
+        // already have spent that epoch on a different body.
+        let storage = InMemStorage::default();
+        let slot = slot_with(&["published"], 4);
+        arm_local_quarantine(&slot, "local-only", true);
+        assert!(
+            AdvisoryState::read(&slot).quarantined_unpublished,
+            "reseed_if_absent's guard: the epoch is set but does not name these bytes"
+        );
+
+        // Publishing the arm makes the pair whole again, and the reseed may run.
+        publish_quarantined(&storage, &[], &slot, &one("local-only", true))
+            .await
+            .unwrap();
+        assert!(!AdvisoryState::read(&slot).quarantined_unpublished);
+    }
+
+    #[tokio::test]
+    async fn a_poll_refuses_a_stored_set_older_than_the_one_in_memory() {
+        let storage = InMemStorage::default();
+        let empty: Vec<String> = Vec::new();
+        // A bucket holding a real but stale copy: epoch 2, nothing quarantined.
+        put_raw(&storage, encode_quarantined(empty.iter(), 2).unwrap()).await;
+
+        let slot = slot_with(&["frozen"], 5);
+        reload_quarantined(&storage, &slot).await.unwrap();
+        assert_eq!(
+            live_names(&slot),
+            ["frozen"],
+            "an older epoch must never un-block a live quarantine"
+        );
+        assert_eq!(AdvisoryState::read(&slot).quarantined_epoch, 5);
+        assert!(
+            AdvisoryState::read(&slot).quarantined_etag.is_some(),
+            "the etag is adopted so the poll stops re-reading the same stale body"
+        );
+
+        // At or above the in-memory epoch it IS adopted — that is how a real
+        // dequarantine propagates.
+        put_raw(&storage, encode_quarantined(empty.iter(), 6).unwrap()).await;
+        reload_quarantined(&storage, &slot).await.unwrap();
+        assert!(live_names(&slot).is_empty());
+        assert_eq!(AdvisoryState::read(&slot).quarantined_epoch, 6);
+    }
+
+    #[tokio::test]
+    async fn a_poll_keeps_the_live_set_when_the_body_is_unreadable_or_gone() {
+        let storage = InMemStorage::default();
+        put_raw(&storage, br#"["legacy-bare-array"]"#.to_vec()).await;
+        let slot = slot_with(&["frozen"], 5);
+        reload_quarantined(&storage, &slot).await.unwrap();
+        assert_eq!(
+            live_names(&slot),
+            ["frozen"],
+            "an unreadable body is 'we do not know', not 'nothing is quarantined'"
+        );
+
+        // And an absent key is a failover to an unseeded bucket, not a clear.
+        let bare = InMemStorage::default();
+        reload_quarantined(&bare, &slot).await.unwrap();
+        assert_eq!(live_names(&slot), ["frozen"]);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_body_blocks_an_increment_and_is_replaced_by_the_sweep() {
+        let storage = InMemStorage::default();
+        put_raw(&storage, br#"["legacy-bare-array"]"#.to_vec()).await;
+        let slot = slot_with(&[], 0);
+
+        // An increment cannot merge into a body it cannot read: fail loudly.
+        assert!(
+            publish_quarantined(&storage, &[], &slot, &one("alpha", true))
+                .await
+                .is_err()
+        );
+
+        // The sweep holds the whole truth, so it replaces the garbage outright.
+        let base = stored_quarantined(&storage).await.unwrap();
+        publish_quarantined(&storage, &[], &slot, &sweep(&["alpha"], base))
+            .await
+            .unwrap();
+        assert_eq!(stored_names(&storage).await, ["alpha"]);
+    }
+
+    #[tokio::test]
+    async fn a_publish_onto_a_bucket_that_lost_ground_still_moves_forward() {
+        // Failover: this node holds epoch 7, the bucket it landed on holds 3. The
+        // new epoch has to clear BOTH, or every other node would refuse the write.
+        let storage = InMemStorage::default();
+        put_raw(
+            &storage,
+            encode_quarantined(["old".to_string()].iter(), 3).unwrap(),
+        )
+        .await;
+        let slot = slot_with(&["old"], 7);
+        publish_quarantined(&storage, &[], &slot, &one("fresh", true))
+            .await
+            .unwrap();
+        assert_eq!(AdvisoryState::read(&slot).quarantined_epoch, 8);
+        assert_eq!(stored_names(&storage).await, ["fresh", "old"]);
+    }
+
+    #[test]
+    fn a_local_arm_takes_effect_without_moving_the_epoch() {
+        let slot = slot_with(&[], 3);
+        arm_local_quarantine(&slot, "frozen", true);
+        assert_eq!(live_names(&slot), ["frozen"]);
+        assert_eq!(
+            AdvisoryState::read(&slot).quarantined_epoch,
+            3,
+            "nothing was published yet, so a genuinely newer poll still wins"
+        );
+        arm_local_quarantine(&slot, "frozen", false);
+        assert!(live_names(&slot).is_empty());
+    }
+
+    #[test]
+    fn adopting_a_confirmed_set_never_drags_the_live_set_backwards() {
+        let slot = slot_with(&["frozen"], 5);
+        adopt_quarantined_if_newer(&slot, &BTreeSet::new(), 4);
+        assert_eq!(live_names(&slot), ["frozen"]);
+        adopt_quarantined_if_newer(&slot, &BTreeSet::new(), 5);
+        assert!(live_names(&slot).is_empty());
     }
 }

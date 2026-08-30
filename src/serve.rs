@@ -148,6 +148,50 @@ async fn multi_bucket_file_visible(
     Ok(true)
 }
 
+/// The single-bucket half of the same fence, memoized per artifact key.
+///
+/// Multi-bucket pays two marker HEADs per download inside
+/// [`multi_bucket_file_visible`]; single-bucket used to skip them outright,
+/// because the direct artifact GET is the hottest route in the server. But a
+/// tombstone can outlive its body's removal — a delete that fails after writing
+/// it, and an upload that hits a fenced filename and deliberately leaves the
+/// body standing rather than free an immutable name on a guess (publish.rs).
+/// Both leave a private artifact suppressed from every index yet downloadable
+/// by direct URL until `tombstone::complete_interrupted_deletes` reaps it, up
+/// to a reconcile interval later — 24 hours by default.
+///
+/// So the markers are read, and the answer is remembered for
+/// [`cache::FENCE_CACHE_TTL`]: two HEADs per artifact per TTL instead of two
+/// per request, and a warm hit is one map lookup on the way through. A delete
+/// on this node drops the entry (publish.rs already invalidates this key's
+/// presigned URL, and that invalidation covers both), so it takes effect at
+/// once; other nodes converge within the TTL. Storage errors propagate — an
+/// unreadable marker is an outage, and 503 is the fail-closed answer, never a
+/// 404 that would read as "no such file".
+async fn single_bucket_file_visible(
+    state: &AppState,
+    pinned: &Pinned,
+    artifact_key: &str,
+) -> Result<bool> {
+    if let Some(visible) = state
+        .presign_cache
+        .fence_verdict(artifact_key, pinned.generation)
+    {
+        return Ok(visible);
+    }
+    let storage = pinned.storage.as_ref();
+    let (tombstoned, frozen) = futures::future::try_join(
+        storage.head_exists(&tombstone_key(artifact_key)),
+        storage.head_exists(&frozen_key(artifact_key)),
+    )
+    .await?;
+    let visible = !tombstoned && !frozen;
+    state
+        .presign_cache
+        .record_fence_verdict(artifact_key, visible, pinned.generation);
+    Ok(visible)
+}
+
 /// An unclaimed proxy companion may bypass local storage only when the package
 /// has no local body, companion, or permanent visibility fence. The exact
 /// claim recheck closes the LIST/HEAD window before the upstream fetch begins.
@@ -904,7 +948,16 @@ pub(crate) async fn files_get(
         }
         ProxyEnsure::Stream(fill) => Some(fill),
     };
-    match file_visible_read_through(&state, &pins, &pkg, &artifact_key).await {
+    // Both modes answer the same question — is this artifact fenced? —
+    // differently: multi-bucket re-reads the origin claim and every marker on
+    // each request, single-bucket reads the two markers once per artifact per
+    // TTL. The refusal is identical either way.
+    let visible = if state.buckets.is_multi() {
+        file_visible_read_through(&state, &pins, &pkg, &artifact_key).await
+    } else {
+        single_bucket_file_visible(&state, pins.read, &artifact_key).await
+    };
+    match visible {
         Ok(true) => {}
         Ok(false) => return not_found("artifact is fenced"),
         Err(error) => return read_error(error),
@@ -928,8 +981,10 @@ pub(crate) async fn files_get(
     };
     if redirect && !filename.ends_with(METADATA_SUFFIX) && !filename.ends_with(PROVENANCE_SUFFIX) {
         // No artifact-existence check: presigning itself is local HMAC math.
-        // Multi-bucket mode already paid its origin/marker visibility reads
-        // above; single-bucket mode still adds no storage round trip here. A
+        // Both modes have already paid for visibility above — multi-bucket on
+        // its origin/marker reads per request, single-bucket on the fence gate,
+        // which costs two HEADs per artifact key per FENCE_CACHE_TTL and nothing
+        // at all on a warm verdict. A
         // signed URL to a missing key gets S3's own 404 (the server's
         // credentials carry s3:ListBucket —
         // required for index rebuilds — which is what makes S3 say 404

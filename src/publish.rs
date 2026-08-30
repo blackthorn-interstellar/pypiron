@@ -31,6 +31,19 @@ use crate::{
     worker,
 };
 
+/// Concurrent wheel central-directory parses allowed process-wide.
+/// Lives here, not in `wheel.rs`: the parser stays a pure module the fuzz
+/// targets can `#[path]`-include without a tokio dependency.
+/// [`wheel::MAX_WHEEL_ENTRIES`] bounds what one parse can cost, but it can only reject
+/// *after* `ZipArchive::new` has already built the whole directory — so without
+/// a second bound, N concurrent uploads hold N of those peaks at once on the
+/// blocking pool. Four slots is invisible to real publishing: a real wheel's
+/// directory is a few thousand records and parses in milliseconds, so the
+/// permit is uncontended unless uploads overlap within that window, and every
+/// upload needs a credential to get here at all. A flood of hostile wheels
+/// queues instead of multiplying resident memory.
+static PARSE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 /// --- Upload endpoint ------------------------------------------------------
 /// Legacy PyPI upload endpoint compatible with uv/twine.
 /// Multipart form with metadata text fields (name, version, sha256_digest,
@@ -252,11 +265,11 @@ pub(crate) async fn legacy_upload(
     let wheel_metadata = if is_wheel {
         let path = spooled.path.path().to_path_buf();
         // Bound how many central directories are resident at once (see
-        // wheel::PARSE_SLOTS). Held across the parse, and taken here rather than
+        // PARSE_SLOTS). Held across the parse, and taken here rather than
         // inside the closure so waiting parks the task instead of a blocking
         // thread. A closed semaphore is no reason to refuse a publish: degrade
         // to the old unbounded behaviour rather than fail the upload.
-        let _permit = wheel::PARSE_SLOTS.acquire().await.ok();
+        let _permit = PARSE_SLOTS.acquire().await.ok();
         tokio::task::spawn_blocking(move || wheel::extract_metadata_from_file(&path))
             .await
             .map_err(|_| {

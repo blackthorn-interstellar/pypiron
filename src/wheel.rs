@@ -21,17 +21,6 @@ pub(crate) const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 /// headroom and no honest publisher can reach it.
 pub(crate) const MAX_WHEEL_ENTRIES: usize = 262_144;
 
-/// Concurrent central-directory parses allowed process-wide.
-/// [`MAX_WHEEL_ENTRIES`] bounds what one parse can cost, but it can only reject
-/// *after* `ZipArchive::new` has already built the whole directory — so without
-/// a second bound, N concurrent uploads hold N of those peaks at once on the
-/// blocking pool. Four slots is invisible to real publishing: a real wheel's
-/// directory is a few thousand records and parses in milliseconds, so the
-/// permit is uncontended unless uploads overlap within that window, and every
-/// upload needs a credential to get here at all. A flood of hostile wheels
-/// queues instead of multiplying resident memory.
-pub(crate) static PARSE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
-
 /// Extract `METADATA` from a wheel on disk without loading the wheel into
 /// memory — zip needs only the central directory plus the one entry.
 pub fn extract_metadata_from_file(path: &Path) -> Option<Vec<u8>> {

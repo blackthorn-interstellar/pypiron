@@ -1,0 +1,18 @@
+# Snyk policy file — see https://docs.snyk.io/manage-risk/policies
+#
+# `dev/` is contributor-facing tooling: benchmarks, ops scripts, and simulation
+# harnesses that an operator runs by hand. None of it ships in the pypiron
+# binary or executes on a server (AGENTS.md draws the same line). Every finding
+# Snyk Code raises there traces untrusted input to the operator's own command
+# line — the target URL, binary path, or output path they typed to start a
+# benchmark — so the "attacker" is the person at the keyboard. Fixing them means
+# constraining the arguments these scripts exist to accept.
+#
+# `.claude/` is untracked local agent worktrees, not project source.
+#
+# This exclusion does NOT cover `src/` or `tests/`, which are still scanned.
+version: v1.25.0
+exclude:
+  global:
+    - dev/**
+    - .claude/**

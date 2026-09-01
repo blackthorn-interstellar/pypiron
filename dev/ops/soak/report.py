@@ -168,7 +168,7 @@ def sighash(sig: str) -> str:
     # fleet already writes its findings under, so changing the algorithm would
     # orphan every stored finding. Fixed by that, not by preference.
     # nosemgrep: python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
-    return hashlib.sha1(sig.encode("utf-8")).hexdigest()
+    return hashlib.sha1(sig.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 def title_for(sig: str) -> str:

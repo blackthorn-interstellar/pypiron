@@ -108,6 +108,7 @@ def run_checked(
             text=text,
             timeout=timeout,
             check=True,
+            shell=False,
         )
         return cp
     except subprocess.CalledProcessError as e:
@@ -136,6 +137,7 @@ def run_returncode(
         capture_output=True,
         text=True,
         timeout=timeout,
+        shell=False,
     )
     return cp.returncode, cp.stdout, cp.stderr
 

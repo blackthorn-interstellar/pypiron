@@ -63,3 +63,8 @@ dev/bench/install/compose/pypicloud-config-dynamo.gen.ini
 # Nested private repo: unpublished docs, scripts, and strategy. Has its own
 # .git, and is never part of this repo's history.
 /private/
+
+# Claude Code local state: agent worktrees, session locks, per-machine settings.
+# The skills under .claude/skills/ are tracked; nothing else here is.
+/.claude/*
+!/.claude/skills/

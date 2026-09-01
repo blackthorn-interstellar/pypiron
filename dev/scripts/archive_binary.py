@@ -10,6 +10,7 @@ CI built for PyPI, so the standalone downloads and the wheels come from one buil
 from __future__ import annotations
 
 import argparse
+import shutil
 import tarfile
 import tempfile
 import zipfile
@@ -19,12 +20,24 @@ _BINARY_NAMES = ("pypiron", "pypiron.exe")
 
 
 def _find_binary(wheel: Path, dest: Path) -> Path:
-    """Extract `wheel` into `dest` and return the path to the pypiron executable."""
+    """Extract the pypiron executable out of `wheel` into `dest`; return its path.
+
+    Only the one member is unpacked, and it is written under a name taken from
+    `_BINARY_NAMES` rather than from the archive, so a wheel carrying a hostile
+    entry name cannot steer the write out of `dest`.
+    """
     with zipfile.ZipFile(wheel) as zf:
-        zf.extractall(dest)
-    for path in dest.rglob("*"):
-        if path.is_file() and path.parent.name == "scripts" and path.name in _BINARY_NAMES:
-            return path
+        for member in zf.infolist():
+            parts = member.filename.split("/")
+            if member.is_dir() or len(parts) < 2 or parts[-2] != "scripts":
+                continue
+            name = next((n for n in _BINARY_NAMES if parts[-1] == n), None)
+            if name is None:
+                continue
+            target = dest / name
+            with zf.open(member) as src, target.open("wb") as fh:
+                shutil.copyfileobj(src, fh)
+            return target
     raise SystemExit(f"no pypiron executable found inside {wheel.name}")
 
 

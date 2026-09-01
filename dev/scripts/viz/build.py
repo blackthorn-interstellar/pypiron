@@ -655,6 +655,12 @@ def main() -> int:
         return 0
 
     out = (ROOT / args.out).resolve()
+    # Everything below writes into `out`, and the inertness gate rmtree's
+    # `out/tmp`. A mistyped --out must not be able to name a tree outside the
+    # repo, so refuse one before anything is created or deleted.
+    if not out.is_relative_to(ROOT):
+        print(f"--out must stay inside the repo, got {out}", file=sys.stderr)
+        return 2
     data = out / "data"
     data.mkdir(parents=True, exist_ok=True)
     player = PLAYER.read_text()

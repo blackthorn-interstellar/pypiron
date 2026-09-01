@@ -255,15 +255,18 @@ async fn run_bucket_health_until(
 }
 
 /// Check a bucket-local lease without inheriting a cloud SDK's multi-minute
-/// retry budget. `ObservedStorage` records completed calls; a cancelled timeout
-/// is recorded here because the wrapper never sees a result.
+/// retry budget.
+///
+/// A cancelled deadline means "not leader this cycle", not "the bucket is
+/// dead". `ObservedStorage` records completed calls; synthesizing
+/// [`crate::bucket_health::BucketSignal::Timeout`] here for a call the wrapper
+/// never saw false-failovers a live selected bucket whenever an audit or peer
+/// drain saturates the store for one second. Availability is the dedicated
+/// health loop's job (`probe_buckets`).
 async fn bounded_lease_check(state: &AppState, bucket: usize, lease: &LeaseManager) -> bool {
     match timeout(BUCKET_HEALTH_IO_TIMEOUT, lease.is_leader()).await {
         Ok(is_leader) => is_leader,
         Err(_) => {
-            if let Some(health) = &state.bucket_health {
-                let _ = health.observe(bucket, crate::bucket_health::BucketSignal::Timeout);
-            }
             warn!(
                 bucket = %state.buckets.handles()[bucket].name,
                 timeout_ms = BUCKET_HEALTH_IO_TIMEOUT.as_millis(),

@@ -41,12 +41,8 @@ PACKAGES = int(sys.argv[4]) if len(sys.argv) > 4 else 5000
 TREE = Path("/tmp/scale-tree")
 
 
-def sh(cmd: str, **kw) -> subprocess.CompletedProcess:
-    # Every caller is a literal in this file, parameterized only by the argv the
-    # operator typed to start a manual local benchmark. Nothing untrusted reaches
-    # the shell, and pipelines are the point of the helper.
-    # nosemgrep: python.lang.security.audit.subprocess-shell-true.subprocess-shell-true
-    return subprocess.run(cmd, shell=True, text=True, capture_output=True, **kw)
+def sh(*cmd: str, **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, text=True, capture_output=True, **kw)
 
 
 def free_port() -> int:
@@ -190,9 +186,16 @@ def stop(proc) -> None:
 
 
 def count_objects(prefix: str) -> int:
-    out = sh(f"aws s3 ls s3://{BUCKET}/{prefix} --recursive --summarize | tail -3")
-    m = re.search(r"Total Objects:\s*(\d+)", out.stdout)
-    return int(m.group(1)) if m else -1
+    # The listing runs to millions of lines at full-PyPI scale and only the
+    # trailing summary matters, so stream it rather than buffer the whole thing.
+    cmd = ["aws", "s3", "ls", f"s3://{BUCKET}/{prefix}", "--recursive", "--summarize"]
+    total = -1
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True) as proc:
+        for line in proc.stdout:
+            m = re.search(r"Total Objects:\s*(\d+)", line)
+            if m:
+                total = int(m.group(1))
+    return total
 
 
 def main() -> int:
@@ -201,16 +204,26 @@ def main() -> int:
     # 1. Seed truth (idempotent: skip if the tree already exists).
     if not (TREE / "scale-manifest.json").exists():
         print(f"== seeding {PACKAGES} packages -> {TREE}", flush=True)
-        r = sh(f"python3 {HERE}/scale.py seed --packages {PACKAGES} --dest {TREE} --workers 16")
+        r = sh(
+            "python3",
+            str(HERE / "scale.py"),
+            "seed",
+            "--packages",
+            str(PACKAGES),
+            "--dest",
+            str(TREE),
+            "--workers",
+            "16",
+        )
         print(r.stdout[-500:], r.stderr[-500:])
     manifest = json.loads((TREE / "scale-manifest.json").read_text())
     results["manifest"] = {"packages": manifest["packages"], "files": manifest["files"]}
 
     # 2. Push to S3 (empty bucket first so the audit sees only this corpus).
     print("== emptying bucket + syncing tree to S3", flush=True)
-    sh(f"aws s3 rm s3://{BUCKET}/ --recursive --only-show-errors")
+    sh("aws", "s3", "rm", f"s3://{BUCKET}/", "--recursive", "--only-show-errors")
     t0 = time.time()
-    sync = sh(f"aws s3 sync {TREE}/ s3://{BUCKET}/ --only-show-errors")
+    sync = sh("aws", "s3", "sync", f"{TREE}/", f"s3://{BUCKET}/", "--only-show-errors")
     results["seed_sync_secs"] = round(time.time() - t0, 1)
     if sync.returncode != 0:
         print("sync FAILED:", sync.stderr[-1000:])

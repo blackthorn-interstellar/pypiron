@@ -1,18 +1,29 @@
 # Snyk policy file — see https://docs.snyk.io/manage-risk/policies
 #
-# `dev/` is contributor-facing tooling: benchmarks, ops scripts, and simulation
-# harnesses that an operator runs by hand. None of it ships in the pypiron
-# binary or executes on a server (AGENTS.md draws the same line). Every finding
-# Snyk Code raises there traces untrusted input to the operator's own command
-# line — the target URL, binary path, or output path they typed to start a
-# benchmark — so the "attacker" is the person at the keyboard. Fixing them means
+# Excluded paths, and why each one earns it:
+#
+# `dev/bench/**` and `dev/scripts/**` are operator-run tooling — benchmarks,
+# simulation harnesses, and one-shot maintenance scripts. None of it ships in
+# the pypiron binary or executes on a server. Every finding Snyk Code raises
+# there traces untrusted input back to the operator's own command line: the
+# target URL, binary path, or output path they typed to start a run. The
+# "attacker" is the person at the keyboard, and clearing the findings would mean
 # constraining the arguments these scripts exist to accept.
 #
-# `.claude/` is untracked local agent worktrees, not project source.
+# `dev/ops/soak/report.py` is the fleet-internal soak reporter. Its findings
+# were triaged individually on 2026-09-01 and each was a false positive: an
+# env-configured binary path and output locations, a list-arg (shell=False)
+# subprocess call, and a persisted-ID sha1 since marked usedforsecurity=False.
 #
-# This exclusion does NOT cover `src/` or `tests/`, which are still scanned.
+# `.claude/` is local agent state — worktrees and settings. The tracked files
+# under `.claude/skills/` are markdown, not code.
+#
+# Deliberately still in scope: `src/`, `tests/`, and the rest of `dev/ops/**`,
+# so new code landing anywhere outside the paths listed below gets scanned.
 version: v1.25.0
 exclude:
   global:
-    - dev/**
+    - dev/bench/**
+    - dev/scripts/**
+    - dev/ops/soak/report.py
     - .claude/**

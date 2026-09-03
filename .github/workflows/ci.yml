@@ -1057,7 +1057,7 @@ jobs:
           diff "$RUNNER_TEMP/expected.sha256" "$RUNNER_TEMP/actual.sha256"
           echo "verified $(wc -l < "$RUNNER_TEMP/actual.sha256") artifacts against their build-time digests"
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           skip-existing: true
 

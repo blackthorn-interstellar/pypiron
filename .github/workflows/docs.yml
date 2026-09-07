@@ -5,6 +5,9 @@ on:
     branches:
       - master
     paths:
+      - README.md
+      - dev/scripts/readme_to_index.py
+      - dev/scripts/mkdocs_check_meta.py
       - docs/**
       - mkdocs.yml
       - pyproject.toml
@@ -12,6 +15,9 @@ on:
       - .github/workflows/docs.yml
   pull_request:
     paths:
+      - README.md
+      - dev/scripts/readme_to_index.py
+      - dev/scripts/mkdocs_check_meta.py
       - docs/**
       - mkdocs.yml
       - .github/workflows/docs.yml
@@ -36,7 +42,7 @@ jobs:
         with:
           version: 0.12.6
       - name: Build site
-        run: uv run --group docs -- mkdocs build --strict
+        run: make docs
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           # mkdocs.yml sets site_dir to .local/site.

@@ -41,9 +41,9 @@
       fired = true;
       oaiq("measure", "custom", { type: "custom" }, { custom_event_name: "install" });
     }
-    // Copy button (mkdocs-material renders one .md-clipboard per code block).
+    // Material's current copy button, plus the selector used by older releases.
     document.addEventListener("click", function (e) {
-      var btn = e.target.closest && e.target.closest(".md-clipboard");
+      var btn = e.target.closest && e.target.closest('.md-code__button[data-md-type="copy"], .md-clipboard');
       if (!btn) return;
       var target = btn.getAttribute("data-clipboard-target");
       var code = (target && document.querySelector(target)) ||

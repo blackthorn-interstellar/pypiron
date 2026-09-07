@@ -4,68 +4,58 @@ description: pypiron vs pypiserver — both host private Python packages; pypiro
 
 # pypiron vs pypiserver
 
-pypiserver is the smallest thing that serves a private index: a directory of
-wheels, htpasswd auth, and a redirect to PyPI for anything it does not have. It
-has been maintained for over a decade and is a fine choice when that is all you
-need. pypiron does the same job and adds a real PyPI cache, cloud storage,
-supply-chain defense, and roughly 100× the install throughput.
+pypiserver serves a directory of private packages and redirects missing ones to
+PyPI. It is small, established, and enough for that job. pypiron adds a real
+PyPI cache, cloud storage, supply-chain defense, and 100× the measured install
+throughput.
 
-## Where pypiserver is enough
+## Choose pypiserver when
 
-- **Single box, local disk, no cache.** If you keep a folder of internal wheels
-  on one server and let developers get public packages from pypi.org directly,
-  pypiserver covers it. pypiron can run just as
-  small, but if you never want caching or cloud storage, pypiserver's
-  minimalism is the draw.
-- **You want the most boring possible dependency.** pypiserver is a small,
-  well-worn Python app. That is a virtue for a low-stakes internal index.
+- **A folder of private packages is enough.** One server, local disk, public
+  packages from PyPI.
+- **You value age over features.** pypiserver is a small Python application
+  maintained for more than a decade.
 
 pypiserver does *not* cache PyPI — a missing package is a redirect to pypi.org,
 not a stored copy — and it has no built-in cloud-storage backend. If you need
 either, you are already past what it does.
 
-## Where pypiron pulls ahead
+## Choose pypiron when
 
-- **It caches PyPI.** The first install of a public package stores it,
-  behind the same URL as your private ones, so the next install and every
-  air-gapped or egress-blocked build gets it locally. pypiserver only redirects
-  to pypi.org.
+- **You need a real PyPI cache.** The first install stores a public package
+  behind the same URL as your private ones. pypiserver only redirects to PyPI.
 - **Cloud storage, no database.** Point pypiron at an S3, GCS, or Azure bucket
-  and run as many nodes as you like against it — no database either way
-  ([setup](../guides/standard-cloud.md)). pypiserver serves from local directories only.
-- **It is roughly 100× faster.** In the [six-way benchmark](index.md),
+  and run any number of nodes against it
+  ([setup](../guides/standard-cloud.md)).
+- **It is 100× faster in the benchmark.** In the [six-way test](index.md),
   pypiserver on gunicorn peaked at **69 installs/s** on a 2-vCPU box; pypiron hit
-  **8,288 installs/s** on the same hardware. pypiserver pushes every wheel
-  through its own network card and tops out there; pypiron hands the
-  download to object storage and scales to CPU.
+  **8,288 installs/s**.
 - **Supply-chain defense on by default.** New releases wait 7 days before
-  pypiron serves them ([how](../security.md)), a private name can
-  never fall through to PyPI (no dependency confusion), and pypiron refuses any
-  file the advisory feed flags as malware. pypiserver has none of these.
-- **It survives an outage.** Run nodes across regions or clouds on one bucket
-  list; reads fail over with zero data loss ([multi-region](../guides/multi-region.md)).
-  pypiserver is single-box.
+  pypiron serves them, private names never fall through to PyPI, and known
+  malware is refused ([details](../security.md)).
+- **You need more than one region.** A bucket list can span regions or clouds;
+  reads fail over automatically ([setup](../guides/multi-region.md)).
 
 ## Side by side
 
 | | pypiron | pypiserver |
 | --- | --- | --- |
 | Private hosting | ✅ | ✅ |
-| Auth | uploader + admin creds, install tokens | htpasswd |
+| Auth | admin/uploader/reader credentials, install tokens | htpasswd or custom provider |
 | Cache / proxy PyPI | ✅ stores a copy | redirect to PyPI only |
 | Cloud storage | S3, GCS, Azure | — (local disk) |
 | No database | ✅ | ✅ |
 | Dependency cooldown | ✅ default | — |
 | Malware / advisory blocking | ✅ default | — |
 | No dependency confusion | ✅ | — |
-| Multi-node resilience | one bucket, multi-region failover | single box |
+| Multi-node resilience | shared bucket or multi-bucket failover | no built-in failover |
 | Peak installs/s (2 vCPU) | [8,288](index.md) | 69 |
 
-## The honest line
+## The deciding question
 
-For a single-box private index with no caching, pypiserver is a good,
-long-lived choice, and switching for the sake of switching buys you nothing.
-The moment
-you want a PyPI cache, cloud storage, more than one node, supply-chain defense,
-or real throughput, pypiron gives you all of them from one binary.
-[Try it](../guides/standard-cloud.md) — the private-index setup is a single command.
+Need a small private index on one box? Choose pypiserver. Need caching, cloud
+storage, supply-chain defense, or serious throughput? Choose pypiron.
+
+[Start pypiron](../index.md#start-pypiron) ·
+[Deploy on cloud storage](../guides/standard-cloud.md) ·
+[Publish and install](../guides/publish-install.md)

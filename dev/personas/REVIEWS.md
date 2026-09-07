@@ -1,20 +1,49 @@
-# Persona review ledger
+# Documentation review
 
-One row per page: who read it last, when, and the commit that applied the
-confirmed findings. Kept true by the `/persona-review` skill (step 4). A page
-edited materially since its row is due for a fresh pass.
+Reviewed September 6, 2026. This record covers the documentation in the same
+commit. Earlier reviews remain in git history.
 
-| Page | Actors | Date | Findings applied in |
-| --- | --- | --- | --- |
-| README.md / docs/index.md | python-hater, artifactory-refugee, junior-dev, platform-veteran | 2026-08-03 | f6d4f45, 44efb95 (6 positioning items open with owner) |
-| docs/concepts.md | all six + platform-veteran ×2 | 2026-08-03 | 59ebcac, 971bfbe, 44efb95 |
-| docs/security.md | security-lead, platform-veteran | 2026-08-03 | 59ebcac, f6d4f45, ee07273, 44efb95 |
-| docs/testing.md | platform-veteran (security-lead skimmed) | 2026-08-03 | 44efb95 (notes 13–14 open with owner) |
-| docs/guides/standard-cloud.md | artifactory-refugee, junior-dev, grumpy-sre, platform-veteran ×3 — two blind rounds calibrated the residue test (round 2 missed the lede, round 3 flagged it); opener since refactored on owner direction — due a fresh pass | 2026-08-07 | 59ebcac, 44efb95, e66774a |
-| docs/guides/air-gapped.md | airgapped-ops, platform-veteran, blank-slate incremental reader (intro, audited interleaving) | 2026-08-07 | 59ebcac, ee07273, 44efb95, +intro fix |
-| docs/guides/multi-region.md | platform-veteran | 2026-08-03 | 44efb95 |
-| docs/guides/migrate.md | platform-veteran | 2026-08-03 | clean — no notes |
-| docs/compare/* | platform-veteran (refugee skimmed the table) | 2026-08-03 | 44efb95 (4×-PyPI denominator open with owner) |
-| docs/reference/configuration.md | platform-veteran (prose only) | 2026-08-03 | 44efb95 |
-| docs/for-agents.md | — (frame sweep only, no persona pass) | — | ef29d20 |
-| docs/privacy.md | — (frame sweep only, no persona pass) | — | clean in sweep |
+Three Sol agents split editing and verification. Separate agents then reviewed
+each other's pages; the primary agent checked the resulting changes against the
+owner's instructions and earlier documentation conversations.
+
+| Pages | Reader check |
+| --- | --- |
+| README.md / docs/index.md | Clear benefits, bold claims, visible start/deploy actions, one-command start, prerequisite and password defined. |
+| docs/compare/index.md and the three competitor pages | Clear fit, supported comparisons, concise evidence, working next actions. |
+| docs/concepts.md | Private packages, public packages, storage, access, security, and operations in the reader's order. |
+| docs/security.md | Accurate defaults, public/private scope, credential transport, and usable release verification. |
+| docs/testing.md | Claims match the workflows and distinguish the client/backend coverage. |
+| docs/privacy.md | Existing advertising disclosure retained; actual server and cloud-metadata requests explained. |
+| docs/reference/configuration.md | Exact options and precedence, source-build availability, retained lookup anchors. |
+| docs/for-agents.md | Decision criteria, setup, verification, operating facts, and limitations. |
+| docs/guides/publish-install.md | Terminal and directory transitions, package build, publishing, installation, and alternative clients. |
+| docs/guides/standard-cloud.md | Config and service files, credentials, startup, readiness, and client setup. |
+| docs/guides/air-gapped.md | Complete dependency selection, staging, integrity checks, safe replacement, and advisory delivery. |
+| docs/guides/multi-region.md | Shared config, failover limits, maintenance context, and recovery steps. |
+| docs/guides/migrate.md | Source requirements, private-name selection, destination maintenance, and release availability. |
+
+## Checks
+
+- `make check`: passed; 755 Rust tests passed, five ignored.
+- `uv run -- pytest tests/dev/scripts -n 0`: README website/PyPI link regressions passed.
+- `make docs`: strict build passed; README generates the homepage.
+- `uv run -- python dev/scripts/check_docs.py --bin target/debug/pypiron`:
+  CLI, configuration reference, and config template agree.
+- Generated HTML: internal links, fragment targets, image paths, descriptions,
+  social metadata, search coverage, and llms.txt coverage checked.
+- Public install: PyPI 0.0.17 installs with uvx. Its pypicloud migration flags
+  are not released; both the guide and reference state the source-build requirement.
+- Real-client workflows: building and publishing a wheel, fresh private and public
+  installs, release-to-release migration, and offline archive verification and
+  replacement passed. Cloud instructions were checked against configuration and
+  implementation; no external cloud deployments were changed.
+- Install conversion tracking: the exact inline script records one server-command
+  copy event, ignores client-command copies, and prevents duplicate events. Both
+  Material's current copy-button attributes and its legacy selector passed in an
+  offline event harness; no advertising requests were sent.
+
+Browser visual review could not run: the Browser runtime failed during setup
+with `Importing module "node:process" is not allowed in node_repl`. Generated
+HTML checks do not establish desktop or mobile rendering quality. The existing
+theme, chart, product screenshot, and advertising pixel were retained.

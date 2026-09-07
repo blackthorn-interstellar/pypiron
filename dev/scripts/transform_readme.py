@@ -39,7 +39,7 @@ def _ref() -> str:
 
 
 def _is_relative(url: str) -> bool:
-    return not url.startswith(("http://", "https://", "#", "mailto:"))
+    return not urllib.parse.urlsplit(url).scheme and not url.startswith(("#", "//"))
 
 
 def main(target: str) -> None:
@@ -57,14 +57,23 @@ def main(target: str) -> None:
             return match.group(0)
         return f"]({urllib.parse.urljoin(blob, url)})"
 
-    def image(match: re.Match) -> str:
-        url = match.group(1)
+    def attribute(match: re.Match) -> str:
+        name, url = match.groups()
+        if name == "srcset":
+            candidates = []
+            for candidate in url.split(","):
+                parts = candidate.split()
+                if parts and _is_relative(parts[0]):
+                    parts[0] = urllib.parse.urljoin(raw, parts[0])
+                candidates.append(" ".join(parts))
+            return f'{name}="{", ".join(candidates)}"'
         if not _is_relative(url):
             return match.group(0)
-        return f'src="{urllib.parse.urljoin(raw, url)}"'
+        base = raw if name == "src" else blob
+        return f'{name}="{urllib.parse.urljoin(base, url)}"'
 
     content = re.sub(r"\]\(([^)]+)\)", link, content)
-    content = re.sub(r'src="([^"]+)"', image, content)
+    content = re.sub(r'\b(href|src|srcset)="([^"]+)"', attribute, content)
 
     Path("README.md").write_text(content, encoding="utf8")
     print(f"transformed README.md for {target} (ref: {ref})")

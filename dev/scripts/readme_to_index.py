@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 GITHUB = "https://github.com/blackthorn-interstellar/pypiron/blob/master/"
 
 FRONT_MATTER = """---
-description: A self-hosted PyPI server in Rust. 100x faster installs, private packages, an on-demand PyPI cache, and supply-chain defense built in.
+description: 100x faster installs. Host private Python packages, cache PyPI, and block malware with a self-hosted server built for cloud storage.
 ---
 
 """
@@ -29,8 +29,17 @@ def convert(text: str) -> str:
     # HTML img/source attributes into docs/assets become site-relative.
     text = text.replace('src="docs/assets/', 'src="assets/')
     text = text.replace('srcset="docs/assets/', 'srcset="assets/')
-    # HTML link hrefs into docs/ become site-relative.
-    text = text.replace('href="docs/', 'href="')
+
+    # MkDocs rewrites Markdown links, but leaves raw HTML table links alone.
+    def site_href(match: re.Match[str]) -> str:
+        path, separator, fragment = match.group(1).partition("#")
+        if path == "index.md" or path.endswith("/index.md"):
+            path = path.removesuffix("index.md") or "./"
+        elif path.endswith(".md"):
+            path = path.removesuffix(".md") + "/"
+        return f'href="{path}{separator}{fragment}"'
+
+    text = re.sub(r'href="docs/([^"]+)"', site_href, text)
     # Repo-tree links become absolute GitHub URLs.
     text = re.sub(r"\]\((dev|src|tests|examples|bench)/", rf"]({GITHUB}\1/", text)
     text = text.replace("](LICENSE)", f"]({GITHUB}LICENSE)")

@@ -1,80 +1,100 @@
 ---
-description: Move private packages off pypicloud, devpi, Artifactory, or Nexus into pypiron. Select pypicloud projects by private-name pattern.
+description: Move private packages from devpi, Artifactory, Nexus, or pypicloud into pypiron and verify the result.
 ---
 
 # Move your packages off another index
 
-Pull your private packages out of an old index and into pypiron in one command.
-They land as your own packages — private, served from your index, never fetched
-from PyPI. Nothing to install first — prefix the commands with `uvx`
-(`uvx pypiron sync …`) or use the [Docker image](../index.md) — and the
-destination server must already be running: `--to` points at it.
+`pypiron sync --as-private` downloads selected packages from an existing index
+and publishes them to a running pypiron server as your private packages.
+
+Before starting:
+
+- Install pypiron on the workstation that will run the migration:
+  `uv tool install pypiron`.
+- Start the destination with an admin password.
+- List every private package you intend to move.
+- Keep the old index read-only until installs from pypiron succeed.
+
+## devpi
+
+Use the index's `+simple` URL. Preview first:
 
 ```bash
+export PYPIRON_SYNC_SOURCE_USER='devpi-user'
+export PYPIRON_SYNC_SOURCE_PASS='devpi-password'
+export PYPIRON_SYNC_ADMIN_USER='admin'
+export PYPIRON_SYNC_ADMIN_PASS='pypiron-password'
+
 pypiron sync \
-  --from https://devpi.corp/team/dev/+simple \
-  --source-user "$SRC_USER" --source-pass "$SRC_PASS" \
+  --from https://devpi.example.com/acme/prod/+simple \
+  --to https://pypi.internal \
   --as-private \
-  --to http://localhost:8080 \
-  --admin-user admin --admin-pass "$PYPIRON_ADMIN_PASS" \
-  --include-package internal-app \
-  --include-package internal-lib
+  --include-package acme-billing \
+  --include-package acme-auth \
+  --dry-run
 ```
 
-pypiron downloads each named package from the old index (authenticated) and
-stores it as private. Install it like anything else:
+Check the package names, then repeat without `--dry-run`. Confirm one package:
 
 ```bash
-uv pip install internal-app --index-url http://localhost:8080/simple/
+uv pip install \
+  --default-index https://pypi.internal/simple/ \
+  acme-billing
 ```
 
-## What migrating does — and doesn't
+Re-running the migration is safe: files already present are skipped.
 
-- Packages land **private**: your own packages, served from your index. Not a
-  mirror of a public project — pypiron never falls through to PyPI for them.
-- **Migration drops timestamps and yank state.** Migrated files carry the
-  migration date. (Mirroring public PyPI keeps real upload times; a private
-  migration doesn't.)
-- **Don't set `--private-prefix` during a migration.** It reserves a namespace
-  for private names, and pypiron refuses any package whose name falls outside
-  it. Migrate first, add the prefix after.
+## Artifactory and Nexus
 
-Re-running is safe: pypiron skips files already migrated, so a second pass
-only carries what's new.
+Use the repository's Python Simple API URL:
 
-## pypicloud: migrate only the private projects
+- Artifactory: `https://HOST/artifactory/api/pypi/REPOSITORY/simple`
+- Nexus: `https://HOST/repository/REPOSITORY/simple`
 
-A pypicloud server can contain private uploads and public packages cached from
-PyPI in the same index. Tell pypiron which project names belong to you; it
-leaves every unmatched project alone:
+Run the same command used for devpi with the new `--from` URL.
+
+The source must return the JSON Simple API. In Artifactory, enable **PyPI simple
+JSON format** for the repository. Nexus supports it from version 3.93. A wrong
+credential may return an HTML login page; pypiron reports that as an HTML source
+instead of JSON.
+
+The devpi path is tested end to end. Confirm JSON support on your Artifactory or
+Nexus repository before moving packages.
+
+## pypicloud: select only private projects
+
+!!! warning "Requires a build newer than 0.0.17"
+    The pypicloud-specific flags below are on `master` but not in the current
+    PyPI release, 0.0.17. Use the next release when available. To run them now,
+    install the Rust toolchain, clone the
+    [source repository](https://github.com/blackthorn-interstellar/pypiron),
+    and replace `pypiron sync` below with `cargo run --locked -- sync`.
+
+A pypicloud index may contain your uploads and public packages cached from PyPI.
+Select private project names explicitly:
 
 ```bash
+export PYPIRON_SYNC_SOURCE_USER='pypicloud-user'
+export PYPIRON_SYNC_SOURCE_PASS='pypicloud-password'
+export PYPIRON_SYNC_ADMIN_USER='admin'
+export PYPIRON_SYNC_ADMIN_PASS='pypiron-password'
+
 pypiron sync \
   --from https://packages.example.com \
   --source-kind pypicloud \
-  --source-user "$SRC_USER" --source-pass "$SRC_PASS" \
   --as-private \
   --private-pattern 'acme-*' \
   --private-pattern 'internal-tool' \
-  --to http://localhost:8080 \
-  --admin-user admin --admin-pass "$PYPIRON_ADMIN_PASS"
+  --to https://pypi.internal \
+  --dry-run
 ```
 
-Point `--from` at the pypicloud application root, not its `/simple` endpoint.
-`--source-kind pypicloud` switches `sync` from the standard JSON Simple API to
-pypicloud's `/api/package/` API so it can list the projects and their stored
-files.
+Point `--from` at the pypicloud application root, not `/simple`. Check the
+selected names, then repeat without `--dry-run`.
 
-Patterns match the entire normalized package name: matching ignores case and
-treats runs of `-`, `_`, and `.` as `-`. `*` is the only wildcard. For example,
-`Acme_*` becomes `acme-*` and matches `acme-auth`, but not
-`other-acme-auth`. A bare `*` is refused so a typo cannot turn a private-only
-migration into a copy of the whole cache. Every stored file under a matched name
-is eligible for migration as private; any normal sync content filters you set
-still apply.
-
-For a longer list, put one pattern per line (blank lines and `#` comments are
-ignored):
+Patterns match the entire normalized name. Matching ignores case and treats
+`-`, `_`, and `.` as equivalent. `*` is the only wildcard, and a bare `*` is
+refused. For a longer list, save one pattern per line:
 
 ```text title="private-packages.txt"
 acme-*
@@ -82,108 +102,65 @@ internal-tool
 partner-sdk-*
 ```
 
+Then use:
+
 ```bash
 pypiron sync \
   --from https://packages.example.com \
-  --source-kind pypicloud --as-private \
+  --source-kind pypicloud \
+  --as-private \
   --private-patterns-from private-packages.txt \
-  --to http://localhost:8080 \
-  --admin-user admin --admin-pass "$PYPIRON_ADMIN_PASS" \
+  --to https://pypi.internal \
   --dry-run
 ```
 
-Remove `--dry-run` after checking the selected names. Exact
-`--include-package` and `--include-packages-from` lists also work and may be
-combined with patterns.
+pypicloud's uploader metadata is incomplete, so pypiron does not use it to
+decide ownership. The pattern list is the ownership decision. Unmatched cached
+public projects are not copied.
 
-The pattern list is the ownership decision. pypicloud's `uploader` metadata is
-not reliable enough to make that decision: cached public files usually lack it,
-but older private uploads may lack it too. pypiron warns when a selected file
-has no uploader metadata and still migrates it.
+## Migrating a long package list
 
-## devpi
+Put one requirement per line in `packages.txt`:
 
-devpi serves each index's package list at `<base>/<user>/<index>/+simple`. Point
-`--from` at that:
+```text
+acme-auth
+acme-billing>=4
+internal-tool
+```
+
+Then replace repeated `--include-package` arguments with:
 
 ```bash
-pypiron sync \
-  --from https://devpi.example.com/acme/prod/+simple \
-  --source-user acme --source-pass "$DEVPI_PASS" \
-  --as-private \
-  --to http://localhost:8080 \
-  --admin-user admin --admin-pass "$PYPIRON_ADMIN_PASS" \
-  --include-package acme-billing --include-package acme-auth
+--include-packages-from packages.txt
 ```
 
-## Artifactory and Nexus
+`sync` does not resolve dependencies. Include every private package you need;
+for public packages, enable pypiron's PyPI proxy or sync a separate approved
+public list.
 
-Same command, different source URL — point `--from` at the repository's simple
-endpoint:
+## What migration preserves
 
-- **Artifactory:** `https://<host>/artifactory/api/pypi/<repo>/simple`
-- **Nexus:** `https://<host>/repository/<repo>/simple`
+- Artifact bytes and hashes are preserved.
+- Packages are recorded as private and never fall through to public PyPI.
+- Existing destination files are not overwritten.
+- Source upload times and yank state are not preserved; migrated files receive
+  the migration time.
+
+A destination name already claimed from public PyPI cannot be converted in
+place. Delete every file in that package and stop writes to the destination.
+On a host with the destination's storage credentials, run the maintenance
+command against the same storage config used by its server:
 
 ```bash
-pypiron sync \
-  --from https://nexus.example.com/repository/pypi-internal/simple \
-  --source-user "$SRC_USER" --source-pass "$SRC_PASS" \
-  --as-private \
-  --to http://localhost:8080 \
-  --admin-user admin --admin-pass "$PYPIRON_ADMIN_PASS" \
-  --include-package internal-app
+pypiron origin release PACKAGE \
+  --config /etc/pypiron/pypiron.toml
 ```
 
-**One requirement: the source must serve the JSON simple API (PEP 691).**
-pypiron reads the modern JSON index; it does not scrape the older HTML index.
+Restart the server, then migrate the package. If the destination uses
+`private-prefix`, every migrated name must match that prefix.
 
-- **Artifactory** serves HTML by default. Turn on JSON per repository:
-  **Administration > Artifactory Settings > Packages Settings > PyPI > Enable
-  simple json format**. (If JSON is off, Artifactory falls back to HTML.)
-- **Nexus** serves the JSON simple API from **3.93** onward (3.94 adds file
-  sizes and upload times). Older Nexus is HTML-only — upgrade before migrating.
+Use `--allow-insecure-source` only for a trusted plaintext source. Credentials
+otherwise require HTTPS and are never forwarded to another host after a
+redirect.
 
-If the source is still HTML-only, the migration stops with:
-
-```
-source returned an HTML page (Content-Type: text/html), not the PEP 691 JSON
-pypiron migration requires — point --from at a JSON-capable endpoint, or check
-credentials if this is a login page.
-```
-
-The same message appears if a wrong credential lands you on a login page — check
-`--source-user`/`--source-pass` before assuming the endpoint is wrong.
-
-devpi is tested end-to-end. The Artifactory and Nexus paths above are their
-standard simple-API endpoints; the JSON index is the one thing to confirm first.
-
-## Migrating everything
-
-`sync` migrates the packages you name — it won't list the whole source for
-you. Most teams already know their list. If you don't, read it from the source
-index once:
-
-```bash
-curl -s -u "$SRC_USER:$SRC_PASS" \
-  -H 'Accept: application/vnd.pypi.simple.v1+json' \
-  https://devpi.example.com/acme/prod/+simple/ \
-  | python3 -c 'import sys, json; print("\n".join(p["name"] for p in json.load(sys.stdin)["projects"]))' \
-  > packages.txt
-
-pypiron sync --from https://devpi.example.com/acme/prod/+simple \
-  --source-user "$SRC_USER" --source-pass "$SRC_PASS" --as-private \
-  --to http://localhost:8080 --admin-user admin --admin-pass "$PYPIRON_ADMIN_PASS" \
-  --include-packages-from packages.txt
-```
-
-## Credentials
-
-Keep passwords out of the command line — set the environment variables and
-drop the corresponding flags: `PYPIRON_SYNC_SOURCE_USER` /
-`PYPIRON_SYNC_SOURCE_PASS` replace `--source-user`/`--source-pass`, and
-`PYPIRON_SYNC_ADMIN_PASS` replaces `--admin-pass` (the admin username is
-whatever the destination server was started with — `admin` when only a
-password was set). Source credentials go to the source host
-only; pypiron never forwards them to a redirect somewhere else.
-
-Full flag list: [Configuration → Sync](../reference/configuration.md#sync).
+Full options: [Configuration → Sync](../reference/configuration.md#sync).

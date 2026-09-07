@@ -1,51 +1,78 @@
 ---
-description: "Serve packages on a host with no internet access: sync an approved list from a connected host and ferry the malware advisory feed alongside it."
+description: Serve packages without internet access by syncing an approved package list over a private link or removable media.
 ---
 
 # Run without internet access
 
-With a locked-down network path between a connected host and the serving
-host, `pypiron sync` pushes over it. With nothing crossing the boundary but
-scanned media, sync into a staging server on the connected side and carry the
-storage tree. Either way the serving host never touches the internet: it
-answers installs from what sync delivered, and anything it doesn't hold is an
-immediate 404 — nothing waits on a network that isn't there.
+An offline pypiron server never contacts PyPI. Put every required package in
+its storage before clients need it. `sync` does not resolve dependencies, so
+your list must include direct and transitive packages.
+
+Choose one transfer path:
+
+- A private network link: `sync` uploads directly to the offline server.
+- Removable media: `sync` fills a temporary staging server; you stop it before
+  copying its data directory.
+
+Install the same pypiron release on both hosts. On the connected host:
+
+```bash
+uv tool install pypiron
+```
+
+For the offline host, carry the matching binary from
+[GitHub Releases](https://github.com/blackthorn-interstellar/pypiron/releases)
+through your approved software-transfer process.
 
 ## The serving host
 
-An ordinary server with no `proxy-upstream`:
+The examples use `/etc/pypiron` for configuration and `/var/lib/pypiron` for
+data. Create both directories first and grant the pypiron service account read
+access to the config and read/write access to the data directory.
+
+Save this as `/etc/pypiron/pypiron.toml` on the offline host:
 
 ```toml
 private-prefix = "acme"
 
 [serve]
 bind-addr = "0.0.0.0:8080"
+data-dir = "/var/lib/pypiron"
 ```
+
+There is no `proxy-upstream`. Start the server:
 
 ```bash
-export PYPIRON_ADMIN_PASS="$ADMIN"
-pypiron serve
+export PYPIRON_ADMIN_PASS='change-this-password'
+pypiron serve --config /etc/pypiron/pypiron.toml
 ```
 
-`private-prefix` reserves your package names. `PYPIRON_ADMIN_PASS` enables
-publishing — which is how sync delivers, so set it here.
+Leave the password unset for a read-only server. Direct network sync needs it;
+the removable-media path does not.
 
 ## The connected host
 
-`sync` needs an approval list. `packages.txt`:
+Create `packages.txt` with one approved package requirement per line:
 
 ```text
-requests>=2.32,<3
-urllib3
-six
+six==1.17.0
 ```
 
-The list is literal — nothing resolves dependencies for you. Generate it from
-a lockfile (`uv export` emits the full closure) so a transitive dependency
-doesn't 404 on the inside. List syntax, version specifiers, and excludes:
-[Mirror selection](../reference/configuration.md#mirror-selection).
+For a real uv project, export its locked dependency set:
 
-`pypiron.toml` on the connected host:
+```bash
+uv export --frozen --no-dev --no-emit-project \
+  --no-hashes --no-annotate --no-header \
+  | sed -E 's/[[:space:]]*;.*$//' > packages.txt
+```
+
+The command removes environment markers, so the result is a conservative union
+of locked registry packages. Review it before syncing and remove local paths or
+Git dependencies, which cannot be fetched from PyPI. Use
+[mirror filters](../reference/configuration.md#mirror-selection) to restrict
+wheels by the offline clients' Python versions and platforms.
+
+For a private network transfer, save this as `pypiron.toml` beside the list:
 
 ```toml
 [mirror]
@@ -54,111 +81,112 @@ exclude-newer = "7 days"
 
 [sync]
 from = "https://pypi.org"
-to = "http://airgapped:8080"
-package-concurrency = 8
+to = "https://pypi.internal"
+admin-user = "admin"
+advisory-feed = "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip"
 ```
 
-Run it:
+Preview the transfer, then run it:
 
 ```bash
-export PYPIRON_SYNC_ADMIN_PASS="$ADMIN"
+export PYPIRON_SYNC_ADMIN_PASS='change-this-password'
 pypiron sync --config pypiron.toml --dry-run
 pypiron sync --config pypiron.toml
 ```
 
-`PYPIRON_SYNC_ADMIN_PASS` is the serving host's admin password: sync delivers
-over HTTP like any other publisher, so this setup needs a network path from
-the connected host to the serving host — put TLS in front or keep it on a
-locked-down transfer network. Re-running sync is normal — existing files stay.
-Yanks, removals, and project status follow upstream.
+The password belongs to the offline destination. Use TLS or a private transfer
+network. Re-run the same command on a schedule to add new approved releases,
+apply upstream yanks, and refresh the advisory feed.
 
-## No network path at all? Carry it on media
-
-When nothing may cross the boundary but scanned media, sync into a staging
-server on the connected side and carry the storage itself:
+Confirm an install from inside the offline network:
 
 ```bash
-# connected side: a throwaway staging server on local disk
-PYPIRON_DATA_DIR=/srv/staging PYPIRON_ADMIN_PASS="$ADMIN" pypiron serve &
-pypiron sync --config pypiron.toml --to http://localhost:8080
-kill %1 && wait          # stop the staging server: tar a tree at rest
-
-tar -C /srv/staging -cf mirror.tar . && sha256sum mirror.tar > mirror.tar.sha256
+uv venv verify-install
+uv pip install --python verify-install/bin/python \
+  --default-index https://pypi.internal/simple/ six==1.17.0
 ```
 
-Carry both files across. On the serving host, with the server stopped,
-replace the tree — never untar over the old one, or upstream removals and
-yanks can't follow through on this path:
+<a id="no-network-path-at-all-carry-it-on-media"></a>
+
+## Transfer on removable media
+
+On the connected host, start a staging server in one terminal:
 
 ```bash
-sha256sum -c mirror.tar.sha256
-mkdir /var/lib/pypiron.new && tar -C /var/lib/pypiron.new -xf mirror.tar
-PYPIRON_DATA_DIR=/var/lib/pypiron.new pypiron verify-index --deep
-mv /var/lib/pypiron /var/lib/pypiron.old && mv /var/lib/pypiron.new /var/lib/pypiron
+export ADMIN='temporary-password'
+STAGING="$PWD/pypiron-staging-$(date +%Y%m%d-%H%M%S)"
+
+test ! -e "$STAGING" &&
+  mkdir "$STAGING" &&
+  PYPIRON_DATA_DIR="$STAGING" PYPIRON_ADMIN_PASS="$ADMIN" \
+    pypiron serve --bind-addr 127.0.0.1:8081
 ```
 
-`sha256sum -c` proves the media crossed intact; `verify-index --deep`
-re-hashes every file against what clients will verify and exits 0 on a clean
-tree. On this path the serving host publishes nothing — leave
-`PYPIRON_ADMIN_PASS` unset and it runs read-only, one less open write path
-inside the fence. Clients inside point at it like any index:
-`pip install --index-url http://airgapped:8080/simple/ …` (plain HTTP needs
-pip's `--trusted-host`). Deliver the advisory feed the same way — the
-local-file option below needs no network.
-
-For a full offline copy — no cooldown, yanked files included — set
-`exclude-newer = ""` and `include-yanked = true` in `[mirror]`. That switches
-both safety gates off — a deliberate trade for byte-complete mirrors; keep
-them on unless completeness is the requirement.
-
-## Ferry the advisory feed
-
-The serving host refuses downloads of known malware, but with no internet it
-can't fetch the advisory feed itself — you deliver it. Point sync at the OSV
-export on the connected side and the feed travels with the packages:
+Leave it running. In a second terminal, check readiness and transfer the
+packages:
 
 ```bash
-pypiron sync --to http://airgapped:8080 \
-  --advisory-feed https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip
+export ADMIN='temporary-password'
+curl -fsS http://localhost:8081/ready &&
+PYPIRON_SYNC_ADMIN_USER=admin PYPIRON_SYNC_ADMIN_PASS="$ADMIN" \
+  pypiron sync --config pypiron.toml \
+    --to http://localhost:8081
 ```
 
-When the source is another pypiron instead of public PyPI, add nothing: sync
-relays the source server's own feed alongside the packages by default.
-
-No sync? Point the server's own `--advisory-feed` at a local file and have
-your ferry drop a fresh copy there on whatever schedule it runs:
+When sync finishes, press ++ctrl+c++ in the first terminal. Then build and
+verify the index before creating the archive:
 
 ```bash
-pypiron serve --advisory-feed /var/lib/pypiron/osv-pypi-all.zip
+pypiron rebuild-index --data-dir "$STAGING" &&
+  pypiron verify-index --data-dir "$STAGING" --deep &&
+  tar -C "$STAGING" -cf mirror.tar . &&
+  sha256sum mirror.tar > mirror.tar.sha256
 ```
 
-The file is re-read on the daily refresh cycle
-(`--reconcile-interval-secs`) — time the ferry and the staleness alarm to
-that.
+The config's advisory-feed setting puts the current malware data in the same
+tree. Carry both files across the boundary and scan them according to your
+normal media process.
 
-However the feed arrives, blocking behaves the same. Before the first
-delivery, the block set baked into the binary at release covers the box; the
-ferried feed supersedes it without a restart. An enclave usually wants
-fail-closed on top: set `PYPIRON_MALWARE_BLOCK=true` explicitly and the
-server refuses to start until a live feed is loaded.
+On the offline host, stop pypiron and extract into a new directory:
+
+```bash
+(
+  set -eu
+  sha256sum -c mirror.tar.sha256
+  STAMP=$(date +%Y%m%d-%H%M%S)
+  NEW="/var/lib/pypiron.new-$STAMP"
+  OLD="/var/lib/pypiron.old-$STAMP"
+  test ! -e "$NEW" && test ! -e "$OLD"
+  mkdir "$NEW"
+  tar -C "$NEW" -xf mirror.tar
+  pypiron verify-index --data-dir "$NEW" --deep
+  mv /var/lib/pypiron "$OLD" && mv "$NEW" /var/lib/pypiron
+)
+```
+
+The swap runs only if the checksum, extraction, and deep verification succeed.
+Start pypiron again, then keep the old directory until clients have installed
+from the replacement. Use new `STAGING`, `NEW`, and `OLD` names for every
+delivery. Never extract over the live directory: removed and yanked files would
+remain.
+
+<a id="ferry-the-advisory-feed"></a>
+
+## Transfer the advisory feed
+
+The examples transfer the OSV advisory feed with the packages. A network sync
+pushes it directly; a media transfer carries it in the data directory. The
+offline server loads the new feed without an internet connection.
+
+Set `PYPIRON_MALWARE_BLOCK=true` on the serving host to refuse startup until a
+delivered feed has loaded. Without that explicit setting, the binary's bundled
+block list protects first boot and the delivered feed replaces it.
 
 ## Keep it fresh
 
-A server with internet access blocks a new advisory minutes after it's
-published. A ferried mirror is only as fresh as its last delivery: with a
-network path, run `pypiron sync` on a cron; over media, run it before each
-transfer day. One run picks up new versions of approved packages and the
-advisory snapshot together. The
-`pypiron_advisory_snapshot_age_seconds` gauge tracks the loaded feed's age.
-Alert when it climbs past your refresh window:
-[Monitoring](../concepts.md#what-it-tells-you).
+Alert on `pypiron_advisory_snapshot_age_seconds`. A networked transfer can run
+from cron; a media transfer is current only as of its last delivery.
 
-## See also
-
-- [Security features](../security.md) — the cooldown, malware blocking, and
-  name protection the serving host enforces.
-- [Configuration → Sync](../reference/configuration.md#sync) — every sync flag
-  and env var.
-- [Survive a region or cloud outage](multi-region.md) — a failover keeps the
-  mirror intact with no upstream to re-fetch from: the synced packages
-  replicate to every bucket.
+See [mirror selection](../reference/configuration.md#mirror-selection) for
+package filters and [security](../security.md) for the cooldown and malware
+behavior.

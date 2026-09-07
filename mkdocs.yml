@@ -1,5 +1,5 @@
 site_name: pypiron
-site_description: An ultra-fast Python package server, written in Rust.
+site_description: Host private Python packages, cache PyPI, and block malware. Fast, self-hosted, and built for cloud storage.
 site_author: Blackthorn Interstellar
 site_url: https://pypiron.com/
 copyright: 'Copyright &copy; 2025 Blackthorn Interstellar &middot; <a href="/privacy/">Privacy</a> &middot; <a href="/for-agents/">For LLMs</a>'
@@ -99,7 +99,8 @@ plugins:
           - index.md
         Core concepts:
           - concepts.md
-        Deploy guides:
+        Guides:
+          - guides/publish-install.md
           - guides/standard-cloud.md
           - guides/air-gapped.md
           - guides/multi-region.md
@@ -121,7 +122,8 @@ plugins:
 nav:
   - Overview: index.md
   - Core concepts: concepts.md
-  - Deploy guides:
+  - Guides:
+      - Publish and install packages: guides/publish-install.md
       - Standard cloud deploy: guides/standard-cloud.md
       - Air-gapped deploy: guides/air-gapped.md
       - Multi-region & multi-cloud: guides/multi-region.md

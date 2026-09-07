@@ -1,232 +1,143 @@
 ---
-description: A region or a whole cloud goes down; installs and uploads keep working, and you do nothing. Setup is one bucket list and a load balancer.
+description: Keep installs and uploads available through a region or cloud outage with replicated object-storage buckets.
 ---
 
 # Survive a region or cloud outage
 
-A region goes down — or a whole cloud — and installs keep working. Uploads keep
-working. You do nothing: every node fails over by itself within seconds, with no
-promotion command and no DNS changes. Any one bucket can serve the whole index:
-pypiron acknowledges an upload only after every reachable bucket holds the
-file, and a bucket that was down catches up when it returns. Label the buckets
-by region and nodes read from their own region day to day — in-region latency,
-no cross-region egress.
+Multi-region pypiron requires object storage. Every node uses the same ordered
+bucket list. When one bucket fails, nodes use another and repair the failed
+bucket after it returns.
 
-## The whole setup
+## Set up the regions
 
-One bucket per region. One or more nodes per region. The **same ordered bucket
-list** on every node — order is preference, and each node reads from the first
-healthy bucket.
-
-The same `pypiron.toml` in every region:
-
-```toml
-[serve]
-bind-addr = "0.0.0.0:8080"
-buckets = ["s3://iron-a@us-east-1", "s3://iron-b@eu-west-1"]
-```
-
-Or one environment variable, again identical everywhere:
-
-```bash
-export PYPIRON_BUCKETS=s3://iron-a@us-east-1,s3://iron-b@eu-west-1
-```
-
-In front of the nodes, a health-checked load balancer or failover DNS keyed on
-`/ready`. Every region can serve the full index; the front door only picks
-which region a client reaches. `/ready` reports `503` on a node that can no
-longer serve reads — and during a graceful shutdown, so the front door pulls
-the node before it stops accepting.
-
-## What survives
-
-- **A region outage.** A node that sees three straight failures on a bucket
-  switches to the next healthy one within seconds. Every bucket already holds
-  every file, so no catch-up.
-- **A whole cloud outage**, when the buckets span two clouds
-  ([below](#span-two-clouds)).
-- **Every acknowledged upload.** A publish returns `200` only once the file is
-  on every reachable bucket — two buckets, two copies, before the client hears
-  success. If one bucket was down, pypiron copies the file over when it
-  returns.
-- **Your mirror.** Packages you pulled in with `sync --to` replicate
-  exactly like your own uploads, so every bucket holds the whole mirror.
-  Packages fetched on demand from public PyPI (the proxy cache) spread too:
-  the bucket that got it serves the fetch immediately, and the copy to
-  the other buckets happens in the background, within minutes. Nothing you
-  serve stays pinned to a single bucket.
-- **Deletes.** A deleted filename never comes back, even if a bucket was
-  unreachable when you deleted it.
-
-## What happens without you
-
-1. A bucket starts failing. After three straight failures, each node stops
-   using it and serves from the next one in the list.
-2. `/ready` turns `503` on nodes that can no longer reach any bucket, and your
-   load balancer routes clients to a surviving region. Installs continue.
-3. Uploads keep succeeding on the remaining buckets, and pypiron queues a
-   repair for the one that is down.
-4. When the bucket recovers, the repairs drain right away, with
-   a periodic sweep as a backstop and a full comparison daily and at boot.
-   Nodes return to a more-preferred bucket only after five minutes of
-   continuous health, so a flapping region does not bounce traffic back and
-   forth.
-
-Timeouts, connection failures, and `5xx` responses count as an outage.
-Credential, permission, KMS, quota, and configuration errors do not — they
-raise alarms instead, so a misconfigured node cannot flee a healthy region.
-
-## Span two clouds
-
-Losing all of AWS — or all of Google — becomes one more bucket going away. Mix
-backends in the list:
-
-```toml
-buckets = ["s3://iron-a@us-east-1", "gs://iron-b"]
-```
-
-Each bucket authenticates with its own cloud's credentials. Cross-cloud
-replication pays egress on upload — cents a gigabyte, noise at real publish
-rates.
-
-## Reads stay in their region
-
-Installs pull bytes from nearby, and day-to-day cross-region egress drops to
-zero. The region label is the only new configuration, identical on every node:
-
-```toml
-buckets = ["s3://iron-east@us-east-1", "s3://iron-west@us-west-2"]
-```
-
-Each node detects its own region at boot from its cloud's instance metadata
-(AWS, GCP, Azure) and serves reads — index pages and downloads — from the
-matching bucket. Writes don't change: every upload still lands on the preferred
-bucket and fans out to the rest before the client hears `200`. Your own uploads
-and your `sync --to` mirror both live in every region's bucket, so a local
-install of either pulls bytes from nearby and pays no cross-region egress. (A
-fresh on-demand proxy fill is the exception until its background copy lands,
-within minutes.)
-
-A node that detects no region, or matches no labeled bucket, reads from the
-preferred bucket exactly as before. On-prem or MinIO fleets have no metadata to
-read — name the region yourself:
-
-```bash
-export PYPIRON_NODE_REGION=dc-east
-```
-
-A wrong region only ever costs latency, never correctness: when in doubt, a
-node reads from the preferred bucket.
-
-**A local read never returns less than the preferred bucket would.**
-
-- An accepted file never 404s. If a new release hasn't reached the local bucket
-  yet, the node reads through to the preferred bucket and serves it.
-- A brand-new package installs everywhere the moment it's published — the same
-  read-through covers its first release.
-- A private name never falls through to the public proxy. The preferred bucket
-  decides whether a name is yours, so a lagging local bucket can't
-  serve a public package in a private name's place.
-- A new release of an existing package can take a few seconds to appear in a
-  remote region's index. The file installs the whole time; only the listing
-  lags.
-- A yank or delete can stay visible in a region whose bucket missed it until
-  the repair sweep drains it — the same window as a failed-over node, five
-  minutes by default.
-
-Reads leave a region's bucket on the same repeated-failure streak that moves a
-write — within seconds — and fall back to the preferred bucket. They return
-only after it's healthy again *and* holds every accepted file, so a recovering
-bucket never serves a stale read.
-
-## Operating rules
-
-**Restore every bucket together.** Rolling one bucket back to an older snapshot
-resurrects packages and reserved names you had deleted — pypiron trusts what
-the buckets hold now. Version them as a set (bucket versioning, or a
-coordinated snapshot) and restore them as a set.
-
-**Change the list with stop-migrate-restart.** pypiron stamps the list into
-every bucket, and a node refuses a different one. To add, remove, replace, or
-reorder:
-
-1. Stop the fleet.
-2. Run the migration once with the new complete list:
-
-    ```bash
-    PYPIRON_BUCKETS=s3://iron-a@us-east-1,gs://iron-b \
-      pypiron buckets migrate
-    ```
-
-3. Start every node with that same list.
-
-**Adding a bucket backfills itself before it serves.** A fresh bucket starts
-empty, so its region's reads keep coming from the preferred bucket until the files
-have copied over — you never serve a half-filled index. Once every file has
-replicated, that region's reads move to the local bucket automatically. Seed a
-very large package set yourself first (`aws s3 sync`, `rclone`) and the copy step
-becomes a quick verify.
-
-**Removing a bucket refuses to lose data.** Migration will not drop a bucket
-that holds the fleet's only copy of a file — it names examples and stops. Add
-the replacement, let replication finish (so the content lives elsewhere),
-then remove the old bucket. To drop it anyway and *discard that content*, pass
-`--force`.
-
-Migration also refuses while any bucket has pending repairs, and a bucket you
-remove must be reachable — it will not drop one it cannot inspect. Bring it
-back, let it drain, retry. Shrinking to a single bucket needs no migration:
-stop the fleet and restart with that one bucket.
-
-Never run two nodes with different lists.
-
-## Upload collisions
-
-Two uploads of **different bytes under the same filename** both succeed
-only if they hit different buckets during a partition; otherwise the second
-fails, exactly as with one bucket. pypiron keeps the earliest, quarantines
-the other (both, if the arrival times are too close to call), deletes nothing,
-and increments `pypiron_replication_freezes_total`. Alert on it. Resolve by
-publishing under a new filename.
-
-## Private names during a partition
-
-A brand-new private name can exist on one side of a long partition before its
-reservation reaches the other side. If you also proxy public PyPI, reserve the
-namespace on every node:
+Create one bucket per region, then save the same `pypiron.toml` on every node:
 
 ```toml
 private-prefix = "acme"
 
 [serve]
-buckets = ["s3://iron-a@us-east-1", "s3://iron-b@eu-west-1"]
+bind-addr = "0.0.0.0:8080"
+buckets = ["s3://iron-east@us-east-1", "s3://iron-west@us-west-2"]
 proxy-upstream = "https://pypi.org"
 ```
 
-`acme` and `acme-*` are private everywhere, and the proxy never fills those
-names from public PyPI. If your private names share no prefix, deny each exact
-name in the `[mirror]` rules instead.
+Each node needs credentials for every bucket. Start nodes as described in
+[Deploy on cloud storage](standard-cloud.md).
 
-Public packages fetched **on demand through the proxy** spread across buckets
-too, in the background — pypiron serves them the instant they land, and the copy
-to the other buckets follows within minutes (a lag you never see on the
-download path). Once the copy lands, the zero-cross-region-egress promise covers
-everything: a surviving bucket serves proxied packages, mirrored packages, and
-your own uploads alike. Deleting a proxy-cached file by hand fails when
-you run more than one bucket — the entry replicates like everything else now,
-and it stays re-fillable from upstream rather than marked deleted everywhere.
+Put a load balancer in front of them:
+
+- Send readiness checks to `/ready`.
+- Send process-liveness checks to `/health`.
+- Route clients to the nearest healthy region.
+
+`/ready` returns `503` only when a node cannot serve reads or is shutting down.
+`/health` stays `200` while the process is alive, including during a storage
+outage.
+
+## What survives
+
+- pypiron starts private uploads and packages copied by `sync` against every
+  bucket before returning success. If one cannot finish within the write grace
+  period, pypiron records durable repair work and returns after the surviving
+  write.
+- Public packages fetched through the on-demand proxy are served immediately;
+  their other copies are made in the background.
+- Yanks, deletes, package ownership, and the advisory feed also propagate.
+
+A node leaves a bucket after three consecutive connection, timeout, or `5xx`
+failures. Permission, credential, KMS, quota, and configuration errors raise
+alarms instead of triggering failover.
+
+When a bucket returns, repairs start immediately, with a periodic sweep as a
+backstop. A node waits five healthy minutes before preferring the recovered
+bucket again.
+
+## Span two clouds
+
+Bucket schemes may be mixed:
+
+```toml
+buckets = ["s3://iron-east@us-east-1", "gs://iron-west@us-west1"]
+```
+
+Each backend uses its own credentials. Upload replication between cloud
+providers incurs network egress charges.
+
+## Reads stay in their region
+
+The `@region` suffix labels each bucket. AWS, GCP, and Azure nodes detect their
+region at startup and read from a matching healthy bucket. For on-premises or
+custom object storage, set it explicitly:
+
+```bash
+export PYPIRON_NODE_REGION=dc-east
+```
+
+If no label matches, the node reads from the first healthy bucket. A local
+bucket missing a newly accepted file reads through to a complete bucket instead
+of returning `404`.
+
+## Operating rules
+
+### Keep the list identical
+
+Order is part of the topology. A node with a different list or order refuses to
+start.
+
+### Change the list with stop, migrate, restart
+
+To add, remove, replace, or reorder a bucket:
+
+1. Stop every node.
+2. Run one migration with the new complete list.
+3. Restart every node with that same list.
+
+```bash
+PYPIRON_BUCKETS=s3://iron-east@us-east-1,gs://iron-west@us-west1 \
+  pypiron buckets migrate --config /etc/pypiron/pypiron.toml
+```
+
+Use the same config and cloud credentials as the stopped nodes. The environment
+variable replaces only the old bucket list; storage prefixes, endpoints, and
+backend account settings still come from the config.
+
+A new empty bucket stays out of regional reads until its backfill completes.
+Migration refuses to remove a bucket that is unreachable, has pending repairs,
+or contains the only copy of a file. Add its replacement, let backfill finish,
+then remove the old bucket. `--force` accepts loss of unique content.
+
+To evacuate temporarily to one surviving bucket, stop the fleet and restart it
+with that single bucket. Returning to a multi-bucket list requires the migration
+sequence above.
+
+### Restore buckets as a set
+
+Restoring only one bucket from an older snapshot can bring back files or names
+deleted later. Restore every bucket to the same point in time.
+
+## Upload collisions
+
+During a partition, two different files can reach different buckets under the
+same filename. pypiron keeps the earlier one when it can determine an order and
+quarantines the conflict. Alert on `pypiron_replication_freezes_total` and
+publish the corrected artifact under a new filename.
+
+## Private names during a partition
+
+Set `private-prefix` on every node before enabling the public proxy. This keeps
+an unpublished private name from being claimed from PyPI on the other side of a
+partition. If your private names share no prefix, exclude each exact name from
+the proxy instead.
 
 ## Limits
 
-- Destroying (not just disconnecting) a bucket in the seconds after an upload
-  that could not reach it loses those last writes; re-publish them.
-- Already-issued download links live until their one-hour expiry. A client
-  caught mid-switch may need one install retry.
-- A CDN or a client that already cached bytes can still serve them after
-  pypiron quarantines a collision.
-- A quarantined collision needs a human: publish a new filename to move on.
+- If every bucket is unreachable, `/ready` returns `503` on every node until
+  storage returns.
+- Destroying the only bucket that received an outage-time upload before its
+  queued repair finishes loses that upload.
+- A signed object-storage download URL already issued can work until its
+  one-hour expiry.
+- A client caught during failover may need to retry one install.
 
-Every flag lives in
-[Configuration](../reference/configuration.md#multiple-regions-and-clouds), and
-[multi-bucket metrics](../reference/configuration.md#multi-bucket-metrics)
-covers what to alert on.
+See [multi-bucket configuration](../reference/configuration.md#multiple-regions-and-clouds)
+and [metrics](../reference/configuration.md#multi-bucket-metrics).

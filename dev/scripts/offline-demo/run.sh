@@ -26,7 +26,8 @@ else
   test -d "$work/data/packages"
 fi
 
-container=$(docker create --network "$network" --mount "type=bind,src=$work,dst=/demo" "$image" "$mode")
+container=$(docker create --network "$network" --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=$work,dst=/demo" "$image" "$mode")
 cleanup() {
   result=$?
   trap - EXIT

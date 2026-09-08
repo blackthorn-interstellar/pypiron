@@ -302,16 +302,23 @@ jobs:
       # running today's rules would flag. A new upstream rule turning this red
       # on an unchanged tree is signal to triage, not flake to retry away.
       #
-      # --exclude-rule drops dynamic-urllib-use-detected wholesale. It fires on
-      # every `urllib.request.urlopen(url)` where the URL is not a literal, and
-      # the only Python here that makes HTTP calls is dev/ tooling a maintainer
-      # runs by hand: benchmark drivers hitting a localhost pypiron they just
-      # started, operator scripts taking the endpoint as argv, the soak
+      # The first --exclude-rule drops dynamic-urllib-use-detected wholesale. It
+      # fires on every `urllib.request.urlopen(url)` where the URL is not a
+      # literal, and the only Python here that makes HTTP calls is dev/ tooling
+      # a maintainer runs by hand: benchmark drivers hitting a localhost pypiron
+      # they just started, operator scripts taking the endpoint as argv, the soak
       # reporter's EC2 metadata lookups. No untrusted input reaches any of them,
       # and the shipped server is Rust. 23 findings, all of them the same
       # non-finding — a per-line suppression campaign would just be noise with
       # more places to rot. Accepted repo-wide, deliberately: if Python ever
       # serves a request here, this line has to come back out.
+      #
+      # The second drops a back-compatibility check whose premise is false here:
+      # both pyproject.toml files declare requires-python >=3.11, so
+      # `importlib.resources` always exists and the importlib_resources shim the
+      # rule suggests would be a dependency added for nothing. The rest of the
+      # python37/38/39 compatibility family stays on; if another one fires it
+      # gets excluded here for the same stated reason, not silenced per line.
       #
       # No --error: the scan writes SARIF and exits 0 either way, and the step
       # below is what fails the job. Semgrep's SARIF output says nothing on
@@ -324,6 +331,7 @@ jobs:
             --sarif \
             --output semgrep.sarif \
             --exclude-rule=python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected \
+            --exclude-rule=python.lang.compatibility.python37.python37-compatibility-importlib2 \
             --exclude='target/**' \
             --exclude='.local/**' \
             --exclude='fuzz/corpus/**' \

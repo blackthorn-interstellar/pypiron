@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pypiron-ci-example"
+version = "0.1.0"
+description = "A small package for testing publish and install with pypiron"
+requires-python = ">=3.11"
+dependencies = ["six==1.17.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pypiron_ci_example"]

@@ -120,3 +120,5 @@ for the environment variables and [Core concepts](../concepts.md#who-can-do-what
 for the roles.
 
 Next: [deploy on cloud storage](standard-cloud.md).
+
+For release checks, [test your installed wheel in a temporary registry](test-package.md).

@@ -1,0 +1,8 @@
+**
+!examples/
+!examples/package-ci/
+!examples/package-ci/**
+!dev/
+!dev/scripts/
+!dev/scripts/offline-demo/
+!dev/scripts/offline-demo/inside.sh

@@ -190,3 +190,16 @@ from cron; a media transfer is current only as of its last delivery.
 See [mirror selection](../reference/configuration.md#mirror-selection) for
 package filters and [security](../security.md) for the cooldown and malware
 behavior.
+
+## Watch an offline install
+
+[Watch the 40-second demonstration](../assets/offline-demo.mp4): a private
+wheel and its prepared public dependency install with external networking
+disabled and the client cache empty. A copied data directory passes the same
+check; an unprepared public package fails.
+
+To run the experiment yourself, follow the
+[Docker reproduction](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/OFFLINE_DEMO.md).
+Preparation requires internet access. The demonstration disables advisory-feed
+refresh and uses one Python version and platform; it is not a substitute for
+the deployment and feed-transfer steps above.

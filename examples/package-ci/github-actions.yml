@@ -1,0 +1,25 @@
+# Copy this to .github/workflows/package-smoke.yml in your Python project.
+# Also copy dev/scripts/package-ci.sh and provide a check_installed.py script.
+name: Test the published wheel
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  package-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: 0.12.3
+      - name: Publish locally and test the installed wheel
+        # Replace your-distribution-name with [project].name in pyproject.toml.
+        run: bash dev/scripts/package-ci.sh . your-distribution-name check_installed.py

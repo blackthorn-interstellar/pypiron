@@ -101,6 +101,7 @@ plugins:
           - concepts.md
         Guides:
           - guides/publish-install.md
+          - guides/test-package.md
           - guides/standard-cloud.md
           - guides/air-gapped.md
           - guides/multi-region.md
@@ -124,6 +125,7 @@ nav:
   - Core concepts: concepts.md
   - Guides:
       - Publish and install packages: guides/publish-install.md
+      - Test a package in CI: guides/test-package.md
       - Standard cloud deploy: guides/standard-cloud.md
       - Air-gapped deploy: guides/air-gapped.md
       - Multi-region & multi-cloud: guides/multi-region.md

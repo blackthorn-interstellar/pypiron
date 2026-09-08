@@ -16,6 +16,7 @@ from .helpers import (
     http_get_no_redirect,
     make_wheel,
     upload_legacy,
+    wait_for_file_in_index,
     wait_for_project_in_global,
 )
 
@@ -463,7 +464,9 @@ def test_default_page_skips_prerelease(disk_server, tmp_path):
             username=disk_server["user"],
             password=disk_server["password"],
         )
-        wait_for_project_in_global(disk_server["simple"], "prerelpkg")
+        # The name is already global after the first upload. The version page
+        # checks the package index, so wait for this release's view to land.
+        wait_for_file_in_index(disk_server["simple"], "prerelpkg", wheel.name)
 
     code, body, _ = http_get(f"{disk_server['base_url']}/project/prerelpkg/")
     assert code == 200

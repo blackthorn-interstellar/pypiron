@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Iterator
 
 import pytest
@@ -21,6 +23,7 @@ from .helpers import (
     http_get,
     http_request_auth,
     make_wheel,
+    pause_disk_read,
     sync_to,
     upload_legacy,
     wait_for_file_in_index,
@@ -91,6 +94,73 @@ def _yank_value(idx: dict, filename: str):
         if f["filename"] == filename:
             return f.get("yanked", False)
     return None
+
+
+def test_enabling_legacy_versions_invalidates_the_sync_cursor(source_dest, pypiron_bin, tmp_path):
+    source, dest = source_dest["source"], source_dest["dest"]
+    pkg = "reconcilelegacy"
+    egg = tmp_path / f"{pkg}-1.0.egg"
+    with zipfile.ZipFile(egg, "w") as archive:
+        archive.writestr("EGG-INFO/PKG-INFO", f"Metadata-Version: 1.0\nName: {pkg}\nVersion: 1.0\n")
+    upload_legacy(
+        source["legacy"],
+        egg,
+        fields={"name": pkg, "version": "1.0", "mirror": "true"},
+        **_admin(source),
+    )
+    wait_for_file_in_index(source["simple"], pkg, egg.name)
+    pkg_list = tmp_path / "packages.txt"
+    pkg_list.write_text(f"{pkg}\n")
+
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list)
+    assert rc == 0, out + err
+    assert _dest_filenames(dest, pkg) == []
+    assert pkg in json.loads((dest["data_dir"] / "_sync/cursors.json").read_text())
+
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--allow-legacy-versions")
+    assert rc == 0, out + err
+    assert "upstream unchanged since last sync (304)" not in out + err
+    wait_for_file_in_index(dest["simple"], pkg, egg.name)
+    code, body, _ = http_get(f"{dest['base_url']}/files/{pkg}/{egg.name}")
+    assert code == 200 and body == egg.read_bytes()
+
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--allow-legacy-versions")
+    assert rc == 0, out + err
+    assert "upstream unchanged since last sync (304)" in out + err
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a FIFO to pause a real storage read")
+def test_sync_starts_later_packages_while_an_earlier_package_is_stalled(
+    source_dest, pypiron_bin, tmp_path
+):
+    source, dest = source_dest["source"], source_dest["dest"]
+    packages = ["slotsa", "slotsb", "slotsc"]
+    wheels = {pkg: _seed(source, pkg, "1.0", tmp_path) for pkg in packages}
+    for pkg, wheel in wheels.items():
+        wait_for_file_in_index(source["simple"], pkg, wheel.name)
+    # Let the source's one-second index cache expire before pausing its GET.
+    time.sleep(1.1)
+    pkg_list = tmp_path / "packages.txt"
+    # A source 404 must not cancel the other jobs or acquire a success cursor.
+    pkg_list.write_text("\n".join([*packages, "slotsmissing"]) + "\n")
+    index = source["data_dir"] / "simple" / packages[0] / "index.json"
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with pause_disk_read(index) as wait_for_reader:
+            result = pool.submit(
+                _run_sync, pypiron_bin, source, dest, pkg_list, "--package-concurrency", "2"
+            )
+            wait_for_reader()
+            wait_for_file_in_index(
+                dest["simple"], packages[2], wheels[packages[2]].name, timeout=10
+            )
+            assert not result.done(), "the first package must still be stalled"
+        rc, out, err = result.result(timeout=30)
+    assert rc != 0 and "slotsmissing" in out + err
+    cursors = json.loads((dest["data_dir"] / "_sync/cursors.json").read_text())
+    assert set(cursors) == set(packages)
+    for pkg, wheel in wheels.items():
+        stored = dest["data_dir"] / "packages" / pkg / wheel.name
+        assert stored.read_bytes() == wheel.read_bytes()
 
 
 def _wait_yank(simple_url: str, pkg: str, filename: str, expected, *, timeout: float = 30.0):

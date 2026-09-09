@@ -5,16 +5,20 @@ when a read credential is configured."""
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from .conftest import _start_disk_server
 from .helpers import (
     _encode_basic_auth,
     http_get,
     http_get_no_redirect,
     make_wheel,
+    pause_disk_read,
     upload_legacy,
     wait_for_file_in_index,
     wait_for_project_in_global,
@@ -397,6 +401,44 @@ def test_project_page_reflects_new_upload_after_caching(disk_server, tmp_path):
     assert 'href="/files/cachepkg/cachepkg-2.0.0-py3-none-any.whl"' in latest, (
         "the cached /project/ page never reflected the 2.0.0 upload"
     )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a FIFO to pause a real storage read")
+def test_old_project_render_cannot_replace_a_page_after_upload(
+    tmp_path_factory, pypiron_bin, tmp_path
+):
+    server_gen = _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=("--index-cache-ttl-secs", "3600", "--audit-on-boot", "false"),
+    )
+    server = next(server_gen)
+    try:
+        pkg = "renderinvalidation"
+        creds = {"username": server["user"], "password": server["password"]}
+        v1 = make_wheel(pkg, "1.0.0", tmp_path)
+        upload_legacy(server["legacy"], v1, **creds)
+        wait_for_file_in_index(server["simple"], pkg, v1.name)
+        page = f"{server['base_url']}/project/{pkg}/"
+        status = server["data_dir"] / "packages" / pkg / ".project-status.json"
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            # Status is read after the file listing. Hold that read so the old
+            # render retains v1 while the upload invalidates its cache claim.
+            with pause_disk_read(status, b'{"status":"active"}') as wait_for_reader:
+                old_request = pool.submit(http_get, page, timeout=30)
+                wait_for_reader()
+                v2 = make_wheel(pkg, "2.0.0", tmp_path)
+                upload_legacy(server["legacy"], v2, **creds)
+                wait_for_file_in_index(server["simple"], pkg, v2.name)
+                code, fresh, _ = http_get(page)
+                assert code == 200 and v2.name.encode() in fresh
+            code, old, _ = old_request.result(timeout=15)
+            assert code == 200 and v1.name.encode() in old
+            assert v2.name.encode() not in old, "the old render was not paused after its listing"
+        code, cached, _ = http_get(page)
+        assert code == 200 and cached == fresh, "late render replaced the newly cached page"
+    finally:
+        server_gen.close()
 
 
 def test_project_page_fills_request_host_from_shared_cache(disk_server, tmp_path):

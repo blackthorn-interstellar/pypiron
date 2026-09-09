@@ -125,7 +125,7 @@ pub async fn verify_storage(
     }
 
     live_packages.sort();
-    check_global(storage, &live_packages, &mut divergences).await;
+    check_global(storage, &live_packages, &mut divergences).await?;
     Ok(VerifyReport {
         packages: package_count,
         files: file_count,
@@ -516,11 +516,14 @@ async fn stored_sha256(storage: &dyn Storage, key: &str, expected: u64) -> Resul
 }
 
 /// The global index must list exactly the packages that have artifacts.
-async fn check_global(storage: &dyn Storage, live: &[String], divs: &mut Vec<Divergence>) {
-    let live_owned: Vec<String> = live.to_vec();
+async fn check_global(
+    storage: &dyn Storage,
+    live: &[String],
+    divs: &mut Vec<Divergence>,
+) -> Result<()> {
     for (suffix, expected) in [
-        ("index.html", pep503_global_html(&live_owned)),
-        ("index.json", pep691_global_json(&live_owned)),
+        ("index.html", pep503_global_html(live)),
+        ("index.json", pep691_global_json(live)),
     ] {
         match storage.get_bytes(&format!("{SIMPLE_PREFIX}{suffix}")).await {
             Ok(actual) if actual == expected.as_bytes() => {}
@@ -534,14 +537,16 @@ async fn check_global(storage: &dyn Storage, live: &[String], divs: &mut Vec<Div
             }),
             // Never-materialized is only fine when there is nothing to list:
             // a fresh data dir no server has booted yet.
-            Err(_) if live.is_empty() => {}
-            Err(_) => divs.push(Divergence {
+            Err(e) if is_not_found(&e) && live.is_empty() => {}
+            Err(e) if is_not_found(&e) => divs.push(Divergence {
                 kind: "missing-global-index",
                 package: String::new(),
                 detail: suffix.to_string(),
             }),
+            Err(e) => return Err(e),
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

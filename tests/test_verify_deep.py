@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from .helpers import make_wheel, upload_legacy, wait_for_file_in_index
+from .helpers import kill_process_tree, make_wheel, upload_legacy, wait_for_file_in_index
 
 pytestmark = pytest.mark.integration
 
@@ -100,3 +100,31 @@ def test_an_untouched_store_verifies_deep_clean(
     _upload_one(disk_server, tmp_path, "3.0")
     deep = _verify(pypiron_bin, disk_server["data_dir"], "--deep")
     assert deep.returncode == 0, f"{deep.stdout}{deep.stderr}"
+
+
+@pytest.mark.parametrize("has_package", [False, True])
+@pytest.mark.parametrize("suffix", ["index.html", "index.json"])
+@pytest.mark.parametrize("unreadable", [False, True])
+def test_global_index_read_errors_are_distinct_from_missing_views(
+    disk_server, pypiron_bin, tmp_path, has_package, suffix, unreadable
+):
+    if has_package:
+        _upload_one(disk_server, tmp_path, "4.0")
+    # Stop the worker so it cannot repair the deliberately broken view.
+    kill_process_tree(disk_server["proc"])
+    index = disk_server["data_dir"] / "simple" / suffix
+    index.unlink(missing_ok=True)
+    if unreadable:
+        # A directory at the index path deterministically fails GET without
+        # requiring root-sensitive permission bits or a cloud fault injector.
+        index.mkdir()
+    result = _verify(pypiron_bin, disk_server["data_dir"])
+    expected = 2 if unreadable else int(has_package)
+    assert result.returncode == expected, f"{result.stdout}{result.stderr}"
+    if unreadable:
+        assert f"simple/{suffix}" in result.stderr
+        assert "verify:" not in result.stdout
+    elif has_package:
+        assert "missing-global-index" in result.stdout
+    else:
+        assert "0 divergence(s)" in result.stdout

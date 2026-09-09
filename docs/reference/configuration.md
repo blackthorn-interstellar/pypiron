@@ -240,7 +240,7 @@ backends are supported. With more than one bucket:
 | `--counters-flush-interval-secs N` | `PYPIRON_COUNTERS_FLUSH_INTERVAL_SECS` | `300` | Counter flush cadence. |
 | `--counters-rollup-interval-secs N` | `PYPIRON_COUNTERS_ROLLUP_INTERVAL_SECS` | `3600` | Finished-day compaction cadence. |
 | `--counters-retention-days N` | `PYPIRON_COUNTERS_RETENTION_DAYS` | `90` | Counter retention. |
-| `--index-cache-ttl-secs N` | `PYPIRON_INDEX_CACHE_TTL_SECS` | `1` | Staleness bound on the in-memory index/page caches. Only matters multi-node — a node's own writes invalidate its caches exactly; the TTL bounds how long another node's write can go unseen. Single-node deployments can raise it freely. |
+| `--index-cache-ttl-secs N` | `PYPIRON_INDEX_CACHE_TTL_SECS` | `1` | Refresh interval for in-memory index/page caches. Local rebuilds clear cached entries. An index read already in progress can restore older results for another TTL, even on a single node; keep this short when new releases must appear promptly. |
 | `--token-signing-key KEY` | `PYPIRON_TOKEN_SIGNING_KEY` | none | Enables 5-minute install tokens. |
 
 No write credential means read-only. No read credential means installs are open
@@ -353,7 +353,7 @@ than 0.0.17. Use the next release when available, or run
 | `--private-patterns-from FILE` | `PYPIRON_PRIVATE_PATTERNS_FROM` | none | Read pypicloud private-name patterns from a file, one per line. Blank lines and `#` comments are ignored; also `[sync].private-patterns-from`. |
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | relay from `--from` | Deliver an advisory snapshot to the destination. A URL or path overrides the source feed; `""` disables. Failure warns but does not stop package sync. Also `[sync].advisory-feed`. |
 | `--concurrency N` | `PYPIRON_SYNC_CONCURRENCY` | `4` | Transfers within one package. |
-| `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8` | Packages in parallel. |
+| `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8` | Maximum packages in parallel. Each completed package frees a slot for the next, even while another package is stalled. |
 | `--spool-dir PATH` | `PYPIRON_SYNC_SPOOL_DIR` | system temp | Download spool directory. |
 | `--dry-run` | `PYPIRON_SYNC_DRY_RUN` | `false` | Print work, write nothing. |
 | `--full` | `PYPIRON_SYNC_FULL` | `false` | Ignore cursors and reconcile every selected project. |
@@ -361,7 +361,8 @@ than 0.0.17. Use the next release when available, or run
 | `--allow-legacy-versions` | `PYPIRON_ALLOW_LEGACY_VERSIONS` | `false` | Mirror files without an inferable PEP 440 version. Otherwise they are logged and skipped. Applies in sync, because the destination accepts mirror uploads. Also `[sync].allow-legacy-versions`. |
 
 Re-running sync is normal. Existing files stay; yanks, removals, and project
-status reconcile from upstream.
+status reconcile from upstream. Changing file-selection settings, including
+`--allow-legacy-versions`, takes effect on the next run without `--full`.
 
 ## Install tokens
 
@@ -399,8 +400,9 @@ Maintenance commands use the same storage flags and `[serve]` configuration as
 the server.
 
 `verify-index` compares indexes with stored files and checks recorded sizes.
-`--deep` also hashes every artifact, which reads the full corpus. Mismatches exit
-`1`.
+`--deep` also hashes every artifact, which reads the full corpus. A clean check
+exits `0`; mismatches exit `1`. Storage read failures exit `2`: the check could
+not complete, so no clean verdict is reported.
 
 `verify-chain` checks the `_transparency/` records against storage. Changed or
 missing content exits `1`. A filename recorded under two hashes is reported as
@@ -463,3 +465,6 @@ pending repairs, not bytes.
 | `/files/.../yank` | admin | Yank a file. |
 | `DELETE /files/<pkg>/<file>` | admin | Delete a file. Refused for mirrored files — anything that came from an upstream, cached on demand or pulled by `sync` — when you run more than one bucket. |
 | `/project/<pkg>/status` | admin | Set project status. |
+
+File deletion returns `204` after the artifact is removed. A failed storage
+delete returns `500`; correct the storage problem and retry.

@@ -41,6 +41,7 @@ use tokio::fs;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{self, ConfigFile, UpstreamConfig};
+use crate::denylist::Denylist;
 use crate::names::{
     checked_pkg_name, infer_version_from_filename, matches_prefix, normalize_pkg_name,
     parse_wheel_tags, WheelTags,
@@ -994,6 +995,7 @@ struct Resolved {
     /// [`select_from_index`] skips them; see the flag on [`SyncArgs`].
     allow_legacy_versions: bool,
     mirror: ResolvedMirror,
+    denylist: Denylist,
     /// The raw `--exclude-older` input (e.g. `"800 days"`), kept verbatim for
     /// [`config_key`]: a relative duration must hash to a value that is *stable*
     /// across runs, or the sync cursor never matches its own prior config and
@@ -1168,6 +1170,7 @@ impl Resolved {
             // run without the flag.
             allow_legacy_versions: args.allow_legacy_versions
                 || sync.allow_legacy_versions.unwrap_or(false),
+            denylist: Denylist::from_specs(&mirror.exclude_packages),
             mirror,
             exclude_older_raw,
             exclude_newer_raw,
@@ -1496,22 +1499,6 @@ pub(crate) fn spec_matches_filename(specifiers: &VersionSpecifiers, filename: &s
         .is_some_and(|v| specifiers.contains(&v))
 }
 
-fn package_fully_denied(exclude_packages: &[PackageSpec], pkg: &str) -> bool {
-    exclude_packages
-        .iter()
-        .any(|spec| spec.name == pkg && spec.specifiers.is_none())
-}
-
-fn package_file_denied(exclude_packages: &[PackageSpec], pkg: &str, filename: &str) -> bool {
-    exclude_packages
-        .iter()
-        .filter(|spec| spec.name == pkg)
-        .any(|spec| match &spec.specifiers {
-            None => true,
-            Some(specifiers) => spec_matches_filename(specifiers, filename),
-        })
-}
-
 /// A file selected for mirroring. `version` is inferred from the filename (the
 /// Simple API doesn't bind files to versions); `None` means it wasn't parseable.
 struct Selected {
@@ -1613,6 +1600,7 @@ fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
         u8::from(m.exclude_windows),
         u8::from(m.exclude_prereleases),
         u8::from(m.exclude_yanked),
+        u8::from(resolved.allow_legacy_versions),
     ]);
     if let Some((maj, min)) = m.exclude_python_below {
         h.update(maj.to_le_bytes());
@@ -2219,30 +2207,28 @@ pub async fn run_sync(args: SyncArgs, config_path: Option<PathBuf>) -> Result<()
     // --full, or any read error) simply means every project full-fetches.
     let cursors = load_cursors(&client, &resolved).await;
 
-    // Packages in parallel (chunked join_all — same pattern as the worker
-    // sweep), files within each package in parallel below. The long tail of a
-    // mirror is small packages, so serial-per-package was the throughput cap.
+    // Keep the package slots occupied as each finishes; a slow package must
+    // not prevent later packages from starting. File concurrency stays bounded
+    // independently within each package.
     let progress = Arc::new(Progress::new(resolved.mirror.include_packages.len()));
     let ticker = (!args.no_progress).then(|| spawn_progress(progress.clone()));
     let mut failures = 0usize;
     let mut refreshed: Cursors = Cursors::new();
-    for chunk in resolved
-        .mirror
-        .include_packages
-        .chunks(resolved.package_concurrency)
     {
-        let results = futures::future::join_all(chunk.iter().map(|spec| {
-            sync_one_package(
-                &client,
-                &resolved,
-                &endpoint,
-                spec,
-                cursors.get(&spec.name),
-                &progress,
-            )
-        }))
-        .await;
-        for (spec, result) in chunk.iter().zip(results) {
+        let mut packages = stream::iter(&resolved.mirror.include_packages)
+            .map(|spec| {
+                let job = sync_one_package(
+                    &client,
+                    &resolved,
+                    &endpoint,
+                    spec,
+                    cursors.get(&spec.name),
+                    &progress,
+                );
+                async move { (spec, job.await) }
+            })
+            .buffer_unordered(resolved.package_concurrency);
+        while let Some((spec, result)) = packages.next().await {
             progress.package_done();
             match result {
                 Ok(outcome) => {
@@ -2304,7 +2290,7 @@ async fn sync_one_package(
             bail!("'{pkg}' is inside the private namespace '{prefix}'; refusing to mirror");
         }
     }
-    if package_fully_denied(&resolved.mirror.exclude_packages, pkg) {
+    if resolved.denylist.name_fully_denied(pkg) {
         info!("{pkg}: excluded by mirror package denylist");
         return Ok(PackageOutcome { new_cursor: None });
     }
@@ -2820,11 +2806,7 @@ fn select_from_index(
                 continue;
             }
         }
-        if package_file_denied(
-            &resolved.mirror.exclude_packages,
-            &spec.name,
-            &file.filename,
-        ) {
+        if resolved.denylist.file_denied(&spec.name, &file.filename) {
             continue;
         }
         if matches_mirror(&file, &resolved.mirror) {
@@ -4291,6 +4273,7 @@ mod tests {
             dry_run: false,
             full: false,
             allow_legacy_versions: false,
+            denylist: Denylist::from_specs(&filter.exclude_packages),
             mirror: filter,
             exclude_older_raw: None,
             exclude_newer_raw: None,
@@ -4361,6 +4344,10 @@ mod tests {
         let mut as_private = resolved_with(time_filter(None, None), "https://pypi.org");
         as_private.as_private = true;
         assert_ne!(k, config_key(&as_private, &s));
+
+        let mut legacy = resolved_with(time_filter(None, None), "https://pypi.org");
+        legacy.allow_legacy_versions = true;
+        assert_ne!(k, config_key(&legacy, &s));
 
         // Each new filter axis invalidates the cursor key too.
         let with = |mutate: fn(&mut ResolvedMirror)| {

@@ -227,7 +227,7 @@ async fn render_project(
     // per TTL, not one per request. The claim rides along to the `put` below and
     // releases when it drops (at the put, or on any early return here), so an
     // aborted render can't strand the key as forever-refilling.
-    let _render_claim = match state.project_cache.get(&cache_key, generation) {
+    let render_claim = match state.project_cache.get(&cache_key, generation) {
         project_cache::Lookup::Fresh(cached) | project_cache::Lookup::Stale(cached) => {
             return serve_project_page(cached, headers);
         }
@@ -389,7 +389,7 @@ async fn render_project(
         &advisory_panel,
     );
     let body = bytes::Bytes::from(html);
-    state.project_cache.put(cache_key, body.clone(), generation);
+    state.project_cache.put(body.clone(), render_claim);
     serve_project_page(body, headers)
 }
 

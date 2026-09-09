@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import time
 import uuid
 import zipfile
 import zlib
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -37,6 +39,57 @@ CLIENT_PINS = {
     "hatch": "1.17.0",
     "pipenv": "2026.5.2",
 }
+
+
+@contextmanager
+def pause_disk_read(path: Path, response: Optional[bytes] = None):
+    """Pause one real server read with a FIFO; yield a reader-arrival barrier.
+
+    Call the barrier after starting the request. It restores the original path
+    for other requests while the first reader stays paused until context exit.
+    POSIX only; callers skip on other platforms.
+    """
+    original = path.read_bytes() if path.exists() else None
+    if response is None:
+        response = original or b""
+    path.unlink(missing_ok=True)
+    os.mkfifo(path)
+    writer = None
+    restored = False
+
+    def restore():
+        nonlocal restored
+        path.unlink()
+        if original is not None:
+            path.write_bytes(original)
+        restored = True
+
+    def wait_for_reader():
+        nonlocal writer
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                writer = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                if error.errno != errno.ENXIO:
+                    raise
+                time.sleep(0.01)
+            else:
+                restore()
+                return
+        raise TimeoutError(f"server never read {path}")
+
+    try:
+        yield wait_for_reader
+    finally:
+        # Also release a reader blocked in open() if the barrier timed out.
+        if writer is None:
+            writer = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        if not restored:
+            restore()
+        with os.fdopen(writer, "wb") as pipe:
+            os.set_blocking(pipe.fileno(), True)
+            pipe.write(response)
 
 
 def module_name(package: str) -> str:

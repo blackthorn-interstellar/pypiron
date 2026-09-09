@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 import pytest
@@ -13,6 +14,7 @@ from .helpers import (
     http_get,
     http_get_json,
     http_request_auth,
+    make_wheel,
     run_checked,
     upload_legacy,
     wait_for_file_in_index,
@@ -23,6 +25,38 @@ OLD_VERSION = "1.16.0"
 NEW_VERSION = "1.17.0"
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX directory permissions")
+def test_disk_delete_reports_permission_failure_and_can_retry(disk_server, tmp_path):
+    server = disk_server
+    pkg = "deletepermission"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    creds = {"username": server["user"], "password": server["password"]}
+    # Mirror eviction writes no tombstone in this directory, so the permission
+    # failure reaches artifact deletion, after the index has been rewritten.
+    upload_legacy(server["legacy"], wheel, fields={"mirror": "true"}, **creds)
+    wait_for_file_in_index(server["simple"], pkg, wheel.name)
+    directory = server["data_dir"] / "packages" / pkg
+    stored = directory / wheel.name
+    mode = directory.stat().st_mode
+    url = f"{server['base_url']}/files/{pkg}/{wheel.name}"
+    directory.chmod(0o555)
+    try:
+        if os.access(directory, os.W_OK):
+            pytest.skip("current user can bypass directory write permissions")
+        code, body, _ = http_request_auth("DELETE", url, **creds)
+        assert code == 500, body
+        assert b"artifact delete failed" in body, body
+        assert stored.exists()
+        assert (directory / f"{wheel.name}.meta.json").exists()
+    finally:
+        directory.chmod(mode)
+
+    code, body, _ = http_request_auth("DELETE", url, **creds)
+    assert code == 204, body
+    assert not stored.exists()
+    assert http_get(url)[0] == 404
 
 
 @pytest.fixture()

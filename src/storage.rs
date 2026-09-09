@@ -1069,7 +1069,8 @@ pub trait Storage: Send + Sync {
             .collect())
     }
 
-    /// Delete multiple keys (best-effort).
+    /// Delete multiple keys. Missing objects are already deleted; other errors
+    /// propagate, and earlier keys may have been deleted before a failure.
     async fn delete_keys(&self, keys: &[String]) -> Result<()>;
 
     /// Whether this backend supports conditional writes for leader leases.
@@ -2075,8 +2076,11 @@ impl Storage for DiskStorage {
 
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
         for k in keys {
-            if let Ok(p) = self.resolve(k) {
-                let _ = fs::remove_file(p).await;
+            let p = self.resolve(k)?;
+            match fs::remove_file(p).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(anyhow::Error::from(e).context(format!("delete {k}"))),
             }
         }
         Ok(())

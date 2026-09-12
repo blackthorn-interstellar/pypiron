@@ -869,6 +869,10 @@ def disk_server_uploader_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[D
 
 # ------------------------------ MinIO (S3) fixtures ---------------------------
 
+# Docker Hub unpublished minio/minio (anonymous pull is now 125 / access
+# denied). Quay still serves the last official image; same entry point.
+_MINIO_IMAGE = "quay.io/minio/minio"
+
 
 def _real_s3_config() -> Dict | None:
     """Real-S3 target from the environment, or None to fall back to MinIO.
@@ -951,7 +955,7 @@ def _minio_container() -> Iterator[Dict]:
                 "MINIO_ROOT_USER=minioadmin",
                 "-e",
                 "MINIO_ROOT_PASSWORD=minioadmin",
-                "minio/minio",
+                _MINIO_IMAGE,
                 "server",
                 "/data",
             ]
@@ -1057,7 +1061,7 @@ def _minio_container_alt() -> Iterator[Dict]:
                 "MINIO_ROOT_USER=altadmin",
                 "-e",
                 "MINIO_ROOT_PASSWORD=altsecret123",
-                "minio/minio",
+                _MINIO_IMAGE,
                 "server",
                 "/data",
             ]

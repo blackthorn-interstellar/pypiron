@@ -33,7 +33,7 @@
 # A bigger/faster server needs a bigger fleet to saturate — watch for the
 # rig-limited warning and raise RIG2_LOADGENS / RIG2_LOADGEN_TYPE if it fires.
 #
-# Needs: docker+buildx, gh (release download), aws (rig). `local` also needs
+# Needs: docker+buildx, curl (release download), aws (rig). `local` also needs
 # cargo-zigbuild + ziglang on PATH (see dev/BENCHMARK_INSTALL.md).
 set -euo pipefail
 
@@ -81,8 +81,9 @@ if [[ "$REF" == "local" ]]; then
   cp "$REPO/target/${TRIPLE}/release/pypiron" "${ctx}/pypiron"
 else
   echo "-- downloading release v${REF} binary + SHA256SUMS"
-  gh -R "$REPO_SLUG" release download "v${REF}" \
-     -p "pypiron-${TRIPLE}.tar.gz" -p SHA256SUMS -D "$ctx" --clobber
+  base="https://github.com/${REPO_SLUG}/releases/download/v${REF}"
+  curl -fsSL -o "${ctx}/pypiron-${TRIPLE}.tar.gz" "${base}/pypiron-${TRIPLE}.tar.gz"
+  curl -fsSL -o "${ctx}/SHA256SUMS" "${base}/SHA256SUMS"
   ( cd "$ctx" && grep "pypiron-${TRIPLE}.tar.gz" SHA256SUMS | shasum -a 256 -c - )
   tar -xzf "${ctx}/pypiron-${TRIPLE}.tar.gz" -C "$ctx"
   bin="$(find "$ctx" -type f -name pypiron | head -1)"

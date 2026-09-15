@@ -67,7 +67,7 @@ launch() {  # role instance_type ami -> instance id (reused if already running)
     [[ "$itype" == t* ]] && credit=(--credit-specification "CpuCredits=unlimited")
     id=$(aws ec2 run-instances --region "$REGION" --image-id "$ami" --instance-type "$itype" \
       --key-name "$NAME" --security-group-ids "$sg" --iam-instance-profile "Name=${NAME}" \
-      --user-data "$(userdata)" "${credit[@]}" \
+      --user-data "$(userdata)" ${credit[@]+"${credit[@]}"} \
       --metadata-options "HttpTokens=optional,HttpPutResponseHopLimit=2" \
       --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=${DISK_GB},VolumeType=gp3,Throughput=250,Iops=4000}" \
       --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME}2-${role}}]" \
@@ -341,9 +341,20 @@ cmd_results() {
 }
 
 cmd_down() {
-  load_env
-  local ids="$RIG2_SERVER_ID $RIG2_LOADGEN_IDS"
-  aws ec2 terminate-instances --region "$RIG_REGION" --instance-ids $ids >/dev/null
+  # Select the fleet by its Name tag, not by .rig2.env: cmd_up writes that file
+  # only after every instance is up, so a launch that died midway would strand
+  # a fleet an env-file teardown cannot see. Stale IDs in the file are equally
+  # harmless this way. The `2-` infix keeps rig.sh's single box out of it.
+  local ids
+  ids=$(aws ec2 describe-instances --region "$REGION" \
+    --filters "Name=tag:Name,Values=${NAME}2-*" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[].Instances[].InstanceId' --output text)
+  if [[ -z "$ids" ]]; then
+    echo "== no ${NAME}2-* instances to terminate (bucket/IAM/key kept)"
+    return 0
+  fi
+  # shellcheck disable=SC2086
+  aws ec2 terminate-instances --region "$REGION" --instance-ids $ids >/dev/null
   echo "== terminated ${ids} (bucket/IAM/key kept)"
 }
 

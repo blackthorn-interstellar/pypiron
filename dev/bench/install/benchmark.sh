@@ -42,8 +42,11 @@ REPO="$(cd "${HERE}/../.." && pwd)"
 
 REPO_SLUG="${PYPIRON_REPO:-blackthorn-interstellar/pypiron}"
 ARCH="${RIG_ARCH:-x86_64}"                       # the server arch (r7i.large = x86_64)
-TRIPLE="${ARCH}-unknown-linux-musl"              # static → scratch, as the published image
-BASE_IMG="scratch"
+# Defaults match the published image (static musl on scratch). Override both
+# together to A/B a libc: PYPIRON_BENCH_TRIPLE=x86_64-unknown-linux-gnu
+# PYPIRON_BENCH_BASE=gcr.io/distroless/base-nossl-debian13:nonroot
+TRIPLE="${PYPIRON_BENCH_TRIPLE:-${ARCH}-unknown-linux-musl}"
+BASE_IMG="${PYPIRON_BENCH_BASE:-scratch}"
 IMG_TAG="pypiron:bench-${ARCH}"
 IMG_TGZ="/tmp/pypiron-${ARCH}.tgz"               # rig2.sh deploy loads this
 TIER="${RIG_TIER:-lite}"

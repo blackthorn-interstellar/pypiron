@@ -2279,23 +2279,30 @@ def minio_remove_bucket(minio: Dict, bucket: str) -> None:
     (markers, index rebuilds) between the key sweep and the bucket DELETE, so
     one pass is a race it can lose (`mc rb --force` retried the same way).
 
-    A 204 is not proof the outage took hold. A PUT that passed its bucket-exists
-    check before the DELETE committed recreates the bucket microseconds after,
-    and the caller then simulates an outage against a live bucket: writes keep
-    succeeding, the bucket stays healthy, and it is never deselected. Confirm
-    the bucket stayed gone and sweep again if a racing write brought it back —
+    A 204 plus one HEAD miss is not proof the outage took hold. A PUT that
+    passed its bucket-exists check before the DELETE committed recreates the
+    bucket microseconds after that HEAD, and the caller then simulates an
+    outage against a live bucket: writes keep succeeding, the bucket stays
+    healthy, and it is never deselected. Confirm the bucket stayed gone across
+    a short window and sweep again if a racing write brought it back —
     pypiron stops writing once the passes it does observe fail it out."""
     deadline = time.time() + 30.0
-    while True:
-        for key in minio_list_keys_in(minio, bucket):
-            code, resp = _s3_signed(minio, "DELETE", f"/{bucket}/{key}")
-            assert code in (204, 404), f"delete {bucket}/{key} -> {code}: {resp[:200]!r}"
-        code, resp = _s3_signed(minio, "DELETE", f"/{bucket}")
-        if code == 204 and not minio_bucket_exists(minio, bucket):
+    gone_since = None
+    while time.time() < deadline:
+        if minio_bucket_exists(minio, bucket):
+            gone_since = None
+            for key in minio_list_keys_in(minio, bucket):
+                code, resp = _s3_signed(minio, "DELETE", f"/{bucket}/{key}")
+                assert code in (204, 404), f"delete {bucket}/{key} -> {code}: {resp[:200]!r}"
+            code, resp = _s3_signed(minio, "DELETE", f"/{bucket}")
+            assert code in (204, 404, 409), f"remove bucket {bucket} -> {code}: {resp[:200]!r}"
+            continue
+        if gone_since is None:
+            gone_since = time.time()
+        elif time.time() - gone_since >= 0.5:
             return
-        assert code in (204, 409) and time.time() < deadline, (
-            f"remove bucket {bucket} -> {code}: {resp[:200]!r}"
-        )
+        time.sleep(0.1)
+    raise AssertionError(f"remove bucket {bucket} did not stay gone within 30s")
 
 
 def minio_make_bucket(minio: Dict, bucket: str) -> None:

@@ -10,10 +10,13 @@ name: Docker
 # runner with cargo-zigbuild (no QEMU, no per-arch gcc), then assemble a
 # RUN-free image (just `COPY` the binary into a minimal base — see Dockerfile).
 # Because the final image stage runs no target-arch code, `buildx --platform
-# linux/<arch>` builds it without emulation. Releases (tags) and manual dry-runs
-# cover the full arch set; ordinary pushes/PRs build only amd64+arm64 to stay fast.
-# Per-arch images are pushed by digest, then `imagetools create` stitches them
-# into one manifest list (the merge job).
+# linux/<arch>` builds it without emulation. Each image is then booted under
+# QEMU and smoke-tested (dev/scripts/image-smoke.sh) BEFORE it is pushed, so a
+# binary that cannot load on its base, or an image missing a dir the server
+# needs, never reaches GHCR. Releases (tags) and manual dry-runs cover the full
+# arch set; ordinary pushes/PRs build only amd64+arm64 to stay fast. Per-arch
+# images are pushed by digest, then `imagetools create` stitches them into one
+# manifest list (the merge job).
 
 on:
   push:
@@ -69,10 +72,14 @@ jobs:
 
   # The arch set is data: the full 8 for releases (tags) and manual dry-runs;
   # just amd64+arm64 for ordinary pushes/PRs so routine CI stays fast. Each entry
-  # carries the Docker platform, the Rust target to cross-compile, and the base
-  # image for that arch (distroless/cc has glibc + certs + a nonroot user and
-  # covers six arches; scratch carries the two arches distroless has no image for,
-  # which therefore ship a fully static musl binary).
+  # carries the Docker platform, the Rust target to cross-compile, the base
+  # image, and the image size budget the smoke test enforces.
+  #
+  # Every arch with a tier-2 musl target ships a fully static binary on
+  # `scratch`: the image IS the binary. The three without one (ppc64le, s390x,
+  # riscv64) link glibc dynamically and sit on distroless/base-nossl, the
+  # smallest distroless that has a libc — no OpenSSL, libstdc++ or zlib, none
+  # of which the binary loads (TLS is rustls with compiled-in roots).
   setup:
     runs-on: ubuntu-latest
     # Echoes a matrix string and nothing else — no checkout, no registry, no API.
@@ -84,17 +91,28 @@ jobs:
         shell: bash
         run: |
           # Digest-pinned to the OCI index, not to one platform's manifest —
-          # the same string is the base for six arches and buildx picks the
+          # the same string is the base for three arches and buildx picks the
           # right entry out of the index. `:nonroot` is rebuilt continuously, so
           # unpinned it is a different base on every release; bump this line
           # deliberately to take base-image CVE fixes.
-          cc='gcr.io/distroless/cc-debian13:nonroot@sha256:a77defd6fedbb3392b175ba8ea3d1c22be963c1597c248c3ba987ddd80bfb512'
-          full='[{"id":"amd64","platform":"linux/amd64","triple":"x86_64-unknown-linux-gnu","base":"'$cc'"},{"id":"arm64","platform":"linux/arm64","triple":"aarch64-unknown-linux-gnu","base":"'$cc'"},{"id":"armv7","platform":"linux/arm/v7","triple":"armv7-unknown-linux-gnueabihf","base":"'$cc'"},{"id":"ppc64le","platform":"linux/ppc64le","triple":"powerpc64le-unknown-linux-gnu","base":"'$cc'"},{"id":"s390x","platform":"linux/s390x","triple":"s390x-unknown-linux-gnu","base":"'$cc'"},{"id":"riscv64","platform":"linux/riscv64","triple":"riscv64gc-unknown-linux-gnu","base":"'$cc'"},{"id":"386","platform":"linux/386","triple":"i686-unknown-linux-musl","base":"scratch"},{"id":"armv6","platform":"linux/arm/v6","triple":"arm-unknown-linux-musleabihf","base":"scratch"}]'
-          subset='[{"id":"amd64","platform":"linux/amd64","triple":"x86_64-unknown-linux-gnu","base":"'$cc'"},{"id":"arm64","platform":"linux/arm64","triple":"aarch64-unknown-linux-gnu","base":"'$cc'"}]'
+          nossl='gcr.io/distroless/base-nossl-debian13:nonroot@sha256:8c563c1fb5e120606f0d85733049775faed6192e2bd2223ef283a5393eec22b9'
+          # max_mb caps the compressed pull: a static image is the ~8.5 MB
+          # gzipped binary, a glibc one adds ~6 MB of base. Either budget trips
+          # if a full-libc base sneaks back in (distroless/cc pulled 19.5 MB).
+          full=$(jq -c -n --arg nossl "$nossl" '[
+            {id:"amd64",   platform:"linux/amd64",   triple:"x86_64-unknown-linux-musl",      base:"scratch", max_mb:12},
+            {id:"arm64",   platform:"linux/arm64",   triple:"aarch64-unknown-linux-musl",     base:"scratch", max_mb:12},
+            {id:"armv7",   platform:"linux/arm/v7",  triple:"armv7-unknown-linux-musleabihf", base:"scratch", max_mb:12},
+            {id:"386",     platform:"linux/386",     triple:"i686-unknown-linux-musl",        base:"scratch", max_mb:12},
+            {id:"armv6",   platform:"linux/arm/v6",  triple:"arm-unknown-linux-musleabihf",   base:"scratch", max_mb:12},
+            {id:"ppc64le", platform:"linux/ppc64le", triple:"powerpc64le-unknown-linux-gnu",  base:$nossl,    max_mb:18},
+            {id:"s390x",   platform:"linux/s390x",   triple:"s390x-unknown-linux-gnu",        base:$nossl,    max_mb:18},
+            {id:"riscv64", platform:"linux/riscv64", triple:"riscv64gc-unknown-linux-gnu",    base:$nossl,    max_mb:18}
+          ]')
           if [[ "$GITHUB_REF" == refs/tags/* || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             echo "matrix=$full" >> "$GITHUB_OUTPUT"
           else
-            echo "matrix=$subset" >> "$GITHUB_OUTPUT"
+            echo "matrix=$(jq -c '.[0:2]' <<< "$full")" >> "$GITHUB_OUTPUT"
           fi
 
   build:
@@ -159,13 +177,14 @@ jobs:
       - name: Cross-compile ${{ matrix.triple }}
         run: cargo zigbuild --release --locked --target ${{ matrix.triple }}
 
-      # The COPY-only Dockerfile expects the binary, a CA bundle, and an empty
-      # data dir at the build-context root. /etc/ssl/... is the runner's bundle.
+      # The COPY-only Dockerfile expects the binary and empty data/ and tmp/
+      # dirs at the build-context root: neither base has a shell to mkdir them,
+      # and the upload/proxy spool defaults to /tmp — an image without it fails
+      # every upload and proxied fetch (the smoke test below is what catches it).
       - name: Assemble build context
         run: |
-          mkdir -p ctx/data
+          mkdir -p ctx/data ctx/tmp
           cp "target/${{ matrix.triple }}/release/pypiron" ctx/pypiron
-          cp /etc/ssl/certs/ca-certificates.crt ctx/ca-certificates.crt
           cp Dockerfile ctx/Dockerfile
 
       - name: Docker metadata (labels)
@@ -175,6 +194,21 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # Building needs no emulation (COPY only), but the smoke test RUNS the
+      # image, so every non-amd64 arch gets QEMU binfmt. It boots the server,
+      # uploads a wheel and proxies one from PyPI — seconds, even emulated —
+      # and a failure here stops the push below.
+      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        if: matrix.id != 'amd64'
+      - name: Build the image locally for the smoke test
+        run: docker buildx build --load --platform "${{ matrix.platform }}" --build-arg "BASE=${{ matrix.base }}" -t pypiron:smoke ctx
+      - name: Smoke test the image
+        shell: bash
+        run: |
+          expect=""
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then expect="${GITHUB_REF_NAME#v}"; fi
+          EXPECT_VERSION="$expect" dev/scripts/image-smoke.sh pypiron:smoke "${{ matrix.platform }}" "${{ matrix.max_mb }}"
 
       - name: Log in to ${{ env.REGISTRY }}
         if: github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch'

@@ -42,8 +42,8 @@ REPO="$(cd "${HERE}/../.." && pwd)"
 
 REPO_SLUG="${PYPIRON_REPO:-blackthorn-interstellar/pypiron}"
 ARCH="${RIG_ARCH:-x86_64}"                       # the server arch (r7i.large = x86_64)
-TRIPLE="${ARCH}-unknown-linux-gnu"               # glibc → distroless/cc base
-BASE_IMG="gcr.io/distroless/cc-debian13:nonroot"
+TRIPLE="${ARCH}-unknown-linux-musl"              # static → scratch, as the published image
+BASE_IMG="scratch"
 IMG_TAG="pypiron:bench-${ARCH}"
 IMG_TGZ="/tmp/pypiron-${ARCH}.tgz"               # rig2.sh deploy loads this
 TIER="${RIG_TIER:-lite}"
@@ -64,10 +64,11 @@ REF="${REF#v}"                                    # accept v0.0.7 or 0.0.7
 
 # ---- 1. resolve the pypiron binary for REF, assemble the runtime image --------
 # The Dockerfile is COPY-only (no RUN), so buildx assembles a linux/amd64 image
-# on any host with NO QEMU. We feed it a prebuilt binary, a CA bundle (outbound
-# TLS to S3), and an empty data/ — exactly what .github/workflows/docker.yml does.
+# on any host with NO QEMU. We feed it a prebuilt binary and empty data/ and
+# tmp/ dirs — exactly what .github/workflows/docker.yml does. TLS roots (the
+# Amazon roots S3 presents included) are compiled into the binary.
 echo "== resolve pypiron ${REF} (${TRIPLE})"
-ctx="$(mktemp -d)"; mkdir -p "${ctx}/data"
+ctx="$(mktemp -d)"; mkdir -p "${ctx}/data" "${ctx}/tmp"
 trap 'rm -rf "$ctx"' EXIT
 if [[ "$REF" == "local" ]]; then
   echo "-- building working tree from source (cargo-zigbuild)"
@@ -87,8 +88,6 @@ else
 fi
 chmod +x "${ctx}/pypiron"
 cp "$REPO/Dockerfile" "${ctx}/Dockerfile"
-# certifi's Mozilla bundle includes the Amazon roots S3 presents.
-uv run --with certifi python -c "import certifi,shutil;shutil.copy(certifi.where(),'${ctx}/ca-certificates.crt')"
 echo "== assemble ${IMG_TAG} (linux/${ARCH/x86_64/amd64})"
 docker buildx build --platform "linux/${ARCH/x86_64/amd64}" --build-arg "BASE=${BASE_IMG}" \
   -t "$IMG_TAG" --load "$ctx" >/dev/null

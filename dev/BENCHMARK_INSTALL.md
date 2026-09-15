@@ -298,7 +298,7 @@ dev/bench/install/
 
 `benchmark.sh` is the scripted §14/§15 run for one pypiron build. It resolves a
 server image for a released tag (downloads + sha-verifies the GitHub Release
-binary, assembles the COPY-only distroless image) or a local source build,
+binary, assembles the COPY-only scratch image) or a local source build,
 reuses a running rig2 (or brings one up), serves Track 2, and ramps **to the
 server's CPU ceiling** — writing `results/cmp-pypiron.json` (stamped with the
 version and the `server-bound`/`rig-limited` verdict), the input `plot.py`

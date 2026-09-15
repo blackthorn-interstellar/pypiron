@@ -3,29 +3,29 @@
 # Runtime-only image: it just drops a prebuilt pypiron binary into a minimal
 # base. NO `RUN` — so `docker buildx build --platform linux/<any-arch>` builds on
 # an ordinary amd64 runner with NO QEMU (only RUN executes target-arch code).
-# CI cross-compiles the per-arch binary and assembles the multi-arch manifest.
+# CI cross-compiles the per-arch binary, smoke-runs the image
+# (dev/scripts/image-smoke.sh), and assembles the multi-arch manifest.
 #
-# Build context must contain: `pypiron` (the target-arch binary), a
-# `ca-certificates.crt` bundle (outbound TLS to PyPI for sync/proxy), and an
-# empty `data/` dir (distroless/scratch have no shell to mkdir it).
+# Build context must contain: `pypiron` (the target-arch binary) and empty
+# `data/` and `tmp/` dirs. Neither base has a shell to mkdir them, and the
+# upload/proxy spool defaults to /tmp — an image without it fails every upload
+# and proxied fetch. No CA bundle: TLS roots are compiled into the binary.
 #
 # BASE per arch (set by CI):
-#   gcr.io/distroless/cc-debian13:nonroot  — glibc binaries (amd64, arm64,
-#       arm/v7, ppc64le, s390x, riscv64). distroless ships certs + nonroot user.
-#   scratch                                — fully static musl binaries for the
-#       arches distroless has no image for (386, arm/v6).
-ARG BASE=gcr.io/distroless/cc-debian13:nonroot
+#   scratch                                 — fully static musl binaries; the
+#       image IS the binary (amd64, arm64, arm/v7, 386, arm/v6).
+#   gcr.io/distroless/base-nossl-debian13:nonroot — glibc and nothing else, for
+#       the arches Rust has no tier-2 musl target for (ppc64le, s390x, riscv64).
+ARG BASE=scratch
 FROM ${BASE}
 
-COPY ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY pypiron /usr/local/bin/pypiron
 COPY --chown=65532:65532 data /data
+COPY --chown=65532:65532 tmp /tmp
 
 # 65532 is the distroless nonroot uid; on scratch it's just an unprivileged
-# numeric uid (the binary never does a passwd lookup). SSL_CERT_FILE makes the
-# cert bundle unambiguous on scratch, which has no default trust store.
-ENV PYPIRON_DATA_DIR=/data \
-    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+# numeric uid (the binary never does a passwd lookup).
+ENV PYPIRON_DATA_DIR=/data
 USER 65532:65532
 EXPOSE 8080
 

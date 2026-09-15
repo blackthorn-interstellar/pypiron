@@ -318,7 +318,17 @@ ceiling.
 ./benchmark.sh 0.0.7 --down    # tear the rig down when finished
 # cheap rig-limited spot-check (smaller fleet — will warn it's a lower bound):
 RIG2_LOADGENS=2 RIG2_LOADGEN_TYPE=c7i.2xlarge ./benchmark.sh 0.0.7
+# A/B a libc against the default (static musl): same release, same rig
+PYPIRON_BENCH_TRIPLE=x86_64-unknown-linux-gnu PYPIRON_BENCH_BASE=gcr.io/distroless/cc-debian13:nonroot ./benchmark.sh 0.0.7
 ```
+
+**musl vs glibc (2026-09-15).** Two passes of v0.0.17 on one rig, release
+binaries on the same base: musl 628.8 and glibc 608.6 installs/s at their gated
+peaks, glibc 4–6 % ahead at matched concurrency, and three glibc passes on three
+rigs spread 606–623. Both server-bound at 199.5–199.8 % of 2 cores. The libc
+difference sits inside rig-to-rig variance (under ~5 %): the static musl image
+carries no measurable throughput penalty. Raw JSON lives in the private repo
+under `bench/2026-09-15-musl-vs-glibc/`.
 
 Reuse from `meter.py` (do not edit it): `http_get`, `wait_healthy`,
 `upload_wheel`, `wait_visible`, `RssSampler`, `percentile`, `print_markdown`,

@@ -6,10 +6,13 @@
 # CI cross-compiles the per-arch binary, smoke-runs the image
 # (dev/scripts/image-smoke.sh), and assembles the multi-arch manifest.
 #
-# Build context must contain: `pypiron` (the target-arch binary) and empty
-# `data/` and `tmp/` dirs. Neither base has a shell to mkdir them, and the
-# upload/proxy spool defaults to /tmp — an image without it fails every upload
-# and proxied fetch. No CA bundle: TLS roots are compiled into the binary.
+# Build context must contain: `pypiron` (the target-arch binary), a
+# `ca-certificates.crt` bundle, and empty `data/` and `tmp/` dirs. Neither base
+# has a shell to mkdir the dirs, and the upload/proxy spool defaults to /tmp —
+# an image without it fails every upload and proxied fetch. The CA bundle is
+# for the cloud-storage client (S3/GCS/Azure): it trusts only the system store,
+# and without one it refuses to start. pypiron's own upstream client (proxy,
+# sync, advisories) carries compiled-in roots and does not need it.
 #
 # BASE per arch (set by CI):
 #   scratch                                 — fully static musl binaries; the
@@ -19,6 +22,7 @@
 ARG BASE=scratch
 FROM ${BASE}
 
+COPY ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY pypiron /usr/local/bin/pypiron
 COPY --chown=65532:65532 data /data
 COPY --chown=65532:65532 tmp /tmp

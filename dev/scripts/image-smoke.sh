@@ -7,7 +7,9 @@
 #   3. the HEALTHCHECK works          — docker itself reports the container healthy
 #   4. an upload lands                — the spool dir (/tmp) exists and the
 #                                       runtime uid can write it
-#   5. the proxy fetches from PyPI    — DNS + TLS trust with no system store
+#   5. the proxy fetches from PyPI    — DNS + TLS through the compiled-in roots
+#   6. cloud storage can start        — the object-store client trusts only the
+#                                       system CA store, so the image must ship one
 #
 # pip is the client for 4 and 5, so both are real install round-trips.
 #
@@ -18,7 +20,8 @@
 # Env:
 #   EXPECT_VERSION  if set, `--version` must report exactly this version
 #   PYTHON          interpreter that has pip (default: python3)
-# Needs docker, curl, python3 with pip, and network to pypi.org for step 5.
+# Needs docker, curl, python3 with pip, and network to pypi.org (step 5) and
+# s3.amazonaws.com (step 6).
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
@@ -38,7 +41,7 @@ cleanup() {
     echo "--- container log ---" >&2
     docker logs "$name" >&2 2>&1 || true
   fi
-  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker rm -f "$name" "${name}-s3" >/dev/null 2>&1 || true
   rm -rf "$work"
   exit "$rc"
 }
@@ -127,5 +130,23 @@ echo "upload round-trip ok"
 # (no system store on scratch — the roots are compiled in) and the spool again.
 "${pip[@]}" six==1.17.0 || fail "pip could not fetch six through the proxy — DNS, TLS trust or spool?"
 echo "proxy round-trip ok"
+
+# 6. Cloud storage. The object-store client trusts only the system CA store,
+# so an image without a bundle refuses to start with any bucket configured.
+# Fake credentials against real S3: startup must die on S3's 403, not on TLS.
+docker run -d --name "${name}-s3" --platform "$PLATFORM" \
+  -e AWS_ACCESS_KEY_ID=AKIASMOKE -e AWS_SECRET_ACCESS_KEY=smoke -e AWS_REGION=us-east-1 \
+  -e PYPIRON_BUCKETS=s3://pypiron-image-smoke-no-such-bucket \
+  -e PYPIRON_ADVISORY_FEED= \
+  "$IMAGE" >/dev/null
+for _ in $(seq 1 60); do
+  [[ "$(docker inspect -f '{{.State.Status}}' "${name}-s3")" == exited ]] && break
+  sleep 1
+done
+s3out=$(docker logs "${name}-s3" 2>&1)
+docker rm -f "${name}-s3" >/dev/null 2>&1 || true
+grep -q 'No CA certificates' <<< "$s3out" && fail "cloud-storage client found no CA bundle in the image"
+grep -q '403 Forbidden' <<< "$s3out" || fail "expected S3 to answer 403 to fake credentials; got: $(tail -3 <<< "$s3out")"
+echo "cloud-storage TLS ok (S3 answered 403 to fake credentials)"
 
 echo "ok: $IMAGE on $PLATFORM"

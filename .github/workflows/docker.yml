@@ -181,14 +181,18 @@ jobs:
       - name: Cross-compile ${{ matrix.triple }}
         run: cargo zigbuild --release --locked --target ${{ matrix.triple }}
 
-      # The COPY-only Dockerfile expects the binary and empty data/ and tmp/
-      # dirs at the build-context root: neither base has a shell to mkdir them,
-      # and the upload/proxy spool defaults to /tmp — an image without it fails
-      # every upload and proxied fetch (the smoke test below is what catches it).
+      # The COPY-only Dockerfile expects the binary, a CA bundle, and empty
+      # data/ and tmp/ dirs at the build-context root. Neither base has a shell
+      # to mkdir the dirs, and the upload/proxy spool defaults to /tmp — an
+      # image without it fails every upload and proxied fetch. The bundle (the
+      # runner's Mozilla set) is for the cloud-storage client, which trusts only
+      # the system store and refuses to start without one. The smoke test below
+      # is what catches either omission.
       - name: Assemble build context
         run: |
           mkdir -p ctx/data ctx/tmp
           cp "target/${{ matrix.triple }}/release/pypiron" ctx/pypiron
+          cp /etc/ssl/certs/ca-certificates.crt ctx/ca-certificates.crt
           cp Dockerfile ctx/Dockerfile
 
       - name: Docker metadata (labels)

@@ -67,9 +67,11 @@ REF="${REF#v}"                                    # accept v0.0.7 or 0.0.7
 
 # ---- 1. resolve the pypiron binary for REF, assemble the runtime image --------
 # The Dockerfile is COPY-only (no RUN), so buildx assembles a linux/amd64 image
-# on any host with NO QEMU. We feed it a prebuilt binary and empty data/ and
-# tmp/ dirs — exactly what .github/workflows/docker.yml does. TLS roots (the
-# Amazon roots S3 presents included) are compiled into the binary.
+# on any host with NO QEMU. We feed it a prebuilt binary, a CA bundle (the
+# cloud-storage client trusts only the system store, and the rig serves from
+# S3), and empty data/ and tmp/ dirs — the same Dockerfile and context layout
+# as .github/workflows/docker.yml. The binary differs: this is the release
+# tarball (plain cargo, needs libgcc_s on glibc), not the workflow's zig build.
 echo "== resolve pypiron ${REF} (${TRIPLE})"
 ctx="$(mktemp -d)"; mkdir -p "${ctx}/data" "${ctx}/tmp"
 trap 'rm -rf "$ctx"' EXIT
@@ -92,6 +94,8 @@ else
 fi
 chmod +x "${ctx}/pypiron"
 cp "$REPO/Dockerfile" "${ctx}/Dockerfile"
+# certifi's Mozilla bundle includes the Amazon roots S3 presents.
+uv run --with certifi python -c "import certifi,shutil;shutil.copy(certifi.where(),'${ctx}/ca-certificates.crt')"
 echo "== assemble ${IMG_TAG} (linux/${ARCH/x86_64/amd64})"
 docker buildx build --platform "linux/${ARCH/x86_64/amd64}" --build-arg "BASE=${BASE_IMG}" \
   -t "$IMG_TAG" --load "$ctx" >/dev/null

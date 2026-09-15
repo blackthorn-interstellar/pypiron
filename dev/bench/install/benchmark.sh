@@ -38,7 +38,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "${HERE}/../.." && pwd)"
+REPO="$(cd "${HERE}/../../.." && pwd)"   # dev/bench/install -> repo root
 
 REPO_SLUG="${PYPIRON_REPO:-blackthorn-interstellar/pypiron}"
 ARCH="${RIG_ARCH:-x86_64}"                       # the server arch (r7i.large = x86_64)

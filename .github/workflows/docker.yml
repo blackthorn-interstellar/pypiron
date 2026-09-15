@@ -79,7 +79,11 @@ jobs:
   # `scratch`: the image IS the binary. The three without one (ppc64le, s390x,
   # riscv64) link glibc dynamically and sit on distroless/base-nossl, the
   # smallest distroless that has a libc — no OpenSSL, libstdc++ or zlib, none
-  # of which the binary loads (TLS is rustls with compiled-in roots).
+  # of which the binary loads (TLS is rustls with compiled-in roots). It also
+  # has no libgcc_s: that works only because cargo-zigbuild links the unwinder
+  # statically (the release tarballs, built with plain cargo, DO need
+  # libgcc_s.so.1). Swap the toolchain and the smoke test's --version step
+  # fails with a loader error; the fix then is distroless/cc.
   setup:
     runs-on: ubuntu-latest
     # Echoes a matrix string and nothing else — no checkout, no registry, no API.

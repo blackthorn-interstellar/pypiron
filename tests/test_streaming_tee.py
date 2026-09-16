@@ -64,9 +64,16 @@ BALANCED_LEG_SECS = 3.0
 # The client reads this much per pause. Coarse on purpose: ~200 sleeps of ~15ms
 # each, not thousands of micro-sleeps a loaded box cannot honor.
 CLIENT_CHUNK = 128 * 1024
-# Overlapping the legs is ideally 2x — assert well short of that, so the test
-# reports a real regression rather than the scheduler's mood.
-OVERLAP_RATIO = 0.75
+# The overlap is read as a share of the body the client already held at the
+# instant the upstream finished sending it. Serialized, that is exactly 0 — the
+# buffered control asserts it — so the streamed gate only has to be
+# unambiguously non-zero. Teed, the share lands at roughly
+# upstream_leg / client_leg, and load stretches the finer-grained client leg
+# first: measured here at 72-81% idle and under 16 spinners, and still 28% with
+# the client leg deliberately slowed to 3.4x the upstream's. Gate well under
+# that, because the failure this exists to catch reads zero however loaded the
+# box is, while 15% of the body is 3.6 MiB no serialized path can have sent.
+STREAMED_OVERLAP_MIN = 0.15
 
 
 @pytest.fixture()
@@ -202,14 +209,19 @@ def _client_pause(size: int) -> float:
     return pause
 
 
-def _read_at_client_pace(url: str, *, pause: float, timeout: float) -> Tuple[float, bytes]:
+def _read_at_client_pace(
+    url: str, *, pause: float, timeout: float
+) -> Tuple[float, bytes, List[Tuple[float, int]]]:
     """GET `url` over a link that carries `CLIENT_CHUNK` bytes per `pause`, and
-    return the wall-clock time to last byte. Reads block until the chunk is full,
-    so this consumes at a fixed rate and never races ahead to catch up — a slow
-    link, not a fast client that stalled."""
+    return the wall-clock time to last byte, the body, and a `(monotonic, bytes
+    held)` mark per chunk. Reads block until the chunk is full, so this consumes
+    at a fixed rate and never races ahead to catch up — a slow link, not a fast
+    client that stalled. The marks are absolute so they can be read against the
+    upstream's own finish timestamp."""
     parsed = urlparse(url)
     conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
     body = bytearray()
+    marks: List[Tuple[float, int]] = []
     started = time.monotonic()
     try:
         conn.request("GET", parsed.path)
@@ -221,7 +233,8 @@ def _read_at_client_pace(url: str, *, pause: float, timeout: float) -> Tuple[flo
             if not piece:
                 break
             body += piece
-        return time.monotonic() - started, bytes(body)
+            marks.append((time.monotonic(), len(body)))
+        return time.monotonic() - started, bytes(body), marks
     finally:
         conn.close()
 
@@ -235,20 +248,30 @@ def _timed_cold_miss(
     *,
     pause: float,
     extra_env: Optional[Dict[str, str]] = None,
-) -> Tuple[float, bytes]:
-    """Time to last byte for one cold-miss download of `wheel` through a
-    throttled upstream, on a server of its own."""
+) -> Tuple[float, bytes, float]:
+    """One cold-miss download of `wheel` through a throttled upstream, on a
+    server of its own: time to last byte, the body, and the share of it the
+    client already held when the (in-process) upstream finished writing the
+    last chunk. That share is the overlap, measured rather than inferred from a
+    clock — load stretches both legs, but only a serialized fill hands the
+    client nothing until the upstream is done."""
     run_dir.mkdir()
     gen = _proxy_over_fault(tmp_path_factory, pypiron_bin, run_dir, extra_env=extra_env)
     proxy, upstream = next(gen)
     try:
         filename = upstream.register(pkg, wheel)
         upstream.set_fault(pkg, "slow", pace=BALANCED_LEG_SECS)
-        return _read_at_client_pace(
+        secs, body, marks = _read_at_client_pace(
             f"{proxy['base_url']}/files/{pkg}/{filename}",
             pause=pause,
             timeout=FAULT_GET_TIMEOUT,
         )
+        # The tail is withheld until the sha256 over the whole body passes, so
+        # the upstream has always stamped its finish by the time this returns.
+        finished = upstream.completed_at(pkg)
+        assert finished is not None, "the fake upstream never reported finishing the body"
+        held = max((n for t, n in marks if t <= finished), default=0)
+        return secs, body, held / max(1, len(body))
     finally:
         gen.close()
 
@@ -461,15 +484,17 @@ def test_threshold_off_buffers_the_whole_download(proxy_over_fault_no_tee, tmp_p
 
 
 def test_balanced_legs_overlap_instead_of_adding_up(tmp_path_factory, pypiron_bin, tmp_path):
-    """The point of teeing, timed: when the upstream leg and the client leg run
-    at the same speed — the VPN user pulling from a distant PyPI — the download
-    costs about one leg, not two. Buffering pays them in series (fetch it all,
-    then send it all); streaming overlaps them, because the fill writes to the
-    spool at upstream speed no matter how slowly the client drains it.
+    """How much of the body the client already holds at the instant the upstream
+    finishes sending it — the overlap, measured rather than timed. The fake
+    upstream is in-process, so it stamps its own finish, and the client's chunk
+    marks say what had arrived by then.
 
-    Both measurements are made the same way against the same throttles, so the
-    assertion is the ratio between them and not a clock. Both throttles are
-    load-bearing for a pass: kill either one and the two runs converge."""
+    That is the point of teeing, with the upstream leg and the client leg run at
+    the same speed — the VPN user pulling from a distant PyPI. Buffering pays the
+    legs in series (fetch it all, then send it all), so the share is exactly
+    zero; streaming overlaps them, because the fill writes to the spool at
+    upstream speed no matter how slowly the client drains it. The buffered run is
+    the control that keeps the measurement honest: it has to read that zero."""
     pkg = "teebalance"
     wheel = make_wheel(pkg, "1.0", tmp_path, payload_bytes=BALANCED_PAYLOAD)
     size = wheel.stat().st_size
@@ -477,7 +502,7 @@ def test_balanced_legs_overlap_instead_of_adding_up(tmp_path_factory, pypiron_bi
     pause = _client_pause(size)
     digest = sha256_file(wheel)
 
-    buffered_secs, buffered_body = _timed_cold_miss(
+    buffered_secs, buffered_body, buffered_overlap = _timed_cold_miss(
         tmp_path_factory,
         pypiron_bin,
         tmp_path / "buffered",
@@ -486,7 +511,7 @@ def test_balanced_legs_overlap_instead_of_adding_up(tmp_path_factory, pypiron_bi
         pause=pause,
         extra_env={"PYPIRON_PROXY_STREAM_THRESHOLD": "off"},
     )
-    streamed_secs, streamed_body = _timed_cold_miss(
+    streamed_secs, streamed_body, streamed_overlap = _timed_cold_miss(
         tmp_path_factory,
         pypiron_bin,
         tmp_path / "streamed",
@@ -500,10 +525,19 @@ def test_balanced_legs_overlap_instead_of_adding_up(tmp_path_factory, pypiron_bi
         assert len(body) == size, f"{label} body was {len(body)} of {size} bytes"
         assert hashlib.sha256(body).hexdigest() == digest, f"{label} body did not match the wheel"
 
-    assert streamed_secs < buffered_secs * OVERLAP_RATIO, (
-        f"streamed cold miss took {streamed_secs:.1f}s against {buffered_secs:.1f}s buffered "
-        f"({streamed_secs / buffered_secs:.0%} of it): the client transfer is not overlapping "
-        "the upstream fetch"
+    measured = (
+        f"streamed {streamed_overlap:.1%} in {streamed_secs:.1f}s, "
+        f"buffered {buffered_overlap:.1%} in {buffered_secs:.1f}s, "
+        f"{size} bytes over a {BALANCED_LEG_SECS:.0f}s upstream leg"
+    )
+    assert buffered_overlap == 0, (
+        "with streaming off the client held part of the body before the upstream had finished "
+        f"sending it — the overlap measurement is not reading a serialized fill as serialized "
+        f"({measured})"
+    )
+    assert streamed_overlap >= STREAMED_OVERLAP_MIN, (
+        f"the client held only {streamed_overlap:.1%} of the body when the upstream finished "
+        f"sending it: the client transfer is not overlapping the upstream fetch ({measured})"
     )
 
 

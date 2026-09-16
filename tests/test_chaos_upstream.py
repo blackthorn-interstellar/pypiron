@@ -194,6 +194,7 @@ class _FaultHandler(http.server.BaseHTTPRequestHandler):
             # kept running from one it cancelled when its client vanished.
             if self._send_throttled(full, server.pace.get(pkg, SLOW_TRANSFER_SECS)):
                 server.completed[pkg] = server.completed.get(pkg, 0) + 1
+                server.completed_at.setdefault(pkg, time.monotonic())
             return
 
         if mode == "trickle":
@@ -282,6 +283,7 @@ class _FaultServer:
         self.httpd.hits = {}  # type: ignore[attr-defined]
         self.httpd.recover_after = {}  # type: ignore[attr-defined]
         self.httpd.completed = {}  # type: ignore[attr-defined]
+        self.httpd.completed_at = {}  # type: ignore[attr-defined]
         self.httpd.pace = {}  # type: ignore[attr-defined]
         self.base = f"http://127.0.0.1:{port}"
         self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -322,6 +324,10 @@ class _FaultServer:
         pypiron abandoned mid-flight (its client went away and nothing kept it
         alive) shows up as a hit that never completed."""
         return self.httpd.completed.get(pkg, 0)  # type: ignore[attr-defined]
+
+    def completed_at(self, pkg: str) -> Optional[float]:
+        """`time.monotonic()` when this upstream finished writing the body."""
+        return self.httpd.completed_at.get(pkg)  # type: ignore[attr-defined]
 
     def stop(self) -> None:
         self.httpd.shutdown()

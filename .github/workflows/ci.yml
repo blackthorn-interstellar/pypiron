@@ -526,10 +526,13 @@ jobs:
       # instead of eight processes contending on cargo's target-dir lock.
       - name: Build server binary
         run: cargo build --locked
-      # Worker count is per-leg (matrix.workers). The disk leg runs at -n 8: it
-      # carries no fault-injection markers, so its waits are truly wait-bound —
-      # containers, HTTP polls — and oversubscribing the 4-vCPU runner keeps it
-      # busy. Both cloud legs (s3 and azure) run at -n 4, one worker per vCPU:
+      # Worker count is per-leg (matrix.workers). The disk leg runs at -n 8: the
+      # marker string above excludes s3/azure, so 55 of its 419 tests are still
+      # `chaos` fault injection (test_crash_consistency, test_chaos_upstream,
+      # test_streaming_tee, test_proxy_ssrf) — but those assert on ordering and
+      # on generous bounds, not on tight timing windows, so oversubscribing the
+      # 4-vCPU runner is safe on a leg that is otherwise wait-bound anyway.
+      # Both cloud legs (s3 and azure) run at -n 4, one worker per vCPU:
       # they carry multi-region fault-injection tests that assert on real timing
       # windows (1s bucket-health probe deadlines, hysteresis/drip windows), and
       # 2x oversubscription starves the CPU enough that a probe to a *healthy*

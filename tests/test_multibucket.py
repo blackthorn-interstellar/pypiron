@@ -33,6 +33,7 @@ from .conftest import (
     SURVIVOR_MAL_VERSION,
     _s3_env,
     _start_s3_server,
+    minio_bucket_exists,
     minio_delete_key_in,
     minio_get_key_bytes_in,
     minio_get_key_in,
@@ -208,6 +209,32 @@ def _retry_upload(server, wheel, *, timeout: float = 30.0) -> None:
             last_error = exc
             time.sleep(0.2)
     raise AssertionError(f"upload did not survive selection switch: {last_error}")
+
+
+def _eventually_bucket_stays_gone(
+    minio, bucket: str, predicate, *, timeout: float = 45.0, what: str = ""
+) -> None:
+    """Poll `predicate` while holding `bucket` deleted, re-deleting resurrections.
+
+    `minio_remove_bucket` only re-sweeps a resurrection it observes; a PUT that
+    passed its bucket-exists check just before the DELETE committed recreates
+    the bucket after that last check (see a53b7e9). A live bucket never fails
+    out — its writes succeed and the availability counter resets — so the wait
+    itself has to hold the outage open. Every resurrection is a write that
+    succeeded, so re-deleting it within one poll interval makes the server's
+    next periodic write a 404 and the failure counter advances. A bucket that
+    vanishes between the exists-check and the DELETE makes `minio_remove_bucket`
+    raise AssertionError, which `_eventually` catches as a "not yet" and retries
+    — that catch is what makes this safe on a bucket that can vanish under it."""
+
+    def _step():
+        if predicate():
+            return True
+        if minio_bucket_exists(minio, bucket):
+            minio_remove_bucket(minio, bucket)
+        return False
+
+    _eventually(_step, timeout=timeout, what=what)
 
 
 def _claim_owner(minio, bucket: str, pkg: str) -> str:
@@ -510,9 +537,10 @@ def test_selected_bucket_deletion_switches_and_retry_succeeds(minio_two, s3_serv
     minio_remove_bucket(minio_two, a)
     wheel = make_wheel("missingselected", "1.0", tmp_path)
     _retry_upload(server, wheel, timeout=15)
-    _eventually(
+    _eventually_bucket_stays_gone(
+        minio_two,
+        a,
         lambda: _selected_bucket(server) == b and _bucket_health(server, a) == -1,
-        timeout=15,
         what="deleted bucket fails out and selection moves to the fallback",
     )
     key = f"packages/missingselected/{wheel.name}"
@@ -890,10 +918,12 @@ def test_repl_marker_accumulates_then_drains_when_destination_returns(
     a, b = minio["buckets"]
     pkg = "markertest"
 
+    # Build the wheel first so the DELETE -> fan-out gap is only the upload.
+    wheel = make_wheel(pkg, "2.0", tmp_path)
+
     # Kill tier-1: the destination bucket is gone.
     minio_remove_bucket(minio, b)
 
-    wheel = make_wheel(pkg, "2.0", tmp_path)
     _upload(server, wheel)
     # The selected bucket is unaffected — uploads and indexing keep flowing.
     wait_for_file_in_index(server["simple"], pkg, wheel.name)
@@ -904,8 +934,14 @@ def test_repl_marker_accumulates_then_drains_when_destination_returns(
             k.startswith(f"_repl/{s3_repl_tag(b)}/{pkg}/") for k in minio_list_keys_in(minio, a)
         )
 
-    _eventually(_marker_present, what="_repl/ marker for the down bucket")
-    _eventually(
+    # Both waits need B to stay down: a resurrected B lets the sweep deliver the
+    # note and delete it, which starves the marker check and zeroes the backlog.
+    _eventually_bucket_stays_gone(
+        minio, b, _marker_present, what="_repl/ marker for the down bucket"
+    )
+    _eventually_bucket_stays_gone(
+        minio,
+        b,
         lambda: _marker_backlog(server, b) > 0,
         what="reachable-source backlog is visible while B is unavailable",
     )
@@ -1662,7 +1698,7 @@ def test_late_mirror_repair_notes_drain_without_full_reconcile(
 
         _eventually(
             lambda: all(not minio_key_exists_in(minio, source, note) for note in notes),
-            timeout=20,
+            timeout=45,
             what="late mirror notes drain without the daily reconcile",
         )
         quarantine = f"_quarantine/{pkg}/{filename}@{sha[:12]}"
@@ -2706,9 +2742,10 @@ def test_failover_continues_the_chain_instead_of_restarting_genesis(
         wheel2 = make_wheel("chaincontb", "1.0", tmp_path)
         _retry_upload(server, wheel2, timeout=30)
         wait_for_file_in_index(server["simple"], "chaincontb", wheel2.name)
-        _eventually(
+        _eventually_bucket_stays_gone(
+            minio,
+            a,
             lambda: _selected_bucket(server) == b,
-            timeout=30,
             what="node selects bucket B after A is removed",
         )
         # The failover leader continues the chain: seq 1 on B, gapless from 0.

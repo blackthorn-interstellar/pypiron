@@ -1834,9 +1834,18 @@ mod tests {
     #[test]
     fn landing_with_activity_renders_numbers_and_bars() {
         let m = Metrics::new();
-        m.record_request(crate::metrics::route_group("/simple/"), 200);
-        m.record_request(crate::metrics::route_group("/files/six/six.whl"), 200);
-        m.record_request(crate::metrics::route_group("/files/six/six.whl"), 200);
+        m.record_request(
+            crate::metrics::route_group(&axum::http::Method::GET, "/simple/"),
+            200,
+        );
+        m.record_request(
+            crate::metrics::route_group(&axum::http::Method::GET, "/files/six/six.whl"),
+            200,
+        );
+        m.record_request(
+            crate::metrics::route_group(&axum::http::Method::GET, "/files/six/six.whl"),
+            200,
+        );
         m.record_download();
         let snap = m.snapshot();
         let top = [("requests".to_string(), 1200u64), ("flask".to_string(), 42)];

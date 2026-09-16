@@ -43,8 +43,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::{self, ConfigFile, UpstreamConfig};
 use crate::denylist::Denylist;
 use crate::names::{
-    checked_pkg_name, infer_version_from_filename, matches_prefix, normalize_pkg_name,
-    parse_wheel_tags, WheelTags,
+    checked_pkg_name, infer_version_from_filename, parse_wheel_tags, PrivateNames, WheelTags,
 };
 use crate::origin;
 use crate::render::SIMPLE_JSON_CONTENT_TYPE;
@@ -135,38 +134,21 @@ pub struct SyncArgs {
     #[arg(long, env = "PYPIRON_SYNC_ADMIN_PASS", hide_env_values = true)]
     pub admin_pass: Option<String>,
 
-    /// Refuse to mirror names inside this private namespace (PEP 503-normalized)
-    #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
-    pub private_prefix: Option<String>,
+    /// The reserved private names. A mirror run refuses to touch them; a
+    /// pypicloud migration (`--source-kind pypicloud --as-private`) discovers
+    /// its work list from them.
+    #[command(flatten)]
+    pub(crate) private: crate::cli::PrivateArgs,
 
     /// Migrate the source into pypiron's *private* namespace instead of mirroring
     /// it. Each drained package lands `origin = private` — your own package, not a
     /// PyPI mirror — so it is served from your index and never falls through to an
     /// upstream. Use it to move packages off a private devpi/Artifactory/Nexus.
     /// Timestamps and yank state are not preserved: migrated files carry the
-    /// migration date. Don't combine with `--private-prefix` (a name outside the
-    /// prefix would be refused as a private upload).
+    /// migration date. When the destination reserves private names, every
+    /// migrated name must be a reserved one.
     #[arg(long = "as-private", env = "PYPIRON_SYNC_AS_PRIVATE")]
     pub as_private: bool,
-
-    /// Declare pypicloud project names private by whole-name pattern. Matching
-    /// happens after PEP 503 normalization; `*` matches any substring. Repeatable.
-    /// A bare `*` is refused. Valid only with `--source-kind pypicloud --as-private`.
-    #[arg(
-        long = "private-pattern",
-        env = "PYPIRON_PRIVATE_PATTERN",
-        value_name = "PATTERN"
-    )]
-    pub private_pattern: Vec<String>,
-
-    /// File of pypicloud private-name patterns, one per line. Blank lines and
-    /// lines beginning with `#` are ignored.
-    #[arg(
-        long = "private-patterns-from",
-        env = "PYPIRON_PRIVATE_PATTERNS_FROM",
-        value_name = "FILE"
-    )]
-    pub private_patterns_from: Option<PathBuf>,
 
     /// Ferry the advisory snapshot (the OSV malware/vulnerability feed) to the
     /// destination alongside the packages. Unset (the default): relay the source
@@ -682,141 +664,6 @@ pub(crate) struct PackageSpec {
     pub(crate) specifiers: Option<VersionSpecifiers>,
 }
 
-/// A whole-project ownership declaration for a pypicloud migration. The value
-/// is normalized like a package name while preserving `*` wildcards.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PrivatePattern(String);
-
-impl PrivatePattern {
-    fn parse(raw: &str) -> Result<Self> {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            bail!("private pattern is empty");
-        }
-
-        let mut normalized = String::with_capacity(raw.len());
-        let mut last_dash = false;
-        let mut last_star = false;
-        for ch in raw.chars() {
-            if ch == '*' {
-                if !last_star {
-                    normalized.push('*');
-                }
-                last_star = true;
-                last_dash = false;
-                continue;
-            }
-            last_star = false;
-            if matches!(ch, '-' | '_' | '.') {
-                if !last_dash {
-                    normalized.push('-');
-                }
-                last_dash = true;
-                continue;
-            }
-            if !ch.is_ascii_alphanumeric() {
-                bail!("invalid private pattern '{raw}': use package-name characters and '*' only");
-            }
-            normalized.push(ch.to_ascii_lowercase());
-            last_dash = false;
-        }
-        let normalized = normalized.trim_matches('-').to_string();
-        if normalized == "*" {
-            bail!(
-                "private pattern '*' would declare every stored pypicloud project private; list the private namespaces or names explicitly"
-            );
-        }
-        if normalized.is_empty() || normalized.len() > 256 {
-            bail!("invalid private pattern '{raw}'");
-        }
-        if !normalized.contains('*')
-            && checked_pkg_name(&normalized).as_deref() != Some(&normalized)
-        {
-            bail!("invalid private package name '{raw}'");
-        }
-        Ok(Self(normalized))
-    }
-
-    fn matches(&self, package: &str) -> bool {
-        wildcard_match(package.as_bytes(), self.0.as_bytes())
-    }
-}
-
-/// Anchored shell-style `*` matching over ASCII normalized package names.
-/// The greedy fallback is the standard linear wildcard matcher: a pattern must
-/// consume the whole name, so `acme-*` never matches `other-acme-tool`.
-fn wildcard_match(value: &[u8], pattern: &[u8]) -> bool {
-    let (mut value_i, mut pattern_i) = (0, 0);
-    let (mut star_i, mut star_value_i) = (None, 0);
-    while value_i < value.len() {
-        if pattern_i < pattern.len() && pattern[pattern_i] == value[value_i] {
-            value_i += 1;
-            pattern_i += 1;
-        } else if pattern_i < pattern.len() && pattern[pattern_i] == b'*' {
-            star_i = Some(pattern_i);
-            pattern_i += 1;
-            star_value_i = value_i;
-        } else if let Some(star) = star_i {
-            star_value_i += 1;
-            value_i = star_value_i;
-            pattern_i = star + 1;
-        } else {
-            return false;
-        }
-    }
-    pattern[pattern_i..].iter().all(|b| *b == b'*')
-}
-
-fn resolve_private_patterns(
-    cli_inline: &[String],
-    cli_from_file: Option<&Path>,
-    file_inline: Option<&Vec<String>>,
-    file_from_file: Option<&Path>,
-) -> Result<Vec<PrivatePattern>> {
-    let from_cli = cli_from_file.is_some() || !cli_inline.is_empty();
-    let mut lines = Vec::new();
-    if from_cli {
-        if let Some(path) = cli_from_file {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            lines.extend(text.lines().map(str::to_string));
-        }
-        lines.extend(cli_inline.iter().cloned());
-    } else {
-        if let Some(path) = file_from_file {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            lines.extend(text.lines().map(str::to_string));
-        }
-        lines.extend(file_inline.cloned().unwrap_or_default());
-    }
-
-    let mut patterns = Vec::new();
-    let mut seen = HashSet::new();
-    for (lineno, raw) in lines.iter().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let pattern = PrivatePattern::parse(line)
-            .with_context(|| format!("private pattern entry {} ('{line}')", lineno + 1))?;
-        if seen.insert(pattern.0.clone()) {
-            patterns.push(pattern);
-        }
-    }
-    let source_was_set = if from_cli {
-        cli_from_file.is_some() || !cli_inline.is_empty()
-    } else {
-        file_inline.is_some() || file_from_file.is_some()
-    };
-    if source_was_set && patterns.is_empty() {
-        bail!(
-            "private patterns were configured but list no names; omit the setting or provide at least one pattern"
-        );
-    }
-    Ok(patterns)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Format {
     Wheel,
@@ -974,10 +821,10 @@ struct Resolved {
     /// (`origin = private`) rather than mirror it. Suppresses the `mirror` form
     /// field and the mirror-only metadata, and skips yank reconcile / status relay.
     as_private: bool,
-    /// Operator-authored ownership rules used only to expand a pypicloud
-    /// migration's project work list.
-    private_patterns: Vec<PrivatePattern>,
-    private_prefix: Option<String>,
+    /// The reserved private names: a mirror run refuses them before any network
+    /// traffic (the server enforces it again), and a pypicloud migration expands
+    /// its project work list from them.
+    private: PrivateNames,
     /// The advisory-feed source for the relay. `None` = relay from the sync source
     /// (on by default, gated on [`Self::src_explicit`]); `Some("")` after trim =
     /// disabled; `Some(url|path)` = fetch that. See [`push_advisory_feed`].
@@ -1048,6 +895,7 @@ pub struct ResolvedMirror {
 
 impl Resolved {
     async fn merge(args: &SyncArgs, cfg: ConfigFile) -> Result<Self> {
+        let private = args.private.resolve(&cfg)?;
         let sync = cfg.sync;
 
         let source_kind = match args.source_kind {
@@ -1059,12 +907,6 @@ impl Resolved {
                 None => SourceKind::Simple,
             },
         };
-        let private_patterns = resolve_private_patterns(
-            &args.private_pattern,
-            args.private_patterns_from.as_deref(),
-            sync.private_patterns.as_ref(),
-            sync.private_patterns_from.as_deref(),
-        )?;
 
         // Sync mirrors over HTTP; a destination is mandatory.
         let dst_base = require_url_scheme(args.dst_base.clone().or(sync.to).ok_or_else(|| {
@@ -1078,11 +920,6 @@ impl Resolved {
         let mirror = args.mirror.resolve(Some(&cfg.mirror))?;
         match source_kind {
             SourceKind::Simple => {
-                if !private_patterns.is_empty() {
-                    bail!(
-                        "--private-pattern/--private-patterns-from is only valid with --source-kind pypicloud --as-private"
-                    );
-                }
                 if mirror.include_packages.is_empty() {
                     bail!(
                         "no packages to sync: provide --include-package/--include-packages-from or [mirror].include-packages in pypiron.toml; exclude-packages alone is not a work list"
@@ -1098,7 +935,7 @@ impl Resolved {
                         "--source-kind pypicloud requires --from <pypicloud application root> or [sync].from"
                     );
                 }
-                if mirror.include_packages.is_empty() && private_patterns.is_empty() {
+                if mirror.include_packages.is_empty() && private.is_empty() {
                     bail!(
                         "a pypicloud migration needs an explicit private work list: provide --private-pattern/--private-patterns-from or --include-package/--include-packages-from"
                     );
@@ -1156,8 +993,7 @@ impl Resolved {
             admin_pass: args.admin_pass.clone().or(sync.admin_pass),
             source_auth,
             as_private: args.as_private,
-            private_patterns,
-            private_prefix: args.private_prefix.clone().or(cfg.private_prefix),
+            private,
             advisory_feed,
             src_explicit,
             concurrency,
@@ -2157,12 +1993,12 @@ pub async fn run_sync(args: SyncArgs, config_path: Option<PathBuf>) -> Result<()
     // once per file.
     preflight(&client, &resolved).await?;
 
-    if resolved.source_kind == SourceKind::Pypicloud && !resolved.private_patterns.is_empty() {
+    if resolved.source_kind == SourceKind::Pypicloud && !resolved.private.is_empty() {
         let discovered = pypicloud::discover_packages(
             &client,
             &resolved.src_base,
             resolved.source_auth.as_ref(),
-            &resolved.private_patterns,
+            resolved.private.patterns(),
         )
         .await?;
         let discovered_count = discovered.len();
@@ -2283,12 +2119,10 @@ async fn sync_one_package(
     let pkg = spec.name.as_str();
 
     // Policy gate before any network traffic. The server enforces it again —
-    // defense in both places.
-    if let Some(prefix) = &resolved.private_prefix {
-        let prefix = normalize_pkg_name(prefix);
-        if matches_prefix(pkg, &prefix) {
-            bail!("'{pkg}' is inside the private namespace '{prefix}'; refusing to mirror");
-        }
+    // defense in both places. A migration (`--as-private`) is the one writer
+    // that is *supposed* to land on reserved names.
+    if !resolved.as_private && resolved.private.matches(pkg) {
+        bail!("'{pkg}' is a reserved private name; refusing to mirror");
     }
     if resolved.denylist.name_fully_denied(pkg) {
         info!("{pkg}: excluded by mirror package denylist");
@@ -3601,30 +3435,6 @@ mod tests {
         assert!(parse_spec_line("requests >= 2.20").is_ok());
     }
 
-    #[test]
-    fn private_patterns_normalize_and_match_whole_names() {
-        let prefix = PrivatePattern::parse("Acme_*").unwrap();
-        assert_eq!(prefix.0, "acme-*");
-        assert!(prefix.matches("acme-auth"));
-        assert!(!prefix.matches("other-acme-auth"));
-
-        let middle = PrivatePattern::parse("team-*-internal").unwrap();
-        assert!(middle.matches("team-billing-internal"));
-        assert!(!middle.matches("team-billing-internal-extra"));
-
-        let exact = PrivatePattern::parse("Internal.Tool").unwrap();
-        assert_eq!(exact.0, "internal-tool");
-        assert!(exact.matches("internal-tool"));
-        assert!(!exact.matches("internal-toolkit"));
-    }
-
-    #[test]
-    fn private_patterns_refuse_catch_all_and_hostile_syntax() {
-        for bad in ["", "*", "***", "acme/?", "acme/[x]"] {
-            assert!(PrivatePattern::parse(bad).is_err(), "{bad:?}");
-        }
-    }
-
     fn simple_file(upload_time: Option<&str>) -> SimpleFile {
         SimpleFile {
             filename: "six-1.16.0-py2.py3-none-any.whl".into(),
@@ -4263,8 +4073,7 @@ mod tests {
             admin_pass: None,
             source_auth: None,
             as_private: false,
-            private_patterns: Vec::new(),
-            private_prefix: None,
+            private: PrivateNames::default(),
             advisory_feed: None,
             src_explicit: false,
             concurrency: 1,

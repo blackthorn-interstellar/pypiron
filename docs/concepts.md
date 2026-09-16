@@ -44,9 +44,10 @@ does not release that claim, so a private package never falls through to PyPI.
 To repurpose an empty name, an admin must release it explicitly.
 
 `--private-prefix acme` reserves `acme` and `acme-*` for private packages,
-including names you have not published yet. Name matching follows Python's
-normalization rules, so `acme_foo`, `acme.foo`, and `acme-foo` are the same
-name.
+including names you have not published yet. When your private names do not
+share one prefix, `--private-pattern` reserves any set of them: `blueowl-*`,
+`hiroad-*`, `bolt`. Name matching follows Python's normalization rules, so
+`acme_foo`, `acme.foo`, and `acme-foo` are the same name.
 
 [Dependency-confusion protection](security.md#dependency-confusion)
 

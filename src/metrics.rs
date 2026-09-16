@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use axum::http::Method;
+
 use crate::bucket_health::{HealthState, WorkerHealthSnapshot};
 use crate::clock::unix_now_secs;
 
@@ -56,9 +58,13 @@ struct BucketMetricState {
     topology_write_fenced: bool,
 }
 
-/// Index into [`ROUTES`] for a request path.
-pub fn route_group(path: &str) -> usize {
-    if path == "/simple" || path.starts_with("/simple/") {
+/// Index into [`ROUTES`] for a request. Path-keyed, except that an upload on
+/// one of `/legacy`'s aliases (`POST /`, `/simple`, `/simple/` — see the
+/// router) is an upload, not an index read.
+pub fn route_group(method: &Method, path: &str) -> usize {
+    if *method == Method::POST && matches!(path, "/" | "/simple" | "/simple/") {
+        2
+    } else if path == "/simple" || path.starts_with("/simple/") {
         0
     } else if path.starts_with("/files/") {
         1
@@ -852,10 +858,10 @@ mod tests {
     #[test]
     fn snapshot_reports_totals_files_served_and_breakdowns() {
         let m = Metrics::new();
-        m.record_request(route_group("/simple/"), 200);
-        m.record_request(route_group("/simple/"), 404);
-        m.record_request(route_group("/files/six/six.whl"), 200);
-        m.record_request(route_group("/files/six/six.whl"), 200);
+        m.record_request(route_group(&Method::GET, "/simple/"), 200);
+        m.record_request(route_group(&Method::GET, "/simple/"), 404);
+        m.record_request(route_group(&Method::GET, "/files/six/six.whl"), 200);
+        m.record_request(route_group(&Method::GET, "/files/six/six.whl"), 200);
         m.record_download();
         m.record_download();
         let snap = m.snapshot();
@@ -869,21 +875,34 @@ mod tests {
 
     #[test]
     fn route_groups_classify_paths() {
-        assert_eq!(ROUTES[route_group("/simple/")], "simple");
-        assert_eq!(ROUTES[route_group("/simple/six/index.json")], "simple");
-        assert_eq!(ROUTES[route_group("/files/six/six.whl")], "files");
-        assert_eq!(ROUTES[route_group("/legacy/")], "legacy");
-        assert_eq!(ROUTES[route_group("/health")], "health");
-        assert_eq!(ROUTES[route_group("/ready")], "health");
-        assert_eq!(ROUTES[route_group("/metrics")], "metrics");
-        assert_eq!(ROUTES[route_group("/nope")], "other");
+        assert_eq!(ROUTES[route_group(&Method::GET, "/simple/")], "simple");
+        assert_eq!(
+            ROUTES[route_group(&Method::GET, "/simple/six/index.json")],
+            "simple"
+        );
+        assert_eq!(
+            ROUTES[route_group(&Method::GET, "/files/six/six.whl")],
+            "files"
+        );
+        assert_eq!(ROUTES[route_group(&Method::GET, "/legacy/")], "legacy");
+        // The upload aliases count as uploads only when they are one.
+        for alias in ["/", "/simple", "/simple/"] {
+            assert_eq!(ROUTES[route_group(&Method::POST, alias)], "legacy");
+        }
+        assert_eq!(ROUTES[route_group(&Method::GET, "/")], "other");
+        assert_eq!(ROUTES[route_group(&Method::GET, "/simple")], "simple");
+        assert_eq!(ROUTES[route_group(&Method::POST, "/simple/six/")], "simple");
+        assert_eq!(ROUTES[route_group(&Method::GET, "/health")], "health");
+        assert_eq!(ROUTES[route_group(&Method::GET, "/ready")], "health");
+        assert_eq!(ROUTES[route_group(&Method::GET, "/metrics")], "metrics");
+        assert_eq!(ROUTES[route_group(&Method::GET, "/nope")], "other");
     }
 
     #[test]
     fn renders_prometheus_text() {
         let m = Metrics::new();
-        m.record_request(route_group("/simple/"), 200);
-        m.record_request(route_group("/simple/"), 404);
+        m.record_request(route_group(&Method::GET, "/simple/"), 200);
+        m.record_request(route_group(&Method::GET, "/simple/"), 404);
         m.proxy_artifacts_cached.fetch_add(3, Ordering::Relaxed);
         m.record_download();
         let text = m.render();
@@ -1044,10 +1063,13 @@ mod tests {
     #[test]
     fn records_project_attribution() {
         let m = Metrics::new();
-        m.record_project("billing-api", route_group("/simple/"));
-        m.record_project("billing-api", route_group("/simple/"));
-        m.record_project("billing-api", route_group("/files/six/six.whl"));
-        m.record_project("etl", route_group("/simple/"));
+        m.record_project("billing-api", route_group(&Method::GET, "/simple/"));
+        m.record_project("billing-api", route_group(&Method::GET, "/simple/"));
+        m.record_project(
+            "billing-api",
+            route_group(&Method::GET, "/files/six/six.whl"),
+        );
+        m.record_project("etl", route_group(&Method::GET, "/simple/"));
         let text = m.render();
         assert!(text.contains(
             "pypiron_project_requests_total{project=\"billing-api\",route=\"simple\"} 2"

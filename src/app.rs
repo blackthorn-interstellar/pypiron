@@ -30,7 +30,7 @@ use crate::{
 
 use bucket_health::{HealthController, HealthPolicy};
 use buckets::{BucketHandle, BucketSet, Pinned};
-use names::checked_pkg_name;
+use names::PrivateNames;
 use storage::Storage;
 
 use crate::cli::{
@@ -254,7 +254,10 @@ pub struct AppState {
     /// Secret for signing/verifying stateless install tokens. None disables
     /// token auth entirely (mint endpoint refuses, `__token__` never verifies).
     pub token_signing_key: Option<String>,
-    pub private_prefix: Option<String>,
+    /// The reserved private names (`--private-prefix` / `--private-pattern`):
+    /// never proxied or mirrored, and when non-empty the only names a new
+    /// private package may claim.
+    pub private: PrivateNames,
     pub artifact_delivery: ArtifactDelivery,
     /// Attach per-client `project` labels to `/metrics`. Off by default because
     /// `/metrics` carries no auth; see the flag of the same name.
@@ -587,7 +590,7 @@ impl AppState {
             read_user: None,
             read_pass: None,
             token_signing_key: None,
-            private_prefix: None,
+            private: PrivateNames::default(),
             artifact_delivery: ArtifactDelivery::Auto,
             metrics_project_labels: false,
             access_log: false,
@@ -1206,7 +1209,9 @@ async fn run_serve(
     let explicit_malware_block =
         arg_from_cli_or_env(serve_matches, "malware_block") || file.serve.malware_block.is_some();
     merge_serve_file(&mut cli, &file.serve, serve_matches)?;
-    cli.private_prefix = cli.private_prefix.take().or(file.private_prefix.clone());
+    // The reserved private names are the dependency-confusion control; a bad
+    // prefix or pattern fails closed here rather than protecting nothing.
+    let private = cli.private.resolve(&file)?;
     validate_intent_grace_secs(cli.intent_grace_secs)?;
 
     // Load the operator's extra upstream trust roots (a corporate MITM CA) before
@@ -1498,16 +1503,6 @@ async fn run_serve(
     // reconcile can relist what a prior config's excludes delisted.
     let denylist = proxy.as_ref().map(|p| p.denylist());
 
-    // The private prefix is the dependency-confusion control; a value that PEP
-    // 503 normalization reduces to empty (e.g. `.`, `_`, `..`) would match no
-    // package and silently protect nothing. Fail closed at startup instead.
-    let private_prefix = match cli.private_prefix.as_deref() {
-        Some(raw) => Some(checked_pkg_name(raw).ok_or_else(|| {
-            anyhow::anyhow!("--private-prefix '{raw}' is not a valid package name")
-        })?),
-        None => None,
-    };
-
     // Counter day-rollups are replicated truth (the leader mirrors them to every
     // bucket); the current day's live tallies are per-bucket, declared loss. Each
     // flush, compaction, or query pins the selected handle once, so a switch
@@ -1611,7 +1606,7 @@ async fn run_serve(
         read_user: cli.read_user,
         read_pass: cli.read_pass,
         token_signing_key: cli.token_signing_key,
-        private_prefix,
+        private,
         artifact_delivery: cli.artifact_delivery,
         metrics_project_labels: cli.metrics_project_labels,
         access_log: cli.access_log,
@@ -1678,8 +1673,12 @@ async fn run_serve(
     {
         warn!("uploader and admin credentials are identical: every uploader has admin powers");
     }
-    if state.proxy.is_some() && state.private_prefix.is_none() {
-        warn!("proxy enabled without --private-prefix: new private uploads race public names for first claim; a reserved prefix closes that hole");
+    if state.private.is_empty() {
+        if state.proxy.is_some() {
+            warn!("proxy enabled without --private-prefix / --private-pattern: new private uploads race public names for first claim; reserving your private names closes that hole");
+        }
+    } else {
+        info!(names = %state.private, "reserved private names");
     }
 
     // Arm the replication metric family only when multi-bucket is live (§G).
@@ -1698,6 +1697,15 @@ async fn run_serve(
         // Legacy PyPI upload API (used by uv/twine).
         .route("/legacy", post(legacy_upload))
         .route("/legacy/", post(legacy_upload))
+        // Upload aliases, for a hostname cutover from pypicloud: it documented
+        // `POST /simple/` as its upload URL (one URL for pip and twine), and
+        // `uv publish` posts to `/` when its publish URL has no path. Same
+        // handler, auth and deadline; GET on these paths is the index/front
+        // door (the method routers merge). Keep them in step with
+        // `metrics::route_group`.
+        .route("/", post(legacy_upload))
+        .route("/simple", post(legacy_upload))
+        .route("/simple/", post(legacy_upload))
         // Artifact bytes (streamed through this node in `stream` mode).
         .route(
             "/files/:package/:filename",
@@ -2367,7 +2375,7 @@ async fn track_metrics(
     req: Request,
     next: Next,
 ) -> Response<Body> {
-    let group = metrics::route_group(req.uri().path());
+    let group = metrics::route_group(req.method(), req.uri().path());
     // Traffic signal for multi-bucket probe gating: real client requests only.
     // /health and /metrics are infra polls (a load balancer hits /health every
     // second); counting them would pin probes at full cadence forever and

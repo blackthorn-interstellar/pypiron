@@ -457,11 +457,9 @@ async fn advisory_panel_rows(
         return rows; // no match → no origin read, no panel
     }
     // A match — but a private-origin name is never the package OSV named. Fast
-    // private-prefix pre-check (no I/O), then the authoritative claim.
-    if let Some(prefix) = &state.private_prefix {
-        if names::matches_prefix(pkg, prefix) {
-            return Vec::new();
-        }
+    // reserved-name pre-check (no I/O), then the authoritative claim.
+    if state.private.matches(pkg) {
+        return Vec::new();
     }
     match origin::read_origin_claim(storage, pkg).await {
         Ok(Some(origin::OriginState::Private)) => return Vec::new(),

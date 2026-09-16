@@ -118,6 +118,26 @@ pypicloud's uploader metadata is incomplete, so pypiron does not use it to
 decide ownership. The pattern list is the ownership decision. Unmatched cached
 public projects are not copied.
 
+Give the destination server the same list. In its `pypiron.toml`:
+
+```toml
+private-patterns = ["acme-*", "internal-tool"]
+private-patterns-from = "private-packages.txt"
+```
+
+Those names are then reserved on the server: they are never fetched from PyPI
+or accepted from a mirror, and new private uploads must match the list. Put
+the list in place before enabling `proxy-upstream`, or the first install of an
+unclaimed name would claim it as public. See
+[Reserved private names](../reference/configuration.md#reserved-private-names).
+
+### Keep the old hostname
+
+pypicloud publishers post to `/simple/`, and `uv publish` posts to `/` when
+its publish URL has no path. pypiron accepts uploads on both, as well as on
+`/legacy/`, so you can move the hostname to pypiron without editing every
+publisher. Point new publishers at `/legacy/`.
+
 ## Migrating a long package list
 
 Put one requirement per line in `packages.txt`:
@@ -156,8 +176,9 @@ pypiron origin release PACKAGE \
   --config /etc/pypiron/pypiron.toml
 ```
 
-Restart the server, then migrate the package. If the destination uses
-`private-prefix`, every migrated name must match that prefix.
+Restart the server, then migrate the package. If the destination reserves
+private names (`private-prefix` or `private-patterns`), every migrated name
+must be a reserved one.
 
 Use `--allow-insecure-source` only for a trusted plaintext source. Credentials
 otherwise require HTTPS and are never forwarded to another host after a

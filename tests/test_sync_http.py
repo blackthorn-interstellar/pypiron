@@ -142,7 +142,7 @@ def test_sync_refuses_private_namespace(disk_server, pypiron_bin):
         timeout=120,
     )
     assert rc != 0
-    assert "namespace" in (out + err)
+    assert f"'{PACKAGE}' is a reserved private name; refusing to mirror" in (out + err)
     assert not (disk_server["data_dir"] / "packages" / PACKAGE).exists()
 
 
@@ -221,6 +221,23 @@ def test_mirror_prefix_block_holds_even_when_already_mirror_claimed(disk_server_
         fields={"mirror": "true", "name": "acme-tool", "upload_time": "2020-01-01T00:00:00Z"},
         expect_status=403,
     )
+
+
+def test_sync_refuses_to_mirror_a_reserved_pattern_name(disk_server, pypiron_bin):
+    """`sync` gates on the reserved names before any upstream traffic, the same
+    pattern language the server enforces: `--private-pattern bolt` fences `bolt`
+    from a mirror run even though it is a real public package."""
+    rc, out, err = sync_to(
+        pypiron_bin,
+        disk_server,
+        "--include-package",
+        "bolt",
+        "--private-pattern",
+        "blueowl-*,bolt",
+    )
+    assert rc != 0
+    assert "'bolt' is a reserved private name; refusing to mirror" in out + err
+    assert not (disk_server["data_dir"] / "packages" / "bolt").exists()
 
 
 def test_mirror_requires_admin_credential(disk_server, tmp_path):

@@ -1,4 +1,5 @@
-"""Milestone 8: origin exclusivity and the private-namespace prefix policy."""
+"""Milestone 8: origin exclusivity and the reserved private names (prefix and
+pattern) policy."""
 
 from __future__ import annotations
 
@@ -6,7 +7,14 @@ import shutil
 
 import pytest
 
-from .helpers import download_pypi_wheel, origin_owner, upload_legacy, wait_for_file_in_index
+from .conftest import _start_disk_server
+from .helpers import (
+    download_pypi_wheel,
+    make_wheel,
+    origin_owner,
+    upload_legacy,
+    wait_for_file_in_index,
+)
 
 PACKAGE = "six"
 VERSION = "1.17.0"
@@ -66,6 +74,79 @@ def test_private_prefix_policy(disk_server_prefixed, tmp_path):
         origin_owner((server["data_dir"] / "packages" / "acme-foo" / ".origin").read_text())
         == "private"
     )
+
+
+def _assert_private_upload_lands(server, wheel, package):
+    creds = {"username": server["user"], "password": server["password"]}
+    upload_legacy(server["legacy"], wheel, **creds)
+    wait_for_file_in_index(server["simple"], package, wheel.name)
+    origin = server["data_dir"] / "packages" / package / ".origin"
+    assert origin_owner(origin.read_text()) == "private"
+
+
+def test_private_patterns_policy(disk_server_patterned, tmp_path):
+    """Reserved names by pattern: a mixed set (two prefix families plus an
+    unprefixed name that also exists on public PyPI) gates new private packages
+    exactly as one prefix does, without forcing every private package under a
+    single namespace."""
+    server = disk_server_patterned
+    creds = {"username": server["user"], "password": server["password"]}
+
+    # Outside every reserved name: rejected.
+    upload_legacy(server["legacy"], make_wheel("six", "1.0", tmp_path), expect_status=403, **creds)
+    # Patterns are anchored whole names: `bolt` does not cover `bolt-on`, and
+    # `blueowl-*` needs its dash (a string prefix would let `blueowltool` in).
+    for impostor in ("bolt-on", "blueowltool"):
+        wheel = make_wheel(impostor, "1.0", tmp_path)
+        upload_legacy(server["legacy"], wheel, expect_status=403, **creds)
+
+    # Each reserved family accepts and claims private, normalization included.
+    _assert_private_upload_lands(server, make_wheel("bolt", "1.0", tmp_path), "bolt")
+    _assert_private_upload_lands(
+        server, make_wheel("blueowl_tool", "1.0", tmp_path), "blueowl-tool"
+    )
+    _assert_private_upload_lands(server, make_wheel("HiRoad_SDK", "1.0", tmp_path), "hiroad-sdk")
+
+    # A mirror upload (admin) may never touch a reserved name, claimed or not.
+    upload_legacy(
+        server["legacy"],
+        make_wheel("hiroad-other", "1.0", tmp_path),
+        username=server["admin_user"],
+        password=server["admin_password"],
+        fields={"mirror": "true", "upload_time": "2020-01-01T00:00:00Z"},
+        expect_status=403,
+    )
+
+
+def test_private_patterns_from_config_file(tmp_path_factory, pypiron_bin, tmp_path):
+    """The file form a migration hands over: top-level `private-patterns` plus a
+    `private-patterns-from` list resolved next to pypiron.toml, unioned with
+    `private-prefix`."""
+    cfg_dir = tmp_path_factory.mktemp("private-cfg")
+    (cfg_dir / "private.txt").write_text("# unprefixed internals\nlogbundle\n\nbo-mb\n")
+    (cfg_dir / "pypiron.toml").write_text(
+        'private-prefix = "acme"\n'
+        'private-patterns = ["quanata-*"]\n'
+        'private-patterns-from = "private.txt"\n'
+    )
+    gen = _start_disk_server(
+        tmp_path_factory, pypiron_bin, extra_args=["--config", str(cfg_dir / "pypiron.toml")]
+    )
+    server = next(gen)
+    try:
+        creds = {"username": server["user"], "password": server["password"]}
+        upload_legacy(
+            server["legacy"], make_wheel("six", "1.0", tmp_path), expect_status=403, **creds
+        )
+        for name, package in (
+            ("logbundle", "logbundle"),
+            ("bo_mb", "bo-mb"),
+            ("quanata_ml", "quanata-ml"),
+            ("acme_core", "acme-core"),
+        ):
+            _assert_private_upload_lands(server, make_wheel(name, "1.0", tmp_path), package)
+    finally:
+        gen.close()
 
 
 def test_origin_claim_survives_deletion(disk_server, tmp_path):

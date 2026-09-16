@@ -13,10 +13,14 @@
 # uploader, and read passwords, the token signing key, and the Azure access key
 # come only from the CLI or the environment.
 
-# Reserve a private namespace: names equal to `<prefix>` or starting `<prefix>-`
-# are yours alone and never fall through to an upstream (a dependency-confusion
-# guard). Shared by `sync` and the `serve` proxy.
+# Reserve your private names, so they never fall through to an upstream and a
+# new private package can't be raced by a public one (a dependency-confusion
+# guard). Shared by `sync` and the `serve` proxy. A prefix reserves `<prefix>`
+# and `<prefix>-*`; patterns reserve whole names, `*` matching any substring.
+# The two union; a bare `*` is refused.
 # private-prefix = "acme"
+# private-patterns = ["blueowl-*", "quanata-*", "bolt"]
+# private-patterns-from = "private-packages.txt"   # one per line; resolves next to this file
 
 
 [serve]  # the server process — `pypiron serve`
@@ -192,11 +196,8 @@
 # off a private devpi/Artifactory/Nexus). Prefer PYPIRON_SYNC_SOURCE_PASS.
 # source-user = "reader"
 # source-pass = "secret"                    # better: set PYPIRON_SYNC_SOURCE_PASS
-# For a pypicloud migration, declare private project names. `*` matches within
-# the whole normalized name; a bare `*` is refused. CLI equivalents:
-# --private-pattern / --private-patterns-from.
-# private-patterns = ["acme-*", "internal-tool"]
-# private-patterns-from = "private-packages.txt"
+# A pypicloud migration takes its work list from the top-level private-prefix /
+# private-patterns above (or from [mirror].include-packages).
 # Destination admin credential (mirroring is admin-only). Prefer supplying the
 # password via PYPIRON_SYNC_ADMIN_PASS over committing it here.
 # admin-user = "admin"

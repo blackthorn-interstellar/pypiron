@@ -369,6 +369,41 @@ def test_private_prefix_blocks_proxy(proxy_pair_prefixed, tmp_path):
     assert code == 404
 
 
+def test_private_patterns_block_proxy(proxy_pair_patterned, tmp_path):
+    """Reserved-by-pattern names never fall through — the hole proxy mode opens
+    for a mixed private set: `bolt` exists on public PyPI and `blueowl-*` could
+    be squatted there, and the first unclaimed GET would otherwise own the name
+    as public for good."""
+    upstream, proxy = proxy_pair_patterned["upstream"], proxy_pair_patterned["proxy"]
+    wheels = {name: make_wheel(name, "1.0", tmp_path) for name in ("bolt", "blueowl-tool")}
+    for name, wheel in wheels.items():
+        _upload(upstream, wheel, name)
+        code, _, _ = http_get(
+            f"{proxy['simple']}{name}/index.json", headers={"Accept": ACCEPT_PEP691}
+        )
+        assert code == 404, name
+        code, _, _ = http_get(f"{proxy['base_url']}/files/{name}/{wheel.name}")
+        assert code == 404, name
+        assert not (proxy["data_dir"] / "packages" / name).exists(), "nothing was cached"
+
+    # The reservation is a fence, not a scope: an unreserved name still proxies.
+    public = make_wheel("publicthing", "1.0", tmp_path)
+    _upload(upstream, public, "publicthing")
+    assert public.name in [
+        f["filename"] for f in get_index_json(proxy["simple"], "publicthing")["files"]
+    ]
+
+    # And a private upload of a reserved name lands private on the proxy, so the
+    # upstream twin can never displace it.
+    upload_legacy(
+        proxy["legacy"], wheels["bolt"], username=proxy["user"], password=proxy["password"]
+    )
+    wait_for_file_in_index(proxy["simple"], "bolt", wheels["bolt"].name)
+    assert (
+        origin_owner((proxy["data_dir"] / "packages" / "bolt" / ".origin").read_text()) == "private"
+    )
+
+
 def test_proxy_mirror_rules_gate_what_is_served(proxy_pair_wheels_only, tmp_path):
     upstream, proxy = (
         proxy_pair_wheels_only["upstream"],

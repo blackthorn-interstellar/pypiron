@@ -1,8 +1,9 @@
 //! `pypiron.toml`: file-based configuration, layered under CLI/env.
 //!
 //! Four pieces, one per concern:
-//!   - top-level `private-prefix` — the reserved private namespace, shared by
-//!     `sync` and the `serve` proxy (one knob, one place).
+//!   - top-level `private-prefix` / `private-patterns` / `private-patterns-from`
+//!     — the reserved private names, shared by `sync` and the `serve` proxy
+//!     (one knob, one place).
 //!   - `[mirror]` — the slice of PyPI you want, names included. Shared by
 //!     `sync` (push mirror) and `serve --proxy-upstream` (on-demand pull
 //!     mirror): set it once, it governs whichever you run.
@@ -17,9 +18,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 pub(crate) const DEFAULT_CONFIG_PATH: &str = "pypiron.toml";
 
@@ -36,6 +37,11 @@ pub struct ConfigFile {
     /// Reserved private namespace (PEP 503-normalized). Shared by `sync` and the
     /// `serve` proxy — the dependency-confusion control belongs in one place.
     pub private_prefix: Option<String>,
+    /// Reserved private names by whole-name pattern (`*` matches any substring).
+    /// Same sharing as `private-prefix`; the two union.
+    pub private_patterns: Option<Vec<String>>,
+    /// File of private-name patterns, one per line; resolves next to this file.
+    pub private_patterns_from: Option<PathBuf>,
     #[serde(default)]
     pub mirror: UpstreamConfig,
     #[serde(default)]
@@ -189,9 +195,10 @@ pub struct SyncConfig {
     /// password via `PYPIRON_SYNC_SOURCE_PASS`.
     pub source_user: Option<String>,
     pub source_pass: Option<String>,
-    /// Whole-name patterns that declare which pypicloud projects are private.
+    /// Deprecated spelling of the top-level `private-patterns` (v0.0.18 shipped
+    /// it here, pypicloud-migration only). Folded into the top level on load.
     pub private_patterns: Option<Vec<String>>,
-    /// File of private-name patterns, one per line.
+    /// Deprecated spelling of the top-level `private-patterns-from`.
     pub private_patterns_from: Option<PathBuf>,
     pub concurrency: Option<usize>,
     pub package_concurrency: Option<usize>,
@@ -201,6 +208,36 @@ pub struct SyncConfig {
     /// server's snapshot (on by default); a URL/path fetches that feed; `""`
     /// disables the relay. Shares the `PYPIRON_ADVISORY_FEED` concept with serve.
     pub advisory_feed: Option<String>,
+}
+
+/// `[sync].private-patterns` / `private-patterns-from` predate the top-level
+/// keys (they shipped in v0.0.18 as a pypicloud-migration selector). They still
+/// parse, folded into the top level so every consumer sees one list, with a
+/// deprecation warning. Two pattern files would need a merge order nobody
+/// documented, so that combination is refused instead.
+fn fold_deprecated_sync_private_patterns(cfg: &mut ConfigFile) -> Result<()> {
+    let inline = cfg.sync.private_patterns.take();
+    let from_file = cfg.sync.private_patterns_from.take();
+    if inline.is_none() && from_file.is_none() {
+        return Ok(());
+    }
+    warn!(
+        "[sync].private-patterns / private-patterns-from are deprecated: move them to the top level of pypiron.toml"
+    );
+    if let Some(list) = inline {
+        cfg.private_patterns
+            .get_or_insert_with(Vec::new)
+            .extend(list);
+    }
+    if let Some(path) = from_file {
+        if cfg.private_patterns_from.is_some() {
+            bail!(
+                "private-patterns-from is set both at the top level and under [sync]; keep the top-level one"
+            );
+        }
+        cfg.private_patterns_from = Some(path);
+    }
+    Ok(())
 }
 
 /// Load configuration. An explicit `--config` path must exist; without one,
@@ -227,6 +264,8 @@ pub fn load(explicit: Option<&Path>) -> Result<ConfigFile> {
     rebase_relative(&mut cfg.mirror.include_packages_from, &path);
     rebase_relative(&mut cfg.mirror.exclude_packages_from, &path);
     rebase_relative(&mut cfg.sync.private_patterns_from, &path);
+    rebase_relative(&mut cfg.private_patterns_from, &path);
+    fold_deprecated_sync_private_patterns(&mut cfg)?;
     // Announce only after a clean parse — silent auto-discovery of
     // ./pypiron.toml is how an unrelated CLI invocation gets quietly rewired,
     // but a malformed file shouldn't claim it "loaded". The read/parse errors
@@ -253,11 +292,12 @@ mod tests {
         let cfg: ConfigFile = toml::from_str(
             r#"
             private-prefix = "acme"
+            private-patterns = ["acme-*", "internal-tool"]
+            private-patterns-from = "private.txt"
 
             [sync]
             to = "http://localhost:8080"
             source-kind = "pypicloud"
-            private-patterns = ["acme-*", "internal-tool"]
             concurrency = 8
             package-concurrency = 16
 
@@ -279,7 +319,11 @@ mod tests {
         assert_eq!(cfg.sync.concurrency, Some(8));
         assert_eq!(cfg.sync.package_concurrency, Some(16));
         assert_eq!(cfg.sync.source_kind.as_deref(), Some("pypicloud"));
-        assert_eq!(cfg.sync.private_patterns.unwrap().len(), 2);
+        assert_eq!(cfg.private_patterns.unwrap().len(), 2);
+        assert_eq!(
+            cfg.private_patterns_from.as_deref(),
+            Some(Path::new("private.txt"))
+        );
         assert_eq!(cfg.mirror.include_format.unwrap(), ["wheel"]);
         assert_eq!(
             cfg.mirror.exclude_newer.as_deref(),
@@ -431,10 +475,64 @@ mod tests {
         assert_eq!(cfg.sync.to.as_deref(), Some("http://localhost:8080"));
         assert_eq!(cfg.sync.source_kind.as_deref(), Some("simple"));
         assert_eq!(
-            cfg.sync.private_patterns,
+            cfg.private_patterns,
+            Some(vec![
+                "blueowl-*".to_string(),
+                "quanata-*".to_string(),
+                "bolt".to_string()
+            ])
+        );
+        assert_eq!(
+            cfg.private_patterns_from.as_deref(),
+            Some(Path::new("private-packages.txt"))
+        );
+        assert!(cfg.sync.private_patterns.is_none());
+        assert_eq!(cfg.sync.concurrency, Some(4));
+    }
+
+    #[test]
+    fn deprecated_sync_private_patterns_fold_into_the_top_level() {
+        let mut cfg: ConfigFile = toml::from_str(
+            r#"
+            private-patterns = ["acme-*"]
+
+            [sync]
+            private-patterns = ["internal-tool"]
+            private-patterns-from = "old.txt"
+            "#,
+        )
+        .unwrap();
+        fold_deprecated_sync_private_patterns(&mut cfg).unwrap();
+        assert_eq!(
+            cfg.private_patterns,
             Some(vec!["acme-*".to_string(), "internal-tool".to_string()])
         );
-        assert_eq!(cfg.sync.concurrency, Some(4));
+        assert_eq!(
+            cfg.private_patterns_from.as_deref(),
+            Some(Path::new("old.txt"))
+        );
+        assert!(cfg.sync.private_patterns.is_none());
+        assert!(cfg.sync.private_patterns_from.is_none());
+
+        // Two pattern files is a merge order nobody documented: refused.
+        let mut cfg: ConfigFile = toml::from_str(
+            r#"
+            private-patterns-from = "new.txt"
+
+            [sync]
+            private-patterns-from = "old.txt"
+            "#,
+        )
+        .unwrap();
+        let err = fold_deprecated_sync_private_patterns(&mut cfg).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("both at the top level and under [sync]"));
+
+        // Nothing deprecated set: a no-op, not a warning.
+        let mut cfg: ConfigFile = toml::from_str("private-prefix = \"acme\"").unwrap();
+        fold_deprecated_sync_private_patterns(&mut cfg).unwrap();
+        assert!(cfg.private_patterns.is_none());
     }
 
     #[test]

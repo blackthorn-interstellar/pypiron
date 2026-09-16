@@ -10,8 +10,8 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tracing::warn;
 
-use super::{PrivatePattern, SourceAuth};
-use crate::names::checked_pkg_name;
+use super::SourceAuth;
+use crate::names::{checked_pkg_name, PrivatePattern};
 use crate::sidecar::Yanked;
 use crate::simple::{IndexFetch, SimpleFile, SimpleIndex};
 

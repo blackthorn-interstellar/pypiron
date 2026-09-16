@@ -1,5 +1,9 @@
 //! Package-name and filename parsing shared by the server, worker, and sync.
 
+use std::fmt;
+
+use anyhow::{anyhow, bail, Result};
+
 /// PEP 503 normalization: lowercase; replace runs of [-_.] with single '-'.
 pub fn normalize_pkg_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
@@ -104,14 +108,151 @@ pub fn checked_pkg_name(raw: &str) -> Option<String> {
     is_normalized(&name).then_some(name)
 }
 
-/// True if normalized `pkg` falls under normalized `prefix`: the prefix
-/// itself or anything below it (`acme` matches `acme` and `acme-foo`,
-/// never `acmefoo`). Cf. PEP 752 reserved namespaces.
-pub fn matches_prefix(pkg: &str, prefix: &str) -> bool {
-    pkg == prefix
-        || pkg
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('-'))
+/// One reserved private name, or a family of them: a whole-name pattern
+/// normalized like a package name, where `*` matches any substring. Anchored —
+/// `acme-*` covers `acme-auth` and never `other-acme-auth`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivatePattern(String);
+
+impl PrivatePattern {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            bail!("private pattern is empty");
+        }
+
+        let mut normalized = String::with_capacity(raw.len());
+        let mut last_dash = false;
+        let mut last_star = false;
+        for ch in raw.chars() {
+            if ch == '*' {
+                if !last_star {
+                    normalized.push('*');
+                }
+                last_star = true;
+                last_dash = false;
+                continue;
+            }
+            last_star = false;
+            if matches!(ch, '-' | '_' | '.') {
+                if !last_dash {
+                    normalized.push('-');
+                }
+                last_dash = true;
+                continue;
+            }
+            if !ch.is_ascii_alphanumeric() {
+                bail!("invalid private pattern '{raw}': use package-name characters and '*' only");
+            }
+            normalized.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        }
+        let normalized = normalized.trim_matches('-').to_string();
+        if normalized == "*" {
+            bail!(
+                "private pattern '*' would reserve every package name; list the private namespaces or names explicitly"
+            );
+        }
+        if normalized.is_empty() || normalized.len() > 256 {
+            bail!("invalid private pattern '{raw}'");
+        }
+        if !normalized.contains('*')
+            && checked_pkg_name(&normalized).as_deref() != Some(&normalized)
+        {
+            bail!("invalid private package name '{raw}'");
+        }
+        Ok(Self(normalized))
+    }
+
+    pub fn matches(&self, package: &str) -> bool {
+        wildcard_match(package.as_bytes(), self.0.as_bytes())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Anchored shell-style `*` matching over ASCII normalized package names.
+/// The greedy fallback is the standard linear wildcard matcher: a pattern must
+/// consume the whole name, so `acme-*` never matches `other-acme-tool`.
+fn wildcard_match(value: &[u8], pattern: &[u8]) -> bool {
+    let (mut value_i, mut pattern_i) = (0, 0);
+    let (mut star_i, mut star_value_i) = (None, 0);
+    while value_i < value.len() {
+        if pattern_i < pattern.len() && pattern[pattern_i] == value[value_i] {
+            value_i += 1;
+            pattern_i += 1;
+        } else if pattern_i < pattern.len() && pattern[pattern_i] == b'*' {
+            star_i = Some(pattern_i);
+            pattern_i += 1;
+            star_value_i = value_i;
+        } else if let Some(star) = star_i {
+            star_value_i += 1;
+            value_i = star_value_i;
+            pattern_i = star + 1;
+        } else {
+            return false;
+        }
+    }
+    pattern[pattern_i..].iter().all(|b| *b == b'*')
+}
+
+/// The reserved private names: the dependency-confusion control. A matching
+/// name is private by declaration — never proxied, never mirrored — and a new
+/// private package must match when anything is reserved at all. `--private-prefix
+/// acme` is the two patterns `acme` and `acme-*` (cf. PEP 752 namespaces);
+/// `--private-pattern` adds whole-name patterns. Empty reserves nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrivateNames(Vec<PrivatePattern>);
+
+impl PrivateNames {
+    /// A prefix that PEP 503 normalization reduces to empty (`.`, `_`, `..`)
+    /// would match no package and silently protect nothing, so it is refused.
+    pub fn new(prefix: Option<&str>, patterns: Vec<PrivatePattern>) -> Result<Self> {
+        let mut names = Self(Vec::with_capacity(patterns.len() + 2));
+        if let Some(raw) = prefix {
+            let prefix = checked_pkg_name(raw)
+                .ok_or_else(|| anyhow!("--private-prefix '{raw}' is not a valid package name"))?;
+            names.push(PrivatePattern::parse(&prefix)?);
+            names.push(PrivatePattern::parse(&format!("{prefix}-*"))?);
+        }
+        for pattern in patterns {
+            names.push(pattern);
+        }
+        Ok(names)
+    }
+
+    fn push(&mut self, pattern: PrivatePattern) {
+        if !self.0.contains(&pattern) {
+            self.0.push(pattern);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// True when normalized `pkg` is a reserved private name.
+    pub fn matches(&self, pkg: &str) -> bool {
+        self.0.iter().any(|pattern| pattern.matches(pkg))
+    }
+
+    pub fn patterns(&self) -> &[PrivatePattern] {
+        &self.0
+    }
+}
+
+impl fmt::Display for PrivateNames {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, pattern) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(pattern.as_str())?;
+        }
+        Ok(())
+    }
 }
 
 /// Best-effort version extraction from an artifact filename.
@@ -404,12 +545,63 @@ mod tests {
     }
 
     #[test]
-    fn prefix_matching_is_namespace_shaped() {
-        assert!(matches_prefix("acme", "acme"));
-        assert!(matches_prefix("acme-foo", "acme"));
-        assert!(matches_prefix("acme-foo-bar", "acme"));
-        assert!(!matches_prefix("acmefoo", "acme"));
-        assert!(!matches_prefix("other", "acme"));
+    fn private_patterns_normalize_and_match_whole_names() {
+        let prefix = PrivatePattern::parse("Acme_*").unwrap();
+        assert_eq!(prefix.as_str(), "acme-*");
+        assert!(prefix.matches("acme-auth"));
+        assert!(!prefix.matches("other-acme-auth"));
+
+        let middle = PrivatePattern::parse("team-*-internal").unwrap();
+        assert!(middle.matches("team-billing-internal"));
+        assert!(!middle.matches("team-billing-internal-extra"));
+
+        let exact = PrivatePattern::parse("Internal.Tool").unwrap();
+        assert_eq!(exact.as_str(), "internal-tool");
+        assert!(exact.matches("internal-tool"));
+        assert!(!exact.matches("internal-toolkit"));
+    }
+
+    #[test]
+    fn private_patterns_refuse_catch_all_and_hostile_syntax() {
+        for bad in ["", "*", "***", "acme/?", "acme/[x]"] {
+            assert!(PrivatePattern::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn private_names_prefix_is_namespace_shaped() {
+        let names = PrivateNames::new(Some("Acme"), Vec::new()).unwrap();
+        assert_eq!(names.to_string(), "acme, acme-*");
+        assert!(names.matches("acme"));
+        assert!(names.matches("acme-foo"));
+        assert!(names.matches("acme-foo-bar"));
+        assert!(!names.matches("acmefoo"));
+        assert!(!names.matches("other"));
+    }
+
+    #[test]
+    fn private_names_union_prefix_and_patterns_without_dupes() {
+        let patterns = vec![
+            PrivatePattern::parse("bolt").unwrap(),
+            PrivatePattern::parse("blueowl-*").unwrap(),
+            PrivatePattern::parse("acme-*").unwrap(),
+        ];
+        let names = PrivateNames::new(Some("acme"), patterns).unwrap();
+        assert_eq!(names.to_string(), "acme, acme-*, bolt, blueowl-*");
+        assert!(names.matches("bolt"));
+        assert!(!names.matches("bolt-on"));
+        assert!(names.matches("blueowl-tool"));
+        assert!(!names.matches("blueowltool"));
+        assert!(!names.is_empty());
+        assert!(PrivateNames::default().is_empty());
+        assert!(!PrivateNames::default().matches("anything"));
+    }
+
+    #[test]
+    fn private_names_refuse_a_prefix_that_normalizes_to_nothing() {
+        for bad in [".", "_", "..", ""] {
+            assert!(PrivateNames::new(Some(bad), Vec::new()).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

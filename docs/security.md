@@ -78,8 +78,10 @@ private upload. Deleting every file does not release the claim. Repurposing an
 empty name requires `pypiron origin release PACKAGE`.
 
 `--private-prefix acme` also reserves `acme` and `acme-*` before those packages
-exist. Point clients only at pypiron: use uv's default index or pip's
-`--index-url`, rather than adding PyPI with `--extra-index-url`.
+exist, and `--private-pattern` reserves any set of names (`blueowl-*`, `bolt`),
+including names that already exist on PyPI. Reserve your private names before
+enabling the proxy. Point clients only at pypiron: use uv's default index or
+pip's `--index-url`, rather than adding PyPI with `--extra-index-url`.
 
 ## Approval lists
 

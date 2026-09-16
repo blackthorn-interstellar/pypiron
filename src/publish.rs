@@ -457,7 +457,7 @@ async fn acquire_artifact_write_permit<'a>(
     }
 }
 
-/// The storage-protocol core of an upload: origin observation → private-prefix
+/// The storage-protocol core of an upload: origin observation → reserved-name
 /// and cross-origin rejects → intent marker → origin claim (with the early
 /// package-level fan-out) → write fence → verified artifact store → mirror
 /// sidecar → mirror post-publish claim re-check → tombstone/frozen filename
@@ -506,18 +506,14 @@ pub async fn publish_record(
             )
         })?;
     let mut write_fence = observed_origin.as_ref().cloned();
-    // The private namespace is off-limits to mirrors regardless of claim
-    // state — checked here, not only at first write, so adopting a prefix
-    // after a name was mirror-claimed still shuts the door.
-    if is_mirror {
-        if let Some(prefix) = &state.private_prefix {
-            if names::matches_prefix(&pkg_norm, prefix) {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    format!("'{pkg_norm}' is inside the private namespace '{prefix}'; mirrors may not touch it"),
-                ));
-            }
-        }
+    // A reserved private name is off-limits to mirrors regardless of claim
+    // state — checked here, not only at first write, so reserving a name
+    // after it was mirror-claimed still shuts the door.
+    if is_mirror && state.private.matches(&pkg_norm) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("'{pkg_norm}' is a reserved private name; mirrors may not touch it"),
+        ));
     }
     if let Some(owner) = observed_origin.as_ref().map(|observed| observed.state) {
         if matches!(
@@ -563,18 +559,17 @@ pub async fn publish_record(
             ));
         }
         None | Some(origin::OriginState::Unclaimed) => {
-            // A new private name must be inside the prefix; existing private
-            // packages outside a newly-adopted prefix are grandfathered (only
-            // first claims are gated, so adopting a prefix never bricks them).
-            if let Some(prefix) = &state.private_prefix {
-                if !is_mirror && !names::matches_prefix(&pkg_norm, prefix) {
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        format!(
-                            "Package '{pkg_norm}' does not match the private prefix '{prefix}'"
-                        ),
-                    ));
-                }
+            // A new private name must be a reserved one; existing private
+            // packages outside newly-adopted rules are grandfathered (only
+            // first claims are gated, so reserving names never bricks them).
+            if !is_mirror && !state.private.is_empty() && !state.private.matches(&pkg_norm) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "Package '{pkg_norm}' is not a reserved private name (reserved: {})",
+                        state.private
+                    ),
+                ));
             }
             // First write claims the package — atomically, so racing private
             // and mirror first-writes can't merge origins.

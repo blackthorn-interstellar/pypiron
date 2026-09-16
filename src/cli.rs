@@ -17,7 +17,7 @@ use crate::{
     transparency, verify,
 };
 use buckets::{BucketHandle, BucketSet};
-use names::checked_pkg_name;
+use names::{checked_pkg_name, PrivateNames, PrivatePattern};
 use storage::{Storage, StorageArgs};
 
 // Bare `pypiron` (no args) prints help (arg_required_else_help). Every verb is a
@@ -736,6 +736,95 @@ pub enum LogFormat {
     Json,
 }
 
+/// The reserved private names — one surface, flattened into both `serve` and
+/// `sync`, so the dependency-confusion control is one knob in one place: the
+/// server refuses to proxy or mirror a reserved name and gates new private
+/// packages to the reserved set; `sync` refuses to mirror one and, for a
+/// pypicloud migration, discovers its private work list from the same rules.
+/// The file form is the top-level `private-prefix` / `private-patterns` /
+/// `private-patterns-from` keys in pypiron.toml.
+#[derive(ClapArgs, Debug, Clone, Default)]
+pub struct PrivateArgs {
+    /// Reserve a private namespace: `<prefix>` and `<prefix>-*` (PEP
+    /// 503-normalized) are yours alone — never proxied or mirrored, and new
+    /// private packages must land on a reserved name
+    #[arg(long, env = "PYPIRON_PRIVATE_PREFIX", value_name = "PREFIX")]
+    pub(crate) private_prefix: Option<String>,
+
+    /// Reserve private names by whole-name pattern: `*` matches any substring
+    /// of the PEP 503-normalized name (`blueowl-*`, `bolt`). Repeatable;
+    /// comma-separated in the env var. A bare `*` is refused. Any pattern
+    /// given here (or via --private-patterns-from) replaces the config file's
+    /// list rather than merging with it
+    #[arg(
+        long = "private-pattern",
+        env = "PYPIRON_PRIVATE_PATTERN",
+        value_name = "PATTERN",
+        value_delimiter = ','
+    )]
+    pub(crate) private_pattern: Vec<String>,
+
+    /// File of private-name patterns, one per line. Blank lines and lines
+    /// beginning with `#` are ignored
+    #[arg(
+        long = "private-patterns-from",
+        env = "PYPIRON_PRIVATE_PATTERNS_FROM",
+        value_name = "FILE"
+    )]
+    pub(crate) private_patterns_from: Option<std::path::PathBuf>,
+}
+
+impl PrivateArgs {
+    /// Layer the file under CLI/env: the prefix falls back to the file's, and a
+    /// pattern list from the command line (inline or a file) replaces the config
+    /// file's list wholesale — never a union, so one layer can't quietly widen
+    /// another. A configured-but-empty list is refused for the same reason.
+    pub(crate) fn resolve(&self, file: &config::ConfigFile) -> Result<PrivateNames> {
+        let prefix = self
+            .private_prefix
+            .as_deref()
+            .or(file.private_prefix.as_deref());
+        let (inline, from_file, configured) =
+            if !self.private_pattern.is_empty() || self.private_patterns_from.is_some() {
+                (
+                    self.private_pattern.as_slice(),
+                    self.private_patterns_from.as_deref(),
+                    true,
+                )
+            } else {
+                (
+                    file.private_patterns.as_deref().unwrap_or_default(),
+                    file.private_patterns_from.as_deref(),
+                    file.private_patterns.is_some() || file.private_patterns_from.is_some(),
+                )
+            };
+        let mut lines = Vec::new();
+        if let Some(path) = from_file {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            lines.extend(text.lines().map(str::to_string));
+        }
+        lines.extend(inline.iter().cloned());
+
+        let mut patterns = Vec::new();
+        for (lineno, raw) in lines.iter().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let pattern = PrivatePattern::parse(line)
+                .with_context(|| format!("private pattern entry {} ('{line}')", lineno + 1))?;
+            patterns.push(pattern);
+        }
+        if configured && patterns.is_empty() {
+            bail!(
+                "private patterns were configured but list no names; omit the setting or provide at least one pattern"
+            );
+        }
+        PrivateNames::new(prefix, patterns)
+    }
+}
+
 /// `PypIron` - A fast, reliable, and scalable `PyPI` server
 #[derive(ClapArgs, Debug, Clone)]
 pub struct ServeArgs {
@@ -763,10 +852,9 @@ pub struct ServeArgs {
     #[arg(long, env = "PYPIRON_ADMIN_PASS", hide_env_values = true)]
     pub(crate) admin_pass: Option<String>,
 
-    /// Reserve this namespace for private uploads: new private packages must
-    /// match `<prefix>` or `<prefix>-*` (PEP 503-normalized)
-    #[arg(long, env = "PYPIRON_PRIVATE_PREFIX")]
-    pub(crate) private_prefix: Option<String>,
+    /// The reserved private names (prefix and/or patterns).
+    #[command(flatten)]
+    pub(crate) private: PrivateArgs,
 
     /// How artifact bytes reach clients. `stream`: proxy through this node
     /// (URL-keyed HTTP caches like pip's stay effective). `redirect`: 302 to
@@ -1018,7 +1106,8 @@ pub struct ServeArgs {
     /// simple index (e.g. https://pypi.org): package pages are answered from
     /// upstream metadata and artifacts are downloaded, verified, and cached
     /// in storage as `mirror`-origin packages on first request. Names claimed
-    /// `private` (or inside --private-prefix) never fall through. When a package
+    /// `private` (or reserved by --private-prefix / --private-pattern) never
+    /// fall through. When a package
     /// scope is set (`--include-package`/`[mirror].include-packages`), only those names
     /// fall through and the rest are 404'd (fail-closed). Off by default.
     #[arg(long, env = "PYPIRON_PROXY_UPSTREAM")]

@@ -576,6 +576,18 @@ def disk_server_prefixed(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     )
 
 
+# The mixed private set the pattern tests reserve: two prefix families plus an
+# unprefixed name that also exists on public PyPI (`bolt`) — the shape a
+# pypicloud migration brings, which a single `--private-prefix` cannot express.
+PRIVATE_PATTERN_ARGS = ["--private-pattern", "blueowl-*", "--private-pattern", "hiroad-*,bolt"]
+
+
+@pytest.fixture()
+def disk_server_patterned(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Disk server reserving private names by pattern (see PRIVATE_PATTERN_ARGS)."""
+    yield from _start_disk_server(tmp_path_factory, pypiron_bin, extra_args=PRIVATE_PATTERN_ARGS)
+
+
 @pytest.fixture()
 def disk_server_wait_on_upload(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Disk server where uploads wait for index visibility before returning."""
@@ -790,6 +802,14 @@ def proxy_pair_prefixed(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Proxying server that reserves the `acme` namespace for private uploads."""
     yield from _start_proxy_pair(
         tmp_path_factory, pypiron_bin, proxy_extra_args=["--private-prefix", "acme"]
+    )
+
+
+@pytest.fixture()
+def proxy_pair_patterned(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+    """Proxying server reserving private names by pattern (see PRIVATE_PATTERN_ARGS)."""
+    yield from _start_proxy_pair(
+        tmp_path_factory, pypiron_bin, proxy_extra_args=PRIVATE_PATTERN_ARGS
     )
 
 

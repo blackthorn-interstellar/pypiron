@@ -44,7 +44,7 @@ Sections:
 
 | Section | Owns |
 | --- | --- |
-| top level | `private-prefix` |
+| top level | `private-prefix`, `private-patterns`, `private-patterns-from` |
 | `[serve]` | server, proxy, storage, counters, logs |
 | `[mirror]` | package and file selection shared by proxy and sync |
 | `[sync]` | destination and sync worker settings |
@@ -202,7 +202,9 @@ backends are supported. With more than one bucket:
 | `--uploader-pass PASS` | `PYPIRON_UPLOADER_PASS` | none | Upload-only password. |
 | `--read-user USER` | `PYPIRON_READ_USER` | none | Optional read username. |
 | `--read-pass PASS` | `PYPIRON_READ_PASS` | none | Optional read password. |
-| `--private-prefix PREFIX` | `PYPIRON_PRIVATE_PREFIX` | none | Reserve `PREFIX` and `PREFIX-*` for private packages. |
+| `--private-prefix PREFIX` | `PYPIRON_PRIVATE_PREFIX` | none | Reserve `PREFIX` and `PREFIX-*` for private packages. [Details](#reserved-private-names). |
+| `--private-pattern PATTERN` | `PYPIRON_PRIVATE_PATTERN` | none | Reserve every name matching `PATTERN` for private packages. Repeatable; comma-separated in the env var. Also top-level `private-patterns`. |
+| `--private-patterns-from FILE` | `PYPIRON_PRIVATE_PATTERNS_FROM` | none | Read patterns from `FILE`, one per line. Blank lines and `#` comments are ignored. Also top-level `private-patterns-from`, resolved next to the config file. |
 | `--proxy-upstream URL` | `PYPIRON_PROXY_UPSTREAM` | none | On-demand mirror source, usually `https://pypi.org`. |
 | `--allow-insecure-upstream` | `PYPIRON_ALLOW_INSECURE_UPSTREAM` | `false` | Permit a plaintext `http://` proxy upstream. This exposes both bytes and their claimed hash to interception. |
 | `--proxy-stream-threshold SIZE` | `PYPIRON_PROXY_STREAM_THRESHOLD` | `16MiB` | Stream an uncached file at or above this size while fetching it. The last `64KiB` waits for hash verification. Accepts `64MB`, `1GiB`, etc.; minimum `64KiB`; `off` buffers every file. |
@@ -257,6 +259,35 @@ With the advisory feed enabled, use
 `pypiron_malware_probe_age_seconds` to alert on stale data or failed polling.
 `pypiron_blocked_downloads_total` counts refused malware downloads.
 
+### Reserved private names
+
+Reserved names are private by declaration. pypiron never fetches them from an
+upstream or accepts them from `sync`, and when anything is reserved, a new
+private package must use a reserved name. Reserve them before enabling
+`proxy-upstream`: the first install of an unclaimed name claims it as public,
+and a public name cannot be made private in place.
+
+`private-prefix` reserves one namespace: `acme` and `acme-*`. `private-patterns`
+reserves any set of names, including unprefixed ones and names that also exist
+on PyPI:
+
+```toml
+private-prefix = "acme"
+private-patterns = ["blueowl-*", "quanata-*", "hipy-comply", "bolt"]
+private-patterns-from = "private-packages.txt"
+```
+
+A pattern matches the whole name after normalization, so `blueowl-*` covers
+`blueowl_auth` but not `blueowltool`, and `bolt` does not cover `bolt-on`. `*`
+is the only wildcard; a bare `*` is refused. The prefix and the patterns
+combine. Patterns on the command line (`--private-pattern`,
+`--private-patterns-from`) replace the file's list rather than adding to it.
+Private packages that existed before a name was reserved keep working.
+
+`sync` reads the same keys: it refuses to mirror a reserved name, and a
+[pypicloud migration](../guides/migrate.md#pypicloud-select-only-private-projects)
+copies the projects that match.
+
 ### Behind a forward proxy or TLS interception
 
 Sync, proxy fetches, and advisory polling honor `HTTPS_PROXY`, `HTTP_PROXY`,
@@ -301,8 +332,8 @@ Rules:
 - Package specs are names with optional PEP 440 specifiers:
   `requests`, `six==1.16.0`, `requests>=2.20,<3`.
 - `sync` normally requires an include list. A pypicloud private migration may
-  use `--private-pattern` or `--private-patterns-from` as its work list instead.
-  Proxy without an include list is open for any non-private package.
+  use the [reserved private names](#reserved-private-names) as its work list
+  instead. Proxy without an include list is open for any non-private package.
 - Omit a list to leave that filter unset. An explicit empty list or environment
   value is refused because it could erase a stricter value from another config
   layer.
@@ -347,10 +378,10 @@ than 0.0.17. Use the next release when available, or run
 | `--to URL` | `PYPIRON_SYNC_TO` | required | Destination pypiron URL. |
 | `--admin-user USER` | `PYPIRON_SYNC_ADMIN_USER` | none | Destination admin user. |
 | `--admin-pass PASS` | `PYPIRON_SYNC_ADMIN_PASS` | none | Destination admin password. |
-| `--private-prefix PREFIX` | `PYPIRON_PRIVATE_PREFIX` | none | Refuse to mirror private names. |
+| `--private-prefix PREFIX` | `PYPIRON_PRIVATE_PREFIX` | none | Refuse to mirror `PREFIX` and `PREFIX-*`. Also top-level `private-prefix`. |
 | `--as-private` | `PYPIRON_SYNC_AS_PRIVATE` | `false` | Import as private packages. Uses the migration time and does not preserve yank state. Public-owned names require emptying and `origin release`. [Migration guide](../guides/migrate.md). |
-| `--private-pattern PATTERN` | `PYPIRON_PRIVATE_PATTERN` | none | Declare pypicloud project names private. Repeatable; matches the entire PEP 503-normalized name and supports only `*`. A bare `*` is refused. Valid only with `--source-kind pypicloud --as-private`; also `[sync].private-patterns`. |
-| `--private-patterns-from FILE` | `PYPIRON_PRIVATE_PATTERNS_FROM` | none | Read pypicloud private-name patterns from a file, one per line. Blank lines and `#` comments are ignored; also `[sync].private-patterns-from`. |
+| `--private-pattern PATTERN` | `PYPIRON_PRIVATE_PATTERN` | none | Refuse to mirror names matching `PATTERN`; with `--source-kind pypicloud --as-private`, migrate the matching projects instead. Repeatable; comma-separated in the env var. Also top-level `private-patterns`. [Details](#reserved-private-names). |
+| `--private-patterns-from FILE` | `PYPIRON_PRIVATE_PATTERNS_FROM` | none | Read patterns from `FILE`, one per line. Blank lines and `#` comments are ignored. Also top-level `private-patterns-from`. |
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | relay from `--from` | Deliver an advisory snapshot to the destination. A URL or path overrides the source feed; `""` disables. Failure warns but does not stop package sync. Also `[sync].advisory-feed`. |
 | `--concurrency N` | `PYPIRON_SYNC_CONCURRENCY` | `4` | Transfers within one package. |
 | `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8` | Maximum packages in parallel. Each completed package frees a slot for the next, even while another package is stalled. |
@@ -452,7 +483,7 @@ pending repairs, not bytes.
 | --- | --- | --- |
 | `/simple/` | read | Package index. |
 | `/files/<pkg>/<file>` | read | Artifact bytes. |
-| `/legacy/` | uploader/admin | Upload API. |
+| `/legacy/` | uploader/admin | Upload API. `POST /simple/`, `POST /simple`, and `POST /` upload too, so publishers configured for pypicloud keep working. |
 | `/health` | open | Liveness: the process is up. Always `200` while serving (a Kubernetes `livenessProbe`). |
 | `/ready` | open | Readiness: this node can serve reads. Point your load balancer and a Kubernetes `readinessProbe` here. |
 | `/metrics` | open | Prometheus metrics. |

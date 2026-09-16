@@ -64,7 +64,7 @@ Expected health responses:
 | --- | --- |
 | HTML index | `/simple/` and `/simple/<package>/` |
 | JSON index | `/simple/index.json` and `/simple/<package>/index.json` |
-| Upload | `POST /legacy/`; works with uv, twine, and poetry |
+| Upload | `POST /legacy/`; works with uv, twine, and poetry. `POST /simple/` and `POST /` also upload, for publishers configured for pypicloud |
 | Liveness | `GET /health` |
 | Readiness | `GET /ready`; point the load balancer here |
 | Metrics | `GET /metrics`; Prometheus format |

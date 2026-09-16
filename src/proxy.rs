@@ -3,7 +3,7 @@
 //!
 //! This is `sync`, made lazy. The same rules hold: the origin model is the
 //! dependency-confusion defense, so a name claimed `private` (or inside
-//! `--private-prefix`) never falls through to upstream, and the first
+//! `--private-prefix` / `--private-pattern`) never falls through to upstream, and the first
 //! upstream artifact write claims the name `mirror` — atomically, exactly as
 //! `sync` does. Artifacts are immutable, so caching them is trivially
 //! correct; only the package *listing* needs freshness, and it is fetched
@@ -33,7 +33,7 @@ use tracing::{debug, info, warn};
 
 use crate::app::{AppState, PACKAGES_PREFIX};
 use crate::hash::sha256_hex;
-use crate::names::{infer_version_from_filename, matches_prefix};
+use crate::names::infer_version_from_filename;
 use crate::origin;
 use crate::render::{self, FileMetadata};
 use crate::sidecar::{
@@ -653,13 +653,11 @@ fn advisory_blocks(state: &AppState, pkg: &str, filename: &str) -> bool {
 }
 
 /// May this package be served from upstream at all? Private names, the reserved
-/// prefix, and (when a scope is configured) names outside the allowlist never
-/// fall through — that is the entire defense.
+/// private names, and (when a scope is configured) names outside the allowlist
+/// never fall through — that is the entire defense.
 pub async fn eligible(state: &AppState, storage: &dyn Storage, pkg: &str) -> Result<bool> {
-    if let Some(prefix) = &state.private_prefix {
-        if matches_prefix(pkg, prefix) {
-            return Ok(false);
-        }
+    if state.private.matches(pkg) {
+        return Ok(false);
     }
     // The package allowlist is fail-closed and pure (no I/O), so it gates before
     // the origin read — an unapproved name never even touches storage.

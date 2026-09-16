@@ -26,7 +26,7 @@ use crate::sidecar::{
     PROVENANCE_SUFFIX,
 };
 use crate::storage::Storage;
-use crate::{cache, names, origin, proxy, render, sidecar, storage};
+use crate::{cache, origin, proxy, render, sidecar, storage};
 
 /// User-Agent prefixes of clients whose artifact caches are keyed by package
 /// filename rather than the URL that served the bytes, verified to follow
@@ -1116,11 +1116,9 @@ async fn advisory_byte_gate(
     }
 
     // A hit — but a private-origin name never consults either set. Fast pre-check
-    // on the configured private prefix (no I/O), then the authoritative claim.
-    if let Some(prefix) = &state.private_prefix {
-        if names::matches_prefix(pkg, prefix) {
-            return None;
-        }
+    // on the reserved private names (no I/O), then the authoritative claim.
+    if state.private.matches(pkg) {
+        return None;
     }
     match origin::read_origin_claim(storage, pkg).await {
         Ok(Some(origin::OriginState::Private)) => return None,

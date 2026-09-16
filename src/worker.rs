@@ -4351,6 +4351,7 @@ mod tests {
     use super::*;
     use crate::app::{AccessLogFormat, ArtifactDelivery};
     use crate::buckets::{BucketHandle, BucketSet, Pinned};
+    use crate::names::PrivateNames;
     use crate::storage::test_support::InMemStorage;
     use axum::body::Body;
     use http::Response;
@@ -4397,7 +4398,7 @@ mod tests {
             read_user: None,
             read_pass: None,
             token_signing_key: None,
-            private_prefix: None,
+            private: PrivateNames::default(),
             artifact_delivery: ArtifactDelivery::Auto,
             metrics_project_labels: false,
             access_log: false,

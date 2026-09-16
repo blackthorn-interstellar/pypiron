@@ -297,7 +297,14 @@ ENDPOINTS: list = [
         name="upload-legacy",
         method="POST",
         path="/legacy/",
-        routes=(("POST", "/legacy"), ("POST", "/legacy/")),
+        # The pypicloud-cutover aliases are the same handler; measured once here.
+        routes=(
+            ("POST", "/legacy"),
+            ("POST", "/legacy/"),
+            ("POST", "/"),
+            ("POST", "/simple"),
+            ("POST", "/simple/"),
+        ),
         auth=UPLOADER,
         body="wheel_upload",
         expect=(200, 201),

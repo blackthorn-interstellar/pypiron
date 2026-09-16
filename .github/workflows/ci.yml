@@ -273,6 +273,11 @@ jobs:
           # mirror->private succession next door) adds nothing.
           cargo run --example vopr -- --seed 97800043727 --nodes 3 --buckets 3 --packages 6 --files 4 --ops 63 --fail-percent 3 --partition 100
           cargo run --example vopr -- --seed 121000059774 --nodes 3 --buckets 3 --packages 6 --files 2 --ops 94 --fail-percent 3 --partition 100
+          # Late mirror bytes under already-private claims must repair through
+          # the note sweep, not retry until the full diff. The blackbox test
+          # test_late_mirror_repair_notes_drain_without_full_reconcile pins the
+          # state with the daily backstop disabled; this seed found the gap.
+          cargo run --example vopr -- --seed 207609138345 --nodes 3 --buckets 3 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100
           # A stranded global-index pair whose JSON was ABSENT, not merely stale.
           # `write_global_indexes_cas` writes `simple/index.html` before the
           # canonical `simple/index.json`, so a crash between the legs strands

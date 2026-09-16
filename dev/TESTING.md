@@ -314,6 +314,13 @@ storage failures, node crashes at storage-op boundaries (power cut between two
 ops — the task is parked and aborted, in-memory state dies, storage survives),
 cold restarts, and clock jumps past the intent grace.
 
+`SimStorage` distinguishes listing ETags from conditional-write tokens. Listings
+provide stable change detectors that move on every rewrite, even of identical
+bytes; only HEAD, GET, and conditional PUT return a version usable for CAS.
+Passing a listing ETag to `put_if_match` errors, like a versionless update on
+GCS, rather than returning a lost race. The storage and fault-view regression
+tests pin this distinction so the simulator catches accidental LIST-to-CAS use.
+
 The *workload* derives from the seed too, and that matters more than it sounds.
 A fixed workload is the quiet way a simulator stops finding things: for a long
 time this one ran two packages × two files and one hardcoded op mix on every
@@ -436,6 +443,16 @@ The invariants:
 - **staleness** — bounded agreement, on a clock. See below.
 
 ### Bounded staleness: how long "converged" is allowed to take
+
+A fast-path regression found by seed `207609138345` (three buckets, partitioned
+writers) left late mirror bytes under already-private package claims. The note
+sweep correctly refused to copy them into private peers, but only the full diff
+knew to quarantine them, so the same notes retried for 20 drain passes. Both
+paths now use the existing package repair when they encounter that state. The
+blackbox `test_late_mirror_repair_notes_drain_without_full_reconcile` holds the
+full reconcile off for a day and verifies that notes drain, private bytes stay
+intact, and the late bytes are preserved in quarantine. It fails on the old
+implementation. The seed is also pinned in `ci.yml`; no deadline was relaxed.
 
 The oracle above used to be **liveness**, and liveness was a boolean over a
 made-up number: the fleet had to reach a fixpoint inside 12 heal rounds x 20
@@ -1775,7 +1792,7 @@ matching the table below.
 | ORIGIN_TERMINALITY (the `.origin` claim) | workload-reachable, never witnessed | needs a mirror claim to win over a private one on some bucket after the private ack | `origin-demoted` |
 | ORIGIN_TERMINALITY (the record under it) | workload-reachable, never witnessed | needs a live mirror sidecar left renderable under a private claim | `mirror-served` |
 | CONVERGENCE | workload-reachable | needs ≥2 buckets; the replication paths that could break it run on every multi-bucket seed | `diverge` |
-| STALENESS | workload-reachable | both arms: any undrainable breadcrumb stops the fleet settling, and any divergence the fast path cannot see costs a backstop cycle. The fast path has simply always drained inside the deadline | `wedge` (never settles), `slow-repair` (past the deadline) |
+| STALENESS | workload-reachable | both arms: any undrainable breadcrumb stops the fleet settling, and any divergence the fast path cannot see costs a backstop cycle. The late-mirror repair-note gap above breached the deadline and is now regression-tested | `wedge` (never settles), `slow-repair` (past the deadline) |
 | ACK_TOTALITY | workload-reachable, and *observed* — including where it is fatal; green now | a reported statistic under fault injection (4,691 misses in 44,648 partitioned seeds); crash-only, where it *is* fatal, it produced 8 failing seeds in 46,660 partitioned, first `--seed 9504440`, and 0 in 276,998 once `4bb9cb8` stopped `decide` calling a demotion fence a peer had never seen an agreement. That row used to read "has never produced one", which was true only of the aligned schedule | `fanout` |
 | DETERMINISM | workload-reachable | any nondeterminism downstream of the op sequence reds it | `rerun` |
 | TOMBSTONE_MONOTONICITY | **product-unreachable** | `publish_record`'s tombstone fence rejects re-publishing a deleted filename, so no ack can follow a `204` — 150k wide seeds (795k acked uploads, 251M interleavings) produced zero, and could not have produced one | `resurrect` |

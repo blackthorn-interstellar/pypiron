@@ -8137,6 +8137,15 @@ mod tests {
                 .expect("get_with_etag forwards"),
             Some((b"{}".to_vec(), first.clone())),
         );
+        let listed = view.list_all("simple/").await.expect("list forwards");
+        assert_ne!(listed[0].etag, first);
+        let error = view
+            .put_if_match(key, &listed[0].etag, b"bad".to_vec())
+            .await
+            .expect_err("a listed ETag is an invalid precondition, not a CAS loss");
+        assert!(error
+            .to_string()
+            .contains("version required for conditional update"));
         assert!(
             view.put_if_match(key, &first, b"[]".to_vec())
                 .await

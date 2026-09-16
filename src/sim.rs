@@ -12,6 +12,8 @@
 //! `HashMap`/`RandomState`) for stable ordering, versioned etags instead of
 //! content hashes, and timestamps read from a virtual [`SimClock`] rather than
 //! the wall clock. Given the same operations it produces byte-identical states.
+//! Listings expose a separate change detector, never a conditional-write token:
+//! like GCS, conditional updates require a version from HEAD, GET, or PUT.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -171,6 +173,15 @@ struct Obj {
     bytes: Vec<u8>,
     etag: String,
     last_modified: OffsetDateTime,
+}
+
+impl Obj {
+    /// A listing can detect a rewrite but cannot authorize one. Keep the
+    /// generation-based change detection (including identical-byte rewrites),
+    /// without exposing the `vN` token accepted by conditional writes.
+    fn listed_etag(&self) -> String {
+        format!("etag:{}", self.etag)
+    }
 }
 
 #[derive(Default)]
@@ -537,7 +548,7 @@ impl Storage for SimStorage {
             .map(|(k, o)| ObjectMeta {
                 key: k.clone(),
                 size: o.bytes.len() as u64,
-                etag: o.etag.clone(),
+                etag: o.listed_etag(),
             })
             .collect();
         Ok(out)
@@ -559,7 +570,7 @@ impl Storage for SimStorage {
             .map(|(k, o)| ObjectMeta {
                 key: k.clone(),
                 size: o.bytes.len() as u64,
-                etag: o.etag.clone(),
+                etag: o.listed_etag(),
             })
             .collect();
         Ok(out)
@@ -622,6 +633,15 @@ impl Storage for SimStorage {
     }
 
     async fn put_if_match(&self, key: &str, etag: &str, bytes: Vec<u8>) -> Result<Option<String>> {
+        // A versionless precondition is an invalid request on GCS, not a
+        // lost race. Returning None would hide misuse behind CAS retries.
+        if etag
+            .strip_prefix('v')
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_none()
+        {
+            bail!("version required for conditional update: {key}");
+        }
         let now = self.clock.now_utc();
         let mut inner = self.lock();
         match inner.objects.get(key) {
@@ -996,6 +1016,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listings_detect_rewrites_but_cannot_authorize_cas() {
+        let s = SimStorage::new(SimClock::new(start()));
+        let created = s
+            .put_if_none_match("k", b"a".to_vec())
+            .await
+            .unwrap()
+            .unwrap();
+        let listed = s.list_all("").await.unwrap();
+        assert_eq!(listed, s.list_page("", None, 1).await.unwrap());
+        assert_eq!(listed, s.list_all("").await.unwrap());
+        assert_ne!(listed[0].etag, created);
+        assert_eq!(s.head_etag("k").await.unwrap().unwrap(), created);
+        assert_eq!(s.get_with_etag("k").await.unwrap().unwrap().1, created);
+
+        for key in ["k", "absent"] {
+            let err = s
+                .put_if_match(key, &listed[0].etag, b"bad".to_vec())
+                .await
+                .unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("version required for conditional update"));
+        }
+        assert_eq!(s.get_bytes("k").await.unwrap(), b"a");
+        assert!(!s.head_exists("absent").await.unwrap());
+
+        // Even an identical-byte rewrite invalidates old versions and changes
+        // listing fingerprints; it must not revive a stale CAS token (ABA).
+        let updated = s
+            .put_if_match("k", &created, b"a".to_vec())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(created, updated);
+        let rewritten = s.list_all("").await.unwrap();
+        assert_ne!(listed[0].etag, rewritten[0].etag);
+        assert_eq!(rewritten, s.list_page("", None, 1).await.unwrap());
+        assert!(s
+            .put_if_match("k", &created, b"bad".to_vec())
+            .await
+            .unwrap()
+            .is_none());
+        let head = s.head_etag("k").await.unwrap().unwrap();
+        assert_eq!(head, updated);
+        assert!(s
+            .put_if_match("k", &head, b"b".to_vec())
+            .await
+            .unwrap()
+            .is_some());
+        let get = s.get_with_etag("k").await.unwrap().unwrap().1;
+        assert!(s
+            .put_if_match("k", &get, b"c".to_vec())
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn cas_versions_advance_and_gate() {
         let s = SimStorage::new(SimClock::new(start()));
 
@@ -1013,7 +1091,7 @@ mod tests {
 
         // put_if_match only succeeds against the current etag.
         assert!(s
-            .put_if_match("k", "v0-stale", b"c".to_vec())
+            .put_if_match("k", "v999", b"c".to_vec())
             .await
             .unwrap()
             .is_none());

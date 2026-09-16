@@ -2731,10 +2731,32 @@ async fn replicate_record(
         }
         return Ok(Convergence::Converged);
     }
-    let a = read_record(src, pkg, filename).await?;
-    let b = read_record(dst, pkg, filename).await?;
+    let mut a = read_record(src, pkg, filename).await?;
+    let mut b = read_record(dst, pkg, filename).await?;
+    if is_late_mirror(&a, src_origin) || is_late_mirror(&b, dst_origin) {
+        // A fill can finish after both claims already became private. There
+        // is no split left for reconcile_split_origin to repair, and copying
+        // the mirror record is correctly refused. Repair the package through
+        // the same quarantine path as the full diff instead of retrying its
+        // note until the daily reconcile. Re-read before deciding whether the
+        // note is satisfied: the repair may have deferred another torn record.
+        converge_package(state, src, dst, pkg).await?;
+        a = read_record(src, pkg, filename).await?;
+        b = read_record(dst, pkg, filename).await?;
+    }
     let verdict = decide(&a, &b);
     execute(state, (src, dst), pkg, filename, (&a, &b), verdict, source).await
+}
+
+fn is_late_mirror(record: &Record, pkg_origin: Option<Origin>) -> bool {
+    pkg_origin == Some(Origin::Private)
+        && matches!(
+            record.state(),
+            RecordState::Live {
+                origin: Origin::Mirror,
+                ..
+            }
+        )
 }
 
 async fn normalize_mirror_status_under_private_claim(
@@ -3610,22 +3632,8 @@ async fn converge_package(
             // private source. Quarantine it here: a mirror body under a
             // private claim is a demotion loser, never truth to replicate,
             // whatever `decide` would do for two mirror-claimed peers.
-            let late_a = a_origin == Some(Origin::Private)
-                && matches!(
-                    ra.state(),
-                    RecordState::Live {
-                        origin: Origin::Mirror,
-                        ..
-                    }
-                );
-            let late_b = b_origin == Some(Origin::Private)
-                && matches!(
-                    rb.state(),
-                    RecordState::Live {
-                        origin: Origin::Mirror,
-                        ..
-                    }
-                );
+            let late_a = is_late_mirror(&ra, a_origin);
+            let late_b = is_late_mirror(&rb, b_origin);
             if late_a || late_b {
                 if late_a {
                     if quarantine_mirror_artifacts(a, pkg).await? > 0 {
@@ -5284,69 +5292,94 @@ mod tests {
 
     #[tokio::test]
     async fn mirror_only_filename_landing_after_demotion_is_quarantined() {
-        let private = Arc::new(InMemStorage::default());
-        let destination = Arc::new(InMemStorage::default());
-        let private_filename = "pkg-2.whl";
-        let late_mirror_filename = "pkg-1.whl";
-        seed_live(
-            private.as_ref(),
-            "pkg",
-            private_filename,
-            b"private bytes",
-            PRIVATE,
-        );
-        seed_live(
-            destination.as_ref(),
-            "pkg",
-            late_mirror_filename,
-            b"late public bytes",
-            MIRROR,
-        );
-        // The proxy passed its final mirror-claim check, then package demotion
-        // completed before this extra filename's artifact + sidecar landed.
-        destination.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
-        let state = two_bucket_state(private.clone(), destination.clone());
-
-        diff_pair(&state, private.as_ref(), destination.as_ref())
-            .await
-            .unwrap();
-
-        assert!(!destination
-            .head_exists(&artifact_key("pkg", late_mirror_filename))
-            .await
-            .unwrap());
-        assert!(destination
-            .head_exists(&mirror_quarantined_key(&artifact_key(
+        // Full diff and fast replication in both source/destination directions.
+        for direction in [None, Some(false), Some(true)] {
+            let private = Arc::new(InMemStorage::default());
+            let destination = Arc::new(InMemStorage::default());
+            let private_filename = "pkg-2.whl";
+            let late_mirror_filename = "pkg-1.whl";
+            seed_live(
+                private.as_ref(),
                 "pkg",
-                late_mirror_filename
-            )))
-            .await
-            .unwrap());
-        // The fence replicated to the peer that never held the loser.
-        assert!(private
-            .head_exists(&mirror_quarantined_key(&artifact_key(
+                private_filename,
+                b"private bytes",
+                PRIVATE,
+            );
+            seed_live(
+                destination.as_ref(),
                 "pkg",
-                late_mirror_filename
-            )))
-            .await
-            .unwrap());
-        assert!(!private
-            .head_exists(&artifact_key("pkg", late_mirror_filename))
-            .await
-            .unwrap());
-        assert!(destination
-            .list_all(QUARANTINE_PREFIX)
-            .await
-            .unwrap()
-            .iter()
-            .any(|object| object.key.contains(late_mirror_filename)));
-        assert_eq!(
-            destination
-                .get_bytes(&artifact_key("pkg", private_filename))
+                late_mirror_filename,
+                b"late public bytes",
+                MIRROR,
+            );
+            // The proxy passed its final mirror-claim check, then package demotion
+            // completed before this extra filename's artifact + sidecar landed.
+            destination.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
+            let state = two_bucket_state(private.clone(), destination.clone());
+
+            match direction {
+                None => diff_pair(&state, private.as_ref(), destination.as_ref())
+                    .await
+                    .unwrap(),
+                Some(from_mirror) => {
+                    let (src, dst) = if from_mirror {
+                        (destination.as_ref(), private.as_ref())
+                    } else {
+                        (private.as_ref(), destination.as_ref())
+                    };
+                    assert_eq!(
+                        replicate_record(
+                            &state,
+                            src,
+                            dst,
+                            "pkg",
+                            late_mirror_filename,
+                            ArtifactSource::Bucket
+                        )
+                        .await
+                        .unwrap(),
+                        Convergence::Converged,
+                    );
+                }
+            }
+
+            assert!(!destination
+                .head_exists(&artifact_key("pkg", late_mirror_filename))
                 .await
-                .unwrap(),
-            b"private bytes"
-        );
+                .unwrap());
+            assert!(destination
+                .head_exists(&mirror_quarantined_key(&artifact_key(
+                    "pkg",
+                    late_mirror_filename
+                )))
+                .await
+                .unwrap());
+            // The fence replicated to the peer that never held the loser.
+            assert!(private
+                .head_exists(&mirror_quarantined_key(&artifact_key(
+                    "pkg",
+                    late_mirror_filename
+                )))
+                .await
+                .unwrap());
+            assert!(!private
+                .head_exists(&artifact_key("pkg", late_mirror_filename))
+                .await
+                .unwrap());
+            assert!(destination
+                .list_all(QUARANTINE_PREFIX)
+                .await
+                .unwrap()
+                .iter()
+                .any(|object| object.key.contains(late_mirror_filename)));
+            assert_eq!(
+                destination
+                    .get_bytes(&artifact_key("pkg", private_filename))
+                    .await
+                    .unwrap(),
+                b"private bytes"
+            );
+        }
     }
 
     /// A demotion the operator already resolved by republishing privately, and

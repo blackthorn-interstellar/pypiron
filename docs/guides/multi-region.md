@@ -129,6 +129,10 @@ an unpublished private name from being claimed from PyPI on the other side of a
 partition. If your private names share no prefix, exclude each exact name from
 the proxy instead.
 
+If a public download finishes after the package becomes private, its late
+mirror files are quarantined during queued replication repair. Private files
+remain intact; recovery does not wait for the daily full reconcile.
+
 ## Limits
 
 - If every bucket is unreachable, `/ready` returns `503` on every node until

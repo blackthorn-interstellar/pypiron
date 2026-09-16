@@ -1608,6 +1608,79 @@ def test_proxy_fill_vs_private_upload_demotes_and_quarantines(s3_servers_multi_p
     cluster["right"]["faults"].recover(a)
 
 
+def test_late_mirror_repair_notes_drain_without_full_reconcile(
+    minio_three, pypiron_bin, tmp_path, tmp_path_factory
+):
+    """A mirror fill finishing after private demotion heals on the note sweep."""
+    minio = minio_three
+    buckets = minio["buckets"]
+    pkg = "latemirror"
+    private_wheel = make_wheel(pkg, "2.0", tmp_path)
+    server_gen = _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        extra_env={
+            "PYPIRON_AUDIT_ON_BOOT": "false",
+            "PYPIRON_RECONCILE_INTERVAL_SECS": "86400",
+            "PYPIRON_REPL_SWEEP_INTERVAL_SECS": "2",
+        },
+    )
+    try:
+        server = next(server_gen)
+        _upload(server, private_wheel)
+        wait_for_file_in_index(server["simple"], pkg, private_wheel.name)
+        assert all(_claim_owner(minio, bucket, pkg) == "private" for bucket in buckets)
+
+        # The fill passed its claim check before demotion, then landed this
+        # extra filename afterwards. Keep every claim private: a split claim
+        # takes a different repair path that already worked.
+        filename = "latemirror-1.0-py3-none-any.whl"
+        key = f"packages/{pkg}/{filename}"
+        body = "late public bytes"
+        sha = hashlib.sha256(body.encode()).hexdigest()
+        source = buckets[-1]
+        minio_put_key_in(minio, source, key, body)
+        minio_put_key_in(
+            minio,
+            source,
+            f"{key}.meta.json",
+            json.dumps(
+                {
+                    "sha256": sha,
+                    "size": len(body),
+                    "version": "1.0",
+                    "upload-time": "2020-01-01T00:00:00Z",
+                    "yanked": False,
+                    "origin": "mirror",
+                }
+            ),
+        )
+        notes = [f"_repl/{s3_repl_tag(dest)}/{pkg}/{filename}!late" for dest in buckets[:-1]]
+        for note in notes:
+            minio_put_key_in(minio, source, note, "")
+
+        _eventually(
+            lambda: all(not minio_key_exists_in(minio, source, note) for note in notes),
+            timeout=20,
+            what="late mirror notes drain without the daily reconcile",
+        )
+        quarantine = f"_quarantine/{pkg}/{filename}@{sha[:12]}"
+        assert minio_get_key_bytes_in(minio, source, quarantine) == body.encode()
+        for bucket in buckets:
+            assert _claim_owner(minio, bucket, pkg) == "private"
+            assert not minio_key_exists_in(minio, bucket, key)
+            assert minio_key_exists_in(minio, bucket, f"{key}.mirror-quarantined")
+            assert (
+                minio_get_key_bytes_in(minio, bucket, f"packages/{pkg}/{private_wheel.name}")
+                == private_wheel.read_bytes()
+            )
+        code, _, _ = http_get_no_redirect(f"{server['base_url']}/files/{pkg}/{filename}")
+        assert code in (403, 404)
+    finally:
+        server_gen.close()
+
+
 def test_proxy_page_and_companion_respect_local_freeze_fence(s3_servers_multi_proxy, tmp_path):
     cluster = s3_servers_multi_proxy
     node = cluster["right"]

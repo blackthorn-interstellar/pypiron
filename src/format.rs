@@ -42,7 +42,7 @@ pub struct FormatStamp {
 /// warning, so a multi-bucket fleet still starts on its reachable buckets during
 /// the outage multi-bucket exists for; every other GET error fails closed.
 ///
-/// The classifier is applied verbatim — the one-second control-I/O bound is NOT
+/// The classifier is applied verbatim — the internal control-I/O bound is NOT
 /// folded in here. Serve wraps its classifier with
 /// [`topology_error_is_availability`](crate::buckets::topology_error_is_availability)
 /// so a bucket too slow to answer that bound is skipped like any other outage.

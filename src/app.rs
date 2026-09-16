@@ -1304,7 +1304,7 @@ async fn run_serve(
     // topology stamp is parsed: an older binary must refuse a newer tree rather
     // than front-run a topology error against a layout it cannot read. Same
     // handles, same availability classifier; runs single-bucket too (topology
-    // no-ops there, the format gate does not). Fold the one-second control bound
+    // no-ops there, the format gate does not). Fold the internal control-I/O bound
     // in like topology, so a bucket too slow to answer is skipped as an outage
     // rather than refused — multi-bucket startup must survive that.
     let format_availability = |_: usize, error: &anyhow::Error| {

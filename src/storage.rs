@@ -393,7 +393,7 @@ impl StorageArgs {
     /// [`build`](Self::build) plus the storage-format read gate — the write-open
     /// entry point for a headless op (rebuild-index) that mutates the default
     /// bucket. The gate runs strictly: a bucket whose format cannot be verified —
-    /// a real GET error or a hang past the one-second control bound — refuses
+    /// a real GET error or a hang past the control-I/O bound — refuses
     /// rather than being written blind, and the operator retries once it is
     /// reachable. New writers should build through this, not `build`, so the gate
     /// can never be forgotten.
@@ -413,7 +413,7 @@ impl StorageArgs {
     /// mutates the whole fleet (`buckets migrate`, `origin release`).
     ///
     /// Unlike [`build_for_write`](Self::build_for_write), this skips an
-    /// availability failure (serve's classifier, one-second control bound folded
+    /// availability failure (serve's classifier, control-I/O bound folded
     /// in) rather than refusing: these ops are designed to defer an unreachable
     /// member, and they defer its WRITES under the same bound, so a hung member is
     /// never verified-skipped here yet written blind there. `buckets migrate`

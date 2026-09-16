@@ -23,7 +23,16 @@ use crate::storage::{copy_pair_eligible, CopyOrigin, CopyOutcome, Storage};
 /// Topology stamps are tiny control records. Never let their GET/CAS operations
 /// inherit the data path's deliberately generous transfer timeout: one hung
 /// bucket must not prevent a node from starting on the reachable topology.
-const TOPOLOGY_IO_TIMEOUT: Duration = Duration::from_secs(1);
+///
+/// This is a cold-start bound, not a probe deadline. The first control call on
+/// a bucket pays DNS, TCP, TLS, and on GCS/Azure a token exchange before the
+/// GET itself; on a slow link or a slow board that is seconds, and the riscv64
+/// release image (booted under QEMU by the smoke test) blew a one-second bound
+/// on the TLS handshake alone and refused to start. Ten seconds still keeps a
+/// hung bucket from parking startup on the hour-long transfer ceiling. The
+/// runtime health loop probes warm connections and keeps its own one-second
+/// deadline (`BUCKET_HEALTH_IO_TIMEOUT` in src/worker.rs).
+const TOPOLOGY_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 struct TopologyIoTimeout;
@@ -32,7 +41,7 @@ impl std::fmt::Display for TopologyIoTimeout {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "topology control I/O timed out after {} second",
+            "topology control I/O timed out after {} seconds",
             TOPOLOGY_IO_TIMEOUT.as_secs()
         )
     }
@@ -52,7 +61,7 @@ pub(crate) async fn bounded_topology_io<T>(
     }
 }
 
-/// A control-I/O error is availability when it is the internal one-second bound
+/// A control-I/O error is availability when it is the internal control-I/O bound
 /// (a bucket too slow to answer) or the caller's classifier says so. Shared with
 /// the storage-format gate so both fence the fleet with one rule.
 pub(crate) fn topology_error_is_availability<F>(
@@ -427,10 +436,11 @@ impl BucketSet {
     }
 
     /// Verify the ordered topology and one consistent generation across every
-    /// reachable bucket. Each tiny control operation has a one-second bound;
-    /// timeout means that bucket is unreachable. Returned storage errors are
-    /// skipped only when `is_availability(index, error)` says so, so auth, KMS,
-    /// quota, configuration, and unknown failures still fail closed.
+    /// reachable bucket. Each tiny control operation is bounded by
+    /// [`TOPOLOGY_IO_TIMEOUT`]; timeout means that bucket is unreachable.
+    /// Returned storage errors are skipped only when `is_availability(index,
+    /// error)` says so, so auth, KMS, quota, configuration, and unknown failures
+    /// still fail closed.
     pub async fn verify_topology_with<F>(&self, is_availability: F) -> Result<TopologyReport>
     where
         F: Fn(usize, &anyhow::Error) -> bool,
@@ -1293,7 +1303,9 @@ mod tests {
         assert!(b.get_with_etag(TOPOLOGY_STAMP_KEY).await.unwrap().is_none());
     }
 
-    #[tokio::test]
+    // The hang tests run on tokio's paused clock: the runtime skips straight to
+    // the TOPOLOGY_IO_TIMEOUT deadline instead of sleeping through it.
+    #[tokio::test(start_paused = true)]
     async fn startup_bounds_a_hung_bucket_as_unreachable() {
         let reachable = Arc::new(InMemStorage::default());
         let hung = Arc::new(TopologyTestStorage::new());
@@ -1312,7 +1324,7 @@ mod tests {
         assert_eq!(set.topology_generation(), Some(0));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn startup_refuses_when_no_bucket_is_reachable() {
         // Both buckets hang: the internal control-I/O timeout classes each as
         // unreachable, so nothing answers. Committing a fabricated generation 0
@@ -1333,7 +1345,7 @@ mod tests {
         assert_eq!(set.topology_generation(), None);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn runtime_verification_and_race_proof_bound_hung_reads() {
         let east = Arc::new(InMemStorage::default());
         let west = Arc::new(TopologyTestStorage::new());
@@ -1365,7 +1377,7 @@ mod tests {
         .unwrap());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn migration_bounds_a_hung_conditional_write() {
         let east = Arc::new(InMemStorage::default());
         let west = Arc::new(TopologyTestStorage::new());

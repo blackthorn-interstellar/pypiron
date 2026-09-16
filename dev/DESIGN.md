@@ -518,11 +518,13 @@ move off the write selection.
 
 Real traffic feeds the health view. A dedicated multi-only loop GETs the tiny,
 guaranteed topology stamp from every bucket, with a one-second deadline and no
-overlapping sweep. Startup, runtime revalidation, and migration use the same
-per-operation bound. GET is required because a body-less HEAD 404 cannot
-distinguish a missing object from a deleted bucket (`NoSuchBucket`). The loop is
-independent of index, counter, and replication work, so a dead bucket's retries
-cannot stall publishes or selection. Probes are traffic-gated: full cadence only
+overlapping sweep. Startup, runtime revalidation, and migration bound each
+control operation too, at ten seconds: their connections are cold, and DNS, TLS,
+and a provider token exchange on a slow link or a slow board can take more than a
+second without the bucket being down. GET is required because a body-less HEAD
+404 cannot distinguish a missing object from a deleted bucket (`NoSuchBucket`).
+The loop is independent of index, counter, and replication work, so a dead
+bucket's retries cannot stall publishes or selection. Probes are traffic-gated: full cadence only
 with recent traffic or an unhealthy bucket (re-probing unhealthy buckets is the
 only way heal-back happens), decaying when idle. Classification is backend-neutral
 and fail-closed: only timeouts (including HTTP 408), connection failures, and 5xx

@@ -26,13 +26,15 @@ use crate::storage::{copy_pair_eligible, CopyOrigin, CopyOutcome, Storage};
 ///
 /// This is a cold-start bound, not a probe deadline. The first control call on
 /// a bucket pays DNS, TCP, TLS, and on GCS/Azure a token exchange before the
-/// GET itself; on a slow link or a slow board that is seconds, and the riscv64
-/// release image (booted under QEMU by the smoke test) blew a one-second bound
-/// on the TLS handshake alone and refused to start. Ten seconds still keeps a
-/// hung bucket from parking startup on the hour-long transfer ceiling. The
-/// runtime health loop probes warm connections and keeps its own one-second
-/// deadline (`BUCKET_HEALTH_IO_TIMEOUT` in src/worker.rs).
-const TOPOLOGY_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// GET itself. On a slow link or a slow board that is seconds: the riscv64
+/// release image, booted under QEMU by the smoke test, needs one to two
+/// seconds for its first S3 GET and refused to start under a one-second bound.
+/// Five seconds covers that with margin, matches object_store's own default
+/// connect budget, and still keeps a hung bucket from parking startup on the
+/// hour-long transfer ceiling — each startup gate waits at most this long per
+/// hung bucket. The runtime health loop probes warm connections and keeps its
+/// own one-second deadline (`BUCKET_HEALTH_IO_TIMEOUT` in src/worker.rs).
+const TOPOLOGY_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct TopologyIoTimeout;

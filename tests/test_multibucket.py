@@ -450,7 +450,10 @@ def test_fresh_startup_skips_a_blackholed_preferred_bucket(
     )
     try:
         server = next(server_gen)
-        assert time.monotonic() - started < 8
+        # The format gate and the topology gate each wait the five-second
+        # cold-start control bound on the silent bucket: about ten seconds,
+        # never the hour-long artifact transfer ceiling.
+        assert time.monotonic() - started < 15
         _eventually(
             lambda: _selected_bucket(server) == b,
             timeout=5,

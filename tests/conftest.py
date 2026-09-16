@@ -1226,9 +1226,10 @@ class _S3FaultProxyHandler(BaseHTTPRequestHandler):
             self._send_error(503, b"injected bucket outage")
             return
         if bucket and self.server.faults.is_blackholed(bucket):
-            # Health-only calls are cancelled by pypiron after one second. Keep
-            # this connection silent much longer so the test distinguishes that
-            # bound from an immediate synthetic 503.
+            # Health-only calls are cancelled by pypiron after one second and
+            # startup control calls after five. Keep this connection silent much
+            # longer so the test distinguishes those bounds from an immediate
+            # synthetic 503.
             time.sleep(15)
             self._log(bucket, received, 0, "503-injected-blackhole")
             try:

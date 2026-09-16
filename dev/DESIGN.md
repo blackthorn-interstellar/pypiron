@@ -519,7 +519,7 @@ move off the write selection.
 Real traffic feeds the health view. A dedicated multi-only loop GETs the tiny,
 guaranteed topology stamp from every bucket, with a one-second deadline and no
 overlapping sweep. Startup, runtime revalidation, and migration bound each
-control operation too, at ten seconds: their connections are cold, and DNS, TLS,
+control operation too, at five seconds: their connections are cold, and DNS, TLS,
 and a provider token exchange on a slow link or a slow board can take more than a
 second without the bucket being down. GET is required because a body-less HEAD
 404 cannot distinguish a missing object from a deleted bucket (`NoSuchBucket`).

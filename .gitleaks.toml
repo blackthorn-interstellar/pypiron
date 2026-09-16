@@ -4,16 +4,19 @@
 useDefault = true
 
 [allowlist]
-description = "Documented placeholder credentials"
+description = "Placeholder credentials from the manual and the dev scripts"
 # The manual teaches auth with `curl -u admin:secret` (and once `reader:secret`)
 # against a local dev server — `make run` starts exactly that pair. The default
 # curl-auth-user rule flags every one of those 31 lines across README.md and
-# docs/. Allowlisting the two literals rather than the rule or the docs/ tree is
-# the narrow fix: any OTHER credential that ever appears after `curl -u`, in docs
-# or anywhere else, still fails the scan.
+# docs/. `admin:smoke` is the same story in dev/scripts/image-smoke.sh: the
+# throwaway container it talks to gets PYPIRON_ADMIN_PASS=smoke a few lines
+# earlier. Allowlisting the three literals rather than the rule, the docs/ tree
+# or the script path is the narrow fix: any OTHER credential that ever appears
+# after `curl -u`, in docs or anywhere else, still fails the scan.
 regexes = [
   '''^admin:secret$''',
   '''^reader:secret$''',
+  '''^admin:smoke$''',
 ]
 
 # Deliberately NOT allowlisted: generated trees (target/, .local/) and the fuzz

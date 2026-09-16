@@ -24,8 +24,21 @@ fuzz_target!(|data: &[u8]| {
     // empty stems, dash-only names, versions that aren't versions, ...).
     let norm = normalize_pkg_name(s);
     let _ = is_normalized(s);
-    let _ = matches_prefix(s, "acme");
-    let _ = matches_prefix("acme-foo", s);
+    // Reserved private names: the pattern side is operator input, the match
+    // side is the hostile name — neither may panic, and a pattern that parses
+    // is a normalized name (or a `*` family over one) by construction.
+    if let Ok(pattern) = PrivatePattern::parse(s) {
+        assert!(
+            pattern.as_str().contains('*') || is_normalized(pattern.as_str()),
+            "PrivatePattern::parse approved a non-normalized name {:?} (from {s:?})",
+            pattern.as_str()
+        );
+        let _ = pattern.matches("acme-foo");
+    }
+    let _ = PrivateNames::new(Some(s), Vec::new());
+    if let Ok(names) = PrivateNames::new(Some("acme"), Vec::new()) {
+        let _ = names.matches(s);
+    }
     let _ = infer_package_from_filename(s);
     let _ = infer_version_from_filename(s);
     let _ = fold_version(s);
@@ -68,5 +81,9 @@ fuzz_target!(|data: &[u8]| {
 
     // PEP 503 normalization must be idempotent — the canonical-URL 301 in
     // `simple_pkg` would otherwise redirect in a loop.
-    assert_eq!(normalize_pkg_name(&norm), norm, "normalize_pkg_name not idempotent");
+    assert_eq!(
+        normalize_pkg_name(&norm),
+        norm,
+        "normalize_pkg_name not idempotent"
+    );
 });

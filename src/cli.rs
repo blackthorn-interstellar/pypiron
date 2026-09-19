@@ -798,23 +798,32 @@ impl PrivateArgs {
                     file.private_patterns.is_some() || file.private_patterns_from.is_some(),
                 )
             };
-        let mut lines = Vec::new();
+        // Only the file has a comment/blank-line syntax. An inline or TOML entry
+        // is parsed as given: one that would be refused must refuse startup,
+        // never vanish, or a name the operator believes is reserved isn't.
+        let mut patterns = Vec::new();
         if let Some(path) = from_file {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            lines.extend(text.lines().map(str::to_string));
-        }
-        lines.extend(inline.iter().cloned());
-
-        let mut patterns = Vec::new();
-        for (lineno, raw) in lines.iter().enumerate() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
+            for (lineno, raw) in text.lines().enumerate() {
+                let line = raw.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                patterns.push(PrivatePattern::parse(line).with_context(|| {
+                    format!(
+                        "private pattern {}:{} ('{line}')",
+                        path.display(),
+                        lineno + 1
+                    )
+                })?);
             }
-            let pattern = PrivatePattern::parse(line)
-                .with_context(|| format!("private pattern entry {} ('{line}')", lineno + 1))?;
-            patterns.push(pattern);
+        }
+        for (i, raw) in inline.iter().enumerate() {
+            patterns.push(
+                PrivatePattern::parse(raw)
+                    .with_context(|| format!("private pattern entry {} ({raw:?})", i + 1))?,
+            );
         }
         if configured && patterns.is_empty() {
             bail!(
@@ -1439,6 +1448,32 @@ fn merge_storage_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the pattern *file* has a comment/blank-line syntax. An inline or
+    /// TOML entry that would be refused by `PrivatePattern::parse` must refuse
+    /// startup, never vanish: a reserved name that silently isn't is the
+    /// dependency-confusion hole the knob exists to close.
+    #[test]
+    fn inline_and_toml_private_patterns_are_parsed_strictly() {
+        let file = config::ConfigFile::default();
+        for bad in ["#bolt", "", "  "] {
+            let args = PrivateArgs {
+                private_pattern: vec!["acme-*".into(), bad.into()],
+                ..PrivateArgs::default()
+            };
+            assert!(args.resolve(&file).is_err(), "inline {bad:?}");
+        }
+        for bad in ["#bolt", ""] {
+            let file = config::ConfigFile {
+                private_patterns: Some(vec!["acme-*".into(), bad.into()]),
+                ..config::ConfigFile::default()
+            };
+            assert!(
+                PrivateArgs::default().resolve(&file).is_err(),
+                "toml {bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn loopback_health_url_defaults_and_follows_bind_port() {

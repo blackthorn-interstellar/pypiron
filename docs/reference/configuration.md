@@ -279,8 +279,9 @@ private-patterns-from = "private-packages.txt"
 
 A pattern matches the whole name after normalization, so `blueowl-*` covers
 `blueowl_auth` but not `blueowltool`, and `bolt` does not cover `bolt-on`. `*`
-is the only wildcard; a bare `*` is refused. The prefix and the patterns
-combine. Patterns on the command line (`--private-pattern`,
+is the only wildcard; a bare `*` is refused, and so is any entry that is not a
+valid pattern. Only the file form allows blank lines and `#` comments. The
+prefix and the patterns combine. Patterns on the command line (`--private-pattern`,
 `--private-patterns-from`) replace the file's list rather than adding to it.
 Private packages that existed before a name was reserved keep working.
 

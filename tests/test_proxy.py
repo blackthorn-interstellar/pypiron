@@ -707,6 +707,24 @@ def test_empty_config_package_list_refuses_startup(pypiron_bin, tmp_path):
     assert "include-packages" in out, out
 
 
+def test_invalid_inline_private_pattern_refuses_startup(pypiron_bin, tmp_path):
+    """Only the pattern *file* has a comment syntax. An inline entry that is not
+    a valid pattern must refuse startup, never be skipped: a name the operator
+    believes is reserved but isn't is exactly the dependency-confusion hole."""
+    cp = _serve(
+        pypiron_bin,
+        "--data-dir",
+        str(tmp_path / "data"),
+        "--private-pattern",
+        "acme-*",
+        "--private-pattern",
+        "#bolt",
+    )
+    out = cp.stdout + cp.stderr
+    assert cp.returncode != 0, f"invalid inline private pattern must refuse startup:\n{out}"
+    assert "#bolt" in out, out
+
+
 def test_no_package_scope_still_starts_open(proxy_pair, tmp_path):
     """The documented default is unchanged: with no package scope configured at
     all, the proxy serves any non-private name."""

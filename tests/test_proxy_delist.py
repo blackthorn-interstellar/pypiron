@@ -266,7 +266,14 @@ def test_excluding_a_cached_package_delists_it(tmp_path_factory, pypiron_bin, tm
             assert _poll(lambda: _index_filenames(data_dir, "delistme") == {wheel.name}), (
                 "proxy never materialized the cached package's local index"
             )
-            assert "delistme" in _global_names(proxy["simple"])
+            # Polled, like the delist/relist halves below: the tick writes the
+            # per-package index during rebuild_package, then the global name
+            # list once in a batched pass at the end. An un-polled assert here
+            # races that second write and fails on a loaded runner with an
+            # empty /simple/ projects list.
+            assert _poll(lambda: "delistme" in _global_names(proxy["simple"])), (
+                "proxy never added the cached package to the global /simple/ name list"
+            )
 
         # (2) Restart with the package on the denylist. The startup reconcile
         # delists it: the per-package index is deleted, the name leaves the

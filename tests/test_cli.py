@@ -3,6 +3,7 @@ global flags only. Serve-specific flags live under `pypiron serve --help`."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -122,6 +123,33 @@ def test_config_init_output_loads_as_config(pypiron_bin: Path, tmp_path: Path):
         str(store),
     )
     assert cp.returncode == 0, cp.stdout + cp.stderr
+
+
+def test_log_format_from_config_file(pypiron_bin: Path, tmp_path: Path):
+    """Top-level `log-format` switches the process's log output. It is read
+    before logging starts, so even the "loaded configuration" line honors it;
+    a flag after the subcommand still wins; a bad value refuses, naming the key."""
+    cfg = tmp_path / "pypiron.toml"
+    cfg.write_text('log-format = "json"\n')
+    store = tmp_path / "store"
+    store.mkdir()
+    base = ("verify-index", "--config", str(cfg), "--data-dir", str(store))
+
+    cp = _run(pypiron_bin, *base)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    loaded = [l for l in (cp.stdout + cp.stderr).splitlines() if "loaded configuration" in l]
+    assert loaded, cp.stdout + cp.stderr
+    assert json.loads(loaded[0])["fields"]["message"].startswith("loaded configuration")
+
+    cp = _run(pypiron_bin, *base, "--log-format", "text")
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    loaded = [l for l in (cp.stdout + cp.stderr).splitlines() if "loaded configuration" in l]
+    assert loaded and not loaded[0].startswith("{"), cp.stdout + cp.stderr
+
+    cfg.write_text('log-format = "xml"\n')
+    cp = _run(pypiron_bin, *base)
+    assert cp.returncode != 0, cp.stdout + cp.stderr
+    assert "log-format" in cp.stderr, cp.stderr
 
 
 def test_serve_rejects_out_of_range_counter_knob(pypiron_bin: Path, tmp_path: Path):

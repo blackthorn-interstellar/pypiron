@@ -13,6 +13,10 @@
 # uploader, and read passwords, the token signing key, and the Azure access key
 # come only from the CLI or the environment.
 
+# Log output: text (human-readable) or json (one object per line, for log
+# pipelines). Applies to every command.
+# log-format = "text"
+
 # Reserve your private names, so they never fall through to an upstream and a
 # new private package can't be raced by a public one (a dependency-confusion
 # guard). Shared by `sync` and the `serve` proxy. A prefix reserves `<prefix>`

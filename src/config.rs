@@ -16,10 +16,11 @@
 //! how you mirror the wrong thing.
 //!
 //! Every `serve`/`sync` flag has a same-named key here except, by design: the
-//! serve credentials and the Azure access key (secrets), the process-level
-//! `--config`/`--log-format` (logging is up before the file is read), and the
-//! one-shot sync switches `--dry-run`/`--full`/`--no-progress`. The
-//! `every_serve_and_sync_flag_has_a_file_key` test pins that list.
+//! serve credentials and the Azure access key (secrets), `--config` itself, and
+//! the one-shot sync switches `--dry-run`/`--full`/`--no-progress`. The
+//! `every_serve_and_sync_flag_has_a_file_key` test pins that list. The global
+//! `log-format` is a top-level key read by [`peek_log_format`] before logging
+//! starts, since a tracing subscriber installs once per process.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,8 @@ pub const TEMPLATE: &str = include_str!("config_template.toml");
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ConfigFile {
+    /// Log output format, `text` or `json`; the file form of `--log-format`.
+    pub log_format: Option<String>,
     /// Reserved private namespace (PEP 503-normalized). Shared by `sync` and the
     /// `serve` proxy — the dependency-confusion control belongs in one place.
     pub private_prefix: Option<String>,
@@ -269,19 +272,9 @@ fn fold_deprecated_sync_private_patterns(cfg: &mut ConfigFile) -> Result<()> {
 /// Relative `include-packages-from` and `exclude-packages-from` paths inside the
 /// file resolve against the config file's own directory, not the process cwd.
 pub fn load(explicit: Option<&Path>) -> Result<ConfigFile> {
-    let path = match explicit {
-        Some(p) => p.to_path_buf(),
-        None => {
-            let default = Path::new(DEFAULT_CONFIG_PATH);
-            if !default.exists() {
-                return Ok(ConfigFile::default());
-            }
-            default.to_path_buf()
-        }
+    let Some((path, text)) = read_text(explicit)? else {
+        return Ok(ConfigFile::default());
     };
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading config {}", path.display()))?;
-
     let mut cfg: ConfigFile =
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
 
@@ -298,6 +291,37 @@ pub fn load(explicit: Option<&Path>) -> Result<ConfigFile> {
     // above carry the path via `with_context`, so failures still name the file.
     info!("loaded configuration from {}", path.display());
     Ok(cfg)
+}
+
+/// The file's `log-format`, read before logging is initialised (the one key
+/// that must be known before the first log line). A file the full [`load`]
+/// will refuse yields `None` here, so that load reports the error with logging
+/// up rather than this peek reporting it twice.
+pub fn peek_log_format(explicit: Option<&Path>) -> Result<Option<String>> {
+    let Some((_, text)) = read_text(explicit)? else {
+        return Ok(None);
+    };
+    Ok(toml::from_str::<ConfigFile>(&text)
+        .ok()
+        .and_then(|cfg| cfg.log_format))
+}
+
+/// Resolve the config path and read it. An explicit path must exist;
+/// `./pypiron.toml` is optional.
+fn read_text(explicit: Option<&Path>) -> Result<Option<(PathBuf, String)>> {
+    let path = match explicit {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let default = Path::new(DEFAULT_CONFIG_PATH);
+            if !default.exists() {
+                return Ok(None);
+            }
+            default.to_path_buf()
+        }
+    };
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading config {}", path.display()))?;
+    Ok(Some((path, text)))
 }
 
 fn rebase_relative(path: &mut Option<PathBuf>, config_path: &Path) {
@@ -484,6 +508,7 @@ mod tests {
 
         // Spot-check that documented defaults match the real ones and land in
         // the right section.
+        assert_eq!(cfg.log_format.as_deref(), Some("text"));
         assert_eq!(cfg.private_prefix.as_deref(), Some("acme"));
         assert_eq!(cfg.serve.bind_addr.as_deref(), Some("0.0.0.0:8080"));
         assert_eq!(cfg.serve.artifact_delivery.as_deref(), Some("auto"));
@@ -543,8 +568,8 @@ mod tests {
             .map(|(k, _)| k.as_str())
             .collect();
         let mirror = keys("mirror");
-        // Global process flags: logging is initialised before the file is read.
-        const GLOBAL: &[&str] = &["help", "version", "config", "log_format"];
+        // `--config` names the file; it can't live in it.
+        const GLOBAL: &[&str] = &["help", "version", "config"];
         // Secrets stay out of the file; the sync switches are per-run, not config.
         const CLI_ONLY: &[(&str, &[&str])] = &[
             (

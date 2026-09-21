@@ -879,10 +879,24 @@ pub async fn cli_main() -> Result<()> {
     };
 
     // logging — format comes from the global --log-format/PYPIRON_LOG_FORMAT,
-    // so every subcommand (serve, sync, verify-index, rebuild-index) logs consistently.
+    // else the file's top-level `log-format`, so every subcommand logs
+    // consistently. A subscriber installs once per process, so the file's value
+    // is the one key peeked before the full config load; `config init` stays
+    // free of any config read.
+    let log_format = if arg_from_cli_or_env(&matches, "log_format")
+        || matches!(cli.command, Some(Commands::Config(_)))
+    {
+        cli.log_format
+    } else {
+        match config::peek_log_format(cli.config.as_deref())? {
+            Some(raw) => <LogFormat as clap::ValueEnum>::from_str(&raw, true)
+                .map_err(|e| anyhow::anyhow!("log-format: {e}"))?,
+            None => cli.log_format,
+        }
+    };
     let env_filter =
         std::env::var("RUST_LOG").unwrap_or_else(|_| "info,pypiron=info,object_store=warn".into());
-    match cli.log_format {
+    match log_format {
         // ANSI only when stdout is a TTY, so color codes don't leak into files
         // or `docker logs`.
         LogFormat::Text => tracing_subscriber::fmt()
@@ -953,7 +967,7 @@ pub async fn cli_main() -> Result<()> {
             let serve_matches = matches
                 .subcommand_matches("serve")
                 .expect("serve subcommand matched");
-            run_serve(*args, config_path, serve_matches, cli.log_format).await
+            run_serve(*args, config_path, serve_matches, log_format).await
         }
         Some(Commands::Healthcheck(args)) => run_healthcheck(args).await,
         Some(Commands::CreateToken(args)) => run_create_token(args).await,

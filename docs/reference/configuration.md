@@ -14,7 +14,7 @@ Precedence: **CLI > environment > file > defaults**.
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
 | `--config PATH` | `PYPIRON_CONFIG` | `./pypiron.toml` when present | Config file. Read by every command. |
-| `--log-format text\|json` | `PYPIRON_LOG_FORMAT` | `text` | Human logs or one JSON object per line. |
+| `--log-format text\|json` | `PYPIRON_LOG_FORMAT` | `text` | Human logs or one JSON object per line. Also top-level `log-format`. |
 
 ## `pypiron.toml`
 
@@ -44,7 +44,7 @@ Sections:
 
 | Section | Owns |
 | --- | --- |
-| top level | `private-prefix`, `private-patterns`, `private-patterns-from` |
+| top level | `log-format`, `private-prefix`, `private-patterns`, `private-patterns-from` |
 | `[serve]` | server, proxy, storage, counters, logs |
 | `[mirror]` | package and file selection shared by proxy and sync |
 | `[sync]` | destination and sync worker settings |
@@ -53,8 +53,8 @@ Every `serve` and `sync` flag below is also a `[serve]` or `[sync]` key with
 the same name, minus the `--`. The exceptions stay in CLI/env: the serve
 credentials (`--admin-user`, `--admin-pass`, `--uploader-user`,
 `--uploader-pass`, `--read-user`, `--read-pass`, `--token-signing-key`,
-`--azure-access-key`), the process-level `--config` and `--log-format`, and
-the one-shot sync switches `--dry-run`, `--full`, and `--no-progress`.
+`--azure-access-key`), `--config` itself, and the one-shot sync switches
+`--dry-run`, `--full`, and `--no-progress`.
 `sync.admin-pass` exists for closed deployment files, but env is cleaner:
 `PYPIRON_SYNC_ADMIN_PASS`.
 

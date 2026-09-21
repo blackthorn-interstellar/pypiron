@@ -836,6 +836,9 @@ struct Resolved {
     concurrency: usize,
     package_concurrency: usize,
     spool_dir: PathBuf,
+    /// Extra CA bundle for the source TLS (`--upstream-ca-cert` /
+    /// `[sync].upstream-ca-cert`); loaded fail-closed before the client is built.
+    upstream_ca_cert: Option<PathBuf>,
     dry_run: bool,
     full: bool,
     /// Mirror files whose version isn't valid PEP 440. When false (the default),
@@ -915,6 +918,12 @@ impl Resolved {
             )
         })?)?;
 
+        // Opt-in bools share one precedence shape: CLI/env can only turn them
+        // on, so a file that opted in isn't force-disabled by a bare run.
+        let as_private = args.as_private || sync.as_private.unwrap_or(false);
+        let allow_insecure_source =
+            args.allow_insecure_source || sync.allow_insecure_source.unwrap_or(false);
+
         // The ordinary package scope is shared with the proxy. A pypicloud
         // migration may instead discover its work list from private patterns.
         let mirror = args.mirror.resolve(Some(&cfg.mirror))?;
@@ -927,7 +936,7 @@ impl Resolved {
                 }
             }
             SourceKind::Pypicloud => {
-                if !args.as_private {
+                if !as_private {
                     bail!("--source-kind pypicloud requires --as-private");
                 }
                 if args.src_base.is_none() && sync.from.is_none() {
@@ -982,7 +991,7 @@ impl Resolved {
             &src_base,
             args.source_user.clone().or(sync.source_user),
             args.source_pass.clone().or(sync.source_pass),
-            args.allow_insecure_source,
+            allow_insecure_source,
         )?;
         Ok(Self {
             guard: Arc::new(crate::ssrf::Guard::new(&src_base, &dst_host, &[])?),
@@ -992,18 +1001,20 @@ impl Resolved {
             admin_user: args.admin_user.clone().or(sync.admin_user),
             admin_pass: args.admin_pass.clone().or(sync.admin_pass),
             source_auth,
-            as_private: args.as_private,
+            as_private,
             private,
             advisory_feed,
             src_explicit,
             concurrency,
             package_concurrency,
-            spool_dir: args.spool_dir.clone().unwrap_or_else(std::env::temp_dir),
+            spool_dir: args
+                .spool_dir
+                .clone()
+                .or(sync.spool_dir)
+                .unwrap_or_else(std::env::temp_dir),
+            upstream_ca_cert: args.upstream_ca_cert.clone().or(sync.upstream_ca_cert),
             dry_run: args.dry_run,
             full: args.full,
-            // Same precedence shape as the other opt-in bools: CLI/env can only
-            // turn it on, so a file that opted in isn't force-disabled by a bare
-            // run without the flag.
             allow_legacy_versions: args.allow_legacy_versions
                 || sync.allow_legacy_versions.unwrap_or(false),
             denylist: Denylist::from_specs(&mirror.exclude_packages),
@@ -1951,7 +1962,7 @@ pub async fn run_sync(args: SyncArgs, config_path: Option<PathBuf>) -> Result<()
     // Extra upstream trust roots (a corporate MITM CA presented on the source
     // TLS) before the client is built. Fail-closed: a bad --upstream-ca-cert
     // bundle aborts the run here rather than surfacing on the first fetch.
-    crate::upstream_tls::init(args.upstream_ca_cert.as_deref())?;
+    crate::upstream_tls::init(resolved.upstream_ca_cert.as_deref())?;
 
     let client = crate::upstream_tls::apply(
         Client::builder()
@@ -4079,6 +4090,7 @@ mod tests {
             concurrency: 1,
             package_concurrency: 1,
             spool_dir: std::env::temp_dir(),
+            upstream_ca_cert: None,
             dry_run: false,
             full: false,
             allow_legacy_versions: false,

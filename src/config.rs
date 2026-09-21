@@ -14,6 +14,12 @@
 //! Precedence is CLI/env (clap merges those) > file > built-in default.
 //! Unknown keys are hard errors — a typo'd mirror rule that silently no-ops is
 //! how you mirror the wrong thing.
+//!
+//! Every `serve`/`sync` flag has a same-named key here except, by design: the
+//! serve credentials and the Azure access key (secrets), the process-level
+//! `--config`/`--log-format` (logging is up before the file is read), and the
+//! one-shot sync switches `--dry-run`/`--full`/`--no-progress`. The
+//! `every_serve_and_sync_flag_has_a_file_key` test pins that list.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -101,6 +107,16 @@ pub struct ServeConfig {
     pub proxy_upstream: Option<String>,
     pub allow_insecure_upstream: Option<bool>,
     pub proxy_stream_threshold: Option<String>,
+    /// Hosts the proxy may fetch listing-derived URLs from even when they
+    /// resolve to a private address; `proxy-allow-cidr` does the same by range.
+    pub proxy_allow_host: Option<Vec<String>>,
+    pub proxy_allow_cidr: Option<Vec<String>>,
+    /// Extra CA bundle for upstream/advisory TLS; a relative path resolves next
+    /// to this file.
+    pub upstream_ca_cert: Option<PathBuf>,
+    /// This node's region label (multi-bucket read steering); detected on cloud
+    /// nodes when unset.
+    pub node_region: Option<String>,
     pub advisory_feed: Option<String>,
     pub malware_block: Option<bool>,
     pub malware_probe_secs: Option<u64>,
@@ -195,6 +211,14 @@ pub struct SyncConfig {
     /// password via `PYPIRON_SYNC_SOURCE_PASS`.
     pub source_user: Option<String>,
     pub source_pass: Option<String>,
+    /// Send the source credential to a plaintext `http://` source.
+    pub allow_insecure_source: Option<bool>,
+    /// Migrate into the private namespace instead of mirroring.
+    pub as_private: Option<bool>,
+    /// Download spool directory (default: the system temp dir).
+    pub spool_dir: Option<PathBuf>,
+    /// Extra CA bundle for source TLS; a relative path resolves next to this file.
+    pub upstream_ca_cert: Option<PathBuf>,
     /// Deprecated spelling of the top-level `private-patterns` (v0.0.18 shipped
     /// it here, pypicloud-migration only). Folded into the top level on load.
     pub private_patterns: Option<Vec<String>>,
@@ -265,6 +289,8 @@ pub fn load(explicit: Option<&Path>) -> Result<ConfigFile> {
     rebase_relative(&mut cfg.mirror.exclude_packages_from, &path);
     rebase_relative(&mut cfg.sync.private_patterns_from, &path);
     rebase_relative(&mut cfg.private_patterns_from, &path);
+    rebase_relative(&mut cfg.serve.upstream_ca_cert, &path);
+    rebase_relative(&mut cfg.sync.upstream_ca_cert, &path);
     fold_deprecated_sync_private_patterns(&mut cfg)?;
     // Announce only after a clean parse — silent auto-discovery of
     // ./pypiron.toml is how an unrelated CLI invocation gets quietly rewired,
@@ -427,12 +453,10 @@ mod tests {
         assert_eq!(air.mirror.include_yanked, Some(true));
     }
 
-    #[test]
-    fn annotated_template_uncomments_and_parses() {
-        // Uncommenting every `# <key> = <value>` line must yield a config that
-        // still parses under deny_unknown_fields. A renamed or removed knob
-        // leaves a stale template line that this catches at build time.
-        let uncommented = TEMPLATE
+    /// The template with every `# <key> = <value>` line uncommented: the full
+    /// documented key set, as a parseable file.
+    fn uncommented_template() -> String {
+        TEMPLATE
             .lines()
             .map(|line| match line.strip_prefix("# ") {
                 Some(rest)
@@ -447,10 +471,16 @@ mod tests {
                 _ => line.to_string(),
             })
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+    }
 
+    #[test]
+    fn annotated_template_uncomments_and_parses() {
+        // Uncommenting every `# <key> = <value>` line must yield a config that
+        // still parses under deny_unknown_fields. A renamed or removed knob
+        // leaves a stale template line that this catches at build time.
         let cfg: ConfigFile =
-            toml::from_str(&uncommented).expect("uncommented template must parse");
+            toml::from_str(&uncommented_template()).expect("uncommented template must parse");
 
         // Spot-check that documented defaults match the real ones and land in
         // the right section.
@@ -488,6 +518,93 @@ mod tests {
         );
         assert!(cfg.sync.private_patterns.is_none());
         assert_eq!(cfg.sync.concurrency, Some(4));
+    }
+
+    /// Every `serve`/`sync` flag has a `PYPIRON_*` env var and a same-named key
+    /// in the template (which the test above proves is the struct's key set), so
+    /// a new flag can't quietly ship CLI/env-only. The exceptions are listed, not
+    /// inferred.
+    #[test]
+    fn every_serve_and_sync_flag_has_a_file_key() {
+        use clap::CommandFactory;
+
+        let table: toml::Table = toml::from_str(&uncommented_template()).unwrap();
+        let keys = |section: &str| -> Vec<&str> {
+            table[section]
+                .as_table()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect()
+        };
+        let top: Vec<&str> = table
+            .iter()
+            .filter(|(_, v)| !v.is_table())
+            .map(|(k, _)| k.as_str())
+            .collect();
+        let mirror = keys("mirror");
+        // Global process flags: logging is initialised before the file is read.
+        const GLOBAL: &[&str] = &["help", "version", "config", "log_format"];
+        // Secrets stay out of the file; the sync switches are per-run, not config.
+        const CLI_ONLY: &[(&str, &[&str])] = &[
+            (
+                "serve",
+                &[
+                    "admin_user",
+                    "admin_pass",
+                    "uploader_user",
+                    "uploader_pass",
+                    "read_user",
+                    "read_pass",
+                    "token_signing_key",
+                    "azure_access_key",
+                ],
+            ),
+            ("sync", &["dry_run", "full", "no_progress"]),
+        ];
+        // Repeatable flags are plural in the file; `--from`/`--to` are their own keys.
+        const RENAMED: &[(&str, &str)] = &[
+            ("include_package", "include-packages"),
+            ("exclude_package", "exclude-packages"),
+            ("private_pattern", "private-patterns"),
+            ("src_base", "from"),
+            ("dst_base", "to"),
+        ];
+
+        let mut cmd = crate::cli::Cli::command();
+        cmd.build();
+        let mut missing = Vec::new();
+        for (sub, cli_only) in CLI_ONLY {
+            let section = keys(sub);
+            let args = cmd.find_subcommand(sub).unwrap().get_arguments();
+            for arg in args {
+                let id = arg.get_id().as_str();
+                if GLOBAL.contains(&id) || cli_only.contains(&id) {
+                    continue;
+                }
+                let flag = arg.get_long().unwrap_or(id);
+                if arg.get_env().is_none() {
+                    missing.push(format!("{sub} --{flag}: no PYPIRON_* env var"));
+                }
+                let key = RENAMED
+                    .iter()
+                    .find(|(from, _)| *from == id)
+                    .map_or_else(|| id.replace('_', "-"), |(_, to)| (*to).to_string());
+                let known = top.contains(&key.as_str())
+                    || mirror.contains(&key.as_str())
+                    || section.contains(&key.as_str());
+                if !known {
+                    missing.push(format!(
+                        "{sub} --{flag}: no `{key}` in the pypiron.toml template"
+                    ));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "flags without a file key (add the key to the struct and the template, or list it as CLI-only here):\n{}",
+            missing.join("\n")
+        );
     }
 
     #[test]

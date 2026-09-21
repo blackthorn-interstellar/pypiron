@@ -49,8 +49,14 @@ Sections:
 | `[mirror]` | package and file selection shared by proxy and sync |
 | `[sync]` | destination and sync worker settings |
 
-Serve secrets stay in CLI/env. `sync.admin-pass` exists for closed deployment
-files, but env is cleaner: `PYPIRON_SYNC_ADMIN_PASS`.
+Every `serve` and `sync` flag below is also a `[serve]` or `[sync]` key with
+the same name, minus the `--`. The exceptions stay in CLI/env: the serve
+credentials (`--admin-user`, `--admin-pass`, `--uploader-user`,
+`--uploader-pass`, `--read-user`, `--read-pass`, `--token-signing-key`,
+`--azure-access-key`), the process-level `--config` and `--log-format`, and
+the one-shot sync switches `--dry-run`, `--full`, and `--no-progress`.
+`sync.admin-pass` exists for closed deployment files, but env is cleaner:
+`PYPIRON_SYNC_ADMIN_PASS`.
 
 ## Storage
 
@@ -371,9 +377,9 @@ than 0.0.17. Use the next release when available, or run
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
 | `--from URL` | `PYPIRON_SYNC_FROM` | `https://pypi.org` | Source index. Name a Simple endpoint in full when it lives off `/simple` (devpi: `.../<user>/<index>/+simple`). With `--source-kind pypicloud`, use the pypicloud application root instead. |
-| `--source-kind simple\|pypicloud` | `PYPIRON_SOURCE_KIND` | `simple` | Source protocol. `pypicloud` reads `/api/package/`, requires `--as-private`, and supports private-name patterns. Also `[sync].source-kind`. |
-| `--source-user USER` | `PYPIRON_SYNC_SOURCE_USER` | none | Authenticated-source username. Sent only to the same scheme, host, and port. Requires `--source-pass`; also `[sync].source-user`. |
-| `--source-pass PASS` | `PYPIRON_SYNC_SOURCE_PASS` | none | Password for an authenticated source. Requires `--source-user`; also `[sync].source-pass`. |
+| `--source-kind simple\|pypicloud` | `PYPIRON_SOURCE_KIND` | `simple` | Source protocol. `pypicloud` reads `/api/package/`, requires `--as-private`, and supports private-name patterns. |
+| `--source-user USER` | `PYPIRON_SYNC_SOURCE_USER` | none | Authenticated-source username. Sent only to the same scheme, host, and port. Requires `--source-pass`. |
+| `--source-pass PASS` | `PYPIRON_SYNC_SOURCE_PASS` | none | Password for an authenticated source. Requires `--source-user`. |
 | `--allow-insecure-source` | `PYPIRON_ALLOW_INSECURE_SOURCE` | `false` | Send source credentials over plaintext HTTP. Unauthenticated HTTP sources need no flag. |
 | `--upstream-ca-cert PEM` | `PYPIRON_UPSTREAM_CA_CERT` | none | Extra CA certificates for source TLS. Adds to built-in roots and must parse at startup. [Proxy setup](#behind-a-forward-proxy-or-tls-interception). |
 | `--to URL` | `PYPIRON_SYNC_TO` | required | Destination pypiron URL. |
@@ -383,14 +389,14 @@ than 0.0.17. Use the next release when available, or run
 | `--as-private` | `PYPIRON_SYNC_AS_PRIVATE` | `false` | Import as private packages. Uses the migration time and does not preserve yank state. Public-owned names require emptying and `origin release`. [Migration guide](../guides/migrate.md). |
 | `--private-pattern PATTERN` | `PYPIRON_PRIVATE_PATTERN` | none | Refuse to mirror names matching `PATTERN`; with `--source-kind pypicloud --as-private`, migrate the matching projects instead. Repeatable; comma-separated in the env var. Also top-level `private-patterns`. [Details](#reserved-private-names). |
 | `--private-patterns-from FILE` | `PYPIRON_PRIVATE_PATTERNS_FROM` | none | Read patterns from `FILE`, one per line. Blank lines and `#` comments are ignored. Also top-level `private-patterns-from`. |
-| `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | relay from `--from` | Deliver an advisory snapshot to the destination. A URL or path overrides the source feed; `""` disables. Failure warns but does not stop package sync. Also `[sync].advisory-feed`. |
+| `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | relay from `--from` | Deliver an advisory snapshot to the destination. A URL or path overrides the source feed; `""` disables. Failure warns but does not stop package sync. |
 | `--concurrency N` | `PYPIRON_SYNC_CONCURRENCY` | `4` | Transfers within one package. |
 | `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8` | Maximum packages in parallel. Each completed package frees a slot for the next, even while another package is stalled. |
 | `--spool-dir PATH` | `PYPIRON_SYNC_SPOOL_DIR` | system temp | Download spool directory. |
 | `--dry-run` | `PYPIRON_SYNC_DRY_RUN` | `false` | Print work, write nothing. |
 | `--full` | `PYPIRON_SYNC_FULL` | `false` | Ignore cursors and reconcile every selected project. |
 | `--no-progress` | `PYPIRON_SYNC_NO_PROGRESS` | `false` | Hide the live progress meter. |
-| `--allow-legacy-versions` | `PYPIRON_ALLOW_LEGACY_VERSIONS` | `false` | Mirror files without an inferable PEP 440 version. Otherwise they are logged and skipped. Applies in sync, because the destination accepts mirror uploads. Also `[sync].allow-legacy-versions`. |
+| `--allow-legacy-versions` | `PYPIRON_ALLOW_LEGACY_VERSIONS` | `false` | Mirror files without an inferable PEP 440 version. Otherwise they are logged and skipped. Applies in sync, because the destination accepts mirror uploads. |
 
 Re-running sync is normal. Existing files stay; yanks, removals, and project
 status reconcile from upstream. Changing file-selection settings, including

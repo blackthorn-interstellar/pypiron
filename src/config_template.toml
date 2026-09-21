@@ -79,6 +79,15 @@
 # from upstream. The last bytes wait for the hash check, so a download that
 # finishes is a verified one. "off" waits for every file.
 # proxy-stream-threshold = "16MiB"
+# Let the proxy fetch listing-derived URLs (artifacts, .metadata, redirect
+# targets) from these hosts / address ranges even when they resolve to a private
+# address. Only the upstream host itself is exempt otherwise.
+# proxy-allow-host = ["files.internal.example"]
+# proxy-allow-cidr = ["10.0.0.0/8"]
+# Extra CA certificates (PEM) to trust for upstream, sync-source and advisory
+# TLS — the root a corporate TLS-intercepting proxy presents. Adds to the
+# built-in roots; a relative path resolves next to this file.
+# upstream-ca-cert = "corp-root.pem"
 
 # Supply-chain security — malware blocking plus the org audit, from one OSV feed
 # (the same database uv audit uses). On by default: protection nobody configured
@@ -124,6 +133,9 @@
 # Failed-login cooldown: five failed logins from one address, each within this
 # window of the last, lock that address out of logging in for the window.
 # login-cooldown-secs = 300                 # 0 disables
+# Take that address from X-Forwarded-For / X-Real-IP. Only behind a proxy that
+# overwrites those headers; otherwise any caller can forge its logged address.
+# trusted-proxy = false
 
 # Download statistics (beta) — count per-package/version downloads per day.
 # About $0.04 per node per month, no database.
@@ -142,9 +154,12 @@
 # intent-grace-secs = 900                   # upload/replication crash grace; range 3..9223372036854775807
 # audit-on-boot = true                      # self-heal sweep when a node becomes leader
 # reconcile-interval-secs = 86400           # audit sweep interval (an unchanged corpus is ~free)
+# quarantine-poll-secs = 30                 # max delay before other nodes adopt a project freeze
 # transparency = true                       # write tamper-evident checkpoints (pypiron verify-chain)
 # repl-sweep-interval-secs = 300             # _repl/ repair-note sweep backstop (also fires on bucket heal)
 # lease-ttl-secs = 30                       # leader lease TTL (multi-node S3)
+# node-region = "us-east-1"                 # this node's region, matched to bucket @region labels
+                                            # to pick the bucket it reads from; cloud nodes detect it
 
 
 [mirror]  # the slice of PyPI to mirror/proxy — shared by `sync` and the serve proxy
@@ -196,14 +211,20 @@
 # off a private devpi/Artifactory/Nexus). Prefer PYPIRON_SYNC_SOURCE_PASS.
 # source-user = "reader"
 # source-pass = "secret"                    # better: set PYPIRON_SYNC_SOURCE_PASS
+# allow-insecure-source = false             # send that credential to a plaintext http:// source
+# upstream-ca-cert = "corp-root.pem"        # extra CA bundle for the source TLS; resolves next to this file
 # A pypicloud migration takes its work list from the top-level private-prefix /
 # private-patterns above (or from [mirror].include-packages).
 # Destination admin credential (mirroring is admin-only). Prefer supplying the
 # password via PYPIRON_SYNC_ADMIN_PASS over committing it here.
 # admin-user = "admin"
 # admin-pass = "secret"                     # better: set PYPIRON_SYNC_ADMIN_PASS
+# Migrate the source into your private namespace instead of mirroring it (moving
+# off a private devpi/Artifactory/Nexus). Required with source-kind = "pypicloud".
+# as-private = false
 # concurrency = 4                           # parallel transfers within one package
 # package-concurrency = 8                   # packages synced in parallel
+# spool-dir = "/var/spool/pypiron-sync"     # download spool; real disk, not tmpfs, for multi-GB wheels
 # Skip upstream files whose version string isn't valid PEP 440 (the default), so
 # a single ancient release can't break a mirror run. Decided entirely here: the
 # destination doesn't re-check mirror uploads and stores whatever sync sends. Set

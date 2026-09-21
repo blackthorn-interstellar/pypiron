@@ -1384,6 +1384,19 @@ pub fn merge_serve_file(
     cli.spool_dir = cli.spool_dir.take().or(f.spool_dir.clone());
     cli.advisory_feed = cli.advisory_feed.take().or(f.advisory_feed.clone());
     cli.malware_block = cli.malware_block.or(f.malware_block);
+    cli.upstream_ca_cert = cli.upstream_ca_cert.take().or(f.upstream_ca_cert.clone());
+    cli.node_region = cli.node_region.take().or(f.node_region.clone());
+    // Lists: like `buckets`, the file fills in only when CLI/env gave none.
+    if cli.proxy_allow_host.is_empty() {
+        if let Some(list) = &f.proxy_allow_host {
+            cli.proxy_allow_host = list.clone();
+        }
+    }
+    if cli.proxy_allow_cidr.is_empty() {
+        if let Some(list) = &f.proxy_allow_cidr {
+            cli.proxy_allow_cidr = list.clone();
+        }
+    }
 
     // Storage selection is shared with the maintenance commands, so it lives in
     // its own helper.

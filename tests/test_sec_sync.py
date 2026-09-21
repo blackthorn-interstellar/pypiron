@@ -163,6 +163,42 @@ def test_allow_insecure_source_permits_the_plaintext_credential(disk_server, pyp
         source_gen.close()
 
 
+def test_allow_insecure_source_from_config_file(disk_server, pypiron_bin, tmp_path):
+    """The same override as a `[sync]` key: every sync flag is also a file key,
+    and an opt-in bool set in the file isn't force-disabled by a run without
+    the flag."""
+    package = "insecuresrcfilepkg"
+    wheel = make_wheel(package, "1.0.0", tmp_path)
+    routes = {
+        f"/simple/{package}/": (
+            200,
+            ACCEPT_PEP691,
+            _listing(package, [_file_row(wheel)]),
+        ),
+        f"/files/{wheel.name}": (200, "application/octet-stream", wheel.read_bytes()),
+    }
+    config = tmp_path / "pypiron.toml"
+    config.write_text('[sync]\nallow-insecure-source = true\nsource-user = "reader"\n')
+    source_gen = _start_source(routes)
+    source_url, source = next(source_gen)
+    try:
+        rc, out, err = _mirror_sync(
+            pypiron_bin,
+            disk_server,
+            package,
+            source_url,
+            "--config",
+            str(config),
+            "--source-pass",
+            "secret",
+        )
+        assert rc == 0, f"{out}\n{err}"
+        wait_for_file_in_index(disk_server["simple"], package, wheel.name)
+        assert source.seen_auth[f"/simple/{package}/"] is not None
+    finally:
+        source_gen.close()
+
+
 def test_source_credential_stays_on_the_source_origin(disk_server, pypiron_bin, tmp_path):
     """The listing points the artifact at the same host on another port — a
     different service. The credential is scoped to the source's whole origin

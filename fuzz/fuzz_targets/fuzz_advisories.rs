@@ -23,10 +23,10 @@ use libfuzzer_sys::fuzz_target;
 // and `clock` (plus std/zip/serde/pep440_rs/time/anyhow), so this trio is the
 // whole surface. `clock` is the wall-clock read behind the watermark horizon;
 // it is itself a leaf over std atomics and `time`, so the real file drops in.
-#[path = "../../src/names.rs"]
-mod names;
 #[path = "../../src/clock.rs"]
 mod clock;
+#[path = "../../src/names.rs"]
+mod names;
 #[path = "../../src/osv.rs"]
 mod osv;
 

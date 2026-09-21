@@ -21,10 +21,10 @@ use libfuzzer_sys::fuzz_target;
 // absolute paths resolve, then pull render in beside them.
 #[path = "../../src/names.rs"]
 mod names;
-#[path = "../../src/sidecar.rs"]
-mod sidecar;
 #[path = "../../src/render.rs"]
 mod render;
+#[path = "../../src/sidecar.rs"]
+mod sidecar;
 
 // The real `status.rs` drags in the storage/anyhow stack (S3, axum, tokio) for
 // its sidecar read/write helpers, which would pull the whole crate into this

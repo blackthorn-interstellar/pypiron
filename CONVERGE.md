@@ -43,9 +43,11 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Wrong docs: `docs/reference/configuration.md` said a username tag (`reader+billing-api`) is recorded "in request metrics"; `/metrics` reads it only with `--metrics-project-labels` (default off). Now names the access log and the flag.
 - 2026-09-22 Delete: `make compat` ran serially (`-n 0`) to feed a ~130-line conftest writer for `docs/reference/compatibility.md`, a page removed from the manual in `25d8a82`; CI discarded the output and local runs left an untracked file. Writer, result collection and marker-label validation gone; `make compat` 66 s -> 10 s, same 21 passed / 1 skipped.
 - 2026-09-22 Delete: `tenacity` and `requests` sat in the `dev` dependency group since `114000b` and were never imported (`git log -S` empty); dropped, `tenacity` leaves `uv.lock` (`requests` stays via `twine`).
+- 2026-09-22 Delete: fixture `s3_server_multi_reconcile_cost` lost its only test in `3ecef9a`; removed (−16 test lines).
 
 ## Rejected
 
+- 2026-09-22 Strip the `integration`/`chaos` marker labels (nothing selects on them) and the `compat(client, feature)` arguments: 77 lines of churn for no gain; they still document coverage.
 - 2026-09-22 Drop the 2.5 s sleep + `total == 0` in `test_head_and_partial_range_are_not_counted`: without it a wrongly counted HEAD flushed before the GET makes the later poll return 1 early and pass — the sleep is the guard.
 - 2026-09-22 Delete `provenance::parse_publisher` (4 lines, used only by its own unit tests): same test-helper shuffle as the rejected shims.
 - 2026-09-22 Accept a lowercase `basic` auth scheme (RFC 7235 says case-insensitive): no real client (pip, uv, twine, requests) sends it.
@@ -137,7 +139,3 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   "mutations by default; every request with `--access-log`". Recommendation: A —
   the sentence exists for fail2ban rules, and the rules are only useful if the
   guess-heavy path is in the log. Cost of choosing wrong: low either way.
-
-## Leads (not yet adjudicated)
-
-- Delete: fixture `s3_server_multi_reconcile_cost` (`tests/conftest.py`) has no user since its only test went in `3ecef9a`; ~−16 test lines.

@@ -1360,22 +1360,6 @@ def s3_server_multi_cadence(
 
 
 @pytest.fixture()
-def s3_server_multi_reconcile_cost(
-    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
-) -> Iterator[Dict]:
-    """Short full-diff cadence behind the request-counting S3 proxy."""
-    yield from _start_s3_server(
-        tmp_path_factory,
-        pypiron_bin,
-        minio_two_proxy,
-        extra_env={
-            "PYPIRON_AUDIT_ON_BOOT": "false",
-            "PYPIRON_RECONCILE_INTERVAL_SECS": "2",
-        },
-    )
-
-
-@pytest.fixture()
 def s3_server_three_failover(
     tmp_path_factory, pypiron_bin: Path, minio_three_proxy: Dict
 ) -> Iterator[Dict]:

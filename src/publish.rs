@@ -1135,6 +1135,10 @@ async fn wait_for_index_visibility(
             }
             if let Ok(idx) = serde_json::from_slice::<Index>(&bytes) {
                 if idx.files.iter().any(|f| f.filename == filename) {
+                    // Every node serves installs from a TTL cache; outlast any
+                    // entry filled before the rebuild so the 200 means visible
+                    // fleet-wide, not just in storage.
+                    tokio::time::sleep(state.index_cache.ttl()).await;
                     return;
                 }
             }

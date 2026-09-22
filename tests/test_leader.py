@@ -11,7 +11,13 @@ from contextlib import ExitStack, contextmanager
 import pytest
 
 from .conftest import _start_s3_server
-from .helpers import download_pypi_wheel, upload_legacy, wait_for_file_in_index
+from .helpers import (
+    download_pypi_wheel,
+    get_index_json,
+    make_wheel,
+    upload_legacy,
+    wait_for_file_in_index,
+)
 
 PACKAGE = "six"
 OLD_VERSION = "1.16.0"
@@ -59,3 +65,31 @@ def test_leader_failover(minio, pypiron_bin, tmp_path_factory, tmp_path):
         )
         wait_for_file_in_index(server_b["simple"], PACKAGE, new_wheel.name, timeout=30.0)
         assert "lease stolen" in server_b["log_path"].read_text()
+
+
+def test_wait_on_upload_is_visible_on_a_warm_follower(
+    minio, pypiron_bin, tmp_path_factory, tmp_path
+):
+    """`--wait-on-upload` promises index visibility at the 200. On a follower
+    whose index cache is warm (any busy node), that means outlasting the cache
+    entry filled before the leader rebuilt the index, not just seeing the
+    rebuilt index in storage."""
+    start = contextmanager(_start_s3_server)
+    env = {
+        "PYPIRON_WAIT_ON_UPLOAD": "true",
+        "PYPIRON_AUDIT_ON_BOOT": "false",
+        "PYPIRON_INDEX_CACHE_TTL_SECS": "5",
+    }
+    with ExitStack() as stack:
+        stack.enter_context(start(tmp_path_factory, pypiron_bin, minio, extra_env=env))
+        follower = stack.enter_context(start(tmp_path_factory, pypiron_bin, minio, extra_env=env))
+        creds = {"username": follower["user"], "password": follower["password"]}
+        first = make_wheel("waitpkg", "1.0", tmp_path)
+        upload_legacy(follower["legacy"], first, **creds)
+        wait_for_file_in_index(follower["simple"], "waitpkg", first.name)
+        for minor in range(1, 5):
+            get_index_json(follower["simple"], "waitpkg")  # warm the cache
+            wheel = make_wheel("waitpkg", f"1.{minor}", tmp_path)
+            upload_legacy(follower["legacy"], wheel, **creds)
+            files = [f["filename"] for f in get_index_json(follower["simple"], "waitpkg")["files"]]
+            assert wheel.name in files, f"{wheel.name} missing right after its 200"

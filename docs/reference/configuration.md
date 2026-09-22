@@ -54,7 +54,7 @@ the same name, minus the `--`. The exceptions stay in CLI/env: the serve
 credentials (`--admin-user`, `--admin-pass`, `--uploader-user`,
 `--uploader-pass`, `--read-user`, `--read-pass`, `--token-signing-key`,
 `--azure-access-key`), `--config` itself, and the one-shot sync switches
-`--dry-run`, `--full`, and `--no-progress`.
+`--dry-run`, `--full`, `--no-progress`, and `--repair-upload-times`.
 `sync.admin-pass` exists for closed deployment files, but env is cleaner:
 `PYPIRON_SYNC_ADMIN_PASS`.
 

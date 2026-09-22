@@ -851,10 +851,12 @@ async fn poll_and_persist(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut RefreshMe
         RawFetch::NotModified => return Ok(()),
         RawFetch::Bytes { bytes, http_etag } => (bytes, http_etag),
     };
-    memo.http_etag = http_etag;
+    // Remember the source's ETag only once these bytes are persisted (or already
+    // loaded): a write that fails must be retried, not turned into a 304 forever.
     let loaded_sha = AdvisoryState::read(ctx.slot).zip_sha256.clone();
     let sha = sha256_hex(&bytes);
     if Some(&sha) == loaded_sha.as_ref() {
+        memo.http_etag = http_etag;
         return Ok(());
     }
     // Validate before persisting — the storage copy is what every node loads. The
@@ -873,6 +875,7 @@ async fn poll_and_persist(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut RefreshMe
     )
     .await
     .context("persisting advisory snapshot")?;
+    memo.http_etag = http_etag;
     Ok(())
 }
 

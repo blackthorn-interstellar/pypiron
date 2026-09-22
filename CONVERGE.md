@@ -44,6 +44,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Delete: `make compat` ran serially (`-n 0`) to feed a ~130-line conftest writer for `docs/reference/compatibility.md`, a page removed from the manual in `25d8a82`; CI discarded the output and local runs left an untracked file. Writer, result collection and marker-label validation gone; `make compat` 66 s -> 10 s, same 21 passed / 1 skipped.
 - 2026-09-22 Delete: `tenacity` and `requests` sat in the `dev` dependency group since `114000b` and were never imported (`git log -S` empty); dropped, `tenacity` leaves `uv.lock` (`requests` stays via `twine`).
 - 2026-09-22 Delete: fixture `s3_server_multi_reconcile_cost` lost its only test in `3ecef9a`; removed (−16 test lines).
+- 2026-09-22 Bug: the advisory leader remembered the feed's HTTP ETag before validating and persisting the new snapshot, so one failed storage write turned every later poll into a `304` and the delivered advisory never reached the byte gate until the feed changed. The ETag is now kept only once the bytes are persisted or already loaded. Blackbox test (read-only `_advisories/` for one poll) red first.
 
 ## Rejected
 
@@ -59,7 +60,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-2 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 
@@ -156,3 +157,10 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   "mutations by default; every request with `--access-log`". Recommendation: A —
   the sentence exists for fail2ban rules, and the rules are only useful if the
   guess-heavy path is in the log. Cost of choosing wrong: low either way.
+
+## Leads (not yet adjudicated)
+
+From a 2026-09-22 Codex bug hunt (not yet verified):
+
+- Bug?: `src/advisories.rs` ~1026 — a snapshot reload resets the malware-probe overlay (`overlay: Arc::default()`), so a release the probe blocked becomes downloadable again when a newer baseline that predates that advisory loads, until the next successful probe. Would break `docs/security.md` "a cached file that becomes known malware stops downloading".
+- Bug?: `src/counters.rs` ~852 — compaction publishes a day summary after freezing only some shards; a later pass rewrites it on the local bucket, but replication copies summaries only if absent (~1230), so a peer keeps the undercounted day forever.

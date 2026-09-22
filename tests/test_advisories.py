@@ -607,6 +607,43 @@ def test_ac6_dead_feed_keeps_serving_and_ages_gauge(
             assert age2 > age1, f"staleness gauge did not rise after feed death: {age1} -> {age2}"
 
 
+def test_failed_snapshot_write_is_retried_under_an_unchanged_etag(
+    tmp_path_factory, pypiron_bin, tmp_path
+):
+    """A new snapshot whose storage write fails must be retried on the next poll.
+    Remembering the source's ETag before the write lands turns every later poll
+    into a 304, so a delivered advisory never reaches the byte gate until the
+    feed changes again."""
+    records = canonical_records()
+    first = make_osv_zip(tmp_path / "a.zip", {MAL_EXACT_ID: records[MAL_EXACT_ID]}).read_bytes()
+    second = make_osv_zip(tmp_path / "b.zip", records).read_bytes()
+    httpd = http.server.HTTPServer(("127.0.0.1", find_free_port()), _FeedHandler)
+    httpd.payload, httpd.etag = first, '"one"'  # type: ignore[attr-defined]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    direct = {"HTTP_PROXY": "", "HTTPS_PROXY": "", "ALL_PROXY": "", "NO_PROXY": "*"}
+    feed_url = f"http://127.0.0.1:{httpd.server_port}/osv.zip"
+    try:
+        with advisory_server(
+            tmp_path_factory,
+            pypiron_bin,
+            feed_url,
+            extra_args=["--reconcile-interval-secs", "1"],
+            extra_env=direct,
+        ) as server:
+            stored = _stored_feed_path(server)
+            _wait_file_bytes(stored, first)
+            stored.parent.chmod(0o555)  # the next snapshot write fails
+            try:
+                httpd.payload, httpd.etag = second, '"two"'  # type: ignore[attr-defined]
+                _wait_log_contains(server["log_path"], "persisting advisory snapshot")
+            finally:
+                stored.parent.chmod(0o755)
+            _wait_file_bytes(stored, second)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 # --------------------------- listings + quarantine (rung 5) ------------------
 
 

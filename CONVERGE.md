@@ -53,7 +53,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-0 consecutive.
+1 consecutive.
 
 ## Open questions
 

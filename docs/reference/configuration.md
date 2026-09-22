@@ -505,5 +505,7 @@ pending repairs, not bytes.
 | `DELETE /files/<pkg>/<file>` | admin | Delete a file. Refused for mirrored files — anything that came from an upstream, cached on demand or pulled by `sync` — when you run more than one bucket. |
 | `/project/<pkg>/status` | admin | Set project status. |
 
-File deletion returns `204` after the artifact is removed. A failed storage
-delete returns `500`; correct the storage problem and retry.
+File deletion returns `204` after the artifact is removed. A storage or
+replication failure returns `503` or `500`, sometimes after the file is already
+gone; correct the problem and retry. A `404` on the retry means the delete had
+already finished.

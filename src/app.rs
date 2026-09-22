@@ -970,7 +970,7 @@ pub async fn cli_main() -> Result<()> {
                 .expect("serve subcommand matched");
             run_serve(*args, config_path, serve_matches, log_format).await
         }
-        Some(Commands::Healthcheck(args)) => run_healthcheck(args).await,
+        Some(Commands::Healthcheck(args)) => run_healthcheck(args, config_path.as_deref()).await,
         Some(Commands::CreateToken(args)) => run_create_token(args).await,
         Some(Commands::Config(args)) => match args.command {
             // Pure stdout, no logging or config load — `config init > pypiron.toml`

@@ -207,8 +207,8 @@ pub struct CreateTokenArgs {
 #[derive(ClapArgs, Debug)]
 pub struct HealthcheckArgs {
     /// URL to probe. Defaults to `http://127.0.0.1:<port>/health`, where the port
-    /// is taken from `PYPIRON_BIND_ADDR` (so a port override is honored without
-    /// repeating it here), falling back to 8080.
+    /// is the one `serve` binds: `PYPIRON_BIND_ADDR`, else the config file's
+    /// `[serve] bind-addr`, else 8080.
     #[arg(long, env = "PYPIRON_HEALTHCHECK_URL")]
     url: Option<String>,
 }
@@ -220,7 +220,7 @@ pub struct RebuildIndexArgs {
 }
 
 /// Loopback `/health` URL for the port `serve` would bind. `bind` is the raw
-/// `PYPIRON_BIND_ADDR` value (e.g. `0.0.0.0:8080`); an unset or unparseable
+/// `bind-addr` value (e.g. `0.0.0.0:8080`); an unset or unparseable
 /// value falls back to the default 8080. Always loopback — the probe runs inside
 /// the container, regardless of which interface the server binds to.
 fn loopback_health_url(bind: Option<&str>) -> String {
@@ -234,10 +234,15 @@ fn loopback_health_url(bind: Option<&str>) -> String {
 /// map the result onto the process exit code (2xx → 0, anything else → nonzero;
 /// the returned `Err` becomes exit 1). Self-contained over the binary's existing
 /// HTTP client, so the slim runtime image needs no `curl`/`wget`.
-pub async fn run_healthcheck(args: HealthcheckArgs) -> Result<()> {
-    let url = args
-        .url
-        .unwrap_or_else(|| loopback_health_url(std::env::var("PYPIRON_BIND_ADDR").ok().as_deref()));
+pub async fn run_healthcheck(
+    args: HealthcheckArgs,
+    config_path: Option<&std::path::Path>,
+) -> Result<()> {
+    let url = match (args.url, std::env::var("PYPIRON_BIND_ADDR").ok()) {
+        (Some(url), _) => url,
+        (None, Some(bind)) => loopback_health_url(Some(&bind)),
+        (None, None) => loopback_health_url(config::load(config_path)?.serve.bind_addr.as_deref()),
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()

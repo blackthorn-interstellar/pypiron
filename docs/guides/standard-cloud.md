@@ -51,10 +51,10 @@ services:
   pypiron:
     image: ghcr.io/blackthorn-interstellar/pypiron:latest
     restart: unless-stopped
-    command: serve --config /etc/pypiron/pypiron.toml
     ports:
       - "8080:8080"
     environment:
+      PYPIRON_CONFIG: /etc/pypiron/pypiron.toml
       PYPIRON_ADMIN_PASS: ${PYPIRON_ADMIN_PASS}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}

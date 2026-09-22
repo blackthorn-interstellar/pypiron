@@ -200,6 +200,21 @@ def test_healthcheck_follows_bind_addr_env(pypiron_bin: Path, disk_server):
     assert cp.returncode == 0, cp.stdout + cp.stderr
 
 
+def test_healthcheck_follows_bind_addr_in_config(pypiron_bin: Path, disk_server, tmp_path):
+    """A port set only in pypiron.toml `[serve] bind-addr` is probed too, so a
+    container configured by file isn't marked unhealthy forever."""
+    cfg = tmp_path / "pypiron.toml"
+    cfg.write_text(f'[serve]\nbind-addr = "{disk_server["bind"]}"\n')
+    env = os.environ.copy()
+    env["PYPIRON_CONFIG"] = str(cfg)
+    env.pop("PYPIRON_BIND_ADDR", None)
+    env.pop("PYPIRON_HEALTHCHECK_URL", None)
+    cp = subprocess.run(
+        [str(pypiron_bin), "healthcheck"], capture_output=True, text=True, timeout=15, env=env
+    )
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+
+
 def test_healthcheck_unreachable_exits_nonzero(pypiron_bin: Path):
     """Nothing listening → connection refused → nonzero exit (orchestrator pulls
     the node), reported on stderr rather than crashing."""

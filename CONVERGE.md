@@ -36,9 +36,12 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Wrong docs: `docs/reference/configuration.md` listed the CLI-only sync switches without `--repair-upload-times`, which `src/config.rs` refuses in the file.
 - 2026-09-22 Bug: with multiple buckets, a refused yank/unyank/upload-time repair (`404` missing file, `409` repair refusals, CAS exhaustion) left the intent marker `edit_sidecar` opens up front, stalling the package's index for the 900 s intent grace; refusals now close it. The multi-bucket fixture's 3 s reconcile masked it; new test uses the production interval and was red first.
 - 2026-09-22 Wrong docs: `docs/security.md` promised the seven-day cooldown for every proxy and `sync` fetch, but `src/sync.rs` keeps any file whose upstream gives no upload time; the page now says so.
+- 2026-09-22 Wrong docs (code comments): `PRE_DRAIN_PAUSE` and `AppState::shutting_down` said the drain fails `/health`; it fails `/ready` (`/health` stays 200 by design). Dropped the "malware enforcement lands in a later rung" note; `serve.rs` enforces it.
 
 ## Rejected
 
+- 2026-09-22 Delete `provenance::parse_publisher` (4 lines, used only by its own unit tests): same test-helper shuffle as the rejected shims.
+- 2026-09-22 Accept a lowercase `basic` auth scheme (RFC 7235 says case-insensitive): no real client (pip, uv, twine, requests) sends it.
 - 2026-09-22 Close the intent on `delete_record`'s "no live origin claim" `500`: only reachable with an artifact that has no `.origin` claim, already a broken store; not a client path.
 - 2026-09-22 Drop `cargo check` from `make check` (~3.5 s of ~48 s): `clippy --all-targets` unifies dev-dependency features (tokio `test-util`) into the lib build, so only plain `cargo check` catches production code leaning on a test-only feature.
 - 2026-09-22 Delete the seven `#[cfg(test)]` compatibility shims in `origin.rs`/`buckets.rs`: they compile only under test, so the "−85 non-test lines" is a counting artifact; moving test helpers is reorganizing, not simplifying.
@@ -49,6 +52,26 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 0 consecutive.
 
 ## Open questions
+
+- **Should a PEP 792 project status be refused on a private package?**
+  `POST /project/<pkg>/status` (`write_project_status`, `src/publish.rs`) never
+  checks the package's origin, and `pypiron sync` relays upstream statuses
+  through it (skipped only with `--as-private`). So a public upstream quarantine
+  of a same-named package, synced in, empties the index of *your private*
+  package, while `advisory_byte_gate` (`src/serve.rs`) exempts private packages
+  and direct file URLs still download. Reproduced: JSON index `files: []`,
+  `GET /files/qdemo/...whl` 200. An admin quarantining their own private package
+  gets the same half-freeze, contradicting `docs/security.md` ("direct artifact
+  requests are refused") and "a private package with the same name is still
+  your package". Options: (A) refuse status on a private-origin package with
+  `409` (fail closed `503` if the origin read errors); sync then reports an
+  error for that package, and admins can no longer hide a private project's
+  files via status — ~10 lines plus a blackbox test and a docs note; (B) let
+  quarantine also block direct downloads of private packages — but then a synced
+  public quarantine fully takes down your private package, which is worse.
+  Recommendation: A — PEP 792 status is something pypiron relays for mirrored
+  projects, and a public event must never reach a private name. Cost of choosing
+  wrong: medium; public endpoint behavior, but a few lines either way.
 
 - **Should `serve` without a proxy apply `[mirror] exclude-packages`?** Today
   `serve` ignores `exclude-packages` unless `--proxy-upstream` is set, but the

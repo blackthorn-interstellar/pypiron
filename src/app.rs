@@ -141,7 +141,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const STREAMING_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// On a graceful shutdown of a cloud-backed (multi-node) deployment, fail
-/// `/health` for this long *before* the listener stops accepting, so a load
+/// `/ready` for this long *before* the listener stops accepting, so a load
 /// balancer pulls the node from rotation instead of routing new requests into
 /// connection-refused. Skipped on disk (single-node) — see the shutdown path.
 const PRE_DRAIN_PAUSE: Duration = Duration::from_secs(3);
@@ -391,13 +391,13 @@ pub struct AppState {
     pub denylist: Option<Arc<denylist::Denylist>>,
     /// Process start, for the homepage uptime readout.
     pub started: std::time::Instant,
-    /// Set on graceful shutdown so `/health` reports 503 *before* the listener
+    /// Set on graceful shutdown so `/ready` reports 503 *before* the listener
     /// stops accepting, letting a load balancer drain the node cleanly.
     pub shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// Resolved advisory feed (a URL or a local path), post-empty-filter. `None`
     /// means the feature is disabled (`--advisory-feed ""`).
     pub advisory_feed: Option<String>,
-    /// Whether malware blocking is armed (enforcement lands in a later rung).
+    /// Whether malware blocking is armed.
     pub malware_block: bool,
     /// Per-node malware-probe interval. `Duration::ZERO` disables it; the worker
     /// also holds it inert unless blocking is armed and the feed is the OSV

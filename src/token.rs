@@ -8,7 +8,7 @@
 //!
 //! Wire shape: `pypiron-<payload>.<mac>`, where `<payload>` is base64url(JSON
 //! claims) and `<mac>` is base64url(HMAC-SHA256(signing-key, payload)). It is a
-//! JWT in spirit (HS256 + `exp`) but implemented as ~a dozen lines over `sha2`
+//! JWT in spirit (HS256 + `exp`) but implemented over [`crate::hash::hmac_sha256`]
 //! rather than pulling in a JWT crate — unforgeability comes from the
 //! operator's signing key, so no per-token randomness (and no CSPRNG dep) is
 //! needed.
@@ -16,6 +16,7 @@
 //! The signature authenticates the *grant* (this is a real, unexpired token the
 //! server minted), not the truthfulness of the self-reported attribution.
 
+use crate::hash::hmac_sha256;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as b64url, Engine};
 use serde::{Deserialize, Serialize};
 
@@ -77,36 +78,6 @@ pub struct Claims {
     pub iat: i64,
     /// Expiry, unix seconds. Verification rejects `now >= exp`.
     pub exp: i64,
-}
-
-/// HMAC-SHA256 (RFC 2104). Block size 64 bytes; keys longer than the block are
-/// hashed down first. ~a dozen lines so we don't add an `hmac` dependency.
-fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut block = [0u8; 64];
-    if key.len() > 64 {
-        block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0u8; 64];
-    let mut opad = [0u8; 64];
-    for i in 0..64 {
-        ipad[i] = block[i] ^ 0x36;
-        opad[i] = block[i] ^ 0x5c;
-    }
-    let inner = Sha256::new()
-        .chain_update(ipad)
-        .chain_update(msg)
-        .finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(
-        &Sha256::new()
-            .chain_update(opad)
-            .chain_update(inner)
-            .finalize(),
-    );
-    out
 }
 
 /// Encode + sign a token. Fails only if the claims can't be serialized (they

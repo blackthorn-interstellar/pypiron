@@ -41,6 +41,7 @@
 
 use std::sync::OnceLock;
 
+use crate::hash::hex;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::Value;
@@ -227,7 +228,7 @@ fn entry_binds_attestation(
         return false;
     };
     // payloadHash (sha256 hex) must equal sha256(our DSSE payload).
-    let want_payload_hash = hex_lower(&Sha256::digest(payload));
+    let want_payload_hash = hex(&Sha256::digest(payload));
     let payload_hash_ok = spec
         .pointer("/payloadHash/value")
         .and_then(Value::as_str)
@@ -652,7 +653,7 @@ fn verify_set(entry: &Value, root: &TrustedRoot, integrated_time: i64) -> bool {
     let canon = match serde_json::to_vec(&SetPayload {
         body,
         integrated_time,
-        log_id: hex_lower(&key_id),
+        log_id: hex(&key_id),
         log_index,
     }) {
         Ok(c) => c,
@@ -752,14 +753,6 @@ fn b64(s: &str) -> Option<Vec<u8>> {
 fn as_i64(v: &Value) -> Option<i64> {
     v.as_i64()
         .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 /// True if `t` (unix seconds) is within `[start, end]`; an *absent* bound is
@@ -926,7 +919,7 @@ mod tests {
         // cert must NOT bind — the old code checked neither.
         let (leaf_der, _leaf) = sampleproject_leaf();
         let (payload, dsse_sig) = sampleproject_payload_and_sig();
-        let payload_hash = hex_lower(&Sha256::digest(&payload));
+        let payload_hash = hex(&Sha256::digest(&payload));
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&dsse_sig);
         let make_entry = |verifier_der: &[u8]| -> Value {
             let body = serde_json::json!({
@@ -1232,7 +1225,7 @@ mod tests {
         let canon = serde_json::to_vec(&SetPayload {
             body: "Zm9vYmFy",
             integrated_time,
-            log_id: hex_lower(&key_id),
+            log_id: hex(&key_id),
             log_index: 42,
         })
         .unwrap();

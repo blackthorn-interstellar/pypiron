@@ -6,13 +6,12 @@
 //! on `Authorization`), so it has no entry point here.
 //!
 //! Zero new dependencies: SigV4 and Shared Key are both HMAC-SHA256 string
-//! building (same reason [`crate::token`] hand-rolls its own MAC). Both
+//! building (the shared [`crate::hash::hmac_sha256`]). Both
 //! functions are pure — the wire calls live in [`crate::storage`] and the KATs
 //! below pin them against the vendors' published examples.
 
-use crate::hash::hmac_sha256;
+use crate::hash::{hex, hmac_sha256, sha256_hex};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 /// sha256 of the empty body, hex — the payload hash for every copy verb (none
@@ -58,10 +57,6 @@ fn amz_datestamps(now: OffsetDateTime) -> (String, String) {
     );
     let date = amz[..8].to_string();
     (amz, date)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// One S3 request to sign. `host` is the request URL's authority; `extra_headers`
@@ -145,14 +140,6 @@ pub fn sign_s3_request(
         .collect();
     wire.push(("authorization".to_string(), authorization));
     wire
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 /// Azure Blob "Copy Blob" (a `PUT` with `x-ms-copy-source` and an empty body).

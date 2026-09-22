@@ -32,6 +32,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Wrong docs: `docs/reference/configuration.md` said a failed storage delete returns `500`; the probe, intent marker, origin reads and the replication-gap record return `503`, the last after the file is already gone. Doc now names both codes and what a `404` retry means. Lines unchanged.
 - 2026-09-22 Bug: `pypiron healthcheck` (the Docker HEALTHCHECK) took its port only from `PYPIRON_BIND_ADDR`, so a container whose port was set in `pypiron.toml` was marked unhealthy forever; now falls back to the config's `[serve] bind-addr`, and the Compose recipe passes the file via `PYPIRON_CONFIG` so the probe can see it. Blackbox test red first.
 - 2026-09-22 Wrong docs: `docs/guides/multi-region.md` told operators with unprefixed private names to exclude them from the proxy, which neither reserves the name nor blocks a mirror claim, and delists the real private files; it now points at `private-patterns`, which shares the prefix's reservation matcher.
+- 2026-09-22 Bug: a refused upload (duplicate-file `409`, lost first claim `403`/`409`) left its intent marker open, so the worker deferred the package's index rebuilds for the full 900 s intent grace — a CI retry's `409` hid the next release. Refusals now close the marker; the not-reserved `403` moved ahead of the marker and an unreachable owner-mismatch arm went. Blackbox test red first.
 
 ## Rejected
 
@@ -57,3 +58,10 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   "mutations by default; every request with `--access-log`". Recommendation: A —
   the sentence exists for fail2ban rules, and the rules are only useful if the
   guess-heavy path is in the log. Cost of choosing wrong: low either way.
+
+## Leads (not yet adjudicated)
+
+From a 2026-09-22 candidate sweep:
+
+- Perf: `make check` runs `cargo check` then `cargo clippy --all-targets`, which covers the same targets; measured ~3.3 s of the ~11.5 s after an edit is redundant. Drop `cargo-check` from the `check:` prerequisites (`Makefile:59`) and the step from `AGENTS.md`.
+- Wrong docs: `docs/reference/configuration.md:56-57` lists the CLI-only sync switches as `--dry-run`, `--full`, `--no-progress`, omitting `--repair-upload-times` (`src/config.rs:590` refuses it in the file).

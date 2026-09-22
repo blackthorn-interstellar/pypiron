@@ -60,3 +60,19 @@ def test_global_index_rebuilt_only_on_name_set_change(disk_server, tmp_path):
     assert global_html.stat().st_mtime_ns == baseline_mtime, (
         "global index must not be rewritten when the package-name set is unchanged"
     )
+
+
+def test_refused_reupload_does_not_stall_the_next_release(disk_server, tmp_path):
+    """A 409 duplicate (a CI retry of `twine upload`) must close its intent
+    marker; a dangling one defers the package's index rebuilds for the whole
+    intent grace (15 min), hiding the next release."""
+    creds = {"username": disk_server["user"], "password": disk_server["password"]}
+    old_wheel = download_pypi_wheel(PACKAGE, OLD_VERSION, tmp_path)
+    upload_legacy(disk_server["legacy"], old_wheel, **creds)
+    wait_for_file_in_index(disk_server["simple"], PACKAGE, old_wheel.name)
+    upload_legacy(disk_server["legacy"], old_wheel, expect_status=409, **creds)
+
+    new_wheel = download_pypi_wheel(PACKAGE, NEW_VERSION, tmp_path)
+    upload_legacy(disk_server["legacy"], new_wheel, **creds)
+    wait_for_file_in_index(disk_server["simple"], PACKAGE, new_wheel.name, timeout=10.0)
+    _wait_dirty_empty(disk_server["data_dir"])

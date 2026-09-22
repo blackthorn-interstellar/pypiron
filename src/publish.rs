@@ -541,6 +541,24 @@ pub async fn publish_record(
         }
     }
 
+    // A new private name must be a reserved one; existing private packages
+    // outside newly-adopted rules are grandfathered (only first claims are
+    // gated, so reserving names never bricks them). Refused before the intent
+    // marker, so a refusal leaves nothing to close.
+    let first_claim = matches!(
+        observed_origin.as_ref().map(|observed| observed.state),
+        None | Some(origin::OriginState::Unclaimed)
+    );
+    if first_claim && !is_mirror && !state.private.is_empty() && !state.private.matches(&pkg_norm) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "Package '{pkg_norm}' is not a reserved private name (reserved: {})",
+                state.private
+            ),
+        ));
+    }
+
     // The crash-recovery marker is correctness-critical in every mode: it is the
     // only durable signal that carries a global-index membership change (a new
     // name appearing) to the worker. Dropping it before touching truth — and
@@ -556,104 +574,91 @@ pub async fn publish_record(
                 )
             })?,
     );
-    match observed_origin.as_ref().map(|observed| observed.state) {
-        Some(origin::OriginState::Mirror) if desired_origin == origin::MIRROR => {}
-        Some(origin::OriginState::Private) if desired_origin == origin::PRIVATE => {}
-        Some(owner @ (origin::OriginState::Mirror | origin::OriginState::Private)) => {
+    // A claimed package's owner already matched `desired_origin` above.
+    if first_claim {
+        // First write claims the package — atomically, so racing private
+        // and mirror first-writes can't merge origins.
+        let claim = origin::claim_origin(
+            storage,
+            &pkg_norm,
+            origin::ClaimRequest::new(
+                desired_origin,
+                observed_origin
+                    .as_ref()
+                    .filter(|observed| observed.state == origin::OriginState::Unclaimed),
+            ),
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to claim origin: {e}"),
+            )
+        })?;
+        if claim.owner != desired_origin {
+            if let Err(e) = markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await {
+                warn!(error=?e, "legacy: failed to close refused-claim intent marker");
+            }
             return Err((
                 StatusCode::FORBIDDEN,
                 format!(
                     "Package '{pkg_norm}' is {}-owned; {desired_origin} uploads are rejected",
-                    owner.as_str()
+                    claim.owner
                 ),
             ));
         }
-        None | Some(origin::OriginState::Unclaimed) => {
-            // A new private name must be a reserved one; existing private
-            // packages outside newly-adopted rules are grandfathered (only
-            // first claims are gated, so reserving names never bricks them).
-            if !is_mirror && !state.private.is_empty() && !state.private.matches(&pkg_norm) {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    format!(
-                        "Package '{pkg_norm}' is not a reserved private name (reserved: {})",
-                        state.private
-                    ),
-                ));
-            }
-            // First write claims the package — atomically, so racing private
-            // and mirror first-writes can't merge origins.
-            let claim = origin::claim_origin(
-                storage,
-                &pkg_norm,
-                origin::ClaimRequest::new(
-                    desired_origin,
-                    observed_origin
-                        .as_ref()
-                        .filter(|observed| observed.state == origin::OriginState::Unclaimed),
-                ),
-            )
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to claim origin: {e}"),
-                )
-            })?;
-            if claim.owner != desired_origin {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    format!(
-                        "Package '{pkg_norm}' is {}-owned; {desired_origin} uploads are rejected",
-                        claim.owner
-                    ),
-                ));
-            }
-            // A claim can survive even when the uploader dies before writing an
-            // artifact. Fan the package-level claim out to every healthy bucket
-            // before the artifact even lands locally, so the name is reserved
-            // fleet-wide ahead of its bytes (the dependency-confusion boundary);
-            // the later artifact fan-out re-claims idempotently. A `sync --to`
-            // snapshot claim replicates too — it shrinks the same window.
-            if claim.etag.is_some() && state.buckets.is_multi() {
-                // Logged, not fatal — today's behavior, held unchanged: the
-                // artifact write below has not happened yet, so there is no
-                // acked record for an unrecorded gap to falsify. The claim
-                // fan-out is a window-narrowing optimization and the artifact's
-                // own fan-out re-claims idempotently.
-                if let Err(error) =
-                    replicate::fanout_sync(state, pinned, &pkg_norm, replicate::ORIGIN_MARKER, None)
-                        .await
-                {
-                    warn!(package=%pkg_norm, error=?error, "could not record the origin-claim replication gap");
-                }
-            }
-            write_fence = Some(match claim.etag {
-                Some(etag) => origin::OriginObservation {
-                    state: if is_mirror {
-                        origin::OriginState::Mirror
-                    } else {
-                        origin::OriginState::Private
-                    },
-                    etag,
-                },
-                None => origin::read_origin_observation(storage, &pkg_norm)
+        // A claim can survive even when the uploader dies before writing an
+        // artifact. Fan the package-level claim out to every healthy bucket
+        // before the artifact even lands locally, so the name is reserved
+        // fleet-wide ahead of its bytes (the dependency-confusion boundary);
+        // the later artifact fan-out re-claims idempotently. A `sync --to`
+        // snapshot claim replicates too — it shrinks the same window.
+        if claim.etag.is_some() && state.buckets.is_multi() {
+            // Logged, not fatal — today's behavior, held unchanged: the
+            // artifact write below has not happened yet, so there is no
+            // acked record for an unrecorded gap to falsify. The claim
+            // fan-out is a window-narrowing optimization and the artifact's
+            // own fan-out re-claims idempotently.
+            if let Err(error) =
+                replicate::fanout_sync(state, pinned, &pkg_norm, replicate::ORIGIN_MARKER, None)
                     .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("storage error re-reading origin claim: {e}"),
-                        )
-                    })?
-                    .filter(|observed| observed.state.as_str() == desired_origin)
-                    .ok_or_else(|| {
-                        (
-                            StatusCode::CONFLICT,
-                            format!("Package '{pkg_norm}' changed origin while claiming"),
-                        )
-                    })?,
-            });
+            {
+                warn!(package=%pkg_norm, error=?error, "could not record the origin-claim replication gap");
+            }
         }
+        write_fence = Some(match claim.etag {
+            Some(etag) => origin::OriginObservation {
+                state: if is_mirror {
+                    origin::OriginState::Mirror
+                } else {
+                    origin::OriginState::Private
+                },
+                etag,
+            },
+            None => match origin::read_origin_observation(storage, &pkg_norm)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("storage error re-reading origin claim: {e}"),
+                    )
+                })?
+                .filter(|observed| observed.state.as_str() == desired_origin)
+            {
+                Some(observed) => observed,
+                None => {
+                    if let Err(e) =
+                        markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await
+                    {
+                        warn!(error=?e, "legacy: failed to close refused-claim intent marker");
+                    }
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!("Package '{pkg_norm}' changed origin while claiming"),
+                    ));
+                }
+            },
+        });
     }
 
     // Every multi-bucket writer consumes the exact origin observation it began
@@ -712,6 +717,9 @@ pub async fn publish_record(
     match store_result {
         Ok(true) => {}
         Ok(false) => {
+            if let Err(e) = markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await {
+                warn!(error=?e, "legacy: failed to close duplicate-upload intent marker");
+            }
             return Err((
                 StatusCode::CONFLICT,
                 format!("File already exists: {filename}"),

@@ -15,9 +15,20 @@ for f in $(find src -name '*.rs'); do awk '{ if (pending && /^(pub )?mod /) exit
 
 (Every `src/**/*.rs` line before the file's `#[cfg(test)] mod …` block.)
 
+- Test lines: **48928** measured 2026-09-22 at `f86345a`.
+- Ceiling: **51374** (measured + 5%).
+- Measure with, from the repo root (all `src/**/*.rs` lines minus the non-test
+  count above, plus the Python blackbox suite):
+
+```
+echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests -name '*.py' | xargs cat | wc -l)" | bc
+```
+
 ## Done
 
 - 2026-09-19 Bug: an invalid inline `--private-pattern` / TOML `private-patterns` entry (`#bolt`, empty) was silently dropped by the pattern-file comment filter, so a name the operator believed reserved could fall through to the proxy; now refuses startup naming the entry. Unit test on `PrivateArgs::resolve` and a blackbox startup-refusal test were red first. Lines 45330 -> 45339.
+
+- 2026-09-22 Wrong docs: `docs/for-agents.md` claimed every `--flag` has a `PYPIRON_FLAG` env var; false for `create-token` and not mechanical (`--from` is `PYPIRON_SYNC_FROM`), so an agent's guessed name is silently ignored. Row now points at the configuration reference. Lines unchanged.
 
 ## Rejected
 
@@ -48,11 +59,6 @@ for f in $(find src -name '*.rs'); do awk '{ if (pending && /^(pub )?mod /) exit
 From a 2026-09-19 docs-versus-code sweep; each is a "wrong docs" candidate for a
 later iteration, not a done task:
 
-- `docs/for-agents.md` row "every `--flag` has a `PYPIRON_FLAG` environment
-  variable" is false: `create-token`'s `--role`/`--repo`/`--commit`/`--user`
-  have no env var by design (`dev/scripts/check_docs.py` allowlists them), and
-  the naming is not mechanical (`--from` is `PYPIRON_SYNC_FROM`, `--deep` is
-  `PYPIRON_VERIFY_DEEP`, `--force` is `PYPIRON_MIGRATE_FORCE`).
 - `docs/reference/configuration.md` "A failed storage delete returns `500`" is
   incomplete: the existence probe, intent-marker write, origin read/re-check and
   the replication-gap path in `src/publish.rs` return `503`; only the artifact

@@ -69,7 +69,7 @@ Expected health responses:
 | Readiness | `GET /ready`; point the load balancer here |
 | Metrics | `GET /metrics`; Prometheus format |
 | Vulnerability audit | `GET /audit`; admin-only |
-| Configuration | every `--flag` has a `PYPIRON_FLAG` environment variable |
+| Configuration | flags, `PYPIRON_*` environment variables, or `pypiron.toml`; exact names in the [configuration reference](reference/configuration.md) |
 | Storage | local disk by default; `--buckets` selects S3, GCS, or Azure |
 | Logs | `--log-format json` |
 | Integrity | `pypiron verify-index`; add `--deep` to hash every file |

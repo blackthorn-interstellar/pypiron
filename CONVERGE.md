@@ -47,6 +47,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Rejected
 
+- 2026-09-22 Trim `make check` time: the only sizable test cost is the two model checkers (`tests/model_event_protocol.rs` 8.7 s, `tests/model_replication.rs` 6.9 s of ~16 s `cargo test`); they guard the replication protocol on every change, so the time is the point.
 - 2026-09-22 Strip the `integration`/`chaos` marker labels (nothing selects on them) and the `compat(client, feature)` arguments: 77 lines of churn for no gain; they still document coverage.
 - 2026-09-22 Drop the 2.5 s sleep + `total == 0` in `test_head_and_partial_range_are_not_counted`: without it a wrongly counted HEAD flushed before the GET makes the later poll return 1 early and pass — the sleep is the guard.
 - 2026-09-22 Delete `provenance::parse_publisher` (4 lines, used only by its own unit tests): same test-helper shuffle as the rejected shims.
@@ -58,7 +59,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+2 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 

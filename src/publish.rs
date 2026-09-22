@@ -1546,120 +1546,140 @@ async fn edit_sidecar(
     };
     let mut wrote = false;
     let mut record_origin = None;
-    for _ in 0..8 {
-        let Some((bytes, etag)) = storage.get_with_etag(&sc_key).await.map_err(|e| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("sidecar read failed: {e}"),
-            )
-        })?
-        else {
-            return Err((StatusCode::NOT_FOUND, "No such file".to_string()));
-        };
-        let mut sc: Sidecar = serde_json::from_slice(&bytes).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("bad sidecar: {e}"),
-            )
-        })?;
-        let changed = match &edit {
-            SidecarEdit::Yank(desired) => {
-                let changed = sc.yanked.normalized() != *desired;
-                sc.yanked = desired.clone();
-                changed
-            }
-            SidecarEdit::UploadTime {
-                sha256,
-                upload_time,
-            } => {
-                // Check truth on every CAS attempt, not just the CLI's possibly
-                // stale index. Never repair mirror records or suppressed files.
-                let owner = origin::read_origin_claim(storage, pkg)
-                    .await
-                    .map_err(|e| internal("read origin", e))?;
-                if owner != Some(origin::OriginState::Private)
-                    || sc.origin.as_deref().is_some_and(|o| o != origin::PRIVATE)
-                {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        "timestamp repair requires a private artifact".into(),
-                    ));
+    // A refusal must still close the intent it opened: an unpaired one defers
+    // the package's index rebuilds for the whole intent grace.
+    let edited = async {
+        for _ in 0..8 {
+            let Some((bytes, etag)) = storage.get_with_etag(&sc_key).await.map_err(|e| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("sidecar read failed: {e}"),
+                )
+            })?
+            else {
+                return Err((StatusCode::NOT_FOUND, "No such file".to_string()));
+            };
+            let mut sc: Sidecar = serde_json::from_slice(&bytes).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("bad sidecar: {e}"),
+                )
+            })?;
+            let changed = match &edit {
+                SidecarEdit::Yank(desired) => {
+                    let changed = sc.yanked.normalized() != *desired;
+                    sc.yanked = desired.clone();
+                    changed
                 }
-                for fence in [
-                    tombstone_key(&key),
-                    frozen_key(&key),
-                    sidecar::mirror_quarantined_key(&key),
-                ] {
-                    if storage
-                        .head_exists(&fence)
+                SidecarEdit::UploadTime {
+                    sha256,
+                    upload_time,
+                } => {
+                    // Check truth on every CAS attempt, not just the CLI's possibly
+                    // stale index. Never repair mirror records or suppressed files.
+                    let owner = origin::read_origin_claim(storage, pkg)
                         .await
-                        .map_err(|e| internal("read fence", e))?
+                        .map_err(|e| internal("read origin", e))?;
+                    if owner != Some(origin::OriginState::Private)
+                        || sc.origin.as_deref().is_some_and(|o| o != origin::PRIVATE)
                     {
                         return Err((
                             StatusCode::CONFLICT,
-                            "cannot repair a deleted or quarantined artifact".into(),
+                            "timestamp repair requires a private artifact".into(),
                         ));
                     }
+                    for fence in [
+                        tombstone_key(&key),
+                        frozen_key(&key),
+                        sidecar::mirror_quarantined_key(&key),
+                    ] {
+                        if storage
+                            .head_exists(&fence)
+                            .await
+                            .map_err(|e| internal("read fence", e))?
+                        {
+                            return Err((
+                                StatusCode::CONFLICT,
+                                "cannot repair a deleted or quarantined artifact".into(),
+                            ));
+                        }
+                    }
+                    if !storage
+                        .head_exists(&key)
+                        .await
+                        .map_err(|e| internal("read artifact", e))?
+                    {
+                        return Err((StatusCode::NOT_FOUND, "No such file".into()));
+                    }
+                    if !sc.sha256.eq_ignore_ascii_case(sha256) {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            "SHA-256 mismatch; refusing timestamp repair".into(),
+                        ));
+                    }
+                    let changed = OffsetDateTime::parse(&sc.upload_time, &Rfc3339).ok()
+                        != OffsetDateTime::parse(upload_time, &Rfc3339).ok();
+                    sc.upload_time = upload_time.clone();
+                    changed
                 }
-                if !storage
-                    .head_exists(&key)
-                    .await
-                    .map_err(|e| internal("read artifact", e))?
-                {
-                    return Err((StatusCode::NOT_FOUND, "No such file".into()));
+            };
+            if !changed {
+                if matches!(edit, SidecarEdit::Yank(_)) {
+                    return Ok(false);
                 }
-                if !sc.sha256.eq_ignore_ascii_case(sha256) {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        "SHA-256 mismatch; refusing timestamp repair".into(),
-                    ));
-                }
-                let changed = OffsetDateTime::parse(&sc.upload_time, &Rfc3339).ok()
-                    != OffsetDateTime::parse(upload_time, &Rfc3339).ok();
-                sc.upload_time = upload_time.clone();
-                changed
-            }
-        };
-        if !changed {
-            if matches!(edit, SidecarEdit::Yank(_)) {
-                if let Some(nonce) = intent_nonce {
-                    let _ = markers::mark_commit(storage, pkg, &nonce).await;
-                }
-                return Ok(StatusCode::OK);
-            }
-            // Retrying an acknowledged local edit must still heal replication
-            // if its previous fan-out failed, without consuming another epoch.
-            record_origin = sc.origin.clone();
-            wrote = true;
-            break;
-        }
-        sc.yank_epoch = sc.yank_epoch.checked_add(1).ok_or_else(|| {
-            (
-                StatusCode::CONFLICT,
-                "sidecar revision exhausted".to_string(),
-            )
-        })?;
-        record_origin = sc.origin.clone();
-        if intent_nonce.is_none() {
-            intent_nonce = markers::mark_intent(storage, pkg).await.ok();
-        }
-        let out = serde_json::to_vec(&sc).map_err(|e| internal("encode", e))?;
-        match storage.put_if_match(&sc_key, &etag, out).await {
-            Ok(Some(_)) => {
+                // Retrying an acknowledged local edit must still heal replication
+                // if its previous fan-out failed, without consuming another epoch.
+                record_origin = sc.origin.clone();
                 wrote = true;
                 break;
             }
-            Ok(None) => continue,
-            Err(e) => {
-                return Err(internal("write", e));
+            sc.yank_epoch = sc.yank_epoch.checked_add(1).ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "sidecar revision exhausted".to_string(),
+                )
+            })?;
+            record_origin = sc.origin.clone();
+            if intent_nonce.is_none() {
+                intent_nonce = markers::mark_intent(storage, pkg).await.ok();
+            }
+            let out = serde_json::to_vec(&sc).map_err(|e| internal("encode", e))?;
+            match storage.put_if_match(&sc_key, &etag, out).await {
+                Ok(Some(_)) => {
+                    wrote = true;
+                    break;
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    return Err(internal("write", e));
+                }
             }
         }
+        if !wrote {
+            return Err((
+                StatusCode::CONFLICT,
+                "sidecar changed repeatedly; retry the metadata update".to_string(),
+            ));
+        }
+        Ok(true)
     }
-    if !wrote {
-        return Err((
-            StatusCode::CONFLICT,
-            "sidecar changed repeatedly; retry the metadata update".to_string(),
-        ));
+    .await;
+    match edited {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Some(nonce) = intent_nonce {
+                let _ = markers::mark_commit(storage, pkg, &nonce).await;
+            }
+            return Ok(StatusCode::OK);
+        }
+        Err(refused) => {
+            if intent_nonce.is_some() {
+                if let Err(e) = markers::commit_marker(state, storage, pkg, intent_nonce).await {
+                    warn!(error=?e, "metadata update: failed to close intent marker");
+                }
+            }
+            return Err(refused);
+        }
     }
 
     if let Err(e) = markers::commit_marker(state, storage, pkg, intent_nonce).await {

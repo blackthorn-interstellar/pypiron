@@ -3352,3 +3352,43 @@ def test_private_upload_date_repair_survives_partition_and_later_yank(s3_servers
             ),
             what="subsequent yank retains historical date",
         )
+
+
+def test_refused_yank_does_not_stall_the_next_index_change(
+    tmp_path_factory, pypiron_bin, minio_two, tmp_path
+):
+    """A yank of a missing file (404) must close the intent marker it opened;
+    a dangling one defers the package's rebuilds for the whole 900 s intent
+    grace. The production reconcile interval keeps the audit from masking it."""
+    wheel = make_wheel("stallpkg", "1.0", tmp_path)
+    server_gen = _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two,
+        extra_env={
+            "PYPIRON_RECONCILE_INTERVAL_SECS": "86400",
+            "PYPIRON_REPL_SWEEP_INTERVAL_SECS": "2",
+        },
+    )
+    try:
+        server = next(server_gen)
+        creds = {"username": server["user"], "password": server["password"]}
+        _upload(server, wheel)
+        wait_for_file_in_index(server["simple"], "stallpkg", wheel.name)
+
+        files = f"{server['base_url']}/files/stallpkg"
+        missing = "stallpkg-9.9-py3-none-any.whl"
+        status, _, _ = http_request_auth("POST", f"{files}/{missing}/yank", data=b"x", **creds)
+        assert status == 404
+        status, _, _ = http_request_auth("POST", f"{files}/{wheel.name}/yank", data=b"bad", **creds)
+        assert status == 200
+
+        def yanked():
+            _, body, _ = http_get(f"{server['simple']}stallpkg/", headers={"Accept": ACCEPT_PEP691})
+            return any(
+                f["filename"] == wheel.name and f["yanked"] for f in json.loads(body)["files"]
+            )
+
+        _eventually(yanked, timeout=15, what="yank visible in the index")
+    finally:
+        server_gen.close()

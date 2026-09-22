@@ -67,9 +67,7 @@ Markers (`pyproject.toml`): `integration`, `s3` (needs Docker/MinIO), `azure`
 ## Client compatibility matrix
 
 Tests that prove behavior through a real client binary carry
-`@pytest.mark.compat(client, feature)`. Run `make compat` to execute those tests
-and regenerate [COMPATIBILITY.md](../docs/reference/compatibility.md), including the client
-versions used for the matrix.
+`@pytest.mark.compat(client, feature)`. Run `make compat` to execute those tests.
 
 ## Key scenarios
 
@@ -2425,9 +2423,8 @@ Isolation is by construction, not by locking:
   per-worker range (the bare bind-then-close trick is a cross-process race).
   Containers get daemon-assigned ports (`-p 127.0.0.1::9000` + `docker port`).
 - **Serial escapes** (`-n 0`, already wired into the Makefile targets):
-  `make perf` (xdist swallows `-s` and parallel load corrupts timings),
-  `make compat` (results aggregate in-process; the doc writer refuses to run
-  under xdist), and `make test-s3-real` (the shared real bucket is wiped per
+  `make perf` (xdist swallows `-s` and parallel load corrupts timings) and
+  `make test-s3-real` (the shared real bucket is wiped per
   test; the fixture fails loudly if it sees an xdist worker).
 
 Debugging a single test? `pytest tests/test_x.py -n 0` gets you serial

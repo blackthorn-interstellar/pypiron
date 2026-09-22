@@ -36,8 +36,7 @@ jobs:
       - name: Sync dev dependencies
         run: uv sync
       # Exercises poetry/pdm/flit/hatch/pipenv against a real server (fetched on
-      # demand via uvx). Regenerates docs/reference/compatibility.md; the working-
-      # tree change is discarded, this only checks the clients still pass.
+      # demand via uvx).
       - name: Client compatibility matrix
         run: make compat
 

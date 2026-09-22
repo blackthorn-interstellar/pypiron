@@ -41,6 +41,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Missing capability (VISION: "waits for index visibility before returning 200"): `--wait-on-upload` polled the stored index, but every node serves installs from its TTL index cache, so a warm follower served the old index after the 200 (2/20 at the 1 s default, 16/20 at 5 s). The wait now outlasts one cache TTL once the file is in storage. Two-node test red first.
 - 2026-09-22 Simplify: `token.rs` carried a byte-for-byte copy of `hash::hmac_sha256`, and `reqsign.rs`/`attest.rs` their own `sha256_hex`/`hex`/`hex_lower`; all now use `crate::hash`. Signing KATs and token tests unchanged. Non-test lines −49 (45731).
 - 2026-09-22 Wrong docs: `docs/reference/configuration.md` said a username tag (`reader+billing-api`) is recorded "in request metrics"; `/metrics` reads it only with `--metrics-project-labels` (default off). Now names the access log and the flag.
+- 2026-09-22 Delete: `make compat` ran serially (`-n 0`) to feed a ~130-line conftest writer for `docs/reference/compatibility.md`, a page removed from the manual in `25d8a82`; CI discarded the output and local runs left an untracked file. Writer, result collection and marker-label validation gone; `make compat` 66 s -> 10 s, same 21 passed / 1 skipped.
 
 ## Rejected
 
@@ -54,7 +55,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 

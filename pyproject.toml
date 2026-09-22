@@ -85,12 +85,12 @@ markers = [
     "gcs: end-to-end tests against a real GCS bucket (no emulator; skips unless PYPIRON_TEST_GCS_REAL_BUCKET is set)",
     "perf: performance benchmarks against the release binary (disabled by default)",
     "chaos: crash-point fault injection sweeps (slow-ish, deterministic)",
-    "compat(client, feature): client compatibility coverage point for docs/reference/compatibility.md",
+    "compat(client, feature): runs a real client binary; selected by `make compat`",
     "devpi: migration tests that drive a real devpi-server (fetched via uv tool run) as the source; skip cleanly when devpi can't be fetched/started",
 ]
 # -n auto: tests isolate by uuid bucket/container/port, so they parallelize.
-# The serial-only targets (perf timing, the compat doc's result aggregation,
-# real-bucket runs that wipe a shared bucket) pass -n 0 in the Makefile.
+# The serial-only targets (perf timing, real-bucket runs that wipe a shared
+# bucket) pass -n 0 in the Makefile.
 addopts = "-m 'not perf and not stress' -n auto"
 testpaths = [
     "tests",

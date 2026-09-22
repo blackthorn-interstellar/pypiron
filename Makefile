@@ -50,9 +50,8 @@ perf:  ## Run performance benchmarks (builds release binary)
 microbench: build  ## Tracked per-endpoint latencies at the 50k-package tier (dev/bench/MICROBENCH.md)
 	python3 dev/bench/microbench.py run --packages $(or $(PACKAGES),50000)
 
-compat:  ## Generate the client compatibility matrix
-	# -n 0: compat results aggregate in-process; xdist workers can't feed the doc writer.
-	uv run -- pytest tests -m "compat and not perf and not stress" --write-compat-doc -n 0
+compat:  ## Run the real-client compatibility tests (poetry, pdm, flit, hatch, pipenv, ...)
+	uv run -- pytest tests -m "compat and not perf and not stress"
 
 check: af cargo-check lint test-rust  ## Format, lint, and unit-test
 

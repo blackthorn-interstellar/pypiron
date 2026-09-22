@@ -255,8 +255,9 @@ No write credential means read-only. No read credential means installs are open
 to the network. Half-configured credentials refuse startup.
 
 Username tags are for attribution: `reader+billing-api` authenticates as
-`reader` and records `billing-api` in request metrics. Tags are capped and
-restricted to `[A-Za-z0-9._-]`.
+`reader` and records `billing-api` in the access log and, with
+`--metrics-project-labels`, in `/metrics`. Tags are capped and restricted to
+`[A-Za-z0-9._-]`.
 
 `pypiron_storage_ops_total` reports backend reads, writes, lists, and deletes.
 With the advisory feed enabled, use

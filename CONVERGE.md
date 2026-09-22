@@ -40,6 +40,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Wrong docs: `docs/guides/migrate.md`'s devpi/pypicloud `sync --as-private` commands kept the default seven-day cooldown, so a migration silently skipped every private file uploaded in the last week and still exited 0 (reproduced against a fake pypicloud). The commands now pass `--exclude-newer ''` and say why.
 - 2026-09-22 Missing capability (VISION: "waits for index visibility before returning 200"): `--wait-on-upload` polled the stored index, but every node serves installs from its TTL index cache, so a warm follower served the old index after the 200 (2/20 at the 1 s default, 16/20 at 5 s). The wait now outlasts one cache TTL once the file is in storage. Two-node test red first.
 - 2026-09-22 Simplify: `token.rs` carried a byte-for-byte copy of `hash::hmac_sha256`, and `reqsign.rs`/`attest.rs` their own `sha256_hex`/`hex`/`hex_lower`; all now use `crate::hash`. Signing KATs and token tests unchanged. Non-test lines −49 (45731).
+- 2026-09-22 Wrong docs: `docs/reference/configuration.md` said a username tag (`reader+billing-api`) is recorded "in request metrics"; `/metrics` reads it only with `--metrics-project-labels` (default off). Now names the access log and the flag.
 
 ## Rejected
 
@@ -53,7 +54,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-1 consecutive.
+0 consecutive.
 
 ## Open questions
 

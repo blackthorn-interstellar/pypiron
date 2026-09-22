@@ -58,9 +58,25 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
+
+- **Add guards for three unguarded security invariants? (the loop's rules bar
+  "coverage for its own sake", so this needs your call)** A 30-mutation break
+  test found three one-line regressions no test catches, each a fail-open:
+  (1) deleting the length check in `token::ct_eq` (`src/token.rs`) makes an
+  empty password match any secret — admin bypass with the default `admin`
+  user — and accepts forged tokens with an empty MAC; existing tests' wrong
+  secrets all differ inside the shared prefix. (2) Loosening `is_uploader` /
+  `is_admin` in `src/app.rs` (`token_role(..).is_some()`, `>= Uploader`) lets a
+  reader token publish or an uploader token delete/yank; tests check the role
+  cap only at minting. (3) `any` -> `all` in `src/denylist.rs`
+  (`version_allowed`, `name_fully_denied`) un-denies a name listed both bare
+  and pinned. Options: (A) add a Rust unit test for (1) and (3) and a blackbox
+  test in `tests/test_token_auth.py` for (2), ~40 test lines; (B) leave as is.
+  Recommendation: A for (1) and (2) — plausible "simplifications" that ship a
+  full auth bypass silently; (3) optional. Cost of choosing wrong: low.
 
 - **Should `sync --as-private` default to no cooldown?** The seven-day
   `exclude-newer` hold exists to keep fresh *public* releases away from

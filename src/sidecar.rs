@@ -112,10 +112,11 @@ pub struct Sidecar {
     /// the package-level `.origin` claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
-    /// Monotonic yank epoch, bumped on every yank/unyank flip (§6.5). The
+    /// Monotonic sidecar revision (historically named yank-epoch), bumped on
+    /// every yank/unyank flip and historical upload-time repair (§6.5). The
     /// cross-bucket merge takes the max epoch — no wall clocks, because two
     /// buckets have two clocks and skew makes verdicts non-convergent. Absent
-    /// means 0 (never yanked).
+    /// means 0 (no metadata edits).
     #[serde(rename = "yank-epoch", default, skip_serializing_if = "is_zero_epoch")]
     pub yank_epoch: u64,
     /// Provenance of a mirror record: `true` on a `sync --to` snapshot (mirror

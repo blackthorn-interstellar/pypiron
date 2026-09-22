@@ -183,7 +183,7 @@ def test_http_mirror_refuses_private_owned_names(disk_server, pypiron_bin, tmp_p
 
 def test_normal_uploads_cannot_backdate(disk_server, tmp_path):
     """A non-mirror upload carrying a timestamp is rejected even when sent with
-    the admin credential — backdating only happens through mirror=true."""
+    the admin credential — backdating requires explicit mirror or migration mode."""
     wheel_path = download_pypi_wheel(PACKAGE, "1.17.0", tmp_path)
     upload_legacy(
         disk_server["legacy"],

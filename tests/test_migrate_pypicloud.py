@@ -30,6 +30,12 @@ class _PypicloudHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self.server.seen[self.path] = self.headers.get("Authorization")
+        self.server.conditionals.append(self.headers.get("If-None-Match"))
+        if self.server.etag and self.headers.get("If-None-Match") == self.server.etag:
+            self.send_response(304)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         route = self.server.routes.get(self.path)
         if route is None:
             self.send_error(404, "not found")
@@ -37,6 +43,8 @@ class _PypicloudHandler(BaseHTTPRequestHandler):
         status, content_type, body = route
         self.send_response(status)
         self.send_header("Content-Type", content_type)
+        if self.server.etag:
+            self.send_header("ETag", self.server.etag)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
@@ -51,6 +59,8 @@ class _PypicloudServer(ThreadingHTTPServer):
         super().__init__(address, _PypicloudHandler)
         self.routes = routes
         self.seen: Dict[str, Optional[str]] = {}
+        self.etag = None
+        self.conditionals = []
 
 
 def _start_source(routes) -> Iterator[Tuple[str, _PypicloudServer]]:
@@ -249,3 +259,348 @@ def test_pypicloud_mode_requires_an_explicit_source(disk_server, pypiron_bin):
     )
     assert rc != 0
     assert "requires --from" in out + err
+
+
+# Pypicloud's package API returns Unix seconds, not an RFC 3339 string.
+SOURCE_DATE = "2020-01-02T03:04:05Z"
+SOURCE_SECONDS = 1577934245
+
+
+def _dated_routes(package, wheel, *, timestamp=SOURCE_SECONDS, with_hash=True):
+    record = _record(package, wheel, uploader="builder", with_hash=with_hash)
+    record["last_modified"] = timestamp
+    return {
+        f"/api/package/{package}/": _json({"packages": [record]}),
+        f"/api/package/{package}/{wheel.name}": (
+            200,
+            "application/octet-stream",
+            wheel.read_bytes(),
+        ),
+    }
+
+
+def _sidecar(server, package, wheel):
+    return server["data_dir"] / "packages" / package / f"{wheel.name}.meta.json"
+
+
+def _wait_date(server, package, wheel, date):
+    import time
+
+    from .helpers import get_index_json
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        index = get_index_json(server["simple"], package)
+        if any(
+            f["filename"] == wheel.name and f.get("upload-time") == date for f in index["files"]
+        ):
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"upload date never became {date}: {index}")
+
+
+def test_pypicloud_preserves_date_for_uv_exclude_newer(
+    disk_server, pypiron_bin, tmp_path, uv_path, uv_venv
+):
+    from .helpers import run_checked
+
+    package = "historical-private"
+    wheel = make_wheel(package, "1.0.0", tmp_path)
+    source_gen = _start_source(_dated_routes(package, wheel))
+    source_url, _ = next(source_gen)
+    try:
+        rc, out, err = _pypicloud_sync(
+            pypiron_bin, disk_server, source_url, "--include-package", package
+        )
+        assert rc == 0, f"{out}\n{err}"
+    finally:
+        source_gen.close()
+    index = wait_for_file_in_index(disk_server["simple"], package, wheel.name)
+    assert index["files"][0]["upload-time"] == SOURCE_DATE
+    sc = json.loads(_sidecar(disk_server, package, wheel).read_text())
+    assert sc["origin"] == "private"
+    assert sc["upload-epoch-ms"] > SOURCE_SECONDS * 1000
+    run_checked(
+        [
+            uv_path,
+            "pip",
+            "install",
+            "--python",
+            str(uv_venv),
+            "--index-url",
+            disk_server["simple"],
+            "--no-cache",
+            "--exclude-newer",
+            "2021-01-01T00:00:00Z",
+            package,
+        ]
+    )
+
+
+@pytest.mark.parametrize("with_hash", [True, False])
+def test_repair_dates_is_hash_checked_previewable_and_repeatable(
+    disk_server, pypiron_bin, tmp_path, with_hash
+):
+    from .helpers import upload_legacy
+
+    package = "repair-private"
+    wheel = make_wheel(package, "1.0.0", tmp_path)
+    upload_legacy(
+        disk_server["legacy"], wheel, username=disk_server["user"], password=disk_server["password"]
+    )
+    wait_for_file_in_index(disk_server["simple"], package, wheel.name)
+    sc_path = _sidecar(disk_server, package, wheel)
+    before_bytes = sc_path.read_bytes()
+    before = json.loads(before_bytes)
+    artifact = sc_path.with_name(wheel.name)
+    before_stat = artifact.stat()
+    routes = _dated_routes(package, wheel, with_hash=with_hash)
+    missing = make_wheel(package, "2.0.0", tmp_path / "missing")
+    records = json.loads(routes[f"/api/package/{package}/"][2])
+    records["packages"].append(
+        {**_record(package, missing, uploader="builder"), "last_modified": SOURCE_SECONDS}
+    )
+    routes[f"/api/package/{package}/"] = _json(records)
+    source_gen = _start_source(routes)
+    source_url, source = next(source_gen)
+    source.etag = '"historical-dates"'
+    args = ("--include-package", f"{package}==1.0.0", "--repair-upload-times")
+    try:
+        # Ordinary re-sync continues to skip existing files. Repair is explicit.
+        rc, out, err = _pypicloud_sync(
+            pypiron_bin, disk_server, source_url, "--include-package", f"{package}==1.0.0"
+        )
+        assert rc == 0, f"{out}\n{err}"
+        assert sc_path.read_bytes() == before_bytes
+        source.conditionals.clear()
+        cursor_path = disk_server["data_dir"] / "_sync" / "cursors.json"
+        cursor_bytes = cursor_path.read_bytes()
+        rc, out, err = _pypicloud_sync(pypiron_bin, disk_server, source_url, *args, "--dry-run")
+        assert rc == 0, f"{out}\n{err}"
+        assert f"would repair upload time {package}/{wheel.name} -> {SOURCE_DATE}" in out
+        assert sc_path.read_bytes() == before_bytes
+        rc, out, err = _pypicloud_sync(pypiron_bin, disk_server, source_url, *args)
+        assert rc == 0, f"{out}\n{err}"
+        _wait_date(disk_server, package, wheel, SOURCE_DATE)
+        after = json.loads(sc_path.read_text())
+        assert after == {**before, "upload-time": SOURCE_DATE, "yank-epoch": 1}
+        assert artifact.stat().st_mtime_ns == before_stat.st_mtime_ns
+        assert artifact.read_bytes() == wheel.read_bytes()
+        assert not artifact.with_name(missing.name).exists()
+        rc, out, err = _pypicloud_sync(
+            pypiron_bin,
+            disk_server,
+            source_url,
+            "--include-package",
+            package,
+            "--repair-upload-times",
+            "--dry-run",
+        )
+        assert rc == 0, f"{out}\n{err}"
+        assert "absent on destination; skipping" in out + err
+
+        rc, out, err = _pypicloud_sync(pypiron_bin, disk_server, source_url, *args)
+        assert rc == 0, f"{out}\n{err}"
+        assert "upload date already matches" in out + err
+        assert json.loads(sc_path.read_text()) == after
+        assert all(value is None for value in source.conditionals)
+        assert cursor_path.read_bytes() == cursor_bytes
+        assert (f"/api/package/{package}/{wheel.name}" in source.seen) is not with_hash
+    finally:
+        source_gen.close()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_repair_refuses_source_hash_mismatch(disk_server, pypiron_bin, tmp_path, dry_run):
+    from .helpers import upload_legacy
+
+    package = "repair-mismatch"
+    wheel = make_wheel(package, "1.0.0", tmp_path)
+    upload_legacy(
+        disk_server["legacy"], wheel, username=disk_server["user"], password=disk_server["password"]
+    )
+    wait_for_file_in_index(disk_server["simple"], package, wheel.name)
+    before = _sidecar(disk_server, package, wheel).read_bytes()
+    routes = _dated_routes(package, wheel)
+    record = json.loads(routes[f"/api/package/{package}/"][2])
+    record["packages"][0]["metadata"]["hash_sha256"] = "0" * 64
+    routes[f"/api/package/{package}/"] = _json(record)
+    source_gen = _start_source(routes)
+    source_url, _ = next(source_gen)
+    try:
+        rc, out, err = _pypicloud_sync(
+            pypiron_bin,
+            disk_server,
+            source_url,
+            "--include-package",
+            package,
+            "--repair-upload-times",
+            *(["--dry-run"] if dry_run else []),
+        )
+        assert rc != 0
+        assert "SHA-256 mismatch" in out + err
+        assert _sidecar(disk_server, package, wheel).read_bytes() == before
+    finally:
+        source_gen.close()
+
+
+@pytest.mark.parametrize("timestamp", [None, "not-a-date", 9223372036854775807])
+def test_missing_and_invalid_source_dates(disk_server, pypiron_bin, tmp_path, timestamp):
+    package = "missing-date"
+    wheel = make_wheel(package, "1.0.0", tmp_path)
+    source_gen = _start_source(_dated_routes(package, wheel, timestamp=timestamp))
+    source_url, _ = next(source_gen)
+    try:
+        rc, out, err = _pypicloud_sync(
+            pypiron_bin, disk_server, source_url, "--include-package", package
+        )
+        if timestamp is not None:
+            assert rc != 0
+            assert not _sidecar(disk_server, package, wheel).exists()
+            return
+        assert rc == 0, f"{out}\n{err}"
+        assert "source has no upload date" in out + err
+        wait_for_file_in_index(disk_server["simple"], package, wheel.name)
+        before = _sidecar(disk_server, package, wheel).read_bytes()
+        rc, out, err = _pypicloud_sync(
+            pypiron_bin,
+            disk_server,
+            source_url,
+            "--include-package",
+            package,
+            "--repair-upload-times",
+        )
+        assert rc == 0, f"{out}\n{err}"
+        assert "leaving destination unchanged" in out + err
+        assert _sidecar(disk_server, package, wheel).read_bytes() == before
+    finally:
+        source_gen.close()
+
+
+def test_private_migration_dates_require_admin_and_explicit_mode(disk_server, tmp_path):
+    from .helpers import http_request_auth, upload_legacy
+
+    server = disk_server
+    package = "date-permissions"
+    wheel = make_wheel(package, "1.0.0", tmp_path)
+    fields = {"migration": "true", "upload_time": SOURCE_DATE}
+    upload_legacy(
+        server["legacy"],
+        wheel,
+        fields=fields,
+        username=server["uploader_user"],
+        password=server["uploader_password"],
+        expect_status=403,
+    )
+    admin = {"username": server["user"], "password": server["password"]}
+    for invalid in (
+        {"upload_time": SOURCE_DATE},
+        {**fields, "mirror": "true"},
+        {**fields, "yanked": "true"},
+        {**fields, "upload_time": "bad"},
+    ):
+        upload_legacy(server["legacy"], wheel, fields=invalid, **admin, expect_status=400)
+    upload_legacy(server["legacy"], wheel, **admin)
+    wait_for_file_in_index(server["simple"], package, wheel.name)
+    before = _sidecar(server, package, wheel).read_bytes()
+    url = f"{server['base_url']}/files/{package}/{wheel.name}/upload-time"
+    body = {"sha256": sha256_file(wheel), "upload-time": SOURCE_DATE}
+    code, _, _ = http_request_auth(
+        "POST",
+        url,
+        data=json.dumps(body).encode(),
+        username=server["uploader_user"],
+        password=server["uploader_password"],
+    )
+    assert code == 403
+    for invalid, expected in (
+        ({**body, "sha256": "0" * 64}, 409),
+        ({**body, "upload-time": "bad"}, 400),
+    ):
+        code, response, _ = http_request_auth(
+            "POST", url, data=json.dumps(invalid).encode(), **admin
+        )
+        assert code == expected, response
+    assert _sidecar(server, package, wheel).read_bytes() == before
+    # A date repair and a later yank preserve each other's metadata.
+    code, response, _ = http_request_auth("POST", url, data=json.dumps(body).encode(), **admin)
+    assert code == 200, response
+    code, response, _ = http_request_auth(
+        "POST", url.replace("upload-time", "yank"), data=b"withdrawn", **admin
+    )
+    assert code == 200, response
+    sc = json.loads(_sidecar(server, package, wheel).read_text())
+    assert sc["upload-time"] == SOURCE_DATE
+    assert sc["yanked"] == "withdrawn"
+    assert sc["yank-epoch"] == 2
+    body["upload-time"] = "2019-01-01T00:00:00Z"
+    code, response, _ = http_request_auth("POST", url, data=json.dumps(body).encode(), **admin)
+    assert code == 200, response
+    sc = json.loads(_sidecar(server, package, wheel).read_text())
+    assert sc["yanked"] == "withdrawn"
+    assert sc["yank-epoch"] == 3
+    code, response, _ = http_request_auth("POST", url, data=json.dumps(body).encode(), **admin)
+    assert code == 200, response
+    assert json.loads(_sidecar(server, package, wheel).read_text()) == sc
+
+
+def test_repair_requires_private_mode(disk_server, pypiron_bin):
+    rc, out, err = sync_to(
+        pypiron_bin, disk_server, "--include-package", "six", "--repair-upload-times"
+    )
+    assert rc != 0
+    assert "--repair-upload-times requires --as-private" in out + err
+
+
+def test_simple_source_private_migration_preserves_dates(
+    disk_server, disk_server_wait_on_upload, pypiron_bin, tmp_path
+):
+    from .helpers import upload_legacy
+
+    source = disk_server_wait_on_upload
+    package = "simple-history"
+    wheel = make_wheel(package, "1.0.0", tmp_path)
+    upload_legacy(
+        source["legacy"],
+        wheel,
+        username=source["user"],
+        password=source["password"],
+        fields={"migration": "true", "upload_time": SOURCE_DATE},
+    )
+    wait_for_file_in_index(source["simple"], package, wheel.name)
+    rc, out, err = sync_to(
+        pypiron_bin,
+        disk_server,
+        "--include-package",
+        package,
+        "--as-private",
+        "--advisory-feed",
+        "",
+        source=source["base_url"],
+    )
+    assert rc == 0, f"{out}\n{err}"
+    index = wait_for_file_in_index(disk_server["simple"], package, wheel.name)
+    assert index["files"][0]["upload-time"] == SOURCE_DATE
+    assert json.loads(_sidecar(disk_server, package, wheel).read_text())["origin"] == "private"
+
+
+def test_repair_endpoint_refuses_mirror_and_deleted_files(disk_server, tmp_path):
+    from .helpers import http_request_auth, upload_legacy
+
+    package = "repair-mirror"
+    wheel = make_wheel(package, "1.0.0", tmp_path)
+    server = disk_server
+    admin = {"username": server["user"], "password": server["password"]}
+    upload_legacy(server["legacy"], wheel, fields={"mirror": "true"}, **admin)
+    wait_for_file_in_index(server["simple"], package, wheel.name)
+    before = _sidecar(server, package, wheel).read_bytes()
+    body = json.dumps({"sha256": sha256_file(wheel), "upload-time": SOURCE_DATE}).encode()
+    url = f"{server['base_url']}/files/{package}/{wheel.name}"
+    code, response, _ = http_request_auth("POST", f"{url}/upload-time", data=body, **admin)
+    assert code == 409, response
+    assert _sidecar(server, package, wheel).read_bytes() == before
+    code, response, _ = http_request_auth("DELETE", url, **admin)
+    assert code == 204, response
+    code, response, _ = http_request_auth("POST", f"{url}/upload-time", data=body, **admin)
+    assert code == 404, response
+    assert not _sidecar(server, package, wheel).exists()

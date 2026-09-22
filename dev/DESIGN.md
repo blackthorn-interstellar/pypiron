@@ -294,6 +294,16 @@ cannot backdate. With no admin credential configured, mirror uploads — like
 deletion and yank — are disabled, so a stock server never accepts a client
 timestamp.
 
+Private migration uses `migration=true` instead of `mirror=true`, also requiring
+admin credentials. It carries `upload_time` when the source reports one;
+pypicloud's `last_modified` Unix seconds are converted to RFC 3339. Missing dates
+use receive time. Ordinary uploads still reject historical dates, and private
+migration never imports yank state. `sync --as-private --repair-upload-times`
+uses the admin `POST /files/<pkg>/<filename>/upload-time` with a source SHA-256
+and historical date: the server checks the private record and digest again
+before a metadata-only CAS. The repair bypasses cursors, does not push feeds,
+and neither uploads nor deletes artifacts.
+
 A re-sync also *reconciles* what the destination already holds: it drives the
 server's yank endpoint to bring yank state in line with upstream (and to flag
 files gone upstream `removed upstream`), and its status endpoint
@@ -1052,9 +1062,14 @@ milliseconds), the **first-uploaded-wins** tiebreak for the rare cross-partition
 byte conflict: the older epoch wins, the loser is quarantined. It is absent on
 legacy sidecars and on mirror artifacts; a conflict with either side missing it,
 or with the two within a 2 s skew, degrades to quarantine-both + alarm.
-`yank-epoch` is a monotonic counter bumped on every yank/unyank flip — the
-cross-bucket merge takes the max epoch (no wall clocks, which two buckets cannot
-agree on); absent means 0. `snapshot` records a mirror record's provenance: a
+`yank-epoch` is the sidecar's monotonic revision, retaining its historical field
+name. Every yank/unyank flip and historical upload-time repair increments it;
+the cross-bucket merge takes the max epoch and adopts the whole sidecar (no wall
+clocks, which two buckets cannot agree on); absent means 0. Timestamp repairs
+use the same CAS, intent/commit, and fan-out path as yanks, preserving yank state
+and the server-stamped `upload-epoch-ms`. At equal revisions the existing
+fail-closed yank preference and deterministic sidecar-digest tie-break still
+apply, including concurrent repairs during a partition. `snapshot` records a mirror record's provenance: a
 `sync --to` snapshot (`snapshot=true`) fans out pre-ack, a proxy-cache fill (the
 bit absent/false) replicates asynchronously via a post-serve note. Both are
 truth that converges — the bit picks the mechanism, never *whether* a mirror

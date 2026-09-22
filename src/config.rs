@@ -585,7 +585,10 @@ mod tests {
                     "azure_access_key",
                 ],
             ),
-            ("sync", &["dry_run", "full", "no_progress"]),
+            (
+                "sync",
+                &["dry_run", "full", "no_progress", "repair_upload_times"],
+            ),
         ];
         // Repeatable flags are plural in the file; `--from`/`--to` are their own keys.
         const RENAMED: &[(&str, &str)] = &[

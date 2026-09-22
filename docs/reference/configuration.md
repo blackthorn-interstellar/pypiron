@@ -370,9 +370,8 @@ stored.
 `sync` mirrors over HTTP into a running pypiron server. It never writes storage
 directly.
 
-The pypicloud-specific source and private-pattern options require a build newer
-than 0.0.17. Use the next release when available, or run
-`cargo run --locked -- sync ...` from a source checkout.
+Preserving private-package upload dates and using `--repair-upload-times`
+require pypiron 0.0.23 or newer on both the sync client and destination server.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
@@ -386,7 +385,8 @@ than 0.0.17. Use the next release when available, or run
 | `--admin-user USER` | `PYPIRON_SYNC_ADMIN_USER` | none | Destination admin user. |
 | `--admin-pass PASS` | `PYPIRON_SYNC_ADMIN_PASS` | none | Destination admin password. |
 | `--private-prefix PREFIX` | `PYPIRON_PRIVATE_PREFIX` | none | Refuse to mirror `PREFIX` and `PREFIX-*`. Also top-level `private-prefix`. |
-| `--as-private` | `PYPIRON_SYNC_AS_PRIVATE` | `false` | Import as private packages. Uses the migration time and does not preserve yank state. Public-owned names require emptying and `origin release`. [Migration guide](../guides/migrate.md). |
+| `--as-private` | `PYPIRON_SYNC_AS_PRIVATE` | `false` | Import as private packages. Preserves source upload dates when available; missing dates use migration time. Does not preserve yank state. Public-owned names require emptying and `origin release`. [Migration guide](../guides/migrate.md). |
+| `--repair-upload-times` | `PYPIRON_SYNC_REPAIR_UPLOAD_TIMES` | `false` | With `--as-private`, repair dates of existing private files after SHA-256 comparison. Copies no new files; ignores sync cursors and leaves the advisory feed unchanged. Supports `--dry-run`. CLI/env only. Upgrade both client and server. [Procedure](../guides/migrate.md#repair-upload-dates). |
 | `--private-pattern PATTERN` | `PYPIRON_PRIVATE_PATTERN` | none | Refuse to mirror names matching `PATTERN`; with `--source-kind pypicloud --as-private`, migrate the matching projects instead. Repeatable; comma-separated in the env var. Also top-level `private-patterns`. [Details](#reserved-private-names). |
 | `--private-patterns-from FILE` | `PYPIRON_PRIVATE_PATTERNS_FROM` | none | Read patterns from `FILE`, one per line. Blank lines and `#` comments are ignored. Also top-level `private-patterns-from`. |
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | relay from `--from` | Deliver an advisory snapshot to the destination. A URL or path overrides the source feed; `""` disables. Failure warns but does not stop package sync. |
@@ -490,6 +490,7 @@ pending repairs, not bytes.
 | --- | --- | --- |
 | `/simple/` | read | Package index. |
 | `/files/<pkg>/<file>` | read | Artifact bytes. |
+| `/files/<pkg>/<filename>/upload-time` | admin | `POST` JSON with `sha256` and RFC 3339 `upload-time` to repair a private file's date. Refuses hash mismatches and deleted/quarantined files. |
 | `/legacy/` | uploader/admin | Upload API. `POST /simple/`, `POST /simple`, and `POST /` upload too, so publishers configured for pypicloud keep working. |
 | `/health` | open | Liveness: the process is up. Always `200` while serving (a Kubernetes `livenessProbe`). |
 | `/ready` | open | Readiness: this node can serve reads. Point your load balancer and a Kubernetes `readinessProbe` here. |

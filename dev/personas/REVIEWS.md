@@ -47,3 +47,15 @@ Browser visual review could not run: the Browser runtime failed during setup
 with `Importing module "node:process" is not allowed in node_repl`. Generated
 HTML checks do not establish desktop or mobile rendering quality. The existing
 theme, chart, product screenshot, and advertising pixel were retained.
+
+
+## September 22, 2026 — migration upload dates (v0.0.23)
+
+`docs/guides/migrate.md`: artifactory-refugee and junior-dev actors, followed by
+a separate extraction analyst. Confirmed stalls: repair example appeared
+pypicloud-only; required builds were unclear; workstation/checkout context for
+source commands was missing. Clarified source scope, build availability and
+command location. The junior stopped at the build prerequisite before reaching
+the repair section; this is not a whole-page pass. Release preparation replaced
+the source-build prerequisite with the concrete minimum version, 0.0.23. The
+fix commit is tagged [v0.0.23](https://github.com/blackthorn-interstellar/pypiron/tree/v0.0.23).

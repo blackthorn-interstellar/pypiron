@@ -3297,3 +3297,58 @@ def test_single_survivor_every_state_class_serves_from_one_bucket(
     _eventually(
         _audit_has_malware, timeout=30, what="/audit intact and names the blocked package on B"
     )
+
+
+def test_private_upload_date_repair_survives_partition_and_later_yank(s3_servers_multi, tmp_path):
+    cluster = s3_servers_multi
+    minio = cluster["minio"]
+    a, b = minio["buckets"]
+    pkg = "repairdate"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    _upload(cluster["left"], wheel)
+    key = f"packages/{pkg}/{wheel.name}.meta.json"
+    before = json.loads(minio_get_key_in(minio, a, key))
+    _eventually(lambda: minio_key_exists_in(minio, b, key), what="baseline copy")
+    _partition_nodes(cluster)
+    left = cluster["left"]
+    url = f"{left['base_url']}/files/{pkg}/{wheel.name}/upload-time"
+    code, body, _ = http_request_auth(
+        "POST",
+        url,
+        username=left["user"],
+        password=left["password"],
+        data=json.dumps(
+            {"sha256": before["sha256"], "upload-time": "2020-01-01T00:00:00Z"}
+        ).encode(),
+    )
+    assert code == 200, body
+    repaired = json.loads(minio_get_key_in(minio, a, key))
+    assert repaired == {**before, "upload-time": "2020-01-01T00:00:00Z", "yank-epoch": 1}
+    assert json.loads(minio_get_key_in(minio, b, key))["upload-time"] == before["upload-time"]
+    _heal_nodes(cluster, a, b)
+    _eventually(
+        lambda: json.loads(minio_get_key_in(minio, b, key)) == repaired,
+        timeout=60,
+        what="repaired date reaches peer after healing",
+    )
+    right = cluster["right"]
+    code, body, _ = http_request_auth(
+        "POST",
+        f"{right['base_url']}/files/{pkg}/{wheel.name}/yank",
+        username=right["user"],
+        password=right["password"],
+        data=b"withdrawn",
+    )
+    assert code == 200, body
+    for bucket in (a, b):
+        _eventually(
+            lambda: (
+                json.loads(minio_get_key_in(minio, bucket, key))
+                == {
+                    **repaired,
+                    "yanked": "withdrawn",
+                    "yank-epoch": 2,
+                }
+            ),
+            what="subsequent yank retains historical date",
+        )

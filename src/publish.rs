@@ -322,6 +322,16 @@ pub(crate) async fn legacy_upload(
     // metadata. Backdating is an admin privilege — never reachable with plain
     // uploader rights, and never reinterpreted as a normal upload.
     let is_mirror = fields.get("mirror").map(String::as_str) == Some("true");
+    let is_migration = fields.get("migration").map(String::as_str) == Some("true");
+    if is_migration {
+        require_admin(&state, &headers)?;
+        if is_mirror {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "migration and mirror are mutually exclusive".into(),
+            ));
+        }
+    }
     if is_mirror {
         if !is_admin {
             // Distinguish "admin disabled here" from "you're not admin".
@@ -337,13 +347,13 @@ pub(crate) async fn legacy_upload(
                 )
             });
         }
-    } else if fields.contains_key("upload_time")
+    } else if (!is_migration && fields.contains_key("upload_time"))
         || fields.contains_key("yanked")
         || fields.contains_key("yanked_reason")
     {
         return Err((
             StatusCode::BAD_REQUEST,
-            "upload_time/yanked fields require a mirror upload (mirror=true, admin credential)"
+            "upload_time requires mirror=true or migration=true (admin); yanked fields require mirror=true"
                 .into(),
         ));
     }
@@ -1050,6 +1060,7 @@ enum Mutation {
     Delete,
     Yank,
     StatusChange,
+    UploadTime,
 }
 
 impl Mutation {
@@ -1059,6 +1070,7 @@ impl Mutation {
             Mutation::Delete => "delete",
             Mutation::Yank => "yank",
             Mutation::StatusChange => "status change",
+            Mutation::UploadTime => "upload time repair",
         }
     }
 
@@ -1068,7 +1080,7 @@ impl Mutation {
                 "the bytes are already stored, so re-sending the file will be refused as a \
                  duplicate filename"
             }
-            Mutation::Delete | Mutation::Yank | Mutation::StatusChange => {
+            Mutation::Delete | Mutation::Yank | Mutation::StatusChange | Mutation::UploadTime => {
                 "sending the same request again is safe"
             }
         }
@@ -1407,6 +1419,73 @@ async fn yank_handler(
     set_yank(state, &pinned, &pkg, filename, yanked).await
 }
 
+/// Admin-only, hash-bound correction of a private artifact's historical date.
+pub(crate) async fn upload_time_set(
+    State(state): State<Arc<AppState>>,
+    Path((package, filename)): Path<(String, String)>,
+    request: axum::extract::Request,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_admin(&state, request.headers())?;
+    let Some(pkg) = checked_pkg_name(&package).filter(|_| valid_artifact_filename(&filename))
+    else {
+        return Err((StatusCode::NOT_FOUND, "No such file".into()));
+    };
+    let body = axum::body::to_bytes(request.into_body(), 4096)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "timestamp repair body too large".into(),
+            )
+        })?;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Repair {
+        sha256: String,
+        #[serde(rename = "upload-time")]
+        upload_time: String,
+    }
+    let repair: Repair = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid timestamp repair: {e}"),
+        )
+    })?;
+    if repair.sha256.len() != 64 || !repair.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "sha256 must be 64 hex digits".into(),
+        ));
+    }
+    let timestamp = OffsetDateTime::parse(&repair.upload_time, &Rfc3339).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("upload-time must be RFC 3339: {e}"),
+        )
+    })?;
+    let upload_time = timestamp
+        .to_offset(time::UtcOffset::UTC)
+        .format(&Rfc3339)
+        .map_err(|e| internal("format upload time", e))?;
+    let pinned = state.pin();
+    edit_sidecar(
+        &state,
+        &pinned,
+        &pkg,
+        &filename,
+        SidecarEdit::UploadTime {
+            sha256: repair.sha256,
+            upload_time,
+        },
+    )
+    .await
+}
+
+enum SidecarEdit {
+    Yank(Yanked),
+    UploadTime { sha256: String, upload_time: String },
+}
+
 /// The storage-protocol core of a yank/unyank (PEP 592): the sidecar is truth,
 /// so the flip is a bounded compare-and-set loop that bumps the yank epoch on
 /// every real change, pairs an intent/commit marker so the derived index heals,
@@ -1419,16 +1498,39 @@ pub(crate) async fn set_yank(
     filename: &str,
     yanked: Yanked,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    edit_sidecar(
+        state,
+        pinned,
+        pkg,
+        filename,
+        SidecarEdit::Yank(yanked.normalized()),
+    )
+    .await
+}
+
+/// Both edits consume the observed sidecar with CAS and bump its existing
+/// revision (historically named yank-epoch). Replication adopts the whole
+/// winning sidecar, so a repaired date must advance that revision too.
+async fn edit_sidecar(
+    state: &AppState,
+    pinned: &buckets::Pinned,
+    pkg: &str,
+    filename: &str,
+    edit: SidecarEdit,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let mutation = match &edit {
+        SidecarEdit::Yank(_) => Mutation::Yank,
+        SidecarEdit::UploadTime { .. } => Mutation::UploadTime,
+    };
     let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
     let sc_key = sidecar_key(&key);
     let storage = pinned.storage.as_ref();
 
-    let desired = yanked.normalized();
     let mut intent_nonce = if state.buckets.is_multi() {
         Some(markers::mark_intent(storage, pkg).await.map_err(|e| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("failed to reserve yank: {e}"),
+                format!("failed to reserve {}: {e}", mutation.noun()),
             )
         })?)
     } else {
@@ -1452,19 +1554,83 @@ pub(crate) async fn set_yank(
                 format!("bad sidecar: {e}"),
             )
         })?;
-        if sc.yanked.normalized() == desired {
-            if let Some(nonce) = intent_nonce {
-                let _ = markers::mark_commit(storage, pkg, &nonce).await;
+        let changed = match &edit {
+            SidecarEdit::Yank(desired) => {
+                let changed = sc.yanked.normalized() != *desired;
+                sc.yanked = desired.clone();
+                changed
             }
-            return Ok(StatusCode::OK);
+            SidecarEdit::UploadTime {
+                sha256,
+                upload_time,
+            } => {
+                // Check truth on every CAS attempt, not just the CLI's possibly
+                // stale index. Never repair mirror records or suppressed files.
+                let owner = origin::read_origin_claim(storage, pkg)
+                    .await
+                    .map_err(|e| internal("read origin", e))?;
+                if owner != Some(origin::OriginState::Private)
+                    || sc.origin.as_deref().is_some_and(|o| o != origin::PRIVATE)
+                {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "timestamp repair requires a private artifact".into(),
+                    ));
+                }
+                for fence in [
+                    tombstone_key(&key),
+                    frozen_key(&key),
+                    sidecar::mirror_quarantined_key(&key),
+                ] {
+                    if storage
+                        .head_exists(&fence)
+                        .await
+                        .map_err(|e| internal("read fence", e))?
+                    {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            "cannot repair a deleted or quarantined artifact".into(),
+                        ));
+                    }
+                }
+                if !storage
+                    .head_exists(&key)
+                    .await
+                    .map_err(|e| internal("read artifact", e))?
+                {
+                    return Err((StatusCode::NOT_FOUND, "No such file".into()));
+                }
+                if !sc.sha256.eq_ignore_ascii_case(sha256) {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "SHA-256 mismatch; refusing timestamp repair".into(),
+                    ));
+                }
+                let changed = OffsetDateTime::parse(&sc.upload_time, &Rfc3339).ok()
+                    != OffsetDateTime::parse(upload_time, &Rfc3339).ok();
+                sc.upload_time = upload_time.clone();
+                changed
+            }
+        };
+        if !changed {
+            if matches!(edit, SidecarEdit::Yank(_)) {
+                if let Some(nonce) = intent_nonce {
+                    let _ = markers::mark_commit(storage, pkg, &nonce).await;
+                }
+                return Ok(StatusCode::OK);
+            }
+            // Retrying an acknowledged local edit must still heal replication
+            // if its previous fan-out failed, without consuming another epoch.
+            record_origin = sc.origin.clone();
+            wrote = true;
+            break;
         }
-
-        // Every real flip consumes the exact sidecar version it observed. Two
-        // nodes yanking during a partition may produce equal epochs (the merge
-        // has a deterministic tie-break), but two writers on one bucket cannot
-        // silently lose an increment through a blind overwrite.
-        sc.yank_epoch = sc.yank_epoch.saturating_add(1);
-        sc.yanked = desired.clone();
+        sc.yank_epoch = sc.yank_epoch.checked_add(1).ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                "sidecar revision exhausted".to_string(),
+            )
+        })?;
         record_origin = sc.origin.clone();
         if intent_nonce.is_none() {
             intent_nonce = markers::mark_intent(storage, pkg).await.ok();
@@ -1484,12 +1650,12 @@ pub(crate) async fn set_yank(
     if !wrote {
         return Err((
             StatusCode::CONFLICT,
-            "sidecar changed repeatedly; retry the yank".to_string(),
+            "sidecar changed repeatedly; retry the metadata update".to_string(),
         ));
     }
 
     if let Err(e) = markers::commit_marker(state, storage, pkg, intent_nonce).await {
-        warn!(error=?e, "yank: failed to write commit marker");
+        warn!(error=?e, "metadata update: failed to write commit marker");
     }
     // A yank rides truth, and all package truth replicates now: private always,
     // and every mirror record — a `sync --to` snapshot and a proxy cache alike,
@@ -1519,7 +1685,7 @@ pub(crate) async fn set_yank(
     if replicate_this {
         replicate::fanout_sync(state, pinned, pkg, filename, None)
             .await
-            .map_err(unrecorded_replication_gap(Mutation::Yank))?;
+            .map_err(unrecorded_replication_gap(mutation))?;
     }
     Ok(StatusCode::OK)
 }

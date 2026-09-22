@@ -8,6 +8,7 @@ use futures::StreamExt;
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::warn;
 
 use super::SourceAuth;
@@ -31,6 +32,9 @@ struct PackageRecords {
 struct PackageRecord {
     name: String,
     filename: String,
+    // Pypicloud serializes datetimes with calendar.timegm (UTC seconds).
+    #[serde(default)]
+    last_modified: Option<i64>,
     #[serde(default)]
     metadata: Option<PackageMetadata>,
 }
@@ -183,12 +187,21 @@ pub(super) async fn fetch_index(
         {
             hashes.insert("sha256".to_string(), digest);
         }
+        let upload_time = record
+            .last_modified
+            .map(|seconds| {
+                OffsetDateTime::from_unix_timestamp(seconds)
+                    .context("invalid pypicloud last_modified")?
+                    .format(&Rfc3339)
+                    .context("formatting pypicloud last_modified")
+            })
+            .transpose()?;
         files.push(SimpleFile {
             url: api_url(base, &[package, &record.filename])?.to_string(),
             filename: record.filename,
             hashes,
             size: None,
-            upload_time: None,
+            upload_time,
             requires_python: metadata.requires_python,
             yanked: Yanked::default(),
             core_metadata: None,

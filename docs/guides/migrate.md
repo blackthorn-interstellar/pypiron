@@ -42,7 +42,8 @@ uv pip install \
   acme-billing
 ```
 
-Re-running the migration is safe: files already present are skipped.
+Re-running the migration is safe: files already present are skipped. To correct
+dates from an earlier migration, use [Repair upload dates](#repair-upload-dates).
 
 ## Artifactory and Nexus
 
@@ -53,8 +54,8 @@ Use the repository's Python Simple API URL:
 
 Run the same command used for devpi with the new `--from` URL.
 
-The source must return the JSON Simple API. In Artifactory, enable **PyPI simple
-JSON format** for the repository. Nexus supports it from version 3.93. A wrong
+For Artifactory and Nexus, the source must return the JSON Simple API. In
+Artifactory, enable **PyPI simple JSON format** for the repository. Nexus supports it from version 3.93. A wrong
 credential may return an HTML login page; pypiron reports that as an HTML source
 instead of JSON.
 
@@ -63,12 +64,9 @@ Nexus repository before moving packages.
 
 ## pypicloud: select only private projects
 
-!!! warning "Requires a build newer than 0.0.17"
-    The pypicloud-specific flags below are on `master` but not in the current
-    PyPI release, 0.0.17. Use the next release when available. To run them now,
-    install the Rust toolchain, clone the
-    [source repository](https://github.com/blackthorn-interstellar/pypiron),
-    and replace `pypiron sync` below with `cargo run --locked -- sync`.
+!!! note "Use pypiron 0.0.23 or newer"
+    Upgrade both the sync client and destination server to preserve original
+    upload dates and repair dates from earlier migrations.
 
 A pypicloud index may contain your uploads and public packages cached from PyPI.
 Select private project names explicitly:
@@ -163,8 +161,51 @@ public list.
 - Artifact bytes and hashes are preserved.
 - Packages are recorded as private and never fall through to public PyPI.
 - Existing destination files are not overwritten.
-- Source upload times and yank state are not preserved; migrated files receive
-  the migration time.
+- Source upload dates are preserved when available. For pypicloud, these are
+  the per-file `last_modified` dates reported by its package API. Missing dates
+  are reported and use the migration time; invalid dates fail the package.
+- Yank state is not preserved.
+
+### Repair upload dates
+
+If an earlier migration gave every file the migration date, upgrade **both the
+sync client and destination server to 0.0.23 or newer**. Keep the old server
+available as the date source.
+
+For any supported source, add `--repair-upload-times --dry-run` to the original
+`sync --as-private` command. For pypicloud, using the credentials and private
+project selection above, preview from your migration workstation:
+
+```bash
+pypiron sync \
+  --from https://packages.example.com \
+  --source-kind pypicloud \
+  --as-private \
+  --private-pattern 'acme-*' \
+  --private-pattern 'internal-tool' \
+  --to https://pypi.internal \
+  --exclude-newer '' \
+  --repair-upload-times \
+  --dry-run
+```
+
+Check the filenames and proposed dates, then repeat without `--dry-run`.
+`--exclude-newer ''` includes recent uploads that the default seven-day cutoff
+would otherwise skip. Existing file-selection filters still apply.
+
+The repair changes only upload dates on existing private files. It compares
+SHA-256 hashes first and refuses mismatches. If pypicloud has no stored hash,
+it downloads the source file to compute one, including during a dry run.
+Missing source dates leave the destination unchanged and produce a warning.
+Files absent from the destination are reported and skipped; nothing is uploaded
+or deleted. Repeating the repair is safe.
+
+After the indexes refresh, check the dates on the destination's
+`/project/PACKAGE/` page, replacing `PACKAGE` with a migrated project name.
+These are the dates used by `uv --exclude-newer`. Filesystem modification times
+and cloud object `Last-Modified` values remain storage timestamps.
+
+## Resolve an ownership conflict
 
 A destination name already claimed from public PyPI cannot be converted in
 place. Delete every file in that package and stop writes to the destination.

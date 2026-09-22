@@ -355,6 +355,22 @@ ENDPOINTS: list = [
         bytes_range=(0, 100),
     ),
     _e(
+        name="upload-time-repair",
+        method="POST",
+        path="/files/{probe_pkg}/{probe_filename}/upload-time",
+        routes=(("POST", "/files/:package/:filename/upload-time"),),
+        auth=ADMIN,
+        body="upload_time",
+        mutates=True,
+        target="probe",
+        # Sidecar CAS/indexing like yank, plus the private origin, three
+        # suppression fences, and artifact-presence checks. The HTML Simple
+        # index contains no dates, so only the JSON index is rewritten.
+        cold_ops={"read": 11, "write": 4, "list": 2, "delete": 1},
+        warm_ops={"read": 11, "write": 4, "list": 2, "delete": 1},
+        bytes_range=(0, 100),
+    ),
+    _e(
         name="project-status-set",
         method="POST",
         path="/project/{probe_pkg}/status",
@@ -653,7 +669,12 @@ def wheel_upload_body(name: str, version: str) -> tuple:
         + b"\r\n"
     )
     parts.append(f"--{boundary}--\r\n".encode())
-    return b"".join(parts), f"multipart/form-data; boundary={boundary}", filename
+    return (
+        b"".join(parts),
+        f"multipart/form-data; boundary={boundary}",
+        filename,
+        hashlib.sha256(wheel).hexdigest(),
+    )
 
 
 def make_osv_zip() -> bytes:
@@ -684,6 +705,7 @@ class Ctx:
     versions: dict  # package name -> version of its first file
     probe_prefix: str = "mb-probe"
     probe_filenames: dict = field(default_factory=dict)  # i -> uploaded wheel filename
+    probe_hashes: dict = field(default_factory=dict)  # i -> uploaded wheel SHA-256
 
     def probe_pkg(self, i: int) -> str:
         return f"{self.probe_prefix}-{i}"
@@ -734,9 +756,13 @@ def build_request(ep: Endpoint, ctx: Ctx, i: int) -> tuple:
     if ep.body == "empty":
         return path, b"", None
     if ep.body == "wheel_upload":
-        body, ctype, wheel_name = wheel_upload_body(probe_pkg, "0.0.1")
+        body, ctype, wheel_name, digest = wheel_upload_body(probe_pkg, "0.0.1")
         ctx.probe_filenames[i] = wheel_name
+        ctx.probe_hashes[i] = digest
         return path, body, ctype
+    if ep.body == "upload_time":
+        body = {"sha256": ctx.probe_hashes[i], "upload-time": "2020-01-01T00:00:00Z"}
+        return path, json.dumps(body).encode(), "application/json"
     if ep.body == "status_doc":
         return path, json.dumps({"status": "quarantined"}).encode(), "application/json"
     if ep.body == "cursors_json":

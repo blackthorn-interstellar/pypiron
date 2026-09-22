@@ -225,7 +225,10 @@
 # admin-pass = "secret"                     # better: set PYPIRON_SYNC_ADMIN_PASS
 # Migrate the source into your private namespace instead of mirroring it (moving
 # off a private devpi/Artifactory/Nexus). Required with source-kind = "pypicloud".
+# Source upload dates are preserved when available; yank state is not.
 # as-private = false
+# One-off repair of old migration dates: pass --repair-upload-times (CLI/env
+# only), with --as-private and --dry-run to preview. Upgrade client and server.
 # concurrency = 4                           # parallel transfers within one package
 # package-concurrency = 8                   # packages synced in parallel
 # spool-dir = "/var/spool/pypiron-sync"     # download spool; real disk, not tmpfs, for multi-GB wheels

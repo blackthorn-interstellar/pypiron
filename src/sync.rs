@@ -144,11 +144,16 @@ pub struct SyncArgs {
     /// it. Each drained package lands `origin = private` — your own package, not a
     /// PyPI mirror — so it is served from your index and never falls through to an
     /// upstream. Use it to move packages off a private devpi/Artifactory/Nexus.
-    /// Timestamps and yank state are not preserved: migrated files carry the
-    /// migration date. When the destination reserves private names, every
+    /// Preserves source upload times when available, but not yank state.
+    /// When the destination reserves private names, every
     /// migrated name must be a reserved one.
     #[arg(long = "as-private", env = "PYPIRON_SYNC_AS_PRIVATE")]
     pub as_private: bool,
+
+    /// Repair upload dates on existing private files, after matching SHA-256.
+    /// Requires --as-private; copies no new files. Use --dry-run to preview.
+    #[arg(long, env = "PYPIRON_SYNC_REPAIR_UPLOAD_TIMES")]
+    pub repair_upload_times: bool,
 
     /// Ferry the advisory snapshot (the OSV malware/vulnerability feed) to the
     /// destination alongside the packages. Unset (the default): relay the source
@@ -821,6 +826,7 @@ struct Resolved {
     /// (`origin = private`) rather than mirror it. Suppresses the `mirror` form
     /// field and the mirror-only metadata, and skips yank reconcile / status relay.
     as_private: bool,
+    repair_upload_times: bool,
     /// The reserved private names: a mirror run refuses them before any network
     /// traffic (the server enforces it again), and a pypicloud migration expands
     /// its project work list from them.
@@ -921,6 +927,9 @@ impl Resolved {
         // Opt-in bools share one precedence shape: CLI/env can only turn them
         // on, so a file that opted in isn't force-disabled by a bare run.
         let as_private = args.as_private || sync.as_private.unwrap_or(false);
+        if args.repair_upload_times && !as_private {
+            bail!("--repair-upload-times requires --as-private");
+        }
         let allow_insecure_source =
             args.allow_insecure_source || sync.allow_insecure_source.unwrap_or(false);
 
@@ -1002,6 +1011,7 @@ impl Resolved {
             admin_pass: args.admin_pass.clone().or(sync.admin_pass),
             source_auth,
             as_private,
+            repair_upload_times: args.repair_upload_times,
             private,
             advisory_feed,
             src_explicit,
@@ -1561,6 +1571,9 @@ async fn load_cursors(client: &Client, resolved: &Resolved) -> Cursors {
 /// just means the next run re-fetches, so it must never fail an otherwise-good
 /// sync.
 async fn save_cursors(client: &Client, resolved: &Resolved, cursors: &Cursors) {
+    if resolved.repair_upload_times {
+        return;
+    }
     if resolved.dry_run {
         info!("[dry-run] would persist the sync cursor memo to the destination (no write)");
         return;
@@ -1598,6 +1611,9 @@ async fn save_cursors(client: &Client, resolved: &Resolved, cursors: &Cursors) {
 /// the run — the packages are the job; the feed is supply-chain metadata riding
 /// along. `""` (the opt-out) skips it entirely, issuing no requests.
 async fn push_advisory_feed(client: &Client, resolved: &Resolved) {
+    if resolved.repair_upload_times {
+        return;
+    }
     if resolved.source_kind == SourceKind::Pypicloud && resolved.advisory_feed.is_none() {
         debug!("advisory feed: pypicloud has no pypiron advisory endpoint; skipping relay");
         return;
@@ -2144,7 +2160,7 @@ async fn sync_one_package(
     // this is a dry run that wants the full picture). A 304 means nothing
     // changed upstream — no files to add, nothing to reconcile — so skip.
     let cfg_key = config_key(resolved, spec);
-    let if_none_match = if resolved.dry_run {
+    let if_none_match = if resolved.dry_run || resolved.repair_upload_times {
         None
     } else {
         prev_cursor
@@ -2250,6 +2266,17 @@ async fn sync_one_package(
              remove its mirrored files and run `pypiron origin release {pkg}` there — \
              or migrate under a different name."
         );
+    }
+
+    if resolved.repair_upload_times {
+        let local = local.as_ref().ok_or_else(|| {
+            anyhow!("timestamp repair requires the destination's /sync/local-index endpoint")
+        })?;
+        if dest_origin != Some(origin::OriginState::Private) {
+            bail!("timestamp repair requires a private destination package: {pkg}");
+        }
+        repair_upload_times(client, resolved, pkg, &selected, local).await?;
+        return Ok(PackageOutcome { new_cursor: None });
     }
 
     // The check above can only refuse a claim the destination stated in terms
@@ -2463,6 +2490,105 @@ async fn fetch_local_index(
     Ok(Some((resp.json().await?, dest_origin)))
 }
 
+/// Validate the whole package before applying any date repairs. Missing source
+/// hashes on old pypicloud records are computed from the source bytes, including
+/// during a dry run. No destination artifact is uploaded or replaced.
+async fn repair_upload_times(
+    client: &Client,
+    resolved: &Resolved,
+    pkg: &str,
+    selected: &[Selected],
+    local: &SimpleIndex,
+) -> Result<()> {
+    let local_files: HashMap<_, _> = local
+        .files
+        .iter()
+        .map(|f| (f.filename.as_str(), f))
+        .collect();
+    let mut repairs = Vec::new();
+    for selected in selected {
+        let file = &selected.file;
+        let Some(dest) = local_files.get(file.filename.as_str()) else {
+            info!(filename = %file.filename, "timestamp repair: absent on destination; skipping");
+            continue;
+        };
+        let Some(ts) = file.upload_time.as_deref() else {
+            warn!(filename = %file.filename, "source has no upload date; leaving destination unchanged");
+            continue;
+        };
+        let timestamp = OffsetDateTime::parse(ts, &Rfc3339)
+            .with_context(|| format!("invalid source upload date for {}", file.filename))?;
+        let digest = match file.sha256() {
+            Some(digest) => digest.to_string(),
+            None => {
+                download_verified(
+                    client,
+                    &resolved.guard,
+                    file,
+                    &resolved.spool_dir,
+                    resolved.source_auth.as_ref(),
+                    spool_ceiling(file, &resolved.mirror),
+                    true,
+                )
+                .await?
+                .sha256
+            }
+        };
+        if dest
+            .sha256()
+            .is_none_or(|sha| !sha.eq_ignore_ascii_case(&digest))
+        {
+            bail!(
+                "SHA-256 mismatch for {pkg}/{}; refusing timestamp repair",
+                file.filename
+            );
+        }
+        if dest
+            .upload_time
+            .as_deref()
+            .and_then(|ts| OffsetDateTime::parse(ts, &Rfc3339).ok())
+            == Some(timestamp)
+        {
+            info!(filename = %file.filename, "upload date already matches");
+            continue;
+        }
+        repairs.push((file, digest));
+    }
+    for (file, digest) in repairs {
+        let ts = file.upload_time.as_deref().unwrap_or_default();
+        if resolved.dry_run {
+            println!(
+                "[dry-run] would repair upload time {pkg}/{} -> {ts}",
+                file.filename
+            );
+            continue;
+        }
+        let mut url = reqwest::Url::parse(&resolved.dst_base)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("invalid destination URL"))?
+            .pop_if_empty()
+            .extend(["files", pkg, &file.filename, "upload-time"]);
+        let response = with_admin_auth(
+            client.post(url).json(&serde_json::json!({
+                "sha256": digest,
+                "upload-time": ts,
+            })),
+            resolved,
+        )
+        .send()
+        .await?;
+        if !response.status().is_success() {
+            return Err(http_body_error(
+                response,
+                &format!("timestamp repair failed for {}", file.filename),
+            )
+            .await);
+        }
+        info!(filename = %file.filename, upload_time = ts, "repaired upload date");
+    }
+    Ok(())
+}
+
 /// For each already-mirrored file whose yank state has drifted from upstream,
 /// drive the server's `/files/.../yank` endpoint. (Newly-uploaded files already
 /// carry the right yank from the upload; this catches drift on files already
@@ -2618,7 +2744,10 @@ fn select_from_index(
         // A standards source must declare the digest we verify. Pypicloud's old
         // records may predate stored hashes; migration computes one while
         // streaming, without weakening the ordinary mirror path.
-        if file.sha256().is_none() && resolved.source_kind == SourceKind::Simple {
+        if file.sha256().is_none()
+            && resolved.source_kind == SourceKind::Simple
+            && !resolved.repair_upload_times
+        {
             continue;
         }
         file.yanked = file.yanked.normalized();
@@ -2883,11 +3012,16 @@ async fn upload_via_http(
     if let Some(rp) = &s.file.requires_python {
         form = form.text("requires_python", rp.clone());
     }
-    // Mirror-only metadata. `--as-private` omits all of it: with no `mirror`
-    // field the server takes the private path (origin=private), and a non-mirror
-    // upload rejects `upload_time`/`yanked`/`yanked_reason` outright. Migrated
-    // files therefore carry the migration date, not the source's original time,
-    // and no yank state — the documented v1 trade.
+    // Historical dates require an explicit admin import. Ordinary uploads
+    // cannot backdate; migration keeps private origin and omits yank state.
+    if resolved.as_private {
+        form = form.text("migration", "true");
+    }
+    if let Some(ts) = &s.file.upload_time {
+        form = form.text("upload_time", ts.clone());
+    } else if resolved.as_private {
+        warn!(filename = %s.file.filename, "source has no upload date; using migration time");
+    }
     if !resolved.as_private {
         let (yanked, yanked_reason) = match &s.file.yanked {
             Yanked::Flag(f) => (*f, None),
@@ -2896,9 +3030,6 @@ async fn upload_via_http(
         form = form
             .text("mirror", "true")
             .text("yanked", if yanked { "true" } else { "false" });
-        if let Some(ts) = &s.file.upload_time {
-            form = form.text("upload_time", ts.clone());
-        }
         if let Some(reason) = &yanked_reason {
             if !reason.trim().is_empty() {
                 form = form.text("yanked_reason", reason.trim().to_string());
@@ -4084,6 +4215,7 @@ mod tests {
             admin_pass: None,
             source_auth: None,
             as_private: false,
+            repair_upload_times: false,
             private: PrivateNames::default(),
             advisory_feed: None,
             src_explicit: false,

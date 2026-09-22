@@ -51,7 +51,8 @@ use crate::auth::{
 };
 use crate::pages::{downloads_page, project_page, project_version_page, projects_page, root};
 use crate::publish::{
-    files_delete, legacy_upload, project_status_clear, project_status_set, yank_clear, yank_set,
+    files_delete, legacy_upload, project_status_clear, project_status_set, upload_time_set,
+    yank_clear, yank_set,
 };
 use crate::serve::{files_get, simple_pkg, simple_pkg_json, simple_root, simple_root_json};
 
@@ -1751,6 +1752,10 @@ async fn run_serve(
         .route(
             "/files/:package/:filename/yank",
             post(yank_set).delete(yank_clear),
+        )
+        .route(
+            "/files/:package/:filename/upload-time",
+            post(upload_time_set),
         )
         // PEP 792 project status (admin): the project-level twin of file yank.
         // Mirror-over-HTTP `sync` relays upstream status through it.

@@ -31,9 +31,11 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Wrong docs: `docs/for-agents.md` claimed every `--flag` has a `PYPIRON_FLAG` env var; false for `create-token` and not mechanical (`--from` is `PYPIRON_SYNC_FROM`), so an agent's guessed name is silently ignored. Row now points at the configuration reference. Lines unchanged.
 - 2026-09-22 Wrong docs: `docs/reference/configuration.md` said a failed storage delete returns `500`; the probe, intent marker, origin reads and the replication-gap record return `503`, the last after the file is already gone. Doc now names both codes and what a `404` retry means. Lines unchanged.
 - 2026-09-22 Bug: `pypiron healthcheck` (the Docker HEALTHCHECK) took its port only from `PYPIRON_BIND_ADDR`, so a container whose port was set in `pypiron.toml` was marked unhealthy forever; now falls back to the config's `[serve] bind-addr`, and the Compose recipe passes the file via `PYPIRON_CONFIG` so the probe can see it. Blackbox test red first.
+- 2026-09-22 Wrong docs: `docs/guides/multi-region.md` told operators with unprefixed private names to exclude them from the proxy, which neither reserves the name nor blocks a mirror claim, and delists the real private files; it now points at `private-patterns`, which shares the prefix's reservation matcher.
 
 ## Rejected
 
+- 2026-09-22 Delete the seven `#[cfg(test)]` compatibility shims in `origin.rs`/`buckets.rs`: they compile only under test, so the "−85 non-test lines" is a counting artifact; moving test helpers is reorganizing, not simplifying.
 - 2026-09-19 `--private-prefix` of 255 or 256 bytes now refuses startup because `{prefix}-*` exceeds the 256-byte pattern cap (a regression in c030441). Real, but no deployment has a 255-byte namespace; not worth a change until someone hits it. One-line fix if ever wanted: build the `-*` pattern in `PrivateNames::new` without re-parsing.
 
 ## Empty iterations
@@ -55,10 +57,3 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   "mutations by default; every request with `--access-log`". Recommendation: A —
   the sentence exists for fail2ban rules, and the rules are only useful if the
   guess-heavy path is in the log. Cost of choosing wrong: low either way.
-
-## Leads (not yet adjudicated)
-
-From a 2026-09-22 candidate sweep:
-
-- Simplify: seven `#[cfg(test)] pub(crate)` shims kept for callers that no longer exist — `origin.rs` `read_origin_versioned`, `demote_mirror_to_private`, `release_empty_claim`, `release_for_repurpose`; `buckets.rs` `verify_topology`, `verify_topology_index`, `migrate_topology`. Tests could call the observation/`*_with` APIs production uses; `release_empty_claim` tests exercise shim-only behavior. ~−85 non-test lines.
-- Wrong docs: `docs/guides/multi-region.md:129-130` says names with no shared prefix should be excluded from the proxy; predates `private-patterns`, which reserves them (see `docs/concepts.md`, `docs/security.md`).

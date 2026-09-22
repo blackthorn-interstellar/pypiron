@@ -126,8 +126,8 @@ publish the corrected artifact under a new filename.
 
 Set `private-prefix` on every node before enabling the public proxy. This keeps
 an unpublished private name from being claimed from PyPI on the other side of a
-partition. If your private names share no prefix, exclude each exact name from
-the proxy instead.
+partition. If your private names share no prefix, list them in the top-level
+`private-patterns` setting on every node instead.
 
 If a public download finishes after the package becomes private, its late
 mirror files are quarantined during queued replication repair. Private files

@@ -41,6 +41,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Rejected
 
+- 2026-09-22 Drop the 2.5 s sleep + `total == 0` in `test_head_and_partial_range_are_not_counted`: without it a wrongly counted HEAD flushed before the GET makes the later poll return 1 early and pass — the sleep is the guard.
 - 2026-09-22 Delete `provenance::parse_publisher` (4 lines, used only by its own unit tests): same test-helper shuffle as the rejected shims.
 - 2026-09-22 Accept a lowercase `basic` auth scheme (RFC 7235 says case-insensitive): no real client (pip, uv, twine, requests) sends it.
 - 2026-09-22 Close the intent on `delete_record`'s "no live origin claim" `500`: only reachable with an artifact that has no `.origin` claim, already a broken store; not a client path.
@@ -50,7 +51,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-0 consecutive.
+1 consecutive.
 
 ## Open questions
 

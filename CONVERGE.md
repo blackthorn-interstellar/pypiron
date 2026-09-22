@@ -52,7 +52,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-0 consecutive.
+1 consecutive.
 
 ## Open questions
 
@@ -88,6 +88,19 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   Recommendation: A — PEP 792 status is something pypiron relays for mirrored
   projects, and a public event must never reach a private name. Cost of choosing
   wrong: medium; public endpoint behavior, but a few lines either way.
+  Related, same endpoint, decide together: an admin quarantine of a package the
+  on-demand proxy serves from upstream is silently undone. Right after the
+  `POST`, downloads return `403`, but the proxy index keeps rendering upstream's
+  status, and within 60 s the next upstream listing rewrites the local status to
+  `active` (`reconcile_observed_status`, `src/proxy.rs`, keeps only
+  private-origin statuses) and downloads return `200` again. Reproduced on one
+  node. Options for this half: (A) document that proxied packages follow
+  upstream status and point at `exclude-packages` for blocking; (B) refuse the
+  write with `409` when the proxy serves the package, pointing at
+  `exclude-packages` (~6 lines + test + docs line). Recommendation: B — a freeze
+  that quietly un-freezes is the worst outcome; a loud refusal is fail-closed.
+  Together with A above, the rule becomes "the endpoint only relays status for
+  `sync`-mirrored projects".
 
 - **Should `serve` without a proxy apply `[mirror] exclude-packages`?** Today
   `serve` ignores `exclude-packages` unless `--proxy-upstream` is set, but the

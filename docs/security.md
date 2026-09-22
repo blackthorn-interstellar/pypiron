@@ -38,7 +38,8 @@ The default **dependency cooldown** hides a public release until it is seven
 days old. This gives maintainers, PyPI, and advisory services time to identify
 a compromised account, typosquat, or malicious release before your resolver
 can select it. The window moves forward continuously and applies to both proxy
-requests and `sync`.
+requests and `sync`. It needs the upstream's upload times: PyPI always sends
+them, but a file from an index that omits them is never held back.
 
 The measured benefit is substantial:
 

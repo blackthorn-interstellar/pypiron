@@ -35,6 +35,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Bug: a refused upload (duplicate-file `409`, lost first claim `403`/`409`) left its intent marker open, so the worker deferred the package's index rebuilds for the full 900 s intent grace — a CI retry's `409` hid the next release. Refusals now close the marker; the not-reserved `403` moved ahead of the marker and an unreachable owner-mismatch arm went. Blackbox test red first.
 - 2026-09-22 Wrong docs: `docs/reference/configuration.md` listed the CLI-only sync switches without `--repair-upload-times`, which `src/config.rs` refuses in the file.
 - 2026-09-22 Bug: with multiple buckets, a refused yank/unyank/upload-time repair (`404` missing file, `409` repair refusals, CAS exhaustion) left the intent marker `edit_sidecar` opens up front, stalling the package's index for the 900 s intent grace; refusals now close it. The multi-bucket fixture's 3 s reconcile masked it; new test uses the production interval and was red first.
+- 2026-09-22 Wrong docs: `docs/security.md` promised the seven-day cooldown for every proxy and `sync` fetch, but `src/sync.rs` keeps any file whose upstream gives no upload time; the page now says so.
 
 ## Rejected
 
@@ -48,6 +49,24 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 0 consecutive.
 
 ## Open questions
+
+- **Should `serve` without a proxy apply `[mirror] exclude-packages`?** Today
+  `serve` ignores `exclude-packages` unless `--proxy-upstream` is set, but the
+  offline `rebuild-index`/`verify-index` read it from the same `pypiron.toml`
+  whenever the store has no enforced-excludes stamp (a proxy-less `serve` never
+  writes one). So on a proxy-less server that shares its config with `sync`
+  (air-gapped setups), `rebuild-index` hides an excluded package, and the next
+  upload's rebuild lists it again in full. Reproduced. Options: (A) `serve`
+  always applies `exclude-packages` (resolve only the exclude list, so fetch-only
+  settings aren't validated offline), matching the maintenance commands and the
+  "removes matching names from package listings" sentence — but it would start
+  hiding matching packages, private ones included, on proxy-less servers that
+  never hid them; (B) `serve` without a proxy writes an empty stamp, so the
+  maintenance commands follow `serve` and `[mirror]` stays proxy/sync-only, as
+  `docs/reference/configuration.md` scopes it ("`serve --proxy-upstream` and
+  `pypiron sync` share `[mirror]`"). Recommendation: B — it keeps today's
+  serving behavior and the documented scope, and only stops the offline
+  commands from disagreeing. Cost of choosing wrong: low; either is a few lines.
 
 - **Should failed logins on reads be logged by default?** `docs/security.md`
   promises "the access log records failed logins as `401` and throttled requests

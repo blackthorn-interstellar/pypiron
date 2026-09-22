@@ -62,9 +62,7 @@ dev = [
     "packaging>=25.0",
     "pytest>=7",
     "pytest-xdist>=3",
-    "requests>=2.31",
     "ruff>=0.15",
-    "tenacity>=8.2",
     "twine",
     "uv",
 ]

@@ -29,12 +29,15 @@ pypiron sync \
   --from https://devpi.example.com/acme/prod/+simple \
   --to https://pypi.internal \
   --as-private \
+  --exclude-newer '' \
   --include-package acme-billing \
   --include-package acme-auth \
   --dry-run
 ```
 
-Check the package names, then repeat without `--dry-run`. Confirm one package:
+`--exclude-newer ''` includes uploads from the last seven days, which the
+default public-release cooldown would otherwise skip. Check the package names,
+then repeat without `--dry-run`. Confirm one package:
 
 ```bash
 uv pip install \
@@ -81,6 +84,7 @@ pypiron sync \
   --from https://packages.example.com \
   --source-kind pypicloud \
   --as-private \
+  --exclude-newer '' \
   --private-pattern 'acme-*' \
   --private-pattern 'internal-tool' \
   --to https://pypi.internal \
@@ -107,6 +111,7 @@ pypiron sync \
   --from https://packages.example.com \
   --source-kind pypicloud \
   --as-private \
+  --exclude-newer '' \
   --private-patterns-from private-packages.txt \
   --to https://pypi.internal \
   --dry-run

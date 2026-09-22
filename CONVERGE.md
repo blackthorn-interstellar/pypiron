@@ -37,6 +37,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Bug: with multiple buckets, a refused yank/unyank/upload-time repair (`404` missing file, `409` repair refusals, CAS exhaustion) left the intent marker `edit_sidecar` opens up front, stalling the package's index for the 900 s intent grace; refusals now close it. The multi-bucket fixture's 3 s reconcile masked it; new test uses the production interval and was red first.
 - 2026-09-22 Wrong docs: `docs/security.md` promised the seven-day cooldown for every proxy and `sync` fetch, but `src/sync.rs` keeps any file whose upstream gives no upload time; the page now says so.
 - 2026-09-22 Wrong docs (code comments): `PRE_DRAIN_PAUSE` and `AppState::shutting_down` said the drain fails `/health`; it fails `/ready` (`/health` stays 200 by design). Dropped the "malware enforcement lands in a later rung" note; `serve.rs` enforces it.
+- 2026-09-22 Wrong docs: `docs/guides/migrate.md`'s devpi/pypicloud `sync --as-private` commands kept the default seven-day cooldown, so a migration silently skipped every private file uploaded in the last week and still exited 0 (reproduced against a fake pypicloud). The commands now pass `--exclude-newer ''` and say why.
 
 ## Rejected
 
@@ -52,6 +53,19 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 0 consecutive.
 
 ## Open questions
+
+- **Should `sync --as-private` default to no cooldown?** The seven-day
+  `exclude-newer` hold exists to keep fresh *public* releases away from
+  resolvers, but `sync --as-private` (migrating your own packages off devpi,
+  pypicloud, Artifactory or Nexus) inherits it, so anyone not following the
+  migration guide verbatim silently leaves out the last week's private uploads
+  with a successful exit. The guide now passes `--exclude-newer ''`. Options:
+  (A) with `--as-private`, default the cooldown off unless set explicitly —
+  ~5-8 lines in `src/sync.rs` (`exclude_newer_input` and the cursor-hash input
+  `exclude_newer_raw` must change together) plus a blackbox test; (B) keep the
+  default and rely on the guide. Recommendation: A — the hold protects nothing
+  for packages you wrote, and the failure is silent. Cost of choosing wrong: low;
+  explicit `--exclude-newer` still wins either way.
 
 - **Should a PEP 792 project status be refused on a private package?**
   `POST /project/<pkg>/status` (`write_project_status`, `src/publish.rs`) never

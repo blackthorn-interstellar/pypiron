@@ -60,6 +60,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Rejected
 
+- 2026-09-22 Read `/stats` history from every stored bucket variant, not just configured bucket tags (after removing a bucket, its replicated day rollups stay stored but stop counting): real, but fixing it costs a LIST per stats query or a tag registry maintained by compaction, for best-effort counters after a rare topology change; re-adding the bucket restores the view.
 - 2026-09-22 Re-run the advisory gate after a buffered proxy fill (an advisory landing mid-download of a sub-16 MiB wheel is not applied to that one response): the window is a single download of seconds, far below the probe's 120 s cadence, so it is indistinguishable from the request arriving a moment earlier; no deterministic test is possible without timing an advisory into a throttled fetch.
 - 2026-09-22 Read-through to every reachable peer when a file is on neither pin (an upload a failed-over node landed on a third bucket during a partition): the window lasts only until the `_repl/` sweep delivers it, and probing every peer on each unfenced miss would make every genuine `404` cost cross-region GETs. The guide's "complete bucket" is the write home by design.
 - 2026-09-22 Map an upstream project-index `410 Gone` to not-found (`src/simple.rs` ~232): a cold `410` already answers `404`; only a previously cached listing is revived as stale, and PyPI answers removed projects with `404`, so only an exotic upstream hits it — not worth a 60 s-TTL test.
@@ -78,7 +79,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 
@@ -231,5 +232,4 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Leads (not yet adjudicated)
 
-- Bug?: `/stats/downloads` history is read only for currently configured bucket tags (`src/app.rs` ~778, `src/counters.rs` ~1034/~1174), so after evacuating to one bucket the replicated rollups a retired bucket wrote are invisible though still stored. Code-traced by Codex; DESIGN.md says replicated rollups preserve `/stats` history.
 - Flaky: `tests/test_crash_consistency.py::test_dual_leadership_overlap_triggers_cas_conflict` failed once in a full run on 2026-09-22 (loaded machine) and passed 3/3 alone right after.

@@ -41,6 +41,9 @@ class _PypicloudHandler(BaseHTTPRequestHandler):
             self.send_error(404, "not found")
             return
         status, content_type, body = route
+        if body is None:
+            self._stream_forever(status, content_type)
+            return
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         if self.server.etag:
@@ -49,6 +52,20 @@ class _PypicloudHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+        self.close_connection = True
+
+    def _stream_forever(self, status, content_type) -> None:
+        """An error page that never ends, for as long as the client reads."""
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        chunk = b"x" * 65536
+        try:
+            while True:
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         self.close_connection = True
 
 
@@ -94,7 +111,7 @@ def _record(package: str, wheel, *, uploader: Optional[str], with_hash: bool = T
     }
 
 
-def _pypicloud_sync(pypiron_bin, disk_server, source, *extra):
+def _pypicloud_sync(pypiron_bin, disk_server, source, *extra, **kwargs):
     return sync_to(
         pypiron_bin,
         disk_server,
@@ -107,6 +124,7 @@ def _pypicloud_sync(pypiron_bin, disk_server, source, *extra):
         "",
         *extra,
         source=source,
+        **kwargs,
     )
 
 
@@ -231,6 +249,22 @@ def test_pypicloud_mode_requires_private_ownership_rules(disk_server, pypiron_bi
     )
     assert rc != 0
     assert "explicit private work list" in out + err
+
+
+def test_endless_error_page_fails_fast_with_a_short_message(disk_server, pypiron_bin):
+    """A source that streams an unbounded error body must not be buffered whole:
+    the run fails promptly, quoting only a snippet."""
+    source_gen = _start_source({"/api/package/": (500, "text/plain", None)})
+    source_url, _source = next(source_gen)
+    try:
+        rc, out, err = _pypicloud_sync(
+            pypiron_bin, disk_server, source_url, "--private-pattern", "acme-*", timeout=60
+        )
+    finally:
+        next(source_gen, None)
+    assert rc != 0
+    assert "[500" in out + err
+    assert len(out + err) < 64 * 1024
 
 
 def test_pypicloud_mode_requires_as_private(disk_server, pypiron_bin):

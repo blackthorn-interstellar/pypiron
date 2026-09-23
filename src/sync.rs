@@ -79,8 +79,25 @@ fn with_admin_auth(req: reqwest::RequestBuilder, resolved: &Resolved) -> reqwest
 /// best-effort body snippet. `action` names what failed (e.g. `"upload failed"`).
 async fn http_body_error(resp: reqwest::Response, action: &str) -> anyhow::Error {
     let code = resp.status();
-    let body = resp.text().await.unwrap_or_else(|_| "<no body>".into());
+    let body = error_snippet(resp).await;
     anyhow!("{action} [{code}]: {body}")
+}
+
+/// The first few KiB of an error body, for a message. Never the whole body: a
+/// hostile or broken peer can stream an endless error page, and the client's
+/// per-read timeout would let it run forever.
+pub(crate) async fn error_snippet(resp: reqwest::Response) -> String {
+    const MAX: usize = 4096;
+    let mut buf = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while buf.len() < MAX {
+        let Some(Ok(chunk)) = stream.next().await else {
+            break;
+        };
+        buf.extend_from_slice(&chunk);
+    }
+    buf.truncate(MAX);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[derive(Debug, Clone, Args)]

@@ -83,7 +83,7 @@ fn with_auth(req: reqwest::RequestBuilder, auth: Option<&SourceAuth>) -> reqwest
 async fn parse_json<T: DeserializeOwned>(resp: Response, action: &str) -> Result<T> {
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_else(|_| "<no body>".into());
+        let body = super::error_snippet(resp).await;
         bail!("{action} [{status}]: {body}");
     }
     if resp

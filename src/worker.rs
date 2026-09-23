@@ -3568,11 +3568,12 @@ enum HtmlReconcile {
 
 /// Rewrite `simple/index.html` when it disagrees with `packages`. This is the
 /// slow path — it reads the body — and runs only when the stamp could not prove
-/// currency. Unlike [`put_if_changed`] it never *creates* the view: the HTML is
-/// always written before the canonical JSON, so an absent one means the bucket
-/// has published no global index at all. Materializing one here would be pure
-/// churn — and a view whose bytes move at quiescence is exactly what the
-/// simulator flags as a premature marker consumption.
+/// currency. An absent HTML with an empty name set means the bucket has
+/// published no global index at all, and materializing one would be pure churn
+/// (a view whose bytes move at quiescence is what the simulator flags as a
+/// premature marker consumption). But the HTML is always written before the
+/// canonical JSON, so an absent one beside a non-empty name set was deleted from
+/// under us, and the view is recreated from truth like any other.
 async fn reconcile_global_html(
     state: &AppState,
     storage: &dyn Storage,
@@ -3582,7 +3583,13 @@ async fn reconcile_global_html(
     let key = format!("{SIMPLE_PREFIX}index.html");
     let current = match storage.get_bytes(&key).await {
         Ok(bytes) => bytes,
-        Err(e) if is_not_found(&e) => return Ok(HtmlReconcile::Current),
+        Err(e) if is_not_found(&e) && packages.is_empty() => return Ok(HtmlReconcile::Current),
+        Err(e) if is_not_found(&e) => {
+            return match write_global_html_cas(state, storage, packages, &None).await? {
+                HtmlWrite::Wrote(etag) => Ok(HtmlReconcile::Rewrote(etag)),
+                HtmlWrite::Lost => Ok(HtmlReconcile::Lost),
+            };
+        }
         Err(e) => return Err(e),
     };
     if current == pep503_global_html(packages).into_bytes() {

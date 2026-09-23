@@ -26,6 +26,7 @@ from .helpers import (
     get_index_json,
     http_get,
     kill_process_tree,
+    make_wheel,
     sha256_file,
     upload_legacy,
     wait_for_file_in_index,
@@ -181,3 +182,30 @@ def test_sweep_heals_a_torn_global_index_pair_on_an_empty_store(pypiron_bin, tmp
         timeout=60,
     )
     assert cp.returncode == 0, f"torn global pair survived the sweep:\n{cp.stdout}{cp.stderr}"
+
+
+def test_rebuild_index_restores_a_deleted_global_html_index(pypiron_bin, tmp_path):
+    """Indexes are regenerable views: with the canonical JSON still present, a
+    deleted `simple/index.html` comes back from `rebuild-index` (it used to be
+    read as "never published" and left missing, so HTML clients got 404)."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    proc, base = _serve(pypiron_bin, data_dir)
+    try:
+        wheel = make_wheel("htmlgone", "1.0", tmp_path)
+        user, password = _DISK_SERVER_CREDS["full"]["args"][1::2][:2]
+        upload_legacy(f"{base}/legacy/", wheel, username=user, password=password)
+        wait_for_project_in_global(f"{base}/simple/", "htmlgone", timeout=15.0)
+    finally:
+        kill_process_tree(proc)
+    (data_dir / "simple" / "index.html").unlink()
+
+    cp = subprocess.run(
+        [str(pypiron_bin), "rebuild-index", "--data-dir", str(data_dir)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "PYPIRON_ADVISORY_FEED": ""},
+    )
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert "htmlgone" in _global_html_names(data_dir)

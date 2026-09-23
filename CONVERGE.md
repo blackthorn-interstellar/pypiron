@@ -52,6 +52,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Bug: `buckets migrate` refused to drop a bucket holding the sole copy of an artifact but ignored fences, so a delete (tombstone) or freeze acknowledged while the fleet ran on that bucket alone — the documented evacuation — was lost and the file resurrected from the survivors. Tombstone, frozen and mirror-quarantined keys now count as unique content. Unit test red first.
 - 2026-09-22 Bug: a deleted `simple/index.html` beside a populated `simple/index.json` was read as "never published" and left missing, even by `rebuild-index`, so HTML clients got `404` on `/simple/`. `reconcile_global_html` now recreates it when the name set is non-empty (the HTML is always written before the JSON, so that pair can only come from a deletion). Blackbox test red first; 3-minute vopr soak clean. A running disk server still trusts its in-memory "HTML current" memo until restart or `rebuild-index`.
 - 2026-09-22 Bug: a package whose `packages/<pkg>/` and `simple/<pkg>/` were both removed out of band stayed in both global indexes forever (`verify-index` red after every `rebuild-index`): the audit walks only listed truth/views, so the name produced no dead observation. A clean full audit now proves each unwalked global name absent and removes it through the existing re-proved path. Blackbox test red first; vopr soak clean.
+- 2026-09-22 Bug: `verify-chain --strict` read a committed file's sidecar sha as proof of presence, so an artifact deleted out of band beside its surviving `.meta.json` verified clean (exit 0), against the docs' "changed or missing content exits 1". A matching sidecar now also needs the artifact to exist; otherwise the tombstone/demotion check decides covered vs `vanished`. Unit test red first; reproduced and fixed on a real store.
 
 ## Rejected
 
@@ -70,7 +71,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 
@@ -196,3 +197,9 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   "mutations by default; every request with `--access-log`". Recommendation: A —
   the sentence exists for fail2ban rules, and the rules are only useful if the
   guess-heavy path is in the log. Cost of choosing wrong: low either way.
+
+## Leads (not yet adjudicated)
+
+From a 2026-09-22 Codex bug hunt (not yet verified):
+
+- Bug?: `src/transparency.rs` ~454/~791 — `replay` drops a package whose later checkpoint lists it with no files, so an appended link `{"demo":{}}` (no tombstone) erases the committed files from verification: `verify-chain --strict` checks nothing and exits 0. Needs a crafted chain link to reproduce.

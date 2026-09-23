@@ -854,7 +854,7 @@ pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
             Violation {
                 kind: "vanished",
                 package: pkg.clone(),
-                detail: format!("{filename}: committed sidecar is gone with no tombstone"),
+                detail: format!("{filename}: committed file is gone with no tombstone"),
             },
         ));
     }
@@ -976,23 +976,36 @@ async fn probe_presence(
     let base = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
     match storage.get_bytes(&format!("{base}{SIDECAR_SUFFIX}")).await {
         Ok(bytes) => match serde_json::from_slice::<Sidecar>(&bytes) {
-            Ok(sc) if sc.sha256 == expected_sha => Ok(Presence::Match),
+            // A matching sidecar is the sha of record, not proof the bytes are
+            // there: an artifact removed from beside it is a disappearance too.
+            Ok(sc) if sc.sha256 == expected_sha => {
+                if storage.head_exists(&base).await? {
+                    Ok(Presence::Match)
+                } else {
+                    absence(storage, &base).await
+                }
+            }
             Ok(sc) => Ok(Presence::WrongSha(sc.sha256)),
             Err(e) => Ok(Presence::Corrupt(e.to_string())),
         },
-        Err(e) if is_not_found(&e) => {
-            let (tombstoned, demoted) = futures::future::try_join(
-                storage.head_exists(&format!("{base}{TOMBSTONE_SUFFIX}")),
-                storage.head_exists(&format!("{base}{MIRROR_QUARANTINED_SUFFIX}")),
-            )
-            .await?;
-            if tombstoned || demoted {
-                Ok(Presence::Covered)
-            } else {
-                Ok(Presence::Absent)
-            }
-        }
+        Err(e) if is_not_found(&e) => absence(storage, &base).await,
         Err(e) => Err(e),
+    }
+}
+
+/// A committed record with no artifact: covered when a marker authorizes the
+/// disappearance (a tombstone, or the operator's own mirror demotion), else a
+/// vanish.
+async fn absence(storage: &dyn Storage, base: &str) -> Result<Presence> {
+    let (tombstoned, demoted) = futures::future::try_join(
+        storage.head_exists(&format!("{base}{TOMBSTONE_SUFFIX}")),
+        storage.head_exists(&format!("{base}{MIRROR_QUARANTINED_SUFFIX}")),
+    )
+    .await?;
+    if tombstoned || demoted {
+        Ok(Presence::Covered)
+    } else {
+        Ok(Presence::Absent)
     }
 }
 
@@ -1060,6 +1073,21 @@ mod tests {
             matches!(probe(&storage).await, Presence::Absent),
             "an unauthorized disappearance must stay a vanish"
         );
+    }
+
+    /// The sidecar is the sha of record, not proof the bytes are there: an
+    /// artifact deleted out of band beside a surviving sidecar is still a vanish
+    /// (`verify-chain` used to exit 0 over it).
+    #[tokio::test]
+    async fn a_surviving_sidecar_does_not_cover_a_missing_artifact() {
+        let storage = InMemStorage::default();
+        storage.insert(&sidecar_key(&akey()), sidecar_bytes(COMMITTED, "private"));
+        assert!(
+            matches!(probe(&storage).await, Presence::Absent),
+            "a committed artifact gone from under its sidecar must stay a vanish"
+        );
+        storage.insert(&akey(), b"bytes".to_vec());
+        assert!(matches!(probe(&storage).await, Presence::Match));
     }
 
     /// A completed supersede is NOT excused. The private body that replaced the

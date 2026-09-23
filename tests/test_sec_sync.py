@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Iterator, Optional, Tuple
 
@@ -18,6 +19,7 @@ import pytest
 from .helpers import (
     ACCEPT_PEP691,
     find_free_port,
+    get_index_json,
     http_request_auth,
     make_wheel,
     sha256_file,
@@ -284,6 +286,20 @@ def _sync_against_status(pypiron_bin, server, package, wheel, status):
     wait_for_file_in_index(server["simple"], package, wheel.name)
     _quarantine(server, package)
     assert _status_of(server, package)["status"] == "quarantined"
+    # Sync diffs against the dest listing, which lags the marker. Wait until
+    # the quarantine is visible there, or relay_status treats dest as already
+    # active and skips the clear.
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        try:
+            doc = get_index_json(server["simple"], package)
+            if doc.get("project-status", {}).get("status") == "quarantined":
+                break
+        except (RuntimeError, ConnectionError):
+            pass
+        time.sleep(0.2)
+    else:
+        raise TimeoutError(f"quarantine never reached the dest index for {package}")
 
     routes = {f"/simple/{package}/": (200, ACCEPT_PEP691, _listing(package, [], status))}
     source_gen = _start_source(routes)

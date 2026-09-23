@@ -71,9 +71,27 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
+
+- **Should the transparency chain stop treating a later checkpoint as
+  permission for a committed file to disappear?** `verify-chain` replays the
+  chain last-write-wins (`replay`, `src/transparency.rs`), so a newer link that
+  lists a package with fewer files — or `{"pkg": {}}` — silently drops the
+  earlier commitments from verification. Someone who holds storage credentials
+  can't rewrite locked links, but they can append one, then delete the files,
+  and `verify-chain --strict` passes. The design doc defines a violation as "a
+  committed filename vanished with no marker authorizing it". Options: (A)
+  verify every filename ever committed (keep its last sha across links), with
+  a tombstone or demotion fence as the only authorization — but single-bucket
+  mirror-cache deletes write no tombstone today, so each would start alarming
+  unless they gain a marker (a small eviction marker, ~20 lines + tests); (B)
+  keep the chain delta as the authorization and document that append rights
+  are enough to retire commitments. Recommendation: A with an eviction marker —
+  the chain exists to catch a storage-credential attacker, and append is the
+  one write Object Lock still allows. Cost of choosing wrong: medium; it changes
+  what `verify-chain` flags on existing stores.
 
 - **Should `sync` fail when the source and destination hold different bytes
   under the same filename?** `sync` skips any file whose *filename* the
@@ -197,9 +215,3 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   "mutations by default; every request with `--access-log`". Recommendation: A —
   the sentence exists for fail2ban rules, and the rules are only useful if the
   guess-heavy path is in the log. Cost of choosing wrong: low either way.
-
-## Leads (not yet adjudicated)
-
-From a 2026-09-22 Codex bug hunt (not yet verified):
-
-- Bug?: `src/transparency.rs` ~454/~791 — `replay` drops a package whose later checkpoint lists it with no files, so an appended link `{"demo":{}}` (no tombstone) erases the committed files from verification: `verify-chain --strict` checks nothing and exits 0. Needs a crafted chain link to reproduce.

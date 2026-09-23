@@ -26,7 +26,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use tracing::warn;
@@ -513,15 +513,36 @@ pub async fn release_observed_for_repurpose(
     let package_prefix = format!("{PACKAGES_PREFIX}{pkg}/");
     let dirty_prefix = format!("{DIRTY_PREFIX}{pkg}");
     let claim_key = origin_key(pkg);
-    let appeared = storage
-        .list_dir_entries(&package_prefix)
-        .await?
-        .iter()
-        .any(|entry| entry.key != claim_key)
-        || storage.list_all(&dirty_prefix).await?.iter().any(|entry| {
-            entry.key == dirty_prefix || entry.key.starts_with(&format!("{dirty_prefix}!"))
-        })
-        || has_pending_replication_notes(storage, pkg).await?;
+    let appeared = async {
+        Ok::<_, anyhow::Error>(
+            storage
+                .list_dir_entries(&package_prefix)
+                .await?
+                .iter()
+                .any(|entry| entry.key != claim_key)
+                || storage.list_all(&dirty_prefix).await?.iter().any(|entry| {
+                    entry.key == dirty_prefix || entry.key.starts_with(&format!("{dirty_prefix}!"))
+                })
+                || has_pending_replication_notes(storage, pkg).await?,
+        )
+    }
+    .await;
+    // A verification that could not run is not a clean one: restore this
+    // bucket before failing, because the caller rolls back only the buckets
+    // whose release returned Ok.
+    let appeared = match appeared {
+        Ok(appeared) => appeared,
+        Err(error) => {
+            claim_origin(
+                storage,
+                pkg,
+                ClaimRequest::new(current.state.as_str(), Some(&unclaimed)),
+            )
+            .await
+            .context("restoring the origin claim after a failed release check")?;
+            return Err(error.context("checking the package after releasing its origin"));
+        }
+    };
     if appeared {
         let restored = claim_origin(
             storage,
@@ -913,6 +934,28 @@ mod tests {
                 .unwrap()
                 .state,
             OriginState::Unclaimed
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_release_restores_a_bucket_whose_post_cas_check_fails() {
+        // The caller only rolls back buckets whose release returned Ok, so a
+        // bucket that wrote `unclaimed` and then failed its own verification
+        // must restore itself, or it stays released while the command fails.
+        let s = store();
+        claim_origin(s.as_ref(), "pkg", PRIVATE).await.unwrap();
+        let original = releasable_for_repurpose(s.as_ref(), "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        s.fail_lists_after_cas(&origin_key("pkg"), &format!("{DIRTY_PREFIX}pkg"));
+        assert!(release_observed_for_repurpose(s.as_ref(), "pkg", &original)
+            .await
+            .is_err());
+        s.heal_lists();
+        assert_eq!(
+            read_origin(s.as_ref(), "pkg").await.unwrap().as_deref(),
+            Some(PRIVATE)
         );
     }
 

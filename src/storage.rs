@@ -4532,6 +4532,10 @@ pub mod test_support {
         /// listing, and code that reads "I saw nothing there" out of "I could
         /// not look" decides on a set it never observed.
         unlistable: Mutex<Option<String>>,
+        /// `(key, prefix)`: once a conditional write of `key` lands, listings of
+        /// `prefix` start failing — an outage that strikes between a CAS and
+        /// the verification that follows it.
+        unlistable_after_cas: Mutex<Option<(String, String)>>,
         /// One key whose *mutations* fail until [`InMemStorage::heal_writes`].
         /// The mirror of `unreadable`, and its own hazard class: a write that
         /// errors AFTER the caller has already moved in-memory state or other
@@ -4589,6 +4593,12 @@ pub mod test_support {
         }
         pub fn heal_lists(&self) {
             *self.unlistable.lock().unwrap() = None;
+        }
+        /// Make listings of `prefix` fail from the moment a conditional write of
+        /// `key` succeeds, until [`InMemStorage::heal_lists`].
+        pub fn fail_lists_after_cas(&self, key: &str, prefix: &str) {
+            *self.unlistable_after_cas.lock().unwrap() =
+                Some((key.to_string(), prefix.to_string()));
         }
         fn unlistable(&self, prefix: &str) -> bool {
             self.unlistable
@@ -4819,6 +4829,10 @@ pub mod test_support {
                     let new_token = cas_token(&bytes);
                     map.insert(key.to_string(), bytes);
                     self.writes.lock().unwrap().push(key.to_string());
+                    let mut armed = self.unlistable_after_cas.lock().unwrap();
+                    if armed.as_ref().is_some_and(|(k, _)| k == key) {
+                        *self.unlistable.lock().unwrap() = armed.take().map(|(_, prefix)| prefix);
+                    }
                     Ok(Some(new_token))
                 }
                 _ => Ok(None),

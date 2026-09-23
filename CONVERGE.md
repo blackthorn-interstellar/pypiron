@@ -48,6 +48,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Bug: counter compaction summarized a day as soon as any of its shards froze, even when another closeable shard's read or freeze failed that pass; the local summary healed next pass, but summaries replicate copy-if-absent, so peers kept the undercounted day forever. A day with an unfrozen closeable shard is now left unsummarized until a pass freezes them all. Unit test red first.
 - 2026-09-22 Bug: an upload's `name` field overrode the wheel filename's project without comparison, so `other-1.0-py3-none-any.whl` sent with `name=demo` was stored and listed under `/simple/demo/` (PyPI refuses this). Non-mirror wheel uploads whose filename project differs from `name` now get `400`; mirror uploads and legacy formats keep the field's word. Blackbox test red first; `test_copy_escaped_keys` moved its escaped bytes into the platform tag.
 - 2026-09-22 Bug (security, fail-open): a node with no admin/uploader credential is documented read-only, but `is_admin`/`is_uploader` honored admin and uploader `__token__`s signed with its key — including ones minted on a write-enabled peer sharing the signing key — so a "read-only" replica accepted uploads, yanks and deletes. Token roles now count only for write roles this node has enabled. Blackbox test (two nodes, one key) red first.
+- 2026-09-22 Bug: `origin release` — a bucket whose post-CAS verification listing failed after it wrote `unclaimed` returned `Err` without restoring itself, and the CLI rolls back only buckets that returned `Ok`, so it stayed released while the command reported failure. The release now restores its own claim before failing. Unit test (new `InMemStorage::fail_lists_after_cas` hook) red first.
 
 ## Rejected
 
@@ -197,4 +198,3 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 From a 2026-09-22 Codex bug hunt (not yet verified):
 
 - Bug?: `buckets migrate` removing a bucket skips tombstones (`src/replicate.rs` ~3172 only checks `sidecar::is_artifact`), so a delete acknowledged while that bucket ran alone (single-bucket fan-out records no repair note, ~2465) is lost and the file resurrects from the survivors.
-- Bug?: `origin release` (`src/origin.rs` ~516, `src/cli.rs` ~425) — if a bucket's post-CAS listing errors after it wrote `unclaimed`, that bucket is not in the rollback list, so it stays released while the command reports failure.

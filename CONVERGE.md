@@ -57,6 +57,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Bug: download read-through fell back to the write pin whenever the read pin said "not visible", including when the read pin held a tombstone or freeze — so a delete a failed-over node landed on the region bucket, not yet replicated to the write home, was served (200, deleted bytes) by a node that had just seen the tombstone. Read-pin fences now end the request; only absence reads through. Blackbox test (read-affinity pair) red first.
 - 2026-09-22 Bug (security, fail-open): the malware/quarantine byte gate skipped any name matching `--private-prefix`/`--private-pattern` before reading the actual owner, so reserving a name that already held cached public (mirror-claimed) bytes made a blocked wheel download again (200). The origin claim alone now exempts a package. Blackbox test (restart with the name reserved) red first.
 - 2026-09-22 Bug: with `--malware-block=false` (documented: keep the audit, drop the refusal) the `/audit` report, `/audit.json` and the project page still marked `MAL-*` matches `blocked` while the byte gate served them; `blocked` is documented as "whether the byte gate would 403 this file". Both builders now take the blocking toggle; quarantine still blocks. Unit tests extended.
+- 2026-09-22 Bug: `pypiron config init` shows the disk default as `data-dir = "~/.pypiron/packages"`, but a config-file `~` is never shell-expanded, so uncommenting that line made `serve`/`rebuild-index`/`verify-index` use a literal `./~/.pypiron/packages` under the working directory — packages seemed to vanish and `verify-index` passed an empty store. A leading `~`/`~/` in the data dir now expands to `$HOME`. Blackbox test red first; 10-minute vopr soak at `4d06750` clean (~194k seeds).
 
 ## Rejected
 
@@ -79,7 +80,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-2 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 
@@ -232,4 +233,5 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Leads (not yet adjudicated)
 
+- Minor: `POST /project/<pkg>/status` on a package that does not exist returns 200 and leaves a stray `packages/<pkg>/.project-status.json`, which `verify-index` then counts as a package.
 - Flaky: `tests/test_crash_consistency.py::test_dual_leadership_overlap_triggers_cas_conflict` failed once in a full run on 2026-09-22 (loaded machine) and passed 3/3 alone right after.

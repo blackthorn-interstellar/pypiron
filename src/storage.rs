@@ -474,13 +474,18 @@ impl StorageArgs {
             .unwrap_or_default()
     }
 
-    /// The disk data directory actually used, applying the default.
+    /// The disk data directory actually used, applying the default. A leading
+    /// `~/` is expanded: the generated `pypiron.toml` shows the default as
+    /// `~/.pypiron/packages`, and no shell expands it inside a config file.
     fn resolved_data_dir(&self) -> String {
-        self.data_dir.clone().unwrap_or_else(|| {
-            std::env::var("HOME")
-                .map(|home| format!("{home}/.pypiron/packages"))
-                .unwrap_or_else(|_| "./.pypiron/packages".to_string())
-        })
+        let home = std::env::var("HOME").ok();
+        match &self.data_dir {
+            Some(dir) => expand_home(dir, home.as_deref()),
+            None => home.map_or_else(
+                || "./.pypiron/packages".to_string(),
+                |home| format!("{home}/.pypiron/packages"),
+            ),
+        }
     }
 
     /// The storage prefix in the normalized form the backends want, if set.
@@ -3512,9 +3517,34 @@ impl Storage for FaultInjectStorage {
     }
 }
 
+/// `~` or a leading `~/` → `$HOME`; anything else unchanged (and unchanged
+/// when `HOME` is unset, rather than guessing).
+fn expand_home(path: &str, home: Option<&str>) -> String {
+    match (path.strip_prefix('~'), home) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+            format!("{home}{rest}")
+        }
+        _ => path.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_config_file_tilde_data_dir_expands_to_home() {
+        // `pypiron config init` shows the default as `~/.pypiron/packages`; an
+        // uncommented copy must not create a literal `./~` store.
+        assert_eq!(
+            expand_home("~/.pypiron/packages", Some("/h")),
+            "/h/.pypiron/packages"
+        );
+        assert_eq!(expand_home("~", Some("/h")), "/h");
+        assert_eq!(expand_home("~other/x", Some("/h")), "~other/x");
+        assert_eq!(expand_home("/abs/x", Some("/h")), "/abs/x");
+        assert_eq!(expand_home("~/x", None), "~/x");
+    }
 
     #[test]
     fn s3_copy_checksum_reads_a_plain_etag_as_content_md5() {

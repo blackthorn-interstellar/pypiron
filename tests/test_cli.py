@@ -317,3 +317,24 @@ def test_help_still_names_credential_env_vars(pypiron_bin: Path, monkeypatch):
         out = cp.stdout + cp.stderr
         for var in variables:
             assert var in out, f"`pypiron {' '.join(path)} --help` lost {var}:\n{out}"
+
+
+def test_config_file_tilde_data_dir_means_home(pypiron_bin: Path, tmp_path: Path):
+    """`config init` shows the default as `data-dir = "~/.pypiron/packages"`;
+    uncommenting it must use $HOME, not create a literal `./~` store in the
+    working directory (no shell expands `~` inside a config file)."""
+    home, work = tmp_path / "home", tmp_path / "work"
+    home.mkdir()
+    work.mkdir()
+    (work / "pypiron.toml").write_text('[serve]\ndata-dir = "~/store"\n')
+    cp = subprocess.run(
+        [str(pypiron_bin), "rebuild-index"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=work,
+        env={**os.environ, "HOME": str(home), "PYPIRON_ADVISORY_FEED": ""},
+    )
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert (home / "store").is_dir()
+    assert not (work / "~").exists()

@@ -126,3 +126,19 @@ def test_filename_past_the_servable_cap_is_rejected(disk_server, tmp_path):
     assert code == 400
     # Named reason, so the test can't pass on some unrelated 400.
     assert b"Invalid filename" in body
+
+
+def test_wheel_under_another_projects_name_is_refused(disk_server, tmp_path):
+    """The form's `name` must match the wheel's filename project (as PyPI
+    enforces); otherwise `other-1.0` would be stored and listed under `demo`."""
+    wheel = make_wheel("otherpkg", "1.0", tmp_path)
+    upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+        fields={"name": "demopkg", "version": "1.0"},
+        expect_status=400,
+    )
+    status, _, _ = http_get(f"{disk_server['simple']}demopkg/")
+    assert status == 404

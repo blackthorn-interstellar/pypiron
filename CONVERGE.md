@@ -46,9 +46,11 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Delete: fixture `s3_server_multi_reconcile_cost` lost its only test in `3ecef9a`; removed (−16 test lines).
 - 2026-09-22 Bug: the advisory leader remembered the feed's HTTP ETag before validating and persisting the new snapshot, so one failed storage write turned every later poll into a `304` and the delivered advisory never reached the byte gate until the feed changed. The ETag is now kept only once the bytes are persisted or already loaded. Blackbox test (read-only `_advisories/` for one poll) red first.
 - 2026-09-22 Bug: counter compaction summarized a day as soon as any of its shards froze, even when another closeable shard's read or freeze failed that pass; the local summary healed next pass, but summaries replicate copy-if-absent, so peers kept the undercounted day forever. A day with an unfrozen closeable shard is now left unsummarized until a pass freezes them all. Unit test red first.
+- 2026-09-22 Bug: an upload's `name` field overrode the wheel filename's project without comparison, so `other-1.0-py3-none-any.whl` sent with `name=demo` was stored and listed under `/simple/demo/` (PyPI refuses this). Non-mirror wheel uploads whose filename project differs from `name` now get `400`; mirror uploads and legacy formats keep the field's word. Blackbox test red first; `test_copy_escaped_keys` moved its escaped bytes into the platform tag.
 
 ## Rejected
 
+- 2026-09-22 Verify `md5_digest`/`blake2_256_digest` on upload like PyPI: every real client also sends `sha256_digest`, which is verified; a second weaker digest adds nothing. Also `fold_version` treating `1!2` as `1.2`: needs a hand-crafted epoch mismatch no build tool emits.
 - 2026-09-22 Make `sync` fail when the destination answers `409` for a filename an admin deleted there: the delete deliberately bars the filename (PyPI semantics); failing would make every later run of that package error forever.
 - 2026-09-22 Trim `make check` time: the only sizable test cost is the two model checkers (`tests/model_event_protocol.rs` 8.7 s, `tests/model_replication.rs` 6.9 s of ~16 s `cargo test`); they guard the replication protocol on every change, so the time is the point.
 - 2026-09-22 Strip the `integration`/`chaos` marker labels (nothing selects on them) and the `compat(client, feature)` arguments: 77 lines of churn for no gain; they still document coverage.
@@ -62,7 +64,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 

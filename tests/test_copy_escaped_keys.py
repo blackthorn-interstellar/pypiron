@@ -1,8 +1,8 @@
 """Server-side replication copy of artifacts whose names the store escapes.
 
 object_store percent-escapes ``~ % # [ ] { } ^ | < > " * ? \\`` and every
-non-ASCII byte when it writes a key, so the wheel ``a~b-1.0-py3-none-any.whl``
-is really stored under ``.../a%7Eb-1.0-py3-none-any.whl``. Uploads accept every
+non-ASCII byte when it writes a key, so the wheel ``escapedtilde-1.0-py3-none-a~b.whl``
+is really stored under ``.../escapedtilde-1.0-py3-none-a%7Eb.whl``. Uploads accept every
 one of those bytes in a filename (the *package* name is always normalized, so
 this is the only place they can appear).
 
@@ -47,9 +47,9 @@ pytestmark = [pytest.mark.integration, pytest.mark.s3]
 #: silently addresses the wrong object), `#` (also a URL fragment delimiter), and
 #: a non-ASCII run (escaped as multiple bytes).
 CASES = [
-    ("escapedtilde", "wheel", "a~b-1.0-py3-none-any.whl"),
+    ("escapedtilde", "wheel", "escapedtilde-1.0-py3-none-a~b.whl"),
     ("escapedhash", "sdist", "weird#name-1.0.tar.gz"),
-    ("escapedutf8", "wheel", "café-1.0-py3-none-any.whl"),
+    ("escapedutf8", "wheel", "escapedutf8-1.0-py3-none-café.whl"),
 ]
 
 #: Companion keys pypiron writes beside an artifact (`sidecar::is_artifact`).

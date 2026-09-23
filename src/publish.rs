@@ -252,6 +252,19 @@ pub(crate) async fn legacy_upload(
         Some(name) => normalize_pkg_name(name),
         None => infer_package_from_filename(&filename),
     };
+    // A wheel's filename names its project unambiguously (PEP 427); refuse one
+    // filed under another project's name, as PyPI does. Other formats' names are
+    // too loose historically to judge, and mirror uploads relay whatever the
+    // upstream already published, so both keep the field's word.
+    if filename.ends_with(".whl")
+        && fields.get("mirror").map(String::as_str) != Some("true")
+        && infer_package_from_filename(&filename) != pkg_norm
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("wheel '{filename}' does not belong to project '{pkg_norm}'"),
+        ));
+    }
     // Normalized names are storage path segments; anything else is hostile.
     if !is_normalized(&pkg_norm) {
         return Err((StatusCode::BAD_REQUEST, "Invalid package name".into()));

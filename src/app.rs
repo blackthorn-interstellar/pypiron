@@ -916,7 +916,12 @@ pub async fn cli_main() -> Result<()> {
 
     let config_path = cli.config.clone();
     match cli.command {
-        Some(Commands::Sync(args)) => sync::run_sync(*args, config_path).await,
+        Some(Commands::Sync(args)) => {
+            let sync_matches = matches
+                .subcommand_matches("sync")
+                .expect("sync subcommand matched");
+            sync::run_sync(*args, config_path, sync_matches).await
+        }
         Some(Commands::VerifyIndex(mut args)) => {
             apply_maintenance_config(
                 &mut args.storage,
@@ -1219,7 +1224,8 @@ async fn run_serve(
     // top-level `private-prefix` + shared `[mirror]` reach the server here. The
     // mirror selection itself is resolved through sync's one shared path, so the proxy and
     // a sync run can never drift.
-    let file = config::load(config_path.as_deref())?;
+    let mut file = config::load(config_path.as_deref())?;
+    crate::sync::drop_file_bools_set_by_cli(serve_matches, &mut file.mirror);
     // Capture whether the advisory knobs were set explicitly BEFORE the merge
     // folds file/default values in — startup posture is fail-closed only for an
     // explicit request (AC7), never for the always-on defaults.

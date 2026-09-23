@@ -1971,8 +1971,44 @@ fn fmt_count(n: u64) -> String {
     out
 }
 
-pub async fn run_sync(args: SyncArgs, config_path: Option<PathBuf>) -> Result<()> {
-    let cfg = config::load(config_path.as_deref())?;
+/// Precedence is CLI > env > file for every knob, but the opt-in bools merge
+/// with OR so a run without the flag can't force-disable a file's opt-in. That
+/// also reads an explicit `PYPIRON_X=false` as "unset", so drop the file's
+/// value for every `[mirror]` bool the CLI or environment set before merging.
+pub(crate) fn drop_file_bools_set_by_cli(
+    matches: &clap::ArgMatches,
+    mirror: &mut config::UpstreamConfig,
+) {
+    for (id, slot) in [
+        ("exclude_dev", &mut mirror.exclude_dev),
+        ("exclude_windows", &mut mirror.exclude_windows),
+        ("exclude_prereleases", &mut mirror.exclude_prereleases),
+        ("include_yanked", &mut mirror.include_yanked),
+    ] {
+        if crate::cli::arg_from_cli_or_env(matches, id) {
+            *slot = None;
+        }
+    }
+}
+
+pub async fn run_sync(
+    args: SyncArgs,
+    config_path: Option<PathBuf>,
+    matches: &clap::ArgMatches,
+) -> Result<()> {
+    let mut cfg = config::load(config_path.as_deref())?;
+    drop_file_bools_set_by_cli(matches, &mut cfg.mirror);
+    let set = |id| crate::cli::arg_from_cli_or_env(matches, id);
+    let sync = &mut cfg.sync;
+    for (id, slot) in [
+        ("as_private", &mut sync.as_private),
+        ("allow_insecure_source", &mut sync.allow_insecure_source),
+        ("allow_legacy_versions", &mut sync.allow_legacy_versions),
+    ] {
+        if set(id) {
+            *slot = None;
+        }
+    }
     let mut resolved = Resolved::merge(&args, cfg).await?;
 
     // Extra upstream trust roots (a corporate MITM CA presented on the source

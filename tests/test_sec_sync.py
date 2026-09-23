@@ -201,6 +201,31 @@ def test_allow_insecure_source_from_config_file(disk_server, pypiron_bin, tmp_pa
         source_gen.close()
 
 
+def test_env_false_overrides_a_file_opt_in(disk_server, pypiron_bin, tmp_path):
+    """Precedence is CLI > env > file: `PYPIRON_ALLOW_INSECURE_SOURCE=false`
+    must win over `allow-insecure-source = true` in the file, not be OR-ed away
+    by it — or an operator can't turn the plaintext credential back off."""
+    config = tmp_path / "pypiron.toml"
+    config.write_text("[sync]\nallow-insecure-source = true\n")
+    rc, out, err = sync_to(
+        pypiron_bin,
+        disk_server,
+        "--include-package",
+        "anypkg",
+        "--config",
+        str(config),
+        "--source-user",
+        "reader",
+        "--source-pass",
+        "secret",
+        source="http://127.0.0.1:9/simple",
+        env={"PYPIRON_ALLOW_INSECURE_SOURCE": "false"},
+    )
+    combined = out + err
+    assert rc != 0, combined
+    assert "plaintext http://" in combined, combined
+
+
 def test_source_credential_stays_on_the_source_origin(disk_server, pypiron_bin, tmp_path):
     """The listing points the artifact at the same host on another port — a
     different service. The credential is scoped to the source's whole origin

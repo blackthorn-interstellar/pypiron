@@ -56,6 +56,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Rejected
 
+- 2026-09-22 Map an upstream project-index `410 Gone` to not-found (`src/simple.rs` ~232): a cold `410` already answers `404`; only a previously cached listing is revived as stale, and PyPI answers removed projects with `404`, so only an exotic upstream hits it — not worth a 60 s-TTL test.
 - 2026-09-22 "An audit rebuild racing a yank records a fingerprint over stale views, freezing the pre-yank index" (`src/worker.rs` audit, single bucket where no rebuild intent fences it): plausible by reading, but unreproduced, and the vopr — which runs the audit concurrently with the tick and counts `concurrent-race` view repairs — reported 0 across ~280k seeds today. Revisit only with a failing seed.
 - 2026-09-22 Verify `md5_digest`/`blake2_256_digest` on upload like PyPI: every real client also sends `sha256_digest`, which is verified; a second weaker digest adds nothing. Also `fold_version` treating `1!2` as `1.2`: needs a hand-crafted epoch mismatch no build tool emits.
 - 2026-09-22 Make `sync` fail when the destination answers `409` for a filename an admin deleted there: the delete deliberately bars the filename (PyPI semantics); failing would make every later run of that package error forever.
@@ -71,7 +72,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+2 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 
@@ -183,6 +184,12 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   that quietly un-freezes is the worst outcome; a loud refusal is fail-closed.
   Together with A above, the rule becomes "the endpoint only relays status for
   `sync`-mirrored projects".
+  Same family, same decision: an admin *yank* of a proxy-cached file
+  (`POST /files/<pkg>/<file>/yank` on a package the on-demand proxy serves)
+  returns `200` and writes the sidecar, but the proxy index renders upstream's
+  yank state (`src/proxy.rs` ~861), so the yank never shows. Code-traced by
+  Codex, not reproduced. Refusing it (`409`, like status under A) or overlaying
+  local yanks onto the upstream listing are the two ways out.
 
 - **Should `serve` without a proxy apply `[mirror] exclude-packages`?** Today
   `serve` ignores `exclude-packages` unless `--proxy-upstream` is set, but the

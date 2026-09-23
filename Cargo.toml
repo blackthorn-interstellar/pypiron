@@ -18,7 +18,7 @@ axum = { version = "0.7", features = ["macros", "json", "multipart"] }
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
-flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 futures = "0.3"
 http = "1"
 # Already in the tree via hyper-util; used directly for --proxy-allow-cidr.
@@ -84,6 +84,13 @@ test = true
 
 [target.'cfg(not(any(target_arch = "s390x", target_arch = "powerpc64")))'.dependencies]
 mimalloc = "0.1.52"
+
+# sha2 0.10 uses the ARMv8 SHA instructions only with `asm`; without it every
+# upload/fill/index hash runs in software, ~5x slower on Graviton and Apple
+# silicon. x86 gets SHA-NI either way. Windows is left out: sha2-asm's build
+# script doesn't target MSVC.
+[target.'cfg(all(target_arch = "aarch64", not(windows)))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
 
 # Policy as data: these apply to local `cargo clippy` and rust-analyzer, not just
 # the CI `-D warnings` gate. Kept deliberately small — no clippy::pedantic.

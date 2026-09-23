@@ -2,17 +2,17 @@
   "endpoints": {
     "advisories-feed-get": {
       "bytes": 0,
-      "cold_ms": 0.622,
+      "cold_ms": 0.337,
       "cold_ops": {
         "list": 1
       },
-      "rss_mb": 13.5,
-      "startup_secs": 0.031,
+      "rss_mb": 14.7,
+      "startup_secs": 0.022,
       "warm": {
-        "max_ms": 0.631,
+        "max_ms": 0.365,
         "n": 100,
-        "p50_ms": 0.318,
-        "p95_ms": 0.433
+        "p50_ms": 0.2,
+        "p95_ms": 0.313
       },
       "warm_ops": {
         "list": 1
@@ -20,33 +20,35 @@
     },
     "advisories-feed-put": {
       "cold_ops": {
-        "list": 1,
+        "list": 2,
+        "read": 2,
         "write": 1
       },
       "warm": {
-        "max_ms": 0.892,
+        "max_ms": 0.631,
         "n": 5,
-        "p50_ms": 0.695,
-        "p95_ms": 0.892
+        "p50_ms": 0.465,
+        "p95_ms": 0.631
       },
       "warm_ops": {
-        "list": 1,
+        "list": 2,
+        "read": 1,
         "write": 1
       }
     },
     "artifact-download": {
       "bytes": 0,
-      "cold_ms": 0.714,
+      "cold_ms": 0.34,
       "cold_ops": {
-        "read": 1
+        "read": 3
       },
-      "rss_mb": 13.5,
-      "startup_secs": 0.029,
+      "rss_mb": 14.8,
+      "startup_secs": 0.025,
       "warm": {
-        "max_ms": 0.478,
+        "max_ms": 0.454,
         "n": 100,
-        "p50_ms": 0.288,
-        "p95_ms": 0.407
+        "p50_ms": 0.208,
+        "p95_ms": 0.392
       },
       "warm_ops": {
         "read": 1
@@ -54,82 +56,82 @@
     },
     "audit-json": {
       "bytes": 88,
-      "cold_ms": 0.343,
+      "cold_ms": 0.24,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 13.5,
-      "startup_secs": 0.031,
+      "rss_mb": 14.6,
+      "startup_secs": 0.032,
       "warm": {
-        "max_ms": 0.444,
+        "max_ms": 0.301,
         "n": 100,
-        "p50_ms": 0.289,
-        "p95_ms": 0.382
+        "p50_ms": 0.192,
+        "p95_ms": 0.255
       },
       "warm_ops": {
         "read": 1
       }
     },
     "audit-page": {
-      "bytes": 47811,
-      "cold_ms": 0.436,
+      "bytes": 48120,
+      "cold_ms": 0.279,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 14.2,
-      "startup_secs": 0.029,
+      "rss_mb": 15.3,
+      "startup_secs": 0.024,
       "warm": {
-        "max_ms": 0.451,
+        "max_ms": 0.539,
         "n": 100,
-        "p50_ms": 0.292,
-        "p95_ms": 0.404
+        "p50_ms": 0.205,
+        "p95_ms": 0.381
       },
       "warm_ops": {
         "read": 1
       }
     },
     "downloads-page": {
-      "bytes": 48029,
-      "cold_ms": 1.411,
+      "bytes": 48336,
+      "cold_ms": 0.796,
       "cold_ops": {
         "list": 4,
-        "read": 44
+        "read": 33
       },
-      "rss_mb": 14.2,
+      "rss_mb": 15.6,
       "startup_secs": 0.03,
       "warm": {
-        "max_ms": 0.297,
+        "max_ms": 0.355,
         "n": 100,
         "p50_ms": 0.172,
-        "p95_ms": 0.259
+        "p95_ms": 0.29
       },
       "warm_ops": {}
     },
     "fallback-404": {
       "bytes": 46,
-      "cold_ms": 0.477,
+      "cold_ms": 0.323,
       "cold_ops": {},
-      "rss_mb": 13.4,
+      "rss_mb": 14.7,
       "startup_secs": 0.031,
       "warm": {
-        "max_ms": 0.459,
+        "max_ms": 0.387,
         "n": 100,
-        "p50_ms": 0.283,
-        "p95_ms": 0.368
+        "p50_ms": 0.179,
+        "p95_ms": 0.333
       },
       "warm_ops": {}
     },
     "favicon": {
       "bytes": 15086,
-      "cold_ms": 0.214,
+      "cold_ms": 0.155,
       "cold_ops": {},
-      "rss_mb": 13.1,
-      "startup_secs": 0.027,
+      "rss_mb": 14.5,
+      "startup_secs": 0.024,
       "warm": {
-        "max_ms": 0.27,
+        "max_ms": 0.386,
         "n": 100,
-        "p50_ms": 0.148,
-        "p95_ms": 0.237
+        "p50_ms": 0.171,
+        "p95_ms": 0.279
       },
       "warm_ops": {}
     },
@@ -141,10 +143,10 @@
         "write": 5
       },
       "warm": {
-        "max_ms": 2.433,
+        "max_ms": 2.226,
         "n": 5,
-        "p50_ms": 2.336,
-        "p95_ms": 2.433
+        "p50_ms": 1.904,
+        "p95_ms": 2.226
       },
       "warm_ops": {
         "delete": 5,
@@ -155,46 +157,46 @@
     },
     "health": {
       "bytes": 15,
-      "cold_ms": 0.286,
+      "cold_ms": 0.222,
       "cold_ops": {},
-      "rss_mb": 13.3,
-      "startup_secs": 0.032,
+      "rss_mb": 14.5,
+      "startup_secs": 0.025,
       "warm": {
-        "max_ms": 0.494,
+        "max_ms": 0.195,
         "n": 100,
-        "p50_ms": 0.255,
-        "p95_ms": 0.351
+        "p50_ms": 0.113,
+        "p95_ms": 0.165
       },
       "warm_ops": {}
     },
     "metrics": {
-      "bytes": 4788,
-      "cold_ms": 0.334,
+      "bytes": 5231,
+      "cold_ms": 0.147,
       "cold_ops": {},
-      "rss_mb": 13.3,
-      "startup_secs": 0.033,
+      "rss_mb": 14.4,
+      "startup_secs": 0.027,
       "warm": {
-        "max_ms": 2.971,
+        "max_ms": 0.311,
         "n": 100,
-        "p50_ms": 0.254,
-        "p95_ms": 0.348
+        "p50_ms": 0.176,
+        "p95_ms": 0.276
       },
       "warm_ops": {}
     },
     "project-page": {
-      "bytes": 51198,
-      "cold_ms": 5.603,
+      "bytes": 51507,
+      "cold_ms": 3.629,
       "cold_ops": {
         "list": 31,
-        "read": 48
+        "read": 38
       },
-      "rss_mb": 14.9,
-      "startup_secs": 0.028,
+      "rss_mb": 15.8,
+      "startup_secs": 0.029,
       "warm": {
-        "max_ms": 0.518,
+        "max_ms": 0.281,
         "n": 100,
-        "p50_ms": 0.298,
-        "p95_ms": 0.406
+        "p50_ms": 0.173,
+        "p95_ms": 0.248
       },
       "warm_ops": {}
     },
@@ -202,221 +204,221 @@
       "cold_ops": {
         "delete": 2,
         "list": 2,
-        "read": 5,
-        "write": 4
+        "read": 6,
+        "write": 5
       },
       "warm": {
-        "max_ms": 1.241,
+        "max_ms": 1.288,
         "n": 5,
-        "p50_ms": 0.928,
-        "p95_ms": 1.241
+        "p50_ms": 0.909,
+        "p95_ms": 1.288
       },
       "warm_ops": {
         "delete": 2,
         "list": 2,
-        "read": 5,
-        "write": 4
+        "read": 6,
+        "write": 5
       }
     },
     "project-status-set": {
       "cold_ops": {
         "delete": 1,
         "list": 2,
-        "read": 5,
-        "write": 5
+        "read": 6,
+        "write": 6
       },
       "warm": {
-        "max_ms": 1.45,
+        "max_ms": 1.306,
         "n": 5,
-        "p50_ms": 1.182,
-        "p95_ms": 1.45
+        "p50_ms": 1.046,
+        "p95_ms": 1.306
       },
       "warm_ops": {
         "delete": 1,
         "list": 2,
-        "read": 5,
-        "write": 5
+        "read": 6,
+        "write": 6
       }
     },
     "project-version-page": {
-      "bytes": 55164,
-      "cold_ms": 9.621,
+      "bytes": 55473,
+      "cold_ms": 9.392,
       "cold_ops": {
         "list": 31,
-        "read": 83
+        "read": 73
       },
-      "rss_mb": 17.3,
-      "startup_secs": 0.028,
+      "rss_mb": 18.4,
+      "startup_secs": 0.026,
       "warm": {
-        "max_ms": 0.441,
+        "max_ms": 0.34,
         "n": 100,
-        "p50_ms": 0.284,
-        "p95_ms": 0.375
+        "p50_ms": 0.195,
+        "p95_ms": 0.284
       },
       "warm_ops": {}
     },
     "projects-page": {
-      "bytes": 3160264,
-      "cold_ms": 21.156,
+      "bytes": 3160573,
+      "cold_ms": 19.985,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 44.2,
-      "startup_secs": 0.033,
+      "rss_mb": 42.2,
+      "startup_secs": 0.023,
       "warm": {
-        "max_ms": 1.961,
+        "max_ms": 2.185,
         "n": 100,
-        "p50_ms": 0.6,
-        "p95_ms": 1.602
+        "p50_ms": 0.485,
+        "p95_ms": 1.115
       },
       "warm_ops": {}
     },
     "ready": {
       "bytes": 18,
-      "cold_ms": 0.345,
+      "cold_ms": 0.152,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 13.5,
-      "startup_secs": 0.031,
+      "rss_mb": 14.5,
+      "startup_secs": 0.026,
       "warm": {
-        "max_ms": 0.42,
+        "max_ms": 0.28,
         "n": 100,
-        "p50_ms": 0.271,
-        "p95_ms": 0.37
+        "p50_ms": 0.132,
+        "p95_ms": 0.196
       },
       "warm_ops": {
         "read": 1
       }
     },
     "root-page": {
-      "bytes": 51439,
-      "cold_ms": 1.87,
+      "bytes": 51746,
+      "cold_ms": 0.811,
       "cold_ops": {
         "list": 4,
-        "read": 44
+        "read": 33
       },
-      "rss_mb": 14.6,
-      "startup_secs": 0.028,
+      "rss_mb": 15.9,
+      "startup_secs": 0.032,
       "warm": {
-        "max_ms": 0.346,
+        "max_ms": 0.33,
         "n": 100,
-        "p50_ms": 0.187,
-        "p95_ms": 0.277
+        "p50_ms": 0.178,
+        "p95_ms": 0.27
       },
       "warm_ops": {}
     },
     "simple-pkg-html": {
       "bytes": 4019,
-      "cold_ms": 1.023,
+      "cold_ms": 8.092,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 14.1,
-      "startup_secs": 0.533,
+      "rss_mb": 15.2,
+      "startup_secs": 0.015,
       "warm": {
-        "max_ms": 0.54,
+        "max_ms": 0.347,
         "n": 100,
-        "p50_ms": 0.261,
-        "p95_ms": 0.38
+        "p50_ms": 0.173,
+        "p95_ms": 0.27
       },
       "warm_ops": {}
     },
     "simple-pkg-json": {
       "bytes": 1170,
-      "cold_ms": 1.26,
+      "cold_ms": 3.117,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 14.0,
-      "startup_secs": 0.031,
+      "rss_mb": 15.3,
+      "startup_secs": 0.023,
       "warm": {
-        "max_ms": 0.42,
+        "max_ms": 0.271,
         "n": 100,
-        "p50_ms": 0.25,
-        "p95_ms": 0.36
+        "p50_ms": 0.17,
+        "p95_ms": 0.241
       },
       "warm_ops": {}
     },
     "simple-root-html": {
       "bytes": 2862089,
-      "cold_ms": 68.173,
+      "cold_ms": 37.588,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 17.3,
-      "startup_secs": 0.029,
+      "rss_mb": 18.4,
+      "startup_secs": 0.032,
       "warm": {
-        "max_ms": 2.141,
+        "max_ms": 1.224,
         "n": 100,
-        "p50_ms": 0.602,
-        "p95_ms": 1.398
+        "p50_ms": 0.502,
+        "p95_ms": 1.13
       },
       "warm_ops": {}
     },
     "simple-root-json": {
       "bytes": 2912015,
-      "cold_ms": 70.775,
+      "cold_ms": 38.461,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 17.3,
-      "startup_secs": 0.033,
+      "rss_mb": 18.7,
+      "startup_secs": 0.026,
       "warm": {
-        "max_ms": 1.583,
+        "max_ms": 2.132,
         "n": 100,
-        "p50_ms": 0.572,
-        "p95_ms": 1.273
+        "p50_ms": 0.487,
+        "p95_ms": 1.078
       },
       "warm_ops": {}
     },
     "stats-pkg": {
       "bytes": 63,
-      "cold_ms": 1.054,
+      "cold_ms": 0.918,
       "cold_ops": {
         "list": 30,
         "read": 30
       },
-      "rss_mb": 13.4,
-      "startup_secs": 0.029,
+      "rss_mb": 14.7,
+      "startup_secs": 0.028,
       "warm": {
-        "max_ms": 0.446,
+        "max_ms": 0.279,
         "n": 100,
-        "p50_ms": 0.256,
-        "p95_ms": 0.35
+        "p50_ms": 0.172,
+        "p95_ms": 0.269
       },
       "warm_ops": {}
     },
     "stats-summary": {
-      "bytes": 100,
-      "cold_ms": 1.715,
+      "bytes": 97,
+      "cold_ms": 0.653,
       "cold_ops": {
         "list": 4,
-        "read": 44
+        "read": 33
       },
-      "rss_mb": 13.6,
-      "startup_secs": 0.023,
+      "rss_mb": 15.0,
+      "startup_secs": 0.026,
       "warm": {
-        "max_ms": 0.577,
+        "max_ms": 0.384,
         "n": 100,
-        "p50_ms": 0.151,
-        "p95_ms": 0.283
+        "p50_ms": 0.173,
+        "p95_ms": 0.326
       },
       "warm_ops": {}
     },
     "sync-cursors-get": {
       "bytes": 2,
-      "cold_ms": 0.406,
+      "cold_ms": 0.726,
       "cold_ops": {
         "read": 1
       },
-      "rss_mb": 13.5,
-      "startup_secs": 0.033,
+      "rss_mb": 14.5,
+      "startup_secs": 0.03,
       "warm": {
-        "max_ms": 0.581,
+        "max_ms": 0.326,
         "n": 100,
-        "p50_ms": 0.26,
-        "p95_ms": 0.41
+        "p50_ms": 0.187,
+        "p95_ms": 0.258
       },
       "warm_ops": {
         "read": 1
@@ -427,10 +429,10 @@
         "write": 1
       },
       "warm": {
-        "max_ms": 1.05,
+        "max_ms": 0.912,
         "n": 5,
-        "p50_ms": 0.654,
-        "p95_ms": 1.05
+        "p50_ms": 0.621,
+        "p95_ms": 0.912
       },
       "warm_ops": {
         "write": 1
@@ -438,33 +440,33 @@
     },
     "sync-local-index": {
       "bytes": 7301,
-      "cold_ms": 1.097,
+      "cold_ms": 3.197,
       "cold_ops": {
-        "read": 1
+        "read": 2
       },
-      "rss_mb": 13.5,
-      "startup_secs": 0.031,
+      "rss_mb": 14.6,
+      "startup_secs": 0.032,
       "warm": {
-        "max_ms": 0.984,
+        "max_ms": 0.383,
         "n": 100,
-        "p50_ms": 0.283,
-        "p95_ms": 0.375
+        "p50_ms": 0.208,
+        "p95_ms": 0.312
       },
       "warm_ops": {
-        "read": 1
+        "read": 2
       }
     },
     "tokens-mint": {
       "bytes": 224,
-      "cold_ms": 0.467,
+      "cold_ms": 0.318,
       "cold_ops": {},
-      "rss_mb": 13.5,
-      "startup_secs": 0.033,
+      "rss_mb": 14.7,
+      "startup_secs": 0.025,
       "warm": {
-        "max_ms": 0.461,
+        "max_ms": 0.368,
         "n": 100,
-        "p50_ms": 0.273,
-        "p95_ms": 0.377
+        "p50_ms": 0.176,
+        "p95_ms": 0.311
       },
       "warm_ops": {}
     },
@@ -476,16 +478,36 @@
         "write": 10
       },
       "warm": {
-        "max_ms": 12.938,
+        "max_ms": 8.978,
         "n": 5,
-        "p50_ms": 11.009,
-        "p95_ms": 12.938
+        "p50_ms": 6.181,
+        "p95_ms": 8.978
       },
       "warm_ops": {
         "delete": 1,
         "list": 2,
         "read": 11,
         "write": 10
+      }
+    },
+    "upload-time-repair": {
+      "cold_ops": {
+        "delete": 1,
+        "list": 2,
+        "read": 11,
+        "write": 4
+      },
+      "warm": {
+        "max_ms": 1.235,
+        "n": 5,
+        "p50_ms": 0.916,
+        "p95_ms": 1.235
+      },
+      "warm_ops": {
+        "delete": 1,
+        "list": 2,
+        "read": 11,
+        "write": 4
       }
     },
     "yank-clear": {
@@ -496,10 +518,10 @@
         "write": 5
       },
       "warm": {
-        "max_ms": 1.77,
+        "max_ms": 1.175,
         "n": 5,
-        "p50_ms": 1.433,
-        "p95_ms": 1.77
+        "p50_ms": 0.916,
+        "p95_ms": 1.175
       },
       "warm_ops": {
         "delete": 1,
@@ -516,10 +538,10 @@
         "write": 5
       },
       "warm": {
-        "max_ms": 1.365,
+        "max_ms": 1.049,
         "n": 5,
-        "p50_ms": 1.208,
-        "p95_ms": 1.365
+        "p50_ms": 0.908,
+        "p95_ms": 1.049
       },
       "warm_ops": {
         "delete": 1,
@@ -529,26 +551,26 @@
       }
     }
   },
-  "git_rev": "59b37e2",
+  "git_rev": "47ef9da",
   "host": {
-    "cpus": 10,
+    "cpus": 12,
     "machine": "arm64",
-    "platform": "macOS-26.5-arm64-arm-64bit-Mach-O"
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O"
   },
   "monster": {
     "bytes": 8146754,
-    "cold_ms": 142.521,
+    "cold_ms": 89.577,
     "files": 45636,
     "package": "pyagrum-nightly",
-    "rss_mb": 25.8
+    "rss_mb": 25.0
   },
   "schema": 1,
-  "startup_secs_median": 0.031,
+  "startup_secs_median": 0.026,
   "tier": {
     "files": 1206496,
     "packages": 50000,
     "seed": 42,
     "tree_format": 1
   },
-  "upload_visible_secs": 0.052
+  "upload_visible_secs": 0.039
 }

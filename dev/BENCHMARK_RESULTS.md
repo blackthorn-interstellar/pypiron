@@ -72,6 +72,9 @@ Every landed optimization, paired with the meter runs that bracket it.
 | 2026-07-23 | `/stats/:metric` summary TTL cache (3539423, admin.rs) | microbench stats-summary warm @50k | 3.13ms + 105 reads/74 lists per request → 0.15ms + **0 storage ops** |
 | 2026-07-23 | `/stats/:metric/:package` series TTL cache (2b46874, admin.rs) | microbench stats-pkg warm @50k | 0.89ms + 30 reads/30 lists per request → 0.26ms + **0 storage ops** |
 | 2026-07-23 | Counters live day-summary shard fan-out collapsed to two LISTs (59b37e2, counters.rs) | cold global-stats refill (root/downloads/stats-summary) | 74 fanned-out LISTs → **4**; root-page cold 3.8ms → 1.9ms (would be ~178 sequential S3 round-trips per refill) |
+| 2026-09-23 | Hardware SHA-256 on aarch64 (`sha2` `asm` feature; without it ARM hashed in software) | 54 MB global-index SHA @780k names / 400 MB wheel upload wall (M2 Max) | 148ms → 33ms / 4.2s → 3.2s |
+| 2026-09-23 | flate2 backend miniz_oxide → zlib-rs (same level 6) | gzip of 54 MB global index / 401 real per-package indexes | 451ms → 105ms / 3.09 MB → 2.93 MB (5% smaller) |
+| 2026-09-23 | Both of the above | microbench @50k cold: simple-root / monster (45k files) | 64ms → 38ms / 158ms → 90ms |
 
 The 2026-07-23 rows came out of the endpoint micro-benchmark loop
 (dev/bench/MICROBENCH.md); a fifth candidate (borrowing `file_version` instead

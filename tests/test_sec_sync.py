@@ -9,6 +9,7 @@ input. These drive the real binary against a fake source that abuses it.
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -224,6 +225,45 @@ def test_env_false_overrides_a_file_opt_in(disk_server, pypiron_bin, tmp_path):
     combined = out + err
     assert rc != 0, combined
     assert "plaintext http://" in combined, combined
+
+
+def test_admin_pass_alone_authenticates_as_admin(disk_server, pypiron_bin, tmp_path):
+    """As on `serve`, `--admin-pass` alone means the user `admin`; it used to be
+    dropped silently, so the run sent no credential and blamed a 401 on it."""
+    package = "adminpassonlypkg"
+    wheel = make_wheel(package, "1.0.0", tmp_path)
+    routes = {
+        f"/simple/{package}/": (200, ACCEPT_PEP691, _listing(package, [_file_row(wheel)])),
+        f"/files/{wheel.name}": (200, "application/octet-stream", wheel.read_bytes()),
+    }
+    source_gen = _start_source(routes)
+    source_url, _ = next(source_gen)
+    try:
+        cp = subprocess.run(
+            [
+                str(pypiron_bin),
+                "sync",
+                "--from",
+                f"{source_url}/simple",
+                "--to",
+                disk_server["base_url"],
+                "--admin-pass",
+                disk_server["password"],
+                "--include-package",
+                package,
+                "--exclude-newer",
+                "",
+                "--advisory-feed",
+                "",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert cp.returncode == 0, cp.stdout + cp.stderr
+        wait_for_file_in_index(disk_server["simple"], package, wheel.name)
+    finally:
+        source_gen.close()
 
 
 def test_source_credential_stays_on_the_source_origin(disk_server, pypiron_bin, tmp_path):

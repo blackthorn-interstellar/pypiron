@@ -58,6 +58,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Bug (security, fail-open): the malware/quarantine byte gate skipped any name matching `--private-prefix`/`--private-pattern` before reading the actual owner, so reserving a name that already held cached public (mirror-claimed) bytes made a blocked wheel download again (200). The origin claim alone now exempts a package. Blackbox test (restart with the name reserved) red first.
 - 2026-09-22 Bug: with `--malware-block=false` (documented: keep the audit, drop the refusal) the `/audit` report, `/audit.json` and the project page still marked `MAL-*` matches `blocked` while the byte gate served them; `blocked` is documented as "whether the byte gate would 403 this file". Both builders now take the blocking toggle; quarantine still blocks. Unit tests extended.
 - 2026-09-22 Bug: `pypiron config init` shows the disk default as `data-dir = "~/.pypiron/packages"`, but a config-file `~` is never shell-expanded, so uncommenting that line made `serve`/`rebuild-index`/`verify-index` use a literal `./~/.pypiron/packages` under the working directory — packages seemed to vanish and `verify-index` passed an empty store. A leading `~`/`~/` in the data dir now expands to `$HOME`. Blackbox test red first; 10-minute vopr soak at `4d06750` clean (~194k seeds).
+- 2026-09-23 Bug: `sync --admin-pass` without `--admin-user` silently sent no credential (`with_admin_auth` needs both) and then reported the destination "rejected the admin credentials" (401), while `serve` treats a lone `--admin-pass` as user `admin`; a lone `--admin-user` was likewise dropped instead of refusing (AGENTS.md: half-configured credentials refuse). Sync now uses `serve`'s rule and refuses a password-less username. Found by a hands-on run against real PyPI; blackbox test red first.
 
 ## Rejected
 
@@ -81,7 +82,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 

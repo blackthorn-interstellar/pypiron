@@ -1002,13 +1002,26 @@ impl Resolved {
             args.source_pass.clone().or(sync.source_pass),
             allow_insecure_source,
         )?;
+        // Same credential rule as `serve`: a password alone means the user
+        // `admin`, and a username without a password can authenticate no one,
+        // so it refuses rather than silently sending no credential at all.
+        let admin_pass = args.admin_pass.clone().or(sync.admin_pass);
+        let admin_user = crate::auth::resolve_admin_user(
+            args.admin_user.clone().or(sync.admin_user).as_deref(),
+            admin_pass.as_deref(),
+        );
+        if admin_user.is_some() != admin_pass.is_some() {
+            bail!(
+                "--admin-user needs --admin-pass (or [sync] admin-pass / PYPIRON_SYNC_ADMIN_PASS)"
+            );
+        }
         Ok(Self {
             guard: Arc::new(crate::ssrf::Guard::new(&src_base, &dst_host, &[])?),
             src_base,
             source_kind,
             dst_base,
-            admin_user: args.admin_user.clone().or(sync.admin_user),
-            admin_pass: args.admin_pass.clone().or(sync.admin_pass),
+            admin_user,
+            admin_pass,
             source_auth,
             as_private,
             repair_upload_times: args.repair_upload_times,

@@ -1,4 +1,7 @@
-use html_escape::{encode_double_quoted_attribute, encode_text};
+use html_escape::{
+    encode_double_quoted_attribute, encode_double_quoted_attribute_to_string, encode_text,
+    encode_text_to_string,
+};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 
@@ -152,14 +155,19 @@ pub fn pep503_project_html(
 }
 
 /// Render minimal PEP 503 global HTML index (with PEP 629 version meta).
+///
+/// Written straight into one buffer: at full-PyPI scale (780k names) a
+/// per-name `format!` was most of the render.
 pub fn pep503_global_html(packages: &[String]) -> String {
-    let mut body = String::new();
+    let mut body = String::with_capacity(128 + packages.len() * 64);
     body.push_str(&html_head_open());
     body.push_str(r#"<title>Simple index</title></head><body>"#);
     for p in packages {
-        let p_attr = encode_double_quoted_attribute(p);
-        let p_text = encode_text(p);
-        body.push_str(&format!(r#"<a href="/simple/{p_attr}/">{p_text}</a><br/>"#));
+        body.push_str(r#"<a href="/simple/"#);
+        encode_double_quoted_attribute_to_string(p, &mut body);
+        body.push_str(r#"/">"#);
+        encode_text_to_string(p, &mut body);
+        body.push_str("</a><br/>");
     }
     body.push_str("</body></html>");
     body
@@ -256,42 +264,79 @@ pub fn pep691_project_json(
     serde_json::to_string(&doc).unwrap_or_else(|_| pep691_meta_only())
 }
 
-#[derive(Serialize)]
-struct Pep691ProjectRef<'a> {
-    name: &'a str,
-    url: String,
-}
-
-#[derive(Serialize)]
-struct Pep691Global<'a> {
-    #[serde(rename = "meta")]
-    meta: Pep691Meta<'a>,
-    projects: Vec<Pep691ProjectRef<'a>>,
-}
-
-/// Minimal PEP 691 global index JSON.
+/// Minimal PEP 691 global index JSON, written straight into one buffer (see
+/// [`pep503_global_html`]). Each name is JSON-escaped once and reused for both
+/// fields; the output is what serializing `{"meta", "projects": [{name, url}]}`
+/// with serde produces.
 pub fn pep691_global_json(packages: &[String]) -> String {
-    let projects: Vec<Pep691ProjectRef> = packages
-        .iter()
-        .map(|p| Pep691ProjectRef {
-            name: p,
-            url: format!("/simple/{p}/"),
-        })
-        .collect();
-
-    let doc = Pep691Global {
-        meta: Pep691Meta {
-            api_version: API_VERSION,
-        },
-        projects,
-    };
-    serde_json::to_string(&doc).unwrap_or_else(|_| pep691_meta_only())
+    let mut body = Vec::with_capacity(64 + packages.len() * 64);
+    body.extend_from_slice(
+        format!("{{\"meta\":{{\"api-version\":\"{API_VERSION}\"}},\"projects\":[").as_bytes(),
+    );
+    let mut quoted = Vec::new();
+    for (i, p) in packages.iter().enumerate() {
+        quoted.clear();
+        if serde_json::to_writer(&mut quoted, p).is_err() {
+            return pep691_meta_only();
+        }
+        if i > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(b"{\"name\":");
+        body.extend_from_slice(&quoted);
+        body.extend_from_slice(b",\"url\":\"/simple/");
+        body.extend_from_slice(&quoted[1..quoted.len() - 1]);
+        body.extend_from_slice(b"/\"}");
+    }
+    body.extend_from_slice(b"]}");
+    String::from_utf8(body).unwrap_or_else(|_| pep691_meta_only())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::status::ProjectStatus;
+
+    #[test]
+    fn global_indexes_match_the_generic_renderings_byte_for_byte() {
+        for names in [
+            vec![],
+            vec![
+                "a".to_string(),
+                "we\"ird\\name".to_string(),
+                "<&>".to_string(),
+                "\u{1}\u{e9}".to_string(),
+            ],
+        ] {
+            // serde_json's default map sorts keys, which is also the order the
+            // hand-written JSON emits (meta < projects, name < url).
+            let expected = serde_json::json!({
+                "meta": {"api-version": API_VERSION},
+                "projects": names
+                    .iter()
+                    .map(|n| serde_json::json!({"name": n, "url": format!("/simple/{n}/")}))
+                    .collect::<Vec<_>>(),
+            });
+            assert_eq!(pep691_global_json(&names), expected.to_string());
+            let links: String = names
+                .iter()
+                .map(|n| {
+                    format!(
+                        r#"<a href="/simple/{}/">{}</a><br/>"#,
+                        encode_double_quoted_attribute(n),
+                        encode_text(n)
+                    )
+                })
+                .collect();
+            assert_eq!(
+                pep503_global_html(&names),
+                format!(
+                    "{}<title>Simple index</title></head><body>{links}</body></html>",
+                    html_head_open()
+                )
+            );
+        }
+    }
 
     fn meta(version: Option<&str>) -> FileMetadata {
         FileMetadata {

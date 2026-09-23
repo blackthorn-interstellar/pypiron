@@ -20,7 +20,7 @@
 //! upgraded node drains what an old node wrote.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
@@ -3056,7 +3056,9 @@ impl InventoryMap {
 /// parse; against this it costs a hash lookup.
 pub struct GlobalNames {
     etag: Option<String>,
-    names: HashSet<String>,
+    /// Ordered, so the global views render from it without a sort — at 780k
+    /// names a clone-and-sort per change was a tenth of a second.
+    names: BTreeSet<String>,
     /// The stored `simple/index.html`'s ETag as of this load. Every HTML write
     /// is conditional on it, so a node holding a stale view of the HTML cannot
     /// clobber a fresher one — its write fails and it reloads. `None` when no
@@ -3105,7 +3107,16 @@ struct GlobalHtmlStamp {
 /// Content-addressed rather than ETag-addressed so it means the same thing in
 /// every bucket and on every backend.
 fn global_names_digest(packages: &[String]) -> String {
-    crate::hash::sha256_hex(packages.join("\n").as_bytes())
+    // Streamed: the same digest as hashing `packages.join("\n")`, without
+    // materializing a corpus-sized string on every global change.
+    let mut hasher = Sha256::new();
+    for (i, name) in packages.iter().enumerate() {
+        if i > 0 {
+            hasher.update(b"\n");
+        }
+        hasher.update(name.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// Read the currency stamp, if one was ever written. A missing or unparsable
@@ -3150,15 +3161,13 @@ pub async fn global_package_names(state: &AppState, storage: &dyn Storage) -> Re
     if guard.is_none() {
         *guard = Some(load_global_names(storage).await?);
     }
-    let mut names: Vec<String> = guard
+    Ok(guard
         .as_ref()
         .expect("just loaded")
         .names
         .iter()
         .cloned()
-        .collect();
-    names.sort();
-    Ok(names)
+        .collect())
 }
 
 /// The global index only changes when the *set of package names* changes —
@@ -3341,8 +3350,7 @@ async fn update_global_index_locked(
             // 780,000. Only an unproven pair pays the byte compare, and only
             // once per observed HTML ETag.
             if !cached.html_current {
-                let mut packages: Vec<String> = cached.names.iter().cloned().collect();
-                packages.sort();
+                let packages: Vec<String> = cached.names.iter().cloned().collect();
                 if !global_html_proved_current(storage, &cached.html_etag, &packages).await {
                     match reconcile_global_html(state, storage, &packages, &cached.html_etag)
                         .await?
@@ -3367,8 +3375,7 @@ async fn update_global_index_locked(
             }
             return Ok(());
         }
-        let mut packages: Vec<String> = cached.names.iter().cloned().collect();
-        packages.sort();
+        let packages: Vec<String> = cached.names.iter().cloned().collect();
         let expected_json = cached.etag.clone();
         let expected_html = cached.html_etag.clone();
         match write_global_indexes_cas(state, storage, &packages, &expected_json, &expected_html)
@@ -3522,8 +3529,7 @@ pub(crate) async fn update_global_index_uncached(
         for pkg in removes {
             changed |= names.remove(pkg);
         }
-        let mut packages: Vec<String> = names.into_iter().collect();
-        packages.sort();
+        let packages: Vec<String> = names.into_iter().collect();
         // A stranded load (canonical JSON absent under a published HTML, or
         // present but unparseable) derived its names from the per-package views,
         // so a delta that dedups against them is not a no-op: the JSON still has
@@ -3668,7 +3674,7 @@ async fn load_global_names(storage: &dyn Storage) -> Result<GlobalNames> {
         let names = if stranded {
             derive_global_names(storage).await?
         } else {
-            HashSet::new()
+            BTreeSet::new()
         };
         return Ok(GlobalNames {
             etag,
@@ -3762,9 +3768,9 @@ async fn current_global_html_etag(storage: &dyn Storage) -> Result<Option<String
 /// views: a package is globally listed exactly when `simple/<pkg>/index.json`
 /// exists, which is the rule the audit applies. Used only when the canonical
 /// global JSON is absent and there is therefore nothing authoritative to read.
-async fn derive_global_names(storage: &dyn Storage) -> Result<HashSet<String>> {
+async fn derive_global_names(storage: &dyn Storage) -> Result<BTreeSet<String>> {
     const SHARD_CONCURRENCY: usize = 6;
-    let mut names = HashSet::new();
+    let mut names = BTreeSet::new();
     let shards: Vec<String> = crate::storage::SHARD_CHARS
         .iter()
         .map(|c| format!("{SIMPLE_PREFIX}{c}"))
@@ -5604,6 +5610,22 @@ mod tests {
             "the stamp must name the page this call itself wrote"
         );
         assert_eq!(stamp.names, global_names_digest(&published));
+    }
+
+    /// Stamps already stored by earlier versions hashed the newline-joined list;
+    /// the streamed digest must keep proving them current.
+    #[test]
+    fn the_names_digest_is_the_hash_of_the_joined_list() {
+        for names in [
+            vec![],
+            vec!["a".to_string()],
+            vec!["a".into(), "b-c".into(), "d".into()],
+        ] {
+            assert_eq!(
+                global_names_digest(&names),
+                crate::hash::sha256_hex(names.join("\n").as_bytes())
+            );
+        }
     }
 
     /// The reconcile must not *create* views: a bucket that has never published

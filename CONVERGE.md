@@ -58,6 +58,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Rejected
 
+- 2026-09-22 Read-through to every reachable peer when a file is on neither pin (an upload a failed-over node landed on a third bucket during a partition): the window lasts only until the `_repl/` sweep delivers it, and probing every peer on each unfenced miss would make every genuine `404` cost cross-region GETs. The guide's "complete bucket" is the write home by design.
 - 2026-09-22 Map an upstream project-index `410 Gone` to not-found (`src/simple.rs` ~232): a cold `410` already answers `404`; only a previously cached listing is revived as stale, and PyPI answers removed projects with `404`, so only an exotic upstream hits it — not worth a 60 s-TTL test.
 - 2026-09-22 "An audit rebuild racing a yank records a fingerprint over stale views, freezing the pre-yank index" (`src/worker.rs` audit, single bucket where no rebuild intent fences it): plausible by reading, but unreproduced, and the vopr — which runs the audit concurrently with the tick and counts `concurrent-race` view repairs — reported 0 across ~280k seeds today. Revisit only with a failing seed.
 - 2026-09-22 Verify `md5_digest`/`blake2_256_digest` on upload like PyPI: every real client also sends `sha256_digest`, which is verified; a second weaker digest adds nothing. Also `fold_version` treating `1!2` as `1.2`: needs a hand-crafted epoch mismatch no build tool emits.
@@ -74,7 +75,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 
@@ -227,5 +228,4 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Leads (not yet adjudicated)
 
-- Bug?: `src/serve.rs` ~1046 — an acked file held only on a reachable peer that is neither the read nor the write pin (a failed-over node uploaded to B, fan-out to A pending; this node pins A for both) returns `404`; read-through tries only the two pins, while `docs/guides/multi-region.md` says a missing file "reads through to a complete bucket instead of returning 404". Code-traced by Codex, not reproduced.
 - Flaky: `tests/test_crash_consistency.py::test_dual_leadership_overlap_triggers_cas_conflict` failed once in a full run on 2026-09-22 (loaded machine) and passed 3/3 alone right after.

@@ -55,6 +55,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Bug: `verify-chain --strict` read a committed file's sidecar sha as proof of presence, so an artifact deleted out of band beside its surviving `.meta.json` verified clean (exit 0), against the docs' "changed or missing content exits 1". A matching sidecar now also needs the artifact to exist; otherwise the tombstone/demotion check decides covered vs `vanished`. Unit test red first; reproduced and fixed on a real store.
 - 2026-09-22 Bug: `sync`/`[mirror]` opt-in bools (`as-private`, `allow-insecure-source`, `allow-legacy-versions`, `exclude-dev`, `exclude-windows`, `exclude-prereleases`, `include-yanked`) merged as `cli || file`, so an explicit `PYPIRON_X=false` could not override `true` in `pypiron.toml`, against the documented CLI > env > file precedence (e.g. plaintext source credentials stayed allowed). A file value is now dropped when the CLI/env set that bool; `serve` shares the `[mirror]` path. Blackbox test red first.
 - 2026-09-22 Bug: download read-through fell back to the write pin whenever the read pin said "not visible", including when the read pin held a tombstone or freeze — so a delete a failed-over node landed on the region bucket, not yet replicated to the write home, was served (200, deleted bytes) by a node that had just seen the tombstone. Read-pin fences now end the request; only absence reads through. Blackbox test (read-affinity pair) red first.
+- 2026-09-22 Bug (security, fail-open): the malware/quarantine byte gate skipped any name matching `--private-prefix`/`--private-pattern` before reading the actual owner, so reserving a name that already held cached public (mirror-claimed) bytes made a blocked wheel download again (200). The origin claim alone now exempts a package. Blackbox test (restart with the name reserved) red first.
 
 ## Rejected
 
@@ -75,7 +76,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 
@@ -228,4 +229,5 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Leads (not yet adjudicated)
 
+- Bug?: a buffered (below `--proxy-stream-threshold`) cold-miss proxy fill checks the advisory gate before the fetch and not after; an advisory that lands mid-fetch is not applied to that response (`src/serve.rs` ~882/~937, `src/proxy.rs` ~1319 refuses late only for streamed fills). Code-traced by Codex; window is one download's duration.
 - Flaky: `tests/test_crash_consistency.py::test_dual_leadership_overlap_triggers_cas_conflict` failed once in a full run on 2026-09-22 (loaded machine) and passed 3/3 alone right after.

@@ -1128,11 +1128,9 @@ async fn advisory_byte_gate(
         return None; // the common path: no origin read, no I/O
     }
 
-    // A hit — but a private-origin name never consults either set. Fast pre-check
-    // on the reserved private names (no I/O), then the authoritative claim.
-    if state.private.matches(pkg) {
-        return None;
-    }
+    // A hit — but a private-origin name never consults either set. Only the
+    // claim proves that: a reserved name can still hold grandfathered mirror
+    // bytes (reserving a name does not re-own what is already cached).
     match origin::read_origin_claim(storage, pkg).await {
         Ok(Some(origin::OriginState::Private)) => return None,
         // Mirror, the unclaimed sentinel, or no claim at all: not proven private,

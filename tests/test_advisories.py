@@ -433,6 +433,44 @@ def test_ac1_byte_gate_blocks_mal_version_by_default(
         run_checked([str(uv_venv), "-c", f"import {_import_name(MAL_EXACT_PKG)}"])
 
 
+def test_reserving_a_mirrored_name_keeps_its_malware_block(tmp_path_factory, pypiron_bin, tmp_path):
+    """Reserving a name for private packages does not make its already-cached
+    public bytes private (the claim stays `mirror`), so they stay blocked. The
+    gate used to skip any reserved name before reading the actual owner."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    bad = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+    with advisory_server(tmp_path_factory, pypiron_bin, feed) as server:
+        _mirror_upload(server, bad)
+        code, _, _ = http_get(f"{server['base_url']}/files/{MAL_EXACT_PKG}/{bad.name}")
+        assert code == 403
+        data_dir = server["data_dir"]
+
+    bind = f"127.0.0.1:{find_free_port()}"
+    env = {**os.environ, "PYPIRON_ADVISORY_FEED": str(feed)}
+    with open(tmp_path / "reserved.log", "w") as log:
+        proc = subprocess.Popen(
+            [
+                str(pypiron_bin),
+                "serve",
+                "--bind-addr",
+                bind,
+                "--data-dir",
+                str(data_dir),
+                "--private-pattern",
+                MAL_EXACT_PKG,
+            ],
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    try:
+        wait_http_responding(f"http://{bind}/simple/index.json", timeout=30.0)
+        code, _, _ = http_get(f"http://{bind}/files/{MAL_EXACT_PKG}/{bad.name}")
+        assert code == 403, f"reserving the name unblocked cached malware: {code}"
+    finally:
+        kill_process_tree(proc)
+
+
 def test_unreadable_filename_version_blocks_against_every_mal_rule(
     tmp_path_factory, pypiron_bin, tmp_path
 ):

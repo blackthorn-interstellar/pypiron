@@ -109,7 +109,9 @@ workflow writes the commit message itself — from the seed, the signature, the
 oracle name and the gate results, never from an agent's prose — and runs a fixed
 `git apply --check` → `git apply` → `make check` → commit → push, with the patch
 handed over as a file path rather than as diff text and no decision left in the
-step. A non-zero exit anywhere stops it, and the finding goes to
+step. The step applies that file only if its SHA-256 matches the diff the gates
+reviewed, so a patch file that differs from what was verified never lands.
+A non-zero exit anywhere stops it, and the finding goes to
 `findings-needs-human/` — the same place a rejected fix goes. Every result the
 workflow returns carries `needs_human`, so the routine files it without having
 to interpret an outcome string.

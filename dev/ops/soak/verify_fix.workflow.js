@@ -49,6 +49,51 @@ const fnv1a = (s) => {
   }
   return h.toString(36)
 }
+// SHA-256 of a string's UTF-8 bytes, as hex. The workflow sandbox promises no
+// crypto global, and this digest is what binds the file the applier lands to the
+// diff the gates reviewed, so it has to be the real thing, not fnv1a.
+const sha256hex = (str) => {
+  const bytes = []
+  for (const ch of str) {
+    const c = ch.codePointAt(0)
+    if (c < 0x80) bytes.push(c)
+    else if (c < 0x800) bytes.push(0xc0 | (c >> 6), 0x80 | (c & 63))
+    else if (c < 0x10000) bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63))
+    else bytes.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63))
+  }
+  const bitLen = bytes.length * 8
+  bytes.push(0x80)
+  while (bytes.length % 64 !== 56) bytes.push(0)
+  for (let i = 7; i >= 0; i--) bytes.push(i >= 4 ? 0 : (bitLen >>> (i * 8)) & 0xff)
+  const K = []
+  for (let n = 2, found = 0; found < 64; n++) {
+    let prime = true
+    for (let d = 2; d * d <= n; d++) if (n % d === 0) prime = false
+    if (prime) K[found++] = (Math.cbrt(n) % 1) * 2 ** 32 >>> 0
+  }
+  const H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n))
+  const W = new Array(64)
+  for (let off = 0; off < bytes.length; off += 64) {
+    for (let t = 0; t < 16; t++) {
+      const j = off + t * 4
+      W[t] = ((bytes[j] << 24) | (bytes[j + 1] << 16) | (bytes[j + 2] << 8) | bytes[j + 3]) >>> 0
+    }
+    for (let t = 16; t < 64; t++) {
+      const s0 = rotr(W[t - 15], 7) ^ rotr(W[t - 15], 18) ^ (W[t - 15] >>> 3)
+      const s1 = rotr(W[t - 2], 17) ^ rotr(W[t - 2], 19) ^ (W[t - 2] >>> 10)
+      W[t] = (W[t - 16] + s0 + W[t - 7] + s1) >>> 0
+    }
+    let [a, b, c, d, e, f, g, h] = H
+    for (let t = 0; t < 64; t++) {
+      const t1 = (h + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K[t] + W[t]) >>> 0
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0
+      ;[h, g, f, e, d, c, b, a] = [g, f, e, (d + t1) >>> 0, c, b, a, (t1 + t2) >>> 0]
+    }
+    H.forEach((v, i) => (H[i] = (v + [a, b, c, d, e, f, g, h][i]) >>> 0))
+  }
+  return H.map((v) => v.toString(16).padStart(8, '0')).join('')
+}
 const PATCH_PATH_RE = /^\/[A-Za-z0-9._/-]{1,200}\.patch$/
 // The same path, split at the fixed `.local/soak-fixes/` the Fix step writes
 // into, so the main checkout's root is recovered under the same strictness as
@@ -307,6 +352,14 @@ if (!commit) {
 
 // Composed here, from the finding's structured fields and the gate results — an
 // agent's prose never reaches master's history.
+// The gates reviewed `fix.diff`; the applier lands the file at `patch_path`.
+// Nothing ties those together but this digest: the applier copies the file into
+// its own worktree and applies the copy only if it hashes to the reviewed bytes,
+// so a patch file that says anything else — a lying Fix agent, or a later write
+// to the shared path — fails the push. `git diff` output ends in a newline; an
+// agent's string field may not.
+const reviewedSha = sha256hex(fix.diff.endsWith('\n') ? fix.diff : `${fix.diff}\n`)
+
 const commitMessage =
   `fix(vopr): ${safeSignature}\n` +
   `\n` +
@@ -329,16 +382,19 @@ const applied = await agent(
     `(that worktree's own root — NOT the operator's main checkout, which these commands never enter ` +
     `except to reuse its build cache). Do not judge, read other files, ` +
     `edit anything, or deviate. Stop at the first command that exits non-zero.\n\n` +
-    `1. git apply --check -v -- '${fix.patch_path}'\n` +
-    `2. git apply -- '${fix.patch_path}'\n` +
-    `3. CARGO_TARGET_DIR='${mainCheckout}/.local/target-soak' make check\n` +
-    `4. git add -A\n` +
-    `5. git commit -F - <<'PYPIRON_MSG_${nonce}'\n${commitMessage}PYPIRON_MSG_${nonce}\n` +
-    `6. git push origin HEAD:master\n` +
-    `7. git rev-parse HEAD\n\n` +
-    `Then report: result = PASS if all seven exited 0 else FAIL; failed_step = the step number that failed, ` +
-    `else 0; sha = step 7's output, else ""; output_tail = the last 20 lines of the failing command's output, ` +
-    `or of step 7 on success. Do nothing else — no retry, no amend, no force-push, no fixes, no commentary.`,
+    `1. cp -- '${fix.patch_path}' .soak-fix.patch\n` +
+    `2. test "$(sha256sum < .soak-fix.patch | cut -c1-64)" = '${reviewedSha}'\n` +
+    `3. git apply --check -v -- .soak-fix.patch\n` +
+    `4. git apply -- .soak-fix.patch\n` +
+    `5. rm -- .soak-fix.patch\n` +
+    `6. CARGO_TARGET_DIR='${mainCheckout}/.local/target-soak' make check\n` +
+    `7. git add -A\n` +
+    `8. git commit -F - <<'PYPIRON_MSG_${nonce}'\n${commitMessage}PYPIRON_MSG_${nonce}\n` +
+    `9. git push origin HEAD:master\n` +
+    `10. git rev-parse HEAD\n\n` +
+    `Then report: result = PASS if all ten exited 0 else FAIL; failed_step = the step number that failed, ` +
+    `else 0; sha = step 10's output, else ""; output_tail = the last 20 lines of the failing command's output, ` +
+    `or of step 10 on success. Do nothing else — no retry, no amend, no force-push, no fixes, no commentary.`,
   { schema: APPLY, phase: 'Apply', effort: 'low', isolation: 'worktree', label: 'apply:mechanical' },
 )
 const pushed = !!(applied && applied.result === 'PASS' && applied.sha)

@@ -424,6 +424,8 @@ export UV_INDEX_COMPANY_PASSWORD=$(
 | `--user VALUE` | none | local user | Attribution override. |
 
 Tokens live for 5 minutes and cannot outrank the credential that minted them.
+A server with no write credential stays read-only for every token, including
+ones minted by another server that shares its signing key.
 
 ## Health and maintenance
 

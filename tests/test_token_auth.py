@@ -14,6 +14,7 @@ import subprocess
 
 import pytest
 
+from .conftest import _start_disk_server
 from .helpers import _encode_basic_auth, _http_request, http_get, make_wheel, upload_legacy
 
 pytestmark = pytest.mark.integration
@@ -158,3 +159,38 @@ def test_create_token_cli_mints_and_reads(disk_server_token_auth, pypiron_bin):
 
     code, _, _ = http_get(f"{server['simple']}index.json", headers=_token_header(token))
     assert code == 200
+
+
+def test_a_read_only_node_refuses_write_tokens(
+    disk_server_token_auth, tmp_path_factory, pypiron_bin, tmp_path
+):
+    """A node with no write credential is read-only even for admin and uploader
+    tokens a write-enabled node sharing its signing key minted."""
+    writer = disk_server_token_auth
+    tokens = {}
+    for role in ("admin", "uploader"):
+        _, body, _ = _mint(writer, role=role, auth=(writer["admin_user"], writer["admin_password"]))
+        tokens[role] = json.loads(body)["token"]
+
+    replica_gen = _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=["--token-signing-key", "test-signing-key-0123456789abcdef"],
+        creds="none",
+    )
+    replica = next(replica_gen)
+    try:
+        wheel = make_wheel("replicapkg", "1.0.0", tmp_path)
+        for token in tokens.values():
+            upload_legacy(
+                replica["legacy"], wheel, username="__token__", password=token, expect_status=403
+            )
+        code, _, _ = _http_request(
+            f"{replica['base_url']}/files/replicapkg/{wheel.name}/yank",
+            method="POST",
+            headers=_token_header(tokens["admin"]),
+            data=b"x",
+        )
+        assert code == 403
+    finally:
+        replica_gen.close()

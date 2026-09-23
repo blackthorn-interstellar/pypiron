@@ -685,20 +685,24 @@ impl AppState {
         token::verify(key, &pass, now).map(|c| c.role)
     }
 
-    /// Does the request authenticate as admin?
+    /// Does the request authenticate as admin? A token only grants a role this
+    /// node has enabled: a node without an admin credential stays admin-free
+    /// even for a token a peer sharing the signing key minted.
     pub(crate) fn is_admin(&self, headers: &HeaderMap) -> bool {
-        self.admin_credential()
-            .is_some_and(|(u, p)| check_basic_auth(headers, u, p).is_ok())
-            || self.token_role(headers) == Some(token::Role::Admin)
+        self.admin_credential().is_some_and(|(u, p)| {
+            check_basic_auth(headers, u, p).is_ok()
+                || self.token_role(headers) == Some(token::Role::Admin)
+        })
     }
 
-    /// May the request publish? Admin ⊇ uploader.
+    /// May the request publish? Admin ⊇ uploader. A read-only node refuses
+    /// write tokens too.
     pub(crate) fn is_uploader(&self, headers: &HeaderMap) -> bool {
         self.is_admin(headers)
             || self
                 .uploader_credential()
                 .is_some_and(|(u, p)| check_basic_auth(headers, u, p).is_ok())
-            || self.token_role(headers) >= Some(token::Role::Uploader)
+            || (!self.uploads_disabled() && self.token_role(headers) >= Some(token::Role::Uploader))
     }
 
     /// May the request read indexes and artifacts? Public unless a read

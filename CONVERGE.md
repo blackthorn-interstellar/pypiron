@@ -49,6 +49,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Rejected
 
+- 2026-09-22 Make `sync` fail when the destination answers `409` for a filename an admin deleted there: the delete deliberately bars the filename (PyPI semantics); failing would make every later run of that package error forever.
 - 2026-09-22 Trim `make check` time: the only sizable test cost is the two model checkers (`tests/model_event_protocol.rs` 8.7 s, `tests/model_replication.rs` 6.9 s of ~16 s `cargo test`); they guard the replication protocol on every change, so the time is the point.
 - 2026-09-22 Strip the `integration`/`chaos` marker labels (nothing selects on them) and the `compat(client, feature)` arguments: 77 lines of churn for no gain; they still document coverage.
 - 2026-09-22 Drop the 2.5 s sleep + `total == 0` in `test_head_and_partial_range_are_not_counted`: without it a wrongly counted HEAD flushed before the GET makes the later poll return 1 early and pass — the sleep is the guard.
@@ -61,9 +62,23 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
+
+- **Should `sync` fail when the source and destination hold different bytes
+  under the same filename?** `sync` skips any file whose *filename* the
+  destination already lists (`src/sync.rs` ~2305), and the server's `409` on
+  a re-upload is treated as "already present" too, so a source file whose bytes
+  changed after migration (devpi volatile indexes allow overwriting a release)
+  is silently left at the old bytes while the run exits 0.
+  `docs/guides/migrate.md` says "artifact bytes and hashes are preserved".
+  Options: (A) when both sides publish a sha256 and they differ, count the file
+  as an error (exit nonzero, cursor withheld) naming both hashes — pypiron still
+  never overwrites; (B) log a warning and keep exit 0; (C) leave as is.
+  Recommendation: A — a migration that verifies nothing about divergent bytes
+  should not report success; ~10 lines + a blackbox test. Cost of choosing
+  wrong: low.
 
 - **Should an advisory snapshot reload keep the malware probe's newer blocks?**
   The per-node probe blocks a newly published `MAL-*` release within minutes,

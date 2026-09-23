@@ -655,6 +655,7 @@ fn in_chain_sha_changes(links: &[(u64, Vec<u8>, ChainLink)]) -> Vec<FingerprintC
 /// truncation). The walk is metadata-only — chain links plus sidecar reads, never
 /// artifact bytes.
 pub async fn run_verify_chain(args: VerifyChainArgs) -> Result<bool> {
+    args.storage.require_existing_disk_root()?;
     let storages = args.storage.build_all().await?;
     let names = args.storage.bucket_names();
 

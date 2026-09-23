@@ -59,6 +59,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Bug: with `--malware-block=false` (documented: keep the audit, drop the refusal) the `/audit` report, `/audit.json` and the project page still marked `MAL-*` matches `blocked` while the byte gate served them; `blocked` is documented as "whether the byte gate would 403 this file". Both builders now take the blocking toggle; quarantine still blocks. Unit tests extended.
 - 2026-09-22 Bug: `pypiron config init` shows the disk default as `data-dir = "~/.pypiron/packages"`, but a config-file `~` is never shell-expanded, so uncommenting that line made `serve`/`rebuild-index`/`verify-index` use a literal `./~/.pypiron/packages` under the working directory — packages seemed to vanish and `verify-index` passed an empty store. A leading `~`/`~/` in the data dir now expands to `$HOME`. Blackbox test red first; 10-minute vopr soak at `4d06750` clean (~194k seeds).
 - 2026-09-23 Bug: `sync --admin-pass` without `--admin-user` silently sent no credential (`with_admin_auth` needs both) and then reported the destination "rejected the admin credentials" (401), while `serve` treats a lone `--admin-pass` as user `admin`; a lone `--admin-user` was likewise dropped instead of refusing (AGENTS.md: half-configured credentials refuse). Sync now uses `serve`'s rule and refuses a password-less username. Found by a hands-on run against real PyPI; blackbox test red first.
+- 2026-09-23 Bug: `verify-index`/`verify-chain` against a missing `--data-dir` (a typo) read every listing as empty and exited 0 with "0 divergence(s)"/"no chain", though the docs say storage read failures exit 2. A read-only verify now refuses a disk root that does not exist (exit 2, naming the path). Blackbox test red first.
 
 ## Rejected
 
@@ -236,3 +237,4 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 ## Leads (not yet adjudicated)
 
 - Flaky: `tests/test_crash_consistency.py::test_dual_leadership_overlap_triggers_cas_conflict` failed once in a full run on 2026-09-22 (loaded machine) and passed 3/3 alone right after.
+- Bug?: `create-token` with an explicit `--config` that is missing or malformed never loads it (`src/app.rs` ~891/~983), against "Config file. Read by every command." Reproduced by Codex. Also `buckets migrate` to a single remaining bucket always exits 1 "no reachable bucket" (`src/buckets.rs` ~746 returns an empty report when not multi), though the guide says the same migration removes a bucket; code-traced only.

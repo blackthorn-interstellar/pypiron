@@ -474,6 +474,20 @@ impl StorageArgs {
             .unwrap_or_default()
     }
 
+    /// For read-only checks: a disk store's root must already exist. Listings
+    /// read a missing directory as empty, so a mistyped `--data-dir` would
+    /// otherwise verify as a clean, empty store instead of failing to run.
+    pub fn require_existing_disk_root(&self) -> Result<()> {
+        if !self.buckets.is_empty() {
+            return Ok(());
+        }
+        let root = PathBuf::from(self.resolved_data_dir());
+        if !root.is_dir() {
+            bail!("data dir {} does not exist", root.display());
+        }
+        Ok(())
+    }
+
     /// The disk data directory actually used, applying the default. A leading
     /// `~/` is expanded: the generated `pypiron.toml` shows the default as
     /// `~/.pypiron/packages`, and no shell expands it inside a config file.

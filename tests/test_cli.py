@@ -89,6 +89,16 @@ def test_verify_index_diverged_exits_1(pypiron_bin: Path, tmp_path: Path):
     assert "Error:" not in cp.stderr, cp.stderr
 
 
+def test_verify_against_a_missing_data_dir_could_not_run(pypiron_bin: Path, tmp_path: Path):
+    """A typo'd `--data-dir` is not an empty, converged store: both verifiers
+    exit 2 (could not run) instead of reporting a clean verdict forever."""
+    missing = str(tmp_path / "no-such-store")
+    for cmd in ("verify-index", "verify-chain"):
+        cp = _run(pypiron_bin, cmd, "--data-dir", missing)
+        assert cp.returncode == 2, f"{cmd}: {cp.stdout}{cp.stderr}"
+        assert "no-such-store" in cp.stderr, cp.stderr
+
+
 # `config init` prints an annotated pypiron.toml to stdout. It is the guided
 # path to a first config: `pypiron config init > pypiron.toml`, then uncomment.
 

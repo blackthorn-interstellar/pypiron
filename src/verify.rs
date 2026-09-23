@@ -140,6 +140,7 @@ pub async fn verify_storage(
 /// stamp (what `serve` last enforced, via any channel) is the authority so the
 /// oracle models the same delisting the running server applied.
 pub async fn run_verify(args: VerifyArgs, fallback: &Denylist) -> Result<bool> {
+    args.storage.require_existing_disk_root()?;
     let storage = args.storage.build().await?;
     let denylist = crate::worker::enforced_denylist(storage.as_ref(), fallback).await?;
 

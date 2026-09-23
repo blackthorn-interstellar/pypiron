@@ -51,6 +51,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Bug: `origin release` — a bucket whose post-CAS verification listing failed after it wrote `unclaimed` returned `Err` without restoring itself, and the CLI rolls back only buckets that returned `Ok`, so it stayed released while the command reported failure. The release now restores its own claim before failing. Unit test (new `InMemStorage::fail_lists_after_cas` hook) red first.
 - 2026-09-22 Bug: `buckets migrate` refused to drop a bucket holding the sole copy of an artifact but ignored fences, so a delete (tombstone) or freeze acknowledged while the fleet ran on that bucket alone — the documented evacuation — was lost and the file resurrected from the survivors. Tombstone, frozen and mirror-quarantined keys now count as unique content. Unit test red first.
 - 2026-09-22 Bug: a deleted `simple/index.html` beside a populated `simple/index.json` was read as "never published" and left missing, even by `rebuild-index`, so HTML clients got `404` on `/simple/`. `reconcile_global_html` now recreates it when the name set is non-empty (the HTML is always written before the JSON, so that pair can only come from a deletion). Blackbox test red first; 3-minute vopr soak clean. A running disk server still trusts its in-memory "HTML current" memo until restart or `rebuild-index`.
+- 2026-09-22 Bug: a package whose `packages/<pkg>/` and `simple/<pkg>/` were both removed out of band stayed in both global indexes forever (`verify-index` red after every `rebuild-index`): the audit walks only listed truth/views, so the name produced no dead observation. A clean full audit now proves each unwalked global name absent and removes it through the existing re-proved path. Blackbox test red first; vopr soak clean.
 
 ## Rejected
 
@@ -200,4 +201,3 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 From a 2026-09-22 Codex bug hunt (not yet verified):
 
 - Bug?: `src/worker.rs` ~2200 — an audit that read `yanked=false`, then lost a race with a yank rebuild, overwrites the views with its stale render and records a fingerprint of current sidecars + stale views, so later audits skip the package and the yank never shows.
-- Bug?: `src/worker.rs` ~1898 — a package whose `packages/<pkg>/` and `simple/<pkg>/` were both removed externally stays in the global indexes forever: audit candidates come only from listed truth/views, and global membership shrinks only through explicit removals.

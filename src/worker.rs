@@ -1382,6 +1382,28 @@ pub async fn audit(
     // observation with no fingerprint cannot be proved and never removes — it
     // is handed to the marker path instead.
     let mut verified_dead: Vec<(String, String)> = Vec::new();
+    // A globally listed name the walk found nowhere — its truth and view both
+    // removed out of band — yields neither a live nor a dead observation, so it
+    // would stay listed forever. With every shard walked, prove each such name
+    // absent now and feed it through the same re-proved removal. One still
+    // present (a publish racing the walk) is left to its marker.
+    if failures == 0 {
+        let walked: HashSet<&str> = live
+            .iter()
+            .map(String::as_str)
+            .chain(dead.iter().map(|(pkg, _)| pkg.as_str()))
+            .collect();
+        let empty = fingerprint(&[], &[]);
+        for ghost in load_global_names(storage).await?.names {
+            if walked.contains(ghost.as_str()) {
+                continue;
+            }
+            let fp = package_fingerprint(storage, &ghost).await?;
+            if fp == empty {
+                verified_dead.push((ghost, fp));
+            }
+        }
+    }
     for (pkg, observed_fp) in dead {
         match observed_fp {
             Some(fp) => verified_dead.push((pkg, fp)),

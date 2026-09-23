@@ -209,3 +209,32 @@ def test_rebuild_index_restores_a_deleted_global_html_index(pypiron_bin, tmp_pat
     )
     assert cp.returncode == 0, cp.stdout + cp.stderr
     assert "htmlgone" in _global_html_names(data_dir)
+
+
+def test_rebuild_index_drops_a_package_removed_out_of_band(pypiron_bin, tmp_path):
+    """A package whose truth and view were both removed out of band must leave
+    the global indexes: the audit used to find it nowhere and so never proved
+    it dead, leaving a ghost listing that 404s."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    proc, base = _serve(pypiron_bin, data_dir)
+    try:
+        wheel = make_wheel("ghostpkg", "1.0", tmp_path)
+        user, password = _DISK_SERVER_CREDS["full"]["args"][1::2][:2]
+        upload_legacy(f"{base}/legacy/", wheel, username=user, password=password)
+        wait_for_project_in_global(f"{base}/simple/", "ghostpkg", timeout=15.0)
+    finally:
+        kill_process_tree(proc)
+    shutil.rmtree(data_dir / "packages" / "ghostpkg")
+    shutil.rmtree(data_dir / "simple" / "ghostpkg")
+
+    cp = subprocess.run(
+        [str(pypiron_bin), "rebuild-index", "--data-dir", str(data_dir)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "PYPIRON_ADVISORY_FEED": ""},
+    )
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert "ghostpkg" not in _global_html_names(data_dir)
+    assert "ghostpkg" not in (data_dir / "simple" / "index.json").read_text()

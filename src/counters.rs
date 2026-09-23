@@ -826,6 +826,10 @@ impl Counters {
 
         // Freeze closeable day-shards; collect each frozen day for its summary.
         let mut to_summarize: BTreeMap<(String, String), ()> = BTreeMap::new();
+        // Days with a closeable shard left unfrozen this pass. Summaries replicate
+        // copy-if-absent, so one written from a partial set of shards would stay
+        // undercounted on every peer: those days wait for a pass that freezes all.
+        let mut unfinished: std::collections::HashSet<(String, String)> = Default::default();
         for ((metric, day, shard), seg_keys) in &layout.segments {
             if day.as_str() >= close_cutoff {
                 continue; // still open (or within grace)
@@ -850,9 +854,12 @@ impl Counters {
                         let _ = store.delete(seg_keys).await;
                         rollups.insert(key);
                         to_summarize.insert((metric.clone(), day.clone()), ());
+                    } else {
+                        unfinished.insert((metric.clone(), day.clone()));
                     }
                 }
                 None => {
+                    unfinished.insert((metric.clone(), day.clone()));
                     // Transient read error mid-day — skip; next cycle retries.
                     // Never freeze from a partial read.
                 }
@@ -873,6 +880,7 @@ impl Counters {
             }
         }
 
+        to_summarize.retain(|day, _| !unfinished.contains(day));
         // Recompute each pending day's summary from this bucket's frozen shards.
         for (metric, day) in to_summarize.into_keys() {
             if let Some(key) = self.write_summary(store, &metric, &day).await {
@@ -1472,6 +1480,8 @@ mod tests {
         objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
         name: String,
         up: Arc<AtomicBool>,
+        /// Reads of a key containing this substring fail transiently.
+        fail_get: Arc<Mutex<Option<String>>>,
     }
     impl Default for MemStore {
         fn default() -> Self {
@@ -1484,6 +1494,7 @@ mod tests {
                 objects: Arc::new(Mutex::new(BTreeMap::new())),
                 name: bucket_tag(name),
                 up: Arc::new(AtomicBool::new(true)),
+                fail_get: Arc::default(),
             }
         }
         fn len(&self) -> usize {
@@ -1515,6 +1526,9 @@ mod tests {
         }
         async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
             self.down()?;
+            if let Some(needle) = self.fail_get.lock().unwrap().as_deref() {
+                anyhow::ensure!(!key.contains(needle), "injected read failure: {key}");
+            }
             Ok(self.objects.lock().unwrap().get(key).cloned())
         }
         async fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
@@ -2056,6 +2070,47 @@ mod tests {
         assert_eq!(
             series[&past]["r-1.0.whl"], 8,
             "A's frozen rollup plus B's still-live segments"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_never_summarizes_a_day_with_an_unfrozen_shard() {
+        // Summaries replicate copy-if-absent, so a summary written after only some
+        // of a day's shards froze would stay undercounted on every peer forever.
+        let store = MemStore::default();
+        let c = engine(store.clone(), Config::default());
+        let day = day_str(
+            OffsetDateTime::now_utc()
+                .date()
+                .saturating_sub(time::Duration::days(3)),
+        );
+        for (shard, count) in [('a', 10), ('b', 20)] {
+            store
+                .put(
+                    &format!("{SEG_PREFIX}downloads/{day}/{shard}/inc-0.json"),
+                    seg_bytes("requests/r-1.0.whl", count),
+                )
+                .await
+                .unwrap();
+        }
+        let summary = summary_key("downloads", &day, "local");
+
+        *store.fail_get.lock().unwrap() = Some(format!("/{day}/b/"));
+        c.compact(&[]).await;
+        assert!(
+            !store.objects.lock().unwrap().contains_key(&summary),
+            "summary written while shard b was still unfrozen"
+        );
+
+        *store.fail_get.lock().unwrap() = None;
+        c.compact(&[]).await;
+        let from = OffsetDateTime::now_utc()
+            .date()
+            .saturating_sub(time::Duration::days(4));
+        let to = OffsetDateTime::now_utc().date();
+        assert_eq!(
+            c.query_summaries("downloads", from, to).await[&day].total,
+            30
         );
     }
 

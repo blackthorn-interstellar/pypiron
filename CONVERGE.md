@@ -45,6 +45,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Delete: `tenacity` and `requests` sat in the `dev` dependency group since `114000b` and were never imported (`git log -S` empty); dropped, `tenacity` leaves `uv.lock` (`requests` stays via `twine`).
 - 2026-09-22 Delete: fixture `s3_server_multi_reconcile_cost` lost its only test in `3ecef9a`; removed (−16 test lines).
 - 2026-09-22 Bug: the advisory leader remembered the feed's HTTP ETag before validating and persisting the new snapshot, so one failed storage write turned every later poll into a `304` and the delivered advisory never reached the byte gate until the feed changed. The ETag is now kept only once the bytes are persisted or already loaded. Blackbox test (read-only `_advisories/` for one poll) red first.
+- 2026-09-22 Bug: counter compaction summarized a day as soon as any of its shards froze, even when another closeable shard's read or freeze failed that pass; the local summary healed next pass, but summaries replicate copy-if-absent, so peers kept the undercounted day forever. A day with an unfrozen closeable shard is now left unsummarized until a pass freezes them all. Unit test red first.
 
 ## Rejected
 
@@ -63,6 +64,21 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
+
+- **Should an advisory snapshot reload keep the malware probe's newer blocks?**
+  The per-node probe blocks a newly published `MAL-*` release within minutes,
+  ahead of the daily OSV snapshot. When a new snapshot loads, `src/advisories.rs`
+  (~1027) clears the probe overlay on purpose ("the next probe backfills anything
+  still newer"). If that snapshot predates an advisory the probe already
+  applied, the release downloads again until the next successful probe — about
+  2 minutes normally, indefinitely while the probe endpoint is down. That window
+  contradicts `docs/security.md` ("a cached file that becomes known malware stops
+  downloading"). Options: (A) on reload, keep overlay rules whose advisory id the
+  new snapshot does not contain (fail-closed; a withdrawal inside the snapshot
+  still removes it) — ~10 lines plus a unit test; (B) keep the designed window
+  and say in `docs/security.md` that a snapshot swap can briefly reopen a
+  probe-only block. Recommendation: A — a security block should never reopen
+  because newer-but-staler data arrived. Cost of choosing wrong: low.
 
 - **Add guards for three unguarded security invariants? (the loop's rules bar
   "coverage for its own sake", so this needs your call)** A 30-mutation break
@@ -157,10 +173,3 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   "mutations by default; every request with `--access-log`". Recommendation: A —
   the sentence exists for fail2ban rules, and the rules are only useful if the
   guess-heavy path is in the log. Cost of choosing wrong: low either way.
-
-## Leads (not yet adjudicated)
-
-From a 2026-09-22 Codex bug hunt (not yet verified):
-
-- Bug?: `src/advisories.rs` ~1026 — a snapshot reload resets the malware-probe overlay (`overlay: Arc::default()`), so a release the probe blocked becomes downloadable again when a newer baseline that predates that advisory loads, until the next successful probe. Would break `docs/security.md` "a cached file that becomes known malware stops downloading".
-- Bug?: `src/counters.rs` ~852 — compaction publishes a day summary after freezing only some shards; a later pass rewrites it on the local bucket, but replication copies summaries only if absent (~1230), so a peer keeps the undercounted day forever.

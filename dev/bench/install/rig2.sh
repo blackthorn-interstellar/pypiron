@@ -21,6 +21,16 @@
 #   ./rig2.sh results && ./rig2.sh down
 set -euo pipefail
 
+# `down` tears down the fleet `up` launched: `up` records its region and name
+# here before provisioning anything, so an interrupted launch is still found.
+# An explicit RIG_REGION/RIG_NAME in the environment still wins.
+FLEETF="$(cd "$(dirname "$0")" && pwd)/.rig2.env.fleet"
+if [[ "${1:-}" == down && -f "$FLEETF" ]]; then
+  # shellcheck disable=SC1090
+  source "$FLEETF"
+  RIG_REGION="${RIG_REGION:-$FLEET_REGION}" RIG_NAME="${RIG_NAME:-$FLEET_NAME}"
+fi
+
 REGION="${RIG_REGION:-us-east-1}"
 NAME="${RIG_NAME:-pypiron-ibench}"            # shares rig.sh's bucket/IAM/key
 ARCH="${RIG_ARCH:-x86_64}"                          # loadgen + corpus arch (x86)
@@ -81,6 +91,7 @@ cmd_up() {
   account=$(aws sts get-caller-identity --query Account --output text)
   bucket="${NAME}-${account}-${REGION}"
   myip=$(curl -fsS https://checkip.amazonaws.com)
+  printf 'FLEET_REGION=%q FLEET_NAME=%q\n' "$REGION" "$NAME" > "$FLEETF"
 
   echo "== bucket + IAM (shared with rig.sh; create if absent)"
   aws s3api head-bucket --bucket "$bucket" 2>/dev/null || aws s3 mb "s3://${bucket}" --region "$REGION"
@@ -344,7 +355,8 @@ cmd_down() {
   # Select the fleet by its Name tag, not by .rig2.env: cmd_up writes that file
   # only after every instance is up, so a launch that died midway would strand
   # a fleet an env-file teardown cannot see. Stale IDs in the file are equally
-  # harmless this way. The `2-` infix keeps rig.sh's single box out of it.
+  # harmless this way. The region and name come from .rig2.env.fleet, which
+  # cmd_up writes first. The `2-` infix keeps rig.sh's single box out of it.
   local ids
   ids=$(aws ec2 describe-instances --region "$REGION" \
     --filters "Name=tag:Name,Values=${NAME}2-*" "Name=instance-state-name,Values=pending,running,stopping,stopped" \

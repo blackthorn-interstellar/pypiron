@@ -3140,9 +3140,11 @@ impl<'a> PagedKeys<'a> {
     }
 }
 
-/// Up to `sample_cap` `packages/` artifact keys that live on `removed` but on no
-/// surviving bucket. An empty result means every artifact `removed` holds is safe
-/// elsewhere, so the bucket can be dropped without losing content. Short-circuits
+/// Up to `sample_cap` `packages/` artifact and fence keys (tombstone, frozen,
+/// mirror-quarantined) that live on `removed` but on no surviving bucket. A fence
+/// only there is a delete or freeze the survivors never saw — dropping it would
+/// resurrect the file. An empty result means the bucket can be dropped without
+/// losing content. Short-circuits
 /// once the sample fills, so a badly-diverged bucket is rejected cheaply. A
 /// survivor that errors mid-diff propagates: the caller must treat an
 /// unverifiable survivor as a refusal, never a silent drop.
@@ -3169,7 +3171,14 @@ pub async fn artifacts_unique_to_removed(
         after = page.last().map(|obj| obj.key.clone());
         for obj in &page {
             let filename = obj.key.rsplit('/').next().unwrap_or("");
-            if !crate::sidecar::is_artifact(filename) {
+            let fence = [
+                crate::sidecar::TOMBSTONE_SUFFIX,
+                crate::sidecar::FROZEN_SUFFIX,
+                crate::sidecar::MIRROR_QUARANTINED_SUFFIX,
+            ]
+            .iter()
+            .any(|suffix| filename.ends_with(suffix));
+            if !fence && !crate::sidecar::is_artifact(filename) {
                 continue;
             }
             let mut present = false;
@@ -6421,6 +6430,30 @@ mod tests {
 
         // Once the survivor also holds it, nothing is sole-copy.
         survivor.insert(&art("pkgb", "2.0"), b"b".to_vec());
+        let unique = artifacts_unique_to_removed(removed.as_ref(), &survivors, 5)
+            .await
+            .unwrap();
+        assert!(unique.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removal_diff_flags_a_sole_copy_tombstone() {
+        // A delete acknowledged while the fleet ran on the removed bucket alone
+        // lives only in its tombstone; dropping that bucket would resurrect the
+        // file from the survivors, which still hold it live.
+        let removed = Arc::new(InMemStorage::default());
+        let survivor = Arc::new(InMemStorage::default());
+        let tombstone = format!("{}.tombstone", art("pkga", "1.0"));
+        removed.insert(&tombstone, b"{}".to_vec());
+        survivor.insert(&art("pkga", "1.0"), b"a".to_vec());
+
+        let survivors: Vec<Arc<dyn Storage>> = vec![survivor.clone()];
+        let unique = artifacts_unique_to_removed(removed.as_ref(), &survivors, 5)
+            .await
+            .unwrap();
+        assert_eq!(unique, vec![tombstone.clone()]);
+
+        survivor.insert(&tombstone, b"{}".to_vec());
         let unique = artifacts_unique_to_removed(removed.as_ref(), &survivors, 5)
             .await
             .unwrap();

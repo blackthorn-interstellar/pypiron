@@ -590,7 +590,8 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
                     // never fanned out — a snapshot seeded out-of-band, or a bucket
                     // whose backfill has not converged. Diff its `packages/` against
                     // every surviving bucket and refuse the drop if it is the sole
-                    // copy of any artifact. `--force` accepts the loss.
+                    // copy of any artifact or fence (a delete or freeze the survivors never saw).
+                    // `--force` accepts the loss.
                     if !args.force {
                         let samples = replicate::artifacts_unique_to_removed(
                             storage.as_ref(),

@@ -103,7 +103,7 @@ backend account settings still come from the config.
 
 A new empty bucket stays out of regional reads until its backfill completes.
 Migration refuses to remove a bucket that is unreachable, has pending repairs,
-or contains the only copy of a file. Add its replacement, let backfill finish,
+or contains the only copy of a file or of a deletion. Add its replacement, let backfill finish,
 then remove the old bucket. `--force` accepts loss of unique content.
 
 To evacuate temporarily to one surviving bucket, stop the fleet and restart it

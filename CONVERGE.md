@@ -55,6 +55,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Rejected
 
+- 2026-09-22 "An audit rebuild racing a yank records a fingerprint over stale views, freezing the pre-yank index" (`src/worker.rs` audit, single bucket where no rebuild intent fences it): plausible by reading, but unreproduced, and the vopr — which runs the audit concurrently with the tick and counts `concurrent-race` view repairs — reported 0 across ~280k seeds today. Revisit only with a failing seed.
 - 2026-09-22 Verify `md5_digest`/`blake2_256_digest` on upload like PyPI: every real client also sends `sha256_digest`, which is verified; a second weaker digest adds nothing. Also `fold_version` treating `1!2` as `1.2`: needs a hand-crafted epoch mismatch no build tool emits.
 - 2026-09-22 Make `sync` fail when the destination answers `409` for a filename an admin deleted there: the delete deliberately bars the filename (PyPI semantics); failing would make every later run of that package error forever.
 - 2026-09-22 Trim `make check` time: the only sizable test cost is the two model checkers (`tests/model_event_protocol.rs` 8.7 s, `tests/model_replication.rs` 6.9 s of ~16 s `cargo test`); they guard the replication protocol on every change, so the time is the point.
@@ -69,7 +70,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 
@@ -195,9 +196,3 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   "mutations by default; every request with `--access-log`". Recommendation: A —
   the sentence exists for fail2ban rules, and the rules are only useful if the
   guess-heavy path is in the log. Cost of choosing wrong: low either way.
-
-## Leads (not yet adjudicated)
-
-From a 2026-09-22 Codex bug hunt (not yet verified):
-
-- Bug?: `src/worker.rs` ~2200 — an audit that read `yanked=false`, then lost a race with a yank rebuild, overwrites the views with its stale render and records a fingerprint of current sidecars + stale views, so later audits skip the package and the yank never shows.

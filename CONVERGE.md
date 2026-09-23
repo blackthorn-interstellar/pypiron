@@ -54,6 +54,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Bug: a package whose `packages/<pkg>/` and `simple/<pkg>/` were both removed out of band stayed in both global indexes forever (`verify-index` red after every `rebuild-index`): the audit walks only listed truth/views, so the name produced no dead observation. A clean full audit now proves each unwalked global name absent and removes it through the existing re-proved path. Blackbox test red first; vopr soak clean.
 - 2026-09-22 Bug: `verify-chain --strict` read a committed file's sidecar sha as proof of presence, so an artifact deleted out of band beside its surviving `.meta.json` verified clean (exit 0), against the docs' "changed or missing content exits 1". A matching sidecar now also needs the artifact to exist; otherwise the tombstone/demotion check decides covered vs `vanished`. Unit test red first; reproduced and fixed on a real store.
 - 2026-09-22 Bug: `sync`/`[mirror]` opt-in bools (`as-private`, `allow-insecure-source`, `allow-legacy-versions`, `exclude-dev`, `exclude-windows`, `exclude-prereleases`, `include-yanked`) merged as `cli || file`, so an explicit `PYPIRON_X=false` could not override `true` in `pypiron.toml`, against the documented CLI > env > file precedence (e.g. plaintext source credentials stayed allowed). A file value is now dropped when the CLI/env set that bool; `serve` shares the `[mirror]` path. Blackbox test red first.
+- 2026-09-22 Bug: download read-through fell back to the write pin whenever the read pin said "not visible", including when the read pin held a tombstone or freeze — so a delete a failed-over node landed on the region bucket, not yet replicated to the write home, was served (200, deleted bytes) by a node that had just seen the tombstone. Read-pin fences now end the request; only absence reads through. Blackbox test (read-affinity pair) red first.
 
 ## Rejected
 
@@ -226,4 +227,5 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Leads (not yet adjudicated)
 
+- Bug?: `src/serve.rs` ~1046 — an acked file held only on a reachable peer that is neither the read nor the write pin (a failed-over node uploaded to B, fan-out to A pending; this node pins A for both) returns `404`; read-through tries only the two pins, while `docs/guides/multi-region.md` says a missing file "reads through to a complete bucket instead of returning 404". Code-traced by Codex, not reproduced.
 - Flaky: `tests/test_crash_consistency.py::test_dual_leadership_overlap_triggers_cas_conflict` failed once in a full run on 2026-09-22 (loaded machine) and passed 3/3 alone right after.

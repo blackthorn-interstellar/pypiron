@@ -263,6 +263,19 @@ async fn file_visible_read_through(
     if pins.same_pin {
         return Ok(false);
     }
+    // Read-through covers a lagging read pin's *absence*, never its fence: a
+    // tombstone or freeze there is final (a failed-over peer's delete that the
+    // write pin has not received yet), so it must not fall back to a stale live
+    // copy.
+    let read = pins.read.storage.as_ref();
+    let (tombstoned, frozen) = futures::future::try_join(
+        read.head_exists(&tombstone_key(artifact_key)),
+        read.head_exists(&frozen_key(artifact_key)),
+    )
+    .await?;
+    if tombstoned || frozen {
+        return Ok(false);
+    }
     multi_bucket_file_visible(state, pins.write.storage.as_ref(), pkg, artifact_key).await
 }
 

@@ -968,3 +968,34 @@ def test_no_region_node_reads_from_the_write_bucket(s3_server_read_affinity_no_r
         what="download served from the write bucket A",
     )
     assert _artifact_gets(faults, b, akey) == before_b, "the region bucket B is never read"
+
+
+def test_a_tombstone_on_the_read_pin_is_never_read_through(
+    s3_server_read_affinity_sticky, tmp_path
+):
+    """Read-through covers *absence* on a lagging read pin, never a fence. A
+    delete that another node (failed over to B) landed on B, and that A has not
+    received yet, must not be served from A's stale live copy by a node that
+    just saw B's tombstone."""
+    server = s3_server_read_affinity_sticky
+    minio = server["minio"]
+    a, b = minio["buckets"]
+    _eventually(lambda: _read_bucket(server) == b, what="reads pin to B")
+    _eventually(lambda: _write_bucket(server) == a, what="writes home to A")
+
+    pkg = "fencedpkg"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    akey = f"packages/{pkg}/{wheel.name}"
+    _upload(server, wheel)
+    wait_for_file_in_index(server["simple"], pkg, wheel.name)
+    _eventually(lambda: minio_key_exists_in(minio, b, akey), what="B holds the file")
+
+    # The delete as a node failed over to B performed it: tombstone first, then
+    # the artifact and its sidecar go; A still holds the live record.
+    minio_put_key_in(minio, b, f"{akey}.tombstone", "{}")
+    minio_delete_key_in(minio, b, akey)
+    minio_delete_key_in(minio, b, f"{akey}.meta.json")
+    assert minio_key_exists_in(minio, a, akey)
+
+    code, _, _ = http_get(f"{server['base_url']}/files/{pkg}/{wheel.name}", timeout=15)
+    assert code == 404, f"a tombstoned file was served from the write pin: {code}"

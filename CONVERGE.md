@@ -56,6 +56,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Bug: `sync`/`[mirror]` opt-in bools (`as-private`, `allow-insecure-source`, `allow-legacy-versions`, `exclude-dev`, `exclude-windows`, `exclude-prereleases`, `include-yanked`) merged as `cli || file`, so an explicit `PYPIRON_X=false` could not override `true` in `pypiron.toml`, against the documented CLI > env > file precedence (e.g. plaintext source credentials stayed allowed). A file value is now dropped when the CLI/env set that bool; `serve` shares the `[mirror]` path. Blackbox test red first.
 - 2026-09-22 Bug: download read-through fell back to the write pin whenever the read pin said "not visible", including when the read pin held a tombstone or freeze — so a delete a failed-over node landed on the region bucket, not yet replicated to the write home, was served (200, deleted bytes) by a node that had just seen the tombstone. Read-pin fences now end the request; only absence reads through. Blackbox test (read-affinity pair) red first.
 - 2026-09-22 Bug (security, fail-open): the malware/quarantine byte gate skipped any name matching `--private-prefix`/`--private-pattern` before reading the actual owner, so reserving a name that already held cached public (mirror-claimed) bytes made a blocked wheel download again (200). The origin claim alone now exempts a package. Blackbox test (restart with the name reserved) red first.
+- 2026-09-22 Bug: with `--malware-block=false` (documented: keep the audit, drop the refusal) the `/audit` report, `/audit.json` and the project page still marked `MAL-*` matches `blocked` while the byte gate served them; `blocked` is documented as "whether the byte gate would 403 this file". Both builders now take the blocking toggle; quarantine still blocks. Unit tests extended.
 
 ## Rejected
 
@@ -77,7 +78,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Empty iterations
 
-1 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 
@@ -230,4 +231,5 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Leads (not yet adjudicated)
 
+- Bug?: `/stats/downloads` history is read only for currently configured bucket tags (`src/app.rs` ~778, `src/counters.rs` ~1034/~1174), so after evacuating to one bucket the replicated rollups a retired bucket wrote are invisible though still stored. Code-traced by Codex; DESIGN.md says replicated rollups preserve `/stats` history.
 - Flaky: `tests/test_crash_consistency.py::test_dual_leadership_overlap_triggers_cas_conflict` failed once in a full run on 2026-09-22 (loaded machine) and passed 3/3 alone right after.

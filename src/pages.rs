@@ -450,7 +450,12 @@ async fn advisory_panel_rows(
     let mut rows: Vec<html::AdvisoryPanelRow> = Vec::new();
     for version in versions {
         for record in advisories::advisories_for(db, pkg, version) {
-            rows.push(advisory_row(version, record, quarantined));
+            rows.push(advisory_row(
+                version,
+                record,
+                quarantined,
+                state.malware_block,
+            ));
         }
     }
     if rows.is_empty() {
@@ -490,6 +495,7 @@ fn advisory_row(
     version: &str,
     record: &crate::osv::AdvisoryRecord,
     quarantined: bool,
+    malware_block: bool,
 ) -> html::AdvisoryPanelRow {
     html::AdvisoryPanelRow {
         version: coremeta::strip_control_chars(version),
@@ -500,7 +506,7 @@ fn advisory_row(
             .iter()
             .map(|v| coremeta::strip_control_chars(v))
             .collect(),
-        blocked: quarantined || record.id.starts_with("MAL-"),
+        blocked: quarantined || (malware_block && record.id.starts_with("MAL-")),
     }
 }
 
@@ -776,7 +782,7 @@ mod tests {
             fixed_in: vec![format!("2.0.0{sentinel}")],
             matcher: crate::osv::VersionScope::AllVersions,
         };
-        let row = advisory_row(&format!("1.0.0{sentinel}"), &record, false);
+        let row = advisory_row(&format!("1.0.0{sentinel}"), &record, false, true);
         for field in [&row.version, &row.id, &row.severity, &row.fixed_in[0]] {
             assert!(
                 !field.contains(sentinel) && !field.chars().any(char::is_control),
@@ -793,9 +799,13 @@ mod tests {
             id: "MAL-2026-1".into(),
             ..record
         };
-        assert!(advisory_row("1.0.0", &mal, false).blocked);
+        assert!(advisory_row("1.0.0", &mal, false, true).blocked);
         assert!(
-            advisory_row("1.0.0", &mal, true).blocked,
+            !advisory_row("1.0.0", &mal, false, false).blocked,
+            "with malware blocking off the gate serves it"
+        );
+        assert!(
+            advisory_row("1.0.0", &mal, true, false).blocked,
             "a quarantined project blocks regardless of advisory kind"
         );
     }

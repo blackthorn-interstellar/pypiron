@@ -2345,8 +2345,14 @@ async fn build_advisory_report(
         }
     }
     let generated_unix = time::OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
-    let report =
-        crate::advisories::build_report(&entries, db, quarantined, generated_unix, feed_sha256);
+    let report = crate::advisories::build_report(
+        &entries,
+        db,
+        quarantined,
+        state.malware_block,
+        generated_unix,
+        feed_sha256,
+    );
     crate::advisories::write_report_if_changed(storage, &report).await
 }
 

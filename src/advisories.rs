@@ -89,7 +89,8 @@ pub struct ReportRow {
     pub fixed_in: Vec<String>,
     pub downloads_30d: u64,
     /// Whether the byte gate would 403 this file: a `MAL-*` match (on the
-    /// included non-private origin) or a quarantined project. Vulnerabilities are
+    /// included non-private origin) while malware blocking is on, or a
+    /// quarantined project. Vulnerabilities are
     /// informational (`false`); malware is blocked (`true`).
     pub blocked: bool,
 }
@@ -116,6 +117,7 @@ pub fn build_report(
     inventory: &[AuditInventory],
     db: &AdvisoryDb,
     quarantined: &HashSet<String>,
+    malware_block: bool,
     generated_unix: u64,
     feed_sha256: &str,
 ) -> Report {
@@ -145,7 +147,10 @@ pub fn build_report(
             .collect();
         fixed_in.sort();
         fixed_in.dedup();
-        let blocked = !blocking_advisories(db, &item.package, Some(&item.version)).is_empty()
+        // `--malware-block=false` keeps the audit but not the refusal, so only a
+        // quarantine blocks then.
+        let blocked = (malware_block
+            && !blocking_advisories(db, &item.package, Some(&item.version)).is_empty())
             || quarantined.contains(&item.package);
         rows.push(ReportRow {
             package: item.package.clone(),
@@ -2008,7 +2013,7 @@ mod tests {
             // No advisory → no row (even at the top of downloads).
             inv("clean", "9.9.9", "mirror", 100),
         ];
-        let report = build_report(&inventory, &db, &quarantined, 123, "deadbeef");
+        let report = build_report(&inventory, &db, &quarantined, true, 123, "deadbeef");
         assert_eq!(report.generated_unix, 123);
         assert_eq!(report.feed_sha256, "deadbeef");
         assert_eq!(
@@ -2035,6 +2040,11 @@ mod tests {
         assert_eq!(evil.advisories, ["MAL-2024-1"]);
         assert_eq!(evil.origin, "mirror");
         assert!(evil.blocked, "a MAL match must be flagged blocked");
+
+        // With `--malware-block=false` the byte gate serves it, so the report
+        // must not claim it is blocked.
+        let report = build_report(&inventory, &db, &quarantined, false, 123, "deadbeef");
+        assert!(report.rows.iter().all(|row| !row.blocked));
     }
 
     #[test]
@@ -2049,6 +2059,7 @@ mod tests {
             &[inv("widget", "1.0.0", "mirror", 1)],
             &db,
             &quarantined,
+            true,
             0,
             "",
         );

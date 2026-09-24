@@ -889,9 +889,11 @@ def disk_server_uploader_only(tmp_path_factory, pypiron_bin: Path) -> Iterator[D
 
 # ------------------------------ MinIO (S3) fixtures ---------------------------
 
-# Docker Hub unpublished minio/minio (anonymous pull is now 125 / access
-# denied). Quay still serves the last official image; same entry point.
-_MINIO_IMAGE = "quay.io/minio/minio"
+# Docker Hub unpublished minio/minio, then Quay started denying anonymous
+# pulls of quay.io/minio/minio (tagged RELEASE.* included; docker run exits
+# 125: "unauthorized"). Chainguard still serves a public MinIO image with
+# the same `server /data` entry point and `/minio/health/ready` probe.
+_MINIO_IMAGE = "cgr.dev/chainguard/minio"
 
 
 def _real_s3_config() -> Dict | None:

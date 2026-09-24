@@ -85,6 +85,22 @@ As features land, each gets its blackbox test in
 the same style: yank → pip refuses to pick it unless pinned; immutability →
 re-upload of the same filename is rejected; caching → ETag round-trips as a 304.
 
+## Upgrade and rollback
+
+`tests/test_upgrade.py` (marker `upgrade`) proves an operator can swap the
+binary over a live store in both directions. The latest pypiron release,
+installed from PyPI with uv, writes real state: uploads, an sdist, a yank, a
+project status and downloads. The binary under test then boots on that store.
+It must list and serve every file byte-for-byte with its yank state, install
+through `uv pip`, pass `verify-index`, and write its own uploads and yanks.
+Then the release boots again on what the new binary wrote and must serve all
+of it. It runs on disk and on S3 (MinIO), in the default suite, and skips
+cleanly when PyPI is unreachable.
+
+Rollback succeeding is today's contract because no storage-format stamp is
+written. A format bump (dev/DESIGN.md) turns rollback into a clean refusal,
+which `tests/test_format_stamp.py` covers; update the rollback leg with the bump.
+
 ## Chaos and crash consistency
 
 The storage contract is write-to-tmp-then-rename on one filesystem, so the tests

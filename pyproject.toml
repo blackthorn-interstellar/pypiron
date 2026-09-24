@@ -85,6 +85,7 @@ markers = [
     "chaos: crash-point fault injection sweeps (slow-ish, deterministic)",
     "compat(client, feature): runs a real client binary; selected by `make compat`",
     "devpi: migration tests that drive a real devpi-server (fetched via uv tool run) as the source; skip cleanly when devpi can't be fetched/started",
+    "upgrade: upgrade/rollback against the latest pypiron release (installed from PyPI via uv); skip cleanly when it can't be fetched",
 ]
 # -n auto: tests isolate by uuid bucket/container/port, so they parallelize.
 # The serial-only targets (perf timing, real-bucket runs that wipe a shared
